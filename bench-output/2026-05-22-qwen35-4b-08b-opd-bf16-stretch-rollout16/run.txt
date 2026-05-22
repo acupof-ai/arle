@@ -1,0 +1,825 @@
+warning: cuda-kernels@0.1.5: Compiling CUDA kernels for targets: sm_89
+warning: cuda-kernels@0.1.5: TileLang AOT: built per-SM cubins for 1 target(s) across HD64/HD128/HD256 prefill, HD64/HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.
+   Compiling infer v0.1.5 (/home/ckl/projects/arle/infer)
+warning: unused import: `half::bf16`
+  --> infer/src/model/deepseek/mlp.rs:23:5
+   |
+23 | use half::bf16;
+   |     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `ensure_dispatch_payload_scratch`, `ensure_local_route_scratch`, `ensure_recv_route_scratch`, `ensure_route_logits_scratch`, and `ensure_send_route_scratch`
+  --> infer/src/model/deepseek/mlp.rs:34:67
+   |
+34 |     DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_dispatch_payload_scratch,
+   |                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+35 |     ensure_local_route_scratch, ensure_recv_route_scratch, ensure_route_logits_scratch,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+36 |     ensure_send_route_scratch,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `argmax_batch_readback_into`
+   --> infer/src/ops.rs:645:34
+    |
+645 |     argmax_batch_logprob_launch, argmax_batch_readback_into, gpu_sample_launch_raw,
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> infer/src/model/deepseek/weights.rs:188:13
+    |
+188 |         let mut comm = LayerCommunicator::new_with_ep(
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ctx`
+   --> infer/src/model/deepseek/weights.rs:185:9
+    |
+185 |         ctx: &DeviceContext,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `forward_scratch_input` and `try_forward_scratch_input_segment` are never used
+   --> infer/src/model/deepseek/mlp.rs:105:19
+    |
+ 66 | impl DeepseekV4Expert {
+    | --------------------- methods in this implementation
+...
+105 |     pub(super) fn forward_scratch_input<'a>(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+157 |     pub(super) fn try_forward_scratch_input_segment(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `dsv4_run_block_scaled_gemv_segment` is never used
+   --> infer/src/model/deepseek/mlp.rs:317:4
+    |
+317 | fn dsv4_run_block_scaled_gemv_segment(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_run_block_scaled_gemv_pair_segment` is never used
+   --> infer/src/model/deepseek/mlp.rs:404:4
+    |
+404 | fn dsv4_run_block_scaled_gemv_pair_segment(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_grouped_experts_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1090:4
+     |
+1090 | fn dsv4_grouped_experts_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_pair_expert_gemv_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1102:4
+     |
+1102 | fn dsv4_pair_expert_gemv_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_route_grouped_experts_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1114:4
+     |
+1114 | fn dsv4_route_grouped_experts_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Dsv4CountExchangeMode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1229:6
+     |
+1229 | enum Dsv4CountExchangeMode {
+     |      ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_count_exchange_mode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1235:4
+     |
+1235 | fn dsv4_count_exchange_mode() -> Result<Dsv4CountExchangeMode> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_padded_dispatch_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1251:4
+     |
+1251 | fn dsv4_padded_dispatch_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_fused_dispatch_payload_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1263:4
+     |
+1263 | fn dsv4_fused_dispatch_payload_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Dsv4CombineExchangeMode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1276:6
+     |
+1276 | enum Dsv4CombineExchangeMode {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_combine_exchange_mode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1282:4
+     |
+1282 | fn dsv4_combine_exchange_mode() -> Result<Dsv4CombineExchangeMode> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_reduce_scatter_combine_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1294:4
+     |
+1294 | fn dsv4_reduce_scatter_combine_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_zero_i32_slice` is never used
+    --> infer/src/model/deepseek/mlp.rs:3933:4
+     |
+3933 | fn dsv4_zero_i32_slice(ctx: &DeviceContext, slice: &mut CudaSlice<i32>, len: usize) -> Result<()> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_counts_to_offsets_i32` is never used
+    --> infer/src/model/deepseek/mlp.rs:3975:4
+     |
+3975 | fn dsv4_counts_to_offsets_i32(counts: &[i32], label: &str) -> Result<(Vec<i32>, usize)> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_counts_to_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:3998:4
+     |
+3998 | fn dsv4_counts_to_usize(counts: &[i32], label: &str) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_offsets_to_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:4013:4
+     |
+4013 | fn dsv4_offsets_to_usize(offsets: &[i32]) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_scale_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:4028:4
+     |
+4028 | fn dsv4_scale_usize(values: &[usize], factor: usize) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_usize_to_i32` is never used
+    --> infer/src/model/deepseek/mlp.rs:4040:4
+     |
+4040 | fn dsv4_usize_to_i32(value: usize, label: &str) -> Result<i32> {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+  --> infer/src/model/deepseek/state.rs:88:16
+   |
+87 | pub(crate) struct DeepseekMoeRuntimeCache {
+   |                   ----------------------- fields in this struct
+88 |     pub(crate) route_logits: Option<DeepseekRouteLogitsRuntimeScratch>,
+   |                ^^^^^^^^^^^^
+89 |     pub(crate) dispatch: Option<DeepseekDispatchRuntimeScratch>,
+   |                ^^^^^^^^
+90 |     pub(crate) dispatch_payload: Option<DeepseekDispatchPayloadRuntimeScratch>,
+   |                ^^^^^^^^^^^^^^^^
+91 |     pub(crate) send_route: Option<DeepseekSendRouteRuntimeScratch>,
+   |                ^^^^^^^^^^
+92 |     pub(crate) recv_route: Option<DeepseekRecvRouteRuntimeScratch>,
+   |                ^^^^^^^^^^
+93 |     pub(crate) local_route: Option<DeepseekLocalRouteRuntimeScratch>,
+   |                ^^^^^^^^^^^
+94 |     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
+   |                ^^^^^^
+...
+97 |     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
+   |                ^^^^^^^^^^^^^
+
+warning: fields `capacity_tokens`, `n_experts`, and `logits` are never read
+   --> infer/src/model/deepseek/state.rs:102:16
+    |
+101 | pub(crate) struct DeepseekRouteLogitsRuntimeScratch {
+    |                   --------------------------------- fields in this struct
+102 |     pub(crate) capacity_tokens: usize,
+    |                ^^^^^^^^^^^^^^^
+103 |     pub(crate) n_experts: usize,
+    |                ^^^^^^^^^
+104 |     pub(crate) logits: HiddenStates,
+    |                ^^^^^^
+
+warning: multiple fields are never read
+   --> infer/src/model/deepseek/state.rs:109:16
+    |
+108 | pub(crate) struct DeepseekDispatchRuntimeScratch {
+    |                   ------------------------------ fields in this struct
+109 |     pub(crate) capacity_tokens: usize,
+    |                ^^^^^^^^^^^^^^^
+110 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+111 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+112 |     pub(crate) topk: usize,
+    |                ^^^^
+113 |     pub(crate) ep_world: usize,
+    |                ^^^^^^^^
+114 |     pub(crate) experts_per_rank: usize,
+    |                ^^^^^^^^^^^^^^^^
+115 |     pub(crate) token_ids: CudaSlice<u32>,
+    |                ^^^^^^^^^
+116 |     pub(crate) route_indices: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+117 |     pub(crate) route_weights: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^
+118 |     pub(crate) send_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^
+119 |     pub(crate) send_rank_offsets: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^^
+120 |     pub(crate) rank_cursors: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^
+121 |     pub(crate) send_hidden: HiddenStates,
+    |                ^^^^^^^^^^^
+122 |     pub(crate) send_meta: CudaSlice<i32>,
+    |                ^^^^^^^^^
+123 |     pub(crate) all_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^
+124 |     pub(crate) recv_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^
+125 |     pub(crate) local_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^
+126 |     pub(crate) local_offsets: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+127 |     pub(crate) local_cursors: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `stride_elems`, `send_payload`, and `recv_payload` are never read
+   --> infer/src/model/deepseek/state.rs:132:16
+    |
+131 | pub(crate) struct DeepseekDispatchPayloadRuntimeScratch {
+    |                   ------------------------------------- fields in this struct
+132 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+133 |     pub(crate) stride_elems: usize,
+    |                ^^^^^^^^^^^^
+134 |     pub(crate) send_payload: CudaSlice<bf16>,
+    |                ^^^^^^^^^^^^
+135 |     pub(crate) recv_payload: CudaSlice<bf16>,
+    |                ^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `send_token`, and `send_route_slot` are never read
+   --> infer/src/model/deepseek/state.rs:140:16
+    |
+139 | pub(crate) struct DeepseekSendRouteRuntimeScratch {
+    |                   ------------------------------- fields in this struct
+140 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+141 |     pub(crate) send_token: CudaSlice<i32>,
+    |                ^^^^^^^^^^
+142 |     pub(crate) send_route_slot: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `hidden_dim`, `recv_hidden`, `recv_meta`, and `route_out` are never read
+   --> infer/src/model/deepseek/state.rs:147:16
+    |
+146 | pub(crate) struct DeepseekRecvRouteRuntimeScratch {
+    |                   ------------------------------- fields in this struct
+147 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+148 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+149 |     pub(crate) recv_hidden: HiddenStates,
+    |                ^^^^^^^^^^^
+150 |     pub(crate) recv_meta: CudaSlice<i32>,
+    |                ^^^^^^^^^
+151 |     pub(crate) route_out: HiddenStates,
+    |                ^^^^^^^^^
+
+warning: fields `capacity_routes`, `hidden_dim`, `expert_hidden`, `expert_weight`, and `expert_route_slot` are never read
+   --> infer/src/model/deepseek/state.rs:156:16
+    |
+155 | pub(crate) struct DeepseekLocalRouteRuntimeScratch {
+    |                   -------------------------------- fields in this struct
+156 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+157 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+158 |     pub(crate) expert_hidden: HiddenStates,
+    |                ^^^^^^^^^^^^^
+159 |     pub(crate) expert_weight: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^
+160 |     pub(crate) expert_route_slot: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^^
+
+warning: field `input` is never read
+   --> infer/src/model/deepseek/state.rs:188:16
+    |
+183 | pub(crate) struct DeepseekExpertRuntimeScratch {
+    |                   ---------------------------- field in this struct
+...
+188 |     pub(crate) input: HiddenStates,
+    |                ^^^^^
+
+warning: multiple fields are never read
+   --> infer/src/model/deepseek/state.rs:238:16
+    |
+237 | pub(crate) struct DeepseekRouteCombineRuntimeScratch {
+    |                   ---------------------------------- fields in this struct
+238 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+239 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+240 |     pub(crate) combine_recv: HiddenStates,
+    |                ^^^^^^^^^^^^
+241 |     pub(crate) route_slot_out: HiddenStates,
+    |                ^^^^^^^^^^^^^^
+242 |     pub(crate) combine_fp8_send: CudaSlice<u8>,
+    |                ^^^^^^^^^^^^^^^^
+243 |     pub(crate) combine_fp8_recv: CudaSlice<u8>,
+    |                ^^^^^^^^^^^^^^^^
+244 |     pub(crate) combine_scale_send: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^^^^^^
+245 |     pub(crate) combine_scale_recv: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^^^^^^
+
+warning: methods `ensure_dispatch_scratch`, `ensure_expert_scratch`, and `ensure_route_combine_scratch` are never used
+   --> infer/src/model/deepseek/state.rs:250:19
+    |
+249 | impl DeepseekMoeRuntimeCache {
+    | ---------------------------- methods in this implementation
+250 |     pub(crate) fn ensure_dispatch_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+...
+302 |     pub(crate) fn ensure_expert_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+416 |     pub(crate) fn ensure_route_combine_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_route_logits_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:456:15
+    |
+456 | pub(crate) fn ensure_route_logits_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_send_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:480:15
+    |
+480 | pub(crate) fn ensure_send_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_dispatch_payload_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:503:15
+    |
+503 | pub(crate) fn ensure_dispatch_payload_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_recv_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:532:15
+    |
+532 | pub(crate) fn ensure_recv_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_local_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:560:15
+    |
+560 | pub(crate) fn ensure_local_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `generate_greedy` is never used
+   --> infer/src/model/deepseek/reference.rs:111:19
+    |
+ 94 | impl DeepseekV4ReferenceModel {
+    | ----------------------------- method in this implementation
+...
+111 |     pub(crate) fn generate_greedy(
+    |                   ^^^^^^^^^^^^^^^
+
+warning: function `argmax` is never used
+    --> infer/src/model/deepseek/reference.rs:1803:4
+     |
+1803 | fn argmax(values: &[f32]) -> usize {
+     |    ^^^^^^
+
+warning: `infer` (lib) generated 41 warnings (run `cargo fix --lib -p infer` to apply 5 suggestions)
+   Compiling train v0.1.5 (/home/ckl/projects/arle/crates/train)
+    Finished `release` profile [optimized] target(s) in 1m 57s
+     Running `target/release/examples/opd_step_cuda_infer_teacher_train --teacher-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B --student-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base --prompts-file examples/opd/sample-prompts.jsonl --steps 200 --rollout-len 16 --lr 1e-5 --eval-steps 0,50,100,200 --prompt-max-tokens 16 --max-step-seconds 30`
+config backend=cuda teacher_model=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B teacher_api_url=none teacher_config=none student_model=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base student_mode=lora lora_rank=16 lora_alpha=32.000000 lora_target_set=attention-qv steps=200 rollout_len=16 lr=9.999999747e-6 grad_clip=1 prompt_source=jsonl:examples/opd/sample-prompts.jsonl rows=20 tokenizer=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base/tokenizer.json truncated_rows=1 train_prompt_count=16 heldout_prompt_count=4 eval_steps=[0, 50, 100, 200] cuda_graph=true
+prompt split=train index=0 ids=[814, 20139, 3069, 2526, 3992, 3983, 8495, 494, 383, 64179, 1527, 63853, 13]
+prompt split=train index=1 ids=[8917, 5437, 537, 279, 6463, 1881, 4487, 65427, 321, 9637, 65427, 13]
+prompt split=train index=2 ids=[7734, 264, 61446, 50802, 364, 26805, 264, 52965, 4706, 2923, 13]
+prompt split=train index=3 ids=[3710, 3520, 264, 27502, 1067, 54067, 30]
+prompt split=train index=4 ids=[72240, 1204, 264, 19088, 10756, 628, 8214, 264, 17671, 71698, 5286, 1558, 13]
+prompt split=train index=5 ids=[33963, 264, 2716, 3010, 314, 264, 9640, 421, 6813, 33633, 31626, 13]
+prompt split=train index=6 ids=[826, 2250, 11590, 421, 264, 4706, 1542, 369, 35140, 3072, 13]
+prompt split=train index=7 ids=[814, 20139, 3817, 11258, 35887, 303, 799, 13901, 13]
+prompt split=train index=8 ids=[4199, 1220, 449, 22839, 9973, 3315, 310, 2426, 466, 5332, 449, 24460, 30]
+prompt split=train index=9 ids=[7734, 264, 16338, 5020, 883, 21966, 4779, 22627, 16070, 13]
+prompt split=train index=10 ids=[9930, 369, 4581, 33686, 26370, 6807, 2166, 47590, 430, 449, 5428, 17723, 30]
+prompt split=train index=11 ids=[26487, 54102, 45543, 440, 47241, 6299, 11336, 364, 1527, 63853, 13]
+prompt split=train index=12 ids=[3710, 369, 279, 3364, 314, 5467, 9502, 49219, 303, 449, 12753, 35, 9064, 30]
+prompt split=train index=13 ids=[814, 20139, 3069, 17515, 11241, 4766, 303, 4906, 944, 13]
+prompt split=train index=14 ids=[33963, 264, 799, 1284, 17834, 7044, 314, 15135, 19441, 45597, 4706, 13]
+prompt split=train index=15 ids=[3710, 1220, 264, 1156, 1716, 1518, 4162, 264, 1167, 16451, 44424, 27502, 30]
+prompt split=heldout index=0 ids=[72240, 264, 5902, 1581, 6618, 4238, 364, 264, 3043, 15464, 2680, 5286, 13]
+prompt split=heldout index=1 ids=[9930, 628, 264, 4557, 15196, 7042, 1345, 4581, 26370, 25710, 9766, 30]
+prompt split=heldout index=2 ids=[7734, 264, 2716, 9663, 883, 5132, 49219, 1973, 449, 6326, 6696, 13]
+prompt split=heldout index=3 ids=[814, 20139, 3069, 264, 1865, 1414, 9640, 716, 369, 2577, 1056, 1375, 2195, 17952, 3817, 27437]
+model_summary teacher_source=infer student_hidden=1024 student_layers=24 student_vocab=248320 student_model_elements=769809216 student_trainable_elements=638976 student_load_seconds=10.109288 teacher_load_seconds=2.336160
+eval_summary step=0 train_kl=1.510384544190e-5 heldout_kl=1.739055323924e-5 eval_seconds=7.923220
+train_step step=1 prompt_index=0 teacher_id=infer loss=1.595064168214e-5 rollout_len=29 step_seconds=11.919542
+phase_summary step=1 total=11.919541 student_rollout=6.681798 infer_forward_token_logits=0.005679 infer_sync=0.721850 d2d_bridge_import=0.000087 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.727621 student_forward=0.491862 kl_loss=0.020280 optimizer_zero_grad=0.000002 backward=3.957317 grad_clip=0.001219 optimizer_step=0.001621 post_step_cleanup=0.037803 teacher_seq_len=29 teacher_vocab=248320
+train_step step=2 prompt_index=1 teacher_id=infer loss=1.923706440721e-5 rollout_len=28 step_seconds=11.627472
+phase_summary step=2 total=11.627472 student_rollout=7.313231 infer_forward_token_logits=0.005690 infer_sync=0.555881 d2d_bridge_import=0.000634 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.562209 student_forward=0.460540 kl_loss=0.010399 optimizer_zero_grad=0.000027 backward=3.255593 grad_clip=0.000555 optimizer_step=0.000572 post_step_cleanup=0.024169 teacher_seq_len=28 teacher_vocab=248320
+train_step step=3 prompt_index=2 teacher_id=infer loss=1.641355811444e-5 rollout_len=27 step_seconds=9.776057
+phase_summary step=3 total=9.776057 student_rollout=5.690171 infer_forward_token_logits=0.005424 infer_sync=0.537274 d2d_bridge_import=0.000247 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.542949 student_forward=0.439394 kl_loss=0.009767 optimizer_zero_grad=0.000027 backward=3.067221 grad_clip=0.000521 optimizer_step=0.000889 post_step_cleanup=0.024683 teacher_seq_len=27 teacher_vocab=248320
+train_step step=4 prompt_index=3 teacher_id=infer loss=1.228358541994e-5 rollout_len=23 step_seconds=9.214341
+phase_summary step=4 total=9.214340 student_rollout=5.561921 infer_forward_token_logits=0.005584 infer_sync=0.624223 d2d_bridge_import=0.000084 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.629896 student_forward=0.374579 kl_loss=0.008664 optimizer_zero_grad=0.000030 backward=2.612164 grad_clip=0.000549 optimizer_step=0.000515 post_step_cleanup=0.025556 teacher_seq_len=23 teacher_vocab=248320
+train_step step=5 prompt_index=4 teacher_id=infer loss=1.767081084836e-5 rollout_len=29 step_seconds=10.838036
+phase_summary step=5 total=10.838036 student_rollout=6.504407 infer_forward_token_logits=0.005654 infer_sync=0.554606 d2d_bridge_import=0.000084 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.560348 student_forward=0.469363 kl_loss=0.010392 optimizer_zero_grad=0.000026 backward=3.267647 grad_clip=0.000532 optimizer_step=0.000913 post_step_cleanup=0.023843 teacher_seq_len=29 teacher_vocab=248320
+train_step step=6 prompt_index=5 teacher_id=infer loss=1.531561792945e-5 rollout_len=28 step_seconds=11.275802
+phase_summary step=6 total=11.275802 student_rollout=6.984782 infer_forward_token_logits=0.005625 infer_sync=0.619019 d2d_bridge_import=0.000640 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.625289 student_forward=0.452952 kl_loss=0.010239 optimizer_zero_grad=0.000028 backward=3.176974 grad_clip=0.000540 optimizer_step=0.000906 post_step_cleanup=0.023878 teacher_seq_len=28 teacher_vocab=248320
+train_step step=7 prompt_index=6 teacher_id=infer loss=1.899897324620e-5 rollout_len=27 step_seconds=11.082536
+phase_summary step=7 total=11.082536 student_rollout=6.803200 infer_forward_token_logits=0.005661 infer_sync=0.712895 d2d_bridge_import=0.000585 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.719144 student_forward=0.443185 kl_loss=0.009759 optimizer_zero_grad=0.000028 backward=3.081447 grad_clip=0.000530 optimizer_step=0.000881 post_step_cleanup=0.023902 teacher_seq_len=27 teacher_vocab=248320
+train_step step=8 prompt_index=7 teacher_id=infer loss=2.360975304327e-5 rollout_len=25 step_seconds=10.279559
+phase_summary step=8 total=10.279558 student_rollout=6.425281 infer_forward_token_logits=0.005462 infer_sync=0.569393 d2d_bridge_import=0.000086 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.574946 student_forward=0.410089 kl_loss=0.009076 optimizer_zero_grad=0.000025 backward=2.834926 grad_clip=0.000522 optimizer_step=0.000502 post_step_cleanup=0.023809 teacher_seq_len=25 teacher_vocab=248320
+train_step step=9 prompt_index=8 teacher_id=infer loss=1.370949303237e-5 rollout_len=29 step_seconds=11.140740
+phase_summary step=9 total=11.140739 student_rollout=6.637162 infer_forward_token_logits=0.005688 infer_sync=0.729638 d2d_bridge_import=0.000085 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.735415 student_forward=0.474340 kl_loss=0.010857 optimizer_zero_grad=0.000029 backward=3.256796 grad_clip=0.000575 optimizer_step=0.000892 post_step_cleanup=0.024274 teacher_seq_len=29 teacher_vocab=248320
+train_step step=10 prompt_index=9 teacher_id=infer loss=1.785611493688e-5 rollout_len=26 step_seconds=10.381169
+phase_summary step=10 total=10.381168 student_rollout=6.416810 infer_forward_token_logits=0.003501 infer_sync=0.570688 d2d_bridge_import=0.000073 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.574266 student_forward=0.420876 kl_loss=0.009657 optimizer_zero_grad=0.000025 backward=2.932830 grad_clip=0.000921 optimizer_step=0.000879 post_step_cleanup=0.024463 teacher_seq_len=26 teacher_vocab=248320
+train_step step=11 prompt_index=10 teacher_id=infer loss=1.591372165421e-5 rollout_len=29 step_seconds=11.747613
+phase_summary step=11 total=11.747613 student_rollout=7.441210 infer_forward_token_logits=0.005775 infer_sync=0.601552 d2d_bridge_import=0.000261 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.607594 student_forward=0.471121 kl_loss=0.010470 optimizer_zero_grad=0.000029 backward=3.190797 grad_clip=0.001130 optimizer_step=0.000906 post_step_cleanup=0.023887 teacher_seq_len=29 teacher_vocab=248320
+train_step step=12 prompt_index=11 teacher_id=infer loss=1.665344461799e-5 rollout_len=27 step_seconds=10.795195
+phase_summary step=12 total=10.795195 student_rollout=6.688485 infer_forward_token_logits=0.005616 infer_sync=0.572113 d2d_bridge_import=0.000080 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.577815 student_forward=0.436950 kl_loss=0.009770 optimizer_zero_grad=0.000022 backward=3.056732 grad_clip=0.000527 optimizer_step=0.000511 post_step_cleanup=0.023934 teacher_seq_len=27 teacher_vocab=248320
+train_step step=13 prompt_index=12 teacher_id=infer loss=1.691228862910e-5 rollout_len=30 step_seconds=11.457867
+phase_summary step=13 total=11.457867 student_rollout=6.858926 infer_forward_token_logits=0.005537 infer_sync=0.647579 d2d_bridge_import=0.000245 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.653366 student_forward=0.484640 kl_loss=0.022047 optimizer_zero_grad=0.000027 backward=3.411320 grad_clip=0.001045 optimizer_step=0.001681 post_step_cleanup=0.024372 teacher_seq_len=30 teacher_vocab=248320
+train_step step=14 prompt_index=13 teacher_id=infer loss=1.671728205110e-5 rollout_len=26 step_seconds=10.416162
+phase_summary step=14 total=10.416162 student_rollout=6.356567 infer_forward_token_logits=0.005643 infer_sync=0.636571 d2d_bridge_import=0.000588 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.642806 student_forward=0.420338 kl_loss=0.009333 optimizer_zero_grad=0.000025 backward=2.961228 grad_clip=0.000695 optimizer_step=0.000870 post_step_cleanup=0.023834 teacher_seq_len=26 teacher_vocab=248320
+train_step step=15 prompt_index=14 teacher_id=infer loss=1.619268550712e-5 rollout_len=28 step_seconds=11.516131
+phase_summary step=15 total=11.516131 student_rollout=7.125085 infer_forward_token_logits=0.005692 infer_sync=0.671663 d2d_bridge_import=0.000638 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.677999 student_forward=0.458902 kl_loss=0.010192 optimizer_zero_grad=0.000025 backward=3.217427 grad_clip=0.001158 optimizer_step=0.000910 post_step_cleanup=0.023988 teacher_seq_len=28 teacher_vocab=248320
+train_step step=16 prompt_index=15 teacher_id=infer loss=1.536513082101e-5 rollout_len=29 step_seconds=12.121149
+phase_summary step=16 total=12.121148 student_rollout=7.632372 infer_forward_token_logits=0.005697 infer_sync=0.660965 d2d_bridge_import=0.000240 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.666906 student_forward=0.476769 kl_loss=0.010500 optimizer_zero_grad=0.000027 backward=3.307217 grad_clip=0.001208 optimizer_step=0.001611 post_step_cleanup=0.024069 teacher_seq_len=29 teacher_vocab=248320
+train_step step=17 prompt_index=0 teacher_id=infer loss=1.588635859662e-5 rollout_len=29 step_seconds=11.919895
+phase_summary step=17 total=11.919895 student_rollout=7.564372 infer_forward_token_logits=0.005544 infer_sync=0.602780 d2d_bridge_import=0.000232 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.608561 student_forward=0.466124 kl_loss=0.010374 optimizer_zero_grad=0.000026 backward=3.244021 grad_clip=0.001136 optimizer_step=0.000903 post_step_cleanup=0.023910 teacher_seq_len=29 teacher_vocab=248320
+train_step step=18 prompt_index=1 teacher_id=infer loss=1.915078428283e-5 rollout_len=28 step_seconds=11.299541
+phase_summary step=18 total=11.299540 student_rollout=6.983553 infer_forward_token_logits=0.005679 infer_sync=0.646986 d2d_bridge_import=0.000235 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.652904 student_forward=0.461093 kl_loss=0.010132 optimizer_zero_grad=0.000026 backward=3.165613 grad_clip=0.000975 optimizer_step=0.000903 post_step_cleanup=0.023970 teacher_seq_len=28 teacher_vocab=248320
+train_step step=19 prompt_index=2 teacher_id=infer loss=1.636496563151e-5 rollout_len=27 step_seconds=11.253308
+phase_summary step=19 total=11.253308 student_rollout=7.050822 infer_forward_token_logits=0.005597 infer_sync=0.663083 d2d_bridge_import=0.000229 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.668913 student_forward=0.444494 kl_loss=0.009758 optimizer_zero_grad=0.000029 backward=3.052802 grad_clip=0.001145 optimizer_step=0.000880 post_step_cleanup=0.024064 teacher_seq_len=27 teacher_vocab=248320
+train_step step=20 prompt_index=3 teacher_id=infer loss=1.226688527822e-5 rollout_len=23 step_seconds=9.377849
+phase_summary step=20 total=9.377849 student_rollout=5.861364 infer_forward_token_logits=0.005388 infer_sync=0.542314 d2d_bridge_import=0.000043 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.547748 student_forward=0.373161 kl_loss=0.008345 optimizer_zero_grad=0.000025 backward=2.561972 grad_clip=0.000520 optimizer_step=0.000488 post_step_cleanup=0.023775 teacher_seq_len=23 teacher_vocab=248320
+train_step step=21 prompt_index=4 teacher_id=infer loss=1.679851629888e-5 rollout_len=29 step_seconds=10.800248
+phase_summary step=21 total=10.800248 student_rollout=6.455743 infer_forward_token_logits=0.005685 infer_sync=0.652396 d2d_bridge_import=0.000083 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.658170 student_forward=0.466181 kl_loss=0.010386 optimizer_zero_grad=0.000028 backward=3.184053 grad_clip=0.000525 optimizer_step=0.000884 post_step_cleanup=0.023846 teacher_seq_len=29 teacher_vocab=248320
+train_step step=22 prompt_index=5 teacher_id=infer loss=1.527989297756e-5 rollout_len=28 step_seconds=11.136973
+phase_summary step=22 total=11.136973 student_rollout=6.916121 infer_forward_token_logits=0.005676 infer_sync=0.574802 d2d_bridge_import=0.000636 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.581119 student_forward=0.450374 kl_loss=0.009927 optimizer_zero_grad=0.000027 backward=3.153474 grad_clip=0.000925 optimizer_step=0.000887 post_step_cleanup=0.023705 teacher_seq_len=28 teacher_vocab=248320
+train_step step=23 prompt_index=6 teacher_id=infer loss=1.894001252367e-5 rollout_len=27 step_seconds=11.003751
+phase_summary step=23 total=11.003750 student_rollout=6.967794 infer_forward_token_logits=0.005626 infer_sync=0.568795 d2d_bridge_import=0.000649 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.575074 student_forward=0.435127 kl_loss=0.009623 optimizer_zero_grad=0.000028 backward=2.990764 grad_clip=0.000527 optimizer_step=0.000516 post_step_cleanup=0.024010 teacher_seq_len=27 teacher_vocab=248320
+train_step step=24 prompt_index=7 teacher_id=infer loss=2.347678127990e-5 rollout_len=25 step_seconds=9.129994
+phase_summary step=24 total=9.129994 student_rollout=5.226899 infer_forward_token_logits=0.005573 infer_sync=0.660350 d2d_bridge_import=0.000074 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.666001 student_forward=0.409390 kl_loss=0.009031 optimizer_zero_grad=0.000029 backward=2.792892 grad_clip=0.000525 optimizer_step=0.000882 post_step_cleanup=0.023875 teacher_seq_len=25 teacher_vocab=248320
+train_step step=25 prompt_index=8 teacher_id=infer loss=1.368961420667e-5 rollout_len=29 step_seconds=11.771996
+phase_summary step=25 total=11.771996 student_rollout=7.429142 infer_forward_token_logits=0.005691 infer_sync=0.618901 d2d_bridge_import=0.000084 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.624679 student_forward=0.467563 kl_loss=0.010434 optimizer_zero_grad=0.000027 backward=3.214168 grad_clip=0.001156 optimizer_step=0.000950 post_step_cleanup=0.023674 teacher_seq_len=29 teacher_vocab=248320
+train_step step=26 prompt_index=9 teacher_id=infer loss=1.784378400771e-5 rollout_len=26 step_seconds=10.757086
+phase_summary step=26 total=10.757086 student_rollout=6.712753 infer_forward_token_logits=0.005821 infer_sync=0.694144 d2d_bridge_import=0.000078 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.700047 student_forward=0.419450 kl_loss=0.009239 optimizer_zero_grad=0.000025 backward=2.890377 grad_clip=0.000524 optimizer_step=0.000509 post_step_cleanup=0.023728 teacher_seq_len=26 teacher_vocab=248320
+train_step step=27 prompt_index=10 teacher_id=infer loss=1.584263554832e-5 rollout_len=29 step_seconds=10.800132
+phase_summary step=27 total=10.800132 student_rollout=6.526053 infer_forward_token_logits=0.005692 infer_sync=0.567750 d2d_bridge_import=0.000145 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.573590 student_forward=0.466824 kl_loss=0.010387 optimizer_zero_grad=0.000023 backward=3.197419 grad_clip=0.000907 optimizer_step=0.000936 post_step_cleanup=0.023639 teacher_seq_len=29 teacher_vocab=248320
+train_step step=28 prompt_index=11 teacher_id=infer loss=1.661790156504e-5 rollout_len=27 step_seconds=11.192400
+phase_summary step=28 total=11.192400 student_rollout=6.951725 infer_forward_token_logits=0.005617 infer_sync=0.703886 d2d_bridge_import=0.000059 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.709566 student_forward=0.443533 kl_loss=0.009694 optimizer_zero_grad=0.000023 backward=3.051704 grad_clip=0.001131 optimizer_step=0.000912 post_step_cleanup=0.023695 teacher_seq_len=27 teacher_vocab=248320
+train_step step=29 prompt_index=12 teacher_id=infer loss=1.688295924396e-5 rollout_len=30 step_seconds=12.424959
+phase_summary step=29 total=12.424959 student_rollout=7.748103 infer_forward_token_logits=0.005392 infer_sync=0.755775 d2d_bridge_import=0.000233 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.761406 student_forward=0.485134 kl_loss=0.010739 optimizer_zero_grad=0.000028 backward=3.392447 grad_clip=0.001159 optimizer_step=0.001600 post_step_cleanup=0.023899 teacher_seq_len=30 teacher_vocab=248320
+train_step step=30 prompt_index=13 teacher_id=infer loss=1.664595401962e-5 rollout_len=26 step_seconds=10.877016
+phase_summary step=30 total=10.877016 student_rollout=6.800104 infer_forward_token_logits=0.005586 infer_sync=0.621769 d2d_bridge_import=0.000591 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.627950 student_forward=0.428786 kl_loss=0.009413 optimizer_zero_grad=0.000020 backward=2.984826 grad_clip=0.001023 optimizer_step=0.000882 post_step_cleanup=0.023568 teacher_seq_len=26 teacher_vocab=248320
+train_step step=31 prompt_index=14 teacher_id=infer loss=1.612074265722e-5 rollout_len=28 step_seconds=11.372846
+phase_summary step=31 total=11.372845 student_rollout=7.163757 infer_forward_token_logits=0.005598 infer_sync=0.603694 d2d_bridge_import=0.000637 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.609933 student_forward=0.451561 kl_loss=0.010111 optimizer_zero_grad=0.000025 backward=3.112035 grad_clip=0.000521 optimizer_step=0.000519 post_step_cleanup=0.023905 teacher_seq_len=28 teacher_vocab=248320
+train_step step=32 prompt_index=15 teacher_id=infer loss=1.477630030422e-5 rollout_len=29 step_seconds=11.023695
+phase_summary step=32 total=11.023694 student_rollout=6.611956 infer_forward_token_logits=0.005719 infer_sync=0.597166 d2d_bridge_import=0.000239 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.603128 student_forward=0.476036 kl_loss=0.010503 optimizer_zero_grad=0.000029 backward=3.296554 grad_clip=0.000528 optimizer_step=0.000520 post_step_cleanup=0.024037 teacher_seq_len=29 teacher_vocab=248320
+train_step step=33 prompt_index=0 teacher_id=infer loss=1.877969953057e-5 rollout_len=29 step_seconds=11.101984
+phase_summary step=33 total=11.101984 student_rollout=6.654784 infer_forward_token_logits=0.005541 infer_sync=0.726408 d2d_bridge_import=0.000236 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.732188 student_forward=0.465989 kl_loss=0.010629 optimizer_zero_grad=0.000028 backward=3.212081 grad_clip=0.001127 optimizer_step=0.000911 post_step_cleanup=0.023757 teacher_seq_len=29 teacher_vocab=248320
+train_step step=34 prompt_index=1 teacher_id=infer loss=1.904840064526e-5 rollout_len=28 step_seconds=11.240332
+phase_summary step=34 total=11.240332 student_rollout=7.044506 infer_forward_token_logits=0.005892 infer_sync=0.614072 d2d_bridge_import=0.000233 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.620202 student_forward=0.451392 kl_loss=0.010002 optimizer_zero_grad=0.000027 backward=3.088498 grad_clip=0.000534 optimizer_step=0.000867 post_step_cleanup=0.023816 teacher_seq_len=28 teacher_vocab=248320
+train_step step=35 prompt_index=2 teacher_id=infer loss=1.632854036870e-5 rollout_len=27 step_seconds=10.882419
+phase_summary step=35 total=10.882419 student_rollout=6.757995 infer_forward_token_logits=0.005605 infer_sync=0.648036 d2d_bridge_import=0.000218 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.653863 student_forward=0.435261 kl_loss=0.009683 optimizer_zero_grad=0.000025 backward=3.000416 grad_clip=0.000523 optimizer_step=0.000528 post_step_cleanup=0.023664 teacher_seq_len=27 teacher_vocab=248320
+train_step step=36 prompt_index=3 teacher_id=infer loss=1.225729920407e-5 rollout_len=23 step_seconds=8.033266
+phase_summary step=36 total=8.033266 student_rollout=4.556481 infer_forward_token_logits=0.005306 infer_sync=0.514761 d2d_bridge_import=0.000079 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.520151 student_forward=0.372803 kl_loss=0.008352 optimizer_zero_grad=0.000030 backward=2.549885 grad_clip=0.000526 optimizer_step=0.000868 post_step_cleanup=0.023736 teacher_seq_len=23 teacher_vocab=248320
+train_step step=37 prompt_index=4 teacher_id=infer loss=1.676208376011e-5 rollout_len=29 step_seconds=11.651979
+phase_summary step=37 total=11.651979 student_rollout=7.201258 infer_forward_token_logits=0.005616 infer_sync=0.709467 d2d_bridge_import=0.000234 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.715322 student_forward=0.465325 kl_loss=0.010356 optimizer_zero_grad=0.000025 backward=3.233202 grad_clip=0.001144 optimizer_step=0.000953 post_step_cleanup=0.023947 teacher_seq_len=29 teacher_vocab=248320
+train_step step=38 prompt_index=5 teacher_id=infer loss=1.522984530311e-5 rollout_len=28 step_seconds=11.425332
+phase_summary step=38 total=11.425332 student_rollout=7.200480 infer_forward_token_logits=0.005770 infer_sync=0.639048 d2d_bridge_import=0.000632 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.645455 student_forward=0.451097 kl_loss=0.009985 optimizer_zero_grad=0.000025 backward=3.092669 grad_clip=0.000529 optimizer_step=0.000877 post_step_cleanup=0.023741 teacher_seq_len=28 teacher_vocab=248320
+train_step step=39 prompt_index=6 teacher_id=infer loss=1.887943290058e-5 rollout_len=27 step_seconds=10.866147
+phase_summary step=39 total=10.866147 student_rollout=6.752391 infer_forward_token_logits=0.005610 infer_sync=0.636209 d2d_bridge_import=0.000643 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.642467 student_forward=0.436810 kl_loss=0.009626 optimizer_zero_grad=0.000029 backward=2.999527 grad_clip=0.000515 optimizer_step=0.000543 post_step_cleanup=0.023768 teacher_seq_len=27 teacher_vocab=248320
+train_step step=40 prompt_index=7 teacher_id=infer loss=2.336210309295e-5 rollout_len=25 step_seconds=9.109185
+phase_summary step=40 total=9.109185 student_rollout=5.229496 infer_forward_token_logits=0.005416 infer_sync=0.670078 d2d_bridge_import=0.000092 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.675591 student_forward=0.403447 kl_loss=0.008970 optimizer_zero_grad=0.000031 backward=2.766242 grad_clip=0.000519 optimizer_step=0.000902 post_step_cleanup=0.023536 teacher_seq_len=25 teacher_vocab=248320
+train_step step=41 prompt_index=8 teacher_id=infer loss=1.368406265101e-5 rollout_len=29 step_seconds=11.781307
+phase_summary step=41 total=11.781307 student_rollout=7.411199 infer_forward_token_logits=0.005812 infer_sync=0.637055 d2d_bridge_import=0.000246 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.643118 student_forward=0.465994 kl_loss=0.010443 optimizer_zero_grad=0.000030 backward=3.224592 grad_clip=0.000921 optimizer_step=0.000875 post_step_cleanup=0.023683 teacher_seq_len=29 teacher_vocab=248320
+train_step step=42 prompt_index=9 teacher_id=infer loss=1.777774014045e-5 rollout_len=26 step_seconds=10.599335
+phase_summary step=42 total=10.599335 student_rollout=6.687170 infer_forward_token_logits=0.005562 infer_sync=0.537528 d2d_bridge_import=0.000079 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.543174 student_forward=0.421757 kl_loss=0.009235 optimizer_zero_grad=0.000026 backward=2.912122 grad_clip=0.000906 optimizer_step=0.000888 post_step_cleanup=0.023615 teacher_seq_len=26 teacher_vocab=248320
+train_step step=43 prompt_index=10 teacher_id=infer loss=1.581425931363e-5 rollout_len=29 step_seconds=11.781473
+phase_summary step=43 total=11.781473 student_rollout=7.365014 infer_forward_token_logits=0.005652 infer_sync=0.695394 d2d_bridge_import=0.000229 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.701279 student_forward=0.470174 kl_loss=0.010436 optimizer_zero_grad=0.000027 backward=3.208996 grad_clip=0.000524 optimizer_step=0.000884 post_step_cleanup=0.023750 teacher_seq_len=29 teacher_vocab=248320
+train_step step=44 prompt_index=11 teacher_id=infer loss=1.657096800045e-5 rollout_len=27 step_seconds=10.741565
+phase_summary step=44 total=10.741565 student_rollout=6.639164 infer_forward_token_logits=0.005614 infer_sync=0.610463 d2d_bridge_import=0.000083 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.616163 student_forward=0.436490 kl_loss=0.009752 optimizer_zero_grad=0.000021 backward=3.014582 grad_clip=0.000525 optimizer_step=0.000509 post_step_cleanup=0.023867 teacher_seq_len=27 teacher_vocab=248320
+train_step step=45 prompt_index=12 teacher_id=infer loss=1.681050162006e-5 rollout_len=30 step_seconds=11.461822
+phase_summary step=45 total=11.461821 student_rollout=6.838189 infer_forward_token_logits=0.005554 infer_sync=0.703457 d2d_bridge_import=0.000178 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.709192 student_forward=0.483177 kl_loss=0.010672 optimizer_zero_grad=0.000027 backward=3.393704 grad_clip=0.001167 optimizer_step=0.001688 post_step_cleanup=0.023572 teacher_seq_len=30 teacher_vocab=248320
+train_step step=46 prompt_index=13 teacher_id=infer loss=1.655585219851e-5 rollout_len=26 step_seconds=10.791849
+phase_summary step=46 total=10.791849 student_rollout=6.724634 infer_forward_token_logits=0.005577 infer_sync=0.698364 d2d_bridge_import=0.000587 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.704533 student_forward=0.420971 kl_loss=0.009374 optimizer_zero_grad=0.000023 backward=2.906221 grad_clip=0.001109 optimizer_step=0.000882 post_step_cleanup=0.023650 teacher_seq_len=26 teacher_vocab=248320
+train_step step=47 prompt_index=14 teacher_id=infer loss=1.606322257430e-5 rollout_len=28 step_seconds=11.438272
+phase_summary step=47 total=11.438272 student_rollout=7.162548 infer_forward_token_logits=0.005692 infer_sync=0.694606 d2d_bridge_import=0.000647 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.700950 student_forward=0.450641 kl_loss=0.010827 optimizer_zero_grad=0.000028 backward=3.088070 grad_clip=0.000519 optimizer_step=0.000527 post_step_cleanup=0.023715 teacher_seq_len=28 teacher_vocab=248320
+train_step step=48 prompt_index=15 teacher_id=infer loss=1.543077087263e-5 rollout_len=29 step_seconds=10.972338
+phase_summary step=48 total=10.972337 student_rollout=6.529735 infer_forward_token_logits=0.005715 infer_sync=0.697236 d2d_bridge_import=0.000228 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.703184 student_forward=0.466046 kl_loss=0.010441 optimizer_zero_grad=0.000028 backward=3.237544 grad_clip=0.000527 optimizer_step=0.000506 post_step_cleanup=0.023876 teacher_seq_len=29 teacher_vocab=248320
+train_step step=49 prompt_index=0 teacher_id=infer loss=1.871063795988e-5 rollout_len=29 step_seconds=11.054612
+phase_summary step=49 total=11.054612 student_rollout=6.667261 infer_forward_token_logits=0.005516 infer_sync=0.593836 d2d_bridge_import=0.000231 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.599588 student_forward=0.478936 kl_loss=0.010411 optimizer_zero_grad=0.000027 backward=3.271670 grad_clip=0.000557 optimizer_step=0.001589 post_step_cleanup=0.024110 teacher_seq_len=29 teacher_vocab=248320
+train_step step=50 prompt_index=1 teacher_id=infer loss=1.899325070553e-5 rollout_len=28 step_seconds=11.598909
+phase_summary step=50 total=11.598909 student_rollout=7.340740 infer_forward_token_logits=0.005655 infer_sync=0.665513 d2d_bridge_import=0.000232 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.671404 student_forward=0.451635 kl_loss=0.010041 optimizer_zero_grad=0.000026 backward=3.100097 grad_clip=0.000523 optimizer_step=0.000507 post_step_cleanup=0.023572 teacher_seq_len=28 teacher_vocab=248320
+eval_summary step=50 train_kl=1.504912705741e-5 heldout_kl=1.731940187710e-5 eval_seconds=7.821412
+train_step step=51 prompt_index=2 teacher_id=infer loss=1.630486985960e-5 rollout_len=27 step_seconds=9.647132
+phase_summary step=51 total=9.647132 student_rollout=5.558770 infer_forward_token_logits=0.005902 infer_sync=0.583636 d2d_bridge_import=0.000074 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.589617 student_forward=0.437453 kl_loss=0.009692 optimizer_zero_grad=0.000029 backward=3.025696 grad_clip=0.001130 optimizer_step=0.000912 post_step_cleanup=0.023770 teacher_seq_len=27 teacher_vocab=248320
+train_step step=52 prompt_index=3 teacher_id=infer loss=9.107663572649e-6 rollout_len=23 step_seconds=9.401626
+phase_summary step=52 total=9.401625 student_rollout=5.796455 infer_forward_token_logits=0.005511 infer_sync=0.637213 d2d_bridge_import=0.000068 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.642797 student_forward=0.373454 kl_loss=0.008334 optimizer_zero_grad=0.000028 backward=2.555191 grad_clip=0.000529 optimizer_step=0.000511 post_step_cleanup=0.023880 teacher_seq_len=23 teacher_vocab=248320
+train_step step=53 prompt_index=4 teacher_id=infer loss=1.672794678598e-5 rollout_len=29 step_seconds=10.824827
+phase_summary step=53 total=10.824827 student_rollout=6.495480 infer_forward_token_logits=0.005627 infer_sync=0.622017 d2d_bridge_import=0.000064 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.627713 student_forward=0.467767 kl_loss=0.010437 optimizer_zero_grad=0.000028 backward=3.197742 grad_clip=0.000528 optimizer_step=0.000919 post_step_cleanup=0.023767 teacher_seq_len=29 teacher_vocab=248320
+train_step step=54 prompt_index=5 teacher_id=infer loss=1.517460623290e-5 rollout_len=28 step_seconds=11.293236
+phase_summary step=54 total=11.293236 student_rollout=7.049779 infer_forward_token_logits=0.005708 infer_sync=0.623901 d2d_bridge_import=0.000632 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.630245 student_forward=0.451782 kl_loss=0.010121 optimizer_zero_grad=0.000026 backward=3.125066 grad_clip=0.001175 optimizer_step=0.000906 post_step_cleanup=0.023680 teacher_seq_len=28 teacher_vocab=248320
+train_step step=55 prompt_index=6 teacher_id=infer loss=1.879614137579e-5 rollout_len=27 step_seconds=11.051558
+phase_summary step=55 total=11.051557 student_rollout=6.857748 infer_forward_token_logits=0.005518 infer_sync=0.708602 d2d_bridge_import=0.000646 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.714770 student_forward=0.436753 kl_loss=0.009649 optimizer_zero_grad=0.000027 backward=3.006674 grad_clip=0.000984 optimizer_step=0.000910 post_step_cleanup=0.023587 teacher_seq_len=27 teacher_vocab=248320
+train_step step=56 prompt_index=7 teacher_id=infer loss=2.328773007321e-5 rollout_len=25 step_seconds=10.090638
+phase_summary step=56 total=10.090637 student_rollout=6.356626 infer_forward_token_logits=0.005576 infer_sync=0.530420 d2d_bridge_import=0.000597 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.536597 student_forward=0.404775 kl_loss=0.009128 optimizer_zero_grad=0.000027 backward=2.757845 grad_clip=0.000516 optimizer_step=0.000883 post_step_cleanup=0.023791 teacher_seq_len=25 teacher_vocab=248320
+train_step step=57 prompt_index=8 teacher_id=infer loss=1.368418907077e-5 rollout_len=29 step_seconds=11.761901
+phase_summary step=57 total=11.761901 student_rollout=7.399238 infer_forward_token_logits=0.005467 infer_sync=0.653839 d2d_bridge_import=0.000233 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.659544 student_forward=0.467831 kl_loss=0.010393 optimizer_zero_grad=0.000028 backward=3.198791 grad_clip=0.000920 optimizer_step=0.000907 post_step_cleanup=0.023768 teacher_seq_len=29 teacher_vocab=248320
+train_step step=58 prompt_index=9 teacher_id=infer loss=1.666774187470e-5 rollout_len=26 step_seconds=10.693420
+phase_summary step=58 total=10.693420 student_rollout=6.696638 infer_forward_token_logits=0.005439 infer_sync=0.546052 d2d_bridge_import=0.000051 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.551547 student_forward=0.421188 kl_loss=0.009328 optimizer_zero_grad=0.000029 backward=2.988349 grad_clip=0.001148 optimizer_step=0.000883 post_step_cleanup=0.023825 teacher_seq_len=26 teacher_vocab=248320
+train_step step=59 prompt_index=10 teacher_id=infer loss=1.571486063767e-5 rollout_len=29 step_seconds=11.817750
+phase_summary step=59 total=11.817750 student_rollout=7.401437 infer_forward_token_logits=0.005603 infer_sync=0.588623 d2d_bridge_import=0.000239 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.594470 student_forward=0.471444 kl_loss=0.010424 optimizer_zero_grad=0.000026 backward=3.314272 grad_clip=0.000549 optimizer_step=0.000914 post_step_cleanup=0.023736 teacher_seq_len=29 teacher_vocab=248320
+train_step step=60 prompt_index=11 teacher_id=infer loss=2.590362782939e-5 rollout_len=27 step_seconds=10.901356
+phase_summary step=60 total=10.901356 student_rollout=6.730712 infer_forward_token_logits=0.005638 infer_sync=0.616351 d2d_bridge_import=0.000090 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.622084 student_forward=0.437885 kl_loss=0.009734 optimizer_zero_grad=0.000022 backward=3.074885 grad_clip=0.000533 optimizer_step=0.000879 post_step_cleanup=0.024121 teacher_seq_len=27 teacher_vocab=248320
+train_step step=61 prompt_index=12 teacher_id=infer loss=1.676280407992e-5 rollout_len=30 step_seconds=12.509471
+phase_summary step=61 total=12.509471 student_rollout=7.844065 infer_forward_token_logits=0.005377 infer_sync=0.634211 d2d_bridge_import=0.000241 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.639834 student_forward=0.485192 kl_loss=0.011290 optimizer_zero_grad=0.000031 backward=3.502031 grad_clip=0.001181 optimizer_step=0.001599 post_step_cleanup=0.023780 teacher_seq_len=30 teacher_vocab=248320
+train_step step=62 prompt_index=13 teacher_id=infer loss=1.653504114074e-5 rollout_len=26 step_seconds=10.792009
+phase_summary step=62 total=10.792009 student_rollout=6.773267 infer_forward_token_logits=0.005576 infer_sync=0.534416 d2d_bridge_import=0.000589 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.540586 student_forward=0.424746 kl_loss=0.009273 optimizer_zero_grad=0.000027 backward=3.017379 grad_clip=0.001168 optimizer_step=0.000926 post_step_cleanup=0.024121 teacher_seq_len=26 teacher_vocab=248320
+train_step step=63 prompt_index=14 teacher_id=infer loss=1.598501876288e-5 rollout_len=28 step_seconds=11.573101
+phase_summary step=63 total=11.573101 student_rollout=7.204612 infer_forward_token_logits=0.005704 infer_sync=0.732462 d2d_bridge_import=0.000640 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.738810 student_forward=0.456720 kl_loss=0.010059 optimizer_zero_grad=0.000027 backward=3.136284 grad_clip=0.001156 optimizer_step=0.000882 post_step_cleanup=0.024078 teacher_seq_len=28 teacher_vocab=248320
+train_step step=64 prompt_index=15 teacher_id=infer loss=1.541849269415e-5 rollout_len=29 step_seconds=11.961968
+phase_summary step=64 total=11.961968 student_rollout=7.550686 infer_forward_token_logits=0.005636 infer_sync=0.629744 d2d_bridge_import=0.000252 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.635637 student_forward=0.471994 kl_loss=0.010529 optimizer_zero_grad=0.000025 backward=3.262784 grad_clip=0.000536 optimizer_step=0.000507 post_step_cleanup=0.028795 teacher_seq_len=29 teacher_vocab=248320
+train_step step=65 prompt_index=0 teacher_id=infer loss=1.864063779067e-5 rollout_len=29 step_seconds=11.223942
+phase_summary step=65 total=11.223942 student_rollout=6.678159 infer_forward_token_logits=0.005610 infer_sync=0.733015 d2d_bridge_import=0.000233 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.738863 student_forward=0.472877 kl_loss=0.010468 optimizer_zero_grad=0.000023 backward=3.296793 grad_clip=0.001161 optimizer_step=0.000944 post_step_cleanup=0.024155 teacher_seq_len=29 teacher_vocab=248320
+train_step step=66 prompt_index=1 teacher_id=infer loss=1.855535811046e-5 rollout_len=28 step_seconds=11.478585
+phase_summary step=66 total=11.478585 student_rollout=7.149268 infer_forward_token_logits=0.005928 infer_sync=0.625394 d2d_bridge_import=0.000253 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.631580 student_forward=0.462779 kl_loss=0.010549 optimizer_zero_grad=0.000025 backward=3.198625 grad_clip=0.000535 optimizer_step=0.000524 post_step_cleanup=0.024291 teacher_seq_len=28 teacher_vocab=248320
+train_step step=67 prompt_index=2 teacher_id=infer loss=1.626552329981e-5 rollout_len=27 step_seconds=10.216457
+phase_summary step=67 total=10.216457 student_rollout=6.017518 infer_forward_token_logits=0.005666 infer_sync=0.658118 d2d_bridge_import=0.000243 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.664032 student_forward=0.438101 kl_loss=0.009757 optimizer_zero_grad=0.000027 backward=3.060444 grad_clip=0.001139 optimizer_step=0.000893 post_step_cleanup=0.024040 teacher_seq_len=27 teacher_vocab=248320
+train_step step=68 prompt_index=3 teacher_id=infer loss=1.221933871420e-5 rollout_len=23 step_seconds=9.439909
+phase_summary step=68 total=9.439908 student_rollout=5.878458 infer_forward_token_logits=0.005597 infer_sync=0.525680 d2d_bridge_import=0.000084 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.531371 student_forward=0.384778 kl_loss=0.008646 optimizer_zero_grad=0.000023 backward=2.611294 grad_clip=0.000534 optimizer_step=0.000502 post_step_cleanup=0.023897 teacher_seq_len=23 teacher_vocab=248320
+train_step step=69 prompt_index=4 teacher_id=infer loss=1.668705772317e-5 rollout_len=29 step_seconds=11.042400
+phase_summary step=69 total=11.042400 student_rollout=6.600891 infer_forward_token_logits=0.005609 infer_sync=0.638219 d2d_bridge_import=0.000093 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.643926 student_forward=0.471208 kl_loss=0.010574 optimizer_zero_grad=0.000028 backward=3.290231 grad_clip=0.000528 optimizer_step=0.000525 post_step_cleanup=0.024023 teacher_seq_len=29 teacher_vocab=248320
+train_step step=70 prompt_index=5 teacher_id=infer loss=1.513122879260e-5 rollout_len=28 step_seconds=10.611395
+phase_summary step=70 total=10.611394 student_rollout=6.354040 infer_forward_token_logits=0.005691 infer_sync=0.625041 d2d_bridge_import=0.000666 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.631403 student_forward=0.460001 kl_loss=0.010141 optimizer_zero_grad=0.000026 backward=3.130323 grad_clip=0.000529 optimizer_step=0.000530 post_step_cleanup=0.023931 teacher_seq_len=28 teacher_vocab=248320
+train_step step=71 prompt_index=6 teacher_id=infer loss=1.876946043922e-5 rollout_len=27 step_seconds=10.016110
+phase_summary step=71 total=10.016110 student_rollout=5.936191 infer_forward_token_logits=0.005603 infer_sync=0.620551 d2d_bridge_import=0.000648 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.626807 student_forward=0.436815 kl_loss=0.009671 optimizer_zero_grad=0.000029 backward=2.981080 grad_clip=0.000530 optimizer_step=0.000520 post_step_cleanup=0.023976 teacher_seq_len=27 teacher_vocab=248320
+train_step step=72 prompt_index=7 teacher_id=infer loss=2.311123353138e-5 rollout_len=25 step_seconds=9.099867
+phase_summary step=72 total=9.099866 student_rollout=5.286778 infer_forward_token_logits=0.005486 infer_sync=0.618072 d2d_bridge_import=0.000057 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.623618 student_forward=0.406051 kl_loss=0.009026 optimizer_zero_grad=0.000025 backward=2.748162 grad_clip=0.000526 optimizer_step=0.000878 post_step_cleanup=0.024336 teacher_seq_len=25 teacher_vocab=248320
+train_step step=73 prompt_index=8 teacher_id=infer loss=1.366504784528e-5 rollout_len=29 step_seconds=11.813923
+phase_summary step=73 total=11.813923 student_rollout=7.419706 infer_forward_token_logits=0.005662 infer_sync=0.639547 d2d_bridge_import=0.000099 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.645313 student_forward=0.467502 kl_loss=0.010946 optimizer_zero_grad=0.000031 backward=3.244014 grad_clip=0.001137 optimizer_step=0.000913 post_step_cleanup=0.023837 teacher_seq_len=29 teacher_vocab=248320
+train_step step=74 prompt_index=9 teacher_id=infer loss=2.024131208600e-5 rollout_len=26 step_seconds=10.332104
+phase_summary step=74 total=10.332104 student_rollout=6.304100 infer_forward_token_logits=0.003374 infer_sync=0.701216 d2d_bridge_import=0.000072 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.704666 student_forward=0.421499 kl_loss=0.009290 optimizer_zero_grad=0.000026 backward=2.866218 grad_clip=0.001129 optimizer_step=0.000888 post_step_cleanup=0.023822 teacher_seq_len=26 teacher_vocab=248320
+train_step step=75 prompt_index=10 teacher_id=infer loss=1.566017999721e-5 rollout_len=29 step_seconds=11.860157
+phase_summary step=75 total=11.860156 student_rollout=7.439277 infer_forward_token_logits=0.005654 infer_sync=0.688194 d2d_bridge_import=0.000233 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.694086 student_forward=0.467612 kl_loss=0.010450 optimizer_zero_grad=0.000028 backward=3.221523 grad_clip=0.001145 optimizer_step=0.000875 post_step_cleanup=0.024818 teacher_seq_len=29 teacher_vocab=248320
+train_step step=76 prompt_index=11 teacher_id=infer loss=1.648571196711e-5 rollout_len=27 step_seconds=10.688043
+phase_summary step=76 total=10.688043 student_rollout=6.610745 infer_forward_token_logits=0.005589 infer_sync=0.637963 d2d_bridge_import=0.000230 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.643786 student_forward=0.437725 kl_loss=0.009978 optimizer_zero_grad=0.000024 backward=2.960818 grad_clip=0.000522 optimizer_step=0.000496 post_step_cleanup=0.023739 teacher_seq_len=27 teacher_vocab=248320
+train_step step=77 prompt_index=12 teacher_id=infer loss=1.671352038102e-5 rollout_len=30 step_seconds=11.820204
+phase_summary step=77 total=11.820204 student_rollout=7.405405 infer_forward_token_logits=0.005565 infer_sync=0.578655 d2d_bridge_import=0.000239 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.584464 student_forward=0.483400 kl_loss=0.010683 optimizer_zero_grad=0.000028 backward=3.309704 grad_clip=0.000558 optimizer_step=0.000989 post_step_cleanup=0.024526 teacher_seq_len=30 teacher_vocab=248320
+train_step step=78 prompt_index=13 teacher_id=infer loss=1.648317447689e-5 rollout_len=26 step_seconds=10.255301
+phase_summary step=78 total=10.255301 student_rollout=6.326505 infer_forward_token_logits=0.005629 infer_sync=0.560932 d2d_bridge_import=0.000590 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.567156 student_forward=0.420637 kl_loss=0.009360 optimizer_zero_grad=0.000026 backward=2.905205 grad_clip=0.001126 optimizer_step=0.000907 post_step_cleanup=0.023885 teacher_seq_len=26 teacher_vocab=248320
+train_step step=79 prompt_index=14 teacher_id=infer loss=1.594903915247e-5 rollout_len=28 step_seconds=11.293700
+phase_summary step=79 total=11.293700 student_rollout=7.117290 infer_forward_token_logits=0.005615 infer_sync=0.543154 d2d_bridge_import=0.000636 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.549410 student_forward=0.451033 kl_loss=0.010058 optimizer_zero_grad=0.000025 backward=3.140363 grad_clip=0.000533 optimizer_step=0.000520 post_step_cleanup=0.023996 teacher_seq_len=28 teacher_vocab=248320
+train_step step=80 prompt_index=15 teacher_id=infer loss=1.469432118029e-5 rollout_len=29 step_seconds=10.908665
+phase_summary step=80 total=10.908664 student_rollout=6.464311 infer_forward_token_logits=0.005627 infer_sync=0.711446 d2d_bridge_import=0.000242 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.717319 student_forward=0.468258 kl_loss=0.010415 optimizer_zero_grad=0.000029 backward=3.222727 grad_clip=0.000527 optimizer_step=0.000520 post_step_cleanup=0.024081 teacher_seq_len=29 teacher_vocab=248320
+train_step step=81 prompt_index=0 teacher_id=infer loss=1.854111178545e-5 rollout_len=29 step_seconds=10.974346
+phase_summary step=81 total=10.974346 student_rollout=6.565778 infer_forward_token_logits=0.005709 infer_sync=0.699376 d2d_bridge_import=0.000247 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.705337 student_forward=0.468401 kl_loss=0.010361 optimizer_zero_grad=0.000026 backward=3.198341 grad_clip=0.001132 optimizer_step=0.000910 post_step_cleanup=0.023603 teacher_seq_len=29 teacher_vocab=248320
+train_step step=82 prompt_index=1 teacher_id=infer loss=1.847113890108e-5 rollout_len=28 step_seconds=11.501375
+phase_summary step=82 total=11.501374 student_rollout=7.281996 infer_forward_token_logits=0.005664 infer_sync=0.596137 d2d_bridge_import=0.000203 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.602008 student_forward=0.452361 kl_loss=0.010063 optimizer_zero_grad=0.000024 backward=3.129291 grad_clip=0.000537 optimizer_step=0.000891 post_step_cleanup=0.023743 teacher_seq_len=28 teacher_vocab=248320
+train_step step=83 prompt_index=2 teacher_id=infer loss=1.623614298296e-5 rollout_len=27 step_seconds=10.766439
+phase_summary step=83 total=10.766439 student_rollout=6.772898 infer_forward_token_logits=0.005632 infer_sync=0.587037 d2d_bridge_import=0.000168 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.592841 student_forward=0.437243 kl_loss=0.009651 optimizer_zero_grad=0.000027 backward=2.928046 grad_clip=0.000528 optimizer_step=0.000511 post_step_cleanup=0.024238 teacher_seq_len=27 teacher_vocab=248320
+train_step step=84 prompt_index=3 teacher_id=infer loss=9.093512744585e-6 rollout_len=23 step_seconds=8.139939
+phase_summary step=84 total=8.139938 student_rollout=4.544623 infer_forward_token_logits=0.005469 infer_sync=0.587691 d2d_bridge_import=0.000062 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.593227 student_forward=0.372688 kl_loss=0.008343 optimizer_zero_grad=0.000029 backward=2.595138 grad_clip=0.000524 optimizer_step=0.000851 post_step_cleanup=0.024001 teacher_seq_len=23 teacher_vocab=248320
+train_step step=85 prompt_index=4 teacher_id=infer loss=1.666439675319e-5 rollout_len=29 step_seconds=11.650537
+phase_summary step=85 total=11.650536 student_rollout=7.316177 infer_forward_token_logits=0.005545 infer_sync=0.558069 d2d_bridge_import=0.000238 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.563855 student_forward=0.467436 kl_loss=0.010417 optimizer_zero_grad=0.000027 backward=3.265407 grad_clip=0.000883 optimizer_step=0.000876 post_step_cleanup=0.025240 teacher_seq_len=29 teacher_vocab=248320
+train_step step=86 prompt_index=5 teacher_id=infer loss=1.506195349066e-5 rollout_len=28 step_seconds=11.265961
+phase_summary step=86 total=11.265960 student_rollout=6.942768 infer_forward_token_logits=0.005666 infer_sync=0.657417 d2d_bridge_import=0.000640 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.663728 student_forward=0.457595 kl_loss=0.010052 optimizer_zero_grad=0.000026 backward=3.165119 grad_clip=0.001136 optimizer_step=0.000905 post_step_cleanup=0.024040 teacher_seq_len=28 teacher_vocab=248320
+train_step step=87 prompt_index=6 teacher_id=infer loss=1.865164995252e-5 rollout_len=27 step_seconds=11.015188
+phase_summary step=87 total=11.015187 student_rollout=6.973625 infer_forward_token_logits=0.005616 infer_sync=0.556823 d2d_bridge_import=0.000640 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.563084 student_forward=0.437288 kl_loss=0.009729 optimizer_zero_grad=0.000025 backward=3.006209 grad_clip=0.000521 optimizer_step=0.000501 post_step_cleanup=0.023732 teacher_seq_len=27 teacher_vocab=248320
+train_step step=88 prompt_index=7 teacher_id=infer loss=2.301705717400e-5 rollout_len=25 step_seconds=8.916744
+phase_summary step=88 total=8.916744 student_rollout=4.998550 infer_forward_token_logits=0.005534 infer_sync=0.646079 d2d_bridge_import=0.000082 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.651699 student_forward=0.408687 kl_loss=0.009191 optimizer_zero_grad=0.000030 backward=2.823050 grad_clip=0.000531 optimizer_step=0.000915 post_step_cleanup=0.023660 teacher_seq_len=25 teacher_vocab=248320
+train_step step=89 prompt_index=8 teacher_id=infer loss=1.366111428069e-5 rollout_len=29 step_seconds=11.692642
+phase_summary step=89 total=11.692641 student_rollout=7.398849 infer_forward_token_logits=0.005635 infer_sync=0.617093 d2d_bridge_import=0.000089 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.622821 student_forward=0.471400 kl_loss=0.010406 optimizer_zero_grad=0.000028 backward=3.163943 grad_clip=0.000518 optimizer_step=0.000497 post_step_cleanup=0.023712 teacher_seq_len=29 teacher_vocab=248320
+train_step step=90 prompt_index=9 teacher_id=infer loss=2.015608333750e-5 rollout_len=26 step_seconds=9.682532
+phase_summary step=90 total=9.682532 student_rollout=5.645548 infer_forward_token_logits=0.005548 infer_sync=0.640105 d2d_bridge_import=0.000075 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.645733 student_forward=0.421752 kl_loss=0.009321 optimizer_zero_grad=0.000021 backward=2.933937 grad_clip=0.001125 optimizer_step=0.000899 post_step_cleanup=0.023717 teacher_seq_len=26 teacher_vocab=248320
+train_step step=91 prompt_index=10 teacher_id=infer loss=1.561528915772e-5 rollout_len=29 step_seconds=11.759225
+phase_summary step=91 total=11.759224 student_rollout=7.360529 infer_forward_token_logits=0.005585 infer_sync=0.669533 d2d_bridge_import=0.000223 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.675344 student_forward=0.467095 kl_loss=0.010488 optimizer_zero_grad=0.000025 backward=3.220206 grad_clip=0.000540 optimizer_step=0.000873 post_step_cleanup=0.023671 teacher_seq_len=29 teacher_vocab=248320
+train_step step=92 prompt_index=11 teacher_id=infer loss=1.642644201638e-5 rollout_len=27 step_seconds=10.746822
+phase_summary step=92 total=10.746822 student_rollout=6.677203 infer_forward_token_logits=0.005565 infer_sync=0.571630 d2d_bridge_import=0.000169 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.577367 student_forward=0.435920 kl_loss=0.009779 optimizer_zero_grad=0.000023 backward=3.021354 grad_clip=0.000533 optimizer_step=0.000508 post_step_cleanup=0.023699 teacher_seq_len=27 teacher_vocab=248320
+train_step step=93 prompt_index=12 teacher_id=infer loss=1.665627678449e-5 rollout_len=30 step_seconds=11.434285
+phase_summary step=93 total=11.434285 student_rollout=6.819164 infer_forward_token_logits=0.005552 infer_sync=0.712262 d2d_bridge_import=0.000649 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.718469 student_forward=0.482609 kl_loss=0.010688 optimizer_zero_grad=0.000029 backward=3.376468 grad_clip=0.001108 optimizer_step=0.001591 post_step_cleanup=0.023707 teacher_seq_len=30 teacher_vocab=248320
+train_step step=94 prompt_index=13 teacher_id=infer loss=1.641224662308e-5 rollout_len=26 step_seconds=10.590027
+phase_summary step=94 total=10.590027 student_rollout=6.722756 infer_forward_token_logits=0.005644 infer_sync=0.521255 d2d_bridge_import=0.000584 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.527487 student_forward=0.422355 kl_loss=0.009406 optimizer_zero_grad=0.000028 backward=2.882856 grad_clip=0.000528 optimizer_step=0.000508 post_step_cleanup=0.023646 teacher_seq_len=26 teacher_vocab=248320
+train_step step=95 prompt_index=14 teacher_id=infer loss=1.586077087268e-5 rollout_len=28 step_seconds=10.310424
+phase_summary step=95 total=10.310424 student_rollout=6.004782 infer_forward_token_logits=0.005540 infer_sync=0.681116 d2d_bridge_import=0.000235 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.686895 student_forward=0.452312 kl_loss=0.010008 optimizer_zero_grad=0.000027 backward=3.130805 grad_clip=0.000533 optimizer_step=0.000894 post_step_cleanup=0.023770 teacher_seq_len=28 teacher_vocab=248320
+train_step step=96 prompt_index=15 teacher_id=infer loss=1.536634226795e-5 rollout_len=29 step_seconds=11.692969
+phase_summary step=96 total=11.692968 student_rollout=7.330917 infer_forward_token_logits=0.005965 infer_sync=0.648812 d2d_bridge_import=0.000229 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.655009 student_forward=0.466305 kl_loss=0.010460 optimizer_zero_grad=0.000027 backward=3.205092 grad_clip=0.000528 optimizer_step=0.000515 post_step_cleanup=0.023799 teacher_seq_len=29 teacher_vocab=248320
+train_step step=97 prompt_index=0 teacher_id=infer loss=1.851005981734e-5 rollout_len=29 step_seconds=11.060707
+phase_summary step=97 total=11.060707 student_rollout=6.578445 infer_forward_token_logits=0.005568 infer_sync=0.707012 d2d_bridge_import=0.000242 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.712827 student_forward=0.467911 kl_loss=0.010472 optimizer_zero_grad=0.000028 backward=3.265008 grad_clip=0.000920 optimizer_step=0.000896 post_step_cleanup=0.023793 teacher_seq_len=29 teacher_vocab=248320
+train_step step=98 prompt_index=1 teacher_id=infer loss=1.835906186898e-5 rollout_len=28 step_seconds=11.209496
+phase_summary step=98 total=11.209496 student_rollout=6.921120 infer_forward_token_logits=0.005615 infer_sync=0.682703 d2d_bridge_import=0.000212 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.688534 student_forward=0.451177 kl_loss=0.009991 optimizer_zero_grad=0.000028 backward=3.108170 grad_clip=0.000526 optimizer_step=0.000874 post_step_cleanup=0.028604 teacher_seq_len=28 teacher_vocab=248320
+train_step step=99 prompt_index=2 teacher_id=infer loss=1.618503665668e-5 rollout_len=27 step_seconds=11.075253
+phase_summary step=99 total=11.075253 student_rollout=6.928819 infer_forward_token_logits=0.005548 infer_sync=0.649150 d2d_bridge_import=0.000183 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.654885 student_forward=0.436765 kl_loss=0.009670 optimizer_zero_grad=0.000028 backward=3.019805 grad_clip=0.000521 optimizer_step=0.000518 post_step_cleanup=0.023750 teacher_seq_len=27 teacher_vocab=248320
+train_step step=100 prompt_index=3 teacher_id=infer loss=1.218067700393e-5 rollout_len=23 step_seconds=8.299292
+phase_summary step=100 total=8.299291 student_rollout=4.636229 infer_forward_token_logits=0.005432 infer_sync=0.603631 d2d_bridge_import=0.000092 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.609161 student_forward=0.381436 kl_loss=0.008456 optimizer_zero_grad=0.000027 backward=2.637920 grad_clip=0.000539 optimizer_step=0.000878 post_step_cleanup=0.024177 teacher_seq_len=23 teacher_vocab=248320
+eval_summary step=100 train_kl=1.500015440570e-5 heldout_kl=1.724250546431e-5 eval_seconds=7.889213
+train_step step=101 prompt_index=4 teacher_id=infer loss=1.662356589804e-5 rollout_len=29 step_seconds=10.046075
+phase_summary step=101 total=10.046075 student_rollout=5.637110 infer_forward_token_logits=0.005648 infer_sync=0.671066 d2d_bridge_import=0.000087 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.676806 student_forward=0.468280 kl_loss=0.010417 optimizer_zero_grad=0.000030 backward=3.227692 grad_clip=0.001155 optimizer_step=0.000912 post_step_cleanup=0.023631 teacher_seq_len=29 teacher_vocab=248320
+train_step step=102 prompt_index=5 teacher_id=infer loss=1.503740622866e-5 rollout_len=28 step_seconds=11.449355
+phase_summary step=102 total=11.449354 student_rollout=7.271697 infer_forward_token_logits=0.005724 infer_sync=0.602545 d2d_bridge_import=0.000224 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.608497 student_forward=0.451081 kl_loss=0.010023 optimizer_zero_grad=0.000022 backward=3.082450 grad_clip=0.000525 optimizer_step=0.000895 post_step_cleanup=0.023688 teacher_seq_len=28 teacher_vocab=248320
+train_step step=103 prompt_index=6 teacher_id=infer loss=1.862152203103e-5 rollout_len=27 step_seconds=10.900578
+phase_summary step=103 total=10.900578 student_rollout=6.721086 infer_forward_token_logits=0.005608 infer_sync=0.685519 d2d_bridge_import=0.000648 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.691778 student_forward=0.435364 kl_loss=0.010266 optimizer_zero_grad=0.000031 backward=3.017103 grad_clip=0.000529 optimizer_step=0.000514 post_step_cleanup=0.023832 teacher_seq_len=27 teacher_vocab=248320
+train_step step=104 prompt_index=7 teacher_id=infer loss=2.282619425387e-5 rollout_len=25 step_seconds=9.181596
+phase_summary step=104 total=9.181596 student_rollout=5.268083 infer_forward_token_logits=0.005446 infer_sync=0.609812 d2d_bridge_import=0.000063 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.615325 student_forward=0.405764 kl_loss=0.009024 optimizer_zero_grad=0.000028 backward=2.857273 grad_clip=0.001121 optimizer_step=0.000889 post_step_cleanup=0.023734 teacher_seq_len=25 teacher_vocab=248320
+train_step step=105 prompt_index=8 teacher_id=infer loss=1.377348053211e-5 rollout_len=29 step_seconds=11.854956
+phase_summary step=105 total=11.854955 student_rollout=7.452314 infer_forward_token_logits=0.005629 infer_sync=0.694665 d2d_bridge_import=0.000075 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.700374 student_forward=0.465775 kl_loss=0.010383 optimizer_zero_grad=0.000029 backward=3.200362 grad_clip=0.000525 optimizer_step=0.000901 post_step_cleanup=0.023838 teacher_seq_len=29 teacher_vocab=248320
+train_step step=106 prompt_index=9 teacher_id=infer loss=2.005870737776e-5 rollout_len=26 step_seconds=10.207312
+phase_summary step=106 total=10.207311 student_rollout=6.308651 infer_forward_token_logits=0.005786 infer_sync=0.538559 d2d_bridge_import=0.000076 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.544425 student_forward=0.420463 kl_loss=0.009284 optimizer_zero_grad=0.000026 backward=2.898853 grad_clip=0.000529 optimizer_step=0.000896 post_step_cleanup=0.023712 teacher_seq_len=26 teacher_vocab=248320
+train_step step=107 prompt_index=10 teacher_id=infer loss=1.555065318826e-5 rollout_len=29 step_seconds=11.805676
+phase_summary step=107 total=11.805675 student_rollout=7.419222 infer_forward_token_logits=0.005619 infer_sync=0.662757 d2d_bridge_import=0.000228 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.668609 student_forward=0.465539 kl_loss=0.010441 optimizer_zero_grad=0.000028 backward=3.215602 grad_clip=0.001122 optimizer_step=0.000885 post_step_cleanup=0.023771 teacher_seq_len=29 teacher_vocab=248320
+train_step step=108 prompt_index=11 teacher_id=infer loss=2.550275166868e-5 rollout_len=27 step_seconds=11.139497
+phase_summary step=108 total=11.139497 student_rollout=6.985551 infer_forward_token_logits=0.005111 infer_sync=0.657962 d2d_bridge_import=0.000089 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.663166 student_forward=0.436641 kl_loss=0.009634 optimizer_zero_grad=0.000025 backward=3.018355 grad_clip=0.001125 optimizer_step=0.000910 post_step_cleanup=0.023638 teacher_seq_len=27 teacher_vocab=248320
+train_step step=109 prompt_index=12 teacher_id=infer loss=1.661930036789e-5 rollout_len=30 step_seconds=12.198860
+phase_summary step=109 total=12.198860 student_rollout=7.741750 infer_forward_token_logits=0.005301 infer_sync=0.605051 d2d_bridge_import=0.000243 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.610600 student_forward=0.483656 kl_loss=0.010980 optimizer_zero_grad=0.000029 backward=3.326400 grad_clip=0.000525 optimizer_step=0.000740 post_step_cleanup=0.023721 teacher_seq_len=30 teacher_vocab=248320
+train_step step=110 prompt_index=13 teacher_id=infer loss=1.638603680476e-5 rollout_len=26 step_seconds=9.245862
+phase_summary step=110 total=9.245862 student_rollout=5.357639 infer_forward_token_logits=0.005549 infer_sync=0.525989 d2d_bridge_import=0.000586 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.532130 student_forward=0.420042 kl_loss=0.009299 optimizer_zero_grad=0.000024 backward=2.901031 grad_clip=0.000527 optimizer_step=0.000886 post_step_cleanup=0.023817 teacher_seq_len=26 teacher_vocab=248320
+train_step step=111 prompt_index=14 teacher_id=infer loss=1.577174771228e-5 rollout_len=28 step_seconds=11.455110
+phase_summary step=111 total=11.455109 student_rollout=7.136714 infer_forward_token_logits=0.005581 infer_sync=0.728816 d2d_bridge_import=0.000637 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.735039 student_forward=0.452162 kl_loss=0.010942 optimizer_zero_grad=0.000030 backward=3.095142 grad_clip=0.000526 optimizer_step=0.000501 post_step_cleanup=0.023660 teacher_seq_len=28 teacher_vocab=248320
+train_step step=112 prompt_index=15 teacher_id=infer loss=1.532738679089e-5 rollout_len=29 step_seconds=10.901954
+phase_summary step=112 total=10.901954 student_rollout=6.556499 infer_forward_token_logits=0.005698 infer_sync=0.656423 d2d_bridge_import=0.000258 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.662385 student_forward=0.465970 kl_loss=0.010416 optimizer_zero_grad=0.000028 backward=3.180909 grad_clip=0.000538 optimizer_step=0.000518 post_step_cleanup=0.024235 teacher_seq_len=29 teacher_vocab=248320
+train_step step=113 prompt_index=0 teacher_id=infer loss=1.843290738179e-5 rollout_len=29 step_seconds=11.033013
+phase_summary step=113 total=11.033012 student_rollout=6.577813 infer_forward_token_logits=0.005478 infer_sync=0.735594 d2d_bridge_import=0.000235 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.741312 student_forward=0.466345 kl_loss=0.010320 optimizer_zero_grad=0.000027 backward=3.211503 grad_clip=0.000885 optimizer_step=0.000909 post_step_cleanup=0.023638 teacher_seq_len=29 teacher_vocab=248320
+train_step step=114 prompt_index=1 teacher_id=infer loss=1.827600863180e-5 rollout_len=28 step_seconds=11.443720
+phase_summary step=114 total=11.443719 student_rollout=7.241813 infer_forward_token_logits=0.005690 infer_sync=0.629839 d2d_bridge_import=0.000225 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.635759 student_forward=0.453340 kl_loss=0.010044 optimizer_zero_grad=0.000025 backward=3.077066 grad_clip=0.000528 optimizer_step=0.000868 post_step_cleanup=0.023820 teacher_seq_len=28 teacher_vocab=248320
+train_step step=115 prompt_index=2 teacher_id=infer loss=1.617871384951e-5 rollout_len=27 step_seconds=10.896078
+phase_summary step=115 total=10.896078 student_rollout=6.745319 infer_forward_token_logits=0.005616 infer_sync=0.673570 d2d_bridge_import=0.000242 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.679433 student_forward=0.441608 kl_loss=0.009687 optimizer_zero_grad=0.000030 backward=2.994652 grad_clip=0.000519 optimizer_step=0.000525 post_step_cleanup=0.023843 teacher_seq_len=27 teacher_vocab=248320
+train_step step=116 prompt_index=3 teacher_id=infer loss=1.218176203110e-5 rollout_len=23 step_seconds=8.080865
+phase_summary step=116 total=8.080865 student_rollout=4.580954 infer_forward_token_logits=0.005285 infer_sync=0.476860 d2d_bridge_import=0.000089 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.482239 student_forward=0.374209 kl_loss=0.008560 optimizer_zero_grad=0.000027 backward=2.609417 grad_clip=0.000524 optimizer_step=0.000879 post_step_cleanup=0.023801 teacher_seq_len=23 teacher_vocab=248320
+train_step step=117 prompt_index=4 teacher_id=infer loss=1.656349741097e-5 rollout_len=29 step_seconds=11.787796
+phase_summary step=117 total=11.787795 student_rollout=7.376767 infer_forward_token_logits=0.005501 infer_sync=0.673941 d2d_bridge_import=0.000248 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.679695 student_forward=0.467296 kl_loss=0.011067 optimizer_zero_grad=0.000024 backward=3.227446 grad_clip=0.000533 optimizer_step=0.000892 post_step_cleanup=0.023720 teacher_seq_len=29 teacher_vocab=248320
+train_step step=118 prompt_index=5 teacher_id=infer loss=1.496777804277e-5 rollout_len=28 step_seconds=11.296270
+phase_summary step=118 total=11.296270 student_rollout=6.930936 infer_forward_token_logits=0.005621 infer_sync=0.715060 d2d_bridge_import=0.000642 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.721327 student_forward=0.453331 kl_loss=0.010088 optimizer_zero_grad=0.000025 backward=3.148440 grad_clip=0.000538 optimizer_step=0.000886 post_step_cleanup=0.030243 teacher_seq_len=28 teacher_vocab=248320
+train_step step=119 prompt_index=6 teacher_id=infer loss=1.848771353252e-5 rollout_len=27 step_seconds=10.797248
+phase_summary step=119 total=10.797248 student_rollout=6.740897 infer_forward_token_logits=0.005587 infer_sync=0.595282 d2d_bridge_import=0.000648 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.601520 student_forward=0.438137 kl_loss=0.009630 optimizer_zero_grad=0.000027 backward=2.981635 grad_clip=0.000526 optimizer_step=0.000501 post_step_cleanup=0.023967 teacher_seq_len=27 teacher_vocab=248320
+train_step step=120 prompt_index=7 teacher_id=infer loss=2.267892523378e-5 rollout_len=25 step_seconds=9.156586
+phase_summary step=120 total=9.156586 student_rollout=5.241029 infer_forward_token_logits=0.005378 infer_sync=0.661483 d2d_bridge_import=0.000087 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.666953 student_forward=0.403328 kl_loss=0.008958 optimizer_zero_grad=0.000025 backward=2.810202 grad_clip=0.000887 optimizer_step=0.000921 post_step_cleanup=0.023821 teacher_seq_len=25 teacher_vocab=248320
+train_step step=121 prompt_index=8 teacher_id=infer loss=1.376426644129e-5 rollout_len=29 step_seconds=11.727690
+phase_summary step=121 total=11.727690 student_rollout=7.442390 infer_forward_token_logits=0.005734 infer_sync=0.563568 d2d_bridge_import=0.000080 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.569385 student_forward=0.467562 kl_loss=0.010522 optimizer_zero_grad=0.000025 backward=3.211517 grad_clip=0.001138 optimizer_step=0.000911 post_step_cleanup=0.023807 teacher_seq_len=29 teacher_vocab=248320
+train_step step=122 prompt_index=9 teacher_id=infer loss=1.993663499888e-5 rollout_len=26 step_seconds=10.826582
+phase_summary step=122 total=10.826582 student_rollout=6.743233 infer_forward_token_logits=0.005597 infer_sync=0.684159 d2d_bridge_import=0.000081 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.689842 student_forward=0.424058 kl_loss=0.009336 optimizer_zero_grad=0.000026 backward=2.934487 grad_clip=0.000530 optimizer_step=0.000515 post_step_cleanup=0.024091 teacher_seq_len=26 teacher_vocab=248320
+train_step step=123 prompt_index=10 teacher_id=infer loss=1.545704253658e-5 rollout_len=29 step_seconds=10.991028
+phase_summary step=123 total=10.991028 student_rollout=6.644843 infer_forward_token_logits=0.005634 infer_sync=0.599974 d2d_bridge_import=0.000239 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.605850 student_forward=0.472426 kl_loss=0.010428 optimizer_zero_grad=0.000025 backward=3.231903 grad_clip=0.000530 optimizer_step=0.000911 post_step_cleanup=0.023881 teacher_seq_len=29 teacher_vocab=248320
+train_step step=124 prompt_index=11 teacher_id=infer loss=2.529046469135e-5 rollout_len=27 step_seconds=10.711362
+phase_summary step=124 total=10.711362 student_rollout=6.693078 infer_forward_token_logits=0.005610 infer_sync=0.535225 d2d_bridge_import=0.000084 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.540924 student_forward=0.435960 kl_loss=0.009650 optimizer_zero_grad=0.000027 backward=3.006298 grad_clip=0.000523 optimizer_step=0.000500 post_step_cleanup=0.023902 teacher_seq_len=27 teacher_vocab=248320
+train_step step=125 prompt_index=12 teacher_id=infer loss=1.656701351749e-5 rollout_len=30 step_seconds=11.235693
+phase_summary step=125 total=11.235693 student_rollout=6.686871 infer_forward_token_logits=0.005470 infer_sync=0.661525 d2d_bridge_import=0.000248 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.667248 student_forward=0.485065 kl_loss=0.010683 optimizer_zero_grad=0.000031 backward=3.359753 grad_clip=0.000538 optimizer_step=0.000593 post_step_cleanup=0.024433 teacher_seq_len=30 teacher_vocab=248320
+train_step step=126 prompt_index=13 teacher_id=infer loss=1.633315878280e-5 rollout_len=26 step_seconds=9.626930
+phase_summary step=126 total=9.626929 student_rollout=5.695454 infer_forward_token_logits=0.005657 infer_sync=0.561764 d2d_bridge_import=0.000585 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.568011 student_forward=0.421410 kl_loss=0.009342 optimizer_zero_grad=0.000027 backward=2.907304 grad_clip=0.000525 optimizer_step=0.000506 post_step_cleanup=0.023800 teacher_seq_len=26 teacher_vocab=248320
+train_step step=127 prompt_index=14 teacher_id=infer loss=1.566640821693e-5 rollout_len=28 step_seconds=10.518483
+phase_summary step=127 total=10.518482 student_rollout=6.251348 infer_forward_token_logits=0.005660 infer_sync=0.609916 d2d_bridge_import=0.000642 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.616223 student_forward=0.452504 kl_loss=0.010693 optimizer_zero_grad=0.000030 backward=3.162209 grad_clip=0.000527 optimizer_step=0.000519 post_step_cleanup=0.024062 teacher_seq_len=28 teacher_vocab=248320
+train_step step=128 prompt_index=15 teacher_id=infer loss=1.531632915430e-5 rollout_len=29 step_seconds=11.128005
+phase_summary step=128 total=11.128005 student_rollout=6.601446 infer_forward_token_logits=0.005642 infer_sync=0.755324 d2d_bridge_import=0.000250 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.761220 student_forward=0.466805 kl_loss=0.010637 optimizer_zero_grad=0.000028 backward=3.261530 grad_clip=0.000884 optimizer_step=0.000913 post_step_cleanup=0.024053 teacher_seq_len=29 teacher_vocab=248320
+train_step step=129 prompt_index=0 teacher_id=infer loss=1.832374982769e-5 rollout_len=29 step_seconds=11.825783
+phase_summary step=129 total=11.825782 student_rollout=7.282900 infer_forward_token_logits=0.005530 infer_sync=0.731525 d2d_bridge_import=0.000234 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.737294 student_forward=0.477074 kl_loss=0.010867 optimizer_zero_grad=0.000029 backward=3.291891 grad_clip=0.000536 optimizer_step=0.000536 post_step_cleanup=0.024186 teacher_seq_len=29 teacher_vocab=248320
+train_step step=130 prompt_index=1 teacher_id=infer loss=1.814701136027e-5 rollout_len=28 step_seconds=10.637754
+phase_summary step=130 total=10.637754 student_rollout=6.428618 infer_forward_token_logits=0.005668 infer_sync=0.544456 d2d_bridge_import=0.000226 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.550354 student_forward=0.461834 kl_loss=0.010076 optimizer_zero_grad=0.000026 backward=3.161283 grad_clip=0.000533 optimizer_step=0.000502 post_step_cleanup=0.023962 teacher_seq_len=28 teacher_vocab=248320
+train_step step=131 prompt_index=2 teacher_id=infer loss=1.790665191947e-5 rollout_len=27 step_seconds=9.881540
+phase_summary step=131 total=9.881540 student_rollout=5.777633 infer_forward_token_logits=0.005573 infer_sync=0.538886 d2d_bridge_import=0.000238 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.544702 student_forward=0.447340 kl_loss=0.009946 optimizer_zero_grad=0.000026 backward=3.075756 grad_clip=0.000935 optimizer_step=0.000908 post_step_cleanup=0.024055 teacher_seq_len=27 teacher_vocab=248320
+train_step step=132 prompt_index=3 teacher_id=infer loss=1.214929761773e-5 rollout_len=23 step_seconds=9.393634
+phase_summary step=132 total=9.393634 student_rollout=5.823698 infer_forward_token_logits=0.005448 infer_sync=0.552317 d2d_bridge_import=0.000087 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.557857 student_forward=0.380501 kl_loss=0.008438 optimizer_zero_grad=0.000024 backward=2.596264 grad_clip=0.000542 optimizer_step=0.000862 post_step_cleanup=0.024981 teacher_seq_len=23 teacher_vocab=248320
+train_step step=133 prompt_index=4 teacher_id=infer loss=1.481231538492e-5 rollout_len=29 step_seconds=11.821539
+phase_summary step=133 total=11.821538 student_rollout=7.358448 infer_forward_token_logits=0.005645 infer_sync=0.709341 d2d_bridge_import=0.000251 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.715243 student_forward=0.468672 kl_loss=0.010396 optimizer_zero_grad=0.000030 backward=3.243126 grad_clip=0.000533 optimizer_step=0.000881 post_step_cleanup=0.023743 teacher_seq_len=29 teacher_vocab=248320
+train_step step=134 prompt_index=5 teacher_id=infer loss=1.533609065518e-5 rollout_len=28 step_seconds=11.184248
+phase_summary step=134 total=11.184247 student_rollout=7.060892 infer_forward_token_logits=0.005638 infer_sync=0.559921 d2d_bridge_import=0.000642 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.566205 student_forward=0.450506 kl_loss=0.009969 optimizer_zero_grad=0.000023 backward=3.069883 grad_clip=0.001143 optimizer_step=0.000893 post_step_cleanup=0.024288 teacher_seq_len=28 teacher_vocab=248320
+train_step step=135 prompt_index=6 teacher_id=infer loss=2.358818710491e-5 rollout_len=27 step_seconds=10.909180
+phase_summary step=135 total=10.909179 student_rollout=6.862583 infer_forward_token_logits=0.005649 infer_sync=0.563056 d2d_bridge_import=0.000649 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.569358 student_forward=0.437047 kl_loss=0.009644 optimizer_zero_grad=0.000031 backward=3.005219 grad_clip=0.000516 optimizer_step=0.000515 post_step_cleanup=0.023793 teacher_seq_len=27 teacher_vocab=248320
+train_step step=136 prompt_index=7 teacher_id=infer loss=2.251407386211e-5 rollout_len=25 step_seconds=9.135992
+phase_summary step=136 total=9.135992 student_rollout=5.260833 infer_forward_token_logits=0.005709 infer_sync=0.624994 d2d_bridge_import=0.000074 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.630781 student_forward=0.405300 kl_loss=0.009074 optimizer_zero_grad=0.000024 backward=2.803843 grad_clip=0.000940 optimizer_step=0.000886 post_step_cleanup=0.023863 teacher_seq_len=25 teacher_vocab=248320
+train_step step=137 prompt_index=8 teacher_id=infer loss=1.373044233333e-5 rollout_len=29 step_seconds=11.730697
+phase_summary step=137 total=11.730696 student_rollout=7.440831 infer_forward_token_logits=0.005504 infer_sync=0.567337 d2d_bridge_import=0.000259 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.573105 student_forward=0.468688 kl_loss=0.010514 optimizer_zero_grad=0.000028 backward=3.211389 grad_clip=0.001127 optimizer_step=0.000874 post_step_cleanup=0.023691 teacher_seq_len=29 teacher_vocab=248320
+train_step step=138 prompt_index=9 teacher_id=infer loss=1.978248656087e-5 rollout_len=26 step_seconds=10.545888
+phase_summary step=138 total=10.545888 student_rollout=6.722884 infer_forward_token_logits=0.005421 infer_sync=0.509884 d2d_bridge_import=0.000079 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.515389 student_forward=0.420742 kl_loss=0.009254 optimizer_zero_grad=0.000027 backward=2.851798 grad_clip=0.000519 optimizer_step=0.000889 post_step_cleanup=0.023943 teacher_seq_len=26 teacher_vocab=248320
+train_step step=139 prompt_index=10 teacher_id=infer loss=1.539441836940e-5 rollout_len=29 step_seconds=11.667166
+phase_summary step=139 total=11.667166 student_rollout=7.355708 infer_forward_token_logits=0.005664 infer_sync=0.568595 d2d_bridge_import=0.000236 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.574500 student_forward=0.467480 kl_loss=0.010430 optimizer_zero_grad=0.000028 backward=3.232305 grad_clip=0.001141 optimizer_step=0.000914 post_step_cleanup=0.024170 teacher_seq_len=29 teacher_vocab=248320
+train_step step=140 prompt_index=11 teacher_id=infer loss=2.640588536451e-5 rollout_len=27 step_seconds=10.775329
+phase_summary step=140 total=10.775328 student_rollout=6.644563 infer_forward_token_logits=0.005634 infer_sync=0.576844 d2d_bridge_import=0.000080 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.582562 student_forward=0.440917 kl_loss=0.009700 optimizer_zero_grad=0.000024 backward=3.070876 grad_clip=0.001048 optimizer_step=0.000881 post_step_cleanup=0.024246 teacher_seq_len=27 teacher_vocab=248320
+train_step step=141 prompt_index=12 teacher_id=infer loss=1.648189208936e-5 rollout_len=30 step_seconds=12.399821
+phase_summary step=141 total=12.399821 student_rollout=7.812575 infer_forward_token_logits=0.005330 infer_sync=0.674934 d2d_bridge_import=0.000232 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.680501 student_forward=0.486920 kl_loss=0.010678 optimizer_zero_grad=0.000029 backward=3.383214 grad_clip=0.000533 optimizer_step=0.000929 post_step_cleanup=0.023965 teacher_seq_len=30 teacher_vocab=248320
+train_step step=142 prompt_index=13 teacher_id=infer loss=1.623795833439e-5 rollout_len=26 step_seconds=10.244635
+phase_summary step=142 total=10.244635 student_rollout=6.310212 infer_forward_token_logits=0.005529 infer_sync=0.527522 d2d_bridge_import=0.000104 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.533160 student_forward=0.421385 kl_loss=0.009562 optimizer_zero_grad=0.000027 backward=2.944196 grad_clip=0.000879 optimizer_step=0.000876 post_step_cleanup=0.023844 teacher_seq_len=26 teacher_vocab=248320
+train_step step=143 prompt_index=14 teacher_id=infer loss=1.562928264320e-5 rollout_len=28 step_seconds=11.517929
+phase_summary step=143 total=11.517929 student_rollout=7.166058 infer_forward_token_logits=0.005792 infer_sync=0.635215 d2d_bridge_import=0.000250 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.641262 student_forward=0.464806 kl_loss=0.010072 optimizer_zero_grad=0.000025 backward=3.209298 grad_clip=0.000885 optimizer_step=0.000922 post_step_cleanup=0.024211 teacher_seq_len=28 teacher_vocab=248320
+train_step step=144 prompt_index=15 teacher_id=infer loss=1.527722815808e-5 rollout_len=29 step_seconds=12.068029
+phase_summary step=144 total=12.068027 student_rollout=7.579715 infer_forward_token_logits=0.005683 infer_sync=0.719813 d2d_bridge_import=0.000093 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.725594 student_forward=0.474232 kl_loss=0.010452 optimizer_zero_grad=0.000028 backward=3.251062 grad_clip=0.001132 optimizer_step=0.000903 post_step_cleanup=0.024432 teacher_seq_len=29 teacher_vocab=248320
+train_step step=145 prompt_index=0 teacher_id=infer loss=1.821213118092e-5 rollout_len=29 step_seconds=11.858235
+phase_summary step=145 total=11.858235 student_rollout=7.288269 infer_forward_token_logits=0.005529 infer_sync=0.741741 d2d_bridge_import=0.000253 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.747528 student_forward=0.478395 kl_loss=0.010545 optimizer_zero_grad=0.000026 backward=3.307822 grad_clip=0.000527 optimizer_step=0.000510 post_step_cleanup=0.024198 teacher_seq_len=29 teacher_vocab=248320
+train_step step=146 prompt_index=1 teacher_id=infer loss=1.801968574000e-5 rollout_len=28 step_seconds=10.788689
+phase_summary step=146 total=10.788689 student_rollout=6.420633 infer_forward_token_logits=0.005802 infer_sync=0.737199 d2d_bridge_import=0.000259 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.743264 student_forward=0.461236 kl_loss=0.010103 optimizer_zero_grad=0.000028 backward=3.126627 grad_clip=0.001145 optimizer_step=0.000912 post_step_cleanup=0.024269 teacher_seq_len=28 teacher_vocab=248320
+train_step step=147 prompt_index=2 teacher_id=infer loss=1.796297692636e-5 rollout_len=27 step_seconds=11.341056
+phase_summary step=147 total=11.341055 student_rollout=7.094485 infer_forward_token_logits=0.005642 infer_sync=0.651908 d2d_bridge_import=0.000084 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.657639 student_forward=0.447172 kl_loss=0.009968 optimizer_zero_grad=0.000028 backward=3.104598 grad_clip=0.001133 optimizer_step=0.000940 post_step_cleanup=0.024666 teacher_seq_len=27 teacher_vocab=248320
+train_step step=148 prompt_index=3 teacher_id=infer loss=1.214237636304e-5 rollout_len=23 step_seconds=9.416770
+phase_summary step=148 total=9.416770 student_rollout=5.876035 infer_forward_token_logits=0.005393 infer_sync=0.472209 d2d_bridge_import=0.000081 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.477690 student_forward=0.375202 kl_loss=0.008406 optimizer_zero_grad=0.000025 backward=2.653582 grad_clip=0.000560 optimizer_step=0.000513 post_step_cleanup=0.024281 teacher_seq_len=23 teacher_vocab=248320
+train_step step=149 prompt_index=4 teacher_id=infer loss=1.477143541706e-5 rollout_len=29 step_seconds=10.984610
+phase_summary step=149 total=10.984610 student_rollout=6.475758 infer_forward_token_logits=0.005620 infer_sync=0.738328 d2d_bridge_import=0.000082 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.744034 student_forward=0.474737 kl_loss=0.010468 optimizer_zero_grad=0.000028 backward=3.254304 grad_clip=0.000521 optimizer_step=0.000506 post_step_cleanup=0.023820 teacher_seq_len=29 teacher_vocab=248320
+train_step step=150 prompt_index=5 teacher_id=infer loss=1.530115696369e-5 rollout_len=28 step_seconds=10.759119
+phase_summary step=150 total=10.759119 student_rollout=6.312118 infer_forward_token_logits=0.005774 infer_sync=0.696412 d2d_bridge_import=0.000640 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.702830 student_forward=0.458971 kl_loss=0.010124 optimizer_zero_grad=0.000025 backward=3.249735 grad_clip=0.000521 optimizer_step=0.000520 post_step_cleanup=0.023804 teacher_seq_len=28 teacher_vocab=248320
+train_step step=151 prompt_index=6 teacher_id=infer loss=2.342679908907e-5 rollout_len=27 step_seconds=10.229072
+phase_summary step=151 total=10.229071 student_rollout=5.990270 infer_forward_token_logits=0.005825 infer_sync=0.646621 d2d_bridge_import=0.000642 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.653092 student_forward=0.440679 kl_loss=0.009646 optimizer_zero_grad=0.000027 backward=3.108740 grad_clip=0.001138 optimizer_step=0.000896 post_step_cleanup=0.024126 teacher_seq_len=27 teacher_vocab=248320
+train_step step=152 prompt_index=7 teacher_id=infer loss=2.231090729765e-5 rollout_len=25 step_seconds=10.424528
+phase_summary step=152 total=10.424528 student_rollout=6.522840 infer_forward_token_logits=0.005440 infer_sync=0.652350 d2d_bridge_import=0.000077 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.657872 student_forward=0.405282 kl_loss=0.009506 optimizer_zero_grad=0.000032 backward=2.802729 grad_clip=0.001142 optimizer_step=0.000900 post_step_cleanup=0.023741 teacher_seq_len=25 teacher_vocab=248320
+train_step step=153 prompt_index=8 teacher_id=infer loss=1.371997223032e-5 rollout_len=29 step_seconds=12.078441
+phase_summary step=153 total=12.078441 student_rollout=7.530430 infer_forward_token_logits=0.006164 infer_sync=0.675156 d2d_bridge_import=0.000094 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.681420 student_forward=0.474225 kl_loss=0.010526 optimizer_zero_grad=0.000029 backward=3.353973 grad_clip=0.001189 optimizer_step=0.001579 post_step_cleanup=0.024588 teacher_seq_len=29 teacher_vocab=248320
+train_step step=154 prompt_index=9 teacher_id=infer loss=1.968650394701e-5 rollout_len=26 step_seconds=10.968239
+phase_summary step=154 total=10.968239 student_rollout=6.866214 infer_forward_token_logits=0.005538 infer_sync=0.616219 d2d_bridge_import=0.000078 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.621839 student_forward=0.430419 kl_loss=0.009421 optimizer_zero_grad=0.000029 backward=3.013290 grad_clip=0.001143 optimizer_step=0.000907 post_step_cleanup=0.024448 teacher_seq_len=26 teacher_vocab=248320
+train_step step=155 prompt_index=10 teacher_id=infer loss=1.530697227281e-5 rollout_len=29 step_seconds=12.101434
+phase_summary step=155 total=12.101434 student_rollout=7.579674 infer_forward_token_logits=0.005648 infer_sync=0.577018 d2d_bridge_import=0.000252 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.582923 student_forward=0.484907 kl_loss=0.011028 optimizer_zero_grad=0.000029 backward=3.416839 grad_clip=0.000544 optimizer_step=0.000945 post_step_cleanup=0.024101 teacher_seq_len=29 teacher_vocab=248320
+train_step step=156 prompt_index=11 teacher_id=infer loss=2.619498445711e-5 rollout_len=27 step_seconds=10.987150
+phase_summary step=156 total=10.987150 student_rollout=6.852183 infer_forward_token_logits=0.005710 infer_sync=0.569530 d2d_bridge_import=0.000088 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.575334 student_forward=0.446804 kl_loss=0.009906 optimizer_zero_grad=0.000022 backward=3.075498 grad_clip=0.000583 optimizer_step=0.000926 post_step_cleanup=0.025400 teacher_seq_len=27 teacher_vocab=248320
+train_step step=157 prompt_index=12 teacher_id=infer loss=1.640111440793e-5 rollout_len=30 step_seconds=12.452119
+phase_summary step=157 total=12.452119 student_rollout=7.841260 infer_forward_token_logits=0.005663 infer_sync=0.630760 d2d_bridge_import=0.000260 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.636687 student_forward=0.495186 kl_loss=0.019583 optimizer_zero_grad=0.000028 backward=3.433539 grad_clip=0.000525 optimizer_step=0.000972 post_step_cleanup=0.023935 teacher_seq_len=30 teacher_vocab=248320
+train_step step=158 prompt_index=13 teacher_id=infer loss=1.618829446670e-5 rollout_len=26 step_seconds=10.647776
+phase_summary step=158 total=10.647776 student_rollout=6.518036 infer_forward_token_logits=0.005611 infer_sync=0.643951 d2d_bridge_import=0.000584 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.650152 student_forward=0.425770 kl_loss=0.009902 optimizer_zero_grad=0.000031 backward=3.017184 grad_clip=0.001164 optimizer_step=0.000885 post_step_cleanup=0.024183 teacher_seq_len=26 teacher_vocab=248320
+train_step step=159 prompt_index=14 teacher_id=infer loss=1.549587068439e-5 rollout_len=28 step_seconds=11.629337
+phase_summary step=159 total=11.629336 student_rollout=7.203800 infer_forward_token_logits=0.005670 infer_sync=0.730891 d2d_bridge_import=0.000637 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.737203 student_forward=0.456353 kl_loss=0.010142 optimizer_zero_grad=0.000034 backward=3.195360 grad_clip=0.000893 optimizer_step=0.000914 post_step_cleanup=0.024155 teacher_seq_len=28 teacher_vocab=248320
+train_step step=160 prompt_index=15 teacher_id=infer loss=1.524092112959e-5 rollout_len=29 step_seconds=11.834459
+phase_summary step=160 total=11.834459 student_rollout=7.547945 infer_forward_token_logits=0.005750 infer_sync=0.572459 d2d_bridge_import=0.000229 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.578443 student_forward=0.468072 kl_loss=0.010446 optimizer_zero_grad=0.000028 backward=3.203211 grad_clip=0.000546 optimizer_step=0.000526 post_step_cleanup=0.024767 teacher_seq_len=29 teacher_vocab=248320
+train_step step=161 prompt_index=0 teacher_id=infer loss=1.811434776755e-5 rollout_len=29 step_seconds=10.901011
+phase_summary step=161 total=10.901011 student_rollout=6.376468 infer_forward_token_logits=0.005594 infer_sync=0.714370 d2d_bridge_import=0.000240 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.720208 student_forward=0.473570 kl_loss=0.010359 optimizer_zero_grad=0.000025 backward=3.290019 grad_clip=0.000535 optimizer_step=0.000512 post_step_cleanup=0.028816 teacher_seq_len=29 teacher_vocab=248320
+train_step step=162 prompt_index=1 teacher_id=infer loss=1.874481858977e-5 rollout_len=28 step_seconds=10.613499
+phase_summary step=162 total=10.613499 student_rollout=6.360737 infer_forward_token_logits=0.005754 infer_sync=0.604392 d2d_bridge_import=0.000225 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.610377 student_forward=0.457393 kl_loss=0.010052 optimizer_zero_grad=0.000026 backward=3.149810 grad_clip=0.000537 optimizer_step=0.000503 post_step_cleanup=0.023929 teacher_seq_len=28 teacher_vocab=248320
+train_step step=163 prompt_index=2 teacher_id=infer loss=1.607201375009e-5 rollout_len=27 step_seconds=10.065540
+phase_summary step=163 total=10.065540 student_rollout=6.003371 infer_forward_token_logits=0.003494 infer_sync=0.538751 d2d_bridge_import=0.000057 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.542305 student_forward=0.442054 kl_loss=0.009739 optimizer_zero_grad=0.000028 backward=3.042915 grad_clip=0.000531 optimizer_step=0.000500 post_step_cleanup=0.023804 teacher_seq_len=27 teacher_vocab=248320
+train_step step=164 prompt_index=3 teacher_id=infer loss=1.212702591147e-5 rollout_len=23 step_seconds=8.044337
+phase_summary step=164 total=8.044337 student_rollout=4.470297 infer_forward_token_logits=0.005400 infer_sync=0.517235 d2d_bridge_import=0.000098 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.522737 student_forward=0.381036 kl_loss=0.008466 optimizer_zero_grad=0.000027 backward=2.636062 grad_clip=0.000531 optimizer_step=0.000484 post_step_cleanup=0.024191 teacher_seq_len=23 teacher_vocab=248320
+train_step step=165 prompt_index=4 teacher_id=infer loss=1.641511335038e-5 rollout_len=29 step_seconds=10.653867
+phase_summary step=165 total=10.653867 student_rollout=6.288466 infer_forward_token_logits=0.005595 infer_sync=0.552632 d2d_bridge_import=0.000078 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.558309 student_forward=0.477603 kl_loss=0.010528 optimizer_zero_grad=0.000029 backward=3.292228 grad_clip=0.001159 optimizer_step=0.000902 post_step_cleanup=0.024200 teacher_seq_len=29 teacher_vocab=248320
+train_step step=166 prompt_index=5 teacher_id=infer loss=1.519000852568e-5 rollout_len=28 step_seconds=11.405243
+phase_summary step=166 total=11.405242 student_rollout=7.187123 infer_forward_token_logits=0.003934 infer_sync=0.591232 d2d_bridge_import=0.000637 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.595808 student_forward=0.465231 kl_loss=0.010797 optimizer_zero_grad=0.000026 backward=3.120886 grad_clip=0.000532 optimizer_step=0.000521 post_step_cleanup=0.023866 teacher_seq_len=28 teacher_vocab=248320
+train_step step=167 prompt_index=6 teacher_id=infer loss=1.828664426284e-5 rollout_len=27 step_seconds=10.025251
+phase_summary step=167 total=10.025250 student_rollout=5.947872 infer_forward_token_logits=0.005571 infer_sync=0.608171 d2d_bridge_import=0.000637 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.614383 student_forward=0.436609 kl_loss=0.009720 optimizer_zero_grad=0.000025 backward=2.991398 grad_clip=0.000527 optimizer_step=0.000498 post_step_cleanup=0.023742 teacher_seq_len=27 teacher_vocab=248320
+train_step step=168 prompt_index=7 teacher_id=infer loss=2.215023596364e-5 rollout_len=25 step_seconds=9.142725
+phase_summary step=168 total=9.142725 student_rollout=5.235427 infer_forward_token_logits=0.005522 infer_sync=0.670414 d2d_bridge_import=0.000084 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.676025 student_forward=0.404055 kl_loss=0.009007 optimizer_zero_grad=0.000026 backward=2.791956 grad_clip=0.001144 optimizer_step=0.000912 post_step_cleanup=0.023719 teacher_seq_len=25 teacher_vocab=248320
+train_step step=169 prompt_index=8 teacher_id=infer loss=1.372358201479e-5 rollout_len=29 step_seconds=11.758200
+phase_summary step=169 total=11.758200 student_rollout=7.450144 infer_forward_token_logits=0.005626 infer_sync=0.564710 d2d_bridge_import=0.000090 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.570430 student_forward=0.467696 kl_loss=0.010480 optimizer_zero_grad=0.000025 backward=3.233171 grad_clip=0.001137 optimizer_step=0.000888 post_step_cleanup=0.023783 teacher_seq_len=29 teacher_vocab=248320
+train_step step=170 prompt_index=9 teacher_id=infer loss=1.951558442670e-5 rollout_len=26 step_seconds=10.772992
+phase_summary step=170 total=10.772991 student_rollout=6.724650 infer_forward_token_logits=0.005462 infer_sync=0.678663 d2d_bridge_import=0.000082 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.684213 student_forward=0.421278 kl_loss=0.010202 optimizer_zero_grad=0.000031 backward=2.907252 grad_clip=0.000539 optimizer_step=0.000490 post_step_cleanup=0.023889 teacher_seq_len=26 teacher_vocab=248320
+train_step step=171 prompt_index=10 teacher_id=infer loss=1.523516311863e-5 rollout_len=29 step_seconds=10.990072
+phase_summary step=171 total=10.990072 student_rollout=6.550352 infer_forward_token_logits=0.005684 infer_sync=0.727184 d2d_bridge_import=0.000238 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.733111 student_forward=0.466423 kl_loss=0.010409 optimizer_zero_grad=0.000028 backward=3.204205 grad_clip=0.000546 optimizer_step=0.000880 post_step_cleanup=0.023633 teacher_seq_len=29 teacher_vocab=248320
+train_step step=172 prompt_index=11 teacher_id=infer loss=2.588045936136e-5 rollout_len=27 step_seconds=10.701482
+phase_summary step=172 total=10.701482 student_rollout=6.631974 infer_forward_token_logits=0.005567 infer_sync=0.619200 d2d_bridge_import=0.000543 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.625316 student_forward=0.436133 kl_loss=0.009677 optimizer_zero_grad=0.000026 backward=2.972975 grad_clip=0.000528 optimizer_step=0.000524 post_step_cleanup=0.023895 teacher_seq_len=27 teacher_vocab=248320
+train_step step=173 prompt_index=12 teacher_id=infer loss=1.631163650018e-5 rollout_len=30 step_seconds=11.279238
+phase_summary step=173 total=11.279237 student_rollout=6.814345 infer_forward_token_logits=0.005263 infer_sync=0.579746 d2d_bridge_import=0.000248 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.585265 student_forward=0.484146 kl_loss=0.010893 optimizer_zero_grad=0.000030 backward=3.359123 grad_clip=0.000538 optimizer_step=0.000555 post_step_cleanup=0.023879 teacher_seq_len=30 teacher_vocab=248320
+train_step step=174 prompt_index=13 teacher_id=infer loss=1.613235872355e-5 rollout_len=26 step_seconds=9.444416
+phase_summary step=174 total=9.444415 student_rollout=5.416510 infer_forward_token_logits=0.005542 infer_sync=0.635972 d2d_bridge_import=0.000081 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.641599 student_forward=0.422608 kl_loss=0.009442 optimizer_zero_grad=0.000026 backward=2.928061 grad_clip=0.001124 optimizer_step=0.000889 post_step_cleanup=0.023669 teacher_seq_len=26 teacher_vocab=248320
+train_step step=175 prompt_index=14 teacher_id=infer loss=1.542087557027e-5 rollout_len=28 step_seconds=11.435834
+phase_summary step=175 total=11.435834 student_rollout=7.100807 infer_forward_token_logits=0.005656 infer_sync=0.724686 d2d_bridge_import=0.000078 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.730426 student_forward=0.451062 kl_loss=0.009997 optimizer_zero_grad=0.000026 backward=3.117232 grad_clip=0.001154 optimizer_step=0.000902 post_step_cleanup=0.023802 teacher_seq_len=28 teacher_vocab=248320
+train_step step=176 prompt_index=15 teacher_id=infer loss=1.520234854979e-5 rollout_len=29 step_seconds=11.986323
+phase_summary step=176 total=11.986322 student_rollout=7.497148 infer_forward_token_logits=0.005654 infer_sync=0.710046 d2d_bridge_import=0.000252 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.715957 student_forward=0.469197 kl_loss=0.010425 optimizer_zero_grad=0.000027 backward=3.268726 grad_clip=0.000518 optimizer_step=0.000518 post_step_cleanup=0.023606 teacher_seq_len=29 teacher_vocab=248320
+train_step step=177 prompt_index=0 teacher_id=infer loss=1.795427670004e-5 rollout_len=29 step_seconds=10.956279
+phase_summary step=177 total=10.956279 student_rollout=6.610818 infer_forward_token_logits=0.005538 infer_sync=0.612325 d2d_bridge_import=0.000125 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.617991 student_forward=0.468260 kl_loss=0.010391 optimizer_zero_grad=0.000026 backward=3.223087 grad_clip=0.000523 optimizer_step=0.000889 post_step_cleanup=0.023907 teacher_seq_len=29 teacher_vocab=248320
+train_step step=178 prompt_index=1 teacher_id=infer loss=1.861004238890e-5 rollout_len=28 step_seconds=11.468064
+phase_summary step=178 total=11.468064 student_rollout=7.264352 infer_forward_token_logits=0.005670 infer_sync=0.581460 d2d_bridge_import=0.000224 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.587359 student_forward=0.451599 kl_loss=0.010172 optimizer_zero_grad=0.000026 backward=3.129004 grad_clip=0.000531 optimizer_step=0.000883 post_step_cleanup=0.023660 teacher_seq_len=28 teacher_vocab=248320
+train_step step=179 prompt_index=2 teacher_id=infer loss=1.603437340236e-5 rollout_len=27 step_seconds=10.877097
+phase_summary step=179 total=10.877096 student_rollout=6.751564 infer_forward_token_logits=0.005594 infer_sync=0.609849 d2d_bridge_import=0.000235 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.615684 student_forward=0.436165 kl_loss=0.009688 optimizer_zero_grad=0.000034 backward=3.038852 grad_clip=0.000528 optimizer_step=0.000511 post_step_cleanup=0.023663 teacher_seq_len=27 teacher_vocab=248320
+train_step step=180 prompt_index=3 teacher_id=infer loss=1.210460050061e-5 rollout_len=23 step_seconds=8.205545
+phase_summary step=180 total=8.205545 student_rollout=4.651714 infer_forward_token_logits=0.005413 infer_sync=0.575156 d2d_bridge_import=0.000083 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.580657 student_forward=0.372800 kl_loss=0.008391 optimizer_zero_grad=0.000027 backward=2.566498 grad_clip=0.000518 optimizer_step=0.000898 post_step_cleanup=0.023638 teacher_seq_len=23 teacher_vocab=248320
+train_step step=181 prompt_index=4 teacher_id=infer loss=1.467033871450e-5 rollout_len=29 step_seconds=11.626263
+phase_summary step=181 total=11.626263 student_rollout=7.341386 infer_forward_token_logits=0.005803 infer_sync=0.570135 d2d_bridge_import=0.000218 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.576160 student_forward=0.466470 kl_loss=0.010498 optimizer_zero_grad=0.000026 backward=3.206110 grad_clip=0.000524 optimizer_step=0.000880 post_step_cleanup=0.023772 teacher_seq_len=29 teacher_vocab=248320
+train_step step=182 prompt_index=5 teacher_id=infer loss=1.511848040536e-5 rollout_len=28 step_seconds=11.073254
+phase_summary step=182 total=11.073254 student_rollout=6.898442 infer_forward_token_logits=0.005543 infer_sync=0.565245 d2d_bridge_import=0.000639 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.571431 student_forward=0.452909 kl_loss=0.010006 optimizer_zero_grad=0.000023 backward=3.114272 grad_clip=0.001150 optimizer_step=0.000899 post_step_cleanup=0.023667 teacher_seq_len=28 teacher_vocab=248320
+train_step step=183 prompt_index=6 teacher_id=infer loss=2.303718065377e-5 rollout_len=27 step_seconds=11.087264
+phase_summary step=183 total=11.087264 student_rollout=6.943716 infer_forward_token_logits=0.005541 infer_sync=0.620991 d2d_bridge_import=0.000649 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.627185 student_forward=0.435502 kl_loss=0.009624 optimizer_zero_grad=0.000027 backward=3.046006 grad_clip=0.000517 optimizer_step=0.000497 post_step_cleanup=0.023732 teacher_seq_len=27 teacher_vocab=248320
+train_step step=184 prompt_index=7 teacher_id=infer loss=2.195973684138e-5 rollout_len=25 step_seconds=9.079879
+phase_summary step=184 total=9.079879 student_rollout=5.248096 infer_forward_token_logits=0.005478 infer_sync=0.602890 d2d_bridge_import=0.000082 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.608455 student_forward=0.405087 kl_loss=0.009006 optimizer_zero_grad=0.000028 backward=2.783561 grad_clip=0.000524 optimizer_step=0.000893 post_step_cleanup=0.023793 teacher_seq_len=25 teacher_vocab=248320
+train_step step=185 prompt_index=8 teacher_id=infer loss=1.368217272102e-5 rollout_len=29 step_seconds=11.777472
+phase_summary step=185 total=11.777472 student_rollout=7.413586 infer_forward_token_logits=0.005590 infer_sync=0.615175 d2d_bridge_import=0.000087 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.620857 student_forward=0.465798 kl_loss=0.010378 optimizer_zero_grad=0.000028 backward=3.240693 grad_clip=0.001145 optimizer_step=0.000868 post_step_cleanup=0.023684 teacher_seq_len=29 teacher_vocab=248320
+train_step step=186 prompt_index=9 teacher_id=infer loss=1.939316643984e-5 rollout_len=26 step_seconds=10.375204
+phase_summary step=186 total=10.375203 student_rollout=6.301510 infer_forward_token_logits=0.005553 infer_sync=0.700378 d2d_bridge_import=0.000587 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.706522 student_forward=0.421509 kl_loss=0.009341 optimizer_zero_grad=0.000025 backward=2.909628 grad_clip=0.001143 optimizer_step=0.000897 post_step_cleanup=0.024147 teacher_seq_len=26 teacher_vocab=248320
+train_step step=187 prompt_index=10 teacher_id=infer loss=1.512028666184e-5 rollout_len=29 step_seconds=11.843901
+phase_summary step=187 total=11.843900 student_rollout=7.503888 infer_forward_token_logits=0.005553 infer_sync=0.567792 d2d_bridge_import=0.000226 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.573576 student_forward=0.465631 kl_loss=0.010436 optimizer_zero_grad=0.000027 backward=3.264393 grad_clip=0.000880 optimizer_step=0.000899 post_step_cleanup=0.023700 teacher_seq_len=29 teacher_vocab=248320
+train_step step=188 prompt_index=11 teacher_id=infer loss=2.557203697506e-5 rollout_len=27 step_seconds=10.701878
+phase_summary step=188 total=10.701878 student_rollout=6.603170 infer_forward_token_logits=0.005555 infer_sync=0.591036 d2d_bridge_import=0.000174 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.596769 student_forward=0.436697 kl_loss=0.009645 optimizer_zero_grad=0.000024 backward=3.029417 grad_clip=0.001136 optimizer_step=0.000904 post_step_cleanup=0.023645 teacher_seq_len=27 teacher_vocab=248320
+train_step step=189 prompt_index=12 teacher_id=infer loss=1.623713615118e-5 rollout_len=30 step_seconds=12.222433
+phase_summary step=189 total=12.222433 student_rollout=7.665941 infer_forward_token_logits=0.005593 infer_sync=0.670015 d2d_bridge_import=0.000222 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.675835 student_forward=0.483491 kl_loss=0.010674 optimizer_zero_grad=0.000033 backward=3.359006 grad_clip=0.001178 optimizer_step=0.001617 post_step_cleanup=0.024177 teacher_seq_len=30 teacher_vocab=248320
+train_step step=190 prompt_index=13 teacher_id=infer loss=1.604824319656e-5 rollout_len=26 step_seconds=10.637701
+phase_summary step=190 total=10.637700 student_rollout=6.733949 infer_forward_token_logits=0.005565 infer_sync=0.520414 d2d_bridge_import=0.000587 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.526571 student_forward=0.422105 kl_loss=0.009316 optimizer_zero_grad=0.000026 backward=2.920377 grad_clip=0.000524 optimizer_step=0.000499 post_step_cleanup=0.023848 teacher_seq_len=26 teacher_vocab=248320
+train_step step=191 prompt_index=14 teacher_id=infer loss=1.528869324829e-5 rollout_len=28 step_seconds=10.336432
+phase_summary step=191 total=10.336431 student_rollout=6.030959 infer_forward_token_logits=0.005409 infer_sync=0.606109 d2d_bridge_import=0.000236 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.611759 student_forward=0.452699 kl_loss=0.010120 optimizer_zero_grad=0.000026 backward=3.204888 grad_clip=0.000549 optimizer_step=0.000908 post_step_cleanup=0.024017 teacher_seq_len=28 teacher_vocab=248320
+train_step step=192 prompt_index=15 teacher_id=infer loss=1.515618623671e-5 rollout_len=29 step_seconds=11.680054
+phase_summary step=192 total=11.680054 student_rollout=7.346052 infer_forward_token_logits=0.005666 infer_sync=0.568230 d2d_bridge_import=0.000229 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.574128 student_forward=0.473468 kl_loss=0.010470 optimizer_zero_grad=0.000027 backward=3.250720 grad_clip=0.000519 optimizer_step=0.000503 post_step_cleanup=0.023656 teacher_seq_len=29 teacher_vocab=248320
+train_step step=193 prompt_index=0 teacher_id=infer loss=1.780595448508e-5 rollout_len=29 step_seconds=10.769021
+phase_summary step=193 total=10.769021 student_rollout=6.312346 infer_forward_token_logits=0.003450 infer_sync=0.713373 d2d_bridge_import=0.000240 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.717068 student_forward=0.468030 kl_loss=0.010352 optimizer_zero_grad=0.000028 backward=3.235718 grad_clip=0.000525 optimizer_step=0.000510 post_step_cleanup=0.023959 teacher_seq_len=29 teacher_vocab=248320
+train_step step=194 prompt_index=1 teacher_id=infer loss=1.921975672303e-5 rollout_len=28 step_seconds=10.704729
+phase_summary step=194 total=10.704729 student_rollout=6.392011 infer_forward_token_logits=0.005699 infer_sync=0.649662 d2d_bridge_import=0.000230 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.655596 student_forward=0.461608 kl_loss=0.010104 optimizer_zero_grad=0.000023 backward=3.159819 grad_clip=0.000540 optimizer_step=0.000523 post_step_cleanup=0.024021 teacher_seq_len=28 teacher_vocab=248320
+train_step step=195 prompt_index=2 teacher_id=infer loss=1.769421032805e-5 rollout_len=27 step_seconds=10.261184
+phase_summary step=195 total=10.261184 student_rollout=6.037094 infer_forward_token_logits=0.005627 infer_sync=0.682069 d2d_bridge_import=0.000235 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.687936 student_forward=0.444857 kl_loss=0.009944 optimizer_zero_grad=0.000027 backward=3.054506 grad_clip=0.001150 optimizer_step=0.000895 post_step_cleanup=0.024258 teacher_seq_len=27 teacher_vocab=248320
+train_step step=196 prompt_index=3 teacher_id=infer loss=1.209552738146e-5 rollout_len=23 step_seconds=9.370246
+phase_summary step=196 total=9.370245 student_rollout=5.885442 infer_forward_token_logits=0.005700 infer_sync=0.513388 d2d_bridge_import=0.000087 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.519179 student_forward=0.377330 kl_loss=0.008341 optimizer_zero_grad=0.000028 backward=2.554232 grad_clip=0.000517 optimizer_step=0.000494 post_step_cleanup=0.024209 teacher_seq_len=23 teacher_vocab=248320
+train_step step=197 prompt_index=4 teacher_id=infer loss=1.463413536840e-5 rollout_len=29 step_seconds=10.870958
+phase_summary step=197 total=10.870958 student_rollout=6.505934 infer_forward_token_logits=0.005685 infer_sync=0.604696 d2d_bridge_import=0.000081 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.610466 student_forward=0.467876 kl_loss=0.010409 optimizer_zero_grad=0.000026 backward=3.250363 grad_clip=0.000526 optimizer_step=0.000920 post_step_cleanup=0.024221 teacher_seq_len=29 teacher_vocab=248320
+train_step step=198 prompt_index=5 teacher_id=infer loss=1.501437600382e-5 rollout_len=28 step_seconds=11.238440
+phase_summary step=198 total=11.238440 student_rollout=7.079858 infer_forward_token_logits=0.005686 infer_sync=0.540303 d2d_bridge_import=0.000639 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.546632 student_forward=0.451785 kl_loss=0.009947 optimizer_zero_grad=0.000026 backward=3.124526 grad_clip=0.000537 optimizer_step=0.000868 post_step_cleanup=0.023724 teacher_seq_len=28 teacher_vocab=248320
+train_step step=199 prompt_index=6 teacher_id=infer loss=2.282615969307e-5 rollout_len=27 step_seconds=10.857578
+phase_summary step=199 total=10.857578 student_rollout=6.744200 infer_forward_token_logits=0.005698 infer_sync=0.621042 d2d_bridge_import=0.000645 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.627391 student_forward=0.436692 kl_loss=0.009704 optimizer_zero_grad=0.000027 backward=3.014272 grad_clip=0.000528 optimizer_step=0.000521 post_step_cleanup=0.023760 teacher_seq_len=27 teacher_vocab=248320
+train_step step=200 prompt_index=7 teacher_id=infer loss=2.171787127736e-5 rollout_len=25 step_seconds=9.120462
+phase_summary step=200 total=9.120462 student_rollout=5.297886 infer_forward_token_logits=0.003328 infer_sync=0.582842 d2d_bridge_import=0.000075 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.586249 student_forward=0.409872 kl_loss=0.009026 optimizer_zero_grad=0.000027 backward=2.791128 grad_clip=0.000879 optimizer_step=0.000897 post_step_cleanup=0.024055 teacher_seq_len=25 teacher_vocab=248320
+eval_summary step=200 train_kl=1.488929962079e-5 heldout_kl=1.705238992145e-5 eval_seconds=7.821249
+training_summary teacher_source=infer total_steps=200 total_wall_seconds=2194.248984 mean_step_seconds=10.853569 median_step_seconds=10.984610 first_loss=1.595064168214e-5 final_loss=2.171787127736e-5 sampled_loss_reduction_pct=-36.156725
