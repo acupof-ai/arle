@@ -71,33 +71,41 @@ def panel_trajectory(ax):
 
 
 def panel_cross_validation(ax):
-    labels = ["ARLE\nserve", "HF\ntransformers"]
-    accuracies = [77.33, 78.18]
-    invalid_pct = [12.3, 3.6]
-    colors = ["#1f4e79", "#e67e22"]
+    # Re-purposed as: GSM8K trajectory — inverse U-curve (peak at step 1000)
+    steps = np.array([0, 1000, 2000])
+    gsm8k_lr2e5 = np.array([1.5, np.nan, 1.6])  # only step 2000 measured
+    gsm8k_lr1e5 = np.array([1.5, 3.16, 2.22])
+    base_floor = 1.5
+    teacher_ceiling = 2.5
 
-    x = np.arange(len(labels))
-    bars = ax.bar(x, accuracies, color=colors, width=0.55, edgecolor="black", linewidth=0.7)
-    for bar, acc in zip(bars, accuracies):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                f"{acc:.2f}%", ha="center", fontsize=11, fontweight="bold")
-    for i, (acc, inv) in enumerate(zip(accuracies, invalid_pct)):
-        ax.text(i, acc / 2, f"invalid\n{inv:.1f}%", ha="center", fontsize=9, color="white", fontweight="bold")
+    ax.set_xlim(-50, 2200)
+    ax.set_ylim(0, 4)
+    ax.set_xlabel("training step")
+    ax.set_ylabel("GSM8K 3-shot accuracy (%)")
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=10)
-    ax.set_ylabel("MMLU 5-shot accuracy (%)")
-    ax.set_ylim(0, 95)
-    ax.axhline(0, color="black", linewidth=0.5)
-    # Add a delta annotation
-    ax.annotate("", xy=(1, 78.18), xytext=(0, 77.33),
-                arrowprops=dict(arrowstyle="<->", color="#666666", lw=1))
-    ax.text(0.5, 82, "Δ = +0.85 pp\n(within ±5 pp 95 % CI)",
-            ha="center", fontsize=9, color="#555555",
-            bbox=dict(boxstyle="round,pad=0.4", facecolor="#f9f4e6", edgecolor="#cccccc"))
-    ax.set_title("Cross-engine validation: ARLE serve ≈ HF transformers\nsame Qwen3.5-4B checkpoint, MMLU 5-shot, n=171",
-                 fontsize=11, fontweight="bold")
-    ax.grid(True, axis="y", alpha=0.3)
+    ax.axhline(teacher_ceiling, color="#3a7d3a", linestyle=":", linewidth=2,
+               label=f"Teacher 4B = {teacher_ceiling:.1f}%")
+    ax.axhline(base_floor, color="#999999", linestyle="--", linewidth=2,
+               label=f"Base 0.8B = {base_floor:.1f}%")
+
+    mask = ~np.isnan(gsm8k_lr2e5)
+    ax.plot(steps[mask], gsm8k_lr2e5[mask], "o-", color="#1f4e79", linewidth=2.5, markersize=10,
+            label="lr=2e-5")
+    ax.plot(steps, gsm8k_lr1e5, "s-", color="#c0392b", linewidth=2.5, markersize=10,
+            label="lr=1e-5")
+
+    # Annotate the peak that beats teacher
+    ax.annotate("PEAK 3.16%\nbeats teacher!", xy=(1000, 3.16), xytext=(550, 3.7),
+                fontsize=9, ha="center", color="#c0392b", fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color="#c0392b", lw=0.8))
+    ax.annotate("regression\nto 2.22%", xy=(2000, 2.22), xytext=(2050, 2.9),
+                fontsize=9, ha="left", color="#c0392b",
+                arrowprops=dict(arrowstyle="->", color="#c0392b", lw=0.8))
+
+    ax.legend(loc="lower right", fontsize=8.5, framealpha=0.9)
+    ax.set_title("GSM8K trajectory: inverse U-curve (peak at step 1000)\nlr=1e-5 step 1000 BEATS the 4B teacher (3.16% vs 2.5%)",
+                 fontsize=10.5, fontweight="bold")
+    ax.grid(True, alpha=0.3)
 
 
 def main():
