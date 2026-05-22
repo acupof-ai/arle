@@ -1,8 +1,20 @@
 # 2026-05-21 — ARLE OPD CUDA: Qwen3.5-9B → Qwen3.5-0.8B real distillation
 
-> **Status:** plan / coordination doc. Owns the 6-phase execution of a real
-> large-to-small OPD distillation experiment using ARLE's full stack
-> (teacher inference via `infer`, student OPD step via `train`),
+> **Status (2026-05-22 update): BLOCKED on 16 GB hardware. Local 9B weights
+> deleted post-cycle.** The 2026-05-22 BF16 frozen-base cycle proved the
+> binding constraint is teacher+student+tape co-residency, not weight
+> storage — strictest no-eval shape still hit 15871/16384 MiB and OOM'd at
+> `mean_backward_device`. See
+> [`docs/projects/2026-05-22-opd-9b-teacher-bf16-cycle-wrap.md`](../projects/2026-05-22-opd-9b-teacher-bf16-cycle-wrap.md)
+> for the full evidence and verdict. To unblock this plan: move teacher to
+> a separate GPU/host (use the `ApiTeacher` / `MultiTeacher` track from
+> [`2026-05-21-opd-teacher-api-and-multiteacher-plan.md`](2026-05-21-opd-teacher-api-and-multiteacher-plan.md)),
+> or run on a ≥24 GB card. Re-download Qwen3.5-9B weights from ModelScope
+> before retrying.
+>
+> **Original status:** plan / coordination doc. Owns the 6-phase execution
+> of a real large-to-small OPD distillation experiment using ARLE's full
+> stack (teacher inference via `infer`, student OPD step via `train`),
 > benchmarked head-to-head against PyTorch + TRL on industry-standard
 > evaluations (MMLU + IFEval). Companion to the
 > [usage manual](../projects/2026-05-21-arle-opd-cuda-usage-manual.md) and
