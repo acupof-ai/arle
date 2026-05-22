@@ -125,6 +125,19 @@ Operators wanting only the serving binary can use `infer` directly — same HTTP
 
 <!-- Last 1-2 entries. Older history → CHANGELOG.md. -->
 
+**2026-05-22 — ARLE OPD pipeline closed end-to-end, GDR prefill bug fixed.**
+4B BF16 teacher → 0.8B-Base LoRA r=16 student, train→save→load→eval loop in one cycle. ARLE serve cross-validated against HF `transformers` reference: same Qwen3.5-4B, MMLU 5-shot n=171, **77.33 % vs 78.18 % (Δ +0.85 pp, statistically equivalent)** — engines agree.
+
+![ARLE OPD distill trajectory (U-curve valley → recovery) + ARLE serve vs HF transformers cross-validation](docs/projects/img/2026-05-22-arle-opd-distill-trajectory.png)
+
+- **Bug fixed:** `arle serve` corruption on prompts ≥ 33 tokens (Qwen3.5 hybrid GDR chunkwise prefill divergence) → MMLU recovered 0/171 invalid → 116/150 = 77.3 % ([`a374108`](https://github.com/cklxx/arle/commit/a374108)).
+- **Pipeline closed:** OPD train saves LoRA adapter (PEFT format) → `INFER_LORA_PATH` loads in CUDA serve → `scripts/arle_capability_eval.py` produces before/after MMLU table.
+- **Distill trajectory at lr=2e-5, 2 000 steps:** classic OPD U-curve. Base 51.4 % → step 1000 valley 47.9 % (−3.5 pp, invalid 29 → 2) → step 2000 50.0 % (recovering, +2.1 pp). KL bottoms at step 1000, but MMLU keeps moving — **KL ≠ capability** in the recovery phase. Literature horizon (10 k–100 k steps) needed to cross the +25.9 pp 4B teacher ceiling.
+
+Evidence: [`serve fix`](docs/experience/wins/2026-05-22-arle-serve-long-prompt-bug-fix.md) · [`pipeline close`](docs/experience/wins/2026-05-22-p1b-train-save-load-eval-loop.md) · [`U-curve diagnosis`](docs/experience/wins/2026-05-22-distill-trajectory-valley-then-recovery.md) · [`cross-validation`](docs/experience/wins/2026-05-22-arle-vs-hf-transformers-cross-validation.md) · [`cycle wrap`](docs/projects/2026-05-22-serve-fix-and-capability-baselines.md)
+
+---
+
 **2026-05-21 — ARLE OPD CUDA: faster + smaller vs HuggingFace TRL.**
 Same Qwen3-0.6B teacher/student, 32 prompts, `rollout_len=8`, `lr=1e-7`, 500 steps, AdamW, RTX 4070 Ti SUPER.
 
