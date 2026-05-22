@@ -65,12 +65,19 @@ cuda-kernels = { path = "../crates/cuda-kernels", default-features = false }
 qwen3-spec = { path = "../crates/qwen3-spec" }
 qwen35-spec = { path = "../crates/qwen35-spec" }
 deepseek-spec = { path = "../crates/deepseek-spec" }
+# autograd is only used by the cuda-only `qwen35_train_vs_infer_parity`
+# example. Declared as an optional regular dep (not dev-dep) so its
+# `cuda` feature only activates when infer's `cuda` feature is on —
+# otherwise `cargo test --lib --features no-cuda` would transitively
+# pull cudarc through the dev-dep feature-unification path and fail in
+# CPU-only CI runners that have no nvcc.
+autograd = { path = "../crates/autograd", default-features = false, features = ["safetensors"], optional = true }
 
 [features]
 # Enable CUDA kernel compilation and GPU inference (default on Linux/GPU machines).
 #
 # CUDA builds use TileLang as the only AOT attention/GDR compiler surface.
-cuda = ["dep:cudarc", "dep:libc", "dep:memmap2", "cuda-kernels/cuda"]
+cuda = ["dep:cudarc", "dep:libc", "dep:memmap2", "dep:autograd", "autograd/cuda", "cuda-kernels/cuda"]
 # Disable CUDA – allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
 no-cuda = ["cuda-kernels/no-cuda"]
 # NCCL FFI for multi-GPU collectives. Implies `cuda` (NCCL needs CUDA).
@@ -113,7 +120,6 @@ cc = "1.0"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
-autograd = { path = "../crates/autograd", default-features = false, features = ["cuda", "safetensors"] }
 train = { path = "../crates/train", default-features = false }
 base64 = "0.22"
 tower = "0.5"
@@ -195,6 +201,11 @@ required-features = ["cpu"]
 [[example]]
 name = "regenerate_test_data"
 path = "examples/regenerate_test_data.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_train_vs_infer_parity"
+path = "examples/qwen35_train_vs_infer_parity.rs"
 required-features = ["cuda"]
 
 [[bench]]
