@@ -130,6 +130,24 @@ back to the user.
 - Teacher API plan: [`../plans/2026-05-21-opd-teacher-api-and-multiteacher-plan.md`](../plans/2026-05-21-opd-teacher-api-and-multiteacher-plan.md)
 - OPD CUDA usage manual: [`2026-05-21-arle-opd-cuda-usage-manual.md`](2026-05-21-arle-opd-cuda-usage-manual.md)
 
+## Post-cycle weight cleanup (2026-05-22)
+
+Local 9B model weights deleted after this cycle wrapped — they served their
+purpose as evidence (loader bug surface, parity reference, OOM target) but
+are no longer load-bearing on 16 GB hardware. ~28 GB reclaimed:
+
+- `~/.cache/modelscope/hub/Qwen/Qwen3___5-9B` (19 GB, BF16 base / parity ref)
+- `~/.cache/modelscope/hub/DavidWen2025/Qwen3___5-9B-GPTQ-4bit` (11 GB, GPTQModel 4bit)
+- `~/.cache/modelscope/hub/RedHatAI/Qwen3___5-9B-FP8-dynamic` (20 MB, killed)
+- `~/.cache/modelscope/hub/Qwen/Qwen3___5-9B-Instruct` (empty)
+- `~/.cache/huggingface/hub/models--mssfj--Qwen3.5-9B-GPTQ-INT4` (empty shell)
+- `._____temp/` 9B subdirs (empty)
+- All symlinks under `Qwen/` and `DavidWen2025/`
+
+To retry 9B work later: re-download from ModelScope. Evidence numbers in
+`docs/experience/errors/` + bench artifacts in `bench-output/...` are
+preserved — the weights themselves are reproducible from upstream.
+
 ## Cooperative-cycle protocol notes (validated this session)
 
 - **Audit-before-substrate works at fine granularity too**: the

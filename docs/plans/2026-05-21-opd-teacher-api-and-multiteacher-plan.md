@@ -51,14 +51,22 @@ Therefore an API-backed OPD teacher needs one of these contracts:
 
 ## Local 9B Availability Result
 
-Latest local inventory:
+**2026-05-22 update — local 9B weights deleted post-cycle.** The 2026-05-22
+BF16 frozen-base cycle proved same-card 9B OPD is hardware-blocked on
+16 GB (teacher+student+tape co-residency, peak 15871/16384 MiB before
+backward). Cycle wrap:
+[`docs/projects/2026-05-22-opd-9b-teacher-bf16-cycle-wrap.md`](../projects/2026-05-22-opd-9b-teacher-bf16-cycle-wrap.md).
+~28 GB reclaimed. Re-download from ModelScope if/when a 9B retry on
+≥24 GB hardware or via remote `ApiTeacher` becomes viable.
 
-| Checkpoint | Local status | Runtime status |
+The historical inventory below records what was on disk during the cycle:
+
+| Checkpoint | Local status (pre-cleanup) | Runtime status |
 | --- | --- | --- |
-| `Qwen/Qwen3.5-9B` BF16 | Complete, 18.0 GiB files | Fails ARLE CUDA serve on 16 GB: H2D OOM before readiness |
-| `Qwen/Qwen3.5-9B-Instruct` | Directory exists, no weights | Not usable |
-| `DavidWen2025/Qwen3.5-9B-GPTQ-4bit` | Complete, 10.35 GiB safetensors | Experimental GPTQModel W4 loader reaches HTTP readiness behind `INFER_EXPERIMENTAL_GPTQMODEL_W4=1`; generation quality gate fails with repeated `!`, so not OPD-licensed |
-| `RedHatAI/Qwen3.5-9B-FP8-dynamic` | Metadata only | Loader blocked: compressed-tensors `.weight_scale` unsupported |
+| `Qwen/Qwen3.5-9B` BF16 | Complete, 18.0 GiB files (DELETED) | Fails ARLE CUDA serve on 16 GB: H2D OOM before readiness |
+| `Qwen/Qwen3.5-9B-Instruct` | Directory exists, no weights (DELETED) | Not usable |
+| `DavidWen2025/Qwen3.5-9B-GPTQ-4bit` | Complete, 10.35 GiB safetensors (DELETED) | Experimental GPTQModel W4 loader reaches HTTP readiness behind `INFER_EXPERIMENTAL_GPTQMODEL_W4=1`; generation quality gate fails with repeated `!`, so not OPD-licensed |
+| `RedHatAI/Qwen3.5-9B-FP8-dynamic` | Metadata only (DELETED) | Loader blocked: compressed-tensors `.weight_scale` unsupported |
 
 Raw evidence:
 
