@@ -22,12 +22,17 @@ mod app {
         opd::{opd_step_with_teacher_forward_profiled, OpdStepConfig, OpdStepProfile},
         prompts::load_jsonl_prompt_sets,
         qwen35::Qwen35Model,
+        qwen35_checkpoint::{
+            save_named_qwen35_student_checkpoint, save_qwen35_student_checkpoint, ConfigJsonSource,
+            GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StepCheckpoint,
+            Qwen35StudentWeights,
+        },
         qwen35_loader::load_qwen35_lora_from_hf_dir,
         teacher_infer::{
             ApiTeacher, InferTeacher, MultiTeacher, TeacherEntry, TeacherForward, TeacherRoute,
         },
         trainer::extend_keep_with_params_and_grads,
-        LoraConfig, LoraTargetSet,
+        LoraAdapterConfig, LoraConfig, LoraTargetSet,
     };
 
     const DEFAULT_QWEN35_08B_DIR: &str =
@@ -58,6 +63,8 @@ mod app {
         prompt_max_tokens: usize,
         max_step_seconds: Option<f64>,
         enable_cuda_graph: bool,
+        save_student_checkpoint: Option<PathBuf>,
+        save_every: usize,
     }
 
     #[derive(Debug)]
@@ -127,7 +134,7 @@ mod app {
              lora_rank={LORA_RANK} lora_alpha={LORA_ALPHA:.6} lora_target_set={} \
              steps={} rollout_len={} lr={:.9e} grad_clip={GRAD_CLIP} \
              prompt_source={} train_prompt_count={} heldout_prompt_count={} \
-             eval_steps={:?} cuda_graph={}",
+             eval_steps={:?} cuda_graph={} save_student_checkpoint={} save_every={}",
             args.teacher_model.display(),
             args.teacher_api_url.as_deref().unwrap_or("none"),
             args.teacher_config
@@ -143,7 +150,12 @@ mod app {
             prompts.train.len(),
             prompts.heldout.len(),
             args.eval_steps,
-            args.enable_cuda_graph
+            args.enable_cuda_graph,
+            args.save_student_checkpoint
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            args.save_every
         );
         for (idx, prompt) in prompts.train.iter().enumerate() {
             println!("prompt split=train index={idx} ids={prompt:?}");
@@ -273,6 +285,8 @@ mod app {
         let mut prompt_max_tokens = DEFAULT_PROMPT_MAX_TOKENS;
         let mut max_step_seconds = None;
         let mut enable_cuda_graph = true;
+        let mut save_student_checkpoint = None;
+        let mut save_every = 0usize;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -298,6 +312,10 @@ mod app {
                 "--max-step-seconds" => {
                     max_step_seconds = Some(next_arg(&mut args, &arg)?.parse::<f64>()?)
                 }
+                "--save-student-checkpoint" => {
+                    save_student_checkpoint = Some(PathBuf::from(next_arg(&mut args, &arg)?))
+                }
+                "--save-every" => save_every = next_arg(&mut args, &arg)?.parse::<usize>()?,
                 "--no-cuda-graph" => enable_cuda_graph = false,
                 "--help" | "-h" => {
                     println!(
@@ -306,7 +324,7 @@ mod app {
                          [--teacher-api-url URL] [--teacher-config JSON] [--prompts-file JSONL] \
                          [--steps N] [--rollout-len N] [--lr LR] \
                          [--eval-steps CSV] [--prompt-max-tokens N] [--max-step-seconds SEC] \
-                         [--no-cuda-graph]"
+                         [--save-student-checkpoint DIR] [--save-every N] [--no-cuda-graph]"
                     );
                     std::process::exit(0);
                 }
@@ -315,6 +333,9 @@ mod app {
         }
         if teacher_api_url.is_some() && teacher_config.is_some() {
             return Err("--teacher-api-url and --teacher-config are mutually exclusive".into());
+        }
+        if save_every > 0 && save_student_checkpoint.is_none() {
+            return Err("--save-every requires --save-student-checkpoint".into());
         }
         if eval_steps.is_empty() {
             eval_steps = if steps == 1 {
@@ -340,6 +361,8 @@ mod app {
             prompt_max_tokens,
             max_step_seconds,
             enable_cuda_graph,
+            save_student_checkpoint,
+            save_every,
         })
     }
 
@@ -548,7 +571,15 @@ mod app {
                 store,
                 tape,
             )?;
+            maybe_save_student_checkpoint(
+                args,
+                CheckpointTarget::Step(step),
+                student,
+                store,
+                tape,
+            )?;
         }
+        maybe_save_student_checkpoint(args, CheckpointTarget::Final, student, store, tape)?;
         println!(
             "training_summary teacher_source={teacher_source} total_steps={} total_wall_seconds={:.6} mean_step_seconds={:.6} \
              median_step_seconds={:.6} first_loss={:.12e} final_loss={:.12e} \
@@ -565,6 +596,152 @@ mod app {
             )
         );
         Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    enum CheckpointTarget {
+        Step(usize),
+        Final,
+    }
+
+    fn maybe_save_student_checkpoint(
+        args: &Args,
+        target: CheckpointTarget,
+        student: &Qwen35Model,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(out_dir) = args.save_student_checkpoint.as_ref() else {
+            return Ok(());
+        };
+        match target {
+            CheckpointTarget::Step(step) => {
+                if args.save_every == 0 || step % args.save_every != 0 {
+                    return Ok(());
+                }
+                save_student_checkpoint(
+                    args,
+                    out_dir,
+                    CheckpointTarget::Step(step),
+                    student,
+                    store,
+                    tape,
+                )
+            }
+            CheckpointTarget::Final => save_student_checkpoint(
+                args,
+                out_dir,
+                CheckpointTarget::Final,
+                student,
+                store,
+                tape,
+            ),
+        }
+    }
+
+    fn save_student_checkpoint(
+        args: &Args,
+        out_dir: &Path,
+        target: CheckpointTarget,
+        student: &Qwen35Model,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fs::create_dir_all(out_dir)?;
+        let started = Instant::now();
+        let adapter_config = lora_adapter_config(&args.student_model);
+        let sources = checkpoint_sources(args)?;
+        let tokenizer_path = sources.tokenizer_path.as_deref();
+        let saved_dir = match target {
+            CheckpointTarget::Step(step) => save_qwen35_student_checkpoint(
+                Qwen35StepCheckpoint {
+                    out_dir,
+                    step,
+                    tokenizer_path,
+                    config_json: ConfigJsonSource::CopyFrom(&sources.config_path),
+                    generation_config: GenerationConfigSource::CopyOrSynthesize {
+                        source_path: &sources.generation_config_path,
+                        fallback_config_path: &sources.config_path,
+                    },
+                },
+                student,
+                store,
+                tape,
+                Qwen35StudentWeights::AdapterOnly {
+                    bf16: true,
+                    adapter_config: &adapter_config,
+                },
+            )?,
+            CheckpointTarget::Final => save_named_qwen35_student_checkpoint(
+                Qwen35NamedCheckpoint {
+                    out_dir,
+                    dirname: "final",
+                    tokenizer_path,
+                    config_json: ConfigJsonSource::CopyFrom(&sources.config_path),
+                    generation_config: GenerationConfigSource::CopyOrSynthesize {
+                        source_path: &sources.generation_config_path,
+                        fallback_config_path: &sources.config_path,
+                    },
+                },
+                student,
+                store,
+                tape,
+                Qwen35StudentWeights::AdapterOnly {
+                    bf16: true,
+                    adapter_config: &adapter_config,
+                },
+            )?,
+        };
+        println!(
+            "checkpoint_saved kind=lora_adapter target={} dir={} seconds={:.6}",
+            match target {
+                CheckpointTarget::Step(step) => format!("step_{step:06}"),
+                CheckpointTarget::Final => "final".to_owned(),
+            },
+            saved_dir.display(),
+            started.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+
+    struct CheckpointSources {
+        tokenizer_path: Option<PathBuf>,
+        config_path: PathBuf,
+        generation_config_path: PathBuf,
+    }
+
+    fn checkpoint_sources(args: &Args) -> Result<CheckpointSources, Box<dyn std::error::Error>> {
+        let config_path = args.student_model.join("config.json");
+        if !config_path.is_file() {
+            return Err(format!(
+                "student config.json not found at {}; adapter checkpoint save needs the base HF config",
+                config_path.display()
+            )
+            .into());
+        }
+        let tokenizer_path = args.student_model.join("tokenizer.json");
+        let generation_config_path = args.student_model.join("generation_config.json");
+        Ok(CheckpointSources {
+            tokenizer_path: tokenizer_path.is_file().then_some(tokenizer_path),
+            config_path,
+            generation_config_path,
+        })
+    }
+
+    fn lora_adapter_config(student_model: &Path) -> LoraAdapterConfig {
+        let mut config = LoraAdapterConfig::new(
+            student_model.display().to_string(),
+            "qwen35",
+            LoraConfig {
+                rank: LORA_RANK,
+                alpha: LORA_ALPHA,
+            },
+        );
+        config.target_modules = match LORA_TARGET_SET {
+            LoraTargetSet::AttentionQv => vec!["q_proj".to_owned(), "v_proj".to_owned()],
+            LoraTargetSet::AllLinear => vec!["all-linear".to_owned()],
+        };
+        config
     }
 
     fn build_api_teacher(
