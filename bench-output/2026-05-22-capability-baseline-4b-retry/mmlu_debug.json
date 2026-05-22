@@ -1,0 +1,37 @@
+[
+  {
+    "i": 0,
+    "subject": "abstract_algebra",
+    "gold": "B",
+    "extracted": null,
+    "response_first_200": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  },
+  {
+    "i": 1,
+    "subject": "abstract_algebra",
+    "gold": "C",
+    "extracted": null,
+    "response_first_200": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  },
+  {
+    "i": 2,
+    "subject": "abstract_algebra",
+    "gold": "D",
+    "extracted": null,
+    "response_first_200": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  },
+  {
+    "i": 3,
+    "subject": "anatomy",
+    "gold": "A",
+    "extracted": null,
+    "response_first_200": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  },
+  {
+    "i": 4,
+    "subject": "anatomy",
+    "gold": "B",
+    "extracted": null,
+    "response_first_200": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  }
+]

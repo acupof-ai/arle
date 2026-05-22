@@ -1,0 +1,37 @@
+[
+  {
+    "i": 0,
+    "subject": "abstract_algebra",
+    "gold": "B",
+    "extracted": null,
+    "response_first_200": "zBuilding\n\n(111?\n then about? Whatart???\n\n\n\n\n  \n\n, 33&m"
+  },
+  {
+    "i": 1,
+    "subject": "abstract_algebra",
+    "gold": "C",
+    "extracted": null,
+    "response_first_200": "\u0651\u0639it\u00e9\u4e8c.\n\n What\n1  \nM8/\n50's\u30015505555551j15"
+  },
+  {
+    "i": 2,
+    "subject": "abstract_algebra",
+    "gold": "D",
+    "extracted": "A",
+    "response_first_200": "\u6d66SL\",npmf\ufffd a|\u7684\uff0c,tr|\n\nbpa\uff0c (Symec,IAHA. is.2c73,"
+  },
+  {
+    "i": 3,
+    "subject": "anatomy",
+    "gold": "A",
+    "extracted": "A",
+    "response_first_200": " a \"3  V,\n\n\n\u7ecf\u6d4e (42actly\n"
+  },
+  {
+    "i": 4,
+    "subject": "anatomy",
+    "gold": "B",
+    "extracted": null,
+    "response_first_200": "\u6c9f^\n\n This\u5c31\u4e0d/cl.\u8d44_bad,az**</\n This is\n doesives\u62a5 bodies-\n\n_ to,: quais\ns is"
+  }
+]
