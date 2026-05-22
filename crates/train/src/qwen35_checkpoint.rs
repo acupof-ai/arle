@@ -7,7 +7,7 @@ use autograd::{AutogradError, SafetensorsRegistry, Tape, TensorId, TensorStore};
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde_json::json;
 use thiserror::Error;
-use tokenizers::{Tokenizer, models::wordlevel::WordLevel};
+use tokenizers::{models::wordlevel::WordLevel, Tokenizer};
 
 use crate::{
     causal_lm::{live_tensor_ids, save_materialized_registry},
@@ -56,6 +56,14 @@ pub struct Qwen35StepCheckpoint<'a> {
     pub generation_config: GenerationConfigSource<'a>,
 }
 
+pub struct Qwen35NamedCheckpoint<'a> {
+    pub out_dir: &'a Path,
+    pub dirname: &'a str,
+    pub tokenizer_path: Option<&'a Path>,
+    pub config_json: ConfigJsonSource<'a>,
+    pub generation_config: GenerationConfigSource<'a>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Qwen35StudentWeights<'a> {
     /// Save a full model checkpoint. For LoRA students this materializes
@@ -91,18 +99,63 @@ fn save_step_checkpoint_with_artifact<F>(
 where
     F: FnOnce(&Path) -> Result<(), Qwen35CheckpointError>,
 {
+    let step_basename = format!("step_{:06}", spec.step);
+    save_named_checkpoint_with_artifact(
+        Qwen35NamedCheckpoint {
+            out_dir: spec.out_dir,
+            dirname: &step_basename,
+            tokenizer_path: spec.tokenizer_path,
+            config_json: spec.config_json,
+            generation_config: spec.generation_config,
+        },
+        artifact_filename,
+        save_artifact,
+    )
+}
+
+pub fn save_named_qwen35_student_checkpoint<'a>(
+    spec: Qwen35NamedCheckpoint<'_>,
+    student: &Qwen35Model,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    weights: Qwen35StudentWeights<'a>,
+) -> Result<PathBuf, Qwen35CheckpointError> {
+    match weights {
+        Qwen35StudentWeights::FullMaterialized { bf16 } => {
+            save_named_checkpoint_with_artifact(spec, MODEL_WEIGHTS_FILENAME, |weights_path| {
+                save_full_materialized_weights(student, store, tape, weights_path, bf16)
+            })
+        }
+        Qwen35StudentWeights::AdapterOnly {
+            bf16,
+            adapter_config,
+        } => save_named_checkpoint_with_artifact(spec, ADAPTER_WEIGHTS_FILENAME, |weights_path| {
+            save_adapter_only_weights(student, store, weights_path, bf16, adapter_config)
+        }),
+    }
+}
+
+fn save_named_checkpoint_with_artifact<F>(
+    spec: Qwen35NamedCheckpoint<'_>,
+    artifact_filename: &'static str,
+    save_artifact: F,
+) -> Result<PathBuf, Qwen35CheckpointError>
+where
+    F: FnOnce(&Path) -> Result<(), Qwen35CheckpointError>,
+{
+    validate_checkpoint_dirname(spec.dirname)?;
     let synth_tokenizer_cfg = match &spec.config_json {
         ConfigJsonSource::Synthesize { cfg, .. } => Some(*cfg),
         ConfigJsonSource::CopyFrom(_) => None,
     };
-    let step_basename = format!("step_{:06}", spec.step);
-    let step_dir = spec.out_dir.join(&step_basename);
+    let step_basename = spec.dirname;
+    let step_dir = spec.out_dir.join(step_basename);
     if step_dir.exists() {
         return Err(Qwen35CheckpointError::Custom(format!(
-            "OPD checkpoint step directory {} already exists. Hint: choose a \
-             fresh step number or inspect/remove the existing directory before \
+            "OPD checkpoint directory {} already exists. Hint: choose a \
+             fresh step or checkpoint name, or inspect/remove the existing directory before \
              retrying; refusing to merge new checkpoint artifacts into an \
-             existing step directory.",
+             existing checkpoint directory.",
             step_dir.display()
         )));
     }
@@ -123,7 +176,7 @@ where
 
         let artifact_path = step_dir.join(artifact_filename);
         save_artifact(&artifact_path)?;
-        publish_latest_after_artifact(spec.out_dir, &step_basename, artifact_filename)?;
+        publish_latest_after_artifact(spec.out_dir, step_basename, artifact_filename)?;
         Ok(step_dir.clone())
     })();
 
@@ -131,6 +184,21 @@ where
         let _ = fs::remove_dir_all(&step_dir);
     }
     result
+}
+
+fn validate_checkpoint_dirname(dirname: &str) -> Result<(), Qwen35CheckpointError> {
+    if dirname.is_empty()
+        || dirname == "."
+        || dirname == ".."
+        || dirname.contains('/')
+        || dirname.contains('\\')
+    {
+        return Err(Qwen35CheckpointError::Custom(format!(
+            "invalid OPD checkpoint directory name {dirname:?}; use a single \
+             path component such as `step_000500` or `final`"
+        )));
+    }
+    Ok(())
 }
 
 pub fn save_qwen35_student_checkpoint<'a>(
@@ -472,11 +540,11 @@ mod tests {
     use super::*;
     use crate::{
         lora::{LoraAdapterConfig, LoraConfig},
-        opd::{OpdStepConfig, opd_step},
+        opd::{opd_step, OpdStepConfig},
         qwen35::Qwen35Model,
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
     };
-    use autograd::{Tape, TensorStore, optim::AdamW};
+    use autograd::{optim::AdamW, Tape, TensorStore};
     use half::bf16;
     use safetensors::{Dtype, SafeTensors};
     use tempfile::tempdir;
@@ -869,6 +937,56 @@ mod tests {
     }
 
     #[test]
+    fn save_named_qwen35_student_checkpoint_writes_final_adapter_dir() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = tiny_qwen35_config();
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let lora = test_lora_config();
+        let adapter_config = test_adapter_config(lora);
+        let student =
+            Qwen35Model::new_with_lora(&cfg, Some(lora), &mut store).expect("lora student");
+
+        let final_dir = save_named_qwen35_student_checkpoint(
+            Qwen35NamedCheckpoint {
+                out_dir: tmp.path(),
+                dirname: "final",
+                tokenizer_path: None,
+                config_json: ConfigJsonSource::Synthesize {
+                    cfg: &cfg,
+                    torch_dtype: "float32",
+                },
+                generation_config: GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            &student,
+            &mut store,
+            &mut tape,
+            Qwen35StudentWeights::AdapterOnly {
+                bf16: false,
+                adapter_config: &adapter_config,
+            },
+        )
+        .expect("save final adapter checkpoint");
+
+        assert_eq!(
+            final_dir.file_name().and_then(|name| name.to_str()),
+            Some("final")
+        );
+        assert!(final_dir.join("adapter_model.safetensors").is_file());
+        assert!(final_dir.join("adapter_config.json").is_file());
+        assert!(
+            tmp.path()
+                .join("latest")
+                .join("adapter_model.safetensors")
+                .is_file(),
+            "latest should point at the named final adapter checkpoint"
+        );
+    }
+
+    #[test]
     fn save_qwen35_student_checkpoint_adapter_only_bf16_uses_bf16_dtype() {
         let tmp = tempdir().expect("tempdir");
         let cfg = tiny_qwen35_config();
@@ -951,11 +1069,9 @@ mod tests {
             "full materialized save must not retain merged LoRA temporary tensors"
         );
         let names = safetensor_names(&step_dir.join("model.safetensors"));
-        assert!(
-            names
-                .iter()
-                .any(|name| name == cfg.embed_tokens_tensor_name())
-        );
+        assert!(names
+            .iter()
+            .any(|name| name == cfg.embed_tokens_tensor_name()));
         assert!(
             names.iter().all(|name| !name.contains(".lora_")),
             "full materialized checkpoint should use base HF tensor names: {names:?}"
