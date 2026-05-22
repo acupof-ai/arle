@@ -1,0 +1,37 @@
+[
+  {
+    "i": 0,
+    "subject": "abstract_algebra",
+    "gold": "B",
+    "extracted": "C",
+    "response_first_200": " C\n\nThe following are called the only thing to do with the following:\n- Theorem of Arithmetic and Complexes (Theorem 1.20"
+  },
+  {
+    "i": 1,
+    "subject": "abstract_algebra",
+    "gold": "C",
+    "extracted": "A",
+    "response_first_200": " A\n\nThe following are called the number of ways of thinking of the number of the number of the number of the number of the number of the number of the"
+  },
+  {
+    "i": 2,
+    "subject": "abstract_algebra",
+    "gold": "D",
+    "extracted": "C",
+    "response_first_200": " C\n\nThe following are called the only thing you and the\nA) 1\nB) 2\nC) 3\nD) 4"
+  },
+  {
+    "i": 3,
+    "subject": "anatomy",
+    "gold": "A",
+    "extracted": "C",
+    "response_first_200": " C\n\nThe following are the only candidates of the disease.\nA:\nB:\nC:\nD:\nE:\nF:\nG"
+  },
+  {
+    "i": 4,
+    "subject": "anatomy",
+    "gold": "B",
+    "extracted": "A",
+    "response_first_200": " A"
+  }
+]
