@@ -1,0 +1,20 @@
+{
+  "backend": "arle",
+  "base_url": "http://localhost:8127",
+  "model_path": null,
+  "model_id": "Qwen3___5-0___8B-Base",
+  "tasks": {
+    "gsm8k": {
+      "task": "gsm8k",
+      "status": "ok",
+      "n_samples": 200,
+      "n_scored": 190,
+      "n_invalid": 10,
+      "n_correct": 6,
+      "accuracy": 0.031578947368421054,
+      "elapsed_seconds": 171.65379643440247
+    }
+  },
+  "started_at": "2026-05-23T01:11:32",
+  "finished_at": "2026-05-23T01:14:30"
+}
