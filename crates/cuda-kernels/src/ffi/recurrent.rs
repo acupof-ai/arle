@@ -17,6 +17,22 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn gated_delta_rule_prefill_recurrent_cuda(
+        qkv: *const Half,
+        b_proj: *const Half,
+        a_proj: *const Half,
+        dt_bias: *const Half,
+        A_log: *const f32,
+        state: *mut f32,
+        output: *mut Half,
+        num_key_heads: i32,
+        num_value_heads: i32,
+        key_dim: i32,
+        val_dim: i32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn conv1d_decode_batch_cuda(
         x_batch: *const Half,
         conv_weight: *const Half,

@@ -1,0 +1,83 @@
+[
+  {
+    "reps": 5,
+    "tokens": 20,
+    "ok": true,
+    "error": null,
+    "output": " Paris. The capital of France is Paris. The capital of France is Paris.",
+    "output_first_120": " Paris. The capital of France is Paris. The capital of France is Paris.",
+    "elapsed_s": 0.385
+  },
+  {
+    "reps": 6,
+    "tokens": 23,
+    "ok": true,
+    "error": null,
+    "output": " Paris. The capital of France is Paris. The capital of France is Paris.",
+    "output_first_120": " Paris. The capital of France is Paris. The capital of France is Paris.",
+    "elapsed_s": 0.06
+  },
+  {
+    "reps": 7,
+    "tokens": 26,
+    "ok": true,
+    "error": null,
+    "output": " Paris. The capital of France is Paris. The capital of France is Paris.",
+    "output_first_120": " Paris. The capital of France is Paris. The capital of France is Paris.",
+    "elapsed_s": 0.06
+  },
+  {
+    "reps": 8,
+    "tokens": 29,
+    "ok": true,
+    "error": null,
+    "output": " Paris. The capital of France is Paris. The capital of France is Paris.",
+    "output_first_120": " Paris. The capital of France is Paris. The capital of France is Paris.",
+    "elapsed_s": 0.059
+  },
+  {
+    "reps": 9,
+    "tokens": 32,
+    "ok": true,
+    "error": null,
+    "output": " Paris. The capital of France is Paris. The capital of France is Paris.",
+    "output_first_120": " Paris. The capital of France is Paris. The capital of France is Paris.",
+    "elapsed_s": 0.06
+  },
+  {
+    "reps": 10,
+    "tokens": 35,
+    "ok": true,
+    "error": null,
+    "output": " with | |,\nCact, is the process of the\ncor,",
+    "output_first_120": " with | |,\nCact, is the process of the\ncor,",
+    "elapsed_s": 0.062
+  },
+  {
+    "reps": 11,
+    "tokens": 38,
+    "ok": true,
+    "error": null,
+    "output": "亦\n\n\r\n\n3 it? people\n\n\n Sceitmo",
+    "output_first_120": "亦\n\n\r\n\n3 it? people\n\n\n Sceitmo",
+    "elapsed_s": 0.064
+  },
+  {
+    "reps": 12,
+    "tokens": 41,
+    "ok": true,
+    "error": null,
+    "output": "ac\n\nσμαN\n residown\n，根KF51\n\n",
+    "output_first_120": "ac\n\nσμαN\n residown\n，根KF51\n\n",
+    "elapsed_s": 0.066
+  },
+  {
+    "reps": 13,
+    "tokens": 44,
+    "ok": true,
+    "error": null,
+    "output": " ...Th</ on*landEl2b selfone,)",
+    "output_first_120": " ...Th</ on*landEl2b selfone,)",
+    "elapsed_s": 0.065
+  }
+]

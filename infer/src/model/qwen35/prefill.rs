@@ -12,7 +12,7 @@ use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::{KVCache, KVFormat};
 use crate::ops;
 use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
-use cuda_kernels::{ffi, kv_quant, TokenKVPool};
+use cuda_kernels::{TokenKVPool, ffi, kv_quant};
 
 pub(super) struct Qwen35PagedPrefillRequest<'a> {
     pub tokens: &'a [u32],
@@ -812,6 +812,8 @@ impl Qwen35Model {
             .map(|bufs| !bufs.matches_shape(seq_len, page_size))
             .unwrap_or(true);
         if needs_realloc {
+            *batch_guard = None;
+            self.ctx.sync()?;
             *batch_guard = Some(PagedPrefillBuffers35::new(
                 &self.ctx,
                 &self.config,

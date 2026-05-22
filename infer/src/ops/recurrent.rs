@@ -168,6 +168,52 @@ pub(crate) fn gated_delta_rule_decode_into(
     Ok(())
 }
 
+fn gated_delta_rule_prefill_recurrent_into(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    b_proj: &HiddenStates,
+    a_proj: &HiddenStates,
+    weights: &GdrWeights<'_>,
+    state: &mut CudaSlice<f32>,
+    output: &mut HiddenStates,
+    heads: &GdrHeadConfig,
+) -> Result<()> {
+    ensure!(
+        qkv.seq_len == b_proj.seq_len
+            && qkv.seq_len == a_proj.seq_len
+            && qkv.seq_len == output.seq_len,
+        "GDR recurrent prefill tensors must share seq_len"
+    );
+    let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
+    let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = weights.dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = weights.a_log.device_ptr(&ctx.stream);
+    let (s_ptr, _gs) = state.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::gated_delta_rule_prefill_recurrent_cuda(
+            qkv_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            a_ptr as *const ffi::Half,
+            dt_ptr as *const ffi::Half,
+            alog_ptr as *const f32,
+            s_ptr as *mut f32,
+            o_ptr as *mut ffi::Half,
+            heads.num_key_heads as i32,
+            heads.num_value_heads as i32,
+            heads.key_dim as i32,
+            heads.val_dim as i32,
+            qkv.seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+
+    Ok(())
+}
+
 /// Batched conv1d decode: process B requests' conv1d in one kernel launch.
 ///
 /// Per-request conv states are accessed via device pointer array — no gather/scatter.
@@ -636,6 +682,12 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
     assert_eq!(scratch.a_tril.len(), expected_chunk_a_len);
     assert_eq!(scratch.a_inv.len(), expected_chunk_ai_len);
     assert_eq!(scratch.chunk_state.len(), expected_chunk_state_len);
+
+    if qkv.seq_len > 32 {
+        return gated_delta_rule_prefill_recurrent_into(
+            ctx, qkv, b_proj, a_proj, weights, state, output, heads,
+        );
+    }
 
     gated_delta_rule_prefill_chunk_prepare_into(
         ctx,

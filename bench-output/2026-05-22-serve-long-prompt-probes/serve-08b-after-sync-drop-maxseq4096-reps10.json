@@ -1,0 +1,39 @@
+{
+  "prompt_reps": 10,
+  "response": {
+    "id": "cmpl-784bf03a-fcc1-4671-a000-7685a496ff1d",
+    "object": "text_completion",
+    "created": 1779434777,
+    "model": "Qwen3___5-0___8B-Base",
+    "choices": [
+      {
+        "text": " Paris. The capital of France is Paris. The capital of France is Paris.",
+        "index": 0,
+        "logprobs": {
+          "token_logprobs": [
+            -0.45517525,
+            -0.9998928,
+            -0.5986072,
+            -0.033487152,
+            -1.4892238,
+            -0.09326085,
+            -0.88539374,
+            -0.1097883,
+            -0.62129796,
+            -0.40492144,
+            -0.015970996,
+            -0.20343997,
+            -0.023171136,
+            -0.06068027
+          ]
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 35,
+      "completion_tokens": 16,
+      "total_tokens": 51
+    }
+  }
+}

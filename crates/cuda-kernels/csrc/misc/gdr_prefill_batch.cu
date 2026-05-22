@@ -88,6 +88,22 @@ cudaError_t gated_delta_rule_prefill_chunk_o_cuda(
     cudaStream_t stream
 );
 
+cudaError_t gated_delta_rule_prefill_recurrent_cuda(
+    const __nv_bfloat16* qkv,
+    const __nv_bfloat16* b_proj,
+    const __nv_bfloat16* a_proj,
+    const __nv_bfloat16* dt_bias,
+    const float* A_log,
+    float* state,
+    __nv_bfloat16* output,
+    int num_key_heads,
+    int num_value_heads,
+    int key_dim,
+    int val_dim,
+    int seq_len,
+    cudaStream_t stream
+);
+
 } // extern "C"
 
 namespace {
@@ -118,6 +134,24 @@ inline cudaError_t launch_chunkwise_for_sequence(
     int seq_len,
     cudaStream_t stream
 ) {
+    if (seq_len > 32) {
+        return gated_delta_rule_prefill_recurrent_cuda(
+            qkv,
+            b_proj,
+            a_proj,
+            dt_bias,
+            a_log,
+            state,
+            output,
+            num_key_heads,
+            num_value_heads,
+            key_dim,
+            val_dim,
+            seq_len,
+            stream
+        );
+    }
+
     const int qkv_dim = 2 * num_key_heads * key_dim + num_value_heads * val_dim;
     const float scale = rsqrtf(static_cast<float>(key_dim));
 

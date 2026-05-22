@@ -85,6 +85,8 @@ impl Qwen35State {
             .as_ref()
             .is_none_or(|bufs| !bufs.matches_shape(seq_len, page_size));
         if needs_realloc {
+            self.paged_prefill = None;
+            ctx.sync()?;
             self.paged_prefill = Some(PagedPrefillBuffers35::new(ctx, config, seq_len, page_size)?);
         }
         Ok(())

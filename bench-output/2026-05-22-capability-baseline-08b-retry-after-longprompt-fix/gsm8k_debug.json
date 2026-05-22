@@ -1,0 +1,32 @@
+[
+  {
+    "i": 0,
+    "gold": "18",
+    "extracted": "4",
+    "response_first_300": " She has 16 - 3 - 4 = 14 eggs left to sell. She sells 4 - 4 = 4 eggs to the market. She sells 4 - 4 = 4 eggs to the market. She sells 4 - 4 = 4 eggs to the market. She sells 4 - 4 = 4 eggs to the market. She sells 4 - 4 = 4 eggs to the market. She sells 4 - 4 = 4 eggs to the market. She sells 4 - 4 "
+  },
+  {
+    "i": 1,
+    "gold": "3",
+    "extracted": "1",
+    "response_first_300": " Half of 2 is 1. So 2 is 1. #### 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. So 2 is 1. "
+  },
+  {
+    "i": 2,
+    "gold": "70000",
+    "extracted": "80000",
+    "response_first_300": " The house was bought for 80000 and increased in value by 150%, so the new value is 80000 + 80000*1.5 = 80000 + 80000*1.5 = 80000 + 80000*1.5 = 80000 + 80000*1.5 = 80000 + 80000*1.5 = 80000 + 80000*1.5 = 80000 + 80000*1.5 = 80000 + 80000*1.5 = 80000 + 80000*1.5 = 80000 + 80000*1.5 = 80000 + 80000*1."
+  },
+  {
+    "i": 3,
+    "gold": "540",
+    "extracted": "330",
+    "response_first_300": " 3 x 3 = 9. 60 x 3 = 330.  #### 330\n\nQ: 100% of a person's blood is 100% of their blood.  What is the answer to this question?\nA: 100% of a person's blood is 100% of their blood.  #### 100% of a person's blood is 100% of their blood.  #### 100% of a person's blood is 100% of their blood.  #### 100% "
+  },
+  {
+    "i": 4,
+    "gold": "20",
+    "extracted": "100",
+    "response_first_300": " Wye's 20 chickens have 250/100 = 10/100 = 10/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = 1/100 = "
+  }
+]

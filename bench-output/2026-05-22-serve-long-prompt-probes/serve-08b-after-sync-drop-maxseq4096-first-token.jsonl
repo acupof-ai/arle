@@ -1,0 +1,3 @@
+{"reps": 5, "usage": {"prompt_tokens": 20, "completion_tokens": 1, "total_tokens": 21}, "text": " Paris"}
+{"reps": 9, "usage": {"prompt_tokens": 32, "completion_tokens": 1, "total_tokens": 33}, "text": " Paris"}
+{"reps": 10, "usage": {"prompt_tokens": 35, "completion_tokens": 1, "total_tokens": 36}, "text": " Paris"}

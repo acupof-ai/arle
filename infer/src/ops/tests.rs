@@ -6,6 +6,7 @@ use super::*;
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::*;
 
+use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 use crate::ops::linear::try_gemm_with_phase_into;
 
 fn bf16_vec(data: &[f32]) -> Vec<bf16> {
@@ -1855,6 +1856,164 @@ fn test_conv1d_prefill_handoff_matches_single_prefill() -> Result<()> {
 
     assert!(max_out_diff < 0.02, "output diff {max_out_diff}");
     assert!(max_state_diff < 0.02, "state diff {max_state_diff}");
+    Ok(())
+}
+
+#[test]
+fn test_gdr_prefill_matches_repeated_decode_at_long_prompt_threshold() -> Result<()> {
+    for seq_len in [32_usize, 33_usize, 34_usize, 35_usize] {
+        run_gdr_prefill_vs_decode_case(seq_len)?;
+    }
+    Ok(())
+}
+
+fn run_gdr_prefill_vs_decode_case(seq_len: usize) -> Result<()> {
+    let ctx = DeviceContext::new()?;
+    let heads = GdrHeadConfig {
+        num_key_heads: 16,
+        num_value_heads: 16,
+        key_dim: 128,
+        val_dim: 128,
+    };
+    let qkv_dim = 2 * heads.num_key_heads * heads.key_dim + heads.num_value_heads * heads.val_dim;
+    let head_dim = heads.num_value_heads;
+    let out_dim = heads.num_value_heads * heads.val_dim;
+    let state_len = heads.num_value_heads * heads.key_dim * heads.val_dim;
+
+    let qkv_host = bf16_vec(
+        &(0..qkv_dim * seq_len)
+            .map(|i| ((i % 257) as f32 - 128.0) * 0.001953125)
+            .collect::<Vec<_>>(),
+    );
+    let b_host = bf16_vec(
+        &(0..head_dim * seq_len)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.015625)
+            .collect::<Vec<_>>(),
+    );
+    let a_host = bf16_vec(
+        &(0..head_dim * seq_len)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.0078125)
+            .collect::<Vec<_>>(),
+    );
+    let dt_host = bf16_vec(
+        &(0..heads.num_value_heads)
+            .map(|i| -0.75 + (i as f32 % 7.0) * 0.03125)
+            .collect::<Vec<_>>(),
+    );
+    let a_log_host = (0..heads.num_value_heads)
+        .map(|i| -2.0 + (i as f32 % 11.0) * 0.015625)
+        .collect::<Vec<_>>();
+    let zero_state = vec![0.0_f32; state_len];
+
+    let qkv_prefill = HiddenStates {
+        data: ctx.stream.clone_htod(&qkv_host)?,
+        hidden_dim: qkv_dim,
+        seq_len,
+    };
+    let b_prefill = HiddenStates {
+        data: ctx.stream.clone_htod(&b_host)?,
+        hidden_dim: head_dim,
+        seq_len,
+    };
+    let a_prefill = HiddenStates {
+        data: ctx.stream.clone_htod(&a_host)?,
+        hidden_dim: head_dim,
+        seq_len,
+    };
+    let dt_bias = DeviceVec::from_host(&ctx, &dt_host)?;
+    let a_log: CudaSlice<f32> = ctx.stream.clone_htod(&a_log_host)?;
+    let weights = GdrWeights {
+        dt_bias: &dt_bias,
+        a_log: &a_log,
+    };
+
+    let mut prefill_state: CudaSlice<f32> = ctx.stream.clone_htod(&zero_state)?;
+    let mut scratch = GdrChunkwiseScratch35::from_dims(
+        &ctx,
+        heads.num_value_heads,
+        heads.key_dim,
+        heads.val_dim,
+        seq_len,
+    )?;
+    let mut prefill_out = HiddenStates::zeros(&ctx, out_dim, seq_len)?;
+    gated_delta_rule_prefill_chunkwise_into(
+        &ctx,
+        &qkv_prefill,
+        &b_prefill,
+        &a_prefill,
+        &weights,
+        &mut prefill_state,
+        &mut scratch,
+        &mut prefill_out,
+        &heads,
+    )?;
+
+    let mut decode_state: CudaSlice<f32> = ctx.stream.clone_htod(&zero_state)?;
+    let mut decode_outputs = Vec::with_capacity(out_dim * seq_len);
+    for step in 0..seq_len {
+        let qkv_step = HiddenStates {
+            data: ctx
+                .stream
+                .clone_htod(&qkv_host[qkv_dim * step..qkv_dim * (step + 1)])?,
+            hidden_dim: qkv_dim,
+            seq_len: 1,
+        };
+        let b_step = HiddenStates {
+            data: ctx
+                .stream
+                .clone_htod(&b_host[head_dim * step..head_dim * (step + 1)])?,
+            hidden_dim: head_dim,
+            seq_len: 1,
+        };
+        let a_step = HiddenStates {
+            data: ctx
+                .stream
+                .clone_htod(&a_host[head_dim * step..head_dim * (step + 1)])?,
+            hidden_dim: head_dim,
+            seq_len: 1,
+        };
+        let mut step_out = HiddenStates::zeros(&ctx, out_dim, 1)?;
+        gated_delta_rule_decode_into(
+            &ctx,
+            &qkv_step,
+            &b_step,
+            &a_step,
+            &weights,
+            &mut decode_state,
+            &mut step_out,
+            &heads,
+        )?;
+        let step_host = ctx.stream.clone_dtoh(&step_out.data)?;
+        decode_outputs.extend(step_host.into_iter().map(|x| x.to_f32()));
+    }
+
+    let prefill_host = ctx.stream.clone_dtoh(&prefill_out.data)?;
+    let prefill_state_host = ctx.stream.clone_dtoh(&prefill_state)?;
+    let decode_state_host = ctx.stream.clone_dtoh(&decode_state)?;
+    ctx.sync()?;
+    let prefill_outputs: Vec<f32> = prefill_host.iter().map(|x| x.to_f32()).collect();
+    let max_out_diff = prefill_outputs
+        .iter()
+        .zip(decode_outputs.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    let max_state_diff = prefill_state_host
+        .iter()
+        .zip(decode_state_host.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+
+    eprintln!(
+        "GDR prefill-vs-decode seq_len={seq_len}: max_out_diff={max_out_diff:.6} max_state_diff={max_state_diff:.6}"
+    );
+    assert!(
+        max_out_diff < 0.01,
+        "GDR prefill/decode output diff at seq_len={seq_len}: {max_out_diff}"
+    );
+    assert!(
+        max_state_diff < 0.01,
+        "GDR prefill/decode state diff at seq_len={seq_len}: {max_state_diff}"
+    );
     Ok(())
 }
 
