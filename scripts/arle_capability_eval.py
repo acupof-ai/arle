@@ -112,17 +112,61 @@ def _mmlu_format_shot(example: dict) -> str:
 
 
 def _mmlu_extract_letter(text: str) -> str | None:
+    """Extract the model's MMLU answer letter A/B/C/D.
+
+    Base (non-instruct) models output a variety of shapes after `Answer:`:
+        " A"                    → easy
+        " A)"                   → leading letter
+        " (A)"                  → parenthesized
+        " The answer is A."     → embedded
+        " A. <reasoning>"       → leading + reasoning
+        " <empty>"              → none
+
+    The strategy is layered: try the cleanest leading-letter match first,
+    then progressively-noisier patterns. Returns None only when the
+    response truly contains no decipherable letter in the first chunk.
+    """
+    if not text:
+        return None
     text = text.strip()
     if not text:
         return None
-    # Match a leading letter A/B/C/D, possibly followed by ) or .
-    m = re.match(r"\s*([A-D])\b", text, flags=re.IGNORECASE)
+
+    # Layer 1: leading letter, possibly with trailing punctuation.
+    #   "A", "A)", "A.", "A:"
+    m = re.match(r"([A-D])(?:[\)\.\:,;]|$|\s)", text, flags=re.IGNORECASE)
     if m:
         return m.group(1).upper()
+
+    # Layer 2: leading parenthesized letter "(A)".
+    m = re.match(r"\(([A-D])\)", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # Layer 3: "answer is X" / "answer: X" / "is X" embedded in early text.
+    early = text[:200]
+    m = re.search(
+        r"\b(?:answer\s*(?:is|:)|correct\s*(?:is|:)|option)\s*\(?\s*([A-D])\b",
+        early,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).upper()
+
+    # Layer 4: any standalone letter A-D in the first 60 chars as a last
+    # resort. Only fires when no clearer signal was found above.
+    short = text[:60]
+    m = re.search(r"\b([A-D])\b", short, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
     return None
 
 
-def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path) -> dict:
+def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path, debug_samples: int = 5) -> dict:
+    """Run MMLU 5-shot eval. Saves the first `debug_samples` raw responses
+    to <output_dir>/mmlu_debug.json so future extractor fixes can target
+    real model output instead of guessed prompt-shape."""
     try:
         from datasets import load_dataset
     except ImportError:
@@ -155,6 +199,7 @@ def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path) -> dict:
     correct = 0
     invalid = 0
     per_subject: dict[str, dict] = {}
+    debug_records: list[dict] = []
     t0 = time.time()
     for i, ex in enumerate(pool):
         subj = ex["subject"]
@@ -168,8 +213,11 @@ def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path) -> dict:
             c=ex["choices"][2],
             d=ex["choices"][3],
         )
+        # Base models often need a few tokens to commit to a letter when
+        # leading whitespace / paren / "The answer is" pattern lands.
+        # 32 tokens covers all those shapes and is still fast.
         try:
-            resp = client.completion(prompt, max_tokens=4, temperature=0.0)
+            resp = client.completion(prompt, max_tokens=32, temperature=0.0)
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             print(f"[mmlu] sample {i} request error: {exc}", flush=True)
             invalid += 1
@@ -183,6 +231,16 @@ def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path) -> dict:
         elif letter == gold:
             correct += 1
             sub_stat["correct"] += 1
+        if i < debug_samples:
+            debug_records.append(
+                {
+                    "i": i,
+                    "subject": subj,
+                    "gold": gold,
+                    "extracted": letter,
+                    "response_first_200": resp[:200],
+                }
+            )
         if (i + 1) % 50 == 0:
             print(f"[mmlu] {i + 1}/{len(pool)} acc={correct / max(1, i + 1 - invalid):.3f}", flush=True)
 
@@ -201,6 +259,8 @@ def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path) -> dict:
         "per_subject": per_subject,
     }
     (output_dir / "mmlu.json").write_text(json.dumps(report, indent=2))
+    if debug_records:
+        (output_dir / "mmlu_debug.json").write_text(json.dumps(debug_records, indent=2))
     print(f"[mmlu] accuracy={accuracy:.3f} ({correct}/{scored}, invalid={invalid}, {elapsed:.1f}s)", flush=True)
     return report
 
@@ -244,7 +304,7 @@ def _gsm8k_extract_answer(text: str) -> str | None:
     return None
 
 
-def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path) -> dict:
+def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_samples: int = 5) -> dict:
     try:
         from datasets import load_dataset
     except ImportError:
@@ -261,6 +321,7 @@ def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path) -> dict:
 
     correct = 0
     invalid = 0
+    debug_records: list[dict] = []
     t0 = time.time()
     for i, ex in enumerate(pool):
         prompt = GSM8K_FEW_SHOT + f"Q: {ex['question']}\nA:"
@@ -276,6 +337,15 @@ def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path) -> dict:
             invalid += 1
         elif pred == gold:
             correct += 1
+        if i < debug_samples:
+            debug_records.append(
+                {
+                    "i": i,
+                    "gold": gold,
+                    "extracted": pred,
+                    "response_first_300": resp[:300],
+                }
+            )
         if (i + 1) % 25 == 0:
             print(
                 f"[gsm8k] {i + 1}/{len(pool)} acc={correct / max(1, i + 1 - invalid):.3f}",
@@ -296,6 +366,8 @@ def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path) -> dict:
         "elapsed_seconds": elapsed,
     }
     (output_dir / "gsm8k.json").write_text(json.dumps(report, indent=2))
+    if debug_records:
+        (output_dir / "gsm8k_debug.json").write_text(json.dumps(debug_records, indent=2))
     print(f"[gsm8k] accuracy={accuracy:.3f} ({correct}/{scored}, invalid={invalid}, {elapsed:.1f}s)", flush=True)
     return report
 
