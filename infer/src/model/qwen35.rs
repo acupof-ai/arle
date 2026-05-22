@@ -11,6 +11,9 @@ mod decode_buffers;
 mod diagnostics;
 #[path = "qwen35/forward.rs"]
 mod forward;
+#[cfg(feature = "cuda")]
+#[path = "qwen35/lora.rs"]
+pub mod lora;
 #[path = "qwen35/prefill.rs"]
 mod prefill;
 #[path = "qwen35/prefill_buffers.rs"]

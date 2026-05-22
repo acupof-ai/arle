@@ -915,6 +915,57 @@ impl Qwen35Model {
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
         common::output_projection(self.lm_head.as_ref(), &self.embed_tokens)
     }
+
+    pub fn load_and_attach_lora(mut self, lora_path: &str) -> Result<Self> {
+        let lora = super::lora::load_peft_lora(lora_path, self.config.num_hidden_layers)?;
+        self.merge_lora(&lora)?;
+        info!(
+            "Qwen3.5 LoRA adapter merged from {} ({} tensors, r={}, alpha={:.6})",
+            lora_path, lora.tensor_count, lora.rank, lora.alpha
+        );
+        Ok(self)
+    }
+
+    fn merge_lora(&mut self, lora: &super::lora::Qwen35LoRA) -> Result<()> {
+        for (layer_idx, layer_lora) in lora.layers.iter().enumerate() {
+            if layer_lora.q_proj.is_none() && layer_lora.v_proj.is_none() {
+                continue;
+            }
+            let layer_count = self.layers.len();
+            let layer = self.layers.get_mut(layer_idx).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Qwen3.5 LoRA references layer {layer_idx}, but model has only {} layers",
+                    layer_count
+                )
+            })?;
+            let LayerKind::FullAttention(attn) = &mut layer.attn else {
+                anyhow::bail!(
+                    "Qwen3.5 LoRA references q/v adapter for layer {layer_idx}, but that layer is {:?}; only full-attention q/v adapters are supported",
+                    self.config.layer_types[layer_idx]
+                );
+            };
+            if let Some(adapter) = &layer_lora.q_proj {
+                super::lora::merge_lora_into_dense_matrix(
+                    &self.ctx,
+                    &mut attn.q_proj,
+                    adapter,
+                    lora.scale,
+                    &format!("layers.{layer_idx}.self_attn.q_proj"),
+                )?;
+            }
+            if let Some(adapter) = &layer_lora.v_proj {
+                super::lora::merge_lora_into_dense_matrix(
+                    &self.ctx,
+                    &mut attn.v_proj,
+                    adapter,
+                    lora.scale,
+                    &format!("layers.{layer_idx}.self_attn.v_proj"),
+                )?;
+            }
+        }
+        self.ctx.sync()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

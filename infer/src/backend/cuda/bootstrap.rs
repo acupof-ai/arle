@@ -14,15 +14,15 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 #[cfg(feature = "cuda")]
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 #[cfg(feature = "cuda")]
 use log::{info, warn};
 
 #[cfg(feature = "cuda")]
 use crate::model::deepseek::{DeepseekModel, DeepseekRuntimeConfig};
-use crate::model::{ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
+use crate::model::{ModelForward, ModelRuntimeConfig, Qwen35Model, Qwen3Model};
 #[cfg(feature = "cuda")]
-use crate::model_registry::{ModelArch, detect_arch};
+use crate::model_registry::{detect_arch, ModelArch};
 #[cfg(feature = "cuda")]
 use crate::model_source::ResolvedModelSource;
 #[cfg(feature = "cuda")]
@@ -227,7 +227,15 @@ pub fn load_qwen35_components(
     options: InferenceEngineOptions,
 ) -> Result<ModelComponents<Qwen35Model>> {
     load_model_with(model_path, options, |model_path, options| {
-        Qwen35Model::from_safetensors_with_options(model_path, options.enable_cuda_graph)
+        let model =
+            Qwen35Model::from_safetensors_with_options(model_path, options.enable_cuda_graph)?;
+        match std::env::var("INFER_LORA_PATH") {
+            Ok(lora_path) if !lora_path.trim().is_empty() => {
+                log::info!("Attaching Qwen3.5 LoRA adapter from {}", lora_path);
+                model.load_and_attach_lora(&lora_path)
+            }
+            _ => Ok(model),
+        }
     })
 }
 
@@ -596,8 +604,8 @@ mod tests {
     use super::SchedulerRuntimeGuard;
     use anyhow::Result;
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     };
 
     #[test]
