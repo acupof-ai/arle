@@ -209,8 +209,10 @@ def main() -> int:
     errors: list[str] = []
 
     errors.extend(check_required_files())
-    errors.extend(check_latest_updates(Path("README.md"), "## 📰 Latest Updates", 3))
-    errors.extend(check_latest_updates(Path("README.zh-CN.md"), "## 📰 最新动态", 3))
+    # `## 📰 Latest Updates` / `## 📰 最新动态` sections were intentionally
+    # dropped from the READMEs in commit 5654142 to keep them under 166
+    # lines. The check is preserved on the function side for any future
+    # opt-in, but the README is no longer required to carry it.
     errors.extend(check_markdown_links(PUBLIC_CHECK_FILES))
     errors.extend(check_disallowed_markers(PUBLIC_CHECK_FILES))
     errors.extend(check_template(Path(".github/PULL_REQUEST_TEMPLATE.md"), PR_TEMPLATE_REQUIRED_HEADINGS))
