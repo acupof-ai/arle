@@ -1,0 +1,26 @@
+
+========== mmlu ==========
+[mmlu] loading dataset...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[mmlu] sampling 171 questions across 57 subjects
+[mmlu] 50/171 acc=0.000
+[mmlu] 100/171 acc=0.000
+[mmlu] 150/171 acc=0.000
+[mmlu] accuracy=0.000 (0/0, invalid=171, 70.8s)
+
+========== gsm8k ==========
+[gsm8k] loading dataset...
+[gsm8k] running 200 problems
+[gsm8k] 25/200 acc=0.000
+[gsm8k] 50/200 acc=0.000
+[gsm8k] 75/200 acc=0.000
+[gsm8k] 100/200 acc=0.000
+[gsm8k] 125/200 acc=0.000
+[gsm8k] 150/200 acc=0.000
+[gsm8k] 175/200 acc=0.000
+[gsm8k] 200/200 acc=0.000
+[gsm8k] accuracy=0.000 (0/0, invalid=200, 824.8s)
+
+========== summary ==========
+  mmlu: 0.000 (0/0)
+  gsm8k: 0.000 (0/0)
