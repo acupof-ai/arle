@@ -3,8 +3,27 @@ name: CI
 on:
   push:
     branches: [ main, master ]
+    # Skip CI for docs-only / memory / bench-output commits — they cannot
+    # affect compile/test outcomes. Without this filter every wins/errors
+    # entry triggers a 10-15 min CI run for no value.
+    paths-ignore:
+      - 'docs/**'
+      - 'bench-output/**'
+      - 'memory/**'
+      - '**/*.md'
+      - 'CLAUDE.md'
+      - 'AGENTS.md'
+      - 'ROADMAP.md'
+      - 'CHANGELOG.md'
+      - 'README.md'
+      - 'README.zh-CN.md'
   pull_request:
     branches: [ main, master ]
+    paths-ignore:
+      - 'docs/**'
+      - 'bench-output/**'
+      - 'memory/**'
+      - '**/*.md'
 
 env:
   CARGO_TERM_COLOR: always
