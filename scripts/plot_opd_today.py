@@ -21,63 +21,52 @@ OUT = Path(__file__).resolve().parents[1] / "docs/projects/img/2026-05-22-arle-o
 
 
 def panel_trajectory(ax):
-    steps = np.array([0, 500, 1000, 2000])
-    # MMLU accuracy (%): base=51.4, step1000=47.9, step2000=50.0 measured;
-    # step 500 not eval'd → interpolate as the segment between 51.4 → 47.9.
-    mmlu_distill = np.array([51.4, np.nan, 47.9, 50.0])
+    steps = np.array([0, 1000, 2000])
+    mmlu_lr2e5 = np.array([51.4, 47.9, 50.0])
+    mmlu_lr1e5 = np.array([51.4, 50.6, 48.5])
     base_floor = 51.4
     teacher_ceiling = 77.33
 
-    # KL trajectory (×1e-5): heldout
-    kl_heldout = np.array([1.739, 1.606, 1.598, 1.599])
-
-    # MMLU axis
-    ax.set_xlim(-50, 2150)
+    ax.set_xlim(-50, 2200)
     ax.set_ylim(45, 80)
     ax.set_xlabel("training step")
-    ax.set_ylabel("MMLU 5-shot accuracy (%)", color="#1f4e79")
-    ax.tick_params(axis="y", labelcolor="#1f4e79")
+    ax.set_ylabel("MMLU 5-shot accuracy (%)")
 
-    # Teacher ceiling line
-    ax.axhline(teacher_ceiling, color="#3a7d3a", linestyle=":", linewidth=2, label=f"Teacher 4B ceiling = {teacher_ceiling:.1f}%")
-    # Base floor line
-    ax.axhline(base_floor, color="#999999", linestyle="--", linewidth=2, label=f"Base 0.8B floor = {base_floor:.1f}%")
+    # Teacher ceiling + base floor
+    ax.axhline(teacher_ceiling, color="#3a7d3a", linestyle=":", linewidth=2,
+               label=f"Teacher 4B ceiling = {teacher_ceiling:.1f}%")
+    ax.axhline(base_floor, color="#999999", linestyle="--", linewidth=2,
+               label=f"Base 0.8B floor = {base_floor:.1f}%")
 
-    # MMLU distill points (only at measured steps)
-    mask = ~np.isnan(mmlu_distill)
-    ax.plot(steps[mask], mmlu_distill[mask], "o-", color="#1f4e79", linewidth=2.5, markersize=10,
-            label="Distilled 0.8B (lr=2e-5)")
+    # lr=2e-5 (deeper valley + recovery)
+    ax.plot(steps, mmlu_lr2e5, "o-", color="#1f4e79", linewidth=2.5, markersize=10,
+            label="lr=2e-5 (deep valley → recovery)")
+    # lr=1e-5 (shallow valley + regression)
+    ax.plot(steps, mmlu_lr1e5, "s-", color="#c0392b", linewidth=2.5, markersize=10,
+            label="lr=1e-5 (shallow valley → REGRESSION)")
 
-    # Annotations
-    ax.annotate("base 51.4%\n(starting point)", xy=(0, 51.4), xytext=(150, 53.5),
-                fontsize=9, ha="left", color="#1f4e79",
+    # Annotations on key points
+    ax.annotate("lr=2e-5 valley\n47.9%", xy=(1000, 47.9), xytext=(700, 46),
+                fontsize=9, ha="center", color="#1f4e79",
                 arrowprops=dict(arrowstyle="->", color="#1f4e79", lw=0.8))
-    ax.annotate("valley\n-3.5pp", xy=(1000, 47.9), xytext=(700, 46),
+    ax.annotate("lr=2e-5 recovery\n50.0%", xy=(2000, 50.0), xytext=(2000, 53),
+                fontsize=9, ha="center", color="#1f4e79", fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color="#1f4e79", lw=0.8))
+    ax.annotate("lr=1e-5 shallow\nvalley 50.6%", xy=(1000, 50.6), xytext=(550, 56),
+                fontsize=9, ha="center", color="#c0392b",
+                arrowprops=dict(arrowstyle="->", color="#c0392b", lw=0.8))
+    ax.annotate("lr=1e-5 REGRESSED\n48.5%", xy=(2000, 48.5), xytext=(1500, 45.5),
                 fontsize=9, ha="center", color="#c0392b", fontweight="bold",
                 arrowprops=dict(arrowstyle="->", color="#c0392b", lw=0.8))
-    ax.annotate("recovering\n+2.1pp", xy=(2000, 50.0), xytext=(1650, 53),
-                fontsize=9, ha="center", color="#2980b9", fontweight="bold",
-                arrowprops=dict(arrowstyle="->", color="#2980b9", lw=0.8))
-    # Gap annotation
-    ax.annotate("",  xy=(2100, 77.33), xytext=(2100, 50.0),
+
+    # Capability gap to close
+    ax.annotate("", xy=(2150, 77.33), xytext=(2150, 50.0),
                 arrowprops=dict(arrowstyle="<->", color="#3a7d3a", lw=1.5))
-    ax.text(2120, 63.6, "+27.3pp\ngap to\nclose", fontsize=9, color="#3a7d3a", va="center")
+    ax.text(2170, 63.6, "+27.3pp\ngap\nto close", fontsize=9, color="#3a7d3a", va="center")
 
-    # KL secondary axis
-    ax2 = ax.twinx()
-    ax2.set_ylim(1.55, 1.78)
-    ax2.set_ylabel("held-out KL ×1e-5", color="#8e44ad")
-    ax2.tick_params(axis="y", labelcolor="#8e44ad")
-    ax2.plot(steps, kl_heldout, "s--", color="#8e44ad", linewidth=1.5, markersize=7, alpha=0.7,
-             label="KL held-out")
-
-    # Combined legend
-    h1, l1 = ax.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, loc="center left", fontsize=8.5, framealpha=0.9)
-
-    ax.set_title("OPD distill trajectory: U-curve valley → recovery\n4B teacher → 0.8B LoRA student, 2 000 steps, lr=2e-5",
-                 fontsize=11, fontweight="bold")
+    ax.legend(loc="lower center", fontsize=8.5, framealpha=0.9, ncol=2)
+    ax.set_title("OPD distill trajectory: lr sweep shows valley is NOT just lr-driven\n4B teacher → 0.8B LoRA student, 2 000 steps",
+                 fontsize=10.5, fontweight="bold")
     ax.grid(True, alpha=0.3)
 
 
