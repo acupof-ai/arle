@@ -1,0 +1,467 @@
+warning: cuda-kernels@0.1.5: Compiling CUDA kernels for targets: sm_89
+warning: cuda-kernels@0.1.5: TileLang AOT: built per-SM cubins for 1 target(s) across HD64/HD128/HD256 prefill, HD64/HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.
+   Compiling infer v0.1.5 (/home/ckl/projects/arle/infer)
+warning: unused import: `half::bf16`
+  --> infer/src/model/deepseek/mlp.rs:23:5
+   |
+23 | use half::bf16;
+   |     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `ensure_dispatch_payload_scratch`, `ensure_local_route_scratch`, `ensure_recv_route_scratch`, `ensure_route_logits_scratch`, and `ensure_send_route_scratch`
+  --> infer/src/model/deepseek/mlp.rs:34:67
+   |
+34 |     DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_dispatch_payload_scratch,
+   |                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+35 |     ensure_local_route_scratch, ensure_recv_route_scratch, ensure_route_logits_scratch,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+36 |     ensure_send_route_scratch,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `argmax_batch_readback_into`
+   --> infer/src/ops.rs:645:34
+    |
+645 |     argmax_batch_logprob_launch, argmax_batch_readback_into, gpu_sample_launch_raw,
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> infer/src/model/deepseek/weights.rs:188:13
+    |
+188 |         let mut comm = LayerCommunicator::new_with_ep(
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ctx`
+   --> infer/src/model/deepseek/weights.rs:185:9
+    |
+185 |         ctx: &DeviceContext,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `forward_scratch_input` and `try_forward_scratch_input_segment` are never used
+   --> infer/src/model/deepseek/mlp.rs:105:19
+    |
+ 66 | impl DeepseekV4Expert {
+    | --------------------- methods in this implementation
+...
+105 |     pub(super) fn forward_scratch_input<'a>(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+157 |     pub(super) fn try_forward_scratch_input_segment(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `dsv4_run_block_scaled_gemv_segment` is never used
+   --> infer/src/model/deepseek/mlp.rs:317:4
+    |
+317 | fn dsv4_run_block_scaled_gemv_segment(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_run_block_scaled_gemv_pair_segment` is never used
+   --> infer/src/model/deepseek/mlp.rs:404:4
+    |
+404 | fn dsv4_run_block_scaled_gemv_pair_segment(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_grouped_experts_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1090:4
+     |
+1090 | fn dsv4_grouped_experts_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_pair_expert_gemv_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1102:4
+     |
+1102 | fn dsv4_pair_expert_gemv_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_route_grouped_experts_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1114:4
+     |
+1114 | fn dsv4_route_grouped_experts_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Dsv4CountExchangeMode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1229:6
+     |
+1229 | enum Dsv4CountExchangeMode {
+     |      ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_count_exchange_mode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1235:4
+     |
+1235 | fn dsv4_count_exchange_mode() -> Result<Dsv4CountExchangeMode> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_padded_dispatch_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1251:4
+     |
+1251 | fn dsv4_padded_dispatch_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_fused_dispatch_payload_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1263:4
+     |
+1263 | fn dsv4_fused_dispatch_payload_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Dsv4CombineExchangeMode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1276:6
+     |
+1276 | enum Dsv4CombineExchangeMode {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_combine_exchange_mode` is never used
+    --> infer/src/model/deepseek/mlp.rs:1282:4
+     |
+1282 | fn dsv4_combine_exchange_mode() -> Result<Dsv4CombineExchangeMode> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_reduce_scatter_combine_enabled` is never used
+    --> infer/src/model/deepseek/mlp.rs:1294:4
+     |
+1294 | fn dsv4_reduce_scatter_combine_enabled() -> Result<bool> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_zero_i32_slice` is never used
+    --> infer/src/model/deepseek/mlp.rs:3933:4
+     |
+3933 | fn dsv4_zero_i32_slice(ctx: &DeviceContext, slice: &mut CudaSlice<i32>, len: usize) -> Result<()> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_counts_to_offsets_i32` is never used
+    --> infer/src/model/deepseek/mlp.rs:3975:4
+     |
+3975 | fn dsv4_counts_to_offsets_i32(counts: &[i32], label: &str) -> Result<(Vec<i32>, usize)> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_counts_to_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:3998:4
+     |
+3998 | fn dsv4_counts_to_usize(counts: &[i32], label: &str) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_offsets_to_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:4013:4
+     |
+4013 | fn dsv4_offsets_to_usize(offsets: &[i32]) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_scale_usize` is never used
+    --> infer/src/model/deepseek/mlp.rs:4028:4
+     |
+4028 | fn dsv4_scale_usize(values: &[usize], factor: usize) -> Result<Vec<usize>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `dsv4_usize_to_i32` is never used
+    --> infer/src/model/deepseek/mlp.rs:4040:4
+     |
+4040 | fn dsv4_usize_to_i32(value: usize, label: &str) -> Result<i32> {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+  --> infer/src/model/deepseek/state.rs:88:16
+   |
+87 | pub(crate) struct DeepseekMoeRuntimeCache {
+   |                   ----------------------- fields in this struct
+88 |     pub(crate) route_logits: Option<DeepseekRouteLogitsRuntimeScratch>,
+   |                ^^^^^^^^^^^^
+89 |     pub(crate) dispatch: Option<DeepseekDispatchRuntimeScratch>,
+   |                ^^^^^^^^
+90 |     pub(crate) dispatch_payload: Option<DeepseekDispatchPayloadRuntimeScratch>,
+   |                ^^^^^^^^^^^^^^^^
+91 |     pub(crate) send_route: Option<DeepseekSendRouteRuntimeScratch>,
+   |                ^^^^^^^^^^
+92 |     pub(crate) recv_route: Option<DeepseekRecvRouteRuntimeScratch>,
+   |                ^^^^^^^^^^
+93 |     pub(crate) local_route: Option<DeepseekLocalRouteRuntimeScratch>,
+   |                ^^^^^^^^^^^
+94 |     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
+   |                ^^^^^^
+...
+97 |     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
+   |                ^^^^^^^^^^^^^
+
+warning: fields `capacity_tokens`, `n_experts`, and `logits` are never read
+   --> infer/src/model/deepseek/state.rs:102:16
+    |
+101 | pub(crate) struct DeepseekRouteLogitsRuntimeScratch {
+    |                   --------------------------------- fields in this struct
+102 |     pub(crate) capacity_tokens: usize,
+    |                ^^^^^^^^^^^^^^^
+103 |     pub(crate) n_experts: usize,
+    |                ^^^^^^^^^
+104 |     pub(crate) logits: HiddenStates,
+    |                ^^^^^^
+
+warning: multiple fields are never read
+   --> infer/src/model/deepseek/state.rs:109:16
+    |
+108 | pub(crate) struct DeepseekDispatchRuntimeScratch {
+    |                   ------------------------------ fields in this struct
+109 |     pub(crate) capacity_tokens: usize,
+    |                ^^^^^^^^^^^^^^^
+110 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+111 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+112 |     pub(crate) topk: usize,
+    |                ^^^^
+113 |     pub(crate) ep_world: usize,
+    |                ^^^^^^^^
+114 |     pub(crate) experts_per_rank: usize,
+    |                ^^^^^^^^^^^^^^^^
+115 |     pub(crate) token_ids: CudaSlice<u32>,
+    |                ^^^^^^^^^
+116 |     pub(crate) route_indices: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+117 |     pub(crate) route_weights: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^
+118 |     pub(crate) send_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^
+119 |     pub(crate) send_rank_offsets: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^^
+120 |     pub(crate) rank_cursors: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^
+121 |     pub(crate) send_hidden: HiddenStates,
+    |                ^^^^^^^^^^^
+122 |     pub(crate) send_meta: CudaSlice<i32>,
+    |                ^^^^^^^^^
+123 |     pub(crate) all_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^
+124 |     pub(crate) recv_rank_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^
+125 |     pub(crate) local_counts: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^
+126 |     pub(crate) local_offsets: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+127 |     pub(crate) local_cursors: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `stride_elems`, `send_payload`, and `recv_payload` are never read
+   --> infer/src/model/deepseek/state.rs:132:16
+    |
+131 | pub(crate) struct DeepseekDispatchPayloadRuntimeScratch {
+    |                   ------------------------------------- fields in this struct
+132 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+133 |     pub(crate) stride_elems: usize,
+    |                ^^^^^^^^^^^^
+134 |     pub(crate) send_payload: CudaSlice<bf16>,
+    |                ^^^^^^^^^^^^
+135 |     pub(crate) recv_payload: CudaSlice<bf16>,
+    |                ^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `send_token`, and `send_route_slot` are never read
+   --> infer/src/model/deepseek/state.rs:140:16
+    |
+139 | pub(crate) struct DeepseekSendRouteRuntimeScratch {
+    |                   ------------------------------- fields in this struct
+140 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+141 |     pub(crate) send_token: CudaSlice<i32>,
+    |                ^^^^^^^^^^
+142 |     pub(crate) send_route_slot: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^
+
+warning: fields `capacity_routes`, `hidden_dim`, `recv_hidden`, `recv_meta`, and `route_out` are never read
+   --> infer/src/model/deepseek/state.rs:147:16
+    |
+146 | pub(crate) struct DeepseekRecvRouteRuntimeScratch {
+    |                   ------------------------------- fields in this struct
+147 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+148 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+149 |     pub(crate) recv_hidden: HiddenStates,
+    |                ^^^^^^^^^^^
+150 |     pub(crate) recv_meta: CudaSlice<i32>,
+    |                ^^^^^^^^^
+151 |     pub(crate) route_out: HiddenStates,
+    |                ^^^^^^^^^
+
+warning: fields `capacity_routes`, `hidden_dim`, `expert_hidden`, `expert_weight`, and `expert_route_slot` are never read
+   --> infer/src/model/deepseek/state.rs:156:16
+    |
+155 | pub(crate) struct DeepseekLocalRouteRuntimeScratch {
+    |                   -------------------------------- fields in this struct
+156 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+157 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+158 |     pub(crate) expert_hidden: HiddenStates,
+    |                ^^^^^^^^^^^^^
+159 |     pub(crate) expert_weight: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^
+160 |     pub(crate) expert_route_slot: CudaSlice<i32>,
+    |                ^^^^^^^^^^^^^^^^^
+
+warning: field `input` is never read
+   --> infer/src/model/deepseek/state.rs:188:16
+    |
+183 | pub(crate) struct DeepseekExpertRuntimeScratch {
+    |                   ---------------------------- field in this struct
+...
+188 |     pub(crate) input: HiddenStates,
+    |                ^^^^^
+
+warning: multiple fields are never read
+   --> infer/src/model/deepseek/state.rs:238:16
+    |
+237 | pub(crate) struct DeepseekRouteCombineRuntimeScratch {
+    |                   ---------------------------------- fields in this struct
+238 |     pub(crate) capacity_routes: usize,
+    |                ^^^^^^^^^^^^^^^
+239 |     pub(crate) hidden_dim: usize,
+    |                ^^^^^^^^^^
+240 |     pub(crate) combine_recv: HiddenStates,
+    |                ^^^^^^^^^^^^
+241 |     pub(crate) route_slot_out: HiddenStates,
+    |                ^^^^^^^^^^^^^^
+242 |     pub(crate) combine_fp8_send: CudaSlice<u8>,
+    |                ^^^^^^^^^^^^^^^^
+243 |     pub(crate) combine_fp8_recv: CudaSlice<u8>,
+    |                ^^^^^^^^^^^^^^^^
+244 |     pub(crate) combine_scale_send: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^^^^^^
+245 |     pub(crate) combine_scale_recv: CudaSlice<f32>,
+    |                ^^^^^^^^^^^^^^^^^^
+
+warning: methods `ensure_dispatch_scratch`, `ensure_expert_scratch`, and `ensure_route_combine_scratch` are never used
+   --> infer/src/model/deepseek/state.rs:250:19
+    |
+249 | impl DeepseekMoeRuntimeCache {
+    | ---------------------------- methods in this implementation
+250 |     pub(crate) fn ensure_dispatch_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+...
+302 |     pub(crate) fn ensure_expert_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+416 |     pub(crate) fn ensure_route_combine_scratch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_route_logits_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:456:15
+    |
+456 | pub(crate) fn ensure_route_logits_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_send_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:480:15
+    |
+480 | pub(crate) fn ensure_send_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_dispatch_payload_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:503:15
+    |
+503 | pub(crate) fn ensure_dispatch_payload_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_recv_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:532:15
+    |
+532 | pub(crate) fn ensure_recv_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_local_route_scratch` is never used
+   --> infer/src/model/deepseek/state.rs:560:15
+    |
+560 | pub(crate) fn ensure_local_route_scratch<'a>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `generate_greedy` is never used
+   --> infer/src/model/deepseek/reference.rs:111:19
+    |
+ 94 | impl DeepseekV4ReferenceModel {
+    | ----------------------------- method in this implementation
+...
+111 |     pub(crate) fn generate_greedy(
+    |                   ^^^^^^^^^^^^^^^
+
+warning: function `argmax` is never used
+    --> infer/src/model/deepseek/reference.rs:1803:4
+     |
+1803 | fn argmax(values: &[f32]) -> usize {
+     |    ^^^^^^
+
+warning: `infer` (lib) generated 41 warnings (run `cargo fix --lib -p infer` to apply 5 suggestions)
+   Compiling train v0.1.5 (/home/ckl/projects/arle/crates/train)
+    Finished `release` profile [optimized] target(s) in 2m 10s
+     Running `target/release/examples/opd_step_cuda_infer_teacher_train --teacher-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B --student-model /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base --prompts-file examples/opd/sample-prompts.jsonl --steps 200 --rollout-len 8 --lr 1e-5 --eval-steps 0,50,100,200 --prompt-max-tokens 32 --max-step-seconds 30`
+config backend=cuda teacher_model=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-4B teacher_api_url=none teacher_config=none student_model=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base student_mode=lora lora_rank=16 lora_alpha=32.000000 lora_target_set=attention-qv steps=200 rollout_len=8 lr=9.999999747e-6 grad_clip=1 prompt_source=jsonl:examples/opd/sample-prompts.jsonl rows=20 tokenizer=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base/tokenizer.json truncated_rows=1 train_prompt_count=16 heldout_prompt_count=4 eval_steps=[0, 50, 100, 200] cuda_graph=true
+prompt split=train index=0 ids=[814, 20139, 3069, 2526, 3992, 3983, 8495, 494, 383, 64179, 1527, 63853, 13]
+prompt split=train index=1 ids=[8917, 5437, 537, 279, 6463, 1881, 4487, 65427, 321, 9637, 65427, 13]
+prompt split=train index=2 ids=[7734, 264, 61446, 50802, 364, 26805, 264, 52965, 4706, 2923, 13]
+prompt split=train index=3 ids=[3710, 3520, 264, 27502, 1067, 54067, 30]
+prompt split=train index=4 ids=[72240, 1204, 264, 19088, 10756, 628, 8214, 264, 17671, 71698, 5286, 1558, 13]
+prompt split=train index=5 ids=[33963, 264, 2716, 3010, 314, 264, 9640, 421, 6813, 33633, 31626, 13]
+prompt split=train index=6 ids=[826, 2250, 11590, 421, 264, 4706, 1542, 369, 35140, 3072, 13]
+prompt split=train index=7 ids=[814, 20139, 3817, 11258, 35887, 303, 799, 13901, 13]
+prompt split=train index=8 ids=[4199, 1220, 449, 22839, 9973, 3315, 310, 2426, 466, 5332, 449, 24460, 30]
+prompt split=train index=9 ids=[7734, 264, 16338, 5020, 883, 21966, 4779, 22627, 16070, 13]
+prompt split=train index=10 ids=[9930, 369, 4581, 33686, 26370, 6807, 2166, 47590, 430, 449, 5428, 17723, 30]
+prompt split=train index=11 ids=[26487, 54102, 45543, 440, 47241, 6299, 11336, 364, 1527, 63853, 13]
+prompt split=train index=12 ids=[3710, 369, 279, 3364, 314, 5467, 9502, 49219, 303, 449, 12753, 35, 9064, 30]
+prompt split=train index=13 ids=[814, 20139, 3069, 17515, 11241, 4766, 303, 4906, 944, 13]
+prompt split=train index=14 ids=[33963, 264, 799, 1284, 17834, 7044, 314, 15135, 19441, 45597, 4706, 13]
+prompt split=train index=15 ids=[3710, 1220, 264, 1156, 1716, 1518, 4162, 264, 1167, 16451, 44424, 27502, 30]
+prompt split=heldout index=0 ids=[72240, 264, 5902, 1581, 6618, 4238, 364, 264, 3043, 15464, 2680, 5286, 13]
+prompt split=heldout index=1 ids=[9930, 628, 264, 4557, 15196, 7042, 1345, 4581, 26370, 25710, 9766, 30]
+prompt split=heldout index=2 ids=[7734, 264, 2716, 9663, 883, 5132, 49219, 1973, 449, 6326, 6696, 13]
+prompt split=heldout index=3 ids=[814, 20139, 3069, 264, 1865, 1414, 9640, 716, 369, 2577, 1056, 1375, 2195, 17952, 3817, 27437]
+model_summary teacher_source=infer student_hidden=1024 student_layers=24 student_vocab=248320 student_model_elements=769809216 student_trainable_elements=638976 student_load_seconds=8.681672 teacher_load_seconds=2.705221
+eval_summary step=0 train_kl=1.510384544190e-5 heldout_kl=1.739055323924e-5 eval_seconds=7.944459
+train_step step=1 prompt_index=0 teacher_id=infer loss=1.677495674812e-5 rollout_len=21 step_seconds=6.106677
+phase_summary step=1 total=6.106677 student_rollout=2.348927 infer_forward_token_logits=0.003353 infer_sync=0.435502 d2d_bridge_import=0.000081 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.438941 student_forward=0.355225 kl_loss=0.014883 optimizer_zero_grad=0.000001 backward=2.931290 grad_clip=0.000553 optimizer_step=0.000947 post_step_cleanup=0.015900 teacher_seq_len=21 teacher_vocab=248320
+train_step step=2 prompt_index=1 teacher_id=infer loss=1.479068305343e-5 rollout_len=20 step_seconds=6.094701
+phase_summary step=2 total=6.094701 student_rollout=2.949149 infer_forward_token_logits=0.005335 infer_sync=0.453281 d2d_bridge_import=0.000078 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.458698 student_forward=0.326694 kl_loss=0.007885 optimizer_zero_grad=0.000024 backward=2.337624 grad_clip=0.000524 optimizer_step=0.000851 post_step_cleanup=0.013179 teacher_seq_len=20 teacher_vocab=248320
+train_step step=3 prompt_index=2 teacher_id=infer loss=1.751424315444e-5 rollout_len=19 step_seconds=5.642458
+phase_summary step=3 total=5.642457 student_rollout=2.573734 infer_forward_token_logits=0.005381 infer_sync=0.518035 d2d_bridge_import=0.000085 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.523510 student_forward=0.314985 kl_loss=0.007483 optimizer_zero_grad=0.000027 backward=2.207452 grad_clip=0.000531 optimizer_step=0.000489 post_step_cleanup=0.014066 teacher_seq_len=19 teacher_vocab=248320
+train_step step=4 prompt_index=3 teacher_id=infer loss=1.309895287704e-5 rollout_len=15 step_seconds=3.968262
+phase_summary step=4 total=3.968262 student_rollout=1.566953 infer_forward_token_logits=0.005214 infer_sync=0.329654 d2d_bridge_import=0.000149 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.335022 student_forward=0.248749 kl_loss=0.006118 optimizer_zero_grad=0.000027 backward=1.797031 grad_clip=0.000517 optimizer_step=0.000456 post_step_cleanup=0.013168 teacher_seq_len=15 teacher_vocab=248320
+train_step step=5 prompt_index=4 teacher_id=infer loss=1.522407455923e-5 rollout_len=21 step_seconds=5.654661
+phase_summary step=5 total=5.654661 student_rollout=2.344375 infer_forward_token_logits=0.005362 infer_sync=0.460424 d2d_bridge_import=0.000080 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.465871 student_forward=0.348217 kl_loss=0.008125 optimizer_zero_grad=0.000025 backward=2.473767 grad_clip=0.000521 optimizer_step=0.000477 post_step_cleanup=0.013048 teacher_seq_len=21 teacher_vocab=248320
+train_step step=6 prompt_index=5 teacher_id=infer loss=1.333484760835e-5 rollout_len=20 step_seconds=5.373103
+phase_summary step=6 total=5.373103 student_rollout=2.255146 infer_forward_token_logits=0.005284 infer_sync=0.474126 d2d_bridge_import=0.000078 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.479493 student_forward=0.333283 kl_loss=0.007666 optimizer_zero_grad=0.000023 backward=2.282408 grad_clip=0.000507 optimizer_step=0.000485 post_step_cleanup=0.013933 teacher_seq_len=20 teacher_vocab=248320
+train_step step=7 prompt_index=6 teacher_id=infer loss=1.910363062052e-5 rollout_len=19 step_seconds=5.105314
+phase_summary step=7 total=5.105314 student_rollout=2.099416 infer_forward_token_logits=0.005383 infer_sync=0.442567 d2d_bridge_import=0.000074 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.448028 student_forward=0.315298 kl_loss=0.007599 optimizer_zero_grad=0.003413 backward=2.216788 grad_clip=0.000526 optimizer_step=0.000843 post_step_cleanup=0.013164 teacher_seq_len=19 teacher_vocab=248320
+train_step step=8 prompt_index=7 teacher_id=infer loss=1.407327999914e-5 rollout_len=17 step_seconds=5.026537
+phase_summary step=8 total=5.026536 student_rollout=2.227710 infer_forward_token_logits=0.005434 infer_sync=0.477513 d2d_bridge_import=0.000078 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.483030 student_forward=0.282650 kl_loss=0.006894 optimizer_zero_grad=0.000023 backward=2.011883 grad_clip=0.000533 optimizer_step=0.000442 post_step_cleanup=0.013207 teacher_seq_len=17 teacher_vocab=248320
+train_step step=9 prompt_index=8 teacher_id=infer loss=1.252292895515e-5 rollout_len=21 step_seconds=6.184014
+phase_summary step=9 total=6.184013 student_rollout=2.787902 infer_forward_token_logits=0.005461 infer_sync=0.549443 d2d_bridge_import=0.000082 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.554991 student_forward=0.346481 kl_loss=0.008049 optimizer_zero_grad=0.000025 backward=2.472040 grad_clip=0.000525 optimizer_step=0.000481 post_step_cleanup=0.013334 teacher_seq_len=21 teacher_vocab=248320
+train_step step=10 prompt_index=9 teacher_id=infer loss=1.900759707496e-5 rollout_len=18 step_seconds=4.917519
+phase_summary step=10 total=4.917519 student_rollout=2.022730 infer_forward_token_logits=0.005360 infer_sync=0.464356 d2d_bridge_import=0.000079 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.469799 student_forward=0.299029 kl_loss=0.007232 optimizer_zero_grad=0.000023 backward=2.100059 grad_clip=0.000542 optimizer_step=0.000506 post_step_cleanup=0.017436 teacher_seq_len=18 teacher_vocab=248320
+train_step step=11 prompt_index=10 teacher_id=infer loss=1.861949021986e-5 rollout_len=21 step_seconds=5.955972
+phase_summary step=11 total=5.955971 student_rollout=2.500529 infer_forward_token_logits=0.005662 infer_sync=0.509645 d2d_bridge_import=0.000080 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.515392 student_forward=0.349755 kl_loss=0.008075 optimizer_zero_grad=0.000023 backward=2.567803 grad_clip=0.000528 optimizer_step=0.000489 post_step_cleanup=0.013178 teacher_seq_len=21 teacher_vocab=248320
+train_step step=12 prompt_index=11 teacher_id=infer loss=1.657132452237e-5 rollout_len=19 step_seconds=5.194838
+phase_summary step=12 total=5.194837 student_rollout=2.178945 infer_forward_token_logits=0.005395 infer_sync=0.450325 d2d_bridge_import=0.000589 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.456314 student_forward=0.316934 kl_loss=0.007450 optimizer_zero_grad=0.000025 backward=2.220834 grad_clip=0.000516 optimizer_step=0.000482 post_step_cleanup=0.013152 teacher_seq_len=19 teacher_vocab=248320
+train_step step=13 prompt_index=12 teacher_id=infer loss=1.978450745810e-5 rollout_len=22 step_seconds=5.977738
+phase_summary step=13 total=5.977738 student_rollout=2.529667 infer_forward_token_logits=0.005373 infer_sync=0.481690 d2d_bridge_import=0.000603 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.487671 student_forward=0.364087 kl_loss=0.008612 optimizer_zero_grad=0.000026 backward=2.572467 grad_clip=0.000532 optimizer_step=0.000860 post_step_cleanup=0.013622 teacher_seq_len=22 teacher_vocab=248320
+train_step step=14 prompt_index=13 teacher_id=infer loss=1.614137909201e-5 rollout_len=18 step_seconds=5.272776
+phase_summary step=14 total=5.272776 student_rollout=2.465272 infer_forward_token_logits=0.005327 infer_sync=0.399827 d2d_bridge_import=0.000079 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.405237 student_forward=0.296076 kl_loss=0.007260 optimizer_zero_grad=0.000022 backward=2.084508 grad_clip=0.000528 optimizer_step=0.000453 post_step_cleanup=0.013249 teacher_seq_len=18 teacher_vocab=248320
+train_step step=15 prompt_index=14 teacher_id=infer loss=1.248181069968e-5 rollout_len=20 step_seconds=5.398602
+phase_summary step=15 total=5.398602 student_rollout=2.229567 infer_forward_token_logits=0.005295 infer_sync=0.469949 d2d_bridge_import=0.000073 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.475323 student_forward=0.331017 kl_loss=0.007872 optimizer_zero_grad=0.000023 backward=2.333973 grad_clip=0.000524 optimizer_step=0.000838 post_step_cleanup=0.019271 teacher_seq_len=20 teacher_vocab=248320
+train_step step=16 prompt_index=15 teacher_id=infer loss=1.337612866337e-5 rollout_len=21 step_seconds=6.223747
+phase_summary step=16 total=6.223746 student_rollout=2.904841 infer_forward_token_logits=0.003935 infer_sync=0.527323 d2d_bridge_import=0.000075 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.531337 student_forward=0.342739 kl_loss=0.008323 optimizer_zero_grad=0.000026 backward=2.422262 grad_clip=0.000505 optimizer_step=0.000479 post_step_cleanup=0.013036 teacher_seq_len=21 teacher_vocab=248320
+train_step step=17 prompt_index=0 teacher_id=infer loss=1.662829345150e-5 rollout_len=21 step_seconds=5.766009
+phase_summary step=17 total=5.766008 student_rollout=2.445409 infer_forward_token_logits=0.005523 infer_sync=0.531391 d2d_bridge_import=0.000058 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.536976 student_forward=0.347238 kl_loss=0.008069 optimizer_zero_grad=0.000024 backward=2.413404 grad_clip=0.000541 optimizer_step=0.000866 post_step_cleanup=0.013320 teacher_seq_len=21 teacher_vocab=248320
+train_step step=18 prompt_index=1 teacher_id=infer loss=1.472213807574e-5 rollout_len=20 step_seconds=6.109476
+phase_summary step=18 total=6.109476 student_rollout=2.872566 infer_forward_token_logits=0.005520 infer_sync=0.539972 d2d_bridge_import=0.000579 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.546076 student_forward=0.331747 kl_loss=0.007780 optimizer_zero_grad=0.000022 backward=2.336722 grad_clip=0.000530 optimizer_step=0.000492 post_step_cleanup=0.013366 teacher_seq_len=20 teacher_vocab=248320
+train_step step=19 prompt_index=2 teacher_id=infer loss=1.745614099491e-5 rollout_len=19 step_seconds=5.257428
+phase_summary step=19 total=5.257427 student_rollout=2.140178 infer_forward_token_logits=0.005398 infer_sync=0.526645 d2d_bridge_import=0.000083 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.532132 student_forward=0.316664 kl_loss=0.007626 optimizer_zero_grad=0.000029 backward=2.246321 grad_clip=0.000529 optimizer_step=0.000475 post_step_cleanup=0.013292 teacher_seq_len=19 teacher_vocab=248320
+train_step step=20 prompt_index=3 teacher_id=infer loss=1.307665570494e-5 rollout_len=15 step_seconds=4.030389
+phase_summary step=20 total=4.030388 student_rollout=1.593139 infer_forward_token_logits=0.005229 infer_sync=0.368569 d2d_bridge_import=0.000082 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.373885 student_forward=0.252250 kl_loss=0.006180 optimizer_zero_grad=0.000027 backward=1.790844 grad_clip=0.000524 optimizer_step=0.000453 post_step_cleanup=0.012948 teacher_seq_len=15 teacher_vocab=248320
+train_step step=21 prompt_index=4 teacher_id=infer loss=1.518686713098e-5 rollout_len=21 step_seconds=6.013051
+phase_summary step=21 total=6.013051 student_rollout=2.604905 infer_forward_token_logits=0.005409 infer_sync=0.600126 d2d_bridge_import=0.000077 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.605617 student_forward=0.343388 kl_loss=0.008189 optimizer_zero_grad=0.000032 backward=2.436230 grad_clip=0.000516 optimizer_step=0.000498 post_step_cleanup=0.013496 teacher_seq_len=21 teacher_vocab=248320
+train_step step=22 prompt_index=5 teacher_id=infer loss=1.331609018962e-5 rollout_len=20 step_seconds=5.377507
+phase_summary step=22 total=5.377507 student_rollout=2.266484 infer_forward_token_logits=0.005337 infer_sync=0.453133 d2d_bridge_import=0.000076 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.458551 student_forward=0.332373 kl_loss=0.007963 optimizer_zero_grad=0.000025 backward=2.297338 grad_clip=0.000533 optimizer_step=0.000850 post_step_cleanup=0.013160 teacher_seq_len=20 teacher_vocab=248320
+train_step step=23 prompt_index=6 teacher_id=infer loss=1.902421354316e-5 rollout_len=19 step_seconds=5.625142
+phase_summary step=23 total=5.625142 student_rollout=2.596110 infer_forward_token_logits=0.005462 infer_sync=0.416116 d2d_bridge_import=0.000082 api_http=0.000000 api_decode=0.000000 api_upload=0.000000 teacher_forward_total=0.421666 student_forward=0.317188 kl_loss=0.007747 optimizer_zero_grad=0.000024 backward=2.267333 grad_clip=0.000533 optimizer_step=0.000470 post_step_cleanup=0.013887 teacher_seq_len=19 teacher_vocab=248320
