@@ -33,7 +33,7 @@ capability benchmark, within reasonable compute budget on 16 GB?"
 
 PASS criterion (the smallest meaningful claim): **distilled student
 shows ≥ +1 percentage point on at least one of MMLU-5-shot accuracy,
-IFEval strict-followed-pct, or HellaSwag accuracy** vs the HF base
+IFEval strict-followed-pct, or GSM8K exact-match accuracy** vs the HF base
 checkpoint, with the teacher serving as upper bound.
 
 KILL criteria (any of):
@@ -48,10 +48,30 @@ that needs fixing.
 
 ## Approach
 
-ARLE's `infer` HTTP server already exposes the OpenAI v1 surface
+ARLE's `infer` HTTP server exposes the OpenAI v1 surface
 (`/v1/completions`, `/v1/chat/completions`, `logprobs` parameter — see
 `infer/src/http_server/router.rs`). The eval harness can talk to it as
-if it were the OpenAI API. **No new ARLE-side endpoints needed.**
+if it were the OpenAI API.
+
+**ARLE HTTP surface audit (2026-05-22)**:
+
+| Field | Status | Impacted tasks |
+|---|---|---|
+| `/v1/completions`, `/v1/chat/completions` | ✅ | All generation-based eval |
+| `logprobs` (top-N) | ✅ | Calibration tasks |
+| `token_logprobs` in response | ✅ | Per-token analysis |
+| `temperature`, `max_tokens`, `top_p` | ✅ | Sampling control |
+| **`echo`** (return prompt logprobs) | ❌ | HellaSwag (standard scoring), Lambada |
+| Batched completions | Check before P0 | Throughput-bound tasks |
+
+For tasks that need `echo` (HellaSwag-style logprob-of-candidate-sequence
+scoring), use a generation-based fallback ("Which is most plausible? A/B/C/D")
+for P0, and add `echo` support to ARLE as a separate small tranche if the
+signal-quality difference matters.
+
+Recommended task subset (revised): **MMLU + IFEval + GSM8K** at 500
+samples each. All three are generation-based, work with current ARLE.
+HellaSwag deferred to a v2 cycle that lands `echo`.
 
 Eval harness choice: **simple-evals** (OpenAI, MIT license, ~2k LOC
 Python).
@@ -71,7 +91,7 @@ Why simple-evals over alternatives:
 
 1. Spin up `arle serve` with Qwen3.5-0.8B-Base.
 2. Install simple-evals, point `OPENAI_BASE_URL=http://localhost:8123/v1`.
-3. Run MMLU-5-shot (subset 500 questions for speed), IFEval (500 prompts), HellaSwag (1000 questions). Total ~2000 prompts.
+3. Run MMLU-5-shot (subset 500 questions), IFEval (500 prompts), GSM8K (500 problems). Total ~1500 prompts.
 4. Record per-task accuracy + total wall-clock.
 5. Re-run same three tasks against Qwen3.5-4B (teacher) for upper-bound reference.
 6. Land wins entry: `docs/experience/wins/2026-05-22-baseline-08b-4b-capability-eval.md` with the two-row table.
@@ -120,7 +140,7 @@ via arle serve + simple-evals.
 1. pip install simple-evals (or git clone openai/simple-evals if not on PyPI)
 2. arle serve --model Qwen3___5-0___8B-Base --port 8123
 3. OPENAI_BASE_URL=http://localhost:8123/v1 python -m simple_evals \
-   --models qwen35-08b-base --tasks mmlu,ifeval,hellaswag --n_samples 500
+   --models qwen35-08b-base --tasks mmlu,ifeval,gsm8k --n_samples 500
 4. Repeat with Qwen3___5-4B on port 8123 (teacher)
 5. Record results in bench-output/2026-05-22-baseline-capability/
 6. Write wins entry with the two-row table
@@ -159,6 +179,6 @@ KILL: any task can't run (simple-evals API mismatch, ARLE missing OpenAI feature
 Before P0 briefs to codex:
 
 1. **Confirm simple-evals as the harness** (vs lm-eval / native).
-2. **Confirm task subset** (MMLU + IFEval + HellaSwag at 500 samples each, vs full sets or different tasks like GSM8K).
+2. **Confirm task subset** (MMLU + IFEval + GSM8K at 500 samples each, vs full sets or swapping in HumanEval / MATH). HellaSwag deferred until ARLE adds `echo` support.
 3. **Confirm rollout choice for P1** — wait for Stretch A/B results before committing to rollout=8 vs 16.
 4. **Compute budget tolerance** — 22 h vs 36 h vs cap at 5k steps for fast first data point.
