@@ -160,6 +160,97 @@ Run H3 first (it's free):
 If still `!` × N → H1 or H2. If now produces letters → H3 confirmed,
 the eval plan just needs `--max-seq-len 4096` for MMLU runs.
 
+## 2026-05-22 14:24 update — H3 partial-confirm + tight bisection
+
+Actually ran H3 on Qwen3.5-0.8B-Base with `--max-seq-len 4096
+--chunked-prefill-size 4096` and `--max-num-batched-tokens 4096`.
+Result: **H3 partial-confirm** — output shape changed but bug remains.
+
+- max_seq_len=1024 + 2 K prompt: silent prompt truncation → garbage tokens
+- **max_seq_len=4096 + 2 K prompt: prompt fits but model still emits `!` × N**
+
+Then bisected collapse threshold with controlled-content prompts
+("Hello world. " × N + "The capital of France is", `max_tokens=15`,
+`temperature=0`):
+
+| N reps | ~tokens | Output (first 60 chars) | Verdict |
+|---:|---:|---|---|
+| 5 | 20 | `' Paris. The capital of France is Paris.'` | ✅ coherent |
+| 10 | 35 | `'\n\n  \n by, , and\n22\n   3'` | ❌ garbage |
+| 15 | 50 | `'fe e'` | ❌ garbage |
+| 20 | 65 | `",'tmconfess1anh0icosneZl0\n\n"` | ❌ garbage |
+| 25 | 80 | `'0\nThe 0, ...​...1: "Ex"'` | ❌ garbage |
+| 30 | 95 | `' the same, N1\n\n),'` | ❌ garbage |
+| 40 | 125 | `'00组\n，焦尽+D2+0-.2'` | ❌ garbage |
+| 100 | 305 | `'!!!!!!!!!!!!!!!!'` | ❌ `!` collapse |
+| 150 | 455 | `'!!!!!!!!!!!!!!!!'` | ❌ `!` collapse |
+
+**The corruption threshold is ~30 tokens.** That's catastrophically
+short: virtually every real chat / eval / agent prompt exceeds it.
+
+Cross-temperature probe (T=0.0 / 0.5 / 1.0, fixed seed): bug fires at
+every temperature → rules out greedy-decode-specific path. Bug is in
+the engine forward pass, not the sampler.
+
+## Why this didn't surface earlier
+
+- Existing `arle serve` smoke tests use single-token or very-short
+  prompts (e.g. the 2026-05-22 9B GPTQModel recheck used a 1-token
+  `/v1/completions` request). Those prompts are below the ~30-token
+  threshold.
+- OPD train (`train::OpdStep`) calls
+  `LoadedInferenceEngine::forward_token_logits` directly — different
+  code path, bypasses the serving scheduler entirely.
+- Existing wins entries on 4B-teacher OPD use rollout=8 with
+  prompt_max=16 — total scored sequence stays ≤24 tokens. Below
+  threshold by construction.
+
+This bug has been latent since whenever the serve path last regressed,
+because every routine test stayed under the threshold.
+
+## Revised hypothesis ranking
+
+- **H1 RoPE drift / positional encoding bug** — strongest. The ~30
+  token threshold is far below `max_position_embeddings` (32 768 for
+  Qwen3.5), so it's not a model limit. RoPE position arithmetic at
+  prefill chunk boundaries is the most likely culprit. Possibly an
+  off-by-one or wrap that fires at small chunk indexes.
+- H2 chunked prefill miscalc — **ruled out** for the ~30-token case:
+  with `--chunked-prefill-size 4096`, a 200-token prompt is a single
+  chunk. Bug still fires.
+- H3 max_seq_len truncation — partial: max_seq_len=1024 produced a
+  different garbage shape, but 4096 still fails. Truncation only
+  changes the failure mode.
+- H4 BOS / chat template mismatch — possible. Worth probing the exact
+  request → tokens path that ARLE serve produces vs. HF reference.
+- H5 paged KV bug — unlikely with `--num-slots 1`.
+
+## Recommended next code work (real, scoped)
+
+1. **Bisect to the single-token threshold**: try prompts of 25, 26,
+   27, ..., 35 tokens to find the exact boundary. RoPE bugs often
+   hinge on power-of-2 or window-size constants.
+2. **Tokens-eq-prompt control**: send the same SHORT prompt (20 tok
+   that works) but prepend padding tokens via the API. If padding
+   fixes it, it's a position-id bug. If padding also breaks, it's
+   content/structure-driven.
+3. **Diff infer code path serve vs forward_token_logits**: which
+   layers differ? RoPE cache construction is a common divergence
+   point. (Touches dirty `infer/src/model/qwen35/prefill.rs` — codex
+   territory.)
+4. **Capability eval workaround until bug fixed**: write a
+   `scripts/arle_capability_eval_direct.py` that uses the
+   `forward_token_logits` API directly via a small Rust binary or
+   embedded Python binding. Bypasses the broken serve path while we
+   debug it.
+
+## Cross-links update
+
+- ARLE OPD pipeline manual MUST note "OPD bypasses serve" callout:
+  `docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`
+- ApiTeacher path now BLOCKED until serve bug fixed:
+  `docs/plans/2026-05-21-opd-teacher-api-and-multiteacher-plan.md`
+
 ## Cross-links
 
 - 9B GPTQModel `!` collapse (the first surface of this bug, written off as quant-specific): `docs/experience/errors/2026-05-22-qwen35-9b-gptqmodel-generation-f32load-fix-kill.md`
