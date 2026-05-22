@@ -47,15 +47,37 @@ class MMLULetterExtraction(unittest.TestCase):
 
     def test_no_letter_returns_none(self):
         self.assertIsNone(eval_mod._mmlu_extract_letter(""))
-        self.assertIsNone(eval_mod._mmlu_extract_letter("the answer is..."))
         self.assertIsNone(eval_mod._mmlu_extract_letter("E"))  # outside A-D
-        # Reject letter that is part of a longer word — the model said
-        # "Avocado" not "A".
-        self.assertIsNone(eval_mod._mmlu_extract_letter("Avocado"))
 
     def test_full_word_answer_rejected(self):
-        # Not a leading single letter; should not score as correct.
+        # "answer is something" contains no A-D letter at all in the
+        # first 60 chars, so all layers (1-4) miss → None.
         self.assertIsNone(eval_mod._mmlu_extract_letter("answer is something"))
+
+    def test_layer2_parenthesized(self):
+        # Base models commonly output "(A)" — layer 2 catches this.
+        self.assertEqual(eval_mod._mmlu_extract_letter("(A)"), "A")
+        self.assertEqual(eval_mod._mmlu_extract_letter("(B) some reasoning"), "B")
+
+    def test_layer3_answer_is_pattern(self):
+        # "The answer is C." → layer 3 phrase match.
+        self.assertEqual(eval_mod._mmlu_extract_letter("The answer is C."), "C")
+        self.assertEqual(eval_mod._mmlu_extract_letter("Answer: D, because..."), "D")
+        # "correct option B" → layer 3 phrase match.
+        self.assertEqual(eval_mod._mmlu_extract_letter("The correct option is B"), "B")
+
+    def test_layer4_first60_char_fallback(self):
+        # No leading letter, no "answer is" phrase, but a free-standing
+        # A-D in the first 60 chars → layer 4 fallback.
+        self.assertEqual(eval_mod._mmlu_extract_letter("After reasoning, A"), "A")
+
+    def test_avocado_not_extracted_as_a(self):
+        # "Avocado" should NOT match — the A is part of a longer word.
+        # All layers should miss because no standalone A-D appears.
+        # Layer 1 fails because "A" is followed by "v" (not punctuation
+        # or whitespace). Layers 2-4 also miss because there's no
+        # standalone A.
+        self.assertIsNone(eval_mod._mmlu_extract_letter("Avocado"))
 
 
 class GSM8KGoldAnswer(unittest.TestCase):
