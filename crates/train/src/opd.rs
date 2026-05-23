@@ -75,6 +75,29 @@ pub struct OpdStepProfile {
     pub post_step_cleanup_seconds: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GkdSftAnchor {
+    StudentRollout,
+    CorpusTruth,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GkdLossConfig<'a> {
+    pub lambda: f32,
+    pub sft_anchor: GkdSftAnchor,
+    pub corpus_tokens: Option<&'a [u32]>,
+}
+
+impl Default for GkdLossConfig<'_> {
+    fn default() -> Self {
+        Self {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+        }
+    }
+}
+
 fn record_profile(
     profile: &mut Option<&mut OpdStepProfile>,
     update: impl FnOnce(&mut OpdStepProfile),
@@ -417,6 +440,25 @@ fn validate_gkd_lambda(gkd_lambda: f32) -> Result<()> {
     )))
 }
 
+fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> {
+    validate_gkd_lambda(config.lambda)?;
+    if config.lambda == 0.0 {
+        return Ok(());
+    }
+    if config.sft_anchor == GkdSftAnchor::CorpusTruth
+        && config.corpus_tokens.is_none_or(|tokens| tokens.is_empty())
+    {
+        return Err(OpdError::InvalidInput(
+            "GKD corpus-truth SFT anchor requires non-empty corpus completion \
+             tokens when lambda > 0. Hint: add a `completion` or `target` \
+             field to each training row in --prompts-file, or use \
+             --sft-anchor student-rollout."
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_rollout_shape(prompt_len: usize, rollout_len: usize, vocab: usize) -> Result<()> {
     let total_len = prompt_len.checked_add(rollout_len).ok_or_else(|| {
         OpdError::InvalidInput(format!(
@@ -442,6 +484,79 @@ fn validate_rollout_shape(prompt_len: usize, rollout_len: usize, vocab: usize) -
     Ok(())
 }
 
+fn next_token_sft_loss_from_logits(
+    student_logits: TensorId,
+    logits_seq_len: usize,
+    start_position: usize,
+    target_tokens: &[u32],
+    vocab: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    if target_tokens.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "GKD SFT proxy requires at least one target token. Hint: provide \
+             non-empty corpus completion tokens or use a rollout with at \
+             least two tokens."
+                .to_owned(),
+        ));
+    }
+    let end_position = start_position
+        .checked_add(target_tokens.len())
+        .ok_or_else(|| {
+            OpdError::InvalidInput(
+                "GKD SFT proxy logits slice overflowed. Hint: check prompt \
+                 and completion lengths before mixing SFT into OPD."
+                    .to_owned(),
+            )
+        })?;
+    if end_position > logits_seq_len {
+        return Err(OpdError::InvalidInput(format!(
+            "GKD SFT proxy target slice [{}..{}) exceeds logits_seq_len={}. \
+             Hint: completion-token CE should use logits from the prompt's \
+             final token through the completion prefix.",
+            start_position, end_position, logits_seq_len
+        )));
+    }
+    let shape = store
+        .get(student_logits)
+        .ok_or(AutogradError::InvalidTensorId(student_logits))?
+        .shape
+        .clone();
+    let expected_shape = vec![1, logits_seq_len, vocab];
+    if shape != expected_shape {
+        return Err(OpdError::InvalidInput(format!(
+            "GKD SFT proxy expected student logits shape {:?}, got {:?}. \
+             Hint: pass logits from the same sequence used for the SFT \
+             target tokens.",
+            expected_shape, shape
+        )));
+    }
+    let mut targets = Vec::with_capacity(target_tokens.len());
+    for (index, &token_id) in target_tokens.iter().enumerate() {
+        if token_id as usize >= vocab {
+            return Err(OpdError::InvalidInput(format!(
+                "GKD SFT proxy target token {token_id} at target[{index}] is \
+                 outside vocab={vocab}. Hint: verify tokenizer/model vocab \
+                 alignment before mixing hard-token SFT into OPD."
+            )));
+        }
+        targets.push(token_id as usize);
+    }
+    let shifted_logits = slice(
+        student_logits,
+        &[0, start_position, 0],
+        &[1, end_position, vocab],
+        store,
+        tape,
+    )?;
+    let token_mean_ce = cross_entropy_loss(shifted_logits, &targets, store, tape)?;
+    // `kl_distill_loss` intentionally uses mean over positions * vocab.
+    // Scale the hard-label CE to the same internal normalization before
+    // mixing, otherwise lambda=0.3 would dominate KL by roughly vocab_size.
+    mul_scalar(token_mean_ce, 1.0 / vocab as f32, store, tape).map_err(OpdError::from)
+}
+
 fn shifted_rollout_sft_loss(
     student_logits: TensorId,
     rollout: &[u32],
@@ -451,48 +566,120 @@ fn shifted_rollout_sft_loss(
 ) -> Result<TensorId> {
     if rollout.len() < 2 {
         return Err(OpdError::InvalidInput(
-            "GKD SFT proxy requires at least two rollout tokens so logits can \
-             be trained against next-token labels. Hint: use a prompt with \
-             length >= 2 or set --rollout-len > 0 when --gkd-lambda > 0."
+            "GKD student-rollout SFT anchor requires at least two rollout \
+             tokens so logits can be trained against next-token labels. Hint: \
+             use a prompt with length >= 2 or set --rollout-len > 0 when \
+             --gkd-lambda > 0."
                 .to_owned(),
         ));
     }
-    let shape = store
-        .get(student_logits)
-        .ok_or(AutogradError::InvalidTensorId(student_logits))?
-        .shape
-        .clone();
-    let expected_shape = vec![1, rollout.len(), vocab];
-    if shape != expected_shape {
-        return Err(OpdError::InvalidInput(format!(
-            "GKD SFT proxy expected student logits shape {:?}, got {:?}. \
-             Hint: pass logits from the same full OPD rollout used for KL.",
-            expected_shape, shape
-        )));
-    }
-    let mut targets = Vec::with_capacity(rollout.len() - 1);
-    for (index, &token_id) in rollout.iter().enumerate().skip(1) {
-        if token_id as usize >= vocab {
-            return Err(OpdError::InvalidInput(format!(
-                "GKD SFT proxy target token {token_id} at rollout[{index}] is \
-                 outside vocab={vocab}. Hint: verify tokenizer/model vocab \
-                 alignment before mixing hard-token SFT into OPD."
-            )));
-        }
-        targets.push(token_id as usize);
-    }
-    let shifted_logits = slice(
+    next_token_sft_loss_from_logits(
         student_logits,
-        &[0, 0, 0],
-        &[1, rollout.len() - 1, vocab],
+        rollout.len(),
+        0,
+        &rollout[1..],
+        vocab,
         store,
         tape,
-    )?;
-    let token_mean_ce = cross_entropy_loss(shifted_logits, &targets, store, tape)?;
-    // `kl_distill_loss` intentionally uses mean over positions * vocab.
-    // Scale the hard-label CE to the same internal normalization before
-    // mixing, otherwise lambda=0.3 would dominate KL by roughly vocab_size.
-    mul_scalar(token_mean_ce, 1.0 / vocab as f32, store, tape).map_err(OpdError::from)
+    )
+}
+
+fn corpus_truth_sft_loss(
+    student: &Qwen35Model,
+    prompt_ids: &[u32],
+    corpus_tokens: &[u32],
+    vocab: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    if prompt_ids.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "GKD corpus-truth SFT anchor requires a non-empty prompt. Hint: \
+             OPD prompts should include at least one context token."
+                .to_owned(),
+        ));
+    }
+    if corpus_tokens.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "GKD corpus-truth SFT anchor requires non-empty completion tokens. \
+             Hint: add a `completion` or `target` field to each training row \
+             in --prompts-file."
+                .to_owned(),
+        ));
+    }
+    let total_len = prompt_ids
+        .len()
+        .checked_add(corpus_tokens.len())
+        .ok_or_else(|| {
+            OpdError::InvalidInput(
+                "GKD corpus-truth SFT prompt+completion length overflowed. \
+                 Hint: reduce prompt/completion max tokens."
+                    .to_owned(),
+            )
+        })?;
+    if total_len > u32::MAX as usize {
+        return Err(OpdError::InvalidInput(format!(
+            "GKD corpus-truth SFT sequence length {total_len} exceeds u32::MAX \
+             RoPE position range. Hint: reduce prompt/completion max tokens."
+        )));
+    }
+    for (index, &token_id) in corpus_tokens.iter().enumerate() {
+        if token_id as usize >= vocab {
+            return Err(OpdError::InvalidInput(format!(
+                "GKD corpus-truth SFT completion token {token_id} at \
+                 completion[{index}] is outside vocab={vocab}. Hint: verify \
+                 tokenizer/model vocab alignment before training."
+            )));
+        }
+    }
+    let mut sft_sequence = Vec::with_capacity(total_len);
+    sft_sequence.extend_from_slice(prompt_ids);
+    sft_sequence.extend_from_slice(corpus_tokens);
+    let positions = (0..total_len as u32).collect::<Vec<_>>();
+    let student_logits = student
+        .forward(store, tape, &sft_sequence, &positions)
+        .map_err(|err| map_qwen35_forward_error("student corpus SFT", err))?;
+    next_token_sft_loss_from_logits(
+        student_logits,
+        total_len,
+        prompt_ids.len() - 1,
+        corpus_tokens,
+        vocab,
+        store,
+        tape,
+    )
+}
+
+fn gkd_sft_loss(
+    config: GkdLossConfig<'_>,
+    student: &Qwen35Model,
+    prompt_ids: &[u32],
+    student_logits: TensorId,
+    rollout: &[u32],
+    vocab: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    match config.sft_anchor {
+        GkdSftAnchor::StudentRollout => {
+            shifted_rollout_sft_loss(student_logits, rollout, vocab, store, tape)
+        }
+        GkdSftAnchor::CorpusTruth => corpus_truth_sft_loss(
+            student,
+            prompt_ids,
+            config.corpus_tokens.ok_or_else(|| {
+                OpdError::InvalidInput(
+                    "GKD corpus-truth SFT anchor requires corpus completion \
+                     tokens. Hint: add completion/target fields to \
+                     --prompts-file."
+                        .to_owned(),
+                )
+            })?,
+            vocab,
+            store,
+            tape,
+        ),
+    }
 }
 
 fn mix_gkd_losses(
@@ -673,13 +860,46 @@ pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForwar
     gkd_lambda: f32,
     profile: Option<&mut OpdStepProfile>,
 ) -> Result<OpdStepOutcome> {
+    opd_step_with_teacher_forward_profiled_gkd_anchor(
+        student,
+        teacher,
+        prompt_ids,
+        cfg,
+        student_params,
+        optimizer,
+        store,
+        tape,
+        GkdLossConfig {
+            lambda: gkd_lambda,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+        },
+        profile,
+    )
+}
+
+pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
+    O: Optimizer,
+    T: TeacherForward + ?Sized,
+>(
+    student: &Qwen35Model,
+    teacher: &T,
+    prompt_ids: &[u32],
+    cfg: OpdStepConfig,
+    student_params: &[TensorId],
+    optimizer: &mut O,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    gkd_config: GkdLossConfig<'_>,
+    profile: Option<&mut OpdStepProfile>,
+) -> Result<OpdStepOutcome> {
     let mut profile = profile;
     if let Some(profile) = profile.as_deref_mut() {
         *profile = OpdStepProfile::default();
     }
     let total_started = Instant::now();
     validate_step_config(cfg)?;
-    validate_gkd_lambda(gkd_lambda)?;
+    validate_gkd_loss_config(gkd_config)?;
     let vocab = student.config().vocab_size;
     if prompt_ids.is_empty() {
         return Err(OpdError::InvalidInput(
@@ -867,8 +1087,9 @@ pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForwar
             profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
         });
 
-        // 4. KL distill loss, optionally blended with the GKD hard-token
-        //    SFT proxy on the same on-policy rollout.
+        // 4. KL distill loss, optionally blended with a GKD hard-token
+        //    SFT anchor. The legacy anchor uses the on-policy rollout;
+        //    corpus-truth mode re-forwards the student over prompt+target.
         let phase_started = Instant::now();
         let kl_loss = kl_distill_loss(
             student_logits,
@@ -877,11 +1098,20 @@ pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForwar
             store,
             tape,
         )?;
-        let loss = if gkd_lambda == 0.0 {
+        let loss = if gkd_config.lambda == 0.0 {
             kl_loss
         } else {
-            let sft_loss = shifted_rollout_sft_loss(student_logits, &rollout, vocab, store, tape)?;
-            mix_gkd_losses(kl_loss, sft_loss, gkd_lambda, store, tape)?
+            let sft_loss = gkd_sft_loss(
+                gkd_config,
+                student,
+                prompt_ids,
+                student_logits,
+                &rollout,
+                vocab,
+                store,
+                tape,
+            )?;
+            mix_gkd_losses(kl_loss, sft_loss, gkd_config.lambda, store, tape)?
         };
         let loss_value = store.to_host(loss)?[0];
         validate_loss_value(loss_value)?;
@@ -936,10 +1166,11 @@ mod tests {
     use autograd::{AutogradError, Tape, Tensor, TensorStore};
 
     use super::{
-        OpdError, OpdStepConfig, greedy_next_token, map_qwen35_forward_error, mix_gkd_losses,
-        shifted_rollout_sft_loss, validate_gkd_lambda, validate_loss_value, validate_rollout_shape,
-        validate_step_config, validate_student_param_ownership, validate_student_params,
-        validate_teacher_params,
+        GkdLossConfig, GkdSftAnchor, OpdError, OpdStepConfig, greedy_next_token,
+        map_qwen35_forward_error, mix_gkd_losses, next_token_sft_loss_from_logits,
+        shifted_rollout_sft_loss, validate_gkd_lambda, validate_gkd_loss_config,
+        validate_loss_value, validate_rollout_shape, validate_step_config,
+        validate_student_param_ownership, validate_student_params, validate_teacher_params,
     };
     use crate::qwen35::Qwen35Error;
 
@@ -1157,7 +1388,46 @@ mod tests {
     }
 
     #[test]
-    fn mix_gkd_losses_respects_lambda_endpoints_and_midpoint() {
+    fn validate_gkd_loss_config_requires_corpus_tokens_for_corpus_anchor() {
+        let missing = validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.3,
+            sft_anchor: GkdSftAnchor::CorpusTruth,
+            corpus_tokens: None,
+        })
+        .expect_err("corpus anchor must require target tokens");
+        let OpdError::InvalidInput(message) = missing else {
+            panic!("expected InvalidInput, got {missing:?}");
+        };
+        assert!(message.contains("corpus-truth"));
+        assert!(message.contains("completion"));
+
+        let empty = validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.3,
+            sft_anchor: GkdSftAnchor::CorpusTruth,
+            corpus_tokens: Some(&[]),
+        })
+        .expect_err("empty corpus anchor tokens must be rejected");
+        let OpdError::InvalidInput(message) = empty else {
+            panic!("expected InvalidInput, got {empty:?}");
+        };
+        assert!(message.contains("non-empty"));
+
+        validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::CorpusTruth,
+            corpus_tokens: None,
+        })
+        .expect("lambda=0 should not require unused corpus targets");
+        validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.3,
+            sft_anchor: GkdSftAnchor::CorpusTruth,
+            corpus_tokens: Some(&[1, 2]),
+        })
+        .expect("non-empty corpus targets should be accepted");
+    }
+
+    #[test]
+    fn mix_gkd_losses_respects_lambda_endpoints_and_weighted_blend() {
         let mut store = TensorStore::default();
         let mut tape = Tape::new();
         let kl = store.alloc(Tensor::new(vec![2.0], vec![1], true).expect("kl scalar"));
@@ -1175,6 +1445,11 @@ mod tests {
             .expect("lambda=0.5 should mix losses evenly");
         let value = store.to_host(midpoint).expect("midpoint host")[0];
         assert!((value - 6.0).abs() < 1.0e-6, "got {value}");
+
+        let lambda03 = mix_gkd_losses(kl, sft, 0.3, &mut store, &mut tape)
+            .expect("lambda=0.3 should mix losses with SFT weight 0.3");
+        let value = store.to_host(lambda03).expect("lambda03 host")[0];
+        assert!((value - 4.4).abs() < 1.0e-6, "got {value}");
     }
 
     #[test]
@@ -1201,6 +1476,37 @@ mod tests {
         // Manual CE over positions 0..1, then divided by vocab=4 to match
         // the current KL internal normalization.
         let ce0 = (0.0f32.exp() + 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp()).ln() - 2.0;
+        let ce1 = (4.0f32.exp() + 3.0f32.exp() + 2.0f32.exp() + 1.0f32.exp()).ln() - 3.0;
+        let expected = ((ce0 + ce1) * 0.5) / 4.0;
+        assert!(
+            (value - expected).abs() < 1.0e-6,
+            "got {value}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn corpus_target_sft_loss_uses_completion_logits_after_prompt() {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let logits = store.alloc(
+            Tensor::new(
+                vec![
+                    0.0, 0.0, 0.0, 0.0, // prompt position 0 ignored
+                    0.0, 1.0, 2.0, 3.0, // prompt final position -> target 3
+                    4.0, 3.0, 2.0, 1.0, // completion prefix -> target 1
+                    0.5, 0.25, 0.0, -0.25, // final position ignored
+                ],
+                vec![1, 4, 4],
+                true,
+            )
+            .expect("student logits"),
+        );
+
+        let loss = next_token_sft_loss_from_logits(logits, 4, 1, &[3, 1], 4, &mut store, &mut tape)
+            .expect("corpus sft loss");
+        let value = store.to_host(loss).expect("loss host")[0];
+
+        let ce0 = (0.0f32.exp() + 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp()).ln() - 3.0;
         let ce1 = (4.0f32.exp() + 3.0f32.exp() + 2.0f32.exp() + 1.0f32.exp()).ln() - 3.0;
         let expected = ((ce0 + ce1) * 0.5) / 4.0;
         assert!(
