@@ -20,7 +20,10 @@ mod app {
     use train::{
         LoraAdapterConfig, LoraConfig, LoraTargetSet,
         loss::kl_distill_loss,
-        opd::{OpdStepConfig, OpdStepProfile, opd_step_with_teacher_forward_profiled_gkd},
+        opd::{
+            GkdLossConfig, GkdSftAnchor, OpdStepConfig, OpdStepProfile,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
+        },
         prompts::load_jsonl_prompt_sets,
         qwen35::Qwen35Model,
         qwen35_checkpoint::{
@@ -66,12 +69,14 @@ mod app {
         save_student_checkpoint: Option<PathBuf>,
         save_every: usize,
         gkd_lambda: f32,
+        sft_anchor: GkdSftAnchor,
     }
 
     #[derive(Debug)]
     struct PromptSets {
         train: Vec<Vec<u32>>,
         heldout: Vec<Vec<u32>>,
+        train_completions: Vec<Option<Vec<u32>>>,
         source: String,
     }
 
@@ -129,6 +134,7 @@ mod app {
     pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         let args = parse_args()?;
         let prompts = load_prompts(&args)?;
+        validate_prompt_sft_anchors(&args, &prompts)?;
         println!(
             "config backend=cuda teacher_model={} teacher_api_url={} teacher_config={} \
              student_model={} student_mode=lora \
@@ -136,7 +142,7 @@ mod app {
              steps={} rollout_len={} lr={:.9e} grad_clip={GRAD_CLIP} \
              prompt_source={} train_prompt_count={} heldout_prompt_count={} \
              eval_steps={:?} cuda_graph={} save_student_checkpoint={} save_every={} \
-             gkd_lambda={:.6}",
+             gkd_lambda={:.6} sft_anchor={}",
             args.teacher_model.display(),
             args.teacher_api_url.as_deref().unwrap_or("none"),
             args.teacher_config
@@ -158,10 +164,14 @@ mod app {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "none".to_owned()),
             args.save_every,
-            args.gkd_lambda
+            args.gkd_lambda,
+            sft_anchor_label(args.sft_anchor)
         );
         for (idx, prompt) in prompts.train.iter().enumerate() {
             println!("prompt split=train index={idx} ids={prompt:?}");
+            if let Some(completion) = prompts.train_completions.get(idx).and_then(Option::as_ref) {
+                println!("prompt split=train index={idx} completion_ids={completion:?}");
+            }
         }
         for (idx, prompt) in prompts.heldout.iter().enumerate() {
             println!("prompt split=heldout index={idx} ids={prompt:?}");
@@ -291,6 +301,7 @@ mod app {
         let mut save_student_checkpoint = None;
         let mut save_every = 0usize;
         let mut gkd_lambda = 0.0f32;
+        let mut sft_anchor = GkdSftAnchor::StudentRollout;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -321,6 +332,7 @@ mod app {
                 }
                 "--save-every" => save_every = next_arg(&mut args, &arg)?.parse::<usize>()?,
                 "--gkd-lambda" => gkd_lambda = parse_gkd_lambda(&next_arg(&mut args, &arg)?)?,
+                "--sft-anchor" => sft_anchor = parse_sft_anchor(&next_arg(&mut args, &arg)?)?,
                 "--no-cuda-graph" => enable_cuda_graph = false,
                 "--help" | "-h" => {
                     println!(
@@ -330,7 +342,8 @@ mod app {
                          [--steps N] [--rollout-len N] [--lr LR] \
                          [--eval-steps CSV] [--prompt-max-tokens N] [--max-step-seconds SEC] \
                          [--save-student-checkpoint DIR] [--save-every N] \
-                         [--gkd-lambda LAMBDA] [--no-cuda-graph]"
+                         [--gkd-lambda LAMBDA] [--sft-anchor student-rollout|corpus-truth] \
+                         [--no-cuda-graph]"
                     );
                     std::process::exit(0);
                 }
@@ -370,6 +383,7 @@ mod app {
             save_student_checkpoint,
             save_every,
             gkd_lambda,
+            sft_anchor,
         })
     }
 
@@ -411,6 +425,24 @@ mod app {
         Ok(value)
     }
 
+    fn parse_sft_anchor(raw: &str) -> Result<GkdSftAnchor, Box<dyn std::error::Error>> {
+        match raw {
+            "student-rollout" => Ok(GkdSftAnchor::StudentRollout),
+            "corpus-truth" => Ok(GkdSftAnchor::CorpusTruth),
+            _ => Err(format!(
+                "--sft-anchor must be one of student-rollout|corpus-truth, got `{raw}`"
+            )
+            .into()),
+        }
+    }
+
+    fn sft_anchor_label(anchor: GkdSftAnchor) -> &'static str {
+        match anchor {
+            GkdSftAnchor::StudentRollout => "student-rollout",
+            GkdSftAnchor::CorpusTruth => "corpus-truth",
+        }
+    }
+
     fn load_prompts(args: &Args) -> Result<PromptSets, Box<dyn std::error::Error>> {
         if let Some(path) = args.prompts_file.as_ref() {
             let loaded = load_jsonl_prompt_sets(
@@ -422,20 +454,56 @@ mod app {
             return Ok(PromptSets {
                 train: loaded.train,
                 heldout: loaded.heldout,
+                train_completions: loaded.train_completions,
                 source: format!(
-                    "jsonl:{} rows={} tokenizer={} truncated_rows={}",
+                    "jsonl:{} rows={} tokenizer={} truncated_rows={} completion_rows={} truncated_completion_rows={}",
                     loaded.prompt_file.display(),
                     loaded.jsonl_rows,
                     loaded.tokenizer_path.display(),
-                    loaded.truncated_rows
+                    loaded.truncated_rows,
+                    loaded.completion_rows,
+                    loaded.truncated_completion_rows
                 ),
             });
         }
         Ok(PromptSets {
             train: vec![vec![9419]],
             heldout: Vec::new(),
+            train_completions: vec![None],
             source: "single-token-hello".to_string(),
         })
+    }
+
+    fn validate_prompt_sft_anchors(
+        args: &Args,
+        prompts: &PromptSets,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if args.gkd_lambda == 0.0 || args.sft_anchor != GkdSftAnchor::CorpusTruth {
+            return Ok(());
+        }
+        if args.prompts_file.is_none() {
+            return Err("--sft-anchor corpus-truth requires --prompts-file with completion or target fields".into());
+        }
+        if prompts.train_completions.len() != prompts.train.len() {
+            return Err(format!(
+                "internal prompt/completion split mismatch: train_prompts={} train_completions={}",
+                prompts.train.len(),
+                prompts.train_completions.len()
+            )
+            .into());
+        }
+        if let Some((index, _)) = prompts
+            .train_completions
+            .iter()
+            .enumerate()
+            .find(|(_, completion)| completion.as_ref().map_or(true, |tokens| tokens.is_empty()))
+        {
+            return Err(format!(
+                "--sft-anchor corpus-truth requires non-empty completion/target tokens for every training row; missing train index {index}"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn load_infer_engine(
@@ -516,10 +584,18 @@ mod app {
         for step in 1..=args.steps {
             let prompt_index = (step - 1) % prompts.train.len();
             let prompt = prompts.train[prompt_index].as_slice();
+            let corpus_tokens = if args.sft_anchor == GkdSftAnchor::CorpusTruth {
+                prompts
+                    .train_completions
+                    .get(prompt_index)
+                    .and_then(Option::as_deref)
+            } else {
+                None
+            };
             let selected_teacher = route_teacher_id(prompt);
             let mut profile = OpdStepProfile::default();
             let step_started = Instant::now();
-            let outcome = opd_step_with_teacher_forward_profiled_gkd(
+            let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
                 student,
                 teacher,
                 prompt,
@@ -531,7 +607,11 @@ mod app {
                 &mut optimizer,
                 store,
                 tape,
-                args.gkd_lambda,
+                GkdLossConfig {
+                    lambda: args.gkd_lambda,
+                    sft_anchor: args.sft_anchor,
+                    corpus_tokens,
+                },
                 Some(&mut profile),
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();
@@ -548,8 +628,10 @@ mod app {
             step_seconds.push(elapsed);
             println!(
                 "train_step step={step} prompt_index={prompt_index} teacher_id={selected_teacher} \
-                 loss={:.12e} rollout_len={} step_seconds={elapsed:.6}",
-                outcome.loss, outcome.rollout_len
+                 loss={:.12e} rollout_len={} step_seconds={elapsed:.6} sft_anchor={}",
+                outcome.loss,
+                outcome.rollout_len,
+                sft_anchor_label(args.sft_anchor)
             );
             println!(
                 "phase_summary step={step} total={:.6} student_rollout={:.6} \
