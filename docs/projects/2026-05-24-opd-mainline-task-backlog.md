@@ -59,9 +59,10 @@ related:
 | T1 | Ship `run_opd_from_dirs` CLI + wins entry | codex | in_progress | compile + clippy clean on standalone diff | This session 2026-05-24 |
 | T2 | End-to-end OPD trace, max-split (per-phase wall-clock) | codex | **deferred until P5 finishes** | every phase has a measured number, not file:line citation only | User 2026-05-24 22:00 |
 | T3 | Delete non-mainline / dead code audit | codex | **completed** (8ca4403, 81842cc, 2f975cb; 4th-cluster grep clean) | each removal cites zero grep usage; one commit per cluster | User 2026-05-24 22:00 |
-| T4a | kv_tier observability metrics — **code-only** (no bench) | codex | queued | new metric fields landed + unit tests pass; audit-first to avoid duplicating existing infrastructure | Split 2026-05-25 — code-only part is CPU-safe |
+| T4a | kv_tier observability metrics — **code-only** (no bench) | codex | **completed** (375f09f audit, 83b9710 impl, a696fb4 tests; 588 unit tests pass) | new metric fields landed + unit tests pass; audit-first to avoid duplicating existing infrastructure | Split 2026-05-25 — code-only part is CPU-safe |
 | T4b | kv_tier observability — ≥4k SERVE baseline bench | codex | **deferred until P5 finishes** | baseline numbers recorded before any PrefetchPolicy::Timeout work | Split from T4 |
-| T5 | Chunked-logits KL implementation | codex | queued | real-corpus GKD reaches eval_summary step=0 + 1 train_step on 16GB | bf16 research mit. 2 |
+| T5a | Chunked-logits KL — **code-only** (forward + backward + unit tests) | codex | queued | parity test against existing KL on a small shape passes within ε; tape memory drops vs current shape (synthetic check, no real-corpus bench) | Split 2026-05-25 — code-only part is CPU-safe |
+| T5b | Chunked-logits KL — real-corpus 512-tok acceptance bench | codex | **deferred until P5 finishes** | real-corpus GKD reaches eval_summary step=0 + 1 train_step on 16GB at prompt_max_tokens=512 | bf16 research mit. 2 |
 | T6 | gap-analysis §6 G1→G7 ordered execution | codex | queued | each Gn passes its §5 license-or-kill threshold (PASS→wins, KILL→errors) | User 2026-05-24 23:xx |
 | T7 | SGLang docs deep-mine — surface gaps not yet in T6 | codex | queued | docs/research/2026-05-24-sglang-deep-mine-gaps.md with kill thresholds | User 2026-05-24 23:xx |
 
