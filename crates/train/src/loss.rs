@@ -214,3 +214,157 @@ fn validate_kl_distill_inputs(
         prefix_positions,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autograd::{Tensor, TensorStore};
+
+    fn deterministic_logits(len: usize, salt: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let mixed = (i.wrapping_mul(37).wrapping_add(salt * 19)) % 257;
+                (mixed as f32 - 128.0) / 32.0
+            })
+            .collect()
+    }
+
+    fn loss_and_student_grad(
+        student_logits: &[f32],
+        teacher_logits: &[f32],
+        shape: &[usize],
+        chunk_size: Option<usize>,
+    ) -> (f32, Vec<f32>) {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let student = store.alloc(
+            Tensor::new(student_logits.to_vec(), shape.to_vec(), true).expect("student logits"),
+        );
+        let teacher = store.alloc(
+            Tensor::new(teacher_logits.to_vec(), shape.to_vec(), false).expect("teacher logits"),
+        );
+        let vocab = shape.last().copied().expect("vocab dim");
+        let num_positions = student_logits.len() / vocab;
+        let loss = match chunk_size {
+            Some(chunk_size) => kl_distill_loss_chunked(
+                student,
+                teacher,
+                num_positions,
+                chunk_size,
+                &mut store,
+                &mut tape,
+            ),
+            None => kl_distill_loss(student, teacher, num_positions, &mut store, &mut tape),
+        }
+        .expect("kl loss");
+        let loss_value = store.to_host(loss).expect("loss host value")[0];
+        tape.backward(loss, &mut store).expect("backward");
+
+        let grad = store
+            .get(student)
+            .and_then(|tensor| tensor.grad)
+            .expect("student logits gradient");
+        let grad_values = store.to_host(grad).expect("gradient host value");
+        (loss_value, grad_values)
+    }
+
+    fn assert_close(lhs: f32, rhs: f32, eps: f32, label: &str) {
+        let abs = (lhs - rhs).abs();
+        assert!(
+            abs <= eps,
+            "{label} mismatch: lhs={lhs:.10e} rhs={rhs:.10e} abs={abs:.3e} eps={eps:.3e}"
+        );
+    }
+
+    fn assert_slice_close(lhs: &[f32], rhs: &[f32], eps: f32, label: &str) {
+        assert_eq!(lhs.len(), rhs.len(), "{label} length mismatch");
+        let mut worst = (0usize, 0.0_f32, 0.0_f32, 0.0_f32);
+        for (i, (&a, &b)) in lhs.iter().zip(rhs.iter()).enumerate() {
+            let abs = (a - b).abs();
+            if abs > worst.3 {
+                worst = (i, a, b, abs);
+            }
+        }
+        assert!(
+            worst.3 <= eps,
+            "{label} mismatch at {}: lhs={:.10e} rhs={:.10e} abs={:.3e} eps={:.3e}",
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3,
+            eps
+        );
+    }
+
+    #[test]
+    fn chunked_kl_matches_baseline_forward_and_student_grad() {
+        let shape = [1, 64, 1024];
+        let len = shape.iter().product();
+        let student_logits = deterministic_logits(len, 3);
+        let teacher_logits = deterministic_logits(len, 11);
+
+        let (baseline_loss, baseline_grad) =
+            loss_and_student_grad(&student_logits, &teacher_logits, &shape, None);
+        let (chunked_loss, chunked_grad) =
+            loss_and_student_grad(&student_logits, &teacher_logits, &shape, Some(8));
+
+        assert_close(baseline_loss, chunked_loss, 1.0e-5, "chunk_size=8 loss");
+        assert_slice_close(
+            &baseline_grad,
+            &chunked_grad,
+            1.0e-5,
+            "chunk_size=8 student gradient",
+        );
+    }
+
+    #[test]
+    fn chunked_kl_single_chunk_degenerates_to_baseline() {
+        let shape = [1, 64, 1024];
+        let len = shape.iter().product();
+        let student_logits = deterministic_logits(len, 5);
+        let teacher_logits = deterministic_logits(len, 17);
+
+        let (baseline_loss, baseline_grad) =
+            loss_and_student_grad(&student_logits, &teacher_logits, &shape, None);
+        let (chunked_loss, chunked_grad) =
+            loss_and_student_grad(&student_logits, &teacher_logits, &shape, Some(64));
+
+        assert_close(baseline_loss, chunked_loss, 1.0e-5, "single-chunk loss");
+        assert_slice_close(
+            &baseline_grad,
+            &chunked_grad,
+            1.0e-5,
+            "single-chunk student gradient",
+        );
+    }
+
+    #[test]
+    fn chunked_kl_chunk_size_one_boundary_is_finite() {
+        let shape = [1, 64, 1024];
+        let len = shape.iter().product();
+        let student_logits = deterministic_logits(len, 7);
+        let teacher_logits = deterministic_logits(len, 23);
+
+        let (loss, grad) = loss_and_student_grad(&student_logits, &teacher_logits, &shape, Some(1));
+
+        assert!(loss.is_finite(), "chunk_size=1 loss must be finite");
+        assert_eq!(grad.len(), len);
+        assert!(
+            grad.iter().all(|value| value.is_finite()),
+            "chunk_size=1 gradient must be finite"
+        );
+    }
+
+    #[test]
+    fn chunked_kl_synthetic_memory_sanity_for_512_token_qwen35_logits() {
+        let bytes_per_f32 = std::mem::size_of::<f32>();
+        let full_tensor_bytes = 512usize * 248_320usize * bytes_per_f32;
+        let chunked_tensor_bytes = 64usize * 248_320usize * bytes_per_f32;
+
+        assert_eq!(full_tensor_bytes, 508_559_360);
+        assert_eq!(chunked_tensor_bytes, 63_569_920);
+        assert_eq!(full_tensor_bytes / chunked_tensor_bytes, 8);
+        assert_eq!(full_tensor_bytes * 2, 1_017_118_720);
+        assert_eq!(chunked_tensor_bytes * 2, 127_139_840);
+    }
+}
