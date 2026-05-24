@@ -65,6 +65,9 @@ related:
 | T5b | Chunked-logits KL — real-corpus 512-tok acceptance bench | codex | **deferred until P5 finishes** | real-corpus GKD reaches eval_summary step=0 + 1 train_step on 16GB at prompt_max_tokens=512 | bf16 research mit. 2 |
 | T6 | gap-analysis §6 G1→G7 ordered execution | codex | queued | each Gn passes its §5 license-or-kill threshold (PASS→wins, KILL→errors) | User 2026-05-24 23:xx |
 | T7 | SGLang docs deep-mine — surface gaps not yet in T6 | codex | queued | docs/research/2026-05-24-sglang-deep-mine-gaps.md with kill thresholds | User 2026-05-24 23:xx |
+| T8 | M-state dirty file audit — decide ship-vs-revert per file | codex | queued | each of the still-dirty M files (lora.rs, weights.rs, bootstrap.rs, qwen35_checkpoint.rs, teacher_infer.rs, train_cli.rs leftover, 3 train+infer examples, autograd test) has a verdict: ship as standalone commit, revert if abandoned, or merge into a related landed feature | Continuous-cleanup discipline |
+| T9 | Audit `cargo test -p infer` / `-p train` "existing unrelated blockers" called out in T4a wins | codex | queued | wins entries 2026-05-25 cite test failures unrelated to the changed code — codex audits whether those are real flakes, env-specific, or hidden bugs; fix or document each | T4a wins entry surfaced this |
+| T10 | G-series code-only wireframes — pre-stage code for hardware-blocked gaps | codex | queued (low priority — after T7/T8/T9) | for G2/G4/G5: write the Rust changes that can land without Mac/long-context GPU; gate with `#[cfg]` or feature flag so they compile but only activate on right hardware; bench remains deferred | Keeps codex productive while P5 holds GPU |
 
 Detail per task:
 
@@ -144,6 +147,75 @@ Detail per task:
 - Each PASS → `docs/experience/wins/2026-05-24-gap-G<n>-<short>.md`.
 - Each KILL → `docs/experience/errors/2026-05-24-gap-G<n>-kill.md`.
 - Codex can interleave with T2/T3/T4/T5 when a gap depends on those.
+
+### T8 — M-state dirty file audit
+
+The repo has these uncommitted M-state files that have lived through multiple
+codex tasks without being shipped (or reverted):
+
+- `crates/autograd/tests/test_cuda_lazy_ops.rs`
+- `crates/train/src/qwen35_checkpoint.rs`
+- `crates/train/src/teacher_infer.rs`
+- `crates/train/examples/opd_step_cuda_{convergence_bench,realckpt_diag,realckpt_profile}.rs`
+- `infer/examples/{gptqmodel_w4_gemv_parity,qwen35_dense_module_dump,qwen35_linear_attn_parity}.rs`
+- `infer/src/backend/cuda/bootstrap.rs`
+- `infer/src/model/qwen35/{lora,weights}.rs`
+- `examples/opd/sft-anchor-mmlu-gsm8k.jsonl` (untracked)
+- `bench-output/2026-05-22-h3-max-seq-len-4096-08b/serve.log` (output noise — likely git-ignore-worthy)
+
+For each file, codex runs `git diff <file>`, decides:
+1. **Ship as standalone commit** — diff is meaningful + self-contained + tests
+   pass → commit with appropriate scope.
+2. **Merge into a landed feature** — diff is a follow-up to an already-shipped
+   commit → cherry-pick into that line if reasonable, otherwise standalone
+   commit citing the parent.
+3. **Revert** — diff is abandoned experiment with no value → `git checkout
+   <file>`. Cite the reason.
+4. **Add to .gitignore** — output / log noise → ship .gitignore update.
+
+One commit per cluster of related verdicts. Document in
+`docs/experience/wins/2026-05-25-m-state-audit.md`.
+
+### T9 — Unrelated test blockers audit
+
+T4a wins entry (`2026-05-25-kv-tier-observability-code-patch.md`) noted
+that `cargo test -p infer` and `cargo test -p infer --tests` hit existing
+example/Metal audit blockers that are unrelated to the T4a change. Codex:
+
+1. Runs `cargo test -p infer 2>&1 | tee /tmp/infer-test-output.log` and
+   `cargo test -p train 2>&1 | tee /tmp/train-test-output.log` on a clean
+   target dir.
+2. Classifies each failure: env-specific (Metal-only on Linux), flake
+   (intermittent), real-bug (deterministic, unrelated to recent changes).
+3. Fix the real bugs (≤3 files per fix, separate commit per).
+4. Skip with `#[ignore]` + comment for env-specific (CI matrix already
+   covers via the right runner).
+5. Mark flakes with `#[ignore = "flaky — see docs/...."]` and open errors
+   entry for each.
+
+Output: `docs/experience/errors/2026-05-25-test-suite-cleanup.md` with
+the classification table.
+
+### T10 — G-series code-only wireframes (low priority)
+
+For G-series gaps that ARE hardware-blocked but have a code-only
+"skeleton" that could land without bench verification, codex can stage:
+
+- **G4 Metal GPU sampler**: port CUDA `gpu_sample_cuda` logic to MLX
+  primitives in Rust; gate with the existing `metal` feature; `cargo check
+  -p infer --no-default-features --features cuda,no-cuda` passes (Linux
+  Mac-equivalent typecheck). Bench (sampling KS test ≤ 0.05) deferred until
+  ckl runs on Mac.
+- **G2 spike skeleton**: experiment harness file under
+  `crates/mlx-sys/examples/encode_replay_spike.rs` ready to run when
+  ckl/codex have Mac access; not licensed yet.
+- **G5 wiring stub**: extend the `Coordinator` consumer in
+  `infer/src/scheduler/cuda/core.rs` for the T2 disk fetch/store path,
+  gated behind a config flag default-off; bench deferred.
+
+ONLY do these after T7/T8/T9 complete. They're skeleton-shipping with
+deferred verification, so the value is "doesn't block when hardware
+appears" — not "delivers value today".
 
 ### T7 — SGLang docs deep-mine
 
