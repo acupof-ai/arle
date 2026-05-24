@@ -66,7 +66,7 @@ related:
 | A2 测显存 → 推 token 槽数 | ✅ | `crates/cuda-kernels/src/paged_kv.rs:127-180` `compute_budget_breakdown`;`bootstrap.rs:91-100` 用 SGLang 公式 `free × (1 - mem_fraction_static)`;page_size=16,BF16/FP8/INT8 均尊重 |
 | A3 req_to_token + 空 radix 树 | ✅ | `infer/src/prefix_cache.rs:308-350` `RadixCache::new`;`Node` (138-195) 带 `tier_location` / `session_id` / `fingerprint` |
 | A4 FlashInfer workspace | ❌ → N/A | **不接 FlashInfer**,用自家 TileLang AOT `csrc/attention/{prefill_attention,prefill_attention_hd256,decode_prep_paged,fused_attention}.cu`;dispatch 在 `infer/src/ops/attention.rs:54-67` |
-| A5 多 batch-size CUDA Graph 预录 | ⚠️ | `infer/src/model/cuda_graph.rs:10-68` 单 graph **on-demand capture**,**无 `[1,2,4,8,16,…]` bucket 预热**;miss bucket 落回 kernel launch |
+| A5 多 batch-size CUDA Graph 预录 | ✅ | 已有 batch-size graph warmup/cache:scheduler 启动预热 batch-size 列表(`infer/src/scheduler/cuda/core/warmup.rs:26,418`);Qwen3 `graph_cache[batch_size - 1]`(`infer/src/model/qwen3/batch_decode.rs:171`);Qwen3.5 piecewise `graph_cache[group_idx][batch_size - 1]`(`infer/src/model/qwen35/batch_decode.rs:168`) |
 | A6 3 进程 ZMQ | ❌ → N/A | 单进程,grep `zmq`/`TokenizerManager` 无结果 |
 
 ### B. 请求 → 调度
@@ -209,22 +209,32 @@ related:
   上 MTP 不是当前最高 ROI(因为 MLX-parity 已经达到 78% 带宽天花板)。**G2
   是先于 MTP 的瓶颈**。
 
-### G3 🟡 CUDA — CUDA Graph bucket pool 预热
+### G3 🟡 CUDA — CUDA Graph efficacy 实测
 
-- **现状**:`cuda_graph.rs:10-68` per-layer 单 graph on-demand,miss bucket
-  落回 kernel launch。
-- **影响**:🟡 **预测**对低 batch decode 有 launch overhead 削减;但
+- **现状**:已有 batch-size graph warmup/cache:scheduler 启动预热 batch-size
+  列表(`infer/src/scheduler/cuda/core/warmup.rs:26,418`);Qwen3
+  `graph_cache[batch_size - 1]`(`infer/src/model/qwen3/batch_decode.rs:171`);
+  Qwen3.5 piecewise
+  `graph_cache[group_idx][batch_size - 1]`(`infer/src/model/qwen35/batch_decode.rs:168`)。
+- **修正**:原 PASS/KILL("上不上 bucket pool") **KILLED** — 问题本身错,
+  因为当前主线已经有 batch-size warmup/cache。G3 现在只回答"现有 graph
+  path 对 P5/low-c decode 是否仍有实测收益"。
+- **影响**:🟡 **预测**现有 graph path 可能削低 batch decode launch overhead;但
   **EOD+19 `M_pf-graph v2` 教训**:nsys "X% of NVTX window" 必须 cross-check
   "(Y ms / per-request total time)" framing,取保守者。前次 `M_pf-graph
   Phase 0 KILL` 就是因为 graph capture 不是 SGLang 主因。
 - **Evidence 强度**:🟡 — 必须先 nsys + wall-clock framing 双 cross-check。
 - **License-or-kill 实验**(必跑,先于实现):
-  1. nsys 跑 Qwen3.5 decode c=1/2/4/8,measure **per-launch dispatch
-     overhead × launches-per-step ÷ per-request wall-clock**,要求 ≥ 10%
-     才上 bucket pool。
-  2. 同时跑 `[1,2,4,8,16]` 实际命中分布的 c-mix 模拟,确认 bucket 命中率。
-- **PASS** = wall-clock framing ≥ 10% 且 bucket 命中 ≥ 80%。**KILL** = 任一
-  不达 → 不动,把工程预算挪到 G1/G2/G4。
+  1. Qwen3.5 decode c=1/2/4/8,成对测 `--cuda-graph` vs
+     `--disable-cuda-graph`。
+  2. 记录 wall-clock per-request latency(TTFT/ITL/tok/s/mean request)和
+     nsys CUDA API stats(`cuLaunchKernel`,`cuGraphLaunch`,`cuStreamSynchronize`)。
+  3. 与 T2 P5 trace 的 sync-bound 结论 cross-correlate:若 graph 改不了
+     wall-clock,该 axis 让位给 student_rollout/backward。
+- **PASS** = `--cuda-graph` 比 `--disable-cuda-graph` mean step/request
+  latency ≥ 5% lower,或 c≤4 范围内 `cuLaunchKernel` time ≥ 30% lower。
+  **KILL** = wall-clock < 5% 且 `cuLaunchKernel` < 30% 差 → graph cache
+  已是次要 bottleneck,不继续投入 G3 实施。
 
 ### G4 🟢 Metal — GPU sampler 补 top-k / top-p / penalties
 
@@ -290,8 +300,8 @@ related:
 | 3 | **G4** Metal GPU sampler 补全 | 补齐 | S(~半周) | 正确性,非性能 | — |
 | 4 | **G2 license 实验** Metal encode 复用可行性 | 实验 | M(~2 天 spike) | 决定 G2 路线 A/B | — |
 | 5 | **G2 实施**(路线 A 或 B,看 4 的结果) | 实装 | L(~2-4 周) | decode 2× 起 / 或 KILL 接受现状 | G2 license |
-| 6 | **G3 license 实验** CUDA graph bucket nsys | 实验 | XS(~半天 nsys) | 决定 G3 上/不上 | — |
-| 7 | **G3 实施**(若 license PASS) | 实装 | M(~1 周) | 低 batch decode launch overhead 削减 | G3 license |
+| 6 | **G3 license 实验** CUDA graph efficacy nsys | 实验 | XS(~半天 nsys) | 决定现有 graph path 是否值得继续优化 | — |
+| 7 | **G3 实施**(若 license PASS) | 实装 | M(~1 周) | 低 batch decode launch/sync overhead 削减 | G3 license |
 | 8 | **G5 license measure** T0 pool 满载频率 | 测量 | S(~1 天 bench) | 决定 G5 上/不上 | — |
 | 9 | **G5 实施**(若 license PASS) | 实装 | L(~2-3 周) | long-session evict 后命中 | G5 license |
 | 10 | **G7 license measure** mutex hold time | 测量 | XS(~半天 profile) | 决定 G7 上/不上 | G2 完成 |
