@@ -20,17 +20,12 @@ use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
         ModelFamilyArg, OpdBackendArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand,
-        TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainTestArgs,
+        TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs,
     },
     hardware, hub_discovery,
 };
 
-const TRAIN_ENV_COMMANDS: &[&str] = &[
-    "train env",
-    "train test",
-    "train estimate-memory",
-    "train opd",
-];
+const TRAIN_ENV_COMMANDS: &[&str] = &["train env", "train estimate-memory", "train opd"];
 
 #[derive(Debug, Clone, Serialize)]
 struct OpdStepMetric {
@@ -53,7 +48,6 @@ struct OpdSummary {
 pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
     match train.command {
         TrainCommand::Env(args) => exit_from_result(run_train_env(args)),
-        TrainCommand::Test(args) => run_train_test(args),
         TrainCommand::EstimateMemory(args) => exit_from_result(run_train_estimate_memory(args)),
         TrainCommand::Opd(args) => run_opd(args),
     }
@@ -150,16 +144,6 @@ fn run_train_env(args: TrainEnvArgs) -> Result<()> {
     println!("cwd {}", report.cwd);
     println!("commands {}", report.commands.join(", "));
     Ok(())
-}
-
-fn run_train_test(_args: TrainTestArgs) -> ExitCode {
-    eprintln!(
-        "[arle train test] OPD smoke fixture pending — the legacy \
-         convert→pretrain→sft→eval pipeline was retired in the \
-         2026-05-18 OPD-only pivot. Re-implementation lands with \
-         the OPD substrate. See docs/projects/2026-05-18-opd-only-pivot.md."
-    );
-    ExitCode::from(0)
 }
 
 fn run_train_estimate_memory(args: TrainEstimateMemoryArgs) -> Result<()> {

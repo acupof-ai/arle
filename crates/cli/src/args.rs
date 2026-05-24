@@ -134,7 +134,7 @@ pub(crate) struct RenderArgs {
 #[command(
     name = "arle",
     about = "ARLE local agent, training, and dataset CLI",
-    after_help = "Common flows:\n  arle                                       Start the interactive agent REPL.\n  arle run                                   Explicit alias for the interactive agent REPL.\n  arle run --prompt \"Summarize this repo\"    Run one prompt and exit.\n  arle run --stdin --json < prompt.txt       Read one prompt from stdin and emit JSON.\n  arle serve --model-path /path/to/model      Start the OpenAI-compatible server.\n  arle --doctor                              Inspect the local environment and model resolution.\n  arle train env                             Print train-time environment diagnostics.\n  arle train test                            Report OPD smoke fixture status.",
+    after_help = "Common flows:\n  arle                                       Start the interactive agent REPL.\n  arle run                                   Explicit alias for the interactive agent REPL.\n  arle run --prompt \"Summarize this repo\"    Run one prompt and exit.\n  arle run --stdin --json < prompt.txt       Read one prompt from stdin and emit JSON.\n  arle serve --model-path /path/to/model      Start the OpenAI-compatible server.\n  arle --doctor                              Inspect the local environment and model resolution.\n  arle train env                             Print train-time environment diagnostics.\n  arle train opd --smoke --steps 5            Run the OPD smoke path.",
     group(ArgGroup::new("inspection_mode").args(["doctor", "list_models"]))
 )]
 pub(crate) struct Args {
@@ -340,7 +340,7 @@ pub(crate) struct ServeArgs {
 #[derive(Debug, Clone, clap::Args)]
 #[command(
     arg_required_else_help = true,
-    after_help = "Examples:\n  arle train env\n  arle train test\n  arle train estimate-memory --tokenizer tokenizer.json --preset small-25m"
+    after_help = "Examples:\n  arle train env\n  arle train opd --smoke --steps 5\n  arle train estimate-memory --tokenizer tokenizer.json --preset small-25m"
 )]
 pub(crate) struct TrainArgs {
     #[command(subcommand)]
@@ -351,38 +351,14 @@ pub(crate) struct TrainArgs {
 pub(crate) enum TrainCommand {
     /// Print train-time environment diagnostics.
     Env(TrainEnvArgs),
-    /// Report OPD smoke fixture status.
-    Test(TrainTestArgs),
     /// Estimate parameter count and rough memory.
     EstimateMemory(TrainEstimateMemoryArgs),
-    /// On-policy distillation. Stub until the OPD substrate lands.
+    /// On-policy distillation.
     Opd(TrainOpdArgs),
 }
 
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct TrainEnvArgs {
-    /// Render output as JSON for scripts and CI.
-    #[arg(long, default_value_t = false)]
-    pub(crate) json: bool,
-}
-
-#[derive(Debug, Clone, ClapArgs)]
-#[command(
-    after_help = "OPD smoke fixture pending. Returns once the OPD substrate lands; see docs/projects/2026-05-18-opd-only-pivot.md."
-)]
-pub(crate) struct TrainTestArgs {
-    /// Training backend to exercise; `auto` selects the compiled backend.
-    #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
-    pub(crate) backend: BackendArg,
-
-    /// Keep the temporary fixture directory instead of deleting it.
-    #[arg(long, default_value_t = false)]
-    pub(crate) keep_artifacts: bool,
-
-    /// Override the fixture output directory. Defaults to a temp folder.
-    #[arg(long)]
-    pub(crate) out_dir: Option<PathBuf>,
-
     /// Render output as JSON for scripts and CI.
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
@@ -526,7 +502,7 @@ pub(crate) enum OpdBackendArg {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, BackendArg, CliCommand, RunArgs, TrainCommand};
+    use super::{Args, CliCommand, RunArgs};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -761,17 +737,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_train_test_stub_args() {
-        let args = Args::try_parse_from(["arle", "train", "test", "--backend", "cpu", "--json"])
-            .expect("train test should parse");
-        let Some(CliCommand::Train(train)) = args.command else {
-            panic!("expected train command");
-        };
-        let TrainCommand::Test(test) = train.command else {
-            panic!("expected train test command");
-        };
-        assert_eq!(test.backend, BackendArg::Cpu);
-        assert!(test.json);
+    fn rejects_retired_train_test_stub() {
+        assert!(Args::try_parse_from(["arle", "train", "test"]).is_err());
     }
 
     #[test]
