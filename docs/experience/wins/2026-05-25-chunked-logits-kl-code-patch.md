@@ -75,7 +75,9 @@ cargo test -p train --lib
 - `cargo test -p train --lib chunked_kl`: 4 passed.
 - `cargo test -p train --lib`: 85 passed, 0 failed.
 - T5a does not run real-corpus 512-token GKD; T5b owns that GPU acceptance
-  after P5 PID 28950 finishes.
+  after P5 PID 28950 finishes. T5b later KILLed the 512-token gate because
+  chunking only the loss still leaves full teacher/student logits resident;
+  see `docs/experience/errors/2026-05-25-chunked-kl-real-corpus-512-kill.md`.
 
 ## Rule
 
