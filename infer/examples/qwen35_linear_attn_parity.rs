@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use infer::model::Qwen35Model;
 use serde::{Deserialize, Serialize};
 

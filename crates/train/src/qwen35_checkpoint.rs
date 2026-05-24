@@ -7,7 +7,7 @@ use autograd::{AutogradError, SafetensorsRegistry, Tape, TensorId, TensorStore};
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde_json::json;
 use thiserror::Error;
-use tokenizers::{models::wordlevel::WordLevel, Tokenizer};
+use tokenizers::{Tokenizer, models::wordlevel::WordLevel};
 
 use crate::{
     causal_lm::{live_tensor_ids, save_materialized_registry},
@@ -540,11 +540,11 @@ mod tests {
     use super::*;
     use crate::{
         lora::{LoraAdapterConfig, LoraConfig},
-        opd::{opd_step, OpdStepConfig},
+        opd::{OpdStepConfig, opd_step},
         qwen35::Qwen35Model,
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
     };
-    use autograd::{optim::AdamW, Tape, TensorStore};
+    use autograd::{Tape, TensorStore, optim::AdamW};
     use half::bf16;
     use safetensors::{Dtype, SafeTensors};
     use tempfile::tempdir;
@@ -1069,9 +1069,11 @@ mod tests {
             "full materialized save must not retain merged LoRA temporary tensors"
         );
         let names = safetensor_names(&step_dir.join("model.safetensors"));
-        assert!(names
-            .iter()
-            .any(|name| name == cfg.embed_tokens_tensor_name()));
+        assert!(
+            names
+                .iter()
+                .any(|name| name == cfg.embed_tokens_tensor_name())
+        );
         assert!(
             names.iter().all(|name| !name.contains(".lora_")),
             "full materialized checkpoint should use base HF tensor names: {names:?}"

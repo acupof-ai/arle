@@ -22,11 +22,11 @@
 #![cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 
 use autograd::backend::{
-    cpu_causal_sdpa_decode_gqa, cpu_concat_axis2, cpu_embedding_forward,
+    CpuBackend, cpu_causal_sdpa_decode_gqa, cpu_concat_axis2, cpu_embedding_forward,
     cpu_gather_last_dim_backward, cpu_gather_last_dim_forward, cpu_log_softmax_backward,
     cpu_log_softmax_forward_last_axis, cpu_matmul_backward, cpu_matmul_bt_backward,
     cpu_matmul_bt_forward, cpu_rms_norm_forward, cpu_scatter_add_rows_forward, cpu_slice,
-    cpu_softmax_backward, cpu_softmax_forward_last_axis, cpu_transpose_swap, CpuBackend,
+    cpu_softmax_backward, cpu_softmax_forward_last_axis, cpu_transpose_swap,
 };
 use autograd::backend_cuda::CudaBackend;
 use autograd::{Backend, DeviceHandle};
