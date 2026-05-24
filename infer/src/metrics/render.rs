@@ -316,6 +316,72 @@ impl ServerMetrics {
         .unwrap();
 
         out.push_str(
+            "# HELP infer_tier_fetch_queue_saturated_fallback_total Staged-prefix cold fallbacks caused by fetch queue saturation.\n",
+        );
+        out.push_str("# TYPE infer_tier_fetch_queue_saturated_fallback_total counter\n");
+        writeln!(
+            out,
+            "infer_tier_fetch_queue_saturated_fallback_total{{{labels}}} {}",
+            self.tier_fetch_queue_saturated_fallback_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_recompute_advised_fallback_total Prefix hits that advised recompute instead of reuse.\n",
+        );
+        out.push_str("# TYPE infer_tier_recompute_advised_fallback_total counter\n");
+        writeln!(
+            out,
+            "infer_tier_recompute_advised_fallback_total{{{labels}}} {}",
+            self.tier_recompute_advised_fallback_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_demote_to_host_bytes_total Bytes successfully demoted from T0 to T1.\n",
+        );
+        out.push_str("# TYPE infer_tier_demote_to_host_bytes_total counter\n");
+        writeln!(
+            out,
+            "infer_tier_demote_to_host_bytes_total{{{labels}}} {}",
+            self.tier_demote_to_host_bytes_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_store_bytes_total Bytes successfully stored from T1 to T2/T3.\n",
+        );
+        out.push_str("# TYPE infer_tier_store_bytes_total counter\n");
+        writeln!(
+            out,
+            "infer_tier_store_bytes_total{{{labels}}} {}",
+            self.tier_store_bytes_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_host_pool_high_pressure_ticks_total Scheduler ticks where T1 usage is at or above the configured high watermark.\n",
+        );
+        out.push_str("# TYPE infer_host_pool_high_pressure_ticks_total counter\n");
+        writeln!(
+            out,
+            "infer_host_pool_high_pressure_ticks_total{{{labels}}} {}",
+            self.host_pool_high_pressure_ticks_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_host_pool_low_pressure_ticks_total Scheduler ticks where T1 usage is at or below the configured low watermark.\n",
+        );
+        out.push_str("# TYPE infer_host_pool_low_pressure_ticks_total counter\n");
+        writeln!(
+            out,
+            "infer_host_pool_low_pressure_ticks_total{{{labels}}} {}",
+            self.host_pool_low_pressure_ticks_total()
+        )
+        .unwrap();
+
+        out.push_str(
             "# HELP infer_tier_fetch_recall_rate Promoted staged blocks divided by staged blocks [0,1].\n",
         );
         out.push_str("# TYPE infer_tier_fetch_recall_rate gauge\n");
@@ -1229,6 +1295,33 @@ impl ServerMetrics {
                 &h.spec_step_latency_us
                     .render("infer_spec_step_latency_us", &labels),
             );
+
+            out.push_str(
+                "# HELP infer_tier_demote_to_host_latency_us Completed T0 to T1 demote latency.\n",
+            );
+            out.push_str("# TYPE infer_tier_demote_to_host_latency_us histogram\n");
+            out.push_str(
+                &h.tier_demote_to_host_latency_us
+                    .render("infer_tier_demote_to_host_latency_us", &labels),
+            );
+
+            out.push_str(
+                "# HELP infer_tier_store_latency_us Completed T1 to T2/T3 store latency.\n",
+            );
+            out.push_str("# TYPE infer_tier_store_latency_us histogram\n");
+            out.push_str(
+                &h.tier_store_latency_us
+                    .render("infer_tier_store_latency_us", &labels),
+            );
+
+            out.push_str(
+                "# HELP infer_tier_readmission_fetch_wait_us Completed staged-readmission fetch wait.\n",
+            );
+            out.push_str("# TYPE infer_tier_readmission_fetch_wait_us histogram\n");
+            out.push_str(
+                &h.tier_readmission_fetch_wait_us
+                    .render("infer_tier_readmission_fetch_wait_us", &labels),
+            );
         }
 
         out
@@ -1480,6 +1573,16 @@ impl ServerMetrics {
                 },
             },
         });
+        let tier_observability = serde_json::json!({
+            "demote_to_host_bytes_total": self.tier_demote_to_host_bytes_total(),
+            "store_bytes_total": self.tier_store_bytes_total(),
+            "fetch_queue_saturated_fallback_total": self.tier_fetch_queue_saturated_fallback_total(),
+            "recompute_advised_fallback_total": self.tier_recompute_advised_fallback_total(),
+            "readmission_fetch_wait_us_p50": self.tier_readmission_fetch_wait_us_percentile(0.50),
+            "readmission_fetch_wait_us_p99": self.tier_readmission_fetch_wait_us_percentile(0.99),
+            "host_pool_high_pressure_ticks_total": self.host_pool_high_pressure_ticks_total(),
+            "host_pool_low_pressure_ticks_total": self.host_pool_low_pressure_ticks_total(),
+        });
 
         serde_json::json!({
             "requests": self.requests_total(),
@@ -1502,6 +1605,7 @@ impl ServerMetrics {
             "prefix_lookup_staged": self.prefix_lookup_staged(),
             "prefix_lookup_prefetch": self.prefix_lookup_prefetch(),
             "prefix_lookup_recompute": self.prefix_lookup_recompute(),
+            "tier_observability": tier_observability,
             "last_request": {
                 "session_id": latest.session_id,
                 "prefix_hit_rate": latest.prefix_hit_rate(),
@@ -1734,10 +1838,13 @@ impl ServerMetrics {
         } else {
             String::new()
         };
+        let fmt_opt = |v: Option<f64>| -> String {
+            v.map_or_else(|| "na".to_string(), |val| format!("{val:.1}"))
+        };
         let staged_blocks = self.tier_fetch_staged_blocks_total();
         let tier_suffix = if staged_blocks > 0 || self.tier_fetch_fallback_total() > 0 {
             format!(
-                " prefix_skip_rate={:.1}% tier_recall={:.1}% tier_src=h:{}/d:{}/r:{} tier_promoted={} tier_fallback={}",
+                " prefix_skip_rate={:.1}% tier_recall={:.1}% tier_src=h:{}/d:{}/r:{} tier_promoted={} tier_fallback={} tier_queue_sat_fallback={} tier_recompute_fallback={} tier_demote_bytes={} tier_store_bytes={} tier_fetch_wait_p50_us={} tier_fetch_wait_p99_us={} host_pool_pressure=high:{},low:{}",
                 self.prefix_skip_rate() * 100.0,
                 self.tier_fetch_recall_rate() * 100.0,
                 self.tier_fetch_staged_host_blocks_total(),
@@ -1745,9 +1852,28 @@ impl ServerMetrics {
                 self.tier_fetch_staged_remote_blocks_total(),
                 self.tier_fetch_promoted_blocks_total(),
                 self.tier_fetch_fallback_total(),
+                self.tier_fetch_queue_saturated_fallback_total(),
+                self.tier_recompute_advised_fallback_total(),
+                self.tier_demote_to_host_bytes_total(),
+                self.tier_store_bytes_total(),
+                fmt_opt(self.tier_readmission_fetch_wait_us_percentile(0.50)),
+                fmt_opt(self.tier_readmission_fetch_wait_us_percentile(0.99)),
+                self.host_pool_high_pressure_ticks_total(),
+                self.host_pool_low_pressure_ticks_total(),
             )
         } else {
-            format!(" prefix_skip_rate={:.1}%", self.prefix_skip_rate() * 100.0)
+            format!(
+                " prefix_skip_rate={:.1}% tier_queue_sat_fallback={} tier_recompute_fallback={} tier_demote_bytes={} tier_store_bytes={} tier_fetch_wait_p50_us={} tier_fetch_wait_p99_us={} host_pool_pressure=high:{},low:{}",
+                self.prefix_skip_rate() * 100.0,
+                self.tier_fetch_queue_saturated_fallback_total(),
+                self.tier_recompute_advised_fallback_total(),
+                self.tier_demote_to_host_bytes_total(),
+                self.tier_store_bytes_total(),
+                fmt_opt(self.tier_readmission_fetch_wait_us_percentile(0.50)),
+                fmt_opt(self.tier_readmission_fetch_wait_us_percentile(0.99)),
+                self.host_pool_high_pressure_ticks_total(),
+                self.host_pool_low_pressure_ticks_total(),
+            )
         };
         let agent_cache_suffix = format!(
             " prefix_request_hit_rate={:.1}% prefix_request_skip_rate={:.1}% session_affinity_hit={} session_affinity_miss={} session_slot_pressure_evictions_hard={} prefix_aware_admit_deferrals={} matched_prefix_tokens={} resume_prefill_tokens={} prefix_lookup_latency_us={} prefix_lookup_reusable_tokens={} prefix_lookup_ready_on_gpu={} prefix_lookup_direct_gpu_attach={} prefix_lookup_staged={} prefix_lookup_prefetch={} prefix_lookup_recompute={}",

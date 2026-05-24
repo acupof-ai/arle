@@ -131,6 +131,9 @@ pub struct HistogramSet {
     pub e2e: Histogram,
     pub scheduler_step: Histogram,
     pub spec_step_latency_us: Histogram,
+    pub tier_demote_to_host_latency_us: Histogram,
+    pub tier_store_latency_us: Histogram,
+    pub tier_readmission_fetch_wait_us: Histogram,
 }
 
 impl HistogramSet {
@@ -145,6 +148,9 @@ impl HistogramSet {
             e2e: Histogram::new(LATENCY_BUCKETS),
             scheduler_step: Histogram::new(LATENCY_BUCKETS),
             spec_step_latency_us: Histogram::new(MICROSECOND_BUCKETS),
+            tier_demote_to_host_latency_us: Histogram::new(MICROSECOND_BUCKETS),
+            tier_store_latency_us: Histogram::new(MICROSECOND_BUCKETS),
+            tier_readmission_fetch_wait_us: Histogram::new(MICROSECOND_BUCKETS),
         }
     }
 }
