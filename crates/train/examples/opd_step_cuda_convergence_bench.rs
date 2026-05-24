@@ -14,14 +14,14 @@ mod app {
     };
 
     use autograd::{
+        Tape,
         backend_cuda::CudaBackend,
         optim::AdamW,
         tensor::{TensorId, TensorStore},
-        Tape,
     };
     use qwen35_spec::{LayerType, Qwen35Config};
     use train::{
-        opd::{opd_step, OpdStepConfig},
+        opd::{OpdStepConfig, opd_step},
         qwen35::Qwen35Model,
     };
 
@@ -269,7 +269,9 @@ mod app {
                 "cross_backend steps={} rollout_match_steps={}/{} max_loss_relerr={:.12e} first_divergence_step={} cpu={:?} cuda={:?}",
                 cpu.losses.len().min(cuda.losses.len()),
                 rollout_match_steps,
-                cpu.observed_rollouts.len().min(cuda.observed_rollouts.len()),
+                cpu.observed_rollouts
+                    .len()
+                    .min(cuda.observed_rollouts.len()),
                 max_loss_relerr,
                 step,
                 cpu_tokens,
@@ -279,7 +281,9 @@ mod app {
                 "cross_backend steps={} rollout_match_steps={}/{} max_loss_relerr={:.12e} first_divergence_step=none",
                 cpu.losses.len().min(cuda.losses.len()),
                 rollout_match_steps,
-                cpu.observed_rollouts.len().min(cuda.observed_rollouts.len()),
+                cpu.observed_rollouts
+                    .len()
+                    .min(cuda.observed_rollouts.len()),
                 max_loss_relerr
             ),
         }

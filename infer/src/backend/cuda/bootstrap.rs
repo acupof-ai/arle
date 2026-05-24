@@ -14,15 +14,15 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 #[cfg(feature = "cuda")]
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 #[cfg(feature = "cuda")]
 use log::{info, warn};
 
 #[cfg(feature = "cuda")]
 use crate::model::deepseek::{DeepseekModel, DeepseekRuntimeConfig};
-use crate::model::{ModelForward, ModelRuntimeConfig, Qwen35Model, Qwen3Model};
+use crate::model::{ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
 #[cfg(feature = "cuda")]
-use crate::model_registry::{detect_arch, ModelArch};
+use crate::model_registry::{ModelArch, detect_arch};
 #[cfg(feature = "cuda")]
 use crate::model_source::ResolvedModelSource;
 #[cfg(feature = "cuda")]
@@ -604,8 +604,8 @@ mod tests {
     use super::SchedulerRuntimeGuard;
     use anyhow::Result;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
 
     #[test]

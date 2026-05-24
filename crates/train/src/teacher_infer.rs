@@ -17,7 +17,7 @@ use std::{
 #[cfg(feature = "cuda")]
 use autograd::Backend;
 use autograd::{AutogradError, Tape, Tensor, TensorId, TensorStore};
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use half::bf16;
 #[cfg(feature = "cuda")]
 use infer::server_engine::LoadedInferenceEngine;
@@ -835,8 +835,8 @@ mod tests {
     }
 
     #[test]
-    fn api_teacher_fetches_http_logits_into_tensor_store(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn api_teacher_fetches_http_logits_into_tensor_store()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let server = thread::spawn(move || -> std::result::Result<(), String> {
