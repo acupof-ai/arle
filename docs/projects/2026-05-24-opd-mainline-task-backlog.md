@@ -16,10 +16,9 @@ related:
 ## Live state (refreshed by T13 docs audit, 2026-05-25)
 
 - **Mainline**: optimize OPD effect + perf. Per CLAUDE.md + 2026-05-18 OPD-only pivot.
-- **Concurrent local GPU**: P5 pure-OPD 5k run (PID 28950) remains the hard
-  isolation boundary until it exits. Last user-reported T12 preflight state:
-  step ~2830/5000, ETA ~3h. Do not launch GPU inference or bench work while it
-  is still active.
+- **Concurrent local GPU**: P5 pure-OPD 5k run has exited. T14 swept all five
+  saved checkpoints; MMLU did not beat the no-LoRA base, and GSM8K remains
+  near-floor. GPU is free for the next serialized GPU task.
 - **Codex active task**: auto-pulling from §Queue per standing instruction
   (sent 2026-05-24 23:30). CPU-only tasks through T13 are now linked in
   §Session artifact ledger. GPU-blocked work resumes only after P5 exits.
@@ -69,6 +68,7 @@ related:
 | T10 | G-series code-only wireframes — **scope narrowed to G5 only** (G2/G4 defer to Mac) | codex | **completed** (8b595a6 feat(kv-tier) gate coordinator t2 disk wireframe; cargo check + 588 lib tests + codex review --uncommitted all green) | G5 only — Coordinator stub for T2 disk fetch/store, gated behind existing config flag default-off | Codex caught bugged gate 2026-05-25 — Linux can't typecheck Metal cfg |
 | T12 | **Capability eval harness preflight** (Task 14 prep) | codex | **completed** (ccb5ce9) | Verify `scripts/arle_capability_eval.py` runs end-to-end with `--dry-run` or equivalent: paths resolve, env vars match P5's checkpoint layout (runs/2026-05-24-p5-pure-opd-5k/), MMLU/GSM8K loader hits cache, INFER_LORA_PATH expects the right adapter file shape from `crates/train/src/qwen35_checkpoint.rs:save_lora_only`. Output: dry-run log + any path bugs fixed, so the moment P5 hits step 5000 we just hit play with no setup delay. **Industry-result enabler.** | User 2026-05-25: "目标是要拿到结果 / 业界有成就的成果"; P5 ETA ~3h |
 | T13 | Session docs cross-reference audit | codex | **completed** (docs-only cross-reference audit) | Audit this session's commits (fdb021c onwards) — every wins/errors/research entry should link to and from the related plan/project doc. Update CHANGELOG.md (if exists) and ROADMAP.md (if stale). Fix broken links. Continuous-cleanup discipline. | Continuous-cleanup |
+| T14 | P5 pure-OPD 5k capability sweep | codex | **completed** (capability sweep docs) | Sequential MMLU/GSM8K eval over step_001000..step_005000; compare capability winner against heldout-KL winner and base | User 2026-05-25 after P5 exit |
 
 ## Session artifact ledger (fdb021c onwards)
 
@@ -87,6 +87,7 @@ related:
 | T10/G5 coordinator stub (`8b595a6`) | [SGLang gap analysis](../plans/2026-05-24-sglang-pipeline-cuda-mlx-gap-analysis.md), [T11 transport plan](../plans/2026-05-25-kv-storage-transport-library-design.md) | [wins/2026-05-25-gap-G5-coordinator-stub.md](../experience/wins/2026-05-25-gap-G5-coordinator-stub.md) |
 | T12 eval harness preflight (`ccb5ce9`) | [2026-05-22 EOD OPD cycle wrap](2026-05-22-eod-opd-cycle-wrap.md) | [wins/2026-05-25-capability-eval-preflight.md](../experience/wins/2026-05-25-capability-eval-preflight.md) |
 | T13 docs cross-reference audit | This backlog | [wins/2026-05-25-session-docs-cross-reference-audit.md](../experience/wins/2026-05-25-session-docs-cross-reference-audit.md) |
+| T14 P5 capability sweep | [2026-05-22 EOD OPD cycle wrap](2026-05-22-eod-opd-cycle-wrap.md), [distill trajectory](../experience/wins/2026-05-22-distill-trajectory-valley-then-recovery.md), [task-divergent impact](../experience/wins/2026-05-22-opd-task-divergent-impact.md) | [wins/2026-05-25-p5-pure-opd-5k-capability-sweep.md](../experience/wins/2026-05-25-p5-pure-opd-5k-capability-sweep.md) |
 
 Detail per task:
 
