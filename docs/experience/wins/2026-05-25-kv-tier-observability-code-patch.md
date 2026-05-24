@@ -58,11 +58,21 @@ Verdict table:
 
 ```bash
 cargo check -p infer --no-default-features --features no-cuda
+cargo test -p infer kv_tier_observability_records_new_metrics
+cargo test -p infer --lib
 ```
 
-- Exit 0.
-- Full `cargo test -p infer` remains in the test commit. T4a does not run
-  SERVE bench; T4b owns the >=4k-token workload.
+- Exit 0 for the check, targeted unit test, and lib test suite.
+- `cargo test -p infer --lib`: 588 passed, 0 failed, 14 ignored.
+- `cargo test -p infer` was attempted and hit existing non-T4a example build
+  failures in `infer/examples/qwen35_*` paths gated around `infer::model`;
+  those files were already dirty/out of scope and were not edited.
+- `cargo test -p infer --tests` was attempted and hit existing
+  `infer/tests/metal_eval_audit.rs` classification drift for
+  `infer/src/backend/metal/kv_pool.rs`; Metal audit cleanup is not part of
+  this KV-tier metrics patch and was not edited.
+- T4a does not run SERVE bench; T4b owns the >=4k-token workload after P5
+  PID 28950 releases the GPU.
 
 ## Rule
 
