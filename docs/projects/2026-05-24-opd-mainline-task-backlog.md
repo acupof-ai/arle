@@ -16,14 +16,25 @@ related:
 ## Live state (refreshed each /loop tick)
 
 - **Mainline**: optimize OPD effect + perf. Per CLAUDE.md + 2026-05-18 OPD-only pivot.
-- **Concurrent local GPU**: P5 pure-OPD 5k run (PID 28950), step ~800/5000,
-  ETA ~11h. ~5 GB GPU headroom; GPU is OK to use for sub-4 GB peak jobs (user
-  2026-05-24 22:05 "gpu 可以用啊没问题的"). Do not OOM-kill it.
-- **Codex active task**: T1 — ship `run_opd_from_dirs` CLI feature
-  (`crates/cli/src/train_cli.rs` +101 line WIP).
-- **Codex next pickups**: this file's §"Queue" in order. Codex has authority
-  to reorder when license-or-kill measurements disagree with priority; record
-  the reason in the relevant wins/errors entry.
+- **Concurrent local GPU**: P5 pure-OPD 5k run (PID 28950), step 1007/5000
+  (eval@1000: train_kl 1.51e-5→1.36e-5 −10%, heldout_kl 1.74e-5→1.60e-5 −8%
+  vs step 0). ETA remainder ~10h. ~4.7 GB GPU headroom (11.7 GB used).
+  GPU is OK to use for sub-4 GB peak jobs (user 2026-05-24 22:05 "gpu 可以
+  用啊没问题的"). Do not OOM-kill it.
+- **Codex active task**: auto-pulling from §Queue per standing instruction
+  (sent 2026-05-24 23:30). Just shipped T1 (14c3be9 code + fc65d4f wins,
+  11m46s). Expected next pickup: T2 trace analysis.
+- **Recent commits this session**: fdb021c (codex bbuf skills),
+  d436dfa (Claude backlog + gkd-OOM errors), 14c3be9 (codex T1 code),
+  fc65d4f (codex T1 wins). All pushed origin/main.
+- **Codex hard-stop conditions** (only times it should idle):
+  1. license-or-kill threshold needs user/Claude call
+  2. change would touch P5 PID 28950
+  3. file collision with other in-flight editor
+  4. single task >2h impl with no license-or-kill in backlog
+  5. SOLID self-check finds the gate itself is bugged
+- **Codex authority**: reorder by measurement, record reason in wins/errors
+  entry.
 
 ## Rules
 
@@ -46,9 +57,10 @@ related:
 | # | Task | Owner | Status | Gate | Source |
 |---|---|---|---|---|---|
 | T1 | Ship `run_opd_from_dirs` CLI + wins entry | codex | in_progress | compile + clippy clean on standalone diff | This session 2026-05-24 |
-| T2 | End-to-end OPD trace, max-split (per-phase wall-clock) | codex | queued | every phase has a measured number, not file:line citation only | User 2026-05-24 22:00 |
-| T3 | Delete non-mainline / dead code audit | codex | queued | each removal cites zero grep usage; one commit per cluster | User 2026-05-24 22:00 |
-| T4 | kv_tier observability metrics patch | codex | queued | metric counters land + baseline bench run on ≥4k-prompt SERVE workload | Codex 2026-05-24 kv audit |
+| T2 | End-to-end OPD trace, max-split (per-phase wall-clock) | codex | **deferred until P5 finishes** | every phase has a measured number, not file:line citation only | User 2026-05-24 22:00 |
+| T3 | Delete non-mainline / dead code audit | codex | **completed** (8ca4403, 81842cc, 2f975cb; 4th-cluster grep clean) | each removal cites zero grep usage; one commit per cluster | User 2026-05-24 22:00 |
+| T4a | kv_tier observability metrics — **code-only** (no bench) | codex | queued | new metric fields landed + unit tests pass; audit-first to avoid duplicating existing infrastructure | Split 2026-05-25 — code-only part is CPU-safe |
+| T4b | kv_tier observability — ≥4k SERVE baseline bench | codex | **deferred until P5 finishes** | baseline numbers recorded before any PrefetchPolicy::Timeout work | Split from T4 |
 | T5 | Chunked-logits KL implementation | codex | queued | real-corpus GKD reaches eval_summary step=0 + 1 train_step on 16GB | bf16 research mit. 2 |
 | T6 | gap-analysis §6 G1→G7 ordered execution | codex | queued | each Gn passes its §5 license-or-kill threshold (PASS→wins, KILL→errors) | User 2026-05-24 23:xx |
 | T7 | SGLang docs deep-mine — surface gaps not yet in T6 | codex | queued | docs/research/2026-05-24-sglang-deep-mine-gaps.md with kill thresholds | User 2026-05-24 23:xx |
