@@ -22,7 +22,8 @@ fn root_help_mentions_explicit_run_entrypoint() {
     assert!(help.contains("Start the OpenAI-compatible server."));
     assert!(help.contains("Explicit alias for the interactive agent REPL."));
     assert!(help.contains("arle --doctor"));
-    assert!(help.contains("arle train test"));
+    assert!(help.contains("arle train opd --smoke --steps 5"));
+    assert!(!help.contains("arle train test"));
 }
 
 #[test]
@@ -72,8 +73,9 @@ fn train_help_lists_primary_workflows() {
 
     let help = stdout(&output);
     assert!(help.contains("arle train env"));
-    assert!(help.contains("arle train test"));
     assert!(help.contains("arle train estimate-memory"));
+    assert!(help.contains("arle train opd --smoke --steps 5"));
+    assert!(!help.contains("arle train test"));
     assert!(help.contains("opd"));
 }
 
@@ -95,17 +97,4 @@ fn doctor_json_reports_schema_and_compiled_backend() {
     assert!(value.get("gpu").is_some());
     assert!(value.get("tools").is_some());
     assert!(value.get("checks").is_some());
-}
-
-#[test]
-fn train_test_reports_opd_pending_stub() {
-    let output = run_arle(&["train", "test"]);
-    assert!(
-        output.status.success(),
-        "arle train test stub should exit 0\nstdout:\n{}\nstderr:\n{}",
-        stdout(&output),
-        stderr(&output)
-    );
-    let combined = format!("{}{}", stdout(&output), stderr(&output));
-    assert!(combined.contains("OPD"));
 }
