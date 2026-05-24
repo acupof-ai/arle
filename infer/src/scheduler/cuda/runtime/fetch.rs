@@ -110,10 +110,12 @@ impl<M: ModelForward> Scheduler<M> {
         let (host_blocks, disk_blocks, remote_blocks) =
             ready_waiters[0].staged_prefix.source_counts();
         if let Some(started_at) = readmit_started_at {
+            let wait_us = started_at.elapsed().as_micros() as u64;
+            self.metrics.record_tier_readmission_fetch_wait(wait_us);
             info!(
                 "Request {}: staged prefix ready in {:.1}ms src=h:{}/d:{}/r:{} waiters={}",
                 ready_waiters[0].request_id,
-                started_at.elapsed().as_secs_f64() * 1000.0,
+                wait_us as f64 / 1000.0,
                 host_blocks,
                 disk_blocks,
                 remote_blocks,
@@ -192,11 +194,12 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
             crate::kv_tier::CoordinatorEvent::StoreCompleted { ticket, locations } => {
-                self.store_ticket_started_at.remove(&ticket);
+                let store_started_at = self.store_ticket_started_at.remove(&ticket);
                 if let Some(key) = self.store_ticket_keys.remove(&ticket) {
                     self.store_dedupe.remove(&key);
                 }
                 if let Some(waiters) = self.store_waiting.remove(&ticket) {
+                    let stored_bytes = waiters.iter().map(|(_, region)| region.len).sum::<usize>();
                     let canonical_location =
                         locations.first().map(|(_, location)| location.clone());
                     for (block_id, region) in waiters {
@@ -208,6 +211,12 @@ impl<M: ModelForward> Scheduler<M> {
                             let _ = self.prefix_cache.mark_block_store_failed(block_id);
                         }
                         self.release_host_region(region);
+                    }
+                    if let Some(started_at) = store_started_at {
+                        self.metrics.record_tier_store_completed(
+                            started_at.elapsed().as_micros() as u64,
+                            stored_bytes,
+                        );
                     }
                 }
             }

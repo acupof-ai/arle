@@ -765,6 +765,7 @@ impl<M: ModelForward> Scheduler<M> {
                             coordinator_stats.queue_capacity(),
                             coordinator_stats.fetch_waiters,
                         );
+                        self.metrics.record_tier_fetch_queue_saturated_fallback();
                         self.fallback_to_cold_prefill(slot_idx);
                     } else if let Some(fetch_requests) =
                         staged_prefix.fetch_requests(&self.host_pinned_pool)
@@ -790,6 +791,7 @@ impl<M: ModelForward> Scheduler<M> {
                                 coordinator_stats.queue_capacity(),
                                 coordinator_stats.fetch_waiters,
                             );
+                            self.metrics.record_tier_fetch_queue_saturated_fallback();
                             self.fallback_to_cold_prefill(slot_idx);
                         }
                     } else {

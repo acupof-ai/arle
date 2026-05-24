@@ -36,7 +36,11 @@ Verdict table:
 
 ## What Worked
 
-Pending implementation.
+- Reused existing tier hit-rate projection instead of adding duplicate T0/T1/T2/T3 fields.
+- Added code-only metrics for the gaps found by the audit: completed demote/store latency, completed staged-readmission fetch wait, specific fallback counters, and host-pool pressure ticks.
+- Wired callbacks only at existing state-transition points:
+  `demote_block_to_host()`, staged fetch queue fallback branches, store completion, readmission completion, and the scheduler loop pressure tick.
+- Left T4b's SERVE bench deferred while P5 PID 28950 is running.
 
 ## Metric Semantics
 
@@ -52,7 +56,13 @@ Pending implementation.
 
 ## Verification
 
-Pending tests. T4a does not run SERVE bench; T4b owns the >=4k-token workload.
+```bash
+cargo check -p infer --no-default-features --features no-cuda
+```
+
+- Exit 0.
+- Full `cargo test -p infer` remains in the test commit. T4a does not run
+  SERVE bench; T4b owns the >=4k-token workload.
 
 ## Rule
 
