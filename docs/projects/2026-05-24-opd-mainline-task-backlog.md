@@ -68,6 +68,7 @@ related:
 | T8 | M-state dirty file audit — decide ship-vs-revert per file | codex | queued | each of the still-dirty M files (lora.rs, weights.rs, bootstrap.rs, qwen35_checkpoint.rs, teacher_infer.rs, train_cli.rs leftover, 3 train+infer examples, autograd test) has a verdict: ship as standalone commit, revert if abandoned, or merge into a related landed feature | Continuous-cleanup discipline |
 | T9 | Audit `cargo test -p infer` / `-p train` "existing unrelated blockers" called out in T4a wins | codex | queued | wins entries 2026-05-25 cite test failures unrelated to the changed code — codex audits whether those are real flakes, env-specific, or hidden bugs; fix or document each | T4a wins entry surfaced this |
 | T10 | G-series code-only wireframes — pre-stage code for hardware-blocked gaps | codex | queued (low priority — after T7/T8/T9) | for G2/G4/G5: write the Rust changes that can land without Mac/long-context GPU; gate with `#[cfg]` or feature flag so they compile but only activate on right hardware; bench remains deferred | Keeps codex productive while P5 holds GPU |
+| T11 | Storage + transport library — design exploration | codex (design only, no impl) | queued — high-priority Plan doc | output: docs/plans/2026-05-25-kv-storage-transport-library-design.md with: (1) current state inventory (HostPinnedPool / disk transport / shared_fs / local_cuda / kv-native-sys), (2) bottleneck map (DRAM↔HBM via pinned + memcpy; SSD→HBM staged via T1; missing: GPU Direct Storage, NVLink-aware, ring-buffer ASYNC pipelines), (3) upstream survey (NVIDIA GDS, SGLang HiCache backends, MoonCake transfer engine, NIXL spec, NCCL DMA paths), (4) proposed crate/API shape — single `crates/kv-transport` with pluggable backends? extend `crates/kv-native-sys`? extend `infer/src/kv_tier/transport`?, (5) ROI vs current path (must cite measurable wall-clock win or correctness gap; otherwise KILL), (6) license-or-kill thresholds for each proposed sub-component. **Design only** — no code, no large refactor commits. After ckl reviews → license one tranche at a time. | User 2026-05-25 — "存储层 + 传输层 高效库,尤其 SSD↔HBM / DRAM↔HBM" |
 
 Detail per task:
 
@@ -216,6 +217,56 @@ For G-series gaps that ARE hardware-blocked but have a code-only
 ONLY do these after T7/T8/T9 complete. They're skeleton-shipping with
 deferred verification, so the value is "doesn't block when hardware
 appears" — not "delivers value today".
+
+### T11 — Storage + transport library design exploration
+
+User 2026-05-25 request: efficient library for storage layer + transport layer,
+especially **SSD ↔ HBM** and **DRAM ↔ HBM**. Core: efficient organization +
+transport.
+
+**Current state (Claude pre-survey, codex to verify file:line)**:
+
+| Layer | Existing | Where | Status |
+|---|---|---|---|
+| T0 GPU HBM page pool | `TokenKVPool` | `crates/cuda-kernels/src/paged_kv.rs` | Owns T0; not in kv_tier |
+| T1 DRAM pinned arena | `HostPinnedPool` | `infer/src/kv_tier/host_pool.rs` | Live |
+| T2 SSD persistence | disk transport | `infer/src/kv_tier/transport/disk.rs` | Live, no-fsync proven |
+| T3 shared-fs / NIXL | `shared_fs.rs` + `nixl.rs` stub | `infer/src/kv_tier/transport/` | Real = shared-fs; NIXL stub |
+| Local D↔H | `local_cuda.rs` | `infer/src/kv_tier/transport/` | Live |
+| Native persistence | `kv-native-sys` | `crates/kv-native-sys/` | Substrate, partially exposed |
+
+**Codex design pass — output `docs/plans/2026-05-25-kv-storage-transport-library-design.md`**:
+
+1. **Inventory** — every storage + transport surface today, with file:line +
+   API shape + who calls it. No omissions.
+2. **Bottleneck map** — for each existing path, measured or hypothesized
+   wall-clock cost per byte + cost per op + sync points. Mark "measured" vs
+   "hypothesis" per §0 SOLID.
+3. **Upstream survey** — what do these projects do for SSD↔HBM / DRAM↔HBM that
+   ARLE doesn't:
+   - NVIDIA GPUDirect Storage (GDS) — bypasses CPU bounce buffer for SSD→HBM
+   - NVIDIA NVLink/NVSwitch — HBM↔HBM peer-to-peer
+   - SGLang HiCache backends — storage/distributed-storage tiers
+   - MoonCake transfer engine — KV pool migration across nodes
+   - NIXL spec — RDMA-class remote tier abstraction
+   - NCCL DMA paths — multi-GPU KV sharing
+4. **Proposed crate / API shape** — choose ONE:
+   - extend `crates/kv-native-sys` (substrate already exists)
+   - extend `infer/src/kv_tier/transport/` (live, but tied to scheduler)
+   - new `crates/kv-transport` (clean break, swappable backends)
+   Give a recommendation with reason; do not pre-commit.
+5. **ROI per proposed sub-component** — must cite measurable wall-clock win or
+   correctness gap. Items without ROI → KILL.
+6. **License-or-kill thresholds** — each sub-component gets PASS/KILL gate
+   tied to a bench or test, NOT to "we should have this".
+7. **Constraint**: don't propose anything that requires Mac access (Metal
+   unified memory makes T0/T1 boundary moot); CUDA-lane focus.
+8. **Constraint**: don't propose anything that needs Coordinator rewrite —
+   the boundary discipline from the 2026-05-24 kv audit must hold (RadixCache
+   = metadata truth, scheduler = lifecycle, coordinator = bytes).
+
+**Design-only this tranche.** No code, no architectural refactor commits. After
+ckl reviews the design doc → license one sub-component tranche at a time.
 
 ### T7 — SGLang docs deep-mine
 
