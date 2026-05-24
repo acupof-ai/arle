@@ -21,6 +21,12 @@ links stale. It landed as `9bd23ec`.
 artifacts. I did not delete it; this patch only ignores future local run
 outputs.
 
+Follow-up user decision: `examples/opd/sft-anchor-mmlu-gsm8k.jsonl` is safe to
+ship. Its source/license was already recorded in
+`docs/experience/errors/2026-05-24-gkd-real-corpus-tape-oom-kill.md`: 56 rows
+from MIT-licensed MMLU and GSM8K train splits, leak-checked and
+tokenizer-validated.
+
 ## Verdicts
 
 | Path | Verdict | Reason |
@@ -40,12 +46,14 @@ outputs.
 | `infer/src/model/qwen35/weights.rs` | revert | import reorder only |
 | `docs/research/2026-05-24-bf16-frozen-base-impl-path.md` | ship | committed docs referenced it; docs-only research note |
 | `runs/` | ignore | local training/checkpoint output; do not remove active or historical run artifacts |
-| `examples/opd/sft-anchor-mmlu-gsm8k.jsonl` | hard stop | data source/license is not documented; do not ship or delete without ckl decision |
+| `examples/opd/sft-anchor-mmlu-gsm8k.jsonl` | ship | ckl confirmed MMLU/GSM8K MIT license and source/filter rules; README now carries attribution |
 
 ## Verification
 
 ```bash
 git diff --check --no-index /dev/null docs/research/2026-05-24-bf16-frozen-base-impl-path.md
+wc -l examples/opd/sft-anchor-mmlu-gsm8k.jsonl
+jq empty examples/opd/sft-anchor-mmlu-gsm8k.jsonl
 git diff --cached --check
 git status --short
 ```
