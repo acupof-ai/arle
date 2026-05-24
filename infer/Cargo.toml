@@ -208,6 +208,26 @@ name = "qwen35_train_vs_infer_parity"
 path = "examples/qwen35_train_vs_infer_parity.rs"
 required-features = ["cuda"]
 
+[[example]]
+name = "qwen35_dense_module_dump"
+path = "examples/qwen35_dense_module_dump.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_linear_attn_parity"
+path = "examples/qwen35_linear_attn_parity.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_linear_attn_substage_dump"
+path = "examples/qwen35_linear_attn_substage_dump.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_prefill_path_probe"
+path = "examples/qwen35_prefill_path_probe.rs"
+required-features = ["cuda"]
+
 [[bench]]
 name = "tokenizer_bench"
 harness = false
