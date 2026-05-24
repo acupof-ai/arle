@@ -79,3 +79,10 @@ cargo test -p train --lib
 Keep a baseline loss entrypoint while adding memory-saving loss variants. Loss
 chunking must prove forward and student-logit gradient parity before any OPD or
 eval caller switches to it.
+
+## Verdict
+
+PASS for T5a code-only scope. Chunked KL forward/backward is implemented,
+baseline callsites are unchanged, small-shape CPU parity passes, and the
+512-token memory sanity is documented as synthetic rather than a real GPU
+measurement.
