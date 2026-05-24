@@ -1,5 +1,9 @@
 # GKD Real-Corpus 2k Killed by Autograd Tape OOM Before Step 0
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md`,
+`docs/research/2026-05-24-bf16-frozen-base-impl-path.md`, and
+`docs/projects/2026-05-22-eod-opd-cycle-wrap.md`.
+
 ## Context
 
 P4 KILL (`2026-05-22-p4-gkd-corpus-anchor-kill.md`) licensed two next branches:

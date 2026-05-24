@@ -21,6 +21,15 @@ Related governance docs:
 
 ### OPD train (CUDA) — new beta surface
 
+- **OPD mainline queue moved from experiment-only to operator-facing workflow.**
+  `arle train opd --student-model <dir>` now runs the real HF-dir OPD path
+  instead of the old pending stub, using the Qwen3.5 loader and `opd_step`
+  directly. The 2026-05-24/25 queue also landed code-only chunked-logits KL
+  parity, KV-tier observability counters, the default-off T2 coordinator
+  wireframe, SFT-anchor corpus attribution, and a CPU-only capability-eval
+  preflight for the P5 pure-OPD 5k adapter. Live task ordering, deferred GPU
+  gates, and artifact links are tracked in
+  [`docs/projects/2026-05-24-opd-mainline-task-backlog.md`](docs/projects/2026-05-24-opd-mainline-task-backlog.md).
 - **End-to-end OPD CUDA training stack landed on Qwen3-0.6B.** Single-session
   32-commit arc through kill-or-license-gated wins brings the OPD step at the
   moderate Qwen3.5-like shape to **48.5 ms** on RTX 4070 Ti SUPER —

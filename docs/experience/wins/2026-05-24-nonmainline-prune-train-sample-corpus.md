@@ -1,5 +1,8 @@
 # T3 Non-Mainline Prune — Retired Train Sample Corpus
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T3 and
+`docs/projects/2026-05-18-opd-only-pivot.md`.
+
 ## Context
 
 - T3 asks for non-mainline/dead-code deletion with zero-usage evidence.
@@ -39,4 +42,3 @@ cargo check -p train --no-default-features
 - Do not keep generic pretrain fixture data after the corresponding pretrain
   command surface is retired. OPD prompt fixtures should live under explicit
   OPD paths with task-specific semantics.
-

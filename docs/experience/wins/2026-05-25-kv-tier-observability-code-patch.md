@@ -1,5 +1,8 @@
 # T4a KV-Tier Observability Code Patch
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T4a/T4b and
+`docs/projects/tiered-kv-runtime-flow.md`.
+
 ## Context
 
 T4 split into:

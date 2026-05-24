@@ -1,5 +1,8 @@
 # Capability Eval Harness Preflight
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T12 and
+`docs/projects/2026-05-22-eod-opd-cycle-wrap.md`.
+
 ## Context
 
 P5 pure OPD is still running under `runs/2026-05-24-p5-pure-opd-5k/`.

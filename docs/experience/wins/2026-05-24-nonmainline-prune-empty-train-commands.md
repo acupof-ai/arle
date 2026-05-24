@@ -1,5 +1,8 @@
 # T3 Non-Mainline Prune — Empty Train Command Namespace
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T3 and
+`docs/projects/2026-05-18-opd-only-pivot.md`.
+
 ## Context
 
 - T3 requires one deletion cluster per commit with zero-usage evidence.
@@ -49,4 +52,3 @@ cargo test -p train --no-default-features --lib
 - After deleting a command family, delete the empty public namespace too.
   A comment-only module still advertises an API shape and keeps stale docs
   alive.
-

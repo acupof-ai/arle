@@ -1,5 +1,8 @@
 # T8 M-State Audit
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T8 and
+`docs/projects/2026-05-18-opd-only-pivot.md`.
+
 ## Context
 
 After the OPD CLI, T4a, T5a, G6, T7, and T11 commits, the working tree still

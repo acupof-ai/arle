@@ -1,5 +1,8 @@
 # Test Suite Cleanup
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T9 and
+`docs/experience/wins/2026-05-25-kv-tier-observability-code-patch.md`.
+
 ## Context
 
 T9 audited the unrelated test blockers called out by

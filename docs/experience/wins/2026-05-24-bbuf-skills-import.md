@@ -1,5 +1,8 @@
 # BBuf Skill Import Distilled Into ARLE Skills
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` session
+artifact ledger and `.claude/skills/arle-upstream-runtime-scan/SKILL.md`.
+
 ## Context
 
 ckl asked to fetch and scan three BBuf repositories, distill only the parts

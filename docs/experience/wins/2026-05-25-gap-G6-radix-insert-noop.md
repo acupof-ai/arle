@@ -1,5 +1,8 @@
 # G6 Radix Insert E2E Verification Closed as Noop
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T6/G6 and
+`docs/plans/2026-05-24-sglang-pipeline-cuda-mlx-gap-analysis.md`.
+
 ## Context
 
 T6 G6 asked whether the CUDA scheduler actually inserts completed prompts back
