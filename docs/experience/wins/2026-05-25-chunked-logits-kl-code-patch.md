@@ -36,7 +36,16 @@ Verdict table:
 
 ## What Worked
 
-Pending implementation.
+- Added `kl_distill_loss_chunked(student_logits, teacher_logits,
+  num_positions, chunk_size, ...)` as a sibling entrypoint; the existing
+  `kl_distill_loss` signature and both OPD/eval callsites remain unchanged.
+- Reused `slice` so backward scatters each chunk gradient into the original
+  student logits tensor through the existing autograd layout op.
+- Preserved baseline scale exactly: each chunk computes the same
+  mean-over-chunk-positions-and-vocab value, then weights by
+  `chunk_positions / num_positions` before the final negative scalar.
+- Avoided `sum_backward`; the chunked path stays on the same `mean` backward
+  family that the baseline KL and CE loss already exercise.
 
 ## Memory Sanity
 

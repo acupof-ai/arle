@@ -1,6 +1,6 @@
 use autograd::{
     AutogradError, Result, Tape, TensorId, TensorStore,
-    ops::{gather_last_dim, log_softmax, mean, mul, mul_scalar, softmax},
+    ops::{add, gather_last_dim, log_softmax, mean, mul, mul_scalar, slice, softmax},
 };
 
 pub fn cross_entropy_loss(
@@ -52,12 +52,94 @@ pub fn kl_distill_loss(
     mul_scalar(avg, -1.0, store, tape)
 }
 
+/// Chunked sibling of [`kl_distill_loss`] that preserves the baseline
+/// mean-over-positions-and-vocab scale while limiting KL intermediates to
+/// `[prefix..., chunk, vocab]`.
+///
+/// The input logits may still be full-sequence tensors. This entrypoint
+/// chunks the loss graph only; OPD/eval callers must stop materializing full
+/// forward logits separately before this becomes an end-to-end peak-memory
+/// fix.
+pub fn kl_distill_loss_chunked(
+    student_logits: TensorId,
+    teacher_logits: TensorId,
+    num_positions: usize,
+    chunk_size: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let shape = validate_kl_distill_inputs(student_logits, teacher_logits, num_positions, store)?;
+    if chunk_size == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "kl_distill_loss_chunked: chunk_size must be > 0. \
+             Hint: pass the maximum sequence positions to score per KL chunk.",
+        ));
+    }
+    if shape.rank < 2 {
+        return Err(AutogradError::TapeInvariant(
+            "kl_distill_loss_chunked: logits must be shaped [..., seq_len, vocab]. \
+             Hint: pass Qwen35Model forward logits shaped [batch, seq_len, vocab].",
+        ));
+    }
+    if shape.seq_len == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "kl_distill_loss_chunked: seq_len must be > 0. \
+             Hint: pass at least one prompt or rollout token.",
+        ));
+    }
+
+    let mut total = None;
+    for seq_start in (0..shape.seq_len).step_by(chunk_size) {
+        let seq_end = seq_start.saturating_add(chunk_size).min(shape.seq_len);
+        let chunk_len = seq_end - seq_start;
+        let chunk_positions =
+            shape
+                .prefix_positions
+                .checked_mul(chunk_len)
+                .ok_or(AutogradError::TapeInvariant(
+                    "kl_distill_loss_chunked: chunk position count overflow",
+                ))?;
+        let chunk_weight = chunk_positions as f32 / num_positions as f32;
+
+        let mut starts = vec![0; shape.rank];
+        let mut ends = shape.dims.clone();
+        starts[shape.seq_axis] = seq_start;
+        ends[shape.seq_axis] = seq_end;
+
+        let teacher_chunk = slice(teacher_logits, &starts, &ends, store, tape)?;
+        let student_chunk = slice(student_logits, &starts, &ends, store, tape)?;
+        let teacher_probs = softmax(teacher_chunk, store, tape)?;
+        let student_log_probs = log_softmax(student_chunk, store, tape)?;
+        let weighted = mul(teacher_probs, student_log_probs, store, tape)?;
+        let chunk_avg = mean(weighted, store, tape)?;
+        let weighted_chunk = mul_scalar(chunk_avg, chunk_weight, store, tape)?;
+        total = Some(match total {
+            Some(previous) => add(previous, weighted_chunk, store, tape)?,
+            None => weighted_chunk,
+        });
+    }
+
+    let total = total.ok_or(AutogradError::TapeInvariant(
+        "kl_distill_loss_chunked: no chunks were produced",
+    ))?;
+    mul_scalar(total, -1.0, store, tape)
+}
+
+#[derive(Debug, Clone)]
+struct KlDistillShape {
+    dims: Vec<usize>,
+    rank: usize,
+    seq_axis: usize,
+    seq_len: usize,
+    prefix_positions: usize,
+}
+
 fn validate_kl_distill_inputs(
     student_logits: TensorId,
     teacher_logits: TensorId,
     num_positions: usize,
     store: &TensorStore,
-) -> Result<()> {
+) -> Result<KlDistillShape> {
     let student = store
         .get(student_logits)
         .ok_or(AutogradError::InvalidTensorId(student_logits))?;
@@ -115,5 +197,20 @@ fn validate_kl_distill_inputs(
         ));
     }
 
-    Ok(())
+    let rank = student.shape.len();
+    let seq_axis = rank.saturating_sub(2);
+    let seq_len = student.shape.get(seq_axis).copied().unwrap_or(0);
+    let prefix_positions = if rank >= 2 {
+        student.shape[..seq_axis].iter().product()
+    } else {
+        0
+    };
+
+    Ok(KlDistillShape {
+        dims: student.shape.clone(),
+        rank,
+        seq_axis,
+        seq_len,
+        prefix_positions,
+    })
 }
