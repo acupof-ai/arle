@@ -1,7 +1,7 @@
 ---
 name: tmux-agent-control
-description: Use this skill when the user asks to inspect, send a task to, queue work for, interrupt, spawn, replace, or otherwise drive another coding-agent CLI (Codex / Claude Code / aider / ...) running inside a tmux session. Triggers include "看看 tmux 中 codex", "给 codex 发任务 X", "send X to codex", "推进 codex", "打断 codex / pivot", "起一个 claude / codex 接手", "替代 codex", "check what the other agent is doing". Covers session discovery, single-line vs multi-line vs long-brief submit semantics (Enter / Enter Enter / load-buffer + paste-buffer), spawning peers, quota handoff, queue-vs-immediate behavior, scrollback capture, and don't-talk-to-yourself safety.
-version: 1.2.0
+description: Use this skill when ckl asks to inspect, queue work for, interrupt, spawn, replace, or otherwise drive another coding-agent CLI running inside tmux. Covers ARLE's known-safe tmux path for Codex/Claude Code delegation, including session discovery, capture-pane status checks, Enter semantics, long-brief buffer paste, queue-vs-immediate behavior, and don't-send-to-yourself safety.
+version: 1.3.0
 ---
 
 # tmux-agent-control
@@ -231,27 +231,6 @@ Common when an agent (typically Codex) hits its weekly limit and the user wants 
 2. **Send the same brief via buffer** to the replacement. Adjust paths if the new cwd differs (e.g. drop absolute prefixes if the new cwd is now the target repo).
 3. **Stand down the original**: `tmux send-keys -t <orig>:<w> Escape` to interrupt, then send a one-liner explaining the handoff so it doesn't sit at "Conversation interrupted" expecting input. Example: `Track X has been handed off to a fresh agent on session N. Stay idle, do nothing further.`
 4. **Verify both**: capture-pane on the replacement (should show `Working`); capture-pane on the original (should be at idle prompt with no pending work).
-5. The original's phase-1 reads aren't lost in any meaningful sense — the replacement re-reads, costing some tokens but avoiding contaminated assumptions and any stale plan the original drafted.
-
-## Real example (from this repo's history)
-
-User: "看看 tmux 中 codex 并且给它发任务 勇闯世界第一"
-
-```bash
-tmux ls
-# → c: ... (Claude Code), 1: ... (Codex)
-
-tmux capture-pane -t 1:0 -p | tail -80
-# → gpt-5.5 banner, "Working (1m 04s)", Plan with 4 steps loaded
-
-tmux send-keys -t 1:0 "勇闯世界第一" Enter
-
-sleep 2 && tmux capture-pane -t 1:0 -p | tail -30
-# → "Messages to be submitted after next tool call ↳ 勇闯世界第一"
-# Confirmed queued. Done.
-```
-
-Reported back to user: which session, what Codex was doing (1m04s into A0 task), confirmation the new directive landed in the queue.
 
 ## Anti-patterns
 
@@ -268,5 +247,4 @@ Reported back to user: which session, what Codex was doing (1m04s into A0 task),
 
 - `CLAUDE.md` §Delegation — authoritative on why tmux (not the in-process subagent) is the Codex execution path.
 - `memory/feedback_codex_tmux_double_enter.md` — origin of the Enter-vs-Enter-Enter rule (2026-04-30 incident).
-- `memory/feedback_claude_executes_codex_reviews.md` — current inverted-delegation preference (Claude implements, Codex reviews); overrides CLAUDE.md default until user reverses.
 - `loop` skill — for scheduled periodic nudges.

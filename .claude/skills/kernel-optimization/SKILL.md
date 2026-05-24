@@ -1,7 +1,7 @@
 ---
 name: kernel-optimization
-description: Use this skill when the user asks to optimize, tune, speed up, or improve the performance of a GPU/CPU kernel, operator (op), attention path, GEMM call, decode/prefill path, quantization op, scheduler hot path, or any "make this faster" / "reduce ITL/TTFT" / "lower memory" / "拉满 utilization" / "调 kernel" / "优化算子" request. Captures the methodology — formula-predict → measure binding constraint → single-variable A/B with matched controls → combinational A/B when interactions suspected → tradeoff explicit (no tradeoff = not at extremes) → license-or-kill — and an industry-reference catalog (FlashAttention, cutlass, Marlin, SGLang, vLLM, TileLang, ncu/nsys methodology) so each attempt is grounded, not hand-waved.
-version: 1.15.0
+description: Use this skill when ckl asks to optimize an ARLE kernel, operator, attention path, GEMM, decode/prefill path, quantization op, scheduler hot path, TTFT/ITL/tok-s metric, memory footprint, or any "优化算子" / "调 kernel" / "make this faster" request. It enforces formula-predict -> measured binding constraint -> matched single-variable A/B -> interaction A/B when needed -> explicit tradeoff -> license-or-kill, and keeps the industry catalog scoped to ARLE CUDA/TileLang/MLX/runtime work.
+version: 1.17.0
 ---
 
 # kernel-optimization
@@ -59,6 +59,19 @@ Pick one (no "make it faster all-around" — that's vibes):
 | **Memory bandwidth** | GB/s achieved / 672 GB/s (4070 Ti SUPER) | ncu HBM pct |
 
 **Acid test**: if pre-optimization you can't say "I want to move <metric> from <X> to <Y> within <Z> minutes wall-clock", you don't have a target. Stop.
+
+For a standalone kernel campaign, also pin the KernelPilot-style `K/R/W` triple
+before touching code:
+
+- `K`: exact kernel semantics, dtypes, shapes, layouts, and unsupported regimes.
+- `R`: correctness oracle in this repo, usually JSON baseline, existing Rust
+  test, or a small reference implementation.
+- `W`: workload distribution or one focused shape. If it is one shape, keep the
+  dispatcher simple and say that generality is deferred.
+
+Do not create a sibling optimization checkout inside ARLE unless ckl explicitly
+asks for one. ARLE kernel work normally lands in the existing module with a
+small attempt ledger in the wins/errors entry.
 
 ### Phase 2 — Hardware constraint sheet
 
@@ -279,6 +292,24 @@ Always write a wins or errors entry. **Both outcomes accumulate knowledge.** A K
 ## Industry pattern catalog
 
 Apply these by **identifying the binding constraint first** (Phase 3), THEN selecting the matching pattern. Don't apply patterns by reputation.
+
+### Upstream evidence lookup
+
+- **BBuf KernelWiki / KernelPilot**.
+  - References: <https://github.com/BBuf/KernelWiki>,
+    <https://github.com/BBuf/kernel-pilot>
+  - Use as a prior-art index when the ARLE question involves Hopper/Blackwell
+    kernels, FlashAttention-4, FlashMLA, DeepGEMM, fused MoE, grouped GEMM,
+    FP8/FP4 block scaling, tail effects, pipeline stalls, register pressure,
+    warp specialization, TMA/TMEM/tcgen05, or ncu-driven next-edit selection.
+  - Treat pages as source-survey input, not evidence for ARLE. A KernelWiki PR
+    card can suggest what to test; only ARLE nsys/ncu/bench/log data licenses
+    the local conclusion.
+  - For ARLE's current sm_89 path, Blackwell-only techniques are usually future
+    notes unless the code has an Ada/Hopper fallback and a measurable wall-clock
+    bottleneck.
+  - If a source materially shapes code, record URL, upstream commit or PR, what
+    was adapted, and license/notice status in the wins/errors entry.
 
 ### Attention path
 
@@ -1274,6 +1305,8 @@ cargo test --release --features cuda --test greedy_consistency
 - Triton (alternative DSL): <https://github.com/openai/triton>
 - ncu reference: <https://docs.nvidia.com/nsight-compute/>
 - nsys reference: <https://docs.nvidia.com/nsight-systems/>
+- BBuf KernelWiki: <https://github.com/BBuf/KernelWiki>
+- BBuf kernel-pilot: <https://github.com/BBuf/kernel-pilot>
 
 ---
 
