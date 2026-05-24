@@ -56,13 +56,23 @@ Pending tests. The intended synthetic calculation is for one f32
 - Chunk size 64: `1 * 64 * 248320 * 4 = 63,569,920` bytes, about 60.6 MiB.
 - Theoretical reduction: 8x per KL intermediate.
 
-This is synthetic, not measured on a real GPU run. It covers KL intermediates;
-end-to-end peak drops only after T5b switches callers so full forward logits do
-not remain the dominant allocation.
+The unit test locks the exact byte math. This is synthetic, not measured on a
+real GPU run. It covers KL intermediates; end-to-end peak drops only after T5b
+switches callers so full forward logits do not remain the dominant allocation.
 
 ## Verification
 
-Pending tests. T5a does not run real-corpus 512-token GKD.
+```bash
+cargo check -p train --no-default-features --lib
+cargo test -p train --lib chunked_kl
+cargo test -p train --lib
+```
+
+- Exit 0 for all commands.
+- `cargo test -p train --lib chunked_kl`: 4 passed.
+- `cargo test -p train --lib`: 85 passed, 0 failed.
+- T5a does not run real-corpus 512-token GKD; T5b owns that GPU acceptance
+  after P5 PID 28950 finishes.
 
 ## Rule
 
