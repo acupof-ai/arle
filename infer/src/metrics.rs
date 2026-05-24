@@ -2445,6 +2445,114 @@ mod tests {
     }
 
     #[test]
+    fn kv_tier_observability_records_new_metrics() {
+        let m = ServerMetrics::new("Qwen3-4B");
+
+        m.record_prefix_lookup_detail(PrefixLookupDetail {
+            prompt_tokens: 128,
+            matched_prefix_tokens: 64,
+            reusable_tokens: 0,
+            lookup_latency_us: 9,
+            ready_on_gpu: false,
+            direct_gpu_attach: false,
+            staged: false,
+            prefetch: false,
+            recompute: true,
+        });
+        m.record_tier_fetch_queue_saturated_fallback();
+        m.record_tier_demote_to_host(75, 4096);
+        m.record_tier_store_completed(150, 8192);
+        m.record_tier_readmission_fetch_wait(300);
+        m.record_host_pool_pressure_tick(0.90, 0.70, 0.85);
+        m.record_host_pool_pressure_tick(0.50, 0.70, 0.85);
+        m.record_host_pool_pressure_tick(0.80, 0.70, 0.85);
+
+        assert_eq!(m.tier_recompute_advised_fallback_total(), 1);
+        assert_eq!(m.tier_fetch_queue_saturated_fallback_total(), 1);
+        assert_eq!(m.tier_demote_to_host_bytes_total(), 4096);
+        assert_eq!(m.tier_store_bytes_total(), 8192);
+        assert_eq!(m.host_pool_high_pressure_ticks_total(), 1);
+        assert_eq!(m.host_pool_low_pressure_ticks_total(), 1);
+        assert_eq!(
+            m.tier_readmission_fetch_wait_us_percentile(0.50),
+            Some(300.0)
+        );
+        assert_eq!(
+            m.tier_readmission_fetch_wait_us_percentile(0.99),
+            Some(300.0)
+        );
+
+        let rendered = m.render_prometheus();
+        assert!(
+            rendered.contains("infer_tier_recompute_advised_fallback_total{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(
+            rendered
+                .contains("infer_tier_fetch_queue_saturated_fallback_total{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(
+            rendered.contains("infer_tier_demote_to_host_bytes_total{model=\"Qwen3-4B\",} 4096")
+        );
+        assert!(rendered.contains("infer_tier_store_bytes_total{model=\"Qwen3-4B\",} 8192"));
+        assert!(
+            rendered.contains("infer_host_pool_high_pressure_ticks_total{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(
+            rendered.contains("infer_host_pool_low_pressure_ticks_total{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(
+            rendered.contains("infer_tier_demote_to_host_latency_us_count{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(rendered.contains("infer_tier_store_latency_us_count{model=\"Qwen3-4B\",} 1"));
+        assert!(
+            rendered.contains("infer_tier_readmission_fetch_wait_us_count{model=\"Qwen3-4B\",} 1")
+        );
+
+        let stats = m.render_stats_json();
+        assert_eq!(
+            stats["tier_observability"]["demote_to_host_bytes_total"],
+            serde_json::json!(4096)
+        );
+        assert_eq!(
+            stats["tier_observability"]["store_bytes_total"],
+            serde_json::json!(8192)
+        );
+        assert_eq!(
+            stats["tier_observability"]["fetch_queue_saturated_fallback_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            stats["tier_observability"]["recompute_advised_fallback_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            stats["tier_observability"]["readmission_fetch_wait_us_p50"],
+            serde_json::json!(300.0)
+        );
+        assert_eq!(
+            stats["tier_observability"]["readmission_fetch_wait_us_p99"],
+            serde_json::json!(300.0)
+        );
+        assert_eq!(
+            stats["tier_observability"]["host_pool_high_pressure_ticks_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            stats["tier_observability"]["host_pool_low_pressure_ticks_total"],
+            serde_json::json!(1)
+        );
+
+        let summary = m.render_summary();
+        assert!(summary.contains("tier_queue_sat_fallback=1"));
+        assert!(summary.contains("tier_recompute_fallback=1"));
+        assert!(summary.contains("tier_demote_bytes=4096"));
+        assert!(summary.contains("tier_store_bytes=8192"));
+        assert!(summary.contains("tier_fetch_wait_p50_us=300.0"));
+        assert!(summary.contains("tier_fetch_wait_p99_us=300.0"));
+        assert!(summary.contains("host_pool_pressure=high:1,low:1"));
+    }
+
+    #[test]
     fn server_metrics_render_stats_json_agent_cache_fields() {
         let m = ServerMetrics::new("Qwen3-4B");
         m.set_model_arch(crate::model_arch::ModelArchSummary {
