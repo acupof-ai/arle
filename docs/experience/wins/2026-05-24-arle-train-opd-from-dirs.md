@@ -1,5 +1,8 @@
 # `arle train opd` HF-dir wiring — 2026-05-24
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T1 and
+`docs/projects/2026-05-18-opd-only-pivot.md`.
+
 ## Goal
 
 - Ship the OPD CLI main path that turns `arle train opd --student-model <dir>`
@@ -62,4 +65,3 @@ cargo clippy -p cli --no-deps -- -D warnings
 - Any CLI user path change must land with an experience entry in the same
   tranche; do not commit user-facing wiring without the corresponding docs
   breadcrumb.
-

@@ -1,5 +1,8 @@
 # BF16 Frozen-Base Implementation Path
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T5 and
+`docs/experience/errors/2026-05-24-gkd-real-corpus-tape-oom-kill.md`.
+
 ## 1. Where is the f32 frozen-base resident memory today?
 
 Current source already has a partial CUDA BF16 frozen-base path; the May 22 "all frozen base widens to f32" diagnosis is stale for rank-2

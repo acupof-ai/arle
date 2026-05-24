@@ -13,20 +13,18 @@ related:
 
 # OPD mainline + runtime optimization backlog
 
-## Live state (refreshed each /loop tick)
+## Live state (refreshed by T13 docs audit, 2026-05-25)
 
 - **Mainline**: optimize OPD effect + perf. Per CLAUDE.md + 2026-05-18 OPD-only pivot.
-- **Concurrent local GPU**: P5 pure-OPD 5k run (PID 28950), step 1007/5000
-  (eval@1000: train_kl 1.51e-5→1.36e-5 −10%, heldout_kl 1.74e-5→1.60e-5 −8%
-  vs step 0). ETA remainder ~10h. ~4.7 GB GPU headroom (11.7 GB used).
-  GPU is OK to use for sub-4 GB peak jobs (user 2026-05-24 22:05 "gpu 可以
-  用啊没问题的"). Do not OOM-kill it.
+- **Concurrent local GPU**: P5 pure-OPD 5k run (PID 28950) remains the hard
+  isolation boundary until it exits. Last user-reported T12 preflight state:
+  step ~2830/5000, ETA ~3h. Do not launch GPU inference or bench work while it
+  is still active.
 - **Codex active task**: auto-pulling from §Queue per standing instruction
-  (sent 2026-05-24 23:30). Just shipped T1 (14c3be9 code + fc65d4f wins,
-  11m46s). Expected next pickup: T2 trace analysis.
-- **Recent commits this session**: fdb021c (codex bbuf skills),
-  d436dfa (Claude backlog + gkd-OOM errors), 14c3be9 (codex T1 code),
-  fc65d4f (codex T1 wins). All pushed origin/main.
+  (sent 2026-05-24 23:30). CPU-only tasks through T13 are now linked in
+  §Session artifact ledger. GPU-blocked work resumes only after P5 exits.
+- **Recent commits this session**: see §Session artifact ledger for the
+  fdb021c→HEAD cross-reference map.
 - **Codex hard-stop conditions** (only times it should idle):
   1. license-or-kill threshold needs user/Claude call
   2. change would touch P5 PID 28950
@@ -56,21 +54,39 @@ related:
 
 | # | Task | Owner | Status | Gate | Source |
 |---|---|---|---|---|---|
-| T1 | Ship `run_opd_from_dirs` CLI + wins entry | codex | in_progress | compile + clippy clean on standalone diff | This session 2026-05-24 |
+| T1 | Ship `run_opd_from_dirs` CLI + wins entry | codex | **completed** (14c3be9 code, fc65d4f wins) | compile + clippy clean on standalone diff | This session 2026-05-24 |
 | T2 | End-to-end OPD trace, max-split (per-phase wall-clock) | codex | **deferred until P5 finishes** | every phase has a measured number, not file:line citation only | User 2026-05-24 22:00 |
 | T3 | Delete non-mainline / dead code audit | codex | **completed** (8ca4403, 81842cc, 2f975cb; 4th-cluster grep clean) | each removal cites zero grep usage; one commit per cluster | User 2026-05-24 22:00 |
 | T4a | kv_tier observability metrics — **code-only** (no bench) | codex | **completed** (375f09f audit, 83b9710 impl, a696fb4 tests; 588 unit tests pass) | new metric fields landed + unit tests pass; audit-first to avoid duplicating existing infrastructure | Split 2026-05-25 — code-only part is CPU-safe |
 | T4b | kv_tier observability — ≥4k SERVE baseline bench | codex | **deferred until P5 finishes** | baseline numbers recorded before any PrefetchPolicy::Timeout work | Split from T4 |
-| T5a | Chunked-logits KL — **code-only** (forward + backward + unit tests) | codex | queued | parity test against existing KL on a small shape passes within ε; tape memory drops vs current shape (synthetic check, no real-corpus bench) | Split 2026-05-25 — code-only part is CPU-safe |
+| T5a | Chunked-logits KL — **code-only** (forward + backward + unit tests) | codex | **completed** (dae29d0 audit, 1d7cd5b impl, ab2d0f6 tests, 61980ef wins) | parity test against existing KL on a small shape passes within ε; tape memory drops vs current shape (synthetic check, no real-corpus bench) | Split 2026-05-25 — code-only part is CPU-safe |
 | T5b | Chunked-logits KL — real-corpus 512-tok acceptance bench | codex | **deferred until P5 finishes** | real-corpus GKD reaches eval_summary step=0 + 1 train_step on 16GB at prompt_max_tokens=512 | bf16 research mit. 2 |
-| T6 | gap-analysis §6 G1→G7 ordered execution | codex | queued | each Gn passes its §5 license-or-kill threshold (PASS→wins, KILL→errors) | User 2026-05-24 23:xx |
-| T7 | SGLang docs deep-mine — surface gaps not yet in T6 | codex | queued | docs/research/2026-05-24-sglang-deep-mine-gaps.md with kill thresholds | User 2026-05-24 23:xx |
-| T11 | Storage + transport library — **design exploration** (HIGH PRIORITY, runs after T7) | codex (design only, no impl) | queued — high-priority Plan doc | output: docs/plans/2026-05-25-kv-storage-transport-library-design.md per §"T11" detail block | User 2026-05-25 — "存储层 + 传输层 高效库,尤其 SSD↔HBM / DRAM↔HBM" |
-| T8 | M-state dirty file audit — decide ship-vs-revert per file | codex | queued | each of the still-dirty M files (lora.rs, weights.rs, bootstrap.rs, qwen35_checkpoint.rs, teacher_infer.rs, train_cli.rs leftover, 3 train+infer examples, autograd test) has a verdict: ship as standalone commit, revert if abandoned, or merge into a related landed feature | Continuous-cleanup discipline |
-| T9 | Audit `cargo test -p infer` / `-p train` "existing unrelated blockers" called out in T4a wins | codex | queued | wins entries 2026-05-25 cite test failures unrelated to the changed code — codex audits whether those are real flakes, env-specific, or hidden bugs; fix or document each | T4a wins entry surfaced this |
+| T6 | gap-analysis §6 G1→G7 ordered execution | codex | **partial** (G1 deferred for architecture license; G6 completed 9dcc166; GPU/Metal items remain gated) | each Gn passes its §5 license-or-kill threshold (PASS→wins, KILL→errors) | User 2026-05-24 23:xx |
+| T7 | SGLang docs deep-mine — surface gaps not yet in T6 | codex | **completed** (c05e055) | docs/research/2026-05-24-sglang-deep-mine-gaps.md with kill thresholds | User 2026-05-24 23:xx |
+| T11 | Storage + transport library — **design exploration** (HIGH PRIORITY, runs after T7) | codex (design only, no impl) | **completed** (ce17782) | output: docs/plans/2026-05-25-kv-storage-transport-library-design.md per §"T11" detail block | User 2026-05-25 — "存储层 + 传输层 高效库,尤其 SSD↔HBM / DRAM↔HBM" |
+| T8 | M-state dirty file audit — decide ship-vs-revert per file | codex | **completed** (3bc1ea9 audit cleanup, 08a2cca corpus ship, 3b86586 fmt alignment) | each of the still-dirty M files (lora.rs, weights.rs, bootstrap.rs, qwen35_checkpoint.rs, teacher_infer.rs, train_cli.rs leftover, 3 train+infer examples, autograd test) has a verdict: ship as standalone commit, revert if abandoned, or merge into a related landed feature | Continuous-cleanup discipline |
+| T9 | Audit `cargo test -p infer` / `-p train` "existing unrelated blockers" called out in T4a wins | codex | **completed** (9669212, 3103a0c, bca1f31) | wins entries 2026-05-25 cite test failures unrelated to the changed code — codex audits whether those are real flakes, env-specific, or hidden bugs; fix or document each | T4a wins entry surfaced this |
 | T10 | G-series code-only wireframes — **scope narrowed to G5 only** (G2/G4 defer to Mac) | codex | **completed** (8b595a6 feat(kv-tier) gate coordinator t2 disk wireframe; cargo check + 588 lib tests + codex review --uncommitted all green) | G5 only — Coordinator stub for T2 disk fetch/store, gated behind existing config flag default-off | Codex caught bugged gate 2026-05-25 — Linux can't typecheck Metal cfg |
-| T12 | **Capability eval harness preflight** (Task 14 prep) | codex | queued | Verify `scripts/arle_capability_eval.py` runs end-to-end with `--dry-run` or equivalent: paths resolve, env vars match P5's checkpoint layout (runs/2026-05-24-p5-pure-opd-5k/), MMLU/GSM8K loader hits cache, INFER_LORA_PATH expects the right adapter file shape from `crates/train/src/qwen35_checkpoint.rs:save_lora_only`. Output: dry-run log + any path bugs fixed, so the moment P5 hits step 5000 we just hit play with no setup delay. **Industry-result enabler.** | User 2026-05-25: "目标是要拿到结果 / 业界有成就的成果"; P5 ETA ~3h |
-| T13 | Session docs cross-reference audit | codex | queued (low priority) | Audit this session's commits (fdb021c onwards) — every wins/errors/research entry should link to and from the related plan/project doc. Update CHANGELOG.md (if exists) and ROADMAP.md (if stale). Fix broken links. Continuous-cleanup discipline. | Continuous-cleanup |
+| T12 | **Capability eval harness preflight** (Task 14 prep) | codex | **completed** (ccb5ce9) | Verify `scripts/arle_capability_eval.py` runs end-to-end with `--dry-run` or equivalent: paths resolve, env vars match P5's checkpoint layout (runs/2026-05-24-p5-pure-opd-5k/), MMLU/GSM8K loader hits cache, INFER_LORA_PATH expects the right adapter file shape from `crates/train/src/qwen35_checkpoint.rs:save_lora_only`. Output: dry-run log + any path bugs fixed, so the moment P5 hits step 5000 we just hit play with no setup delay. **Industry-result enabler.** | User 2026-05-25: "目标是要拿到结果 / 业界有成就的成果"; P5 ETA ~3h |
+| T13 | Session docs cross-reference audit | codex | **completed** (docs-only cross-reference audit) | Audit this session's commits (fdb021c onwards) — every wins/errors/research entry should link to and from the related plan/project doc. Update CHANGELOG.md (if exists) and ROADMAP.md (if stale). Fix broken links. Continuous-cleanup discipline. | Continuous-cleanup |
+
+## Session artifact ledger (fdb021c onwards)
+
+| Task / commit range | Plan / project anchor | Artifact |
+| --- | --- | --- |
+| BBuf skills import (`fdb021c`) | This backlog; `.claude/skills/arle-upstream-runtime-scan/SKILL.md` | [wins/2026-05-24-bbuf-skills-import.md](../experience/wins/2026-05-24-bbuf-skills-import.md) |
+| T1 OPD CLI main path (`14c3be9`, `fc65d4f`) | [2026-05-18 OPD-only pivot](2026-05-18-opd-only-pivot.md) | [wins/2026-05-24-arle-train-opd-from-dirs.md](../experience/wins/2026-05-24-arle-train-opd-from-dirs.md) |
+| T3 non-mainline prune (`8ca4403`, `81842cc`, `2f975cb`, `e049787`) | [2026-05-18 OPD-only pivot](2026-05-18-opd-only-pivot.md) | [train-test](../experience/wins/2026-05-24-nonmainline-prune-train-test.md), [empty train commands](../experience/wins/2026-05-24-nonmainline-prune-empty-train-commands.md), [sample corpus](../experience/wins/2026-05-24-nonmainline-prune-train-sample-corpus.md) |
+| T4a kv-tier observability (`375f09f`, `83b9710`, `a696fb4`) | [tiered-kv-runtime-flow.md](tiered-kv-runtime-flow.md) | [wins/2026-05-25-kv-tier-observability-code-patch.md](../experience/wins/2026-05-25-kv-tier-observability-code-patch.md) |
+| T5a chunked KL (`dae29d0`, `1d7cd5b`, `ab2d0f6`, `61980ef`) | [bf16 frozen-base impl path](../research/2026-05-24-bf16-frozen-base-impl-path.md) | [wins/2026-05-25-chunked-logits-kl-code-patch.md](../experience/wins/2026-05-25-chunked-logits-kl-code-patch.md), [errors/2026-05-24-gkd-real-corpus-tape-oom-kill.md](../experience/errors/2026-05-24-gkd-real-corpus-tape-oom-kill.md) |
+| T6/G6 radix insert validation (`9dcc166`) | [SGLang gap analysis](../plans/2026-05-24-sglang-pipeline-cuda-mlx-gap-analysis.md) | [wins/2026-05-25-gap-G6-radix-insert-noop.md](../experience/wins/2026-05-25-gap-G6-radix-insert-noop.md) |
+| T7 SGLang deep mine (`c05e055`) | [SGLang gap analysis](../plans/2026-05-24-sglang-pipeline-cuda-mlx-gap-analysis.md) | [research/2026-05-24-sglang-deep-mine-gaps.md](../research/2026-05-24-sglang-deep-mine-gaps.md) |
+| T11 storage + transport design (`ce17782`) | [tiered-kv-runtime-flow.md](tiered-kv-runtime-flow.md) | [plans/2026-05-25-kv-storage-transport-library-design.md](../plans/2026-05-25-kv-storage-transport-library-design.md) |
+| T8 M-state audit (`3bc1ea9`, `08a2cca`, `3b86586`) | [2026-05-18 OPD-only pivot](2026-05-18-opd-only-pivot.md) | [wins/2026-05-25-m-state-audit.md](../experience/wins/2026-05-25-m-state-audit.md) |
+| T9 test cleanup (`9669212`, `3103a0c`, `bca1f31`) | T4a follow-up | [errors/2026-05-25-test-suite-cleanup.md](../experience/errors/2026-05-25-test-suite-cleanup.md) |
+| T10/G5 coordinator stub (`8b595a6`) | [SGLang gap analysis](../plans/2026-05-24-sglang-pipeline-cuda-mlx-gap-analysis.md), [T11 transport plan](../plans/2026-05-25-kv-storage-transport-library-design.md) | [wins/2026-05-25-gap-G5-coordinator-stub.md](../experience/wins/2026-05-25-gap-G5-coordinator-stub.md) |
+| T12 eval harness preflight (`ccb5ce9`) | [2026-05-22 EOD OPD cycle wrap](2026-05-22-eod-opd-cycle-wrap.md) | [wins/2026-05-25-capability-eval-preflight.md](../experience/wins/2026-05-25-capability-eval-preflight.md) |
+| T13 docs cross-reference audit | This backlog | [wins/2026-05-25-session-docs-cross-reference-audit.md](../experience/wins/2026-05-25-session-docs-cross-reference-audit.md) |
 
 Detail per task:
 

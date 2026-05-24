@@ -1,5 +1,8 @@
 # T5a Chunked-Logits KL Code Patch
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T5a/T5b and
+`docs/research/2026-05-24-bf16-frozen-base-impl-path.md`.
+
 ## Context
 
 T5 split into:

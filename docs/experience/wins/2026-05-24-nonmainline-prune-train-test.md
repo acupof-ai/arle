@@ -1,5 +1,8 @@
 # T3 Non-Mainline Prune — `arle train test` Stub
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T3 and
+`docs/projects/2026-05-18-opd-only-pivot.md`.
+
 ## Context
 
 - T3 in `docs/projects/2026-05-24-opd-mainline-task-backlog.md` asks for
@@ -49,4 +52,3 @@ cargo clippy -p cli --no-default-features --no-deps -- -D warnings
 - Retired CLI stubs are still product surface. If the active replacement
   exists, delete the stub and pin the rejection path in parser tests instead
   of keeping a no-op command around.
-

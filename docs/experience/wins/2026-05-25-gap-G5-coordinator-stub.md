@@ -1,5 +1,8 @@
 # G5 Coordinator T2 Disk Wireframe
 
+Related: `docs/projects/2026-05-24-opd-mainline-task-backlog.md` T10 and
+`docs/plans/2026-05-24-sglang-pipeline-cuda-mlx-gap-analysis.md` G5.
+
 ## Context
 
 T10 was narrowed to G5 after the G4 Metal sampler gate was found invalid on
