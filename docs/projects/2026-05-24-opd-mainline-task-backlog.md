@@ -18,9 +18,9 @@ related:
 - **Mainline**: optimize OPD effect + perf. Per CLAUDE.md + 2026-05-18 OPD-only pivot.
 - **Concurrent local GPU**: P5 pure-OPD 5k run has exited. T14 swept all five
   saved checkpoints; MMLU did not beat the no-LoRA base, and GSM8K remains
-  near-floor. T5b then KILLed the 512-token chunked-KL acceptance: c64/c8/c1
-  all failed at `cuda alloc_zeros failed (slice)`. GPU is free for the next
-  serialized GPU task.
+  near-floor. T5b then KILLed the 512-token chunked-KL acceptance. T2 traced
+  the P5 shape and ranked student rollout/backward as the wall-clock bottleneck.
+  GPU is free for the next serialized GPU task.
 - **Codex active task**: auto-pulling from §Queue per standing instruction
   (sent 2026-05-24 23:30). CPU-only tasks through T13 are now linked in
   §Session artifact ledger. GPU-blocked work resumes only after P5 exits.
@@ -56,7 +56,7 @@ related:
 | # | Task | Owner | Status | Gate | Source |
 |---|---|---|---|---|---|
 | T1 | Ship `run_opd_from_dirs` CLI + wins entry | codex | **completed** (14c3be9 code, fc65d4f wins) | compile + clippy clean on standalone diff | This session 2026-05-24 |
-| T2 | End-to-end OPD trace, max-split (per-phase wall-clock) | codex | **deferred until P5 finishes** | every phase has a measured number, not file:line citation only | User 2026-05-24 22:00 |
+| T2 | End-to-end OPD trace, max-split (per-phase wall-clock) | codex | **completed** (trace docs) | every phase has a measured number, not file:line citation only | User 2026-05-24 22:00 |
 | T3 | Delete non-mainline / dead code audit | codex | **completed** (8ca4403, 81842cc, 2f975cb; 4th-cluster grep clean) | each removal cites zero grep usage; one commit per cluster | User 2026-05-24 22:00 |
 | T4a | kv_tier observability metrics — **code-only** (no bench) | codex | **completed** (375f09f audit, 83b9710 impl, a696fb4 tests; 588 unit tests pass) | new metric fields landed + unit tests pass; audit-first to avoid duplicating existing infrastructure | Split 2026-05-25 — code-only part is CPU-safe |
 | T4b | kv_tier observability — ≥4k SERVE baseline bench | codex | **deferred until P5 finishes** | baseline numbers recorded before any PrefetchPolicy::Timeout work | Split from T4 |
@@ -78,6 +78,7 @@ related:
 | --- | --- | --- |
 | BBuf skills import (`fdb021c`) | This backlog; `.claude/skills/arle-upstream-runtime-scan/SKILL.md` | [wins/2026-05-24-bbuf-skills-import.md](../experience/wins/2026-05-24-bbuf-skills-import.md) |
 | T1 OPD CLI main path (`14c3be9`, `fc65d4f`) | [2026-05-18 OPD-only pivot](2026-05-18-opd-only-pivot.md) | [wins/2026-05-24-arle-train-opd-from-dirs.md](../experience/wins/2026-05-24-arle-train-opd-from-dirs.md) |
+| T2 OPD end-to-end trace | This backlog | [research/2026-05-24-arle-opd-end-to-end-trace.md](../research/2026-05-24-arle-opd-end-to-end-trace.md), [wins/2026-05-25-opd-end-to-end-trace-p5-shape.md](../experience/wins/2026-05-25-opd-end-to-end-trace-p5-shape.md) |
 | T3 non-mainline prune (`8ca4403`, `81842cc`, `2f975cb`, `e049787`) | [2026-05-18 OPD-only pivot](2026-05-18-opd-only-pivot.md) | [train-test](../experience/wins/2026-05-24-nonmainline-prune-train-test.md), [empty train commands](../experience/wins/2026-05-24-nonmainline-prune-empty-train-commands.md), [sample corpus](../experience/wins/2026-05-24-nonmainline-prune-train-sample-corpus.md) |
 | T4a kv-tier observability (`375f09f`, `83b9710`, `a696fb4`) | [tiered-kv-runtime-flow.md](tiered-kv-runtime-flow.md) | [wins/2026-05-25-kv-tier-observability-code-patch.md](../experience/wins/2026-05-25-kv-tier-observability-code-patch.md) |
 | T5a chunked KL (`dae29d0`, `1d7cd5b`, `ab2d0f6`, `61980ef`) | [bf16 frozen-base impl path](../research/2026-05-24-bf16-frozen-base-impl-path.md) | [wins/2026-05-25-chunked-logits-kl-code-patch.md](../experience/wins/2026-05-25-chunked-logits-kl-code-patch.md), [errors/2026-05-24-gkd-real-corpus-tape-oom-kill.md](../experience/errors/2026-05-24-gkd-real-corpus-tape-oom-kill.md) |
