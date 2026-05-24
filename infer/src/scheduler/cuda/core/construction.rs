@@ -280,8 +280,10 @@ impl<M: ModelForward> Scheduler<M> {
             .as_ref()
             .map(crate::kv_tier::ClusterSharedBackendConfig::build);
         let coordinator_queue_capacity = config.max_slots.max(16);
-        let mut coord_builder = crate::kv_tier::CoordinatorBuilder::new(coordinator_queue_capacity)
-            .disk_store(Arc::clone(&disk_store));
+        let mut coord_builder = crate::kv_tier::CoordinatorBuilder::new(coordinator_queue_capacity);
+        if config.t2_disk_tier_enabled {
+            coord_builder = coord_builder.disk_store(Arc::clone(&disk_store));
+        }
         if let Some(backend) = cluster_shared_backend.clone() {
             coord_builder = coord_builder.cluster_shared_backend(backend);
         }

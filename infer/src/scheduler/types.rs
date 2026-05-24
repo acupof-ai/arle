@@ -312,6 +312,12 @@ pub struct SchedulerConfig {
     pub t1_host_pinned_min_prompt_tokens: usize,
     /// Root directory used by the session snapshot disk store.
     pub disk_store_root: PathBuf,
+    /// Enable scheduler-owned T2 disk KV fetch/store through the Coordinator.
+    ///
+    /// Default off: G5's code-only wireframe must not move hot-path behavior
+    /// until the >=4k SERVE workload licenses the benefit. The existing
+    /// `--disk-store-root` CLI flag turns this on and supplies the root.
+    pub t2_disk_tier_enabled: bool,
     /// Optional cluster-shared slower-tier backend config. The current repo-local
     /// implementation supports shared-fs and the NIXL stub behind `rdma-nixl`.
     pub cluster_shared_backend: Option<ClusterSharedBackendConfig>,
@@ -363,6 +369,7 @@ impl Default for SchedulerConfig {
             t1_host_pinned_capacity_bytes: None,
             t1_host_pinned_min_prompt_tokens: 4096,
             disk_store_root: std::env::temp_dir().join("infer-kv"),
+            t2_disk_tier_enabled: false,
             cluster_shared_backend: None,
         }
     }
@@ -1096,6 +1103,7 @@ mod tests {
         assert_eq!(cfg.t1_host_pinned_keepalive_ticks, 128);
         assert_eq!(cfg.t1_host_pinned_capacity_bytes, None);
         assert_eq!(cfg.t1_host_pinned_min_prompt_tokens, 4096);
+        assert!(!cfg.t2_disk_tier_enabled);
         assert_eq!(cfg.cluster_shared_backend, None);
         assert!(cfg.validate().is_ok());
     }

@@ -746,6 +746,14 @@ impl<M: ModelForward> Scheduler<M> {
                     let (host_blocks, disk_blocks, remote_blocks) = staged_prefix.source_counts();
                     self.metrics
                         .record_tier_fetch_plan(host_blocks, disk_blocks, remote_blocks);
+                    if disk_blocks > 0 && !self.t2_disk_tier_enabled() {
+                        info!(
+                            "Request {}: staged prefix includes {} T2 disk blocks but T2 disk tier is disabled; falling back to cold prefill",
+                            id, disk_blocks
+                        );
+                        self.fallback_to_cold_prefill(slot_idx);
+                        return;
+                    }
                     if let Some(ticket) = self.fetch_dedupe.get(&fetch_key).copied() {
                         if let Some(req) = self.request_mut(slot_idx)
                             && let Some(plan) = req.staged_prefix.as_mut()
@@ -893,6 +901,9 @@ impl<M: ModelForward> Scheduler<M> {
         let Some(prefetch_state) = staged_prefix_prefetch_state(staged_prefix) else {
             return;
         };
+        if prefetch_state.disk_blocks > 0 && !self.t2_disk_tier_enabled() {
+            return;
+        }
         if !self.tier_policy.allow_prefetch(
             self.coordinator_handle
                 .queue_stats(crate::kv_tier::QueueKind::Fetch),

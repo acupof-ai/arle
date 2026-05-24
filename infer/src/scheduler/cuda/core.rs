@@ -682,6 +682,10 @@ impl<M: ModelForward> Scheduler<M> {
         self.has_pending_store_work()
     }
 
+    pub(super) fn t2_disk_tier_enabled(&self) -> bool {
+        self.config.t2_disk_tier_enabled
+    }
+
     pub(super) fn attach_gpu_prefix_blocks(
         &mut self,
         slot_idx: usize,
@@ -1479,6 +1483,9 @@ impl<M: ModelForward> Scheduler<M> {
         if bytes_to_spill == 0 {
             return 0;
         }
+        if !self.t2_disk_tier_enabled() && self.cluster_shared_backend.is_none() {
+            return 0;
+        }
 
         let coordinator_stats = self.coordinator_queue_stats();
         let mut store_submit_headroom =
@@ -1521,6 +1528,11 @@ impl<M: ModelForward> Scheduler<M> {
                 self.coordinator_handle.stats(),
                 self.cluster_shared_backend.is_some(),
             );
+            if matches!(target, crate::kv_tier::coordinator::StoreTarget::Disk)
+                && !self.t2_disk_tier_enabled()
+            {
+                continue;
+            }
             let store_key = StoreDedupKey {
                 fingerprint,
                 target,
