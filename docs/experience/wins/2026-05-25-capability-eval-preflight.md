@@ -114,6 +114,11 @@ exists:
 ADAPTER=runs/2026-05-24-p5-pure-opd-5k/step_005000 BASE=/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base OUT=bench-output/2026-05-25-p5-pure-opd-step5000-capability PORT=8125; set -euo pipefail; mkdir -p "$OUT"; test -f "$ADAPTER/adapter_model.safetensors"; test -f "$ADAPTER/adapter_config.json"; INFER_LORA_PATH="$ADAPTER" ./target/release/arle serve --backend cuda --model-path "$BASE" --port "$PORT" -- --num-slots 1 --max-seq-len 4096 --chunked-prefill-size 4096 --max-num-batched-tokens 4096 >"$OUT/serve.log" 2>&1 & server=$!; trap 'kill "$server" 2>/dev/null || true' EXIT; until curl -fsS "http://127.0.0.1:${PORT}/readyz" >/dev/null; do sleep 2; done; .venv/bin/python scripts/arle_capability_eval.py --backend arle --base-url "http://127.0.0.1:${PORT}" --model-id Qwen3___5-0___8B-Base --tasks mmlu,gsm8k --n-samples 200 --output "$OUT"; kill "$server"; trap - EXIT
 ```
 
+T14 found that sequential checkpoint sweeps should launch `target/release/infer`
+directly or kill the full process group; killing only the `arle serve` wrapper
+can leave the backend child alive. See
+`docs/experience/wins/2026-05-25-p5-pure-opd-5k-capability-sweep.md`.
+
 ## Rule
 
 For OPD capability eval, `INFER_LORA_PATH` belongs to the server launch, not
