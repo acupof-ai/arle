@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -422,7 +422,13 @@ impl ModelForward for Qwen35Model {
         states: &mut [Self::State],
         pool: &mut PagedKVPool,
     ) -> Result<bool> {
-        if !prepare_paged_prefill_batch(&self.ctx, requests, pool)? {
+        let total_tokens: usize = requests.iter().map(|request| request.tokens.len()).sum();
+        if !prepare_paged_prefill_batch(&self.ctx, requests, pool).with_context(|| {
+            format!(
+                "qwen35 prepare_paged_prefill_batch requests={} total_tokens={total_tokens}",
+                requests.len()
+            )
+        })? {
             return Ok(false);
         }
 
@@ -437,7 +443,13 @@ impl ModelForward for Qwen35Model {
                 slot: request.slot_idx,
             })
             .collect();
-        self.prefill_forward_paged_batch(&paged_requests, states, pool)?;
+        self.prefill_forward_paged_batch(&paged_requests, states, pool)
+            .with_context(|| {
+                format!(
+                    "qwen35 prefill_forward_paged_batch requests={} total_tokens={total_tokens}",
+                    requests.len()
+                )
+            })?;
 
         Ok(true)
     }
@@ -567,7 +579,14 @@ impl ModelForward for Qwen35Model {
         }
         match paged_kv_pool {
             Some(pool) if pool.is_active() => {
-                self.prepare_decode_context(tokens, slot_indices, pool, decode_ctx)?;
+                self.prepare_decode_context(tokens, slot_indices, pool, decode_ctx)
+                    .with_context(|| {
+                        format!(
+                            "qwen35 prepare_decode_context batch_size={} tokens={}",
+                            slot_indices.len(),
+                            tokens.len()
+                        )
+                    })?;
                 self.decode_batch(
                     tokens,
                     states,
@@ -576,8 +595,23 @@ impl ModelForward for Qwen35Model {
                     pool,
                     decode_ctx,
                 )
+                .with_context(|| {
+                    format!(
+                        "qwen35 decode_batch batch_size={} tokens={} skip_logit_scatter={skip_logit_scatter}",
+                        slot_indices.len(),
+                        tokens.len()
+                    )
+                })
             }
-            _ => self.decode_batch_contiguous(tokens, states, slot_indices),
+            _ => self
+                .decode_batch_contiguous(tokens, states, slot_indices)
+                .with_context(|| {
+                    format!(
+                        "qwen35 decode_batch_contiguous batch_size={} tokens={}",
+                        slot_indices.len(),
+                        tokens.len()
+                    )
+                }),
         }
     }
 

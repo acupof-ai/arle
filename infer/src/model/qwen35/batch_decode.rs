@@ -5,7 +5,7 @@
 //! 24 linear attention layers use batched recurrent kernels (conv1d + GDR)
 //! via pointer arrays.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
@@ -822,7 +822,12 @@ impl Qwen35Model {
                             group_idx,
                             batch_size,
                             force_eager,
-                        )?;
+                        )
+                        .with_context(|| {
+                            format!(
+                                "qwen35 decode linear-attention group_idx={group_idx} layers={start}..{layer_i} batch_size={batch_size}"
+                            )
+                        })?;
                         group_idx += 1;
                     }
 
@@ -830,7 +835,12 @@ impl Qwen35Model {
                     let hidden = unsafe { &mut *hidden_ptr };
                     self.decode_batch_full_attn_layer(
                         layer, attn, hidden, bufs, kv_pool, full_idx, batch_size,
-                    )?;
+                    )
+                    .with_context(|| {
+                        format!(
+                            "qwen35 decode full-attention layer_idx={layer_i} full_idx={full_idx} batch_size={batch_size}"
+                        )
+                    })?;
                     full_idx += 1;
                 }
             }
@@ -845,7 +855,13 @@ impl Qwen35Model {
                 group_idx,
                 batch_size,
                 force_eager,
-            )?;
+            )
+            .with_context(|| {
+                format!(
+                    "qwen35 decode trailing linear-attention group_idx={group_idx} layers={start}..{} batch_size={batch_size}",
+                    self.layers.len()
+                )
+            })?;
         }
 
         // Final norm (offset variant) + logits GEMM (eager)
@@ -856,7 +872,8 @@ impl Qwen35Model {
             &self.norm,
             c.rms_norm_eps,
             &mut bufs.common.normed,
-        )?;
+        )
+        .with_context(|| format!("qwen35 decode final_norm batch_size={batch_size}"))?;
         if let Some(capture) = &self.medusa_hidden_capture {
             capture
                 .lock()
