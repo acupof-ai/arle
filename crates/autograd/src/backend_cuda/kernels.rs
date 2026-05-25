@@ -1,7 +1,10 @@
 use crate::{AutogradError, Result};
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchArgs, LaunchConfig};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaStream, LaunchArgs, LaunchConfig, sys,
+};
+use cudarc::nvrtc::{Ptx, result as nvrtc_result, sys as nvrtc_sys};
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 #[cfg(not(feature = "no-cuda"))]
@@ -132,14 +135,10 @@ impl KernelCache {
 
         #[cfg(not(feature = "no-cuda"))]
         {
-            let ptx = compile_ptx(concat_sources()).map_err(|err| {
+            let (image, arch) = compile_cubin_for_current_device(ctx)?;
+            let module = ctx.load_module(image).map_err(|err| {
                 cuda_kernel_error(format!(
-                    "nvrtc compile_ptx failed for autograd kernels: {err:?}"
-                ))
-            })?;
-            let module = ctx.load_module(ptx).map_err(|err| {
-                cuda_kernel_error(format!(
-                    "cuda load_module failed for autograd kernels: {err:?}"
+                    "cuda load_module failed for autograd kernels arch={arch}: {err:?}"
                 ))
             })?;
             let functions = FUNCTION_NAMES
@@ -172,6 +171,149 @@ impl KernelCache {
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_kernel_error(message: String) -> AutogradError {
     AutogradError::TapeInvariant(Box::leak(message.into_boxed_str()))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn compile_cubin_for_current_device(ctx: &Arc<CudaContext>) -> Result<(Ptx, &'static str)> {
+    let arch = current_sm_arch(ctx)?;
+    // Emit SASS cubin for the exact device instead of PTX. On V100 the
+    // deployment driver supports CUDA 12.2 while the available NVRTC is 12.4;
+    // PTX 8.4 would fail driver JIT with CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
+    // but an sm_70 cubin loads cleanly and keeps the kernel code uniform.
+    let image = compile_cubin(concat_sources(), arch).map_err(|err| {
+        cuda_kernel_error(format!(
+            "nvrtc compile cubin failed for autograd kernels arch={arch}: {err}"
+        ))
+    })?;
+    Ok((image, arch))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn current_sm_arch(ctx: &Arc<CudaContext>) -> Result<&'static str> {
+    let major = ctx
+        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+        .map_err(|err| {
+            cuda_kernel_error(format!(
+                "cuda device attribute COMPUTE_CAPABILITY_MAJOR failed: {err:?}"
+            ))
+        })?;
+    let minor = ctx
+        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+        .map_err(|err| {
+            cuda_kernel_error(format!(
+                "cuda device attribute COMPUTE_CAPABILITY_MINOR failed: {err:?}"
+            ))
+        })?;
+    sm_arch(major, minor)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn sm_arch(major: i32, minor: i32) -> Result<&'static str> {
+    match (major, minor) {
+        (7, 0) => Ok("sm_70"),
+        (7, 5) => Ok("sm_75"),
+        (8, 0) => Ok("sm_80"),
+        (8, 6) => Ok("sm_86"),
+        (8, 7) => Ok("sm_87"),
+        (8, 9) => Ok("sm_89"),
+        (9, 0) => Ok("sm_90"),
+        (10, 0) => Ok("sm_100"),
+        (10, 1) => Ok("sm_101"),
+        (12, 0) => Ok("sm_120"),
+        _ => Err(cuda_kernel_error(format!(
+            "unsupported cuda compute capability for autograd kernels: sm_{major}{minor}"
+        ))),
+    }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn compile_cubin(src: &str, arch: &'static str) -> Result<Ptx> {
+    let program = NvrtcProgram::create(src, "arle_autograd_kernels.cu")?;
+    let options = [format!("--gpu-architecture={arch}")];
+    unsafe { nvrtc_result::compile_program(program.raw(), &options) }.map_err(|err| {
+        cuda_kernel_error(format!(
+            "nvrtc compile_program failed arch={arch} err={err:?} log={}",
+            program.log()
+        ))
+    })?;
+    let cubin = get_cubin(program.raw()).map_err(|err| {
+        cuda_kernel_error(format!(
+            "nvrtc get cubin failed arch={arch} err={err:?} log={}",
+            program.log()
+        ))
+    })?;
+    Ok(Ptx::from_binary(cubin))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+struct NvrtcProgram {
+    prog: nvrtc_sys::nvrtcProgram,
+    _src: CString,
+    _name: CString,
+}
+
+#[cfg(not(feature = "no-cuda"))]
+impl NvrtcProgram {
+    fn create(src: &str, name: &str) -> Result<Self> {
+        let src = CString::new(src.as_bytes())
+            .map_err(|_| cuda_kernel_error("autograd cuda source contains NUL".to_string()))?;
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            cuda_kernel_error("autograd cuda program name contains NUL".to_string())
+        })?;
+        let prog = nvrtc_result::create_program(&src, Some(&name)).map_err(|err| {
+            cuda_kernel_error(format!(
+                "nvrtc create_program failed for autograd kernels: {err:?}"
+            ))
+        })?;
+        Ok(Self {
+            prog,
+            _src: src,
+            _name: name,
+        })
+    }
+
+    fn raw(&self) -> nvrtc_sys::nvrtcProgram {
+        self.prog
+    }
+
+    fn log(&self) -> String {
+        unsafe { nvrtc_result::get_program_log(self.prog) }
+            .ok()
+            .and_then(|raw| unsafe {
+                CStr::from_ptr(raw.as_ptr())
+                    .to_str()
+                    .ok()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "<no nvrtc log>".to_string())
+    }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+impl Drop for NvrtcProgram {
+    fn drop(&mut self) {
+        if !self.prog.is_null() {
+            unsafe {
+                let _ = nvrtc_result::destroy_program(self.prog);
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn get_cubin(
+    prog: nvrtc_sys::nvrtcProgram,
+) -> std::result::Result<Vec<u8>, nvrtc_result::NvrtcError> {
+    let mut size = 0usize;
+    unsafe {
+        nvrtc_sys::nvrtcGetCUBINSize(prog, &mut size as *mut _).result()?;
+    }
+
+    let mut cubin = vec![0u8; size];
+    unsafe {
+        nvrtc_sys::nvrtcGetCUBIN(prog, cubin.as_mut_ptr().cast()).result()?;
+    }
+    Ok(cubin)
 }
 
 pub(super) fn launch_rows<'a, F>(
