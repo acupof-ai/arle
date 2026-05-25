@@ -20,6 +20,7 @@ use super::{
 use crate::backend::cuda::paged_kv::PagedKVPool;
 use crate::kv_tier::transport::DiskStore;
 use crate::model::{GenerationState, ModelForward};
+use crate::model_registry::ModelArch;
 use crate::prefix_cache::RadixCache;
 use crate::runtime_topology::WorkerPlacement;
 use crate::tokenizer::Tokenizer;
@@ -104,8 +105,16 @@ impl<M: ModelForward> Scheduler<M> {
         // per-slot contiguous scratch buffer is unused by prefill. Shrink it
         // to the minimum that single-token decode / INT8 working buffers
         // still require, and reclaim the freed bytes into the pool budget.
+        //
+        // BUT: paged prefill currently only supports `page_size == 16` (the
+        // TileLang HD128 batched kernel's invariant — see
+        // `ops/attention.rs:617` and `scheduler/cuda/prefill.rs:535`). Pool
+        // formats that allocate `page_size == 1` (TurboQuant today) must run
+        // prefill via the contiguous BF16 path and migrate at completion, so
+        // they need the full contiguous buffer.
         let model_uses_paged_prefill = model.prefill_uses_paged_pool();
-        let contiguous_tokens = if model_uses_paged_prefill {
+        let format_uses_paged_prefill = kv_pool_format.default_page_size() == 16;
+        let contiguous_tokens = if model_uses_paged_prefill && format_uses_paged_prefill {
             // Single-token decode path still allocates per-slot contiguous
             // K/V of this size; 1 page's worth is enough.
             PREFIX_CACHE_BLOCK_SIZE
@@ -194,7 +203,20 @@ impl<M: ModelForward> Scheduler<M> {
                             requested_tokens,
                             kv_pool_format,
                         );
-                        if budget < explicit_budget {
+                        if matches!(model.arch_kind(), ModelArch::DeepSeekV4) {
+                            if budget > explicit_budget {
+                                info!(
+                                    "TokenKVPool budget capped from {:.3} GB to {:.3} GB for \
+                                     DeepSeek-V4 explicit max_seq_len={} across {} slot(s); \
+                                     retaining scratch headroom for long-prefill kernels",
+                                    budget as f64 / 1e9,
+                                    explicit_budget as f64 / 1e9,
+                                    explicit_max_seq_len,
+                                    config.max_slots,
+                                );
+                            }
+                            explicit_budget
+                        } else if budget < explicit_budget {
                             warn!(
                                 "TokenKVPool budget raised from {:.3} GB to {:.3} GB to honor \
                                  explicit max_seq_len={} across {} slot(s)",
@@ -203,8 +225,10 @@ impl<M: ModelForward> Scheduler<M> {
                                 explicit_max_seq_len,
                                 config.max_slots,
                             );
+                            explicit_budget
+                        } else {
+                            budget
                         }
-                        budget.max(explicit_budget)
                     } else {
                         budget
                     }
