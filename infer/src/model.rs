@@ -493,6 +493,13 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
     ///
     /// Default implementation keeps a single semantic path by treating batch
     /// size 1 as the degenerate case and iterating over requests.
+    ///
+    /// Pools that allocate `page_size != 16` (TurboQuant today) can't use the
+    /// paged-prefill kernel (TileLang HD128 invariant — see
+    /// `ops/attention.rs:617`) and must take the contiguous BF16 prefill path
+    /// even when `prefill_uses_paged_pool` reports `true`. Migration to the
+    /// quantized paged pool happens at completion via
+    /// `migrate_kv_range_to_paged`.
     fn forward_prefill_batch(
         &self,
         requests: &[PrefillBatchRequest<'_>],
@@ -504,7 +511,9 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         }
 
         match paged_kv_pool {
-            Some(pool) if self.prefill_uses_paged_pool() && pool.is_active() => {
+            Some(pool)
+                if self.prefill_uses_paged_pool() && pool.is_active() && pool.page_size == 16 =>
+            {
                 let _ = self.forward_prefill_batch_with_pool(requests, states, pool)?;
             }
             _ => {

@@ -214,10 +214,14 @@ struct Args {
     /// modes "tq2"/"tq3"/"tq4". FP8 and TurboQuant keep the contiguous prefill
     /// cache in BF16 and quantize when migrating into the paged token pool.
     ///
-    /// `auto` defaults to FP8 paged pool (BF16 contiguous), halving per-token
-    /// KV bytes vs full BF16 with negligible quality impact on Qwen3-family
-    /// models. Falls back to BF16 paged pool if the FP8 dispatch is
-    /// unavailable for the model arch.
+    /// `auto` selects BF16 paged pool — the only mode currently validated by
+    /// the cross-precision parity audit (`infer/tests/kv_precision_parity.rs`,
+    /// `docs/plans/2026-05-25-kv-precision-parity-framework.md`). FP8 / INT8
+    /// remain opt-in: FP8 catastrophically diverges at the first decode token
+    /// (~0.4% trajectory match at 256-token horizon, per 2026-05-25 audit);
+    /// INT8 drifts at long-decode (~89% trajectory match at the same horizon).
+    /// Both are usable for throughput experiments but not for correctness-
+    /// sensitive workloads until Phase 3 root-cause work lands.
     #[arg(long, default_value = "auto")]
     kv_cache_dtype: String,
 
@@ -1486,17 +1490,17 @@ fn kv_mode_candidates(
     _has_explicit_max_seq_len: bool,
 ) -> Vec<(KVCacheDtype, KVFormat, &'static str)> {
     match requested_mode {
-        // Pure-inference auto: FP8 paged pool by default — halves the per-token
-        // KV bytes vs BF16 with negligible quality regression on Qwen3 family,
-        // matching SGLang/vLLM v1's default for L4-class GPUs. The contiguous
-        // single-request cache stays BF16; quantization happens on migration
-        // into the paged pool. Fall back to BF16 if the FP8 path can't satisfy
-        // the requested envelope (e.g. no FP8 kernel for the model arch).
+        // Pure-inference auto: BF16 paged pool. FP8 historically held this
+        // slot, but the 2026-05-25 cross-precision parity audit
+        // (`infer/tests/kv_precision_parity.rs`) shows FP8 diverges at the
+        // first decode token over a 256-token horizon (mean trajectory
+        // match 0.4% vs BF16 reference). Until the FP8 migration / decode
+        // path is root-caused and re-validated, `auto` ships the
+        // correctness-safe BF16 default. Operators who want the FP8 memory
+        // saving must opt in via `--kv-cache-dtype fp8` and accept the
+        // current divergence.
         RequestedKvCacheMode::Auto => {
-            vec![
-                (KVCacheDtype::BF16, KVFormat::FP8E4M3, "auto-fp8"),
-                (KVCacheDtype::BF16, KVFormat::BF16, "auto-bf16"),
-            ]
+            vec![(KVCacheDtype::BF16, KVFormat::BF16, "auto-bf16")]
         }
         RequestedKvCacheMode::Explicit {
             kv_cache_dtype,

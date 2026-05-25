@@ -8,8 +8,12 @@ use autograd::{backend::Backend, backend_cuda::CudaBackend};
 use train::lora::LoraTargetSet;
 use train::{
     lora::LoraConfig,
-    opd::{OpdError, OpdStepConfig, opd_step},
+    opd::{
+        GkdLossConfig, GkdSftAnchor, OpdError, OpdStepConfig, OpdStepProfile, opd_step,
+        opd_step_with_teacher_forward_profiled_gkd_anchor,
+    },
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
+    teacher_infer::InProcessTeacher,
 };
 
 fn live_tensor_count(store: &TensorStore) -> usize {
@@ -117,6 +121,56 @@ fn opd_step_runs_end_to_end() {
         outcome.loss.is_finite(),
         "opd_step loss should be finite, got {}",
         outcome.loss
+    );
+}
+
+#[test]
+fn opd_step_windowed_gkd_runs_end_to_end() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let teacher = InProcessTeacher::new(&teacher);
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+    let prompt_ids: Vec<u32> = vec![1, 3, 8];
+    let corpus_tokens: Vec<u32> = vec![4, 5, 6];
+    let mut profile = OpdStepProfile::default();
+
+    let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
+        &student,
+        &teacher,
+        &prompt_ids,
+        OpdStepConfig {
+            rollout_len: 2,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+        GkdLossConfig {
+            lambda: 0.3,
+            sft_anchor: GkdSftAnchor::CorpusTruth,
+            corpus_tokens: Some(&corpus_tokens),
+            kl_chunk_size: Some(2),
+            logits_window_size: Some(2),
+        },
+        Some(&mut profile),
+    )
+    .expect("windowed GKD OPD step runs without panic");
+
+    assert_eq!(outcome.rollout_len, prompt_ids.len() + 2);
+    assert!(
+        outcome.loss.is_finite(),
+        "windowed GKD loss should be finite, got {}",
+        outcome.loss
+    );
+    assert!(
+        profile.backward_seconds > 0.0,
+        "Route B must run at least one per-window backward"
     );
 }
 

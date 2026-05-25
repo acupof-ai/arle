@@ -20,7 +20,7 @@ holds 12.05 post-first tok/s, isolated single-token wave **105.2 → 87.7 ms**.
 Remaining blockers: NCCL SendRecv/AllReduce, FP8/FP4 expert GEMV (awaits true
 grouped GEMM / DeepGEMM), launch churn. Evidence:
 [`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md),
-[`trace-artifacts/2026-05-15-dsv4-deepep/`](trace-artifacts/2026-05-15-dsv4-deepep/).
+`trace-artifacts/2026-05-15-dsv4-deepep/`.
 
 **Qwen3.5 Medusa is not pickup-ready** — recurrent-state accepted-length
 commit/rollback contract is the gate. Active plan:

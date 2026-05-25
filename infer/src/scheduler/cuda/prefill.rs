@@ -532,7 +532,15 @@ impl<M: ModelForward> Scheduler<M> {
             });
         }
 
-        let uses_paged = self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active();
+        // Paged prefill currently relies on the TileLang HD128 batched kernel,
+        // which hard-asserts `page_size == 16` (see `ops/attention.rs:617`).
+        // TurboQuant pools allocate `page_size = 1` until a token-granular
+        // paged-prefill kernel lands, so route those through the contiguous
+        // BF16 prefill path and migrate via `migrate_from_contiguous_turboquant_range`
+        // at completion (handled below in `prepare_prefill_completion`).
+        let uses_paged = self.model.prefill_uses_paged_pool()
+            && self.paged_kv_pool.is_active()
+            && self.paged_kv_pool.page_size == 16;
         let batch_size = chunks.len();
         let prefill_spans: Vec<(usize, fastrace::Span)> = chunks
             .iter()

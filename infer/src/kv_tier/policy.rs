@@ -1,9 +1,9 @@
 //! Tier-movement policies — write-through / write-back and prefetch modes.
 //!
 //! These enums govern when blocks travel between tiers. They live in
-//! `kv_tier/` (not in `scheduler/`) because per the kv_tier invariant
-//! "only the coordinator moves blocks between tiers" — the policy
-//! belongs next to the mover, not the caller.
+//! `kv_tier/` (not in `scheduler/`) because the scheduler and coordinator
+//! share tier-movement policy vocabulary even though T0↔T1 and T1↔T2/T3
+//! byte movement are owned by different boundaries.
 //!
 //! Names align with the SGLang HiCache convention (see
 //! `docs/research/2026-05-04-sglang-hicache-guide.md` Part VI §6.4

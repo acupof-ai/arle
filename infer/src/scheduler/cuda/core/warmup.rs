@@ -194,6 +194,18 @@ impl<M: ModelForward> Scheduler<M> {
             info!("Pass 3 prefill warmup disabled by INFER_PREFILL_WARMUP=0");
             return 0;
         }
+        // Paged prefill warmup is meaningful only when the pool actually
+        // supports the paged kernel (page_size == 16, the TileLang HD128
+        // invariant). Formats with `page_size == 1` (TurboQuant today) run
+        // prefill on the contiguous BF16 path that has no graph capture to
+        // pre-warm — skipping here avoids the 7-retry warning spam.
+        if self.paged_kv_pool.is_active() && self.paged_kv_pool.page_size != 16 {
+            info!(
+                "Pass 3 prefill warmup skipped: paged pool page_size={} (non-paged prefill path)",
+                self.paged_kv_pool.page_size
+            );
+            return 0;
+        }
 
         let prefill_cap = self
             .model

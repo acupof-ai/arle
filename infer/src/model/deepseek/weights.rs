@@ -32,8 +32,8 @@ use super::mlp::{
 #[cfg(feature = "cuda")]
 use super::state::{
     DeepseekAttentionRuntimeCache, DeepseekGpuCompressorRuntimeCache, DeepseekHiddenRuntimeScratch,
-    DeepseekMhcRuntimeScratch, ensure_hidden_scratch, ensure_mhc_scratch, put_hidden_scratch,
-    take_hidden_scratch,
+    DeepseekLayerRuntimeCache, DeepseekMhcRuntimeScratch, ensure_hidden_scratch,
+    ensure_mhc_scratch, put_hidden_scratch, take_hidden_scratch,
 };
 #[cfg(all(test, feature = "cuda"))]
 use super::state::{DeepseekCompressedRow, DeepseekCompressorRuntimeCache};
@@ -519,6 +519,9 @@ impl DeepseekModel {
 
         if !emit_logits {
             put_hidden_scratch(&mut state.incremental.stream_recycle, stream);
+            if tokens.len() > 1 {
+                state.incremental.trim_prefill_scratch();
+            }
             return Ok(None);
         }
 
@@ -540,82 +543,10 @@ impl DeepseekModel {
             false,
         )?;
         put_hidden_scratch(&mut state.incremental.stream_recycle, stream);
+        if tokens.len() > 1 {
+            state.incremental.trim_prefill_scratch();
+        }
         Ok(Some(logits.with_label("dsv4_incremental_top_level_logits")))
-    }
-
-    fn forward_transformer_layer_stream(
-        &self,
-        layer_idx: usize,
-        stream: &HiddenStates,
-        tokens: &[u32],
-    ) -> Result<HiddenStates> {
-        ensure!(
-            tokens.len() == stream.seq_len,
-            "DeepSeek V4 full layer token count {} does not match stream seq_len {}",
-            tokens.len(),
-            stream.seq_len
-        );
-        ensure!(
-            stream.hidden_dim == self.config.hidden_size * self.config.hc_mult,
-            "DeepSeek V4 full layer stream dim {} does not match hidden_size {} * hc_mult {}",
-            stream.hidden_dim,
-            self.config.hidden_size,
-            self.config.hc_mult
-        );
-        let layer = self.layers.get(layer_idx).ok_or_else(|| {
-            anyhow::anyhow!(
-                "DeepSeek V4 GPU full layer {} out of range for {} loaded layers",
-                layer_idx,
-                self.layers.len()
-            )
-        })?;
-        let trace = dsv4_trace_begin(&self.ctx)?;
-        let mhc = gen_mhc_params(
-            &self.ctx,
-            &layer.hc_attn,
-            stream,
-            self.config.hc_mult,
-            self.config.hc_eps,
-            self.config.hc_sinkhorn_iters,
-        )?;
-        dsv4_trace_end(&self.ctx, "attn_mhc", layer_idx, stream.seq_len, trace)?;
-        let trace = dsv4_trace_begin(&self.ctx)?;
-        let attn_in = hc_pre_from_stream(
-            &self.ctx,
-            stream,
-            &mhc.pre,
-            self.config.hidden_size,
-            self.config.hc_mult,
-        )?;
-        let mut normed =
-            unsafe { HiddenStates::uninit(&self.ctx, self.config.hidden_size, stream.seq_len)? };
-        ops::rms_norm_batch_into(
-            &self.ctx,
-            &attn_in,
-            &layer.attn_norm,
-            self.config.rms_norm_eps,
-            &mut normed,
-        );
-        dsv4_trace_end(&self.ctx, "attn_pre_norm", layer_idx, stream.seq_len, trace)?;
-        let trace = dsv4_trace_begin(&self.ctx)?;
-        let attn_out =
-            self.forward_sliding_window_attention(layer_idx, &layer.attention, &normed)?;
-        dsv4_trace_end(&self.ctx, "attn_total", layer_idx, stream.seq_len, trace)?;
-        let trace = dsv4_trace_begin(&self.ctx)?;
-        let stream = hc_post_to_stream(
-            &self.ctx,
-            &attn_out,
-            stream,
-            &mhc.post,
-            &mhc.comb,
-            self.config.hidden_size,
-            self.config.hc_mult,
-        )?;
-        dsv4_trace_end(&self.ctx, "attn_post", layer_idx, stream.seq_len, trace)?;
-        let trace = dsv4_trace_begin(&self.ctx)?;
-        let stream = self.forward_ffn_layer_stream(layer_idx, &stream, tokens)?;
-        dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, stream.seq_len, trace)?;
-        Ok(stream)
     }
 
     fn forward_transformer_layer_stream_incremental_into(
@@ -624,7 +555,7 @@ impl DeepseekModel {
         stream: &HiddenStates,
         tokens: &[u32],
         start_pos: usize,
-        cache: &mut super::state::DeepseekLayerRuntimeCache,
+        cache: &mut DeepseekLayerRuntimeCache,
         out: &mut HiddenStates,
     ) -> Result<()> {
         ensure!(
@@ -758,6 +689,81 @@ impl DeepseekModel {
         )?;
         dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, out.seq_len, trace)?;
         Ok(())
+    }
+
+    fn forward_transformer_layer_stream(
+        &self,
+        layer_idx: usize,
+        stream: &HiddenStates,
+        tokens: &[u32],
+    ) -> Result<HiddenStates> {
+        ensure!(
+            tokens.len() == stream.seq_len,
+            "DeepSeek V4 full layer token count {} does not match stream seq_len {}",
+            tokens.len(),
+            stream.seq_len
+        );
+        ensure!(
+            stream.hidden_dim == self.config.hidden_size * self.config.hc_mult,
+            "DeepSeek V4 full layer stream dim {} does not match hidden_size {} * hc_mult {}",
+            stream.hidden_dim,
+            self.config.hidden_size,
+            self.config.hc_mult
+        );
+        let layer = self.layers.get(layer_idx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepSeek V4 GPU full layer {} out of range for {} loaded layers",
+                layer_idx,
+                self.layers.len()
+            )
+        })?;
+        let trace = dsv4_trace_begin(&self.ctx)?;
+        let mhc = gen_mhc_params(
+            &self.ctx,
+            &layer.hc_attn,
+            stream,
+            self.config.hc_mult,
+            self.config.hc_eps,
+            self.config.hc_sinkhorn_iters,
+        )?;
+        dsv4_trace_end(&self.ctx, "attn_mhc", layer_idx, stream.seq_len, trace)?;
+        let trace = dsv4_trace_begin(&self.ctx)?;
+        let attn_in = hc_pre_from_stream(
+            &self.ctx,
+            stream,
+            &mhc.pre,
+            self.config.hidden_size,
+            self.config.hc_mult,
+        )?;
+        let mut normed =
+            unsafe { HiddenStates::uninit(&self.ctx, self.config.hidden_size, stream.seq_len)? };
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &attn_in,
+            &layer.attn_norm,
+            self.config.rms_norm_eps,
+            &mut normed,
+        );
+        dsv4_trace_end(&self.ctx, "attn_pre_norm", layer_idx, stream.seq_len, trace)?;
+        let trace = dsv4_trace_begin(&self.ctx)?;
+        let attn_out =
+            self.forward_sliding_window_attention(layer_idx, &layer.attention, &normed)?;
+        dsv4_trace_end(&self.ctx, "attn_total", layer_idx, stream.seq_len, trace)?;
+        let trace = dsv4_trace_begin(&self.ctx)?;
+        let stream = hc_post_to_stream(
+            &self.ctx,
+            &attn_out,
+            stream,
+            &mhc.post,
+            &mhc.comb,
+            self.config.hidden_size,
+            self.config.hc_mult,
+        )?;
+        dsv4_trace_end(&self.ctx, "attn_post", layer_idx, stream.seq_len, trace)?;
+        let trace = dsv4_trace_begin(&self.ctx)?;
+        let stream = self.forward_ffn_layer_stream(layer_idx, &stream, tokens)?;
+        dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, stream.seq_len, trace)?;
+        Ok(stream)
     }
 
     fn forward_sliding_window_attention(
@@ -2230,6 +2236,7 @@ impl DeepseekModel {
                 &self.config.ep,
                 &normed,
                 tokens,
+                moe_scratch.as_deref_mut(),
             )?;
             dsv4_trace_end(
                 &self.ctx,
@@ -2330,24 +2337,14 @@ impl DeepseekModel {
         state: &mut super::state::DeepseekState,
     ) -> Result<Option<DeviceVec>> {
         state.reference_tokens.extend_from_slice(tokens);
-        if dsv4_incremental_kv_enabled()? {
-            return self.compute_top_level_logits_incremental(tokens, state, true);
-        }
+        // Long-prefill is throughput-bound and must use the batched transformer
+        // path. The incremental path is a decode optimization; applying it to a
+        // 6K-token prefill regresses TTFT by >2x on DSv4.
         if dsv4_gpu_contextual_logits_enabled()? {
             self.compute_top_level_logits(&state.reference_tokens)
         } else {
             self.compute_top_level_logits(&[tokens[tokens.len() - 1]])
         }
-    }
-
-    pub(super) fn compute_gpu_incremental_prefill_chunk(
-        &self,
-        tokens: &[u32],
-        state: &mut super::state::DeepseekState,
-        emit_logits: bool,
-    ) -> Result<Option<DeviceVec>> {
-        state.reference_tokens.extend_from_slice(tokens);
-        self.compute_top_level_logits_incremental(tokens, state, emit_logits)
     }
 
     fn load_layer_weights(
@@ -2627,6 +2624,9 @@ impl DeepseekModel {
     ) -> Result<Option<DeviceVec>> {
         state.reference_tokens.push(token);
         if dsv4_incremental_kv_enabled()? {
+            if state.incremental.processed_tokens == 0 {
+                state.incremental.processed_tokens = state.base.kv_cache.len();
+            }
             return self.compute_top_level_logits_incremental(&[token], state, true);
         }
         if dsv4_gpu_contextual_logits_enabled()? {
@@ -4026,7 +4026,7 @@ fn dsv4_trace_end(
 #[cfg(feature = "cuda")]
 pub(super) fn dsv4_incremental_kv_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_INCREMENTAL_KV").ok() else {
-        return Ok(false);
+        return Ok(dsv4_gpu_full_layer_limit()? > 0);
     };
     match raw.as_str() {
         "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
