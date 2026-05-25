@@ -1,6 +1,7 @@
 # Multi-SM coverage policy
 
-**Status:** Phase A (tier policy + env var migration) landing 2026-04-28.
+**Status:** Phase A (tier policy + env var migration) landed 2026-04-28;
+Volta sm_70 legacy lane opened 2026-05-25 for V100 Qwen3.5 dense inference.
 Owner: ckl. Verification: T1 four-card bench gate (sm_80/86/89/90).
 Cross-link: [`tilelang-integration-verification.md`](tilelang-integration-verification.md)
 for SM-specific bench thresholds, [`cuda-kernel-crate-extraction.md`](cuda-kernel-crate-extraction.md)
@@ -19,7 +20,10 @@ emits an unrunnable artifact.
 
 The shipped target is one release binary that runs natively on the four
 mainstream T1 SMs without rebuild, with a clear opt-in path for Blackwell
-(T2) and an explicit reject for older hardware (T3).
+(T2). Volta V100 (`sm_70`) is a separate legacy lane: it is allowed only as an
+SM-pinned build so the T1 binary never carries Volta fallback code and the
+Volta binary never carries T1/Hopper-only kernels. Other pre-Ampere hardware
+stays rejected.
 
 ---
 
@@ -33,7 +37,8 @@ mainstream T1 SMs without rebuild, with a clear opt-in path for Blackwell
 | T1   | 90 | H100                              | yes     | same                                                      |
 | T2   | 100| B100 / B200                       | no — opt-in via `TORCH_CUDA_ARCH_LIST` | same as T1 once opted in |
 | T2   | 120| RTX 5090 / RTX PRO 6000           | no — opt-in via `TORCH_CUDA_ARCH_LIST` | same as T1 once opted in |
-| T3   | < 80 | V100 / T4 / Pascal / older      | rejected at build time | n/a — `panic!` with hint |
+| T0-legacy | 70 | V100                         | auto-detect / explicit `TORCH_CUDA_ARCH_LIST=7.0`; SM-pin only | Qwen3.5 BF16 attention + GDR lane for 4B/9B smoke; unsupported operators must return clear not-supported / build-time errors |
+| T3   | other < 80 | T4 / Pascal / older        | rejected at build time | n/a — `panic!` with hint |
 
 **Why T2 is opt-in.** Triton 3.6 has working evidence on sm_120 (vLLM
 [PR #31089](https://github.com/vllm-project/vllm/pull/31089)) but not all
@@ -41,10 +46,35 @@ mainstream T1 SMs without rebuild, with a clear opt-in path for Blackwell
 for sm_120 in `tile-ai/tilelang`. Defaulting to T2 would make build hard
 fails the common case for users on T1-only hardware.
 
-**Why T3 is rejected.** Marlin (`csrc/gemm/marlin_kernel.cu`) needs 96 KB
-shared memory which exceeds the 64 KB per-block cap on sm_75 (Turing).
-Most kernels assume native bf16, only available from sm_80. Emitting a
-binary that segfaults on older hardware is worse than refusing to build.
+**Why sm_70 is separate instead of T1.** V100 has useful FP16 tensor cores but
+does not have native BF16 MMA, FP8, `cp.async`, TMA, WGMMA, or the shared-memory
+headroom expected by the Marlin fast path. The sm_70 contract is therefore an
+operator-level fallback lane:
+
+- BF16 TileLang attention lowers through BF16→FP16 fragment conversion with
+  FP32 accumulation, preserving the Qwen3.5 attention-score range contract as
+  far as Volta hardware allows.
+- Qwen3.5 dense BF16 KV is in scope first. The initial V100 AOT set is pinned
+  to the observed 4B and 9B attention shapes: HD256 `q16_kv4` for Qwen3.5-4B
+  and HD128 `q40_kv8` for Qwen3.5-9B, with HD128 `q32_kv8` kept as the adjacent
+  4B/9B compatibility shape from the P0 spike. GDR TileLang kernels are enabled
+  on sm_70 because Qwen3.5 smoke exercises the hybrid path. INT8 or FP8
+  split-KV, DSv4, and Marlin W4/W4A8/W4+FP8 paths remain outside the initial
+  V100 lane.
+- The sm_70 build is SM-pinned. `TORCH_CUDA_ARCH_LIST="7.0;8.9"` is rejected
+  because it would either pollute T1 cubins with Volta fallbacks or pollute the
+  V100 binary with kernels it cannot execute.
+
+**Why other T3 hardware is still rejected.** T4/Turing and Pascal are not part
+of the V100 target and do not share one clean fallback contract. Emitting a
+binary that later segfaults on older hardware is worse than refusing to build.
+
+**Deprecation timeline.** sm_70 support is legacy and tied to available V100
+validation capacity. Keep it while Qwen3.5-4B / Qwen3.5-9B dense inference can
+hit the V100 gate in this plan. Revisit every quarter; remove only after either
+(a) the V100 validation host is retired and no production/customer workflow
+depends on it, or (b) the fallback path falls below the documented performance
+floor for two consecutive validation cycles and no owner accepts the repair.
 
 ---
 
@@ -62,7 +92,7 @@ backwards-compat shim — see `feedback_no_half_states.md`.
 1. `TORCH_CUDA_ARCH_LIST` — semicolon / comma / space separated, PyTorch format
 2. `CMAKE_CUDA_ARCHITECTURES` — same parser
 3. `nvidia-smi --query-gpu=compute_cap` — auto-detect the local GPU
-4. Default to **T1 set** `{80, 86, 89, 90}` — never includes T2
+4. Default to **T1 set** `{80, 86, 89, 90}` — never includes T2 or sm_70
 
 **Accepted formats** (any combination per-token):
 
@@ -89,6 +119,9 @@ TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;10.0" cargo build --release --features cud
 # RTX 5090-only build (Blackwell consumer)
 TORCH_CUDA_ARCH_LIST="12.0" cargo build --release --features cuda
 
+# V100-only legacy build (SM-pinned, Qwen3.5 dense lane)
+TORCH_CUDA_ARCH_LIST="7.0" cargo build --release --features cuda
+
 # CMake-style integer alias works too
 CMAKE_CUDA_ARCHITECTURES="80;86;89;90" cargo build --release --features cuda
 
@@ -101,6 +134,11 @@ compile for a target SM, it warns and skips. ARLE is **hard-fail**: any
 target SM that can't emit cubin for any kernel panics the build, with a
 suggested `TORCH_CUDA_ARCH_LIST` value to exclude that SM. This matches
 the production-binary contract: every supported SM must work.
+
+The sm_70 exception is not a warn-skip path. Unsupported operator families
+produce compiled not-supported wrappers or build-time hard rejects with this
+document as the rationale; Qwen3.5 dense attention kernels still hard-fail if
+their sm_70 cubin cannot be emitted.
 
 ---
 

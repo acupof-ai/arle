@@ -119,7 +119,8 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
   Always emit a `cargo:warning` on the T1-default fallback.
 - **Tier policy** (canonical: [`docs/plans/sm-coverage.md`](../../docs/plans/sm-coverage.md)):
   T1 `{80, 86, 89, 90}` default-built; T2 `{100, 120}` opt-in via env var;
-  T3 `< 80` panics at build time. Adding a new SM = update `T1_SMS`/`T2_SMS`
+  legacy Volta `{70}` is SM-pinned for the V100 Qwen3.5 BF16 attention + GDR lane; other
+  T3 `< 80` SMs panic at build time. Adding a new SM = update the tier lists
   in `build.rs` and the GPU/SM row in `docs/support-matrix.md`.
 - **AOT failure policy:** any (SM, kernel) combination that fails to emit
   cubin → `panic!`. No warn-skip. Error message must suggest a

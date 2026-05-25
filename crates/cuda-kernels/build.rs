@@ -8,8 +8,19 @@ const T1_SMS: &[&str] = &["80", "86", "89", "90"];
 /// Tier-2 SMs: opt-in via TORCH_CUDA_ARCH_LIST. B100·B200 / RTX 5090.
 const T2_SMS: &[&str] = &["100", "120"];
 
+/// Legacy Volta SMs: opt-in / auto-detect only, built as a separate SM-pinned binary.
+const LEGACY_VOLTA_SMS: &[&str] = &["70"];
+
 fn is_supported_sm(sm: &str) -> bool {
-    T1_SMS.contains(&sm) || T2_SMS.contains(&sm)
+    T1_SMS.contains(&sm) || T2_SMS.contains(&sm) || LEGACY_VOLTA_SMS.contains(&sm)
+}
+
+fn is_legacy_volta_sm(sm: &str) -> bool {
+    LEGACY_VOLTA_SMS.contains(&sm)
+}
+
+fn has_legacy_volta(sm_targets: &[SmSpec]) -> bool {
+    sm_targets.iter().any(|spec| is_legacy_volta_sm(&spec.sm))
 }
 
 #[derive(Clone, Debug)]
@@ -62,16 +73,29 @@ fn parse_sm_token(raw: &str) -> Option<SmSpec> {
     Some(SmSpec { sm, ptx })
 }
 
-/// Reject SMs outside the T1∪T2 whitelist. T3 (Volta/Turing/older) is unsupported.
+/// Reject SMs outside the explicit whitelist. Turing/Pascal/older stay unsupported.
 fn validate_sm(spec: &SmSpec, source: &str) {
     if !is_supported_sm(&spec.sm) {
         panic!(
             "Unsupported CUDA compute capability 'sm_{}' from {}. \
-             ARLE supports T1={{80,86,89,90}} (default) and T2={{100,120}} (opt-in). \
-             T3 (sm < 80) and unknown SMs are rejected. \
+             ARLE supports T1={{80,86,89,90}} (default), T2={{100,120}} (opt-in), \
+             and legacy Volta={{70}} as a separate SM-pinned build. \
+             Turing/Pascal/unknown SMs are rejected. \
              See docs/plans/sm-coverage.md and docs/support-matrix.md. \
              To restrict targets explicitly: TORCH_CUDA_ARCH_LIST=\"8.0;8.6;8.9;9.0\".",
             spec.sm, source
+        );
+    }
+}
+
+fn validate_sm_set(sm_targets: &[SmSpec]) {
+    if has_legacy_volta(sm_targets) && sm_targets.len() != 1 {
+        panic!(
+            "sm_70 legacy Volta builds must be SM-pinned and cannot be mixed with T1/T2 targets. \
+             Build V100 with TORCH_CUDA_ARCH_LIST=\"7.0\"; build the T1 release binary separately \
+             with TORCH_CUDA_ARCH_LIST=\"8.0;8.6;8.9;9.0\". \
+             This keeps T1 cubins free of sm_70 fallback code and keeps sm_70 binaries free of \
+             T1/Hopper-only kernels. See docs/plans/sm-coverage.md."
         );
     }
 }
@@ -352,6 +376,14 @@ const TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS: &[(u32, u32)] = TILELANG_DECODE_
 /// `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd128_fp8.py`.
 const TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS: &[(u32, u32)] = &[(32, 8)];
 
+fn sm70_qwen35_dense_head_config(q: u32, kv: u32) -> bool {
+    matches!((q, kv), (32, 8) | (40, 8))
+}
+
+fn sm70_qwen35_dense_hd256_head_config(q: u32, kv: u32) -> bool {
+    matches!((q, kv), (16, 4))
+}
+
 struct TileLangKernelSpec {
     artifact_dir: String,
     kernel_path: &'static str,
@@ -364,6 +396,7 @@ struct TileLangKernelSpec {
     public_decl: &'static str,
     extern_decl: &'static str,
     call_args: &'static str,
+    allow_sm70: bool,
 }
 
 fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
@@ -517,10 +550,17 @@ spec = importlib.util.find_spec("tilelang")
 if spec is None or not spec.submodule_search_locations:
     print("ERR_NOT_INSTALLED")
     sys.exit(0)
-pkg = spec.submodule_search_locations[0]
+from pathlib import Path
+pkg = Path(spec.submodule_search_locations[0]).resolve()
+roots = [pkg, pkg.parent]
+src = next((root / "src" for root in roots if (root / "src" / "tl_templates").exists()), None)
+cutlass = next((root / "3rdparty" / "cutlass" / "include" for root in roots if (root / "3rdparty" / "cutlass" / "include").exists()), None)
+if src is None or cutlass is None:
+    print("ERR_LAYOUT:" + str(pkg))
+    sys.exit(0)
 print(json.dumps({
-    "src": f"{pkg}/src",
-    "cutlass_include": f"{pkg}/3rdparty/cutlass/include",
+    "src": str(src),
+    "cutlass_include": str(cutlass),
 }))
 "#;
     let output = Command::new(python)
@@ -532,6 +572,12 @@ print(json.dumps({
     let stdout = stdout.trim();
     if stdout == "ERR_NOT_INSTALLED" {
         panic!("tilelang Python package not installed for the chosen interpreter");
+    }
+    if let Some(pkg) = stdout.strip_prefix("ERR_LAYOUT:") {
+        panic!(
+            "tilelang Python package at {pkg} does not expose src/tl_templates or 3rdparty/cutlass/include; \
+             install TileLang from a source checkout or set INFER_TILELANG_PYTHON to the patched checkout interpreter"
+        );
     }
     // Tiny hand-rolled parse — JSON has only two known keys, no need to add a dep.
     let src = stdout
@@ -689,10 +735,15 @@ fn build_tilelang_kernel(
     base_spec: &TileLangKernelSpec,
     generated_sources: &mut Vec<PathBuf>,
 ) {
+    let eligible_targets: Vec<SmSpec> = sm_targets
+        .iter()
+        .filter(|sm| base_spec.allow_sm70 || !is_legacy_volta_sm(&sm.sm))
+        .cloned()
+        .collect();
     let per_sm = generate_tilelang_artifacts_per_sm(
         python,
         out_dir,
-        sm_targets,
+        &eligible_targets,
         cuda_path,
         tilelang_src,
         cutlass_include,
@@ -744,6 +795,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
             extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
             call_args: TILELANG_DISPATCH_CALL_ARGS,
+            allow_sm70: sm70_qwen35_dense_head_config(q, kv),
         };
         build_tilelang_kernel(
             &python,
@@ -771,6 +823,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
             extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
             call_args: TILELANG_DISPATCH_CALL_ARGS,
+            allow_sm70: sm70_qwen35_dense_hd256_head_config(q, kv),
         };
         build_tilelang_kernel(
             &python,
@@ -798,6 +851,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
             extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
             call_args: TILELANG_DISPATCH_CALL_ARGS,
+            allow_sm70: sm70_qwen35_dense_hd256_head_config(q, kv),
         };
         build_tilelang_kernel(
             &python,
@@ -825,6 +879,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
             extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
             call_args: TILELANG_DISPATCH_CALL_ARGS,
+            allow_sm70: sm70_qwen35_dense_head_config(q, kv),
         };
         build_tilelang_kernel(
             &python,
@@ -855,6 +910,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
             extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
             call_args: TILELANG_DISPATCH_CALL_ARGS,
+            allow_sm70: false,
         };
         build_tilelang_kernel(
             &python,
@@ -882,6 +938,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
             extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
             call_args: TILELANG_DISPATCH_CALL_ARGS,
+            allow_sm70: false,
         };
         build_tilelang_kernel(
             &python,
@@ -909,6 +966,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL,
             extern_decl: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_EXTERN_DECL,
             call_args: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_CALL_ARGS,
+            allow_sm70: sm70_qwen35_dense_head_config(q, kv),
         };
         build_tilelang_kernel(
             &python,
@@ -933,6 +991,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL,
             extern_decl: TILELANG_DISPATCH_BF16_SPLIT_MERGE_EXTERN_DECL,
             call_args: TILELANG_DISPATCH_BF16_SPLIT_MERGE_CALL_ARGS,
+            allow_sm70: sm70_qwen35_dense_head_config(q, kv),
         };
         build_tilelang_kernel(
             &python,
@@ -961,6 +1020,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: TILELANG_DISPATCH_FP8_PUBLIC_DECL,
             extern_decl: TILELANG_DISPATCH_FP8_EXTERN_DECL,
             call_args: TILELANG_DISPATCH_FP8_CALL_ARGS,
+            allow_sm70: false,
         };
         build_tilelang_kernel(
             &python,
@@ -987,6 +1047,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: GDR_PREPARE_PUBLIC_DECL,
             extern_decl: GDR_PREPARE_EXTERN_DECL,
             call_args: GDR_PREPARE_CALL_ARGS,
+            allow_sm70: true,
         },
         TileLangKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_cumsum".to_string(),
@@ -1000,6 +1061,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: GDR_CUMSUM_PUBLIC_DECL,
             extern_decl: GDR_CUMSUM_EXTERN_DECL,
             call_args: GDR_CUMSUM_CALL_ARGS,
+            allow_sm70: true,
         },
         TileLangKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_a".to_string(),
@@ -1013,6 +1075,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: GDR_A_PUBLIC_DECL,
             extern_decl: GDR_A_EXTERN_DECL,
             call_args: GDR_A_CALL_ARGS,
+            allow_sm70: true,
         },
         TileLangKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_recompute".to_string(),
@@ -1026,6 +1089,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: GDR_RECOMPUTE_PUBLIC_DECL,
             extern_decl: GDR_RECOMPUTE_EXTERN_DECL,
             call_args: GDR_RECOMPUTE_CALL_ARGS,
+            allow_sm70: true,
         },
         TileLangKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_state".to_string(),
@@ -1039,6 +1103,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: GDR_STATE_PUBLIC_DECL,
             extern_decl: GDR_STATE_EXTERN_DECL,
             call_args: GDR_STATE_CALL_ARGS,
+            allow_sm70: true,
         },
         TileLangKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_o".to_string(),
@@ -1052,6 +1117,7 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             public_decl: GDR_O_PUBLIC_DECL,
             extern_decl: GDR_O_EXTERN_DECL,
             call_args: GDR_O_CALL_ARGS,
+            allow_sm70: true,
         },
     ];
     for spec in &gdr_specs {
@@ -1083,6 +1149,11 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
         "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD64/HD128/HD256 prefill, HD64/HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
         sm_targets.len()
     );
+    if has_legacy_volta(sm_targets) {
+        println!(
+            "cargo:warning=sm_70 legacy Volta build: TileLang AOT emits BF16 Qwen3.5 dense-attention and GDR cubins; FP8 KV and DSv4 HD64 wrappers return CUDA_ERROR_NOT_SUPPORTED."
+        );
+    }
     for entry in std::fs::read_dir("tools/tilelang")
         .expect("tools/tilelang directory must exist")
         .flatten()
@@ -1143,6 +1214,7 @@ fn main() {
     let nvcc = format!("{}/bin/nvcc", cuda_path);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let sm_targets = detect_sm_targets();
+    validate_sm_set(&sm_targets);
     let arch_args = nvcc_arch_args(&sm_targets);
     println!(
         "cargo:warning=Compiling CUDA kernels for targets: {}",
@@ -1166,10 +1238,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
     let ccbin = std::env::var("NVCC_CCBIN").ok();
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_MARLIN_W4_FP8");
-    let disable_marlin_w4_fp8 = matches!(
-        std::env::var("ARLE_CUDA_DISABLE_MARLIN_W4_FP8").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "YES")
-    );
+    let legacy_volta_build = has_legacy_volta(&sm_targets);
+    let disable_marlin_w4_fp8 = legacy_volta_build
+        || matches!(
+            std::env::var("ARLE_CUDA_DISABLE_MARLIN_W4_FP8").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "YES")
+        );
 
     let mut obj_files = Vec::new();
     for cu_file in &cu_files {
@@ -1188,6 +1262,14 @@ fn main() {
         }
         if disable_marlin_w4_fp8 && stem == "marlin_w4_fp8_kernel" {
             nvcc_args.push("-DARLE_DISABLE_MARLIN_W4_FP8=1".to_string());
+        }
+        if legacy_volta_build
+            && matches!(
+                stem,
+                "marlin_kernel" | "marlin_repack" | "marlin_w4a8_kernel"
+            )
+        {
+            nvcc_args.push("-DARLE_DISABLE_MARLIN_SM70=1".to_string());
         }
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);

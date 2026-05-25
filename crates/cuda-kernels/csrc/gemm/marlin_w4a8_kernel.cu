@@ -18,13 +18,58 @@
  */
 
 
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#ifdef ARLE_DISABLE_MARLIN_SM70
+
+extern "C" int gemm_w4a8_marlin_cuda(
+    const void* A,
+    const void* B,
+    void* C,
+    void* D,
+    void* s1,
+    void* s2,
+    void* s3,
+    int prob_m,
+    int prob_n,
+    int prob_k,
+    void* workspace,
+    int groupsize,
+    int dev,
+    cudaStream_t stream,
+    int thread_k,
+    int thread_n,
+    int sms,
+    int max_par) {
+  (void)A;
+  (void)B;
+  (void)C;
+  (void)D;
+  (void)s1;
+  (void)s2;
+  (void)s3;
+  (void)prob_m;
+  (void)prob_n;
+  (void)prob_k;
+  (void)workspace;
+  (void)groupsize;
+  (void)dev;
+  (void)stream;
+  (void)thread_k;
+  (void)thread_n;
+  (void)sms;
+  (void)max_par;
+  return cudaErrorNotSupported;
+}
+
+#else
+
 #ifndef MARLIN_CUDA_KERNEL_CUH
 #define MARLIN_CUDA_KERNEL_CUH
 
 
-#include <cuda.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 #include <iostream>
 #include <assert.h>
 
@@ -1037,3 +1082,5 @@ extern "C" int gemm_w4a8_marlin_cuda(
                             workspace, groupsize, dev, stream, thread_k,
                             thread_n, sms, max_par);
 }
+
+#endif  // ARLE_DISABLE_MARLIN_SM70

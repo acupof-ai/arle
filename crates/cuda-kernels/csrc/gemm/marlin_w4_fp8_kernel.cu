@@ -18,7 +18,7 @@
 
 constexpr int ERR_PROB_SHAPE = 1;
 constexpr int ERR_KERN_SHAPE = 2;
-constexpr int ERR_ARCH = 3;
+constexpr int ERR_ARCH = cudaErrorNotSupported;
 
 #ifdef ARLE_DISABLE_MARLIN_W4_FP8
 

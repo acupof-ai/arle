@@ -43,13 +43,17 @@ Env var contract: see [`environment.md`](environment.md) §`TORCH_CUDA_ARCH_LIST
 | T1 | sm_90 | H100, H200 | Supported | yes |
 | T2 | sm_100 | B100, B200 | Beta — opt-in via `TORCH_CUDA_ARCH_LIST` | no |
 | T2 | sm_120 | RTX 5090, RTX PRO 6000 | Beta — opt-in via `TORCH_CUDA_ARCH_LIST` | no |
-| T3 | sm < 80 | V100, T4, Pascal, older | Unsupported — build rejects | n/a |
+| T0-legacy | sm_70 | V100 | Legacy — SM-pinned Qwen3.5 BF16 attention + GDR lane | no |
+| T3 | other sm < 80 | T4, Pascal, older | Unsupported — build rejects | n/a |
 
 Notes:
 
 - Hosted CI does not provide full CUDA runtime correctness coverage.
 - CUDA correctness and performance still require dedicated GPU validation.
 - T1 ship gate requires four-card bench validation (sm_80 + sm_86 + sm_89 + sm_90); see [`plans/sm-coverage.md`](plans/sm-coverage.md) §5.
+- sm_70 builds must be SM-pinned (`TORCH_CUDA_ARCH_LIST=7.0`) and are limited
+  to the V100 Qwen3.5 BF16 attention + GDR path while Volta fallbacks are
+  validated.
 
 ---
 
