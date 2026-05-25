@@ -91,15 +91,15 @@ item (1) DSv4 scaffold strict-clippy debt out of scope as architectural.
 | `docs/plans/M_pf83_h1prime_v2_redesign_brief.md` | `5329498` | BLOCKED, not ready for pickup | Status banner now says PF8.3 remains opt-in/default-off and runtime-KILLed; fresh license is required before any PF8 scratch/kernel work. |
 | `docs/plans/M_37-pathB-device-mem-startpos.md` | `5329498` | SUPERSEDED | Path B v1 preserved as historical context; banner points to Tier 4 KILL and Path B.2 Tier 1 outcome. |
 | `docs/plans/2026-05-10-post-37-license-decision-tree.md` | `5329498` | EXECUTED | Decision tree preserved as record; banner says do not run it as current instructions. |
-| Editable local Markdown links | `7066bb9` | CLEAN | 61 editable broken local links reduced to 0. |
-| `docs/experience/wins/` and `docs/experience/errors/` broken links | not touched | KEEP | 44 immutable historical broken links remain by policy; wins/errors entries were not edited. |
+| Editable local Markdown links | `7066bb9` + post-rebase follow-up | CLEAN | 61 initial editable broken local links reduced to 0; rebase on remote prune exposed 2 more pre-May links, also annotated before push. |
+| `docs/experience/wins/` and `docs/experience/errors/` broken links | not touched | KEEP | 39 immutable historical broken links remain by policy; wins/errors entries were not edited. |
 
 Broken-link classification:
 
 | Class | Count | Action |
 | --- | ---: | --- |
 | Existing-but-moved targets | 14 | Repointed to current files, mostly consolidated Metal strategy and renamed W4/W3 evidence entries. |
-| Truly missing historical targets | 45 | Converted to non-link text with `(historical reference, file removed)` annotation. |
+| Truly missing historical targets | 47 | Converted to non-link text with `(historical reference, file removed)` annotation. |
 | Malformed placeholder/prose links | 2 | Normalized to plain code/prose (`<date>-bench...`, `signed nibble`). |
 
 Verification for the follow-up:
@@ -114,9 +114,9 @@ PY
 Results:
 
 - Editable docs (`docs/plans`, `docs/projects`, `docs/research`, `README.md`,
-  `CONTRIBUTING.md`): missing local links `61 -> 0`.
+  `CONTRIBUTING.md`): missing local links `61 + 2 post-rebase -> 0`.
 - Immutable docs (`docs/experience/wins`, `docs/experience/errors`): missing
-  local links still `44`, intentionally untouched.
+  local links still `39`, intentionally untouched.
 - No Rust/code files changed; cargo/bench exempt.
 
 Follow-up line stats:
