@@ -97,6 +97,29 @@ pub struct Qwen35KvCache {
     seq_len: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequenceWindow {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl SequenceWindow {
+    pub fn len(self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+}
+
+pub trait SequenceWindowedForward {
+    fn forward_logits_window(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        input_ids: &[u32],
+        position_ids: &[u32],
+        window: SequenceWindow,
+    ) -> Result<TensorId>;
+}
+
 impl Qwen35KvCache {
     pub fn new(model: &Qwen35Model) -> Self {
         Self {
@@ -1908,6 +1931,19 @@ impl Qwen35Model {
         positions: &[usize],
         batch: usize,
     ) -> Result<TensorId> {
+        let hidden =
+            self.forward_batch_hidden_indices(store, tape, token_indices, positions, batch)?;
+        linear_forward(hidden, self.lm_head, store, tape)
+    }
+
+    fn forward_batch_hidden_indices(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        token_indices: &[usize],
+        positions: &[usize],
+        batch: usize,
+    ) -> Result<TensorId> {
         let seq_len = positions.len();
         if token_indices.len() != batch * seq_len {
             return Err(Qwen35Error::InputLenMismatch {
@@ -1928,14 +1964,13 @@ impl Qwen35Model {
         for layer in &self.layers {
             hidden = layer.forward(hidden, &self.config, cos, sin, store, tape)?;
         }
-        let hidden = qwen35_rmsnorm(
+        qwen35_rmsnorm(
             hidden,
             self.final_norm,
             self.config.rms_norm_eps,
             store,
             tape,
-        )?;
-        linear_forward(hidden, self.lm_head, store, tape)
+        )
     }
 
     fn forward_batch_indices_with_kv_cache(
@@ -2136,6 +2171,24 @@ impl Qwen35Model {
         self.forward_batch(store, tape, input_ids, position_ids, 1, position_ids.len())
     }
 
+    pub fn forward_logits_window(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        input_ids: &[u32],
+        position_ids: &[u32],
+        window: SequenceWindow,
+    ) -> Result<TensorId> {
+        <Self as SequenceWindowedForward>::forward_logits_window(
+            self,
+            store,
+            tape,
+            input_ids,
+            position_ids,
+            window,
+        )
+    }
+
     pub fn param_name_map(&self) -> HashMap<&'static str, TensorId> {
         self.param_names.clone()
     }
@@ -2247,6 +2300,67 @@ impl Qwen35Model {
         }
         Ok(map)
     }
+}
+
+impl SequenceWindowedForward for Qwen35Model {
+    fn forward_logits_window(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        input_ids: &[u32],
+        position_ids: &[u32],
+        window: SequenceWindow,
+    ) -> Result<TensorId> {
+        validate_sequence_window(input_ids, position_ids, window)?;
+        let prefix_len = window.end;
+        let token_indices = input_ids[..prefix_len]
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
+        let positions = position_ids[..prefix_len]
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
+        let hidden =
+            self.forward_batch_hidden_indices(store, tape, &token_indices, &positions, 1)?;
+        let hidden_window = if window.start == 0 && window.end == prefix_len {
+            hidden
+        } else {
+            slice(
+                hidden,
+                &[0, window.start, 0],
+                &[1, window.end, self.config.hidden_size],
+                store,
+                tape,
+            )?
+        };
+        linear_forward(hidden_window, self.lm_head, store, tape)
+    }
+}
+
+fn validate_sequence_window(
+    input_ids: &[u32],
+    position_ids: &[u32],
+    window: SequenceWindow,
+) -> Result<()> {
+    if input_ids.len() != position_ids.len() {
+        return Err(Qwen35Error::InputLenMismatch {
+            input_len: input_ids.len(),
+            expected_len: position_ids.len(),
+        });
+    }
+    if window.start >= window.end {
+        return Err(Qwen35Error::InvalidConfig(
+            "sequence logits window must be non-empty",
+        ));
+    }
+    if window.end > input_ids.len() {
+        return Err(Qwen35Error::InputLenMismatch {
+            input_len: window.end,
+            expected_len: input_ids.len(),
+        });
+    }
+    Ok(())
 }
 
 impl CausalLm for Qwen35Model {
@@ -2944,6 +3058,44 @@ mod tests {
         }
 
         assert_eq!(cache.seq_len, rollout.len() - 1);
+        Ok(())
+    }
+
+    #[test]
+    fn qwen35_logits_window_matches_full_forward_slice() -> TestResult {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        tape.set_enabled(false);
+
+        let cfg = tiny_qwen35_config(16);
+        let model = Qwen35Model::new_for_eval(&cfg, &mut store)?;
+        let tokens = vec![1_u32, 3, 8, 4, 2];
+        let positions = (0..tokens.len() as u32).collect::<Vec<_>>();
+        let full_logits = model.forward(&mut store, &mut tape, &tokens, &positions)?;
+        let full_host = logits_host(&mut store, full_logits)?;
+
+        let window = super::SequenceWindow { start: 1, end: 4 };
+        let window_logits =
+            model.forward_logits_window(&mut store, &mut tape, &tokens, &positions, window)?;
+        let window_host = logits_host(&mut store, window_logits)?;
+
+        let expected_len = window.len() * cfg.vocab_size;
+        assert_eq!(window_host.len(), expected_len);
+        for local_pos in 0..window.len() {
+            let full_start = (window.start + local_pos) * cfg.vocab_size;
+            let window_start = local_pos * cfg.vocab_size;
+            let full_row = &full_host[full_start..full_start + cfg.vocab_size];
+            let window_row = &window_host[window_start..window_start + cfg.vocab_size];
+            let max_abs = full_row
+                .iter()
+                .zip(window_row.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs <= 1.0e-5,
+                "window row {local_pos} must match full logits slice; max_abs={max_abs}"
+            );
+        }
         Ok(())
     }
 }

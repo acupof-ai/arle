@@ -23,7 +23,7 @@ use half::bf16;
 use infer::server_engine::LoadedInferenceEngine;
 use serde::{Deserialize, Serialize};
 
-use crate::qwen35::{Qwen35Error, Qwen35Model};
+use crate::qwen35::{Qwen35Error, Qwen35Model, SequenceWindow};
 
 #[derive(Debug, Clone)]
 pub struct DeviceLogits {
@@ -59,11 +59,38 @@ pub trait TeacherForward {
         tape: &mut Tape,
     ) -> Result<DeviceLogits>;
 
+    fn forward_logits_window_device(
+        &self,
+        _input_ids: &[u32],
+        _positions: &[u32],
+        _window: SequenceWindow,
+        _store: &mut TensorStore,
+        _tape: &mut Tape,
+    ) -> Result<DeviceLogits> {
+        Err(TeacherForwardError::InvalidInput(
+            "--logits-window-size requires a windowed teacher; the in-process \
+             Qwen35 teacher supports it, API and infer-runtime teachers still \
+             materialize full logits and are intentionally rejected for Route B"
+                .to_owned(),
+        ))
+    }
+
     fn vocab_size(&self) -> usize;
 
     fn parameter_ids(&self) -> &[TensorId] {
         &[]
     }
+}
+
+pub trait TeacherWindowedForward: TeacherForward {
+    fn forward_logits_window_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        window: SequenceWindow,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<DeviceLogits>;
 }
 
 pub struct TeacherEntry<'a> {
@@ -246,6 +273,20 @@ impl TeacherForward for MultiTeacher<'_> {
     ) -> Result<DeviceLogits> {
         let teacher = self.entries[self.selected_teacher_index(input_ids)].teacher;
         teacher.forward_logits_device(input_ids, positions, store, tape)
+    }
+
+    fn forward_logits_window_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        window: SequenceWindow,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<DeviceLogits> {
+        let teacher = self.entries[self.selected_teacher_index(input_ids)].teacher;
+        TeacherForward::forward_logits_window_device(
+            teacher, input_ids, positions, window, store, tape,
+        )
     }
 
     fn vocab_size(&self) -> usize {
@@ -528,12 +569,47 @@ impl TeacherForward for InProcessTeacher<'_> {
         Ok(DeviceLogits { tensor_id, shape })
     }
 
+    fn forward_logits_window_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        window: SequenceWindow,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<DeviceLogits> {
+        <Self as TeacherWindowedForward>::forward_logits_window_device(
+            self, input_ids, positions, window, store, tape,
+        )
+    }
+
     fn vocab_size(&self) -> usize {
         self.model.config().vocab_size
     }
 
     fn parameter_ids(&self) -> &[TensorId] {
         &self.parameter_ids
+    }
+}
+
+impl TeacherWindowedForward for InProcessTeacher<'_> {
+    fn forward_logits_window_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        window: SequenceWindow,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<DeviceLogits> {
+        let tensor_id = self
+            .model
+            .forward_logits_window(store, tape, input_ids, positions, window)?;
+        store.ensure_device(tensor_id)?;
+        let shape = store
+            .get(tensor_id)
+            .ok_or(AutogradError::InvalidTensorId(tensor_id))?
+            .shape
+            .clone();
+        Ok(DeviceLogits { tensor_id, shape })
     }
 }
 
