@@ -111,9 +111,9 @@ If 2.A fails(Marlin OOM at cap=8),skip to 2.B(no kernel risk)。
 
 ## Cross-references
 
-- Plan main: [`a25416b`](../plans/M_ttft-p99-tail-latency.md)
+- Plan main: `a25416b` (historical reference, file removed)
 - Phase 0 H1 confirmed: [`ec7fe9d`](2026-05-08-ttft-p99-h1-prefill-cap-4-confirmed.md)
-- Phase 1 NULL wrong-workload: [`099c7bd`](2026-05-08-ttft-p99-phase1-null-wrong-workload.md)
+- Phase 1 NULL wrong-workload: `099c7bd` (historical reference, file removed)
 - Original signal: `f5cf829` W4 c=8 8K
 - Concurrency sweep: `8588f6a`
 - 3-shape grid: `c4fae17`

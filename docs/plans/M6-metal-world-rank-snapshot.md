@@ -38,7 +38,7 @@ cross-backend M6 matrix is a clean A/B by backend:
 Skip W4/c=64 in the snapshot — use W3/c=16 as the high-conc cell
 because the canonical scheduler runtime currently caps Metal hot-path
 concurrency at single-digit slots until Tier B#1 paged-KV wires through
-([recalibration §B1](../projects/2026-05-07-metal-world-first-recalibration-vs-unification.md)).
+([strategy §B1](../projects/2026-05-07-metal-world-first-strategy.md)).
 Skip W7/W8 (64k/128k) because mlx-lm currently does not ship a
 matched-format public baseline at those lengths on M-series. They land
 when M_e adds a custom long-context Apple-Silicon baseline.

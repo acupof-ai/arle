@@ -226,4 +226,4 @@ revertable.
 - Layer 1 runbook (zero-code config approach):
   [`docs/resources/eli-integration.md`](../resources/eli-integration.md).
 - Tier-A acceptance gates from gap analysis:
-  [`2026-05-07-metal-world-first-gap-analysis.md`](2026-05-07-metal-world-first-gap-analysis.md).
+  [`2026-05-07-metal-world-first-strategy.md`](2026-05-07-metal-world-first-strategy.md).

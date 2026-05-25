@@ -137,9 +137,9 @@ toward English text — this is REAL signal.
 
 ## Cross-references
 
-- H3 row-stride confirmed: [`2026-05-08-w4a8-bug-h3-confirmed-perms-row-stride.md`](2026-05-08-w4a8-bug-h3-confirmed-perms-row-stride.md) (`25391f3`)
+- H3 row-stride confirmed: `2026-05-08-w4a8-bug-h3-confirmed-perms-row-stride.md` (`25391f3`; historical reference, file removed)
 - H3 row-fix partial: [`2026-05-08-w4a8-h3-row-fix-partial.md`](2026-05-08-w4a8-h3-row-fix-partial.md) (`62f885d`)
-- H3b scale_perm_single confirmed: [`2026-05-08-w4a8-bug-h3b-confirmed-scale-perm-single-deleted.md`](2026-05-08-w4a8-bug-h3b-confirmed-scale-perm-single-deleted.md) (`3479a87`)
+- H3b scale_perm_single confirmed: `2026-05-08-w4a8-bug-h3b-confirmed-scale-perm-single-deleted.md` (`3479a87`; historical reference, file removed)
 - W4A8 garbage gate: [`../experience/errors/2026-05-08-w4a8-quantize-broken-100pct-token-diff.md`](../experience/errors/2026-05-08-w4a8-quantize-broken-100pct-token-diff.md) (`81b6481`)
 - ARLE script (current state with H3 + H3b): `/tmp/quantize_qwen3_w4a8.py`
 - PR #31 reference: `/tmp/marlin-w4a8/marlin/__init__.py:263-310`

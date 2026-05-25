@@ -4,7 +4,8 @@
 now implies `tilelang-attn` (see `crates/cuda-kernels/Cargo.toml`); every
 `--features cuda` build uses the TileLang prefill HD128 kernel. The
 matched A/B that motivated the promotion is at
-[`docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-tilelang-prefill-causal-bound.md`](../experience/wins/2026-04-28-bench-guidellm-cuda-l4-tilelang-prefill-causal-bound.md):
+`docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-tilelang-prefill-causal-bound.md`
+(historical reference, file removed):
 TTFT p50 -82%, out tok/s +5.1% vs FlashInfer at c=16/4096-in/Qwen3-4B/L4
 after Patches A (causal-bound KV loop) + C (page-lookup hoist) landed.
 
@@ -244,7 +245,8 @@ project and warrant their own evaluation.
   Rust dispatch swap, no new kernel, no `.cu` changes. Default builds
   remain on FlashInfer; `--features tilelang-attn` enables the alias.
   Pending-remote bench stub:
-  [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-tc-decode-hd128-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-tc-decode-hd128-pending-remote.md).
+  `docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-tc-decode-hd128-pending-remote.md`
+  (historical reference, file removed).
 
 - **Tranche 2 (HD256 paged-prefill swap) — landed 2026-04-27.** Wires
   the new TileLang HD256 paged-prefill kernel
@@ -261,7 +263,8 @@ project and warrant their own evaluation.
   `PagedPrefillBuffers35::plan` field stays under both cfg arms (allocated
   but unused under tilelang-attn — "不着急删除"). Pending-remote bench
   stub:
-  [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-prefill-hd256-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-prefill-hd256-pending-remote.md).
+  `docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-prefill-hd256-pending-remote.md`
+  (historical reference, file removed).
 
 - **Tranche 3 (HD256 paged-decode swap) — landed 2026-04-27.** Wires the
   new TileLang HD256 paged-decode kernel
@@ -279,7 +282,8 @@ project and warrant their own evaluation.
   clean by giving decode its own `tilelang_decode_hd256_decl!` macro
   (identical fill rules to the prefill twin). Pending-remote bench
   stub:
-  [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-decode-hd256-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-decode-hd256-pending-remote.md).
+  `docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-decode-hd256-pending-remote.md`
+  (historical reference, file removed).
 
 - **Tranche 5 (single-prefill HD128/HD256, contiguous-KV) — landed
   2026-04-27, Option A: contiguous-KV single-prefill paths deliberately
@@ -304,7 +308,8 @@ project and warrant their own evaluation.
   and with the project rule "不着急删除". **No code change** in this
   tranche — doc-only ledger entry so the next iteration of "全部接入"
   does not re-investigate. Decision recorded:
-  [`docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-single-prefill-hd128-hd256-pending-remote.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-single-prefill-hd128-hd256-pending-remote.md).
+  `docs/experience/wins/2026-04-27-bench-guidellm-cuda-tilelang-single-prefill-hd128-hd256-pending-remote.md`
+  (historical reference, file removed).
 
 ### Codex review pass (≥3 rounds, per user requirement)
 

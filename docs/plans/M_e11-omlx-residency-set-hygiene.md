@@ -159,4 +159,5 @@ with `max_tokens=8192` (above the 4096 threshold). Predicate:
   [`infer/src/backend/metal/runtime.rs`](../../infer/src/backend/metal/runtime.rs)
   + [`request_state.rs::decode_qwen35_packed_batch`](../../infer/src/backend/metal/request_state.rs)
 - Long-context bench reference:
-  [`docs/experience/wins/2026-04-30-longctx-32k-128k-leadership.md`](../experience/wins/2026-04-30-longctx-32k-128k-leadership.md)
+  `docs/experience/wins/2026-04-30-longctx-32k-128k-leadership.md`
+  (historical reference, file removed)

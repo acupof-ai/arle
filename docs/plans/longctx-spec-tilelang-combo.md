@@ -145,7 +145,7 @@ linear-attn 层在 spec-verify 下需要的 hidden state checkpoint/rollback:
 
 - **TileLang 0.1.9 版本能力**:fuse draft+verify kernel 依赖 TileLang 支持 multi-output 同步;若不支持降级到 separate-launch 但保留 prefix shmem 复用。
 - **GDR rollback 状态空间**:每层 hidden_state ~ kv_dim × hidden,如果 num_layers ≥ 60 单次 snapshot 可能 ≥ 数百 MB。回退方案:只对 spec-verify 段(typically 前几层)做 snapshot,后面层用 deterministic re-replay。
-- **spec-decode 与 batched-decode 数值漂移**:目前未修的 deferred bug([2026-04-13](../experience/errors/2026-04-13-batched-decode-high-concurrency.md))会让 spec-verify 看到的 logits 在 B=K vs B=1 不一致 → 接受率下降。M_a 落地前必须先 close 那个 bug 或确认其 ULP 漂移不影响接受率(需测量)。
+- **spec-decode 与 batched-decode 数值漂移**:目前未修的 deferred bug(2026-04-13, historical reference, file removed)会让 spec-verify 看到的 logits 在 B=K vs B=1 不一致 → 接受率下降。M_a 落地前必须先 close 那个 bug 或确认其 ULP 漂移不影响接受率(需测量)。
 
 ---
 

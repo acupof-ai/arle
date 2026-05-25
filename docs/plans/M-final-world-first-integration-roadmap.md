@@ -38,8 +38,8 @@
 proved wrong — Phase 1A v3 implementation REGRESSED long-ctx
 (TTFT +132%) before fix landed. The fix (default Split, multi-slot
 ring as substrate) ended up being NET POSITIVE +25.6% via incidental
-gain. Lesson recorded in
-[`feedback_docs_priority_roi_evidence.md`](../../../.claude/projects/-home-ckl-projects-arle/memory/feedback_docs_priority_roi_evidence.md).
+gain. Lesson recorded in `feedback_docs_priority_roi_evidence.md`
+(historical reference, file removed).
 
 ## Current state (2026-05-07 EOD)
 

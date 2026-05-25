@@ -441,8 +441,8 @@ alone restores single-SM AOT behavior.
 - [`tilelang-integration-verification.md`](tilelang-integration-verification.md)
   §5 — the H100-driven Phase 0 thresholds that **continue to apply**
   on top of this gate.
-- [`../experience/wins/2026-04-27-bench-guidellm-cuda-l4-qwen35-0p8b-packed-gguf.md`](../experience/wins/2026-04-27-bench-guidellm-cuda-l4-qwen35-0p8b-packed-gguf.md)
-  — sm_89 baseline.
+- `../experience/wins/2026-04-27-bench-guidellm-cuda-l4-qwen35-0p8b-packed-gguf.md`
+  — sm_89 baseline (historical reference, file removed).
 - [`../experience/wins/2026-04-28-bench-guidellm-multi-sm-{80,86,89,90}.md`](../experience/wins/)
   — the four pending-remote stubs this runbook retires.
 - [`../environment.md`](../environment.md) §`TORCH_CUDA_ARCH_LIST` — env var reference.

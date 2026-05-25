@@ -119,7 +119,7 @@ result。
 
 ## Cross-references
 
-- Methodology retrospective: [`3cee2f0`](2026-05-08-w4a8-methodology-retrospective-wrong-class.md)
+- Methodology retrospective: `3cee2f0` (historical reference, file removed)
 - Audit clean: [`01ace86`](2026-05-08-w4a8-kernel-and-wiring-audit-clean.md)
 - Multi-shape diag: [`4aebcec`](2026-05-08-w4a8-pack-roundtrip-diag-confirms-broken.md)(actually confirmed prod-shape PASS)
 - Diag tool: `scripts/diag_w4a8_pack_roundtrip.py`

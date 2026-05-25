@@ -169,7 +169,7 @@ Goal: remove contradictions and fix verified runtime-contract bugs.
 - align DFlash status across README/support/stability docs
 - align canonical `guidellm` parameters across script/plan/template
 - remove active references to deprecated throughput-sweep tooling where the canonical path is already established
-- bench evidence for the runtime slice: [`docs/experience/wins/2026-04-20-bench-guidellm-cuda-paged-prefill-contract-fix.md`](../experience/wins/2026-04-20-bench-guidellm-cuda-paged-prefill-contract-fix.md)
+- bench evidence for the runtime slice: `docs/experience/wins/2026-04-20-bench-guidellm-cuda-paged-prefill-contract-fix.md` (historical reference, file removed)
 
 ### Tranche T1 — boundary tightening
 

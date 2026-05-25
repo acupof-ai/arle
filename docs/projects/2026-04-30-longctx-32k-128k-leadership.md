@@ -432,7 +432,7 @@ Phase 1 SGLang-row close 结论：
 - Bench 协议：[`../bench-and-trace-spec.md`](../bench-and-trace-spec.md)
 - Bench 矩阵设计：[`../plans/bench-matrix-design-2026-04-29.md`](../plans/bench-matrix-design-2026-04-29.md)
 - 数值漂移历史：[`../experience/errors/2026-04-30-arle-fp8kv-numerical-drift.md`](../experience/errors/2026-04-30-arle-fp8kv-numerical-drift.md)
-- TileLang 盲区先例：[`../experience/errors/2026-04-28-tilelang-prefill-short-qlen-nan.md`](../experience/errors/2026-04-28-tilelang-prefill-short-qlen-nan.md)
+- TileLang 盲区先例：`../experience/errors/2026-04-28-tilelang-prefill-short-qlen-nan.md` (historical reference, file removed)
 - 反速 模式：`feedback_no_speculative_interface_shaping.md`、`feedback_no_half_states.md`
 
 ### 论文 / 系统引用

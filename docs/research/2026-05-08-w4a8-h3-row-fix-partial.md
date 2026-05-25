@@ -121,8 +121,8 @@ qualitative information. With methodology, partial-fix is real progress.
 
 ## Cross-references
 
-- H3 confirmed: [`2026-05-08-w4a8-bug-h3-confirmed-perms-row-stride.md`](2026-05-08-w4a8-bug-h3-confirmed-perms-row-stride.md) (`25391f3`)
-- H3 mechanism: [`2026-05-08-w4a8-bug-h3-mechanism.md`](2026-05-08-w4a8-bug-h3-mechanism.md) (`e3ca4d8`)
+- H3 confirmed: `2026-05-08-w4a8-bug-h3-confirmed-perms-row-stride.md` (`25391f3`; historical reference, file removed)
+- H3 mechanism: `2026-05-08-w4a8-bug-h3-mechanism.md` (`e3ca4d8`; historical reference, file removed)
 - W4A8 garbage gate: [`../experience/errors/2026-05-08-w4a8-quantize-broken-100pct-token-diff.md`](../experience/errors/2026-05-08-w4a8-quantize-broken-100pct-token-diff.md) (`81b6481`)
 - PR #31 reference (per codex): see `25391f3`
 - Failing test: `infer/tests/greedy_consistency.rs::test_w4a8_vs_bf16_token_diff`

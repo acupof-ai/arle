@@ -341,7 +341,7 @@ M0 Day 5:
 | 2026-04-18 | Plan + project doc + research note 提交 | ✅ | 锁定 scope v3；准备开工 M0 |
 | 2026-04-18 | M0–M1 Autograd + 核心 op + AdamW | ✅ | TinyLM (~8.4M) CPU SFT 收敛到位；保留为历史 scaffolding，不是当前 train-side model line |
 | 2026-04-18 | M2a LoRA on TinyLM (self-contained) | ✅ | frozen base + rank-r adapters, grad 仅流向 A/B；保留为历史 scaffolding |
-| 2026-04-18 | M2b LoRA hook into Qwen3 `linear.rs` | ✅ | 走 [`m2b-blocker-analysis.md`](m2b-blocker-analysis.md) 选项 (b)：`LoRAAdapter { a/b: DeviceMatrix }` 落在 `infer/src/model/qwen3/lora.rs`（不与 train `TensorStore` 共享），PEFT loader + additive apply ops + prefill/decode hot-path wiring + synthetic safetensors integration test；这仍是 Qwen3-era 历史实现记录，不是当前 train-side 主线；CUDA Graph decode 在 LoRA 激活时自动降级为 eager（`supports_cuda_graph_decode`），warmup 仍跑两遍以预热 cublasLt autotune cache；train↔infer gradient loop 仍走选项 (a)/M1-CUDA, 未在此 phase 内 |
+| 2026-04-18 | M2b LoRA hook into Qwen3 `linear.rs` | ✅ | 走 `m2b-blocker-analysis.md` 选项 (b)（historical reference, file removed）：`LoRAAdapter { a/b: DeviceMatrix }` 落在 `infer/src/model/qwen3/lora.rs`（不与 train `TensorStore` 共享），PEFT loader + additive apply ops + prefill/decode hot-path wiring + synthetic safetensors integration test；这仍是 Qwen3-era 历史实现记录，不是当前 train-side 主线；CUDA Graph decode 在 LoRA 激活时自动降级为 eager（`supports_cuda_graph_decode`），warmup 仍跑两遍以预热 cublasLt autotune cache；train↔infer gradient loop 仍走选项 (a)/M1-CUDA, 未在此 phase 内 |
 | 2026-04-18 | M3 GRPO 单 verifier 闭环 | ✅ | rollout_group + group_advantages + PPO-clip surrogate |
 | 2026-04-18 | M3.5 PPO clip + multi-verifier scaffolding | ✅ | host-space active-mask；Copy/ReverseCopy/Palette/WeightedEnsemble |
 | 2026-04-18 | M4.1 Multi-turn episode scaffolding | ✅ | Episode / TurnSpec / Environment / rollout_episode |

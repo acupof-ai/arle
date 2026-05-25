@@ -74,7 +74,8 @@ this plan is DX-2 / DX-3 follow-through, not the `latest` marker flow.
   once at entry, `publish_latest_after_weights(parent, basename)` helper
   + 3 unit tests pinning the publish-last contract. Closed both remaining
   codex findings on `8bde810`. See
-  [`wins/2026-04-20-dx1-publish-last-helper-and-canonicalize.md`](../experience/wins/2026-04-20-dx1-publish-last-helper-and-canonicalize.md).
+  `wins/2026-04-20-dx1-publish-last-helper-and-canonicalize.md`
+  (historical reference, file removed).
 
 ### Phase DX-2 — Standalone eval binary
 

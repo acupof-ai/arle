@@ -67,7 +67,7 @@ three commits, all CPU-typecheck clean under both
   green; cli regression tests still 66/66.
 
 The smoke test
-[`infer/tests/dsv4_nano_smoke.rs`](../../infer/tests/dsv4_nano_smoke.rs)
+`infer/tests/dsv4_nano_smoke.rs` (historical reference, file removed)
 constructs the nano model and runs `forward_prefill` on tiny synthetic
 input, asserting the logits shape. It is `#[ignore]`'d today because
 every entry point is `todo!()`; remove the `#[ignore]` as part of the
@@ -161,7 +161,7 @@ remain the next runtime blocker.
 
 ## 3. Tokenizer & Data
 
-- **65 k 词表 BPE**, 使用 [`crates/train/examples/build_bpe_tokenizer.rs`](../../crates/train/examples/build_bpe_tokenizer.rs) 已有的 trainer。容量为 V3 的一半 (V3 = 129 280), 节省约 60 MB BF16 vocab embedding。
+- **65 k 词表 BPE**, 使用 `crates/train/examples/build_bpe_tokenizer.rs` 已有的 trainer（historical reference, file removed）。容量为 V3 的一半 (V3 = 129 280), 节省约 60 MB BF16 vocab embedding。
 - **数据配比** (按 token 体积): 英 50% / 中 30% / code 15% / math 5%。
   - 英: The Pile v2 (去 Books3) + FineWeb-Edu 高质量子集
   - 中: Wudao 开放子集
@@ -214,7 +214,8 @@ remain the next runtime blocker.
 CUDA 上 BF16 MLA forward 复用 FlashInfer 0.6.x 的 MLA kernel family
 (Apache-2.0, build-time 已 vendored 在 `crates/cuda-kernels/build.rs`
 `find_flashinfer_include` 路径)。包装层落在
-[`crates/cuda-kernels/csrc/attention/flashinfer_mla.cu`](../../crates/cuda-kernels/csrc/attention/flashinfer_mla.cu),
+`crates/cuda-kernels/csrc/attention/flashinfer_mla.cu`
+(historical reference, file removed),
 对外 `extern "C"` 接口在
 [`crates/cuda-kernels/src/ffi/attention.rs`](../../crates/cuda-kernels/src/ffi/attention.rs)
 最末尾两条 `flashinfer_mla_paged_attention_{plan,run}` 声明:
