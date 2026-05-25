@@ -132,11 +132,15 @@ impl KernelCache {
 
         #[cfg(not(feature = "no-cuda"))]
         {
-            let ptx = compile_ptx(concat_sources()).map_err(|_| {
-                AutogradError::TapeInvariant("nvrtc compile_ptx failed for autograd kernels")
+            let ptx = compile_ptx(concat_sources()).map_err(|err| {
+                cuda_kernel_error(format!(
+                    "nvrtc compile_ptx failed for autograd kernels: {err:?}"
+                ))
             })?;
-            let module = ctx.load_module(ptx).map_err(|_| {
-                AutogradError::TapeInvariant("cuda load_module failed for autograd kernels")
+            let module = ctx.load_module(ptx).map_err(|err| {
+                cuda_kernel_error(format!(
+                    "cuda load_module failed for autograd kernels: {err:?}"
+                ))
             })?;
             let functions = FUNCTION_NAMES
                 .iter()
@@ -144,10 +148,10 @@ impl KernelCache {
                     module
                         .load_function(name)
                         .map(|function| (name, function))
-                        .map_err(|_| {
-                            AutogradError::TapeInvariant(
-                                "cuda load_function failed for autograd kernel",
-                            )
+                        .map_err(|err| {
+                            cuda_kernel_error(format!(
+                                "cuda load_function failed for autograd kernel {name}: {err:?}"
+                            ))
                         })
                 })
                 .collect::<Result<HashMap<_, _>>>()?;
@@ -163,6 +167,11 @@ impl KernelCache {
             "autograd cuda kernel not found in cache",
         ))
     }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_kernel_error(message: String) -> AutogradError {
+    AutogradError::TapeInvariant(Box::leak(message.into_boxed_str()))
 }
 
 pub(super) fn launch_rows<'a, F>(
