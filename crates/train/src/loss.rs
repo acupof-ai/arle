@@ -3,6 +3,8 @@ use autograd::{
     ops::{add, gather_last_dim, log_softmax, mean, mul, mul_scalar, slice, softmax},
 };
 
+pub const DEFAULT_KL_CHUNK_SIZE: usize = 32;
+
 pub fn cross_entropy_loss(
     logits_id: TensorId,
     targets: &[usize],

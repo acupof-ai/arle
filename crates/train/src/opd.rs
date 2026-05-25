@@ -25,7 +25,7 @@ use std::{collections::HashSet, time::Instant};
 
 use crate::{
     grad_clip::clip_grad_norm,
-    loss::{cross_entropy_loss, kl_distill_loss, kl_distill_loss_chunked},
+    loss::{DEFAULT_KL_CHUNK_SIZE, cross_entropy_loss, kl_distill_loss, kl_distill_loss_chunked},
     qwen35::{
         Qwen35Error, Qwen35KvCache, Qwen35Model, forward_rollout_cached,
         forward_rollout_cached_device_token,
@@ -95,7 +95,7 @@ impl Default for GkdLossConfig<'_> {
             lambda: 0.0,
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
-            kl_chunk_size: None,
+            kl_chunk_size: Some(DEFAULT_KL_CHUNK_SIZE),
         }
     }
 }
@@ -467,8 +467,8 @@ fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> {
     if config.kl_chunk_size == Some(0) {
         return Err(OpdError::InvalidInput(
             "OPD KL chunk size must be > 0 when set. Hint: pass \
-             --kl-chunk-size 64 for the 512-token real-corpus smoke, or omit \
-             it to keep the baseline full-logits KL path."
+             --kl-chunk-size 32 for the 256-token rollout bench, or set an \
+             explicit larger value after a memory check."
                 .to_owned(),
         ));
     }
@@ -1002,9 +1002,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForwar
         tape,
         GkdLossConfig {
             lambda: gkd_lambda,
-            sft_anchor: GkdSftAnchor::StudentRollout,
-            corpus_tokens: None,
-            kl_chunk_size: None,
+            ..GkdLossConfig::default()
         },
         profile,
     )
