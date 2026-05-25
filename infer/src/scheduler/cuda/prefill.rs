@@ -536,8 +536,18 @@ impl<M: ModelForward> Scheduler<M> {
         // which hard-asserts `page_size == 16` (see `ops/attention.rs:617`).
         // TurboQuant pools allocate `page_size = 1` until a token-granular
         // paged-prefill kernel lands, so route those through the contiguous
-        // BF16 prefill path and migrate via `migrate_from_contiguous_turboquant_range`
-        // at completion (handled below in `prepare_prefill_completion`).
+        // BF16 prefill path and migrate via `migrate_from_contiguous_*` at
+        // completion (handled below in `prepare_prefill_completion`).
+        //
+        // FP8E4M3 stays on the paged path despite the 2026-05-26 token-1
+        // divergence: routing FP8 through the non-paged path (legacy CUDA
+        // prefill kernel) produces step-0 divergence vs BF16 because the
+        // two prefill kernels are not bit-identical even at the same KV
+        // precision — TileLang HD128 paged vs legacy CUDA non-paged. The
+        // FP8 dispatch bug stays known-broken until Phase 3 lands proper
+        // diagnostics; auto-default has already been routed off FP8 to
+        // protect production. See
+        // `docs/experience/errors/2026-05-26-fp8-kv-step1-divergence-known-deferred.md`.
         let uses_paged = self.model.prefill_uses_paged_pool()
             && self.paged_kv_pool.is_active()
             && self.paged_kv_pool.page_size == 16;
