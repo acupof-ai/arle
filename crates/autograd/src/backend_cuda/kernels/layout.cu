@@ -92,6 +92,33 @@ extern "C" __global__ void concat_axis2_f32(
     }
 }
 
+extern "C" __global__ void kv_cache_write_axis2_f32(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    int batch,
+    int heads,
+    int max_seq,
+    int src_seq,
+    int dim,
+    int seq_offset,
+    int total
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int dim_idx = idx % dim;
+    int tmp = idx / dim;
+    int seq_idx = tmp % src_seq;
+    tmp /= src_seq;
+    int head_idx = tmp % heads;
+    int batch_idx = tmp / heads;
+    if (batch_idx >= batch) return;
+
+    int dst_idx =
+        (((batch_idx * heads + head_idx) * max_seq + seq_offset + seq_idx) * dim) + dim_idx;
+    dst[dst_idx] = src[idx];
+}
+
 extern "C" __global__ void slice_backward_f32(
     float* __restrict__ grad,
     const float* __restrict__ upstream,

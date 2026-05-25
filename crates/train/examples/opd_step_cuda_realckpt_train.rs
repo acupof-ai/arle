@@ -948,7 +948,7 @@ pub mod app {
         }
         tape.entries.clear();
         tape.set_enabled(false);
-        let mut cache = Qwen35KvCache::new(model);
+        let mut cache = Qwen35KvCache::new(model, prompt.len() + decode_len);
         let mut tokens = prompt.to_vec();
         let mut suffix = Vec::with_capacity(decode_len);
         let vocab = model.config().vocab_size;

@@ -16,8 +16,8 @@ use crate::{
     AutogradError,
     backend::{
         CudaBf16Storage, CudaStorage, matmul_bt_output_shape, matmul_output_shape,
-        validate_broadcast, validate_decode_gqa_shapes, validate_qwen_decode_prepare_kv_shapes,
-        validate_qwen_decode_prepare_q_shapes,
+        validate_broadcast, validate_decode_gqa_cache_shapes, validate_decode_gqa_shapes,
+        validate_qwen_decode_prepare_kv_shapes, validate_qwen_decode_prepare_q_shapes,
     },
 };
 use crate::{
@@ -1702,6 +1702,25 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn kv_cache_write_axis2(
+        &self,
+        dst: &DeviceHandle,
+        dst_shape: &[usize],
+        src: &DeviceHandle,
+        src_shape: &[usize],
+        seq_offset: usize,
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (dst, dst_shape, src, src_shape, seq_offset);
+            todo!("GPU required: cuda kv_cache_write_axis2 is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_kv_cache_write_axis2(self, dst, dst_shape, src, src_shape, seq_offset)
+        }
+    }
+
     fn causal_sdpa_decode_gqa(
         &self,
         q: &DeviceHandle,
@@ -1720,6 +1739,32 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_causal_sdpa_decode_gqa(self, q, q_shape, k, k_shape, v, v_shape, q_start)
+        }
+    }
+
+    fn causal_sdpa_decode_gqa_cache(
+        &self,
+        q: &DeviceHandle,
+        q_shape: &[usize],
+        k: &DeviceHandle,
+        k_shape: &[usize],
+        v: &DeviceHandle,
+        v_shape: &[usize],
+        kv_len: usize,
+        q_start: usize,
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (q, q_shape, k, k_shape, v, v_shape, kv_len, q_start);
+            todo!(
+                "GPU required: cuda causal_sdpa_decode_gqa_cache is unavailable under feature no-cuda"
+            )
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_causal_sdpa_decode_gqa_cache(
+                self, q, q_shape, k, k_shape, v, v_shape, kv_len, q_start,
+            )
         }
     }
 
@@ -5108,6 +5153,95 @@ fn cuda_concat_axis2_device(
 }
 
 #[cfg(not(feature = "no-cuda"))]
+fn cuda_kv_cache_write_axis2(
+    backend: &CudaBackend,
+    dst: &DeviceHandle,
+    dst_shape: &[usize],
+    src: &DeviceHandle,
+    src_shape: &[usize],
+    seq_offset: usize,
+) -> Result<DeviceHandle> {
+    if dst_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: dst_shape.len(),
+        });
+    }
+    if src_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: src_shape.len(),
+        });
+    }
+    if dst_shape[0] != src_shape[0] || dst_shape[1] != src_shape[1] || dst_shape[3] != src_shape[3]
+    {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![dst_shape[0], dst_shape[1], dst_shape[3]],
+            got: vec![src_shape[0], src_shape[1], src_shape[3]],
+        });
+    }
+    if seq_offset + src_shape[2] > dst_shape[2] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![dst_shape[2]],
+            got: vec![seq_offset + src_shape[2]],
+        });
+    }
+    let dst_total = shape_size(dst_shape);
+    let src_total = shape_size(src_shape);
+    let d_dst = backend.cuda_slice(dst, "kv_cache_write_axis2")?;
+    let d_src = backend.cuda_slice(src, "kv_cache_write_axis2")?;
+    if d_dst.len() != dst_total {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_dst.len(),
+            shape: dst_shape.to_vec(),
+            size: dst_total,
+        });
+    }
+    if d_src.len() != src_total {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_src.len(),
+            shape: src_shape.to_vec(),
+            size: src_total,
+        });
+    }
+
+    let batch_i = i32::try_from(dst_shape[0])
+        .map_err(|_| AutogradError::TapeInvariant("cuda kv write batch exceeds i32"))?;
+    let heads_i = i32::try_from(dst_shape[1])
+        .map_err(|_| AutogradError::TapeInvariant("cuda kv write heads exceeds i32"))?;
+    let max_seq_i = i32::try_from(dst_shape[2])
+        .map_err(|_| AutogradError::TapeInvariant("cuda kv write max_seq exceeds i32"))?;
+    let src_seq_i = i32::try_from(src_shape[2])
+        .map_err(|_| AutogradError::TapeInvariant("cuda kv write src_seq exceeds i32"))?;
+    let dim_i = i32::try_from(dst_shape[3])
+        .map_err(|_| AutogradError::TapeInvariant("cuda kv write dim exceeds i32"))?;
+    let offset_i = i32::try_from(seq_offset)
+        .map_err(|_| AutogradError::TapeInvariant("cuda kv write offset exceeds i32"))?;
+    let total_i = i32::try_from(src_total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda kv write total exceeds i32"))?;
+
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("kv_cache_write_axis2_f32")?,
+        src_total,
+        |mut builder| {
+            builder
+                .arg(d_dst)
+                .arg(d_src)
+                .arg(&batch_i)
+                .arg(&heads_i)
+                .arg(&max_seq_i)
+                .arg(&src_seq_i)
+                .arg(&dim_i)
+                .arg(&offset_i)
+                .arg(&total_i);
+            builder
+        },
+    )?;
+    Ok(dst.clone())
+}
+
+#[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
 fn cuda_causal_sdpa_decode_gqa(
     backend: &CudaBackend,
@@ -5192,6 +5326,106 @@ fn cuda_causal_sdpa_decode_gqa(
                 .arg(&batch_i)
                 .arg(&query_heads_i)
                 .arg(&kv_heads_i)
+                .arg(&kv_len_i)
+                .arg(&head_dim_i)
+                .arg(&q_start_i)
+                .arg(&scale);
+            builder
+        },
+    )?;
+    Ok((DeviceHandle::Cuda(CudaStorage::new(d_out)), out_shape))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn cuda_causal_sdpa_decode_gqa_cache(
+    backend: &CudaBackend,
+    q: &DeviceHandle,
+    q_shape: &[usize],
+    k: &DeviceHandle,
+    k_shape: &[usize],
+    v: &DeviceHandle,
+    v_shape: &[usize],
+    kv_len: usize,
+    q_start: usize,
+) -> Result<(DeviceHandle, Vec<usize>)> {
+    validate_decode_gqa_cache_shapes(q_shape, k_shape, v_shape, kv_len, q_start)?;
+
+    let d_q = backend.cuda_slice(q, "causal_sdpa_decode_gqa_cache")?;
+    let d_k = backend.cuda_slice(k, "causal_sdpa_decode_gqa_cache")?;
+    let d_v = backend.cuda_slice(v, "causal_sdpa_decode_gqa_cache")?;
+    let q_size = shape_size(q_shape);
+    let k_size = shape_size(k_shape);
+    let v_size = shape_size(v_shape);
+    if d_q.len() != q_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_q.len(),
+            shape: q_shape.to_vec(),
+            size: q_size,
+        });
+    }
+    if d_k.len() != k_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_k.len(),
+            shape: k_shape.to_vec(),
+            size: k_size,
+        });
+    }
+    if d_v.len() != v_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_v.len(),
+            shape: v_shape.to_vec(),
+            size: v_size,
+        });
+    }
+
+    let out_shape = vec![q_shape[0], q_shape[1], 1, q_shape[3]];
+    let out_total = shape_size(&out_shape);
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(out_total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (cache decode sdpa)"))?;
+
+    let batch_i = i32::try_from(q_shape[0])
+        .map_err(|_| AutogradError::TapeInvariant("cuda cache decode batch exceeds i32"))?;
+    let query_heads_i = i32::try_from(q_shape[1])
+        .map_err(|_| AutogradError::TapeInvariant("cuda cache decode heads exceeds i32"))?;
+    let kv_heads_i = i32::try_from(k_shape[1])
+        .map_err(|_| AutogradError::TapeInvariant("cuda cache decode kv_heads exceeds i32"))?;
+    let max_seq_i = i32::try_from(k_shape[2])
+        .map_err(|_| AutogradError::TapeInvariant("cuda cache decode max_seq exceeds i32"))?;
+    let kv_len_i = i32::try_from(kv_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda cache decode kv_len exceeds i32"))?;
+    let head_dim_i = i32::try_from(q_shape[3])
+        .map_err(|_| AutogradError::TapeInvariant("cuda cache decode head_dim exceeds i32"))?;
+    let q_start_i = i32::try_from(q_start)
+        .map_err(|_| AutogradError::TapeInvariant("cuda cache decode q_start exceeds i32"))?;
+    let scale = 1.0_f32 / (q_shape[3] as f32).sqrt();
+    let rows = q_shape[0] * q_shape[1];
+    const BLOCK: u32 = 256;
+    let visible = q_start.saturating_add(1).min(kv_len);
+    let shared = BLOCK * std::mem::size_of::<f32>() as u32
+        + u32::try_from(visible)
+            .map_err(|_| AutogradError::TapeInvariant("cuda cache decode visible exceeds u32"))?
+            * std::mem::size_of::<f32>() as u32;
+    launch_rows(
+        &backend.stream,
+        backend
+            .kernels
+            .function("causal_sdpa_decode_gqa_cache_f32")?,
+        rows,
+        BLOCK,
+        shared,
+        |mut builder| {
+            builder
+                .arg(d_q)
+                .arg(d_k)
+                .arg(d_v)
+                .arg(&mut d_out)
+                .arg(&batch_i)
+                .arg(&query_heads_i)
+                .arg(&kv_heads_i)
+                .arg(&max_seq_i)
                 .arg(&kv_len_i)
                 .arg(&head_dim_i)
                 .arg(&q_start_i)
