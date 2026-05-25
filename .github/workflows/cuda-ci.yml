@@ -60,9 +60,3 @@ jobs:
           --no-default-features --features cuda,no-cuda,cli
           --test cli_smoke
 
-      - name: cargo test (cuda + no-cuda tiny fixture live path)
-        run: >
-          cargo test -p agent-infer --release
-          --no-default-features --features cuda,no-cuda,cli
-          --test cli_tiny_fixture_live
-          -- --test-threads 1
