@@ -117,14 +117,6 @@ jobs:
       - name: cargo test (metal + no-cuda CLI unit tests)
         run: cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer --release
 
-      - name: cargo test (metal + no-cuda tiny fixture live path)
-        run: >
-          cargo test
-          --no-default-features --features metal,no-cuda,cli
-          -p agent-infer --release
-          --test cli_tiny_fixture_live
-          -- --test-threads 1
-
       - name: cargo build metal_serve
         working-directory: infer
         run: >
