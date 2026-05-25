@@ -57,6 +57,7 @@ impl DeepseekIncrementalState {
     pub(crate) fn clear(&mut self) {
         self.processed_tokens = 0;
         self.layers.clear();
+        self.stream_recycle = None;
     }
 
     pub(crate) fn ensure_layers(&mut self, layers: usize) {
@@ -64,6 +65,29 @@ impl DeepseekIncrementalState {
             self.layers
                 .resize_with(layers, DeepseekLayerRuntimeCache::default);
         }
+    }
+
+    pub(crate) fn trim_prefill_scratch(&mut self) {
+        self.stream_recycle = None;
+        for layer in &mut self.layers {
+            layer.trim_prefill_scratch();
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl DeepseekLayerRuntimeCache {
+    fn trim_prefill_scratch(&mut self) {
+        self.stream_recycle = None;
+        self.attn_mhc = None;
+        self.ffn_mhc = None;
+        self.attn_pre = None;
+        self.attn_normed = None;
+        self.attn_post = None;
+        self.ffn_pre = None;
+        self.ffn_normed = None;
+        self.moe = DeepseekMoeRuntimeCache::default();
+        self.attention.trim_prefill_scratch();
     }
 }
 
@@ -158,6 +182,7 @@ pub(crate) struct DeepseekLocalRouteRuntimeScratch {
     pub(crate) expert_hidden: HiddenStates,
     pub(crate) expert_weight: CudaSlice<f32>,
     pub(crate) expert_route_slot: CudaSlice<i32>,
+    pub(crate) route_out: HiddenStates,
 }
 
 #[cfg(feature = "cuda")]
@@ -596,6 +621,7 @@ pub(crate) fn ensure_local_route_scratch<'a>(
             expert_hidden: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_routes)? },
             expert_weight: unsafe { ctx.stream.alloc_traced::<f32>(capacity_routes)? },
             expert_route_slot: unsafe { ctx.stream.alloc_traced::<i32>(capacity_routes)? },
+            route_out: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_routes)? },
         });
     }
     Ok(slot
@@ -852,6 +878,27 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     pub(crate) indexer_gpu: Option<DeepseekGpuCompressorRuntimeCache>,
 }
 
+#[cfg(feature = "cuda")]
+impl DeepseekAttentionRuntimeCache {
+    fn trim_prefill_scratch(&mut self) {
+        self.c_q = None;
+        self.c_q_normed = None;
+        self.q_raw = None;
+        self.kv_raw = None;
+        self.kv_normed = None;
+        self.q_prepared = None;
+        self.k_prepared = None;
+        self.local_attn = None;
+        self.output_latent = None;
+        if let Some(cache) = &mut self.compressed_gpu {
+            cache.trim_prefill_scratch();
+        }
+        if let Some(cache) = &mut self.indexer_gpu {
+            cache.trim_prefill_scratch();
+        }
+    }
+}
+
 #[cfg(all(test, feature = "cuda"))]
 pub(crate) struct DeepseekKvRow {
     pub(crate) pos: usize,
@@ -879,6 +926,14 @@ pub(crate) struct DeepseekGpuCompressorRuntimeCache {
     pub(crate) compressed_capacity: usize,
     pub(crate) pending_width: usize,
     pub(crate) head_dim: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl DeepseekGpuCompressorRuntimeCache {
+    fn trim_prefill_scratch(&mut self) {
+        self.kv_raw = None;
+        self.score_raw = None;
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]
