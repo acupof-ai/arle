@@ -31,6 +31,7 @@ use std::time::Instant;
 #[cfg(feature = "cuda")]
 use super::state::{
     DeepseekDsv4GroupedBlockFormat, DeepseekExpertRuntimeScratch,
+    DeepseekGroupedExpertActiveScratch, DeepseekGroupedExpertRuntimeScratch,
     DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_dispatch_payload_scratch,
     ensure_local_route_scratch, ensure_recv_route_scratch, ensure_route_logits_scratch,
     ensure_send_route_scratch,
@@ -651,9 +652,28 @@ pub(super) fn dsv4_try_build_deepgemm_expert_cache(
 ) -> Result<Option<DeepseekDsv4DeepGemmExpertCache>> {
     let backend = dsv4_expert_backend()?;
     let explicit_cache = dsv4_env_flag("ARLE_DSV4_DEEPGEMM_WEIGHT_CACHE")?;
-    let should_build = explicit_cache || matches!(backend, Dsv4ExpertBackend::DeepGemmRequired);
+    let should_build = explicit_cache || !matches!(backend, Dsv4ExpertBackend::Native);
     if !should_build {
         return Ok(None);
+    }
+    if !matches!(backend, Dsv4ExpertBackend::Native) {
+        let first = experts
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 DeepGEMM cache needs local experts"))?;
+        if let Err(err) = dsv4_validate_deepgemm_expert_backend(
+            ctx,
+            "expert cache",
+            &[&first.w1, &first.w3, &first.w2],
+        ) {
+            if matches!(backend, Dsv4ExpertBackend::DeepGemmRequired) {
+                return Err(err);
+            }
+            static LOGGED_PRECHECK: OnceLock<()> = OnceLock::new();
+            LOGGED_PRECHECK.get_or_init(|| {
+                info!("DeepSeek V4 DeepGEMM FP8 expert cache skipped before build: {err:#}");
+            });
+            return Ok(None);
+        }
     }
 
     match dsv4_build_deepgemm_expert_cache(ctx, experts) {
@@ -679,8 +699,8 @@ pub(super) fn dsv4_try_build_deepgemm_expert_cache(
         }
         Err(err) if matches!(backend, Dsv4ExpertBackend::DeepGemmRequired) => Err(err),
         Err(err) => {
-            static LOGGED: OnceLock<()> = OnceLock::new();
-            LOGGED.get_or_init(|| {
+            static LOGGED_BUILD_FAILURE: OnceLock<()> = OnceLock::new();
+            LOGGED_BUILD_FAILURE.get_or_init(|| {
                 info!(
                     "DeepSeek V4 DeepGEMM FP8 expert cache disabled after build failure: {err:#}"
                 );
@@ -1191,13 +1211,12 @@ fn dsv4_validate_deepgemm_expert_backend(
     );
 
     let (major, minor) = ctx.compute_capability();
-    bail!(
-        "DeepSeek V4 DeepGEMM backend for {path} is selected, but ARLE has not linked a raw-pointer DeepGEMM C ABI launcher yet. \
-         The load-time FP4/FP8 -> FP8 expert-weight cache boundary is wired, but the vendored DeepGEMM entrypoints are still PyTorch/JIT APIs. \
-         The next code step is a raw C ABI masked/contiguous grouped-GEMM launcher that consumes the resident FP8 cache. formats={} sm_{}{minor}",
-        dsv4_weight_format_summary(weights),
+    ensure!(
+        major == 9,
+        "DeepSeek V4 DeepGEMM backend for {path} currently targets SM90/Hopper, got sm_{}{minor}",
         major
-    )
+    );
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -1206,11 +1225,12 @@ fn dsv4_handle_deepgemm_expert_backend(
     backend: Dsv4ExpertBackend,
     path: &str,
     weights: &[&DeviceMatrix],
-) -> Result<()> {
+) -> Result<bool> {
     match backend {
-        Dsv4ExpertBackend::Native => Ok(()),
+        Dsv4ExpertBackend::Native => Ok(false),
         Dsv4ExpertBackend::DeepGemmRequired => {
-            dsv4_validate_deepgemm_expert_backend(ctx, path, weights)
+            dsv4_validate_deepgemm_expert_backend(ctx, path, weights)?;
+            Ok(true)
         }
         Dsv4ExpertBackend::DeepGemmAuto => {
             static LOGGED: OnceLock<()> = OnceLock::new();
@@ -1218,8 +1238,9 @@ fn dsv4_handle_deepgemm_expert_backend(
                 LOGGED.get_or_init(|| {
                     info!("DeepSeek V4 DeepGEMM auto fallback to native expert path: {err:#}");
                 });
+                return Ok(false);
             }
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -1605,7 +1626,7 @@ impl DeepseekV4MoeBlock {
             self.experts.len()
         );
         if let Some(first) = self.experts.first() {
-            dsv4_handle_deepgemm_expert_backend(
+            let _ = dsv4_handle_deepgemm_expert_backend(
                 ctx,
                 dsv4_expert_backend()?,
                 "local routed experts",
@@ -1874,6 +1895,261 @@ impl DeepseekV4MoeBlock {
         Ok(out)
     }
 
+    fn forward_deepgemm_grouped_dsv4_experts_gpu(
+        &self,
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        expert_hidden: &HiddenStates,
+        expert_route_slot: &CudaSlice<i32>,
+        expert_weight: &CudaSlice<f32>,
+        active: &DeepseekGroupedExpertActiveScratch,
+        active_experts: &[usize],
+        active_counts_host: &[i32],
+        total_local_routes: usize,
+        max_local_routes: usize,
+        route_out: &mut HiddenStates,
+        scratch: &mut DeepseekGroupedExpertRuntimeScratch,
+    ) -> Result<()> {
+        let cache = self.deepgemm_cache.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepSeek V4 DeepGEMM expert backend selected but FP8 expert cache is unavailable"
+            )
+        })?;
+        let first = self
+            .experts
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 DeepGEMM path needs local experts"))?;
+        let hidden_dim = expert_hidden.hidden_dim;
+        let intermediate_dim = first.w1.rows;
+        ensure!(
+            first.w1.rows == first.w3.rows
+                && first.w1.cols == hidden_dim
+                && first.w3.cols == hidden_dim
+                && first.w2.cols == intermediate_dim
+                && first.w2.rows == route_out.hidden_dim,
+            "DeepSeek V4 DeepGEMM grouped expert shape mismatch"
+        );
+        ensure!(
+            hidden_dim.is_multiple_of(128) && intermediate_dim.is_multiple_of(128),
+            "DeepSeek V4 DeepGEMM needs H and I aligned to 128, got H={} I={}",
+            hidden_dim,
+            intermediate_dim
+        );
+        ensure!(
+            cache.num_experts == self.experts.len()
+                && cache.w13.rows == cache.num_experts * intermediate_dim * 2
+                && cache.w13.cols == hidden_dim
+                && cache.w2.rows == cache.num_experts * hidden_dim
+                && cache.w2.cols == intermediate_dim,
+            "DeepSeek V4 DeepGEMM FP8 cache shape mismatch"
+        );
+        ensure!(
+            active_experts.len() == active_counts_host.len(),
+            "DeepSeek V4 DeepGEMM active expert/count length mismatch"
+        );
+
+        let mut masked_m_host = vec![0i32; cache.num_experts];
+        for (slot, &expert_idx) in active_experts.iter().enumerate() {
+            ensure!(
+                expert_idx < cache.num_experts,
+                "DeepSeek V4 DeepGEMM active expert {} out of range {}",
+                expert_idx,
+                cache.num_experts
+            );
+            masked_m_host[expert_idx] = active_counts_host[slot];
+        }
+
+        let dg = scratch.ensure_deepgemm_scratch(
+            ctx,
+            cache.num_experts,
+            max_local_routes,
+            hidden_dim,
+            intermediate_dim,
+        )?;
+        dg.out_compact.seq_len = total_local_routes;
+        ctx.stream
+            .memcpy_htod(&masked_m_host, &mut dg.masked_m)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM masked_m H2D failed: {err}"))?;
+        ctx.stream
+            .memset_zeros(&mut dg.input_fp8)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM input zero failed: {err}"))?;
+        ctx.stream
+            .memset_zeros(&mut dg.input_scales)
+            .map_err(|err| {
+                anyhow::anyhow!("DeepSeek V4 DeepGEMM input-scale zero failed: {err}")
+            })?;
+        ctx.stream
+            .memset_zeros(&mut dg.act_fp8)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM act zero failed: {err}"))?;
+        ctx.stream
+            .memset_zeros(&mut dg.act_scales)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM act-scale zero failed: {err}"))?;
+
+        let active_count_i32 = i32::try_from(active_experts.len())
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 DeepGEMM active count overflows i32"))?;
+        let max_m_i32 = i32::try_from(max_local_routes)
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 DeepGEMM max_m overflows i32"))?;
+        let hidden_i32 = i32::try_from(hidden_dim)
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 DeepGEMM hidden_dim overflows i32"))?;
+        let intermediate_i32 = i32::try_from(intermediate_dim)
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 DeepGEMM intermediate_dim overflows i32"))?;
+        let num_groups_i32 = i32::try_from(cache.num_experts)
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 DeepGEMM group count overflows i32"))?;
+        let scale_stride_m_i32 = i32::try_from(dg.scale_stride_m)
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 DeepGEMM scale stride overflows i32"))?;
+
+        {
+            let (input_ptr, _input_guard) = expert_hidden.data.device_ptr(&ctx.stream);
+            let (fp8_ptr, _fp8_guard) = dg.input_fp8.device_ptr_mut(&ctx.stream);
+            let (scale_ptr, _scale_guard) = dg.input_scales.device_ptr_mut(&ctx.stream);
+            let (active_ptr, _active_guard) = active.indices.device_ptr(&ctx.stream);
+            let (offset_ptr, _offset_guard) = active.offsets.device_ptr(&ctx.stream);
+            let (count_ptr, _count_guard) = active.counts.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
+                    input_ptr as *const ffi::Half,
+                    fp8_ptr as *mut u8,
+                    scale_ptr as *mut f32,
+                    active_ptr as *const i32,
+                    offset_ptr as *const i32,
+                    count_ptr as *const i32,
+                    active_count_i32,
+                    max_m_i32,
+                    hidden_i32,
+                    scale_stride_m_i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 DeepGEMM input pack/quantize failed: {err}")
+                })?;
+            }
+        }
+
+        {
+            let (a_ptr, _a_guard) = dg.input_fp8.device_ptr(&ctx.stream);
+            let (sfa_ptr, _sfa_guard) = dg.input_scales.device_ptr(&ctx.stream);
+            let (b_ptr, _b_guard) = cache.w13.weight.device_ptr(&ctx.stream);
+            let (sfb_ptr, _sfb_guard) = cache.w13.scales.device_ptr(&ctx.stream);
+            let (d_ptr, _d_guard) = dg.w13_out.data.device_ptr_mut(&ctx.stream);
+            let (masked_ptr, _masked_guard) = dg.masked_m.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda(
+                    a_ptr as *const u8,
+                    sfa_ptr as *const f32,
+                    b_ptr as *const u8,
+                    sfb_ptr as *const f32,
+                    d_ptr as *mut ffi::Half,
+                    masked_ptr as *const i32,
+                    num_groups_i32,
+                    max_m_i32,
+                    intermediate_i32 * 2,
+                    hidden_i32,
+                    scale_stride_m_i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM w13 GEMM failed: {err}"))?;
+            }
+        }
+
+        {
+            let (w13_ptr, _w13_guard) = dg.w13_out.data.device_ptr(&ctx.stream);
+            let (act_ptr, _act_guard) = dg.act_fp8.device_ptr_mut(&ctx.stream);
+            let (scale_ptr, _scale_guard) = dg.act_scales.device_ptr_mut(&ctx.stream);
+            let (active_ptr, _active_guard) = active.indices.device_ptr(&ctx.stream);
+            let (count_ptr, _count_guard) = active.counts.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_deepgemm_swiglu_quantize_w13_cuda(
+                    w13_ptr as *const ffi::Half,
+                    act_ptr as *mut u8,
+                    scale_ptr as *mut f32,
+                    active_ptr as *const i32,
+                    count_ptr as *const i32,
+                    active_count_i32,
+                    max_m_i32,
+                    intermediate_i32,
+                    scale_stride_m_i32,
+                    config.swiglu_limit,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 DeepGEMM SwiGLU/quantize failed: {err}")
+                })?;
+            }
+        }
+
+        {
+            let (a_ptr, _a_guard) = dg.act_fp8.device_ptr(&ctx.stream);
+            let (sfa_ptr, _sfa_guard) = dg.act_scales.device_ptr(&ctx.stream);
+            let (b_ptr, _b_guard) = cache.w2.weight.device_ptr(&ctx.stream);
+            let (sfb_ptr, _sfb_guard) = cache.w2.scales.device_ptr(&ctx.stream);
+            let (d_ptr, _d_guard) = dg.out_padded.data.device_ptr_mut(&ctx.stream);
+            let (masked_ptr, _masked_guard) = dg.masked_m.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda(
+                    a_ptr as *const u8,
+                    sfa_ptr as *const f32,
+                    b_ptr as *const u8,
+                    sfb_ptr as *const f32,
+                    d_ptr as *mut ffi::Half,
+                    masked_ptr as *const i32,
+                    num_groups_i32,
+                    max_m_i32,
+                    hidden_i32,
+                    intermediate_i32,
+                    scale_stride_m_i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM w2 GEMM failed: {err}"))?;
+            }
+        }
+
+        {
+            let (grouped_ptr, _grouped_guard) = dg.out_padded.data.device_ptr(&ctx.stream);
+            let (compact_ptr, _compact_guard) = dg.out_compact.data.device_ptr_mut(&ctx.stream);
+            let (active_ptr, _active_guard) = active.indices.device_ptr(&ctx.stream);
+            let (offset_ptr, _offset_guard) = active.offsets.device_ptr(&ctx.stream);
+            let (count_ptr, _count_guard) = active.counts.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_deepgemm_unpad_grouped_bf16_cuda(
+                    grouped_ptr as *const ffi::Half,
+                    compact_ptr as *mut ffi::Half,
+                    active_ptr as *const i32,
+                    offset_ptr as *const i32,
+                    count_ptr as *const i32,
+                    active_count_i32,
+                    max_m_i32,
+                    hidden_i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM unpad failed: {err}"))?;
+            }
+        }
+
+        let (expert_ptr, _expert_guard) = dg.out_compact.data.device_ptr(&ctx.stream);
+        let (route_out_ptr, _route_guard) = route_out.data.device_ptr_mut(&ctx.stream);
+        let (route_slot_ptr, _route_slot_guard) = expert_route_slot.device_ptr(&ctx.stream);
+        let (weight_ptr, _weight_guard) = expert_weight.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::dsv4_scatter_all_route_slots_cuda(
+                expert_ptr as *const ffi::Half,
+                route_out_ptr as *mut ffi::Half,
+                route_slot_ptr as *const i32,
+                weight_ptr as *const f32,
+                total_local_routes as i32,
+                route_out.hidden_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM route scatter failed: {err}"))?;
+        }
+        Ok(())
+    }
+
     fn forward_grouped_dsv4_experts_gpu(
         &self,
         ctx: &DeviceContext,
@@ -1924,9 +2200,56 @@ impl DeepseekV4MoeBlock {
             route_out.seq_len,
             total_local_routes
         );
-        dsv4_handle_deepgemm_expert_backend(
+        ensure!(
+            active_offsets_host.len() == active_experts.len()
+                && active_counts_host.len() == active_experts.len(),
+            "DeepSeek V4 grouped active metadata length mismatch: experts={} offsets={} counts={}",
+            active_experts.len(),
+            active_offsets_host.len(),
+            active_counts_host.len()
+        );
+        let total_local_routes_i32 = i32::try_from(total_local_routes)
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 grouped route count overflows i32"))?;
+        let route_out_dim_i32 = i32::try_from(route_out.hidden_dim)
+            .map_err(|_| anyhow::anyhow!("DeepSeek V4 grouped output dim overflows i32"))?;
+        for (slot, ((&expert_idx, &offset), &count)) in active_experts
+            .iter()
+            .zip(active_offsets_host)
+            .zip(active_counts_host)
+            .enumerate()
+        {
+            ensure!(
+                expert_idx < self.experts.len(),
+                "DeepSeek V4 active expert {} at slot {} out of range {}",
+                expert_idx,
+                slot,
+                self.experts.len()
+            );
+            ensure!(
+                offset >= 0 && count >= 0,
+                "DeepSeek V4 active expert slot {} has negative offset/count: offset={} count={}",
+                slot,
+                offset,
+                count
+            );
+            let offset = usize::try_from(offset)
+                .map_err(|_| anyhow::anyhow!("DeepSeek V4 active offset conversion failed"))?;
+            let count = usize::try_from(count)
+                .map_err(|_| anyhow::anyhow!("DeepSeek V4 active count conversion failed"))?;
+            ensure!(
+                count <= max_local_routes && offset + count <= total_local_routes,
+                "DeepSeek V4 active expert slot {} range overflow: offset={} count={} max_m={} total={}",
+                slot,
+                offset,
+                count,
+                max_local_routes,
+                total_local_routes
+            );
+        }
+        let expert_backend = dsv4_expert_backend()?;
+        let deepgemm_backend_usable = dsv4_handle_deepgemm_expert_backend(
             ctx,
-            dsv4_expert_backend()?,
+            expert_backend,
             "packed grouped local experts",
             &[&first.w1, &first.w3, &first.w2],
         )?;
@@ -1965,6 +2288,48 @@ impl DeepseekV4MoeBlock {
                 .map_err(|err| {
                     anyhow::anyhow!("DeepSeek V4 active expert count H2D failed: {err}")
                 })?;
+        }
+        let should_try_deepgemm = match expert_backend {
+            Dsv4ExpertBackend::Native => false,
+            Dsv4ExpertBackend::DeepGemmRequired => true,
+            Dsv4ExpertBackend::DeepGemmAuto => {
+                deepgemm_backend_usable && self.deepgemm_cache.is_some()
+            }
+        };
+        if should_try_deepgemm {
+            let active_owned = scratch
+                .active
+                .take()
+                .expect("DeepSeek V4 grouped active scratch allocated");
+            let deepgemm_result = self.forward_deepgemm_grouped_dsv4_experts_gpu(
+                ctx,
+                config,
+                expert_hidden,
+                expert_route_slot,
+                expert_weight,
+                &active_owned,
+                active_experts,
+                active_counts_host,
+                total_local_routes,
+                max_local_routes,
+                route_out,
+                scratch,
+            );
+            scratch.active = Some(active_owned);
+            match deepgemm_result {
+                Ok(()) => return Ok(true),
+                Err(err) => {
+                    if matches!(expert_backend, Dsv4ExpertBackend::DeepGemmRequired) {
+                        return Err(err);
+                    }
+                    static LOGGED: OnceLock<()> = OnceLock::new();
+                    LOGGED.get_or_init(|| {
+                        info!(
+                            "DeepSeek V4 DeepGEMM auto fallback to native grouped expert path: {err:#}"
+                        );
+                    });
+                }
+            }
         }
         let active = scratch
             .active
@@ -2050,8 +2415,8 @@ impl DeepseekV4MoeBlock {
                 route_out_ptr as *mut ffi::Half,
                 route_slot_ptr as *const i32,
                 weight_ptr as *const f32,
-                total_local_routes as i32,
-                route_out.hidden_dim as i32,
+                total_local_routes_i32,
+                route_out_dim_i32,
                 ctx.stream.cu_stream(),
             )
             .result()
@@ -2108,7 +2473,7 @@ impl DeepseekV4MoeBlock {
             route_out.seq_len,
             num_routes
         );
-        dsv4_handle_deepgemm_expert_backend(
+        let _ = dsv4_handle_deepgemm_expert_backend(
             ctx,
             dsv4_expert_backend()?,
             "route-grouped decode experts",
@@ -2251,8 +2616,9 @@ impl DeepseekV4MoeBlock {
 
         let has_moe_scratch = moe_scratch.is_some();
         let expert_backend = dsv4_expert_backend()?;
+        let mut deepgemm_backend_usable = false;
         if let Some(first) = self.experts.first() {
-            dsv4_handle_deepgemm_expert_backend(
+            deepgemm_backend_usable = dsv4_handle_deepgemm_expert_backend(
                 ctx,
                 expert_backend,
                 "DeepEP routed experts",
@@ -2269,8 +2635,16 @@ impl DeepseekV4MoeBlock {
             && dsv4_padded_dispatch_enabled()?;
         let use_fused_dispatch_payload =
             use_padded_dispatch && dsv4_fused_dispatch_payload_enabled()?;
+        let use_deepgemm_experts = match expert_backend {
+            Dsv4ExpertBackend::Native => false,
+            Dsv4ExpertBackend::DeepGemmRequired => true,
+            Dsv4ExpertBackend::DeepGemmAuto => {
+                deepgemm_backend_usable && self.deepgemm_cache.is_some()
+            }
+        };
         let use_route_grouped_experts =
-            use_padded_dispatch && dsv4_route_grouped_experts_enabled()?;
+            use_padded_dispatch && !use_deepgemm_experts && dsv4_route_grouped_experts_enabled()?;
+        let use_grouped_experts = use_deepgemm_experts || dsv4_grouped_experts_enabled()?;
         let send_route_capacity = if use_padded_dispatch {
             ep.world_size.saturating_mul(config.num_experts_per_tok)
         } else {
@@ -3182,7 +3556,7 @@ impl DeepseekV4MoeBlock {
                     }
                 }
 
-                let grouped_done = if dsv4_grouped_experts_enabled()? {
+                let grouped_done = if use_grouped_experts {
                     if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
                         let active_experts = local_counts_usize
                             .iter()
