@@ -1,5 +1,15 @@
 # M_medusa Phase 1.A directive — pick dataset + wire HF Hub loader
 
+> **2026-05-25 status — RETIRED for SFT path**. The `arle train sft`
+> command used in this plan's example invocations was deleted in the
+> 2026-05-18 OPD-only pivot
+> ([`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md));
+> SFT is no longer a supported ARLE training surface. If Medusa needs
+> training-style adapter data in the future, it must wire through the
+> OPD path (`arle train opd --student-model <dir>`), not `arle train sft`.
+> The Hub dataset loader (`crates/train/src/hub_dataset.rs`) still
+> exists as substrate for OPD prompt corpora and eval datasets.
+
 > **2026-05-10 Qwen3.5 scope update**: dataset prep is not the active
 > blocker anymore. Alpaca is already prepared, but Qwen3.5 Medusa cannot
 > proceed to training/runtime until recurrent-state accepted-length
