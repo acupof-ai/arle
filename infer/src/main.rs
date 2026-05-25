@@ -18,6 +18,7 @@ use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{GenerationState, KVCacheDtype, KVFormat, ModelForward};
 use infer::request_handle::{DistributedSchedulerGroup, NumaSchedulerRouter, NumaSchedulerWorker};
+use infer::runtime_notify::RuntimeNotifyGate;
 use infer::runtime_topology::{
     AffinityApplyResult, RuntimeTopology, WorkerPlacement, bind_process_to_placement,
     configured_cuda_worker_ordinals, sample_process_numa_maps,
@@ -868,6 +869,7 @@ fn spawn_cuda_worker_group(
     metrics: &infer::metrics::ServerMetrics,
 ) -> anyhow::Result<Vec<StartedCudaWorker>> {
     let world_size = workers.len();
+    let startup_warmup_gate = (world_size > 1).then(RuntimeNotifyGate::new);
     let mut planned = Vec::with_capacity(workers.len());
     for (rank, worker) in workers.iter().enumerate() {
         let runtime = ServerRuntimeConfig {
@@ -893,6 +895,7 @@ fn spawn_cuda_worker_group(
             } else {
                 None
             },
+            startup_warmup_gate: startup_warmup_gate.clone(),
         };
         planned.push((rank, worker.clone(), runtime));
     }
@@ -952,18 +955,27 @@ fn spawn_cuda_worker_group(
     let mut started_by_rank = (0..world_size).map(|_| None).collect::<Vec<_>>();
     let mut first_err = None;
     for thread in load_threads {
-        let (rank, result) = thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("CUDA worker loader thread panicked"))?;
-        match result {
-            Ok(worker) => started_by_rank[rank] = Some(worker),
-            Err(err) if first_err.is_none() => first_err = Some(err),
+        match thread.join() {
+            Ok((rank, result)) => match result {
+                Ok(worker) => started_by_rank[rank] = Some(worker),
+                Err(err) if first_err.is_none() => first_err = Some(err),
+                Err(_) => {}
+            },
+            Err(_) if first_err.is_none() => {
+                first_err = Some(anyhow::anyhow!("CUDA worker loader thread panicked"));
+            }
             Err(_) => {}
         }
     }
     if let Some(err) = first_err {
+        if let Some(gate) = startup_warmup_gate.as_ref() {
+            gate.cancel();
+        }
         shutdown_started_workers(started_by_rank.into_iter().flatten().collect());
         return Err(err);
+    }
+    if let Some(gate) = startup_warmup_gate.as_ref() {
+        gate.release();
     }
     Ok(started_by_rank
         .into_iter()

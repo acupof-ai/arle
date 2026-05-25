@@ -26,6 +26,8 @@ use crate::model_registry::{ModelArch, detect_arch};
 #[cfg(feature = "cuda")]
 use crate::model_source::ResolvedModelSource;
 #[cfg(feature = "cuda")]
+use crate::runtime_notify::{RuntimeNotifyGate, RuntimeNotifyOutcome};
+#[cfg(feature = "cuda")]
 use crate::scheduler::{Scheduler, SchedulerConfig, SchedulerHandle};
 #[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
@@ -113,6 +115,10 @@ pub struct ServerRuntimeConfig {
     /// process-global rank env races when the HTTP server creates one scheduler
     /// thread per rank inside a single process.
     pub deepseek_parallel: Option<DeepseekParallelConfig>,
+    /// Optional multi-worker startup latch. When set, scheduler threads wait
+    /// here before startup warmup so distributed decode warmup cannot enter
+    /// collectives before every rank has loaded.
+    pub startup_warmup_gate: Option<RuntimeNotifyGate>,
 }
 
 #[cfg(feature = "cuda")]
@@ -130,6 +136,7 @@ impl Default for ServerRuntimeConfig {
             worker_placement: None,
             cuda_device_ordinal: None,
             deepseek_parallel: None,
+            startup_warmup_gate: None,
         }
     }
 }
@@ -497,6 +504,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         pre_model_free_bytes,
         worker_placement,
         cuda_device_ordinal,
+        startup_warmup_gate,
         ..
     } = runtime;
 
@@ -557,6 +565,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
     let (ready_tx, ready_rx) = mpsc::channel();
     let scheduler_thread_placement = worker_placement.clone();
     let scheduler_thread_cuda_ordinal = cuda_device_ordinal;
+    let scheduler_thread_model_id = model_id.clone();
     let thread_name = scheduler_thread_placement.as_ref().map_or_else(
         || "infer-cuda-scheduler".to_string(),
         |placement| format!("infer-cuda-scheduler-gpu{}", placement.gpu_ordinal),
@@ -580,6 +589,19 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
                         affinity.applied,
                         affinity.reason,
                     );
+                }
+                if let Some(gate) = startup_warmup_gate.as_ref() {
+                    info!(
+                        "CUDA scheduler waiting for all workers before startup warmup (model={})",
+                        scheduler_thread_model_id
+                    );
+                    if gate.wait() == RuntimeNotifyOutcome::Cancelled {
+                        info!(
+                            "CUDA scheduler startup warmup cancelled before release (model={})",
+                            scheduler_thread_model_id
+                        );
+                        return;
+                    }
                 }
                 scheduler.run_with_ready_signal(ready_tx);
             };
