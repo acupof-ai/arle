@@ -27,7 +27,7 @@ use crate::{
     grad_clip::clip_grad_norm,
     loss::{DEFAULT_KL_CHUNK_SIZE, cross_entropy_loss, kl_distill_loss, kl_distill_loss_chunked},
     qwen35::{
-        Qwen35Error, Qwen35KvCache, Qwen35Model, forward_rollout_cached,
+        Qwen35Error, Qwen35KvCache, Qwen35Model, SequenceWindow, forward_rollout_cached,
         forward_rollout_cached_device_token,
     },
     teacher_infer::{InProcessTeacher, TeacherForward, TeacherForwardError},
@@ -87,6 +87,7 @@ pub struct GkdLossConfig<'a> {
     pub sft_anchor: GkdSftAnchor,
     pub corpus_tokens: Option<&'a [u32]>,
     pub kl_chunk_size: Option<usize>,
+    pub logits_window_size: Option<usize>,
 }
 
 impl Default for GkdLossConfig<'_> {
@@ -96,6 +97,7 @@ impl Default for GkdLossConfig<'_> {
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
             kl_chunk_size: Some(DEFAULT_KL_CHUNK_SIZE),
+            logits_window_size: None,
         }
     }
 }
@@ -449,6 +451,19 @@ fn validate_loss_value(loss_value: f32) -> Result<()> {
     )))
 }
 
+fn validate_logits_shape(stage: &str, shape: &[usize], seq_len: usize, vocab: usize) -> Result<()> {
+    let expected_shape = vec![1, seq_len, vocab];
+    if shape == expected_shape {
+        return Ok(());
+    }
+    Err(OpdError::InvalidInput(format!(
+        "OPD {stage} logits shape mismatch: got {shape:?}, expected \
+         {expected_shape:?}. Hint: windowed Route B requires each teacher and \
+         student forward to return [batch=1, window_len, vocab] for exactly \
+         the current logits window."
+    )))
+}
+
 fn validate_step_config(cfg: OpdStepConfig) -> Result<()> {
     if cfg.grad_clip >= 0.0 && cfg.grad_clip.is_finite() {
         return Ok(());
@@ -479,6 +494,15 @@ fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> {
             "OPD KL chunk size must be > 0 when set. Hint: pass \
              --kl-chunk-size 32 for the 256-token rollout bench, or set an \
              explicit larger value after a memory check."
+                .to_owned(),
+        ));
+    }
+    if config.logits_window_size == Some(0) {
+        return Err(OpdError::InvalidInput(
+            "OPD logits window size must be > 0 when set. Hint: pass \
+             --logits-window-size 64 with --kl-chunk-size 64 for the \
+             512-token real-corpus Route B smoke, or omit it to keep the \
+             baseline full-logits path."
                 .to_owned(),
         ));
     }
@@ -520,6 +544,32 @@ fn kl_distill_loss_for_config(
         None => kl_distill_loss(student_logits, teacher_logits, num_positions, store, tape)
             .map_err(OpdError::from),
     }
+}
+
+fn sequence_windows(total_positions: usize, window_size: usize) -> Result<Vec<SequenceWindow>> {
+    if total_positions == 0 {
+        return Err(OpdError::InvalidInput(
+            "OPD windowed logits path requires at least one position. Hint: \
+             pass a non-empty prompt/completion sequence before enabling \
+             --logits-window-size."
+                .to_owned(),
+        ));
+    }
+    if window_size == 0 {
+        return Err(OpdError::InvalidInput(
+            "OPD logits window size must be > 0 when set. Hint: pass \
+             --logits-window-size 64 or omit the flag for full logits."
+                .to_owned(),
+        ));
+    }
+    let mut windows = Vec::new();
+    let mut start = 0usize;
+    while start < total_positions {
+        let end = start.saturating_add(window_size).min(total_positions);
+        windows.push(SequenceWindow { start, end });
+        start = end;
+    }
+    Ok(windows)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -842,6 +892,39 @@ fn mix_gkd_losses(
     add(weighted_kl, weighted_sft, store, tape).map_err(OpdError::from)
 }
 
+fn backward_weighted_window_loss(
+    loss: TensorId,
+    weight: f32,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    profile: &mut Option<&mut OpdStepProfile>,
+) -> Result<f32> {
+    if !weight.is_finite() || weight < 0.0 {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD window loss weight must be finite and non-negative, got {weight}. \
+             Hint: verify lambda and window/target counts before Route B backward."
+        )));
+    }
+    let loss_started = Instant::now();
+    let weighted_loss = if (weight - 1.0).abs() < f32::EPSILON {
+        loss
+    } else {
+        mul_scalar(loss, weight, store, tape)?
+    };
+    let loss_value = store.to_host(weighted_loss)?[0];
+    validate_loss_value(loss_value)?;
+    record_profile(profile, |profile| {
+        profile.kl_loss_seconds += loss_started.elapsed().as_secs_f64();
+    });
+
+    let phase_started = Instant::now();
+    tape.backward(weighted_loss, store)?;
+    record_profile(profile, |profile| {
+        profile.backward_seconds += phase_started.elapsed().as_secs_f64();
+    });
+    Ok(loss_value)
+}
+
 fn map_qwen35_forward_error(stage: &str, err: Qwen35Error) -> OpdError {
     match err {
         Qwen35Error::InputLenMismatch {
@@ -909,6 +992,250 @@ fn map_teacher_forward_error(stage: &str, err: TeacherForwardError) -> OpdError 
              the current Path B bridge."
         )),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
+    student: &Qwen35Model,
+    teacher: &T,
+    prompt_ids: &[u32],
+    rollout: &[u32],
+    positions: &[u32],
+    vocab: usize,
+    gkd_config: GkdLossConfig<'_>,
+    window_size: usize,
+    student_model_params: &[TensorId],
+    keep_extra: &HashSet<TensorId>,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    profile: &mut Option<&mut OpdStepProfile>,
+) -> Result<f32> {
+    let mut total_loss = 0.0f32;
+    let mut backward_windows = 0usize;
+
+    if gkd_config.lambda < 1.0 {
+        for window in sequence_windows(rollout.len(), window_size)? {
+            tape.entries.clear();
+            tape.set_enabled(false);
+
+            let phase_started = Instant::now();
+            let teacher_logits = teacher
+                .forward_logits_window_device(rollout, positions, window, store, tape)
+                .map_err(|err| map_teacher_forward_error("teacher windowed KL", err))?;
+            record_profile(profile, |profile| {
+                profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
+            });
+            validate_logits_shape(
+                "teacher windowed KL",
+                &teacher_logits.shape,
+                window.len(),
+                vocab,
+            )?;
+
+            tape.set_enabled(true);
+            let phase_started = Instant::now();
+            let student_logits = student
+                .forward_logits_window(store, tape, rollout, positions, window)
+                .map_err(|err| map_qwen35_forward_error("student windowed KL", err))?;
+            let student_shape = store
+                .get(student_logits)
+                .ok_or(AutogradError::InvalidTensorId(student_logits))?
+                .shape
+                .clone();
+            validate_logits_shape("student windowed KL", &student_shape, window.len(), vocab)?;
+            record_profile(profile, |profile| {
+                profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
+            });
+
+            let phase_started = Instant::now();
+            let kl_loss = kl_distill_loss_for_config(
+                student_logits,
+                teacher_logits.tensor_id,
+                window.len(),
+                gkd_config.kl_chunk_size,
+                store,
+                tape,
+            )?;
+            record_profile(profile, |profile| {
+                profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
+            });
+            let weight = (1.0 - gkd_config.lambda) * (window.len() as f32 / rollout.len() as f32);
+            total_loss += backward_weighted_window_loss(kl_loss, weight, store, tape, profile)?;
+            backward_windows += 1;
+            cleanup_after_backward(store, tape, student_model_params, keep_extra);
+        }
+    }
+
+    if gkd_config.lambda > 0.0 {
+        match gkd_config.sft_anchor {
+            GkdSftAnchor::StudentRollout => {
+                let target_count = rollout.len().checked_sub(1).ok_or_else(|| {
+                    OpdError::InvalidInput(
+                        "GKD student-rollout SFT anchor requires at least two rollout \
+                         tokens so logits can be trained against next-token labels."
+                            .to_owned(),
+                    )
+                })?;
+                if target_count == 0 {
+                    return Err(OpdError::InvalidInput(
+                        "GKD student-rollout SFT anchor requires at least two rollout \
+                         tokens so logits can be trained against next-token labels."
+                            .to_owned(),
+                    ));
+                }
+                for target_window in sequence_windows(target_count, window_size)? {
+                    tape.entries.clear();
+                    tape.set_enabled(true);
+
+                    let logits_window = target_window;
+                    let phase_started = Instant::now();
+                    let student_logits = student
+                        .forward_logits_window(store, tape, rollout, positions, logits_window)
+                        .map_err(|err| {
+                            map_qwen35_forward_error("student windowed rollout SFT", err)
+                        })?;
+                    let student_shape = store
+                        .get(student_logits)
+                        .ok_or(AutogradError::InvalidTensorId(student_logits))?
+                        .shape
+                        .clone();
+                    validate_logits_shape(
+                        "student windowed rollout SFT",
+                        &student_shape,
+                        logits_window.len(),
+                        vocab,
+                    )?;
+                    record_profile(profile, |profile| {
+                        profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
+                    });
+
+                    let target_tokens = &rollout[target_window.start + 1..target_window.end + 1];
+                    let phase_started = Instant::now();
+                    let sft_loss = next_token_sft_loss_from_logits(
+                        student_logits,
+                        logits_window.len(),
+                        0,
+                        target_tokens,
+                        vocab,
+                        store,
+                        tape,
+                    )?;
+                    record_profile(profile, |profile| {
+                        profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
+                    });
+                    let weight =
+                        gkd_config.lambda * (target_tokens.len() as f32 / target_count as f32);
+                    total_loss +=
+                        backward_weighted_window_loss(sft_loss, weight, store, tape, profile)?;
+                    backward_windows += 1;
+                    cleanup_after_backward(store, tape, student_model_params, keep_extra);
+                }
+            }
+            GkdSftAnchor::CorpusTruth => {
+                let corpus_tokens = gkd_config.corpus_tokens.ok_or_else(|| {
+                    OpdError::InvalidInput(
+                        "GKD corpus-truth SFT anchor requires corpus completion \
+                         tokens. Hint: add completion/target fields to \
+                         --prompts-file."
+                            .to_owned(),
+                    )
+                })?;
+                if prompt_ids.is_empty() || corpus_tokens.is_empty() {
+                    return Err(OpdError::InvalidInput(
+                        "GKD corpus-truth SFT anchor requires non-empty prompt and \
+                         completion tokens."
+                            .to_owned(),
+                    ));
+                }
+                let total_len = prompt_ids
+                    .len()
+                    .checked_add(corpus_tokens.len())
+                    .ok_or_else(|| {
+                        OpdError::InvalidInput(
+                            "GKD corpus-truth SFT prompt+completion length overflowed. \
+                             Hint: reduce prompt/completion max tokens."
+                                .to_owned(),
+                        )
+                    })?;
+                if total_len > u32::MAX as usize {
+                    return Err(OpdError::InvalidInput(format!(
+                        "GKD corpus-truth SFT sequence length {total_len} exceeds \
+                         u32::MAX RoPE position range. Hint: reduce prompt/completion \
+                         max tokens."
+                    )));
+                }
+                let mut sft_sequence = Vec::with_capacity(total_len);
+                sft_sequence.extend_from_slice(prompt_ids);
+                sft_sequence.extend_from_slice(corpus_tokens);
+                let sft_positions = (0..total_len as u32).collect::<Vec<_>>();
+                for target_window in sequence_windows(corpus_tokens.len(), window_size)? {
+                    let logits_window = SequenceWindow {
+                        start: prompt_ids.len() - 1 + target_window.start,
+                        end: prompt_ids.len() - 1 + target_window.end,
+                    };
+
+                    tape.entries.clear();
+                    tape.set_enabled(true);
+                    let phase_started = Instant::now();
+                    let student_logits = student
+                        .forward_logits_window(
+                            store,
+                            tape,
+                            &sft_sequence,
+                            &sft_positions,
+                            logits_window,
+                        )
+                        .map_err(|err| {
+                            map_qwen35_forward_error("student windowed corpus SFT", err)
+                        })?;
+                    let student_shape = store
+                        .get(student_logits)
+                        .ok_or(AutogradError::InvalidTensorId(student_logits))?
+                        .shape
+                        .clone();
+                    validate_logits_shape(
+                        "student windowed corpus SFT",
+                        &student_shape,
+                        logits_window.len(),
+                        vocab,
+                    )?;
+                    record_profile(profile, |profile| {
+                        profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
+                    });
+
+                    let target_tokens = &corpus_tokens[target_window.start..target_window.end];
+                    let phase_started = Instant::now();
+                    let sft_loss = next_token_sft_loss_from_logits(
+                        student_logits,
+                        logits_window.len(),
+                        0,
+                        target_tokens,
+                        vocab,
+                        store,
+                        tape,
+                    )?;
+                    record_profile(profile, |profile| {
+                        profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
+                    });
+                    let weight = gkd_config.lambda
+                        * (target_tokens.len() as f32 / corpus_tokens.len() as f32);
+                    total_loss +=
+                        backward_weighted_window_loss(sft_loss, weight, store, tape, profile)?;
+                    backward_windows += 1;
+                    cleanup_after_backward(store, tape, student_model_params, keep_extra);
+                }
+            }
+        }
+    }
+
+    if backward_windows == 0 {
+        return Err(OpdError::InvalidInput(
+            "OPD windowed Route B built zero backward windows. Hint: verify \
+             lambda, prompt length, rollout length, and --logits-window-size."
+                .to_owned(),
+        ));
+    }
+    Ok(total_loss)
 }
 
 /// Run one OPD step:
@@ -1269,6 +1596,46 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         //    `requires_grad = false` so no entries record even if tape was on,
         //    but disabling cheap-defends against any rogue grad-bearing weight.
         let positions: Vec<u32> = (0..rollout.len() as u32).collect();
+        if let Some(window_size) = gkd_config.logits_window_size {
+            let phase_started = Instant::now();
+            optimizer.zero_grad(store, student_params);
+            record_profile(&mut profile, |profile| {
+                profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
+            });
+
+            let loss_value = backward_windowed_gkd_loss(
+                student,
+                teacher,
+                prompt_ids,
+                &rollout,
+                &positions,
+                vocab,
+                gkd_config,
+                window_size,
+                &student_model_params,
+                &keep_extra,
+                store,
+                tape,
+                &mut profile,
+            )?;
+
+            let phase_started = Instant::now();
+            clip_grad_norm(student_params, cfg.grad_clip, store);
+            record_profile(&mut profile, |profile| {
+                profile.grad_clip_seconds += phase_started.elapsed().as_secs_f64();
+            });
+            let phase_started = Instant::now();
+            optimizer.step(store, student_params)?;
+            record_profile(&mut profile, |profile| {
+                profile.optimizer_step_seconds += phase_started.elapsed().as_secs_f64();
+            });
+
+            return Ok(OpdStepOutcome {
+                loss: loss_value,
+                rollout_len: rollout.len(),
+            });
+        }
+
         let phase_started = Instant::now();
         let teacher_logits = teacher
             .forward_logits_device(&rollout, &positions, store, tape)
@@ -1382,8 +1749,8 @@ mod tests {
     use super::{
         GkdLossConfig, GkdSftAnchor, OpdError, OpdStepConfig, greedy_next_token,
         kl_distill_loss_for_config, map_qwen35_forward_error, mix_gkd_losses,
-        next_token_sft_loss_from_logits, shifted_rollout_sft_loss, validate_gkd_lambda,
-        validate_gkd_loss_config, validate_loss_value, validate_rollout_shape,
+        next_token_sft_loss_from_logits, sequence_windows, shifted_rollout_sft_loss,
+        validate_gkd_lambda, validate_gkd_loss_config, validate_loss_value, validate_rollout_shape,
         validate_step_config, validate_student_param_ownership, validate_student_params,
         validate_teacher_params,
     };
@@ -1609,6 +1976,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: None,
             kl_chunk_size: None,
+            logits_window_size: None,
         })
         .expect_err("corpus anchor must require target tokens");
         let OpdError::InvalidInput(message) = missing else {
@@ -1622,6 +1990,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: Some(&[]),
             kl_chunk_size: None,
+            logits_window_size: None,
         })
         .expect_err("empty corpus anchor tokens must be rejected");
         let OpdError::InvalidInput(message) = empty else {
@@ -1634,6 +2003,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: None,
             kl_chunk_size: None,
+            logits_window_size: None,
         })
         .expect("lambda=0 should not require unused corpus targets");
         validate_gkd_loss_config(GkdLossConfig {
@@ -1641,6 +2011,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: Some(&[1, 2]),
             kl_chunk_size: None,
+            logits_window_size: None,
         })
         .expect("non-empty corpus targets should be accepted");
     }
@@ -1652,6 +2023,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
             kl_chunk_size: Some(0),
+            logits_window_size: None,
         })
         .expect_err("zero KL chunk size must be rejected");
 
@@ -1661,6 +2033,35 @@ mod tests {
         assert!(message.contains("KL chunk size"));
         assert!(message.contains("> 0"));
         assert!(message.contains("--kl-chunk-size"));
+    }
+
+    #[test]
+    fn validate_gkd_loss_config_rejects_zero_logits_window_size() {
+        let err = validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: None,
+            logits_window_size: Some(0),
+        })
+        .expect_err("zero logits window size must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("logits window size"));
+        assert!(message.contains("> 0"));
+        assert!(message.contains("--logits-window-size"));
+    }
+
+    #[test]
+    fn sequence_windows_cover_tail_without_overlap() {
+        let windows = sequence_windows(10, 4).expect("windows");
+        let spans = windows
+            .into_iter()
+            .map(|window| (window.start, window.end))
+            .collect::<Vec<_>>();
+        assert_eq!(spans, vec![(0, 4), (4, 8), (8, 10)]);
     }
 
     #[test]

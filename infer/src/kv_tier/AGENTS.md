@@ -63,10 +63,11 @@ kv_tier/coordinator.rs + kv_tier/coordinator/  — Coordinator entry surface plu
    Canonical definition in `crate::types::BlockId`. Content-addressable
    identity uses `crate::types::BlockFingerprint` and only exists at
    persist (M4) or migrate (M5) boundaries.
-2. **Only the coordinator moves blocks between tiers.** The scheduler decides
-   which blocks should spill; the coordinator owns the byte movement and
-   completion events. Scheduler code **must not** issue `TransferOp`s
-   directly.
+2. **Tier byte-movement ownership is split by boundary.** The CUDA scheduler
+   owns local T0↔T1 materialization/demotion because it owns GPU page
+   allocation, CUDA stream fences, and radix retag timing. The coordinator owns
+   queued T1↔T2/T3 movement and completion events. Scheduler code **must not**
+   issue `TransferOp`s directly.
 3. **MR registration stability.** NIXL requires registered memory regions
    to be allocation-stable. `HostPinnedPool` must be allocated once at
    engine init and never reallocated. See `tiered-kv-cache.md §4.2` inv 5

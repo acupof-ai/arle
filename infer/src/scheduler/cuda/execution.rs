@@ -879,6 +879,14 @@ impl<M: ModelForward> Scheduler<M> {
                 self.stats.step_timing_gpu_completion_wait_us.round() as u64,
                 1,
             );
+            // H5 (2026-05-25 nsys finding): without this backoff, the
+            // scheduler tight-spins `cuEventQuery` while decode readback isn't
+            // ready — observed 2.71M queries in 29s (93k/s, 7.7% wall) at
+            // c=16. 50us cap on per-tick ITL impact is negligible vs decode
+            // ITL ~71ms at c=16; cuts the spin ~500x (post-fix nsys: 159k
+            // queries in 25s = 6k/s). See:
+            // docs/experience/wins/2026-05-25-bench-guidellm-cuda-l4-arle-nsys-h1-h5-confirmed.md
+            std::thread::sleep(std::time::Duration::from_micros(50));
             return;
         }
 

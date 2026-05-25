@@ -359,6 +359,23 @@ fn prefill_owners(requests: &[Qwen3PagedPrefillRequest<'_>]) -> Vec<PendingPaged
         .collect()
 }
 
+// `INFER_PREFILL_GRAPH=1` — opt-in CUDA Graph capture for paged prefill.
+//
+// **Do NOT default this on.** 2026-05-25 bench (L4 / Qwen3-4B / 4k prompt /
+// 256 out): +6% tok/s at c=1, +5% at c=2, but **-16% at c=4, -77% at c=8,
+// -86% at c=16 with `scheduler_channel_closed` errors and bench validation
+// failure**. See `docs/experience/errors/2026-05-25-prefill-graph-default-kill.md`.
+//
+// Root cause: per-(token_count, page_indices_len, prefix_rows) graph variants
+// thrash the 8-slot LRU cache (`QWEN3_PREFILL_GRAPH_CACHE_MAX_KEYS`). At c=16
+// each session has distinct prompt length + KV layout → >8 shape variants
+// per second → constant re-capture stall.
+//
+// To make this default-on, either (a) widen the bucketing in
+// `QWEN3_PREFILL_GRAPH_PAGE_INDICES_BUCKET` / `_PREFIX_ROWS_BUCKET` so c=16
+// collapses into ≤8 unique keys, or (b) grow the cache + add proper LRU
+// eviction telemetry. Until either lands, only enable for c≤2 short-prompt
+// workloads.
 pub(super) fn qwen3_prefill_graph_requested() -> bool {
     matches!(
         std::env::var("INFER_PREFILL_GRAPH").as_deref(),

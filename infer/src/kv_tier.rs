@@ -67,9 +67,11 @@
 //!    carry `Option<BlockFingerprint>` — `None` for transient
 //!    in-memory blocks.
 //!
-//! 3. **Only the coordinator moves blocks between tiers.** The scheduler
-//!    decides *which* blocks should store or readmit; the coordinator owns the
-//!    byte-moving work and emits completion events.
+//! 3. **Tier byte-movement ownership is split by boundary.** The CUDA scheduler
+//!    owns local T0<->T1 materialization/demotion because it owns GPU page
+//!    allocation, CUDA stream fences, and radix retag timing. The coordinator
+//!    owns queued T1<->T2/T3 movement and completion events. Scheduler code
+//!    must not issue [`TransferOp`]s directly.
 //!
 //! 4. **MR registration stability.** The NIXL transport requires
 //!    registered memory regions to be allocation-stable. The T1

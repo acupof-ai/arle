@@ -25,15 +25,16 @@ mod app {
             opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         prompts::load_jsonl_prompt_sets,
-        qwen35::Qwen35Model,
+        qwen35::{Qwen35Model, SequenceWindow},
         qwen35_checkpoint::{
             ConfigJsonSource, GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StepCheckpoint,
             Qwen35StudentWeights, save_named_qwen35_student_checkpoint,
             save_qwen35_student_checkpoint,
         },
-        qwen35_loader::load_qwen35_lora_from_hf_dir,
+        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
         teacher_infer::{
-            ApiTeacher, InferTeacher, MultiTeacher, TeacherEntry, TeacherForward, TeacherRoute,
+            ApiTeacher, InProcessTeacher, InferTeacher, MultiTeacher, TeacherEntry, TeacherForward,
+            TeacherRoute,
         },
         trainer::extend_keep_with_params_and_grads,
     };
@@ -71,6 +72,7 @@ mod app {
         gkd_lambda: f32,
         sft_anchor: GkdSftAnchor,
         kl_chunk_size: Option<usize>,
+        logits_window_size: Option<usize>,
     }
 
     #[derive(Debug)]
@@ -143,7 +145,7 @@ mod app {
              steps={} rollout_len={} lr={:.9e} grad_clip={GRAD_CLIP} \
              prompt_source={} train_prompt_count={} heldout_prompt_count={} \
              eval_steps={:?} cuda_graph={} save_student_checkpoint={} save_every={} \
-             gkd_lambda={:.6} sft_anchor={} kl_chunk_size={}",
+             gkd_lambda={:.6} sft_anchor={} kl_chunk_size={} logits_window_size={}",
             args.teacher_model.display(),
             args.teacher_api_url.as_deref().unwrap_or("none"),
             args.teacher_config
@@ -168,6 +170,9 @@ mod app {
             args.gkd_lambda,
             sft_anchor_label(args.sft_anchor),
             args.kl_chunk_size
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            args.logits_window_size
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_owned())
         );
@@ -257,6 +262,29 @@ mod app {
             );
         }
 
+        if args.logits_window_size.is_some() {
+            let teacher_load_started = Instant::now();
+            let teacher_model = load_qwen35_from_hf_dir(&args.teacher_model, &mut store)?;
+            let teacher_load_seconds = teacher_load_started.elapsed().as_secs_f64();
+            let in_process_teacher = InProcessTeacher::new(&teacher_model);
+            return run_training(
+                &args,
+                &prompts,
+                &student,
+                &student_model_params,
+                &student_trainable_params,
+                &mut store,
+                &mut tape,
+                cuda_backend,
+                &in_process_teacher,
+                "in-process",
+                student_load_seconds,
+                teacher_load_seconds,
+                || RuntimeTeacherProfile::default(),
+                |_| "in-process".to_owned(),
+            );
+        }
+
         let infer_load_started = Instant::now();
         let infer_engine = load_infer_engine(
             &args.teacher_model,
@@ -307,6 +335,7 @@ mod app {
         let mut gkd_lambda = 0.0f32;
         let mut sft_anchor = GkdSftAnchor::StudentRollout;
         let mut kl_chunk_size = Some(DEFAULT_KL_CHUNK_SIZE);
+        let mut logits_window_size = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -341,6 +370,10 @@ mod app {
                 "--kl-chunk-size" => {
                     kl_chunk_size = Some(parse_positive_usize(&arg, &next_arg(&mut args, &arg)?)?)
                 }
+                "--logits-window-size" => {
+                    logits_window_size =
+                        Some(parse_positive_usize(&arg, &next_arg(&mut args, &arg)?)?)
+                }
                 "--no-cuda-graph" => enable_cuda_graph = false,
                 "--help" | "-h" => {
                     println!(
@@ -351,7 +384,7 @@ mod app {
                          [--eval-steps CSV] [--prompt-max-tokens N] [--max-step-seconds SEC] \
                          [--save-student-checkpoint DIR] [--save-every N] \
                          [--gkd-lambda LAMBDA] [--sft-anchor student-rollout|corpus-truth] \
-                         [--kl-chunk-size N(default 32)] \
+                         [--kl-chunk-size N(default 32)] [--logits-window-size N] \
                          [--no-cuda-graph]"
                     );
                     std::process::exit(0);
@@ -394,6 +427,7 @@ mod app {
             gkd_lambda,
             sft_anchor,
             kl_chunk_size,
+            logits_window_size,
         })
     }
 
@@ -622,6 +656,7 @@ mod app {
                     sft_anchor: args.sft_anchor,
                     corpus_tokens,
                     kl_chunk_size: args.kl_chunk_size,
+                    logits_window_size: args.logits_window_size,
                 },
                 Some(&mut profile),
             )?;
@@ -959,6 +994,7 @@ mod app {
             store,
             tape,
             args.kl_chunk_size,
+            args.logits_window_size,
         )?;
         let heldout_kl = mean_prompt_kl(
             &prompts.heldout,
@@ -968,6 +1004,7 @@ mod app {
             store,
             tape,
             args.kl_chunk_size,
+            args.logits_window_size,
         )?;
         println!(
             "eval_summary step={step} train_kl={train_kl:.12e} heldout_kl={heldout_kl:.12e} \
@@ -985,6 +1022,7 @@ mod app {
         store: &mut TensorStore,
         tape: &mut Tape,
         kl_chunk_size: Option<usize>,
+        logits_window_size: Option<usize>,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         if prompts.is_empty() {
             return Ok(f64::NAN);
@@ -994,35 +1032,78 @@ mod app {
             tape.entries.clear();
             tape.set_enabled(false);
             let positions = (0..prompt.len() as u32).collect::<Vec<_>>();
-            let teacher_logits = teacher.forward_logits_device(prompt, &positions, store, tape)?;
-            let student_logits = student.forward(store, tape, prompt, &positions)?;
-            let loss = match kl_chunk_size {
-                Some(chunk_size) => kl_distill_loss_chunked(
-                    student_logits,
-                    teacher_logits.tensor_id,
-                    prompt.len(),
-                    chunk_size,
-                    store,
-                    tape,
-                )?,
-                None => kl_distill_loss(
-                    student_logits,
-                    teacher_logits.tensor_id,
-                    prompt.len(),
-                    store,
-                    tape,
-                )?,
-            };
-            total += store.to_host(loss)?[0] as f64;
-            retain_student_state(store, tape, student_model_params);
+            if let Some(window_size) = logits_window_size {
+                let mut prompt_kl = 0.0f64;
+                let mut start = 0usize;
+                while start < prompt.len() {
+                    let end = start.saturating_add(window_size).min(prompt.len());
+                    let window = SequenceWindow { start, end };
+                    let teacher_logits = teacher
+                        .forward_logits_window_device(prompt, &positions, window, store, tape)?;
+                    let student_logits =
+                        student.forward_logits_window(store, tape, prompt, &positions, window)?;
+                    let loss = match kl_chunk_size {
+                        Some(chunk_size) => kl_distill_loss_chunked(
+                            student_logits,
+                            teacher_logits.tensor_id,
+                            window.len(),
+                            chunk_size,
+                            store,
+                            tape,
+                        )?,
+                        None => kl_distill_loss(
+                            student_logits,
+                            teacher_logits.tensor_id,
+                            window.len(),
+                            store,
+                            tape,
+                        )?,
+                    };
+                    prompt_kl += store.to_host(loss)?[0] as f64
+                        * (window.len() as f64 / prompt.len() as f64);
+                    retain_eval_state(store, tape, student_model_params, teacher.parameter_ids());
+                    tape.set_enabled(false);
+                    start = end;
+                }
+                total += prompt_kl;
+            } else {
+                let teacher_logits =
+                    teacher.forward_logits_device(prompt, &positions, store, tape)?;
+                let student_logits = student.forward(store, tape, prompt, &positions)?;
+                let loss = match kl_chunk_size {
+                    Some(chunk_size) => kl_distill_loss_chunked(
+                        student_logits,
+                        teacher_logits.tensor_id,
+                        prompt.len(),
+                        chunk_size,
+                        store,
+                        tape,
+                    )?,
+                    None => kl_distill_loss(
+                        student_logits,
+                        teacher_logits.tensor_id,
+                        prompt.len(),
+                        store,
+                        tape,
+                    )?,
+                };
+                total += store.to_host(loss)?[0] as f64;
+                retain_eval_state(store, tape, student_model_params, teacher.parameter_ids());
+            }
         }
         Ok(total / prompts.len() as f64)
     }
 
-    fn retain_student_state(store: &mut TensorStore, tape: &mut Tape, params: &[TensorId]) {
+    fn retain_eval_state(
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        student_params: &[TensorId],
+        teacher_params: &[TensorId],
+    ) {
         tape.entries.clear();
-        let mut keep = HashSet::with_capacity(params.len() * 2);
-        extend_keep_with_params_and_grads(&mut keep, params.iter().copied(), store);
+        let mut keep = HashSet::with_capacity((student_params.len() + teacher_params.len()) * 2);
+        extend_keep_with_params_and_grads(&mut keep, student_params.iter().copied(), store);
+        extend_keep_with_params_and_grads(&mut keep, teacher_params.iter().copied(), store);
         store.retain_ids(&keep);
     }
 

@@ -13,8 +13,6 @@ use super::state::DeepseekState;
 #[cfg(feature = "cuda")]
 use super::weights::DeepseekModel;
 #[cfg(feature = "cuda")]
-use super::weights::dsv4_incremental_kv_enabled;
-#[cfg(feature = "cuda")]
 use crate::model::PrefillBatchRequest;
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::DeviceVec;
@@ -76,11 +74,7 @@ impl DeepseekModel {
         }
 
         if !emit_logits {
-            if dsv4_incremental_kv_enabled()? {
-                self.compute_gpu_incremental_prefill_chunk(tokens, state, false)?;
-            } else {
-                state.reference_tokens.extend_from_slice(tokens);
-            }
+            state.reference_tokens.extend_from_slice(tokens);
             state.base.prefill_logits = None;
             state.base.kv_cache.advance_seq_len(tokens.len());
             return Ok(());
