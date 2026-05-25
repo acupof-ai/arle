@@ -114,6 +114,17 @@ impl Qwen35KvCache {
             seq_len: 0,
         }
     }
+
+    pub fn extend_tensor_ids(&self, keep: &mut HashSet<TensorId>) {
+        for layer in &self.layers {
+            if let Some(k) = layer.k {
+                keep.insert(k);
+            }
+            if let Some(v) = layer.v {
+                keep.insert(v);
+            }
+        }
+    }
 }
 
 #[doc(hidden)]
