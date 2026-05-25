@@ -6,9 +6,11 @@
 > ([`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md)).
 > The substrate it produced (HF-style checkpoint dirs, `latest`
 > marker, eval codec → reborn as OPD-side eval, shared CLI arg
-> helpers) **survives** and will host the OPD command's DX when the
-> substrate lands. The cross-surface train → eval → infer story now
-> reduces to `arle train opd → eval → infer`.
+> helpers) **survives** and now hosts the OPD command's DX (substrate
+> landed 2026-05-24 via `crates/cli/src/train_cli.rs::run_opd_from_dirs`,
+> commit `14c3be9`). The cross-surface train → eval → infer story
+> now reduces to `arle train opd → eval → infer`, validated end-to-end
+> in the P5 5k cycle (see `docs/experience/wins/2026-05-24-arle-train-opd-from-dirs.md`).
 
 **Driver:** user directive 2026-04-20 — "现在训练出来的模型能够直接自动化评测和推理吗；这部分的 dx 也做好；做好 cli 的易用性，可理解"
 (Can trained models be directly auto-evaluated and served? Polish the
