@@ -72,6 +72,75 @@ related:
 | T13 | Session docs cross-reference audit | codex | **completed** (docs-only cross-reference audit) | Audit this session's commits (fdb021c onwards) — every wins/errors/research entry should link to and from the related plan/project doc. Update CHANGELOG.md (if exists) and ROADMAP.md (if stale). Fix broken links. Continuous-cleanup discipline. | Continuous-cleanup |
 | T14 | P5 pure-OPD 5k capability sweep | codex | **completed** (capability sweep docs) | Sequential MMLU/GSM8K eval over step_001000..step_005000; compare capability winner against heldout-KL winner and base | User 2026-05-25 after P5 exit |
 | T18 | **OPD recipe variant** — lr=1e-5 or LR-decay-from-step-1000, save every 250 | codex | queued (after T17) | bench shape same as P5: Qwen3.5-4B teacher → 0.8B-Base LoRA, rollout 8, prompt_max 16, 5000 steps. Knob: `--lr 1e-5` OR `--lr-decay-after-step 1000`. PASS = a checkpoint heldout_kl < P5 best (1.598e-5) AND its MMLU >= 50% (i.e., recovery exceeds P5 step-2000 best). KILL = no checkpoint beats P5 step-2000 (50.00% MMLU). T14 wins entry §"new research direction" pre-licensed this; T2 trace says backward+rollout dominate so this recipe change doesn't shift wall-clock. Output: docs/experience/wins/2026-05-25-opd-recipe-variant.md (PASS) or errors (KILL). | User 2026-05-25 "opd 也继续推进" + T14 wins recommendation |
+| T19 | **Stale doc + dead code cleanup pass** ("删除陈旧的文档和无用的代码 需要的时候再加") | codex | queued (after T18) | See §"T19" detail block. Scan-classify-prune cycle: identify stale docs / dead code → classify SAFE vs needs-ckl-review → ship safe deletions one cluster per commit → list borderline items in a wins/errors entry for ckl decision. Respect bench-spec §9 immutability (`wins/`, `errors/` entries are historical record, not deletable). | User 2026-05-25 "需要的时候再加" philosophy |
+
+### T19 — Stale doc + dead code cleanup pass
+
+User 2026-05-25 directive: "删除所有的陈旧的文档和无用的代码 需要的时候
+再加" (delete all stale docs and unused code; add back when needed).
+
+**What counts as stale / dead**:
+
+- Docs claiming things that aren't true today (e.g., `docs/projects/
+  2026-05-18-opd-only-pivot.md:86,150` says "OPD substrate landing next
+  milestone" but it landed via `crates/cli/src/train_cli.rs::run_opd_from_dirs`
+  on 2026-05-24 `14c3be9`).
+- Plan docs whose subject was executed and superseded (e.g., a plan that
+  said "we will do X" where X is now done and tracked elsewhere).
+- Duplicate plan files (e.g., `docs/plans/dsv4-small-repro.md` vs
+  `docs/plans/2026-05-25-dsv4-from-scratch-feasibility.md` — verify
+  duplication, kill if redundant).
+- Code paths with zero grep usage across the workspace (T3 did one pass;
+  the cycle continues — re-grep after T17/T18 changes).
+- `TODO`/`FIXME` comments without actionable item (either action them or
+  delete the comment).
+- Dead feature gates (`#[cfg(feature = "x")]` where `x` has no callers).
+- Old `bench-output/` artifacts older than 30 days that aren't referenced
+  by any current wins/errors entry.
+
+**What is NEVER deletable** (per `docs/bench-and-trace-spec.md` §9 + this
+project's experience discipline):
+
+- Any file under `docs/experience/wins/` or `docs/experience/errors/`
+  — historical SOLID record, immutable.
+- `CHANGELOG.md` entries — append-only.
+- Git commits — already-shipped history (Co-Authored-By trailer cleanup
+  is a separate user decision, pending B-option call).
+- Plan docs that capture design rationale that future work depends on
+  (even if the plan is "done", the rationale may still inform follow-ups).
+
+**Classification rule**:
+
+For each candidate, codex outputs one of:
+
+- **SAFE_DELETE** — zero current refs, no historical value, ship in this
+  task's commits.
+- **EDIT_NOT_DELETE** — stale claim within an otherwise-valuable doc
+  (e.g., 2026-05-18 pivot doc); update the claim, don't delete the doc.
+- **NEEDS_CKL_REVIEW** — codex is unsure if deletion loses real value;
+  list in T19 errors entry with the question for ckl.
+
+**Output**:
+
+- One commit per cluster of related SAFE_DELETE items
+  (`chore(cleanup): prune <cluster-name>` or `docs(cleanup): drop stale
+  <topic> docs`).
+- One commit per EDIT_NOT_DELETE batch (`docs(...): update stale
+  <claim>`).
+- Wins entry `docs/experience/wins/2026-05-25-stale-doc-dead-code-cleanup.md`
+  with the full classification table (kept / deleted / edited / pending-ckl).
+- Total touched lines should be measurable but conservative — better to
+  underdelete and surface borderline calls than overdelete.
+
+**Anti-patterns to avoid**:
+
+- Deleting a doc because it's "old". Date alone doesn't make a doc stale.
+- Deleting code because it's "complex". Complexity alone doesn't make
+  code dead.
+- Mass-renaming or restructuring as part of cleanup — separate concern.
+- Touching `wins/` / `errors/` entries (immutable).
+- Reverting any commits to "clean history" — see CLAUDE.md "Never destructive
+  without explicit ask".
 
 ## Session artifact ledger (fdb021c onwards)
 
