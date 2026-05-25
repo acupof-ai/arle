@@ -2,11 +2,20 @@
 title: M_pf83 H1' v2 redesign brief — extend MarlinScratch (do NOT create PF8Scratch); fix per-call alloc that fails on FIRST request
 date: 2026-05-10
 type: plan
-status: ready-for-codex-pickup (replaces blocked M_pf83_h1prime_static_scratch.md original §3)
+status: blocked-pending-pf8-kernel-fix (2026-05-25; replaces blocked M_pf83_h1prime_static_scratch.md original §3)
 related_docs: [`M_pf83_h1prime_static_scratch.md` blocked plan, `0be278f` PF8.5 KILL, `7ed8160` Arm B REFUTE, `2b956ce` sm_89 W4 alternatives §4.3]
 ---
 
 # M_pf83 H1' v2 — redesign brief (Task #47 unblock)
+
+> **2026-05-25 status — BLOCKED, not ready for pickup.** PF8.3 remains
+> opt-in/default-off and was KILLed at runtime
+> ([`pf83-runtime-KILL`](../experience/errors/2026-05-10-pf83-runtime-KILL-gemm-code-2-101k-failures.md),
+> [`pf85-bench-v11`](../experience/errors/2026-05-10-pf85-bench-v11-substrate-kill-conc1-warmup.md)).
+> Current code still excludes PF8 from CUDA graph capture because scratch is
+> per-call (`infer/src/ops/linear.rs`). This brief remains design context for
+> a future PF8 kernel/scratch fix, but needs fresh license before
+> implementation.
 
 > **2026-05-10 later update**: priority references to A+B/Medusa in
 > this brief are historical. The active Qwen3.5 Medusa path is blocked
