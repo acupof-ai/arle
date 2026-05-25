@@ -21,7 +21,7 @@ we can graduate to lm-eval if we need broader task coverage.
 
 Tasks supported (P0 cut):
   - mmlu     — MMLU 5-shot exact-match on the answer letter (A/B/C/D)
-  - gsm8k   — GSM8K exact-match on the final numeric answer after `####`
+  - gsm8k   — GSM8K 8-shot exact-match on the final numeric answer after `####`
 
 Tasks deferred:
   - ifeval  — requires rule-based verifier set; ship in a later patch
@@ -348,21 +348,12 @@ def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path, debug_samples
 # ───────────────────────── GSM8K ────────────────────────────────
 
 
-GSM8K_FEW_SHOT = """\
-Q: Janet's ducks lay 16 eggs per day. She eats three for breakfast and uses four to bake muffins for her friends. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?
-A: She has 16 - 3 - 4 = 9 eggs left to sell. She makes 9 * 2 = $18 per day. #### 18
-
-Q: A robe takes 2 bolts of blue fiber and half that much white fiber. How many bolts in total does it take?
-A: Half of 2 bolts is 1 bolt of white fiber. Total bolts = 2 + 1 = 3. #### 3
-
-Q: Josh decides to try flipping a house. He buys a house for $80,000 and then puts in $50,000 in repairs. This increased the value of the house by 150%. How much profit did he make?
-A: The house was bought for 80000 and increased in value by 150%, so the new value is 80000 + 80000*1.5 = 200000. After repair costs of 50000, his profit was 200000 - 80000 - 50000 = 70000. #### 70000
-
-"""
-
-
 _GSM8K_ANSWER_RE = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
 _GSM8K_LAST_NUMBER_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+def _gsm8k_format_shot(example: dict) -> str:
+    return f"Q: {example['question']}\nA: {example['answer']}\n"
 
 
 def _gsm8k_gold_answer(answer: str) -> str:
@@ -384,7 +375,7 @@ def _gsm8k_extract_answer(text: str) -> str | None:
     return None
 
 
-def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_samples: int = 5) -> dict:
+def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_samples: int = 5, n_shots: int = 8) -> dict:
     try:
         from datasets import load_dataset
     except ImportError:
@@ -396,15 +387,20 @@ def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_sample
 
     print("[gsm8k] loading dataset...", flush=True)
     ds_test = load_dataset("openai/gsm8k", "main", split="test")
+    ds_train = load_dataset("openai/gsm8k", "main", split="train") if n_shots > 0 else []
+    shot_examples = list(ds_train.select(range(min(n_shots, len(ds_train))))) if n_shots > 0 else []
+    few_shot = "\n".join(_gsm8k_format_shot(ex) for ex in shot_examples)
+    if few_shot:
+        few_shot += "\n"
     pool = list(ds_test.select(range(min(n_samples, len(ds_test)))))
-    print(f"[gsm8k] running {len(pool)} problems", flush=True)
+    print(f"[gsm8k] running {len(pool)} problems with {len(shot_examples)} shots", flush=True)
 
     correct = 0
     invalid = 0
     debug_records: list[dict] = []
     t0 = time.time()
     for i, ex in enumerate(pool):
-        prompt = GSM8K_FEW_SHOT + f"Q: {ex['question']}\nA:"
+        prompt = few_shot + f"Q: {ex['question']}\nA:"
         try:
             resp = client.completion(prompt, max_tokens=256, temperature=0.0)
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
@@ -442,6 +438,7 @@ def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_sample
         "n_scored": scored,
         "n_invalid": invalid,
         "n_correct": correct,
+        "n_shots": len(shot_examples),
         "accuracy": accuracy,
         "elapsed_seconds": elapsed,
     }
@@ -476,6 +473,7 @@ def main(argv: list[str]) -> int:
                         help="--backend hf only")
     parser.add_argument("--tasks", default="mmlu,gsm8k", help="comma-separated subset of: " + ", ".join(TASK_RUNNERS))
     parser.add_argument("--n-samples", type=int, default=200, help="samples per task")
+    parser.add_argument("--gsm8k-shots", type=int, default=8, help="few-shot examples for GSM8K")
     parser.add_argument("--output", type=Path, required=True, help="output directory for per-task reports")
     args = parser.parse_args(argv)
 
@@ -494,12 +492,16 @@ def main(argv: list[str]) -> int:
         "base_url": args.base_url if args.backend == "arle" else None,
         "model_path": args.model_path if args.backend == "hf" else None,
         "model_id": args.model_id,
+        "gsm8k_shots": args.gsm8k_shots,
         "tasks": {},
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     for task in requested:
         print(f"\n========== {task} ==========", flush=True)
-        report = TASK_RUNNERS[task](client, args.n_samples, args.output)
+        if task == "gsm8k":
+            report = run_gsm8k(client, args.n_samples, args.output, n_shots=args.gsm8k_shots)
+        else:
+            report = TASK_RUNNERS[task](client, args.n_samples, args.output)
         summary["tasks"][task] = report
 
     summary["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
