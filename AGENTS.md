@@ -222,6 +222,17 @@ changes.
   user-facing explanations, final integration after subagents report back,
   and the `codex review` pass before commit on non-trivial diffs.
 
+### Execution hygiene (Claude and delegated agents alike)
+
+- Surface known failure logs upfront so the same blocker isn't re-discovered.
+- Pin SKU / shape / scope at exact granularity, not by fuzzy name — otherwise everything gets enabled then narrowed down.
+- Before patching an upstream component, grep the raise point and lock the root cause first.
+- When probing install / directory / env layout, enumerate candidate paths upfront, not fail-then-retry.
+- PR branches start from `upstream/main`, never from a local WIP branch — defaults pick current HEAD, so state it explicitly.
+- Verify a patched upstream lib in an isolated dir, never the existing dev install, to dodge editable / `.pth` finder hijacks.
+- When an upstream patch crosses a size or cross-cutting-policy threshold, pause and ack before landing.
+- Regression tests should mirror the failure mode with a minimal in-component kernel, not by importing caller code.
+
 ### Benchmarks
 
 - **Spec — always read first:**
