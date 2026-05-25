@@ -285,7 +285,7 @@ fn use_device_rollout_argmax(store: &TensorStore, rollout_len: usize, vocab: usi
     matches!(store.backend().device(), Device::Cuda) && (rollout_len >= 4 || vocab >= 65_536)
 }
 
-const ROLLOUT_RETAIN_INTERVAL: usize = 8;
+const ROLLOUT_RETAIN_INTERVAL: usize = 2;
 
 fn should_retain_rollout_step(step: usize, rollout_len: usize) -> bool {
     let completed_steps = step + 1;
