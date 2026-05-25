@@ -19,7 +19,7 @@ mod app {
     };
     use train::{
         LoraAdapterConfig, LoraConfig, LoraTargetSet,
-        loss::{kl_distill_loss, kl_distill_loss_chunked},
+        loss::{DEFAULT_KL_CHUNK_SIZE, kl_distill_loss, kl_distill_loss_chunked},
         opd::{
             GkdLossConfig, GkdSftAnchor, OpdStepConfig, OpdStepProfile,
             opd_step_with_teacher_forward_profiled_gkd_anchor,
@@ -143,7 +143,7 @@ mod app {
              steps={} rollout_len={} lr={:.9e} grad_clip={GRAD_CLIP} \
              prompt_source={} train_prompt_count={} heldout_prompt_count={} \
              eval_steps={:?} cuda_graph={} save_student_checkpoint={} save_every={} \
-             gkd_lambda={:.6} sft_anchor={}",
+             gkd_lambda={:.6} sft_anchor={} kl_chunk_size={}",
             args.teacher_model.display(),
             args.teacher_api_url.as_deref().unwrap_or("none"),
             args.teacher_config
@@ -166,7 +166,10 @@ mod app {
                 .unwrap_or_else(|| "none".to_owned()),
             args.save_every,
             args.gkd_lambda,
-            sft_anchor_label(args.sft_anchor)
+            sft_anchor_label(args.sft_anchor),
+            args.kl_chunk_size
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned())
         );
         for (idx, prompt) in prompts.train.iter().enumerate() {
             println!("prompt split=train index={idx} ids={prompt:?}");
@@ -303,7 +306,7 @@ mod app {
         let mut save_every = 0usize;
         let mut gkd_lambda = 0.0f32;
         let mut sft_anchor = GkdSftAnchor::StudentRollout;
-        let mut kl_chunk_size = None;
+        let mut kl_chunk_size = Some(DEFAULT_KL_CHUNK_SIZE);
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -348,7 +351,7 @@ mod app {
                          [--eval-steps CSV] [--prompt-max-tokens N] [--max-step-seconds SEC] \
                          [--save-student-checkpoint DIR] [--save-every N] \
                          [--gkd-lambda LAMBDA] [--sft-anchor student-rollout|corpus-truth] \
-                         [--kl-chunk-size N] \
+                         [--kl-chunk-size N(default 32)] \
                          [--no-cuda-graph]"
                     );
                     std::process::exit(0);
