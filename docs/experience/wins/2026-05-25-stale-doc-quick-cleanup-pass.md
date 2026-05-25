@@ -24,6 +24,9 @@ parallel — the easy SAFE_EDIT items.
 | `docs/plans/train-observability-v1.md` (commit `c3e0f2a`) | "reused by `arle train opd --serve` once the OPD substrate lands" | OPD CLI shipped as one-shot runner; `--serve` mode is separate scope not yet licensed (cross-link support-matrix §5a) |
 | `docs/plans/2026-05-05-deepseek-v4-small-substrate.md` (commit `1f81b71`) | Whole plan still readable as if pretrain-dsv4 is active | Top banner: §0a, §0b, §1-5 RETIRED with OPD-pivot + T17 feasibility KILL; §6 (Runtime Adaptation kernels) remains active ROADMAP P0 |
 | `docs/support-matrix.md` (commits `b2c0348`, `e3a0ce0`, earlier in session) | "OPD substrate landing"; "`arle train pretrain-dsv4` seeds from..."; "OPD wiring pending" | OPD = Supported (Beta), `pretrain-dsv4` killed in OPD pivot, `--serve` scope clarified |
+| `docs/plans/M_medusa-phase1a-dataset-directive.md` (commit `656c6c9`) | Plan example invocations use `arle train sft --data ...` — that command is deleted | Added retirement banner: SFT path retired in OPD-pivot; future Medusa training-style data must wire through OPD, not SFT |
+| `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md` (commit `656c6c9`) | §Workload command `arle train pretrain ...` no longer exists | Added historical-context banner: kernel-time attribution still valid for OPD-path kernels; cross-link `docs/research/2026-05-24-arle-opd-end-to-end-trace.md` as current canonical training-step trace |
+| `docs/plans/2026-05-10-rope-yarn-phase3b-ppl-eval-plan.md` (commit `77412c0`) | Plan premised on `arle train eval` (deleted); status was `ready-for-execution` | Status changed to `blocked-on-eval-harness`; banner explains PPL methodology still valid but needs replacement harness (script or new `arle eval` CLI) |
 
 ## What Was NOT Touched
 
