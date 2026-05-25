@@ -1109,10 +1109,24 @@ fn collect_cu_files(dir: &Path, out: &mut Vec<PathBuf>) {
             collect_cu_files(&path, out);
             continue;
         }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("._"))
+        {
+            continue;
+        }
         if path.extension().and_then(|e| e.to_str()) == Some("cu") {
             out.push(path);
         }
     }
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
 }
 
 fn main() {
@@ -1164,6 +1178,24 @@ fn main() {
     cu_files.sort();
 
     println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE");
+    // Backward-compatible alias for old remote scripts. It no longer enables a
+    // PyTorch bridge; it selects the native raw-pointer DeepGEMM bridge.
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_DEEPGEMM_TORCH");
+    println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_ROOT");
+    let enable_deepgemm_native =
+        env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE") || env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_TORCH");
+    let deepgemm_root = std::env::var("ARLE_DEEPGEMM_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("vendor/deepgemm"));
+    let deepgemm_root = if deepgemm_root.is_absolute() {
+        deepgemm_root
+    } else {
+        std::env::current_dir()
+            .expect("failed to resolve cuda-kernels build cwd")
+            .join(deepgemm_root)
+    };
+    let deepgemm_library_root = deepgemm_root.join("deep_gemm");
     let ccbin = std::env::var("NVCC_CCBIN").ok();
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_MARLIN_W4_FP8");
     let disable_marlin_w4_fp8 = matches!(
@@ -1189,11 +1221,38 @@ fn main() {
         if disable_marlin_w4_fp8 && stem == "marlin_w4_fp8_kernel" {
             nvcc_args.push("-DARLE_DISABLE_MARLIN_W4_FP8=1".to_string());
         }
+        if enable_deepgemm_native {
+            nvcc_args.push("-DARLE_ENABLE_DEEPGEMM_NATIVE=1".to_string());
+        }
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
         // Ensure `#include "common.cuh"` resolves from any domain subdir
         // (attention/, gemm/, kv/, quant/, misc/).
         nvcc_args.push("-Icsrc".to_string());
+
+        if enable_deepgemm_native && stem == "deepgemm_native" {
+            nvcc_args.extend([
+                "-std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "-Wno-deprecated-declarations".to_string(),
+                format!("-I{}/include", cuda_path),
+                format!("-I{}", deepgemm_root.join("csrc").display()),
+                format!("-I{}", deepgemm_library_root.join("include").display()),
+                format!(
+                    "-I{}",
+                    deepgemm_root.join("third-party/cutlass/include").display()
+                ),
+                format!(
+                    "-I{}",
+                    deepgemm_root.join("third-party/fmt/include").display()
+                ),
+                format!(
+                    "-DARLE_DEEPGEMM_DEFAULT_LIBRARY_ROOT=\"{}\"",
+                    deepgemm_library_root.display()
+                ),
+                format!("-DARLE_DEEPGEMM_DEFAULT_CUDA_HOME=\"{}\"", cuda_path),
+            ]);
+        }
 
         // Marlin kernel needs C++17 + relaxed constexpr
         if stem.starts_with("marlin_") {
@@ -1244,6 +1303,13 @@ fn main() {
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cublasLt");
+    if enable_deepgemm_native {
+        println!("cargo:rustc-link-lib=nvrtc");
+        println!(
+            "cargo:warning=DeepGEMM native bridge enabled, root={}",
+            deepgemm_root.display()
+        );
+    }
     if cfg!(target_os = "macos") {
         println!("cargo:rustc-link-lib=c++");
     } else if !cfg!(target_os = "windows") {

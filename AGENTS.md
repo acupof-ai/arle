@@ -27,17 +27,14 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
   per-request framing 是 ground truth**。Narrow window 占比 X% 不等于实际 wall-clock 影响 X%。
   License-or-kill 决策必须用 wall-clock framing,不用 narrow window framing 自欺。
 
-实证经验:
-- **2026-05-08 EOD M_pf-graph Phase 0 KILL** 回顾:errors entry 80% SOLID(具体 graph
-  hit/miss 计数器 + 实测 throughput regression),但 3 个 SOLID gap(launch overhead 占比
-  未 nsys 验证 / SGLang 实际 graph trigger 计数未对照 / 4 个变量同时改未隔离),导致"graph
-  capture 不是 SGLang 主因"这个 strategic conclusion **不够 SOLID**。
-- **2026-05-08 EOD+19 M_pf-graph v2 nsys framing trap**:codex nsys finding "dispatch
-  55.7% of prefill launch window" → license Phase 0v2.B PASS,但 §Problems 自己写 "only
-  191 ms in 60s trace" = per prefill 6.4ms / TTFT 1995ms = **0.32% wall-clock**。Window
-  framing PASS 但 wall-clock framing < 10% kill threshold。**License 决策错误**因为用错
-  framing。**Lesson**:nsys "X% of NVTX window" 必须 cross-check "(Y ms / per-request total
-  time)" framing,**取保守的那个**作 license-or-kill ground truth。
+实证 anchors:
+- **M_pf-graph Phase 0 KILL** (2026-05-08):errors entry 80% SOLID 仍栽,3 个 gap —
+  launch overhead 占比未 nsys 验证 / SGLang graph trigger 实计数未对照 / 4 变量同改未隔离
+  → strategic conclusion 全废。
+- **M_pf-graph v2 framing trap** (2026-05-08 EOD+19):nsys "55.7% of prefill window"
+  看似 PASS,但 191ms / 60s trace = 6.4ms per prefill / 1995ms TTFT = **0.32% wall-clock**,
+  远低于 10% kill 阈。**Lesson**:nsys "X% of NVTX window" 必须 cross-check "Y ms /
+  per-request total" framing,取保守者作 license-or-kill 基准。
 
 ---
 
@@ -103,19 +100,12 @@ backend development, benchmarking, and testing uses
   (model dir size + 1 GiB headroom) and follows HF cache symlinks.
   Drops c=1 p99 from 86 ms → 15 ms on Qwen3.6 (−82%). Opt-out via
   `--wired-limit-bytes 0`.
-- **MLX command-buffer env tunes — Qwen3.5-only.** Earlier guidance
-  here recommended `MLX_MAX_OPS_PER_BUFFER=200
-  MLX_MAX_MB_PER_BUFFER=200` for any c≥8 bench. That recommendation
-  was Qwen3.5-dense-specific and benched as wash-or-loss on Qwen3.6
-  MoE — see
-  [`docs/experience/wins/2026-05-07-bench-qwen36-baseline.md`](docs/experience/wins/2026-05-07-bench-qwen36-baseline.md)
-  and
-  [`docs/experience/wins/2026-05-07-bench-qwen36-encode-bottleneck.md`](docs/experience/wins/2026-05-07-bench-qwen36-encode-bottleneck.md).
-  On Qwen3.6 35B-A3B the dominant cost (95% of step) is `mx::async_eval`
-  doing synchronous Metal command-buffer encoding for ~600-1000
-  primitives — increasing `MLX_MAX_OPS_PER_BUFFER` doesn't help that.
-  **Don't set these env vars by default; they're a per-workload
-  matched-A/B tunable.**
+- **MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER — not a default.**
+  Qwen3.5-dense-only tune; on Qwen3.6 MoE benched wash-or-loss because 95% of
+  step is `mx::async_eval` encoding ~600-1000 primitives — buffer cap doesn't
+  help. Per-workload matched-A/B only.
+  Refs: [baseline](docs/experience/wins/2026-05-07-bench-qwen36-baseline.md),
+  [encode-bottleneck](docs/experience/wins/2026-05-07-bench-qwen36-encode-bottleneck.md).
 
 **Workspace (current):**
 
@@ -130,8 +120,10 @@ ARLE/
 │   ├── deepseek-spec/         ← DeepSeek V4 readiness scaffold (DS0 config + tensor names + Shard)
 │   ├── kv-native-sys/         ← local persistence substrate for KV tier transports
 │   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc), Qwen3.5 step / MoE / DFlash draft / Metal capture hook
+│   ├── qwen3-spec/            ← Qwen3 config + tensor-parallel Shard enum (TP layout authority)
 │   ├── qwen35-spec/           ← shared Qwen3.5 config + tensor-name contract
-│   └── train/                 ← train-side control plane + runtime-integrated RL stack
+│   ├── train/                 ← train-side control plane + runtime-integrated RL stack
+│   └── xgrammar-sys/          ← Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode)
 └── docs/                      ← projects/ plans/ experience/ reviews/ resources/
 ```
 
@@ -202,25 +194,14 @@ changes.
 | Code review of non-trivial diffs | **Claude runs `codex review` at Bash** |
 | Stuck-problem rescue (2-strike hand-off) | **`general-purpose` with full context** |
 
-- **Parallelize by default.** When multiple delegated tasks are independent
-  (different files, different layers, research + execution), fire them in a
-  **single message with multiple Agent tool uses** so they run concurrently.
-  Serial delegation is reserved for genuinely data-dependent steps.
-- **Execution bias:** when a task is "write/change code", draft a brief
-  (files, constraints, acceptance criteria) and delegate to a `general-purpose`
-  subagent. Claude integrates and verifies — Claude does not hand-write
-  substantial diffs.
-- **Code review is Claude-driven via Codex CLI at Bash:** invoke
-  `codex review --uncommitted` (or `--commit <sha>` / `--base <branch>`)
-  directly from the Bash tool and relay the findings. This is a shell
-  command — unlike the Codex subagent path, it does not hang.
-- **2-strike rule:** two good-faith failed subagent attempts → either
-  hand-write the diff yourself (if small) or re-brief a fresh `general-purpose`
-  agent with explicit notes on what the prior attempts tried and why they
-  failed.
-- **Claude always owns:** planning docs, experience entries, roadmap edits,
-  user-facing explanations, final integration after subagents report back,
-  and the `codex review` pass before commit on non-trivial diffs.
+- **Parallel by default.** Independent delegated tasks → single message,
+  multiple Agent calls. Serial only when data-dependent.
+- **Code review invocation:** `codex review --uncommitted` (or `--commit <sha>` /
+  `--base <branch>`) at Bash, run in background + tee to tmp file —
+  non-blocking (`feedback_codex_review_async.md`).
+- **2-strike rule:** two failed subagent attempts → hand-write the diff (if
+  small) or re-brief a fresh `general-purpose` with notes on what prior
+  attempts tried and why they failed.
 
 ### Benchmarks
 
@@ -234,29 +215,21 @@ changes.
   lifecycle hygiene). Internal info sources (§3: `/v1/stats` service trace,
   scheduling envelope, K6 OOM detector) are first-class report content.
   Applies to both benchmarks and traces.
-- **MANDATORY — every runtime change produces a bench entry.** A change is
-  not "done" until a dated entry lands under `docs/experience/wins/` (or
-  `errors/` if a regression was found). This is the Verify phase exit
-  condition for any diff that could move numbers. No bench entry → not
-  shipped.
-  - **In scope** (bench required): anything under `infer/src/`,
-    `crates/cuda-kernels/csrc/`, `crates/mlx-sys/src/`, `src/`, any
-    `scripts/bench_*.{sh,py}` parameter change, feature-flag default flips,
-    scheduler/kernel/ops/model/backend edits, dependency bumps that touch
-    the hot path.
-  - **Exempt** (no bench): pure docs (`docs/`, `*.md`, `AGENTS.md`),
-    comment-only diffs, `CLAUDE.md` / memory, dev-only tooling,
-    gitignored-output paths. When exempt, state so in the commit body.
-  - **Regression-check minimum.** Even a "small" change: one
-    `scripts/bench_guidellm.sh` run against the most recent baseline for
-    the affected backend+model, with a Δ% row. Full sweep only when the
-    change is an optimization or architectural.
-  - **If the bench can't run locally** (e.g. CUDA change on a Mac),
-    the commit body MUST cite the remote-machine ticket or plan entry
-    that will execute it, and the entry is opened as a stub under
-    `wins/` with status `pending-remote`. No silent skips.
-  - **Auto-iterate** per spec §7 until stopping rules hold; then cross-link
-    the wins entry from the project/plan that commissioned the change.
+- **MANDATORY — every runtime change produces a bench entry.** A diff isn't
+  "done" until a dated entry lands under `docs/experience/wins/` (or
+  `errors/` on regression). Verify-phase exit condition. No entry → not shipped.
+  - **In scope:** `infer/src/`, `crates/cuda-kernels/csrc/`,
+    `crates/mlx-sys/src/`, `src/`, `scripts/bench_*.{sh,py}` param changes,
+    feature-flag default flips, hot-path dep bumps.
+  - **Exempt:** docs / `AGENTS.md` / `CLAUDE.md` / memory / dev-only tooling
+    / gitignored output. State so in the commit body.
+  - **Minimum:** one `scripts/bench_guidellm.sh` run vs latest baseline for
+    affected backend+model, with Δ% row. Full sweep only for optimization /
+    architectural changes.
+  - **Can't run locally** (e.g. CUDA on a Mac): commit body cites the remote
+    ticket; stub the entry under `wins/` with `pending-remote`. No silent skips.
+  - **Auto-iterate** per spec §7; cross-link wins back to the commissioning
+    project/plan.
 - Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-guidellm-<label>.md`
   using the [`TEMPLATE-bench-guidellm.md`](docs/experience/wins/TEMPLATE-bench-guidellm.md)
   skeleton. **Never overwrite**; after-snapshots cite before-snapshots with deltas.
@@ -362,6 +335,7 @@ Load the relevant `AGENTS.md` **before** editing inside a module.
 | `infer/src/ops/` | [AGENTS.md](infer/src/ops/AGENTS.md) — visibility policy, `_into` variants, batched conventions |
 | `infer/src/kv_tier/` | [AGENTS.md](infer/src/kv_tier/AGENTS.md) — tier model, RadixCache invariant, MR stability |
 | `infer/src/http_server/` | [AGENTS.md](infer/src/http_server/AGENTS.md) — OpenAI v1 compat, `session_id`, streaming |
+| `crates/autograd/` | [AGENTS.md](crates/autograd/AGENTS.md) — training-tape engine, CPU + Metal backends, host-authoritative `Vec<f32>` |
 | `crates/cuda-kernels/` | [AGENTS.md](crates/cuda-kernels/AGENTS.md) — prelude discipline, csrc layout, TileLang AOT |
 | `crates/mlx-sys/` | [AGENTS.md](crates/mlx-sys/AGENTS.md) — single Metal bridge, cmake+cc build, no repo `.metal` |
 

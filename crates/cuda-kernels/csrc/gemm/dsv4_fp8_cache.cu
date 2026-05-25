@@ -186,6 +186,10 @@ extern "C" cudaError_t dsv4_block_scaled_to_fp8_deepgemm_cuda(
       dst_scale_cols <= 0) {
     return cudaErrorInvalidValue;
   }
+  if (weight == nullptr || src_scales == nullptr || dst_weight == nullptr ||
+      dst_scales == nullptr) {
+    return cudaErrorInvalidValue;
+  }
   if (source_format != kDsv4SourceFp8 && source_format != kDsv4SourceFp4) {
     return cudaErrorInvalidValue;
   }
