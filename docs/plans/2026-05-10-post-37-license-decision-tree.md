@@ -2,10 +2,18 @@
 title: Post-#37 license decision tree — fast next-axis selection
 date: 2026-05-10
 type: plan
-status: ready-for-execution
+status: executed-superseded-by-pathB2-tier1 (2026-05-10)
 ---
 
 # Post-#37 license decision tree — what to do based on bench A/B Δ
+
+> **2026-05-25 status — EXECUTED.** This decision tree was consumed:
+> Path B v1 hit Tier 4 KILL
+> ([`Path B v1 KILL`](../experience/errors/2026-05-10-37-pathB-bench-tier4-kill-cache-miss-at-4k.md)),
+> then Path B.2 bucketing hit Tier 1 strong proceed
+> ([`Path B.2 Tier 1`](../experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md);
+> current summary in [`support-matrix.md`](../support-matrix.md)). Keep this
+> doc as the license-decision record; do not run it as current instructions.
 
 > Codex's Path B impl pre-commit evidence(per `c021053`)is HIGH confidence
 > for predicted TTFT improvement。This brief defines **explicit Claude

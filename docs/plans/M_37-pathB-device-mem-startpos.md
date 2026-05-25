@@ -2,12 +2,21 @@
 title: M_37 Path B — device-memory `start_pos` for prefill graph reuse
 date: 2026-05-10
 type: plan
-status: ready-for-codex-pickup
+status: superseded-by-pathB2-tier1 (2026-05-10)
 audience: codex
 prereq: #24 (35fc3cf landed) + #37 Path A KILL (e462c53)
 ---
 
 # Path B device-memory `start_pos` — close prefill graph reuse gap
+
+> **2026-05-25 status — SUPERSEDED.** Path B v1 device-metadata
+> implementation landed and passed functional gates, but the production
+> 4k/c=4 bench KILLED it: 388 capture keys for 388 requests = 0% reuse
+> ([`Path B v1 Tier 4 KILL`](../experience/errors/2026-05-10-37-pathB-bench-tier4-kill-cache-miss-at-4k.md)).
+> The follow-up Path B.2 bucketing fix then delivered Tier 1
+> ([`Path B.2 Tier 1`](../experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md);
+> current summary in [`support-matrix.md`](../support-matrix.md)).
+> Treat this plan as historical design context, not pickup work.
 
 > Per `docs/experience/errors/2026-05-10-37-throughput-bench-killed-pathA-multikey-churn.md`,
 > codex's #24 `35fc3cf` landed multi-key 8-d graph cache(`tokens, batch,
