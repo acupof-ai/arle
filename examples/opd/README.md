@@ -71,6 +71,7 @@ flag is tracked as Phase 7 of the
 |---|---:|---|---|
 | `sample-prompts.jsonl` | 20 | Short real-text OPD prompts for smoke-scale examples. | Manually curated repo-local examples. |
 | `sft-anchor-mmlu-gsm8k.jsonl` | 56 | Real-corpus SFT anchor for OPD/GKD feasibility tests. | 26 MMLU train rows + 30 GSM8K train rows. |
+| `opd-diverse-1k.jsonl` | 1000 | T20 corpus-diversity pure-OPD bench at `--prompt-max-tokens 16`. | MMLU `auxiliary_train` short-question subset. |
 
 `sft-anchor-mmlu-gsm8k.jsonl` was curated for the 2026-05-24 GKD
 real-corpus smoke. It uses train splits only, keeps 26 diverse-subject MMLU
@@ -92,6 +93,15 @@ Reproduction: no builder script is checked in yet; this corpus is a manually
 curated subset. Rebuild from the upstream train splits using the filter rules
 above and compare against the errors entry before replacing the checked-in
 file.
+
+`opd-diverse-1k.jsonl` was built for the 2026-05-25 T20 corpus-diversity
+bench. It samples 1000 rows from the 3720 eligible MMLU `auxiliary_train`
+questions after Qwen3.5-0.8B tokenizer filtering: prompt tokens are 6..16,
+completion tokens are 1..16, and exact question overlap with cached MMLU
+validation/test plus GSM8K test rows was removed. The prompt format is
+`Question: ...\nAnswer:`; GSM8K train yielded no rows in that format under
+the strict 16-token prompt cap, so this file stays MMLU-only rather than
+mixing prompt formats.
 
 ## Expected output (smoke)
 
