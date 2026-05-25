@@ -283,6 +283,24 @@ fn use_device_rollout_argmax(store: &TensorStore, rollout_len: usize, vocab: usi
     matches!(store.backend().device(), Device::Cuda) && (rollout_len >= 4 || vocab >= 65_536)
 }
 
+fn retain_rollout_step_tensors(
+    store: &mut TensorStore,
+    base_keep: &HashSet<TensorId>,
+    rollout_cache: &Qwen35KvCache,
+    current_device_token: Option<TensorId>,
+    generated_tokens: Option<TensorId>,
+) {
+    let mut keep = base_keep.clone();
+    rollout_cache.extend_tensor_ids(&mut keep);
+    if let Some(token_id) = current_device_token {
+        keep.insert(token_id);
+    }
+    if let Some(buffer_id) = generated_tokens {
+        keep.insert(buffer_id);
+    }
+    store.retain_ids(&keep);
+}
+
 fn rollout_full_forward(
     student: &Qwen35Model,
     rollout: &mut Vec<u32>,
@@ -290,6 +308,7 @@ fn rollout_full_forward(
     vocab: usize,
     store: &mut TensorStore,
     tape: &mut Tape,
+    base_keep: &HashSet<TensorId>,
 ) -> Result<()> {
     for _ in 0..rollout_len {
         let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
@@ -298,6 +317,7 @@ fn rollout_full_forward(
             .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
         let next = greedy_next_token(logits, rollout.len(), vocab, store)?;
         rollout.push(next);
+        store.retain_ids(base_keep);
     }
     Ok(())
 }
@@ -1060,6 +1080,8 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
     validate_student_params(student_params, store)?;
     validate_student_param_ownership(student_params, &student_model_params, &teacher_params)?;
     let keep_extra = retained_param_and_grad_ids(&teacher_params, store);
+    let mut rollout_keep_base = retained_param_and_grad_ids(&student_model_params, store);
+    rollout_keep_base.extend(keep_extra.iter().copied());
 
     let result = (|| {
         // 1. Greedy rollout — tape disabled, no backward graph for sample tokens.
@@ -1119,6 +1141,13 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                     )?);
                 }
                 current_device_token = Some(next_token);
+                retain_rollout_step_tensors(
+                    store,
+                    &rollout_keep_base,
+                    &rollout_cache,
+                    current_device_token,
+                    generated_tokens,
+                );
             }
             if let Some(buffer_id) = generated_tokens {
                 rollout.extend(read_generated_rollout_tokens(
@@ -1128,6 +1157,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                     store,
                 )?);
             }
+            store.retain_ids(&rollout_keep_base);
         } else if use_rollout_kv_cache {
             let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + cfg.rollout_len);
             for step in 0..cfg.rollout_len {
@@ -1159,9 +1189,19 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
                 let next = greedy_next_token(logits, logits_seq_len, vocab, store)?;
                 rollout.push(next);
+                retain_rollout_step_tensors(store, &rollout_keep_base, &rollout_cache, None, None);
             }
+            store.retain_ids(&rollout_keep_base);
         } else {
-            rollout_full_forward(student, &mut rollout, cfg.rollout_len, vocab, store, tape)?;
+            rollout_full_forward(
+                student,
+                &mut rollout,
+                cfg.rollout_len,
+                vocab,
+                store,
+                tape,
+                &rollout_keep_base,
+            )?;
         }
         record_profile(&mut profile, |profile| {
             profile.student_rollout_seconds += phase_started.elapsed().as_secs_f64();
@@ -1228,6 +1268,9 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 teacher_logits.shape, expected_teacher_shape
             )));
         }
+        let mut keep_teacher_logits = rollout_keep_base.clone();
+        keep_teacher_logits.insert(teacher_logits.tensor_id);
+        store.retain_ids(&keep_teacher_logits);
 
         // 3. Student forward — tape enabled now so backward can flow.
         tape.set_enabled(true);
