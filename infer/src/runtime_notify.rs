@@ -65,7 +65,7 @@ impl RuntimeNotifyGate {
             let _guard = self
                 .inner
                 .cv
-                .wait_while(guard, |_| {
+                .wait_while(guard, |()| {
                     self.inner.state.load(Ordering::Acquire) == PENDING
                 })
                 .unwrap_or_else(PoisonError::into_inner);
