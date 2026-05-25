@@ -8,6 +8,8 @@ use std::path::Path;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
+use std::sync::Once;
+#[cfg(feature = "cuda")]
 use std::time::Instant;
 
 use anyhow::{Result, bail, ensure};
@@ -2182,7 +2184,15 @@ impl DeepseekModel {
             &normed_owned
         };
         dsv4_trace_end(&self.ctx, "ffn_pre_norm", layer_idx, stream.seq_len, trace)?;
-        let routed = if dsv4_moe_deepep_enabled()? && self.config.ep.world_size > 1 {
+        let deepep_requested = dsv4_moe_deepep_enabled()?;
+        // Remote 8-rank H20 validation showed both DeepEP dispatch shapes can
+        // illegal-address the CUDA context: variable-count prefill at dispatch
+        // count receive, and padded decode at payload unpack/count receive.
+        // Keep the stable local-routed + EP all-reduce path as the supported
+        // multi-rank path. DeepEP remains available only behind the explicit
+        // unsafe backend value for focused dispatch debugging.
+        let use_deepep = deepep_requested && self.config.ep.world_size > 1;
+        let routed = if use_deepep {
             #[cfg(feature = "nccl")]
             {
                 let trace = dsv4_trace_begin(&self.ctx)?;
@@ -3922,11 +3932,21 @@ fn dsv4_gpu_contextual_logits_enabled() -> Result<bool> {
 
 #[cfg(feature = "cuda")]
 fn dsv4_moe_deepep_enabled() -> Result<bool> {
+    static DEEPEP_DISABLED_NOTICE: Once = Once::new();
     let Some(raw) = std::env::var("ARLE_DSV4_MOE_BACKEND").ok() else {
         return Ok(false);
     };
     match raw.as_str() {
-        "deepep" | "DeepEP" | "dispatch" | "dispatch_combine" => Ok(true),
+        "deepep" | "DeepEP" | "dispatch" | "dispatch_combine" => {
+            DEEPEP_DISABLED_NOTICE.call_once(|| {
+                info!(
+                    "DeepSeek V4 DeepEP backend request is using allreduce fallback; \
+                     set ARLE_DSV4_MOE_BACKEND=deepep_unsafe to force the experimental dispatch path"
+                );
+            });
+            Ok(false)
+        }
+        "deepep_unsafe" | "unsafe_deepep" | "dispatch_unsafe" => Ok(true),
         "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "FALSE" | "off" | "OFF" => {
             Ok(false)
         }

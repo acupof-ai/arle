@@ -30,13 +30,16 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let graph_capture_enabled = self.model.supports_cuda_graph_decode();
+        let decode_warmup_enabled = self.model.supports_decode_warmup();
         // Warm only batch sizes that can map to real scheduler slots. The
         // admission cap may be larger than a test/runtime slot count, but
         // decode warmup indexes slot-local state and paged-KV metadata.
         let max_bs = num_slots.min(256);
         let warmup_sizes = Self::cuda_graph_batch_sizes(max_bs);
 
-        if graph_capture_enabled {
+        if !decode_warmup_enabled {
+            info!("Decode warmup disabled by model capability");
+        } else if graph_capture_enabled {
             info!(
                 "Warming up CUDA Graphs for {} batch sizes (max {})...",
                 warmup_sizes.len(),
@@ -65,76 +68,76 @@ impl<M: ModelForward> Scheduler<M> {
             "paged KV pool page size must be non-zero"
         );
 
-        'warmup: {
-            for slot in 0..max_bs {
-                if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
-                    error!("Warmup: pool alloc for slot {} failed: {}", slot, e);
-                    break 'warmup;
-                }
-                allocated = slot + 1;
-            }
-
-            // Lazy-init decode context before warmup.
-            if self.decode_bufs.is_none() {
-                match self.model.create_decode_context(
-                    self.states.len(),
-                    self.effective_max_seq_len,
-                    &self.paged_kv_pool,
-                ) {
-                    Ok(ctx) => self.decode_bufs = Some(ctx),
-                    Err(e) => {
-                        error!("Warmup: failed to create decode context: {}", e);
+        if decode_warmup_enabled {
+            'warmup: {
+                for slot in 0..max_bs {
+                    if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
+                        error!("Warmup: pool alloc for slot {} failed: {}", slot, e);
                         break 'warmup;
                     }
+                    allocated = slot + 1;
                 }
-            }
 
-            let dummy_tokens: Vec<u32> = vec![0; max_bs];
-            let slot_indices: Vec<usize> = (0..max_bs).collect();
+                // Lazy-init decode context before warmup.
+                if self.decode_bufs.is_none() {
+                    match self.model.create_decode_context(
+                        self.states.len(),
+                        self.effective_max_seq_len,
+                        &self.paged_kv_pool,
+                    ) {
+                        Ok(ctx) => self.decode_bufs = Some(ctx),
+                        Err(e) => {
+                            error!("Warmup: failed to create decode context: {}", e);
+                            break 'warmup;
+                        }
+                    }
+                }
 
-            // Pass 1: drive forward for each warmup batch size. Populates the
-            // cublasLt heuristic algo cache for all GEMM shapes used by decode.
-            // In graph-capture mode, also captures a graph per batch size.
-            warmed = self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+                let dummy_tokens: Vec<u32> = vec![0; max_bs];
+                let slot_indices: Vec<usize> = (0..max_bs).collect();
 
-            // Autotune: benchmark all heuristic candidates, replace with measured best.
-            // Runs regardless of graph mode so eager LoRA decode lands on the same
-            // tuned algorithms as graph-mode decode.
-            //
-            // INFER_DETERMINISTIC=1 skips autotune. Reason: autotune keys the algo
-            // cache by (M,N,K); B=1 vs B=3 GEMMs land on different M and may pick
-            // different cublasLt algorithms with different fp accumulation order,
-            // which cascades into per-batch greedy divergence (the deferred
-            // greedy_consistency failure tracked in
-            // docs/experience/errors/2026-04-13-batched-decode-high-concurrency.md).
-            // With autotune off, cublasLtMatmulAlgoGetHeuristic returns the same
-            // top-ranked candidate for similar shapes regardless of M, restoring
-            // batch-invariant numerics at a small perf cost. Production keeps the
-            // default (autotune on) for max throughput.
-            let deterministic = matches!(
-                std::env::var("INFER_DETERMINISTIC").as_deref(),
-                Ok("1" | "true" | "TRUE" | "on" | "ON")
-            );
-            if warmed > 0 && !deterministic {
-                info!("Autotuning cublasLt GEMM algorithms ({} shapes)...", warmed);
-                let t_at = std::time::Instant::now();
-                unsafe {
-                    cuda_kernels::ffi::autotune_all_cached_gemms_cuda(
-                        self.model.device_context().stream.cu_stream(),
+                // Pass 1: drive forward for each warmup batch size. Populates the
+                // cublasLt heuristic algo cache for all GEMM shapes used by decode.
+                // In graph-capture mode, also captures a graph per batch size.
+                warmed = self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+
+                // Autotune: benchmark all heuristic candidates, replace with measured best.
+                // Runs regardless of graph mode so eager LoRA decode lands on the same
+                // tuned algorithms as graph-mode decode.
+                //
+                // INFER_DETERMINISTIC=1 skips autotune. Reason: autotune keys the algo
+                // cache by (M,N,K); B=1 vs B=3 GEMMs land on different M and may pick
+                // different cublasLt algorithms with different fp accumulation order,
+                // which cascades into per-batch greedy divergence (the deferred
+                // greedy_consistency failure tracked in
+                // docs/experience/errors/2026-04-13-batched-decode-high-concurrency.md).
+                // With autotune off, cublasLtMatmulAlgoGetHeuristic returns the same
+                // top-ranked candidate for similar shapes regardless of M, restoring
+                // batch-invariant numerics at a small perf cost. Production keeps the
+                // default (autotune on) for max throughput.
+                let deterministic = matches!(
+                    std::env::var("INFER_DETERMINISTIC").as_deref(),
+                    Ok("1" | "true" | "TRUE" | "on" | "ON")
+                );
+                if warmed > 0 && !deterministic {
+                    info!("Autotuning cublasLt GEMM algorithms ({} shapes)...", warmed);
+                    let t_at = std::time::Instant::now();
+                    unsafe {
+                        cuda_kernels::ffi::autotune_all_cached_gemms_cuda(
+                            self.model.device_context().stream.cu_stream(),
+                        );
+                    }
+                    info!(
+                        "cublasLt autotune done in {:.0}ms",
+                        t_at.elapsed().as_secs_f64() * 1e3,
+                    );
+                } else if deterministic {
+                    info!(
+                        "INFER_DETERMINISTIC=1 — skipping cublasLt autotune; \
+                         using heuristic top-1 for batch-invariant numerics"
                     );
                 }
-                info!(
-                    "cublasLt autotune done in {:.0}ms",
-                    t_at.elapsed().as_secs_f64() * 1e3,
-                );
-            } else if deterministic {
-                info!(
-                    "INFER_DETERMINISTIC=1 — skipping cublasLt autotune; \
-                     using heuristic top-1 for batch-invariant numerics"
-                );
-            }
-            if warmed > 0 && !deterministic {
-                if graph_capture_enabled {
+                if warmed > 0 && !deterministic && graph_capture_enabled {
                     // Invalidate graphs captured with heuristic algos.
                     {
                         use crate::model::DecodeContextOps;

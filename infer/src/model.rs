@@ -437,6 +437,17 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn device_context(&self) -> &DeviceContext;
 
+    /// Whether startup warmup may run synthetic decode work through this model.
+    ///
+    /// Synthetic decode is a pure performance warmup for models whose decode
+    /// path is side-effect-safe on dummy one-token rows. Distributed models
+    /// whose decode path enters collectives or transport state before a real
+    /// request should return false; otherwise a failed dummy decode can poison
+    /// the CUDA context before HTTP readiness opens.
+    fn supports_decode_warmup(&self) -> bool {
+        true
+    }
+
     /// Batched sampling: launch all sampling kernels, sync once, readback all.
     /// Returns one token per request. Default falls back to sequential select_token.
     fn select_tokens_batch(

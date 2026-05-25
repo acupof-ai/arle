@@ -225,6 +225,10 @@ impl ModelForward for DeepseekModel {
         &self.ctx
     }
 
+    fn supports_decode_warmup(&self) -> bool {
+        self.config.tp.world_size == 1 && self.config.ep.world_size == 1
+    }
+
     fn supports_cuda_graph_decode(&self) -> bool {
         false
     }
