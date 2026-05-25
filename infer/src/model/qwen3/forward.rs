@@ -441,8 +441,18 @@ impl ModelForward for Qwen3Model {
         paged_kv_pool: Option<&mut PagedKVPool>,
         prefill_ctx: &mut Self::PrefillContext,
     ) -> Result<()> {
+        // Paged prefill currently relies on the TileLang HD128 batched kernel,
+        // which hard-asserts `page_size == 16` (see `ops/attention.rs:617`).
+        // Pools that allocate `page_size == 1` (TurboQuant) must take the
+        // contiguous BF16 prefill path; the scheduler then migrates via
+        // `migrate_from_contiguous_turboquant_range` at completion. Mirror
+        // the same gate that `scheduler/cuda/prefill.rs::prepare` applies
+        // so direct entry points (e.g. warmup, in-process tests) honor the
+        // invariant too.
         match paged_kv_pool {
-            Some(pool) if self.prefill_uses_paged_pool() && pool.is_active() => {
+            Some(pool)
+                if self.prefill_uses_paged_pool() && pool.is_active() && pool.page_size == 16 =>
+            {
                 if !prepare_paged_prefill_batch(&self.ctx, requests, pool)? {
                     return Ok(());
                 }
