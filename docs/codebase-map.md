@@ -123,7 +123,8 @@ Key files:
 ### Current train control-plane path (post-OPD-pivot, 2026-05-18)
 
 ```text
-crates/train/src/commands/train_opd.rs   (substrate landing next milestone)
+crates/train/src/{opd,teacher_infer}.rs   (OPD substrate ✅ landed: opd_step, GKD anchor, MultiTeacher/InferTeacher/ApiTeacher/InProcessTeacher)
+crates/train/src/commands.rs             (in-crate command module 🚧 stub; arle train opd CLI in crates/cli/src/train_cli.rs)
   -> train::server::bind_and_serve_on_thread()
   -> std TcpListener control plane on /v1/train/{status,events,stop,save}
   -> train::control::TrainingController + ControllerSink

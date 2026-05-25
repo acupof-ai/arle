@@ -12,8 +12,7 @@ and broad scratch reuse have landed on 8xH20; `decode64` holds 12.05 post-first
 tok/s, isolated single-token wave **105.2 → 87.7 ms**. Remaining blockers:
 NCCL SendRecv/AllReduce, FP8/FP4 expert GEMV (awaits true grouped GEMM /
 DeepGEMM), launch churn. Evidence:
-[`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md),
-[`trace-artifacts/2026-05-15-dsv4-deepep/`](trace-artifacts/2026-05-15-dsv4-deepep/).
+[`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md).
 
 **Qwen3.5 Medusa is not pickup-ready** — recurrent-state accepted-length
 commit/rollback contract is the gate. Active plan:
@@ -62,8 +61,8 @@ marked as the current source of truth, treat it as historical context.
 | [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | Active | The question is current KV-tier scope, milestones, or operator-facing status. |
 | [projects/tiered-kv-runtime-flow.md](projects/tiered-kv-runtime-flow.md) | Active | The question is how scheduler, RadixCache, and tier coordinator interact at runtime. |
 | [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | Active | The question is Metal serving closure, MLX runtime direction, Qwen3.5 GGUF decode hot path. |
-| [projects/agent-rl-self-evolving.md](projects/agent-rl-self-evolving.md) | Active | The question is how train/RL/self-evolution work strengthens the runtime spine. |
 | [projects/agent-first-architecture.md](projects/agent-first-architecture.md) | Active but secondary | The question is long-horizon agent-serving priorities outside the current KV plan. |
+| [projects/2026-05-18-opd-only-pivot.md](projects/2026-05-18-opd-only-pivot.md) | Active | The question is the OPD-only training pivot (supersedes the retired agent-rl-self-evolving / rust-agent-rl-single-node / train-runtime-architecture-v1 trio). |
 
 ## Active Plans
 
@@ -75,12 +74,11 @@ marked as the current source of truth, treat it as historical context.
 | [plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md) | Active gate | The question is how to make Qwen3.5 safe for Medusa/spec verification. Start here for Qwen3.5 Medusa work. |
 | [plans/2026-05-01-mla-kernel-design.md](plans/2026-05-01-mla-kernel-design.md) | Design only | The question is the DeepSeek-family MLA CUDA kernel design (DS3) — formula, cache layout, prefill/decode dispatch. |
 | [plans/2026-05-02-agent-load-bench-spec.md](plans/2026-05-02-agent-load-bench-spec.md) | Active | The question is the W3/W4 agent-load benchmark contract: short-prompt multi-turn, tool-call resume, session affinity, cache metrics, four-engine baseline evidence. |
+| [plans/2026-05-25-tiered-kv-swap-substrate.md](plans/2026-05-25-tiered-kv-swap-substrate.md) | Draft implementation contract | The question is the memory/GPU/SSD exchange substrate for tiered KV: T0 GPU HBM <-> T1 host pinned DRAM <-> T2 local NVMe, direct-region copy, and required review/bench gates. |
 | [plans/2026-05-03-a8-gpu-sm-kv-io-kernel.md](plans/2026-05-03-a8-gpu-sm-kv-io-kernel.md) | Pending — gated on W4 close | The question is whether to swap `cudaMemcpyAsync` for an SM-driven kernel on T0↔T1 paged-block transfers (LMSYS 3× claim). Read before touching `kv_tier/transport`. |
 | [plans/cpu-gpu-pipeline-sync-stream.md](plans/cpu-gpu-pipeline-sync-stream.md) | Design plan | The question is how to make CPU/GPU serving pipeline stages explicit, with CUDA stream/event fences and Metal async-eval or command-buffer completion semantics. |
 | [plans/infer-observability-v1.md](plans/infer-observability-v1.md) | Active | The question is operator-facing observability, traces, or profiling flow. |
 | [plans/tiered-kv-hicache-readmission.md](plans/tiered-kv-hicache-readmission.md) | Active | The question is staged KV readmission or remote/shared backend follow-up. |
-| [plans/rust-agent-rl-single-node.md](plans/rust-agent-rl-single-node.md) | Active | The question is the Phase 6 execution path under the runtime-first rule. |
-| [plans/train-runtime-architecture-v1.md](plans/train-runtime-architecture-v1.md) | Active | The question is today's train-side runtime / control-plane factoring. |
 | [plans/train-observability-v1.md](plans/train-observability-v1.md) | Active | The question is train-side events, MLflow, OTLP, or W&B export flow. |
 | [plans/train-eval-infer-dx-v1.md](plans/train-eval-infer-dx-v1.md) | Active | The question is unified operator DX across train, eval, and infer. |
 
@@ -152,8 +150,6 @@ brings them back.
   SGLang closure, RoPE YARN scaling landing, train-side milestone snapshots).
 - `docs/experience/reviews/` is one Codex code-review snapshot retained as
   reference for the cuda-link audit.
-- `docs/trace-artifacts/` holds dated nsys / GPU trace artifacts (DSv4 decode
-  + DeepEP, 2026-05-14 onwards).
 - Plans / projects / research / reviews not listed above (active or archived)
   are historical session notes. Anything not on this index is not a source
   of truth.
