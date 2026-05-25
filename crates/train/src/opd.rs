@@ -283,6 +283,13 @@ fn use_device_rollout_argmax(store: &TensorStore, rollout_len: usize, vocab: usi
     matches!(store.backend().device(), Device::Cuda) && (rollout_len >= 4 || vocab >= 65_536)
 }
 
+const ROLLOUT_RETAIN_INTERVAL: usize = 8;
+
+fn should_retain_rollout_step(step: usize, rollout_len: usize) -> bool {
+    let completed_steps = step + 1;
+    completed_steps % ROLLOUT_RETAIN_INTERVAL == 0 || completed_steps == rollout_len
+}
+
 fn retain_rollout_step_tensors(
     store: &mut TensorStore,
     base_keep: &HashSet<TensorId>,
@@ -310,15 +317,18 @@ fn rollout_full_forward(
     tape: &mut Tape,
     base_keep: &HashSet<TensorId>,
 ) -> Result<()> {
-    for _ in 0..rollout_len {
+    for step in 0..rollout_len {
         let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
         let logits = student
             .forward(store, tape, rollout, &positions)
             .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
         let next = greedy_next_token(logits, rollout.len(), vocab, store)?;
         rollout.push(next);
-        store.retain_ids(base_keep);
+        if should_retain_rollout_step(step, rollout_len) {
+            store.retain_ids(base_keep);
+        }
     }
+    store.retain_ids(base_keep);
     Ok(())
 }
 
@@ -539,7 +549,7 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
         let phase_started = Instant::now();
         let teacher_logits = teacher
             .forward_logits_device(prefix, &positions, store, tape)
-            .map_err(|err| map_teacher_forward_error("teacher chunk scoring", err))?;
+            .map_err(|err| map_teacher_forward_error("teacher scoring", err))?;
         record_profile(profile, |profile| {
             profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
         });
@@ -1139,13 +1149,15 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                     )?);
                 }
                 current_device_token = Some(next_token);
-                retain_rollout_step_tensors(
-                    store,
-                    &rollout_keep_base,
-                    &rollout_cache,
-                    current_device_token,
-                    generated_tokens,
-                );
+                if should_retain_rollout_step(step, cfg.rollout_len) {
+                    retain_rollout_step_tensors(
+                        store,
+                        &rollout_keep_base,
+                        &rollout_cache,
+                        current_device_token,
+                        generated_tokens,
+                    );
+                }
             }
             if let Some(buffer_id) = generated_tokens {
                 rollout.extend(read_generated_rollout_tokens(
@@ -1187,7 +1199,15 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
                 let next = greedy_next_token(logits, logits_seq_len, vocab, store)?;
                 rollout.push(next);
-                retain_rollout_step_tensors(store, &rollout_keep_base, &rollout_cache, None, None);
+                if should_retain_rollout_step(step, cfg.rollout_len) {
+                    retain_rollout_step_tensors(
+                        store,
+                        &rollout_keep_base,
+                        &rollout_cache,
+                        None,
+                        None,
+                    );
+                }
             }
             store.retain_ids(&rollout_keep_base);
         } else {
