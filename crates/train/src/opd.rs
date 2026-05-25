@@ -492,6 +492,84 @@ fn kl_distill_loss_for_config(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
+    student: &Qwen35Model,
+    teacher: &T,
+    rollout: &[u32],
+    vocab: usize,
+    chunk_size: usize,
+    student_model_params: &[TensorId],
+    keep_extra: &HashSet<TensorId>,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    profile: &mut Option<&mut OpdStepProfile>,
+) -> Result<f32> {
+    let total_positions = rollout.len();
+    let mut loss_value = 0.0_f32;
+
+    for seq_start in (0..total_positions).step_by(chunk_size) {
+        let seq_end = seq_start.saturating_add(chunk_size).min(total_positions);
+        let chunk_len = seq_end - seq_start;
+        let positions = (0..seq_end as u32).collect::<Vec<_>>();
+        let prefix = &rollout[..seq_end];
+
+        tape.entries.clear();
+        tape.set_enabled(false);
+        let phase_started = Instant::now();
+        let teacher_logits = teacher
+            .forward_logits_device(prefix, &positions, store, tape)
+            .map_err(|err| map_teacher_forward_error("teacher chunk scoring", err))?;
+        record_profile(profile, |profile| {
+            profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
+        });
+        let expected_shape = vec![1, seq_end, vocab];
+        if teacher_logits.shape != expected_shape {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD chunked teacher logits shape mismatch: got {:?}, expected {:?}. \
+                 Hint: the TeacherForward implementation must return \
+                 [batch=1, seq_len, vocab] logits for the exact prefix being scored.",
+                teacher_logits.shape, expected_shape
+            )));
+        }
+
+        tape.set_enabled(true);
+        let phase_started = Instant::now();
+        let student_logits = student
+            .forward(store, tape, prefix, &positions)
+            .map_err(|err| map_qwen35_forward_error("student chunk KL", err))?;
+        record_profile(profile, |profile| {
+            profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
+        });
+
+        let phase_started = Instant::now();
+        let starts = [0, seq_start, 0];
+        let ends = [1, seq_end, vocab];
+        let teacher_chunk =
+            slice(teacher_logits.tensor_id, &starts, &ends, store, tape).map_err(OpdError::from)?;
+        let student_chunk =
+            slice(student_logits, &starts, &ends, store, tape).map_err(OpdError::from)?;
+        let chunk_loss = kl_distill_loss(student_chunk, teacher_chunk, chunk_len, store, tape)
+            .map_err(OpdError::from)?;
+        let chunk_weight = chunk_len as f32 / total_positions as f32;
+        let weighted_loss =
+            mul_scalar(chunk_loss, chunk_weight, store, tape).map_err(OpdError::from)?;
+        loss_value += store.to_host(weighted_loss).map_err(OpdError::from)?[0];
+        record_profile(profile, |profile| {
+            profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
+        });
+
+        let phase_started = Instant::now();
+        tape.backward(weighted_loss, store)?;
+        record_profile(profile, |profile| {
+            profile.backward_seconds += phase_started.elapsed().as_secs_f64();
+        });
+        cleanup_after_backward(store, tape, student_model_params, keep_extra);
+    }
+
+    Ok(loss_value)
+}
+
 fn validate_rollout_shape(prompt_len: usize, rollout_len: usize, vocab: usize) -> Result<()> {
     let total_len = prompt_len.checked_add(rollout_len).ok_or_else(|| {
         OpdError::InvalidInput(format!(
@@ -1088,6 +1166,46 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         record_profile(&mut profile, |profile| {
             profile.student_rollout_seconds += phase_started.elapsed().as_secs_f64();
         });
+
+        if let Some(chunk_size) = gkd_config.kl_chunk_size
+            && gkd_config.lambda == 0.0
+        {
+            let phase_started = Instant::now();
+            optimizer.zero_grad(store, student_params);
+            record_profile(&mut profile, |profile| {
+                profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
+            });
+
+            let loss_value = backward_chunked_kl_rollout(
+                student,
+                teacher,
+                &rollout,
+                vocab,
+                chunk_size,
+                &student_model_params,
+                &keep_extra,
+                store,
+                tape,
+                &mut profile,
+            )?;
+            validate_loss_value(loss_value)?;
+
+            let phase_started = Instant::now();
+            clip_grad_norm(student_params, cfg.grad_clip, store);
+            record_profile(&mut profile, |profile| {
+                profile.grad_clip_seconds += phase_started.elapsed().as_secs_f64();
+            });
+            let phase_started = Instant::now();
+            optimizer.step(store, student_params)?;
+            record_profile(&mut profile, |profile| {
+                profile.optimizer_step_seconds += phase_started.elapsed().as_secs_f64();
+            });
+
+            return Ok(OpdStepOutcome {
+                loss: loss_value,
+                rollout_len: rollout.len(),
+            });
+        }
 
         // 2. Teacher forward — still tape-disabled. Teacher params carry
         //    `requires_grad = false` so no entries record even if tape was on,
