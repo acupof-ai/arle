@@ -180,7 +180,7 @@ fn compile_cubin_for_current_device(ctx: &Arc<CudaContext>) -> Result<(Ptx, &'st
     // deployment driver supports CUDA 12.2 while the available NVRTC is 12.4;
     // PTX 8.4 would fail driver JIT with CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
     // but an sm_70 cubin loads cleanly and keeps the kernel code uniform.
-    let image = compile_cubin(concat_sources(), arch).map_err(|err| {
+    let image = compile_cubin(&concat_sources(), arch).map_err(|err| {
         cuda_kernel_error(format!(
             "nvrtc compile cubin failed for autograd kernels arch={arch}: {err}"
         ))
