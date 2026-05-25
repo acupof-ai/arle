@@ -335,6 +335,7 @@ mod tests {
                         usage: None,
                         logprob: None,
                         token_ids: Vec::new(),
+                        error: None,
                     });
                 }
                 let _ = tx.send(CompletionStreamDelta {
@@ -343,6 +344,7 @@ mod tests {
                     usage: Some(output.usage),
                     logprob: None,
                     token_ids: output.response_token_ids.clone(),
+                    error: None,
                 });
                 Ok(())
             }

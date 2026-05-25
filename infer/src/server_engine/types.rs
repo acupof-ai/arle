@@ -35,7 +35,7 @@ impl RawLogits {
 
     pub fn with_logits_device_ptr<T>(&self, f: impl FnOnce(u64) -> T) -> T {
         let (ptr, _guard) = self.logits.data.device_ptr(&self.device.stream);
-        f(ptr as u64)
+        f(ptr)
     }
 }
 
@@ -140,6 +140,15 @@ impl CompletionStreamError {
             message,
             chain,
         }
+    }
+
+    pub fn into_anyhow(self) -> anyhow::Error {
+        let chain = if self.chain.is_empty() {
+            self.message
+        } else {
+            self.chain.join(": ")
+        };
+        anyhow!("{}: {}", self.kind, chain)
     }
 }
 

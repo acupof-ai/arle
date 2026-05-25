@@ -78,16 +78,27 @@ impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
         let mut response_token_ids: Vec<u32> = Vec::new();
 
         while let Some(delta) = rx.blocking_recv() {
-            if !delta.text_delta.is_empty() {
-                text.push_str(&delta.text_delta);
+            let CompletionStreamDelta {
+                text_delta,
+                finish_reason: delta_finish_reason,
+                usage: delta_usage,
+                logprob: _,
+                token_ids,
+                error,
+            } = delta;
+            if let Some(error) = error {
+                return Err(error.into_anyhow());
             }
-            if !delta.token_ids.is_empty() {
-                response_token_ids.extend(delta.token_ids);
+            if !text_delta.is_empty() {
+                text.push_str(&text_delta);
             }
-            if let Some(final_usage) = delta.usage {
+            if !token_ids.is_empty() {
+                response_token_ids.extend(token_ids);
+            }
+            if let Some(final_usage) = delta_usage {
                 usage = Some(final_usage);
             }
-            if let Some(reason) = delta.finish_reason {
+            if let Some(reason) = delta_finish_reason {
                 finish_reason = Some(reason);
                 break;
             }
@@ -116,7 +127,7 @@ impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
         let _ = self.submit_request(req, inner_tx)?;
         while let Some(delta) = inner_rx.blocking_recv() {
-            let finished = delta.finish_reason.is_some();
+            let finished = delta.finish_reason.is_some() || delta.error.is_some();
             if tx.send(delta).is_err() {
                 // Consumer dropped — drain remaining deltas silently.
                 while inner_rx.blocking_recv().is_some() {}

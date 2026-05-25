@@ -368,6 +368,57 @@ mod tests {
 
     #[cfg(any(feature = "metal", test))]
     #[test]
+    fn request_handle_engine_complete_surfaces_terminal_error_delta() {
+        use super::{
+            CompletionRequest, CompletionStreamDelta, InferenceEngine, RequestHandleInferenceEngine,
+        };
+        use crate::request_handle::{RequestHandle, SubmitError};
+        use crate::sampler::SamplingParams;
+        use crate::scheduler::IncomingRequest;
+
+        struct ErrorHandle;
+
+        impl RequestHandle for ErrorHandle {
+            fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+                let _ = req.delta_tx.send(CompletionStreamDelta::error(
+                    "inference_failed",
+                    vec![
+                        "op=batch_decode layer=12".into(),
+                        "CUDA_ERROR_ILLEGAL_ADDRESS".into(),
+                    ],
+                ));
+                Ok(())
+            }
+
+            fn model_id(&self) -> &'static str {
+                "error-handle"
+            }
+        }
+
+        let mut engine = RequestHandleInferenceEngine {
+            model_id: "error-handle".into(),
+            handle: ErrorHandle,
+        };
+        let err = match engine.complete(CompletionRequest {
+            prompt: "hi".into(),
+            max_tokens: 1,
+            sampling: SamplingParams::default(),
+            stop: None,
+            logprobs: false,
+            session_id: None,
+            trace_context: None,
+        }) {
+            Ok(_) => panic!("terminal error delta should fail complete()"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("inference_failed"));
+        assert!(msg.contains("op=batch_decode layer=12"));
+        assert!(msg.contains("CUDA_ERROR_ILLEGAL_ADDRESS"));
+    }
+
+    #[cfg(any(feature = "metal", test))]
+    #[test]
     fn request_handle_engine_preprocesses_prompt_tokens_before_submit() {
         use super::{
             CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,

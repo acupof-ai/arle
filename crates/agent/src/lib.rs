@@ -1281,19 +1281,29 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
             let Some(rx_ref) = rx.as_mut() else { break };
             match rx_ref.try_recv() {
                 Ok(delta) => {
-                    if !delta.text_delta.is_empty() {
+                    let CompletionStreamDelta {
+                        text_delta,
+                        finish_reason: delta_finish_reason,
+                        usage: delta_usage,
+                        logprob: _,
+                        token_ids,
+                        error,
+                    } = delta;
+                    if let Some(error) = error {
+                        stream_err = Some(error.into_anyhow());
+                        break;
+                    }
+                    if !text_delta.is_empty() {
                         if let Some(callback) = on_text_chunk.as_deref_mut() {
-                            callback(&delta.text_delta);
+                            callback(&text_delta);
                         }
-                        text.push_str(&delta.text_delta);
+                        text.push_str(&text_delta);
                     }
-                    if !delta.token_ids.is_empty() {
-                        response_token_ids.extend(delta.token_ids.iter());
-                    }
-                    if let Some(final_usage) = delta.usage {
+                    response_token_ids.extend(token_ids);
+                    if let Some(final_usage) = delta_usage {
                         usage = Some(final_usage);
                     }
-                    if let Some(reason) = delta.finish_reason {
+                    if let Some(reason) = delta_finish_reason {
                         finish_reason = Some(reason);
                         break;
                     }
@@ -1457,6 +1467,7 @@ mod tests {
                     usage: None,
                     logprob: None,
                     token_ids: Vec::new(),
+                    error: None,
                 });
             }
             let _ = tx.send(CompletionStreamDelta {
@@ -1465,6 +1476,7 @@ mod tests {
                 usage: Some(output.usage),
                 logprob: None,
                 token_ids: output.response_token_ids.clone(),
+                error: None,
             });
             Ok(())
         }
