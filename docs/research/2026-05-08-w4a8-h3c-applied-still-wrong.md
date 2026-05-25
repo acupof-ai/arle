@@ -124,10 +124,10 @@ on a single linear layer (unit test with known input).
 
 ## Cross-references
 
-- H3 row stride: [`2026-05-08-w4a8-bug-h3-confirmed-perms-row-stride.md`](2026-05-08-w4a8-bug-h3-confirmed-perms-row-stride.md) (`25391f3`)
-- H3b scale_perm_single missing: [`2026-05-08-w4a8-bug-h3b-confirmed-scale-perm-single-deleted.md`](2026-05-08-w4a8-bug-h3b-confirmed-scale-perm-single-deleted.md) (`3479a87`)
+- H3 row stride: `2026-05-08-w4a8-bug-h3-confirmed-perms-row-stride.md` (`25391f3`; historical reference, file removed)
+- H3b scale_perm_single missing: `2026-05-08-w4a8-bug-h3b-confirmed-scale-perm-single-deleted.md` (`3479a87`; historical reference, file removed)
 - H3 row-fix partial: [`2026-05-08-w4a8-h3-row-fix-partial.md`](2026-05-08-w4a8-h3-row-fix-partial.md) (`62f885d`)
 - H3b applied still partial: [`2026-05-08-w4a8-h3b-fix-applied-still-partial.md`](2026-05-08-w4a8-h3b-fix-applied-still-partial.md) (`03178cf`)
-- H3c source diff: [`2026-05-08-w4a8-bug-h3c-confirmed-permute-before-divide.md`](2026-05-08-w4a8-bug-h3c-confirmed-permute-before-divide.md) (`d0f030b`)
+- H3c source diff: `2026-05-08-w4a8-bug-h3c-confirmed-permute-before-divide.md` (`d0f030b`; historical reference, file removed)
 - W4A8 garbage gate: [`../experience/errors/2026-05-08-w4a8-quantize-broken-100pct-token-diff.md`](../experience/errors/2026-05-08-w4a8-quantize-broken-100pct-token-diff.md) (`81b6481`)
 - ARLE script (current state with H3 + H3b + H3c): `/tmp/quantize_qwen3_w4a8.py`

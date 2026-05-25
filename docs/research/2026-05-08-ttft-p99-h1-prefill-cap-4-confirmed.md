@@ -118,7 +118,7 @@ chunking / graph-warmup interaction。
 
 ## Cross-references
 
-- Plan: [`a25416b`](../plans/M_ttft-p99-tail-latency.md)
+- Plan: `a25416b` (historical reference, file removed)
 - Source-of-cap: `b708e00` admission fix
 - Empirical signal: `f5cf829` W4 c=8 bench
 - Cap location: `infer/src/model/qwen3/forward.rs:310-320`

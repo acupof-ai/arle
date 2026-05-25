@@ -81,7 +81,7 @@ without unit-test isolation** is at methodology limit per codex audit Rule。
 
 ## Cross-references
 
-- Codex H4 confirmed: [`2026-05-08-w4a8-bug-h4-confirmed-spack-redundant-transpose.md`](2026-05-08-w4a8-bug-h4-confirmed-spack-redundant-transpose.md) (`592779a`)
+- Codex H4 confirmed: `2026-05-08-w4a8-bug-h4-confirmed-spack-redundant-transpose.md` (`592779a`; historical reference, file removed)
 - Codex H4 fix promoted: `scripts/quantize_qwen3_w4a8.py` (`945df02`)
 - Codex audit: [`2026-05-08-w4a8-kernel-and-wiring-audit-clean.md`](2026-05-08-w4a8-kernel-and-wiring-audit-clean.md) (`01ace86`)
 - 5-iteration narrowing chain:

@@ -221,7 +221,7 @@ The wrapper's only hard dependency is `guidellm` itself + `jq` + `curl`.
 - <generalizable rule or tuning takeaway>
 
 ## Δ vs baseline
-- Baseline: [`<date>-bench-guidellm-<label>.md`](<relative path>)
+- Baseline: `<date>-bench-guidellm-<label>.md`
 - % change per column if prior snapshot exists.
 
 ## Artefacts
@@ -294,7 +294,8 @@ docs.
   `pending-remote` wins stub for the canonical run, then use exploration
   mode (`--quick` or explicit overrides) only for local diagnosis.
   Root cause + fix plan:
-  [`docs/experience/errors/2026-04-15-metal-allocator-resource-limit-panic.md`](../experience/errors/2026-04-15-metal-allocator-resource-limit-panic.md).
+  `docs/experience/errors/2026-04-15-metal-allocator-resource-limit-panic.md`
+  (historical reference, file removed).
   CUDA is unaffected.
 
 ---

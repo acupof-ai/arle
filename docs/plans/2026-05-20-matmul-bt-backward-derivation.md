@@ -1,7 +1,8 @@
 # 2026-05-20 — `matmul_bt` op + backward derivation (Axis A of `lm_head` perf)
 
 > **Status:** plan / derivation. Companion to
-> [`docs/research/2026-05-20-lm-head-transpose-cache.md`](../research/2026-05-20-lm-head-transpose-cache.md)
+> `docs/research/2026-05-20-lm-head-transpose-cache.md`
+> (historical reference, file removed)
 > §"Axis A — Transpose-aware forward matmul". Implementation handed to
 > codex per the 2026-05-20 work split (Claude = research/plan/docs/deterministic
 > code; codex = complex code + verification).
@@ -194,7 +195,8 @@ parameter check. Codex decides the surface.
 ## Cross-links
 
 - Research / decision tree:
-  [`docs/research/2026-05-20-lm-head-transpose-cache.md`](../research/2026-05-20-lm-head-transpose-cache.md)
+  `docs/research/2026-05-20-lm-head-transpose-cache.md`
+  (historical reference, file removed)
 - Existing transpose-aware kernel:
   `crates/autograd/src/backend.rs:1697-1810`
 - Existing `linear_forward`:

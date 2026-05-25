@@ -156,7 +156,7 @@ D3. **Default-on flip timing**:
 ## §8 Cross-references
 
 - W4A8 finding: [`39237b9`](../research/2026-05-08-w4a8-naive-max-scale-too-lossy-need-calibration.md)
-- W4A16 license: [`f6f3af3`](../experience/wins/...marlin license entry)
+- W4A16 license: `f6f3af3` (historical reference, placeholder wins path removed)
 - Master strategy: [`docs/projects/2026-05-07-arle-master-strategy.md`](../projects/2026-05-07-arle-master-strategy.md) §1.2.1.A
 - Kernel substrate: `crates/cuda-kernels/csrc/gemm/marlin_w4a8_kernel.cu`(0-diff PR #31)
 - Loader: `infer/src/weight_loader.rs:663-715`

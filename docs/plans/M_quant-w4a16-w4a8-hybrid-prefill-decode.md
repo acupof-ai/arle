@@ -206,13 +206,13 @@ when 35B production looms。
 
 ## §7 Cross-references
 
-- W4A16 LICENSED: [`bc15eca`](../experience/wins/2026-05-08-w4a16-gptq-zpfix-round4-bench.md)
-- W4A8 prefill LICENSED: [`b5889b3`](../experience/wins/2026-05-08-w4a8-gptq-zpfix-canonical-bench.md)
+- W4A16 LICENSED: [`bc15eca`](../experience/wins/2026-05-08-w4a16-gptq-zpfix-implementation-gap-CLOSED.md)
+- W4A8 prefill LICENSED: [`b5889b3`](../experience/wins/2026-05-08-w4a8-gptq-zpfix-prefill-win-decode-null.md)
 - qzeros fix: [`2a3a6f0`](../research/2026-05-08-gptq-qzeros-zero-minus-1-convention-bug.md)
 - Master strategy update: [`182e084`](../projects/2026-05-07-arle-master-strategy.md)
 - R4 #6 hybrid KILL precedent: `4571082`(W4A16 dynamic batch-size dispatch — different from this plan)
 - M_quant umbrella: [`662cbbb`](M_quant-autogptq-marlin-integration.md)
-- EOD+43 synthesis: [`b04b5fb`](../research/2026-05-08-eod43-w4a8-axis3-licensed-end-to-end.md)
+- EOD+43 synthesis: `b04b5fb` (historical reference, file removed)
 
 ## §8 Methodology validation
 

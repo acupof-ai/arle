@@ -8,9 +8,9 @@
 > in the decode kernel, not the scheduler.
 >
 > Tier B#1 from the morning gap analysis
-> ([`2026-05-07-metal-world-first-gap-analysis.md`](../projects/2026-05-07-metal-world-first-gap-analysis.md))
+> ([`2026-05-07-metal-world-first-strategy.md`](../projects/2026-05-07-metal-world-first-strategy.md))
 > and the unification recalibration
-> ([`2026-05-07-metal-world-first-recalibration-vs-unification.md`](../projects/2026-05-07-metal-world-first-recalibration-vs-unification.md))
+> ([`2026-05-07-metal-world-first-strategy.md`](../projects/2026-05-07-metal-world-first-strategy.md))
 > both pointed at paged-KV; this plan turns it into ordered commits.
 
 ## 0. Goal
@@ -176,8 +176,8 @@ default of 4 stays until commit 5 lands.
   block-table-aware attention is M_e.2.
 - **KV quantization.** Q8 / FP8 KV is Tier A#2 and lives on the
   shared `infer/src/ops/kv_ops.rs` per the M4 unification frame
-  ([`recalibration doc`](../projects/2026-05-07-metal-world-first-
-  recalibration-vs-unification.md)). It composes orthogonally on top
+  ([`strategy doc`](../projects/2026-05-07-metal-world-first-strategy.md)).
+  It composes orthogonally on top
   of this plan.
 - **Multi-LoRA.** Punica/S-LoRA on Metal is Tier D frontier work, no
   upstream baseline to compete with — separate plan.
@@ -337,9 +337,9 @@ in this session.
 - Bench evidence:
   [`2026-05-07-bench-guidellm-metal-c-sweep-m4pro.md`](../experience/wins/2026-05-07-bench-guidellm-metal-c-sweep-m4pro.md)
 - Tier ranking source:
-  [`2026-05-07-metal-world-first-gap-analysis.md`](../projects/2026-05-07-metal-world-first-gap-analysis.md)
+  [`2026-05-07-metal-world-first-strategy.md`](../projects/2026-05-07-metal-world-first-strategy.md)
 - Unification frame for any cross-backend op work:
-  [`2026-05-07-metal-world-first-recalibration-vs-unification.md`](../projects/2026-05-07-metal-world-first-recalibration-vs-unification.md)
+  [`2026-05-07-metal-world-first-strategy.md`](../projects/2026-05-07-metal-world-first-strategy.md)
 - Substrate to wire:
   `infer/src/backend/metal/kv_pool.rs` (fully built, unused on hot path)
 - Hot-path invariants:

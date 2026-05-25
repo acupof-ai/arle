@@ -2,7 +2,7 @@
 
 > Pre-plan output for `backend-unification.md` §M5 (Unified ModelForward
 > Trait + Qwen3 Cross-Backend Path). Per the
-> [`feedback_p0_survey_before_plan_body`](../../.claude/projects/-home-ckl-projects-arle/memory/feedback_p0_survey_before_plan_body.md)
+> `feedback_p0_survey_before_plan_body` (historical reference, file removed)
 > rule, do the file survey before drafting milestones — this entry IS the
 > survey output, not a milestone plan.
 >

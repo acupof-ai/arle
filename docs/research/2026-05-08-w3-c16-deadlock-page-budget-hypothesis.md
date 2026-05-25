@@ -114,8 +114,8 @@ Doesn't fix root cause but works around the deadlock at lower throughput。
 
 ## Cross-references
 
-- W3 deadlock errors entry: [`cb087c7`](../experience/errors/2026-05-08-w3-c16-arle-deadlock.md)
-- W3 c=4 working baseline: [`370a267`](../experience/wins/2026-05-08-w3-c4-baseline.md)
+- W3 deadlock errors entry: [`cb087c7`](../experience/errors/2026-05-08-w3-c16-deadlock-not-just-admission.md)
+- W3 c=4 working baseline: [`370a267`](../experience/wins/2026-05-08-w3-c4-baseline-first-valid.md)
 - W3 503 source identification: [`5e8525c`](2026-05-08-w3-503-source-identified.md)
 - Code paths:
   - `infer/src/scheduler/cuda/execution.rs:136-170` PrefillBudget construction

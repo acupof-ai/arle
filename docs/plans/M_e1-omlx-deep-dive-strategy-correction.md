@@ -182,7 +182,7 @@ the BatchPackedDecode left-pad mask + scheduler timing; needs profile.
     (eval barriers)
 - mlx-lm `mlx_lm/models/cache.py` — upstream KVCache.update_and_fetch
 - ARLE master analysis (now needs correction):
-  [`docs/projects/2026-05-07-metal-optimization-master-analysis.md`](../projects/2026-05-07-metal-optimization-master-analysis.md)
+  [`docs/projects/2026-05-07-metal-world-first-strategy.md`](../projects/2026-05-07-metal-world-first-strategy.md)
 - M_e.1 plan parent:
   [`M_e1-metal-paged-kv-hot-path.md`](M_e1-metal-paged-kv-hot-path.md)
 - Audit chain:

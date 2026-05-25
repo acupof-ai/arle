@@ -195,4 +195,4 @@ graph. Pure deletion-style refactor (`feedback_no_half_states.md`).
   `crates/mlx-sys/src/mlx_qwen35_model.cpp:840-855`.
 - Master analysis decomposition (the 2.09× batching gap this commit
   closes):
-  [`docs/projects/2026-05-07-metal-optimization-master-analysis.md`](../projects/2026-05-07-metal-optimization-master-analysis.md).
+  [`docs/projects/2026-05-07-metal-world-first-strategy.md`](../projects/2026-05-07-metal-world-first-strategy.md).

@@ -237,10 +237,10 @@ Methodology:**stop iterating script blind**;run unit test to isolate。
 
 ## Cross-references
 
-- H3c applied still wrong: [`4dea952`](2026-05-08-w4a8-h3c-applied-still-broken.md)
-- H3c confirmed: [`d0f030b`](2026-05-08-w4a8-bug-h3c-confirmed-permute-before-divide.md)
-- H3b confirmed: [`3479a87`](2026-05-08-w4a8-bug-h3b-confirmed-scale-perm-single-deleted.md)
-- H3 row stride: [`25391f3`](2026-05-08-w4a8-bug-h3-confirmed-perms-row-stride.md)
+- H3c applied still wrong: `4dea952` (historical reference, file removed)
+- H3c confirmed: `d0f030b` (historical reference, file removed)
+- H3b confirmed: `3479a87` (historical reference, file removed)
+- H3 row stride: `25391f3` (historical reference, file removed)
 - Kernel source: `crates/cuda-kernels/csrc/gemm/marlin_w4a8_kernel.cu`(961+26 LOC)
 - PR #31 reference: `/tmp/marlin-w4a8/marlin/w4a8_marlin_cuda_kernel.cu`(961 LOC)
 - Linear FFI call: `infer/src/ops/linear.rs:777-859`

@@ -3,7 +3,7 @@
 Reference review:
 
 - [../reviews/2026-04-15-metal-ecosystem-route-correction.md](../reviews/2026-04-15-metal-ecosystem-route-correction.md)
-- [../experience/errors/2026-04-27-metal-serving-gap-vs-industry.md](../experience/errors/2026-04-27-metal-serving-gap-vs-industry.md)
+- `../experience/errors/2026-04-27-metal-serving-gap-vs-industry.md` (historical reference, file removed)
 
 ## Current State
 
@@ -82,7 +82,8 @@ embedding / 转换中间态；同 profile 下 RSS 约 1679 MB，而 MLX SafeTens
    session，并且 scheduler 现在能输出一个 local logical serve plan。这个
    checkpoint 只作为后续 runtime-owned batched state 的基础层保存；它不代表
    continuous batching / paged KV / prefix lifecycle 已经统一完成。证据见
-   [`../experience/wins/2026-04-28-bench-guidellm-metal-qwen35-session-handoff.md`](../experience/wins/2026-04-28-bench-guidellm-metal-qwen35-session-handoff.md)。
+   `../experience/wins/2026-04-28-bench-guidellm-metal-qwen35-session-handoff.md`
+   (historical reference, file removed)。
    Qwen3.6-35B-A3B 也做了 2026-04-27 的本地 quick check，确认本地
    Metal 路径仍可加载和执行。该短序列结果不作为 DFlash 优化依据；DFlash
    后续只看 long-context / 超长序列 workload。

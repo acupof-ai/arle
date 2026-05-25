@@ -141,7 +141,7 @@ If re-pack works,total M_quant timeline becomes 2-2.5 days(versus
 - da19d71 Phase 0 reconnaissance: [`docs/research/...`]
 - M_quant plan: [`662cbbb`](../plans/M_quant-autogptq-marlin-integration.md)
 - W4A8 finding: [`39237b9`](2026-05-08-w4a8-naive-max-scale-too-lossy-need-calibration.md)
-- W4A16 vs W4A8 perm distinction: [`3cee2f0`](2026-05-08-w4a8-methodology-retrospective-wrong-class.md)
+- W4A16 vs W4A8 perm distinction: `3cee2f0` (historical reference, file removed)
 - ARLE W4A16 path: `scripts/marlin_repack.py:25-53`(skip-8)
 - ARLE W4A8 path: `scripts/quantize_qwen3_w4a8.py:50-81`(4-consecutive)
 - Existing GPTQ checkpoint: `infer/models/Qwen3-4B-GPTQ-Int4-marlin/`

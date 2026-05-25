@@ -30,7 +30,7 @@
 ## Why naive max-scale W4 is insufficient
 
 Per-group max-scale W4 quantizes each 128-element group of a weight column to:
-- 16 levels of integer in [-8, 7](signed nibble)
+- 16 levels of integer in [-8, 7] (`signed nibble`)
 - Scale = max_abs / 7(symmetric around 0)
 - Quant noise ≈ scale / 2 ≈ |w_max_in_group| / 14
 
@@ -131,7 +131,7 @@ quantization quality,not code bugs。Earlier prevention:
 
 - Codex pack diag verification: pane EOD+30(this entry)
 - Decision tree: [`f329997`](2026-05-08-w4a8-canonical-test-decision-tree.md)
-- Methodology retrospective: [`3cee2f0`](2026-05-08-w4a8-methodology-retrospective-wrong-class.md)
+- Methodology retrospective: `3cee2f0` (historical reference, file removed)
 - Audit clean: [`01ace86`](2026-05-08-w4a8-kernel-and-wiring-audit-clean.md)
 - W4A8 garbage gate: `81b6481`
 - W4A16 Marlin license: `f6f3af3`

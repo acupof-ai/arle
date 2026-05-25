@@ -277,7 +277,8 @@ Two concrete reasons:
 
 ## §5 Where time goes (c=16, FP8, L4, Qwen3-4B)
 
-Source: [`bench-output/2026-04-29-c16fixed-fp8/service_stats_trace_summary.md`](../../bench-output/2026-04-29-c16fixed-fp8/service_stats_trace_summary.md)
+Source: `bench-output/2026-04-29-c16fixed-fp8/service_stats_trace_summary.md`
+(historical reference, file removed)
 plus the server log step breakdowns emitted at
 [execution.rs:457-468](../../infer/src/scheduler/cuda/execution.rs#L457).
 

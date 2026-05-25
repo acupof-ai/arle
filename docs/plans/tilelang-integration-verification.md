@@ -310,7 +310,8 @@ Run §1–§4 to produce a `…-l4-floor.md` wins entry, then **stop**:
 ## 6 · Bench entry handoff
 
 Replace
-[`docs/experience/wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md`](../experience/wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md)
+`docs/experience/wins/2026-04-26-bench-guidellm-cuda-tilelang-prefill-hd128-pending-remote.md`
+(historical reference, file removed)
 with two new dated entries — one for `off`, one for `on` — using
 [`TEMPLATE-bench-guidellm.md`](../experience/wins/TEMPLATE-bench-guidellm.md).
 The `on` entry's `## Δ vs baseline` cites the `off` entry as the

@@ -280,7 +280,7 @@ These are decisions outside what the planner can settle alone:
 - B1 result + B2 statement: [`docs/experience/wins/2026-05-03-bench-metal-qwen35-prefix-publish-fix.md`](../experience/wins/2026-05-03-bench-metal-qwen35-prefix-publish-fix.md).
 - Metal varlen pattern: [`infer/src/backend/metal/AGENTS.md`](../../infer/src/backend/metal/AGENTS.md) §7.
 - CUDA reference architecture: [`infer/src/scheduler/cuda/execution.rs:30-208`](../../infer/src/scheduler/cuda/execution.rs).
-- Snapshot semantics + GDR state correctness: [`docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md`](../experience/errors/2026-04-16-metal-varlen-rope-blocker.md), wins/2026-05-03 §Learnings.
+- Snapshot semantics + GDR state correctness: `docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md` (historical reference, file removed), wins/2026-05-03 §Learnings.
 - No-half-states discipline: `feedback_no_half_states.md` (referenced from CLAUDE.md §Editing).
 - Bench spec: [`docs/bench-and-trace-spec.md`](../bench-and-trace-spec.md).
 

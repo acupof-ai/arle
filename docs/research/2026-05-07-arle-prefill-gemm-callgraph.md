@@ -107,4 +107,4 @@ if (N <= 2560 && M >= 2048) {
 - M_pf-gemm Phase 0 KILL:[`267fcfa`](../experience/wins/2026-05-07-m_pf-gemm-phase0-killed-cublas-heuristic-already-optimal.md)
 - M_pf-fuse Phase 0 KILL:[`3e0ed5a`](../experience/wins/2026-05-07-m_pf-fuse-phase0-gateup-killed.md)
 - M_world1 P0.1 SGLang baseline:[`12c4c86`](../experience/wins/2026-05-07-m_world1-p0-sglang-baseline.md)
-- Phase 2.5 plan(待 codex #2 ground-truth 后细化):[`docs/plans/M_pf-gemm-cublaslt-autotune.md`](../../plans/M_pf-gemm-cublaslt-autotune.md) §Phase 2.5
+- Phase 2.5 plan(待 codex #2 ground-truth 后细化):[`docs/plans/M_pf-gemm-cublaslt-autotune.md`](../plans/M_pf-gemm-cublaslt-autotune.md) §Phase 2.5
