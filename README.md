@@ -125,6 +125,22 @@ Operators wanting only the serving binary can use `infer` directly — same HTTP
 
 <!-- Last 2-3 entries. Achievements only. Older history → CHANGELOG.md. -->
 
+**2026-05-25 — V100 (sm_70 Volta) inference target unlocked; capability preserved.**
+ARLE serve now runs Qwen3.5-4B/9B on Tesla V100-SXM2-32GB end-to-end. Made it work through an upstream TileLang patch ([PR #2257](https://github.com/tile-ai/tilelang/pull/2257) — fragment-to-fragment dtype-converting copy via shared-memory staging + BF16→FP16 MMA fallback with FP32 accumulation) plus an ARLE-side per-kernel `allow_sm70` cubin filter that pins T0-legacy emission to Qwen3.5 dense + GDR chunkwise paths only. **T1 (A100/L4/H100) builds and binaries untouched by construction.**
+
+![V100 sm_70 capability — Qwen3.5-4B/9B MMLU vs T1 reference](docs/img/2026-05-25-v100-sm70-capability.png)
+
+| MMLU 5-shot (n=200, harness scored ~164-165 valid) | Qwen3.5-4B | Qwen3.5-9B |
+|---|---:|---:|
+| T1 reference (A100/L4/H100) | 77.33 % | n/a |
+| **V100 sm_70 (this work)** | **79.9 %** | **83.0 %** (+3.1 pp size scaling) |
+
+Benefit: a cheap, widely-available Volta box becomes a usable ARLE inference target — same OpenAI-v1 surface, same Qwen3.5 family, no measurable capability cost from the Volta-specific fallback.
+
+Evidence: [P1 build pass](docs/experience/wins/2026-05-25-v100-sm70-p1-build-pass.md) · [P1.4 smoke](docs/experience/wins/2026-05-25-v100-sm70-p1-smoke-pass.md) · [P3.1 4B capability](docs/experience/wins/2026-05-25-v100-sm70-p3-1-capability-qwen35-4b.md) · [P3.2 9B capability](docs/experience/wins/2026-05-25-v100-sm70-p3-2-capability-qwen35-9b.md)
+
+---
+
 **2026-05-24 — `arle train opd <model-dir>` ships end-to-end.**
 One command goes from HF/ModelScope-cached student/teacher dirs to a finished OPD run — `qwen35_loader` + autograd `Tape` + `opd_step` + `AdamW`, no example script needed. ([`14c3be9`](https://github.com/cklxx/arle/commit/14c3be9))
 
