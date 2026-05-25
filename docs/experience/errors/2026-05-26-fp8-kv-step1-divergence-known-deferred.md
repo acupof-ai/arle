@@ -18,27 +18,63 @@ the same token as BF16 at step 0 (prefill's last logit) and **diverges at
 the very first decode step** — identical signature to the 2026-05-02
 "token-1 divergences 30/32" reading.
 
-## Root cause (status: hypothesis only)
+## Root cause — narrowed to dispatch / wiring (2026-05-26)
 
-Step 0 logit is the prefill kernel's last position output, computed against
-the BF16 working buffer — agrees with the BF16 reference. Step 1 is the
-first true decode that reads K/V from the FP8 paged pool for all prior
-positions (the prefill rows quantized by `finalize_paged_prefill_kv_layer`
-+ the new decode write). Divergence at step 1 isolates the failure to one of:
+Two production-layout roundtrip diagnostics now live in
+`crates/cuda-kernels/src/kv_quant.rs` (`fp8_scatter_qwen3_production_layout_diagnostic`,
+`fp8_paged_quantize_qwen3_production_layout_diagnostic`). Both exercise
+the actual FP8 kernels called from the migration path
+(`quantize_scatter_kv_fp8_range`) and the prefill-finalize / per-decode-step
+path (`quantize_paged_kv_fp8`) at Qwen3-4B layout (num_kv_heads=8,
+head_dim=128, 64 tokens) with realistic ±6 outliers and N(0, 2)
+fill. Result on L4 (sm_89):
 
-1. `finalize_paged_prefill_kv_layer` writes FP8 rows whose dequantized
-   values drift far from the BF16 reference.
-2. `decode_attention_fp8` reads scales / rows with wrong indexing
-   (the scales-layout `[row_idx * num_kv_heads + kv_head]` vs the read
-   path at `decode_attention_quantized.cu:381` matches in source survey,
-   but the audit has not yet confirmed bit-identity of the durable bytes).
-3. The per-token-per-head scale recomputation between prefill-time
-   quantization and decode-time quantization desynchronizes attention's
-   key/query interaction.
+| Kernel | max_abs_err | mean_abs_err | max_rel_err | scale range |
+|---|---:|---:|---:|---|
+| `quantize_scatter_kv_fp8_range` | 0.109 | 0.022 | 21% | [0.0123, 0.0134] |
+| `quantize_paged_kv_fp8` | 0.113 | 0.022 | 32% | [0.0123, 0.0134] |
 
-These remain hypotheses pending the diagnostic work listed below. The
-2026-05-05 errors entry already enumerated the right next steps; no one has
-landed them.
+Both within the expected FP8 E4M3 precision envelope. **The kernels are
+not the bug.** The 0.4% trajectory match in the end-to-end audit must come
+from dispatch or wiring upstream of these kernels:
+
+1. `prefill_token_rows` passed to `finalize_paged_prefill_kv_layer` could
+   address the wrong rows (off-by-page, off-by-slot).
+2. `last_token_indices` in the per-decode-step write could address a
+   different row than the `kv_indices` the decode-attention kernel reads.
+3. K vs V scale pointers could be swapped at a higher level.
+4. Layer-index propagation: layer N quantize could write to layer M's
+   pool slot.
+5. Mixed-batch vs pure-decode dispatch (`decode_attention_varlen_fp8` vs
+   `decode_attention_fp8`) could mis-route for the first decode step
+   following prefill in the same scheduler tick.
+
+Phase 3 next-step refinement (replacing the 2026-05-05 list, which assumed
+the kernel needed fixing):
+
+1. Add an in-process integration test that boots Qwen3-4B in FP8 mode,
+   runs prefill on a fixed short prompt, dequantizes the FP8 paged pool
+   for the prefill rows, and compares against the same prompt's BF16
+   prefill K/V layer-by-layer. Expect divergence at layer 0 if migration
+   indices are wrong; expect drift at deeper layers if layer-state
+   propagation is wrong.
+2. If (1) reports all layers clean, instrument decode step 1 only:
+   dequantize the FP8 pool's read region at decode-attention entry and
+   diff against the BF16 mode's K/V cache view of the same positions.
+3. ❌ Tried (2026-05-26, reverted): gate FP8 through the same
+   contiguous-BF16-prefill path TurboQuant uses by excluding
+   `KVFormat::FP8E4M3` from the `page_size == 16` whitelist in
+   `scheduler/cuda/prefill.rs`. **Did not recover parity** — FP8 then
+   diverged at step 0 (worse than original step 1) because the legacy
+   non-paged CUDA prefill kernel is not bit-identical to the TileLang
+   HD128 paged prefill kernel that BF16 uses; greedy argmax flips on the
+   numerical diff alone. Conclusion: must keep FP8 on the paged path
+   (same kernel as BF16) for any step-0 parity hope, and find the actual
+   wiring bug in the FP8-specific finalize / quantize / decode call sites
+   instead of trying to route around it.
+
+The two diagnostic tests now serve as regression gates for the kernels
+themselves — any future FP8 kernel change must keep them green.
 
 ## Fix — deferred to Phase 3
 

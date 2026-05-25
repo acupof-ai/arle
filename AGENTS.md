@@ -320,6 +320,15 @@ cargo test --release                                   # ~9s, CPU-only
 cargo test --release --test e2e                        # GPU + weights
 cargo test --release --test e2e_qwen35
 cargo test --release --no-default-features --features metal
+
+# KV precision parity audit (CUDA only) — BF16 reference vs INT8/FP8/TQ4
+# trajectory match. Required after any change touching KV quant kernels,
+# `infer/src/model/qwen3/{prefill,batch_decode}.rs`, the paged-pool gating,
+# or `auto`-default selection.
+cargo test --release -p infer --features cuda \
+  --test kv_precision_parity -- --nocapture --test-threads=1
+# Knobs: KV_PARITY_PROMPTS / KV_PARITY_MAX_TOKENS / KV_PARITY_MAX_SEQ_LEN /
+# KV_PARITY_INCLUDE_TQ23=1. Report lands at target/kv-parity-<model>-<unix>.json.
 ```
 
 Env vars: `TORCH_CUDA_ARCH_LIST` (SM override, PyTorch convention; alt `CMAKE_CUDA_ARCHITECTURES`),

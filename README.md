@@ -125,6 +125,22 @@ Operators wanting only the serving binary can use `infer` directly — same HTTP
 
 <!-- Last 2-3 entries. Achievements only. Older history → CHANGELOG.md. -->
 
+**2026-05-26 — OPD GKD chunked-KL Route B fits the 512-token corpus shape; full-logit OOMs even on V100 32 GB.**
+Real-corpus Qwen3.5-4B → 0.8B-Base GKD with corpus-truth SFT anchor at `prompt-max-tokens=512` previously [KILLed on consumer 16 GB hardware](docs/experience/errors/2026-05-25-chunked-kl-real-corpus-512-kill.md) because chunking the KL loss left full `[B, S, V]` teacher + student logits resident before the loss saw them. Route B (`SequenceWindowedForward` trait + per-window `tape.backward(window_loss)`, never materialize `[B, S, V]`, slice hidden then `lm_head` per window) lands the structural fix and is now validated end-to-end on Tesla V100-SXM2-32GB.
+
+![Route B vs full-logit peak GPU memory on V100](docs/img/2026-05-26-opd-chunked-kl-route-b-v100-memory.png)
+
+| Mode | `--logits-window-size` | Peak GPU | Outcome |
+|---|---:|---:|---|
+| **fullogit** (T5b shape) | off | **31 506 MiB** | **VRAM OOM** — `cuda alloc_zeros failed (slice)` |
+| **windowed** (Route B) | 64 | **20 800 MiB** | fits, ~11 GB headroom |
+
+Same corpus + rollout + GKD config across rows; only `--logits-window-size` varied. **−34 % peak GPU (−10 706 MiB)** — Route B is not just a 16 GB consumer-GPU mitigation, the 32 GB V100 also needs it to run this shape at all.
+
+Evidence: [wins entry](docs/experience/wins/2026-05-26-opd-chunked-kl-route-b-bench.md) · [design plan (Route B)](docs/plans/2026-05-25-sequence-windowed-forward-design.md) · [prior 16 GB KILL](docs/experience/errors/2026-05-25-chunked-kl-real-corpus-512-kill.md)
+
+---
+
 **2026-05-25 — V100 (sm_70 Volta) inference target unlocked; capability preserved.**
 ARLE serve now runs Qwen3.5-4B/9B on Tesla V100-SXM2-32GB end-to-end. Made it work through an upstream TileLang patch ([PR #2257](https://github.com/tile-ai/tilelang/pull/2257) — fragment-to-fragment dtype-converting copy via shared-memory staging + BF16→FP16 MMA fallback with FP32 accumulation) plus an ARLE-side per-kernel `allow_sm70` cubin filter that pins T0-legacy emission to Qwen3.5 dense + GDR chunkwise paths only. **T1 (A100/L4/H100) builds and binaries untouched by construction.**
 
