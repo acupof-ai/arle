@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use infer::model::Qwen35Model;
 use serde_json::json;
 

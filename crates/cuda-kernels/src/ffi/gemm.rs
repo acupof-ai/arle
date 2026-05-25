@@ -456,6 +456,61 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
+        input: *const Half,
+        output: *mut u8,
+        scales: *mut f32,
+        active_experts: *const i32,
+        active_offsets: *const i32,
+        active_counts: *const i32,
+        active_count: i32,
+        max_m: i32,
+        cols: i32,
+        scale_stride_m: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_deepgemm_swiglu_quantize_w13_cuda(
+        w13: *const Half,
+        act: *mut u8,
+        scales: *mut f32,
+        active_experts: *const i32,
+        active_counts: *const i32,
+        active_count: i32,
+        max_m: i32,
+        intermediate_dim: i32,
+        scale_stride_m: i32,
+        limit: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_deepgemm_unpad_grouped_bf16_cuda(
+        grouped: *const Half,
+        compact: *mut Half,
+        active_experts: *const i32,
+        active_offsets: *const i32,
+        active_counts: *const i32,
+        active_count: i32,
+        max_m: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda(
+        a: *const u8,
+        sfa: *const f32,
+        b: *const u8,
+        sfb: *const f32,
+        d: *mut Half,
+        masked_m: *const i32,
+        num_groups: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        sfa_aligned_m: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn q6k_gemv_cuda(
         weight: *const u8,
         input: *const Half,

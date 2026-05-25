@@ -13,10 +13,10 @@ mod app {
         time::Instant,
     };
 
-    use autograd::{backend_cuda::CudaBackend, optim::AdamW, Tape, TensorId, TensorStore};
+    use autograd::{Tape, TensorId, TensorStore, backend_cuda::CudaBackend, optim::AdamW};
     use train::{
-        opd::{opd_step, OpdStepConfig},
-        qwen35::{forward_rollout_cached, Qwen35KvCache, Qwen35Model},
+        opd::{OpdStepConfig, opd_step},
+        qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
         trainer::extend_keep_with_params_and_grads,
     };

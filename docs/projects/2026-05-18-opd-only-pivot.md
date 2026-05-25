@@ -83,6 +83,20 @@ OPD-focused, runtime-led teacher-student loop.
 
 ### What gets added (separate sub-project, not this commit)
 
+> **Status update 2026-05-25**: substrate landed via a different code path
+> than originally planned. The CLI entrypoint is
+> `crates/cli/src/train_cli.rs::run_opd_from_dirs` (shipped
+> 2026-05-24 commit `14c3be9`, not `crates/train/src/commands/train_opd.rs`
+> as the original plan called for). The per-step loop lives in
+> `crates/train/src/opd.rs::opd_step`. `crates/train/src/teacher_infer.rs`
+> hosts `InProcessTeacher` + the `TeacherForward` trait. End-to-end:
+> `arle train opd --student-model <dir> --teacher-model <dir>` runs the
+> rollout/KL/backward/AdamW loop directly on HF/ModelScope-cached models.
+> Validated by P5 5k run, T14 capability sweep, and T18 recipe variant
+> currently in progress.
+
+Original plan (kept for historical context):
+
 A new `crates/train/src/commands/train_opd.rs` + `crates/train/src/opd.rs`
 substrate:
 - Teacher loader (frozen weights, calls into `infer` for forward)
@@ -147,7 +161,10 @@ Delegated to Codex via tmux session `0:1`. Codex's job:
    lives) so `arle train pretrain|sft|grpo|multi-turn|eval|...`
    subcommands are gone; only `env / test / estimate-memory` remain
    from the existing surface (and a stub for `opd` that errors with
-   "OPD substrate landing next milestone").
+   "OPD substrate landing next milestone"). *(Update 2026-05-25: the
+   `opd` stub was replaced by the real `run_opd_from_dirs` in `14c3be9`;
+   `arle train test` was also removed in T3 prune `81842cc`. Only
+   `env` and `estimate-memory` remain from the original list.)*
 4. Update workspace `Cargo.toml` / `crates/train/Cargo.toml` if any
    deleted-module-only dependency drops out.
 5. `cargo check --workspace` + `cargo test -p train --release` green at

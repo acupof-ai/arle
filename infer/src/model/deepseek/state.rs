@@ -205,6 +205,7 @@ pub(crate) struct DeepseekGroupedExpertRuntimeScratch {
     pub(crate) w3_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
     pub(crate) w2_ptrs: Option<DeepseekGroupedExpertWeightPtrCache>,
     pub(crate) active: Option<DeepseekGroupedExpertActiveScratch>,
+    pub(crate) deepgemm: Option<DeepseekDeepGemmExpertRuntimeScratch>,
 }
 
 #[cfg(feature = "cuda")]
@@ -213,6 +214,23 @@ pub(crate) struct DeepseekGroupedExpertActiveScratch {
     pub(crate) indices: CudaSlice<i32>,
     pub(crate) offsets: CudaSlice<i32>,
     pub(crate) counts: CudaSlice<i32>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekDeepGemmExpertRuntimeScratch {
+    pub(crate) capacity_experts: usize,
+    pub(crate) capacity_m: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) intermediate_dim: usize,
+    pub(crate) scale_stride_m: usize,
+    pub(crate) input_fp8: CudaSlice<u8>,
+    pub(crate) input_scales: CudaSlice<f32>,
+    pub(crate) w13_out: HiddenStates,
+    pub(crate) act_fp8: CudaSlice<u8>,
+    pub(crate) act_scales: CudaSlice<f32>,
+    pub(crate) out_padded: HiddenStates,
+    pub(crate) out_compact: HiddenStates,
+    pub(crate) masked_m: CudaSlice<i32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -405,6 +423,7 @@ impl DeepseekMoeRuntimeCache {
                 w3_ptrs: None,
                 w2_ptrs: None,
                 active: None,
+                deepgemm: None,
             });
         }
         Ok(self
@@ -609,6 +628,108 @@ impl DeepseekGroupedExpertRuntimeScratch {
             .active
             .as_mut()
             .expect("DeepSeek V4 grouped expert active scratch allocated"))
+    }
+
+    pub(crate) fn ensure_deepgemm_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        capacity_experts: usize,
+        capacity_m: usize,
+        hidden_dim: usize,
+        intermediate_dim: usize,
+    ) -> Result<&mut DeepseekDeepGemmExpertRuntimeScratch> {
+        let capacity_experts = capacity_experts.max(1);
+        let capacity_m = capacity_m.max(1);
+        let scale_stride_m = capacity_m
+            .div_ceil(4)
+            .checked_mul(4)
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 DeepGEMM scale stride overflows usize"))?;
+        let hidden_scale_cols = hidden_dim.div_ceil(128);
+        let intermediate_scale_cols = intermediate_dim.div_ceil(128);
+        let rows = capacity_experts.checked_mul(capacity_m).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepSeek V4 DeepGEMM scratch row count overflow: experts={} capacity_m={}",
+                capacity_experts,
+                capacity_m
+            )
+        })?;
+        let input_elems = rows.checked_mul(hidden_dim).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepSeek V4 DeepGEMM input scratch overflow: rows={} hidden_dim={}",
+                rows,
+                hidden_dim
+            )
+        })?;
+        let hidden_scale_elems = capacity_experts
+            .checked_mul(scale_stride_m)
+            .and_then(|value| value.checked_mul(hidden_scale_cols))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DeepSeek V4 DeepGEMM input scale scratch overflow: experts={} stride={} cols={}",
+                    capacity_experts,
+                    scale_stride_m,
+                    hidden_scale_cols
+                )
+            })?;
+        let w13_dim = intermediate_dim.checked_mul(2).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepSeek V4 DeepGEMM w13 scratch width overflow: intermediate_dim={}",
+                intermediate_dim
+            )
+        })?;
+        let act_elems = rows.checked_mul(intermediate_dim).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepSeek V4 DeepGEMM activation scratch overflow: rows={} intermediate_dim={}",
+                rows,
+                intermediate_dim
+            )
+        })?;
+        let intermediate_scale_elems = capacity_experts
+            .checked_mul(scale_stride_m)
+            .and_then(|value| value.checked_mul(intermediate_scale_cols))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DeepSeek V4 DeepGEMM activation scale scratch overflow: experts={} stride={} cols={}",
+                    capacity_experts,
+                    scale_stride_m,
+                    intermediate_scale_cols
+                )
+            })?;
+        let needs_alloc = self
+            .deepgemm
+            .as_ref()
+            .map(|scratch| {
+                scratch.capacity_experts < capacity_experts
+                    || scratch.capacity_m < capacity_m
+                    || scratch.hidden_dim != hidden_dim
+                    || scratch.intermediate_dim != intermediate_dim
+            })
+            .unwrap_or(true);
+        if needs_alloc {
+            self.deepgemm = Some(DeepseekDeepGemmExpertRuntimeScratch {
+                capacity_experts,
+                capacity_m,
+                hidden_dim,
+                intermediate_dim,
+                scale_stride_m,
+                input_fp8: unsafe { ctx.stream.alloc_traced::<u8>(input_elems)? },
+                input_scales: unsafe { ctx.stream.alloc_traced::<f32>(hidden_scale_elems)? },
+                w13_out: unsafe { HiddenStates::uninit(ctx, w13_dim, rows)? },
+                act_fp8: unsafe { ctx.stream.alloc_traced::<u8>(act_elems)? },
+                act_scales: unsafe { ctx.stream.alloc_traced::<f32>(intermediate_scale_elems)? },
+                out_padded: unsafe { HiddenStates::uninit(ctx, hidden_dim, rows)? },
+                out_compact: unsafe { HiddenStates::uninit(ctx, hidden_dim, rows)? },
+                masked_m: unsafe { ctx.stream.alloc_traced::<i32>(capacity_experts)? },
+            });
+        }
+        let scratch = self
+            .deepgemm
+            .as_mut()
+            .expect("DeepSeek V4 DeepGEMM expert scratch allocated");
+        scratch.w13_out.seq_len = rows;
+        scratch.out_padded.seq_len = rows;
+        scratch.out_compact.seq_len = rows;
+        Ok(scratch)
     }
 }
 

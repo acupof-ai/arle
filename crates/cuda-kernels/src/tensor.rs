@@ -1039,12 +1039,23 @@ impl Dsv4Fp8DeepGemmWeightCache {
     pub fn uninit(ctx: &DeviceContext, rows: usize, cols: usize) -> Result<Self> {
         let scale_rows = rows.div_ceil(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M);
         let scale_cols = cols.div_ceil(DSV4_DEEPGEMM_FP8_SCALE_GRAN_K);
+        let weight_len = rows.checked_mul(cols).ok_or_else(|| {
+            anyhow!(
+                "DeepSeek V4 DeepGEMM cache weight size overflow: rows={} cols={}",
+                rows,
+                cols
+            )
+        })?;
+        let scale_len = scale_rows.checked_mul(scale_cols).ok_or_else(|| {
+            anyhow!(
+                "DeepSeek V4 DeepGEMM cache scale size overflow: rows={} cols={}",
+                scale_rows,
+                scale_cols
+            )
+        })?;
         Ok(Self {
-            weight: unsafe { ctx.stream.alloc_traced::<u8>(rows.saturating_mul(cols))? },
-            scales: unsafe {
-                ctx.stream
-                    .alloc_traced::<f32>(scale_rows.saturating_mul(scale_cols))?
-            },
+            weight: unsafe { ctx.stream.alloc_traced::<u8>(weight_len)? },
+            scales: unsafe { ctx.stream.alloc_traced::<f32>(scale_len)? },
             rows,
             cols,
             scale_rows,
@@ -1167,6 +1178,16 @@ fn dsv4_fill_fp8_deepgemm_weight_cache(
         .dsv4_scales
         .as_ref()
         .ok_or_else(|| anyhow!("DeepSeek V4 DeepGEMM cache source missing block scales"))?;
+    let rows_i32 = i32::try_from(src.rows)
+        .map_err(|_| anyhow!("DeepSeek V4 DeepGEMM cache rows overflow i32"))?;
+    let cols_i32 = i32::try_from(src.cols)
+        .map_err(|_| anyhow!("DeepSeek V4 DeepGEMM cache cols overflow i32"))?;
+    let scale_rows_i32 = i32::try_from(src.dsv4_scale_rows)
+        .map_err(|_| anyhow!("DeepSeek V4 DeepGEMM source scale rows overflow i32"))?;
+    let scale_cols_i32 = i32::try_from(src.dsv4_scale_cols)
+        .map_err(|_| anyhow!("DeepSeek V4 DeepGEMM source scale cols overflow i32"))?;
+    let dst_scale_cols_i32 = i32::try_from(dst.scale_cols)
+        .map_err(|_| anyhow!("DeepSeek V4 DeepGEMM cache scale cols overflow i32"))?;
     let (src_ptr, _src_guard) = qweight.device_ptr(&ctx.stream);
     let (src_scale_ptr, _src_scale_guard) = src_scales.device_ptr(&ctx.stream);
     let (dst_weight_ptr, _dst_weight_guard) = dst.weight.device_ptr_mut(&ctx.stream);
@@ -1180,11 +1201,11 @@ fn dsv4_fill_fp8_deepgemm_weight_cache(
             src_scale_ptr as *const u8,
             dst_weight_ptr,
             dst_scale_ptr,
-            src.rows as i32,
-            src.cols as i32,
-            src.dsv4_scale_rows as i32,
-            src.dsv4_scale_cols as i32,
-            dst.scale_cols as i32,
+            rows_i32,
+            cols_i32,
+            scale_rows_i32,
+            scale_cols_i32,
+            dst_scale_cols_i32,
             source_format as i32,
             ctx.stream.cu_stream(),
         )

@@ -20,17 +20,12 @@ use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
         ModelFamilyArg, OpdBackendArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand,
-        TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainTestArgs,
+        TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs,
     },
     hardware, hub_discovery,
 };
 
-const TRAIN_ENV_COMMANDS: &[&str] = &[
-    "train env",
-    "train test",
-    "train estimate-memory",
-    "train opd",
-];
+const TRAIN_ENV_COMMANDS: &[&str] = &["train env", "train estimate-memory", "train opd"];
 
 #[derive(Debug, Clone, Serialize)]
 struct OpdStepMetric {
@@ -53,7 +48,6 @@ struct OpdSummary {
 pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
     match train.command {
         TrainCommand::Env(args) => exit_from_result(run_train_env(args)),
-        TrainCommand::Test(args) => run_train_test(args),
         TrainCommand::EstimateMemory(args) => exit_from_result(run_train_estimate_memory(args)),
         TrainCommand::Opd(args) => run_opd(args),
     }
@@ -152,16 +146,6 @@ fn run_train_env(args: TrainEnvArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_train_test(_args: TrainTestArgs) -> ExitCode {
-    eprintln!(
-        "[arle train test] OPD smoke fixture pending — the legacy \
-         convert→pretrain→sft→eval pipeline was retired in the \
-         2026-05-18 OPD-only pivot. Re-implementation lands with \
-         the OPD substrate. See docs/projects/2026-05-18-opd-only-pivot.md."
-    );
-    ExitCode::from(0)
-}
-
 fn run_train_estimate_memory(args: TrainEstimateMemoryArgs) -> Result<()> {
     let report = if let Some(model_source) = args.model.as_deref() {
         estimate_from_model_dir(model_source, &args)?
@@ -219,19 +203,113 @@ fn run_opd(args: TrainOpdArgs) -> ExitCode {
         return exit_from_result(run_opd_smoke(args));
     }
     if args.student_model.is_some() {
-        eprintln!(
-            "[arle train opd] error: HF/ModelScope-cached model loading is pending — \
-             a `train::qwen35_loader` is landing in the next tranche. For now, run \
-             `arle train opd --smoke` to exercise the rollout/KL/backward path on the \
-             embedded tiny Qwen3.5 config. See docs/projects/2026-05-18-opd-only-pivot.md."
-        );
-        return ExitCode::FAILURE;
+        return exit_from_result(run_opd_from_dirs(args));
     }
     eprintln!(
         "[arle train opd] error: either `--student-model <dir>` or `--smoke` is required.\n\
          See `arle train opd --help` for the full surface."
     );
     ExitCode::FAILURE
+}
+
+fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
+    use autograd::{Tape, optim::AdamW};
+    use train::{
+        opd::{OpdStepConfig, opd_step},
+        qwen35_loader::load_qwen35_from_hf_dir,
+    };
+
+    let student_dir = args
+        .student_model
+        .as_deref()
+        .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
+    let teacher_dir = args.teacher_model.as_deref().unwrap_or(student_dir);
+
+    let (mut store, backend_label) = build_opd_store(args.backend)?;
+    let mut tape = Tape::new();
+
+    eprintln!(
+        "[arle train opd] loading teacher from {}",
+        teacher_dir.display()
+    );
+    let teacher = load_qwen35_from_hf_dir(teacher_dir, &mut store)
+        .with_context(|| format!("load teacher from {}", teacher_dir.display()))?;
+    eprintln!(
+        "[arle train opd] loading student from {}",
+        student_dir.display()
+    );
+    let student = load_qwen35_from_hf_dir(student_dir, &mut store)
+        .with_context(|| format!("load student from {}", student_dir.display()))?;
+    let student_params = student.all_parameter_ids();
+    let cfg = student.config().clone();
+
+    let prompt_ids = parse_prompt_ids(args.prompt_ids.as_deref())?;
+    if prompt_ids.iter().any(|&id| (id as usize) >= cfg.vocab_size) {
+        bail!(
+            "prompt token ids must be < {} (student vocab size); got {prompt_ids:?}",
+            cfg.vocab_size
+        );
+    }
+
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let step_cfg = OpdStepConfig {
+        rollout_len: args.rollout_len,
+        grad_clip: args.grad_clip,
+    };
+
+    let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
+    for step in 1..=args.steps {
+        let outcome = opd_step(
+            &student,
+            &teacher,
+            &prompt_ids,
+            step_cfg,
+            &student_params,
+            &mut optimizer,
+            &mut store,
+            &mut tape,
+        )
+        .with_context(|| format!("opd step {step} failed"))?;
+        losses.push(outcome.loss);
+        if !args.json {
+            println!(
+                "step {step}/{total} loss {loss:.6} rollout_len {rl}",
+                total = args.steps,
+                loss = outcome.loss,
+                rl = outcome.rollout_len,
+            );
+        }
+    }
+
+    if args.json {
+        let report = serde_json::json!({
+            "mode": "from-dirs",
+            "backend": backend_label,
+            "student_model": student_dir.display().to_string(),
+            "teacher_model": teacher_dir.display().to_string(),
+            "steps": args.steps,
+            "rollout_len": args.rollout_len,
+            "lr": args.lr,
+            "losses": losses,
+            "prompt_ids": prompt_ids,
+            "vocab_size": cfg.vocab_size,
+            "hidden_size": cfg.hidden_size,
+            "num_hidden_layers": cfg.num_hidden_layers,
+            "full_attn_gated": cfg.full_attn_gated,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "ARLE train opd: ran {} step(s) on Qwen3.x (vocab={}, hidden={}, layers={}, full_attn_gated={}, backend={})",
+            args.steps,
+            cfg.vocab_size,
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+            cfg.full_attn_gated,
+            backend_label,
+        );
+    }
+    Ok(())
 }
 
 fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {

@@ -11,14 +11,13 @@ use crate::model::qwen35::prefill_buffers::PagedPrefillBuffers35;
 use crate::model_source::ResolvedModelSource;
 #[cfg(test)]
 use crate::tensor_parallel::ShardingSpec;
-use crate::tensor_parallel::{column_shard, TpConfig};
+use crate::tensor_parallel::{TpConfig, column_shard};
 use crate::tp::TpLoadContext;
 use crate::weight_loader::{
-    load_tensor_1d, load_tensor_1d_f32, load_tensor_1d_f32_sharded,
+    QuantLoadConfig, load_tensor_1d, load_tensor_1d_f32, load_tensor_1d_f32_sharded,
     load_tensor_1d_fused_segments_sharded, load_tensor_1d_sharded, load_tensor_2d,
     load_tensor_2d_fused_column_segments_sharded, load_tensor_2d_maybe_quantized_with_config,
     load_tensor_2d_sharded, precompute_rope_with_qwen35_scaling, resolve_rope_cache_len,
-    QuantLoadConfig,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 

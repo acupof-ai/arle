@@ -2,14 +2,17 @@
 
 Last updated: 2026-04-21
 
-> **Status update 2026-05-18**: the observability substrate this plan
-> defined (SharedSink + JSONL/MLflow/OTLP/W&B adapters +
-> lifecycle/artifact events + `/v1/train/*` server) **survives the
-> OPD-only pivot** and will host OPD's progress stream. The
-> per-binary `pretrain --serve` / `train_sft --serve` /
+> **Status update 2026-05-18 (refined 2026-05-25)**: the observability
+> substrate this plan defined (SharedSink + JSONL/MLflow/OTLP/W&B
+> adapters + lifecycle/artifact events + `/v1/train/*` server)
+> **survives the OPD-only pivot** and remains the canonical observability
+> surface. The per-binary `pretrain --serve` / `train_sft --serve` /
 > `train_grpo --serve` / `train_multi_turn --serve` wiring described
-> below was retired with those binaries; the same wiring is reused
-> by `arle train opd --serve` once the OPD substrate lands.
+> below was retired with those binaries. OPD CLI (`arle train opd
+> <dir>`) shipped 2026-05-24 (`14c3be9`) as a one-shot runner; reusing
+> the train control plane via `arle train opd --serve` is **separate
+> scope, not yet licensed** (per
+> [`../support-matrix.md`](../support-matrix.md) §5a, line 139 row).
 > See [`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md).
 
 ## Goal
@@ -40,9 +43,10 @@ Today the landed train-side observability surface is:
 - `Trainer` emits shared supervised metrics (`loss`, `ppl`, `lr`,
   `grad_norm`, `ms_per_step`, `tok_per_sec`, `eval_*`) through the same async
   sink path as the hand-written RL loops.
-- All active train binaries (`pretrain`, `train_sft`, `train_grpo`,
-  `train_multi_turn`) expose the same live train control plane:
-  `/v1/train/status|events|stop|save`.
+- The retired train binaries (`pretrain`, `train_sft`, `train_grpo`,
+  `train_multi_turn`) exposed the same live train control plane:
+  `/v1/train/status|events|stop|save`. The control-plane substrate survives,
+  but OPD one-shot CLI does not currently expose `--serve`.
 - Operator save / stop requests are recorded into the controller event ring,
   so `/v1/train/events` carries both trainer-emitted lifecycle records and
   control-plane intents.
@@ -70,7 +74,7 @@ Today the landed train-side observability surface is:
 
 What is missing:
 
-- no infer-side unified `/v1/train/*` bridge yet
+- OPD-specific reuse of the train-control server (`arle train opd --serve`)
 - no trace-first rollout / tool-call export yet
 - no run/span model for long multi-turn rollouts beyond the current event stream
 

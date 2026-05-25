@@ -88,6 +88,15 @@
 //! | `infer_tier_fetch_promoted_blocks_total` | counter | Staged blocks promoted back into T0 |
 //! | `infer_tier_fetch_fallback_total` | counter | Staged-prefix fallbacks back to cold prefill |
 //! | `infer_tier_fetch_recall_rate` | gauge | Promoted staged blocks / staged blocks |
+//! | `infer_tier_demote_to_host_latency_us` | histogram | Completed T0->T1 demote latency |
+//! | `infer_tier_demote_to_host_bytes_total` | counter | Bytes successfully demoted from T0 to T1 |
+//! | `infer_tier_store_latency_us` | histogram | Completed T1->T2/T3 store latency |
+//! | `infer_tier_store_bytes_total` | counter | Bytes successfully stored from T1 to T2/T3 |
+//! | `infer_tier_readmission_fetch_wait_us` | histogram | Completed staged-readmission fetch wait |
+//! | `infer_tier_fetch_queue_saturated_fallback_total` | counter | Staged-prefix cold fallbacks caused by fetch-queue saturation |
+//! | `infer_tier_recompute_advised_fallback_total` | counter | Prefix hits that advised recompute instead of reuse |
+//! | `infer_host_pool_high_pressure_ticks_total` | counter | Scheduler ticks at or above T1 high watermark |
+//! | `infer_host_pool_low_pressure_ticks_total` | counter | Scheduler ticks at or below T1 low watermark |
 //! | `infer_memory_active_bytes` | gauge | Active MLX allocator memory |
 //! | `infer_memory_peak_bytes` | gauge | Peak MLX allocator memory |
 //! | `infer_memory_cache_bytes` | gauge | Cached MLX allocator memory |
@@ -306,6 +315,12 @@ struct MetricsInner {
     pub tier_fetch_staged_remote_blocks_total: AtomicU64,
     pub tier_fetch_promoted_blocks_total: AtomicU64,
     pub tier_fetch_fallback_total: AtomicU64,
+    pub tier_demote_to_host_bytes_total: AtomicU64,
+    pub tier_store_bytes_total: AtomicU64,
+    pub tier_fetch_queue_saturated_fallback_total: AtomicU64,
+    pub tier_recompute_advised_fallback_total: AtomicU64,
+    pub host_pool_high_pressure_ticks_total: AtomicU64,
+    pub host_pool_low_pressure_ticks_total: AtomicU64,
     pub spec_draft_tokens_total: AtomicU64,
     pub spec_verified_tokens_total: AtomicU64,
     pub spec_accepted_tokens_total: AtomicU64,
@@ -443,6 +458,12 @@ impl ServerMetrics {
                 tier_fetch_staged_remote_blocks_total: AtomicU64::new(0),
                 tier_fetch_promoted_blocks_total: AtomicU64::new(0),
                 tier_fetch_fallback_total: AtomicU64::new(0),
+                tier_demote_to_host_bytes_total: AtomicU64::new(0),
+                tier_store_bytes_total: AtomicU64::new(0),
+                tier_fetch_queue_saturated_fallback_total: AtomicU64::new(0),
+                tier_recompute_advised_fallback_total: AtomicU64::new(0),
+                host_pool_high_pressure_ticks_total: AtomicU64::new(0),
+                host_pool_low_pressure_ticks_total: AtomicU64::new(0),
                 spec_draft_tokens_total: AtomicU64::new(0),
                 spec_verified_tokens_total: AtomicU64::new(0),
                 spec_accepted_tokens_total: AtomicU64::new(0),
@@ -759,6 +780,11 @@ impl ServerMetrics {
         self.inner
             .prefix_lookup_recompute
             .store(recompute as u64, Ordering::Relaxed);
+        if recompute && matched_prefix_tokens > 0 {
+            self.inner
+                .tier_recompute_advised_fallback_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Mark that the most recent staged prefix lookup was queued for prefetch.
@@ -798,6 +824,58 @@ impl ServerMetrics {
         self.inner
             .tier_fetch_fallback_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one staged-prefix cold fallback caused by fetch queue saturation.
+    pub fn record_tier_fetch_queue_saturated_fallback(&self) {
+        self.inner
+            .tier_fetch_queue_saturated_fallback_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one completed T0->T1 demotion.
+    pub fn record_tier_demote_to_host(&self, latency_us: u64, bytes: usize) {
+        self.inner
+            .tier_demote_to_host_bytes_total
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        if let Ok(mut h) = self.inner.histograms.lock() {
+            h.tier_demote_to_host_latency_us.observe(latency_us as f64);
+        }
+    }
+
+    /// Record one completed T1->T2/T3 store.
+    pub fn record_tier_store_completed(&self, latency_us: u64, bytes: usize) {
+        self.inner
+            .tier_store_bytes_total
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        if let Ok(mut h) = self.inner.histograms.lock() {
+            h.tier_store_latency_us.observe(latency_us as f64);
+        }
+    }
+
+    /// Record completed staged-readmission fetch wait.
+    pub fn record_tier_readmission_fetch_wait(&self, wait_us: u64) {
+        if let Ok(mut h) = self.inner.histograms.lock() {
+            h.tier_readmission_fetch_wait_us.observe(wait_us as f64);
+        }
+    }
+
+    /// Record host-pinned pool pressure classification for one scheduler tick.
+    pub fn record_host_pool_pressure_tick(
+        &self,
+        usage_fraction: f64,
+        low_water: f64,
+        high_water: f64,
+    ) {
+        if usage_fraction >= high_water {
+            self.inner
+                .host_pool_high_pressure_ticks_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else if usage_fraction <= low_water {
+            self.inner
+                .host_pool_low_pressure_ticks_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Record inactive session slots evicted by hard pressure reclamation.
@@ -1729,6 +1807,48 @@ impl ServerMetrics {
         self.inner.tier_fetch_fallback_total.load(Ordering::Relaxed)
     }
 
+    pub fn tier_demote_to_host_bytes_total(&self) -> u64 {
+        self.inner
+            .tier_demote_to_host_bytes_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn tier_store_bytes_total(&self) -> u64 {
+        self.inner.tier_store_bytes_total.load(Ordering::Relaxed)
+    }
+
+    pub fn tier_fetch_queue_saturated_fallback_total(&self) -> u64 {
+        self.inner
+            .tier_fetch_queue_saturated_fallback_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn tier_recompute_advised_fallback_total(&self) -> u64 {
+        self.inner
+            .tier_recompute_advised_fallback_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn host_pool_high_pressure_ticks_total(&self) -> u64 {
+        self.inner
+            .host_pool_high_pressure_ticks_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn host_pool_low_pressure_ticks_total(&self) -> u64 {
+        self.inner
+            .host_pool_low_pressure_ticks_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn tier_readmission_fetch_wait_us_percentile(&self, p: f64) -> Option<f64> {
+        self.inner
+            .histograms
+            .lock()
+            .ok()
+            .and_then(|h| h.tier_readmission_fetch_wait_us.percentile(p))
+    }
+
     pub fn tier_fetch_staged_blocks_total(&self) -> u64 {
         self.tier_fetch_staged_host_blocks_total()
             + self.tier_fetch_staged_disk_blocks_total()
@@ -2322,6 +2442,114 @@ mod tests {
         assert!(s.contains("tier_fallback=1"));
         assert!(s.contains("metal_decode=batch:1/4,scalar:1,fallback:3,qwen35_packed:1/4"));
         assert!(s.contains("kv_store=sub:3,done:2,fail:1,rej:4"));
+    }
+
+    #[test]
+    fn kv_tier_observability_records_new_metrics() {
+        let m = ServerMetrics::new("Qwen3-4B");
+
+        m.record_prefix_lookup_detail(PrefixLookupDetail {
+            prompt_tokens: 128,
+            matched_prefix_tokens: 64,
+            reusable_tokens: 0,
+            lookup_latency_us: 9,
+            ready_on_gpu: false,
+            direct_gpu_attach: false,
+            staged: false,
+            prefetch: false,
+            recompute: true,
+        });
+        m.record_tier_fetch_queue_saturated_fallback();
+        m.record_tier_demote_to_host(75, 4096);
+        m.record_tier_store_completed(150, 8192);
+        m.record_tier_readmission_fetch_wait(300);
+        m.record_host_pool_pressure_tick(0.90, 0.70, 0.85);
+        m.record_host_pool_pressure_tick(0.50, 0.70, 0.85);
+        m.record_host_pool_pressure_tick(0.80, 0.70, 0.85);
+
+        assert_eq!(m.tier_recompute_advised_fallback_total(), 1);
+        assert_eq!(m.tier_fetch_queue_saturated_fallback_total(), 1);
+        assert_eq!(m.tier_demote_to_host_bytes_total(), 4096);
+        assert_eq!(m.tier_store_bytes_total(), 8192);
+        assert_eq!(m.host_pool_high_pressure_ticks_total(), 1);
+        assert_eq!(m.host_pool_low_pressure_ticks_total(), 1);
+        assert_eq!(
+            m.tier_readmission_fetch_wait_us_percentile(0.50),
+            Some(300.0)
+        );
+        assert_eq!(
+            m.tier_readmission_fetch_wait_us_percentile(0.99),
+            Some(300.0)
+        );
+
+        let rendered = m.render_prometheus();
+        assert!(
+            rendered.contains("infer_tier_recompute_advised_fallback_total{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(
+            rendered
+                .contains("infer_tier_fetch_queue_saturated_fallback_total{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(
+            rendered.contains("infer_tier_demote_to_host_bytes_total{model=\"Qwen3-4B\",} 4096")
+        );
+        assert!(rendered.contains("infer_tier_store_bytes_total{model=\"Qwen3-4B\",} 8192"));
+        assert!(
+            rendered.contains("infer_host_pool_high_pressure_ticks_total{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(
+            rendered.contains("infer_host_pool_low_pressure_ticks_total{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(
+            rendered.contains("infer_tier_demote_to_host_latency_us_count{model=\"Qwen3-4B\",} 1")
+        );
+        assert!(rendered.contains("infer_tier_store_latency_us_count{model=\"Qwen3-4B\",} 1"));
+        assert!(
+            rendered.contains("infer_tier_readmission_fetch_wait_us_count{model=\"Qwen3-4B\",} 1")
+        );
+
+        let stats = m.render_stats_json();
+        assert_eq!(
+            stats["tier_observability"]["demote_to_host_bytes_total"],
+            serde_json::json!(4096)
+        );
+        assert_eq!(
+            stats["tier_observability"]["store_bytes_total"],
+            serde_json::json!(8192)
+        );
+        assert_eq!(
+            stats["tier_observability"]["fetch_queue_saturated_fallback_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            stats["tier_observability"]["recompute_advised_fallback_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            stats["tier_observability"]["readmission_fetch_wait_us_p50"],
+            serde_json::json!(300.0)
+        );
+        assert_eq!(
+            stats["tier_observability"]["readmission_fetch_wait_us_p99"],
+            serde_json::json!(300.0)
+        );
+        assert_eq!(
+            stats["tier_observability"]["host_pool_high_pressure_ticks_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            stats["tier_observability"]["host_pool_low_pressure_ticks_total"],
+            serde_json::json!(1)
+        );
+
+        let summary = m.render_summary();
+        assert!(summary.contains("tier_queue_sat_fallback=1"));
+        assert!(summary.contains("tier_recompute_fallback=1"));
+        assert!(summary.contains("tier_demote_bytes=4096"));
+        assert!(summary.contains("tier_store_bytes=8192"));
+        assert!(summary.contains("tier_fetch_wait_p50_us=300.0"));
+        assert!(summary.contains("tier_fetch_wait_p99_us=300.0"));
+        assert!(summary.contains("host_pool_pressure=high:1,low:1"));
     }
 
     #[test]

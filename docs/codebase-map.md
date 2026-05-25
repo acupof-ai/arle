@@ -120,30 +120,28 @@ Key files:
 - `infer/src/bin/cpu_serve.rs`
 - `infer/src/bin/metal_serve.rs`
 
-### Current train control-plane path (post-OPD-pivot, 2026-05-18)
+### Current OPD train path (post-OPD-pivot, 2026-05-24)
 
 ```text
-crates/train/src/{opd,teacher_infer}.rs   (OPD substrate ✅ landed: opd_step, GKD anchor, MultiTeacher/InferTeacher/ApiTeacher/InProcessTeacher)
-crates/train/src/commands.rs             (in-crate command module 🚧 stub; arle train opd CLI in crates/cli/src/train_cli.rs)
-  -> train::server::bind_and_serve_on_thread()
-  -> std TcpListener control plane on /v1/train/{status,events,stop,save}
-  -> train::control::TrainingController + ControllerSink
-  -> SharedSink background worker
-  -> local JSONL/stdout + optional MLflow / OTLP / W&B export
-  -> autograd + Trainer<O, C, S> + teacher (in `infer`) + student LoRA
+crates/cli/src/train_cli.rs::run_opd()
+  -> run_opd_from_dirs() or run_opd_smoke()
+  -> train::qwen35_loader::load_qwen35_from_hf_dir()
+  -> train::opd::opd_step()
+  -> autograd Tape + AdamW + Qwen3.5 teacher/student weights
 ```
 
 Scratch pretrain, SFT, GRPO, and multi-turn RL surfaces were retired
 in commit `bd94c09` (see `docs/projects/2026-05-18-opd-only-pivot.md`).
-Their dispatch sources, supporting modules, and tests have been
-deleted from `crates/train`. The autograd + Trainer + checkpoint codec
-+ tokenizer + LoRA + `/v1/train/*` control plane remain as OPD
-substrate. `infer` continues to expose the optional `/v1/train/*`
-proxy when `--train-control-url` is configured.
+Their dispatch sources, supporting modules, and tests have been deleted
+from `crates/train`; the empty legacy command namespace is also gone.
+The autograd + Trainer + checkpoint codec + tokenizer + LoRA +
+`/v1/train/*` control plane remain as OPD substrate. `infer` continues
+to expose the optional `/v1/train/*` proxy when `--train-control-url` is
+configured.
 
 Key files (surviving the pivot):
 
-- `crates/train/src/commands/env.rs`, `test.rs`, `estimate-memory.rs`: diagnostic surfaces preserved
+- `crates/cli/src/train_cli.rs`: `arle train env`, `estimate-memory`, and `opd` front door
 - `crates/train/src/server.rs`: minimal HTTP control plane for `/v1/train/status|events|stop|save`
 - `crates/train/src/control.rs`: shared controller / status state plus recent event ring buffer
 - `crates/train/src/metrics.rs`: shared async observability sink, lifecycle/artifact events, MLflow / OTLP / W&B export adapters

@@ -8,7 +8,7 @@ mod app {
     use std::{
         collections::{BTreeMap, HashSet},
         env,
-        ffi::{c_char, c_int, c_void, CString},
+        ffi::{CString, c_char, c_int, c_void},
         path::PathBuf,
         ptr,
         sync::Arc,
@@ -17,20 +17,20 @@ mod app {
     };
 
     use autograd::{
+        AutogradError, BackwardProfile, Tape, TensorId, TensorStore,
         backend_cuda::CudaBackend,
         optim::{AdamW, Optimizer},
         tensor::Dirty,
-        AutogradError, BackwardProfile, Tape, TensorId, TensorStore,
     };
     use train::{
         grad_clip::clip_grad_norm,
         loss::kl_distill_loss,
         opd::{OpdStepConfig, OpdStepOutcome},
         qwen35::{
-            forward_rollout_cached, forward_rollout_cached_device_token,
-            forward_rollout_cached_device_token_profiled, forward_rollout_cached_profiled,
             Qwen35AttentionForwardProfile, Qwen35KvCache, Qwen35LayerForwardProfile, Qwen35Model,
-            Qwen35RolloutForwardProfile,
+            Qwen35RolloutForwardProfile, forward_rollout_cached,
+            forward_rollout_cached_device_token, forward_rollout_cached_device_token_profiled,
+            forward_rollout_cached_profiled,
         },
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
         trainer::{cleanup_after_backward, retained_param_and_grad_ids},
@@ -1203,7 +1203,11 @@ mod app {
                     row.iter,
                     component,
                     seconds,
-                    if total == 0.0 { 0.0 } else { seconds / total * 100.0 }
+                    if total == 0.0 {
+                        0.0
+                    } else {
+                        seconds / total * 100.0
+                    }
                 );
             }
 
@@ -1221,7 +1225,11 @@ mod app {
                     } else {
                         seconds / decode_attention_seconds * 100.0
                     },
-                    if total == 0.0 { 0.0 } else { seconds / total * 100.0 }
+                    if total == 0.0 {
+                        0.0
+                    } else {
+                        seconds / total * 100.0
+                    }
                 );
             }
 
