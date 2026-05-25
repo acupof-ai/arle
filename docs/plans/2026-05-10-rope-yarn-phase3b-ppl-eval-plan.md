@@ -2,11 +2,24 @@
 title: M_rope-yarn-scaling Phase 3b — PPL eval plan(quality validation)
 date: 2026-05-10
 type: plan
-status: ready-for-execution
-prereq: Phase 3a smoke PASS (`4efd30b`) + ARLE `arle train eval` + long-ctx eval data
+status: blocked-on-eval-harness (2026-05-25 update)
+prereq: Phase 3a smoke PASS (`4efd30b`) + long-ctx eval data + new eval harness (see banner)
 ---
 
 # Phase 3b — PPL eval(quality validation)concrete plan
+
+> **2026-05-25 status — eval harness command was deleted**:
+> `arle train eval` was removed in the 2026-05-18 OPD-only pivot
+> ([`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md)).
+> Current `arle train` surface = `env / estimate-memory / opd` only.
+> The PPL evaluation methodology in this plan is still valid for ROPE-yarn
+> quality validation, but the implementation needs a new harness — either
+> a `scripts/` PPL eval (like `scripts/arle_capability_eval.py`) or
+> reintroducing PPL into `arle eval` (separate CLI command, not yet
+> licensed). Treat all `arle train eval ...` command examples below as
+> historical placeholder for the eval surface; pick a replacement before
+> executing this plan.
+
 
 > Phase 3a smoke confirmed end-to-end M_rope-yarn-scaling Phase 1+2 wire
 > works in production CUDA serving(Qwen3-4B + YARN factor=2.0)。Phase 3b
