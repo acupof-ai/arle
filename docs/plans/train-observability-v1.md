@@ -43,9 +43,10 @@ Today the landed train-side observability surface is:
 - `Trainer` emits shared supervised metrics (`loss`, `ppl`, `lr`,
   `grad_norm`, `ms_per_step`, `tok_per_sec`, `eval_*`) through the same async
   sink path as the hand-written RL loops.
-- All active train binaries (`pretrain`, `train_sft`, `train_grpo`,
-  `train_multi_turn`) expose the same live train control plane:
-  `/v1/train/status|events|stop|save`.
+- The retired train binaries (`pretrain`, `train_sft`, `train_grpo`,
+  `train_multi_turn`) exposed the same live train control plane:
+  `/v1/train/status|events|stop|save`. The control-plane substrate survives,
+  but OPD one-shot CLI does not currently expose `--serve`.
 - Operator save / stop requests are recorded into the controller event ring,
   so `/v1/train/events` carries both trainer-emitted lifecycle records and
   control-plane intents.
@@ -73,7 +74,7 @@ Today the landed train-side observability surface is:
 
 What is missing:
 
-- no infer-side unified `/v1/train/*` bridge yet
+- OPD-specific reuse of the train-control server (`arle train opd --serve`)
 - no trace-first rollout / tool-call export yet
 - no run/span model for long multi-turn rollouts beyond the current event stream
 

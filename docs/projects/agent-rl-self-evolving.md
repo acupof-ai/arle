@@ -45,15 +45,14 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 
 **训练端从零写**（参考 [mni-ml/framework](https://github.com/mni-ml/framework) 只读,不 vendor），**推理端复用** agent-infer 现有栈（FlashInfer / Triton AOT / Paged KV / Metal runtime）。这是一次 runtime-led 的认知提升 + 产品化工作。
 
-> **Current implementation note**
+> **Historical implementation note**
 > 下文的 workspace / 数据流 / `/v1/train/*` 更多是在定义 **目标架构**。
-> 2026-04-21 当前树里的训练控制面仍然在 `crates/train`：
+> 2026-04-21 的实现状态曾经是 `crates/train` 中的
 > `pretrain --serve` / `train_sft --serve` / `train_grpo --serve` /
-> `train_multi_turn --serve` 会启动 `crates/train/src/server.rs`
-> 里的 train-side HTTP control plane。要回答"今天 repo 里已经有什么"，
-> 先看 [`docs/codebase-map.md`](../codebase-map.md) 和
-> [`docs/plans/train-runtime-architecture-v1.md`](../plans/train-runtime-architecture-v1.md)。
-> 当前 train-side 训练模型线已经变成通用 Qwen-family 控制面，且以 Qwen3.5 为默认与优化主线；`pretrain` 是唯一 canonical scratch-pretrain 入口，`train_grpo` 和 `train_multi_turn` 都已经支持 exact checkpoint/resume，`train_multi_turn` 已经支持 stepwise GRPO 和 sequence-level GSPO 两种 objective，shared async observability 已经落到 train-side event stream / MLflow / OTLP / W&B sidecar。2026-04-21 的远端 CUDA 验证已经补齐到了四个 active train binaries：`pretrain`、`train_sft`、`train_grpo`、`train_multi_turn`；同日也补上了 Mac 本地 `Metal` 的 dense/full-attn Qwen3.5 LoRA 验证（`pretrain -> train_sft --backend metal -> eval_lm -> resume` on `Apple M4 Pro`）以及 hybrid scratch pretrain / `train_grpo` / `train_multi_turn` 的本地 CPU + Metal acceptance。`infer` 侧也已经能通过 `--train-control-url` 提供 `/v1/train/*` 代理桥接到 live train-side server。当前还不能写成“全线完成”的唯一主要原因，是 hybrid 路径的 CUDA runtime acceptance 仍未关闭；这一点必须继续按 truth surface 明写。
+> `train_multi_turn --serve` 共享 train-side HTTP control plane。那些
+> binaries 在 2026-05-18 OPD-only pivot 中退休。今天的可执行训练主线是
+> `arle train opd --student-model <dir>`；`/v1/train/*` 控制面 substrate
+> 仍在，但 `arle train opd --serve` 未重新授权。
 
 ---
 
@@ -92,7 +91,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 |---|---|---|
 | 硬件 | 单机单卡 NVIDIA（L40S/A100/H100 任一） | 分布式、多机、TP/PP/ZeRO |
 | Metal | 本地 dev 支线，M4 里程碑再做 | 和 CUDA 并行推进 |
-| 进程 | 目标态是统一 Rust 训练/推理栈；当前实现是独立 `train` crate + train-side server（`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 都可 `--serve`），后续允许同进程或异步 worker 边界，只要模型 authority 仍然唯一 | 双栈分叉、各自维护模型真相 |
+| 进程 | 目标态是统一 Rust 训练/推理栈；历史实现曾是独立 `train` crate + train-side server，当前 OPD 主线是 one-shot `arle train opd`，控制面复用另行授权；后续允许同进程或异步 worker 边界，只要模型 authority 仍然唯一 | 双栈分叉、各自维护模型真相 |
 | Autograd | **从零写，参考 mni-ml/framework 结构** | candle / burn / 包 PyTorch |
 | Op 集 | 只实现 LoRA+GRPO 用到的 ~7 个 op | 全量 op（conv/pool/full-attention-bwd） |
 | Device 抽象 | `cudarc` 直接写；Metal 用 `mlx-sys`（支线） | 多 backend 抽象层 |

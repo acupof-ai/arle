@@ -26,13 +26,18 @@ prereq: Phase 3a smoke PASS (`4efd30b`) + long-ctx eval data + new eval harness 
 > validates **quality**:does YARN factor=2.0 maintain reasonable PPL at
 > extended context vs vanilla 40k baseline?
 
-## 1. Infrastructure ALREADY EXISTS
+## 1. Historical PPL Infrastructure
 
-`arle train eval` is the canonical PPL evaluation surface:
+At the time this plan was written, `arle train eval` was the canonical PPL
+evaluation surface:
 - `crates/train/src/eval_lm.rs:34-36` `EvalSummary::ppl() = self.loss.exp()`
 - Supports `--backend {auto,cpu,metal,cuda}` — CUDA-side viable
 - Accepts tokenized JSONL or chat JSONL via `--data` flag
 - Returns per-token cross-entropy loss → exp = perplexity
+
+That CLI command is no longer present. Treat the bullets above as the old
+implementation contract to preserve in a replacement harness, not as a command
+that can be run today.
 
 Usage:
 ```bash
@@ -190,7 +195,7 @@ need check or modify。
 
 ## 10. 状态
 
-Phase 3b ready for execution。30-50 min wall-clock total。Substrate
-Phase 1+2 + 3a smoke proven;Phase 3b is quality validation only。Eval
-data must be offline-generated due to #34 HF Hub blocker(20-30 LOC
-Python script)。
+Phase 3b is **blocked on a replacement eval harness**. Substrate Phase 1+2 +
+3a smoke remain proven, and Phase 3b is still quality validation only, but the
+old `arle train eval` command examples above are historical. Eval data should
+still be offline-generated due to #34 HF Hub blocker.
