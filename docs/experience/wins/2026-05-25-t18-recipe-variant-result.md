@@ -38,11 +38,29 @@ Capability eval uses `scripts/arle_capability_eval.py --tasks mmlu,gsm8k
 
 | Row | train KL | heldout KL | MMLU | GSM8K | Verdict |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Base no-LoRA | n/a | `1.739055e-5` | **51.41%** (`73/142`, inv 29) | `1.55%` (`3/194`, inv 6) | baseline |
+| **Teacher Qwen3.5-4B** | n/a | n/a | **77.33%** (`116/150`, inv 21) | `2.53%` (`5/198`, inv 2) | ceiling |
+| Base no-LoRA Qwen3.5-0.8B-Base | n/a | `1.739055e-5` | **51.41%** (`73/142`, inv 29) | `1.55%` (`3/194`, inv 6) | student baseline |
 | P5 best capability, step 2000 | `1.318e-5` | `1.599e-5` | `50.00%` (`83/166`, inv 5) | `1.60%` (`3/188`, inv 12) | P5 winner |
 | T18 step 500 | `1.445267e-5` | `1.635091e-5` | `47.31%` (`79/167`, inv 4) | `2.62%` (`5/191`, inv 9) | below P5/base |
 | T18 step 1000 | `1.404491e-5` | `1.606972e-5` | **50.59%** (`86/170`, inv 1) | **3.16%** (`6/190`, inv 10) | beats P5 MMLU, below base |
 | T18 step 2500 | `1.341832e-5` | **`1.597832e-5`** | `46.11%` (`77/167`, inv 4) | `1.67%` (`3/180`, inv 20) | heldout best, capability fails |
+
+**Teacher-student MMLU headroom = 25.92 pp** (`77.33 − 51.41`). All T18 and P5
+checkpoints stayed within ±2 pp of student base, so **pure-OPD at this recipe
+family transferred <3% of the available teacher-student gap on MMLU**. KL was
+optimized (heldout dropped from `1.739e-5` to `1.598e-5`, -8.1%); capability
+transfer was not. The gap between the two is the structural finding, not
+just "pure OPD lost capability".
+
+GSM8K caveat: teacher itself is at `2.53%` (effectively floor-class), so
+"T18 step 1000 = 3.16% GSM8K beats teacher 2.53%" is within noise and not
+a transfer claim. See
+`docs/experience/wins/2026-05-22-opd-task-divergent-impact.md` for the
+teacher-weakness analysis on GSM8K.
+
+Teacher baseline source:
+`bench-output/2026-05-22-capability-baseline-4b-retry-after-longprompt-fix/summary.json`
+(same MMLU 5-shot n=171 + GSM8K n=200 harness as the student rows).
 
 After the `step_001000` row passed the P5 MMLU threshold, the user directed
 the sweep to prioritize the most promising KL checkpoint (`step_002500`).
