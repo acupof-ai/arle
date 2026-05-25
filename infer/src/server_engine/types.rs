@@ -116,6 +116,31 @@ pub struct CompletionStreamDelta {
     /// agent loop treats an empty cumulative response as "unavailable"
     /// and surfaces `tokens = None` rather than fabricating partial data.
     pub token_ids: Vec<u32>,
+    /// Terminal inference/scheduler failure, if the request failed before a
+    /// normal finish delta. HTTP handlers serialize this chain instead of
+    /// collapsing it into an ambiguous service-unavailable response.
+    pub error: Option<CompletionStreamError>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionStreamError {
+    pub kind: String,
+    pub message: String,
+    pub chain: Vec<String>,
+}
+
+impl CompletionStreamError {
+    pub fn from_chain(kind: impl Into<String>, chain: Vec<String>) -> Self {
+        let message = chain
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "inference request failed".to_string());
+        Self {
+            kind: kind.into(),
+            message,
+            chain,
+        }
+    }
 }
 
 impl CompletionStreamDelta {
@@ -127,6 +152,18 @@ impl CompletionStreamDelta {
             usage: None,
             logprob: None,
             token_ids: Vec::new(),
+            error: None,
+        }
+    }
+
+    pub fn error(kind: impl Into<String>, chain: Vec<String>) -> Self {
+        Self {
+            text_delta: String::new(),
+            finish_reason: None,
+            usage: None,
+            logprob: None,
+            token_ids: Vec::new(),
+            error: Some(CompletionStreamError::from_chain(kind, chain)),
         }
     }
 }

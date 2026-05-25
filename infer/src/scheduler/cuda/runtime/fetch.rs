@@ -60,7 +60,7 @@ impl<M: ModelForward> Scheduler<M> {
                 continue;
             }
             if req.delta_tx.is_closed() {
-                self.finish_slot(slot_idx);
+                self.finish_slot_client_closed(slot_idx);
                 continue;
             }
             if !matches!(req.phase, Phase::WaitingFetch) {

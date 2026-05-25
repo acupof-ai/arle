@@ -43,7 +43,11 @@ impl<M: ModelForward> Scheduler<M> {
                     "Request {}: Decoding state with no generated tokens - dropping",
                     req_id
                 );
-                self.finish_slot(slot_idx);
+                self.finish_slot_with_message(
+                    slot_idx,
+                    "inference_failed",
+                    format!("Request {req_id}: decoding state had no generated tokens"),
+                );
             }
         }
         (valid_decode_indices, token_ids)
@@ -132,7 +136,7 @@ impl<M: ModelForward> Scheduler<M> {
                 continue;
             };
             if req.delta_tx.is_closed() {
-                self.finish_slot(slot_idx);
+                self.finish_slot_client_closed(slot_idx);
                 continue;
             }
             if self.slot_is_runnable_decode(slot_idx) {
@@ -178,6 +182,8 @@ impl<M: ModelForward> Scheduler<M> {
                 "Request {}: slot reset after preempt failed: {}",
                 victim_id, e
             );
+            self.finish_slot_with_error(slot_idx, "inference_failed", &e);
+            return;
         }
         self.slot_materialized_prompt_lens[slot_idx] = 0;
         self.clear_slot_prefix_ownership(slot_idx);
@@ -274,7 +280,7 @@ impl<M: ModelForward> Scheduler<M> {
                 Err(e) => {
                     error!("Failed to create decode context: {}", e);
                     for &slot_idx in &decode_indices {
-                        self.finish_slot(slot_idx);
+                        self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                     }
                     return;
                 }
@@ -297,7 +303,7 @@ impl<M: ModelForward> Scheduler<M> {
         if let Err(e) = forward_result {
             error!("Batched decode failed: {}", e);
             for &slot_idx in &decode_indices {
-                self.finish_slot(slot_idx);
+                self.finish_slot_with_error(slot_idx, "inference_failed", &e);
             }
             return;
         }
@@ -320,7 +326,7 @@ impl<M: ModelForward> Scheduler<M> {
                     ) {
                         error!("Preparing batched sampling fallback failed: {}", e);
                         for &slot_idx in &decode_indices {
-                            self.finish_slot(slot_idx);
+                            self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                         }
                         return;
                     }
@@ -329,7 +335,7 @@ impl<M: ModelForward> Scheduler<M> {
                 Err(e) => {
                     error!("Batched greedy sampling launch failed: {}", e);
                     for &slot_idx in &decode_indices {
-                        self.finish_slot(slot_idx);
+                        self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                     }
                     return;
                 }
@@ -479,7 +485,7 @@ impl<M: ModelForward> Scheduler<M> {
                 continue;
             };
             if req.delta_tx.is_closed() {
-                self.finish_slot(slot_idx);
+                self.finish_slot_client_closed(slot_idx);
                 continue;
             }
             let (prefill_tokens, progress, total_tokens) = if let Phase::Prefilling {
@@ -526,10 +532,10 @@ impl<M: ModelForward> Scheduler<M> {
                 Err(e) => {
                     error!("Failed to create decode context: {}", e);
                     for row in &pending_rows {
-                        self.finish_slot(row.slot_idx);
+                        self.finish_slot_with_error(row.slot_idx, "inference_failed", &e);
                     }
                     for &slot_idx in &decode_indices {
-                        self.finish_slot(slot_idx);
+                        self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                     }
                     return;
                 }
@@ -628,10 +634,10 @@ impl<M: ModelForward> Scheduler<M> {
             Err(e) => {
                 error!("Mixed batch launch failed: {}", e);
                 for row in &pending_rows {
-                    self.finish_slot(row.slot_idx);
+                    self.finish_slot_with_error(row.slot_idx, "inference_failed", &e);
                 }
                 for &slot_idx in &decode_indices {
-                    self.finish_slot(slot_idx);
+                    self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                 }
                 return;
             }
@@ -654,10 +660,10 @@ impl<M: ModelForward> Scheduler<M> {
                     ) {
                         error!("Preparing batched sampling fallback failed: {}", e);
                         for row in &pending_rows {
-                            self.finish_slot(row.slot_idx);
+                            self.finish_slot_with_error(row.slot_idx, "inference_failed", &e);
                         }
                         for &slot_idx in &decode_indices {
-                            self.finish_slot(slot_idx);
+                            self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                         }
                         return;
                     }
@@ -666,10 +672,10 @@ impl<M: ModelForward> Scheduler<M> {
                 Err(e) => {
                     error!("Batched greedy sampling launch failed: {}", e);
                     for row in &pending_rows {
-                        self.finish_slot(row.slot_idx);
+                        self.finish_slot_with_error(row.slot_idx, "inference_failed", &e);
                     }
                     for &slot_idx in &decode_indices {
-                        self.finish_slot(slot_idx);
+                        self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                     }
                     return;
                 }
@@ -682,10 +688,10 @@ impl<M: ModelForward> Scheduler<M> {
             ) {
                 error!("Preparing mixed-batch sampling fallback failed: {}", e);
                 for row in &pending_rows {
-                    self.finish_slot(row.slot_idx);
+                    self.finish_slot_with_error(row.slot_idx, "inference_failed", &e);
                 }
                 for &slot_idx in &decode_indices {
-                    self.finish_slot(slot_idx);
+                    self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                 }
                 return;
             }
@@ -713,19 +719,25 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn finish_pending_decode_with_error(&mut self, mut pending: PendingDecode, err: anyhow::Error) {
-        error!("Batched sampling failed: {}", err);
+        error!(
+            "Batched sampling failed: {}",
+            err.chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" | caused by: ")
+        );
         pending.stage.mark_completed();
         self.metrics
             .record_scheduler_pipeline_stage_completed(pending.stage.kind.as_str());
         for &slot_idx in &pending.decode_indices {
-            self.finish_slot(slot_idx);
+            self.finish_slot_with_error(slot_idx, "inference_failed", &err);
         }
         if let Some(mut mixed_prefill) = pending.mixed_prefill {
             mixed_prefill.stage.mark_completed();
             self.metrics
                 .record_scheduler_pipeline_stage_completed(mixed_prefill.stage.kind.as_str());
             for row in mixed_prefill.rows {
-                self.finish_slot(row.slot_idx);
+                self.finish_slot_with_error(row.slot_idx, "inference_failed", &err);
             }
         }
         self.publish_gpu_stage_depths();
@@ -817,7 +829,7 @@ impl<M: ModelForward> Scheduler<M> {
                         "Request {}: distributed decode token sync failed: {}",
                         req_id, err
                     );
-                    self.finish_slot(slot_idx);
+                    self.finish_slot_with_error(slot_idx, "inference_failed", &err);
                     continue;
                 }
             };

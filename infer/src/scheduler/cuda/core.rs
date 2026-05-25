@@ -6,8 +6,8 @@ use super::budget::{
 };
 use super::policy::TieredKvPolicy;
 use super::{
-    ActiveRequest, Arc, AtomicUsize, IncomingRequest, ModelForward, PagedKVPool, Phase, Result,
-    SchedulerConfig, StdRng, Tokenizer, VecDeque, error, info, mpsc, warn,
+    AbortReason, ActiveRequest, Arc, AtomicUsize, IncomingRequest, ModelForward, PagedKVPool,
+    Phase, Result, SchedulerConfig, StdRng, Tokenizer, VecDeque, error, info, mpsc, warn,
 };
 use crate::kv_tier::transport::DiskStore;
 use crate::kv_tier::{
@@ -1102,6 +1102,46 @@ impl<M: ModelForward> Scheduler<M> {
         }
         self.dequeue_prefill(slot_idx);
         self.dequeue_running(slot_idx);
+    }
+
+    pub(super) fn finish_slot_with_error(
+        &mut self,
+        slot_idx: usize,
+        kind: &'static str,
+        err: &anyhow::Error,
+    ) {
+        let reason = AbortReason::from_error(kind, err);
+        let request_id = self.request(slot_idx).map(|req| req.id);
+        if let Some(request_id) = request_id {
+            error!(
+                "Request {request_id}: abort kind={} chain={}",
+                reason.kind,
+                reason.chain.join(" | caused by: ")
+            );
+        }
+        if let Some(req) = self.request_mut(slot_idx) {
+            req.abort_reason = Some(reason.clone());
+            let _ = req.delta_tx.send(reason.to_delta());
+        }
+        self.finish_slot(slot_idx);
+    }
+
+    pub(super) fn finish_slot_with_message(
+        &mut self,
+        slot_idx: usize,
+        kind: &'static str,
+        message: impl Into<String>,
+    ) {
+        let message = message.into();
+        let err = anyhow::anyhow!("{message}");
+        self.finish_slot_with_error(slot_idx, kind, &err);
+    }
+
+    pub(super) fn finish_slot_client_closed(&mut self, slot_idx: usize) {
+        if let Some(req) = self.request_mut(slot_idx) {
+            req.abort_reason = Some(AbortReason::client_closed());
+        }
+        self.finish_slot(slot_idx);
     }
 
     pub(super) fn move_to_decode(&mut self, slot_idx: usize) {

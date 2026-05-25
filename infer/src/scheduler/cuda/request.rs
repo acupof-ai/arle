@@ -4,6 +4,44 @@ use log::warn;
 
 use super::{CompletionStreamDelta, FinishReason, RequestPriority, TokenUsage, Tokenizer, mpsc};
 
+#[derive(Clone, Debug)]
+pub(crate) struct AbortReason {
+    pub(crate) kind: String,
+    pub(crate) chain: Vec<String>,
+}
+
+impl AbortReason {
+    pub(crate) fn from_error(kind: impl Into<String>, err: &anyhow::Error) -> Self {
+        let mut chain: Vec<String> = err.chain().map(ToString::to_string).collect();
+        if chain.is_empty() {
+            chain.push("request aborted".to_string());
+        }
+        let kind = kind.into();
+        let kind = if kind == "inference_failed"
+            && chain.iter().any(|cause| {
+                cause.contains("CUDA_ERROR_NOT_SUPPORTED")
+                    || cause.contains("cudaErrorNotSupported")
+                    || cause.contains("operation not supported")
+            }) {
+            "architectural_deferral".to_string()
+        } else {
+            kind
+        };
+        Self { kind, chain }
+    }
+
+    pub(crate) fn client_closed() -> Self {
+        Self {
+            kind: "client_closed".to_string(),
+            chain: vec!["request client channel closed".to_string()],
+        }
+    }
+
+    pub(crate) fn to_delta(&self) -> CompletionStreamDelta {
+        CompletionStreamDelta::error(self.kind.clone(), self.chain.clone())
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct StreamDecodeState {
     pub(crate) full_decoded: String,
@@ -84,6 +122,7 @@ impl StreamDecodeState {
                             // `decoded_token_count`. The cumulative list
                             // still rides on `send_finish` below.
                             token_ids: Vec::new(),
+                            error: None,
                         });
                     }
                     self.sent_len = stop_pos;
@@ -105,6 +144,7 @@ impl StreamDecodeState {
                             logprob,
                             // TODO Phase-2 follow-up: see above.
                             token_ids: Vec::new(),
+                            error: None,
                         });
                         self.sent_len = safe_len;
                     }
@@ -122,6 +162,7 @@ impl StreamDecodeState {
                         logprob,
                         // TODO Phase-2 follow-up: see above.
                         token_ids: Vec::new(),
+                        error: None,
                     });
                 }
                 self.sent_len = self.full_decoded.len();
@@ -162,6 +203,7 @@ impl StreamDecodeState {
                             logprob: None,
                             // TODO Phase-2 follow-up: see emit_delta.
                             token_ids: Vec::new(),
+                            error: None,
                         });
                     }
                 }
@@ -214,6 +256,7 @@ impl StreamDecodeState {
             }),
             logprob: None,
             token_ids: generated_tokens.to_vec(),
+            error: None,
         });
     }
 }
@@ -290,6 +333,7 @@ pub(crate) struct ActiveRequest {
     /// Deferred terminal reason that must wait for a stop-sensitive emit gate
     /// result before the scheduler can finalize the request.
     pub(crate) pending_finish_reason: Option<FinishReason>,
+    pub(crate) abort_reason: Option<AbortReason>,
     /// Block-aligned prefix length that was proven reusable at admission time.
     /// This is derived from the global radix lookup, not a slot-local token
     /// compare. Zero means the request should start cold.
@@ -449,6 +493,7 @@ mod tests {
             cacheable_prompt_len: 0,
             latest_logprob: None,
             pending_finish_reason: None,
+            abort_reason: None,
             reusable_prefix_len: 0,
             reusable_cached_prompt_len: 0,
             attached_prefix_blocks: Vec::new(),

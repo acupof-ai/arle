@@ -704,6 +704,7 @@ impl<M: ModelForward> Scheduler<M> {
             cacheable_prompt_len: 0,
             latest_logprob: None,
             pending_finish_reason: None,
+            abort_reason: None,
             reusable_prefix_len: if direct_gpu_attach {
                 lookup.matched_len
             } else {

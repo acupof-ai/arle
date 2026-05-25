@@ -32,8 +32,8 @@ pub use request_handle_engine::RequestHandleInferenceEngine;
 #[cfg(feature = "cuda")]
 pub use types::RawLogits;
 pub use types::{
-    CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry, FinishReason,
-    InferenceEngine, PrefillPathStats, TokenUsage,
+    CompletionOutput, CompletionRequest, CompletionStreamDelta, CompletionStreamError,
+    EngineTelemetry, FinishReason, InferenceEngine, PrefillPathStats, TokenUsage,
 };
 
 #[cfg(test)]
@@ -295,6 +295,7 @@ mod tests {
                     usage: None,
                     logprob: None,
                     token_ids: Vec::new(),
+                    error: None,
                 });
                 let _ = req.delta_tx.send(CompletionStreamDelta {
                     text_delta: "lo".into(),
@@ -302,6 +303,7 @@ mod tests {
                     usage: None,
                     logprob: None,
                     token_ids: Vec::new(),
+                    error: None,
                 });
                 let _ = req.delta_tx.send(CompletionStreamDelta {
                     text_delta: String::new(),
@@ -313,6 +315,7 @@ mod tests {
                     }),
                     logprob: None,
                     token_ids: Vec::new(),
+                    error: None,
                 });
                 Ok(())
             }
@@ -420,6 +423,7 @@ mod tests {
                     }),
                     logprob: None,
                     token_ids: Vec::new(),
+                    error: None,
                 });
                 Ok(())
             }

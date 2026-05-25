@@ -18,7 +18,8 @@ use crate::runtime_topology::RuntimeTopology;
 use crate::sampler::{SamplingParams, sampling_params_from_request};
 use crate::scheduler::{IncomingRequest, RequestPriority, RequestSpecConfig};
 use crate::server_engine::{
-    CompletionOutput, CompletionStreamDelta, EnginePoolModelSpec, FinishReason, TokenUsage,
+    CompletionOutput, CompletionStreamDelta, CompletionStreamError, EnginePoolModelSpec,
+    FinishReason, TokenUsage,
 };
 use fastrace::collector::SpanContext;
 use tokio::sync::Semaphore;
@@ -288,6 +289,7 @@ pub(super) struct BufferedResponse {
     /// terminal delta). The non-streaming HTTP handlers use this to return a
     /// 503 instead of an empty 200 when the server gave up on the request.
     pub(super) terminal_seen: bool,
+    pub(super) error: Option<CompletionStreamError>,
 }
 
 impl Default for BufferedResponse {
@@ -303,12 +305,16 @@ impl Default for BufferedResponse {
             token_logprobs: Vec::new(),
             response_token_ids: Vec::new(),
             terminal_seen: false,
+            error: None,
         }
     }
 }
 
 impl BufferedResponse {
     pub(super) fn apply_delta(&mut self, delta: &CompletionStreamDelta) {
+        if let Some(error) = &delta.error {
+            self.error = Some(error.clone());
+        }
         self.text.push_str(&delta.text_delta);
         if let Some(reason) = delta.finish_reason {
             self.finish_reason = reason;
