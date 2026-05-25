@@ -8,7 +8,7 @@
 > the OPD-only pivot — GRPO duplicates verl/TRL and the
 > single-product GRPO axis lost to industry baselines. Continue at
 > [`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md).
-**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 的 `--serve` 共享当前控制面真相，`infer --train-control-url` 可选暴露代理入口） / 训练端从零写 / sole train-side model line is the Qwen3.5-family path with HF-style checkpoint dirs; hybrid linear-attn is now locally accepted on CPU + Metal across scratch pretrain / LoRA-eval / RL, handwritten Transformer/TinyLM runtime compat deleted
+**Historical scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成。The GRPO/multi-turn command surface was retired in the 2026-05-18 OPD-only pivot; the surviving current train surface is OPD-only (`arle train opd --student-model <dir>`), with the train-control substrate kept for separately licensed reuse.
 
 This plan executes under the runtime-first rule: `infer` remains the primary
 runtime truth, and Phase 6 work is only valid if it converges on that spine
@@ -22,16 +22,14 @@ instead of creating a second product boundary.
 2. [`docs/projects/agent-rl-self-evolving.md`](../projects/agent-rl-self-evolving.md) — 架构 + Why + 风险
 3. 上游参考:<https://github.com/mni-ml/framework>(read-only,不 vendor)
 
-> **Current implementation note**
+> **Historical implementation note**
 > 本计划主要描述 Phase 6 的执行路径和目标收敛方向。
-> 2026-04-21 当前 repo 里的训练控制面仍然是 `crates/train`
-> 自己的 train-side server：`pretrain --serve` / `train_sft --serve` /
-> `train_grpo --serve` / `train_multi_turn --serve` →
-> `crates/train/src/server.rs`。如果问题是当前 runtime / checkpoint /
-> metrics / server 的真实边界，先看
-> [`train-runtime-architecture-v1.md`](train-runtime-architecture-v1.md)
-> 和 [`docs/codebase-map.md`](../codebase-map.md)。
-> 当前 train-side 训练模型实现已经是 Qwen3.5-family 路径；HF-style checkpoint 目录、exact resume、以及 shared async observability 都已在用。`pretrain` 是唯一 canonical scratch-pretrain 入口，手写 Transformer/TinyLM runtime compatibility 路径已经删除，不再作为单独主线描述。当前 acceptance 切分也已经更新：hybrid linear-attn 已经在 CPU / Metal 上覆盖 scratch pretrain、LoRA/eval、以及 RL；剩余主要是 CUDA hybrid runtime acceptance，而不是本地 runtime 缺口。
+> 2026-04-21 repo state used `crates/train` train-side server binaries
+> (`pretrain --serve`, `train_sft --serve`, `train_grpo --serve`,
+> `train_multi_turn --serve`). Those binaries are no longer current command
+> surfaces. For today's runtime / checkpoint / metrics boundary, start from
+> [`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md),
+> [`docs/codebase-map.md`](../codebase-map.md), and the OPD wins entries.
 
 ---
 

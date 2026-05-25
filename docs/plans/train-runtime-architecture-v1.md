@@ -15,26 +15,19 @@
 > this doc is kept as the historical record of how the surviving
 > substrate took its shape.
 
-> **Current reality note**
+> **Historical reality note**
 > This runtime layer is model-family agnostic. The current train-side
-> implementation already includes a generic Qwen-family control plane with
-> Qwen3.5 as the optimized default. `pretrain` now dispatches across
-> Qwen3 / Qwen3.5 families and resumes both weights and optimizer state,
-> `train_sft` and `train_grpo` dispatch across Qwen3 / Qwen3.5 families,
-> `train_grpo` and `train_multi_turn` now round-trip exact resume state on
-> the active RL path, `train_multi_turn` exposes an explicit stepwise-GRPO vs
-> sequence-level-GSPO objective switch,
-> checkpoints are written as HF-style directories, and the shared Qwen3.5
-> model path now supports hybrid linear-attn layers across scratch pretrain,
-> LoRA/frozen eval, and RL on the local CPU + Metal path, while CUDA hybrid
-> runtime acceptance remains pending. The target train-side
-> model line is the Qwen3.5 architecture family.
+> implementation once included a generic Qwen-family control plane with
+> `pretrain`, `train_sft`, `train_grpo`, and `train_multi_turn` binaries.
+> Those binaries were retired in the OPD-only pivot. The surviving substrate
+> is the trainer/checkpoint/metrics/control-plane machinery; the current
+> executable product surface is OPD-only.
 
 ---
 
 ## 1. Problem
 
-The active training binaries (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) historically duplicated the step loop: forward → loss → backward → `optimizer.step()` → `tape.zero_grad()`. That factoring work is now mostly landed: the handwritten Transformer runtime is gone, the active train-side path already shares `Trainer<O, C, S>`, HF-style checkpoint dirs, exact-resume state, and a shared async observability sink. The remaining pain has narrowed to the parts that still resist the current generic runtime shape:
+The retired training binaries (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) historically duplicated the step loop: forward → loss → backward → `optimizer.step()` → `tape.zero_grad()`. That factoring work produced substrate that OPD still uses: `Trainer<O, C, S>`, HF-style checkpoint dirs, exact-resume state, and a shared async observability sink. The historical pain points below explain why that substrate was shaped this way:
 
 - **RL loops still sit partly outside `Trainer<O, C, S>`** — `train_grpo` and `train_multi_turn` still own rollout/reward/objective orchestration by hand because the current closure model is supervised-step shaped.
 - **CLI/runtime composition is still hand-rolled per binary** — flags are not normalized across all train surfaces yet, and `clap` adoption is still open.
