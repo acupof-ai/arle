@@ -310,6 +310,31 @@ fn retain_rollout_step_tensors(
     store.retain_ids(&keep);
 }
 
+fn sanitize_non_finite_grads(params: &[TensorId], store: &mut TensorStore) -> Result<usize> {
+    let mut replaced = 0usize;
+    for &param_id in params {
+        let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {
+            continue;
+        };
+        let Some(grad) = store.get_mut(grad_id) else {
+            continue;
+        };
+        for value in &mut grad.data {
+            if !value.is_finite() {
+                *value = 0.0;
+                replaced += 1;
+            }
+        }
+    }
+    if replaced > 0 {
+        println!(
+            "opd_grad_sanitize params={} non_finite_replaced={replaced}",
+            params.len()
+        );
+    }
+    Ok(replaced)
+}
+
 fn rollout_full_forward(
     student: &Qwen35Model,
     rollout: &mut Vec<u32>,
@@ -1574,6 +1599,8 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 &mut profile,
             )?;
             validate_loss_value(loss_value)?;
+
+            sanitize_non_finite_grads(student_params, store)?;
 
             let phase_started = Instant::now();
             clip_grad_norm(student_params, cfg.grad_clip, store);
