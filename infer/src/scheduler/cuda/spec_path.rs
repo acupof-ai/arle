@@ -222,7 +222,7 @@ impl SpecPath {
                 }
                 log::error!("spec verifier failed: {err}");
                 for row in &rows {
-                    scheduler.finish_slot(row.slot_idx);
+                    scheduler.finish_slot_with_error(row.slot_idx, "inference_failed", &err);
                 }
                 return;
             }
@@ -236,7 +236,14 @@ impl SpecPath {
                 .iter()
                 .find(|output| output.slot_idx == row.slot_idx)
             else {
-                scheduler.finish_slot(row.slot_idx);
+                scheduler.finish_slot_with_message(
+                    row.slot_idx,
+                    "inference_failed",
+                    format!(
+                        "spec verifier output missing for request {} slot {}",
+                        row.request_id, row.slot_idx
+                    ),
+                );
                 continue;
             };
             let result = crate::speculative::verify_tokens_greedy(
@@ -257,7 +264,7 @@ impl SpecPath {
                 .truncate_slot(row.slot_idx, keep_target_len)
             {
                 log::error!("spec target KV rollback failed: {err}");
-                scheduler.finish_slot(row.slot_idx);
+                scheduler.finish_slot_with_error(row.slot_idx, "inference_failed", &err);
                 continue;
             }
             if let Err(err) = scheduler.model.commit_speculative_target_state(
@@ -266,7 +273,7 @@ impl SpecPath {
                 result.num_accepted,
             ) {
                 log::error!("spec target state rollback failed: {err}");
-                scheduler.finish_slot(row.slot_idx);
+                scheduler.finish_slot_with_error(row.slot_idx, "inference_failed", &err);
                 continue;
             }
             if let Some(draft_engine) = scheduler.draft_engine.as_ref() {
@@ -494,7 +501,7 @@ impl SpecPath {
                 .truncate_slot(slot_idx, original_target_len)
             {
                 log::error!("sparse draft rollback failed for request {request_id}: {err}");
-                scheduler.finish_slot(slot_idx);
+                scheduler.finish_slot_with_error(slot_idx, "inference_failed", &err);
                 continue;
             }
             if draft_tokens.is_empty() {
@@ -562,7 +569,14 @@ fn verify_and_commit_rows<M: ModelForward>(
             .iter()
             .find(|output| output.slot_idx == row.slot_idx)
         else {
-            scheduler.finish_slot(row.slot_idx);
+            scheduler.finish_slot_with_message(
+                row.slot_idx,
+                "inference_failed",
+                format!(
+                    "sparse spec verifier output missing for request {} slot {}",
+                    row.request_id, row.slot_idx
+                ),
+            );
             continue;
         };
         let result = crate::speculative::verify_tokens_greedy(
@@ -583,7 +597,7 @@ fn verify_and_commit_rows<M: ModelForward>(
             .truncate_slot(row.slot_idx, keep_target_len)
         {
             log::error!("sparse spec target KV rollback failed: {err}");
-            scheduler.finish_slot(row.slot_idx);
+            scheduler.finish_slot_with_error(row.slot_idx, "inference_failed", &err);
             continue;
         }
         if let Err(err) = scheduler.model.commit_speculative_target_state(
@@ -592,7 +606,7 @@ fn verify_and_commit_rows<M: ModelForward>(
             result.num_accepted,
         ) {
             log::error!("sparse spec target state rollback failed: {err}");
-            scheduler.finish_slot(row.slot_idx);
+            scheduler.finish_slot_with_error(row.slot_idx, "inference_failed", &err);
             continue;
         }
 

@@ -596,6 +596,7 @@ mod tests {
                 usage: None,
                 logprob: None,
                 token_ids: Vec::new(),
+                error: None,
             })
             .unwrap();
     }

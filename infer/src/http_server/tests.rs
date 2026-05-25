@@ -31,6 +31,7 @@ mod tests {
                     usage: None,
                     logprob: None,
                     token_ids: Vec::new(),
+                    error: None,
                 },
                 CompletionStreamDelta {
                     text_delta: String::new(),
@@ -42,6 +43,7 @@ mod tests {
                     }),
                     logprob: None,
                     token_ids: Vec::new(),
+                    error: None,
                 },
             ],
             true,
@@ -70,6 +72,7 @@ mod tests {
                         usage: delta.usage,
                         logprob: delta.logprob,
                         token_ids: delta.token_ids.clone(),
+                        error: delta.error.clone(),
                     });
                 }
             }
@@ -213,6 +216,7 @@ mod tests {
                     usage: None,
                     logprob: None,
                     token_ids: vec![11],
+                    error: None,
                 },
                 CompletionStreamDelta {
                     text_delta: String::new(),
@@ -224,6 +228,7 @@ mod tests {
                     }),
                     logprob: None,
                     token_ids: vec![22],
+                    error: None,
                 },
             ],
             true,
@@ -245,6 +250,48 @@ mod tests {
         assert_eq!(
             payload["choices"][0]["token_ids"],
             serde_json::json!([11, 22])
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_response_surfaces_inference_error_chain() {
+        let app = build_app(mock_scheduler_with_deltas(
+            "Qwen3-4B",
+            vec![CompletionStreamDelta::error(
+                "inference_failed",
+                vec![
+                    "op=batch_decode_paged_hd128 layer=12".to_string(),
+                    "kernel=batch_decode_paged_hd128 cuda_err=CUDA_ERROR_ILLEGAL_ADDRESS code=700"
+                        .to_string(),
+                ],
+            )],
+            false,
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":2}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "inference_failed");
+        assert_eq!(payload["error"]["details"]["kind"], "inference_failed");
+        assert_eq!(
+            payload["error"]["details"]["chain"][0],
+            "op=batch_decode_paged_hd128 layer=12"
+        );
+        assert!(
+            payload["error"]["details"]["chain"][1]
+                .as_str()
+                .is_some_and(|cause| cause.contains("CUDA_ERROR_ILLEGAL_ADDRESS")),
+            "payload={payload}"
         );
     }
 
@@ -1190,6 +1237,7 @@ mod tests {
                     usage: None,
                     logprob: None,
                     token_ids: Vec::new(),
+                    error: None,
                 },
                 CompletionStreamDelta {
                     text_delta: String::new(),
@@ -1201,6 +1249,7 @@ mod tests {
                     }),
                     logprob: None,
                     token_ids: Vec::new(),
+                    error: None,
                 },
             ],
             false,
@@ -1346,6 +1395,7 @@ mod tests {
                     }),
                     logprob: None,
                     token_ids: Vec::new(),
+                    error: None,
                 });
             }
         });

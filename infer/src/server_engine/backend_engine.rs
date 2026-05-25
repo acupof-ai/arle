@@ -155,6 +155,7 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
                                 usage: None,
                                 logprob: None,
                                 token_ids: Vec::new(),
+                                error: None,
                             })
                             .is_err()
                         {
@@ -192,6 +193,7 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
                 usage: None,
                 logprob: None,
                 token_ids: Vec::new(),
+                error: None,
             });
         }
 
@@ -224,6 +226,7 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
             usage: Some(usage),
             logprob: None,
             token_ids: response_token_ids,
+            error: None,
         });
         Ok(())
     }

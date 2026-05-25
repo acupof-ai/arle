@@ -522,7 +522,7 @@ impl<M: ModelForward> Scheduler<M> {
                 .request(slot_idx)
                 .is_some_and(|req| req.delta_tx.is_closed())
             {
-                self.finish_slot(slot_idx);
+                self.finish_slot_client_closed(slot_idx);
                 continue;
             }
             let Some(reservation) = self.prefill_reservation(

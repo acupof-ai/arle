@@ -310,6 +310,7 @@ where
         usage: Some(usage),
         logprob: None,
         token_ids: response_token_ids,
+        error: None,
     });
 
     Ok(())
@@ -340,6 +341,7 @@ fn send_text_delta(
             // text-callback streaming path; the cumulative list rides
             // on the final delta in `execute_request`.
             token_ids: Vec::new(),
+            error: None,
         })
         .map_err(|_| anyhow!("stream consumer dropped"))
 }

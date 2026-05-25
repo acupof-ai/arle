@@ -114,7 +114,7 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         };
         if req.delta_tx.is_closed() {
-            self.finish_slot(slot_idx);
+            self.finish_slot_client_closed(slot_idx);
             return;
         }
 
@@ -149,7 +149,7 @@ impl<M: ModelForward> Scheduler<M> {
                     "Request {}: reset before paged prefix attach failed: {}",
                     req_id, e
                 );
-                self.finish_slot(slot_idx);
+                self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                 return;
             }
             self.slot_materialized_prompt_lens[si] = 0;
@@ -161,7 +161,7 @@ impl<M: ModelForward> Scheduler<M> {
                     "Request {}: paged prefix attach failed for {} tokens: {}",
                     req_id, attach_prefix_len, e
                 );
-                self.finish_slot(slot_idx);
+                self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                 return;
             }
 
@@ -233,7 +233,7 @@ impl<M: ModelForward> Scheduler<M> {
                             "Request {}: truncate on full prompt reuse hit failed: {}",
                             req_id, e
                         );
-                        self.finish_slot(slot_idx);
+                        self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                         return;
                     }
                     self.slot_materialized_prompt_lens[si] = replay_from;
@@ -246,7 +246,7 @@ impl<M: ModelForward> Scheduler<M> {
                     );
                     if let Err(e) = state.reset() {
                         error!("Request {}: reset failed: {}", req_id, e);
-                        self.finish_slot(slot_idx);
+                        self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                         return;
                     }
                     self.slot_materialized_prompt_lens[si] = 0;
@@ -260,7 +260,7 @@ impl<M: ModelForward> Scheduler<M> {
                 );
                 if let Err(e) = state.reset() {
                     error!("Request {}: reset failed: {}", req_id, e);
-                    self.finish_slot(slot_idx);
+                    self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                     return;
                 }
                 self.slot_materialized_prompt_lens[si] = 0;
@@ -302,7 +302,7 @@ impl<M: ModelForward> Scheduler<M> {
                             );
                             if let Err(e2) = state.reset() {
                                 error!("Request {}: reset failed: {}", req_id, e2);
-                                self.finish_slot(slot_idx);
+                                self.finish_slot_with_error(slot_idx, "inference_failed", &e2);
                                 return;
                             }
                             self.slot_materialized_prompt_lens[si] = 0;
@@ -324,7 +324,7 @@ impl<M: ModelForward> Scheduler<M> {
                 );
                 if let Err(e) = state.truncate_to(prefix_len) {
                     error!("Request {}: truncate failed: {}", req_id, e);
-                    self.finish_slot(slot_idx);
+                    self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                     return;
                 }
                 self.slot_materialized_prompt_lens[si] = prefix_len;
@@ -333,7 +333,7 @@ impl<M: ModelForward> Scheduler<M> {
                 info!("Request {}: prefix MISS", req_id);
                 if let Err(e) = state.reset() {
                     error!("Request {}: reset failed: {}", req_id, e);
-                    self.finish_slot(slot_idx);
+                    self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                     return;
                 }
                 self.slot_materialized_prompt_lens[si] = 0;
@@ -496,7 +496,7 @@ impl<M: ModelForward> Scheduler<M> {
                 continue;
             };
             if req.delta_tx.is_closed() {
-                self.finish_slot(slot_idx);
+                self.finish_slot_client_closed(slot_idx);
                 continue;
             }
 
@@ -580,7 +580,11 @@ impl<M: ModelForward> Scheduler<M> {
                 continue;
             };
             if req.delta_tx.is_closed() || matches!(req.phase, Phase::Finished) {
-                self.finish_slot(slot_idx);
+                if req.delta_tx.is_closed() {
+                    self.finish_slot_client_closed(slot_idx);
+                } else {
+                    self.finish_slot(slot_idx);
+                }
                 continue;
             }
 
@@ -633,7 +637,7 @@ impl<M: ModelForward> Scheduler<M> {
                                 "Request {}: distributed prefill token sync failed: {}",
                                 req_id, err
                             );
-                            self.finish_slot(slot_idx);
+                            self.finish_slot_with_error(slot_idx, "inference_failed", &err);
                             continue;
                         }
                     };
@@ -647,7 +651,7 @@ impl<M: ModelForward> Scheduler<M> {
                         "Request {}: batched prefill completion failed: {}",
                         req_id, e
                     );
-                    self.finish_slot(slot_idx);
+                    self.finish_slot_with_error(slot_idx, "inference_failed", &e);
                 }
             }
         }
@@ -686,8 +690,15 @@ impl<M: ModelForward> Scheduler<M> {
                 .request(row.slot_idx)
                 .map(|req| req.id)
                 .unwrap_or_default();
-            error!("Request {}: prefill batch failed: {}", req_id, err);
-            self.finish_slot(row.slot_idx);
+            error!(
+                "Request {}: prefill batch failed: {}",
+                req_id,
+                err.chain()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" | caused by: ")
+            );
+            self.finish_slot_with_error(row.slot_idx, "inference_failed", err);
         }
         // K7 (perf-bug-roundup 2026-04-29): a single workspace OOM used to
         // cascade into every subsequent request OOMing too because admission

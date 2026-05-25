@@ -44,7 +44,9 @@ use super::types::{
 };
 use crate::error::ApiError;
 use crate::metrics::ServerMetrics;
-use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
+use crate::server_engine::{
+    CompletionStreamDelta, CompletionStreamError, FinishReason, TokenUsage,
+};
 use crate::trace_reporter::trace_runtime;
 
 fn now_secs() -> u64 {
@@ -133,6 +135,15 @@ fn non_streaming_timeout_error(request_kind: &str) -> ApiError {
         RESPONSE_TIMEOUT.as_secs()
     );
     ApiError::timeout(RESPONSE_TIMEOUT.as_secs())
+}
+
+fn log_stream_error(prefix: &str, error: &CompletionStreamError) {
+    error!(
+        "{prefix}: kind={} message={} chain={}",
+        error.kind,
+        error.message,
+        error.chain.join(" | caused by: ")
+    );
 }
 
 struct RequestTraceState {
@@ -362,6 +373,12 @@ fn trace_streaming_deltas(
     tokio::spawn(async move {
         while let Some(delta) = source.recv().await {
             trace.observe_delta(&delta);
+            if let Some(error) = &delta.error {
+                log_stream_error("streaming inference failed", error);
+                trace.finish(false, None, Some("inference_failed"));
+                let _ = tx.send(delta);
+                return;
+            }
             let finish_reason = delta.finish_reason;
             let terminal = finish_reason.is_some();
             if terminal {
@@ -398,20 +415,33 @@ async fn collect_buffered_response_inner(
         buffered.apply_delta(&delta);
     }
 
-    // Channel closed without a terminal delta — the scheduler aborted this
-    // request (e.g. prefill OOM, slot teardown). Returning the buffered
-    // (empty) body as a 200 silently swallows the error and confuses
-    // clients (see K7 in docs/projects/2026-04-29-perf-bug-roundup.md);
-    // surface a 503 instead so callers retry.
+    if let Some(error) = buffered.error.as_ref() {
+        log_stream_error("non-streaming inference failed", error);
+        trace.finish(false, None, Some("inference_failed"));
+        return Err(ApiError::inference_failed(
+            error.kind.clone(),
+            error.chain.clone(),
+        ));
+    }
+
+    // Channel closed without a terminal or error delta. This is a scheduler
+    // lifecycle bug after request admission, not a "server busy" rejection:
+    // surface it as an inference failure so follow-up debugging does not
+    // collapse into a generic overloaded/OOM placeholder.
     if !buffered.terminal_seen {
         warn!(
-            "{request_kind} channel closed without finish_reason ({} completion tokens, {} bytes text); returning 503",
+            "{request_kind} channel closed without finish_reason or error delta ({} completion tokens, {} bytes text)",
             buffered.usage.completion_tokens,
             buffered.text.len(),
         );
         trace.finish(false, None, Some("scheduler_channel_closed"));
-        return Err(ApiError::service_unavailable(
-            "Inference request aborted before completion (server overloaded or out of memory). Please retry.",
+        return Err(ApiError::inference_failed(
+            "scheduler_channel_closed",
+            vec![format!(
+                "{request_kind} scheduler channel closed without finish_reason or error delta; completion_tokens={} text_bytes={}",
+                buffered.usage.completion_tokens,
+                buffered.text.len()
+            )],
         ));
     }
 
@@ -551,7 +581,11 @@ async fn preprocess_prompt_tokens(
         .await
         .map_err(|err| {
             error!("Prompt preprocessing queue closed before scheduler submission: {err}");
-            ApiError::service_unavailable("Failed to preprocess request prompt")
+            ApiError::service_unavailable_with_details(
+                "Failed to preprocess request prompt",
+                "preprocess_unavailable",
+                vec![err.to_string()],
+            )
         })?;
     let wait_us = wait_started_at.elapsed().as_micros() as u64;
     state
@@ -571,7 +605,11 @@ async fn preprocess_prompt_tokens(
         .await
         .map_err(|err| {
             error!("Prompt tokenization failed before scheduler submission: {err}");
-            ApiError::service_unavailable("Failed to tokenize request prompt")
+            ApiError::service_unavailable_with_details(
+                "Failed to tokenize request prompt",
+                "tokenization_failed",
+                vec![err.to_string()],
+            )
         })?;
     Ok((output.prompt, Some(output.prompt_tokens), output.numa_node))
 }
@@ -601,8 +639,10 @@ async fn submit_request(
 
     if let Err(e) = state.handle.submit(incoming) {
         warn!("Scheduler at capacity: {e}");
-        return Err(ApiError::service_unavailable(
+        return Err(ApiError::service_unavailable_with_details(
             "Server is at capacity, please retry later",
+            "server_busy",
+            vec![e.to_string()],
         ));
     }
 
@@ -745,6 +785,24 @@ where
     C: serde::Serialize,
     U: serde::Serialize,
 {
+    if let Some(error) = delta.error {
+        let kind = error.kind.clone();
+        let payload = serde_json::json!({
+            "error": {
+                "message": error.message,
+                "type": "server_error",
+                "code": kind,
+                "details": {
+                    "kind": kind,
+                    "chain": error.chain,
+                },
+            },
+        });
+        return vec![Ok(Event::default().event("error").data(
+            serde_json::to_string(&payload).expect("error serialization"),
+        ))];
+    }
+
     let usage = delta.usage;
     let is_terminal = delta.finish_reason.is_some();
     let chunk = make_chunk(delta);
@@ -852,6 +910,22 @@ fn responses_sse_stream(
                     }
 
                     while let Some(delta) = delta_rx.recv().await {
+                        if let Some(error) = delta.error.as_ref() {
+                            log_stream_error("responses stream inference failed", error);
+                            let payload = serde_json::json!({
+                                "error": {
+                                    "message": &error.message,
+                                    "type": "server_error",
+                                    "code": &error.kind,
+                                    "details": {
+                                        "kind": &error.kind,
+                                        "chain": &error.chain,
+                                    },
+                                },
+                            });
+                            let event = sse_json_event("response.failed", &payload);
+                            return Some((Ok(event), ResponsesSseState::Done));
+                        }
                         let has_text = !delta.text_delta.is_empty();
                         let is_terminal = delta.finish_reason.is_some();
                         let text_delta = delta.text_delta.clone();

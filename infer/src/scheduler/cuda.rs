@@ -27,7 +27,7 @@ mod runtime;
 mod spec_path;
 
 pub use core::Scheduler;
-pub(super) use request::{ActiveRequest, Phase};
+pub(super) use request::{AbortReason, ActiveRequest, Phase};
 
 /// Interval (in completed requests) at which stats are logged.
 pub(super) const STATS_LOG_INTERVAL: u64 = 10;

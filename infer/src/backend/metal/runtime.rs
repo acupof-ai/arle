@@ -218,6 +218,7 @@ impl ActiveMetalRequest {
             usage: Some(usage),
             logprob: None,
             token_ids: std::mem::take(&mut self.pending_token_ids),
+            error: None,
         });
         Ok(())
     }
@@ -3126,6 +3127,7 @@ fn send_text_delta_with_ids(
             usage: None,
             logprob: None,
             token_ids,
+            error: None,
         })
         .map_err(|_| MetalStreamError::ConsumerDropped.into())
 }

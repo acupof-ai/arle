@@ -20,6 +20,14 @@ pub struct ApiErrorBody {
     pub code: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub param: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Box<ApiErrorDetails>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiErrorDetails {
+    pub kind: String,
+    pub chain: Vec<String>,
 }
 
 /// HTTP error response with status code and OpenAI-compatible JSON body.
@@ -44,6 +52,7 @@ impl ApiError {
                 error_type,
                 code,
                 param: None,
+                details: None,
             },
             headers: Vec::new(),
         }
@@ -67,6 +76,53 @@ impl ApiError {
             "server_error",
             "service_unavailable",
         )
+    }
+
+    /// 503 Service Unavailable with structured cause details. Use this for
+    /// real admission/capacity failures where retrying may be appropriate,
+    /// but the operator still needs the upstream error chain in logs/body.
+    pub fn service_unavailable_with_details(
+        message: impl Into<String>,
+        kind: impl Into<String>,
+        chain: Vec<String>,
+    ) -> Self {
+        let mut error = Self::service_unavailable(message);
+        error.body.details = Some(Box::new(ApiErrorDetails {
+            kind: kind.into(),
+            chain,
+        }));
+        error
+    }
+
+    /// 500/501 inference failure — model/scheduler/kernel execution failed
+    /// after request admission. The chain carries operator/kernel context.
+    pub fn inference_failed(kind: impl Into<String>, chain: Vec<String>) -> Self {
+        let kind = kind.into();
+        let architectural = kind == "architectural_deferral"
+            || chain.iter().any(|cause| {
+                cause.contains("CUDA_ERROR_NOT_SUPPORTED")
+                    || cause.contains("cudaErrorNotSupported")
+                    || cause.contains("operation not supported")
+            });
+        let mut error = Self::new(
+            if architectural {
+                StatusCode::NOT_IMPLEMENTED
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            chain
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Inference request failed".to_string()),
+            "server_error",
+            if architectural {
+                "architectural_deferral"
+            } else {
+                "inference_failed"
+            },
+        );
+        error.body.details = Some(Box::new(ApiErrorDetails { kind, chain }));
+        error
     }
 
     /// 401 Unauthorized — missing or invalid authentication credentials.
