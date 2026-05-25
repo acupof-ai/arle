@@ -250,10 +250,11 @@ shipped truth remains:
    original "radix tree + separate directory" topology is explicitly
    superseded; no function takes a `BlockId` and needs a second query to
    know which tier it is in.
-2. **Only the coordinator moves blocks between tiers.** The scheduler
-   emits intents (`Demote`, `Promote`, `Pin`, `Unpin`); the coordinator
-   owns the copy stream, the in-flight IO queue, and tier transitions.
-   No tier transitions on the scheduler main loop.
+2. **Tier byte-movement ownership is split by boundary.** The CUDA scheduler
+   owns local T0↔T1 materialization/demotion because it owns GPU page
+   allocation, CUDA stream fences, and radix retag timing. The coordinator owns
+   queued T1↔T2/T3 movement and completion events. Scheduler code must not issue
+   `TransferOp`s directly.
 3. **`RadixCache` is the single source of truth for `tier`.** A block's
    tier changes atomically at `Cell<TierLocation>` write; pool, transport,
    and eviction code never maintain their own tier bookkeeping.
@@ -276,9 +277,9 @@ shipped truth remains:
    a time. A page that holds fewer than `page_size` valid tokens is the
    request's hot tail and is **not eligible** for radix insertion, tier
    transfer, or fingerprint computation. Only when the tail page fills
-   does the scheduler hand it to `RadixCache::insert` and to the
-   coordinator as a candidate for demotion. Without this rule, the
-   coordinator would either ship partial blocks across PCIe (wasting
+   does the scheduler hand it to `RadixCache::insert` and to the local
+   demotion path as a candidate for T0<->T1 movement. Without this rule,
+   the runtime would either ship partial blocks across PCIe (wasting
    bandwidth) or maintain "in-progress block" state on every page (a
    second source of truth for tier location).
 9. **Old contiguous CPU offload is mutually exclusive with paged-pool
@@ -290,14 +291,16 @@ shipped truth remains:
    dependency on either path's tier metadata.
 10. **Demote state machine on every pool page.** A page's lifecycle is
     `Free → Resident → Demoting → Free` (or `Demoting → Resident` if a
-    cancel-on-hit overrides the demote). The Coordinator owns the
-    `Demoting` transition, and the page is only released back to the
-    pool's free list once the `cudaMemcpyAsync` to T1 has completed
-    *and* refcount has dropped to 0 *and* no concurrent `lookup` has
-    upgraded it back to `Resident`. Pages in `Demoting` state must not
-    be reissued by `alloc_block`; they remain physically reachable for
-    in-flight reads. Codex flagged the read-after-evict race here as
-    M3's primary correctness risk; see §6 M3b.
+    cancel-on-hit overrides the demote). The CUDA scheduler / paged-KV
+    boundary owns the local T0<->T1 `Demoting` transition because it owns
+    page allocation, stream fences, and radix retag timing; the
+    coordinator owns queued T1<->T2/T3 transitions only. A page is only
+    released back to the pool's free list once the device-to-host copy to
+    T1 has completed *and* refcount has dropped to 0 *and* no concurrent
+    `lookup` has upgraded it back to `Resident`. Pages in `Demoting`
+    state must not be reissued by `alloc_block`; they remain physically
+    reachable for in-flight reads. Codex flagged the read-after-evict
+    race here as M3's primary correctness risk; see §6 M3b.
 
 ### 4.3 Dual residency (the vLLM / SGLang / TRT-LLM pattern)
 
@@ -634,7 +637,8 @@ impl RadixCache {
     }
 
     pub fn promote(&self, block_id: BlockId, to: TierLocation) {
-        // Called by coordinator when a block moves between tiers.
+        // Called by the scheduler for local T0<->T1 transitions and by
+        // the coordinator for queued T1<->T2/T3 completions.
     }
 }
 ```
@@ -695,10 +699,14 @@ pub struct OpaqueRemoteDesc(pub smallvec::SmallVec<[u8; 32]>);
 
 **Implementations, in order of planned delivery:**
 
-- **`LocalCudaTransport`** (M3). `cudaMemcpyAsync` on a dedicated copy
-  stream. Covers T0↔T1. Registration is a no-op beyond storing the base ptr.
-  First version uses vanilla DMA; the SGLang GPU-assisted I/O kernel (3×
-  speedup for small blocks) is a follow-up optimization, not a blocker.
+- **`LocalCudaTransport`** (M3 historical shape). It remains a structural
+  stub and is not the current implementation surface for T0<->T1. The
+  2026-05-25 swap-substrate contract supersedes this part: local CUDA
+  T0<->T1 movement is implemented at the scheduler + `PagedKVPool`
+  boundary with direct host-region copies, while `KVTransport` stays the
+  queued T1<->T2/T3 transport surface. A later `LocalCudaTransport`
+  wrapper can be reconsidered only after the direct path is accepted and
+  measured.
 - **`DiskStore`** (M4). Already implemented at `kv_tier/transport/disk.rs`
   with a local round-trip test that preserves block bytes and fingerprint.
   It still needs to (a) switch from raw-bytes dump to postcard header +
@@ -1061,11 +1069,12 @@ for the stacked M2b + M0.3 + M3a local batches.
   `cudaMemcpyAsync` path validated on GPU yet, and no runtime consumers
   of the new node metadata. Remote CUDA smoke remains the acceptance gate.
 - **M3b · Coordinator OS thread + policy convergence + recompute
-  fallback.** Coordinator owns: (1) the `crossbeam_channel::bounded`
-  intent queue, (2) the dedicated `CudaStream`, (3) the `Free →
-  Resident → Demoting → Free` page-lifecycle state machine on every
-  pool page (§4.2 invariant 10 — this is the M3 correctness centre,
-  not the cudaMemcpyAsync itself). `evict_prefix_cache_if_pressured`
+  fallback.** Coordinator owns the `crossbeam_channel::bounded` intent
+  queue for queued T1<->T2/T3 work. Local T0<->T1 demotion/promotion now
+  belongs to the CUDA scheduler + `PagedKVPool` boundary, including the
+  `Free → Resident → Demoting → Free` page-lifecycle state machine on
+  every pool page (§4.2 invariant 10 — this is the M3 correctness
+  centre, not the cudaMemcpyAsync itself). `evict_prefix_cache_if_pressured`
   rewires from its hand-rolled watermark loop to the policy trait
   via a new `RadixCache::evict_with_policy` (§5.4.1). The
   `lookup_or_stage` interface (§4.5) lands here. The
@@ -1296,14 +1305,15 @@ here so that M0.2's test suite references them by number.
     it, lookups intentionally do not retain (the hit is reported but
     not pinned). This is the "fail open" path. See §6 M2b.
 17. **Demote / read-after-evict race.** Block X is being copied T0→T1.
-    Mid-copy, a new request `lookup`s X. If the coordinator releases X
-    from T0 the moment `cudaMemcpyAsync` is *posted*, the new request
-    reads garbage. Correct fix: three-state page lifecycle
-    `Free | Resident | Demoting` on every pool page; release only when
-    the copy completes *and* refcount hits 0 *and* no `lookup` has
-    upgraded the page back to `Resident`. M3b owns this state machine
-    — it is the M3 correctness centre, not the cudaMemcpyAsync itself.
-    See §4.2 invariant 10.
+    Mid-copy, a new request `lookup`s X. If the local demotion path
+    releases X from T0 the moment the device-to-host copy is *posted*,
+    the new request reads garbage. Correct fix: three-state page
+    lifecycle `Free | Resident | Demoting` on every pool page; release
+    only when the copy completes *and* refcount hits 0 *and* no `lookup`
+    has upgraded the page back to `Resident`. The scheduler +
+    `PagedKVPool` T0<->T1 boundary owns this state machine — it is the
+    M3 correctness centre, not the copy primitive itself. See §4.2
+    invariant 10.
 
 ### 2026-04-15 bugs flagged by the internal survey — **all three already fixed**
 
@@ -1422,10 +1432,11 @@ Contested design questions (where the 7 systems genuinely disagree):
    experiment. §5.4.**
 6. **Transport abstraction** — NIXL or Mooncake Transfer Engine or none
    (vLLM native `cudaMemcpyAsync`, TRT-LLM native `cudaMemcpyAsync`,
-   SGLang custom kernels). **Our choice: trait + `LocalCudaTransport` +
-   `DiskStore` + `NixlTransport`. M3 ships the CUDA impl with vanilla
-   `cudaMemcpyAsync`; SGLang's 3×-faster custom I/O kernel is a post-M3
-   optimization. §5.3.**
+   SGLang custom kernels). **Our current choice: direct scheduler +
+   `PagedKVPool` copies for local T0<->T1, plus `DiskStore` /
+   `NixlTransport` behind the queued `KVTransport` surface for
+   T1<->T2/T3. The older `LocalCudaTransport` M3 plan is superseded until
+   the direct path is accepted and measured. §5.3.**
 7. **Scope** — vLLM / TRT-LLM / DeepSpeed single-node; Mooncake / KVBM
    cluster. **Our choice: single-node through M4; cluster is M5+.**
 8. **Non-prefix reuse** — only LMCache does it (CacheBlend). **Our choice:
@@ -1467,11 +1478,11 @@ post-M4 candidate if its trigger condition materialises.
   and read paths. Revisit when the M4 disk tier is full and users want
   persistence over more sessions than the disk pool holds.
 - **SGLang GPU-assisted I/O kernels (3× faster than `cudaMemcpyAsync` for
-  small blocks)** — considered for M3 (§6 M3). Deferred: the first version
-  of `LocalCudaTransport` uses vanilla `cudaMemcpyAsync`. Only revisit
-  if M3 bench shows DMA launch overhead dominates tier-transfer
-  throughput at `page_size=16`, in which case ~100 lines of custom CUDA
-  can close the gap.
+  small blocks)** — considered for M3 (§6 M3). Deferred: the first
+  accepted local T0<->T1 path should use direct scheduler + `PagedKVPool`
+  host-region copies. Only revisit if M3 bench shows DMA launch overhead
+  dominates tier-transfer throughput at `page_size=16`, in which case
+  ~100 lines of custom CUDA can close the gap.
 - **TRT-LLM priority-bucket LRU (0–100 bucket eviction, +20% hit rate
   over pure LRU)** — considered as M3's eviction policy default (§5.4).
   Deferred: M3 ships with `SessionBiasedLru` (the KVFlow-matched default).
@@ -1713,16 +1724,19 @@ revision supersedes all three of those as documented above.
    `docs/experience/wins/2026-04-15-tiered-kv-m2b-{local,remote}.md`;
    BF16 `page_size=16` + M3a structural smoke at
    `docs/experience/wins/2026-04-15-tiered-kv-m0.3-m3a-{local,remote}.md`.
-2. **M3b · coordinator + page lifecycle + policy convergence + recompute
-   fallback**. The M3 correctness centre. Three-state page lifecycle
-   (`Free | Resident | Demoting`), policy-trait wire (`evict_with_policy`),
+2. **M3b · local page lifecycle + coordinator queues + policy convergence
+   + recompute fallback**. The M3 correctness centre. Three-state page
+   lifecycle (`Free | Resident | Demoting`) belongs to the scheduler +
+   `PagedKVPool` T0<->T1 boundary; coordinator queues cover T1<->T2/T3.
+   Also includes policy-trait wire (`evict_with_policy`),
    `lookup_or_stage` interface (§4.5), recompute-vs-fetch fallback
    heuristic (§4.5.1). Default policy `SessionBiasedLru`. Watermarks now
    come from `SchedulerConfig` defaults (`prefix_cache_high_water = 0.75`,
    `prefix_cache_low_water = 0.50`, `prefix_cache_retain_hard_cap = 0.90`).
-5. **M3c · T1→T0 promotion wiring + delete legacy `model/kv_cache.rs`
-   CPU offload**. The deletion half is landed locally; the remaining work is
-   runtime wiring + remote CUDA acceptance of that cleanup.
+5. **M3c · scheduler-owned T1→T0 promotion wiring + delete legacy
+   `model/kv_cache.rs` CPU offload**. The deletion half is landed locally;
+   the remaining work is runtime wiring + remote CUDA acceptance of that
+   cleanup.
 6. **M4a / M4b** — disk tier + session save/load with
    fingerprint-reconciliation reload. Waits on M3 for the coordinator
    shape.
