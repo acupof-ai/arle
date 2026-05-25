@@ -20,7 +20,9 @@ argument order back to ARLE's C ABI by parsing the generated device signature.
 
 import argparse
 import importlib.util
+import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -431,13 +433,19 @@ def load_gdr_kernel(kernel_path: str, kernel_key: str):
     return module.get_kernel(kernel_key)
 
 
-def parse_target(target: str) -> str:
+def parse_target(target: str):
     if not target.startswith("cuda"):
         raise ValueError(f"unsupported TileLang AOT target: {target}")
+    for token in shlex.split(target):
+        if token == "cuda":
+            continue
+        if token.startswith("-arch="):
+            continue
+        raise ValueError(f"unsupported TileLang AOT target option {token!r} in {target!r}")
     return target
 
 
-def compile_kernel(prim_func, target: str):
+def compile_kernel(prim_func, target):
     try:
         import tilelang
     except ImportError as exc:
@@ -718,6 +726,8 @@ def main() -> int:
     parser.add_argument("--cuda-include", required=True,
                         help="CUDA toolkit include dir (e.g. /usr/local/cuda/include).")
     args = parser.parse_args()
+
+    os.environ["ARLE_TILELANG_CUDA_ARCH"] = str(args.cuda_arch)
 
     target = parse_target(args.target)
     if args.kernel_family == "attention":

@@ -15,13 +15,52 @@
  */
 
 
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#ifdef ARLE_DISABLE_MARLIN_SM70
+
+extern "C" int marlin_gemm_cuda(
+    const void* A,
+    const void* B,
+    void* C,
+    void* s,
+    int prob_m,
+    int prob_n,
+    int prob_k,
+    void* workspace,
+    int groupsize,
+    int dev,
+    cudaStream_t stream,
+    int thread_k,
+    int thread_n,
+    int sms,
+    int max_par) {
+  (void)A;
+  (void)B;
+  (void)C;
+  (void)s;
+  (void)prob_m;
+  (void)prob_n;
+  (void)prob_k;
+  (void)workspace;
+  (void)groupsize;
+  (void)dev;
+  (void)stream;
+  (void)thread_k;
+  (void)thread_n;
+  (void)sms;
+  (void)max_par;
+  return cudaErrorNotSupported;
+}
+
+#else
+
 #ifndef MARLIN_CUDA_KERNEL_CUH
 #define MARLIN_CUDA_KERNEL_CUH
 
 
-#include <cuda.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 #include <iostream>
 
 #include "marlin_dequant.cuh"
@@ -826,3 +865,5 @@ extern "C" int marlin_gemm_cuda(
     return marlin_cuda(A, B, C, s, prob_m, prob_n, prob_k, workspace,
                        groupsize, dev, stream, thread_k, thread_n, sms, max_par);
 }
+
+#endif  // ARLE_DISABLE_MARLIN_SM70

@@ -52,6 +52,7 @@ H100 spike per docs/plans/tilelang-integration.md §6 will retune):
 """
 
 import math
+import os
 
 import tilelang
 import tilelang.language as T
@@ -62,6 +63,7 @@ BLOCK_M = 64
 BLOCK_N = 32
 NUM_STAGES = 2
 NUM_THREADS = 128
+SM70_FORCE_TWO_KV_TILES = os.environ.get("ARLE_TILELANG_CUDA_ARCH") == "70"
 
 # (num_q_heads, num_kv_heads) configurations the Phase 0 build emits.
 # Mirrors the Qwen3.5 HD256 family at the time of writing. Extend here +
@@ -146,27 +148,66 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                     T.cast(0, dtype),
                 )
 
-            for kn in T.Pipelined(T.ceildiv(kv_total_len, BLOCK_N), num_stages=NUM_STAGES):
+            kv_loop_tiles = T.ceildiv(kv_total_len, BLOCK_N)
+            if SM70_FORCE_TWO_KV_TILES:
+                # Volta lowering from the patched TileLang BF16->FP16 fallback
+                # fails for HD256 prefill when the causal window fits in one
+                # KV tile. A second masked tile keeps the loop shape on the
+                # working lowering path without changing visible attention.
+                kv_loop_tiles = kv_loop_tiles + T.if_then_else(kv_loop_tiles == 1, 1, 0)
+
+            for kn in T.Pipelined(kv_loop_tiles, num_stages=NUM_STAGES):
                 col0 = kn * BLOCK_N
-                for j, d in T.Parallel(BLOCK_N, HEAD_DIM):
-                    abs_col = col0 + j
-                    page_local = abs_col // PAGE_SIZE
-                    in_page = abs_col % PAGE_SIZE
-                    page_idx = T.if_then_else(
-                        abs_col < kv_total_len,
-                        KV_indices[kv_page_start + page_local],
-                        0,
-                    )
-                    k_tile[j, d] = T.if_then_else(
-                        abs_col < kv_total_len,
-                        K_pool[page_idx, kv_head, in_page, d],
-                        T.cast(0, dtype),
-                    )
-                    v_tile[j, d] = T.if_then_else(
-                        abs_col < kv_total_len,
-                        V_pool[page_idx, kv_head, in_page, d],
-                        T.cast(0, dtype),
-                    )
+                if SM70_FORCE_TWO_KV_TILES:
+                    page_idx_j = T.alloc_fragment((BLOCK_N,), index_dtype)
+                    in_page_j = T.alloc_fragment((BLOCK_N,), index_dtype)
+                    valid_j = T.alloc_fragment((BLOCK_N,), index_dtype)
+
+                    for j in T.Parallel(BLOCK_N):
+                        abs_col = col0 + j
+                        page_local = abs_col // PAGE_SIZE
+                        in_page_j[j] = abs_col % PAGE_SIZE
+                        valid_col = ((abs_col - PAGE_SIZE) < kv_total_len) and (
+                            page_local < num_kv_pages
+                        )
+                        valid_j[j] = T.if_then_else(valid_col, 1, 0)
+                        page_idx_j[j] = T.if_then_else(
+                            valid_col,
+                            KV_indices[kv_page_start + page_local],
+                            0,
+                        )
+                    for j, d in T.Parallel(BLOCK_N, HEAD_DIM):
+                        is_valid = valid_j[j] != 0
+                        k_tile[j, d] = T.if_then_else(
+                            is_valid,
+                            K_pool[page_idx_j[j], kv_head, in_page_j[j], d],
+                            T.cast(0, dtype),
+                        )
+                        v_tile[j, d] = T.if_then_else(
+                            is_valid,
+                            V_pool[page_idx_j[j], kv_head, in_page_j[j], d],
+                            T.cast(0, dtype),
+                        )
+                else:
+                    for j, d in T.Parallel(BLOCK_N, HEAD_DIM):
+                        abs_col = col0 + j
+                        page_local = abs_col // PAGE_SIZE
+                        in_page = abs_col % PAGE_SIZE
+                        page_idx = T.if_then_else(
+                            abs_col < kv_total_len,
+                            KV_indices[kv_page_start + page_local],
+                            0,
+                        )
+                        k_tile[j, d] = T.if_then_else(
+                            abs_col < kv_total_len,
+                            K_pool[page_idx, kv_head, in_page, d],
+                            T.cast(0, dtype),
+                        )
+                        v_tile[j, d] = T.if_then_else(
+                            abs_col < kv_total_len,
+                            V_pool[page_idx, kv_head, in_page, d],
+                            T.cast(0, dtype),
+                        )
 
                 T.clear(scores)
                 T.gemm(q_tile, k_tile, scores, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
@@ -176,8 +217,17 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
                     row = row0 + i
                     col = col0 + j
-                    in_bounds = (row < qlen) and (col < kv_total_len)
-                    causal = col <= kv_offset + row
+                    if SM70_FORCE_TWO_KV_TILES:
+                        # TileLang's Volta vectorized lowering shifts the
+                        # column predicate by one 16-token page. Express the
+                        # source predicate in the opposite direction so the
+                        # generated guard remains the intended `col < len` /
+                        # causal diagonal test for short contexts.
+                        in_bounds = (row < qlen) and (valid_j[j] != 0)
+                        causal = (col - PAGE_SIZE) <= kv_offset + row
+                    else:
+                        in_bounds = (row < qlen) and (col < kv_total_len)
+                        causal = col <= kv_offset + row
                     scores[i, j] = T.if_then_else(
                         in_bounds and causal,
                         scores[i, j] * sm_scale,

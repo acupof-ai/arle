@@ -5,6 +5,34 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+#ifdef ARLE_DISABLE_MARLIN_SM70
+
+extern "C" {
+
+cudaError_t gptq_marlin_repack_cuda(
+    const uint32_t* b_q_weight,
+    uint32_t* out,
+    int size_k,
+    int size_n,
+    cudaStream_t stream) {
+    (void)b_q_weight;
+    (void)out;
+    (void)size_k;
+    (void)size_n;
+    (void)stream;
+    return cudaErrorNotSupported;
+}
+
+size_t marlin_workspace_size(int prob_n, int sms) {
+    (void)prob_n;
+    (void)sms;
+    return 0;
+}
+
+}  // extern "C"
+
+#else
+
 // Marlin layout constants
 namespace marlin {
 constexpr int tile_size = 16;
@@ -149,3 +177,5 @@ size_t marlin_workspace_size(int prob_n, int sms) {
 }
 
 }  // extern "C"
+
+#endif  // ARLE_DISABLE_MARLIN_SM70
