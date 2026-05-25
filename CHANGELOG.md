@@ -76,40 +76,40 @@ Related governance docs:
   32-token decode window. Evidence and industry comparison are recorded in
   [`docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md).
 - Added committed DSv4 trace artifacts under
-  [`docs/trace-artifacts/2026-05-14-dsv4-decode/`](docs/trace-artifacts/2026-05-14-dsv4-decode/),
+  `docs/trace-artifacts/2026-05-14-dsv4-decode/`,
   including the compressed raw nsys report/database, `nsys stats`, client JSON,
   server log, and SHA256 manifest. The trace record no longer depends on remote
   `/tmp` files.
 - Added DSv4 DeepEP MoE trace artifacts under
-  [`docs/trace-artifacts/2026-05-14-dsv4-deepep/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/),
+  `docs/trace-artifacts/2026-05-14-dsv4-deepep/`,
   including compressed BF16 and FP8 combine trace logs, parsed summaries, remote
   build evidence, default trace-off post-checks, and the current bottleneck
   callout for return-side combine exchange plus local expert GEMMs.
 - Added a current 8xH20 DSv4 single-token Nsight trace under
-  [`docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-one-token-current/`](docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-one-token-current/).
+  `docs/trace-artifacts/2026-05-14-dsv4-deepep/nsys-one-token-current/`.
   The `max_tokens=2` streaming request returned `霓灯` and produced exactly one
   `step_decode_kernel_launch` wave across 8 ranks. The isolated token takes
   266.020 ms wall; decode-only nsys shows `cuStreamSynchronize`,
   async allocation/free, launch/memset churn, and NCCL send/recv ahead of the
   actual attention and GEMV kernels.
 - Added a refreshed 2026-05-15 DSv4 single-token Nsight trace under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-one-token-current/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-one-token-current/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-one-token-current/`.
   With send/recv route and route-logits scratch reuse in place, the same
   one-token decode shape is now 158.439 ms wall. The remaining ranked costs are
   async allocation/free, launch/memset churn, D2H route readbacks, NCCL
   SendRecv/AllReduce, and local expert FP8/FP4 GEMV.
 - Added 2026-05-15 DSv4 padded-dispatch Nsight records under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/`.
   The negative first trace (`nsys-single-token-padded-dispatch`) shows that
   padding without removing the dead send-count kernel regresses to 136.908 ms;
   the fixed trace (`nsys-single-token-padded-dispatch-skip-count`) validates the
   shipped B=1 decode path at 123.955 ms and records the remaining ranked costs.
 - Added the DSv4 padded peer-combine Nsight trace under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-token-padded-peer-combine/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-token-padded-peer-combine/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-token-padded-peer-combine/`.
   The real 8xH20 run keeps the `霓彩` output and shows the single-token decode
   wave at 112.133 ms after pre-summing padded return rows per origin peer.
 - Added the DSv4 fused dispatch payload Nsight trace and matching HTTP smoke
-  under [`docs/trace-artifacts/2026-05-15-dsv4-deepep/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/).
+  under `docs/trace-artifacts/2026-05-15-dsv4-deepep/`.
   The real 8xH20 run keeps the `霓彩` output, cuts decode-window SendRecv
   launches from 1,032 to 688 by exchanging hidden rows and route metadata in
   one BF16 payload, and records a fresh isolated single-token decode wave at
@@ -118,21 +118,21 @@ Related governance docs:
   makes clear that NCCL exchange/reduction, launch overhead, allocator churn,
   D2H, and local expert GEMV still dominate.
 - Added the DSv4 route-grouped pair GEMV Nsight trace under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-pair-gemv/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-pair-gemv/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-route-pair-gemv/`.
   The opt-in `ARLE_DSV4_ROUTE_GROUPED_EXPERTS=1` run keeps the `霓彩` output
   and measures a 117.894 ms single-token decode wave. The decode-window top
   costs are now explicit: `ncclDevKernel_SendRecv` at 50.338 ms per rank
   range, FP4 route pair GEMV at 19.616 ms, FP4 route `w2` GEMV at 10.487 ms,
   FP8 GEMV at 9.408 ms, plus allocator/free and launch overhead.
 - Added a fresh user-requested single-token `nsys` rerun under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-current-user/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-current-user/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-current-user/`.
   The real 8xH20 `/root/DeepSeek-V4-Flash` run returns exact arithmetic `406`
   and measures a 94.841 ms decode wave. The slow stack is reduce-scatter
   combine, local FP8/FP4 expert GEMV, residual all-reduce/send-recv,
   attention/MHC/route kernels, and high per-token launch/alloc/free/D2H
   runtime overhead, not sampler time.
 - Added the matching DSv4 single-token `NCCL_PROTO=LL128` negative trace under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-nccl-ll128/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-nccl-ll128/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-nccl-ll128/`.
   The arithmetic request still returns `406`, but the isolated decode wave is
   94.936 ms versus 94.841 ms on the current default reference, and
   reduce-scatter combine is slightly worse at 21.371 ms per rank-range.
@@ -148,9 +148,9 @@ Related governance docs:
   so the overlap experiment remains disabled by default.
 - Added a fused DSv4 B=1 padded DeepEP local expert prepare kernel and matching
   trace records under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-small-local-pack-prepare/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-small-local-pack-prepare/)
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-small-local-pack-prepare/`
   and
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-small-local-pack-prepare-smoke/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-small-local-pack-prepare-smoke/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-small-local-pack-prepare-smoke/`.
   The real 8xH20 run returns exact arithmetic `406`, cuts H2D runtime calls
   from 1,040 to 696, cuts `cuMemsetD8Async` calls from 1,232 to 544, and keeps
   trace-off `decode64` at 12.05 post-first tok/s. The single captured nsys wave
@@ -164,7 +164,7 @@ Related governance docs:
   the decode range. The matching HTTP smoke keeps normal Chinese/English
   streaming output and exact math, with `decode64` at 11.89 post-first tok/s.
 - Added a direct current-path single decode-token Nsight breakdown under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-current-breakdown/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-current-breakdown/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-current-breakdown/`.
   The real 8xH20 `/root/DeepSeek-V4-Flash` run returns exact arithmetic `406`
   and measures a 105.205 ms isolated second-token decode wave. The top stack is
   now explicit: 16,177 CUDA launches, reduce-scatter combine, local FP8/FP4
@@ -176,24 +176,24 @@ Related governance docs:
   allocation to uninitialized allocation: expert/shared/grouped hidden scratch,
   route logits, per-layer hidden scratch, and MHC parameter scratch. The real
   8xH20 single-token `nsys` trace under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-expanded-uninit/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-expanded-uninit/)
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-expanded-uninit/`
   returns exact arithmetic `406`, moves the isolated decode wave from
   105.205 ms to 88.554 ms, and cuts `cuMemsetD8Async` from 3,640 calls /
   6.932 ms per rank range to 1,920 calls / 2.839 ms. The trace still points at
   reduce-scatter combine and local FP8/FP4 expert GEMV as the main bottlenecks.
   The matching HTTP smoke under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-expanded-uninit-smoke/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-expanded-uninit-smoke/)
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-expanded-uninit-smoke/`
   keeps normal Chinese/English multi-token output, exact math `410`, and
   `decode64` at 11.94 post-first tok/s.
 - Extended the DSv4 uninitialized scratch cleanup to MoE dispatch, payload,
   recv/local-route, active grouped, and combine buffers. The real 8xH20
   single-token `nsys` artifact under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-moe-scratch-uninit-rerun/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-moe-scratch-uninit-rerun/)
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-moe-scratch-uninit-rerun/`
   returns exact arithmetic `406`, moves the isolated decode wave from
   88.554 ms to 87.667 ms after a rerun, and cuts `cuMemsetD8Async` from
   1,920 calls / 2.839 ms per rank range to 1,232 calls / 1.558 ms. The
   matching HTTP smoke under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-moe-scratch-uninit-smoke/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-moe-scratch-uninit-smoke/)
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-moe-scratch-uninit-smoke/`
   keeps normal Chinese/English multi-token output, exact math `410`, and
   `decode64` at 12.06 post-first tok/s.
 - Moved DSv4 grouped expert weight/scale pointer tables into
@@ -207,7 +207,7 @@ Related governance docs:
   dominate; the default DeepEP smoke still returns math `410`, normal Chinese
   writing, and normal English decode text.
 - Added the DSv4 default-path warm decode Nsight trace under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-default-warm-decode/`.
   The run warms a real decode first, then profiles a second single decode token
   on 8xH20. The output remains `霓彩`, the decode wave is 128.130 ms, and the
   trace confirms allocator/free overhead is steady-state rather than only
@@ -216,7 +216,7 @@ Related governance docs:
   NCCL SendRecv/AllReduce, local FP8/FP4 expert GEMV, launch/runtime overhead,
   allocator/free churn, and route-count D2H synchronization.
 - Added the DSv4 expert-wise grouped GEMV negative Nsight trace under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-expert-grouped/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-expert-grouped/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-expert-grouped/`.
   With `ARLE_DSV4_GROUPED_EXPERTS=1`, the real 8xH20 run keeps the `霓彩`
   output but regresses the warmed single-token decode wave to 145.693 ms.
   The trace shows `ncclDevKernel_SendRecv` at 58.049 ms per rank range, FP4
@@ -225,16 +225,16 @@ Related governance docs:
   GEMV path remains default-off and that the target remains true grouped
   GEMM/DeepGEMM with DeepEP overlap.
 - Added the DSv4 route-grouped pair trace-off HTTP comparison under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-route-grouped-pair-vs-default/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-route-grouped-pair-vs-default/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-route-grouped-pair-vs-default/`.
   Default fused-dispatch decode keeps `decode64` at 11.47 completion tok/s and
   arithmetic at `410`; `ARLE_DSV4_ROUTE_GROUPED_EXPERTS=1` returns normal text
   and the same arithmetic answer but regresses `decode64` to 6.54 completion
   tok/s. Route-wise grouped GEMV remains default-off.
 - Added DSv4 incremental stream scratch recycling and captured both the HTTP
   smoke and Nsight follow-up under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-stream-recycle/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-stream-recycle/)
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-stream-recycle/`
   and
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-stream-recycle/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-stream-recycle/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-stream-recycle/`.
   The real 8xH20 run keeps normal text and arithmetic `410`; the isolated
   warmed decode wave improves from 128.130 ms to 111.798 ms, with
   `cuMemAllocAsync` dropping from 8,453 calls / 16.802 ms to 7,757 calls /
@@ -243,18 +243,18 @@ Related governance docs:
   main target remains NCCL plus local expert GEMV.
 - Added DSv4 GPU compressor projection scratch reuse for `kv_raw` and
   `score_raw`, with trace artifacts under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-compressor-projection-scratch/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-compressor-projection-scratch/)
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-compressor-projection-scratch/`
   and
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-compressor-projection-scratch/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-compressor-projection-scratch/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-compressor-projection-scratch/`.
   The real-output checks still pass (`decode64` normal text, arithmetic `410`)
   and alloc/free calls fall again (`cuMemAllocAsync` 7,757 -> 6,765,
   `cuMemFreeAsync` 5,352 -> 4,360), but HTTP `decode64` remains flat at
   11.47 tok/s and the single nsys wave is not a wall-time win because D2H/NCCL
   timing dominates this capture.
 - Added DSv4 incremental attention scratch Nsight and HTTP artifacts under
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-attention-scratch/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-attention-scratch/)
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/bench-attention-scratch/`
   and
-  [`docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-attention-scratch/`](docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-attention-scratch/).
+  `docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-attention-scratch/`.
   The real 8xH20 run returns normal multi-token output and arithmetic `410`;
   the isolated single-token decode wave is 97.042 ms after B=1 attention
   scratch cuts decode-window free calls from 4,360 to 3,048 without retaining
@@ -515,9 +515,9 @@ Related governance docs:
   opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s
   step-driver, so current status surfaces no longer present the historical
   211.7 tok/s GGUF-only profile as the Metal SOTA headline. Evidence:
-  [`docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md`](docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md).
+  `docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-mlx4bit-qknorm-default.md`.
   Native-q4 GGUF evidence:
-  [`docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-gguf-native-q4.md`](docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-gguf-native-q4.md).
+  `docs/experience/wins/2026-04-28-bench-metal-qwen35-0p8b-gguf-native-q4.md`.
 
 ## [0.1.4] — 2026-04-28
 
@@ -661,7 +661,7 @@ and on GHCR (`ghcr.io/cklxx/arle:0.1.2`, `:0.1`, `:latest`).
   diagnostic. This is not DFlash acceptance evidence; future DFlash
   optimization claims for Qwen3.6 should use long-context /
   ultra-long-sequence workloads only. Evidence:
-  [`docs/experience/wins/2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md`](docs/experience/wins/2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md).
+  `docs/experience/wins/2026-04-27-bench-metal-qwen36-a3b-dflash-quick-check.md`.
 
 ### HTTP
 
