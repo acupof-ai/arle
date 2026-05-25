@@ -447,7 +447,7 @@ impl<M: ModelForward> Scheduler<M> {
         Some(ReadmissionPlan::new(lookup.matched_len, blocks))
     }
 
-    fn host_pool_usage_fraction(&self) -> f64 {
+    pub(super) fn host_pool_usage_fraction(&self) -> f64 {
         let Ok(pool) = self.host_pinned_pool.lock() else {
             return 1.0;
         };
@@ -680,6 +680,10 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let _ = self.spill_host_blocks_if_pressured(BlockSelectionIntent::Drain);
         self.has_pending_store_work()
+    }
+
+    pub(super) fn t2_disk_tier_enabled(&self) -> bool {
+        self.config.t2_disk_tier_enabled
     }
 
     pub(super) fn attach_gpu_prefix_blocks(
@@ -1407,6 +1411,7 @@ impl<M: ModelForward> Scheduler<M> {
             return Ok(0);
         };
         let block_bytes = metadata.byte_len as usize;
+        let demote_started_at = std::time::Instant::now();
         if !self.ensure_host_demote_headroom(block_bytes) {
             return Err(anyhow::anyhow!(
                 "host pinned tier has no leaf eviction headroom for block {:?} ({} bytes)",
@@ -1468,7 +1473,12 @@ impl<M: ModelForward> Scheduler<M> {
             },
         );
 
-        Ok(self.paged_kv_pool.release_pages(&pages).len())
+        let released_pages = self.paged_kv_pool.release_pages(&pages).len();
+        self.metrics.record_tier_demote_to_host(
+            demote_started_at.elapsed().as_micros() as u64,
+            block_bytes,
+        );
+        Ok(released_pages)
     }
 
     fn delete_disk_block_if_present(&self, metadata: &BlockMetadata) {
@@ -1513,6 +1523,9 @@ impl<M: ModelForward> Scheduler<M> {
         if bytes_to_spill == 0 {
             return 0;
         }
+        if !self.t2_disk_tier_enabled() && self.cluster_shared_backend.is_none() {
+            return 0;
+        }
 
         let coordinator_stats = self.coordinator_queue_stats();
         let mut store_submit_headroom =
@@ -1555,6 +1568,11 @@ impl<M: ModelForward> Scheduler<M> {
                 self.coordinator_handle.stats(),
                 self.cluster_shared_backend.is_some(),
             );
+            if matches!(target, crate::kv_tier::coordinator::StoreTarget::Disk)
+                && !self.t2_disk_tier_enabled()
+            {
+                continue;
+            }
             let store_key = StoreDedupKey {
                 fingerprint,
                 target,

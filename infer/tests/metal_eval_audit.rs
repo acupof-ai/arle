@@ -86,15 +86,16 @@ fn metal_materialize_boundaries_stay_classified() {
     let expected = BTreeMap::from([
         ("crates/mlx-sys/src/lib.rs", 2usize),
         ("crates/mlx-sys/src/mlx_bridge.cpp", 5),
-        ("crates/mlx-sys/src/mlx_qwen35_model.cpp", 10),
+        ("crates/mlx-sys/src/mlx_qwen35_model.cpp", 11),
         ("infer/src/backend/metal/dflash.rs", 6),
         ("infer/src/backend/metal/gdr.rs", 10),
         ("infer/src/backend/metal/generate.rs", 2),
+        ("infer/src/backend/metal/kv_pool.rs", 1),
         ("infer/src/backend/metal/loader.rs", 2),
-        ("infer/src/backend/metal/mlx.rs", 18),
-        ("infer/src/backend/metal/ops.rs", 2),
+        ("infer/src/backend/metal/mlx.rs", 15),
+        ("infer/src/backend/metal/ops.rs", 6),
         ("infer/src/backend/metal/qwen35.rs", 10),
-        ("infer/src/backend/metal/request_state.rs", 27),
+        ("infer/src/backend/metal/request_state.rs", 30),
         ("infer/src/backend/metal/weights.rs", 1),
     ]);
 

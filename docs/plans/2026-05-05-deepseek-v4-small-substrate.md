@@ -1,5 +1,19 @@
 # DeepSeek-V4 Small-VRAM Substrate Plan
 
+> ⚠️ **Status updated 2026-05-25**: the **pretrain-dsv4 sections (§0a, §0b,
+> §1, §2, §3, §4, §5)** are RETIRED.
+> `arle train pretrain-dsv4`, the `pretrain_dsv4` driver, and the cold-path
+> PyTorch pretrain story were dropped in the 2026-05-18 OPD-only pivot
+> ([`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md));
+> the 2026-05-25 T17 feasibility doc
+> ([`2026-05-25-dsv4-from-scratch-feasibility.md`](2026-05-25-dsv4-from-scratch-feasibility.md))
+> independently KILLed direct 1B scratch training on the 4070 Ti SUPER
+> path. **What remains active**: §6 (Runtime Adaptation — MLA / MoE / MTP
+> kernels, quantization, backend isolation) is still the relevant reference
+> for DSv4 INFERENCE work tracked under ROADMAP P0
+> ([`../../ROADMAP.md`](../../ROADMAP.md)). Treat §0a→§5 as historical
+> design context only.
+
 > ⚠️ **Architecture truth source: [`../projects/2026-05-07-arle-master-strategy.md`](../projects/2026-05-07-arle-master-strategy.md) §5.1**
 > 本 plan 关注 substrate + nano training driver。**架构维度全部以 master §5.1 为准**
 > (HF replica `kshitijthakkar/deepseek-v4-mini-1B-init` config)。本 plan 中任何

@@ -2,24 +2,42 @@
 title: M_rope-yarn-scaling Phase 3b — PPL eval plan(quality validation)
 date: 2026-05-10
 type: plan
-status: ready-for-execution
-prereq: Phase 3a smoke PASS (`4efd30b`) + ARLE `arle train eval` + long-ctx eval data
+status: blocked-on-eval-harness (2026-05-25 update)
+prereq: Phase 3a smoke PASS (`4efd30b`) + long-ctx eval data + new eval harness (see banner)
 ---
 
 # Phase 3b — PPL eval(quality validation)concrete plan
+
+> **2026-05-25 status — eval harness command was deleted**:
+> `arle train eval` was removed in the 2026-05-18 OPD-only pivot
+> ([`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md)).
+> Current `arle train` surface = `env / estimate-memory / opd` only.
+> The PPL evaluation methodology in this plan is still valid for ROPE-yarn
+> quality validation, but the implementation needs a new harness — either
+> a `scripts/` PPL eval (like `scripts/arle_capability_eval.py`) or
+> reintroducing PPL into `arle eval` (separate CLI command, not yet
+> licensed). Treat all `arle train eval ...` command examples below as
+> historical placeholder for the eval surface; pick a replacement before
+> executing this plan.
+
 
 > Phase 3a smoke confirmed end-to-end M_rope-yarn-scaling Phase 1+2 wire
 > works in production CUDA serving(Qwen3-4B + YARN factor=2.0)。Phase 3b
 > validates **quality**:does YARN factor=2.0 maintain reasonable PPL at
 > extended context vs vanilla 40k baseline?
 
-## 1. Infrastructure ALREADY EXISTS
+## 1. Historical PPL Infrastructure
 
-`arle train eval` is the canonical PPL evaluation surface:
+At the time this plan was written, `arle train eval` was the canonical PPL
+evaluation surface:
 - `crates/train/src/eval_lm.rs:34-36` `EvalSummary::ppl() = self.loss.exp()`
 - Supports `--backend {auto,cpu,metal,cuda}` — CUDA-side viable
 - Accepts tokenized JSONL or chat JSONL via `--data` flag
 - Returns per-token cross-entropy loss → exp = perplexity
+
+That CLI command is no longer present. Treat the bullets above as the old
+implementation contract to preserve in a replacement harness, not as a command
+that can be run today.
 
 Usage:
 ```bash
@@ -177,7 +195,7 @@ need check or modify。
 
 ## 10. 状态
 
-Phase 3b ready for execution。30-50 min wall-clock total。Substrate
-Phase 1+2 + 3a smoke proven;Phase 3b is quality validation only。Eval
-data must be offline-generated due to #34 HF Hub blocker(20-30 LOC
-Python script)。
+Phase 3b is **blocked on a replacement eval harness**. Substrate Phase 1+2 +
+3a smoke remain proven, and Phase 3b is still quality validation only, but the
+old `arle train eval` command examples above are historical. Eval data should
+still be offline-generated due to #34 HF Hub blocker.

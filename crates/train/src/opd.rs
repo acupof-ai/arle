@@ -25,7 +25,7 @@ use std::{collections::HashSet, time::Instant};
 
 use crate::{
     grad_clip::clip_grad_norm,
-    loss::{cross_entropy_loss, kl_distill_loss},
+    loss::{cross_entropy_loss, kl_distill_loss, kl_distill_loss_chunked},
     qwen35::{
         Qwen35Error, Qwen35KvCache, Qwen35Model, forward_rollout_cached,
         forward_rollout_cached_device_token,
@@ -86,6 +86,7 @@ pub struct GkdLossConfig<'a> {
     pub lambda: f32,
     pub sft_anchor: GkdSftAnchor,
     pub corpus_tokens: Option<&'a [u32]>,
+    pub kl_chunk_size: Option<usize>,
 }
 
 impl Default for GkdLossConfig<'_> {
@@ -94,6 +95,7 @@ impl Default for GkdLossConfig<'_> {
             lambda: 0.0,
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
+            kl_chunk_size: None,
         }
     }
 }
@@ -442,6 +444,14 @@ fn validate_gkd_lambda(gkd_lambda: f32) -> Result<()> {
 
 fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> {
     validate_gkd_lambda(config.lambda)?;
+    if config.kl_chunk_size == Some(0) {
+        return Err(OpdError::InvalidInput(
+            "OPD KL chunk size must be > 0 when set. Hint: pass \
+             --kl-chunk-size 64 for the 512-token real-corpus smoke, or omit \
+             it to keep the baseline full-logits KL path."
+                .to_owned(),
+        ));
+    }
     if config.lambda == 0.0 {
         return Ok(());
     }
@@ -457,6 +467,29 @@ fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn kl_distill_loss_for_config(
+    student_logits: TensorId,
+    teacher_logits: TensorId,
+    num_positions: usize,
+    kl_chunk_size: Option<usize>,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    match kl_chunk_size {
+        Some(chunk_size) => kl_distill_loss_chunked(
+            student_logits,
+            teacher_logits,
+            num_positions,
+            chunk_size,
+            store,
+            tape,
+        )
+        .map_err(OpdError::from),
+        None => kl_distill_loss(student_logits, teacher_logits, num_positions, store, tape)
+            .map_err(OpdError::from),
+    }
 }
 
 fn validate_rollout_shape(prompt_len: usize, rollout_len: usize, vocab: usize) -> Result<()> {
@@ -873,6 +906,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForwar
             lambda: gkd_lambda,
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
+            kl_chunk_size: None,
         },
         profile,
     )
@@ -1091,10 +1125,11 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         //    SFT anchor. The legacy anchor uses the on-policy rollout;
         //    corpus-truth mode re-forwards the student over prompt+target.
         let phase_started = Instant::now();
-        let kl_loss = kl_distill_loss(
+        let kl_loss = kl_distill_loss_for_config(
             student_logits,
             teacher_logits.tensor_id,
             rollout.len(),
+            gkd_config.kl_chunk_size,
             store,
             tape,
         )?;
@@ -1167,10 +1202,11 @@ mod tests {
 
     use super::{
         GkdLossConfig, GkdSftAnchor, OpdError, OpdStepConfig, greedy_next_token,
-        map_qwen35_forward_error, mix_gkd_losses, next_token_sft_loss_from_logits,
-        shifted_rollout_sft_loss, validate_gkd_lambda, validate_gkd_loss_config,
-        validate_loss_value, validate_rollout_shape, validate_step_config,
-        validate_student_param_ownership, validate_student_params, validate_teacher_params,
+        kl_distill_loss_for_config, map_qwen35_forward_error, mix_gkd_losses,
+        next_token_sft_loss_from_logits, shifted_rollout_sft_loss, validate_gkd_lambda,
+        validate_gkd_loss_config, validate_loss_value, validate_rollout_shape,
+        validate_step_config, validate_student_param_ownership, validate_student_params,
+        validate_teacher_params,
     };
     use crate::qwen35::Qwen35Error;
 
@@ -1393,6 +1429,7 @@ mod tests {
             lambda: 0.3,
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: None,
+            kl_chunk_size: None,
         })
         .expect_err("corpus anchor must require target tokens");
         let OpdError::InvalidInput(message) = missing else {
@@ -1405,6 +1442,7 @@ mod tests {
             lambda: 0.3,
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: Some(&[]),
+            kl_chunk_size: None,
         })
         .expect_err("empty corpus anchor tokens must be rejected");
         let OpdError::InvalidInput(message) = empty else {
@@ -1416,14 +1454,51 @@ mod tests {
             lambda: 0.0,
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: None,
+            kl_chunk_size: None,
         })
         .expect("lambda=0 should not require unused corpus targets");
         validate_gkd_loss_config(GkdLossConfig {
             lambda: 0.3,
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: Some(&[1, 2]),
+            kl_chunk_size: None,
         })
         .expect("non-empty corpus targets should be accepted");
+    }
+
+    #[test]
+    fn validate_gkd_loss_config_rejects_zero_kl_chunk_size() {
+        let err = validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: Some(0),
+        })
+        .expect_err("zero KL chunk size must be rejected");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("KL chunk size"));
+        assert!(message.contains("> 0"));
+        assert!(message.contains("--kl-chunk-size"));
+    }
+
+    #[test]
+    fn kl_distill_loss_for_config_accepts_chunked_path() {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let student = store.alloc(
+            Tensor::new(vec![0.1, 0.2, 0.3, 0.4], vec![1, 2, 2], true).expect("student logits"),
+        );
+        let teacher = store.alloc(
+            Tensor::new(vec![0.4, 0.3, 0.2, 0.1], vec![1, 2, 2], false).expect("teacher logits"),
+        );
+
+        let loss = kl_distill_loss_for_config(student, teacher, 2, Some(1), &mut store, &mut tape)
+            .expect("chunked KL config should run");
+        let value = store.to_host(loss).expect("loss host")[0];
+        assert!(value.is_finite(), "chunked KL loss must be finite");
     }
 
     #[test]

@@ -6,9 +6,11 @@
 > ([`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md)).
 > The substrate it produced (HF-style checkpoint dirs, `latest`
 > marker, eval codec → reborn as OPD-side eval, shared CLI arg
-> helpers) **survives** and will host the OPD command's DX when the
-> substrate lands. The cross-surface train → eval → infer story now
-> reduces to `arle train opd → eval → infer`.
+> helpers) **survives** and now hosts the OPD command's DX (substrate
+> landed 2026-05-24 via `crates/cli/src/train_cli.rs::run_opd_from_dirs`,
+> commit `14c3be9`). The cross-surface train → eval → infer story
+> now reduces to `arle train opd → eval → infer`, validated end-to-end
+> in the P5 5k cycle (see `docs/experience/wins/2026-05-24-arle-train-opd-from-dirs.md`).
 
 **Driver:** user directive 2026-04-20 — "现在训练出来的模型能够直接自动化评测和推理吗；这部分的 dx 也做好；做好 cli 的易用性，可理解"
 (Can trained models be directly auto-evaluated and served? Polish the
@@ -27,8 +29,8 @@ reality.
 | Question | Answer |
 |----------|--------|
 | Does the checkpoint format match what `infer` expects? | ✅ (exact) |
-| Can I serve a trained checkpoint without hand-assembling paths? | ✅ `latest` marker is landed; serve from any train output (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) via `infer --model-path <out>/latest` without guessing the step number. |
-| Is there a standalone eval binary? | ✅ `eval_lm` landed — it evaluates Qwen3/Qwen3.5 checkpoint dirs directly on tokenized or chat JSONL. |
+| Can I serve a trained checkpoint without hand-assembling paths? | Historical ✅ for retired full-checkpoint producers (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`). Current OPD LoRA adapters are served by launching the base model with `INFER_LORA_PATH=<adapter-dir>`. |
+| Is there a standalone eval binary? | Historical ✅ `eval_lm` landed for full checkpoint dirs. Current OPD capability eval uses `scripts/arle_capability_eval.py` against the OpenAI-v1 server. |
 | Do train binaries have `--help`? | ❌ NO — all hand-roll arg parsing. |
 | Are flag names consistent across binaries? | ❌ NO — `--seq` vs `--seq-len` and `--model` vs `--model-path` still diverge, though the generic pretrain entrypoint now accepts canonical `--resume-from` (with `--resume` kept only as a compatibility alias). |
 | Does `infer` fail early on a malformed `config.json`? | ❌ NO — `is_model_dir` only checks file existence; field schema validated late. |
@@ -57,7 +59,7 @@ this plan is DX-2 / DX-3 follow-through, not the `latest` marker flow.
    producers. Resume path lookup becomes a
    single glob pattern instead of per-binary branches.
 3. `scripts/train_and_chat.sh` walkthrough: 3-line data.jsonl →
-   train_sft 10 steps → REPL, with inline comments explaining each
+   historical `train_sft` 10 steps → REPL, with inline comments explaining each
    flag.
 
 **Out of scope:** broader flag rename (in DX-3).

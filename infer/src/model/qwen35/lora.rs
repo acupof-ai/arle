@@ -12,13 +12,13 @@ use std::{
     path::Path,
 };
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use half::bf16;
 use log::{debug, info, warn};
 use memmap2::Mmap;
 use safetensors::{
-    tensor::{Dtype, TensorView},
     SafeTensors,
+    tensor::{Dtype, TensorView},
 };
 
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix};

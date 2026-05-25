@@ -162,6 +162,11 @@ impl<M: ModelForward> Scheduler<M> {
             let (fetch_wait_s, store_wait_s) = self.current_tier_wait_seconds();
             self.metrics
                 .set_tier_wait_seconds(fetch_wait_s, store_wait_s);
+            self.metrics.record_host_pool_pressure_tick(
+                self.host_pool_usage_fraction(),
+                self.config.t1_host_pinned_low_water,
+                self.config.t1_host_pinned_high_water,
+            );
             if self.paged_kv_pool.is_active() {
                 // Both in token units so kv_util = (total-free)/total is correct.
                 let total =

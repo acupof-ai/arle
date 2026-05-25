@@ -58,7 +58,7 @@ cargo test --no-default-features --features no-cuda   # Unit tests (~9s)
 cargo test --release --features cuda --test e2e        # E2E (GPU required)
 cargo test -p train --release --features no-cuda --lib
 cargo test -p autograd --release --features no-cuda --lib
-cargo test -p agent-infer --release --no-default-features --features metal,no-cuda,cli --test cli_tiny_fixture_live
+cargo test -p agent-infer --release --no-default-features --features no-cuda,cli --test cli_smoke
 
 # Lint + format
 cargo clippy --workspace -- -D warnings

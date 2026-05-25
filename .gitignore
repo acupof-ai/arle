@@ -21,6 +21,7 @@ models/
 /vendor/
 bench-output/
 opd-output/
+runs/
 
 # web frontend build
 web/node_modules/

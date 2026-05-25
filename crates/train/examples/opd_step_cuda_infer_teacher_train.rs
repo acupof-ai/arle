@@ -19,7 +19,7 @@ mod app {
     };
     use train::{
         LoraAdapterConfig, LoraConfig, LoraTargetSet,
-        loss::kl_distill_loss,
+        loss::{kl_distill_loss, kl_distill_loss_chunked},
         opd::{
             GkdLossConfig, GkdSftAnchor, OpdStepConfig, OpdStepProfile,
             opd_step_with_teacher_forward_profiled_gkd_anchor,
@@ -70,6 +70,7 @@ mod app {
         save_every: usize,
         gkd_lambda: f32,
         sft_anchor: GkdSftAnchor,
+        kl_chunk_size: Option<usize>,
     }
 
     #[derive(Debug)]
@@ -302,6 +303,7 @@ mod app {
         let mut save_every = 0usize;
         let mut gkd_lambda = 0.0f32;
         let mut sft_anchor = GkdSftAnchor::StudentRollout;
+        let mut kl_chunk_size = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -333,6 +335,9 @@ mod app {
                 "--save-every" => save_every = next_arg(&mut args, &arg)?.parse::<usize>()?,
                 "--gkd-lambda" => gkd_lambda = parse_gkd_lambda(&next_arg(&mut args, &arg)?)?,
                 "--sft-anchor" => sft_anchor = parse_sft_anchor(&next_arg(&mut args, &arg)?)?,
+                "--kl-chunk-size" => {
+                    kl_chunk_size = Some(parse_positive_usize(&arg, &next_arg(&mut args, &arg)?)?)
+                }
                 "--no-cuda-graph" => enable_cuda_graph = false,
                 "--help" | "-h" => {
                     println!(
@@ -343,6 +348,7 @@ mod app {
                          [--eval-steps CSV] [--prompt-max-tokens N] [--max-step-seconds SEC] \
                          [--save-student-checkpoint DIR] [--save-every N] \
                          [--gkd-lambda LAMBDA] [--sft-anchor student-rollout|corpus-truth] \
+                         [--kl-chunk-size N] \
                          [--no-cuda-graph]"
                     );
                     std::process::exit(0);
@@ -384,6 +390,7 @@ mod app {
             save_every,
             gkd_lambda,
             sft_anchor,
+            kl_chunk_size,
         })
     }
 
@@ -611,6 +618,7 @@ mod app {
                     lambda: args.gkd_lambda,
                     sft_anchor: args.sft_anchor,
                     corpus_tokens,
+                    kl_chunk_size: args.kl_chunk_size,
                 },
                 Some(&mut profile),
             )?;
@@ -947,6 +955,7 @@ mod app {
             student_model_params,
             store,
             tape,
+            args.kl_chunk_size,
         )?;
         let heldout_kl = mean_prompt_kl(
             &prompts.heldout,
@@ -955,6 +964,7 @@ mod app {
             student_model_params,
             store,
             tape,
+            args.kl_chunk_size,
         )?;
         println!(
             "eval_summary step={step} train_kl={train_kl:.12e} heldout_kl={heldout_kl:.12e} \
@@ -971,6 +981,7 @@ mod app {
         student_model_params: &[TensorId],
         store: &mut TensorStore,
         tape: &mut Tape,
+        kl_chunk_size: Option<usize>,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         if prompts.is_empty() {
             return Ok(f64::NAN);
@@ -982,13 +993,23 @@ mod app {
             let positions = (0..prompt.len() as u32).collect::<Vec<_>>();
             let teacher_logits = teacher.forward_logits_device(prompt, &positions, store, tape)?;
             let student_logits = student.forward(store, tape, prompt, &positions)?;
-            let loss = kl_distill_loss(
-                student_logits,
-                teacher_logits.tensor_id,
-                prompt.len(),
-                store,
-                tape,
-            )?;
+            let loss = match kl_chunk_size {
+                Some(chunk_size) => kl_distill_loss_chunked(
+                    student_logits,
+                    teacher_logits.tensor_id,
+                    prompt.len(),
+                    chunk_size,
+                    store,
+                    tape,
+                )?,
+                None => kl_distill_loss(
+                    student_logits,
+                    teacher_logits.tensor_id,
+                    prompt.len(),
+                    store,
+                    tape,
+                )?,
+            };
             total += store.to_host(loss)?[0] as f64;
             retain_student_state(store, tape, student_model_params);
         }

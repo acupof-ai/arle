@@ -1,5 +1,15 @@
 # M_medusa Phase 1.A directive — pick dataset + wire HF Hub loader
 
+> **2026-05-25 status — RETIRED for SFT path**. The `arle train sft`
+> command used in this plan's example invocations was deleted in the
+> 2026-05-18 OPD-only pivot
+> ([`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md));
+> SFT is no longer a supported ARLE training surface. If Medusa needs
+> training-style adapter data in the future, it must wire through the
+> OPD path (`arle train opd --student-model <dir>`), not `arle train sft`.
+> The Hub dataset loader (`crates/train/src/hub_dataset.rs`) still
+> exists as substrate for OPD prompt corpora and eval datasets.
+
 > **2026-05-10 Qwen3.5 scope update**: dataset prep is not the active
 > blocker anymore. Alpaca is already prepared, but Qwen3.5 Medusa cannot
 > proceed to training/runtime until recurrent-state accepted-length
@@ -151,14 +161,16 @@ Scope unchanged within ±10%。
 
 ## Status
 
-Phase 1.A directive ready for codex pickup。Effort ~1-2 days for Phase
-1.A alone(download + tokenize + smoke train + eval pipeline)。
+Phase 1.A is **not ready for codex pickup** in this form. The data-selection
+analysis is retained, but the runnable path was `arle train sft`, which was
+retired in the OPD-only pivot. Any future Medusa data/training task needs a
+new OPD-compatible brief.
 
-Phase 1.A.2 production training adds ~3-4 days codex(WizardLM 70k full
-run + accept-rate eval)。
+Historical estimate: Phase 1.A alone was 1-2 days; Phase 1.A.2 production
+training added about 3-4 days for WizardLM 70k + accept-rate eval.
 
-Total Phase 1 complete:8-10 days codex,within original `afdddec`
-estimate envelope。
+Historical estimate: total Phase 1 complete was 8-10 days codex, within the
+original `afdddec` estimate envelope.
 
-When codex picks up:start with Phase 1.A.1 smoke(alpaca),verify
-pipeline,then advance to Phase 1.A.2 production。
+Do not start from the old Alpaca/SFT smoke command; replace the executable
+surface first.

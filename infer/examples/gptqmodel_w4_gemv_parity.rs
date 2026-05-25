@@ -7,7 +7,7 @@ mod app {
         path::{Path, PathBuf},
     };
 
-    use anyhow::{bail, Context, Result};
+    use anyhow::{Context, Result, bail};
     use cuda_kernels::{ffi, prelude::DeviceContext, tensor::CudaAllocTraceExt};
     use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
     use half::{bf16, f16};

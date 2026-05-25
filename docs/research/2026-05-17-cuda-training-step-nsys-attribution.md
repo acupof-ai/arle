@@ -1,5 +1,15 @@
 # CUDA training-step nsys profile — attribution that retires "port one more op" thinking
 
+> **2026-05-25 historical-context note**: `arle train pretrain` was retired
+> in the 2026-05-18 OPD-only pivot
+> ([`../projects/2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md)).
+> This nsys profile + its kernel-time attribution remain valid evidence for the
+> underlying kernels (matmul / SDPA / RoPE), which still live in the OPD path;
+> the wins/losses in this doc inform the current `docs/research/2026-05-24-arle-opd-end-to-end-trace.md`
+> (P5-shape OPD wall-clock breakdown) which is the current canonical training-
+> step trace. Treat the pretrain command in §Workload as the historical capture
+> command, not a still-runnable example.
+
 **Date**: 2026-05-17 · **Hardware**: RTX 4070 Ti SUPER (sm_89, 16 GB)
 · **Workload**: `arle train pretrain --preset small-25m --model-family qwen35
 --batch 2 --seq 512 --grad-accum-steps 16` post M5.3b (commit M5.3b on `main`)

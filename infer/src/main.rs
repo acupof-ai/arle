@@ -1549,6 +1549,7 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
     }
     if let Some(root) = args.disk_store_root.as_ref() {
         config.disk_store_root = root.clone();
+        config.t2_disk_tier_enabled = true;
     }
     config.cluster_shared_backend = args
         .cluster_shared_root
@@ -1591,7 +1592,7 @@ fn log_tier_config_overrides(args: &Args) {
     }
 
     info!(
-        "Tier config: t1_high_water={}, t1_low_water={}, t1_keepalive_ticks={}, t1_capacity_mb={}, t1_min_prompt_tokens={}, disk_store_root={}, cluster_shared_root={}",
+        "Tier config: t1_high_water={}, t1_low_water={}, t1_keepalive_ticks={}, t1_capacity_mb={}, t1_min_prompt_tokens={}, t2_disk_tier={}, disk_store_root={}, cluster_shared_root={}",
         args.t1_host_pinned_high_water
             .map(|value| value.to_string())
             .unwrap_or_else(|| "default".to_string()),
@@ -1607,6 +1608,11 @@ fn log_tier_config_overrides(args: &Args) {
         args.t1_host_pinned_min_prompt_tokens
             .map(|value| value.to_string())
             .unwrap_or_else(|| "default".to_string()),
+        if args.disk_store_root.is_some() {
+            "on"
+        } else {
+            "off"
+        },
         args.disk_store_root
             .as_ref()
             .map(|path| path.display().to_string())

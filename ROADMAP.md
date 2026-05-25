@@ -1,6 +1,6 @@
 # ARLE Roadmap
 
-Updated 2026-05-15. Derived planning surface. On any conflict the canonical
+Updated 2026-05-25. Derived planning surface. On any conflict the canonical
 doc wins:
 
 - Strategic master: [`docs/projects/2026-05-07-arle-master-strategy.md`](docs/projects/2026-05-07-arle-master-strategy.md)
@@ -8,6 +8,8 @@ doc wins:
 - Workspace topology: [`docs/codebase-map.md`](docs/codebase-map.md)
 - Architecture boundaries: [`docs/architecture.md`](docs/architecture.md)
 - Benchmark process: [`docs/bench-and-trace-spec.md`](docs/bench-and-trace-spec.md)
+- OPD mainline queue:
+  [`docs/projects/2026-05-24-opd-mainline-task-backlog.md`](docs/projects/2026-05-24-opd-mainline-task-backlog.md)
 - Contributor contract: [`AGENTS.md`](AGENTS.md)
 
 ## Positioning
@@ -30,7 +32,7 @@ SFT, GRPO, and multi-turn RL surfaces were retired 2026-05-18 — see
 | **P1** | Finish the `infer`-side observability spine: throughput, TTFT, ITL, queue shape, `ncu`, `nsys`, sampled traces on one operator surface. | [`docs/plans/infer-observability-v1.md`](docs/plans/infer-observability-v1.md) |
 | **P2** | Push tiered KV from a strong local CUDA path toward validated staged readmission + remote/shared backends. | [`docs/projects/tiered-kv-cache.md`](docs/projects/tiered-kv-cache.md), [`docs/plans/tiered-kv-hicache-readmission.md`](docs/plans/tiered-kv-hicache-readmission.md) |
 | **P3** | Finish serving-grade Metal batching and long-context closure without forking runtime truth away from CUDA. | [`docs/projects/mlx-backend-roadmap.md`](docs/projects/mlx-backend-roadmap.md) |
-| **P4** | OPD-only training substrate. Teacher in `infer`, student LoRA on the same backend. Pretrain / SFT / GRPO / multi-turn surfaces deleted 2026-05-18 — train crate slimmed to OPD pre-req substrate (autograd, Trainer skeleton, checkpoint codec, tokenizer, LoRA). | [`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md) |
+| **P4** | OPD-only training substrate. Teacher in `infer`, student LoRA on the same backend. Pretrain / SFT / GRPO / multi-turn surfaces deleted 2026-05-18. Current execution runs through the 2026-05-24 mainline backlog: `arle train opd --student-model <dir>` is wired end-to-end, P5 pure-OPD 5k capability eval is preflighted, chunked-KL and KV-tier observability are code-landed, and GPU benches/evals remain deferred until P5 releases the GPU. | [`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md), [`docs/projects/2026-05-24-opd-mainline-task-backlog.md`](docs/projects/2026-05-24-opd-mainline-task-backlog.md), [`docs/experience/wins/2026-05-25-capability-eval-preflight.md`](docs/experience/wins/2026-05-25-capability-eval-preflight.md) |
 
 ## Next-Model Priority Order
 

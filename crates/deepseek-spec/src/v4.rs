@@ -80,7 +80,9 @@ impl DeepSeekV4Config {
     }
 
     pub fn from_json_value(value: &serde_json::Value) -> Result<Self> {
-        let config: Self = serde_json::from_value(value.clone())?;
+        let mut value = value.clone();
+        normalize_rope_parameters_aliases(&mut value);
+        let config: Self = serde_json::from_value(value)?;
         config.validate()?;
         Ok(config)
     }
@@ -395,6 +397,20 @@ impl DeepSeekV4Config {
                 weight: scores[expert_idx] / denom * self.routed_scaling_factor,
             })
             .collect())
+    }
+}
+
+fn normalize_rope_parameters_aliases(value: &mut serde_json::Value) {
+    for key in ["rope_parameters", "rope_scaling"] {
+        let Some(rope) = value
+            .get_mut(key)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if rope.contains_key("rope_type") {
+            rope.remove("type");
+        }
     }
 }
 
@@ -1011,6 +1027,71 @@ mod tests {
         assert_eq!(cfg.rope_parameters.factor, 16.0);
         assert_eq!(cfg.compress_ratios.len(), 3);
         assert_eq!(cfg.pad_token_id, None);
+    }
+
+    #[test]
+    fn parses_hf_rope_type_duplicate_alias() {
+        let cfg = DeepSeekV4Config::from_json_str(
+            r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "dtype": "bfloat16",
+            "vocab_size": 129280,
+            "hidden_size": 512,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "hidden_act": "silu",
+            "swiglu_limit": 10.0,
+            "q_lora_rank": 256,
+            "o_lora_rank": 256,
+            "o_groups": 2,
+            "qk_rope_head_dim": 32,
+            "n_routed_experts": 16,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 512,
+            "routed_scaling_factor": 1.5,
+            "norm_topk_prob": true,
+            "scoring_func": "sqrtsoftplus",
+            "topk_method": "noaux_tc",
+            "index_n_heads": 4,
+            "index_head_dim": 64,
+            "index_topk": 128,
+            "num_hash_layers": 2,
+            "sliding_window": 32,
+            "compress_ratios": [0, 4, 0, 128, 0, 16, 0, 4, 0, 128, 0, 16],
+            "compress_rope_theta": 160000.0,
+            "hc_mult": 4,
+            "hc_sinkhorn_iters": 20,
+            "hc_eps": 1.0e-6,
+            "num_nextn_predict_layers": 1,
+            "max_position_embeddings": 1048576,
+            "rope_theta": 10000.0,
+            "rope_parameters": {
+                "type": "yarn",
+                "rope_type": "yarn",
+                "factor": 16.0,
+                "original_max_position_embeddings": 65536,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "rope_theta": 10000.0
+            },
+            "rms_norm_eps": 1.0e-6,
+            "initializer_range": 0.02,
+            "tie_word_embeddings": false,
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "bos_token_id": 0,
+            "eos_token_id": 1,
+            "pad_token_id": null
+        }"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.rope_parameters.rope_type, "yarn");
+        assert_eq!(cfg.hidden_size, 512);
     }
 
     #[test]

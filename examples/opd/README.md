@@ -65,6 +65,34 @@ the example train binaries. The current `arle train opd` CLI accepts only
 flag is tracked as Phase 7 of the
 [Qwen3.5-9B→0.8B distillation plan](../../docs/plans/2026-05-21-arle-opd-qwen35-9b-to-08b-distillation-plan.md).
 
+## Example data files
+
+| File | Rows | Use | Source |
+|---|---:|---|---|
+| `sample-prompts.jsonl` | 20 | Short real-text OPD prompts for smoke-scale examples. | Manually curated repo-local examples. |
+| `sft-anchor-mmlu-gsm8k.jsonl` | 56 | Real-corpus SFT anchor for OPD/GKD feasibility tests. | 26 MMLU train rows + 30 GSM8K train rows. |
+
+`sft-anchor-mmlu-gsm8k.jsonl` was curated for the 2026-05-24 GKD
+real-corpus smoke. It uses train splits only, keeps 26 diverse-subject MMLU
+multiple-choice rows and 30 GSM8K math rows, leak-checks the selected rows
+against the held-out eval use, validates tokenization, records `max_tokens`
+as the actual tokenized prompt length capped at 512, and drops 4 MMLU rows
+that exceeded 512 tokens. The file carries only the prompt/completion records;
+the construction notes are recorded in
+[2026-05-24-gkd-real-corpus-tape-oom-kill.md](../../docs/experience/errors/2026-05-24-gkd-real-corpus-tape-oom-kill.md).
+
+License attribution:
+
+- MMLU: MIT, upstream dataset card
+  https://huggingface.co/datasets/cais/mmlu.
+- GSM8K: MIT, upstream dataset card
+  https://huggingface.co/datasets/openai/gsm8k.
+
+Reproduction: no builder script is checked in yet; this corpus is a manually
+curated subset. Rebuild from the upstream train splits using the filter rules
+above and compare against the errors entry before replacing the checked-in
+file.
+
 ## Expected output (smoke)
 
 ```json
