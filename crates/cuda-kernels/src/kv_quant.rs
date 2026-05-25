@@ -836,4 +836,339 @@ mod tests {
         run_fp8_scatter_roundtrip_case(&ctx, 8);
         run_fp8_scatter_roundtrip_case(&ctx, 7);
     }
+
+    /// Diagnostic for the 2026-05-26 FP8 KV catastrophic step-1 divergence.
+    /// The existing `fp8_scatter_quantized_kv_roundtrips_representable_values`
+    /// test uses tiny representable values (|val| ≤ 1.0), which fit FP8 E4M3
+    /// without loss. The production Qwen3-4B forward produces K/V values
+    /// closer to N(0, 1) with occasional ±5 outliers, where FP8 quantization
+    /// has measurable relative error. This test exercises the realistic
+    /// shape (num_kv_heads=8, head_dim=128) at multi-page coverage so a
+    /// shape-specific kernel bug would surface here, while a pure
+    /// precision-limit issue would print bounded error numbers without
+    /// failing.
+    #[test]
+    fn fp8_scatter_qwen3_production_layout_diagnostic() {
+        let ctx = DeviceContext::new().expect("failed to create CUDA context");
+        let num_kv_heads = 8usize;
+        let head_dim = 128usize;
+        let total_tokens = 64usize;
+        let max_seq_len = 128usize;
+        let kv_dim = num_kv_heads * head_dim;
+        let hnd_elem_count = total_tokens.div_ceil(16) * 16 * kv_dim;
+
+        // Deterministic pseudo-Gaussian via xorshift; values in roughly
+        // ±3.5 range with one ±6 outlier per (token, head) to stress the
+        // per-(token, head) scale path the same way real attention does.
+        let mut rng_state: u64 = 0x9E3779B97F4A7C15;
+        let mut next_f32 = || -> f32 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            let v = ((rng_state >> 32) as u32) as f32 / u32::MAX as f32;
+            (v - 0.5) * 4.0
+        };
+
+        let mut cont_host = vec![bf16::ZERO; num_kv_heads * max_seq_len * head_dim];
+        for kv_head in 0..num_kv_heads {
+            for token_row in 0..total_tokens {
+                for d in 0..head_dim {
+                    let mut value = next_f32();
+                    if d == 0 {
+                        // Outlier per (token, head): forces the scale to a
+                        // larger value than the bulk of dims would need.
+                        value = if (token_row + kv_head) % 2 == 0 {
+                            6.0
+                        } else {
+                            -5.5
+                        };
+                    }
+                    let src = kv_head * max_seq_len * head_dim + token_row * head_dim + d;
+                    cont_host[src] = bf16::from_f32(value);
+                }
+            }
+        }
+
+        let kv_cont = DeviceVec::from_host(&ctx, &cont_host).expect("prod cont H2D");
+        let mut kv_fp8 = ctx
+            .stream
+            .alloc_zeros::<u8>(total_tokens * kv_dim)
+            .expect("prod fp8 alloc");
+        let mut scales = ctx
+            .stream
+            .alloc_zeros::<f32>(total_tokens * num_kv_heads)
+            .expect("prod scales alloc");
+        let token_rows_host: Vec<i32> = (0..total_tokens).map(|idx| idx as i32).collect();
+        let token_rows_gpu = ctx
+            .stream
+            .clone_htod(&token_rows_host)
+            .expect("prod rows H2D");
+
+        {
+            let (fp8_ptr, _g1) = kv_fp8.device_ptr_mut(&ctx.stream);
+            let (scales_ptr, _g2) = scales.device_ptr_mut(&ctx.stream);
+            quantize_scatter_kv_fp8_range(
+                &ctx,
+                &kv_cont,
+                fp8_ptr,
+                scales_ptr,
+                &token_rows_gpu,
+                0,
+                max_seq_len,
+                total_tokens,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+            )
+            .expect("prod fp8 quantize");
+        }
+
+        let mut hnd_out = ctx
+            .stream
+            .alloc_zeros::<u16>(hnd_elem_count)
+            .expect("prod hnd alloc");
+        {
+            let (fp8_ptr, _g1) = kv_fp8.device_ptr(&ctx.stream);
+            let (scales_ptr, _g2) = scales.device_ptr(&ctx.stream);
+            let (out_ptr, _g3) = hnd_out.device_ptr_mut(&ctx.stream);
+            dequantize_paged_kv_fp8_to_hnd(
+                &ctx,
+                fp8_ptr,
+                scales_ptr,
+                out_ptr,
+                &token_rows_gpu,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                total_tokens,
+            )
+            .expect("prod hnd refill");
+        }
+
+        ctx.sync().expect("prod sync");
+        let got = ctx.stream.clone_dtoh(&hnd_out).expect("prod D2H");
+        let got_scales = ctx.stream.clone_dtoh(&scales).expect("prod scales D2H");
+
+        // Compute per-(token, head) error stats. The expected relative L∞
+        // error for FP8 E4M3 with per-(token, head) scaling is ~1/2^3 ≈
+        // 12.5% (3 mantissa bits at the mantissa-only range, plus tail). If
+        // the kernel itself is bug-free, error stays in that envelope. If
+        // we see error > 50% rel or arbitrary garbage, the kernel has a
+        // shape/indexing bug specific to this layout.
+        let mut max_abs_err = 0.0f32;
+        let mut sum_abs_err = 0.0f64;
+        let mut max_rel_err = 0.0f32;
+        let mut n_elems = 0usize;
+        let mut scale_min = f32::INFINITY;
+        let mut scale_max = 0.0f32;
+        for token_row in 0..total_tokens {
+            for kv_head in 0..num_kv_heads {
+                let s = got_scales[token_row * num_kv_heads + kv_head];
+                scale_min = scale_min.min(s);
+                scale_max = scale_max.max(s);
+                for d in 0..head_dim {
+                    let src = kv_head * max_seq_len * head_dim + token_row * head_dim + d;
+                    let dst = hnd_offset(token_row, kv_head, d, head_dim, kv_dim);
+                    let expected = cont_host[src].to_f32();
+                    let actual = bf16::from_bits(got[dst]).to_f32();
+                    let abs_err = (actual - expected).abs();
+                    let rel_err = if expected.abs() > 1.0e-6 {
+                        abs_err / expected.abs()
+                    } else {
+                        0.0
+                    };
+                    max_abs_err = max_abs_err.max(abs_err);
+                    sum_abs_err += abs_err as f64;
+                    max_rel_err = max_rel_err.max(rel_err);
+                    n_elems += 1;
+                }
+            }
+        }
+        let mean_abs_err = sum_abs_err / n_elems as f64;
+
+        eprintln!(
+            "fp8_scatter_qwen3_production_diagnostic: \
+             num_kv_heads={num_kv_heads} head_dim={head_dim} total_tokens={total_tokens} \
+             max_abs_err={max_abs_err:.6} mean_abs_err={mean_abs_err:.6} \
+             max_rel_err={max_rel_err:.6} scale_range=[{scale_min:.6}, {scale_max:.6}]"
+        );
+
+        // Sanity floor: FP8 E4M3 with per-(token, head) scaling on inputs
+        // bounded by 6.0 must produce max_abs_err well under 1.0. Beyond
+        // that indicates a kernel structural bug, not a precision-limit
+        // issue. (The kernel comment notes max_rel_err can spike past 12%
+        // for dims whose value is small relative to the per-head outlier
+        // — that's expected, so we don't gate on rel_err.)
+        assert!(
+            max_abs_err < 1.0,
+            "FP8 KV scatter roundtrip max_abs_err={max_abs_err:.6} exceeds 1.0 \
+             — kernel is producing garbage at production layout"
+        );
+    }
+
+    /// Same diagnostic as above but exercises `quantize_paged_kv_fp8`, the
+    /// kernel actually called by `finalize_paged_prefill_kv_layer` and the
+    /// per-decode-step write path (NOT `quantize_scatter_kv_fp8`, which only
+    /// runs for non-paged-prefill formats like TurboQuant). The source
+    /// layout assumption differs: `quantize_paged_kv_fp8_kernel` reads HND-
+    /// paged `[page, head, token, dim]` from the work buffer. A wrong
+    /// stride or per-(token, head) scale plumbing bug here would be
+    /// invisible to the scatter diagnostic above and explain the 2026-05-26
+    /// audit's token-1 catastrophic divergence (where FP8 = ~0.4% match
+    /// while the scatter kernel proves clean).
+    #[test]
+    fn fp8_paged_quantize_qwen3_production_layout_diagnostic() {
+        let ctx = DeviceContext::new().expect("failed to create CUDA context");
+        let num_kv_heads = 8usize;
+        let head_dim = 128usize;
+        let total_tokens = 64usize;
+        let kv_dim = num_kv_heads * head_dim;
+        const PAGE_SIZE: usize = 16;
+        let num_pages = total_tokens.div_ceil(PAGE_SIZE);
+        // HND-paged work buffer: [page, head, token, dim]
+        let work_elem_count = num_pages * PAGE_SIZE * kv_dim;
+        let hnd_elem_count = work_elem_count;
+
+        let mut rng_state: u64 = 0x9E3779B97F4A7C15;
+        let mut next_f32 = || -> f32 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            let v = ((rng_state >> 32) as u32) as f32 / u32::MAX as f32;
+            (v - 0.5) * 4.0
+        };
+
+        // Write known values into the HND-paged work buffer at the layout
+        // `quantize_paged_kv_fp8_kernel` reads from. Tokens beyond
+        // `total_tokens` stay zero — they're "padding" rows in the last
+        // partial page.
+        let mut work_host = vec![bf16::ZERO; work_elem_count];
+        let mut expected_per_token_head = vec![vec![0.0f32; head_dim]; total_tokens * num_kv_heads];
+        for token_row in 0..total_tokens {
+            let page_idx = token_row / PAGE_SIZE;
+            let offset_in_page = token_row % PAGE_SIZE;
+            for kv_head in 0..num_kv_heads {
+                for d in 0..head_dim {
+                    let mut value = next_f32();
+                    if d == 0 {
+                        value = if (token_row + kv_head) % 2 == 0 {
+                            6.0
+                        } else {
+                            -5.5
+                        };
+                    }
+                    let src_offset = page_idx * PAGE_SIZE * kv_dim
+                        + kv_head * PAGE_SIZE * head_dim
+                        + offset_in_page * head_dim
+                        + d;
+                    work_host[src_offset] = bf16::from_f32(value);
+                    expected_per_token_head[token_row * num_kv_heads + kv_head][d] = value;
+                }
+            }
+        }
+
+        let kv_work = DeviceVec::from_host(&ctx, &work_host).expect("paged work H2D");
+        let mut kv_fp8 = ctx
+            .stream
+            .alloc_zeros::<u8>(total_tokens * kv_dim)
+            .expect("paged fp8 alloc");
+        let mut scales = ctx
+            .stream
+            .alloc_zeros::<f32>(total_tokens * num_kv_heads)
+            .expect("paged scales alloc");
+        let token_rows_host: Vec<i32> = (0..total_tokens).map(|idx| idx as i32).collect();
+        let token_rows_gpu = ctx
+            .stream
+            .clone_htod(&token_rows_host)
+            .expect("paged rows H2D");
+
+        {
+            let (fp8_ptr, _g1) = kv_fp8.device_ptr_mut(&ctx.stream);
+            let (scales_ptr, _g2) = scales.device_ptr_mut(&ctx.stream);
+            let (work_ptr, _g3) = kv_work.data.device_ptr(&ctx.stream);
+            quantize_paged_kv_fp8(
+                &ctx,
+                work_ptr,
+                fp8_ptr,
+                scales_ptr,
+                &token_rows_gpu,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                total_tokens,
+            )
+            .expect("paged fp8 quantize");
+        }
+
+        let mut hnd_out = ctx
+            .stream
+            .alloc_zeros::<u16>(hnd_elem_count)
+            .expect("paged hnd alloc");
+        {
+            let (fp8_ptr, _g1) = kv_fp8.device_ptr(&ctx.stream);
+            let (scales_ptr, _g2) = scales.device_ptr(&ctx.stream);
+            let (out_ptr, _g3) = hnd_out.device_ptr_mut(&ctx.stream);
+            dequantize_paged_kv_fp8_to_hnd(
+                &ctx,
+                fp8_ptr,
+                scales_ptr,
+                out_ptr,
+                &token_rows_gpu,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                total_tokens,
+            )
+            .expect("paged hnd refill");
+        }
+
+        ctx.sync().expect("paged sync");
+        let got = ctx.stream.clone_dtoh(&hnd_out).expect("paged D2H");
+        let got_scales = ctx.stream.clone_dtoh(&scales).expect("paged scales D2H");
+
+        let mut max_abs_err = 0.0f32;
+        let mut sum_abs_err = 0.0f64;
+        let mut max_rel_err = 0.0f32;
+        let mut n_elems = 0usize;
+        let mut scale_min = f32::INFINITY;
+        let mut scale_max = 0.0f32;
+        for token_row in 0..total_tokens {
+            for kv_head in 0..num_kv_heads {
+                let s = got_scales[token_row * num_kv_heads + kv_head];
+                scale_min = scale_min.min(s);
+                scale_max = scale_max.max(s);
+                for d in 0..head_dim {
+                    let dst = hnd_offset(token_row, kv_head, d, head_dim, kv_dim);
+                    let expected = expected_per_token_head[token_row * num_kv_heads + kv_head][d];
+                    let actual = bf16::from_bits(got[dst]).to_f32();
+                    let abs_err = (actual - expected).abs();
+                    let rel_err = if expected.abs() > 1.0e-6 {
+                        abs_err / expected.abs()
+                    } else {
+                        0.0
+                    };
+                    max_abs_err = max_abs_err.max(abs_err);
+                    sum_abs_err += abs_err as f64;
+                    max_rel_err = max_rel_err.max(rel_err);
+                    n_elems += 1;
+                }
+            }
+        }
+        let mean_abs_err = sum_abs_err / n_elems as f64;
+
+        eprintln!(
+            "fp8_paged_quantize_qwen3_production_diagnostic: \
+             num_kv_heads={num_kv_heads} head_dim={head_dim} total_tokens={total_tokens} \
+             max_abs_err={max_abs_err:.6} mean_abs_err={mean_abs_err:.6} \
+             max_rel_err={max_rel_err:.6} scale_range=[{scale_min:.6}, {scale_max:.6}]"
+        );
+
+        assert!(
+            max_abs_err < 1.0,
+            "FP8 paged quantize roundtrip max_abs_err={max_abs_err:.6} exceeds 1.0 \
+             — kernel is producing garbage when called from the prefill-finalize / \
+             decode-write path. Scatter path tested cleanly, so the divergence is \
+             specific to the HND-paged source layout."
+        );
+    }
 }

@@ -108,10 +108,10 @@ impl<M: ModelForward> Scheduler<M> {
         //
         // BUT: paged prefill currently only supports `page_size == 16` (the
         // TileLang HD128 batched kernel's invariant — see
-        // `ops/attention.rs:617` and `scheduler/cuda/prefill.rs:535`). Pool
-        // formats that allocate `page_size == 1` (TurboQuant today) must run
-        // prefill via the contiguous BF16 path and migrate at completion, so
-        // they need the full contiguous buffer.
+        // `ops/attention.rs:617` and `scheduler/cuda/prefill.rs::prepare`).
+        // Pool formats that allocate `page_size == 1` (TurboQuant today)
+        // must run prefill via the contiguous BF16 path and migrate at
+        // completion, so they need the full contiguous buffer.
         let model_uses_paged_prefill = model.prefill_uses_paged_pool();
         let format_uses_paged_prefill = kv_pool_format.default_page_size() == 16;
         let contiguous_tokens = if model_uses_paged_prefill && format_uses_paged_prefill {
