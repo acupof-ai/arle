@@ -400,7 +400,7 @@ mod app {
         })?;
 
         let mut rollout = prompt_ids.to_vec();
-        let mut rollout_cache = Qwen35KvCache::new(student);
+        let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + cfg.rollout_len);
         let mut generated_tokens = if cfg.rollout_len == 0 {
             None
         } else {
@@ -553,7 +553,7 @@ mod app {
         tape.set_enabled(false);
 
         let mut rollout = prompt_ids.to_vec();
-        let mut rollout_cache = Qwen35KvCache::new(student);
+        let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + cfg.rollout_len);
         let mut generated_tokens = if cfg.rollout_len == 0 {
             None
         } else {
@@ -768,7 +768,7 @@ mod app {
         tape.set_enabled(false);
 
         let mut rollout = prompt_ids.to_vec();
-        let mut rollout_cache = Qwen35KvCache::new(student);
+        let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + rollout_len);
         for step in 0..rollout_len {
             let (input_ids, positions) = if step == 0 {
                 (
@@ -807,7 +807,7 @@ mod app {
         tape.set_enabled(false);
 
         let mut rollout = prompt_ids.to_vec();
-        let mut rollout_cache = Qwen35KvCache::new(student);
+        let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + rollout_len);
         let mut generated_tokens = if rollout_len == 0 {
             None
         } else {

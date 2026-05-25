@@ -1095,6 +1095,26 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((handle, out_shape))
     }
 
+    /// Write compact rank-4 `[batch, heads, src_seq, dim]` `src` into the
+    /// sequence window of a preallocated `[batch, heads, max_seq, dim]` cache.
+    ///
+    /// CUDA overrides this with an in-place kernel and returns a clone of the
+    /// destination handle. The CPU fallback returns a fresh uploaded handle so
+    /// the functional contract remains backend-neutral.
+    fn kv_cache_write_axis2(
+        &self,
+        dst: &DeviceHandle,
+        dst_shape: &[usize],
+        src: &DeviceHandle,
+        src_shape: &[usize],
+        seq_offset: usize,
+    ) -> Result<DeviceHandle> {
+        let mut dst_host = self.readback(dst)?;
+        let src_host = self.readback(src)?;
+        cpu_kv_cache_write_axis2(&mut dst_host, dst_shape, &src_host, src_shape, seq_offset)?;
+        self.upload(&dst_host, dst_shape)
+    }
+
     /// Decode-time GQA causal attention for a one-token query:
     /// `out = softmax(q @ k^T / sqrt(D)) @ v`.
     ///
@@ -1121,6 +1141,30 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         let v_host = self.readback(v)?;
         let (data, out_shape) = cpu_causal_sdpa_decode_gqa(
             &q_host, q_shape, &k_host, k_shape, &v_host, v_shape, q_start,
+        )?;
+        let handle = self.upload(&data, &out_shape)?;
+        Ok((handle, out_shape))
+    }
+
+    /// Decode-time GQA attention over a preallocated KV cache. `k_shape` and
+    /// `v_shape` are the full cache shapes `[batch, kv_heads, max_seq, dim]`;
+    /// `kv_len` declares how many prefix tokens are valid.
+    fn causal_sdpa_decode_gqa_cache(
+        &self,
+        q: &DeviceHandle,
+        q_shape: &[usize],
+        k: &DeviceHandle,
+        k_shape: &[usize],
+        v: &DeviceHandle,
+        v_shape: &[usize],
+        kv_len: usize,
+        q_start: usize,
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let q_host = self.readback(q)?;
+        let k_host = self.readback(k)?;
+        let v_host = self.readback(v)?;
+        let (data, out_shape) = cpu_causal_sdpa_decode_gqa_cache(
+            &q_host, q_shape, &k_host, k_shape, &v_host, v_shape, kv_len, q_start,
         )?;
         let handle = self.upload(&data, &out_shape)?;
         Ok((handle, out_shape))
@@ -3268,6 +3312,158 @@ pub fn cpu_causal_sdpa_decode_gqa(
     Ok((out, out_shape))
 }
 
+pub fn cpu_kv_cache_write_axis2(
+    dst: &mut [f32],
+    dst_shape: &[usize],
+    src: &[f32],
+    src_shape: &[usize],
+    seq_offset: usize,
+) -> Result<()> {
+    for shape in [dst_shape, src_shape] {
+        if shape.len() != 4 {
+            return Err(crate::AutogradError::InvalidRank {
+                expected: "4",
+                got: shape.len(),
+            });
+        }
+    }
+    if dst_shape[0] != src_shape[0] || dst_shape[1] != src_shape[1] || dst_shape[3] != src_shape[3]
+    {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![dst_shape[0], dst_shape[1], dst_shape[3]],
+            got: vec![src_shape[0], src_shape[1], src_shape[3]],
+        });
+    }
+    let src_seq = src_shape[2];
+    if seq_offset + src_seq > dst_shape[2] {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![dst_shape[2]],
+            got: vec![seq_offset + src_seq],
+        });
+    }
+    let dst_size = shape_size(dst_shape);
+    let src_size = shape_size(src_shape);
+    if dst.len() != dst_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: dst.len(),
+            shape: dst_shape.to_vec(),
+            size: dst_size,
+        });
+    }
+    if src.len() != src_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: src.len(),
+            shape: src_shape.to_vec(),
+            size: src_size,
+        });
+    }
+
+    let batch = dst_shape[0];
+    let heads = dst_shape[1];
+    let max_seq = dst_shape[2];
+    let dim = dst_shape[3];
+    for batch_idx in 0..batch {
+        for head_idx in 0..heads {
+            for seq_idx in 0..src_seq {
+                let src_base = ((batch_idx * heads + head_idx) * src_seq + seq_idx) * dim;
+                let dst_base =
+                    ((batch_idx * heads + head_idx) * max_seq + seq_offset + seq_idx) * dim;
+                dst[dst_base..dst_base + dim].copy_from_slice(&src[src_base..src_base + dim]);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_causal_sdpa_decode_gqa_cache(
+    q: &[f32],
+    q_shape: &[usize],
+    k: &[f32],
+    k_shape: &[usize],
+    v: &[f32],
+    v_shape: &[usize],
+    kv_len: usize,
+    q_start: usize,
+) -> Result<(Vec<f32>, Vec<usize>)> {
+    validate_decode_gqa_cache_shapes(q_shape, k_shape, v_shape, kv_len, q_start)?;
+    let q_size = shape_size(q_shape);
+    let k_size = shape_size(k_shape);
+    let v_size = shape_size(v_shape);
+    if q.len() != q_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: q.len(),
+            shape: q_shape.to_vec(),
+            size: q_size,
+        });
+    }
+    if k.len() != k_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: k.len(),
+            shape: k_shape.to_vec(),
+            size: k_size,
+        });
+    }
+    if v.len() != v_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: v.len(),
+            shape: v_shape.to_vec(),
+            size: v_size,
+        });
+    }
+
+    let batch = q_shape[0];
+    let query_heads = q_shape[1];
+    let kv_heads = k_shape[1];
+    let max_seq = k_shape[2];
+    let head_dim = q_shape[3];
+    let kv_repeat = query_heads / kv_heads;
+    let visible = (q_start + 1).min(kv_len);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let out_shape = vec![batch, query_heads, 1, head_dim];
+    let mut out = vec![0.0_f32; shape_size(&out_shape)];
+    let mut scores = vec![0.0_f32; visible];
+
+    for batch_idx in 0..batch {
+        for query_head in 0..query_heads {
+            let kv_head = query_head / kv_repeat;
+            let q_base = (batch_idx * query_heads + query_head) * head_dim;
+
+            let mut max_score = f32::NEG_INFINITY;
+            for (pos, score_slot) in scores.iter_mut().enumerate().take(visible) {
+                let k_base = ((batch_idx * kv_heads + kv_head) * max_seq + pos) * head_dim;
+                let mut dot = 0.0_f32;
+                for dim in 0..head_dim {
+                    dot += q[q_base + dim] * k[k_base + dim];
+                }
+                let score = dot * scale;
+                *score_slot = score;
+                max_score = max_score.max(score);
+            }
+
+            let mut denom = 0.0_f32;
+            for score in &mut scores {
+                *score = (*score - max_score).exp();
+                denom += *score;
+            }
+            if denom == 0.0 {
+                continue;
+            }
+
+            let out_base = (batch_idx * query_heads + query_head) * head_dim;
+            for dim in 0..head_dim {
+                let mut acc = 0.0_f32;
+                for (pos, &weight_exp) in scores.iter().enumerate() {
+                    let v_base = ((batch_idx * kv_heads + kv_head) * max_seq + pos) * head_dim;
+                    acc += (weight_exp / denom) * v[v_base + dim];
+                }
+                out[out_base + dim] = acc;
+            }
+        }
+    }
+    Ok((out, out_shape))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cpu_qwen_decode_prepare_q(
     q_full: &[f32],
@@ -3567,6 +3763,68 @@ pub fn validate_decode_gqa_shapes(
         return Err(crate::AutogradError::ShapeMismatch {
             expected: vec![q_start + 1],
             got: vec![k_shape[2]],
+        });
+    }
+
+    Ok(())
+}
+
+pub fn validate_decode_gqa_cache_shapes(
+    q_shape: &[usize],
+    k_shape: &[usize],
+    v_shape: &[usize],
+    kv_len: usize,
+    q_start: usize,
+) -> Result<()> {
+    for shape in [q_shape, k_shape, v_shape] {
+        if shape.len() != 4 {
+            return Err(crate::AutogradError::InvalidRank {
+                expected: "4",
+                got: shape.len(),
+            });
+        }
+    }
+
+    if q_shape[0] != k_shape[0] || q_shape[0] != v_shape[0] {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: q_shape.to_vec(),
+            got: k_shape.to_vec(),
+        });
+    }
+    if q_shape[2] != 1 {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![1],
+            got: vec![q_shape[2]],
+        });
+    }
+    if q_shape[3] != k_shape[3] || q_shape[3] != v_shape[3] {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: q_shape.to_vec(),
+            got: k_shape.to_vec(),
+        });
+    }
+    if k_shape[1] != v_shape[1] || k_shape[2] != v_shape[2] {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: k_shape.to_vec(),
+            got: v_shape.to_vec(),
+        });
+    }
+    if k_shape[2] == 0 || kv_len == 0 || kv_len > k_shape[2] {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "non-empty kv_len within cache capacity",
+            got: kv_len,
+        });
+    }
+    if q_shape[1] == 0 || k_shape[1] == 0 || !q_shape[1].is_multiple_of(k_shape[1]) {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![q_shape[1]],
+            got: vec![k_shape[1]],
+        });
+    }
+    if q_start >= kv_len {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![q_start + 1],
+            got: vec![kv_len],
         });
     }
 

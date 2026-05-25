@@ -1069,7 +1069,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         let mut rollout: Vec<u32> = prompt_ids.to_vec();
         let use_rollout_kv_cache = student.supports_rollout_kv_cache();
         if use_rollout_kv_cache && use_device_rollout_argmax(store, cfg.rollout_len, vocab) {
-            let mut rollout_cache = Qwen35KvCache::new(student);
+            let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + cfg.rollout_len);
             let mut generated_tokens = if cfg.rollout_len == 0 {
                 None
             } else {
@@ -1129,7 +1129,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 )?);
             }
         } else if use_rollout_kv_cache {
-            let mut rollout_cache = Qwen35KvCache::new(student);
+            let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + cfg.rollout_len);
             for step in 0..cfg.rollout_len {
                 let (input_ids, positions, logits_seq_len) = if step == 0 {
                     (

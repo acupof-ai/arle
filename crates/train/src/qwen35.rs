@@ -7,9 +7,9 @@ use std::{
 use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
-        LinearAttentionParams, add, causal_sdpa, causal_sdpa_decode_gqa, causal_sdpa_with_q_start,
-        embedding, linear_attention_core, matmul_bt, mul, repeat_kv, reshape, rmsnorm, rope,
-        sigmoid, silu, slice, transpose,
+        LinearAttentionParams, add, causal_sdpa, causal_sdpa_with_q_start, embedding,
+        linear_attention_core, matmul_bt, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
+        slice, transpose,
     },
 };
 use half::bf16;
@@ -85,10 +85,12 @@ struct Qwen35Layer {
     mlp: Qwen35Mlp,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct Qwen35LayerKvCache {
     k: Option<TensorId>,
     v: Option<TensorId>,
+    max_seq_len: usize,
+    seq_cursor: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -98,9 +100,17 @@ pub struct Qwen35KvCache {
 }
 
 impl Qwen35KvCache {
-    pub fn new(model: &Qwen35Model) -> Self {
+    pub fn new(model: &Qwen35Model, max_seq_len: usize) -> Self {
         Self {
-            layers: vec![Qwen35LayerKvCache::default(); model.layers.len()],
+            layers: vec![
+                Qwen35LayerKvCache {
+                    k: None,
+                    v: None,
+                    max_seq_len,
+                    seq_cursor: 0,
+                };
+                model.layers.len()
+            ],
             seq_len: 0,
         }
     }
@@ -684,28 +694,42 @@ impl Qwen35Layer {
             (q, gate, k, v)
         };
 
-        let k_all = append_cached_kv(layer_cache.k, k, store)?;
-        let v_all = append_cached_kv(layer_cache.v, v, store)?;
-        layer_cache.k = Some(k_all);
-        layer_cache.v = Some(v_all);
+        if layer_cache.seq_cursor != q_start {
+            return Err(Qwen35Error::InvalidConfig(
+                "rollout KV cache layer cursor diverged from global cache length",
+            ));
+        }
+        let prev_kv_len = layer_cache.seq_cursor;
+        let k_cache = append_cached_kv(
+            layer_cache.k,
+            k,
+            layer_cache.max_seq_len,
+            prev_kv_len,
+            store,
+        )?;
+        let v_cache = append_cached_kv(
+            layer_cache.v,
+            v,
+            layer_cache.max_seq_len,
+            prev_kv_len,
+            store,
+        )?;
+        let kv_len = prev_kv_len + seq_len;
+        layer_cache.k = Some(k_cache);
+        layer_cache.v = Some(v_cache);
+        layer_cache.seq_cursor = kv_len;
 
         let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
-        let kv_len = store
-            .get(k_all)
-            .ok_or(AutogradError::InvalidTensorId(k_all))?
-            .shape
-            .get(2)
-            .copied()
-            .ok_or(AutogradError::InvalidRank {
-                expected: "4",
-                got: 0,
-            })?;
-        let attn_hidden = if !tape.enabled && seq_len == 1 && q_start + 1 == kv_len && kv_len <= 32
-        {
-            causal_sdpa_decode_gqa(q, k_all, v_all, q_start, store, tape)?
+        let attn_hidden = if !tape.enabled && seq_len == 1 && q_start + 1 == kv_len {
+            causal_sdpa_decode_gqa_cached(q, k_cache, v_cache, kv_len, q_start, store, tape)?
         } else {
-            let k_all = repeat_kv(k_all, kv_repeat, store, tape)?;
-            let v_all = repeat_kv(v_all, kv_repeat, store, tape)?;
+            if prev_kv_len != 0 {
+                return Err(Qwen35Error::InvalidConfig(
+                    "rollout KV cache only supports one-token decode after the initial prompt",
+                ));
+            }
+            let k_all = repeat_kv(k, kv_repeat, store, tape)?;
+            let v_all = repeat_kv(v, kv_repeat, store, tape)?;
             causal_sdpa_with_q_start(q, k_all, v_all, q_start, store, tape)?
         };
         let attn_hidden = if let Some(gate) = gate {
@@ -848,33 +872,48 @@ impl Qwen35Layer {
         };
 
         let started = Instant::now();
-        let k_all = append_cached_kv(layer_cache.k, k, store)?;
-        let v_all = append_cached_kv(layer_cache.v, v, store)?;
-        layer_cache.k = Some(k_all);
-        layer_cache.v = Some(v_all);
+        if layer_cache.seq_cursor != q_start {
+            return Err(Qwen35Error::InvalidConfig(
+                "rollout KV cache layer cursor diverged from global cache length",
+            ));
+        }
+        let prev_kv_len = layer_cache.seq_cursor;
+        let k_cache = append_cached_kv(
+            layer_cache.k,
+            k,
+            layer_cache.max_seq_len,
+            prev_kv_len,
+            store,
+        )?;
+        let v_cache = append_cached_kv(
+            layer_cache.v,
+            v,
+            layer_cache.max_seq_len,
+            prev_kv_len,
+            store,
+        )?;
+        let kv_len = prev_kv_len + seq_len;
+        layer_cache.k = Some(k_cache);
+        layer_cache.v = Some(v_cache);
+        layer_cache.seq_cursor = kv_len;
         profile.append_kv += started.elapsed();
 
         let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
-        let kv_len = store
-            .get(k_all)
-            .ok_or(AutogradError::InvalidTensorId(k_all))?
-            .shape
-            .get(2)
-            .copied()
-            .ok_or(AutogradError::InvalidRank {
-                expected: "4",
-                got: 0,
-            })?;
-        let attn_hidden = if !tape.enabled && seq_len == 1 && q_start + 1 == kv_len && kv_len <= 32
-        {
+        let attn_hidden = if !tape.enabled && seq_len == 1 && q_start + 1 == kv_len {
             let started = Instant::now();
-            let out = causal_sdpa_decode_gqa(q, k_all, v_all, q_start, store, tape)?;
+            let out =
+                causal_sdpa_decode_gqa_cached(q, k_cache, v_cache, kv_len, q_start, store, tape)?;
             profile.sdpa += started.elapsed();
             out
         } else {
+            if prev_kv_len != 0 {
+                return Err(Qwen35Error::InvalidConfig(
+                    "rollout KV cache only supports one-token decode after the initial prompt",
+                ));
+            }
             let repeat_started = Instant::now();
-            let k_all = repeat_kv(k_all, kv_repeat, store, tape)?;
-            let v_all = repeat_kv(v_all, kv_repeat, store, tape)?;
+            let k_all = repeat_kv(k, kv_repeat, store, tape)?;
+            let v_all = repeat_kv(v, kv_repeat, store, tape)?;
             profile.repeat_kv += repeat_started.elapsed();
             let started = Instant::now();
             let out = causal_sdpa_with_q_start(q, k_all, v_all, q_start, store, tape)?;
@@ -2413,20 +2452,40 @@ fn copy_frozen_tensor(source_id: TensorId, target_id: TensorId, store: &mut Tens
 fn append_cached_kv(
     cached: Option<TensorId>,
     next: TensorId,
+    max_seq_len: usize,
+    seq_cursor: usize,
     store: &mut TensorStore,
 ) -> Result<TensorId> {
-    let Some(cached) = cached else {
-        return Ok(next);
+    let next_shape = store
+        .get(next)
+        .ok_or(AutogradError::InvalidTensorId(next))?
+        .shape
+        .clone();
+    if next_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "rank-4 KV tensor [batch, heads, seq, dim]",
+            got: next_shape.len(),
+        }
+        .into());
+    }
+    let next_seq_len = next_shape[2];
+    if seq_cursor + next_seq_len > max_seq_len {
+        return Err(Qwen35Error::InvalidConfig(
+            "rollout KV cache append exceeds preallocated max_seq_len",
+        ));
+    }
+
+    let cached = if let Some(cached) = cached {
+        cached
+    } else {
+        let cache_shape = vec![next_shape[0], next_shape[1], max_seq_len, next_shape[3]];
+        let handle = store.backend().zeros(&cache_shape)?;
+        store.alloc_device_tensor(cache_shape, handle)?
     };
 
     let cached_shape = store
         .get(cached)
         .ok_or(AutogradError::InvalidTensorId(cached))?
-        .shape
-        .clone();
-    let next_shape = store
-        .get(next)
-        .ok_or(AutogradError::InvalidTensorId(next))?
         .shape
         .clone();
 
@@ -2444,10 +2503,71 @@ fn append_cached_kv(
         .ok_or(AutogradError::TapeInvariant(
             "append_cached_kv: next tensor missing device handle",
         ))?;
-    let (out_handle, out_shape) =
-        store
-            .backend()
-            .concat_axis2(&cached_handle, &cached_shape, &next_handle, &next_shape)?;
+    let out_handle = store.backend().kv_cache_write_axis2(
+        &cached_handle,
+        &cached_shape,
+        &next_handle,
+        &next_shape,
+        seq_cursor,
+    )?;
+    store.replace_device_handle(cached, out_handle)?;
+    Ok(cached)
+}
+
+fn causal_sdpa_decode_gqa_cached(
+    q: TensorId,
+    k_cache: TensorId,
+    v_cache: TensorId,
+    kv_len: usize,
+    q_start: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    if tape.enabled {
+        return Err(AutogradError::TapeInvariant(
+            "causal_sdpa_decode_gqa_cached is rollout-only and requires tape disabled",
+        )
+        .into());
+    }
+    let q_shape = store
+        .get(q)
+        .ok_or(AutogradError::InvalidTensorId(q))?
+        .shape
+        .clone();
+    let k_shape = store
+        .get(k_cache)
+        .ok_or(AutogradError::InvalidTensorId(k_cache))?
+        .shape
+        .clone();
+    let v_shape = store
+        .get(v_cache)
+        .ok_or(AutogradError::InvalidTensorId(v_cache))?
+        .shape
+        .clone();
+    store.ensure_device(q)?;
+    store.ensure_device(k_cache)?;
+    store.ensure_device(v_cache)?;
+    let q_handle = store
+        .get(q)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "causal_sdpa_decode_gqa_cached: q missing device handle",
+        ))?;
+    let k_handle = store
+        .get(k_cache)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "causal_sdpa_decode_gqa_cached: k missing device handle",
+        ))?;
+    let v_handle = store
+        .get(v_cache)
+        .and_then(|tensor| tensor.device_handle.clone())
+        .ok_or(AutogradError::TapeInvariant(
+            "causal_sdpa_decode_gqa_cached: v missing device handle",
+        ))?;
+    let (out_handle, out_shape) = store.backend().causal_sdpa_decode_gqa_cache(
+        &q_handle, &q_shape, &k_handle, &k_shape, &v_handle, &v_shape, kv_len, q_start,
+    )?;
     Ok(store.alloc_device_tensor(out_shape, out_handle)?)
 }
 
@@ -2899,8 +3019,8 @@ mod tests {
         let cfg = tiny_qwen35_config(16);
         let model = Qwen35Model::new_for_eval(&cfg, &mut store)?;
         let vocab = cfg.vocab_size;
-        let mut cache = Qwen35KvCache::new(&model);
         let mut rollout = vec![1_u32, 3, 8];
+        let mut cache = Qwen35KvCache::new(&model, rollout.len() + 5);
 
         for step in 0..5 {
             let full_positions = (0..rollout.len() as u32).collect::<Vec<_>>();
