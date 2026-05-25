@@ -333,7 +333,7 @@ fn jsonl_sink_serializes_lifecycle_events() {
         let mut sink = JsonlSink::create(&path).expect("create jsonl");
         let strings = [
             ("run_id", "run-123"),
-            ("job", "train_sft"),
+            ("job", "opd"),
             ("artifact_model", "model.safetensors"),
         ];
         let scalars = [("total_steps", 5.0), ("best_reward", f64::NAN)];
@@ -354,7 +354,7 @@ fn jsonl_sink_serializes_lifecycle_events() {
     assert_eq!(value["kind"], serde_json::json!("run_start"));
     assert_eq!(value["step"], serde_json::json!(3));
     assert_eq!(value["run_id"], serde_json::json!("run-123"));
-    assert_eq!(value["job"], serde_json::json!("train_sft"));
+    assert_eq!(value["job"], serde_json::json!("opd"));
     assert_eq!(
         value["artifact_model"],
         serde_json::json!("model.safetensors")
@@ -709,7 +709,7 @@ fn mlflow_sink_posts_run_metrics_and_run_end() {
     sink.event(&TrainEvent {
         kind: "run_start",
         step: Some(0),
-        strings: &[("run_id", "local-run"), ("job", "train_sft")],
+        strings: &[("run_id", "local-run"), ("job", "opd")],
         scalars: &[("total_steps", 2.0)],
         bools: &[("resumed", false)],
     });
@@ -824,7 +824,7 @@ fn mlflow_sink_uploads_checkpoint_artifacts_when_enabled() {
     sink.event(&TrainEvent {
         kind: "run_start",
         step: Some(0),
-        strings: &[("run_id", "artifact-run"), ("job", "train_sft")],
+        strings: &[("run_id", "artifact-run"), ("job", "opd")],
         scalars: &[("total_steps", 2.0)],
         bools: &[],
     });
