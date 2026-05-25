@@ -23,6 +23,43 @@ use cuda_kernels::tensor::{CudaAllocTraceExt, WeightFormat};
 use crate::ops::LinearDispatchPhase;
 
 const MARLIN_MAX_PAR: usize = 16;
+const MARLIN_ERR_ARCH_LEGACY: i32 = 3;
+const CUDA_ERROR_NOT_SUPPORTED_CODE: i32 =
+    cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED as i32;
+
+#[allow(clippy::too_many_arguments)]
+fn check_marlin_status(
+    ret: i32,
+    kernel: &'static str,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+    dev: i32,
+    sms: i32,
+    thread_k: i32,
+    thread_n: i32,
+    max_par: i32,
+) -> Result<()> {
+    if ret == 0 {
+        return Ok(());
+    }
+    let architectural_deferral =
+        ret == CUDA_ERROR_NOT_SUPPORTED_CODE || ret == MARLIN_ERR_ARCH_LEGACY;
+    let cuda_err = match ret {
+        CUDA_ERROR_NOT_SUPPORTED_CODE => "CUDA_ERROR_NOT_SUPPORTED",
+        MARLIN_ERR_ARCH_LEGACY => "MARLIN_ERR_ARCH_LEGACY",
+        1 => "CUDA_ERROR_INVALID_VALUE",
+        2 => "CUDA_ERROR_OUT_OF_MEMORY",
+        700 => "CUDA_ERROR_ILLEGAL_ADDRESS",
+        701 => "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES",
+        719 => "CUDA_ERROR_LAUNCH_FAILED",
+        _ => "CUDA_ERROR_UNKNOWN",
+    };
+    Err(anyhow::anyhow!(
+        "kernel={kernel} cuda_err={cuda_err} code={ret} architectural_deferral={architectural_deferral} params=m={m} n={n} k={k} group_size={group_size} dev={dev} sms={sms} thread_k={thread_k} thread_n={thread_n} max_par={max_par}"
+    ))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinearKernelPlan {
@@ -1267,7 +1304,19 @@ fn run_marlin_w4_linear(
                 16,
             )
         };
-        anyhow::ensure!(ret == 0, "marlin_gemm_cuda failed with code {ret}");
+        check_marlin_status(
+            ret,
+            "marlin_gemm_cuda",
+            m,
+            n,
+            k,
+            weight.group_size,
+            ctx.ordinal() as i32,
+            sms,
+            -1,
+            -1,
+            16,
+        )?;
     }
 
     {
@@ -1370,7 +1419,19 @@ fn run_marlin_w4_linear_with_scratch(
                 MARLIN_MAX_PAR as i32,
             )
         };
-        anyhow::ensure!(ret == 0, "marlin_gemm_cuda failed with code {ret}");
+        check_marlin_status(
+            ret,
+            "marlin_gemm_cuda",
+            m,
+            n,
+            k,
+            weight.group_size,
+            ctx.ordinal() as i32,
+            sms,
+            -1,
+            -1,
+            MARLIN_MAX_PAR as i32,
+        )?;
     }
 
     {
@@ -1496,7 +1557,19 @@ fn run_marlin_w4a8_linear(
                 max_par as i32,
             )
         };
-        anyhow::ensure!(ret == 0, "gemm_w4a8_marlin_cuda failed with code {ret}");
+        check_marlin_status(
+            ret,
+            "gemm_w4a8_marlin_cuda",
+            m,
+            n,
+            k,
+            weight.group_size,
+            ctx.ordinal() as i32,
+            sms,
+            thread_k,
+            thread_n,
+            max_par as i32,
+        )?;
     }
 
     {
@@ -1646,7 +1719,19 @@ fn run_marlin_w4a8_linear_with_scratch(
                 MARLIN_MAX_PAR as i32,
             )
         };
-        anyhow::ensure!(ret == 0, "gemm_w4a8_marlin_cuda failed with code {ret}");
+        check_marlin_status(
+            ret,
+            "gemm_w4a8_marlin_cuda",
+            m,
+            n,
+            k,
+            weight.group_size,
+            ctx.ordinal() as i32,
+            sms,
+            thread_k,
+            thread_n,
+            MARLIN_MAX_PAR as i32,
+        )?;
     }
 
     {
@@ -1774,7 +1859,19 @@ fn run_marlin_w4_fp8_prefill(
                 max_par as i32,
             )
         };
-        anyhow::ensure!(ret == 0, "gemm_w4_fp8_marlin_cuda failed with code {ret}");
+        check_marlin_status(
+            ret,
+            "gemm_w4_fp8_marlin_cuda",
+            m,
+            n,
+            k,
+            weight.group_size,
+            ctx.ordinal() as i32,
+            sms,
+            -1,
+            -1,
+            max_par as i32,
+        )?;
     }
     {
         let (yf_ptr, _g1) = y_fp16.device_ptr(&ctx.stream);

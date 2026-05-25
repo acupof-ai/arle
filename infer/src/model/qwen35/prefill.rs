@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::sync::OnceLock;
+
+use anyhow::{Context, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 use super::forward::Qwen35State;
@@ -11,8 +13,30 @@ use super::weights::{
 use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::{KVCache, KVFormat};
 use crate::ops;
-use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
+use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::{TokenKVPool, ffi, kv_quant};
+
+fn qwen35_cuda_debug_sync_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("ARLE_CUDA_DEBUG_SYNC")
+            .and_then(|value| value.into_string().ok())
+            .map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                !value.is_empty() && value != "0" && value != "false" && value != "off"
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn qwen35_cuda_debug_sync(ctx: &DeviceContext, label: impl AsRef<str>) -> Result<()> {
+    if qwen35_cuda_debug_sync_enabled() {
+        let label = label.as_ref();
+        ctx.sync()
+            .with_context(|| format!("CUDA debug sync after {label}"))?;
+    }
+    Ok(())
+}
 
 pub(super) struct Qwen35PagedPrefillRequest<'a> {
     pub tokens: &'a [u32],
@@ -410,7 +434,7 @@ impl Qwen35Model {
 
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
-        for layer in &self.layers {
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
             let eps = self.config.rms_norm_eps;
             ops::rms_norm_batch_offset_into(
                 &self.ctx,
@@ -427,14 +451,28 @@ impl Qwen35Model {
                     pool,
                     sequences,
                     bufs,
-                )?,
+                )
+                .with_context(|| {
+                    format!(
+                        "qwen35 paged prefill full-attention layer_idx={layer_idx} full_idx={full_idx} batch_size={} seq_len={}",
+                        requests.len(),
+                        bufs.seq_len
+                    )
+                })?,
                 LayerKind::LinearAttention(attn) => self.prefill_linear_attention_paged_batch(
                     attn,
                     &mut linear_idx,
                     requests,
                     states,
                     bufs,
-                )?,
+                )
+                .with_context(|| {
+                    format!(
+                        "qwen35 paged prefill linear-attention layer_idx={layer_idx} linear_idx={linear_idx} batch_size={} seq_len={}",
+                        requests.len(),
+                        bufs.seq_len
+                    )
+                })?,
             }
             self.layer_communicator
                 .post_attn_all_reduce_hidden_states(&mut bufs.attn_results)?;
@@ -563,7 +601,20 @@ impl Qwen35Model {
                     nrp.rms_eps,
                     self.ctx.stream.cu_stream(),
                 )
-                .result()?;
+                .result()
+                .with_context(|| {
+                    format!(
+                        "prefill_attention_paged_prep_hd256_cuda layer={full_idx} batch_idx={batch_idx} seq_len={} start_pos={}",
+                        seq.seq_len, seq.start_pos
+                    )
+                })?;
+                qwen35_cuda_debug_sync(
+                    &self.ctx,
+                    format!(
+                        "prefill_attention_paged_prep_hd256_cuda layer={full_idx} batch_idx={batch_idx} seq_len={} start_pos={}",
+                        seq.seq_len, seq.start_pos
+                    ),
+                )?;
             }
         }
 
@@ -603,6 +654,19 @@ impl Qwen35Model {
                 pool.page_size,
                 max_qlen,
                 total_pages,
+            )
+            .with_context(|| {
+                format!(
+                    "tilelang hd256 paged prefill layer={full_idx} batch_size={} seq_len={} max_qlen={max_qlen} total_pages={total_pages}",
+                    bufs.metadata.batch_size, bufs.seq_len
+                )
+            })?;
+            qwen35_cuda_debug_sync(
+                &self.ctx,
+                format!(
+                    "tilelang hd256 paged prefill layer={full_idx} batch_size={} seq_len={} max_qlen={max_qlen} total_pages={total_pages}",
+                    bufs.metadata.batch_size, bufs.seq_len
+                ),
             )?;
         }
         self.commit_fp8_paged_prefill_if_needed(pool, *full_idx, bufs)?;
@@ -617,7 +681,20 @@ impl Qwen35Model {
                 bufs.seq_len as i32,
                 self.ctx.stream.cu_stream(),
             )
-            .result()?;
+            .result()
+            .with_context(|| {
+                format!(
+                    "attention_gate_batch_hd256_cuda layer={full_idx} seq_len={}",
+                    bufs.seq_len
+                )
+            })?;
+            qwen35_cuda_debug_sync(
+                &self.ctx,
+                format!(
+                    "attention_gate_batch_hd256_cuda layer={full_idx} seq_len={}",
+                    bufs.seq_len
+                ),
+            )?;
         }
 
         *full_idx += 1;
@@ -722,6 +799,21 @@ impl Qwen35Model {
                 key_dim: c.linear_key_head_dim,
                 val_dim: c.linear_value_head_dim,
             },
+        )
+        .with_context(|| {
+            format!(
+                "gated_delta_rule_prefill_chunkwise_batch_into linear_layer={linear_idx} batch_size={} seq_len={}",
+                requests.len(),
+                bufs.seq_len
+            )
+        })?;
+        qwen35_cuda_debug_sync(
+            &self.ctx,
+            format!(
+                "gated_delta_rule_prefill_chunkwise_batch_into linear_layer={linear_idx} batch_size={} seq_len={}",
+                requests.len(),
+                bufs.seq_len
+            ),
         )?;
         ops::rms_norm_gated_batch_into(
             &self.ctx,
@@ -1100,7 +1192,20 @@ impl Qwen35Model {
                 nrp.rms_eps,
                 self.ctx.stream.cu_stream(),
             )
-            .result()?;
+            .result()
+            .with_context(|| {
+                format!(
+                    "prefill_attention_paged_prep_hd256_cuda layer={full_idx} seq_len={} max_qlen={}",
+                    bufs.seq_len, bufs.seq_len
+                )
+            })?;
+            qwen35_cuda_debug_sync(
+                &self.ctx,
+                format!(
+                    "prefill_attention_paged_prep_hd256_cuda layer={full_idx} seq_len={} max_qlen={}",
+                    bufs.seq_len, bufs.seq_len
+                ),
+            )?;
         }
 
         {
@@ -1139,6 +1244,19 @@ impl Qwen35Model {
                 pool.page_size,
                 max_qlen,
                 total_pages,
+            )
+            .with_context(|| {
+                format!(
+                    "tilelang hd256 paged prefill layer={full_idx} batch_size=1 seq_len={} max_qlen={max_qlen} total_pages={total_pages}",
+                    bufs.seq_len
+                )
+            })?;
+            qwen35_cuda_debug_sync(
+                &self.ctx,
+                format!(
+                    "tilelang hd256 paged prefill layer={full_idx} batch_size=1 seq_len={} max_qlen={max_qlen} total_pages={total_pages}",
+                    bufs.seq_len
+                ),
             )?;
         }
         self.commit_fp8_paged_prefill_if_needed(pool, *full_idx, bufs)?;
@@ -1153,7 +1271,20 @@ impl Qwen35Model {
                 bufs.seq_len as i32,
                 self.ctx.stream.cu_stream(),
             )
-            .result()?;
+            .result()
+            .with_context(|| {
+                format!(
+                    "attention_gate_batch_hd256_cuda layer={full_idx} seq_len={}",
+                    bufs.seq_len
+                )
+            })?;
+            qwen35_cuda_debug_sync(
+                &self.ctx,
+                format!(
+                    "attention_gate_batch_hd256_cuda layer={full_idx} seq_len={}",
+                    bufs.seq_len
+                ),
+            )?;
         }
 
         *full_idx += 1;
@@ -1274,6 +1405,19 @@ impl Qwen35Model {
                 key_dim: c.linear_key_head_dim,
                 val_dim: c.linear_value_head_dim,
             },
+        )
+        .with_context(|| {
+            format!(
+                "gated_delta_rule_prefill_chunkwise_into linear_layer={linear_idx} seq_len={}",
+                bufs.seq_len
+            )
+        })?;
+        qwen35_cuda_debug_sync(
+            &self.ctx,
+            format!(
+                "gated_delta_rule_prefill_chunkwise_into linear_layer={linear_idx} seq_len={}",
+                bufs.seq_len
+            ),
         )?;
         ops::rms_norm_gated_batch_into(
             &self.ctx,
