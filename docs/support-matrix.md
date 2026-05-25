@@ -161,8 +161,8 @@ Code lives in `infer/src/prefix_cache.rs` (radix tree) and
 
 | Surface | Status | Notes |
 | --- | --- | --- |
-| `arle train opd` | **Substrate landing** | OPD command stub is in tree; full teacher-student loop ships next milestone. Substrate kept: `Trainer<O, C, S>`, HF-style checkpoint codec, tokenizer load, `/v1/train/*` control plane, LoRA, `crates/autograd` device-resident gradient kernels (Wave 1–2.x). |
-| `arle train env` / `arle train estimate-memory` | Supported | Diagnostic surfaces preserved across the OPD-only pivot. `arle train test` was retired with the legacy `convert→pretrain→sft→eval` fixture and will return as an OPD smoke fixture once the substrate lands. |
+| `arle train opd` | **Supported (Beta)** | End-to-end CLI shipped 2026-05-24 (`14c3be9`): `arle train opd --student-model <dir> --teacher-model <dir>` runs HF/ModelScope-cached models through `qwen35_loader` + autograd `Tape` + `opd_step` + AdamW directly, no example script needed. CUDA backend. Wins: [`2026-05-24-arle-train-opd-from-dirs`](experience/wins/2026-05-24-arle-train-opd-from-dirs.md). Live task queue tracked in [`2026-05-24-opd-mainline-task-backlog`](projects/2026-05-24-opd-mainline-task-backlog.md). |
+| `arle train env` / `arle train estimate-memory` | Supported | Diagnostic surfaces preserved across the OPD-only pivot. `arle train test` was retired permanently in the 2026-05-24 T3 prune (`81842cc`); the test stubs were removed in `cli_smoke` cleanup (`e049787`). |
 | Infer-side unified `/v1/train/*` bridge | Supported (optional proxy) | `infer` exposes `/v1/train/status|events|stop|save` when `--train-control-url http://...` is configured, forwarding to the train-side server in `crates/train/src/server.rs`. Will host OPD progress events when the substrate lands. |
 
 ---
