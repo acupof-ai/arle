@@ -62,30 +62,30 @@ pub struct RelayCoordinator {
     workers: Vec<TcpStream>,
 }
 
-impl RelayCoordinator {
-    /// Bind to a free port and accept exactly `world_size - 1` worker
-    /// connections. Blocks until all workers connect or `accept_timeout`
-    /// elapses (returns error on timeout).
-    ///
-    /// `world_size` is the FULL distributed world (coordinator + workers);
-    /// the coordinator itself doesn't connect to its own listener.
-    pub fn bind_and_accept(world_size: usize, accept_timeout: Duration) -> Result<Self> {
+/// Pending coordinator state — listener is bound and port is known but
+/// workers have not yet connected. Caller uses this to publish the port
+/// (env var, file, etc.) so children can connect, then calls
+/// `accept(world_size, timeout)` to finalize a `RelayCoordinator`.
+pub struct PendingRelayCoordinator {
+    port: u16,
+    listener: TcpListener,
+}
+
+impl PendingRelayCoordinator {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn accept(self, world_size: usize, accept_timeout: Duration) -> Result<RelayCoordinator> {
         if world_size < 2 {
             bail!("RelayCoordinator needs world_size >= 2 (got {world_size})");
         }
-        let port = pick_free_port()?;
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .with_context(|| format!("RelayCoordinator bind port {port}"))?;
-        listener
-            .set_nonblocking(true)
-            .context("RelayCoordinator set_nonblocking on listener")?;
-
         let expected = world_size - 1;
         let mut workers = Vec::with_capacity(expected);
         let deadline = Instant::now() + accept_timeout;
 
         while workers.len() < expected {
-            match listener.accept() {
+            match self.listener.accept() {
                 Ok((stream, addr)) => {
                     stream
                         .set_nonblocking(false)
@@ -111,7 +111,37 @@ impl RelayCoordinator {
                 Err(err) => return Err(err).context("RelayCoordinator accept"),
             }
         }
-        Ok(Self { port, workers })
+        Ok(RelayCoordinator {
+            port: self.port,
+            workers,
+        })
+    }
+}
+
+impl RelayCoordinator {
+    /// Bind to a free port WITHOUT yet accepting any worker connections.
+    /// Returns a `PendingRelayCoordinator` whose port can be published to
+    /// children (env var, file). Call `pending.accept(world_size, timeout)`
+    /// after spawning workers to finalize.
+    ///
+    /// Two-phase API exists because coordinator must `bind` before spawning
+    /// workers (so child env carries the port) but `accept` must happen
+    /// after spawn (children need to connect first).
+    pub fn bind() -> Result<PendingRelayCoordinator> {
+        let port = pick_free_port()?;
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .with_context(|| format!("RelayCoordinator bind port {port}"))?;
+        listener
+            .set_nonblocking(true)
+            .context("RelayCoordinator set_nonblocking on listener")?;
+        Ok(PendingRelayCoordinator { port, listener })
+    }
+
+    /// Convenience: bind + accept in one call. Only useful when the
+    /// children are already running (e.g. in tests where both sides race
+    /// at startup).
+    pub fn bind_and_accept(world_size: usize, accept_timeout: Duration) -> Result<Self> {
+        Self::bind()?.accept(world_size, accept_timeout)
     }
 
     pub fn port(&self) -> u16 {

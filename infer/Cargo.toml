@@ -203,6 +203,10 @@ name = "multiproc_nccl_smoke"
 path = "src/bin/multiproc_nccl_smoke.rs"
 required-features = ["cuda", "nccl"]
 
+[[bin]]
+name = "multiproc_relay_smoke"
+path = "src/bin/multiproc_relay_smoke.rs"
+
 [[example]]
 name = "regenerate_test_data"
 path = "examples/regenerate_test_data.rs"
