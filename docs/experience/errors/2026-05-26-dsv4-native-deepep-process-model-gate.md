@@ -61,15 +61,15 @@ direction is:
 ## Artifacts
 
 - Same-process native DeepEP LL gate:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-ll-sameprocess-gate-20260526`
+  `dsv4-deepep-ll-sameprocess-gate-20260526`
 - Official DeepEP low-latency DSv4-shape gate:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-ll-standalone-t1-h4096-topk8-e256-20260526/test_low_latency.log`
+  `dsv4-deepep-ll-standalone-t1-h4096-topk8-e256-20260526/test_low_latency.log`
 - Same-process DeepEP intranode gate:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-intranode-sameprocess-gate-20260526`
+  `dsv4-deepep-intranode-sameprocess-gate-20260526`
 - Same-process DeepEP intranode context-reset gate:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-intranode-sameprocess-gate2-20260526`
+  `dsv4-deepep-intranode-sameprocess-gate2-20260526`
 - Official DeepEP intranode DSv4-shape gate:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-intranode-standalone-t1-h4096-topk6-e256-20260526/test_intranode.log`
+  `dsv4-deepep-intranode-standalone-t1-h4096-topk6-e256-20260526/test_intranode.log`
 
 ## Rule
 

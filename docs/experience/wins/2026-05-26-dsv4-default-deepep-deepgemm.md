@@ -101,13 +101,13 @@ time is below the NCCL/D2H/API-sync costs:
 ## Artefacts
 
 - Remote env-check:
-  `/sgl-workspace/bench-artifacts/dsv4-default-deepep-envcheck-20260526-2.log`
+  `dsv4-default-deepep-envcheck-20260526-2.log`
 - Remote build:
-  `/sgl-workspace/bench-artifacts/dsv4-default-deepep-build-20260526`
+  `dsv4-default-deepep-build-20260526`
 - Remote smoke:
-  `/sgl-workspace/bench-artifacts/dsv4-default-deepep-smoke-max32-20260526`
+  `dsv4-default-deepep-smoke-max32-20260526`
 - Remote nsys:
-  `/sgl-workspace/bench-artifacts/dsv4-default-deepep-nsys-max32-20260526`
+  `dsv4-default-deepep-nsys-max32-20260526`
 
 ## Learnings
 

@@ -109,19 +109,19 @@ NVTX ranges:
 ## Artifacts
 
 - Build:
-  `/sgl-workspace/bench-artifacts/dsv4-device-count-build-20260526`
+  `dsv4-device-count-build-20260526`
 - Control smoke:
-  `/sgl-workspace/bench-artifacts/dsv4-device-count-off-smoke-max32-20260526`
+  `dsv4-device-count-off-smoke-max32-20260526`
 - Device-count smoke:
-  `/sgl-workspace/bench-artifacts/dsv4-device-count-on-smoke-max32-20260526`
+  `dsv4-device-count-on-smoke-max32-20260526`
 - Control nsys:
-  `/sgl-workspace/bench-artifacts/dsv4-device-count-off-nsys-max32-20260526`
+  `dsv4-device-count-off-nsys-max32-20260526`
 - Device-count nsys:
-  `/sgl-workspace/bench-artifacts/dsv4-device-count-on-nsys-max32-20260526`
+  `dsv4-device-count-on-nsys-max32-20260526`
 - Default-on rebuild:
-  `/sgl-workspace/bench-artifacts/dsv4-device-count-default-build-20260526`
+  `dsv4-device-count-default-build-20260526`
 - Default-unset smoke:
-  `/sgl-workspace/bench-artifacts/dsv4-device-count-default-smoke-max32-20260526`
+  `dsv4-device-count-default-smoke-max32-20260526`
 
 ## Rule
 

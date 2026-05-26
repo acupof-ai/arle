@@ -82,13 +82,13 @@ The new `dsv4_exclusive_scan_i32_kernel` is tiny in this trace:
 ## Artefacts
 
 - HTTP short A/B:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-phase1-http-20260526-030520`
+  `dsv4-a3-phase1-http-20260526-030520`
 - nsys off:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-phase1-nsys-mode0-20260526-030633`
+  `dsv4-a3-phase1-nsys-mode0-20260526-030633`
 - nsys on:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-phase1-nsys-mode1-20260526-030732`
+  `dsv4-a3-phase1-nsys-mode1-20260526-030732`
 - longseq A/B:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-phase1-longseq-20260526-031102`
+  `dsv4-a3-phase1-longseq-20260526-031102`
 
 ## Learnings
 

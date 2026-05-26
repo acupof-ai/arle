@@ -63,15 +63,15 @@ Greedy output stayed stable for the profiled request:
 ## Artefacts
 
 - Before default DeepEP + DeepGEMM nsys:
-  `/sgl-workspace/bench-artifacts/dsv4-default-deepep-nsys-max32-20260526`
+  `dsv4-default-deepep-nsys-max32-20260526`
 - Before default DeepEP + DeepGEMM smoke:
-  `/sgl-workspace/bench-artifacts/dsv4-default-deepep-smoke-max32-20260526`
+  `dsv4-default-deepep-smoke-max32-20260526`
 - After build:
-  `/sgl-workspace/bench-artifacts/dsv4-deepgemm-prop-cache-build-20260526`
+  `dsv4-deepgemm-prop-cache-build-20260526`
 - After smoke:
-  `/sgl-workspace/bench-artifacts/dsv4-deepgemm-prop-cache-smoke-max32-20260526`
+  `dsv4-deepgemm-prop-cache-smoke-max32-20260526`
 - After nsys:
-  `/sgl-workspace/bench-artifacts/dsv4-deepgemm-prop-cache-nsys-max32-20260526`
+  `dsv4-deepgemm-prop-cache-nsys-max32-20260526`
 
 ## Learnings
 

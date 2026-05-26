@@ -70,19 +70,19 @@ This is a narrow-window win, not a shippable default: wall-clock framing wins.
 ## Artifacts
 
 - DeepEP baseline nsys:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-deepep-unsafe-baseline-nsys-20260526-114229`
+  `dsv4-a3-deepep-unsafe-baseline-nsys-20260526-114229`
 - Pre-fix route-grouped nsys:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-deepep-unsafe-routegrouped-nsys-20260526-114342`
+  `dsv4-a3-deepep-unsafe-routegrouped-nsys-20260526-114342`
 - Pre-fix longseq A/B:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-deepep-routegrouped-longseq-20260526-034841`
+  `dsv4-a3-deepep-routegrouped-longseq-20260526-034841`
 - Fixed longseq `max_tokens=64`:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-routegrouped-scale-fix-long64-20260526-040659`
+  `dsv4-a3-routegrouped-scale-fix-long64-20260526-040659`
 - Fixed longseq `max_tokens=32` A/B:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-routegrouped-scale-fix-long32-ab-20260526-040949`
+  `dsv4-a3-routegrouped-scale-fix-long32-ab-20260526-040949`
 - Fixed nsys:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-routegrouped-scale-fix-nsys-20260526-121432`
+  `dsv4-a3-routegrouped-scale-fix-nsys-20260526-121432`
 - Fixed short HTTP A/B:
-  `/sgl-workspace/bench-artifacts/dsv4-a3-deepep-routegrouped-http-20260526-041546`
+  `dsv4-a3-deepep-routegrouped-http-20260526-041546`
 
 ## Rule
 

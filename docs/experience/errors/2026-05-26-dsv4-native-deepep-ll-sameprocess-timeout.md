@@ -65,11 +65,11 @@ same-process or multi-process runtime contract is designed and verified.
 ## Artifacts
 
 - Same-process native DeepEP LL gate:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-ll-sameprocess-gate-20260526`
+  `dsv4-deepep-ll-sameprocess-gate-20260526`
 - Official DeepEP low-latency DSv4-shape gate:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-ll-standalone-t1-h4096-topk8-e256-20260526/test_low_latency.log`
+  `dsv4-deepep-ll-standalone-t1-h4096-topk8-e256-20260526/test_low_latency.log`
 - Default env-check:
-  `/sgl-workspace/bench-artifacts/dsv4-default-deepep-envcheck-after-default-request-20260526.log`
+  `dsv4-default-deepep-envcheck-after-default-request-20260526.log`
 
 ## Rule
 
