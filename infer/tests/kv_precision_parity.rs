@@ -43,7 +43,21 @@ const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B")
 // flagged as FP8's remaining failure mode. Short one-liner prompts only
 // touch a single KV page and let the FP8 token-1 divergence bug hide behind
 // a length-1 common prefix.
+//
+// Prompt 0 is a natural-continuation prompt (encyclopedic style) that a
+// base LM (no instruction tuning) can continue coherently under greedy
+// decode. The remaining instruction-style prompts in this array trigger
+// the Qwen3-4B base + greedy degenerate `!`-loop documented in
+// `docs/experience/errors/2026-05-26-fp8-kv-catastrophic-was-test-artifact.md`
+// and would invalidate the audit if used in isolation. The
+// degenerate-baseline guard in `kv_precision_parity_audit` warns when
+// any prompt's reference is a single-token repetition.
 const DEFAULT_PROMPTS: &[&str] = &[
+    "The Eiffel Tower is a wrought-iron lattice tower located on the Champ de Mars in Paris, \
+     France. It was designed by the engineer Gustave Eiffel and built between 1887 and 1889 as \
+     the entrance to the 1889 World's Fair. Standing at 330 metres tall, the tower remained the \
+     tallest man-made structure in the world for 41 years, until the completion of the Chrysler \
+     Building in New York in 1930. Today, the Eiffel Tower is one of the most",
     "Explain in detail how a transformer language model performs causal attention during decode. \
      Cover: KV caching, the role of the attention mask, why the past keys and values are reused, \
      and how rotary position embedding interacts with cached positions. Begin step by step.",
@@ -241,8 +255,16 @@ fn make_request(
     // degenerate loop so the BF16 reference becomes a real text
     // trajectory. See `docs/experience/errors/2026-05-26-fp8-kv-
     // catastrophic-was-test-artifact.md` for the full retract + rule.
-    let mut sampling = SamplingParams::default(); // greedy
-    sampling.repetition_penalty = 1.1;
+    let sampling = SamplingParams::default(); // greedy
+    // Note: repetition_penalty is implemented in sampler.rs::apply_penalties
+    // but ONLY wired into the pure-Rust unit-test path — the CUDA
+    // production sampler does not apply it. Verified A100 audit
+    // 1779809061: setting repetition_penalty=1.3 had no effect on BF16's
+    // `!`-token loop. Until the CUDA sampler grows penalty support, the
+    // only ways to avoid the degenerate-baseline regime are (a) use
+    // prompts a base LM can continue coherently under greedy (handled in
+    // DEFAULT_PROMPTS — prompt 0 is now a natural-continuation prompt),
+    // or (b) switch to an instruct-tuned model variant.
     let req = IncomingRequest {
         prompt: prompt.to_string(),
         prompt_tokens: None,
