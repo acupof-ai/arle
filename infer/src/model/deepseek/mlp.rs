@@ -1180,7 +1180,17 @@ enum Dsv4ExpertBackend {
 #[cfg(feature = "cuda")]
 fn dsv4_expert_backend() -> Result<Dsv4ExpertBackend> {
     let Some(raw) = std::env::var("ARLE_DSV4_EXPERT_BACKEND").ok() else {
-        return Ok(Dsv4ExpertBackend::Native);
+        let moe_backend = std::env::var("ARLE_DSV4_MOE_BACKEND")
+            .unwrap_or_else(|_| "deepep".to_string())
+            .to_ascii_lowercase();
+        match moe_backend.as_str() {
+            "" | "deepep" | "deepep_unsafe" | "unsafe_deepep" | "dispatch" | "dispatch_combine"
+            | "dispatch_unsafe" => return Ok(Dsv4ExpertBackend::DeepGemmAuto),
+            "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => {
+                return Ok(Dsv4ExpertBackend::Native);
+            }
+            other => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{other}`"),
+        }
     };
     match raw.to_ascii_lowercase().as_str() {
         "" | "native" | "gemv" | "raw-gemv" | "raw_gemv" => Ok(Dsv4ExpertBackend::Native),
