@@ -223,6 +223,12 @@ Phase 3 估算：~2-3 天（DeepEP API 调研 + 重构 + 多卡 bench）。
   byte-identical grouped expert compute are validated. Default-path build,
   `max_tokens=32` smoke, and nsys evidence:
   [`../experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md`](../experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md).
+- 2026-05-26 DeepGEMM native bridge now caches `cudaDeviceProp` per thread and
+  current CUDA device. This removes `cudaGetDeviceProperties_v2_v12000` from
+  the hot decode API frame and improves `max_tokens=32` smoke wall-clock
+  12.1466 s → 8.2378 s, but does not complete A3 because D2H calls remain.
+  Evidence:
+  [`../experience/wins/2026-05-26-dsv4-deepgemm-device-prop-cache.md`](../experience/wins/2026-05-26-dsv4-deepgemm-device-prop-cache.md).
 
 ## Cross-refs
 
