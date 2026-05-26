@@ -315,6 +315,34 @@ sites dominate. The actionable target is therefore structural
 amortization across many per-layer GEMMs (or a broader linear-attn
 backward kernel), not a one-off replacement for a single projection.
 
+### Phase 2A.2 — `LinearAttention` sub-op attribution
+
+The same `9efc40be` profile pass splits `LinearAttention` backward into
+the parts that matter for kernel selection. `41ca68ef fix(train):
+reduce LinearAttention profile overhead` then moved profile map updates
+out of the inner parameter-gradient loops so the timing rows measure
+the work instead of the profiler bookkeeping.
+
+Final `wG-windowed-attribution` aggregate:
+
+| sub-op | calls | count | seconds | % LinearAttention |
+|---|---:|---:|---:|---:|
+| `scan_state_history` | 30 | 30 | 42.9 | 57.8 % |
+| `fwd_recompute` | 30 | 30 | 27.9 | 37.6 % |
+| `param_grad_accum` | 30 | 60 | 3.2 | 4.3 % |
+| `host_materialize` | 30 | 30 | 0.2 | 0.3 % |
+| `grad_alloc` | 30 | 30 | 0.0 | 0.1 % |
+| `grad_pack` | 30 | 30 | 0.0 | 0.0 % |
+
+Verdict: the first CUDA spike for train-side linear attention should
+target the state-history scan/backward chain. It is the largest
+internal component and is also the most Volta-hostile part of the
+current fallback. Fusing only parameter-gradient accumulation is not
+licensed: it is ~4 % of `LinearAttention`, ~1.8 % of backward, and
+less than 1 % of train-step wall-clock. Forward-intermediate recompute
+is the second target if the scan kernel does not move enough wall-clock
+time.
+
 ## Headline (updated)
 
 Route B is now end-to-end:
