@@ -9,3 +9,7 @@ pub use cuda_kernels::{ffi, paged_kv, prelude, tensor, tilelang, turboquant_stat
 #[cfg(feature = "cuda")]
 #[path = "cuda/bootstrap.rs"]
 pub mod bootstrap;
+
+#[cfg(feature = "cuda")]
+#[path = "cuda/deepep_sidecar.rs"]
+pub mod deepep_sidecar;
