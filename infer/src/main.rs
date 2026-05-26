@@ -309,6 +309,25 @@ fn main() {
     let args = Args::parse();
     apply_quant_format_override(&args);
     logging::init_default();
+
+    // Phase B-1 multiproc-serve worker entry. When ARLE_WORKER_RANK is set
+    // (by the coordinator before spawning this process), we're a worker
+    // process for rank R>0: skip HTTP / tokenizer / tokio, just join the
+    // NCCL group at our rank and run the scheduler loop until parent dies.
+    // See docs/plans/2026-05-27-multiproc-serve-pivot.md §B-1.
+    if let Ok(rank_str) = std::env::var("ARLE_WORKER_RANK") {
+        let rank: usize = rank_str
+            .parse()
+            .unwrap_or_else(|e| panic!("ARLE_WORKER_RANK={rank_str} parse: {e}"));
+        if rank > 0 {
+            run_worker_mode(&args, rank)
+                .unwrap_or_else(|err| panic!("worker rank {rank} failed: {err:#}"));
+            return;
+        }
+        // rank == 0 falls through to the normal path; the coordinator
+        // also identifies as rank 0 internally.
+    }
+
     if args.deepseek_distributed_generate {
         run_deepseek_distributed_generate(&args)
             .unwrap_or_else(|err| panic!("DeepSeek distributed generate failed: {err:#}"));
@@ -321,6 +340,67 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime");
     runtime.block_on(async_main(args));
+}
+
+/// Worker-mode entry for multiproc-serve (phase B-1 scaffolding).
+///
+/// Invoked by the coordinator's `std::process::Command::current_exe()` with
+/// `ARLE_WORKER_RANK=R` (R > 0). Workers skip the HTTP server, tokenizer,
+/// and tokio runtime. They join NCCL at their rank via the existing
+/// `EnvBootstrap` (MASTER_ADDR/PORT/WORLD_SIZE env, set by the coordinator)
+/// and run a single scheduler thread bound to one CUDA device.
+///
+/// This skeleton does **not** yet handle request relay from rank-0 — phase
+/// B-1 commit C wires the NCCL `broadcast_bytes` of bincode-serialized
+/// `StepPlan` messages into the scheduler's request_rx. Today the worker
+/// boots, idles until the parent process closes the file-descriptor it
+/// inherited from the coordinator's spawn, then exits.
+///
+/// Exit semantics: the worker blocks on a `read()` of fd `ARLE_WORKER_PARENT_FD`
+/// (set to a pipe write-end the coordinator holds). When the coordinator
+/// dies or closes the pipe, the read returns EOF / error and the worker
+/// exits 0. This avoids zombie workers if the coordinator crashes mid-flight.
+fn run_worker_mode(_args: &Args, rank: usize) -> anyhow::Result<()> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    let world_size: usize = std::env::var("WORLD_SIZE")
+        .map_err(|_| anyhow::anyhow!("worker missing WORLD_SIZE env (set by coordinator)"))?
+        .parse()
+        .map_err(|err| anyhow::anyhow!("worker WORLD_SIZE parse: {err}"))?;
+
+    info!(
+        "[arle-worker pid={} rank={rank}/{world_size}] starting (scaffolding only — request relay pending B-1 commit C)",
+        std::process::id()
+    );
+
+    // TODO(B-1 commit C): boot the rank-R scheduler here. For now we just
+    // hold the parent pipe and exit when it closes, validating the launcher
+    // → worker → shutdown lifecycle without touching the model load path.
+    if let Ok(fd_str) = std::env::var("ARLE_WORKER_PARENT_FD") {
+        let fd: i32 = fd_str
+            .parse()
+            .map_err(|err| anyhow::anyhow!("ARLE_WORKER_PARENT_FD parse: {err}"))?;
+        // SAFETY: fd was inherited from the coordinator via pre_exec dup2.
+        // We own it; the File destructor will close it on exit.
+        let mut parent_pipe = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut buf = [0u8; 1];
+        // read returns Ok(0) on EOF (parent closed the pipe) or an error
+        // if the parent died (EPIPE). Both signal "time to shut down".
+        match parent_pipe.read(&mut buf) {
+            Ok(0) => info!("[arle-worker rank={rank}] parent pipe closed, exiting"),
+            Ok(_) => info!("[arle-worker rank={rank}] parent sent shutdown byte, exiting"),
+            Err(err) => info!("[arle-worker rank={rank}] parent pipe error {err}, exiting"),
+        }
+    } else {
+        // No parent pipe — interactive debugging mode. Wait forever.
+        info!("[arle-worker rank={rank}] no ARLE_WORKER_PARENT_FD; sleeping forever");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
+    Ok(())
 }
 
 fn apply_quant_format_override(args: &Args) {
