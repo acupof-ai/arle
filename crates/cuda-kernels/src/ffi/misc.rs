@@ -83,6 +83,25 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    pub fn dsv4_prepare_qk_fused_cuda(
+        q_raw: *const super::Half,
+        k_raw: *const super::Half,
+        q_out: *mut super::Half,
+        k_out: *mut super::Half,
+        num_tokens: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        start_pos: i32,
+        rms_eps: f32,
+        rope_base: f32,
+        original_seq_len: i32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_swa_attention_cuda(
         q: *const super::Half,
         k_new: *const super::Half,
