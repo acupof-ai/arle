@@ -142,7 +142,7 @@ Evidence: [wins entry](docs/experience/wins/2026-05-26-opd-chunked-kl-route-b-be
 ---
 
 **2026-05-25 — V100 (sm_70 Volta) inference target unlocked; capability preserved.**
-ARLE serve now runs Qwen3.5-4B/9B on Tesla V100-SXM2-32GB end-to-end. Made it work through an upstream TileLang patch ([PR #2257](https://github.com/tile-ai/tilelang/pull/2257) — fragment-to-fragment dtype-converting copy via shared-memory staging + BF16→FP16 MMA fallback with FP32 accumulation) plus an ARLE-side per-kernel `allow_sm70` cubin filter that pins T0-legacy emission to Qwen3.5 dense + GDR chunkwise paths only. **T1 (A100/L4/H100) builds and binaries untouched by construction.**
+ARLE serve now runs Qwen3.5-4B/9B on Tesla V100-SXM2-32GB end-to-end. Made it work through an upstream TileLang patch ([PR #2279](https://github.com/tile-ai/tilelang/pull/2279) — fragment-to-fragment dtype-converting copy via shared-memory staging + SM70 `T.gemm` GemmFMA fallback for unsupported BF16/layout combinations) plus an ARLE-side per-kernel `allow_sm70` cubin filter that pins T0-legacy emission to Qwen3.5 dense + GDR chunkwise paths only. **T1 (A100/L4/H100) builds and binaries untouched by construction.**
 
 ![V100 sm_70 capability — Qwen3.5-4B/9B MMLU vs T1 reference](docs/img/2026-05-25-v100-sm70-capability.png)
 
