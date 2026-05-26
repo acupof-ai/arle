@@ -80,6 +80,36 @@ env. FP8 `mean_match = 0.0156`, `first_div = step 1` — bit-for-bit
 identical to the graph-on result. Graph-capture write-order is not
 the bug.
 
+**Production-state runtime dump captured (2026-05-26 A100 sm_80, graph
+off)** via `quant_debug_dump_fp8_state` in
+`infer/src/model/qwen3/batch_decode.rs`, env-gated on `INFER_FP8_DEBUG=1`,
+fires on layer 0 only. Pool sizing is correct (`pool_layers=36
+pool_kv_dim=1024 k_data_len=807927808 bytes per layer`,
+`k_scales_len=6311936 floats per layer`). The decode-step writes
+update `last_token_indices` correctly between steps
+(`4035 → 4036 → 4037 → 4038`) and the FP8 byte payload + scales
+vary per row — the per-step quant kernel is doing its job.
+
+**The smoking-gun signal**: with KV_PARITY_PROMPTS=1 against a 50+ BPE
+token prompt, the first real decode step writes to `row=4035 =
+page_252 * 16 + 3`, implying the slot's accumulated `seq_len = 4`
+when `build_last_indices` was called — only **3 prefill rows
+materialized** out of the 50+ the prompt expanded into. INT8 and
+BF16 with the same prompt produce parity-correct sequences, so the
+gap is FP8-specific to either `prefill_forward_paged_batch` (the
+paged-prefill kernel sequence for FP8 chunks) or
+`finalize_paged_prefill_kv_layer` (the FP8 finalize that quantizes
+work → durable FP8 pool). The decode-step path is innocent; the
+prefill path silently drops most of the tokens or fails to publish
+their KV into the pool, leaving the decode-step attention to read
+mostly-zero / dummy rows for positions 3..N.
+
+Next instrumentation point: dump prefill_token_rows length and
+pool.seq_lens[slot] before/after `finalize_paged_prefill_kv_layer`
+to confirm where the prefill rows are getting lost. The kernel-
+clean and dispatch-symmetry findings still hold for the decode-step
+path; the failure is upstream in prefill.
+
 **Structural symmetry confirmed**: INT8 mode and FP8 mode use the
 exact same paged-pool buffers and dispatch shapes — both route the
 prep K/V to `pool.k_ptr(layer)` (which is the shared `k_work` for
