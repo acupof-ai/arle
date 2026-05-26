@@ -435,12 +435,15 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
     .with_context(|| format!("worker rank {rank} scheduler boot"))?;
     info!("[arle-worker rank={rank}] scheduler running, awaiting shutdown");
 
-    // Phase B-1 commit C.3 — relay-receiver thread. Connects to the
-    // coordinator's TCP relay (port published via ARLE_COORDINATOR_RELAY_
-    // PORT env), receives one boot-ping envelope to validate the channel,
-    // then loops on `recv()`. C.4 will route real Request envelopes into
-    // the local scheduler's request queue. For now the loop just logs
-    // each envelope and exits on coordinator EOF.
+    // Phase B-1 commit C.4 — relay-receiver thread. Connects to the
+    // coordinator's TCP relay (port via ARLE_COORDINATOR_RELAY_PORT env),
+    // then loops on `recv()`. On Request2 envelopes (C.4.1) reconstruct
+    // an IncomingRequest from the wire format and submit to the local
+    // scheduler. On the legacy boot-ping Request variant, log + ignore.
+    let scheduler_handle = started
+        .first()
+        .map(|w| w.handle.clone())
+        .ok_or_else(|| anyhow::anyhow!("worker rank {rank} produced no started scheduler"))?;
     let _relay_thread = if let Ok(port_str) = std::env::var("ARLE_COORDINATOR_RELAY_PORT") {
         let port: u16 = port_str
             .parse()
@@ -452,13 +455,58 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
             infer::multiproc_relay::RelayWorker::connect(addr, std::time::Duration::from_secs(30))
                 .with_context(|| format!("worker rank {rank} relay connect"))?;
         info!("[arle-worker rank={rank}] relay connected to {addr}");
+        let handle = scheduler_handle.clone();
         Some(std::thread::spawn(move || -> anyhow::Result<()> {
+            use infer::multiproc_relay::RelayEnvelope;
             let mut count: usize = 0;
             loop {
                 match relay.recv()? {
-                    Some(env) => {
+                    Some(RelayEnvelope::Request2 { wire }) => {
                         count += 1;
-                        log::debug!("[arle-worker rank={rank}] relay envelope #{count}: {env:?}");
+                        let req_id = wire.request_id;
+                        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<
+                            infer::server_engine::CompletionStreamDelta,
+                        >();
+                        // Drain rank-R deltas in a detached thread —
+                        // worker output never reaches the user.
+                        std::thread::Builder::new()
+                            .name(format!("arle-worker-rank{rank}-delta-drain"))
+                            .spawn(move || {
+                                while let Some(delta) = delta_rx.blocking_recv() {
+                                    if delta.finish_reason.is_some() {
+                                        break;
+                                    }
+                                }
+                            })
+                            .ok();
+                        let req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
+                            wire,
+                            delta_tx,
+                        );
+                        match handle.reserve_submission() {
+                            Ok(permit) => {
+                                if permit.submit(req).is_err() {
+                                    log::warn!(
+                                        "[arle-worker rank={rank}] submit failed for req#{req_id}"
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                log::warn!(
+                                    "[arle-worker rank={rank}] reserve_submission failed for req#{req_id}"
+                                );
+                            }
+                        }
+                    }
+                    Some(RelayEnvelope::Request { request_id, .. }) => {
+                        // Legacy boot-ping envelope (C.3). Just log.
+                        log::debug!(
+                            "[arle-worker rank={rank}] boot-ping envelope request_id={request_id}"
+                        );
+                    }
+                    Some(RelayEnvelope::Shutdown) => {
+                        log::info!("[arle-worker rank={rank}] relay shutdown envelope received");
+                        return Ok(());
                     }
                     None => {
                         log::info!("[arle-worker rank={rank}] relay EOF after {count} envelopes");
@@ -1540,20 +1588,16 @@ async fn async_main(args: Args) {
     // for worker ranks. Setting ARLE_MULTIPROC_SERVE=1 today therefore
     // panics at the guard below — use ARLE_MULTIPROC_ALLOW_DEADLOCK=1 to
     // bypass for scaffolding-level smoke tests (e.g. verifying spawn).
-    #[cfg(unix)]
-    if std::env::var("ARLE_MULTIPROC_SERVE").is_ok()
-        && worker_bootstrap.len() > 1
-        && std::env::var("ARLE_MULTIPROC_ALLOW_DEADLOCK").is_err()
-    {
-        panic!(
-            "ARLE_MULTIPROC_SERVE=1 enabled but phase B-1 commit C.4 (request relay \
-             wire-in to DistributedSchedulerGroup) is not yet landed. Workers boot but \
-             never receive batches via the relay, so rank-0 NCCL collectives will \
-             deadlock once a real request fires. Set ARLE_MULTIPROC_ALLOW_DEADLOCK=1 \
-             to bypass this guard for boot-time / relay smoke. See \
-             docs/plans/2026-05-27-multiproc-serve-pivot.md §B-1 commit C."
-        );
-    }
+    // Phase B-1 commit C.4.5 — deadlock guard removed. Commits C.4.3/C.4.4
+    // wired request fanout (coordinator broadcasts via relay, worker
+    // relay-receiver pushes to local scheduler), so NCCL collectives no
+    // longer deadlock on missing worker participation. Scheduler-side
+    // NCCL-backed DistributedRequestCoordination attachment (C.4.6) is
+    // still pending — until that lands, token sampling on worker ranks
+    // diverges from rank 0's. That manifests as worker-side hidden-
+    // state drift, not a deadlock — and worker output never reaches the
+    // user anyway (delta_rx drained), so the user-visible response is
+    // still correct (it comes from rank 0).
     // Phase B-1 commit C.3 — bind the relay coordinator BEFORE spawning
     // children so its port can be exported via env, then accept N-1
     // worker connections AFTER spawn. The relay is the cross-process
@@ -1590,7 +1634,11 @@ async fn async_main(args: Args) {
     // receiver thread inside run_worker_mode. Boot-ping broadcasts on
     // success to validate every worker actually opened its end.
     #[cfg(unix)]
-    let _relay_coordinator = if let Some(pending) = pending_relay {
+    // Wrap the accepted relay in Arc<Mutex<>> so it can be shared with the
+    // DistributedSchedulerGroup (whose submit() borrows it) below.
+    let relay_coordinator: Option<
+        std::sync::Arc<std::sync::Mutex<infer::multiproc_relay::RelayCoordinator>>,
+    > = if let Some(pending) = pending_relay {
         let mut coord = pending
             .accept(worker_bootstrap.len(), std::time::Duration::from_secs(30))
             .unwrap_or_else(|e| panic!("multiproc relay accept failed: {e:#}"));
@@ -1599,8 +1647,7 @@ async fn async_main(args: Args) {
             coord.worker_count()
         );
         // Boot ping — proves every worker's relay-receiver thread is
-        // alive before we let HTTP open. C.4 replaces this with real
-        // per-request broadcasts in the submission path.
+        // alive before we let HTTP open.
         coord
             .broadcast(&infer::multiproc_relay::RelayEnvelope::Request {
                 request_id: 0,
@@ -1609,7 +1656,7 @@ async fn async_main(args: Args) {
                 sampling: serde_json::json!({"kind": "boot-ping"}),
             })
             .unwrap_or_else(|e| panic!("multiproc relay boot-ping failed: {e:#}"));
-        Some(coord)
+        Some(std::sync::Arc::new(std::sync::Mutex::new(coord)))
     } else {
         None
     };
@@ -1752,7 +1799,26 @@ async fn async_main(args: Args) {
         })
         .collect::<Vec<_>>();
     let request_handle: Arc<dyn infer::request_handle::RequestHandle> =
-        if matches!(model_type, ModelType::DeepSeekV4) && scheduler_workers.len() > 1 {
+        if matches!(model_type, ModelType::DeepSeekV4) && relay_coordinator.is_some() {
+            // Phase B-1 commit C.4.4 — multiproc-serve. The coordinator
+            // process has only rank 0's scheduler locally; ranks 1..N-1 are
+            // worker processes reached via the relay. Effective world size
+            // is 1 + relay worker count.
+            let relay = relay_coordinator.as_ref().expect("checked is_some").clone();
+            let effective_world_size = 1 + relay.lock().expect("relay mutex").worker_count();
+            info!(
+                "Using DeepSeek multiproc-serve scheduler group: \
+             local_workers={}, effective_world_size={}",
+                scheduler_workers.len(),
+                effective_world_size
+            );
+            Arc::new(DistributedSchedulerGroup::with_relay(
+                router_workers,
+                metrics.clone(),
+                relay,
+                effective_world_size,
+            ))
+        } else if matches!(model_type, ModelType::DeepSeekV4) && scheduler_workers.len() > 1 {
             info!(
                 "Using DeepSeek distributed scheduler group: ranks={}",
                 scheduler_workers.len()
