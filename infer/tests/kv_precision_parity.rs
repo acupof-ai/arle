@@ -522,6 +522,37 @@ fn kv_precision_parity_audit() -> Result<()> {
         .expect("bf16 must be in matrix");
     let reference = run_precision(bf16_case, &model_path, &prompts, tokens)?;
 
+    // Degenerate-baseline guard. Greedy + base LM + long technical
+    // prompts collapses to a single-token repetition loop (Qwen3-4B
+    // base + DEFAULT_PROMPTS = `!!!!!!!!`, token 0 forever). When
+    // that happens, any other precision matching token-for-token is
+    // measuring "reproducing the junk faithfully", and any other
+    // precision diverging is measuring "noise broke the junk loop"
+    // — neither is a quality signal. Refuse to draw conclusions.
+    //
+    // See `docs/experience/errors/2026-05-26-fp8-kv-catastrophic-
+    // was-test-artifact.md` for the full retract + rule.
+    let degenerate_baseline = reference
+        .sequences
+        .iter()
+        .any(|seq| seq.len() >= 8 && seq.iter().take(8).all(|&t| t == seq[0]));
+    if degenerate_baseline {
+        let dump: Vec<&[u32]> = reference
+            .sequences
+            .iter()
+            .map(|s| &s[..s.len().min(8)])
+            .collect();
+        eprintln!(
+            "kv-parity: WARNING degenerate BF16 reference detected \
+             (one or more prompts repeat a single token for the first \
+             8 generated tokens). Quality conclusions about INT8/FP8/TQ \
+             from this run are INVALID — match-against-reference is \
+             measuring noise-fidelity, not quality. Reference first-8 \
+             tokens per prompt: {:?}",
+            dump
+        );
+    }
+
     let mut rows = Vec::with_capacity(cases.len());
     rows.push(diff_against_reference(
         &reference,
@@ -533,6 +564,20 @@ fn kv_precision_parity_audit() -> Result<()> {
     for case in cases.iter().filter(|c| c.name != "bf16") {
         match run_precision(*case, &model_path, &prompts, tokens) {
             Ok(result) => {
+                // Token-level divergence dump — first 8 tokens of prompt 0
+                // for every non-BF16 precision, to make catastrophic-vs-noise
+                // distinguishable in the audit log.
+                if let (Some(ref_seq), Some(cand_seq)) =
+                    (reference.sequences.first(), result.sequences.first())
+                {
+                    let n = ref_seq.len().min(cand_seq.len()).min(8);
+                    let refs: Vec<u32> = ref_seq[..n].to_vec();
+                    let cands: Vec<u32> = cand_seq[..n].to_vec();
+                    eprintln!(
+                        "kv-parity: {:<6} prompt0 first{} tokens: ref={:?} cand={:?}",
+                        result.name, n, refs, cands
+                    );
+                }
                 rows.push(diff_against_reference(
                     &reference,
                     &result,

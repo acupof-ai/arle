@@ -1,5 +1,25 @@
 # KIVI per-channel K insufficient as sole FP8 fix on Qwen3-4B / A100
 
+> **⚠ RETRACTED 2026-05-26**
+>
+> This entry's conclusion is invalid. The `mean_match=0.0156` metric
+> it relied on was measuring "do you reproduce the BF16 reference
+> token-for-token", but the BF16 reference itself is a degenerate
+> `!`-token repetition loop (Qwen3-4B *base* + greedy + long technical
+> prompts collapses to single-token repetition). INT8's
+> `mean_match=1.0000` reflects "INT8 noise level is small enough to
+> faithfully reproduce the `!`-loop", not "INT8 is high-quality".
+> FP8's `mean_match=0.0156` reflects "FP8 noise breaks out of the
+> loop into real text fragments", not "FP8 is catastrophically broken".
+>
+> See [`2026-05-26-fp8-kv-catastrophic-was-test-artifact.md`](2026-05-26-fp8-kv-catastrophic-was-test-artifact.md)
+> for the full retract + rule.
+>
+> The KIVI implementation itself (`8c6d92db`), normalize fix
+> (`73a72615`), and floor fix (`25c7d409`) are all kept — they are
+> correct unit-tested numerical improvements. The "kill" decision is
+> withdrawn pending re-audit under a non-degenerate reference.
+
 ## Context
 
 After the 2026-05-26 FP8 KV step-1 catastrophic divergence root-cause
