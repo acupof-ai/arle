@@ -147,6 +147,46 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// KIVI per-channel K quantize: consumes a pre-computed
+    /// `[num_kv_heads, head_dim]` f32 scale table, no per-(token, head)
+    /// reduction. See `csrc/kv/kv_quant.cu::quantize_paged_kv_fp8_per_channel_cuda`.
+    pub fn quantize_paged_kv_fp8_per_channel_cuda(
+        kv_bf16: *const Half,
+        kv_fp8: *mut u8,
+        k_static_scales: *const f32,
+        new_token_indices: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Calibration: accumulate per-(kv_head, head_dim) absmax over a batch
+    /// of K rows from the bf16 HND-paged work buffer into
+    /// `k_static_scales`. Stores **raw absmax**, not divided by 448. Caller
+    /// must invoke `finalize_k_per_channel_scales_cuda` once after all
+    /// calibration batches are accumulated.
+    pub fn compute_k_per_channel_absmax_cuda(
+        kv_bf16: *const Half,
+        k_static_scales: *mut f32,
+        token_rows: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Divide accumulated absmax in `k_static_scales` by 448.0 (FP8 E4M3
+    /// max representable) to yield the final per-channel scale. Idempotent
+    /// only if called exactly once per layer per calibration session.
+    pub fn finalize_k_per_channel_scales_cuda(
+        k_static_scales: *mut f32,
+        num_channels: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn quantize_scatter_kv_fp8_cuda(
         kv_cont: *const Half,
         kv_fp8: *mut u8,

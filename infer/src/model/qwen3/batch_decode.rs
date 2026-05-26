@@ -2395,17 +2395,35 @@ impl Qwen3Model {
             // Quantize new token into pool (FP8/INT8 only — bf16 wrote directly)
             match kv_pool.format {
                 KVFormat::FP8E4M3 => {
-                    kv_quant::quantize_paged_kv_fp8(
-                        &self.ctx,
-                        kv_pool.k_work_ptr(stream),
-                        kv_pool.k_data_ptr(layer_idx, stream),
-                        kv_pool.k_scales_ptr(layer_idx, stream),
-                        &bufs.metadata.last_token_indices,
-                        num_kv_heads,
-                        head_dim,
-                        kv_pool.kv_dim,
-                        batch_size,
-                    )?;
+                    // KIVI: per-channel K scale (calibrated at prefill
+                    // time), per-(row, head) V scale (unchanged).
+                    if let Some(k_static_scales_ptr) =
+                        kv_pool.k_static_scales_ptr(layer_idx, stream)
+                    {
+                        kv_quant::quantize_paged_kv_fp8_per_channel(
+                            &self.ctx,
+                            kv_pool.k_work_ptr(stream),
+                            kv_pool.k_data_ptr(layer_idx, stream),
+                            k_static_scales_ptr,
+                            &bufs.metadata.last_token_indices,
+                            num_kv_heads,
+                            head_dim,
+                            kv_pool.kv_dim,
+                            batch_size,
+                        )?;
+                    } else {
+                        kv_quant::quantize_paged_kv_fp8(
+                            &self.ctx,
+                            kv_pool.k_work_ptr(stream),
+                            kv_pool.k_data_ptr(layer_idx, stream),
+                            kv_pool.k_scales_ptr(layer_idx, stream),
+                            &bufs.metadata.last_token_indices,
+                            num_kv_heads,
+                            head_dim,
+                            kv_pool.kv_dim,
+                            batch_size,
+                        )?;
+                    }
                     kv_quant::quantize_paged_kv_fp8(
                         &self.ctx,
                         kv_pool.v_work_ptr(stream),
@@ -2500,25 +2518,61 @@ impl Qwen3Model {
                         batch_size,
                         "pre-attn-vanilla",
                     );
-                    kv_quant::decode_attention_fp8(
-                        &self.ctx,
-                        &bufs.q_batch,
-                        kv_pool.k_data_ptr(layer_idx, stream),
-                        kv_pool.v_data_ptr(layer_idx, stream),
-                        kv_pool.k_scales_ptr(layer_idx, stream),
-                        kv_pool.v_scales_ptr(layer_idx, stream),
-                        &bufs.metadata.kv_indices,
-                        &bufs.quantized_kv_meta,
-                        &mut bufs.attn_output,
-                        batch_size,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        kv_pool.kv_dim,
-                        sm_scale,
-                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
-                        kv_pool.int8_attn_workspace_bytes,
-                    )?;
+                    // KIVI: dispatch to per-channel K kernel when the static
+                    // K scale table is populated, else fall back to the
+                    // per-token K scale kernel.
+                    if let Some(k_static_scales_ptr) =
+                        kv_pool.k_static_scales_ptr(layer_idx, stream)
+                    {
+                        if layer_idx == 0 && std::env::var("INFER_FP8_DEBUG").is_ok() {
+                            use std::sync::atomic::{AtomicUsize, Ordering};
+                            static FIRES: AtomicUsize = AtomicUsize::new(0);
+                            if FIRES.fetch_add(1, Ordering::Relaxed) < 3 {
+                                eprintln!(
+                                    "[kivi-decode] layer=0 batch={batch_size} KIVI per-channel K decode-attn engaged"
+                                );
+                            }
+                        }
+                        kv_quant::decode_attention_fp8_per_channel_k(
+                            &self.ctx,
+                            &bufs.q_batch,
+                            kv_pool.k_data_ptr(layer_idx, stream),
+                            kv_pool.v_data_ptr(layer_idx, stream),
+                            k_static_scales_ptr,
+                            kv_pool.v_scales_ptr(layer_idx, stream),
+                            &bufs.metadata.kv_indices,
+                            &bufs.quantized_kv_meta,
+                            &mut bufs.attn_output,
+                            batch_size,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            kv_pool.kv_dim,
+                            sm_scale,
+                            kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                            kv_pool.int8_attn_workspace_bytes,
+                        )?;
+                    } else {
+                        kv_quant::decode_attention_fp8(
+                            &self.ctx,
+                            &bufs.q_batch,
+                            kv_pool.k_data_ptr(layer_idx, stream),
+                            kv_pool.v_data_ptr(layer_idx, stream),
+                            kv_pool.k_scales_ptr(layer_idx, stream),
+                            kv_pool.v_scales_ptr(layer_idx, stream),
+                            &bufs.metadata.kv_indices,
+                            &bufs.quantized_kv_meta,
+                            &mut bufs.attn_output,
+                            batch_size,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            kv_pool.kv_dim,
+                            sm_scale,
+                            kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                            kv_pool.int8_attn_workspace_bytes,
+                        )?;
+                    }
                     quant_debug_dump_fp8_state(
                         &self.ctx,
                         layer_idx,

@@ -1330,17 +1330,80 @@ impl Qwen3Model {
             KVFormat::BF16 => Ok(()),
             KVFormat::FP8E4M3 => {
                 let stream = &self.ctx.stream;
-                kv_quant::quantize_paged_kv_fp8(
-                    &self.ctx,
-                    pool.k_work_ptr(stream),
-                    pool.k_data_ptr(layer_idx, stream),
-                    pool.k_scales_ptr(layer_idx, stream),
-                    prefill_token_rows,
-                    num_kv_heads,
-                    head_dim,
-                    pool.kv_dim,
-                    token_count,
-                )?;
+                // KIVI per-channel K path: re-calibrate the per-channel scale
+                // table on every prefill batch (zero → absmax → /448) before
+                // quantizing K. V1 uses **batch-local recalibration** so the
+                // scheduler's warmup prefill (which feeds dummy zero-token K
+                // through the same dispatch) cannot lock-in degenerate
+                // calibration data — each real prefill computes its own scale
+                // from its own K statistics. Multi-slot cross-contamination
+                // accepted as a V1 tradeoff (audit harness uses num_slots=1).
+                if let Some(static_scales_ptr) = pool.k_static_scales_ptr(layer_idx, stream) {
+                    if layer_idx == 0 && std::env::var("INFER_FP8_DEBUG").is_ok() {
+                        use std::sync::atomic::{AtomicUsize, Ordering};
+                        static FIRES: AtomicUsize = AtomicUsize::new(0);
+                        if FIRES.fetch_add(1, Ordering::Relaxed) < 3 {
+                            eprintln!(
+                                "[kivi-prefill] layer=0 token_count={} KIVI per-channel K path engaged",
+                                token_count
+                            );
+                        }
+                    }
+                    // Zero scales (cheap memset on a small `num_kv_heads *
+                    // head_dim` f32 table).
+                    unsafe {
+                        cudarc::driver::result::memset_d8_async(
+                            cudarc::driver::sys::CUdeviceptr::from(static_scales_ptr),
+                            0,
+                            num_kv_heads * head_dim * std::mem::size_of::<f32>(),
+                            stream.cu_stream(),
+                        )
+                        .ok();
+                    }
+                    kv_quant::compute_k_per_channel_absmax(
+                        &self.ctx,
+                        pool.k_work_ptr(stream),
+                        static_scales_ptr,
+                        prefill_token_rows,
+                        num_kv_heads,
+                        head_dim,
+                        pool.kv_dim,
+                        token_count,
+                    )?;
+                    kv_quant::finalize_k_per_channel_scales(
+                        &self.ctx,
+                        static_scales_ptr,
+                        num_kv_heads * head_dim,
+                    )?;
+                    pool.k_kivi_calibrated[layer_idx]
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    kv_quant::quantize_paged_kv_fp8_per_channel(
+                        &self.ctx,
+                        pool.k_work_ptr(stream),
+                        pool.k_data_ptr(layer_idx, stream),
+                        static_scales_ptr,
+                        prefill_token_rows,
+                        num_kv_heads,
+                        head_dim,
+                        pool.kv_dim,
+                        token_count,
+                    )?;
+                } else {
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        pool.k_work_ptr(stream),
+                        pool.k_data_ptr(layer_idx, stream),
+                        pool.k_scales_ptr(layer_idx, stream),
+                        prefill_token_rows,
+                        num_kv_heads,
+                        head_dim,
+                        pool.kv_dim,
+                        token_count,
+                    )?;
+                }
+                // V always uses per-(row, head) scales — KIVI's asymmetric
+                // choice (V doesn't show the same outlier-channel structure
+                // K does).
                 kv_quant::quantize_paged_kv_fp8(
                     &self.ctx,
                     pool.v_work_ptr(stream),
