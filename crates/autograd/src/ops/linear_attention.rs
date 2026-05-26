@@ -97,9 +97,13 @@ fn record_elapsed_subop(
     subop: &'static str,
     started: Option<Instant>,
 ) -> Duration {
-    let duration = started.map_or(Duration::default(), |started| started.elapsed());
+    let duration = elapsed_subop(started);
     record_subop(profile, subop, duration);
     duration
+}
+
+fn elapsed_subop(started: Option<Instant>) -> Duration {
+    started.map_or(Duration::default(), |started| started.elapsed())
 }
 
 fn log_linear_attention_backward_profile(profile: &LinearAttentionBackwardProfile) {
@@ -474,8 +478,7 @@ pub(crate) fn linear_attention_backward(
                         dcore[value_idx] * core_out[value_idx] * norm_tensor.data[value_idx];
                     dnorm[value_idx] += dcore[value_idx] * core_out[value_idx] * inv_rms;
                 }
-                nested_param_grad_duration +=
-                    record_elapsed_subop(&mut profile, "param_grad_accum", param_started);
+                nested_param_grad_duration += elapsed_subop(param_started);
                 dcore = rmsnorm_backward_row(
                     &core_out,
                     &norm_tensor.data,
@@ -555,8 +558,7 @@ pub(crate) fn linear_attention_backward(
                 da_log[value_head] += dg * (-exp_a * softplus_value);
                 db[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] +=
                     dbeta_scalar * beta * (1.0 - beta);
-                nested_param_grad_duration +=
-                    record_elapsed_subop(&mut profile, "param_grad_accum", param_started);
+                nested_param_grad_duration += elapsed_subop(param_started);
 
                 let dq_raw = l2_normalize_scaled_backward(
                     &q_raw,
@@ -596,8 +598,7 @@ pub(crate) fn linear_attention_backward(
                         qkv_tensor.shape[2],
                     )] += dv_raw[value_idx];
                 }
-                nested_param_grad_duration +=
-                    record_elapsed_subop(&mut profile, "param_grad_accum", param_started);
+                nested_param_grad_duration += elapsed_subop(param_started);
 
                 state = prev_state;
                 grad_state = dstate_prev;
@@ -612,6 +613,7 @@ pub(crate) fn linear_attention_backward(
             scan_duration.saturating_sub(nested_param_grad_duration),
         );
     }
+    record_subop(&mut profile, "param_grad_accum", nested_param_grad_duration);
 
     let param_started = subop_started(&profile);
     let (dqkv, dconv) = conv1d_backward(
