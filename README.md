@@ -130,12 +130,12 @@ Real-corpus Qwen3.5-4B → 0.8B-Base GKD with corpus-truth SFT anchor at `prompt
 
 ![Route B vs full-logit peak GPU memory on V100](docs/img/2026-05-26-opd-chunked-kl-route-b-v100-memory.png)
 
-| Mode | `--logits-window-size` | Peak GPU | Outcome |
-|---|---:|---:|---|
-| **fullogit** (T5b shape) | off | **31 506 MiB** | **VRAM OOM** — `cuda alloc_zeros failed (slice)` |
-| **windowed** (Route B) | 64 | **20 800 MiB** | fits, ~11 GB headroom |
+| Mode | `--logits-window-size` | Peak GPU | Train step 1 | Outcome |
+|---|---:|---:|---:|---|
+| **fullogit** (T5b shape) | off | **31 506 MiB** | n/a | **VRAM OOM** — `cuda alloc_zeros failed (slice)` |
+| **windowed** (Route B) | 64 | **25 440 MiB** | **897.4 s** (rollout 112 / teacher 168 / student 78 / backward 538) | loss 9.72 × 10⁻⁶, RSS 9.22 GB post-train |
 
-Same corpus + rollout + GKD config across rows; only `--logits-window-size` varied. **−34 % peak GPU (−10 706 MiB)** — Route B is not just a 16 GB consumer-GPU mitigation, the 32 GB V100 also needs it to run this shape at all.
+Same corpus + rollout + GKD config across rows; only `--logits-window-size` varied. **−19 % peak GPU + train step lands** (was OOM). Two structural fixes were needed end-to-end: per-window forward (Route B itself, never materialize `[B, S, V]`) plus `evict_host_mirror` to drop 19.8 GB → 2.1 GB of host RAM held by post-upload weight mirrors. On V100 32 GB the windowed path now runs the full GKD step the unwindowed path cannot start.
 
 Evidence: [wins entry](docs/experience/wins/2026-05-26-opd-chunked-kl-route-b-bench.md) · [design plan (Route B)](docs/plans/2026-05-25-sequence-windowed-forward-design.md) · [prior 16 GB KILL](docs/experience/errors/2026-05-25-chunked-kl-real-corpus-512-kill.md)
 
