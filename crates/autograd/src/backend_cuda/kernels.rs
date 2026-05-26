@@ -59,6 +59,8 @@ const ROLLOUT_CU: &str = include_str!("kernels/rollout.cu");
 const ATTENTION_CU: &str = include_str!("kernels/attention.cu");
 #[cfg(not(feature = "no-cuda"))]
 const BRIDGE_CU: &str = include_str!("kernels/bridge.cu");
+#[cfg(not(feature = "no-cuda"))]
+const LINEAR_ATTENTION_CU: &str = include_str!("kernels/linear_attention.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -119,6 +121,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "qwen_decode_prepare_kv_f32",
     "bf16_bits_to_f32",
     "f32_to_bf16_bits",
+    "linear_attention_scan_backward_f32",
 ];
 
 #[derive(Debug)]
@@ -427,6 +430,7 @@ fn concat_sources() -> String {
         ROLLOUT_CU,
         ATTENTION_CU,
         BRIDGE_CU,
+        LINEAR_ATTENTION_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');

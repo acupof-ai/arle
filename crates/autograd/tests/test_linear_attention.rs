@@ -4,14 +4,18 @@ use autograd::{
     Result, Tape, TensorStore,
     ops::{LinearAttentionParams, linear_attention_core, mul, sum},
 };
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 use helpers::max_abs_err;
 use helpers::num_grad;
 
+#[cfg(feature = "cuda")]
+use autograd::backend_cuda::CudaBackend;
 #[cfg(feature = "metal")]
 use autograd::backend_metal::MetalBackend;
+#[cfg(any(feature = "metal", feature = "cuda"))]
+use std::sync::Arc;
 #[cfg(feature = "metal")]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 #[cfg(feature = "metal")]
 static METAL_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -671,6 +675,136 @@ fn metal_linear_attention_matches_cpu_with_device_inputs() -> Result<()> {
     assert!(max_abs_err(&metal_dt_grad, &cpu_dt_grad) <= 1.0e-6);
     assert!(max_abs_err(&metal_a_log_grad, &cpu_a_log_grad) <= 1.0e-6);
     assert!(max_abs_err(&metal_norm_grad, &cpu_norm_grad) <= 1.0e-6);
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_linear_attention_matches_cpu_with_device_inputs() -> Result<()> {
+    let params = tiny_params();
+    let fixture = LinearAttentionFixture::new(params);
+    let qkv_shape = [params.batch, params.seq_len, qkv_dim(params)];
+    let z_shape = [params.batch, params.seq_len, z_dim(params)];
+    let head_shape = [params.batch, params.seq_len, params.num_value_heads];
+
+    let mut cpu_store = TensorStore::default();
+    let mut cpu_tape = Tape::new();
+    let cpu_qkv = cpu_store.from_slice(&fixture.qkv, &qkv_shape)?;
+    let cpu_z = cpu_store.from_slice(&fixture.z, &z_shape)?;
+    let cpu_b = cpu_store.from_slice(&fixture.b_proj, &head_shape)?;
+    let cpu_a = cpu_store.from_slice(&fixture.a_proj, &head_shape)?;
+    let cpu_conv = cpu_store.from_slice(
+        &fixture.conv1d_weight,
+        &[qkv_dim(params), params.conv_kernel],
+    )?;
+    let cpu_dt = cpu_store.from_slice(&fixture.dt_bias, &[params.num_value_heads])?;
+    let cpu_a_log = cpu_store.from_slice(&fixture.a_log, &[params.num_value_heads])?;
+    let cpu_norm = cpu_store.from_slice(&fixture.norm_weight, &[params.value_dim])?;
+    let cpu_coeff = cpu_store.from_slice(&fixture.coeff, &z_shape)?;
+    for tensor_id in [
+        cpu_qkv, cpu_z, cpu_b, cpu_a, cpu_conv, cpu_dt, cpu_a_log, cpu_norm,
+    ] {
+        cpu_store
+            .get_mut(tensor_id)
+            .expect("cpu tensor exists")
+            .requires_grad = true;
+    }
+    let cpu_out = linear_attention_core(
+        cpu_qkv,
+        cpu_z,
+        cpu_b,
+        cpu_a,
+        cpu_conv,
+        cpu_dt,
+        cpu_a_log,
+        cpu_norm,
+        params,
+        &mut cpu_store,
+        &mut cpu_tape,
+    )?;
+    let cpu_weighted = mul(cpu_out, cpu_coeff, &mut cpu_store, &mut cpu_tape)?;
+    let cpu_loss = sum(cpu_weighted, &mut cpu_store, &mut cpu_tape)?;
+    let cpu_grads = cpu_tape.backward(cpu_loss, &mut cpu_store)?;
+    let cpu_out_host = cpu_store.to_host(cpu_out)?;
+    let cpu_qkv_grad = cpu_store.to_host(*cpu_grads.get(&cpu_qkv).expect("cpu qkv grad"))?;
+    let cpu_z_grad = cpu_store.to_host(*cpu_grads.get(&cpu_z).expect("cpu z grad"))?;
+    let cpu_b_grad = cpu_store.to_host(*cpu_grads.get(&cpu_b).expect("cpu b grad"))?;
+    let cpu_a_grad = cpu_store.to_host(*cpu_grads.get(&cpu_a).expect("cpu a grad"))?;
+    let cpu_conv_grad = cpu_store.to_host(*cpu_grads.get(&cpu_conv).expect("cpu conv grad"))?;
+    let cpu_dt_grad = cpu_store.to_host(*cpu_grads.get(&cpu_dt).expect("cpu dt grad"))?;
+    let cpu_a_log_grad = cpu_store.to_host(*cpu_grads.get(&cpu_a_log).expect("cpu a_log grad"))?;
+    let cpu_norm_grad = cpu_store.to_host(*cpu_grads.get(&cpu_norm).expect("cpu norm grad"))?;
+
+    let Ok(cuda_backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_linear_attention_matches_cpu_with_device_inputs: no CUDA device");
+        return Ok(());
+    };
+    let mut cuda_store = TensorStore::with_backend(Arc::new(cuda_backend));
+    let mut cuda_tape = Tape::new();
+    let cuda_qkv = cuda_store.from_slice(&fixture.qkv, &qkv_shape)?;
+    let cuda_z = cuda_store.from_slice(&fixture.z, &z_shape)?;
+    let cuda_b = cuda_store.from_slice(&fixture.b_proj, &head_shape)?;
+    let cuda_a = cuda_store.from_slice(&fixture.a_proj, &head_shape)?;
+    let cuda_conv = cuda_store.from_slice(
+        &fixture.conv1d_weight,
+        &[qkv_dim(params), params.conv_kernel],
+    )?;
+    let cuda_dt = cuda_store.from_slice(&fixture.dt_bias, &[params.num_value_heads])?;
+    let cuda_a_log = cuda_store.from_slice(&fixture.a_log, &[params.num_value_heads])?;
+    let cuda_norm = cuda_store.from_slice(&fixture.norm_weight, &[params.value_dim])?;
+    let cuda_coeff = cuda_store.from_slice(&fixture.coeff, &z_shape)?;
+    for tensor_id in [
+        cuda_qkv, cuda_z, cuda_b, cuda_a, cuda_conv, cuda_dt, cuda_a_log, cuda_norm, cuda_coeff,
+    ] {
+        cuda_store.ensure_device(tensor_id)?;
+    }
+    for tensor_id in [
+        cuda_qkv, cuda_z, cuda_b, cuda_a, cuda_conv, cuda_dt, cuda_a_log, cuda_norm,
+    ] {
+        cuda_store
+            .get_mut(tensor_id)
+            .expect("cuda tensor exists")
+            .requires_grad = true;
+    }
+    let cuda_out = linear_attention_core(
+        cuda_qkv,
+        cuda_z,
+        cuda_b,
+        cuda_a,
+        cuda_conv,
+        cuda_dt,
+        cuda_a_log,
+        cuda_norm,
+        params,
+        &mut cuda_store,
+        &mut cuda_tape,
+    )?;
+    let cuda_weighted = mul(cuda_out, cuda_coeff, &mut cuda_store, &mut cuda_tape)?;
+    let cuda_loss = sum(cuda_weighted, &mut cuda_store, &mut cuda_tape)?;
+    let cuda_grads = cuda_tape.backward(cuda_loss, &mut cuda_store)?;
+    let cuda_out_host = cuda_store.to_host(cuda_out)?;
+    let cuda_qkv_grad = cuda_store.to_host(*cuda_grads.get(&cuda_qkv).expect("cuda qkv grad"))?;
+    let cuda_z_grad = cuda_store.to_host(*cuda_grads.get(&cuda_z).expect("cuda z grad"))?;
+    let cuda_b_grad = cuda_store.to_host(*cuda_grads.get(&cuda_b).expect("cuda b grad"))?;
+    let cuda_a_grad = cuda_store.to_host(*cuda_grads.get(&cuda_a).expect("cuda a grad"))?;
+    let cuda_conv_grad =
+        cuda_store.to_host(*cuda_grads.get(&cuda_conv).expect("cuda conv grad"))?;
+    let cuda_dt_grad = cuda_store.to_host(*cuda_grads.get(&cuda_dt).expect("cuda dt grad"))?;
+    let cuda_a_log_grad =
+        cuda_store.to_host(*cuda_grads.get(&cuda_a_log).expect("cuda a_log grad"))?;
+    let cuda_norm_grad =
+        cuda_store.to_host(*cuda_grads.get(&cuda_norm).expect("cuda norm grad"))?;
+
+    assert!(max_abs_err(&cuda_out_host, &cpu_out_host) <= 1.0e-6);
+    assert!(max_abs_err(&cuda_qkv_grad, &cpu_qkv_grad) <= 1.0e-3);
+    assert!(max_abs_err(&cuda_z_grad, &cpu_z_grad) <= 1.0e-3);
+    assert!(max_abs_err(&cuda_b_grad, &cpu_b_grad) <= 1.0e-3);
+    assert!(max_abs_err(&cuda_a_grad, &cpu_a_grad) <= 1.0e-3);
+    assert!(max_abs_err(&cuda_conv_grad, &cpu_conv_grad) <= 1.0e-3);
+    assert!(max_abs_err(&cuda_dt_grad, &cpu_dt_grad) <= 1.0e-3);
+    assert!(max_abs_err(&cuda_a_log_grad, &cpu_a_log_grad) <= 1.0e-3);
+    assert!(max_abs_err(&cuda_norm_grad, &cpu_norm_grad) <= 1.0e-3);
 
     Ok(())
 }

@@ -148,6 +148,45 @@ pub struct DeviceGradClipResult {
     pub clipped_grads: Option<Vec<DeviceHandle>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LinearAttentionScanBackwardParams {
+    pub batch: usize,
+    pub seq_len: usize,
+    pub num_key_heads: usize,
+    pub num_value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub eps: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LinearAttentionScanBackwardArgs<'a> {
+    pub params: LinearAttentionScanBackwardParams,
+    pub upstream: &'a [f32],
+    pub z: &'a [f32],
+    pub a_proj: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub a_log: &'a [f32],
+    pub norm_weight: &'a [f32],
+    pub preact: &'a [f32],
+    pub beta: &'a [f32],
+    pub exp_g: &'a [f32],
+    pub kv_mem: &'a [f32],
+    pub state_history: &'a [f32],
+    pub final_state: &'a [f32],
+}
+
+#[derive(Debug, Clone)]
+pub struct LinearAttentionScanBackwardGrads {
+    pub dqkv: Vec<f32>,
+    pub dz: Vec<f32>,
+    pub db: Vec<f32>,
+    pub da: Vec<f32>,
+    pub ddt: Vec<f32>,
+    pub da_log: Vec<f32>,
+    pub dnorm: Vec<f32>,
+}
+
 pub trait Backend: std::fmt::Debug + Send + Sync {
     fn device(&self) -> Device;
 
@@ -209,6 +248,16 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
 
     fn eval(&self, _handles: &[&DeviceHandle]) -> Result<()> {
         Ok(())
+    }
+
+    /// Optional backend override for Qwen3.5 linear-attention's reverse
+    /// state-history scan. The default returns `None` so CPU remains the
+    /// reference implementation and non-CUDA backends keep the existing path.
+    fn linear_attention_scan_backward(
+        &self,
+        _args: LinearAttentionScanBackwardArgs<'_>,
+    ) -> Result<Option<LinearAttentionScanBackwardGrads>> {
+        Ok(None)
     }
 
     /// Whether `Tape::backward` should `flush_to_host_batch` every
