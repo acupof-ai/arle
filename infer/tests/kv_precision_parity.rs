@@ -286,10 +286,18 @@ fn run_precision(
         std::env::set_var("INFER_DETERMINISTIC", "1");
     }
 
+    // CUDA Graph capture can mask scheduler-state bugs whose write order
+    // matters across decode steps (the audit can be re-run with
+    // `INFER_TEST_CUDA_GRAPH=0` to confirm whether divergence is graph-
+    // capture related or independent of it).
+    let enable_cuda_graph = !matches!(
+        std::env::var("INFER_TEST_CUDA_GRAPH").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF")
+    );
     let model = Qwen3Model::from_safetensors_with_runtime(
         model_path,
         ModelRuntimeConfig {
-            enable_cuda_graph: true,
+            enable_cuda_graph,
             ..ModelRuntimeConfig::default()
         },
     )

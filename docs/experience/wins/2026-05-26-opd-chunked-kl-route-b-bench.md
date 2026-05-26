@@ -140,11 +140,46 @@ Route B is therefore not just a 16 GB consumer-GPU mitigation —
   - `7dce52e1` — V100 build.rs T0-legacy re-applied after DeepGEMM PR merge collision
   - `af8cbdf6` / `8cb2f2e1` / `e39429e9` — autograd sm_70 cubin loader fix chain
 
+## Follow-up 1 (2026-05-26) — eval slowness fixed; first KL numbers from windowed pass
+
+`eebcfec9 fix(opd): bound windowed eval train sample` (+ TileLang dict
+target API drift fix in `f6bebd25`) addressed the step 0 eval >20 min
+stall. The root cause was per-prompt tape lifetime: the windowed eval
+loop kept accumulating tape entries across heldout prompts, so each
+new prompt's KL graph walked an ever-larger live-tensor set.
+
+Clean `wC-windowed-clean` re-run on the same V100 32 GB shape
+(`/tmp/v100_opd_bench.sh windowed wC-windowed-clean`):
+
+| metric | value |
+|---|---:|
+| eval_seconds (step 0, 1 train sample + 4 heldout) | **270.9 s** |
+| train_kl (eval) | 1.031 × 10⁻⁵ |
+| heldout_kl (eval) | 7.465 × 10⁻⁶ |
+| heldout per-prompt time | 4.7-5.6 s |
+| train per-prompt time (468 tok) | ~250 s |
+| peak GPU during eval | 25 504 MiB |
+| tape_entries at step boundary | 0 (was unbounded) |
+| live_tensors at step boundary | 774 (stable across prompts) |
+
+`tape_entries=0` after each prompt + `live_tensors=774` flat across
+prompts confirms the lifetime fix — no graph accumulation across the
+eval loop. Heldout per-prompt timing dropped from "never finishes" to
+~5 s; the 250 s train-eval-prompt outlier is the 468-token single
+example reflecting per-window forward count (window_size=64 means
+~8 windows per prompt × teacher+student per window).
+
+Train step itself still hits the host-RAM `rc=137` (Follow-up 2 below)
+so per-step train wall-clock + train-step KL parity are not yet on
+this table.
+
 ## Next
 
-- **Train-step host RAM OOM** — separate CPU memory audit; not a Route B
-  regression but blocks producing a KL parity number.
-- **Step 0 eval slowness under windowed** — profile per-prompt windowed
-  KL allocation; likely a tape lifetime issue, not a real cost.
-- After both above land, re-run a clean `windowed` vs `fullogit` 1-step
-  bench and add KL parity + step wall-clock to this table.
+- **Train-step host RAM OOM (Follow-up 2)** — separate CPU memory
+  audit; not a Route B regression. Hypotheses to bisect: full-vocab
+  logits copy held on host, rollout argmax readback materializing
+  `[S, V]`, optimizer/grad accum host copy, or tokenizer/preprocessor
+  buffer retained too long. Window-or-stream the offender; do not
+  alloc full `[S, V]` host-side.
+- After Follow-up 2 lands, re-run a clean `windowed` 1-step bench and
+  add train-step KL + step wall-clock to this table.
