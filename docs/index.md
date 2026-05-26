@@ -27,6 +27,7 @@ byte-identical grouped expert GEMM, launch churn. Evidence:
 [`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md),
+[`experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md`](experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md),
 `trace-artifacts/2026-05-15-dsv4-deepep/`.
 
 **Qwen3.5 Medusa is not pickup-ready** — recurrent-state accepted-length
