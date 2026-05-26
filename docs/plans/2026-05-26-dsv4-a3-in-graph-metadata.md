@@ -229,6 +229,14 @@ Phase 3 估算：~2-3 天（DeepEP API 调研 + 重构 + 多卡 bench）。
   12.1466 s → 8.2378 s, but does not complete A3 because D2H calls remain.
   Evidence:
   [`../experience/wins/2026-05-26-dsv4-deepgemm-device-prop-cache.md`](../experience/wins/2026-05-26-dsv4-deepgemm-device-prop-cache.md).
+- 2026-05-26 padded B=1 DeepGEMM local experts now keep recv-side local counts
+  and offsets on device by default (`ARLE_DSV4_DEEPGEMM_DEVICE_COUNTS=0` is the
+  opt-out). This closes the A3 short-decode D2H gate for the default
+  DeepEP+DeepGEMM path: D2H memcpy activity 10,711 calls / 1,365,180 B → 11
+  calls / 44 B, warmed nsys profile request 3.3974 s → 3.1908 s (-6.08%),
+  greedy output byte-identical for `max_tokens=32`. Final SLO evidence still
+  needs the 32K / 1.5K, c=8, qps=8 frame. Evidence:
+  [`../experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md`](../experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md).
 
 ## Cross-refs
 

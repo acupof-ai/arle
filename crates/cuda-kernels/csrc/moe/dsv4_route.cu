@@ -841,6 +841,33 @@ extern "C" CUresult dsv4_init_padded_route_slots_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_fill_i32_kernel(
+    int32_t *__restrict__ data,
+    int32_t value,
+    int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) return;
+  data[idx] = value;
+}
+
+extern "C" CUresult dsv4_fill_i32_cuda(
+    int32_t *data,
+    int32_t value,
+    int elements,
+    CUstream stream) {
+  if (elements < 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (elements == 0) return CUDA_SUCCESS;
+  if (data == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int grid = (elements + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_fill_i32_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      data, value, elements);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_count_packed_local_experts_kernel(
     const int32_t *__restrict__ packed_meta,
     int32_t *__restrict__ counts,
@@ -923,6 +950,43 @@ extern "C" CUresult dsv4_prepare_packed_local_experts_small_cuda(
   }
   dsv4_prepare_packed_local_experts_small_kernel<<<1, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
       packed_meta, counts, offsets, cursors, num_routes, local_expert_start,
+      experts_per_rank);
+  return (CUresult)cudaGetLastError();
+}
+
+__global__ void dsv4_prepare_deepgemm_all_expert_metadata_kernel(
+    int32_t *__restrict__ active_experts,
+    int32_t *__restrict__ active_offsets,
+    int32_t *__restrict__ active_counts,
+    const int32_t *__restrict__ local_offsets,
+    const int32_t *__restrict__ local_counts,
+    int experts_per_rank) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= experts_per_rank) return;
+  active_experts[idx] = idx;
+  active_offsets[idx] = local_offsets[idx];
+  active_counts[idx] = local_counts[idx];
+}
+
+extern "C" CUresult dsv4_prepare_deepgemm_all_expert_metadata_cuda(
+    int32_t *active_experts,
+    int32_t *active_offsets,
+    int32_t *active_counts,
+    const int32_t *local_offsets,
+    const int32_t *local_counts,
+    int experts_per_rank,
+    CUstream stream) {
+  if (experts_per_rank <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (active_experts == nullptr || active_offsets == nullptr ||
+      active_counts == nullptr || local_offsets == nullptr ||
+      local_counts == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int grid = (experts_per_rank + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_prepare_deepgemm_all_expert_metadata_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      active_experts, active_offsets, active_counts, local_offsets, local_counts,
       experts_per_rank);
   return (CUresult)cudaGetLastError();
 }
@@ -1038,6 +1102,7 @@ __global__ void dsv4_scatter_all_route_slots_kernel(
   int route = idx / hidden_dim;
   int col = idx - route * hidden_dim;
   int route_slot = expert_route_slot[route];
+  if (route_slot < 0) return;
   float weight = expert_weight[route];
   float value = dsv4_route_bf16_to_f32(expert_out[idx]);
   route_out[route_slot * hidden_dim + col] =
