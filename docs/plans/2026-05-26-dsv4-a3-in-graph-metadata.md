@@ -213,8 +213,14 @@ Phase 3 估算：~2-3 天（DeepEP API 调研 + 重构 + 多卡 bench）。
   SFA stride support for reused scratch), but was KILLed as an optimization:
   `max_tokens=32` A/B mean was native 3.7632 s vs DeepGEMM 7.5347 s (+100.2%),
   and greedy output was not byte-identical. Keep
-  `ARLE_DSV4_EXPERT_BACKEND=deepgemm` diagnostic-only/default-off. See
+  `ARLE_DSV4_EXPERT_BACKEND=deepgemm` as the required/fail-fast toolchain
+  validation mode, not a claimed optimization win. See
   [`../experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](../experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md).
+- 2026-05-26 user licensed pivot to make DSv4 default to DeepEP-style
+  dispatch/combine and the DeepGEMM auto expert backend. This changes the
+  default integration path only; the previous wall-clock/correctness KILL still
+  blocks claiming DeepGEMM as a performance win until native DeepEP LL +
+  byte-identical grouped expert compute are validated.
 
 ## Cross-refs
 

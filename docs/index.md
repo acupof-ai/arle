@@ -17,11 +17,13 @@ The OPD-only product boundary remains
 next-model hot path. User-facing target framing is input 32K / output 1.5K,
 H20 qps 8 at concurrency 8, SLO TTFT <= 5000 ms and TPOT <= 30 ms; current
 target baseline is TTFT 4800 ms, TPOT 18 ms, total throughput 8402. Default
-B=1 padded BF16 reduce-scatter combine, fused local-expert prepare, and broad
-scratch reuse have landed; A3 Phase 2 route-grouped and native DeepGEMM
-required modes are diagnostic-only/default-off after wall-clock and correctness
-KILLs. Remaining blockers: NCCL SendRecv/AllReduce, byte-identical grouped
-expert GEMM, launch churn. Evidence:
+B=1 padded BF16 reduce-scatter combine, fused local-expert prepare, broad
+scratch reuse, DeepEP-style dispatch/combine, and the DeepGEMM auto local
+expert backend have landed. Required DeepGEMM remains a fail-fast validation
+toolchain gate after the 2026-05-26 wall-clock and correctness KILL;
+route-grouped experts remain diagnostic-only. Remaining blockers: replacing the
+DeepEP-style NCCL fallback with native DeepEP low-latency kernels,
+byte-identical grouped expert GEMM, launch churn. Evidence:
 [`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md),

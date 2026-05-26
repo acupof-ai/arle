@@ -8,8 +8,6 @@ use std::path::Path;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
-use std::sync::Once;
-#[cfg(feature = "cuda")]
 use std::time::Instant;
 
 use anyhow::{Result, bail, ensure};
@@ -2191,12 +2189,9 @@ impl DeepseekModel {
         };
         dsv4_trace_end(&self.ctx, "ffn_pre_norm", layer_idx, stream.seq_len, trace)?;
         let deepep_requested = dsv4_moe_deepep_enabled()?;
-        // Remote 8-rank H20 validation showed both DeepEP dispatch shapes can
-        // illegal-address the CUDA context: variable-count prefill at dispatch
-        // count receive, and padded decode at payload unpack/count receive.
-        // Keep the stable local-routed + EP all-reduce path as the supported
-        // multi-rank path. DeepEP remains available only behind the explicit
-        // unsafe backend value for focused dispatch debugging.
+        // DSv4 defaults to the DeepEP-style dispatch/combine route. Operators
+        // can still force the legacy local-routed + EP all-reduce path with
+        // ARLE_DSV4_MOE_BACKEND=allreduce while DeepEP LL integration closes.
         let use_deepep = deepep_requested && self.config.ep.world_size > 1;
         let routed = if use_deepep {
             #[cfg(feature = "nccl")]
@@ -3932,24 +3927,13 @@ fn dsv4_gpu_contextual_logits_enabled() -> Result<bool> {
 
 #[cfg(feature = "cuda")]
 fn dsv4_moe_deepep_enabled() -> Result<bool> {
-    static DEEPEP_DISABLED_NOTICE: Once = Once::new();
     let Some(raw) = std::env::var("ARLE_DSV4_MOE_BACKEND").ok() else {
-        return Ok(false);
+        return Ok(true);
     };
-    match raw.as_str() {
-        "deepep" | "DeepEP" | "dispatch" | "dispatch_combine" => {
-            DEEPEP_DISABLED_NOTICE.call_once(|| {
-                info!(
-                    "DeepSeek V4 DeepEP backend request is using allreduce fallback; \
-                     set ARLE_DSV4_MOE_BACKEND=deepep_unsafe to force the experimental dispatch path"
-                );
-            });
-            Ok(false)
-        }
-        "deepep_unsafe" | "unsafe_deepep" | "dispatch_unsafe" => Ok(true),
-        "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "FALSE" | "off" | "OFF" => {
-            Ok(false)
-        }
+    match raw.to_ascii_lowercase().as_str() {
+        "" | "deepep" | "dispatch" | "dispatch_combine" | "deepep_unsafe" | "unsafe_deepep"
+        | "dispatch_unsafe" => Ok(true),
+        "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => Ok(false),
         _ => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{raw}`"),
     }
 }
