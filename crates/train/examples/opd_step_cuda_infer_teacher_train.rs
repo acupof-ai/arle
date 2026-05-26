@@ -21,7 +21,7 @@ mod app {
         LoraAdapterConfig, LoraConfig, LoraTargetSet,
         loss::{DEFAULT_KL_CHUNK_SIZE, kl_distill_loss, kl_distill_loss_chunked},
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdStepConfig, OpdStepProfile,
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig, OpdStepProfile,
             opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         prompts::load_jsonl_prompt_sets,
@@ -73,6 +73,7 @@ mod app {
         sft_anchor: GkdSftAnchor,
         kl_chunk_size: Option<usize>,
         logits_window_size: Option<usize>,
+        opd_kl_mask: OpdKlMask,
     }
 
     #[derive(Debug)]
@@ -145,7 +146,8 @@ mod app {
              steps={} rollout_len={} lr={:.9e} grad_clip={GRAD_CLIP} \
              prompt_source={} train_prompt_count={} heldout_prompt_count={} \
              eval_steps={:?} cuda_graph={} save_student_checkpoint={} save_every={} \
-             gkd_lambda={:.6} sft_anchor={} kl_chunk_size={} logits_window_size={}",
+             gkd_lambda={:.6} sft_anchor={} kl_chunk_size={} logits_window_size={} \
+             opd_kl_mask={}",
             args.teacher_model.display(),
             args.teacher_api_url.as_deref().unwrap_or("none"),
             args.teacher_config
@@ -174,7 +176,8 @@ mod app {
                 .unwrap_or_else(|| "none".to_owned()),
             args.logits_window_size
                 .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_owned())
+                .unwrap_or_else(|| "none".to_owned()),
+            opd_kl_mask_label(args.opd_kl_mask)
         );
         for (idx, prompt) in prompts.train.iter().enumerate() {
             println!("prompt split=train index={idx} ids={prompt:?}");
@@ -336,6 +339,7 @@ mod app {
         let mut sft_anchor = GkdSftAnchor::StudentRollout;
         let mut kl_chunk_size = Some(DEFAULT_KL_CHUNK_SIZE);
         let mut logits_window_size = None;
+        let mut opd_kl_mask = OpdKlMask::CompletionOnly;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -374,6 +378,7 @@ mod app {
                     logits_window_size =
                         Some(parse_positive_usize(&arg, &next_arg(&mut args, &arg)?)?)
                 }
+                "--opd-kl-mask" => opd_kl_mask = parse_opd_kl_mask(&next_arg(&mut args, &arg)?)?,
                 "--no-cuda-graph" => enable_cuda_graph = false,
                 "--help" | "-h" => {
                     println!(
@@ -385,6 +390,7 @@ mod app {
                          [--save-student-checkpoint DIR] [--save-every N] \
                          [--gkd-lambda LAMBDA] [--sft-anchor student-rollout|corpus-truth] \
                          [--kl-chunk-size N(default 32)] [--logits-window-size N] \
+                         [--opd-kl-mask full|completion-only(default)] \
                          [--no-cuda-graph]"
                     );
                     std::process::exit(0);
@@ -428,6 +434,7 @@ mod app {
             sft_anchor,
             kl_chunk_size,
             logits_window_size,
+            opd_kl_mask,
         })
     }
 
@@ -480,10 +487,27 @@ mod app {
         }
     }
 
+    fn parse_opd_kl_mask(raw: &str) -> Result<OpdKlMask, Box<dyn std::error::Error>> {
+        match raw {
+            "full" => Ok(OpdKlMask::Full),
+            "completion-only" => Ok(OpdKlMask::CompletionOnly),
+            _ => Err(
+                format!("--opd-kl-mask must be one of full|completion-only, got `{raw}`").into(),
+            ),
+        }
+    }
+
     fn sft_anchor_label(anchor: GkdSftAnchor) -> &'static str {
         match anchor {
             GkdSftAnchor::StudentRollout => "student-rollout",
             GkdSftAnchor::CorpusTruth => "corpus-truth",
+        }
+    }
+
+    fn opd_kl_mask_label(mask: OpdKlMask) -> &'static str {
+        match mask {
+            OpdKlMask::Full => "full",
+            OpdKlMask::CompletionOnly => "completion-only",
         }
     }
 
@@ -657,6 +681,7 @@ mod app {
                     corpus_tokens,
                     kl_chunk_size: args.kl_chunk_size,
                     logits_window_size: args.logits_window_size,
+                    kl_mask: args.opd_kl_mask,
                 },
                 Some(&mut profile),
             )?;

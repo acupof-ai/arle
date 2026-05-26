@@ -81,6 +81,12 @@ pub enum GkdSftAnchor {
     CorpusTruth,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpdKlMask {
+    Full,
+    CompletionOnly,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct GkdLossConfig<'a> {
     pub lambda: f32,
@@ -88,6 +94,7 @@ pub struct GkdLossConfig<'a> {
     pub corpus_tokens: Option<&'a [u32]>,
     pub kl_chunk_size: Option<usize>,
     pub logits_window_size: Option<usize>,
+    pub kl_mask: OpdKlMask,
 }
 
 impl Default for GkdLossConfig<'_> {
@@ -98,6 +105,7 @@ impl Default for GkdLossConfig<'_> {
             corpus_tokens: None,
             kl_chunk_size: Some(DEFAULT_KL_CHUNK_SIZE),
             logits_window_size: None,
+            kl_mask: OpdKlMask::CompletionOnly,
         }
     }
 }
@@ -597,24 +605,99 @@ fn sequence_windows(total_positions: usize, window_size: usize) -> Result<Vec<Se
     Ok(windows)
 }
 
+fn sequence_windows_for_range(
+    range: KlLogitRange,
+    window_size: usize,
+) -> Result<Vec<SequenceWindow>> {
+    sequence_windows(range.len(), window_size).map(|windows| {
+        windows
+            .into_iter()
+            .map(|window| SequenceWindow {
+                start: range.start + window.start,
+                end: range.start + window.end,
+            })
+            .collect()
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KlLogitRange {
+    start: usize,
+    end: usize,
+}
+
+impl KlLogitRange {
+    fn len(self) -> usize {
+        self.end - self.start
+    }
+}
+
+fn kl_logit_range(mask: OpdKlMask, prompt_len: usize, sequence_len: usize) -> Result<KlLogitRange> {
+    match mask {
+        OpdKlMask::Full => {
+            if sequence_len == 0 {
+                return Err(OpdError::InvalidInput(
+                    "OPD full KL mask requires at least one sequence position.".to_owned(),
+                ));
+            }
+            Ok(KlLogitRange {
+                start: 0,
+                end: sequence_len,
+            })
+        }
+        OpdKlMask::CompletionOnly => {
+            if prompt_len == 0 {
+                return Err(OpdError::InvalidInput(
+                    "OPD completion-only KL mask requires a non-empty prompt.".to_owned(),
+                ));
+            }
+            if sequence_len <= prompt_len {
+                return Err(OpdError::InvalidInput(format!(
+                    "OPD completion-only KL mask requires at least one completion token, \
+                     got prompt_len={prompt_len} and sequence_len={sequence_len}. \
+                     Hint: set --rollout-len > 0 or use --opd-kl-mask full."
+                )));
+            }
+            Ok(KlLogitRange {
+                start: prompt_len - 1,
+                end: sequence_len - 1,
+            })
+        }
+    }
+}
+
+fn slice_logits_for_kl(
+    logits: TensorId,
+    range: KlLogitRange,
+    vocab: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let starts = [0, range.start, 0];
+    let ends = [1, range.end, vocab];
+    slice(logits, &starts, &ends, store, tape).map_err(OpdError::from)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
     rollout: &[u32],
+    prompt_len: usize,
     vocab: usize,
     chunk_size: usize,
+    kl_mask: OpdKlMask,
     student_model_params: &[TensorId],
     keep_extra: &HashSet<TensorId>,
     store: &mut TensorStore,
     tape: &mut Tape,
     profile: &mut Option<&mut OpdStepProfile>,
 ) -> Result<f32> {
-    let total_positions = rollout.len();
+    let kl_range = kl_logit_range(kl_mask, prompt_len, rollout.len())?;
     let mut loss_value = 0.0_f32;
 
-    for seq_start in (0..total_positions).step_by(chunk_size) {
-        let seq_end = seq_start.saturating_add(chunk_size).min(total_positions);
+    for seq_start in (kl_range.start..kl_range.end).step_by(chunk_size) {
+        let seq_end = seq_start.saturating_add(chunk_size).min(kl_range.end);
         let chunk_len = seq_end - seq_start;
         let positions = (0..seq_end as u32).collect::<Vec<_>>();
         let prefix = &rollout[..seq_end];
@@ -656,7 +739,7 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
             slice(student_logits, &starts, &ends, store, tape).map_err(OpdError::from)?;
         let chunk_loss = kl_distill_loss(student_chunk, teacher_chunk, chunk_len, store, tape)
             .map_err(OpdError::from)?;
-        let chunk_weight = chunk_len as f32 / total_positions as f32;
+        let chunk_weight = chunk_len as f32 / kl_range.len() as f32;
         let weighted_loss =
             mul_scalar(chunk_loss, chunk_weight, store, tape).map_err(OpdError::from)?;
         loss_value += store.to_host(weighted_loss).map_err(OpdError::from)?[0];
@@ -1039,7 +1122,8 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
     let mut backward_windows = 0usize;
 
     if gkd_config.lambda < 1.0 {
-        for window in sequence_windows(rollout.len(), window_size)? {
+        let kl_range = kl_logit_range(gkd_config.kl_mask, prompt_ids.len(), rollout.len())?;
+        for window in sequence_windows_for_range(kl_range, window_size)? {
             tape.entries.clear();
             tape.set_enabled(false);
 
@@ -1084,7 +1168,7 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
             record_profile(profile, |profile| {
                 profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
             });
-            let weight = (1.0 - gkd_config.lambda) * (window.len() as f32 / rollout.len() as f32);
+            let weight = (1.0 - gkd_config.lambda) * (window.len() as f32 / kl_range.len() as f32);
             total_loss += backward_weighted_window_loss(kl_loss, weight, store, tape, profile)?;
             backward_windows += 1;
             cleanup_after_backward(store, tape, student_model_params, keep_extra);
@@ -1590,8 +1674,10 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 student,
                 teacher,
                 &rollout,
+                prompt_ids.len(),
                 vocab,
                 chunk_size,
+                gkd_config.kl_mask,
                 &student_model_params,
                 &keep_extra,
                 store,
@@ -1698,10 +1784,20 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         //    SFT anchor. The legacy anchor uses the on-policy rollout;
         //    corpus-truth mode re-forwards the student over prompt+target.
         let phase_started = Instant::now();
+        let kl_range = kl_logit_range(gkd_config.kl_mask, prompt_ids.len(), rollout.len())?;
+        let (student_kl_logits, teacher_kl_logits) =
+            if kl_range.start == 0 && kl_range.end == rollout.len() {
+                (student_logits, teacher_logits.tensor_id)
+            } else {
+                (
+                    slice_logits_for_kl(student_logits, kl_range, vocab, store, tape)?,
+                    slice_logits_for_kl(teacher_logits.tensor_id, kl_range, vocab, store, tape)?,
+                )
+            };
         let kl_loss = kl_distill_loss_for_config(
-            student_logits,
-            teacher_logits.tensor_id,
-            rollout.len(),
+            student_kl_logits,
+            teacher_kl_logits,
+            kl_range.len(),
             gkd_config.kl_chunk_size,
             store,
             tape,
@@ -1774,12 +1870,12 @@ mod tests {
     use autograd::{AutogradError, Tape, Tensor, TensorStore};
 
     use super::{
-        GkdLossConfig, GkdSftAnchor, OpdError, OpdStepConfig, greedy_next_token,
-        kl_distill_loss_for_config, map_qwen35_forward_error, mix_gkd_losses,
-        next_token_sft_loss_from_logits, sequence_windows, shifted_rollout_sft_loss,
-        validate_gkd_lambda, validate_gkd_loss_config, validate_loss_value, validate_rollout_shape,
-        validate_step_config, validate_student_param_ownership, validate_student_params,
-        validate_teacher_params,
+        GkdLossConfig, GkdSftAnchor, KlLogitRange, OpdError, OpdKlMask, OpdStepConfig,
+        greedy_next_token, kl_distill_loss_for_config, kl_logit_range, map_qwen35_forward_error,
+        mix_gkd_losses, next_token_sft_loss_from_logits, sequence_windows,
+        shifted_rollout_sft_loss, validate_gkd_lambda, validate_gkd_loss_config,
+        validate_loss_value, validate_rollout_shape, validate_step_config,
+        validate_student_param_ownership, validate_student_params, validate_teacher_params,
     };
     use crate::qwen35::Qwen35Error;
 
@@ -2004,6 +2100,7 @@ mod tests {
             corpus_tokens: None,
             kl_chunk_size: None,
             logits_window_size: None,
+            kl_mask: OpdKlMask::Full,
         })
         .expect_err("corpus anchor must require target tokens");
         let OpdError::InvalidInput(message) = missing else {
@@ -2018,6 +2115,7 @@ mod tests {
             corpus_tokens: Some(&[]),
             kl_chunk_size: None,
             logits_window_size: None,
+            kl_mask: OpdKlMask::Full,
         })
         .expect_err("empty corpus anchor tokens must be rejected");
         let OpdError::InvalidInput(message) = empty else {
@@ -2031,6 +2129,7 @@ mod tests {
             corpus_tokens: None,
             kl_chunk_size: None,
             logits_window_size: None,
+            kl_mask: OpdKlMask::Full,
         })
         .expect("lambda=0 should not require unused corpus targets");
         validate_gkd_loss_config(GkdLossConfig {
@@ -2039,6 +2138,7 @@ mod tests {
             corpus_tokens: Some(&[1, 2]),
             kl_chunk_size: None,
             logits_window_size: None,
+            kl_mask: OpdKlMask::Full,
         })
         .expect("non-empty corpus targets should be accepted");
     }
@@ -2051,6 +2151,7 @@ mod tests {
             corpus_tokens: None,
             kl_chunk_size: Some(0),
             logits_window_size: None,
+            kl_mask: OpdKlMask::Full,
         })
         .expect_err("zero KL chunk size must be rejected");
 
@@ -2070,6 +2171,7 @@ mod tests {
             corpus_tokens: None,
             kl_chunk_size: None,
             logits_window_size: Some(0),
+            kl_mask: OpdKlMask::Full,
         })
         .expect_err("zero logits window size must be rejected");
 
@@ -2089,6 +2191,26 @@ mod tests {
             .map(|window| (window.start, window.end))
             .collect::<Vec<_>>();
         assert_eq!(spans, vec![(0, 4), (4, 8), (8, 10)]);
+    }
+
+    #[test]
+    fn kl_logit_range_completion_only_slices_completion_targets() {
+        let range = kl_logit_range(OpdKlMask::CompletionOnly, 16, 144).expect("range");
+        assert_eq!(
+            range,
+            KlLogitRange {
+                start: 15,
+                end: 143
+            }
+        );
+        assert_eq!(range.len(), 128);
+    }
+
+    #[test]
+    fn kl_logit_range_full_preserves_legacy_positions() {
+        let range = kl_logit_range(OpdKlMask::Full, 16, 144).expect("range");
+        assert_eq!(range, KlLogitRange { start: 0, end: 144 });
+        assert_eq!(range.len(), 144);
     }
 
     #[test]
