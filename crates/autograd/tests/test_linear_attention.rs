@@ -439,6 +439,98 @@ fn linear_attention_grad_matches_numeric() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn linear_attention_backward_keeps_tiny_decay_finite() -> Result<()> {
+    let params = LinearAttentionParams {
+        batch: 1,
+        seq_len: 20,
+        num_key_heads: 1,
+        num_value_heads: 1,
+        key_dim: 2,
+        value_dim: 2,
+        conv_kernel: 1,
+        eps: 1.0e-6,
+    };
+    let qkv_dim = qkv_dim(params);
+    let z_dim = z_dim(params);
+    let head_len = params.batch * params.seq_len * params.num_value_heads;
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+
+    let qkv = store.from_slice(
+        &vec![3.0; params.batch * params.seq_len * qkv_dim],
+        &[params.batch, params.seq_len, qkv_dim],
+    )?;
+    let z = store.from_slice(
+        &vec![3.0; params.batch * params.seq_len * z_dim],
+        &[params.batch, params.seq_len, z_dim],
+    )?;
+    let b_proj = store.from_slice(
+        &vec![0.0; head_len],
+        &[params.batch, params.seq_len, params.num_value_heads],
+    )?;
+    let a_proj = store.from_slice(
+        &vec![0.5; head_len],
+        &[params.batch, params.seq_len, params.num_value_heads],
+    )?;
+    let conv1d_weight = store.from_slice(&vec![1.0; qkv_dim], &[qkv_dim, params.conv_kernel])?;
+    let dt_bias = store.from_slice(&[0.0], &[params.num_value_heads])?;
+    let a_log = store.from_slice(&[3.0], &[params.num_value_heads])?;
+    let norm_weight = store.from_slice(&vec![1.0; params.value_dim], &[params.value_dim])?;
+
+    for tensor_id in [
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+    ] {
+        store
+            .get_mut(tensor_id)
+            .expect("tensor exists")
+            .requires_grad = true;
+    }
+
+    let output = linear_attention_core(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        &mut store,
+        &mut tape,
+    )?;
+    let loss = sum(output, &mut store, &mut tape)?;
+    let grads = tape.backward(loss, &mut store)?;
+
+    for (label, tensor_id) in [
+        ("qkv", qkv),
+        ("z", z),
+        ("b_proj", b_proj),
+        ("a_proj", a_proj),
+        ("conv1d_weight", conv1d_weight),
+        ("dt_bias", dt_bias),
+        ("a_log", a_log),
+        ("norm_weight", norm_weight),
+    ] {
+        let grad_id = *grads.get(&tensor_id).expect("grad exists");
+        let grad = store.to_host(grad_id)?;
+        assert!(
+            grad.iter().all(|value| value.is_finite()),
+            "{label} grad contains non-finite values"
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "metal")]
 #[test]
 fn metal_linear_attention_matches_cpu_with_device_inputs() -> Result<()> {
