@@ -216,14 +216,31 @@ CUDA-12.8 job:
 - `test_merge_dynamic_shared_rewrites_cp_async_case_after_flatten`
 - `test_merge_dynamic_shared_lowbit_style_scratch_and_long_buffer_do_not_reuse_yet`
 
-None of them lived on the branch at base commit `7f359ea8` — they were
-introduced upstream by `e84a0ee6 [Transform] Rewrite
-MergeSharedMemoryAllocations with per-epoch liveness (#2185)` and the
-pipeline refactor `3bf3d00a (#2245)`. GitHub Actions' `pull_request` event
-runs the workflow against the virtual `refs/pull/N/merge` ref (PR head +
-base), so the new upstream tests were exercised against my old transform
-code. Resolved by explicit `git merge upstream/main` into the fork branch
-(commit `444d370b`), then `git push`. New CI run pending at PR head.
+These failures have two distinct causes, not one:
+
+- The 3 `test_merge_dynamic_shared_*` cases are **new tests** added by
+  `e84a0ee6 [Transform] Rewrite MergeSharedMemoryAllocations with per-epoch
+  liveness (#2185)`. They did not exist at the branch base `7f359ea8`, so
+  the assertions describe the *post-rewrite* behavior. GitHub Actions'
+  `pull_request` event runs the workflow against the virtual
+  `refs/pull/N/merge` ref (PR head merged into base), so the new upstream
+  tests were exercised against this branch's pre-rewrite `merge_shared_memory_allocations.cc`
+  and failed.
+- `test_wgmma_atom_gemm` is **pre-existing** at `7f359ea8` and passed on
+  upstream main. It started failing on this branch's merge-ref likely
+  because of `3bf3d00a [Pipeline] Refactor software pipeline transforms
+  (#2245)` — the only upstream pipeline change between base and head, and
+  the WGMMA path is downstream of the software-pipeline lowering. Not
+  confirmed by bisect; the symptom (98.6% mismatch) is consistent with
+  a pipeline / barrier ordering regression rather than a numerical-precision
+  one, but other transitive causes (e.g. `c66cadf8 named barrier arrive`)
+  cannot be ruled out without a fresh run.
+
+Both classes are resolved by the same fix: explicit `git merge upstream/main`
+into the fork branch (commit `444d370b`), then `git push`. After that push,
+GitHub did not auto-create check-suites for the new head SHAs — left a
+maintainer ping on the PR and posted an empty re-trigger commit
+(`e401700f`) to retry. CI status pending maintainer action.
 
 ## Rule
 
