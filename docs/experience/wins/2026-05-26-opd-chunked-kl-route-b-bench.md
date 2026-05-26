@@ -173,13 +173,76 @@ Train step itself still hits the host-RAM `rc=137` (Follow-up 2 below)
 so per-step train wall-clock + train-step KL parity are not yet on
 this table.
 
+## Follow-up 2 (2026-05-26) — host RAM evict unblocks first train step
+
+`93fa4fac fix(opd): evict CUDA host mirrors before Route B train` was
+the structural fix: model weights were keeping a full host-side mirror
+after upload to device, blowing 19.8 GB host RAM before the first
+train step even started. The new
+`TensorStore::evict_host_mirror(TensorId)` drops the cached host copy
+once the device handle is established; weights become device-
+authoritative and host RSS collapses.
+
+| metric | before evict | after evict | Δ |
+|---|---:|---:|---:|
+| RSS (kB) | 19 798 864 | 2 116 644 | **−89 %** |
+| host tensor bytes | 19 969 350 912 | 185 867 520 | **−99 %** |
+| live tensors | 774 | 774 | 0 |
+| device-only tensors | 187 | 388 | +201 |
+
+201 tensors flipped from "host + device mirror" to device-only,
+recovering ~17.7 GB host RAM. With `STATIC_PARAM_EVICT_MIN_ELEMENTS=
+1_000_000` only large weight tensors are evicted; smaller buffers
+keep their host mirror for cheap to-host reads.
+
+### Clean `wD-windowed-train-1step` re-run on V100 32 GB
+
+| phase | metric | value |
+|---|---|---:|
+| step-0 eval | wall-clock | **252.4 s** |
+|  | train_kl | 1.031 × 10⁻⁵ |
+|  | heldout_kl | 7.465 × 10⁻⁶ |
+| train step 1 | wall-clock | **897.4 s** |
+|  | rollout | 111.6 s |
+|  | teacher forward | 168.2 s |
+|  | student forward | 78.1 s |
+|  | **backward** | **538.2 s (60 %)** |
+|  | loss | 9.72 × 10⁻⁶ |
+| post-train | RSS | 9.22 GB |
+|  | host tensor bytes | 1.824 GB |
+|  | peak GPU | 25 440 MiB |
+
+End-to-end Route B GKD now runs on V100 32 GB at the 512-token corpus
+shape that previously OOMed everywhere:
+
+- ~15 min per train step is real cost (Volta sm_70 FP16 fallback for
+  attention, no BF16 tensor cores)
+- backward dominates 60 % of step — expected: per-window forward path
+  does work that the baseline only did once, and the autograd graph
+  tracks every window's reduce-mean-then-weight chain
+- post-train RSS 9.22 GB is well under V100 host budget; the
+  pre-evict 19.8 GB peak was the original rc=137 root cause
+
+## Headline (updated)
+
+Route B is now end-to-end:
+
+- ✅ **VRAM:** windowed 20.8 GB vs fullogit 31.5 GB OOM
+- ✅ **Eval throughput:** windowed eval 252-271 s for step-0 (1 train
+  prompt + 4 heldout)
+- ✅ **Train step 1 lands** at 897 s on V100 32 GB; loss + KL numbers
+  recorded
+- ✅ **Host RSS** stable at 9 GB post-train (was 19.8 GB blowing rc=137)
+
 ## Next
 
-- **Train-step host RAM OOM (Follow-up 2)** — separate CPU memory
-  audit; not a Route B regression. Hypotheses to bisect: full-vocab
-  logits copy held on host, rollout argmax readback materializing
-  `[S, V]`, optimizer/grad accum host copy, or tokenizer/preprocessor
-  buffer retained too long. Window-or-stream the offender; do not
-  alloc full `[S, V]` host-side.
-- After Follow-up 2 lands, re-run a clean `windowed` 1-step bench and
-  add train-step KL + step wall-clock to this table.
+- **Per-step wall-clock optimization** — 897 s/step is workable but
+  not productive. Backward 60 % suggests the per-window backward graph
+  has extra reduce/scale ops. Profile + try cudaGraph capture for the
+  windowed path (current path is eager).
+- **Production-scale loop** — 5-10 step run with eval cadence; verify
+  KL trajectory matches the unwindowed reference (when reference is
+  feasible) at small shapes.
+- **Forward perf** — 168 s teacher + 78 s student is the per-window
+  recompute cost (windows re-run the prefix). KV-cache reuse across
+  windows would cut this in half but is a bigger structural change.
