@@ -74,6 +74,22 @@ within BF16 truncation noise. The kernel pair, the kv_meta / kv_indices
 layout interpretation, and the per-(token, head) scale plumbing are all
 clean when the dispatch fields match the kernel's contract.
 
+**CUDA Graph ruled out** (2026-05-26): re-ran the audit with
+`INFER_TEST_CUDA_GRAPH=0` after teaching the harness to honor the
+env. FP8 `mean_match = 0.0156`, `first_div = step 1` — bit-for-bit
+identical to the graph-on result. Graph-capture write-order is not
+the bug.
+
+**Structural symmetry confirmed**: INT8 mode and FP8 mode use the
+exact same paged-pool buffers and dispatch shapes — both route the
+prep K/V to `pool.k_ptr(layer)` (which is the shared `k_work` for
+both quantized formats), both call `quantize_paged_kv_<x>` with the
+same `last_token_indices` / `prefill_token_rows` plumbing, both call
+`decode_attention_<x>` with the same `kv_indices` / `kv_meta`. The
+only on-the-wire difference is the kernel name. INT8 passes parity,
+FP8 fails — so the bug is in some FP8-specific behavior the kernel
+parity tests have not yet exercised.
+
 **Conclusion**: the audit's step-1 catastrophic divergence is in
 scheduler-side runtime dispatch wiring of the values fed to these
 kernels, not in any FP8 CUDA kernel. Remaining suspect surface:
