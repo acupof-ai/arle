@@ -269,6 +269,52 @@ is not licensed yet. Next step is a narrower split: identify which
 intermediate recompute vs scan/state-history work before choosing the
 kernel target.
 
+### Phase 2A.1 — `MatmulBT` site attribution
+
+`9efc40be feat(train): attribute OPD backward profile sites` adds a
+static site label to `MatmulBT` at op construction time. For OPD this
+uses the tensor name already carried by `LinearWithLora`; the direct
+Qwen3.5 LM head path is labelled `lm_head`. The profile now emits both
+the op aggregate and `opd_backward_site_profile`, so the `MatmulBT`
+bucket can be grouped by projection family instead of guessed from the
+call count.
+
+V100 run:
+`bench-output/2026-05-26-opd-chunked-kl-route-b-wG-windowed-attribution/`
+
+Same Route B shape as `wE`: `--steps 1 --eval-steps 999
+--logits-window-size 64`, with `ARLE_OPD_BACKWARD_PROFILE=1`.
+
+| metric | value |
+|---|---:|
+| rc | 0 |
+| train step 1 wall-clock | 422.1 s |
+| backward wall-clock | 179.4 s (42.5 % of step) |
+| `MatmulBT` total | 90.0 s (50.2 % backward / 21.3 % step) |
+| peak GPU | 30 822 MiB |
+
+Grouped `MatmulBT` sites:
+
+| group | calls | seconds | % backward |
+|---|---:|---:|---:|
+| `linear_attn.in_proj_qkv` | 30 | 22.7 | 12.7 % |
+| `mlp.down_proj` | 42 | 15.3 | 8.5 % |
+| `mlp.up_proj` | 42 | 15.3 | 8.5 % |
+| `mlp.gate_proj` | 42 | 14.5 | 8.1 % |
+| `linear_attn.in_proj_z` | 30 | 6.8 | 3.8 % |
+| `linear_attn.out_proj` | 30 | 6.7 | 3.7 % |
+| `full_attn.q_proj` | 10 | 4.9 | 2.7 % |
+| `full_attn.o_proj` | 12 | 2.3 | 1.3 % |
+| other full-attn / LoRA / LM head sites | 110 | 1.5 | 0.8 % |
+
+Top individual sites are still diffuse: the largest single site is
+`model.language_model.layers.5.linear_attn.in_proj_qkv.weight` at
+1.78 s (0.99 % of backward), followed by other linear-attention QKV
+input projections at ~1.38-1.74 s each. No one or two `MatmulBT`
+sites dominate. The actionable target is therefore structural
+amortization across many per-layer GEMMs (or a broader linear-attn
+backward kernel), not a one-off replacement for a single projection.
+
 ## Headline (updated)
 
 Route B is now end-to-end:
