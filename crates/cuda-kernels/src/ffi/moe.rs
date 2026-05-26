@@ -185,6 +185,13 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_fill_i32_cuda(
+        data: *mut i32,
+        value: i32,
+        elements: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_count_packed_local_experts_cuda(
         packed_meta: *const i32,
         counts: *mut i32,
@@ -201,6 +208,16 @@ unsafe extern "C" {
         cursors: *mut i32,
         num_routes: i32,
         local_expert_start: i32,
+        experts_per_rank: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_prepare_deepgemm_all_expert_metadata_cuda(
+        active_experts: *mut i32,
+        active_offsets: *mut i32,
+        active_counts: *mut i32,
+        local_offsets: *const i32,
+        local_counts: *const i32,
         experts_per_rank: i32,
         stream: CUstream,
     ) -> CUresult;
