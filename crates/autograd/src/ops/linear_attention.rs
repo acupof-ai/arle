@@ -6,8 +6,6 @@ use crate::{
     tensor::{Tensor, TensorId, TensorStore},
 };
 
-const MIN_STABLE_DECAY: f32 = 1.0e-6;
-
 #[derive(Debug, Clone, Copy)]
 pub struct LinearAttentionParams {
     pub batch: usize,
@@ -26,6 +24,7 @@ struct LinearAttentionForward {
     beta: Vec<f32>,
     exp_g: Vec<f32>,
     kv_mem: Vec<f32>,
+    state_history: Vec<f32>,
     final_state: Vec<f32>,
 }
 
@@ -397,14 +396,24 @@ pub(crate) fn linear_attention_backward(
                     dk[key_idx] += accum;
                 }
 
+                let prev_state = if seq_idx == 0 {
+                    vec![0.0_f32; key_dim * value_dim]
+                } else {
+                    let prev_base = state_time_base(
+                        batch_idx,
+                        seq_idx - 1,
+                        value_head,
+                        seq_len,
+                        num_value_heads,
+                        key_dim,
+                        value_dim,
+                    );
+                    forward.state_history[prev_base..prev_base + key_dim * value_dim].to_vec()
+                };
                 let mut dstate_prev = vec![0.0_f32; key_dim * value_dim];
                 let mut dexp_g = 0.0_f32;
-                let decay_is_stable = exp_g.is_finite() && exp_g > MIN_STABLE_DECAY;
                 for idx in 0..key_dim * value_dim {
-                    if !decay_is_stable {
-                        continue;
-                    }
-                    dexp_g += (s_decay[idx] / exp_g) * grad_state[idx];
+                    dexp_g += prev_state[idx] * grad_state[idx];
                     dstate_prev[idx] = grad_state[idx] * exp_g;
                 }
 
@@ -455,11 +464,7 @@ pub(crate) fn linear_attention_backward(
                     )] += dv_raw[value_idx];
                 }
 
-                state = if decay_is_stable {
-                    s_decay.iter().map(|value| value / exp_g).collect()
-                } else {
-                    vec![0.0; key_dim * value_dim]
-                };
+                state = prev_state;
                 grad_state = dstate_prev;
             }
         }
@@ -609,6 +614,14 @@ fn linear_attention_forward(
     let mut beta = vec![0.0_f32; params.batch * params.seq_len * params.num_value_heads];
     let mut exp_g = vec![0.0_f32; params.batch * params.seq_len * params.num_value_heads];
     let mut kv_mem = vec![0.0_f32; params.batch * params.seq_len * z_dim];
+    let mut state_history = vec![
+        0.0_f32;
+        params.batch
+            * params.seq_len
+            * params.num_value_heads
+            * params.key_dim
+            * params.value_dim
+    ];
     let mut final_state =
         vec![0.0_f32; params.batch * params.num_value_heads * params.key_dim * params.value_dim];
 
@@ -745,6 +758,18 @@ fn linear_attention_forward(
                     core_out[value_idx] = accum;
                 }
 
+                let history_base = state_time_base(
+                    batch_idx,
+                    seq_idx,
+                    value_head,
+                    params.seq_len,
+                    params.num_value_heads,
+                    params.key_dim,
+                    params.value_dim,
+                );
+                state_history[history_base..history_base + params.key_dim * params.value_dim]
+                    .copy_from_slice(&state[base..base + params.key_dim * params.value_dim]);
+
                 let (normed, _) = rmsnorm_row(&core_out, norm_weight, params.eps);
                 for value_idx in 0..params.value_dim {
                     let gate = silu_scalar(
@@ -781,6 +806,7 @@ fn linear_attention_forward(
         beta,
         exp_g,
         kv_mem,
+        state_history,
         final_state,
     }
 }
@@ -998,4 +1024,16 @@ fn state_base(batch: usize, head: usize, heads: usize, key_dim: usize, value_dim
 
 fn state_head_base(head: usize, key_dim: usize, value_dim: usize) -> usize {
     head * key_dim * value_dim
+}
+
+fn state_time_base(
+    batch: usize,
+    seq: usize,
+    head: usize,
+    seq_len: usize,
+    heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> usize {
+    (((batch * seq_len + seq) * heads + head) * key_dim) * value_dim
 }
