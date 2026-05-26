@@ -208,7 +208,15 @@ __global__ void quantize_paged_kv_fp8_kernel(
         float v = (lane_id < num_warps) ? smem[lane_id] : 0.0f;
         v = warp_reduce_max_abs(v);
         if (lane_id == 0) {
-            s_scale = fmaxf(v / 448.0f, 1.0e-6f);
+            // Match the INT8 guard: only protect against divide-by-zero, no
+            // numerical floor. The earlier 1e-6 floor activated whenever the
+            // row absmax fell below 4.48e-4 (typical at deep Qwen3 layers
+            // where K activations shrink), forcing val/s_scale to underflow
+            // FP8 E4M3's subnormal threshold and round to ±0 — the root
+            // cause of the 2026-05-26 mean_match=0.0156 catastrophic
+            // divergence (layer 17/35 K bytes mostly 0x00/0x80 in the
+            // INFER_FP8_DEBUG dump).
+            s_scale = (v > 0.0f) ? (v / 448.0f) : 1.0f;
             scales[row_idx * num_kv_heads + kv_head] = s_scale;
         }
     }
@@ -281,7 +289,9 @@ __global__ void quantize_scatter_kv_fp8_kernel(
         float v = (lane_id < num_warps) ? smem[lane_id] : 0.0f;
         v = warp_reduce_max_abs(v);
         if (lane_id == 0) {
-            s_scale = fmaxf(v / 448.0f, 1.0e-6f);
+            // Same guard as the per-token decode quant kernel: no
+            // 1e-6 numerical floor, only divide-by-zero protection.
+            s_scale = (v > 0.0f) ? (v / 448.0f) : 1.0f;
             scales[row_idx * num_kv_heads + kv_head] = s_scale;
         }
     }
