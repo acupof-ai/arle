@@ -22,7 +22,10 @@ use crate::{
 };
 use crate::{
     Result,
-    backend::{Backend, Device, DeviceGradClipResult, DeviceHandle},
+    backend::{
+        Backend, Device, DeviceGradClipResult, DeviceHandle, LinearAttentionScanBackwardArgs,
+        LinearAttentionScanBackwardGrads,
+    },
 };
 #[cfg(not(feature = "no-cuda"))]
 #[path = "backend_cuda/kernels.rs"]
@@ -679,6 +682,24 @@ impl Backend for CudaBackend {
             self.stream
                 .synchronize()
                 .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))
+        }
+    }
+
+    fn linear_attention_scan_backward(
+        &self,
+        args: LinearAttentionScanBackwardArgs<'_>,
+    ) -> Result<Option<LinearAttentionScanBackwardGrads>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = args;
+            todo!(
+                "GPU required: cuda linear_attention_scan_backward is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_linear_attention_scan_backward(self, args)
         }
     }
 
@@ -2739,6 +2760,206 @@ fn cuda_gather_last_dim_backward(
     )?;
 
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_linear_attention_scan_backward(
+    backend: &CudaBackend,
+    args: LinearAttentionScanBackwardArgs<'_>,
+) -> Result<Option<LinearAttentionScanBackwardGrads>> {
+    let p = args.params;
+    const MAX_DIM: usize = 256;
+    if p.key_dim > MAX_DIM || p.value_dim > MAX_DIM {
+        return Ok(None);
+    }
+
+    let q_dim = p.num_key_heads * p.key_dim;
+    let qkv_dim = q_dim * 2 + p.num_value_heads * p.value_dim;
+    let z_dim = p.num_value_heads * p.value_dim;
+    let qkv_len = p.batch * p.seq_len * qkv_dim;
+    let z_len = p.batch * p.seq_len * z_dim;
+    let head_len = p.batch * p.seq_len * p.num_value_heads;
+    let state_len = p.batch * p.num_value_heads * p.key_dim * p.value_dim;
+    let state_history_len = p.batch * p.seq_len * p.num_value_heads * p.key_dim * p.value_dim;
+
+    for (label, got, expected) in [
+        ("upstream", args.upstream.len(), z_len),
+        ("z", args.z.len(), z_len),
+        ("a_proj", args.a_proj.len(), head_len),
+        ("dt_bias", args.dt_bias.len(), p.num_value_heads),
+        ("a_log", args.a_log.len(), p.num_value_heads),
+        ("norm_weight", args.norm_weight.len(), p.value_dim),
+        ("preact", args.preact.len(), qkv_len),
+        ("beta", args.beta.len(), head_len),
+        ("exp_g", args.exp_g.len(), head_len),
+        ("kv_mem", args.kv_mem.len(), z_len),
+        ("state_history", args.state_history.len(), state_history_len),
+        ("final_state", args.final_state.len(), state_len),
+    ] {
+        if got != expected {
+            return Err(AutogradError::TapeInvariant(Box::leak(
+                format!(
+                    "cuda linear_attention_scan_backward {label} len mismatch: got={got} expected={expected}"
+                )
+                .into_boxed_str(),
+            )));
+        }
+    }
+
+    let d_upstream = backend.upload_slice(args.upstream, &[z_len])?;
+    let d_z = backend.upload_slice(args.z, &[z_len])?;
+    let d_a_proj = backend.upload_slice(args.a_proj, &[head_len])?;
+    let d_dt_bias = backend.upload_slice(args.dt_bias, &[p.num_value_heads])?;
+    let d_a_log = backend.upload_slice(args.a_log, &[p.num_value_heads])?;
+    let d_norm_weight = backend.upload_slice(args.norm_weight, &[p.value_dim])?;
+    let d_preact = backend.upload_slice(args.preact, &[qkv_len])?;
+    let d_beta = backend.upload_slice(args.beta, &[head_len])?;
+    let d_exp_g = backend.upload_slice(args.exp_g, &[head_len])?;
+    let d_kv_mem = backend.upload_slice(args.kv_mem, &[z_len])?;
+    let d_state_history = backend.upload_slice(args.state_history, &[state_history_len])?;
+    let d_final_state = backend.upload_slice(args.final_state, &[state_len])?;
+
+    let mut d_dqkv = backend.stream.alloc_zeros::<f32>(qkv_len).map_err(|_| {
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (linear_attention dqkv)")
+    })?;
+    let mut d_dz = backend.stream.alloc_zeros::<f32>(z_len).map_err(|_| {
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (linear_attention dz)")
+    })?;
+    let mut d_db = backend.stream.alloc_zeros::<f32>(head_len).map_err(|_| {
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (linear_attention db)")
+    })?;
+    let mut d_da = backend.stream.alloc_zeros::<f32>(head_len).map_err(|_| {
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (linear_attention da)")
+    })?;
+    let mut d_ddt = backend
+        .stream
+        .alloc_zeros::<f32>(p.num_value_heads)
+        .map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (linear_attention ddt)")
+        })?;
+    let mut d_da_log = backend
+        .stream
+        .alloc_zeros::<f32>(p.num_value_heads)
+        .map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (linear_attention da_log)")
+        })?;
+    let mut d_dnorm = backend
+        .stream
+        .alloc_zeros::<f32>(p.value_dim)
+        .map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (linear_attention dnorm)")
+        })?;
+    let mut d_grad_state = backend.stream.alloc_zeros::<f32>(state_len).map_err(|_| {
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (linear_attention grad_state)")
+    })?;
+
+    let rows = p.batch * p.num_value_heads;
+    let batch_i32 = i32::try_from(p.batch)
+        .map_err(|_| AutogradError::TapeInvariant("cuda linear_attention batch exceeds i32"))?;
+    let seq_len_i32 = i32::try_from(p.seq_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda linear_attention seq_len exceeds i32"))?;
+    let key_heads_i32 = i32::try_from(p.num_key_heads).map_err(|_| {
+        AutogradError::TapeInvariant("cuda linear_attention num_key_heads exceeds i32")
+    })?;
+    let value_heads_i32 = i32::try_from(p.num_value_heads).map_err(|_| {
+        AutogradError::TapeInvariant("cuda linear_attention num_value_heads exceeds i32")
+    })?;
+    let key_dim_i32 = i32::try_from(p.key_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda linear_attention key_dim exceeds i32"))?;
+    let value_dim_i32 = i32::try_from(p.value_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda linear_attention value_dim exceeds i32"))?;
+    let qkv_dim_i32 = i32::try_from(qkv_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda linear_attention qkv_dim exceeds i32"))?;
+
+    launch_rows(
+        &backend.stream,
+        backend
+            .kernels
+            .function("linear_attention_scan_backward_f32")?,
+        rows,
+        256,
+        0,
+        |mut builder| {
+            builder
+                .arg(&mut d_dqkv)
+                .arg(&mut d_dz)
+                .arg(&mut d_db)
+                .arg(&mut d_da)
+                .arg(&mut d_ddt)
+                .arg(&mut d_da_log)
+                .arg(&mut d_dnorm)
+                .arg(&mut d_grad_state)
+                .arg(&d_upstream)
+                .arg(&d_z)
+                .arg(&d_a_proj)
+                .arg(&d_dt_bias)
+                .arg(&d_a_log)
+                .arg(&d_norm_weight)
+                .arg(&d_preact)
+                .arg(&d_beta)
+                .arg(&d_exp_g)
+                .arg(&d_kv_mem)
+                .arg(&d_state_history)
+                .arg(&d_final_state)
+                .arg(&batch_i32)
+                .arg(&seq_len_i32)
+                .arg(&key_heads_i32)
+                .arg(&value_heads_i32)
+                .arg(&key_dim_i32)
+                .arg(&value_dim_i32)
+                .arg(&qkv_dim_i32)
+                .arg(&p.eps);
+            builder
+        },
+    )?;
+
+    Ok(Some(LinearAttentionScanBackwardGrads {
+        dqkv: cuda_readback_slice(backend, &d_dqkv, qkv_len, "linear_attention dqkv")?,
+        dz: cuda_readback_slice(backend, &d_dz, z_len, "linear_attention dz")?,
+        db: cuda_readback_slice(backend, &d_db, head_len, "linear_attention db")?,
+        da: cuda_readback_slice(backend, &d_da, head_len, "linear_attention da")?,
+        ddt: cuda_readback_slice(backend, &d_ddt, p.num_value_heads, "linear_attention ddt")?,
+        da_log: cuda_readback_slice(
+            backend,
+            &d_da_log,
+            p.num_value_heads,
+            "linear_attention da_log",
+        )?,
+        dnorm: cuda_readback_slice(backend, &d_dnorm, p.value_dim, "linear_attention dnorm")?,
+    }))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_readback_slice(
+    backend: &CudaBackend,
+    slice: &CudaSlice<f32>,
+    len: usize,
+    label: &'static str,
+) -> Result<Vec<f32>> {
+    if slice.len() != len {
+        return Err(AutogradError::TapeInvariant(Box::leak(
+            format!(
+                "cuda readback len mismatch ({label}): got={} expected={len}",
+                slice.len()
+            )
+            .into_boxed_str(),
+        )));
+    }
+    let mut host = vec![0.0f32; len];
+    backend
+        .stream
+        .memcpy_dtoh(slice, &mut host)
+        .map_err(|err| {
+            AutogradError::TapeInvariant(Box::leak(
+                format!("cuda dtoh copy failed ({label}): {err:?}").into_boxed_str(),
+            ))
+        })?;
+    backend.stream.synchronize().map_err(|err| {
+        AutogradError::TapeInvariant(Box::leak(
+            format!("cuda synchronize failed ({label}): {err:?}").into_boxed_str(),
+        ))
+    })?;
+    Ok(host)
 }
 
 #[cfg(not(feature = "no-cuda"))]

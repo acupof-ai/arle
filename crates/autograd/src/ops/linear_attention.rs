@@ -11,6 +11,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::{LinearAttentionScanBackwardArgs, LinearAttentionScanBackwardParams},
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Tensor, TensorId, TensorStore},
 };
@@ -379,229 +380,266 @@ pub(crate) fn linear_attention_backward(
 
     let scan_started = subop_started(&profile);
     let mut nested_param_grad_duration = Duration::default();
-    for batch_idx in 0..batch {
-        for value_head in 0..num_value_heads {
-            let key_head = value_head * num_key_heads / num_value_heads;
-            let mut state = forward.final_state[state_base(
-                batch_idx,
-                value_head,
-                num_value_heads,
-                key_dim,
-                value_dim,
-            )
-                ..state_base(batch_idx, value_head, num_value_heads, key_dim, value_dim)
-                    + key_dim * value_dim]
-                .to_vec();
-            let mut grad_state = vec![0.0_f32; key_dim * value_dim];
-            let exp_a = a_log_tensor.data[value_head].exp();
-
-            for seq_idx in (0..seq_len).rev() {
-                let preact_row = row3(
-                    &forward.preact,
-                    batch_idx,
-                    seq_idx,
+    if let Some(cuda_grads) =
+        store
+            .backend()
+            .linear_attention_scan_backward(LinearAttentionScanBackwardArgs {
+                params: LinearAttentionScanBackwardParams {
+                    batch,
                     seq_len,
-                    qkv_tensor.shape[2],
-                );
-                let q_raw = silu_slice(&preact_row[key_head * key_dim..(key_head + 1) * key_dim]);
-                let k_raw = silu_slice(
-                    &preact_row[q_dim + key_head * key_dim..q_dim + (key_head + 1) * key_dim],
-                );
-                let v_raw = silu_slice(
-                    &preact_row[v_offset + value_head * value_dim
-                        ..v_offset + (value_head + 1) * value_dim],
-                );
-
-                let q = l2_normalize_scaled(&q_raw, 1.0 / (key_dim as f32).sqrt());
-                let k = l2_normalize_scaled(&k_raw, 1.0);
-                let beta =
-                    forward.beta[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
-                let exp_g =
-                    forward.exp_g[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
-                let a_value =
-                    a_tensor.data[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
-                let softplus_input = a_value + dt_tensor.data[value_head];
-                let softplus_value = softplus_scalar(softplus_input);
-                let kv_mem = row4(
-                    &forward.kv_mem,
-                    batch_idx,
-                    seq_idx,
-                    value_head,
-                    seq_len,
+                    num_key_heads,
                     num_value_heads,
+                    key_dim,
                     value_dim,
-                );
-                let delta = v_raw
-                    .iter()
-                    .zip(kv_mem.iter())
-                    .map(|(&v_value, &kv_value)| (v_value - kv_value) * beta)
-                    .collect::<Vec<_>>();
-
-                let gate_row = row4(
-                    &z_tensor.data,
+                    eps,
+                },
+                upstream: &upstream.data,
+                z: &z_tensor.data,
+                a_proj: &a_tensor.data,
+                dt_bias: &dt_tensor.data,
+                a_log: &a_log_tensor.data,
+                norm_weight: &norm_tensor.data,
+                preact: &forward.preact,
+                beta: &forward.beta,
+                exp_g: &forward.exp_g,
+                kv_mem: &forward.kv_mem,
+                state_history: &forward.state_history,
+                final_state: &forward.final_state,
+            })?
+    {
+        dqkv = cuda_grads.dqkv;
+        dz = cuda_grads.dz;
+        db = cuda_grads.db;
+        da = cuda_grads.da;
+        ddt = cuda_grads.ddt;
+        da_log = cuda_grads.da_log;
+        dnorm = cuda_grads.dnorm;
+    } else {
+        for batch_idx in 0..batch {
+            for value_head in 0..num_value_heads {
+                let key_head = value_head * num_key_heads / num_value_heads;
+                let mut state = forward.final_state[state_base(
                     batch_idx,
-                    seq_idx,
                     value_head,
-                    seq_len,
                     num_value_heads,
+                    key_dim,
                     value_dim,
-                );
-                let upstream_row = row4(
-                    &upstream.data,
-                    batch_idx,
-                    seq_idx,
-                    value_head,
-                    seq_len,
-                    num_value_heads,
-                    value_dim,
-                );
-                let core_out = mat_t_vec(&state, &q.values, key_dim, value_dim);
-                let (normed, inv_rms) = rmsnorm_row(&core_out, &norm_tensor.data, eps);
-                let gate_silu = silu_slice(gate_row);
+                )
+                    ..state_base(batch_idx, value_head, num_value_heads, key_dim, value_dim)
+                        + key_dim * value_dim]
+                    .to_vec();
+                let mut grad_state = vec![0.0_f32; key_dim * value_dim];
+                let exp_a = a_log_tensor.data[value_head].exp();
 
-                let mut dcore = vec![0.0_f32; value_dim];
-                let mut dot_beta = 0.0_f32;
-                let param_started = subop_started(&profile);
-                for value_idx in 0..value_dim {
-                    dcore[value_idx] = upstream_row[value_idx] * gate_silu[value_idx];
-                    let gate_grad = upstream_row[value_idx] * normed[value_idx];
-                    dz[idx4(
+                for seq_idx in (0..seq_len).rev() {
+                    let preact_row = row3(
+                        &forward.preact,
+                        batch_idx,
+                        seq_idx,
+                        seq_len,
+                        qkv_tensor.shape[2],
+                    );
+                    let q_raw =
+                        silu_slice(&preact_row[key_head * key_dim..(key_head + 1) * key_dim]);
+                    let k_raw = silu_slice(
+                        &preact_row[q_dim + key_head * key_dim..q_dim + (key_head + 1) * key_dim],
+                    );
+                    let v_raw = silu_slice(
+                        &preact_row[v_offset + value_head * value_dim
+                            ..v_offset + (value_head + 1) * value_dim],
+                    );
+
+                    let q = l2_normalize_scaled(&q_raw, 1.0 / (key_dim as f32).sqrt());
+                    let k = l2_normalize_scaled(&k_raw, 1.0);
+                    let beta = forward.beta
+                        [idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
+                    let exp_g = forward.exp_g
+                        [idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
+                    let a_value = a_tensor.data
+                        [idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
+                    let softplus_input = a_value + dt_tensor.data[value_head];
+                    let softplus_value = softplus_scalar(softplus_input);
+                    let kv_mem = row4(
+                        &forward.kv_mem,
                         batch_idx,
                         seq_idx,
                         value_head,
-                        value_idx,
                         seq_len,
                         num_value_heads,
-                        value_dim,
-                    )] += gate_grad * silu_grad_scalar(gate_row[value_idx]);
-                    dot_beta +=
-                        dcore[value_idx] * core_out[value_idx] * norm_tensor.data[value_idx];
-                    dnorm[value_idx] += dcore[value_idx] * core_out[value_idx] * inv_rms;
-                }
-                nested_param_grad_duration += elapsed_subop(param_started);
-                dcore = rmsnorm_backward_row(
-                    &core_out,
-                    &norm_tensor.data,
-                    &dcore,
-                    inv_rms,
-                    dot_beta,
-                    value_dim,
-                );
-
-                let dq = mat_vec(&state, &dcore, key_dim, value_dim);
-                add_outer_in_place(&mut grad_state, &q.values, &dcore, key_dim, value_dim);
-
-                let mut s_decay = state.clone();
-                subtract_outer_in_place(&mut s_decay, &k.values, &delta, key_dim, value_dim);
-
-                let mut d_delta = vec![0.0_f32; value_dim];
-                let mut dk = vec![0.0_f32; key_dim];
-                for key_idx in 0..key_dim {
-                    let mut accum = 0.0_f32;
-                    for value_idx in 0..value_dim {
-                        let grad_value = grad_state[key_idx * value_dim + value_idx];
-                        accum += grad_value * delta[value_idx];
-                        d_delta[value_idx] += grad_value * k.values[key_idx];
-                    }
-                    dk[key_idx] += accum;
-                }
-
-                let mut dkv_mem = vec![0.0_f32; value_dim];
-                let v_minus_kv = v_raw
-                    .iter()
-                    .zip(kv_mem.iter())
-                    .map(|(&v_value, &kv_value)| v_value - kv_value)
-                    .collect::<Vec<_>>();
-                let mut dbeta_scalar = 0.0_f32;
-                for value_idx in 0..value_dim {
-                    dbeta_scalar += d_delta[value_idx] * v_minus_kv[value_idx];
-                    dkv_mem[value_idx] -= d_delta[value_idx] * beta;
-                }
-
-                for key_idx in 0..key_dim {
-                    let mut accum = 0.0_f32;
-                    for value_idx in 0..value_dim {
-                        grad_state[key_idx * value_dim + value_idx] +=
-                            k.values[key_idx] * dkv_mem[value_idx];
-                        accum += s_decay[key_idx * value_dim + value_idx] * dkv_mem[value_idx];
-                    }
-                    dk[key_idx] += accum;
-                }
-
-                let prev_state = if seq_idx == 0 {
-                    vec![0.0_f32; key_dim * value_dim]
-                } else {
-                    let prev_base = state_time_base(
-                        batch_idx,
-                        seq_idx - 1,
-                        value_head,
-                        seq_len,
-                        num_value_heads,
-                        key_dim,
                         value_dim,
                     );
-                    forward.state_history[prev_base..prev_base + key_dim * value_dim].to_vec()
-                };
-                let mut dstate_prev = vec![0.0_f32; key_dim * value_dim];
-                let mut dexp_g = 0.0_f32;
-                for idx in 0..key_dim * value_dim {
-                    dexp_g += prev_state[idx] * grad_state[idx];
-                    dstate_prev[idx] = grad_state[idx] * exp_g;
-                }
+                    let delta = v_raw
+                        .iter()
+                        .zip(kv_mem.iter())
+                        .map(|(&v_value, &kv_value)| (v_value - kv_value) * beta)
+                        .collect::<Vec<_>>();
 
-                let dg = dexp_g * exp_g;
-                let softplus_grad = sigmoid_scalar(softplus_input);
-                let param_started = subop_started(&profile);
-                da[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] +=
-                    dg * (-exp_a * softplus_grad);
-                ddt[value_head] += dg * (-exp_a * softplus_grad);
-                da_log[value_head] += dg * (-exp_a * softplus_value);
-                db[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] +=
-                    dbeta_scalar * beta * (1.0 - beta);
-                nested_param_grad_duration += elapsed_subop(param_started);
-
-                let dq_raw = l2_normalize_scaled_backward(
-                    &q_raw,
-                    &dq,
-                    q.norm,
-                    1.0 / (key_dim as f32).sqrt(),
-                );
-                let dk_raw = l2_normalize_scaled_backward(&k_raw, &dk, k.norm, 1.0);
-                let dv_raw = d_delta
-                    .iter()
-                    .map(|&d_value| d_value * beta)
-                    .collect::<Vec<_>>();
-
-                let param_started = subop_started(&profile);
-                for key_idx in 0..key_dim {
-                    dqkv[idx3(
+                    let gate_row = row4(
+                        &z_tensor.data,
                         batch_idx,
                         seq_idx,
-                        key_head * key_dim + key_idx,
+                        value_head,
                         seq_len,
-                        qkv_tensor.shape[2],
-                    )] += dq_raw[key_idx];
-                    dqkv[idx3(
+                        num_value_heads,
+                        value_dim,
+                    );
+                    let upstream_row = row4(
+                        &upstream.data,
                         batch_idx,
                         seq_idx,
-                        q_dim + key_head * key_dim + key_idx,
+                        value_head,
                         seq_len,
-                        qkv_tensor.shape[2],
-                    )] += dk_raw[key_idx];
-                }
-                for value_idx in 0..value_dim {
-                    dqkv[idx3(
-                        batch_idx,
-                        seq_idx,
-                        v_offset + value_head * value_dim + value_idx,
-                        seq_len,
-                        qkv_tensor.shape[2],
-                    )] += dv_raw[value_idx];
-                }
-                nested_param_grad_duration += elapsed_subop(param_started);
+                        num_value_heads,
+                        value_dim,
+                    );
+                    let core_out = mat_t_vec(&state, &q.values, key_dim, value_dim);
+                    let (normed, inv_rms) = rmsnorm_row(&core_out, &norm_tensor.data, eps);
+                    let gate_silu = silu_slice(gate_row);
 
-                state = prev_state;
-                grad_state = dstate_prev;
+                    let mut dcore = vec![0.0_f32; value_dim];
+                    let mut dot_beta = 0.0_f32;
+                    let param_started = subop_started(&profile);
+                    for value_idx in 0..value_dim {
+                        dcore[value_idx] = upstream_row[value_idx] * gate_silu[value_idx];
+                        let gate_grad = upstream_row[value_idx] * normed[value_idx];
+                        dz[idx4(
+                            batch_idx,
+                            seq_idx,
+                            value_head,
+                            value_idx,
+                            seq_len,
+                            num_value_heads,
+                            value_dim,
+                        )] += gate_grad * silu_grad_scalar(gate_row[value_idx]);
+                        dot_beta +=
+                            dcore[value_idx] * core_out[value_idx] * norm_tensor.data[value_idx];
+                        dnorm[value_idx] += dcore[value_idx] * core_out[value_idx] * inv_rms;
+                    }
+                    nested_param_grad_duration += elapsed_subop(param_started);
+                    dcore = rmsnorm_backward_row(
+                        &core_out,
+                        &norm_tensor.data,
+                        &dcore,
+                        inv_rms,
+                        dot_beta,
+                        value_dim,
+                    );
+
+                    let dq = mat_vec(&state, &dcore, key_dim, value_dim);
+                    add_outer_in_place(&mut grad_state, &q.values, &dcore, key_dim, value_dim);
+
+                    let mut s_decay = state.clone();
+                    subtract_outer_in_place(&mut s_decay, &k.values, &delta, key_dim, value_dim);
+
+                    let mut d_delta = vec![0.0_f32; value_dim];
+                    let mut dk = vec![0.0_f32; key_dim];
+                    for key_idx in 0..key_dim {
+                        let mut accum = 0.0_f32;
+                        for value_idx in 0..value_dim {
+                            let grad_value = grad_state[key_idx * value_dim + value_idx];
+                            accum += grad_value * delta[value_idx];
+                            d_delta[value_idx] += grad_value * k.values[key_idx];
+                        }
+                        dk[key_idx] += accum;
+                    }
+
+                    let mut dkv_mem = vec![0.0_f32; value_dim];
+                    let v_minus_kv = v_raw
+                        .iter()
+                        .zip(kv_mem.iter())
+                        .map(|(&v_value, &kv_value)| v_value - kv_value)
+                        .collect::<Vec<_>>();
+                    let mut dbeta_scalar = 0.0_f32;
+                    for value_idx in 0..value_dim {
+                        dbeta_scalar += d_delta[value_idx] * v_minus_kv[value_idx];
+                        dkv_mem[value_idx] -= d_delta[value_idx] * beta;
+                    }
+
+                    for key_idx in 0..key_dim {
+                        let mut accum = 0.0_f32;
+                        for value_idx in 0..value_dim {
+                            grad_state[key_idx * value_dim + value_idx] +=
+                                k.values[key_idx] * dkv_mem[value_idx];
+                            accum += s_decay[key_idx * value_dim + value_idx] * dkv_mem[value_idx];
+                        }
+                        dk[key_idx] += accum;
+                    }
+
+                    let prev_state = if seq_idx == 0 {
+                        vec![0.0_f32; key_dim * value_dim]
+                    } else {
+                        let prev_base = state_time_base(
+                            batch_idx,
+                            seq_idx - 1,
+                            value_head,
+                            seq_len,
+                            num_value_heads,
+                            key_dim,
+                            value_dim,
+                        );
+                        forward.state_history[prev_base..prev_base + key_dim * value_dim].to_vec()
+                    };
+                    let mut dstate_prev = vec![0.0_f32; key_dim * value_dim];
+                    let mut dexp_g = 0.0_f32;
+                    for idx in 0..key_dim * value_dim {
+                        dexp_g += prev_state[idx] * grad_state[idx];
+                        dstate_prev[idx] = grad_state[idx] * exp_g;
+                    }
+
+                    let dg = dexp_g * exp_g;
+                    let softplus_grad = sigmoid_scalar(softplus_input);
+                    let param_started = subop_started(&profile);
+                    da[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] +=
+                        dg * (-exp_a * softplus_grad);
+                    ddt[value_head] += dg * (-exp_a * softplus_grad);
+                    da_log[value_head] += dg * (-exp_a * softplus_value);
+                    db[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] +=
+                        dbeta_scalar * beta * (1.0 - beta);
+                    nested_param_grad_duration += elapsed_subop(param_started);
+
+                    let dq_raw = l2_normalize_scaled_backward(
+                        &q_raw,
+                        &dq,
+                        q.norm,
+                        1.0 / (key_dim as f32).sqrt(),
+                    );
+                    let dk_raw = l2_normalize_scaled_backward(&k_raw, &dk, k.norm, 1.0);
+                    let dv_raw = d_delta
+                        .iter()
+                        .map(|&d_value| d_value * beta)
+                        .collect::<Vec<_>>();
+
+                    let param_started = subop_started(&profile);
+                    for key_idx in 0..key_dim {
+                        dqkv[idx3(
+                            batch_idx,
+                            seq_idx,
+                            key_head * key_dim + key_idx,
+                            seq_len,
+                            qkv_tensor.shape[2],
+                        )] += dq_raw[key_idx];
+                        dqkv[idx3(
+                            batch_idx,
+                            seq_idx,
+                            q_dim + key_head * key_dim + key_idx,
+                            seq_len,
+                            qkv_tensor.shape[2],
+                        )] += dk_raw[key_idx];
+                    }
+                    for value_idx in 0..value_dim {
+                        dqkv[idx3(
+                            batch_idx,
+                            seq_idx,
+                            v_offset + value_head * value_dim + value_idx,
+                            seq_len,
+                            qkv_tensor.shape[2],
+                        )] += dv_raw[value_idx];
+                    }
+                    nested_param_grad_duration += elapsed_subop(param_started);
+
+                    state = prev_state;
+                    grad_state = dstate_prev;
+                }
             }
         }
     }
