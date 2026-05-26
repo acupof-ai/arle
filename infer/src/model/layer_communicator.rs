@@ -221,6 +221,24 @@ impl LayerCommunicator {
         self.ep_world_size
     }
 
+    /// Phase B-1 commit C.4 accessor: shared TP NCCL group, if one was
+    /// attached via `with_tp_nccl`. Lets the scheduler thread reach into
+    /// the model's NCCL group to build NCCL-backed
+    /// `DistributedRequestCoordination` instances without re-creating the
+    /// underlying communicator.
+    #[cfg(feature = "nccl")]
+    pub fn tp_nccl(&self) -> Option<Arc<NcclGroup>> {
+        self.tp_nccl.clone()
+    }
+
+    /// Phase B-1 commit C.4 accessor: shared EP NCCL group, if one was
+    /// attached via `with_ep_nccl`. Same role as `tp_nccl` for expert-
+    /// parallel forwards.
+    #[cfg(feature = "nccl")]
+    pub fn ep_nccl(&self) -> Option<Arc<NcclGroup>> {
+        self.ep_nccl.clone()
+    }
+
     pub fn is_single_rank(&self) -> bool {
         self.tp_world_size == 1
             && self.dp_world_size == 1
