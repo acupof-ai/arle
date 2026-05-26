@@ -1390,6 +1390,16 @@ impl TokenKVPool {
         &self.v_data[layer]
     }
 
+    /// K scales CudaSlice ref for a layer (FP8/INT8 only).
+    pub fn k_scales_slice(&self, layer: usize) -> &CudaSlice<f32> {
+        &self.k_scales[layer]
+    }
+
+    /// V scales CudaSlice ref for a layer (FP8/INT8 only).
+    pub fn v_scales_slice(&self, layer: usize) -> &CudaSlice<f32> {
+        &self.v_scales[layer]
+    }
+
     /// K working buffer pointer (bf16, shared across layers).
     pub fn k_work_ptr(&self, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.k_work.as_ref().expect("k_work").device_ptr(stream);

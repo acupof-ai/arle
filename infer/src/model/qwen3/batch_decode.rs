@@ -46,6 +46,79 @@ fn bytes_for<T>(count: usize) -> usize {
     count.saturating_mul(std::mem::size_of::<T>())
 }
 
+/// One-shot debug dump for FP8 KV decode-step state. Env-gated on
+/// `INFER_FP8_DEBUG`; fires at most 6 times (3 each for `after-quant` and
+/// `after-decode-attn`), only on layer 0. Reads back the first KV row's
+/// stored FP8 bytes + scale and the first attention-output bytes so the
+/// production state can be compared against the kernel-pair unit-test
+/// fixture (`crates/cuda-kernels/src/kv_quant.rs` ::
+/// `fp8_kernel_pair_decode_attention_diagnostic`). Used during the
+/// 2026-05-26 FP8 step-1 catastrophic divergence isolation.
+#[allow(clippy::too_many_arguments)]
+fn quant_debug_dump_fp8_state(
+    ctx: &DeviceContext,
+    layer_idx: usize,
+    kv_pool: &PagedKVPool,
+    bufs: &BatchDecodeBuffers,
+    num_kv_heads: usize,
+    head_dim: usize,
+    batch_size: usize,
+    stage: &str,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static FIRES: AtomicUsize = AtomicUsize::new(0);
+    if layer_idx != 0 {
+        return;
+    }
+    if std::env::var("INFER_FP8_DEBUG").is_err() {
+        return;
+    }
+    let fire = FIRES.fetch_add(1, Ordering::Relaxed);
+    if fire >= 6 {
+        return;
+    }
+
+    let _ = ctx.sync();
+    let stream = &ctx.stream;
+    let k_data_slice = kv_pool.k_data_slice(layer_idx);
+    let k_scales_slice = kv_pool.k_scales_slice(layer_idx);
+    let k_bytes = ctx.stream.clone_dtoh(k_data_slice).unwrap_or_default();
+    let k_scales = ctx.stream.clone_dtoh(k_scales_slice).unwrap_or_default();
+    let attn_out_bytes = ctx
+        .stream
+        .clone_dtoh(&bufs.attn_output.data)
+        .unwrap_or_default();
+    let last_token_h = ctx
+        .stream
+        .clone_dtoh(&bufs.metadata.last_token_indices)
+        .unwrap_or_default();
+
+    let row = if !last_token_h.is_empty() {
+        last_token_h[0] as usize
+    } else {
+        0
+    };
+    let kv_dim = num_kv_heads * head_dim;
+    let row_off = row * kv_dim;
+    let scale_off = row * num_kv_heads;
+    let bytes_8: Vec<i32> = (0..8)
+        .filter_map(|i| k_bytes.get(row_off + i).map(|b| *b as i32))
+        .collect();
+    let scales_4: Vec<f32> = (0..num_kv_heads.min(4))
+        .filter_map(|i| k_scales.get(scale_off + i).copied())
+        .collect();
+    // attn_output[0] (BF16) — interpret first 4 bf16 values for q_head 0.
+    let attn_first: Vec<f32> = (0..4)
+        .filter_map(|i| attn_out_bytes.get(i).map(|w| w.to_f32()))
+        .collect();
+    let _ = stream;
+    eprintln!(
+        "[fp8-debug fire#{fire} stage={stage}] layer={layer_idx} batch={batch_size} \
+         last_token_indices[0]={row} k_data[row,0..8]={bytes_8:?} \
+         k_scales[row,0..4]={scales_4:?} attn_out[0..4]={attn_first:?}"
+    );
+}
+
 fn max_kv_tokens_from_indptr(indptr_h: &[i32], page_size: usize) -> usize {
     indptr_h
         .windows(2)
@@ -1965,6 +2038,16 @@ impl Qwen3Model {
                         kv_pool.kv_dim,
                         batch_size,
                     )?;
+                    quant_debug_dump_fp8_state(
+                        &self.ctx,
+                        layer_idx,
+                        kv_pool,
+                        bufs,
+                        num_kv_heads,
+                        head_dim,
+                        batch_size,
+                        "after-quant",
+                    );
                     let sm_scale = 1.0 / (head_dim as f32).sqrt();
                     kv_quant::decode_attention_fp8(
                         &self.ctx,
@@ -1985,6 +2068,16 @@ impl Qwen3Model {
                         kv_pool.int8_attn_workspace.as_ref().unwrap(),
                         kv_pool.int8_attn_workspace_bytes,
                     )?;
+                    quant_debug_dump_fp8_state(
+                        &self.ctx,
+                        layer_idx,
+                        kv_pool,
+                        bufs,
+                        num_kv_heads,
+                        head_dim,
+                        batch_size,
+                        "after-decode-attn",
+                    );
                 }
                 KVFormat::INT8 => {
                     kv_quant::quantize_paged_kv_single(
