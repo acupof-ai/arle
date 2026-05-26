@@ -37,9 +37,8 @@ pub fn pick_free_port() -> Result<u16> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RelayEnvelope {
-    /// Submit a new chat/completion request to every rank's scheduler.
-    /// `prompt_tokens` are the post-tokenized prompt; sampling params
-    /// already serialized in `sampling`.
+    /// (Phase B-1 commit C.1 boot-ping variant.) Lightweight envelope
+    /// used by C.3 boot validation; retained for backward compat.
     Request {
         request_id: u64,
         prompt_tokens: Vec<u32>,
@@ -48,10 +47,51 @@ pub enum RelayEnvelope {
         /// module doesn't depend on `crate::sampler`.
         sampling: serde_json::Value,
     },
+    /// (Phase B-1 commit C.4.) Full per-request fanout payload — the
+    /// coordinator's HTTP submission path serializes one of these per
+    /// incoming chat completion; every worker reconstructs an
+    /// `IncomingRequest` from it on receive.
+    Request2 { wire: WireRequest },
     /// Graceful shutdown notice; workers should drain in-flight then
     /// exit. (Coordinator can also just drop streams; this is the
     /// nicer path for telemetry/log capture.)
     Shutdown,
+}
+
+/// Serializable counterpart of `crate::scheduler::IncomingRequest` (minus
+/// the channel + DistributedRequestCoordination + tracing fields, which
+/// are reconstructed worker-side). Captures the minimum data needed for
+/// a worker rank to schedule the same forward path as rank 0.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireRequest {
+    pub request_id: u64,
+    pub prompt: String,
+    pub prompt_tokens: Option<Vec<u32>>,
+    pub max_tokens: usize,
+    pub sampling: WireSamplingParams,
+    pub stop: Option<Vec<String>>,
+    /// `RequestPriority` discriminant (0=Low, 1=Normal, 2=High).
+    pub priority: u8,
+    /// `SessionId` as a string (it wraps `Arc<str>` internally).
+    pub session_id: Option<String>,
+}
+
+/// Serializable counterpart of `crate::sampler::SamplingParams`. Field-
+/// by-field mirror; conversion helpers in
+/// `crate::request_handle::wire_conversion` (C.4.3+) translate the two.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireSamplingParams {
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub repetition_penalty: f32,
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
+    pub ignore_eos: bool,
+    pub stop_token_ids: Vec<u32>,
+    pub seed: Option<u64>,
+    pub max_new_tokens: Option<usize>,
 }
 
 /// Coordinator-side TCP relay. Binds a port, accepts N-1 worker
