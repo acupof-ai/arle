@@ -74,16 +74,34 @@ fn quant_debug_dump_fp8_state(
         return;
     }
     let fire = FIRES.fetch_add(1, Ordering::Relaxed);
-    if fire >= 6 {
+    if fire >= 12 {
         return;
     }
 
-    let _ = ctx.sync();
+    let sync_err = ctx.sync().err().map(|e| e.to_string());
     let stream = &ctx.stream;
     let k_data_slice = kv_pool.k_data_slice(layer_idx);
     let k_scales_slice = kv_pool.k_scales_slice(layer_idx);
-    let k_bytes = ctx.stream.clone_dtoh(k_data_slice).unwrap_or_default();
-    let k_scales = ctx.stream.clone_dtoh(k_scales_slice).unwrap_or_default();
+    let k_data_len = k_data_slice.len();
+    let k_scales_len = k_scales_slice.len();
+    let pool_layers = kv_pool.num_layers;
+    let pool_kv_dim = kv_pool.kv_dim;
+    let k_bytes_res = ctx.stream.clone_dtoh(k_data_slice);
+    let k_bytes = match &k_bytes_res {
+        Ok(v) => v.clone(),
+        Err(e) => {
+            eprintln!("[fp8-debug] k_data clone_dtoh err: {e}");
+            Vec::new()
+        }
+    };
+    let k_scales_res = ctx.stream.clone_dtoh(k_scales_slice);
+    let k_scales = match &k_scales_res {
+        Ok(v) => v.clone(),
+        Err(e) => {
+            eprintln!("[fp8-debug] k_scales clone_dtoh err: {e}");
+            Vec::new()
+        }
+    };
     let attn_out_bytes = ctx
         .stream
         .clone_dtoh(&bufs.attn_output.data)
@@ -92,6 +110,9 @@ fn quant_debug_dump_fp8_state(
         .stream
         .clone_dtoh(&bufs.metadata.last_token_indices)
         .unwrap_or_default();
+    eprintln!(
+        "[fp8-debug fire#{fire} stage={stage}] meta: pool_layers={pool_layers} pool_kv_dim={pool_kv_dim} layer_idx={layer_idx} k_data_len={k_data_len} k_scales_len={k_scales_len} sync_err={sync_err:?}"
+    );
 
     let row = if !last_token_h.is_empty() {
         last_token_h[0] as usize
@@ -2387,6 +2408,16 @@ impl Qwen3Model {
                         kv_pool.kv_dim,
                         batch_size,
                     )?;
+                    quant_debug_dump_fp8_state(
+                        &self.ctx,
+                        layer_idx,
+                        kv_pool,
+                        bufs,
+                        num_kv_heads,
+                        head_dim,
+                        batch_size,
+                        "after-quant-vanilla",
+                    );
                 }
                 KVFormat::INT8 => {
                     kv_quant::quantize_paged_kv_single(
@@ -2450,6 +2481,16 @@ impl Qwen3Model {
                 KVFormat::FP8E4M3 => {
                     // Fused-dequant FP8 — reads FP8 E4M3 from pool, casts in registers
                     let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                    quant_debug_dump_fp8_state(
+                        &self.ctx,
+                        layer_idx,
+                        kv_pool,
+                        bufs,
+                        num_kv_heads,
+                        head_dim,
+                        batch_size,
+                        "pre-attn-vanilla",
+                    );
                     kv_quant::decode_attention_fp8(
                         &self.ctx,
                         &bufs.q_batch,
@@ -2469,6 +2510,16 @@ impl Qwen3Model {
                         kv_pool.int8_attn_workspace.as_ref().unwrap(),
                         kv_pool.int8_attn_workspace_bytes,
                     )?;
+                    quant_debug_dump_fp8_state(
+                        &self.ctx,
+                        layer_idx,
+                        kv_pool,
+                        bufs,
+                        num_kv_heads,
+                        head_dim,
+                        batch_size,
+                        "post-attn-vanilla",
+                    );
                 }
                 KVFormat::INT8 => {
                     // Fused-dequant decode attention — reads INT8+scale from pool directly
