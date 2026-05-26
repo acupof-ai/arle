@@ -76,6 +76,14 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_exclusive_scan_i32_cuda(
+        counts: *const i32,
+        offsets: *mut i32,
+        total: *mut i32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_count_expert_ranks_cuda(
         indices: *const i32,
         counts: *mut i32,

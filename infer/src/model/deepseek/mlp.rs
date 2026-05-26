@@ -1141,6 +1141,11 @@ fn dsv4_local_grouped_experts_enabled() -> Result<bool> {
 }
 
 #[cfg(feature = "cuda")]
+fn dsv4_a3_phase1_enabled() -> Result<bool> {
+    dsv4_env_flag_default("DSV4_A3_PHASE1", true)
+}
+
+#[cfg(feature = "cuda")]
 fn dsv4_env_flag(name: &str) -> Result<bool> {
     let Some(raw) = std::env::var(name).ok() else {
         return Ok(false);
@@ -1801,6 +1806,54 @@ impl DeepseekV4MoeBlock {
         if total_local_routes == 0 {
             return Ok(out);
         }
+        let use_a3_phase1 = dsv4_a3_phase1_enabled()?;
+        let offsets_gpu = if use_a3_phase1 {
+            let trace = dsv4_moe_trace_begin(ctx)?;
+            let mut gpu_offsets = ctx
+                .stream
+                .alloc_zeros_traced::<i32>(ep.experts_per_rank)
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 local route offset alloc failed: {err}")
+                })?;
+            {
+                let (count_ptr, _count_guard) = local_counts.device_ptr(&ctx.stream);
+                let (offset_ptr, _offset_guard) = gpu_offsets.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_exclusive_scan_i32_cuda(
+                        count_ptr as *const i32,
+                        offset_ptr as *mut i32,
+                        std::ptr::null_mut(),
+                        experts_per_rank_i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 local route offset scan failed: {err}")
+                    })?;
+                }
+            }
+            dsv4_moe_trace_end(
+                ctx,
+                "ffn_route_offset_scan_gpu",
+                layer_idx,
+                hidden.seq_len,
+                trace,
+            )?;
+            gpu_offsets
+        } else {
+            let trace = dsv4_moe_trace_begin(ctx)?;
+            let offsets = ctx.stream.clone_htod(&offsets_host).map_err(|err| {
+                anyhow::anyhow!("DeepSeek V4 local route offsets H2D failed: {err}")
+            })?;
+            dsv4_moe_trace_end(
+                ctx,
+                "ffn_route_offsets_h2d",
+                layer_idx,
+                hidden.seq_len,
+                trace,
+            )?;
+            offsets
+        };
         if hidden.seq_len > 1 && dsv4_local_grouped_experts_enabled()? {
             if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
                 return self.forward_compact_local_routes_gpu(
@@ -1812,6 +1865,7 @@ impl DeepseekV4MoeBlock {
                     &route_weights,
                     &counts_host,
                     &offsets_host,
+                    &offsets_gpu,
                     total_local_routes,
                     local_expert_start_i32,
                     experts_per_rank_i32,
@@ -1821,10 +1875,6 @@ impl DeepseekV4MoeBlock {
         }
 
         let trace = dsv4_moe_trace_begin(ctx)?;
-        let offsets_gpu = ctx
-            .stream
-            .clone_htod(&offsets_host)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route offsets H2D failed: {err}"))?;
         let mut pack_cursors = ctx
             .stream
             .alloc_zeros_traced::<i32>(ep.experts_per_rank)
@@ -1942,6 +1992,7 @@ impl DeepseekV4MoeBlock {
         route_weights: &CudaSlice<f32>,
         counts_host: &[i32],
         offsets_host: &[i32],
+        offsets_gpu: &CudaSlice<i32>,
         total_local_routes: usize,
         local_expert_start: i32,
         experts_per_rank: i32,
@@ -1994,9 +2045,6 @@ impl DeepseekV4MoeBlock {
             )?;
             local_route.expert_hidden.seq_len = total_local_routes;
             local_route.route_out.seq_len = route_capacity;
-            let offsets_gpu = ctx.stream.clone_htod(offsets_host).map_err(|err| {
-                anyhow::anyhow!("DeepSeek V4 compact local offsets H2D failed: {err}")
-            })?;
             let mut cursors = ctx
                 .stream
                 .alloc_zeros_traced::<i32>(experts_per_rank_usize)

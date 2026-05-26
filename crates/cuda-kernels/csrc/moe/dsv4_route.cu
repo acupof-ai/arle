@@ -336,6 +336,47 @@ extern "C" CUresult dsv4_count_local_experts_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_exclusive_scan_i32_kernel(
+    const int32_t *__restrict__ counts,
+    int32_t *__restrict__ offsets,
+    int32_t *__restrict__ total,
+    int n) {
+  __shared__ int32_t values[DSV4_ROUTE_BLOCK];
+  int tid = threadIdx.x;
+  int value = (tid < n) ? counts[tid] : 0;
+  values[tid] = value;
+  __syncthreads();
+
+  for (int stride = 1; stride < DSV4_ROUTE_BLOCK; stride <<= 1) {
+    int add = (tid >= stride) ? values[tid - stride] : 0;
+    __syncthreads();
+    values[tid] += add;
+    __syncthreads();
+  }
+
+  if (tid < n) {
+    offsets[tid] = values[tid] - value;
+  }
+  if (tid == 0 && total != nullptr) {
+    total[0] = (n > 0) ? values[n - 1] : 0;
+  }
+}
+
+extern "C" CUresult dsv4_exclusive_scan_i32_cuda(
+    const int32_t *counts,
+    int32_t *offsets,
+    int32_t *total,
+    int n,
+    CUstream stream) {
+  if (n < 0 || n > DSV4_ROUTE_BLOCK) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (n == 0) return CUDA_SUCCESS;
+  dsv4_exclusive_scan_i32_kernel<<<1, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      counts, offsets, total, n);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_count_expert_ranks_kernel(
     const int32_t *__restrict__ indices,
     int32_t *__restrict__ counts,

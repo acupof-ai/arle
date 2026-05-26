@@ -188,6 +188,16 @@ Phase 1 估算：~4-6 小时 codex 时间（写 scan kernel + 重构 site 1 + bu
 Phase 2 估算：~1-2 天（persistent kernel 是新写、要 sweep register/occupancy）。
 Phase 3 估算：~2-3 天（DeepEP API 调研 + 重构 + 多卡 bench）。
 
+## Execution log
+
+- 2026-05-26 Phase 1 landed as device-side local-route offsets with
+  `DSV4_A3_PHASE1=0` fallback. Result: H2D activity drops 546 → 352 calls
+  and 26,240 B → 1,408 B in single-token decode nsys; D2H remains 344 calls;
+  longseq output is byte-identical and wall-clock is flat/slightly positive
+  (31.3438 s → 31.3414 s for `max_tokens=1`, 36.4854 s → 36.4439 s for
+  `max_tokens=64`). See
+  [`../experience/wins/2026-05-26-dsv4-a3-phase1-device-offsets.md`](../experience/wins/2026-05-26-dsv4-a3-phase1-device-offsets.md).
+
 ## Cross-refs
 
 - A3 axis backlog 入口：
