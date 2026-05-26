@@ -28,13 +28,16 @@ backend today; native DeepEP LL is not yet the default because the 8-rank
 same-process NVSHMEM gate timed out on 2026-05-26 while the official
 multi-process DeepEP LL test passed. A2.0 fused the B=1 decode attention
 window-cache update into the attention kernels, removing 9504 standalone update
-kernel launches from the measured H20 `max_tokens=32` nsys request. Evidence:
+kernel launches from the measured H20 `max_tokens=32` nsys request. A2.1 fused
+Q/K prepare into one launch, cutting `cudaLaunchKernel` runtime calls 490244 →
+479574 in the same filtered decode framing. Evidence:
 [`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md),
 [`experience/errors/2026-05-26-dsv4-native-deepep-ll-sameprocess-timeout.md`](experience/errors/2026-05-26-dsv4-native-deepep-ll-sameprocess-timeout.md),
 [`experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md`](experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md),
 [`experience/wins/2026-05-26-dsv4-a20-fused-attn-window-update.md`](experience/wins/2026-05-26-dsv4-a20-fused-attn-window-update.md),
+[`experience/wins/2026-05-26-dsv4-a21-fused-qk-prep.md`](experience/wins/2026-05-26-dsv4-a21-fused-qk-prep.md),
 [`experience/wins/2026-05-26-dsv4-deepgemm-device-prop-cache.md`](experience/wins/2026-05-26-dsv4-deepgemm-device-prop-cache.md),
 [`experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md`](experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md),
 `trace-artifacts/2026-05-15-dsv4-deepep/`.

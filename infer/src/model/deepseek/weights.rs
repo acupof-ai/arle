@@ -1028,33 +1028,56 @@ impl DeepseekModel {
         let trace = dsv4_trace_begin(&self.ctx)?;
         let mut q_prepared = unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
         let mut k_prepared = unsafe { HiddenStates::uninit(&self.ctx, head_dim, token_count)? };
+        let fuse_qk_prep = dsv4_fuse_qk_prep_enabled()?;
         {
             let (q_raw_ptr, _q_raw_guard) = q_raw.data.device_ptr(&self.ctx.stream);
             let (k_raw_ptr, _k_raw_guard) = kv_normed.data.device_ptr(&self.ctx.stream);
             let (q_out_ptr, _q_out_guard) = q_prepared.data.device_ptr_mut(&self.ctx.stream);
             let (k_out_ptr, _k_out_guard) = k_prepared.data.device_ptr_mut(&self.ctx.stream);
-            unsafe {
-                ffi::dsv4_prepare_qk_cuda(
-                    q_raw_ptr as *const ffi::Half,
-                    k_raw_ptr as *const ffi::Half,
-                    q_out_ptr as *mut ffi::Half,
-                    k_out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    head_dim as i32,
-                    self.config.qk_rope_head_dim as i32,
-                    start_pos as i32,
-                    self.config.rms_norm_eps,
-                    rope_base,
-                    original_seq_len,
-                    rope_params.factor,
-                    rope_params.beta_fast,
-                    rope_params.beta_slow,
-                    self.ctx.stream.cu_stream(),
-                )
+            let status = unsafe {
+                if fuse_qk_prep {
+                    ffi::dsv4_prepare_qk_fused_cuda(
+                        q_raw_ptr as *const ffi::Half,
+                        k_raw_ptr as *const ffi::Half,
+                        q_out_ptr as *mut ffi::Half,
+                        k_out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        self.config.qk_rope_head_dim as i32,
+                        start_pos as i32,
+                        self.config.rms_norm_eps,
+                        rope_base,
+                        original_seq_len,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        self.ctx.stream.cu_stream(),
+                    )
+                } else {
+                    ffi::dsv4_prepare_qk_cuda(
+                        q_raw_ptr as *const ffi::Half,
+                        k_raw_ptr as *const ffi::Half,
+                        q_out_ptr as *mut ffi::Half,
+                        k_out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        self.config.qk_rope_head_dim as i32,
+                        start_pos as i32,
+                        self.config.rms_norm_eps,
+                        rope_base,
+                        original_seq_len,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        self.ctx.stream.cu_stream(),
+                    )
+                }
+            };
+            status
                 .result()
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU SWA q/k prep failed: {err}"))?;
-            }
         }
         dsv4_trace_end(
             &self.ctx,
@@ -1574,33 +1597,56 @@ impl DeepseekModel {
             k_prepared_owned = unsafe { HiddenStates::uninit(&self.ctx, head_dim, token_count)? };
             &mut k_prepared_owned
         };
+        let fuse_qk_prep = dsv4_fuse_qk_prep_enabled()?;
         {
             let (q_raw_ptr, _q_raw_guard) = q_raw.data.device_ptr(&self.ctx.stream);
             let (k_raw_ptr, _k_raw_guard) = kv_normed.data.device_ptr(&self.ctx.stream);
             let (q_out_ptr, _q_out_guard) = q_prepared.data.device_ptr_mut(&self.ctx.stream);
             let (k_out_ptr, _k_out_guard) = k_prepared.data.device_ptr_mut(&self.ctx.stream);
-            unsafe {
-                ffi::dsv4_prepare_qk_cuda(
-                    q_raw_ptr as *const ffi::Half,
-                    k_raw_ptr as *const ffi::Half,
-                    q_out_ptr as *mut ffi::Half,
-                    k_out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    head_dim as i32,
-                    self.config.qk_rope_head_dim as i32,
-                    start_pos as i32,
-                    self.config.rms_norm_eps,
-                    rope_base,
-                    original_seq_len as i32,
-                    rope_params.factor,
-                    rope_params.beta_fast,
-                    rope_params.beta_slow,
-                    self.ctx.stream.cu_stream(),
-                )
+            let status = unsafe {
+                if fuse_qk_prep {
+                    ffi::dsv4_prepare_qk_fused_cuda(
+                        q_raw_ptr as *const ffi::Half,
+                        k_raw_ptr as *const ffi::Half,
+                        q_out_ptr as *mut ffi::Half,
+                        k_out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        self.config.qk_rope_head_dim as i32,
+                        start_pos as i32,
+                        self.config.rms_norm_eps,
+                        rope_base,
+                        original_seq_len as i32,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        self.ctx.stream.cu_stream(),
+                    )
+                } else {
+                    ffi::dsv4_prepare_qk_cuda(
+                        q_raw_ptr as *const ffi::Half,
+                        k_raw_ptr as *const ffi::Half,
+                        q_out_ptr as *mut ffi::Half,
+                        k_out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        self.config.qk_rope_head_dim as i32,
+                        start_pos as i32,
+                        self.config.rms_norm_eps,
+                        rope_base,
+                        original_seq_len as i32,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        self.ctx.stream.cu_stream(),
+                    )
+                }
+            };
+            status
                 .result()
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU q/k prep failed: {err}"))?;
-            }
         }
         dsv4_trace_end(&self.ctx, "attn_prepare_qk", layer_idx, token_count, trace)?;
 
@@ -3990,6 +4036,18 @@ fn dsv4_fuse_attn_window_update_enabled() -> Result<bool> {
         "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
         "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
         _ => bail!("invalid ARLE_DSV4_FUSE_ATTN_WINDOW_UPDATE value `{raw}`"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_fuse_qk_prep_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_FUSE_QK_PREP").ok() else {
+        return Ok(true);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => bail!("invalid ARLE_DSV4_FUSE_QK_PREP value `{raw}`"),
     }
 }
 

@@ -118,6 +118,18 @@ smem/L2。
 **Implementation boundary**：`crates/cuda-kernels/csrc/attention/dsv4_*.cu`
 新增 fused entry；老路径保留作回滚开关；同一 nsys 对照 trace。
 
+**Execution log**：
+- 2026-05-26 A2.0 fused B=1 decode window-cache update into SWA / hybrid
+  attention tails. It removed 9504 standalone `dsv4_update_window_cache_kernel`
+  launches in the measured H20 `max_tokens=32` trace and kept greedy output
+  byte-identical. This is a launch-churn substep, not full FlashMLA.
+- 2026-05-26 A2.1 fused Q RMSNorm+RoPE prep and K RoPE prep into one CUDA
+  launch with `ARLE_DSV4_FUSE_QK_PREP=0` fallback. Split nsys had
+  `dsv4_prepare_q_kernel` 7352 calls and `dsv4_prepare_k_kernel` 7342 calls;
+  fused nsys had `dsv4_prepare_qk_fused_kernel` 7290 calls and byte-identical
+  `max_tokens=32` output. This still does not close full CSA + hybrid
+  attention fusion.
+
 ---
 
 ### A4 · Hierarchical multi-stream overlap（A1 / A2 落地后做，scheduler 层）
