@@ -110,7 +110,22 @@ parity bug. (`crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu:1
 FP8 only drifting at step 20 on Qwen3.5/V100, instead of the
 catastrophic step-1 divergence seen on Qwen3-4B/L4, is the strongest
 signal yet: **the Qwen3-dense FP8 step-1 catastrophe is Qwen3-dense-
-specific, not shared-kernel-pair-specific**. The Qwen3.5 full-
+specific, not shared-kernel-pair-specific**. The 4-prompt × 64-token
+follow-up audit (2026-05-26, V100) reinforces this — Qwen3.5 FP8 is
+**prompt-dependent drift**, not catastrophic at any consistent step:
+
+| Prompt | match | first divergence |
+|---|---:|---|
+| 0 | 0.5781 | step 37 |
+| 1 | 0.9219 | (late or none) |
+| 2 | 1.0000 | none |
+| 3 | 0.1406 | (very early) |
+
+Mean 0.6602 with no consistent first-divergence step is the
+fingerprint of an honest FP8 precision-floor drift, not a wiring
+bug. Compare with Qwen3-dense where every prompt diverges at step 1
+with identical fingerprint — a structural dispatch break, not
+precision noise. The Qwen3.5 full-
 attention dispatch indexes the paged pool with `full_idx` (subset
 index over the 8 full-attention layers) while Qwen3-dense uses
 `layer_idx` over all 32 layers. The bug surface narrows to whatever
