@@ -103,6 +103,20 @@ pub struct DistributedSchedulerGroup {
     /// interleave differently across ranks, rank 0 can run request A while a
     /// follower runs request B and both coordinators wait forever.
     submission_lock: Mutex<()>,
+    /// Phase B-1 commit C.4 — multiproc-serve TCP control plane. When set,
+    /// each `submit()` broadcasts a `RelayEnvelope::Request2 { wire }` to
+    /// worker processes via this coordinator BEFORE submitting locally,
+    /// so workers' relay-receiver threads (see main.rs::run_worker_mode)
+    /// see the request roughly when rank-0's scheduler does.
+    relay: Option<Arc<Mutex<crate::multiproc_relay::RelayCoordinator>>>,
+    /// Effective distributed world size. With `relay = None`, equals
+    /// `workers.len()` (legacy in-process N-thread). With `relay = Some`,
+    /// equals 1 + relay's worker connection count. Used by the relay
+    /// path for envelope-field validation; read by the public accessor
+    /// `effective_world_size()`.
+    effective_world_size: usize,
+    /// Monotonic request ID for relay envelope tagging.
+    next_request_id: std::sync::atomic::AtomicU64,
 }
 
 impl NumaSchedulerRouter {
@@ -228,12 +242,51 @@ impl DistributedSchedulerGroup {
         );
         let model_id = Arc::from(workers[0].handle.model_id());
         let tokenizer = workers[0].handle.tokenizer_clone();
+        let effective_world_size = workers.len();
         Self {
             workers,
             model_id,
             tokenizer,
             metrics,
             submission_lock: Mutex::new(()),
+            relay: None,
+            effective_world_size,
+            next_request_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    /// Phase B-1 commit C.4.3 — multiproc-serve constructor. `workers` is
+    /// the LOCAL set of schedulers in this process (just rank 0 for the
+    /// coordinator); `effective_world_size` is the full NCCL world size
+    /// (rank 0 + all worker processes); `relay` ships request envelopes
+    /// to the worker processes via TCP.
+    pub fn with_relay(
+        workers: Vec<NumaSchedulerWorker>,
+        metrics: crate::metrics::ServerMetrics,
+        relay: Arc<Mutex<crate::multiproc_relay::RelayCoordinator>>,
+        effective_world_size: usize,
+    ) -> Self {
+        assert!(
+            !workers.is_empty(),
+            "distributed scheduler group requires at least one worker"
+        );
+        assert!(
+            effective_world_size >= workers.len(),
+            "effective_world_size {} cannot be less than local workers.len() {}",
+            effective_world_size,
+            workers.len()
+        );
+        let model_id = Arc::from(workers[0].handle.model_id());
+        let tokenizer = workers[0].handle.tokenizer_clone();
+        Self {
+            workers,
+            model_id,
+            tokenizer,
+            metrics,
+            submission_lock: Mutex::new(()),
+            relay: Some(relay),
+            effective_world_size,
+            next_request_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -255,6 +308,94 @@ impl DistributedSchedulerGroup {
             delta_tx,
             trace_context: req.trace_context,
             distributed: Some(distributed),
+        }
+    }
+
+    /// Phase B-1 commit C.4.3 — translate an `IncomingRequest` into a
+    /// serializable `WireRequest` for the relay. Channels, distributed
+    /// coordination, and trace context are discarded — workers
+    /// reconstruct them from their own local environment.
+    fn wire_request_from_incoming(
+        req: &IncomingRequest,
+        request_id: u64,
+    ) -> crate::multiproc_relay::WireRequest {
+        use crate::multiproc_relay::{WireRequest, WireSamplingParams};
+        WireRequest {
+            request_id,
+            prompt: req.prompt.clone(),
+            prompt_tokens: req.prompt_tokens.clone(),
+            max_tokens: req.max_tokens,
+            sampling: WireSamplingParams {
+                temperature: req.sampling.temperature,
+                top_k: req.sampling.top_k,
+                top_p: req.sampling.top_p,
+                min_p: req.sampling.min_p,
+                repetition_penalty: req.sampling.repetition_penalty,
+                frequency_penalty: req.sampling.frequency_penalty,
+                presence_penalty: req.sampling.presence_penalty,
+                ignore_eos: req.sampling.ignore_eos,
+                stop_token_ids: req.sampling.stop_token_ids.clone(),
+                seed: req.sampling.seed,
+                max_new_tokens: req.sampling.max_new_tokens,
+            },
+            stop: req.stop.clone(),
+            priority: match req.priority {
+                crate::scheduler::RequestPriority::Low => 0,
+                crate::scheduler::RequestPriority::Normal => 1,
+                crate::scheduler::RequestPriority::High => 2,
+            },
+            session_id: req.session_id.as_ref().map(|s| s.as_str().to_string()),
+        }
+    }
+
+    /// Effective distributed world size — see field doc.
+    pub fn effective_world_size(&self) -> usize {
+        self.effective_world_size
+    }
+
+    /// Phase B-1 commit C.4.4 — worker-side inverse of
+    /// `wire_request_from_incoming`. Reconstructs an `IncomingRequest`
+    /// from a wire envelope with a fresh sink `delta_tx` (worker output
+    /// is discarded — only rank 0 surfaces tokens to the user). The
+    /// scheduler thread attaches a NCCL-backed
+    /// `DistributedRequestCoordination` itself when it ingests the
+    /// request from `request_rx`.
+    pub fn incoming_request_from_wire(
+        wire: crate::multiproc_relay::WireRequest,
+        delta_tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
+    ) -> IncomingRequest {
+        use crate::sampler::SamplingParams;
+        use crate::scheduler::RequestPriority;
+        let priority = match wire.priority {
+            0 => RequestPriority::Low,
+            2 => RequestPriority::High,
+            _ => RequestPriority::Normal,
+        };
+        IncomingRequest {
+            prompt: wire.prompt,
+            prompt_tokens: wire.prompt_tokens,
+            max_tokens: wire.max_tokens,
+            sampling: SamplingParams {
+                temperature: wire.sampling.temperature,
+                top_k: wire.sampling.top_k,
+                top_p: wire.sampling.top_p,
+                min_p: wire.sampling.min_p,
+                repetition_penalty: wire.sampling.repetition_penalty,
+                frequency_penalty: wire.sampling.frequency_penalty,
+                presence_penalty: wire.sampling.presence_penalty,
+                ignore_eos: wire.sampling.ignore_eos,
+                stop_token_ids: wire.sampling.stop_token_ids,
+                seed: wire.sampling.seed,
+                max_new_tokens: wire.sampling.max_new_tokens,
+            },
+            stop: wire.stop,
+            speculative: None,
+            priority,
+            session_id: wire.session_id.map(crate::types::SessionId::from),
+            ingress_numa_node: None,
+            delta_tx,
+            trace_context: None,
+            distributed: None, // scheduler attaches NCCL-backed coord on ingest
         }
     }
 
@@ -334,6 +475,41 @@ impl RequestHandle for DistributedSchedulerGroup {
             permits.push(permit);
         }
 
+        // Phase B-1 commit C.4.3 — multiproc-serve relay path. When the
+        // relay is set, the local `self.workers` typically has only rank 0
+        // (the coordinator process's own scheduler); ranks 1..N-1 live in
+        // worker processes and receive the request via TCP broadcast.
+        // Their schedulers attach NCCL-backed
+        // DistributedRequestCoordination on ingest using their model's
+        // ep_nccl group; rank 0 does the same here for consistency.
+        if let Some(relay) = self.relay.as_ref() {
+            let request_id = self
+                .next_request_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let wire = Self::wire_request_from_incoming(&req, request_id);
+            // Broadcast to worker processes BEFORE submitting locally so
+            // workers' schedulers see the request roughly in lockstep
+            // with rank 0's.
+            {
+                let mut coord = relay
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                coord
+                    .broadcast(&crate::multiproc_relay::RelayEnvelope::Request2 { wire })
+                    .map_err(|_| SubmitError)?;
+            }
+            // Submit to rank-0's local scheduler. `distributed` is left
+            // None — the scheduler attaches its NCCL-backed coordinator
+            // on ingest (commit C.4.5).
+            let mut rank0_req = req;
+            rank0_req.distributed = None;
+            let permit = permits.into_iter().next().ok_or(SubmitError)?;
+            permit.submit(rank0_req).map_err(|_| SubmitError)?;
+            return Ok(());
+        }
+
+        // Legacy single-process N-thread path: shared Mutex+Condvar
+        // coordinator, in-process Arc fanout across self.workers.
         let coordinator =
             DistributedTokenCoordinator::new(self.workers.len()).map_err(|_| SubmitError)?;
         let mut requests = Vec::with_capacity(self.workers.len());
