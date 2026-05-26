@@ -9,9 +9,12 @@ torch-free C++ binary. Phase 1.0a-iii is the real workload: actually run
 `intranode::dispatch` on DSv4-shape synthetic input across 8 H20 GPUs and
 verify combined output is bitwise reproducible across runs.
 
-Combine is deferred to phase 1.0a-iv — a subtle deadlock surfaces inside
-`intranode::combine` that needs its own debug pass; dispatch alone is the
-larger architecture gate and now passes.
+Combine was deferred to phase 1.0a-iv — a subtle deadlock surfaced inside
+`intranode::combine` that needed its own debug pass; dispatch alone was the
+larger architecture gate and passed here. Phase 1.0a-iv
+([`./2026-05-26-dsv4-deepep-cpp-full-dispatch-combine.md`](./2026-05-26-dsv4-deepep-cpp-full-dispatch-combine.md))
+has since rooted and fixed combine — full dispatch+combine round-trip
+now PASSes, byte-deterministic.
 
 ## What worked
 
@@ -82,35 +85,27 @@ on all 8 ranks — dispatch is deterministic at the byte level.
   wrapping — the raw `void*` + `cudaStream_t` API in
   `csrc/kernels/api.cuh` carries everything needed.
 
-## What didn't (yet) — phase 1.0a-iv backlog
+## Combine deadlock — resolved in phase 1.0a-iv
 
-`intranode::combine` deadlocks all 8 ranks immediately after
-`pre-combine` even after fixing two argument-order bugs:
+The combine deadlock that surfaced here was rooted in phase 1.0a-iv
+([`./2026-05-26-dsv4-deepep-cpp-full-dispatch-combine.md`](./2026-05-26-dsv4-deepep-cpp-full-dispatch-combine.md))
+to a parameter-naming trap, **not** any of the hypotheses above:
 
-- `combine`'s `num_tokens` and `num_recv_tokens` parameters have
-  swapped semantics from intuition: `num_tokens = x.size(0)` is the
-  COMBINE INPUT count (= dispatch's recv-side count), and
-  `num_recv_tokens = send_head.size(0)` is the COMBINE OUTPUT count
-  (= original token count before dispatch).
-- `cached_notify_combine` takes `num_recv_tokens =
-  send_head.size(0) = original_token_count`, not the per-rank
-  dispatch-recv count.
+- `intranode::combine`'s `channel_prefix_matrix` parameter is the
+  dispatch OUTPUT `recv_channel_prefix_matrix` (recv-side exclusive
+  prefix), **not** the dispatch INPUT `channel_prefix_matrix`
+  (send-side inclusive prefix written by `notify_dispatch`). DeepEP's
+  kernel signature re-uses the same name for two semantically different
+  tensors; Python's `Buffer.combine` handle unpack at
+  `deep_ep/buffer.py:424` is the smoking gun.
 
-After both fixes, all 8 ranks still hang at `intranode::combine` itself
-(no `post-combine` probe fires; kernel does not return). The kernel
-spins on `channel_tail_idx > expected_head` waits. Open hypotheses:
+Single-variable fix: pass `d_recv_channel_prefix` instead of
+`d_channel_prefix_matrix` to `intranode::combine`. With that swap
+applied, all 8 ranks reach `post-combine` and produce
+byte-deterministic combined output.
 
-- `send_head` written by dispatch has values that don't match what
-  combine receivers expect, despite matching upstream call shape;
-- one of `rank_prefix_matrix` / `channel_prefix_matrix` is being read
-  before the dispatch stream finishes (although my `cudaStreamSynchronize`
-  between dispatch and combine should foreclose this);
-- combine's `num_max_nvl_chunked_send_tokens=4` interacts unexpectedly
-  with the symmetric 6-peer routing.
-
-Phase 1.0a-iv will isolate: add per-stage NVTX, trace one rank's
-`send_head` / `expected_head` values, and bisect against a single-source
-single-dest dispatch shape to localize.
+The companion `num_tokens / num_recv_tokens` swap noted earlier still
+applies; combine needs **both** parameter fixes to PASS.
 
 ## Why this still unblocks the integration
 
