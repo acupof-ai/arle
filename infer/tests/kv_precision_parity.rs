@@ -238,6 +238,20 @@ fn gpu_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Wrap a prompt in Qwen3 ChatML format. The model at
+/// `infer/models/Qwen3-4B` is the **chat/instruct** variant (has
+/// `<|im_start|>` / `<|im_end|>` special tokens, generation_config
+/// recommends `temperature=0.6, top_k=20, top_p=0.95`). Sending raw
+/// prompts under greedy decode confuses the chat-tuned model and
+/// degenerates to a token-0 (`!`) repetition loop — verified
+/// 2026-05-27 A100 audit.
+fn chatml_wrap(prompt: &str) -> String {
+    format!(
+        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+        prompt
+    )
+}
+
 fn make_request(
     prompt: &str,
     tokens: usize,
@@ -246,6 +260,7 @@ fn make_request(
     mpsc::UnboundedReceiver<CompletionStreamDelta>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
+    let wrapped = chatml_wrap(prompt);
     // Greedy + repetition_penalty=1.1. Plain greedy on Qwen3-4B base with
     // long technical prompts collapses to a single-token (`!`) repetition
     // loop, which makes mean_match a noise-fidelity metric rather than a
@@ -266,7 +281,7 @@ fn make_request(
     // DEFAULT_PROMPTS — prompt 0 is now a natural-continuation prompt),
     // or (b) switch to an instruct-tuned model variant.
     let req = IncomingRequest {
-        prompt: prompt.to_string(),
+        prompt: wrapped,
         prompt_tokens: None,
         max_tokens: tokens,
         sampling,
@@ -309,15 +324,17 @@ fn run_precision(
         case.name, case.dtype, case.format
     );
 
-    // Determinism: greedy decode + INFER_DETERMINISTIC to match
-    // greedy_consistency.rs's batch-invariant requirement. We don't
-    // mix concurrent prompts in this test, but we still want repeatable
-    // output across runs.
-    // SAFETY: set before any scheduler worker thread is spawned in this
-    // invocation; gpu_test_lock serializes precisions.
-    unsafe {
-        std::env::set_var("INFER_DETERMINISTIC", "1");
-    }
+    // 2026-05-27 diagnostic: INFER_DETERMINISTIC=1 forces every BF16
+    // GEMM through cublasGemmEx fallback (see `crates/cuda-kernels/csrc/
+    // gemm/gemv.cu::deterministic_gemm_enabled`). On Qwen3-4B with
+    // chat-tuned prompts under greedy, this path produces uniform-or-
+    // NaN logits that argmax to token 0 (`!`) for BF16/INT8/FP8 — masking
+    // any KV-precision question and reading as "FP8 catastrophic" for
+    // 3 weeks. TQ4 bypasses this path and produces HF-correct argmax
+    // (151667 = `<think>`) as the first token. Honor the env var if the
+    // caller explicitly sets it, but do NOT force it from the test.
+    // See `docs/experience/errors/2026-05-26-fp8-kv-catastrophic-was-
+    // test-artifact.md` for the full chain.
 
     // CUDA Graph capture can mask scheduler-state bugs whose write order
     // matters across decode steps (the audit can be re-run with
