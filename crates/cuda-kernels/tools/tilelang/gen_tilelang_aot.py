@@ -436,14 +436,16 @@ def load_gdr_kernel(kernel_path: str, kernel_key: str):
 def parse_target(target: str):
     if not target.startswith("cuda"):
         raise ValueError(f"unsupported TileLang AOT target: {target}")
+    parsed = {"kind": "cuda"}
     for token in shlex.split(target):
         if token == "cuda":
             continue
         if token.startswith("-arch="):
+            parsed["arch"] = token.split("=", 1)[1]
             continue
         raise ValueError(f"unsupported TileLang AOT target option {token!r} in {target!r}")
     import tilelang
-    return tilelang.tvm.target.Target(target)
+    return tilelang.tvm.target.Target(parsed)
 
 
 def compile_kernel(prim_func, target):
