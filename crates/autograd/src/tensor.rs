@@ -306,6 +306,35 @@ impl TensorStore {
         Ok(())
     }
 
+    /// Drop the cached host mirror for a tensor after ensuring a device handle
+    /// exists. This keeps model weights device-authoritative on memory-tight
+    /// CUDA hosts; callers that later need host data can still use `to_host`.
+    pub fn evict_host_mirror(&mut self, id: TensorId) -> Result<usize> {
+        let (dirty, has_handle) = {
+            let tensor = self.tensor(id)?;
+            (tensor.dirty.clone(), tensor.device_handle.is_some())
+        };
+        if dirty == Dirty::Host || !has_handle {
+            let handle = {
+                let tensor = self.tensor(id)?;
+                let handle = self.backend().upload(&tensor.data, &tensor.shape)?;
+                self.backend().eval(&[&handle])?;
+                handle
+            };
+            self.raw_tensor_mut(id)?.device_handle = Some(handle);
+        }
+        let tensor = self.raw_tensor_mut(id)?;
+        if tensor.device_handle.is_none() {
+            return Err(AutogradError::TapeInvariant(
+                "evict_host_mirror: tensor has no device handle after upload",
+            ));
+        }
+        let evicted_bytes = tensor.data.capacity() * std::mem::size_of::<f32>();
+        tensor.data = Vec::new();
+        tensor.dirty = Dirty::Device;
+        Ok(evicted_bytes)
+    }
+
     pub(crate) fn set_requires_grad(&mut self, id: TensorId, requires_grad: bool) -> Result<()> {
         self.raw_tensor_mut(id)?.requires_grad = requires_grad;
         Ok(())
@@ -575,5 +604,57 @@ mod tests {
         assert_eq!(cloned.dirty, Dirty::Device);
         assert!(cloned.data.is_empty());
         assert!(cloned.device_handle.is_some());
+    }
+
+    #[test]
+    fn evict_host_mirror_preserves_readback_contract() {
+        let mut store = TensorStore::default();
+        let id = store
+            .from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2])
+            .expect("alloc tensor");
+
+        let evicted = store.evict_host_mirror(id).expect("evict host mirror");
+        assert_eq!(evicted, 4 * std::mem::size_of::<f32>());
+
+        let tensor = store.get(id).expect("tensor exists");
+        assert_eq!(tensor.dirty, Dirty::Device);
+        assert!(tensor.data.is_empty());
+        assert_eq!(tensor.data.capacity(), 0);
+        assert!(tensor.device_handle.is_some());
+
+        assert_eq!(
+            store.to_host(id).expect("read back evicted tensor"),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+        let tensor = store.get(id).expect("tensor exists");
+        assert_eq!(tensor.dirty, Dirty::Both);
+    }
+
+    #[test]
+    fn evict_host_mirror_releases_retained_empty_buffer() {
+        let mut store = TensorStore::default();
+        let id = store
+            .from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2])
+            .expect("alloc tensor");
+        let retained_capacity = store.get(id).expect("tensor exists").data.capacity();
+        store
+            .replace_device_handle(id, DeviceHandle::Cpu(vec![1.0, 2.0, 3.0, 4.0]))
+            .expect("mark device authoritative");
+
+        let tensor = store.get(id).expect("tensor exists");
+        assert_eq!(tensor.dirty, Dirty::Device);
+        assert!(tensor.data.is_empty());
+        assert_eq!(tensor.data.capacity(), retained_capacity);
+
+        let evicted = store.evict_host_mirror(id).expect("evict retained buffer");
+        assert_eq!(evicted, retained_capacity * std::mem::size_of::<f32>());
+
+        let tensor = store.get(id).expect("tensor exists");
+        assert_eq!(tensor.dirty, Dirty::Device);
+        assert_eq!(tensor.data.capacity(), 0);
+        assert_eq!(
+            store.to_host(id).expect("read back evicted tensor"),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
     }
 }

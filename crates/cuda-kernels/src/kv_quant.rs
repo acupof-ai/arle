@@ -1006,6 +1006,326 @@ mod tests {
         );
     }
 
+    /// End-to-end isolation for the 2026-05-26 FP8 KV step-1 divergence.
+    /// Wires the production kernel pair (`quantize_paged_kv_fp8` writes
+    /// → `decode_attention_fp8` reads) over a deterministic Qwen3-4B-shaped
+    /// (num_q_heads=4 GQA 2:1, head_dim=128, 32 KV tokens / 2 pages)
+    /// workload, then compares the GPU attention output against a
+    /// dequantize-then-host-compute reference. The earlier prefill-logit
+    /// parity test (`infer/tests/kv_fp8_prefill_logit_parity.rs`) proved
+    /// prefill bit-identical between BF16 and FP8 modes, so any production
+    /// FP8 divergence must come from this kernel pair or its dispatch
+    /// wiring. A clean result here pins the bug to scheduler-side
+    /// kv_indices / kv_meta / scale-pointer plumbing at runtime. A failing
+    /// result identifies the actual quant→read break.
+    #[test]
+    fn fp8_kernel_pair_decode_attention_diagnostic() {
+        let ctx = DeviceContext::new().expect("ctx");
+        // Production Qwen3-4B layout: num_q_heads=32 num_kv_heads=8 (GQA 4:1).
+        // The 4:2 ratio used previously matches GQA semantics but a wider q
+        // group could expose head-mapping bugs that smaller ratios miss.
+        let num_q_heads = 32usize;
+        let num_kv_heads = 8usize;
+        let head_dim = 128usize;
+        let kv_dim = num_kv_heads * head_dim;
+        let q_dim = num_q_heads * head_dim;
+        let kv_seq_len = 32usize;
+        const PAGE_SIZE: usize = 16;
+        let num_pages = kv_seq_len.div_ceil(PAGE_SIZE);
+        let batch_size = 1usize;
+        let total_pool_rows = num_pages * PAGE_SIZE;
+
+        // ── 1. Deterministic Q, K, V (BF16) in the value range Qwen3-4B
+        //       attention sees post-QK-norm post-RoPE: roughly ±2 with
+        //       occasional ±5 outliers on the first dim of each token.
+        let mut rng_state: u64 = 0xA5A5_5A5A_DEAD_BEEF;
+        let mut next_f32 = || -> f32 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            let v = ((rng_state >> 32) as u32) as f32 / u32::MAX as f32;
+            (v - 0.5) * 4.0
+        };
+        let mut q_host = vec![bf16::ZERO; q_dim];
+        for d in 0..q_dim {
+            q_host[d] = bf16::from_f32(next_f32());
+        }
+        let mut k_host = vec![bf16::ZERO; kv_seq_len * kv_dim];
+        let mut v_host = vec![bf16::ZERO; kv_seq_len * kv_dim];
+        for t in 0..kv_seq_len {
+            for h in 0..num_kv_heads {
+                for d in 0..head_dim {
+                    let mut kv = next_f32();
+                    let mut vv = next_f32();
+                    if d == 0 {
+                        kv = if (t + h) % 2 == 0 { 5.0 } else { -4.5 };
+                        vv = if (t + h) % 3 == 0 { 5.5 } else { -4.0 };
+                    }
+                    k_host[t * kv_dim + h * head_dim + d] = bf16::from_f32(kv);
+                    v_host[t * kv_dim + h * head_dim + d] = bf16::from_f32(vv);
+                }
+            }
+        }
+
+        // ── 2. Stage K, V into the HND-paged work buffer layout that
+        //       `quantize_paged_kv_fp8_kernel` reads (it expects
+        //       `[page, head, token, dim]`). Pool rows are dense in [0,
+        //       total_pool_rows).
+        let mut k_work_host = vec![bf16::ZERO; total_pool_rows * kv_dim];
+        let mut v_work_host = vec![bf16::ZERO; total_pool_rows * kv_dim];
+        for t in 0..kv_seq_len {
+            let page = t / PAGE_SIZE;
+            let in_page = t % PAGE_SIZE;
+            for h in 0..num_kv_heads {
+                for d in 0..head_dim {
+                    let src = t * kv_dim + h * head_dim + d;
+                    let dst = page * PAGE_SIZE * kv_dim
+                        + h * PAGE_SIZE * head_dim
+                        + in_page * head_dim
+                        + d;
+                    k_work_host[dst] = k_host[src];
+                    v_work_host[dst] = v_host[src];
+                }
+            }
+        }
+
+        let k_work = DeviceVec::from_host(&ctx, &k_work_host).expect("k_work H2D");
+        let v_work = DeviceVec::from_host(&ctx, &v_work_host).expect("v_work H2D");
+
+        let mut k_fp8 = ctx
+            .stream
+            .alloc_zeros::<u8>(total_pool_rows * kv_dim)
+            .expect("k_fp8 alloc");
+        let mut v_fp8 = ctx
+            .stream
+            .alloc_zeros::<u8>(total_pool_rows * kv_dim)
+            .expect("v_fp8 alloc");
+        let mut k_scales = ctx
+            .stream
+            .alloc_zeros::<f32>(total_pool_rows * num_kv_heads)
+            .expect("k_scales alloc");
+        let mut v_scales = ctx
+            .stream
+            .alloc_zeros::<f32>(total_pool_rows * num_kv_heads)
+            .expect("v_scales alloc");
+
+        // Quantize all `kv_seq_len` tokens via the production kernel.
+        let token_rows_host: Vec<i32> = (0..kv_seq_len).map(|i| i as i32).collect();
+        let token_rows_gpu = ctx.stream.clone_htod(&token_rows_host).expect("rows H2D");
+        {
+            let (k_fp8_ptr, _g1) = k_fp8.device_ptr_mut(&ctx.stream);
+            let (k_scl_ptr, _g2) = k_scales.device_ptr_mut(&ctx.stream);
+            let (k_src_ptr, _g3) = k_work.data.device_ptr(&ctx.stream);
+            quantize_paged_kv_fp8(
+                &ctx,
+                k_src_ptr,
+                k_fp8_ptr,
+                k_scl_ptr,
+                &token_rows_gpu,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                kv_seq_len,
+            )
+            .expect("k quant");
+        }
+        {
+            let (v_fp8_ptr, _g1) = v_fp8.device_ptr_mut(&ctx.stream);
+            let (v_scl_ptr, _g2) = v_scales.device_ptr_mut(&ctx.stream);
+            let (v_src_ptr, _g3) = v_work.data.device_ptr(&ctx.stream);
+            quantize_paged_kv_fp8(
+                &ctx,
+                v_src_ptr,
+                v_fp8_ptr,
+                v_scl_ptr,
+                &token_rows_gpu,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                kv_seq_len,
+            )
+            .expect("v quant");
+        }
+
+        // ── 3. Pack the kv_meta / kv_indices the way the decode-attention
+        //       FP8 kernel expects: kv_meta = [kv_indptr (batch+1) ||
+        //       last_page_len (batch)]; kv_indices = page list.
+        let last_page_tokens = kv_seq_len - (num_pages - 1) * PAGE_SIZE;
+        let kv_meta_host: Vec<i32> = vec![0, num_pages as i32, last_page_tokens as i32];
+        let kv_meta_gpu = ctx.stream.clone_htod(&kv_meta_host).expect("kv_meta H2D");
+        let kv_indices_host: Vec<i32> = (0..num_pages as i32).collect();
+        let kv_indices_gpu = ctx.stream.clone_htod(&kv_indices_host).expect("kv_idx H2D");
+
+        // ── 4. Upload Q + allocate output.
+        let q = {
+            let q_data = ctx.stream.clone_htod(&q_host).expect("q H2D");
+            HiddenStates {
+                data: q_data,
+                hidden_dim: q_dim,
+                seq_len: batch_size,
+            }
+        };
+        let mut o = HiddenStates::zeros(&ctx, q_dim, batch_size).expect("o alloc");
+
+        // ── 5. Workspace + dispatch.
+        let num_splits = 4usize;
+        let workspace_bytes =
+            decode_attention_int8_workspace_bytes(batch_size, num_q_heads, head_dim, num_splits);
+        let workspace = ctx
+            .stream
+            .alloc_zeros::<u8>(workspace_bytes.max(1))
+            .expect("ws alloc");
+
+        let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let (k_fp8_ptr, _gk) = k_fp8.device_ptr(&ctx.stream);
+        let (v_fp8_ptr, _gv) = v_fp8.device_ptr(&ctx.stream);
+        let (k_scl_ptr, _gks) = k_scales.device_ptr(&ctx.stream);
+        let (v_scl_ptr, _gvs) = v_scales.device_ptr(&ctx.stream);
+        decode_attention_fp8(
+            &ctx,
+            &q,
+            k_fp8_ptr,
+            v_fp8_ptr,
+            k_scl_ptr,
+            v_scl_ptr,
+            &kv_indices_gpu,
+            &kv_meta_gpu,
+            &mut o,
+            batch_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            kv_dim,
+            sm_scale,
+            &workspace,
+            workspace_bytes,
+        )
+        .expect("decode_attn_fp8");
+
+        ctx.sync().expect("sync");
+        let got_bits = ctx.stream.clone_dtoh(&o.data).expect("o D2H");
+        let got: Vec<f32> = got_bits.iter().map(|b| b.to_f32()).collect();
+
+        // ── 6. Host reference: dequantize K, V back to f32 (using the
+        //       per-(token, head) scales the production kernel wrote), then
+        //       compute attention for the single Q row.
+        let k_fp8_host = ctx.stream.clone_dtoh(&k_fp8).expect("k_fp8 D2H");
+        let v_fp8_host = ctx.stream.clone_dtoh(&v_fp8).expect("v_fp8 D2H");
+        let k_scl_host = ctx.stream.clone_dtoh(&k_scales).expect("k_scl D2H");
+        let v_scl_host = ctx.stream.clone_dtoh(&v_scales).expect("v_scl D2H");
+
+        let mut max_abs_err = 0.0f32;
+        let mut sum_abs_err = 0.0f64;
+        let group_q_per_kv = num_q_heads / num_kv_heads;
+        let mut q_f32 = vec![0.0f32; q_dim];
+        for i in 0..q_dim {
+            q_f32[i] = q_host[i].to_f32();
+        }
+
+        // Pre-dequantize K, V for the active rows.
+        let mut k_deq = vec![0.0f32; kv_seq_len * kv_dim];
+        let mut v_deq = vec![0.0f32; kv_seq_len * kv_dim];
+        for t in 0..kv_seq_len {
+            for h in 0..num_kv_heads {
+                let ks = k_scl_host[t * num_kv_heads + h];
+                let vs = v_scl_host[t * num_kv_heads + h];
+                for d in 0..head_dim {
+                    let off = t * kv_dim + h * head_dim + d;
+                    // FP8 E4M3 decode: cast i8 bits via `__nv_fp8_e4m3` is
+                    // the production path; here we re-quantize on host
+                    // using the same formula `val/scale → fp8 → val*scale`
+                    // to match what GPU does.
+                    let raw = k_fp8_host[off];
+                    let k_dq = fp8_e4m3_to_f32(raw) * ks;
+                    let raw_v = v_fp8_host[off];
+                    let v_dq = fp8_e4m3_to_f32(raw_v) * vs;
+                    k_deq[off] = k_dq;
+                    v_deq[off] = v_dq;
+                }
+            }
+        }
+
+        for hq in 0..num_q_heads {
+            let hk = hq / group_q_per_kv;
+            let mut scores = vec![0.0f32; kv_seq_len];
+            let mut m = f32::NEG_INFINITY;
+            for t in 0..kv_seq_len {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q_f32[hq * head_dim + d] * k_deq[t * kv_dim + hk * head_dim + d];
+                }
+                scores[t] = dot * sm_scale;
+                if scores[t] > m {
+                    m = scores[t];
+                }
+            }
+            let mut sum_exp = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - m).exp();
+                sum_exp += *s;
+            }
+            for s in scores.iter_mut() {
+                *s /= sum_exp;
+            }
+            for d in 0..head_dim {
+                let mut o_d = 0.0f32;
+                for t in 0..kv_seq_len {
+                    o_d += scores[t] * v_deq[t * kv_dim + hk * head_dim + d];
+                }
+                let actual = got[hq * head_dim + d];
+                let err = (actual - o_d).abs();
+                max_abs_err = max_abs_err.max(err);
+                sum_abs_err += err as f64;
+            }
+        }
+        let mean_abs_err = sum_abs_err / (num_q_heads * head_dim) as f64;
+
+        eprintln!(
+            "fp8_kernel_pair_decode_attention_diagnostic: \
+             num_q_heads={num_q_heads} num_kv_heads={num_kv_heads} head_dim={head_dim} \
+             kv_seq_len={kv_seq_len} max_abs_err={max_abs_err:.6} \
+             mean_abs_err={mean_abs_err:.6}"
+        );
+
+        // The GPU output is BF16 (truncated from f32). Host reference uses
+        // the same dequantized values the GPU sees. Acceptable error
+        // envelope: BF16 truncation (~1e-3 per element) + accumulation
+        // noise (~5e-3 for kv_seq_len=32). Anything > 0.5 indicates the
+        // kernel-pair is producing systematically wrong output.
+        assert!(
+            max_abs_err < 0.5,
+            "FP8 kernel-pair decode attention diverges from host reference \
+             (max_abs_err={max_abs_err:.6}). Bug is in the production kernel \
+             pair (quantize_paged_kv_fp8 → decode_attention_fp8). Otherwise \
+             the audit's step-1 divergence is in scheduler-side dispatch \
+             wiring (kv_indices / kv_meta / scale-pointer plumbing) outside \
+             this kernel pair."
+        );
+    }
+
+    /// Host-side FP8 E4M3 decode for the diagnostic above. Bit-exact for
+    /// the 256-value table the GPU's `__nv_fp8_e4m3` cast produces.
+    fn fp8_e4m3_to_f32(byte: u8) -> f32 {
+        // FP8 E4M3 layout: 1 sign | 4 exponent | 3 mantissa, bias=7, no
+        // infinities (S.1111.111 is NaN). Values: ±[0, 1, ..., 448].
+        let sign = ((byte >> 7) & 0x1) as u32;
+        let exp = ((byte >> 3) & 0x0F) as u32;
+        let mant = (byte & 0x07) as u32;
+        if exp == 0 {
+            // Subnormal: 2^-6 * (mant / 8)
+            let mag = (mant as f32) * (1.0f32 / 8.0f32) * 2.0f32.powi(-6);
+            if sign == 1 { -mag } else { mag }
+        } else if exp == 0xF && mant == 0x7 {
+            // NaN sentinel.
+            f32::NAN
+        } else {
+            let m = 1.0f32 + (mant as f32) / 8.0f32;
+            let e = exp as i32 - 7;
+            let mag = m * 2.0f32.powi(e);
+            if sign == 1 { -mag } else { mag }
+        }
+    }
+
     /// Same diagnostic as above but exercises `quantize_paged_kv_fp8`, the
     /// kernel actually called by `finalize_paged_prefill_kv_layer` and the
     /// per-decode-step write path (NOT `quantize_scatter_kv_fp8`, which only

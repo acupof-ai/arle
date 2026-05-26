@@ -18,16 +18,99 @@ the same token as BF16 at step 0 (prefill's last logit) and **diverges at
 the very first decode step** — identical signature to the 2026-05-02
 "token-1 divergences 30/32" reading.
 
-## Root cause — narrowed to dispatch / wiring (2026-05-26)
+## Root cause — narrowed to decode-step path (2026-05-26)
 
-Two production-layout roundtrip diagnostics now live in
-`crates/cuda-kernels/src/kv_quant.rs` (`fp8_scatter_qwen3_production_layout_diagnostic`,
+A third diagnostic, `infer/tests/kv_fp8_prefill_logit_parity.rs`, drives
+`forward_token_logits` on the same 16-token input in BF16 and FP8 KV
+modes and compares the per-position logit vector (vocab=151936). On L4
+sm_89:
+
+```
+fp8_vs_bf16_prefill_logits_parity:
+  max_abs=0.000000  mean_abs=0.000000  max_rel=0.000000
+  argmax_bf16=16  argmax_fp8=16  argmax_match=true
+  top1_bf16_val=17.7500  top1_fp8_val=17.7500
+```
+
+**Bit-identical.** The entire prefill compute path — TileLang HD128 paged
+prefill, BF16 work buffer attention, last-position logit extraction — is
+shape- and dispatch-equivalent across both modes. The
+`finalize_paged_prefill_kv_layer` quantize-after-attention step runs after
+the logit is computed, so even if it wrote wrong bytes it would not show
+up here.
+
+The audit's catastrophic divergence at step 1 must therefore live in the
+per-decode-step path, which is the only code that differs once we move
+past the prefill boundary:
+
+- Per-decode-step `quantize_paged_kv_fp8` writes the new token's K/V
+  into FP8 paged storage using `last_token_indices` for the destination
+  row. Off-by-row here would write to the wrong page slot.
+- `decode_attention_fp8` reads prefill rows (written by
+  `finalize_paged_prefill_kv_layer`) + the new row using `kv_indices` and
+  `kv_last_page_len`. Off-by-row OR a stale-snapshot of `kv_indices`
+  would read the wrong tokens.
+- Per-token-per-head scale layout in the paged pool (the kernel writes
+  `scales[row * num_kv_heads + kv_head]`; the decode-attention kernel
+  reads `K_scales[row * num_kv_heads + kv_head]`). Source survey shows
+  these agree, but a hidden stride or layer-index miswire would only
+  surface in production.
+
+Two production-layout kernel roundtrips already certify the kernel
+correctness in isolation (`crates/cuda-kernels/src/kv_quant.rs`
+`fp8_scatter_qwen3_production_layout_diagnostic`,
 `fp8_paged_quantize_qwen3_production_layout_diagnostic`). Both exercise
-the actual FP8 kernels called from the migration path
-(`quantize_scatter_kv_fp8_range`) and the prefill-finalize / per-decode-step
-path (`quantize_paged_kv_fp8`) at Qwen3-4B layout (num_kv_heads=8,
-head_dim=128, 64 tokens) with realistic ±6 outliers and N(0, 2)
-fill. Result on L4 (sm_89):
+the actual FP8 kernels at Qwen3-4B layout (num_kv_heads=8, head_dim=128,
+64 tokens) with realistic ±6 outliers and N(0, 2) fill.
+
+A third diagnostic, `fp8_kernel_pair_decode_attention_diagnostic`, now
+wires the production kernel pair end-to-end (production
+`quantize_paged_kv_fp8` writes → production `decode_attention_fp8` reads)
+over a deterministic Qwen3-4B-shaped GQA 2:1 workload (num_q_heads=4,
+num_kv_heads=2, head_dim=128, 32 KV tokens / 2 pages) and compares the
+GPU attention output against a dequantize-then-host-compute reference.
+Result on L4 sm_89: `max_abs_err=0.003784`, `mean_abs_err=0.000523` —
+within BF16 truncation noise. The kernel pair, the kv_meta / kv_indices
+layout interpretation, and the per-(token, head) scale plumbing are all
+clean when the dispatch fields match the kernel's contract.
+
+**CUDA Graph ruled out** (2026-05-26): re-ran the audit with
+`INFER_TEST_CUDA_GRAPH=0` after teaching the harness to honor the
+env. FP8 `mean_match = 0.0156`, `first_div = step 1` — bit-for-bit
+identical to the graph-on result. Graph-capture write-order is not
+the bug.
+
+**Structural symmetry confirmed**: INT8 mode and FP8 mode use the
+exact same paged-pool buffers and dispatch shapes — both route the
+prep K/V to `pool.k_ptr(layer)` (which is the shared `k_work` for
+both quantized formats), both call `quantize_paged_kv_<x>` with the
+same `last_token_indices` / `prefill_token_rows` plumbing, both call
+`decode_attention_<x>` with the same `kv_indices` / `kv_meta`. The
+only on-the-wire difference is the kernel name. INT8 passes parity,
+FP8 fails — so the bug is in some FP8-specific behavior the kernel
+parity tests have not yet exercised.
+
+**Conclusion**: the audit's step-1 catastrophic divergence is in
+scheduler-side runtime dispatch wiring of the values fed to these
+kernels, not in any FP8 CUDA kernel. Remaining suspect surface:
+
+1. The per-decode-step `last_token_indices` build (`tilelang.rs`
+   `last_token_scratch` → `last_token_indices` H2D + `build_last_indices`
+   in `paged_kv.rs`). If the new token's destination row is wrong, the
+   per-step quantize writes to the wrong slot and `decode_attention_fp8`
+   reads stale bytes there.
+2. The `kv_indices` snapshot (`tilelang.rs` `indices_scratch` → H2D vs
+   incremental-update GPU kernel). At decode step 1 the page list grows
+   to include the newly allocated page — if the snapshot is stale, the
+   attention misses the new token's page or reads from an evicted one.
+3. The K vs V scale-pointer ordering across the per-layer
+   `finalize_paged_prefill_kv_layer` + per-step paths — a swap would
+   make every attention score multiplicatively wrong, exactly the
+   "catastrophic from step 1" failure shape.
+4. Layer-index propagation across `pool.k_data_ptr(layer)` /
+   `pool.k_scales_ptr(layer)` between prefill finalize and decode steps —
+   if layer L's decode reads layer M's pool data, every layer mixes
+   wrong K/V. Result on L4 (sm_89):
 
 | Kernel | max_abs_err | mean_abs_err | max_rel_err | scale range |
 |---|---:|---:|---:|---|

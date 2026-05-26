@@ -188,6 +188,26 @@ Phase 1 估算：~4-6 小时 codex 时间（写 scan kernel + 重构 site 1 + bu
 Phase 2 估算：~1-2 天（persistent kernel 是新写、要 sweep register/occupancy）。
 Phase 3 估算：~2-3 天（DeepEP API 调研 + 重构 + 多卡 bench）。
 
+## Execution log
+
+- 2026-05-26 Phase 1 landed as device-side local-route offsets with
+  `DSV4_A3_PHASE1=0` fallback. Result: H2D activity drops 546 → 352 calls
+  and 26,240 B → 1,408 B in single-token decode nsys; D2H remains 344 calls;
+  longseq output is byte-identical and wall-clock is flat/slightly positive
+  (31.3438 s → 31.3414 s for `max_tokens=1`, 36.4854 s → 36.4439 s for
+  `max_tokens=64`). See
+  [`../experience/wins/2026-05-26-dsv4-a3-phase1-device-offsets.md`](../experience/wins/2026-05-26-dsv4-a3-phase1-device-offsets.md).
+- 2026-05-26 Phase 2 route-grouped reuse was KILLed as a default path. The
+  opt-in path can delete decode-window D2H (344 calls → 0 in the filtered
+  nsys summary) and a rounding-order fix restored longseq byte identity, but
+  wall-clock failed the gate: short decode improved only 0.7891 s → 0.7528 s
+  (-4.60%, below the 5% PASS threshold) and longseq `max_tokens=32` regressed
+  108.7749 s → 110.2519 s (+1.36%). Keep
+  `ARLE_DSV4_ROUTE_GROUPED_EXPERTS` default-off; the next Phase 2 attempt must
+  be true persistent grouped GEMM/DeepGEMM-style dispatch, not more tuning of
+  the route-wise GEMV prototype. See
+  [`../experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](../experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md).
+
 ## Cross-refs
 
 - A3 axis backlog 入口：
