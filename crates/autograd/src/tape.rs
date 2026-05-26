@@ -127,6 +127,35 @@ pub enum BackwardOp {
     LinearAttention,
 }
 
+impl BackwardOp {
+    pub fn name(self) -> &'static str {
+        match self {
+            BackwardOp::Add => "Add",
+            BackwardOp::Mul => "Mul",
+            BackwardOp::MulScalar => "MulScalar",
+            BackwardOp::Exp => "Exp",
+            BackwardOp::Sum => "Sum",
+            BackwardOp::Matmul => "Matmul",
+            BackwardOp::MatmulBT => "MatmulBT",
+            BackwardOp::Softmax => "Softmax",
+            BackwardOp::LogSoftmax => "LogSoftmax",
+            BackwardOp::Gather => "Gather",
+            BackwardOp::Mean => "Mean",
+            BackwardOp::RMSNorm => "RMSNorm",
+            BackwardOp::Silu => "Silu",
+            BackwardOp::Sigmoid => "Sigmoid",
+            BackwardOp::Gelu => "Gelu",
+            BackwardOp::RoPE => "RoPE",
+            BackwardOp::Reshape => "Reshape",
+            BackwardOp::Slice => "Slice",
+            BackwardOp::Transpose => "Transpose",
+            BackwardOp::AddBroadcast => "AddBroadcast",
+            BackwardOp::Embedding => "Embedding",
+            BackwardOp::LinearAttention => "LinearAttention",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BackwardOpProfile {
     pub count: usize,
@@ -303,6 +332,9 @@ impl Tape {
                     None => continue,
                 };
 
+                if profile.is_some() {
+                    sync_profile_boundary(store)?;
+                }
                 let op_started = profile.is_some().then(Instant::now);
                 let input_grads = match entry.op {
                     BackwardOp::Add => ops::add_backward(&entry, output_grad_id, store)?,
@@ -343,14 +375,19 @@ impl Tape {
                     }
                 };
                 if let (Some(profile), Some(started)) = (profile.as_deref_mut(), op_started) {
+                    sync_profile_boundary(store)?;
                     profile.record_op(entry.op, started.elapsed());
                 }
 
+                if profile.is_some() {
+                    sync_profile_boundary(store)?;
+                }
                 let merge_started = profile.is_some().then(Instant::now);
                 for (input_id, grad_id) in input_grads {
                     merge_grad(&mut grads, input_id, grad_id, store)?;
                 }
                 if let (Some(profile), Some(started)) = (profile.as_deref_mut(), merge_started) {
+                    sync_profile_boundary(store)?;
                     profile.merge_grad_duration += started.elapsed();
                 }
             }
@@ -364,6 +401,10 @@ impl Tape {
         }
         result
     }
+}
+
+fn sync_profile_boundary(store: &TensorStore) -> Result<()> {
+    store.backend().eval(&[])
 }
 
 fn collect_relevant(
@@ -527,6 +568,7 @@ mod tests {
         assert_eq!(profiled_stored_grad, profiled_grad);
 
         let profile = profile.expect("profile returned");
+        assert_eq!(BackwardOp::LinearAttention.name(), "LinearAttention");
         assert_eq!(profile.op_totals[&BackwardOp::Sum].count, 1);
         assert_eq!(profile.op_totals[&BackwardOp::Mul].count, 1);
         assert!(profile.total_duration >= profile.total_op_duration());

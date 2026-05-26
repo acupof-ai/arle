@@ -81,6 +81,88 @@ fn tiny_hybrid_qwen35_config() -> Qwen35Config {
     cfg
 }
 
+static OPD_BACKWARD_PROFILE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct BackwardProfileEnvGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl BackwardProfileEnvGuard {
+    fn unset() -> Self {
+        let previous = std::env::var_os("ARLE_OPD_BACKWARD_PROFILE");
+        // SAFETY: this test serializes writes to the env var with
+        // OPD_BACKWARD_PROFILE_ENV_LOCK and restores the previous value.
+        unsafe {
+            std::env::remove_var("ARLE_OPD_BACKWARD_PROFILE");
+        }
+        Self { previous }
+    }
+
+    fn set_enabled(&self) {
+        // SAFETY: see `unset`.
+        unsafe {
+            std::env::set_var("ARLE_OPD_BACKWARD_PROFILE", "1");
+        }
+    }
+}
+
+impl Drop for BackwardProfileEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `unset`.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("ARLE_OPD_BACKWARD_PROFILE", value),
+                None => std::env::remove_var("ARLE_OPD_BACKWARD_PROFILE"),
+            }
+        }
+    }
+}
+
+fn run_tiny_windowed_gkd_step() -> (f32, usize) {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let teacher = InProcessTeacher::new(&teacher);
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+    let prompt_ids: Vec<u32> = vec![1, 3, 8];
+    let corpus_tokens: Vec<u32> = vec![4, 5, 6];
+    let mut profile = OpdStepProfile::default();
+
+    let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
+        &student,
+        &teacher,
+        &prompt_ids,
+        OpdStepConfig {
+            rollout_len: 2,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+        GkdLossConfig {
+            lambda: 0.3,
+            sft_anchor: GkdSftAnchor::CorpusTruth,
+            corpus_tokens: Some(&corpus_tokens),
+            kl_chunk_size: Some(2),
+            logits_window_size: Some(2),
+            kl_mask: OpdKlMask::Full,
+        },
+        Some(&mut profile),
+    )
+    .expect("windowed GKD OPD step runs");
+
+    assert!(
+        profile.backward_seconds > 0.0,
+        "Route B must run at least one per-window backward"
+    );
+    (outcome.loss, outcome.rollout_len)
+}
+
 /// End-to-end opd_step smoke: rollout → teacher forward → student forward
 /// → KL → backward → AdamW step. Teacher is built with `new_for_eval`, so
 /// its deterministic scratch weights match the student initializer while
@@ -125,53 +207,27 @@ fn opd_step_runs_end_to_end() {
 }
 
 #[test]
+fn opd_backward_profile_env_preserves_windowed_gkd_loss() {
+    let _guard = OPD_BACKWARD_PROFILE_ENV_LOCK
+        .lock()
+        .expect("profile env lock");
+    let env_guard = BackwardProfileEnvGuard::unset();
+
+    let plain = run_tiny_windowed_gkd_step();
+    env_guard.set_enabled();
+    let profiled = run_tiny_windowed_gkd_step();
+
+    assert_eq!(plain, profiled);
+}
+
+#[test]
 fn opd_step_windowed_gkd_runs_end_to_end() {
-    let mut store = TensorStore::default();
-    let mut tape = Tape::new();
-    let cfg = tiny_qwen35_config();
+    let (loss, rollout_len) = run_tiny_windowed_gkd_step();
 
-    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
-    let teacher = InProcessTeacher::new(&teacher);
-    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
-    let student_params = student.all_parameter_ids();
-    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
-    let prompt_ids: Vec<u32> = vec![1, 3, 8];
-    let corpus_tokens: Vec<u32> = vec![4, 5, 6];
-    let mut profile = OpdStepProfile::default();
-
-    let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
-        &student,
-        &teacher,
-        &prompt_ids,
-        OpdStepConfig {
-            rollout_len: 2,
-            grad_clip: 1.0,
-        },
-        &student_params,
-        &mut optimizer,
-        &mut store,
-        &mut tape,
-        GkdLossConfig {
-            lambda: 0.3,
-            sft_anchor: GkdSftAnchor::CorpusTruth,
-            corpus_tokens: Some(&corpus_tokens),
-            kl_chunk_size: Some(2),
-            logits_window_size: Some(2),
-            kl_mask: OpdKlMask::Full,
-        },
-        Some(&mut profile),
-    )
-    .expect("windowed GKD OPD step runs without panic");
-
-    assert_eq!(outcome.rollout_len, prompt_ids.len() + 2);
+    assert_eq!(rollout_len, 5);
     assert!(
-        outcome.loss.is_finite(),
-        "windowed GKD loss should be finite, got {}",
-        outcome.loss
-    );
-    assert!(
-        profile.backward_seconds > 0.0,
-        "Route B must run at least one per-window backward"
+        loss.is_finite(),
+        "windowed GKD loss should be finite, got {loss}"
     );
 }
 
