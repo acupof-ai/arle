@@ -26,10 +26,27 @@ const DISTRIBUTED_TOKEN_WAIT_TIMEOUT: Duration = Duration::from_mins(5);
 /// per rank. Only rank 0 is allowed to choose the next token; follower ranks
 /// use the published token so TP/EP collectives see identical token histories
 /// on the next forward step.
+///
+/// Two implementations:
+/// - **InProcess** (the historical and still-default single-process N-thread
+///   path): all ranks share a per-request `DistributedTokenCoordinator`
+///   backed by Mutex+Condvar. Fast (~50 ns/sync) but cannot cross processes.
+/// - **Nccl** (phase B-1 multiproc-serve): each rank owns its own
+///   coordinator wrapping its rank's `Arc<NcclGroup>`. `synchronize_token`
+///   becomes `broadcast_i32(local, 1, root=0)`. Slightly slower (~10 µs/
+///   sync over NVLink) but works across process boundaries.
 #[derive(Clone)]
-pub struct DistributedRequestCoordination {
-    rank: usize,
-    coordinator: Arc<DistributedTokenCoordinator>,
+pub enum DistributedRequestCoordination {
+    InProcess {
+        rank: usize,
+        coordinator: Arc<DistributedTokenCoordinator>,
+    },
+    #[cfg(feature = "nccl")]
+    Nccl {
+        rank: usize,
+        world_size: usize,
+        nccl: Arc<crate::distributed::nccl::NcclGroup>,
+    },
 }
 
 impl DistributedRequestCoordination {
@@ -40,16 +57,69 @@ impl DistributedRequestCoordination {
                 coordinator.world_size
             );
         }
-        Ok(Self { rank, coordinator })
+        Ok(Self::InProcess { rank, coordinator })
+    }
+
+    /// Construct a multi-process-safe coordination backed by NCCL
+    /// `broadcast_i32`. Phase B-1 commit C.4 wires this from
+    /// `request_handle.rs` (rank 0) and from the worker-side relay
+    /// receiver in `main.rs::run_worker_mode` (ranks 1..N-1).
+    #[cfg(feature = "nccl")]
+    pub fn new_nccl(
+        rank: usize,
+        world_size: usize,
+        nccl: Arc<crate::distributed::nccl::NcclGroup>,
+    ) -> Result<Self> {
+        if world_size == 0 {
+            anyhow::bail!("distributed request world_size must be >= 1");
+        }
+        if rank >= world_size {
+            anyhow::bail!(
+                "distributed request rank {rank} out of range for world_size {world_size}"
+            );
+        }
+        if nccl.world_size != world_size || nccl.rank != rank {
+            anyhow::bail!(
+                "NCCL group (rank={}, ws={}) does not match request rank/world_size ({rank}, {world_size})",
+                nccl.rank,
+                nccl.world_size
+            );
+        }
+        Ok(Self::Nccl {
+            rank,
+            world_size,
+            nccl,
+        })
     }
 
     pub fn rank(&self) -> usize {
-        self.rank
+        match self {
+            Self::InProcess { rank, .. } => *rank,
+            #[cfg(feature = "nccl")]
+            Self::Nccl { rank, .. } => *rank,
+        }
     }
 
     pub fn synchronize_token(&self, step_idx: usize, local_token: u32) -> Result<u32> {
-        self.coordinator
-            .synchronize_token(self.rank, step_idx, local_token)
+        match self {
+            Self::InProcess { rank, coordinator } => {
+                coordinator.synchronize_token(*rank, step_idx, local_token)
+            }
+            #[cfg(feature = "nccl")]
+            Self::Nccl {
+                rank,
+                world_size: _,
+                nccl,
+            } => {
+                let input = if *rank == 0 {
+                    vec![local_token as i32]
+                } else {
+                    vec![0i32]
+                };
+                let out = nccl.broadcast_i32(&input, 1, 0)?;
+                Ok(out[0] as u32)
+            }
+        }
     }
 }
 
@@ -207,8 +277,13 @@ pub struct SchedulerConfig {
     /// Maximum number of prefilling requests to advance in one scheduler step.
     /// `None` means no explicit request-count cap.
     pub prefill_max_requests: Option<usize>,
+    /// Maximum number of cold long-prefill requests that may be active at the
+    /// same time. Short prompts and prefix hits bypass this cap, so high-c
+    /// traffic does not inflate TTFT by admitting every long prefill before
+    /// already-decoding rows can make progress.
+    pub long_prefill_active_limit: Option<usize>,
     /// Prompt length at or below which prefix staging/prefetch and
-    /// decode+prefill split launches are bypassed.
+    /// decode+prefill mixed launches are bypassed.
     ///
     /// SGLang exposes `--disable-chunked-prefix-cache` because chunked prefix
     /// cache overhead can dominate short sequences. ARLE keeps the default
@@ -230,8 +305,8 @@ pub struct SchedulerConfig {
     /// Operator-facing schedule policy name. The CUDA scheduler currently
     /// implements SGLang-compatible `fcfs`; other names are rejected at CLI.
     pub schedule_policy: SchedulePolicy,
-    /// Whether CUDA decode-active prefill rows use the mixed decode+prefill
-    /// path or the production split prefill-then-decode path.
+    /// CUDA decode-active prefill policy. Mixed is the only operator-facing
+    /// mode; models without a mixed lowering fall back internally.
     pub mixed_policy: SchedulerMixedPolicy,
     /// Stream chunking interval in generated tokens. 1 matches SGLang's
     /// default and flushes every token.
@@ -332,12 +407,13 @@ impl Default for SchedulerConfig {
             max_prefill_tokens: 16384,
             long_prefill_token_threshold: 512,
             prefill_max_requests: None,
+            long_prefill_active_limit: Some(4),
             short_prompt_bypass_tokens: 256,
             prefix_cache_enabled: true,
             admission_policy: SchedulerAdmissionPolicy::QueueBound,
             cold_headroom: None,
             schedule_policy: SchedulePolicy::Fcfs,
-            mixed_policy: SchedulerMixedPolicy::Split,
+            mixed_policy: SchedulerMixedPolicy::Mixed,
             stream_interval: 1,
             spec_enabled: false,
             spec_draft_k: 5,
@@ -471,22 +547,21 @@ impl SchedulerConfig {
         }
     }
 
-    /// Total prefill tokens allowed inside a mixed decode+prefill launch.
+    /// Total prefill tokens allowed inside one mixed decode+prefill launch.
     ///
-    /// Per-request decode-active chunks are already capped by
-    /// [`Self::long_prefill_token_threshold`] when candidates are created.
-    /// This method must therefore return the whole-step prefill budget, or
-    /// c=4 long-context traffic gets collapsed to one 4096-token row per mixed
-    /// tick while split can pack four rows.
-    pub fn mixed_prefill_token_budget(&self) -> usize {
-        self.max_prefill_tokens.max(1)
+    /// Mirrors SGLang's mixed chunk admission: a mixed batch spends one
+    /// chunk-sized token envelope, and running decode rows consume the first
+    /// tokens in that envelope. Larger prefill bursts still use the pure prefill
+    /// path when no decode is active.
+    pub fn mixed_prefill_token_budget(&self, decode_rows: usize) -> usize {
+        self.chunked_prefill_size.saturating_sub(decode_rows)
     }
 
     /// Mixed workspace budget. Zero means the runtime must not reserve mixed
     /// buffers because the policy cannot launch that path.
     pub fn mixed_prefill_workspace_token_budget(&self) -> usize {
         if self.mixed_policy.allows_mixed() {
-            self.mixed_prefill_token_budget()
+            self.chunked_prefill_size.max(1)
         } else {
             0
         }
@@ -528,6 +603,9 @@ impl SchedulerConfig {
         }
         if matches!(self.prefill_max_requests, Some(0)) {
             anyhow::bail!("prefill_max_requests must be ≥ 1 when provided");
+        }
+        if matches!(self.long_prefill_active_limit, Some(0)) {
+            anyhow::bail!("long_prefill_active_limit must be ≥ 1 when provided");
         }
         if self.stream_interval == 0 {
             anyhow::bail!("stream_interval must be ≥ 1");
@@ -632,31 +710,30 @@ pub enum SchedulePolicy {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SchedulerMixedPolicy {
+    /// Always try the single mixed decode+prefill lowering first. Models that
+    /// cannot execute it still fall back internally to separate launches.
     #[default]
-    Split,
     Mixed,
 }
 
 impl SchedulerMixedPolicy {
     pub fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "split" => Ok(Self::Split),
             "mixed" => Ok(Self::Mixed),
-            other => anyhow::bail!(
-                "unsupported --scheduler-mixed-policy '{other}': expected 'split' or 'mixed'"
-            ),
+            other => {
+                anyhow::bail!("unsupported --scheduler-mixed-policy '{other}': expected 'mixed'")
+            }
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Split => "split",
             Self::Mixed => "mixed",
         }
     }
 
     pub fn allows_mixed(self) -> bool {
-        matches!(self, Self::Mixed)
+        true
     }
 }
 
@@ -1082,11 +1159,12 @@ mod tests {
         assert_eq!(cfg.max_num_batched_tokens, 16384);
         assert_eq!(cfg.max_prefill_tokens, 16384);
         assert_eq!(cfg.long_prefill_token_threshold, 4096);
-        assert_eq!(cfg.mixed_prefill_token_budget(), 16384);
+        assert_eq!(cfg.mixed_prefill_token_budget(16), 4080);
         assert_eq!(cfg.prefill_max_requests, None);
+        assert_eq!(cfg.long_prefill_active_limit, Some(4));
         assert_eq!(cfg.admission_policy, SchedulerAdmissionPolicy::QueueBound);
         assert_eq!(cfg.cold_headroom, None);
-        assert_eq!(cfg.mixed_policy, SchedulerMixedPolicy::Split);
+        assert_eq!(cfg.mixed_policy, SchedulerMixedPolicy::Mixed);
         assert!(!cfg.spec_enabled);
         assert_eq!(cfg.spec_draft_k, 5);
         assert_eq!(cfg.spec_acceptance_threshold, 0.6);
@@ -1374,38 +1452,33 @@ mod tests {
     }
 
     #[test]
-    fn mixed_prefill_token_budget_uses_full_step_cap_not_long_row_cap() {
+    fn mixed_prefill_token_budget_uses_chunk_minus_decode_rows() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.chunked_prefill_size = 2048;
         cfg.max_prefill_tokens = 2048;
         cfg.long_prefill_token_threshold = 4096;
-        assert_eq!(cfg.mixed_prefill_token_budget(), 2048);
+        assert_eq!(cfg.mixed_prefill_token_budget(16), 2032);
 
         cfg.max_prefill_tokens = 16384;
         cfg.long_prefill_token_threshold = 1024;
-        assert_eq!(cfg.mixed_prefill_token_budget(), 16384);
+        assert_eq!(cfg.mixed_prefill_token_budget(2048), 0);
     }
 
     #[test]
-    fn mixed_prefill_workspace_budget_respects_policy_gate() {
+    fn mixed_prefill_workspace_budget_uses_chunk_workspace() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.max_prefill_tokens = 16384;
         cfg.long_prefill_token_threshold = 1024;
-        assert_eq!(cfg.mixed_prefill_workspace_token_budget(), 0);
-
-        cfg.mixed_policy = SchedulerMixedPolicy::Mixed;
-        assert_eq!(cfg.mixed_prefill_workspace_token_budget(), 16384);
+        assert_eq!(cfg.mixed_prefill_workspace_token_budget(), 4096);
     }
 
     #[test]
     fn scheduler_mixed_policy_parse_rejects_unknown_values() {
         assert_eq!(
-            SchedulerMixedPolicy::parse("split").unwrap(),
-            SchedulerMixedPolicy::Split
-        );
-        assert_eq!(
             SchedulerMixedPolicy::parse("mixed").unwrap(),
             SchedulerMixedPolicy::Mixed
         );
+        assert!(SchedulerMixedPolicy::parse("split").is_err());
         assert!(SchedulerMixedPolicy::parse("auto").is_err());
     }
 
@@ -1463,6 +1536,13 @@ mod tests {
     fn scheduler_config_rejects_zero_prefill_max_requests() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.prefill_max_requests = Some(0);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_zero_long_prefill_active_limit() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.long_prefill_active_limit = Some(0);
         assert!(cfg.validate().is_err());
     }
 
