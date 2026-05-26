@@ -103,8 +103,10 @@ fn make_request(
         speculative: None,
         priority: RequestPriority::default(),
         session_id: None,
+        ingress_numa_node: None,
         delta_tx: tx,
         trace_context: None,
+        distributed: None,
     };
     (req, rx)
 }

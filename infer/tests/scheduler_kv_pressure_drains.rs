@@ -66,8 +66,10 @@ fn make_request(
         speculative: None,
         priority: RequestPriority::default(),
         session_id: None,
+        ingress_numa_node: None,
         delta_tx: tx,
         trace_context: None,
+        distributed: None,
     };
     (req, rx)
 }
@@ -106,6 +108,7 @@ fn build_pressure_scheduler(
         Some(max_seq_len),
         KVCacheDtype::BF16,
         KVFormat::BF16,
+        None,
     )
     .expect("create scheduler")
 }
