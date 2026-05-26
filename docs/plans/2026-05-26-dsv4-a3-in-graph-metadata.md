@@ -237,6 +237,14 @@ Phase 3 估算：~2-3 天（DeepEP API 调研 + 重构 + 多卡 bench）。
   greedy output byte-identical for `max_tokens=32`. Final SLO evidence still
   needs the 32K / 1.5K, c=8, qps=8 frame. Evidence:
   [`../experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md`](../experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md).
+- 2026-05-26 native DeepEP process-model gate says A3 Phase 3 cannot be a
+  same-process drop-in. Official DeepEP multi-process LL/intranode tests pass
+  on the target 8xH20 shape, but ARLE same-process 8-thread LL times out and
+  same-process intranode fails at `cudaIpcOpenMemHandle` with
+  `invalid device context`. Treat native DeepEP as the highest-priority
+  communication axis, but enter through a process-per-rank transport design.
+  Evidence:
+  [`../experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md`](../experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md).
 
 ## Cross-refs
 

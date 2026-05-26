@@ -24,9 +24,11 @@ toolchain gate after the 2026-05-26 wall-clock and correctness KILL;
 route-grouped experts remain diagnostic-only. Remaining blockers: replacing the
 DeepEP-style NCCL fallback with native DeepEP low-latency kernels,
 byte-identical grouped expert GEMM, launch churn. `deepep` is the default MoE
-backend today; native DeepEP LL is not yet the default because the 8-rank
-same-process NVSHMEM gate timed out on 2026-05-26 while the official
-multi-process DeepEP LL test passed. A2.0 fused the B=1 decode attention
+backend today; native DeepEP is now the top DSv4 communication axis, but it is
+not yet the default because the official multi-process DeepEP LL/intranode
+gates pass while ARLE's same-process 8-thread LL/intranode gates fail. The next
+DeepEP step is a process-per-rank transport design, not another same-process
+drop-in attempt. A2.0 fused the B=1 decode attention
 window-cache update into the attention kernels, removing 9504 standalone update
 kernel launches from the measured H20 `max_tokens=32` nsys request. A2.1 fused
 Q/K prepare into one launch, cutting `cudaLaunchKernel` runtime calls 490244 →
@@ -35,6 +37,7 @@ Q/K prepare into one launch, cutting `cudaLaunchKernel` runtime calls 490244 →
 [`experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md),
 [`experience/errors/2026-05-26-dsv4-native-deepep-ll-sameprocess-timeout.md`](experience/errors/2026-05-26-dsv4-native-deepep-ll-sameprocess-timeout.md),
+[`experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md`](experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md),
 [`experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md`](experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md),
 [`experience/wins/2026-05-26-dsv4-a20-fused-attn-window-update.md`](experience/wins/2026-05-26-dsv4-a20-fused-attn-window-update.md),
 [`experience/wins/2026-05-26-dsv4-a21-fused-qk-prep.md`](experience/wins/2026-05-26-dsv4-a21-fused-qk-prep.md),

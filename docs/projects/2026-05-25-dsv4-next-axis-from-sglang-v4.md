@@ -173,6 +173,16 @@ ncclReduce 同步。L6 trace 显示 reduce-scatter 段 ≈ 20 ms / rank-range。
 DeepEP / NVSHMEM symmetric memory primitive + 自写 GEMM kernel
 （或者集成 SGLang 同款 DeepGEMM，但 license/兼容要查）。
 
+**2026-05-26 gate update**：native DeepEP 现在是 DSv4 通信侧最高优先级，
+但不是现有 one-process multi-thread worker 的 drop-in。远端 8xH20 evidence：
+official DeepEP multi-process LL 通过（dispatch+combine about 48.7 us/rank），
+official intranode multi-process DSv4 decode shape 通过（BF16 dispatch best
+42.05 us, combine best 36.34 us）；ARLE same-process 8-thread LL gate 180 s
+timeout，same-process intranode gate 在 `cudaIpcOpenMemHandle` 报
+`invalid device context`。下一步必须先做 process-per-rank DeepEP transport
+设计/接入；继续同进程强塞或继续小 launch 轴不是收益优先级。Evidence：
+[`../experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md`](../experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md).
+
 ---
 
 ### A5 · HiSparse CPU offload — C4 inactive KV 卸 CPU（长 ctx 单卡 3×）
