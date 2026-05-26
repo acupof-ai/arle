@@ -67,14 +67,16 @@ fn quant_debug_dump_fp8_state(
 ) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static FIRES: AtomicUsize = AtomicUsize::new(0);
-    if layer_idx != 0 {
+    // Fire on layers 0, 17, 35 to track precision-floor compounding across
+    // Qwen3-dense's 36 full-attention layers.
+    if !matches!(layer_idx, 0 | 17 | 35) {
         return;
     }
     if std::env::var("INFER_FP8_DEBUG").is_err() {
         return;
     }
     let fire = FIRES.fetch_add(1, Ordering::Relaxed);
-    if fire >= 12 {
+    if fire >= 18 {
         return;
     }
 
