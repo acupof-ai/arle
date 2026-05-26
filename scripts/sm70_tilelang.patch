@@ -1,8 +1,8 @@
 diff --git a/src/backend/cuda/op/copy.cc b/src/backend/cuda/op/copy.cc
-index 75b904afd..3ed5de212 100644
+index 997b046a..b2864554 100644
 --- a/src/backend/cuda/op/copy.cc
 +++ b/src/backend/cuda/op/copy.cc
-@@ -338,6 +338,11 @@ struct Copy {
+@@ -353,6 +353,11 @@ private:
    static LayoutMap InferBulkLayout(const CopyNode &op, const LayoutInferArgs &T,
                                     InferLevel level, CopyInst copy_inst);
  
@@ -14,7 +14,7 @@ index 75b904afd..3ed5de212 100644
    static Stmt LowerNormal(const CopyNode &op, const LowerArgs &T,
                            arith::Analyzer *analyzer);
  
-@@ -414,6 +419,10 @@ LayoutMap Copy::InferLayout(const CopyNode &op, const LayoutInferArgs &T,
+@@ -429,6 +434,10 @@ LayoutMap Copy::InferLayout(const CopyNode &op, const LayoutInferArgs &T,
        SelectInst(op, T.target, T.layout_map, T.analyzer, T.buffer_oob);
    CheckParallelLoopLayout(op, copy_inst);
  
@@ -25,7 +25,7 @@ index 75b904afd..3ed5de212 100644
    if (copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
      return InferTMemLayout(op, T, copy_inst);
    }
-@@ -576,6 +585,11 @@ LayoutMap Copy::InferBulkLayout(const CopyNode &op, const LayoutInferArgs &T,
+@@ -591,6 +600,11 @@ LayoutMap Copy::InferBulkLayout(const CopyNode &op, const LayoutInferArgs &T,
    return result_map;
  }
  
@@ -37,7 +37,7 @@ index 75b904afd..3ed5de212 100644
  CopyInst Copy::SelectInst(const CopyNode &op, Target target,
                            const LayoutMap &layout_map,
                            arith::Analyzer *analyzer, bool buffer_oob) {
-@@ -600,6 +614,10 @@ Stmt Copy::Lower(const CopyNode &op, const LowerArgs &T,
+@@ -615,6 +629,10 @@ Stmt Copy::Lower(const CopyNode &op, const LowerArgs &T,
          << "Got target=" << T.target;
      return LowerCluster(op, T, analyzer);
    }
@@ -48,7 +48,7 @@ index 75b904afd..3ed5de212 100644
    if (copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
      auto tmem_copy = LowerTmem(op, T, analyzer);
      ICHECK(tmem_copy.defined()) << "Failed to lower tensor memory copy";
-@@ -634,6 +652,40 @@ Stmt Copy::Lower(const CopyNode &op, const LowerArgs &T,
+@@ -649,6 +667,40 @@ Stmt Copy::Lower(const CopyNode &op, const LowerArgs &T,
    }
  }
  
@@ -89,86 +89,113 @@ index 75b904afd..3ed5de212 100644
  Stmt Copy::LowerCPAsync(const CopyNode &op, const LowerArgs &T,
                          arith::Analyzer *analyzer) {
    using namespace tvm::transform;
-diff --git a/src/tl_templates/cuda/instruction/mma_sm70.h b/src/tl_templates/cuda/instruction/mma_sm70.h
-index 7a44b9212..1727b7812 100644
---- a/src/tl_templates/cuda/instruction/mma_sm70.h
-+++ b/src/tl_templates/cuda/instruction/mma_sm70.h
-@@ -284,6 +284,16 @@ TL_DEVICE void call_fma_sm70(typename MmaSm70ImplTraits<Impl>::DReg *d,
-       std::make_index_sequence<MmaSm70ImplTraits<Impl>::kCRegs>{});
+diff --git a/src/backend/cuda/op/gemm.cc b/src/backend/cuda/op/gemm.cc
+index 72b5ada5..2516f1bd 100644
+--- a/src/backend/cuda/op/gemm.cc
++++ b/src/backend/cuda/op/gemm.cc
+@@ -31,6 +31,7 @@ namespace cuda {
+ namespace {
+ 
+ constexpr const char *kCudaMMA = "cuda.mma";
++constexpr const char *kCudaFMA = "cuda.fma";
+ constexpr const char *kCudaWGMMA = "cuda.wgmma";
+ constexpr const char *kCudaTCGEN05 = "cuda.tcgen05";
+ 
+@@ -94,6 +95,23 @@ bool AllowWgmma(const GemmNode &op, int block_size, Target target) {
+          CheckWgmma(op);
  }
  
-+TL_DEVICE unsigned bf16x2_to_f16x2_sm70(unsigned packed_bf16) {
-+  union PackedBf16 {
-+    unsigned u;
-+    bfloat16_t v[2];
-+  } in;
-+  in.u = packed_bf16;
-+  return __pack_half2(half_t(static_cast<float>(in.v[0])),
-+                      half_t(static_cast<float>(in.v[1])));
++bool AllowVoltaMma(const GemmNode &op) {
++  bool scope_ok = (IsSharedBuffer(op.a_) || IsFragmentBuffer(op.a_)) &&
++                  IsSharedBuffer(op.b_);
++  if (!scope_ok) {
++    return false;
++  }
++  if (op.a_->dtype != DataType::Float(16) ||
++      op.b_->dtype != DataType::Float(16)) {
++    return false;
++  }
++  if (op.c_->dtype != DataType::Float(16) &&
++      op.c_->dtype != DataType::Float(32)) {
++    return false;
++  }
++  return op.m_ % 16 == 0 && op.n_ % 16 == 0 && op.k_ % 4 == 0;
 +}
 +
- // Define dispatchers for all supported SM70 configurations
- // Note: m8n8k4 instruction computes m16n16k4 at warp level
- #define TL_DEFINE_MMA_SM70_DISPATCHER(ATypeEnum, BTypeEnum, CTypeEnum,         \
-@@ -321,11 +331,50 @@ TL_DEFINE_MMA_SM70_DISPATCHER(kFloat16, kFloat16, kFloat32, false, false)
+ void FatalWgmmaUnavailable(const GemmNode &op, Target target) {
+   LOG(FATAL) << "T.wgmma_gemm() requires Hopper WGMMA lowering, but "
+                 "constraints were not satisfied. Got target="
+@@ -283,6 +301,9 @@ struct Gemm {
+     if (AllowWgmma(op, block_size, target)) {
+       return kCudaWGMMA;
+     }
++    if (TargetIsVolta(target) && !AllowVoltaMma(op)) {
++      return kCudaFMA;
++    }
+     return kCudaMMA;
+   }
  
- #undef TL_DEFINE_MMA_SM70_DISPATCHER
- 
-+// Volta has no native BF16 tensor-core MMA. Keep the public TileLang BF16
-+// contract compileable by value-converting BF16 fragment registers to FP16
-+// inputs and reusing the FP16 MMA path. Accumulation remains FP32.
-+#define TL_DEFINE_MMA_SM70_BF16_FALLBACK_DISPATCHER(TransAValue, TransBValue)  \
-+  template <>                                                                  \
-+  struct MmaSm70Dispatcher<DataType::kBFloat16, DataType::kBFloat16,           \
-+                           DataType::kFloat32, 16, 16, 4, TransAValue,         \
-+                           TransBValue> {                                      \
-+    using Impl = MmaSm70Impl<DataType::kFloat16, DataType::kFloat16,           \
-+                             DataType::kFloat32, TransAValue, TransBValue>;    \
-+    using Traits = MmaSm70ImplTraits<Impl>;                                    \
-+    using CRegType = typename Traits::DReg;                                    \
-+    using ARegType = unsigned;                                                 \
-+    using BRegType = unsigned;                                                 \
-+    static_assert(                                                             \
-+        std::is_same_v<typename Traits::DReg, typename Traits::CReg>,          \
-+        "tl::mma_sync_sm70 requires matching accumulator/output regs");        \
-+    static TL_DEVICE void exec(CRegType *d, const ARegType *a,                 \
-+                               const BRegType *b, const CRegType *c) {         \
-+      unsigned a_fp16[Traits::kARegs];                                         \
-+      unsigned b_fp16[Traits::kBRegs];                                         \
-+      for (int i = 0; i < Traits::kARegs; ++i) {                               \
-+        a_fp16[i] = bf16x2_to_f16x2_sm70(a[i]);                                \
-+      }                                                                        \
-+      for (int i = 0; i < Traits::kBRegs; ++i) {                               \
-+        b_fp16[i] = bf16x2_to_f16x2_sm70(b[i]);                                \
-+      }                                                                        \
-+      call_fma_sm70<Impl>(d, a_fp16, b_fp16, c);                               \
-+    }                                                                          \
-+  };
-+
-+TL_DEFINE_MMA_SM70_BF16_FALLBACK_DISPATCHER(true, true)
-+TL_DEFINE_MMA_SM70_BF16_FALLBACK_DISPATCHER(true, false)
-+TL_DEFINE_MMA_SM70_BF16_FALLBACK_DISPATCHER(false, true)
-+TL_DEFINE_MMA_SM70_BF16_FALLBACK_DISPATCHER(false, false)
-+
-+#undef TL_DEFINE_MMA_SM70_BF16_FALLBACK_DISPATCHER
-+
- } // namespace detail
+@@ -298,6 +319,11 @@ struct Gemm {
+     if (gemm_inst == kCudaWGMMA) {
+       return ComputeWgmmaWarpPartition(policy, M, N, num_warps);
+     }
++    if (gemm_inst == kCudaFMA) {
++      policy.m_warp = 1;
++      policy.n_warp = num_warps;
++      return {1, num_warps};
++    }
+     int k_n_per_warp = TargetIsVolta(target) ? 16 : 8;
+     return ComputeDefaultWarpPartition(policy, M, N, num_warps, k_n_per_warp);
+   }
+@@ -316,6 +342,9 @@ struct Gemm {
+     if (gemm_inst == kCudaMMA) {
+       return "mma";
+     }
++    if (gemm_inst == kCudaFMA) {
++      return "sync";
++    }
+     return "unknown";
+   }
+ };
+diff --git a/src/tl_templates/cuda/instruction/mma_sm70.h b/src/tl_templates/cuda/instruction/mma_sm70.h
+index 7a44b921..e8ea4239 100644
+--- a/src/tl_templates/cuda/instruction/mma_sm70.h
++++ b/src/tl_templates/cuda/instruction/mma_sm70.h
+@@ -325,7 +325,7 @@ TL_DEFINE_MMA_SM70_DISPATCHER(kFloat16, kFloat16, kFloat32, false, false)
  
  /// SM70 MMA synchronous instruction wrapper
--/// Supports m16n16k4 shape (m8n8k4 instruction at warp level) with FP16 inputs
+ /// Supports m16n16k4 shape (m8n8k4 instruction at warp level) with FP16 inputs
 -/// and FP16/FP32 accumulation
-+/// Supports m16n16k4 shape (m8n8k4 instruction at warp level). Native SM70
-+/// tensor cores use FP16 inputs with FP16/FP32 accumulation; BF16 inputs fall
-+/// back to FP16 MMA inputs with FP32 accumulation.
++/// and FP16/FP32 accumulation.
  ///
  /// @tparam AType Input A data type (kFloat16)
  /// @tparam BType Input B data type (kFloat16)
+diff --git a/testing/python/cuda/test_cuda_mma_sm75_dispatch.py b/testing/python/cuda/test_cuda_mma_sm75_dispatch.py
+index 240e8b14..e027e159 100644
+--- a/testing/python/cuda/test_cuda_mma_sm75_dispatch.py
++++ b/testing/python/cuda/test_cuda_mma_sm75_dispatch.py
+@@ -5,6 +5,7 @@ from tilelang import tvm
+ import tilelang.testing
+ from tilelang.cuda.intrinsics.macro.mma_macro_generator import TensorCoreIntrinEmitter, TensorCoreIntrinEmitterWithLadderTransform
+ from tilelang.cuda.intrinsics.macro.mma_sm75_macro_generator import TensorCoreIntrinEmitterSM75
++from tilelang.cuda.op.gemm.gemm_fma import GemmFMA
+ from tilelang.cuda.op.gemm.gemm_mma import GemmMMA
+ from tilelang.cuda.op.gemm.gemm_mma_sm70 import GemmMMASm70
+ from tilelang.cuda.op.gemm.gemm_mma_sm75 import GemmMMASm75
+@@ -17,6 +18,7 @@ def test_sm75_uses_sm75_mma_gemm_impl():
+     assert resolve_gemm_impl("cuda.mma", Target({"kind": "cuda", "arch": "sm_70"})) is GemmMMASm70
+     assert resolve_gemm_impl("cuda.mma", Target({"kind": "cuda", "arch": "sm_75"})) is GemmMMASm75
+     assert resolve_gemm_impl("cuda.mma", Target({"kind": "cuda", "arch": "sm_80"})) is GemmMMA
++    assert resolve_gemm_impl("cuda.fma", Target({"kind": "cuda", "arch": "sm_70"})) is GemmFMA
+ 
+ 
+ def test_sm75_fp16_emitter_uses_m16n8k8_shape():
 diff --git a/testing/python/kernel/test_tilelang_kernel_sm70_fragment_copy.py b/testing/python/kernel/test_tilelang_kernel_sm70_fragment_copy.py
 new file mode 100644
-index 000000000..935e9ea30
+index 00000000..5a6a0626
 --- /dev/null
 +++ b/testing/python/kernel/test_tilelang_kernel_sm70_fragment_copy.py
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,46 @@
 +import torch
 +
 +import tilelang
@@ -204,6 +231,51 @@ index 000000000..935e9ea30
 +    return main
 +
 +
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_eq(7, 0)
++def test_sm70_fragment_cast_copy_feeds_rs_gemm():
++    kernel = tilelang.compile(_make_fragment_cast_into_rs_gemm(), target="cuda", out_idx=[2])
++
++    a = torch.randn((64, 16), device="cuda", dtype=torch.float16)
++    b = torch.randn((16, 16), device="cuda", dtype=torch.float16)
++    c = kernel(a, b)
++    ref = a.float() @ b.float()
++
++    tilelang.testing.torch_assert_close(c, ref, rtol=1e-2, atol=1e-2, max_mismatched_ratio=0.01)
+diff --git a/testing/python/kernel/test_tilelang_kernel_sm70_gemm_fma.py b/testing/python/kernel/test_tilelang_kernel_sm70_gemm_fma.py
+new file mode 100644
+index 00000000..18f83b60
+--- /dev/null
++++ b/testing/python/kernel/test_tilelang_kernel_sm70_gemm_fma.py
+@@ -0,0 +1,89 @@
++import torch
++
++import tilelang
++import tilelang.language as T
++import tilelang.testing
++
++
++def _make_bf16_ss_gemm():
++    @T.prim_func
++    def main(
++        A: T.Tensor((64, 16), T.bfloat16),
++        B: T.Tensor((16, 16), T.bfloat16),
++        C: T.Tensor((64, 16), T.float32),
++    ):
++        with T.Kernel(1, threads=128):
++            A_shared = T.alloc_shared((64, 16), T.bfloat16)
++            B_shared = T.alloc_shared((16, 16), T.bfloat16)
++            C_local = T.alloc_fragment((64, 16), T.float32)
++
++            T.copy(A, A_shared)
++            T.copy(B, B_shared)
++            T.clear(C_local)
++            T.gemm(A_shared, B_shared, C_local, policy=T.GemmWarpPolicy.FullRow)
++            T.copy(C_local, C)
++
++    return main
++
++
 +def _make_bf16_ss_and_rs_gemm():
 +    @T.prim_func
 +    def main(
@@ -234,11 +306,13 @@ index 000000000..935e9ea30
 +
 +@tilelang.testing.requires_cuda
 +@tilelang.testing.requires_cuda_compute_version_eq(7, 0)
-+def test_sm70_fragment_cast_copy_feeds_rs_gemm():
-+    kernel = tilelang.compile(_make_fragment_cast_into_rs_gemm(), target="cuda", out_idx=[2])
++def test_sm70_bf16_ss_gemm_uses_fma_fallback():
++    kernel = tilelang.compile(_make_bf16_ss_gemm(), target="cuda", out_idx=[2])
++    source = kernel.get_kernel_source()
++    assert "mma_sync_sm70<tl::DataType::kBFloat16" not in source
 +
-+    a = torch.randn((64, 16), device="cuda", dtype=torch.float16)
-+    b = torch.randn((16, 16), device="cuda", dtype=torch.float16)
++    a = torch.randn((64, 16), device="cuda", dtype=torch.bfloat16)
++    b = torch.randn((16, 16), device="cuda", dtype=torch.bfloat16)
 +    c = kernel(a, b)
 +    ref = a.float() @ b.float()
 +
@@ -247,9 +321,171 @@ index 000000000..935e9ea30
 +
 +@tilelang.testing.requires_cuda
 +@tilelang.testing.requires_cuda_compute_version_eq(7, 0)
-+def test_sm70_bf16_gemm_emits_fp16_mma_fallback():
-+    tilelang.compile(
-+        _make_bf16_ss_and_rs_gemm(),
-+        target="cuda",
-+        out_idx=[2],
-+    )
++def test_sm70_bf16_rs_gemm_uses_fma_fallback():
++    kernel = tilelang.compile(_make_bf16_ss_and_rs_gemm(), target="cuda", out_idx=[2])
++    source = kernel.get_kernel_source()
++    assert "mma_sync_sm70<tl::DataType::kBFloat16" not in source
++
++    a = torch.randn((64, 16), device="cuda", dtype=torch.bfloat16) * 0.25
++    b = torch.randn((16, 16), device="cuda", dtype=torch.bfloat16) * 0.25
++    c = kernel(a, b)
++    p = (a.float() @ b.float()).to(torch.bfloat16)
++    ref = p.float() @ b.float()
++
++    tilelang.testing.torch_assert_close(c, ref, rtol=2e-2, atol=2e-2, max_mismatched_ratio=0.01)
++
++
++if __name__ == "__main__":
++    tilelang.testing.main()
+diff --git a/tilelang/cuda/op/gemm/__init__.py b/tilelang/cuda/op/gemm/__init__.py
+index 52aa4d44..310c9e60 100644
+--- a/tilelang/cuda/op/gemm/__init__.py
++++ b/tilelang/cuda/op/gemm/__init__.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ from tilelang.tileop.gemm.registry import register_gemm_impl
++from .gemm_fma import GEMM_INST_FMA, GemmFMA
+ from .gemm_mma import GEMM_INST_MMA, GemmMMA
+ from .gemm_mma_sm70 import GemmMMASm70
+ from .gemm_mma_sm75 import GemmMMASm75
+@@ -23,6 +24,10 @@ def _match_mma_sm75(target) -> bool:
+     return target_is_turing(target)
+ 
+ 
++def _match_fma(target) -> bool:
++    return target_is_cuda(target)
++
++
+ def _match_wgmma(target) -> bool:
+     return target_is_cuda(target)
+ 
+@@ -34,5 +39,6 @@ def _match_tcgen05(target) -> bool:
+ register_gemm_impl("cuda.mma", GEMM_INST_MMA, _match_mma, GemmMMA)
+ register_gemm_impl("cuda.mma_sm70", GEMM_INST_MMA, _match_mma_sm70, GemmMMASm70)
+ register_gemm_impl("cuda.mma_sm75", GEMM_INST_MMA, _match_mma_sm75, GemmMMASm75)
++register_gemm_impl("cuda.fma", GEMM_INST_FMA, _match_fma, GemmFMA)
+ register_gemm_impl("cuda.wgmma", GEMM_INST_WGMMA, _match_wgmma, GemmWGMMA)
+ register_gemm_impl("cuda.tcgen05", GEMM_INST_TCGEN05, _match_tcgen05, GemmTCGEN5)
+diff --git a/tilelang/cuda/op/gemm/gemm_fma.py b/tilelang/cuda/op/gemm/gemm_fma.py
+new file mode 100644
+index 00000000..0387d7dd
+--- /dev/null
++++ b/tilelang/cuda/op/gemm/gemm_fma.py
+@@ -0,0 +1,116 @@
++from __future__ import annotations
++
++from tilelang.tileop.gemm.gemm_base import GemmBase
++from tilelang.utils.language import is_fragment, is_full_region
++from tilelang import language as T
++from tilelang.transform.simplify import _Simplify
++from tvm.target import Target
++from tvm.ir import Range
++from tvm import tirx
++
++
++GEMM_INST_FMA = "cuda.fma"
++
++
++def _linear_fragment(local_buf, thread_nums: int) -> T.Fragment:
++    shape = list(local_buf.shape)
++    strides = [1 for _ in shape]
++    for idx in range(len(shape) - 2, -1, -1):
++        strides[idx] = strides[idx + 1] * shape[idx + 1]
++
++    def forward(*indices):
++        flat = 0
++        for index, stride in zip(indices, strides):
++            flat += index * stride
++        return flat % thread_nums, flat // thread_nums
++
++    return T.Fragment(shape, forward_fn=forward)
++
++
++class GemmFMA(GemmBase):
++    """CUDA scalar FMA fallback for GEMM combinations without tensor-core MMA."""
++
++    def infer_layout(self, target: Target, thread_nums: int):
++        layouts = {}
++        if is_fragment(self.A):
++            layouts[self.A] = _linear_fragment(self.A, thread_nums)
++        if is_fragment(self.B):
++            layouts[self.B] = _linear_fragment(self.B, thread_nums)
++        if is_fragment(self.C):
++            layouts[self.C] = _linear_fragment(self.C, thread_nums)
++        return layouts
++
++    def lower(
++        self,
++        layout_map: dict,
++        target: Target,
++        thread_bounds: Range,
++        thread_var: tirx.Var,
++        mbar_phase_expr: tirx.PrimExpr | None = None,
++    ):
++        M, N, K = self.M, self.N, self.K
++        A_region = self.ARegion
++        B_region = self.BRegion
++        C_region = self.CRegion
++
++        A_buf = A_region.buffer
++        B_buf = B_region.buffer
++        C_buf = C_region.buffer
++
++        assert len(A_region.region) >= 2, "FMA GEMM requires at least 2D A"
++        assert len(B_region.region) >= 2, "FMA GEMM requires at least 2D B"
++        assert len(C_region.region) >= 2, "FMA GEMM requires at least 2D C"
++        if is_fragment(self.C):
++            assert is_full_region(C_region), "Fragment output C must be a full region"
++
++        a_rows = A_region.region[-2].extent
++        a_cols = A_region.region[-1].extent
++        b_rows = B_region.region[-2].extent
++        b_cols = B_region.region[-1].extent
++
++        A_other = [r.min for r in A_region.region[:-2]]
++        B_other = [r.min for r in B_region.region[:-2]]
++        C_other = [r.min for r in C_region.region[:-2]]
++        a0 = A_region.region[-2].min
++        a1 = A_region.region[-1].min
++        b0 = B_region.region[-2].min
++        b1 = B_region.region[-1].min
++        c0 = C_region.region[-2].min
++        c1 = C_region.region[-1].min
++
++        trans_A = self.trans_A
++        trans_B = self.trans_B
++        clear_accum = self.clear_accum
++        in_dtype = self.in_dtype
++        accum_dtype = self.accum_dtype
++        thread_nums = thread_bounds.extent
++
++        @T.prim_func
++        def _gemm_fma() -> None:
++            A_stage = T.alloc_shared((a_rows, a_cols), in_dtype)
++            B_stage = T.alloc_shared((b_rows, b_cols), in_dtype)
++
++            T.sync_threads()
++            for a_flat in T.serial(thread_var, a_rows * a_cols, thread_nums):
++                ai = a_flat // a_cols
++                aj = a_flat % a_cols
++                A_stage[ai, aj] = A_buf[tuple(A_other) + (a0 + ai, a1 + aj)]
++            for b_flat in T.serial(thread_var, b_rows * b_cols, thread_nums):
++                bi = b_flat // b_cols
++                bj = b_flat % b_cols
++                B_stage[bi, bj] = B_buf[tuple(B_other) + (b0 + bi, b1 + bj)]
++            T.sync_threads()
++
++            for c_flat in T.serial(thread_var, M * N, thread_nums):
++                i = c_flat // N
++                j = c_flat % N
++                if clear_accum:
++                    C_buf[tuple(C_other) + (c0 + i, c1 + j)] = T.cast(0, accum_dtype)
++                for k in T.serial(K):
++                    C_buf[tuple(C_other) + (c0 + i, c1 + j)] += T.cast(
++                        T.cast(A_stage[k if trans_A else i, i if trans_A else k], accum_dtype)
++                        * T.cast(B_stage[j if trans_B else k, k if trans_B else j], accum_dtype),
++                        accum_dtype,
++                    )
++
++        return _Simplify(_gemm_fma, inline_let=True)

@@ -92,7 +92,7 @@ ax.spines["right"].set_visible(False)
 
 ax.set_title(
     "V100 sm_70 inference fallback preserves Qwen3.5 capability\n"
-    "ARLE serve + TileLang PR #2257 (BF16→FP16 fragment staging) + per-kernel cubin filter",
+    "ARLE serve + TileLang PR #2279 (GemmFMA fallback) + per-kernel cubin filter",
     fontsize=11,
     loc="left",
     pad=14,
