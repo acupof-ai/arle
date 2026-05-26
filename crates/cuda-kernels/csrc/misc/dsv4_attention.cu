@@ -242,7 +242,7 @@ __device__ __forceinline__ float dsv4_swa_key_value(
 __global__ void dsv4_swa_attention_kernel(
     const uint16_t *__restrict__ q,
     const uint16_t *__restrict__ k_new,
-    const uint16_t *__restrict__ window_cache,
+    uint16_t *__restrict__ window_cache,
     const uint16_t *__restrict__ attn_sink,
     uint16_t *__restrict__ out,
     int num_tokens,
@@ -257,7 +257,8 @@ __global__ void dsv4_swa_attention_kernel(
     int original_seq_len,
     float factor,
     float beta_fast,
-    float beta_slow) {
+    float beta_slow,
+    int write_window_cache) {
   int row = blockIdx.x;
   if (row >= num_tokens * local_heads) return;
   int token = row / local_heads;
@@ -334,12 +335,19 @@ __global__ void dsv4_swa_attention_kernel(
     }
     out[token * local_width + head * head_dim + col] = dsv4_attn_f32_to_bf16_bits(value);
   }
+
+  if (write_window_cache && head == 0) {
+    int slot = abs_pos % sliding_window;
+    for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
+      window_cache[slot * head_dim + col] = k_new[token * head_dim + col];
+    }
+  }
 }
 
 extern "C" CUresult dsv4_swa_attention_cuda(
     const uint16_t *q,
     const uint16_t *k_new,
-    const uint16_t *window_cache,
+    uint16_t *window_cache,
     const uint16_t *attn_sink,
     uint16_t *out,
     int num_tokens,
@@ -355,6 +363,7 @@ extern "C" CUresult dsv4_swa_attention_cuda(
     float factor,
     float beta_fast,
     float beta_slow,
+    int write_window_cache,
     CUstream stream) {
   if (num_tokens < 0 || local_heads <= 0 || head_dim <= 0 || sliding_window <= 0 ||
       sliding_window > DSV4_ATTN_MAX_WINDOW || head_dim > DSV4_ATTN_MAX_HEAD_DIM ||
@@ -365,7 +374,7 @@ extern "C" CUresult dsv4_swa_attention_cuda(
   dsv4_swa_attention_kernel<<<num_tokens * local_heads, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
       q, k_new, window_cache, attn_sink, out, num_tokens, local_heads, head_dim,
       sliding_window, start_pos, sink_offset, scale_value, rope_dim, rope_base,
-      original_seq_len, factor, beta_fast, beta_slow);
+      original_seq_len, factor, beta_fast, beta_slow, write_window_cache);
   return (CUresult)cudaGetLastError();
 }
 
@@ -716,7 +725,7 @@ __device__ __forceinline__ float dsv4_csa_score_block(
 __global__ void dsv4_hybrid_attention_kernel(
     const uint16_t *__restrict__ q,
     const uint16_t *__restrict__ k_new,
-    const uint16_t *__restrict__ window_cache,
+    uint16_t *__restrict__ window_cache,
     const uint16_t *__restrict__ compressed,
     const int32_t *__restrict__ selected,
     const uint16_t *__restrict__ attn_sink,
@@ -737,7 +746,8 @@ __global__ void dsv4_hybrid_attention_kernel(
     int mode,
     int compress_ratio,
     int compressed_count,
-    int selected_topk) {
+    int selected_topk,
+    int write_window_cache) {
   int row = blockIdx.x;
   if (row >= num_tokens * local_heads) return;
   int token = row / local_heads;
@@ -854,12 +864,19 @@ __global__ void dsv4_hybrid_attention_kernel(
     }
     out[token * local_width + head * head_dim + col] = dsv4_attn_f32_to_bf16_bits(value);
   }
+
+  if (write_window_cache && head == 0) {
+    int slot = abs_pos % sliding_window;
+    for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
+      window_cache[slot * head_dim + col] = k_new[token * head_dim + col];
+    }
+  }
 }
 
 extern "C" CUresult dsv4_hybrid_attention_cuda(
     const uint16_t *q,
     const uint16_t *k_new,
-    const uint16_t *window_cache,
+    uint16_t *window_cache,
     const uint16_t *compressed,
     const int32_t *selected,
     const uint16_t *attn_sink,
@@ -881,6 +898,7 @@ extern "C" CUresult dsv4_hybrid_attention_cuda(
     int compress_ratio,
     int compressed_count,
     int selected_topk,
+    int write_window_cache,
     CUstream stream) {
   if (num_tokens < 0 || local_heads <= 0 || head_dim <= 0 ||
       head_dim > DSV4_ATTN_MAX_HEAD_DIM || sliding_window <= 0 ||
@@ -893,7 +911,7 @@ extern "C" CUresult dsv4_hybrid_attention_cuda(
       q, k_new, window_cache, compressed, selected, attn_sink, out, num_tokens,
       local_heads, head_dim, sliding_window, start_pos, sink_offset, scale_value,
       rope_dim, rope_base, original_seq_len, factor, beta_fast, beta_slow, mode,
-      compress_ratio, compressed_count, selected_topk);
+      compress_ratio, compressed_count, selected_topk, write_window_cache);
   return (CUresult)cudaGetLastError();
 }
 

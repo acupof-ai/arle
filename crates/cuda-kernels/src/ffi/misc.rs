@@ -86,7 +86,7 @@ unsafe extern "C" {
     pub fn dsv4_swa_attention_cuda(
         q: *const super::Half,
         k_new: *const super::Half,
-        window_cache: *const super::Half,
+        window_cache: *mut super::Half,
         attn_sink: *const super::Half,
         out: *mut super::Half,
         num_tokens: i32,
@@ -102,6 +102,7 @@ unsafe extern "C" {
         factor: f32,
         beta_fast: f32,
         beta_slow: f32,
+        write_window_cache: i32,
         stream: super::CUstream,
     ) -> super::CUresult;
 
@@ -147,7 +148,7 @@ unsafe extern "C" {
     pub fn dsv4_hybrid_attention_cuda(
         q: *const super::Half,
         k_new: *const super::Half,
-        window_cache: *const super::Half,
+        window_cache: *mut super::Half,
         compressed: *const super::Half,
         selected: *const i32,
         attn_sink: *const super::Half,
@@ -169,6 +170,7 @@ unsafe extern "C" {
         compress_ratio: i32,
         compressed_count: i32,
         selected_topk: i32,
+        write_window_cache: i32,
         stream: super::CUstream,
     ) -> super::CUresult;
 

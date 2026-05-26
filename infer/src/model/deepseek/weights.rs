@@ -1068,6 +1068,8 @@ impl DeepseekModel {
         let cache_len = self.config.sliding_window * head_dim;
         let mut scratch_window;
         let update_window_cache = cache.is_some();
+        let fuse_window_update =
+            update_window_cache && token_count == 1 && dsv4_fuse_attn_window_update_enabled()?;
         let window_cache = if let Some(cache) = cache.as_deref_mut() {
             ensure_swa_window_cache(&self.ctx, cache, cache_len)?
         } else {
@@ -1093,14 +1095,14 @@ impl DeepseekModel {
         {
             let (q_ptr, _q_guard) = q_prepared.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
-            let (window_ptr, _window_guard) = window_cache.device_ptr(&self.ctx.stream);
+            let (window_ptr, _window_guard) = window_cache.device_ptr_mut(&self.ctx.stream);
             let (sink_ptr, _sink_guard) = attention.attn_sink.data.device_ptr(&self.ctx.stream);
             let (out_ptr, _out_guard) = local_attn.data.device_ptr_mut(&self.ctx.stream);
             unsafe {
                 ffi::dsv4_swa_attention_cuda(
                     q_ptr as *const ffi::Half,
                     k_ptr as *const ffi::Half,
-                    window_ptr as *const ffi::Half,
+                    window_ptr as *mut ffi::Half,
                     sink_ptr as *const ffi::Half,
                     out_ptr as *mut ffi::Half,
                     token_count as i32,
@@ -1116,6 +1118,7 @@ impl DeepseekModel {
                     rope_params.factor,
                     rope_params.beta_fast,
                     rope_params.beta_slow,
+                    i32::from(fuse_window_update),
                     self.ctx.stream.cu_stream(),
                 )
                 .result()
@@ -1124,7 +1127,7 @@ impl DeepseekModel {
         }
         dsv4_trace_end(&self.ctx, "attn_swa_kernel", layer_idx, token_count, trace)?;
 
-        if update_window_cache {
+        if update_window_cache && !fuse_window_update {
             let trace = dsv4_trace_begin(&self.ctx)?;
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
             let (window_ptr, _window_guard) = window_cache.device_ptr_mut(&self.ctx.stream);
@@ -1605,6 +1608,8 @@ impl DeepseekModel {
         let cache_len = self.config.sliding_window * head_dim;
         let mut scratch_window;
         let update_window_cache = cache.is_some();
+        let fuse_window_update =
+            update_window_cache && token_count == 1 && dsv4_fuse_attn_window_update_enabled()?;
         let window_cache = if let Some(cache) = cache.as_deref_mut() {
             ensure_swa_window_cache(&self.ctx, cache, cache_len)?
         } else {
@@ -1637,7 +1642,7 @@ impl DeepseekModel {
         {
             let (q_ptr, _q_guard) = q_prepared.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
-            let (window_ptr, _window_guard) = window_cache.device_ptr(&self.ctx.stream);
+            let (window_ptr, _window_guard) = window_cache.device_ptr_mut(&self.ctx.stream);
             let compressed_guard;
             let (compressed_ptr, compressed_count) = if let Some((compressed, count)) = compressed {
                 let (ptr, guard) = compressed.device_ptr(&self.ctx.stream);
@@ -1667,7 +1672,7 @@ impl DeepseekModel {
                 ffi::dsv4_hybrid_attention_cuda(
                     q_ptr as *const ffi::Half,
                     k_ptr as *const ffi::Half,
-                    window_ptr as *const ffi::Half,
+                    window_ptr as *mut ffi::Half,
                     compressed_ptr,
                     selected_ptr,
                     sink_ptr as *const ffi::Half,
@@ -1689,6 +1694,7 @@ impl DeepseekModel {
                     compress_ratio as i32,
                     compressed_count as i32,
                     self.config.index_topk as i32,
+                    i32::from(fuse_window_update),
                     self.ctx.stream.cu_stream(),
                 )
                 .result()
@@ -1705,7 +1711,7 @@ impl DeepseekModel {
             trace,
         )?;
 
-        if update_window_cache {
+        if update_window_cache && !fuse_window_update {
             let trace = dsv4_trace_begin(&self.ctx)?;
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
             let (window_ptr, _window_guard) = window_cache.device_ptr_mut(&self.ctx.stream);
@@ -3973,6 +3979,18 @@ fn dsv4_trace_layer_enabled() -> bool {
     std::env::var("ARLE_DSV4_TRACE_LAYER")
         .ok()
         .is_some_and(|raw| !matches!(raw.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_fuse_attn_window_update_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_FUSE_ATTN_WINDOW_UPDATE").ok() else {
+        return Ok(true);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => bail!("invalid ARLE_DSV4_FUSE_ATTN_WINDOW_UPDATE value `{raw}`"),
+    }
 }
 
 #[cfg(feature = "cuda")]
