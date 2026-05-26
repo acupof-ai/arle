@@ -13,13 +13,18 @@ CPU-only shipped tasks, GPU-deferred gates, and session artifact ledger are in
 The OPD-only product boundary remains
 [`projects/2026-05-18-opd-only-pivot.md`](projects/2026-05-18-opd-only-pivot.md).
 
-**DSv4 status snapshot (2026-05-15):** DSv4 DeepEP decode remains the active
-next-model hot path. Default B=1 padded BF16 reduce-scatter combine, fused
-local-expert prepare, and broad scratch reuse have landed on 8xH20; `decode64`
-holds 12.05 post-first tok/s, isolated single-token wave **105.2 → 87.7 ms**.
-Remaining blockers: NCCL SendRecv/AllReduce, FP8/FP4 expert GEMV (awaits true
-grouped GEMM / DeepGEMM), launch churn. Evidence:
+**DSv4 status snapshot (2026-05-26):** DSv4 DeepEP decode remains the active
+next-model hot path. User-facing target framing is input 32K / output 1.5K,
+H20 qps 8 at concurrency 8, SLO TTFT <= 5000 ms and TPOT <= 30 ms; current
+target baseline is TTFT 4800 ms, TPOT 18 ms, total throughput 8402. Default
+B=1 padded BF16 reduce-scatter combine, fused local-expert prepare, and broad
+scratch reuse have landed; A3 Phase 2 route-grouped and native DeepGEMM
+required modes are diagnostic-only/default-off after wall-clock and correctness
+KILLs. Remaining blockers: NCCL SendRecv/AllReduce, byte-identical grouped
+expert GEMM, launch churn. Evidence:
 [`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md),
+[`experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md),
+[`experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md),
 `trace-artifacts/2026-05-15-dsv4-deepep/`.
 
 **Qwen3.5 Medusa is not pickup-ready** — recurrent-state accepted-length

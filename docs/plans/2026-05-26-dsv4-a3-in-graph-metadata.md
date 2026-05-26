@@ -162,8 +162,9 @@ constraints 实证）。
 - 每 phase PASS / KILL 落 `docs/experience/wins/` 或 `errors/`，按
   `CLAUDE.md §Benchmarks` 强制 entry。
 - bench 命令固定：复用 `/sgl-workspace/bench-artifacts/dsv4-longseq-20260525/
-  request.json` 同 prompt，`max_tokens=1` 测 TTFT，`max_tokens=64` 测 ITL；
-  按 codex 已有的 tn exec / tarball push / kubectl cp 流程跑。
+  request.json` 同 prompt；`max_tokens=1` 只能标成 prefill/TTFT smoke，不能
+  当 decode 证据；decode / wall-clock PASS/KILL 用 `max_tokens>=32`，最终按
+  32K input / 1.5K output、c=8、qps=8 的 DSv4 SLO framing 对齐。
 - nsys 对照取 `--cuda-flush-interval=1000`，命名 `/tmp/dsv4_a3_phase{N}_
   {before|after}.nsys-rep`。
 - wall-clock framing 强制：每 phase 的"减少 X%"必须用 per-request total ms 算，
@@ -207,6 +208,13 @@ Phase 3 估算：~2-3 天（DeepEP API 调研 + 重构 + 多卡 bench）。
   be true persistent grouped GEMM/DeepGEMM-style dispatch, not more tuning of
   the route-wise GEMV prototype. See
   [`../experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](../experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md).
+- 2026-05-26 Phase 2 native DeepGEMM required mode reached real decode after
+  toolchain/runtime hardening (NVCC JIT, per-CUDA-context runtime handles, and
+  SFA stride support for reused scratch), but was KILLed as an optimization:
+  `max_tokens=32` A/B mean was native 3.7632 s vs DeepGEMM 7.5347 s (+100.2%),
+  and greedy output was not byte-identical. Keep
+  `ARLE_DSV4_EXPERT_BACKEND=deepgemm` diagnostic-only/default-off. See
+  [`../experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](../experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md).
 
 ## Cross-refs
 

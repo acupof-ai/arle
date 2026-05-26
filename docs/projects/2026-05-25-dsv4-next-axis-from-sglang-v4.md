@@ -24,6 +24,26 @@ fusion** 和 **CUDA graph 内化 metadata**——属于另一个量级的 lever�
 把这些 SGLang pattern 套到 ARLE 已有 binding-constraints 表（L1–L6）上，给
 codex 自上而下取活。
 
+## Serving SLO Baseline
+
+后续 DSv4 性能优化统一按这个用户-facing 目标 framing，不再用短 token smoke
+代替吞吐判断：
+
+| Metric | Target / baseline |
+|---|---:|
+| Workload length | input 32K / output 1.5K |
+| SLO TTFT | <= 5000 ms |
+| SLO TPOT | <= 30 ms |
+| Hardware | H20 |
+| QPS | 8 |
+| Concurrency | 8 |
+| Current target TTFT | 4800 ms |
+| Current target TPOT | 18 ms |
+| Current total throughput | 8402 |
+
+`max_tokens=1` 只允许标成 prefill/TTFT smoke；decode 或 wall-clock PASS/KILL
+必须用 `max_tokens >= 32`，最终回到上表的 32K/1.5K、c=8、qps=8 framing。
+
 ## Mapping — SGLang V4 trick × ARLE binding constraint
 
 | ARLE L 层 | 当前现状 | SGLang V4 对应解法 | 本 backlog axis |
