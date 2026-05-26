@@ -17,6 +17,17 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_scale_route_outputs_by_meta_cuda(
+        expert_out: *const Half,
+        route_out: *mut Half,
+        route_meta: *const i32,
+        num_routes: i32,
+        hidden_dim: i32,
+        local_expert_start: i32,
+        experts_per_rank: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_dequantize_fp8_rows_to_bf16_cuda(
         input: *const u8,
         scales: *const f32,
