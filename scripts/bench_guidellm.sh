@@ -91,7 +91,10 @@ PROFILE="sweep"
 DATA="prompt_tokens=4096,prompt_tokens_stdev=1,prompt_tokens_min=4096,prompt_tokens_max=4096,output_tokens=256,output_tokens_stdev=1,output_tokens_min=256,output_tokens_max=256"
 MAX_SECONDS=60
 RANDOM_SEED=20260416
-OUTPUTS=(json csv html)
+# HTML report needs to fetch a CDN template (guidellm.utils.text.load_text);
+# offline boxes (e.g. V100 lab nodes) hang at finalize stage. Allow opting
+# out via GUIDELLM_OUTPUTS env var; json/csv carry all the bench data.
+read -ra OUTPUTS <<< "${GUIDELLM_OUTPUTS:-json csv html}"
 WORKLOAD="${WORKLOAD:-default}"
 SECONDARY_C1_SECONDS=""
 # **Pin the HTTP backend explicitly.** guidellm 0.6.0's default backend is
