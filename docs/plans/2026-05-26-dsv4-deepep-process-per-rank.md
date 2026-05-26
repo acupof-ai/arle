@@ -272,7 +272,10 @@ DSv4 SLO workload (32K input / 1.5K output, c=8, qps=8, H20)?
 
 **KILL**:
 - Wall-clock TTFT or TPOT regresses at SLO workload.
-- IPC round-trip per layer > 5 us measured by NVTX inside the sidecar.
+- IPC round-trip per layer > 250 us measured inside the sidecar
+  (the NCCL-DeepEP gap; see
+  [`../experience/wins/2026-05-26-dsv4-deepep-ipc-roundtrip-measurement.md`](../experience/wins/2026-05-26-dsv4-deepep-ipc-roundtrip-measurement.md)
+  for why this replaces the original 5 us target).
 - Tail p99 regresses > 3% (latency bimodality from child scheduling).
 - Output diverges from baseline (sampling-level reproducibility break).
 
@@ -297,15 +300,20 @@ under bench load:
 
 | # | Task | Owner | Estimate |
 |---|---|---|---|
-| 0.1 | sidecar binary skeleton (links DeepEP, opens IPC pipe, runs one dispatch+combine on fixed shape) | claude direct | small |
-| 0.2 | host-side spawn helper (`deepep_sidecar.rs`) + test that posts CUDA IPC handles | claude direct | small |
-| 0.3 | spike test on remote 8xH20: 8 children, 1 layer, byte-identical vs NCCL baseline | tn exec on pod | small |
-| 0.4 | phase 0 wins or errors entry; license phase 1 | claude direct | trivial |
-| 1.1 | `LayerCommunicator` `NativeDeepEPTransport` variant | general-purpose subagent | medium |
-| 1.2 | `forward_deepep_routed_gpu` route to sidecar when flag set | general-purpose subagent | medium |
-| 1.3 | sidecar pool: one buffer constructed at boot, all layers reuse | general-purpose subagent | medium |
-| 1.4 | bench A/B at SLO workload, fill in §License gates phase 1 | tn exec + claude direct | medium |
-| 1.5 | wins or errors entry, license phase 2 (or kill) | claude direct | trivial |
+| 0.1 | python child-process spike: parent supervises 8 DeepEP children with buffer reuse | claude direct | done (8cdc3d03) |
+| 0.2 | byte-identical determinism check for combined output across cycles | claude direct | done (fc19d15f) |
+| 0.3 | IPC roundtrip measurement; phase 1 budget reframed to 250 us | claude direct | done (this commit) |
+| 0.4 | phase 0 wins entry, license phase 1 | claude direct | done |
+| 1.1 | C++ sidecar binary skeleton (links `deep_ep_cpp.so` raw constructor, eventfd control plane, CUDA IPC data plane) | general-purpose subagent | medium-large |
+| 1.2 | host-side Rust spawn helper at `infer/src/backend/cuda/deepep_sidecar.rs` (fork N children, gather their device_id + IPC handle, broadcast back, runtime.sync) | general-purpose subagent | medium |
+| 1.3 | `LayerCommunicator` `NativeDeepEPTransport` variant; `forward_deepep_routed_gpu` route under `ARLE_DSV4_MOE_BACKEND=native-deepep` | general-purpose subagent | medium |
+| 1.4 | sidecar pool: one Buffer constructed at boot, all layers reuse | general-purpose subagent | small (folded into 1.2/1.3) |
+| 1.5 | bench A/B at SLO workload, fill in §License gates phase 1 | claude direct + remote pod | medium |
+| 1.6 | wins or errors entry, license phase 2 (or kill) | claude direct | trivial |
+
+Sidecar language locked to C++ per user preference and the
+no-Python-on-hot-path rule (see the IPC measurement entry linked above
+for the budget framing).
 
 Phase 2 not estimated until phase 1 lands.
 
