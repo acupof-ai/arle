@@ -1426,6 +1426,8 @@ fn main() {
         println!("cargo:rustc-link-lib=stdc++");
     }
 
+    build_deepep_sidecar(&cuda_path, &nvcc, &out_dir, &sm_targets);
+
     // Recursive watch — `rerun-if-changed=csrc/` alone only watches the
     // immediate dir entries; subdirectory `.cu`/`.cuh`/`.h` edits would be
     // missed by cargo's incremental detector without this walk.
@@ -1436,4 +1438,92 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=TORCH_CUDA_ARCH_LIST");
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
+    println!("cargo:rerun-if-env-changed=ARLE_DEEPEP_DIR");
+}
+
+/// Compile the ARLE DeepEP sidecar binary if `ARLE_DEEPEP_DIR` points at an
+/// upstream DeepEP source tree (the deepseek-ai/DeepEP repo). Skipped silently
+/// when unset — the sidecar is opt-in until phase 2 default flip.
+///
+/// Output: `$OUT_DIR/arle_deepep_sidecar`. The path is published via
+/// `cargo:rustc-env=ARLE_DEEPEP_SIDECAR_PATH=<path>` for runtime discovery.
+fn build_deepep_sidecar(cuda_path: &str, nvcc: &str, out_dir: &Path, sm_targets: &[SmSpec]) {
+    let Ok(deepep_dir) = std::env::var("ARLE_DEEPEP_DIR") else {
+        println!(
+            "cargo:warning=ARLE_DEEPEP_DIR unset — skipping arle_deepep_sidecar build (set to the deepseek-ai/DeepEP source tree to enable native-deepep backend)."
+        );
+        return;
+    };
+    let deepep_root = PathBuf::from(&deepep_dir);
+    let kernels_dir = deepep_root.join("csrc").join("kernels");
+    let api_header = kernels_dir.join("api.cuh");
+    if !api_header.exists() {
+        println!(
+            "cargo:warning=ARLE_DEEPEP_DIR={} does not contain csrc/kernels/api.cuh — skipping sidecar build.",
+            deepep_root.display()
+        );
+        return;
+    }
+
+    // The sidecar only supports SM90 (H100/H20) today — that's where the DSv4
+    // 32K/1.5K SLO bench lives. Earlier SMs would need TMA-disabled paths.
+    let sidecar_archs: Vec<String> = sm_targets
+        .iter()
+        .filter(|spec| spec.sm == "90")
+        .map(|spec| format!("-gencode=arch=compute_{},code=sm_{}", spec.sm, spec.sm))
+        .collect();
+    if sidecar_archs.is_empty() {
+        println!(
+            "cargo:warning=SM90 not in current TORCH_CUDA_ARCH_LIST — skipping arle_deepep_sidecar build (sidecar targets H100/H20 only)."
+        );
+        return;
+    }
+
+    let csrc = Path::new("csrc").join("deepep_sidecar");
+    let sidecar_main = csrc.join("sidecar_main.cpp");
+    let sidecar_bin = out_dir.join("arle_deepep_sidecar");
+
+    let mut cmd = Command::new(nvcc);
+    cmd.arg("-ccbin")
+        .arg("g++")
+        .arg("-std=c++17")
+        .arg("-O2")
+        .arg("-DDISABLE_NVSHMEM")
+        .arg("--expt-relaxed-constexpr")
+        .arg("--expt-extended-lambda")
+        .arg("-I")
+        .arg(deepep_root.join("csrc"))
+        .arg("-I")
+        .arg(&csrc);
+    for a in &sidecar_archs {
+        cmd.arg(a);
+    }
+    cmd.arg(kernels_dir.join("intranode.cu"))
+        .arg(kernels_dir.join("layout.cu"))
+        .arg(kernels_dir.join("runtime.cu"))
+        .arg(&sidecar_main)
+        .arg("-lcudart")
+        .arg(format!("-L{}/lib64", cuda_path))
+        .arg("-o")
+        .arg(&sidecar_bin);
+
+    let status = cmd
+        .status()
+        .expect("Failed to spawn nvcc for arle_deepep_sidecar");
+    if !status.success() {
+        panic!(
+            "nvcc failed to build arle_deepep_sidecar (status {:?}). Set ARLE_DEEPEP_DIR=<DeepEP source tree> or unset to skip.",
+            status.code()
+        );
+    }
+
+    println!(
+        "cargo:warning=arle_deepep_sidecar built at {} (DeepEP={})",
+        sidecar_bin.display(),
+        deepep_root.display()
+    );
+    println!(
+        "cargo:rustc-env=ARLE_DEEPEP_SIDECAR_PATH={}",
+        sidecar_bin.display()
+    );
 }
