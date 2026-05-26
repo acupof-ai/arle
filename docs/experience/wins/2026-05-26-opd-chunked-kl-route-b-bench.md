@@ -343,6 +343,30 @@ less than 1 % of train-step wall-clock. Forward-intermediate recompute
 is the second target if the scan kernel does not move enough wall-clock
 time.
 
+### Phase 2B — wD/wE wall-clock confounder resolved
+
+The original `wD-windowed-train-1step` run reported a 897.4 s train
+step, while the first synchronized profile run (`wE`) reported 423.5 s.
+That was not SOLID enough to use as a baseline because `wE` also used
+`--eval-steps 999` and profile fences. The control rerun was
+`wF1-windowed-wd-rerun`: same wD shape, no profile env, no
+`--eval-steps 999`.
+
+| run | step-0 eval | profile env | train step | rollout | teacher fwd | student fwd | backward | peak GPU |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| `wD` original | 252.4 s | off | 897.4 s | 111.6 s | 168.2 s | 78.1 s | 538.2 s | 25 440 MiB |
+| `wE` profile | skipped | on | 423.5 s | 149.5 s | 51.4 s | 39.3 s | 183.2 s | 25 120 MiB |
+| `wF1` wD-shape rerun | 342.3 s | off | 420.5 s | 149.1 s | 51.4 s | 37.0 s | 182.9 s | 25 216 MiB |
+| `wG` attribution profile | skipped | on | 422.1 s | 147.4 s | 58.7 s | 36.4 s | 179.4 s | 30 822 MiB |
+
+Conclusion: the 897.4 s `wD` train step was a cold/old-run
+confounder, not the steady Route B per-step cost. The `wF1` rerun still
+performed step-0 eval yet its train step matched `wE`, so eval skip is
+not the explanation; `wG` also matches despite finer profile fences, so
+the profiler did not create a fake speedup. Use 420-423 s as the warm
+step-1 baseline until a longer multi-step run provides median steady
+state.
+
 ## Headline (updated)
 
 Route B is now end-to-end:
@@ -350,17 +374,17 @@ Route B is now end-to-end:
 - ✅ **VRAM:** windowed 20.8 GB vs fullogit 31.5 GB OOM
 - ✅ **Eval throughput:** windowed eval 252-271 s for step-0 (1 train
   prompt + 4 heldout)
-- ✅ **Train step 1 lands** at 897 s on V100 32 GB; loss + KL numbers
-  recorded
+- ✅ **Train step 1 lands:** warm reruns are 420-423 s on V100 32 GB;
+  the earlier 897 s step is recorded as a cold/old-run confounder
 - ✅ **Host RSS** stable at 9 GB post-train (was 19.8 GB blowing rc=137)
 
 ## Next
 
-- **Per-step wall-clock optimization** — 897 s/step is workable but
-  not productive. The first synchronized backward profile is GRAY:
+- **Per-step wall-clock optimization** — 420-423 s/step is workable
+  but not productive. The first synchronized backward profile is GRAY:
   `MatmulBT` and `LinearAttention` split almost all backward time, so
-  the next optimization needs finer attribution before a CUDA backward
-  kernel spike.
+  the first licensed target is the linear-attention state-history scan,
+  with structural MatmulBT amortization as the parallel candidate.
 - **Production-scale loop** — 5-10 step run with eval cadence; verify
   KL trajectory matches the unwindowed reference (when reference is
   feasible) at small shapes.
