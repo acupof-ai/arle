@@ -110,8 +110,15 @@ fn quant_debug_dump_fp8_state(
         .stream
         .clone_dtoh(&bufs.metadata.last_token_indices)
         .unwrap_or_default();
+    let slot_seq = kv_pool.seq_len(0);
+    let slot_pages = kv_pool
+        .page_indices(0)
+        .iter()
+        .take(8)
+        .copied()
+        .collect::<Vec<_>>();
     eprintln!(
-        "[fp8-debug fire#{fire} stage={stage}] meta: pool_layers={pool_layers} pool_kv_dim={pool_kv_dim} layer_idx={layer_idx} k_data_len={k_data_len} k_scales_len={k_scales_len} sync_err={sync_err:?}"
+        "[fp8-debug fire#{fire} stage={stage}] meta: pool_layers={pool_layers} pool_kv_dim={pool_kv_dim} layer_idx={layer_idx} k_data_len={k_data_len} k_scales_len={k_scales_len} sync_err={sync_err:?} slot0_seq_len={slot_seq} slot0_page_indices_first8={slot_pages:?}"
     );
 
     let row = if !last_token_h.is_empty() {

@@ -110,6 +110,31 @@ to confirm where the prefill rows are getting lost. The kernel-
 clean and dispatch-symmetry findings still hold for the decode-step
 path; the failure is upstream in prefill.
 
+**Update (2026-05-26 A100 sm_80, with prefill + slot inspect)**:
+the prefill row count is correct — 51 prefill rows materialize for
+the 51-BPE-token prompt, written across the slot's page list
+`[255, 254, 253, 252]` at rows `[4080..4095, 4064..4079, 4048..4063,
+4032..4034]`. Slot accounting is correct (`seq_len=52` post-prefill,
+matches prompt + 1 decode token). The first real decode step's
+`last_token_indices[0] = 4035 = page_252 * 16 + 3 = position 51 of
+slot`, which is correct. Layer 0's `decode_attention_fp8` output is
+small and reasonable: `attn_out[0..4] = [-0.013, 0.004, 0.011,
+0.008]`.
+
+The remaining hypothesis: **FP8 precision floor compounds catastrophically
+through Qwen3-dense's 36 full-attention layers**, while Qwen3.5 only
+has 8 full-attention layers (4.5× fewer compounding steps), and INT8
+has finer near-zero resolution that survives 36 layers. The dispatch
+and kernels are clean; the catastrophic step-1 divergence is the
+accumulated effect of FP8 E4M3's ~3-mantissa-bit precision compounding
+36×.
+
+**Recommendation**: ship INT8 as the preferred quantized KV for
+Qwen3-dense (already works, mean_match=1.0). FP8 KV stays opt-in
+behind `--kv-cache-dtype fp8` with documented precision caveat for
+deep dense models. Add `--kv-cache-dtype` help text noting the
+dense-layer-count sensitivity.
+
 **Structural symmetry confirmed**: INT8 mode and FP8 mode use the
 exact same paged-pool buffers and dispatch shapes — both route the
 prep K/V to `pool.k_ptr(layer)` (which is the shared `k_work` for
