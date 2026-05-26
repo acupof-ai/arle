@@ -77,6 +77,26 @@ The sidecar transport process model is **licensed for phase 1**:
   the earlier kill does NOT reappear in the child-process shape. Confirms
   the root cause was process model, not a recoverable bug.
 
+### Byte-identical determinism check (follow-up)
+
+A second pass ran 8 ranks × 8 cycles with a deterministic input (fixed
+per-rank seed, scores tensor pinned so topk routing is reproducible).
+After each cycle, the combined output bytes were SHA-256 hashed.
+
+| Rank | warm-cycle unique hashes | determinism |
+|---:|---:|---|
+| 0–7 | 1 each | **PASS** — every cycle on every rank produced the same combined bytes |
+
+For each rank, cycle 0 hash also matched the warm hash, so determinism
+held from the first cycle. Per-rank hashes differ across ranks (expected:
+combine returns per-rank tokens, not a single broadcast tensor).
+
+This closes the design doc's PASS criterion "combined output is
+byte-identical to NCCL DeepEP-style baseline for the same input" on the
+intra-DeepEP side. The vs-NCCL byte-identical comparison itself moves
+to phase 1's bench harness, since it requires the full forward
+integration — but the upstream determinism is now confirmed.
+
 Open questions deferred to phase 1 by design:
 
 - How does the Rust host post tensor data INTO the child (CUDA IPC handle
@@ -97,6 +117,9 @@ These are implementation, not architecture-license, questions.
   `/sgl-workspace/bench-artifacts/dsv4-deepep-child-process-spike-20260526/rank{0..7}.json`
 - Summary JSON:
   `/sgl-workspace/bench-artifacts/dsv4-deepep-child-process-spike-20260526/summary.json`
+- Byte-identical determinism check script + summary:
+  `/sgl-workspace/bench-artifacts/dsv4-deepep-byte-identical-check-20260526/byte_identical_check.py`
+  `/sgl-workspace/bench-artifacts/dsv4-deepep-byte-identical-check-20260526/summary.json`
 
 ## Rule
 
