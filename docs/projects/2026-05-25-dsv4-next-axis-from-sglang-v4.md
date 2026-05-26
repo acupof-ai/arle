@@ -182,6 +182,8 @@ timeout，same-process intranode gate 在 `cudaIpcOpenMemHandle` 报
 `invalid device context`。下一步必须先做 process-per-rank DeepEP transport
 设计/接入；继续同进程强塞或继续小 launch 轴不是收益优先级。Evidence：
 [`../experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md`](../experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md).
+Design doc for the sidecar transport (phase 0 spike licensed, phase 1/2
+gated): [`../plans/2026-05-26-dsv4-deepep-process-per-rank.md`](../plans/2026-05-26-dsv4-deepep-process-per-rank.md).
 
 ---
 
