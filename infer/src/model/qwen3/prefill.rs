@@ -1305,6 +1305,27 @@ impl Qwen3Model {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<()> {
+        if layer_idx == 0
+            && matches!(pool.format, KVFormat::FP8E4M3)
+            && std::env::var("INFER_FP8_DEBUG").is_ok()
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static FIRES: AtomicUsize = AtomicUsize::new(0);
+            let fire = FIRES.fetch_add(1, Ordering::Relaxed);
+            if fire < 8 {
+                let rows_h = self
+                    .ctx
+                    .stream
+                    .clone_dtoh(prefill_token_rows)
+                    .unwrap_or_default();
+                eprintln!(
+                    "[fp8-prefill-debug fire#{fire}] layer=0 format={:?} token_count={token_count} prefill_rows_slice_len={} prefill_rows={:?}",
+                    pool.format,
+                    prefill_token_rows.len(),
+                    rows_h.iter().take(16).copied().collect::<Vec<_>>(),
+                );
+            }
+        }
         match pool.format {
             KVFormat::BF16 => Ok(()),
             KVFormat::FP8E4M3 => {
