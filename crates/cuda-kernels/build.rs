@@ -1193,6 +1193,35 @@ fn collect_cu_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+// Recursively walk `dir` and emit `cargo:rerun-if-changed` for every file.
+// Cargo's `rerun-if-changed=<dir>` directive only watches the *immediate*
+// directory entries, NOT subdirectories — so `rerun-if-changed=csrc/` alone
+// silently misses changes to `csrc/kv/*.cu`, `csrc/attention/*.cu`, etc., and
+// stale cubins ship while source diffs sit dormant. Emit one directive per
+// file so every `.cu`/`.cuh`/`.h` edit invalidates the build.
+fn emit_rerun_recursive(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => panic!("Failed to read {}: {}", dir.display(), err),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("._"))
+        {
+            continue;
+        }
+        if path.is_dir() {
+            println!("cargo:rerun-if-changed={}", path.display());
+            emit_rerun_recursive(&path);
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
 fn env_flag(name: &str) -> bool {
     matches!(
         std::env::var(name).as_deref(),
@@ -1397,7 +1426,11 @@ fn main() {
         println!("cargo:rustc-link-lib=stdc++");
     }
 
+    // Recursive watch — `rerun-if-changed=csrc/` alone only watches the
+    // immediate dir entries; subdirectory `.cu`/`.cuh`/`.h` edits would be
+    // missed by cargo's incremental detector without this walk.
     println!("cargo:rerun-if-changed=csrc/");
+    emit_rerun_recursive(Path::new("csrc"));
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
