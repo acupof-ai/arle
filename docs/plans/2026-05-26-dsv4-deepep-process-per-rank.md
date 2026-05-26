@@ -236,6 +236,15 @@ total per layer for sanity vs the official 48.7 us/rank multi-process
 PASS — if our sidecar is 10× slower we still pass phase 0 (it's the
 gate) but phase 1 has to recover the gap.
 
+**Phase 0 outcome (2026-05-26)**: PASS. 8xH20 pod, 8 children × 5
+dispatch+combine cycles, all exit 0; steady-state per-layer min
+~87us dispatch / ~52us combine vs official tuned ~42us / ~36us
+(within phase 0 tolerance). Same-process `cudaIpcOpenMemHandle`
+error does not reappear under child-process shape. Evidence:
+[`../experience/wins/2026-05-26-dsv4-deepep-child-process-spike.md`](../experience/wins/2026-05-26-dsv4-deepep-child-process-spike.md).
+Phase 1 (LayerCommunicator `NativeDeepEPTransport` variant +
+SLO wall-clock bench) is licensed.
+
 ### Phase 1 — sidecar transport landed behind a flag
 
 **Question**: With `ARLE_DSV4_MOE_BACKEND=native-deepep`, does ARLE produce

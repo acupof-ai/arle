@@ -39,6 +39,7 @@ Q/K prepare into one launch, cutting `cudaLaunchKernel` runtime calls 490244 →
 [`experience/errors/2026-05-26-dsv4-native-deepep-ll-sameprocess-timeout.md`](experience/errors/2026-05-26-dsv4-native-deepep-ll-sameprocess-timeout.md),
 [`experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md`](experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md),
 [`plans/2026-05-26-dsv4-deepep-process-per-rank.md`](plans/2026-05-26-dsv4-deepep-process-per-rank.md) (next step — sidecar transport),
+[`experience/wins/2026-05-26-dsv4-deepep-child-process-spike.md`](experience/wins/2026-05-26-dsv4-deepep-child-process-spike.md) (phase 0 PASS — child-process buffer reuse),
 [`experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md`](experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md),
 [`experience/wins/2026-05-26-dsv4-a20-fused-attn-window-update.md`](experience/wins/2026-05-26-dsv4-a20-fused-attn-window-update.md),
 [`experience/wins/2026-05-26-dsv4-a21-fused-qk-prep.md`](experience/wins/2026-05-26-dsv4-a21-fused-qk-prep.md),
