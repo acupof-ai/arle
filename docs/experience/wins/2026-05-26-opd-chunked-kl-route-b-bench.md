@@ -367,6 +367,65 @@ the profiler did not create a fake speedup. Use 420-423 s as the warm
 step-1 baseline until a longer multi-step run provides median steady
 state.
 
+### Phase 2C — `scan_state_history` CUDA spike PASS
+
+`5b26db30 feat(train): accelerate linear-attention scan backward on CUDA`
+adds the narrow backend override licensed by Phase 2A.2. The root
+cause snapshot before the change:
+
+- `linear_attention_core()` is structurally host-only today: it calls
+  `store.ensure_host()` for every input and runs the Rust
+  `linear_attention_forward()` reference path.
+- Backward then recomputes the same host forward intermediates and
+  walks `state_history` in a serial reverse-time Rust loop over
+  `(batch, value_head)`.
+- CUDA had no `Backend` override seam for this reverse scan, so this
+  was not a missed dispatch; it was a deliberate CPU reference path
+  with no device alternative.
+
+The spike keeps CPU as the numerical reference and adds only an
+optional CUDA override for the reverse state-history scan. It launches
+one block per `(batch, value_head)` stream, keeps the recurrence along
+time inside the block, and parallelizes the `key_dim x value_dim`
+state math within each step. Forward recompute and conv1d backward
+remain unchanged, so the experiment isolates the scan target.
+
+Validation:
+
+- Local: `cargo fmt --check --all`
+- Local: `cargo check -p train --no-default-features --features no-cuda`
+- Local: `cargo test -p autograd --no-default-features --features no-cuda linear_attention -- --nocapture`
+- V100: `cargo test -p autograd --release --features cuda cuda_linear_attention_matches_cpu_with_device_inputs -- --nocapture`
+- V100: `opd_step_cuda_infer_teacher_train` release build with CUDA
+- V100 bench:
+  `bench-output/2026-05-26-opd-chunked-kl-route-b-wH-windowed-scan-cuda-profile/`
+
+Same Route B shape as `wG`: `--steps 1 --eval-steps 999
+--logits-window-size 64`, with `ARLE_OPD_BACKWARD_PROFILE=1`.
+
+| metric | `wG` CPU scan | `wH` CUDA scan | delta |
+|---|---:|---:|---:|
+| rc | 0 | 0 | 0 |
+| train step 1 wall-clock | 422.1 s | **372.8 s** | **-49.3 s / -11.7 %** |
+| backward profile total | 179.4 s | **140.2 s** | **-39.2 s / -21.8 %** |
+| `LinearAttention` total | 74.6 s | **36.2 s** | **-38.4 s / -51.5 %** |
+| `scan_state_history` | 42.9 s | **5.3 s** | **-37.6 s / -87.6 %** |
+| `fwd_recompute` | 27.9 s | 27.9 s | unchanged |
+| train-step loss | 5.317462e-6 | 5.317462e-6 | parity |
+| peak GPU | 30 822 MiB | 25 632 MiB | -5 190 MiB |
+
+License verdict: **PASS**. The cheap spike clears the target by a wide
+margin: `scan_state_history` drops by 87.6 % (target was at least
+40 %) and the end-to-end train step drops by 49.3 s, or 11.7 %
+wall-clock. The conservative wall-clock framing is still positive, so
+the root cause was real and the scan kernel is worth keeping.
+
+The remaining `LinearAttention` time is now dominated by
+`fwd_recompute` (27.9 s). Per the original decision tree, the next
+linear-attention target is forward-intermediate recompute only if it
+can be licensed against total step wall-clock; otherwise broader
+`MatmulBT` structural amortization is the better candidate.
+
 ## Headline (updated)
 
 Route B is now end-to-end:
@@ -376,15 +435,18 @@ Route B is now end-to-end:
   prompt + 4 heldout)
 - ✅ **Train step 1 lands:** warm reruns are 420-423 s on V100 32 GB;
   the earlier 897 s step is recorded as a cold/old-run confounder
+- ✅ **Backward scan spike:** `scan_state_history` CUDA cuts warm
+  step-1 from 422.1 s to 372.8 s
 - ✅ **Host RSS** stable at 9 GB post-train (was 19.8 GB blowing rc=137)
 
 ## Next
 
 - **Per-step wall-clock optimization** — 420-423 s/step is workable
-  but not productive. The first synchronized backward profile is GRAY:
-  `MatmulBT` and `LinearAttention` split almost all backward time, so
-  the first licensed target is the linear-attention state-history scan,
-  with structural MatmulBT amortization as the parallel candidate.
+  but not productive; the scan CUDA spike improves the current profiled
+  shape to 372.8 s. The next licensed candidates are
+  `LinearAttention` forward recompute (27.9 s left after the scan
+  spike) and structural `MatmulBT` amortization across many diffuse
+  projection sites.
 - **Production-scale loop** — 5-10 step run with eval cadence; verify
   KL trajectory matches the unwindowed reference (when reference is
   feasible) at small shapes.
