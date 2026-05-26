@@ -891,6 +891,146 @@ fn multi_worker_affinity_placeholder() -> AffinityApplyResult {
     }
 }
 
+/// Coordinator-side child spawn for the multiproc-serve pivot (phase B-1
+/// commit B.2). Forks one child process per rank ≥ 1 via
+/// `std::process::Command::current_exe()` with `ARLE_WORKER_RANK=R` and a
+/// pre-arranged parent pipe so the child can detect coordinator death
+/// (read EOF → exit). Returns the list of children + parent-side pipe
+/// write-ends; dropping the returned struct closes all pipes → workers
+/// exit cleanly.
+///
+/// Only invoked when `ARLE_MULTIPROC_SERVE=1` is set AND world_size > 1 AND
+/// the current process is not itself a worker (`ARLE_WORKER_RANK` unset).
+/// Default unset preserves the existing single-process-N-thread behavior.
+struct WorkerChildren {
+    children: Vec<(usize, std::process::Child, std::fs::File)>,
+}
+
+impl Drop for WorkerChildren {
+    fn drop(&mut self) {
+        // Close parent pipe write-ends → children's read() returns EOF →
+        // they exit 0 on their own. Then wait up to 5 s per child; SIGKILL
+        // any stragglers.
+        let _writes_dropped: Vec<_> = self
+            .children
+            .iter_mut()
+            .map(|(_, _, pipe)| std::mem::replace(pipe, dummy_file()))
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for (rank, child, _) in self.children.iter_mut() {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        if !status.success() {
+                            log::warn!("worker rank {rank} exited {:?}", status.code());
+                        }
+                        break;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    _ => {
+                        log::warn!("worker rank {rank} timed out on shutdown — killing");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn dummy_file() -> std::fs::File {
+    // /dev/null wrapped in a File so std::mem::replace has something to swap
+    // in. Used by Drop only — we never read or write it.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("/dev/null open for dummy_file")
+}
+
+#[cfg(unix)]
+fn spawn_cuda_worker_processes(workers: &[CudaWorkerBootstrap]) -> anyhow::Result<WorkerChildren> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let world_size = workers.len();
+    if world_size < 2 {
+        anyhow::bail!("spawn_cuda_worker_processes needs world_size >= 2 (got {world_size})");
+    }
+    let exe = std::env::current_exe().context("current_exe")?;
+    let mut children = Vec::with_capacity(world_size - 1);
+
+    for (rank, worker) in workers.iter().enumerate().skip(1) {
+        // Parent → child pipe. Child holds read end, parent holds write end.
+        // When parent drops the write end (or dies), child's read() returns
+        // EOF and the worker exits.
+        let mut fds = [0i32; 2];
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if ret != 0 {
+            return Err(anyhow::anyhow!(
+                "pipe(2) for worker rank {rank} failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: pipe(2) returns two valid owned fds.
+        use std::os::fd::FromRawFd;
+        let child_read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let parent_write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let child_read_raw = child_read_end.as_raw_fd();
+
+        let mut cmd = std::process::Command::new(&exe);
+        // Forward every command-line argument so child sees identical args.
+        // It will short-circuit to run_worker_mode() because ARLE_WORKER_RANK
+        // is set. Other args (model path, etc.) become inert in worker mode
+        // but the parser must still accept them.
+        for arg in std::env::args().skip(1) {
+            cmd.arg(arg);
+        }
+        cmd.env("ARLE_WORKER_RANK", rank.to_string());
+        cmd.env("ARLE_WORKER_PARENT_FD", child_read_raw.to_string());
+        cmd.env("INFER_CUDA_DEVICE", worker.cuda_ordinal.to_string());
+        // MASTER_ADDR/PORT/WORLD_SIZE are already set by
+        // configure_deepseek_serving_env_if_needed before main spawns;
+        // children inherit them via the default Command env passthrough.
+
+        // pre_exec dup2 ensures fd `child_read_raw` survives exec (dup2
+        // clears CLOEXEC on the target fd; child_read_end's drop runs in
+        // the *child* address space, but since we keep the dup'd raw fd
+        // open via the env var the file pointer survives).
+        let dup_target = child_read_raw;
+        unsafe {
+            cmd.pre_exec(move || {
+                // No remapping needed — child_read_raw is inherited as is.
+                // We could dup2 it to a fixed fd for symmetry with the
+                // sidecar but the env var carries the fd number, which is
+                // sufficient and avoids fd-collision with cargo / inherited
+                // stdio.
+                let _ = dup_target;
+                Ok(())
+            });
+        }
+
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("spawn worker rank {rank}"))?;
+
+        // After spawn, parent doesn't need the child-side read fd. The
+        // child inherits it; closing it here would EOF the child immediately.
+        drop(child_read_end);
+        children.push((rank, child, parent_write_end));
+
+        log::info!(
+            "spawned worker rank {rank} pid={} cuda_ordinal={}",
+            children.last().map(|(_, c, _)| c.id()).unwrap_or(0),
+            worker.cuda_ordinal
+        );
+    }
+
+    Ok(WorkerChildren { children })
+}
+
 fn build_cuda_worker_bootstrap(topology: &RuntimeTopology) -> Vec<CudaWorkerBootstrap> {
     let cuda_ordinals = configured_cuda_worker_ordinals()
         .unwrap_or_else(|err| panic!("invalid CUDA workers: {err}"));
@@ -1252,6 +1392,33 @@ async fn async_main(args: Args) {
     let mut selected_mode = None;
     let mut scheduler_workers = None;
 
+    // Phase B-1 commit B.2 — multiproc-serve coordinator-side child spawn.
+    // When ARLE_MULTIPROC_SERVE=1 AND world_size > 1, fork N-1 worker
+    // processes via current_exe + ARLE_WORKER_RANK env. The coordinator
+    // then becomes responsible only for rank 0; spawn_cuda_worker_group
+    // gets a single-rank slice.
+    //
+    // The `_worker_children` RAII guard holds parent pipe write-ends; when
+    // it drops at end of async_main, workers EOF on their read() and exit.
+    #[cfg(unix)]
+    let _worker_children =
+        if std::env::var("ARLE_MULTIPROC_SERVE").is_ok() && worker_bootstrap.len() > 1 {
+            Some(
+                spawn_cuda_worker_processes(&worker_bootstrap)
+                    .unwrap_or_else(|e| panic!("multiproc worker spawn failed: {e:#}")),
+            )
+        } else {
+            None
+        };
+    #[cfg(unix)]
+    let worker_bootstrap_for_coord: Vec<CudaWorkerBootstrap> = if _worker_children.is_some() {
+        worker_bootstrap[..1].to_vec()
+    } else {
+        worker_bootstrap.clone()
+    };
+    #[cfg(not(unix))]
+    let worker_bootstrap_for_coord: Vec<CudaWorkerBootstrap> = worker_bootstrap.clone();
+
     for (candidate_idx, (kv_cache_dtype, kv_pool_format, kv_mode_label)) in
         kv_candidates.iter().copied().enumerate()
     {
@@ -1262,7 +1429,7 @@ async fn async_main(args: Args) {
             num_slots,
             kv_cache_dtype,
             kv_pool_format,
-            &worker_bootstrap,
+            &worker_bootstrap_for_coord,
             pre_model_free_bytes,
             &metrics,
         ) {
