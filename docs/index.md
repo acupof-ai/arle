@@ -23,10 +23,14 @@ expert backend have landed. Required DeepGEMM remains a fail-fast validation
 toolchain gate after the 2026-05-26 wall-clock and correctness KILL;
 route-grouped experts remain diagnostic-only. Remaining blockers: replacing the
 DeepEP-style NCCL fallback with native DeepEP low-latency kernels,
-byte-identical grouped expert GEMM, launch churn. Evidence:
+byte-identical grouped expert GEMM, launch churn. `deepep` is the default MoE
+backend today; native DeepEP LL is not yet the default because the 8-rank
+same-process NVSHMEM gate timed out on 2026-05-26 while the official
+multi-process DeepEP LL test passed. Evidence:
 [`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md),
+[`experience/errors/2026-05-26-dsv4-native-deepep-ll-sameprocess-timeout.md`](experience/errors/2026-05-26-dsv4-native-deepep-ll-sameprocess-timeout.md),
 [`experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md`](experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md),
 [`experience/wins/2026-05-26-dsv4-deepgemm-device-prop-cache.md`](experience/wins/2026-05-26-dsv4-deepgemm-device-prop-cache.md),
 [`experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md`](experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md),
