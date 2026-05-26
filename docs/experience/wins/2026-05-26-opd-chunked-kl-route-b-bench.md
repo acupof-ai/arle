@@ -223,6 +223,52 @@ shape that previously OOMed everywhere:
 - post-train RSS 9.22 GB is well under V100 host budget; the
   pre-evict 19.8 GB peak was the original rc=137 root cause
 
+## Per-step optimization — Phase 2 profile
+
+`22cea903 feat(train): profile OPD backward ops` adds
+`ARLE_OPD_BACKWARD_PROFILE=1`, which routes OPD backward calls through
+the existing `Tape::backward_profiled()` path, fences CUDA around each
+profiled op/merge, and emits per-window plus cumulative op timing.
+
+V100 run:
+`bench-output/2026-05-26-opd-chunked-kl-route-b-wE-windowed-profile/`
+
+Params: same Route B shape as `wD`, but `--steps 1 --eval-steps 999`
+to isolate one train step without the step-0 eval pass. Profile
+instrumentation is synchronous by design, so use this as bottleneck
+licensing evidence, not as the production step-time baseline.
+
+| metric | value |
+|---|---:|
+| rc | 0 |
+| train step 1 wall-clock | 423.5 s |
+| backward wall-clock | 183.2 s (43.3 % of step) |
+| rollout | 149.5 s |
+| teacher forward | 51.4 s |
+| student forward | 39.3 s |
+| peak GPU | 25 120 MiB |
+
+Final aggregate backward profile:
+
+| rank | op | count | seconds | % backward | % step |
+|---:|---|---:|---:|---:|---:|
+| 1 | MatmulBT | 368 | 89.9 | 49.1 % | 21.2 % |
+| 2 | LinearAttention | 30 | 78.4 | 42.8 % | 18.5 % |
+| 3 | Transpose | 68 | 3.3 | 1.8 % | 0.8 % |
+| 4 | AddBroadcast | 34 | 2.9 | 1.6 % | 0.7 % |
+| 5 | Slice | 28 | 1.6 | 0.9 % | 0.4 % |
+| 6 | Mul | 55 | 1.3 | 0.7 % | 0.3 % |
+
+License verdict: **GRAY**, not PASS. LinearAttention is a real
+backward hotspot, but it is not dominant: 42.8 % of backward and
+18.5 % of step wall-clock, while `MatmulBT` is slightly larger at
+49.1 % of backward. Per §0, the wall-clock framing is the conservative
+ground truth, so a full train-side LinearAttention CUDA backward spike
+is not licensed yet. Next step is a narrower split: identify which
+`MatmulBT` sites dominate and split `LinearAttention` into forward
+intermediate recompute vs scan/state-history work before choosing the
+kernel target.
+
 ## Headline (updated)
 
 Route B is now end-to-end:
@@ -237,9 +283,10 @@ Route B is now end-to-end:
 ## Next
 
 - **Per-step wall-clock optimization** — 897 s/step is workable but
-  not productive. Backward 60 % suggests the per-window backward graph
-  has extra reduce/scale ops. Profile + try cudaGraph capture for the
-  windowed path (current path is eager).
+  not productive. The first synchronized backward profile is GRAY:
+  `MatmulBT` and `LinearAttention` split almost all backward time, so
+  the next optimization needs finer attribution before a CUDA backward
+  kernel spike.
 - **Production-scale loop** — 5-10 step run with eval cadence; verify
   KL trajectory matches the unwindowed reference (when reference is
   feasible) at small shapes.
