@@ -232,11 +232,22 @@ fn make_request(
     mpsc::UnboundedReceiver<CompletionStreamDelta>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
+    // Greedy + repetition_penalty=1.1. Plain greedy on Qwen3-4B base with
+    // long technical prompts collapses to a single-token (`!`) repetition
+    // loop, which makes mean_match a noise-fidelity metric rather than a
+    // quality metric (the precision that reproduces the junk most
+    // faithfully wins). repetition_penalty=1.1 is deterministic, keeps
+    // the audit parity-comparable across precisions, and breaks the
+    // degenerate loop so the BF16 reference becomes a real text
+    // trajectory. See `docs/experience/errors/2026-05-26-fp8-kv-
+    // catastrophic-was-test-artifact.md` for the full retract + rule.
+    let mut sampling = SamplingParams::default(); // greedy
+    sampling.repetition_penalty = 1.1;
     let req = IncomingRequest {
         prompt: prompt.to_string(),
         prompt_tokens: None,
         max_tokens: tokens,
-        sampling: SamplingParams::default(), // greedy
+        sampling,
         stop: None,
         speculative: None,
         priority: RequestPriority::default(),
