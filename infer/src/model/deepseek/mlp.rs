@@ -2916,13 +2916,32 @@ impl DeepseekV4MoeBlock {
                 ctx,
                 w2_ptrs,
                 &scratch.act,
-                route_out,
+                &mut scratch.out,
                 recv_meta,
                 local_expert_start,
                 experts_per_rank,
                 num_routes,
-                true,
+                false,
             )?;
+            let (expert_ptr, _expert_guard) = scratch.out.data.device_ptr(&ctx.stream);
+            let (route_out_ptr, _route_out_guard) = route_out.data.device_ptr_mut(&ctx.stream);
+            let (meta_ptr, _meta_guard) = recv_meta.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_scale_route_outputs_by_meta_cuda(
+                    expert_ptr as *const ffi::Half,
+                    route_out_ptr as *mut ffi::Half,
+                    meta_ptr as *const i32,
+                    num_routes as i32,
+                    route_out.hidden_dim as i32,
+                    local_expert_start,
+                    experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 route-grouped expert weight scale failed: {err}")
+                })?;
+            }
         }
         Ok(true)
     }

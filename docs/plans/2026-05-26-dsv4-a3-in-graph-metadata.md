@@ -197,6 +197,16 @@ Phase 3 估算：~2-3 天（DeepEP API 调研 + 重构 + 多卡 bench）。
   (31.3438 s → 31.3414 s for `max_tokens=1`, 36.4854 s → 36.4439 s for
   `max_tokens=64`). See
   [`../experience/wins/2026-05-26-dsv4-a3-phase1-device-offsets.md`](../experience/wins/2026-05-26-dsv4-a3-phase1-device-offsets.md).
+- 2026-05-26 Phase 2 route-grouped reuse was KILLed as a default path. The
+  opt-in path can delete decode-window D2H (344 calls → 0 in the filtered
+  nsys summary) and a rounding-order fix restored longseq byte identity, but
+  wall-clock failed the gate: short decode improved only 0.7891 s → 0.7528 s
+  (-4.60%, below the 5% PASS threshold) and longseq `max_tokens=32` regressed
+  108.7749 s → 110.2519 s (+1.36%). Keep
+  `ARLE_DSV4_ROUTE_GROUPED_EXPERTS` default-off; the next Phase 2 attempt must
+  be true persistent grouped GEMM/DeepGEMM-style dispatch, not more tuning of
+  the route-wise GEMV prototype. See
+  [`../experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](../experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md).
 
 ## Cross-refs
 

@@ -138,6 +138,49 @@ extern "C" CUresult dsv4_swiglu_clamped_routes_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_scale_route_outputs_by_meta_kernel(
+    const uint16_t *__restrict__ expert_out,
+    uint16_t *__restrict__ route_out,
+    const int32_t *__restrict__ route_meta,
+    int num_routes,
+    int hidden_dim,
+    int local_expert_start,
+    int experts_per_rank) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = num_routes * hidden_dim;
+  if (idx >= total) return;
+  int route = idx / hidden_dim;
+  if (dsv4_route_local_expert(route_meta, route, local_expert_start, experts_per_rank) < 0) {
+    route_out[idx] = 0;
+    return;
+  }
+  float weight = dsv4_route_i32_bits_to_f32(route_meta[route * 3 + 2]);
+  float value = dsv4_route_bf16_to_f32(expert_out[idx]);
+  route_out[idx] = dsv4_route_f32_to_bf16_bits(weight * value);
+}
+
+extern "C" CUresult dsv4_scale_route_outputs_by_meta_cuda(
+    const uint16_t *expert_out,
+    uint16_t *route_out,
+    const int32_t *route_meta,
+    int num_routes,
+    int hidden_dim,
+    int local_expert_start,
+    int experts_per_rank,
+    CUstream stream) {
+  if (num_routes < 0 || hidden_dim <= 0 || local_expert_start < 0 ||
+      experts_per_rank <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = num_routes * hidden_dim;
+  if (total == 0) return CUDA_SUCCESS;
+  int grid = (total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_scale_route_outputs_by_meta_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      expert_out, route_out, route_meta, num_routes, hidden_dim, local_expert_start,
+      experts_per_rank);
+  return (CUresult)cudaGetLastError();
+}
+
 __device__ __forceinline__ float dsv4_route_sigmoid(float value) {
   if (value >= 0.0f) {
     return 1.0f / (1.0f + expf(-value));
