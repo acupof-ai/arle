@@ -112,14 +112,14 @@ These are implementation, not architecture-license, questions.
 ## Artifacts
 
 - Spike script:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-child-process-spike-20260526/child_process_spike.py`
+  `dsv4-deepep-child-process-spike-20260526/child_process_spike.py`
 - Full per-rank JSON:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-child-process-spike-20260526/rank{0..7}.json`
+  `dsv4-deepep-child-process-spike-20260526/rank{0..7}.json`
 - Summary JSON:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-child-process-spike-20260526/summary.json`
+  `dsv4-deepep-child-process-spike-20260526/summary.json`
 - Byte-identical determinism check script + summary:
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-byte-identical-check-20260526/byte_identical_check.py`
-  `/sgl-workspace/bench-artifacts/dsv4-deepep-byte-identical-check-20260526/summary.json`
+  `dsv4-deepep-byte-identical-check-20260526/byte_identical_check.py`
+  `dsv4-deepep-byte-identical-check-20260526/summary.json`
 
 ## Rule
 

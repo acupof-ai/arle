@@ -21,12 +21,12 @@ Remote H20 validation artifacts:
 
 | Run | Artifact | Result |
 | --- | --- | --- |
-| Build | `/sgl-workspace/bench-artifacts/dsv4-a20-fuse-window-build-20260526/build.log` | `cargo build --release -p infer --features cuda,nccl --bin infer` passed in 6m49s |
-| Smoke baseline | `/sgl-workspace/bench-artifacts/dsv4-a20-window-baseline-smoke-max32-20260526` | `max_tokens=32`, elapsed 7.5398s, output `4062 0.0000 ...` |
-| Smoke fused | `/sgl-workspace/bench-artifacts/dsv4-a20-window-fused-smoke-max32-20260526` | `max_tokens=32`, elapsed 7.5188s, byte-identical output |
-| Nsys baseline | `/sgl-workspace/bench-artifacts/dsv4-a20-window-baseline-nsys-max32-20260526/nsys` | profile request 3.1348s; `dsv4_update_window_cache_kernel`: 9504 calls, 10.9566ms total GPU time |
-| Nsys fused | `/sgl-workspace/bench-artifacts/dsv4-a20-window-fused-nsys-max32-20260526/nsys` | profile request 3.0272s; `dsv4_update_window_cache_kernel`: 0 calls |
-| Default smoke | `/sgl-workspace/bench-artifacts/dsv4-a20-default-fuse-smoke-max32-20260526` | unset DSv4 backend/fuse env, env-check resolved `deepep` + `deepgemm`, elapsed 7.4941s, byte-identical output |
+| Build | `dsv4-a20-fuse-window-build-20260526/build.log` | `cargo build --release -p infer --features cuda,nccl --bin infer` passed in 6m49s |
+| Smoke baseline | `dsv4-a20-window-baseline-smoke-max32-20260526` | `max_tokens=32`, elapsed 7.5398s, output `4062 0.0000 ...` |
+| Smoke fused | `dsv4-a20-window-fused-smoke-max32-20260526` | `max_tokens=32`, elapsed 7.5188s, byte-identical output |
+| Nsys baseline | `dsv4-a20-window-baseline-nsys-max32-20260526/nsys` | profile request 3.1348s; `dsv4_update_window_cache_kernel`: 9504 calls, 10.9566ms total GPU time |
+| Nsys fused | `dsv4-a20-window-fused-nsys-max32-20260526/nsys` | profile request 3.0272s; `dsv4_update_window_cache_kernel`: 0 calls |
+| Default smoke | `dsv4-a20-default-fuse-smoke-max32-20260526` | unset DSv4 backend/fuse env, env-check resolved `deepep` + `deepgemm`, elapsed 7.4941s, byte-identical output |
 
 The hard pass condition is launch removal plus byte-identical greedy decode.
 The single nsys profile-request wall-clock delta was -3.43%, but the trace also

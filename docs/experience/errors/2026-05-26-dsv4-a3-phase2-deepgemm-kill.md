@@ -74,17 +74,17 @@ strings across the three measured requests.
 ## Artifacts
 
 - Toolchain/context-cache build:
-  `/sgl-workspace/bench-artifacts/dsv4-toolchain-context-cache-build-20260526-062011`
+  `dsv4-toolchain-context-cache-build-20260526-062011`
 - Context-cache smoke before SFA stride fix:
-  `/sgl-workspace/bench-artifacts/dsv4-toolchain-deepgemm-smoke-max32-20260526-062111`
+  `dsv4-toolchain-deepgemm-smoke-max32-20260526-062111`
 - Shape-detail smoke:
-  `/sgl-workspace/bench-artifacts/dsv4-deepgemm-shape-detail-smoke-20260526-063124`
+  `dsv4-deepgemm-shape-detail-smoke-20260526-063124`
 - SFA stride build:
-  `/sgl-workspace/bench-artifacts/dsv4-deepgemm-sfa-stride-build-20260526-063442`
+  `dsv4-deepgemm-sfa-stride-build-20260526-063442`
 - Required DeepGEMM smoke after SFA stride fix:
-  `/sgl-workspace/bench-artifacts/dsv4-deepgemm-sfa-stride-smoke-max32-20260526-064221`
+  `dsv4-deepgemm-sfa-stride-smoke-max32-20260526-064221`
 - Native vs DeepGEMM A/B:
-  `/sgl-workspace/bench-artifacts/dsv4-deepgemm-native-ab-max32-20260526-064326`
+  `dsv4-deepgemm-native-ab-max32-20260526-064326`
 
 ## Rule
 

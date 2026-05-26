@@ -161,7 +161,7 @@ constraints 实证）。
 - 一 phase 一组 commit，message 用 `feat(cuda):` 或 `feat(dsv4):` scope。
 - 每 phase PASS / KILL 落 `docs/experience/wins/` 或 `errors/`，按
   `CLAUDE.md §Benchmarks` 强制 entry。
-- bench 命令固定：复用 `/sgl-workspace/bench-artifacts/dsv4-longseq-20260525/
+- bench 命令固定：复用 `dsv4-longseq-20260525/
   request.json` 同 prompt；`max_tokens=1` 只能标成 prefill/TTFT smoke，不能
   当 decode 证据；decode / wall-clock PASS/KILL 用 `max_tokens>=32`，最终按
   32K input / 1.5K output、c=8、qps=8 的 DSv4 SLO framing 对齐。
