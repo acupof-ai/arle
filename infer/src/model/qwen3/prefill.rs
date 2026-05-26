@@ -1375,6 +1375,52 @@ impl Qwen3Model {
                         static_scales_ptr,
                         num_kv_heads * head_dim,
                     )?;
+                    if layer_idx == 0 && std::env::var("INFER_FP8_DEBUG").is_ok() {
+                        use std::sync::atomic::{AtomicUsize, Ordering};
+                        static DUMP_FIRES: AtomicUsize = AtomicUsize::new(0);
+                        if DUMP_FIRES.fetch_add(1, Ordering::Relaxed) < 1 {
+                            if let Some(scales_slice) = pool.k_static_scales_slice(layer_idx) {
+                                let total = num_kv_heads * head_dim;
+                                let mut host = vec![0.0f32; total];
+                                if self.ctx.stream.memcpy_dtoh(scales_slice, &mut host).is_ok() {
+                                    let _ = self.ctx.stream.synchronize();
+                                    let mut mn = f32::INFINITY;
+                                    let mut mx = f32::NEG_INFINITY;
+                                    let mut sum = 0.0f32;
+                                    let mut zeros = 0usize;
+                                    for &v in &host {
+                                        mn = mn.min(v);
+                                        mx = mx.max(v);
+                                        sum += v;
+                                        if v < 1e-20 {
+                                            zeros += 1;
+                                        }
+                                    }
+                                    let mean = sum / total as f32;
+                                    eprintln!(
+                                        "[kivi-scales] layer=0 n={} min={:.3e} max={:.3e} mean={:.3e} near_zero={}/{}",
+                                        total, mn, mx, mean, zeros, total
+                                    );
+                                    let head0: Vec<f32> = host[0..head_dim.min(8)].to_vec();
+                                    eprintln!(
+                                        "[kivi-scales] layer=0 head=0 dims[0..8]={:?}",
+                                        head0
+                                    );
+                                    if num_kv_heads > 1 {
+                                        let last_head_start = (num_kv_heads - 1) * head_dim;
+                                        let last: Vec<f32> = host
+                                            [last_head_start..last_head_start + head_dim.min(8)]
+                                            .to_vec();
+                                        eprintln!(
+                                            "[kivi-scales] layer=0 head={} dims[0..8]={:?}",
+                                            num_kv_heads - 1,
+                                            last
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     pool.k_kivi_calibrated[layer_idx]
                         .store(true, std::sync::atomic::Ordering::Release);
                     kv_quant::quantize_paged_kv_fp8_per_channel(
