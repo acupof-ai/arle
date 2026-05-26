@@ -155,36 +155,7 @@ Benefit: a cheap, widely-available Volta box becomes a usable ARLE inference tar
 
 Evidence: [P1 build pass](docs/experience/wins/2026-05-25-v100-sm70-p1-build-pass.md) · [P1.4 smoke](docs/experience/wins/2026-05-25-v100-sm70-p1-smoke-pass.md) · [P3.1 4B capability](docs/experience/wins/2026-05-25-v100-sm70-p3-1-capability-qwen35-4b.md) · [P3.2 9B capability](docs/experience/wins/2026-05-25-v100-sm70-p3-2-capability-qwen35-9b.md)
 
----
-
-**2026-05-24 — `arle train opd <model-dir>` ships end-to-end.**
-One command goes from HF/ModelScope-cached student/teacher dirs to a finished OPD run — `qwen35_loader` + autograd `Tape` + `opd_step` + `AdamW`, no example script needed. ([`14c3be9`](https://github.com/cklxx/arle/commit/14c3be9))
-
----
-
-**2026-05-22 — OPD pipeline closed; ARLE serve matches HuggingFace `transformers`.**
-4B BF16 teacher → 0.8B-Base LoRA r=16 student, train → save (PEFT) → load (`INFER_LORA_PATH`) → eval in one cycle. Cross-engine validation on MMLU 5-shot (Qwen3.5-4B, n=171): **ARLE 77.33 % vs HF transformers 78.18 %** (Δ +0.85 pp, statistically equivalent).
-
-Evidence: [`pipeline close`](docs/experience/wins/2026-05-22-p1b-train-save-load-eval-loop.md) · [`cross-validation`](docs/experience/wins/2026-05-22-arle-vs-hf-transformers-cross-validation.md) · [`cycle wrap`](docs/projects/2026-05-22-serve-fix-and-capability-baselines.md)
-
----
-
-**2026-05-21 — ARLE OPD CUDA: 2.49–2.91× faster than HuggingFace TRL `GKDTrainer`.**
-Same Qwen3-0.6B teacher/student, 32 prompts, `rollout_len=8`, `lr=1e-7`, 500 steps, AdamW, RTX 4070 Ti SUPER.
-
-![ARLE OPD CUDA vs HuggingFace TRL — speed, memory, held-out KL](docs/projects/img/2026-05-21-arle-vs-pytorch-opd-comparison.png)
-
-| | TRL `GKDTrainer` | **ARLE full-finetune** | **ARLE LoRA r=16** |
-|---|---:|---:|---:|
-| step time (s) | 0.408 | **0.164** (2.49×) | **0.140** (2.91×) |
-| peak GPU memory (GB) | 12.6 | 15.4 | **3.93** (fits 4 GB cards) |
-| held-out KL (500 steps) | -5.5 % | **-18.5 %** | **-36.4 %** |
-
-Cross-runtime large-teacher path: Qwen3.5-4B BF16 teacher in `infer` → 0.8B-Base LoRA r=16 student in `train` via the `InferTeacher` device-logits bridge. **5.66 s/step, 14.8 GiB peak, 1.5 % cross-runtime overhead.** Held-out exact-overlap converges 50 % → 82.8 % over 5 000 steps.
-
-Evidence: [`cycle wrap`](docs/projects/2026-05-21-opd-cuda-cycle-wrap.md) · [usage manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md) · [TRL head-to-head](docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md) · [4B→0.8B cross-runtime bench](docs/experience/wins/2026-05-21-qwen35-4b-08b-opd-infer-teacher.md)
-
-Full history: [CHANGELOG.md](CHANGELOG.md).
+Older entries (OPD CLI ship, OPD pipeline close + HF cross-validation, ARLE-vs-TRL 2.49–2.91×): [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
