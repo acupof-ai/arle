@@ -3986,6 +3986,16 @@ fn dsv4_moe_deepep_enabled() -> Result<bool> {
         "" | "deepep" | "dispatch" | "dispatch_combine" | "deepep_unsafe" | "unsafe_deepep"
         | "dispatch_unsafe" => Ok(true),
         "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => Ok(false),
+        // `native-deepep` is the in-progress sidecar transport (phase 1.1
+        // production scaffolding landed; LayerCommunicator wire-in pending).
+        // Reserve the name so users get an explicit error instead of a
+        // silent fallback to the NCCL DeepEP-style default.
+        "native-deepep" | "native_deepep" => bail!(
+            "ARLE_DSV4_MOE_BACKEND=native-deepep is reserved for the upcoming sidecar transport \
+             but is not yet wired through LayerCommunicator. Use `deepep` (default) or \
+             `allreduce` until phase 1.1.7 lands. Track: docs/plans/2026-05-26-dsv4-deepep-\
+             process-per-rank.md"
+        ),
         _ => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{raw}`"),
     }
 }
