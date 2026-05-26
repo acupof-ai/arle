@@ -763,9 +763,18 @@ __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
             partial_m[out_idx] = final_m;
             partial_l[out_idx] = final_l;
         }
+        // CRITICAL: write the *normalized* per-split average (final_o /
+        // final_l), matching `decode_attention_fp8_partial_kernel` and the
+        // merge-kernel contract at line ~295: `o_s * s_cur / l_new` with
+        // `s_cur = l_s * exp(...)` only balances if o_s is pre-normalized.
+        // Unnormalized writes produce O(l_s)-scale-off attention output and
+        // were the actual root cause of the 2026-05-26 KIVI bit-identical
+        // failure pattern (`fp8 mean_match=0.0156` unchanged regardless of
+        // K calibration quality).
+        float inv_final_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
         #pragma unroll
         for (int i = 0; i < EPT; i++)
-            partial_out[out_idx * HEAD_DIM + lane_id * EPT + i] = final_o[i];
+            partial_out[out_idx * HEAD_DIM + lane_id * EPT + i] = final_o[i] * inv_final_l;
     }
 }
 }  // extern "C++" — KIVI per-channel K template kernel
