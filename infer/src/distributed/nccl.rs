@@ -559,6 +559,110 @@ impl NcclGroup {
             .clone_dtoh(&recv)
             .with_context(|| format!("rank {} D2H broadcast output copy failed", self.rank))
     }
+
+    /// Broadcast a contiguous i32 buffer from `root_rank` to all peers.
+    /// Mirrors `broadcast_f32`; used by the multiproc-serve token coordinator
+    /// (per-step sampled-token sync) and other small per-step control-plane
+    /// messages.
+    pub fn broadcast_i32(&self, input: &[i32], count: usize, root_rank: usize) -> Result<Vec<i32>> {
+        if root_rank >= self.world_size {
+            bail!(
+                "NCCL broadcast_i32 root {root_rank} must be < world_size {}",
+                self.world_size
+            );
+        }
+        if self.rank == root_rank && input.len() != count {
+            bail!(
+                "NCCL broadcast_i32 root rank {} input len {} must equal count {count}",
+                self.rank,
+                input.len()
+            );
+        }
+        let mut recv = if self.rank == root_rank {
+            self.stream.clone_htod(input).with_context(|| {
+                format!("rank {} H2D broadcast_i32 input copy failed", self.rank)
+            })?
+        } else {
+            self.stream.alloc_zeros::<i32>(count).with_context(|| {
+                format!("rank {} broadcast_i32 output allocation failed", self.rank)
+            })?
+        };
+
+        {
+            let (ptr, _record) = recv.device_ptr_mut(&self.stream);
+            self.comm.broadcast(
+                ptr as *mut c_void,
+                count,
+                ncclDataType_t::Int32,
+                root_rank,
+                &self.stream,
+            )?;
+        }
+        self.stream.synchronize().with_context(|| {
+            format!("rank {} stream sync after broadcast_i32 failed", self.rank)
+        })?;
+        self.stream
+            .clone_dtoh(&recv)
+            .with_context(|| format!("rank {} D2H broadcast_i32 output copy failed", self.rank))
+    }
+
+    /// Broadcast a contiguous byte buffer from `root_rank` to all peers.
+    /// The buffer is overwritten in place on receivers; root rank's bytes
+    /// are unchanged. Used for the rank-0 → worker per-step batch metadata
+    /// relay (bincode-serialized `StepPlan` etc.).
+    ///
+    /// `buf` must be the same length on every rank.
+    pub fn broadcast_bytes(&self, buf: &mut [u8], root_rank: usize) -> Result<()> {
+        if root_rank >= self.world_size {
+            bail!(
+                "NCCL broadcast_bytes root {root_rank} must be < world_size {}",
+                self.world_size
+            );
+        }
+        let count = buf.len();
+        if count == 0 {
+            return Ok(());
+        }
+        // NCCL Int8 view of the buffer.
+        let mut dev = self.stream.alloc_zeros::<u8>(count).with_context(|| {
+            format!(
+                "rank {} broadcast_bytes device allocation failed",
+                self.rank
+            )
+        })?;
+        if self.rank == root_rank {
+            // Copy host bytes → device before the collective so the root has
+            // the payload in the same buffer the collective writes from.
+            self.stream.memcpy_htod(buf, &mut dev).with_context(|| {
+                format!("rank {} H2D broadcast_bytes input copy failed", self.rank)
+            })?;
+        }
+        {
+            let (ptr, _record) = dev.device_ptr_mut(&self.stream);
+            self.comm.broadcast(
+                ptr as *mut c_void,
+                count,
+                ncclDataType_t::Int8,
+                root_rank,
+                &self.stream,
+            )?;
+        }
+        self.stream.synchronize().with_context(|| {
+            format!(
+                "rank {} stream sync after broadcast_bytes failed",
+                self.rank
+            )
+        })?;
+        if self.rank != root_rank {
+            // Non-root copies device buffer back into the caller-provided
+            // host slice.
+            let out = self.stream.clone_dtoh(&dev).with_context(|| {
+                format!("rank {} D2H broadcast_bytes output copy failed", self.rank)
+            })?;
+            buf.copy_from_slice(&out);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
