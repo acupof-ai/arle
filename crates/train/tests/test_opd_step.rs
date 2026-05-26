@@ -9,7 +9,7 @@ use train::lora::LoraTargetSet;
 use train::{
     lora::LoraConfig,
     opd::{
-        GkdLossConfig, GkdSftAnchor, OpdError, OpdStepConfig, OpdStepProfile, opd_step,
+        GkdLossConfig, GkdSftAnchor, OpdError, OpdKlMask, OpdStepConfig, OpdStepProfile, opd_step,
         opd_step_with_teacher_forward_profiled_gkd_anchor,
     },
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
@@ -157,6 +157,7 @@ fn opd_step_windowed_gkd_runs_end_to_end() {
             corpus_tokens: Some(&corpus_tokens),
             kl_chunk_size: Some(2),
             logits_window_size: Some(2),
+            kl_mask: OpdKlMask::Full,
         },
         Some(&mut profile),
     )
@@ -343,9 +344,10 @@ fn opd_step_error_after_rollout_cleans_tape_and_temporaries() {
     let live_before = live_tensor_count(&store);
     let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
 
-    let err = opd_step(
+    let teacher_forward = InProcessTeacher::new(&teacher);
+    let err = opd_step_with_teacher_forward_profiled_gkd_anchor(
         &student,
-        &teacher,
+        &teacher_forward,
         &[1],
         OpdStepConfig {
             rollout_len: 2,
@@ -355,6 +357,15 @@ fn opd_step_error_after_rollout_cleans_tape_and_temporaries() {
         &mut optimizer,
         &mut store,
         &mut tape,
+        GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: None,
+            logits_window_size: None,
+            kl_mask: OpdKlMask::Full,
+        },
+        None,
     )
     .expect_err("teacher scoring should fail after student rollout grows past rope cache");
 
@@ -702,9 +713,10 @@ fn opd_step_rejects_short_rope_cache_with_actionable_error() {
     let student_params = student.all_parameter_ids();
     let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
 
-    let err = opd_step(
+    let teacher_forward = InProcessTeacher::new(&teacher);
+    let err = opd_step_with_teacher_forward_profiled_gkd_anchor(
         &student,
-        &teacher,
+        &teacher_forward,
         &[1, 3, 8],
         OpdStepConfig {
             rollout_len: 0,
@@ -714,6 +726,15 @@ fn opd_step_rejects_short_rope_cache_with_actionable_error() {
         &mut optimizer,
         &mut store,
         &mut tape,
+        GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: None,
+            logits_window_size: None,
+            kl_mask: OpdKlMask::Full,
+        },
+        None,
     )
     .expect_err("rope cache shorter than prompt must fail with OPD context");
 
