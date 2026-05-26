@@ -3,8 +3,32 @@
     allow(dead_code, unused_imports)
 )]
 
+const DEFAULT_EVAL_TRAIN_PROMPT_LIMIT: usize = 1;
+
+fn eval_prompt_limit_len(total: usize, limit: Option<usize>) -> usize {
+    limit.map_or(total, |limit| limit.min(total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eval_prompt_limit_len;
+
+    #[test]
+    fn eval_prompt_limit_defaults_to_bounded_prefix() {
+        assert_eq!(eval_prompt_limit_len(52, Some(1)), 1);
+        assert_eq!(eval_prompt_limit_len(2, Some(8)), 2);
+        assert_eq!(eval_prompt_limit_len(52, Some(0)), 0);
+    }
+
+    #[test]
+    fn eval_prompt_limit_none_keeps_full_split() {
+        assert_eq!(eval_prompt_limit_len(52, None), 52);
+    }
+}
+
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 mod app {
+    use super::DEFAULT_EVAL_TRAIN_PROMPT_LIMIT;
     use std::{
         collections::HashSet,
         fs,
@@ -73,6 +97,7 @@ mod app {
         sft_anchor: GkdSftAnchor,
         kl_chunk_size: Option<usize>,
         logits_window_size: Option<usize>,
+        eval_train_prompt_limit: Option<usize>,
     }
 
     #[derive(Debug)]
@@ -145,7 +170,8 @@ mod app {
              steps={} rollout_len={} lr={:.9e} grad_clip={GRAD_CLIP} \
              prompt_source={} train_prompt_count={} heldout_prompt_count={} \
              eval_steps={:?} cuda_graph={} save_student_checkpoint={} save_every={} \
-             gkd_lambda={:.6} sft_anchor={} kl_chunk_size={} logits_window_size={}",
+             gkd_lambda={:.6} sft_anchor={} kl_chunk_size={} logits_window_size={} \
+             eval_train_prompt_limit={}",
             args.teacher_model.display(),
             args.teacher_api_url.as_deref().unwrap_or("none"),
             args.teacher_config
@@ -174,7 +200,10 @@ mod app {
                 .unwrap_or_else(|| "none".to_owned()),
             args.logits_window_size
                 .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_owned())
+                .unwrap_or_else(|| "none".to_owned()),
+            args.eval_train_prompt_limit
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "all".to_owned())
         );
         for (idx, prompt) in prompts.train.iter().enumerate() {
             println!("prompt split=train index={idx} ids={prompt:?}");
@@ -336,6 +365,7 @@ mod app {
         let mut sft_anchor = GkdSftAnchor::StudentRollout;
         let mut kl_chunk_size = Some(DEFAULT_KL_CHUNK_SIZE);
         let mut logits_window_size = None;
+        let mut eval_train_prompt_limit = Some(DEFAULT_EVAL_TRAIN_PROMPT_LIMIT);
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -374,6 +404,10 @@ mod app {
                     logits_window_size =
                         Some(parse_positive_usize(&arg, &next_arg(&mut args, &arg)?)?)
                 }
+                "--eval-train-prompt-limit" => {
+                    eval_train_prompt_limit =
+                        parse_optional_usize_or_all(&arg, &next_arg(&mut args, &arg)?)?
+                }
                 "--no-cuda-graph" => enable_cuda_graph = false,
                 "--help" | "-h" => {
                     println!(
@@ -385,6 +419,7 @@ mod app {
                          [--save-student-checkpoint DIR] [--save-every N] \
                          [--gkd-lambda LAMBDA] [--sft-anchor student-rollout|corpus-truth] \
                          [--kl-chunk-size N(default 32)] [--logits-window-size N] \
+                         [--eval-train-prompt-limit N|all(default {DEFAULT_EVAL_TRAIN_PROMPT_LIMIT})] \
                          [--no-cuda-graph]"
                     );
                     std::process::exit(0);
@@ -428,6 +463,7 @@ mod app {
             sft_anchor,
             kl_chunk_size,
             logits_window_size,
+            eval_train_prompt_limit,
         })
     }
 
@@ -445,6 +481,18 @@ mod app {
             return Err(format!("{flag} must be positive").into());
         }
         Ok(value)
+    }
+
+    fn parse_optional_usize_or_all(
+        flag: &str,
+        raw: &str,
+    ) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+        if raw.eq_ignore_ascii_case("all") {
+            return Ok(None);
+        }
+        raw.parse::<usize>()
+            .map(Some)
+            .map_err(|err| format!("{flag} must be a non-negative integer or `all`: {err}").into())
     }
 
     fn parse_step_csv(raw: &str) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
@@ -986,8 +1034,11 @@ mod app {
             return Ok(());
         }
         let started = Instant::now();
+        let train_prompt_count =
+            super::eval_prompt_limit_len(prompts.train.len(), args.eval_train_prompt_limit);
         let train_kl = mean_prompt_kl(
-            &prompts.train,
+            "train",
+            &prompts.train[..train_prompt_count],
             teacher,
             student,
             student_model_params,
@@ -997,6 +1048,7 @@ mod app {
             args.logits_window_size,
         )?;
         let heldout_kl = mean_prompt_kl(
+            "heldout",
             &prompts.heldout,
             teacher,
             student,
@@ -1008,13 +1060,16 @@ mod app {
         )?;
         println!(
             "eval_summary step={step} train_kl={train_kl:.12e} heldout_kl={heldout_kl:.12e} \
-             eval_seconds={:.6}",
-            started.elapsed().as_secs_f64()
+             eval_seconds={:.6} train_eval_count={} heldout_eval_count={}",
+            started.elapsed().as_secs_f64(),
+            train_prompt_count,
+            prompts.heldout.len()
         );
         Ok(())
     }
 
     fn mean_prompt_kl<T: TeacherForward + ?Sized>(
+        split: &str,
         prompts: &[Vec<u32>],
         teacher: &T,
         student: &Qwen35Model,
@@ -1028,14 +1083,17 @@ mod app {
             return Ok(f64::NAN);
         }
         let mut total = 0.0f64;
-        for prompt in prompts {
+        for (prompt_index, prompt) in prompts.iter().enumerate() {
+            let prompt_started = Instant::now();
             tape.entries.clear();
             tape.set_enabled(false);
             let positions = (0..prompt.len() as u32).collect::<Vec<_>>();
             if let Some(window_size) = logits_window_size {
                 let mut prompt_kl = 0.0f64;
                 let mut start = 0usize;
+                let mut window_index = 0usize;
                 while start < prompt.len() {
+                    let window_started = Instant::now();
                     let end = start.saturating_add(window_size).min(prompt.len());
                     let window = SequenceWindow { start, end };
                     let teacher_logits = teacher
@@ -1062,10 +1120,28 @@ mod app {
                     prompt_kl += store.to_host(loss)?[0] as f64
                         * (window.len() as f64 / prompt.len() as f64);
                     retain_eval_state(store, tape, student_model_params, teacher.parameter_ids());
+                    println!(
+                        "eval_window_summary split={split} prompt_index={prompt_index} \
+                         window_index={window_index} start={start} end={end} \
+                         window_seconds={:.6} live_tensors={} tape_entries={}",
+                        window_started.elapsed().as_secs_f64(),
+                        live_tensor_count(store),
+                        tape.entries.len()
+                    );
                     tape.set_enabled(false);
                     start = end;
+                    window_index += 1;
                 }
                 total += prompt_kl;
+                println!(
+                    "eval_prompt_summary split={split} prompt_index={prompt_index} \
+                     prompt_len={} windows={window_index} kl={prompt_kl:.12e} \
+                     prompt_seconds={:.6} live_tensors={} tape_entries={}",
+                    prompt.len(),
+                    prompt_started.elapsed().as_secs_f64(),
+                    live_tensor_count(store),
+                    tape.entries.len()
+                );
             } else {
                 let teacher_logits =
                     teacher.forward_logits_device(prompt, &positions, store, tape)?;
@@ -1087,11 +1163,25 @@ mod app {
                         tape,
                     )?,
                 };
-                total += store.to_host(loss)?[0] as f64;
+                let prompt_kl = store.to_host(loss)?[0] as f64;
+                total += prompt_kl;
                 retain_eval_state(store, tape, student_model_params, teacher.parameter_ids());
+                println!(
+                    "eval_prompt_summary split={split} prompt_index={prompt_index} \
+                     prompt_len={} windows=1 kl={prompt_kl:.12e} prompt_seconds={:.6} \
+                     live_tensors={} tape_entries={}",
+                    prompt.len(),
+                    prompt_started.elapsed().as_secs_f64(),
+                    live_tensor_count(store),
+                    tape.entries.len()
+                );
             }
         }
         Ok(total / prompts.len() as f64)
+    }
+
+    fn live_tensor_count(store: &TensorStore) -> usize {
+        store.tensors.iter().filter(|slot| slot.is_some()).count()
     }
 
     fn retain_eval_state(
