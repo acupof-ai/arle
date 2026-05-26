@@ -61,8 +61,40 @@ correctness in isolation (`crates/cuda-kernels/src/kv_quant.rs`
 `fp8_scatter_qwen3_production_layout_diagnostic`,
 `fp8_paged_quantize_qwen3_production_layout_diagnostic`). Both exercise
 the actual FP8 kernels at Qwen3-4B layout (num_kv_heads=8, head_dim=128,
-64 tokens) with realistic ±6 outliers and N(0, 2)
-fill. Result on L4 (sm_89):
+64 tokens) with realistic ±6 outliers and N(0, 2) fill.
+
+A third diagnostic, `fp8_kernel_pair_decode_attention_diagnostic`, now
+wires the production kernel pair end-to-end (production
+`quantize_paged_kv_fp8` writes → production `decode_attention_fp8` reads)
+over a deterministic Qwen3-4B-shaped GQA 2:1 workload (num_q_heads=4,
+num_kv_heads=2, head_dim=128, 32 KV tokens / 2 pages) and compares the
+GPU attention output against a dequantize-then-host-compute reference.
+Result on L4 sm_89: `max_abs_err=0.003784`, `mean_abs_err=0.000523` —
+within BF16 truncation noise. The kernel pair, the kv_meta / kv_indices
+layout interpretation, and the per-(token, head) scale plumbing are all
+clean when the dispatch fields match the kernel's contract.
+
+**Conclusion**: the audit's step-1 catastrophic divergence is in
+scheduler-side runtime dispatch wiring of the values fed to these
+kernels, not in any FP8 CUDA kernel. Remaining suspect surface:
+
+1. The per-decode-step `last_token_indices` build (`tilelang.rs`
+   `last_token_scratch` → `last_token_indices` H2D + `build_last_indices`
+   in `paged_kv.rs`). If the new token's destination row is wrong, the
+   per-step quantize writes to the wrong slot and `decode_attention_fp8`
+   reads stale bytes there.
+2. The `kv_indices` snapshot (`tilelang.rs` `indices_scratch` → H2D vs
+   incremental-update GPU kernel). At decode step 1 the page list grows
+   to include the newly allocated page — if the snapshot is stale, the
+   attention misses the new token's page or reads from an evicted one.
+3. The K vs V scale-pointer ordering across the per-layer
+   `finalize_paged_prefill_kv_layer` + per-step paths — a swap would
+   make every attention score multiplicatively wrong, exactly the
+   "catastrophic from step 1" failure shape.
+4. Layer-index propagation across `pool.k_data_ptr(layer)` /
+   `pool.k_scales_ptr(layer)` between prefill finalize and decode steps —
+   if layer L's decode reads layer M's pool data, every layer mixes
+   wrong K/V. Result on L4 (sm_89):
 
 | Kernel | max_abs_err | mean_abs_err | max_rel_err | scale range |
 |---|---:|---:|---:|---|
