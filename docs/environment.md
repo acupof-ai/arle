@@ -288,7 +288,7 @@ as diagnostics and validation gates, not stable tuning API.
 
 | Variable | Values | Default | Current behavior |
 |---|---|---|---|
-| `ARLE_DSV4_MOE_BACKEND` | `deepep`, `allreduce`, unset | `deepep` | Selects the DSv4 MoE runtime. The default high-performance route uses DeepEP-style dispatch/combine; `allreduce`/`legacy` forces the local-routed + EP all-reduce fallback for diagnosis. |
+| `ARLE_DSV4_MOE_BACKEND` | `deepep`, `allreduce`, unset | `deepep` | Selects the DSv4 MoE runtime. Unset means `deepep`. The default high-performance route uses the validated DeepEP-style dispatch/combine path; `allreduce`/`legacy` forces the local-routed + EP all-reduce fallback for diagnosis. Native DeepEP low-latency kernels are not silently enabled by this name until the process-model gate passes. |
 | `ARLE_DSV4_INCREMENTAL_KV` | `1` / unset | unset | Enables the incremental DSv4 KV state path used by the 8-rank HTTP bring-up. |
 | `ARLE_DSV4_TRACE_LAYER` | `1` / unset | unset | Emits CUDA-synchronizing per-layer phase traces. Use for diagnosis only; it changes latency. |
 | `ARLE_DSV4_COUNT_EXCHANGE` | `allgather`, `sendrecv` | `allgather` | Selects the tiny per-layer route-count exchange. `sendrecv` keeps the older grouped P2P fallback. |
