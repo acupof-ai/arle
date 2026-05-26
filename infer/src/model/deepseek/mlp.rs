@@ -2400,7 +2400,18 @@ impl DeepseekV4MoeBlock {
                     ctx.stream.cu_stream(),
                 )
                 .result()
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM w13 GEMM failed: {err}"))?;
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "DeepSeek V4 DeepGEMM w13 GEMM failed: {err}; groups={} max_m={} n={} k={} scale_stride_m={} active_experts={} active_counts={:?}",
+                        num_groups_i32,
+                        max_m_i32,
+                        intermediate_i32 * 2,
+                        hidden_i32,
+                        scale_stride_m_i32,
+                        active_experts.len(),
+                        active_counts_host
+                    )
+                })?;
             }
         }
 
@@ -2454,7 +2465,18 @@ impl DeepseekV4MoeBlock {
                     ctx.stream.cu_stream(),
                 )
                 .result()
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM w2 GEMM failed: {err}"))?;
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "DeepSeek V4 DeepGEMM w2 GEMM failed: {err}; groups={} max_m={} n={} k={} scale_stride_m={} active_experts={} active_counts={:?}",
+                        num_groups_i32,
+                        max_m_i32,
+                        hidden_i32,
+                        intermediate_i32,
+                        scale_stride_m_i32,
+                        active_experts.len(),
+                        active_counts_host
+                    )
+                })?;
             }
         }
 
@@ -2995,23 +3017,26 @@ impl DeepseekV4MoeBlock {
                 &[&first.w1, &first.w3, &first.w2],
             )?;
         }
-        ensure!(
-            !matches!(expert_backend, Dsv4ExpertBackend::DeepGemmRequired) || has_moe_scratch,
-            "ARLE_DSV4_EXPERT_BACKEND=deepgemm requires DeepSeek V4 MoE runtime scratch"
-        );
         let count_exchange_mode = dsv4_count_exchange_mode()?;
         let use_padded_dispatch = hidden.seq_len == 1
             && matches!(count_exchange_mode, Dsv4CountExchangeMode::AllGather)
             && dsv4_padded_dispatch_enabled()?;
         let use_fused_dispatch_payload =
             use_padded_dispatch && dsv4_fused_dispatch_payload_enabled()?;
-        let use_deepgemm_experts = match expert_backend {
-            Dsv4ExpertBackend::Native => false,
-            Dsv4ExpertBackend::DeepGemmRequired => true,
-            Dsv4ExpertBackend::DeepGemmAuto => {
-                deepgemm_backend_usable && self.deepgemm_cache.is_some()
-            }
-        };
+        let use_deepgemm_experts = has_moe_scratch
+            && match expert_backend {
+                Dsv4ExpertBackend::Native => false,
+                Dsv4ExpertBackend::DeepGemmRequired => true,
+                Dsv4ExpertBackend::DeepGemmAuto => {
+                    deepgemm_backend_usable && self.deepgemm_cache.is_some()
+                }
+            };
+        ensure!(
+            !matches!(expert_backend, Dsv4ExpertBackend::DeepGemmRequired)
+                || use_deepgemm_experts
+                || hidden.seq_len > 1,
+            "ARLE_DSV4_EXPERT_BACKEND=deepgemm requires DeepSeek V4 MoE runtime scratch for decode"
+        );
         let use_route_grouped_experts =
             use_padded_dispatch && !use_deepgemm_experts && dsv4_route_grouped_experts_enabled()?;
         let use_grouped_experts = use_deepgemm_experts || dsv4_grouped_experts_enabled()?;

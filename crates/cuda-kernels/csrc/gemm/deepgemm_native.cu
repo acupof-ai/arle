@@ -3,13 +3,13 @@
 #ifdef ARLE_ENABLE_DEEPGEMM_NATIVE
 
 #include <cuda_runtime.h>
-#include <nvrtc.h>
 
 #include <sys/wait.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -127,6 +127,7 @@ void* cuda_driver_handle() {
 
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorName);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorString);
+ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuCtxGetCurrent);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuFuncSetAttribute);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLaunchKernelEx);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuTensorMapEncodeTiled);
@@ -269,6 +270,17 @@ void check_driver(CUresult result, const char* what) {
   throw std::runtime_error(out.str());
 }
 
+std::string current_context_key() {
+  CUcontext ctx = nullptr;
+  check_driver(lazy_cuCtxGetCurrent(&ctx), "cuCtxGetCurrent");
+  if (ctx == nullptr) {
+    throw std::runtime_error("DeepGEMM native bridge requires a current CUDA context");
+  }
+  std::ostringstream out;
+  out << "ctx:" << reinterpret_cast<std::uintptr_t>(ctx);
+  return out.str();
+}
+
 KernelHandle load_kernel(
     const std::filesystem::path& cubin_path,
     const std::string& func_name,
@@ -363,13 +375,6 @@ CUresult launch_kernel(KernelHandle kernel, const CUlaunchConfig& config, Args&&
   };
   return lazy_cuLaunchKernelEx(
       const_cast<CUlaunchConfig*>(&config), kernel, ptr_args, nullptr);
-}
-
-void check_nvrtc(nvrtcResult result, const char* what) {
-  if (result == NVRTC_SUCCESS) return;
-  std::ostringstream out;
-  out << what << " failed: " << nvrtcGetErrorString(result);
-  throw std::runtime_error(out.str());
 }
 
 int get_tma_aligned_size(int x, int elem_size) {
@@ -626,8 +631,8 @@ CUtensorMap make_tma_sfa_desc(
     int num_groups,
     int outer_stride) {
   const int aligned_m = get_tma_aligned_size(shape_m, 4);
-  if (outer_stride != aligned_m) {
-    throw std::runtime_error("SFA stride does not match DeepGEMM TMA alignment");
+  if (outer_stride < aligned_m) {
+    throw std::runtime_error("SFA stride is smaller than DeepGEMM TMA alignment");
   }
   return make_tma_2d_desc_raw(
       ptr, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4, aligned_m,
@@ -679,80 +684,52 @@ std::filesystem::path cache_root() {
   return std::filesystem::path(home) / ".deep_gemm";
 }
 
-std::string arch_flag(int major, int minor, int nvrtc_major, int nvrtc_minor) {
+std::string arch_flag(int major, int minor, int cuda_major, int cuda_minor) {
   if (major == 10 && minor != 1) {
-    return (nvrtc_major > 12 || (nvrtc_major == 12 && nvrtc_minor >= 9)) ? "100a"
-                                                                         : "100";
+    return (cuda_major > 12 || (cuda_major == 12 && cuda_minor >= 9)) ? "100a"
+                                                                      : "100";
   }
   return std::to_string(major * 10 + minor) + "a";
 }
 
-std::string compile_with_nvrtc(
-    const std::string& code,
+void compile_with_nvcc(
+    const std::filesystem::path& code_path,
     const std::filesystem::path& cubin_path,
     int major,
     int minor) {
-  int nvrtc_major = 0;
-  int nvrtc_minor = 0;
-  check_nvrtc(nvrtcVersion(&nvrtc_major, &nvrtc_minor), "nvrtcVersion");
-
   const auto library_root =
       std::filesystem::path(non_empty_env(
           "ARLE_DEEPGEMM_LIBRARY_ROOT", ARLE_DEEPGEMM_DEFAULT_LIBRARY_ROOT));
   const auto source_root = library_root.parent_path();
   const auto cuda_home = cuda_home_path();
+  const auto nvcc = cuda_home / "bin" / "nvcc";
   const char* cutlass_env = std::getenv("ARLE_DEEPGEMM_CUTLASS_INCLUDE");
   const auto cutlass_include =
       cutlass_env != nullptr && cutlass_env[0] != '\0'
           ? std::filesystem::path(cutlass_env)
           : source_root / "third-party/cutlass/include";
 
-  std::vector<std::string> options = {
-      "-std=c++20",
-      "--diag-suppress=39,161,174,177,186,940",
-      "--ptxas-options=--register-usage-level=10",
-      "--expt-relaxed-constexpr",
-      "--device-int128",
-      "-default-device",
-      "--gpu-architecture=sm_" + arch_flag(major, minor, nvrtc_major, nvrtc_minor),
-      "-I" + (library_root / "include").string(),
-      "-I" + cutlass_include.string(),
-      "-I" + (cuda_home / "include").string(),
-  };
-  if (nvrtc_major > 12 || (nvrtc_major == 12 && nvrtc_minor >= 8)) {
-    options.push_back("--pch");
+  std::ostringstream command;
+  command << shell_quote(nvcc)
+          << " " << shell_quote(code_path)
+          << " -cubin"
+          << " -o " << shell_quote(cubin_path)
+          << " -O3"
+          << " -std=c++20"
+          << " --expt-relaxed-constexpr"
+          << " --expt-extended-lambda"
+          << " --diag-suppress=39,161,174,177,186,940"
+          << " --ptxas-options=--register-usage-level=10"
+          << " --compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi"
+          << " --gpu-architecture=sm_" << arch_flag(major, minor, 12, 9)
+          << " -I" << shell_quote(library_root / "include")
+          << " -I" << shell_quote(cutlass_include)
+          << " -I" << shell_quote(cuda_home / "include");
+
+  const auto [exit_code, output] = run_capture(command.str());
+  if (exit_code != 0) {
+    throw std::runtime_error("NVCC DeepGEMM compile failed:\n" + output);
   }
-
-  std::vector<const char*> option_ptrs;
-  option_ptrs.reserve(options.size());
-  for (const auto& option : options) option_ptrs.push_back(option.c_str());
-
-  nvrtcProgram program = nullptr;
-  check_nvrtc(
-      nvrtcCreateProgram(&program, code.c_str(), "deepgemm_native.cu", 0, nullptr, nullptr),
-      "nvrtcCreateProgram");
-  nvrtcResult compile_result =
-      nvrtcCompileProgram(program, static_cast<int>(option_ptrs.size()), option_ptrs.data());
-
-  size_t log_size = 0;
-  check_nvrtc(nvrtcGetProgramLogSize(program, &log_size), "nvrtcGetProgramLogSize");
-  std::string log;
-  if (log_size > 1) {
-    log.resize(log_size);
-    check_nvrtc(nvrtcGetProgramLog(program, log.data()), "nvrtcGetProgramLog");
-  }
-  if (compile_result != NVRTC_SUCCESS) {
-    nvrtcDestroyProgram(&program);
-    throw std::runtime_error("NVRTC DeepGEMM compile failed:\n" + log);
-  }
-
-  size_t cubin_size = 0;
-  check_nvrtc(nvrtcGetCUBINSize(program, &cubin_size), "nvrtcGetCUBINSize");
-  std::string cubin(cubin_size, '\0');
-  check_nvrtc(nvrtcGetCUBIN(program, cubin.data()), "nvrtcGetCUBIN");
-  check_nvrtc(nvrtcDestroyProgram(&program), "nvrtcDestroyProgram");
-  write_binary_file(cubin_path, cubin);
-  return log;
 }
 
 #ifndef DG_JIT_USE_LIBRARY_ENUM_KERNELS
@@ -795,21 +772,17 @@ std::shared_ptr<NativeRuntime> get_or_build_runtime(
   const std::string key = name + "$$" + arch_flag(major, minor, 12, 9) + "$$" + code;
   const std::string digest = hex_digest(key);
 
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  if (auto it = g_runtimes.find(digest); it != g_runtimes.end()) {
-    return it->second;
-  }
-
   const auto dir = cache_root() / "cache" / ("kernel." + name + "." + digest);
   const auto cubin_path = dir / "kernel.cubin";
   const auto code_path = dir / "kernel.cu";
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (!std::filesystem::exists(cubin_path)) {
     const auto tmp = cache_root() / "tmp" / ("arle-" + digest);
     std::filesystem::create_directories(tmp);
     const auto tmp_cubin = tmp / "kernel.cubin";
     const auto tmp_code = tmp / "kernel.cu";
     write_binary_file(tmp_code, code);
-    compile_with_nvrtc(code, tmp_cubin, major, minor);
+    compile_with_nvcc(tmp_code, tmp_cubin, major, minor);
     std::filesystem::create_directories(dir.parent_path());
     std::error_code ec;
     std::filesystem::rename(tmp, dir, ec);
@@ -821,6 +794,11 @@ std::shared_ptr<NativeRuntime> get_or_build_runtime(
     write_binary_file(code_path, code);
   }
 
+  const std::string runtime_key = digest + "$$" + current_context_key();
+  if (auto it = g_runtimes.find(runtime_key); it != g_runtimes.end()) {
+    return it->second;
+  }
+
   auto runtime = std::make_shared<NativeRuntime>();
 #ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
   const std::string symbol;
@@ -829,7 +807,7 @@ std::shared_ptr<NativeRuntime> get_or_build_runtime(
 #endif
   runtime->kernel = load_kernel(cubin_path, symbol, &runtime->library);
   runtime->loaded = true;
-  g_runtimes.emplace(digest, runtime);
+  g_runtimes.emplace(runtime_key, runtime);
   return runtime;
 }
 
@@ -926,7 +904,7 @@ extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   if ((k % kScaleGranK) != 0 || (n % 8) != 0 ||
-      sfa_aligned_m != get_tma_aligned_size(m, sizeof(float))) {
+      sfa_aligned_m < get_tma_aligned_size(m, sizeof(float))) {
     return CUDA_ERROR_INVALID_VALUE;
   }
 

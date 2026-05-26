@@ -1386,7 +1386,6 @@ fn main() {
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cublasLt");
     if enable_deepgemm_native {
-        println!("cargo:rustc-link-lib=nvrtc");
         println!(
             "cargo:warning=DeepGEMM native bridge enabled, root={}",
             deepgemm_root.display()

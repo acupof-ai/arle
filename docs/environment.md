@@ -299,28 +299,33 @@ as diagnostics and validation gates, not stable tuning API.
 | `ARLE_DSV4_ROUTE_GROUPED_EXPERTS` | `1` / unset | unset | Enables the route-wise grouped local expert experiment for padded B=1 decode. The opt-in path pairs route-local `w1`/`w3` GEMV when DSv4 block-scaled formats match and applies route weights after BF16 `w2` output to preserve baseline rounding. It removes D2H from the filtered decode nsys summary, but remains default-off: 2026-05-26 validation improved short decode only -4.60% and regressed longseq `max_tokens=32` by +1.36%. Use only for diagnostics until replaced by true grouped GEMM/DeepGEMM with DeepEP overlap. |
 | `ARLE_DSV4_EXPERT_BACKEND` | `native`, `deepgemm-auto`, `deepgemm` | `native` | Selects the DSv4 local expert backend. `native` keeps the current per-expert/raw grouped GEMV paths. `deepgemm-auto` builds the resident FP8 expert-weight cache, attempts the optional DeepGEMM masked grouped GEMM bridge on SM90, and falls back to native with a one-time reason. `deepgemm` makes that bridge required and fails fast on build/runtime incompatibility. |
 | `ARLE_DSV4_DEEPGEMM_WEIGHT_CACHE` | `1` / unset | unset | Builds the DSv4 routed-expert FP8 E4M3 + FP32-scale cache at load time without selecting the runtime DeepGEMM backend. On H20/SM90 this is the required conversion boundary for FP4 Flash experts before DeepGEMM masked/contiguous grouped GEMM can replace raw GEMV. It fuses `w1`/`w3` rows into one gate/up cache and builds a separate `w2` cache. |
-| `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE` | `1` / unset | unset | Build-time switch for the optional raw-pointer DeepGEMM C ABI bridge. Requires CUDA, NVRTC, and DeepGEMM/CUTLASS sources; without it the backend symbol returns `CUDA_ERROR_NOT_SUPPORTED` so `deepgemm-auto` can fall back cleanly. `ARLE_CUDA_ENABLE_DEEPGEMM_TORCH=1` is accepted as a compatibility alias but no longer links PyTorch. |
+| `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE` | `1` / unset | unset | Build-time switch for the optional raw-pointer DeepGEMM C ABI bridge. Requires CUDA driver/runtime libs and DeepGEMM/CUTLASS sources; runtime JIT uses `${CUDA_HOME}/bin/nvcc` plus `cuobjdump`, so the CUDA bin tools must be present. Without this switch the backend symbol returns `CUDA_ERROR_NOT_SUPPORTED` so `deepgemm-auto` can fall back cleanly. `ARLE_CUDA_ENABLE_DEEPGEMM_TORCH=1` is accepted as a compatibility alias but no longer links PyTorch. |
 | `ARLE_DEEPGEMM_ROOT` | path | `crates/cuda-kernels/vendor/deepgemm` | Build-time DeepGEMM source root for the optional native bridge. Use a recursive upstream clone when the vendored third-party submodules are not populated. |
 | `ARLE_DEEPGEMM_LIBRARY_ROOT` | path | `${ARLE_DEEPGEMM_ROOT}/deep_gemm` | Runtime DeepGEMM JIT library root consumed by the native bridge. Set this when the runtime source tree differs from the build-time path. |
-| `ARLE_DEEPGEMM_CUTLASS_INCLUDE` | path | `${ARLE_DEEPGEMM_ROOT}/third-party/cutlass/include` | Optional runtime CUTLASS include override for the native NVRTC JIT path. |
+| `ARLE_DEEPGEMM_CUTLASS_INCLUDE` | path | `${ARLE_DEEPGEMM_ROOT}/third-party/cutlass/include` | Optional runtime CUTLASS include override for the native NVCC JIT path. |
 | `ARLE_DSV4_COMBINE_DTYPE` | `bf16`, `fp8`, unset | `bf16` | Selects the return-side MoE combine exchange payload. `fp8` is validated as an opt-in experiment but is not faster than the BF16 default on the current 8xH20 trace. |
 | `ARLE_DSV4_COMBINE_OVERLAP` | `1`, `0`, unset | unset | Enables the opt-in return-side MoE reduce-scatter overlap experiment. It creates a second EP NCCL communicator on `comm_stream` and returns a routed-output fence so shared expert compute can run before consuming routed output. Real 8xH20 nsys returns exact `406`, but regresses the single-token decode wave from 94.841 ms to 104.359 ms, so the default remains off. |
 
-Current DSv4 8-rank validation command shape:
+Canonical DSv4 toolchain helper:
 
 ```bash
-ARLE_DSV4_MOE_BACKEND=deepep \
-ARLE_DSV4_INCREMENTAL_KV=1 \
-INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 \
-./target/release/infer \
-  --model-path /root/DeepSeek-V4-Flash \
-  --port 18084 \
-  --max-seq-len 900000 \
-  --kv-cache-dtype fp8 \
-  --num-slots 1 \
-  --deepseek-distributed-layers 43 \
-  --mem-fraction-static 0.1
+export ARLE_DSV4_MODEL_PATH=<local-dsv4-model-path>
+export ARLE_DEEPGEMM_ROOT=<deepgemm-source-root>
+export ARLE_DEEPGEMM_LIBRARY_ROOT=${ARLE_DEEPGEMM_ROOT}/deep_gemm
+
+./scripts/dsv4_toolchain.sh env-check
+./scripts/dsv4_toolchain.sh build
+./scripts/dsv4_toolchain.sh smoke --max-tokens 32
+./scripts/dsv4_toolchain.sh nsys --max-tokens 32
 ```
+
+The helper validates CUDA/NVCC, NCCL, DeepGEMM/CUTLASS, model path, and
+decode token count before running. Build uses `cargo build --release -p infer
+--features cuda,nccl --bin infer` with `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`.
+Smoke/nsys default to the 8-rank DSv4 validation envelope (`num_slots=1`,
+`mem_fraction_static=0.10`, FP8 KV, 43 distributed layers). `max_tokens=1`
+must only be used for explicit prefill/TTFT smoke outside this helper; decode
+evidence uses `max_tokens>=32`.
 
 ### `INFER_TILELANG_PYTHON`
 

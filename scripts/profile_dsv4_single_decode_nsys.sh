@@ -8,11 +8,11 @@
 
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/root/DeepSeek-V4-Flash}"
+MODEL_PATH="${MODEL_PATH:-${ARLE_DSV4_MODEL_PATH:-/data01/models/DeepSeek-V4-Flash}}"
 SERVER_BIN="${SERVER_BIN:-target/release/infer}"
 OUT="${OUT:-docs/trace-artifacts/2026-05-15-dsv4-deepep/nsys-single-decode-token-attention-scratch}"
 PORT="${PORT:-18188}"
-MAX_TOKENS="${MAX_TOKENS:-2}"
+MAX_TOKENS="${MAX_TOKENS:-32}"
 PROMPT="${PROMPT:-Compute 137 + 269. Answer with the number only.}"
 MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash}"
 
@@ -26,7 +26,7 @@ Options:
   --model-path DIR   model path (default: ${MODEL_PATH})
   --server-bin PATH  infer binary (default: ${SERVER_BIN})
   --prompt TEXT      prompt for warmup/profile request
-  --max-tokens N     request max_tokens; must be >=2 for a decode range
+  --max-tokens N     request max_tokens; must be >=32 for decode evidence
   -h, --help         show this help
 
 Environment:
@@ -51,8 +51,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if (( MAX_TOKENS < 2 )); then
-    echo "error: --max-tokens must be >=2; max_tokens=1 exits from prefill" >&2
+if (( MAX_TOKENS < 32 )); then
+    echo "error: --max-tokens must be >=32; max_tokens=1 exits from prefill and shorter runs are smoke-only" >&2
     exit 2
 fi
 
