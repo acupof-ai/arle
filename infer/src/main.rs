@@ -125,6 +125,11 @@ struct Args {
     #[arg(long)]
     prefill_max_requests: Option<usize>,
 
+    /// Maximum number of cold long-prefill requests to keep active at once.
+    /// Defaults to 4; short prompts and prefix hits bypass this cap.
+    #[arg(long)]
+    long_prefill_active_limit: Option<usize>,
+
     /// Request scheduling policy. ARLE CUDA currently implements SGLang's
     /// default `fcfs`; other policy names are rejected instead of accepted as
     /// no-ops.
@@ -141,9 +146,9 @@ struct Args {
     #[arg(long)]
     cold_headroom: Option<usize>,
 
-    /// Decode-active prefill policy: `split` keeps production prefill+decode
-    /// launches separate; `mixed` opts into the experimental single mixed launch.
-    #[arg(long, default_value = "split")]
+    /// Decode-active prefill policy. `mixed` is the only operator-facing mode;
+    /// models without a mixed lowering fall back internally.
+    #[arg(long, default_value = "mixed")]
     scheduler_mixed_policy: String,
 
     /// SGLang-compatible streaming interval in generated tokens.
@@ -182,12 +187,12 @@ struct Args {
     #[arg(long)]
     disable_radix_cache: bool,
 
-    /// Disable short-prompt bypass for prefix prefetch and split scheduling.
+    /// Disable short-prompt bypass for prefix prefetch and mixed scheduling.
     #[arg(long)]
     disable_short_prompt_bypass: bool,
 
     /// Prompt length at or below which ARLE skips staged prefix prefetch and
-    /// avoids decode+prefill split launches.
+    /// avoids decode+prefill mixed launches.
     #[arg(long, default_value_t = 256)]
     short_prompt_bypass_tokens: usize,
 
@@ -214,14 +219,23 @@ struct Args {
     /// modes "tq2"/"tq3"/"tq4". FP8 and TurboQuant keep the contiguous prefill
     /// cache in BF16 and quantize when migrating into the paged token pool.
     ///
-    /// `auto` selects BF16 paged pool — the only mode currently validated by
-    /// the cross-precision parity audit (`infer/tests/kv_precision_parity.rs`,
-    /// `docs/plans/2026-05-25-kv-precision-parity-framework.md`). FP8 / INT8
-    /// remain opt-in: FP8 catastrophically diverges at the first decode token
-    /// (~0.4% trajectory match at 256-token horizon, per 2026-05-25 audit);
-    /// INT8 drifts at long-decode (~89% trajectory match at the same horizon).
-    /// Both are usable for throughput experiments but not for correctness-
-    /// sensitive workloads until Phase 3 root-cause work lands.
+    /// `auto` selects BF16 paged pool — the production-safe default for all
+    /// Qwen3 / Qwen3.5 models. Opt-in alternatives, ordered by quality
+    /// (parity audit `infer/tests/kv_precision_parity.rs`, 2026-05-26):
+    ///
+    /// - `int8`: production-quality quantized KV. Qwen3-dense parity_match=1.0
+    ///   at 64-token horizon; small long-decode drift (~89%) past ~240 tokens.
+    ///   Recommended quantized choice for memory savings on deep dense models.
+    /// - `fp8`: experimental memory mode. Catastrophic step-1 divergence on
+    ///   Qwen3-dense (36 full-attention layers — FP8 E4M3's non-uniform 256
+    ///   levels lose resolution to BF16 truncation as K/V scales shrink 10×
+    ///   through deeper layers). Only acceptable on shallower full-attention
+    ///   stacks (e.g. Qwen3.5 hybrid's 8 full-attn layers, where FP8 = mild
+    ///   prompt-dependent drift). See
+    ///   `docs/experience/errors/2026-05-26-fp8-kv-step1-divergence-known-deferred.md`.
+    /// - `tq2`/`tq3`/`tq4`: TurboQuant 4-bit FWHT. Extreme memory mode; greedy
+    ///   token-trajectory parity not preserved by design — use only when
+    ///   memory pressure outweighs per-token output equivalence.
     #[arg(long, default_value = "auto")]
     kv_cache_dtype: String,
 
@@ -1525,6 +1539,7 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
     let mut config = SchedulerConfig {
         max_num_batched_tokens: args.max_num_batched_tokens,
         prefill_max_requests: args.prefill_max_requests,
+        long_prefill_active_limit: args.long_prefill_active_limit.or(Some(4)),
         short_prompt_bypass_tokens: if args.disable_short_prompt_bypass {
             0
         } else {

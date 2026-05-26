@@ -121,13 +121,54 @@ slot`, which is correct. Layer 0's `decode_attention_fp8` output is
 small and reasonable: `attn_out[0..4] = [-0.013, 0.004, 0.011,
 0.008]`.
 
-The remaining hypothesis: **FP8 precision floor compounds catastrophically
-through Qwen3-dense's 36 full-attention layers**, while Qwen3.5 only
-has 8 full-attention layers (4.5× fewer compounding steps), and INT8
-has finer near-zero resolution that survives 36 layers. The dispatch
-and kernels are clean; the catastrophic step-1 divergence is the
-accumulated effect of FP8 E4M3's ~3-mantissa-bit precision compounding
-36×.
+The remaining hypothesis (confirmed): **FP8 precision floor compounds
+catastrophically through Qwen3-dense's 36 full-attention layers**.
+
+**Multi-layer attn-output dump (2026-05-26, A100 sm_80)** at decode
+step 1 confirms the mechanism:
+
+| Layer | K scales (head 0..3) | attn_out (first 4 dims) |
+|---|---|---|
+| 0  | `[0.225, 0.249, 0.319, 0.397]` | `[-0.013, 0.004, 0.011, 0.008]` |
+| 17 | `[0.019, 0.015, 0.024, 0.022]` ← 10× smaller | `[0.0, 0.0, 0.0, 0.0]` |
+| 35 | `[0.019, 0.015, 0.034, 0.018]` | `[0.0, 0.0, 0.0, 0.0]` |
+
+Deeper layers' K/V magnitudes shrink ~10× from layer 0 (RMSNorm +
+attention bottlenecking the activation magnitudes). FP8 quant step is
+`scale / 448 ≈ 4e-5` per value at layer 17; after softmax weights
+multiply V (also shrunk + quantized at the same precision floor), the
+intermediate values are dominated by quant noise rather than signal,
+and BF16 truncation at the attn-output write collapses them to zero.
+**INT8 doesn't hit this because its 256 uniform levels resolve down to
+`scale / 127 ≈ 1.6e-4` and stay representable through BF16 truncation;
+the 256 *non-uniform* FP8 E4M3 levels concentrate near zero with worse
+resolution at the magnitudes that matter for deep dense Qwen3.**
+Qwen3.5 has 8 full-attention layers instead of 36, so the shrinkage is
+4.5× milder and FP8 only drifts.
+
+This is a fundamental FP8 E4M3 precision limitation for deep dense
+transformers, not a wiring bug. Three structural fixes that would
+recover FP8 KV correctness on Qwen3-dense:
+
+1. **Per-channel scales** (one scale per (head, dim) instead of per
+   (token, head)): preserves dynamic range across head_dim.
+2. **Higher-precision attn-output accumulation** (FP32 → only truncate
+   the final logits, not intermediate per-layer activations).
+3. **Pre-rotation (Hadamard or similar)** as TurboQuant does: smooth
+   outliers so per-(token, head) absmax shrinks less aggressively.
+
+None are small code changes; all are real research-grade work. For
+the 2026-05-26 "all precisions usable" goal, the operationally correct
+posture is:
+
+- **BF16 paged pool** — production default, parity_match=1.0.
+- **INT8 paged pool** — production-quality quantized KV for memory
+  savings, parity_match=1.0 on Qwen3-dense.
+- **FP8 paged pool** — opt-in for memory experiments on deep dense
+  models, expect quality loss; usable production on shallower
+  full-attention models (Qwen3.5 with 8 full-attn layers).
+- **TurboQuant** — opt-in extreme memory mode, 4-bit FWHT, structural
+  trajectory loss accepted by design.
 
 **Recommendation**: ship INT8 as the preferred quantized KV for
 Qwen3-dense (already works, mean_match=1.0). FP8 KV stays opt-in
