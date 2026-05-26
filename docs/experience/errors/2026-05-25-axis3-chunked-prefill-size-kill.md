@@ -178,3 +178,16 @@ Do not change the L4 default chunked-prefill size. Keep the resolved default at
 Do not default larger chunked-prefill sizes from TTFT alone. The acceptance
 gate must include ITL and output throughput because larger chunks can move the
 loss from prefill queueing into decode starvation.
+
+## 2026-05-26 Qwen3.5 Hybrid Follow-up
+
+V100/Qwen3.5 hybrid mixed repeated the same conclusion after the HTTP
+streaming cancellation bug was fixed and Qwen3.5 prefill concurrency was capped
+at 2:
+
+- raw artefacts: `/home/chenkailun.c/agent-infer-v100-audit/bench-output/2026-05-26-hybrid-mixed-cancel-prefillcap2-v100-c16-cap2-chunk4096`
+- c16 `chunk=2048`: TTFT p50 9760.2 ms, ITL p50 170.10 ms, out tok/s 10.52
+- c16 `chunk=4096`: TTFT p50 9775.3 ms, ITL p50 173.13 ms, out tok/s 8.27
+
+So `4096` is also killed for the hybrid path: no TTFT win, worse ITL, worse
+output throughput, and TTFT p95 widened to 53079.9 ms.
