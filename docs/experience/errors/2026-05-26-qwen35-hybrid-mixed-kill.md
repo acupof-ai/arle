@@ -1,105 +1,136 @@
-# Qwen3.5 Hybrid Mixed KILL — plan=mixed is not enough
+# Qwen3.5 Hybrid Mixed KILL - mixed triggers, SLO gate still fails
 
 ## Context
 
 Follow-up to [`docs/plans/2026-05-25-cuda-perf-codex-collab.md`](../../plans/2026-05-25-cuda-perf-codex-collab.md)
-Axis 2. L4 was unavailable, so the CUDA validation ran on V100 in
-`/home/chenkailun.c/agent-infer-v100-audit` with cached `Qwen3.5-4B`.
+Axis 2 and Axis 3. L4 was unavailable, so the follow-up validation ran on V100
+in `/home/chenkailun.c/agent-infer-v100-audit` with cached `Qwen3.5-4B`.
 
-Goal: remove the scheduler Split fallback and make Qwen3.5 hybrid support the
-same mixed decode+prefill contract as Qwen3 dense.
-
-The first experiment tried a prefill-backed shortcut and was killed because
-decode rows ran through the paged-prefill path. The second experiment kept
-decode rows on Qwen3.5's optimized `decode_batch` path and ran prefill rows via
-`prefill_forward_paged_batch` inside `forward_mixed_batch`.
+Goal: make Qwen3.5 hybrid support the same mixed decode+prefill contract as
+Qwen3 dense, then validate whether `mixed_policy=Mixed` and larger chunked
+prefill can be defaulted.
 
 ## Evidence
 
-Build passed on V100:
+Remote build passed:
 
-- `CUDA_HOME=/usr/local/cuda-12.4`
-- `TORCH_CUDA_ARCH_LIST=7.0`
+- V100-SXM2-32GB, CUDA 12.4, `TORCH_CUDA_ARCH_LIST=7.0`
 - `cargo build --release -p infer --bin infer --features cuda`
+- server flags shared unless stated: `--num-slots 16 --max-seq-len 5120`
+- GuideLLM shape: 4096 input tokens, 256 output tokens, `max-seconds=60`,
+  `warmup=5`
 
-GuideLLM shape for all probes:
+Local checks passed:
 
-- `--concurrencies 16`
-- `--max-seconds 60`
-- `--warmup 5`
-- prompt 4096 tokens, output 256 tokens
-- server `--num-slots 16 --max-seq-len 5120`
+- `cargo test --release -p infer`: 595 passed, 14 ignored
+- `cargo test --release`: 5 CLI tests passed
+- `cargo test --release -p infer --test e2e`: 0 local GPU tests
+- `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
 
-| experiment | raw artifacts | plan evidence | GuideLLM result |
-|---|---|---|---|
-| prefill-backed mixed | `bench-output/2026-05-26-axis2-qwen35-mixed-v100-run3/` | `plan=mixed` appeared | c=16 invalid, 0 successful |
-| decode-first, cap=512, rows=1 | `bench-output/2026-05-26-axis2-qwen35-hybrid-mixed-v100-cap512/` | mixed=190, split=0 | c=16 invalid, 0 successful |
-| decode-first, cap=2048, rows=1 | `bench-output/2026-05-26-axis2-qwen35-hybrid-mixed-v100-cap2048-c16probe/` | mixed active | c=16 invalid, 0 successful |
-| decode-first, cap=2048, rows=4 | `bench-output/2026-05-26-axis2-qwen35-hybrid-mixed-v100-rows4-c16probe/` | mixed=18, split=0 | invalid; paged prefill OOM |
-| decode-first, cap=2048, rows=2 + continuation queue-front | `bench-output/2026-05-26-axis2-qwen35-hybrid-mixed-v100-frontqueue-c16probe/` | mixed=37, split=0 | invalid, 0 successful, 66 incomplete output tokens |
-| decode-first, cap=512, rows=1 + continuation queue-front | `bench-output/2026-05-26-axis2-qwen35-hybrid-mixed-v100-frontqueue-cap512-c16probe/` | mixed=255, split=0 | invalid, 0 successful, 614 incomplete output tokens |
+### Cancellation bug fixed during the run
 
-Representative failure logs:
+Before the final sweeps, `/v1/completions` streaming cancellation was not
+propagating to the scheduler: `trace_streaming_deltas()` kept draining the
+scheduler receiver after the HTTP client disconnected, so
+`delta_tx.is_closed()` never became true. This polluted c-sweeps because stale
+requests kept running after GuideLLM closed a window.
+
+After dropping the scheduler receiver immediately on client disconnect, service
+trace showed active requests draining between windows and the c-sweeps became
+valid. The unit test added for this bug verifies that the scheduler sender
+observes closed after the client receiver is dropped.
+
+### Axis 2: Qwen3.5 hybrid mixed
+
+Raw artefacts:
+
+- invalid cap=4: `/home/chenkailun.c/agent-infer-v100-audit/bench-output/2026-05-26-hybrid-mixed-cancel-v100-csweep-cap3-chunk2048`
+- cap=3, chunk=2048: `/home/chenkailun.c/agent-infer-v100-audit/bench-output/2026-05-26-hybrid-mixed-cancel-prefillcap2-v100-csweep-cap3-chunk2048`
+- cap=2, chunk=2048: `/home/chenkailun.c/agent-infer-v100-audit/bench-output/2026-05-26-hybrid-mixed-cancel-prefillcap2-v100-csweep-cap2-chunk2048`
+
+Plan labels for the best valid variants:
 
 ```text
-plan=mixed reason=mixed_policy_supported launch_order=single_mixed_launch
-decode=phase:10,runnable:10 selected_prefill_rows=2 selected_prefill_tokens=2049
-phase_us.decode=912162 phase_us.prefill=1482160 phase_us.total=2396743
+cap=3/chunk=2048: idle=20773, decode=2049, prefill=25, split=0, mixed=21
+cap=2/chunk=2048: idle=23849, decode=2568, prefill=34, split=0, mixed=14
 ```
 
-```text
-qwen35 mixed prefill rows=2 total_tokens=4096
-caused by: Alloc chunk_state failed: DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
-```
+V100 c-sweep:
+
+| config | c | TTFT p50 ms | ITL p50 ms | out tok/s | notes |
+|---|---:|---:|---:|---:|---|
+| cap=3, chunk=2048 | 1 | 4182.4 | 33.50 | 21.52 | valid |
+| cap=3, chunk=2048 | 4 | 11264.0 | 178.91 | 14.16 | valid |
+| cap=3, chunk=2048 | 8 | 11297.7 | 178.91 | 14.16 | valid |
+| cap=3, chunk=2048 | 16 | 11387.5 | 166.43 | 10.74 | valid |
+| cap=2, chunk=2048 | 1 | 4195.7 | 33.48 | 21.52 | valid |
+| cap=2, chunk=2048 | 4 | 8924.7 | 163.68 | 8.55 | c4/c8 p95 TTFT >52s |
+| cap=2, chunk=2048 | 8 | 8927.9 | 163.65 | 8.55 | c4/c8 p95 TTFT >52s |
+| cap=2, chunk=2048 | 16 | 9760.2 | 170.10 | 10.52 | best c16 TTFT |
+
+cap=4 is not viable on V100. It produced an invalid GuideLLM result and server
+logs showed:
 
 ```text
-guidellm validation failed:
-  - conc16: no successful requests recorded
+qwen35 prefill_forward_paged_batch requests=3 total_tokens=6145
+caused by: Alloc failed: DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
 ```
+
+Against the original L4 acceptance baseline supplied in the plan
+(`c16 TTFT=12913 ms, ITL=71.85 ms, out tok/s=164`), the V100 c16 TTFT can be
+made lower, but ITL and output throughput regress far beyond the gate. The GPU
+is different, so this is not a clean baseline comparison; it is still enough to
+reject defaulting Qwen3.5 hybrid mixed from this evidence.
+
+### Axis 3: chunk=4096 follow-up
+
+Raw artefacts:
+
+- `/home/chenkailun.c/agent-infer-v100-audit/bench-output/2026-05-26-hybrid-mixed-cancel-prefillcap2-v100-c16-cap2-chunk4096`
+
+The 4096 chunk probe did not improve c16:
+
+| config | c | TTFT p50 ms | ITL p50 ms | out tok/s |
+|---|---:|---:|---:|---:|
+| cap=2, chunk=2048 | 16 | 9760.2 | 170.10 | 10.52 |
+| cap=2, chunk=4096 | 16 | 9775.3 | 173.13 | 8.27 |
+
+chunk=4096 also widened c16 TTFT p95 to 53079.9 ms. Do not use it as the
+hybrid default.
 
 ## Root Cause
 
-Qwen3.5 hybrid mixed cannot be made valid by only adding
-`supports_mixed_batch()` and sequencing `decode_batch` plus paged prefill inside
-one model method.
+The implementation reached a real mixed path: `split=0` and `mixed>0`, with
+decode rows staying on Qwen3.5 decode kernels and prefill rows using paged
+hybrid prefill. That fixed the earlier false-negative where mixed silently
+fell back or used the wrong row semantics.
 
-The decode-first path fixed the semantic bug from the prefill-backed shortcut:
-decode rows used the optimized recurrent/full-attention decode kernels. It still
-failed the SLO gate because each mixed tick also carried expensive hybrid
-prefill work. At c=16, mixed ticks reached hundreds of milliseconds to seconds,
-so incomplete requests received some tokens but no request completed 256 output
-tokens inside the 60s GuideLLM window.
+The remaining failure is performance, not planner reachability:
 
-Two scheduler-side findings are separate:
-
-- Requeueing partial prefill chunks at the tail amplifies TTFT because many
-  sessions receive their first prefill chunk before an already-started prompt
-  reaches its prefill completion token.
-- Moving continuations to the queue front improves first-token order, but does
-  not make this mixed implementation acceptable. Decode ITL still collapses
-  while hybrid prefill remains inside mixed ticks.
-
-Rows=4 is not viable on V100 because Qwen3.5 paged-prefill scratch OOMs. Rows=2
-also hit OOM in mixed prefill after sustained c=16 pressure. Rows=1 with cap=512
-avoids the immediate OOM but still produces 0 completed requests.
+- Qwen3.5 hybrid prefill is too expensive to colocate with decode in a 60s
+  high-concurrency GuideLLM window on V100.
+- cap=4 allows 3-row prefill batches and OOMs on V100.
+- cap=3 keeps throughput slightly better but c16 TTFT remains ~11.4s and only a
+  small number of requests complete.
+- cap=2 improves c16 TTFT to ~9.8s but c4/c8 throughput and tail TTFT regress.
+- chunk=4096 moves cost into larger prefill steps and worsens throughput/tail.
 
 ## Fix
 
-Kill and revert the runtime experiment. Do not mark Qwen3.5 hybrid as
-`supports_mixed_batch()` yet, and do not delete Split/default Mixed under the
-claim that Qwen3.5 is now covered.
+Do not land Qwen3.5 hybrid mixed as the default based on this run. The useful
+pieces can be kept as follow-up candidates, but not as a perf win:
 
-Qwen3.5 needs one of these before mixed can land:
-
-- a real integrated hybrid mixed forward that does not serialize a full decode
-  pass plus a full prefill pass per tick;
-- or a scheduler/runtime split that lets decode sample/readback complete before
-  prefill work occupies the stream;
-- plus a SLO-aware mixed prefill budget validated by c=1,4,8,16.
+- keep the HTTP streaming cancellation fix;
+- keep `max_concurrent_prefill_requests <= 2` as the V100 safety bound if
+  hybrid mixed remains enabled for experiments;
+- keep `chunked_prefill_size=2048` for this workload;
+- require a kernel-level hybrid prefill/decode optimization or SLO-aware
+  admission policy before revisiting default Mixed for Qwen3.5 hybrid.
 
 ## Rule
 
-`plan=mixed` counters are necessary evidence, not sufficient evidence. A mixed
-path only counts if the c-sweep has valid GuideLLM completions and no TTFT/ITL
-or throughput regression beyond the gate.
-
+`plan_label=mixed` is only reachability evidence. It is not a license to land.
+The c-sweep must have valid completions and must pass TTFT, ITL, and throughput
+gates. Client cancellation must also propagate to the scheduler before using
+GuideLLM c-sweeps as evidence, otherwise stale requests contaminate later
+concurrency windows.
