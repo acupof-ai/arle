@@ -360,7 +360,7 @@ fn main() {
 /// (set to a pipe write-end the coordinator holds). When the coordinator
 /// dies or closes the pipe, the read returns EOF / error and the worker
 /// exits 0. This avoids zombie workers if the coordinator crashes mid-flight.
-fn run_worker_mode(_args: &Args, rank: usize) -> anyhow::Result<()> {
+fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
     use std::io::Read;
     use std::os::fd::FromRawFd;
 
@@ -368,38 +368,95 @@ fn run_worker_mode(_args: &Args, rank: usize) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("worker missing WORLD_SIZE env (set by coordinator)"))?
         .parse()
         .map_err(|err| anyhow::anyhow!("worker WORLD_SIZE parse: {err}"))?;
+    let cuda_ordinal: usize = std::env::var("INFER_CUDA_DEVICE")
+        .map_err(|_| anyhow::anyhow!("worker missing INFER_CUDA_DEVICE env"))?
+        .parse()
+        .map_err(|err| anyhow::anyhow!("worker INFER_CUDA_DEVICE parse: {err}"))?;
 
     info!(
-        "[arle-worker pid={} rank={rank}/{world_size}] starting (scaffolding only — request relay pending B-1 commit C)",
+        "[arle-worker pid={} rank={rank}/{world_size} cuda_ordinal={cuda_ordinal}] starting",
         std::process::id()
     );
 
-    // TODO(B-1 commit C): boot the rank-R scheduler here. For now we just
-    // hold the parent pipe and exit when it closes, validating the launcher
-    // → worker → shutdown lifecycle without touching the model load path.
+    let model_path = args
+        .model_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("worker model_path must be valid UTF-8"))?;
+    let resolved_model_path = hf_hub::resolve_model_path(model_path)
+        .map_err(|err| anyhow::anyhow!("worker model resolve: {err:#}"))?;
+    let resolved_model_path = resolved_model_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("worker resolved model path must be valid UTF-8"))?;
+    let model_type = detect_model_type(resolved_model_path)
+        .map_err(|err| anyhow::anyhow!("worker detect_model_type: {err:#}"))?;
+    let metrics = infer::metrics::ServerMetrics::new(model_path);
+    let runtime_topology = RuntimeTopology::discover();
+    let placement = runtime_topology.placement_for_cuda_device_ordinal(cuda_ordinal, rank);
+    let worker_bootstrap = vec![CudaWorkerBootstrap {
+        cuda_ordinal,
+        placement,
+    }];
+
+    // Reuse the coordinator's KV mode selection logic.
+    let requested_kv_mode = parse_kv_cache_mode(&args.kv_cache_dtype)
+        .map_err(|err| anyhow::anyhow!("worker kv mode parse: {err:#}"))?;
+    let num_slots = args.num_slots.unwrap_or_else(|| {
+        auto_num_slots(
+            resolved_model_path,
+            args.max_seq_len,
+            requested_kv_mode.slot_sizing_format(),
+            args.mem_fraction_static,
+            Some(cuda_ordinal),
+        )
+    });
+    let kv_candidates = kv_mode_candidates(requested_kv_mode, args.max_seq_len.is_some());
+    let (kv_cache_dtype, kv_pool_format, _label) = kv_candidates
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("worker kv candidates empty"))?;
+
+    let distributed_shape = Some(DistributedShape {
+        rank_offset: rank,
+        world_size,
+    });
+    info!("[arle-worker rank={rank}] booting scheduler (model={model_path} num_slots={num_slots})");
+    let started = spawn_cuda_worker_group(
+        resolved_model_path,
+        args,
+        model_type,
+        num_slots,
+        kv_cache_dtype,
+        kv_pool_format,
+        &worker_bootstrap,
+        None,
+        &metrics,
+        distributed_shape,
+    )
+    .with_context(|| format!("worker rank {rank} scheduler boot"))?;
+    info!("[arle-worker rank={rank}] scheduler running, awaiting shutdown");
+
+    // Block on parent pipe — coordinator closes write end on shutdown,
+    // read() returns EOF, worker exits 0.
     if let Ok(fd_str) = std::env::var("ARLE_WORKER_PARENT_FD") {
         let fd: i32 = fd_str
             .parse()
             .map_err(|err| anyhow::anyhow!("ARLE_WORKER_PARENT_FD parse: {err}"))?;
-        // SAFETY: fd was inherited from the coordinator via pre_exec dup2.
-        // We own it; the File destructor will close it on exit.
+        // SAFETY: fd was inherited from the coordinator. The File destructor
+        // closes it on exit.
         let mut parent_pipe = unsafe { std::fs::File::from_raw_fd(fd) };
         let mut buf = [0u8; 1];
-        // read returns Ok(0) on EOF (parent closed the pipe) or an error
-        // if the parent died (EPIPE). Both signal "time to shut down".
         match parent_pipe.read(&mut buf) {
-            Ok(0) => info!("[arle-worker rank={rank}] parent pipe closed, exiting"),
-            Ok(_) => info!("[arle-worker rank={rank}] parent sent shutdown byte, exiting"),
-            Err(err) => info!("[arle-worker rank={rank}] parent pipe error {err}, exiting"),
+            Ok(0) => info!("[arle-worker rank={rank}] parent pipe closed, shutting down"),
+            Ok(_) => info!("[arle-worker rank={rank}] parent sent shutdown byte, shutting down"),
+            Err(err) => info!("[arle-worker rank={rank}] parent pipe error {err}, shutting down"),
         }
     } else {
-        // No parent pipe — interactive debugging mode. Wait forever.
         info!("[arle-worker rank={rank}] no ARLE_WORKER_PARENT_FD; sleeping forever");
         loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     }
-
+    shutdown_started_workers(started);
     Ok(())
 }
 
@@ -1095,6 +1152,22 @@ fn shutdown_started_workers(workers: Vec<StartedCudaWorker>) {
     }
 }
 
+/// Distributed-rank override for multiproc-serve worker mode.
+/// `rank_offset` is added to the per-worker enumerate index to obtain the
+/// effective NCCL/EP rank; `world_size` overrides `workers.len()` for the
+/// startup-warmup-gate and `deepseek_parallel_config_for_rank` lookup.
+///
+/// In the existing single-process N-thread path, callers pass `None` and
+/// the function uses `(enumerate_index, workers.len())` — current behavior.
+/// In worker mode, the coordinator forks one child per rank ≥ 1; each
+/// child calls `spawn_cuda_worker_group` with `workers = [my_worker]` and
+/// `Some(DistributedShape { rank_offset: my_rank, world_size: N })`.
+#[derive(Clone, Copy)]
+struct DistributedShape {
+    rank_offset: usize,
+    world_size: usize,
+}
+
 fn spawn_cuda_worker_group(
     model_path: &str,
     args: &Args,
@@ -1105,11 +1178,23 @@ fn spawn_cuda_worker_group(
     workers: &[CudaWorkerBootstrap],
     single_worker_pre_model_free_bytes: Option<usize>,
     metrics: &infer::metrics::ServerMetrics,
+    distributed_shape: Option<DistributedShape>,
 ) -> anyhow::Result<Vec<StartedCudaWorker>> {
-    let world_size = workers.len();
-    let startup_warmup_gate = (world_size > 1).then(RuntimeNotifyGate::new);
+    // Effective world_size for distributed config + the startup-warmup gate
+    // decision. Override comes from worker-mode callers; default to
+    // `workers.len()` for the existing single-process N-thread path.
+    let world_size = distributed_shape
+        .map(|s| s.world_size)
+        .unwrap_or_else(|| workers.len());
+    let rank_offset = distributed_shape.map(|s| s.rank_offset).unwrap_or(0);
+    // Startup-warmup gate is only useful when this process spawns multiple
+    // threads (single-process N-thread mode). In multi-process mode, each
+    // worker process holds its own gate via NCCL barriers, not via the
+    // local gate.
+    let startup_warmup_gate = (workers.len() > 1).then(RuntimeNotifyGate::new);
     let mut planned = Vec::with_capacity(workers.len());
-    for (rank, worker) in workers.iter().enumerate() {
+    for (local_idx, worker) in workers.iter().enumerate() {
+        let rank = rank_offset + local_idx;
         let runtime = ServerRuntimeConfig {
             engine: InferenceEngineOptions {
                 enable_cuda_graph: args.cuda_graph && !args.disable_cuda_graph,
@@ -1135,12 +1220,16 @@ fn spawn_cuda_worker_group(
             },
             startup_warmup_gate: startup_warmup_gate.clone(),
         };
-        planned.push((rank, worker.clone(), runtime));
+        planned.push((local_idx, rank, worker.clone(), runtime));
     }
 
-    if world_size <= 1 {
+    // Take the "spawn inline" branch when this process is responsible for
+    // a single scheduler — covers (a) single-process world_size=1, and
+    // (b) multiproc-serve worker mode where world_size > 1 but workers.len()
+    // == 1 (one scheduler per child process).
+    if workers.len() <= 1 {
         let mut started = Vec::with_capacity(planned.len());
-        for (_, worker, runtime) in planned {
+        for (_, _, worker, runtime) in planned {
             match spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone()) {
                 Ok((handle, guard)) => {
                     started.push(StartedCudaWorker {
@@ -1166,7 +1255,9 @@ fn spawn_cuda_worker_group(
     }
 
     let mut load_threads = Vec::with_capacity(planned.len());
-    for (rank, worker, runtime) in planned {
+    // Indexing is per-process LOCAL slot (not distributed rank), so worker
+    // mode can reuse this branch without sizing started_by_local by N.
+    for (local_idx, _rank, worker, runtime) in planned {
         let model_path = model_path.to_string();
         let metrics = metrics.clone();
         load_threads.push(std::thread::spawn(
@@ -1185,17 +1276,17 @@ fn spawn_cuda_worker_group(
                             worker.placement.gpu_ordinal
                         )
                     });
-                (rank, result)
+                (local_idx, result)
             },
         ));
     }
 
-    let mut started_by_rank = (0..world_size).map(|_| None).collect::<Vec<_>>();
+    let mut started_by_local = (0..workers.len()).map(|_| None).collect::<Vec<_>>();
     let mut first_err = None;
     for thread in load_threads {
         match thread.join() {
-            Ok((rank, result)) => match result {
-                Ok(worker) => started_by_rank[rank] = Some(worker),
+            Ok((local_idx, result)) => match result {
+                Ok(worker) => started_by_local[local_idx] = Some(worker),
                 Err(err) if first_err.is_none() => first_err = Some(err),
                 Err(_) => {}
             },
@@ -1209,13 +1300,13 @@ fn spawn_cuda_worker_group(
         if let Some(gate) = startup_warmup_gate.as_ref() {
             gate.cancel();
         }
-        shutdown_started_workers(started_by_rank.into_iter().flatten().collect());
+        shutdown_started_workers(started_by_local.into_iter().flatten().collect());
         return Err(err);
     }
     if let Some(gate) = startup_warmup_gate.as_ref() {
         gate.release();
     }
-    Ok(started_by_rank
+    Ok(started_by_local
         .into_iter()
         .map(|worker| worker.expect("all ranks loaded successfully"))
         .collect())
@@ -1419,9 +1510,33 @@ async fn async_main(args: Args) {
     #[cfg(not(unix))]
     let worker_bootstrap_for_coord: Vec<CudaWorkerBootstrap> = worker_bootstrap.clone();
 
+    // When multiproc-serve is active, the coordinator is rank 0 of an
+    // N-rank NCCL group; spawn_cuda_worker_group needs the explicit
+    // world_size so its TP/EP config + deepseek_parallel match the workers'
+    // view. When inactive, None preserves the existing enumerate-based
+    // single-process path.
+    #[cfg(unix)]
+    let distributed_shape_for_coord: Option<DistributedShape> = if _worker_children.is_some() {
+        Some(DistributedShape {
+            rank_offset: 0,
+            world_size: worker_bootstrap.len(),
+        })
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let distributed_shape_for_coord: Option<DistributedShape> = None;
+
     for (candidate_idx, (kv_cache_dtype, kv_pool_format, kv_mode_label)) in
         kv_candidates.iter().copied().enumerate()
     {
+        // Coordinator passes None — uses enumerate-based rank, world_size=
+        // workers.len(). The B-1 commit B.2 child-spawn already trimmed
+        // `worker_bootstrap_for_coord` to just the rank-0 entry when
+        // ARLE_MULTIPROC_SERVE=1, so rank-0 + world_size=1 reflects the
+        // coordinator-process role correctly. Worker children invoke
+        // spawn_cuda_worker_group via run_worker_mode with the explicit
+        // DistributedShape override.
         match spawn_cuda_worker_group(
             model_path,
             &args,
@@ -1432,6 +1547,7 @@ async fn async_main(args: Args) {
             &worker_bootstrap_for_coord,
             pre_model_free_bytes,
             &metrics,
+            distributed_shape_for_coord,
         ) {
             Ok(workers) => {
                 selected_mode = Some((kv_cache_dtype, kv_pool_format, kv_mode_label));
