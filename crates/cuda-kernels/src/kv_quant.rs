@@ -1021,8 +1021,11 @@ mod tests {
     #[test]
     fn fp8_kernel_pair_decode_attention_diagnostic() {
         let ctx = DeviceContext::new().expect("ctx");
-        let num_q_heads = 4usize;
-        let num_kv_heads = 2usize;
+        // Production Qwen3-4B layout: num_q_heads=32 num_kv_heads=8 (GQA 4:1).
+        // The 4:2 ratio used previously matches GQA semantics but a wider q
+        // group could expose head-mapping bugs that smaller ratios miss.
+        let num_q_heads = 32usize;
+        let num_kv_heads = 8usize;
         let head_dim = 128usize;
         let kv_dim = num_kv_heads * head_dim;
         let q_dim = num_q_heads * head_dim;
