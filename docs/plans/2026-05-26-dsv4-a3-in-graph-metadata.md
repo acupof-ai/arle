@@ -220,7 +220,9 @@ Phase 3 估算：~2-3 天（DeepEP API 调研 + 重构 + 多卡 bench）。
   dispatch/combine and the DeepGEMM auto expert backend. This changes the
   default integration path only; the previous wall-clock/correctness KILL still
   blocks claiming DeepGEMM as a performance win until native DeepEP LL +
-  byte-identical grouped expert compute are validated.
+  byte-identical grouped expert compute are validated. Default-path build,
+  `max_tokens=32` smoke, and nsys evidence:
+  [`../experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md`](../experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md).
 
 ## Cross-refs
 
