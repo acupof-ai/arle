@@ -435,6 +435,46 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
     .with_context(|| format!("worker rank {rank} scheduler boot"))?;
     info!("[arle-worker rank={rank}] scheduler running, awaiting shutdown");
 
+    // Phase B-1 commit C.3 — relay-receiver thread. Connects to the
+    // coordinator's TCP relay (port published via ARLE_COORDINATOR_RELAY_
+    // PORT env), receives one boot-ping envelope to validate the channel,
+    // then loops on `recv()`. C.4 will route real Request envelopes into
+    // the local scheduler's request queue. For now the loop just logs
+    // each envelope and exits on coordinator EOF.
+    let _relay_thread = if let Ok(port_str) = std::env::var("ARLE_COORDINATOR_RELAY_PORT") {
+        let port: u16 = port_str
+            .parse()
+            .with_context(|| format!("worker rank {rank} ARLE_COORDINATOR_RELAY_PORT parse"))?;
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .with_context(|| format!("worker rank {rank} relay addr parse"))?;
+        let mut relay =
+            infer::multiproc_relay::RelayWorker::connect(addr, std::time::Duration::from_secs(30))
+                .with_context(|| format!("worker rank {rank} relay connect"))?;
+        info!("[arle-worker rank={rank}] relay connected to {addr}");
+        Some(std::thread::spawn(move || -> anyhow::Result<()> {
+            let mut count: usize = 0;
+            loop {
+                match relay.recv()? {
+                    Some(env) => {
+                        count += 1;
+                        log::debug!("[arle-worker rank={rank}] relay envelope #{count}: {env:?}");
+                    }
+                    None => {
+                        log::info!("[arle-worker rank={rank}] relay EOF after {count} envelopes");
+                        return Ok(());
+                    }
+                }
+            }
+        }))
+    } else {
+        log::info!(
+            "[arle-worker rank={rank}] ARLE_COORDINATOR_RELAY_PORT unset; \
+             skipping relay-receiver thread"
+        );
+        None
+    };
+
     // Block on parent pipe — coordinator closes write end on shutdown,
     // read() returns EOF, worker exits 0.
     if let Ok(fd_str) = std::env::var("ARLE_WORKER_PARENT_FD") {
@@ -1506,13 +1546,36 @@ async fn async_main(args: Args) {
         && std::env::var("ARLE_MULTIPROC_ALLOW_DEADLOCK").is_err()
     {
         panic!(
-            "ARLE_MULTIPROC_SERVE=1 enabled but phase B-1 commit C (cross-process \
-             request relay) is not yet wired. Workers boot but never receive batches, \
-             so rank-0 NCCL collectives will deadlock. Set ARLE_MULTIPROC_ALLOW_DEADLOCK\
-             =1 to bypass this guard. See docs/plans/2026-05-27-multiproc-serve-pivot.md \
-             §B-1 commit C."
+            "ARLE_MULTIPROC_SERVE=1 enabled but phase B-1 commit C.4 (request relay \
+             wire-in to DistributedSchedulerGroup) is not yet landed. Workers boot but \
+             never receive batches via the relay, so rank-0 NCCL collectives will \
+             deadlock once a real request fires. Set ARLE_MULTIPROC_ALLOW_DEADLOCK=1 \
+             to bypass this guard for boot-time / relay smoke. See \
+             docs/plans/2026-05-27-multiproc-serve-pivot.md §B-1 commit C."
         );
     }
+    // Phase B-1 commit C.3 — bind the relay coordinator BEFORE spawning
+    // children so its port can be exported via env, then accept N-1
+    // worker connections AFTER spawn. The relay is the cross-process
+    // control plane that ships per-request batch metadata; C.4 wires it
+    // into the DistributedSchedulerGroup submission path.
+    #[cfg(unix)]
+    let pending_relay =
+        if std::env::var("ARLE_MULTIPROC_SERVE").is_ok() && worker_bootstrap.len() > 1 {
+            let pending = infer::multiproc_relay::RelayCoordinator::bind()
+                .unwrap_or_else(|e| panic!("multiproc relay bind failed: {e:#}"));
+            // SAFETY: env writes happen before child spawn, single-threaded.
+            unsafe {
+                std::env::set_var("ARLE_COORDINATOR_RELAY_PORT", pending.port().to_string());
+            }
+            log::info!(
+                "[multiproc-coord] relay bound at 127.0.0.1:{} (port published via env)",
+                pending.port()
+            );
+            Some(pending)
+        } else {
+            None
+        };
     #[cfg(unix)]
     let _worker_children =
         if std::env::var("ARLE_MULTIPROC_SERVE").is_ok() && worker_bootstrap.len() > 1 {
@@ -1523,6 +1586,33 @@ async fn async_main(args: Args) {
         } else {
             None
         };
+    // Accept N-1 worker connections. Workers connect from their relay-
+    // receiver thread inside run_worker_mode. Boot-ping broadcasts on
+    // success to validate every worker actually opened its end.
+    #[cfg(unix)]
+    let _relay_coordinator = if let Some(pending) = pending_relay {
+        let mut coord = pending
+            .accept(worker_bootstrap.len(), std::time::Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("multiproc relay accept failed: {e:#}"));
+        log::info!(
+            "[multiproc-coord] relay accepted {} worker connects",
+            coord.worker_count()
+        );
+        // Boot ping — proves every worker's relay-receiver thread is
+        // alive before we let HTTP open. C.4 replaces this with real
+        // per-request broadcasts in the submission path.
+        coord
+            .broadcast(&infer::multiproc_relay::RelayEnvelope::Request {
+                request_id: 0,
+                prompt_tokens: vec![],
+                max_new_tokens: 0,
+                sampling: serde_json::json!({"kind": "boot-ping"}),
+            })
+            .unwrap_or_else(|e| panic!("multiproc relay boot-ping failed: {e:#}"));
+        Some(coord)
+    } else {
+        None
+    };
     #[cfg(unix)]
     let worker_bootstrap_for_coord: Vec<CudaWorkerBootstrap> = if _worker_children.is_some() {
         worker_bootstrap[..1].to_vec()
