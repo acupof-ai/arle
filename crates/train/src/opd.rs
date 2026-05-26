@@ -20,8 +20,17 @@
 //! - Student initialised from a smaller checkpoint with LoRA adapter
 //!   layered on via `Qwen35Model::new_with_lora`.
 
-use autograd::{AutogradError, Device, Tape, TensorId, TensorStore, optim::Optimizer};
-use std::{collections::HashSet, time::Instant};
+use autograd::{
+    AutogradError, BackwardProfile, Device, Tape, TensorId, TensorStore, optim::Optimizer,
+};
+use std::{
+    collections::HashSet,
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use crate::{
     grad_clip::clip_grad_norm,
@@ -116,6 +125,84 @@ fn record_profile(
 ) {
     if let Some(profile) = profile.as_deref_mut() {
         update(profile);
+    }
+}
+
+static OPD_BACKWARD_PROFILE_WINDOWS: AtomicU64 = AtomicU64::new(0);
+static OPD_BACKWARD_PROFILE_TOTALS: LazyLock<Mutex<BackwardProfile>> =
+    LazyLock::new(|| Mutex::new(BackwardProfile::default()));
+
+fn opd_backward_profile_enabled() -> bool {
+    std::env::var_os("ARLE_OPD_BACKWARD_PROFILE").is_some()
+}
+
+fn backward_with_optional_profile(
+    loss: TensorId,
+    loss_value: f32,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<()> {
+    if !opd_backward_profile_enabled() {
+        tape.backward(loss, store)?;
+        return Ok(());
+    }
+
+    let (_, backward_profile) = tape.backward_profiled(loss, store)?;
+    log_opd_backward_profile(loss_value, &backward_profile);
+    Ok(())
+}
+
+fn log_opd_backward_profile(loss_value: f32, profile: &BackwardProfile) {
+    let window_index = OPD_BACKWARD_PROFILE_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
+    print_backward_profile("window", window_index, loss_value, profile);
+
+    let aggregate = {
+        let mut aggregate = OPD_BACKWARD_PROFILE_TOTALS
+            .lock()
+            .expect("OPD backward profile mutex poisoned");
+        aggregate.merge(profile);
+        aggregate.clone()
+    };
+    print_backward_profile("aggregate", window_index, loss_value, &aggregate);
+}
+
+fn print_backward_profile(
+    scope: &str,
+    window_index: u64,
+    loss_value: f32,
+    profile: &BackwardProfile,
+) {
+    let total_secs = profile.total_duration.as_secs_f64();
+    let op_secs = profile.total_op_duration().as_secs_f64();
+    let merge_secs = profile.merge_grad_duration.as_secs_f64();
+    let prelude_secs = profile.prelude_duration.as_secs_f64();
+    let unattributed_secs = (total_secs - op_secs - merge_secs - prelude_secs).max(0.0);
+    eprintln!(
+        "opd_backward_profile scope={scope} windows={window_index} loss={loss_value:.12e} \
+         total_seconds={total_secs:.6} op_seconds={op_secs:.6} \
+         merge_grad_seconds={merge_secs:.6} prelude_seconds={prelude_secs:.6} \
+         unattributed_seconds={unattributed_secs:.6}"
+    );
+
+    let mut rows = profile
+        .op_totals
+        .iter()
+        .map(|(&op, stats)| (op, stats.count, stats.duration.as_secs_f64()))
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    for (rank, (op, count, seconds)) in rows.iter().enumerate() {
+        let pct_backward = if total_secs == 0.0 {
+            0.0
+        } else {
+            seconds / total_secs * 100.0
+        };
+        eprintln!(
+            "opd_backward_op_profile scope={scope} windows={window_index} rank={} op={} \
+             count={} seconds={seconds:.6} pct_backward={pct_backward:.3}",
+            rank + 1,
+            op.name(),
+            count
+        );
     }
 }
 
@@ -748,7 +835,7 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
         });
 
         let phase_started = Instant::now();
-        tape.backward(weighted_loss, store)?;
+        backward_with_optional_profile(weighted_loss, loss_value, store, tape)?;
         record_profile(profile, |profile| {
             profile.backward_seconds += phase_started.elapsed().as_secs_f64();
         });
@@ -1026,7 +1113,7 @@ fn backward_weighted_window_loss(
     });
 
     let phase_started = Instant::now();
-    tape.backward(weighted_loss, store)?;
+    backward_with_optional_profile(weighted_loss, loss_value, store, tape)?;
     record_profile(profile, |profile| {
         profile.backward_seconds += phase_started.elapsed().as_secs_f64();
     });
@@ -1830,7 +1917,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
         });
         let phase_started = Instant::now();
-        tape.backward(loss, store)?;
+        backward_with_optional_profile(loss, loss_value, store, tape)?;
         record_profile(&mut profile, |profile| {
             profile.backward_seconds += phase_started.elapsed().as_secs_f64();
         });
