@@ -90,6 +90,35 @@ only on-the-wire difference is the kernel name. INT8 passes parity,
 FP8 fails — so the bug is in some FP8-specific behavior the kernel
 parity tests have not yet exercised.
 
+**Qwen3.5 hybrid audit (2026-05-26, V100 sm_70) — inverts the
+signal**: ran the same harness adapted for `Qwen35Model` on V100
+(L4 dense-only box offline). With `KV_PARITY_MAX_TOKENS=32`,
+`KV_PARITY_PROMPTS=2`:
+
+- `bf16   mean_match=1.0000`  ✓
+- `int8   mean_match=0.0469`  ✗ catastrophic step 1
+- `fp8    mean_match=0.8125`  ⚠ slow drift (first divergence step 20)
+- `tq4    mean_match=0.0000`  ✗ kernel error
+
+INT8 catastrophic stems from `CUDA_ERROR_NOT_SUPPORTED` at
+`qwen35 decode full-attention layer_idx=3 full_idx=0` —
+`decode_attention_int8_partial_kernel` uses `__pipeline_memcpy_async`
+(`cp.async`, SM 8.0+), which Volta (sm_70) does not implement. So
+INT8 on V100 is an architectural sm-coverage gap, not a numerical
+parity bug. (`crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu:142-148`.)
+
+FP8 only drifting at step 20 on Qwen3.5/V100, instead of the
+catastrophic step-1 divergence seen on Qwen3-4B/L4, is the strongest
+signal yet: **the Qwen3-dense FP8 step-1 catastrophe is Qwen3-dense-
+specific, not shared-kernel-pair-specific**. The Qwen3.5 full-
+attention dispatch indexes the paged pool with `full_idx` (subset
+index over the 8 full-attention layers) while Qwen3-dense uses
+`layer_idx` over all 32 layers. The bug surface narrows to whatever
+diverges between the two dispatch sites in
+`infer/src/model/qwen3/batch_decode.rs` vs
+`infer/src/model/qwen35/batch_decode.rs`, with the kernels themselves
+already certified clean.
+
 **Conclusion**: the audit's step-1 catastrophic divergence is in
 scheduler-side runtime dispatch wiring of the values fed to these
 kernels, not in any FP8 CUDA kernel. Remaining suspect surface:
