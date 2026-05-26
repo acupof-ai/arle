@@ -263,6 +263,16 @@ pub fn matmul_bt(
     matmul::matmul_bt(a, b, store, tape)
 }
 
+pub fn matmul_bt_with_site(
+    a: TensorId,
+    b: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    site: &'static str,
+) -> Result<TensorId> {
+    matmul::matmul_bt_with_site(a, b, store, tape, site)
+}
+
 pub use linear_attention::LinearAttentionParams;
 
 pub fn linear_attention_core(

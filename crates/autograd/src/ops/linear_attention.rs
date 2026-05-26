@@ -1,3 +1,12 @@
+use std::{
+    collections::BTreeMap,
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
 use smallvec::smallvec;
 
 use crate::{
@@ -26,6 +35,113 @@ struct LinearAttentionForward {
     kv_mem: Vec<f32>,
     state_history: Vec<f32>,
     final_state: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LinearAttentionSubopProfile {
+    count: usize,
+    duration: Duration,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LinearAttentionBackwardProfile {
+    subops: BTreeMap<&'static str, LinearAttentionSubopProfile>,
+}
+
+impl LinearAttentionBackwardProfile {
+    fn record(&mut self, subop: &'static str, duration: Duration) {
+        let entry = self.subops.entry(subop).or_default();
+        entry.count += 1;
+        entry.duration += duration;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for (&subop, &stats) in &other.subops {
+            let entry = self.subops.entry(subop).or_default();
+            entry.count += stats.count;
+            entry.duration += stats.duration;
+        }
+    }
+
+    fn total_duration(&self) -> Duration {
+        self.subops
+            .values()
+            .fold(Duration::default(), |acc, stats| acc + stats.duration)
+    }
+}
+
+static LINEAR_ATTENTION_BACKWARD_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
+static LINEAR_ATTENTION_BACKWARD_PROFILE_TOTALS: LazyLock<Mutex<LinearAttentionBackwardProfile>> =
+    LazyLock::new(|| Mutex::new(LinearAttentionBackwardProfile::default()));
+
+fn linear_attention_backward_profile_enabled() -> bool {
+    std::env::var_os("ARLE_OPD_BACKWARD_PROFILE").is_some()
+}
+
+fn subop_started(profile: &Option<LinearAttentionBackwardProfile>) -> Option<Instant> {
+    profile.as_ref().map(|_| Instant::now())
+}
+
+fn record_subop(
+    profile: &mut Option<LinearAttentionBackwardProfile>,
+    subop: &'static str,
+    duration: Duration,
+) {
+    if let Some(profile) = profile {
+        profile.record(subop, duration);
+    }
+}
+
+fn record_elapsed_subop(
+    profile: &mut Option<LinearAttentionBackwardProfile>,
+    subop: &'static str,
+    started: Option<Instant>,
+) -> Duration {
+    let duration = started.map_or(Duration::default(), |started| started.elapsed());
+    record_subop(profile, subop, duration);
+    duration
+}
+
+fn log_linear_attention_backward_profile(profile: &LinearAttentionBackwardProfile) {
+    let call_index = LINEAR_ATTENTION_BACKWARD_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    print_linear_attention_backward_profile("call", call_index, profile);
+
+    let aggregate = {
+        let mut aggregate = LINEAR_ATTENTION_BACKWARD_PROFILE_TOTALS
+            .lock()
+            .expect("linear attention backward profile mutex poisoned");
+        aggregate.merge(profile);
+        aggregate.clone()
+    };
+    print_linear_attention_backward_profile("aggregate", call_index, &aggregate);
+}
+
+fn print_linear_attention_backward_profile(
+    scope: &str,
+    call_index: u64,
+    profile: &LinearAttentionBackwardProfile,
+) {
+    let total_secs = profile.total_duration().as_secs_f64();
+    let mut rows = profile
+        .subops
+        .iter()
+        .map(|(&subop, stats)| (subop, stats.count, stats.duration.as_secs_f64()))
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+    for (rank, (subop, count, seconds)) in rows.iter().enumerate() {
+        let pct_linear_attention = if total_secs == 0.0 {
+            0.0
+        } else {
+            seconds / total_secs * 100.0
+        };
+        eprintln!(
+            "opd_linear_attention_subop_profile scope={scope} calls={call_index} rank={} \
+             subop={} count={} seconds={seconds:.6} pct_linear_attention={pct_linear_attention:.3}",
+            rank + 1,
+            subop,
+            count
+        );
+    }
 }
 
 pub fn linear_attention_core(
@@ -194,6 +310,9 @@ pub(crate) fn linear_attention_backward(
         store,
     )?;
 
+    let mut profile =
+        linear_attention_backward_profile_enabled().then(LinearAttentionBackwardProfile::default);
+    let materialize_started = subop_started(&profile);
     for tensor_id in [
         qkv,
         z,
@@ -224,7 +343,9 @@ pub(crate) fn linear_attention_backward(
             got: upstream.shape,
         });
     }
+    record_elapsed_subop(&mut profile, "host_materialize", materialize_started);
 
+    let recompute_started = subop_started(&profile);
     let forward = linear_attention_forward(
         &qkv_tensor.data,
         &z_tensor.data,
@@ -237,7 +358,9 @@ pub(crate) fn linear_attention_backward(
         &norm_tensor.data,
         params,
     );
+    record_elapsed_subop(&mut profile, "fwd_recompute", recompute_started);
 
+    let grad_alloc_started = subop_started(&profile);
     let q_dim = num_key_heads * key_dim;
     let k_dim = q_dim;
     let v_offset = q_dim + k_dim;
@@ -248,7 +371,10 @@ pub(crate) fn linear_attention_backward(
     let mut ddt = vec![0.0_f32; dt_tensor.data.len()];
     let mut da_log = vec![0.0_f32; a_log_tensor.data.len()];
     let mut dnorm = vec![0.0_f32; norm_tensor.data.len()];
+    record_elapsed_subop(&mut profile, "grad_alloc", grad_alloc_started);
 
+    let scan_started = subop_started(&profile);
+    let mut nested_param_grad_duration = Duration::default();
     for batch_idx in 0..batch {
         for value_head in 0..num_value_heads {
             let key_head = value_head * num_key_heads / num_value_heads;
@@ -331,6 +457,7 @@ pub(crate) fn linear_attention_backward(
 
                 let mut dcore = vec![0.0_f32; value_dim];
                 let mut dot_beta = 0.0_f32;
+                let param_started = subop_started(&profile);
                 for value_idx in 0..value_dim {
                     dcore[value_idx] = upstream_row[value_idx] * gate_silu[value_idx];
                     let gate_grad = upstream_row[value_idx] * normed[value_idx];
@@ -347,6 +474,8 @@ pub(crate) fn linear_attention_backward(
                         dcore[value_idx] * core_out[value_idx] * norm_tensor.data[value_idx];
                     dnorm[value_idx] += dcore[value_idx] * core_out[value_idx] * inv_rms;
                 }
+                nested_param_grad_duration +=
+                    record_elapsed_subop(&mut profile, "param_grad_accum", param_started);
                 dcore = rmsnorm_backward_row(
                     &core_out,
                     &norm_tensor.data,
@@ -419,12 +548,15 @@ pub(crate) fn linear_attention_backward(
 
                 let dg = dexp_g * exp_g;
                 let softplus_grad = sigmoid_scalar(softplus_input);
+                let param_started = subop_started(&profile);
                 da[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] +=
                     dg * (-exp_a * softplus_grad);
                 ddt[value_head] += dg * (-exp_a * softplus_grad);
                 da_log[value_head] += dg * (-exp_a * softplus_value);
                 db[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] +=
                     dbeta_scalar * beta * (1.0 - beta);
+                nested_param_grad_duration +=
+                    record_elapsed_subop(&mut profile, "param_grad_accum", param_started);
 
                 let dq_raw = l2_normalize_scaled_backward(
                     &q_raw,
@@ -438,6 +570,7 @@ pub(crate) fn linear_attention_backward(
                     .map(|&d_value| d_value * beta)
                     .collect::<Vec<_>>();
 
+                let param_started = subop_started(&profile);
                 for key_idx in 0..key_dim {
                     dqkv[idx3(
                         batch_idx,
@@ -463,13 +596,24 @@ pub(crate) fn linear_attention_backward(
                         qkv_tensor.shape[2],
                     )] += dv_raw[value_idx];
                 }
+                nested_param_grad_duration +=
+                    record_elapsed_subop(&mut profile, "param_grad_accum", param_started);
 
                 state = prev_state;
                 grad_state = dstate_prev;
             }
         }
     }
+    if let Some(started) = scan_started {
+        let scan_duration = started.elapsed();
+        record_subop(
+            &mut profile,
+            "scan_state_history",
+            scan_duration.saturating_sub(nested_param_grad_duration),
+        );
+    }
 
+    let param_started = subop_started(&profile);
     let (dqkv, dconv) = conv1d_backward(
         &dqkv,
         &forward.preact,
@@ -478,7 +622,9 @@ pub(crate) fn linear_attention_backward(
         &conv_tensor.shape,
         params,
     )?;
+    record_elapsed_subop(&mut profile, "param_grad_accum", param_started);
 
+    let grad_pack_started = subop_started(&profile);
     let mut grads = GradPairs::new();
     if qkv_tensor.requires_grad {
         grads.push((
@@ -527,6 +673,10 @@ pub(crate) fn linear_attention_backward(
             norm_weight,
             store.alloc(Tensor::new(dnorm, norm_tensor.shape.clone(), false)?),
         ));
+    }
+    record_elapsed_subop(&mut profile, "grad_pack", grad_pack_started);
+    if let Some(profile) = profile {
+        log_linear_attention_backward_profile(&profile);
     }
     Ok(grads)
 }

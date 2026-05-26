@@ -2,7 +2,7 @@ use std::{collections::HashMap, f32::consts::TAU};
 
 use autograd::{
     AutogradError, Result, Tape, Tensor, TensorId, TensorStore,
-    ops::{add, matmul_bt, mul_scalar, reshape},
+    ops::{add, matmul_bt_with_site, mul_scalar, reshape},
 };
 use serde::{Deserialize, Serialize};
 
@@ -180,10 +180,10 @@ impl LinearWithLora {
 
         let prefix_elems = x_shape.iter().product::<usize>() / input_dim;
         let flat_x = reshape(x, &[prefix_elems, input_dim], store, tape)?;
-        let mut projected = matmul_bt(flat_x, self.weight, store, tape)?;
+        let mut projected = matmul_bt_with_site(flat_x, self.weight, store, tape, self.base_name)?;
         if let Some(lora) = &self.lora {
-            let low_rank = matmul_bt(flat_x, lora.lora_a, store, tape)?;
-            let delta = matmul_bt(low_rank, lora.lora_b, store, tape)?;
+            let low_rank = matmul_bt_with_site(flat_x, lora.lora_a, store, tape, lora.lora_a_name)?;
+            let delta = matmul_bt_with_site(low_rank, lora.lora_b, store, tape, lora.lora_b_name)?;
             let delta = mul_scalar(delta, lora.scale, store, tape)?;
             projected = add(projected, delta, store, tape)?;
         }
