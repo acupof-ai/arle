@@ -198,6 +198,11 @@ name = "cpu_serve"
 path = "src/bin/cpu_serve.rs"
 required-features = ["cpu"]
 
+[[bin]]
+name = "multiproc_nccl_smoke"
+path = "src/bin/multiproc_nccl_smoke.rs"
+required-features = ["cuda", "nccl"]
+
 [[example]]
 name = "regenerate_test_data"
 path = "examples/regenerate_test_data.rs"
