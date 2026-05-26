@@ -6,6 +6,8 @@ use crate::{
     tensor::{Tensor, TensorId, TensorStore},
 };
 
+const MIN_STABLE_DECAY: f32 = 1.0e-6;
+
 #[derive(Debug, Clone, Copy)]
 pub struct LinearAttentionParams {
     pub batch: usize,
@@ -397,8 +399,9 @@ pub(crate) fn linear_attention_backward(
 
                 let mut dstate_prev = vec![0.0_f32; key_dim * value_dim];
                 let mut dexp_g = 0.0_f32;
+                let decay_is_stable = exp_g.is_finite() && exp_g > MIN_STABLE_DECAY;
                 for idx in 0..key_dim * value_dim {
-                    if exp_g <= 0.0 {
+                    if !decay_is_stable {
                         continue;
                     }
                     dexp_g += (s_decay[idx] / exp_g) * grad_state[idx];
@@ -452,7 +455,7 @@ pub(crate) fn linear_attention_backward(
                     )] += dv_raw[value_idx];
                 }
 
-                state = if exp_g > 0.0 {
+                state = if decay_is_stable {
                     s_decay.iter().map(|value| value / exp_g).collect()
                 } else {
                     vec![0.0; key_dim * value_dim]
