@@ -323,6 +323,30 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 
+    /// KIVI per-channel K decode attention. `k_static_scales` shape is
+    /// `[num_kv_heads, head_dim]` f32 (one scale per channel per KV head,
+    /// shared across tokens). `v_scales` keeps per-(row, head) layout
+    /// `[max_total_tokens, num_kv_heads]`.
+    pub fn decode_attention_fp8_per_channel_k_cuda(
+        q: *const Half,
+        k_data: *const u8,
+        v_data: *const u8,
+        k_static_scales: *const f32,
+        v_scales: *const f32,
+        kv_indices: *const i32,
+        kv_indptr: *const i32,
+        o: *mut Half,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        sm_scale: f32,
+        stream: CUstream,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+    ) -> CUresult;
+
     /// Variable-length Q + paged FP8 E4M3 KV attention.
     ///
     /// Mirrors the TileLang TC decode shape but reads FP8 KV directly (no bf16

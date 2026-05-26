@@ -39,9 +39,26 @@ pub struct TokenKVPool {
     k_data: Vec<CudaSlice<u8>>,
     /// V data per layer: same layout
     v_data: Vec<CudaSlice<u8>>,
-    /// Per-head per-token f32 scales (INT8 only). `[max_total_tokens, num_kv_heads]`
+    /// Per-head per-token f32 scales (INT8 + FP8 default). `[max_total_tokens, num_kv_heads]`
     k_scales: Vec<CudaSlice<f32>>,
     v_scales: Vec<CudaSlice<f32>>,
+    /// **KIVI per-channel K scale** (FP8 only, optional). `[num_kv_heads, head_dim]` f32
+    /// per layer. When `Some`, FP8 K quantization uses this static per-channel
+    /// scale instead of computing per-(token, head) scales into `k_scales`. The
+    /// per-channel scheme reduces K's outlier-channel-dominated quantization
+    /// error that catastrophically compounds through Qwen3-dense's 36 layers
+    /// (see `docs/experience/errors/2026-05-26-fp8-kv-step1-divergence-known-deferred.md`
+    /// and `docs/plans/2026-05-26-fp8-kv-per-channel-k-fix.md`). V keeps
+    /// per-(token, head) scales (KIVI's asymmetric choice — V doesn't have the
+    /// channel-outlier structure K does).
+    pub k_static_scales: Option<Vec<CudaSlice<f32>>>,
+    /// Per-layer KIVI calibration latch. `true` = `k_static_scales[layer]` has
+    /// been populated via `compute_k_per_channel_absmax` +
+    /// `finalize_k_per_channel_scales` and can be used for quantization.
+    /// `false` (initial state) signals the first FP8 prefill batch through
+    /// that layer to first calibrate, then quantize. Length = num_layers
+    /// when `k_static_scales` is `Some`, empty otherwise.
+    pub k_kivi_calibrated: Vec<std::sync::atomic::AtomicBool>,
     /// Shared bf16 working buffers (1 layer, for decode_prep write target).
     /// Only allocated when format != BF16.
     k_work: Option<CudaSlice<u8>>,
@@ -469,6 +486,29 @@ impl TokenKVPool {
             (None, None)
         };
 
+        // KIVI per-channel K scale: one `[num_kv_heads, head_dim]` table per
+        // layer for FP8 mode. Zero-init — the first FP8 prefill batch
+        // populates these via `populate_kivi_k_scales_from_prefill` (online
+        // calibration from the prefill K statistics). For BF16/INT8/TQ
+        // formats this stays None to keep the existing path bit-identical.
+        let (k_static_scales, k_kivi_calibrated) =
+            if matches!(format, KVFormat::FP8E4M3) && pool_bytes_per_layer > 0 {
+                let channels = num_kv_heads * head_dim;
+                let mut buf = Vec::with_capacity(num_layers);
+                let mut latches = Vec::with_capacity(num_layers);
+                for _ in 0..num_layers {
+                    buf.push(
+                        ctx.stream
+                            .alloc_zeros::<f32>(channels)
+                            .map_err(|e| anyhow!("KIVI k_static_scales alloc failed: {e}"))?,
+                    );
+                    latches.push(std::sync::atomic::AtomicBool::new(false));
+                }
+                (Some(buf), latches)
+            } else {
+                (None, Vec::new())
+            };
+
         // Legacy dtype mapping
         let dtype = match format {
             KVFormat::BF16 => KVCacheDtype::BF16,
@@ -484,6 +524,8 @@ impl TokenKVPool {
             v_work,
             int8_attn_workspace,
             int8_attn_workspace_bytes,
+            k_static_scales,
+            k_kivi_calibrated,
             k_norms,
             v_norms,
             tq_k_state,
@@ -1398,6 +1440,26 @@ impl TokenKVPool {
     /// V scales CudaSlice ref for a layer (FP8/INT8 only).
     pub fn v_scales_slice(&self, layer: usize) -> &CudaSlice<f32> {
         &self.v_scales[layer]
+    }
+
+    /// KIVI per-channel K scale CudaSlice ref for a layer.
+    /// Returns `None` when the pool is not in FP8 mode (BF16 / INT8 / TQ
+    /// keep their per-(token, head) scales).
+    pub fn k_static_scales_slice(&self, layer: usize) -> Option<&CudaSlice<f32>> {
+        self.k_static_scales.as_ref().map(|s| &s[layer])
+    }
+
+    /// KIVI per-channel K scale pointer for a layer (raw device address),
+    /// for kernels that consume `*const f32`. `None` when not FP8 mode.
+    pub fn k_static_scales_ptr(
+        &self,
+        layer: usize,
+        stream: &cudarc::driver::CudaStream,
+    ) -> Option<u64> {
+        self.k_static_scales.as_ref().map(|s| {
+            let (ptr, _guard) = s[layer].device_ptr(stream);
+            ptr
+        })
     }
 
     /// K working buffer pointer (bf16, shared across layers).

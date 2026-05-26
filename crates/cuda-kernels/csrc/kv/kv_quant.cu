@@ -650,4 +650,181 @@ cudaError_t quantize_paged_kv_single_cuda(
     return cudaGetLastError();
 }
 
+// ============================================================================
+// KIVI per-channel K scale quantization (FP8 E4M3 only).
+//
+// Reads K from the HND-paged bf16 working buffer and writes FP8 E4M3 to the
+// NHD durable pool, using a **pre-computed per-(kv_head, head_dim) scale
+// table** rather than computing per-(token, head) absmax on the fly. The
+// scale table layout is `[num_kv_heads, head_dim]` f32 (one scale per
+// channel of each KV head), populated once per layer at calibration time
+// (via `compute_k_per_channel_absmax_cuda` below on the first prefill batch).
+//
+// This is the KIVI ICML 2024 fix for K's outlier-channel-dominated
+// quantization error that catastrophically compounds through deep dense
+// transformers. V keeps its per-(token, head) scales (KIVI's asymmetric
+// choice — V doesn't show the same outlier-channel structure).
+// ============================================================================
+
+__global__ void quantize_paged_kv_fp8_per_channel_kernel(
+    const __nv_bfloat16* __restrict__ kv_bf16,      // HND-paged work buffer [page, head, token, dim]
+    __nv_fp8_e4m3* __restrict__ kv_fp8,             // FP8 pool [max_total_tokens * kv_dim]
+    const float* __restrict__ k_static_scales,      // [num_kv_heads, head_dim] per-channel scale
+    const int32_t* __restrict__ new_token_indices,  // [batch_size] token row of newest token
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim)
+{
+    int kv_head = blockIdx.x;
+    int batch_idx = blockIdx.y;
+    int d = threadIdx.x;
+
+    if (d >= head_dim) return;
+
+    constexpr int kPageSize = 16;
+    int token_row = new_token_indices[batch_idx];
+    int page_idx = token_row / kPageSize;
+    int offset_in_page = token_row % kPageSize;
+    int row_idx = page_idx * kPageSize + offset_in_page;
+    int src_offset = page_idx * kPageSize * kv_dim
+                   + kv_head * kPageSize * head_dim
+                   + offset_in_page * head_dim
+                   + d;
+    int dst_offset = row_idx * kv_dim + kv_head * head_dim + d;
+
+    float val = __bfloat162float(kv_bf16[src_offset]);
+    float scale = k_static_scales[kv_head * head_dim + d];
+    // Threshold matches the finalize floor (1e-30). Above that we trust the
+    // calibration; at-or-below we treat as untouched channel (val should be
+    // ~0 too, so producing 0 is correct).
+    float inv_scale = (scale > 1.0e-29f) ? (1.0f / scale) : 0.0f;
+    kv_fp8[dst_offset] = __nv_fp8_e4m3(val * inv_scale);
+}
+
+// ============================================================================
+// Per-channel K absmax: scan a batch of K rows and update the per-channel
+// scale table. Uses atomicMax-on-bits to maintain the running absmax
+// across multiple invocations (so multiple prefill batches contribute).
+// Final scale = running_absmax / 448.0 (FP8 E4M3 max representable).
+// ============================================================================
+
+static __device__ __forceinline__ void atomic_max_float(float* addr, float val) {
+    int* iaddr = reinterpret_cast<int*>(addr);
+    int old = __float_as_int(*addr);
+    int assumed;
+    do {
+        if (__int_as_float(old) >= val) return;
+        assumed = old;
+        old = atomicCAS(iaddr, assumed, __float_as_int(val));
+    } while (assumed != old);
+}
+
+__global__ void compute_k_per_channel_absmax_kernel(
+    const __nv_bfloat16* __restrict__ kv_bf16,      // HND-paged work [page, head, token, dim]
+    float* __restrict__ k_static_scales,            // [num_kv_heads, head_dim] running absmax
+    const int32_t* __restrict__ token_rows,         // [batch_size] token rows to scan
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim)
+{
+    int kv_head = blockIdx.x;
+    int batch_idx = blockIdx.y;
+    int d = threadIdx.x;
+
+    if (d >= head_dim) return;
+
+    constexpr int kPageSize = 16;
+    int token_row = token_rows[batch_idx];
+    int page_idx = token_row / kPageSize;
+    int offset_in_page = token_row % kPageSize;
+    int src_offset = page_idx * kPageSize * kv_dim
+                   + kv_head * kPageSize * head_dim
+                   + offset_in_page * head_dim
+                   + d;
+
+    float val = fabsf(__bfloat162float(kv_bf16[src_offset]));
+    int channel_idx = kv_head * head_dim + d;
+    atomic_max_float(&k_static_scales[channel_idx], val);
+}
+
+// (Already inside the outer `extern "C" {` block — no extra block needed.)
+
+// Quantize new K tokens using a pre-computed per-channel scale table.
+// Mirrors `quantize_paged_kv_fp8_cuda` API but consumes static per-channel
+// scales instead of computing per-(token, head) absmax. Caller is
+// responsible for populating `k_static_scales` (via
+// `compute_k_per_channel_absmax_cuda` during calibration / first prefill).
+cudaError_t quantize_paged_kv_fp8_per_channel_cuda(
+    const __nv_bfloat16* kv_bf16,
+    __nv_fp8_e4m3* kv_fp8,
+    const float* k_static_scales,
+    const int32_t* new_token_indices,
+    int num_kv_heads, int head_dim, int kv_dim,
+    int batch_size,
+    cudaStream_t stream)
+{
+    if (batch_size <= 0) return cudaSuccess;
+    dim3 grid(num_kv_heads, batch_size);
+    dim3 block(head_dim);
+    quantize_paged_kv_fp8_per_channel_kernel<<<grid, block, 0, stream>>>(
+        kv_bf16, kv_fp8, k_static_scales, new_token_indices,
+        num_kv_heads, head_dim, kv_dim);
+    return cudaGetLastError();
+}
+
+// Compute / accumulate per-channel K absmax from a batch of bf16 K rows
+// in the HND-paged work buffer. Stores **raw absmax** into k_static_scales
+// (caller divides by 448.0 to get FP8 E4M3 scale after all calibration
+// batches are consumed). Called via `finalize_paged_prefill_kv_layer`
+// before per-channel quantization on the first FP8 prefill batch.
+cudaError_t compute_k_per_channel_absmax_cuda(
+    const __nv_bfloat16* kv_bf16,
+    float* k_static_scales,
+    const int32_t* token_rows,
+    int num_kv_heads, int head_dim, int kv_dim,
+    int batch_size,
+    cudaStream_t stream)
+{
+    if (batch_size <= 0) return cudaSuccess;
+    dim3 grid(num_kv_heads, batch_size);
+    dim3 block(head_dim);
+    compute_k_per_channel_absmax_kernel<<<grid, block, 0, stream>>>(
+        kv_bf16, k_static_scales, token_rows,
+        num_kv_heads, head_dim, kv_dim);
+    return cudaGetLastError();
+}
+
+// Finalize the per-channel scale table by dividing accumulated absmax by
+// FP8 E4M3 max (448.0). Idempotent if all values are already <= 448 (the
+// first call divides by 448, subsequent calls just re-divide further —
+// caller must only invoke once after all calibration batches).
+__global__ void finalize_k_per_channel_scales_kernel(
+    float* k_static_scales,
+    int num_channels)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_channels) return;
+    float v = k_static_scales[idx];
+    // Divide accumulated absmax by FP8 E4M3 max (448) to yield the scale.
+    // Floor at 1e-30 (essentially only catches truly-zero absmax — untouched
+    // channels) so real small-magnitude channels keep their natural scale
+    // instead of being artificially inflated, which would saturate the
+    // quantized representation. Earlier 1e-6 floor caused FP8 KV to look
+    // broken even with KIVI scales — see commit history for context.
+    k_static_scales[idx] = fmaxf(v / 448.0f, 1.0e-30f);
+}
+
+cudaError_t finalize_k_per_channel_scales_cuda(
+    float* k_static_scales,
+    int num_channels,
+    cudaStream_t stream)
+{
+    if (num_channels <= 0) return cudaSuccess;
+    int block = 256;
+    int grid = (num_channels + block - 1) / block;
+    finalize_k_per_channel_scales_kernel<<<grid, block, 0, stream>>>(
+        k_static_scales, num_channels);
+    return cudaGetLastError();
+}
+
 }  // extern "C"
