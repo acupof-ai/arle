@@ -1194,6 +1194,12 @@ fn dsv4_expert_backend() -> Result<Dsv4ExpertBackend> {
             "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => {
                 return Ok(Dsv4ExpertBackend::Native);
             }
+            "native-deepep" | "native_deepep" => bail!(
+                "ARLE_DSV4_MOE_BACKEND=native-deepep is reserved for the upcoming sidecar \
+                 transport but is not yet wired through LayerCommunicator. Use `deepep` (default) \
+                 or `allreduce` until phase 1.1.7 lands. Track: docs/plans/2026-05-26-dsv4-\
+                 deepep-process-per-rank.md"
+            ),
             other => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{other}`"),
         }
     };
