@@ -8,8 +8,8 @@ use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
         LinearAttentionParams, add, causal_sdpa, causal_sdpa_with_q_start, embedding,
-        linear_attention_core, matmul_bt, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
-        slice, transpose,
+        linear_attention_core, matmul_bt_with_site, mul, repeat_kv, reshape, rmsnorm, rope,
+        sigmoid, silu, slice, transpose,
     },
 };
 use half::bf16;
@@ -2483,7 +2483,7 @@ fn linear_forward(
 
     let prefix_elems = x_shape.iter().product::<usize>() / input_dim;
     let flat_x = reshape(x, &[prefix_elems, input_dim], store, tape)?;
-    let projected = matmul_bt(flat_x, weight, store, tape)?;
+    let projected = matmul_bt_with_site(flat_x, weight, store, tape, "lm_head")?;
     let mut output_shape = x_shape[..x_shape.len() - 1].to_vec();
     output_shape.push(weight_shape[0]);
     Ok(reshape(projected, &output_shape, store, tape)?)

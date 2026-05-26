@@ -21,7 +21,8 @@
 //!   layered on via `Qwen35Model::new_with_lora`.
 
 use autograd::{
-    AutogradError, BackwardProfile, Device, Tape, TensorId, TensorStore, optim::Optimizer,
+    AutogradError, BackwardOp, BackwardProfile, Device, Tape, TensorId, TensorStore,
+    optim::Optimizer,
 };
 use std::{
     collections::HashSet,
@@ -201,6 +202,35 @@ fn print_backward_profile(
              count={} seconds={seconds:.6} pct_backward={pct_backward:.3}",
             rank + 1,
             op.name(),
+            count
+        );
+    }
+
+    let mut site_rows = profile
+        .site_totals
+        .iter()
+        .filter_map(|(&(op, site), stats)| {
+            (op == BackwardOp::MatmulBT).then_some((op, site, stats.count, stats.duration))
+        })
+        .collect::<Vec<_>>();
+    site_rows.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then_with(|| a.1.cmp(b.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    for (rank, (op, site, count, duration)) in site_rows.iter().enumerate() {
+        let seconds = duration.as_secs_f64();
+        let pct_backward = if total_secs == 0.0 {
+            0.0
+        } else {
+            seconds / total_secs * 100.0
+        };
+        eprintln!(
+            "opd_backward_site_profile scope={scope} windows={window_index} rank={} op={} \
+             site={} count={} seconds={seconds:.6} pct_backward={pct_backward:.3}",
+            rank + 1,
+            op.name(),
+            site,
             count
         );
     }

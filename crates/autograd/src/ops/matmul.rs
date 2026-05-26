@@ -57,6 +57,16 @@ pub fn matmul_bt(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
+    matmul_bt_with_site(a, b, store, tape, "matmul_bt")
+}
+
+pub fn matmul_bt_with_site(
+    a: TensorId,
+    b: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    site: &'static str,
+) -> Result<TensorId> {
     store.ensure_device(a)?;
     store.ensure_device(b)?;
     let a_handle = store
@@ -85,7 +95,7 @@ pub fn matmul_bt(
             op: BackwardOp::MatmulBT,
             output_id,
             input_ids: smallvec![a, b],
-            saved: SavedContext::MatmulBTCtx { a, b },
+            saved: SavedContext::MatmulBTCtx { a, b, site },
         });
     }
 
@@ -225,7 +235,7 @@ pub(crate) fn matmul_bt_backward(
     output_grad_id: TensorId,
     store: &mut TensorStore,
 ) -> Result<GradPairs> {
-    let SavedContext::MatmulBTCtx { a, b } = entry.saved.clone() else {
+    let SavedContext::MatmulBTCtx { a, b, .. } = entry.saved.clone() else {
         return Err(AutogradError::TapeInvariant(
             "matmul_bt backward missing saved context",
         ));

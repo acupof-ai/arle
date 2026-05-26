@@ -27,6 +27,7 @@ pub enum SavedContext {
     MatmulBTCtx {
         a: TensorId,
         b: TensorId,
+        site: &'static str,
     },
     SoftmaxCtx {
         y: TensorId,
@@ -165,6 +166,7 @@ pub struct BackwardOpProfile {
 #[derive(Debug, Clone, Default)]
 pub struct BackwardProfile {
     pub op_totals: BTreeMap<BackwardOp, BackwardOpProfile>,
+    pub site_totals: BTreeMap<(BackwardOp, &'static str), BackwardOpProfile>,
     pub merge_grad_duration: Duration,
     pub prelude_duration: Duration,
     pub total_duration: Duration,
@@ -177,9 +179,20 @@ impl BackwardProfile {
         entry.duration += duration;
     }
 
+    fn record_site(&mut self, op: BackwardOp, site: &'static str, duration: Duration) {
+        let entry = self.site_totals.entry((op, site)).or_default();
+        entry.count += 1;
+        entry.duration += duration;
+    }
+
     pub fn merge(&mut self, other: &Self) {
         for (&op, &stats) in &other.op_totals {
             let entry = self.op_totals.entry(op).or_default();
+            entry.count += stats.count;
+            entry.duration += stats.duration;
+        }
+        for (&site, &stats) in &other.site_totals {
+            let entry = self.site_totals.entry(site).or_default();
             entry.count += stats.count;
             entry.duration += stats.duration;
         }
@@ -201,6 +214,15 @@ pub struct TapeEntry {
     pub output_id: TensorId,
     pub input_ids: SmallVec<[TensorId; 2]>,
     pub saved: SavedContext,
+}
+
+impl TapeEntry {
+    pub fn profile_site(&self) -> Option<&'static str> {
+        match &self.saved {
+            SavedContext::MatmulBTCtx { site, .. } => Some(*site),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) type GradPairs = SmallVec<[(TensorId, TensorId); 2]>;
@@ -376,7 +398,11 @@ impl Tape {
                 };
                 if let (Some(profile), Some(started)) = (profile.as_deref_mut(), op_started) {
                     sync_profile_boundary(store)?;
-                    profile.record_op(entry.op, started.elapsed());
+                    let duration = started.elapsed();
+                    profile.record_op(entry.op, duration);
+                    if let Some(site) = entry.profile_site() {
+                        profile.record_site(entry.op, site, duration);
+                    }
                 }
 
                 if profile.is_some() {
@@ -572,5 +598,28 @@ mod tests {
         assert_eq!(profile.op_totals[&BackwardOp::Sum].count, 1);
         assert_eq!(profile.op_totals[&BackwardOp::Mul].count, 1);
         assert!(profile.total_duration >= profile.total_op_duration());
+    }
+
+    #[test]
+    fn backward_profiled_counts_matmul_bt_sites() {
+        let mut store = TensorStore::default();
+        let a = store.alloc(Tensor::new(vec![1.0, 2.0, 3.0], vec![1, 3], true).expect("create a"));
+        let b = store.alloc(
+            Tensor::new(vec![1.0, -1.0, 0.5, 2.0, 0.25, -0.5], vec![2, 3], true).expect("create b"),
+        );
+        let mut tape = Tape::new();
+        let y = ops::matmul_bt_with_site(a, b, &mut store, &mut tape, "unit.matmul_bt")
+            .expect("matmul_bt");
+        let loss = ops::sum(y, &mut store, &mut tape).expect("sum");
+
+        let (_grads, profile) = tape
+            .backward_profiled(loss, &mut store)
+            .expect("profiled backward");
+
+        assert_eq!(profile.op_totals[&BackwardOp::MatmulBT].count, 1);
+        assert_eq!(
+            profile.site_totals[&(BackwardOp::MatmulBT, "unit.matmul_bt")].count,
+            1
+        );
     }
 }
