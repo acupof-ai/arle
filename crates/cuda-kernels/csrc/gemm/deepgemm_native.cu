@@ -197,6 +197,25 @@ int env_int(const char* name, int fallback) {
   return std::sscanf(value, "%d", &parsed) == 1 ? parsed : fallback;
 }
 
+CUresult current_device_prop(cudaDeviceProp* prop_out) {
+  int device = 0;
+  cudaError_t cuda_err = cudaGetDevice(&device);
+  if (cuda_err != cudaSuccess) return static_cast<CUresult>(cuda_err);
+
+  struct CachedProp {
+    int device = -1;
+    cudaDeviceProp prop{};
+  };
+  static thread_local CachedProp cache;
+  if (cache.device != device) {
+    cuda_err = cudaGetDeviceProperties(&cache.prop, device);
+    if (cuda_err != cudaSuccess) return static_cast<CUresult>(cuda_err);
+    cache.device = device;
+  }
+  *prop_out = cache.prop;
+  return CUDA_SUCCESS;
+}
+
 std::string shell_quote(const std::filesystem::path& path) {
   std::string input = path.string();
   std::string out = "'";
@@ -824,13 +843,9 @@ CUresult launch_sm90_grouped_masked(
     int k,
     int sfa_aligned_m,
     CUstream stream) {
-  int device = 0;
-  cudaError_t cuda_err = cudaGetDevice(&device);
-  if (cuda_err != cudaSuccess) return static_cast<CUresult>(cuda_err);
-
   cudaDeviceProp prop{};
-  cuda_err = cudaGetDeviceProperties(&prop, device);
-  if (cuda_err != cudaSuccess) return static_cast<CUresult>(cuda_err);
+  CUresult prop_err = current_device_prop(&prop);
+  if (prop_err != CUDA_SUCCESS) return prop_err;
   if (prop.major != 9) return CUDA_ERROR_NOT_SUPPORTED;
 
   int num_sms = env_int("DG_NUM_SMS", prop.multiProcessorCount);
