@@ -1491,6 +1491,28 @@ async fn async_main(args: Args) {
     //
     // The `_worker_children` RAII guard holds parent pipe write-ends; when
     // it drops at end of async_main, workers EOF on their read() and exit.
+    //
+    // KNOWN-INCOMPLETE STATE (phase B-1 commit C pending): the cross-process
+    // request relay is NOT wired yet. Without it, rank-0's HTTP handler
+    // submits requests only to its own in-process scheduler. Workers boot
+    // with empty request_rx queues and never enter forward, so any TP/EP
+    // NCCL collective issued by rank-0's forward will block forever waiting
+    // for worker ranks. Setting ARLE_MULTIPROC_SERVE=1 today therefore
+    // panics at the guard below — use ARLE_MULTIPROC_ALLOW_DEADLOCK=1 to
+    // bypass for scaffolding-level smoke tests (e.g. verifying spawn).
+    #[cfg(unix)]
+    if std::env::var("ARLE_MULTIPROC_SERVE").is_ok()
+        && worker_bootstrap.len() > 1
+        && std::env::var("ARLE_MULTIPROC_ALLOW_DEADLOCK").is_err()
+    {
+        panic!(
+            "ARLE_MULTIPROC_SERVE=1 enabled but phase B-1 commit C (cross-process \
+             request relay) is not yet wired. Workers boot but never receive batches, \
+             so rank-0 NCCL collectives will deadlock. Set ARLE_MULTIPROC_ALLOW_DEADLOCK\
+             =1 to bypass this guard. See docs/plans/2026-05-27-multiproc-serve-pivot.md \
+             §B-1 commit C."
+        );
+    }
     #[cfg(unix)]
     let _worker_children =
         if std::env::var("ARLE_MULTIPROC_SERVE").is_ok() && worker_bootstrap.len() > 1 {
