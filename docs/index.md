@@ -106,6 +106,7 @@ marked as the current source of truth, treat it as historical context.
 
 | Path | Status | Use this when |
 | --- | --- | --- |
+| [plans/2026-05-27-flashinfer-paged-prefill-migration.md](plans/2026-05-27-flashinfer-paged-prefill-migration.md) | Active design | The question is whether/how to drop TileLang HD128 paged prefill for FlashInfer on sm_80. Driven by two TileLang 0.1.10 regressions in one week. |
 | [plans/2026-05-24-sglang-pipeline-cuda-mlx-gap-analysis.md](plans/2026-05-24-sglang-pipeline-cuda-mlx-gap-analysis.md) | Active — OPD/runtime gap queue | The question is G1–G7 license-or-kill work, SGLang parity gaps, or GPU/Metal-deferred runtime experiments. |
 | [plans/2026-05-25-kv-storage-transport-library-design.md](plans/2026-05-25-kv-storage-transport-library-design.md) | Active design | The question is storage/transport substrate direction for SSD↔HBM, DRAM↔HBM, T2/T3 KV movement, or the proposed transport crate boundary. |
 | [plans/2026-04-28-single-node-multi-gpu.md](plans/2026-04-28-single-node-multi-gpu.md) | Active | The question is the single-node multi-GPU plan (F0–F8 phases) for TP/PP/EP scaffolding and forward collectives. |
