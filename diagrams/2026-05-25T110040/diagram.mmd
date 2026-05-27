@@ -1,0 +1,102 @@
+---
+title: ARLE 推理数据流 — 一张图三条后端 (commit 38f28d09)
+---
+flowchart LR
+
+  %% ============ 入口 ============
+  subgraph ENTRY["入口 Entrypoints"]
+    direction TB
+    CLI["Agent CLI<br/>src/main.rs"]
+    REPL["crates/cli<br/>REPL"]
+    AGENT["crates/agent<br/>session / turn loop"]
+    HTTP["infer/http_server.rs<br/>axum"]
+    OPENAI["openai_v1.rs<br/>OpenAI 兼容"]
+    CLI --> REPL --> AGENT
+    HTTP --> OPENAI
+  end
+
+  %% ============ 契约层 ============
+  subgraph CONTRACT["统一契约 server_engine"]
+    direction TB
+    TRAIT["InferenceEngine trait<br/>server_engine.rs"]
+    LOADED["LoadedInferenceEngine enum"]
+    BIE["BackendInferenceEngine&lt;X&gt;"]
+    TRAIT --> LOADED --> BIE
+  end
+
+  AGENT --> TRAIT
+  OPENAI --> TRAIT
+
+  %% ============ CUDA path ============
+  subgraph CUDA["CUDA path 主线"]
+    direction TB
+    CBOOT["backend/cuda/bootstrap.rs"]
+    CSCHED["scheduler/cuda<br/>continuous batching<br/>chunked prefill + decode-priority"]
+    CSPEC["scheduler/cuda/spec_path.rs<br/>Phase 2 spec-decode 暂停"]
+    CMODEL["model::qwen35"]
+    COPS["ops"]
+    CKERN["crates/cuda-kernels<br/>paged_kv + TileLang AOT<br/>graph_pool + 原生 CUDA C"]
+    CBOOT --> CSCHED --> CMODEL --> COPS --> CKERN
+    CSCHED -.-> CSPEC
+  end
+
+  %% ============ Metal path ============
+  subgraph METAL["Metal path 主线"]
+    direction TB
+    MBACK["backend/metal.rs"]
+    MSCHED["backend/metal/scheduler.rs<br/>continuous batching<br/>varlen packed decode"]
+    MREQ["request_state.rs<br/>BatchKVCache 模式"]
+    MMLX["crates/mlx-sys<br/>C++ bridge"]
+    MOPS["MLX qmv / fast::rope / SDPA"]
+    MBACK --> MSCHED --> MREQ --> MMLX --> MOPS
+  end
+
+  %% ============ CPU path ============
+  subgraph CPU["CPU path"]
+    direction TB
+    CPUB["backend/cpu.rs<br/>309 行 smoke only<br/>合成响应"]
+  end
+
+  BIE --> CBOOT
+  BIE --> MBACK
+  BIE --> CPUB
+
+  %% ============ KV 子系统 横切 ============
+  subgraph KV["KV 子系统 横切"]
+    direction TB
+    PFX["prefix_cache.rs<br/>RadixCache<br/>tier-aware metadata"]
+    KTIER["kv_tier.rs + kv_tier/*<br/>backend / chunk / io / lookup<br/>readmission / coordinator<br/>host_pool / transport / tier"]
+    T0["T0 GPU paged"]
+    T1["T1 host pinned"]
+    T2["T2 NVMe"]
+    T3["T3 shared_fs<br/>NIXL 远端 stub"]
+    PFX --> KTIER
+    KTIER --> T0
+    KTIER --> T1
+    KTIER --> T2
+    KTIER --> T3
+  end
+
+  CSCHED -.-> PFX
+  MSCHED -.-> PFX
+
+  %% ============ 图例 ============
+  subgraph LEGEND["状态图例"]
+    direction LR
+    L1["主路径 ready"]:::ok
+    L2["回归暂停 paused"]:::warn
+    L3["stub 未完工"]:::stub
+  end
+
+  %% ============ 样式 ============
+  classDef ok fill:#d4f4dd,stroke:#2e7d32,stroke-width:1px,color:#1b5e20;
+  classDef warn fill:#ffe7c2,stroke:#e67e22,stroke-width:1px,color:#7a4f01;
+  classDef stub fill:#e0e0e0,stroke:#757575,stroke-width:1px,color:#424242;
+
+  class CLI,REPL,AGENT,HTTP,OPENAI,TRAIT,LOADED,BIE ok;
+  class CBOOT,CSCHED,CMODEL,COPS,CKERN ok;
+  class MBACK,MSCHED,MREQ,MMLX,MOPS ok;
+  class PFX,KTIER,T0,T1,T2 ok;
+  class CSPEC warn;
+  class CPUB stub;
+  class T3 stub;

@@ -1,0 +1,100 @@
+---
+title: ARLE Workspace Crate 依赖 (13 crates, commit 38f28d09)
+---
+flowchart TD
+    classDef binary fill:#1f3a5f,stroke:#0d1f33,color:#fff,stroke-width:2px
+    classDef control fill:#5b3a87,stroke:#2a1648,color:#fff,stroke-width:2px
+    classDef runtime fill:#2e6e3e,stroke:#143a1a,color:#fff,stroke-width:2px
+    classDef kernel fill:#a04b00,stroke:#4a2300,color:#fff,stroke-width:2px
+    classDef spec fill:#7a5c00,stroke:#3a2c00,color:#fff,stroke-width:2px
+    classDef train fill:#063b5e,stroke:#03203a,color:#fff,stroke-width:2px
+    classDef todo fill:#7a5c00,stroke:#a02020,color:#fff,stroke-width:3px,stroke-dasharray:5 3
+    classDef anti fill:#3a0a0a,stroke:#a02020,color:#fff,stroke-width:2px
+    classDef rule fill:#1a2a3a,stroke:#3a5a7a,color:#fff,stroke-width:1px
+
+    %% ============ Layer 0: binary ============
+    arle["arle (bin)<br/>src/main.rs"]:::binary
+
+    %% ============ Layer 1: control plane ============
+    subgraph CONTROL ["Control Plane (crates/)"]
+        direction LR
+        cli["cli"]:::control
+        agent["agent"]:::control
+        chat["chat"]:::control
+        tools["tools"]:::control
+    end
+
+    %% ============ Layer 2: runtime + spec ============
+    subgraph SPEC ["Spec Contracts (shared by infer + train)"]
+        direction LR
+        qwen3spec["qwen3-spec"]:::spec
+        qwen35spec["qwen35-spec"]:::spec
+        deepseek["deepseek-spec<br/>🚧 DS0 scaffold"]:::todo
+    end
+
+    infer["infer<br/>(runtime truth /<br/>scheduler / model / ops /<br/>backends / HTTP / dist)"]:::runtime
+
+    %% ============ Layer 3: kernels + persistence ============
+    subgraph KERNEL ["GPU Kernels & Native Substrates"]
+        direction LR
+        cudak["cuda-kernels<br/>csrc + TileLang + NCCL"]:::kernel
+        mlxsys["mlx-sys<br/>(feature=metal)"]:::kernel
+        kvnative["kv-native-sys<br/>(KV tier disk transport)"]:::kernel
+    end
+
+    %% ============ Layer 4: train (OPD-only) ============
+    subgraph TRAIN ["Train Plane (OPD-only, 2026-05-18 pivot)"]
+        direction LR
+        train["train"]:::train
+        autograd["autograd<br/>(from-scratch tape +<br/>AdamW + lr-sched)"]:::train
+    end
+
+    %% ===== Binary -> CLI =====
+    arle --> cli
+
+    %% ===== CLI fan-out =====
+    cli --> infer
+    cli --> agent
+    cli --> chat
+    cli --> tools
+
+    %% ===== Agent fan-out =====
+    agent --> infer
+    agent --> chat
+    agent --> tools
+
+    %% ===== Infer -> chat / kernels / persistence =====
+    infer --> chat
+    infer ==>|"⚠️ one-way only"| cudak
+    infer -->|"feature=metal"| mlxsys
+    infer -->|"kv_tier/transport/disk.rs"| kvnative
+
+    %% ===== Spec contracts consumed by infer + train =====
+    qwen3spec -.->|"model/*"| infer
+    qwen35spec -.->|"model/qwen35.rs"| infer
+    qwen35spec -.->|"qwen35.rs teacher"| train
+    deepseek -.->|"V4 kernels blocker"| infer
+
+    %% ===== Train -> infer (teacher) + autograd =====
+    train ==>|"teacher rollouts"| infer
+    train --> autograd
+
+    %% ============ Side panels (anti-goals + rules) ============
+    subgraph RULES ["Crate Split 规则"]
+        direction TB
+        r1["❌ 反向依赖<br/>runtime-* → http / cli 禁止"]:::rule
+        r2["✅ 新 crate PR 必须命名<br/>≥2 个直接消费者"]:::rule
+    end
+
+    subgraph ANTI ["⛔ Active Anti-Goals (do NOT extract)"]
+        direction TB
+        a1["NO infer-ops<br/>ops ↔ model 强耦合"]:::anti
+        a2["NO infer-scheduler-core<br/>CUDA sched 触及 PagedKVPool /<br/>TileLang meta / model bootstrap"]:::anti
+        a3["NO infer-runtime-api<br/>已被 server_engine::InferenceEngine 覆盖"]:::anti
+        a4["NO kernel *-sys split<br/>单消费者无收益"]:::anti
+        a5["NO CPU backend extract<br/>309 行 smoke / 0 独立性"]:::anti
+    end
+
+    %% Invisible links to push panels to bottom-right
+    autograd ~~~ RULES
+    RULES ~~~ ANTI

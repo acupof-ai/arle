@@ -1,0 +1,261 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100">
+  <!-- =================== Background =================== -->
+  <rect x="0" y="0" width="1600" height="1100" fill="#F7F8FB"/>
+
+  <!-- =================== Title band =================== -->
+  <rect x="40" y="30" width="1520" height="84" fill="#0F172A" rx="8" ry="8"/>
+  <text x="800" y="76" font-family="Noto Sans SC, Arial, sans-serif" font-size="30" font-weight="700" fill="#FFFFFF" text-anchor="middle">ARLE 训练-推理共生 — OPD-only Pivot (2026-05-18)</text>
+  <text x="800" y="104" font-family="Noto Sans SC, Arial, sans-serif" font-size="14" fill="#94A3B8" text-anchor="middle">commit bd94c09  ·  docs/projects/2026-05-18-opd-only-pivot.md  ·  runtime authority = 唯一立得住的差异化训练轴</text>
+
+  <!-- =================== Column headers =================== -->
+  <!-- Left header: deleted -->
+  <rect x="40" y="148" width="490" height="56" fill="#FEE2E2" stroke="#B91C1C" stroke-width="2" rx="8" ry="8"/>
+  <text x="80" y="183" font-family="Noto Sans SC, Arial, sans-serif" font-size="22" font-weight="700" fill="#B91C1C">✗ 已删 (Pivot Away)</text>
+  <text x="490" y="184" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#7F1D1D" text-anchor="end">2026-05-18</text>
+
+  <!-- Center header: substrate kept -->
+  <rect x="555" y="148" width="490" height="56" fill="#DCFCE7" stroke="#15803D" stroke-width="2" rx="8" ry="8"/>
+  <text x="595" y="183" font-family="Noto Sans SC, Arial, sans-serif" font-size="22" font-weight="700" fill="#166534">✓ 保留 (OPD Substrate)</text>
+  <text x="1005" y="184" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#14532D" text-anchor="end">crates/train + crates/autograd</text>
+
+  <!-- Right header: OPD paradigm -->
+  <rect x="1070" y="148" width="490" height="56" fill="#DBEAFE" stroke="#1D4ED8" stroke-width="2" rx="8" ry="8"/>
+  <text x="1110" y="183" font-family="Noto Sans SC, Arial, sans-serif" font-size="22" font-weight="700" fill="#1E3A8A">✓ OPD 范式 (Runtime Authority)</text>
+  <text x="1520" y="184" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E40AF" text-anchor="end">infer ⇄ train 共生</text>
+
+  <!-- =================== LEFT COLUMN: Deleted =================== -->
+  <rect x="40" y="220" width="490" height="680" fill="#FEF2F2" stroke="#FCA5A5" stroke-width="2" rx="10" ry="10"/>
+
+  <!-- Item: scratch pretrain -->
+  <rect x="64" y="248" width="442" height="92" fill="#FFFFFF" stroke="#FCA5A5" stroke-width="1.5" rx="6" ry="6"/>
+  <text x="86" y="280" font-family="Noto Sans SC, Arial, sans-serif" font-size="18" font-weight="700" fill="#991B1B" text-decoration="line-through">scratch pretrain</text>
+  <text x="86" y="306" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#7F1D1D">从零预训练 — Qwen/DeepSeek/Llama 全量数据 + GPU 池</text>
+  <text x="86" y="326" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#B91C1C">└ kill 理由：工业基线 322× 算力差距，结构性不可赢</text>
+
+  <!-- Item: SFT -->
+  <rect x="64" y="356" width="442" height="92" fill="#FFFFFF" stroke="#FCA5A5" stroke-width="1.5" rx="6" ry="6"/>
+  <text x="86" y="388" font-family="Noto Sans SC, Arial, sans-serif" font-size="18" font-weight="700" fill="#991B1B" text-decoration="line-through">SFT (Supervised Fine-Tuning)</text>
+  <text x="86" y="414" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#7F1D1D">指令数据 next-token loss — train_sft 全套</text>
+  <text x="86" y="434" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#B91C1C">└ kill 理由：axolotl / LLaMA-Factory 已成熟，无差异化</text>
+
+  <!-- Item: GRPO -->
+  <rect x="64" y="464" width="442" height="92" fill="#FFFFFF" stroke="#FCA5A5" stroke-width="1.5" rx="6" ry="6"/>
+  <text x="86" y="496" font-family="Noto Sans SC, Arial, sans-serif" font-size="18" font-weight="700" fill="#991B1B" text-decoration="line-through">GRPO (Group RL Policy Opt.)</text>
+  <text x="86" y="522" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#7F1D1D">PPO 简化 — DeepSeekMath 引入的群相对优势 RL</text>
+  <text x="86" y="542" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#B91C1C">└ kill 理由：vLLM+verl 是事实标准</text>
+
+  <!-- Item: multi-turn RL -->
+  <rect x="64" y="572" width="442" height="92" fill="#FFFFFF" stroke="#FCA5A5" stroke-width="1.5" rx="6" ry="6"/>
+  <text x="86" y="604" font-family="Noto Sans SC, Arial, sans-serif" font-size="18" font-weight="700" fill="#991B1B" text-decoration="line-through">multi-turn RL</text>
+  <text x="86" y="630" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#7F1D1D">Agent 多轮工具调用 RL — trajectory-level reward</text>
+  <text x="86" y="650" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#B91C1C">└ kill 理由：TRL / OpenRLHF 覆盖完整</text>
+
+  <!-- Decorative big X overlay -->
+  <g opacity="0.08">
+    <line x1="100" y1="700" x2="470" y2="870" stroke="#B91C1C" stroke-width="22" stroke-linecap="round"/>
+    <line x1="470" y1="700" x2="100" y2="870" stroke="#B91C1C" stroke-width="22" stroke-linecap="round"/>
+  </g>
+
+  <!-- bottom annotation -->
+  <rect x="64" y="700" width="442" height="178" fill="#FFFFFF" stroke="#FCA5A5" stroke-width="1.5" stroke-dasharray="6 4" rx="6" ry="6"/>
+  <text x="86" y="730" font-family="Noto Sans SC, Arial, sans-serif" font-size="14" font-weight="700" fill="#991B1B">为什么删？</text>
+  <text x="86" y="756" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#7F1D1D">· pretrain：算力规模差 322× — 无法追赶</text>
+  <text x="86" y="778" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#7F1D1D">· SFT：HuggingFace TRL / axolotl 已工业级</text>
+  <text x="86" y="800" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#7F1D1D">· GRPO：vLLM + verl 是事实标准栈</text>
+  <text x="86" y="822" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#7F1D1D">· multi-turn：TRL / OpenRLHF / SkyRL 覆盖完整</text>
+  <text x="86" y="852" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" font-style="italic" fill="#7F1D1D">没有 runtime 杠杆 → 与 OSS 比无任何结构性优势</text>
+
+  <!-- =================== CENTER COLUMN: Substrate =================== -->
+  <rect x="555" y="220" width="490" height="680" fill="#F0FDF4" stroke="#86EFAC" stroke-width="2" rx="10" ry="10"/>
+
+  <!-- crates/autograd -->
+  <rect x="579" y="248" width="442" height="110" fill="#FFFFFF" stroke="#22C55E" stroke-width="1.5" rx="6" ry="6"/>
+  <rect x="579" y="248" width="6" height="110" fill="#15803D" rx="3" ry="3"/>
+  <text x="601" y="278" font-family="Noto Sans SC, Arial, sans-serif" font-size="17" font-weight="700" fill="#14532D">crates/autograd</text>
+  <text x="601" y="302" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#166534">From-scratch tape — TensorStore + Tape + Backend trait</text>
+  <text x="601" y="322" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#166534">复用 infer 的 CUDA/Metal kernel，绑定到训练前后向</text>
+  <text x="601" y="346" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" fill="#16A34A" font-style="italic">支撑：LoRA 反传 · 梯度 accum/clip · AdamW codec</text>
+
+  <!-- Trainer skeleton -->
+  <rect x="579" y="370" width="442" height="98" fill="#FFFFFF" stroke="#22C55E" stroke-width="1.5" rx="6" ry="6"/>
+  <rect x="579" y="370" width="6" height="98" fill="#15803D" rx="3" ry="3"/>
+  <text x="601" y="400" font-family="Noto Sans SC, Arial, sans-serif" font-size="17" font-weight="700" fill="#14532D">Trainer&lt;O, C, S&gt;</text>
+  <text x="601" y="424" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#166534">通用骨架：Optimizer · Checkpoint · LR-Schedule</text>
+  <text x="601" y="444" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#166534">OPD 注入 step_fn (student rollout + teacher score + bp)</text>
+
+  <!-- train modules grid -->
+  <rect x="579" y="480" width="442" height="170" fill="#FFFFFF" stroke="#22C55E" stroke-width="1.5" rx="6" ry="6"/>
+  <rect x="579" y="480" width="6" height="170" fill="#15803D" rx="3" ry="3"/>
+  <text x="601" y="510" font-family="Noto Sans SC, Arial, sans-serif" font-size="17" font-weight="700" fill="#14532D">crates/train/src/* — 模块清单</text>
+  <!-- 4x3 chip grid -->
+  <g font-family="Noto Sans SC, Arial, sans-serif" font-size="12" fill="#14532D" text-anchor="middle">
+    <rect x="601" y="524" width="100" height="28" fill="#DCFCE7" stroke="#22C55E" stroke-width="1" rx="4" ry="4"/>
+    <text x="651" y="543">checkpoint</text>
+    <rect x="709" y="524" width="100" height="28" fill="#DCFCE7" stroke="#22C55E" stroke-width="1" rx="4" ry="4"/>
+    <text x="759" y="543">lora</text>
+    <rect x="817" y="524" width="100" height="28" fill="#DCFCE7" stroke="#22C55E" stroke-width="1" rx="4" ry="4"/>
+    <text x="867" y="543">tokenizer</text>
+    <rect x="925" y="524" width="92" height="28" fill="#DCFCE7" stroke="#22C55E" stroke-width="1" rx="4" ry="4"/>
+    <text x="971" y="543">causal_lm</text>
+
+    <rect x="601" y="560" width="100" height="28" fill="#DCFCE7" stroke="#22C55E" stroke-width="1" rx="4" ry="4"/>
+    <text x="651" y="579">qwen35</text>
+    <rect x="709" y="560" width="100" height="28" fill="#DCFCE7" stroke="#22C55E" stroke-width="1" rx="4" ry="4"/>
+    <text x="759" y="579">qwen35_ckpt</text>
+    <rect x="817" y="560" width="100" height="28" fill="#DCFCE7" stroke="#22C55E" stroke-width="1" rx="4" ry="4"/>
+    <text x="867" y="579">grad_accum</text>
+    <rect x="925" y="560" width="92" height="28" fill="#DCFCE7" stroke="#22C55E" stroke-width="1" rx="4" ry="4"/>
+    <text x="971" y="579">grad_clip</text>
+
+    <rect x="601" y="596" width="100" height="28" fill="#DCFCE7" stroke="#22C55E" stroke-width="1" rx="4" ry="4"/>
+    <text x="651" y="615">loss</text>
+    <rect x="709" y="596" width="208" height="28" fill="#DCFCE7" stroke="#22C55E" stroke-width="1" rx="4" ry="4"/>
+    <text x="813" y="615">model_family</text>
+    <rect x="925" y="596" width="92" height="28" fill="#F0FDF4" stroke="#86EFAC" stroke-width="1" stroke-dasharray="4 3" rx="4" ry="4"/>
+    <text x="971" y="615" fill="#16A34A">+ 扩展槽</text>
+  </g>
+  <text x="601" y="641" font-family="Noto Sans SC, Arial, sans-serif" font-size="11" fill="#16A34A" font-style="italic">all under `crates/train/src/` — OPD 直接复用</text>
+
+  <!-- Control plane -->
+  <rect x="579" y="662" width="442" height="100" fill="#FFFFFF" stroke="#22C55E" stroke-width="1.5" rx="6" ry="6"/>
+  <rect x="579" y="662" width="6" height="100" fill="#15803D" rx="3" ry="3"/>
+  <text x="601" y="692" font-family="Noto Sans SC, Arial, sans-serif" font-size="16" font-weight="700" fill="#14532D">控制面 (server · control · metrics)</text>
+  <g font-family="ui-monospace, Menlo, monospace" font-size="12" fill="#15803D">
+    <rect x="601" y="708" width="96" height="24" fill="#DCFCE7" stroke="#15803D" stroke-width="1" rx="4" ry="4"/>
+    <text x="649" y="725" text-anchor="middle">/v1/train/status</text>
+    <rect x="705" y="708" width="96" height="24" fill="#DCFCE7" stroke="#15803D" stroke-width="1" rx="4" ry="4"/>
+    <text x="753" y="725" text-anchor="middle">/events</text>
+    <rect x="809" y="708" width="96" height="24" fill="#DCFCE7" stroke="#15803D" stroke-width="1" rx="4" ry="4"/>
+    <text x="857" y="725" text-anchor="middle">/stop</text>
+    <rect x="913" y="708" width="96" height="24" fill="#DCFCE7" stroke="#15803D" stroke-width="1" rx="4" ry="4"/>
+    <text x="961" y="725" text-anchor="middle">/save</text>
+  </g>
+  <text x="601" y="751" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" fill="#166534">OpenAI 风格控制面：status / SSE events / stop / save</text>
+
+  <!-- export adapters -->
+  <rect x="579" y="774" width="442" height="104" fill="#FFFFFF" stroke="#22C55E" stroke-width="1.5" rx="6" ry="6"/>
+  <rect x="579" y="774" width="6" height="104" fill="#15803D" rx="3" ry="3"/>
+  <text x="601" y="804" font-family="Noto Sans SC, Arial, sans-serif" font-size="17" font-weight="700" fill="#14532D">可选 export adapter (三选 N)</text>
+  <g font-family="Noto Sans SC, Arial, sans-serif" font-size="13" font-weight="700" fill="#FFFFFF" text-anchor="middle">
+    <rect x="601" y="820" width="130" height="42" fill="#2563EB" stroke="#1E3A8A" stroke-width="1.5" rx="6" ry="6"/>
+    <text x="666" y="838">MLflow</text>
+    <text x="666" y="855" font-size="10" font-weight="400" fill="#DBEAFE">run/metric/artifact</text>
+
+    <rect x="739" y="820" width="130" height="42" fill="#7C3AED" stroke="#4C1D95" stroke-width="1.5" rx="6" ry="6"/>
+    <text x="804" y="838">OTLP</text>
+    <text x="804" y="855" font-size="10" font-weight="400" fill="#EDE9FE">metrics + traces</text>
+
+    <rect x="877" y="820" width="130" height="42" fill="#F59E0B" stroke="#92400E" stroke-width="1.5" rx="6" ry="6"/>
+    <text x="942" y="838">W&amp;B</text>
+    <text x="942" y="855" font-size="10" font-weight="400" fill="#FEF3C7">scalar/loss/grad</text>
+  </g>
+
+  <!-- =================== RIGHT COLUMN: OPD paradigm =================== -->
+  <rect x="1070" y="220" width="490" height="680" fill="#EFF6FF" stroke="#93C5FD" stroke-width="2" rx="10" ry="10"/>
+
+  <!-- shared infer column header -->
+  <rect x="1094" y="248" width="442" height="56" fill="#1D4ED8" rx="6" ry="6"/>
+  <text x="1115" y="282" font-family="Noto Sans SC, Arial, sans-serif" font-size="17" font-weight="700" fill="#FFFFFF">共享 inference path (infer crate)</text>
+  <text x="1515" y="282" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" fill="#DBEAFE" text-anchor="end">paged_kv · scheduler · ops</text>
+
+  <!-- Teacher box -->
+  <rect x="1094" y="320" width="200" height="180" fill="#FFFFFF" stroke="#1E40AF" stroke-width="2" rx="8" ry="8"/>
+  <rect x="1094" y="320" width="200" height="36" fill="#1E40AF" rx="8" ry="8"/>
+  <rect x="1094" y="345" width="200" height="11" fill="#1E40AF"/>
+  <text x="1194" y="345" font-family="Noto Sans SC, Arial, sans-serif" font-size="15" font-weight="700" fill="#FFFFFF" text-anchor="middle">Teacher (大模型)</text>
+  <text x="1108" y="382" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E3A8A">· Qwen3.6-35B-A3B 类</text>
+  <text x="1108" y="404" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E3A8A">· 高质量 logits 输出</text>
+  <text x="1108" y="426" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E3A8A">· 共享 paged KV</text>
+  <text x="1108" y="448" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E3A8A">· 共享 scheduler 槽</text>
+  <text x="1108" y="476" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" font-style="italic" fill="#2563EB">⇒ 训练时同步评分</text>
+
+  <!-- Student box -->
+  <rect x="1336" y="320" width="200" height="180" fill="#FFFFFF" stroke="#1E40AF" stroke-width="2" rx="8" ry="8"/>
+  <rect x="1336" y="320" width="200" height="36" fill="#2563EB" rx="8" ry="8"/>
+  <rect x="1336" y="345" width="200" height="11" fill="#2563EB"/>
+  <text x="1436" y="345" font-family="Noto Sans SC, Arial, sans-serif" font-size="15" font-weight="700" fill="#FFFFFF" text-anchor="middle">Student (小模型 + LoRA)</text>
+  <text x="1350" y="382" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E3A8A">· Qwen3.5-0.8B / 4B 类</text>
+  <text x="1350" y="404" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E3A8A">· LoRA wrap (低秩可调)</text>
+  <text x="1350" y="426" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E3A8A">· 输出 token = on-policy</text>
+  <text x="1350" y="448" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E3A8A">· 反传只更新 LoRA Δ</text>
+  <text x="1350" y="476" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" font-style="italic" fill="#2563EB">⇒ 训练目标方</text>
+
+  <!-- On-policy rollout cycle -->
+  <rect x="1094" y="520" width="442" height="180" fill="#FFFFFF" stroke="#1E40AF" stroke-width="2" rx="8" ry="8"/>
+  <text x="1108" y="552" font-family="Noto Sans SC, Arial, sans-serif" font-size="16" font-weight="700" fill="#1E3A8A">On-Policy Rollout 闭环</text>
+
+  <!-- step 1 -->
+  <circle cx="1130" cy="592" r="16" fill="#2563EB"/>
+  <text x="1130" y="598" font-family="Noto Sans SC, Arial, sans-serif" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+  <text x="1156" y="589" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E3A8A" font-weight="700">student decode 一段 token</text>
+  <text x="1156" y="606" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" fill="#1E40AF">infer scheduler · 复用 paged_kv 槽</text>
+
+  <!-- arrow down -->
+  <polyline points="1130,612 1130,628" stroke="#1D4ED8" stroke-width="2" fill="none"/>
+  <polygon points="1126,628 1134,628 1130,636" fill="#1D4ED8"/>
+
+  <!-- step 2 -->
+  <circle cx="1130" cy="652" r="16" fill="#1D4ED8"/>
+  <text x="1130" y="658" font-family="Noto Sans SC, Arial, sans-serif" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+  <text x="1156" y="649" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" fill="#1E3A8A" font-weight="700">teacher 同步打分 (logits / reward)</text>
+  <text x="1156" y="666" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" fill="#1E40AF">同 process · 同 KV pool · 低延迟</text>
+
+  <!-- step 3 -->
+  <polyline points="1130,672 1130,684" stroke="#1D4ED8" stroke-width="2" fill="none"/>
+  <polygon points="1126,684 1134,684 1130,692" fill="#1D4ED8"/>
+  <circle cx="1130" cy="700" r="0" fill="none"/>
+
+  <!-- =================== Bottom callout =================== -->
+  <rect x="40" y="920" width="1520" height="156" fill="#0F172A" rx="10" ry="10"/>
+  <rect x="40" y="920" width="10" height="156" fill="#3B82F6" rx="4" ry="4"/>
+  <text x="80" y="960" font-family="Noto Sans SC, Arial, sans-serif" font-size="20" font-weight="700" fill="#FBBF24">为什么是 OPD？— ARLE runtime authority 的结构性差异化</text>
+  <text x="80" y="996" font-family="Noto Sans SC, Arial, sans-serif" font-size="14" fill="#E2E8F0">强 inference path  ⇒  强 teacher (大模型实时 logits)  +  低延迟 student rollout 打分  ⇒  on-policy 训练唯一能跑顺的地方</text>
+  <text x="80" y="1020" font-family="Noto Sans SC, Arial, sans-serif" font-size="14" fill="#94A3B8">其他训练轴：pretrain / SFT / GRPO / multi-turn RL，开源生态 (axolotl · TRL · vLLM+verl · OpenRLHF) 已成熟 — 不重复造轮子。</text>
+  <text x="80" y="1044" font-family="Noto Sans SC, Arial, sans-serif" font-size="14" fill="#94A3B8">OPD 路径：infer 已建好的 teacher rollout latency + scheduler 直接给 student 训练当成"打分服务"，这是别的训练框架做不到的。</text>
+
+  <!-- runtime authority badge -->
+  <g transform="translate(1340 940)">
+    <rect x="0" y="0" width="200" height="120" fill="#1E40AF" stroke="#3B82F6" stroke-width="2" rx="8" ry="8"/>
+    <text x="100" y="32" font-family="Noto Sans SC, Arial, sans-serif" font-size="13" font-weight="700" fill="#DBEAFE" text-anchor="middle">infer crate</text>
+    <text x="100" y="56" font-family="Noto Sans SC, Arial, sans-serif" font-size="22" font-weight="700" fill="#FFFFFF" text-anchor="middle">runtime</text>
+    <text x="100" y="82" font-family="Noto Sans SC, Arial, sans-serif" font-size="22" font-weight="700" fill="#FFFFFF" text-anchor="middle">authority</text>
+    <text x="100" y="104" font-family="Noto Sans SC, Arial, sans-serif" font-size="11" fill="#BFDBFE" text-anchor="middle">= 唯一杠杆点</text>
+  </g>
+
+  <!-- =================== Cross-column arrows (deletion → substrate → paradigm) =================== -->
+  <!-- arrow 1: deleted to kept -->
+  <g>
+    <polyline points="540,560 553,560" stroke="#94A3B8" stroke-width="2" fill="none" stroke-dasharray="6 4"/>
+  </g>
+
+  <!-- arrow 2: kept → paradigm -->
+  <g>
+    <polyline points="1055,560 1068,560" stroke="#1D4ED8" stroke-width="2.5" fill="none"/>
+    <polygon points="1062,556 1062,564 1072,560" fill="#1D4ED8"/>
+  </g>
+
+  <!-- arrow back from student to teacher (rollout closes loop) -->
+  <g>
+    <polyline points="1294,410 1304,410 1304,440 1336,440" stroke="#2563EB" stroke-width="2" fill="none"/>
+    <polygon points="1330,436 1330,444 1340,440" fill="#2563EB"/>
+    <text x="1315" y="425" font-family="Noto Sans SC, Arial, sans-serif" font-size="11" fill="#1E40AF" text-anchor="middle">score</text>
+  </g>
+  <g>
+    <polyline points="1336,470 1304,470 1304,480 1294,480" stroke="#2563EB" stroke-width="2" fill="none"/>
+    <polygon points="1300,476 1300,484 1290,480" fill="#2563EB"/>
+    <text x="1315" y="492" font-family="Noto Sans SC, Arial, sans-serif" font-size="11" fill="#1E40AF" text-anchor="middle">tokens</text>
+  </g>
+
+  <!-- Milestone status -->
+  <text x="1108" y="730" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" fill="#1E3A8A" font-weight="700">状态：🚧 substrate 落地中</text>
+  <text x="1108" y="750" font-family="ui-monospace, Menlo, monospace" font-size="11" fill="#1D4ED8">crates/train/src/commands/train_opd.rs</text>
+  <text x="1108" y="768" font-family="Noto Sans SC, Arial, sans-serif" font-size="11" fill="#1E40AF" font-style="italic">下一个 milestone 接入完整 OPD step_fn</text>
+
+  <!-- Right column footer note -->
+  <rect x="1094" y="785" width="442" height="93" fill="#DBEAFE" stroke="#1E40AF" stroke-width="1.5" stroke-dasharray="6 4" rx="6" ry="6"/>
+  <text x="1115" y="812" font-family="Noto Sans SC, Arial, sans-serif" font-size="14" font-weight="700" fill="#1E3A8A">关键属性</text>
+  <text x="1115" y="834" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" fill="#1E40AF">· 同 process · 同 KV pool — 不出 infer 进程</text>
+  <text x="1115" y="854" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" fill="#1E40AF">· teacher 评分延迟 ≈ infer decode 延迟</text>
+  <text x="1115" y="874" font-family="Noto Sans SC, Arial, sans-serif" font-size="12" fill="#1E40AF">· LoRA Δ 反传：仅训练 student 的小量参数</text>
+
+</svg>

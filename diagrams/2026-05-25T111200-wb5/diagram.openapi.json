@@ -1,0 +1,2451 @@
+{
+  "code": 0,
+  "data": {
+    "to": "openapi",
+    "result": {
+      "nodes": [
+        {
+          "id": "o001:14",
+          "type": "composite_shape",
+          "x": 95.12375164031982,
+          "y": 8,
+          "width": 383.8999938964844,
+          "height": 634.8079999999999,
+          "text": {
+            "text": "🧭 核心枢纽 (横切所有 tier)",
+            "font_weight": "regular",
+            "font_size": 16,
+            "horizontal_align": "center",
+            "vertical_align": "top",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "🧭 核心枢纽 (横切所有 tier)"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#c2c262",
+            "border_color_type": 1,
+            "border_style": "solid",
+            "fill_opacity": 100,
+            "fill_color": "#ffffde",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        },
+        {
+          "id": "o001:21",
+          "type": "composite_shape",
+          "x": 8,
+          "y": 720.1839999999997,
+          "width": 558.147497177124,
+          "height": 1019.4,
+          "text": {
+            "text": "⬇ Demote  /  ⬆ Promote  (latency: 快→慢, 容量: 小→大)",
+            "font_weight": "regular",
+            "font_size": 16,
+            "horizontal_align": "center",
+            "vertical_align": "top",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "⬇ Demote  /  ⬆ Promote  (latency: 快→慢, 容量: 小→大)"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#c2c262",
+            "border_color_type": 1,
+            "border_style": "solid",
+            "fill_opacity": 100,
+            "fill_color": "#ffffde",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        },
+        {
+          "id": "c001:1",
+          "type": "connector",
+          "x": 353.339,
+          "y": 641.829,
+          "width": 6.553999999999974,
+          "height": 78.35500000000002,
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "dot"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:21",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.6241808872421452,
+                  "y": 2.230465719474515e-16
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:14",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.6726107123338634,
+                  "y": 0.998457801413971
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "curve",
+            "captions": {
+              "data": [
+                {
+                  "text": "分类 / 路由",
+                  "font_weight": "regular",
+                  "font_size": 12,
+                  "horizontal_align": "center",
+                  "vertical_align": "mid",
+                  "line_through": false,
+                  "underline": false,
+                  "italic": false,
+                  "angle": 0,
+                  "text_color": "#1f2329",
+                  "text_color_type": 0,
+                  "text_background_color_type": 0,
+                  "theme_text_color_code": -1,
+                  "theme_text_background_color_code": -1,
+                  "rich_text": {
+                    "paragraphs": [
+                      {
+                        "paragraph_type": 0,
+                        "elements": [
+                          {
+                            "element_type": 0,
+                            "text_element": {
+                              "text_style": {
+                                "italic": false,
+                                "underline": false,
+                                "line_through": false
+                              },
+                              "text": "分类 / 路由"
+                            }
+                          }
+                        ],
+                        "indent": 0,
+                        "list_begin_index": 0,
+                        "quote": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "turning_points": [
+              {
+                "x": 3.923000000000002,
+                "y": 71.90700000000004
+              },
+              {
+                "x": 6.045999999999992,
+                "y": 39.50400000000002
+              }
+            ],
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "caption_position": 0.6699999999999999,
+            "start_object": {
+              "id": "o001:21",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.6241808872421452,
+                "y": 2.230465719474515e-16
+              }
+            },
+            "end_object": {
+              "id": "o001:14",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.6726107123338634,
+                "y": 0.998457801413971
+              }
+            }
+          }
+        },
+        {
+          "id": "c001:2",
+          "type": "connector",
+          "x": 214.3,
+          "y": 642.808,
+          "width": 6.302999999999997,
+          "height": 78.36699999999996,
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "dot"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:14",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.3268539993608718,
+                  "y": 1
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:21",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.3760600935443964,
+                  "y": 0.0009721404747893005
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "curve",
+            "captions": {
+              "data": [
+                {
+                  "text": "调度 promote / demote",
+                  "font_weight": "regular",
+                  "font_size": 12,
+                  "horizontal_align": "center",
+                  "vertical_align": "mid",
+                  "line_through": false,
+                  "underline": false,
+                  "italic": false,
+                  "angle": 0,
+                  "text_color": "#1f2329",
+                  "text_color_type": 0,
+                  "text_background_color_type": 0,
+                  "theme_text_color_code": -1,
+                  "theme_text_background_color_code": -1,
+                  "rich_text": {
+                    "paragraphs": [
+                      {
+                        "paragraph_type": 0,
+                        "elements": [
+                          {
+                            "element_type": 0,
+                            "text_element": {
+                              "text_style": {
+                                "italic": false,
+                                "underline": false,
+                                "line_through": false
+                              },
+                              "text": "调度 promote / demote"
+                            }
+                          }
+                        ],
+                        "indent": 0,
+                        "list_begin_index": 0,
+                        "quote": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "turning_points": [
+              {
+                "x": 4.9529999999999745,
+                "y": 6.447999999999979
+              },
+              {
+                "x": 0.4509999999999934,
+                "y": 38.85299999999995
+              }
+            ],
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "caption_position": 0.6699999999999999,
+            "start_object": {
+              "id": "o001:14",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.3268539993608718,
+                "y": 1
+              }
+            },
+            "end_object": {
+              "id": "o001:21",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.3760600935443964,
+                "y": 0.0009721404747893005
+              }
+            }
+          }
+        },
+        {
+          "id": "c001:3",
+          "type": "connector",
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "solid"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:11",
+                "snap_to": "bottom",
+                "position": {
+                  "x": 0.5000000103632086,
+                  "y": 1
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:12",
+                "snap_to": "top",
+                "position": {
+                  "x": 0.5000000101698145,
+                  "y": 0.008842671194114821
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "straight",
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "start_object": {
+              "id": "o001:11",
+              "snap_to": "bottom",
+              "position": {
+                "x": 0.5000000103632086,
+                "y": 1
+              }
+            },
+            "end_object": {
+              "id": "o001:12",
+              "snap_to": "top",
+              "position": {
+                "x": 0.5000000101698145,
+                "y": 0.008842671194114821
+              }
+            }
+          },
+          "x": 0,
+          "y": 0,
+          "width": 0,
+          "height": 0
+        },
+        {
+          "id": "c001:4",
+          "type": "connector",
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "solid"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:12",
+                "snap_to": "bottom",
+                "position": {
+                  "x": 0.5000000101698145,
+                  "y": 1
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:13",
+                "snap_to": "top",
+                "position": {
+                  "x": 0.5000000100419805,
+                  "y": 0.008842671194115324
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "straight",
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "start_object": {
+              "id": "o001:12",
+              "snap_to": "bottom",
+              "position": {
+                "x": 0.5000000101698145,
+                "y": 1
+              }
+            },
+            "end_object": {
+              "id": "o001:13",
+              "snap_to": "top",
+              "position": {
+                "x": 0.5000000100419805,
+                "y": 0.008842671194115324
+              }
+            }
+          },
+          "x": 0,
+          "y": 0,
+          "width": 0,
+          "height": 0
+        },
+        {
+          "id": "c001:5",
+          "type": "connector",
+          "x": 172.022,
+          "y": 875.7719999999997,
+          "width": 43.650000000000006,
+          "height": 102.99900000000002,
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "solid"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:16",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.2758386833639661,
+                  "y": 0.9999999999999998
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:17",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.24918596526468098,
+                  "y": 0.005508984153933639
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "curve",
+            "captions": {
+              "data": [
+                {
+                  "text": "evict-on-pressure",
+                  "font_weight": "regular",
+                  "font_size": 12,
+                  "horizontal_align": "center",
+                  "vertical_align": "mid",
+                  "line_through": false,
+                  "underline": false,
+                  "italic": false,
+                  "angle": 0,
+                  "text_color": "#1f2329",
+                  "text_color_type": 0,
+                  "text_background_color_type": 0,
+                  "theme_text_color_code": -1,
+                  "theme_text_background_color_code": -1,
+                  "rich_text": {
+                    "paragraphs": [
+                      {
+                        "paragraph_type": 0,
+                        "elements": [
+                          {
+                            "element_type": 0,
+                            "text_element": {
+                              "text_style": {
+                                "italic": false,
+                                "underline": false,
+                                "line_through": false
+                              },
+                              "text": "evict-on-pressure"
+                            }
+                          }
+                        ],
+                        "indent": 0,
+                        "list_begin_index": 0,
+                        "quote": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "turning_points": [
+              {
+                "x": 32.15100000000001,
+                "y": 8.531000000000063
+              },
+              {
+                "x": 0.12999999999999545,
+                "y": 51.29200000000003
+              },
+              {
+                "x": 32.803,
+                "y": 94.36400000000003
+              }
+            ],
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "caption_position": 0.5,
+            "start_object": {
+              "id": "o001:16",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.2758386833639661,
+                "y": 0.9999999999999998
+              }
+            },
+            "end_object": {
+              "id": "o001:17",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.24918596526468098,
+                "y": 0.005508984153933639
+              }
+            }
+          }
+        },
+        {
+          "id": "c001:6",
+          "type": "connector",
+          "x": 160.592,
+          "y": 1091.2359999999999,
+          "width": 47.97999999999999,
+          "height": 102.96199999999999,
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "solid"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:17",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.22094403457242348,
+                  "y": 1
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:18",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.22597869367209752,
+                  "y": 0.005181805319753114
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "curve",
+            "captions": {
+              "data": [
+                {
+                  "text": "demote",
+                  "font_weight": "regular",
+                  "font_size": 12,
+                  "horizontal_align": "center",
+                  "vertical_align": "mid",
+                  "line_through": false,
+                  "underline": false,
+                  "italic": false,
+                  "angle": 0,
+                  "text_color": "#1f2329",
+                  "text_color_type": 0,
+                  "text_background_color_type": 0,
+                  "theme_text_color_code": -1,
+                  "theme_text_background_color_code": -1,
+                  "rich_text": {
+                    "paragraphs": [
+                      {
+                        "paragraph_type": 0,
+                        "elements": [
+                          {
+                            "element_type": 0,
+                            "text_element": {
+                              "text_style": {
+                                "italic": false,
+                                "underline": false,
+                                "line_through": false
+                              },
+                              "text": "demote"
+                            }
+                          }
+                        ],
+                        "indent": 0,
+                        "list_begin_index": 0,
+                        "quote": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "turning_points": [
+              {
+                "x": 35.377999999999986,
+                "y": 8.530999999999949
+              },
+              {
+                "x": 0.1349999999999909,
+                "y": 51.28599999999983
+              },
+              {
+                "x": 36.053,
+                "y": 94.33299999999986
+              }
+            ],
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "caption_position": 0.5,
+            "start_object": {
+              "id": "o001:17",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.22094403457242348,
+                "y": 1
+              }
+            },
+            "end_object": {
+              "id": "o001:18",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.22597869367209752,
+                "y": 0.005181805319753114
+              }
+            }
+          }
+        },
+        {
+          "id": "c001:7",
+          "type": "connector",
+          "x": 132.974,
+          "y": 1306.6999999999998,
+          "width": 65.94900000000001,
+          "height": 103.17999999999984,
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "solid"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:18",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.1917951110953023,
+                  "y": 1
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:19",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.362552521957265,
+                  "y": 0.008662299603517576
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "curve",
+            "captions": {
+              "data": [
+                {
+                  "text": "demote",
+                  "font_weight": "regular",
+                  "font_size": 12,
+                  "horizontal_align": "center",
+                  "vertical_align": "mid",
+                  "line_through": false,
+                  "underline": false,
+                  "italic": false,
+                  "angle": 0,
+                  "text_color": "#1f2329",
+                  "text_color_type": 0,
+                  "text_background_color_type": 0,
+                  "theme_text_color_code": -1,
+                  "theme_text_background_color_code": -1,
+                  "rich_text": {
+                    "paragraphs": [
+                      {
+                        "paragraph_type": 0,
+                        "elements": [
+                          {
+                            "element_type": 0,
+                            "text_element": {
+                              "text_style": {
+                                "italic": false,
+                                "underline": false,
+                                "line_through": false
+                              },
+                              "text": "demote"
+                            }
+                          }
+                        ],
+                        "indent": 0,
+                        "list_begin_index": 0,
+                        "quote": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "turning_points": [
+              {
+                "x": 52.82300000000001,
+                "y": 8.530999999999949
+              },
+              {
+                "x": 6.723000000000013,
+                "y": 51.32199999999989
+              }
+            ],
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "caption_position": 0.6699999999999999,
+            "start_object": {
+              "id": "o001:18",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.1917951110953023,
+                "y": 1
+              }
+            },
+            "end_object": {
+              "id": "o001:19",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.362552521957265,
+                "y": 0.008662299603517576
+              }
+            }
+          }
+        },
+        {
+          "id": "c001:8",
+          "type": "connector",
+          "x": 192.285,
+          "y": 1501.8919999999998,
+          "width": 61.242999999999995,
+          "height": 103.02199999999993,
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "dot"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:19",
+                "snap_to": "bottom",
+                "position": {
+                  "x": 0.5000000084020743,
+                  "y": 1
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:20",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.2832972661198062,
+                  "y": 0.006960006895364868
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "curve",
+            "captions": {
+              "data": [
+                {
+                  "text": "future",
+                  "font_weight": "regular",
+                  "font_size": 12,
+                  "horizontal_align": "center",
+                  "vertical_align": "mid",
+                  "line_through": false,
+                  "underline": false,
+                  "italic": false,
+                  "angle": 0,
+                  "text_color": "#1f2329",
+                  "text_color_type": 0,
+                  "text_background_color_type": 0,
+                  "theme_text_color_code": -1,
+                  "theme_text_background_color_code": -1,
+                  "rich_text": {
+                    "paragraphs": [
+                      {
+                        "paragraph_type": 0,
+                        "elements": [
+                          {
+                            "element_type": 0,
+                            "text_element": {
+                              "text_style": {
+                                "italic": false,
+                                "underline": false,
+                                "line_through": false
+                              },
+                              "text": "future"
+                            }
+                          }
+                        ],
+                        "indent": 0,
+                        "list_begin_index": 0,
+                        "quote": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "turning_points": [
+              {
+                "x": 0,
+                "y": 8.530999999999949
+              },
+              {
+                "x": 10.206999999999994,
+                "y": 51.29599999999982
+              },
+              {
+                "x": 51.036,
+                "y": 94.38299999999981
+              }
+            ],
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "caption_position": 0.5,
+            "start_object": {
+              "id": "o001:19",
+              "snap_to": "bottom",
+              "position": {
+                "x": 0.5000000084020743,
+                "y": 1
+              }
+            },
+            "end_object": {
+              "id": "o001:20",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.2832972661198062,
+                "y": 0.006960006895364868
+              }
+            }
+          }
+        },
+        {
+          "id": "c001:9",
+          "type": "connector",
+          "x": 365.84,
+          "y": 1306.1259999999997,
+          "width": 73.91000000000003,
+          "height": 298.1419999999998,
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "dot"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:20",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.7518556508493484,
+                  "y": 0
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:18",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.7831331827059275,
+                  "y": 0.9949243067345795
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "curve",
+            "captions": {
+              "data": [
+                {
+                  "text": "fetch-on-hit (TBD)",
+                  "font_weight": "regular",
+                  "font_size": 12,
+                  "horizontal_align": "center",
+                  "vertical_align": "mid",
+                  "line_through": false,
+                  "underline": false,
+                  "italic": false,
+                  "angle": 0,
+                  "text_color": "#1f2329",
+                  "text_color_type": 0,
+                  "text_background_color_type": 0,
+                  "theme_text_color_code": -1,
+                  "theme_text_background_color_code": -1,
+                  "rich_text": {
+                    "paragraphs": [
+                      {
+                        "paragraph_type": 0,
+                        "elements": [
+                          {
+                            "element_type": 0,
+                            "text_element": {
+                              "text_style": {
+                                "italic": false,
+                                "underline": false,
+                                "line_through": false
+                              },
+                              "text": "fetch-on-hit (TBD)"
+                            }
+                          }
+                        ],
+                        "indent": 0,
+                        "list_begin_index": 0,
+                        "quote": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "turning_points": [
+              {
+                "x": 16.150000000000034,
+                "y": 289.6109999999999
+              },
+              {
+                "x": 62.358000000000004,
+                "y": 239.21900000000005
+              },
+              {
+                "x": 73.91000000000003,
+                "y": 149.35799999999995
+              },
+              {
+                "x": 61.59200000000004,
+                "y": 59.40099999999984
+              },
+              {
+                "x": 12.31800000000004,
+                "y": 8.626999999999953
+              }
+            ],
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "caption_position": 0.5,
+            "start_object": {
+              "id": "o001:20",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.7518556508493484,
+                "y": 0
+              }
+            },
+            "end_object": {
+              "id": "o001:18",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.7831331827059275,
+                "y": 0.9949243067345795
+              }
+            }
+          }
+        },
+        {
+          "id": "c001:10",
+          "type": "connector",
+          "x": 218.57,
+          "y": 1305.7579999999998,
+          "width": 47.553,
+          "height": 103.31799999999998,
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "solid"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:19",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.607211331958422,
+                  "y": 2.4497249983109815e-15
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:18",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.42986504053468844,
+                  "y": 0.991670203735146
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "curve",
+            "captions": {
+              "data": [
+                {
+                  "text": "fetch-on-hit",
+                  "font_weight": "regular",
+                  "font_size": 12,
+                  "horizontal_align": "center",
+                  "vertical_align": "mid",
+                  "line_through": false,
+                  "underline": false,
+                  "italic": false,
+                  "angle": 0,
+                  "text_color": "#1f2329",
+                  "text_color_type": 0,
+                  "text_background_color_type": 0,
+                  "theme_text_color_code": -1,
+                  "theme_text_background_color_code": -1,
+                  "rich_text": {
+                    "paragraphs": [
+                      {
+                        "paragraph_type": 0,
+                        "elements": [
+                          {
+                            "element_type": 0,
+                            "text_element": {
+                              "text_style": {
+                                "italic": false,
+                                "underline": false,
+                                "line_through": false
+                              },
+                              "text": "fetch-on-hit"
+                            }
+                          }
+                        ],
+                        "indent": 0,
+                        "list_begin_index": 0,
+                        "quote": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "turning_points": [
+              {
+                "x": 4.831999999999994,
+                "y": 94.78699999999981
+              },
+              {
+                "x": 27.25400000000002,
+                "y": 51.972999999999956
+              }
+            ],
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "caption_position": 0.6699999999999999,
+            "start_object": {
+              "id": "o001:19",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.607211331958422,
+                "y": 2.4497249983109815e-15
+              }
+            },
+            "end_object": {
+              "id": "o001:18",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.42986504053468844,
+                "y": 0.991670203735146
+              }
+            }
+          }
+        },
+        {
+          "id": "c001:11",
+          "type": "connector",
+          "x": 363.805,
+          "y": 1090.6519999999998,
+          "width": 48.307000000000016,
+          "height": 102.95999999999981,
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "solid"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:18",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.7788004516984222,
+                  "y": 0
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:17",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.7780812774310755,
+                  "y": 0.9948358800226385
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "curve",
+            "captions": {
+              "data": [
+                {
+                  "text": "promote",
+                  "font_weight": "regular",
+                  "font_size": 12,
+                  "horizontal_align": "center",
+                  "vertical_align": "mid",
+                  "line_through": false,
+                  "underline": false,
+                  "italic": false,
+                  "angle": 0,
+                  "text_color": "#1f2329",
+                  "text_color_type": 0,
+                  "text_background_color_type": 0,
+                  "theme_text_color_code": -1,
+                  "theme_text_background_color_code": -1,
+                  "rich_text": {
+                    "paragraphs": [
+                      {
+                        "paragraph_type": 0,
+                        "elements": [
+                          {
+                            "element_type": 0,
+                            "text_element": {
+                              "text_style": {
+                                "italic": false,
+                                "underline": false,
+                                "line_through": false
+                              },
+                              "text": "promote"
+                            }
+                          }
+                        ],
+                        "indent": 0,
+                        "list_begin_index": 0,
+                        "quote": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "turning_points": [
+              {
+                "x": 12.685999999999979,
+                "y": 94.42899999999986
+              },
+              {
+                "x": 48.17199999999997,
+                "y": 51.674999999999955
+              },
+              {
+                "x": 12.009000000000015,
+                "y": 8.628999999999905
+              }
+            ],
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "caption_position": 0.5,
+            "start_object": {
+              "id": "o001:18",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.7788004516984222,
+                "y": 0
+              }
+            },
+            "end_object": {
+              "id": "o001:17",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.7780812774310755,
+                "y": 0.9948358800226385
+              }
+            }
+          }
+        },
+        {
+          "id": "c001:12",
+          "type": "connector",
+          "x": 352.237,
+          "y": 875.1279999999997,
+          "width": 41.25,
+          "height": 103.01999999999998,
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#bbbfc4",
+            "border_color_type": 0,
+            "theme_border_color_code": -1,
+            "border_style": "solid"
+          },
+          "connector": {
+            "start": {
+              "attached_object": {
+                "id": "o001:17",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.7395101551468204,
+                  "y": 0
+                }
+              },
+              "arrow_style": "none"
+            },
+            "end": {
+              "attached_object": {
+                "id": "o001:16",
+                "snap_to": "auto",
+                "position": {
+                  "x": 0.7092877385489016,
+                  "y": 0.9943053197509901
+                }
+              },
+              "arrow_style": "triangle_arrow"
+            },
+            "shape": "curve",
+            "captions": {
+              "data": [
+                {
+                  "text": "promote (re-attach GPU)",
+                  "font_weight": "regular",
+                  "font_size": 12,
+                  "horizontal_align": "center",
+                  "vertical_align": "mid",
+                  "line_through": false,
+                  "underline": false,
+                  "italic": false,
+                  "angle": 0,
+                  "text_color": "#1f2329",
+                  "text_color_type": 0,
+                  "text_background_color_type": 0,
+                  "theme_text_color_code": -1,
+                  "theme_text_background_color_code": -1,
+                  "rich_text": {
+                    "paragraphs": [
+                      {
+                        "paragraph_type": 0,
+                        "elements": [
+                          {
+                            "element_type": 0,
+                            "text_element": {
+                              "text_style": {
+                                "italic": false,
+                                "underline": false,
+                                "line_through": false
+                              },
+                              "text": "promote (re-attach GPU)"
+                            }
+                          }
+                        ],
+                        "indent": 0,
+                        "list_begin_index": 0,
+                        "quote": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "turning_points": [
+              {
+                "x": 10.885999999999967,
+                "y": 94.48900000000003
+              },
+              {
+                "x": 41.12299999999999,
+                "y": 51.72500000000002
+              },
+              {
+                "x": 10.248999999999967,
+                "y": 8.638000000000034
+              }
+            ],
+            "caption_auto_direction": false,
+            "specified_coordinate": true,
+            "caption_position": 0.5,
+            "start_object": {
+              "id": "o001:17",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.7395101551468204,
+                "y": 0
+              }
+            },
+            "end_object": {
+              "id": "o001:16",
+              "snap_to": "auto",
+              "position": {
+                "x": 0.7092877385489016,
+                "y": 0.9943053197509901
+              }
+            }
+          }
+        },
+        {
+          "id": "o001:11",
+          "type": "composite_shape",
+          "x": 139.83374309539795,
+          "y": 50.5,
+          "width": 294.4800109863281,
+          "height": 153.63199999999998,
+          "text": {
+            "text": "RadixCache\ninfer/src/prefix_cache.rs\ntier-aware metadata:\nhit_count · tier_location · session_id\nfingerprint · soft_pin_until · byte_len\nAPI: lookup_or_stage",
+            "font_weight": "regular",
+            "font_size": 14,
+            "horizontal_align": "center",
+            "vertical_align": "mid",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "font_weight": "bold",
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "RadixCache"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "infer/src/prefix_cache.rs"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "tier-aware metadata:"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "hit_count · tier_location · session_id"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "fingerprint · soft_pin_until · byte_len"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "API: lookup_or_stage"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#1565c0",
+            "border_color_type": 1,
+            "border_style": "solid",
+            "fill_opacity": 100,
+            "fill_color": "#e3f2fd",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        },
+        {
+          "id": "o001:12",
+          "type": "composite_shape",
+          "x": 137.0337553024292,
+          "y": 289.13199999999995,
+          "width": 300.0799865722656,
+          "height": 113.088,
+          "text": {
+            "text": "Coordinator\ninfer/src/kv_tier/coordinator.rs\n统一 fetch / store 队列\nServerMetrics queue / backpressure 计量",
+            "font_weight": "regular",
+            "font_size": 14,
+            "horizontal_align": "center",
+            "vertical_align": "mid",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "font_weight": "bold",
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "Coordinator"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "infer/src/kv_tier/coordinator.rs"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "统一 fetch / store 队列"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "ServerMetrics queue / backpressure 计量"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#1565c0",
+            "border_color_type": 1,
+            "border_style": "solid",
+            "fill_opacity": 100,
+            "fill_color": "#e3f2fd",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        },
+        {
+          "id": "o001:13",
+          "type": "composite_shape",
+          "x": 135.12375164031982,
+          "y": 487.2199999999999,
+          "width": 303.8999938964844,
+          "height": 113.088,
+          "text": {
+            "text": "ReadmissionPlan\n+ WaitingFetch + promote_fetched_prefix\nstaged 回升路径\n(demote → 命中 → 重 attach GPU)",
+            "font_weight": "regular",
+            "font_size": 14,
+            "horizontal_align": "center",
+            "vertical_align": "mid",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "font_weight": "bold",
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "ReadmissionPlan"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "+ WaitingFetch + promote_fetched_prefix"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "staged 回升路径"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "(demote → 命中 → 重 attach GPU)"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#1565c0",
+            "border_color_type": 1,
+            "border_style": "solid",
+            "fill_opacity": 100,
+            "fill_color": "#e3f2fd",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        },
+        {
+          "id": "o001:16",
+          "type": "composite_shape",
+          "x": 127.48499774932861,
+          "y": 762.6839999999997,
+          "width": 316.8699951171875,
+          "height": 113.088,
+          "text": {
+            "text": "✅ T0 GPU paged KV\ncrates/cuda-kernels/src/paged_kv.rs\nBF16 · page_size=16 · page-aware\ndecode-time COW · GPU 直接 prefix attach",
+            "font_weight": "regular",
+            "font_size": 14,
+            "horizontal_align": "center",
+            "vertical_align": "mid",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "✅ T0 GPU paged KV"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "font_weight": "bold",
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "crates/cuda-kernels/src/paged_kv.rs"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "BF16 · page_size=16 · page-aware"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "decode-time COW · GPU 直接 prefix attach"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#2e7d32",
+            "border_color_type": 1,
+            "border_style": "solid",
+            "fill_opacity": 100,
+            "fill_color": "#d6f5d6",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        },
+        {
+          "id": "o001:17",
+          "type": "composite_shape",
+          "x": 145.87999439239502,
+          "y": 978.1479999999997,
+          "width": 280.0800018310547,
+          "height": 113.088,
+          "text": {
+            "text": "✅ T1 Host pinned\ninfer/src/kv_tier/host_pool.rs\nHostPinnedPool (kv-native-sys arena)\ndemotion 落点",
+            "font_weight": "regular",
+            "font_size": 14,
+            "horizontal_align": "center",
+            "vertical_align": "mid",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "✅ T1 Host pinned"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "font_weight": "bold",
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "infer/src/kv_tier/host_pool.rs"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "HostPinnedPool (kv-native-sys arena)"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "demotion 落点"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#2e7d32",
+            "border_color_type": 1,
+            "border_style": "solid",
+            "fill_opacity": 100,
+            "fill_color": "#d6f5d6",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        },
+        {
+          "id": "o001:18",
+          "type": "composite_shape",
+          "x": 144.7849931716919,
+          "y": 1193.6119999999996,
+          "width": 282.27000427246094,
+          "height": 113.088,
+          "text": {
+            "text": "✅ T2 NVMe (node-local)\ninfer/src/kv_tier/transport/disk.rs\nfile/block ABI · WAL · mmap · shm\n(via crates/kv-native-sys)",
+            "font_weight": "regular",
+            "font_size": 14,
+            "horizontal_align": "center",
+            "vertical_align": "mid",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "✅ T2 NVMe (node-local)"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "font_weight": "bold",
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "infer/src/kv_tier/transport/disk.rs"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "file/block ABI · WAL · mmap · shm"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "(via crates/kv-native-sys)"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#2e7d32",
+            "border_color_type": 1,
+            "border_style": "solid",
+            "fill_opacity": 100,
+            "fill_color": "#d6f5d6",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        },
+        {
+          "id": "o001:19",
+          "type": "composite_shape",
+          "x": 69.69999885559082,
+          "y": 1409.0759999999996,
+          "width": 245.1699981689453,
+          "height": 92.816,
+          "text": {
+            "text": "✅ T3 Shared FS (cluster)\nkv_tier/transport/shared_fs.rs\nminimal cluster-shared backend",
+            "font_weight": "regular",
+            "font_size": 14,
+            "horizontal_align": "center",
+            "vertical_align": "mid",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "✅ T3 Shared FS (cluster)"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "font_weight": "bold",
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "kv_tier/transport/shared_fs.rs"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "minimal cluster-shared backend"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#2e7d32",
+            "border_color_type": 1,
+            "border_style": "solid",
+            "fill_opacity": 100,
+            "fill_color": "#d6f5d6",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        },
+        {
+          "id": "o001:20",
+          "type": "composite_shape",
+          "x": 182.8425006866455,
+          "y": 1604.2679999999996,
+          "width": 249.50999450683594,
+          "height": 92.816,
+          "text": {
+            "text": "🚧 T3 NIXL Remote\nRDMA-style cross-node transport\nstub-only — 尚未拉通",
+            "font_weight": "regular",
+            "font_size": 14,
+            "horizontal_align": "center",
+            "vertical_align": "mid",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "🚧 T3 NIXL Remote"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "RDMA-style cross-node transport"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "stub-only — 尚未拉通"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#c62828",
+            "border_color_type": 1,
+            "border_style": "solid",
+            "fill_opacity": 100,
+            "fill_color": "#fde2e2",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        },
+        {
+          "id": "o001:22",
+          "type": "composite_shape",
+          "x": 539.0237455368042,
+          "y": 289.13199999999995,
+          "width": 389.36000061035156,
+          "height": 72.544,
+          "text": {
+            "text": "状态: 本地路径 (T0–T2 + T3 shared_fs) 已拉通 ✅\n跨节点 NIXL 仍为 stub-only 🚧 (blocker for 多机 KV 共享)",
+            "font_weight": "regular",
+            "font_size": 14,
+            "horizontal_align": "center",
+            "vertical_align": "mid",
+            "line_through": false,
+            "underline": false,
+            "italic": false,
+            "angle": 0,
+            "text_color": "#1f2329",
+            "text_color_type": 0,
+            "text_background_color_type": 0,
+            "theme_text_color_code": -1,
+            "theme_text_background_color_code": -1,
+            "rich_text": {
+              "paragraphs": [
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "font_weight": "bold",
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "状态"
+                      }
+                    },
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": ": 本地路径 (T0–T2 + T3 shared_fs) 已拉通 ✅"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                },
+                {
+                  "paragraph_type": 0,
+                  "elements": [
+                    {
+                      "element_type": 0,
+                      "text_element": {
+                        "text_style": {
+                          "italic": false,
+                          "underline": false,
+                          "line_through": false
+                        },
+                        "text": "跨节点 NIXL 仍为 stub-only 🚧 (blocker for 多机 KV 共享)"
+                      }
+                    }
+                  ],
+                  "indent": 0,
+                  "list_begin_index": 0,
+                  "quote": false
+                }
+              ]
+            }
+          },
+          "style": {
+            "border_opacity": 100,
+            "border_width": "narrow",
+            "border_color": "#9e9e9e",
+            "border_color_type": 1,
+            "border_style": "dash",
+            "fill_opacity": 100,
+            "fill_color": "#f5f5f5",
+            "fill_color_type": 1
+          },
+          "composite_shape": {
+            "type": "round_rect"
+          }
+        }
+      ]
+    },
+    "metadata": {
+      "width": 0,
+      "height": 0,
+      "nodeCount": 23,
+      "connectorCount": 12
+    }
+  },
+  "error": ""
+}

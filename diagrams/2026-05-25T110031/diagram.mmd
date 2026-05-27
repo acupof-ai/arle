@@ -1,0 +1,79 @@
+---
+title: ARLE 分层架构 (commit 38f28d09 / 2026-05-25)
+---
+flowchart TD
+    classDef ok fill:#DFF5E1,stroke:#2F8F4E,stroke-width:1.5px,color:#1F3F2A;
+    classDef warn fill:#FFE8C2,stroke:#C7791F,stroke-width:1.5px,color:#5A3A0F;
+    classDef todo fill:#FBD3D1,stroke:#B23A37,stroke-width:1.5px,color:#5A1816;
+    classDef neutral fill:#EAF1FA,stroke:#3A5F8C,stroke-width:1.5px,color:#1B2C44;
+    classDef layerL1 fill:#F7F0FF,stroke:#6B4FAE,stroke-width:1.5px,color:#2D1B5A;
+    classDef layerL5 fill:#EFF7F7,stroke:#3F8F8F,stroke-width:1.5px,color:#173838;
+
+    subgraph L1["L1 · 入口层 (binary)"]
+        direction LR
+        ARLE["arle ✅<br/>src/main.rs · 薄壳"]:::ok
+    end
+
+    subgraph L2["L2 · 控制面 crates"]
+        direction LR
+        CLI["cli ✅"]:::ok
+        AGENT["agent ✅"]:::ok
+        TOOLS["tools ✅"]:::ok
+        CHAT["chat ✅"]:::ok
+    end
+
+    subgraph L3["L3 · 推理运行时 — infer crate (主权 ✅)"]
+        direction TB
+        ENGINE["server_engine ✅<br/>InferenceEngine 契约"]:::ok
+        HTTP["http_server ✅<br/>axum · OpenAI v1"]:::ok
+        SCHED["scheduler ✅<br/>batch · cuda · policy · forward_batch"]:::ok
+        MODEL["model ✅<br/>qwen35 · qwen3 · layer_communicator"]:::ok
+        OPS["ops ✅"]:::ok
+        KVT["kv_tier ✅<br/>T0 – T3"]:::ok
+        PREFIX["prefix_cache ✅<br/>RadixCache"]:::ok
+        DIST["distributed ⚠️<br/>F0–F4 scaffold · 未进 forward"]:::warn
+        SPEC["speculative ⚠️<br/>Phase 2 plumbing<br/>-62.8% 回归已暂停"]:::warn
+        subgraph BK["backend"]
+            direction LR
+            BCUDA["cuda ✅"]:::ok
+            BMETAL["metal ✅"]:::ok
+            BCPU["cpu 🚧<br/>309 行 smoke only"]:::todo
+        end
+    end
+
+    subgraph L4["L4 · 内核 / 桥"]
+        direction LR
+        CKERN["crates/cuda-kernels ✅<br/>csrc · TileLang AOT · paged_kv · graph_pool"]:::ok
+        MLXSYS["crates/mlx-sys ✅<br/>MLX C++ bridge"]:::ok
+        KVNATIVE["crates/kv-native-sys ✅<br/>本地持久化"]:::ok
+    end
+
+    subgraph L5["L5 · 共享契约层 (sideways)"]
+        direction LR
+        Q35S["crates/qwen35-spec ✅"]:::ok
+        Q3S["crates/qwen3-spec ✅"]:::ok
+        DSS["crates/deepseek-spec 🚧<br/>V4 kernels blocker"]:::todo
+        AGRAD["crates/autograd ✅"]:::ok
+        TRAIN["crates/train ✅<br/>OPD substrate · 2026-05-18 pivot"]:::ok
+    end
+
+    ARLE --> CLI
+    ARLE --> AGENT
+    ARLE --> TOOLS
+    ARLE --> CHAT
+
+    CLI --> ENGINE
+    AGENT --> ENGINE
+    TOOLS --> ENGINE
+    CHAT --> ENGINE
+
+    L3 --> L4
+    L3 -.shared contracts.-> L5
+    L4 -.shared contracts.-> L5
+
+    class L1 layerL1
+    class L2 neutral
+    class L3 neutral
+    class L4 neutral
+    class L5 layerL5
+    class BK neutral
