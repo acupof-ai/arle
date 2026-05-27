@@ -1943,26 +1943,28 @@ impl DeepseekModel {
                             })?;
                         }
                     }
-                    // V2.3: fill padded rows [token_count..padded_s_q) with
-                    // indices = -1 and topk_length = 0. No-op when no padding.
-                    if padded_s_q > token_count {
-                        use cudarc::driver::DevicePtrMut;
-                        let (idx_ptr, _gi2) = indices_unified.device_ptr_mut(&self.ctx.stream);
-                        let (len_ptr, _gl2) = topk_length.device_ptr_mut(&self.ctx.stream);
-                        unsafe {
-                            ffi::arle_flashmla_fill_pad_rows(
-                                idx_ptr as *mut i32,
-                                len_ptr as *mut i32,
-                                token_count as i32,
-                                padded_s_q as i32,
-                                topk_unified as i32,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()
-                            .map_err(|err| {
-                                anyhow::anyhow!("DSv4 FlashMLA fill_pad_rows failed: {err}")
-                            })?;
-                        }
+                }
+                // V2.3: fill padded rows [token_count..padded_s_q) with
+                // indices = -1 and topk_length = 0. Scoped outside the
+                // build_indices block so the prior `_gi/_gl` SyncOnDrop
+                // guards have dropped before we re-borrow.
+                if padded_s_q > token_count {
+                    use cudarc::driver::DevicePtrMut;
+                    let (idx_ptr, _gi2) = indices_unified.device_ptr_mut(&self.ctx.stream);
+                    let (len_ptr, _gl2) = topk_length.device_ptr_mut(&self.ctx.stream);
+                    unsafe {
+                        ffi::arle_flashmla_fill_pad_rows(
+                            idx_ptr as *mut i32,
+                            len_ptr as *mut i32,
+                            token_count as i32,
+                            padded_s_q as i32,
+                            topk_unified as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|err| {
+                            anyhow::anyhow!("DSv4 FlashMLA fill_pad_rows failed: {err}")
+                        })?;
                     }
                 }
 
