@@ -102,10 +102,40 @@ breaking the model*, not net capability gain.
   **remain valid**: those fixes were verified by sanitizer NaN count
   going from 532k → 0 per step, which is mechanism-level evidence, not
   capability-level.
-- Pending: base 0.8B multi-seed at matched seeds 0..4 (running at
-  `runs/2026-05-28-base-multiseed-eval/`), then a paired per-seed
-  delta computation to nail down the actual OPD effect (or null) at
-  this n. Errors-entry numerical update will follow.
+- Base 0.8B 5-seed eval completed (matched seeds 0..4 at
+  `runs/2026-05-28-base-multiseed-eval/`). Paired analysis below.
+
+## Paired 5-seed verdict (added 2026-05-28 tick 6)
+
+Same 5 seeds, same harness, treated = v4 step_020 (with LoRA),
+control = base 0.8B (no LoRA). Question subset is determined by seed
+alone, so paired Δ cancels question variance and gives the cleanest
+estimate of model effect.
+
+| metric | paired mean Δ | σ | 95% CI | t (H0 Δ=0) | conclusion |
+|---|---|---|---|---|---|
+| MMLU  | **+0.47pp** | 1.49pp | [-0.84, +1.77] | +0.70 | null |
+| GSM8K | **-0.70pp** | 1.15pp | [-1.71, +0.31] | -1.36 | null |
+
+Per-seed deltas (v4 − base, pp):
+
+| seed | MMLU Δ | GSM8K Δ |
+|---|---:|---:|
+| 0 | +2.54 | -1.50 |
+| 1 | +1.55 | -2.00 |
+| 2 | -0.36 | -1.00 |
+| 3 | -0.69 | +0.50 |
+| 4 | -0.70 | +0.50 |
+
+Both 95% CIs sit within ±2pp of zero. The 4× tighter paired SE
+(0.67pp MMLU, 0.51pp GSM8K) — vs the unpaired 2.89pp SE — is the
+clearest possible single experiment at this n, and it returns null.
+
+**Net OPD effect at v4 step_020: indistinguishable from base on both
+MMLU and GSM8K.** The "first cross-base" headline was noise; the
+"GSM8K regression" was noise. Future OPD work must either change the
+training (loss / data / scale) or change the eval to detect effects
+below 2pp, ideally both.
 
 ## Rule
 
