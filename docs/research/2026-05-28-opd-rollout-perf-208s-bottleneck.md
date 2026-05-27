@@ -64,6 +64,29 @@ Extrapolation to v7's rollout=256: 0.31 · 256 + 0.0099 · 256² ≈
 
 Raw data: `runs/2026-05-28-rollout-scale-bench/run.log`.
 
+### Subhypothesis check — retain_ids is NOT the quadratic source
+
+`retain_rollout_step_tensors` (`opd.rs:1705`) is called every 2
+rollout steps and calls `store.retain_ids(&keep)` which walks
+`tensors.len()` slots (`crates/autograd/src/tensor.rs:153`). A
+priori plausible O(n²) culprit.
+
+But `memory_summary live_tensors=` across the rollout sweep stays
+**flat at 370** for every (rollout_len, step) — at rollout=8, 16, 32
+the high-water mark is identical. The retain mechanism + alloc's
+`free_ids` reuse keep `tensors.len()` bounded by max-simultaneous-
+live, not by total-ever-allocated.
+
+Cost arithmetic: 370 slots × ~100 ns/slot iteration × 65 retain
+calls (n/2 at n=130) ≈ 2.4 ms total. Negligible vs the 169 s
+quadratic budget at n=130.
+
+**Subhypothesis (b) ruled out.** The quadratic cost is (a) attention
+math + KV cache materialization, which is fundamental to the
+autoregressive decode shape and cannot be removed inside the
+train-crate path — only the kernel constant can be cut, which is
+what infer's flash-attention and paged-KV kernels provide.
+
 ## What's actually happening in those 208s
 
 `crates/train/src/opd.rs:1648` opens the rollout phase with:
