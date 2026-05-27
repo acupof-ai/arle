@@ -32,6 +32,10 @@ STUDENT_BASE="${STUDENT_BASE:-/home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0__
 PORT="${PORT:-8123}"
 N_SAMPLES="${N_SAMPLES:-200}"
 GSM8K_SHOTS="${GSM8K_SHOTS:-8}"
+# Default 0.30 keeps 0.8B serve under ~5 GB on a 16 GB SKU (vs the 0.85
+# infer default that grabs ~13.6 GB). Single-request eval doesn't need a
+# big KV pool. Override for sweeps or larger ckpts.
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.30}"
 mkdir -p "$OUT_BASE"
 
 printf 'ckpt=%s\nout_base=%s\nseeds=%s\nn_samples=%s\n' \
@@ -42,6 +46,7 @@ INFER_LORA_PATH="$CKPT_PATH" target/release/infer \
     --model-path "$STUDENT_BASE" \
     --port "$PORT" \
     --disable-cuda-graph \
+    --mem-fraction-static "$MEM_FRACTION_STATIC" \
     > "$OUT_BASE/serve.log" 2>&1 &
 SERVE_PID=$!
 trap 'kill "$SERVE_PID" 2>/dev/null || true; sleep 2; kill -9 "$SERVE_PID" 2>/dev/null || true' EXIT
