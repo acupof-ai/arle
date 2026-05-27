@@ -62,7 +62,8 @@ live in this file.
 | Concern | Canonical source | Notes |
 | --- | --- | --- |
 | Strategic master (positioning, axes, kill criteria) | [projects/2026-05-07-arle-master-strategy.md](projects/2026-05-07-arle-master-strategy.md) | Cited by [`ROADMAP.md`](../ROADMAP.md) as strategic master. |
-| Support status of backends / APIs / model families / quantization | [support-matrix.md](support-matrix.md) | README and roadmap summarize only. |
+| Support status of backends / APIs / model families | [support-matrix.md](support-matrix.md) | README and roadmap summarize only. |
+| Quantization deep map (KV + weights, kernels, status, tests) | [quantization.md](quantization.md) | Canonical for every quant path; support-matrix §4 mirrors a one-glance view. |
 | Stability levels and compatibility posture | [stability-policy.md](stability-policy.md) | Do not redefine tiers elsewhere. |
 | Workspace topology and module entry points | [codebase-map.md](codebase-map.md) | Source of truth for "what exists today". |
 | Architecture ownership and boundaries | [architecture.md](architecture.md) | `infer` owns runtime truth. |
