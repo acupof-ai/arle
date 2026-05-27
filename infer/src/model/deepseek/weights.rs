@@ -1788,13 +1788,23 @@ impl DeepseekModel {
             // Default ON (env knob `ARLE_DSV4_FLASHMLA_PREFILL` defaults to
             // true). Override with `=0` to force legacy for the chunk-1
             // boundary too.
+            // V2.3 s_q padding (TP>1 only). For TP>1 we already allocate
+            // separate gather/pack/full_out scratches, so padding s_q to the
+            // next multiple of 64 is a localized change: pad q_send, gather,
+            // pack, full_out + fill indices/topk_length pad rows + pass
+            // padded_s_q to FlashMLA. TP=1 keeps the strict verified shape
+            // (q_prepared / local_attn would need their own padding to avoid
+            // OOB and that's a separate cleanup).
             const FLASHMLA_VERIFIED_S_Q: usize = 16384;
             const FLASHMLA_TOTAL_POSITION_LIMIT: usize = 24576;
             let total_position_after = start_pos + token_count;
             let (sm_major, _sm_minor) = self.ctx.compute_capability();
+            let tp_world_outer = self.config.tp.world_size;
+            let token_count_ok =
+                token_count == FLASHMLA_VERIFIED_S_Q || (tp_world_outer > 1 && token_count > 1);
             let use_flashmla = sm_major == 9
                 && (mode_int == 1 || mode_int == 2)
-                && token_count == FLASHMLA_VERIFIED_S_Q
+                && token_count_ok
                 && (head_dim == 512 || head_dim == 576)
                 && total_position_after <= FLASHMLA_TOTAL_POSITION_LIMIT
                 && dsv4_flashmla_prefill_enabled()?;
@@ -1802,6 +1812,15 @@ impl DeepseekModel {
                 let tp_world = self.config.tp.world_size;
                 let tp_rank = self.config.tp.rank;
                 let global_heads = local_heads * tp_world;
+
+                // V2.3 padded s_q: TP=1 path keeps padded_s_q == token_count
+                // (strict gate guarantees 16384 there); TP>1 pads up to next
+                // multiple of 64 for FlashMLA's TMA descriptor.
+                let padded_s_q = if tp_world > 1 {
+                    token_count.div_ceil(64) * 64
+                } else {
+                    token_count
+                };
 
                 // FlashMLA B_H == 64 → global h_q must be a multiple of 64. With
                 // 64 total Q heads at any TP this is satisfied; check defensively.
@@ -1871,16 +1890,16 @@ impl DeepseekModel {
                     }
                 }
 
-                // ---- Unified indices + topk_length ----
+                // ---- Unified indices + topk_length (padded for V2.3) ----
                 let mut indices_unified: cudarc::driver::CudaSlice<i32> = self
                     .ctx
                     .stream
-                    .alloc_zeros::<i32>(token_count * topk_unified)
+                    .alloc_zeros::<i32>(padded_s_q * topk_unified)
                     .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA indices alloc failed: {err}"))?;
                 let mut topk_length: cudarc::driver::CudaSlice<i32> = self
                     .ctx
                     .stream
-                    .alloc_zeros::<i32>(token_count)
+                    .alloc_zeros::<i32>(padded_s_q)
                     .map_err(|err| {
                         anyhow::anyhow!("DSv4 FlashMLA topk_length alloc failed: {err}")
                     })?;
@@ -1924,6 +1943,27 @@ impl DeepseekModel {
                             })?;
                         }
                     }
+                    // V2.3: fill padded rows [token_count..padded_s_q) with
+                    // indices = -1 and topk_length = 0. No-op when no padding.
+                    if padded_s_q > token_count {
+                        use cudarc::driver::DevicePtrMut;
+                        let (idx_ptr, _gi2) = indices_unified.device_ptr_mut(&self.ctx.stream);
+                        let (len_ptr, _gl2) = topk_length.device_ptr_mut(&self.ctx.stream);
+                        unsafe {
+                            ffi::arle_flashmla_fill_pad_rows(
+                                idx_ptr as *mut i32,
+                                len_ptr as *mut i32,
+                                token_count as i32,
+                                padded_s_q as i32,
+                                topk_unified as i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DSv4 FlashMLA fill_pad_rows failed: {err}")
+                            })?;
+                        }
+                    }
                 }
 
                 // ---- TP-AllGather Q (skipped at TP=1) ----
@@ -1941,22 +1981,70 @@ impl DeepseekModel {
                              build with --features nccl and set TP env-bootstrap vars",
                         )
                     })?;
-                    let send_count = token_count * local_heads * head_dim;
+                    // V2.3 padded send: pad q_prepared from token_count rows to
+                    // padded_s_q rows (zero-fill tail) so the AllGather, repack
+                    // and downstream FlashMLA all see the same padded s_q.
+                    let padded_send_count = padded_s_q * local_heads * head_dim;
+                    let q_send_buf: cudarc::driver::CudaSlice<bf16> = if padded_s_q == token_count {
+                        // No padding needed — clone the existing q_prepared via
+                        // an alloc + memcpy_dtod so the borrow lifetime matches
+                        // the padded path below (avoids carrying two code paths).
+                        let mut buf = self
+                            .ctx
+                            .stream
+                            .alloc_zeros::<bf16>(padded_send_count)
+                            .map_err(|err| {
+                                anyhow::anyhow!("FlashMLA TP Q send scratch alloc failed: {err}")
+                            })?;
+                        self.ctx
+                            .stream
+                            .memcpy_dtod(&q_prepared.data, &mut buf)
+                            .map_err(|err| {
+                                anyhow::anyhow!("FlashMLA TP Q send memcpy failed: {err}")
+                            })?;
+                        buf
+                    } else {
+                        // Allocate padded buffer (zero-filled) and copy the
+                        // actual token_count rows into the first slab. Tail
+                        // rows remain zero so FlashMLA reads zero Q for them.
+                        let mut buf = self
+                            .ctx
+                            .stream
+                            .alloc_zeros::<bf16>(padded_send_count)
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "FlashMLA TP Q padded send scratch alloc failed: {err}"
+                                )
+                            })?;
+                        let actual_elems = token_count * local_heads * head_dim;
+                        let dst_slice = buf.slice_mut(0..actual_elems);
+                        self.ctx
+                            .stream
+                            .memcpy_dtod(&q_prepared.data, &mut { dst_slice })
+                            .map_err(|err| {
+                                anyhow::anyhow!("FlashMLA TP Q padded send memcpy failed: {err}")
+                            })?;
+                        buf
+                    };
                     let mut gathered = unsafe {
                         self.ctx
                             .stream
-                            .alloc_traced::<bf16>(send_count * tp_world)
+                            .alloc_traced::<bf16>(padded_send_count * tp_world)
                             .map_err(|err| {
                                 anyhow::anyhow!(
                                     "FlashMLA TP allgather Q scratch alloc failed: {err}",
                                 )
                             })?
                     };
-                    tp_nccl.all_gather_bf16_device(&q_prepared.data, send_count, &mut gathered)?;
+                    tp_nccl.all_gather_bf16_device(
+                        &q_send_buf,
+                        padded_send_count,
+                        &mut gathered,
+                    )?;
                     let mut packed = unsafe {
                         self.ctx
                             .stream
-                            .alloc_traced::<bf16>(send_count * tp_world)
+                            .alloc_traced::<bf16>(padded_send_count * tp_world)
                             .map_err(|err| {
                                 anyhow::anyhow!("FlashMLA TP packed Q scratch alloc failed: {err}",)
                             })?
@@ -1973,7 +2061,7 @@ impl DeepseekModel {
                                 gathered_ptr as *const ffi::Half,
                                 packed_ptr as *mut ffi::Half,
                                 tp_world as i32,
-                                token_count as i32,
+                                padded_s_q as i32,
                                 local_heads as i32,
                                 head_dim as i32,
                                 self.ctx.stream.cu_stream(),
@@ -1984,7 +2072,8 @@ impl DeepseekModel {
                             })?;
                         }
                     }
-                    let full_out_len = token_count * global_heads * head_dim;
+                    drop(q_send_buf);
+                    let full_out_len = padded_s_q * global_heads * head_dim;
                     let full_out = unsafe {
                         self.ctx
                             .stream
@@ -2073,7 +2162,8 @@ impl DeepseekModel {
                             flashmla_out_ptr,
                             std::ptr::null_mut(), // max_logits
                             std::ptr::null_mut(), // lse
-                            token_count as i32,
+                            // V2.3: padded s_q (TP>1) or token_count (TP=1).
+                            padded_s_q as i32,
                             s_kv_total as i32,
                             h_q_for_flashmla,
                             h_kv,
