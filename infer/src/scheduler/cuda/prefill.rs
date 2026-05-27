@@ -11,6 +11,21 @@ use super::execution::PrefillCandidate;
 /// drop and for in-flight decode rows to free their growth reservations.
 const PREFILL_OOM_COOLDOWN_MS: u64 = 5_000;
 
+/// `INFER_BYPASS_TILELANG_PREFILL=1` opt-in route-around. Forces every
+/// paged-pool prefill to take the contig CUDA C prefill path (already
+/// used by TurboQuant page_size=1 today). Scheduler then performs the
+/// standard contig→paged migration in `prepare_prefill_completion`.
+///
+/// Motivation: TileLang 0.1.10 FullRow on sm_80 produces NaN attention
+/// output for warps 2/3 (rows ≥ BLOCK_M/2). See
+/// `docs/experience/errors/2026-05-27-tilelang-0110-fullrow-warp23-nan-sm80.md`.
+/// Cached on first call to avoid env lookup overhead per prefill batch.
+fn bypass_tilelang_prefill() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("INFER_BYPASS_TILELANG_PREFILL").is_ok())
+}
+
 /// Recognise the OOM signature surfaced by `cudarc` / CUDA kernels through
 /// `anyhow`. Matches both `DriverError(CUDA_ERROR_OUT_OF_MEMORY, ...)` and
 /// the bare "out of memory" string the kernel-side allocator emits.
@@ -548,9 +563,21 @@ impl<M: ModelForward> Scheduler<M> {
         // diagnostics; auto-default has already been routed off FP8 to
         // protect production. See
         // `docs/experience/errors/2026-05-26-fp8-kv-step1-divergence-known-deferred.md`.
+        //
+        // `INFER_BYPASS_TILELANG_PREFILL=1` route-around: TileLang 0.1.10
+        // FullRow + sm_80 produces NaN for warps 2/3 of the paged prefill
+        // attention output (see
+        // `docs/experience/errors/2026-05-27-tilelang-0110-fullrow-warp23-nan-sm80.md`).
+        // Setting the env var forces every paged-pool request to the
+        // contig prefill path (BF16/INT8/FP8/TQ — uniform); the
+        // `prepare_prefill_completion` arm at line ~400 handles the
+        // contig→paged migration the same way TQ4 already relies on. Decode
+        // is unaffected (paged decode kernel does not share the FullRow
+        // codegen path).
         let uses_paged = self.model.prefill_uses_paged_pool()
             && self.paged_kv_pool.is_active()
-            && self.paged_kv_pool.page_size == 16;
+            && self.paged_kv_pool.page_size == 16
+            && !bypass_tilelang_prefill();
         let batch_size = chunks.len();
         let prefill_spans: Vec<(usize, fastrace::Span)> = chunks
             .iter()
