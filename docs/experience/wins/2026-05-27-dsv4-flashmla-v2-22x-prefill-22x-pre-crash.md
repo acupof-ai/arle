@@ -1,4 +1,4 @@
-# DSv4 FlashMLA V2 SM90 sparse prefill — 22× prefill speedup (partial: crashes mid-prefill on TMA, debug pending)
+# DSv4 FlashMLA V2 / V2.1 SM90 sparse prefill — 15–22× prefill speedup, SLO range achieved for ≤16K (crashes >24K)
 
 ## SLO-shape probed?  Y — 28899-token prefill, 8× H20 TP=8, FlashMLA V2 ENABLED
 
@@ -31,13 +31,17 @@ After landing the FlashMLA vendored kernel (commit `bbd23a20`) + V1 shim wire (`
 |---|---|---:|---:|---|
 | 2026-05-27 baseline | per-token grid kernel | 282s @ 29K | — | (from GEMM-marginal entry) |
 | V1 (3b7808ee) | FlashMLA → KUException → host abort | N/A | — | h_q % B_H fail |
-| **V2 @ 4K** | FlashMLA full V2 path | **1.84s** | 17.6s @ 4K → **9.6× faster** | ✅ clean |
-| **V2 @ 16K** | FlashMLA full V2 path | **4.93s** | ~76s linear extrap → **15× faster** | ✅ clean — **single chunk, in SLO range** |
-| **V2 @ 24K** | FlashMLA full V2 path | **7.81s** | ~115s linear extrap → **15× faster** | ✅ clean (across chunk-2 transition) |
+| **V2 @ 4K** (CSA-only) | FlashMLA, CSA mode 1 only | **1.84s** | 17.6s @ 4K → **9.6× faster** | ✅ clean |
+| **V2 @ 16K** (CSA-only) | FlashMLA, CSA mode 1 only | **4.93s** | ~76s linear extrap → **15× faster** | ✅ clean — **single chunk, in SLO range** |
+| **V2 @ 24K** (CSA-only) | FlashMLA, CSA mode 1 only | **7.81s** | ~115s linear extrap → **15× faster** | ✅ clean (across chunk-2 transition) |
 | **V2 #1 @ 29K** | FlashMLA full V2 path | **12.81s before crash** | 282s → **22× faster pre-crash** | ❌ TMA OOB mid-prefill |
 | **V2 #2 @ 29K** (with null defense) | + eaa42a8d | **13.00s before crash** | same | ❌ same sig (null wasn't the bug) |
+| **V2.1 @ 4K** (HCA-on) | FlashMLA, CSA + HCA mode 2 | **2.06s** | +12% vs V2 4K | ✅ clean |
+| **V2.1 @ 16K** (HCA-on) | FlashMLA, CSA + HCA mode 2 | **5.05s** | +2.4% vs V2 16K (wash) | ✅ clean, **in SLO range** |
+| **V2.1 @ 24K** (HCA-on) | FlashMLA, CSA + HCA mode 2 | **7.69s** | **−1.5% vs V2 24K (slightly faster)** | ✅ clean — HCA structurally sound |
+| **V2.1 @ 29K** (HCA-on, commit `326a6e48`) | FlashMLA, CSA + HCA mode 2 | **12.80s before crash** | same as V2 #1 / #2 | ❌ same TMA OOB crash sig |
 
-Bisect: bug only triggers at >24K-token prompts. Chunk-2 transition itself is fine (24K and 29K both have chunk 2). Bug-trigger is at some specific compressed_count / kv_unified size threshold between 24K and 29K.
+Bisect: bug only triggers at >24K-token prompts. Chunk-2 transition itself is fine (24K and 29K both have chunk 2). Adding HCA wiring did not shift the crash point — **the bug lives in shared CSA+HCA infrastructure**: most likely `kv_unified` size accounting or the TP-AllGather of Q at chunk-2 with large `compressed_count`, since both mode 1 and mode 2 share `arle_flashmla_csa_pack_kv` and the TP-AllGather block in `weights.rs::finish_attention_gpu`.
 
 ## What's causing the crash
 
@@ -84,8 +88,20 @@ When integrating a 3rd-party kernel with internal exceptions or asserts, **alway
 - Probe artifacts on pod: `/sgl-workspace/arle-fresh/docs/trace-artifacts/2026-05-27-dsv4-flashmla-v2{,-fix}/`
 - TMA Desc Addr output captured in `bzp7cxh0i.output`
 
-## Open issues for V2.1 (debug + ship)
+## Open issues for V2.2 (debug + ship)
 
-1. TMA crash root-cause: bisect with 4K-token probe (in flight); if 4K passes, the bug is in chunk-2 compressed_count interaction. If 4K fails, the bug is at smaller scale and easier to repro.
-2. Once crash fixed, write **HCA mode dispatch** through FlashMLA (the 20 layers still falling back to legacy) — projected another 2-3× total speedup.
-3. After both, flip `dsv4_flashmla_prefill_enabled()` default to `true`.
+1. **HCA wiring DONE (commit `326a6e48`)** — `arle_flashmla_hca_build_indices` + `mode_int == 2` dispatch lands the 20 HCA layers on the FlashMLA path. All ≤24K probes are clean (4K=2.06s, 16K=5.05s, 24K=7.69s); 24K is slightly FASTER than the CSA-only baseline (-1.5%) which strongly suggests HCA layers were a partial bottleneck on the legacy path.
+2. **29K TMA crash root-cause: shared CSA+HCA infra, not mode-specific.** Both V2 (CSA only) and V2.1 (CSA+HCA) crash at the same 12.8s wall-clock point with `CUDA_ERROR_ILLEGAL_ADDRESS` at the downstream MoE D2H. Hypothesis order:
+   - **`arle_flashmla_csa_pack_kv` size mismatch at chunk-2** when `compressed_count` accumulates from chunk 1. The kv_unified buffer is sized `sliding_window + token_count + compressed_count` head_dim entries; if the actual write footprint at chunk 2 exceeds this, TMA descriptor would point past the buffer.
+   - **TP-AllGather Q size accounting at chunk-2** — `send_count = token_count * local_heads * head_dim` for the chunk 2 sub-block. With chunk 2 having more SW-cache writes (12515 vs 16384 tokens), the AllGather receive buffer might mis-stride. Less likely since the same code path runs at 16K and 24K cleanly.
+   - **`indices_unified` OOB values** when CSA selector at chunk-2 returns indices that include the prior chunk's compressed entries. The compress-block causality gate (`compress_ratio`) in `arle_csa_build_indices` filters block_end > abs_pos, but it doesn't filter against `compressed_count`. If selector outputs an index >= compressed_count, we deref a -1 slot.
+3. After crash fixed, flip `dsv4_flashmla_prefill_enabled()` default to `true` and remove the env knob.
+
+## Refs (V2.1 additions)
+
+- `326a6e48` HCA dispatch wired (mode 2 layers now flow through FlashMLA)
+- `38fae612` `arle_flashmla_hca_build_indices` kernel + FFI
+- 4K HCA probe artifact: `bn1k41f3c.output` (2.06s)
+- 16K HCA probe artifact: `bz3hr2np8.output` (5.05s)
+- 24K HCA probe artifact: `bts92gdts.output` (7.69s — FASTER than CSA-only baseline!)
+- 29K HCA full probe artifact: `b4mhwg0a4.output` (12.80s pre-crash, same sig as V2)
