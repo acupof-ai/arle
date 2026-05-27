@@ -119,6 +119,33 @@ pub(crate) struct DeepseekMoeRuntimeCache {
     pub(crate) shared_expert: Option<DeepseekExpertRuntimeScratch>,
     pub(crate) grouped: Option<DeepseekGroupedExpertRuntimeScratch>,
     pub(crate) route_combine: Option<DeepseekRouteCombineRuntimeScratch>,
+    pub(crate) native_deepep: Option<DeepseekNativeDeepEpRuntimeScratch>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekNativeDeepEpRuntimeScratch {
+    pub(crate) capacity_tokens: usize,
+    pub(crate) capacity_recv: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) topk: usize,
+    pub(crate) ep_world: usize,
+    pub(crate) num_experts: usize,
+    pub(crate) num_channels: usize,
+    pub(crate) topk_idx_i64: CudaSlice<i64>,
+    pub(crate) recv_x: HiddenStates,
+    pub(crate) recv_src_idx: CudaSlice<i32>,
+    pub(crate) recv_topk_idx: CudaSlice<i64>,
+    pub(crate) recv_topk_w: CudaSlice<f32>,
+    pub(crate) rank_prefix: CudaSlice<i32>,
+    pub(crate) recv_channel_prefix: CudaSlice<i32>,
+    pub(crate) send_head: CudaSlice<i32>,
+    pub(crate) num_tokens_per_rank: CudaSlice<i32>,
+    pub(crate) num_tokens_per_expert: CudaSlice<i32>,
+    pub(crate) is_token_in_rank: CudaSlice<u8>,
+    pub(crate) channel_prefix_matrix: CudaSlice<i32>,
+    pub(crate) combined_x: HiddenStates,
+    pub(crate) combined_topk_w: CudaSlice<f32>,
+    pub(crate) expert_out: HiddenStates,
 }
 
 #[cfg(feature = "cuda")]
@@ -493,6 +520,96 @@ impl DeepseekMoeRuntimeCache {
             .route_combine
             .as_mut()
             .expect("DeepSeek V4 route combine scratch allocated"))
+    }
+
+    pub(crate) fn ensure_native_deepep_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        hidden_dim: usize,
+        capacity_tokens: usize,
+        topk: usize,
+        ep_world: usize,
+        num_experts: usize,
+        num_channels: usize,
+    ) -> Result<&mut DeepseekNativeDeepEpRuntimeScratch> {
+        let capacity_tokens = capacity_tokens.max(1);
+        // Worst-case received tokens: every input could be broadcast to every
+        // rank's experts. Match DeepEP's upper bound (num_tokens * world).
+        let capacity_recv = capacity_tokens.saturating_mul(ep_world).max(1);
+        let topk = topk.max(1);
+        let ep_world = ep_world.max(1);
+        let num_experts = num_experts.max(1);
+        let num_channels = num_channels.max(1);
+        let needs_alloc = self
+            .native_deepep
+            .as_ref()
+            .map(|scratch| {
+                scratch.capacity_tokens < capacity_tokens
+                    || scratch.capacity_recv < capacity_recv
+                    || scratch.hidden_dim != hidden_dim
+                    || scratch.topk != topk
+                    || scratch.ep_world != ep_world
+                    || scratch.num_experts != num_experts
+                    || scratch.num_channels != num_channels
+            })
+            .unwrap_or(true);
+        if needs_alloc {
+            self.native_deepep = Some(DeepseekNativeDeepEpRuntimeScratch {
+                capacity_tokens,
+                capacity_recv,
+                hidden_dim,
+                topk,
+                ep_world,
+                num_experts,
+                num_channels,
+                topk_idx_i64: unsafe {
+                    ctx.stream
+                        .alloc_traced::<i64>(capacity_tokens.saturating_mul(topk))?
+                },
+                recv_x: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_recv)? },
+                recv_src_idx: unsafe { ctx.stream.alloc_traced::<i32>(capacity_recv)? },
+                recv_topk_idx: unsafe {
+                    ctx.stream
+                        .alloc_traced::<i64>(capacity_recv.saturating_mul(topk))?
+                },
+                recv_topk_w: unsafe {
+                    ctx.stream
+                        .alloc_traced::<f32>(capacity_recv.saturating_mul(topk))?
+                },
+                rank_prefix: unsafe {
+                    ctx.stream
+                        .alloc_traced::<i32>(ep_world.saturating_mul(ep_world))?
+                },
+                recv_channel_prefix: unsafe {
+                    ctx.stream
+                        .alloc_traced::<i32>(ep_world.saturating_mul(num_channels))?
+                },
+                send_head: unsafe {
+                    ctx.stream
+                        .alloc_traced::<i32>(capacity_tokens.saturating_mul(ep_world))?
+                },
+                num_tokens_per_rank: unsafe { ctx.stream.alloc_traced::<i32>(ep_world)? },
+                num_tokens_per_expert: unsafe { ctx.stream.alloc_traced::<i32>(num_experts)? },
+                is_token_in_rank: unsafe {
+                    ctx.stream
+                        .alloc_traced::<u8>(capacity_tokens.saturating_mul(ep_world))?
+                },
+                channel_prefix_matrix: unsafe {
+                    ctx.stream
+                        .alloc_traced::<i32>(ep_world.saturating_mul(num_channels))?
+                },
+                combined_x: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_tokens)? },
+                combined_topk_w: unsafe {
+                    ctx.stream
+                        .alloc_traced::<f32>(capacity_tokens.saturating_mul(topk))?
+                },
+                expert_out: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_recv)? },
+            });
+        }
+        Ok(self
+            .native_deepep
+            .as_mut()
+            .expect("DeepSeek V4 native-deepep scratch allocated"))
     }
 }
 
