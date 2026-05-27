@@ -91,6 +91,12 @@ Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B) on CUDA + Metal. Next-mod
 
 Authoritative tier matrix: [docs/support-matrix.md](docs/support-matrix.md) · [docs/stability-policy.md](docs/stability-policy.md).
 
+### DSv4-Flash · 8×H20 workload performance
+
+<p align="center"><img src="docs/figures/dsv4-h20-workload-perf.png" alt="DSv4-Flash workload chart" width="900"></p>
+
+Measured on **DeepSeek-V4-Flash** with the **legacy CSA prefill kernel** (8×H20, TP=8, fp8 KV cache, num-slots=4). Decode TPOT is shape-insensitive (~26 ms/token); prefill TTFT scales linearly with prompt length (~7 ms/token). The FlashMLA SM90 sparse-prefill backend (V2 work-in-progress, env-opt-in via `ARLE_DSV4_FLASHMLA_PREFILL=1`) ships an experimental fast path for chunks where `token_count` is a multiple of 64 — see [`docs/experience/wins/2026-05-27-dsv4-flashmla-v2-22x-prefill-22x-pre-crash.md`](docs/experience/wins/2026-05-27-dsv4-flashmla-v2-22x-prefill-22x-pre-crash.md) for the in-flight axis.
+
 ---
 
 ## Why ARLE
