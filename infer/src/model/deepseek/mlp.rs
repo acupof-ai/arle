@@ -1203,7 +1203,13 @@ fn dsv4_local_grouped_experts_enabled() -> Result<bool> {
 
 #[cfg(feature = "cuda")]
 fn dsv4_a3_phase1_enabled() -> Result<bool> {
-    dsv4_env_flag_default("DSV4_A3_PHASE1", true)
+    // Default OFF until the V2.2 FlashMLA TMA descriptor regression is
+    // root-caused. A3 phase 1 = device exclusive-scan for offsets_gpu; the
+    // ON-path co-occurred with a TMA init failure on the FlashMLA prefill
+    // path at 4K-16K probes (server.log: TMA descriptor 700, format 9). The
+    // legacy `clone_htod(offsets_host)` path remains stable. Re-enable opt-in
+    // via `DSV4_A3_PHASE1=1` once the regression is isolated.
+    dsv4_env_flag("DSV4_A3_PHASE1")
 }
 
 #[cfg(feature = "cuda")]
