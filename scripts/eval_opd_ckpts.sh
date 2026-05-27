@@ -83,10 +83,11 @@ print(f'>> $label mmlu={m} gsm8k={g}')"
 }
 
 eval_one "base_0p8b" ""
-for step in 010 020 030 040 050 060 070 080 090 100; do
-    ckpt="$RUN_DIR/student/step_000${step}"
-    [[ -d "$ckpt" ]] && eval_one "step_000${step}" "$ckpt"
-done
+# Discover all step_000NNN dirs (covers save-every 5, 10, etc.) and eval in order.
+while IFS= read -r ckpt; do
+    name=$(basename "$ckpt")
+    eval_one "$name" "$ckpt"
+done < <(ls -d "$RUN_DIR/student/step_"* 2>/dev/null | sort)
 [[ -d "$RUN_DIR/student/final" ]] && eval_one "final" "$RUN_DIR/student/final"
 
 printf '\n══════════ BENCH SUMMARY (%s) ══════════\n' "$RUN_DIR"
