@@ -696,4 +696,248 @@ cudaError_t decode_attention_int8_per_channel_k_cuda(
     return cudaGetLastError();
 }
 
+// ============================================================================
+// INT4 KIVI per-channel K decode attention. 4-bit packed K/V, unpacked
+// on-the-fly during compute. Same KIVI scheme as INT8/FP8 siblings:
+// per-channel K + per-(row, head) V.
+// ============================================================================
+extern "C++" {
+template <int HEAD_DIM>
+__global__ void decode_attention_int4_per_channel_k_partial_kernel(
+    const __nv_bfloat16* __restrict__ Q,
+    const uint8_t* __restrict__ K_data_packed,
+    const uint8_t* __restrict__ V_data_packed,
+    const float* __restrict__ K_static_scales,
+    const float* __restrict__ V_scales,
+    const int32_t* __restrict__ kv_indices,
+    const int32_t* __restrict__ kv_meta,
+    float* __restrict__ partial_out,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l,
+    int batch_size,
+    int num_qo_heads,
+    int num_kv_heads,
+    int kv_dim,
+    float sm_scale,
+    int num_splits)
+{
+    constexpr int EPT = HEAD_DIM / WARP_SIZE;
+    static_assert(EPT % 2 == 0,
+        "INT4 KIVI requires HEAD_DIM/WARP_SIZE even (paired-nibble compute)");
+
+    int split_idx = blockIdx.x;
+    int total_q_idx = blockIdx.y;
+    int req_idx = total_q_idx / num_qo_heads;
+    int q_head  = total_q_idx % num_qo_heads;
+    if (req_idx >= batch_size) return;
+
+    int gqa_ratio = num_qo_heads / num_kv_heads;
+    int kv_head = q_head / gqa_ratio;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    const int32_t* page_indptr = kv_meta;
+    const int32_t* last_page_len = kv_meta + (batch_size + 1);
+    int page_start_global = page_indptr[req_idx];
+    int page_end_global = page_indptr[req_idx + 1];
+    int total_pages = page_end_global - page_start_global;
+    int page_chunk_size = (total_pages + num_splits - 1) / num_splits;
+    int my_page_start = split_idx * page_chunk_size;
+    int my_page_end = min(my_page_start + page_chunk_size, total_pages);
+
+    if (my_page_start >= total_pages) {
+        int out_idx = split_idx * (batch_size * num_qo_heads) + total_q_idx;
+        if (threadIdx.x == 0) {
+            partial_m[out_idx] = -FLT_MAX;
+            partial_l[out_idx] = 0.0f;
+        }
+        if (threadIdx.x < HEAD_DIM) {
+            partial_out[out_idx * HEAD_DIM + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
+
+    float q_reg[EPT];
+    float k_scale_reg[EPT];
+    int k_scale_base = kv_head * HEAD_DIM;
+    #pragma unroll
+    for (int i = 0; i < EPT; i++) {
+        int d = lane_id * EPT + i;
+        q_reg[i] = __bfloat162float(Q[total_q_idx * HEAD_DIM + d]) * sm_scale;
+        k_scale_reg[i] = K_static_scales[k_scale_base + d];
+    }
+
+    float o_reg[EPT];
+    #pragma unroll
+    for (int i = 0; i < EPT; i++) o_reg[i] = 0.0f;
+    float m_local = -FLT_MAX;
+    float l_local = 0.0f;
+
+    const int d_base = lane_id * EPT;
+    const int byte_base = d_base / 2;
+    const int kv_dim_packed = kv_dim / 2;
+    const int head_bytes = HEAD_DIM / 2;
+
+    for (int page_local_idx = 0; page_local_idx < my_page_end - my_page_start; page_local_idx++) {
+        int global_page = my_page_start + page_local_idx;
+        int page_idx = kv_indices[page_start_global + global_page];
+        int row_base = page_idx * kQuantPageSize;
+        int page_tokens = (global_page == total_pages - 1) ? last_page_len[req_idx] : kQuantPageSize;
+
+        for (int t = warp_id; t < page_tokens; t += NUM_WARPS) {
+            int row_idx = row_base + t;
+            int kv_token_byte_base = row_idx * kv_dim_packed + kv_head * head_bytes;
+            int scale_off = row_idx * num_kv_heads + kv_head;
+            float v_scale = V_scales[scale_off];
+
+            float qk = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < EPT; i += 2) {
+                int b = byte_base + i / 2;
+                uint8_t byte = K_data_packed[kv_token_byte_base + b];
+                int8_t k0 = (int8_t)(byte << 4) >> 4;          // sign-extend low nibble
+                int8_t k1 = (int8_t)(byte & 0xF0) >> 4;         // arith-shift high nibble
+                qk += q_reg[i + 0] * (float)k0 * k_scale_reg[i + 0];
+                qk += q_reg[i + 1] * (float)k1 * k_scale_reg[i + 1];
+            }
+            qk = warp_reduce_sum(qk);
+
+            float m_new = fmaxf(m_local, qk);
+            float exp_diff = __expf(m_local - m_new);
+            float exp_qk = __expf(qk - m_new);
+            float l_new = l_local * exp_diff + exp_qk;
+
+            #pragma unroll
+            for (int i = 0; i < EPT; i += 2) {
+                int b = byte_base + i / 2;
+                uint8_t byte = V_data_packed[kv_token_byte_base + b];
+                int8_t v0 = (int8_t)(byte << 4) >> 4;
+                int8_t v1 = (int8_t)(byte & 0xF0) >> 4;
+                o_reg[i + 0] = o_reg[i + 0] * exp_diff + exp_qk * (float)v0 * v_scale;
+                o_reg[i + 1] = o_reg[i + 1] * exp_diff + exp_qk * (float)v1 * v_scale;
+            }
+
+            m_local = m_new;
+            l_local = l_new;
+        }
+    }
+
+    __shared__ float smem_m[NUM_WARPS];
+    __shared__ float smem_l[NUM_WARPS];
+    __shared__ float smem_o[NUM_WARPS * HEAD_DIM];
+
+    if (lane_id == 0) {
+        smem_m[warp_id] = m_local;
+        smem_l[warp_id] = l_local;
+    }
+    #pragma unroll
+    for (int i = 0; i < EPT; i++) {
+        smem_o[warp_id * HEAD_DIM + lane_id * EPT + i] = o_reg[i];
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float final_m = smem_m[0];
+        float final_l = smem_l[0];
+        float final_o[EPT];
+        #pragma unroll
+        for (int i = 0; i < EPT; i++) final_o[i] = smem_o[lane_id * EPT + i];
+
+        #pragma unroll
+        for (int w = 1; w < NUM_WARPS; w++) {
+            float m_w = smem_m[w];
+            float l_w = smem_l[w];
+            if (l_w == 0.0f) continue;
+            float m_new = fmaxf(final_m, m_w);
+            float scale_prev = __expf(final_m - m_new);
+            float scale_w    = __expf(m_w - m_new);
+            #pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                float o_w = smem_o[w * HEAD_DIM + lane_id * EPT + i];
+                final_o[i] = final_o[i] * scale_prev + o_w * scale_w;
+            }
+            final_l = final_l * scale_prev + l_w * scale_w;
+            final_m = m_new;
+        }
+
+        int out_idx = split_idx * (batch_size * num_qo_heads) + total_q_idx;
+        if (lane_id == 0) {
+            partial_m[out_idx] = final_m;
+            partial_l[out_idx] = final_l;
+        }
+        float inv_final_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
+        #pragma unroll
+        for (int i = 0; i < EPT; i++) {
+            int d = lane_id * EPT + i;
+            partial_out[out_idx * HEAD_DIM + d] = final_o[i] * inv_final_l;
+        }
+    }
+}
+}  // extern "C++" — INT4 KIVI per-channel K template kernel
+
+cudaError_t decode_attention_int4_per_channel_k_cuda(
+    const __nv_bfloat16* Q,
+    const uint8_t* K_data_packed,
+    const uint8_t* V_data_packed,
+    const float* K_static_scales,
+    const float* V_scales,
+    const int32_t* kv_indices,
+    const int32_t* kv_indptr,
+    __nv_bfloat16* O,
+    int batch_size,
+    int num_qo_heads,
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim,
+    float sm_scale,
+    cudaStream_t stream,
+    void* workspace,
+    size_t workspace_bytes)
+{
+    if (batch_size <= 0) return cudaSuccess;
+    int total_q_heads = batch_size * num_qo_heads;
+    int num_splits = choose_decode_num_splits(
+        batch_size, num_qo_heads, head_dim, total_q_heads, workspace_bytes);
+    size_t needed = decode_attention_int8_workspace_bytes(
+        batch_size, num_qo_heads, head_dim, num_splits);
+    if (workspace == nullptr || workspace_bytes < needed) {
+        return cudaErrorInvalidValue;
+    }
+    float* ws_float = reinterpret_cast<float*>(workspace);
+    size_t total_q = (size_t)total_q_heads;
+    float* p_out = ws_float;
+    float* p_m   = ws_float + num_splits * total_q * head_dim;
+    float* p_l   = p_m + num_splits * total_q;
+
+    {
+        dim3 grid(num_splits, total_q_heads);
+        dim3 block(BLOCK_SIZE);
+        if (head_dim == 128) {
+            decode_attention_int4_per_channel_k_partial_kernel<128><<<grid, block, 0, stream>>>(
+                Q, K_data_packed, V_data_packed, K_static_scales, V_scales,
+                kv_indices, kv_indptr, p_out, p_m, p_l,
+                batch_size, num_qo_heads, num_kv_heads, kv_dim, sm_scale, num_splits);
+        } else if (head_dim == 256) {
+            decode_attention_int4_per_channel_k_partial_kernel<256><<<grid, block, 0, stream>>>(
+                Q, K_data_packed, V_data_packed, K_static_scales, V_scales,
+                kv_indices, kv_indptr, p_out, p_m, p_l,
+                batch_size, num_qo_heads, num_kv_heads, kv_dim, sm_scale, num_splits);
+        } else {
+            return cudaErrorInvalidValue;
+        }
+    }
+    {
+        dim3 grid(total_q_heads);
+        dim3 block(head_dim);
+        if (head_dim == 128) {
+            decode_attention_merge_kernel<128><<<grid, block, 0, stream>>>(
+                p_out, p_m, p_l, O, total_q_heads, num_splits);
+        } else if (head_dim == 256) {
+            decode_attention_merge_kernel<256><<<grid, block, 0, stream>>>(
+                p_out, p_m, p_l, O, total_q_heads, num_splits);
+        }
+    }
+    return cudaGetLastError();
+}
+
 }  // extern "C"

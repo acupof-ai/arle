@@ -1576,6 +1576,9 @@ impl Qwen3Model {
                         )?;
                     }
                     KVFormat::BF16 => {}
+                    KVFormat::INT4 => unreachable!(
+                        "INT4 KV not wired for qwen3 mixed/LoRA paths (PoC qwen35-only)"
+                    ),
                     KVFormat::TurboQuant { .. } => unreachable!("TurboQuant does not enter mixed"),
                 }
 
@@ -1645,6 +1648,9 @@ impl Qwen3Model {
                             quantized.attn_workspace_bytes,
                         )?;
                     }
+                    KVFormat::INT4 => unreachable!(
+                        "INT4 KV not wired for qwen3 mixed/LoRA paths (PoC qwen35-only)"
+                    ),
                     KVFormat::TurboQuant { .. } => unreachable!("TurboQuant does not enter mixed"),
                 }
             }
@@ -2206,6 +2212,9 @@ impl Qwen3Model {
                         max_kv_tokens,
                     )?;
                 }
+                KVFormat::INT4 => {
+                    unreachable!("INT4 KV not wired for qwen3 paths (PoC qwen35-only)")
+                }
                 KVFormat::TurboQuant { .. } => {
                     anyhow::bail!(
                         "LoRA + TurboQuant KV cache not supported — refuse earlier at load time"
@@ -2481,6 +2490,9 @@ impl Qwen3Model {
                     )?;
                 }
                 KVFormat::BF16 => {} // decode_prep already wrote bf16 to pool
+                KVFormat::INT4 => {
+                    unreachable!("INT4 KV not wired for qwen3 paths (PoC qwen35-only)")
+                }
                 KVFormat::TurboQuant { .. } => {
                     // Quantize new K token: bf16 working → TQ packed pool
                     let tq_k = kv_pool.tq_k_state.as_ref().unwrap();
@@ -2631,6 +2643,9 @@ impl Qwen3Model {
                         total_pages,
                         max_kv_tokens,
                     )?;
+                }
+                KVFormat::INT4 => {
+                    unreachable!("INT4 KV not wired for qwen3 paths (PoC qwen35-only)")
                 }
                 KVFormat::TurboQuant { .. } => {
                     // Fused TQ attention: rotate Q once, score from packed K centroids.

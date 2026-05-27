@@ -212,6 +212,41 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// INT4 KIVI per-channel K finalize: divides absmax by 7 (symmetric
+    /// int4 max), same 1e-30 floor as INT8/FP8 siblings.
+    pub fn finalize_k_per_channel_scales_int4_cuda(
+        k_static_scales: *mut f32,
+        num_channels: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// INT4 KIVI per-channel K quantize: 4-bit packed (2 nibbles/byte).
+    /// `kv_int4_packed` must have `max_total_tokens * kv_dim / 2` bytes.
+    pub fn quantize_paged_kv_int4_per_channel_cuda(
+        kv_bf16: *const Half,
+        kv_int4_packed: *mut u8,
+        k_static_scales: *const f32,
+        new_token_indices: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// INT4 V quantize (per-(row, head) absmax, /7). 4-bit packed output.
+    pub fn quantize_paged_kv_single_int4_cuda(
+        kv_bf16: *const Half,
+        kv_int4_packed: *mut u8,
+        scales: *mut f32,
+        new_token_indices: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn quantize_scatter_kv_fp8_cuda(
         kv_cont: *const Half,
         kv_fp8: *mut u8,

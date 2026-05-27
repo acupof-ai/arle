@@ -753,7 +753,10 @@ impl Qwen35Model {
         // NOTE: set_batch_size, upload_token_ids, update_metadata, and
         // plan_attention are now called by the scheduler via DecodeContextOps
         // before this method is invoked.
-        if matches!(paged_kv_pool.format, KVFormat::INT8 | KVFormat::FP8E4M3) {
+        if matches!(
+            paged_kv_pool.format,
+            KVFormat::INT8 | KVFormat::FP8E4M3 | KVFormat::INT4
+        ) {
             let packed = paged_kv_pool.build_quantized_decode_indptr(slot_indices);
             self.ctx
                 .stream
@@ -1288,6 +1291,34 @@ impl Qwen35Model {
                         batch_size,
                     )?;
                 }
+                KVFormat::INT4 => {
+                    // KIVI per-channel K + per-(row, head) V, 4-bit packed.
+                    let k_static_scales_ptr = kv_pool
+                        .k_static_scales_ptr(full_idx, stream)
+                        .expect("KIVI per-channel K must be allocated for INT4");
+                    kv_quant::quantize_paged_kv_int4_per_channel(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_ptr(full_idx, stream),
+                        k_static_scales_ptr,
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    kv_quant::quantize_paged_kv_single_int4(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_ptr(full_idx, stream),
+                        kv_pool.v_scales_ptr(full_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                }
                 KVFormat::BF16 => {}
                 KVFormat::TurboQuant { .. } => {
                     let tq_k = kv_pool.tq_k_state.as_ref().unwrap();
@@ -1351,6 +1382,31 @@ impl Qwen35Model {
                         .k_static_scales_ptr(full_idx, stream)
                         .expect("KIVI per-channel K must be allocated for FP8");
                     kv_quant::decode_attention_fp8_per_channel_k(
+                        &self.ctx,
+                        &bufs.attn.q_batch,
+                        kv_pool.k_data_ptr(full_idx, stream),
+                        kv_pool.v_data_ptr(full_idx, stream),
+                        k_static_scales_ptr,
+                        kv_pool.v_scales_ptr(full_idx, stream),
+                        &bufs.metadata.kv_indices,
+                        &bufs.quantized_kv_meta,
+                        &mut bufs.attn.attn_output,
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        sm_scale,
+                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                        kv_pool.int8_attn_workspace_bytes,
+                    )?;
+                }
+                KVFormat::INT4 => {
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                    let k_static_scales_ptr = kv_pool
+                        .k_static_scales_ptr(full_idx, stream)
+                        .expect("KIVI per-channel K must be allocated for INT4");
+                    kv_quant::decode_attention_int4_per_channel_k(
                         &self.ctx,
                         &bufs.attn.q_batch,
                         kv_pool.k_data_ptr(full_idx, stream),

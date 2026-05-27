@@ -102,6 +102,15 @@ fn precision_matrix() -> Vec<PrecisionCase> {
             },
             gate_trajectory: None,
         },
+        // INT4 + KIVI per-channel K PoC (2026-05-27). Parallel to TQ4 in
+        // memory footprint (4-bit packed) but uses per-channel K
+        // calibration instead of Hadamard rotation for outlier handling.
+        PrecisionCase {
+            name: "int4",
+            dtype: KVCacheDtype::BF16,
+            format: KVFormat::INT4,
+            gate_trajectory: None,
+        },
     ];
     if matches!(
         std::env::var("KV_PARITY_INCLUDE_TQ23").as_deref(),
@@ -309,6 +318,25 @@ fn diff_against_reference(
     tokens: usize,
 ) -> DiffRow {
     assert_eq!(reference.sequences.len(), candidate.sequences.len());
+
+    // Dump first-N token IDs per (precision, prompt) so we can decode and
+    // discriminate noise-fidelity from real quality drift. See
+    // docs/experience/wins/2026-05-27-v100-kv-precision-parity-qwen35-4b.md
+    // for the diagnostic rationale.
+    for (idx, (ref_seq, cand_seq)) in reference
+        .sequences
+        .iter()
+        .zip(candidate.sequences.iter())
+        .enumerate()
+    {
+        let take = ref_seq.len().min(cand_seq.len()).min(16);
+        let ref_head: Vec<u32> = ref_seq.iter().copied().take(take).collect();
+        let cand_head: Vec<u32> = cand_seq.iter().copied().take(take).collect();
+        eprintln!(
+            "kv-parity-qwen35: {:<5} prompt{} first{} tokens: ref={:?} cand={:?}",
+            candidate.name, idx, take, ref_head, cand_head
+        );
+    }
 
     let mut per_prompt_match = Vec::with_capacity(reference.sequences.len());
     let mut first_diverging_prompt = None;

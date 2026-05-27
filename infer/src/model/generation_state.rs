@@ -94,6 +94,10 @@ impl GenerationStateBase {
                 self.kv_cache.v_scales(),
                 self.kv_cache.max_seq_len(),
             ),
+            KVFormat::INT4 => anyhow::bail!(
+                "INT4 KV does not support contig→paged migration in the PoC; \
+                 use paged-only prefill path"
+            ),
             KVFormat::TurboQuant { .. } => {
                 let token_rows = pool.token_rows_for_range(slot, 0, pool.seq_len(slot));
                 pool.migrate_from_contiguous_turboquant_range(
@@ -152,6 +156,10 @@ impl GenerationStateBase {
                     &token_rows,
                 )
             }
+            KVFormat::INT4 => anyhow::bail!(
+                "INT4 KV does not support contig→paged migration in the PoC; \
+                 use paged-only prefill path"
+            ),
             KVFormat::TurboQuant { .. } => {
                 let token_rows = pool.token_rows_for_range(slot, start_pos, token_count);
                 pool.migrate_from_contiguous_turboquant_range(
