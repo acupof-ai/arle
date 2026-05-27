@@ -734,7 +734,12 @@ void compile_with_nvcc(
           << " -cubin"
           << " -o " << shell_quote(cubin_path)
           << " -O3"
-          << " -std=c++20"
+          // CUDA 12.2 nvcc silently rejects -std=c++20 with the system
+          // gcc on this pod ("not supported with the configured host compiler.
+          // Flag will be ignored.") and falls back to c++14, which breaks
+          // cute headers using std::conjunction / fold expressions. c++17
+          // covers everything cute needs and works across gcc 8.3+/CUDA 12.2+.
+          << " -std=c++17"
           << " --expt-relaxed-constexpr"
           << " --expt-extended-lambda"
           << " --diag-suppress=39,161,174,177,186,940"
