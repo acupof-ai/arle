@@ -26,16 +26,26 @@ fn main() {
         return;
     };
     let deepep_root = PathBuf::from(&deepep_dir);
-    let kernels_dir = deepep_root.join("csrc").join("kernels");
-    if !kernels_dir.join("api.cuh").exists() {
-        println!(
-            "cargo:warning=ARLE_DEEPEP_DIR={} missing csrc/kernels/api.cuh — \
-             skipping deepep-sys native build.",
-            deepep_root.display()
-        );
-        println!("cargo:rustc-cfg=deepep_stub");
-        return;
-    }
+    // DeepEP upstream refactored the intranode kernels into csrc/kernels/legacy/
+    // after the phase 1.0a-iv spike was written against the old flat layout.
+    // Probe both layouts and use whichever has api.cuh present.
+    let (kernels_dir, is_legacy_layout) = {
+        let flat = deepep_root.join("csrc").join("kernels");
+        let legacy = flat.join("legacy");
+        if flat.join("api.cuh").exists() {
+            (flat, false)
+        } else if legacy.join("api.cuh").exists() {
+            (legacy, true)
+        } else {
+            println!(
+                "cargo:warning=ARLE_DEEPEP_DIR={} missing csrc/kernels/api.cuh or \
+                 csrc/kernels/legacy/api.cuh — skipping deepep-sys native build.",
+                deepep_root.display()
+            );
+            println!("cargo:rustc-cfg=deepep_stub");
+            return;
+        }
+    };
 
     let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
     let nvcc = format!("{cuda_home}/bin/nvcc");
@@ -55,12 +65,20 @@ fn main() {
     let csrc_dir = PathBuf::from("csrc");
 
     // 1. nvcc-compile each source to a .o
-    let sources: &[(PathBuf, &str)] = &[
+    let mut sources: Vec<(PathBuf, &str)> = vec![
         (kernels_dir.join("intranode.cu"), "intranode.o"),
         (kernels_dir.join("layout.cu"), "layout.o"),
-        (kernels_dir.join("runtime.cu"), "runtime.o"),
-        (csrc_dir.join("deepep_buffer.cpp"), "deepep_buffer.o"),
     ];
+    // runtime.cu existed in DeepEP's flat layout but was removed/inlined in
+    // the legacy subdir refactor. Skip when absent — our cpp wrapper only
+    // calls intranode::{barrier,notify_dispatch,dispatch,cached_notify_
+    // combine,combine} + layout::get_dispatch_layout, all defined in
+    // intranode.cu + layout.cu.
+    let runtime_cu = kernels_dir.join("runtime.cu");
+    if runtime_cu.exists() {
+        sources.push((runtime_cu, "runtime.o"));
+    }
+    sources.push((csrc_dir.join("deepep_buffer.cpp"), "deepep_buffer.o"));
     let mut objs = Vec::with_capacity(sources.len());
     for (src, name) in sources {
         let obj = out_dir.join(name);
@@ -71,16 +89,23 @@ fn main() {
             .arg("-O2")
             .arg("-DDISABLE_NVSHMEM")
             .arg("--expt-relaxed-constexpr")
-            .arg("--expt-extended-lambda")
-            .arg("-Xcompiler")
+            .arg("--expt-extended-lambda");
+        if is_legacy_layout {
+            cmd.arg("-DARLE_DEEPEP_LEGACY_LAYOUT=1");
+        }
+        cmd.arg("-Xcompiler")
             .arg("-fPIC")
             .arg(arch)
             .arg("-I")
             .arg(deepep_root.join("csrc"))
+            // DeepEP refactor: legacy kernels include <deep_ep/common/...>
+            // from the new namespaced header tree at deep_ep/include/.
+            .arg("-I")
+            .arg(deepep_root.join("deep_ep").join("include"))
             .arg("-I")
             .arg(&csrc_dir)
             .arg("-c")
-            .arg(src)
+            .arg(&src)
             .arg("-o")
             .arg(&obj);
         let status = cmd.status().expect("spawn nvcc");

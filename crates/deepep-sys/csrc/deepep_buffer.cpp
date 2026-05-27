@@ -22,8 +22,31 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+// Header layout differs between the old flat DeepEP tree and the new
+// "csrc/kernels/legacy/" refactor. build.rs defines ARLE_DEEPEP_LEGACY_
+// LAYOUT=1 when api.cuh sits under legacy/ — pick the right include +
+// shim the renamed constants (NUM_MAX_NVL_PEERS → LEGACY_NUM_MAX_NVL_PEERS).
+#ifdef ARLE_DEEPEP_LEGACY_LAYOUT
+#include "kernels/legacy/api.cuh"
+#include "kernels/legacy/compiled.cuh"
+#ifndef NUM_MAX_NVL_PEERS
+#define NUM_MAX_NVL_PEERS LEGACY_NUM_MAX_NVL_PEERS
+#endif
+#ifndef NUM_MAX_LOCAL_EXPERTS
+#define NUM_MAX_LOCAL_EXPERTS LEGACY_NUM_MAX_LOCAL_EXPERTS
+#endif
+#ifndef NUM_WORKSPACE_BYTES
+#define NUM_WORKSPACE_BYTES LEGACY_NUM_WORKSPACE_BYTES
+#endif
+// Legacy refactor put intranode/layout under deep_ep::legacy::*.
+namespace deep_ep_intranode_ns = deep_ep::legacy::intranode;
+namespace deep_ep_layout_ns = deep_ep::legacy::layout;
+#else
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
+namespace deep_ep_intranode_ns = deep_ep::intranode;
+namespace deep_ep_layout_ns = deep_ep::layout;
+#endif
 
 namespace {
 
@@ -264,7 +287,7 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_sync(
        "memcpy barrier_signal_ptrs_gpu");
     CK(cudaStreamSynchronize(self->stream), "sync after peer ptr upload");
 
-    deep_ep::intranode::barrier(self->barrier_signal_ptrs_gpu, self->rank,
+    deep_ep_intranode_ns::barrier(self->barrier_signal_ptrs_gpu, self->rank,
                                 self->world_size, self->stream);
     CK(cudaStreamSynchronize(self->stream), "sync after intranode::barrier");
 
@@ -311,7 +334,7 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_dispatch(
         reinterpret_cast<int *>(p->d_channel_prefix_matrix);
 
     // 1. layout
-    deep_ep::layout::get_dispatch_layout(
+    deep_ep_layout_ns::get_dispatch_layout(
         d_topk_idx, d_num_tokens_per_rank, /*num_tokens_per_rdma_rank=*/nullptr,
         d_num_tokens_per_expert, d_is_token_in_rank,
         static_cast<int>(p->num_tokens), static_cast<int>(p->num_topk),
@@ -324,7 +347,7 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_dispatch(
     for (int i = 0; i < experts_per_rank; ++i)
         self->moe_recv_expert_host[i] = -1;
     int num_memset_int = num_channels * self->world_size * 4;
-    deep_ep::intranode::notify_dispatch(
+    deep_ep_intranode_ns::notify_dispatch(
         d_num_tokens_per_rank, self->moe_recv_counter_dev, self->world_size,
         d_num_tokens_per_expert, self->moe_recv_expert_dev,
         static_cast<int>(p->num_experts),
@@ -350,7 +373,7 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_dispatch(
     }
 
     // 3. dispatch
-    deep_ep::intranode::dispatch(
+    deep_ep_intranode_ns::dispatch(
         d_recv_x, /*recv_x_scales=*/nullptr, d_recv_src_idx, d_recv_topk_idx,
         d_recv_topk_w, d_recv_channel_prefix, d_send_head, d_x,
         /*x_scales=*/nullptr, d_topk_idx, d_topk_w, d_is_token_in_rank,
@@ -395,7 +418,7 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_combine(
     auto *d_combined_topk_w =
         reinterpret_cast<float *>(p->d_combined_topk_w);
 
-    deep_ep::intranode::cached_notify_combine(
+    deep_ep_intranode_ns::cached_notify_combine(
         self->buffer_ptrs_gpu, d_send_head, num_channels,
         /*num_recv_tokens=*/static_cast<int>(p->num_output_tokens),
         /*num_memset_int=*/num_channels * self->world_size * 2,
@@ -406,7 +429,7 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_combine(
     // exclusive prefix), not channel_prefix_matrix (notify_dispatch
     // OUTPUT, inclusive prefix). See feedback_deepep_combine_uses_
     // recv_channel_prefix.md.
-    deep_ep::intranode::combine(
+    deep_ep_intranode_ns::combine(
         CUDA_R_16BF, d_combined_x, d_combined_topk_w, d_x, /*topk_weights=*/d_topk_w,
         /*bias_0=*/nullptr, /*bias_1=*/nullptr, d_recv_src_idx, d_rank_prefix,
         /*channel_prefix_matrix=*/d_recv_channel_prefix, d_send_head,
