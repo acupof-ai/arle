@@ -1800,8 +1800,16 @@ impl DeepseekModel {
             let total_position_after = start_pos + token_count;
             let (sm_major, _sm_minor) = self.ctx.compute_capability();
             let tp_world_outer = self.config.tp.world_size;
-            let token_count_ok =
-                token_count == FLASHMLA_VERIFIED_S_Q || (tp_world_outer > 1 && token_count > 1);
+            // V2.3 padding empirically did NOT fix the failure mode at
+            // non-16384 token_counts (4K probe with FlashMLA on + TP=8 hit
+            // an illegal memory access inside phase1.cuh after padding s_q
+            // to a multiple of 64). The TMA descriptor init bug went away
+            // but a runtime OOB inside the kernel surfaced. Root-cause
+            // requires a GPU debugger / cuda-memcheck pass that this
+            // session cannot run. Keep the strict gate; the padding code
+            // below stays inert (padded_s_q == token_count when not
+            // crossed) for future re-enable when the kernel bug is fixed.
+            let token_count_ok = token_count == FLASHMLA_VERIFIED_S_Q;
             let use_flashmla = sm_major == 9
                 && (mode_int == 1 || mode_int == 2)
                 && token_count_ok
