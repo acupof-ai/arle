@@ -419,6 +419,34 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
         rank_offset: rank,
         world_size,
     });
+
+    // Phase B-1 commit C.4 + 2026-05-27 deadlock fix — connect to the
+    // coordinator's relay TCP listener FIRST, before spawn_cuda_worker_group's
+    // NCCL rendezvous. The coordinator's flow is:
+    //   1. bind relay listener (immediate, port published via env)
+    //   2. spawn workers
+    //   3. accept(N-1) relay connects (blocking, 30s timeout)
+    //   4. enter spawn_cuda_worker_group → bind NCCL TCP listener (rank 0)
+    // If workers do NCCL first they hit a refused connection (rank 0 hasn't
+    // bound yet) while rank 0 is still stuck in step 3 → deadlock. Connect
+    // relay first so coord unblocks step 3 → step 4 → NCCL listener up → both
+    // sides proceed in lockstep.
+    let pre_boot_relay = if let Ok(port_str) = std::env::var("ARLE_COORDINATOR_RELAY_PORT") {
+        let port: u16 = port_str
+            .parse()
+            .with_context(|| format!("worker rank {rank} ARLE_COORDINATOR_RELAY_PORT parse"))?;
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .with_context(|| format!("worker rank {rank} relay addr parse"))?;
+        let relay =
+            infer::multiproc_relay::RelayWorker::connect(addr, std::time::Duration::from_secs(30))
+                .with_context(|| format!("worker rank {rank} relay connect"))?;
+        info!("[arle-worker rank={rank}] relay pre-connected to {addr}");
+        Some(relay)
+    } else {
+        None
+    };
+
     info!("[arle-worker rank={rank}] booting scheduler (model={model_path} num_slots={num_slots})");
     let started = spawn_cuda_worker_group(
         resolved_model_path,
@@ -435,26 +463,12 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
     .with_context(|| format!("worker rank {rank} scheduler boot"))?;
     info!("[arle-worker rank={rank}] scheduler running, awaiting shutdown");
 
-    // Phase B-1 commit C.4 — relay-receiver thread. Connects to the
-    // coordinator's TCP relay (port via ARLE_COORDINATOR_RELAY_PORT env),
-    // then loops on `recv()`. On Request2 envelopes (C.4.1) reconstruct
-    // an IncomingRequest from the wire format and submit to the local
-    // scheduler. On the legacy boot-ping Request variant, log + ignore.
     let scheduler_handle = started
         .first()
         .map(|w| w.handle.clone())
         .ok_or_else(|| anyhow::anyhow!("worker rank {rank} produced no started scheduler"))?;
-    let _relay_thread = if let Ok(port_str) = std::env::var("ARLE_COORDINATOR_RELAY_PORT") {
-        let port: u16 = port_str
-            .parse()
-            .with_context(|| format!("worker rank {rank} ARLE_COORDINATOR_RELAY_PORT parse"))?;
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
-            .parse()
-            .with_context(|| format!("worker rank {rank} relay addr parse"))?;
-        let mut relay =
-            infer::multiproc_relay::RelayWorker::connect(addr, std::time::Duration::from_secs(30))
-                .with_context(|| format!("worker rank {rank} relay connect"))?;
-        info!("[arle-worker rank={rank}] relay connected to {addr}");
+    let _relay_thread = if let Some(mut relay) = pre_boot_relay {
+        info!("[arle-worker rank={rank}] starting relay receiver thread");
         let handle = scheduler_handle.clone();
         Some(std::thread::spawn(move || -> anyhow::Result<()> {
             use infer::multiproc_relay::RelayEnvelope;
