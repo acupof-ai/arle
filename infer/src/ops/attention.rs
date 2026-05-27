@@ -2,8 +2,8 @@
 //!
 //! Three paged decode attention paths (selected by KV pool format):
 //!   - **BF16**: TileLang AOT paged attention
-//!   - **INT8**: Custom split-KV kernel with fused INT8 dequant (`decode_attention_int8`)
-//!   - **FP8**: Custom split-KV kernel with FP8→FP32 cast (`decode_attention_fp8`)
+//!   - **INT8**: KIVI per-channel K + per-(row, head) V (`decode_attention_int8_per_channel_k`)
+//!   - **FP8**: KIVI per-channel K + per-(row, head) V (`decode_attention_fp8_per_channel_k`)
 
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};

@@ -1986,11 +1986,43 @@ impl Qwen35Model {
         let head_dim = self.config.head_dim;
         match pool.format {
             KVFormat::FP8E4M3 => {
-                kv_quant::quantize_paged_kv_fp8(
+                // KIVI per-channel K (mirrors qwen3/prefill.rs FP8 arm).
+                // Calibrate static scales from this batch's K statistics,
+                // then quantize K through the static table. V stays per-
+                // (row, head).
+                let static_scales_ptr = pool
+                    .k_static_scales_ptr(full_idx, stream)
+                    .expect("KIVI per-channel K must be allocated for FP8");
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        cudarc::driver::sys::CUdeviceptr::from(static_scales_ptr),
+                        0,
+                        num_kv_heads * head_dim * std::mem::size_of::<f32>(),
+                        stream.cu_stream(),
+                    )
+                    .ok();
+                }
+                kv_quant::compute_k_per_channel_absmax(
+                    &self.ctx,
+                    pool.k_work_ptr(stream),
+                    static_scales_ptr,
+                    &bufs.metadata.token_rows_gpu,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )?;
+                kv_quant::finalize_k_per_channel_scales(
+                    &self.ctx,
+                    static_scales_ptr,
+                    num_kv_heads * head_dim,
+                )?;
+                pool.k_kivi_calibrated[full_idx].store(true, std::sync::atomic::Ordering::Release);
+                kv_quant::quantize_paged_kv_fp8_per_channel(
                     &self.ctx,
                     pool.k_work_ptr(stream),
                     pool.k_data_ptr(full_idx, stream),
-                    pool.k_scales_ptr(full_idx, stream),
+                    static_scales_ptr,
                     &bufs.metadata.token_rows_gpu,
                     num_kv_heads,
                     head_dim,
