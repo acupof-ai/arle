@@ -1768,20 +1768,30 @@ impl DeepseekModel {
             //   crates/cuda-kernels/csrc/misc/arle_flashmla_csa_prep.cu
             //   crates/cuda-kernels/csrc/misc/dsv4_tp_attention_repack.cu
             //   crates/cuda-kernels/vendor/flashmla (sgl-project/FlashMLA @ df022eb)
-            // Conservative total-position gate: V2.1 ≤24K passes clean
-            // (4K/16K/24K probes), >24K hits a CUDA_ERROR_ILLEGAL_ADDRESS in
-            // shared CSA+HCA infrastructure (kv_unified pack or TP-AllGather).
-            // Root-cause still pending. This gate keeps FlashMLA opt-in for
-            // the safe window so the future default-on flip can land without
-            // re-triggering the >24K crash. The 24576 boundary matches the
-            // largest validated probe (24K = 21333 tokens) padded to the
-            // nearest 8K alignment.
+            // Conservative gates derived from observed FlashMLA failure modes:
+            //
+            // 1. `total_position_after <= 24576` — prevents the >24K crash in
+            //    shared CSA+HCA infrastructure. The 24K probe is the largest
+            //    validated good shape.
+            // 2. `token_count % 64 == 0` — FlashMLA SM90's TMA descriptor box
+            //    dimension is 64 along the s_q axis. CUDA returns
+            //    cudaErrorInvalidValue (700) at descriptor init when
+            //    globalDim[2] = token_count is not a multiple of 64 (observed
+            //    at 4017-token and 14250-token probes, both crashed; 16384
+            //    chunk-1 of 29K worked because it's exactly 64-aligned).
+            // 3. `token_count > 1` — decode (single-token) always goes legacy.
+            //
+            // Without all three gates active the FlashMLA prefill path
+            // produces a TMA init failure that surfaces async at the next
+            // sync, corrupting the response. Env knob stays opt-in until the
+            // TMA descriptor padding work lands (track in V2.3 follow-up).
             const FLASHMLA_TOTAL_POSITION_LIMIT: usize = 24576;
             let total_position_after = start_pos + token_count;
             let (sm_major, _sm_minor) = self.ctx.compute_capability();
             let use_flashmla = sm_major == 9
                 && (mode_int == 1 || mode_int == 2)
                 && token_count > 1
+                && token_count.is_multiple_of(64)
                 && (head_dim == 512 || head_dim == 576)
                 && total_position_after <= FLASHMLA_TOTAL_POSITION_LIMIT
                 && dsv4_flashmla_prefill_enabled()?;
