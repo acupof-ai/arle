@@ -145,11 +145,78 @@ def print_report(stats: dict, threshold_mean: float, threshold_sigma: float) -> 
     print(f"  verdict    : {verdict}")
 
 
+def paired_delta(treated_out: Path, control_out: Path, task: str) -> dict:
+    """Per-seed paired delta (treated - control) at matched seeds.
+
+    The question subset is determined by the seed alone, so paired
+    differences cancel the question-subset variance and give a much
+    tighter estimate of the true model effect.
+    """
+    seeds = []
+    for td in sorted(treated_out.glob("seed_*")):
+        cd = control_out / td.name
+        ts = td / "summary.json"
+        cs = cd / "summary.json"
+        if not (ts.exists() and cs.exists()):
+            continue
+        t = json.loads(ts.read_text())
+        c = json.loads(cs.read_text())
+        tt = t["tasks"].get(task)
+        cc = c["tasks"].get(task)
+        if not (tt and cc and tt.get("status") == "ok" and cc.get("status") == "ok"):
+            continue
+        seeds.append({
+            "seed": t.get("seed"),
+            "treated": tt["accuracy"],
+            "control": cc["accuracy"],
+            "delta": tt["accuracy"] - cc["accuracy"],
+        })
+    if not seeds:
+        return {"task": task, "n_seeds": 0, "seeds": seeds}
+    deltas = [s["delta"] for s in seeds]
+    out = {
+        "task": task,
+        "n_seeds": len(seeds),
+        "seeds": seeds,
+        "mean_delta": mean(deltas),
+        "sigma_delta": stdev(deltas) if len(deltas) > 1 else 0.0,
+    }
+    return out
+
+
+def print_paired_report(stats: dict) -> None:
+    task = stats["task"]
+    print(f"\n══════════ PAIRED {task.upper()} (treated − control) ══════════")
+    if stats["n_seeds"] == 0:
+        print("No matched seed pairs found.")
+        return
+    print(f"{'seed':>5} {'treated':>10} {'control':>10} {'delta(pp)':>11}")
+    for s in stats["seeds"]:
+        print(f"{str(s['seed']):>5} {s['treated']:>10.4f} {s['control']:>10.4f} {100*s['delta']:>+11.2f}")
+
+    md = stats["mean_delta"]
+    sd = stats["sigma_delta"]
+    n = stats["n_seeds"]
+    sem = sd / math.sqrt(n) if n > 1 else float("inf")
+    ci_lo = md - 1.96 * sem
+    ci_hi = md + 1.96 * sem
+    # t-statistic for H0: mean_delta = 0
+    t_stat = (md / sem) if sem > 0 else float("inf")
+    print(f"\nPaired mean delta: {100*md:+.2f}pp  sample-σ: {100*sd:.2f}pp  n={n}")
+    print(f"95% CI of mean delta: [{100*ci_lo:+.2f}pp, {100*ci_hi:+.2f}pp]  (SEM={100*sem:.2f}pp)")
+    if math.isfinite(t_stat):
+        print(f"t (H0 delta=0)     : {t_stat:+.2f}  ({'reject H0' if abs(t_stat) > 2 else 'fail to reject H0'} at ~95% with n={n})")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("out_base", type=Path, help="dir containing seed_<N>/ subdirs")
     p.add_argument("--baseline", type=Path, action="append", default=[],
                    help="path to an additional summary.json dir to include as baseline (repeatable)")
+    p.add_argument("--paired-vs", type=Path, default=None,
+                   help="path to another out_base; runs a per-seed paired (treated-control) "
+                        "analysis where treated=out_base, control=this arg. Tightens the "
+                        "estimate by canceling question-subset variance.")
     p.add_argument("--task", choices=["mmlu", "gsm8k", "both"], default="both")
     p.add_argument("--threshold-mean", type=float, default=0.505,
                    help="kill threshold for mean (default 0.505 = MMLU cross-base gate)")
@@ -179,6 +246,11 @@ def main() -> int:
     for task in tasks:
         stats = per_task_stats(seeds_data, baseline_data, task)
         print_report(stats, args.threshold_mean, args.threshold_sigma)
+
+    if args.paired_vs is not None:
+        for task in tasks:
+            stats = paired_delta(args.out_base, args.paired_vs, task)
+            print_paired_report(stats)
 
     return 0
 
