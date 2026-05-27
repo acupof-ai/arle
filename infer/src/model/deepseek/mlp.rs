@@ -4788,6 +4788,239 @@ impl DeepseekV4MoeBlock {
         })
     }
 
+    #[cfg(feature = "nccl")]
+    pub(super) fn forward_native_deepep_routed_gpu(
+        &self,
+        ctx: &DeviceContext,
+        comm: &LayerCommunicator,
+        layer_idx: usize,
+        config: &DeepSeekV4Config,
+        ep: &ExpertGroup,
+        hidden: &HiddenStates,
+        token_ids: &[u32],
+        moe_scratch: &mut DeepseekMoeRuntimeCache,
+    ) -> Result<DeepseekRoutedMoeOutput> {
+        ensure!(
+            ep.world_size > 1,
+            "native-deepep MoE requires ep_world_size > 1"
+        );
+        ensure!(
+            token_ids.len() == hidden.seq_len,
+            "native-deepep token count {} != hidden seq_len {}",
+            token_ids.len(),
+            hidden.seq_len
+        );
+        ensure!(
+            self.gate_weight.rows == config.n_routed_experts
+                && self.gate_weight.cols == hidden.hidden_dim,
+            "native-deepep gate shape mismatch: gate={}x{} hidden_dim={} n_routed_experts={}",
+            self.gate_weight.rows,
+            self.gate_weight.cols,
+            hidden.hidden_dim,
+            config.n_routed_experts
+        );
+        ensure!(
+            ep.experts_per_rank == self.experts.len(),
+            "native-deepep expects {} local experts, block has {}",
+            ep.experts_per_rank,
+            self.experts.len()
+        );
+        let nde = comm.native_deepep().ok_or_else(|| {
+            anyhow::anyhow!(
+                "forward_native_deepep_routed_gpu called without NativeDeepEp wired \
+                 (ARLE_DSV4_MOE_BACKEND=native-deepep + ARLE_DEEPEP_DIR build)"
+            )
+        })?;
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let logits = ops::gemm(ctx, &self.gate_weight, hidden)?;
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_native_deepep_route_logits",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let token_ids_gpu = ctx
+            .stream
+            .clone_htod(token_ids)
+            .map_err(|err| anyhow::anyhow!("native-deepep token ids H2D failed: {err}"))?;
+        let mut route_indices = ctx
+            .stream
+            .alloc_zeros_traced::<i32>(hidden.seq_len * config.num_experts_per_tok)
+            .map_err(|err| anyhow::anyhow!("native-deepep route idx alloc failed: {err}"))?;
+        let mut route_weights = ctx
+            .stream
+            .alloc_zeros_traced::<f32>(hidden.seq_len * config.num_experts_per_tok)
+            .map_err(|err| anyhow::anyhow!("native-deepep route weight alloc failed: {err}"))?;
+
+        let routing_kind = match config.moe_routing_kind(layer_idx) {
+            DeepSeekV4MoeRoutingKind::Hash => 0,
+            DeepSeekV4MoeRoutingKind::LearnedBias => 1,
+        };
+        let scoring_kind = match config.scoring_func.as_str() {
+            "softmax" => 0,
+            "sigmoid" => 1,
+            "sqrtsoftplus" => 2,
+            other => bail!("native-deepep unsupported scoring_func `{other}`"),
+        };
+        {
+            let (logits_ptr, _g0) = logits.data.device_ptr(&ctx.stream);
+            let bias_guard;
+            let bias_ptr = if let Some(bias) = self.gate_bias.as_ref() {
+                let (p, g) = bias.data.device_ptr(&ctx.stream);
+                bias_guard = Some(g);
+                p as *const ffi::Half
+            } else {
+                bias_guard = None;
+                std::ptr::null()
+            };
+            let tid_guard;
+            let tid_ptr = if let Some(tid2eid) = self.gate_tid2eid.as_ref() {
+                let (p, g) = tid2eid.device_ptr(&ctx.stream);
+                tid_guard = Some(g);
+                p as *const i64
+            } else {
+                tid_guard = None;
+                std::ptr::null()
+            };
+            let (token_ptr, _g1) = token_ids_gpu.device_ptr(&ctx.stream);
+            let (idx_ptr, _g2) = route_indices.device_ptr_mut(&ctx.stream);
+            let (wt_ptr, _g3) = route_weights.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_route_cuda(
+                    logits_ptr as *const ffi::Half,
+                    bias_ptr,
+                    tid_ptr,
+                    token_ptr as *const u32,
+                    idx_ptr as *mut i32,
+                    wt_ptr as *mut f32,
+                    hidden.seq_len as i32,
+                    config.n_routed_experts as i32,
+                    config.num_experts_per_tok as i32,
+                    routing_kind,
+                    scoring_kind,
+                    config.routed_scaling_factor,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("native-deepep route kernel failed: {err}"))?;
+            }
+            drop(bias_guard);
+            drop(tid_guard);
+        }
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_native_deepep_route_select",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        // DeepEP intranode::dispatch wants int64_t topk indices; convert.
+        let num_route_slots = hidden.seq_len.saturating_mul(config.num_experts_per_tok);
+        // num_sms must be > 0 and even; channels = sms / 2. 20 SMs / 10 channels
+        // matches the phase 1.0a-iv spike + tests/deepep_sidecar_smoke.rs.
+        let num_sms: u32 = 20;
+        let num_channels = (num_sms / 2) as usize;
+        let scratch = moe_scratch.ensure_native_deepep_scratch(
+            ctx,
+            hidden.hidden_dim,
+            hidden.seq_len,
+            config.num_experts_per_tok,
+            ep.world_size,
+            config.n_routed_experts,
+            num_channels,
+        )?;
+        {
+            let (idx_ptr, _g) = route_indices.device_ptr(&ctx.stream);
+            let (dst_ptr, _g2) = scratch.topk_idx_i64.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_cast_i32_to_i64_cuda(
+                    idx_ptr as *const i32,
+                    dst_ptr as *mut i64,
+                    num_route_slots as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("native-deepep topk i32→i64 cast failed: {err}"))?;
+            }
+        }
+
+        // Dispatch call.
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let (x_ptr, _gx) = hidden.data.device_ptr(&ctx.stream);
+        let (topk_idx_ptr, _gti) = scratch.topk_idx_i64.device_ptr(&ctx.stream);
+        let (topk_w_ptr, _gtw) = route_weights.device_ptr(&ctx.stream);
+        let (recv_x_ptr, _grx) = scratch.recv_x.data.device_ptr_mut(&ctx.stream);
+        let (recv_src_ptr, _grsrc) = scratch.recv_src_idx.device_ptr_mut(&ctx.stream);
+        let (recv_tki_ptr, _grtki) = scratch.recv_topk_idx.device_ptr_mut(&ctx.stream);
+        let (recv_tkw_ptr, _grtkw) = scratch.recv_topk_w.device_ptr_mut(&ctx.stream);
+        let (rank_pref_ptr, _grp) = scratch.rank_prefix.device_ptr_mut(&ctx.stream);
+        let (recv_chan_ptr, _grc) = scratch.recv_channel_prefix.device_ptr_mut(&ctx.stream);
+        let (send_head_ptr, _gsh) = scratch.send_head.device_ptr_mut(&ctx.stream);
+        let (ntpr_ptr, _gntpr) = scratch.num_tokens_per_rank.device_ptr_mut(&ctx.stream);
+        let (ntpe_ptr, _gntpe) = scratch.num_tokens_per_expert.device_ptr_mut(&ctx.stream);
+        let (titr_ptr, _gtitr) = scratch.is_token_in_rank.device_ptr_mut(&ctx.stream);
+        let (chan_pref_ptr, _gcp) = scratch.channel_prefix_matrix.device_ptr_mut(&ctx.stream);
+
+        let dispatch_params = deepep_sys::DispatchParams {
+            num_tokens: hidden.seq_len as u32,
+            hidden: hidden.hidden_dim as u32,
+            num_topk: config.num_experts_per_tok as u32,
+            num_experts: config.n_routed_experts as u32,
+            num_sms,
+            nvl_chunked_send: 6,
+            nvl_chunked_recv: 256,
+            d_x: x_ptr as usize,
+            d_topk_idx: topk_idx_ptr as usize,
+            d_topk_weights: topk_w_ptr as usize,
+            d_recv_x: recv_x_ptr as usize,
+            d_recv_src_idx: recv_src_ptr as usize,
+            d_recv_topk_idx: recv_tki_ptr as usize,
+            d_recv_topk_weights: recv_tkw_ptr as usize,
+            d_rank_prefix_matrix: rank_pref_ptr as usize,
+            d_recv_channel_prefix: recv_chan_ptr as usize,
+            d_send_head: send_head_ptr as usize,
+            d_num_tokens_per_rank: ntpr_ptr as usize,
+            d_num_tokens_per_expert: ntpe_ptr as usize,
+            d_is_token_in_rank: titr_ptr as usize,
+            d_channel_prefix_matrix: chan_pref_ptr as usize,
+        };
+        let num_recv_tokens = {
+            let mut guard = nde
+                .buffer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native-deepep buffer mutex poisoned"))?;
+            guard
+                .dispatch(&dispatch_params)
+                .map_err(|err| anyhow::anyhow!("native-deepep dispatch failed: {err}"))?
+        };
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_native_deepep_dispatch",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+        log::trace!(
+            "[native-deepep] layer={layer_idx} src_tokens={} num_recv={num_recv_tokens}",
+            hidden.seq_len
+        );
+
+        // B-3.3.4 (next commit): per-recv-token local-expert FFN + Buffer.combine.
+        // Until that lands, this path is not reachable from production routing —
+        // the caller in weights.rs continues to dispatch through
+        // forward_deepep_routed_gpu when ARLE_DSV4_MOE_BACKEND=native-deepep.
+        let _ = num_recv_tokens;
+        bail!(
+            "native-deepep forward path is dispatch-only; FFN + combine pending B-3.3.4 \
+             (see docs/experience/wins/2026-05-27-native-deepep-boot-B32-pod-verified.md)"
+        );
+    }
+
     #[cfg(test)]
     fn route_local(
         &self,
