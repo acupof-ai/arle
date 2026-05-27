@@ -487,12 +487,19 @@ impl TokenKVPool {
         };
 
         // KIVI per-channel K scale: one `[num_kv_heads, head_dim]` table per
-        // layer for FP8 mode. Zero-init — the first FP8 prefill batch
+        // layer for FP8 and INT8 modes. Zero-init — the first prefill batch
         // populates these via `populate_kivi_k_scales_from_prefill` (online
-        // calibration from the prefill K statistics). For BF16/INT8/TQ
-        // formats this stays None to keep the existing path bit-identical.
+        // calibration from the prefill K statistics). For BF16/TQ formats
+        // this stays None to keep the existing path bit-identical.
+        //
+        // INT8 was added to this gate on 2026-05-27 after the V100 Qwen3.5-4B
+        // audit (wins/2026-05-27-v100-kv-precision-parity-qwen35-4b.md)
+        // showed INT8 step-1 divergence from BF16 while FP8 was bit-identical;
+        // the discriminator was that FP8 had per-channel K calibration and
+        // INT8 still used per-(token, head) absmax. See
+        // docs/plans/2026-05-27-int8-kv-kivi-per-channel.md.
         let (k_static_scales, k_kivi_calibrated) =
-            if matches!(format, KVFormat::FP8E4M3) && pool_bytes_per_layer > 0 {
+            if matches!(format, KVFormat::FP8E4M3 | KVFormat::INT8) && pool_bytes_per_layer > 0 {
                 let channels = num_kv_heads * head_dim;
                 let mut buf = Vec::with_capacity(num_layers);
                 let mut latches = Vec::with_capacity(num_layers);

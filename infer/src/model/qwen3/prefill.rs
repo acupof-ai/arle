@@ -1464,17 +1464,61 @@ impl Qwen3Model {
             }
             KVFormat::INT8 => {
                 let stream = &self.ctx.stream;
-                kv_quant::quantize_paged_kv_single(
-                    &self.ctx,
-                    pool.k_work_ptr(stream),
-                    pool.k_data_ptr(layer_idx, stream),
-                    pool.k_scales_ptr(layer_idx, stream),
-                    prefill_token_rows,
-                    num_kv_heads,
-                    head_dim,
-                    pool.kv_dim,
-                    token_count,
-                )?;
+                // KIVI per-channel K path (mirrors FP8 arm above). On the
+                // first prefill that has a real K signal we calibrate the
+                // per-(kv_head, head_dim) absmax table, then quantize K
+                // through it. V always uses per-(row, head) scales.
+                if let Some(static_scales_ptr) = pool.k_static_scales_ptr(layer_idx, stream) {
+                    unsafe {
+                        cudarc::driver::result::memset_d8_async(
+                            cudarc::driver::sys::CUdeviceptr::from(static_scales_ptr),
+                            0,
+                            num_kv_heads * head_dim * std::mem::size_of::<f32>(),
+                            stream.cu_stream(),
+                        )
+                        .ok();
+                    }
+                    kv_quant::compute_k_per_channel_absmax(
+                        &self.ctx,
+                        pool.k_work_ptr(stream),
+                        static_scales_ptr,
+                        prefill_token_rows,
+                        num_kv_heads,
+                        head_dim,
+                        pool.kv_dim,
+                        token_count,
+                    )?;
+                    kv_quant::finalize_k_per_channel_scales_int8(
+                        &self.ctx,
+                        static_scales_ptr,
+                        num_kv_heads * head_dim,
+                    )?;
+                    pool.k_kivi_calibrated[layer_idx]
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    kv_quant::quantize_paged_kv_int8_per_channel(
+                        &self.ctx,
+                        pool.k_work_ptr(stream),
+                        pool.k_data_ptr(layer_idx, stream),
+                        static_scales_ptr,
+                        prefill_token_rows,
+                        num_kv_heads,
+                        head_dim,
+                        pool.kv_dim,
+                        token_count,
+                    )?;
+                } else {
+                    kv_quant::quantize_paged_kv_single(
+                        &self.ctx,
+                        pool.k_work_ptr(stream),
+                        pool.k_data_ptr(layer_idx, stream),
+                        pool.k_scales_ptr(layer_idx, stream),
+                        prefill_token_rows,
+                        num_kv_heads,
+                        head_dim,
+                        pool.kv_dim,
+                        token_count,
+                    )?;
+                }
                 kv_quant::quantize_paged_kv_single(
                     &self.ctx,
                     pool.v_work_ptr(stream),

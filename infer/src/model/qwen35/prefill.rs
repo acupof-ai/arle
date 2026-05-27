@@ -1980,32 +1980,109 @@ impl Qwen35Model {
         full_idx: usize,
         bufs: &PagedPrefillBuffers35,
     ) -> Result<()> {
-        if !matches!(pool.format, KVFormat::FP8E4M3) {
-            return Ok(());
-        }
         let token_count = bufs.seq_len;
-        kv_quant::quantize_paged_kv_fp8(
-            &self.ctx,
-            pool.k_work_ptr(&self.ctx.stream),
-            pool.k_data_ptr(full_idx, &self.ctx.stream),
-            pool.k_scales_ptr(full_idx, &self.ctx.stream),
-            &bufs.metadata.token_rows_gpu,
-            self.config.num_key_value_heads,
-            self.config.head_dim,
-            pool.kv_dim,
-            token_count,
-        )?;
-        kv_quant::quantize_paged_kv_fp8(
-            &self.ctx,
-            pool.v_work_ptr(&self.ctx.stream),
-            pool.v_data_ptr(full_idx, &self.ctx.stream),
-            pool.v_scales_ptr(full_idx, &self.ctx.stream),
-            &bufs.metadata.token_rows_gpu,
-            self.config.num_key_value_heads,
-            self.config.head_dim,
-            pool.kv_dim,
-            token_count,
-        )
+        let stream = &self.ctx.stream;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+        match pool.format {
+            KVFormat::FP8E4M3 => {
+                kv_quant::quantize_paged_kv_fp8(
+                    &self.ctx,
+                    pool.k_work_ptr(stream),
+                    pool.k_data_ptr(full_idx, stream),
+                    pool.k_scales_ptr(full_idx, stream),
+                    &bufs.metadata.token_rows_gpu,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )?;
+                kv_quant::quantize_paged_kv_fp8(
+                    &self.ctx,
+                    pool.v_work_ptr(stream),
+                    pool.v_data_ptr(full_idx, stream),
+                    pool.v_scales_ptr(full_idx, stream),
+                    &bufs.metadata.token_rows_gpu,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )?;
+                Ok(())
+            }
+            KVFormat::INT8 => {
+                // KIVI per-channel K path (mirrors qwen3/prefill.rs INT8 arm).
+                // When the pool exposes static per-channel scales, calibrate
+                // from this prefill batch's K statistics and quantize through
+                // the static table; otherwise fall back to per-(row, head)
+                // absmax. V always uses per-(row, head) scales (KIVI's
+                // asymmetric choice).
+                if let Some(static_scales_ptr) = pool.k_static_scales_ptr(full_idx, stream) {
+                    unsafe {
+                        cudarc::driver::result::memset_d8_async(
+                            cudarc::driver::sys::CUdeviceptr::from(static_scales_ptr),
+                            0,
+                            num_kv_heads * head_dim * std::mem::size_of::<f32>(),
+                            stream.cu_stream(),
+                        )
+                        .ok();
+                    }
+                    kv_quant::compute_k_per_channel_absmax(
+                        &self.ctx,
+                        pool.k_work_ptr(stream),
+                        static_scales_ptr,
+                        &bufs.metadata.token_rows_gpu,
+                        num_kv_heads,
+                        head_dim,
+                        pool.kv_dim,
+                        token_count,
+                    )?;
+                    kv_quant::finalize_k_per_channel_scales_int8(
+                        &self.ctx,
+                        static_scales_ptr,
+                        num_kv_heads * head_dim,
+                    )?;
+                    pool.k_kivi_calibrated[full_idx]
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    kv_quant::quantize_paged_kv_int8_per_channel(
+                        &self.ctx,
+                        pool.k_work_ptr(stream),
+                        pool.k_data_ptr(full_idx, stream),
+                        static_scales_ptr,
+                        &bufs.metadata.token_rows_gpu,
+                        num_kv_heads,
+                        head_dim,
+                        pool.kv_dim,
+                        token_count,
+                    )?;
+                } else {
+                    kv_quant::quantize_paged_kv_single(
+                        &self.ctx,
+                        pool.k_work_ptr(stream),
+                        pool.k_data_ptr(full_idx, stream),
+                        pool.k_scales_ptr(full_idx, stream),
+                        &bufs.metadata.token_rows_gpu,
+                        num_kv_heads,
+                        head_dim,
+                        pool.kv_dim,
+                        token_count,
+                    )?;
+                }
+                kv_quant::quantize_paged_kv_single(
+                    &self.ctx,
+                    pool.v_work_ptr(stream),
+                    pool.v_data_ptr(full_idx, stream),
+                    pool.v_scales_ptr(full_idx, stream),
+                    &bufs.metadata.token_rows_gpu,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     fn refill_fp8_paged_prefill_prefix_if_needed(
