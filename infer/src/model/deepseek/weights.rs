@@ -1736,75 +1736,341 @@ impl DeepseekModel {
             };
 
             // FlashMLA SM90 sparse prefill (opt-in via ARLE_DSV4_FLASHMLA_PREFILL=1).
-            // V1 scope: CSA mode (mode_int == 1) only, token_count > 1 only, head_dim
-            // ∈ {512, 576}. Falls back to the existing hand-rolled
-            // dsv4_hybrid_attention_kernel for decode (token_count == 1),
-            // unsupported head_dim, or modes != CSA.
             //
-            // V1 limitations (v2 follow-up):
-            //   - Sliding-window contribution is NOT included — FlashMLA's
-            //     sparse-prefill kernel attends to a single KV pool. For
-            //     long-context prefill the sliding-window is a small
-            //     recency add vs the top-512 compressed selection, so
-            //     dropping it changes early-token quality only.
-            //   - attn_sink (bf16 in ARLE) is passed as nullptr because
-            //     FlashMLA wants float[h_q]. A persistent f32 mirror at
-            //     model load is the cleanest fix; deferred to v2.
+            // V2 scope: CSA mode (mode_int == 1), token_count > 1, head_dim ∈ {512, 576},
+            // SM 9.x (FlashMLA cubins are compiled sm_90a only). HCA (mode 2) and
+            // SWA (mode 0) fall through to the legacy kernel — wiring planned in a
+            // follow-up after CSA bench validates the kernel path.
+            //
+            // V2 additions vs V1:
+            //   - Unified KV pool (SW rolling + linear k_prepared + compressed) so
+            //     the sliding-window recency contribution is preserved instead of
+            //     dropped. See arle_flashmla_csa_pack_kv.
+            //   - Per-token unified indices + topk_length so each Q-token attends to
+            //     its own SW window slice + the full top-k selected compressed
+            //     blocks. See arle_flashmla_csa_build_indices.
+            //   - attn_sink as f32 (mirror loaded at model init, offset by
+            //     tp.rank * local_heads — FlashMLA indexes over the local head range).
+            //   - TP-AllGather Q (when tp_world > 1) so FlashMLA's h_q % B_H == 0
+            //     hard-assertion is satisfied (B_H = 64, see
+            //     vendor/flashmla/csrc/sm90/prefill/sparse/config.h:26). Each rank
+            //     computes the full 64-head output redundantly and slices its own
+            //     8-head slab back to local_attn. The 8× attention compute waste is
+            //     ~14.7% layer overhead because sparse attention is ~2% of total
+            //     layer FLOPs (compute-roofline analysis in agent V2-A report).
             //
             // Refs:
+            //   docs/experience/errors/2026-05-27-dsv4-flashmla-v1-h_q-tp-shard-mismatch.md
             //   docs/experience/errors/2026-05-27-dsv4-grouped-gemm-marginal-prefill-kernel-not-blocker.md
             //   crates/cuda-kernels/csrc/misc/arle_flashmla_shim.cu
+            //   crates/cuda-kernels/csrc/misc/arle_flashmla_csa_prep.cu
+            //   crates/cuda-kernels/csrc/misc/dsv4_tp_attention_repack.cu
             //   crates/cuda-kernels/vendor/flashmla (sgl-project/FlashMLA @ df022eb)
-            let use_flashmla = mode_int == 1
+            let (sm_major, _sm_minor) = self.ctx.compute_capability();
+            let use_flashmla = sm_major == 9
+                && mode_int == 1
                 && token_count > 1
                 && (head_dim == 512 || head_dim == 576)
                 && dsv4_flashmla_prefill_enabled()?;
             if use_flashmla {
-                // h_kv = 1 (MLA shares K across heads). indices stride =
-                // selected_topk; kv stride = head_dim. h_kv axis is degenerate
-                // so its strides are 0 (no row stride within a single h_kv).
-                let h_kv: i32 = 1;
-                let topk_i32 = self.config.index_topk as i32;
-                let stride_q_s_q = (local_heads * head_dim) as i32;
-                let stride_q_h_q = head_dim as i32;
-                let stride_kv_s_kv = head_dim as i32;
-                let stride_kv_h_kv = 0_i32;
-                let stride_indices_s_q = topk_i32;
-                let stride_indices_h_kv = 0_i32;
-                // num_sm = 0 lets FlashMLA's launcher use the device default
-                // (param is consulted only by paths that split across SMs).
-                let num_sm = 0_i32;
-                let scale = 1.0 / (head_dim as f32).sqrt();
-                let res = unsafe {
-                    ffi::arle_flashmla_sm90_sparse_prefill_fwd(
-                        q_ptr as *const ffi::Half,
-                        compressed_ptr,
-                        selected_ptr,
-                        std::ptr::null(), // attn_sink (v1: NULL, see comment above)
-                        std::ptr::null(), // topk_length (v1: full selected_topk per row)
-                        out_ptr as *mut ffi::Half,
-                        std::ptr::null_mut(),    // max_logits (unused)
-                        std::ptr::null_mut(),    // lse (unused)
-                        token_count as i32,      // s_q
-                        compressed_count as i32, // s_kv
-                        local_heads as i32,      // h_q
-                        h_kv,
-                        head_dim as i32, // d_qk
-                        head_dim as i32, // d_v (MLA: same as d_qk for the 512 dim)
-                        topk_i32,
-                        scale,
-                        stride_q_s_q,
-                        stride_q_h_q,
-                        stride_kv_s_kv,
-                        stride_kv_h_kv,
-                        stride_indices_s_q,
-                        stride_indices_h_kv,
-                        num_sm,
-                        self.ctx.stream.cu_stream(),
-                    )
+                let tp_world = self.config.tp.world_size;
+                let tp_rank = self.config.tp.rank;
+                let global_heads = local_heads * tp_world;
+
+                // FlashMLA B_H == 64 → global h_q must be a multiple of 64. With
+                // 64 total Q heads at any TP this is satisfied; check defensively.
+                if !global_heads.is_multiple_of(64) {
+                    anyhow::bail!(
+                        "FlashMLA SM90 sparse prefill requires global h_q % 64 == 0, \
+                         got tp_world={} * local_heads={} = global_heads={}",
+                        tp_world,
+                        local_heads,
+                        global_heads,
+                    );
+                }
+
+                let sliding_window = self.config.sliding_window;
+                let index_topk = self.config.index_topk;
+                let s_kv_total = sliding_window + token_count + compressed_count;
+                let topk_unified = sliding_window + index_topk;
+                debug_assert_eq!(
+                    topk_unified % 128,
+                    0,
+                    "FlashMLA requires params.topk % (2*B_TOPK=128) == 0"
+                );
+
+                // ---- Unified KV pool: [SW rebased | k_prepared | compressed] ----
+                let mut kv_unified: cudarc::driver::CudaSlice<bf16> = self
+                    .ctx
+                    .stream
+                    .alloc_zeros::<bf16>(s_kv_total * head_dim)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DSv4 FlashMLA KV scratch alloc failed: {err}")
+                    })?;
+                {
+                    use cudarc::driver::DevicePtrMut;
+                    let (kv_ptr, _g) = kv_unified.device_ptr_mut(&self.ctx.stream);
+                    let comp_ptr_arg = if compressed_count > 0 {
+                        compressed_ptr
+                    } else {
+                        std::ptr::null()
+                    };
+                    unsafe {
+                        ffi::arle_flashmla_csa_pack_kv(
+                            kv_ptr as *mut ffi::Half,
+                            window_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            comp_ptr_arg,
+                            start_pos as i32,
+                            sliding_window as i32,
+                            token_count as i32,
+                            compressed_count as i32,
+                            head_dim as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|err| {
+                            anyhow::anyhow!("DSv4 FlashMLA CSA KV pack failed: {err}")
+                        })?;
+                    }
+                }
+
+                // ---- Unified indices + topk_length ----
+                let mut indices_unified: cudarc::driver::CudaSlice<i32> = self
+                    .ctx
+                    .stream
+                    .alloc_zeros::<i32>(token_count * topk_unified)
+                    .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA indices alloc failed: {err}"))?;
+                let mut topk_length: cudarc::driver::CudaSlice<i32> = self
+                    .ctx
+                    .stream
+                    .alloc_zeros::<i32>(token_count)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DSv4 FlashMLA topk_length alloc failed: {err}")
+                    })?;
+                {
+                    use cudarc::driver::DevicePtrMut;
+                    let (idx_ptr, _gi) = indices_unified.device_ptr_mut(&self.ctx.stream);
+                    let (len_ptr, _gl) = topk_length.device_ptr_mut(&self.ctx.stream);
+                    unsafe {
+                        ffi::arle_flashmla_csa_build_indices(
+                            idx_ptr as *mut i32,
+                            len_ptr as *mut i32,
+                            selected_ptr,
+                            token_count as i32,
+                            start_pos as i32,
+                            sliding_window as i32,
+                            index_topk as i32,
+                            compressed_count as i32,
+                            compress_ratio as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|err| {
+                            anyhow::anyhow!("DSv4 FlashMLA CSA index build failed: {err}")
+                        })?;
+                    }
+                }
+
+                // ---- TP-AllGather Q (skipped at TP=1) ----
+                // gathered_q / packed_q / full_out are dropped after the dispatch
+                // returns, freeing back to the cudarc pool.
+                let mut gathered_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+                let mut packed_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+                let mut full_out_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+
+                #[cfg(feature = "nccl")]
+                let _tp_nccl_dispatch = if tp_world > 1 {
+                    let tp_nccl = self.layer_communicator.tp_nccl().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "FlashMLA TP>1 prefill requires TP NCCL group; \
+                             build with --features nccl and set TP env-bootstrap vars",
+                        )
+                    })?;
+                    let send_count = token_count * local_heads * head_dim;
+                    let mut gathered = unsafe {
+                        self.ctx
+                            .stream
+                            .alloc_traced::<bf16>(send_count * tp_world)
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "FlashMLA TP allgather Q scratch alloc failed: {err}",
+                                )
+                            })?
+                    };
+                    tp_nccl.all_gather_bf16_device(&q_prepared.data, send_count, &mut gathered)?;
+                    let mut packed = unsafe {
+                        self.ctx
+                            .stream
+                            .alloc_traced::<bf16>(send_count * tp_world)
+                            .map_err(|err| {
+                                anyhow::anyhow!("FlashMLA TP packed Q scratch alloc failed: {err}",)
+                            })?
+                    };
+                    use cudarc::driver::{DevicePtr, DevicePtrMut};
+                    let (gathered_ptr, _gg) = gathered.device_ptr(&self.ctx.stream);
+                    let (packed_ptr, _gp) = packed.device_ptr_mut(&self.ctx.stream);
+                    unsafe {
+                        ffi::dsv4_tp_q_repack_cuda(
+                            gathered_ptr as *const ffi::Half,
+                            packed_ptr as *mut ffi::Half,
+                            tp_world as i32,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|err| {
+                            anyhow::anyhow!("DSv4 FlashMLA TP Q repack failed: {err}")
+                        })?;
+                    }
+                    let full_out_len = token_count * global_heads * head_dim;
+                    let full_out = unsafe {
+                        self.ctx
+                            .stream
+                            .alloc_traced::<bf16>(full_out_len)
+                            .map_err(|err| {
+                                anyhow::anyhow!("FlashMLA TP full-out scratch alloc failed: {err}",)
+                            })?
+                    };
+                    gathered_q_owned = Some(gathered);
+                    packed_q_owned = Some(packed);
+                    full_out_owned = Some(full_out);
+                    Some(tp_nccl)
+                } else {
+                    None
                 };
-                res.result()
-                    .map_err(|err| anyhow::anyhow!("DeepSeek V4 FlashMLA prefill failed: {err}"))?;
+                #[cfg(not(feature = "nccl"))]
+                if tp_world > 1 {
+                    anyhow::bail!("FlashMLA TP>1 prefill requires --features nccl");
+                }
+
+                // ---- Dispatch FlashMLA + (optional) TP output-slice ----
+                // Scope guards inside two inner blocks: first block holds the
+                // mut borrow on full_out_owned for the dispatch; second block
+                // re-acquires an immutable borrow for the slice. The borrow
+                // checker won't allow both to coexist.
+                {
+                    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+                    // Q pointer + stride: post-AllGather packed buffer or
+                    // raw local q_prepared.
+                    let (q_for_flashmla_ptr, stride_q_s_q) =
+                        if let Some(ref packed) = packed_q_owned {
+                            let (ptr, _g) = packed.device_ptr(&self.ctx.stream);
+                            (ptr as *const ffi::Half, (global_heads * head_dim) as i32)
+                        } else {
+                            (q_ptr as *const ffi::Half, (local_heads * head_dim) as i32)
+                        };
+
+                    // Output pointer: full_out scratch (TP>1) or local_attn directly.
+                    let (flashmla_out_ptr, flashmla_out_guard) =
+                        if let Some(ref mut full_out) = full_out_owned {
+                            let (ptr, g) = full_out.device_ptr_mut(&self.ctx.stream);
+                            (ptr as *mut ffi::Half, Some(g))
+                        } else {
+                            (out_ptr as *mut ffi::Half, None)
+                        };
+
+                    // attn_sink_f32 with rank offset (only at TP=1; FlashMLA
+                    // processes all global heads at TP>1 so the full base ptr
+                    // covers what it indexes).
+                    let (sink_f32_base_ptr, _sink_f32_g) =
+                        attention.attn_sink_f32.device_ptr(&self.ctx.stream);
+                    let sink_offset_elems = tp_rank * local_heads;
+                    debug_assert!(
+                        attention.attn_sink_f32.len() >= sink_offset_elems + local_heads,
+                        "DSv4 attn_sink_f32 mirror len {} cannot cover local heads {} at rank {}",
+                        attention.attn_sink_f32.len(),
+                        local_heads,
+                        tp_rank,
+                    );
+                    let sink_f32_local_ptr = if tp_world > 1 {
+                        sink_f32_base_ptr as *const f32
+                    } else {
+                        unsafe { (sink_f32_base_ptr as *const f32).add(sink_offset_elems) }
+                    };
+
+                    let (kv_unified_ptr_const, _kv_unified_g) =
+                        kv_unified.device_ptr(&self.ctx.stream);
+                    let (idx_const_ptr, _gic) = indices_unified.device_ptr(&self.ctx.stream);
+                    let (len_const_ptr, _glc) = topk_length.device_ptr(&self.ctx.stream);
+
+                    let h_kv: i32 = 1;
+                    let h_q_for_flashmla = if tp_world > 1 {
+                        global_heads as i32
+                    } else {
+                        local_heads as i32
+                    };
+                    let scale = 1.0 / (head_dim as f32).sqrt();
+                    let res = unsafe {
+                        ffi::arle_flashmla_sm90_sparse_prefill_fwd(
+                            q_for_flashmla_ptr,
+                            kv_unified_ptr_const as *const ffi::Half,
+                            idx_const_ptr as *const i32,
+                            sink_f32_local_ptr,
+                            len_const_ptr as *const i32,
+                            flashmla_out_ptr,
+                            std::ptr::null_mut(), // max_logits
+                            std::ptr::null_mut(), // lse
+                            token_count as i32,
+                            s_kv_total as i32,
+                            h_q_for_flashmla,
+                            h_kv,
+                            head_dim as i32,
+                            head_dim as i32,
+                            topk_unified as i32,
+                            scale,
+                            stride_q_s_q,
+                            head_dim as i32,     // stride_q_h_q
+                            head_dim as i32,     // stride_kv_s_kv
+                            0_i32,               // stride_kv_h_kv (degenerate)
+                            topk_unified as i32, // stride_indices_s_q
+                            0_i32,               // stride_indices_h_kv (degenerate)
+                            0_i32,               // num_sm — device default
+                            self.ctx.stream.cu_stream(),
+                        )
+                    };
+                    res.result().map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 FlashMLA prefill failed: {err}")
+                    })?;
+                    // Drop the mut guard explicitly so the immutable re-borrow
+                    // below can take place. (FlashMLA's output write is enqueued
+                    // on the stream; the guard records that on drop.)
+                    drop(flashmla_out_guard);
+                }
+
+                // ---- Slice rank's heads from full_out into local_attn ----
+                // Re-acquire immutable borrow on full_out_owned for the slice.
+                if tp_world > 1
+                    && let Some(ref full_out) = full_out_owned
+                {
+                    use cudarc::driver::DevicePtr;
+                    let (full_out_ptr_const, _g) = full_out.device_ptr(&self.ctx.stream);
+                    let global_width = global_heads * head_dim;
+                    let local_width_elems = local_heads * head_dim;
+                    let head_offset_elems = tp_rank * local_width_elems;
+                    unsafe {
+                        ffi::dsv4_tp_out_slice_cuda(
+                            full_out_ptr_const as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            global_width as i32,
+                            local_width_elems as i32,
+                            head_offset_elems as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|err| {
+                            anyhow::anyhow!("DSv4 FlashMLA TP out slice failed: {err}")
+                        })?;
+                    }
+                }
+                // Scratches freed back to the cudarc pool here.
+                drop(gathered_q_owned);
+                drop(packed_q_owned);
+                drop(full_out_owned);
             } else {
                 unsafe {
                     ffi::dsv4_hybrid_attention_cuda(
