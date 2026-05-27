@@ -1863,34 +1863,22 @@ impl DeepseekV4MoeBlock {
             hidden.seq_len,
             trace,
         )?;
-        let trace = dsv4_moe_trace_begin(ctx)?;
-        let counts_host = ctx
-            .stream
-            .clone_dtoh(&local_counts)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route count D2H failed: {err}"))?;
-        dsv4_moe_trace_end(ctx, "ffn_route_count_d2h", layer_idx, hidden.seq_len, trace)?;
-        let mut offsets_host = Vec::with_capacity(ep.experts_per_rank);
-        let mut total_local_routes = 0usize;
-        for &count in &counts_host {
-            ensure!(
-                count >= 0,
-                "DeepSeek V4 local route count kernel returned negative count {count}"
-            );
-            offsets_host.push(
-                i32::try_from(total_local_routes).map_err(|_| {
-                    anyhow::anyhow!("DeepSeek V4 packed route offset overflows i32")
-                })?,
-            );
-            total_local_routes += usize::try_from(count)
-                .map_err(|_| anyhow::anyhow!("DeepSeek V4 local route count overflows usize"))?;
-        }
-
-        let mut out = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
-        if total_local_routes == 0 {
-            return Ok(out);
-        }
+        // A3 Phase 1 (per docs/plans/2026-05-26-dsv4-a3-in-graph-metadata.md):
+        // device-side scan produces offsets_gpu + writes total to a 4-byte
+        // device slot. D2H only the 4-byte total — skip the full counts D2H
+        // and host scan whenever the downstream path doesn't need
+        // counts_host / offsets_host (i.e. decode hot path).
+        //
+        // The seq_len > 1 + LOCAL_GROUPED_EXPERTS branch (forward_compact_local_
+        // routes_gpu, prefill batched) still needs host-side counts/offsets to
+        // pick per-expert work units; for that branch we fall through to the
+        // legacy path. Decode (seq_len == 1) is the D2H-hot path and is what
+        // Phase 1 is targeting per L5 binding-constraints.
         let use_a3_phase1 = dsv4_a3_phase1_enabled()?;
-        let offsets_gpu = if use_a3_phase1 {
+        let needs_host_route_metadata = hidden.seq_len > 1 && dsv4_local_grouped_experts_enabled()?;
+        let mut offsets_gpu_owned: Option<cudarc::driver::CudaSlice<i32>> = None;
+        let mut total_local_routes_via_device: Option<usize> = None;
+        if use_a3_phase1 {
             let trace = dsv4_moe_trace_begin(ctx)?;
             let mut gpu_offsets = ctx
                 .stream
@@ -1898,14 +1886,18 @@ impl DeepseekV4MoeBlock {
                 .map_err(|err| {
                     anyhow::anyhow!("DeepSeek V4 local route offset alloc failed: {err}")
                 })?;
+            let mut total_gpu = ctx.stream.alloc_zeros_traced::<i32>(1).map_err(|err| {
+                anyhow::anyhow!("DeepSeek V4 local route total scratch alloc failed: {err}")
+            })?;
             {
                 let (count_ptr, _count_guard) = local_counts.device_ptr(&ctx.stream);
                 let (offset_ptr, _offset_guard) = gpu_offsets.device_ptr_mut(&ctx.stream);
+                let (total_ptr, _total_guard) = total_gpu.device_ptr_mut(&ctx.stream);
                 unsafe {
                     ffi::dsv4_exclusive_scan_i32_cuda(
                         count_ptr as *const i32,
                         offset_ptr as *mut i32,
-                        std::ptr::null_mut(),
+                        total_ptr as *mut i32,
                         experts_per_rank_i32,
                         ctx.stream.cu_stream(),
                     )
@@ -1922,7 +1914,62 @@ impl DeepseekV4MoeBlock {
                 hidden.seq_len,
                 trace,
             )?;
-            gpu_offsets
+            // 4-byte D2H to read the scan's accumulated total — pre-condition
+            // for early-return + tensor sizing, but ~64× smaller payload than
+            // D2H'ing the full counts vector.
+            let trace = dsv4_moe_trace_begin(ctx)?;
+            let total_vec = ctx.stream.clone_dtoh(&total_gpu).map_err(|err| {
+                anyhow::anyhow!("DeepSeek V4 local route total D2H failed: {err}")
+            })?;
+            dsv4_moe_trace_end(ctx, "ffn_route_total_d2h", layer_idx, hidden.seq_len, trace)?;
+            let total_i32 = total_vec[0];
+            ensure!(
+                total_i32 >= 0,
+                "DeepSeek V4 local route total scan returned negative {total_i32}"
+            );
+            total_local_routes_via_device = Some(total_i32 as usize);
+            offsets_gpu_owned = Some(gpu_offsets);
+        }
+
+        // counts_host / offsets_host are only built if a downstream branch
+        // actually needs them. With A3 phase 1 ON and decode-shaped hidden,
+        // both stay empty and the wide counts D2H + host scan is skipped.
+        let (counts_host, offsets_host, total_local_routes) =
+            if total_local_routes_via_device.is_some() && !needs_host_route_metadata {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    total_local_routes_via_device.unwrap(),
+                )
+            } else {
+                let trace = dsv4_moe_trace_begin(ctx)?;
+                let counts_host = ctx.stream.clone_dtoh(&local_counts).map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 local route count D2H failed: {err}")
+                })?;
+                dsv4_moe_trace_end(ctx, "ffn_route_count_d2h", layer_idx, hidden.seq_len, trace)?;
+                let mut offsets_host = Vec::with_capacity(ep.experts_per_rank);
+                let mut total = 0usize;
+                for &count in &counts_host {
+                    ensure!(
+                        count >= 0,
+                        "DeepSeek V4 local route count kernel returned negative count {count}"
+                    );
+                    offsets_host.push(i32::try_from(total).map_err(|_| {
+                        anyhow::anyhow!("DeepSeek V4 packed route offset overflows i32")
+                    })?);
+                    total += usize::try_from(count).map_err(|_| {
+                        anyhow::anyhow!("DeepSeek V4 local route count overflows usize")
+                    })?;
+                }
+                (counts_host, offsets_host, total)
+            };
+
+        let mut out = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
+        if total_local_routes == 0 {
+            return Ok(out);
+        }
+        let offsets_gpu = if let Some(gpu) = offsets_gpu_owned {
+            gpu
         } else {
             let trace = dsv4_moe_trace_begin(ctx)?;
             let offsets = ctx.stream.clone_htod(&offsets_host).map_err(|err| {
