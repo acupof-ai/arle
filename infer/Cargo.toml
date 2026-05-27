@@ -65,6 +65,10 @@ cuda-kernels = { path = "../crates/cuda-kernels", default-features = false }
 qwen3-spec = { path = "../crates/qwen3-spec" }
 qwen35-spec = { path = "../crates/qwen35-spec" }
 deepseek-spec = { path = "../crates/deepseek-spec" }
+# deepep-sys: torch-free DeepEP binding (phase B-2). Stub-only unless
+# ARLE_DEEPEP_DIR is set at build time, so this dep is safe to include
+# unconditionally — non-native path returns DeepEpError::NotBuilt.
+deepep-sys = { path = "../crates/deepep-sys" }
 # autograd is only used by the cuda-only `qwen35_train_vs_infer_parity`
 # example. Declared as an optional regular dep (not dev-dep) so its
 # `cuda` feature only activates when infer's `cuda` feature is on —
