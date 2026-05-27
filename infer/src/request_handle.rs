@@ -498,11 +498,32 @@ impl RequestHandle for DistributedSchedulerGroup {
                     .broadcast(&crate::multiproc_relay::RelayEnvelope::Request2 { wire })
                     .map_err(|_| SubmitError)?;
             }
-            // Submit to rank-0's local scheduler. `distributed` is left
-            // None — the scheduler attaches its NCCL-backed coordinator
-            // on ingest (commit C.4.5).
+            // Phase B-1 commit C.4.6.3 — attach NCCL-backed
+            // DistributedRequestCoordination so rank 0's
+            // synchronize_token calls participate in NCCL broadcast_i32
+            // alongside worker ranks. The NcclGroup comes from the
+            // model's ep_nccl, exposed via SchedulerHandle::ep_nccl
+            // (populated by spawn_scheduler_handle_from_path in C.4.6.2).
             let mut rank0_req = req;
-            rank0_req.distributed = None;
+            #[cfg(feature = "nccl")]
+            {
+                if let Some(nccl) = self.workers[0].handle.ep_nccl() {
+                    rank0_req.distributed = Some(
+                        DistributedRequestCoordination::new_nccl(
+                            0,
+                            self.effective_world_size,
+                            nccl,
+                        )
+                        .map_err(|_| SubmitError)?,
+                    );
+                } else {
+                    rank0_req.distributed = None;
+                }
+            }
+            #[cfg(not(feature = "nccl"))]
+            {
+                rank0_req.distributed = None;
+            }
             let permit = permits.into_iter().next().ok_or(SubmitError)?;
             permit.submit(rank0_req).map_err(|_| SubmitError)?;
             return Ok(());
