@@ -518,6 +518,57 @@ impl NcclGroup {
             .with_context(|| format!("rank {} D2H all_gather output copy failed", self.rank))
     }
 
+    /// All-gather a small byte buffer across all ranks. Every rank
+    /// contributes `per_rank_bytes` bytes; the returned `Vec<u8>` has
+    /// length `world_size * per_rank_bytes` with rank R's bytes at
+    /// offset `R * per_rank_bytes`. Used by phase B-3 native DeepEP
+    /// boot to exchange `cudaIpcMemHandle_t` (64 bytes) across ranks
+    /// before `Buffer::sync`.
+    pub fn all_gather_bytes(&self, input: &[u8], per_rank_bytes: usize) -> Result<Vec<u8>> {
+        if input.len() != per_rank_bytes {
+            bail!(
+                "NCCL all_gather_bytes rank {} input len {} must equal per-rank count {per_rank_bytes}",
+                self.rank,
+                input.len()
+            );
+        }
+        if per_rank_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let send = self.stream.clone_htod(input).with_context(|| {
+            format!("rank {} H2D all_gather_bytes input copy failed", self.rank)
+        })?;
+        let mut recv = self
+            .stream
+            .alloc_zeros::<u8>(per_rank_bytes * self.world_size)
+            .with_context(|| {
+                format!(
+                    "rank {} all_gather_bytes output allocation failed",
+                    self.rank
+                )
+            })?;
+        {
+            let (src, _record_src) = send.device_ptr(&self.stream);
+            let (dst, _record_dst) = recv.device_ptr_mut(&self.stream);
+            self.comm.all_gather(
+                src as *const c_void,
+                dst as *mut c_void,
+                per_rank_bytes,
+                ncclDataType_t::Int8,
+                &self.stream,
+            )?;
+        }
+        self.stream.synchronize().with_context(|| {
+            format!(
+                "rank {} stream sync after all_gather_bytes failed",
+                self.rank
+            )
+        })?;
+        self.stream
+            .clone_dtoh(&recv)
+            .with_context(|| format!("rank {} D2H all_gather_bytes output copy failed", self.rank))
+    }
+
     pub fn broadcast_f32(&self, input: &[f32], count: usize, root_rank: usize) -> Result<Vec<f32>> {
         if root_rank >= self.world_size {
             bail!(
