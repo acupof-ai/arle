@@ -166,6 +166,13 @@ export_runtime_env() {
     export ARLE_DSV4_INCREMENTAL_KV="${ARLE_DSV4_INCREMENTAL_KV:-1}"
     export ARLE_DSV4_FUSED_DISPATCH_PAYLOAD="${ARLE_DSV4_FUSED_DISPATCH_PAYLOAD:-1}"
     export ARLE_DSV4_EXPERT_BACKEND="$EXPERT_BACKEND"
+    # 2026-05-27 SLO unblock: grouped local expert path uses M-blind
+    # dsv4_fp8_grouped_gemv_batch_kernel (grid Y = max_count, no weight reuse) —
+    # catastrophic at prefill (29K-token TTFT = 325s). Disabling routes
+    # prefill (seq_len>1) through the per-expert loop where expert.forward()
+    # picks dsv4_fp8_gemv_batch_cuda → _tiled_kernel with DSV4_BATCH_TILE=32
+    # weight reuse. Refs: docs/experience/errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md
+    export ARLE_DSV4_LOCAL_GROUPED_EXPERTS="${ARLE_DSV4_LOCAL_GROUPED_EXPERTS:-0}"
     export ARLE_DEEPGEMM_LIBRARY_ROOT="$DEEPGEMM_LIBRARY_ROOT"
     # native-deepep needs the source tree available at runtime too (the
     # Buffer lifecycle is driven by the static archive linked at build,
