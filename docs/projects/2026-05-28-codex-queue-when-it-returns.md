@@ -52,12 +52,11 @@ The 0.0099·n² coefficient is consistent with several causes:
 1. **Attention math + KV cache append** — each decode step's
    `QK^T` and `attn @ V` over the growing cache → O(t) work at step
    t, O(n²) total.
-2. **`store.retain_ids(&keep)` at `opd.rs:1755`** — walks
-   `tensors.len()` slots each call (line 153 of `crates/autograd/
-   src/tensor.rs`). If `tensors.len()` (the high-water mark of
-   simultaneously-live tensors) grows linearly during the rollout,
-   and retain_ids is called every 2 tokens, that's O(n) × O(n/2) =
-   O(n²). Need to measure `tensors.len()` over the rollout.
+2. ~~`store.retain_ids(&keep)` at `opd.rs:1755`~~ — **RULED OUT**
+   2026-05-28 tick 11. `memory_summary live_tensors=370` flat
+   across the rollout sweep at rollout ∈ {8, 16, 32}; max-live
+   doesn't grow with n. Total retain cost at n=130 ≈ 2.4 ms,
+   negligible.
 3. **Backward graph buildup** — even with `tape.set_enabled(false)`
    the autograd backend might still walk a growing structure per
    forward.
