@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# Multi-seed MMLU+GSM8K eval for a single OPD checkpoint.
-# Usage: scripts/eval_opd_ckpt_seeds.sh <ckpt_path> <out_base> <seed1> [seed2 ...]
+# Multi-seed MMLU+GSM8K eval for a single OPD checkpoint (or base model).
+# Usage: scripts/eval_opd_ckpt_seeds.sh <ckpt_path|base> <out_base> <seed1> [seed2 ...]
 #
 # Mechanism: boots `target/release/infer` once with INFER_LORA_PATH set to
-# <ckpt_path>, then runs scripts/arle_capability_eval.py once per seed,
-# emitting <out_base>/seed_<N>/{mmlu.json,gsm8k.json,summary.json,eval.log}.
+# <ckpt_path> (or omitted when ckpt_path == "base"), then runs
+# scripts/arle_capability_eval.py once per seed, emitting
+# <out_base>/seed_<N>/{mmlu.json,gsm8k.json,summary.json,eval.log}.
 # Reuses one serve across seeds — only sample-selection differs.
 #
 # Why a separate script vs eval_opd_ckpts.sh: that driver iterates ckpts
 # (one serve per ckpt). For variance estimation at a fixed ckpt the
 # per-seed re-serve is pure overhead, and we want the same model state
 # across seeds so the only source of variance is the sample subset.
+#
+# Pass "base" as ckpt_path to eval the base model with no LoRA — used to
+# get a matched-n multi-seed baseline for paired comparison against an
+# OPD checkpoint.
 set -uo pipefail
 
 if [[ $# -lt 3 ]]; then
-    echo "usage: $0 <ckpt_path> <out_base> <seed1> [seed2 ...]" >&2
+    echo "usage: $0 <ckpt_path|base> <out_base> <seed1> [seed2 ...]" >&2
     exit 2
 fi
 
@@ -23,8 +28,8 @@ OUT_BASE="$2"
 shift 2
 SEEDS=("$@")
 
-if [[ ! -d "$CKPT_PATH" ]]; then
-    echo "error: ckpt $CKPT_PATH not found" >&2
+if [[ "$CKPT_PATH" != "base" && ! -d "$CKPT_PATH" ]]; then
+    echo "error: ckpt $CKPT_PATH not found (pass 'base' literal for no-LoRA baseline)" >&2
     exit 2
 fi
 
@@ -42,7 +47,14 @@ printf 'ckpt=%s\nout_base=%s\nseeds=%s\nn_samples=%s\n' \
     "$CKPT_PATH" "$OUT_BASE" "${SEEDS[*]}" "$N_SAMPLES" \
     | tee "$OUT_BASE/run.meta"
 
-INFER_LORA_PATH="$CKPT_PATH" target/release/infer \
+if [[ "$CKPT_PATH" == "base" ]]; then
+    LORA_ENV=()
+    echo "base-model eval (no INFER_LORA_PATH)"
+else
+    LORA_ENV=("INFER_LORA_PATH=$CKPT_PATH")
+fi
+
+env "${LORA_ENV[@]}" target/release/infer \
     --model-path "$STUDENT_BASE" \
     --port "$PORT" \
     --disable-cuda-graph \
