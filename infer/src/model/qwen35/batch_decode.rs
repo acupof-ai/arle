@@ -17,7 +17,7 @@ use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
 use crate::model::kv_cache::KVFormat;
-use crate::model::{DecodeContextOps, ModelForward};
+use crate::model::{DecodeContextOps, ModelForward, PrefillBatchRequest};
 use crate::ops;
 use cuda_kernels::kv_quant;
 use cuda_kernels::kv_turboquant;
@@ -353,6 +353,20 @@ impl BatchDecodeBuffers35 {
         self.mlp.set_batch_size(bs);
     }
 
+    pub(super) fn ensure_logits_batch(
+        &mut self,
+        ctx: &DeviceContext,
+        vocab_size: usize,
+    ) -> Result<&mut HiddenStates> {
+        if self.logits_batch.is_none() {
+            self.logits_batch = Some(HiddenStates::zeros(ctx, vocab_size, self.max_batch_size)?);
+        }
+        Ok(self
+            .logits_batch
+            .as_mut()
+            .expect("qwen35 logits batch initialized"))
+    }
+
     pub(crate) fn prepare_decode_token_ids(
         &mut self,
         ctx: &DeviceContext,
@@ -430,6 +444,48 @@ impl BatchDecodeBuffers35 {
         self.sampled_tokens_len = batch_size;
         self.sampled_tokens_valid = true;
         Ok(())
+    }
+
+    pub(super) fn upload_mixed_token_ids_with_handoff(
+        &mut self,
+        ctx: &DeviceContext,
+        mixed_token_ids_gpu: &mut CudaSlice<i32>,
+        decode_tokens: &[u32],
+        decode_slot_indices: &[usize],
+        prefills: &[PrefillBatchRequest<'_>],
+    ) -> Result<bool> {
+        self.token_ids_scratch.clear();
+        self.token_ids_scratch
+            .extend(decode_tokens.iter().map(|&tok| tok as i32));
+        for prefill in prefills {
+            self.token_ids_scratch
+                .extend(prefill.tokens.iter().map(|&tok| tok as i32));
+        }
+        ctx.stream
+            .memcpy_htod(self.token_ids_scratch.as_slice(), mixed_token_ids_gpu)
+            .map_err(|e| anyhow::anyhow!("qwen35 H2D mixed token_ids: {e}"))?;
+
+        if !self.sampled_tokens_valid || self.sampled_tokens_len == 0 {
+            return Ok(false);
+        }
+
+        let owner_len = self.sampled_tokens_len.min(self.sampled_tokens_owner.len());
+        let mut used_handoff = false;
+        for (dst_row, &slot_idx) in decode_slot_indices.iter().enumerate() {
+            let Some(src_row) = self.sampled_tokens_owner[..owner_len]
+                .iter()
+                .position(|owner| *owner == Some(slot_idx))
+            else {
+                continue;
+            };
+            let src = self.argmax_out.slice(src_row..=src_row);
+            let mut dst = mixed_token_ids_gpu.slice_mut(dst_row..=dst_row);
+            ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|e| {
+                anyhow::anyhow!("qwen35 D2D mixed sampled token handoff failed: {e}")
+            })?;
+            used_handoff = true;
+        }
+        Ok(used_handoff)
     }
 
     pub(crate) fn invalidate_sampled_token_handoff(&mut self) {

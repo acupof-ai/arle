@@ -612,7 +612,7 @@ impl<M: ModelForward> Scheduler<M> {
                     && let Phase::Prefilling { progress, .. } = &mut req.phase
                 {
                     *progress = row.next_progress;
-                    self.queue_prefill(slot_idx);
+                    self.queue_prefill_front(slot_idx);
                 }
                 info!(
                     "Request {}: prefill chunk {}/{} tokens",

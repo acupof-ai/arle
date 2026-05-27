@@ -386,13 +386,6 @@ fn trace_streaming_deltas(
             }
             if tx.send(delta).is_err() {
                 trace.finish(false, finish_reason, Some("client_channel_closed"));
-                while let Some(delta) = source.recv().await {
-                    trace.observe_delta(&delta);
-                    if let Some(finish_reason) = delta.finish_reason {
-                        trace.finish(true, Some(finish_reason), None);
-                        break;
-                    }
-                }
                 return;
             }
             if terminal {
@@ -402,6 +395,50 @@ fn trace_streaming_deltas(
         trace.finish(false, None, Some("scheduler_channel_closed"));
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_delta(text: &str) -> CompletionStreamDelta {
+        CompletionStreamDelta {
+            text_delta: text.to_string(),
+            finish_reason: None,
+            usage: None,
+            logprob: None,
+            token_ids: Vec::new(),
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_trace_drops_scheduler_rx_when_client_disconnects() {
+        let (source_tx, source_rx) = tokio::sync::mpsc::unbounded_channel();
+        let trace = RequestTraceState::new(
+            "/v1/completions",
+            "test-request".to_string(),
+            true,
+            16,
+            4,
+            ServerMetrics::new("test-model"),
+        );
+        let mut client_rx = trace_streaming_deltas(source_rx, trace);
+
+        source_tx.send(text_delta("a")).unwrap();
+        assert_eq!(client_rx.recv().await.unwrap().text_delta, "a");
+
+        drop(client_rx);
+        source_tx.send(text_delta("b")).unwrap();
+
+        for _ in 0..20 {
+            if source_tx.is_closed() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(source_tx.is_closed(), "scheduler sender stayed open");
+    }
 }
 
 async fn collect_buffered_response_inner(

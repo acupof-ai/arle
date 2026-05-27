@@ -931,6 +931,11 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
+    pub(super) fn queue_prefill_front(&mut self, slot_idx: usize) {
+        self.dequeue_prefill(slot_idx);
+        self.prefill_queue.push_front(slot_idx);
+    }
+
     pub(super) fn dequeue_prefill(&mut self, slot_idx: usize) {
         self.prefill_queue.retain(|&queued| queued != slot_idx);
     }

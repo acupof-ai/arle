@@ -33,7 +33,7 @@ use infer::server_engine::LoadedInferenceEngine;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 const INPUT_IDS: &[u32] = &[
-    9707, 11, 1879, 0, 11765, 264, 4756, 304, 13027, 13, 4248, 311, 387, 64594, 13, 220,
+    151644, 872, 198, 785, 468, 3092, 301, 21938, 374, 151645, 198, 151644, 77091, 198,
 ];
 
 fn get_model_path() -> String {

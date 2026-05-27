@@ -427,18 +427,21 @@ impl<M: ModelForward> Scheduler<M> {
             cuda_kernels::prelude::DeviceVec::zeros(&ctx, input_ids.len() * vocab_size)?
                 .with_label("raw_token_logits[seq,vocab]");
 
-        for (idx, &token) in input_ids.iter().enumerate() {
-            let (_tokens, token_logits) = self.model.forward_with_logits(&[token], &mut state)?;
-            anyhow::ensure!(
-                token_logits.len == vocab_size,
-                "forward_token_logits expected one vocab row per token, got logits len {} \
-                 for vocab size {} at token index {}",
-                token_logits.len,
-                vocab_size,
-                idx
-            );
-            logits.copy_region_from_device(&ctx, idx * vocab_size, &token_logits, 0, vocab_size)?;
-        }
+        // DIAGNOSTIC (2026-05-27): one-shot multi-token forward (exercises
+        // contiguous multi-token prefill via process_all_layers_batch). The
+        // model only fills the last position's logits in this path — earlier
+        // rows of the `logits` buffer are zeros. Reverting after the paged-
+        // prefill bug investigation closes.
+        let (_tokens, token_logits) = self.model.forward_with_logits(input_ids, &mut state)?;
+        anyhow::ensure!(
+            token_logits.len == vocab_size,
+            "forward_token_logits expected one vocab row, got logits len {} \
+             for vocab size {}",
+            token_logits.len,
+            vocab_size,
+        );
+        let last_offset = (input_ids.len() - 1) * vocab_size;
+        logits.copy_region_from_device(&ctx, last_offset, &token_logits, 0, vocab_size)?;
 
         Ok(crate::server_engine::RawLogits {
             logits,
