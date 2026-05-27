@@ -88,7 +88,46 @@ When integrating a 3rd-party kernel with internal exceptions or asserts, **alway
 - Probe artifacts on pod: `/sgl-workspace/arle-fresh/docs/trace-artifacts/2026-05-27-dsv4-flashmla-v2{,-fix}/`
 - TMA Desc Addr output captured in `bzp7cxh0i.output`
 
-## Open issues for V2.2 (debug + ship)
+## V2.2 — 24576 total-position gate (commit `d24880f3` + `7ea63e83`)
+
+Conservative safety gate landed: when `start_pos + token_count > 24576`,
+the FlashMLA branch is skipped and the chunk falls through to the legacy
+`dsv4_hybrid_attention_cuda` path. This eliminates the >24K crash zone
+without touching the FlashMLA kernel itself.
+
+Verified empirically at 29K with `ARLE_DSV4_FLASHMLA_PREFILL=1` (binary
+`16:35 UTC` after `cargo build -p infer --bin infer`):
+
+| Probe | Path | Prefill | Total | Status |
+|---|---|---:|---:|---|
+| V2.1 @ 29K (no gate, FlashMLA all chunks) | crash mid-prefill | 12.8s | crashed | TMA OOB |
+| **V2.2 @ 29K (gate, chunk1=FlashMLA, chunk2=legacy)** | mixed | **280.5s** | **281.7s** | ✅ **clean, finish_reason="length"** |
+| Baseline @ 29K (no FlashMLA at all) | legacy all | — | 282s | ✅ |
+
+Wall-clock framing per CLAUDE.md §0: gate keeps 29K runtime at the legacy
+baseline (282s) — no regression. Future work to unlock 29K speed-up will
+need a deeper FlashMLA fix; for now the gate is a defensive partial-ship.
+
+Build-system gotcha caught en route: `cargo build --release --features
+cuda,nccl` (without `-p infer --bin infer`) only re-links the workspace
+`arle` binary, not the `infer` server binary that the probe scripts
+launch. Verify binary mtime after every build:
+
+```
+stat -c %y /sgl-workspace/arle-fresh/target/release/infer
+```
+
+If unchanged after a code change, re-run with `cargo build --release
+--features cuda,nccl -p infer --bin infer`. Worth landing in
+`scripts/bench_guidellm.sh` / probe scripts as a defensive precondition.
+
+Also surfaced an A3 phase 1 bug: my prior counts_host skip broke the
+non-compact pack loop (`mlp.rs:2078`) at `LOCAL_GROUPED_EXPERTS=0`. Fixed
+in `7ea63e83` by always rebuilding `counts_host`; A3 phase 1's net D2H
+saving reverts to zero until Phase 2 lands a persistent grouped-GEMM
+kernel that replaces the per-expert host loop.
+
+## Open issues for V2.3 (debug + ship)
 
 1. **HCA wiring DONE (commit `326a6e48`)** — `arle_flashmla_hca_build_indices` + `mode_int == 2` dispatch lands the 20 HCA layers on the FlashMLA path. All ≤24K probes are clean (4K=2.06s, 16K=5.05s, 24K=7.69s); 24K is slightly FASTER than the CSA-only baseline (-1.5%) which strongly suggests HCA layers were a partial bottleneck on the legacy path.
 2. **29K TMA crash root-cause: shared CSA+HCA infra, not mode-specific.** Both V2 (CSA only) and V2.1 (CSA+HCA) crash at the same 12.8s wall-clock point with `CUDA_ERROR_ILLEGAL_ADDRESS` at the downstream MoE D2H. Hypothesis order:
