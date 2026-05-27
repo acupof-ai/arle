@@ -1424,6 +1424,14 @@ fn main() {
         println!("cargo:rustc-link-lib=c++");
     } else if !cfg!(target_os = "windows") {
         println!("cargo:rustc-link-lib=stdc++");
+        // GCC < 9 needs explicit -lstdc++fs for std::filesystem symbols.
+        // DeepGEMM's runtime cache (get_or_build_runtime) uses
+        // std::filesystem::{create_directories,remove_all,exists,...};
+        // on the pod's gcc 8.3 these are in libstdc++fs.a, not libstdc++.
+        // No-op on gcc 9+ where filesystem is in libstdc++.
+        if enable_deepgemm_native {
+            println!("cargo:rustc-link-lib=stdc++fs");
+        }
     }
 
     build_deepep_sidecar(&cuda_path, &nvcc, &out_dir, &sm_targets);
