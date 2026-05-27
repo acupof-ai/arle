@@ -1,0 +1,50 @@
+---
+title: ARLE 请求调度状态机 (commit 38f28d09)
+---
+stateDiagram-v2
+    [*] --> Submitted : HTTP / agent 提交
+    Submitted --> Queued : 入队待 admission
+    Queued --> Admitted : admission policy<br/>(scheduler/policy.rs)
+    Admitted --> Prefilling : 进入 chunked prefill
+    Prefilling --> Prefilling : chunk 未完成<br/>继续下一 token 块
+    Prefilling --> Decoding : 首 token 产出<br/>切 decode-priority batching
+    Decoding --> Decoding : per-token 解码循环
+
+    Decoding --> SpecPath : 进入投机解码<br/>(spec_path.rs)
+    SpecPath --> Decoding : accepted (commit drafted tokens)
+    SpecPath --> Decoding : rejected (single-token fallback)
+
+    Decoding --> Preempted : 压力命中 eviction policy
+    Prefilling --> Preempted : 压力命中 eviction policy
+    Preempted --> Queued : 重新排队等待 admission
+
+    Decoding --> Stopped : EOS / stop seq / max_tokens
+    Stopped --> Released : 释放 KV / 归还 slot
+    Released --> [*]
+
+    note right of SpecPath
+        ⚠️ Phase 2 paused
+        verifier 仍 K+1 次跑 target paged decode
+        → -62.8% throughput regression → 已暂停
+        blocker:
+          - packed K+1 verifier 或
+          - MagicDec sparse-KV self-spec
+          - Qwen3.5 hybrid linear-attention
+            recurrent state accepted-length rollback
+    end note
+
+    note left of Queued
+        实现路径
+        ─ CPU accounting scheduler: infer/src/scheduler/batch.rs
+        ─ CUDA scheduler:           infer/src/scheduler/cuda/
+        ─ Metal scheduler:          infer/src/backend/metal/scheduler.rs
+        ─ Forward batch (F0.7 PP):  infer/src/scheduler/forward_batch.rs
+    end note
+
+    note right of Preempted
+        状态成熟度
+        ─ chunked prefill            ✅
+        ─ decode-priority batching   ✅
+        ─ preemption / eviction      ✅ (policy.rs)
+        ─ spec_path                  ⚠️ Phase 2 paused
+    end note

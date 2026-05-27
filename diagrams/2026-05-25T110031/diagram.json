@@ -1,0 +1,298 @@
+{
+  "version": 2,
+  "nodes": [
+    {
+      "type": "frame",
+      "id": "root",
+      "x": 0,
+      "y": 0,
+      "width": 1400,
+      "height": "fit-content",
+      "layout": "vertical",
+      "gap": 18,
+      "padding": 28,
+      "fillColor": "#FAFBFD",
+      "borderWidth": 0,
+      "children": [
+        {
+          "type": "text",
+          "id": "title",
+          "width": "fill-container",
+          "height": "fit-content",
+          "text": "ARLE 分层架构  (commit 38f28d09 · 2026-05-25)",
+          "fontSize": 26,
+          "fontWeight": "bold",
+          "textAlign": "center",
+          "verticalAlign": "middle",
+          "textColor": "#1B2C44"
+        },
+        {
+          "type": "frame",
+          "id": "legend",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 18,
+          "padding": 8,
+          "alignItems": "center",
+          "justifyContent": "center",
+          "borderWidth": 0,
+          "children": [
+            { "type": "rect", "id": "lg-ok", "width": 150, "height": "fit-content", "text": "✅  生产就绪", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderWidth": 1.5, "borderRadius": 6, "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+            { "type": "rect", "id": "lg-warn", "width": 200, "height": "fit-content", "text": "⚠️  scaffold / 暂停", "fillColor": "#FFE8C2", "borderColor": "#C7791F", "borderWidth": 1.5, "borderRadius": 6, "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+            { "type": "rect", "id": "lg-todo", "width": 200, "height": "fit-content", "text": "🚧  WIP / smoke only", "fillColor": "#FBD3D1", "borderColor": "#B23A37", "borderWidth": 1.5, "borderRadius": 6, "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" }
+          ]
+        },
+
+        {
+          "type": "frame",
+          "id": "row-l1",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 18,
+          "padding": 0,
+          "alignItems": "center",
+          "borderWidth": 0,
+          "children": [
+            { "type": "text", "id": "lbl-l1", "width": 110, "height": "fit-content", "text": "L1\n入口", "fontSize": 16, "fontWeight": "bold", "textAlign": "right", "textColor": "#2D1B5A" },
+            {
+              "type": "frame",
+              "id": "layer-l1",
+              "width": "fill-container",
+              "height": "fit-content",
+              "borderWidth": 2,
+              "borderColor": "#6B4FAE",
+              "borderRadius": 10,
+              "fillColor": "#F7F0FF",
+              "layout": "horizontal",
+              "gap": 16,
+              "padding": 20,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "n-arle", "width": "fill-container", "height": "fit-content", "text": "arle  ✅\nsrc/main.rs · 薄壳 binary, 复用 infer 主权", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" }
+              ]
+            }
+          ]
+        },
+
+        {
+          "type": "frame",
+          "id": "row-l2",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 18,
+          "padding": 0,
+          "alignItems": "center",
+          "borderWidth": 0,
+          "children": [
+            { "type": "text", "id": "lbl-l2", "width": 110, "height": "fit-content", "text": "L2\n控制面", "fontSize": 16, "fontWeight": "bold", "textAlign": "right", "textColor": "#1B2C44" },
+            {
+              "type": "frame",
+              "id": "layer-l2",
+              "width": "fill-container",
+              "height": "fit-content",
+              "borderWidth": 2,
+              "borderColor": "#3A5F8C",
+              "borderRadius": 10,
+              "fillColor": "#EAF1FA",
+              "layout": "horizontal",
+              "gap": 14,
+              "padding": 20,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "n-cli", "width": "fill-container", "height": "fit-content", "text": "cli  ✅\n命令行入口", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "n-agent", "width": "fill-container", "height": "fit-content", "text": "agent  ✅\n本地 agent loop", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "n-tools", "width": "fill-container", "height": "fit-content", "text": "tools  ✅\nbash / file / web", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "n-chat", "width": "fill-container", "height": "fit-content", "text": "chat  ✅\n对话编排", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" }
+              ]
+            }
+          ]
+        },
+
+        {
+          "type": "frame",
+          "id": "row-l3",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 18,
+          "padding": 0,
+          "alignItems": "stretch",
+          "borderWidth": 0,
+          "children": [
+            { "type": "text", "id": "lbl-l3", "width": 110, "height": "fit-content", "text": "L3\n推理运行时\n(infer · 主权)", "fontSize": 16, "fontWeight": "bold", "textAlign": "right", "textColor": "#1B2C44" },
+            {
+              "type": "frame",
+              "id": "layer-l3",
+              "width": "fill-container",
+              "height": "fit-content",
+              "borderWidth": 2,
+              "borderColor": "#3A5F8C",
+              "borderRadius": 10,
+              "fillColor": "#EAF1FA",
+              "layout": "vertical",
+              "gap": 12,
+              "padding": 20,
+              "alignItems": "stretch",
+              "children": [
+                {
+                  "type": "frame",
+                  "id": "l3-row-1",
+                  "width": "fill-container",
+                  "height": "fit-content",
+                  "layout": "horizontal",
+                  "gap": 12,
+                  "padding": 0,
+                  "alignItems": "stretch",
+                  "borderWidth": 0,
+                  "children": [
+                    { "type": "rect", "id": "n-engine", "width": "fill-container", "height": "fit-content", "text": "server_engine  ✅\nInferenceEngine 契约", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                    { "type": "rect", "id": "n-http", "width": "fill-container", "height": "fit-content", "text": "http_server  ✅\naxum · OpenAI v1 compat", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                    { "type": "rect", "id": "n-sched", "width": "fill-container", "height": "fit-content", "text": "scheduler  ✅\nbatch · cuda · policy · forward_batch", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "l3-row-2",
+                  "width": "fill-container",
+                  "height": "fit-content",
+                  "layout": "horizontal",
+                  "gap": 12,
+                  "padding": 0,
+                  "alignItems": "stretch",
+                  "borderWidth": 0,
+                  "children": [
+                    { "type": "rect", "id": "n-model", "width": "fill-container", "height": "fit-content", "text": "model  ✅\nqwen35 · qwen3 · layer_communicator", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                    { "type": "rect", "id": "n-ops", "width": "fill-container", "height": "fit-content", "text": "ops  ✅\nbatched · _into variants", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                    { "type": "rect", "id": "n-kvt", "width": "fill-container", "height": "fit-content", "text": "kv_tier  ✅\nT0 – T3 (HBM→SSD)", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                    { "type": "rect", "id": "n-prefix", "width": "fill-container", "height": "fit-content", "text": "prefix_cache  ✅\nRadixCache", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" }
+                  ]
+                },
+                {
+                  "type": "frame",
+                  "id": "l3-row-3",
+                  "width": "fill-container",
+                  "height": "fit-content",
+                  "layout": "horizontal",
+                  "gap": 12,
+                  "padding": 0,
+                  "alignItems": "stretch",
+                  "borderWidth": 0,
+                  "children": [
+                    { "type": "rect", "id": "n-dist", "width": "fill-container", "height": "fit-content", "text": "distributed  ⚠️\nF0–F4 scaffold · 真正 collectives 未进 forward", "fillColor": "#FFE8C2", "borderColor": "#C7791F", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                    { "type": "rect", "id": "n-spec", "width": "fill-container", "height": "fit-content", "text": "speculative  ⚠️\nPhase 2 plumbing · -62.8% 回归后暂停", "fillColor": "#FFE8C2", "borderColor": "#C7791F", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                    {
+                      "type": "frame",
+                      "id": "n-backend",
+                      "width": "fill-container",
+                      "height": "fit-content",
+                      "layout": "vertical",
+                      "gap": 6,
+                      "padding": 10,
+                      "borderRadius": 8,
+                      "borderWidth": 1.5,
+                      "borderColor": "#3A5F8C",
+                      "fillColor": "#F2F6FC",
+                      "alignItems": "stretch",
+                      "children": [
+                        { "type": "text", "id": "n-backend-title", "width": "fill-container", "height": "fit-content", "text": "backend", "fontSize": 13, "fontWeight": "bold", "textAlign": "center", "verticalAlign": "middle", "textColor": "#1B2C44" },
+                        {
+                          "type": "frame",
+                          "id": "backend-row",
+                          "width": "fill-container",
+                          "height": "fit-content",
+                          "layout": "horizontal",
+                          "gap": 6,
+                          "padding": 0,
+                          "borderWidth": 0,
+                          "alignItems": "stretch",
+                          "children": [
+                            { "type": "rect", "id": "n-bcuda", "width": "fill-container", "height": "fit-content", "text": "cuda ✅", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 6, "borderWidth": 1.5, "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                            { "type": "rect", "id": "n-bmetal", "width": "fill-container", "height": "fit-content", "text": "metal ✅", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 6, "borderWidth": 1.5, "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                            { "type": "rect", "id": "n-bcpu", "width": "fill-container", "height": "fit-content", "text": "cpu 🚧\n309 行 smoke", "fillColor": "#FBD3D1", "borderColor": "#B23A37", "borderRadius": 6, "borderWidth": 1.5, "fontSize": 12, "textAlign": "center", "verticalAlign": "middle" }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+
+        {
+          "type": "frame",
+          "id": "row-l4",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 18,
+          "padding": 0,
+          "alignItems": "center",
+          "borderWidth": 0,
+          "children": [
+            { "type": "text", "id": "lbl-l4", "width": 110, "height": "fit-content", "text": "L4\n内核 / 桥", "fontSize": 16, "fontWeight": "bold", "textAlign": "right", "textColor": "#1B2C44" },
+            {
+              "type": "frame",
+              "id": "layer-l4",
+              "width": "fill-container",
+              "height": "fit-content",
+              "borderWidth": 2,
+              "borderColor": "#3A5F8C",
+              "borderRadius": 10,
+              "fillColor": "#EAF1FA",
+              "layout": "horizontal",
+              "gap": 14,
+              "padding": 20,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "n-ckern", "width": "fill-container", "height": "fit-content", "text": "crates/cuda-kernels  ✅\ncsrc · TileLang AOT · paged_kv · graph_pool", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "n-mlxsys", "width": "fill-container", "height": "fit-content", "text": "crates/mlx-sys  ✅\nMLX C++ bridge · cmake + cc", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "n-kvnat", "width": "fill-container", "height": "fit-content", "text": "crates/kv-native-sys  ✅\n本地持久化 (KV tier transport)", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" }
+              ]
+            }
+          ]
+        },
+
+        {
+          "type": "frame",
+          "id": "row-l5",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 18,
+          "padding": 0,
+          "alignItems": "center",
+          "borderWidth": 0,
+          "children": [
+            { "type": "text", "id": "lbl-l5", "width": 110, "height": "fit-content", "text": "L5\n共享契约\n(sideways)", "fontSize": 16, "fontWeight": "bold", "textAlign": "right", "textColor": "#173838" },
+            {
+              "type": "frame",
+              "id": "layer-l5",
+              "width": "fill-container",
+              "height": "fit-content",
+              "borderWidth": 2,
+              "borderColor": "#3F8F8F",
+              "borderRadius": 10,
+              "fillColor": "#EFF7F7",
+              "layout": "horizontal",
+              "gap": 12,
+              "padding": 20,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "n-q35s", "width": "fill-container", "height": "fit-content", "text": "qwen35-spec  ✅\n配置 + tensor names", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "n-q3s", "width": "fill-container", "height": "fit-content", "text": "qwen3-spec  ✅\n配置 + tensor names", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "n-dss", "width": "fill-container", "height": "fit-content", "text": "deepseek-spec  🚧\nDS0 + Shard · V4 kernels blocker", "fillColor": "#FBD3D1", "borderColor": "#B23A37", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "n-agrad", "width": "fill-container", "height": "fit-content", "text": "autograd  ✅\nAdamW · lr-schedule", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "n-train", "width": "fill-container", "height": "fit-content", "text": "train  ✅\nOPD substrate (2026-05-18 pivot)", "fillColor": "#DFF5E1", "borderColor": "#2F8F4E", "borderRadius": 8, "borderWidth": 1.5, "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

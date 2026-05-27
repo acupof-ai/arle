@@ -1,0 +1,256 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1680 1100" width="1680" height="1100">
+  <!-- background -->
+  <rect x="0" y="0" width="1680" height="1100" fill="#fafbfc"/>
+
+  <!-- ========== TITLE ========== -->
+  <text x="60" y="56" font-family="Noto Sans SC, Helvetica, Arial" font-size="30" font-weight="700" fill="#1a2433">ARLE KV-Tier 4 层缓存</text>
+  <text x="60" y="92" font-family="Noto Sans SC, Helvetica, Arial" font-size="20" font-weight="500" fill="#3a4a5f">T0 GPU  →  T1 Pinned  →  T2 NVMe  →  T3 Shared</text>
+  <text x="60" y="120" font-family="Helvetica, Arial" font-size="14" fill="#7a869a">commit 38f28d09  ·  本地路径已拉通，跨节点 NIXL 是 blocker</text>
+
+  <!-- axis label: speed / capacity -->
+  <g transform="translate(28,260)">
+    <line x1="0" y1="0" x2="0" y2="660" stroke="#9aa6b8" stroke-width="2"/>
+    <polygon points="-6,0 6,0 0,-12" fill="#9aa6b8"/>
+    <polygon points="-6,660 6,660 0,672" fill="#9aa6b8"/>
+    <text x="-12" y="-22" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#5b6a82" text-anchor="middle">快 / 小</text>
+    <text x="-12" y="690" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#5b6a82" text-anchor="middle">慢 / 大</text>
+  </g>
+
+  <!-- ========== TIER BANDS (left column) ========== -->
+  <!-- T0 — light blue -->
+  <g>
+    <rect x="80" y="180" width="900" height="160" rx="14" ry="14" fill="#dbeafe" stroke="#3b82f6" stroke-width="2"/>
+    <rect x="80" y="180" width="14" height="160" rx="6" ry="6" fill="#3b82f6"/>
+    <text x="120" y="218" font-family="Noto Sans SC, Helvetica, Arial" font-size="24" font-weight="700" fill="#1d3a8a">T0 · GPU paged KV</text>
+    <text x="850" y="218" font-family="Helvetica, Arial" font-size="22" font-weight="700" fill="#16a34a" text-anchor="end">✅</text>
+    <text x="120" y="248" font-family="Helvetica, Arial" font-size="13" fill="#1e3a8a">crates/cuda-kernels/src/paged_kv.rs</text>
+    <!-- attribute chips -->
+    <g font-family="Helvetica, Arial" font-size="12" fill="#1e3a8a">
+      <rect x="120" y="266" width="86" height="24" rx="12" ry="12" fill="#bfdbfe" stroke="#60a5fa"/>
+      <text x="163" y="282" text-anchor="middle">BF16</text>
+      <rect x="216" y="266" width="120" height="24" rx="12" ry="12" fill="#bfdbfe" stroke="#60a5fa"/>
+      <text x="276" y="282" text-anchor="middle">page_size = 16</text>
+      <rect x="346" y="266" width="100" height="24" rx="12" ry="12" fill="#bfdbfe" stroke="#60a5fa"/>
+      <text x="396" y="282" text-anchor="middle">page-aware</text>
+      <rect x="456" y="266" width="150" height="24" rx="12" ry="12" fill="#bfdbfe" stroke="#60a5fa"/>
+      <text x="531" y="282" text-anchor="middle">decode-time COW</text>
+      <rect x="616" y="266" width="206" height="24" rx="12" ry="12" fill="#bfdbfe" stroke="#60a5fa"/>
+      <text x="719" y="282" text-anchor="middle">GPU 直接 prefix attach</text>
+    </g>
+    <text x="120" y="320" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#475569">hot tier · decode 命中即可零拷贝 attach 到当前 slot</text>
+  </g>
+
+  <!-- T1 — sky -->
+  <g>
+    <rect x="80" y="360" width="900" height="160" rx="14" ry="14" fill="#e0f2fe" stroke="#0284c7" stroke-width="2"/>
+    <rect x="80" y="360" width="14" height="160" rx="6" ry="6" fill="#0284c7"/>
+    <text x="120" y="398" font-family="Noto Sans SC, Helvetica, Arial" font-size="24" font-weight="700" fill="#075985">T1 · Host pinned</text>
+    <text x="850" y="398" font-family="Helvetica, Arial" font-size="22" font-weight="700" fill="#16a34a" text-anchor="end">✅</text>
+    <text x="120" y="428" font-family="Helvetica, Arial" font-size="13" fill="#075985">infer/src/kv_tier/host_pool.rs  ·  HostPinnedPool</text>
+    <g font-family="Helvetica, Arial" font-size="12" fill="#075985">
+      <rect x="120" y="446" width="156" height="24" rx="12" ry="12" fill="#bae6fd" stroke="#38bdf8"/>
+      <text x="198" y="462" text-anchor="middle">crates/kv-native-sys arena</text>
+      <rect x="286" y="446" width="120" height="24" rx="12" ry="12" fill="#bae6fd" stroke="#38bdf8"/>
+      <text x="346" y="462" text-anchor="middle">pinned host mem</text>
+      <rect x="416" y="446" width="140" height="24" rx="12" ry="12" fill="#bae6fd" stroke="#38bdf8"/>
+      <text x="486" y="462" text-anchor="middle">demotion 落点</text>
+    </g>
+    <text x="120" y="500" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#475569">warm tier · GPU pressure 下 T0 块的第一站，PCIe DMA back-fill</text>
+  </g>
+
+  <!-- T2 — light teal -->
+  <g>
+    <rect x="80" y="540" width="900" height="160" rx="14" ry="14" fill="#ccfbf1" stroke="#0d9488" stroke-width="2"/>
+    <rect x="80" y="540" width="14" height="160" rx="6" ry="6" fill="#0d9488"/>
+    <text x="120" y="578" font-family="Noto Sans SC, Helvetica, Arial" font-size="24" font-weight="700" fill="#134e4a">T2 · NVMe (node-local)</text>
+    <text x="850" y="578" font-family="Helvetica, Arial" font-size="22" font-weight="700" fill="#16a34a" text-anchor="end">✅</text>
+    <text x="120" y="608" font-family="Helvetica, Arial" font-size="13" fill="#134e4a">infer/src/kv_tier/transport/disk.rs</text>
+    <g font-family="Helvetica, Arial" font-size="12" fill="#134e4a">
+      <rect x="120" y="626" width="200" height="24" rx="12" ry="12" fill="#99f6e4" stroke="#2dd4bf"/>
+      <text x="220" y="642" text-anchor="middle">kv-native-sys file/block ABI</text>
+      <rect x="330" y="626" width="60" height="24" rx="12" ry="12" fill="#99f6e4" stroke="#2dd4bf"/>
+      <text x="360" y="642" text-anchor="middle">WAL</text>
+      <rect x="400" y="626" width="74" height="24" rx="12" ry="12" fill="#99f6e4" stroke="#2dd4bf"/>
+      <text x="437" y="642" text-anchor="middle">mmap</text>
+      <rect x="484" y="626" width="148" height="24" rx="12" ry="12" fill="#99f6e4" stroke="#2dd4bf"/>
+      <text x="558" y="642" text-anchor="middle">shm descriptor</text>
+    </g>
+    <text x="120" y="680" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#475569">cold tier · 长 session / 多 turn 复用，崩溃后 WAL 重建</text>
+  </g>
+
+  <!-- T3 — light gray with two sub-rows (shared_fs ✅ + NIXL 🚧) -->
+  <g>
+    <rect x="80" y="720" width="900" height="200" rx="14" ry="14" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+    <rect x="80" y="720" width="14" height="200" rx="6" ry="6" fill="#64748b"/>
+    <text x="120" y="758" font-family="Noto Sans SC, Helvetica, Arial" font-size="24" font-weight="700" fill="#1e293b">T3 · 远端 / 跨节点</text>
+
+    <!-- T3a shared_fs -->
+    <g>
+      <rect x="120" y="780" width="820" height="58" rx="10" ry="10" fill="#e2e8f0" stroke="#16a34a" stroke-width="2"/>
+      <text x="140" y="816" font-family="Noto Sans SC, Helvetica, Arial" font-size="16" font-weight="600" fill="#0f172a">shared_fs  ·  minimal cluster-shared backend</text>
+      <text x="900" y="816" font-family="Helvetica, Arial" font-size="20" font-weight="700" fill="#16a34a" text-anchor="end">✅</text>
+      <text x="500" y="816" font-family="Helvetica, Arial" font-size="12" fill="#475569">infer/src/kv_tier/transport/shared_fs.rs</text>
+    </g>
+
+    <!-- T3b NIXL -->
+    <g>
+      <rect x="120" y="848" width="820" height="58" rx="10" ry="10" fill="#fef3c7" stroke="#d97706" stroke-width="2" stroke-dasharray="8 4"/>
+      <text x="140" y="884" font-family="Noto Sans SC, Helvetica, Arial" font-size="16" font-weight="600" fill="#7c2d12">NIXL RDMA transport  ·  stub-only, 未拉通</text>
+      <text x="900" y="884" font-family="Helvetica, Arial" font-size="20" font-weight="700" fill="#d97706" text-anchor="end">🚧</text>
+      <text x="500" y="884" font-family="Helvetica, Arial" font-size="12" fill="#7c2d12">blocker · 跨节点 prefix 共享、disagg-prefill 全部依赖此项</text>
+    </g>
+  </g>
+
+  <!-- ========== BIDIRECTIONAL DEMOTE / PROMOTE ARROWS (between tiers) ========== -->
+  <!-- Arrow marker defs (画板能识别) -->
+  <defs>
+    <marker id="arrowDown" viewBox="0 0 12 12" refX="6" refY="6" markerWidth="10" markerHeight="10" orient="auto">
+      <polygon points="0,0 12,6 0,12" fill="#dc2626"/>
+    </marker>
+    <marker id="arrowUp" viewBox="0 0 12 12" refX="6" refY="6" markerWidth="10" markerHeight="10" orient="auto">
+      <polygon points="0,0 12,6 0,12" fill="#0ea5e9"/>
+    </marker>
+  </defs>
+
+  <!-- T0 <-> T1 -->
+  <line x1="700" y1="340" x2="700" y2="360" stroke="#dc2626" stroke-width="5" marker-end="url(#arrowDown)"/>
+  <line x1="760" y1="360" x2="760" y2="340" stroke="#0ea5e9" stroke-width="5" marker-end="url(#arrowUp)"/>
+  <text x="788" y="356" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#1e293b">evict-on-pressure  /  fetch-on-hit</text>
+
+  <!-- T1 <-> T2 -->
+  <line x1="700" y1="520" x2="700" y2="540" stroke="#dc2626" stroke-width="5" marker-end="url(#arrowDown)"/>
+  <line x1="760" y1="540" x2="760" y2="520" stroke="#0ea5e9" stroke-width="5" marker-end="url(#arrowUp)"/>
+  <text x="788" y="536" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#1e293b">spill-to-disk  /  page-in</text>
+
+  <!-- T2 <-> T3 -->
+  <line x1="700" y1="700" x2="700" y2="720" stroke="#dc2626" stroke-width="5" marker-end="url(#arrowDown)"/>
+  <line x1="760" y1="720" x2="760" y2="700" stroke="#0ea5e9" stroke-width="5" marker-end="url(#arrowUp)"/>
+  <text x="788" y="716" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#1e293b">cluster export  /  remote fetch</text>
+
+  <!-- legend for arrows (top-right of tier column) -->
+  <g transform="translate(80,150)">
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#dc2626" stroke-width="4" marker-end="url(#arrowDown)"/>
+    <text x="50" y="4" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#1e293b">Demote (向下)</text>
+    <line x1="180" y1="0" x2="220" y2="0" stroke="#0ea5e9" stroke-width="4" marker-end="url(#arrowUp)"/>
+    <text x="230" y="4" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#1e293b">Promote (向上)</text>
+  </g>
+
+  <!-- ========== CORE HUB (right column) ========== -->
+  <g>
+    <!-- big container -->
+    <rect x="1030" y="180" width="600" height="740" rx="18" ry="18" fill="#ffffff" stroke="#475569" stroke-width="2.5" stroke-dasharray="2 0"/>
+    <rect x="1030" y="180" width="600" height="46" rx="18" ry="18" fill="#475569"/>
+    <rect x="1030" y="206" width="600" height="20" fill="#475569"/>
+    <text x="1330" y="212" font-family="Noto Sans SC, Helvetica, Arial" font-size="20" font-weight="700" fill="#ffffff" text-anchor="middle">核心枢纽 · 横切所有 tier</text>
+
+    <!-- RadixCache -->
+    <g>
+      <rect x="1060" y="250" width="540" height="220" rx="12" ry="12" fill="#fef9c3" stroke="#ca8a04" stroke-width="2"/>
+      <text x="1080" y="284" font-family="Noto Sans SC, Helvetica, Arial" font-size="20" font-weight="700" fill="#713f12">RadixCache</text>
+      <text x="1080" y="306" font-family="Helvetica, Arial" font-size="12" fill="#713f12">infer/src/prefix_cache.rs  ·  tier-aware metadata</text>
+
+      <!-- metadata chips -->
+      <g font-family="Helvetica, Arial" font-size="12" fill="#713f12">
+        <rect x="1080" y="322" width="106" height="26" rx="13" ry="13" fill="#fde68a" stroke="#f59e0b"/>
+        <text x="1133" y="339" text-anchor="middle">hit_count</text>
+        <rect x="1196" y="322" width="118" height="26" rx="13" ry="13" fill="#fde68a" stroke="#f59e0b"/>
+        <text x="1255" y="339" text-anchor="middle">tier_location</text>
+        <rect x="1324" y="322" width="110" height="26" rx="13" ry="13" fill="#fde68a" stroke="#f59e0b"/>
+        <text x="1379" y="339" text-anchor="middle">session_id</text>
+        <rect x="1444" y="322" width="120" height="26" rx="13" ry="13" fill="#fde68a" stroke="#f59e0b"/>
+        <text x="1504" y="339" text-anchor="middle">fingerprint</text>
+
+        <rect x="1080" y="356" width="146" height="26" rx="13" ry="13" fill="#fde68a" stroke="#f59e0b"/>
+        <text x="1153" y="373" text-anchor="middle">soft_pin_until</text>
+        <rect x="1236" y="356" width="100" height="26" rx="13" ry="13" fill="#fde68a" stroke="#f59e0b"/>
+        <text x="1286" y="373" text-anchor="middle">byte_len</text>
+      </g>
+
+      <!-- interface line -->
+      <line x1="1080" y1="400" x2="1580" y2="400" stroke="#ca8a04" stroke-width="1" stroke-dasharray="4 3"/>
+      <text x="1080" y="420" font-family="Noto Sans SC, Helvetica, Arial" font-size="13" font-weight="600" fill="#713f12">接口</text>
+      <rect x="1124" y="406" width="220" height="26" rx="6" ry="6" fill="#fef08a" stroke="#ca8a04"/>
+      <text x="1234" y="423" font-family="Helvetica, Arial" font-size="12" fill="#713f12" text-anchor="middle">lookup_or_stage()  · 分类契约</text>
+      <text x="1080" y="454" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#475569">返回 Hit/Miss/Staged，驱动后续 fetch 或 readmission</text>
+    </g>
+
+    <!-- Coordinator -->
+    <g>
+      <rect x="1060" y="492" width="540" height="190" rx="12" ry="12" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+      <text x="1080" y="526" font-family="Noto Sans SC, Helvetica, Arial" font-size="20" font-weight="700" fill="#4c1d95">Coordinator</text>
+      <text x="1080" y="548" font-family="Helvetica, Arial" font-size="12" fill="#4c1d95">infer/src/kv_tier/coordinator.rs</text>
+
+      <!-- two columns -->
+      <g>
+        <rect x="1080" y="566" width="240" height="44" rx="8" ry="8" fill="#ddd6fe" stroke="#8b5cf6"/>
+        <text x="1200" y="584" font-family="Noto Sans SC, Helvetica, Arial" font-size="13" font-weight="600" fill="#4c1d95" text-anchor="middle">统一 fetch / store 队列</text>
+        <text x="1200" y="602" font-family="Helvetica, Arial" font-size="11" fill="#4c1d95" text-anchor="middle">cross-tier I/O 单入口</text>
+
+        <rect x="1340" y="566" width="240" height="44" rx="8" ry="8" fill="#ddd6fe" stroke="#8b5cf6"/>
+        <text x="1460" y="584" font-family="Noto Sans SC, Helvetica, Arial" font-size="13" font-weight="600" fill="#4c1d95" text-anchor="middle">ServerMetrics 计量</text>
+        <text x="1460" y="602" font-family="Helvetica, Arial" font-size="11" fill="#4c1d95" text-anchor="middle">queue depth · backpressure</text>
+      </g>
+
+      <text x="1080" y="640" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#475569">所有 tier 之间的 demote / promote / persist 都走这里</text>
+      <text x="1080" y="660" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#475569">把异步搬运与调度解耦，scheduler 只 enqueue 与等待</text>
+    </g>
+
+    <!-- Readmission cluster -->
+    <g>
+      <rect x="1060" y="704" width="540" height="196" rx="12" ry="12" fill="#fce7f3" stroke="#db2777" stroke-width="2"/>
+      <text x="1080" y="738" font-family="Noto Sans SC, Helvetica, Arial" font-size="20" font-weight="700" fill="#831843">Readmission 路径</text>
+      <text x="1080" y="758" font-family="Helvetica, Arial" font-size="12" fill="#831843">staged 回升  ·  demote → 命中 → 重新 attach 到 GPU</text>
+
+      <!-- 3 chips in row -->
+      <g>
+        <rect x="1080" y="776" width="160" height="50" rx="8" ry="8" fill="#fbcfe8" stroke="#ec4899"/>
+        <text x="1160" y="798" font-family="Noto Sans SC, Helvetica, Arial" font-size="14" font-weight="600" fill="#831843" text-anchor="middle">ReadmissionPlan</text>
+        <text x="1160" y="816" font-family="Helvetica, Arial" font-size="11" fill="#831843" text-anchor="middle">计划要拉回哪些 page</text>
+
+        <rect x="1250" y="776" width="160" height="50" rx="8" ry="8" fill="#fbcfe8" stroke="#ec4899"/>
+        <text x="1330" y="798" font-family="Noto Sans SC, Helvetica, Arial" font-size="14" font-weight="600" fill="#831843" text-anchor="middle">WaitingFetch</text>
+        <text x="1330" y="816" font-family="Helvetica, Arial" font-size="11" fill="#831843" text-anchor="middle">slot 暂挂等回填</text>
+
+        <rect x="1420" y="776" width="170" height="50" rx="8" ry="8" fill="#fbcfe8" stroke="#ec4899"/>
+        <text x="1505" y="798" font-family="Noto Sans SC, Helvetica, Arial" font-size="13" font-weight="600" fill="#831843" text-anchor="middle">promote_fetched_prefix</text>
+        <text x="1505" y="816" font-family="Helvetica, Arial" font-size="11" fill="#831843" text-anchor="middle">回升到 T0 并 attach</text>
+      </g>
+
+      <!-- mini flow inside readmission -->
+      <line x1="1240" y1="800" x2="1250" y2="800" stroke="#831843" stroke-width="3" marker-end="url(#arrowUp)"/>
+      <line x1="1410" y1="800" x2="1420" y2="800" stroke="#831843" stroke-width="3" marker-end="url(#arrowUp)"/>
+
+      <text x="1080" y="864" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#475569">闭环：scheduler 命中 RadixCache → Coordinator 排队 fetch → WaitingFetch 等待</text>
+      <text x="1080" y="882" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" fill="#475569">→ promote 完成 → slot 恢复 decode</text>
+    </g>
+  </g>
+
+  <!-- ========== HUB -> TIERS CROSS-CUT ARROWS ========== -->
+  <!-- 4 dashed cross-cut lines from hub to each tier -->
+  <g stroke="#94a3b8" stroke-width="2" stroke-dasharray="6 4" fill="none">
+    <line x1="980" y1="260" x2="1030" y2="260"/>
+    <line x1="980" y1="440" x2="1030" y2="440"/>
+    <line x1="980" y1="620" x2="1030" y2="620"/>
+    <line x1="980" y1="820" x2="1030" y2="820"/>
+  </g>
+  <g font-family="Noto Sans SC, Helvetica, Arial" font-size="11" fill="#64748b">
+    <text x="985" y="254">RadixCache 元数据</text>
+    <text x="985" y="434">Coordinator I/O</text>
+    <text x="985" y="614">Coordinator I/O</text>
+    <text x="985" y="814">Coordinator I/O</text>
+  </g>
+
+  <!-- ========== STATUS LEGEND (bottom-left corner annotation) ========== -->
+  <g transform="translate(60,970)">
+    <rect x="0" y="0" width="900" height="100" rx="10" ry="10" fill="#fff7ed" stroke="#f59e0b" stroke-width="2"/>
+    <text x="20" y="30" font-family="Noto Sans SC, Helvetica, Arial" font-size="14" font-weight="700" fill="#92400e">状态</text>
+    <g font-family="Noto Sans SC, Helvetica, Arial" font-size="13" fill="#7c2d12">
+      <text x="20" y="56">✅  T0 GPU paged KV  ·  T1 Host pinned  ·  T2 NVMe  ·  T3 shared_fs 全部已落地</text>
+      <text x="20" y="78">🚧  T3 NIXL RDMA transport stub-only  →  跨节点 prefix 共享 / disagg-prefill 全部被卡住</text>
+    </g>
+    <text x="880" y="78" font-family="Noto Sans SC, Helvetica, Arial" font-size="12" font-weight="600" fill="#7c2d12" text-anchor="end">本地路径已拉通，跨节点 NIXL 是 blocker</text>
+  </g>
+
+  <!-- corner footer with commit -->
+  <text x="1620" y="1080" font-family="Helvetica, Arial" font-size="11" fill="#94a3b8" text-anchor="end">commit 38f28d09  ·  2026-05-25</text>
+</svg>

@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120">
+  <defs>
+    <style>
+      .bg { fill: #f6f8fb; }
+      .panel { fill: #ffffff; stroke: #d6dde8; stroke-width: 2; rx: 18; }
+      .title { font: 700 40px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #121826; }
+      .subtitle { font: 500 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #526175; }
+      .h2 { font: 700 25px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #172033; }
+      .label { font: 600 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #172033; }
+      .small { font: 500 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #526175; }
+      .mono { font: 600 16px "SFMono-Regular", Consolas, monospace; fill: #172033; }
+      .big-num { font: 800 34px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #172033; }
+      .muted { fill: #738198; }
+      .red { fill: #dc2626; }
+      .red-bg { fill: #fff1f2; stroke: #fb7185; stroke-width: 2; rx: 16; }
+      .amber-bg { fill: #fffbeb; stroke: #f59e0b; stroke-width: 2; rx: 16; }
+      .green-bg { fill: #ecfdf5; stroke: #22c55e; stroke-width: 2; rx: 16; }
+      .blue-bg { fill: #eff6ff; stroke: #60a5fa; stroke-width: 2; rx: 16; }
+      .bar { fill: #2563eb; rx: 7; }
+      .bar2 { fill: #93c5fd; rx: 7; }
+      .arrow { stroke: #526175; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .arrow-red { stroke: #dc2626; stroke-width: 4; fill: none; marker-end: url(#arrow-red); }
+      .arrow-green { stroke: #16a34a; stroke-width: 4; fill: none; marker-end: url(#arrow-green); }
+      .thin { stroke: #d6dde8; stroke-width: 2; }
+      .dash { stroke-dasharray: 8 8; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#526175"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#16a34a"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1120"/>
+
+  <text class="title" x="70" y="72">DeepSeek V4 prefill bottleneck: 128B D2H readback becomes a sync barrier</text>
+  <text class="subtitle" x="70" y="108">nsys evidence: tiny device-to-host copies are not bandwidth-costly; they serialize the CPU launch path after each local MoE layer.</text>
+
+  <rect class="panel" x="60" y="150" width="520" height="610"/>
+  <text class="h2" x="95" y="195">Observed prefill window</text>
+  <text class="small" x="95" y="225">8 ranks, one long prefill request</text>
+
+  <g transform="translate(95,260)">
+    <text class="small" x="0" y="-18">NVTX: step_prefill_kernel_launch</text>
+    <g>
+      <text class="mono" x="0" y="18">rank0</text><rect class="bar" x="70" y="2" width="360" height="20"/><text class="small" x="445" y="18">35.76s</text>
+      <text class="mono" x="0" y="56">rank1</text><rect class="bar" x="70" y="40" width="359" height="20"/><text class="small" x="445" y="56">35.76s</text>
+      <text class="mono" x="0" y="94">rank2</text><rect class="bar" x="70" y="78" width="360" height="20"/><text class="small" x="445" y="94">35.76s</text>
+      <text class="mono" x="0" y="132">rank3</text><rect class="bar" x="70" y="116" width="360" height="20"/><text class="small" x="445" y="132">35.76s</text>
+      <text class="mono" x="0" y="170">rank4</text><rect class="bar" x="70" y="154" width="359" height="20"/><text class="small" x="445" y="170">35.76s</text>
+      <text class="mono" x="0" y="208">rank5</text><rect class="bar" x="70" y="192" width="360" height="20"/><text class="small" x="445" y="208">35.76s</text>
+      <text class="mono" x="0" y="246">rank6</text><rect class="bar" x="70" y="230" width="359" height="20"/><text class="small" x="445" y="246">35.76s</text>
+      <text class="mono" x="0" y="284">rank7</text><rect class="bar" x="70" y="268" width="360" height="20"/><text class="small" x="445" y="284">35.76s</text>
+    </g>
+  </g>
+
+  <rect class="blue-bg" x="95" y="595" width="425" height="120"/>
+  <text class="label" x="125" y="632">Rank aggregate</text>
+  <text class="big-num" x="125" y="676">286s</text>
+  <text class="small" x="235" y="666">8 x ~35.7s</text>
+  <text class="small" x="125" y="700">prefill kernel-launch NVTX window</text>
+
+  <rect class="panel" x="640" y="150" width="520" height="610"/>
+  <text class="h2" x="675" y="195">Hot path in local MoE fallback</text>
+  <text class="small" x="675" y="225">Repeated once per DSv4 layer on every rank</text>
+
+  <g transform="translate(705,270)">
+    <rect class="blue-bg" x="0" y="0" width="390" height="74"/>
+    <text class="label" x="24" y="32">Router on GPU</text>
+    <text class="mono" x="24" y="56">route_indices, route_weights</text>
+
+    <path class="arrow" d="M195 84 L195 122"/>
+    <rect class="amber-bg" x="0" y="132" width="390" height="84"/>
+    <text class="label" x="24" y="164">Count local expert routes</text>
+    <text class="mono" x="24" y="190">local_counts[32] = 128B</text>
+
+    <path class="arrow-red" d="M195 226 L195 268"/>
+    <rect class="red-bg" x="-20" y="278" width="430" height="120"/>
+    <text class="label red" x="24" y="314">CPU sync point</text>
+    <text class="mono" x="24" y="342">clone_dtoh(local_counts)</text>
+    <text class="small" x="24" y="368">forces host to wait for prior GPU work</text>
+
+    <path class="arrow" d="M195 408 L195 446"/>
+    <rect class="amber-bg" x="0" y="456" width="390" height="84"/>
+    <text class="label" x="24" y="488">CPU offsets + variable alloc</text>
+    <text class="small" x="24" y="514">then H2D offsets and expert dispatch</text>
+  </g>
+
+  <rect class="red-bg" x="700" y="655" width="400" height="70"/>
+  <text class="mono" x="728" y="694">43 layers x 8 ranks = 344 tiny D2H barriers</text>
+
+  <rect class="panel" x="1220" y="150" width="520" height="610"/>
+  <text class="h2" x="1255" y="195">Why it dominates</text>
+  <text class="small" x="1255" y="225">The payload is tiny; the synchronization is expensive.</text>
+
+  <g transform="translate(1260,280)">
+    <rect class="green-bg" x="0" y="0" width="420" height="120"/>
+    <text class="label" x="30" y="38">Actual GPU memcpy time</text>
+    <text class="big-num" x="30" y="82">~25 ms</text>
+    <text class="small" x="175" y="73">full-trace D2H device work</text>
+    <rect fill="#22c55e" x="30" y="96" width="38" height="10" rx="5"/>
+    <rect fill="#d1fae5" x="68" y="96" width="290" height="10" rx="5"/>
+
+    <rect class="red-bg" x="0" y="165" width="420" height="145"/>
+    <text class="label red" x="30" y="204">CUDA API wall time in prefill</text>
+    <text class="big-num" x="30" y="250">~269s</text>
+    <text class="small" x="170" y="240">rank aggregate</text>
+    <text class="small" x="30" y="276">352 D2H API calls incl. 344 count copies</text>
+    <rect fill="#dc2626" x="30" y="296" width="330" height="10" rx="5"/>
+
+    <path class="arrow-red dash" d="M210 335 L210 390"/>
+    <rect class="amber-bg" x="0" y="405" width="420" height="100"/>
+    <text class="label" x="30" y="443">Conclusion</text>
+    <text class="small" x="30" y="471">This is launch-path serialization, not D2H bandwidth.</text>
+  </g>
+
+  <path class="arrow" d="M580 455 L630 455"/>
+  <path class="arrow" d="M1160 455 L1210 455"/>
+
+  <rect class="panel" x="60" y="820" width="1680" height="230"/>
+  <text class="h2" x="95" y="866">Recommended fix direction</text>
+  <text class="small" x="95" y="896">Keep routing metadata on GPU and remove per-layer host readback from the steady-state prefill path.</text>
+
+  <g transform="translate(100,930)">
+    <rect class="red-bg" x="0" y="0" width="360" height="74"/>
+    <text class="label red" x="22" y="31">Current fallback</text>
+    <text class="mono" x="22" y="55">GPU counts -> D2H -> CPU offsets</text>
+
+    <path class="arrow-green" d="M380 37 L470 37"/>
+    <rect class="green-bg" x="500" y="0" width="330" height="74"/>
+    <text class="label" x="522" y="31">Device-side compact</text>
+    <text class="small" x="522" y="55">GPU counts, prefix-sum, offsets</text>
+
+    <path class="arrow-green" d="M850 37 L940 37"/>
+    <rect class="green-bg" x="970" y="0" width="310" height="74"/>
+    <text class="label" x="992" y="31">Route-grouped / all-to-all</text>
+    <text class="small" x="992" y="55">DeepEP-style dispatch/combine</text>
+
+    <path class="arrow-green" d="M1300 37 L1390 37"/>
+    <rect class="green-bg" x="1420" y="0" width="220" height="74"/>
+    <text class="label" x="1442" y="31">No host barrier</text>
+    <text class="small" x="1442" y="55">one GPU-resident pipeline</text>
+  </g>
+
+  <text class="small" x="95" y="1030">Numbers from the local nsys analysis: 8 rank prefill ranges, 43 DSv4 layers, 344 x 128B local_counts copies, ~269s D2H CUDA API wall time, and 286s prefill NVTX rank aggregate.</text>
+</svg>

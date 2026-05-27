@@ -1,0 +1,35 @@
+---
+title: ARLE CUDA Scheduler 单步循环 (scheduler/cuda/runtime/scheduler_loop.rs)
+---
+flowchart TD
+  classDef def fill:#e3f2fd,stroke:#1565c0,color:#0d2c4a;
+  classDef warn fill:#fff3cd,stroke:#b8860b,color:#5a3e00;
+  classDef muted fill:#f5f5f5,stroke:#9e9e9e,color:#555;
+
+  TICK([Tick start]):::def
+  ADM["admission.rs<br/>取请求 + 切 chunk<br/>policy.rs / budget.rs"]:::def
+  FETCH["fetch.rs<br/>prefix_cache lookup<br/>KV-tier promote"]:::def
+  EXEC{"execution.rs<br/>批形态分流"}:::def
+  PREFILL["prefill.rs<br/>chunked prefill"]:::def
+  DECODE["decode.rs<br/>decode-priority batched"]:::def
+  EMIT["core/emit_worker.rs<br/>push token to stream"]:::def
+  SLOTS["core/session_slots.rs<br/>slot 生命周期"]:::def
+
+  PREEMPT["preempt + evict<br/>压力回退"]:::warn
+  SPEC["scheduler/cuda/spec_path.rs<br/>Phase 2 暂停"]:::warn
+
+  TICK --> ADM
+  ADM --> FETCH
+  FETCH --> EXEC
+  EXEC --> PREFILL
+  EXEC --> DECODE
+  PREFILL --> EMIT
+  DECODE --> EMIT
+  EMIT --> SLOTS
+  SLOTS -->|loop back| ADM
+
+  PREFILL -.->|压力| PREEMPT
+  DECODE -.->|压力| PREEMPT
+  PREEMPT -.->|回到 queue| ADM
+
+  DECODE -.->|fork ⚠️| SPEC
