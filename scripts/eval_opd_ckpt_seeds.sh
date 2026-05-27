@@ -124,26 +124,8 @@ print(f'{g:.4f}')")
     fi
 done
 
-# Mean + sample-σ across seeds (for the license-or-kill gate in
-# docs/research/2026-05-28-opd-effect-axis-next.md).
-OUT_BASE="$OUT_BASE" .venv/bin/python - <<'PY'
-import json
-import os
-from pathlib import Path
-from statistics import mean, pstdev, stdev
-
-out_base = Path(os.environ["OUT_BASE"])
-mmlu = []
-gsm8k = []
-for d in sorted(out_base.glob("seed_*")):
-    p = d / "summary.json"
-    if not p.exists():
-        continue
-    s = json.loads(p.read_text())
-    mmlu.append(s["tasks"]["mmlu"]["accuracy"])
-    gsm8k.append(s["tasks"]["gsm8k"]["accuracy"])
-if mmlu:
-    print(f"mmlu: n={len(mmlu)} mean={mean(mmlu):.4f} sigma={(stdev(mmlu) if len(mmlu)>1 else 0):.4f} min={min(mmlu):.4f} max={max(mmlu):.4f}")
-if gsm8k:
-    print(f"gsm8k: n={len(gsm8k)} mean={mean(gsm8k):.4f} sigma={(stdev(gsm8k) if len(gsm8k)>1 else 0):.4f} min={min(gsm8k):.4f} max={max(gsm8k):.4f}")
-PY
+# Wilson CI + mean / sample-σ + kill-criterion verdict via the dedicated
+# analyzer (single source of truth vs. inline math). Add --paired-vs to
+# the analyzer invocation manually when comparing two runs at matched
+# seeds.
+.venv/bin/python scripts/analyze_multi_seed.py "$OUT_BASE" || true
