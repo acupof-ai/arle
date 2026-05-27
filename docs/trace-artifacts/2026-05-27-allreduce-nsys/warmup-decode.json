@@ -1,0 +1,10 @@
+{
+  "status": 200,
+  "elapsed_s": 2.5459155030548573,
+  "usage": {
+    "prompt_tokens": 17,
+    "completion_tokens": 32,
+    "total_tokens": 49
+  },
+  "text": "4262 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000"
+}
