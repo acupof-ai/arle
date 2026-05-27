@@ -1897,19 +1897,26 @@ impl DeepseekV4MoeBlock {
         }
 
         let trace = dsv4_moe_trace_begin(ctx)?;
+        // pack_cursors MUST stay zero-init (kernel uses atomicAdd from 0).
         let mut pack_cursors = ctx
             .stream
             .alloc_zeros_traced::<i32>(ep.experts_per_rank)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route cursor alloc failed: {err}"))?;
-        let mut packed_hidden = HiddenStates::zeros(ctx, hidden.hidden_dim, total_local_routes)?;
-        let mut packed_token = ctx
-            .stream
-            .alloc_zeros_traced::<i32>(total_local_routes)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 packed token alloc failed: {err}"))?;
-        let mut packed_weight = ctx
-            .stream
-            .alloc_zeros_traced::<f32>(total_local_routes)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 packed weight alloc failed: {err}"))?;
+        // packed_hidden / packed_token / packed_weight: pack kernel fully
+        // writes [0..total_local_routes] (atomicAdd cursors guarantees each
+        // slot is hit exactly once), so the prior zero-fill is wasted work.
+        let mut packed_hidden =
+            unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, total_local_routes)? };
+        let mut packed_token = unsafe {
+            ctx.stream
+                .alloc_traced::<i32>(total_local_routes)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 packed token alloc failed: {err}"))?
+        };
+        let mut packed_weight = unsafe {
+            ctx.stream
+                .alloc_traced::<f32>(total_local_routes)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 packed weight alloc failed: {err}"))?
+        };
         dsv4_moe_trace_end(
             ctx,
             "ffn_route_pack_setup",
