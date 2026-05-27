@@ -154,6 +154,11 @@ pub(crate) struct DeepseekNativeDeepEpRuntimeScratch {
     pub(crate) packed_x: HiddenStates,
     pub(crate) packed_token: CudaSlice<i32>,
     pub(crate) packed_weight: CudaSlice<f32>,
+    /// Grouped DeepGEMM expert scratch — populated by
+    /// `forward_native_deepep_routed_gpu` when EXPERT_BACKEND=deepgemm
+    /// is active. Taken into a temporary cache for
+    /// `forward_deepgemm_all_dsv4_experts_gpu`, then restored.
+    pub(crate) grouped: Option<DeepseekGroupedExpertRuntimeScratch>,
 }
 
 #[cfg(feature = "cuda")]
@@ -627,6 +632,7 @@ impl DeepseekMoeRuntimeCache {
                 packed_x: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_local_routes)? },
                 packed_token: unsafe { ctx.stream.alloc_traced::<i32>(capacity_local_routes)? },
                 packed_weight: unsafe { ctx.stream.alloc_traced::<f32>(capacity_local_routes)? },
+                grouped: None,
             });
         }
         Ok(self

@@ -4840,6 +4840,31 @@ impl DeepseekV4MoeBlock {
             )
         })?;
 
+        // B-3.3.5 — DeepGEMM grouped-expert dispatch on the post-recv FFN.
+        // Mirror the use_deepgemm_experts decision from
+        // forward_deepep_routed_gpu (mlp.rs:3149). When DeepGEMM is auto-
+        // selected or required AND the per-block FP8 cache built ok, the
+        // post-dispatch FFN section calls forward_deepgemm_all_dsv4_experts_
+        // gpu with the packed recv buffers instead of looping per expert.
+        let expert_backend = dsv4_expert_backend()?;
+        let deepgemm_backend_usable = if let Some(first) = self.experts.first() {
+            dsv4_handle_deepgemm_expert_backend(
+                ctx,
+                expert_backend,
+                "native-deepep routed experts",
+                &[&first.w1, &first.w3, &first.w2],
+            )?
+        } else {
+            false
+        };
+        let use_deepgemm_experts = match expert_backend {
+            Dsv4ExpertBackend::Native => false,
+            Dsv4ExpertBackend::DeepGemmRequired => true,
+            Dsv4ExpertBackend::DeepGemmAuto => {
+                deepgemm_backend_usable && self.deepgemm_cache.is_some()
+            }
+        };
+
         let trace = dsv4_moe_trace_begin(ctx)?;
         let logits = ops::gemm(ctx, &self.gate_weight, hidden)?;
         dsv4_moe_trace_end(
@@ -5142,49 +5167,83 @@ impl DeepseekV4MoeBlock {
                 }
             }
 
-            for (local_expert_idx, expert) in self.experts.iter().enumerate() {
-                let count = counts_host[local_expert_idx];
-                if count <= 0 {
-                    continue;
-                }
-                let count_usize = count as usize;
-                let offset = offsets_host[local_expert_idx] as usize;
-                let elem_start = offset * hidden.hidden_dim;
-                let elem_end = elem_start + count_usize * hidden.hidden_dim;
+            if use_deepgemm_experts {
+                // Grouped DeepGEMM path — mirrors the use_deepgemm_experts
+                // branch in forward_deepep_routed_gpu (mlp.rs:3157+).
+                // Treats scratch.packed_x as expert_hidden (slot-major
+                // bf16), scratch.packed_token as expert_route_slot
+                // (recv-token index for scatter destination), scratch.
+                // packed_weight as expert_weight. Output goes directly
+                // into scratch.expert_out via the weighted scatter
+                // inside forward_deepgemm_all_dsv4_experts_gpu.
+                scratch.expert_out.seq_len = num_recv;
+                let mut device_grouped_cache = DeepseekMoeRuntimeCache {
+                    grouped: scratch.grouped.take(),
+                    ..Default::default()
+                };
+                self.forward_deepgemm_all_dsv4_experts_gpu(
+                    ctx,
+                    config,
+                    &scratch.packed_x,
+                    &scratch.packed_token,
+                    &scratch.packed_weight,
+                    &scratch.local_offsets,
+                    &scratch.local_counts,
+                    total_local_routes,
+                    &mut scratch.expert_out,
+                    &mut device_grouped_cache,
+                )?;
+                scratch.grouped = device_grouped_cache.grouped.take();
+            } else {
+                for (local_expert_idx, expert) in self.experts.iter().enumerate() {
+                    let count = counts_host[local_expert_idx];
+                    if count <= 0 {
+                        continue;
+                    }
+                    let count_usize = count as usize;
+                    let offset = offsets_host[local_expert_idx] as usize;
+                    let elem_start = offset * hidden.hidden_dim;
+                    let elem_end = elem_start + count_usize * hidden.hidden_dim;
 
-                // memcpy_dtod below writes every byte — skip the zero-fill memset.
-                let mut expert_input =
-                    unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, count_usize)? };
-                {
-                    let src = scratch.packed_x.data.slice(elem_start..elem_end);
-                    ctx.stream
-                        .memcpy_dtod(&src, &mut expert_input.data)
+                    // memcpy_dtod below writes every byte — skip the
+                    // zero-fill memset.
+                    let mut expert_input =
+                        unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, count_usize)? };
+                    {
+                        let src = scratch.packed_x.data.slice(elem_start..elem_end);
+                        ctx.stream
+                            .memcpy_dtod(&src, &mut expert_input.data)
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "native-deepep packed→expert input D2D failed: {err}"
+                                )
+                            })?;
+                    }
+                    let expert_out_slice =
+                        expert.forward(ctx, &expert_input, config.swiglu_limit)?;
+
+                    // Scatter weighted expert output into expert_out[packed_
+                    // token[i]] rows.
+                    let (exp_ptr, _g0) = expert_out_slice.data.device_ptr(&ctx.stream);
+                    let (out_ptr, _g1) = scratch.expert_out.data.device_ptr_mut(&ctx.stream);
+                    let (tok_ptr, _g2) = scratch.packed_token.device_ptr(&ctx.stream);
+                    let (w_ptr, _g3) = scratch.packed_weight.device_ptr(&ctx.stream);
+                    unsafe {
+                        ffi::dsv4_scatter_packed_expert_cuda(
+                            exp_ptr as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            tok_ptr as *const i32,
+                            w_ptr as *const f32,
+                            offsets_host[local_expert_idx],
+                            count,
+                            hidden.hidden_dim as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
                         .map_err(|err| {
-                            anyhow::anyhow!("native-deepep packed→expert input D2D failed: {err}")
+                            anyhow::anyhow!("native-deepep recv expert scatter failed: {err}")
                         })?;
-                }
-                let expert_out_slice = expert.forward(ctx, &expert_input, config.swiglu_limit)?;
-
-                // Scatter weighted expert output into expert_out[packed_token[i]] rows.
-                let (exp_ptr, _g0) = expert_out_slice.data.device_ptr(&ctx.stream);
-                let (out_ptr, _g1) = scratch.expert_out.data.device_ptr_mut(&ctx.stream);
-                let (tok_ptr, _g2) = scratch.packed_token.device_ptr(&ctx.stream);
-                let (w_ptr, _g3) = scratch.packed_weight.device_ptr(&ctx.stream);
-                unsafe {
-                    ffi::dsv4_scatter_packed_expert_cuda(
-                        exp_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        tok_ptr as *const i32,
-                        w_ptr as *const f32,
-                        offsets_host[local_expert_idx],
-                        count,
-                        hidden.hidden_dim as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|err| {
-                        anyhow::anyhow!("native-deepep recv expert scatter failed: {err}")
-                    })?;
+                    }
                 }
             }
         }
