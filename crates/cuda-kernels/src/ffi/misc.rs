@@ -193,6 +193,38 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    // FlashMLA SM90 sparse prefill (vendored sgl-project/FlashMLA @ df022eb).
+    // Bypasses FlashMLA's PyTorch wrapper and calls `sm90::run_fwd_kernel`
+    // directly. q/kv must be bf16 device pointers; the kernel supports
+    // d_qk ∈ {512, 576} and d_v = 512 — matches DSv4-Flash MLA (head_dim 512
+    // NoPE + optional 64-dim RoPE tail). See arle_flashmla_shim.cu.
+    pub fn arle_flashmla_sm90_sparse_prefill_fwd(
+        q: *const super::Half,
+        kv: *const super::Half,
+        indices: *const i32,
+        attn_sink: *const f32,
+        topk_length: *const i32,
+        out: *mut super::Half,
+        max_logits: *mut f32,
+        lse: *mut f32,
+        s_q: i32,
+        s_kv: i32,
+        h_q: i32,
+        h_kv: i32,
+        d_qk: i32,
+        d_v: i32,
+        topk: i32,
+        sm_scale: f32,
+        stride_q_s_q: i32,
+        stride_q_h_q: i32,
+        stride_kv_s_kv: i32,
+        stride_kv_h_kv: i32,
+        stride_indices_s_q: i32,
+        stride_indices_h_kv: i32,
+        num_sm: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_csa_select_cuda(
         q: *const super::Half,
         weights: *const super::Half,

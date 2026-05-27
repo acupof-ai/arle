@@ -1275,6 +1275,29 @@ fn main() {
     let csrc_dir = Path::new("csrc");
     let mut cu_files: Vec<PathBuf> = Vec::new();
     collect_cu_files(csrc_dir, &mut cu_files);
+
+    // FlashMLA SM90 sparse prefill — vendored at `vendor/flashmla/` (pin
+    // df022ebafb88578eab9f0300606ee765608d8b5c). Add the 5 .cu files needed
+    // by ARLE's `arle_flashmla_shim.cu`: fwd.cu + 4 phase1 instantiations.
+    // Hopper only (DSv4 target = H20 / SM90a); SM100 sources are skipped.
+    // CUTLASS ships inside vendor/flashmla/csrc/cutlass/ (NVIDIA tag
+    // 147f5673 — FlashMLA submodule pin). Refs sgl-kernel/cmake/flashmla.cmake.
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHMLA");
+    let flashmla_root = Path::new("vendor/flashmla");
+    let enable_flashmla = flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA");
+    if enable_flashmla {
+        let sparse = flashmla_root.join("csrc/sm90/prefill/sparse");
+        for entry in [
+            "fwd.cu",
+            "instantiations/phase1_k512.cu",
+            "instantiations/phase1_k512_topklen.cu",
+            "instantiations/phase1_k576.cu",
+            "instantiations/phase1_k576_topklen.cu",
+        ] {
+            cu_files.push(sparse.join(entry));
+        }
+    }
+
     // Keep a stable compile order independent of filesystem iteration order.
     cu_files.sort();
 
@@ -1370,6 +1393,27 @@ fn main() {
             nvcc_args.extend([
                 "-std=c++17".to_string(),
                 "--expt-relaxed-constexpr".to_string(),
+            ]);
+        }
+
+        // FlashMLA SM90 sparse prefill kernels + ARLE shim. Mirror
+        // sgl-kernel/cmake/flashmla.cmake flags so we inherit upstream's
+        // tuning. CUTLASS include is FlashMLA's vendored copy (NVIDIA
+        // CUTLASS tag 147f5673 from the FlashMLA submodule). Hopper-only
+        // gencode is already in `arch_args` for SM90 builds; the
+        // sm_90a-specific arch is also needed because FlashMLA's WGMMA
+        // primitives require the architecture variant.
+        let is_flashmla_kernel = cu_file.components().any(|c| c.as_os_str() == "flashmla");
+        if is_flashmla_kernel || stem == "arle_flashmla_shim" {
+            nvcc_args.extend([
+                "-std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "--use_fast_math".to_string(),
+                "-Xcudafe=--diag_suppress=177".to_string(),
+                "-gencode=arch=compute_90a,code=sm_90a".to_string(),
+                format!("-I{}", flashmla_root.join("csrc").display()),
+                format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
             ]);
         }
 
