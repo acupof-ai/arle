@@ -79,25 +79,30 @@ Other "Planned" families above sit behind these two and are not actively schedul
 
 ## 4. Quantization Matrix
 
-| Capability | Status | Notes |
+**Canonical map**: [`docs/quantization.md`](quantization.md). That doc is
+the source of truth for KV-cache and weight quantization status, code
+locations, test-harness semantics, and the active TileLang HD128
+batched paged-prefill investigation (2026-05-27). The summary table
+below is the one-glance view — for any change, edit
+`quantization.md` first and re-sync here.
+
+| Capability | Status | One-line |
 | --- | --- | --- |
-| FP8 KV cache | Beta | FP8 E4M3 + fused-dequant decode attention; 50% KV memory reduction, benchmarked. |
-| INT8 KV cache | Beta | INT8 W8A16 GEMV/GEMM + INT8 KV fused-dequant decode; benchmarked. |
-| TurboQuant KV (2–4 bit) | Experimental | Fused decode attention with dequant. Fast-moving optimization area. |
-| W8 / W4 / W2 weight quantization | Beta | Native W4 GEMV path + Marlin W4 prefill (5–25× TTFT on long prompts). |
-| W4-hybrid prefill CUDA Graph capture | Opt-in (CUDA) — **Tier 1 wins** | `INFER_PREFILL_GRAPH=1` + `INFER_HYBRID_W4A8_PREFILL=1` enables prefill-lifetime `MarlinPrefillScratch` lifecycle + multi-key 8-d graph cache + bucketed allocation key for Qwen3.5 paged prefill on W4 / W4-hybrid. Phase 1 functional gate PASS (`35fc3cf`); Path A multi-key throughput KILLED (`e462c53`); Path B device-memory `start_pos` v1 KILLED (`a7a8b94`); **Path B.2 bucketing fix DELIVERS Tier 1 wins** (`a56b7a9`/`c44788f`): engine TTFT p50 2000ms → 150ms = -92.5%, 7 unique capture keys (98.5% LRU reuse), +632% throughput on matched-control 4k/c=4 60s window — closes the +76.6% SGLang gap on this workload. Default behavior unchanged when env vars unset. Client-side guidellm 0.6.0 TTFT measurement broken with graph capture (`e8d82b0` — bench tool bug, not substrate); use server-side `/v1/stats engine_ttft_us` for ground truth. |
-| GPTQ / AWQ (W4A16) | Beta | GEMV + Marlin kernel path; format detection production-ready. |
-| GGUF loading | Beta | Supported loader path. CUDA ships the native packed Q4_K GPU kernel (`q4k_gemv_kernel` + packed fast path in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`) — fits Carnice-27B on L4-24GB. Metal supports Qwen3.5 GGUF on Apple Silicon via the shared Rust GGUF parser; Qwen3.5-0.8B Q4_K_M defaults to exact GGUF affine/packed behavior. Set `AGENT_INFER_METAL_GGUF_NATIVE_Q4=all` for an opt-in lossy load-time conversion into MLX native q4 group64 for packed Q3/Q4/Q5/Q6/Q8 tensors. It is still slower than MLX SafeTensors 4bit, so exact K-quant Metal kernels remain a separate optimization target. |
+| BF16 KV cache | production | Default via `--kv-cache-dtype auto`; correctness-safe reference. |
+| INT8 KV cache (CUDA) | production | `--kv-cache-dtype int8`; per-(token, head) /127; +57–113% throughput vs BF16 on A100 (`wins/2026-05-26-bench-int8-vs-bf16-kv-a100`). |
+| FP8 E4M3 KV cache (CUDA, +KIVI) | opt-in | `--kv-cache-dtype fp8`; KIVI per-channel K + per-token V scaffolding (`8c6d92db`/`73a72615`/`25c7d409`); quality verdict deferred pending §5 paged-prefill investigation. |
+| TurboQuant KV 2/3/4-bit (CUDA) | experimental | `--kv-cache-dtype tq{2,3,4}`; FWHT + packed indices; page_size=1 bypasses the HD128 paged prefill — the only KV format that matches the HF first token on the 2026-05-27 chat audit. |
+| Weights — W4A16 / W8A16 / W2A16 | production / experimental (W2) | Native GEMV + Marlin W4 prefill; safetensors auto-detect. |
+| Weights — MarlinW4A8 prefill-graph | production, **Tier-1 wins** | `INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1` → engine TTFT p50 –92.5%, +632% throughput (`a56b7a9`/`c44788f`). |
+| Weights — GGUF Q3/Q4/Q5/Q6_K | production (CUDA & Metal) | Packed superblock kernels; `.gguf` auto-detect. Metal-native-q4 opt-in via `AGENT_INFER_METAL_GGUF_NATIVE_Q4=all`. |
+| Weights — TurboQuant | experimental | Tensor-local gate only (`errors/2026-05-21-arle-turboquant-9b-fwht-fixed-logits-kill`). |
+| Weights — DSv4 FP8/FP4 block-scaled | in progress | `Dsv4Fp8BlockScaled` / `Dsv4Fp4BlockScaled`; pending CUDA V4 attention/MoE/MTP kernels. |
 
-Backend note:
-
-- The `FP8 KV cache`, `INT8 KV cache`, and `TurboQuant KV` rows above describe
-  the shipped project-wide quantized-KV work, which is currently CUDA-backed.
-- Metal / MLX does **not** currently ship quantized KV cache. The live Metal
-  path stores KV in the model's native dtype today, typically `bf16` / `f16`,
-  and it does not expose a `--kv-cache-dtype` surface.
-- Metal can still run weight-quantized MLX models; that is separate from
-  quantized KV cache support.
+Backend reach:
+- Quantized KV cache is **CUDA-only** today. Metal stores KV in the
+  model's native dtype (`bf16` / `f16`) and does not expose
+  `--kv-cache-dtype`. Metal weight-quantized MLX models are
+  unaffected.
 
 ---
 
