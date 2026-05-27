@@ -130,6 +130,49 @@ impl NcclGroup {
         )
     }
 
+    /// Device-side AllGather for bf16 buffers. Required by DSv4 FlashMLA SM90
+    /// sparse prefill TP path: each rank contributes its local Q
+    /// [token_count, h_local, d_qk]; recv buffer ends up with
+    /// [world_size, token_count, h_local, d_qk] rank-major concat, which
+    /// the dsv4_tp_q_repack_cuda kernel then transposes into FlashMLA's
+    /// expected [token_count, world_size*h_local, d_qk] layout.
+    pub fn all_gather_bf16_device(
+        &self,
+        sendbuf: &CudaSlice<bf16>,
+        send_count: usize,
+        recvbuf: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        if send_count == 0 {
+            return Ok(());
+        }
+        if sendbuf.len() < send_count {
+            bail!(
+                "NCCL all_gather_bf16 rank {} send buffer len {} smaller than count {}",
+                self.rank,
+                sendbuf.len(),
+                send_count
+            );
+        }
+        let expected_recv = send_count.saturating_mul(self.world_size);
+        if recvbuf.len() < expected_recv {
+            bail!(
+                "NCCL all_gather_bf16 rank {} recv buffer len {} smaller than expected {}",
+                self.rank,
+                recvbuf.len(),
+                expected_recv
+            );
+        }
+        let (src, _src_record) = sendbuf.device_ptr(&self.stream);
+        let (dst, _dst_record) = recvbuf.device_ptr_mut(&self.stream);
+        self.comm.all_gather(
+            src as *const c_void,
+            dst as *mut c_void,
+            send_count,
+            ncclDataType_t::Bfloat16,
+            &self.stream,
+        )
+    }
+
     pub fn reduce_scatter_bf16_device(
         &self,
         sendbuf: &CudaSlice<bf16>,

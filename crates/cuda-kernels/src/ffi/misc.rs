@@ -241,4 +241,78 @@ unsafe extern "C" {
         start_pos: i32,
         stream: super::CUstream,
     ) -> super::CUresult;
+
+    // ------------------------------------------------------------------
+    // V2 FlashMLA support: bf16→f32 convert, TP repack/slice, CSA prep.
+    // See:
+    //   crates/cuda-kernels/csrc/misc/arle_dtype_convert.cu
+    //   crates/cuda-kernels/csrc/misc/dsv4_tp_attention_repack.cu
+    //   crates/cuda-kernels/csrc/misc/arle_flashmla_csa_prep.cu
+    // ------------------------------------------------------------------
+
+    /// bf16 → f32 device-side convert. One-shot at model load (e.g. DSv4
+    /// attn_sink f32 mirror for FlashMLA's float[h_q] contract).
+    pub fn arle_bf16_to_f32_cuda(
+        src: *const super::Half,
+        dst: *mut f32,
+        n: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    /// Repack AllGather recv buffer (rank-major) into FlashMLA's expected
+    /// h_q-major Q layout. gathered: bf16 [tp_world, s_q, h_local, d];
+    /// packed: bf16 [s_q, tp_world*h_local, d] with rank w at heads
+    /// [w*h_local, (w+1)*h_local).
+    pub fn dsv4_tp_q_repack_cuda(
+        gathered: *const super::Half,
+        packed: *mut super::Half,
+        tp_world: i32,
+        s_q: i32,
+        h_local: i32,
+        d: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    /// Slice this rank's local-heads slab out of FlashMLA's [s_q, h_global, d]
+    /// output into the per-rank local_attn buffer [s_q, h_local, d].
+    pub fn dsv4_tp_out_slice_cuda(
+        full_out: *const super::Half,
+        local: *mut super::Half,
+        s_q: i32,
+        global_width: i32,
+        local_width: i32,
+        head_offset: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    /// Pack ARLE's rolling sliding-window cache + current-chunk K + compressed
+    /// pool into a single contiguous KV pool for FlashMLA SM90 sparse prefill.
+    pub fn arle_flashmla_csa_pack_kv(
+        kv_unified: *mut super::Half,
+        window_cache: *const super::Half,
+        k_prepared: *const super::Half,
+        compressed: *const super::Half,
+        start_pos: i32,
+        sw_window: i32,
+        n_tokens: i32,
+        compressed_count: i32,
+        d_qk: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    /// Build per-token unified indices + topk_length matching the layout
+    /// produced by `arle_flashmla_csa_pack_kv`. `compress_ratio` enables
+    /// the compress-block causality gate (block_end > abs_pos → -1).
+    pub fn arle_flashmla_csa_build_indices(
+        indices: *mut i32,
+        topk_length: *mut i32,
+        selected: *const i32,
+        s_q: i32,
+        start_pos: i32,
+        sw_window: i32,
+        index_topk: i32,
+        compressed_count: i32,
+        compress_ratio: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
 }
