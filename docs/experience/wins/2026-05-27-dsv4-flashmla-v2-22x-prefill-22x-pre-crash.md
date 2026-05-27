@@ -27,14 +27,17 @@ After landing the FlashMLA vendored kernel (commit `bbd23a20`) + V1 shim wire (`
 
 ## Results
 
-| Run | Path | Prefill (28899 tokens) | vs 282s baseline | Note |
+| Run | Path | Prefill | vs baseline | Status |
 |---|---|---:|---:|---|
-| 2026-05-27 baseline | per-token grid kernel | 282s | — | per the GEMM-marginal entry |
+| 2026-05-27 baseline | per-token grid kernel | 282s @ 29K | — | (from GEMM-marginal entry) |
 | V1 (3b7808ee) | FlashMLA → KUException → host abort | N/A | — | h_q % B_H fail |
-| **V2 #1 (f2fcee6d)** | FlashMLA + TP-AllGather + SW concat + attn_sink_f32 | **12.81s before crash** | **-95% (22× faster)** | abort at MoE D2H (sticky cuda) |
-| **V2 #2 (eaa42a8d)** | + null defense on selected_ptr | **13.00s before crash** | **-95% (22× faster)** | same crash sig — null wasn't the bug |
+| **V2 @ 4K** | FlashMLA full V2 path | **1.84s** | 17.6s @ 4K → **9.6× faster** | ✅ clean |
+| **V2 @ 16K** | FlashMLA full V2 path | **4.93s** | ~76s linear extrap → **15× faster** | ✅ clean — **single chunk, in SLO range** |
+| **V2 @ 24K** | FlashMLA full V2 path | **7.81s** | ~115s linear extrap → **15× faster** | ✅ clean (across chunk-2 transition) |
+| **V2 #1 @ 29K** | FlashMLA full V2 path | **12.81s before crash** | 282s → **22× faster pre-crash** | ❌ TMA OOB mid-prefill |
+| **V2 #2 @ 29K** (with null defense) | + eaa42a8d | **13.00s before crash** | same | ❌ same sig (null wasn't the bug) |
 
-Both V2 probes ran for 13s before the same crash. That's consistent — the abort point is deterministic.
+Bisect: bug only triggers at >24K-token prompts. Chunk-2 transition itself is fine (24K and 29K both have chunk 2). Bug-trigger is at some specific compressed_count / kv_unified size threshold between 24K and 29K.
 
 ## What's causing the crash
 
