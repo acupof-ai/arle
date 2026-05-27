@@ -1969,7 +1969,8 @@ impl DeepseekV4MoeBlock {
                 .map_err(|_| anyhow::anyhow!("DeepSeek V4 packed route offset overflows usize"))?;
             let elem_start = offset * hidden.hidden_dim;
             let elem_end = elem_start + count * hidden.hidden_dim;
-            let mut expert_input = HiddenStates::zeros(ctx, hidden.hidden_dim, count)?;
+            // memcpy_dtod below writes every byte — skip the zero-fill memset.
+            let mut expert_input = unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, count)? };
             {
                 let src = packed_hidden.data.slice(elem_start..elem_end);
                 ctx.stream
@@ -5144,7 +5145,9 @@ impl DeepseekV4MoeBlock {
                 let elem_start = offset * hidden.hidden_dim;
                 let elem_end = elem_start + count_usize * hidden.hidden_dim;
 
-                let mut expert_input = HiddenStates::zeros(ctx, hidden.hidden_dim, count_usize)?;
+                // memcpy_dtod below writes every byte — skip the zero-fill memset.
+                let mut expert_input =
+                    unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, count_usize)? };
                 {
                     let src = scratch.packed_x.data.slice(elem_start..elem_end);
                     ctx.stream
