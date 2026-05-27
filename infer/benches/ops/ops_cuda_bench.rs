@@ -1240,7 +1240,9 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
         let q_dim = QWEN35_4B_Q_HEADS * QWEN35_4B_HEAD_DIM;
         let kv_dim = QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM;
         let data_len = total_rows * kv_dim;
-        let scales_len = total_rows * QWEN35_4B_KV_HEADS;
+        // KIVI per-channel K static scales: [num_kv_heads, head_dim].
+        let k_static_scales_len = QWEN35_4B_KV_HEADS * QWEN35_4B_HEAD_DIM;
+        let v_scales_len = total_rows * QWEN35_4B_KV_HEADS;
 
         let q = hidden_states(&ctx, q_dim, batch_size).expect("failed to allocate q");
         let fp8_pattern = [0x00u8, 0x38, 0xb8, 0x40, 0xc0, 0x30, 0xb0, 0x34];
@@ -1250,7 +1252,10 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
         let v_host: Vec<u8> = (0..data_len)
             .map(|idx| fp8_pattern[(idx * 5 + 2) % fp8_pattern.len()])
             .collect();
-        let scale_host: Vec<f32> = (0..scales_len)
+        let k_static_scale_host: Vec<f32> = (0..k_static_scales_len)
+            .map(|idx| 0.001 + (idx % 19) as f32 * 0.000_25)
+            .collect();
+        let v_scale_host: Vec<f32> = (0..v_scales_len)
             .map(|idx| 0.001 + (idx % 19) as f32 * 0.000_25)
             .collect();
         let kv_indices_host: Vec<i32> = (0..total_pages).map(|idx| idx as i32).collect();
@@ -1262,13 +1267,13 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
 
         let k_data = ctx.stream.clone_htod(&k_host).expect("failed to H2D k");
         let v_data = ctx.stream.clone_htod(&v_host).expect("failed to H2D v");
-        let k_scales = ctx
+        let k_static_scales = ctx
             .stream
-            .clone_htod(&scale_host)
-            .expect("failed to H2D k scales");
+            .clone_htod(&k_static_scale_host)
+            .expect("failed to H2D k static scales");
         let v_scales = ctx
             .stream
-            .clone_htod(&scale_host)
+            .clone_htod(&v_scale_host)
             .expect("failed to H2D v scales");
         let kv_indices = ctx
             .stream
@@ -1292,16 +1297,16 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
             .expect("failed to allocate attention workspace");
         let (k_ptr, _k_guard) = k_data.device_ptr(&ctx.stream);
         let (v_ptr, _v_guard) = v_data.device_ptr(&ctx.stream);
-        let (k_scale_ptr, _ks_guard) = k_scales.device_ptr(&ctx.stream);
+        let (k_static_ptr, _ks_guard) = k_static_scales.device_ptr(&ctx.stream);
         let (v_scale_ptr, _vs_guard) = v_scales.device_ptr(&ctx.stream);
 
         iter_sync(b, &ctx, || {
-            kv_quant::decode_attention_fp8(
+            kv_quant::decode_attention_fp8_per_channel_k(
                 &ctx,
                 &q,
                 k_ptr,
                 v_ptr,
-                k_scale_ptr,
+                k_static_ptr,
                 v_scale_ptr,
                 &kv_indices,
                 &kv_meta,
@@ -1315,7 +1320,7 @@ pub(crate) fn bench_cuda_ops(c: &mut Criterion) {
                 &workspace,
                 workspace_bytes,
             )
-            .expect("decode_attention_fp8 failed");
+            .expect("decode_attention_fp8_per_channel_k failed");
         });
     });
 

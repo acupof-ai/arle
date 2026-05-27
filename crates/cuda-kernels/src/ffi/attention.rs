@@ -283,46 +283,6 @@ unsafe extern "C" {
         num_splits: i32,
     ) -> usize;
 
-    pub fn decode_attention_int8_cuda(
-        q: *const Half,
-        k_data: *const i8,
-        v_data: *const i8,
-        k_scales: *const f32,
-        v_scales: *const f32,
-        kv_indices: *const i32,
-        kv_indptr: *const i32,
-        o: *mut Half,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        sm_scale: f32,
-        stream: CUstream,
-        workspace: *mut u8,
-        workspace_bytes: usize,
-    ) -> CUresult;
-
-    pub fn decode_attention_fp8_cuda(
-        q: *const Half,
-        k_data: *const u8, // FP8 E4M3
-        v_data: *const u8, // FP8 E4M3
-        k_scales: *const f32,
-        v_scales: *const f32,
-        kv_indices: *const i32,
-        kv_indptr: *const i32,
-        o: *mut Half,
-        batch_size: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        kv_dim: i32,
-        sm_scale: f32,
-        stream: CUstream,
-        workspace: *mut u8,
-        workspace_bytes: usize,
-    ) -> CUresult;
-
     /// KIVI per-channel K decode attention. `k_static_scales` shape is
     /// `[num_kv_heads, head_dim]` f32 (one scale per channel per KV head,
     /// shared across tokens). `v_scales` keeps per-(row, head) layout
