@@ -33,14 +33,21 @@ across rollout_len ∈ {8, 16, 32} on the same SKU and config as v4
 `prompt_max_tokens=16`, `kl_chunk_size=16`,
 `opd_kl_mask=completion-only`, no GPU contention).
 
-Step-2 measurements (warm) — student_rollout vs n_gen:
+Step-2 measurements (warm; rollout=64 step-1 included as the midpoint
+held-out validation point) — student_rollout vs n_gen:
 
-| rollout_len | n_gen (≈seq_len − prompt) | student_rollout | per-token mean |
-|---:|---:|---:|---:|
-| 8   | 6.5  | 2.45 s  | 0.38 s/tok |
-| 16  | 14.5 | 6.30 s  | 0.43 s/tok |
-| 32  | 30.5 | 19.26 s | 0.63 s/tok |
-| 128 | 130  | 208 s   | 1.60 s/tok |
+| rollout_len | n_gen (≈seq_len − prompt) | student_rollout | per-token mean | fit predict | abs error |
+|---:|---:|---:|---:|---:|---:|
+| 8   | 6.5  | 2.45 s  | 0.38 s/tok | 2.43 s  | 0.02 s |
+| 16  | 14.5 | 6.30 s  | 0.43 s/tok | 6.58 s  | 0.28 s |
+| 32  | 30.5 | 19.26 s | 0.63 s/tok | 18.66 s | 0.60 s |
+| **64**  | **64**   | **61.93 s** (step 1, held-out) | **0.97 s/tok** | **60.39 s** | **1.54 s (2.5%)** |
+| 128 | 130  | 208 s   | 1.60 s/tok | 207 s   | 1 s |
+
+The rollout=64 point was added 2026-05-28 tick 12 as held-out
+validation — the 0.31n + 0.0099n² fit was derived from {8, 16, 32,
+128} and predicted 60.4 s at n=64. Measured 61.93 s confirms the
+curve. Largest relative error on any point is ~5%.
 
 Per-token cost is **not constant** — it grows with rollout length.
 Two-term fit (linear+quadratic) on the four points:
