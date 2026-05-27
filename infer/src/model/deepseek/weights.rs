@@ -1737,10 +1737,12 @@ impl DeepseekModel {
 
             // FlashMLA SM90 sparse prefill (opt-in via ARLE_DSV4_FLASHMLA_PREFILL=1).
             //
-            // V2 scope: CSA mode (mode_int == 1), token_count > 1, head_dim ∈ {512, 576},
-            // SM 9.x (FlashMLA cubins are compiled sm_90a only). HCA (mode 2) and
-            // SWA (mode 0) fall through to the legacy kernel — wiring planned in a
-            // follow-up after CSA bench validates the kernel path.
+            // V2 scope: CSA mode (mode_int == 1) and HCA mode (mode_int == 2),
+            // token_count > 1, head_dim ∈ {512, 576}, SM 9.x (FlashMLA cubins
+            // compiled sm_90a only). SWA (mode 0) falls through to the legacy
+            // kernel. HCA uses the same unified KV pool + TP-AllGather path
+            // but builds indices without a top-k selector (attend to all
+            // compressed pages causally) — see arle_flashmla_hca_build_indices.
             //
             // V2 additions vs V1:
             //   - Unified KV pool (SW rolling + linear k_prepared + compressed) so
@@ -1768,7 +1770,7 @@ impl DeepseekModel {
             //   crates/cuda-kernels/vendor/flashmla (sgl-project/FlashMLA @ df022eb)
             let (sm_major, _sm_minor) = self.ctx.compute_capability();
             let use_flashmla = sm_major == 9
-                && mode_int == 1
+                && (mode_int == 1 || mode_int == 2)
                 && token_count > 1
                 && (head_dim == 512 || head_dim == 576)
                 && dsv4_flashmla_prefill_enabled()?;
@@ -1792,7 +1794,17 @@ impl DeepseekModel {
                 let sliding_window = self.config.sliding_window;
                 let index_topk = self.config.index_topk;
                 let s_kv_total = sliding_window + token_count + compressed_count;
-                let topk_unified = sliding_window + index_topk;
+                // For CSA (mode 1): fixed top-k of compressed pages (index_topk slots).
+                // For HCA (mode 2): no selector — round compressed_count up to a
+                // multiple of 128 so that sliding_window + max_compressed_keys
+                // (which becomes params.topk) satisfies FlashMLA's
+                // topk % (2*B_TOPK=128) == 0 constraint.
+                let max_compressed_keys = if mode_int == 2 {
+                    compressed_count.div_ceil(128) * 128
+                } else {
+                    index_topk
+                };
+                let topk_unified = sliding_window + max_compressed_keys;
                 debug_assert_eq!(
                     topk_unified % 128,
                     0,
@@ -1853,22 +1865,40 @@ impl DeepseekModel {
                     let (idx_ptr, _gi) = indices_unified.device_ptr_mut(&self.ctx.stream);
                     let (len_ptr, _gl) = topk_length.device_ptr_mut(&self.ctx.stream);
                     unsafe {
-                        ffi::arle_flashmla_csa_build_indices(
-                            idx_ptr as *mut i32,
-                            len_ptr as *mut i32,
-                            selected_ptr,
-                            token_count as i32,
-                            start_pos as i32,
-                            sliding_window as i32,
-                            index_topk as i32,
-                            compressed_count as i32,
-                            compress_ratio as i32,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()
-                        .map_err(|err| {
-                            anyhow::anyhow!("DSv4 FlashMLA CSA index build failed: {err}")
-                        })?;
+                        if mode_int == 2 {
+                            ffi::arle_flashmla_hca_build_indices(
+                                idx_ptr as *mut i32,
+                                len_ptr as *mut i32,
+                                token_count as i32,
+                                start_pos as i32,
+                                sliding_window as i32,
+                                max_compressed_keys as i32,
+                                compressed_count as i32,
+                                compress_ratio as i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DSv4 FlashMLA HCA index build failed: {err}")
+                            })?;
+                        } else {
+                            ffi::arle_flashmla_csa_build_indices(
+                                idx_ptr as *mut i32,
+                                len_ptr as *mut i32,
+                                selected_ptr,
+                                token_count as i32,
+                                start_pos as i32,
+                                sliding_window as i32,
+                                index_topk as i32,
+                                compressed_count as i32,
+                                compress_ratio as i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DSv4 FlashMLA CSA index build failed: {err}")
+                            })?;
+                        }
                     }
                 }
 
