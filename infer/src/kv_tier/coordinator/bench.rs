@@ -53,10 +53,6 @@ fn fmt_bandwidth(bytes_total: u128, secs: f64) -> String {
     format!("{:>9.1} MiB/s", mb / secs)
 }
 
-fn fmt_avg_us(secs: f64, iters: usize) -> String {
-    format!("{:>9.2} µs", (secs / iters as f64) * 1e6)
-}
-
 fn fmt_size(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:>5} MiB", bytes / (1024 * 1024))
@@ -302,12 +298,6 @@ fn bench_kv_tier_copy_throughput() {
             fmt_bandwidth(t2_nf_total, t2_nf_secs),
             fmt_bandwidth(cyc_total, cyc_secs),
             cyc_ops_per_s,
-        );
-        // Latency view (currently unused but kept for ad-hoc inspection).
-        let _ = (
-            fmt_avg_us(t1_secs, t1_iters),
-            fmt_avg_us(t2_secs, t2_iters),
-            fmt_avg_us(t2_nf_secs, t2_nf_iters),
         );
     }
     println!();
