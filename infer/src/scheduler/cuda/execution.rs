@@ -507,7 +507,7 @@ impl<M: ModelForward> Scheduler<M> {
     ) -> Vec<PrefillCandidate> {
         cap_prefill_candidates_by_tokens(
             self.select_launch_prefill_candidates(candidates, decode_slots),
-            self.config.mixed_prefill_token_budget(),
+            self.config.mixed_prefill_token_budget(decode_slots.len()),
         )
     }
 
