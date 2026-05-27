@@ -19,6 +19,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <exception>
 #include <stdexcept>
 
 // FlashMLA internals (vendored): SparseAttnFwdParams + the SM90 entry.
@@ -54,6 +55,22 @@ cudaError_t arle_flashmla_sm90_sparse_prefill_fwd(
     int num_sm,
     cudaStream_t stream
 ) {
+    // Pre-flight: validate FlashMLA SM90 sparse-prefill invariants. Failing
+    // here returns cudaErrorInvalidValue cleanly; failing inside the kernel
+    // throws kerutils::KUException (extends std::exception, NOT
+    // std::runtime_error — V1 abort root cause), and that throw across the
+    // extern "C" boundary aborts the host process. Mirror the asserts at
+    // vendor/flashmla/csrc/sm90/prefill/sparse/phase1.cuh:576-579 and
+    // sm90/prefill/sparse/config.h:26-27 (B_H = 64, B_TOPK = 64).
+    constexpr int B_H = 64;
+    constexpr int B_TOPK = 64;
+    if (h_kv != 1) return cudaErrorInvalidValue;
+    if (h_q <= 0 || (h_q % B_H) != 0) return cudaErrorInvalidValue;
+    if (topk <= 0 || (topk % (2 * B_TOPK)) != 0) return cudaErrorInvalidValue;
+    if (d_qk != 512 && d_qk != 576) return cudaErrorInvalidValue;
+    if (d_v != 512) return cudaErrorInvalidValue;
+    if (s_q <= 0 || s_kv <= 0) return cudaErrorInvalidValue;
+
     SparseAttnFwdParams p{};
     p.s_q = s_q;
     p.s_kv = s_kv;
@@ -87,11 +104,16 @@ cudaError_t arle_flashmla_sm90_sparse_prefill_fwd(
     p.num_sm = num_sm;
     p.stream = stream;
 
+    // Belt-and-braces: catch anything the launcher might throw, including
+    // kerutils::KUException (extends std::exception, not std::runtime_error
+    // — V1 caught only runtime_error, KUException escaped → process abort).
+    // Pre-flight above should already prevent the documented assert paths.
     try {
         sm90::run_fwd_kernel(p);
-    } catch (const std::runtime_error&) {
-        // d_qk unsupported by FlashMLA SM90 dispatch (only 512/576 valid).
+    } catch (const std::exception&) {
         return cudaErrorInvalidValue;
+    } catch (...) {
+        return cudaErrorUnknown;
     }
     return cudaGetLastError();
 }
