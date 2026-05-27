@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -243,10 +244,21 @@ def _mmlu_extract_letter(text: str) -> str | None:
     return None
 
 
-def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path, debug_samples: int = 5) -> dict:
+def run_mmlu(
+    client: ArleClient,
+    n_samples: int,
+    output_dir: Path,
+    debug_samples: int = 5,
+    seed: int | None = None,
+) -> dict:
     """Run MMLU 5-shot eval. Saves the first `debug_samples` raw responses
     to <output_dir>/mmlu_debug.json so future extractor fixes can target
-    real model output instead of guessed prompt-shape."""
+    real model output instead of guessed prompt-shape.
+
+    When `seed` is set, each per-subject pool is shuffled before subject-
+    balanced subsampling so multiple runs at the same `n_samples` produce
+    independent draws — needed for binomial-noise variance estimates at
+    the small-n eval shapes used today."""
     try:
         from datasets import load_dataset
     except ImportError:
@@ -271,10 +283,13 @@ def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path, debug_samples
     n_per_subject = max(1, n_samples // len(subjects))
     pool: list[dict] = []
     for subj in subjects:
-        subj_pool = [ex for ex in ds_test if ex["subject"] == subj][:n_per_subject]
-        pool.extend(subj_pool)
+        subj_pool = [ex for ex in ds_test if ex["subject"] == subj]
+        if seed is not None:
+            random.Random(f"mmlu-{seed}-{subj}").shuffle(subj_pool)
+        pool.extend(subj_pool[:n_per_subject])
     pool = pool[:n_samples]
-    print(f"[mmlu] sampling {len(pool)} questions across {len(subjects)} subjects", flush=True)
+    seed_tag = f" seed={seed}" if seed is not None else ""
+    print(f"[mmlu] sampling {len(pool)} questions across {len(subjects)} subjects{seed_tag}", flush=True)
 
     correct = 0
     invalid = 0
@@ -336,6 +351,7 @@ def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path, debug_samples
         "n_correct": correct,
         "accuracy": accuracy,
         "elapsed_seconds": elapsed,
+        "seed": seed,
         "per_subject": per_subject,
     }
     (output_dir / "mmlu.json").write_text(json.dumps(report, indent=2))
@@ -375,7 +391,14 @@ def _gsm8k_extract_answer(text: str) -> str | None:
     return None
 
 
-def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_samples: int = 5, n_shots: int = 8) -> dict:
+def run_gsm8k(
+    client: ArleClient,
+    n_samples: int,
+    output_dir: Path,
+    debug_samples: int = 5,
+    n_shots: int = 8,
+    seed: int | None = None,
+) -> dict:
     try:
         from datasets import load_dataset
     except ImportError:
@@ -392,8 +415,12 @@ def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_sample
     few_shot = "\n".join(_gsm8k_format_shot(ex) for ex in shot_examples)
     if few_shot:
         few_shot += "\n"
-    pool = list(ds_test.select(range(min(n_samples, len(ds_test)))))
-    print(f"[gsm8k] running {len(pool)} problems with {len(shot_examples)} shots", flush=True)
+    indices = list(range(len(ds_test)))
+    if seed is not None:
+        random.Random(f"gsm8k-{seed}").shuffle(indices)
+    pool = [ds_test[i] for i in indices[: min(n_samples, len(ds_test))]]
+    seed_tag = f" seed={seed}" if seed is not None else ""
+    print(f"[gsm8k] running {len(pool)} problems with {len(shot_examples)} shots{seed_tag}", flush=True)
 
     correct = 0
     invalid = 0
@@ -441,6 +468,7 @@ def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_sample
         "n_shots": len(shot_examples),
         "accuracy": accuracy,
         "elapsed_seconds": elapsed,
+        "seed": seed,
     }
     (output_dir / "gsm8k.json").write_text(json.dumps(report, indent=2))
     if debug_records:
@@ -474,6 +502,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--tasks", default="mmlu,gsm8k", help="comma-separated subset of: " + ", ".join(TASK_RUNNERS))
     parser.add_argument("--n-samples", type=int, default=200, help="samples per task")
     parser.add_argument("--gsm8k-shots", type=int, default=8, help="few-shot examples for GSM8K")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="if set, shuffle per-subject MMLU pool and GSM8K test pool before "
+                             "sampling. Distinct seeds give independent draws for variance estimation. "
+                             "Default unset = original deterministic ordering, reproduces older runs.")
     parser.add_argument("--output", type=Path, required=True, help="output directory for per-task reports")
     args = parser.parse_args(argv)
 
@@ -493,15 +525,16 @@ def main(argv: list[str]) -> int:
         "model_path": args.model_path if args.backend == "hf" else None,
         "model_id": args.model_id,
         "gsm8k_shots": args.gsm8k_shots,
+        "seed": args.seed,
         "tasks": {},
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     for task in requested:
         print(f"\n========== {task} ==========", flush=True)
         if task == "gsm8k":
-            report = run_gsm8k(client, args.n_samples, args.output, n_shots=args.gsm8k_shots)
+            report = run_gsm8k(client, args.n_samples, args.output, n_shots=args.gsm8k_shots, seed=args.seed)
         else:
-            report = TASK_RUNNERS[task](client, args.n_samples, args.output)
+            report = TASK_RUNNERS[task](client, args.n_samples, args.output, seed=args.seed)
         summary["tasks"][task] = report
 
     summary["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
