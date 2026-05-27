@@ -136,6 +136,75 @@ __global__ void arle_csa_pack_sw_region_kernel(
 
 }  // namespace
 
+namespace {
+
+// HCA build indices variant.
+//
+// HCA (HybridCompressed) attention has NO top-k selector — it attends to
+// all compressed pages whose block_end <= abs_pos (causal). For each Q-token,
+// the unified pool indices are:
+//   [0,           sw_count_t)            ← SW pool offsets (same as CSA)
+//   [sw_count_t,  sw_count_t + comp_t)   ← identity 0..comp_t-1 into compressed
+//   [sw_count_t + comp_t, topk_unified)  ← -1 padding
+//
+// where comp_t = min(compressed_count, (start_pos + t + 1) / compress_ratio)
+// mirrors `comp_keys = dsv4_imin(compressed_count, (abs_pos+1)/compress_ratio)`
+// at dsv4_hybrid_attention_kernel:882.
+//
+// topk_length[t] = sw_count_t + comp_t.
+__global__ void arle_hca_build_indices_kernel(
+        int32_t* __restrict__ indices,       // [s_q, topk_unified] int32
+        int32_t* __restrict__ topk_length,   // [s_q] int32
+        int s_q,
+        int start_pos,
+        int sw_window,
+        int topk_unified,                    // sw_window + max_compressed (padded to 128)
+        int n_tokens,
+        int compressed_count,
+        int compress_ratio,
+        int sw_base) {
+    int token = blockIdx.x;
+    if (token >= s_q) return;
+
+    const int abs_pos = start_pos + token;
+    const int sw_start = max(0, abs_pos + 1 - sw_window);
+    const int sw_count = abs_pos - sw_start + 1;
+
+    // HCA per-token compressed key count (mirrors dsv4_hybrid_attention_kernel:882).
+    int comp_keys = (compress_ratio > 0) ? ((abs_pos + 1) / compress_ratio) : 0;
+    if (comp_keys > compressed_count) comp_keys = compressed_count;
+    if (comp_keys < 0) comp_keys = 0;
+
+    const int comp_base_in_pool = sw_window + n_tokens;
+    int32_t* row = indices + (size_t)token * topk_unified;
+
+    // [0, sw_count): SW pool offsets (same arithmetic as CSA path).
+    for (int j = threadIdx.x; j < sw_count; j += blockDim.x) {
+        int p = sw_start + j;
+        int slot = (p < start_pos)
+                 ? (p - sw_base)
+                 : (sw_window + (p - start_pos));
+        row[j] = slot;
+    }
+
+    // [sw_count, sw_count + comp_keys): identity 0..comp_keys-1 into compressed.
+    for (int k = threadIdx.x; k < comp_keys; k += blockDim.x) {
+        row[sw_count + k] = comp_base_in_pool + k;
+    }
+
+    // [sw_count + comp_keys, topk_unified): -1 padding.
+    int pad_start = sw_count + comp_keys;
+    for (int k = pad_start + threadIdx.x; k < topk_unified; k += blockDim.x) {
+        row[k] = -1;
+    }
+
+    if (threadIdx.x == 0) {
+        topk_length[token] = sw_count + comp_keys;
+    }
+}
+
+}  // namespace (HCA helpers)
+
 extern "C" {
 
 // Build kv_unified = concat(window_cache_rebased, k_prepared, compressed).
@@ -215,6 +284,38 @@ cudaError_t arle_flashmla_csa_build_indices(
     arle_csa_build_indices_kernel<<<s_q, kBlock, 0, stream>>>(
         indices, topk_length, selected,
         s_q, start_pos, sw_window, index_topk, topk_unified,
+        /*n_tokens=*/s_q, compressed_count, compress_ratio, sw_base);
+    return cudaGetLastError();
+}
+
+// HCA (HybridCompressed) indices launcher. No selector — attend to all
+// compressed pages causally. topk_unified must be a multiple of 128.
+//
+// max_compressed_keys is the cap padded into the indices buffer; pass the
+// total compressed_count for this chunk (or the next-multiple-of-128 padded
+// length the caller allocated).
+cudaError_t arle_flashmla_hca_build_indices(
+        int32_t* indices,
+        int32_t* topk_length,
+        int s_q,
+        int start_pos,
+        int sw_window,
+        int max_compressed_keys,    // pool capacity for compressed slots in indices row
+        int compressed_count,
+        int compress_ratio,
+        cudaStream_t stream) {
+    if (s_q <= 0) return cudaSuccess;
+    if (sw_window <= 0 || max_compressed_keys < 0 || compressed_count < 0 || start_pos < 0) {
+        return cudaErrorInvalidValue;
+    }
+    const int topk_unified = sw_window + max_compressed_keys;
+    if ((topk_unified & 127) != 0) return cudaErrorInvalidValue;
+
+    const int sw_base = std::max(0, start_pos - sw_window);
+    constexpr int kBlock = 128;
+    arle_hca_build_indices_kernel<<<s_q, kBlock, 0, stream>>>(
+        indices, topk_length,
+        s_q, start_pos, sw_window, topk_unified,
         /*n_tokens=*/s_q, compressed_count, compress_ratio, sw_base);
     return cudaGetLastError();
 }
