@@ -25,6 +25,45 @@ At rollout=128 the rollout dominates because it scales linearly with
 token count while backward scales sub-linearly (chunked KL with
 chunk_size=16).
 
+## Microbench update (2026-05-28 tick 10) — cost is **quadratic in rollout_len**
+
+Ran `target/release/examples/opd_step_cuda_infer_teacher_train --steps 2`
+across rollout_len ∈ {8, 16, 32} on the same SKU and config as v4
+(0.8B student + 4B teacher, `examples/opd/sample-prompts.jsonl`,
+`prompt_max_tokens=16`, `kl_chunk_size=16`,
+`opd_kl_mask=completion-only`, no GPU contention).
+
+Step-2 measurements (warm) — student_rollout vs n_gen:
+
+| rollout_len | n_gen (≈seq_len − prompt) | student_rollout | per-token mean |
+|---:|---:|---:|---:|
+| 8   | 6.5  | 2.45 s  | 0.38 s/tok |
+| 16  | 14.5 | 6.30 s  | 0.43 s/tok |
+| 32  | 30.5 | 19.26 s | 0.63 s/tok |
+| 128 | 130  | 208 s   | 1.60 s/tok |
+
+Per-token cost is **not constant** — it grows with rollout length.
+Two-term fit (linear+quadratic) on the four points:
+
+```
+student_rollout(n_gen) ≈ 0.31 · n_gen + 0.0099 · n_gen²
+```
+
+Predicted vs actual:
+- n=6.5  → 2.46 s (actual 2.45 — match)
+- n=14.5 → 6.58 s (actual 6.30 — match)
+- n=30.5 → 18.66 s (actual 19.26 — match)
+- n=130  → 207 s (actual 208 — perfect)
+
+**At n=130 the quadratic term is 169 s out of 208 s = 81% of student_rollout.**
+The linear "per-call host overhead" term is 40 s.
+
+Extrapolation to v7's rollout=256: 0.31 · 256 + 0.0099 · 256² ≈
+79 + 649 = **728 s student_rollout per step** (+ backward + forward etc.
+≈ 12-15 min/step), matches the v7-dryrun kill at 19 min/step.
+
+Raw data: `runs/2026-05-28-rollout-scale-bench/run.log`.
+
 ## What's actually happening in those 208s
 
 `crates/train/src/opd.rs:1648` opens the rollout phase with:
@@ -60,6 +99,17 @@ incur:
 
 **16× per-token slowdown** vs the batched train-crate forward.
 
+**2026-05-28 tick 10 amendment**: the microbench above proves the
+slowdown is *not* purely per-call host overhead. The linear term
+(0.31 s/tok) IS host overhead, but the quadratic term (0.01·n²) is
+**attention math over the growing KV cache** — each decode step's
+attention attends over all t prior keys/values, total O(n²) FLOPs
+across the rollout. At n=130 quadratic dominates linear 4:1.
+
+The 16× ratio held at n=130 but is rollout-len dependent. At small
+n (e.g. n=8), the batched-vs-perToken gap is much smaller because
+neither path is yet dominated by O(n²) attention.
+
 The teacher pays no such cost because it's routed through the infer
 engine (`teacher_id=infer` in the run.txt config) — teacher's
 12 s for 143 tokens through full-seq forward = 84 ms/token, same
@@ -70,23 +120,33 @@ order as student_forward (also batched).
 Route student rollout through the **infer engine**, the same way
 teacher already runs. Infer has:
 
-- CUDA-graph capture/replay for decode (`--cuda-graph=true` default)
-- paged KV decode kernel optimized for autoregressive single-token append
+- CUDA-graph capture/replay for decode (`--cuda-graph=true` default) —
+  attacks the **linear** 0.31 s/tok term (host-side launch overhead).
+- paged KV decode kernel optimized for autoregressive single-token
+  append — attacks the **quadratic** 0.01·n² term (attention cost
+  scales differently with tiled / paged attention; the kernel is
+  still O(n²) FLOPs but the constant is much smaller, AND infer's
+  paged attention can keep tokens local in shared memory).
 - no autograd machinery on the rollout path
-- BF16 0.8 B decode reaches ~5–10 ms/token in standalone benches
-  (cf. `docs/experience/wins/2026-05-25-kv-tier-observability-serve-baseline.md`)
+- BF16 0.8 B decode reaches ~5–10 ms/token in standalone benches at
+  full sequence lengths (cf.
+  `docs/experience/wins/2026-05-25-kv-tier-observability-serve-baseline.md`)
 
-Expected per-token: **~10-30 ms** for 0.8 B BF16 decode through infer
-(conservative — needs measurement). 144 tokens × 20 ms = **~3 s
-student_rollout** vs 208 s today. **~70× faster** on this phase alone.
+Conservative projection at rollout=128:
+- linear: 0.05 s/tok × 130 = 6.5 s (vs 40 s today, ~6× cut)
+- quadratic: 0.002 · n² × 130² ≈ 34 s (vs 169 s today, ~5× cut on the
+  quadratic constant)
+- total student_rollout: ~40 s vs 208 s = **5× cut** (more conservative
+  than the original 70× — that figure ignored the quadratic term)
 
-End-to-end step time at rollout=128 would drop from ~310 s to
-~310 - 208 + 3 = **~105 s** (3× step throughput).
+End-to-end step time at rollout=128: ~310 - 208 + 40 = **~140 s**
+(vs 310 today = 2.2× step throughput).
 
-At rollout=256 (where v7 dryrun was killed at 19 min/step):
-extrapolated current cost 208/144 × 256 = 370 s in student_rollout
-out of ~520 s step = pretty bad. Same fix → 256 × 20 ms = 5 s
-student_rollout, total step ~150 s. Unblocks rollout=256 entirely.
+At rollout=256:
+- linear: 0.05 × 256 = 13 s
+- quadratic: 0.002 × 256² = 131 s
+- total student_rollout: ~144 s vs predicted 728 s = **5× cut**
+- end-to-end step: ~260 s vs ~1200 s today = unblocks rollout=256.
 
 ## Risk and license-or-kill
 
