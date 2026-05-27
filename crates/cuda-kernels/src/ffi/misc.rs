@@ -315,4 +315,21 @@ unsafe extern "C" {
         compress_ratio: i32,
         stream: super::CUstream,
     ) -> super::CUresult;
+
+    /// HCA (HybridCompressed) per-token unified indices. No selector;
+    /// attends to all compressed pages causally gated by `compress_ratio`.
+    /// `max_compressed_keys` is the pool capacity for compressed slots in
+    /// each row — caller must allocate `s_q * (sw_window + max_compressed_keys)`
+    /// int32 with `(sw_window + max_compressed_keys) % 128 == 0`.
+    pub fn arle_flashmla_hca_build_indices(
+        indices: *mut i32,
+        topk_length: *mut i32,
+        s_q: i32,
+        start_pos: i32,
+        sw_window: i32,
+        max_compressed_keys: i32,
+        compressed_count: i32,
+        compress_ratio: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
 }
