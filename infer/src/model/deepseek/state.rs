@@ -146,6 +146,14 @@ pub(crate) struct DeepseekNativeDeepEpRuntimeScratch {
     pub(crate) combined_x: HiddenStates,
     pub(crate) combined_topk_w: CudaSlice<f32>,
     pub(crate) expert_out: HiddenStates,
+    pub(crate) experts_per_rank: usize,
+    pub(crate) recv_topk_idx_i32: CudaSlice<i32>,
+    pub(crate) local_counts: CudaSlice<i32>,
+    pub(crate) local_offsets: CudaSlice<i32>,
+    pub(crate) local_cursors: CudaSlice<i32>,
+    pub(crate) packed_x: HiddenStates,
+    pub(crate) packed_token: CudaSlice<i32>,
+    pub(crate) packed_weight: CudaSlice<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -531,6 +539,7 @@ impl DeepseekMoeRuntimeCache {
         ep_world: usize,
         num_experts: usize,
         num_channels: usize,
+        experts_per_rank: usize,
     ) -> Result<&mut DeepseekNativeDeepEpRuntimeScratch> {
         let capacity_tokens = capacity_tokens.max(1);
         // Worst-case received tokens: every input could be broadcast to every
@@ -540,6 +549,8 @@ impl DeepseekMoeRuntimeCache {
         let ep_world = ep_world.max(1);
         let num_experts = num_experts.max(1);
         let num_channels = num_channels.max(1);
+        let experts_per_rank = experts_per_rank.max(1);
+        let capacity_local_routes = capacity_recv.saturating_mul(topk).max(1);
         let needs_alloc = self
             .native_deepep
             .as_ref()
@@ -551,6 +562,7 @@ impl DeepseekMoeRuntimeCache {
                     || scratch.ep_world != ep_world
                     || scratch.num_experts != num_experts
                     || scratch.num_channels != num_channels
+                    || scratch.experts_per_rank != experts_per_rank
             })
             .unwrap_or(true);
         if needs_alloc {
@@ -562,6 +574,7 @@ impl DeepseekMoeRuntimeCache {
                 ep_world,
                 num_experts,
                 num_channels,
+                experts_per_rank,
                 topk_idx_i64: unsafe {
                     ctx.stream
                         .alloc_traced::<i64>(capacity_tokens.saturating_mul(topk))?
@@ -604,6 +617,16 @@ impl DeepseekMoeRuntimeCache {
                         .alloc_traced::<f32>(capacity_tokens.saturating_mul(topk))?
                 },
                 expert_out: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_recv)? },
+                recv_topk_idx_i32: unsafe {
+                    ctx.stream
+                        .alloc_traced::<i32>(capacity_recv.saturating_mul(topk))?
+                },
+                local_counts: unsafe { ctx.stream.alloc_traced::<i32>(experts_per_rank)? },
+                local_offsets: unsafe { ctx.stream.alloc_traced::<i32>(experts_per_rank)? },
+                local_cursors: unsafe { ctx.stream.alloc_traced::<i32>(experts_per_rank)? },
+                packed_x: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_local_routes)? },
+                packed_token: unsafe { ctx.stream.alloc_traced::<i32>(capacity_local_routes)? },
+                packed_weight: unsafe { ctx.stream.alloc_traced::<f32>(capacity_local_routes)? },
             });
         }
         Ok(self

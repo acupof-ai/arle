@@ -2268,24 +2268,52 @@ impl DeepseekModel {
         let routed = if use_deepep {
             #[cfg(feature = "nccl")]
             {
+                let native_deepep_active = dsv4_native_deepep_enabled()?
+                    && self.layer_communicator.native_deepep().is_some()
+                    && moe_scratch.is_some();
                 let trace = dsv4_trace_begin(&self.ctx)?;
-                let routed = layer.ffn.forward_deepep_routed_gpu(
-                    &self.ctx,
-                    &self.layer_communicator,
-                    layer_idx,
-                    &self.config.spec,
-                    &self.config.ep,
-                    &normed,
-                    tokens,
-                    moe_scratch.as_deref_mut(),
-                )?;
-                dsv4_trace_end(
-                    &self.ctx,
-                    "ffn_deepep_dispatch_combine",
-                    layer_idx,
-                    stream.seq_len,
-                    trace,
-                )?;
+                let routed = if native_deepep_active {
+                    let scratch = moe_scratch
+                        .as_deref_mut()
+                        .expect("DSv4 native-deepep route requires moe scratch (guarded above)");
+                    let routed = layer.ffn.forward_native_deepep_routed_gpu(
+                        &self.ctx,
+                        &self.layer_communicator,
+                        layer_idx,
+                        &self.config.spec,
+                        &self.config.ep,
+                        &normed,
+                        tokens,
+                        scratch,
+                    )?;
+                    dsv4_trace_end(
+                        &self.ctx,
+                        "ffn_native_deepep_dispatch_combine",
+                        layer_idx,
+                        stream.seq_len,
+                        trace,
+                    )?;
+                    routed
+                } else {
+                    let routed = layer.ffn.forward_deepep_routed_gpu(
+                        &self.ctx,
+                        &self.layer_communicator,
+                        layer_idx,
+                        &self.config.spec,
+                        &self.config.ep,
+                        &normed,
+                        tokens,
+                        moe_scratch.as_deref_mut(),
+                    )?;
+                    dsv4_trace_end(
+                        &self.ctx,
+                        "ffn_deepep_dispatch_combine",
+                        layer_idx,
+                        stream.seq_len,
+                        trace,
+                    )?;
+                    routed
+                };
                 routed
             }
             #[cfg(not(feature = "nccl"))]

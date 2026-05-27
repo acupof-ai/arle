@@ -4933,6 +4933,7 @@ impl DeepseekV4MoeBlock {
             ep.world_size,
             config.n_routed_experts,
             num_channels,
+            ep.experts_per_rank,
         )?;
         {
             let (idx_ptr, _g) = route_indices.device_ptr(&ctx.stream);
@@ -4949,47 +4950,48 @@ impl DeepseekV4MoeBlock {
             }
         }
 
-        // Dispatch call.
+        // Dispatch call. Scope the device-pointer guards so the mutable
+        // borrows on scratch.* drop before the post-dispatch FFN reads them.
         let trace = dsv4_moe_trace_begin(ctx)?;
-        let (x_ptr, _gx) = hidden.data.device_ptr(&ctx.stream);
-        let (topk_idx_ptr, _gti) = scratch.topk_idx_i64.device_ptr(&ctx.stream);
-        let (topk_w_ptr, _gtw) = route_weights.device_ptr(&ctx.stream);
-        let (recv_x_ptr, _grx) = scratch.recv_x.data.device_ptr_mut(&ctx.stream);
-        let (recv_src_ptr, _grsrc) = scratch.recv_src_idx.device_ptr_mut(&ctx.stream);
-        let (recv_tki_ptr, _grtki) = scratch.recv_topk_idx.device_ptr_mut(&ctx.stream);
-        let (recv_tkw_ptr, _grtkw) = scratch.recv_topk_w.device_ptr_mut(&ctx.stream);
-        let (rank_pref_ptr, _grp) = scratch.rank_prefix.device_ptr_mut(&ctx.stream);
-        let (recv_chan_ptr, _grc) = scratch.recv_channel_prefix.device_ptr_mut(&ctx.stream);
-        let (send_head_ptr, _gsh) = scratch.send_head.device_ptr_mut(&ctx.stream);
-        let (ntpr_ptr, _gntpr) = scratch.num_tokens_per_rank.device_ptr_mut(&ctx.stream);
-        let (ntpe_ptr, _gntpe) = scratch.num_tokens_per_expert.device_ptr_mut(&ctx.stream);
-        let (titr_ptr, _gtitr) = scratch.is_token_in_rank.device_ptr_mut(&ctx.stream);
-        let (chan_pref_ptr, _gcp) = scratch.channel_prefix_matrix.device_ptr_mut(&ctx.stream);
-
-        let dispatch_params = deepep_sys::DispatchParams {
-            num_tokens: hidden.seq_len as u32,
-            hidden: hidden.hidden_dim as u32,
-            num_topk: config.num_experts_per_tok as u32,
-            num_experts: config.n_routed_experts as u32,
-            num_sms,
-            nvl_chunked_send: 6,
-            nvl_chunked_recv: 256,
-            d_x: x_ptr as usize,
-            d_topk_idx: topk_idx_ptr as usize,
-            d_topk_weights: topk_w_ptr as usize,
-            d_recv_x: recv_x_ptr as usize,
-            d_recv_src_idx: recv_src_ptr as usize,
-            d_recv_topk_idx: recv_tki_ptr as usize,
-            d_recv_topk_weights: recv_tkw_ptr as usize,
-            d_rank_prefix_matrix: rank_pref_ptr as usize,
-            d_recv_channel_prefix: recv_chan_ptr as usize,
-            d_send_head: send_head_ptr as usize,
-            d_num_tokens_per_rank: ntpr_ptr as usize,
-            d_num_tokens_per_expert: ntpe_ptr as usize,
-            d_is_token_in_rank: titr_ptr as usize,
-            d_channel_prefix_matrix: chan_pref_ptr as usize,
-        };
         let num_recv_tokens = {
+            let (x_ptr, _gx) = hidden.data.device_ptr(&ctx.stream);
+            let (topk_idx_ptr, _gti) = scratch.topk_idx_i64.device_ptr(&ctx.stream);
+            let (topk_w_ptr, _gtw) = route_weights.device_ptr(&ctx.stream);
+            let (recv_x_ptr, _grx) = scratch.recv_x.data.device_ptr_mut(&ctx.stream);
+            let (recv_src_ptr, _grsrc) = scratch.recv_src_idx.device_ptr_mut(&ctx.stream);
+            let (recv_tki_ptr, _grtki) = scratch.recv_topk_idx.device_ptr_mut(&ctx.stream);
+            let (recv_tkw_ptr, _grtkw) = scratch.recv_topk_w.device_ptr_mut(&ctx.stream);
+            let (rank_pref_ptr, _grp) = scratch.rank_prefix.device_ptr_mut(&ctx.stream);
+            let (recv_chan_ptr, _grc) = scratch.recv_channel_prefix.device_ptr_mut(&ctx.stream);
+            let (send_head_ptr, _gsh) = scratch.send_head.device_ptr_mut(&ctx.stream);
+            let (ntpr_ptr, _gntpr) = scratch.num_tokens_per_rank.device_ptr_mut(&ctx.stream);
+            let (ntpe_ptr, _gntpe) = scratch.num_tokens_per_expert.device_ptr_mut(&ctx.stream);
+            let (titr_ptr, _gtitr) = scratch.is_token_in_rank.device_ptr_mut(&ctx.stream);
+            let (chan_pref_ptr, _gcp) = scratch.channel_prefix_matrix.device_ptr_mut(&ctx.stream);
+
+            let dispatch_params = deepep_sys::DispatchParams {
+                num_tokens: hidden.seq_len as u32,
+                hidden: hidden.hidden_dim as u32,
+                num_topk: config.num_experts_per_tok as u32,
+                num_experts: config.n_routed_experts as u32,
+                num_sms,
+                nvl_chunked_send: 6,
+                nvl_chunked_recv: 256,
+                d_x: x_ptr as usize,
+                d_topk_idx: topk_idx_ptr as usize,
+                d_topk_weights: topk_w_ptr as usize,
+                d_recv_x: recv_x_ptr as usize,
+                d_recv_src_idx: recv_src_ptr as usize,
+                d_recv_topk_idx: recv_tki_ptr as usize,
+                d_recv_topk_weights: recv_tkw_ptr as usize,
+                d_rank_prefix_matrix: rank_pref_ptr as usize,
+                d_recv_channel_prefix: recv_chan_ptr as usize,
+                d_send_head: send_head_ptr as usize,
+                d_num_tokens_per_rank: ntpr_ptr as usize,
+                d_num_tokens_per_expert: ntpe_ptr as usize,
+                d_is_token_in_rank: titr_ptr as usize,
+                d_channel_prefix_matrix: chan_pref_ptr as usize,
+            };
             let mut guard = nde
                 .buffer
                 .lock()
@@ -5010,15 +5012,222 @@ impl DeepseekV4MoeBlock {
             hidden.seq_len
         );
 
-        // B-3.3.4 (next commit): per-recv-token local-expert FFN + Buffer.combine.
-        // Until that lands, this path is not reachable from production routing —
-        // the caller in weights.rs continues to dispatch through
-        // forward_deepep_routed_gpu when ARLE_DSV4_MOE_BACKEND=native-deepep.
-        let _ = num_recv_tokens;
-        bail!(
-            "native-deepep forward path is dispatch-only; FFN + combine pending B-3.3.4 \
-             (see docs/experience/wins/2026-05-27-native-deepep-boot-B32-pod-verified.md)"
-        );
+        // === post-dispatch local-expert FFN (B-3.3.4) ===
+        let num_recv = num_recv_tokens.max(0) as usize;
+        let recv_slots = num_recv.saturating_mul(config.num_experts_per_tok);
+        let local_expert_start = ep.local_expert_range().start;
+        let local_expert_start_i32 = i32::try_from(local_expert_start)
+            .map_err(|_| anyhow::anyhow!("native-deepep local_expert_start overflows i32"))?;
+        let experts_per_rank_i32 = i32::try_from(ep.experts_per_rank)
+            .map_err(|_| anyhow::anyhow!("native-deepep experts_per_rank overflows i32"))?;
+
+        // Zero expert_out (accumulator across local experts per recv token).
+        if num_recv > 0 {
+            let len = num_recv.saturating_mul(hidden.hidden_dim);
+            ctx.stream
+                .memset_zeros(&mut scratch.expert_out.data.slice_mut(0..len))
+                .map_err(|err| anyhow::anyhow!("native-deepep expert_out memset failed: {err}"))?;
+        }
+
+        let mut counts_host: Vec<i32> = vec![0; ep.experts_per_rank];
+        let mut offsets_host: Vec<i32> = vec![0; ep.experts_per_rank];
+        let mut total_local_routes: usize = 0;
+
+        if recv_slots > 0 {
+            // Cast recv_topk_idx i64 → i32 for our existing kernels.
+            {
+                let (src_ptr, _g0) = scratch.recv_topk_idx.device_ptr(&ctx.stream);
+                let (dst_ptr, _g1) = scratch.recv_topk_idx_i32.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_cast_i64_to_i32_cuda(
+                        src_ptr as *const i64,
+                        dst_ptr as *mut i32,
+                        recv_slots as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("native-deepep recv_topk_idx i64→i32 cast failed: {err}")
+                    })?;
+                }
+            }
+            // Zero local_counts (count kernel uses atomicAdd).
+            ctx.stream
+                .memset_zeros(&mut scratch.local_counts)
+                .map_err(|err| {
+                    anyhow::anyhow!("native-deepep local_counts memset failed: {err}")
+                })?;
+            // Count local-expert hits across recv tokens.
+            {
+                let (idx_ptr, _g0) = scratch.recv_topk_idx_i32.device_ptr(&ctx.stream);
+                let (cnt_ptr, _g1) = scratch.local_counts.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_count_local_experts_cuda(
+                        idx_ptr as *const i32,
+                        cnt_ptr as *mut i32,
+                        num_recv as i32,
+                        config.num_experts_per_tok as i32,
+                        local_expert_start_i32,
+                        experts_per_rank_i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("native-deepep recv local-count failed: {err}")
+                    })?;
+                }
+            }
+            counts_host = ctx
+                .stream
+                .clone_dtoh(&scratch.local_counts)
+                .map_err(|err| anyhow::anyhow!("native-deepep local_counts D2H failed: {err}"))?;
+            offsets_host.clear();
+            offsets_host.reserve(ep.experts_per_rank);
+            for &c in &counts_host {
+                ensure!(c >= 0, "native-deepep negative local count {c}");
+                offsets_host.push(
+                    i32::try_from(total_local_routes)
+                        .map_err(|_| anyhow::anyhow!("native-deepep offset overflows i32"))?,
+                );
+                total_local_routes += c as usize;
+            }
+        }
+
+        // Pack + per-expert FFN + scatter into expert_out (weighted accumulate).
+        if total_local_routes > 0 {
+            ctx.stream
+                .memcpy_htod(&offsets_host, &mut scratch.local_offsets)
+                .map_err(|err| anyhow::anyhow!("native-deepep local_offsets H2D failed: {err}"))?;
+            ctx.stream
+                .memset_zeros(&mut scratch.local_cursors)
+                .map_err(|err| {
+                    anyhow::anyhow!("native-deepep local_cursors memset failed: {err}")
+                })?;
+            {
+                let (recv_x_ptr, _g0) = scratch.recv_x.data.device_ptr(&ctx.stream);
+                let (recv_idx_ptr, _g1) = scratch.recv_topk_idx_i32.device_ptr(&ctx.stream);
+                let (recv_w_ptr, _g2) = scratch.recv_topk_w.device_ptr(&ctx.stream);
+                let (offsets_ptr, _g3) = scratch.local_offsets.device_ptr(&ctx.stream);
+                let (cursors_ptr, _g4) = scratch.local_cursors.device_ptr_mut(&ctx.stream);
+                let (packed_x_ptr, _g5) = scratch.packed_x.data.device_ptr_mut(&ctx.stream);
+                let (packed_tok_ptr, _g6) = scratch.packed_token.device_ptr_mut(&ctx.stream);
+                let (packed_w_ptr, _g7) = scratch.packed_weight.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_pack_local_experts_cuda(
+                        recv_x_ptr as *const ffi::Half,
+                        recv_idx_ptr as *const i32,
+                        recv_w_ptr as *const f32,
+                        offsets_ptr as *const i32,
+                        cursors_ptr as *mut i32,
+                        packed_x_ptr as *mut ffi::Half,
+                        packed_tok_ptr as *mut i32,
+                        packed_w_ptr as *mut f32,
+                        num_recv as i32,
+                        hidden.hidden_dim as i32,
+                        config.num_experts_per_tok as i32,
+                        local_expert_start_i32,
+                        experts_per_rank_i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| anyhow::anyhow!("native-deepep recv pack failed: {err}"))?;
+                }
+            }
+
+            for (local_expert_idx, expert) in self.experts.iter().enumerate() {
+                let count = counts_host[local_expert_idx];
+                if count <= 0 {
+                    continue;
+                }
+                let count_usize = count as usize;
+                let offset = offsets_host[local_expert_idx] as usize;
+                let elem_start = offset * hidden.hidden_dim;
+                let elem_end = elem_start + count_usize * hidden.hidden_dim;
+
+                let mut expert_input = HiddenStates::zeros(ctx, hidden.hidden_dim, count_usize)?;
+                {
+                    let src = scratch.packed_x.data.slice(elem_start..elem_end);
+                    ctx.stream
+                        .memcpy_dtod(&src, &mut expert_input.data)
+                        .map_err(|err| {
+                            anyhow::anyhow!("native-deepep packed→expert input D2D failed: {err}")
+                        })?;
+                }
+                let expert_out_slice = expert.forward(ctx, &expert_input, config.swiglu_limit)?;
+
+                // Scatter weighted expert output into expert_out[packed_token[i]] rows.
+                let (exp_ptr, _g0) = expert_out_slice.data.device_ptr(&ctx.stream);
+                let (out_ptr, _g1) = scratch.expert_out.data.device_ptr_mut(&ctx.stream);
+                let (tok_ptr, _g2) = scratch.packed_token.device_ptr(&ctx.stream);
+                let (w_ptr, _g3) = scratch.packed_weight.device_ptr(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_scatter_packed_expert_cuda(
+                        exp_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        tok_ptr as *const i32,
+                        w_ptr as *const f32,
+                        offsets_host[local_expert_idx],
+                        count,
+                        hidden.hidden_dim as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("native-deepep recv expert scatter failed: {err}")
+                    })?;
+                }
+            }
+        }
+
+        // === Buffer.combine — sum per-rank expert_out back to source tokens ===
+        let trace = dsv4_moe_trace_begin(ctx)?;
+        let mut combined_x = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
+        {
+            let (eo_ptr, _g0) = scratch.expert_out.data.device_ptr(&ctx.stream);
+            let (rtkw_ptr, _g1) = scratch.recv_topk_w.device_ptr(&ctx.stream);
+            let (rsrc_ptr, _g2) = scratch.recv_src_idx.device_ptr(&ctx.stream);
+            let (rpref_ptr, _g3) = scratch.rank_prefix.device_ptr(&ctx.stream);
+            let (rchan_ptr, _g4) = scratch.recv_channel_prefix.device_ptr(&ctx.stream);
+            let (shead_ptr, _g5) = scratch.send_head.device_ptr(&ctx.stream);
+            let (cx_ptr, _g6) = combined_x.data.device_ptr_mut(&ctx.stream);
+            let (ctkw_ptr, _g7) = scratch.combined_topk_w.device_ptr_mut(&ctx.stream);
+            let combine_params = deepep_sys::CombineParams {
+                num_input_tokens: num_recv as u32,
+                num_output_tokens: hidden.seq_len as u32,
+                hidden: hidden.hidden_dim as u32,
+                num_topk: config.num_experts_per_tok as u32,
+                num_sms,
+                nvl_chunked_send: 6,
+                nvl_chunked_recv: 256,
+                d_x: eo_ptr as usize,
+                d_topk_weights: rtkw_ptr as usize,
+                d_recv_src_idx: rsrc_ptr as usize,
+                d_rank_prefix_matrix: rpref_ptr as usize,
+                d_recv_channel_prefix: rchan_ptr as usize,
+                d_send_head: shead_ptr as usize,
+                d_combined_x: cx_ptr as usize,
+                d_combined_topk_w: ctkw_ptr as usize,
+            };
+            let mut guard = nde
+                .buffer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native-deepep buffer mutex poisoned (combine)"))?;
+            guard
+                .combine(&combine_params)
+                .map_err(|err| anyhow::anyhow!("native-deepep combine failed: {err}"))?;
+        }
+        dsv4_moe_trace_end(
+            ctx,
+            "ffn_native_deepep_combine",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        Ok(DeepseekRoutedMoeOutput {
+            hidden: combined_x,
+            ready: None,
+        })
     }
 
     #[cfg(test)]

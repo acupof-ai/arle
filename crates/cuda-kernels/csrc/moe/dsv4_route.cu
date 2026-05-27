@@ -1382,3 +1382,25 @@ extern "C" CUresult dsv4_cast_i32_to_i64_cuda(
       src, dst, n);
   return (CUresult)cudaGetLastError();
 }
+
+__global__ void dsv4_cast_i64_to_i32_kernel(
+    const int64_t *__restrict__ src,
+    int32_t *__restrict__ dst,
+    int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+  dst[idx] = static_cast<int32_t>(src[idx]);
+}
+
+extern "C" CUresult dsv4_cast_i64_to_i32_cuda(
+    const int64_t *src,
+    int32_t *dst,
+    int n,
+    CUstream stream) {
+  if (n < 0) return CUDA_ERROR_INVALID_VALUE;
+  if (n == 0) return CUDA_SUCCESS;
+  int grid = (n + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK;
+  dsv4_cast_i64_to_i32_kernel<<<grid, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      src, dst, n);
+  return (CUresult)cudaGetLastError();
+}
