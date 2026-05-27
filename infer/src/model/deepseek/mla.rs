@@ -11,6 +11,8 @@
 use anyhow::Result;
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
 
 /// Optional compressor sub-block for CSA/HCA layers.
 #[cfg(feature = "cuda")]
@@ -43,6 +45,12 @@ pub(super) struct DeepseekV4Attention {
     pub(super) wo_a: DeviceMatrix,
     pub(super) wo_b: DeviceMatrix,
     pub(super) attn_sink: DeviceVec,
+    /// f32 mirror of `attn_sink` for FlashMLA SM90 sparse prefill, which
+    /// requires `float[h_q]` (vendor/flashmla/csrc/params.h:153). Same
+    /// length as `attn_sink` (full TP-replicated `[num_attention_heads]`);
+    /// FlashMLA dispatch offsets by `tp.rank * local_heads` into this
+    /// buffer. Populated once at model load via `arle_bf16_to_f32_cuda`.
+    pub(super) attn_sink_f32: CudaSlice<f32>,
     pub(super) compressor: Option<DeepseekV4Compressor>,
     pub(super) indexer: Option<DeepseekV4Indexer>,
 }
