@@ -1907,23 +1907,28 @@ impl DeepseekModel {
                                 anyhow::anyhow!("FlashMLA TP packed Q scratch alloc failed: {err}",)
                             })?
                     };
-                    use cudarc::driver::{DevicePtr, DevicePtrMut};
-                    let (gathered_ptr, _gg) = gathered.device_ptr(&self.ctx.stream);
-                    let (packed_ptr, _gp) = packed.device_ptr_mut(&self.ctx.stream);
-                    unsafe {
-                        ffi::dsv4_tp_q_repack_cuda(
-                            gathered_ptr as *const ffi::Half,
-                            packed_ptr as *mut ffi::Half,
-                            tp_world as i32,
-                            token_count as i32,
-                            local_heads as i32,
-                            head_dim as i32,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()
-                        .map_err(|err| {
-                            anyhow::anyhow!("DSv4 FlashMLA TP Q repack failed: {err}")
-                        })?;
+                    // Scope the borrow on `gathered` + `packed` so the SyncOnDrop
+                    // guards release before we move the buffers into the Option
+                    // owners below.
+                    {
+                        use cudarc::driver::{DevicePtr, DevicePtrMut};
+                        let (gathered_ptr, _gg) = gathered.device_ptr(&self.ctx.stream);
+                        let (packed_ptr, _gp) = packed.device_ptr_mut(&self.ctx.stream);
+                        unsafe {
+                            ffi::dsv4_tp_q_repack_cuda(
+                                gathered_ptr as *const ffi::Half,
+                                packed_ptr as *mut ffi::Half,
+                                tp_world as i32,
+                                token_count as i32,
+                                local_heads as i32,
+                                head_dim as i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DSv4 FlashMLA TP Q repack failed: {err}")
+                            })?;
+                        }
                     }
                     let full_out_len = token_count * global_heads * head_dim;
                     let full_out = unsafe {
