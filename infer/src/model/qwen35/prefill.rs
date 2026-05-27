@@ -2113,6 +2113,62 @@ impl Qwen35Model {
                 )?;
                 Ok(())
             }
+            KVFormat::INT4 => {
+                // PoC: KIVI per-channel K + per-(row, head) V, both packed 4-bit
+                // (2 nibbles per byte). Parallel to TQ4 but uses KIVI scaling
+                // instead of Hadamard rotation for outlier handling.
+                let static_scales_ptr = pool
+                    .k_static_scales_ptr(full_idx, stream)
+                    .expect("KIVI per-channel K must be allocated for INT4");
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        cudarc::driver::sys::CUdeviceptr::from(static_scales_ptr),
+                        0,
+                        num_kv_heads * head_dim * std::mem::size_of::<f32>(),
+                        stream.cu_stream(),
+                    )
+                    .ok();
+                }
+                kv_quant::compute_k_per_channel_absmax(
+                    &self.ctx,
+                    pool.k_work_ptr(stream),
+                    static_scales_ptr,
+                    &bufs.metadata.token_rows_gpu,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )?;
+                kv_quant::finalize_k_per_channel_scales_int4(
+                    &self.ctx,
+                    static_scales_ptr,
+                    num_kv_heads * head_dim,
+                )?;
+                pool.k_kivi_calibrated[full_idx].store(true, std::sync::atomic::Ordering::Release);
+                kv_quant::quantize_paged_kv_int4_per_channel(
+                    &self.ctx,
+                    pool.k_work_ptr(stream),
+                    pool.k_data_ptr(full_idx, stream),
+                    static_scales_ptr,
+                    &bufs.metadata.token_rows_gpu,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )?;
+                kv_quant::quantize_paged_kv_single_int4(
+                    &self.ctx,
+                    pool.v_work_ptr(stream),
+                    pool.v_data_ptr(full_idx, stream),
+                    pool.v_scales_ptr(full_idx, stream),
+                    &bufs.metadata.token_rows_gpu,
+                    num_kv_heads,
+                    head_dim,
+                    pool.kv_dim,
+                    token_count,
+                )?;
+                Ok(())
+            }
             _ => Ok(()),
         }
     }

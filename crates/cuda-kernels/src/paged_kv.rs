@@ -361,7 +361,13 @@ impl TokenKVPool {
             format,
         );
 
-        let pool_bytes_per_layer = max_total_tokens * kv_dim * bpe;
+        // INT4 packs 2 nibbles per byte → kv_dim/2 actual bytes per token.
+        // Other formats: kv_dim * bpe bytes per token.
+        let pool_bytes_per_layer = if matches!(format, KVFormat::INT4) {
+            max_total_tokens * kv_dim.div_ceil(2)
+        } else {
+            max_total_tokens * kv_dim * bpe
+        };
         let scale_elements = max_total_tokens * num_kv_heads;
 
         let mut k_data = Vec::new();
@@ -458,7 +464,9 @@ impl TokenKVPool {
         // FP8 reuses the same two-phase reduction scratch layout as INT8.
         let num_splits = 32;
         let (int8_attn_workspace, int8_attn_workspace_bytes) =
-            if matches!(format, KVFormat::INT8 | KVFormat::FP8E4M3) && pool_bytes_per_layer > 0 {
+            if matches!(format, KVFormat::INT8 | KVFormat::FP8E4M3 | KVFormat::INT4)
+                && pool_bytes_per_layer > 0
+            {
                 let ws_bytes = decode_attention_int8_workspace_bytes(
                     num_slots,
                     num_kv_heads * (head_dim / 128).max(1) * 4, // approximate max q_heads
@@ -499,7 +507,9 @@ impl TokenKVPool {
         // INT8 still used per-(token, head) absmax. See
         // docs/plans/2026-05-27-int8-kv-kivi-per-channel.md.
         let (k_static_scales, k_kivi_calibrated) =
-            if matches!(format, KVFormat::FP8E4M3 | KVFormat::INT8) && pool_bytes_per_layer > 0 {
+            if matches!(format, KVFormat::FP8E4M3 | KVFormat::INT8 | KVFormat::INT4)
+                && pool_bytes_per_layer > 0
+            {
                 let channels = num_kv_heads * head_dim;
                 let mut buf = Vec::with_capacity(num_layers);
                 let mut latches = Vec::with_capacity(num_layers);
@@ -516,9 +526,11 @@ impl TokenKVPool {
                 (None, Vec::new())
             };
 
-        // Legacy dtype mapping
+        // Legacy dtype mapping. INT4 falls back to BF16 contig (PoC has no
+        // contig INT4 storage; prefill stages K/V in bf16 work buffer then
+        // packs to INT4 in the pool).
         let dtype = match format {
-            KVFormat::BF16 => KVCacheDtype::BF16,
+            KVFormat::BF16 | KVFormat::INT4 => KVCacheDtype::BF16,
             KVFormat::FP8E4M3 | KVFormat::INT8 | KVFormat::TurboQuant { .. } => KVCacheDtype::INT8,
         };
 

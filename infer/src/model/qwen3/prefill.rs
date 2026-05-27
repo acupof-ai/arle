@@ -1290,6 +1290,7 @@ impl Qwen3Model {
                     prefix_token_count,
                 )
             }
+            KVFormat::INT4 => unreachable!("INT4 KV not wired for qwen3 prefill (PoC qwen35-only)"),
             KVFormat::TurboQuant { .. } => {
                 anyhow::bail!("Qwen3 paged prefill does not support TurboQuant KV prefix refill")
             }
@@ -1531,6 +1532,7 @@ impl Qwen3Model {
                     token_count,
                 )
             }
+            KVFormat::INT4 => unreachable!("INT4 KV not wired for qwen3 prefill (PoC qwen35-only)"),
             KVFormat::TurboQuant { .. } => {
                 anyhow::bail!("Qwen3 paged prefill does not support TurboQuant KV finalization")
             }

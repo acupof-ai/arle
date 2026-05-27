@@ -351,6 +351,162 @@ pub fn quantize_paged_kv_int8_per_channel(
     Ok(())
 }
 
+/// INT4 KIVI calibration step 2: divide accumulated absmax by 7 (INT4
+/// symmetric max). Same idempotent guarantee as the INT8/FP8 siblings.
+pub fn finalize_k_per_channel_scales_int4(
+    ctx: &DeviceContext,
+    k_static_scales_ptr: u64,
+    num_channels: usize,
+) -> Result<()> {
+    if num_channels == 0 {
+        return Ok(());
+    }
+    unsafe {
+        ffi::finalize_k_per_channel_scales_int4_cuda(
+            k_static_scales_ptr as *mut f32,
+            num_channels as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// INT4 KIVI per-channel K quantize (4-bit packed, 2 nibbles per byte).
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_paged_kv_int4_per_channel(
+    ctx: &DeviceContext,
+    kv_bf16_ptr: u64,
+    kv_int4_packed_ptr: u64,
+    k_static_scales_ptr: u64,
+    new_token_indices_gpu: &CudaSlice<i32>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    batch_size: usize,
+) -> Result<()> {
+    if batch_size == 0 {
+        return Ok(());
+    }
+    let mut offset = 0usize;
+    while offset < batch_size {
+        let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
+        let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
+        let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::quantize_paged_kv_int4_per_channel_cuda(
+                kv_bf16_ptr as *const ffi::Half,
+                kv_int4_packed_ptr as *mut u8,
+                k_static_scales_ptr as *const f32,
+                nti_ptr as *const i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dim as i32,
+                chunk_tokens as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        offset += chunk_tokens;
+    }
+    Ok(())
+}
+
+/// INT4 V quantize (per-(row, head) absmax, /7, 4-bit packed). Mirrors
+/// [`quantize_paged_kv_single`] but with 4-bit packed storage.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_paged_kv_single_int4(
+    ctx: &DeviceContext,
+    kv_bf16_ptr: u64,
+    kv_int4_packed_ptr: u64,
+    scales_ptr: u64,
+    new_token_indices_gpu: &CudaSlice<i32>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    batch_size: usize,
+) -> Result<()> {
+    if batch_size == 0 {
+        return Ok(());
+    }
+    let mut offset = 0usize;
+    while offset < batch_size {
+        let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
+        let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
+        let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::quantize_paged_kv_single_int4_cuda(
+                kv_bf16_ptr as *const ffi::Half,
+                kv_int4_packed_ptr as *mut u8,
+                scales_ptr as *mut f32,
+                nti_ptr as *const i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dim as i32,
+                chunk_tokens as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        offset += chunk_tokens;
+    }
+    Ok(())
+}
+
+/// INT4 KIVI decode attention (4-bit packed K/V, unpack on-the-fly).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_attention_int4_per_channel_k(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k_data_packed_ptr: u64,
+    v_data_packed_ptr: u64,
+    k_static_scales_ptr: u64,
+    v_scales_ptr: u64,
+    kv_indices: &CudaSlice<i32>,
+    kv_meta: &CudaSlice<i32>,
+    o: &mut HiddenStates,
+    batch_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    sm_scale: f32,
+    workspace: &CudaSlice<u8>,
+    workspace_bytes: usize,
+) -> Result<()> {
+    if batch_size == 0 {
+        return Ok(());
+    }
+    let (q_ptr, _g1) = q.data.device_ptr(&ctx.stream);
+    let (ki_ptr, _g2) = kv_indices.device_ptr(&ctx.stream);
+    let (ip_ptr, _g3) = kv_meta.device_ptr(&ctx.stream);
+    let (o_ptr, _g4) = o.data.device_ptr_mut(&ctx.stream);
+    let (ws_ptr, _g5) = workspace.device_ptr(&ctx.stream);
+    unsafe {
+        ffi::decode_attention_int4_per_channel_k_cuda(
+            q_ptr as *const ffi::Half,
+            k_data_packed_ptr as *const u8,
+            v_data_packed_ptr as *const u8,
+            k_static_scales_ptr as *const f32,
+            v_scales_ptr as *const f32,
+            ki_ptr as *const i32,
+            ip_ptr as *const i32,
+            o_ptr as *mut ffi::Half,
+            batch_size as i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            kv_dim as i32,
+            sm_scale,
+            ctx.stream.cu_stream(),
+            ws_ptr as *mut u8,
+            workspace_bytes,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Quantize + scatter contiguous bf16 KV → FP8 paged pool (for prefill→pool migration).
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_scatter_kv_fp8(
