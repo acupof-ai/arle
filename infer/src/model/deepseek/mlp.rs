@@ -1194,12 +1194,13 @@ fn dsv4_expert_backend() -> Result<Dsv4ExpertBackend> {
             "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => {
                 return Ok(Dsv4ExpertBackend::Native);
             }
-            "native-deepep" | "native_deepep" => bail!(
-                "ARLE_DSV4_MOE_BACKEND=native-deepep is reserved for the upcoming sidecar \
-                 transport but is not yet wired through LayerCommunicator. Use `deepep` (default) \
-                 or `allreduce` until phase 1.1.7 lands. Track: docs/plans/2026-05-26-dsv4-\
-                 deepep-process-per-rank.md"
-            ),
+            // Phase B-3.2 — native-deepep boots a real Buffer at model
+            // construction (see weights.rs dsv4_native_deepep_enabled).
+            // Expert backend selection matches the default deepep path
+            // (DeepGemmAuto) because the forward shape is identical —
+            // the only difference is dispatch/combine transport, which
+            // is plugged in B-3.3.
+            "native-deepep" | "native_deepep" => return Ok(Dsv4ExpertBackend::DeepGemmAuto),
             other => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{other}`"),
         }
     };
