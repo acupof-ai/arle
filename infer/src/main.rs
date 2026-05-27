@@ -479,10 +479,29 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                                 }
                             })
                             .ok();
-                        let req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
+                        let mut req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
                             wire,
                             delta_tx,
                         );
+                        // Phase B-1 commit C.4.6.4 — attach NCCL-backed
+                        // DistributedRequestCoordination so worker rank R's
+                        // synchronize_token participates in the cross-rank
+                        // broadcast_i32 collective. Group is the worker's
+                        // own model.ep_nccl, exposed via SchedulerHandle::
+                        // ep_nccl (populated by spawn_scheduler_handle_
+                        // from_path in C.4.6.2).
+                        if let Some(nccl) = handle.ep_nccl() {
+                            match infer::scheduler::DistributedRequestCoordination::new_nccl(
+                                rank, world_size, nccl,
+                            ) {
+                                Ok(coord) => req.distributed = Some(coord),
+                                Err(err) => {
+                                    log::warn!(
+                                        "[arle-worker rank={rank}] new_nccl failed for req#{req_id}: {err:#}"
+                                    );
+                                }
+                            }
+                        }
                         match handle.reserve_submission() {
                             Ok(permit) => {
                                 if permit.submit(req).is_err() {
