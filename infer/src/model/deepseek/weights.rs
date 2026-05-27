@@ -1768,11 +1768,22 @@ impl DeepseekModel {
             //   crates/cuda-kernels/csrc/misc/arle_flashmla_csa_prep.cu
             //   crates/cuda-kernels/csrc/misc/dsv4_tp_attention_repack.cu
             //   crates/cuda-kernels/vendor/flashmla (sgl-project/FlashMLA @ df022eb)
+            // Conservative total-position gate: V2.1 ≤24K passes clean
+            // (4K/16K/24K probes), >24K hits a CUDA_ERROR_ILLEGAL_ADDRESS in
+            // shared CSA+HCA infrastructure (kv_unified pack or TP-AllGather).
+            // Root-cause still pending. This gate keeps FlashMLA opt-in for
+            // the safe window so the future default-on flip can land without
+            // re-triggering the >24K crash. The 24576 boundary matches the
+            // largest validated probe (24K = 21333 tokens) padded to the
+            // nearest 8K alignment.
+            const FLASHMLA_TOTAL_POSITION_LIMIT: usize = 24576;
+            let total_position_after = start_pos + token_count;
             let (sm_major, _sm_minor) = self.ctx.compute_capability();
             let use_flashmla = sm_major == 9
                 && (mode_int == 1 || mode_int == 2)
                 && token_count > 1
                 && (head_dim == 512 || head_dim == 576)
+                && total_position_after <= FLASHMLA_TOTAL_POSITION_LIMIT
                 && dsv4_flashmla_prefill_enabled()?;
             if use_flashmla {
                 let tp_world = self.config.tp.world_size;
