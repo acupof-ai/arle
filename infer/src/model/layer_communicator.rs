@@ -54,6 +54,13 @@ pub struct LayerCommunicator {
     ep_nccl: Option<Arc<NcclGroup>>,
     #[cfg(feature = "nccl")]
     ep_overlap_nccl: Option<Arc<NcclGroup>>,
+    /// Phase B-3.2 — native DeepEP `Buffer` booted when
+    /// `ARLE_DSV4_MOE_BACKEND=native-deepep`. Lives alongside the EP
+    /// NCCL group so forward-path callers reach the Buffer from the
+    /// same LayerCommunicator they already use for NCCL collectives.
+    /// `None` for the legacy NCCL-DeepEP-style path.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    native_deepep: Option<Arc<crate::native_deepep::NativeDeepEp>>,
 }
 
 impl LayerCommunicator {
@@ -73,6 +80,8 @@ impl LayerCommunicator {
             ep_nccl: None,
             #[cfg(feature = "nccl")]
             ep_overlap_nccl: None,
+            #[cfg(all(feature = "cuda", feature = "nccl"))]
+            native_deepep: None,
         }
     }
 
@@ -126,6 +135,8 @@ impl LayerCommunicator {
             ep_nccl: None,
             #[cfg(feature = "nccl")]
             ep_overlap_nccl: None,
+            #[cfg(all(feature = "cuda", feature = "nccl"))]
+            native_deepep: None,
         })
     }
 
@@ -237,6 +248,24 @@ impl LayerCommunicator {
     #[cfg(feature = "nccl")]
     pub fn ep_nccl(&self) -> Option<Arc<NcclGroup>> {
         self.ep_nccl.clone()
+    }
+
+    /// Phase B-3.2 builder — attach a pre-booted `NativeDeepEp` to this
+    /// LayerCommunicator. Constructed at model boot when the env-var
+    /// `ARLE_DSV4_MOE_BACKEND=native-deepep` is set; otherwise stays
+    /// `None` and forward falls back to the NCCL-DeepEP-style path.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    #[must_use]
+    pub fn with_native_deepep(mut self, nde: Arc<crate::native_deepep::NativeDeepEp>) -> Self {
+        self.native_deepep = Some(nde);
+        self
+    }
+
+    /// Returns the booted `NativeDeepEp` if one was attached via
+    /// `with_native_deepep`.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn native_deepep(&self) -> Option<Arc<crate::native_deepep::NativeDeepEp>> {
+        self.native_deepep.clone()
     }
 
     pub fn is_single_rank(&self) -> bool {

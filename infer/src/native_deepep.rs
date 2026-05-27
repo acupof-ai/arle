@@ -29,6 +29,15 @@ pub struct NativeDeepEp {
     pub buffer: Arc<Mutex<Buffer>>,
 }
 
+impl std::fmt::Debug for NativeDeepEp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeDeepEp")
+            .field("rank", &self.rank)
+            .field("world_size", &self.world_size)
+            .finish_non_exhaustive()
+    }
+}
+
 impl NativeDeepEp {
     /// Boot a `Buffer` at this rank, exchange IPC handles with peers
     /// via the provided NCCL group's all_gather_bytes, then `Buffer::

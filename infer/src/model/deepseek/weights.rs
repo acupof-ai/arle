@@ -236,6 +236,26 @@ impl DeepseekModel {
                     )?);
                     comm = comm.with_ep_overlap_nccl(overlap_group)?;
                 }
+
+                // Phase B-3.2 — boot the native-DeepEP Buffer when the
+                // env-var selects native-deepep. Boots once per model
+                // construction (= once per rank scheduler). Reuses the
+                // EP NCCL group for IPC handle exchange via
+                // `all_gather_bytes`, so no separate rendezvous.
+                if dsv4_native_deepep_enabled()? {
+                    let ep_nccl = comm.ep_nccl().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "ARLE_DSV4_MOE_BACKEND=native-deepep requires an EP NCCL \
+                             group (ep.world_size > 1)"
+                        )
+                    })?;
+                    let nde = crate::native_deepep::NativeDeepEp::boot(
+                        config.ep.rank as u32,
+                        config.ep.world_size as u32,
+                        &ep_nccl,
+                    )?;
+                    comm = comm.with_native_deepep(nde);
+                }
             }
         }
 
@@ -3986,18 +4006,31 @@ fn dsv4_moe_deepep_enabled() -> Result<bool> {
         "" | "deepep" | "dispatch" | "dispatch_combine" | "deepep_unsafe" | "unsafe_deepep"
         | "dispatch_unsafe" => Ok(true),
         "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => Ok(false),
-        // `native-deepep` is the in-progress sidecar transport (phase 1.1
-        // production scaffolding landed; LayerCommunicator wire-in pending).
-        // Reserve the name so users get an explicit error instead of a
-        // silent fallback to the NCCL DeepEP-style default.
-        "native-deepep" | "native_deepep" => bail!(
-            "ARLE_DSV4_MOE_BACKEND=native-deepep is reserved for the upcoming sidecar transport \
-             but is not yet wired through LayerCommunicator. Use `deepep` (default) or \
-             `allreduce` until phase 1.1.7 lands. Track: docs/plans/2026-05-26-dsv4-deepep-\
-             process-per-rank.md"
-        ),
+        // Phase B-3.2 — native-deepep now boots a real DeepEP Buffer
+        // via crates/deepep-sys (see dsv4_native_deepep_enabled below).
+        // The forward-path replacement (Buffer::dispatch + local experts
+        // + Buffer::combine, B-3.3) is still pending — until it lands,
+        // the actual dispatch/combine code path is the legacy NCCL
+        // DeepEP-style fallback even when this returns true. The Buffer
+        // boot itself proves the NativeDeepEp::boot → Buffer::sync
+        // round-trip on the production model-load path.
+        "native-deepep" | "native_deepep" => Ok(true),
         _ => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{raw}`"),
     }
+}
+
+/// Phase B-3.2 — returns true when the user asked for the native-DeepEP
+/// transport via `ARLE_DSV4_MOE_BACKEND=native-deepep`. Drives whether
+/// `layer_communicator_from_config` boots a `NativeDeepEp` Buffer.
+#[cfg(feature = "cuda")]
+fn dsv4_native_deepep_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_MOE_BACKEND").ok() else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "native-deepep" | "native_deepep"
+    ))
 }
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
