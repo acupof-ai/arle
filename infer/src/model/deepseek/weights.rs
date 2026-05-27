@@ -1734,37 +1734,110 @@ impl DeepseekModel {
                 deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse => 1,
                 deepseek_spec::DeepSeekV4AttentionMode::HybridCompressed => 2,
             };
-            unsafe {
-                ffi::dsv4_hybrid_attention_cuda(
-                    q_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    window_ptr as *mut ffi::Half,
-                    compressed_ptr,
-                    selected_ptr,
-                    sink_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    head_dim as i32,
-                    self.config.sliding_window as i32,
-                    start_pos as i32,
-                    (self.config.tp.rank * local_heads) as i32,
-                    1.0 / (head_dim as f32).sqrt(),
-                    self.config.qk_rope_head_dim as i32,
-                    rope_base,
-                    original_seq_len as i32,
-                    rope_params.factor,
-                    rope_params.beta_fast,
-                    rope_params.beta_slow,
-                    mode_int,
-                    compress_ratio as i32,
-                    compressed_count as i32,
-                    self.config.index_topk as i32,
-                    i32::from(fuse_window_update),
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU attention failed: {err}"))?;
+
+            // FlashMLA SM90 sparse prefill (opt-in via ARLE_DSV4_FLASHMLA_PREFILL=1).
+            // V1 scope: CSA mode (mode_int == 1) only, token_count > 1 only, head_dim
+            // ∈ {512, 576}. Falls back to the existing hand-rolled
+            // dsv4_hybrid_attention_kernel for decode (token_count == 1),
+            // unsupported head_dim, or modes != CSA.
+            //
+            // V1 limitations (v2 follow-up):
+            //   - Sliding-window contribution is NOT included — FlashMLA's
+            //     sparse-prefill kernel attends to a single KV pool. For
+            //     long-context prefill the sliding-window is a small
+            //     recency add vs the top-512 compressed selection, so
+            //     dropping it changes early-token quality only.
+            //   - attn_sink (bf16 in ARLE) is passed as nullptr because
+            //     FlashMLA wants float[h_q]. A persistent f32 mirror at
+            //     model load is the cleanest fix; deferred to v2.
+            //
+            // Refs:
+            //   docs/experience/errors/2026-05-27-dsv4-grouped-gemm-marginal-prefill-kernel-not-blocker.md
+            //   crates/cuda-kernels/csrc/misc/arle_flashmla_shim.cu
+            //   crates/cuda-kernels/vendor/flashmla (sgl-project/FlashMLA @ df022eb)
+            let use_flashmla = mode_int == 1
+                && token_count > 1
+                && (head_dim == 512 || head_dim == 576)
+                && dsv4_flashmla_prefill_enabled()?;
+            if use_flashmla {
+                // h_kv = 1 (MLA shares K across heads). indices stride =
+                // selected_topk; kv stride = head_dim. h_kv axis is degenerate
+                // so its strides are 0 (no row stride within a single h_kv).
+                let h_kv: i32 = 1;
+                let topk_i32 = self.config.index_topk as i32;
+                let stride_q_s_q = (local_heads * head_dim) as i32;
+                let stride_q_h_q = head_dim as i32;
+                let stride_kv_s_kv = head_dim as i32;
+                let stride_kv_h_kv = 0_i32;
+                let stride_indices_s_q = topk_i32;
+                let stride_indices_h_kv = 0_i32;
+                // num_sm = 0 lets FlashMLA's launcher use the device default
+                // (param is consulted only by paths that split across SMs).
+                let num_sm = 0_i32;
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                let res = unsafe {
+                    ffi::arle_flashmla_sm90_sparse_prefill_fwd(
+                        q_ptr as *const ffi::Half,
+                        compressed_ptr,
+                        selected_ptr,
+                        std::ptr::null(), // attn_sink (v1: NULL, see comment above)
+                        std::ptr::null(), // topk_length (v1: full selected_topk per row)
+                        out_ptr as *mut ffi::Half,
+                        std::ptr::null_mut(),    // max_logits (unused)
+                        std::ptr::null_mut(),    // lse (unused)
+                        token_count as i32,      // s_q
+                        compressed_count as i32, // s_kv
+                        local_heads as i32,      // h_q
+                        h_kv,
+                        head_dim as i32, // d_qk
+                        head_dim as i32, // d_v (MLA: same as d_qk for the 512 dim)
+                        topk_i32,
+                        scale,
+                        stride_q_s_q,
+                        stride_q_h_q,
+                        stride_kv_s_kv,
+                        stride_kv_h_kv,
+                        stride_indices_s_q,
+                        stride_indices_h_kv,
+                        num_sm,
+                        self.ctx.stream.cu_stream(),
+                    )
+                };
+                res.result()
+                    .map_err(|err| anyhow::anyhow!("DeepSeek V4 FlashMLA prefill failed: {err}"))?;
+            } else {
+                unsafe {
+                    ffi::dsv4_hybrid_attention_cuda(
+                        q_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        compressed_ptr,
+                        selected_ptr,
+                        sink_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        self.config.sliding_window as i32,
+                        start_pos as i32,
+                        (self.config.tp.rank * local_heads) as i32,
+                        1.0 / (head_dim as f32).sqrt(),
+                        self.config.qk_rope_head_dim as i32,
+                        rope_base,
+                        original_seq_len as i32,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        mode_int,
+                        compress_ratio as i32,
+                        compressed_count as i32,
+                        self.config.index_topk as i32,
+                        i32::from(fuse_window_update),
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU attention failed: {err}"))?;
+                }
             }
             drop(compressed_guard);
             drop(selected_guard);
@@ -4119,6 +4192,27 @@ fn dsv4_fuse_qk_prep_enabled() -> Result<bool> {
         "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
         "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
         _ => bail!("invalid ARLE_DSV4_FUSE_QK_PREP value `{raw}`"),
+    }
+}
+
+/// Opt-in route DSv4 CSA-mode prefill attention through the vendored
+/// FlashMLA SM90 sparse prefill kernel (replaces the per-token
+/// `dsv4_hybrid_attention_kernel` for `token_count > 1` only).
+///
+/// Default OFF — gives a clean A/B against the existing kernel. The
+/// existing path is per-(token, head) grid; FlashMLA tiles M=Q-tokens
+/// per block with WGMMA, which is the structural fix for the
+/// 282-second 29K-token-prefill measured in `2026-05-27-dsv4-
+/// grouped-gemm-marginal-prefill-kernel-not-blocker.md`.
+#[cfg(feature = "cuda")]
+fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_FLASHMLA_PREFILL").ok() else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => bail!("invalid ARLE_DSV4_FLASHMLA_PREFILL value `{raw}`"),
     }
 }
 
