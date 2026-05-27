@@ -1768,8 +1768,8 @@ impl DeepseekModel {
             //   crates/cuda-kernels/csrc/misc/arle_flashmla_csa_prep.cu
             //   crates/cuda-kernels/csrc/misc/dsv4_tp_attention_repack.cu
             //   crates/cuda-kernels/vendor/flashmla (sgl-project/FlashMLA @ df022eb)
-            // Empirical V2 gate — restrict FlashMLA to the ONE shape that has
-            // produced a clean response end-to-end (chunk-1 of a chunked-prefill
+            // V2 default-on gate — FlashMLA fires for the ONE shape that has
+            // produced a clean end-to-end response (chunk-1 of a chunked-prefill
             // 29K probe: 16384 tokens, finish_reason="length", 8 tokens out).
             // All other observed shapes (4017, 14250, 12515 etc.) trigger an
             // async TMA descriptor init failure (CUDA error 700) at the next
@@ -1777,17 +1777,17 @@ impl DeepseekModel {
             // hypothesis was unverified by inspection — FlashMLA's TMA-Q box
             // dim along s_q is 1 (per phase1.cuh:46-89), so 64-alignment of
             // token_count shouldn't matter from kernel logic alone. Real
-            // root cause is deferred to a fresh investigation pass (V2.3
-            // follow-up).
+            // root cause is deferred to V2.3 (s_q padding).
             //
-            // Practical effect of this gate: with default chunked_prefill_size
-            // = 16384, only the first chunk of a chunked-prefill request enters
-            // FlashMLA. Single-chunk prompts (<16384 tokens) and all chunk-2+
+            // Practical effect: with default chunked_prefill_size = 16384,
+            // FlashMLA fires only on the FIRST chunk of a chunked-prefill
+            // request. Single-chunk prompts (<16384 tokens) and all chunk-2+
             // chunks fall back to legacy. Decode (token_count == 1) always
             // legacy.
             //
-            // Env knob `ARLE_DSV4_FLASHMLA_PREFILL=1` remains opt-in; default
-            // OFF until V2.3 lands.
+            // Default ON (env knob `ARLE_DSV4_FLASHMLA_PREFILL` defaults to
+            // true). Override with `=0` to force legacy for the chunk-1
+            // boundary too.
             const FLASHMLA_VERIFIED_S_Q: usize = 16384;
             const FLASHMLA_TOTAL_POSITION_LIMIT: usize = 24576;
             let total_position_after = start_pos + token_count;
@@ -4562,15 +4562,21 @@ fn build_attn_sink_f32_mirror(
 /// FlashMLA SM90 sparse prefill kernel (replaces the per-token
 /// `dsv4_hybrid_attention_kernel` for `token_count > 1` only).
 ///
-/// Default OFF — gives a clean A/B against the existing kernel. The
-/// existing path is per-(token, head) grid; FlashMLA tiles M=Q-tokens
-/// per block with WGMMA, which is the structural fix for the
-/// 282-second 29K-token-prefill measured in `2026-05-27-dsv4-
-/// grouped-gemm-marginal-prefill-kernel-not-blocker.md`.
+/// Default ON — FlashMLA SM90 sparse prefill fires for the strict gate
+/// (`token_count == 16384`, SM 9.x, head_dim ∈ {512, 576},
+/// `start_pos + token_count <= 24576`). Outside that envelope the dispatch
+/// falls back to the legacy per-(token, head) grid. FlashMLA tiles M=Q-tokens
+/// per block with WGMMA, which is the structural fix for the 282-second
+/// 29K-token-prefill measured in `2026-05-27-dsv4-grouped-gemm-marginal-
+/// prefill-kernel-not-blocker.md`.
+///
+/// Override with `ARLE_DSV4_FLASHMLA_PREFILL=0` to force legacy even for
+/// the chunk-1 boundary (for A/B benching or to isolate FlashMLA-induced
+/// regressions).
 #[cfg(feature = "cuda")]
 fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_FLASHMLA_PREFILL").ok() else {
-        return Ok(false);
+        return Ok(true);
     };
     match raw.as_str() {
         "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
