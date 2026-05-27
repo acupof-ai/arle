@@ -41,7 +41,7 @@ held-out validation point) — student_rollout vs n_gen:
 | 8   | 6.5  | 2.45 s  | 0.38 s/tok | 2.43 s  | 0.02 s |
 | 16  | 14.5 | 6.30 s  | 0.43 s/tok | 6.58 s  | 0.28 s |
 | 32  | 30.5 | 19.26 s | 0.63 s/tok | 18.66 s | 0.60 s |
-| **64**  | **64**   | **61.93 s** (step 1, held-out) | **0.97 s/tok** | **60.39 s** | **1.54 s (2.5%)** |
+| **64**  | **64**   | **60.73 s** (held-out)         | **0.95 s/tok** | **60.39 s** | **0.34 s (0.5%)** |
 | 128 | 130  | 208 s   | 1.60 s/tok | 207 s   | 1 s |
 
 The rollout=64 point was added 2026-05-28 tick 12 as held-out
