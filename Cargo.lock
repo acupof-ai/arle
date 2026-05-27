@@ -918,6 +918,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepep-sys"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "cc",
+ "libc",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "deepseek-spec"
 version = "0.1.5"
 dependencies = [
@@ -1794,6 +1804,7 @@ dependencies = [
  "crossbeam-queue",
  "cuda-kernels",
  "cudarc",
+ "deepep-sys",
  "deepseek-spec",
  "fastrace",
  "futures",

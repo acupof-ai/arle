@@ -10,9 +10,9 @@ use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
-    GenerationState, ModelForward, PrefillBatchRequest, SchedulerRuntimeWorkspaceBudget,
-    SpecVerifyOutput, SpecVerifyRequest, decode_metadata_page_capacity,
-    prepare_paged_prefill_batch,
+    GenerationState, MixedBatchOutcome, MixedBatchRequest, ModelForward, PrefillBatchRequest,
+    SchedulerRuntimeWorkspaceBudget, SpecVerifyOutput, SpecVerifyRequest,
+    decode_metadata_page_capacity, prepare_paged_prefill_batch,
 };
 use crate::model_arch::ModelArchInfo;
 use crate::model_registry::ModelArch;
@@ -68,7 +68,7 @@ impl Qwen35State {
         }
     }
 
-    fn drop_paged_prefill(&mut self) {
+    pub(super) fn drop_paged_prefill(&mut self) {
         self.clear_prefill_logits();
         self.paged_prefill = None;
     }
@@ -378,7 +378,7 @@ impl ModelForward for Qwen35Model {
     }
 
     fn max_concurrent_prefill_requests(&self) -> Option<usize> {
-        Some(1)
+        Some(2)
     }
 
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
@@ -456,6 +456,27 @@ impl ModelForward for Qwen35Model {
 
     fn prefill_uses_paged_pool(&self) -> bool {
         true
+    }
+
+    fn supports_mixed_batch(&self, kv_pool_format: crate::model::kv_cache::KVFormat) -> bool {
+        !self.uses_marlin_w4a8() && matches!(kv_pool_format, crate::model::kv_cache::KVFormat::BF16)
+    }
+
+    fn forward_mixed_batch(
+        &self,
+        batch: MixedBatchRequest<'_>,
+        states: &mut [Self::State],
+        paged_kv_pool: Option<&mut PagedKVPool>,
+        decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<MixedBatchOutcome> {
+        match paged_kv_pool {
+            Some(pool) if pool.is_active() => {
+                self.forward_mixed_batch_paged(batch, states, pool, decode_ctx)
+            }
+            _ => Ok(MixedBatchOutcome::Fallback(
+                crate::model::MixedBatchFallbackReason::InactivePagedPool,
+            )),
+        }
     }
 
     fn supports_cross_slot_prefix_attach(&self) -> bool {

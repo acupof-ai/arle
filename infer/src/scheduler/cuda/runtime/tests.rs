@@ -8,12 +8,14 @@ mod tests {
         DeferredWaitingRequest, PrefixAdmissionPlan, QueuedAdmissionCandidate, WaitingInsertBias,
         WaitingRequestHint, best_reusable_slot_for_radix_hit, choose_session_affinity_candidate,
         finish_rejected_request, insert_deferred_waiting_request,
-        insert_waiting_request_by_priority, lookup_blocks_ready_on_gpu,
-        matched_sealed_lookup_blocks, session_affinity_tokens_for_plan,
-        staged_prefix_direct_host_blocks, staged_prefix_prefetch_state,
+        insert_waiting_request_by_priority, is_active_long_prefill_lane, is_long_uncached_prefill,
+        lookup_blocks_ready_on_gpu, matched_sealed_lookup_blocks,
+        resolved_long_prefill_active_limit, session_affinity_tokens_for_plan,
+        staged_prefix_direct_host_blocks, staged_prefix_prefetch_state, uncached_prefill_tokens,
     };
     use crate::kv_tier::{HostPinnedRegion, ReadmissionBlock, ReadmissionPlan, ReadmissionSource};
     use crate::prefix_cache::BlockId;
+    use crate::scheduler::cuda::Phase;
     use crate::scheduler::cuda::budget::{PageBudget, estimated_request_target};
     use crate::scheduler::cuda::core::{PrefetchTicketState, is_full_sealed_prefix};
     use crate::scheduler::{IncomingRequest, RequestPriority};
@@ -443,6 +445,37 @@ mod tests {
         ];
 
         assert_eq!(choose_session_affinity_candidate(&candidates), Some(0));
+    }
+
+    #[test]
+    fn long_prefill_active_limit_clamps_to_slots_and_preserves_none() {
+        assert_eq!(resolved_long_prefill_active_limit(16, Some(4)), Some(4));
+        assert_eq!(resolved_long_prefill_active_limit(2, Some(4)), Some(2));
+        assert_eq!(resolved_long_prefill_active_limit(16, None), None);
+    }
+
+    #[test]
+    fn long_prefill_classification_uses_uncached_tokens() {
+        assert_eq!(uncached_prefill_tokens(4096, 1024), 3072);
+        assert_eq!(uncached_prefill_tokens(512, 1024), 0);
+        assert!(is_long_uncached_prefill(4096, 0, 2048));
+        assert!(!is_long_uncached_prefill(4096, 3072, 2048));
+    }
+
+    #[test]
+    fn long_prefill_lane_limit_counts_prefill_and_decode_lifetime() {
+        let prefill = Phase::Prefilling {
+            effective_tokens: vec![1; 4096],
+            progress: 2048,
+        };
+        assert!(is_active_long_prefill_lane(&prefill, 4096, 0, 4096));
+        assert!(is_active_long_prefill_lane(&Phase::Decoding, 4096, 0, 4096));
+        assert!(!is_active_long_prefill_lane(
+            &Phase::WaitingFetch,
+            4096,
+            0,
+            4096
+        ));
     }
 
     #[test]

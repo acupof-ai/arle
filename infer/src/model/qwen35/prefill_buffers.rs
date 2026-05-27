@@ -500,6 +500,31 @@ impl PagedPrefillBuffers35 {
         self.seq_len == seq_len && self.page_size == page_size
     }
 
+    pub(super) fn set_active_seq_len(&mut self, seq_len: usize) {
+        debug_assert!(seq_len <= self.seq_len);
+        self.hidden.seq_len = seq_len;
+        self.hidden_next.seq_len = seq_len;
+        self.normed.seq_len = seq_len;
+        self.q_full.seq_len = seq_len;
+        self.k_attn.seq_len = seq_len;
+        self.v_attn.seq_len = seq_len;
+        self.q_prepped.seq_len = seq_len;
+        self.attn_out_full.seq_len = seq_len;
+        self.qkv.seq_len = seq_len;
+        self.z.seq_len = seq_len;
+        self.b_proj.seq_len = seq_len;
+        self.a_proj.seq_len = seq_len;
+        self.qkv_conv.seq_len = seq_len;
+        self.gdr_out.seq_len = seq_len;
+        self.normed_gated.seq_len = seq_len;
+        self.attn_results.seq_len = seq_len;
+        self.hidden_mid.seq_len = seq_len;
+        self.gate_out.seq_len = seq_len;
+        self.up_out.seq_len = seq_len;
+        self.act_out.seq_len = seq_len;
+        self.mlp_out.seq_len = seq_len;
+    }
+
     pub(super) fn invalidate_graph(&mut self) {
         self.graph_state = CudaGraphState::new();
     }

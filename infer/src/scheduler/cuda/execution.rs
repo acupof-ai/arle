@@ -19,6 +19,35 @@ fn logical_scheduler_shadow_enabled() -> bool {
     })
 }
 
+fn scheduler_plan_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("INFER_SCHEDULER_PLAN_TRACE")
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Ok("1" | "true" | "yes" | "on")
+        )
+    })
+}
+
+fn coalesce_tiny_prefill_tail(
+    remaining_tokens: usize,
+    prefill_token_cap: usize,
+    tiny_tail_limit: usize,
+) -> usize {
+    let capped = remaining_tokens.min(prefill_token_cap);
+    if capped == 0 || capped >= remaining_tokens {
+        return capped;
+    }
+    if remaining_tokens.saturating_sub(capped) <= tiny_tail_limit.max(1) {
+        remaining_tokens
+    } else {
+        capped
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PrefillReservation {
     pub prefill_tokens: usize,
@@ -293,6 +322,7 @@ fn select_prefill_candidates(
     selected
 }
 
+#[cfg(test)]
 fn cap_prefill_candidates_by_tokens(
     candidates: Vec<PrefillCandidate>,
     token_budget: usize,
@@ -446,7 +476,9 @@ impl<M: ModelForward> Scheduler<M> {
             return None;
         }
 
-        let prefill_tokens = remaining_tokens.min(prefill_token_cap);
+        let tiny_tail_limit = self.paged_kv_pool.page_size.max(1);
+        let prefill_tokens =
+            coalesce_tiny_prefill_tail(remaining_tokens, prefill_token_cap, tiny_tail_limit);
         let first_decode_token = if prefill_tokens >= remaining_tokens {
             usize::from(self.remaining_decode_reservation_tokens(slot_idx) > 0)
         } else {
@@ -505,10 +537,33 @@ impl<M: ModelForward> Scheduler<M> {
         candidates: &[PrefillCandidate],
         decode_slots: &[usize],
     ) -> Vec<PrefillCandidate> {
-        cap_prefill_candidates_by_tokens(
-            self.select_launch_prefill_candidates(candidates, decode_slots),
-            self.config.mixed_prefill_token_budget(decode_slots.len()),
-        )
+        let mut remaining_tokens = self.config.mixed_prefill_token_budget(decode_slots.len());
+        if remaining_tokens == 0 {
+            return Vec::new();
+        }
+
+        let mut budget = PrefillBudget::from_scheduler_for_decode_slots(self, decode_slots);
+        let mut selected = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let token_cap = candidate.reservation.prefill_tokens.min(remaining_tokens);
+            let Some(reservation) = self.capped_prefill_reservation(candidate.slot_idx, token_cap)
+            else {
+                continue;
+            };
+            if !budget.can_schedule(reservation) {
+                continue;
+            }
+            budget.reserve(reservation);
+            remaining_tokens = remaining_tokens.saturating_sub(reservation.prefill_tokens);
+            selected.push(PrefillCandidate {
+                slot_idx: candidate.slot_idx,
+                reservation,
+            });
+            if remaining_tokens == 0 {
+                break;
+            }
+        }
+        selected
     }
 
     fn collect_prefill_candidates(
@@ -549,12 +604,28 @@ impl<M: ModelForward> Scheduler<M> {
         let mut budget = PrefillBudget::from_scheduler(self);
         let scored_candidates = self.collect_prefill_candidates(&budget);
         let candidates = select_prefill_candidates(&mut budget, scored_candidates);
+        let trace_plans = scheduler_plan_trace_enabled();
         if has_decode {
+            let mixed_available = self.config.mixed_policy.allows_mixed()
+                && self.model.supports_mixed_batch(self.paged_kv_pool.format);
+            if self.deferred_decode_emit.is_some() && (candidates.is_empty() || !mixed_available) {
+                if trace_plans {
+                    info!(
+                        "scheduler plan trace: plan=decode reason=deferred_decode_emit active={} waiting={} running_decode={} prefill_queue={} selected_prefill=0",
+                        self.active_len(),
+                        self.waiting.len(),
+                        self.running_batch
+                            .iter()
+                            .filter(|&&slot_idx| self.slot_is_runnable_decode(slot_idx))
+                            .count(),
+                        self.prefill_queue.len(),
+                    );
+                }
+                return StepPlan::Decode;
+            }
             let plan = if candidates.is_empty() {
                 StepPlan::Decode
-            } else if self.config.mixed_policy.allows_mixed()
-                && self.model.supports_mixed_batch(self.paged_kv_pool.format)
-            {
+            } else if mixed_available {
                 StepPlan::Mixed(candidates)
             } else if self.config.short_prompt_bypass_tokens > 0
                 && candidates.iter().all(|candidate| {
@@ -571,6 +642,21 @@ impl<M: ModelForward> Scheduler<M> {
                 // real single-launch mixed lowering yet.
                 StepPlan::Split(candidates)
             };
+            if trace_plans {
+                info!(
+                    "scheduler plan trace: plan={} reason=decode_active active={} waiting={} running_decode={} prefill_queue={} selected_prefill={} selected_tokens={}",
+                    plan.label(),
+                    self.active_len(),
+                    self.waiting.len(),
+                    self.running_batch
+                        .iter()
+                        .filter(|&&slot_idx| self.slot_is_runnable_decode(slot_idx))
+                        .count(),
+                    self.prefill_queue.len(),
+                    plan.scheduled_prefill_rows(),
+                    plan.scheduled_prefill_tokens(),
+                );
+            }
             let spec_allowed = self.config.spec_enabled && self.deferred_decode_emit.is_none();
             return route_spec_plan(spec_allowed, self.config.spec_draft_k, plan);
         }
@@ -579,6 +665,17 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             StepPlan::Prefill(candidates)
         };
+        if trace_plans {
+            info!(
+                "scheduler plan trace: plan={} reason=no_decode active={} waiting={} running_decode=0 prefill_queue={} selected_prefill={} selected_tokens={}",
+                plan.label(),
+                self.active_len(),
+                self.waiting.len(),
+                self.prefill_queue.len(),
+                plan.scheduled_prefill_rows(),
+                plan.scheduled_prefill_tokens(),
+            );
+        }
         let spec_allowed = self.config.spec_enabled && self.deferred_decode_emit.is_none();
         route_spec_plan(spec_allowed, self.config.spec_draft_k, plan)
     }
@@ -1012,8 +1109,9 @@ mod tests {
     use super::{
         CandidatePlan, GpuCommand, PrefillBudget, PrefillCandidate, PrefillCandidateScore,
         PrefillReservation, PreparedHostMetadata, ScoredPrefillCandidate, StepPlan,
-        cap_prefill_candidates_by_tokens, reserve_decode_headroom_for_slots, route_spec_plan,
-        score_prefill_candidates, select_prefill_candidates,
+        cap_prefill_candidates_by_tokens, coalesce_tiny_prefill_tail,
+        reserve_decode_headroom_for_slots, route_spec_plan, score_prefill_candidates,
+        select_prefill_candidates,
     };
     use crate::scheduler::cuda::budget::{PageBudget, PageGrowth, StepTokenBudget};
 
@@ -1033,6 +1131,14 @@ mod tests {
             .into_iter()
             .map(|candidate| candidate.slot_idx)
             .collect()
+    }
+
+    #[test]
+    fn prefill_reservation_coalesces_page_sized_tail() {
+        assert_eq!(coalesce_tiny_prefill_tail(4097, 2048, 16), 2048);
+        assert_eq!(coalesce_tiny_prefill_tail(2049, 2048, 16), 2049);
+        assert_eq!(coalesce_tiny_prefill_tail(2065, 2048, 16), 2048);
+        assert_eq!(coalesce_tiny_prefill_tail(0, 2048, 16), 0);
     }
 
     #[test]

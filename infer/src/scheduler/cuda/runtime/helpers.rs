@@ -1,5 +1,5 @@
 use super::super::core::PrefetchTicketState;
-use super::super::{CompletionStreamDelta, FinishReason, TokenUsage};
+use super::super::{CompletionStreamDelta, FinishReason, Phase, TokenUsage};
 use crate::kv_tier::ReadmissionSource;
 
 #[derive(Clone)]
@@ -193,6 +193,35 @@ pub(super) fn choose_session_affinity_candidate(
                 && candidate.hint.session_affinity_tokens > 0
         })
         .or(Some(0))
+}
+
+pub(super) fn resolved_long_prefill_active_limit(
+    max_slots: usize,
+    configured: Option<usize>,
+) -> Option<usize> {
+    configured.map(|limit| limit.min(max_slots).max(1))
+}
+
+pub(super) fn uncached_prefill_tokens(prompt_tokens: usize, reusable_tokens: usize) -> usize {
+    prompt_tokens.saturating_sub(reusable_tokens)
+}
+
+pub(super) fn is_long_uncached_prefill(
+    prompt_tokens: usize,
+    reusable_tokens: usize,
+    long_prefill_token_threshold: usize,
+) -> bool {
+    uncached_prefill_tokens(prompt_tokens, reusable_tokens) >= long_prefill_token_threshold
+}
+
+pub(super) fn is_active_long_prefill_lane(
+    phase: &Phase,
+    prompt_tokens: usize,
+    reusable_tokens: usize,
+    long_prefill_token_threshold: usize,
+) -> bool {
+    matches!(phase, Phase::Prefilling { .. } | Phase::Decoding)
+        && is_long_uncached_prefill(prompt_tokens, reusable_tokens, long_prefill_token_threshold)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

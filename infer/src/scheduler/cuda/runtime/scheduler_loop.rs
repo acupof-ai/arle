@@ -8,8 +8,9 @@ use super::super::budget::{PageBudget, estimated_request_target};
 use super::super::nvtx_scopes::nvtx_scope;
 use super::super::{ModelForward, Phase, STATS_LOG_INTERVAL, Scheduler, error, info};
 use super::helpers::{
-    DeferredWaitingRequest, WaitingInsertBias, choose_session_affinity_candidate,
-    insert_deferred_waiting_request,
+    DeferredWaitingRequest, QueuedAdmissionCandidate, WaitingInsertBias,
+    choose_session_affinity_candidate, insert_deferred_waiting_request,
+    is_active_long_prefill_lane, is_long_uncached_prefill, resolved_long_prefill_active_limit,
 };
 
 impl<M: ModelForward> Scheduler<M> {
@@ -238,6 +239,11 @@ impl<M: ModelForward> Scheduler<M> {
         let mut candidates =
             self.collect_admission_candidates(&available_free_slots, &mut deferred_waiting);
         let mut admission_budget = PageBudget::from_scheduler(self, self.paged_kv_pool.is_active());
+        let long_prefill_active_limit = resolved_long_prefill_active_limit(
+            self.config.max_slots,
+            self.config.long_prefill_active_limit,
+        );
+        let mut long_prefill_active = self.long_prefill_active_admission_count();
         for (slot_idx, req) in self.active.iter().enumerate() {
             let Some(req) = req.as_ref() else {
                 continue;
@@ -256,6 +262,25 @@ impl<M: ModelForward> Scheduler<M> {
             let candidate_idx = choose_session_affinity_candidate(&candidates)
                 .expect("candidate list is non-empty");
             let candidate = candidates.remove(candidate_idx);
+            let candidate_is_long_prefill =
+                self.candidate_needs_long_prefill_active_limit(&candidate);
+            if let Some(limit) = long_prefill_active_limit
+                && candidate_is_long_prefill
+                && long_prefill_active >= limit
+            {
+                self.maybe_prefetch_staged_prefix(&candidate.plan);
+                self.release_admission_plan(&candidate.plan);
+                insert_deferred_waiting_request(
+                    &mut deferred_waiting,
+                    DeferredWaitingRequest {
+                        incoming: candidate.incoming,
+                        prompt_tokens: candidate.prompt_tokens,
+                        hint: candidate.hint,
+                    },
+                    WaitingInsertBias::BeforeEqual,
+                );
+                continue;
+            }
             let Some((slot_idx, reusable_prefix_len, reusable_cached_prompt_len)) =
                 Self::choose_admission_slot(&candidate.plan, &available_free_slots)
             else {
@@ -319,8 +344,38 @@ impl<M: ModelForward> Scheduler<M> {
                 reusable_prefix_len,
                 reusable_cached_prompt_len,
             );
+            if candidate_is_long_prefill {
+                long_prefill_active += 1;
+            }
         }
         self.restore_deferred_waiting_requests(deferred_waiting);
+    }
+
+    fn long_prefill_active_admission_count(&self) -> usize {
+        self.active
+            .iter()
+            .flatten()
+            .filter(|req| {
+                !matches!(req.phase, Phase::Finished)
+                    && is_active_long_prefill_lane(
+                        &req.phase,
+                        req.prompt_tokens.len(),
+                        req.reusable_prefix_len,
+                        self.config.long_prefill_token_threshold,
+                    )
+            })
+            .count()
+    }
+
+    fn candidate_needs_long_prefill_active_limit(
+        &self,
+        candidate: &QueuedAdmissionCandidate,
+    ) -> bool {
+        is_long_uncached_prefill(
+            candidate.prompt_tokens.len(),
+            candidate.hint.total_reuse_tokens,
+            self.config.long_prefill_token_threshold,
+        )
     }
 
     /// Find all free slot indices.

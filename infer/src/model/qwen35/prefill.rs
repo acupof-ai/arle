@@ -1,8 +1,9 @@
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
+use super::batch_decode::BatchDecodeBuffers35;
 use super::forward::Qwen35State;
 use super::prefill_buffers::{GdrChunkwiseScratch35, PagedPrefillBuffers35};
 use super::recurrent_state::RecurrentState;
@@ -12,6 +13,9 @@ use super::weights::{
 };
 use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::{KVCache, KVFormat};
+use crate::model::{
+    MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, PrefillBatchRequest,
+};
 use crate::ops;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::{TokenKVPool, ffi, kv_quant};
@@ -36,6 +40,21 @@ fn qwen35_cuda_debug_sync(ctx: &DeviceContext, label: impl AsRef<str>) -> Result
             .with_context(|| format!("CUDA debug sync after {label}"))?;
     }
     Ok(())
+}
+
+fn mixed_prefill_seq_indptr(prefills: &[PrefillBatchRequest<'_>]) -> Result<Vec<i32>> {
+    let mut indptr = Vec::with_capacity(prefills.len() + 1);
+    let mut offset = 0usize;
+    indptr.push(0);
+    for prefill in prefills {
+        ensure!(
+            !prefill.tokens.is_empty(),
+            "qwen35 mixed prefill row must not be empty"
+        );
+        offset += prefill.tokens.len();
+        indptr.push(offset as i32);
+    }
+    Ok(indptr)
 }
 
 pub(super) struct Qwen35PagedPrefillRequest<'a> {
@@ -409,6 +428,665 @@ impl Qwen35Model {
             state.recurrent_state.seq_len += request.tokens.len();
         }
 
+        Ok(())
+    }
+
+    pub(super) fn forward_mixed_batch_paged(
+        &self,
+        batch: MixedBatchRequest<'_>,
+        states: &mut [Qwen35State],
+        pool: &mut TokenKVPool,
+        decode_ctx: &mut BatchDecodeBuffers35,
+    ) -> Result<MixedBatchOutcome> {
+        let decode_rows = batch.decode_tokens.len();
+        let prefill_rows = batch.prefills.len();
+        if decode_rows == 0 {
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::EmptyDecodeBatch,
+            ));
+        }
+        if decode_rows != batch.decode_slot_indices.len() {
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::DecodeSlotCountMismatch,
+            ));
+        }
+        if prefill_rows == 0 {
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::EmptyPrefillBatch,
+            ));
+        }
+        if prefill_rows != batch.prefill_start_positions.len() {
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::PrefillStartPositionCountMismatch,
+            ));
+        }
+        if pool.page_size != 16 || pool.format != KVFormat::BF16 {
+            return Ok(MixedBatchOutcome::Fallback(
+                MixedBatchFallbackReason::UnsupportedKvFormat,
+            ));
+        }
+
+        let mut prefill_slot_indices = Vec::with_capacity(prefill_rows);
+        for (prefill, &start_pos) in batch.prefills.iter().zip(batch.prefill_start_positions) {
+            if prefill.tokens.is_empty() {
+                return Ok(MixedBatchOutcome::Fallback(
+                    MixedBatchFallbackReason::EmptyPrefillTokens,
+                ));
+            }
+            if batch.decode_slot_indices.contains(&prefill.slot_idx) {
+                return Ok(MixedBatchOutcome::Fallback(
+                    MixedBatchFallbackReason::PrefillSlotInDecodeBatch,
+                ));
+            }
+            if prefill_slot_indices.contains(&prefill.slot_idx) {
+                return Ok(MixedBatchOutcome::Fallback(
+                    MixedBatchFallbackReason::DuplicatePrefillSlot,
+                ));
+            }
+            if pool.seq_len(prefill.slot_idx) != start_pos {
+                return Ok(MixedBatchOutcome::Fallback(
+                    MixedBatchFallbackReason::PrefillSeqLenMismatch,
+                ));
+            }
+            prefill_slot_indices.push(prefill.slot_idx);
+        }
+
+        let required_pages: usize = batch
+            .prefills
+            .iter()
+            .map(|prefill| pool.append_pages_needed(prefill.slot_idx, prefill.tokens.len()))
+            .sum();
+        if required_pages > pool.free_page_count() {
+            anyhow::bail!(
+                "qwen35 mixed prefill needs {required_pages} free pages, only {} available",
+                pool.free_page_count()
+            );
+        }
+
+        for &slot_idx in batch.decode_slot_indices {
+            states[slot_idx].drop_paged_prefill();
+        }
+        for prefill in batch.prefills {
+            states[prefill.slot_idx].drop_paged_prefill();
+            pool.cow_tail_page_for_append(&self.ctx, prefill.slot_idx)?;
+            pool.alloc_tokens(prefill.slot_idx, prefill.tokens.len())?;
+        }
+
+        let decode_token_rows: Vec<[u32; 1]> =
+            batch.decode_tokens.iter().map(|&token| [token]).collect();
+        let total_tokens = decode_rows
+            + batch
+                .prefills
+                .iter()
+                .map(|prefill| prefill.tokens.len())
+                .sum::<usize>();
+        let mut combined_requests = Vec::with_capacity(decode_rows + prefill_rows);
+        let mut packed_tokens = Vec::with_capacity(total_tokens);
+        for (row, &slot_idx) in batch.decode_slot_indices.iter().enumerate() {
+            packed_tokens.push(batch.decode_tokens[row]);
+            combined_requests.push(Qwen35PagedPrefillRequest {
+                tokens: &decode_token_rows[row],
+                slot: slot_idx,
+            });
+        }
+        for prefill in batch.prefills {
+            packed_tokens.extend_from_slice(prefill.tokens);
+            combined_requests.push(Qwen35PagedPrefillRequest {
+                tokens: prefill.tokens,
+                slot: prefill.slot_idx,
+            });
+        }
+
+        let (sequences, page_indices) =
+            self.build_paged_prefill_sequences(&combined_requests, pool)?;
+        let mut batch_guard = self.ensure_paged_prefill_batch(total_tokens, pool.page_size)?;
+        let bufs = batch_guard
+            .as_mut()
+            .expect("paged prefill batch buffers initialized");
+        let metadata_reallocated = bufs.metadata.update(
+            &self.ctx,
+            &packed_tokens,
+            &page_indices,
+            &sequences,
+            pool.page_size,
+        )?;
+        if metadata_reallocated {
+            bufs.invalidate_graph();
+        }
+        bufs.set_active_seq_len(total_tokens);
+        decode_ctx.upload_mixed_token_ids_with_handoff(
+            &self.ctx,
+            &mut bufs.metadata.token_ids_gpu,
+            batch.decode_tokens,
+            batch.decode_slot_indices,
+            batch.prefills,
+        )?;
+        self.prepare_mixed_decode_recurrent_ptrs(batch.decode_slot_indices, states, decode_ctx)?;
+        self.forward_mixed_batch_paged_kernels(
+            decode_rows,
+            batch.prefills,
+            states,
+            pool,
+            &sequences,
+            bufs,
+            decode_ctx,
+        )?;
+
+        let vocab_size = self.output_projection().rows;
+        let decode_logits = decode_ctx.ensure_logits_batch(&self.ctx, vocab_size)?;
+        let kept_rows = decode_rows + prefill_rows;
+        self.compact_mixed_final_rows(&mut bufs.normed, decode_rows, batch.prefills)?;
+        bufs.normed.seq_len = kept_rows;
+        decode_logits.seq_len = kept_rows;
+        ops::gemm_into(
+            &self.ctx,
+            self.output_projection(),
+            &bufs.normed,
+            decode_logits,
+        );
+
+        for (i, prefill) in batch.prefills.iter().enumerate() {
+            let state = &mut states[prefill.slot_idx];
+            if state.base.prefill_logits.is_none() {
+                state.base.prefill_logits = Some(DeviceVec::zeros(&self.ctx, vocab_size)?);
+            }
+            ops::extract_vec_into(
+                &self.ctx,
+                decode_logits,
+                decode_rows + i,
+                state
+                    .base
+                    .prefill_logits
+                    .as_mut()
+                    .expect("qwen35 mixed prefill logits allocated"),
+            )?;
+            state.recurrent_state.seq_len += prefill.tokens.len();
+        }
+        decode_logits.seq_len = decode_rows;
+        bufs.set_active_seq_len(total_tokens);
+
+        Ok(MixedBatchOutcome::Executed)
+    }
+
+    fn prepare_mixed_decode_recurrent_ptrs(
+        &self,
+        decode_slot_indices: &[usize],
+        states: &mut [Qwen35State],
+        decode_ctx: &mut BatchDecodeBuffers35,
+    ) -> Result<()> {
+        let decode_rows = decode_slot_indices.len();
+        let mut linear_idx = 0usize;
+        for layer in &self.layers {
+            if matches!(layer.attn, LayerKind::LinearAttention(_)) {
+                for (row, &slot_idx) in decode_slot_indices.iter().enumerate() {
+                    let layer_state = &mut states[slot_idx].recurrent_state.layers[linear_idx];
+                    let (conv_ptr, _) =
+                        layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
+                    let (gdr_ptr, _) = layer_state.state.device_ptr_mut(&self.ctx.stream);
+                    decode_ctx.recurrent.conv_state_ptrs_host[row] = conv_ptr;
+                    decode_ctx.recurrent.gdr_state_ptrs_host[row] = gdr_ptr;
+                }
+                self.ctx
+                    .stream
+                    .memcpy_htod(
+                        &decode_ctx.recurrent.conv_state_ptrs_host[..decode_rows],
+                        &mut decode_ctx.recurrent.conv_state_ptrs_per_layer[linear_idx],
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("H2D qwen35 mixed conv ptrs layer {linear_idx}: {e}")
+                    })?;
+                self.ctx
+                    .stream
+                    .memcpy_htod(
+                        &decode_ctx.recurrent.gdr_state_ptrs_host[..decode_rows],
+                        &mut decode_ctx.recurrent.gdr_state_ptrs_per_layer[linear_idx],
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("H2D qwen35 mixed gdr ptrs layer {linear_idx}: {e}")
+                    })?;
+                linear_idx += 1;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_mixed_batch_paged_kernels(
+        &self,
+        decode_rows: usize,
+        prefills: &[PrefillBatchRequest<'_>],
+        states: &mut [Qwen35State],
+        pool: &TokenKVPool,
+        sequences: &[ops::PagedPrefillSequence],
+        bufs: &mut PagedPrefillBuffers35,
+        decode_ctx: &mut BatchDecodeBuffers35,
+    ) -> Result<()> {
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.metadata.token_ids_gpu,
+            &mut bufs.hidden,
+        )?;
+        let request_lens: Vec<usize> = prefills
+            .iter()
+            .map(|request| request.tokens.len())
+            .collect();
+        bufs.ensure_batch_gdr_scratch(&self.ctx, &self.config, &request_lens)?;
+
+        let mut linear_idx = 0usize;
+        let mut full_idx = 0usize;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let eps = self.config.rms_norm_eps;
+            ops::rms_norm_batch_offset_into(
+                &self.ctx,
+                &bufs.hidden,
+                &layer.input_layernorm,
+                eps,
+                &mut bufs.normed,
+            )?;
+
+            match &layer.attn {
+                LayerKind::FullAttention(attn) => self
+                    .prefill_full_attention_paged_batch(attn, &mut full_idx, pool, sequences, bufs)
+                    .with_context(|| {
+                        format!(
+                            "qwen35 mixed full-attention layer_idx={layer_idx} full_idx={full_idx} decode_rows={} prefill_rows={} seq_len={}",
+                            decode_rows,
+                            prefills.len(),
+                            bufs.seq_len
+                        )
+                    })?,
+                LayerKind::LinearAttention(attn) => self
+                    .mixed_linear_attention_paged_batch(
+                        attn,
+                        &mut linear_idx,
+                        decode_rows,
+                        prefills,
+                        states,
+                        bufs,
+                        decode_ctx,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "qwen35 mixed linear-attention layer_idx={layer_idx} linear_idx={linear_idx} decode_rows={} prefill_rows={} seq_len={}",
+                            decode_rows,
+                            prefills.len(),
+                            bufs.seq_len
+                        )
+                    })?,
+            }
+            self.layer_communicator
+                .post_attn_all_reduce_hidden_states(&mut bufs.attn_results)?;
+
+            ops::add_batch_into(
+                &self.ctx,
+                &bufs.hidden,
+                &bufs.attn_results,
+                &mut bufs.hidden_mid,
+            )?;
+            ops::rms_norm_batch_offset_into(
+                &self.ctx,
+                &bufs.hidden_mid,
+                &layer.post_attention_layernorm,
+                eps,
+                &mut bufs.normed,
+            )?;
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.gate_proj,
+                &bufs.normed,
+                &mut bufs.gate_out,
+            );
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.up_proj,
+                &bufs.normed,
+                &mut bufs.up_out,
+            );
+            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.down_proj,
+                &bufs.act_out,
+                &mut bufs.mlp_out,
+            );
+            self.layer_communicator
+                .post_mlp_all_reduce_hidden_states(&mut bufs.mlp_out)?;
+            ops::add_batch_into(
+                &self.ctx,
+                &bufs.hidden_mid,
+                &bufs.mlp_out,
+                &mut bufs.hidden_next,
+            )?;
+            std::mem::swap(&mut bufs.hidden, &mut bufs.hidden_next);
+        }
+
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            &bufs.hidden,
+            &self.norm,
+            self.config.rms_norm_eps,
+            &mut bufs.normed,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mixed_linear_attention_paged_batch(
+        &self,
+        attn: &LinearAttentionLayer,
+        linear_idx: &mut usize,
+        decode_rows: usize,
+        prefills: &[PrefillBatchRequest<'_>],
+        states: &mut [Qwen35State],
+        bufs: &mut PagedPrefillBuffers35,
+        decode_ctx: &mut BatchDecodeBuffers35,
+    ) -> Result<()> {
+        let c = &self.config;
+        let prefill_tokens: usize = prefills.iter().map(|prefill| prefill.tokens.len()).sum();
+
+        ops::gemm_into(&self.ctx, &attn.in_proj_qkv, &bufs.normed, &mut bufs.qkv);
+        ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.z);
+        ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_proj);
+        ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.a_proj);
+
+        if decode_rows > 0 {
+            ops::conv1d_decode_batch_into(
+                &self.ctx,
+                &bufs.qkv,
+                &attn.conv1d_weight,
+                &mut decode_ctx.recurrent.conv_state_ptrs_per_layer[*linear_idx],
+                &mut bufs.qkv_conv,
+                c.linear_conv_kernel_dim,
+                decode_rows,
+            );
+            ops::gdr_decode_batch_into(
+                &self.ctx,
+                &bufs.qkv_conv,
+                &bufs.b_proj,
+                &bufs.a_proj,
+                &ops::GdrWeights {
+                    dt_bias: &attn.dt_bias,
+                    a_log: &attn.a_log,
+                },
+                &mut decode_ctx.recurrent.gdr_state_ptrs_per_layer[*linear_idx],
+                &mut bufs.gdr_out,
+                &ops::GdrHeadConfig {
+                    num_key_heads: c.linear_num_key_heads,
+                    num_value_heads: c.linear_num_value_heads,
+                    key_dim: c.linear_key_head_dim,
+                    val_dim: c.linear_value_head_dim,
+                },
+                decode_rows,
+            )?;
+        }
+
+        if prefill_tokens > 0 {
+            self.prepare_mixed_prefill_gdr_launch(*linear_idx, prefills, states, bufs)?;
+            let seq_indptr = mixed_prefill_seq_indptr(prefills)?;
+            self.conv1d_prefill_packed_tail_into(
+                &bufs.qkv,
+                &attn.conv1d_weight,
+                &bufs.gdr_launch.conv_state_ptrs,
+                &seq_indptr,
+                &mut bufs.qkv_conv,
+                c.linear_conv_kernel_dim,
+                decode_rows,
+            )?;
+            self.gdr_prefill_chunkwise_tail_into(
+                &bufs.qkv_conv,
+                &bufs.b_proj,
+                &bufs.a_proj,
+                &ops::GdrWeights {
+                    dt_bias: &attn.dt_bias,
+                    a_log: &attn.a_log,
+                },
+                &seq_indptr,
+                &mut bufs.gdr_out,
+                &ops::GdrHeadConfig {
+                    num_key_heads: c.linear_num_key_heads,
+                    num_value_heads: c.linear_num_value_heads,
+                    key_dim: c.linear_key_head_dim,
+                    val_dim: c.linear_value_head_dim,
+                },
+                decode_rows,
+                &bufs.gdr_launch.state_ptrs,
+                &bufs.gdr_launch.q_ptrs,
+                &bufs.gdr_launch.k_ptrs,
+                &bufs.gdr_launch.v_ptrs,
+                &bufs.gdr_launch.g_cumsum_ptrs,
+                &bufs.gdr_launch.beta_ptrs,
+                &bufs.gdr_launch.a_tril_ptrs,
+                &bufs.gdr_launch.a_inv_ptrs,
+                &bufs.gdr_launch.w_ptrs,
+                &bufs.gdr_launch.u_ptrs,
+                &bufs.gdr_launch.chunk_state_ptrs,
+                &bufs.gdr_launch.v_new_ptrs,
+            )?;
+        }
+
+        ops::rms_norm_gated_batch_into(
+            &self.ctx,
+            &bufs.gdr_out,
+            &attn.norm_weight,
+            &bufs.z,
+            &mut bufs.normed_gated,
+            c.linear_num_value_heads,
+            c.linear_value_head_dim,
+            c.rms_norm_eps,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &attn.out_proj,
+            &bufs.normed_gated,
+            &mut bufs.attn_results,
+        );
+        *linear_idx += 1;
+        Ok(())
+    }
+
+    fn prepare_mixed_prefill_gdr_launch(
+        &self,
+        linear_idx: usize,
+        prefills: &[PrefillBatchRequest<'_>],
+        states: &mut [Qwen35State],
+        bufs: &mut PagedPrefillBuffers35,
+    ) -> Result<()> {
+        for (batch_idx, request) in prefills.iter().enumerate() {
+            let state = &mut states[request.slot_idx];
+            let layer_state = &mut state.recurrent_state.layers[linear_idx];
+            let scratch = &mut bufs.gdr_batch_scratch[batch_idx];
+
+            let (conv_state_ptr, _gconv) =
+                layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
+            let (state_ptr, _gstate) = layer_state.state.device_ptr_mut(&self.ctx.stream);
+            let (q_ptr, _gq) = scratch.q_expanded.data.device_ptr_mut(&self.ctx.stream);
+            let (k_ptr, _gk) = scratch.k_expanded.data.device_ptr_mut(&self.ctx.stream);
+            let (v_ptr, _gv) = scratch.v_raw.data.device_ptr_mut(&self.ctx.stream);
+            let (g_cumsum_ptr, _gg) = scratch.g_cumsum.device_ptr_mut(&self.ctx.stream);
+            let (beta_ptr, _gbeta) = scratch.beta.device_ptr_mut(&self.ctx.stream);
+            let (a_tril_ptr, _ga) = scratch.a_tril.device_ptr_mut(&self.ctx.stream);
+            let (a_inv_ptr, _gainv) = scratch.a_inv.device_ptr_mut(&self.ctx.stream);
+            let (w_ptr, _gw) = scratch.w.data.device_ptr_mut(&self.ctx.stream);
+            let (u_ptr, _gu) = scratch.u.data.device_ptr_mut(&self.ctx.stream);
+            let (chunk_state_ptr, _gchunk) = scratch.chunk_state.device_ptr_mut(&self.ctx.stream);
+            let (v_new_ptr, _gvnew) = scratch.v_new.data.device_ptr_mut(&self.ctx.stream);
+
+            bufs.gdr_launch.conv_state_ptrs[batch_idx] = conv_state_ptr;
+            bufs.gdr_launch.state_ptrs[batch_idx] = state_ptr;
+            bufs.gdr_launch.q_ptrs[batch_idx] = q_ptr;
+            bufs.gdr_launch.k_ptrs[batch_idx] = k_ptr;
+            bufs.gdr_launch.v_ptrs[batch_idx] = v_ptr;
+            bufs.gdr_launch.g_cumsum_ptrs[batch_idx] = g_cumsum_ptr;
+            bufs.gdr_launch.beta_ptrs[batch_idx] = beta_ptr;
+            bufs.gdr_launch.a_tril_ptrs[batch_idx] = a_tril_ptr;
+            bufs.gdr_launch.a_inv_ptrs[batch_idx] = a_inv_ptr;
+            bufs.gdr_launch.w_ptrs[batch_idx] = w_ptr;
+            bufs.gdr_launch.u_ptrs[batch_idx] = u_ptr;
+            bufs.gdr_launch.chunk_state_ptrs[batch_idx] = chunk_state_ptr;
+            bufs.gdr_launch.v_new_ptrs[batch_idx] = v_new_ptr;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_prefill_packed_tail_into(
+        &self,
+        x_batch: &HiddenStates,
+        conv_weight: &DeviceVec,
+        conv_state_ptrs: &[u64],
+        seq_indptr: &[i32],
+        out_batch: &mut HiddenStates,
+        kernel_size: usize,
+        row_offset: usize,
+    ) -> Result<()> {
+        ensure!(
+            conv_state_ptrs.len() + 1 == seq_indptr.len(),
+            "qwen35 mixed conv1d seq_indptr len mismatch"
+        );
+        let num_channels = x_batch.hidden_dim;
+        let half_size = std::mem::size_of::<ffi::Half>();
+        let (x_ptr, _gx) = x_batch.data.device_ptr(&self.ctx.stream);
+        let (w_ptr, _gw) = conv_weight.data.device_ptr(&self.ctx.stream);
+        let (out_ptr, _go) = out_batch.data.device_ptr_mut(&self.ctx.stream);
+        let x_tail = (x_ptr as usize + row_offset * num_channels * half_size) as *const ffi::Half;
+        let out_tail = (out_ptr as usize + row_offset * num_channels * half_size) as *mut ffi::Half;
+        unsafe {
+            ffi::conv1d_prefill_packed_batch_cuda(
+                x_tail,
+                w_ptr as *const ffi::Half,
+                conv_state_ptrs.as_ptr(),
+                seq_indptr.as_ptr(),
+                out_tail,
+                num_channels as i32,
+                kernel_size as i32,
+                conv_state_ptrs.len() as i32,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()
+            .context("qwen35 mixed conv1d prefill tail failed")?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gdr_prefill_chunkwise_tail_into(
+        &self,
+        qkv_batch: &HiddenStates,
+        b_proj_batch: &HiddenStates,
+        a_proj_batch: &HiddenStates,
+        weights: &ops::GdrWeights<'_>,
+        seq_indptr: &[i32],
+        output_batch: &mut HiddenStates,
+        heads: &ops::GdrHeadConfig,
+        row_offset: usize,
+        state_ptrs: &[u64],
+        q_ptrs: &[u64],
+        k_ptrs: &[u64],
+        v_ptrs: &[u64],
+        g_cumsum_ptrs: &[u64],
+        beta_ptrs: &[u64],
+        a_tril_ptrs: &[u64],
+        a_inv_ptrs: &[u64],
+        w_ptrs: &[u64],
+        u_ptrs: &[u64],
+        chunk_state_ptrs: &[u64],
+        v_new_ptrs: &[u64],
+    ) -> Result<()> {
+        let batch_size = state_ptrs.len();
+        ensure!(
+            batch_size + 1 == seq_indptr.len(),
+            "qwen35 mixed GDR seq_indptr len mismatch"
+        );
+        ensure!(
+            q_ptrs.len() == batch_size
+                && k_ptrs.len() == batch_size
+                && v_ptrs.len() == batch_size
+                && g_cumsum_ptrs.len() == batch_size
+                && beta_ptrs.len() == batch_size
+                && a_tril_ptrs.len() == batch_size
+                && a_inv_ptrs.len() == batch_size
+                && w_ptrs.len() == batch_size
+                && u_ptrs.len() == batch_size
+                && chunk_state_ptrs.len() == batch_size
+                && v_new_ptrs.len() == batch_size,
+            "qwen35 mixed GDR pointer table length mismatch"
+        );
+        let half_size = std::mem::size_of::<ffi::Half>();
+        let qkv_dim = qkv_batch.hidden_dim;
+        let b_dim = b_proj_batch.hidden_dim;
+        let out_dim = output_batch.hidden_dim;
+        let (qkv_ptr, _gqkv) = qkv_batch.data.device_ptr(&self.ctx.stream);
+        let (b_ptr, _gb) = b_proj_batch.data.device_ptr(&self.ctx.stream);
+        let (a_ptr, _ga) = a_proj_batch.data.device_ptr(&self.ctx.stream);
+        let (dt_ptr, _gdt) = weights.dt_bias.data.device_ptr(&self.ctx.stream);
+        let (alog_ptr, _galog) = weights.a_log.device_ptr(&self.ctx.stream);
+        let (out_ptr, _go) = output_batch.data.device_ptr_mut(&self.ctx.stream);
+        let qkv_tail = (qkv_ptr as usize + row_offset * qkv_dim * half_size) as *const ffi::Half;
+        let b_tail = (b_ptr as usize + row_offset * b_dim * half_size) as *const ffi::Half;
+        let a_tail = (a_ptr as usize + row_offset * b_dim * half_size) as *const ffi::Half;
+        let out_tail = (out_ptr as usize + row_offset * out_dim * half_size) as *mut ffi::Half;
+        unsafe {
+            ffi::gated_delta_rule_prefill_chunkwise_batch_cuda(
+                qkv_tail,
+                b_tail,
+                a_tail,
+                dt_ptr as *const ffi::Half,
+                alog_ptr as *const f32,
+                state_ptrs.as_ptr(),
+                q_ptrs.as_ptr(),
+                k_ptrs.as_ptr(),
+                v_ptrs.as_ptr(),
+                g_cumsum_ptrs.as_ptr(),
+                beta_ptrs.as_ptr(),
+                a_tril_ptrs.as_ptr(),
+                a_inv_ptrs.as_ptr(),
+                w_ptrs.as_ptr(),
+                u_ptrs.as_ptr(),
+                chunk_state_ptrs.as_ptr(),
+                v_new_ptrs.as_ptr(),
+                seq_indptr.as_ptr(),
+                out_tail,
+                heads.num_key_heads as i32,
+                heads.num_value_heads as i32,
+                heads.key_dim as i32,
+                heads.val_dim as i32,
+                batch_size as i32,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()
+            .context("qwen35 mixed GDR prefill tail failed")?;
+        }
+        Ok(())
+    }
+
+    fn compact_mixed_final_rows(
+        &self,
+        normed: &mut HiddenStates,
+        decode_rows: usize,
+        prefills: &[PrefillBatchRequest<'_>],
+    ) -> Result<()> {
+        use cudarc::driver::sys::{cuMemcpyDtoDAsync_v2, cudaError_enum::CUDA_SUCCESS};
+
+        let hidden_dim = normed.hidden_dim;
+        let row_bytes = hidden_dim * std::mem::size_of::<ffi::Half>();
+        let (base_ptr, _guard) = normed.data.device_ptr_mut(&self.ctx.stream);
+        let mut prefill_token_offset = 0usize;
+        for (i, prefill) in prefills.iter().enumerate() {
+            let src_row = decode_rows + prefill_token_offset + prefill.tokens.len() - 1;
+            let dst_row = decode_rows + i;
+            if src_row != dst_row {
+                let src_ptr = base_ptr + (src_row * row_bytes) as u64;
+                let dst_ptr = base_ptr + (dst_row * row_bytes) as u64;
+                let result = unsafe {
+                    cuMemcpyDtoDAsync_v2(dst_ptr, src_ptr, row_bytes, self.ctx.stream.cu_stream())
+                };
+                if result != CUDA_SUCCESS {
+                    anyhow::bail!("qwen35 mixed final-row D2D gather failed: {result:?}");
+                }
+            }
+            prefill_token_offset += prefill.tokens.len();
+        }
         Ok(())
     }
 
