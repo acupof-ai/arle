@@ -27,6 +27,9 @@ MOE_BACKEND="${ARLE_DSV4_MOE_BACKEND:-deepep}"
 EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
 DEEPGEMM_ROOT="${ARLE_DEEPGEMM_ROOT:-$ROOT/crates/cuda-kernels/vendor/deepgemm}"
 DEEPGEMM_LIBRARY_ROOT="${ARLE_DEEPGEMM_LIBRARY_ROOT:-$DEEPGEMM_ROOT/deep_gemm}"
+# DeepEP source tree (deepseek-ai/DeepEP) required for native-deepep MoE
+# backend; left unset → deepep-sys stub mode (NativeDeepEp::boot will bail).
+DEEPEP_DIR="${ARLE_DEEPEP_DIR:-}"
 CUDA_HOME_DETECTED="${CUDA_HOME:-}"
 
 usage() {
@@ -41,16 +44,20 @@ Options:
   --port PORT        HTTP port (default: $PORT)
   --max-tokens N     smoke/nsys max_tokens; default 32, must be >=32
   --devices LIST     CUDA device list (default: $DEVICES)
-  --moe-backend NAME DSv4 MoE backend (default: $MOE_BACKEND)
+  --moe-backend NAME DSv4 MoE backend (default: $MOE_BACKEND).
+                    Accepts: deepep | native-deepep | allreduce.
+                    native-deepep requires --deepep-dir + nvcc at build time.
   --expert-backend NAME
                     DSv4 expert backend (default: $EXPERT_BACKEND)
+  --deepep-dir DIR   path to deepseek-ai/DeepEP source tree; required when
+                    --moe-backend=native-deepep. Overrides ARLE_DEEPEP_DIR.
   --prompt TEXT      prompt for smoke/nsys
   -h, --help         show this help
 
 Environment:
   CUDA_HOME, ARLE_DEEPGEMM_ROOT, ARLE_DEEPGEMM_LIBRARY_ROOT,
   ARLE_DSV4_MODEL_PATH, ARLE_DSV4_MOE_BACKEND, ARLE_DSV4_EXPERT_BACKEND,
-  ARTIFACT_ROOT, PORT, SERVER_BIN, MAX_TOKENS, PROMPT.
+  ARLE_DEEPEP_DIR, ARTIFACT_ROOT, PORT, SERVER_BIN, MAX_TOKENS, PROMPT.
 EOF
 }
 
@@ -87,6 +94,7 @@ parse_args() {
             --devices) need_value "$@"; DEVICES="$2"; shift 2 ;;
             --moe-backend) need_value "$@"; MOE_BACKEND="$2"; shift 2 ;;
             --expert-backend) need_value "$@"; EXPERT_BACKEND="$2"; shift 2 ;;
+            --deepep-dir) need_value "$@"; DEEPEP_DIR="$(abs_path "$2")"; shift 2 ;;
             --prompt) need_value "$@"; PROMPT="$2"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown argument: $1" ;;
@@ -133,6 +141,22 @@ detect_deepgemm() {
     export ARLE_DEEPGEMM_LIBRARY_ROOT="$DEEPGEMM_LIBRARY_ROOT"
 }
 
+# Validate ARLE_DEEPEP_DIR when MOE_BACKEND=native-deepep. Other backends
+# don't require it — deepep-sys falls back to stub mode without it.
+detect_deepep_dir() {
+    if [[ "$MOE_BACKEND" != "native-deepep" ]]; then
+        return 0
+    fi
+    [[ -n "$DEEPEP_DIR" ]] ||
+        die "ARLE_DSV4_MOE_BACKEND=native-deepep requires --deepep-dir DIR or ARLE_DEEPEP_DIR"
+    DEEPEP_DIR="$(abs_path "$DEEPEP_DIR")"
+    [[ -d "$DEEPEP_DIR/csrc/kernels" ]] ||
+        die "DeepEP source tree missing csrc/kernels/: $DEEPEP_DIR (expected deepseek-ai/DeepEP layout)"
+    [[ -f "$DEEPEP_DIR/csrc/kernels/api.cuh" ]] ||
+        die "DeepEP api.cuh missing at $DEEPEP_DIR/csrc/kernels/api.cuh"
+    export ARLE_DEEPEP_DIR="$DEEPEP_DIR"
+}
+
 export_runtime_env() {
     export CUDA_VISIBLE_DEVICES="$DEVICES"
     export INFER_CUDA_DEVICES="${INFER_CUDA_DEVICES:-$DEVICES}"
@@ -143,6 +167,13 @@ export_runtime_env() {
     export ARLE_DSV4_FUSED_DISPATCH_PAYLOAD="${ARLE_DSV4_FUSED_DISPATCH_PAYLOAD:-1}"
     export ARLE_DSV4_EXPERT_BACKEND="$EXPERT_BACKEND"
     export ARLE_DEEPGEMM_LIBRARY_ROOT="$DEEPGEMM_LIBRARY_ROOT"
+    # native-deepep needs the source tree available at runtime too (the
+    # Buffer lifecycle is driven by the static archive linked at build,
+    # but the env var is logged for traceability and consumed by smoke
+    # diagnostics). Export only when set so we don't shadow stub mode.
+    if [[ -n "${ARLE_DEEPEP_DIR:-}" ]]; then
+        export ARLE_DEEPEP_DIR
+    fi
 }
 
 detect_model() {
@@ -162,6 +193,7 @@ preflight() {
     detect_cuda
     detect_nccl
     detect_deepgemm
+    detect_deepep_dir
     detect_model
 }
 
@@ -176,12 +208,18 @@ env_check() {
     echo "CUDA_VISIBLE_DEVICES=$DEVICES"
     echo "ARLE_DSV4_MOE_BACKEND=$MOE_BACKEND"
     echo "ARLE_DSV4_EXPERT_BACKEND=$EXPERT_BACKEND"
+    if [[ "$MOE_BACKEND" == "native-deepep" ]]; then
+        echo "ARLE_DEEPEP_DIR=$ARLE_DEEPEP_DIR"
+    else
+        echo "ARLE_DEEPEP_DIR=(unset — not native-deepep)"
+    fi
 }
 
 build_infer() {
     detect_cuda
     detect_nccl
     detect_deepgemm
+    detect_deepep_dir
     need_cmd cargo
     cd "$ROOT"
     export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
