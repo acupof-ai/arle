@@ -1,0 +1,31 @@
+[package]
+name = "deepep-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Torch-free Rust binding for deepseek-ai/DeepEP intranode dispatch/combine kernels. Phase B-2 of the multiproc-serve pivot."
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+# When set + ARLE_DEEPEP_DIR env var present at build time, build.rs
+# nvcc-compiles the C++ wrapper + DeepEP kernel sources and links them
+# into the static archive. Without the feature OR without the env var,
+# the crate exports stub functions that return DeepEpError::NotBuilt at
+# call time — lets dependent crates compile cleanly on machines without
+# the DeepEP source tree.
+deepep = []
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+thiserror = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(deepep_stub)"] }
+
+[build-dependencies]
+cc = "1"
