@@ -295,6 +295,7 @@ def run_mmlu(
     invalid = 0
     per_subject: dict[str, dict] = {}
     debug_records: list[dict] = []
+    invalid_records: list[dict] = []
     t0 = time.time()
     for i, ex in enumerate(pool):
         subj = ex["subject"]
@@ -316,6 +317,7 @@ def run_mmlu(
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             print(f"[mmlu] sample {i} request error: {exc}", flush=True)
             invalid += 1
+            invalid_records.append({"i": i, "subject": subj, "kind": "request_error", "reason": str(exc)})
             continue
         letter = _mmlu_extract_letter(resp)
         gold = chr(ord("A") + ex["answer"])
@@ -323,6 +325,15 @@ def run_mmlu(
         sub_stat["total"] += 1
         if letter is None:
             invalid += 1
+            # Save every extractor-fail response so future extractor patches
+            # can target empirical failure modes (not guessed shapes).
+            invalid_records.append({
+                "i": i,
+                "subject": subj,
+                "gold": gold,
+                "kind": "extract_fail",
+                "response": resp[:300],
+            })
         elif letter == gold:
             correct += 1
             sub_stat["correct"] += 1
@@ -357,6 +368,8 @@ def run_mmlu(
     (output_dir / "mmlu.json").write_text(json.dumps(report, indent=2))
     if debug_records:
         (output_dir / "mmlu_debug.json").write_text(json.dumps(debug_records, indent=2))
+    if invalid_records:
+        (output_dir / "mmlu_invalid.json").write_text(json.dumps(invalid_records, indent=2))
     print(f"[mmlu] accuracy={accuracy:.3f} ({correct}/{scored}, invalid={invalid}, {elapsed:.1f}s)", flush=True)
     return report
 
