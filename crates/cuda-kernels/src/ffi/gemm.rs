@@ -370,6 +370,46 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // GEMM-shape grouped variants (M-tile = DSV4_BATCH_TILE = 32 weight reuse).
+    // Use when caller knows max_count >= 4. See
+    // docs/experience/errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md.
+    pub fn dsv4_fp8_grouped_gemm_batch_cuda(
+        weight_ptrs: *const u64,
+        scale_ptrs: *const u64,
+        input: *const Half,
+        output: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        scale_rows: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_fp8_grouped_gemm_pair_batch_cuda(
+        weight_a_ptrs: *const u64,
+        scale_a_ptrs: *const u64,
+        weight_b_ptrs: *const u64,
+        scale_b_ptrs: *const u64,
+        input: *const Half,
+        output_a: *mut Half,
+        output_b: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        scale_rows: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_fp8_route_gemv_batch_cuda(
         weight_ptrs: *const u64,
         scale_ptrs: *const u64,
