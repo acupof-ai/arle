@@ -12,50 +12,68 @@ any order. Each task should land as its own commit (`<type>(<scope>):
 
 ---
 
-## Task A — Microbench validating the student_rollout 1.44 s/tok claim
+## Task A — DONE 2026-05-28 tick 10 — perf scaling characterized
 
-**Scope**: small new bench, no train-crate changes.
+**Skip this**. Claude ran a 2-step rollout-scale sweep across
+rollout_len ∈ {8, 16, 32} against the v4 (rollout=128) production
+point using the existing `opd_step_cuda_infer_teacher_train` binary
+— no new bench needed. Raw data:
+`runs/2026-05-28-rollout-scale-bench/run.log`. The findings are in
+[`docs/research/2026-05-28-opd-rollout-perf-208s-bottleneck.md`](../research/2026-05-28-opd-rollout-perf-208s-bottleneck.md)
+"Microbench update" section.
 
-**Goal**: confirm or refute the perf hypothesis in
-[`docs/research/2026-05-28-opd-rollout-perf-208s-bottleneck.md`](../research/2026-05-28-opd-rollout-perf-208s-bottleneck.md).
-The doc's claim: train-crate `forward_rollout_cached_device_token` is
-~16× slower per token than batched `student_forward`, with the gap
-caused by host-side per-op autograd-tape bookkeeping over ~300 ops per
-token × 144 tokens.
+**Key result**: per-token rollout cost is NOT constant — it scales.
+Two-term fit:
 
-**Deliverable**: `crates/train/examples/opd_rollout_token_bench.rs`
-that:
+```
+student_rollout(n_gen) ≈ 0.31 · n_gen + 0.0099 · n_gen²
+```
 
-1. Loads Qwen3.5-0.8B-Base (with or without LoRA — flag-controlled)
-   via the same path the OPD train uses.
-2. Runs warm-up: 5 prompts of `prompt_max_tokens=16`,
-   `rollout_len=64`, dropping into the same code path
-   `opd.rs:1654-1722` (the `use_device_rollout_argmax` branch).
-3. Measures per-token latency across N=10 prompts at rollout_len=64
-   and N=10 at rollout_len=128. Reports:
-   - mean / median / p50 / p99 per-token latency
-   - per-phase breakdown using the existing
-     `Qwen35RolloutForwardProfile` machinery (cache_select,
-     embedding, layers, final_norm, lm_head)
-   - per-layer min/max/mean to spot outlier layers
-4. Same harness with `tape.set_enabled(true)` for one control run
-   to confirm the "tape disabled" claim isn't accidentally still
-   recording.
+At n=130 the quadratic term is 81% of student_rollout (169 s out of
+208 s). Predicted n=256 → 728 s student_rollout/step (matches the
+v7-dryrun kill at 19 min/step).
 
-**Acceptance**:
-- Bench runs in ≤10 min wall-clock on the 4070 Ti SUPER at
-  `--mem-fraction-static 0.30` (~6 GB peak).
-- Output saved to `bench-output/2026-MM-DD-opd-rollout-token-bench/`.
-- Compare numbers against the v4 run.txt 1.44 s/tok point estimate.
+The original "host-side per-op bookkeeping dominates" hypothesis
+from tick 7 was wrong at large n. Both terms matter; the quadratic
+attention math dominates above n≈30.
 
-**Kill criteria**:
-- Pass: bench reproduces ≥1.0 s/tok at rollout_len=128, with per-layer
-  profile showing layer-uniform cost (no single outlier > 2× the
-  median).
-- Kill (reduces task ROI): bench measures < 0.3 s/tok — the v4 run's
-  208 s/step came from something other than the per-token forward
-  (e.g., the retain bookkeeping at `opd.rs:1755`). Investigate that
-  next instead.
+Route-through-infer projection revised to ~5× speedup (vs original
+70×) — more conservative, accounts for the quadratic term that
+infer's flash/paged-attention kernels can only attack the *constant*
+of, not the *shape* of.
+
+## Task A' — Pin the quadratic source (was Task B)
+
+**Promoted from Task B because Task A is done; Task A' is the next
+diagnostic step.**
+
+The 0.0099·n² coefficient is consistent with several causes:
+
+1. **Attention math + KV cache append** — each decode step's
+   `QK^T` and `attn @ V` over the growing cache → O(t) work at step
+   t, O(n²) total.
+2. **`store.retain_ids(&keep)` at `opd.rs:1755`** — walks
+   `tensors.len()` slots each call (line 153 of `crates/autograd/
+   src/tensor.rs`). If `tensors.len()` (the high-water mark of
+   simultaneously-live tensors) grows linearly during the rollout,
+   and retain_ids is called every 2 tokens, that's O(n) × O(n/2) =
+   O(n²). Need to measure `tensors.len()` over the rollout.
+3. **Backward graph buildup** — even with `tape.set_enabled(false)`
+   the autograd backend might still walk a growing structure per
+   forward.
+
+**Deliverable**: nsys profile OR cuda-events instrumentation on one
+rollout step at rollout_len=64 (mid-range — clear quadratic signal,
+fast iteration). Report: which of (1)-(3) accounts for what
+fraction of the 0.01·n² coefficient.
+
+**Acceptance**: top hypothesis named with evidence; if (1) attention
+is >70% of the quadratic term, the only path is route-through-infer
+(Task E). If (2) or (3) is >50%, there's a cheaper pure-train-crate
+fix worth a separate task.
+
+**Kill criteria**: as before — no single source > 25%, the cost is
+diffuse, pivot to Task E.
 
 ---
 
