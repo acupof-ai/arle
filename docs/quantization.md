@@ -23,9 +23,9 @@ with concrete evidence.
 | Axis | Format | Status | Enable | Notes |
 |---|---|---|---|---|
 | **KV cache** | BF16 | production | `--kv-cache-dtype bf16` *(default via `auto`)* | Reference. CUDA-paged + Metal. |
-| KV cache | INT8 | production (CUDA) | `--kv-cache-dtype int8` | Per-(token, head) scale, /127. +57–113% throughput vs BF16 on A100 4096/256 (`bench-int8-vs-bf16-kv-a100`). Verified token-level identical to BF16 on the audit's paged-prefill regime. |
-| KV cache | FP8 E4M3 | opt-in (CUDA) | `--kv-cache-dtype fp8` | Per-(token, head) scale, /448. **+ KIVI per-channel K scaffolding** built but does not change the user-visible metric today — see §1.3. Quality re-audit pending on the paged-prefill investigation (§5). |
-| KV cache | TurboQuant TQ2/3/4 | experimental (CUDA) | `--kv-cache-dtype tq{2,3,4}` | FWHT-rotated packed indices + FP16 group norms. Page-size-1 path, bypasses the HD128 batched prefill kernel — the **only** KV format that produced the HF-reference first token in the 2026-05-27 chat-prompt audit. |
+| KV cache | INT8 | production (CUDA) | `--kv-cache-dtype int8` | **KIVI per-channel K** (`[num_kv_heads, head_dim]` static table, /127) + per-(row, head) V (/127). V100 Qwen3.5-4B audit `mean_match=1.0000` bit-identical with BF16 (2026-05-27 wins entry). 1.57× max tokens per GB vs BF16. |
+| KV cache | FP8 E4M3 | production (CUDA) | `--kv-cache-dtype fp8` | **KIVI per-channel K** (/448) + per-(row, head) V (/448). Same code shape as INT8 modulo quant range. V100 audit `mean_match=1.0000`. |
+| KV cache | TurboQuant TQ2/3/4 | experimental (CUDA) | `--kv-cache-dtype tq{2,3,4}` | FWHT-rotated packed indices + FP16 group norms. Page-size-1 path bypasses the HD128 batched prefill kernel. **Decode requires sm_80+**; sm_70 V100 build returns `CUDA_ERROR_NOT_SUPPORTED`. sm_80 audit pending. |
 | **Weights** | DenseBF16 | production | default | No quantization. |
 | Weights | W4A16 (uniform-group packed INT4) | production (CUDA) | safetensors metadata | Native `w4_gemv` + Marlin W4 prefill. |
 | Weights | MarlinW4A8 | production (CUDA), Tier-1 | env `INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1` for the prefill-graph win path (–92.5% TTFT p50). |
@@ -60,63 +60,77 @@ CUDA kernels are in `crates/cuda-kernels/csrc/{kv,attention}/`.
 - **Limitation**: No KV compression; cache size scales as
   `num_layers · 2 · num_kv_heads · head_dim · max_total_tokens · 2 B`.
 
-### 1.2 INT8
+### 1.2 INT8 (KIVI per-channel K)
 
-- **Storage**: `i8` rows + `f32` scale per `(token, kv_head)`.
-- **Scale**: `absmax / 127`, no numerical floor (only `(absmax > 0) ?
-  absmax/127 : 1.0` guard against divide-by-zero).
-- **Quantize kernels**: `quantize_paged_kv_int8_*` family in
-  `crates/cuda-kernels/csrc/kv/kv_quant.cu`. Decode single-token quant
-  via `quantize_paged_kv_single_kernel` (line 553).
-- **Decode-attn kernel**:
-  `decode_attention_int8_partial_kernel` (`csrc/attention/decode_attention_quantized.cu`
-  line 46) — cp.async smem tiling with per-(token, kv_head) dequant.
-- **Status**: production (CUDA). +57–113% throughput / –39–55% ITL p50
-  vs BF16 on A100 4096/256 (`docs/experience/wins/2026-05-26-bench-int8-vs-bf16-kv-a100.md`).
-  Verified token-level identical to BF16 on the paged-prefill regime
-  used by the audit harness.
-- **Memory cost**: ~1.05 byte / element (i8 + per-(token, head) f32
-  scale, amortized).
-
-### 1.3 FP8 E4M3 (+ KIVI per-channel K scaffolding)
-
-- **Storage**: `__nv_fp8_e4m3` rows + `f32` scale.
-- **Scale**: two paths, asymmetric per KIVI:
-  - **V (and legacy K)**: per-(token, kv_head), `absmax / 448`. The
-    1e-6 floor that masked deep-layer K activations was removed
-    2026-05-26 (`25c7d409`); the guard now matches INT8 —
-    `(absmax > 0) ? absmax/448 : 1.0`.
-  - **K (KIVI mode, enabled whenever the FP8 pool is allocated)**:
-    per-(kv_head, head_dim) static table calibrated from the first
-    prefill batch via `compute_k_per_channel_absmax_cuda` +
-    `finalize_k_per_channel_scales_cuda`. Floor at 1e-30 (essentially
-    only catches truly-zero channels).
+- **Storage**: `i8` rows (NHD `[max_tokens, kv_dim]`) + `f32` scales,
+  asymmetric per KIVI:
+  - **K**: per-(kv_head, head_dim) static table calibrated from the
+    first prefill batch (`absmax / 127`).
+  - **V**: per-(token, kv_head) (`absmax / 127`).
 - **Quantize kernels** (`csrc/kv/kv_quant.cu`):
-  - `quantize_paged_kv_fp8_kernel` (line 171) — legacy per-token K,
-    used by V on every step.
-  - `quantize_paged_kv_fp8_per_channel_kernel` (line 670) — KIVI
-    per-channel K, used when `k_static_scales` is allocated.
-  - `compute_k_per_channel_absmax_kernel` (line 722) +
-    `finalize_k_per_channel_scales_kernel` — KIVI calibration pair.
-- **Decode-attn kernels**:
-  - `decode_attention_fp8_partial_kernel` (line 307) — legacy
-    per-(token, head) K scale.
-  - `decode_attention_fp8_per_channel_k_partial_kernel` (line 606,
-    HEAD_DIM templated) — pre-loads `k_scale_reg[EPT]` once per warp
-    from the per-channel table and multiplies per-dim during QK dot.
-    Fix `73a72615` ensures it writes the *normalized* per-split
-    average (`final_o * inv_final_l`) like the legacy kernel — earlier
-    drafts dropped the divide and produced O(l_s)-scale-off
-    attention.
-- **Status**: opt-in (CUDA). KIVI implementation is unit-test clean
-  and dispatches as expected; the bench shows real throughput. The
-  end-to-end audit (`kv_precision_parity`) currently reports
-  `mean_match=0.0156` vs BF16, but the 2026-05-27 chain showed that
-  metric is **not a quality signal** under the audit's regime — see
-  §4.
-- **Open question**: shared paged-prefill regime affects BF16/INT8/FP8
-  identically (§5). Quality verdict on FP8 specifically is deferred
-  until the paged-prefill investigation resolves.
+  - `quantize_paged_kv_int8_per_channel_kernel` — KIVI K quantize
+    using the static `[num_kv_heads, head_dim]` scale table.
+  - `quantize_paged_kv_single_kernel` — V per-(row, head) quantize
+    (also handles K in the BF16 contig→paged migration path).
+  - `compute_k_per_channel_absmax_kernel` +
+    `finalize_k_per_channel_scales_int8_kernel` (/127) — calibration.
+- **Decode-attn kernel**:
+  `decode_attention_int8_per_channel_k_partial_kernel`
+  (`csrc/attention/decode_attention_quantized.cu`) — cp.async smem
+  tiling, K scales pre-loaded into `k_scale_reg[EPT]` registers once
+  per warp at kernel entry, V scales loaded per-token from smem.
+- **Status**: production (CUDA). V100 Qwen3.5-4B audit
+  `mean_match=1.0000` bit-identical with BF16 across 32 generated
+  tokens / 2 prompts (2026-05-27 wins entry). Prior per-(token, head)
+  K path showed `mean_match=0.094` step-1 drift — retired in the same
+  commit that wired KIVI for INT8.
+- **Memory cost**: ~1.05 byte / element (i8 + V per-(token, head) f32
+  scale + K static `[num_kv_heads, head_dim]` f32 table — the K table
+  is layer-shared, amortizing to ~0 bytes / element).
+
+### 1.3 FP8 E4M3 (KIVI per-channel K)
+
+Identical code shape to INT8 modulo the quant range constant and
+hardware-accelerated `__nv_fp8x4_e4m3` dequant — same KIVI dispatch,
+same K calibration, same V per-(row, head) scheme.
+
+- **Storage**: `__nv_fp8_e4m3` rows + `f32` scales.
+- **Scale**:
+  - **K**: per-(kv_head, head_dim) static table, `absmax / 448`,
+    1e-30 floor (catches only truly-zero channels — the 2026-05-26
+    1e-6 floor incident at `8c6d92db` showed any larger floor causes
+    deep-layer K to saturate; the floor is intentionally minimal).
+  - **V**: per-(token, kv_head), `absmax / 448`.
+- **Quantize kernels** (`csrc/kv/kv_quant.cu`):
+  - `quantize_paged_kv_fp8_per_channel_kernel` — KIVI K quantize.
+  - `quantize_paged_kv_fp8_kernel` — V per-(row, head) quantize.
+  - `compute_k_per_channel_absmax_kernel` +
+    `finalize_k_per_channel_scales_kernel` (/448) — calibration pair.
+- **Decode-attn kernel**:
+  `decode_attention_fp8_per_channel_k_partial_kernel` (HEAD_DIM
+  templated) — K scales pre-loaded into registers; HW-accelerated
+  4-wide FP8 dequant via `__nv_fp8x4_e4m3 → float4`. Phase-2 merge
+  shares `decode_attention_merge_kernel` with INT8.
+- **Status**: production (CUDA). V100 audit `mean_match=1.0000`.
+
+### 1.3.5 The retired per-token K kernels
+
+Pre-2026-05-27 INT8 and FP8 both used per-(token, head) K scales via
+`decode_attention_int8` / `decode_attention_fp8`. These were retired
+in commit `ba74dd49`:
+
+- 1052 lines deleted across `decode_attention_quantized.cu`, the
+  Rust wrappers, FFI, and a smoke test.
+- All dispatch sites in `qwen3/{prefill,batch_decode}.rs` and
+  `qwen35/{prefill,batch_decode}.rs` route exclusively through the
+  per-channel K kernels.
+- Kept: `quantize_paged_kv_single` and `quantize_paged_kv_fp8`,
+  because V still uses per-(row, head) scales (KIVI's asymmetric
+  design); `decode_attention_int8_workspace_bytes` because both
+  per-channel K kernels share its workspace layout;
+  `decode_attention_merge_kernel` (Phase 2, shared);
+  `decode_attention_varlen_fp8` (mixed prefill+decode varlen path —
+  separate KIVI migration tracked as follow-up).
 
 ### 1.4 TurboQuant TQ2 / TQ3 / TQ4
 

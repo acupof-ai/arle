@@ -1,5 +1,10 @@
 # INT8 KV: extend KIVI per-channel K calibration from FP8 to INT8
 
+**Status: DONE 2026-05-27** (commits `8afecffe` + `ba74dd49`).
+V100 Qwen3.5-4B audit `int8 mean_match=1.0000` bit-identical with BF16
+across 32 tokens × 2 prompts. Wins entry:
+[`2026-05-27-int8-kv-kivi-per-channel-k-fix.md`](../experience/wins/2026-05-27-int8-kv-kivi-per-channel-k-fix.md).
+
 ## The "right problem"
 
 V100 audit on Qwen3.5-4B (2026-05-27, see
