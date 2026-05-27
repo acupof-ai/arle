@@ -7,6 +7,18 @@
 > Canonical params are locked in
 > [`docs/plans/guidellm-integration.md`](../../plans/guidellm-integration.md) §3.
 
+## SLO-shape probed?  <Y | N + workload>
+
+**MANDATORY** (bench-spec §7.7). Y = at least one run included **M ≥ 4096 prefill**, **batch ≥ 4**, and **prompt ≥ 8K tokens**. N → entry defaults to *deferred*, cannot claim PASS, cannot drive a default-flag-flip. State which probes ran here.
+
+## Roofline check
+
+**MANDATORY** (bench-spec §7.6). achieved_TFLOPS / theoretical_peak_TFLOPS for compute-bound ops; achieved_GB/s / HBM_peak_GB/s for memory-bound ops. < **5% peak** → defaults to KILL unless explicitly annotated "deferred — accept uncertainty + root-cause hypothesis + next step".
+
+| Op | Achieved | Peak (this HW) | % | Verdict |
+|---|---:|---:|---:|---|
+| <prefill GEMM \| decode GEMV \| attention QK \| etc.> | <TFLOPS or GB/s> | <theoretical> | <%> | <PASS \| KILL \| deferred:reason> |
+
 ## Goal
 
 - <one sentence describing the benchmark goal and goal type>

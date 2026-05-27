@@ -234,7 +234,60 @@ was driven by exactly this.
 - Stale lock after a killed run: `rm -f bench-output/.bench_guidellm.lock`.
 - Slot leak when client disconnects mid-stream (K7 — see [`projects/2026-04-29-perf-bug-roundup.md`](projects/2026-04-29-perf-bug-roundup.md)). Restart server between sessions when status is uncertain; verify `/v1/stats` shows `active=0 waiting=0` before re-running.
 
-### 7.6 Bench reports 0 successful → CHECK SERVER LOG FIRST
+### 7.6 Roofline gate — measured tok/s < 5% of theoretical peak → default KILL
+
+Codified from 2026-05-27 DSv4 GEMV-at-prefill incident
+(`docs/experience/errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md`).
+The 2026-05-25 `dsv4-longseq-prefill-decode-split` wins entry shipped
+196 tok/s/rank prefill = **0.42% of H20 BF16 peak** (FLOPS-roofline
+46,250 tok/s/rank for DSv4-Flash per-token compute). It was called
+PASS because the entry goal was only "don't OOM and don't decode
+regress" — no roofline check. Two days later the same kernel shape
+re-surfaced as a 67× SLO miss.
+
+**Rule:** every wins/errors entry that reports throughput MUST compute
+achieved-vs-peak ratio:
+
+- **Compute-bound op** (prefill GEMM, attention QK): achieved TFLOPS
+  vs theoretical peak (BF16/FP8 SM peak × num_GPUs × utilization
+  budget 70%).
+- **Memory-bound op** (decode GEMV, KV streaming): achieved
+  GB/s vs HBM peak (e.g. H20 ~1.6 TB/s, MI300 ~5.3 TB/s).
+
+If achieved < **5% of peak**, the entry defaults to **KILL**
+regardless of relative-vs-baseline framing. The only way to PASS
+under 5% is an explicit "deferred — accept uncertainty" annotation
+that names the root-cause hypothesis and the next investigation step.
+
+Why 5%: the GEMV-at-prefill bug ran at 0.42% (>10× below threshold);
+modest baselines on suboptimal kernels run 30–60%; well-tuned kernels
+run 60–85%. 5% is the floor below which something is structurally
+wrong with the kernel shape, dispatch, or path, not a tuning gap.
+
+Cross-check with `framing trap rule` (CLAUDE.md §0): nsys "X% of NVTX
+window" tells you what fraction of wall-clock the kernel consumed,
+not whether the kernel itself runs at acceptable efficiency. Both
+checks must pass.
+
+### 7.7 SLO-shape probe before declaring win
+
+A bench at c=1 / short prompt validates the dispatch path. It does
+NOT validate scaling behavior. The 2026-05-27 incident:
+`a98c3dde` win entry (c=1 short decode 2.21× TP/allreduce vs EP)
+projected to SLO 32K prefill = **67× off** because the kernel that's
+fast at M=1 is bandwidth-bound at M=large.
+
+**Rule:** any wins entry claiming a default-flag-flip or backend
+switch must include at least one probe at:
+
+- M ≥ 4096 (prefill scaling — surface weight-reuse / M-tile bugs)
+- batch ≥ 4 concurrent requests (NCCL / scheduler contention surface)
+- prompt ≥ 8K tokens (KV pool sizing — surface OOM-near-SLO bugs)
+
+Single-row entry header `SLO-shape probed?` (Y/N + workload) is
+mandatory. N → defaults to deferred, never PASS, never default-flip.
+
+### 7.8 Bench reports 0 successful → CHECK SERVER LOG FIRST
 
 Codified from the 2026-05-10 PF8.5 v3-v10 cascade (skill
 `kernel-optimization` v1.12.0 #34b): when guidellm or any other
