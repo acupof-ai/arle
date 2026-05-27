@@ -794,9 +794,16 @@ fn dsv4_run_grouped_block_scaled_gemv(
         expert_idx_guard = None;
         std::ptr::null()
     };
+    // M-threshold dispatch: GEMV path has grid Y = max_count (no weight
+    // reuse, decode-shaped). GEMM path tiles tokens into DSV4_BATCH_TILE=32
+    // groups for 32× weight reuse — required at prefill (M>=4 per expert).
+    // FP4 has no GEMM variant yet; falls back to GEMV.
+    // Refs docs/experience/errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md.
+    let use_gemm = matches!(weights.format, DeepseekDsv4GroupedBlockFormat::Fp8)
+        && max_count >= dsv4_grouped_gemm_m_threshold();
     let res = unsafe {
-        match weights.format {
-            DeepseekDsv4GroupedBlockFormat::Fp8 => ffi::dsv4_fp8_grouped_gemv_batch_cuda(
+        match (weights.format, use_gemm) {
+            (DeepseekDsv4GroupedBlockFormat::Fp8, true) => ffi::dsv4_fp8_grouped_gemm_batch_cuda(
                 w_ptr as *const u64,
                 s_ptr as *const u64,
                 x_ptr as *const ffi::Half,
@@ -812,7 +819,23 @@ fn dsv4_run_grouped_block_scaled_gemv(
                 weights.scale_cols as i32,
                 ctx.stream.cu_stream(),
             ),
-            DeepseekDsv4GroupedBlockFormat::Fp4 => ffi::dsv4_fp4_grouped_gemv_batch_cuda(
+            (DeepseekDsv4GroupedBlockFormat::Fp8, false) => ffi::dsv4_fp8_grouped_gemv_batch_cuda(
+                w_ptr as *const u64,
+                s_ptr as *const u64,
+                x_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                off_ptr as *const i32,
+                count_ptr as *const i32,
+                expert_idx_ptr,
+                num_active_experts as i32,
+                max_count as i32,
+                weights.rows as i32,
+                weights.cols as i32,
+                weights.scale_rows as i32,
+                weights.scale_cols as i32,
+                ctx.stream.cu_stream(),
+            ),
+            (DeepseekDsv4GroupedBlockFormat::Fp4, _) => ffi::dsv4_fp4_grouped_gemv_batch_cuda(
                 w_ptr as *const u64,
                 s_ptr as *const u64,
                 x_ptr as *const ffi::Half,
@@ -833,6 +856,18 @@ fn dsv4_run_grouped_block_scaled_gemv(
     drop(expert_idx_guard);
     res.result()
         .map_err(|err| anyhow::anyhow!("DeepSeek V4 grouped expert GEMV failed: {err}"))
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_grouped_gemm_m_threshold() -> usize {
+    // Default 4: matches the _tiled_kernel fast-path break (sums4 vs sums32);
+    // below M=4 GEMV's lower register pressure wins, at/above M=4 the
+    // 32-way M-tile reuse dominates. Tunable via env for bench sweeps.
+    std::env::var("ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(4)
 }
 
 #[cfg(feature = "cuda")]
@@ -886,28 +921,54 @@ fn dsv4_run_grouped_block_scaled_gemv_pair(
         expert_idx_guard = None;
         std::ptr::null()
     };
+    // M-threshold dispatch — see dsv4_run_grouped_block_scaled_gemv comment.
+    let use_gemm = matches!(weights_a.format, DeepseekDsv4GroupedBlockFormat::Fp8)
+        && max_count >= dsv4_grouped_gemm_m_threshold();
     let res = unsafe {
-        match weights_a.format {
-            DeepseekDsv4GroupedBlockFormat::Fp8 => ffi::dsv4_fp8_grouped_gemv_pair_batch_cuda(
-                wa_ptr as *const u64,
-                sa_ptr as *const u64,
-                wb_ptr as *const u64,
-                sb_ptr as *const u64,
-                x_ptr as *const ffi::Half,
-                ya_ptr as *mut ffi::Half,
-                yb_ptr as *mut ffi::Half,
-                off_ptr as *const i32,
-                count_ptr as *const i32,
-                expert_idx_ptr,
-                num_active_experts as i32,
-                max_count as i32,
-                weights_a.rows as i32,
-                weights_a.cols as i32,
-                weights_a.scale_rows as i32,
-                weights_a.scale_cols as i32,
-                ctx.stream.cu_stream(),
-            ),
-            DeepseekDsv4GroupedBlockFormat::Fp4 => ffi::dsv4_fp4_grouped_gemv_pair_batch_cuda(
+        match (weights_a.format, use_gemm) {
+            (DeepseekDsv4GroupedBlockFormat::Fp8, true) => {
+                ffi::dsv4_fp8_grouped_gemm_pair_batch_cuda(
+                    wa_ptr as *const u64,
+                    sa_ptr as *const u64,
+                    wb_ptr as *const u64,
+                    sb_ptr as *const u64,
+                    x_ptr as *const ffi::Half,
+                    ya_ptr as *mut ffi::Half,
+                    yb_ptr as *mut ffi::Half,
+                    off_ptr as *const i32,
+                    count_ptr as *const i32,
+                    expert_idx_ptr,
+                    num_active_experts as i32,
+                    max_count as i32,
+                    weights_a.rows as i32,
+                    weights_a.cols as i32,
+                    weights_a.scale_rows as i32,
+                    weights_a.scale_cols as i32,
+                    ctx.stream.cu_stream(),
+                )
+            }
+            (DeepseekDsv4GroupedBlockFormat::Fp8, false) => {
+                ffi::dsv4_fp8_grouped_gemv_pair_batch_cuda(
+                    wa_ptr as *const u64,
+                    sa_ptr as *const u64,
+                    wb_ptr as *const u64,
+                    sb_ptr as *const u64,
+                    x_ptr as *const ffi::Half,
+                    ya_ptr as *mut ffi::Half,
+                    yb_ptr as *mut ffi::Half,
+                    off_ptr as *const i32,
+                    count_ptr as *const i32,
+                    expert_idx_ptr,
+                    num_active_experts as i32,
+                    max_count as i32,
+                    weights_a.rows as i32,
+                    weights_a.cols as i32,
+                    weights_a.scale_rows as i32,
+                    weights_a.scale_cols as i32,
+                    ctx.stream.cu_stream(),
+                )
+            }
+            (DeepseekDsv4GroupedBlockFormat::Fp4, _) => ffi::dsv4_fp4_grouped_gemv_pair_batch_cuda(
                 wa_ptr as *const u64,
                 sa_ptr as *const u64,
                 wb_ptr as *const u64,
