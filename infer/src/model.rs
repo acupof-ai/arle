@@ -437,6 +437,15 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn device_context(&self) -> &DeviceContext;
 
+    /// Phase B-1 commit C.4.6 — expose the model's EP NCCL group so the
+    /// scheduler can attach an NCCL-backed `DistributedRequestCoordination`
+    /// to incoming requests in multiproc-serve mode. Default `None`; only
+    /// distributed-aware models (e.g. DeepSeek V4) override.
+    #[cfg(feature = "nccl")]
+    fn ep_nccl(&self) -> Option<std::sync::Arc<crate::distributed::nccl::NcclGroup>> {
+        None
+    }
+
     /// Whether startup warmup may run synthetic decode work through this model.
     ///
     /// Synthetic decode is a pure performance warmup for models whose decode

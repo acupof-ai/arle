@@ -225,6 +225,11 @@ impl ModelForward for DeepseekModel {
         &self.ctx
     }
 
+    #[cfg(feature = "nccl")]
+    fn ep_nccl(&self) -> Option<std::sync::Arc<crate::distributed::nccl::NcclGroup>> {
+        self.layer_communicator.ep_nccl()
+    }
+
     fn supports_decode_warmup(&self) -> bool {
         self.config.tp.world_size == 1 && self.config.ep.world_size == 1
     }
