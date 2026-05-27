@@ -95,6 +95,13 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_cast_i32_to_i64_cuda(
+        src: *const i32,
+        dst: *mut i64,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_count_expert_ranks_cuda(
         indices: *const i32,
         counts: *mut i32,
