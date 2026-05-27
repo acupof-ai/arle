@@ -332,4 +332,17 @@ unsafe extern "C" {
         compress_ratio: i32,
         stream: super::CUstream,
     ) -> super::CUresult;
+
+    /// Fill the [s_q_actual..s_q_padded) rows of the indices buffer with -1
+    /// and the corresponding topk_length entries with 0, for FlashMLA s_q
+    /// padding (V2.3). Use this after a build_indices call that wrote rows
+    /// [0..s_q_actual). No-op when s_q_padded <= s_q_actual.
+    pub fn arle_flashmla_fill_pad_rows(
+        indices: *mut i32,
+        topk_length: *mut i32,
+        s_q_actual: i32,
+        s_q_padded: i32,
+        topk_unified: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
 }
