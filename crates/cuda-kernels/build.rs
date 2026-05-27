@@ -1414,6 +1414,10 @@ fn main() {
                 "-gencode=arch=compute_90a,code=sm_90a".to_string(),
                 format!("-I{}", flashmla_root.join("csrc").display()),
                 format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
+                format!(
+                    "-I{}",
+                    flashmla_root.join("csrc/kerutils/include").display()
+                ),
             ]);
         }
 
