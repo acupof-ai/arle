@@ -79,15 +79,26 @@ __global__ void arle_csa_build_indices_kernel(
     // dsv4_hybrid_attention_kernel:898-901): selected block c covers
     // tokens [c*compress_ratio .. (c+1)*compress_ratio - 1]; if
     // block_end > abs_pos the block summarises future tokens — mask as -1.
-    const int32_t* sel = selected + (size_t)token * index_topk;
-    for (int k = threadIdx.x; k < index_topk; k += blockDim.x) {
-        int32_t c = sel[k];
-        bool valid = (c >= 0) && (c < compressed_count);
-        if (valid && compress_ratio > 0) {
-            int block_end = c * compress_ratio + (compress_ratio - 1);
-            if (block_end > abs_pos) valid = false;
+    //
+    // selected can be nullptr when the CSA selector hasn't run yet (very early
+    // prefill, or modes that hit this path without a selector populated). Treat
+    // as "no compressed entries selected" — fill -1 padding so FlashMLA masks
+    // the entire compressed range.
+    if (selected == nullptr) {
+        for (int k = threadIdx.x; k < index_topk; k += blockDim.x) {
+            row[sw_count + k] = -1;
         }
-        row[sw_count + k] = valid ? (comp_base_in_pool + c) : -1;
+    } else {
+        const int32_t* sel = selected + (size_t)token * index_topk;
+        for (int k = threadIdx.x; k < index_topk; k += blockDim.x) {
+            int32_t c = sel[k];
+            bool valid = (c >= 0) && (c < compressed_count);
+            if (valid && compress_ratio > 0) {
+                int block_end = c * compress_ratio + (compress_ratio - 1);
+                if (block_end > abs_pos) valid = false;
+            }
+            row[sw_count + k] = valid ? (comp_base_in_pool + c) : -1;
+        }
     }
 
     // [sw_count + index_topk, topk_unified): -1 padding.
