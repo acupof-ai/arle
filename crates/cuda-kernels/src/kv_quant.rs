@@ -286,6 +286,71 @@ pub fn finalize_k_per_channel_scales(
     Ok(())
 }
 
+/// INT8 KIVI calibration step 2: divide accumulated absmax by 127 (INT8
+/// symmetric max) to produce the final per-channel scale. Same idempotent
+/// guarantee as [`finalize_k_per_channel_scales`].
+pub fn finalize_k_per_channel_scales_int8(
+    ctx: &DeviceContext,
+    k_static_scales_ptr: u64,
+    num_channels: usize,
+) -> Result<()> {
+    if num_channels == 0 {
+        return Ok(());
+    }
+    unsafe {
+        ffi::finalize_k_per_channel_scales_int8_cuda(
+            k_static_scales_ptr as *mut f32,
+            num_channels as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// INT8 KIVI per-channel K quantize for the per-decode-step append path.
+/// Mirrors [`quantize_paged_kv_fp8_per_channel`] but writes INT8 (rounded
+/// + clamped to ±127) using a pre-computed `[num_kv_heads, head_dim]`
+/// scale table.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_paged_kv_int8_per_channel(
+    ctx: &DeviceContext,
+    kv_bf16_ptr: u64,
+    kv_int8_ptr: u64,
+    k_static_scales_ptr: u64,
+    new_token_indices_gpu: &CudaSlice<i32>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    batch_size: usize,
+) -> Result<()> {
+    if batch_size == 0 {
+        return Ok(());
+    }
+    let mut offset = 0usize;
+    while offset < batch_size {
+        let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
+        let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
+        let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::quantize_paged_kv_int8_per_channel_cuda(
+                kv_bf16_ptr as *const ffi::Half,
+                kv_int8_ptr as *mut i8,
+                k_static_scales_ptr as *const f32,
+                nti_ptr as *const i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dim as i32,
+                chunk_tokens as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        offset += chunk_tokens;
+    }
+    Ok(())
+}
+
 /// Quantize + scatter contiguous bf16 KV → FP8 paged pool (for prefill→pool migration).
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_scatter_kv_fp8(
@@ -612,6 +677,63 @@ pub fn decode_attention_fp8_per_channel_k(
             q_ptr as *const ffi::Half,
             k_data_ptr as *const u8,
             v_data_ptr as *const u8,
+            k_static_scales_ptr as *const f32,
+            v_scales_ptr as *const f32,
+            ki_ptr as *const i32,
+            ip_ptr as *const i32,
+            o_ptr as *mut ffi::Half,
+            batch_size as i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            kv_dim as i32,
+            sm_scale,
+            ctx.stream.cu_stream(),
+            ws_ptr as *mut u8,
+            workspace_bytes,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// INT8 KIVI decode attention: mirrors [`decode_attention_fp8_per_channel_k`]
+/// but reads INT8 K/V from the pool with cp.async pipelining (same as the
+/// per-(row, head) INT8 sibling). See
+/// docs/plans/2026-05-27-int8-kv-kivi-per-channel.md.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_attention_int8_per_channel_k(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k_data_ptr: u64,
+    v_data_ptr: u64,
+    k_static_scales_ptr: u64,
+    v_scales_ptr: u64,
+    kv_indices: &CudaSlice<i32>,
+    kv_meta: &CudaSlice<i32>,
+    o: &mut HiddenStates,
+    batch_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    sm_scale: f32,
+    workspace: &CudaSlice<u8>,
+    workspace_bytes: usize,
+) -> Result<()> {
+    if batch_size == 0 {
+        return Ok(());
+    }
+    let (q_ptr, _g1) = q.data.device_ptr(&ctx.stream);
+    let (ki_ptr, _g2) = kv_indices.device_ptr(&ctx.stream);
+    let (ip_ptr, _g3) = kv_meta.device_ptr(&ctx.stream);
+    let (o_ptr, _g4) = o.data.device_ptr_mut(&ctx.stream);
+    let (ws_ptr, _g5) = workspace.device_ptr(&ctx.stream);
+    unsafe {
+        ffi::decode_attention_int8_per_channel_k_cuda(
+            q_ptr as *const ffi::Half,
+            k_data_ptr as *const i8,
+            v_data_ptr as *const i8,
             k_static_scales_ptr as *const f32,
             v_scales_ptr as *const f32,
             ki_ptr as *const i32,

@@ -837,4 +837,93 @@ cudaError_t finalize_k_per_channel_scales_cuda(
     return cudaGetLastError();
 }
 
+// ============================================================================
+// INT8 KIVI per-channel K finalize + per-token quantize.
+//
+// Mirrors the FP8 path above; only the symmetric range constant differs
+// (INT8 max representable = 127 vs FP8 E4M3 = 448). See
+// docs/plans/2026-05-27-int8-kv-kivi-per-channel.md for rationale.
+// ============================================================================
+
+__global__ void finalize_k_per_channel_scales_int8_kernel(
+    float* k_static_scales,
+    int num_channels)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_channels) return;
+    float v = k_static_scales[idx];
+    // INT8 symmetric range: divide accumulated absmax by 127 (max representable
+    // positive int8). Same 1e-30 floor for truly-zero channels — mirrors the
+    // FP8 finalize at line ~824.
+    k_static_scales[idx] = fmaxf(v / 127.0f, 1.0e-30f);
+}
+
+cudaError_t finalize_k_per_channel_scales_int8_cuda(
+    float* k_static_scales,
+    int num_channels,
+    cudaStream_t stream)
+{
+    if (num_channels <= 0) return cudaSuccess;
+    int block = 256;
+    int grid = (num_channels + block - 1) / block;
+    finalize_k_per_channel_scales_int8_kernel<<<grid, block, 0, stream>>>(
+        k_static_scales, num_channels);
+    return cudaGetLastError();
+}
+
+__global__ void quantize_paged_kv_int8_per_channel_kernel(
+    const __nv_bfloat16* __restrict__ kv_bf16,      // HND-paged work [page, head, token, dim]
+    int8_t* __restrict__ kv_int8,                    // INT8 pool [max_total_tokens * kv_dim]
+    const float* __restrict__ k_static_scales,       // [num_kv_heads, head_dim] per-channel scale
+    const int32_t* __restrict__ new_token_indices,   // [batch_size] pool index of newest token
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim)
+{
+    int kv_head = blockIdx.x;
+    int batch_idx = blockIdx.y;
+    int d = threadIdx.x;
+
+    if (d >= head_dim) return;
+
+    constexpr int kPageSize = 16;
+    int token_row = new_token_indices[batch_idx];
+    int page_idx = token_row / kPageSize;
+    int offset_in_page = token_row % kPageSize;
+    int row_idx = page_idx * kPageSize + offset_in_page;
+    int src_offset = page_idx * kPageSize * kv_dim
+                   + kv_head * kPageSize * head_dim
+                   + offset_in_page * head_dim
+                   + d;
+    int dst_offset = row_idx * kv_dim + kv_head * head_dim + d;
+
+    float val = __bfloat162float(kv_bf16[src_offset]);
+    float scale = k_static_scales[kv_head * head_dim + d];
+    // Mirrors the FP8 per-channel quant guard: 1e-30 floor means the
+    // calibration is untouched (truly-zero channel); produce 0 in that case
+    // since the input value should also be ~0.
+    float inv_scale = (scale > 1.0e-29f) ? (1.0f / scale) : 0.0f;
+    int q = __float2int_rn(val * inv_scale);
+    q = max(-127, min(127, q));
+    kv_int8[dst_offset] = static_cast<int8_t>(q);
+}
+
+cudaError_t quantize_paged_kv_int8_per_channel_cuda(
+    const __nv_bfloat16* kv_bf16,
+    int8_t* kv_int8,
+    const float* k_static_scales,
+    const int32_t* new_token_indices,
+    int num_kv_heads, int head_dim, int kv_dim,
+    int batch_size,
+    cudaStream_t stream)
+{
+    if (batch_size <= 0) return cudaSuccess;
+    dim3 grid(num_kv_heads, batch_size);
+    dim3 block(head_dim);
+    quantize_paged_kv_int8_per_channel_kernel<<<grid, block, 0, stream>>>(
+        kv_bf16, kv_int8, k_static_scales, new_token_indices,
+        num_kv_heads, head_dim, kv_dim);
+    return cudaGetLastError();
+}
+
 }  // extern "C"

@@ -2110,17 +2110,36 @@ impl Qwen3Model {
                     );
                 }
                 KVFormat::INT8 => {
-                    kv_quant::quantize_paged_kv_single(
-                        &self.ctx,
-                        kv_pool.k_work_ptr(stream),
-                        kv_pool.k_data_ptr(layer_idx, stream),
-                        kv_pool.k_scales_ptr(layer_idx, stream),
-                        &bufs.metadata.last_token_indices,
-                        num_kv_heads,
-                        head_dim,
-                        kv_pool.kv_dim,
-                        batch_size,
-                    )?;
+                    // KIVI per-channel K dispatch (mirrors FP8 arm above).
+                    // K quantize uses static per-channel scales when the pool
+                    // exposes them; V always uses per-(row, head). Attention
+                    // reads the per-channel K scales via the dedicated kernel.
+                    let kivi_k_static = kv_pool.k_static_scales_ptr(layer_idx, stream);
+                    if let Some(k_static_scales_ptr) = kivi_k_static {
+                        kv_quant::quantize_paged_kv_int8_per_channel(
+                            &self.ctx,
+                            kv_pool.k_work_ptr(stream),
+                            kv_pool.k_data_ptr(layer_idx, stream),
+                            k_static_scales_ptr,
+                            &bufs.metadata.last_token_indices,
+                            num_kv_heads,
+                            head_dim,
+                            kv_pool.kv_dim,
+                            batch_size,
+                        )?;
+                    } else {
+                        kv_quant::quantize_paged_kv_single(
+                            &self.ctx,
+                            kv_pool.k_work_ptr(stream),
+                            kv_pool.k_data_ptr(layer_idx, stream),
+                            kv_pool.k_scales_ptr(layer_idx, stream),
+                            &bufs.metadata.last_token_indices,
+                            num_kv_heads,
+                            head_dim,
+                            kv_pool.kv_dim,
+                            batch_size,
+                        )?;
+                    }
                     kv_quant::quantize_paged_kv_single(
                         &self.ctx,
                         kv_pool.v_work_ptr(stream),
@@ -2133,25 +2152,47 @@ impl Qwen3Model {
                         batch_size,
                     )?;
                     let sm_scale = 1.0 / (head_dim as f32).sqrt();
-                    kv_quant::decode_attention_int8(
-                        &self.ctx,
-                        &bufs.q_batch,
-                        kv_pool.k_data_ptr(layer_idx, stream),
-                        kv_pool.v_data_ptr(layer_idx, stream),
-                        kv_pool.k_scales_ptr(layer_idx, stream),
-                        kv_pool.v_scales_ptr(layer_idx, stream),
-                        &bufs.metadata.kv_indices,
-                        &bufs.quantized_kv_meta,
-                        &mut bufs.attn_output,
-                        batch_size,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        kv_pool.kv_dim,
-                        sm_scale,
-                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
-                        kv_pool.int8_attn_workspace_bytes,
-                    )?;
+                    if let Some(k_static_scales_ptr) = kivi_k_static {
+                        kv_quant::decode_attention_int8_per_channel_k(
+                            &self.ctx,
+                            &bufs.q_batch,
+                            kv_pool.k_data_ptr(layer_idx, stream),
+                            kv_pool.v_data_ptr(layer_idx, stream),
+                            k_static_scales_ptr,
+                            kv_pool.v_scales_ptr(layer_idx, stream),
+                            &bufs.metadata.kv_indices,
+                            &bufs.quantized_kv_meta,
+                            &mut bufs.attn_output,
+                            batch_size,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            kv_pool.kv_dim,
+                            sm_scale,
+                            kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                            kv_pool.int8_attn_workspace_bytes,
+                        )?;
+                    } else {
+                        kv_quant::decode_attention_int8(
+                            &self.ctx,
+                            &bufs.q_batch,
+                            kv_pool.k_data_ptr(layer_idx, stream),
+                            kv_pool.v_data_ptr(layer_idx, stream),
+                            kv_pool.k_scales_ptr(layer_idx, stream),
+                            kv_pool.v_scales_ptr(layer_idx, stream),
+                            &bufs.metadata.kv_indices,
+                            &bufs.quantized_kv_meta,
+                            &mut bufs.attn_output,
+                            batch_size,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            kv_pool.kv_dim,
+                            sm_scale,
+                            kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                            kv_pool.int8_attn_workspace_bytes,
+                        )?;
+                    }
                 }
                 KVFormat::BF16 => {
                     let max_qlen = bufs
@@ -2585,27 +2626,53 @@ impl Qwen3Model {
                     );
                 }
                 KVFormat::INT8 => {
-                    // Fused-dequant decode attention — reads INT8+scale from pool directly
+                    // Fused-dequant decode attention — reads INT8+scale from
+                    // pool directly. KIVI per-channel K when the pool exposes
+                    // static scales; per-(row, head) fallback otherwise.
                     let sm_scale = 1.0 / (head_dim as f32).sqrt();
-                    kv_quant::decode_attention_int8(
-                        &self.ctx,
-                        &bufs.q_batch,
-                        kv_pool.k_data_ptr(layer_idx, stream),
-                        kv_pool.v_data_ptr(layer_idx, stream),
-                        kv_pool.k_scales_ptr(layer_idx, stream),
-                        kv_pool.v_scales_ptr(layer_idx, stream),
-                        &bufs.metadata.kv_indices,
-                        &bufs.quantized_kv_meta,
-                        &mut bufs.attn_output,
-                        batch_size,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        kv_pool.kv_dim,
-                        sm_scale,
-                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
-                        kv_pool.int8_attn_workspace_bytes,
-                    )?;
+                    if let Some(k_static_scales_ptr) =
+                        kv_pool.k_static_scales_ptr(layer_idx, stream)
+                    {
+                        kv_quant::decode_attention_int8_per_channel_k(
+                            &self.ctx,
+                            &bufs.q_batch,
+                            kv_pool.k_data_ptr(layer_idx, stream),
+                            kv_pool.v_data_ptr(layer_idx, stream),
+                            k_static_scales_ptr,
+                            kv_pool.v_scales_ptr(layer_idx, stream),
+                            &bufs.metadata.kv_indices,
+                            &bufs.quantized_kv_meta,
+                            &mut bufs.attn_output,
+                            batch_size,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            kv_pool.kv_dim,
+                            sm_scale,
+                            kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                            kv_pool.int8_attn_workspace_bytes,
+                        )?;
+                    } else {
+                        kv_quant::decode_attention_int8(
+                            &self.ctx,
+                            &bufs.q_batch,
+                            kv_pool.k_data_ptr(layer_idx, stream),
+                            kv_pool.v_data_ptr(layer_idx, stream),
+                            kv_pool.k_scales_ptr(layer_idx, stream),
+                            kv_pool.v_scales_ptr(layer_idx, stream),
+                            &bufs.metadata.kv_indices,
+                            &bufs.quantized_kv_meta,
+                            &mut bufs.attn_output,
+                            batch_size,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            kv_pool.kv_dim,
+                            sm_scale,
+                            kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                            kv_pool.int8_attn_workspace_bytes,
+                        )?;
+                    }
                 }
                 KVFormat::BF16 => {
                     let max_qlen = bufs

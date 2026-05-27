@@ -187,6 +187,31 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// INT8 KIVI sibling of `finalize_k_per_channel_scales_cuda`: divides
+    /// accumulated absmax by 127.0 (INT8 max representable, symmetric). Same
+    /// 1e-30 floor for untouched channels. See
+    /// docs/plans/2026-05-27-int8-kv-kivi-per-channel.md.
+    pub fn finalize_k_per_channel_scales_int8_cuda(
+        k_static_scales: *mut f32,
+        num_channels: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// INT8 KIVI per-channel K quantize: mirrors
+    /// `quantize_paged_kv_fp8_per_channel_cuda` but writes INT8 (round +
+    /// clamp to [-127, 127]) instead of FP8.
+    pub fn quantize_paged_kv_int8_per_channel_cuda(
+        kv_bf16: *const Half,
+        kv_int8: *mut i8,
+        k_static_scales: *const f32,
+        new_token_indices: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn quantize_scatter_kv_fp8_cuda(
         kv_cont: *const Half,
         kv_fp8: *mut u8,
