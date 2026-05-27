@@ -1,5 +1,17 @@
 # OPD 51.03% MMLU first cross-base — rollout=128 + NaN root cause fix + 1k corpus
 
+> **CAPABILITY CLAIMS AMENDED 2026-05-28.** The 51.03% MMLU cross-base
+> headline and the "GSM8K regression to 28-30%" claim do not survive
+> 5-seed verification at matched n=200 — mean MMLU = 50.53 ± 5.09pp
+> (statistically indistinguishable from base 49.66%), mean GSM8K =
+> 33.60 > base 32.5% (regression direction reversed). See
+> [`docs/experience/errors/2026-05-28-mmlu-cross-base-was-noise.md`](../errors/2026-05-28-mmlu-cross-base-was-noise.md)
+> for the methodological post-mortem. The train-side engineering wins
+> below (NaN root cause, chunked KL bwd, KV in-place append, completion-
+> only KL mask, mid-rollout retain pruning) remain valid — those are
+> verified at mechanism level (sanitizer NaN count 532k → 0/step), not
+> at capability level.
+
 ## Context
 
 ARLE OPD had never crossed base 0.8B MMLU before this session. Prior best
