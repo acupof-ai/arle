@@ -2572,6 +2572,8 @@ impl DeepseekModel {
         weight_map: &std::collections::HashMap<String, usize>,
         names: &deepseek_spec::DeepSeekV4AttentionTensorNames,
     ) -> Result<DeepseekV4Attention> {
+        let attn_sink_bf16 = load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.attn_sink)?;
+        let attn_sink_f32 = build_attn_sink_f32_mirror(&self.ctx, &attn_sink_bf16)?;
         Ok(DeepseekV4Attention {
             wq_a: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.wq_a)?,
             q_norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.q_norm)?,
@@ -2580,7 +2582,8 @@ impl DeepseekModel {
             kv_norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.kv_norm)?,
             wo_a: self.load_tp_column_matrix(shards, weight_map, &names.wo_a)?,
             wo_b: self.load_tp_row_matrix(shards, weight_map, &names.wo_b)?,
-            attn_sink: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.attn_sink)?,
+            attn_sink: attn_sink_bf16,
+            attn_sink_f32,
             compressor: names
                 .compressor
                 .as_ref()
@@ -4195,6 +4198,41 @@ fn dsv4_fuse_qk_prep_enabled() -> Result<bool> {
     }
 }
 
+/// Allocate + populate an f32 mirror of an attn_sink bf16 vector. Used at
+/// model load so the FlashMLA SM90 sparse prefill (`float[h_q]` contract)
+/// can read the sink directly without a per-call up-cast. The mirror is
+/// allocated on the same length as the bf16 source (full TP-replicated
+/// `[num_attention_heads]`); FlashMLA dispatch offsets by
+/// `tp.rank * local_heads` into this buffer.
+#[cfg(feature = "cuda")]
+fn build_attn_sink_f32_mirror(
+    ctx: &DeviceContext,
+    bf16_sink: &DeviceVec,
+) -> Result<cudarc::driver::CudaSlice<f32>> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let n = bf16_sink.len;
+    let mut dst: cudarc::driver::CudaSlice<f32> = ctx
+        .stream
+        .alloc_zeros::<f32>(n)
+        .map_err(|err| anyhow::anyhow!("attn_sink f32 mirror alloc failed: {err}"))?;
+    {
+        let (src_ptr, _src_guard) = bf16_sink.data.device_ptr(&ctx.stream);
+        let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::arle_bf16_to_f32_cuda(
+                src_ptr as *const ffi::Half,
+                dst_ptr as *mut f32,
+                n as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| anyhow::anyhow!("attn_sink bf16→f32 convert failed: {err}"))?;
+        }
+        // Explicit drop order: guards released here before `dst` moves out.
+    }
+    Ok(dst)
+}
+
 /// Opt-in route DSv4 CSA-mode prefill attention through the vendored
 /// FlashMLA SM90 sparse prefill kernel (replaces the per-token
 /// `dsv4_hybrid_attention_kernel` for `token_count > 1` only).
@@ -4367,6 +4405,10 @@ mod tests {
             wo_a: matrix(ctx, &[0.0], 1, 1)?,
             wo_b: matrix(ctx, &[0.0, 0.0], 2, 1)?,
             attn_sink: vec(ctx, &[0.0])?,
+            attn_sink_f32: ctx
+                .stream
+                .alloc_zeros::<f32>(1)
+                .map_err(|err| anyhow::anyhow!("test attn_sink_f32 alloc: {err}"))?,
             compressor: None,
             indexer: None,
         })
@@ -4641,6 +4683,10 @@ mod tests {
             wo_a: matrix(&ctx, &[1.0], 1, 1)?,
             wo_b: matrix(&ctx, &[1.0, 1.0], 2, 1)?,
             attn_sink: vec(&ctx, &[0.0])?,
+            attn_sink_f32: ctx
+                .stream
+                .alloc_zeros::<f32>(1)
+                .map_err(|err| anyhow::anyhow!("test attn_sink_f32 alloc: {err}"))?,
             compressor: None,
             indexer: None,
         };
@@ -4685,6 +4731,10 @@ mod tests {
             wo_a: matrix(&ctx, &[1.0], 1, 1)?,
             wo_b: matrix(&ctx, &[1.0, 1.0], 2, 1)?,
             attn_sink: vec(&ctx, &[0.0])?,
+            attn_sink_f32: ctx
+                .stream
+                .alloc_zeros::<f32>(1)
+                .map_err(|err| anyhow::anyhow!("test attn_sink_f32 alloc: {err}"))?,
             compressor: None,
             indexer: None,
         };
