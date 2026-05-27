@@ -187,17 +187,46 @@ task. User signoff required before any actual refactor.
 
 ## Side tasks (parallel, low-priority)
 
-### Task F — extractor improvement for MMLU invalid responses
+### Task F — REPLACE MMLU letter generation with logprob scoring (was: extractor patch)
 
-The `arle_capability_eval.py` MMLU extractor fails on 18% of responses
-(30/171 per seed). The tick-6 patch adds `mmlu_invalid.json` dumping
-EVERY invalid response (commit `e68aa26c`). After running the next
-multi-seed eval (whenever that happens), the
-`runs/.../seed_N/mmlu_invalid.json` files will give empirical failure
-modes. Patch `_mmlu_extract_letter` at
-`scripts/arle_capability_eval.py:195` with new layers covering those
-modes. Kill criterion: bring n_scored / n_samples from 145/171 to
-≥160/171 on the same prompts.
+**Updated 2026-05-28 tick 9 after empirical data.** Ran a fresh
+base seed=5 with the new `mmlu_invalid.json` dump (commit `e68aa26c`)
+to characterize the 18% invalid rate. Findings from
+`runs/2026-05-28-base-extractor-data/capability_seeds/seed_5/mmlu_invalid.json`
+(26 invalids):
+
+- **24/26** are letter-enumeration responses (' ABCD', ' ACD', ' BCD',
+  ' ABC', etc.) — the model never commits to a single letter.
+- **2/26** are " None of the above" — model commits to "none".
+- **0/26** are responses an improved extractor could legitimately
+  rescue without introducing false positives.
+
+The extractor at `scripts/arle_capability_eval.py:195` is **already
+correct** on these — None is the right return on a genuine
+enumeration. Patching to extract the first letter would be a false
+positive (picking A from "ABCD" doesn't reflect the model's choice).
+Max potential gain from extractor work: ~1pp better n. Not worth it.
+
+**Real fix path** — bigger scope:
+
+1. **Constrained decode**: restrict the completion to A/B/C/D only at
+   the HTTP layer. Either add a stop-sequence on whitespace + non-
+   letter, or use the existing xgrammar matcher
+   (`crates/xgrammar-sys`) to constrain to `(A|B|C|D)`.
+2. **Logprob scoring**: compute log P(letter|prompt) for each of A/B/
+   C/D directly from the model's first-position output distribution.
+   The infer engine already returns logprobs through `/v1/completions`
+   with `logprobs=N` — wire that into MMLU and rank A-D by logprob.
+   This eliminates extraction entirely and is the standard MMLU eval
+   methodology (cf. lm-evaluation-harness `loglikelihood` mode).
+3. **Prompt change**: append "Answer with exactly one letter (A, B,
+   C, or D):" to push the model toward commitment. Lower-effort,
+   smaller gain than the above.
+
+Kill criterion for the logprob path: at n_samples=200, invalid rate
+should drop to ≤2% (from current 15-18%). Also enables true paired
+comparison since logprobs are deterministic across the same model
+state.
 
 ### Task G — kv-tier audit follow-ups not landed in tick 1
 
