@@ -296,6 +296,10 @@ def run_mmlu(
     per_subject: dict[str, dict] = {}
     debug_records: list[dict] = []
     invalid_records: list[dict] = []
+    # Per-question outcomes for paired McNemar-style analysis at the
+    # question level (n=~145 paired per seed vs n=5 paired across seeds —
+    # much tighter SE when comparing two models on the same seed).
+    per_question: list[dict] = []
     t0 = time.time()
     for i, ex in enumerate(pool):
         subj = ex["subject"]
@@ -318,13 +322,17 @@ def run_mmlu(
             print(f"[mmlu] sample {i} request error: {exc}", flush=True)
             invalid += 1
             invalid_records.append({"i": i, "subject": subj, "kind": "request_error", "reason": str(exc)})
+            per_question.append({"i": i, "subject": subj, "gold": None, "predicted": None,
+                                 "status": "request_error"})
             continue
         letter = _mmlu_extract_letter(resp)
         gold = chr(ord("A") + ex["answer"])
         sub_stat = per_subject.setdefault(subj, {"correct": 0, "total": 0})
         sub_stat["total"] += 1
+        status = "scored"
         if letter is None:
             invalid += 1
+            status = "extract_fail"
             # Save every extractor-fail response so future extractor patches
             # can target empirical failure modes (not guessed shapes).
             invalid_records.append({
@@ -337,6 +345,14 @@ def run_mmlu(
         elif letter == gold:
             correct += 1
             sub_stat["correct"] += 1
+        per_question.append({
+            "i": i,
+            "subject": subj,
+            "gold": gold,
+            "predicted": letter,
+            "correct": letter == gold,
+            "status": status,
+        })
         if i < debug_samples:
             debug_records.append(
                 {
@@ -370,6 +386,7 @@ def run_mmlu(
         (output_dir / "mmlu_debug.json").write_text(json.dumps(debug_records, indent=2))
     if invalid_records:
         (output_dir / "mmlu_invalid.json").write_text(json.dumps(invalid_records, indent=2))
+    (output_dir / "mmlu_perquestion.json").write_text(json.dumps(per_question, indent=2))
     print(f"[mmlu] accuracy={accuracy:.3f} ({correct}/{scored}, invalid={invalid}, {elapsed:.1f}s)", flush=True)
     return report
 
@@ -438,6 +455,7 @@ def run_gsm8k(
     correct = 0
     invalid = 0
     debug_records: list[dict] = []
+    per_question: list[dict] = []
     t0 = time.time()
     for i, ex in enumerate(pool):
         prompt = few_shot + f"Q: {ex['question']}\nA:"
@@ -446,13 +464,23 @@ def run_gsm8k(
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             print(f"[gsm8k] sample {i} request error: {exc}", flush=True)
             invalid += 1
+            per_question.append({"i": i, "gold": None, "predicted": None, "status": "request_error"})
             continue
         gold = _gsm8k_gold_answer(ex["answer"])
         pred = _gsm8k_extract_answer(resp)
+        status = "scored"
         if pred is None:
             invalid += 1
+            status = "extract_fail"
         elif pred == gold:
             correct += 1
+        per_question.append({
+            "i": i,
+            "gold": gold,
+            "predicted": pred,
+            "correct": pred == gold if pred is not None else False,
+            "status": status,
+        })
         if i < debug_samples:
             debug_records.append(
                 {
@@ -486,6 +514,7 @@ def run_gsm8k(
     (output_dir / "gsm8k.json").write_text(json.dumps(report, indent=2))
     if debug_records:
         (output_dir / "gsm8k_debug.json").write_text(json.dumps(debug_records, indent=2))
+    (output_dir / "gsm8k_perquestion.json").write_text(json.dumps(per_question, indent=2))
     print(f"[gsm8k] accuracy={accuracy:.3f} ({correct}/{scored}, invalid={invalid}, {elapsed:.1f}s)", flush=True)
     return report
 
