@@ -895,6 +895,14 @@ pub struct SchedulerHandle {
     /// `RequestHandle::server_metrics()`. `None` in legacy / test paths
     /// that build the handle without metrics wiring.
     server_metrics: Option<crate::metrics::ServerMetrics>,
+    /// Phase B-1 commit C.4.6.2 — the model's EP NCCL group, populated
+    /// post-model-load by `spawn_scheduler_handle_from_path`. The
+    /// request-submission path uses this to attach
+    /// `DistributedRequestCoordination::Nccl` in multiproc-serve mode
+    /// (commit C.4.6.3+). `None` for non-distributed models or backends
+    /// without NCCL.
+    #[cfg(feature = "nccl")]
+    ep_nccl: Option<Arc<crate::distributed::nccl::NcclGroup>>,
 }
 
 pub struct SchedulerSubmissionPermit<'a> {
@@ -965,6 +973,8 @@ impl SchedulerHandle {
             waiting_count: Arc::new(AtomicUsize::new(0)),
             max_waiting: 0,
             server_metrics: None,
+            #[cfg(feature = "nccl")]
+            ep_nccl: None,
         }
     }
 
@@ -985,6 +995,8 @@ impl SchedulerHandle {
             waiting_count: Arc::new(AtomicUsize::new(0)),
             max_waiting,
             server_metrics: None,
+            #[cfg(feature = "nccl")]
+            ep_nccl: None,
         }
     }
 
@@ -1006,6 +1018,8 @@ impl SchedulerHandle {
             waiting_count,
             max_waiting,
             server_metrics: None,
+            #[cfg(feature = "nccl")]
+            ep_nccl: None,
         }
     }
 
@@ -1026,6 +1040,8 @@ impl SchedulerHandle {
             waiting_count,
             max_waiting,
             server_metrics: None,
+            #[cfg(feature = "nccl")]
+            ep_nccl: None,
         }
     }
 
@@ -1033,6 +1049,25 @@ impl SchedulerHandle {
     pub fn with_tokenizer(mut self, tokenizer: Tokenizer) -> Self {
         self.tokenizer = Some(tokenizer);
         self
+    }
+
+    /// Phase B-1 commit C.4.6.2 — attach the model's EP NCCL group
+    /// post-construction. `spawn_scheduler_handle_from_path` extracts
+    /// this via `ModelForward::ep_nccl()` and threads it through here so
+    /// the request-submission path can build NCCL-backed
+    /// `DistributedRequestCoordination` instances.
+    #[cfg(feature = "nccl")]
+    #[must_use]
+    pub fn with_ep_nccl(mut self, nccl: Arc<crate::distributed::nccl::NcclGroup>) -> Self {
+        self.ep_nccl = Some(nccl);
+        self
+    }
+
+    /// Returns the model's EP NCCL group, if one was attached via
+    /// `with_ep_nccl` (multiproc-serve setup).
+    #[cfg(feature = "nccl")]
+    pub fn ep_nccl(&self) -> Option<Arc<crate::distributed::nccl::NcclGroup>> {
+        self.ep_nccl.clone()
     }
 
     #[cfg(feature = "cuda")]

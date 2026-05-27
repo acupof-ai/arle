@@ -550,6 +550,13 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         scheduler.max_slots,
     );
 
+    // Phase B-1 commit C.4.6.2 — extract the EP NCCL group BEFORE the
+    // model is moved into Scheduler::with_config, so we can attach it to
+    // the returned SchedulerHandle for the multiproc-serve request-
+    // submission path. Models that don't override the default trait
+    // method return None and this is a no-op.
+    #[cfg(feature = "nccl")]
+    let ep_nccl = model.ep_nccl();
     let (scheduler, handle) = Scheduler::with_config(
         model,
         tokenizer,
@@ -562,6 +569,12 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         kv_pool_format,
         worker_placement.clone(),
     )?;
+    #[cfg(feature = "nccl")]
+    let handle = if let Some(nccl) = ep_nccl {
+        handle.with_ep_nccl(nccl)
+    } else {
+        handle
+    };
     let (ready_tx, ready_rx) = mpsc::channel();
     let scheduler_thread_placement = worker_placement.clone();
     let scheduler_thread_cuda_ordinal = cuda_device_ordinal;
