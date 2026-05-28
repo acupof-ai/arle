@@ -81,6 +81,24 @@ implementation detail.
 - `docs/projects/mlx-backend-roadmap.md` — Metal backend project, including
   the HTTP-side acceptance contract this AGENTS file points at.
 
+## Distilled lessons
+
+- **Streaming-cancel propagation from client → scheduler is a c-sweep correctness gate.** GuideLLM
+  c-sweeps with stale uncancelled requests contaminate later concurrency windows; fix the
+  abort-path through `delta_tx`/scheduler signaling before reading c≥4 numbers
+  (`errors/2026-05-26-qwen35-hybrid-mixed-kill.md`).
+- **Long-prompt serving bugs are silent against ARLE-only smoke tests** until validated against
+  a PyTorch reference at matched sample size. Any HTTP-layer change touching prompt handling
+  needs cross-engine validation (`wins/2026-05-22-arle-serve-long-prompt-bug-fix.md`,
+  `wins/2026-05-22-arle-vs-hf-transformers-cross-validation.md`).
+- **`session_id` empty string and whitespace MUST normalize to `None`** via
+  `openai_v1::normalize_session_id`. Empty `session_id` strings hitting the scheduler create
+  collision keys across unrelated tenants — verify both the `session_id` field AND `user`
+  alias normalize through the same helper.
+- **`bench validation` failure (TTFT=0, `ttft_ms=null`) reaching the scheduler is a server-block
+  signal, not a GuideLLM metric bug.** Inspect server logs first
+  (`errors/2026-05-25-prefill-graph-default-kill.md`).
+
 ## Performance verification
 
 External perf measurement of this HTTP surface uses

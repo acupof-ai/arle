@@ -48,6 +48,19 @@ Load this file before editing anything under `infer/src/backend/`.
 4. If it's single-request, reuse `BackendRuntimeHandle`; if multi-request,
    write a scheduler analogous to `scheduler/cuda/`, not a special case of it.
 
+## Distilled lessons
+
+- **`InferenceBackend::generate_stream` blanket-forwards to `generate`** in `backend.rs`. When
+  adding a backend that needs true streaming, override the blanket impl — don't add a
+  per-handler if-streaming branch upstream in `http_server`.
+- **`BackendRuntimeHandle` already implements CAS-loop admission with `max_waiting`.** Don't
+  reinvent admission throttling for Metal/CPU; the channel-send-failure path also drops the
+  waiting count — preserve that semantic if you ever fork it.
+- **CUDA-only types (cudarc handles, TileLang metadata, PagedKVPool) NEVER leak through
+  `backend.rs`.** The trait method signatures stay backend-neutral; use
+  `server_engine::LoadedInferenceEngine` enum dispatch for backend-specific concrete types
+  (root `AGENTS.md §Backend isolation`).
+
 ## Pointers
 
 - `docs/architecture.md` — the Option-A/Option-B story, why CUDA is still
