@@ -202,6 +202,54 @@ that strengthens the runtime spine). It must stay narrow:
   `cargo run --release -p autograd --example bench_step_matmul --features metal -- --backend metal --d 128 --iters 200 --batch 32`.
   Acceptance gate from the M5.3a plan: Metal ≥ 1.1× CPU at d_model=128.
 
+## Distilled lessons (recurring ≥2 entries)
+
+- **Phase-counter wins that lose full-step wall-clock are dead optimizations.** Target metrics
+  diagnose; the license decision uses matched end-to-end wall-clock with the narrower counter
+  used only to *explain* the result (`errors/2026-05-20-opd-merge-grad-shared-first-revert.md`).
+- **Pre-license future micro-fusion only if one of these is true:** the target cluster ≥ 10 ms
+  step wall-clock, the fused kernel removes a materialization or allocation (not just one
+  elementwise launch), or `ncu` shows launch overhead (not memory traffic) is dominant
+  (`errors/2026-05-21-arle-cuda-opd-swiglu-fused-kill.md`,
+  `errors/2026-05-21-arle-cuda-opd-sdpa-mask-softmax-fuse-kill.md`).
+- **Don't extrapolate Qwen3-0.6B OPD timings to Qwen3.5-0.8B.** Different vocab size and head
+  geometry, plus the infer-teacher bridge adds a scheduler-backed raw-logits path that needs
+  its own phase attribution (`errors/2026-05-21-arle-opd-infer-teacher-selfteach-gate-kill.md`).
+- **`post_step_cleanup` regressions are device-allocator/free-count problems**, not host-mirror
+  bugs. Cleanup-axis license must show full-step wall-clock improvement, not just shifting time
+  out of the named phase (`errors/2026-05-21-arle-cuda-opd-post-step-cleanup-kill.md`).
+- **CUDA Graph capture for rollout decode needs preallocated input/output buffers + device-resident
+  RoPE cache + a replay-correctness gate.** Compare rollout token sequences vs non-graph for the
+  first 7 decode iterations *before* any wall-clock license decision
+  (`errors/2026-05-21-arle-cuda-opd-rollout-graph-capture-kill.md`).
+- **HF Trainer scheduler defaults are not neutral.** Linear LR decay over 500 steps changes
+  convergence; lock Trainer LR schedule before head-to-head OPD comparisons or the bench
+  reads framework defaults as quality (`wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md`).
+- **Held-out KL beats exact-token overlap as the lead OPD metric.** Exact-overlap can show ARLE
+  losing 5pp while held-out KL shows ARLE generalizes 13pp better — overlap rewards memorization
+  on the SFT corpus (`wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md`).
+- **OPD KL-monotonicity is a train-loop gate, not generation-quality.** For quantized teacher
+  paths, public-headline switches need either a multi-token generation gate or a token-level
+  parity gate (greedy argmax divergence at position N) before headline numbers
+  (`errors/2026-05-21-arle-cuda-opd-9b-tq4-generation-quality-kill.md`).
+- **U-curve (KL down + capability briefly down then recovery) is the literature-default OPD
+  trajectory.** Eval every saved intermediate checkpoint before concluding "OPD hurt this model";
+  a monotonically-falling KL with non-monotonic capability is the smoking gun for incomplete recovery
+  (`wins/2026-05-22-distill-trajectory-valley-then-recovery.md`).
+- **Single-task capability eval is not enough to verdict an OPD run.** Tasks respond at different
+  speeds and directions to the same signal; minimum evidence is the eval triplet across ≥ 2
+  capability dimensions, with absolute-noise-floor accuracies excluded from delta reading
+  (`wins/2026-05-22-opd-task-divergent-impact.md`).
+- **Cross-engine validation against PyTorch reference catches silent serving-side corruption.**
+  ARLE-only smoke tests passed during a GDR prefill bug for weeks because they had no PyTorch
+  baseline to diverge from; new hot-path changes must run a matched-sample-size HF comparison
+  (`wins/2026-05-22-arle-vs-hf-transformers-cross-validation.md`).
+- **A checkpoint writer is not an eval pipeline until the serving runtime can load the artifact
+  it writes.** OPD capability claims gate on the whole chain: train → save → load → eval → compare
+  (`errors/2026-05-22-checkpoint-save-or-load-kill.md`,
+  `wins/2026-05-22-p1b-train-save-load-eval-loop.md`,
+  `wins/2026-05-22-qwen35-lora-serve-load.md`).
+
 ## Related memories
 
 - [`feedback_no_half_states.md`](../../.claude/projects/-Users-user-code-agent-infer/memory/feedback_no_half_states.md)
