@@ -24,6 +24,20 @@ struct __half;
 
 extern "C" {
 
+cudaError_t arle_flashmla_sm90_sparse_prefill_fwd(
+    const __half* /*q*/, const __half* /*kv*/, const int32_t* /*indices*/,
+    const float* /*attn_sink*/, const int32_t* /*topk_length*/,
+    __half* /*out*/, float* /*max_logits*/, float* /*lse*/,
+    int32_t /*s_q*/, int32_t /*s_kv*/, int32_t /*h_q*/, int32_t /*h_kv*/,
+    int32_t /*d_qk*/, int32_t /*d_v*/, int32_t /*topk*/, float /*sm_scale*/,
+    int32_t /*stride_q_s_q*/, int32_t /*stride_q_h_q*/,
+    int32_t /*stride_kv_s_kv*/, int32_t /*stride_kv_h_kv*/,
+    int32_t /*stride_indices_s_q*/, int32_t /*stride_indices_h_kv*/,
+    int32_t /*num_sm*/, CUstream_st* /*stream*/
+) {
+    return cudaErrorNotSupported;
+}
+
 cudaError_t arle_flashmla_sm90_sparse_decode_fwd(
     const __half* /*q*/,
     const __half* /*kv*/,
