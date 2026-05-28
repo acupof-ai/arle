@@ -143,13 +143,16 @@ static int choose_decode_num_splits(
 
 // FP8 E4M3 fused-dequant decode attention (same split-KV, no scales).
 // ============================================================================
-// KIVI per-channel K partial kernel: same as decode_attention_fp8_partial_kernel
-// but reads K scale from a `[num_kv_heads, head_dim]` static table instead of
-// per-(token, head) `K_scales`. V keeps per-(token, head) scales (KIVI's
-// asymmetric scheme). The per-channel K scale lookup uses each thread's
-// own dim block — pre-loaded into registers once at kernel entry, then
-// reused across all tokens (no per-token scale load, faster than the
-// per-token variant).
+// KIVI per-channel K partial kernel: reads K scale from a
+// `[num_kv_heads, head_dim]` static table; V keeps per-(token, head) scales
+// (KIVI's asymmetric scheme). The per-channel K scale lookup uses each
+// thread's own dim block — pre-loaded into registers once at kernel entry,
+// then reused across all tokens (no per-token scale load).
+//
+// K/V tiles are double-buffered into shared memory via `cp.async` (mirrors
+// the INT8 sibling at line ~421); the previous version used blocking
+// `__nv_fp8x4_e4m3` global loads from inside the compute loop. GAP-C-cheap
+// (2026-05-28 SOTA audit) — see `docs/research/2026-05-28-arle-kernel-vs-sota-audit.md`.
 // ============================================================================
 extern "C++" {
 template <int HEAD_DIM>
@@ -190,10 +193,6 @@ __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
     int page_start_global = page_indptr[req_idx];
     int page_end_global = page_indptr[req_idx + 1];
     int total_pages = page_end_global - page_start_global;
-    int total_tokens = total_pages == 0
-        ? 0
-        : (total_pages - 1) * kQuantPageSize + last_page_len[req_idx];
-    (void)total_tokens;
     int page_chunk_size = (total_pages + num_splits - 1) / num_splits;
     int my_page_start = split_idx * page_chunk_size;
     int my_page_end = min(my_page_start + page_chunk_size, total_pages);
@@ -228,24 +227,63 @@ __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
     float m_local = -FLT_MAX;
     float l_local = 0.0f;
 
-    for (int page_local_idx = 0; page_local_idx < my_page_end - my_page_start; page_local_idx++) {
+    __shared__ __nv_fp8_e4m3 smem_k[2][TILE_TOKENS][HEAD_DIM];
+    __shared__ __nv_fp8_e4m3 smem_v[2][TILE_TOKENS][HEAD_DIM];
+    __shared__ float smem_v_scales[2][TILE_TOKENS];
+
+    __shared__ float smem_m[NUM_WARPS];
+    __shared__ float smem_l[NUM_WARPS];
+    __shared__ float smem_o[NUM_WARPS * HEAD_DIM];
+
+    const int d_base = lane_id * EPT;
+    auto preload_page = [&](int stage, int page_local_idx) {
         int global_page = my_page_start + page_local_idx;
         int page_idx = kv_indices[page_start_global + global_page];
         int row_base = page_idx * kQuantPageSize;
         int page_tokens = (global_page == total_pages - 1) ? last_page_len[req_idx] : kQuantPageSize;
-
         for (int t = warp_id; t < page_tokens; t += NUM_WARPS) {
             int row_idx = row_base + t;
             int base = row_idx * kv_dim + kv_head * HEAD_DIM;
-            int scale_offset = row_idx * num_kv_heads + kv_head;
-            float v_scale = V_scales[scale_offset];
+            int scale_off = row_idx * num_kv_heads + kv_head;
 
+            __pipeline_memcpy_async(
+                &smem_k[stage][t][d_base],
+                &K_data[base + d_base],
+                sizeof(__nv_fp8_e4m3) * EPT);
+            __pipeline_memcpy_async(
+                &smem_v[stage][t][d_base],
+                &V_data[base + d_base],
+                sizeof(__nv_fp8_e4m3) * EPT);
+            // K_static_scales is per-channel (already in registers), so we
+            // only need to async-load V scale here.
+            if (lane_id == 0) {
+                __pipeline_memcpy_async(&smem_v_scales[stage][t], &V_scales[scale_off], sizeof(float));
+            }
+        }
+        __pipeline_commit();
+    };
+
+    preload_page(0, 0);
+
+    for (int page_local_idx = 0; page_local_idx < my_page_end - my_page_start; page_local_idx++) {
+        int stage = page_local_idx & 1;
+        int global_page = my_page_start + page_local_idx;
+        int page_tokens = (global_page == total_pages - 1) ? last_page_len[req_idx] : kQuantPageSize;
+
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        int next_page_local_idx = page_local_idx + 1;
+        if (next_page_local_idx < my_page_end - my_page_start) {
+            preload_page(next_page_local_idx & 1, next_page_local_idx);
+        }
+
+        for (int t = warp_id; t < page_tokens; t += NUM_WARPS) {
             float qk = 0.0f;
             #pragma unroll
             for (int i = 0; i < EPT; i += 4) {
-                int d = lane_id * EPT + i;
                 __nv_fp8x4_e4m3 packed =
-                    *reinterpret_cast<const __nv_fp8x4_e4m3*>(K_data + base + d);
+                    *reinterpret_cast<const __nv_fp8x4_e4m3*>(&smem_k[stage][t][d_base + i]);
                 float4 k_vals = static_cast<float4>(packed);
                 qk += q_reg[i + 0] * k_vals.x * k_scale_reg[i + 0];
                 qk += q_reg[i + 1] * k_vals.y * k_scale_reg[i + 1];
@@ -259,11 +297,11 @@ __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
             float exp_qk = __expf(qk - m_new);
             float l_new = l_local * exp_diff + exp_qk;
 
+            float v_scale = smem_v_scales[stage][t];
             #pragma unroll
             for (int i = 0; i < EPT; i += 4) {
-                int d = lane_id * EPT + i;
                 __nv_fp8x4_e4m3 packed =
-                    *reinterpret_cast<const __nv_fp8x4_e4m3*>(V_data + base + d);
+                    *reinterpret_cast<const __nv_fp8x4_e4m3*>(&smem_v[stage][t][d_base + i]);
                 float4 v_vals = static_cast<float4>(packed);
                 o_reg[i + 0] = o_reg[i + 0] * exp_diff + exp_qk * v_vals.x * v_scale;
                 o_reg[i + 1] = o_reg[i + 1] * exp_diff + exp_qk * v_vals.y * v_scale;
@@ -273,12 +311,9 @@ __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
             m_local = m_new;
             l_local = l_new;
         }
-    }
 
-    // Cross-warp merge (identical to per-token-scale variant)
-    __shared__ float smem_m[NUM_WARPS];
-    __shared__ float smem_l[NUM_WARPS];
-    __shared__ float smem_o[NUM_WARPS * HEAD_DIM];
+        __syncthreads();
+    }
 
     if (lane_id == 0) {
         smem_m[warp_id] = m_local;
@@ -314,13 +349,13 @@ __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
             partial_l[out_idx] = final_l;
         }
         // CRITICAL: write the *normalized* per-split average (final_o /
-        // final_l), matching `decode_attention_fp8_partial_kernel` and the
-        // merge-kernel contract at line ~295: `o_s * s_cur / l_new` with
-        // `s_cur = l_s * exp(...)` only balances if o_s is pre-normalized.
-        // Unnormalized writes produce O(l_s)-scale-off attention output and
-        // were the actual root cause of the 2026-05-26 KIVI bit-identical
-        // failure pattern (`fp8 mean_match=0.0156` unchanged regardless of
-        // K calibration quality).
+        // final_l), matching the Phase-2 merge contract at line ~295:
+        // `o_s * s_cur / l_new` with `s_cur = l_s * exp(...)` only balances
+        // if o_s is pre-normalized. Unnormalized writes produce
+        // O(l_s)-scale-off attention output and were the actual root cause
+        // of the 2026-05-26 KIVI bit-identical failure pattern
+        // (`fp8 mean_match=0.0156` unchanged regardless of K calibration
+        // quality).
         float inv_final_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
         #pragma unroll
         for (int i = 0; i < EPT; i++)
@@ -407,14 +442,12 @@ cudaError_t decode_attention_fp8_per_channel_k_cuda(
 // ============================================================================
 // INT8 KIVI per-channel K decode attention.
 //
-// Mirrors `decode_attention_int8_partial_kernel` (cp.async pipelined) but
-// reads K scale from a `[num_kv_heads, head_dim]` static table preloaded
+// Reads K scale from a `[num_kv_heads, head_dim]` static table preloaded
 // into registers, instead of per-(token, head) `K_scales`. V keeps its
-// per-(token, head) scales (KIVI's asymmetric design). See FP8 sibling
-// `decode_attention_fp8_per_channel_k_partial_kernel` (line ~606) for the
-// algorithm; the only differences here are int8/float dequant and the
-// cp.async pipelining (which the INT8 sibling uses but the FP8 sibling
-// does not).
+// per-(token, head) scales (KIVI's asymmetric design). Same cp.async
+// double-buffered tile pipeline as the FP8 sibling
+// `decode_attention_fp8_per_channel_k_partial_kernel`; the only differences
+// here are int8/float dequant in the QK / PV inner loop.
 // ============================================================================
 extern "C++" {
 template <int HEAD_DIM>
@@ -614,7 +647,7 @@ __global__ void decode_attention_int8_per_channel_k_partial_kernel(
             partial_l[out_idx] = final_l;
         }
         // Write normalized partial (matches Phase-2 merge contract — see FP8
-        // sibling's comment at line ~766 for the unnormalized-write incident).
+        // sibling for the 2026-05-26 unnormalized-write incident comment).
         float inv_final_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
         #pragma unroll
         for (int i = 0; i < EPT; i++) {
