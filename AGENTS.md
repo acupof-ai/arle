@@ -288,6 +288,48 @@ Evaluate against the project-specific heat map in
 — that's where the audited priorities live. Measure with `ncu` (CUDA) or
 Xcode Metal capture / MLX instruments (Metal).
 
+### Distilled lessons (cross-module, recurring ≥3 entries)
+
+- **SLO verdict must come from the SLO workload, not a smoke shape.** A c=1 short-prompt
+  nsys breakdown predicting "2× win" routinely flips on the production prompt length
+  because the path's scaling curve is shape-specific
+  (`errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md`).
+- **`plan_label=mixed` / "executes new path" is reachability evidence, not a license to land.**
+  c-sweep must clear TTFT *and* ITL *and* output throughput before any default flip
+  (`errors/2026-05-25-axis2-mixed-default-kill.md`, `errors/2026-05-26-qwen35-hybrid-mixed-kill.md`,
+  `errors/2026-05-25-axis3-chunked-prefill-size-kill.md`).
+- **Backend / quant / decoding default flips need multi-shape verification.** Single-shape ROI
+  shows "what's possible"; ≥2 binding production shapes show "what's safe to default"
+  (`wins/2026-05-08-prefill-cap-8-multi-shape-safe-default-flip.md`,
+  `errors/2026-05-08-w4-c8-deadlock-confirms-workload-dependent.md`).
+- **A/B must be same-binary, same-shell, same-prompt, two env flips, side-by-side.** Cross-day
+  baseline-vs-treatment claims don't survive — intermediate commits drift backend / KV dtype
+  / scheduler tuning (`wins/2026-05-27-dsv4-native-deepep-perf-ab.md`).
+- **Smoke-output garbage is config-suspect first, code-suspect second.** When a new GPU forward
+  path produces nonsense, A/B against the prod backend on the *same* config before staring at
+  the new code; if prod is also broken, the serving config is the bug
+  (`wins/2026-05-27-dsv4-native-deepep-pod-e2e.md`).
+- **Launch-count source-survey is hypothesis, not evidence.** For tiny CUDA operators, a fused-kernel
+  rewrite is only licensed by a paired component A/B (or nsys/CUDA-event profile) under the
+  same sync framing the runtime uses (`errors/2026-05-12-fp8-kv-pair-quantize-fusion-no-license.md`,
+  `errors/2026-05-21-arle-cuda-opd-swiglu-fused-kill.md`).
+- **Capability/quality claims with magnitude < 5pp on small-n evals (≤200 samples) MUST run
+  multi-seed (≥5) and report mean ± σ + Wilson 95% CI before the wins entry ships.** Picking
+  "best ckpt across save-every-10" is a positively-biased estimator
+  (`errors/2026-05-28-mmlu-cross-base-was-noise.md`).
+- **Pod-side probe trust is conditional on git+symbol checks.** Before flipping a default based on
+  pod output, verify the pod tree is a git repo at HEAD and `strings target/release/infer | grep <symbol>`
+  shows the change actually landed — `target/release/infer` proves *some* tree was current
+  *whenever it was last built*, not that the current source built it
+  (`errors/2026-05-28-dsv4-flashmla-decode-parity-precond-fail.md`).
+- **Decode greedy-token decode the actual generation when a metric looks catastrophic.** Three weeks
+  of "FP8 KV is broken" investigation collapsed when one `eprintln!` of decoded tokens showed the
+  metric was a test-framework artifact (`errors/2026-05-26-fp8-kv-catastrophic-was-test-artifact.md`).
+- **`scripts/dsv4_toolchain.sh` validates DSv4 build-flow before launch.** Native DeepEP / DeepGEMM
+  consumers need env-checked source + compile-time prereqs; without the toolchain helper users
+  get a stub binary that errors at runtime
+  (`wins/2026-05-27-dsv4-native-deepep-run-guide.md`).
+
 ---
 
 ## Memory
