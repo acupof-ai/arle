@@ -1285,6 +1285,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHMLA");
     let flashmla_root = Path::new("vendor/flashmla");
     let enable_flashmla = flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA");
+    if !enable_flashmla {
+        // FlashMLA SM90 disabled (likely SM89-only box or explicit opt-out).
+        // Compile a stub that satisfies the `arle_flashmla_sm90_sparse_decode_*`
+        // symbol set with `cudaErrorNotSupported` returns, so the Rust crate
+        // links. The runtime gate `dsv4_flashmla_decode_enabled` defaults OFF
+        // so this path is never actually called in practice.
+        cu_files.push(Path::new("csrc/attention/arle_flashmla_decode_stubs.cu").to_path_buf());
+    }
     if enable_flashmla {
         let sparse = flashmla_root.join("csrc/sm90/prefill/sparse");
         for entry in [
