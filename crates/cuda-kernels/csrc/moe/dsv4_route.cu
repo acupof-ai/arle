@@ -203,6 +203,128 @@ __device__ __forceinline__ float dsv4_route_score(float logit, int scoring_kind)
   return sqrtf(dsv4_route_softplus(logit));
 }
 
+// Block-wide argmax with tie-break "lower expert wins". Returns (best_score,
+// best_expert) broadcast to every thread of the block. Each thread brings one
+// candidate via `score`/`expert`; pass -INFINITY/-1 for non-participants.
+//
+// Implementation: warp-level tournament via __shfl_xor_sync, then one slot per
+// warp written to shared memory, then a single warp reduces across warps.
+// blockDim.x must be a multiple of 32 and ≤ 1024. Tie-break uses
+// `expert_a < expert_b` so lower expert index wins on equal scores — matches
+// the prior serial selection-sort behavior.
+__device__ __forceinline__ void dsv4_route_block_argmax(
+    float score,
+    int expert,
+    float &best_score,
+    int &best_expert) {
+  __shared__ float warp_scores[DSV4_ROUTE_BLOCK / 32];
+  __shared__ int warp_experts[DSV4_ROUTE_BLOCK / 32];
+
+  // Warp tournament with tie-break.
+  unsigned mask = 0xffffffffu;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    float other_score = __shfl_xor_sync(mask, score, offset);
+    int other_expert = __shfl_xor_sync(mask, expert, offset);
+    bool take_other = other_score > score ||
+                      (other_score == score && other_expert >= 0 &&
+                       (expert < 0 || other_expert < expert));
+    if (take_other) {
+      score = other_score;
+      expert = other_expert;
+    }
+  }
+
+  int lane = threadIdx.x & 31;
+  int warp_id = threadIdx.x >> 5;
+  if (lane == 0) {
+    warp_scores[warp_id] = score;
+    warp_experts[warp_id] = expert;
+  }
+  __syncthreads();
+
+  // Final reduction in warp 0.
+  if (warp_id == 0) {
+    int num_warps = blockDim.x >> 5;
+    if (lane < num_warps) {
+      score = warp_scores[lane];
+      expert = warp_experts[lane];
+    } else {
+      score = -INFINITY;
+      expert = -1;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      float other_score = __shfl_xor_sync(mask, score, offset);
+      int other_expert = __shfl_xor_sync(mask, expert, offset);
+      bool take_other = other_score > score ||
+                        (other_score == score && other_expert >= 0 &&
+                         (expert < 0 || other_expert < expert));
+      if (take_other) {
+        score = other_score;
+        expert = other_expert;
+      }
+    }
+    if (lane == 0) {
+      warp_scores[0] = score;
+      warp_experts[0] = expert;
+    }
+  }
+  __syncthreads();
+
+  best_score = warp_scores[0];
+  best_expert = warp_experts[0];
+  __syncthreads();
+}
+
+// Block-wide reduction: max(value) across all threads, broadcast to all.
+__device__ __forceinline__ float dsv4_route_block_reduce_max(float value) {
+  __shared__ float warp_max[DSV4_ROUTE_BLOCK / 32];
+  unsigned mask = 0xffffffffu;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value = fmaxf(value, __shfl_xor_sync(mask, value, offset));
+  }
+  int lane = threadIdx.x & 31;
+  int warp_id = threadIdx.x >> 5;
+  if (lane == 0) warp_max[warp_id] = value;
+  __syncthreads();
+  if (warp_id == 0) {
+    int num_warps = blockDim.x >> 5;
+    float v = lane < num_warps ? warp_max[lane] : -INFINITY;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      v = fmaxf(v, __shfl_xor_sync(mask, v, offset));
+    }
+    if (lane == 0) warp_max[0] = v;
+  }
+  __syncthreads();
+  float result = warp_max[0];
+  __syncthreads();
+  return result;
+}
+
+// Block-wide reduction: sum(value) across all threads, broadcast to all.
+__device__ __forceinline__ float dsv4_route_block_reduce_sum(float value) {
+  __shared__ float warp_sum[DSV4_ROUTE_BLOCK / 32];
+  unsigned mask = 0xffffffffu;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_xor_sync(mask, value, offset);
+  }
+  int lane = threadIdx.x & 31;
+  int warp_id = threadIdx.x >> 5;
+  if (lane == 0) warp_sum[warp_id] = value;
+  __syncthreads();
+  if (warp_id == 0) {
+    int num_warps = blockDim.x >> 5;
+    float v = lane < num_warps ? warp_sum[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      v += __shfl_xor_sync(mask, v, offset);
+    }
+    if (lane == 0) warp_sum[0] = v;
+  }
+  __syncthreads();
+  float result = warp_sum[0];
+  __syncthreads();
+  return result;
+}
+
 __global__ void dsv4_route_kernel(
     const uint16_t *__restrict__ logits,
     const uint16_t *__restrict__ bias,
@@ -218,39 +340,56 @@ __global__ void dsv4_route_kernel(
     float routed_scaling_factor) {
   int token = blockIdx.x;
   if (token >= num_tokens) return;
+
+  // `scores[e]` holds the per-expert normalized probability (scoring_kind==0
+  // softmax) or scoring_kind-specific score; this is preserved across the
+  // top-k selection so the final renorm can read it. `combined[e]` is the
+  // selection key (score + bias) and gets masked with -INFINITY each time an
+  // expert is picked so the next argmax round skips it.
   __shared__ float scores[DSV4_ROUTE_MAX_EXPERTS];
+  __shared__ float combined[DSV4_ROUTE_MAX_EXPERTS];
   __shared__ float rank_scores[DSV4_ROUTE_MAX_TOPK];
   __shared__ int rank_indices[DSV4_ROUTE_MAX_TOPK];
 
-  if (threadIdx.x == 0) {
-    if (scoring_kind == 0) {
-      float max_logit = -INFINITY;
-      for (int expert = 0; expert < n_experts; ++expert) {
-        max_logit = fmaxf(max_logit, dsv4_route_bf16_to_f32(logits[token * n_experts + expert]));
-      }
-      float denom = 0.0f;
-      for (int expert = 0; expert < n_experts; ++expert) {
-        float value = expf(dsv4_route_bf16_to_f32(logits[token * n_experts + expert]) - max_logit);
-        scores[expert] = value;
-        denom += value;
-      }
-      denom = fmaxf(denom, 1.0e-20f);
-      for (int expert = 0; expert < n_experts; ++expert) {
-        scores[expert] /= denom;
-      }
-    } else {
-      for (int expert = 0; expert < n_experts; ++expert) {
-        scores[expert] = dsv4_route_score(
-            dsv4_route_bf16_to_f32(logits[token * n_experts + expert]), scoring_kind);
-      }
-    }
+  int tid = threadIdx.x;
 
-    for (int k = 0; k < topk; ++k) {
-      rank_scores[k] = -INFINITY;
-      rank_indices[k] = -1;
+  // ---- Phase 1: per-expert scores in parallel. ------------------------------
+  if (scoring_kind == 0) {
+    // Block-parallel softmax over n_experts.
+    float local_max = -INFINITY;
+    for (int e = tid; e < n_experts; e += blockDim.x) {
+      float l = dsv4_route_bf16_to_f32(logits[token * n_experts + e]);
+      scores[e] = l;  // stash raw logit, overwritten below
+      local_max = fmaxf(local_max, l);
     }
+    __syncthreads();
+    float max_logit = dsv4_route_block_reduce_max(local_max);
 
-    if (routing_kind == 0) {
+    float local_sum = 0.0f;
+    for (int e = tid; e < n_experts; e += blockDim.x) {
+      float v = expf(scores[e] - max_logit);
+      scores[e] = v;  // exp(x - max)
+      local_sum += v;
+    }
+    __syncthreads();
+    float denom = dsv4_route_block_reduce_sum(local_sum);
+    denom = fmaxf(denom, 1.0e-20f);
+    float inv_denom = 1.0f / denom;
+    for (int e = tid; e < n_experts; e += blockDim.x) {
+      scores[e] *= inv_denom;
+    }
+  } else {
+    for (int e = tid; e < n_experts; e += blockDim.x) {
+      scores[e] = dsv4_route_score(
+          dsv4_route_bf16_to_f32(logits[token * n_experts + e]), scoring_kind);
+    }
+  }
+  __syncthreads();
+
+  // ---- Phase 2: top-k selection. --------------------------------------------
+  if (routing_kind == 0) {
+    // Read the fixed routing table; topk ≤ 16, single thread suffices.
+    if (tid == 0) {
       uint32_t token_id = token_ids[token];
       int64_t base = (int64_t)token_id * topk;
       for (int k = 0; k < topk; ++k) {
@@ -258,45 +397,62 @@ __global__ void dsv4_route_kernel(
         rank_indices[k] = expert;
         rank_scores[k] = (expert >= 0 && expert < n_experts) ? scores[expert] : 0.0f;
       }
-    } else {
-      if (topk == 2) {
-        for (int expert = 0; expert < n_experts; ++expert) {
-          float top_score = scores[expert] + dsv4_route_bf16_to_f32(bias[expert]);
-          bool better0 = top_score > rank_scores[0] ||
-                         (top_score == rank_scores[0] && expert < rank_indices[0]);
-          if (better0) {
-            rank_scores[1] = rank_scores[0];
-            rank_indices[1] = rank_indices[0];
-            rank_scores[0] = top_score;
-            rank_indices[0] = expert;
-            continue;
-          }
-          bool better1 = top_score > rank_scores[1] ||
-                         (top_score == rank_scores[1] && expert < rank_indices[1]);
-          if (better1) {
-            rank_scores[1] = top_score;
-            rank_indices[1] = expert;
-          }
-        }
-      } else {
-        for (int expert = 0; expert < n_experts; ++expert) {
-          float top_score = scores[expert] + dsv4_route_bf16_to_f32(bias[expert]);
-          for (int k = 0; k < topk; ++k) {
-            bool better = top_score > rank_scores[k] ||
-                          (top_score == rank_scores[k] && expert < rank_indices[k]);
-            if (!better) continue;
-            for (int shift = topk - 1; shift > k; --shift) {
-              rank_scores[shift] = rank_scores[shift - 1];
-              rank_indices[shift] = rank_indices[shift - 1];
-            }
-            rank_scores[k] = top_score;
-            rank_indices[k] = expert;
-            break;
-          }
+    }
+    __syncthreads();
+  } else {
+    // Build `combined[e] = scores[e] + bias[e]` in parallel. Subsequent
+    // argmax loops only touch e < n_experts, so no upper-range init needed.
+    for (int e = tid; e < n_experts; e += blockDim.x) {
+      combined[e] = scores[e] + dsv4_route_bf16_to_f32(bias[e]);
+    }
+    __syncthreads();
+
+    // Initialize ranks to "no pick".
+    if (tid < topk) {
+      rank_scores[tid] = -INFINITY;
+      rank_indices[tid] = -1;
+    }
+    __syncthreads();
+
+    // Repeat `topk` masked block-argmax rounds. Each round selects one expert
+    // and masks it with -INFINITY for subsequent rounds. A round that finds
+    // no candidate above -INFINITY leaves the rank slot at (-INFINITY, -1) —
+    // matches the serial selection-sort behavior when n_experts < topk.
+    for (int k = 0; k < topk; ++k) {
+      float local_best_score = -INFINITY;
+      int local_best_expert = -1;
+      for (int e = tid; e < n_experts; e += blockDim.x) {
+        float s = combined[e];
+        // Strictly greater wins; tie-break (lower expert wins) only applies
+        // among real candidates, never among -INFINITY-masked slots.
+        bool take = s > local_best_score ||
+                    (s == local_best_score && s > -INFINITY &&
+                     local_best_expert >= 0 && e < local_best_expert) ||
+                    (s == local_best_score && s > -INFINITY &&
+                     local_best_expert < 0);
+        if (take) {
+          local_best_score = s;
+          local_best_expert = e;
         }
       }
+      float best_score;
+      int best_expert;
+      dsv4_route_block_argmax(local_best_score, local_best_expert, best_score,
+                              best_expert);
+      if (tid == 0) {
+        if (best_expert >= 0 && best_score > -INFINITY) {
+          rank_scores[k] = best_score;
+          rank_indices[k] = best_expert;
+          combined[best_expert] = -INFINITY;
+        }
+      }
+      __syncthreads();
     }
+  }
 
+  // ---- Phase 3: renorm + write out. -----------------------------------------
+  // topk ≤ 16 — keep the serial path here, branch-light, single thread.
+  if (tid == 0) {
     float selected_sum = 0.0f;
     if (scoring_kind != 0) {
       for (int k = 0; k < topk; ++k) {
