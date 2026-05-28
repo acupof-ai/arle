@@ -27,6 +27,9 @@ chunk_size=16).
 
 ## Microbench update (2026-05-28 tick 10) — cost is **quadratic in rollout_len**
 
+![OPD student rollout O(n²) scaling — fit + measured points + residuals](../figures/2026-05-28-opd-rollout-scaling.png)
+
+
 Ran `target/release/examples/opd_step_cuda_infer_teacher_train --steps 2`
 across rollout_len ∈ {8, 16, 32} on the same SKU and config as v4
 (0.8B student + 4B teacher, `examples/opd/sample-prompts.jsonl`,

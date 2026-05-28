@@ -145,6 +145,8 @@ Operators wanting only the serving binary can use `infer` directly — same HTTP
 
 **2026-05-28 — OPD rollout perf characterized: O(n²) attention, not host overhead.** Five-point rollout-len sweep {8, 16, 32, 64, 128} fits `student_rollout(n) = 0.31·n + 0.0099·n²` within 1-5%. Above n≈30 the quadratic attention term dominates. The fix is routing the student rollout through the inference engine's CUDA-graph + paged-KV path — projected ~5× student_rollout speedup at rollout=128, unblocks rollout=256. [Research doc](docs/research/2026-05-28-opd-rollout-perf-208s-bottleneck.md).
 
+![OPD rollout O(n²) scaling — measured vs fit](docs/figures/2026-05-28-opd-rollout-scaling.png)
+
 **2026-05-26 — V100 Route B lands; OPD GKD now fits the 512-token corpus.** Per-window forward + `evict_host_mirror` cut peak GPU 19% (31.5 → 25.4 GiB) and turned an OOM into a clean train step on V100 32 GB. [Wins entry](docs/experience/wins/2026-05-26-opd-chunked-kl-route-b-bench.md).
 
 **2026-05-25 — V100 (Volta sm_70) inference unlocked.** Qwen3.5-4B/9B serve end-to-end via upstream TileLang patch + per-kernel SM70 filter. MMLU stays at A100/L4 level (4B: 79.9%, 9B: 83.0%). T1 builds untouched. [Wins entry](docs/experience/wins/2026-05-25-v100-sm70-p3-1-capability-qwen35-4b.md).
