@@ -766,3 +766,37 @@ macro_rules! tilelang_decode_hd128_fp8_decl {
 }
 
 tilelang_decode_hd128_fp8_decl!(tilelang_batch_decode_paged_hd128_fp8_q32_kv8_run_cuda,);
+
+// ============================================================================
+// DSv4-Flash (MODEL1) FP8 KV pack.
+//
+// Packs ARLE's bf16 DSv4 KV (NoPE 448 + RoPE 64) into the MODEL1 FP8
+// block-paged layout consumed by upstream FlashMLA's
+// `sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel`.
+// 584 bytes/token per the upstream contract (see
+// `crates/cuda-kernels/csrc/attention/dsv4_fp8_kv_pack.cu` for the byte
+// layout + e8m0 scale encoding).
+//
+// Phase D-3' of the FlashMLA decode integration plan
+// (`docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md`). Sibling FFI
+// for the kernel-side decode dispatch lives in `ffi/misc.rs` next to
+// `arle_flashmla_sm90_sparse_decode_fwd`; runtime wire-up is a separate
+// downstream item.
+// ============================================================================
+unsafe extern "C" {
+    /// Pack `n_tokens` worth of (NoPE bf16, RoPE bf16) into the MODEL1 FP8
+    /// block-paged layout. `page_block_size` is the upstream
+    /// `page_block_size` (64 for DSv4-Flash). `token_block_id[i]` is the
+    /// destination block for token `i`; `token_in_block_row[i]` is the
+    /// 0..page_block_size-1 row within that block.
+    pub fn arle_dsv4_fp8_kv_pack_cuda(
+        nope: *const Half,
+        rope: *const Half,
+        packed_kv: *mut u8,
+        token_block_id: *const i32,
+        token_in_block_row: *const i32,
+        n_tokens: i32,
+        page_block_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+}
