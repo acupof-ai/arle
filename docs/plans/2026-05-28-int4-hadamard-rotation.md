@@ -1,5 +1,25 @@
 # Plan — INT4 KV Hadamard rotation (close the int8 gap)
 
+> **Status (2026-05-28, EOD): First implementation attempt KILLED.**
+> The QuaRot-style weight-bake architecture proposed below does not
+> apply to Qwen3.5 because RoPE is fused into the attention kernel
+> (`prefill_attention_hd256_batch` / decode variants) and does not
+> commute with Hadamard. See "RoPE constraint" section at the bottom.
+>
+> A second attempt that put the rotation INSIDE the
+> `decode_attention_int4_per_channel_k_partial_kernel` and INSIDE the
+> K quant kernel passed Mac type-check + V100 build, but quality
+> *regressed* on the audit (int4 mean_match 0.81 → 0.44 at 4×4)
+> because the in-kernel FWHT assumed `BLOCK_SIZE >= HEAD_DIM` while
+> the decode kernel uses BLOCK_SIZE=128 and Qwen3.5-4B full attention
+> uses HEAD_DIM=256.
+>
+> All Hadamard code reverted. The reverted commit and updated wins
+> entry remain as the current state. Re-attempt requires either (a)
+> un-fusing RoPE so a rotation step can be inserted between RoPE and
+> K-quant / QK-dot, or (b) a block-Hadamard variant that preserves
+> RoPE's pair structure (weaker rotation, may not buy enough quality).
+
 ## Why
 
 `docs/experience/wins/2026-05-28-int4-kv-two-level-k.md` documents the
@@ -117,3 +137,52 @@ audit on V100).
 - Hadamard for Q at *prefill* (only decode-attention is path-critical
   for the audit metric; prefill QK runs in BF16 already on the
   TileLang path).
+
+## RoPE constraint (added 2026-05-28 EOD after first kill)
+
+Qwen3.5 RoPE is applied INSIDE the fused attention kernel and rotates
+(d=2k, d=2k+1) pairs in the original head_dim basis. A Hadamard
+rotation `R` applied to W_Q / W_K at load time changes the basis, so
+the pair structure RoPE depends on is destroyed:
+
+```
+RoPE(R · Q) · RoPE(R · K)  ≠  RoPE(Q) · RoPE(K)
+```
+
+The math for attention preservation under joint orthogonal rotation
+— `(QR)(KR)^T = QK^T` — only holds if rotation is applied **after**
+RoPE, not before. So the QuaRot-style "free, runtime-zero" weight
+baking *does not work for Qwen3.5*.
+
+Two viable paths:
+
+1. **In-kernel rotation between RoPE and quant/dot.** Insert
+   `signs × FWHT` inside the fused attention kernel after RoPE but
+   before the QK dot and before K is written to the cache. Costs
+   `O(head_dim · log(head_dim))` per token per head. The kernel
+   rewrite is non-trivial because the fused attention path threads
+   RoPE + QK + softmax + PV together; the rotation has to slot in at
+   the right phase boundary.
+
+   The first kill attempt (2026-05-28) tried this but hit
+   `BLOCK_SIZE=128 < HEAD_DIM=256` — the FWHT only covered half the
+   dims. Fix is either bumping BLOCK_SIZE to match HEAD_DIM (perf
+   risk) or implementing a multi-element-per-thread FWHT.
+
+2. **Block-Hadamard preserving RoPE pair structure.** Use a
+   block-diagonal Hadamard with block size 2 — rotates within each
+   `(d=2k, d=2k+1)` pair but doesn't mix across pairs. RoPE still
+   sees the pair structure intact, so weight baking works. But the
+   rotation is much weaker (only 2-dim mixing) and likely doesn't
+   reduce channel-wise outliers enough to materially improve INT4
+   quality. Verify against a published QuaRot-on-RoPE benchmark
+   number before committing.
+
+3. **Un-fuse RoPE from the attention kernel.** Apply Hadamard as a
+   standalone op between RoPE and the rest. Loses the fusion
+   speedup. Probably the easiest correctness path; perf trade is
+   measurable but not catastrophic at decode (batch_size=1).
+
+Decision deferred. Two-level K + asymmetric is the current state and
+already lifts the INT4 floor 6× over the PoC; the remaining int4-vs-
+int8 gap is real but not blocking immediate landings.
