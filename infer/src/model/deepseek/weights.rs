@@ -3679,6 +3679,125 @@ fn dsv4_flashmla_fp8_kv_pool_blocks(
     (sw_blocks, comp_blocks)
 }
 
+/// FlashMLA `DecodingSchedMeta` is `__align__(4*8)` with 8 int32 fields
+/// (`vendor/flashmla/csrc/params.h:10-17` → 32 bytes / 8 ints per entry).
+#[cfg(feature = "cuda")]
+const DSV4_FLASHMLA_DECODING_SCHED_META_INTS: usize = 8;
+
+/// Phase D-4 step 2 — amortized FlashMLA decode scratch arena.
+///
+/// Allocates `lse_accum`, `o_accum`, `sched_meta`, `num_splits`, and
+/// `indices` buffers sized for the worst-case `num_sm_parts` and
+/// `topk_unified` of this session. Reused every decode step thereafter
+/// (no per-step alloc).
+///
+/// Sizing rationale (per upstream
+/// `vendor/flashmla/csrc/api/sparse_decode.h` + the local shim in
+/// `crates/cuda-kernels/csrc/misc/arle_flashmla_decode_shim.cu`):
+/// - `num_sm_parts_max` comes from caller — `arch.num_sms / s_q / (h_q/64)`
+///   evaluated for the working shape and then bumped to a 256 ceiling
+///   (H20 has 132 SMs; b=1, s_q=1, h_q=64 → 66, but headroom keeps the
+///   single arena valid across all reasonable shapes).
+/// - `lse_accum` shape `[num_splits, s_q=1, h_q]`. `num_splits` is
+///   bounded by `num_sm_parts + 1`, so we size `num_sm_parts_max + 1`
+///   splits along axis 0.
+/// - `o_accum` shape `[num_splits, s_q=1, h_q, d_v=512]`.
+/// - `sched_meta` is `num_sm_parts` × `DecodingSchedMetaSize/4` = 8 i32.
+/// - `num_splits` is `b+1` = 2 i32 (b=1).
+/// - `indices` is `s_q=1 × topk_unified` i32.
+///
+/// `b = 1` for ARLE decode (single sequence per `finish_attention_gpu`
+/// call; batching is at the scheduler layer above).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn ensure_fm_decode_arena(
+    ctx: &DeviceContext,
+    cache: &mut DeepseekAttentionRuntimeCache,
+    num_sm_parts_max: usize,
+    topk_unified_max: usize,
+    h_q: usize,
+    d_v: usize,
+) -> Result<()> {
+    ensure!(
+        num_sm_parts_max > 0 && topk_unified_max > 0 && h_q > 0 && d_v > 0,
+        "DSv4 FlashMLA decode arena requires positive sizing (got num_sm_parts={}, topk={}, h_q={}, d_v={})",
+        num_sm_parts_max,
+        topk_unified_max,
+        h_q,
+        d_v
+    );
+
+    // num_splits along axis 0 — worst case num_sm_parts + 1 (sched_meta
+    // emits at most num_sm_parts split entries plus a sentinel).
+    let num_splits_axis = num_sm_parts_max + 1;
+    let lse_accum_len = num_splits_axis * h_q;
+    let o_accum_len = num_splits_axis * h_q * d_v;
+    let sched_meta_ints = num_sm_parts_max * DSV4_FLASHMLA_DECODING_SCHED_META_INTS;
+    let num_splits_ints = 2_usize; // b + 1 with b = 1
+    let indices_len = topk_unified_max;
+
+    let need_lse_grow = cache
+        .fm_decode_lse_accum
+        .as_ref()
+        .is_none_or(|buf| buf.len() < lse_accum_len);
+    if need_lse_grow {
+        cache.fm_decode_lse_accum = Some(
+            ctx.stream
+                .alloc_zeros_traced::<f32>(lse_accum_len)
+                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode lse_accum alloc: {err}"))?,
+        );
+    }
+    let need_o_grow = cache
+        .fm_decode_o_accum
+        .as_ref()
+        .is_none_or(|buf| buf.len() < o_accum_len);
+    if need_o_grow {
+        cache.fm_decode_o_accum = Some(
+            ctx.stream
+                .alloc_zeros_traced::<f32>(o_accum_len)
+                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode o_accum alloc: {err}"))?,
+        );
+    }
+    let need_sched_grow = cache
+        .fm_decode_sched_meta
+        .as_ref()
+        .is_none_or(|buf| buf.len() < sched_meta_ints);
+    if need_sched_grow {
+        cache.fm_decode_sched_meta = Some(
+            ctx.stream
+                .alloc_zeros_traced::<i32>(sched_meta_ints)
+                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode sched_meta alloc: {err}"))?,
+        );
+    }
+    let need_splits_grow = cache
+        .fm_decode_num_splits
+        .as_ref()
+        .is_none_or(|buf| buf.len() < num_splits_ints);
+    if need_splits_grow {
+        cache.fm_decode_num_splits = Some(
+            ctx.stream
+                .alloc_zeros_traced::<i32>(num_splits_ints)
+                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode num_splits alloc: {err}"))?,
+        );
+    }
+    let need_indices_grow = cache
+        .fm_decode_indices
+        .as_ref()
+        .is_none_or(|buf| buf.len() < indices_len);
+    if need_indices_grow {
+        cache.fm_decode_indices = Some(
+            ctx.stream
+                .alloc_zeros_traced::<i32>(indices_len)
+                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode indices alloc: {err}"))?,
+        );
+    }
+
+    cache.fm_decode_scratch_num_sm_parts = num_sm_parts_max;
+    cache.fm_decode_scratch_topk_unified = topk_unified_max;
+    cache.fm_decode_scratch_h_q = h_q;
+    Ok(())
+}
+
 /// Phase D-4 step 2 — one-shot prefill→decode SW bootstrap. Packs the
 /// currently-valid bf16 SW ring into the FP8 sub-pool blocks
 /// `[0, sw_blocks)` so the first decode step has every reachable SW

@@ -1071,6 +1071,39 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     pub(crate) fp8_kv_sw_bulk_rows: Option<CudaSlice<i32>>,
     pub(crate) fp8_kv_one_token_scratch: Option<(CudaSlice<i32>, CudaSlice<i32>)>,
     pub(crate) fp8_kv_comp_scratch: Option<(CudaSlice<i32>, CudaSlice<i32>)>,
+
+    // Phase D-4 step 2 — amortized FlashMLA decode scratch arena.
+    //
+    // Allocated once on first decode step when the FlashMLA decode env
+    // knob is on. Lifetime = session; reused every step (no per-step
+    // alloc). Sized for worst-case `num_sm_parts` (H20 SM90 → 132 SMs /
+    // s_q=1 / (h_q/64=1) = 132 at h_q=64, capped to a 256-headroom max)
+    // and worst-case `topk_unified` (sliding_window + index_topk rounded
+    // up to 128; e.g. 128+512 = 640).
+    //
+    // Per upstream `vendor/flashmla/csrc/api/sparse_decode.h:189-194`:
+    //   tile_scheduler_metadata: [num_sm_parts, DecodingSchedMetaSize/4]
+    //   num_splits:             [b+1] = [2] for b=1
+    //   lse_accum:              [num_splits, s_q=1, h_q]
+    //   o_accum:                [num_splits, s_q=1, h_q, d_v=512]
+    //   indices:                [s_q=1, topk_unified]
+    //
+    // `DecodingSchedMetaSize == 32 B == 8 × int32` per
+    // `vendor/flashmla/csrc/params.h:10-17`. Worst-case `num_splits` is
+    // bounded by `num_sm_parts + 1`, so split-axis sizing uses
+    // `num_sm_parts_max + 1`.
+    //
+    // `fm_decode_scratch_num_sm_parts` records the capacity these
+    // buffers were sized for; if a future dispatch needs more (config
+    // drift) the arena grows in place.
+    pub(crate) fm_decode_lse_accum: Option<CudaSlice<f32>>,
+    pub(crate) fm_decode_o_accum: Option<CudaSlice<f32>>,
+    pub(crate) fm_decode_sched_meta: Option<CudaSlice<i32>>,
+    pub(crate) fm_decode_num_splits: Option<CudaSlice<i32>>,
+    pub(crate) fm_decode_indices: Option<CudaSlice<i32>>,
+    pub(crate) fm_decode_scratch_num_sm_parts: usize,
+    pub(crate) fm_decode_scratch_topk_unified: usize,
+    pub(crate) fm_decode_scratch_h_q: usize,
 }
 
 #[cfg(feature = "cuda")]
