@@ -1439,6 +1439,20 @@ impl DeepseekModel {
             trace,
         )?;
 
+        // Phase D-4 steps 2 + 4 — when the FlashMLA decode env knob is on
+        // and we're about to enter a decode step, ensure the FP8 KV pool's
+        // SW sub-pool is bootstrapped from the bf16 SW window (one-shot
+        // per layer), then pack any newly-completed compressor rows into
+        // the FP8 compressed sub-pool. Both are no-ops when the env knob
+        // is OFF and the legacy `dsv4_hybrid_attention_cuda` decode path
+        // runs unmodified.
+        if dsv4_flashmla_decode_enabled()? {
+            if token_count == 1 {
+                self.dsv4_flashmla_sw_bootstrap_hook(cache, compress_ratio, head_dim)?;
+            }
+            self.dsv4_flashmla_compressor_pack_hook(cache, compress_ratio, head_dim)?;
+        }
+
         let selected = if matches!(
             mode,
             deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse
@@ -2583,6 +2597,175 @@ impl DeepseekModel {
         Ok(())
     }
 
+    /// Phase D-4 step 4 — compressor → FP8 pool pack hook. Reads the bf16
+    /// compressor output rows that were newly written this step and packs
+    /// them into the FP8 KV pool compressed sub-pool. Idempotent —
+    /// `cache.attention.fp8_kv_comp_packed_rows` tracks the high-water
+    /// mark, so re-entry packs only the delta.
+    ///
+    /// Gated at the caller by `dsv4_flashmla_decode_enabled()`. When the
+    /// env knob is OFF this method is unreached.
+    #[cfg(feature = "cuda")]
+    fn dsv4_flashmla_compressor_pack_hook(
+        &self,
+        cache: &mut DeepseekAttentionRuntimeCache,
+        compress_ratio: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        ensure!(
+            head_dim == DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE,
+            "DSv4 FlashMLA compressor pack requires head_dim={}, got {head_dim}",
+            DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE
+        );
+        let compressed_rows = match cache.compressed_gpu.as_ref() {
+            Some(c) => c.compressed_rows,
+            None => return Ok(()),
+        };
+        if compressed_rows <= cache.fp8_kv_comp_packed_rows {
+            return Ok(());
+        }
+
+        // Size the pool — sw_blocks from sliding_window, comp_blocks from
+        // the compressor capacity (max_position_embeddings / ratio rounded
+        // up). Sized once monotonically — see `dsv4_flashmla_fp8_kv_pool_blocks`.
+        let sliding_window = self.config.sliding_window;
+        let max_compressed_keys = self
+            .config
+            .max_position_embeddings
+            .div_ceil(compress_ratio.max(1));
+        let (sw_blocks, comp_blocks) =
+            dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, max_compressed_keys);
+
+        // Borrow split: pool through `ensure_*`, then read compressed bf16
+        // pointer via separate immutable borrow.
+        let start_row = cache.fp8_kv_comp_packed_rows;
+        let end_row = compressed_rows;
+
+        // Extract bf16 compressor pointer first (immutable borrow scope).
+        let (comp_bf16_ptr, _comp_g) = {
+            let c = cache.compressed_gpu.as_ref().expect("checked above");
+            let buf = c
+                .compressed
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("DSv4 FP8 pack: compressed buffer missing"))?;
+            buf.device_ptr(&self.ctx.stream)
+        };
+        let comp_bf16_ptr_u64 = comp_bf16_ptr;
+        drop(_comp_g);
+
+        // Mutable borrow on attention cache for the pool + scratch.
+        let pool = ensure_dsv4_flashmla_fp8_kv_pool(&self.ctx, cache, sw_blocks, comp_blocks)?;
+        // SAFETY: pool reference is exclusively held; we need a stable
+        // *mut over the helper call. Split the borrow.
+        let pool_ref: *mut CudaSlice<u8> = pool;
+        // Re-borrow comp_scratch via cache directly — but cache is already
+        // mutably borrowed through pool_ref. Work around by accessing
+        // through a raw mutable ref: split the borrow with split_at trick.
+        // Simpler: take the comp_scratch out, run the pack, put back.
+        let mut comp_scratch = cache.fp8_kv_comp_scratch.take();
+        // SAFETY: `pool_ref` and `comp_scratch` are disjoint fields of
+        // `cache`; `dsv4_flashmla_pack_compressor_rows` only writes
+        // through the pool argument and reads/writes the scratch
+        // argument. The cache reference itself is not aliased while we
+        // hold the raw pointer because we don't touch `cache` again until
+        // the call returns.
+        let res = dsv4_flashmla_pack_compressor_rows(
+            &self.ctx,
+            comp_bf16_ptr_u64,
+            unsafe { &mut *pool_ref },
+            start_row,
+            end_row,
+            sw_blocks,
+            head_dim,
+            &mut comp_scratch,
+        );
+        cache.fp8_kv_comp_scratch = comp_scratch;
+        res?;
+        cache.fp8_kv_comp_packed_rows = end_row;
+        Ok(())
+    }
+
+    /// Phase D-4 step 2 — prefill→decode SW bootstrap. Called from
+    /// `forward_attention_gpu_cached` once per (layer, slot) when the
+    /// FlashMLA decode env knob is on and we're about to enter a decode
+    /// step but the FP8 pool's SW sub-pool hasn't been populated yet.
+    ///
+    /// No-op if `cache.attention.fp8_kv_sw_bootstrapped` is already true.
+    #[cfg(feature = "cuda")]
+    fn dsv4_flashmla_sw_bootstrap_hook(
+        &self,
+        cache: &mut DeepseekAttentionRuntimeCache,
+        compress_ratio: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        if cache.fp8_kv_sw_bootstrapped {
+            return Ok(());
+        }
+        ensure!(
+            head_dim == DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE,
+            "DSv4 FlashMLA SW bootstrap requires head_dim={}, got {head_dim}",
+            DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE
+        );
+        let sliding_window = self.config.sliding_window;
+        if sliding_window == 0 {
+            cache.fp8_kv_sw_bootstrapped = true;
+            return Ok(());
+        }
+        let max_compressed_keys = self
+            .config
+            .max_position_embeddings
+            .div_ceil(compress_ratio.max(1));
+        let (sw_blocks, comp_blocks) =
+            dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, max_compressed_keys);
+
+        // Borrow split: lift the bf16 SW window's device pointer + length
+        // out as a u64 + usize *before* we take a mutable borrow on the
+        // attention cache for the pool / scratch fields. This is safe
+        // because the pointer is a stable device address managed by the
+        // CudaSlice; the slice itself isn't reallocated during this hook.
+        let (window_ptr_u64, window_len) = {
+            let window_cache_buf = match cache.window_gpu.as_ref() {
+                Some(buf) => buf,
+                // SW window cache hasn't been built yet; nothing to
+                // bootstrap from. The first `finish_attention_gpu` call
+                // will allocate it and the per-step SW pack hook fills
+                // the ring slot-by-slot from there on.
+                None => return Ok(()),
+            };
+            let (p, _g) = window_cache_buf.device_ptr(&self.ctx.stream);
+            (p, window_cache_buf.len())
+        };
+        let expected_window_len = sliding_window * head_dim;
+        ensure!(
+            window_len >= expected_window_len,
+            "DSv4 FlashMLA SW bootstrap: window cache len {} < required {}",
+            window_len,
+            expected_window_len
+        );
+
+        // Reborrow mutably for pool + scratch fields (disjoint from the
+        // bf16 SW window pointer above).
+        let pool = ensure_dsv4_flashmla_fp8_kv_pool(&self.ctx, cache, sw_blocks, comp_blocks)?;
+        let pool_ref: *mut CudaSlice<u8> = pool;
+        let mut bids = cache.fp8_kv_sw_bulk_bids.take();
+        let mut rows = cache.fp8_kv_sw_bulk_rows.take();
+        let res = dsv4_flashmla_bulk_pack_sw_ring_raw(
+            &self.ctx,
+            window_ptr_u64,
+            unsafe { &mut *pool_ref },
+            sliding_window,
+            head_dim,
+            sw_blocks,
+            &mut bids,
+            &mut rows,
+        );
+        cache.fp8_kv_sw_bulk_bids = bids;
+        cache.fp8_kv_sw_bulk_rows = rows;
+        res?;
+        cache.fp8_kv_sw_bootstrapped = true;
+        Ok(())
+    }
+
     fn csa_selected_blocks_gpu(
         &self,
         layer_idx: usize,
@@ -3465,11 +3648,321 @@ fn ensure_dsv4_flashmla_fp8_kv_pool<'a>(
         cache.fp8_kv_comp_blocks = comp_blocks;
         cache.fp8_kv_page_block_size = DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE;
         cache.fp8_kv_bytes_per_token = DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN;
+        // Pool was freshly (re)allocated → any prior SW bootstrap +
+        // compressor pack work is invalidated.
+        cache.fp8_kv_sw_bootstrapped = false;
+        cache.fp8_kv_comp_packed_rows = 0;
     }
     cache
         .fp8_kv_pool
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool allocation missing"))
+}
+
+/// Compute the (sw_blocks, comp_blocks) sizing for the FlashMLA FP8 KV pool
+/// given the current request shape. Mirrors the indices builder contract:
+///   sw_blocks  = ceil(sliding_window / page_block_size)
+///   comp_blocks= ceil(max_compressed_keys / page_block_size)
+///
+/// `max_compressed_keys` is the upper bound of how many compressor rows
+/// might be referenced over the request's lifetime — equal to
+/// `ceil(max_position_embeddings / compress_ratio)` rounded up to the
+/// page-block boundary. The pool sizes once, monotonically, so the same
+/// pool covers SW + HCA + CSA dispatch shapes.
+#[cfg(feature = "cuda")]
+fn dsv4_flashmla_fp8_kv_pool_blocks(
+    sliding_window: usize,
+    max_compressed_keys: usize,
+) -> (usize, usize) {
+    let sw_blocks = sliding_window.div_ceil(DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE);
+    let comp_blocks = max_compressed_keys.div_ceil(DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE);
+    (sw_blocks, comp_blocks)
+}
+
+/// Phase D-4 step 2 — one-shot prefill→decode SW bootstrap. Packs the
+/// currently-valid bf16 SW ring into the FP8 sub-pool blocks
+/// `[0, sw_blocks)` so the first decode step has every reachable SW
+/// position covered. Runs once per (layer, slot) pair, gated by
+/// `cache.fp8_kv_sw_bootstrapped`.
+///
+/// The SW ring layout (`dsv4_update_window_cache_kernel`) is
+/// `[sliding_window, head_dim=512]` indexed by `slot = pos % sw`. The
+/// FP8 sub-pool is `[sw_blocks * 64, 584]` indexed by
+/// `(slot / 64, slot % 64)`. We pack **every** SW slot in one launch —
+/// the bf16 cells beyond the valid prefill range hold zero (init via
+/// `alloc_zeros_traced`) which decodes to zero on the kernel side
+/// (e8m0 byte 0 → scale 0 → bf16 zero per FlashMLA dequant); the indices
+/// builder will mask those positions out so the decode kernel never
+/// reads them as live attention.
+///
+/// `start_pos == 0` (pure prefill seed) is a no-op — the SW ring is
+/// either empty or holds only the prefill prefix that was already
+/// written this same call.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn dsv4_flashmla_bulk_pack_sw_ring_raw(
+    ctx: &DeviceContext,
+    window_ptr_u64: u64,
+    fp8_pool: &mut CudaSlice<u8>,
+    sliding_window: usize,
+    head_dim: usize,
+    sw_blocks: usize,
+    block_ids_scratch: &mut Option<CudaSlice<i32>>,
+    rows_scratch: &mut Option<CudaSlice<i32>>,
+) -> Result<()> {
+    if sliding_window == 0 || sw_blocks == 0 {
+        return Ok(());
+    }
+    // Defensive guard: head_dim must be 512 (MODEL1 contract — NoPE 448 + RoPE 64).
+    ensure!(
+        head_dim == DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE,
+        "DSv4 FlashMLA FP8 KV pool bootstrap requires head_dim={}, got {head_dim}",
+        DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE
+    );
+
+    // Build [n_tokens=sliding_window] block_id + row arrays:
+    //   slot s ∈ [0, sw)  → block = s / 64, row = s % 64.
+    let mut block_ids = Vec::with_capacity(sliding_window);
+    let mut rows = Vec::with_capacity(sliding_window);
+    for s in 0..sliding_window {
+        block_ids.push((s / DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE) as i32);
+        rows.push((s % DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE) as i32);
+    }
+
+    // Reuse or grow the per-cache scratch i32 buffers so we don't realloc
+    // every layer step.
+    let need_block_ids_grow = block_ids_scratch
+        .as_ref()
+        .is_none_or(|buf| buf.len() < sliding_window);
+    if need_block_ids_grow {
+        *block_ids_scratch = Some(
+            ctx.stream
+                .alloc_zeros_traced::<i32>(sliding_window)
+                .map_err(|err| {
+                    anyhow::anyhow!("DSv4 FlashMLA SW block_ids scratch alloc failed: {err}")
+                })?,
+        );
+    }
+    let need_rows_grow = rows_scratch
+        .as_ref()
+        .is_none_or(|buf| buf.len() < sliding_window);
+    if need_rows_grow {
+        *rows_scratch = Some(
+            ctx.stream
+                .alloc_zeros_traced::<i32>(sliding_window)
+                .map_err(|err| {
+                    anyhow::anyhow!("DSv4 FlashMLA SW rows scratch alloc failed: {err}")
+                })?,
+        );
+    }
+    let block_ids_dev = block_ids_scratch
+        .as_mut()
+        .expect("block_ids scratch initialized");
+    ctx.stream
+        .memcpy_htod(&block_ids, block_ids_dev)
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA SW block_ids H2D failed: {err}"))?;
+    let rows_dev = rows_scratch.as_mut().expect("rows scratch initialized");
+    ctx.stream
+        .memcpy_htod(&rows, rows_dev)
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA SW rows H2D failed: {err}"))?;
+
+    let (pool_ptr, _pg) = fp8_pool.device_ptr_mut(&ctx.stream);
+    let (bid_ptr, _bidg) = block_ids_dev.device_ptr(&ctx.stream);
+    let (row_ptr, _rowg) = rows_dev.device_ptr(&ctx.stream);
+
+    // The bf16 SW window is `[sliding_window, head_dim=512]` interleaved
+    // [NoPE 448 | RoPE 64]. Feed strided variant:
+    //   nope_ptr = window_ptr_u64,         stride = 512
+    //   rope_ptr = window_ptr_u64 + 448*2, stride = 512
+    let nope_ptr_u64 = window_ptr_u64;
+    let rope_ptr_u64 =
+        window_ptr_u64 + (DSV4_HEAD_DIM_NOPE as u64) * (std::mem::size_of::<bf16>() as u64);
+    let _ = sw_blocks; // sized above; the kernel uses block_ids[i] directly.
+
+    let res = unsafe {
+        ffi::arle_dsv4_fp8_kv_pack_strided_cuda(
+            nope_ptr_u64 as *const ffi::Half,
+            rope_ptr_u64 as *const ffi::Half,
+            pool_ptr as *mut u8,
+            bid_ptr as *const i32,
+            row_ptr as *const i32,
+            sliding_window as i32,
+            DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32,
+            head_dim as i32,
+            head_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    res.result()
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA SW bulk pack failed: {err}"))?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+const DSV4_HEAD_DIM_NOPE: usize = 448;
+#[cfg(feature = "cuda")]
+const DSV4_HEAD_DIM_ROPE: usize = 64;
+
+/// Phase D-4 step 3 — per-step SW pack. Packs the **single** new K row
+/// at `ring_idx = (start_pos + 0) % sliding_window` from the bf16 SW
+/// cache into the FP8 SW sub-pool slot `(ring_idx / 64, ring_idx % 64)`.
+///
+/// Called from `finish_attention_gpu` `token_count == 1` after the bf16
+/// SW window update (either fused-inside `dsv4_hybrid_attention_cuda`
+/// or via `dsv4_update_window_cache_cuda`). When the FlashMLA decode
+/// gate is on, the fused-window-update path inside the legacy kernel
+/// is disabled so the bf16 ring is consistent at this hook.
+///
+/// `k_prepared` is `[1, head_dim=512]` interleaved [NoPE 448 | RoPE 64]
+/// — the strided pack variant reads directly without deinterleave.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn dsv4_flashmla_pack_one_sw_token(
+    ctx: &DeviceContext,
+    k_prepared_ptr: u64,
+    fp8_pool: &mut CudaSlice<u8>,
+    ring_idx: usize,
+    head_dim: usize,
+    one_token_scratch: &mut Option<(CudaSlice<i32>, CudaSlice<i32>)>,
+) -> Result<()> {
+    let block_idx = (ring_idx / DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE) as i32;
+    let row = (ring_idx % DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE) as i32;
+
+    // Lazy-alloc the [1]-element block_ids/rows scratches.
+    if one_token_scratch.is_none() {
+        let bid = ctx
+            .stream
+            .alloc_zeros_traced::<i32>(1)
+            .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA one-token bid alloc: {err}"))?;
+        let row_buf = ctx
+            .stream
+            .alloc_zeros_traced::<i32>(1)
+            .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA one-token row alloc: {err}"))?;
+        *one_token_scratch = Some((bid, row_buf));
+    }
+    let (bid_dev, row_dev) = one_token_scratch
+        .as_mut()
+        .expect("one-token scratch initialized");
+    ctx.stream
+        .memcpy_htod(&[block_idx], bid_dev)
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA one-token bid H2D: {err}"))?;
+    ctx.stream
+        .memcpy_htod(&[row], row_dev)
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA one-token row H2D: {err}"))?;
+
+    let (pool_ptr, _pg) = fp8_pool.device_ptr_mut(&ctx.stream);
+    let (bid_ptr, _bidg) = bid_dev.device_ptr(&ctx.stream);
+    let (row_ptr, _rowg) = row_dev.device_ptr(&ctx.stream);
+
+    let nope_ptr_u64 = k_prepared_ptr;
+    let rope_ptr_u64 =
+        k_prepared_ptr + (DSV4_HEAD_DIM_NOPE as u64) * (std::mem::size_of::<bf16>() as u64);
+
+    let res = unsafe {
+        ffi::arle_dsv4_fp8_kv_pack_strided_cuda(
+            nope_ptr_u64 as *const ffi::Half,
+            rope_ptr_u64 as *const ffi::Half,
+            pool_ptr as *mut u8,
+            bid_ptr as *const i32,
+            row_ptr as *const i32,
+            1_i32,
+            DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32,
+            head_dim as i32,
+            head_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    res.result()
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA one-token SW pack failed: {err}"))?;
+    Ok(())
+}
+
+/// Phase D-4 step 4 — compressor pack. Packs `[start_row, end_row)` of
+/// the bf16 compressor output into the FP8 compressed sub-pool starting
+/// at block `sw_blocks + start_row / 64`, row `start_row % 64`.
+///
+/// `compressed_ptr` points at the bf16 compressor buffer
+/// (`[capacity_rows, head_dim=512]`). The compressor writes rows
+/// monotonically, so once a row is packed it stays valid for the rest
+/// of the session — `cache.fp8_kv_comp_packed_rows` advances past it
+/// and subsequent calls only pack newly-completed rows.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn dsv4_flashmla_pack_compressor_rows(
+    ctx: &DeviceContext,
+    compressed_bf16_ptr: u64,
+    fp8_pool: &mut CudaSlice<u8>,
+    start_row: usize,
+    end_row: usize,
+    sw_blocks: usize,
+    head_dim: usize,
+    comp_scratch: &mut Option<(CudaSlice<i32>, CudaSlice<i32>)>,
+) -> Result<()> {
+    if end_row <= start_row {
+        return Ok(());
+    }
+    let n_tokens = end_row - start_row;
+
+    let mut block_ids = Vec::with_capacity(n_tokens);
+    let mut rows = Vec::with_capacity(n_tokens);
+    for r in start_row..end_row {
+        let abs_block = sw_blocks + r / DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE;
+        let row = r % DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE;
+        block_ids.push(abs_block as i32);
+        rows.push(row as i32);
+    }
+
+    // Reuse / grow scratches.
+    let need_grow = comp_scratch
+        .as_ref()
+        .is_none_or(|(bid, _)| bid.len() < n_tokens);
+    if need_grow {
+        let bid = ctx
+            .stream
+            .alloc_zeros_traced::<i32>(n_tokens)
+            .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA comp bid alloc: {err}"))?;
+        let row_buf = ctx
+            .stream
+            .alloc_zeros_traced::<i32>(n_tokens)
+            .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA comp row alloc: {err}"))?;
+        *comp_scratch = Some((bid, row_buf));
+    }
+    let (bid_dev, row_dev) = comp_scratch.as_mut().expect("comp scratch initialized");
+    ctx.stream
+        .memcpy_htod(&block_ids, bid_dev)
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA comp bid H2D: {err}"))?;
+    ctx.stream
+        .memcpy_htod(&rows, row_dev)
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA comp row H2D: {err}"))?;
+
+    // Compressor output rows start at offset `start_row * head_dim` bf16
+    // elements into the compressed buffer.
+    let nope_ptr_u64 = compressed_bf16_ptr
+        + (start_row as u64) * (head_dim as u64) * (std::mem::size_of::<bf16>() as u64);
+    let rope_ptr_u64 =
+        nope_ptr_u64 + (DSV4_HEAD_DIM_NOPE as u64) * (std::mem::size_of::<bf16>() as u64);
+
+    let (pool_ptr, _pg) = fp8_pool.device_ptr_mut(&ctx.stream);
+    let (bid_ptr, _bidg) = bid_dev.device_ptr(&ctx.stream);
+    let (row_ptr, _rowg) = row_dev.device_ptr(&ctx.stream);
+
+    let res = unsafe {
+        ffi::arle_dsv4_fp8_kv_pack_strided_cuda(
+            nope_ptr_u64 as *const ffi::Half,
+            rope_ptr_u64 as *const ffi::Half,
+            pool_ptr as *mut u8,
+            bid_ptr as *const i32,
+            row_ptr as *const i32,
+            n_tokens as i32,
+            DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32,
+            head_dim as i32,
+            head_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    res.result()
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA compressor pack failed: {err}"))?;
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
