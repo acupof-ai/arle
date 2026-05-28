@@ -5623,6 +5623,48 @@ fn cuda_causal_sdpa_decode_gqa_cache(
         .map_err(|_| AutogradError::TapeInvariant("cuda cache decode q_start exceeds i32"))?;
     let scale = 1.0_f32 / (q_shape[3] as f32).sqrt();
     let rows = q_shape[0] * q_shape[1];
+    let head_dim = q_shape[3];
+
+    // Online-softmax fast path for Qwen3.5-style head_dim=256 (default knob:
+    // ARLE_AUTOGRAD_DECODE_ATTN_LEGACY=1 to force the original two-pass kernel).
+    // The online kernel uses HEAD_DIM threads per block (vs 256 in the legacy),
+    // one-pass running-max softmax (vs two-pass with shared-mem scores buffer),
+    // and warp-level reductions throughout.
+    let use_online = head_dim == 256 && !env_force_legacy_decode_attn();
+    if use_online {
+        const BLOCK_ONLINE: u32 = 256; // = HEAD_DIM
+        let n_warps = (BLOCK_ONLINE / 32) as u32;
+        let shared_online = n_warps * std::mem::size_of::<f32>() as u32;
+        launch_rows(
+            &backend.stream,
+            backend
+                .kernels
+                .function("causal_sdpa_decode_gqa_cache_online_f32_hd256")?,
+            rows,
+            BLOCK_ONLINE,
+            shared_online,
+            |mut builder| {
+                builder
+                    .arg(d_q)
+                    .arg(d_k)
+                    .arg(d_v)
+                    .arg(&mut d_out)
+                    .arg(&batch_i)
+                    .arg(&query_heads_i)
+                    .arg(&kv_heads_i)
+                    .arg(&max_seq_i)
+                    .arg(&kv_len_i)
+                    .arg(&head_dim_i)
+                    .arg(&q_start_i)
+                    .arg(&scale);
+                builder
+            },
+        )?;
+        return Ok((DeviceHandle::Cuda(CudaStorage::new(d_out)), out_shape));
+    }
+
+    // Legacy two-pass kernel — kept for head_dim != 256 and as the
+    // legacy escape hatch.
     const BLOCK: u32 = 256;
     let visible = q_start.saturating_add(1).min(kv_len);
     let shared = BLOCK * std::mem::size_of::<f32>() as u32
@@ -5655,6 +5697,20 @@ fn cuda_causal_sdpa_decode_gqa_cache(
         },
     )?;
     Ok((DeviceHandle::Cuda(CudaStorage::new(d_out)), out_shape))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn env_force_legacy_decode_attn() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("ARLE_AUTOGRAD_DECODE_ATTN_LEGACY")
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Ok("1" | "true" | "yes" | "on")
+        )
+    })
 }
 
 #[cfg(not(feature = "no-cuda"))]

@@ -58,6 +58,8 @@ const ROLLOUT_CU: &str = include_str!("kernels/rollout.cu");
 #[cfg(not(feature = "no-cuda"))]
 const ATTENTION_CU: &str = include_str!("kernels/attention.cu");
 #[cfg(not(feature = "no-cuda"))]
+const ATTENTION_DECODE_ONLINE_CU: &str = include_str!("kernels/attention_decode_online.cu");
+#[cfg(not(feature = "no-cuda"))]
 const BRIDGE_CU: &str = include_str!("kernels/bridge.cu");
 #[cfg(not(feature = "no-cuda"))]
 const LINEAR_ATTENTION_CU: &str = include_str!("kernels/linear_attention.cu");
@@ -116,6 +118,8 @@ const FUNCTION_NAMES: &[&str] = &[
     "write_scalar_at_f32",
     "causal_sdpa_decode_gqa_f32",
     "causal_sdpa_decode_gqa_cache_f32",
+    "causal_sdpa_decode_gqa_cache_online_f32_hd256",
+    "causal_sdpa_decode_gqa_cache_online_bf16_hd256",
     "qwen_decode_prepare_q_f32",
     "qwen_decode_prepare_q_gated_f32",
     "qwen_decode_prepare_kv_f32",
@@ -429,6 +433,7 @@ fn concat_sources() -> String {
         ROPE_BACKWARD_CU,
         ROLLOUT_CU,
         ATTENTION_CU,
+        ATTENTION_DECODE_ONLINE_CU,
         BRIDGE_CU,
         LINEAR_ATTENTION_CU,
     ] {
