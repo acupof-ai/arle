@@ -66,7 +66,22 @@ int4  mean_match=0.5625  (KIVI two-level K + asymmetric [-8,7])
         ↑ PoC was 0.0938 — 6× improvement
 ```
 
-**`KV_PARITY_PROMPTS=4 KV_PARITY_MAX_TOKENS=16`** (stress grid):
+**`KV_PARITY_PROMPTS=4 KV_PARITY_MAX_TOKENS=4`** (short window — bench-noise floor):
+
+```
+bf16  mean_match=1.0000
+int8  mean_match=0.9375   first_div=prompt2 step3
+fp8   mean_match=1.0000
+tq4   mean_match=0.0000   (sm_70 N/A)
+int4  mean_match=0.8125   first_div=prompt0 step1
+```
+
+INT4 is bit-perfect on 3 of 4 prompts at the 4-token horizon. The
+remaining 1/4 prompt-0 step-1 divergence is the same single failure
+mode that dominates the 8-token and 16-token grids.
+
+**`KV_PARITY_PROMPTS=4 KV_PARITY_MAX_TOKENS=16`** (stress grid — divergence
+compounds for all precisions):
 
 ```
 bf16  mean_match=1.0000
