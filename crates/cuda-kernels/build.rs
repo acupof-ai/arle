@@ -1287,6 +1287,19 @@ fn main() {
     let enable_flashmla = flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA");
     if !enable_flashmla {
         // FlashMLA SM90 disabled (likely SM89-only box or explicit opt-out).
+        // Drop the SM90-coupled shims from cu_files — they include vendored
+        // SM90 templates that won't compile without the FlashMLA tree, and
+        // they emit symbols that the stubs below will substitute for.
+        cu_files.retain(|p| {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            !matches!(
+                stem,
+                "arle_flashmla_shim"
+                    | "arle_flashmla_decode_shim"
+                    | "arle_flashmla_csa_build_indices"
+                    | "arle_flashmla_hca_build_indices"
+            )
+        });
         // Compile a stub that satisfies the `arle_flashmla_sm90_sparse_decode_*`
         // symbol set with `cudaErrorNotSupported` returns, so the Rust crate
         // links. The runtime gate `dsv4_flashmla_decode_enabled` defaults OFF
