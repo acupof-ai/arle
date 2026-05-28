@@ -193,6 +193,69 @@ With `--features cuda,no-cuda`:
   §6.1.1 use smaller dims and need a different kernel (cute-DSL or hand-port);
   tracked as future work in that plan.
 
+## Distilled lessons (recurring ≥2 entries)
+
+- **Micro-kernel knobs (launch-shape sweep, vector-load, scale/row-pointer hoist, persistent
+  kernel) are sub-noise on tiny operators.** ~25 P3 DSv4 micro-opt kills (`errors/2026-05-16-p3-*`)
+  share the same lesson: a 0.5–2% kernel-level delta on a < 50 µs kernel doesn't survive the
+  worst-shape gate. License-or-kill via the kernel's wall-clock fraction first
+  (`errors/2026-05-28-dsv4-a4-multi-stream-overlap-kill.md`).
+- **Don't mechanically transfer optimizations across KV-quant formats.** INT8→FP8 stage prefetch,
+  pair-fusion, scale-broadcast all kill on same kernel shape because the bottleneck differs.
+  Require a Qwen3.5-shaped component A/B with tight separated intervals
+  (`errors/2026-05-12-fp8-kv-decode-shared-prefetch-kill.md`,
+  `errors/2026-05-12-fp8-kv-hnd-refill-scale-broadcast-kill.md`,
+  `errors/2026-05-12-fp8-kv-pair-quantize-fusion-no-license.md`,
+  `errors/2026-05-12-fp8-kv-quantize-thread-grouping-kill.md`).
+- **Memory-capacity math is not a kernel license.** FP4's 2× smaller KV bytes does NOT auto-beat FP8
+  on sm_89 — unpack/dequant overhead can dominate. Require full-attention Phase 0 wall-clock
+  evidence, not operator scan results, before runtime integration
+  (`errors/2026-05-12-kv-w4a8-fp4-sm89-scan-kill.md`).
+- **Math-intrinsic swaps (e.g. `expf` → fast variant) on small elementwise kernels are noise.** Use
+  ncu/SASS first to confirm the intrinsic is actually the bottleneck; if it is, prefer a structural
+  rewrite (polynomial sigmoid, fused split-gate path) over scalar swaps
+  (`errors/2026-05-12-silu-mul-fast-exp-kill.md`).
+- **Quantized loaders need a 3-stage parity gate before claiming load works.**
+  (1) tensor-local dequant slice vs reference at relerr ≤ 1e-3,
+  (2) layer-local matmul parity,
+  (3) full-model logits parity. "Model loads and decodes one token" is only a smoke gate
+  (`errors/2026-05-21-arle-infer-awq-zero-point-relerr-kill.md`).
+- **`cargo:rerun-if-changed=<dir>` is NOT recursive.** Subdirectory edits ship stale cubins
+  silently; the build.rs walk must recurse and emit per-file directives
+  (`feedback_cargo_rerun_dir_not_recursive.md`).
+- **DeepEP kernel API has inverted `num_tokens` / `num_recv_tokens` naming.** `combine`'s
+  `num_tokens` is the *input* size, `num_recv_tokens` is the *output* — derived from
+  `send_head.size(0)` (= original dispatch source count). Mirror Python wrapper call sites
+  exactly or hit silent deadlocks (`feedback_deepep_kernel_api_inverted_naming.md`,
+  `wins/2026-05-26-dsv4-deepep-cpp-full-dispatch.md`).
+- **DeepEP `combine` `channel_prefix_matrix` parameter is the dispatch *output* exclusive prefix,
+  NOT the `notify_dispatch` inclusive prefix.** Use `recv_channel_prefix_matrix`, not the
+  same-named earlier one — different tensor, silent kernel deadlock
+  (`feedback_deepep_combine_uses_recv_channel_prefix.md`).
+- **NVCC parser errors in TileLang AOT compile are usually CUDA-version × tilelang-version
+  drift, not `-std=c++17` workarounds.** On CUDA 12.2, pin `tilelang>=0.1,<0.1.10` (newer
+  ships cute-cutlass C++20 requirements nvcc 12.2 rejects)
+  (`errors/2026-05-27-tilelang-0110-cuda122-cutlass-incompat.md`).
+- **Per-warp NaN patterns from a TileLang kernel → inspect generated CUDA.** AOT output sits
+  under `target/release/build/cuda-kernels-*/out/tilelang_aot/<kernel>/device_kernel.cu`;
+  mma-fragment layout bugs aren't visible from the Python kernel definition
+  (`errors/2026-05-27-tilelang-0110-fullrow-warp23-nan-sm80.md`).
+- **For pool-lifecycle APIs, returned "freed/reclaimed" vectors must reflect actual allocator
+  transitions, not refcount transitions.** Refcount-zero isn't enough when a page can still
+  be attached to a live slot (`errors/2026-05-12-paged-kv-release-attached-return.md`).
+- **GAP-style top-k tournaments must `__syncthreads()` after broadcast reads and bake the
+  tie-break sentinel into both per-thread merge AND every warp-tournament round.** Mask
+  sentinel races are the #1 silent corruptor of multi-block top-k reductions
+  (`wins/2026-05-28-cuda-gap-b-dsv4-route-block-parallel.md`).
+- **Wrapper-class porting (e.g. DeepEP torch wrapper → torch-free C++) is usually 80% smaller
+  than first sizing.** Grep the upstream kernel layer for framework coupling
+  (`grep -rln "torch::\|at::\|c10::" csrc/kernels/`) before estimating a "multi-week rewrite"
+  (`wins/2026-05-26-dsv4-deepep-cpp-kernels-torch-free.md`).
+- **Vendored-kernel wrapper bugs hide in "non-mandatory" tensors.** Hand-check the Rust wrapper
+  against upstream's reference invocation (typically a Python C++ extension that lays out all
+  params via `torch::empty`) — even tensors the kernel "doesn't require" may be unconditionally
+  written (`wins/2026-05-28-dsv4-v2-4-flashmla-root-cause-fix.md`).
+
 ## Pointers
 
 - `src/prelude.rs` — the full discipline rule, in-code comments.
