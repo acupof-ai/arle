@@ -134,16 +134,36 @@ smem/L2。
 
 ### A4 · Hierarchical multi-stream overlap（A1 / A2 落地后做，scheduler 层）
 
+**Status 2026-05-28**：**Phase 1 KILL** —
+[`../experience/errors/2026-05-28-dsv4-a4-multi-stream-overlap-kill.md`](../experience/errors/2026-05-28-dsv4-a4-multi-stream-overlap-kill.md).
+FlashMLA prefill AllGather Q overlap implemented (correct, byte-identical
+greedy output), but wall-clock Δ ≤ 0% at 4K/16K/24K. Root cause: per-layer
+AllGather Q at TP=8 / 16384 tokens ≈ 100 µs/layer → 6 ms / 105 s total
+TTFT = 0.006% of wall-clock. Sub-noise even at 100% overlap. Plumbing
+left dormant (default OFF, `ARLE_DSV4_FLASHMLA_TP_OVERLAP=0`) for
+pattern reuse on future axes (A7 CP, etc).
+
+DeepSeek MoE prepare/route/combine multi-stream is a separate scope from
+the prefill AllGather Q just KILLed — original SGLang A4 framing
+described it but ARLE's EP combine already has multi-stream overlap
+(`dsv4_combine_overlap_enabled()`, default OFF, 20 ms/rank lever). Future
+A4 work should rank that one against A1/A2 by wall-clock fraction first.
+
 **SGLang 机制**：4 个 prep op 并发跑（q_lora / q_scale / k cache / kv layout），
 用细粒度 event（`q_lora_ready`、`q_scale_ready`）串依赖，整段在小 batch 下
 塞进 CUDA graph 内。
 
 **ARLE 当前**：DSv4 prepare → route → MoE → combine 是串行 stream 调度。
+EP combine 已经在 `comm_stream` 上有 overlap 通路（`dsv4_combine_overlap_enabled`
+默认 OFF）。prefill AllGather Q overlap 已 KILL（payload 太小）。
 
 **License-or-kill**：
 - **PASS**：单 token decode wall-clock 下降 ≥ 8%；NCCL/D2H sync 不增加；
   prefill 不退步。
 - **KILL**：event 风暴导致 driver 排队，或多 stream 引入 race。
+- **新约束（2026-05-28 Phase 1 学到）**：在落地一段 multi-stream overlap 前，
+  先做 `payload × layer_count / total_wall_clock` envelope。比例 < 1% 直接
+  转 A1/A2 lever，不要写 plan。
 
 **Implementation boundary**：`infer/src/model/deepseek/mlp.rs` stream 编排
 + `crates/cuda-kernels/src/ffi/moe.rs` event 暴露；从单 layer prototype 起，
