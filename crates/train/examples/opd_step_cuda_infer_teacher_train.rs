@@ -71,9 +71,9 @@ mod app {
     const DEFAULT_LR: f32 = 1.0e-5;
     const DEFAULT_PROMPT_MAX_TOKENS: usize = 16;
     const DEFAULT_HELDOUT_PROMPTS: usize = 4;
-    const LORA_RANK: usize = 16;
-    const LORA_ALPHA: f32 = 32.0;
-    const LORA_TARGET_SET: LoraTargetSet = LoraTargetSet::AttentionQv;
+    const DEFAULT_LORA_RANK: usize = 16;
+    const DEFAULT_LORA_ALPHA: f32 = 32.0;
+    const DEFAULT_LORA_TARGET_SET: LoraTargetSet = LoraTargetSet::AttentionQv;
     const GRAD_CLIP: f32 = 1.0;
 
     #[derive(Debug)]
@@ -100,6 +100,9 @@ mod app {
         logits_window_size: Option<usize>,
         opd_kl_mask: OpdKlMask,
         eval_train_prompt_limit: Option<usize>,
+        lora_rank: usize,
+        lora_alpha: f32,
+        lora_target_set: LoraTargetSet,
     }
 
     #[derive(Debug)]
@@ -168,7 +171,7 @@ mod app {
         println!(
             "config backend=cuda teacher_model={} teacher_api_url={} teacher_config={} \
              student_model={} student_mode=lora \
-             lora_rank={LORA_RANK} lora_alpha={LORA_ALPHA:.6} lora_target_set={} \
+             lora_rank={} lora_alpha={:.6} lora_target_set={} \
              steps={} rollout_len={} lr={:.9e} grad_clip={GRAD_CLIP} \
              prompt_source={} train_prompt_count={} heldout_prompt_count={} \
              eval_steps={:?} cuda_graph={} save_student_checkpoint={} save_every={} \
@@ -181,7 +184,9 @@ mod app {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "none".to_owned()),
             args.student_model.display(),
-            LORA_TARGET_SET.label(),
+            args.lora_rank,
+            args.lora_alpha,
+            args.lora_target_set.label(),
             args.steps,
             args.rollout_len,
             args.lr,
@@ -227,10 +232,10 @@ mod app {
         let student = load_qwen35_lora_from_hf_dir(
             &args.student_model,
             LoraConfig {
-                rank: LORA_RANK,
-                alpha: LORA_ALPHA,
+                rank: args.lora_rank,
+                alpha: args.lora_alpha,
             },
-            LORA_TARGET_SET,
+            args.lora_target_set,
             &mut store,
         )?;
         let student_load_seconds = student_load_started.elapsed().as_secs_f64();
@@ -377,6 +382,9 @@ mod app {
         let mut logits_window_size = None;
         let mut opd_kl_mask = OpdKlMask::CompletionOnly;
         let mut eval_train_prompt_limit = Some(DEFAULT_EVAL_TRAIN_PROMPT_LIMIT);
+        let mut lora_rank = DEFAULT_LORA_RANK;
+        let mut lora_alpha = DEFAULT_LORA_ALPHA;
+        let mut lora_target_set = DEFAULT_LORA_TARGET_SET;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -420,6 +428,13 @@ mod app {
                     eval_train_prompt_limit =
                         parse_optional_usize_or_all(&arg, &next_arg(&mut args, &arg)?)?
                 }
+                "--lora-rank" => {
+                    lora_rank = parse_positive_usize(&arg, &next_arg(&mut args, &arg)?)?
+                }
+                "--lora-alpha" => lora_alpha = next_arg(&mut args, &arg)?.parse::<f32>()?,
+                "--lora-target-set" => {
+                    lora_target_set = parse_lora_target_set(&next_arg(&mut args, &arg)?)?
+                }
                 "--no-cuda-graph" => enable_cuda_graph = false,
                 "--help" | "-h" => {
                     println!(
@@ -433,6 +448,9 @@ mod app {
                          [--kl-chunk-size N(default 32)] [--logits-window-size N] \
                          [--opd-kl-mask full|completion-only(default)] \
                          [--eval-train-prompt-limit N|all(default {DEFAULT_EVAL_TRAIN_PROMPT_LIMIT})] \
+                         [--lora-rank N(default {DEFAULT_LORA_RANK})] \
+                         [--lora-alpha F(default {DEFAULT_LORA_ALPHA})] \
+                         [--lora-target-set attention-qv(default)|all-linear] \
                          [--no-cuda-graph]"
                     );
                     std::process::exit(0);
@@ -478,6 +496,9 @@ mod app {
             logits_window_size,
             opd_kl_mask,
             eval_train_prompt_limit,
+            lora_rank,
+            lora_alpha,
+            lora_target_set,
         })
     }
 
@@ -549,6 +570,17 @@ mod app {
             _ => Err(
                 format!("--opd-kl-mask must be one of full|completion-only, got `{raw}`").into(),
             ),
+        }
+    }
+
+    fn parse_lora_target_set(raw: &str) -> Result<LoraTargetSet, Box<dyn std::error::Error>> {
+        match raw {
+            "attention-qv" | "attention_qv" | "qv" => Ok(LoraTargetSet::AttentionQv),
+            "all-linear" | "all_linear" | "all" => Ok(LoraTargetSet::AllLinear),
+            _ => Err(format!(
+                "--lora-target-set must be one of attention-qv|all-linear, got `{raw}`"
+            )
+            .into()),
         }
     }
 
@@ -888,7 +920,12 @@ mod app {
     ) -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(out_dir)?;
         let started = Instant::now();
-        let adapter_config = lora_adapter_config(&args.student_model);
+        let adapter_config = lora_adapter_config(
+            &args.student_model,
+            args.lora_rank,
+            args.lora_alpha,
+            args.lora_target_set,
+        );
         let sources = checkpoint_sources(args)?;
         let tokenizer_path = sources.tokenizer_path.as_deref();
         let saved_dir = match target {
@@ -967,16 +1004,21 @@ mod app {
         })
     }
 
-    fn lora_adapter_config(student_model: &Path) -> LoraAdapterConfig {
+    fn lora_adapter_config(
+        student_model: &Path,
+        lora_rank: usize,
+        lora_alpha: f32,
+        lora_target_set: LoraTargetSet,
+    ) -> LoraAdapterConfig {
         let mut config = LoraAdapterConfig::new(
             student_model.display().to_string(),
             "qwen35",
             LoraConfig {
-                rank: LORA_RANK,
-                alpha: LORA_ALPHA,
+                rank: lora_rank,
+                alpha: lora_alpha,
             },
         );
-        config.target_modules = match LORA_TARGET_SET {
+        config.target_modules = match lora_target_set {
             LoraTargetSet::AttentionQv => vec!["q_proj".to_owned(), "v_proj".to_owned()],
             LoraTargetSet::AllLinear => vec!["all-linear".to_owned()],
         };
