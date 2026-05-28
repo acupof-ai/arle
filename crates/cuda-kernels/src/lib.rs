@@ -1,3 +1,5 @@
+#[cfg(feature = "cuda")]
+pub mod attention;
 pub mod collective;
 #[cfg(feature = "cuda")]
 pub mod ffi;
