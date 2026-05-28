@@ -80,6 +80,15 @@ token_count > 1` (V2.4 broader path). Total-position cap of 24576 stays.
    for per-tile compute-comm overlap; SGLang DSv4 day-0 uses
    "hierarchical multi-stream overlap" for the same axis. Designed in
    the prior session log; implementation in a dedicated follow-up.
+   **2026-05-28 update — Phase 1 KILL.** Hoisting AllGather Q onto
+   `ctx.comm_stream` with proper fences (correct, byte-identical
+   greedy output) yielded Δ ≤ 0% across 4K/16K/24K. Root cause: at
+   TP=8 per-layer AllGather Q payload = 3.1 MB / rank → ~100 µs /
+   layer → 6 ms / 105 s = 0.006% of wall-clock. Sub-noise even at
+   100% overlap. The 24K wash root cause is NOT AllGather; chunk-2
+   amortizes per-chunk fixed cost (FlashMLA launch / metadata /
+   chunked-prefill state-flush) worse than chunk-1. See
+   [`../errors/2026-05-28-dsv4-a4-multi-stream-overlap-kill.md`](../errors/2026-05-28-dsv4-a4-multi-stream-overlap-kill.md).
 2. **TP=1 path** — keeps strict 16384-only gate because FlashMLA reads
    q_prepared / writes local_attn directly (no padded scratch). A V2.5
    pad-at-TP=1 follow-up would symmetrize the dispatch.
