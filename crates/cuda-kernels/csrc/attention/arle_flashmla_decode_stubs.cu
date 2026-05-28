@@ -79,4 +79,36 @@ cudaError_t arle_flashmla_sm90_sparse_decode_sched_meta(
     return cudaErrorNotSupported;
 }
 
+// Prefill-side build-indices stubs — referenced by infer's DSv4 weights
+// path (csa = SlidingCompressed sparse-attention, hca = HybridCompressed).
+// Same disable contract: dropped from .cu list when FlashMLA OFF, replaced
+// here so the linker is satisfied. Runtime callers must check the result
+// and fall back to the legacy CSA path.
+
+cudaError_t arle_flashmla_csa_build_indices(
+    int32_t* /*indices*/, int32_t* /*topk_length*/, const int32_t* /*selected*/,
+    int32_t /*s_q*/, int32_t /*start_pos*/, int32_t /*sw_window*/,
+    int32_t /*index_topk*/, int32_t /*compressed_count*/, int32_t /*compress_ratio*/,
+    CUstream_st* /*stream*/
+) {
+    return cudaErrorNotSupported;
+}
+
+cudaError_t arle_flashmla_hca_build_indices(
+    int32_t* /*indices*/, int32_t* /*topk_length*/,
+    int32_t /*s_q*/, int32_t /*start_pos*/, int32_t /*sw_window*/,
+    int32_t /*max_compressed_keys*/, int32_t /*compressed_count*/, int32_t /*compress_ratio*/,
+    CUstream_st* /*stream*/
+) {
+    return cudaErrorNotSupported;
+}
+
+cudaError_t arle_flashmla_fill_pad_rows(
+    int32_t* /*indices*/, int32_t* /*topk_length*/,
+    int32_t /*s_q_actual*/, int32_t /*s_q_padded*/, int32_t /*topk_unified*/,
+    CUstream_st* /*stream*/
+) {
+    return cudaErrorNotSupported;
+}
+
 }  // extern "C"
