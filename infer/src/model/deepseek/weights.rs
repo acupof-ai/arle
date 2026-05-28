@@ -1800,16 +1800,16 @@ impl DeepseekModel {
             let total_position_after = start_pos + token_count;
             let (sm_major, _sm_minor) = self.ctx.compute_capability();
             let tp_world_outer = self.config.tp.world_size;
-            // V2.3 padding empirically did NOT fix the failure mode at
-            // non-16384 token_counts (4K probe with FlashMLA on + TP=8 hit
-            // an illegal memory access inside phase1.cuh after padding s_q
-            // to a multiple of 64). The TMA descriptor init bug went away
-            // but a runtime OOB inside the kernel surfaced. Root-cause
-            // requires a GPU debugger / cuda-memcheck pass that this
-            // session cannot run. Keep the strict gate; the padding code
-            // below stays inert (padded_s_q == token_count when not
-            // crossed) for future re-enable when the kernel bug is fixed.
-            let token_count_ok = token_count == FLASHMLA_VERIFIED_S_Q;
+            // V2.4 root-cause: phase1.cuh:457-458 writes to params.max_logits
+            // and params.lse unconditionally for every block. The earlier V2.3
+            // 4K crash and the original non-16384 TMA failures both trace to
+            // passing nullptr there → OOB at nullptr+offset. The dispatch
+            // below now allocates real scratch buffers, and the gate widens
+            // to allow any token_count > 1 at TP>1 (with V2.3 s_q padding) or
+            // exactly 16384 at TP=1 (still strict until padding wires through
+            // q_prepared / local_attn at TP=1).
+            let token_count_ok =
+                token_count == FLASHMLA_VERIFIED_S_Q || (tp_world_outer > 1 && token_count > 1);
             let use_flashmla = sm_major == 9
                 && (mode_int == 1 || mode_int == 2)
                 && token_count_ok
@@ -1821,14 +1821,12 @@ impl DeepseekModel {
                 let tp_rank = self.config.tp.rank;
                 let global_heads = local_heads * tp_world;
 
-                // V2.3 padded s_q: TP=1 path keeps padded_s_q == token_count
-                // (strict gate guarantees 16384 there); TP>1 pads up to next
-                // multiple of 64 for FlashMLA's TMA descriptor.
-                let padded_s_q = if tp_world > 1 {
-                    token_count.div_ceil(64) * 64
-                } else {
-                    token_count
-                };
+                // V2.4: padding is no longer needed (the original failure
+                // was nullptr max_logits/lse → OOB write, not s_q alignment).
+                // Keep padded_s_q = token_count; the fill_pad_rows / padded
+                // alloc code below stays in place but goes inert at this
+                // assignment (preserves bisect history).
+                let padded_s_q = token_count;
 
                 // FlashMLA B_H == 64 → global h_q must be a multiple of 64. With
                 // 64 total Q heads at any TP this is satisfied; check defensively.
@@ -2161,6 +2159,33 @@ impl DeepseekModel {
                     } else {
                         local_heads as i32
                     };
+                    // ROOT-CAUSE FIX: phase1.cuh:457-458 unconditionally
+                    // SM90_BULK_COPY_S2G writes to params.max_logits and
+                    // params.lse for every (s_q_idx, q_h_idx) block. Passing
+                    // nullptr → nullptr+offset is the OOB that produced the
+                    // illegal memory access at non-16384 token counts (and
+                    // probably corrupted state at 16384 too, but in a way
+                    // that didn't surface immediately because page 0+small
+                    // offsets may land in driver-reserved scratch on H20).
+                    // Allocate real scratch buffers and pass them through.
+                    let stats_elems = padded_s_q * (h_q_for_flashmla as usize);
+                    let mut max_logits_scratch: cudarc::driver::CudaSlice<f32> = self
+                        .ctx
+                        .stream
+                        .alloc_zeros::<f32>(stats_elems)
+                        .map_err(|err| {
+                            anyhow::anyhow!("DSv4 FlashMLA max_logits scratch alloc failed: {err}")
+                        })?;
+                    let mut lse_scratch: cudarc::driver::CudaSlice<f32> = self
+                        .ctx
+                        .stream
+                        .alloc_zeros::<f32>(stats_elems)
+                        .map_err(|err| {
+                            anyhow::anyhow!("DSv4 FlashMLA lse scratch alloc failed: {err}")
+                        })?;
+                    let (max_logits_ptr_mut, _ml_g) =
+                        max_logits_scratch.device_ptr_mut(&self.ctx.stream);
+                    let (lse_ptr_mut, _lse_g) = lse_scratch.device_ptr_mut(&self.ctx.stream);
                     let scale = 1.0 / (head_dim as f32).sqrt();
                     let res = unsafe {
                         ffi::arle_flashmla_sm90_sparse_prefill_fwd(
@@ -2170,8 +2195,8 @@ impl DeepseekModel {
                             sink_f32_local_ptr,
                             len_const_ptr as *const i32,
                             flashmla_out_ptr,
-                            std::ptr::null_mut(), // max_logits
-                            std::ptr::null_mut(), // lse
+                            max_logits_ptr_mut as *mut f32,
+                            lse_ptr_mut as *mut f32,
                             // V2.3: padded s_q (TP>1) or token_count (TP=1).
                             padded_s_q as i32,
                             s_kv_total as i32,
