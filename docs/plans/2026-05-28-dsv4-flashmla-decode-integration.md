@@ -2,15 +2,29 @@
 title: DSv4 FlashMLA decode integration — make FlashMLA the default decode path
 date: 2026-05-28
 type: implementation plan
-status: ready for codex pickup（next session）
+status: D-1 + D-2 + FFI landed; D-3 KILLED (KV layout mismatch); D-4..D-6 blocked
 owner: ckl
 related:
   - docs/projects/2026-05-25-dsv4-next-axis-from-sglang-v4.md (A2 axis closure)
   - docs/experience/wins/2026-05-28-dsv4-v2-4-flashmla-root-cause-fix.md (prefill done)
+  - docs/experience/wins/2026-05-28-dsv4-flashmla-decode-integration.md (this session's kill)
   - https://github.com/deepseek-ai/FlashMLA/blob/main/csrc/api/sparse_decode.h
 ---
 
 # DSv4 FlashMLA decode integration
+
+> **2026-05-28 status update — D-3 KILLED.** The design below (D-3a/D-3b)
+> assumes upstream's decode kernel consumes a bf16 block-paged KV buffer.
+> That's the declared C type in `params.h` but **not the actual contract**.
+> The kernel reinterprets `params.kv` as `fp8*` and asserts
+> `stride_kv_row == BYTES_PER_TOKEN` (MODEL1 = 584 bytes/token, V32 = 656
+> bytes/token) with a model-specific FP8-NoPE + bf16-RoPE + fp8_e8m0-scales
+> packed layout. ARLE's bf16 KV pool cannot satisfy that without a separate
+> ~1–2 week FP8 packing kernel. Vendor (D-1) + shim (D-2) + FFI landed
+> (commits `5d18b624`, `3f7923a3`); runtime dispatch (D-4) intentionally
+> **NOT** wired to avoid a parallel-old-new-paths half-state. See
+> [`docs/experience/wins/2026-05-28-dsv4-flashmla-decode-integration.md`](../experience/wins/2026-05-28-dsv4-flashmla-decode-integration.md)
+> for the evidence trail and SOLID-aligned decision.
 
 ## Why
 
