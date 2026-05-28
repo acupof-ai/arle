@@ -54,6 +54,13 @@ pub struct LayerCommunicator {
     ep_nccl: Option<Arc<NcclGroup>>,
     #[cfg(feature = "nccl")]
     ep_overlap_nccl: Option<Arc<NcclGroup>>,
+    /// A4 — secondary TP NCCL communicator bound to `ctx.comm_stream` for
+    /// compute/comm overlap during prefill AllGather Q. Attached only when
+    /// `ARLE_DSV4_FLASHMLA_TP_OVERLAP=1`; the main `tp_nccl` group keeps the
+    /// compute-stream binding so unrelated TP collectives stay on the
+    /// hot path.
+    #[cfg(feature = "nccl")]
+    tp_overlap_nccl: Option<Arc<NcclGroup>>,
     /// Phase B-3.2 — native DeepEP `Buffer` booted when
     /// `ARLE_DSV4_MOE_BACKEND=native-deepep`. Lives alongside the EP
     /// NCCL group so forward-path callers reach the Buffer from the
@@ -80,6 +87,8 @@ impl LayerCommunicator {
             ep_nccl: None,
             #[cfg(feature = "nccl")]
             ep_overlap_nccl: None,
+            #[cfg(feature = "nccl")]
+            tp_overlap_nccl: None,
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             native_deepep: None,
         }
@@ -135,6 +144,8 @@ impl LayerCommunicator {
             ep_nccl: None,
             #[cfg(feature = "nccl")]
             ep_overlap_nccl: None,
+            #[cfg(feature = "nccl")]
+            tp_overlap_nccl: None,
             #[cfg(all(feature = "cuda", feature = "nccl"))]
             native_deepep: None,
         })
@@ -200,6 +211,30 @@ impl LayerCommunicator {
         Ok(self)
     }
 
+    /// A4 — attach a secondary TP NCCL group bound to `ctx.comm_stream` so
+    /// AllGather Q can overlap with `arle_flashmla_csa_pack_kv` /
+    /// `arle_flashmla_csa_build_indices` on the compute stream. Mirrors the
+    /// shape of `with_ep_overlap_nccl` but on the TP axis.
+    #[cfg(feature = "nccl")]
+    pub fn with_tp_overlap_nccl(mut self, nccl: Arc<NcclGroup>) -> Result<Self> {
+        if self.tp_world_size != nccl.world_size {
+            bail!(
+                "LayerCommunicator overlap TP world_size {} does not match NCCL world_size {}",
+                self.tp_world_size,
+                nccl.world_size
+            );
+        }
+        if self.tp_rank != nccl.rank {
+            bail!(
+                "LayerCommunicator overlap TP rank {} does not match NCCL rank {}",
+                self.tp_rank,
+                nccl.rank
+            );
+        }
+        self.tp_overlap_nccl = Some(nccl);
+        Ok(self)
+    }
+
     pub fn tp_rank(&self) -> usize {
         self.tp_rank
     }
@@ -248,6 +283,24 @@ impl LayerCommunicator {
     #[cfg(feature = "nccl")]
     pub fn ep_nccl(&self) -> Option<Arc<NcclGroup>> {
         self.ep_nccl.clone()
+    }
+
+    /// A4 accessor — secondary TP NCCL group bound to `ctx.comm_stream`,
+    /// when one was attached via `with_tp_overlap_nccl`. Callers must
+    /// explicitly fence producer/consumer streams around this group's
+    /// collectives (see `DeviceContext::comm_waits_for_compute` /
+    /// `compute_waits_for_comm`).
+    #[cfg(feature = "nccl")]
+    pub fn tp_overlap_nccl(&self) -> Option<Arc<NcclGroup>> {
+        self.tp_overlap_nccl.clone()
+    }
+
+    /// A4 — whether a TP overlap communicator is wired up. `tp_world_size > 1`
+    /// is implied by the group having survived `with_tp_overlap_nccl`'s
+    /// rank/world-size validation.
+    #[cfg(feature = "nccl")]
+    pub fn tp_overlap_can_all_gather_bf16(&self) -> bool {
+        self.tp_world_size > 1 && self.tp_overlap_nccl.is_some()
     }
 
     /// Phase B-3.2 builder — attach a pre-booted `NativeDeepEp` to this
