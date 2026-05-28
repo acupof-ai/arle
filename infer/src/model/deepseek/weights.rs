@@ -210,6 +210,20 @@ impl DeepseekModel {
                 )?);
                 comm = comm.with_tp_nccl(Arc::clone(&group))?;
                 tp_nccl = Some(group);
+
+                // A4 — secondary TP NCCL group bound to `ctx.comm_stream` so
+                // FlashMLA prefill AllGather Q can overlap with kv_pack /
+                // build_indices on the compute stream. Default off until
+                // the pod PASS at 24K reproduces the wash-case improvement.
+                if dsv4_flashmla_tp_overlap_enabled()? {
+                    let overlap_group = Arc::new(NcclGroup::new_on_stream(
+                        config.tp.rank,
+                        config.tp.world_size,
+                        dsv4_nccl_env_bootstrap_with_port_offset(2)?,
+                        ctx.comm_stream.clone(),
+                    )?);
+                    comm = comm.with_tp_overlap_nccl(overlap_group)?;
+                }
             }
             if config.ep.world_size > 1 {
                 let group = if config.ep.world_size == config.tp.world_size
@@ -1860,6 +1874,54 @@ impl DeepseekModel {
                     "FlashMLA requires params.topk % (2*B_TOPK=128) == 0"
                 );
 
+                // A4 — early AllGather Q launch on `ctx.comm_stream` (only
+                // when the overlap TP NCCL group is wired). We hoist this
+                // BEFORE `kv_pack` / `build_indices` so the fence
+                // `comm_waits_for_compute()` only orders past `qk_prep`
+                // (already enqueued at this point), and the subsequent
+                // compute-stream kernels run concurrently with AllGather.
+                //
+                // Without the hoist, fences placed after `kv_pack` /
+                // `build_indices` would force AllGather to wait for them on
+                // the comm stream, collapsing the overlap window to zero.
+                #[cfg(feature = "nccl")]
+                let mut gathered_q_overlap: Option<
+                    cudarc::driver::CudaSlice<bf16>,
+                > = None;
+                #[cfg(feature = "nccl")]
+                let padded_send_count = padded_s_q * local_heads * head_dim;
+                #[cfg(feature = "nccl")]
+                let overlap_nccl = if tp_world > 1 {
+                    self.layer_communicator.tp_overlap_nccl()
+                } else {
+                    None
+                };
+                #[cfg(feature = "nccl")]
+                if let Some(overlap) = overlap_nccl.as_ref() {
+                    let mut gathered = unsafe {
+                        self.ctx
+                            .stream
+                            .alloc_traced::<bf16>(padded_send_count * tp_world)
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "FlashMLA TP overlap AllGather scratch alloc failed: {err}",
+                                )
+                            })?
+                    };
+                    // qk_prep wrote q_prepared on the compute stream above.
+                    // Fence so the comm-stream AllGather observes those
+                    // writes. Records the compute-stream HEAD (post-qk_prep,
+                    // pre-kv_pack) — the subsequent compute kernels stay
+                    // un-fenced from comm.
+                    self.ctx.comm_waits_for_compute()?;
+                    overlap.all_gather_bf16_device(
+                        &q_prepared.data,
+                        padded_send_count,
+                        &mut gathered,
+                    )?;
+                    gathered_q_overlap = Some(gathered);
+                }
+
                 // ---- Unified KV pool: [SW rebased | k_prepared | compressed] ----
                 let mut kv_unified: cudarc::driver::CudaSlice<bf16> = self
                     .ctx
@@ -1989,27 +2051,38 @@ impl DeepseekModel {
                              build with --features nccl and set TP env-bootstrap vars",
                         )
                     })?;
+                    // A4 — when the early-hoisted AllGather Q was launched on
+                    // `ctx.comm_stream` above (because `tp_overlap_nccl` is
+                    // wired), reuse that `gathered` buffer and fence
+                    // `compute_waits_for_comm` before repack. Otherwise post
+                    // a synchronous AllGather inline on the compute stream
+                    // (legacy V2.4 path, byte-identical to the prior commit).
+                    let allgather_on_overlap_stream = gathered_q_overlap.is_some();
                     // AllGather Q directly from q_prepared (V2.4: no padding
                     // needed → no intermediate buffer + memcpy_dtod). This
                     // saves a per-layer memcpy_dtod of size token_count *
                     // local_heads * head_dim that V2.3 left in place when
                     // padded_s_q == token_count.
-                    let padded_send_count = padded_s_q * local_heads * head_dim;
-                    let mut gathered = unsafe {
-                        self.ctx
-                            .stream
-                            .alloc_traced::<bf16>(padded_send_count * tp_world)
-                            .map_err(|err| {
-                                anyhow::anyhow!(
-                                    "FlashMLA TP allgather Q scratch alloc failed: {err}",
-                                )
-                            })?
+                    let gathered = if let Some(buf) = gathered_q_overlap.take() {
+                        buf
+                    } else {
+                        let mut g = unsafe {
+                            self.ctx
+                                .stream
+                                .alloc_traced::<bf16>(padded_send_count * tp_world)
+                                .map_err(|err| {
+                                    anyhow::anyhow!(
+                                        "FlashMLA TP allgather Q scratch alloc failed: {err}",
+                                    )
+                                })?
+                        };
+                        tp_nccl.all_gather_bf16_device(
+                            &q_prepared.data,
+                            padded_send_count,
+                            &mut g,
+                        )?;
+                        g
                     };
-                    tp_nccl.all_gather_bf16_device(
-                        &q_prepared.data,
-                        padded_send_count,
-                        &mut gathered,
-                    )?;
                     let mut packed = unsafe {
                         self.ctx
                             .stream
@@ -2022,6 +2095,12 @@ impl DeepseekModel {
                     // guards release before we move the buffers into the Option
                     // owners below.
                     {
+                        if allgather_on_overlap_stream {
+                            // Before the compute-stream repack reads
+                            // `gathered`, fence the AllGather completion on
+                            // the comm stream into compute.
+                            self.ctx.compute_waits_for_comm()?;
+                        }
                         use cudarc::driver::{DevicePtr, DevicePtrMut};
                         let (gathered_ptr, _gg) = gathered.device_ptr(&self.ctx.stream);
                         let (packed_ptr, _gp) = packed.device_ptr_mut(&self.ctx.stream);
@@ -4552,6 +4631,26 @@ fn dsv4_combine_overlap_enabled() -> bool {
     std::env::var("ARLE_DSV4_COMBINE_OVERLAP")
         .map(|raw| !matches!(raw.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
         .unwrap_or(false)
+}
+
+/// A4 — gate the secondary TP NCCL group bound to `ctx.comm_stream`.
+/// When set, the FlashMLA prefill dispatch issues AllGather Q on the
+/// overlap stream and uses `CudaPipelineFence` to synchronize with the
+/// compute stream that produces `q_prepared` and consumes `gathered`.
+///
+/// Default off (this commit lands the plumbing; flip to on after the pod
+/// 24K probe demonstrates ≥ 5% wall-clock improvement, per
+/// `docs/plans/2026-05-28-dsv4-a4-multi-stream-overlap.md`).
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_flashmla_tp_overlap_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_FLASHMLA_TP_OVERLAP").ok() else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => bail!("invalid ARLE_DSV4_FLASHMLA_TP_OVERLAP value `{raw}`"),
+    }
 }
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
