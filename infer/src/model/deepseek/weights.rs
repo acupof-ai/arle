@@ -1859,6 +1859,7 @@ impl DeepseekModel {
                 && token_count_ok
                 && (head_dim == 512 || head_dim == 576)
                 && total_position_after <= FLASHMLA_TOTAL_POSITION_LIMIT
+                && cache.is_some()
                 && dsv4_flashmla_prefill_enabled()?;
             if use_flashmla {
                 let tp_world = self.config.tp.world_size;
