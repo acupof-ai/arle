@@ -1050,6 +1050,27 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     pub(crate) fp8_kv_comp_blocks: usize,
     pub(crate) fp8_kv_page_block_size: usize,
     pub(crate) fp8_kv_bytes_per_token: usize,
+    // Phase D-4 — set true after the prefill→decode SW bootstrap bulk-pack
+    // has run for this layer. Used to gate the one-shot bf16-SW-ring →
+    // FP8-sub-pool copy that runs the first time a decode step (`token_count
+    // == 1`) executes against this cache.
+    pub(crate) fp8_kv_sw_bootstrapped: bool,
+    // Phase D-4 — tracks how many compressor rows have been packed into the
+    // FP8 compressed sub-pool so the per-step hook only packs new rows.
+    pub(crate) fp8_kv_comp_packed_rows: usize,
+    // Phase D-4 — per-layer i32 scratches used by the strided FP8 KV pack
+    // hooks (block_ids + in-block rows). Lazy-allocated on first decode
+    // step when the env knob is on.
+    //   `fp8_kv_sw_bulk_bids` / `fp8_kv_sw_bulk_rows` — size = sliding_window
+    //     (one entry per SW ring slot) for the prefill→decode bootstrap.
+    //   `fp8_kv_one_token_scratch` — [1]-element scratches for the per-step
+    //     SW pack and (single-row) compressor pack.
+    //   `fp8_kv_comp_scratch` — sized to max compressor rows per step
+    //     (worst case = prefill compressor batch).
+    pub(crate) fp8_kv_sw_bulk_bids: Option<CudaSlice<i32>>,
+    pub(crate) fp8_kv_sw_bulk_rows: Option<CudaSlice<i32>>,
+    pub(crate) fp8_kv_one_token_scratch: Option<(CudaSlice<i32>, CudaSlice<i32>)>,
+    pub(crate) fp8_kv_comp_scratch: Option<(CudaSlice<i32>, CudaSlice<i32>)>,
 }
 
 #[cfg(feature = "cuda")]
