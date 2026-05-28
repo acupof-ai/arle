@@ -122,6 +122,40 @@ hot-path wiring through `ops/linear.rs` is M2b Phase 2 and not yet in).
 4. Add a `BackendInferenceEngine` arm in `server_engine.rs::LoadedInferenceEngine::load`.
 5. Add a greedy baseline under `infer/test_data/` and wire an E2E test.
 
+## Distilled lessons (recurring ≥2 entries)
+
+- **FFI sessions absorb data — Rust-side per-step state can look empty mid-session.** When planning
+  per-step Rust observation/mutation of state crossing C++ FFI (Qwen3.5 step model is the canonical
+  case), grep for `begin_session` / `clear` / `take` patterns first; `kv_flat`-style Rust fields
+  exist but are empty while the C++ session owns the data
+  (`feedback_ffi_session_owns_data.md`).
+- **Quantized loaders need tensor-local dequant parity (relerr ≤ 1e-3) BEFORE layer-local matmul
+  parity BEFORE full-model logits parity.** "Model decodes one token" is only a smoke gate; the
+  first formal gate is a `[rows × cols]` slice dequant compared to gptqmodel/PyTorch
+  (`errors/2026-05-21-arle-infer-awq-zero-point-relerr-kill.md`).
+- **`fast::rope` layout is `[B, heads, seq, d]`, not `[B, seq, heads, d]`.** Transpose to `T=seq`
+  before calling rope; wrong-axis call gives degenerate output
+  (`feedback_mlx_rope_layout.md`, `feedback_mlx_rope_axis.md`).
+- **MLX `fast::rope` scalar offset silently drops batch rows > 0 on `[B, H, S=1, D]`.** Always pass
+  per-row int32 array offsets for batched Metal decode — same-length AND varlen batches both go
+  through the array-offset RoPE path
+  (`docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md`).
+- **HF eos / OpenAI API conventions over project-specific paths.** Fix bugs at the upstream
+  spec layer (HF eos precedence, OpenAI API shape) rather than the symptom that surfaced from
+  one model (`feedback_no_closed_door_solutions.md`).
+- **CUDA-graph capture default-on for prefill requires multi-shape hit-rate sweep.** Per-shape
+  graph cache slots × peak concurrency × per-session shape variants must fit; high-c thrash is
+  slower than pure kernel launch. Don't default on c=1/c=2 alone
+  (`errors/2026-05-25-prefill-graph-default-kill.md`, `errors/2026-05-25-gap-G3-cuda-graph-noop-on-p5-shape.md`).
+- **KV-precision claims gate on the KV parity test (`infer/tests/kv_precision_parity.rs`).** Default-on
+  requires `mean_match >= 0.95` at production decode horizon AND ITL p50 ≥ 30% better at c=1.
+  Mean-match on degenerate baselines is a methodology bug, not a kernel bug
+  (`wins/2026-05-26-bench-int8-vs-bf16-kv-a100.md`,
+  `errors/2026-05-26-fp8-kv-catastrophic-was-test-artifact.md`).
+- **GreedyParityTests skipping cublasLt autotune is insufficient.** Batch-invariant numerics need
+  the same effective GEMM shape and API path per request row — solo vs concurrent must match
+  per-row N=1 paths too (`wins/2026-05-07-cuda-greedy-consistency-deterministic-gemm.md`).
+
 ## Pointers
 
 - `crates/qwen3-spec/` and `crates/qwen35-spec/` — canonical config + tensor-name
