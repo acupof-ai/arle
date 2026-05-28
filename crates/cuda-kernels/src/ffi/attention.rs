@@ -822,3 +822,46 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 }
+
+// ============================================================================
+// DSv4 FlashMLA sparse-decode indices builder (block-paged coords).
+//
+// Builds the unified per-decode-token indices buffer (s_q=1) in the
+// block-paged coord space of the FP8 KV pool described in
+// `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md` Phase D-3'.
+//
+// Sibling kernel of the prefill-side `arle_flashmla_csa_build_indices` /
+// `arle_flashmla_hca_build_indices`; mode_int selects between them.
+// See `csrc/attention/dsv4_flashmla_decode_build_indices.cu` for the
+// row-segment layout (SW slots | compressed selections | -1 padding).
+//
+// Phase D-4 step 1 of the FlashMLA decode integration.
+// ============================================================================
+unsafe extern "C" {
+    /// Build the unified decode indices row (`s_q=1`).
+    ///
+    /// - `indices`: out, `int32 [topk_unified]` where
+    ///   `topk_unified = sliding_window + max_compressed_keys` (must be %128 == 0).
+    /// - `selected`: `int32 [max_compressed_keys]` for CSA (mode_int=1),
+    ///   nullptr for HCA (mode_int=2).
+    /// - `sw_blocks`: SW sub-pool block count
+    ///   (`ceil(sliding_window / page_block_size)`).
+    /// - `start_pos`: absolute position of the decode token.
+    /// - `max_compressed_keys`: `index_topk` (CSA) or padded
+    ///   `compressed_count` (HCA).
+    /// - `compress_ratio`: causality-gate ratio for compressed selections.
+    /// - `mode_int`: 1 = CSA, 2 = HCA.
+    /// - `page_block_size`: 64 for DSv4-Flash MODEL1.
+    pub fn arle_dsv4_flashmla_decode_build_indices_cuda(
+        indices: *mut i32,
+        selected: *const i32,
+        sw_blocks: i32,
+        sliding_window: i32,
+        start_pos: i32,
+        max_compressed_keys: i32,
+        compress_ratio: i32,
+        mode_int: i32,
+        page_block_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+}
