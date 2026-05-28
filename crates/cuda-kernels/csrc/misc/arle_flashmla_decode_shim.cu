@@ -105,11 +105,10 @@ cudaError_t arle_flashmla_sm90_sparse_decode_get_meta(
         return cudaErrorInvalidValue;
     }
     try {
-        sm90::decode::sparse_fp8::Decode_Sm90_Impl impl;
         // Decode_Sm90_Impl is declared in vendor/flashmla/csrc/api/sparse_decode.h
-        // — but that header pulls in <ATen/...> via TORCH_CHECK macros. To
-        // avoid a libtorch dependency we re-implement the meta computation
-        // locally from the upstream formula (api/sparse_decode.h:60-66):
+        // but that header pulls in <ATen/...> via TORCH_CHECK macros. To
+        // avoid a libtorch dependency we re-implement the meta formula
+        // locally from upstream (api/sparse_decode.h:60-66):
         //   {std::max(arch.num_sms / s_q / (h_q/64), 1), 5, 64}
         cudaDeviceProp prop;
         int dev = 0;
@@ -124,7 +123,6 @@ cudaError_t arle_flashmla_sm90_sparse_decode_get_meta(
         *out_num_sm_parts = n;
         *out_fixed_overhead_num_blocks = 5;
         *out_block_size_topk = 64;
-        (void)impl; // silence unused-warning if NDEBUG strips ctor side-effects
     } catch (const std::exception&) {
         return cudaErrorInvalidValue;
     } catch (...) {
