@@ -104,3 +104,53 @@ pub fn dsv4_fp8_kv_pack_raw(
 
     Ok(())
 }
+
+/// Strided-input pack variant — accepts raw u64 NoPE/RoPE pointers plus an
+/// explicit element stride per axis. Phase D-4 runtime hooks feed this
+/// from `k_prepared` (interleaved [NoPE 448 | RoPE 64] bf16, head_dim=512
+/// stride) without an intermediate deinterleave; see
+/// `docs/experience/wins/2026-05-28-dsv4-flashmla-decode-d4-plumbing.md`
+/// Finding 1.
+///
+/// `stride_nope_elems` / `stride_rope_elems` are per-token bf16 element
+/// strides. Must be ≥ 448 / 64 respectively. For `k_prepared`-shaped
+/// input pass `(nope_ptr = k_prepared, rope_ptr = k_prepared + 448*2 B,
+/// stride_*_elems = 512)`.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_fp8_kv_pack_strided_raw(
+    ctx: &DeviceContext,
+    nope_ptr: u64,
+    rope_ptr: u64,
+    packed_kv_ptr: u64,
+    token_block_id: &CudaSlice<i32>,
+    token_in_block_row: &CudaSlice<i32>,
+    n_tokens: usize,
+    page_block_size: usize,
+    stride_nope_elems: usize,
+    stride_rope_elems: usize,
+) -> Result<()> {
+    if n_tokens == 0 {
+        return Ok(());
+    }
+
+    let (tbid_ptr, _gt) = token_block_id.device_ptr(&ctx.stream);
+    let (tibr_ptr, _gi) = token_in_block_row.device_ptr(&ctx.stream);
+
+    unsafe {
+        ffi::arle_dsv4_fp8_kv_pack_strided_cuda(
+            nope_ptr as *const ffi::Half,
+            rope_ptr as *const ffi::Half,
+            packed_kv_ptr as *mut u8,
+            tbid_ptr as *const i32,
+            tibr_ptr as *const i32,
+            n_tokens as i32,
+            page_block_size as i32,
+            stride_nope_elems as i32,
+            stride_rope_elems as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+
+    Ok(())
+}

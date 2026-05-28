@@ -20,7 +20,7 @@
 
 #![cfg(feature = "cuda")]
 
-use cuda_kernels::attention::dsv4_fp8_kv_pack;
+use cuda_kernels::attention::{dsv4_fp8_kv_pack, dsv4_fp8_kv_pack_strided_raw};
 use cuda_kernels::tensor::{DeviceContext, DeviceVec};
 use cudarc::driver::DevicePtr;
 use half::bf16;
@@ -503,6 +503,116 @@ fn dsv4_fp8_kv_pack_parity_two_blocks() {
         max_abs_err < 30.0,
         "max_abs_err={max_abs_err} unexpectedly large — encode path likely broken"
     );
+}
+
+/// Strided-input variant parity — feeds the kernel an interleaved
+/// `k_prepared`-shaped `[n_tokens, head_dim=512]` bf16 buffer where the
+/// NoPE bytes occupy `[0, 448)` and the RoPE bytes occupy `[448, 512)`,
+/// with stride 512 elements per token. Output must be **byte-identical**
+/// to the contiguous packer fed from the deinterleaved (NoPE 448, RoPE 64)
+/// view of the same source. Phase D-4 contract gate per
+/// `docs/experience/wins/2026-05-28-dsv4-flashmla-decode-d4-plumbing.md`
+/// Finding 1.
+#[test]
+fn dsv4_fp8_kv_pack_strided_parity_against_contiguous() {
+    let ctx = DeviceContext::new().expect("CUDA context");
+
+    // 64 tokens → 1 full block of 64.
+    let n_tokens = 64usize;
+    const HEAD_DIM: usize = HEAD_DIM_NOPE + HEAD_DIM_ROPE; // 512
+
+    // Build a `k_prepared`-shaped buffer (interleaved NoPE|RoPE per token,
+    // stride 512), and the matching pair of deinterleaved buffers.
+    let k_prepared_host = make_random_bf16(0xAABBCCDD0011EEFF, n_tokens * HEAD_DIM, 137);
+    let mut nope_host = vec![bf16::ZERO; n_tokens * HEAD_DIM_NOPE];
+    let mut rope_host = vec![bf16::ZERO; n_tokens * HEAD_DIM_ROPE];
+    for t in 0..n_tokens {
+        let base = t * HEAD_DIM;
+        nope_host[t * HEAD_DIM_NOPE..(t + 1) * HEAD_DIM_NOPE]
+            .copy_from_slice(&k_prepared_host[base..base + HEAD_DIM_NOPE]);
+        rope_host[t * HEAD_DIM_ROPE..(t + 1) * HEAD_DIM_ROPE]
+            .copy_from_slice(&k_prepared_host[base + HEAD_DIM_NOPE..base + HEAD_DIM]);
+    }
+
+    // H2D both shapes.
+    let k_prepared_dev = DeviceVec::from_host(&ctx, &k_prepared_host).expect("k_prepared H2D");
+    let nope_dev = DeviceVec::from_host(&ctx, &nope_host).expect("nope H2D");
+    let rope_dev = DeviceVec::from_host(&ctx, &rope_host).expect("rope H2D");
+
+    let pool_bytes = PAGE_BLOCK_SIZE * TOKEN_BYTES;
+    let pool_contig = ctx
+        .stream
+        .alloc_zeros::<u8>(pool_bytes)
+        .expect("contig pool alloc");
+    let pool_strided = ctx
+        .stream
+        .alloc_zeros::<u8>(pool_bytes)
+        .expect("strided pool alloc");
+    let pool_contig_ptr = {
+        let (p, _g) = pool_contig.device_ptr(&ctx.stream);
+        p
+    };
+    let pool_strided_ptr = {
+        let (p, _g) = pool_strided.device_ptr(&ctx.stream);
+        p
+    };
+
+    let block_ids: Vec<i32> = vec![0; n_tokens];
+    let in_block_rows: Vec<i32> = (0..n_tokens).map(|i| i as i32).collect();
+    let block_ids_dev = ctx.stream.clone_htod(&block_ids).expect("block_ids H2D");
+    let rows_dev = ctx.stream.clone_htod(&in_block_rows).expect("rows H2D");
+
+    // Contiguous pack: classic [448, 64] strides.
+    dsv4_fp8_kv_pack(
+        &ctx,
+        &nope_dev,
+        &rope_dev,
+        pool_contig_ptr,
+        &block_ids_dev,
+        &rows_dev,
+        n_tokens,
+        PAGE_BLOCK_SIZE,
+    )
+    .expect("contiguous pack");
+
+    // Strided pack — same k_prepared base for both NoPE and RoPE, RoPE
+    // pointer offset by 448 bf16 elements (= 896 bytes). Stride is 512
+    // for both. We pass u64 device pointers extracted from k_prepared_dev.
+    let (k_prep_u64, _g_kp) = k_prepared_dev.data.device_ptr(&ctx.stream);
+    let rope_ptr_u64 = k_prep_u64 + (HEAD_DIM_NOPE as u64) * (std::mem::size_of::<bf16>() as u64);
+
+    dsv4_fp8_kv_pack_strided_raw(
+        &ctx,
+        k_prep_u64,
+        rope_ptr_u64,
+        pool_strided_ptr,
+        &block_ids_dev,
+        &rows_dev,
+        n_tokens,
+        PAGE_BLOCK_SIZE,
+        HEAD_DIM, // stride_nope_elems = 512
+        HEAD_DIM, // stride_rope_elems = 512
+    )
+    .expect("strided pack");
+
+    ctx.sync().expect("sync");
+
+    let contig_host = ctx.stream.clone_dtoh(&pool_contig).expect("contig D2H");
+    let strided_host = ctx.stream.clone_dtoh(&pool_strided).expect("strided D2H");
+    assert_eq!(contig_host.len(), strided_host.len());
+
+    // Byte-exact match across the full block: NoPE fp8 bytes, RoPE bf16
+    // bytes, and the scales tail must all agree because the kernel logic
+    // is the same.
+    for i in 0..contig_host.len() {
+        if contig_host[i] != strided_host[i] {
+            panic!(
+                "strided vs contiguous packer divergence at byte {i}: \
+                 contig=0x{:02x} strided=0x{:02x}",
+                contig_host[i], strided_host[i]
+            );
+        }
+    }
 }
 
 #[test]
