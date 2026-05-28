@@ -111,6 +111,28 @@ trait yet (M5+ scope).
 - Don't add backend-specific methods (`fn cuda_only_xxx`) to the trait;
   put those on a backend extension trait or keep them on the free fn.
 
+## Distilled lessons (recurring ≥2 entries)
+
+- **`OpsBackend` migrations land one op family per commit.** `961ac13` / `477b761` / `c70ad34`
+  / `5f209d2` are the precedent — partial-migrate dual-routes one callsite via free fn and the
+  other via trait method, which then survives indefinitely and breaks the M4 contract
+  (root `AGENTS.md` §No half-states).
+- **The CUDA-graph capture path stays on free fns.** Raw-pointer launches with cached pointers
+  rely on the legacy free-fn ABI; the trait method is too abstract for the capture loop
+  (commit `5f209d2` body).
+- **Activation-quant kernel A/B is shape-specific.** 9216-column rows and 2560-column rows are
+  separate buckets; treating them as one hides the hidden-size non-win. Smem-trim wins on wide
+  rows, regresses on intermediate rows — keep per-shape evidence
+  (`wins/2026-05-12-bench-qwen35-w4a8-int8-activation-quant-smem-trim.md`,
+  `wins/2026-05-12-bench-qwen35-w4a8-int8-activation-quant-warp-reduce.md`).
+- **Component-bench delta does not project to request-throughput.** An operator hidden-latency
+  −1.8% does not survive into model-level ITL unless the operator is on the binding hot path
+  with no upstream slack (`wins/2026-05-12-bench-qwen35-w4a8-int8-activation-quant-int-round.md`).
+- **Microbench wins that overlap noise intervals must be killed before landing.** Tiny structurally-simple
+  ops require either a clearly separated component interval or a downstream request-level
+  regression gate — math-intrinsic swaps on overlapping CIs are noise
+  (`errors/2026-05-12-silu-mul-fast-exp-kill.md`).
+
 ## Pointers
 
 - `crates/cuda-kernels/src/prelude.rs` — the types you're allowed to
