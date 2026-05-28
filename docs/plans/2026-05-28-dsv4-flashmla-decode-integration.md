@@ -2,29 +2,28 @@
 title: DSv4 FlashMLA decode integration — make FlashMLA the default decode path
 date: 2026-05-28
 type: implementation plan
-status: D-1 + D-2 + FFI landed; D-3 KILLED (KV layout mismatch); D-4..D-6 blocked
+status: D-1 + D-2 + FFI landed; D-3 un-killed → D-3' FP8 pack + pool active
 owner: ckl
 related:
   - docs/projects/2026-05-25-dsv4-next-axis-from-sglang-v4.md (A2 axis closure)
   - docs/experience/wins/2026-05-28-dsv4-v2-4-flashmla-root-cause-fix.md (prefill done)
-  - docs/experience/wins/2026-05-28-dsv4-flashmla-decode-integration.md (this session's kill)
+  - docs/experience/wins/2026-05-28-dsv4-flashmla-decode-integration.md (D-3 kill — superseded by D-3')
   - https://github.com/deepseek-ai/FlashMLA/blob/main/csrc/api/sparse_decode.h
 ---
 
 # DSv4 FlashMLA decode integration
 
-> **2026-05-28 status update — D-3 KILLED.** The design below (D-3a/D-3b)
-> assumes upstream's decode kernel consumes a bf16 block-paged KV buffer.
-> That's the declared C type in `params.h` but **not the actual contract**.
-> The kernel reinterprets `params.kv` as `fp8*` and asserts
-> `stride_kv_row == BYTES_PER_TOKEN` (MODEL1 = 584 bytes/token, V32 = 656
-> bytes/token) with a model-specific FP8-NoPE + bf16-RoPE + fp8_e8m0-scales
-> packed layout. ARLE's bf16 KV pool cannot satisfy that without a separate
-> ~1–2 week FP8 packing kernel. Vendor (D-1) + shim (D-2) + FFI landed
-> (commits `5d18b624`, `3f7923a3`); runtime dispatch (D-4) intentionally
-> **NOT** wired to avoid a parallel-old-new-paths half-state. See
-> [`docs/experience/wins/2026-05-28-dsv4-flashmla-decode-integration.md`](../experience/wins/2026-05-28-dsv4-flashmla-decode-integration.md)
-> for the evidence trail and SOLID-aligned decision.
+> **2026-05-28 update — D-3 UN-KILLED → D-3'.** The original D-3a/D-3b
+> sketch assumed upstream decodes consume bf16 block-paged KV. Upstream
+> source contradicts: the kernel reinterprets `params.kv` as `fp8*` and
+> asserts `stride_kv_row == BYTES_PER_TOKEN` (MODEL1 = 584, V32 = 656)
+> with a model-specific FP8-NoPE + bf16-RoPE + fp8_e8m0-scales layout.
+>
+> **Decision (per user directive 2026-05-28): build the FP8 KV pool +
+> packing kernel.** SGLang already does this; ARLE's bf16 pool is not a
+> blocker, it is a missing layer. See **Phase D-3' below** for the
+> full SOLID contract + implementation plan. Vendor (D-1) + shim (D-2)
+> + FFI landed (`5d18b624`, `3f7923a3`); D-3' + D-4..D-6 active.
 
 ## Why
 
@@ -120,29 +119,88 @@ escape lesson.
 A second shim `arle_flashmla_sm90_decode_combine` wraps the split-KV
 combine kernel.
 
-### Phase D-3 — KV cache layout adapter
+### Phase D-3 — KV cache layout adapter [SUPERSEDED by D-3']
 
-**Critical:** FlashMLA decode expects KV as block-paged
-`[num_blocks, page_block_size=64, d_qk]`. ARLE DSv4 KV cache is a
-contiguous ring per layer at `[max_seq_len, h_kv=1, d_qk]` with explicit
-SW window + compressed pool.
+(Original sketch retained for reference: assumed bf16 block-paged KV.
+Superseded — see D-3' below for the correct FP8 contract.)
 
-Two options:
+### Phase D-3' — FP8 KV pool + packing kernel (SOLID contract, active path)
 
-**D-3a (recommended)**: Build a thin block-table on-the-fly. ARLE's
-contiguous KV addressed by token_id → FlashMLA expects (block_idx,
-in_block_row). With page_block_size=64 and SW window=128 + compressed
-N: emit indices in FlashMLA's block coords by computing
-`block_idx = token_id / 64, row = token_id % 64` and tagging the SW
-slots vs compressed slots in the same indices buffer.
+**Upstream contract (MODEL1 = DSv4-Flash), evidence-anchored:**
 
-**D-3b (alternative)**: Allocate a FlashMLA-shaped block-paged KV buffer
-per layer per request and copy from ARLE's KV ring at decode-time. Simpler
-but ~256 MB extra memory per request and a memcpy per step.
+| Source                                         | Evidence                                                                                                                        |
+|------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| `splitkv_mla.cuh:694`                          | `constexpr int BYTES_PER_TOKEN = HEAD_DIM_NOPE + 2*HEAD_DIM_ROPE + 8 = 448 + 128 + 8 = 584`                                      |
+| `splitkv_mla.cuh:695`                          | `KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN)` (per-token byte stride pin)                                                |
+| `splitkv_mla.cuh:558`                          | `gK_base = k_ptr + block_idx*k_block_stride + rel_idx_in_block*(HEAD_DIM_NOPE + HEAD_DIM_ROPE*sizeof(bf16))`                    |
+| `splitkv_mla.cuh:555`                          | Scales offset = `page_block_size*(NoPE+RoPE_bytes) + rel_idx_in_block*NUM_SCALES*sizeof(fp8_e8m0)`                              |
+| `config.h: NUM_SCALES = 8 / QUANT_TILE_SIZE=64`| 8 fp8_e8m0 scales per token (7 used for the 7×64 NoPE tiles + 1 pad)                                                            |
+| `api/sparse_decode.h:295`                      | preflight: `bytes_per_token = 448 + 64*2 + (448/64)*1 + 1 = 584`                                                                |
 
-D-3a is what SGLang does — strongly preferred. Requires careful
-verification that ARLE's KV pool block alignment is compatible
-(page_block_size=64 vs ARLE's prior allocations).
+**MODEL1 per-block layout (page_block_size=64, 37376 B/block/layer):**
+
+```
+offset 0       : [T0 NoPE 448 B][T0 RoPE 128 B]  (576 B per token AoS)
+offset 576     : [T1 NoPE 448 B][T1 RoPE 128 B]
+...
+offset 36288   : [T63 NoPE 448 B][T63 RoPE 128 B]
+offset 36864   : [T0 scales 8 B][T1 scales 8 B]...[T63 scales 8 B]   ← scales region appended
+total          : 64 × 576 + 64 × 8 = 37376 B = 64 × 584
+```
+
+NoPE = fp8_e4m3 (HEAD_DIM_NOPE=448 elements). Quantized per **tile of 64**
+NoPE dims (so 7 tiles per token) with one **fp8_e8m0** scale per tile.
+RoPE = bf16 verbatim (HEAD_DIM_ROPE=64 elements → 128 bytes).
+
+Dequant inside the kernel (`dequant.h`): pairs of fp8_e8m0 scales are
+converted to `bf16x2` via `__nv_cvt_e8m0x2_to_bf162raw`, then applied
+per fp8x8 chunk via `cvt_fp8x8_bf16x8`.
+
+**Encoder side — what we need to build:**
+
+```
+arle_dsv4_fp8_kv_pack<MODEL1>(
+    const bf16* nope,         // [n_tokens, 448]
+    const bf16* rope,          // [n_tokens, 64]
+    uint8_t* packed_kv,        // block-paged FP8 layout, MODEL1 = 584 B/token
+    const int* block_table,    // [n_tokens] → block_id
+    const int* in_block_row,   // [n_tokens] → 0..page_block_size-1
+    int page_block_size,       // 64 for DSv4
+    int n_tokens,
+    cudaStream_t stream
+)
+```
+
+Per-token per-tile (8 tiles × 64 dims = 448 NoPE elements per token... wait,
+7 tiles × 64 = 448, the 8th scale slot is just padding):
+1. amax = warp-reduce max(|nope[i]|) over the 64 NoPE dims of the tile.
+2. scale_e8m0 = derive E8M0 exponent s.t. amax/2^scale_e8m0 ≤ FP8_E4M3_MAX (448).
+3. quant: x_fp8 = __nv_cvt_float_to_fp8x4(x_bf16 * 2^(-scale_e8m0)).
+4. Write 64 fp8 NoPE bytes to `block_id*block_stride + row*576`.
+5. Write 128 bf16 RoPE bytes to `block_id*block_stride + row*576 + 448`.
+6. Write 8 scale bytes (7 tile scales + 0 pad) to
+   `block_id*block_stride + page_block_size*576 + row*8`.
+
+**Pool design — written-through at compressor update:**
+
+| Path                | Allocator                                                                                                              | Trigger                                          |
+|---------------------|------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------|
+| Prefill (V2.4 FlashMLA on) | Output still goes through ARLE's existing bf16 KV pool — prefill uses different kernel; **no FP8 pool dependency** | n/a                                              |
+| Compressor update (DSv4 hybrid layers, on every decode step) | After the bf16 NoPE+RoPE compressor key/value lands, run `arle_dsv4_fp8_kv_pack` on the **same** stream      | Existing compressor-update hook in `weights.rs` |
+| Decode (FlashMLA path)     | Reads the FP8 pool directly                                                                                  | `token_count == 1` branch                        |
+
+Pool size per rank: `num_layers × max_blocks × page_block_size × 584`.
+For DSv4-Flash @ TP=8, num-slots=4, max_seq_len=32768:
+- max_blocks per rank ≈ ceil(32768 / 64) × num-slots = 2048 (worst-case across all slots).
+- 43 layers × 2048 × 64 × 584 = **3.2 GB / rank**. H20 96 GB — comfortable.
+
+Allocation strategy: per-request, allocated at session start, freed at
+session end. Same lifetime as ARLE's existing bf16 KV pool.
+
+**V32 follow-up:** scales become 4 × float32 (NUM_SCALES=4, scales are
+fp32 inside the kernel — see splitkv_mla.cuh:545-549), BYTES_PER_TOKEN
+= 656, layout AoS. Same encoder skeleton, different scale dtype + count.
+Defer V32 implementation until MODEL1 lands.
 
 ### Phase D-4 — Decode dispatch wire-in
 
@@ -196,14 +254,14 @@ clears, flip `dsv4_flashmla_decode_enabled()` default to true.
 
 ## Estimated cost
 
-- Phase D-1 (vendor): 1-2 hours (mostly mechanical mirror + build.rs).
-- Phase D-2 (shim): 2-3 hours including exception-safety + alloc bookkeeping.
-- Phase D-3 (KV adapter): 4-6 hours — this is the hardest part; needs
-  careful audit of ARLE's KV pool indexing against FlashMLA's expectations.
-- Phase D-4 (dispatch): 1-2 hours.
-- Phase D-5 (test + perf): 2-4 hours per iteration.
+- Phase D-1 (vendor): **DONE** (`5d18b624`).
+- Phase D-2 (shim + FFI): **DONE** (`3f7923a3`).
+- Phase D-3' (FP8 pack kernel + pool): 6–10 hours — central work.
+- Phase D-4 (dispatch + block-paged indices): 2–3 hours.
+- Phase D-5 (parity test vs bf16 reference): 2–4 hours.
+- Phase D-6 (default-on flip after bench PASS): 30 min + bench.
 
-**Total: 1-2 focused sessions** (8-15 hours wall-clock).
+**Total remaining: ~12–18 hours wall-clock.**
 
 ## What this unblocks
 
