@@ -33,13 +33,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterable
 
 
 # ───────────────────────── HTTP client ──────────────────────────
@@ -243,10 +243,21 @@ def _mmlu_extract_letter(text: str) -> str | None:
     return None
 
 
-def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path, debug_samples: int = 5) -> dict:
+def run_mmlu(
+    client: ArleClient,
+    n_samples: int,
+    output_dir: Path,
+    debug_samples: int = 5,
+    seed: int | None = None,
+) -> dict:
     """Run MMLU 5-shot eval. Saves the first `debug_samples` raw responses
     to <output_dir>/mmlu_debug.json so future extractor fixes can target
-    real model output instead of guessed prompt-shape."""
+    real model output instead of guessed prompt-shape.
+
+    When `seed` is set, each per-subject pool is shuffled before subject-
+    balanced subsampling so multiple runs at the same `n_samples` produce
+    independent draws — needed for binomial-noise variance estimates at
+    the small-n eval shapes used today."""
     try:
         from datasets import load_dataset
     except ImportError:
@@ -271,15 +282,23 @@ def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path, debug_samples
     n_per_subject = max(1, n_samples // len(subjects))
     pool: list[dict] = []
     for subj in subjects:
-        subj_pool = [ex for ex in ds_test if ex["subject"] == subj][:n_per_subject]
-        pool.extend(subj_pool)
+        subj_pool = [ex for ex in ds_test if ex["subject"] == subj]
+        if seed is not None:
+            random.Random(f"mmlu-{seed}-{subj}").shuffle(subj_pool)
+        pool.extend(subj_pool[:n_per_subject])
     pool = pool[:n_samples]
-    print(f"[mmlu] sampling {len(pool)} questions across {len(subjects)} subjects", flush=True)
+    seed_tag = f" seed={seed}" if seed is not None else ""
+    print(f"[mmlu] sampling {len(pool)} questions across {len(subjects)} subjects{seed_tag}", flush=True)
 
     correct = 0
     invalid = 0
     per_subject: dict[str, dict] = {}
     debug_records: list[dict] = []
+    invalid_records: list[dict] = []
+    # Per-question outcomes for paired McNemar-style analysis at the
+    # question level (n=~145 paired per seed vs n=5 paired across seeds —
+    # much tighter SE when comparing two models on the same seed).
+    per_question: list[dict] = []
     t0 = time.time()
     for i, ex in enumerate(pool):
         subj = ex["subject"]
@@ -301,16 +320,38 @@ def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path, debug_samples
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             print(f"[mmlu] sample {i} request error: {exc}", flush=True)
             invalid += 1
+            invalid_records.append({"i": i, "subject": subj, "kind": "request_error", "reason": str(exc)})
+            per_question.append({"i": i, "subject": subj, "gold": None, "predicted": None,
+                                 "status": "request_error"})
             continue
         letter = _mmlu_extract_letter(resp)
         gold = chr(ord("A") + ex["answer"])
         sub_stat = per_subject.setdefault(subj, {"correct": 0, "total": 0})
         sub_stat["total"] += 1
+        status = "scored"
         if letter is None:
             invalid += 1
+            status = "extract_fail"
+            # Save every extractor-fail response so future extractor patches
+            # can target empirical failure modes (not guessed shapes).
+            invalid_records.append({
+                "i": i,
+                "subject": subj,
+                "gold": gold,
+                "kind": "extract_fail",
+                "response": resp[:300],
+            })
         elif letter == gold:
             correct += 1
             sub_stat["correct"] += 1
+        per_question.append({
+            "i": i,
+            "subject": subj,
+            "gold": gold,
+            "predicted": letter,
+            "correct": letter == gold,
+            "status": status,
+        })
         if i < debug_samples:
             debug_records.append(
                 {
@@ -336,11 +377,15 @@ def run_mmlu(client: ArleClient, n_samples: int, output_dir: Path, debug_samples
         "n_correct": correct,
         "accuracy": accuracy,
         "elapsed_seconds": elapsed,
+        "seed": seed,
         "per_subject": per_subject,
     }
     (output_dir / "mmlu.json").write_text(json.dumps(report, indent=2))
     if debug_records:
         (output_dir / "mmlu_debug.json").write_text(json.dumps(debug_records, indent=2))
+    if invalid_records:
+        (output_dir / "mmlu_invalid.json").write_text(json.dumps(invalid_records, indent=2))
+    (output_dir / "mmlu_perquestion.json").write_text(json.dumps(per_question, indent=2))
     print(f"[mmlu] accuracy={accuracy:.3f} ({correct}/{scored}, invalid={invalid}, {elapsed:.1f}s)", flush=True)
     return report
 
@@ -375,7 +420,14 @@ def _gsm8k_extract_answer(text: str) -> str | None:
     return None
 
 
-def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_samples: int = 5, n_shots: int = 8) -> dict:
+def run_gsm8k(
+    client: ArleClient,
+    n_samples: int,
+    output_dir: Path,
+    debug_samples: int = 5,
+    n_shots: int = 8,
+    seed: int | None = None,
+) -> dict:
     try:
         from datasets import load_dataset
     except ImportError:
@@ -392,12 +444,17 @@ def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_sample
     few_shot = "\n".join(_gsm8k_format_shot(ex) for ex in shot_examples)
     if few_shot:
         few_shot += "\n"
-    pool = list(ds_test.select(range(min(n_samples, len(ds_test)))))
-    print(f"[gsm8k] running {len(pool)} problems with {len(shot_examples)} shots", flush=True)
+    indices = list(range(len(ds_test)))
+    if seed is not None:
+        random.Random(f"gsm8k-{seed}").shuffle(indices)
+    pool = [ds_test[i] for i in indices[: min(n_samples, len(ds_test))]]
+    seed_tag = f" seed={seed}" if seed is not None else ""
+    print(f"[gsm8k] running {len(pool)} problems with {len(shot_examples)} shots{seed_tag}", flush=True)
 
     correct = 0
     invalid = 0
     debug_records: list[dict] = []
+    per_question: list[dict] = []
     t0 = time.time()
     for i, ex in enumerate(pool):
         prompt = few_shot + f"Q: {ex['question']}\nA:"
@@ -406,13 +463,23 @@ def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_sample
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             print(f"[gsm8k] sample {i} request error: {exc}", flush=True)
             invalid += 1
+            per_question.append({"i": i, "gold": None, "predicted": None, "status": "request_error"})
             continue
         gold = _gsm8k_gold_answer(ex["answer"])
         pred = _gsm8k_extract_answer(resp)
+        status = "scored"
         if pred is None:
             invalid += 1
+            status = "extract_fail"
         elif pred == gold:
             correct += 1
+        per_question.append({
+            "i": i,
+            "gold": gold,
+            "predicted": pred,
+            "correct": pred == gold if pred is not None else False,
+            "status": status,
+        })
         if i < debug_samples:
             debug_records.append(
                 {
@@ -441,10 +508,12 @@ def run_gsm8k(client: ArleClient, n_samples: int, output_dir: Path, debug_sample
         "n_shots": len(shot_examples),
         "accuracy": accuracy,
         "elapsed_seconds": elapsed,
+        "seed": seed,
     }
     (output_dir / "gsm8k.json").write_text(json.dumps(report, indent=2))
     if debug_records:
         (output_dir / "gsm8k_debug.json").write_text(json.dumps(debug_records, indent=2))
+    (output_dir / "gsm8k_perquestion.json").write_text(json.dumps(per_question, indent=2))
     print(f"[gsm8k] accuracy={accuracy:.3f} ({correct}/{scored}, invalid={invalid}, {elapsed:.1f}s)", flush=True)
     return report
 
@@ -474,6 +543,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--tasks", default="mmlu,gsm8k", help="comma-separated subset of: " + ", ".join(TASK_RUNNERS))
     parser.add_argument("--n-samples", type=int, default=200, help="samples per task")
     parser.add_argument("--gsm8k-shots", type=int, default=8, help="few-shot examples for GSM8K")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="if set, shuffle per-subject MMLU pool and GSM8K test pool before "
+                             "sampling. Distinct seeds give independent draws for variance estimation. "
+                             "Default unset = original deterministic ordering, reproduces older runs.")
     parser.add_argument("--output", type=Path, required=True, help="output directory for per-task reports")
     args = parser.parse_args(argv)
 
@@ -493,15 +566,16 @@ def main(argv: list[str]) -> int:
         "model_path": args.model_path if args.backend == "hf" else None,
         "model_id": args.model_id,
         "gsm8k_shots": args.gsm8k_shots,
+        "seed": args.seed,
         "tasks": {},
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     for task in requested:
         print(f"\n========== {task} ==========", flush=True)
         if task == "gsm8k":
-            report = run_gsm8k(client, args.n_samples, args.output, n_shots=args.gsm8k_shots)
+            report = run_gsm8k(client, args.n_samples, args.output, n_shots=args.gsm8k_shots, seed=args.seed)
         else:
-            report = TASK_RUNNERS[task](client, args.n_samples, args.output)
+            report = TASK_RUNNERS[task](client, args.n_samples, args.output, seed=args.seed)
         summary["tasks"][task] = report
 
     summary["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
