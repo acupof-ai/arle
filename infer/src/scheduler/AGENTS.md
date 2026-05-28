@@ -155,6 +155,42 @@ works with any backend. Load before editing any scheduler internals.
   versus the Phase 1 baseline when claiming spec-decode value, not the
   bare acceptance gauge.
 
+## Distilled lessons (recurring ≥2 entries)
+
+- **Deadlock signature = `active=N` but `prefill_rows=0` AND `tokens_out=0` over a window.** Resource
+  reserved with no forward progress is substrate, not capacity tuning; backoff knobs won't move it
+  (`errors/2026-05-08-w3-c16-deadlock-not-just-admission.md`,
+  `errors/2026-05-08-w4-c8-deadlock-confirms-workload-dependent.md`).
+- **Any substrate hypothesis must reproduce on a second workload with different parameter products.**
+  Single-workload deadlock could be workload tuning; same fingerprint at W3 c=16 *and* W4 c=8
+  is substrate (`errors/2026-05-08-w4-c8-deadlock-confirms-workload-dependent.md`).
+- **`prefill-max-requests` cap is the first lever to check at the binding production shape.** A
+  cap defaulted "for safety per past incident" should be revisited annually with current memory
+  profile; config tuning is 0 LOC vs days of substrate refactor
+  (`wins/2026-05-08-ttft-p99-cap8-fix-86pct-reduction.md`,
+  `wins/2026-05-08-prefill-cap-8-multi-shape-safe-default-flip.md`).
+- **Streaming-cancel propagation is a c-sweep gate.** GuideLLM c-sweeps with stale uncancelled
+  requests contaminate later concurrency windows — fix client→scheduler cancellation before
+  reading any c≥4 number (`errors/2026-05-26-qwen35-hybrid-mixed-kill.md`).
+- **Larger `chunked_prefill_size` defaults need ITL + output-throughput gates, not just TTFT.**
+  Bigger chunks move loss from prefill queueing to decode starvation
+  (`errors/2026-05-25-axis3-chunked-prefill-size-kill.md`).
+- **Per-shape CUDA-graph cache default-on requires sweep c=1..16 hit-rate validation.** Cache capacity
+  must be ≥ peak concurrency × per-session shape variants, otherwise high-c thrash is slower than
+  pure kernel launch (re-capture stall). c=1/c=2 alone is not evidence
+  (`errors/2026-05-25-prefill-graph-default-kill.md`).
+- **Classical Leviathan-style spec-decode on Qwen3 longctx is workload-dead at α ≈ 7–19%.** Don't
+  re-litigate self-spec K-sweeps without first cheapening the draft; bare `acceptance_rate=100%`
+  on single-token canaries is the same-model verifying-itself trap
+  (`errors/2026-05-08-spec-decode-self-spec-k5-kill.md`,
+  `errors/2026-05-08-spec-decode-ext-draft-k5-kill.md`,
+  `errors/2026-05-08-spec-decode-32k-self-spec-kill-axis-level.md`).
+- **`bench validation` failure (TTFT=0, `ttft_ms=null`) means the server blocked, not metric math.**
+  Suspect the scheduler first, GuideLLM second (`errors/2026-05-25-prefill-graph-default-kill.md`).
+- **nsys "X% of NVTX window" must cross-check against "ms / per-request total" framing.** A 55.7%
+  prefill-window kernel that is 0.32% wall-clock fails the §0 kill threshold — always take the
+  conservative framing for license-or-kill (`AGENTS.md §0` anchor).
+
 ## Tests
 
 - `scheduler/tests.rs` — unit tests for admission + chunking policy.

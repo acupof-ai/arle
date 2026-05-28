@@ -125,6 +125,29 @@ produced it can decode. Example payloads documented in `tier.rs`:
 - `NixlTransport` (M5): bincode of `(remote_agent_name, addr, len, mem_type, dev_id)`.
 - `MooncakeTransport` (post-M5, trigger-gated): bincode of its own handle.
 
+## Distilled lessons
+
+- **W3/W4 session-keyed lookup needs a slot-eviction-under-pressure proof.** A one-session smoke
+  is necessary but not sufficient; canonical warmup runs must show
+  `session_slot_pressure_eviction > 0` AND a `matched_prefix_tokens` distribution with 8k-scale
+  prefixes (not just 16/32) before claiming session-keyed promotion works
+  (`errors/2026-05-03-bench-agent-load-session-keyed-w4-capacity-gate-miss.md`,
+  `errors/2026-05-03-bench-agent-load-session-slot-eviction-w4-gate-miss.md`).
+- **When W4 resume's matched-prefix stays at 32 tokens, stop capacity experiments.** Inspect the
+  semantic-lookup boundary first — T1/T2 retention only helps after admission can identify the
+  prior session prefix (`errors/2026-05-02-bench-agent-load-a6-t1-retention-gate-miss.md`).
+- **`SessionSlot` side-indexes ship with an explicit inactive-slot pressure policy or never ship.**
+  Unbounded session retention turns a token-walk lookup miss into a T1 capacity deadlock before
+  resume (`errors/2026-05-03-bench-agent-load-session-keyed-w4-capacity-gate-miss.md`).
+- **Disk store cancellation must be safe under coordinator drain.** T2 disk-store entries that
+  remain in-flight at coordinator shutdown leak fetch tickets; verify cancel-paths drain through
+  the `Coordinator::control` channel, not by dropping the transport
+  (`wins/2026-05-04-bench-kv-tier-copy-throughput.md`,
+  `wins/2026-05-05-bench-kv-tier-rust-substrate.md`).
+- **MR registration is allocation-stable for the lifetime of the engine.** `HostPinnedPool`
+  reallocation breaks NIXL/Mooncake registered regions; treat the host arena as effectively
+  static post-init (root tier-cache project doc §4.2 invariant 5).
+
 ## Pointers
 
 - `docs/projects/tiered-kv-cache.md` — live design doc and milestone ledger.
