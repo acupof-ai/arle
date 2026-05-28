@@ -154,6 +154,26 @@ C++ files staying separate from `mlx_bridge.cpp`. New Metal-only fused
 ops should land here, not in `infer`. See
 [`docs/projects/mlx-backend-roadmap.md`](../../docs/projects/mlx-backend-roadmap.md).
 
+## Distilled lessons (recurring ≥2 entries)
+
+- **mlx.metallib must be colocated with the binary on every macOS distribution path.** build.rs,
+  package script, install.sh, brew formula — all must ship `mlx.metallib` next to the binary
+  or runtime fails to load the Metal shaders
+  (`feedback_mlx_metallib_must_be_colocated.md`).
+- **`mx::compile` needs cache-as-input for position-dependent graphs.** `item()` bakes scalars
+  into the compiled graph; runtime `cache_pos` must enter as an active-prefix input tensor,
+  not as `(cache, position)` separately — else compile re-runs every step
+  (`feedback_mx_compile_cache_as_input.md`).
+- **`mx::async_eval` encodes on the *caller* thread.** No worker thread will steal the encode
+  work — falsified multi-stream encode pipelining (5–13% Qwen3.6 regression). Don't propose
+  encode-side pipelining (`feedback_mlx_async_eval_is_caller_thread.md`).
+- **Adding a second C++ translation unit requires `cc::Build::new().file(...)` in `build.rs`
+  AND `cargo:rerun-if-changed`.** There is no glob — silently-missing files compile-skip then
+  link-error opaquely.
+- **Use `mlx_sys::mlx_guard()` for any cross-crate MLX serialization.** MLX state is
+  process-global; autograd's Metal backend and `infer::backend::metal` must share one Rust
+  synchronization boundary, not local mutexes.
+
 ## Pointers
 
 - `infer/src/backend/metal/AGENTS.md` — the Rust consumer side.

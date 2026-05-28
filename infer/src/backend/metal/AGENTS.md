@@ -182,6 +182,38 @@ first; it carries the prioritized backlog and acceptance gates.
 - First build downloads + compiles MLX 0.31.1 via FetchContent — slow,
   cached under `target/.../build/mlx-sys-*/out/`.
 
+## Distilled lessons (recurring ≥2 entries)
+
+- **Auto-`set_wired_limit` pins (model dir size + 1 GiB headroom) by default.** Drops Qwen3.6 c=1
+  p99 from 86 → 15 ms; opt-out is `--wired-limit-bytes 0`. Guard against pinning on hosts where
+  the model exceeds ~75% of system RAM (`wins/2026-05-07-bench-qwen36-mle-perf.md`).
+- **MLX_MAX_OPS_PER_BUFFER / MAX_MB_PER_BUFFER is a Qwen3.5-dense tune, NOT a default for Qwen3.6 MoE.**
+  On MoE, 95% of step is `mx::async_eval` encoding ~600–1000 primitives — buffer cap is wash-or-loss.
+  Per-workload matched-A/B only (`wins/2026-05-07-bench-qwen36-baseline.md`,
+  `wins/2026-05-07-bench-qwen36-encode-bottleneck.md`).
+- **`mx::async_eval` encodes on the *caller* thread.** Falsified multi-stream encode pipelining
+  with a 5–13% Qwen3.6 regression — StreamThread workers don't move encode off the caller
+  (`feedback_mlx_async_eval_is_caller_thread.md`).
+- **Any new `eval()` / `async_eval()` / `.item()` under Metal production code must be classified
+  as setup / request-boundary / hot-loop red flag in `metal_eval_audit.rs` before merge.** A test
+  fails until the audit table is updated (`wins/2026-05-02-metal-eval-audit.md`).
+- **MoE `top_k` is a runtime knob (env-gated).** vllm-mlx ships `--moe-top-k`; lowering it cuts
+  encode work proportionally. Defer flag-flip-to-default until quality eval (MMLU/HumanEval)
+  confirms < 3% delta (`wins/2026-05-07-bench-qwen36-moe-topk-runtime-knob.md`).
+- **Effects ≤ 10% in a single consecutive c-sweep are thermal noise** until reproduced same-binary
+  env-A/B in ≥ 2 sessions. Single-session "Metal won" entries are a known failure mode
+  (`feedback_matched_ab_for_small_bench_effects.md`).
+- **Path probe at fn entry before claiming a Metal perf change works.** Drop a `std::sync::Once`
+  `log::info!` at the targeted function and grep server logs after the bench — three M_e.1 audit
+  misses had the same root cause: the changed code wasn't on the bench's path
+  (`feedback_path_probe_before_perf_claim.md`).
+- **Subprocess-per-turn (`bench_eli_agent.sh`) forks new `eli` per turn.** In-process HashMap
+  session caches don't engage across the boundary; verify deployment shape before claiming a
+  session-cache fix (`feedback_subprocess_mode_breaks_inprocess_cache.md`).
+- **Defensive `eval(&[])` calls travel in clusters.** When one blocks a pipelined path, grep the
+  whole backend for siblings before fixing — same author wrote the same pattern elsewhere
+  (`feedback_audit_defensive_evals_in_batch.md`).
+
 ## Pointers
 
 - `crates/mlx-sys/AGENTS.md` — the bridge layer below this.
