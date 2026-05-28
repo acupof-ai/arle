@@ -44,18 +44,28 @@ Switching ARLE decode to FlashMLA should give:
 
 ## Scope
 
-`ARLE_DSV4_FLASHMLA_DECODE` (env knob for safety only; **default = ON
-once pod parity passes**), single-binary change in
-`infer/src/model/deepseek/weights.rs::finish_attention_gpu` for the
-`token_count == 1` branch.
+**Policy (per user directive 2026-05-28, hardened):** FlashMLA decode is
+the **permanent default** — the industry-standard path (SGLang DSv4
+day-0 production). Once pod parity passes, the legacy
+`dsv4_hybrid_attention_cuda` decode path is **deleted** from the tree
+along with its supporting kernels. The `ARLE_DSV4_FLASHMLA_DECODE` env
+knob exists only as a single-commit rollback hatch during the
+parity-validation window — it disappears once the legacy code is
+removed.
 
-**Policy (per user directive 2026-05-28):** FlashMLA decode is the
-industry-standard production path (SGLang DSv4 day-0). Long-term, the
-legacy `dsv4_hybrid_attention_cuda` remains in the tree as a
-documented fallback for the env-knob OFF case only; default-on is the
-target the moment parity clears. No "validate over multiple sessions"
-fence-sitting — the env knob is a single-flag safety hatch, not a
-permanent gate.
+**No short-term solutions.** All 4 D-4 contract findings get
+long-term fixes, not iteration-friendly half-measures:
+
+| Finding | Long-term solution (no fallback) |
+|---|---|
+| F1: K layout interleaved | Strided pack kernel variant (DONE, `d19b8f87`). |
+| F2: SW pre-fill bootstrap | One-shot bulk pack hook at prefill→decode transition; same strided kernel. |
+| F3: Indices builder | **GPU-side `arle_dsv4_flashmla_decode_build_indices_cuda` kernel** — same shape as the prefill-side `arle_flashmla_{csa,hca}_build_indices` (already vendored). No CPU prep path. |
+| F4: SchedMeta + scratch | **Amortized arena**: one `lse_accum` + `o_accum` + `sched_meta` + `num_splits` allocation per slot, sized for worst-case `num_sm_parts`, reused across all decode steps in a session. No per-step alloc. |
+
+Single-binary change in `infer/src/model/deepseek/weights.rs::finish_attention_gpu`
+for the `token_count == 1` branch + the supporting pack/indices kernels
+in `crates/cuda-kernels/csrc/attention/`.
 
 ## Implementation phases
 
