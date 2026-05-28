@@ -44,9 +44,18 @@ Switching ARLE decode to FlashMLA should give:
 
 ## Scope
 
-`ARLE_DSV4_FLASHMLA_DECODE` (default on after validation), single-binary
-change in `infer/src/model/deepseek/weights.rs::finish_attention_gpu` for
-the `token_count == 1` branch.
+`ARLE_DSV4_FLASHMLA_DECODE` (env knob for safety only; **default = ON
+once pod parity passes**), single-binary change in
+`infer/src/model/deepseek/weights.rs::finish_attention_gpu` for the
+`token_count == 1` branch.
+
+**Policy (per user directive 2026-05-28):** FlashMLA decode is the
+industry-standard production path (SGLang DSv4 day-0). Long-term, the
+legacy `dsv4_hybrid_attention_cuda` remains in the tree as a
+documented fallback for the env-knob OFF case only; default-on is the
+target the moment parity clears. No "validate over multiple sessions"
+fence-sitting — the env knob is a single-flag safety hatch, not a
+permanent gate.
 
 ## Implementation phases
 
