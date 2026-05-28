@@ -1296,6 +1296,36 @@ fn main() {
         ] {
             cu_files.push(sparse.join(entry));
         }
+
+        // FlashMLA SM90 sparse decode — fp8 KV cache + split-KV
+        // combine + CPU-side decode scheduler. 4 model×head instantiations
+        // (MODEL1×{64,128}, V32×{64,128}) + combine + sched-meta kernel.
+        // Compiled with the same flags as prefill — flagged below in the
+        // `is_flashmla_kernel` branch via the shared `vendor/flashmla`
+        // path component.
+        //
+        // NOTE: the kernel hard-asserts `stride_kv_row == BYTES_PER_TOKEN`
+        // where MODEL1 = 584 bytes/token (448 fp8 NoPE + 128 bf16 RoPE +
+        // 8 fp8_e8m0 scales) and V32 = 656 bytes/token (512 fp8 NoPE +
+        // 128 bf16 RoPE + 16 bytes scales). The bf16-pointer typing of
+        // `SparseAttnDecodeParams::kv` in params.h is misleading — the
+        // kernel reinterprets it as `fp8*` (see splitkv_mla.cuh line 491+).
+        // ARLE's current bf16 KV pool cannot satisfy this contract.
+        // Vendored for future wire-up; shim is gated off by default.
+        let decode_sparse_fp8 = flashmla_root.join("csrc/sm90/decode/sparse_fp8");
+        for entry in [
+            "instantiations/model1_persistent_h64.cu",
+            "instantiations/model1_persistent_h128.cu",
+            "instantiations/v32_persistent_h64.cu",
+            "instantiations/v32_persistent_h128.cu",
+        ] {
+            cu_files.push(decode_sparse_fp8.join(entry));
+        }
+        cu_files.push(flashmla_root.join("csrc/smxx/decode/combine/combine.cu"));
+        cu_files.push(
+            flashmla_root
+                .join("csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu"),
+        );
     }
 
     // Keep a stable compile order independent of filesystem iteration order.
@@ -1404,7 +1434,8 @@ fn main() {
         // sm_90a-specific arch is also needed because FlashMLA's WGMMA
         // primitives require the architecture variant.
         let is_flashmla_kernel = cu_file.components().any(|c| c.as_os_str() == "flashmla");
-        if is_flashmla_kernel || stem == "arle_flashmla_shim" {
+        if is_flashmla_kernel || stem == "arle_flashmla_shim" || stem == "arle_flashmla_decode_shim"
+        {
             nvcc_args.extend([
                 "-std=c++17".to_string(),
                 "--expt-relaxed-constexpr".to_string(),
