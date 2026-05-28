@@ -154,3 +154,54 @@ pub fn dsv4_fp8_kv_pack_strided_raw(
 
     Ok(())
 }
+
+/// Phase D-4 step 1 — DSv4 FlashMLA sparse-decode indices builder.
+///
+/// Builds the unified per-decode-token indices row in block-paged coords
+/// (s_q = 1). See `csrc/attention/dsv4_flashmla_decode_build_indices.cu`
+/// for the row layout (SW slots | compressed selections | -1 padding).
+///
+/// Parameters:
+/// - `indices_ptr`: u64 device pointer to `int32[topk_unified]` output.
+/// - `selected_ptr`: u64 device pointer to `int32[max_compressed_keys]`
+///   for CSA mode (mode_int=1); pass `0` for HCA mode (mode_int=2).
+/// - `sw_blocks`: SW sub-pool block count (`ceil(sliding_window / page_block_size)`).
+/// - `sliding_window`: bf16 SW ring length.
+/// - `start_pos`: absolute position of the decode token.
+/// - `max_compressed_keys`: `index_topk` (CSA) or padded compressed count (HCA).
+/// - `compress_ratio`: causality-gate ratio.
+/// - `mode_int`: 1 = CSA, 2 = HCA.
+/// - `page_block_size`: 64 for DSv4-Flash MODEL1.
+///
+/// `topk_unified = sliding_window + max_compressed_keys` must be %128==0
+/// (FlashMLA invariant); the kernel returns `cudaErrorInvalidValue` otherwise.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_flashmla_decode_build_indices_raw(
+    ctx: &DeviceContext,
+    indices_ptr: u64,
+    selected_ptr: u64,
+    sw_blocks: usize,
+    sliding_window: usize,
+    start_pos: usize,
+    max_compressed_keys: usize,
+    compress_ratio: usize,
+    mode_int: i32,
+    page_block_size: usize,
+) -> Result<()> {
+    unsafe {
+        ffi::arle_dsv4_flashmla_decode_build_indices_cuda(
+            indices_ptr as *mut i32,
+            selected_ptr as *const i32,
+            sw_blocks as i32,
+            sliding_window as i32,
+            start_pos as i32,
+            max_compressed_keys as i32,
+            compress_ratio as i32,
+            mode_int,
+            page_block_size as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
