@@ -743,6 +743,7 @@ __global__ void decode_attention_int4_per_channel_k_partial_kernel(
     const float* __restrict__ K_static_scales,
     const float* __restrict__ V_scales,
     const int32_t* __restrict__ kv_indices,
+    const float* __restrict__ K_dynamic_scales,  // [max_tokens, num_kv_heads]
     const int32_t* __restrict__ kv_meta,
     float* __restrict__ partial_out,
     float* __restrict__ partial_m,
@@ -822,6 +823,8 @@ __global__ void decode_attention_int4_per_channel_k_partial_kernel(
             int kv_token_byte_base = row_idx * kv_dim_packed + kv_head * head_bytes;
             int scale_off = row_idx * num_kv_heads + kv_head;
             float v_scale = V_scales[scale_off];
+            // Two-level K: per-channel STATIC × per-(token, head) DYNAMIC.
+            float k_dynamic = K_dynamic_scales[scale_off];
 
             float qk = 0.0f;
             #pragma unroll
@@ -830,8 +833,8 @@ __global__ void decode_attention_int4_per_channel_k_partial_kernel(
                 uint8_t byte = K_data_packed[kv_token_byte_base + b];
                 int8_t k0 = (int8_t)(byte << 4) >> 4;          // sign-extend low nibble
                 int8_t k1 = (int8_t)(byte & 0xF0) >> 4;         // arith-shift high nibble
-                qk += q_reg[i + 0] * (float)k0 * k_scale_reg[i + 0];
-                qk += q_reg[i + 1] * (float)k1 * k_scale_reg[i + 1];
+                qk += q_reg[i + 0] * (float)k0 * k_scale_reg[i + 0] * k_dynamic;
+                qk += q_reg[i + 1] * (float)k1 * k_scale_reg[i + 1] * k_dynamic;
             }
             qk = warp_reduce_sum(qk);
 
@@ -913,6 +916,7 @@ cudaError_t decode_attention_int4_per_channel_k_cuda(
     const uint8_t* K_data_packed,
     const uint8_t* V_data_packed,
     const float* K_static_scales,
+    const float* K_dynamic_scales,
     const float* V_scales,
     const int32_t* kv_indices,
     const int32_t* kv_indptr,
@@ -948,12 +952,12 @@ cudaError_t decode_attention_int4_per_channel_k_cuda(
         if (head_dim == 128) {
             decode_attention_int4_per_channel_k_partial_kernel<128><<<grid, block, 0, stream>>>(
                 Q, K_data_packed, V_data_packed, K_static_scales, V_scales,
-                kv_indices, kv_indptr, p_out, p_m, p_l,
+                kv_indices, K_dynamic_scales, kv_indptr, p_out, p_m, p_l,
                 batch_size, num_qo_heads, num_kv_heads, kv_dim, sm_scale, num_splits);
         } else if (head_dim == 256) {
             decode_attention_int4_per_channel_k_partial_kernel<256><<<grid, block, 0, stream>>>(
                 Q, K_data_packed, V_data_packed, K_static_scales, V_scales,
-                kv_indices, kv_indptr, p_out, p_m, p_l,
+                kv_indices, K_dynamic_scales, kv_indptr, p_out, p_m, p_l,
                 batch_size, num_qo_heads, num_kv_heads, kv_dim, sm_scale, num_splits);
         } else {
             return cudaErrorInvalidValue;
