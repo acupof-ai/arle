@@ -3412,6 +3412,66 @@ fn ensure_swa_window_cache<'a>(
         .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 SWA window cache allocation missing"))
 }
 
+/// MODEL1 FlashMLA sparse-FP8 KV layout constants. Mirrors upstream
+/// `csrc/sm90/decode/sparse_fp8/{config.h,splitkv_mla.cuh}` at pin
+/// `df022eb`. See Phase D-3' wins entry
+/// (`docs/experience/wins/2026-05-28-dsv4-fp8-kv-pack-kernel.md`) for the
+/// full per-block byte table.
+#[cfg(feature = "cuda")]
+const DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE: usize = 64;
+#[cfg(feature = "cuda")]
+const DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN: usize = 584;
+#[cfg(feature = "cuda")]
+const DSV4_FLASHMLA_MODEL1_BLOCK_BYTES: usize =
+    DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE * DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN; // 37376
+
+/// Lazy-allocate (or grow) the FP8 KV pool that backs FlashMLA sparse
+/// decode for this layer + slot. Pool size is sw_blocks + comp_blocks
+/// contiguous MODEL1 blocks; the SW sub-pool occupies the first
+/// `sw_blocks` slots, the compressed sub-pool occupies the next
+/// `comp_blocks` slots. Returns a mutable reference + the byte sub-pool
+/// boundaries so callers can pack into the right sub-pool.
+///
+/// Phase D-4: only invoked when `ARLE_DSV4_FLASHMLA_DECODE` is enabled.
+/// When the env knob is off this function is unreached and the field
+/// stays `None`, preserving legacy decode behaviour byte-for-byte.
+#[cfg(feature = "cuda")]
+fn ensure_dsv4_flashmla_fp8_kv_pool<'a>(
+    ctx: &DeviceContext,
+    cache: &'a mut DeepseekAttentionRuntimeCache,
+    sw_blocks: usize,
+    comp_blocks: usize,
+) -> Result<&'a mut CudaSlice<u8>> {
+    let total_blocks = sw_blocks
+        .checked_add(comp_blocks)
+        .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool block count overflow"))?;
+    let want_bytes = total_blocks
+        .checked_mul(DSV4_FLASHMLA_MODEL1_BLOCK_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool byte size overflow"))?;
+    let need_grow = cache
+        .fp8_kv_pool
+        .as_ref()
+        .is_none_or(|buf| buf.len() < want_bytes)
+        || cache.fp8_kv_sw_blocks != sw_blocks
+        || cache.fp8_kv_comp_blocks != comp_blocks;
+    if need_grow {
+        cache.fp8_kv_pool = Some(
+            ctx.stream
+                .alloc_zeros_traced::<u8>(want_bytes)
+                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool alloc failed: {err}"))?,
+        );
+        cache.fp8_kv_pool_bytes = want_bytes;
+        cache.fp8_kv_sw_blocks = sw_blocks;
+        cache.fp8_kv_comp_blocks = comp_blocks;
+        cache.fp8_kv_page_block_size = DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE;
+        cache.fp8_kv_bytes_per_token = DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN;
+    }
+    cache
+        .fp8_kv_pool
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool allocation missing"))
+}
+
 #[cfg(feature = "cuda")]
 fn ensure_gpu_compressor_cache(
     ctx: &DeviceContext,
@@ -4766,6 +4826,26 @@ fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
         "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
         "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
         _ => bail!("invalid ARLE_DSV4_FLASHMLA_PREFILL value `{raw}`"),
+    }
+}
+
+/// Phase D-4 — FlashMLA sparse-FP8 decode dispatch gate
+/// (`ARLE_DSV4_FLASHMLA_DECODE`). Defaults to **OFF** until pod parity
+/// validates the FP8 KV pack + dispatch end-to-end vs the legacy
+/// `dsv4_hybrid_attention_cuda` kernel. The runtime path only allocates
+/// the FP8 pool, packs on update, and dispatches the FlashMLA decode when
+/// this returns true.
+///
+/// Plan: `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md`.
+#[cfg(feature = "cuda")]
+fn dsv4_flashmla_decode_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_FLASHMLA_DECODE").ok() else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => bail!("invalid ARLE_DSV4_FLASHMLA_DECODE value `{raw}`"),
     }
 }
 

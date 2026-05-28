@@ -1022,6 +1022,34 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     pub(crate) indexer: Option<DeepseekCompressorRuntimeCache>,
     pub(crate) compressed_gpu: Option<DeepseekGpuCompressorRuntimeCache>,
     pub(crate) indexer_gpu: Option<DeepseekGpuCompressorRuntimeCache>,
+
+    // ----------------------------------------------------------------
+    // Phase D-4 — FlashMLA FP8 sparse-decode KV pool (block-paged).
+    //
+    // Lazy-allocated only when `ARLE_DSV4_FLASHMLA_DECODE` is enabled
+    // AND a decode step on this layer first packs a token. Sized to
+    // `(sw_blocks + compressed_blocks) * page_block_size * bytes_per_token`
+    // bytes, where the layout mirrors upstream FlashMLA MODEL1 (584
+    // B/token, AoS [NoPE 448 | RoPE 128] + block-tail e8m0 scales).
+    // See `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md`
+    // Phase D-3' for the byte contract.
+    //
+    // Two contiguous sub-pools:
+    //   blocks [0, sw_blocks)                      → per-token K stream
+    //                                                (packed on SW
+    //                                                 window update)
+    //   blocks [sw_blocks, sw_blocks + comp_blocks) → compressor output
+    //                                                (packed on
+    //                                                 compressor update)
+    //
+    // Freed alongside the bf16 buffers at session end (drop-on-reset
+    // pattern via `Option::take`).
+    pub(crate) fp8_kv_pool: Option<CudaSlice<u8>>,
+    pub(crate) fp8_kv_pool_bytes: usize,
+    pub(crate) fp8_kv_sw_blocks: usize,
+    pub(crate) fp8_kv_comp_blocks: usize,
+    pub(crate) fp8_kv_page_block_size: usize,
+    pub(crate) fp8_kv_bytes_per_token: usize,
 }
 
 #[cfg(feature = "cuda")]
