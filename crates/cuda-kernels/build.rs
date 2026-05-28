@@ -1292,13 +1292,7 @@ fn main() {
         // they emit symbols that the stubs below will substitute for.
         cu_files.retain(|p| {
             let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-            !matches!(
-                stem,
-                "arle_flashmla_shim"
-                    | "arle_flashmla_decode_shim"
-                    | "arle_flashmla_csa_build_indices"
-                    | "arle_flashmla_hca_build_indices"
-            )
+            !matches!(stem, "arle_flashmla_shim" | "arle_flashmla_decode_shim")
         });
         // Compile a stub that satisfies the `arle_flashmla_sm90_sparse_decode_*`
         // symbol set with `cudaErrorNotSupported` returns, so the Rust crate
