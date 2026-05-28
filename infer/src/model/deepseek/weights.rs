@@ -1989,51 +1989,12 @@ impl DeepseekModel {
                              build with --features nccl and set TP env-bootstrap vars",
                         )
                     })?;
-                    // V2.3 padded send: pad q_prepared from token_count rows to
-                    // padded_s_q rows (zero-fill tail) so the AllGather, repack
-                    // and downstream FlashMLA all see the same padded s_q.
+                    // AllGather Q directly from q_prepared (V2.4: no padding
+                    // needed → no intermediate buffer + memcpy_dtod). This
+                    // saves a per-layer memcpy_dtod of size token_count *
+                    // local_heads * head_dim that V2.3 left in place when
+                    // padded_s_q == token_count.
                     let padded_send_count = padded_s_q * local_heads * head_dim;
-                    let q_send_buf: cudarc::driver::CudaSlice<bf16> = if padded_s_q == token_count {
-                        // No padding needed — clone the existing q_prepared via
-                        // an alloc + memcpy_dtod so the borrow lifetime matches
-                        // the padded path below (avoids carrying two code paths).
-                        let mut buf = self
-                            .ctx
-                            .stream
-                            .alloc_zeros::<bf16>(padded_send_count)
-                            .map_err(|err| {
-                                anyhow::anyhow!("FlashMLA TP Q send scratch alloc failed: {err}")
-                            })?;
-                        self.ctx
-                            .stream
-                            .memcpy_dtod(&q_prepared.data, &mut buf)
-                            .map_err(|err| {
-                                anyhow::anyhow!("FlashMLA TP Q send memcpy failed: {err}")
-                            })?;
-                        buf
-                    } else {
-                        // Allocate padded buffer (zero-filled) and copy the
-                        // actual token_count rows into the first slab. Tail
-                        // rows remain zero so FlashMLA reads zero Q for them.
-                        let mut buf = self
-                            .ctx
-                            .stream
-                            .alloc_zeros::<bf16>(padded_send_count)
-                            .map_err(|err| {
-                                anyhow::anyhow!(
-                                    "FlashMLA TP Q padded send scratch alloc failed: {err}"
-                                )
-                            })?;
-                        let actual_elems = token_count * local_heads * head_dim;
-                        let dst_slice = buf.slice_mut(0..actual_elems);
-                        self.ctx
-                            .stream
-                            .memcpy_dtod(&q_prepared.data, &mut { dst_slice })
-                            .map_err(|err| {
-                                anyhow::anyhow!("FlashMLA TP Q padded send memcpy failed: {err}")
-                            })?;
-                        buf
-                    };
                     let mut gathered = unsafe {
                         self.ctx
                             .stream
@@ -2045,7 +2006,7 @@ impl DeepseekModel {
                             })?
                     };
                     tp_nccl.all_gather_bf16_device(
-                        &q_send_buf,
+                        &q_prepared.data,
                         padded_send_count,
                         &mut gathered,
                     )?;
@@ -2080,7 +2041,6 @@ impl DeepseekModel {
                             })?;
                         }
                     }
-                    drop(q_send_buf);
                     let full_out_len = padded_s_q * global_heads * head_dim;
                     let full_out = unsafe {
                         self.ctx
