@@ -260,6 +260,36 @@ audit`, two deletion candidates were deferred for approach-first review:
 
 Both need user-facing trade-off explanation before deletion.
 
+### Task I — FlashMLA SM89/SM90 build gate (blocking local rebuild on SM89)
+
+**Discovered 2026-05-28 tick (post-/loop, infra work).** Recent FlashMLA
+SM90 commits (`b3a33188`, `ed4a7b38`, `8ebe3ff5` and predecessors) added
+`csrc/sm90/decode/sparse_fp8/instantiations/*.cu` to the build and FFI
+entrypoints in `cuda-kernels/src/ffi.rs` (`arle_flashmla_sm90_sparse_decode_fwd`
+etc.). The build env var `ARLE_CUDA_DISABLE_FLASHMLA=1` correctly skips
+the `.cu` files BUT the Rust-side FFI calls aren't cfg-gated, so on
+SM89-only boxes (RTX 4070 Ti SUPER, Ada Lovelace) the build either:
+- compiles `.cu` files and fails with `cannot specify max blocks per
+  cluster for this GPU architecture` (the `launch_bounds(...,
+  Kernel::CLUSTER_SIZE)` attribute is SM90+), OR
+- with `ARLE_CUDA_DISABLE_FLASHMLA=1` skips compile but fails linker
+  on `arle_flashmla_sm90_sparse_decode_fwd` and friends.
+
+Local OPD train rebuild is fully blocked on SM89 as of 2026-05-28.
+Commit `01d07bf6` (LoRA rank/alpha/target-set CLI args) IS in the
+tree but local binary is stuck at the pre-FlashMLA-SM90 build from
+2026-05-26.
+
+**Goal**: make `ARLE_CUDA_DISABLE_FLASHMLA=1` a complete disable —
+both .cu skip AND Rust FFI either cfg-gated or stub-impl returning
+"not built" errors. Alternatively a proper cargo feature
+`cuda-kernels/flashmla` that defaults on for SM90 builds and off on
+SM89-only.
+
+**Acceptance**: SM89 box rebuilds `opd_step_cuda_infer_teacher_train`
+clean with `ARLE_CUDA_DISABLE_FLASHMLA=1` and the resulting binary
+runs at parity with the 2026-05-26 binary on the OPD CUDA path.
+
 ### Task H — add session_id support to `scripts/bench_guidellm.sh`
 
 The kv-tier audit's primary "unlock T1 on default workload"
