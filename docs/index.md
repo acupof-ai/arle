@@ -7,32 +7,19 @@
 > tracking canonical truth surfaces, active plans, and experience logs.
 
 **Current status (2026-05-28):** OPD mainline execution is active.
-Three significant findings this session:
+The 2026-05-27 "51.03% MMLU first cross-base" wins claim was retracted
+under multi-seed paired verification — see
+[`experience/errors/2026-05-28-mmlu-cross-base-was-noise.md`](experience/errors/2026-05-28-mmlu-cross-base-was-noise.md)
+for the post-mortem + "multi-seed before wins" rule.
 
-1. The 2026-05-27 "51.03% MMLU first cross-base" wins claim was retracted —
-   5-seed paired analysis at matched n=200 shows v4 step_020 statistically
-   indistinguishable from base 0.8B on both MMLU (Δ +0.47pp σ 1.49pp) and
-   GSM8K (Δ −0.70pp σ 1.15pp). Methodological post-mortem +
-   "multi-seed before wins" rule in
-   [`experience/errors/2026-05-28-mmlu-cross-base-was-noise.md`](experience/errors/2026-05-28-mmlu-cross-base-was-noise.md).
-2. OPD rollout-perf scaling characterized as
-   `student_rollout(n) ≈ 0.31·n + 0.0099·n²` across rollout_len {8, 16, 32,
-   64, 128}, fit within 1-5% on every measured point. The quadratic term is
-   attention math over the growing KV cache and dominates above n≈30;
-   route-through-infer projection ~5× speedup at rollout=128. Doc:
-   [`research/2026-05-28-opd-rollout-perf-208s-bottleneck.md`](research/2026-05-28-opd-rollout-perf-208s-bottleneck.md).
-3. v8 longer-training experiment (200 steps × rollout=64, ~5h) running at
-   `runs/2026-05-28-rollout64-200steps-v8/` — tests "60 steps was peak" claim
-   that the wins doc had asserted without multi-seed evidence.
-
+Open research threads (not shipped, not wins):
+[rollout-perf O(n²) characterization](research/2026-05-28-opd-rollout-perf-208s-bottleneck.md),
+[codex task queue](projects/2026-05-28-codex-queue-when-it-returns.md).
 The OPD-only product boundary remains
 [`projects/2026-05-18-opd-only-pivot.md`](projects/2026-05-18-opd-only-pivot.md).
-The earlier task backlog
+The 2026-05-24 backlog
 [`projects/2026-05-24-opd-mainline-task-backlog.md`](projects/2026-05-24-opd-mainline-task-backlog.md)
-is now stale — its "P5 pure-OPD 5k" reference predates the methodology shift;
-trust the entries above + the codex queue
-[`projects/2026-05-28-codex-queue-when-it-returns.md`](projects/2026-05-28-codex-queue-when-it-returns.md)
-for current truth.
+predates the methodology shift and is stale.
 
 **DSv4 status snapshot (2026-05-26):** DSv4 DeepEP decode remains the active
 next-model hot path. User-facing target framing is input 32K / output 1.5K,

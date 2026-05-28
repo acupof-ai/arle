@@ -139,13 +139,7 @@ Operators wanting only the serving binary can use `infer` directly — same HTTP
 
 ## Latest Updates
 
-<!-- One-line headlines. Detail lives in wins/ + CHANGELOG.md. -->
-
-**2026-05-28 — OPD eval methodology: multi-seed paired analysis catches a false-positive wins claim.** A 5-seed paired test (treated = v4 step_020, control = base 0.8B, matched seeds) reduces SE 4× vs single-eval and reveals the 2026-05-27 "+1.37pp MMLU cross-base" claim was noise (paired Δ +0.47pp σ 1.49pp, t=+0.70, fails to reject H0). Post-mortem + rule that OPD capability claims <5pp at n≤200 need multi-seed before shipping: [errors entry](docs/experience/errors/2026-05-28-mmlu-cross-base-was-noise.md).
-
-**2026-05-28 — OPD rollout perf characterized: O(n²) attention, not host overhead.** Five-point rollout-len sweep {8, 16, 32, 64, 128} fits `student_rollout(n) = 0.31·n + 0.0099·n²` within 1-5%. Above n≈30 the quadratic attention term dominates. The fix is routing the student rollout through the inference engine's CUDA-graph + paged-KV path — projected ~5× student_rollout speedup at rollout=128, unblocks rollout=256. [Research doc](docs/research/2026-05-28-opd-rollout-perf-208s-bottleneck.md).
-
-![OPD rollout O(n²) scaling — measured vs fit](docs/figures/2026-05-28-opd-rollout-scaling.png)
+<!-- Breakthrough-only headlines (shipped capability / perf wins). Research notes + retractions live in docs/. -->
 
 **2026-05-26 — V100 Route B lands; OPD GKD now fits the 512-token corpus.** Per-window forward + `evict_host_mirror` cut peak GPU 19% (31.5 → 25.4 GiB) and turned an OOM into a clean train step on V100 32 GB. [Wins entry](docs/experience/wins/2026-05-26-opd-chunked-kl-route-b-bench.md).
 
