@@ -1700,22 +1700,39 @@ impl DeepseekModel {
 
         let trace = dsv4_trace_begin(&self.ctx)?;
         let cache_len = self.config.sliding_window * head_dim;
-        let mut scratch_window;
         let update_window_cache = cache.is_some();
-        let fuse_window_update =
-            update_window_cache && token_count == 1 && dsv4_fuse_attn_window_update_enabled()?;
-        let window_cache = if let Some(cache) = cache.as_deref_mut() {
-            ensure_swa_window_cache(&self.ctx, cache, cache_len)?
-        } else {
-            scratch_window = self
-                .ctx
-                .stream
-                .alloc_zeros_traced::<bf16>(cache_len)
-                .map_err(|err| {
-                    anyhow::anyhow!("DeepSeek V4 GPU attention scratch alloc failed: {err}")
-                })?;
-            &mut scratch_window
+        // Phase D-4 step 3 — FlashMLA sparse-FP8 decode gate. The legacy
+        // `dsv4_hybrid_attention_cuda` decode kernel writes the bf16 SW
+        // ring inline via `fuse_window_update`; when the FlashMLA decode
+        // path fires we skip that kernel entirely and the bf16 SW ring
+        // update runs unfused after the dispatch so it stays valid for
+        // future env-OFF fallback (during the one-commit-cycle window
+        // before the legacy path is deleted).
+        let mode_int_early = match mode {
+            deepseek_spec::DeepSeekV4AttentionMode::SlidingWindow => 0,
+            deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse => 1,
+            deepseek_spec::DeepSeekV4AttentionMode::HybridCompressed => 2,
         };
+        let (sm_major_early, _) = self.ctx.compute_capability();
+        let use_flashmla_decode = sm_major_early == 9
+            && (mode_int_early == 1 || mode_int_early == 2)
+            && token_count == 1
+            && (head_dim == 512 || head_dim == 576)
+            && (local_heads == 64 || local_heads == 128)
+            && cache.is_some()
+            && dsv4_flashmla_decode_enabled()?;
+        let fuse_window_update = update_window_cache
+            && token_count == 1
+            && !use_flashmla_decode
+            && dsv4_fuse_attn_window_update_enabled()?;
+        // Lazy-alloc cache.window_gpu without binding the returned mut
+        // reference. The bf16 SW window is only re-acquired (mutably)
+        // inside the legacy-decode / prefill branches below; the
+        // FlashMLA decode path does not touch it directly (it reads
+        // through the FP8 pool, populated by the SW pack hooks).
+        if let Some(c) = cache.as_deref_mut() {
+            let _ = ensure_swa_window_cache(&self.ctx, c, cache_len)?;
+        }
         dsv4_trace_end(
             &self.ctx,
             "attn_window_alloc",
@@ -1736,7 +1753,6 @@ impl DeepseekModel {
         {
             let (q_ptr, _q_guard) = q_prepared.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
-            let (window_ptr, _window_guard) = window_cache.device_ptr_mut(&self.ctx.stream);
             let compressed_guard;
             let (compressed_ptr, compressed_count) = if let Some((compressed, count)) = compressed {
                 let (ptr, guard) = compressed.device_ptr(&self.ctx.stream);
@@ -1947,6 +1963,19 @@ impl DeepseekModel {
                 {
                     use cudarc::driver::DevicePtrMut;
                     let (kv_ptr, _g) = kv_unified.device_ptr_mut(&self.ctx.stream);
+                    // Acquire bf16 SW window ptr from cache (scoped to
+                    // this borrow — the &mut on cache.window_gpu lives
+                    // only until the kernel launch returns, since the
+                    // FFI takes a raw ptr).
+                    let cache_pre = cache
+                        .as_deref_mut()
+                        .expect("FlashMLA prefill requires cache");
+                    let window_pre_buf = cache_pre
+                        .window_gpu
+                        .as_mut()
+                        .expect("SW window cache allocated above");
+                    let (window_ptr_pre, _window_pre_g) =
+                        window_pre_buf.device_ptr_mut(&self.ctx.stream);
                     let comp_ptr_arg = if compressed_count > 0 {
                         compressed_ptr
                     } else {
@@ -1955,7 +1984,7 @@ impl DeepseekModel {
                     unsafe {
                         ffi::arle_flashmla_csa_pack_kv(
                             kv_ptr as *mut ffi::Half,
-                            window_ptr as *const ffi::Half,
+                            window_ptr_pre as *const ffi::Half,
                             k_ptr as *const ffi::Half,
                             comp_ptr_arg,
                             start_pos as i32,
@@ -2308,7 +2337,370 @@ impl DeepseekModel {
                 drop(gathered_q_owned);
                 drop(packed_q_owned);
                 drop(full_out_owned);
+            } else if use_flashmla_decode {
+                // Phase D-4 step 3 — FlashMLA sparse-FP8 decode dispatch.
+                //
+                // Pre-conditions (all checked at the gate):
+                //   sm_major == 9
+                //   mode_int ∈ {1 (CSA), 2 (HCA)}
+                //   token_count == 1 (decode)
+                //   head_dim ∈ {512 (MODEL1), 576 (V32)}
+                //   local_heads ∈ {64, 128} (FlashMLA hard-assert h_q)
+                //   cache is Some (FP8 pool + arena live here)
+                //   env knob ON
+                //
+                // Steps inside this branch:
+                //   1. Get meta (host call → num_sm_parts, block_size_topk).
+                //   2. Ensure decode arena (lse/o accums, sched_meta, num_splits, indices).
+                //   3. Pack one-token K from k_prepared into FP8 SW sub-pool ring slot.
+                //   4. Build indices in block-paged pool coords.
+                //   5. Populate sched_meta + num_splits on stream.
+                //   6. Dispatch decode + combine kernel; writes out_ptr.
+                //
+                // The bf16 SW ring update runs unfused after this branch
+                // (`fuse_window_update = false` for this path) so an env-OFF
+                // fallback during the same session sees a consistent ring.
+                let model_type_int: i32 = if head_dim == 512 { 1 } else { 0 };
+                let sliding_window = self.config.sliding_window;
+                let index_topk = self.config.index_topk;
+                let d_v = head_dim; // MODEL1: d_qk == d_v == 512 at NoPE+RoPE
+                let d_v_for_decode = 512_i32; // decode kernel d_v hard-assert
+
+                // Step 1 — host meta.
+                let mut num_sm_parts: i32 = 0;
+                let mut fixed_overhead_num_blocks: i32 = 0;
+                let mut block_size_topk: i32 = 0;
+                unsafe {
+                    ffi::arle_flashmla_sm90_sparse_decode_get_meta(
+                        local_heads as i32,
+                        1_i32,
+                        model_type_int,
+                        &mut num_sm_parts,
+                        &mut fixed_overhead_num_blocks,
+                        &mut block_size_topk,
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DSv4 FlashMLA decode get_meta failed: {err}")
+                    })?;
+                }
+                ensure!(
+                    num_sm_parts > 0 && block_size_topk > 0,
+                    "DSv4 FlashMLA decode get_meta returned bogus values: num_sm_parts={} block_size_topk={}",
+                    num_sm_parts,
+                    block_size_topk
+                );
+
+                // max_compressed_keys: CSA uses index_topk, HCA pads
+                // compressed_count up to next multiple of 128 (FlashMLA
+                // invariant `topk % 128 == 0`).
+                let max_compressed_keys: usize = if mode_int == 1 {
+                    index_topk
+                } else {
+                    compressed_count.div_ceil(128) * 128
+                };
+                let topk_unified: usize = sliding_window + max_compressed_keys;
+                ensure!(
+                    topk_unified.is_multiple_of(128),
+                    "DSv4 FlashMLA decode topk_unified {} must be multiple of 128 (sliding_window={} max_comp={})",
+                    topk_unified,
+                    sliding_window,
+                    max_compressed_keys
+                );
+
+                // Headroom for amortized arena: pad num_sm_parts to 256
+                // (H20 132 SMs → ~66 max at h_q=64,s_q=1; the 256 ceiling
+                // covers any reasonable config drift without reallocating
+                // mid-session).
+                let num_sm_parts_max = (num_sm_parts as usize).max(256);
+
+                // Step 2 — ensure arena.
+                let cache_mut = cache.as_deref_mut().expect("cache present (gated above)");
+                ensure_fm_decode_arena(
+                    &self.ctx,
+                    cache_mut,
+                    num_sm_parts_max,
+                    topk_unified,
+                    local_heads,
+                    d_v,
+                )?;
+
+                // Sliding-window + compressed pool sizing must match the
+                // bootstrap / compressor pack hooks (same formula).
+                let max_compressed_keys_pool = self
+                    .config
+                    .max_position_embeddings
+                    .div_ceil(compress_ratio.max(1));
+                let (sw_blocks, comp_blocks) =
+                    dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, max_compressed_keys_pool);
+                let total_blocks = sw_blocks + comp_blocks;
+
+                // Step 3 — per-step SW pack of the current decode token's
+                // K row from k_prepared into FP8 SW sub-pool at
+                // ring slot `start_pos % sliding_window`.
+                {
+                    let pool = ensure_dsv4_flashmla_fp8_kv_pool(
+                        &self.ctx,
+                        cache_mut,
+                        sw_blocks,
+                        comp_blocks,
+                    )?;
+                    let pool_ref: *mut CudaSlice<u8> = pool;
+                    let mut one_scratch = cache_mut.fp8_kv_one_token_scratch.take();
+                    let ring_idx = start_pos % sliding_window.max(1);
+                    let res = dsv4_flashmla_pack_one_sw_token(
+                        &self.ctx,
+                        k_ptr,
+                        // SAFETY: pool_ref and one_scratch are disjoint
+                        // fields; helper writes only through pool, scratch.
+                        unsafe { &mut *pool_ref },
+                        ring_idx,
+                        head_dim,
+                        &mut one_scratch,
+                    );
+                    cache_mut.fp8_kv_one_token_scratch = one_scratch;
+                    res?;
+                }
+
+                // Step 4 — build indices (block-paged).
+                // Lift device pointers via a scoped borrow so we can hand
+                // raw u64 to the kernel wrapper. The arena fields and the
+                // FP8 pool live in disjoint cache fields.
+                let (indices_ptr_u64, _ig) = cache_mut
+                    .fm_decode_indices
+                    .as_mut()
+                    .expect("indices arena allocated")
+                    .device_ptr_mut(&self.ctx.stream);
+                drop(_ig);
+                {
+                    let selected_ptr_u64: u64 = if mode_int == 1 {
+                        // `selected_ptr` is *const i32 captured above.
+                        selected_ptr as u64
+                    } else {
+                        0
+                    };
+                    cuda_kernels::attention::dsv4_flashmla_decode_build_indices_raw(
+                        &self.ctx,
+                        indices_ptr_u64,
+                        selected_ptr_u64,
+                        sw_blocks,
+                        sliding_window,
+                        start_pos,
+                        max_compressed_keys,
+                        compress_ratio,
+                        mode_int,
+                        DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE,
+                    )?;
+                }
+
+                // Step 5 — sched_meta + num_splits. `topk_length` for our
+                // batch=1, s_q=1 decode is just `topk_unified` (kernel
+                // bounds the per-query top-k by the row's effective
+                // length). Pass a single-i32 device array.
+                //
+                // Build a [1]-element topk_length on stream. Reuse the
+                // num_splits scratch's stream alloc bandwidth by stamping
+                // a fresh local CudaSlice — the size is 4 bytes and the
+                // sched_meta call is the gating cost.
+                let mut topk_length_dev =
+                    self.ctx
+                        .stream
+                        .alloc_zeros_traced::<i32>(1)
+                        .map_err(|err| {
+                            anyhow::anyhow!("DSv4 FlashMLA decode topk_length alloc: {err}")
+                        })?;
+                self.ctx
+                    .stream
+                    .memcpy_htod(&[topk_unified as i32], &mut topk_length_dev)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DSv4 FlashMLA decode topk_length H2D: {err}")
+                    })?;
+
+                let (sched_meta_ptr_u64, _sg) = cache_mut
+                    .fm_decode_sched_meta
+                    .as_mut()
+                    .expect("sched_meta arena allocated")
+                    .device_ptr_mut(&self.ctx.stream);
+                drop(_sg);
+                let (num_splits_ptr_u64, _ng) = cache_mut
+                    .fm_decode_num_splits
+                    .as_mut()
+                    .expect("num_splits arena allocated")
+                    .device_ptr_mut(&self.ctx.stream);
+                drop(_ng);
+                let (topk_length_ptr_u64, _tg) = topk_length_dev.device_ptr(&self.ctx.stream);
+                drop(_tg);
+                unsafe {
+                    ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
+                        1_i32, // b = 1
+                        1_i32, // s_q = 1
+                        block_size_topk,
+                        fixed_overhead_num_blocks,
+                        topk_unified as i32,
+                        0_i32, // extra_topk
+                        topk_length_ptr_u64 as *const i32,
+                        std::ptr::null(), // extra_topk_length
+                        sched_meta_ptr_u64 as *mut i32,
+                        num_splits_ptr_u64 as *mut i32,
+                        num_sm_parts,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DSv4 FlashMLA decode sched_meta failed: {err}")
+                    })?;
+                }
+
+                // Step 6 — decode + combine.
+                let (kv_pool_ptr_u64, _kg) = cache_mut
+                    .fp8_kv_pool
+                    .as_mut()
+                    .expect("FP8 KV pool allocated")
+                    .device_ptr_mut(&self.ctx.stream);
+                drop(_kg);
+                let (lse_accum_ptr_u64, _lg) = cache_mut
+                    .fm_decode_lse_accum
+                    .as_mut()
+                    .expect("lse_accum arena allocated")
+                    .device_ptr_mut(&self.ctx.stream);
+                drop(_lg);
+                let (o_accum_ptr_u64, _og) = cache_mut
+                    .fm_decode_o_accum
+                    .as_mut()
+                    .expect("o_accum arena allocated")
+                    .device_ptr_mut(&self.ctx.stream);
+                drop(_og);
+
+                // attn_sink_f32 with rank offset (decode runs single-rank
+                // at h_q ∈ {64,128} — same convention as the legacy
+                // hybrid kernel: caller indexes the local head range).
+                let (sink_f32_base_ptr, _sf32g) =
+                    attention.attn_sink_f32.device_ptr(&self.ctx.stream);
+                drop(_sf32g);
+                let sink_offset_elems = self.config.tp.rank * local_heads;
+                let sink_f32_local_ptr =
+                    unsafe { (sink_f32_base_ptr as *const f32).add(sink_offset_elems) };
+
+                // Allocate a dummy lse output [b=1, h_q, s_q=1] — combine
+                // writes here but ARLE doesn't consume it.
+                let mut lse_out_dev = self
+                    .ctx
+                    .stream
+                    .alloc_zeros_traced::<f32>(local_heads)
+                    .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode lse out alloc: {err}"))?;
+                let (lse_out_ptr_u64, _log) = lse_out_dev.device_ptr_mut(&self.ctx.stream);
+                drop(_log);
+
+                let scale = 1.0_f32 / (head_dim as f32).sqrt();
+                let bytes_per_token = if head_dim == 512 {
+                    DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN as i32
+                } else {
+                    656_i32 // V32
+                };
+                let stride_kv_block_bytes =
+                    DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32 * bytes_per_token;
+                // Strides for q [b=1, s_q=1, h_q, d_qk]: elements.
+                let stride_q_b = (local_heads * head_dim) as i32;
+                let stride_q_s_q = (local_heads * head_dim) as i32;
+                let stride_q_h_q = head_dim as i32;
+                // Strides for o [b=1, s_q=1, h_q, d_v]: elements.
+                let stride_o_b = (local_heads * d_v_for_decode as usize) as i32;
+                let stride_o_s_q = (local_heads * d_v_for_decode as usize) as i32;
+                let stride_o_h_q = d_v_for_decode;
+                // Strides for indices [b=1, s_q=1, topk]: ints.
+                let stride_indices_b = topk_unified as i32;
+                let stride_indices_s_q = topk_unified as i32;
+                // Strides for lse [b=1, h_q, s_q=1]: floats.
+                let stride_lse_b = local_heads as i32;
+                let stride_lse_s_q = 1_i32;
+                // Split-axis strides: lse_accum [num_splits, s_q=1, h_q].
+                let stride_lse_accum_split = local_heads as i32;
+                let stride_lse_accum_s_q = local_heads as i32;
+                // o_accum [num_splits, s_q=1, h_q, d_v].
+                let stride_o_accum_split = (local_heads * d_v_for_decode as usize) as i32;
+                let stride_o_accum_s_q = (local_heads * d_v_for_decode as usize) as i32;
+                let stride_o_accum_h_q = d_v_for_decode;
+
+                unsafe {
+                    ffi::arle_flashmla_sm90_sparse_decode_fwd(
+                        q_ptr as *const ffi::Half,
+                        kv_pool_ptr_u64 as *const ffi::Half,
+                        indices_ptr_u64 as *const i32,
+                        topk_length_ptr_u64 as *const i32,
+                        sink_f32_local_ptr,
+                        out_ptr as *mut ffi::Half,
+                        lse_out_ptr_u64 as *mut f32,
+                        lse_accum_ptr_u64 as *mut f32,
+                        o_accum_ptr_u64 as *mut f32,
+                        sched_meta_ptr_u64 as *const i32,
+                        num_splits_ptr_u64 as *const i32,
+                        1_i32, // b
+                        1_i32, // s_q
+                        local_heads as i32,
+                        1_i32, // h_kv
+                        head_dim as i32,
+                        d_v_for_decode,
+                        total_blocks as i32,
+                        DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32,
+                        topk_unified as i32,
+                        num_sm_parts,
+                        model_type_int,
+                        scale,
+                        stride_q_b,
+                        stride_q_s_q,
+                        stride_q_h_q,
+                        stride_kv_block_bytes,
+                        bytes_per_token,
+                        stride_indices_b,
+                        stride_indices_s_q,
+                        stride_lse_b,
+                        stride_lse_s_q,
+                        stride_o_b,
+                        stride_o_s_q,
+                        stride_o_h_q,
+                        stride_lse_accum_split,
+                        stride_lse_accum_s_q,
+                        stride_o_accum_split,
+                        stride_o_accum_s_q,
+                        stride_o_accum_h_q,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode fwd failed: {err}"))?;
+                }
+                drop(topk_length_dev);
+                drop(lse_out_dev);
             } else {
+                // Acquire bf16 SW window ptr from cache (scoped to this
+                // legacy-kernel launch — drops the &mut after the FFI
+                // returns). When `cache` is None we fall back to a
+                // temporary scratch via the early-allocated window_gpu
+                // pool — in practice `update_window_cache=cache.is_some()`
+                // is the gate and this branch only runs with cache=Some
+                // for decode/prefill paths that actually update SW.
+                let mut window_scratch_local: Option<CudaSlice<bf16>> = None;
+                let (window_ptr, _window_guard) = if let Some(c) = cache.as_deref_mut() {
+                    let buf = c
+                        .window_gpu
+                        .as_mut()
+                        .expect("SW window cache allocated above");
+                    buf.device_ptr_mut(&self.ctx.stream)
+                } else {
+                    let buf = self
+                        .ctx
+                        .stream
+                        .alloc_zeros_traced::<bf16>(cache_len)
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "DeepSeek V4 GPU attention legacy scratch alloc failed: {err}"
+                            )
+                        })?;
+                    window_scratch_local = Some(buf);
+                    window_scratch_local
+                        .as_mut()
+                        .unwrap()
+                        .device_ptr_mut(&self.ctx.stream)
+                };
                 unsafe {
                     ffi::dsv4_hybrid_attention_cuda(
                         q_ptr as *const ffi::Half,
@@ -2356,7 +2748,17 @@ impl DeepseekModel {
         if update_window_cache && !fuse_window_update {
             let trace = dsv4_trace_begin(&self.ctx)?;
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
-            let (window_ptr, _window_guard) = window_cache.device_ptr_mut(&self.ctx.stream);
+            // Scoped &mut on cache.window_gpu — the borrow ends after
+            // the kernel launch (raw ptr captured beforehand) so the
+            // projection block below can reborrow cache freely.
+            let c = cache
+                .as_deref_mut()
+                .expect("update_window_cache implies cache present");
+            let window_buf = c
+                .window_gpu
+                .as_mut()
+                .expect("SW window cache allocated above");
+            let (window_ptr, _window_guard) = window_buf.device_ptr_mut(&self.ctx.stream);
             unsafe {
                 ffi::dsv4_update_window_cache_cuda(
                     k_ptr as *const ffi::Half,
