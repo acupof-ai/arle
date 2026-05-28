@@ -799,4 +799,26 @@ unsafe extern "C" {
         page_block_size: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Strided variant — same packing contract as `arle_dsv4_fp8_kv_pack_cuda`
+    /// but the NoPE and RoPE buffers carry an explicit per-token element
+    /// stride. Used by the Phase D-4 decode hooks to feed
+    /// `k_prepared`-shaped `[n_tokens, head_dim=512]` interleaved input
+    /// without an intermediate deinterleave: caller passes
+    ///   `nope = k_prepared,           stride_nope_elems = 512`
+    ///   `rope = k_prepared + 448,     stride_rope_elems = 512`
+    /// Strides must be ≥ HEAD_DIM_NOPE (448) / HEAD_DIM_ROPE (64) respectively.
+    /// See Finding 1 in `docs/experience/wins/2026-05-28-dsv4-flashmla-decode-d4-plumbing.md`.
+    pub fn arle_dsv4_fp8_kv_pack_strided_cuda(
+        nope: *const Half,
+        rope: *const Half,
+        packed_kv: *mut u8,
+        token_block_id: *const i32,
+        token_in_block_row: *const i32,
+        n_tokens: i32,
+        page_block_size: i32,
+        stride_nope_elems: i32,
+        stride_rope_elems: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }

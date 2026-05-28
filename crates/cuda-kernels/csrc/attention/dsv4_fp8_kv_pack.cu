@@ -102,14 +102,23 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 //   NoPE+RoPE @ block_base + row * (HEAD_DIM_NOPE + ROPE_BYTES)
 //   scales    @ block_base + page_block_size * (HEAD_DIM_NOPE + ROPE_BYTES)
 //             + row * NUM_SCALES
+//
+// `stride_nope_elems` / `stride_rope_elems` are the per-token strides in
+// **bf16 elements** for the NoPE and RoPE input buffers. The contiguous
+// shipping caller passes (HEAD_DIM_NOPE=448, HEAD_DIM_ROPE=64); the
+// interleaved-in-`k_prepared` caller passes (head_dim=512, head_dim=512)
+// with separate base pointers `k_prepared + 0` (NoPE) and
+// `k_prepared + 448` (RoPE).
 __global__ void dsv4_fp8_kv_pack_kernel(
-    const __nv_bfloat16* __restrict__ nope,   // [n_tokens, HEAD_DIM_NOPE]
-    const __nv_bfloat16* __restrict__ rope,   // [n_tokens, HEAD_DIM_ROPE]
+    const __nv_bfloat16* __restrict__ nope,   // [n_tokens, stride_nope_elems]
+    const __nv_bfloat16* __restrict__ rope,   // [n_tokens, stride_rope_elems]
     uint8_t* __restrict__ packed_kv,
     const int* __restrict__ token_block_id,
     const int* __restrict__ token_in_block_row,
     int n_tokens,
-    int page_block_size)
+    int page_block_size,
+    int stride_nope_elems,
+    int stride_rope_elems)
 {
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
@@ -148,7 +157,7 @@ __global__ void dsv4_fp8_kv_pack_kernel(
         float v = 0.0f;
         if (is_nope) {
             const int dim_idx = tile * QUANT_TILE_SIZE + nope_lane;
-            v = __bfloat162float(nope[(int64_t)t * HEAD_DIM_NOPE + dim_idx]);
+            v = __bfloat162float(nope[(int64_t)t * stride_nope_elems + dim_idx]);
         }
 
         // Two-warp reduction (only NoPE warps participate in writes).
@@ -237,7 +246,7 @@ __global__ void dsv4_fp8_kv_pack_kernel(
     // RoPE copy (after the last NoPE __syncthreads). 64 RoPE threads, one
     // per dim. NoPE threads sit out of this branch.
     if (!is_nope && rope_lane < HEAD_DIM_ROPE) {
-        __nv_bfloat16 v = rope[(int64_t)t * HEAD_DIM_ROPE + rope_lane];
+        __nv_bfloat16 v = rope[(int64_t)t * stride_rope_elems + rope_lane];
         __nv_bfloat16* rope_base = reinterpret_cast<__nv_bfloat16*>(
             token_data_base + HEAD_DIM_NOPE);
         rope_base[rope_lane] = v;
@@ -246,7 +255,12 @@ __global__ void dsv4_fp8_kv_pack_kernel(
 
 } // namespace
 
-// ===== Public C entry =====
+// ===== Public C entries =====
+
+// Contiguous-input variant: nope and rope are tightly-packed
+// [n_tokens, HEAD_DIM_NOPE] / [n_tokens, HEAD_DIM_ROPE] bf16 buffers.
+// Kept as a thin wrapper around the strided implementation so callers
+// stay single-sourced on one kernel body.
 extern "C" cudaError_t arle_dsv4_fp8_kv_pack_cuda(
     const __nv_bfloat16* nope,
     const __nv_bfloat16* rope,
@@ -269,6 +283,46 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_cuda(
     dsv4_fp8_kv_pack_kernel<<<grid, block, 0, stream>>>(
         nope, rope, packed_kv,
         token_block_id, token_in_block_row,
-        n_tokens, page_block_size);
+        n_tokens, page_block_size,
+        HEAD_DIM_NOPE, HEAD_DIM_ROPE);
+    return cudaGetLastError();
+}
+
+// Strided-input variant for the runtime decode hooks: NoPE and RoPE may
+// share a single `k_prepared`-style [n_tokens, head_dim=512] buffer where
+// the caller passes (nope_ptr = k_prepared, rope_ptr = k_prepared+NOPE,
+// stride_nope_elems = stride_rope_elems = 512) — see Phase D-4 SOLID
+// survey Finding 1 in docs/experience/wins/2026-05-28-dsv4-flashmla-decode-d4-plumbing.md.
+//
+// Both strides must be ≥ HEAD_DIM_NOPE (448) / HEAD_DIM_ROPE (64) respectively.
+extern "C" cudaError_t arle_dsv4_fp8_kv_pack_strided_cuda(
+    const __nv_bfloat16* nope,
+    const __nv_bfloat16* rope,
+    uint8_t* packed_kv,
+    const int* token_block_id,
+    const int* token_in_block_row,
+    int n_tokens,
+    int page_block_size,
+    int stride_nope_elems,
+    int stride_rope_elems,
+    cudaStream_t stream)
+{
+    if (n_tokens == 0) return cudaSuccess;
+    if (page_block_size <= 0) return cudaErrorInvalidValue;
+    if (stride_nope_elems < HEAD_DIM_NOPE || stride_rope_elems < HEAD_DIM_ROPE) {
+        return cudaErrorInvalidValue;
+    }
+    if (nope == nullptr || rope == nullptr || packed_kv == nullptr
+        || token_block_id == nullptr || token_in_block_row == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    dim3 grid((unsigned)n_tokens, 1, 1);
+    dim3 block(THREADS_PER_BLOCK, 1, 1);
+    dsv4_fp8_kv_pack_kernel<<<grid, block, 0, stream>>>(
+        nope, rope, packed_kv,
+        token_block_id, token_in_block_row,
+        n_tokens, page_block_size,
+        stride_nope_elems, stride_rope_elems);
     return cudaGetLastError();
 }
