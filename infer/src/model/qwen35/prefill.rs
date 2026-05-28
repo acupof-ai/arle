@@ -2150,6 +2150,7 @@ impl Qwen35Model {
                     pool.k_work_ptr(stream),
                     pool.k_data_ptr(full_idx, stream),
                     static_scales_ptr,
+                    pool.k_scales_ptr(full_idx, stream),
                     &bufs.metadata.token_rows_gpu,
                     num_kv_heads,
                     head_dim,

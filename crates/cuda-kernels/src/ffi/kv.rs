@@ -220,12 +220,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    /// INT4 KIVI per-channel K quantize: 4-bit packed (2 nibbles/byte).
-    /// `kv_int4_packed` must have `max_total_tokens * kv_dim / 2` bytes.
+    /// INT4 KIVI two-level K quantize: per-channel STATIC × per-(token, head)
+    /// DYNAMIC. 4-bit packed (2 nibbles/byte). `kv_int4_packed` must have
+    /// `max_total_tokens * kv_dim / 2` bytes. `k_dynamic_scales` is
+    /// `[max_total_tokens, num_kv_heads]` f32, written by this kernel.
     pub fn quantize_paged_kv_int4_per_channel_cuda(
         kv_bf16: *const Half,
         kv_int4_packed: *mut u8,
         k_static_scales: *const f32,
+        k_dynamic_scales: *mut f32,
         new_token_indices: *const i32,
         num_kv_heads: i32,
         head_dim: i32,

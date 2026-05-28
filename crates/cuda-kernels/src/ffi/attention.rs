@@ -331,15 +331,15 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 
-    /// INT4 KIVI per-channel K decode attention (PoC). K/V stored as
-    /// 4-bit packed (2 nibbles per byte). K uses static per-channel
-    /// scales; V uses per-(row, head). Same KIVI scheme as INT8/FP8
-    /// siblings, just half the bytes.
+    /// INT4 KIVI two-level K decode attention. K dequant uses
+    /// `static[kv_head, dim] * dynamic[row, kv_head]` (per-channel × per-
+    /// (token, kv_head)). V uses per-(row, kv_head) scale.
     pub fn decode_attention_int4_per_channel_k_cuda(
         q: *const Half,
         k_data_packed: *const u8,
         v_data_packed: *const u8,
         k_static_scales: *const f32,
+        k_dynamic_scales: *const f32,
         v_scales: *const f32,
         kv_indices: *const i32,
         kv_indptr: *const i32,

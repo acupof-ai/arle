@@ -372,13 +372,15 @@ pub fn finalize_k_per_channel_scales_int4(
     Ok(())
 }
 
-/// INT4 KIVI per-channel K quantize (4-bit packed, 2 nibbles per byte).
+/// INT4 KIVI two-level K quantize: per-channel STATIC × per-(token, head)
+/// DYNAMIC. 4-bit packed (2 nibbles/byte).
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_paged_kv_int4_per_channel(
     ctx: &DeviceContext,
     kv_bf16_ptr: u64,
     kv_int4_packed_ptr: u64,
     k_static_scales_ptr: u64,
+    k_dynamic_scales_ptr: u64,
     new_token_indices_gpu: &CudaSlice<i32>,
     num_kv_heads: usize,
     head_dim: usize,
@@ -398,6 +400,7 @@ pub fn quantize_paged_kv_int4_per_channel(
                 kv_bf16_ptr as *const ffi::Half,
                 kv_int4_packed_ptr as *mut u8,
                 k_static_scales_ptr as *const f32,
+                k_dynamic_scales_ptr as *mut f32,
                 nti_ptr as *const i32,
                 num_kv_heads as i32,
                 head_dim as i32,
@@ -453,7 +456,7 @@ pub fn quantize_paged_kv_single_int4(
     Ok(())
 }
 
-/// INT4 KIVI decode attention (4-bit packed K/V, unpack on-the-fly).
+/// INT4 KIVI two-level decode attention. K = static[h,d] * dynamic[t,h] * int4 nibble.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_attention_int4_per_channel_k(
     ctx: &DeviceContext,
@@ -461,6 +464,7 @@ pub fn decode_attention_int4_per_channel_k(
     k_data_packed_ptr: u64,
     v_data_packed_ptr: u64,
     k_static_scales_ptr: u64,
+    k_dynamic_scales_ptr: u64,
     v_scales_ptr: u64,
     kv_indices: &CudaSlice<i32>,
     kv_meta: &CudaSlice<i32>,
@@ -488,6 +492,7 @@ pub fn decode_attention_int4_per_channel_k(
             k_data_packed_ptr as *const u8,
             v_data_packed_ptr as *const u8,
             k_static_scales_ptr as *const f32,
+            k_dynamic_scales_ptr as *const f32,
             v_scales_ptr as *const f32,
             ki_ptr as *const i32,
             ip_ptr as *const i32,
