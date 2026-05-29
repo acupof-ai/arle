@@ -32,24 +32,18 @@
 // path is bit-exact only if the F32 cache value can be represented in
 // BF16 (typical drift ≤ 1.5e-3 relative on attention output, within OPD
 // rollout tolerance since the rollout uses argmax over logits).
-
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+//
+// Compiled via NVRTC alongside the other autograd kernels in
+// kernels.rs::concat_sources; cuda_runtime.h types come from the
+// NVRTC-builtin headers, so no explicit #include needed.
 
 namespace {
 
+// BF16 KV path needs cuda_bf16.h from NVRTC built-ins; deferred until
+// the rollout cache layout itself moves to bf16. For now keep the f32
+// load helper only.
 template <typename TKV>
 __device__ __forceinline__ float load_kv(const TKV* ptr) {
-    return float(*ptr);
-}
-
-template <>
-__device__ __forceinline__ float load_kv<__nv_bfloat16>(const __nv_bfloat16* ptr) {
-    return __bfloat162float(*ptr);
-}
-
-template <>
-__device__ __forceinline__ float load_kv<float>(const float* ptr) {
     return *ptr;
 }
 
@@ -73,7 +67,6 @@ __device__ __forceinline__ float block_sum(float v, float* scratch, int tid, int
     }
     __syncthreads();
     // Final reduce in the first warp.
-    float final_val = 0.0f;
     if (warp_id == 0) {
         float partial = (tid < n_warps) ? scratch[tid] : 0.0f;
         partial = warp_sum(partial);
@@ -83,6 +76,13 @@ __device__ __forceinline__ float block_sum(float v, float* scratch, int tid, int
     }
     __syncthreads();
     return scratch[0];
+}
+
+// NVRTC builds this file without <math.h> / <cuda_runtime.h>, so INFINITY
+// from <math.h> is unavailable. Use the largest-magnitude negative f32 as
+// the initial running max; the first softmax iteration replaces it.
+__device__ __forceinline__ float neg_inf_f32() {
+    return -3.40282347e+38f;
 }
 
 template <typename TKV, int HEAD_DIM>
@@ -126,7 +126,7 @@ __global__ void __launch_bounds__(HEAD_DIM, 2) causal_sdpa_decode_gqa_cache_onli
     // Each thread owns one Q element + one output accumulator slot.
     float q_elem = (tid < HEAD_DIM) ? q[q_base + tid] : 0.0f;
     float o_acc = 0.0f;
-    float m_run = -INFINITY;
+    float m_run = neg_inf_f32();
     float l_run = 0.0f;
 
     extern __shared__ float scratch[];
@@ -172,18 +172,6 @@ __global__ void causal_sdpa_decode_gqa_cache_online_f32_hd256(
 ) {
     if (head_dim != 256) return;  // template safety
     causal_sdpa_decode_gqa_cache_online_impl<float, 256>(
-        q, k, v, out, batch, query_heads, kv_heads, max_seq, kv_len, q_start, scale);
-}
-
-// BF16 KV path — same algorithm, KV widened from bf16 to f32 at load
-// time. Halves the HBM bandwidth on the dominant O(n²) KV term.
-__global__ void causal_sdpa_decode_gqa_cache_online_bf16_hd256(
-    const float* q, const __nv_bfloat16* k, const __nv_bfloat16* v, float* out,
-    int batch, int query_heads, int kv_heads, int max_seq, int kv_len,
-    int head_dim, int q_start, float scale
-) {
-    if (head_dim != 256) return;
-    causal_sdpa_decode_gqa_cache_online_impl<__nv_bfloat16, 256>(
         q, k, v, out, batch, query_heads, kv_heads, max_seq, kv_len, q_start, scale);
 }
 
