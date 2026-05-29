@@ -1733,11 +1733,34 @@ impl DeepseekModel {
         // the FP8 compressed sub-pool. Both are no-ops when the env knob
         // is OFF and the legacy `dsv4_hybrid_attention_cuda` decode path
         // runs unmodified.
+        //
+        // Shared-pool gating (the revert fix). The SW bootstrap is already
+        // decode-only (`token_count == 1`). The compressor pack, however, also
+        // fires during prefill (this path is shared by prefill-via-incremental,
+        // `token_count > 1`). In the per-state default that is harmless — the
+        // pack lazy-allocates its own pool. But with `ARLE_DSV4_SHARED_KV_POOL`
+        // ON the pool's (slot, layer) sub-range is only bound at decode time
+        // (`forward_decode_batch` has the decode context + slot index), so
+        // requiring it during prefill is exactly what crashed the first attempt
+        // ("sub-range not bound" → HTTP 500). So when the shared pool is on we
+        // defer the compressor pack to the first decode step too: it is
+        // idempotent via the `fp8_kv_comp_packed_rows` high-water mark, so the
+        // first decode packs `[0, compressed_rows)` in one shot before Step 6
+        // reads it — byte-identical result, only the pack timing moves. Prefill
+        // then only writes the bf16 SW/compressed buffers and never touches the
+        // FP8 pool.
         if dsv4_flashmla_decode_enabled()? {
             if token_count == 1 {
                 self.dsv4_flashmla_sw_bootstrap_hook(cache, compress_ratio, head_dim)?;
             }
-            self.dsv4_flashmla_compressor_pack_hook(cache, compress_ratio, head_dim)?;
+            let pack_compressor = if dsv4_shared_kv_pool_enabled()? {
+                token_count == 1
+            } else {
+                true
+            };
+            if pack_compressor {
+                self.dsv4_flashmla_compressor_pack_hook(cache, compress_ratio, head_dim)?;
+            }
         }
 
         let selected = if matches!(
@@ -2734,34 +2757,33 @@ impl DeepseekModel {
                 )?;
 
                 // Sliding-window + compressed pool sizing must match the
-                // bootstrap / compressor pack hooks (same formula).
-                let max_compressed_keys_pool = self
-                    .config
-                    .max_position_embeddings
-                    .div_ceil(compress_ratio.max(1));
+                // bootstrap / compressor pack hooks (same source). OFF →
+                // `max_position_embeddings`-based (byte-identical to `main`);
+                // ON → the bound shared sub-range layout stamped at bind time
+                // (bounded by `max_seq_len`).
                 let (sw_blocks, comp_blocks) =
-                    dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, max_compressed_keys_pool);
+                    self.dsv4_flashmla_decode_pool_layout(cache_mut, compress_ratio)?;
                 let total_blocks = sw_blocks + comp_blocks;
 
                 // Step 3 — per-step SW pack of the current decode token's
                 // K row from k_prepared into FP8 SW sub-pool at
-                // ring slot `start_pos % sliding_window`.
+                // ring slot `start_pos % sliding_window`. The pool base
+                // pointer is resolved by mode: OFF → per-state lazy-alloc
+                // (byte-identical to `main`); ON → the bound shared sub-range
+                // (decode-time only).
                 {
-                    let pool = ensure_dsv4_flashmla_fp8_kv_pool(
+                    let pool_base_ptr = dsv4_flashmla_fp8_kv_pool_base_ptr(
                         &self.ctx,
                         cache_mut,
                         sw_blocks,
                         comp_blocks,
                     )?;
-                    let pool_ref: *mut CudaSlice<u8> = pool;
                     let mut one_scratch = cache_mut.fp8_kv_one_token_scratch.take();
                     let ring_idx = start_pos % sliding_window.max(1);
                     let res = dsv4_flashmla_pack_one_sw_token(
                         &self.ctx,
                         k_ptr,
-                        // SAFETY: pool_ref and one_scratch are disjoint
-                        // fields; helper writes only through pool, scratch.
-                        unsafe { &mut *pool_ref },
+                        pool_base_ptr,
                         ring_idx,
                         head_dim,
                         &mut one_scratch,
@@ -2859,13 +2881,16 @@ impl DeepseekModel {
                     })?;
                 }
 
-                // Step 6 — decode + combine.
-                let (kv_pool_ptr_u64, _kg) = cache_mut
-                    .fp8_kv_pool
-                    .as_mut()
-                    .expect("FP8 KV pool allocated")
-                    .device_ptr_mut(&self.ctx.stream);
-                drop(_kg);
+                // Step 6 — decode + combine. The KV pool base pointer is
+                // resolved by mode (OFF → per-state byte 0; ON → the bound
+                // shared sub-range start). Block ids in the indices buffer are
+                // relative to it, identical across both modes.
+                let kv_pool_ptr_u64 = dsv4_flashmla_fp8_kv_pool_base_ptr(
+                    &self.ctx,
+                    cache_mut,
+                    sw_blocks,
+                    comp_blocks,
+                )?;
                 let (lse_accum_ptr_u64, _lg) = cache_mut
                     .fm_decode_lse_accum
                     .as_mut()
@@ -3335,18 +3360,12 @@ impl DeepseekModel {
             return Ok(());
         }
 
-        // Size the pool — sw_blocks from sliding_window, comp_blocks from
-        // the compressor capacity (max_position_embeddings / ratio rounded
-        // up). Sized once monotonically — see `dsv4_flashmla_fp8_kv_pool_blocks`.
-        let sliding_window = self.config.sliding_window;
-        let max_compressed_keys = self
-            .config
-            .max_position_embeddings
-            .div_ceil(compress_ratio.max(1));
+        // Pool layout — OFF: `max_position_embeddings`-based (byte-identical to
+        // `main`); ON: the bound shared sub-range layout stamped at bind time.
         let (sw_blocks, comp_blocks) =
-            dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, max_compressed_keys);
+            self.dsv4_flashmla_decode_pool_layout(cache, compress_ratio)?;
 
-        // Borrow split: pool through `ensure_*`, then read compressed bf16
+        // Borrow split: pool through the resolver, then read compressed bf16
         // pointer via separate immutable borrow.
         let start_row = cache.fp8_kv_comp_packed_rows;
         let end_row = compressed_rows;
@@ -3363,26 +3382,19 @@ impl DeepseekModel {
         let comp_bf16_ptr_u64 = comp_bf16_ptr;
         drop(_comp_g);
 
-        // Mutable borrow on attention cache for the pool + scratch.
-        let pool = ensure_dsv4_flashmla_fp8_kv_pool(&self.ctx, cache, sw_blocks, comp_blocks)?;
-        // SAFETY: pool reference is exclusively held; we need a stable
-        // *mut over the helper call. Split the borrow.
-        let pool_ref: *mut CudaSlice<u8> = pool;
-        // Re-borrow comp_scratch via cache directly — but cache is already
-        // mutably borrowed through pool_ref. Work around by accessing
-        // through a raw mutable ref: split the borrow with split_at trick.
-        // Simpler: take the comp_scratch out, run the pack, put back.
+        // Resolve the pool base pointer by mode (OFF → per-state lazy-alloc;
+        // ON → the bound shared sub-range). This hook only runs at decode time
+        // when the shared pool is on (gated at the caller by `token_count == 1`),
+        // so the ON bind is always present here.
+        let pool_base_ptr =
+            dsv4_flashmla_fp8_kv_pool_base_ptr(&self.ctx, cache, sw_blocks, comp_blocks)?;
+        // Take the comp_scratch out, run the pack, put it back (disjoint from
+        // the pool — the helper writes only through the pool pointer + scratch).
         let mut comp_scratch = cache.fp8_kv_comp_scratch.take();
-        // SAFETY: `pool_ref` and `comp_scratch` are disjoint fields of
-        // `cache`; `dsv4_flashmla_pack_compressor_rows` only writes
-        // through the pool argument and reads/writes the scratch
-        // argument. The cache reference itself is not aliased while we
-        // hold the raw pointer because we don't touch `cache` again until
-        // the call returns.
         let res = dsv4_flashmla_pack_compressor_rows(
             &self.ctx,
             comp_bf16_ptr_u64,
-            unsafe { &mut *pool_ref },
+            pool_base_ptr,
             start_row,
             end_row,
             sw_blocks,
@@ -3421,12 +3433,10 @@ impl DeepseekModel {
             cache.fp8_kv_sw_bootstrapped = true;
             return Ok(());
         }
-        let max_compressed_keys = self
-            .config
-            .max_position_embeddings
-            .div_ceil(compress_ratio.max(1));
+        // Pool layout — OFF: `max_position_embeddings`-based (byte-identical to
+        // `main`); ON: the bound shared sub-range layout stamped at bind time.
         let (sw_blocks, comp_blocks) =
-            dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, max_compressed_keys);
+            self.dsv4_flashmla_decode_pool_layout(cache, compress_ratio)?;
 
         // Borrow split: lift the bf16 SW window's device pointer + length
         // out as a u64 + usize *before* we take a mutable borrow on the
@@ -3453,16 +3463,17 @@ impl DeepseekModel {
             expected_window_len
         );
 
-        // Reborrow mutably for pool + scratch fields (disjoint from the
-        // bf16 SW window pointer above).
-        let pool = ensure_dsv4_flashmla_fp8_kv_pool(&self.ctx, cache, sw_blocks, comp_blocks)?;
-        let pool_ref: *mut CudaSlice<u8> = pool;
+        // Resolve the pool base pointer by mode (OFF → per-state lazy-alloc;
+        // ON → the bound shared sub-range). This hook only runs at decode time
+        // (gated at the caller by `token_count == 1`), so the ON bind is present.
+        let pool_base_ptr =
+            dsv4_flashmla_fp8_kv_pool_base_ptr(&self.ctx, cache, sw_blocks, comp_blocks)?;
         let mut bids = cache.fp8_kv_sw_bulk_bids.take();
         let mut rows = cache.fp8_kv_sw_bulk_rows.take();
         let res = dsv4_flashmla_bulk_pack_sw_ring_raw(
             &self.ctx,
             window_ptr_u64,
-            unsafe { &mut *pool_ref },
+            pool_base_ptr,
             sliding_window,
             head_dim,
             sw_blocks,
@@ -3473,6 +3484,112 @@ impl DeepseekModel {
         cache.fp8_kv_sw_bulk_rows = rows;
         res?;
         cache.fp8_kv_sw_bootstrapped = true;
+        Ok(())
+    }
+
+    /// Number of loaded transformer layers — the layer dimension of both the
+    /// per-state incremental KV caches and the shared FP8 KV pool.
+    #[cfg(feature = "cuda")]
+    pub(super) fn loaded_layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Resolve the `(sw_blocks, comp_blocks)` FP8 KV pool layout for a decode
+    /// pack/decode site, dispatching on `ARLE_DSV4_SHARED_KV_POOL`.
+    ///
+    /// - **OFF (default):** compute from `sliding_window` +
+    ///   `ceil(max_position_embeddings / compress_ratio)`, byte-identical to the
+    ///   per-state path on `main` (the same values `ensure_*` stamps).
+    /// - **ON:** read the uniform layout stamped on the cache at
+    ///   `bind_fp8_kv_pool_view` (bounded by the served `max_seq_len`). The bind
+    ///   always runs before any decode hook when the shared pool is on.
+    ///
+    /// Both branches feed the same indices-builder + pack-kernel contract; only
+    /// the `comp_blocks` capacity differs (`max_position_embeddings / ratio` vs
+    /// `max_seq_len / ratio`), and the larger value is just zeroed slack.
+    #[cfg(feature = "cuda")]
+    fn dsv4_flashmla_decode_pool_layout(
+        &self,
+        cache: &DeepseekAttentionRuntimeCache,
+        compress_ratio: usize,
+    ) -> Result<(usize, usize)> {
+        if dsv4_shared_kv_pool_enabled()? {
+            ensure!(
+                cache.fp8_kv_pool_ptr != 0,
+                "DSv4 shared FlashMLA FP8 KV pool layout read before bind (call bind_fp8_kv_pool_view first)"
+            );
+            return Ok((cache.fp8_kv_sw_blocks, cache.fp8_kv_comp_blocks));
+        }
+        let max_compressed_keys = self
+            .config
+            .max_position_embeddings
+            .div_ceil(compress_ratio.max(1));
+        Ok(dsv4_flashmla_fp8_kv_pool_blocks(
+            self.config.sliding_window,
+            max_compressed_keys,
+        ))
+    }
+
+    /// Worst-case per-(slot, layer) FP8 KV pool block count
+    /// `(sw_blocks, comp_blocks)` for the shared pool, bounded by the served
+    /// `max_seq_len` rather than `max_position_embeddings`.
+    ///
+    /// `comp_blocks` uses the **smallest** non-zero `compress_ratio` across
+    /// layers (largest compressed-row count) so every layer's compressed
+    /// sub-pool fits in the uniform sub-range. SW layers (`ratio == 0`) carry
+    /// no compressed rows. The unused tail in lower-pressure layers is zeroed
+    /// slack the indices builder never references.
+    ///
+    /// Bounding by `max_seq_len` is correct: the compressor only ever writes
+    /// `ceil(processed_tokens / ratio) <= ceil(max_seq_len / ratio)` rows, and
+    /// the scheduler caps every sequence at `max_seq_len`. The prior per-state
+    /// pool over-allocated to `max_position_embeddings / ratio` (~1M / ratio),
+    /// which is what OOMed at c≥8. Shared-pool ON only.
+    #[cfg(feature = "cuda")]
+    pub(super) fn dsv4_flashmla_pool_slot_blocks(&self, max_seq_len: usize) -> (usize, usize) {
+        let sliding_window = self.config.sliding_window;
+        let min_ratio = self
+            .config
+            .compress_ratios
+            .iter()
+            .copied()
+            .filter(|&r| r > 0)
+            .min()
+            .unwrap_or(1)
+            .max(1);
+        let effective_keys = max_seq_len.max(1).div_ceil(min_ratio);
+        dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, effective_keys)
+    }
+
+    /// Bind this (slot, layer) attention cache's FP8 KV pool view to its fixed
+    /// sub-range inside the shared decode-context pool, then stamp the uniform
+    /// `(sw_blocks, comp_blocks)` layout the pack/decode hooks read.
+    ///
+    /// Called from `forward_decode_batch` (the single site that owns both the
+    /// decode context and the slot identity) before any FP8 pack/decode hook
+    /// runs. Shared-pool ON only — never reached when
+    /// `ARLE_DSV4_SHARED_KV_POOL` is off (the bind loop is gated by
+    /// `decode_ctx.fp8_kv_max_seq_len().is_some()`, which is only `Some` when
+    /// the shared pool is allocated, which only happens when ON).
+    #[cfg(feature = "cuda")]
+    pub(super) fn bind_fp8_kv_pool_view(
+        &self,
+        decode_ctx: &mut super::batch_decode::DeepseekBatchDecodeBuffers,
+        cache: &mut DeepseekAttentionRuntimeCache,
+        slot_idx: usize,
+        layer_idx: usize,
+        max_seq_len: usize,
+    ) -> Result<()> {
+        let (sw_blocks, comp_blocks) = self.dsv4_flashmla_pool_slot_blocks(max_seq_len);
+        let slot_blocks = sw_blocks + comp_blocks;
+        let (base_ptr, view_bytes) =
+            decode_ctx.fp8_kv_slot_layer_view(&self.ctx, slot_idx, layer_idx, slot_blocks)?;
+        cache.fp8_kv_pool_ptr = base_ptr;
+        cache.fp8_kv_pool_view_bytes = view_bytes;
+        cache.fp8_kv_sw_blocks = sw_blocks;
+        cache.fp8_kv_comp_blocks = comp_blocks;
+        cache.fp8_kv_page_block_size = DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE;
+        cache.fp8_kv_bytes_per_token = DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN;
         Ok(())
     }
 
@@ -4387,6 +4504,61 @@ fn ensure_dsv4_flashmla_fp8_kv_pool<'a>(
         .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool allocation missing"))
 }
 
+/// Resolve the device base pointer of this (slot, layer) cache's FP8 KV pool,
+/// dispatching on `ARLE_DSV4_SHARED_KV_POOL`.
+///
+/// - **OFF (default):** lazy-allocate (or grow) the per-(slot, layer) pool via
+///   `ensure_dsv4_flashmla_fp8_kv_pool` and return its byte-0 device pointer.
+///   Byte-identical to the path shipped on `main` — the only behavioural change
+///   is that the kernel now receives the same pointer as a `u64` instead of a
+///   `&mut CudaSlice<u8>` it would have dereferenced to the same address.
+/// - **ON:** read the sub-range pointer bound at `bind_fp8_kv_pool_view`
+///   (`cache.fp8_kv_pool_ptr`), asserting the bound view covers the requested
+///   `(sw_blocks, comp_blocks)`. No allocation here — the shared pool was
+///   allocated once at `create_decode_context`.
+///
+/// In both modes the returned pointer is the start of this (slot, layer)'s
+/// `total_blocks`-block window; block ids in the indices buffer are relative to
+/// it, so the pack/decode kernels are unchanged.
+#[cfg(feature = "cuda")]
+fn dsv4_flashmla_fp8_kv_pool_base_ptr(
+    ctx: &DeviceContext,
+    cache: &mut DeepseekAttentionRuntimeCache,
+    sw_blocks: usize,
+    comp_blocks: usize,
+) -> Result<u64> {
+    let total_blocks = sw_blocks
+        .checked_add(comp_blocks)
+        .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool block count overflow"))?;
+    let want_bytes = total_blocks
+        .checked_mul(DSV4_FLASHMLA_MODEL1_BLOCK_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool byte size overflow"))?;
+
+    if dsv4_shared_kv_pool_enabled()? {
+        // Shared pool: the (slot, layer) sub-range was bound in
+        // `forward_decode_batch` before any pack/decode hook runs. Decode-time
+        // only — prefill never reaches the pool because the pack hooks are
+        // gated to `token_count == 1` when the shared pool is on.
+        ensure!(
+            cache.fp8_kv_pool_ptr != 0,
+            "DSv4 shared FlashMLA FP8 KV pool sub-range not bound (call bind_fp8_kv_pool_view before the decode hooks)"
+        );
+        ensure!(
+            cache.fp8_kv_pool_view_bytes >= want_bytes,
+            "DSv4 shared FlashMLA FP8 KV pool bound view {} B < required {} B (sw_blocks={sw_blocks}, comp_blocks={comp_blocks})",
+            cache.fp8_kv_pool_view_bytes,
+            want_bytes
+        );
+        return Ok(cache.fp8_kv_pool_ptr);
+    }
+
+    // Per-state pool (default): lazy-alloc + read byte-0 pointer. Identical
+    // behaviour to `main`.
+    let pool = ensure_dsv4_flashmla_fp8_kv_pool(ctx, cache, sw_blocks, comp_blocks)?;
+    let (ptr, _g) = pool.device_ptr_mut(&ctx.stream);
+    Ok(ptr)
+}
+
 /// Compute the (sw_blocks, comp_blocks) sizing for the FlashMLA FP8 KV pool
 /// given the current request shape. Mirrors the indices builder contract:
 ///   sw_blocks  = ceil(sliding_window / page_block_size)
@@ -4550,7 +4722,7 @@ fn ensure_fm_decode_arena(
 fn dsv4_flashmla_bulk_pack_sw_ring_raw(
     ctx: &DeviceContext,
     window_ptr_u64: u64,
-    fp8_pool: &mut CudaSlice<u8>,
+    fp8_pool_base_ptr: u64,
     sliding_window: usize,
     head_dim: usize,
     sw_blocks: usize,
@@ -4613,7 +4785,7 @@ fn dsv4_flashmla_bulk_pack_sw_ring_raw(
         .memcpy_htod(&rows, rows_dev)
         .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA SW rows H2D failed: {err}"))?;
 
-    let (pool_ptr, _pg) = fp8_pool.device_ptr_mut(&ctx.stream);
+    let pool_ptr = fp8_pool_base_ptr;
     let (bid_ptr, _bidg) = block_ids_dev.device_ptr(&ctx.stream);
     let (row_ptr, _rowg) = rows_dev.device_ptr(&ctx.stream);
 
@@ -4667,7 +4839,7 @@ const DSV4_HEAD_DIM_ROPE: usize = 64;
 fn dsv4_flashmla_pack_one_sw_token(
     ctx: &DeviceContext,
     k_prepared_ptr: u64,
-    fp8_pool: &mut CudaSlice<u8>,
+    fp8_pool_base_ptr: u64,
     ring_idx: usize,
     head_dim: usize,
     one_token_scratch: &mut Option<(CudaSlice<i32>, CudaSlice<i32>)>,
@@ -4697,7 +4869,7 @@ fn dsv4_flashmla_pack_one_sw_token(
         .memcpy_htod(&[row], row_dev)
         .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA one-token row H2D: {err}"))?;
 
-    let (pool_ptr, _pg) = fp8_pool.device_ptr_mut(&ctx.stream);
+    let pool_ptr = fp8_pool_base_ptr;
     let (bid_ptr, _bidg) = bid_dev.device_ptr(&ctx.stream);
     let (row_ptr, _rowg) = row_dev.device_ptr(&ctx.stream);
 
@@ -4738,7 +4910,7 @@ fn dsv4_flashmla_pack_one_sw_token(
 fn dsv4_flashmla_pack_compressor_rows(
     ctx: &DeviceContext,
     compressed_bf16_ptr: u64,
-    fp8_pool: &mut CudaSlice<u8>,
+    fp8_pool_base_ptr: u64,
     start_row: usize,
     end_row: usize,
     sw_blocks: usize,
@@ -4789,7 +4961,7 @@ fn dsv4_flashmla_pack_compressor_rows(
     let rope_ptr_u64 =
         nope_ptr_u64 + (DSV4_HEAD_DIM_NOPE as u64) * (std::mem::size_of::<bf16>() as u64);
 
-    let (pool_ptr, _pg) = fp8_pool.device_ptr_mut(&ctx.stream);
+    let pool_ptr = fp8_pool_base_ptr;
     let (bid_ptr, _bidg) = bid_dev.device_ptr(&ctx.stream);
     let (row_ptr, _rowg) = row_dev.device_ptr(&ctx.stream);
 
@@ -6217,7 +6389,7 @@ fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
 /// See `wins/2026-05-29-dsv4-gpu-native-coherent-output-pd-handoff.md` and
 /// `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md`.
 #[cfg(feature = "cuda")]
-fn dsv4_flashmla_decode_enabled() -> Result<bool> {
+pub(super) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_FLASHMLA_DECODE").ok() else {
         return Ok(true);
     };
@@ -6225,6 +6397,37 @@ fn dsv4_flashmla_decode_enabled() -> Result<bool> {
         "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
         "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
         _ => bail!("invalid ARLE_DSV4_FLASHMLA_DECODE value `{raw}`"),
+    }
+}
+
+/// Phase D-4 (shared-pool) — gate for the **shared persistent FP8 decode KV
+/// pool** (`ARLE_DSV4_SHARED_KV_POOL`). Defaults to **OFF**.
+///
+/// When OFF (default): the FP8 KV pool is allocated per-(slot, layer) lazily at
+/// first decode via `ensure_dsv4_flashmla_fp8_kv_pool`, byte-identical to the
+/// path shipped on `main`. This is the only validated default.
+///
+/// When ON: one shared persistent pool owned by the scheduler-side decode
+/// context (`DeepseekBatchDecodeBuffers`) backs every concurrent sequence; each
+/// (slot, layer) is bound to a fixed byte sub-range at decode time. Sized for
+/// `num_slots × layers × slot_blocks × 37376 B` and bounded by the served
+/// `max_seq_len` (not `max_position_embeddings`), so c≥8 stops OOMing. The bind
+/// happens in `forward_decode_batch` (which has the decode context + slot
+/// indices); prefill never touches the FP8 pool when this is ON (the per-step
+/// pack hooks are gated to `token_count == 1`).
+///
+/// Validate independently of the default ("各自验证"):
+/// `ARLE_DSV4_SHARED_KV_POOL=1 ... scripts/dsv4_batched_decode_validate.py`
+/// at c={1,4,8}.
+#[cfg(feature = "cuda")]
+pub(super) fn dsv4_shared_kv_pool_enabled() -> Result<bool> {
+    let Some(raw) = std::env::var("ARLE_DSV4_SHARED_KV_POOL").ok() else {
+        return Ok(false);
+    };
+    match raw.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => bail!("invalid ARLE_DSV4_SHARED_KV_POOL value `{raw}`"),
     }
 }
 

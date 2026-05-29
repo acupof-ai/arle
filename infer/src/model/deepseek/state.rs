@@ -1044,8 +1044,26 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     //
     // Freed alongside the bf16 buffers at session end (drop-on-reset
     // pattern via `Option::take`).
+    //
+    // `ARLE_DSV4_SHARED_KV_POOL` OFF (default): this owns the per-(slot, layer)
+    // pool, lazy-allocated by `ensure_dsv4_flashmla_fp8_kv_pool`. The bound-view
+    // fields below stay zero/unused.
+    //
+    // `ARLE_DSV4_SHARED_KV_POOL` ON: this stays `None`; the pool lives once in
+    // the scheduler-owned `DeepseekBatchDecodeBuffers` decode context, and the
+    // bound-view fields below (`fp8_kv_pool_ptr` + `fp8_kv_pool_view_bytes`)
+    // carry this (slot, layer)'s sub-range, refreshed at the per-step bind site.
+    // The per-row pack/decode logic is byte-identical across both modes — only
+    // the base pointer moves from an owned buffer's byte 0 to the slot's
+    // sub-range start.
     pub(crate) fp8_kv_pool: Option<CudaSlice<u8>>,
     pub(crate) fp8_kv_pool_bytes: usize,
+    /// Shared-pool ON only: device base pointer of this (slot, layer)'s bound
+    /// sub-range. `0` means unbound (env knob off, or not yet bound this
+    /// session).
+    pub(crate) fp8_kv_pool_ptr: u64,
+    /// Shared-pool ON only: byte length of the bound sub-range.
+    pub(crate) fp8_kv_pool_view_bytes: usize,
     pub(crate) fp8_kv_sw_blocks: usize,
     pub(crate) fp8_kv_comp_blocks: usize,
     pub(crate) fp8_kv_page_block_size: usize,
