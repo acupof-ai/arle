@@ -781,19 +781,17 @@ pub(crate) fn prefill_attention_paged_run_hd256(
             page_size == 16,
             "TileLang prefill HD256 kernel requires page_size=16, got {page_size}"
         );
-        let tilelang_kernel = match (num_q_heads, num_kv_heads) {
-            (8, 2) => ffi::tilelang_batch_prefill_paged_hd256_q8_kv2_run_cuda,
-            (16, 2) => ffi::tilelang_batch_prefill_paged_hd256_q16_kv2_run_cuda,
-            (16, 4) => ffi::tilelang_batch_prefill_paged_hd256_q16_kv4_run_cuda,
-            other => {
-                return Err(anyhow!(
-                    "TileLang: no specialized prefill HD256 kernel for \
-                     (num_q_heads, num_kv_heads) = {other:?}; supported configs \
-                     are (8,2), (16,2), (16,4). Extend SUPPORTED_HEADS \
-                     in tools/tilelang/batch_prefill_paged_hd256.py, \
-                     TILELANG_PREFILL_HD256_HEAD_CONFIGS in cuda-kernels/build.rs, \
-                     and the FFI macro + this match in lockstep, then rebuild."
-                ));
+        // Head-config validation + the unprecompiled-config hard-fail live once
+        // in `oplib::attention::head_config` (CPU-testable); this site only maps
+        // the resolved variant onto its prefill FFI fn pointer (a cuda type).
+        let tilelang_kernel = {
+            use crate::oplib::attention::HeadConfig;
+            match crate::oplib::attention::head_config(num_q_heads, num_kv_heads)
+                .map_err(|e| anyhow!(e))?
+            {
+                HeadConfig::Q8Kv2 => ffi::tilelang_batch_prefill_paged_hd256_q8_kv2_run_cuda,
+                HeadConfig::Q16Kv2 => ffi::tilelang_batch_prefill_paged_hd256_q16_kv2_run_cuda,
+                HeadConfig::Q16Kv4 => ffi::tilelang_batch_prefill_paged_hd256_q16_kv4_run_cuda,
             }
         };
         let head_dim = 256;
@@ -1463,19 +1461,17 @@ pub(crate) fn tilelang_run_layer_hd256(
             "TileLang decode HD256 kernel requires page_size=16, got {}",
             heads.page_size
         );
-        match (heads.num_qo_heads, heads.num_kv_heads) {
-            (8, 2) => ffi::tilelang_batch_decode_paged_hd256_q8_kv2_run_cuda,
-            (16, 2) => ffi::tilelang_batch_decode_paged_hd256_q16_kv2_run_cuda,
-            (16, 4) => ffi::tilelang_batch_decode_paged_hd256_q16_kv4_run_cuda,
-            other => {
-                return Err(anyhow!(
-                    "TileLang: no specialized decode HD256 kernel for \
-                     (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
-                     are (8,2), (16,2), (16,4). Extend SUPPORTED_HEADS \
-                     in tools/tilelang/batch_decode_paged_hd256.py, \
-                     TILELANG_DECODE_HD256_HEAD_CONFIGS in cuda-kernels/build.rs, \
-                     and the FFI macro + this match in lockstep, then rebuild."
-                ));
+        // Head-config validation + the unprecompiled-config hard-fail live once
+        // in `oplib::attention::head_config` (CPU-testable); this site only maps
+        // the resolved variant onto its decode FFI fn pointer (a cuda type).
+        {
+            use crate::oplib::attention::HeadConfig;
+            match crate::oplib::attention::head_config(heads.num_qo_heads, heads.num_kv_heads)
+                .map_err(|e| anyhow!(e))?
+            {
+                HeadConfig::Q8Kv2 => ffi::tilelang_batch_decode_paged_hd256_q8_kv2_run_cuda,
+                HeadConfig::Q16Kv2 => ffi::tilelang_batch_decode_paged_hd256_q16_kv2_run_cuda,
+                HeadConfig::Q16Kv4 => ffi::tilelang_batch_decode_paged_hd256_q16_kv4_run_cuda,
             }
         }
     };
