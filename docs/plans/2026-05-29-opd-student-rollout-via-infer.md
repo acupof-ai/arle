@@ -132,8 +132,15 @@ step-0 student == base), needing no sync machinery.
   agreement vs train-crate argmax ≥90%.
 - **P3** — swap the rollout loop (`opd.rs:1654-1776`) to call infer student;
   keep the train-crate path behind a flag for A/B.
-- **P4** — bench + gate; on pass, **delete the train-crate decode path**
-  (online_f32 + legacy + `forward_rollout_cached*`) as one deletion unit.
+- **P4** ✅ DONE — bench + gate; flipped the infer path to DEFAULT, hardened
+  the base-cache (lazy first-`remerge_lora` snapshot, no temp-dir/env), and
+  ran an inventory-gated deletion audit. **Outcome: zero safe deletions** —
+  the train-crate decode path (`forward_rollout_cached*` + `online_f32` +
+  legacy two-pass kernel) is NOT dead: it is the live `ARLE_OPD_INFER_ROLLOUT=0`
+  opt-out fallback, and the legacy kernel is the model-generic `head_dim != 256`
+  fallback (`online_f32` is `head_dim==256`-only). The plan's "delete as one
+  unit" assumption was wrong — the fallback must stay reachable (no half-state).
+  See [`docs/experience/wins/2026-05-29-opd-infer-rollout-default-p4.md`](../experience/wins/2026-05-29-opd-infer-rollout-default-p4.md).
 
 ## Kill criteria (license-or-kill, explicit thresholds)
 
