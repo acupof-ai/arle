@@ -31,8 +31,7 @@ mod tests {
 mod app {
     use super::{DEFAULT_EVAL_TRAIN_PROMPT_LIMIT, STATIC_PARAM_EVICT_MIN_ELEMENTS};
     use std::{
-        borrow::Cow,
-        collections::{BTreeMap, HashSet},
+        collections::HashSet,
         fs,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
@@ -43,7 +42,6 @@ mod app {
     use infer::server_engine::{
         InferenceEngineOptions, LoadedInferenceEngine, ServerRuntimeConfig,
     };
-    use safetensors::tensor::{Dtype, View};
     use train::{
         LoraAdapterConfig, LoraConfig, LoraTargetSet,
         infer_student::InferStudent,
@@ -246,43 +244,28 @@ mod app {
         let student_trainable_params = trainable_params(&student, &store);
         let student_host_evict_params = host_evict_param_ids(&student);
 
-        // P3: load the in-process infer student engine only when the rollout
-        // flag is on (otherwise don't pay the second-engine VRAM). The engine
-        // is loaded from the *student* model dir with the train student's
-        // current q/v adapter written to a temp PEFT dir + `INFER_LORA_PATH`
-        // set, so the infer model snapshots its pristine base at load
-        // (`cache_lora_base`). Per step, `sync_lora_from_store` restores that
-        // base and re-merges the fresh train adapter.
+        // P4: load the in-process infer student engine (now the default
+        // rollout path). Opt out with `ARLE_OPD_INFER_ROLLOUT=0`. The engine
+        // loads from the *student* model dir with **no** disk adapter: the
+        // pristine BF16 base is snapshotted lazily on the first
+        // `remerge_lora` (driven by the per-step `sync_lora_from_store`), so
+        // the prior temp-PEFT-dir + `INFER_LORA_PATH` juggling is gone (P4
+        // infra hardening — see `infer/src/model/qwen35/weights.rs`).
         let infer_student = if infer_rollout_flag_enabled() {
             if args.lora_target_set != LoraTargetSet::AttentionQv {
                 return Err(
-                    "ARLE_OPD_INFER_ROLLOUT requires --lora-target-set attention-qv (the infer \
-                     merge path only carries q/v adapters on full-attention layers)"
+                    "the infer rollout path requires --lora-target-set attention-qv (the infer \
+                     merge path only carries q/v adapters on full-attention layers); pass \
+                     ARLE_OPD_INFER_ROLLOUT=0 to fall back to the train-crate rollout"
                         .into(),
                 );
             }
             let infer_student_load_started = Instant::now();
-            let adapter_dir = tempfile::tempdir()?;
-            write_infer_adapter_dir(
-                adapter_dir.path(),
-                &mut store,
-                &student.adapter_name_map(),
-                args.lora_rank,
-                args.lora_alpha,
-            )?;
-            // SAFETY: single-threaded setup before the engine scheduler spawns.
-            unsafe {
-                std::env::set_var("INFER_LORA_PATH", adapter_dir.path());
-            }
             let engine = load_infer_engine(
                 &args.student_model,
                 args.prompt_max_tokens + args.rollout_len + 32,
                 args.enable_cuda_graph,
-            );
-            unsafe {
-                std::env::remove_var("INFER_LORA_PATH");
-            }
-            let engine = engine?;
+            )?;
             let infer_student = InferStudent::new(
                 Arc::new(Mutex::new(engine)),
                 cuda_backend.clone() as Arc<dyn Backend>,
@@ -747,85 +730,6 @@ mod app {
                 .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?,
             runtime,
         )
-    }
-
-    /// A raw F32 safetensors matrix view, used to write the PEFT adapter the
-    /// infer student engine loads at bootstrap (so it caches the pristine base).
-    struct F32Tensor {
-        shape: Vec<usize>,
-        data: Vec<u8>,
-    }
-
-    impl View for &F32Tensor {
-        fn dtype(&self) -> Dtype {
-            Dtype::F32
-        }
-        fn shape(&self) -> &[usize] {
-            &self.shape
-        }
-        fn data(&self) -> Cow<'_, [u8]> {
-            Cow::Borrowed(&self.data)
-        }
-        fn data_len(&self) -> usize {
-            self.data.len()
-        }
-    }
-
-    /// Map a train adapter name (`...layers.7.self_attn.q_proj.weight.lora_a`)
-    /// to the PEFT on-disk name infer's loader expects.
-    fn peft_name(internal: &str) -> Option<String> {
-        let (base, suffix) = if let Some(b) = internal.strip_suffix(".lora_a") {
-            (b, "lora_A")
-        } else if let Some(b) = internal.strip_suffix(".lora_b") {
-            (b, "lora_B")
-        } else {
-            return None;
-        };
-        let base = base.strip_suffix(".weight")?;
-        Some(format!("base_model.model.{base}.{suffix}.weight"))
-    }
-
-    /// Write the train student's current q/v adapter (raw A/B) to a PEFT
-    /// adapter dir so the infer engine snapshots the pristine base at load.
-    fn write_infer_adapter_dir(
-        dir: &Path,
-        store: &mut TensorStore,
-        adapter_map: &std::collections::HashMap<&'static str, TensorId>,
-        lora_rank: usize,
-        lora_alpha: f32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut tensors: BTreeMap<String, F32Tensor> = BTreeMap::new();
-        for (&name, &id) in adapter_map {
-            let Some(peft) = peft_name(name) else {
-                continue;
-            };
-            if !(name.contains(".q_proj.") || name.contains(".v_proj.")) {
-                continue;
-            }
-            let shape = store
-                .get(id)
-                .ok_or_else(|| format!("adapter tensor {name} missing from store"))?
-                .shape
-                .clone();
-            let values = store.to_host(id)?;
-            let data = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            tensors.insert(peft, F32Tensor { shape, data });
-        }
-        if tensors.is_empty() {
-            return Err("no q/v adapters to write; check --lora-target-set attention-qv".into());
-        }
-        let views: BTreeMap<String, &F32Tensor> =
-            tensors.iter().map(|(k, v)| (k.clone(), v)).collect();
-        safetensors::serialize_to_file(views, None, &dir.join("adapter_model.safetensors"))?;
-        fs::write(
-            dir.join("adapter_config.json"),
-            serde_json::to_string_pretty(&serde_json::json!({
-                "r": lora_rank,
-                "lora_alpha": lora_alpha,
-                "target_modules": ["q_proj", "v_proj"],
-            }))?,
-        )?;
-        Ok(())
     }
 
     fn run_training<T, ProfileFn, RouteFn>(
