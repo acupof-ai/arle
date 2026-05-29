@@ -2733,35 +2733,28 @@ impl DeepseekModel {
                     d_v,
                 )?;
 
-                // Sliding-window + compressed pool sizing must match the
-                // bootstrap / compressor pack hooks (same formula).
-                let max_compressed_keys_pool = self
-                    .config
-                    .max_position_embeddings
-                    .div_ceil(compress_ratio.max(1));
-                let (sw_blocks, comp_blocks) =
-                    dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, max_compressed_keys_pool);
+                // Sliding-window + compressed pool layout — read the uniform
+                // `(sw_blocks, comp_blocks)` stamped on the cache at
+                // `bind_fp8_kv_pool_view`. Matches the bootstrap / compressor
+                // pack hooks (same bound source) and the shared pool's
+                // per-(slot, layer) sub-range. `total_blocks` is the FlashMLA
+                // kv-pool block count for this (slot, layer) sub-range.
+                let sw_blocks = cache_mut.fp8_kv_sw_blocks;
+                let comp_blocks = cache_mut.fp8_kv_comp_blocks;
                 let total_blocks = sw_blocks + comp_blocks;
 
                 // Step 3 — per-step SW pack of the current decode token's
                 // K row from k_prepared into FP8 SW sub-pool at
                 // ring slot `start_pos % sliding_window`.
                 {
-                    let pool = ensure_dsv4_flashmla_fp8_kv_pool(
-                        &self.ctx,
-                        cache_mut,
-                        sw_blocks,
-                        comp_blocks,
-                    )?;
-                    let pool_ref: *mut CudaSlice<u8> = pool;
+                    let pool_base_ptr =
+                        dsv4_flashmla_fp8_kv_pool_base_ptr(cache_mut, sw_blocks, comp_blocks)?;
                     let mut one_scratch = cache_mut.fp8_kv_one_token_scratch.take();
                     let ring_idx = start_pos % sliding_window.max(1);
                     let res = dsv4_flashmla_pack_one_sw_token(
                         &self.ctx,
                         k_ptr,
-                        // SAFETY: pool_ref and one_scratch are disjoint
-                        // fields; helper writes only through pool, scratch.
-                        unsafe { &mut *pool_ref },
+                        pool_base_ptr,
                         ring_idx,
                         head_dim,
                         &mut one_scratch,
@@ -2859,13 +2852,12 @@ impl DeepseekModel {
                     })?;
                 }
 
-                // Step 6 — decode + combine.
-                let (kv_pool_ptr_u64, _kg) = cache_mut
-                    .fp8_kv_pool
-                    .as_mut()
-                    .expect("FP8 KV pool allocated")
-                    .device_ptr_mut(&self.ctx.stream);
-                drop(_kg);
+                // Step 6 — decode + combine. The KV pool base pointer is the
+                // bound sub-range start for this (slot, layer); block ids in the
+                // indices buffer are relative to it, identical to the prior
+                // owned-buffer layout.
+                let kv_pool_ptr_u64 =
+                    dsv4_flashmla_fp8_kv_pool_base_ptr(cache_mut, sw_blocks, comp_blocks)?;
                 let (lse_accum_ptr_u64, _lg) = cache_mut
                     .fm_decode_lse_accum
                     .as_mut()
@@ -3307,6 +3299,73 @@ impl DeepseekModel {
         Ok(())
     }
 
+    /// Number of loaded transformer layers — the layer dimension of both the
+    /// per-state incremental KV caches and the shared FP8 KV pool.
+    #[cfg(feature = "cuda")]
+    pub(super) fn loaded_layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Worst-case per-(slot, layer) FP8 KV pool block count
+    /// `(sw_blocks, comp_blocks)` for the shared pool, bounded by the served
+    /// `max_seq_len` rather than `max_position_embeddings`.
+    ///
+    /// `comp_blocks` uses the **smallest** non-zero `compress_ratio` across
+    /// layers (largest compressed-row count) so every layer's compressed
+    /// sub-pool fits in the uniform sub-range. SW layers (`ratio == 0`) carry
+    /// no compressed rows. The unused tail in lower-pressure layers is zeroed
+    /// slack the indices builder never references.
+    ///
+    /// Bounding by `max_seq_len` is correct: the compressor only ever writes
+    /// `ceil(processed_tokens / ratio) <= ceil(max_seq_len / ratio)` rows, and
+    /// the scheduler caps every sequence at `max_seq_len`. The prior per-state
+    /// pool over-allocated to `max_position_embeddings / ratio` (~1M / ratio),
+    /// which is what OOMed at c≥8.
+    #[cfg(feature = "cuda")]
+    pub(super) fn dsv4_flashmla_pool_slot_blocks(&self, max_seq_len: usize) -> (usize, usize) {
+        let sliding_window = self.config.sliding_window;
+        let min_ratio = self
+            .config
+            .compress_ratios
+            .iter()
+            .copied()
+            .filter(|&r| r > 0)
+            .min()
+            .unwrap_or(1)
+            .max(1);
+        let effective_keys = max_seq_len.max(1).div_ceil(min_ratio);
+        dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, effective_keys)
+    }
+
+    /// Bind this (slot, layer) attention cache's FP8 KV pool view to its fixed
+    /// sub-range inside the shared decode-context pool, then stamp the uniform
+    /// `(sw_blocks, comp_blocks)` layout the pack/decode hooks read.
+    ///
+    /// Called at the per-layer attention entry sites (both the c=1 incremental
+    /// path and the batched path) before any FP8 pack/decode hook runs. No-op
+    /// when the FlashMLA decode env knob is off.
+    #[cfg(feature = "cuda")]
+    pub(super) fn bind_fp8_kv_pool_view(
+        &self,
+        decode_ctx: &mut super::batch_decode::DeepseekBatchDecodeBuffers,
+        cache: &mut DeepseekAttentionRuntimeCache,
+        slot_idx: usize,
+        layer_idx: usize,
+        max_seq_len: usize,
+    ) -> Result<()> {
+        let (sw_blocks, comp_blocks) = self.dsv4_flashmla_pool_slot_blocks(max_seq_len);
+        let slot_blocks = sw_blocks + comp_blocks;
+        let (base_ptr, view_bytes) =
+            decode_ctx.fp8_kv_slot_layer_view(&self.ctx, slot_idx, layer_idx, slot_blocks)?;
+        cache.fp8_kv_pool_ptr = base_ptr;
+        cache.fp8_kv_pool_view_bytes = view_bytes;
+        cache.fp8_kv_sw_blocks = sw_blocks;
+        cache.fp8_kv_comp_blocks = comp_blocks;
+        cache.fp8_kv_page_block_size = DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE;
+        cache.fp8_kv_bytes_per_token = DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN;
+        Ok(())
+    }
+
     /// Phase D-4 step 4 — compressor → FP8 pool pack hook. Reads the bf16
     /// compressor output rows that were newly written this step and packs
     /// them into the FP8 KV pool compressed sub-pool. Idempotent —
@@ -3319,7 +3378,7 @@ impl DeepseekModel {
     fn dsv4_flashmla_compressor_pack_hook(
         &self,
         cache: &mut DeepseekAttentionRuntimeCache,
-        compress_ratio: usize,
+        _compress_ratio: usize,
         head_dim: usize,
     ) -> Result<()> {
         ensure!(
@@ -3335,19 +3394,15 @@ impl DeepseekModel {
             return Ok(());
         }
 
-        // Size the pool — sw_blocks from sliding_window, comp_blocks from
-        // the compressor capacity (max_position_embeddings / ratio rounded
-        // up). Sized once monotonically — see `dsv4_flashmla_fp8_kv_pool_blocks`.
-        let sliding_window = self.config.sliding_window;
-        let max_compressed_keys = self
-            .config
-            .max_position_embeddings
-            .div_ceil(compress_ratio.max(1));
-        let (sw_blocks, comp_blocks) =
-            dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, max_compressed_keys);
+        // Pool layout — read the uniform `(sw_blocks, comp_blocks)` stamped on
+        // the cache at `bind_fp8_kv_pool_view`. This bounds comp_blocks by the
+        // served `max_seq_len` (not `max_position_embeddings`), matching the
+        // shared pool's per-(slot, layer) sub-range exactly.
+        let sw_blocks = cache.fp8_kv_sw_blocks;
+        let comp_blocks = cache.fp8_kv_comp_blocks;
 
-        // Borrow split: pool through `ensure_*`, then read compressed bf16
-        // pointer via separate immutable borrow.
+        // Borrow split: pool through `dsv4_flashmla_fp8_kv_pool_base_ptr`, then
+        // read compressed bf16 pointer via separate immutable borrow.
         let start_row = cache.fp8_kv_comp_packed_rows;
         let end_row = compressed_rows;
 
@@ -3363,26 +3418,14 @@ impl DeepseekModel {
         let comp_bf16_ptr_u64 = comp_bf16_ptr;
         drop(_comp_g);
 
-        // Mutable borrow on attention cache for the pool + scratch.
-        let pool = ensure_dsv4_flashmla_fp8_kv_pool(&self.ctx, cache, sw_blocks, comp_blocks)?;
-        // SAFETY: pool reference is exclusively held; we need a stable
-        // *mut over the helper call. Split the borrow.
-        let pool_ref: *mut CudaSlice<u8> = pool;
-        // Re-borrow comp_scratch via cache directly — but cache is already
-        // mutably borrowed through pool_ref. Work around by accessing
-        // through a raw mutable ref: split the borrow with split_at trick.
-        // Simpler: take the comp_scratch out, run the pack, put back.
+        // Resolve the bound base pointer of this cache's sub-range inside the
+        // shared pool (the decode context binds it before this hook runs).
+        let pool_base_ptr = dsv4_flashmla_fp8_kv_pool_base_ptr(cache, sw_blocks, comp_blocks)?;
         let mut comp_scratch = cache.fp8_kv_comp_scratch.take();
-        // SAFETY: `pool_ref` and `comp_scratch` are disjoint fields of
-        // `cache`; `dsv4_flashmla_pack_compressor_rows` only writes
-        // through the pool argument and reads/writes the scratch
-        // argument. The cache reference itself is not aliased while we
-        // hold the raw pointer because we don't touch `cache` again until
-        // the call returns.
         let res = dsv4_flashmla_pack_compressor_rows(
             &self.ctx,
             comp_bf16_ptr_u64,
-            unsafe { &mut *pool_ref },
+            pool_base_ptr,
             start_row,
             end_row,
             sw_blocks,
@@ -3405,7 +3448,7 @@ impl DeepseekModel {
     fn dsv4_flashmla_sw_bootstrap_hook(
         &self,
         cache: &mut DeepseekAttentionRuntimeCache,
-        compress_ratio: usize,
+        _compress_ratio: usize,
         head_dim: usize,
     ) -> Result<()> {
         if cache.fp8_kv_sw_bootstrapped {
@@ -3421,12 +3464,10 @@ impl DeepseekModel {
             cache.fp8_kv_sw_bootstrapped = true;
             return Ok(());
         }
-        let max_compressed_keys = self
-            .config
-            .max_position_embeddings
-            .div_ceil(compress_ratio.max(1));
-        let (sw_blocks, comp_blocks) =
-            dsv4_flashmla_fp8_kv_pool_blocks(sliding_window, max_compressed_keys);
+        // Pool layout — read the uniform `(sw_blocks, comp_blocks)` stamped on
+        // the cache at `bind_fp8_kv_pool_view` (bounded by served max_seq_len).
+        let sw_blocks = cache.fp8_kv_sw_blocks;
+        let comp_blocks = cache.fp8_kv_comp_blocks;
 
         // Borrow split: lift the bf16 SW window's device pointer + length
         // out as a u64 + usize *before* we take a mutable borrow on the
@@ -3453,16 +3494,15 @@ impl DeepseekModel {
             expected_window_len
         );
 
-        // Reborrow mutably for pool + scratch fields (disjoint from the
-        // bf16 SW window pointer above).
-        let pool = ensure_dsv4_flashmla_fp8_kv_pool(&self.ctx, cache, sw_blocks, comp_blocks)?;
-        let pool_ref: *mut CudaSlice<u8> = pool;
+        // Resolve the bound base pointer of this cache's sub-range inside the
+        // shared pool (disjoint from the bf16 SW window pointer above).
+        let pool_base_ptr = dsv4_flashmla_fp8_kv_pool_base_ptr(cache, sw_blocks, comp_blocks)?;
         let mut bids = cache.fp8_kv_sw_bulk_bids.take();
         let mut rows = cache.fp8_kv_sw_bulk_rows.take();
         let res = dsv4_flashmla_bulk_pack_sw_ring_raw(
             &self.ctx,
             window_ptr_u64,
-            unsafe { &mut *pool_ref },
+            pool_base_ptr,
             sliding_window,
             head_dim,
             sw_blocks,
@@ -4347,44 +4387,38 @@ const DSV4_FLASHMLA_MODEL1_BLOCK_BYTES: usize =
 /// When the env knob is off this function is unreached and the field
 /// stays `None`, preserving legacy decode behaviour byte-for-byte.
 #[cfg(feature = "cuda")]
-fn ensure_dsv4_flashmla_fp8_kv_pool<'a>(
-    ctx: &DeviceContext,
-    cache: &'a mut DeepseekAttentionRuntimeCache,
+/// Resolve the bound device base pointer of this (slot, layer) cache's
+/// sub-range inside the shared FP8 KV pool, validating the binding covers the
+/// `(sw_blocks, comp_blocks)` the caller needs.
+///
+/// Phase D-4 (shared-pool): the pool is owned once by the decode context; the
+/// per-(slot, layer) cache's `fp8_kv_pool_ptr` is bound to its sub-range at the
+/// per-step binding site (`bind_fp8_kv_pool_view`). This helper no longer
+/// allocates — it only reads the bound view and asserts capacity, so the
+/// pack/decode call sites stay structurally identical to the owned-buffer era.
+#[cfg(feature = "cuda")]
+fn dsv4_flashmla_fp8_kv_pool_base_ptr(
+    cache: &DeepseekAttentionRuntimeCache,
     sw_blocks: usize,
     comp_blocks: usize,
-) -> Result<&'a mut CudaSlice<u8>> {
+) -> Result<u64> {
     let total_blocks = sw_blocks
         .checked_add(comp_blocks)
         .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool block count overflow"))?;
     let want_bytes = total_blocks
         .checked_mul(DSV4_FLASHMLA_MODEL1_BLOCK_BYTES)
         .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool byte size overflow"))?;
-    let need_grow = cache
-        .fp8_kv_pool
-        .as_ref()
-        .is_none_or(|buf| buf.len() < want_bytes)
-        || cache.fp8_kv_sw_blocks != sw_blocks
-        || cache.fp8_kv_comp_blocks != comp_blocks;
-    if need_grow {
-        cache.fp8_kv_pool = Some(
-            ctx.stream
-                .alloc_zeros_traced::<u8>(want_bytes)
-                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool alloc failed: {err}"))?,
-        );
-        cache.fp8_kv_pool_bytes = want_bytes;
-        cache.fp8_kv_sw_blocks = sw_blocks;
-        cache.fp8_kv_comp_blocks = comp_blocks;
-        cache.fp8_kv_page_block_size = DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE;
-        cache.fp8_kv_bytes_per_token = DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN;
-        // Pool was freshly (re)allocated → any prior SW bootstrap +
-        // compressor pack work is invalidated.
-        cache.fp8_kv_sw_bootstrapped = false;
-        cache.fp8_kv_comp_packed_rows = 0;
-    }
-    cache
-        .fp8_kv_pool
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA FP8 KV pool allocation missing"))
+    ensure!(
+        cache.fp8_kv_pool_ptr != 0,
+        "DSv4 FlashMLA FP8 KV pool sub-range not bound (call bind_fp8_kv_pool_view before the decode hooks)"
+    );
+    ensure!(
+        cache.fp8_kv_pool_view_bytes >= want_bytes,
+        "DSv4 FlashMLA FP8 KV pool bound view {} B < required {} B (sw_blocks={sw_blocks}, comp_blocks={comp_blocks})",
+        cache.fp8_kv_pool_view_bytes,
+        want_bytes
+    );
+    Ok(cache.fp8_kv_pool_ptr)
 }
 
 /// Compute the (sw_blocks, comp_blocks) sizing for the FlashMLA FP8 KV pool
@@ -4550,7 +4584,7 @@ fn ensure_fm_decode_arena(
 fn dsv4_flashmla_bulk_pack_sw_ring_raw(
     ctx: &DeviceContext,
     window_ptr_u64: u64,
-    fp8_pool: &mut CudaSlice<u8>,
+    fp8_pool_base_ptr: u64,
     sliding_window: usize,
     head_dim: usize,
     sw_blocks: usize,
@@ -4613,7 +4647,7 @@ fn dsv4_flashmla_bulk_pack_sw_ring_raw(
         .memcpy_htod(&rows, rows_dev)
         .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA SW rows H2D failed: {err}"))?;
 
-    let (pool_ptr, _pg) = fp8_pool.device_ptr_mut(&ctx.stream);
+    let pool_ptr = fp8_pool_base_ptr;
     let (bid_ptr, _bidg) = block_ids_dev.device_ptr(&ctx.stream);
     let (row_ptr, _rowg) = rows_dev.device_ptr(&ctx.stream);
 
@@ -4667,7 +4701,7 @@ const DSV4_HEAD_DIM_ROPE: usize = 64;
 fn dsv4_flashmla_pack_one_sw_token(
     ctx: &DeviceContext,
     k_prepared_ptr: u64,
-    fp8_pool: &mut CudaSlice<u8>,
+    fp8_pool_base_ptr: u64,
     ring_idx: usize,
     head_dim: usize,
     one_token_scratch: &mut Option<(CudaSlice<i32>, CudaSlice<i32>)>,
@@ -4697,7 +4731,7 @@ fn dsv4_flashmla_pack_one_sw_token(
         .memcpy_htod(&[row], row_dev)
         .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA one-token row H2D: {err}"))?;
 
-    let (pool_ptr, _pg) = fp8_pool.device_ptr_mut(&ctx.stream);
+    let pool_ptr = fp8_pool_base_ptr;
     let (bid_ptr, _bidg) = bid_dev.device_ptr(&ctx.stream);
     let (row_ptr, _rowg) = row_dev.device_ptr(&ctx.stream);
 
@@ -4738,7 +4772,7 @@ fn dsv4_flashmla_pack_one_sw_token(
 fn dsv4_flashmla_pack_compressor_rows(
     ctx: &DeviceContext,
     compressed_bf16_ptr: u64,
-    fp8_pool: &mut CudaSlice<u8>,
+    fp8_pool_base_ptr: u64,
     start_row: usize,
     end_row: usize,
     sw_blocks: usize,
@@ -4789,7 +4823,7 @@ fn dsv4_flashmla_pack_compressor_rows(
     let rope_ptr_u64 =
         nope_ptr_u64 + (DSV4_HEAD_DIM_NOPE as u64) * (std::mem::size_of::<bf16>() as u64);
 
-    let (pool_ptr, _pg) = fp8_pool.device_ptr_mut(&ctx.stream);
+    let pool_ptr = fp8_pool_base_ptr;
     let (bid_ptr, _bidg) = bid_dev.device_ptr(&ctx.stream);
     let (row_ptr, _rowg) = row_dev.device_ptr(&ctx.stream);
 
@@ -6217,7 +6251,7 @@ fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
 /// See `wins/2026-05-29-dsv4-gpu-native-coherent-output-pd-handoff.md` and
 /// `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md`.
 #[cfg(feature = "cuda")]
-fn dsv4_flashmla_decode_enabled() -> Result<bool> {
+pub(super) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_FLASHMLA_DECODE").ok() else {
         return Ok(true);
     };

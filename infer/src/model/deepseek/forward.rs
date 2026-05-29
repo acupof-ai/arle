@@ -16,7 +16,7 @@ use super::prefill::DeepseekPrefillContext;
 #[cfg(feature = "cuda")]
 use super::state::DeepseekState;
 #[cfg(feature = "cuda")]
-use super::weights::DeepseekModel;
+use super::weights::{DeepseekModel, dsv4_flashmla_decode_enabled};
 #[cfg(feature = "cuda")]
 use crate::model::generation_state::GenerationStateBase;
 #[cfg(feature = "cuda")]
@@ -72,10 +72,29 @@ impl ModelForward for DeepseekModel {
     fn create_decode_context(
         &self,
         max_batch_size: usize,
-        _max_seq_len: Option<usize>,
+        max_seq_len: Option<usize>,
         pool: &PagedKVPool,
     ) -> Result<Self::DecodeContext> {
-        DeepseekBatchDecodeBuffers::new(&self.ctx, max_batch_size, pool.max_total_pages)
+        let mut ctx =
+            DeepseekBatchDecodeBuffers::new(&self.ctx, max_batch_size, pool.max_total_pages)?;
+        // Phase D-4 (shared-pool): allocate the shared persistent FP8 KV pool
+        // once, sized for `num_slots × layers × slot_blocks`, when the FlashMLA
+        // decode env knob is on and the layer weights are loaded. This replaces
+        // the prior per-state lazy allocation (which OOMed at c≥8) and is
+        // accounted in the static budget via
+        // `scheduler_runtime_workspace_bytes`.
+        if dsv4_flashmla_decode_enabled()? && self.loaded_layer_count() > 0 {
+            let max_seq_len = max_seq_len.unwrap_or(self.config.max_position_embeddings);
+            let (sw_blocks, comp_blocks) = self.dsv4_flashmla_pool_slot_blocks(max_seq_len);
+            ctx.ensure_fp8_kv_pool(
+                &self.ctx,
+                max_batch_size,
+                self.layers.len(),
+                sw_blocks + comp_blocks,
+            )?;
+            ctx.set_fp8_kv_max_seq_len(max_seq_len);
+        }
+        Ok(ctx)
     }
 
     fn create_prefill_context(
@@ -146,7 +165,7 @@ impl ModelForward for DeepseekModel {
         states: &mut [Self::State],
         slot_indices: &[usize],
         _paged_kv_pool: Option<&mut PagedKVPool>,
-        _decode_ctx: &mut Self::DecodeContext,
+        decode_ctx: &mut Self::DecodeContext,
         _skip_logit_scatter: bool,
     ) -> Result<()> {
         ensure!(
@@ -158,6 +177,41 @@ impl ModelForward for DeepseekModel {
         if tokens.is_empty() {
             return Ok(());
         }
+
+        // Phase D-4 (shared-pool): bind every active (slot, layer) attention
+        // cache to its fixed sub-range in the shared FP8 KV pool BEFORE any
+        // decode hook runs. Single source of slot identity + decode context, so
+        // both the N≥2 batched path and the N==1 per-row fallback below read
+        // pre-bound views — no slot/ctx threading through the attention chain.
+        // No-op when the FlashMLA decode env knob is off (pool unallocated →
+        // `fp8_kv_max_seq_len()` is `None`).
+        if let Some(max_seq_len) = decode_ctx.fp8_kv_max_seq_len() {
+            let num_layers = self.loaded_layer_count();
+            for &slot_idx in slot_indices {
+                ensure!(
+                    slot_idx < states.len(),
+                    "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
+                    states.len()
+                );
+                let state = &mut states[slot_idx];
+                state.incremental.ensure_layers(num_layers);
+                for layer_idx in 0..num_layers {
+                    let layer_cache = state
+                        .incremental
+                        .layers
+                        .get_mut(layer_idx)
+                        .expect("incremental cache layer initialized");
+                    self.bind_fp8_kv_pool_view(
+                        decode_ctx,
+                        &mut layer_cache.attention,
+                        slot_idx,
+                        layer_idx,
+                        max_seq_len,
+                    )?;
+                }
+            }
+        }
+
         // TRUE batched decode: process all N decode tokens as ONE forward (the
         // routed-MoE FFN half + NCCL all-reduce amortize over the batch; the
         // per-sequence attention core still loops per row). Eligibility is
@@ -249,6 +303,29 @@ impl ModelForward for DeepseekModel {
 
     fn supports_prefill_warmup(&self) -> bool {
         false
+    }
+
+    fn scheduler_runtime_workspace_bytes(
+        &self,
+        budget: crate::model::SchedulerRuntimeWorkspaceBudget,
+    ) -> usize {
+        // Phase D-4 (shared-pool): reserve the shared FP8 KV pool in the static
+        // budget so the KV-pool sizing leaves headroom for it. Sized for
+        // `num_slots × layers × slot_blocks × 37376 B`, bounded by the served
+        // `max_seq_len` (not `max_position_embeddings`). Zero when the FlashMLA
+        // decode env knob is off or no layers are loaded.
+        if !dsv4_flashmla_decode_enabled().unwrap_or(false) || self.loaded_layer_count() == 0 {
+            return 0;
+        }
+        let max_seq_len = budget
+            .max_seq_len
+            .unwrap_or(self.config.max_position_embeddings);
+        let (sw_blocks, comp_blocks) = self.dsv4_flashmla_pool_slot_blocks(max_seq_len);
+        DeepseekBatchDecodeBuffers::fp8_kv_pool_bytes(
+            budget.max_batch_size,
+            self.loaded_layer_count(),
+            sw_blocks + comp_blocks,
+        )
     }
 }
 
