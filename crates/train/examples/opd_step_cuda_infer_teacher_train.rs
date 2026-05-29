@@ -228,6 +228,7 @@ mod app {
         let teacher_backend: Arc<dyn Backend> = cuda_backend.clone();
         let mut store = TensorStore::with_backend(cuda_backend.clone());
         let mut tape = Tape::new();
+        log_device_vram("00_after_backend_init", &cuda_backend);
 
         let student_load_started = Instant::now();
         let student = load_qwen35_lora_from_hf_dir(
@@ -240,6 +241,7 @@ mod app {
             &mut store,
         )?;
         let student_load_seconds = student_load_started.elapsed().as_secs_f64();
+        log_device_vram("01_after_train_student_base_load", &cuda_backend);
         let student_model_params = student.all_parameter_ids();
         let student_trainable_params = trainable_params(&student, &store);
         let student_host_evict_params = host_evict_param_ids(&student);
@@ -277,6 +279,7 @@ mod app {
                 args.student_model.display()
             );
             log_memory_summary("after_infer_student_load", &store);
+            log_device_vram("02_after_infer_student_load", &cuda_backend);
             Some(infer_student)
         } else {
             None
@@ -378,6 +381,7 @@ mod app {
             args.enable_cuda_graph,
         )?;
         let infer_load_seconds = infer_load_started.elapsed().as_secs_f64();
+        log_device_vram("03_after_teacher_infer_load", &cuda_backend);
         let infer_teacher = InferTeacher::new(
             Arc::new(Mutex::new(infer_engine)),
             teacher_backend,
@@ -755,6 +759,8 @@ mod app {
         ProfileFn: FnMut() -> RuntimeTeacherProfile,
         RouteFn: Fn(&[u32]) -> String,
     {
+        let vram_backend = cuda_backend.clone();
+        log_device_vram("04_before_optimizer_init", &vram_backend);
         let mut optimizer =
             AdamW::new_with_device(args.lr, (0.9, 0.999), 1.0e-8, 0.0, cuda_backend);
         println!(
@@ -808,6 +814,7 @@ mod app {
             let selected_teacher = route_teacher_id(prompt);
             let mut profile = OpdStepProfile::default();
             log_memory_summary("before_train_step", store);
+            log_device_vram(&format!("05_before_train_step_{step}"), &vram_backend);
             let infer_rollout = infer_student.map(|student| InferRolloutCtx {
                 student,
                 lora_config: LoraConfig {
@@ -841,6 +848,7 @@ mod app {
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();
             log_memory_summary("after_train_step", store);
+            log_device_vram(&format!("06_after_train_step_{step}"), &vram_backend);
             if let Some(max_step_seconds) = args.max_step_seconds {
                 if step == 1 && elapsed > max_step_seconds {
                     return Err(format!(
@@ -1359,6 +1367,24 @@ mod app {
                 .filter(|tensor| tensor.data.is_empty() && tensor.device_handle.is_some())
                 .count()
         );
+    }
+
+    /// Print device VRAM `(used, free, total)` MiB for the given phase label.
+    /// Used by the rollout-128 VRAM-fit attribution (free = total - free is
+    /// the cudarc `mem_get_info` semantics: it returns `(free, total)`).
+    fn log_device_vram(label: &str, backend: &CudaBackend) {
+        match backend.mem_get_info() {
+            Ok((free, total)) => {
+                let used = total.saturating_sub(free);
+                println!(
+                    "device_vram label={label} used_mib={} free_mib={} total_mib={}",
+                    used / (1024 * 1024),
+                    free / (1024 * 1024),
+                    total / (1024 * 1024)
+                );
+            }
+            Err(err) => println!("device_vram label={label} error={err:?}"),
+        }
     }
 
     fn evict_static_param_host_mirrors(
