@@ -98,3 +98,11 @@ SGLang and ARLE must bench SEQUENTIALLY, not concurrently.**
   the per-step staging copy (indices offset per-row into the persistent
   shared pool). This is the qwen3 PagedKVPool model for DSv4 decode and the
   real "搞定 gpu 路径" fix.
+
+- **I3a (2026-05-29)**: mem-fraction 0.6 does NOT fix c=8 — still
+  `FlashMLA FP8 KV pool alloc OOM` (batch_width=7). The per-sequence FP8
+  pools are allocated DYNAMICALLY at first-decode and are unbudgeted by
+  mem-fraction-static → N concurrent pools OOM regardless of static %.
+  c=4 still fine (parity PASS). Conclusion: the shared persistent pool is
+  REQUIRED (not a perf nicety) — it's the only way c≥8 fits. Dispatching
+  the shared-pool implementation. Step-1 mem-fraction shortcut KILLED.
