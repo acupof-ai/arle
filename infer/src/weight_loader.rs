@@ -934,12 +934,25 @@ pub(crate) fn load_tensor_2d_maybe_quantized_with_config(
     }
 
     if config.marlin_w4a8 {
+        let packed_name = name.replace(".weight", ".marlin_w4a8_qweight");
+        // Per-tensor fallback to dense: a W4A8 checkpoint may quantize only the
+        // shape-qualifying linears (full-attn + MLP, and any linear-attn proj
+        // matrices with out%256==0 / in%128==0) while leaving narrow projections
+        // (e.g. Qwen3.5 linear_attn.in_proj_a/b with out_features=32), conv1d,
+        // and norms dense. Those dense tensors route through this same loader,
+        // so fall through to the plain bf16 path when their W4A8 sibling is
+        // absent instead of hard-erroring on a missing side tensor. Probe the
+        // shards via `find_tensor`, NOT `weight_map` — `load_shard_info` returns
+        // an empty weight_map for single-file (no-index) checkpoints, so a
+        // contains_key check would falsely drop every quantized tensor to dense.
+        if find_tensor(shards, weight_map, &packed_name).is_err() {
+            return load_tensor_2d(ctx, shards, weight_map, name);
+        }
         anyhow::ensure!(
             config.group_size.unwrap_or(128) == 128,
             "{name}: MarlinW4A8 currently supports group_size=128 only, got {:?}",
             config.group_size
         );
-        let packed_name = name.replace(".weight", ".marlin_w4a8_qweight");
         let channel_scales_name = name.replace(".weight", ".marlin_w4a8_s_channel");
         let group_scales_name = name.replace(".weight", ".marlin_w4a8_s_group");
         let packed_tensor = find_tensor(shards, weight_map, &packed_name)
