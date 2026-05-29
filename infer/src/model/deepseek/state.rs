@@ -1042,17 +1042,10 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     //                                                (packed on
     //                                                 compressor update)
     //
-    // Phase D-4 (shared-pool): the pool is no longer owned per (slot, layer).
-    // It lives once in the scheduler-owned `DeepseekBatchDecodeBuffers` decode
-    // context, sized `num_slots × layers × slot_blocks × 37376 B` and accounted
-    // in the static budget. This cache holds only the *bound view* of its
-    // (slot, layer) sub-range: the device base pointer + byte length, refreshed
-    // at the per-step binding site. `fp8_kv_pool_ptr == 0` means unbound (env
-    // knob off, or not yet bound this session). The per-row pack/decode logic is
-    // byte-identical to the old owned-buffer path — only the base pointer moves
-    // from an owned buffer's byte 0 to the slot's sub-range start.
-    pub(crate) fp8_kv_pool_ptr: u64,
-    pub(crate) fp8_kv_pool_view_bytes: usize,
+    // Freed alongside the bf16 buffers at session end (drop-on-reset
+    // pattern via `Option::take`).
+    pub(crate) fp8_kv_pool: Option<CudaSlice<u8>>,
+    pub(crate) fp8_kv_pool_bytes: usize,
     pub(crate) fp8_kv_sw_blocks: usize,
     pub(crate) fp8_kv_comp_blocks: usize,
     pub(crate) fp8_kv_page_block_size: usize,
