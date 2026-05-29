@@ -152,6 +152,8 @@ fn run_tiny_windowed_gkd_step() -> (f32, usize) {
             logits_window_size: Some(2),
             kl_mask: OpdKlMask::Full,
         },
+        #[cfg(feature = "cuda")]
+        None,
         Some(&mut profile),
     )
     .expect("windowed GKD OPD step runs");
@@ -421,6 +423,8 @@ fn opd_step_error_after_rollout_cleans_tape_and_temporaries() {
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         },
+        #[cfg(feature = "cuda")]
+        None,
         None,
     )
     .expect_err("teacher scoring should fail after student rollout grows past rope cache");
@@ -790,6 +794,8 @@ fn opd_step_rejects_short_rope_cache_with_actionable_error() {
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         },
+        #[cfg(feature = "cuda")]
+        None,
         None,
     )
     .expect_err("rope cache shorter than prompt must fail with OPD context");
