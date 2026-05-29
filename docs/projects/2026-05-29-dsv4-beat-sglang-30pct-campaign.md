@@ -126,3 +126,12 @@ SGLang and ARLE must bench SEQUENTIALLY, not concurrently.**
   design (FlashMLA is SM90-only: WGMMA + __nv_fp8_e8m0), so all-Flash =
   Hopper-only DSv4, which is acceptable. Supersedes the earlier "keep legacy
   for V100/A100" judgment. Legacy deletion is a separate validated tranche.
+
+- **I3-v2 (2026-05-29) — SHARED POOL VALIDATED**: env-gated shared FP8
+  decode KV pool (687158a1, ARLE_DSV4_SHARED_KV_POOL, default OFF==main).
+  Pod ON-path (8×H20 TP=8, mem-fraction 0.6, validator smoke shape):
+  c=1 `137+269=406`, c=4 byte-identical (PARITY PASS), **c=8 errs=0,
+  18.42 tok/s aggregate — NO MORE OOM** (was FlashMLA FP8 pool alloc OOM).
+  The per-state→shared pool change unblocks concurrency: c≥8 now serves.
+  Per-request at c=8 still ~2.3 tok/s (attention per-row) → batched
+  attention (branch 7bfb9084) is the next lever for flat step time.
