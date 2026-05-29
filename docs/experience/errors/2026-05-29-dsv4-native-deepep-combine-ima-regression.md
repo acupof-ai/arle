@@ -52,14 +52,24 @@ kernel → IMA. Consistent with the DeepEP combine API hazards in
 [[feedback_deepep_combine_uses_recv_channel_prefix]].
 
 **Suspect commits** (touch native-deepep / deepep-sys / mlp.rs dispatch+combine
-since `04938e85`), ranked:
-1. `67ac6400` feat(cuda): B-3.3.5 wire DeepGEMM grouped expert dispatch into
-   native-deepep — **top suspect**; changed the dispatch output layout the
-   combine consumes.
-2. `07305fe9` / `7ea63e83` / `b5f20f12` — A3 phase 1 "skip counts D2H + host
-   scan on decode hot path" (and its bug-fix + default-OFF). Changed how
-   route counts/offsets (→ recv_channel_prefix) are computed.
-3. `ac1f0ccc` fp8 grouped GEMM kernels; `5bd83267` DispatchPolicy knob refactor.
+since `04938e85`):
+- `67ac6400` B-3.3.5 DeepGEMM grouped expert dispatch — **LIKELY EXONERATED**:
+  its FFN change is gated on `use_deepgemm_experts` (we run
+  `ARLE_DSV4_EXPERT_BACKEND=native`, so that branch never executes); the only
+  always-on change is `scratch.expert_out.seq_len = num_recv` (mlp.rs:117 of the
+  diff), and it does NOT touch the combine's recv_channel_prefix / send_head /
+  num_recv dataflow. Verify, but deprioritize.
+- `07305fe9` / `7ea63e83` / `b5f20f12` — A3 phase 1 "skip counts D2H + host scan"
+  (+ bug-fix + default-OFF). Changed route counts/offsets (→ recv_channel_prefix).
+  A3 is **default OFF** (b5f20f12), so only the culprit if the OFF path didn't
+  fully revert. Check `dsv4_a3_phase1_enabled()` gating around the
+  count/offset/recv_channel_prefix computation.
+- `ac1f0ccc` fp8 grouped GEMM; `5bd83267` DispatchPolicy knob refactor;
+  plus anything in the big `87089f2d` dispatch-governance merge.
+
+Because all named suspects are either deepgemm-gated or A3-default-OFF, pure
+code-reading did NOT pinpoint it — **compute-sanitizer (exact OOB address +
+kernel) or a proper git-bisect is the decisive next tool**, not more grepping.
 
 ## Next (focused debug — a fresh effort, not tail-of-session)
 
