@@ -1888,14 +1888,21 @@ impl DeepseekModel {
             token_count
         );
         let rope_params = &self.config.rope_parameters;
-        let (rope_base, original_seq_len) = if compress_ratio > 0 {
-            (
-                self.config.compress_rope_theta,
-                rope_params.original_max_position_embeddings,
-            )
-        } else {
-            (self.config.rope_theta, 0)
-        };
+        // RoPE for Q and the sliding-window K — and the legacy hybrid kernel's
+        // output inverse-rope, which reads the same `rope_base` below — is
+        // ALWAYS the main `rope_theta` with NO YaRN, for every layer regardless
+        // of `compress_ratio`. This matches the CPU reference ground truth
+        // (`reference.rs`: `rope_cos` = `build_rope_cache(.., rope_theta)`, no
+        // YaRN, applied UNIFORMLY to Q and `kv_sw`; only the COMPRESSED keys use
+        // `compress_rope_theta`, built in `update_compressor_gpu_cache`) and the
+        // validated pure-SWA path (`forward_swa_attention_gpu`, line ~1347).
+        // The previous `compress_ratio > 0 → (compress_rope_theta, YaRN)` branch
+        // mis-rotated Q and SW-K in every compressed layer, which left output
+        // coherent only while the whole sequence fit in the sliding window
+        // (≤128 tokens) and silently collapsed attention the moment compressed /
+        // long-range keys joined the softmax (seq > sliding_window). See
+        // docs/experience/errors/2026-05-29-dsv4-longctx-rope-conflation.md.
+        let (rope_base, original_seq_len) = (self.config.rope_theta, 0_usize);
         let trace = dsv4_trace_begin(&self.ctx)?;
         let reuse_decode_scratch = token_count == 1;
         let mut q_prepared_scratch = if reuse_decode_scratch {
@@ -3255,11 +3262,22 @@ impl DeepseekModel {
             cache.compressed_capacity
         );
         let rope_params = &self.config.rope_parameters;
+        // Compressed-key RoPE uses `compress_rope_theta` (correct — only the
+        // compressed keys do) with NO YaRN: the CPU reference builds the
+        // compressed rope via `build_rope_cache(.., compress_rope_theta)`
+        // (reference.rs:162) which is plain RoPE with no YaRN correction ramp,
+        // exactly like the main rope. Passing `original_seq_len = 0` keeps the
+        // GPU kernel on the plain-RoPE path (yarn_correction gates on
+        // `original_seq_len > 0`). The prior `original_max_position_embeddings`
+        // turned on a YaRN ramp the reference never applies — a parity
+        // divergence on the compressed keys. Paired with the Q/SW-K rope fix in
+        // `finish_attention_gpu` so all of Q / SW-K / compressed-K / output rope
+        // match the reference for SWA, CSA and HCA layers alike.
         let (rope_dim, rope_base, original_seq_len) = if apply_rope {
             (
                 self.config.qk_rope_head_dim,
                 self.config.compress_rope_theta,
-                rope_params.original_max_position_embeddings,
+                0,
             )
         } else {
             (0, self.config.compress_rope_theta, 0)
