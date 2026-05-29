@@ -251,6 +251,26 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // GAP-A CUTLASS-MMA path for FP8E4M3 batched GEMV (decode shape B <= 16).
+    // Mirrors `dsv4_fp8_gemv_batch_cuda` arg order/types. Self-gates on
+    // N%8 / K%16 and returns a non-success CUresult for shapes it can't tile
+    // (caller falls back to the scalar kernel). The runtime dispatch shim
+    // lives in `quantized_gemv.cu::dsv4_fp8_gemv_batch_cuda` behind the
+    // `ARLE_DSV4_FP8_GEMV_MMA` env knob; this decl exists so the parity test
+    // (and any future direct caller) can invoke the MMA launch explicitly.
+    pub fn dsv4_fp8_gemv_batch_mma_launch(
+        weight: *const u8,
+        scales: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        scale_rows: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_fp4_gemv_batch_cuda(
         weight: *const u8,
         scales: *const u8,

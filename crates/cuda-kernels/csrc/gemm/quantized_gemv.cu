@@ -11,6 +11,35 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
+// GAP-A CUTLASS-MMA GEMV (defined in quantized_gemv_mma.cu). Gated behind
+// the ARLE_DSV4_FP8_GEMV_MMA env knob inside dsv4_fp8_gemv_batch_cuda for
+// decode-shape batches (B <= 16) on FP8E4M3 weights. Returns
+// cudaErrorInvalidValue for shapes it can't tile (N%8 / K%16); the caller
+// then falls through to the scalar path.
+extern "C" cudaError_t dsv4_fp8_gemv_batch_mma_launch(
+    const uint8_t* weight,
+    const uint8_t* scales,
+    const __nv_bfloat16* input,
+    __nv_bfloat16* output,
+    int B,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    cudaStream_t stream);
+
+// Parse ARLE_DSV4_FP8_GEMV_MMA once: "1" / "true" (case-insensitive) → on.
+static bool dsv4_fp8_gemv_mma_enabled() {
+    static const bool enabled = []() -> bool {
+        const char* v = std::getenv("ARLE_DSV4_FP8_GEMV_MMA");
+        if (v == nullptr) return false;
+        return std::strcmp(v, "1") == 0 || std::strcasecmp(v, "true") == 0;
+    }();
+    return enabled;
+}
 
 #define WARP_SIZE 32
 #define GEMV_THREADS 256
@@ -2596,6 +2625,22 @@ cudaError_t dsv4_fp8_gemv_batch_cuda(
 {
     if (B <= 0 || N <= 0 || K <= 0 || scale_rows <= 0 || scale_cols <= 0) {
         return cudaErrorInvalidValue;
+    }
+    // GAP-A MMA dispatch gate: env knob on + decode-shape batch (B <= 16).
+    // This function is the FP8E4M3 path by contract, so the "weight is
+    // fp8e4m3" precondition holds. The MMA launch self-gates on N%8 / K%16
+    // and returns cudaErrorInvalidValue for shapes it can't tile; treat that
+    // as a fall-through signal to the scalar kernels below.
+    // B <= 16 mirrors the MMA kernel's MMA_BLOCK_M tile depth.
+    if (dsv4_fp8_gemv_mma_enabled() && B <= 16) {
+        cudaError_t mma_err = dsv4_fp8_gemv_batch_mma_launch(
+            weight, scales, input, output, B, N, K, scale_rows, scale_cols, stream);
+        if (mma_err != cudaErrorInvalidValue) {
+            return mma_err;
+        }
+        // Reset the sticky error from the rejected launch before falling
+        // through to the scalar path.
+        cudaGetLastError();
     }
     if (B > 1) {
         dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, (B + DSV4_BATCH_TILE - 1) / DSV4_BATCH_TILE);
