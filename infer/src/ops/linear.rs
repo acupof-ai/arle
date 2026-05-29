@@ -154,11 +154,7 @@ impl LinearKernelPlan {
         // See docs/research/2026-05-09-eod106-r4-6-bench-preliminary-solid-gap.md.
         if batch > 1
             && marlin_prefill_aligned(weight).is_ok()
-            && !(batch <= 8
-                && std::env::var("INFER_R4_W4A16_GEMV_OVERRIDE")
-                    .as_deref()
-                    .ok()
-                    == Some("1"))
+            && !(batch <= 8 && crate::dispatch_policy::dispatch_policy().r4_w4a16_gemv_override)
         {
             return Self::MarlinW4Gemm;
         }
@@ -288,10 +284,7 @@ fn turboquant_params(weight: &DeviceMatrix) -> (i32, i32, i32, i32, i32, i32) {
 }
 
 fn hybrid_w4a8_prefill_enabled() -> bool {
-    matches!(
-        std::env::var("INFER_HYBRID_W4A8_PREFILL").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    crate::dispatch_policy::dispatch_policy().hybrid_w4a8_prefill
 }
 
 /// PF8.4 — opt-in for prefill-only W4+FP8 marlin GEMM dispatch.
@@ -299,17 +292,11 @@ fn hybrid_w4a8_prefill_enabled() -> bool {
 /// Decode path stays W4+INT8 unchanged (FP8 mma doesn't help HBM-bound
 /// decode per Phase 0 P0.A architectural KILL synthesis).
 fn marlin_w4_fp8_prefill_enabled() -> bool {
-    matches!(
-        std::env::var("INFER_MARLIN_W4_FP8_PREFILL").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    crate::dispatch_policy::dispatch_policy().marlin_w4_fp8_prefill
 }
 
 fn marlin_w4a8_autoconfig_enabled() -> bool {
-    matches!(
-        std::env::var("INFER_MARLIN_W4A8_AUTOCONFIG").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    crate::dispatch_policy::dispatch_policy().marlin_w4a8_autoconfig
 }
 
 fn marlin_w4a8_thread_config(rows: usize) -> (i32, i32) {
@@ -2223,13 +2210,7 @@ fn run_bf16_linear(
 }
 
 fn deterministic_gemm_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("INFER_DETERMINISTIC").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        )
-    })
+    crate::dispatch_policy::dispatch_policy().deterministic_gemm
 }
 
 fn run_bf16_graphsafe_per_row(
