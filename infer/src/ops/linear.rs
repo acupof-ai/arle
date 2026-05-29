@@ -677,6 +677,11 @@ pub(crate) fn gemv_with_marlin_scratch(
     );
 
     let plan = linear_decode_plan(weight);
+    // Observe gate (governance Phase 1): record which kernel ACTUALLY fired —
+    // a single lock-free Relaxed fetch_add indexed by metric_index(). Counting
+    // here (the launch site), not in plan(), captures the dispatch fact, not the
+    // selection. Additive: changes no kernel launched below.
+    crate::oplib::linear::record_linear_kernel(plan);
     if plan == LinearKernel::Bf16Gemv {
         let (weight_ptr, _ga) = weight.data.device_ptr(&ctx.stream);
         let (input_ptr, _gx) = input.data.device_ptr(&ctx.stream);
@@ -2247,6 +2252,11 @@ pub(crate) fn try_gemm_with_phase_and_scratch_into(
     );
 
     let plan = linear_batched_plan(weight, x.seq_len, phase);
+    // Observe gate (governance Phase 1): record which kernel ACTUALLY fired —
+    // a single lock-free Relaxed fetch_add indexed by metric_index(). Counting
+    // here (the launch site), not in plan(), captures the dispatch fact, not the
+    // selection. Additive: changes no kernel launched in the match below.
+    crate::oplib::linear::record_linear_kernel(plan);
     match plan {
         LinearKernel::MarlinW4Gemm => {
             if let Some(scratch) = marlin_scratch {
