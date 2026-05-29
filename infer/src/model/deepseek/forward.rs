@@ -158,6 +158,15 @@ impl ModelForward for DeepseekModel {
         if tokens.is_empty() {
             return Ok(());
         }
+        // TRUE batched decode: process all N decode tokens as ONE forward (the
+        // routed-MoE FFN half + NCCL all-reduce amortize over the batch; the
+        // per-sequence attention core still loops per row). Eligibility is
+        // gated by `try_decode_batch`; on any unsupported config it returns
+        // `false` and we fall through to the per-row loop, which stays the
+        // correctness reference + fallback and is NEVER deleted.
+        if self.try_decode_batch(tokens, states, slot_indices)? {
+            return Ok(());
+        }
         for (&token, &slot_idx) in tokens.iter().zip(slot_indices) {
             ensure!(
                 slot_idx < states.len(),
