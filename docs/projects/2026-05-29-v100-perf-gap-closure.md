@@ -203,22 +203,101 @@ prefill gap).
 during a 128-token request. If bandwidth + occupancy are both >70%
 of peak → kill. Otherwise land the re-tune.
 
-## Execution order (revised after Phase 1 + Phase 2 kills)
+## Phase 3 — H3 attempt + nsys substrate bug (2026-05-29 EOD)
 
-After two cheap kills (split heuristic + graph capture), revised
-queue:
+Attempted the H3 cheap experiment: `nsys profile` against `infer
+--kv-cache-dtype int4` during one guidellm 128/128 c=1 request.
 
-1. **H3** (ncu of one GEMV) — `low cost, decides H4 + H5`. V100 has
-   ncu in `/usr/bin/ncu`. One profiler run on a representative GEMV
-   yields `gld_efficiency` and `sm__throughput.active` for the
-   weight-bandwidth question. **Do this next.**
-2. **H1 unblock** (generate or download Marlin Qwen3.5-4B checkpoint)
-   — parallel side-quest; once a Marlin variant exists, the actual
-   H1 experiment is one `--quant-format marlin_w4a8` flag flip.
-3. **H5** (TileLang prefill re-tune) — only after H3 confirms prefill
-   kernel is below 70% peak BW + occupancy.
-4. **H4** (FlashInfer-style decode rewrite) — only if H1 + H3 + H5
-   leave a >20% residual gap. Most expensive lever, save for last.
+The capture itself worked (`trace.qdstrm`, 12 MB), but **no nsys tool
+on the V100 box could finish post-processing it:**
+- `/usr/bin/nsys` is 2022.4.2.1, which the 2023-format `qdstrm`
+  rejects: `"Qdstrm version 2023.4.4 not supported"`.
+- `/usr/local/cuda-12.4/nsight-systems-2023.4.4/...` finalises
+  partway then errors with `"Wrong event order has been detected
+  when adding events to the collection"` — a known nsys-2023 import
+  bug on traces produced under its own profiler.
+- `nsys export --type sqlite` rejects `.qdstrm` directly; needs
+  finalisation first.
+
+So the trace exists at `/tmp/nsys2/trace.qdstrm` on V100 but cannot
+currently be converted to a readable form on this box without
+either an nsys 2023 patch or a fresh install of a matched 2024+
+toolchain (the host's `/usr/lib/nsight-systems/...` 2022 importer
+explicitly refuses the 2023 capture format). Documented for the
+next session: re-run with `/usr/bin/nsys profile` (forcing the
+2022 capture) and use `/usr/lib/nsight-systems/host-linux-x64/
+QdstrmImporter` to import — or upgrade nsys on this box to a
+version consistent across capture + importer.
+
+**Without the kernel breakdown the H3 verdict is deferred**, but
+the bandwidth-analysis anchor from the §Why section still stands:
+ITL is ~65% of theoretical peak BW at 4B-class on V100; gap to
+89% peak is mostly GEMV efficiency. H3 evidence would confirm or
+refute that more precisely; until then, the H1 (Marlin W4 weights)
+lever stays the highest-ranked open hypothesis.
+
+## H1 unblock — also blocked on substrate (2026-05-29 EOD)
+
+H1's cheap license-experiment is `--kv-cache-dtype int4
+--quant-format marlin_w4a8` against a pre-quantized Qwen3.5-4B
+checkpoint. Three independent V100-substrate blockers:
+
+1. **No Marlin/AWQ/GPTQ Qwen3.5-4B cached on this box.** Only the
+   BF16 9.3 GB original is at
+   `~/.cache/modelscope/.../Qwen/Qwen3.5-4B`. Searched
+   `~/.cache --iname '*Qwen3.5*W4*|*AWQ*|*GPTQ*'`, found nothing.
+2. **HF hub query is broken in this venv.** `huggingface_hub`'s
+   `list_models()` triggers the same `httpx.InvalidURL: Invalid
+   port ':'` mounts-dict parse bug we hit on guidellm; `env -i`
+   fixes that path for guidellm but breaks for HF API because the
+   API needs the corp proxy to reach `huggingface.co`. Mutually
+   exclusive constraints.
+3. **AutoAWQ install path requires pip + network through the
+   broken httpx/proxy stack.** Same blocker.
+
+Unblocking H1 needs ONE of:
+- A clean fresh Python venv with consistent torch+cu121 + a working
+  httpx (≥0.27) where the proxy URL parses correctly. Pre-existing
+  scripts `scripts/{vllm_serve_control.sh, bench_sglang_longctx.sh}`
+  hint at the pattern but don't currently build their own venvs.
+- A pre-quantized Qwen3.5-4B AWQ/GPTQ/Marlin variant pushed to the
+  box out-of-band (rsync from a working machine).
+- A Marlin quantization run against the BF16 baseline using
+  `llmcompressor` or `auto-awq`, on a machine that has both Internet
+  + the AWQ tooling.
+
+## Execution order (revised after Phases 1-3, all V100-substrate-blocked)
+
+After three kills + two substrate blockers, the queue is now bimodal —
+V100 is exhausted of cheap evidence-bearing experiments at this
+session's tool state, and the user's decision was "**Both — V100
+cheapest levers first, then sm_80+**". The cheapest V100 levers
+are done; remaining V100 work is structural (H4 / H5 each ~1 week
+of kernel surgery) or substrate-unblock (H1 + H3 need new tooling).
+
+**Pivoting to sm_80+** is now the higher-throughput path:
+
+1. **sm_80+ guidellm baseline** — re-run the Step 1 sweep on A100 /
+   L4 hardware (Qwen3.5-4B, 128/128 c=1/4/8 against the same `infer`
+   binary). TileLang AOT prefill `kTargetBlocksPerSm=32` was tuned
+   on L4 sm_89; sm_80+ ITL is where ARLE structurally wins per
+   [`wins/2026-05-08-prefill-cap-8-multi-shape-safe-default-flip.md`](../experience/wins/2026-05-08-prefill-cap-8-multi-shape-safe-default-flip.md)
+   and the Qwen3.6-MoE / Qwen3.5-7B sm_89 wins from April-May 2026.
+2. **sm_80+ industry comparison** — re-run with vLLM/SGLang on the
+   same A100/L4 box; the cross-runtime delta should be where the
+   *actual* wins-over-industry numbers come from.
+
+V100 lanes remaining as deferred:
+
+3. **H1 unblock + run** — generate a Marlin Qwen3.5-4B variant on a
+   working venv (any sm_80+ machine), rsync to V100, flip
+   `--quant-format marlin_w4a8`, re-bench. Single biggest expected
+   V100 ITL win.
+4. **H3 redo** — install consistent nsys 2024.3+ on V100 (or fall
+   back to ncu's metric-mode for `gld_efficiency` on one GEMV).
+   Yields the bandwidth verdict for H4 and H5.
+5. **H4 / H5** — only if H1 + H3 leave a >20% V100 residual gap, AND
+   the sm_80+ work has stabilised. ~1 week each.
 
 Removed from queue: H2 (killed 2026-05-29).
 
