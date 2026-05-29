@@ -360,7 +360,7 @@ impl MetalDflashRuntime {
             Ok(rt) => Ok(Some(rt)),
             Err(LoadError::Compat(reason)) => {
                 log::warn!(
-                    "DFlash disabled: {reason}. Falling back to standard Metal path. (draft='{}')",
+                    "dispatch_fallback: DFlash disabled: {reason}. Falling back to standard Metal path. (draft='{}')",
                     options.draft_model
                 );
                 Ok(None)

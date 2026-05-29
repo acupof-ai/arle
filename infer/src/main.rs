@@ -1756,6 +1756,10 @@ async fn async_main(args: Args) {
                 let can_retry = candidate_idx + 1 < kv_candidates.len()
                     && err_chain.contains("requested scheduler envelope needs at least");
                 if can_retry {
+                    let (_, next_format, next_label) = kv_candidates[candidate_idx + 1];
+                    log::warn!(
+                        "dispatch_fallback: KV pool format {kv_pool_format:?} ({kv_mode_label}) failed the scheduler envelope check, retrying with denser {next_format:?} ({next_label}); reason: {err_chain}"
+                    );
                     info!(
                         "KV auto fallback: {} failed to satisfy the requested envelope ({}); retrying denser layout",
                         kv_mode_label, err_chain
