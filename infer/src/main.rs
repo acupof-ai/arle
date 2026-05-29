@@ -503,7 +503,10 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                         // broadcast_i32 collective. Group is the worker's
                         // own model.ep_nccl, exposed via SchedulerHandle::
                         // ep_nccl (populated by spawn_scheduler_handle_
-                        // from_path in C.4.6.2).
+                        // from_path in C.4.6.2). Only available under
+                        // --features nccl; non-NCCL worker builds fall back
+                        // to in-process coordination automatically.
+                        #[cfg(feature = "nccl")]
                         if let Some(nccl) = handle.ep_nccl() {
                             match infer::scheduler::DistributedRequestCoordination::new_nccl(
                                 rank, world_size, nccl,
@@ -516,6 +519,8 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        #[cfg(not(feature = "nccl"))]
+                        let _ = (rank, world_size); // referenced only under nccl
                         match handle.reserve_submission() {
                             Ok(permit) => {
                                 if permit.submit(req).is_err() {
