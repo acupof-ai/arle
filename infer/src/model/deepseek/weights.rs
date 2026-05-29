@@ -5883,17 +5883,23 @@ fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
 }
 
 /// Phase D-4 — FlashMLA sparse-FP8 decode dispatch gate
-/// (`ARLE_DSV4_FLASHMLA_DECODE`). Defaults to **OFF** until pod parity
-/// validates the FP8 KV pack + dispatch end-to-end vs the legacy
-/// `dsv4_hybrid_attention_cuda` kernel. The runtime path only allocates
-/// the FP8 pool, packs on update, and dispatches the FlashMLA decode when
-/// this returns true.
+/// (`ARLE_DSV4_FLASHMLA_DECODE`). Defaults to **ON** (industry-standard
+/// per SGLang DSv4 day-0). Pod parity validated 2026-05-29 on 8×H20 TP=8:
+/// FlashMLA decode vs the legacy `dsv4_hybrid_attention_cuda` kernel
+/// produced **byte-identical greedy output across two shapes** (the
+/// 137+269 smoke + a 128-token "ocean paragraph" generation), with
+/// neutral-to-positive decode throughput. The SM90 gate (sm_major==9,
+/// head_dim ∈ {512,576}, token_count==1, cache present) means non-SM90 /
+/// out-of-envelope steps still fall back to legacy automatically.
+/// Override with `ARLE_DSV4_FLASHMLA_DECODE=0` for A/B or to isolate a
+/// FlashMLA-induced regression.
 ///
-/// Plan: `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md`.
+/// See `wins/2026-05-29-dsv4-gpu-native-coherent-output-pd-handoff.md` and
+/// `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md`.
 #[cfg(feature = "cuda")]
 fn dsv4_flashmla_decode_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_FLASHMLA_DECODE").ok() else {
-        return Ok(false);
+        return Ok(true);
     };
     match raw.as_str() {
         "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
