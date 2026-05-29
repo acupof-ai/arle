@@ -154,6 +154,72 @@ impl DeepseekModel {
         );
         Ok(())
     }
+
+    /// Eligibility-gated TRUE batched decode entry. Returns `Ok(true)` if the
+    /// batch was processed (logits scattered into each row's `decode_logits`,
+    /// KV seq-len advanced), `Ok(false)` if the config is not batch-eligible and
+    /// the caller must fall back to the per-row loop.
+    ///
+    /// Eligible iff: GPU-native incremental path (no CPU reference model),
+    /// `ARLE_DSV4_INCREMENTAL_KV` on, layer/head/lm_head weights loaded, and
+    /// N ≥ 2 (N == 1 is already optimal via the validated per-row path). Every
+    /// batched op is row-independent or a sum-reduce, and the attention core is
+    /// the unchanged per-row path, so greedy output is byte-identical to the
+    /// per-row loop (the correctness gate — see
+    /// `compute_top_level_logits_incremental_batch`).
+    pub(super) fn try_decode_batch(
+        &self,
+        tokens: &[u32],
+        states: &mut [super::state::DeepseekState],
+        slot_indices: &[usize],
+    ) -> Result<bool> {
+        // N == 1: per-row path is already optimal and the only validated
+        // single-sequence path. Don't route through the batch machinery.
+        if tokens.len() < 2 {
+            return Ok(false);
+        }
+        // CPU reference model active → batch method does not replicate it.
+        if self.reference.is_some() {
+            return Ok(false);
+        }
+        // Only the GPU-native incremental KV path is batched.
+        if !dsv4_incremental_kv_enabled()? {
+            return Ok(false);
+        }
+        // Required weights for the GPU-native forward.
+        if self.embed_tokens.is_none()
+            || self.head_hc.is_none()
+            || self.norm.is_none()
+            || self.lm_head.is_none()
+            || self.layers.is_empty()
+        {
+            return Ok(false);
+        }
+        self.validate_phase0_sw_decode_scope()?;
+        for &token in tokens {
+            ensure!(
+                (token as usize) < self.config.vocab_size,
+                "DeepSeek V4 token id {token} exceeds vocab_size {}",
+                self.config.vocab_size
+            );
+        }
+
+        let logits =
+            self.compute_top_level_logits_incremental_batch(tokens, states, slot_indices)?;
+        ensure!(
+            logits.len() == slot_indices.len(),
+            "DSv4 batched decode produced {} logits for {} rows",
+            logits.len(),
+            slot_indices.len()
+        );
+        for (logit, &slot_idx) in logits.into_iter().zip(slot_indices) {
+            let state = &mut states[slot_idx];
+            state.decode_logits = logit;
+            state.base.prefill_logits = None;
+            state.base.kv_cache.advance_seq_len(1);
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -581,6 +647,195 @@ impl DeepseekModel {
         Ok(Some(logits.with_label("dsv4_incremental_top_level_logits")))
     }
 
+    /// TRUE batched incremental decode for N concurrent single-token sequences.
+    ///
+    /// Each `(token, state)` pair is one decode step at the state's own
+    /// `start_pos`, with its own per-layer KV caches (SW ring / compressed /
+    /// FP8 pool / FlashMLA decode arena). Those caches are **per-sequence**
+    /// (`DeepseekState.incremental.layers[l].attention`), so the **attention
+    /// core stays per-row** — it is run in a loop, one sequence at a time,
+    /// byte-identical to the per-row decode loop. What batches over the N rows:
+    ///
+    ///   - token embeddings + the initial HC stream expand,
+    ///   - the **routed-MoE FFN half** (MHC(ffn), hc_pre, RMSNorm, expert
+    ///     route + GEMMs, **NCCL all-reduce over `[N, hidden]`**, shared expert,
+    ///     hc_post) issued ONCE per layer instead of N times,
+    ///   - the head HC + lm_head logits (one `[N, vocab]` GEMM).
+    ///
+    /// The serial per-step all-reduce (~21 ms/step × 43 layers, the dominant
+    /// concurrency cost — see
+    /// `docs/projects/2026-05-29-dsv4-beat-sglang-30pct-campaign.md` I1) is the
+    /// lever: doing it once over the batch instead of N times amortizes it.
+    ///
+    /// Correctness: every batched op is row-independent (embed / MHC / norm /
+    /// GEMM) or a sum-reduce (all-reduce) whose result is identical whether
+    /// issued per-row or over the stacked batch, and the attention core is the
+    /// unchanged per-row path. Greedy output is therefore byte-identical to the
+    /// per-row loop. Returns one `[1, vocab]` logits buffer per input row in
+    /// `slot_indices` order.
+    ///
+    /// Requires every row to be at `processed_tokens == kv_cache.len()` (a real
+    /// decode step). The caller (`decode_batch`) gates eligibility and falls
+    /// back to the per-row loop otherwise — this fn never silently degrades.
+    fn compute_top_level_logits_incremental_batch(
+        &self,
+        tokens: &[u32],
+        states: &mut [super::state::DeepseekState],
+        slot_indices: &[usize],
+    ) -> Result<Vec<DeviceVec>> {
+        ensure!(
+            tokens.len() == slot_indices.len(),
+            "DSv4 batched decode token/slot mismatch: tokens={} slots={}",
+            tokens.len(),
+            slot_indices.len()
+        );
+        let n = tokens.len();
+        ensure!(n > 0, "DSv4 batched decode requires at least one row");
+        let (Some(embed_tokens), Some(head_hc), Some(norm), Some(lm_head)) = (
+            self.embed_tokens.as_ref(),
+            self.head_hc.as_ref(),
+            self.norm.as_ref(),
+            self.lm_head.as_ref(),
+        ) else {
+            bail!("DSv4 batched decode requires loaded embed/head/norm/lm_head weights");
+        };
+        ensure!(
+            !self.layers.is_empty(),
+            "DSv4 batched decode requires loaded layer weights"
+        );
+        let num_layers = self.layers.len();
+        let hidden_size = self.config.hidden_size;
+        let hc_mult = self.config.hc_mult;
+        let stream_hidden_dim = hidden_size * hc_mult;
+
+        // Per-row absolute decode position + bookkeeping prime. Mirror the
+        // per-row `compute_gpu_logits_after_decode` preconditions exactly.
+        let mut start_pos = Vec::with_capacity(n);
+        for (&token, &slot_idx) in tokens.iter().zip(slot_indices) {
+            ensure!(
+                slot_idx < states.len(),
+                "DSv4 batched decode slot {slot_idx} out of range for {} states",
+                states.len()
+            );
+            let state = &mut states[slot_idx];
+            state.reference_tokens.push(token);
+            if state.incremental.processed_tokens == 0 {
+                state.incremental.processed_tokens = state.base.kv_cache.len();
+            }
+            let sp = state.incremental.processed_tokens;
+            ensure!(
+                sp == state.base.kv_cache.len(),
+                "DSv4 batched decode state length {} does not match scheduler KV length {}",
+                sp,
+                state.base.kv_cache.len()
+            );
+            state.incremental.ensure_layers(num_layers);
+            start_pos.push(sp);
+        }
+
+        // Batched [N, stream_hidden_dim] residual stream from token embeddings.
+        let embeddings =
+            common::get_embeddings_batch(&self.ctx, embed_tokens, tokens, hidden_size)?;
+        let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_hidden_dim, n)? };
+        initial_hc_stream_from_embeddings_into(
+            &self.ctx,
+            &embeddings,
+            hidden_size,
+            hc_mult,
+            &mut stream,
+        )?;
+
+        // Per-row attention scratch (one row in/out), and the batched
+        // post-attention residual stream the FFN half consumes.
+        let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_hidden_dim, n)? };
+
+        for layer_idx in 0..num_layers {
+            // --- Attention half: per-row, each into its row of attn_stream. ---
+            for (row, &slot_idx) in slot_indices.iter().enumerate() {
+                let row_in =
+                    extract_hidden_token_with_width(&self.ctx, &stream, row, stream_hidden_dim)?;
+                let mut row_out = unsafe { HiddenStates::uninit(&self.ctx, stream_hidden_dim, 1)? };
+                let layer_cache = states[slot_idx]
+                    .incremental
+                    .layers
+                    .get_mut(layer_idx)
+                    .expect("incremental cache layer initialized");
+                self.forward_attention_half_incremental_into(
+                    layer_idx,
+                    &row_in,
+                    start_pos[row],
+                    layer_cache,
+                    &mut row_out,
+                )?;
+                write_hidden_row(&self.ctx, &mut attn_stream, row, &row_out)?;
+            }
+
+            // --- FFN half: ONE batched call over all N rows. ---
+            // The routed-MoE expert GEMMs + NCCL all-reduce amortize over N.
+            // Uses the first row's per-layer FFN/MoE scratch (pure capacity
+            // scratch, no persistent per-sequence state). `tokens` only sizes
+            // route capacity; values are row-independent for MoE routing.
+            let ffn_slot = slot_indices[0];
+            let layer = &self.layers[layer_idx];
+            let layer_cache = states[ffn_slot]
+                .incremental
+                .layers
+                .get_mut(layer_idx)
+                .expect("incremental cache layer initialized");
+            let trace = dsv4_trace_begin(&self.ctx)?;
+            let ffn_mhc_scratch = ensure_mhc_scratch(
+                &mut layer_cache.ffn_mhc,
+                &self.ctx,
+                stream_hidden_dim,
+                layer.hc_ffn.mix_fn.rows,
+                hc_mult,
+                n,
+            )?;
+            self.forward_ffn_layer_stream_with_scratch_into(
+                layer_idx,
+                &attn_stream,
+                tokens,
+                Some(&mut layer_cache.moe),
+                Some(ffn_mhc_scratch),
+                Some(&mut layer_cache.ffn_pre),
+                Some(&mut layer_cache.ffn_normed),
+                &mut stream,
+            )?;
+            dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
+        }
+
+        // Advance per-row bookkeeping (one token consumed each).
+        for &slot_idx in slot_indices {
+            states[slot_idx].incremental.processed_tokens += 1;
+        }
+
+        // Head HC + lm_head logits, one row at a time (head is last-token-only
+        // and cheap; the [N, vocab] GEMM would need a stacked head hidden which
+        // the head HC kernel does not yet expose — kept per-row for parity).
+        let mut out = Vec::with_capacity(n);
+        for row in 0..n {
+            let hidden = head_hidden_from_stream(
+                &self.ctx,
+                head_hc,
+                &stream,
+                row,
+                hidden_size,
+                hc_mult,
+                self.config.hc_eps,
+            )?;
+            let logits = common::compute_logits_batch(
+                &self.ctx,
+                &hidden,
+                norm,
+                lm_head,
+                self.config.rms_norm_eps,
+                false,
+            )?;
+            out.push(logits.with_label("dsv4_incremental_batch_logits"));
+        }
+        Ok(out)
+    }
+
     fn forward_transformer_layer_stream_incremental_into(
         &self,
         layer_idx: usize,
@@ -590,12 +845,76 @@ impl DeepseekModel {
         cache: &mut DeepseekLayerRuntimeCache,
         out: &mut HiddenStates,
     ) -> Result<()> {
-        ensure!(
-            tokens.len() == stream.seq_len,
-            "DeepSeek V4 incremental full layer token count {} does not match stream seq_len {}",
-            tokens.len(),
-            stream.seq_len
-        );
+        // Per-row / single-sequence layer = attention half (post-attention
+        // residual stream into the `attn_post` scratch) then the fused FFN
+        // half. The batched decode path reuses the attention half per row and
+        // issues the FFN half ONCE over all rows, amortizing the routed-MoE
+        // expert GEMMs + NCCL all-reduce over the batch.
+        let attn_stream_ptr: *mut HiddenStates = {
+            let attn_stream = ensure_hidden_scratch(
+                &mut cache.attn_post,
+                &self.ctx,
+                self.config.hidden_size * self.config.hc_mult,
+                stream.seq_len,
+            )?;
+            attn_stream as *mut HiddenStates
+        };
+        // SAFETY: `attn_stream_ptr` aliases `cache.attn_post`. The attention
+        // half writes through it and reads other `cache.*` fields but never
+        // `attn_post`; the FFN half reads it and writes `cache.moe`/`cache.ffn_*`
+        // — disjoint fields. Single inference thread, single CUDA stream.
+        self.forward_attention_half_incremental_into(
+            layer_idx,
+            stream,
+            start_pos,
+            cache,
+            unsafe { &mut *attn_stream_ptr },
+        )?;
+        let layer = self.layers.get(layer_idx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepSeek V4 GPU incremental layer {} out of range for {} loaded layers",
+                layer_idx,
+                self.layers.len()
+            )
+        })?;
+        let attn_stream = unsafe { &*attn_stream_ptr };
+        let trace = dsv4_trace_begin(&self.ctx)?;
+        let ffn_mhc_scratch = ensure_mhc_scratch(
+            &mut cache.ffn_mhc,
+            &self.ctx,
+            attn_stream.hidden_dim,
+            layer.hc_ffn.mix_fn.rows,
+            self.config.hc_mult,
+            attn_stream.seq_len,
+        )?;
+        self.forward_ffn_layer_stream_with_scratch_into(
+            layer_idx,
+            attn_stream,
+            tokens,
+            Some(&mut cache.moe),
+            Some(ffn_mhc_scratch),
+            Some(&mut cache.ffn_pre),
+            Some(&mut cache.ffn_normed),
+            out,
+        )?;
+        dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, out.seq_len, trace)?;
+        Ok(())
+    }
+
+    /// Attention half of a single-sequence incremental layer: MHC(attn) +
+    /// hc_pre + RMSNorm + sliding-window/sparse attention + hc_post. Writes the
+    /// post-attention residual stream into `out` (`[seq_len, hidden*hc_mult]`).
+    /// Shared by the per-row decode loop and the batched decode path; `out`
+    /// MUST be disjoint from `cache.attn_post` (the single-row caller passes the
+    /// `attn_post` scratch itself, which this fn never reads back).
+    fn forward_attention_half_incremental_into(
+        &self,
+        layer_idx: usize,
+        stream: &HiddenStates,
+        start_pos: usize,
+        cache: &mut DeepseekLayerRuntimeCache,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         ensure!(
             stream.hidden_dim == self.config.hidden_size * self.config.hc_mult,
             "DeepSeek V4 incremental full layer stream dim {} does not match hidden_size {} * hc_mult {}",
@@ -606,7 +925,7 @@ impl DeepseekModel {
         ensure!(
             out.hidden_dim == self.config.hidden_size * self.config.hc_mult
                 && out.seq_len == stream.seq_len,
-            "DeepSeek V4 incremental full layer output shape mismatch: out={}x{} expected={}x{}",
+            "DeepSeek V4 incremental attention-half output shape mismatch: out={}x{} expected={}x{}",
             out.seq_len,
             out.hidden_dim,
             stream.seq_len,
@@ -677,12 +996,6 @@ impl DeepseekModel {
         )?;
         dsv4_trace_end(&self.ctx, "attn_total", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let attn_stream = ensure_hidden_scratch(
-            &mut cache.attn_post,
-            &self.ctx,
-            self.config.hidden_size * self.config.hc_mult,
-            stream.seq_len,
-        )?;
         hc_post_to_stream_into(
             &self.ctx,
             &attn_out,
@@ -691,35 +1004,9 @@ impl DeepseekModel {
             mhc.comb(),
             self.config.hidden_size,
             self.config.hc_mult,
-            attn_stream,
-        )?;
-        dsv4_trace_end(
-            &self.ctx,
-            "attn_post",
-            layer_idx,
-            attn_stream.seq_len,
-            trace,
-        )?;
-        let trace = dsv4_trace_begin(&self.ctx)?;
-        let ffn_mhc_scratch = ensure_mhc_scratch(
-            &mut cache.ffn_mhc,
-            &self.ctx,
-            attn_stream.hidden_dim,
-            layer.hc_ffn.mix_fn.rows,
-            self.config.hc_mult,
-            attn_stream.seq_len,
-        )?;
-        self.forward_ffn_layer_stream_with_scratch_into(
-            layer_idx,
-            attn_stream,
-            tokens,
-            Some(&mut cache.moe),
-            Some(ffn_mhc_scratch),
-            Some(&mut cache.ffn_pre),
-            Some(&mut cache.ffn_normed),
             out,
         )?;
-        dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, out.seq_len, trace)?;
+        dsv4_trace_end(&self.ctx, "attn_post", layer_idx, out.seq_len, trace)?;
         Ok(())
     }
 
@@ -5470,6 +5757,39 @@ fn extract_hidden_token_with_width(
         .memcpy_dtod(&src, &mut out.data)
         .map_err(|err| anyhow::anyhow!("DeepSeek V4 token extract copy: {err}"))?;
     Ok(out)
+}
+
+/// Write a single `[1, width]` row into row `row_idx` of a batched
+/// `[seq_len, width]` `HiddenStates` (device-to-device). Used by the batched
+/// decode path to scatter per-row attention-half outputs back into the batched
+/// post-attention residual stream.
+#[cfg(feature = "cuda")]
+fn write_hidden_row(
+    ctx: &DeviceContext,
+    batched: &mut HiddenStates,
+    row_idx: usize,
+    row: &HiddenStates,
+) -> Result<()> {
+    ensure!(
+        row_idx < batched.seq_len,
+        "DeepSeek V4 row write index {} out of range for seq_len {}",
+        row_idx,
+        batched.seq_len
+    );
+    ensure!(
+        row.seq_len == 1 && row.hidden_dim == batched.hidden_dim,
+        "DeepSeek V4 row write shape mismatch: row={}x{} batched dim={}",
+        row.seq_len,
+        row.hidden_dim,
+        batched.hidden_dim
+    );
+    let width = batched.hidden_dim;
+    let start = row_idx * width;
+    let mut dst = batched.data.slice_mut(start..start + width);
+    ctx.stream
+        .memcpy_dtod(&row.data, &mut dst)
+        .map_err(|err| anyhow::anyhow!("DeepSeek V4 row write copy: {err}"))?;
+    Ok(())
 }
 
 #[cfg(all(test, feature = "cuda"))]
