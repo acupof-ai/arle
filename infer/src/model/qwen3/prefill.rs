@@ -377,10 +377,7 @@ fn prefill_owners(requests: &[Qwen3PagedPrefillRequest<'_>]) -> Vec<PendingPaged
 // eviction telemetry. Until either lands, only enable for c≤2 short-prompt
 // workloads.
 pub(super) fn qwen3_prefill_graph_requested() -> bool {
-    matches!(
-        std::env::var("INFER_PREFILL_GRAPH").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    crate::dispatch_policy::dispatch_policy().prefill_graph
 }
 
 const QWEN3_PREFILL_GRAPH_CACHE_MAX_KEYS: usize = 8;

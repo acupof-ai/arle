@@ -862,12 +862,9 @@ fn dsv4_run_grouped_block_scaled_gemv(
 fn dsv4_grouped_gemm_m_threshold() -> usize {
     // Default 4: matches the _tiled_kernel fast-path break (sums4 vs sums32);
     // below M=4 GEMV's lower register pressure wins, at/above M=4 the
-    // 32-way M-tile reuse dominates. Tunable via env for bench sweeps.
-    std::env::var("ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v >= 1)
-        .unwrap_or(4)
+    // 32-way M-tile reuse dominates. Tunable via `ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD`
+    // for bench sweeps; resolved once in `dispatch_policy`.
+    crate::dispatch_policy::dispatch_policy().dsv4_grouped_gemm_m_threshold
 }
 
 #[cfg(feature = "cuda")]

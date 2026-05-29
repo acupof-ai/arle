@@ -9,15 +9,21 @@
 //! This module is the **Declare** gate: every dispatch-affecting env knob is
 //! parsed exactly once, here, into one inspectable struct.
 //!
-//! This is the ops-layer subset (the kernel-selection knobs in
-//! `ops/linear.rs` + `ops/attention.rs`). Model-layer knobs
-//! (`INFER_PREFILL_GRAPH`, `INFER_BYPASS_TILELANG_PREFILL`, the `ARLE_DSV4_*`
-//! family, `INFER_QUANT_FORMAT_OVERRIDE`) migrate here in a follow-up tranche.
+//! This covers the ops-layer subset (the kernel-selection knobs in
+//! `ops/linear.rs` + `ops/attention.rs`) and the model-layer path-selection
+//! subset (`INFER_PREFILL_GRAPH` in `model/qwen3/prefill.rs`,
+//! `ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD` in `model/deepseek/mlp.rs`).
+//! `INFER_BYPASS_TILELANG_PREFILL` is a *scheduler-layer* knob
+//! (`scheduler/cuda/prefill.rs`), not a model-layer one, so it is left in place
+//! for a scheduler-scoped tranche. Load-time CONFIG knobs (the `ARLE_DSV4_*`
+//! pool/feature family, `INFER_QUANT_FORMAT_OVERRIDE`,
+//! `INFER_QWEN3_FUSED_GATE_UP`) and the `*_DEBUG`/`*_DUMP` diagnostics are
+//! deliberately NOT dispatch knobs and stay at their original sites.
 //!
 //! Behaviour is preserved bit-for-bit: each field reproduces the exact accepted
-//! token set of the call site it replaced. Knobs are deliberately NOT unified
-//! onto one truthy parser, because the legacy sites disagreed
-//! (`INFER_R4_W4A16_GEMV_OVERRIDE` accepted only `"1"`;
+//! token set (or numeric parse) of the call site it replaced. Knobs are
+//! deliberately NOT unified onto one truthy parser, because the legacy sites
+//! disagreed (`INFER_R4_W4A16_GEMV_OVERRIDE` accepted only `"1"`;
 //! `INFER_TILELANG_BF16_SPLIT_KV` additionally accepted `"YES"`). The parsers
 //! are pure functions so the preserved token sets are unit-tested directly.
 
@@ -41,7 +47,25 @@ fn parse_split_kv(value: Option<&str>) -> bool {
     )
 }
 
-/// Resolved-once view of every dispatch-affecting env knob in the ops layer.
+/// `INFER_PREFILL_GRAPH` legacy semantics: the common truthy set (the
+/// `model/qwen3/prefill.rs` site matched exactly `1`/`true`/`TRUE`/`yes`/`on`/`ON`).
+fn parse_prefill_graph(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "TRUE" | "yes" | "on" | "ON"))
+}
+
+/// `ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD` legacy semantics: parse as `usize`,
+/// keep only values `>= 1`; anything unset / unparseable / `< 1` falls back to
+/// the default `4`. Returns the resolved threshold directly so the field holds
+/// the effective value (not an `Option`), matching the `unwrap_or(4)` site.
+fn parse_dsv4_grouped_gemm_m_threshold(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(4)
+}
+
+/// Resolved-once view of every dispatch-affecting env knob in the ops and
+/// model layers.
 ///
 /// Fields are public for the `explain-dispatch` introspection path and for
 /// test construction; they are read-only after `from_env`.
@@ -61,6 +85,14 @@ pub struct DispatchPolicy {
     /// `INFER_TILELANG_BF16_SPLIT_KV` — request the TileLang BF16 split-KV
     /// decode kernel. Legacy site additionally accepted `"YES"`.
     pub tilelang_bf16_split_kv: bool,
+    /// `INFER_PREFILL_GRAPH` — opt-in CUDA-Graph capture for Qwen3 paged
+    /// prefill (`model/qwen3/prefill.rs`). Common truthy set.
+    pub prefill_graph: bool,
+    /// `ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD` — the M (active-row) count at/above
+    /// which DSv4 grouped MoE switches from block-scaled GEMV to the 32-way
+    /// M-tile grouped GEMM (`model/deepseek/mlp.rs`). Resolved value, default
+    /// `4`; values `< 1` or unparseable fall back to the default.
+    pub dsv4_grouped_gemm_m_threshold: usize,
 }
 
 impl DispatchPolicy {
@@ -81,6 +113,10 @@ impl DispatchPolicy {
             ),
             deterministic_gemm: parse_truthy_common(read("INFER_DETERMINISTIC").as_deref()),
             tilelang_bf16_split_kv: parse_split_kv(read("INFER_TILELANG_BF16_SPLIT_KV").as_deref()),
+            prefill_graph: parse_prefill_graph(read("INFER_PREFILL_GRAPH").as_deref()),
+            dsv4_grouped_gemm_m_threshold: parse_dsv4_grouped_gemm_m_threshold(
+                read("ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD").as_deref(),
+            ),
         }
     }
 }
@@ -145,5 +181,43 @@ mod tests {
         for v in [None, Some(""), Some("0"), Some("false")] {
             assert!(!parse_split_kv(v), "{v:?} should not enable split-kv");
         }
+    }
+
+    #[test]
+    fn prefill_graph_accepts_common_set() {
+        for v in ["1", "true", "TRUE", "yes", "on", "ON"] {
+            assert!(
+                parse_prefill_graph(Some(v)),
+                "{v} should enable prefill-graph"
+            );
+        }
+        // Same strictness as the common truthy set: "YES"/"y"/"0" must not enable it.
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("YES"),
+            Some("y"),
+        ] {
+            assert!(
+                !parse_prefill_graph(v),
+                "{v:?} should not enable prefill-graph"
+            );
+        }
+    }
+
+    #[test]
+    fn dsv4_grouped_gemm_m_threshold_parse_and_default() {
+        // Unset / unparseable / sub-1 fall back to the legacy default 4.
+        assert_eq!(parse_dsv4_grouped_gemm_m_threshold(None), 4);
+        assert_eq!(parse_dsv4_grouped_gemm_m_threshold(Some("")), 4);
+        assert_eq!(parse_dsv4_grouped_gemm_m_threshold(Some("abc")), 4);
+        assert_eq!(parse_dsv4_grouped_gemm_m_threshold(Some("0")), 4);
+        assert_eq!(parse_dsv4_grouped_gemm_m_threshold(Some("-1")), 4);
+        // Valid >= 1 values pass through verbatim.
+        assert_eq!(parse_dsv4_grouped_gemm_m_threshold(Some("1")), 1);
+        assert_eq!(parse_dsv4_grouped_gemm_m_threshold(Some("4")), 4);
+        assert_eq!(parse_dsv4_grouped_gemm_m_threshold(Some("32")), 32);
     }
 }
