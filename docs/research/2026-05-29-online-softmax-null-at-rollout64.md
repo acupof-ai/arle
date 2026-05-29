@@ -127,8 +127,21 @@ total step 310s → ~225s (45s saved on quadratic). At rollout=256:
   × 1024 steps = ~8 s/step), so the online path will eventually
   matter — just not at the current rollout sizes.
 
+## Rollout=128 follow-up (same session, 2026-05-29)
+
+`runs/2026-05-29-online-attn-bench/rollout128_online.log`:
+- step 1 cold student_rollout = 206.52 s (vs v4 baseline 208 s = **−0.7%**)
+- step 2 warm student_rollout = 201.71 s (vs v4 baseline ~205 s = **−1.6%**)
+
+The online kernel scales to a measurable ~1-3% advantage as `n_gen`
+grows, consistent with the analysis: the serial `tid==0` softmax loop
+in the legacy kernel contributes O(visible) per-call serial work, and
+that becomes visible at large n. But the magnitude is small (10s of
+microseconds per call × tens of thousands of calls).
+
+**BF16 KV cache is the only realistic path to 2× rollout speedup.**
+Starting that work in the next commit.
+
 ## Pending
 
-- rollout=128 A/B in flight (`rollout128_online.log`) — expected
-  same null result at this scale.
 - BF16 KV cache implementation as outlined above.
