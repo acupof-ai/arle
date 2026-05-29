@@ -193,6 +193,31 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    /// In-place attention-output inverse-rope for the FlashMLA decode/prefill
+    /// paths. The legacy `dsv4_hybrid_attention_cuda` kernel un-rotates the
+    /// last `rope_dim` cols of each (token, head) output vector with the MAIN
+    /// rope (sign=-1.0) before output-projection (mirroring the CPU reference
+    /// `apply_partial_rope(.., sign=-1.0)` at reference.rs:417-423). The
+    /// FlashMLA SM90 sparse decode/prefill kernels do NOT, so callers on those
+    /// paths must apply this explicitly. `out` is bf16 (u16 bits), layout
+    /// [token_count, local_heads, head_dim] with head_dim contiguous and rope
+    /// tail = the last `rope_dim` cols; abs_pos = start_pos + token. NEVER call
+    /// this on the legacy hybrid path (double-apply).
+    pub fn arle_dsv4_output_inverse_rope_cuda(
+        out: *mut super::Half,
+        token_count: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        start_pos: i32,
+        rope_base: f32,
+        original_seq_len: i32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     // FlashMLA SM90 sparse prefill (vendored sgl-project/FlashMLA @ df022eb).
     // Bypasses FlashMLA's PyTorch wrapper and calls `sm90::run_fwd_kernel`
     // directly. q/kv must be bf16 device pointers; the kernel supports

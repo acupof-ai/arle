@@ -2671,6 +2671,37 @@ impl DeepseekModel {
                         })?;
                     }
                 }
+
+                // Attention-output inverse-rope. The legacy hybrid kernel
+                // un-rotates the last `qk_rope_head_dim` cols of each
+                // (token, head) output vector with the MAIN rope (sign=-1.0)
+                // before output-projection (reference.rs:417-423); the
+                // FlashMLA prefill kernel does NOT, so apply it explicitly
+                // here on the final per-rank output [token_count, local_heads,
+                // head_dim] (= local_attn = out_ptr), for both TP=1 (fwd wrote
+                // out_ptr directly) and TP>1 (sliced from full_out above).
+                // MAIN rope_theta, NO YaRN (rope_base/original_seq_len match
+                // the input-rope fix and the no-YaRN reference).
+                unsafe {
+                    ffi::arle_dsv4_output_inverse_rope_cuda(
+                        out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        self.config.qk_rope_head_dim as i32,
+                        start_pos as i32,
+                        rope_base,
+                        original_seq_len as i32,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {err}")
+                    })?;
+                }
                 // Scratches freed back to the cudarc pool here.
                 drop(gathered_q_owned);
                 drop(packed_q_owned);
@@ -3007,6 +3038,34 @@ impl DeepseekModel {
                     )
                     .result()
                     .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode fwd failed: {err}"))?;
+                }
+
+                // Attention-output inverse-rope. The legacy hybrid decode
+                // kernel un-rotates the last `qk_rope_head_dim` cols of each
+                // head output with the MAIN rope (sign=-1.0) before
+                // output-projection (reference.rs:417-423); the FlashMLA
+                // decode kernel does NOT, so apply it explicitly here over the
+                // single decode token [token_count=1, local_heads, head_dim]
+                // (= local_attn = out_ptr). MAIN rope_theta, NO YaRN.
+                unsafe {
+                    ffi::arle_dsv4_output_inverse_rope_cuda(
+                        out_ptr as *mut ffi::Half,
+                        1_i32, // token_count (decode)
+                        local_heads as i32,
+                        head_dim as i32,
+                        self.config.qk_rope_head_dim as i32,
+                        start_pos as i32,
+                        rope_base,
+                        original_seq_len as i32,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DSv4 FlashMLA decode output inverse-rope failed: {err}")
+                    })?;
                 }
                 drop(topk_length_dev);
                 drop(lse_out_dev);

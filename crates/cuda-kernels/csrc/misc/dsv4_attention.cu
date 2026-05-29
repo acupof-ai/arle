@@ -1031,6 +1031,82 @@ extern "C" CUresult dsv4_hybrid_attention_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+// In-place attention-output inverse-rope for the FlashMLA decode/prefill paths.
+//
+// The legacy `dsv4_hybrid_attention_kernel` un-rotates the last `rope_dim` cols
+// of every (token, head) output vector with the MAIN rope (sign=-1.0f) before
+// output-projection (lines 966-981) — mirroring the CPU reference
+// `apply_partial_rope(.., sign=-1.0)` at reference.rs:417-423. The FlashMLA
+// SM90 sparse decode/prefill kernels do NOT perform this output inverse-rope,
+// so callers on those paths must apply it explicitly via this entry.
+//
+// Layout: `out` is [token_count, local_heads, head_dim] bf16 (uint16 bits),
+// head_dim contiguous, rope tail = the last `rope_dim` cols. abs_pos =
+// start_pos + token. One thread per RoPE PAIR (grid = token_count*local_heads,
+// block = rope_dim/2): each thread reads BOTH originals out[..pair_col] and
+// out[..pair_col+1] before writing either back, avoiding the read-after-write
+// hazard of the legacy per-col loop.
+__global__ void dsv4_output_inverse_rope_kernel(
+    uint16_t *__restrict__ out,
+    int token_count,
+    int local_heads,
+    int head_dim,
+    int rope_dim,
+    int start_pos,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow) {
+  int row = blockIdx.x;
+  if (row >= token_count * local_heads) return;
+  int token = row / local_heads;
+  int head = row - token * local_heads;
+  int local_width = local_heads * head_dim;
+  int abs_pos = start_pos + token;
+  int rope_start = head_dim - rope_dim;
+  int base = token * local_width + head * head_dim;
+
+  int pair = threadIdx.x;
+  if (pair >= rope_dim / 2) return;
+  int pair_col = rope_start + pair * 2;
+  float a = dsv4_attn_bf16_to_f32(out[base + pair_col]);
+  float b = dsv4_attn_bf16_to_f32(out[base + pair_col + 1]);
+  float out_a;
+  float out_b;
+  dsv4_apply_rope_pair(
+      a, b, pair, abs_pos, rope_dim, rope_base, original_seq_len, factor,
+      beta_fast, beta_slow, -1.0f, &out_a, &out_b);
+  out[base + pair_col] = dsv4_attn_f32_to_bf16_bits(out_a);
+  out[base + pair_col + 1] = dsv4_attn_f32_to_bf16_bits(out_b);
+}
+
+extern "C" cudaError_t arle_dsv4_output_inverse_rope_cuda(
+    uint16_t *out,
+    int token_count,
+    int local_heads,
+    int head_dim,
+    int rope_dim,
+    int start_pos,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow,
+    cudaStream_t stream) {
+  if (token_count < 0 || local_heads <= 0 || head_dim <= 0 ||
+      head_dim > DSV4_ATTN_MAX_HEAD_DIM || rope_dim < 0 || rope_dim > head_dim ||
+      start_pos < 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (token_count == 0 || rope_dim == 0) return cudaSuccess;
+  if (out == nullptr) return cudaErrorInvalidValue;
+  dsv4_output_inverse_rope_kernel<<<token_count * local_heads, rope_dim / 2, 0, stream>>>(
+      out, token_count, local_heads, head_dim, rope_dim, start_pos, rope_base,
+      original_seq_len, factor, beta_fast, beta_slow);
+  return cudaGetLastError();
+}
+
 __global__ void dsv4_csa_select_kernel(
     const uint16_t *__restrict__ q,
     const uint16_t *__restrict__ weights,
