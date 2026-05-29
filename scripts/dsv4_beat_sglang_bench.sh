@@ -42,7 +42,7 @@ serve_sglang() {
   cd /sgl-workspace/sglang
   python3 -m sglang.launch_server --model-path "$MODEL" --tp 8 \
     --trust-remote-code --port $SGL_PORT --mem-fraction-static 0.80 \
-    --kv-cache-dtype fp8e4m3 2>&1
+    --kv-cache-dtype fp8_e4m3 2>&1
 }
 
 # Minimal OpenAI-compat throughput bench (no external deps): fire N concurrent
