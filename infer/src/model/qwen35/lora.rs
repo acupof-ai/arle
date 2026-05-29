@@ -162,6 +162,114 @@ pub(super) fn load_peft_lora(lora_path: &str, num_layers: usize) -> Result<Qwen3
     })
 }
 
+/// Per-layer raw (un-scaled) LoRA A/B matrices for a single q/v projection.
+///
+/// `a` is row-major `[rank, in_features]`, `b` is row-major
+/// `[out_features, rank]` — the PEFT on-disk convention. Values are raw:
+/// `scale = alpha / r` is applied exactly once at merge time, matching the
+/// disk-load path. Used by the per-step student LoRA sync (OPD P2).
+#[derive(Debug, Clone)]
+pub struct StudentLoraMatrices {
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+    pub rank: usize,
+    pub in_features: usize,
+    pub out_features: usize,
+}
+
+/// One full-attention layer's optional q/v adapter for the in-memory re-merge
+/// sync. `layer_idx` is the absolute model-layer index (must be a
+/// full-attention layer).
+#[derive(Debug, Clone)]
+pub struct StudentLoraLayer {
+    pub layer_idx: usize,
+    pub q_proj: Option<StudentLoraMatrices>,
+    pub v_proj: Option<StudentLoraMatrices>,
+}
+
+/// A full LoRA update pushed from the train crate into the infer student
+/// engine. Carries raw A/B per full-attention layer plus `r`/`alpha`; the
+/// merge path applies `scale = alpha / r` once.
+#[derive(Debug, Clone)]
+pub struct StudentLoraUpdate {
+    pub layers: Vec<StudentLoraLayer>,
+    pub rank: usize,
+    pub alpha: f32,
+}
+
+impl Qwen35LoRA {
+    /// Build a [`Qwen35LoRA`] from an in-memory [`StudentLoraUpdate`] for the
+    /// per-step re-merge sync. Mirrors the on-disk loader's layout/scale
+    /// contract: A is `[rank, in]`, B is `[out, rank]`, scale = alpha / r.
+    pub(super) fn from_student_update(
+        update: &StudentLoraUpdate,
+        num_layers: usize,
+    ) -> Result<Self> {
+        ensure!(update.rank > 0, "student LoRA update has r=0");
+        let scale = update.alpha / update.rank as f32;
+        let mut layers: Vec<LayerLoRA> = (0..num_layers).map(|_| LayerLoRA::default()).collect();
+        let mut tensor_count = 0usize;
+
+        let mut build = |m: &StudentLoraMatrices, label: &str| -> Result<LoraAB> {
+            ensure!(
+                m.rank == update.rank,
+                "{label}: matrix rank {} != update rank {}",
+                m.rank,
+                update.rank
+            );
+            ensure!(
+                m.a.len() == m.rank * m.in_features,
+                "{label}: lora_A len {} != rank*in {}",
+                m.a.len(),
+                m.rank * m.in_features
+            );
+            ensure!(
+                m.b.len() == m.out_features * m.rank,
+                "{label}: lora_B len {} != out*rank {}",
+                m.b.len(),
+                m.out_features * m.rank
+            );
+            Ok(LoraAB {
+                a: AdapterMatrix {
+                    rows: m.rank,
+                    cols: m.in_features,
+                    values: m.a.clone(),
+                },
+                b: AdapterMatrix {
+                    rows: m.out_features,
+                    cols: m.rank,
+                    values: m.b.clone(),
+                },
+            })
+        };
+
+        for layer in &update.layers {
+            ensure!(
+                layer.layer_idx < num_layers,
+                "student LoRA references layer {} but model has {num_layers} layers",
+                layer.layer_idx
+            );
+            let slot = &mut layers[layer.layer_idx];
+            if let Some(q) = &layer.q_proj {
+                slot.q_proj = Some(build(q, &format!("layer {} q_proj", layer.layer_idx))?);
+                tensor_count += 2;
+            }
+            if let Some(v) = &layer.v_proj {
+                slot.v_proj = Some(build(v, &format!("layer {} v_proj", layer.layer_idx))?);
+                tensor_count += 2;
+            }
+        }
+
+        Ok(Qwen35LoRA {
+            layers,
+            tensor_count,
+            rank: update.rank,
+            alpha: update.alpha,
+            scale,
+        })
+    }
+}
+
 pub(super) fn merge_lora_into_dense_matrix(
     ctx: &DeviceContext,
     matrix: &mut DeviceMatrix,

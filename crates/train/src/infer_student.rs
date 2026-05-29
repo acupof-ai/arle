@@ -14,14 +14,21 @@
 //! `docs/plans/2026-05-29-opd-student-rollout-via-infer.md`).
 
 #[cfg(feature = "cuda")]
+use std::collections::HashMap;
+#[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "cuda")]
 use anyhow::{Result, anyhow, bail};
 #[cfg(feature = "cuda")]
-use autograd::Backend;
+use autograd::{Backend, TensorId, TensorStore};
 #[cfg(feature = "cuda")]
-use infer::server_engine::LoadedInferenceEngine;
+use infer::server_engine::{
+    LoadedInferenceEngine, StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate,
+};
+
+#[cfg(feature = "cuda")]
+use crate::lora::LoraConfig;
 
 #[cfg(feature = "cuda")]
 pub struct InferStudent {
@@ -108,6 +115,204 @@ impl InferStudent {
         let token = argmax(last_row)?;
         Ok(token as u32)
     }
+
+    /// Per-step student LoRA sync (OPD P2).
+    ///
+    /// D2H the q/v LoRA A/B adapter tensors from the train `TensorStore` and
+    /// push them into the infer student engine, which restores its cached base
+    /// q/v weights and folds the fresh adapter in-memory (`remerge_student_lora`).
+    /// Idempotent across steps: the infer side always re-merges from the same
+    /// pristine base, so deltas never accumulate.
+    ///
+    /// `adapter_map` is the train model's `adapter_name_map()`; only q/v
+    /// adapters (full-attention layers) are recognized — the train target set
+    /// must be `AttentionQv`. Matrices are exported raw (un-scaled); the infer
+    /// merge applies `scale = alpha / r` once.
+    pub fn sync_lora_from_store(
+        &self,
+        store: &mut TensorStore,
+        adapter_map: &HashMap<&'static str, TensorId>,
+        lora_config: LoraConfig,
+    ) -> Result<()> {
+        if lora_config.rank == 0 {
+            bail!("InferStudent LoRA sync: lora_config.rank must be > 0");
+        }
+
+        // Collect per-layer A/B from the train store, keyed by absolute layer
+        // index. Each entry is (q_a, q_b, v_a, v_b) slots filled as found.
+        let mut layers: HashMap<usize, PartialLayer> = HashMap::new();
+        for (&name, &tensor_id) in adapter_map {
+            let Some((layer_idx, module, which)) = parse_adapter_name(name) else {
+                continue;
+            };
+            let shape = store
+                .get(tensor_id)
+                .ok_or_else(|| {
+                    anyhow!("LoRA sync: tensor id {tensor_id:?} ({name}) missing from store")
+                })?
+                .shape
+                .clone();
+            if shape.len() != 2 {
+                bail!("LoRA sync: {name} expected rank-2 matrix, got shape {shape:?}");
+            }
+            let values = store
+                .to_host(tensor_id)
+                .map_err(|err| anyhow!("LoRA sync: D2H {name} failed: {err}"))?;
+            let entry = layers.entry(layer_idx).or_default();
+            let slot = match module {
+                AdapterModule::Q => &mut entry.q,
+                AdapterModule::V => &mut entry.v,
+            };
+            match which {
+                Which::A => {
+                    // lora_A shape = [rank, in_features]
+                    slot.a = Some((values, shape[0], shape[1]));
+                }
+                Which::B => {
+                    // lora_B shape = [out_features, rank]
+                    slot.b = Some((values, shape[0], shape[1]));
+                }
+            }
+        }
+
+        if layers.is_empty() {
+            bail!(
+                "LoRA sync: no q/v adapters found in adapter_map ({} entries); \
+                 train target set must be AttentionQv",
+                adapter_map.len()
+            );
+        }
+
+        let mut layer_indices: Vec<usize> = layers.keys().copied().collect();
+        layer_indices.sort_unstable();
+
+        let mut out_layers: Vec<StudentLoraLayer> = Vec::with_capacity(layer_indices.len());
+        for layer_idx in layer_indices {
+            let partial = layers.remove(&layer_idx).expect("layer present");
+            let q_proj = partial
+                .q
+                .into_matrices(lora_config.rank, layer_idx, "q_proj")?;
+            let v_proj = partial
+                .v
+                .into_matrices(lora_config.rank, layer_idx, "v_proj")?;
+            out_layers.push(StudentLoraLayer {
+                layer_idx,
+                q_proj,
+                v_proj,
+            });
+        }
+
+        let update = StudentLoraUpdate {
+            layers: out_layers,
+            rank: lora_config.rank,
+            alpha: lora_config.alpha,
+        };
+
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
+        engine.remerge_student_lora(update)
+    }
+}
+
+/// q/v adapter accumulator for one layer during the store scan.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct PartialLayer {
+    q: PartialProj,
+    v: PartialProj,
+}
+
+/// A single projection's optional A/B host matrices, each as
+/// `(values, rows, cols)`.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct PartialProj {
+    a: Option<(Vec<f32>, usize, usize)>,
+    b: Option<(Vec<f32>, usize, usize)>,
+}
+
+#[cfg(feature = "cuda")]
+impl PartialProj {
+    /// Convert to `StudentLoraMatrices`, or `None` if this projection had no
+    /// adapter. A dangling half (A without B or vice versa) is an error.
+    fn into_matrices(
+        self,
+        rank: usize,
+        layer_idx: usize,
+        label: &str,
+    ) -> Result<Option<StudentLoraMatrices>> {
+        match (self.a, self.b) {
+            (None, None) => Ok(None),
+            (Some((a, a_rows, a_cols)), Some((b, b_rows, b_cols))) => {
+                if a_rows != rank {
+                    bail!(
+                        "LoRA sync: layer {layer_idx} {label} lora_A rows {a_rows} != rank {rank}"
+                    );
+                }
+                if b_cols != rank {
+                    bail!(
+                        "LoRA sync: layer {layer_idx} {label} lora_B cols {b_cols} != rank {rank}"
+                    );
+                }
+                Ok(Some(StudentLoraMatrices {
+                    a,
+                    b,
+                    rank,
+                    in_features: a_cols,
+                    out_features: b_rows,
+                }))
+            }
+            (Some(_), None) => {
+                bail!("LoRA sync: layer {layer_idx} {label} has lora_A without lora_B")
+            }
+            (None, Some(_)) => {
+                bail!("LoRA sync: layer {layer_idx} {label} has lora_B without lora_A")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Copy, Clone)]
+enum AdapterModule {
+    Q,
+    V,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Copy, Clone)]
+enum Which {
+    A,
+    B,
+}
+
+/// Parse a train adapter tensor name like
+/// `model.language_model.layers.7.self_attn.q_proj.weight.lora_a` into
+/// `(layer_idx, module, which)`. Returns `None` for non-q/v adapters (e.g.
+/// MLP adapters under an `AllLinear` target set are ignored).
+#[cfg(feature = "cuda")]
+fn parse_adapter_name(name: &str) -> Option<(usize, AdapterModule, Which)> {
+    let which = if name.ends_with(".lora_a") {
+        Which::A
+    } else if name.ends_with(".lora_b") {
+        Which::B
+    } else {
+        return None;
+    };
+    let parts: Vec<&str> = name.split('.').collect();
+    let layers_pos = parts.iter().position(|part| *part == "layers")?;
+    let layer_idx: usize = parts.get(layers_pos + 1)?.parse().ok()?;
+    if *parts.get(layers_pos + 2)? != "self_attn" {
+        return None;
+    }
+    let module = match *parts.get(layers_pos + 3)? {
+        "q_proj" => AdapterModule::Q,
+        "v_proj" => AdapterModule::V,
+        _ => return None,
+    };
+    Some((layer_idx, module, which))
 }
 
 #[cfg(feature = "cuda")]

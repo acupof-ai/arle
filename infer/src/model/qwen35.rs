@@ -27,4 +27,5 @@ mod weights;
 
 pub use diagnostics::{Qwen35DenseModuleParityOutputs, Qwen35InferParityStages};
 pub use forward::Qwen35State;
+pub use lora::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 pub use weights::{Qwen35Model, Qwen35RuntimeConfig};

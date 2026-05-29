@@ -61,6 +61,10 @@ impl RequestHandleInferenceEngine<crate::scheduler::SchedulerHandle> {
     ) -> Result<super::RawLogits> {
         self.handle.forward_token_logits(input_ids, positions)
     }
+
+    pub fn remerge_student_lora(&self, update: crate::model::StudentLoraUpdate) -> Result<()> {
+        self.handle.remerge_student_lora(update)
+    }
 }
 
 impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {

@@ -396,6 +396,16 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
+    /// Apply pending per-step student LoRA re-merge requests on the
+    /// single-writer scheduler thread (OPD P2). The model owns the cached base
+    /// snapshot, so the restore + merge runs here, not on the caller's thread.
+    pub(super) fn drain_remerge_lora_rx(&mut self) {
+        while let Ok(req) = self.remerge_lora_rx.try_recv() {
+            let result = self.model.remerge_student_lora(&req.update);
+            let _ = req.response_tx.send(result);
+        }
+    }
+
     fn forward_raw_logits(
         &mut self,
         input_ids: &[u32],
@@ -458,5 +468,6 @@ impl<M: ModelForward> Scheduler<M> {
         self.wakeup_live = false;
         self.drain_request_rx();
         self.drain_raw_logits_rx();
+        self.drain_remerge_lora_rx();
     }
 }
