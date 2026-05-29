@@ -1,5 +1,14 @@
 # OPD perf axis: student_rollout is 67% of step at rollout=128
 
+> **Direction confirmed, magnitude updated 2026-05-29** —
+> [`docs/plans/2026-05-29-opd-student-rollout-via-infer.md`](../plans/2026-05-29-opd-student-rollout-via-infer.md)
+> is the implementation plan. Two corrections to this doc: (1) the "~5×"
+> projection was conservative — infer measures 3.5 ms/tok for 0.8B at c=1 vs
+> this path's 1600–2880 ms/tok, i.e. ~500× at the decode level; (2) the §28
+> "amendment" attributing the O(n²) to attention-math FLOPs is wrong by ~5
+> orders of magnitude (520 MFLOP ≈ 0.5 ms, not 2.88 s). The true train-crate
+> pathology is unattributed but moot — infer routing replaces the path.
+
 **Date**: 2026-05-28 (Claude /loop tick 7)
 **Source**: `runs/2026-05-26-rollout128-v4-diverse1k-train-60/run.txt`
 
