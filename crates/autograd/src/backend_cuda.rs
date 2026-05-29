@@ -89,6 +89,26 @@ impl CudaBackend {
         }
     }
 
+    /// Query device VRAM `(free_bytes, total_bytes)` for the backend's CUDA
+    /// context. Used by OPD attribution tooling to log per-phase peak VRAM
+    /// without shelling out to `nvidia-smi`.
+    ///
+    /// # Errors
+    /// Returns an error if the driver `cuMemGetInfo` call fails.
+    #[cfg(not(feature = "no-cuda"))]
+    pub fn mem_get_info(&self) -> Result<(usize, usize)> {
+        self.stream
+            .context()
+            .mem_get_info()
+            .map_err(|_| AutogradError::TapeInvariant("cuda mem_get_info failed"))
+    }
+
+    /// No-GPU stub — VRAM query is unavailable without a CUDA device.
+    #[cfg(feature = "no-cuda")]
+    pub fn mem_get_info(&self) -> Result<(usize, usize)> {
+        todo!("GPU required: CudaBackend::mem_get_info is unavailable under feature no-cuda")
+    }
+
     #[cfg(not(feature = "no-cuda"))]
     fn upload_slice(&self, host: &[f32], shape: &[usize]) -> Result<CudaSlice<f32>> {
         let size = shape_size(shape);
