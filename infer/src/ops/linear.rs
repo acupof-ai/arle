@@ -116,7 +116,7 @@ fn linear_plan_inputs(
 /// Select the decode (single-token) linear kernel for `weight`.
 fn linear_decode_plan(weight: &DeviceMatrix) -> LinearKernel {
     let inputs = linear_plan_inputs(weight, 1, LinearDispatchPhase::Decode);
-    crate::oplib::linear::plan(&inputs, crate::dispatch_policy::dispatch_policy())
+    crate::oplib::linear::plan(&inputs, &crate::dispatch_policy::dispatch_policy())
 }
 
 /// Select the batched linear kernel for `weight` at `batch` on `phase`.
@@ -126,7 +126,7 @@ fn linear_batched_plan(
     phase: LinearDispatchPhase,
 ) -> LinearKernel {
     let inputs = linear_plan_inputs(weight, batch, phase);
-    let plan = crate::oplib::linear::plan(&inputs, crate::dispatch_policy::dispatch_policy());
+    let plan = crate::oplib::linear::plan(&inputs, &crate::dispatch_policy::dispatch_policy());
 
     // Preserve the legacy loud-fallback trace logs the resolver emitted when a
     // Marlin path was expected but the matrix is mis-aligned. The selection
@@ -134,11 +134,16 @@ fn linear_batched_plan(
     // they read the CUDA-side alignment *error reasons*, and fire on the same
     // conditions (and same masking) the inlined resolver did.
     //
-    // Hybrid trace: emitted inside `is_hybrid_w4_marlin` before falling through;
-    // the resolver did not early-return on it, so it is unmasked.
+    // Hybrid trace: in the legacy resolver this lived inside the
+    // `is_hybrid_w4_marlin` block, reached only AFTER the `MarlinW4FP8Prefill`
+    // early-return above it — so when FP8 fired, the hybrid trace was masked.
+    // Reproduce that masking with the `MarlinW4FP8Prefill` guard so the trace
+    // fires on exactly the legacy conditions (selection is identical regardless;
+    // this keeps the diagnostic log byte-identical too).
     if weight.is_hybrid_w4_marlin()
         && phase == LinearDispatchPhase::Prefill
         && batch > 1
+        && !matches!(plan, LinearKernel::MarlinW4FP8Prefill)
         && hybrid_w4a8_prefill_enabled()
         && let Err(reason) = hybrid_w4a8_aligned(weight)
     {
