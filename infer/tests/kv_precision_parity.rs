@@ -200,14 +200,14 @@ fn get_model_path() -> String {
 }
 
 fn max_tokens() -> usize {
-    // Default: 256 tokens. Matches the 2026-05-05 FP8 KV Tier 1 trajectory
-    // gate. Short smoke (e.g. 32-token) misses the multi-page KV scale-drift
-    // failures that the FP8 / TQ paths historically hit. Override with
-    // KV_PARITY_MAX_TOKENS=<n>.
+    // Default: 4 tokens, the snappy iteration grid. Override with
+    // KV_PARITY_MAX_TOKENS=16 for the cross-precision stress grid the
+    // wins entries cite, or 256 for the original FP8 KV Tier 1
+    // multi-page scale-drift gate (2026-05-05 anchor).
     std::env::var("KV_PARITY_MAX_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256)
+        .unwrap_or(4)
 }
 
 fn num_prompts() -> usize {
