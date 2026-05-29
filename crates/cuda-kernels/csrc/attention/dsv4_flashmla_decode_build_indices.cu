@@ -107,7 +107,11 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_kernel(
         } else {
             // HCA — identity 0..comp_keys-1 into compressed; causality cap
             // mirrors dsv4_hybrid_attention_kernel:882.
-            int comp_keys = (compress_ratio > 0) ? ((start_pos + 1) / compress_ratio) : 0;
+            // floor(start_pos / ratio) — matches the reference HCA causal gate
+            // (block_end < t ⟹ floor(t/ratio) kept blocks) and the legacy
+            // hybrid kernel. Was `(start_pos+1)/ratio`, off by one at the SW
+            // boundary (start_pos+1 ≡ 0 mod ratio).
+            int comp_keys = (compress_ratio > 0) ? (start_pos / compress_ratio) : 0;
             // Caller's `max_compressed_keys` is the padded capacity; clamp
             // `comp_keys` to its lower bound (kept-keys) below.
             // Note: caller is responsible for ensuring max_compressed_keys

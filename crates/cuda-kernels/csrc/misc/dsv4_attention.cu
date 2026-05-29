@@ -879,7 +879,13 @@ __global__ void dsv4_hybrid_attention_kernel(
     if (mode == 1) {
       comp_keys = selected_topk;
     } else if (mode == 2) {
-      comp_keys = dsv4_imin(compressed_count, (abs_pos + 1) / compress_ratio);
+      // HCA causal block count = floor(abs_pos / ratio), matching the CPU
+      // reference gate `block_end = block*ratio + ratio-1 < t` (reference.rs:382,
+      // which yields exactly floor(t/ratio) kept blocks). The prior `(abs_pos+1)`
+      // admitted one extra (straddling) block whenever `abs_pos+1` was a multiple
+      // of `ratio` — e.g. at abs_pos=127 with ratio=128, precisely the sliding-
+      // window boundary where long-context attention first engages.
+      comp_keys = dsv4_imin(compressed_count, abs_pos / compress_ratio);
     }
     comp_keys = dsv4_imin(comp_keys, DSV4_ATTN_MAX_KEYS);
     int total_keys = dsv4_imin(comp_keys + sw_count, DSV4_ATTN_MAX_KEYS);
