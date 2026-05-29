@@ -13,6 +13,7 @@ pub(crate) mod deepseek_v4_manifest;
 #[cfg(any(feature = "cpu", feature = "cuda"))]
 #[path = "model/deepseek/reference.rs"]
 pub(crate) mod deepseek_v4_reference;
+pub mod dispatch_policy;
 pub mod distributed;
 pub mod error;
 pub mod events;

@@ -7,7 +7,6 @@
 
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
-use std::sync::OnceLock;
 
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
@@ -52,13 +51,7 @@ pub(crate) struct PagedKVMeta<'a> {
 }
 
 pub(crate) fn tilelang_bf16_split_kv_requested() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("INFER_TILELANG_BF16_SPLIT_KV").as_deref(),
-            Ok("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
-        )
-    })
+    crate::dispatch_policy::dispatch_policy().tilelang_bf16_split_kv
 }
 
 fn tilelang_bf16_split_kv_enabled(max_kv_tokens: usize) -> bool {
