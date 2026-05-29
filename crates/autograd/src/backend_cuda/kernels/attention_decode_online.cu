@@ -63,6 +63,17 @@ __device__ __forceinline__ float load_kv<unsigned short>(const unsigned short* p
     return bf16_bits_to_f32(*ptr);
 }
 
+// F32 → BF16 round-to-nearest-even. Matches `__float2bfloat16_rn` semantics
+// without depending on cuda_bf16.h.
+__device__ __forceinline__ unsigned short f32_to_bf16_bits(float v) {
+    unsigned int u;
+    asm("mov.b32 %0, %1;" : "=r"(u) : "f"(v));
+    // RNE rounding: add 0x7FFF + (mantissa_lsb_msb & 1) before truncation.
+    unsigned int rounding_bias = 0x7FFF + ((u >> 16) & 1);
+    unsigned int rounded = u + rounding_bias;
+    return (unsigned short) (rounded >> 16);
+}
+
 // Warp-wide sum reduction. `WARP_SIZE` must be 32.
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
@@ -204,6 +215,39 @@ __global__ void causal_sdpa_decode_gqa_cache_online_bf16_hd256(
     if (head_dim != 256) return;
     causal_sdpa_decode_gqa_cache_online_impl<unsigned short, 256>(
         q, k, v, out, batch, query_heads, kv_heads, max_seq, kv_len, q_start, scale);
+}
+
+// Combined cast + write kernel: read f32 src K or V row [batch, heads, seq, head_dim]
+// (seq=1 for the freshly-projected token), narrow each element to bf16, store at
+// `dst[..., seq_offset, ...]`. Replaces the f32 `kv_cache_write_axis2_f32` for the
+// bf16-cache rollout path. Launch: one block per (batch * heads * seq) row,
+// `head_dim` threads per block (or up to 1024).
+__global__ void kv_cache_write_axis2_f32_to_bf16(
+    unsigned short* __restrict__ dst,
+    const float* __restrict__ src,
+    int batch,
+    int heads,
+    int dst_max_seq,
+    int src_seq_len,
+    int head_dim,
+    int seq_offset
+) {
+    int row = blockIdx.x;
+    int b = row / (heads * src_seq_len);
+    int rem = row - b * (heads * src_seq_len);
+    int h = rem / src_seq_len;
+    int s = rem - h * src_seq_len;
+    if (b >= batch) return;
+
+    int dst_seq = seq_offset + s;
+    if (dst_seq >= dst_max_seq) return;
+
+    int src_base = ((b * heads + h) * src_seq_len + s) * head_dim;
+    int dst_base = ((b * heads + h) * dst_max_seq + dst_seq) * head_dim;
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        dst[dst_base + d] = f32_to_bf16_bits(src[src_base + d]);
+    }
 }
 
 }  // extern "C"
