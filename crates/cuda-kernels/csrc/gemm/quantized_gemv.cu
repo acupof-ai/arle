@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>  // POSIX strcasecmp — not exposed in std:: under nvcc
 
 // GAP-A CUTLASS-MMA GEMV (defined in quantized_gemv_mma.cu). Gated behind
 // the ARLE_DSV4_FP8_GEMV_MMA env knob inside dsv4_fp8_gemv_batch_cuda for
@@ -36,7 +37,7 @@ static bool dsv4_fp8_gemv_mma_enabled() {
     static const bool enabled = []() -> bool {
         const char* v = std::getenv("ARLE_DSV4_FP8_GEMV_MMA");
         if (v == nullptr) return false;
-        return std::strcmp(v, "1") == 0 || std::strcasecmp(v, "true") == 0;
+        return std::strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0;
     }();
     return enabled;
 }
