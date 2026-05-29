@@ -63,12 +63,20 @@ pub struct InferRolloutCtx<'a> {
     pub lora_config: LoraConfig,
 }
 
-/// True when `ARLE_OPD_INFER_ROLLOUT` selects the infer-engine rollout path.
+/// True when the infer-engine rollout path is selected (OPD P4: now the
+/// **default**). The in-process infer student engine (CUDA graph + paged KV)
+/// is 4.99× faster end-to-end than the train-crate hand-written O(n²) decode
+/// (see `docs/experience/wins/2026-05-29-opd-infer-rollout-default-p4.md`).
+///
+/// Opt **out** to the train-crate fallback rollout by setting
+/// `ARLE_OPD_INFER_ROLLOUT=0` (or `false`); any other value (or unset) keeps
+/// the fast infer path on.
 #[cfg(feature = "cuda")]
 pub fn infer_rollout_flag_enabled() -> bool {
-    std::env::var("ARLE_OPD_INFER_ROLLOUT")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    match std::env::var("ARLE_OPD_INFER_ROLLOUT") {
+        Ok(value) => !(value == "0" || value.eq_ignore_ascii_case("false")),
+        Err(_) => true,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
