@@ -147,9 +147,11 @@ namespace {
 //   [sw_count_t,  sw_count_t + comp_t)   ← identity 0..comp_t-1 into compressed
 //   [sw_count_t + comp_t, topk_unified)  ← -1 padding
 //
-// where comp_t = min(compressed_count, (start_pos + t + 1) / compress_ratio)
-// mirrors `comp_keys = dsv4_imin(compressed_count, (abs_pos+1)/compress_ratio)`
-// at dsv4_hybrid_attention_kernel:882.
+// where comp_t = min(compressed_count, (start_pos + t) / compress_ratio)
+// mirrors `comp_keys = dsv4_imin(compressed_count, abs_pos / compress_ratio)`
+// at dsv4_hybrid_attention_kernel:888 — floor(t/ratio) causal gate, matching
+// the CPU reference and the already-fixed siblings (dsv4_attention.cu:888,
+// dsv4_flashmla_decode_build_indices.cu:114).
 //
 // topk_length[t] = sw_count_t + comp_t.
 __global__ void arle_hca_build_indices_kernel(
@@ -170,8 +172,8 @@ __global__ void arle_hca_build_indices_kernel(
     const int sw_start = max(0, abs_pos + 1 - sw_window);
     const int sw_count = abs_pos - sw_start + 1;
 
-    // HCA per-token compressed key count (mirrors dsv4_hybrid_attention_kernel:882).
-    int comp_keys = (compress_ratio > 0) ? ((abs_pos + 1) / compress_ratio) : 0;
+    // HCA per-token compressed key count (mirrors dsv4_hybrid_attention_kernel:888).
+    int comp_keys = (compress_ratio > 0) ? (abs_pos / compress_ratio) : 0;
     if (comp_keys > compressed_count) comp_keys = compressed_count;
     if (comp_keys < 0) comp_keys = 0;
 
