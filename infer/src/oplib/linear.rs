@@ -23,6 +23,8 @@
 //! returned [`LinearKernel`] to the matching kernel launch. The selection logic
 //! lives here exactly once; the launch logic stays on the CUDA side.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::dispatch_policy::DispatchPolicy;
 
 /// Backend-neutral mirror of the weight storage format the kernel ABI selects
@@ -154,6 +156,138 @@ impl LinearKernel {
             Self::TurboQuantDequantCublasGemm => "TurboQuantDequantCublasGemm",
         }
     }
+
+    /// The number of distinct `LinearKernel` variants — the size of the
+    /// process-global [`LINEAR_KERNEL_FIRED`] counter array. Kept in lockstep
+    /// with [`metric_index`](Self::metric_index): every variant maps to a
+    /// distinct index in `0..VARIANT_COUNT`.
+    pub const VARIANT_COUNT: usize = 31;
+
+    /// O(1), branch-table mapping from variant to a distinct counter slot in
+    /// `0..VARIANT_COUNT`. This is the index the lock-free dispatch counter uses
+    /// — no string compare on the hot path. Aligned 1:1 with
+    /// [`kernel_label`](Self::kernel_label) (same variant order); the unit test
+    /// `metric_index_is_distinct_per_variant` asserts no two variants collide
+    /// and that every index is in range.
+    #[must_use]
+    pub fn metric_index(self) -> usize {
+        match self {
+            Self::Bf16Gemv => 0,
+            Self::Bf16GraphsafeGemm => 1,
+            Self::Bf16CublasGemm => 2,
+            Self::W2A16Gemv => 3,
+            Self::W4A16Gemv => 4,
+            Self::W8A16Gemv => 5,
+            Self::Dsv4Fp8Gemv => 6,
+            Self::Dsv4Fp4Gemv => 7,
+            Self::W2A16BatchGemv => 8,
+            Self::W4A16BatchGemv => 9,
+            Self::W8A16BatchGemv => 10,
+            Self::Dsv4Fp8BatchGemv => 11,
+            Self::Dsv4Fp4BatchGemv => 12,
+            Self::Q3KGemv => 13,
+            Self::Q4KGemv => 14,
+            Self::Q5KGemv => 15,
+            Self::Q6KGemv => 16,
+            Self::Q3KBatchGemv => 17,
+            Self::Q4KBatchGemv => 18,
+            Self::Q5KBatchGemv => 19,
+            Self::Q6KBatchGemv => 20,
+            Self::Q3KDequantCublasGemm => 21,
+            Self::Q4KDequantCublasGemm => 22,
+            Self::Q5KDequantCublasGemm => 23,
+            Self::Q6KDequantCublasGemm => 24,
+            Self::MarlinW4Gemm => 25,
+            Self::MarlinW4A8Gemm => 26,
+            Self::MarlinW4Hybrid => 27,
+            Self::MarlinW4FP8Prefill => 28,
+            Self::TurboQuantGemv => 29,
+            Self::TurboQuantDequantCublasGemm => 30,
+        }
+    }
+
+    /// Reconstruct the variant from its [`metric_index`](Self::metric_index).
+    /// Used only by the cold render path ([`linear_kernel_fired_counts`]) to
+    /// recover the `kernel_label` for each populated counter slot. The match is
+    /// the inverse of `metric_index`; the unit test exercises the round-trip.
+    #[must_use]
+    fn from_metric_index(index: usize) -> Self {
+        match index {
+            0 => Self::Bf16Gemv,
+            1 => Self::Bf16GraphsafeGemm,
+            2 => Self::Bf16CublasGemm,
+            3 => Self::W2A16Gemv,
+            4 => Self::W4A16Gemv,
+            5 => Self::W8A16Gemv,
+            6 => Self::Dsv4Fp8Gemv,
+            7 => Self::Dsv4Fp4Gemv,
+            8 => Self::W2A16BatchGemv,
+            9 => Self::W4A16BatchGemv,
+            10 => Self::W8A16BatchGemv,
+            11 => Self::Dsv4Fp8BatchGemv,
+            12 => Self::Dsv4Fp4BatchGemv,
+            13 => Self::Q3KGemv,
+            14 => Self::Q4KGemv,
+            15 => Self::Q5KGemv,
+            16 => Self::Q6KGemv,
+            17 => Self::Q3KBatchGemv,
+            18 => Self::Q4KBatchGemv,
+            19 => Self::Q5KBatchGemv,
+            20 => Self::Q6KBatchGemv,
+            21 => Self::Q3KDequantCublasGemm,
+            22 => Self::Q4KDequantCublasGemm,
+            23 => Self::Q5KDequantCublasGemm,
+            24 => Self::Q6KDequantCublasGemm,
+            25 => Self::MarlinW4Gemm,
+            26 => Self::MarlinW4A8Gemm,
+            27 => Self::MarlinW4Hybrid,
+            28 => Self::MarlinW4FP8Prefill,
+            29 => Self::TurboQuantGemv,
+            30 => Self::TurboQuantDequantCublasGemm,
+            other => unreachable!(
+                "metric_index {other} out of range 0..{}",
+                Self::VARIANT_COUNT
+            ),
+        }
+    }
+}
+
+/// Process-global, lock-free per-variant "this GEMM kernel actually FIRED"
+/// counter — the Observe gate of GPU-dispatch governance Phase 1
+/// (`docs/plans/gpu-dispatch-governance.md`). One `AtomicU64` slot per
+/// [`LinearKernel`] variant, indexed by [`LinearKernel::metric_index`].
+///
+/// Backend-neutral: no CUDA / MLX / metrics type is named here. The CUDA launch
+/// path calls [`record_linear_kernel`] at the dispatch site (the *fired* fact,
+/// not the *selected* fact — `plan()` stays uncounted); the cold `/v1/stats`
+/// render path reads [`linear_kernel_fired_counts`].
+static LINEAR_KERNEL_FIRED: [AtomicU64; LinearKernel::VARIANT_COUNT] =
+    [const { AtomicU64::new(0) }; LinearKernel::VARIANT_COUNT];
+
+/// Record that `k` was the kernel actually dispatched (launched). Hot path:
+/// exactly one `Relaxed` `fetch_add` indexed by [`LinearKernel::metric_index`]
+/// — no Mutex / RwLock / HashMap, no allocation, no string compare. Called once
+/// per real dispatch from the CUDA launch site.
+#[inline]
+pub fn record_linear_kernel(k: LinearKernel) {
+    LINEAR_KERNEL_FIRED[k.metric_index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the fired-counts as `(kernel_label, count)` pairs, **only for
+/// variants with count > 0** (a `/v1/stats` scrape stays small — quiet kernels
+/// emit no line). Cold path: allocates a `Vec`, reads each slot with `Relaxed`.
+/// The render block (`metrics/render.rs`) iterates this to emit
+/// `infer_dispatch_kernel_total{op="linear",variant="<label>"}` lines.
+#[must_use]
+pub fn linear_kernel_fired_counts() -> Vec<(&'static str, u64)> {
+    LINEAR_KERNEL_FIRED
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            let count = slot.load(Ordering::Relaxed);
+            (count > 0).then(|| (LinearKernel::from_metric_index(index).kernel_label(), count))
+        })
+        .collect()
 }
 
 /// Host-side description of a linear dispatch, holding every predicate the
@@ -603,6 +737,129 @@ mod tests {
                 };
                 assert!(!plan(&inputs, &policy).kernel_label().is_empty());
             }
+        }
+    }
+
+    /// Every variant that `plan` can return — used to exercise `metric_index`
+    /// distinctness and the round-trip through `from_metric_index`. Listed by
+    /// hand (not derived) so adding an enum variant without extending the
+    /// counter contract makes this list, and the asserts below, go stale loudly.
+    const ALL_KERNELS: [LinearKernel; LinearKernel::VARIANT_COUNT] = [
+        LinearKernel::Bf16Gemv,
+        LinearKernel::Bf16GraphsafeGemm,
+        LinearKernel::Bf16CublasGemm,
+        LinearKernel::W2A16Gemv,
+        LinearKernel::W4A16Gemv,
+        LinearKernel::W8A16Gemv,
+        LinearKernel::Dsv4Fp8Gemv,
+        LinearKernel::Dsv4Fp4Gemv,
+        LinearKernel::W2A16BatchGemv,
+        LinearKernel::W4A16BatchGemv,
+        LinearKernel::W8A16BatchGemv,
+        LinearKernel::Dsv4Fp8BatchGemv,
+        LinearKernel::Dsv4Fp4BatchGemv,
+        LinearKernel::Q3KGemv,
+        LinearKernel::Q4KGemv,
+        LinearKernel::Q5KGemv,
+        LinearKernel::Q6KGemv,
+        LinearKernel::Q3KBatchGemv,
+        LinearKernel::Q4KBatchGemv,
+        LinearKernel::Q5KBatchGemv,
+        LinearKernel::Q6KBatchGemv,
+        LinearKernel::Q3KDequantCublasGemm,
+        LinearKernel::Q4KDequantCublasGemm,
+        LinearKernel::Q5KDequantCublasGemm,
+        LinearKernel::Q6KDequantCublasGemm,
+        LinearKernel::MarlinW4Gemm,
+        LinearKernel::MarlinW4A8Gemm,
+        LinearKernel::MarlinW4Hybrid,
+        LinearKernel::MarlinW4FP8Prefill,
+        LinearKernel::TurboQuantGemv,
+        LinearKernel::TurboQuantDequantCublasGemm,
+    ];
+
+    /// `metric_index` is a bijection onto `0..VARIANT_COUNT`: every variant maps
+    /// to a distinct in-range slot, `VARIANT_COUNT` is exactly the number of
+    /// variants, and `from_metric_index` round-trips. A new variant that forgot
+    /// to extend `metric_index` / `from_metric_index` / `VARIANT_COUNT` trips
+    /// one of these asserts (or fails to compile against `ALL_KERNELS`).
+    #[test]
+    fn metric_index_is_distinct_per_variant() {
+        let mut seen = [false; LinearKernel::VARIANT_COUNT];
+        for &k in &ALL_KERNELS {
+            let idx = k.metric_index();
+            assert!(
+                idx < LinearKernel::VARIANT_COUNT,
+                "metric_index {idx} for {k:?} out of range 0..{}",
+                LinearKernel::VARIANT_COUNT
+            );
+            assert!(
+                !seen[idx],
+                "metric_index {idx} collides — {k:?} shares a counter slot with another variant"
+            );
+            seen[idx] = true;
+            // Round-trips back to the same label (the cold render path relies on this).
+            assert_eq!(
+                LinearKernel::from_metric_index(idx).kernel_label(),
+                k.kernel_label()
+            );
+        }
+        assert!(
+            seen.iter().all(|&hit| hit),
+            "VARIANT_COUNT={} exceeds the number of distinct metric_index values produced",
+            LinearKernel::VARIANT_COUNT
+        );
+    }
+
+    /// Recording a kernel bumps exactly its own counter by one. `LINEAR_KERNEL_FIRED`
+    /// is process-global, so this asserts on before→after deltas (other tests in
+    /// the binary may also record) and confirms only the chosen slots move.
+    #[test]
+    fn record_linear_kernel_increments_only_its_slot() {
+        // Three distinct variants; record Bf16Gemv twice so the delta is 2.
+        let recorded = [
+            (LinearKernel::Bf16Gemv, 2u64),
+            (LinearKernel::W4A16BatchGemv, 1),
+            (LinearKernel::MarlinW4FP8Prefill, 3),
+        ];
+
+        let before: Vec<u64> = LINEAR_KERNEL_FIRED
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .collect();
+
+        for &(k, times) in &recorded {
+            for _ in 0..times {
+                record_linear_kernel(k);
+            }
+        }
+
+        // Per-slot deltas equal exactly what we recorded; untouched slots unchanged.
+        let mut expected_delta = [0u64; LinearKernel::VARIANT_COUNT];
+        for &(k, times) in &recorded {
+            expected_delta[k.metric_index()] += times;
+        }
+        for (idx, slot) in LINEAR_KERNEL_FIRED.iter().enumerate() {
+            let delta = slot.load(Ordering::Relaxed) - before[idx];
+            assert_eq!(
+                delta,
+                expected_delta[idx],
+                "slot {idx} ({}) moved by {delta}, expected {}",
+                LinearKernel::from_metric_index(idx).kernel_label(),
+                expected_delta[idx]
+            );
+        }
+
+        // The cold reader surfaces our recorded variants with count > 0 and the
+        // correct labels. (It returns only nonzero slots, so each must appear.)
+        let counts = linear_kernel_fired_counts();
+        for &(k, _) in &recorded {
+            let label = k.kernel_label();
+            let (_, count) = counts
+                .iter()
+                .find(|(name, _)| *name == label)
+                .unwrap_or_else(|| panic!("{label} missing from linear_kernel_fired_counts()"));
+            assert!(*count > 0, "{label} count should be > 0 after recording");
         }
     }
 }

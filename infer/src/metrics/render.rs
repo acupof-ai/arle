@@ -1017,6 +1017,22 @@ impl ServerMetrics {
             .unwrap();
         }
 
+        // Observe gate (GPU-dispatch governance Phase 1): which GEMM kernel
+        // ACTUALLY fired, per oplib::linear variant. Backend-neutral — reads the
+        // lock-free counter in oplib (no cuda/metrics-struct dependency). Only
+        // nonzero variants emit a line (quiet kernels stay off the scrape).
+        out.push_str(
+            "# HELP infer_dispatch_kernel_total GPU kernel dispatches that actually fired, by operator family and variant.\n",
+        );
+        out.push_str("# TYPE infer_dispatch_kernel_total counter\n");
+        for (variant, value) in crate::oplib::linear::linear_kernel_fired_counts() {
+            writeln!(
+                out,
+                "infer_dispatch_kernel_total{{{labels}op=\"linear\",variant=\"{variant}\",}} {value}"
+            )
+            .unwrap();
+        }
+
         let prefill_path_stats = self.prefill_path_stats();
         out.push_str(
             "# HELP infer_prefill_path_mixed_batch_total Mixed decode+prefill path outcomes.\n",
