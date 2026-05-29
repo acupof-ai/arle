@@ -3747,6 +3747,14 @@ pub(super) fn load_qwen35_metal_weights_from_gguf(
 
     if std::env::var("METAL_NO_CPP").is_err() {
         weights.cpp_model = CppQwen35Model::build(&weights, config, arch, false);
+        if weights.cpp_model.is_none() {
+            // C++ step model failed to build (see the build-time warns above for
+            // the specific cause); the forward path silently runs on the slower
+            // Rust/MLX hybrid. Surface the demotion at the default log level.
+            log::warn!(
+                "dispatch_fallback: C++ Qwen3.5 step model unavailable, running Rust/MLX hybrid path"
+            );
+        }
     }
 
     Ok(weights)
@@ -3888,6 +3896,14 @@ pub(super) fn load_qwen35_metal_weights(
     // Try to build the optional C++ step model.
     if std::env::var("METAL_NO_CPP").is_err() {
         weights.cpp_model = CppQwen35Model::build(&weights, config, arch, false);
+        if weights.cpp_model.is_none() {
+            // C++ step model failed to build (see the build-time warns above for
+            // the specific cause); the forward path silently runs on the slower
+            // Rust/MLX hybrid. Surface the demotion at the default log level.
+            log::warn!(
+                "dispatch_fallback: C++ Qwen3.5 step model unavailable, running Rust/MLX hybrid path"
+            );
+        }
     }
 
     Ok(weights)

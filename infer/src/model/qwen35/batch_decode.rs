@@ -1024,6 +1024,21 @@ impl Qwen35Model {
                     batch_size
                 );
                 bufs.graph_cache[group_idx][batch_size - 1] = Some(graph);
+            } else {
+                // end_capture produced no graph: the linear layers above already
+                // ran eagerly during the capture attempt and nothing was cached,
+                // so every subsequent step for this group also runs eager. Surface
+                // this demotion once (hot path — fire-once guard) so it is visible
+                // at the default log level, not only discoverable at bench time.
+                static GRAPH_CAPTURE_EMPTY_WARNED: std::sync::Once = std::sync::Once::new();
+                GRAPH_CAPTURE_EMPTY_WARNED.call_once(|| {
+                    log::warn!(
+                        "dispatch_fallback: cuda graph capture produced no graph for group {} (layers {}-{}), running eager",
+                        group_idx,
+                        layer_start,
+                        layer_end - 1
+                    );
+                });
             }
         }
 
