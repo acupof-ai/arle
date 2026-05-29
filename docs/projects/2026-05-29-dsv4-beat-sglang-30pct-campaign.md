@@ -183,3 +183,18 @@ SGLang and ARLE must bench SEQUENTIALLY, not concurrently.**
     built a whole ON-vs-OFF "regression" conclusion on it. Must validate the
     reference at the SLO shape before A/B-ing against it. See
     [[feedback_unvalidated_path_not_reference]].
+
+- **CORRECTNESS GATE PASSED (2026-05-29) — DSv4 long-context fixed + validated**:
+  The real bug (NOT the shared pool) was a two-part RoPE defect: (1) Q/SW-K
+  rotated with the compressed-key theta in compressed layers, (2) the default
+  FlashMLA decode+prefill shims missing the attention-output inverse-rope that
+  the legacy kernel + CPU reference apply. Found via a 5-lens adversarial audit
+  + legacy-path cross-check; fixed (commits d61d26f4 / 8105d5c6 / 003c8370).
+  **Validated on the default FlashMLA path: needle 11/12 HIT prompt_tok
+  100–2047** (was all-MISS/garbage >128). Decode-tail degeneration on forced
+  open-ended `ignore_eos` generation is universal greedy behaviour (the
+  reference-correct legacy path degenerates the same way; FlashMLA a bit earlier
+  = FP8 KV precision). See
+  `wins/2026-05-29-dsv4-longctx-rope-fix-validated.md`. The campaign can now
+  resume throughput work on a CORRECT foundation — prior I1/I2/I3 throughput
+  numbers were measured on a long-context-broken model and must be re-taken.
