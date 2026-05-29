@@ -29,6 +29,7 @@ pub mod model_source;
 pub mod multiproc_relay;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 pub mod native_deepep;
+pub mod oplib;
 pub mod prefix_cache;
 pub mod quant;
 #[cfg(any(feature = "cuda", feature = "metal"))]

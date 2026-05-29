@@ -61,131 +61,105 @@ fn check_marlin_status(
     ))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LinearKernelPlan {
-    Bf16Gemv,
-    Bf16GraphsafeGemm,
-    Bf16CublasGemm,
-    W2A16Gemv,
-    W4A16Gemv,
-    W8A16Gemv,
-    Dsv4Fp8Gemv,
-    Dsv4Fp4Gemv,
-    W2A16BatchGemv,
-    W4A16BatchGemv,
-    W8A16BatchGemv,
-    Dsv4Fp8BatchGemv,
-    Dsv4Fp4BatchGemv,
-    Q3KGemv,
-    Q4KGemv,
-    Q5KGemv,
-    Q6KGemv,
-    Q3KBatchGemv,
-    Q4KBatchGemv,
-    Q5KBatchGemv,
-    Q6KBatchGemv,
-    Q3KDequantCublasGemm,
-    Q4KDequantCublasGemm,
-    Q5KDequantCublasGemm,
-    Q6KDequantCublasGemm,
-    MarlinW4Gemm,
-    MarlinW4A8Gemm,
-    MarlinW4Hybrid,
-    /// PF8.4 — Prefill-only W4+FP8 marlin GEMM dispatch.
-    /// Opt-in via `INFER_MARLIN_W4_FP8_PREFILL=1` env var. Decode path
-    /// keeps existing W4A8 (FP8 mma is wrong lever for HBM-bound decode
-    /// per docs/research/2026-05-10-phase0a-decode-kill-architectural-implication.md).
-    MarlinW4FP8Prefill,
-    TurboQuantGemv,
-    TurboQuantDequantCublasGemm,
+// The linear dispatch *selection* (the former `LinearKernelPlan` enum + its
+// `batched`/`decode` resolvers) now lives in the backend-neutral, CPU-testable
+// `crate::oplib::linear`. This file keeps only the kernel-launch/run code; it
+// extracts a host-side `LinearPlanInputs` off the `&DeviceMatrix` and calls
+// `oplib::linear::plan()` to pick the kernel. The enum is re-exported under its
+// neutral name `LinearKernel` so the launch `match` arms read the same.
+use crate::oplib::linear::{
+    LinearKernel, LinearPhase, LinearPlanInputs, WeightFormat as OpWeightFmt,
+};
+
+/// Map the CUDA-side `WeightFormat` (kernel ABI selector) onto the
+/// backend-neutral `oplib::linear::WeightFormat` consumed by `plan()`.
+fn op_weight_format(weight: &DeviceMatrix) -> OpWeightFmt {
+    match weight.weight_format() {
+        WeightFormat::DenseBf16 => OpWeightFmt::DenseBf16,
+        WeightFormat::W8A16 => OpWeightFmt::W8A16,
+        WeightFormat::W4A16 => OpWeightFmt::W4A16,
+        WeightFormat::MarlinW4A8 => OpWeightFmt::MarlinW4A8,
+        WeightFormat::W2A16 => OpWeightFmt::W2A16,
+        WeightFormat::GgufQ3K => OpWeightFmt::GgufQ3K,
+        WeightFormat::GgufQ4K => OpWeightFmt::GgufQ4K,
+        WeightFormat::GgufQ5K => OpWeightFmt::GgufQ5K,
+        WeightFormat::GgufQ6K => OpWeightFmt::GgufQ6K,
+        WeightFormat::TurboQuant => OpWeightFmt::TurboQuant,
+        WeightFormat::Dsv4Fp8BlockScaled => OpWeightFmt::Dsv4Fp8BlockScaled,
+        WeightFormat::Dsv4Fp4BlockScaled => OpWeightFmt::Dsv4Fp4BlockScaled,
+    }
 }
 
-impl LinearKernelPlan {
-    fn decode(weight: &DeviceMatrix) -> Self {
-        if weight.is_hybrid_w4_marlin() {
-            return Self::MarlinW4Gemm;
-        }
-        match weight.weight_format() {
-            WeightFormat::DenseBf16 => Self::Bf16Gemv,
-            WeightFormat::W2A16 => Self::W2A16Gemv,
-            WeightFormat::W4A16 => Self::W4A16Gemv,
-            WeightFormat::W8A16 => Self::W8A16Gemv,
-            WeightFormat::Dsv4Fp8BlockScaled => Self::Dsv4Fp8Gemv,
-            WeightFormat::Dsv4Fp4BlockScaled => Self::Dsv4Fp4Gemv,
-            WeightFormat::GgufQ3K => Self::Q3KGemv,
-            WeightFormat::GgufQ4K => Self::Q4KGemv,
-            WeightFormat::GgufQ5K => Self::Q5KGemv,
-            WeightFormat::GgufQ6K => Self::Q6KGemv,
-            WeightFormat::MarlinW4A8 => Self::MarlinW4A8Gemm,
-            WeightFormat::TurboQuant => Self::TurboQuantGemv,
-        }
+/// Extract the host-side dispatch predicates `oplib::linear::plan()` reads,
+/// computing the alignment booleans via the CUDA-side helpers.
+fn linear_plan_inputs(
+    weight: &DeviceMatrix,
+    batch: usize,
+    phase: LinearDispatchPhase,
+) -> LinearPlanInputs {
+    LinearPlanInputs {
+        weight_format: op_weight_format(weight),
+        batch,
+        phase: match phase {
+            LinearDispatchPhase::Decode => LinearPhase::Decode,
+            LinearDispatchPhase::Prefill => LinearPhase::Prefill,
+        },
+        is_hybrid_w4_marlin: weight.is_hybrid_w4_marlin(),
+        has_marlin: weight.has_marlin(),
+        marlin_prefill_aligned: marlin_prefill_aligned(weight).is_ok(),
+        hybrid_w4a8_aligned: hybrid_w4a8_aligned(weight).is_ok(),
+        marlin_w4a8_aligned: marlin_w4a8_aligned(weight).is_ok(),
+        hybrid_w4_fp8_aligned: hybrid_w4_fp8_aligned(weight).is_ok(),
     }
+}
 
-    fn batched(weight: &DeviceMatrix, batch: usize, phase: LinearDispatchPhase) -> Self {
-        // PF8.4 — opt-in W4+FP8 prefill dispatch (decode keeps W4+INT8).
-        if phase == LinearDispatchPhase::Prefill
-            && batch > 1
-            && marlin_w4_fp8_prefill_enabled()
-            && hybrid_w4_fp8_aligned(weight).is_ok()
-        {
-            return Self::MarlinW4FP8Prefill;
-        }
-        if weight.is_hybrid_w4_marlin() {
-            if phase == LinearDispatchPhase::Prefill && batch > 1 && hybrid_w4a8_prefill_enabled() {
-                if hybrid_w4a8_aligned(weight).is_ok() {
-                    return Self::MarlinW4Hybrid;
-                }
-                if let Err(reason) = hybrid_w4a8_aligned(weight) {
-                    log::trace!("Hybrid W4A8 prefill fallback: {reason}");
-                }
-            }
-            if marlin_prefill_aligned(weight).is_ok() {
-                return Self::MarlinW4Gemm;
-            }
-        }
-        if marlin_w4a8_aligned(weight).is_ok() {
-            return Self::MarlinW4A8Gemm;
-        }
-        // M_quant Round 4 #6: env-gated override to prefer W4A16BatchGemv (BF16-native,
-        // 1 launch) over MarlinW4Gemm (3 launches) ONLY for decode-batched (batch ∈ 2..=8).
-        // Prefill (batch > 8 = seq_len > 8) always uses Marlin per Round 1 baseline (tensor-core
-        // utilization wins for matrix-matrix). EOD+106 preliminary bench showed unguarded
-        // override caused +37% ITL regression because it fired for prefill seq=4096.
-        // See docs/research/2026-05-09-eod106-r4-6-bench-preliminary-solid-gap.md.
-        if batch > 1
-            && marlin_prefill_aligned(weight).is_ok()
-            && !(batch <= 8 && crate::dispatch_policy::dispatch_policy().r4_w4a16_gemv_override)
-        {
-            return Self::MarlinW4Gemm;
-        }
-        if batch > 1
-            && weight.has_marlin()
-            && let Err(reason) = marlin_prefill_aligned(weight)
-        {
-            log::trace!("Marlin W4 fallback: {reason}");
-        }
+/// Select the decode (single-token) linear kernel for `weight`.
+fn linear_decode_plan(weight: &DeviceMatrix) -> LinearKernel {
+    let inputs = linear_plan_inputs(weight, 1, LinearDispatchPhase::Decode);
+    crate::oplib::linear::plan(&inputs, crate::dispatch_policy::dispatch_policy())
+}
 
-        match (batch, weight.weight_format()) {
-            (1, WeightFormat::DenseBf16) => Self::Bf16GraphsafeGemm,
-            (_, WeightFormat::DenseBf16) => Self::Bf16CublasGemm,
-            (1, _) => Self::decode(weight),
-            (_, WeightFormat::W2A16) => Self::W2A16BatchGemv,
-            (_, WeightFormat::W4A16) => Self::W4A16BatchGemv,
-            (_, WeightFormat::W8A16) => Self::W8A16BatchGemv,
-            (_, WeightFormat::Dsv4Fp8BlockScaled) => Self::Dsv4Fp8BatchGemv,
-            (_, WeightFormat::Dsv4Fp4BlockScaled) => Self::Dsv4Fp4BatchGemv,
-            (2..=8, WeightFormat::GgufQ3K) => Self::Q3KBatchGemv,
-            (2..=8, WeightFormat::GgufQ4K) => Self::Q4KBatchGemv,
-            (2..=8, WeightFormat::GgufQ5K) => Self::Q5KBatchGemv,
-            (2..=8, WeightFormat::GgufQ6K) => Self::Q6KBatchGemv,
-            (_, WeightFormat::GgufQ3K) => Self::Q3KDequantCublasGemm,
-            (_, WeightFormat::GgufQ4K) => Self::Q4KDequantCublasGemm,
-            (_, WeightFormat::GgufQ5K) => Self::Q5KDequantCublasGemm,
-            (_, WeightFormat::GgufQ6K) => Self::Q6KDequantCublasGemm,
-            (_, WeightFormat::MarlinW4A8) => Self::MarlinW4A8Gemm,
-            (_, WeightFormat::TurboQuant) => Self::TurboQuantDequantCublasGemm,
-        }
+/// Select the batched linear kernel for `weight` at `batch` on `phase`.
+fn linear_batched_plan(
+    weight: &DeviceMatrix,
+    batch: usize,
+    phase: LinearDispatchPhase,
+) -> LinearKernel {
+    let inputs = linear_plan_inputs(weight, batch, phase);
+    let plan = crate::oplib::linear::plan(&inputs, crate::dispatch_policy::dispatch_policy());
+
+    // Preserve the legacy loud-fallback trace logs the resolver emitted when a
+    // Marlin path was expected but the matrix is mis-aligned. The selection
+    // itself moved to `oplib::linear::plan`; these traces stay here because
+    // they read the CUDA-side alignment *error reasons*, and fire on the same
+    // conditions (and same masking) the inlined resolver did.
+    //
+    // Hybrid trace: emitted inside `is_hybrid_w4_marlin` before falling through;
+    // the resolver did not early-return on it, so it is unmasked.
+    if weight.is_hybrid_w4_marlin()
+        && phase == LinearDispatchPhase::Prefill
+        && batch > 1
+        && hybrid_w4a8_prefill_enabled()
+        && let Err(reason) = hybrid_w4a8_aligned(weight)
+    {
+        log::trace!("Hybrid W4A8 prefill fallback: {reason}");
     }
+    // Marlin W4 trace: the resolver only reached it after the
+    // MarlinW4FP8Prefill / MarlinW4Hybrid / MarlinW4A8Gemm early returns, so it
+    // is masked whenever the plan landed on one of those.
+    if batch > 1
+        && weight.has_marlin()
+        && !matches!(
+            plan,
+            LinearKernel::MarlinW4FP8Prefill
+                | LinearKernel::MarlinW4Hybrid
+                | LinearKernel::MarlinW4A8Gemm
+        )
+        && let Err(reason) = marlin_prefill_aligned(weight)
+    {
+        log::trace!("Marlin W4 fallback: {reason}");
+    }
+    plan
 }
 
 fn marlin_prefill_aligned(weight: &DeviceMatrix) -> std::result::Result<(), &'static str> {
@@ -541,39 +515,7 @@ pub(crate) fn linear_kernel_plan_for_test(
     } else {
         LinearDispatchPhase::Decode
     };
-    match LinearKernelPlan::batched(weight, batch, phase) {
-        LinearKernelPlan::Bf16Gemv => "Bf16Gemv",
-        LinearKernelPlan::Bf16GraphsafeGemm => "Bf16GraphsafeGemm",
-        LinearKernelPlan::Bf16CublasGemm => "Bf16CublasGemm",
-        LinearKernelPlan::W2A16Gemv => "W2A16Gemv",
-        LinearKernelPlan::W4A16Gemv => "W4A16Gemv",
-        LinearKernelPlan::W8A16Gemv => "W8A16Gemv",
-        LinearKernelPlan::Dsv4Fp8Gemv => "Dsv4Fp8Gemv",
-        LinearKernelPlan::Dsv4Fp4Gemv => "Dsv4Fp4Gemv",
-        LinearKernelPlan::W2A16BatchGemv => "W2A16BatchGemv",
-        LinearKernelPlan::W4A16BatchGemv => "W4A16BatchGemv",
-        LinearKernelPlan::W8A16BatchGemv => "W8A16BatchGemv",
-        LinearKernelPlan::Dsv4Fp8BatchGemv => "Dsv4Fp8BatchGemv",
-        LinearKernelPlan::Dsv4Fp4BatchGemv => "Dsv4Fp4BatchGemv",
-        LinearKernelPlan::Q3KGemv => "Q3KGemv",
-        LinearKernelPlan::Q4KGemv => "Q4KGemv",
-        LinearKernelPlan::Q5KGemv => "Q5KGemv",
-        LinearKernelPlan::Q6KGemv => "Q6KGemv",
-        LinearKernelPlan::Q3KBatchGemv => "Q3KBatchGemv",
-        LinearKernelPlan::Q4KBatchGemv => "Q4KBatchGemv",
-        LinearKernelPlan::Q5KBatchGemv => "Q5KBatchGemv",
-        LinearKernelPlan::Q6KBatchGemv => "Q6KBatchGemv",
-        LinearKernelPlan::Q3KDequantCublasGemm => "Q3KDequantCublasGemm",
-        LinearKernelPlan::Q4KDequantCublasGemm => "Q4KDequantCublasGemm",
-        LinearKernelPlan::Q5KDequantCublasGemm => "Q5KDequantCublasGemm",
-        LinearKernelPlan::Q6KDequantCublasGemm => "Q6KDequantCublasGemm",
-        LinearKernelPlan::MarlinW4Gemm => "MarlinW4Gemm",
-        LinearKernelPlan::MarlinW4A8Gemm => "MarlinW4A8Gemm",
-        LinearKernelPlan::MarlinW4Hybrid => "MarlinW4Hybrid",
-        LinearKernelPlan::MarlinW4FP8Prefill => "MarlinW4FP8Prefill",
-        LinearKernelPlan::TurboQuantGemv => "TurboQuantGemv",
-        LinearKernelPlan::TurboQuantDequantCublasGemm => "TurboQuantDequantCublasGemm",
-    }
+    linear_batched_plan(weight, batch, phase).kernel_label()
 }
 
 /// Additive LoRA GEMV: `y += B @ (A @ x)`.
@@ -729,8 +671,8 @@ pub(crate) fn gemv_with_marlin_scratch(
         weight.rows, output.len
     );
 
-    let plan = LinearKernelPlan::decode(weight);
-    if plan == LinearKernelPlan::Bf16Gemv {
+    let plan = linear_decode_plan(weight);
+    if plan == LinearKernel::Bf16Gemv {
         let (weight_ptr, _ga) = weight.data.device_ptr(&ctx.stream);
         let (input_ptr, _gx) = input.data.device_ptr(&ctx.stream);
         let (output_ptr, _gy) = output.data.device_ptr_mut(&ctx.stream);
@@ -754,7 +696,7 @@ pub(crate) fn gemv_with_marlin_scratch(
         return Ok(());
     }
 
-    if plan == LinearKernelPlan::MarlinW4A8Gemm {
+    if plan == LinearKernel::MarlinW4A8Gemm {
         if let Some(scratch) = marlin_scratch {
             run_marlin_w4a8_linear_with_scratch(
                 ctx,
@@ -770,7 +712,7 @@ pub(crate) fn gemv_with_marlin_scratch(
         return Ok(());
     }
 
-    if plan == LinearKernelPlan::MarlinW4Gemm {
+    if plan == LinearKernel::MarlinW4Gemm {
         if let Some(scratch) = marlin_scratch {
             run_marlin_w4_linear_with_scratch(
                 ctx,
@@ -786,7 +728,7 @@ pub(crate) fn gemv_with_marlin_scratch(
         return Ok(());
     }
 
-    if plan == LinearKernelPlan::TurboQuantGemv {
+    if plan == LinearKernel::TurboQuantGemv {
         let tq_p = weight
             .tq_packed
             .as_ref()
@@ -825,10 +767,7 @@ pub(crate) fn gemv_with_marlin_scratch(
         return Ok(());
     }
 
-    if matches!(
-        plan,
-        LinearKernelPlan::Dsv4Fp8Gemv | LinearKernelPlan::Dsv4Fp4Gemv
-    ) {
+    if matches!(plan, LinearKernel::Dsv4Fp8Gemv | LinearKernel::Dsv4Fp4Gemv) {
         return run_dsv4_block_scaled_gemv(ctx, weight, input, output, plan);
     }
 
@@ -852,25 +791,25 @@ pub(crate) fn gemv_with_marlin_scratch(
 
         unsafe {
             let res = match plan {
-                LinearKernelPlan::Q3KGemv => {
+                LinearKernel::Q3KGemv => {
                     ffi::q3k_gemv_cuda(wptr, xptr, yptr, out_dim, in_dim, stream)
                 }
-                LinearKernelPlan::Q4KGemv => {
+                LinearKernel::Q4KGemv => {
                     ffi::q4k_gemv_cuda(wptr, xptr, yptr, out_dim, in_dim, stream)
                 }
-                LinearKernelPlan::Q5KGemv => {
+                LinearKernel::Q5KGemv => {
                     ffi::q5k_gemv_cuda(wptr, xptr, yptr, out_dim, in_dim, stream)
                 }
-                LinearKernelPlan::Q6KGemv => {
+                LinearKernel::Q6KGemv => {
                     ffi::q6k_gemv_cuda(wptr, xptr, yptr, out_dim, in_dim, stream)
                 }
-                LinearKernelPlan::W2A16Gemv => ffi::w2a16_gemv_cuda(
+                LinearKernel::W2A16Gemv => ffi::w2a16_gemv_cuda(
                     wptr, sptr, xptr, yptr, out_dim, in_dim, group_size, stream,
                 ),
-                LinearKernelPlan::W4A16Gemv => ffi::w4a16_gemv_cuda(
+                LinearKernel::W4A16Gemv => ffi::w4a16_gemv_cuda(
                     wptr, sptr, xptr, yptr, out_dim, in_dim, group_size, stream,
                 ),
-                LinearKernelPlan::W8A16Gemv => ffi::w8a16_gemv_cuda(
+                LinearKernel::W8A16Gemv => ffi::w8a16_gemv_cuda(
                     qw_ptr as *const i8,
                     sptr,
                     xptr,
@@ -1882,7 +1821,7 @@ fn run_turboquant_linear(
     weight: &DeviceMatrix,
     x: &HiddenStates,
     out: &mut HiddenStates,
-    plan: LinearKernelPlan,
+    plan: LinearKernel,
 ) {
     let tq_p = weight.tq_packed.as_ref().unwrap();
     let tq_s = weight.tq_scales.as_ref().unwrap();
@@ -1899,7 +1838,7 @@ fn run_turboquant_linear(
     let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
 
     match plan {
-        LinearKernelPlan::TurboQuantGemv => unsafe {
+        LinearKernel::TurboQuantGemv => unsafe {
             ffi::turboquant_weight_gemv_cuda(
                 tp_ptr as *const u8,
                 ts_ptr as *const ffi::Half,
@@ -1916,7 +1855,7 @@ fn run_turboquant_linear(
                 stream,
             );
         },
-        LinearKernelPlan::TurboQuantDequantCublasGemm => {
+        LinearKernel::TurboQuantDequantCublasGemm => {
             let ws_size = weight.rows * weight.cols;
             let mut workspace: CudaSlice<bf16> = ctx
                 .stream
@@ -1960,7 +1899,7 @@ fn run_dsv4_block_scaled_gemv(
     weight: &DeviceMatrix,
     input: &DeviceVec,
     output: &mut DeviceVec,
-    plan: LinearKernelPlan,
+    plan: LinearKernel,
 ) -> Result<()> {
     let qw = weight
         .qweight
@@ -1978,7 +1917,7 @@ fn run_dsv4_block_scaled_gemv(
 
     unsafe {
         let res = match plan {
-            LinearKernelPlan::Dsv4Fp8Gemv => ffi::dsv4_fp8_gemv_cuda(
+            LinearKernel::Dsv4Fp8Gemv => ffi::dsv4_fp8_gemv_cuda(
                 qw_ptr as *const u8,
                 scales_ptr as *const u8,
                 input_ptr as *const ffi::Half,
@@ -1989,7 +1928,7 @@ fn run_dsv4_block_scaled_gemv(
                 weight.dsv4_scale_cols as i32,
                 stream,
             ),
-            LinearKernelPlan::Dsv4Fp4Gemv => ffi::dsv4_fp4_gemv_cuda(
+            LinearKernel::Dsv4Fp4Gemv => ffi::dsv4_fp4_gemv_cuda(
                 qw_ptr as *const u8,
                 scales_ptr as *const u8,
                 input_ptr as *const ffi::Half,
@@ -2013,7 +1952,7 @@ fn run_dsv4_block_scaled_linear(
     weight: &DeviceMatrix,
     x: &HiddenStates,
     out: &mut HiddenStates,
-    plan: LinearKernelPlan,
+    plan: LinearKernel,
 ) -> Result<()> {
     let qw = weight
         .qweight
@@ -2031,7 +1970,7 @@ fn run_dsv4_block_scaled_linear(
 
     unsafe {
         let res = match plan {
-            LinearKernelPlan::Dsv4Fp8Gemv | LinearKernelPlan::Dsv4Fp8BatchGemv => {
+            LinearKernel::Dsv4Fp8Gemv | LinearKernel::Dsv4Fp8BatchGemv => {
                 ffi::dsv4_fp8_gemv_batch_cuda(
                     qw_ptr as *const u8,
                     scales_ptr as *const u8,
@@ -2045,7 +1984,7 @@ fn run_dsv4_block_scaled_linear(
                     stream,
                 )
             }
-            LinearKernelPlan::Dsv4Fp4Gemv | LinearKernelPlan::Dsv4Fp4BatchGemv => {
+            LinearKernel::Dsv4Fp4Gemv | LinearKernel::Dsv4Fp4BatchGemv => {
                 ffi::dsv4_fp4_gemv_batch_cuda(
                     qw_ptr as *const u8,
                     scales_ptr as *const u8,
@@ -2072,7 +2011,7 @@ fn run_qweight_linear(
     weight: &DeviceMatrix,
     x: &HiddenStates,
     out: &mut HiddenStates,
-    plan: LinearKernelPlan,
+    plan: LinearKernel,
 ) {
     let qw = weight
         .qweight
@@ -2100,10 +2039,10 @@ fn run_qweight_linear(
 
     unsafe {
         let res = match plan {
-            LinearKernelPlan::Q3KDequantCublasGemm
-            | LinearKernelPlan::Q4KDequantCublasGemm
-            | LinearKernelPlan::Q5KDequantCublasGemm
-            | LinearKernelPlan::Q6KDequantCublasGemm => {
+            LinearKernel::Q3KDequantCublasGemm
+            | LinearKernel::Q4KDequantCublasGemm
+            | LinearKernel::Q5KDequantCublasGemm
+            | LinearKernel::Q6KDequantCublasGemm => {
                 let ws_elems = weight.rows * weight.cols;
                 let mut workspace: CudaSlice<bf16> = ctx
                     .stream
@@ -2112,16 +2051,16 @@ fn run_qweight_linear(
                 let (ws_ptr, _gws) = workspace.device_ptr_mut(&ctx.stream);
                 let tile = ws_ptr as *mut ffi::Half;
                 let dq = match plan {
-                    LinearKernelPlan::Q3KDequantCublasGemm => {
+                    LinearKernel::Q3KDequantCublasGemm => {
                         ffi::q3k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream)
                     }
-                    LinearKernelPlan::Q4KDequantCublasGemm => {
+                    LinearKernel::Q4KDequantCublasGemm => {
                         ffi::q4k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream)
                     }
-                    LinearKernelPlan::Q5KDequantCublasGemm => {
+                    LinearKernel::Q5KDequantCublasGemm => {
                         ffi::q5k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream)
                     }
-                    LinearKernelPlan::Q6KDequantCublasGemm => {
+                    LinearKernel::Q6KDequantCublasGemm => {
                         ffi::q6k_dequant_chunk_cuda(wptr, tile, n, k, 0, k, stream)
                     }
                     _ => unreachable!(),
@@ -2129,38 +2068,38 @@ fn run_qweight_linear(
                 dq.result().expect("qxk_dequant_chunk_cuda failed");
                 ffi::gemm_cuda(tile.cast_const(), xptr, yptr, n, batch, k, stream)
             }
-            LinearKernelPlan::Q3KGemv => ffi::q3k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
-            LinearKernelPlan::Q4KGemv => ffi::q4k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
-            LinearKernelPlan::Q5KGemv => ffi::q5k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
-            LinearKernelPlan::Q6KGemv => ffi::q6k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
-            LinearKernelPlan::W2A16Gemv => {
+            LinearKernel::Q3KGemv => ffi::q3k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
+            LinearKernel::Q4KGemv => ffi::q4k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
+            LinearKernel::Q5KGemv => ffi::q5k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
+            LinearKernel::Q6KGemv => ffi::q6k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
+            LinearKernel::W2A16Gemv => {
                 ffi::w2a16_gemv_cuda(wptr, sptr, xptr, yptr, n, k, group_size, stream)
             }
-            LinearKernelPlan::W4A16Gemv => {
+            LinearKernel::W4A16Gemv => {
                 ffi::w4a16_gemv_cuda(wptr, sptr, xptr, yptr, n, k, group_size, stream)
             }
-            LinearKernelPlan::W8A16Gemv => {
+            LinearKernel::W8A16Gemv => {
                 ffi::w8a16_gemv_cuda(wptr_i8, sptr, xptr, yptr, n, k, group_size, stream)
             }
-            LinearKernelPlan::Q3KBatchGemv => {
+            LinearKernel::Q3KBatchGemv => {
                 ffi::q3k_gemv_batch_cuda(wptr, xptr, yptr, batch, n, k, stream)
             }
-            LinearKernelPlan::Q4KBatchGemv => {
+            LinearKernel::Q4KBatchGemv => {
                 ffi::q4k_gemv_batch_cuda(wptr, xptr, yptr, batch, n, k, stream)
             }
-            LinearKernelPlan::Q5KBatchGemv => {
+            LinearKernel::Q5KBatchGemv => {
                 ffi::q5k_gemv_batch_cuda(wptr, xptr, yptr, batch, n, k, stream)
             }
-            LinearKernelPlan::Q6KBatchGemv => {
+            LinearKernel::Q6KBatchGemv => {
                 ffi::q6k_gemv_batch_cuda(wptr, xptr, yptr, batch, n, k, stream)
             }
-            LinearKernelPlan::W2A16BatchGemv => {
+            LinearKernel::W2A16BatchGemv => {
                 ffi::w2a16_gemv_batch_cuda(wptr, sptr, xptr, yptr, batch, n, k, group_size, stream)
             }
-            LinearKernelPlan::W4A16BatchGemv => {
+            LinearKernel::W4A16BatchGemv => {
                 ffi::w4a16_gemv_batch_cuda(wptr, sptr, xptr, yptr, batch, n, k, group_size, stream)
             }
-            LinearKernelPlan::W8A16BatchGemv => ffi::w8a16_gemv_batch_cuda(
+            LinearKernel::W8A16BatchGemv => ffi::w8a16_gemv_batch_cuda(
                 wptr_i8, sptr, xptr, yptr, batch, n, k, group_size, stream,
             ),
             _ => unreachable!("unexpected qweight linear plan {plan:?}"),
@@ -2174,7 +2113,7 @@ fn run_bf16_linear(
     weight: &DeviceMatrix,
     x: &HiddenStates,
     out: &mut HiddenStates,
-    plan: LinearKernelPlan,
+    plan: LinearKernel,
 ) {
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
@@ -2182,7 +2121,7 @@ fn run_bf16_linear(
 
     unsafe {
         match plan {
-            LinearKernelPlan::Bf16GraphsafeGemm => ffi::gemm_graphsafe_cuda(
+            LinearKernel::Bf16GraphsafeGemm => ffi::gemm_graphsafe_cuda(
                 w_ptr as *const ffi::Half,
                 x_ptr as *const ffi::Half,
                 y_ptr as *mut ffi::Half,
@@ -2193,7 +2132,7 @@ fn run_bf16_linear(
             )
             .result()
             .expect("gemm_graphsafe_cuda failed"),
-            LinearKernelPlan::Bf16CublasGemm => ffi::gemm_cuda(
+            LinearKernel::Bf16CublasGemm => ffi::gemm_cuda(
                 w_ptr as *const ffi::Half,
                 x_ptr as *const ffi::Half,
                 y_ptr as *mut ffi::Half,
@@ -2302,9 +2241,9 @@ pub(crate) fn try_gemm_with_phase_and_scratch_into(
         out.seq_len, x.seq_len
     );
 
-    let plan = LinearKernelPlan::batched(weight, x.seq_len, phase);
+    let plan = linear_batched_plan(weight, x.seq_len, phase);
     match plan {
-        LinearKernelPlan::MarlinW4Gemm => {
+        LinearKernel::MarlinW4Gemm => {
             if let Some(scratch) = marlin_scratch {
                 run_marlin_w4_linear_with_scratch(
                     ctx,
@@ -2318,7 +2257,7 @@ pub(crate) fn try_gemm_with_phase_and_scratch_into(
                 run_marlin_w4_gemm(ctx, weight, x, out)?;
             }
         }
-        LinearKernelPlan::MarlinW4A8Gemm | LinearKernelPlan::MarlinW4Hybrid => {
+        LinearKernel::MarlinW4A8Gemm | LinearKernel::MarlinW4Hybrid => {
             if let Some(scratch) = marlin_scratch {
                 run_marlin_w4a8_linear_with_scratch(
                     ctx,
@@ -2332,25 +2271,25 @@ pub(crate) fn try_gemm_with_phase_and_scratch_into(
                 run_marlin_w4a8_linear(ctx, weight, &x.data, x.seq_len, &mut out.data)?;
             }
         }
-        LinearKernelPlan::MarlinW4FP8Prefill => {
+        LinearKernel::MarlinW4FP8Prefill => {
             run_marlin_w4_fp8_prefill(ctx, weight, &x.data, x.seq_len, &mut out.data)?;
         }
-        LinearKernelPlan::TurboQuantGemv | LinearKernelPlan::TurboQuantDequantCublasGemm => {
+        LinearKernel::TurboQuantGemv | LinearKernel::TurboQuantDequantCublasGemm => {
             run_turboquant_linear(ctx, weight, x, out, plan);
         }
-        LinearKernelPlan::Dsv4Fp8Gemv
-        | LinearKernelPlan::Dsv4Fp4Gemv
-        | LinearKernelPlan::Dsv4Fp8BatchGemv
-        | LinearKernelPlan::Dsv4Fp4BatchGemv => {
+        LinearKernel::Dsv4Fp8Gemv
+        | LinearKernel::Dsv4Fp4Gemv
+        | LinearKernel::Dsv4Fp8BatchGemv
+        | LinearKernel::Dsv4Fp4BatchGemv => {
             run_dsv4_block_scaled_linear(ctx, weight, x, out, plan)?;
         }
-        LinearKernelPlan::Bf16CublasGemm if deterministic_gemm_enabled() => {
+        LinearKernel::Bf16CublasGemm if deterministic_gemm_enabled() => {
             run_bf16_graphsafe_per_row(ctx, weight, x, out);
         }
-        LinearKernelPlan::Bf16GraphsafeGemm | LinearKernelPlan::Bf16CublasGemm => {
+        LinearKernel::Bf16GraphsafeGemm | LinearKernel::Bf16CublasGemm => {
             run_bf16_linear(ctx, weight, x, out, plan);
         }
-        LinearKernelPlan::Bf16Gemv => unreachable!("batched linear never selects BF16 GEMV"),
+        LinearKernel::Bf16Gemv => unreachable!("batched linear never selects BF16 GEMV"),
         _ => run_qweight_linear(ctx, weight, x, out, plan),
     }
     Ok(())
