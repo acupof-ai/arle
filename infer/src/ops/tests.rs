@@ -286,6 +286,114 @@ fn test_dsv4_fp4_batched_gemv_b1_raw() -> Result<()> {
     Ok(())
 }
 
+// GAP-A Phase 4: bit/relerr parity between the CUTLASS-MMA GEMV launch and
+// the scalar `dsv4_fp8_gemv_batch_cuda` reference on a decode-shape tile
+// (B=1, N=128, K=512). Both decode FP8E4M3 + E8M0 identically and accumulate
+// in FP32 from BF16×BF16 products; the only divergence is last-bit BF16
+// rounding in the MMA mainloop, budgeted at relerr <= 1e-3. Calls both
+// launches directly so the env knob / dispatch shim is bypassed (this is a
+// kernel-vs-kernel numeric check, not a dispatch-gate check).
+#[test]
+fn test_dsv4_fp8_gemv_mma_parity() -> Result<()> {
+    let ctx = DeviceContext::new()?;
+
+    const B: usize = 1;
+    const N: usize = 128;
+    const K: usize = 512;
+
+    // Deterministic FP8E4M3 weight bytes drawn from a small "safe" alphabet
+    // (avoids the 0x00 / 0x7f / 0xff specials so both kernels take the common
+    // dequant path). Row-major [N, K].
+    let alphabet: [u8; 6] = [0x38, 0x3c, 0x40, 0xb8, 0xbc, 0xc0]; // ~ +1, +1.5, +2, -1, -1.5, -2
+    let weight_bytes: Vec<u8> = (0..N * K)
+        .map(|idx| alphabet[idx % alphabet.len()])
+        .collect();
+
+    // Single E8M0 scale block over the whole matrix: byte 127 → 2^0 = 1.0.
+    let scale_rows = 1usize;
+    let scale_cols = 1usize;
+    let scale_bytes = vec![127u8; scale_rows * scale_cols];
+
+    // Deterministic BF16 input [B, K] with small magnitude to keep BF16
+    // rounding well inside the relerr budget.
+    let input_host: Vec<bf16> = (0..B * K)
+        .map(|idx| bf16::from_f32(((idx % 7) as f32 - 3.0) * 0.25))
+        .collect();
+
+    let weight = ctx.stream.clone_htod(&weight_bytes)?;
+    let scales = ctx.stream.clone_htod(&scale_bytes)?;
+    let input = ctx.stream.clone_htod(&input_host)?;
+    let mut out_scalar = ctx.stream.alloc_zeros::<bf16>(B * N)?;
+    let mut out_mma = ctx.stream.alloc_zeros::<bf16>(B * N)?;
+
+    // ---- Scalar reference ----
+    {
+        let (weight_ptr, _wg) = weight.device_ptr(&ctx.stream);
+        let (scales_ptr, _sg) = scales.device_ptr(&ctx.stream);
+        let (input_ptr, _ig) = input.device_ptr(&ctx.stream);
+        let (output_ptr, _og) = out_scalar.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_fp8_gemv_batch_cuda(
+                weight_ptr as *const u8,
+                scales_ptr as *const u8,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                B as i32,
+                N as i32,
+                K as i32,
+                scale_rows as i32,
+                scale_cols as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    // ---- MMA launch ----
+    {
+        let (weight_ptr, _wg) = weight.device_ptr(&ctx.stream);
+        let (scales_ptr, _sg) = scales.device_ptr(&ctx.stream);
+        let (input_ptr, _ig) = input.device_ptr(&ctx.stream);
+        let (output_ptr, _og) = out_mma.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_fp8_gemv_batch_mma_launch(
+                weight_ptr as *const u8,
+                scales_ptr as *const u8,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                B as i32,
+                N as i32,
+                K as i32,
+                scale_rows as i32,
+                scale_cols as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    let scalar_host = ctx.stream.clone_dtoh(&out_scalar)?;
+    let mma_host = ctx.stream.clone_dtoh(&out_mma)?;
+    ctx.sync()?;
+
+    let scalar: Vec<f32> = scalar_host.iter().map(|v| v.to_f32()).collect();
+    let mma: Vec<f32> = mma_host.iter().map(|v| v.to_f32()).collect();
+
+    let mut max_relerr = 0.0f32;
+    for (idx, (&s, &m)) in scalar.iter().zip(mma.iter()).enumerate() {
+        let denom = s.abs().max(1.0);
+        let relerr = (s - m).abs() / denom;
+        assert!(
+            relerr <= 1e-3,
+            "MMA parity break at n={idx}: scalar={s} mma={m} relerr={relerr} (budget 1e-3)"
+        );
+        max_relerr = max_relerr.max(relerr);
+    }
+    eprintln!("dsv4_fp8_gemv MMA parity: B={B} N={N} K={K} max_relerr={max_relerr:.3e}");
+
+    Ok(())
+}
+
 #[test]
 fn test_dsv4_fp4_grouped_gemv() -> Result<()> {
     let ctx = DeviceContext::new()?;
