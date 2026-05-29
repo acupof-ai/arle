@@ -2088,6 +2088,9 @@ mod tests {
                     std::env::remove_var("INFER_HYBRID_W4A8_PREFILL");
                 }
             }
+            // The dispatch gate caches the policy; invalidate it so the next
+            // reader re-reads the restored env value.
+            crate::dispatch_policy::reset_dispatch_policy_cache();
         }
     }
 
@@ -2100,8 +2103,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let old = std::env::var_os("INFER_HYBRID_W4A8_PREFILL");
         // SAFETY: the mutex above serializes all mutations of this variable in
-        // these tests. The test only needs process-wide env because the dispatch
-        // gate intentionally reads the runtime env on each call.
+        // these tests. The dispatch gate caches the resolved policy, so after
+        // mutating the env we invalidate the cache (below) to force a re-read.
         unsafe {
             if let Some(value) = value {
                 std::env::set_var("INFER_HYBRID_W4A8_PREFILL", value);
@@ -2109,6 +2112,8 @@ mod tests {
                 std::env::remove_var("INFER_HYBRID_W4A8_PREFILL");
             }
         }
+        // Force the dispatch gate to re-read the env we just set.
+        crate::dispatch_policy::reset_dispatch_policy_cache();
         HybridPrefillEnvGuard { old, _lock: lock }
     }
 
