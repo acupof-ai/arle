@@ -77,3 +77,24 @@ SGLang and ARLE must bench SEQUENTIALLY, not concurrently.**
   decode at concurrency needs fixing BEFORE perf is comparable.
   SGLang baseline still pending user GPU-strategy choice. Next: fix c≥8
   decode concurrency (correctness/throughput) + decode allreduce overlap.
+
+- **I2 (2026-05-29)**: DSv4 true batched decode — FFN half + NCCL allreduce
+  now batch over N rows (c3e46932); attention core per-row (byte-identical).
+  **Parity PASS** (8×H20 TP=8): c=4 batched output byte-identical to c=1
+  per-row (`137 + 269 = 406...` all 4 rows). **Helps**: c=4 wall 6.1s vs
+  ~10.8s if fully serial (≈1.8× from FFN/allreduce batching); not flat
+  (attention still per-row). c=8 → `FlashMLA FP8 KV pool alloc OOM` (server
+  graceful-aborts, not the I1 300s timeout) — the FP8 KV pool is allocated
+  PER-SEQUENCE (per-state, state.rs), so 8 concurrent pools blow the
+  mem-fraction-static budget.
+  Batched-attention primitives landed on branch 7bfb9084 (batched indices
+  kernel + KV-addressing design) but fwd-wiring gated: FlashMLA has no
+  block_table (indices absolute into one kv base, splitkv_mla.cuh:468-545),
+  so the subagent's per-step D2D staging-arena copy is the only b=N path
+  WITHOUT a vendor patch — shape-dependent cost.
+  **UNIFYING NEXT FIX (I3): shared persistent FP8 decode KV pool** (one
+  allocation sized for num_slots, each slot owns a block range). Solves BOTH
+  (a) c=8 OOM (one pool, not N) AND (b) batched FlashMLA attention without
+  the per-step staging copy (indices offset per-row into the persistent
+  shared pool). This is the qwen3 PagedKVPool model for DSv4 decode and the
+  real "搞定 gpu 路径" fix.
