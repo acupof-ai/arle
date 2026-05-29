@@ -43,7 +43,33 @@ use crate::{
     teacher_infer::{InProcessTeacher, TeacherForward, TeacherForwardError},
     trainer::{cleanup_after_backward, retained_param_and_grad_ids},
 };
+#[cfg(feature = "cuda")]
+use crate::{infer_student::InferStudent, lora::LoraConfig};
 use autograd::ops::{add, mul_scalar, slice};
+
+/// Opt-in context to route the OPD student rollout through the in-process
+/// infer engine (`InferStudent`) instead of the train-crate hand-written
+/// decode kernel. P3 wiring behind the `ARLE_OPD_INFER_ROLLOUT` flag — see
+/// `docs/plans/2026-05-29-opd-student-rollout-via-infer.md`.
+///
+/// The caller constructs this only when both (a) the env flag is set and
+/// (b) an `InferStudent` was loaded; when `None`, the train-crate rollout
+/// runs unchanged (the A/B baseline arm).
+#[cfg(feature = "cuda")]
+pub struct InferRolloutCtx<'a> {
+    /// In-process infer student engine (LoRA-synced from the train store).
+    pub student: &'a InferStudent,
+    /// Train LoRA config (rank / alpha) used to export the adapter for sync.
+    pub lora_config: LoraConfig,
+}
+
+/// True when `ARLE_OPD_INFER_ROLLOUT` selects the infer-engine rollout path.
+#[cfg(feature = "cuda")]
+pub fn infer_rollout_flag_enabled() -> bool {
+    std::env::var("ARLE_OPD_INFER_ROLLOUT")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpdError {
@@ -1567,6 +1593,8 @@ pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForwar
             lambda: gkd_lambda,
             ..GkdLossConfig::default()
         },
+        #[cfg(feature = "cuda")]
+        None,
         profile,
     )
 }
@@ -1584,6 +1612,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
     store: &mut TensorStore,
     tape: &mut Tape,
     gkd_config: GkdLossConfig<'_>,
+    #[cfg(feature = "cuda")] infer_rollout: Option<InferRolloutCtx<'_>>,
     profile: Option<&mut OpdStepProfile>,
 ) -> Result<OpdStepOutcome> {
     let mut profile = profile;
@@ -1651,7 +1680,41 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         tape.set_enabled(false);
         let mut rollout: Vec<u32> = prompt_ids.to_vec();
         let use_rollout_kv_cache = student.supports_rollout_kv_cache();
-        if use_rollout_kv_cache && use_device_rollout_argmax(store, cfg.rollout_len, vocab) {
+
+        // P3 infer-engine rollout (opt-in): mirror the train LoRA into the
+        // infer student once per step, then greedily decode `rollout_len`
+        // tokens via the infer engine. Produces the same `rollout: Vec<u32>`
+        // the train-crate path would, so downstream KL/backward is unchanged.
+        // When the flag/ctx is absent, `infer_handled` stays false and the
+        // train-crate rollout chain below runs as the A/B baseline.
+        #[cfg(not(feature = "cuda"))]
+        let infer_handled = false;
+        #[cfg(feature = "cuda")]
+        let infer_handled = if let Some(ctx) = infer_rollout.as_ref() {
+            ctx.student
+                .sync_lora_from_store(store, &student.adapter_name_map(), ctx.lora_config)
+                .map_err(|err| {
+                    OpdError::InvalidInput(format!("infer student LoRA sync failed: {err}"))
+                })?;
+            for _ in 0..cfg.rollout_len {
+                let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
+                let next = ctx
+                    .student
+                    .decode_next_token(&rollout, &positions)
+                    .map_err(|err| {
+                        OpdError::InvalidInput(format!("infer student decode failed: {err}"))
+                    })?;
+                rollout.push(next);
+            }
+            store.retain_ids(&rollout_keep_base);
+            true
+        } else {
+            false
+        };
+
+        if infer_handled {
+            // rollout already produced via the infer engine.
+        } else if use_rollout_kv_cache && use_device_rollout_argmax(store, cfg.rollout_len, vocab) {
             let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + cfg.rollout_len);
             let mut generated_tokens = if cfg.rollout_len == 0 {
                 None

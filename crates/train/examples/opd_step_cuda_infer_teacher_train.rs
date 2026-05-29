@@ -31,7 +31,8 @@ mod tests {
 mod app {
     use super::{DEFAULT_EVAL_TRAIN_PROMPT_LIMIT, STATIC_PARAM_EVICT_MIN_ELEMENTS};
     use std::{
-        collections::HashSet,
+        borrow::Cow,
+        collections::{BTreeMap, HashSet},
         fs,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
@@ -42,12 +43,14 @@ mod app {
     use infer::server_engine::{
         InferenceEngineOptions, LoadedInferenceEngine, ServerRuntimeConfig,
     };
+    use safetensors::tensor::{Dtype, View};
     use train::{
         LoraAdapterConfig, LoraConfig, LoraTargetSet,
+        infer_student::InferStudent,
         loss::{DEFAULT_KL_CHUNK_SIZE, kl_distill_loss, kl_distill_loss_chunked},
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig, OpdStepProfile,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            GkdLossConfig, GkdSftAnchor, InferRolloutCtx, OpdKlMask, OpdStepConfig, OpdStepProfile,
+            infer_rollout_flag_enabled, opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         prompts::load_jsonl_prompt_sets,
         qwen35::{Qwen35Model, SequenceWindow},
@@ -242,6 +245,60 @@ mod app {
         let student_model_params = student.all_parameter_ids();
         let student_trainable_params = trainable_params(&student, &store);
         let student_host_evict_params = host_evict_param_ids(&student);
+
+        // P3: load the in-process infer student engine only when the rollout
+        // flag is on (otherwise don't pay the second-engine VRAM). The engine
+        // is loaded from the *student* model dir with the train student's
+        // current q/v adapter written to a temp PEFT dir + `INFER_LORA_PATH`
+        // set, so the infer model snapshots its pristine base at load
+        // (`cache_lora_base`). Per step, `sync_lora_from_store` restores that
+        // base and re-merges the fresh train adapter.
+        let infer_student = if infer_rollout_flag_enabled() {
+            if args.lora_target_set != LoraTargetSet::AttentionQv {
+                return Err(
+                    "ARLE_OPD_INFER_ROLLOUT requires --lora-target-set attention-qv (the infer \
+                     merge path only carries q/v adapters on full-attention layers)"
+                        .into(),
+                );
+            }
+            let infer_student_load_started = Instant::now();
+            let adapter_dir = tempfile::tempdir()?;
+            write_infer_adapter_dir(
+                adapter_dir.path(),
+                &mut store,
+                &student.adapter_name_map(),
+                args.lora_rank,
+                args.lora_alpha,
+            )?;
+            // SAFETY: single-threaded setup before the engine scheduler spawns.
+            unsafe {
+                std::env::set_var("INFER_LORA_PATH", adapter_dir.path());
+            }
+            let engine = load_infer_engine(
+                &args.student_model,
+                args.prompt_max_tokens + args.rollout_len + 32,
+                args.enable_cuda_graph,
+            );
+            unsafe {
+                std::env::remove_var("INFER_LORA_PATH");
+            }
+            let engine = engine?;
+            let infer_student = InferStudent::new(
+                Arc::new(Mutex::new(engine)),
+                cuda_backend.clone() as Arc<dyn Backend>,
+                student.config().vocab_size,
+            );
+            println!(
+                "infer_student_loaded seconds={:.6} student_model={}",
+                infer_student_load_started.elapsed().as_secs_f64(),
+                args.student_model.display()
+            );
+            log_memory_summary("after_infer_student_load", &store);
+            Some(infer_student)
+        } else {
+            None
+        };
+
         if let Some(config_path) = args.teacher_config.as_ref() {
             let named_teachers = load_api_teacher_config(config_path, student.config().vocab_size)?;
             let entries = named_teachers
@@ -270,6 +327,7 @@ mod app {
                 "api-multi",
                 student_load_seconds,
                 0.0,
+                infer_student.as_ref(),
                 || RuntimeTeacherProfile::default(),
                 |prompt| multi_teacher.selected_teacher_id(prompt).to_owned(),
             );
@@ -297,6 +355,7 @@ mod app {
                 "api",
                 student_load_seconds,
                 0.0,
+                infer_student.as_ref(),
                 || profile_from_api(&api_teacher),
                 |_| "api".to_owned(),
             );
@@ -323,6 +382,7 @@ mod app {
                 "in-process",
                 student_load_seconds,
                 teacher_load_seconds,
+                infer_student.as_ref(),
                 || RuntimeTeacherProfile::default(),
                 |_| "in-process".to_owned(),
             );
@@ -354,6 +414,7 @@ mod app {
             "infer",
             student_load_seconds,
             infer_load_seconds,
+            infer_student.as_ref(),
             || profile_from_infer(&infer_teacher),
             |_| "infer".to_owned(),
         )
@@ -688,6 +749,85 @@ mod app {
         )
     }
 
+    /// A raw F32 safetensors matrix view, used to write the PEFT adapter the
+    /// infer student engine loads at bootstrap (so it caches the pristine base).
+    struct F32Tensor {
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    impl View for &F32Tensor {
+        fn dtype(&self) -> Dtype {
+            Dtype::F32
+        }
+        fn shape(&self) -> &[usize] {
+            &self.shape
+        }
+        fn data(&self) -> Cow<'_, [u8]> {
+            Cow::Borrowed(&self.data)
+        }
+        fn data_len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    /// Map a train adapter name (`...layers.7.self_attn.q_proj.weight.lora_a`)
+    /// to the PEFT on-disk name infer's loader expects.
+    fn peft_name(internal: &str) -> Option<String> {
+        let (base, suffix) = if let Some(b) = internal.strip_suffix(".lora_a") {
+            (b, "lora_A")
+        } else if let Some(b) = internal.strip_suffix(".lora_b") {
+            (b, "lora_B")
+        } else {
+            return None;
+        };
+        let base = base.strip_suffix(".weight")?;
+        Some(format!("base_model.model.{base}.{suffix}.weight"))
+    }
+
+    /// Write the train student's current q/v adapter (raw A/B) to a PEFT
+    /// adapter dir so the infer engine snapshots the pristine base at load.
+    fn write_infer_adapter_dir(
+        dir: &Path,
+        store: &mut TensorStore,
+        adapter_map: &std::collections::HashMap<&'static str, TensorId>,
+        lora_rank: usize,
+        lora_alpha: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut tensors: BTreeMap<String, F32Tensor> = BTreeMap::new();
+        for (&name, &id) in adapter_map {
+            let Some(peft) = peft_name(name) else {
+                continue;
+            };
+            if !(name.contains(".q_proj.") || name.contains(".v_proj.")) {
+                continue;
+            }
+            let shape = store
+                .get(id)
+                .ok_or_else(|| format!("adapter tensor {name} missing from store"))?
+                .shape
+                .clone();
+            let values = store.to_host(id)?;
+            let data = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            tensors.insert(peft, F32Tensor { shape, data });
+        }
+        if tensors.is_empty() {
+            return Err("no q/v adapters to write; check --lora-target-set attention-qv".into());
+        }
+        let views: BTreeMap<String, &F32Tensor> =
+            tensors.iter().map(|(k, v)| (k.clone(), v)).collect();
+        safetensors::serialize_to_file(views, None, &dir.join("adapter_model.safetensors"))?;
+        fs::write(
+            dir.join("adapter_config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "r": lora_rank,
+                "lora_alpha": lora_alpha,
+                "target_modules": ["q_proj", "v_proj"],
+            }))?,
+        )?;
+        Ok(())
+    }
+
     fn run_training<T, ProfileFn, RouteFn>(
         args: &Args,
         prompts: &PromptSets,
@@ -702,6 +842,7 @@ mod app {
         teacher_source: &str,
         student_load_seconds: f64,
         teacher_load_seconds: f64,
+        infer_student: Option<&InferStudent>,
         mut teacher_profile: ProfileFn,
         route_teacher_id: RouteFn,
     ) -> Result<(), Box<dyn std::error::Error>>
@@ -763,6 +904,13 @@ mod app {
             let selected_teacher = route_teacher_id(prompt);
             let mut profile = OpdStepProfile::default();
             log_memory_summary("before_train_step", store);
+            let infer_rollout = infer_student.map(|student| InferRolloutCtx {
+                student,
+                lora_config: LoraConfig {
+                    rank: args.lora_rank,
+                    alpha: args.lora_alpha,
+                },
+            });
             let step_started = Instant::now();
             let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
                 student,
@@ -784,6 +932,7 @@ mod app {
                     logits_window_size: args.logits_window_size,
                     kl_mask: args.opd_kl_mask,
                 },
+                infer_rollout,
                 Some(&mut profile),
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();
