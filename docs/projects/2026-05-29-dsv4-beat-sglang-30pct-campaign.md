@@ -150,3 +150,36 @@ SGLang and ARLE must bench SEQUENTIALLY, not concurrently.**
   serial-allreduce cost is the deeper limit; batched attention + per-step
   cost reduction remain the real throughput levers, but they depend on a
   long-context-correct shared pool first.
+
+- **I3-v2 ENTRY ABOVE IS WRONG — CORRECTED 2026-05-29 (decisive A/B)**: the
+  "shared pool ON long-context regression" was a MISDIAGNOSIS. Re-ran ON at
+  ISL=2053 OSL=64 c=1 → NOT a timeout (35.3s vs OFF 31.3s, ~13%); the output
+  is GARBAGE (`XXXX`). Then ran the SAME needle-in-haystack + wordseq probe on
+  BOTH pools (8×H20 TP=8, num-slots 8, mem-fraction 0.6, ARLE_DSV4_SHARED_KV_POOL
+  flip only):
+  - Needle "ZORBLAX7" at prompt start, question at end:
+    `prompt_tok≈40 (<128)` → BOTH retrieve `ZORBLAX7` ✅;
+    `247 / 922 (>128)` → BOTH MISS (echo recent filler, no retrieval).
+  - wordseq: `197` → BOTH `Figure N.N: The word2vec model`; `645` → BOTH
+    `word27 2020 2021…`; degrades identically.
+  → **OFF and ON behave byte-for-byte the same.** The shared pool is NOT a
+  regression — it matches the per-state pool exactly (short-context parity
+  already PASSed). The earlier "OFF works at 1.99 tok/s" was an illusion: OFF's
+  `dictionary word word…` LOOKED coherent but is the SAME degradation (recent-
+  token echo + parametric priors), not real retrieval.
+  - **REAL ROOT CAUSE**: DSv4 **compressed attention (CSA select + compressed
+    KV decode) does not work at long context (>sliding_window=128) in EITHER
+    pool mode.** Config: `sliding_window=128`, `compress_ratios=[0,0,4,128,…]`,
+    `max_position_embeddings=1048576`. Both modes share the same compressor /
+    CSA-select / compressed-decode kernels (only the pool LAYOUT differs), so
+    the bug is in that shared machinery, not the pool. The "foundation win
+    3/3" only validated <128-token prompts where the SW window covers the whole
+    sequence and the compressed path is never exercised.
+  - **Shared pool is EXONERATED** (industry-standard PagedAttention — keep it;
+    do NOT kill). The campaign pivots: fix DSv4 long-context compressed
+    attention FIRST (correctness gate), then resume throughput work. SGLang +30%
+    is meaningless until DSv4 retrieves beyond 128 tokens.
+  - §0 lesson: treated an unvalidated path (OFF) as ground-truth reference and
+    built a whole ON-vs-OFF "regression" conclusion on it. Must validate the
+    reference at the SLO shape before A/B-ing against it. See
+    [[feedback_unvalidated_path_not_reference]].
