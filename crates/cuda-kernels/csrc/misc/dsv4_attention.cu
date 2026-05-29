@@ -1042,7 +1042,12 @@ __global__ void dsv4_csa_select_kernel(
   int token = blockIdx.x;
   if (token >= num_tokens) return;
   int abs_pos = start_pos + token;
-  int available = dsv4_imin(key_count, (abs_pos + 1) / ratio);
+  // Causal compressed-block count must match the CPU reference exactly:
+  // reference.rs gates `block < t / ratio` (block fully before the query in
+  // block units), i.e. `available = abs_pos / ratio`. The prior `(abs_pos+1)`
+  // admitted one extra block whenever `abs_pos+1` was a multiple of `ratio`
+  // (the block straddling the current token), diverging from the reference.
+  int available = dsv4_imin(key_count, abs_pos / ratio);
 
   __shared__ float sort_scores[DSV4_CSA_SORT_MAX_KEYS];
   __shared__ int sort_indices[DSV4_CSA_SORT_MAX_KEYS];
