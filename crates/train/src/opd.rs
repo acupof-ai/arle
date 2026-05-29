@@ -845,66 +845,80 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     profile: &mut Option<&mut OpdStepProfile>,
 ) -> Result<f32> {
     let kl_range = kl_logit_range(kl_mask, prompt_len, rollout.len())?;
-    let mut loss_value = 0.0_f32;
-
-    for seq_start in (kl_range.start..kl_range.end).step_by(chunk_size) {
-        let seq_end = seq_start.saturating_add(chunk_size).min(kl_range.end);
-        let chunk_len = seq_end - seq_start;
-        let positions = (0..seq_end as u32).collect::<Vec<_>>();
-        let prefix = &rollout[..seq_end];
-
-        tape.entries.clear();
-        tape.set_enabled(false);
-        let phase_started = Instant::now();
-        let teacher_logits = teacher
-            .forward_logits_device(prefix, &positions, store, tape)
-            .map_err(|err| map_teacher_forward_error("teacher scoring", err))?;
-        record_profile(profile, |profile| {
-            profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
-        });
-        let expected_shape = vec![1, seq_end, vocab];
-        if teacher_logits.shape != expected_shape {
-            return Err(OpdError::InvalidInput(format!(
-                "OPD chunked teacher logits shape mismatch: got {:?}, expected {:?}. \
-                 Hint: the TeacherForward implementation must return \
-                 [batch=1, seq_len, vocab] logits for the exact prefix being scored.",
-                teacher_logits.shape, expected_shape
-            )));
-        }
-
-        tape.set_enabled(true);
-        let phase_started = Instant::now();
-        let student_logits = student
-            .forward(store, tape, prefix, &positions)
-            .map_err(|err| map_qwen35_forward_error("student chunk KL", err))?;
-        record_profile(profile, |profile| {
-            profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
-        });
-
-        let phase_started = Instant::now();
-        let starts = [0, seq_start, 0];
-        let ends = [1, seq_end, vocab];
-        let teacher_chunk =
-            slice(teacher_logits.tensor_id, &starts, &ends, store, tape).map_err(OpdError::from)?;
-        let student_chunk =
-            slice(student_logits, &starts, &ends, store, tape).map_err(OpdError::from)?;
-        let chunk_loss = kl_distill_loss(student_chunk, teacher_chunk, chunk_len, store, tape)
-            .map_err(OpdError::from)?;
-        let chunk_weight = chunk_len as f32 / kl_range.len() as f32;
-        let weighted_loss =
-            mul_scalar(chunk_loss, chunk_weight, store, tape).map_err(OpdError::from)?;
-        loss_value += store.to_host(weighted_loss).map_err(OpdError::from)?[0];
-        record_profile(profile, |profile| {
-            profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
-        });
-
-        let phase_started = Instant::now();
-        backward_with_optional_profile(weighted_loss, loss_value, store, tape)?;
-        record_profile(profile, |profile| {
-            profile.backward_seconds += phase_started.elapsed().as_secs_f64();
-        });
-        cleanup_after_backward(store, tape, student_model_params, keep_extra);
+    if kl_range.start >= kl_range.end {
+        return Ok(0.0);
     }
+
+    // Forward teacher + student over the scored prefix exactly ONCE. Causal
+    // attention makes position p's logits independent of tokens after p, so a
+    // single full-prefix forward yields the same per-position logits the old
+    // per-chunk loop produced by re-forwarding `[0..seq_end_k]` from token 0
+    // for every chunk — but without the O(n^2) redundant recompute that
+    // dominated backward (each chunk re-ran the full growing prefix through
+    // the dense base model). Chunking now happens only at the loss/softmax
+    // level via `kl_distill_loss_chunked`, matching the already-correct
+    // `kl_distill_loss_for_config` path used by the non-rollout KL callers.
+    let seq_end = kl_range.end;
+    let positions = (0..seq_end as u32).collect::<Vec<_>>();
+    let prefix = &rollout[..seq_end];
+
+    tape.entries.clear();
+    tape.set_enabled(false);
+    let phase_started = Instant::now();
+    let teacher_logits = teacher
+        .forward_logits_device(prefix, &positions, store, tape)
+        .map_err(|err| map_teacher_forward_error("teacher scoring", err))?;
+    record_profile(profile, |profile| {
+        profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
+    });
+    let expected_shape = vec![1, seq_end, vocab];
+    if teacher_logits.shape != expected_shape {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD chunked teacher logits shape mismatch: got {:?}, expected {:?}. \
+             Hint: the TeacherForward implementation must return \
+             [batch=1, seq_len, vocab] logits for the exact prefix being scored.",
+            teacher_logits.shape, expected_shape
+        )));
+    }
+
+    tape.set_enabled(true);
+    let phase_started = Instant::now();
+    let student_logits = student
+        .forward(store, tape, prefix, &positions)
+        .map_err(|err| map_qwen35_forward_error("student chunk KL", err))?;
+    record_profile(profile, |profile| {
+        profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
+    });
+
+    // KL over the completion region only, chunked at the loss level to bound
+    // the per-chunk vocab-sized softmax/log-softmax intermediates over the
+    // single forward's logits.
+    let phase_started = Instant::now();
+    let starts = [0, kl_range.start, 0];
+    let ends = [1, kl_range.end, vocab];
+    let teacher_kl =
+        slice(teacher_logits.tensor_id, &starts, &ends, store, tape).map_err(OpdError::from)?;
+    let student_kl = slice(student_logits, &starts, &ends, store, tape).map_err(OpdError::from)?;
+    let loss = kl_distill_loss_chunked(
+        student_kl,
+        teacher_kl,
+        kl_range.len(),
+        chunk_size,
+        store,
+        tape,
+    )
+    .map_err(OpdError::from)?;
+    let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
+    record_profile(profile, |profile| {
+        profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
+    });
+
+    let phase_started = Instant::now();
+    backward_with_optional_profile(loss, loss_value, store, tape)?;
+    record_profile(profile, |profile| {
+        profile.backward_seconds += phase_started.elapsed().as_secs_f64();
+    });
+    cleanup_after_backward(store, tape, student_model_params, keep_extra);
 
     Ok(loss_value)
 }
