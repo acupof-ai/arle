@@ -135,3 +135,18 @@ SGLang and ARLE must bench SEQUENTIALLY, not concurrently.**
   The per-state→shared pool change unblocks concurrency: c≥8 now serves.
   Per-request at c=8 still ~2.3 tok/s (attention per-row) → batched
   attention (branch 7bfb9084) is the next lever for flat step time.
+
+- **I3-v2 LONG-SHAPE REGRESSION (2026-05-29)**: shared pool ON passed the
+  SHORT validator (c=8 18.42 tok/s) but FAILS the real SLO shape. Control
+  at ISL=1024 OSL=64, 8×H20:
+  - OFF (==main, per-state pool): **OK, 1.99 tok/s** (32s, prefill-dominated).
+  - ON (shared pool): **timeout >120s** for 64 tokens (<0.5 tok/s).
+  → Shared pool ON has a long-context perf regression (likely per-step
+  bind/pack work scaling with the large compressed sub-pool at long
+  context). NOT validated for production → stays default OFF. Root-cause
+  before any default flip. The short-shape c=8 win does NOT generalize.
+  Separately: even OFF, long-context decode is slow (~2 tok/s OSL=64 /
+  ~5.65 OSL=512) — the fundamental per-row-attention + sparse-machinery +
+  serial-allreduce cost is the deeper limit; batched attention + per-step
+  cost reduction remain the real throughput levers, but they depend on a
+  long-context-correct shared pool first.
