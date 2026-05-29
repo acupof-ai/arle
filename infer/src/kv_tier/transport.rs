@@ -21,13 +21,11 @@
 //!   surface on CUDA hosts.
 
 pub mod disk;
-pub mod local_cuda;
 #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
 pub mod nixl;
 pub mod shared_fs;
 
 pub use disk::DiskStore;
-pub use local_cuda::LocalCudaTransport;
 #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
 pub use nixl::NixlTransport;
 pub use shared_fs::SharedFsStore;
@@ -121,8 +119,6 @@ impl std::error::Error for TransportError {}
 /// Backend-agnostic async KV transfer trait.
 ///
 /// Milestone gates (tiered-kv-cache project, 2026-04-15 revision):
-/// - **M3** — `LocalCudaTransport` (cudaMemcpyAsync on a dedicated copy
-///   stream), not yet implemented
 /// - **M4** — `DiskStore` (tokio::fs default, io_uring behind a feature
 ///   flag); spill/stage coordinator paths route through
 ///   [`disk::DiskStore`] today, but it is not yet a `KVTransport` impl

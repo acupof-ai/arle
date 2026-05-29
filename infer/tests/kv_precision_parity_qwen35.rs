@@ -162,10 +162,13 @@ fn get_model_path() -> String {
 }
 
 fn max_tokens() -> usize {
+    // Default tuned for the snappy iteration grid (4 prompts × 4 tokens).
+    // Override with KV_PARITY_MAX_TOKENS=16 for the stress grid, 256+ for
+    // long-horizon trajectory tracking.
     std::env::var("KV_PARITY_MAX_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256)
+        .unwrap_or(4)
 }
 
 fn num_prompts() -> usize {

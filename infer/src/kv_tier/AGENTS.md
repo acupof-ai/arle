@@ -46,7 +46,6 @@ kv_tier/tier.rs         — Tier enum, BlockLocation, RemoteBlockDesc, Transport
 kv_tier/host_pool.rs    — HostPinnedPool, HostPinnedRegion (Rust wrapper over the `kv-native-sys` native host arena)
 kv_tier/transport.rs    — KVTransport trait + TransferOp + TransportError
 kv_tier/transport/disk.rs       — DiskStore (Rust adapter over the `kv-native-sys` native object store + descriptor substrate)
-kv_tier/transport/local_cuda.rs — LocalCudaTransport (local-lane plumbing; future P0' NVLink peer hop)
 kv_tier/transport/nixl.rs       — NixlTransport remote-tier surface, compiled via `rdma-nixl` (stub) or `rdma-nixl-real`
 kv_tier/transport/shared_fs.rs  — SharedFsStore: shared-filesystem remote backend (POSIX-visible mount), used as the M4-era cluster-shared transport while RDMA work lands
 kv_tier/coordinator.rs + kv_tier/coordinator/  — Coordinator entry surface plus internal split: `builder.rs` (engine-init wiring), `control.rs` (command channel + queue stats / cancellation / backpressure), `events.rs` (completion event fanout), `types.rs` (StoreTarget / QueueControlStats / CoordinatorQueueStats), `bench.rs` (in-tree micro-bench), `tests.rs`. The coordinator owns plan/fetch/store queues, including shared-fs remote fetch/store.
