@@ -10,6 +10,8 @@ pub mod control;
 pub mod grad_accum;
 #[path = "grad_clip.rs"]
 pub mod grad_clip;
+#[path = "infer_student.rs"]
+pub mod infer_student;
 #[path = "lora.rs"]
 pub mod lora;
 #[path = "loss.rs"]
