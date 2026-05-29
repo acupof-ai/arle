@@ -95,6 +95,7 @@ impl<M: ModelForward> Scheduler<M> {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let (raw_logits_tx, raw_logits_rx) = mpsc::unbounded_channel();
+        let (remerge_lora_tx, remerge_lora_rx) = mpsc::unbounded_channel();
         let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded();
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
@@ -385,6 +386,7 @@ impl<M: ModelForward> Scheduler<M> {
             prefetch_fetching: HashMap::new(),
             request_rx: rx,
             raw_logits_rx,
+            remerge_lora_rx,
             wakeup_rx,
             wakeup_live: true,
             waiting_count: Arc::clone(&waiting_count),
@@ -415,6 +417,7 @@ impl<M: ModelForward> Scheduler<M> {
         )
         .with_tokenizer(scheduler.tokenizer.clone())
         .with_raw_logits_tx(raw_logits_tx)
+        .with_remerge_lora_tx(remerge_lora_tx)
         .with_server_metrics(metrics_for_handle);
         debug_assert_eq!(handle.waiting_count(), 0);
 

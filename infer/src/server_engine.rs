@@ -18,6 +18,8 @@ mod stream;
 #[path = "server_engine/types.rs"]
 mod types;
 
+#[cfg(feature = "cuda")]
+pub use crate::model::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 #[cfg(any(feature = "metal", feature = "cpu"))]
 pub use backend_engine::BackendInferenceEngine;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]

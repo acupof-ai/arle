@@ -137,6 +137,20 @@ impl LoadedInferenceEngine {
             Self::Cpu(_) => anyhow::bail!("forward_token_logits is only available on CUDA"),
         }
     }
+
+    /// Push a fresh student LoRA adapter into the running CUDA engine for the
+    /// per-step OPD rollout sync (P2). The re-merge runs on the scheduler
+    /// thread that owns the model.
+    #[cfg(feature = "cuda")]
+    pub fn remerge_student_lora(&self, update: crate::model::StudentLoraUpdate) -> Result<()> {
+        match self {
+            Self::Cuda { engine, .. } => engine.remerge_student_lora(update),
+            #[cfg(feature = "metal")]
+            Self::Metal(_) => anyhow::bail!("remerge_student_lora is only available on CUDA"),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(_) => anyhow::bail!("remerge_student_lora is only available on CUDA"),
+        }
+    }
 }
 
 impl InferenceEngine for LoadedInferenceEngine {

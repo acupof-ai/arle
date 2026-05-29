@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cudarc::driver::CudaSlice;
+use half::bf16;
 use log::{debug, info, warn};
 use std::time::Instant;
 
@@ -20,6 +21,19 @@ use crate::weight_loader::{
     load_tensor_2d_sharded, precompute_rope_with_qwen35_scaling, resolve_rope_cache_len,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
+
+/// Pristine (un-merged) BF16 q/v projection host snapshot for one
+/// full-attention layer, captured at LoRA-enabled load so per-step
+/// `remerge_lora` can restore the base before applying a fresh adapter.
+struct LoraBaseLayer {
+    layer_idx: usize,
+    q_proj: Vec<bf16>,
+    q_rows: usize,
+    q_cols: usize,
+    v_proj: Vec<bf16>,
+    v_rows: usize,
+    v_cols: usize,
+}
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
 pub(super) struct FullAttentionLayer {
@@ -102,6 +116,10 @@ pub struct Qwen35Model {
     pub(super) layer_communicator: LayerCommunicator,
     pub(super) paged_prefill_batch: std::sync::Mutex<Option<PagedPrefillBuffers35>>,
     pub(super) medusa_hidden_capture: Option<SharedHiddenStateCapture>,
+    /// Pristine BF16 q/v base snapshot for the full-attention layers, captured
+    /// at LoRA-enabled load. `Some` iff the model was loaded with an adapter;
+    /// required by `remerge_lora` (per-step student sync, OPD P2).
+    lora_base_cache: Option<Vec<LoraBaseLayer>>,
 }
 
 impl Qwen35Model {
@@ -511,6 +529,7 @@ impl Qwen35Model {
             )?,
             paged_prefill_batch: std::sync::Mutex::new(None),
             medusa_hidden_capture: None,
+            lora_base_cache: None,
         })
     }
 
@@ -908,6 +927,7 @@ impl Qwen35Model {
             )?,
             paged_prefill_batch: std::sync::Mutex::new(None),
             medusa_hidden_capture: None,
+            lora_base_cache: None,
         })
     }
 
@@ -917,12 +937,104 @@ impl Qwen35Model {
 
     pub fn load_and_attach_lora(mut self, lora_path: &str) -> Result<Self> {
         let lora = super::lora::load_peft_lora(lora_path, self.config.num_hidden_layers)?;
+        self.cache_lora_base()?;
         self.merge_lora(&lora)?;
         info!(
             "Qwen3.5 LoRA adapter merged from {} ({} tensors, r={}, alpha={:.6})",
             lora_path, lora.tensor_count, lora.rank, lora.alpha
         );
         Ok(self)
+    }
+
+    /// Snapshot the pristine BF16 q/v projection weights for every
+    /// full-attention layer into `lora_base_cache` so that per-step re-merge
+    /// (`remerge_lora`) can restore the base before applying a fresh adapter.
+    ///
+    /// Idempotent: once a base snapshot exists it is left untouched (the cache
+    /// must always hold the *un-merged* weights).
+    fn cache_lora_base(&mut self) -> Result<()> {
+        if self.lora_base_cache.is_some() {
+            return Ok(());
+        }
+        let mut cache: Vec<LoraBaseLayer> = Vec::new();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let LayerKind::FullAttention(attn) = &layer.attn else {
+                continue;
+            };
+            let q_proj = self
+                .ctx
+                .stream
+                .clone_dtoh(&attn.q_proj.data)
+                .map_err(|err| {
+                    anyhow::anyhow!("layer {layer_idx} q_proj base cache D2H failed: {err}")
+                })?;
+            let v_proj = self
+                .ctx
+                .stream
+                .clone_dtoh(&attn.v_proj.data)
+                .map_err(|err| {
+                    anyhow::anyhow!("layer {layer_idx} v_proj base cache D2H failed: {err}")
+                })?;
+            cache.push(LoraBaseLayer {
+                layer_idx,
+                q_proj,
+                q_rows: attn.q_proj.rows,
+                q_cols: attn.q_proj.cols,
+                v_proj,
+                v_rows: attn.v_proj.rows,
+                v_cols: attn.v_proj.cols,
+            });
+        }
+        self.ctx.sync()?;
+        self.lora_base_cache = Some(cache);
+        Ok(())
+    }
+
+    /// Restore the cached pristine q/v weights into the full-attention layers,
+    /// discarding any previously merged adapter delta. Requires
+    /// `cache_lora_base` to have run (i.e. the model was loaded with LoRA).
+    fn restore_lora_base(&mut self) -> Result<()> {
+        let cache = self.lora_base_cache.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Qwen3.5 remerge_lora requires a cached LoRA base; load the model with an adapter \
+                 (INFER_LORA_PATH) so the pristine weights are snapshotted at load"
+            )
+        })?;
+        for base in cache {
+            let layer = self.layers.get_mut(base.layer_idx).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "LoRA base cache references missing layer {}",
+                    base.layer_idx
+                )
+            })?;
+            let LayerKind::FullAttention(attn) = &mut layer.attn else {
+                anyhow::bail!(
+                    "LoRA base cache references non-full-attention layer {}",
+                    base.layer_idx
+                );
+            };
+            attn.q_proj =
+                DeviceMatrix::from_host(&self.ctx, &base.q_proj, base.q_rows, base.q_cols)
+                    .with_context(|| format!("restore layer {} q_proj base", base.layer_idx))?;
+            attn.v_proj =
+                DeviceMatrix::from_host(&self.ctx, &base.v_proj, base.v_rows, base.v_cols)
+                    .with_context(|| format!("restore layer {} v_proj base", base.layer_idx))?;
+        }
+        self.ctx.sync()?;
+        Ok(())
+    }
+
+    /// Re-merge a fresh LoRA adapter for per-step student sync (OPD P2).
+    ///
+    /// Restores the cached pristine base q/v weights, then merges `update`.
+    /// Idempotent across steps: deltas never accumulate because each call
+    /// starts from the same base snapshot.
+    pub fn remerge_lora(&mut self, update: &super::lora::StudentLoraUpdate) -> Result<()> {
+        let lora =
+            super::lora::Qwen35LoRA::from_student_update(update, self.config.num_hidden_layers)?;
+        self.restore_lora_base()?;
+        self.merge_lora(&lora)?;
+        Ok(())
     }
 
     fn merge_lora(&mut self, lora: &super::lora::Qwen35LoRA) -> Result<()> {

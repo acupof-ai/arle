@@ -30,7 +30,10 @@ pub mod qwen35;
 
 pub use kv_cache::{KVCacheDtype, KVFormat};
 pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State};
-pub use qwen35::{Qwen35Model, Qwen35RuntimeConfig, Qwen35State};
+pub use qwen35::{
+    Qwen35Model, Qwen35RuntimeConfig, Qwen35State, StudentLoraLayer, StudentLoraMatrices,
+    StudentLoraUpdate,
+};
 
 /// One request worth of prefill work inside a scheduler-planned prefill batch.
 #[derive(Clone, Copy, Debug)]
@@ -436,6 +439,13 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
 
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn device_context(&self) -> &DeviceContext;
+
+    /// Per-step student LoRA re-merge sync (OPD P2). Restores the cached base
+    /// weights and folds a fresh adapter delta in-memory. Default `bail!`s;
+    /// only `Qwen35Model` (loaded with an adapter) overrides this.
+    fn remerge_student_lora(&mut self, _update: &StudentLoraUpdate) -> Result<()> {
+        anyhow::bail!("model does not support in-memory student LoRA re-merge")
+    }
 
     /// Phase B-1 commit C.4.6 — expose the model's EP NCCL group so the
     /// scheduler can attach an NCCL-backed `DistributedRequestCoordination`

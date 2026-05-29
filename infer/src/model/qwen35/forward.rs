@@ -583,6 +583,10 @@ impl ModelForward for Qwen35Model {
         &self.ctx
     }
 
+    fn remerge_student_lora(&mut self, update: &crate::model::StudentLoraUpdate) -> Result<()> {
+        self.remerge_lora(update)
+    }
+
     fn forward_decode_batch(
         &self,
         tokens: &[u32],
