@@ -3600,9 +3600,27 @@ impl DeepseekModel {
         state: &mut super::state::DeepseekState,
     ) -> Result<Option<DeviceVec>> {
         state.reference_tokens.extend_from_slice(tokens);
-        // Long-prefill is throughput-bound and must use the batched transformer
-        // path. The incremental path is a decode optimization; applying it to a
-        // 6K-token prefill regresses TTFT by >2x on DSv4.
+        // P→D KV handoff (foundation). When incremental decode is enabled, the
+        // decode path reads per-layer KV caches that ONLY the incremental path
+        // populates. A stateless batched prefill leaves those caches empty →
+        // decode degenerates ("<tok> 0.0000 0.0000..."). So run prefill through
+        // the incremental path itself (batched over the whole prompt in one
+        // call — `forward_transformer_layer_stream_incremental_into` is
+        // seq-batched, not token-serial) with `emit_logits=true`: it writes the
+        // SW window / compressed / FP8 caches AND returns the last-token
+        // (prefill) logits. Falls back to the stateless path if the incremental
+        // path is unavailable (weights not loaded → returns None).
+        //
+        // Note: this supersedes the prior "incremental prefill regresses TTFT
+        // >2x" stance — that was a perf trade-off taken while correctness was
+        // out of scope. Correctness (the populated KV decode reads) is the
+        // foundation; TTFT re-optimization (FlashMLA prefill writing KV
+        // directly / chunked warmup) is a follow-up axis.
+        if dsv4_incremental_kv_enabled()? {
+            if let Some(logits) = self.compute_top_level_logits_incremental(tokens, state, true)? {
+                return Ok(Some(logits));
+            }
+        }
         if dsv4_gpu_contextual_logits_enabled()? {
             self.compute_top_level_logits(&state.reference_tokens)
         } else {
