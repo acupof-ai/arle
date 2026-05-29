@@ -1029,12 +1029,30 @@ impl Qwen35Model {
     /// Restores the cached pristine base q/v weights, then merges `update`.
     /// Idempotent across steps: deltas never accumulate because each call
     /// starts from the same base snapshot.
+    ///
+    /// The base snapshot is captured lazily on the **first** call: a student
+    /// engine constructed without `INFER_LORA_PATH` is pristine (no adapter
+    /// merged), so `cache_lora_base()` here records the un-merged q/v weights.
+    /// This removes the prior requirement that the engine be loaded with a
+    /// disk adapter just to seed the base cache (OPD P4 infra hardening).
     pub fn remerge_lora(&mut self, update: &super::lora::StudentLoraUpdate) -> Result<()> {
+        // Lazy, idempotent: first call snapshots the pristine base; later
+        // calls are no-ops (`cache_lora_base` early-returns when already set).
+        self.cache_lora_base()?;
         let lora =
             super::lora::Qwen35LoRA::from_student_update(update, self.config.num_hidden_layers)?;
         self.restore_lora_base()?;
         self.merge_lora(&lora)?;
         Ok(())
+    }
+
+    /// Explicitly snapshot the pristine base q/v weights for the OPD student
+    /// rollout path. Safe to call right after constructing a student engine
+    /// (before any `remerge_lora`); idempotent. Exposed so callers that want
+    /// the snapshot taken deterministically at a known point can force it,
+    /// rather than relying on the lazy first-`remerge_lora` capture.
+    pub fn cache_lora_base_pub(&mut self) -> Result<()> {
+        self.cache_lora_base()
     }
 
     fn merge_lora(&mut self, lora: &super::lora::Qwen35LoRA) -> Result<()> {
