@@ -836,6 +836,35 @@ pub(crate) fn gemv_with_marlin_scratch(
         return Ok(());
     }
 
+    // BF16-dense decode (N=1). The oplib::linear `plan()` selection emits the
+    // graph-safe / cuBLAS BF16 variants for plain bf16 weights (e.g. DSv4's
+    // attention + shared-expert projections), but this decode executor only
+    // wired `Bf16Gemv` above — so a `Bf16GraphsafeGemm` selection fell through
+    // to the `no matching weight storage` panic, breaking ALL DSv4 decode at
+    // HEAD after the dispatch-governance refactor relocated plan() (a33ed6fd).
+    // weight.data is the bf16-dense matrix; mirror `run_bf16_linear` at N=1.
+    if matches!(
+        plan,
+        LinearKernel::Bf16GraphsafeGemm | LinearKernel::Bf16CublasGemm
+    ) {
+        let (weight_ptr, _ga) = weight.data.device_ptr(&ctx.stream);
+        let (input_ptr, _gx) = input.data.device_ptr(&ctx.stream);
+        let (output_ptr, _gy) = output.data.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::gemm_graphsafe_cuda(
+                weight_ptr as *const ffi::Half,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                weight.rows as i32,
+                1,
+                weight.cols as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        return Ok(());
+    }
+
     unreachable!("linear decode plan {plan:?} has no matching weight storage")
 }
 /// Linear layer: y = weight @ x
