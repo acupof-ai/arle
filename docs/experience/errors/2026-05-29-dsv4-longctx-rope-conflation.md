@@ -88,3 +88,29 @@ run on the 8×H20 pod; bench entry to follow under `wins/` once green.
   correct" claim from short prompts does not cover the compressed path.
 - When two paths (pool modes) behave identically, the bug is in shared code,
   not the diff.
+
+## Validation update (2026-05-29, pod 8×H20)
+
+Input-rope fix CONFIRMED CORRECT via the legacy path. With
+`ARLE_DSV4_FLASHMLA_PREFILL=0 ARLE_DSV4_FLASHMLA_DECODE=0` (legacy
+`dsv4_hybrid_attention_cuda`, which already applies the output inverse-rope),
+the needle now retrieves at ALL lengths: prompt_tok 40 / 247 / 922 / 2272 all
+HIT `ZORBLAX7` (was MISS at >128 before the fix).
+
+But the DEFAULT FlashMLA paths regressed short context — an adversarial audit
+found a SECOND, independent defect the input-rope fix does not cover: the
+FlashMLA sparse **decode and prefill shims apply NO attention-output
+inverse-rope** (reference.rs:417 `apply_partial_rope(dst, .., sign=-1.0)`),
+which the legacy kernel does internally (dsv4_attention.cu:966-981). The
+MODEL1 kernel (head_dim=512) keeps the rope tail in V, so the FlashMLA output
+carries key-position rope that is never un-rotated at the query position →
+collapse grows with |query_pos| (coherent ≤128, broken >128); changing the
+input theta merely shifted which positions argmax survives, regressing short
+context. Plus a third: the prefill HCA index builder
+(`arle_flashmla_csa_prep.cu:174`) kept the `(abs_pos+1)/ratio` off-by-one the
+decode/legacy fix removed.
+
+Remaining fix (FlashMLA default paths): add the output inverse-rope (last
+qk_rope_head_dim cols, sign=-1.0, rope_theta, no-YaRN, per-token
+abs_pos=start_pos+token) after the decode fwd and the prefill fwd (incl. the
+TP>1 sliced output), and change csa_prep.cu:174 to `abs_pos/ratio`.
