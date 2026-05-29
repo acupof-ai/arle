@@ -1,5 +1,12 @@
 # Online-softmax decode-attention kernel — measured null at rollout=64
 
+> **SUPERSEDED 2026-05-29** by
+> [`docs/plans/2026-05-29-opd-student-rollout-via-infer.md`](../plans/2026-05-29-opd-student-rollout-via-infer.md).
+> This whole direction optimized the train-crate hand-written decode kernel —
+> the wrong layer. Infer decodes 0.8B at 3.5 ms/tok vs this path's
+> 1600–2880 ms/tok; routing rollout through infer is ~500× at the decode level.
+> The dead BF16 kernels were deleted in `03cf1bc8`.
+
 **Date**: 2026-05-29
 **Predecessor**: [`docs/research/2026-05-28-opd-rollout-perf-208s-bottleneck.md`](2026-05-28-opd-rollout-perf-208s-bottleneck.md)
 
