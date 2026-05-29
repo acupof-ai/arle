@@ -27,7 +27,7 @@
 //! `INFER_TILELANG_BF16_SPLIT_KV` additionally accepted `"YES"`). The parsers
 //! are pure functions so the preserved token sets are unit-tested directly.
 
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 /// Common truthy set shared by the four Marlin / W4A8 / deterministic knobs.
 fn parse_truthy_common(value: Option<&str>) -> bool {
@@ -121,13 +121,34 @@ impl DispatchPolicy {
     }
 }
 
-/// Process-wide dispatch policy, resolved from the environment on first access.
+static POLICY_CACHE: RwLock<Option<DispatchPolicy>> = RwLock::new(None);
+
+/// Process-wide dispatch policy, resolved from the environment on first access
+/// and cached. Production sets dispatch env vars at startup and never mutates
+/// them afterward, so the cache is effectively immutable for the process
+/// lifetime. Returned by value (`DispatchPolicy` is `Copy`) so the cache can be
+/// invalidated without handing out borrowed references.
 ///
-/// Mirrors the previous `OnceLock`-cached helpers: env is read once, then the
-/// cached struct is returned for the lifetime of the process.
-pub fn dispatch_policy() -> &'static DispatchPolicy {
-    static POLICY: OnceLock<DispatchPolicy> = OnceLock::new();
-    POLICY.get_or_init(DispatchPolicy::from_env)
+/// Tests that mutate a dispatch env var in-process MUST call
+/// [`reset_dispatch_policy_cache`] afterward, or the stale cached value wins.
+pub fn dispatch_policy() -> DispatchPolicy {
+    if let Some(policy) = *POLICY_CACHE.read().expect("dispatch policy cache poisoned") {
+        return policy;
+    }
+    let mut slot = POLICY_CACHE
+        .write()
+        .expect("dispatch policy cache poisoned");
+    *slot.get_or_insert_with(DispatchPolicy::from_env)
+}
+
+/// Drop the cached [`DispatchPolicy`] so the next [`dispatch_policy`] call
+/// re-reads the environment. Intended for tests that mutate dispatch env vars
+/// in-process — production resolves the policy once at startup and never needs
+/// this.
+pub fn reset_dispatch_policy_cache() {
+    *POLICY_CACHE
+        .write()
+        .expect("dispatch policy cache poisoned") = None;
 }
 
 #[cfg(test)]
