@@ -39,12 +39,28 @@
 
 namespace {
 
-// BF16 KV path needs cuda_bf16.h from NVRTC built-ins; deferred until
-// the rollout cache layout itself moves to bf16. For now keep the f32
-// load helper only.
+// BF16 ↔ F32 conversion without cuda_bf16.h. BF16 is the top 16 bits of
+// the f32 binary representation (sign + 8-bit exponent + 7-bit mantissa);
+// widening is a left shift by 16, narrowing is a round-to-nearest-even on
+// the bottom 16 bits.
+__device__ __forceinline__ float bf16_bits_to_f32(unsigned short bits) {
+    unsigned int u = ((unsigned int) bits) << 16;
+    float result;
+    // bit-cast via memcpy — compiler folds to no-op move.
+    asm("mov.b32 %0, %1;" : "=f"(result) : "r"(u));
+    return result;
+}
+
 template <typename TKV>
 __device__ __forceinline__ float load_kv(const TKV* ptr) {
     return *ptr;
+}
+
+// BF16 storage uses unsigned short (raw bits). Specialize the load to do
+// the widening cast.
+template <>
+__device__ __forceinline__ float load_kv<unsigned short>(const unsigned short* ptr) {
+    return bf16_bits_to_f32(*ptr);
 }
 
 // Warp-wide sum reduction. `WARP_SIZE` must be 32.
@@ -172,6 +188,21 @@ __global__ void causal_sdpa_decode_gqa_cache_online_f32_hd256(
 ) {
     if (head_dim != 256) return;  // template safety
     causal_sdpa_decode_gqa_cache_online_impl<float, 256>(
+        q, k, v, out, batch, query_heads, kv_heads, max_seq, kv_len, q_start, scale);
+}
+
+// BF16 KV path — KV cache stored as raw bf16 bits (unsigned short).
+// Widened to f32 inside the kernel at load time via bf16_bits_to_f32.
+// HBM bandwidth on K + V reads is **halved** relative to the f32 path,
+// which directly attacks the dominant 0.0099·n² quadratic term in the
+// OPD rollout perf fit.
+__global__ void causal_sdpa_decode_gqa_cache_online_bf16_hd256(
+    const float* q, const unsigned short* k, const unsigned short* v, float* out,
+    int batch, int query_heads, int kv_heads, int max_seq, int kv_len,
+    int head_dim, int q_start, float scale
+) {
+    if (head_dim != 256) return;
+    causal_sdpa_decode_gqa_cache_online_impl<unsigned short, 256>(
         q, k, v, out, batch, query_heads, kv_heads, max_seq, kv_len, q_start, scale);
 }
 
