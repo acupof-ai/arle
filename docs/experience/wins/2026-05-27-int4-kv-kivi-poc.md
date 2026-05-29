@@ -1,5 +1,33 @@
 # INT4 + KIVI per-channel K — PoC works, 4-bit quality intrinsically below 8-bit
 
+> **Retracted (2026-05-28):** The "intrinsic 4-bit floor" framing in
+> this entry — that 0.094 mean_match is a fundamental property of
+> 16-level symmetric per-channel KIVI on Qwen3.5 — is **wrong**.
+>
+> Two cheap orthogonal levers, stacked the same day, lifted INT4
+> mean_match from **0.0938 → 0.5781 at the same 4×16 grid** (6×):
+>
+> 1. Asymmetric INT4 range `[-8, 7] / 7.5` instead of symmetric
+>    `[-7, 7] / 7`. Uses the full 16 nibble levels and minimizes the
+>    midpoint clipping error.
+> 2. Two-level K scale: per-channel **STATIC** × per-(token, kv_head)
+>    **DYNAMIC**. The per-(token, head) dynamic absmax of the
+>    channel-normalized ratio captures per-token magnitude that the
+>    per-channel-only PoC couldn't.
+>
+> Current state and full audit numbers (incl. 4×4 and 4×16 grids,
+> token traces, and the V100 substrate unblock) live in
+> [`2026-05-28-int4-kv-two-level-k.md`](2026-05-28-int4-kv-two-level-k.md).
+> Read that entry, not this one, for current INT4 KV behavior. This
+> PoC stays in the tree only as a historical "what symmetric +
+> per-channel-only looked like" reference.
+>
+> The lesson — documented as the Rule in the two-level entry — is to
+> exhaust the literature's standard levers (asymmetric range, group
+> size, two-level scaling, Hadamard rotation) before calling any
+> quality number "intrinsic". KIVI's per-channel-only K is one of
+> several KV-quant designs, not the design.
+
 ## Context
 
 After INT8 + FP8 KIVI shipped bit-identical with BF16 on V100 (see
