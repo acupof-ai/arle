@@ -91,3 +91,34 @@ kernel) or a proper git-bisect is the decisive next tool**, not more grepping.
   `ARLE_MULTIPROC_SERVE=1` + `ARLE_DSV4_FUSED_DISPATCH_PAYLOAD=1` +
   `ARLE_DEEPEP_DIR=/data01/build/DeepEP` (the d4f41e4 legacy layout) +
   `ARLE_DSV4_EXPERT_BACKEND=native`. See [[project_h20_pod_access]].
+
+## Update 2026-05-30 — confirmed GENUINE at CLEAN true-HEAD (not a stale-tree artifact)
+
+Critical caveat on the earlier "ruled out" work: the pod `/data01/build/arle`
+was a stale scp snapshot, and full-tree syncs kept getting SIGTERM-interrupted
+(kubectl-exec kills long `tar -x`), so the prior native-deepep tests ran on
+inconsistent PARTIAL trees — untrustworthy. After a CLEAN sync
+(`rm -rf infer && tar -xf infer-head2.tar` IN TMUX, then build; BUILD_EXIT=0,
+record_linear_kernel present) the pod is verified true-HEAD (the default
+allreduce decode now passes needle 4/4 to 2272 tok — see
+[[../wins/2026-05-30-dsv4-oplib-linear-decode-fix-true-head]]).
+
+Re-ran native-deepep (multiproc + FUSED_DISPATCH_PAYLOAD default + DeepEP
+d4f41e4) on this CLEAN true-HEAD: **combine STILL IMAs** (`sync after combine:
+illegal memory access`). So the combine bug is GENUINE at HEAD, not an artifact.
+
+compute-sanitizer (memcheck) attempt FAILED to boot: memcheck slows the 8-proc
+NCCL TCP-store rendezvous past its hardcoded 30s timeout
+(`SOCKET_TIMEOUT = Duration::from_secs(30)`, infer/src/distributed/init_method.rs:36)
+→ rank-0 "accept rank 7 timed out after 30s". 0 errors reported (forward never ran).
+
+**Precise next steps (fresh session, reliable pod):**
+1. Make `SOCKET_TIMEOUT` env-configurable (init_method.rs:36) → e.g. 600s → re-run
+   `compute-sanitizer --target-processes all --tool memcheck` → get the exact OOB
+   buffer + access in the combine kernel.
+2. OR a 2-rank repro harness (world_size=2) — small enough for memcheck to boot.
+3. Source narrowing already done (all RULED OUT at the d4f41e4 contract):
+   combine host/kernel signature matches the deepep-sys wrapper exactly; nvl_chunked
+   (6,256) consistent dispatch↔combine; num_sms=20/num_channels=10 consistent
+   dispatch↔combine↔scratch; kNvlBytes=512MB generous; dispatch passes, combine
+   OOBs. The OOB is a runtime value/buffer issue only compute-sanitizer will pinpoint.
