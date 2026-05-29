@@ -211,6 +211,13 @@ required-features = ["cuda", "nccl"]
 name = "multiproc_relay_smoke"
 path = "src/bin/multiproc_relay_smoke.rs"
 
+# Operator introspection: print the resolved DispatchPolicy (Declare gate).
+# No required-features — `infer::dispatch_policy` is backend-independent, so
+# this resolves and prints under every feature set (including host-only builds).
+[[bin]]
+name = "explain_dispatch"
+path = "src/bin/explain_dispatch.rs"
+
 [[example]]
 name = "regenerate_test_data"
 path = "examples/regenerate_test_data.rs"
