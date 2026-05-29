@@ -61,3 +61,19 @@ SGLang and ARLE must bench SEQUENTIALLY, not concurrently.**
   byte-identical (or within FP tolerance) vs the validated baseline.
 - No legacy deletion (SM<90 fallback stays — see
   `wins/2026-05-29-dsv4-gpu-native-coherent-output-pd-handoff.md`).
+
+- **I1 (2026-05-29)**: ARLE SLO bench (8×H20 TP=8, ISL=1024/OSL=512).
+  c=1 = **5.65 tok/s** (88ms/decode-step). c=8/c=32 **timeout >300s** —
+  unreasonable: step×512 ≈ 264s, no batching speedup. Decode-step profile
+  (ARLE_DSV4_TRACE_LAYER, relative split):
+  - **attn_core dominant** (attn_hybrid_kernel 0.186ms + csa_select 0.205ms
+    + compressor/indexer/csa_project) — DSv4 sparse-attn machinery runs
+    full CSA-select + compressor + indexer EVERY decode step.
+  - **NCCL allreduce ≈21ms/step serial-blocking** (ffn_all_reduce 0.328ms +
+    attn_all_reduce 0.103ms × 43 layers × 2) — NOT overlapped with compute.
+  Top levers: (1) decode allreduce multi-stream overlap (SGLang DSv4 day-0
+  approach; un-killed — distinct from the prefill AllGather-Q overlap killed
+  2026-05-28); (2) c=8+ concurrency is broken (timeout) — continuous-batching
+  decode at concurrency needs fixing BEFORE perf is comparable.
+  SGLang baseline still pending user GPU-strategy choice. Next: fix c≥8
+  decode concurrency (correctness/throughput) + decode allreduce overlap.
