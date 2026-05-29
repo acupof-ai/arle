@@ -864,6 +864,15 @@ pub struct RawLogitsRequest {
     pub response_tx: std_mpsc::Sender<anyhow::Result<crate::server_engine::RawLogits>>,
 }
 
+/// Per-step student LoRA re-merge request (OPD P2). Routed to the
+/// single-writer scheduler thread so the in-memory base-restore + merge runs
+/// on the thread that owns the model.
+#[cfg(feature = "cuda")]
+pub struct RemergeLoraRequest {
+    pub update: crate::model::StudentLoraUpdate,
+    pub response_tx: std_mpsc::Sender<anyhow::Result<()>>,
+}
+
 /// Error returned when the scheduler's waiting queue is full.
 #[derive(Debug)]
 pub struct SchedulerFull;
@@ -882,6 +891,8 @@ pub struct SchedulerHandle {
     tx: mpsc::UnboundedSender<IncomingRequest>,
     #[cfg(feature = "cuda")]
     raw_logits_tx: Option<mpsc::UnboundedSender<RawLogitsRequest>>,
+    #[cfg(feature = "cuda")]
+    remerge_lora_tx: Option<mpsc::UnboundedSender<RemergeLoraRequest>>,
     wakeup_tx: crossbeam_channel::Sender<()>,
     model_id: Arc<str>,
     tokenizer: Option<Tokenizer>,
@@ -967,6 +978,8 @@ impl SchedulerHandle {
             tx,
             #[cfg(feature = "cuda")]
             raw_logits_tx: None,
+            #[cfg(feature = "cuda")]
+            remerge_lora_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -989,6 +1002,8 @@ impl SchedulerHandle {
             tx,
             #[cfg(feature = "cuda")]
             raw_logits_tx: None,
+            #[cfg(feature = "cuda")]
+            remerge_lora_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -1012,6 +1027,8 @@ impl SchedulerHandle {
             tx,
             #[cfg(feature = "cuda")]
             raw_logits_tx: None,
+            #[cfg(feature = "cuda")]
+            remerge_lora_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -1034,6 +1051,8 @@ impl SchedulerHandle {
             tx,
             #[cfg(feature = "cuda")]
             raw_logits_tx: None,
+            #[cfg(feature = "cuda")]
+            remerge_lora_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -1077,6 +1096,16 @@ impl SchedulerHandle {
         raw_logits_tx: mpsc::UnboundedSender<RawLogitsRequest>,
     ) -> Self {
         self.raw_logits_tx = Some(raw_logits_tx);
+        self
+    }
+
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn with_remerge_lora_tx(
+        mut self,
+        remerge_lora_tx: mpsc::UnboundedSender<RemergeLoraRequest>,
+    ) -> Self {
+        self.remerge_lora_tx = Some(remerge_lora_tx);
         self
     }
 
@@ -1152,6 +1181,29 @@ impl SchedulerHandle {
         response_rx
             .recv()
             .map_err(|err| anyhow::anyhow!("raw logits response channel closed: {err}"))?
+    }
+
+    /// Push a fresh student LoRA adapter into the model on the scheduler thread
+    /// (OPD P2 per-step sync). Blocks until the in-memory re-merge completes.
+    #[cfg(feature = "cuda")]
+    pub fn remerge_student_lora(
+        &self,
+        update: crate::model::StudentLoraUpdate,
+    ) -> anyhow::Result<()> {
+        let remerge_lora_tx = self.remerge_lora_tx.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("CUDA scheduler does not expose student LoRA re-merge requests")
+        })?;
+        let (response_tx, response_rx) = std_mpsc::channel();
+        remerge_lora_tx
+            .send(RemergeLoraRequest {
+                update,
+                response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("student LoRA re-merge request submission failed"))?;
+        let _ = self.wakeup_tx.send(());
+        response_rx.recv().map_err(|err| {
+            anyhow::anyhow!("student LoRA re-merge response channel closed: {err}")
+        })?
     }
 
     /// Decrement the waiting count (called by the scheduler when it consumes a request).
