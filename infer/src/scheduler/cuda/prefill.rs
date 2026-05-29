@@ -19,11 +19,9 @@ const PREFILL_OOM_COOLDOWN_MS: u64 = 5_000;
 /// Motivation: TileLang 0.1.10 FullRow on sm_80 produces NaN attention
 /// output for warps 2/3 (rows ≥ BLOCK_M/2). See
 /// `docs/experience/errors/2026-05-27-tilelang-0110-fullrow-warp23-nan-sm80.md`.
-/// Cached on first call to avoid env lookup overhead per prefill batch.
+/// Resolved once via the central `DispatchPolicy` (env read cached there).
 fn bypass_tilelang_prefill() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("INFER_BYPASS_TILELANG_PREFILL").is_ok())
+    crate::dispatch_policy::dispatch_policy().bypass_tilelang_prefill
 }
 
 /// Recognise the OOM signature surfaced by `cudarc` / CUDA kernels through

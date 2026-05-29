@@ -10,12 +10,11 @@
 //! parsed exactly once, here, into one inspectable struct.
 //!
 //! This covers the ops-layer subset (the kernel-selection knobs in
-//! `ops/linear.rs` + `ops/attention.rs`) and the model-layer path-selection
+//! `ops/linear.rs` + `ops/attention.rs`), the model-layer path-selection
 //! subset (`INFER_PREFILL_GRAPH` in `model/qwen3/prefill.rs`,
-//! `ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD` in `model/deepseek/mlp.rs`).
-//! `INFER_BYPASS_TILELANG_PREFILL` is a *scheduler-layer* knob
-//! (`scheduler/cuda/prefill.rs`), not a model-layer one, so it is left in place
-//! for a scheduler-scoped tranche. Load-time CONFIG knobs (the `ARLE_DSV4_*`
+//! `ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD` in `model/deepseek/mlp.rs`), and the
+//! scheduler-layer subset (`INFER_BYPASS_TILELANG_PREFILL` in
+//! `scheduler/cuda/prefill.rs`). Load-time CONFIG knobs (the `ARLE_DSV4_*`
 //! pool/feature family, `INFER_QUANT_FORMAT_OVERRIDE`,
 //! `INFER_QWEN3_FUSED_GATE_UP`) and the `*_DEBUG`/`*_DUMP` diagnostics are
 //! deliberately NOT dispatch knobs and stay at their original sites.
@@ -53,6 +52,14 @@ fn parse_prefill_graph(value: Option<&str>) -> bool {
     matches!(value, Some("1" | "true" | "TRUE" | "yes" | "on" | "ON"))
 }
 
+/// `INFER_BYPASS_TILELANG_PREFILL` legacy semantics: the `scheduler/cuda/prefill.rs`
+/// site gated on `std::env::var(..).is_ok()`, i.e. the variable being *present* at
+/// all enabled it — any value, including the empty string. Only an unset variable
+/// (`None`) is falsy.
+fn parse_bypass_tilelang_prefill(value: Option<&str>) -> bool {
+    value.is_some()
+}
+
 /// `ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD` legacy semantics: parse as `usize`,
 /// keep only values `>= 1`; anything unset / unparseable / `< 1` falls back to
 /// the default `4`. Returns the resolved threshold directly so the field holds
@@ -88,6 +95,11 @@ pub struct DispatchPolicy {
     /// `INFER_PREFILL_GRAPH` — opt-in CUDA-Graph capture for Qwen3 paged
     /// prefill (`model/qwen3/prefill.rs`). Common truthy set.
     pub prefill_graph: bool,
+    /// `INFER_BYPASS_TILELANG_PREFILL` — opt-in route-around forcing every
+    /// paged-pool prefill onto the contig CUDA C path
+    /// (`scheduler/cuda/prefill.rs`). Legacy site gated on variable presence
+    /// (`is_ok()`): any value, including the empty string, enables it.
+    pub bypass_tilelang_prefill: bool,
     /// `ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD` — the M (active-row) count at/above
     /// which DSv4 grouped MoE switches from block-scaled GEMV to the 32-way
     /// M-tile grouped GEMM (`model/deepseek/mlp.rs`). Resolved value, default
@@ -114,6 +126,9 @@ impl DispatchPolicy {
             deterministic_gemm: parse_truthy_common(read("INFER_DETERMINISTIC").as_deref()),
             tilelang_bf16_split_kv: parse_split_kv(read("INFER_TILELANG_BF16_SPLIT_KV").as_deref()),
             prefill_graph: parse_prefill_graph(read("INFER_PREFILL_GRAPH").as_deref()),
+            bypass_tilelang_prefill: parse_bypass_tilelang_prefill(
+                read("INFER_BYPASS_TILELANG_PREFILL").as_deref(),
+            ),
             dsv4_grouped_gemm_m_threshold: parse_dsv4_grouped_gemm_m_threshold(
                 read("ARLE_DSV4_GROUPED_GEMM_M_THRESHOLD").as_deref(),
             ),
@@ -226,6 +241,18 @@ mod tests {
                 "{v:?} should not enable prefill-graph"
             );
         }
+    }
+
+    #[test]
+    fn bypass_tilelang_prefill_enabled_by_presence() {
+        // Legacy `is_ok()` semantics: presence enables it regardless of value,
+        // including the empty string. Only `None` (unset) is falsy.
+        assert!(!parse_bypass_tilelang_prefill(None));
+        assert!(parse_bypass_tilelang_prefill(Some("")));
+        assert!(parse_bypass_tilelang_prefill(Some("1")));
+        assert!(parse_bypass_tilelang_prefill(Some("0")));
+        assert!(parse_bypass_tilelang_prefill(Some("false")));
+        assert!(parse_bypass_tilelang_prefill(Some("anything")));
     }
 
     #[test]
