@@ -88,16 +88,48 @@ Infer currently merges LoRA into dense weights **once at load**
   re-merge doesn't require a full base-weight reload (verify). Use as the
   bring-up path if Option A's hooks aren't ready.
 
-**Open question to resolve in implementation:** does infer's un-merged LoRA
-path (Option A) already run end-to-end for decode, or is merge-at-load the
-only working path? (Workflow agent flagged hooks exist but unconfirmed.)
+## 2026-05-29 design-subagent verdict (RESOLVED the open question)
 
-## Implementation phases
+Evidence-grounded investigation settled the LoRA-path fork:
 
-- **P1** — `InferStudent` engine bring-up: load Qwen3.5-0.8B-Base into a second
-  in-process infer engine alongside the teacher; smoke `forward_token_logits`.
-- **P2** — LoRA sync (Option A if viable, else B): train LoRA → infer student
-  adapter; canary that infer-student logits track train-student.
+- **Option A is NOT reachable for the student.** Un-merged device-resident
+  LoRA (`apply_lora_gemv_add`, `LoRAAdapter{a,b}`) is wired only into
+  `Qwen3Model` (`infer/src/model/qwen3/`). The student `Qwen3.5-0.8B-Base`
+  routes to `Qwen35Model` (`model_registry.rs:139` → `bootstrap.rs:158`),
+  whose only LoRA path is merge-at-load (`qwen35/weights.rs:918`
+  `load_and_attach_lora` → `merge_lora_into_dense_matrix`).
+- **Naive per-step disk reload is broken.** `merge_lora` mutates q/v in place
+  and keeps no base copy (`qwen35/weights.rs:946-963`); re-merging accumulates
+  deltas. Per-step reuse needs the base weights restored each step.
+- Student is **hybrid**: 18 linear-attn + 6 full-attn layers
+  (`full_attention_interval=4`); only the 6 full-attn layers carry q/v
+  adapters. **Lock the train target set to `AttentionQv`** — `AllLinear` makes
+  the infer merge path `bail!` on non-full-attention layers.
+
+**Chosen sync mechanism — B1.5: in-memory re-merge from a cached base.** Cache
+the 6×(q,v)=12 base matrices at load; each step restore base + merge the fresh
+adapter + re-upload. ~12 small H2D (~4 ms), no disk, no full reload. Smaller
+than porting the qwen3 un-merged forward (deferred B2 escalation if re-merge
+proves costly). Export raw (un-scaled) A/B + correct `r`/`lora_alpha`; infer
+applies `scale=alpha/r` once.
+
+**Gating unknowns to kill/license in P1 (before any sync code):** (1) does
+`forward_token_logits` per-token in a tight greedy loop actually hit ~3.5 ms/tok
+on the rollout shape (growing context), or does Arc<Mutex>/scheduler/per-token
+prefill overhead erode it? (2) do **two in-process CUDA engines + train store**
+fit in 16 GB? Both are validated at **step 0 with ZERO LoRA** (B is zero-init →
+step-0 student == base), needing no sync machinery.
+
+## Implementation phases (revised)
+
+- **P1** — `InferStudent` bring-up (mirror `InferTeacher`,
+  `crates/train/src/infer_student.rs` new) + **zero-LoRA validation**: greedy
+  rollout via `forward_token_logits` on an OPD sample prompt, measure per-token
+  latency at growing context + VRAM with two engines. Kill/license the two
+  gating unknowns here. No sync code yet.
+- **P2** — B1.5 in-memory re-merge sync (train LoRA `TensorStore` →
+  `Qwen35Model` cached-base re-merge) + cross-path canary: step-1 token
+  agreement vs train-crate argmax ≥90%.
 - **P3** — swap the rollout loop (`opd.rs:1654-1776`) to call infer student;
   keep the train-crate path behind a flag for A/B.
 - **P4** — bench + gate; on pass, **delete the train-crate decode path**
