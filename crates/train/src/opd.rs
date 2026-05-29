@@ -881,24 +881,51 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
         )));
     }
 
-    tape.set_enabled(true);
-    let phase_started = Instant::now();
-    let student_logits = student
-        .forward(store, tape, prefix, &positions)
-        .map_err(|err| map_qwen35_forward_error("student chunk KL", err))?;
-    record_profile(profile, |profile| {
-        profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
-    });
-
-    // KL over the completion region only, chunked at the loss level to bound
-    // the per-chunk vocab-sized softmax/log-softmax intermediates over the
-    // single forward's logits.
+    // KL over the completion region only. The teacher is a fixed distillation
+    // target — no gradient ever flows into it — so slice its completion region
+    // with the tape DISABLED. This is load-bearing for VRAM: a tape-enabled
+    // slice registers a `slice_bwd` node that pre-allocates a grad buffer the
+    // size of the *full* teacher logits (`[1, seq_end, vocab]` ≈ 142 MiB at
+    // 144×248320), which was the rollout-128 backward OOM site. With the tape
+    // off, only the small `[1, kl_range, vocab]` slice is materialized. The
+    // teacher runs through the infer runtime (full logits — the windowed
+    // `forward_logits_window_device` is only supported by the in-process
+    // Qwen35 teacher), so we then free the full-prefix teacher logits: with the
+    // tape disabled it has no backward dependency, reclaiming ~142 MiB to widen
+    // headroom for the student backward.
     let phase_started = Instant::now();
     let starts = [0, kl_range.start, 0];
     let ends = [1, kl_range.end, vocab];
+    tape.set_enabled(false);
     let teacher_kl =
         slice(teacher_logits.tensor_id, &starts, &ends, store, tape).map_err(OpdError::from)?;
-    let student_kl = slice(student_logits, &starts, &ends, store, tape).map_err(OpdError::from)?;
+    store
+        .free(teacher_logits.tensor_id)
+        .map_err(OpdError::from)?;
+
+    tape.set_enabled(true);
+    let student_phase_started = Instant::now();
+    // VRAM-fit lever (2026-05-29): run the student lm_head over the KL window
+    // ONLY, not the full scored prefix. The hidden-state forward still covers
+    // `[0..seq_end]` (causal attention needs the full prefix), but the
+    // vocab-wide lm_head projection — and its backward grad buffers — are the
+    // dominant transient at seq×vocab=144×248320. `forward_logits_window`
+    // slices the cheap 1024-wide hidden to the window then projects, so the
+    // full `[1, seq_end, vocab]` student logits tensor (≈142 MiB) and the
+    // `slice_bwd` grad buffer of the same size never materialize. Numerically
+    // identical: causal logits at position p are independent of tokens after p,
+    // so windowed lm_head == full lm_head sliced.
+    let kl_window = SequenceWindow {
+        start: kl_range.start,
+        end: kl_range.end,
+    };
+    let student_kl = student
+        .forward_logits_window(store, tape, prefix, &positions, kl_window)
+        .map_err(|err| map_qwen35_forward_error("student chunk KL", err))?;
+    record_profile(profile, |profile| {
+        profile.student_forward_seconds += student_phase_started.elapsed().as_secs_f64();
+    });
+
     let loss = kl_distill_loss_chunked(
         student_kl,
         teacher_kl,
