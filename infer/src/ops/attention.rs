@@ -610,21 +610,17 @@ pub(crate) fn prefill_attention_paged_batch(
             page_size == 16,
             "TileLang prefill HD128 kernel requires page_size=16, got {page_size}"
         );
-        match (num_q_heads, num_kv_heads) {
-            (16, 8) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
-            (32, 8) => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
-            (40, 8) => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
-            (64, 8) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
-            other => {
-                return Err(anyhow!(
-                    "TileLang: no specialized prefill HD128 kernel for \
-                     (num_q_heads, num_kv_heads) = {other:?}; supported configs \
-                     are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
-                     in tools/tilelang/batch_prefill_paged_hd128.py, \
-                     TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs, \
-                     and the FFI macro + this match in lockstep, then rebuild."
-                ));
-            }
+        // Head-config validation + the unprecompiled-config hard-fail live once
+        // in `oplib::attention::head_config_hd128` (CPU-testable); this site only
+        // maps the resolved variant onto its prefill FFI fn pointer (a cuda type).
+        use crate::oplib::attention::HeadConfigHd128;
+        match crate::oplib::attention::head_config_hd128(num_q_heads, num_kv_heads)
+            .map_err(|e| anyhow!(e))?
+        {
+            HeadConfigHd128::Q16Kv8 => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
+            HeadConfigHd128::Q32Kv8 => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
+            HeadConfigHd128::Q40Kv8 => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
+            HeadConfigHd128::Q64Kv8 => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
         }
     };
 
@@ -1131,39 +1127,28 @@ pub fn tilelang_tc_run_layer(
             "TileLang TC decode alias requires page_size=16, got {}",
             heads.page_size
         );
+        // Head-config validation + the unprecompiled-config hard-fail live once
+        // in `oplib::attention::head_config_hd128` (CPU-testable); this site only
+        // maps the resolved variant onto its FFI fn pointer (a cuda type). Pure
+        // decode (max_qlen==1) maps onto the dedicated decode kernels; the
+        // mixed/varlen-Q branch reuses the *prefill* kernels as a TC alias.
+        use crate::oplib::attention::HeadConfigHd128;
+        let head_config =
+            crate::oplib::attention::head_config_hd128(heads.num_qo_heads, heads.num_kv_heads)
+                .map_err(|e| anyhow!(e))?;
         if is_pure_decode {
-            match (heads.num_qo_heads, heads.num_kv_heads) {
-                (16, 8) => ffi::tilelang_batch_decode_paged_hd128_q16_kv8_run_cuda,
-                (32, 8) => ffi::tilelang_batch_decode_paged_hd128_q32_kv8_run_cuda,
-                (40, 8) => ffi::tilelang_batch_decode_paged_hd128_q40_kv8_run_cuda,
-                (64, 8) => ffi::tilelang_batch_decode_paged_hd128_q64_kv8_run_cuda,
-                other => {
-                    return Err(anyhow!(
-                        "TileLang: no specialized HD128 decode kernel for \
-                         (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
-                         are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
-                         in tools/tilelang/batch_decode_paged_hd128.py, \
-                         TILELANG_DECODE_HD128_HEAD_CONFIGS in cuda-kernels/build.rs, \
-                         and the FFI macro + this match in lockstep, then rebuild."
-                    ));
-                }
+            match head_config {
+                HeadConfigHd128::Q16Kv8 => ffi::tilelang_batch_decode_paged_hd128_q16_kv8_run_cuda,
+                HeadConfigHd128::Q32Kv8 => ffi::tilelang_batch_decode_paged_hd128_q32_kv8_run_cuda,
+                HeadConfigHd128::Q40Kv8 => ffi::tilelang_batch_decode_paged_hd128_q40_kv8_run_cuda,
+                HeadConfigHd128::Q64Kv8 => ffi::tilelang_batch_decode_paged_hd128_q64_kv8_run_cuda,
             }
         } else {
-            match (heads.num_qo_heads, heads.num_kv_heads) {
-                (16, 8) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
-                (32, 8) => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
-                (40, 8) => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
-                (64, 8) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
-                other => {
-                    return Err(anyhow!(
-                        "TileLang: no specialized TC-decode HD128 kernel for \
-                         (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
-                         are (16,8), (32,8), (40,8), (64,8). Extend SUPPORTED_HEADS \
-                         in tools/tilelang/batch_prefill_paged_hd128.py, \
-                         TILELANG_PREFILL_HD128_HEAD_CONFIGS in cuda-kernels/build.rs, \
-                         and the FFI macro + this match in lockstep, then rebuild."
-                    ));
-                }
+            match head_config {
+                HeadConfigHd128::Q16Kv8 => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda,
+                HeadConfigHd128::Q32Kv8 => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda,
+                HeadConfigHd128::Q40Kv8 => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda,
+                HeadConfigHd128::Q64Kv8 => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda,
             }
         }
     };
@@ -1184,30 +1169,39 @@ pub fn tilelang_tc_run_layer(
             && let Some((partial_out, partial_m, partial_l)) =
                 workspace.hd128_decode_split_workspace_mut(batch_size as usize, heads.num_qo_heads)
         {
-            let partial_kernel = match (heads.num_qo_heads, heads.num_kv_heads) {
-                (16, 8) => ffi::tilelang_batch_decode_paged_hd128_split_partial_q16_kv8_run_cuda,
-                (32, 8) => ffi::tilelang_batch_decode_paged_hd128_split_partial_q32_kv8_run_cuda,
-                (40, 8) => ffi::tilelang_batch_decode_paged_hd128_split_partial_q40_kv8_run_cuda,
-                (64, 8) => ffi::tilelang_batch_decode_paged_hd128_split_partial_q64_kv8_run_cuda,
-                other => {
-                    return Err(anyhow!(
-                        "TileLang: no specialized HD128 split partial kernel for \
-                         (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
-                         are (16,8), (32,8), (40,8), (64,8)."
-                    ));
+            // Same CPU-testable head-config resolver as the dense decode path
+            // above; this site only maps the resolved variant onto its
+            // split-partial / split-merge FFI fn pointers (cuda types).
+            use crate::oplib::attention::HeadConfigHd128;
+            let split_head_config =
+                crate::oplib::attention::head_config_hd128(heads.num_qo_heads, heads.num_kv_heads)
+                    .map_err(|e| anyhow!(e))?;
+            let partial_kernel = match split_head_config {
+                HeadConfigHd128::Q16Kv8 => {
+                    ffi::tilelang_batch_decode_paged_hd128_split_partial_q16_kv8_run_cuda
+                }
+                HeadConfigHd128::Q32Kv8 => {
+                    ffi::tilelang_batch_decode_paged_hd128_split_partial_q32_kv8_run_cuda
+                }
+                HeadConfigHd128::Q40Kv8 => {
+                    ffi::tilelang_batch_decode_paged_hd128_split_partial_q40_kv8_run_cuda
+                }
+                HeadConfigHd128::Q64Kv8 => {
+                    ffi::tilelang_batch_decode_paged_hd128_split_partial_q64_kv8_run_cuda
                 }
             };
-            let merge_kernel = match (heads.num_qo_heads, heads.num_kv_heads) {
-                (16, 8) => ffi::tilelang_batch_decode_paged_hd128_split_merge_q16_kv8_run_cuda,
-                (32, 8) => ffi::tilelang_batch_decode_paged_hd128_split_merge_q32_kv8_run_cuda,
-                (40, 8) => ffi::tilelang_batch_decode_paged_hd128_split_merge_q40_kv8_run_cuda,
-                (64, 8) => ffi::tilelang_batch_decode_paged_hd128_split_merge_q64_kv8_run_cuda,
-                other => {
-                    return Err(anyhow!(
-                        "TileLang: no specialized HD128 split merge kernel for \
-                         (num_qo_heads, num_kv_heads) = {other:?}; supported configs \
-                         are (16,8), (32,8), (40,8), (64,8)."
-                    ));
+            let merge_kernel = match split_head_config {
+                HeadConfigHd128::Q16Kv8 => {
+                    ffi::tilelang_batch_decode_paged_hd128_split_merge_q16_kv8_run_cuda
+                }
+                HeadConfigHd128::Q32Kv8 => {
+                    ffi::tilelang_batch_decode_paged_hd128_split_merge_q32_kv8_run_cuda
+                }
+                HeadConfigHd128::Q40Kv8 => {
+                    ffi::tilelang_batch_decode_paged_hd128_split_merge_q40_kv8_run_cuda
+                }
+                HeadConfigHd128::Q64Kv8 => {
+                    ffi::tilelang_batch_decode_paged_hd128_split_merge_q64_kv8_run_cuda
                 }
             };
             let (partial_out_ptr, _gpo) = partial_out.device_ptr_mut(&ctx.stream);
