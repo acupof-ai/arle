@@ -106,3 +106,23 @@ SGLang and ARLE must bench SEQUENTIALLY, not concurrently.**
   c=4 still fine (parity PASS). Conclusion: the shared persistent pool is
   REQUIRED (not a perf nicety) — it's the only way c≥8 fits. Dispatching
   the shared-pool implementation. Step-1 mem-fraction shortcut KILLED.
+
+- **I3b (2026-05-29)**: shared-pool first attempt REVERTED (9264c83a). The
+  529-interrupted subagent wired `bind_fp8_kv_pool_view` into the DECODE
+  path (forward_decode_batch, has decode_ctx) but NOT prefill — and prefill
+  (routed through compute_top_level_logits_incremental by the P→D fix) runs
+  the SW-bootstrap PACK hooks, which need the bound pool view but have no
+  decode_ctx → c=1 broke (HTTP 500 "pool sub-range not bound"). Correctness
+  regression → reverted (correctness-first, no-half-states).
+  DESIGN FIX for re-do: the FP8 decode pool bootstrap/pack must happen at
+  FIRST-DECODE (has decode_ctx + slot), NOT during prefill. Gate the pack
+  hooks to decode-time; prefill only writes the bf16 SW window. Then the
+  shared pool lives in decode_ctx, bind only in the decode path (no prefill
+  bind needed). Re-dispatch shared pool with this design, gated env-OFF
+  until validated (per "各自验证" — validate each piece independently).
+
+- **DIRECTIVE (user, 2026-05-29)**: ALL DSv4 attention → FlashMLA; drop the
+  legacy dsv4_hybrid_attention/swa fallback. DSv4-Flash is Hopper-only by
+  design (FlashMLA is SM90-only: WGMMA + __nv_fp8_e8m0), so all-Flash =
+  Hopper-only DSv4, which is acceptable. Supersedes the earlier "keep legacy
+  for V100/A100" judgment. Legacy deletion is a separate validated tranche.
