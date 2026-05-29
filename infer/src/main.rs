@@ -34,7 +34,7 @@ use rand::{SeedableRng, rngs::StdRng};
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 const DEFAULT_SEQ_LEN: usize = 4096;
-const VALID_KV_CACHE_MODES: &str = "'auto', 'bf16', 'fp8', 'int8', 'tq2', 'tq3', or 'tq4'";
+const VALID_KV_CACHE_MODES: &str = "'auto', 'bf16', 'fp8', 'int8', 'int4', 'tq2', 'tq3', or 'tq4'";
 const VALID_QUANT_FORMATS: &str = "'auto' or 'marlin_w4a8'";
 const CONTIGUOUS_KV_TOKENS: usize = 512;
 
@@ -2051,6 +2051,14 @@ fn parse_kv_cache_mode(mode: &str) -> std::result::Result<RequestedKvCacheMode, 
             kv_cache_dtype: KVCacheDtype::INT8,
             kv_pool_format: KVFormat::INT8,
         }),
+        // INT4 KIVI two-level K + asymmetric [-8,7]; matches the audit
+        // path in `infer/tests/kv_precision_parity_qwen35.rs` and the
+        // numbers in wins/2026-05-28-int4-kv-two-level-k.md
+        // (mean_match=0.81 @ 4×4, 0.58 @ 4×16 on Qwen3.5-4B / V100).
+        "int4" => Ok(RequestedKvCacheMode::Explicit {
+            kv_cache_dtype: KVCacheDtype::BF16,
+            kv_pool_format: KVFormat::INT4,
+        }),
         "tq2" => Ok(RequestedKvCacheMode::Explicit {
             kv_cache_dtype: KVCacheDtype::BF16,
             kv_pool_format: KVFormat::TurboQuant {
@@ -2407,6 +2415,13 @@ mod tests {
             RequestedKvCacheMode::Explicit {
                 kv_cache_dtype: KVCacheDtype::INT8,
                 kv_pool_format: KVFormat::INT8,
+            }
+        );
+        assert_eq!(
+            parse_kv_cache_mode("int4").unwrap(),
+            RequestedKvCacheMode::Explicit {
+                kv_cache_dtype: KVCacheDtype::BF16,
+                kv_pool_format: KVFormat::INT4,
             }
         );
         assert_eq!(
