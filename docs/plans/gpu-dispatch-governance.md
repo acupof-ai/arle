@@ -65,7 +65,7 @@ and c=16 run, kill if regression > 0.5%).
 what kernel chain runs." The answer is spread across `StepPlan`, `LinearKernelPlan`, a
 `KVFormat` match in three files, the graph heuristic, and inline `env::var` reads
 (`INFER_MARLIN_W4_FP8_PREFILL`, `INFER_R4_W4A16_GEMV_OVERRIDE`,
-`INFER_HYBRID_W4A8_PREFILL_ENABLED`, `INFER_BYPASS_TILELANG_PREFILL`). No SM-tier
+`INFER_HYBRID_W4A8_PREFILL`, `INFER_BYPASS_TILELANG_PREFILL`). No SM-tier
 resolver exists.
 
 **Intervention.**

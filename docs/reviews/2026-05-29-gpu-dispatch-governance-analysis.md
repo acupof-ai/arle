@@ -55,7 +55,7 @@ not unified; (b) **compute-and-discard** — the resolved choice is never surfac
   - the resolved variant is **never logged or counted** — it is used to launch, then dropped;
   - policy is read inline from the hot path — `INFER_MARLIN_W4_FP8_PREFILL`
     (`linear.rs:95,126`), `INFER_R4_W4A16_GEMV_OVERRIDE` (`linear.rs:158`),
-    `INFER_HYBRID_W4A8_PREFILL_ENABLED` (`linear.rs:134`);
+    `INFER_HYBRID_W4A8_PREFILL` (`linear.rs:134`);
   - alignment-fail fallbacks demote via `log::trace!` (`linear.rs:139,169`), which is
     **off at the default log level** — a W4 weight that fails Marlin alignment silently
     runs a different, slower kernel and nothing visible says so.
