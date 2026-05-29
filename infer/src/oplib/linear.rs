@@ -409,6 +409,7 @@ mod tests {
             deterministic_gemm: false,
             tilelang_bf16_split_kv: false,
             prefill_graph: false,
+            bypass_tilelang_prefill: false,
             dsv4_grouped_gemm_m_threshold: 4,
         };
         let mut out = Vec::new();
@@ -483,6 +484,7 @@ mod tests {
             deterministic_gemm: false,
             tilelang_bf16_split_kv: false,
             prefill_graph: false,
+            bypass_tilelang_prefill: false,
             dsv4_grouped_gemm_m_threshold: 4,
         };
         let unaligned = |weight_format, batch, phase| LinearPlanInputs {
@@ -596,6 +598,7 @@ mod tests {
                     deterministic_gemm: false,
                     tilelang_bf16_split_kv: false,
                     prefill_graph: false,
+                    bypass_tilelang_prefill: false,
                     dsv4_grouped_gemm_m_threshold: 4,
                 };
                 assert!(!plan(&inputs, &policy).kernel_label().is_empty());
