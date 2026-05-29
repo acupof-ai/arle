@@ -1859,7 +1859,6 @@ impl DeepseekModel {
                 && token_count_ok
                 && (head_dim == 512 || head_dim == 576)
                 && total_position_after <= FLASHMLA_TOTAL_POSITION_LIMIT
-                && cache.is_some()
                 && dsv4_flashmla_prefill_enabled()?;
             if use_flashmla {
                 let tp_world = self.config.tp.world_size;
@@ -1964,19 +1963,40 @@ impl DeepseekModel {
                 {
                     use cudarc::driver::DevicePtrMut;
                     let (kv_ptr, _g) = kv_unified.device_ptr_mut(&self.ctx.stream);
-                    // Acquire bf16 SW window ptr from cache (scoped to
-                    // this borrow — the &mut on cache.window_gpu lives
-                    // only until the kernel launch returns, since the
-                    // FFI takes a raw ptr).
-                    let cache_pre = cache
-                        .as_deref_mut()
-                        .expect("FlashMLA prefill requires cache");
-                    let window_pre_buf = cache_pre
-                        .window_gpu
-                        .as_mut()
-                        .expect("SW window cache allocated above");
-                    let (window_ptr_pre, _window_pre_g) =
-                        window_pre_buf.device_ptr_mut(&self.ctx.stream);
+                    // Acquire bf16 SW window ptr (scoped to this borrow —
+                    // the &mut lives only until the kernel launch returns,
+                    // since the FFI takes a raw ptr). When `cache` is None
+                    // (the stateless batched prefill path —
+                    // `compute_top_level_logits`, start_pos=0), fall back to
+                    // a freshly-zeroed scratch window: at start_pos=0 the SW
+                    // ring is empty, so a zeroed window is the correct prior
+                    // (no tokens precede the prompt). This mirrors the legacy
+                    // hybrid path's scratch fallback and restores V2.4's
+                    // cache-less FlashMLA prefill (the D-4 decode plumbing in
+                    // 8ebe3ff5 regressed it to a hard `cache.expect`).
+                    let mut window_pre_scratch: Option<CudaSlice<bf16>> = None;
+                    let (window_ptr_pre, _window_pre_g) = if let Some(c) = cache.as_deref_mut() {
+                        let buf = c
+                            .window_gpu
+                            .as_mut()
+                            .expect("SW window cache allocated above");
+                        buf.device_ptr_mut(&self.ctx.stream)
+                    } else {
+                        let buf = self
+                            .ctx
+                            .stream
+                            .alloc_zeros_traced::<bf16>(cache_len)
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "DSv4 FlashMLA prefill scratch window alloc failed: {err}"
+                                )
+                            })?;
+                        window_pre_scratch = Some(buf);
+                        window_pre_scratch
+                            .as_mut()
+                            .unwrap()
+                            .device_ptr_mut(&self.ctx.stream)
+                    };
                     let comp_ptr_arg = if compressed_count > 0 {
                         compressed_ptr
                     } else {
