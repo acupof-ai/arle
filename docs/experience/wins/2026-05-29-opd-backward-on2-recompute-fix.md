@@ -54,14 +54,26 @@ with the forward-once/chunk-the-loss pattern already used elsewhere.
   tape).
 - **Compiles** clean under `--features cuda` and `cuda,no-cuda`.
 
-## Projected perf (structural, not re-benched)
+## Perf — confirmed end-to-end on the real config (2026-05-29 probe)
 
-Forward work on the scored prefix drops ~4.5× → 1×. Since `student_forward`
-(recompute) + `tape.backward` were the dominant terms, the backward phase is
-expected to drop ~3–4× (≈63s → ~16–20s), taking the step a further ~1.5–2×
-(stacking on the rollout 5×). **Not separately benched** — the gain is
-structural (1 forward vs ~4.5) and will surface in the next real training run;
-no synthetic confirmation sweep was run per user direction.
+A 3-step pre-flight of the **real capability config** (4B teacher + 0.8B
+student LoRA + the now-default in-process infer student engine, rollout-64,
+`opd-diverse-1k`) on the RTX 4070 Ti SUPER measured **~12.8s/step warm**
+(steps 2–3): backward ~8–9s, student_rollout ~2.6s, teacher_forward ~0.03s.
+The old rollout-64 path's `student_rollout` term alone was ~60s (perf fit), so
+the infer-rollout + this backward fix together deliver **~8× at the step level
+on the real 4B-teacher config** — confirmed by a real run, not a synthetic
+sweep (closing the earlier "projected" caveat per user direction). Forward work
+on the scored prefix dropped ~4.5× → 1× as designed; backward is now the
+~8–9s term and the natural next axis only if a bigger GPU lifts the memory cap.
+
+**VRAM finding (hard cap on this 16GB card):** the same probe OOM'd at
+**rollout-128** — `slice_bwd` `alloc_zeros` failed on the first backward, peak
+~14.5GB. rollout-64 fits but with only ~720MB headroom; the two infer engines
+are tiny (`mem_fraction_static=0.05`), so VRAM is dominated by the 4B teacher
+weights + the autograd backward tape. **The "longer rollout = more on-policy
+signal" capability hypothesis is hardware-blocked at rollout-128 on 16GB**;
+testing it needs a 24GB+ GPU or a `slice_bwd`/activation-memory reduction.
 
 ## Rule
 
