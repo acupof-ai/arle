@@ -34,6 +34,27 @@ The gap is ~25 percentage points of memory-bandwidth utilization at
 decode. KV quantization (already shipping INT4) saves K/V reads but
 **doesn't save weight reads**, which is the dominant cost at 4B class.
 
+## Phase 2 — KILL: H2 graph capture coverage (2026-05-29)
+
+**Evidence (from `bench_runs/int4/server.log`):** 8 captured groups of
+3 contiguous layers each = 24 captured layers; pattern is
+`group=N covers layers [4N+0..4N+2]`, **skipping layer 4N+3**. Layer 3
+was the same layer that failed the TQ4 decode pathway with
+`qwen35 decode full-attention layer_idx=3`, so the uncaptured layers
+are the 8 **full-attention layers** of Qwen3.5-4B's hybrid (the other
+24 are linear-attention / GDR).
+
+**Math:** 8 uncaptured layers × ~30 μs launch overhead ≈ 0.24 ms per
+decode step = 1.7% of 13.7 ms ITL. **Not the binding cost.** The full-
+attention layer's actual ITL contribution is the attention *compute*
+on V100 (TileLang sm_70 decode kernel + page-aware K/V loads), not
+the per-layer launch.
+
+**Verdict:** KILLED. Even forcing the full-attention layers into the
+graph (which would require recordable paged-KV index slots and an
+extra graph re-record path per request) buys at most 1.7% ITL. Not
+worth the dispatch-layer plumbing budget.
+
 ## Phase 1 — KILL: split heuristic SM-tier awareness (2026-05-29)
 
 **Hypothesis:** `choose_decode_num_splits` returns 32 splits at any
@@ -73,7 +94,21 @@ the per-step kernel-launch overhead, not the split count.
 Each entry lists: lever, ITL impact estimate, cost, and the cheap
 license-or-kill experiment.
 
-### H1. W4A16 / W4A8 weight quantization on decode hot path
+### H1. W4A16 / W4A8 weight quantization on decode hot path **[BLOCKED]**
+
+**Block discovered 2026-05-29:** there is no Marlin/AWQ/GPTQ
+Qwen3.5-4B checkpoint cached on the V100 box (only the BF16
+9.3 GB original at `~/.cache/modelscope/.../Qwen/Qwen3.5-4B`).
+The Marlin path in `crates/cuda-kernels/csrc/gemm/marlin_*` and
+the `--quant-format marlin_w4a8` CLI surface both expect a
+pre-quantized checkpoint in Marlin's packed weight layout.
+
+Unblocking H1 first requires generating that checkpoint — either:
+(a) calibration + AWQ/GPTQ quant of Qwen3.5-4B (Python tooling,
+~30 min compute + validation), or (b) download a community
+W4-quantized variant if one ships (verify quality matches BF16 base
+within the 4×4 grid first). Defer until someone schedules it as a
+dedicated cycle; ITL impact ranking unchanged.
 
 **Lever:** Use the existing Marlin W4A16 / W4A8 weight-quant kernels
 (`crates/cuda-kernels/csrc/gemm/marlin_*`) for the per-layer Q/K/V/O
@@ -168,20 +203,24 @@ prefill gap).
 during a 128-token request. If bandwidth + occupancy are both >70%
 of peak → kill. Otherwise land the re-tune.
 
-## Execution order
+## Execution order (revised after Phase 1 + Phase 2 kills)
 
-Greedy by `expected_impact / cost`:
+After two cheap kills (split heuristic + graph capture), revised
+queue:
 
-1. **H2** (Graph capture audit) — `low cost, medium impact, fast
-   evidence`. One audit log line away from green-or-red verdict.
-2. **H1** (W4 weights on decode) — `medium cost, high impact,
-   structural`. Probably the single biggest win available.
-3. **H3** (ncu of one GEMV) — `low cost`, gives evidence for or against
-   H4 and H5 simultaneously. Run alongside H1.
-4. **H5** (TileLang prefill re-tune) — only after H3 ncu confirms
-   prefill kernel is the bottleneck.
-5. **H4** (FlashInfer-style decode rewrite) — only if H1 + H3 + H5
+1. **H3** (ncu of one GEMV) — `low cost, decides H4 + H5`. V100 has
+   ncu in `/usr/bin/ncu`. One profiler run on a representative GEMV
+   yields `gld_efficiency` and `sm__throughput.active` for the
+   weight-bandwidth question. **Do this next.**
+2. **H1 unblock** (generate or download Marlin Qwen3.5-4B checkpoint)
+   — parallel side-quest; once a Marlin variant exists, the actual
+   H1 experiment is one `--quant-format marlin_w4a8` flag flip.
+3. **H5** (TileLang prefill re-tune) — only after H3 confirms prefill
+   kernel is below 70% peak BW + occupancy.
+4. **H4** (FlashInfer-style decode rewrite) — only if H1 + H3 + H5
    leave a >20% residual gap. Most expensive lever, save for last.
+
+Removed from queue: H2 (killed 2026-05-29).
 
 After each landed win: re-run `guidellm 128/128 c=1/4/8 int4` per the
 [Step 1 wins entry](../experience/wins/2026-05-29-guidellm-ttft-throughput-v100-qwen35.md),
