@@ -611,6 +611,22 @@ impl DeepseekModel {
                 &mut next_stream.hidden,
             )?;
             put_hidden_scratch(&mut layer_cache.stream_recycle, stream);
+            // Prefill OOM fix. Each layer's per-layer compute scratch
+            // (attention q/k_prepared, local_attn, output_latent, attn_pre/
+            // normed/post, ffn_pre/normed, attn/ffn MHC, the MoE route/expert
+            // scratch) is sized by `tokens.len()`. For a prefill chunk that is
+            // the chunk's token count (e.g. 16384), and these scratches live in
+            // the PER-LAYER `layers[i]` cache, so without trimming, all 43
+            // layers' chunk-sized scratch coexists for the whole forward —
+            // measured at ~74 GB for a single 16384-token chunk (idle 23 GB →
+            // 97 GB → OOM). `trim_prefill_scratch` frees that compute scratch
+            // (and the recycled prior stream just put back) while KEEPING the
+            // KV caches decode reads (window_gpu / compressed / FP8 pool), so
+            // peak stays at ~one layer's scratch instead of 43. Decode
+            // (tokens.len()==1) keeps its tiny per-layer scratch for reuse.
+            if tokens.len() > 1 {
+                layer_cache.trim_prefill_scratch();
+            }
             stream = next_stream;
         }
         state.incremental.processed_tokens += tokens.len();
