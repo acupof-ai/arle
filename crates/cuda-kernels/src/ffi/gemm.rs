@@ -430,6 +430,41 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ── Qwen3.5-MoE / Qwen3.6 single-GPU BF16 grouped expert GEMM ──────────
+    // Mirrors the DSv4 FP8 grouped GEMM structure (M-grouping by expert,
+    // CUDA-core warp-reduce, sm_70-safe) but with plain BF16 weights — no
+    // FP8/E8M0 decode, so no scale pointers / scale_rows / scale_cols.
+    // (W4 nibble-decode variant = explicit follow-up.)
+    pub fn moe_bf16_grouped_gemm_batch_cuda(
+        weight_ptrs: *const u64,
+        input: *const Half,
+        output: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn moe_bf16_grouped_gemm_pair_batch_cuda(
+        weight_a_ptrs: *const u64,
+        weight_b_ptrs: *const u64,
+        input: *const Half,
+        output_a: *mut Half,
+        output_b: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_fp8_route_gemv_batch_cuda(
         weight_ptrs: *const u64,
         scale_ptrs: *const u64,

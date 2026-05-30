@@ -1701,31 +1701,37 @@ impl Qwen35Model {
             &mut bufs.common.normed,
         )?;
 
-        // MLP: gate + up → silu_mul → down
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.gate_proj,
-            &bufs.common.normed,
-            &mut bufs.mlp.gate_out,
-        );
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.up_proj,
-            &bufs.common.normed,
-            &mut bufs.mlp.up_out,
-        );
-        ops::silu_mul_batch_into(
-            &self.ctx,
-            &bufs.mlp.gate_out,
-            &bufs.mlp.up_out,
-            &mut bufs.mlp.act_out,
-        )?;
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.down_proj,
-            &bufs.mlp.act_out,
-            &mut bufs.common.o_buf,
-        );
+        // MLP: dense SwiGLU (gate + up → silu_mul → down) or Qwen3.6 grouped MoE.
+        if let Some(moe) = layer.mlp.as_moe() {
+            let moe_out = moe.forward(&self.ctx, &self.config, &bufs.common.normed)?;
+            super::prefill::copy_hidden_into(&self.ctx, &moe_out, &mut bufs.common.o_buf)?;
+        } else {
+            let dense = layer.mlp.dense();
+            ops::gemm_into(
+                &self.ctx,
+                &dense.gate_proj,
+                &bufs.common.normed,
+                &mut bufs.mlp.gate_out,
+            );
+            ops::gemm_into(
+                &self.ctx,
+                &dense.up_proj,
+                &bufs.common.normed,
+                &mut bufs.mlp.up_out,
+            );
+            ops::silu_mul_batch_into(
+                &self.ctx,
+                &bufs.mlp.gate_out,
+                &bufs.mlp.up_out,
+                &mut bufs.mlp.act_out,
+            )?;
+            ops::gemm_into(
+                &self.ctx,
+                &dense.down_proj,
+                &bufs.mlp.act_out,
+                &mut bufs.common.o_buf,
+            );
+        }
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut bufs.common.o_buf)?;
 
