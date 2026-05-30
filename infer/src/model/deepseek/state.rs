@@ -585,7 +585,15 @@ impl DeepseekMoeRuntimeCache {
                         .alloc_traced::<i64>(capacity_tokens.saturating_mul(topk))?
                 },
                 recv_x: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_recv)? },
-                recv_src_idx: unsafe { ctx.stream.alloc_traced::<i32>(capacity_recv)? },
+                // Zero-init the dispatch-output metadata the combine indexes
+                // with: the dispatch populates only the valid range, leaving an
+                // uninitialized tail that the DeepEP combine kernel reads ->
+                // garbage index -> illegal memory access. compute-sanitizer
+                // (which zero-fills allocations) masked the IMA, proving the
+                // root cause is an uninitialized read. Zero send_head /
+                // rank_prefix / recv_channel_prefix / channel_prefix_matrix /
+                // recv_src_idx so the unused tail is a safe 0.
+                recv_src_idx: unsafe { ctx.stream.alloc_zeros_traced::<i32>(capacity_recv)? },
                 recv_topk_idx: unsafe {
                     ctx.stream
                         .alloc_traced::<i64>(capacity_recv.saturating_mul(topk))?
@@ -596,15 +604,15 @@ impl DeepseekMoeRuntimeCache {
                 },
                 rank_prefix: unsafe {
                     ctx.stream
-                        .alloc_traced::<i32>(ep_world.saturating_mul(ep_world))?
+                        .alloc_zeros_traced::<i32>(ep_world.saturating_mul(ep_world))?
                 },
                 recv_channel_prefix: unsafe {
                     ctx.stream
-                        .alloc_traced::<i32>(ep_world.saturating_mul(num_channels))?
+                        .alloc_zeros_traced::<i32>(ep_world.saturating_mul(num_channels))?
                 },
                 send_head: unsafe {
                     ctx.stream
-                        .alloc_traced::<i32>(capacity_tokens.saturating_mul(ep_world))?
+                        .alloc_zeros_traced::<i32>(capacity_tokens.saturating_mul(ep_world))?
                 },
                 num_tokens_per_rank: unsafe { ctx.stream.alloc_traced::<i32>(ep_world)? },
                 num_tokens_per_expert: unsafe { ctx.stream.alloc_traced::<i32>(num_experts)? },
@@ -614,7 +622,7 @@ impl DeepseekMoeRuntimeCache {
                 },
                 channel_prefix_matrix: unsafe {
                     ctx.stream
-                        .alloc_traced::<i32>(ep_world.saturating_mul(num_channels))?
+                        .alloc_zeros_traced::<i32>(ep_world.saturating_mul(num_channels))?
                 },
                 combined_x: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_tokens)? },
                 combined_topk_w: unsafe {
