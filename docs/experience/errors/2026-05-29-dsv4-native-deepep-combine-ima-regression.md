@@ -165,3 +165,41 @@ that memcheck's serialization masks. Tools available can't cleanly pinpoint it
 The defensive zero-init commits are kept (uninit reads are real bugs regardless);
 native-deepep remains non-functional at HEAD until the cross-rank/DeepEP-internal
 uninit (or race) is found.
+
+## Update 2026-05-30 (round 3) — send_head RULED OUT; fault is cross-rank/intermittent
+
+Instrumented the deepep-sys wrapper (host-side D2H dumps of the metadata, env
+`ARLE_DEEPEP_COMBINE_DEBUG`) — decisive:
+
+- **send_head was a RED HERRING.** DeepEP indexes `send_head[token_idx * kNumRanks
+  + rank]` (intranode.cu:359/670, cached_notify_combine:33/44) → shape
+  `[num_recv_tokens × kNumRanks]`, so the original `× ep_world` allocation was
+  CORRECT. My debug dump mis-sized it (`× num_channels`) and the resulting
+  `cudaMemcpy invalid argument` mis-led me. Reverted.
+- **dispatch-output == combine-input.** Dumping `recv_channel_prefix` + `rank_prefix`
+  right after `dispatch` AND right before `combine` shows IDENTICAL values every
+  layer — so there is NO ordering / overwrite / routing bug; rank-0's local
+  metadata is correct and sane (e.g. L0 num_recv=48 chan=0,1,2,3 rank=6,0,0,0).
+- **Fault is layer-intermittent.** Combine succeeds for L0 (num_recv=48) and L1
+  (num_recv=0 — legitimate: no tokens routed to rank-0's experts that layer), then
+  faults at L2 (num_recv=32) with "sync after combine: unspecified launch failure".
+  No local-metadata difference explains why L2 faults but L0 doesn't.
+
+**Refined conclusion**: combine is a CROSS-RANK kernel (each rank reads peers'
+`local_buf` via CUDA IPC, indexed by its own prefixes). All RANK-LOCAL inputs are
+verified correct. The intermittent (layer-specific) + memcheck-masked fault now
+points to a **cross-rank race or a peer-buffer region rank-0 reads that the peer's
+dispatch left unwritten** — NOT a local sizing/uninit bug (those are ruled out).
+
+**Next (focused DeepEP-kernel debug session):**
+1. `compute-sanitizer --tool racecheck` (the one thing memcheck serializes away).
+2. Dump a PEER's metadata (not just rank-0 local) at the faulting layer — does the
+   peer rank-0 reads from have valid prefixes/send_head for that layer?
+3. Audit the cross-rank barrier between dispatch and combine in cached_notify_combine
+   vs the [[feedback_deepep_combine_uses_recv_channel_prefix]] /
+   [[feedback_deepep_kernel_api_inverted_naming]] contracts — a barrier_signal
+   mismatch would let rank-0 combine before a peer finished its dispatch write.
+
+The defensive zero-init commits (metadata + NVL + all-scratch) are kept but did NOT
+fix it (they changed IMA→launch-failure via the send_head red-herring zeroing).
+native-deepep remains non-functional at HEAD.
