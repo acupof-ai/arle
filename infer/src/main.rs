@@ -438,9 +438,11 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
             .parse()
             .with_context(|| format!("worker rank {rank} relay addr parse"))?;
-        let relay =
-            infer::multiproc_relay::RelayWorker::connect(addr, std::time::Duration::from_secs(30))
-                .with_context(|| format!("worker rank {rank} relay connect"))?;
+        let relay = infer::multiproc_relay::RelayWorker::connect(
+            addr,
+            infer::distributed::init_method::socket_timeout(),
+        )
+        .with_context(|| format!("worker rank {rank} relay connect"))?;
         info!("[arle-worker rank={rank}] relay pre-connected to {addr}");
         Some(relay)
     } else {
@@ -1678,7 +1680,10 @@ async fn async_main(args: Args) {
         std::sync::Arc<std::sync::Mutex<infer::multiproc_relay::RelayCoordinator>>,
     > = if let Some(pending) = pending_relay {
         let mut coord = pending
-            .accept(worker_bootstrap.len(), std::time::Duration::from_secs(30))
+            .accept(
+                worker_bootstrap.len(),
+                infer::distributed::init_method::socket_timeout(),
+            )
             .unwrap_or_else(|e| panic!("multiproc relay accept failed: {e:#}"));
         log::info!(
             "[multiproc-coord] relay accepted {} worker connects",
