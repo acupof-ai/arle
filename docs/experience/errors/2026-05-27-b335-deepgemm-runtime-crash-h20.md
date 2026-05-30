@@ -214,6 +214,27 @@ this session linked the STUB. So:
 `cargo build --features cuda,nccl` does NOT). Rebuilt with the env; real-deepgemm test pending. The candidate-2
 padding fix is the next thing to validate once the real kernel runs.
 
+## Update 2026-05-31 (real deepgemm confirmed) — REPRODUCES the original "unspecified launch failure"
+
+Rebuilt with `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1` + `ARLE_DEEPGEMM_ROOT`/`_LIBRARY_ROOT` (binary now contains the
+real `sm90_fp8_m_grouped_gemm_masked` symbol, not the stub). Re-ran `EXPERT=deepgemm` `MOE_BACKEND=native-deepep`,
+short prompt → the requests now fail with **`CUDA_ERROR_LAUNCH_FAILED, "unspecified launch failure"`** (44
+sticky-error lines; the GEMM device-trap poisons the context → the next `H2D copy` reports the cascade). This is
+EXACTLY the original b335 symptom — so the real deepgemm kernel does crash on the DSv4 expert shapes, and the
+earlier `NOT_SUPPORTED` was purely the stub masking it.
+
+So we are now at the GENUINE bug: an **illegal device access inside the real DeepGEMM kernel** (`LAUNCH_FAILED` =
+a device-side trap), which is consistent with the agent's **candidate-2** (the native-deepep DeepGEMM branch feeds
+unpadded/variable `route_capacity`=`total_local_routes` + a non-`-1` `expert_route_slot`, so on scratch reuse the
+FP8-pack scale-stride disagrees with the SFA TMA descriptor stride → OOB). Next:
+1. `compute-sanitizer --tool memcheck --target-processes all` (with `ARLE_RENDEZVOUS_TIMEOUT_SECS=900`) on ONE
+   short native-deepep+deepgemm request → name the exact OOB kernel + access (writer scale-store vs SFA TMA load).
+2. Apply candidate-2: pass a stable padded `route_capacity` (or make the deepgemm fn use the scratch's allocated
+   `capacity_m` for the scale-stride, both writer+reader) + build `expert_route_slot` as a `-1`-init per-route-unique
+   slot (`dsv4_pack_local_experts_with_slots_cuda`) — which also fixes the Finding-2 overwrite.
+3. Rebuild (with the deepgemm env) + re-test; coherent output + no LAUNCH_FAILED confirms it; then bench the
+   claimed ~2.5× expert-GEMM win vs the scalar grouped GEMM.
+
 ### Rule
 - **A `NOT_SUPPORTED` / "operation not supported" from a vendored, build-flag-gated bridge is "the stub is linked"
   until proven otherwise.** Check the `#ifdef`/build.rs feature gate and confirm the real TU compiled (grep the
