@@ -233,6 +233,55 @@ pub(crate) fn load_tensor_2d_concat_rows(
     DeviceMatrix::from_host(ctx, &host, rows, cols.unwrap_or(0))
 }
 
+/// Load expert `expert_idx`'s 2D sub-matrix from a stacked 3D expert tensor.
+///
+/// The production Qwen3.6-35B-A3B checkpoint ships routed experts as two stacked
+/// tensors rather than per-expert matrices:
+///   `experts.gate_up_proj` : `[E, 2*moe_inter, hidden]` — gate ‖ up fused on the
+///                            output axis (rows `[0, moe_inter)` are gate,
+///                            `[moe_inter, 2*moe_inter)` are up).
+///   `experts.down_proj`    : `[E, hidden, moe_inter]`.
+/// Each per-expert projection is a contiguous row-major slice, so we copy the
+/// `[out_rows, cols]` block at output-row offset `row_offset` inside expert
+/// `expert_idx`'s `[stacked_rows, cols]` block and upload it as a `DeviceMatrix`
+/// — bit-identical to the per-expert `experts.{i}.*` path it replaces.
+pub(crate) fn load_stacked_expert_2d(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    expert_idx: usize,
+    num_experts: usize,
+    stacked_rows: usize,
+    row_offset: usize,
+    out_rows: usize,
+    cols: usize,
+) -> Result<DeviceMatrix> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    anyhow::ensure!(
+        shape.len() == 3 && shape[0] == num_experts && shape[1] == stacked_rows && shape[2] == cols,
+        "{name}: expected stacked expert tensor [{num_experts}, {stacked_rows}, {cols}], got {shape:?}"
+    );
+    anyhow::ensure!(
+        row_offset + out_rows <= stacked_rows,
+        "{name}: expert slice [{row_offset}, {}) exceeds stacked rows {stacked_rows}",
+        row_offset + out_rows
+    );
+    let data = tensor.data();
+    let expected_bytes = num_experts * stacked_rows * cols * std::mem::size_of::<bf16>();
+    anyhow::ensure!(
+        data.len() == expected_bytes,
+        "{name}: bf16 byte length mismatch: expected {expected_bytes}, got {}",
+        data.len()
+    );
+    let elem_start = (expert_idx * stacked_rows + row_offset) * cols;
+    let elem_end = elem_start + out_rows * cols;
+    let mut host = Vec::with_capacity(out_rows * cols);
+    push_bf16_range(data, elem_start, elem_end, &mut host);
+    DeviceMatrix::from_host(ctx, &host, out_rows, cols)
+}
+
 #[allow(dead_code)]
 pub(crate) fn load_tensor_1d_f32_sharded(
     ctx: &DeviceContext,

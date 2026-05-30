@@ -186,16 +186,14 @@ pub(super) fn load_moe_mlp(
         config.num_experts_per_tok
     );
 
-    // Reject the stacked switch_mlp convention up front (explicit follow-up).
-    let switch_stacked = tensor_exists(
-        shards,
-        weight_map,
-        &format!("{mlp_prefix}.switch_mlp.gate_proj.weight"),
-    ) || tensor_exists(
-        shards,
-        weight_map,
-        &format!("{mlp_prefix}.switch_mlp.gate_proj"),
-    );
+    // Routed experts ship in one of two layouts:
+    //   • per-expert    : `experts.{i}.{gate,up,down}_proj` (tiny-random / some
+    //     HF exports) — loaded as separate matrices.
+    //   • stacked+fused : `experts.gate_up_proj` `[E, 2*moe_inter, hidden]`
+    //     (gate‖up on the output axis) + `experts.down_proj`
+    //     `[E, hidden, moe_inter]` (production Qwen3.6-35B-A3B) — sliced
+    //     per-expert into the same `DeviceMatrix` set below (bit-identical).
+    // The legacy stacked `switch_mlp.*` convention is NOT supported.
     let per_expert = tensor_exists(
         shards,
         weight_map,
@@ -205,16 +203,23 @@ pub(super) fn load_moe_mlp(
         weight_map,
         &format!("{mlp_prefix}.experts.0.gate_proj"),
     );
-    ensure!(
-        per_expert,
-        "Qwen3.6 MoE layer `{mlp_prefix}` has no per-expert `experts.{{i}}.gate_proj` tensors{}. \
-         Stacked `switch_mlp.*` expert-axis slicing is an explicit follow-up; \
-         the per-expert (HF) layout is required for the BF16 grouped path.",
-        if switch_stacked {
-            " (found stacked `switch_mlp.*` instead)"
-        } else {
-            ""
-        }
+    let stacked_fused = tensor_exists(
+        shards,
+        weight_map,
+        &format!("{mlp_prefix}.experts.gate_up_proj.weight"),
+    ) || tensor_exists(
+        shards,
+        weight_map,
+        &format!("{mlp_prefix}.experts.gate_up_proj"),
+    );
+    let switch_stacked = tensor_exists(
+        shards,
+        weight_map,
+        &format!("{mlp_prefix}.switch_mlp.gate_proj.weight"),
+    ) || tensor_exists(
+        shards,
+        weight_map,
+        &format!("{mlp_prefix}.switch_mlp.gate_proj"),
     );
 
     let load = |base: &str| -> Result<DeviceMatrix> {
@@ -227,11 +232,77 @@ pub(super) fn load_moe_mlp(
     let mut expert_gate = Vec::with_capacity(num_experts);
     let mut expert_up = Vec::with_capacity(num_experts);
     let mut expert_down = Vec::with_capacity(num_experts);
-    for i in 0..num_experts {
-        let ep = format!("{mlp_prefix}.experts.{i}");
-        expert_gate.push(load(&format!("{ep}.gate_proj"))?);
-        expert_up.push(load(&format!("{ep}.up_proj"))?);
-        expert_down.push(load(&format!("{ep}.down_proj"))?);
+    if per_expert {
+        for i in 0..num_experts {
+            let ep = format!("{mlp_prefix}.experts.{i}");
+            expert_gate.push(load(&format!("{ep}.gate_proj"))?);
+            expert_up.push(load(&format!("{ep}.up_proj"))?);
+            expert_down.push(load(&format!("{ep}.down_proj"))?);
+        }
+    } else if stacked_fused {
+        use crate::weight_loader::load_stacked_expert_2d;
+        let hidden = config.hidden_size;
+        let mi = config.moe_intermediate_size;
+        let gate_up = resolve_name(
+            shards,
+            weight_map,
+            &format!("{mlp_prefix}.experts.gate_up_proj"),
+        )?;
+        let down = resolve_name(
+            shards,
+            weight_map,
+            &format!("{mlp_prefix}.experts.down_proj"),
+        )?;
+        for i in 0..num_experts {
+            // gate_up_proj [E, 2*mi, hidden]: gate = rows [0, mi), up = rows [mi, 2*mi).
+            expert_gate.push(load_stacked_expert_2d(
+                ctx,
+                shards,
+                weight_map,
+                &gate_up,
+                i,
+                num_experts,
+                2 * mi,
+                0,
+                mi,
+                hidden,
+            )?);
+            expert_up.push(load_stacked_expert_2d(
+                ctx,
+                shards,
+                weight_map,
+                &gate_up,
+                i,
+                num_experts,
+                2 * mi,
+                mi,
+                mi,
+                hidden,
+            )?);
+            // down_proj [E, hidden, mi].
+            expert_down.push(load_stacked_expert_2d(
+                ctx,
+                shards,
+                weight_map,
+                &down,
+                i,
+                num_experts,
+                hidden,
+                0,
+                hidden,
+                mi,
+            )?);
+        }
+    } else {
+        anyhow::bail!(
+            "Qwen3.6 MoE layer `{mlp_prefix}`: no recognized expert layout — need per-expert \
+             `experts.{{i}}.gate_proj` or stacked+fused `experts.gate_up_proj`+`experts.down_proj`{}.",
+            if switch_stacked {
+                " (found unsupported `switch_mlp.*`)"
+            } else {
+                ""
+            }
+        );
     }
 
     let shared_prefix = format!("{mlp_prefix}.shared_expert");
