@@ -141,6 +141,8 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) raw_logits_rx: mpsc::UnboundedReceiver<crate::scheduler::types::RawLogitsRequest>,
     pub(super) remerge_lora_rx:
         mpsc::UnboundedReceiver<crate::scheduler::types::RemergeLoraRequest>,
+    pub(super) engine_offload_rx:
+        mpsc::UnboundedReceiver<crate::scheduler::types::EngineOffloadRequest>,
     pub(super) wakeup_rx: crossbeam_channel::Receiver<()>,
     pub(super) wakeup_live: bool,
     /// Shared waiting count with the handle (for backpressure decrement).

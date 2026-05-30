@@ -21,6 +21,7 @@ use crate::weight_loader::{
     load_tensor_2d_sharded, precompute_rope_with_qwen35_scaling, resolve_rope_cache_len,
 };
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
+use cuda_kernels::tensor::{HostMatrixSnapshot, offload_raw_slice, reload_raw_slice};
 
 /// Pristine (un-merged) BF16 q/v projection host snapshot for one
 /// full-attention layer, captured at LoRA-enabled load so per-step
@@ -101,6 +102,49 @@ impl Default for Qwen35RuntimeConfig {
     }
 }
 
+/// Host-resident snapshot of one transformer block's device weight buffers,
+/// captured by [`Qwen35Model::offload_weights_to_host`] for the OPD engine
+/// time-share. Reload restores in the same field order.
+struct OffloadedBlock {
+    input_layernorm: Vec<bf16>,
+    post_attention_layernorm: Vec<bf16>,
+    mlp_gate: HostMatrixSnapshot,
+    mlp_up: HostMatrixSnapshot,
+    mlp_down: HostMatrixSnapshot,
+    attn: OffloadedAttn,
+}
+
+enum OffloadedAttn {
+    Full {
+        q_proj: HostMatrixSnapshot,
+        k_proj: HostMatrixSnapshot,
+        v_proj: HostMatrixSnapshot,
+        o_proj: HostMatrixSnapshot,
+        q_norm: Vec<bf16>,
+        k_norm: Vec<bf16>,
+    },
+    Linear {
+        in_proj_qkv: HostMatrixSnapshot,
+        in_proj_z: HostMatrixSnapshot,
+        in_proj_b: HostMatrixSnapshot,
+        in_proj_a: HostMatrixSnapshot,
+        conv1d_weight: Vec<bf16>,
+        dt_bias: Vec<bf16>,
+        a_log: Vec<f32>,
+        norm_weight: Vec<f32>,
+        out_proj: HostMatrixSnapshot,
+    },
+}
+
+/// Full host-resident snapshot of all model device weights while offloaded.
+/// `embed_tokens` doubles as the (tied) lm_head when `lm_head` is `None`.
+struct OffloadedWeights {
+    embed_tokens: HostMatrixSnapshot,
+    lm_head: Option<HostMatrixSnapshot>,
+    norm: Vec<bf16>,
+    blocks: Vec<OffloadedBlock>,
+}
+
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
@@ -120,6 +164,11 @@ pub struct Qwen35Model {
     /// at LoRA-enabled load. `Some` iff the model was loaded with an adapter;
     /// required by `remerge_lora` (per-step student sync, OPD P2).
     lora_base_cache: Option<Vec<LoraBaseLayer>>,
+    /// Host-resident weight snapshot while the engine is offloaded for the
+    /// OPD time-share. `Some` iff `offload_weights_to_host` ran without a
+    /// matching `reload_weights_to_device`; the device buffers are
+    /// placeholders in that state and must not be forwarded through.
+    offloaded: Option<Box<OffloadedWeights>>,
 }
 
 impl Qwen35Model {
@@ -530,6 +579,7 @@ impl Qwen35Model {
             paged_prefill_batch: std::sync::Mutex::new(None),
             medusa_hidden_capture: None,
             lora_base_cache: None,
+            offloaded: None,
         })
     }
 
@@ -928,6 +978,7 @@ impl Qwen35Model {
             paged_prefill_batch: std::sync::Mutex::new(None),
             medusa_hidden_capture: None,
             lora_base_cache: None,
+            offloaded: None,
         })
     }
 
@@ -1093,6 +1144,260 @@ impl Qwen35Model {
             }
         }
         self.ctx.sync()?;
+        Ok(())
+    }
+
+    /// Whether the model's device weights are currently offloaded to host RAM.
+    pub fn is_offloaded(&self) -> bool {
+        self.offloaded.is_some()
+    }
+
+    /// Move every device weight buffer to host RAM and free the VRAM
+    /// (OPD engine time-share). Idempotent: a no-op if already offloaded.
+    ///
+    /// Returns the total device VRAM (bytes) freed. After this returns the
+    /// model must NOT be forwarded through until `reload_weights_to_device`.
+    /// Format-agnostic (dense BF16, W4-Marlin, hybrid, TQ) and LoRA-merge
+    /// safe — it snapshots the live (merged) weights, so reload restores the
+    /// exact merged state. The pristine `lora_base_cache` host copy is left
+    /// untouched, so a later `remerge_lora` still works.
+    pub fn offload_weights_to_host(&mut self) -> Result<usize> {
+        if self.offloaded.is_some() {
+            return Ok(0);
+        }
+        let ctx = self.ctx.clone();
+        // Drain ALL in-flight GPU work on the device before snapshotting weights.
+        // The OPD step has three co-resident allocators sharing one device/pool
+        // (infer-student, infer-teacher, train autograd) on separate streams; a
+        // full context synchronize quiesces every stream so the D2H snapshot and
+        // the subsequent block frees do not race other-stream allocations from
+        // the shared async pool (the CUDA_ERROR_ILLEGAL_ADDRESS root cause).
+        ctx.ctx
+            .bind_to_thread()
+            .map_err(|e| anyhow::anyhow!("bind context before offload failed: {e}"))?;
+        ctx.ctx
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("device synchronize before offload failed: {e}"))?;
+        let mut freed = 0usize;
+
+        let embed_tokens = self.embed_tokens.offload_to_host(&ctx)?;
+        freed += embed_tokens.freed_bytes();
+        let lm_head = match self.lm_head.as_mut() {
+            Some(head) => {
+                let snap = head.offload_to_host(&ctx)?;
+                freed += snap.freed_bytes();
+                Some(snap)
+            }
+            None => None,
+        };
+        let (norm, n) = self.norm.offload_to_host(&ctx)?;
+        freed += n;
+
+        let mut blocks = Vec::with_capacity(self.layers.len());
+        for layer in self.layers.iter_mut() {
+            let (input_layernorm, a) = layer.input_layernorm.offload_to_host(&ctx)?;
+            let (post_attention_layernorm, b) =
+                layer.post_attention_layernorm.offload_to_host(&ctx)?;
+            freed += a + b;
+            let mlp_gate = layer.mlp.gate_proj.offload_to_host(&ctx)?;
+            let mlp_up = layer.mlp.up_proj.offload_to_host(&ctx)?;
+            let mlp_down = layer.mlp.down_proj.offload_to_host(&ctx)?;
+            freed += mlp_gate.freed_bytes() + mlp_up.freed_bytes() + mlp_down.freed_bytes();
+
+            let attn = match &mut layer.attn {
+                LayerKind::FullAttention(attn) => {
+                    let q_proj = attn.q_proj.offload_to_host(&ctx)?;
+                    let k_proj = attn.k_proj.offload_to_host(&ctx)?;
+                    let v_proj = attn.v_proj.offload_to_host(&ctx)?;
+                    let o_proj = attn.o_proj.offload_to_host(&ctx)?;
+                    let (q_norm, qn) = attn.q_norm.offload_to_host(&ctx)?;
+                    let (k_norm, kn) = attn.k_norm.offload_to_host(&ctx)?;
+                    freed += q_proj.freed_bytes()
+                        + k_proj.freed_bytes()
+                        + v_proj.freed_bytes()
+                        + o_proj.freed_bytes()
+                        + qn
+                        + kn;
+                    OffloadedAttn::Full {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        o_proj,
+                        q_norm,
+                        k_norm,
+                    }
+                }
+                LayerKind::LinearAttention(attn) => {
+                    let in_proj_qkv = attn.in_proj_qkv.offload_to_host(&ctx)?;
+                    let in_proj_z = attn.in_proj_z.offload_to_host(&ctx)?;
+                    let in_proj_b = attn.in_proj_b.offload_to_host(&ctx)?;
+                    let in_proj_a = attn.in_proj_a.offload_to_host(&ctx)?;
+                    let (conv1d_weight, c) = attn.conv1d_weight.offload_to_host(&ctx)?;
+                    let (dt_bias, d) = attn.dt_bias.offload_to_host(&ctx)?;
+                    let (a_log, al) = offload_raw_slice(&ctx, &mut attn.a_log)?;
+                    let (norm_weight, nw) = offload_raw_slice(&ctx, &mut attn.norm_weight)?;
+                    let out_proj = attn.out_proj.offload_to_host(&ctx)?;
+                    freed += in_proj_qkv.freed_bytes()
+                        + in_proj_z.freed_bytes()
+                        + in_proj_b.freed_bytes()
+                        + in_proj_a.freed_bytes()
+                        + out_proj.freed_bytes()
+                        + c
+                        + d
+                        + al
+                        + nw;
+                    OffloadedAttn::Linear {
+                        in_proj_qkv,
+                        in_proj_z,
+                        in_proj_b,
+                        in_proj_a,
+                        conv1d_weight,
+                        dt_bias,
+                        a_log,
+                        norm_weight,
+                        out_proj,
+                    }
+                }
+            };
+
+            blocks.push(OffloadedBlock {
+                input_layernorm,
+                post_attention_layernorm,
+                mlp_gate,
+                mlp_up,
+                mlp_down,
+                attn,
+            });
+        }
+
+        self.ctx
+            .ctx
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("device synchronize after offload failed: {e}"))?;
+        // NOTE: we deliberately do NOT `trim_memory_pool()` here. The freed
+        // weight blocks return to the device's async memory pool and are
+        // reused by the co-resident autograd/optimizer allocator (same pool,
+        // same device) for the student backward — which is exactly the VRAM
+        // headroom the time-share buys. Forcibly trimming the shared pool to
+        // the OS mid-step raced with those allocations and produced
+        // CUDA_ERROR_ILLEGAL_ADDRESS on the next reload. Pool-internal free is
+        // sufficient to fit the backward (verified); OS-level reclaim is not
+        // required and is unsafe while another allocator shares the pool.
+
+        self.offloaded = Some(Box::new(OffloadedWeights {
+            embed_tokens,
+            lm_head,
+            norm,
+            blocks,
+        }));
+        Ok(freed)
+    }
+
+    /// Restore every device weight buffer from the host snapshot, re-allocating
+    /// VRAM (OPD engine time-share). Idempotent: a no-op if not offloaded.
+    pub fn reload_weights_to_device(&mut self) -> Result<()> {
+        let Some(snapshot) = self.offloaded.take() else {
+            return Ok(());
+        };
+        let ctx = self.ctx.clone();
+        // Quiesce the whole device before re-allocating weight VRAM so the H2D
+        // restores do not race the train/optimizer allocations still draining
+        // from the shared async pool (see offload note).
+        ctx.ctx
+            .bind_to_thread()
+            .map_err(|e| anyhow::anyhow!("bind context before reload failed: {e}"))?;
+        ctx.ctx
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("device synchronize before reload failed: {e}"))?;
+        let OffloadedWeights {
+            embed_tokens,
+            lm_head,
+            norm,
+            blocks,
+        } = *snapshot;
+
+        self.embed_tokens.reload_from_host(&ctx, &embed_tokens)?;
+        match (self.lm_head.as_mut(), &lm_head) {
+            (Some(head), Some(snap)) => head.reload_from_host(&ctx, snap)?,
+            (None, None) => {}
+            _ => anyhow::bail!("offload/reload lm_head presence mismatch"),
+        }
+        self.norm.reload_from_host(&ctx, &norm)?;
+
+        anyhow::ensure!(
+            blocks.len() == self.layers.len(),
+            "offload/reload layer count mismatch: snapshot {} vs model {}",
+            blocks.len(),
+            self.layers.len()
+        );
+        for (layer, block) in self.layers.iter_mut().zip(blocks.into_iter()) {
+            layer
+                .input_layernorm
+                .reload_from_host(&ctx, &block.input_layernorm)?;
+            layer
+                .post_attention_layernorm
+                .reload_from_host(&ctx, &block.post_attention_layernorm)?;
+            layer
+                .mlp
+                .gate_proj
+                .reload_from_host(&ctx, &block.mlp_gate)?;
+            layer.mlp.up_proj.reload_from_host(&ctx, &block.mlp_up)?;
+            layer
+                .mlp
+                .down_proj
+                .reload_from_host(&ctx, &block.mlp_down)?;
+
+            match (&mut layer.attn, block.attn) {
+                (
+                    LayerKind::FullAttention(attn),
+                    OffloadedAttn::Full {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        o_proj,
+                        q_norm,
+                        k_norm,
+                    },
+                ) => {
+                    attn.q_proj.reload_from_host(&ctx, &q_proj)?;
+                    attn.k_proj.reload_from_host(&ctx, &k_proj)?;
+                    attn.v_proj.reload_from_host(&ctx, &v_proj)?;
+                    attn.o_proj.reload_from_host(&ctx, &o_proj)?;
+                    attn.q_norm.reload_from_host(&ctx, &q_norm)?;
+                    attn.k_norm.reload_from_host(&ctx, &k_norm)?;
+                }
+                (
+                    LayerKind::LinearAttention(attn),
+                    OffloadedAttn::Linear {
+                        in_proj_qkv,
+                        in_proj_z,
+                        in_proj_b,
+                        in_proj_a,
+                        conv1d_weight,
+                        dt_bias,
+                        a_log,
+                        norm_weight,
+                        out_proj,
+                    },
+                ) => {
+                    attn.in_proj_qkv.reload_from_host(&ctx, &in_proj_qkv)?;
+                    attn.in_proj_z.reload_from_host(&ctx, &in_proj_z)?;
+                    attn.in_proj_b.reload_from_host(&ctx, &in_proj_b)?;
+                    attn.in_proj_a.reload_from_host(&ctx, &in_proj_a)?;
+                    attn.conv1d_weight.reload_from_host(&ctx, &conv1d_weight)?;
+                    attn.dt_bias.reload_from_host(&ctx, &dt_bias)?;
+                    reload_raw_slice(&ctx, &mut attn.a_log, &a_log)?;
+                    reload_raw_slice(&ctx, &mut attn.norm_weight, &norm_weight)?;
+                    attn.out_proj.reload_from_host(&ctx, &out_proj)?;
+                }
+                _ => anyhow::bail!("offload/reload attention layer kind mismatch"),
+            }
+        }
+
+        self.ctx
+            .ctx
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("device synchronize after reload failed: {e}"))?;
         Ok(())
     }
 }
