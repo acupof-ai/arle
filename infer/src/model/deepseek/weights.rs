@@ -542,7 +542,7 @@ impl DeepseekModel {
         Ok(Some(logits.with_label("dsv4_phase2a1_top_level_logits")))
     }
 
-    fn compute_top_level_logits_incremental(
+    pub(super) fn compute_top_level_logits_incremental(
         &self,
         tokens: &[u32],
         state: &mut super::state::DeepseekState,

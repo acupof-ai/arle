@@ -13,6 +13,8 @@ use super::state::DeepseekState;
 #[cfg(feature = "cuda")]
 use super::weights::DeepseekModel;
 #[cfg(feature = "cuda")]
+use super::weights::dsv4_incremental_kv_enabled;
+#[cfg(feature = "cuda")]
 use crate::model::PrefillBatchRequest;
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::DeviceVec;
@@ -74,7 +76,43 @@ impl DeepseekModel {
         }
 
         if !emit_logits {
+            // Non-final chunk of a chunked (>16384-token) prefill. When
+            // incremental decode is enabled, the final chunk's logits path
+            // (`compute_gpu_logits_after_prefill` →
+            // `compute_top_level_logits_incremental`) asserts
+            // `incremental.processed_tokens == kv_cache.len()` and reads the
+            // per-layer SW/compressed/FP8 caches. Those invariants only hold if
+            // EVERY prior chunk also ran the incremental forward: each chunk
+            // must advance `processed_tokens` AND write its slice of KV at the
+            // correct absolute `start_pos` (= prior chunks' length). Routing
+            // only the final chunk through the incremental path (the 8f4db3b6
+            // behavior) leaves intermediate chunks at `processed_tokens == 0`
+            // with empty KV, so chunk-2 aborts with "incremental state length 0
+            // does not match scheduler KV length 16384".
+            //
+            // `compute_top_level_logits_incremental(emit_logits=false)`
+            // processes this chunk's tokens at `start_pos = processed_tokens`
+            // (= current `kv_cache.len()`), writes the SW window / compressed /
+            // FP8 caches decode reads, advances `processed_tokens`, and returns
+            // `None` (no logits for intermediate chunks). RoPE positions and KV
+            // offsets use the absolute `start_pos`, so the compressed/SW state
+            // stays consistent chunk-to-chunk. Falls back to the stateless
+            // accumulate-only path if the incremental path is unavailable
+            // (weights not loaded → returns `None`); the final chunk then
+            // recomputes the whole prompt statelessly, byte-identical to the
+            // pre-8f4db3b6 chunked path.
+            //
+            // `compute_top_level_logits_incremental` does not touch
+            // `reference_tokens`, so accumulate it here exactly as the stateless
+            // path and the final-chunk path (`compute_gpu_logits_after_prefill`)
+            // do. The incremental call runs BEFORE `advance_seq_len` so its
+            // `start_pos == kv_cache.len()` precondition sees the prior chunks'
+            // length, mirroring the final-chunk ordering (logits computed before
+            // the seq-len advance at the bottom of this fn).
             state.reference_tokens.extend_from_slice(tokens);
+            if dsv4_incremental_kv_enabled()? {
+                self.compute_top_level_logits_incremental(tokens, state, false)?;
+            }
             state.base.prefill_logits = None;
             state.base.kv_cache.advance_seq_len(tokens.len());
             return Ok(());
