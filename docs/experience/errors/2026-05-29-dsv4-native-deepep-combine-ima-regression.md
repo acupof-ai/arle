@@ -203,3 +203,78 @@ dispatch left unwritten** — NOT a local sizing/uninit bug (those are ruled out
 The defensive zero-init commits (metadata + NVL + all-scratch) are kept but did NOT
 fix it (they changed IMA→launch-failure via the send_head red-herring zeroing).
 native-deepep remains non-functional at HEAD.
+
+## Update 2026-05-30 (round 4) — IMA ROOT-CAUSED + FIXED: cross-stream race in our wrapper (NOT DeepEP)
+
+User challenge ("你先看清楚 deepep 有这么复杂吗 别的框架都正常接入了") was correct:
+the IMA is an **integration bug in our deepep-sys wrapper, not DeepEP complexity**.
+
+**Decisive control experiment.** Ran DeepEP's OWN `tests/test_intranode.py` (the
+flat `/sgl-workspace/DeepEP` build SGLang uses) on this same 8×H20 →
+**EXIT=0**: full intranode dispatch+combine correctness check + tuning sweep, zero
+illegal address. So **DeepEP works perfectly on this hardware via the official API;
+the bug is 100% in our integration.**
+
+**Arg-by-arg audit vs official.** Compared our `arle_deepep_buffer_dispatch`/
+`_combine` (deepep_buffer.cpp) to DeepEP's `Buffer::intranode_dispatch`/
+`intranode_combine` (csrc/legacy/buffer.hpp). The 28-arg dispatch call and the
+combine call **match exactly**; cached_notify_combine num_memset
+(`num_channels*world*2`), notify_dispatch num_memset (`*4`), nvl_chunked (6/256
+dispatch, official combine is 4/256 but that is perf-only — autotuner picks 6),
+num_sms=20/num_channels=10 dispatch↔combine↔scratch, all scratch sizes
+(send_head `tokens×ep`, rank_prefix `ep×ep`, recv_channel_prefix `ep×channels`),
+512MB NVL (needs ~210MB) — **all correct**.
+
+**The real deviation — the missing `stream_wait`.** DeepEP's official
+`intranode_dispatch`/`intranode_combine` BOTH begin with
+`stream_wait(comm_stream, compute_stream)` (event-based: comm_stream waits for an
+event recorded on compute_stream). Our wrapper creates its **own private CUDA
+stream** (`deepep_buffer.cpp:212 cudaStreamCreate`) and runs all DeepEP ops on it,
+host-syncing it *after* each op but **never ordering it before against the model
+compute stream `ctx.stream`**. So:
+- dispatch reads `topk_idx_i64` (written by the route/top-k kernel on `ctx.stream`)
+  before that kernel finishes → **garbage routing → garbage dispatch metadata →
+  garbage index in combine → IMA**.
+- combine reads `expert_out` (written by the scatter kernel on `ctx.stream`) before
+  it finishes → wrong values.
+
+This explains every prior observation: compute-sanitizer **memcheck** serializes
+streams (masks the race); the round-3 `ARLE_DEEPEP_COMBINE_DEBUG` D2H `cudaMemcpy`
+**itself synchronizes the streams** (so the dumped "metadata is sane/identical" was
+also a Heisenbug artifact); layer-intermittency = top-k-kernel-vs-dispatch timing.
+"Cross-rank" was a misread — it is a LOCAL cross-stream race whose garbage routing
+then corrupts the cross-rank exchange.
+
+**Fix (f30043af)**: `ctx.stream.synchronize()` before dispatch and before combine
+in `mlp.rs` (minimal correct ordering; wrapper is already host-serialized — an
+event-based `stream_wait` is a later perf tranche).
+
+**VALIDATED on 8×H20** (TP=8 multiproc, `ARLE_DSV4_MOE_BACKEND=native-deepep`,
+`EXPERT_BACKEND=native`, bf16 KV, DeepEP d4f41e4): all **8 ranks boot
+(peer_handles=8)**, requests return **HTTP 200 with full completions**, **zero
+`illegal memory access` / `combine failed` in the server log**. The combine IMA
+that 500'd every request is GONE.
+
+## Update 2026-05-30 (round 5) — IMA gone, but a SEPARATE native-deepep correctness bug is now revealed
+
+With the crash fixed we can finally see native-deepep's actual OUTPUT, and it is
+**numerically wrong**. Same-config A/B (flip only `ARLE_DSV4_MOE_BACKEND`, all else
+identical — bf16 KV, multiproc, `EXPERT_BACKEND=native`):
+
+| backend | prompt | output |
+|---|---|---|
+| `allreduce` (validated) | "The capital of France is" | `'The capital of France is **Paris**.'` ✓ |
+| `native-deepep` | (same) | `': is? is? is? is?'` ✗ degenerate |
+
+So the IMA was **masking a second, independent bug**: the native-deepep MoE path
+produces garbage activations even with correct stream ordering and no OOB. Because
+allreduce on the *identical* config is coherent, the bug is in the
+**native-deepep-specific** dataflow (dispatch input prep / expert pack+scatter /
+combine value reconstruction / output assembly), NOT in attention, KV, sampling, or
+the shared MoE math. NB: the 04938e85 "+46%" was a *speed* A/B on ISL=17 — its
+output correctness was never verified, so this may be a long-standing bug, not a
+regression.
+
+**Next**: root-cause the native-deepep numerical bug (parallel dataflow audit vs the
+allreduce path + a pod numerical-parity probe). The IMA fix (f30043af) stands on its
+own and is kept.
