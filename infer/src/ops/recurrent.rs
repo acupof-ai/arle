@@ -19,6 +19,25 @@ pub struct GdrHeadConfig {
     pub val_dim: usize,
 }
 
+/// Gated-delta chunkwise prefill (seq_len<=32) drives TileLang FullRow-WGMMA
+/// kernels that HANG on sm_90 (Hopper); the WGMMA-free recurrent kernel is the
+/// safe default for every seq_len. Opt back into chunkwise with
+/// `ARLE_GDR_CHUNKWISE_PREFILL=1` on arches where it is validated. See
+/// `docs/experience/errors/2026-05-30-gated-delta-short-seq-prefill-hang-h20.md`.
+///
+/// Mirrors the C-side gate in `csrc/misc/gdr_prefill_batch.cu`
+/// (`gdr_chunkwise_prefill_enabled`) so the single-sequence and packed-batch
+/// paths agree on the same default (no half-state).
+fn gdr_chunkwise_prefill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ARLE_GDR_CHUNKWISE_PREFILL")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 fn validate_packed_prefill_seq_indptr(
     op_name: &str,
     batch_size: usize,
@@ -683,7 +702,7 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
     assert_eq!(scratch.a_inv.len(), expected_chunk_ai_len);
     assert_eq!(scratch.chunk_state.len(), expected_chunk_state_len);
 
-    if qkv.seq_len > 32 {
+    if qkv.seq_len > 32 || !gdr_chunkwise_prefill_enabled() {
         return gated_delta_rule_prefill_recurrent_into(
             ctx, qkv, b_proj, a_proj, weights, state, output, heads,
         );

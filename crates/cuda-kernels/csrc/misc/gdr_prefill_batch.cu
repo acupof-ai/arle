@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 extern "C" {
 
@@ -108,6 +109,20 @@ cudaError_t gated_delta_rule_prefill_recurrent_cuda(
 
 namespace {
 
+// Gated-delta-rule chunkwise prefill (the seq_len<=32 path below) drives TileLang
+// FullRow-WGMMA kernels that HANG on sm_90 (Hopper). Full-attn FullRow-WGMMA runs
+// fine on sm_90, so this is a GDR-chunkwise codegen issue, not the arch flag — see
+// docs/experience/errors/2026-05-30-gated-delta-short-seq-prefill-hang-h20.md.
+// Default to the WGMMA-free recurrent kernel for EVERY seq_len; opt back into the
+// chunkwise path with ARLE_GDR_CHUNKWISE_PREFILL=1 on arches where it is validated.
+inline bool gdr_chunkwise_prefill_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("ARLE_GDR_CHUNKWISE_PREFILL");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
+
 inline cudaError_t launch_chunkwise_for_sequence(
     const __nv_bfloat16* qkv,
     const __nv_bfloat16* b_proj,
@@ -134,7 +149,7 @@ inline cudaError_t launch_chunkwise_for_sequence(
     int seq_len,
     cudaStream_t stream
 ) {
-    if (seq_len > 32) {
+    if (seq_len > 32 || !gdr_chunkwise_prefill_enabled()) {
         return gated_delta_rule_prefill_recurrent_cuda(
             qkv,
             b_proj,
