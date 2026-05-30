@@ -111,6 +111,53 @@ The compile-pass victory feels close to the runtime-pass victory but
 isn't — and the 30-60 min "just one more try" trap is exactly when
 SOLID self-audit fails.
 
+## Update 2026-05-31 — ROOT CAUSE found (candidate 2 confirmed by source; 1 & 3 refuted)
+
+Full source trace of both DeepGEMM callers + the FFI kernel + the scratch sizing:
+
+**Candidate 1 (H20 SM) — REFUTED.** The identical JIT kernel
+(`dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda`, generic SM90, `num_sms=78` baked in) is
+**validated working on the same 8×H20 pod** via the `=deepep` device-count path
+(`wins/2026-05-26-dsv4-deepgemm-device-counts.md`, real 7.55 s bench). DeepGEMM is fine on H20.
+
+**Candidate 3 (stream ordering) — REFUTED.** Pack + GEMM both run on `ctx.stream` (ordered).
+
+**Candidate 2 (input-contract divergence) — CONFIRMED.** The native-deepep DeepGEMM branch
+(`forward_native_deepep_routed_gpu`, mlp.rs:5272-5298) does NOT replicate the contract of the only
+working caller, `forward_deepep_routed_gpu` (mlp.rs:4120-4131), which is **decode-only, ≤256 routes,
+padded** (gate `prepared_small_local_pack`, mlp.rs:4006-4007). Two divergences, hit on PREFILL with
+large unpadded routes:
+1. **`route_capacity = total_local_routes`** (live, variable, unpadded; mlp.rs:5294) vs the working
+   path's `total_recv_routes` (fixed padded bound). `route_capacity` → GEMM `max_m` AND scratch
+   `capacity_m`/`scale_stride_m = align_to(capacity_m,4)`. On scratch REUSE (state.rs:896, reused when
+   `capacity_m` shrinks) the FP8 pack writer (dsv4_deepgemm_ops.cu:44-52) uses the NEW small
+   non-128-aligned `scale_stride_m` while the SFA TMA descriptor (deepgemm_native.cu `make_tma_sfa_desc`
+   644-659) uses the scratch's allocated stride → disagree → the masked-grouped kernel's TMA tiles for
+   upper groups address past the written/allocated region → device-side TMA trap → `CUDA_ERROR_LAUNCH_FAILED`.
+2. **`expert_route_slot = scratch.packed_token`** (recv-token index, `alloc_zeros`, never `-1`-init;
+   mlp.rs:5290) vs the working path's `-1`-init per-route-unique route-slot (`dsv4_fill_i32_cuda(-1)`
+   mlp.rs:4069 + `dsv4_pack_received_experts`). `dsv4_scatter_all_route_slots` (dsv4_route.cu:1248-1266)
+   then treats stale `0` as valid recv-token 0 (no sentinel) + plain `=` (the Finding-2 overwrite) — a
+   correctness bug riding along.
+
+### Fix plan (mirror the working contract)
+1. Pass a **STABLE PADDED `route_capacity`** the scratch is keyed on so `max_m == capacity_m` every call
+   (no writer/reader scale-stride divergence). NB `capacity_local_routes` (capacity_recv×topk) is huge →
+   OOMs the `num_experts × max_m × hidden` scratch; the right value is a 128-aligned per-call-stable bound,
+   OR fix the deepgemm fn to use the SCRATCH's allocated `capacity_m` for the scale-stride (writer + reader)
+   instead of the call's `route_capacity`.
+2. Build `expert_route_slot` as a `-1`-init per-route-unique route-slot (`dsv4_pack_local_experts_with_slots_cuda`
+   + `dsv4_fill_i32_cuda(-1)`). Also fixes the Finding-2 overwrite.
+
+Cheapest crash-clearing test: change (1) alone at mlp.rs:5294; if the launch failure clears, the
+scale-stride-on-reuse divergence is confirmed; then `compute-sanitizer --tool memcheck` one prefill to name
+the exact trapping load + add (2).
+
+**Validation blocked 2026-05-31**: a parallel-session rebuild left the pod `target-pod/release/infer` WITHOUT
+`--features nccl` (boot panics "TP/EP world_size > 1 requires building infer with --features nccl"). A clean
+`--features cuda,nccl` rebuild is needed before the discriminator/fix can be pod-tested. Root cause above is
+from source (high confidence on the class; medium on the exact trapping line — needs the sanitizer run).
+
 ## Refs
 
 - B-3.3.5 wire-in: commit `67ac6400`
