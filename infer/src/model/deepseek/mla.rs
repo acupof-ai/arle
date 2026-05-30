@@ -4,13 +4,16 @@
 //! target is now the actual `DeepseekV4ForCausalLM` checkpoint, whose attention
 //! shape uses Q-LoRA, a single KV head, O-LoRA grouping, optional compressor /
 //! indexer blocks, sliding-window local attention, and HCA/CSA-style sparse
-//! streams. Phase 0.5 keeps the typed weight container and explicit TODOs; CUDA
-//! kernels land in Phase 2A.
+//! streams. This file is now just the typed weight container for one V4
+//! attention block (`DeepseekV4Attention` + its `Compressor`/`Indexer`
+//! sub-blocks), populated by the safetensors loader. The forward logic —
+//! FlashMLA prefill/decode, the incremental SW/compressed path, and the legacy
+//! hybrid fallback — lives in `weights.rs` (`finish_attention_gpu` et al.), NOT
+//! here. The earlier Phase-0.5 `forward_prefill`/`forward_decode` scaffold
+//! methods were never wired and have been removed.
 
 #[cfg(feature = "cuda")]
-use anyhow::Result;
-#[cfg(feature = "cuda")]
-use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
+use cuda_kernels::prelude::{DeviceMatrix, DeviceVec};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
 
@@ -53,22 +56,4 @@ pub(super) struct DeepseekV4Attention {
     pub(super) attn_sink_f32: CudaSlice<f32>,
     pub(super) compressor: Option<DeepseekV4Compressor>,
     pub(super) indexer: Option<DeepseekV4Indexer>,
-}
-
-#[cfg(feature = "cuda")]
-#[allow(dead_code)] // methods called from forward.rs once V4 kernels land
-impl DeepseekV4Attention {
-    /// Run V4 prefill for a packed `[seq, hidden]` row block.
-    pub(super) fn forward_prefill(
-        &self,
-        _hidden: &HiddenStates,
-        _start_pos: usize,
-    ) -> Result<HiddenStates> {
-        todo!("DeepSeek V4 attention kernel — Phase 2A")
-    }
-
-    /// Run V4 decode for a single token using the V4 cache/state layout.
-    pub(super) fn forward_decode(&self, _token_pos: usize) -> Result<()> {
-        todo!("DeepSeek V4 attention kernel — Phase 2A")
-    }
 }
