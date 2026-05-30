@@ -5139,9 +5139,20 @@ impl DeepseekV4MoeBlock {
         // === post-dispatch local-expert FFN (B-3.3.4) ===
         let num_recv = num_recv_tokens.max(0) as usize;
         let recv_slots = num_recv.saturating_mul(config.num_experts_per_tok);
-        let local_expert_start = ep.local_expert_range().start;
-        let local_expert_start_i32 = i32::try_from(local_expert_start)
-            .map_err(|_| anyhow::anyhow!("native-deepep local_expert_start overflows i32"))?;
+        // DeepEP intranode dispatch ALREADY remaps recv_topk_idx to RANK-LOCAL
+        // expert ids: the send side subtracts recv_expert_begin =
+        // responsible_rank * num_experts_per_rank (DeepEP intranode.cu:383-387),
+        // so a local hit is in [0, experts_per_rank) and a non-local route is -1.
+        // The count/pack kernels (dsv4_route.cu: `local = expert -
+        // local_expert_start`) must therefore NOT subtract local_expert_start
+        // again here — the already-local index IS the [0,experts_per_rank) group
+        // key, and self.experts[j] is exactly the expert DeepEP labelled `j`.
+        // (Contrast the allreduce path mlp.rs:~1846, which feeds GLOBAL ids and
+        // correctly subtracts the start.) Subtracting r*experts_per_rank in the
+        // native path makes `local = j - r*epr < 0` for ranks 1..N-1 → every
+        // route on those ranks is dropped, only rank-0 experts survive → ~7/8 of
+        // the expert mass vanishes → garbage logits. So the offset is 0 here.
+        let local_expert_start_i32: i32 = 0;
         let experts_per_rank_i32 = i32::try_from(ep.experts_per_rank)
             .map_err(|_| anyhow::anyhow!("native-deepep experts_per_rank overflows i32"))?;
 
