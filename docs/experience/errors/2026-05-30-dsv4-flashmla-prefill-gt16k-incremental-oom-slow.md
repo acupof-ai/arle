@@ -67,8 +67,59 @@ FlashMLA CSA/HCA prefill dispatch), not a tuning change.
 - `deab74f8` chunked-prefill assert fix (eliminates the >16384 `incremental state
   length 0` abort) + `282e797f` cap-lift — both correct foundations, kept.
 
+## Update 2026-05-30 — OOM fixed; speed bottleneck PROFILED, and it is the MoE, not the KV-pack
+
+Two findings collapsed the "incremental prefill is the blocker" framing:
+
+**1. The OOM was a separate, fixable bug — NOT capacity.** A single 16K prompt drove a
+96 GB GPU from 23 GB idle to 97 GB → OOM with 74 GB nominally free. Root cause:
+per-layer compute scratch (sized by `tokens.len()`) accumulated across all 43 layers
+because the prefill forward only trimmed it at the chunk's END. Fixed by trimming
+per-layer (commit 2c133cc8, peak 97 → 34 GB, validated) — see
+[`../wins/2026-05-30-dsv4-prefill-per-layer-scratch-oom-fix.md`]. After this, a 15.5K
+prompt completes coherently; ALL >~12 K prefill is unblocked.
+
+**2. The slowness is the MoE all-reduce + expert GEMM, NOT the KV-pack.** A per-phase
+trace (`ARLE_DSV4_TRACE_LAYER=1`, summed across layers, relative ratios — the trace
+adds sync so absolutes inflate):
+
+| phase | share | note |
+|---|---:|---|
+| **ffn_total** (MoE half) | **~84%** | dominates |
+| └ ffn_all_reduce | 52% of FFN | the NCCL all-reduce after MoE |
+| └ ffn_routed_local (expert GEMM, native backend) | 41% of FFN | deepgemm faster but JIT-blocked on the CUDA-12.2 pod |
+| attn_total (FlashMLA attention) | ~16% | NOT the bottleneck — FlashMLA already fast |
+
+So `8f4db3b6`'s hypothesis ("the >2× TTFT is the KV-pack; fix = FlashMLA writes KV
+directly") is **wrong** — the KV-pack phases (`attn_window_update`, `attn_compressor_update`,
+`ffn_local_route_compact_pack`) are all <1% each. The prefill is MoE-bound.
+
+**3. native-deepep is the right lever but does not yet make >24K fit the 300 s window.**
+native-deepep (the +46% lever, fixed this session) replaces the all-reduce with EP
+dispatch/combine. But a 24–27 K prefill still TIMES OUT at ~290 s with native-deepep
+(8 ranks boot, NO IMA/OOM — it runs, just slow). Two reasons: (a) the cross-stream
+correctness fix `f30043af` host-syncs before every dispatch+combine — 43 layers × 2
+chunks × 2 = 172 host syncs serialize the forward (the deferred event-based
+`stream_wait` would remove this); (b) the expert GEMM (native backend) is still heavy at
+16384-token chunks, and deepgemm (faster FP8 grouped GEMM) is JIT-blocked on this pod.
+
+## Status: >24K prefill is FUNCTIONALLY unblocked, PERF-bound on the MoE
+
+cap-lift + chunked-prefill fix + OOM fix make >24K run correctly (no crash, no OOM,
+coherent ≤16K). The remaining work is **MoE speed**, not FlashMLA: (a) event-based
+`stream_wait` for native-deepep prefill (remove the 172 host syncs), (b) unblock deepgemm
+experts on the pod toolchain, (c) the all-reduce/expert-GEMM kernels. This is a separate
+optimization axis from the FlashMLA prefill integration, which is itself complete.
+
 ## Rule
 
+- **Profile before optimizing a "slow path" — the obvious hypothesis is often wrong.**
+  Three weeks of "FlashMLA writes KV directly" was the planned fix; a 10-minute
+  per-phase trace showed the prefill is 84% MoE (all-reduce + expert GEMM) and the
+  KV-pack is <1%. The attention (FlashMLA) was never the bottleneck.
+- **"It no longer crashes/OOMs" ≠ "it's fast enough."** Lifting a gate, fixing an
+  assert, and fixing an OOM made >24K RUN; it still times out on MoE compute. Functional
+  and performance completion are different milestones — probe TTFT end-to-end.
 - **A "route prefill through the incremental path" correctness fix must cover EVERY
   chunk, not just the final one** — scheduler chunking (16384) silently splits the
   prompt, and a path that only the logits-emitting chunk takes desyncs model state from
