@@ -487,11 +487,20 @@ std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
   std::vector<Layout> candidates;
   const int block_k = kScaleGranK;
   const int step = std::lcm(16, 1);
-  for (int cluster_m = 1; cluster_m <= 2; ++cluster_m) {
-    for (int cluster_n = 1; cluster_n <= 2; ++cluster_n) {
+  // ARLE_DEEPGEMM_CONSERVATIVE_LAYOUT (b335 H20 NOT_SUPPORTED probe): force the
+  // smem-light, cluster-free config (block_m=64, cluster=1) to isolate whether
+  // the larger block_m=128 / cluster=2 config is what H20 rejects at the unpadded
+  // prefill max_m (max_m=56..96 → CUDA_ERROR_NOT_SUPPORTED, while the decode
+  // max_m=8 config works). If the GEMM succeeds with this set, the config (smem
+  // or cluster) is the cause, not the SFA TMA / scale layout.
+  const bool conservative = env_int("ARLE_DEEPGEMM_CONSERVATIVE_LAYOUT", 0) != 0;
+  const int max_cluster = conservative ? 1 : 2;
+  for (int cluster_m = 1; cluster_m <= max_cluster; ++cluster_m) {
+    for (int cluster_n = 1; cluster_n <= max_cluster; ++cluster_n) {
       if (cluster_m * cluster_n > 2) continue;
       if (desc.num_sms % (cluster_m * cluster_n) != 0) continue;
       for (int block_m : {64, 128}) {
+        if (conservative && block_m != 64) continue;
         for (int block_n = step; block_n <= 192; block_n += step) {
           if (block_n > block_k) {
             const int diff = block_n - block_k;

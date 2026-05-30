@@ -158,6 +158,39 @@ the exact trapping load + add (2).
 `--features cuda,nccl` rebuild is needed before the discriminator/fix can be pod-tested. Root cause above is
 from source (high confidence on the class; medium on the exact trapping line — needs the sanitizer run).
 
+## Update 2026-05-31 (pod-reproduced) — the error is `NOT_SUPPORTED`, NOT an OOB; config-dependent at large max_m
+
+Rebuilt with nccl + ran `EXPERT_BACKEND=deepgemm` `MOE_BACKEND=native-deepep`, short prompt. New evidence
+collapses the earlier hypotheses:
+
+```
+DeepSeek V4 DeepGEMM w13 GEMM failed: DriverError(CUDA_ERROR_NOT_SUPPORTED, "operation not supported");
+groups=32 max_m=88 n=4096 k=4096 scale_stride_m=88 active_experts=32   (also max_m=56,72,96)
+abort kind=architectural_deferral
+```
+
+- **It is `CUDA_ERROR_NOT_SUPPORTED`, not the b335 "unspecified launch failure"** — the runtime path now CATCHES
+  the DeepGEMM failure cleanly (`architectural_deferral`) instead of poisoning the context. So the earlier
+  context-cascade symptom is gone; this is the raw kernel-launch rejection.
+- **The agent's scale-stride-OOB / illegal-memory hypothesis is REFUTED** — `NOT_SUPPORTED` is a launch-config
+  *rejection*, not a memory trap.
+- **It fails at `max_m ∈ {56,72,88,96}` (unpadded prefill local routes) and WORKS at `max_m=8`** (the
+  decode-padded `=deepep` path, `wins/2026-05-26`). `prop.major==9` passes (deepgemm_native.cu:855), so the
+  `NOT_SUPPORTED` comes from a CUDA API at launch: `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, smem)`
+  (line 355), the SFA `cuTensorMapEncode` (line 870), or the cluster `cudaLaunchKernelEx` (line 373). The
+  `get_best_config` heuristic (line 520) picks the layout by min `num_cycles`, so a larger `max_m` selects a
+  different config — `block_m=128` and/or `cluster=2` (line 490-516) — than the `max_m=8` config (`block_m=64`,
+  `cluster=1`). The larger config's smem or cluster is what H20 rejects.
+- **Note: DeepGEMM prefill (large max_m) was NEVER validated** — the `=deepep` +46% was DECODE (15.82 tok/s,
+  small padded max_m). So this is a "deepgemm-config-at-large-m-on-H20" gap, not a regression.
+
+### Probe in flight
+Added env `ARLE_DEEPGEMM_CONSERVATIVE_LAYOUT=1` (deepgemm_native.cu:486) that forces `block_m=64` + `cluster=1`
+(the decode-working config) for all shapes, to isolate config (smem/cluster) vs the SFA TMA. If the GEMM then
+succeeds at `max_m=88`, the config is the cause → the fix is to cap the layout (block_m≤64 / cluster=1) for the
+DSv4 expert shapes on H20 (or `DG_NUM_SMS`/cluster gating). If it STILL fails, the SFA scale-factor TMA at
+unpadded `max_m` is the cause → pad `max_m` (route_capacity) to the SFA-aligned bound.
+
 ## Refs
 
 - B-3.3.5 wire-in: commit `67ac6400`
