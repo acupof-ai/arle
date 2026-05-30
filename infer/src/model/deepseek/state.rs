@@ -77,7 +77,7 @@ impl DeepseekIncrementalState {
 
 #[cfg(feature = "cuda")]
 impl DeepseekLayerRuntimeCache {
-    fn trim_prefill_scratch(&mut self) {
+    pub(crate) fn trim_prefill_scratch(&mut self) {
         self.stream_recycle = None;
         self.attn_mhc = None;
         self.ffn_mhc = None;
