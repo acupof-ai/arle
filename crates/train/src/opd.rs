@@ -79,6 +79,22 @@ pub fn infer_rollout_flag_enabled() -> bool {
     }
 }
 
+/// True when the OPD engine weight time-share is enabled
+/// (`ARLE_OPD_ENGINE_OFFLOAD=1`). When on, the idle infer engines (rollout
+/// student + scoring teacher) offload their device weights to host RAM during
+/// the student backward, freeing VRAM so long rollouts (≥256) fit on a 16 GB
+/// card. Default OFF — the resident-weights path is unchanged.
+///
+/// The vLLM-sleep-mode / verl HybridFlow equivalent ARLE previously lacked
+/// (see `docs/research/2026-05-29-opd-memory-best-practice.md` Tier 2).
+#[cfg(feature = "cuda")]
+pub fn engine_offload_flag_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_OPD_ENGINE_OFFLOAD").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpdError {
     #[error(transparent)]
@@ -830,6 +846,7 @@ fn slice_logits_for_kl(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
@@ -843,6 +860,8 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     store: &mut TensorStore,
     tape: &mut Tape,
     profile: &mut Option<&mut OpdStepProfile>,
+    engine_offload: bool,
+    student_engine_offload: Option<&dyn Fn() -> Result<usize>>,
 ) -> Result<f32> {
     let kl_range = kl_logit_range(kl_mask, prompt_len, rollout.len())?;
     if kl_range.start >= kl_range.end {
@@ -864,6 +883,13 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
 
     tape.entries.clear();
     tape.set_enabled(false);
+    // OPD engine time-share: the teacher may have been offloaded to host RAM
+    // during the previous step's student backward. Reload it before scoring.
+    if engine_offload {
+        teacher
+            .reload_engine_weights()
+            .map_err(|err| map_teacher_forward_error("teacher reload", err))?;
+    }
     let phase_started = Instant::now();
     let teacher_logits = teacher
         .forward_logits_device(prefix, &positions, store, tape)
@@ -902,6 +928,31 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     store
         .free(teacher_logits.tensor_id)
         .map_err(OpdError::from)?;
+
+    // OPD engine time-share: the teacher's KL target is now materialized in the
+    // train store and the rollout is complete, so BOTH idle infer engines
+    // (rollout student + scoring teacher) can be offloaded to host RAM to free
+    // VRAM for the student backward. They are offloaded together here — on a
+    // device quiesced after teacher scoring — rather than the student earlier,
+    // to avoid racing the teacher forward's allocations against the student's
+    // async pool frees. Reloaded at the next step (student before rollout,
+    // teacher before scoring).
+    if engine_offload {
+        if let Some(offload_student) = student_engine_offload {
+            let freed = offload_student()?;
+            eprintln!(
+                "opd_engine_offload student_offloaded freed_bytes={freed} freed_mib={:.1}",
+                freed as f64 / (1024.0 * 1024.0)
+            );
+        }
+        let freed = teacher
+            .offload_engine_weights()
+            .map_err(|err| map_teacher_forward_error("teacher offload", err))?;
+        eprintln!(
+            "opd_engine_offload teacher_offloaded freed_bytes={freed} freed_mib={:.1}",
+            freed as f64 / (1024.0 * 1024.0)
+        );
+    }
 
     tape.set_enabled(true);
     let student_phase_started = Instant::now();
@@ -1739,7 +1790,21 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         #[cfg(not(feature = "cuda"))]
         let infer_handled = false;
         #[cfg(feature = "cuda")]
+        let engine_offload = engine_offload_flag_enabled();
+        #[cfg(not(feature = "cuda"))]
+        let engine_offload = false;
+
+        #[cfg(feature = "cuda")]
         let infer_handled = if let Some(ctx) = infer_rollout.as_ref() {
+            // OPD engine time-share: the rollout student may have been
+            // offloaded to host RAM during the previous step's backward.
+            // Reload it before the LoRA sync (which re-merges resident base
+            // weights) and the rollout decode.
+            if engine_offload {
+                ctx.student.reload_engine_weights().map_err(|err| {
+                    OpdError::InvalidInput(format!("infer student reload failed: {err}"))
+                })?;
+            }
             ctx.student
                 .sync_lora_from_store(store, &student.adapter_name_map(), ctx.lora_config)
                 .map_err(|err| {
@@ -1756,6 +1821,13 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 rollout.push(next);
             }
             store.retain_ids(&rollout_keep_base);
+            // NB: the infer student engine is idle after the rollout, but we do
+            // NOT offload it here. Offloading mid-step (before the teacher
+            // forward) churns the shared device memory pool while the teacher
+            // forward allocates from it, racing the async frees → illegal
+            // address. Instead both idle engines are offloaded together AFTER
+            // the teacher scores, just before the student backward (see
+            // `backward_chunked_kl_rollout`), on a quiesced device.
             true
         } else {
             false
@@ -1899,6 +1971,25 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
             });
 
+            // Build the rollout-student offload hook (cuda-only). It is invoked
+            // inside the backward, right after the teacher scores, so both idle
+            // engines are offloaded together on a quiesced device.
+            #[cfg(feature = "cuda")]
+            let student_offload_fn: Option<Box<dyn Fn() -> Result<usize>>> = if engine_offload {
+                infer_rollout.as_ref().map(|ctx| {
+                    let student = ctx.student;
+                    Box::new(move || {
+                        student.offload_engine_weights().map_err(|err| {
+                            OpdError::InvalidInput(format!("infer student offload failed: {err}"))
+                        })
+                    }) as Box<dyn Fn() -> Result<usize>>
+                })
+            } else {
+                None
+            };
+            #[cfg(not(feature = "cuda"))]
+            let student_offload_fn: Option<Box<dyn Fn() -> Result<usize>>> = None;
+
             let loss_value = backward_chunked_kl_rollout(
                 student,
                 teacher,
@@ -1912,6 +2003,8 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 store,
                 tape,
                 &mut profile,
+                engine_offload,
+                student_offload_fn.as_deref(),
             )?;
             validate_loss_value(loss_value)?;
 

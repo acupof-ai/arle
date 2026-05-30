@@ -80,6 +80,21 @@ pub trait TeacherForward {
     fn parameter_ids(&self) -> &[TensorId] {
         &[]
     }
+
+    /// Offload the teacher's device weights to host RAM (OPD engine
+    /// time-share). Called after the teacher has produced logits and the
+    /// student-side KL slice is materialized, so the teacher is idle during the
+    /// student backward. Returns the device VRAM bytes freed. Default no-op
+    /// (in-process / API teachers do not own a separate infer engine to free).
+    fn offload_engine_weights(&self) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Reload the teacher's device weights before the next scoring forward.
+    /// Default no-op.
+    fn reload_engine_weights(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait TeacherWindowedForward: TeacherForward {
@@ -295,6 +310,21 @@ impl TeacherForward for MultiTeacher<'_> {
 
     fn parameter_ids(&self) -> &[TensorId] {
         &self.parameter_ids
+    }
+
+    fn offload_engine_weights(&self) -> Result<usize> {
+        let mut freed = 0usize;
+        for entry in &self.entries {
+            freed += entry.teacher.offload_engine_weights()?;
+        }
+        Ok(freed)
+    }
+
+    fn reload_engine_weights(&self) -> Result<()> {
+        for entry in &self.entries {
+            entry.teacher.reload_engine_weights()?;
+        }
+        Ok(())
     }
 }
 
@@ -743,6 +773,28 @@ impl TeacherForward for InferTeacher {
 
     fn vocab_size(&self) -> usize {
         self.vocab_size
+    }
+
+    fn offload_engine_weights(&self) -> Result<usize> {
+        let engine = self.engine.lock().map_err(|err| {
+            TeacherForwardError::InferRuntime(format!(
+                "LoadedInferenceEngine lock poisoned before offload: {err}"
+            ))
+        })?;
+        engine
+            .offload_engine_weights()
+            .map_err(|err| TeacherForwardError::InferRuntime(err.to_string()))
+    }
+
+    fn reload_engine_weights(&self) -> Result<()> {
+        let engine = self.engine.lock().map_err(|err| {
+            TeacherForwardError::InferRuntime(format!(
+                "LoadedInferenceEngine lock poisoned before reload: {err}"
+            ))
+        })?;
+        engine
+            .reload_engine_weights()
+            .map_err(|err| TeacherForwardError::InferRuntime(err.to_string()))
     }
 }
 

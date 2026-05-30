@@ -447,6 +447,20 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         anyhow::bail!("model does not support in-memory student LoRA re-merge")
     }
 
+    /// Move every device weight buffer to host RAM and free the VRAM
+    /// (OPD engine time-share). Returns the device bytes freed. After this the
+    /// model must NOT be forwarded through until `reload_weights_to_device`.
+    /// Default `bail!`s; only `Qwen35Model` overrides.
+    fn offload_weights_to_host(&mut self) -> Result<usize> {
+        anyhow::bail!("model does not support weight offload to host")
+    }
+
+    /// Restore device weight buffers from the host snapshot (OPD time-share).
+    /// Default `bail!`s; only `Qwen35Model` overrides.
+    fn reload_weights_to_device(&mut self) -> Result<()> {
+        anyhow::bail!("model does not support weight reload to device")
+    }
+
     /// Phase B-1 commit C.4.6 — expose the model's EP NCCL group so the
     /// scheduler can attach an NCCL-backed `DistributedRequestCoordination`
     /// to incoming requests in multiproc-serve mode. Default `None`; only

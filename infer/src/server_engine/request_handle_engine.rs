@@ -65,6 +65,14 @@ impl RequestHandleInferenceEngine<crate::scheduler::SchedulerHandle> {
     pub fn remerge_student_lora(&self, update: crate::model::StudentLoraUpdate) -> Result<()> {
         self.handle.remerge_student_lora(update)
     }
+
+    pub fn offload_engine_weights(&self) -> Result<usize> {
+        self.handle.offload_engine_weights()
+    }
+
+    pub fn reload_engine_weights(&self) -> Result<()> {
+        self.handle.reload_engine_weights()
+    }
 }
 
 impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {

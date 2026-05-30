@@ -54,6 +54,7 @@ impl<M: ModelForward> Scheduler<M> {
                         self.drain_request_rx();
                         self.drain_raw_logits_rx();
                         self.drain_remerge_lora_rx();
+            self.drain_engine_offload_rx();
                         self.drain_wakeup_rx();
                     }
                     Err(_) => self.handle_wakeup_disconnect(),
@@ -89,6 +90,7 @@ impl<M: ModelForward> Scheduler<M> {
                 self.drain_request_rx();
                 self.drain_raw_logits_rx();
                 self.drain_remerge_lora_rx();
+                self.drain_engine_offload_rx();
                 self.drain_wakeup_rx();
                 return true;
             }
@@ -122,6 +124,7 @@ impl<M: ModelForward> Scheduler<M> {
             self.drain_request_rx();
             self.drain_raw_logits_rx();
             self.drain_remerge_lora_rx();
+            self.drain_engine_offload_rx();
             self.drain_coordinator_events();
             self.drain_emit_events();
             if !self.wait_for_wakeup() {

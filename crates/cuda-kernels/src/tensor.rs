@@ -404,6 +404,39 @@ impl DeviceContext {
         (major, minor)
     }
 
+    /// Query (free, total) device memory in bytes for the bound device.
+    ///
+    /// Wraps `cuMemGetInfo`. Used by the OPD engine time-share path to verify
+    /// that weight offload actually releases resident VRAM.
+    pub fn mem_info_bytes(&self) -> Result<(usize, usize)> {
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| anyhow!("bind context before mem_get_info failed: {e}"))?;
+        cudarc::driver::result::mem_get_info().map_err(|e| anyhow!("cuMemGetInfo failed: {e}"))
+    }
+
+    /// Release unused blocks cached in the device's async memory pool back to
+    /// the OS so `nvidia-smi` / `mem_info_bytes` reflect freed weight VRAM.
+    ///
+    /// cudarc allocs through `cuMemAllocAsync` with a 0 release-threshold, so a
+    /// dropped `CudaSlice` returns its block to the pool rather than the OS.
+    /// After offloading weights we trim the pool so the freed VRAM is genuinely
+    /// reclaimed (and observable). Best-effort: a trim failure is not fatal.
+    pub fn trim_memory_pool(&self) -> Result<()> {
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| anyhow!("bind context before mem pool trim failed: {e}"))?;
+        // SAFETY: `cu_device()` returns this context's valid device; the
+        // default pool for that device is valid for the process lifetime.
+        unsafe {
+            let pool = cudarc::driver::result::device::get_mem_pool(self.ctx.cu_device())
+                .map_err(|e| anyhow!("get device mem pool failed: {e}"))?;
+            cudarc::driver::result::mem_pool::trim_to(pool, 0)
+                .map_err(|e| anyhow!("cuMemPoolTrimTo(0) failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Synchronize compute stream.
     pub fn sync(&self) -> Result<()> {
         self.stream
@@ -685,6 +718,34 @@ impl DeviceVec {
     pub fn with_label(mut self, label: &'static str) -> Self {
         self.label = label;
         self
+    }
+
+    /// Move the device buffer to host RAM and free the VRAM (OPD time-share).
+    ///
+    /// Returns the host bytes plus the device bytes freed; the live buffer is
+    /// replaced with a 1-element placeholder.
+    pub fn offload_to_host(&mut self, ctx: &DeviceContext) -> Result<(Vec<bf16>, usize)> {
+        let host = ctx
+            .stream
+            .clone_dtoh(&self.data)
+            .map_err(|e| anyhow!("offload D2H copy (vec) failed: {e}"))?;
+        let freed = host.len() * std::mem::size_of::<bf16>();
+        ctx.sync()?;
+        self.data = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("offload vec placeholder alloc failed: {e}"))?;
+        Ok((host, freed))
+    }
+
+    /// Restore the device buffer from a host snapshot, re-allocating VRAM.
+    pub fn reload_from_host(&mut self, ctx: &DeviceContext, host: &[bf16]) -> Result<()> {
+        self.data = ctx
+            .stream
+            .clone_htod(host)
+            .map_err(|e| anyhow!("reload H2D copy (vec) failed: {e}"))?;
+        ctx.sync()?;
+        Ok(())
     }
 
     /// Copy a region of the device buffer to a host slice (D2H).
@@ -1263,7 +1324,220 @@ pub struct DeviceMatrix {
     pub tq_bits: u8,
 }
 
+/// Host-resident snapshot of an `Option<CudaSlice<T>>` weight buffer, used by
+/// the OPD engine time-share offload to hold idle weights in CPU RAM while the
+/// device VRAM is freed. `None` means the source buffer was absent (the buffer
+/// stays absent on reload).
+type OptHostBuf<T> = Option<Vec<T>>;
+
+/// Host-resident snapshot of every device buffer in a [`DeviceMatrix`].
+///
+/// Captures the full quant-format-agnostic set of side tensors (dense bf16,
+/// INT8/INT4 qweight + scales, Marlin packed/scales, hybrid W4A8/W4-FP8
+/// sidecars, TurboQuant packed storage) so offload→reload is bit-exact for any
+/// weight format. The scalar shape/format fields are restored from the live
+/// `DeviceMatrix` they were detached from, so this snapshot only carries the
+/// raw buffer bytes.
+pub struct HostMatrixSnapshot {
+    data: Vec<bf16>,
+    qweight: OptHostBuf<i8>,
+    qscales: OptHostBuf<bf16>,
+    dsv4_scales: OptHostBuf<u8>,
+    marlin_packed: OptHostBuf<u8>,
+    marlin_scales: OptHostBuf<u16>,
+    marlin_channel_scales: OptHostBuf<f32>,
+    hybrid_w4a8_qweight: OptHostBuf<u8>,
+    hybrid_w4a8_s_channel: OptHostBuf<f32>,
+    hybrid_w4a8_s_group: OptHostBuf<u16>,
+    hybrid_w4_fp8_qweight: OptHostBuf<u8>,
+    tq_packed: OptHostBuf<u8>,
+    tq_scales: OptHostBuf<u16>,
+    tq_signs: OptHostBuf<i8>,
+    tq_centroids: OptHostBuf<f32>,
+    /// Total device bytes this snapshot freed when captured (for accounting).
+    freed_bytes: usize,
+}
+
+impl HostMatrixSnapshot {
+    /// Total device VRAM (bytes) freed by capturing this snapshot.
+    #[must_use]
+    pub fn freed_bytes(&self) -> usize {
+        self.freed_bytes
+    }
+}
+
+/// Copy an optional device buffer to host and report bytes copied.
+fn snapshot_opt_slice<T: DeviceRepr + Clone>(
+    ctx: &DeviceContext,
+    src: &Option<CudaSlice<T>>,
+    freed: &mut usize,
+) -> Result<OptHostBuf<T>> {
+    match src {
+        Some(slice) => {
+            let host = ctx
+                .stream
+                .clone_dtoh(slice)
+                .map_err(|e| anyhow!("offload D2H copy failed: {e}"))?;
+            *freed += host.len() * std::mem::size_of::<T>();
+            Ok(Some(host))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Re-upload an optional host buffer to device.
+fn restore_opt_slice<T: DeviceRepr>(
+    ctx: &DeviceContext,
+    host: &Option<Vec<T>>,
+) -> Result<Option<CudaSlice<T>>> {
+    match host {
+        Some(data) => Ok(Some(
+            ctx.stream
+                .clone_htod(data.as_slice())
+                .map_err(|e| anyhow!("reload H2D copy failed: {e}"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Move a raw `CudaSlice<T>` to host RAM, replacing it with a 1-element
+/// placeholder and freeing the VRAM. Returns the host copy and bytes freed.
+/// Used for the model's bare `CudaSlice<f32>` weight fields (e.g. SSM A_log,
+/// norm weights) that are not wrapped in `DeviceVec`/`DeviceMatrix`.
+pub fn offload_raw_slice<T: DeviceRepr + Clone + ValidAsZeroBits>(
+    ctx: &DeviceContext,
+    slice: &mut CudaSlice<T>,
+) -> Result<(Vec<T>, usize)> {
+    let host = ctx
+        .stream
+        .clone_dtoh(slice)
+        .map_err(|e| anyhow!("offload D2H copy (raw slice) failed: {e}"))?;
+    let freed = host.len() * std::mem::size_of::<T>();
+    ctx.sync()?;
+    *slice = ctx
+        .stream
+        .alloc_zeros::<T>(1)
+        .map_err(|e| anyhow!("offload raw-slice placeholder alloc failed: {e}"))?;
+    Ok((host, freed))
+}
+
+/// Restore a raw `CudaSlice<T>` from a host snapshot, re-allocating VRAM.
+pub fn reload_raw_slice<T: DeviceRepr>(
+    ctx: &DeviceContext,
+    slice: &mut CudaSlice<T>,
+    host: &[T],
+) -> Result<()> {
+    *slice = ctx
+        .stream
+        .clone_htod(host)
+        .map_err(|e| anyhow!("reload H2D copy (raw slice) failed: {e}"))?;
+    ctx.sync()?;
+    Ok(())
+}
+
 impl DeviceMatrix {
+    /// Move every device weight buffer to host RAM and free the VRAM.
+    ///
+    /// Returns a [`HostMatrixSnapshot`] the caller holds until reload. The
+    /// live device buffers are replaced with 1-element placeholders so the
+    /// struct stays valid (it must not be forwarded through while offloaded).
+    /// Format-agnostic: handles dense, INT8/INT4, Marlin, hybrid W4, and TQ.
+    pub fn offload_to_host(&mut self, ctx: &DeviceContext) -> Result<HostMatrixSnapshot> {
+        let mut freed = 0usize;
+        let data = ctx
+            .stream
+            .clone_dtoh(&self.data)
+            .map_err(|e| anyhow!("offload D2H copy (data) failed: {e}"))?;
+        freed += data.len() * std::mem::size_of::<bf16>();
+
+        let snapshot = HostMatrixSnapshot {
+            data,
+            qweight: snapshot_opt_slice(ctx, &self.qweight, &mut freed)?,
+            qscales: snapshot_opt_slice(ctx, &self.qscales, &mut freed)?,
+            dsv4_scales: snapshot_opt_slice(ctx, &self.dsv4_scales, &mut freed)?,
+            marlin_packed: snapshot_opt_slice(ctx, &self.marlin_packed, &mut freed)?,
+            marlin_scales: snapshot_opt_slice(ctx, &self.marlin_scales, &mut freed)?,
+            marlin_channel_scales: snapshot_opt_slice(
+                ctx,
+                &self.marlin_channel_scales,
+                &mut freed,
+            )?,
+            hybrid_w4a8_qweight: snapshot_opt_slice(ctx, &self.hybrid_w4a8_qweight, &mut freed)?,
+            hybrid_w4a8_s_channel: snapshot_opt_slice(
+                ctx,
+                &self.hybrid_w4a8_s_channel,
+                &mut freed,
+            )?,
+            hybrid_w4a8_s_group: snapshot_opt_slice(ctx, &self.hybrid_w4a8_s_group, &mut freed)?,
+            hybrid_w4_fp8_qweight: snapshot_opt_slice(
+                ctx,
+                &self.hybrid_w4_fp8_qweight,
+                &mut freed,
+            )?,
+            tq_packed: snapshot_opt_slice(ctx, &self.tq_packed, &mut freed)?,
+            tq_scales: snapshot_opt_slice(ctx, &self.tq_scales, &mut freed)?,
+            tq_signs: snapshot_opt_slice(ctx, &self.tq_signs, &mut freed)?,
+            tq_centroids: snapshot_opt_slice(ctx, &self.tq_centroids, &mut freed)?,
+            freed_bytes: 0,
+        };
+        ctx.sync()?;
+
+        // Drop the device buffers (return blocks to the async pool). Replace
+        // `data` with a 1-element placeholder so the struct stays well-formed.
+        let placeholder = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("offload placeholder alloc failed: {e}"))?;
+        self.data = placeholder;
+        self.qweight = None;
+        self.qscales = None;
+        self.dsv4_scales = None;
+        self.marlin_packed = None;
+        self.marlin_scales = None;
+        self.marlin_channel_scales = None;
+        self.hybrid_w4a8_qweight = None;
+        self.hybrid_w4a8_s_channel = None;
+        self.hybrid_w4a8_s_group = None;
+        self.hybrid_w4_fp8_qweight = None;
+        self.tq_packed = None;
+        self.tq_scales = None;
+        self.tq_signs = None;
+        self.tq_centroids = None;
+
+        Ok(HostMatrixSnapshot {
+            freed_bytes: freed,
+            ..snapshot
+        })
+    }
+
+    /// Restore device buffers from a host snapshot, re-allocating VRAM.
+    pub fn reload_from_host(
+        &mut self,
+        ctx: &DeviceContext,
+        snapshot: &HostMatrixSnapshot,
+    ) -> Result<()> {
+        self.data = ctx
+            .stream
+            .clone_htod(snapshot.data.as_slice())
+            .map_err(|e| anyhow!("reload H2D copy (data) failed: {e}"))?;
+        self.qweight = restore_opt_slice(ctx, &snapshot.qweight)?;
+        self.qscales = restore_opt_slice(ctx, &snapshot.qscales)?;
+        self.dsv4_scales = restore_opt_slice(ctx, &snapshot.dsv4_scales)?;
+        self.marlin_packed = restore_opt_slice(ctx, &snapshot.marlin_packed)?;
+        self.marlin_scales = restore_opt_slice(ctx, &snapshot.marlin_scales)?;
+        self.marlin_channel_scales = restore_opt_slice(ctx, &snapshot.marlin_channel_scales)?;
+        self.hybrid_w4a8_qweight = restore_opt_slice(ctx, &snapshot.hybrid_w4a8_qweight)?;
+        self.hybrid_w4a8_s_channel = restore_opt_slice(ctx, &snapshot.hybrid_w4a8_s_channel)?;
+        self.hybrid_w4a8_s_group = restore_opt_slice(ctx, &snapshot.hybrid_w4a8_s_group)?;
+        self.hybrid_w4_fp8_qweight = restore_opt_slice(ctx, &snapshot.hybrid_w4_fp8_qweight)?;
+        self.tq_packed = restore_opt_slice(ctx, &snapshot.tq_packed)?;
+        self.tq_scales = restore_opt_slice(ctx, &snapshot.tq_scales)?;
+        self.tq_signs = restore_opt_slice(ctx, &snapshot.tq_signs)?;
+        self.tq_centroids = restore_opt_slice(ctx, &snapshot.tq_centroids)?;
+        ctx.sync()?;
+        Ok(())
+    }
+
     /// Create from host data (row-major, bf16)
     pub fn from_host(ctx: &DeviceContext, data: &[bf16], rows: usize, cols: usize) -> Result<Self> {
         assert_eq!(data.len(), rows * cols);
