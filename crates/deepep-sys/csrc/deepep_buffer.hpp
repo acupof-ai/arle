@@ -126,6 +126,9 @@ typedef struct ArleDeepEpCombineParams {
     // Outputs (caller-allocated).
     uintptr_t d_combined_x;          // __nv_bfloat16[num_output_tokens, hidden]
     uintptr_t d_combined_topk_w;     // float[num_output_tokens, num_topk]
+    // Caller's COMPUTE stream (cudaStream_t). When non-zero, the combine uses
+    // event-based stream_wait instead of host cudaStreamSynchronize. 0 = host sync.
+    uintptr_t compute_stream;
 } ArleDeepEpCombineParams;
 
 ArleDeepEpStatus arle_deepep_buffer_combine(

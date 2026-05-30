@@ -68,6 +68,13 @@ pub struct CombineParams {
     pub d_send_head: usize,
     pub d_combined_x: usize,
     pub d_combined_topk_w: usize,
+    /// CUDA stream handle (cudaStream_t as usize) of the caller's COMPUTE stream
+    /// — the stream that produces `d_x` (the expert output) and consumes
+    /// `d_combined_x`. When non-zero, the wrapper does event-based
+    /// `stream_wait` (comm-stream waits compute before, compute waits comm
+    /// after) instead of host `cudaStreamSynchronize`, so the combine no longer
+    /// host-blocks the caller. 0 = fall back to the host sync.
+    pub compute_stream: usize,
 }
 
 /// Whether this binary was built with the DeepEP native path enabled.
@@ -155,6 +162,7 @@ mod native {
         pub d_send_head: usize,
         pub d_combined_x: usize,
         pub d_combined_topk_w: usize,
+        pub compute_stream: usize,
     }
 
     unsafe extern "C" {
@@ -329,6 +337,7 @@ impl Buffer {
             d_send_head: p.d_send_head,
             d_combined_x: p.d_combined_x,
             d_combined_topk_w: p.d_combined_topk_w,
+            compute_stream: p.compute_stream,
         };
         let status = unsafe { native::arle_deepep_buffer_combine(self.handle, &c) };
         if status != 0 {

@@ -5351,12 +5351,14 @@ impl DeepseekV4MoeBlock {
         }
 
         // === Buffer.combine — sum per-rank expert_out back to source tokens ===
-        // Cross-stream ordering before combine: `expert_out` is written by the
-        // per-expert scatter kernel on `ctx.stream`, but combine reads it on
-        // the buffer's private stream. Mirror DeepEP's
-        // `stream_wait(comm_stream, compute_stream)` at the start of
-        // `intranode_combine` so combine never reads partial expert output.
-        ctx.stream.synchronize()?;
+        // Cross-stream ordering is now EVENT-BASED, not a host sync: `combine`
+        // receives `compute_stream` (ctx.stream) below and does
+        // stream_wait(comm_stream, compute_stream) on-device before the kernel
+        // (so it never reads partial `expert_out`) and stream_wait(compute,
+        // comm) after (so the next op sees `combined_x`). This removes the
+        // per-layer host block that serialized the prefill — the combine phase
+        // was ~52% of FFN purely because the prior `ctx.stream.synchronize()`
+        // host-waited for the expert GEMM every layer.
         let trace = dsv4_moe_trace_begin(ctx)?;
         let mut combined_x = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
         {
@@ -5384,6 +5386,7 @@ impl DeepseekV4MoeBlock {
                 d_send_head: shead_ptr as usize,
                 d_combined_x: cx_ptr as usize,
                 d_combined_topk_w: ctkw_ptr as usize,
+                compute_stream: ctx.stream.cu_stream() as usize,
             };
             let mut guard = nde
                 .buffer
