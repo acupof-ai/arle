@@ -246,18 +246,28 @@ pub fn load_qwen35_components(
     })
 }
 
-/// Qwen3.5 MoE (Qwen3.6-35B-A3B) CUDA loader stub.
+/// Qwen3.5 MoE (Qwen3.6-35B-A3B) CUDA loader.
 ///
-/// The CUDA MoE forward path is not yet implemented. Metal has its own
-/// code path that does not go through this function. We keep the symbol so
-/// the CUDA dispatch table type-checks; attempting to actually load a MoE
-/// model under CUDA panics with a clear message.
+/// Shares the `Qwen35Model` weight loader with the dense path; the loader
+/// branches per layer on `Config35::is_moe_layer` and builds the SOTA-grouped
+/// MoE block (route → grouped expert GEMM → combine + shared expert) for MoE
+/// layers, keeping the dense SwiGLU path bit-identical for non-MoE layers.
 #[cfg(feature = "cuda")]
 pub fn load_qwen35_moe_components(
-    _model_path: &str,
-    _options: InferenceEngineOptions,
+    model_path: &str,
+    options: InferenceEngineOptions,
 ) -> Result<ModelComponents<Qwen35Model>> {
-    todo!("GPU required: Qwen3.6 CUDA not yet implemented")
+    load_model_with(model_path, options, |model_path, options| {
+        let model =
+            Qwen35Model::from_safetensors_with_options(model_path, options.enable_cuda_graph)?;
+        match std::env::var("INFER_LORA_PATH") {
+            Ok(lora_path) if !lora_path.trim().is_empty() => {
+                log::info!("Attaching Qwen3.6 MoE LoRA adapter from {}", lora_path);
+                model.load_and_attach_lora(&lora_path)
+            }
+            _ => Ok(model),
+        }
+    })
 }
 
 #[cfg(feature = "cuda")]

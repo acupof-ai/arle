@@ -42,6 +42,28 @@ fn qwen35_cuda_debug_sync(ctx: &DeviceContext, label: impl AsRef<str>) -> Result
     Ok(())
 }
 
+/// D2D copy of a freshly-allocated MoE output into a pre-allocated MLP output
+/// buffer, so the grouped-MoE branch reuses the dense path's downstream
+/// residual / all-reduce buffers without changing their shapes.
+pub(super) fn copy_hidden_into(
+    ctx: &DeviceContext,
+    src: &HiddenStates,
+    dst: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        src.hidden_dim == dst.hidden_dim && src.seq_len == dst.seq_len,
+        "MoE output shape {}x{} != MLP buffer shape {}x{}",
+        src.hidden_dim,
+        src.seq_len,
+        dst.hidden_dim,
+        dst.seq_len
+    );
+    ctx.stream
+        .memcpy_dtod(&src.data, &mut dst.data)
+        .map_err(|e| anyhow::anyhow!("MoE output D2D copy failed: {e}"))?;
+    Ok(())
+}
+
 fn mixed_prefill_seq_indptr(prefills: &[PrefillBatchRequest<'_>]) -> Result<Vec<i32>> {
     let mut indptr = Vec::with_capacity(prefills.len() + 1);
     let mut offset = 0usize;
@@ -174,11 +196,16 @@ impl Qwen35Model {
         normed_batch =
             self.batched_rms_norm_offset(&hidden_plus_attn, &layer.post_attention_layernorm, eps)?;
 
-        // 4. MLP (batched)
-        let gate_out = ops::gemm(&self.ctx, &layer.mlp.gate_proj, &normed_batch)?;
-        let up_out = ops::gemm(&self.ctx, &layer.mlp.up_proj, &normed_batch)?;
-        let act_out = ops::silu_mul_batch(&self.ctx, &gate_out, &up_out)?;
-        let mut mlp_out = ops::gemm(&self.ctx, &layer.mlp.down_proj, &act_out)?;
+        // 4. MLP (batched) — dense SwiGLU or Qwen3.6 grouped MoE.
+        let mut mlp_out = if let Some(moe) = layer.mlp.as_moe() {
+            moe.forward(&self.ctx, &self.config, &normed_batch)?
+        } else {
+            let dense = layer.mlp.dense();
+            let gate_out = ops::gemm(&self.ctx, &dense.gate_proj, &normed_batch)?;
+            let up_out = ops::gemm(&self.ctx, &dense.up_proj, &normed_batch)?;
+            let act_out = ops::silu_mul_batch(&self.ctx, &gate_out, &up_out)?;
+            ops::gemm(&self.ctx, &dense.down_proj, &act_out)?
+        };
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut mlp_out)?;
 
@@ -731,25 +758,31 @@ impl Qwen35Model {
                 eps,
                 &mut bufs.normed,
             )?;
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.gate_proj,
-                &bufs.normed,
-                &mut bufs.gate_out,
-            );
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.up_proj,
-                &bufs.normed,
-                &mut bufs.up_out,
-            );
-            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.down_proj,
-                &bufs.act_out,
-                &mut bufs.mlp_out,
-            );
+            if let Some(moe) = layer.mlp.as_moe() {
+                let moe_out = moe.forward(&self.ctx, &self.config, &bufs.normed)?;
+                copy_hidden_into(&self.ctx, &moe_out, &mut bufs.mlp_out)?;
+            } else {
+                let dense = layer.mlp.dense();
+                ops::gemm_into(
+                    &self.ctx,
+                    &dense.gate_proj,
+                    &bufs.normed,
+                    &mut bufs.gate_out,
+                );
+                ops::gemm_into(&self.ctx, &dense.up_proj, &bufs.normed, &mut bufs.up_out);
+                ops::silu_mul_batch_into(
+                    &self.ctx,
+                    &bufs.gate_out,
+                    &bufs.up_out,
+                    &mut bufs.act_out,
+                )?;
+                ops::gemm_into(
+                    &self.ctx,
+                    &dense.down_proj,
+                    &bufs.act_out,
+                    &mut bufs.mlp_out,
+                );
+            }
             self.layer_communicator
                 .post_mlp_all_reduce_hidden_states(&mut bufs.mlp_out)?;
             ops::add_batch_into(
@@ -1168,25 +1201,31 @@ impl Qwen35Model {
                 eps,
                 &mut bufs.normed,
             )?;
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.gate_proj,
-                &bufs.normed,
-                &mut bufs.gate_out,
-            );
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.up_proj,
-                &bufs.normed,
-                &mut bufs.up_out,
-            );
-            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.down_proj,
-                &bufs.act_out,
-                &mut bufs.mlp_out,
-            );
+            if let Some(moe) = layer.mlp.as_moe() {
+                let moe_out = moe.forward(&self.ctx, &self.config, &bufs.normed)?;
+                copy_hidden_into(&self.ctx, &moe_out, &mut bufs.mlp_out)?;
+            } else {
+                let dense = layer.mlp.dense();
+                ops::gemm_into(
+                    &self.ctx,
+                    &dense.gate_proj,
+                    &bufs.normed,
+                    &mut bufs.gate_out,
+                );
+                ops::gemm_into(&self.ctx, &dense.up_proj, &bufs.normed, &mut bufs.up_out);
+                ops::silu_mul_batch_into(
+                    &self.ctx,
+                    &bufs.gate_out,
+                    &bufs.up_out,
+                    &mut bufs.act_out,
+                )?;
+                ops::gemm_into(
+                    &self.ctx,
+                    &dense.down_proj,
+                    &bufs.act_out,
+                    &mut bufs.mlp_out,
+                );
+            }
             self.layer_communicator
                 .post_mlp_all_reduce_hidden_states(&mut bufs.mlp_out)?;
             ops::add_batch_into(
@@ -1612,10 +1651,17 @@ impl Qwen35Model {
                             && Self::graphsafe_batched_weight(&attn.out_proj)
                     }
                 };
-                attn_safe
-                    && Self::graphsafe_batched_weight(&layer.mlp.gate_proj)
-                    && Self::graphsafe_batched_weight(&layer.mlp.up_proj)
-                    && Self::graphsafe_batched_weight(&layer.mlp.down_proj)
+                // MoE layers route dynamically and allocate per-step scratch;
+                // the captured graph path only covers the dense SwiGLU.
+                let mlp_safe = match &layer.mlp {
+                    super::moe::Mlp::Dense(mlp) => {
+                        Self::graphsafe_batched_weight(&mlp.gate_proj)
+                            && Self::graphsafe_batched_weight(&mlp.up_proj)
+                            && Self::graphsafe_batched_weight(&mlp.down_proj)
+                    }
+                    super::moe::Mlp::Moe(_) => false,
+                };
+                attn_safe && mlp_safe
             })
     }
 
@@ -1780,25 +1826,26 @@ impl Qwen35Model {
             &mut bufs.normed,
         )?;
 
-        self.prefill_gemm_into(
-            &layer.mlp.gate_proj,
-            &bufs.normed,
-            &mut bufs.gate_out,
-            graphsafe,
-        )?;
-        self.prefill_gemm_into(
-            &layer.mlp.up_proj,
-            &bufs.normed,
-            &mut bufs.up_out,
-            graphsafe,
-        )?;
-        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        self.prefill_gemm_into(
-            &layer.mlp.down_proj,
-            &bufs.act_out,
-            &mut bufs.mlp_out,
-            graphsafe,
-        )?;
+        if let Some(moe) = layer.mlp.as_moe() {
+            let moe_out = moe.forward(&self.ctx, &self.config, &bufs.normed)?;
+            copy_hidden_into(&self.ctx, &moe_out, &mut bufs.mlp_out)?;
+        } else {
+            let dense = layer.mlp.dense();
+            self.prefill_gemm_into(
+                &dense.gate_proj,
+                &bufs.normed,
+                &mut bufs.gate_out,
+                graphsafe,
+            )?;
+            self.prefill_gemm_into(&dense.up_proj, &bufs.normed, &mut bufs.up_out, graphsafe)?;
+            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+            self.prefill_gemm_into(
+                &dense.down_proj,
+                &bufs.act_out,
+                &mut bufs.mlp_out,
+                graphsafe,
+            )?;
+        }
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut bufs.mlp_out)?;
         ops::add_batch_into(
@@ -2499,26 +2546,32 @@ impl Qwen35Model {
                 &mut bufs.normed,
             )?;
 
-            // MLP
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.gate_proj,
-                &bufs.normed,
-                &mut bufs.gate_out,
-            );
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.up_proj,
-                &bufs.normed,
-                &mut bufs.up_out,
-            );
-            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.down_proj,
-                &bufs.act_out,
-                &mut bufs.mlp_out,
-            );
+            // MLP — dense SwiGLU or Qwen3.6 grouped MoE.
+            if let Some(moe) = layer.mlp.as_moe() {
+                let moe_out = moe.forward(&self.ctx, &self.config, &bufs.normed)?;
+                copy_hidden_into(&self.ctx, &moe_out, &mut bufs.mlp_out)?;
+            } else {
+                let dense = layer.mlp.dense();
+                ops::gemm_into(
+                    &self.ctx,
+                    &dense.gate_proj,
+                    &bufs.normed,
+                    &mut bufs.gate_out,
+                );
+                ops::gemm_into(&self.ctx, &dense.up_proj, &bufs.normed, &mut bufs.up_out);
+                ops::silu_mul_batch_into(
+                    &self.ctx,
+                    &bufs.gate_out,
+                    &bufs.up_out,
+                    &mut bufs.act_out,
+                )?;
+                ops::gemm_into(
+                    &self.ctx,
+                    &dense.down_proj,
+                    &bufs.act_out,
+                    &mut bufs.mlp_out,
+                );
+            }
             self.layer_communicator
                 .post_mlp_all_reduce_hidden_states(&mut bufs.mlp_out)?;
 
