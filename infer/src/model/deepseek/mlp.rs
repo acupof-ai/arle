@@ -5060,6 +5060,20 @@ impl DeepseekV4MoeBlock {
             }
         }
 
+        // Cross-stream ordering before dispatch. The router/top-k tensors
+        // (hidden.data, topk_idx_i64, route_weights) are produced by kernels
+        // on `ctx.stream`, but the DeepEP dispatch runs on the buffer's own
+        // private stream (`self->stream`, created in deepep_buffer.cpp). The
+        // wrapper host-syncs `self->stream` *after* each op but never orders
+        // it *before* against `ctx.stream`, so dispatch could read top-k
+        // indices the route kernel hasn't finished writing -> garbage routing
+        // -> garbage dispatch metadata -> illegal address in combine. This
+        // mirrors DeepEP's official `stream_wait(comm_stream, compute_stream)`
+        // at the start of `intranode_dispatch` (csrc/legacy/buffer.hpp). A
+        // host sync here is the minimal correct ordering given the wrapper is
+        // already host-serialized; an event-based wait is a later perf tranche.
+        ctx.stream.synchronize()?;
+
         // Dispatch call. Scope the device-pointer guards so the mutable
         // borrows on scratch.* drop before the post-dispatch FFN reads them.
         let trace = dsv4_moe_trace_begin(ctx)?;
@@ -5326,6 +5340,12 @@ impl DeepseekV4MoeBlock {
         }
 
         // === Buffer.combine — sum per-rank expert_out back to source tokens ===
+        // Cross-stream ordering before combine: `expert_out` is written by the
+        // per-expert scatter kernel on `ctx.stream`, but combine reads it on
+        // the buffer's private stream. Mirror DeepEP's
+        // `stream_wait(comm_stream, compute_stream)` at the start of
+        // `intranode_combine` so combine never reads partial expert output.
+        ctx.stream.synchronize()?;
         let trace = dsv4_moe_trace_begin(ctx)?;
         let mut combined_x = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
         {
