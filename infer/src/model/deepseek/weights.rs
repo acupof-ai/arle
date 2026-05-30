@@ -2157,7 +2157,21 @@ impl DeepseekModel {
             // (q_prepared / local_attn would need their own padding to avoid
             // OOB and that's a separate cleanup).
             const FLASHMLA_VERIFIED_S_Q: usize = 16384;
-            const FLASHMLA_TOTAL_POSITION_LIMIT: usize = 24576;
+            // V2.5 cap-lift: the old hardcoded 24576 total-position cap was a
+            // stale V2-era guard, set while the >24K CUDA_ERROR_ILLEGAL_ADDRESS
+            // was still hypothesized to be a kv_unified/TMA sizing bound. V2.4
+            // found+fixed the real root cause (nullptr params.max_logits /
+            // params.lse, phase1.cuh:457-458) and re-validated 4K/16K/24K. Bind
+            // the bound to the model's declared envelope (max_position_embeddings)
+            // so >24K CSA/HCA prefill uses FlashMLA at TP>1 instead of falling
+            // back to legacy, while kv_unified/indices scratch stays inside the
+            // same envelope the compressed_count sizing already assumes
+            // (weights.rs:1716/1786). NB: the largest *single* FlashMLA dispatch
+            // validated to date is s_q=16384 (the "24K clean" run was chunked
+            // 16384+7632); HCA-mode sizing >16384 is being confirmed by the >24K
+            // pod probe — kept behind ARLE_DSV4_FLASHMLA_PREFILL (default on) so
+            // `=0` forces legacy for the whole prefill if >24K regresses.
+            let flashmla_total_position_limit = self.config.max_position_embeddings;
             let total_position_after = start_pos + token_count;
             let (sm_major, _sm_minor) = self.ctx.compute_capability();
             let tp_world_outer = self.config.tp.world_size;
@@ -2175,7 +2189,7 @@ impl DeepseekModel {
                 && (mode_int == 1 || mode_int == 2)
                 && token_count_ok
                 && (head_dim == 512 || head_dim == 576)
-                && total_position_after <= FLASHMLA_TOTAL_POSITION_LIMIT
+                && total_position_after <= flashmla_total_position_limit
                 && dsv4_flashmla_prefill_enabled()?;
             if use_flashmla {
                 let tp_world = self.config.tp.world_size;
