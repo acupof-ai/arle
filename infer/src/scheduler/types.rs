@@ -873,6 +873,19 @@ pub struct RemergeLoraRequest {
     pub response_tx: std_mpsc::Sender<anyhow::Result<()>>,
 }
 
+/// OPD engine weight time-share request (offload to host / reload to device).
+/// Routed to the single-writer scheduler thread so the D2H/H2D round-trip runs
+/// on the thread that owns the model. `Offload` returns the device bytes freed.
+#[cfg(feature = "cuda")]
+pub enum EngineOffloadRequest {
+    Offload {
+        response_tx: std_mpsc::Sender<anyhow::Result<usize>>,
+    },
+    Reload {
+        response_tx: std_mpsc::Sender<anyhow::Result<()>>,
+    },
+}
+
 /// Error returned when the scheduler's waiting queue is full.
 #[derive(Debug)]
 pub struct SchedulerFull;
@@ -893,6 +906,8 @@ pub struct SchedulerHandle {
     raw_logits_tx: Option<mpsc::UnboundedSender<RawLogitsRequest>>,
     #[cfg(feature = "cuda")]
     remerge_lora_tx: Option<mpsc::UnboundedSender<RemergeLoraRequest>>,
+    #[cfg(feature = "cuda")]
+    engine_offload_tx: Option<mpsc::UnboundedSender<EngineOffloadRequest>>,
     wakeup_tx: crossbeam_channel::Sender<()>,
     model_id: Arc<str>,
     tokenizer: Option<Tokenizer>,
@@ -980,6 +995,8 @@ impl SchedulerHandle {
             raw_logits_tx: None,
             #[cfg(feature = "cuda")]
             remerge_lora_tx: None,
+            #[cfg(feature = "cuda")]
+            engine_offload_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -1004,6 +1021,8 @@ impl SchedulerHandle {
             raw_logits_tx: None,
             #[cfg(feature = "cuda")]
             remerge_lora_tx: None,
+            #[cfg(feature = "cuda")]
+            engine_offload_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -1029,6 +1048,8 @@ impl SchedulerHandle {
             raw_logits_tx: None,
             #[cfg(feature = "cuda")]
             remerge_lora_tx: None,
+            #[cfg(feature = "cuda")]
+            engine_offload_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -1053,6 +1074,8 @@ impl SchedulerHandle {
             raw_logits_tx: None,
             #[cfg(feature = "cuda")]
             remerge_lora_tx: None,
+            #[cfg(feature = "cuda")]
+            engine_offload_tx: None,
             wakeup_tx,
             model_id: Arc::from(model_id),
             tokenizer: None,
@@ -1106,6 +1129,16 @@ impl SchedulerHandle {
         remerge_lora_tx: mpsc::UnboundedSender<RemergeLoraRequest>,
     ) -> Self {
         self.remerge_lora_tx = Some(remerge_lora_tx);
+        self
+    }
+
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn with_engine_offload_tx(
+        mut self,
+        engine_offload_tx: mpsc::UnboundedSender<EngineOffloadRequest>,
+    ) -> Self {
+        self.engine_offload_tx = Some(engine_offload_tx);
         self
     }
 
@@ -1204,6 +1237,40 @@ impl SchedulerHandle {
         response_rx.recv().map_err(|err| {
             anyhow::anyhow!("student LoRA re-merge response channel closed: {err}")
         })?
+    }
+
+    /// Offload the model's device weights to host RAM on the scheduler thread
+    /// (OPD time-share). Blocks until the D2H round-trip completes; returns the
+    /// device VRAM bytes freed.
+    #[cfg(feature = "cuda")]
+    pub fn offload_engine_weights(&self) -> anyhow::Result<usize> {
+        let tx = self.engine_offload_tx.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("CUDA scheduler does not expose engine weight offload requests")
+        })?;
+        let (response_tx, response_rx) = std_mpsc::channel();
+        tx.send(EngineOffloadRequest::Offload { response_tx })
+            .map_err(|_| anyhow::anyhow!("engine offload request submission failed"))?;
+        let _ = self.wakeup_tx.send(());
+        response_rx
+            .recv()
+            .map_err(|err| anyhow::anyhow!("engine offload response channel closed: {err}"))?
+    }
+
+    /// Reload the model's device weights from the host snapshot on the
+    /// scheduler thread (OPD time-share). Blocks until the H2D round-trip
+    /// completes.
+    #[cfg(feature = "cuda")]
+    pub fn reload_engine_weights(&self) -> anyhow::Result<()> {
+        let tx = self.engine_offload_tx.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("CUDA scheduler does not expose engine weight reload requests")
+        })?;
+        let (response_tx, response_rx) = std_mpsc::channel();
+        tx.send(EngineOffloadRequest::Reload { response_tx })
+            .map_err(|_| anyhow::anyhow!("engine reload request submission failed"))?;
+        let _ = self.wakeup_tx.send(());
+        response_rx
+            .recv()
+            .map_err(|err| anyhow::anyhow!("engine reload response channel closed: {err}"))?
     }
 
     /// Decrement the waiting count (called by the scheduler when it consumes a request).

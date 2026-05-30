@@ -706,6 +706,32 @@ pub(crate) fn gemv_with_marlin_scratch(
         return Ok(());
     }
 
+    // Dense single-token GEMM. The unified `oplib::linear::plan()` selects
+    // `Bf16GraphsafeGemm` for `(batch=1, DenseBf16)` in both phases (it is the
+    // graph-capture-safe dense path); the single-token `gemv` launcher services
+    // it with the same handwritten BF16 GEMV used for `Bf16Gemv` (M=rows, K=cols,
+    // N=1). Without this arm a dense single-token decode (e.g. the tied lm_head
+    // last-row projection in `forward_token_logits`) falls through to the
+    // unreachable below — the regression that broke OPD teacher/student scoring
+    // after the oplib dispatch relocation.
+    if plan == LinearKernel::Bf16GraphsafeGemm {
+        let (weight_ptr, _ga) = weight.data.device_ptr(&ctx.stream);
+        let (input_ptr, _gx) = input.data.device_ptr(&ctx.stream);
+        let (output_ptr, _gy) = output.data.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::gemv_cuda(
+                weight_ptr as *const ffi::Half,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                weight.rows as i32,
+                weight.cols as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        return Ok(());
+    }
+
     if plan == LinearKernel::MarlinW4A8Gemm {
         if let Some(scratch) = marlin_scratch {
             run_marlin_w4a8_linear_with_scratch(

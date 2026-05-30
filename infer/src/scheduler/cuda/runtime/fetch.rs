@@ -406,6 +406,25 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
+    /// Apply pending OPD engine weight time-share requests on the single-writer
+    /// scheduler thread. Offload moves the model's device weights to host RAM
+    /// (freeing VRAM during the student backward); reload restores them before
+    /// the next rollout / scoring phase. The model owns the host snapshot, so
+    /// this runs here, not on the caller's thread.
+    pub(super) fn drain_engine_offload_rx(&mut self) {
+        use crate::scheduler::types::EngineOffloadRequest;
+        while let Ok(req) = self.engine_offload_rx.try_recv() {
+            match req {
+                EngineOffloadRequest::Offload { response_tx } => {
+                    let _ = response_tx.send(self.model.offload_weights_to_host());
+                }
+                EngineOffloadRequest::Reload { response_tx } => {
+                    let _ = response_tx.send(self.model.reload_weights_to_device());
+                }
+            }
+        }
+    }
+
     fn forward_raw_logits(
         &mut self,
         input_ids: &[u32],
@@ -469,5 +488,6 @@ impl<M: ModelForward> Scheduler<M> {
         self.drain_request_rx();
         self.drain_raw_logits_rx();
         self.drain_remerge_lora_rx();
+        self.drain_engine_offload_rx();
     }
 }

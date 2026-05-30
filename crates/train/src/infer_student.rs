@@ -63,6 +63,25 @@ impl InferStudent {
         self.vocab_size
     }
 
+    /// Offload the rollout engine's device weights to host RAM (OPD
+    /// time-share), freeing VRAM for the student backward. Returns bytes freed.
+    pub fn offload_engine_weights(&self) -> Result<usize> {
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
+        engine.offload_engine_weights()
+    }
+
+    /// Reload the rollout engine's device weights before the next rollout.
+    pub fn reload_engine_weights(&self) -> Result<()> {
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
+        engine.reload_engine_weights()
+    }
+
     /// Run a single greedy forward over `input_ids` (with absolute `positions`)
     /// and return the argmax token over the **last** position's logits.
     ///

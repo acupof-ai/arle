@@ -151,6 +151,31 @@ impl LoadedInferenceEngine {
             Self::Cpu(_) => anyhow::bail!("remerge_student_lora is only available on CUDA"),
         }
     }
+
+    /// Offload the engine's device weights to host RAM, freeing VRAM for the
+    /// OPD time-share. Returns the device bytes freed.
+    #[cfg(feature = "cuda")]
+    pub fn offload_engine_weights(&self) -> Result<usize> {
+        match self {
+            Self::Cuda { engine, .. } => engine.offload_engine_weights(),
+            #[cfg(feature = "metal")]
+            Self::Metal(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
+        }
+    }
+
+    /// Reload the engine's device weights from the host snapshot.
+    #[cfg(feature = "cuda")]
+    pub fn reload_engine_weights(&self) -> Result<()> {
+        match self {
+            Self::Cuda { engine, .. } => engine.reload_engine_weights(),
+            #[cfg(feature = "metal")]
+            Self::Metal(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
+        }
+    }
 }
 
 impl InferenceEngine for LoadedInferenceEngine {

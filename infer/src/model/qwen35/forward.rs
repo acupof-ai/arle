@@ -587,6 +587,14 @@ impl ModelForward for Qwen35Model {
         self.remerge_lora(update)
     }
 
+    fn offload_weights_to_host(&mut self) -> Result<usize> {
+        Qwen35Model::offload_weights_to_host(self)
+    }
+
+    fn reload_weights_to_device(&mut self) -> Result<()> {
+        Qwen35Model::reload_weights_to_device(self)
+    }
+
     fn forward_decode_batch(
         &self,
         tokens: &[u32],
