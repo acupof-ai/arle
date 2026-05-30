@@ -541,11 +541,18 @@ def nvcc_compile_cubin(
     cuda_include: Path,
 ) -> None:
     nvcc_bin = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    # Hopper (sm_90) TileLang kernels emit CUTLASS WGMMA (`wgmma.fence`), which
+    # nvcc only enables under the architecture-accelerated `sm_90a` target — that
+    # is what defines `CUTE_ARCH_MMA_SM90A_ENABLED`. Plain `sm_90` compiles the
+    # WGMMA path but device-asserts at the first `wgmma.fence` at runtime
+    # (`cute::warpgroup_arrive(): Attempting to use wgmma.fence without
+    # CUTE_ARCH_MMA_SM90A_ENABLED`). Use the `a` variant for the SASS/PTX target.
+    arch_sm = f"{cuda_arch}a" if cuda_arch == 90 else str(cuda_arch)
     cmd = [
         nvcc_bin,
         "-cubin",
         "-O3",
-        f"-gencode=arch=compute_{cuda_arch},code=sm_{cuda_arch}",
+        f"-gencode=arch=compute_{arch_sm},code=sm_{arch_sm}",
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "-Xcompiler=-fPIC",
