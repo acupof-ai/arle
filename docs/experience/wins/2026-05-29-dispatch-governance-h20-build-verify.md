@@ -56,6 +56,7 @@ cargo test -p infer --lib            # default features
 | **Mac default lib suite** | **604 passed, 0 failed, 14 ignored** — incl. `oplib::` full-sweep `plan()`-vs-legacy-oracle equivalence (3) + `dispatch_policy::` parser/token-set (7, incl. bypass presence + r4-only-`"1"`) |
 | **Mac cuda,no-cuda typecheck** | clean (no new warnings) |
 | **H20 cuda test harness + pure tests** | **PASS** — `cargo test --features cuda --lib` harness compiled on `nvcc` and **13 tests passed, 0 failed** (`dispatch_policy` + `oplib`). The harness compile verifies the cuda-gated test code Mac `cfg`s out: the `LinearKernelPlan→LinearKernel` rename in test arms **and** the codex-fix `weight_loader.rs` `reset_dispatch_policy_cache()` guard edit (previously pending-remote typecheck). |
+| **H20 Observe gate end-to-end (runtime populate, 2026-05-30)** | **PASS** — served `DeepSeek-V4-Flash` on 8× H20, sent requests, scraped `/metrics`: `infer_dispatch_kernel_total{op="linear",variant="Bf16CublasGemm"} 288` and `{variant="Dsv4Fp8BatchGemv"} 480` (24 prefills, 768 linear GEMMs). **The Observe counter populates at runtime with the actual fired kernels** — the governance "which kernel fired" probe works on hardware. The other 29 `LinearKernel` variants are absent (count 0, reader filters nonzero) → a kernel you expected to fire but don't see = a never-fired path (`链路不通` detection, live). |
 
 The headline property is realized: `oplib::linear::plan()` is backend-neutral, so
 its full input-cross-product equivalence vs the legacy resolver is a **CPU unit
@@ -90,6 +91,17 @@ test** — selection correctness is provable without a GPU or a bench.
   demonstrated.
 - **cuda `cargo test` filters go after `--`** (libtest OR's them); cargo positionals
   before `--` reject the 2nd filter.
+- **Prometheus counters are at `/metrics`, not `/v1/stats`** — `/v1/stats` is the JSON
+  service-stats (`render_stats_json`); `infer_dispatch_kernel_total` /
+  `infer_scheduler_plan_total` (Prometheus text via `render_prometheus`) live at
+  `/metrics` (`router.rs:100`). A first scrape of `/v1/stats` came back empty for *both*
+  counters — the tell that the endpoint, not the counter, was wrong.
+- **The Observe counter demonstrated its own value live:** DSv4-Flash's FlashMLA prefill
+  failed on this arch (`CUDA_ERROR_NOT_SUPPORTED` — a DSv4 WIP issue), yet
+  `infer_dispatch_kernel_total` showed the linear projection GEMMs (Bf16CublasGemm 288,
+  Dsv4Fp8BatchGemv 480) fired *before* the attention failure. The probe pinpointed
+  "linear ran, attention didn't" — exactly the per-path runtime visibility the
+  governance plan promises.
 
 ## Δ vs baseline
 
