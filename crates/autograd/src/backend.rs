@@ -190,6 +190,23 @@ pub struct LinearAttentionScanBackwardGrads {
 pub trait Backend: std::fmt::Debug + Send + Sync {
     fn device(&self) -> Device;
 
+    /// Drain all in-flight GPU work on this backend's device context
+    /// (`cuCtxSynchronize` for CUDA). Default no-op for host/CPU backends.
+    ///
+    /// Used by the OPD engine time-share (`crates/train/src/opd.rs`) to fence
+    /// the *train* backend before an idle infer engine reloads/offloads its
+    /// weights. The three co-resident CUDA contexts (infer-student,
+    /// infer-teacher, train autograd) share one device async memory pool with
+    /// cudarc `disable_event_tracking()` (no automatic cross-stream waits), so
+    /// the infer engine's pool allocations during a weight reload can collide
+    /// with the train backward's still-outstanding pool ops — handing out the
+    /// same physical block twice and dropping reloaded side buffers (observed
+    /// as the W4A8 "missing Marlin-packed side buffer" on the teacher reload).
+    /// A full train-side device sync orders the train work ahead of the reload.
+    fn device_synchronize(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn upload(&self, host: &[f32], _shape: &[usize]) -> Result<DeviceHandle> {
         Ok(DeviceHandle::Cpu(host.to_vec()))
     }

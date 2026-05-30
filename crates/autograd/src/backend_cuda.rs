@@ -219,6 +219,21 @@ impl CudaBackend {
                 ));
             }
         };
+        // `cuMemcpyDtoD_v2` issues on the per-thread default stream, which is
+        // NOT host-blocking when the context disables event tracking (the OPD
+        // infer/train contexts do — see `DeviceContext::on_device`). The source
+        // pointer belongs to a *foreign* allocator (the infer engine's logits
+        // buffer); its owner frees it via `cuMemFreeAsync` as soon as this
+        // bridge returns. Without a fence the async free races the still-running
+        // D2D read → use-after-free / CUDA_ERROR_ILLEGAL_ADDRESS at the next
+        // sync (confirmed by compute-sanitizer: "Use-after-free ... accessed
+        // after it is free'd" at cuMemcpyDtoD_v2 vs cuMemFreeAsync, and the
+        // fault vanishes under CUDA_LAUNCH_BLOCKING=1). Drain the copy before
+        // the source can be freed.
+        self.stream
+            .context()
+            .synchronize()
+            .map_err(|_| AutogradError::TapeInvariant("cuda D2D bridge sync failed"))?;
         Ok(staging)
     }
 
@@ -563,6 +578,25 @@ impl CudaBackend {
 impl Backend for CudaBackend {
     fn device(&self) -> Device {
         Device::Cuda
+    }
+
+    fn device_synchronize(&self) -> Result<()> {
+        #[cfg(feature = "no-cuda")]
+        {
+            Ok(())
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            // `cuCtxSynchronize` on the train backend's context: drains every
+            // stream so outstanding train ops (incl. async-pool allocs/frees)
+            // are ordered ahead of an infer-thread weight reload/offload that
+            // touches the same shared device pool. See the trait doc.
+            self.stream
+                .context()
+                .synchronize()
+                .map_err(|_| AutogradError::TapeInvariant("cuda device_synchronize failed"))
+        }
     }
 
     fn upload(&self, host: &[f32], shape: &[usize]) -> Result<DeviceHandle> {

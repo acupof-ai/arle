@@ -79,20 +79,73 @@ pub fn infer_rollout_flag_enabled() -> bool {
     }
 }
 
-/// True when the OPD engine weight time-share is enabled
-/// (`ARLE_OPD_ENGINE_OFFLOAD=1`). When on, the idle infer engines (rollout
-/// student + scoring teacher) offload their device weights to host RAM during
-/// the student backward, freeing VRAM so long rollouts (≥256) fit on a 16 GB
-/// card. Default OFF — the resident-weights path is unchanged.
+/// OPD engine weight time-share mode (`ARLE_OPD_ENGINE_OFFLOAD`). When on, the
+/// idle infer engines offload their device weights to host RAM during the
+/// student backward, freeing VRAM so long rollouts (≥256) fit on a 16 GB card.
 ///
 /// The vLLM-sleep-mode / verl HybridFlow equivalent ARLE previously lacked
 /// (see `docs/research/2026-05-29-opd-memory-best-practice.md` Tier 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineOffloadMode {
+    /// Default — resident-weights path is unchanged.
+    Off,
+    /// Offload BOTH idle engines (rollout student + scoring teacher) together
+    /// after the teacher scores. Frees the most VRAM (~4.4 GB at rollout-256)
+    /// but reloads the teacher every step, which races the shared async pool
+    /// across the three co-resident CUDA contexts (step-2 illegal address —
+    /// see `errors/2026-05-30-...`).
+    All,
+    /// Offload ONLY the rollout infer-student; keep the teacher resident. The
+    /// teacher is never reloaded, so the step-2 teacher-reload path is avoided.
+    /// Frees ~1.4 GB — enough for moderate rollout-256 backwards but can OOM on
+    /// the longest CoTs (the teacher's 3 GB stays put).
+    Student,
+    /// Offload ONLY the scoring teacher; keep the rollout infer-student
+    /// resident. Frees the teacher's ~3.0 GB (more headroom than `Student`) and
+    /// — because only ONE engine offloads/reloads — keeps the shared async pool
+    /// free of the student↔teacher offload interleaving that corrupts the W4A8
+    /// Marlin reload under `All`. Matches the single-engine offload/reload
+    /// parity conditions, so the teacher's Marlin side buffers round-trip.
+    Teacher,
+}
+
+impl EngineOffloadMode {
+    /// True when any engine offload is active (student and/or teacher).
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, EngineOffloadMode::Off)
+    }
+
+    /// True when the scoring teacher participates in the offload/reload
+    /// time-share. `Student` keeps the teacher resident.
+    pub fn offloads_teacher(self) -> bool {
+        matches!(self, EngineOffloadMode::All | EngineOffloadMode::Teacher)
+    }
+
+    /// True when the rollout infer-student participates in the offload/reload
+    /// time-share. `Teacher` keeps the student resident.
+    pub fn offloads_student(self) -> bool {
+        matches!(self, EngineOffloadMode::All | EngineOffloadMode::Student)
+    }
+}
+
+/// Parse the OPD engine offload mode from `ARLE_OPD_ENGINE_OFFLOAD`.
+///
+/// - `1` / `true` / `yes` / `on` / `all` → [`EngineOffloadMode::All`]
+///   (offload both engines — original behavior).
+/// - `student` → [`EngineOffloadMode::Student`] (offload only the
+///   infer-student; keep the teacher resident).
+/// - `teacher` → [`EngineOffloadMode::Teacher`] (offload only the scoring
+///   teacher; keep the student resident — frees ~3 GB and avoids the
+///   multi-engine pool interleaving that corrupts the W4A8 Marlin reload).
+/// - anything else / unset → [`EngineOffloadMode::Off`].
 #[cfg(feature = "cuda")]
-pub fn engine_offload_flag_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_OPD_ENGINE_OFFLOAD").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+pub fn engine_offload_mode() -> EngineOffloadMode {
+    match std::env::var("ARLE_OPD_ENGINE_OFFLOAD").as_deref() {
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON" | "all" | "ALL") => EngineOffloadMode::All,
+        Ok("student" | "STUDENT" | "Student") => EngineOffloadMode::Student,
+        Ok("teacher" | "TEACHER" | "Teacher") => EngineOffloadMode::Teacher,
+        _ => EngineOffloadMode::Off,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -860,8 +913,9 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     store: &mut TensorStore,
     tape: &mut Tape,
     profile: &mut Option<&mut OpdStepProfile>,
-    engine_offload: bool,
+    engine_offload: EngineOffloadMode,
     student_engine_offload: Option<&dyn Fn() -> Result<usize>>,
+    student_engine_reload: Option<&dyn Fn() -> Result<()>>,
 ) -> Result<f32> {
     let kl_range = kl_logit_range(kl_mask, prompt_len, rollout.len())?;
     if kl_range.start >= kl_range.end {
@@ -885,7 +939,19 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     tape.set_enabled(false);
     // OPD engine time-share: the teacher may have been offloaded to host RAM
     // during the previous step's student backward. Reload it before scoring.
-    if engine_offload {
+    // In `Student` mode the teacher stays resident, so this is skipped.
+    //
+    // Fence the train backend first. The reload re-allocates the teacher's
+    // weight buffers (incl. the W4A8 Marlin packed side buffers) from the
+    // shared async pool on the infer scheduler thread; without this barrier
+    // the previous step's still-draining train pool ops race those allocs
+    // (event tracking is disabled) and the reloaded Marlin side buffer is
+    // dropped → "missing W4A8 Marlin-packed side buffer".
+    if engine_offload.offloads_teacher() {
+        store
+            .backend()
+            .device_synchronize()
+            .map_err(OpdError::from)?;
         teacher
             .reload_engine_weights()
             .map_err(|err| map_teacher_forward_error("teacher reload", err))?;
@@ -937,14 +1003,25 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     // to avoid racing the teacher forward's allocations against the student's
     // async pool frees. Reloaded at the next step (student before rollout,
     // teacher before scoring).
-    if engine_offload {
-        if let Some(offload_student) = student_engine_offload {
-            let freed = offload_student()?;
-            eprintln!(
-                "opd_engine_offload student_offloaded freed_bytes={freed} freed_mib={:.1}",
-                freed as f64 / (1024.0 * 1024.0)
-            );
-        }
+    //
+    // Fence the train backend before the infer-thread offload frees the
+    // pool blocks, same cross-context ordering reason as the reload fence.
+    if engine_offload.is_enabled() {
+        store
+            .backend()
+            .device_synchronize()
+            .map_err(OpdError::from)?;
+    }
+    if engine_offload.offloads_student()
+        && let Some(offload_student) = student_engine_offload
+    {
+        let freed = offload_student()?;
+        eprintln!(
+            "opd_engine_offload student_offloaded freed_bytes={freed} freed_mib={:.1}",
+            freed as f64 / (1024.0 * 1024.0)
+        );
+    }
+    if engine_offload.offloads_teacher() {
         let freed = teacher
             .offload_engine_weights()
             .map_err(|err| map_teacher_forward_error("teacher offload", err))?;
@@ -997,6 +1074,32 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
         profile.backward_seconds += phase_started.elapsed().as_secs_f64();
     });
     cleanup_after_backward(store, tape, student_model_params, keep_extra);
+
+    // OPD engine time-share: the heavy student-backward transients are now
+    // freed, so reload the engines we offloaded BEFORE returning. This keeps
+    // the offload window strictly inside the backward and leaves both engines
+    // resident for whatever the caller does next — the inter-step KL eval and
+    // checkpoint save both run a teacher/student forward, which would hit an
+    // offloaded (placeholder) weight and fail (W4A8 "missing Marlin-packed
+    // side buffer"). Reload is idempotent, so the next step's pre-rollout /
+    // pre-scoring reloads become no-ops. Fence the train backend first so the
+    // backward's pool ops are ordered ahead of the reload's allocations.
+    if engine_offload.is_enabled() {
+        store
+            .backend()
+            .device_synchronize()
+            .map_err(OpdError::from)?;
+    }
+    if engine_offload.offloads_teacher() {
+        teacher
+            .reload_engine_weights()
+            .map_err(|err| map_teacher_forward_error("teacher reload (post-backward)", err))?;
+    }
+    if engine_offload.offloads_student()
+        && let Some(reload_student) = student_engine_reload
+    {
+        reload_student()?;
+    }
 
     Ok(loss_value)
 }
@@ -1790,17 +1893,24 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         #[cfg(not(feature = "cuda"))]
         let infer_handled = false;
         #[cfg(feature = "cuda")]
-        let engine_offload = engine_offload_flag_enabled();
+        let engine_offload = engine_offload_mode();
         #[cfg(not(feature = "cuda"))]
-        let engine_offload = false;
+        let engine_offload = EngineOffloadMode::Off;
 
         #[cfg(feature = "cuda")]
         let infer_handled = if let Some(ctx) = infer_rollout.as_ref() {
             // OPD engine time-share: the rollout student may have been
             // offloaded to host RAM during the previous step's backward.
             // Reload it before the LoRA sync (which re-merges resident base
-            // weights) and the rollout decode.
-            if engine_offload {
+            // weights) and the rollout decode. Fence the train backend first
+            // so the previous step's optimizer/cleanup pool ops are ordered
+            // ahead of the reload's pool allocations (same cross-context
+            // ordering reason as the teacher reload fence).
+            if engine_offload.offloads_student() {
+                store
+                    .backend()
+                    .device_synchronize()
+                    .map_err(OpdError::from)?;
                 ctx.student.reload_engine_weights().map_err(|err| {
                     OpdError::InvalidInput(format!("infer student reload failed: {err}"))
                 })?;
@@ -1971,11 +2081,15 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
             });
 
-            // Build the rollout-student offload hook (cuda-only). It is invoked
-            // inside the backward, right after the teacher scores, so both idle
-            // engines are offloaded together on a quiesced device.
+            // Build the rollout-student offload/reload hooks (cuda-only). The
+            // offload is invoked inside the backward right after the teacher
+            // scores (idle engines offloaded on a quiesced device); the reload
+            // runs at the end of the backward so the student is resident again
+            // for the inter-step eval / checkpoint / next rollout.
             #[cfg(feature = "cuda")]
-            let student_offload_fn: Option<Box<dyn Fn() -> Result<usize>>> = if engine_offload {
+            let student_offload_fn: Option<Box<dyn Fn() -> Result<usize>>> = if engine_offload
+                .offloads_student()
+            {
                 infer_rollout.as_ref().map(|ctx| {
                     let student = ctx.student;
                     Box::new(move || {
@@ -1989,6 +2103,25 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             };
             #[cfg(not(feature = "cuda"))]
             let student_offload_fn: Option<Box<dyn Fn() -> Result<usize>>> = None;
+
+            #[cfg(feature = "cuda")]
+            let student_reload_fn: Option<Box<dyn Fn() -> Result<()>>> =
+                if engine_offload.offloads_student() {
+                    infer_rollout.as_ref().map(|ctx| {
+                        let student = ctx.student;
+                        Box::new(move || {
+                            student.reload_engine_weights().map_err(|err| {
+                                OpdError::InvalidInput(format!(
+                                    "infer student reload (post-backward) failed: {err}"
+                                ))
+                            })
+                        }) as Box<dyn Fn() -> Result<()>>
+                    })
+                } else {
+                    None
+                };
+            #[cfg(not(feature = "cuda"))]
+            let student_reload_fn: Option<Box<dyn Fn() -> Result<()>>> = None;
 
             let loss_value = backward_chunked_kl_rollout(
                 student,
@@ -2005,6 +2138,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 &mut profile,
                 engine_offload,
                 student_offload_fn.as_deref(),
+                student_reload_fn.as_deref(),
             )?;
             validate_loss_value(loss_value)?;
 
