@@ -185,11 +185,40 @@ abort kind=architectural_deferral
   small padded max_m). So this is a "deepgemm-config-at-large-m-on-H20" gap, not a regression.
 
 ### Probe in flight
-Added env `ARLE_DEEPGEMM_CONSERVATIVE_LAYOUT=1` (deepgemm_native.cu:486) that forces `block_m=64` + `cluster=1`
-(the decode-working config) for all shapes, to isolate config (smem/cluster) vs the SFA TMA. If the GEMM then
-succeeds at `max_m=88`, the config is the cause → the fix is to cap the layout (block_m≤64 / cluster=1) for the
-DSv4 expert shapes on H20 (or `DG_NUM_SMS`/cluster gating). If it STILL fails, the SFA scale-factor TMA at
-unpadded `max_m` is the cause → pad `max_m` (route_capacity) to the SFA-aligned bound.
+Added env `ARLE_DEEPGEMM_CONSERVATIVE_LAYOUT=1` (deepgemm_native.cu:486) that forces `block_m=64` + `cluster=1`.
+
+## Update 2026-05-31 (the REAL root cause) — my builds shipped the STUB; deepgemm was never compiled in
+
+The conservative-layout probe STILL returned `NOT_SUPPORTED` — which is impossible if it were a layout/config
+issue (the probe changes the config). That collapsed the puzzle: in `deepgemm_native.cu` the ONLY
+`return CUDA_ERROR_NOT_SUPPORTED` is `if (prop.major != 9)` (line 863) — shape-independent — yet H20 IS sm_90
+(the JIT even compiles `sm_90a`). The resolution:
+
+**The whole `deepgemm_native.cu` body is `#ifdef ARLE_ENABLE_DEEPGEMM_NATIVE`. When that macro is NOT defined,
+`csrc/gemm/deepgemm_bridge_stub.cu:17` compiles instead and returns `CUDA_ERROR_NOT_SUPPORTED` UNCONDITIONALLY.**
+`build.rs:1355` only defines `-DARLE_ENABLE_DEEPGEMM_NATIVE=1` when the BUILD-TIME env
+`ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1` (or `_TORCH`) is set. **None of my builds set it** — so every "deepgemm" run
+this session linked the STUB. So:
+- The `NOT_SUPPORTED` was the stub, NOT a real deepgemm runtime fault.
+- The "shape-dependent" `max_m=56/72/88/96` was an illusion: the stub ignores everything; the Rust error string
+  just logs the params it *would* have used.
+- The conservative-layout probe (e2b3f40e) was inert — the stub ignores the layout.
+- The "DeepGEMM FP8 expert cache built" log is a SEPARATE always-compiled weight-pack path, so it fired even with
+  the stub — which is exactly what made it look like deepgemm was engaged.
+- b335's original "unspecified launch failure" was a build that DID set the env (real deepgemm) — a genuinely
+  different, real runtime bug. The agent's candidate-2 (route_capacity / SFA padding) analysis may still apply to
+  THAT real path; it was never refuted, only untested here because the stub masked it.
+
+**Fix to even TEST deepgemm: build with `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1` + `ARLE_DEEPGEMM_ROOT` +
+`ARLE_DEEPGEMM_LIBRARY_ROOT`** (the `scripts/dsv4_toolchain.sh` build mode sets these; a plain
+`cargo build --features cuda,nccl` does NOT). Rebuilt with the env; real-deepgemm test pending. The candidate-2
+padding fix is the next thing to validate once the real kernel runs.
+
+### Rule
+- **A `NOT_SUPPORTED` / "operation not supported" from a vendored, build-flag-gated bridge is "the stub is linked"
+  until proven otherwise.** Check the `#ifdef`/build.rs feature gate and confirm the real TU compiled (grep the
+  binary / the build log for the real symbol) BEFORE theorizing about kernel internals. Hours of TMA/cluster/SFA
+  analysis evaporated against one missing build env var.
 
 ## Refs
 
