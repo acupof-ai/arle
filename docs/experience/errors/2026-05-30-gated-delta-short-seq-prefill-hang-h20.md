@@ -1,4 +1,4 @@
-# Gated-delta-rule short-sequence prefill HANGS on H20 (seq_len < chunk span)
+# Gated-delta-rule short-sequence prefill HANGS on H20 (seq_len ≤ 32, chunkwise) — RESOLVED `e2246de1`
 
 ## Context
 
@@ -25,32 +25,64 @@ for the ≥40-token request (coherent output). Decode (single-step recurrent,
 seq_len=1) also works. The failure is specific to the **chunkwise prefill path**
 at small seq_len.
 
-## Root Cause (HYPOTHESIS — not yet evidence-confirmed)
+## Root Cause (CONFIRMED — runtime A/B, 2026-05-30)
 
-`ops::gated_delta_rule_prefill_chunkwise_batch_into` (or its preceding
-`conv1d_prefill_packed_batch_into`) has a partial-chunk-only edge case that does
-not terminate when `seq_len < chunk_size` (chunk span ≈32: 40 tokens works, 11
-does not). Candidates, in order:
-1. A TileLang gated-delta chunk kernel whose grid/loop is derived from
-   `seq_len / chunk_size` (→ 0 full chunks for short seq) and spins or waits on
-   an output a 0-chunk launch never produces.
-2. The sm_90a recompile of the gated-delta cubin (the TVM target is still plain
-   `sm_90` while nvcc now compiles `sm_90a`) miscompiles the partial-chunk WGMMA
-   path. Weaker: arch mismatches are usually seq-length-independent, and the
-   long-seq path works — but the partial-chunk path is a distinct code path.
-3. `conv1d` causal prefill with `linear_conv_kernel_dim=4` on `seq_len < 4`
-   (rules out 11-token, which still hangs — so not the sole cause).
+The gated-delta prefill dispatch routes `seq_len <= 32` into the **chunkwise
+TileLang pipeline** and `seq_len > 32` into the native, WGMMA-free **recurrent**
+kernel — verified at `csrc/misc/gdr_prefill_batch.cu:137` (`if (seq_len > 32)
+return gated_delta_rule_prefill_recurrent_cuda(...)`) and mirrored at
+`infer/src/ops/recurrent.rs:686`. The chunkwise stages emit ten
+`T.gemm(policy=GemmWarpPolicy.FullRow)` WGMMA calls
+(`tools/tilelang/gated_delta_rule.py`). This maps 1:1 to every observation:
+decode (seq_len=1, native fused) OK / `>32` (recurrent) OK / `<=32` (chunkwise)
+HANG.
 
-License-or-kill: confirm by (a) re-probing the exact stuck kernel name with
-`compute-sanitizer --tool synccheck` or finer probes inside the gated-delta op,
-and (b) testing whether making the TileLang TVM target `sm_90a` (consistent with
-the nvcc gencode) changes the behavior — that isolates hypothesis 2.
+The culprit is the **chunkwise `FullRow`-WGMMA kernels themselves**, not the arch
+flag and not the loader/metadata. Two independent pieces of evidence kill the
+arch-split hypothesis (candidate 2 below):
 
-## Fix
+- The full-attn kernel `batch_prefill_paged_hd256.py` **also** uses
+  `GemmWarpPolicy.FullRow` WGMMA and runs **correctly on sm_90** (the MoE e2e).
+  So `FullRow`-WGMMA works on sm_90 under the existing TVM-`sm_90` /
+  nvcc-`sm_90a` split — the split does not universally break `FullRow`.
+- A controlled A/B (below) reproduces the hang with **freshly-regenerated
+  `sm_90a` cubins** (clean `8cd6c252` source + `gen_tilelang_aot.py` sm_90a fix +
+  forced `tilelang_aot` regen), ruling out cubin staleness.
 
-OPEN. Workaround for validation: use prompts ≥40 tokens. The MoE e2e validation
-stands (real-model coherent generation). A `guidellm` perf sweep is blocked until
-this is fixed (default profiles use short prompts).
+The fault is therefore a genuine TileLang **`FullRow` short-tile codegen bug** in
+the gated-delta chunk kernels (the `solve_tril` / partial-chunk path at
+`seq_len <= 32`), the same class as
+[`errors/2026-05-27-tilelang-0110-fullrow-warp23-nan-sm80.md`](2026-05-27-tilelang-0110-fullrow-warp23-nan-sm80.md).
+Candidates KILLED: (1) `num_chunks`/0-block edge — `num_chunks=1` for seq 2, 11
+*and* 40, so it cannot discriminate; (2) arch split — see above; (3) `conv1d`
+sub-kernel-dim — 11>4 still hangs and conv1d is shared by the working `>32` path.
+
+## Fix (RESOLVED — `e2246de1`)
+
+Env-gate `ARLE_GDR_CHUNKWISE_PREFILL`, **default OFF → route every `seq_len`
+through the proven WGMMA-free recurrent kernel**. Gated in both the packed-batch
+C path (`gdr_prefill_batch.cu` `gdr_chunkwise_prefill_enabled()`) and the
+single-sequence Rust path (`recurrent.rs`), so the two paths agree (no
+half-state). Chunkwise stays reachable via `ARLE_GDR_CHUNKWISE_PREFILL=1` on
+arches where it is validated — which doubles as the root-cause A/B probe.
+
+Runtime A/B on one H20 (sm_90), `--disable-cuda-graph`, num_slots=1, BF16,
+freshly rebuilt from `8cd6c252` + the fix:
+
+| `ARLE_GDR_CHUNKWISE_PREFILL` | path | 13-token prompt | GPU |
+|---|---|---|---|
+| OFF (default) | recurrent | **returns** (e2e essay prompt → coherent) | normal |
+| `1` | chunkwise | **NO RESPONSE / HANG (50 s timeout)** | 100% util, wedged |
+
+Fix verification sweep (flag OFF): `prompt_tokens ∈ {1, 13, 16, 20}` (all `<=32`,
+all previously hung) → **all return, no hang**; the 20-token narrative prompt
+emits coherent AI-history text via the recurrent path, which also re-validates
+the Qwen3.6 MoE e2e from clean source. (Looping/short outputs on instruction-style
+prompts under greedy decode are base-model artifacts, not a prefill-state bug.)
+
+Deferred: restoring the chunkwise short-seq path on sm_90 needs the upstream
+TileLang `FullRow` codegen bug fixed; tracked as a perf follow-up, not a
+correctness blocker.
 
 ## Rule
 
