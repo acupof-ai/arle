@@ -103,6 +103,34 @@ chunks × 2 = 172 host syncs serialize the forward (the deferred event-based
 `stream_wait` would remove this); (b) the expert GEMM (native backend) is still heavy at
 16384-token chunks, and deepgemm (faster FP8 grouped GEMM) is JIT-blocked on this pod.
 
+## Update 2026-05-30 (round 2) — native-deepep is SLOWER for prefill; event-based combine correct but not the lever
+
+Acted on the profile ("MoE all-reduce dominates → native-deepep removes it") and it did
+NOT pan out for prefill:
+
+- **Event-based `stream_wait` for combine (941c7d6c)** — replaced the per-layer host
+  `ctx.stream.synchronize()` (f30043af) before/after combine with DeepEP's official
+  on-device `stream_wait(comm,compute)` pattern (the combine receives `compute_stream`).
+  CORRECT (validated: native-deepep short decode still coherent — "Paris"/"406"/primes,
+  8 ranks, 0 IMA) and it removes a real CPU block. But it did NOT make prefill fast.
+- **native-deepep is SLOWER than allreduce for PREFILL.** A ~16.5K native-deepep prefill
+  still times out at 285 s, where a 15.5K allreduce prefill completed (≤285 s). So the
+  +46% native-deepep win — measured at DECODE (1 token) — does NOT transfer to prefill:
+  at 16384-token chunks the dispatch/combine all-to-all + the per-layer `num_recv`
+  host-poll (the recv count sizes the expert compute, so it is an inherent CPU↔GPU sync
+  that event-based streams cannot remove) cost MORE than the single NCCL all-reduce.
+- So the earlier "~130 tok/s after native-deepep" projection was WRONG. native-deepep is
+  not the prefill speed lever.
+
+**Revised conclusion: >16K prefill is ~50–80 tok/s on BOTH backends, MoE-compute +
+serialization bound.** Making it fast (>200 tok/s, TTFT <60 s for 24K) needs a major
+effort that is NOT incremental and is partly pod-toolchain-blocked: (a) faster expert
+GEMM — deepgemm FP8 grouped GEMM is the lever but JIT-blocked on the CUDA-12.2 pod;
+(b) removing the per-layer `num_recv` host-poll (device-side capacity sizing) so prefill
+can pipeline; (c) the all-reduce/GEMM kernels themselves. The event-based combine
+(941c7d6c) is kept — it is correct and de-serializes the (production) decode combine —
+but it is not the prefill fix.
+
 ## Status: >24K prefill is FUNCTIONALLY unblocked, PERF-bound on the MoE
 
 cap-lift + chunked-prefill fix + OOM fix make >24K run correctly (no crash, no OOM,
