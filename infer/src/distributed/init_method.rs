@@ -33,9 +33,30 @@ use anyhow::{Context, Result, bail};
 pub const UNIQUE_ID_BYTES: usize = 128;
 
 const BARRIER_ACK: u8 = 0xAA;
-const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const CLIENT_RETRY_ATTEMPTS: u32 = 10;
+
+/// Per-socket read/write/accept/connect deadline for the bootstrap rendezvous.
+/// Default 30 s; override with `ARLE_RENDEZVOUS_TIMEOUT_SECS` (e.g. 600 when
+/// running under compute-sanitizer / memcheck, which slows the multi-proc NCCL
+/// rendezvous far past 30 s and otherwise trips "accept rank N timed out").
+pub fn socket_timeout() -> Duration {
+    let secs = std::env::var("ARLE_RENDEZVOUS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(30);
+    Duration::from_secs(secs)
+}
+
+/// Bootstrap client connect-retry count. Scales with the timeout override so a
+/// memcheck run (slow rank-0 startup) gets proportionally more attempts.
+fn client_retry_attempts() -> u32 {
+    std::env::var("ARLE_RENDEZVOUS_RETRY_ATTEMPTS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(10)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnvRendezvousConfig {
@@ -162,10 +183,10 @@ impl RendezvousServer {
     }
 
     /// Block until N-1 clients connect, then broadcast `unique_id` and wait
-    /// for a barrier ack from each. Uses [`SOCKET_TIMEOUT`] as the deadline
+    /// for a barrier ack from each. Uses [`socket_timeout`] as the deadline
     /// for both accept and the post-accept read/write phases.
     pub fn rendezvous(&mut self, unique_id: &[u8; UNIQUE_ID_BYTES]) -> Result<()> {
-        self.rendezvous_with_timeout(unique_id, SOCKET_TIMEOUT)
+        self.rendezvous_with_timeout(unique_id, socket_timeout())
     }
 
     /// `rendezvous` with an explicit deadline. F1 (NCCL init) and tests use
@@ -277,22 +298,22 @@ impl RendezvousClient {
 
         let mut last_err: Option<std::io::Error> = None;
         let started = Instant::now();
-        for attempt in 0..CLIENT_RETRY_ATTEMPTS {
+        for attempt in 0..client_retry_attempts() {
             for sa in &addrs {
-                match TcpStream::connect_timeout(sa, SOCKET_TIMEOUT) {
+                match TcpStream::connect_timeout(sa, socket_timeout()) {
                     Ok(stream) => {
                         stream
-                            .set_read_timeout(Some(SOCKET_TIMEOUT))
+                            .set_read_timeout(Some(socket_timeout()))
                             .context("rendezvous client: set_read_timeout failed")?;
                         stream
-                            .set_write_timeout(Some(SOCKET_TIMEOUT))
+                            .set_write_timeout(Some(socket_timeout()))
                             .context("rendezvous client: set_write_timeout failed")?;
                         return Ok(Self { stream });
                     }
                     Err(err) => last_err = Some(err),
                 }
             }
-            if attempt + 1 < CLIENT_RETRY_ATTEMPTS {
+            if attempt + 1 < client_retry_attempts() {
                 thread::sleep(CLIENT_RETRY_INTERVAL);
             }
         }
@@ -300,7 +321,9 @@ impl RendezvousClient {
         let err = last_err.expect("retry loop must record at least one error");
         Err(anyhow::Error::new(err).context(format!(
             "rendezvous client: failed to connect to {:?} after {} attempts ({:.1?} elapsed)",
-            addrs, CLIENT_RETRY_ATTEMPTS, waited
+            addrs,
+            client_retry_attempts(),
+            waited
         )))
     }
 
@@ -505,10 +528,10 @@ mod tests {
 
         let bad_client = thread::spawn(move || -> Result<()> {
             let addr = addr_rx.recv().expect("recv local_addr");
-            let mut stream =
-                TcpStream::connect_timeout(&addr, SOCKET_TIMEOUT).context("bad client connect")?;
-            stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
-            stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+            let mut stream = TcpStream::connect_timeout(&addr, socket_timeout())
+                .context("bad client connect")?;
+            stream.set_read_timeout(Some(socket_timeout()))?;
+            stream.set_write_timeout(Some(socket_timeout()))?;
             let mut buf = [0u8; UNIQUE_ID_BYTES];
             stream.read_exact(&mut buf).context("bad client read")?;
             stream.write_all(&[0x00]).context("bad client write")?;
