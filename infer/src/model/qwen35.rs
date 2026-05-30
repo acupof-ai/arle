@@ -14,6 +14,8 @@ mod forward;
 #[cfg(feature = "cuda")]
 #[path = "qwen35/lora.rs"]
 pub mod lora;
+#[path = "qwen35/moe.rs"]
+pub(crate) mod moe;
 #[path = "qwen35/prefill.rs"]
 mod prefill;
 #[path = "qwen35/prefill_buffers.rs"]

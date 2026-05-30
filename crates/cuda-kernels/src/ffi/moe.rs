@@ -77,6 +77,27 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Qwen3.6 `norm_topk_prob` in-place renorm over dsv4_route weights:
+    /// `weights[t*topk + k] /= sum_k weights[t*topk + k]`. Skip the launch
+    /// entirely when `norm_topk_prob` is false (raw softmax probs are used).
+    pub fn qwen36_renorm_topk_weights_cuda(
+        weights: *mut f32,
+        num_tokens: i32,
+        topk: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Qwen3.6 shared-expert scalar sigmoid gate + accumulate into routed:
+    /// `routed[t,:] += sigmoid(gate_logit[t]) * shared_y[t,:]`.
+    pub fn qwen36_add_shared_expert_gated_cuda(
+        routed: *mut Half,
+        shared_y: *const Half,
+        gate_logit: *const Half,
+        num_tokens: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_count_local_experts_cuda(
         indices: *const i32,
         counts: *mut i32,

@@ -107,10 +107,15 @@ impl Qwen35Model {
             &layer0.post_attention_layernorm,
             c.rms_norm_eps,
         )?;
-        let gate_out = ops::gemm(&self.ctx, &layer0.mlp.gate_proj, &post_attention_norm)?;
-        let up_out = ops::gemm(&self.ctx, &layer0.mlp.up_proj, &post_attention_norm)?;
-        let act_out = ops::silu_mul_batch(&self.ctx, &gate_out, &up_out)?;
-        let mut mlp_out = ops::gemm(&self.ctx, &layer0.mlp.down_proj, &act_out)?;
+        let mut mlp_out = if let Some(moe) = layer0.mlp.as_moe() {
+            moe.forward(&self.ctx, &self.config, &post_attention_norm)?
+        } else {
+            let dense = layer0.mlp.dense();
+            let gate_out = ops::gemm(&self.ctx, &dense.gate_proj, &post_attention_norm)?;
+            let up_out = ops::gemm(&self.ctx, &dense.up_proj, &post_attention_norm)?;
+            let act_out = ops::silu_mul_batch(&self.ctx, &gate_out, &up_out)?;
+            ops::gemm(&self.ctx, &dense.down_proj, &act_out)?
+        };
         self.layer_communicator
             .post_mlp_all_reduce_hidden_states(&mut mlp_out)?;
         let layer0_ffn = copy_hidden(&self.ctx, &mlp_out, "parity_layer0_ffn")?;

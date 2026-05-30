@@ -119,6 +119,20 @@ fn find_tensor<'a>(
     }
 }
 
+/// Whether a tensor with the given name exists in any shard. Used to detect
+/// which weight-naming convention a checkpoint follows (e.g. per-expert
+/// `experts.{i}.*` vs stacked `switch_mlp.*`).
+pub(crate) fn tensor_exists(
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> bool {
+    if weight_map.contains_key(name) {
+        return true;
+    }
+    shards.iter().any(|shard| shard.tensor(name).is_ok())
+}
+
 pub(crate) fn load_tensor_1d(
     ctx: &DeviceContext,
     shards: &[SafeTensors],

@@ -84,7 +84,8 @@ pub(super) struct TransformerBlock35 {
     pub(super) input_layernorm: DeviceVec,
     pub(super) attn: LayerKind,
     pub(super) post_attention_layernorm: DeviceVec,
-    pub(super) mlp: common::MLP,
+    /// Dense SwiGLU MLP (classic Qwen3.5) or Qwen3.6 sparse MoE block.
+    pub(super) mlp: super::moe::Mlp,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -496,16 +497,29 @@ impl Qwen35Model {
                     &weight_map,
                     &format!("{}.post_attention_layernorm.weight", prefix),
                 )?,
-                mlp: if runtime.tp.is_single() {
-                    MLP::load_with_quant_config(
+                mlp: if config.is_moe_layer(i) {
+                    // Qwen3.6 sparse MoE block (single-GPU grouped path).
+                    anyhow::ensure!(
+                        runtime.tp.is_single(),
+                        "Qwen3.6 MoE layer {i} requires single-GPU (TP not yet supported for MoE)"
+                    );
+                    super::moe::Mlp::Moe(super::moe::load_moe_mlp(
+                        &ctx,
+                        &shards,
+                        &weight_map,
+                        &prefix,
+                        &config,
+                    )?)
+                } else if runtime.tp.is_single() {
+                    super::moe::Mlp::Dense(MLP::load_with_quant_config(
                         &ctx,
                         &shards,
                         &weight_map,
                         &format!("{}.mlp", prefix),
                         quant,
-                    )?
+                    )?)
                 } else {
-                    MLP {
+                    super::moe::Mlp::Dense(MLP {
                         gate_proj: load_tp_column(
                             &format!("{}.mlp.gate_proj.weight", prefix),
                             config.intermediate_size,
@@ -518,7 +532,7 @@ impl Qwen35Model {
                             &format!("{}.mlp.down_proj.weight", prefix),
                             config.intermediate_size,
                         )?,
-                    }
+                    })
                 },
             };
 
@@ -589,9 +603,7 @@ impl Qwen35Model {
 
     pub(super) fn uses_marlin_w4a8(&self) -> bool {
         self.layers.iter().any(|layer| {
-            layer.mlp.gate_proj.is_marlin_w4a8()
-                || layer.mlp.up_proj.is_marlin_w4a8()
-                || layer.mlp.down_proj.is_marlin_w4a8()
+            layer.mlp.is_marlin_w4a8()
                 || match &layer.attn {
                     LayerKind::FullAttention(attn) => {
                         attn.q_proj.is_marlin_w4a8()
@@ -638,24 +650,26 @@ impl Qwen35Model {
                 c.hidden_size,
             )?;
 
-            assert_shape(
-                &format!("{}.mlp.gate_proj", prefix),
-                &layer.mlp.gate_proj,
-                c.intermediate_size,
-                c.hidden_size,
-            )?;
-            assert_shape(
-                &format!("{}.mlp.up_proj", prefix),
-                &layer.mlp.up_proj,
-                c.intermediate_size,
-                c.hidden_size,
-            )?;
-            assert_shape(
-                &format!("{}.mlp.down_proj", prefix),
-                &layer.mlp.down_proj,
-                c.hidden_size,
-                c.intermediate_size,
-            )?;
+            if let super::moe::Mlp::Dense(mlp) = &layer.mlp {
+                assert_shape(
+                    &format!("{}.mlp.gate_proj", prefix),
+                    &mlp.gate_proj,
+                    c.intermediate_size,
+                    c.hidden_size,
+                )?;
+                assert_shape(
+                    &format!("{}.mlp.up_proj", prefix),
+                    &mlp.up_proj,
+                    c.intermediate_size,
+                    c.hidden_size,
+                )?;
+                assert_shape(
+                    &format!("{}.mlp.down_proj", prefix),
+                    &mlp.down_proj,
+                    c.hidden_size,
+                    c.intermediate_size,
+                )?;
+            }
 
             match &layer.attn {
                 LayerKind::FullAttention(attn) => {
@@ -916,16 +930,21 @@ impl Qwen35Model {
                     &format!("{p}.post_attention_layernorm.weight"),
                 )?,
                 mlp: {
+                    // GGUF Qwen3.5 path is dense-only (MoE GGUF not yet wired).
+                    anyhow::ensure!(
+                        !config.is_moe_layer(i),
+                        "Qwen3.6 MoE GGUF loading is not supported; use safetensors"
+                    );
                     let gate =
                         load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.gate_proj.weight"))?;
                     let up = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.up_proj.weight"))?;
                     let down =
                         load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.down_proj.weight"))?;
-                    common::MLP {
+                    super::moe::Mlp::Dense(common::MLP {
                         gate_proj: gate,
                         up_proj: up,
                         down_proj: down,
-                    }
+                    })
                 },
             });
 
@@ -1199,9 +1218,14 @@ impl Qwen35Model {
             let (post_attention_layernorm, b) =
                 layer.post_attention_layernorm.offload_to_host(&ctx)?;
             freed += a + b;
-            let mlp_gate = layer.mlp.gate_proj.offload_to_host(&ctx)?;
-            let mlp_up = layer.mlp.up_proj.offload_to_host(&ctx)?;
-            let mlp_down = layer.mlp.down_proj.offload_to_host(&ctx)?;
+            // OPD time-share offload targets the dense Qwen3.5 OPD model; MoE
+            // weight offload is not part of the OPD path.
+            let super::moe::Mlp::Dense(dense_mlp) = &mut layer.mlp else {
+                anyhow::bail!("Qwen3.6 MoE weight offload is not supported (OPD is dense-only)");
+            };
+            let mlp_gate = dense_mlp.gate_proj.offload_to_host(&ctx)?;
+            let mlp_up = dense_mlp.up_proj.offload_to_host(&ctx)?;
+            let mlp_down = dense_mlp.down_proj.offload_to_host(&ctx)?;
             freed += mlp_gate.freed_bytes() + mlp_up.freed_bytes() + mlp_down.freed_bytes();
 
             let attn = match &mut layer.attn {
@@ -1337,13 +1361,14 @@ impl Qwen35Model {
             layer
                 .post_attention_layernorm
                 .reload_from_host(&ctx, &block.post_attention_layernorm)?;
-            layer
-                .mlp
+            let super::moe::Mlp::Dense(dense_mlp) = &mut layer.mlp else {
+                anyhow::bail!("Qwen3.6 MoE weight reload is not supported (OPD is dense-only)");
+            };
+            dense_mlp
                 .gate_proj
                 .reload_from_host(&ctx, &block.mlp_gate)?;
-            layer.mlp.up_proj.reload_from_host(&ctx, &block.mlp_up)?;
-            layer
-                .mlp
+            dense_mlp.up_proj.reload_from_host(&ctx, &block.mlp_up)?;
+            dense_mlp
                 .down_proj
                 .reload_from_host(&ctx, &block.mlp_down)?;
 
