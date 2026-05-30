@@ -122,3 +122,46 @@ NCCL TCP-store rendezvous past its hardcoded 30s timeout
    (6,256) consistent dispatch↔combine; num_sms=20/num_channels=10 consistent
    dispatch↔combine↔scratch; kNvlBytes=512MB generous; dispatch passes, combine
    OOBs. The OOB is a runtime value/buffer issue only compute-sanitizer will pinpoint.
+
+## Update 2026-05-30 (round 2) — Heisenbug: uninitialized-read, but not fully pinpointed
+
+Breakthrough diagnosis + partial fixes (all committed), combine STILL faults:
+
+- **Heisenbug confirmed**: under `compute-sanitizer --tool memcheck` (which
+  zero-fills every allocation) the native-deepep combine WORKS (HTTP 200); WITHOUT
+  it, IMA. So the root cause is an UNINITIALIZED-MEMORY READ (memcheck's zero-fill
+  masks it). [Needed `ARLE_RENDEZVOUS_TIMEOUT_SECS` (new env, commit) for memcheck
+  to boot the 8-proc NCCL rendezvous past 30s.]
+- **Fixes applied** (defensive, correctness-safe, committed): zero-init the
+  native-deepep dispatch-metadata scratch (1e578148: send_head / rank_prefix /
+  recv_channel_prefix / channel_prefix_matrix / recv_src_idx), the DeepEP NVL IPC
+  buffer + workspace (cfce577f: cudaMemset local_buf 512MB + workspace), and ALL
+  remaining state.rs scratch (d8776131: alloc_traced→alloc_zeros_traced).
+- **Symptom progression**: IMA ("illegal memory access") → after metadata zeroing
+  → "unspecified launch failure" → after NVL + all-scratch zeroing → still
+  "unspecified launch failure". So zeroing every REACHABLE buffer is NOT enough.
+- **`--tool initcheck`** (detects uninit reads WITHOUT zero-masking) flagged uninit
+  reads only in `cublasLt::splitKreduce_kernel` (a cuBLAS split-K GEMM workspace —
+  the expert GEMM via cublasLtMatmul), a known mostly-benign cuBLAS initcheck
+  false-positive, NOT the combine. The combine request TIMED OUT (504) under
+  initcheck, so it didn't reproduce there either.
+
+**Conclusion**: the remaining uninitialized read is in memory NOT reachable by the
+Rust/wrapper zeroing — most likely a DeepEP-internal allocation, OR an IPC-peer
+buffer ordering issue (each rank zeros its own local_buf at create, but the combine
+may read a peer's buffer region the peer's dispatch never wrote), OR a true race
+that memcheck's serialization masks. Tools available can't cleanly pinpoint it
+(memcheck masks it; initcheck times out + flags only benign cuBLAS).
+
+**Next (fresh focused effort):**
+1. `--tool racecheck` to rule in/out a race (the other thing memcheck serializes away).
+2. Instrument the DeepEP intranode combine kernel directly (add bounds asserts /
+   printf on the index it derives from send_head/recv_channel_prefix at the faulting
+   thread) — source is at /data01/build/DeepEP/csrc/kernels/legacy/intranode.cu:706.
+3. Check the IPC-peer-buffer write/read ordering: does the combine read a region of
+   a PEER's local_buf that that peer's dispatch leaves unwritten? Zero is applied
+   per-rank-local; a cross-rank unwritten region is the prime remaining suspect.
+
+The defensive zero-init commits are kept (uninit reads are real bugs regardless);
+native-deepep remains non-functional at HEAD until the cross-rank/DeepEP-internal
+uninit (or race) is found.
