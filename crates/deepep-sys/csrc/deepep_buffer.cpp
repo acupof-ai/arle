@@ -436,6 +436,23 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_combine(
     auto *d_combined_topk_w =
         reinterpret_cast<float *>(p->d_combined_topk_w);
 
+    // Event-based cross-stream ordering (mirrors DeepEP's official
+    // stream_wait(comm_stream, compute_stream)). The combine reads d_x (the
+    // expert output) produced on the caller's COMPUTE stream, and writes
+    // d_combined_x consumed there. Make the comm stream (self->stream) wait for
+    // the compute stream ON-DEVICE rather than host-syncing the caller — so the
+    // CPU isn't blocked for the ~ms expert-GEMM wait every layer. (Falls back to
+    // a host sync at the end when compute_stream == 0.)
+    cudaStream_t compute_stream =
+        reinterpret_cast<cudaStream_t>(p->compute_stream);
+    if (compute_stream) {
+        cudaEvent_t ev_in;
+        cudaEventCreateWithFlags(&ev_in, cudaEventDisableTiming);
+        cudaEventRecord(ev_in, compute_stream);
+        cudaStreamWaitEvent(self->stream, ev_in, 0);
+        cudaEventDestroy(ev_in);
+    }
+
     deep_ep_intranode_ns::cached_notify_combine(
         self->buffer_ptrs_gpu, d_send_head, num_channels,
         /*num_recv_tokens=*/static_cast<int>(p->num_output_tokens),
@@ -458,7 +475,16 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_combine(
         static_cast<int>(p->num_sms),
         static_cast<int>(p->nvl_chunked_send),
         static_cast<int>(p->nvl_chunked_recv));
-    CK(cudaStreamSynchronize(self->stream), "sync after combine");
+    if (compute_stream) {
+        // Compute stream waits for the combine output ON-DEVICE; no host block.
+        cudaEvent_t ev_out;
+        cudaEventCreateWithFlags(&ev_out, cudaEventDisableTiming);
+        cudaEventRecord(ev_out, self->stream);
+        cudaStreamWaitEvent(compute_stream, ev_out, 0);
+        cudaEventDestroy(ev_out);
+    } else {
+        CK(cudaStreamSynchronize(self->stream), "sync after combine");
+    }
     return 0;
 }
 
