@@ -146,8 +146,26 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_create(
         delete self;
         return -2;
     }
+    // Zero the NVL IPC buffer. cudaMalloc leaves it uninitialized; the DeepEP
+    // dispatch/combine kernels read header/metadata regions of this buffer that
+    // are not fully written on the first pass, so an uninitialized read causes a
+    // combine OOB / launch failure. compute-sanitizer zero-fills allocations,
+    // which is exactly why the combine "worked" under memcheck — replicate it.
+    if ((err = cudaMemset(self->local_buf, 0, kTotalBytes)) != cudaSuccess) {
+        record_cuda_error("cudaMemset local_buf", err);
+        cudaFree(self->local_buf);
+        delete self;
+        return -2;
+    }
     if ((err = cudaMalloc(&self->workspace, NUM_WORKSPACE_BYTES)) != cudaSuccess) {
         record_cuda_error("cudaMalloc workspace", err);
+        cudaFree(self->local_buf);
+        delete self;
+        return -2;
+    }
+    if ((err = cudaMemset(self->workspace, 0, NUM_WORKSPACE_BYTES)) != cudaSuccess) {
+        record_cuda_error("cudaMemset workspace", err);
+        cudaFree(self->workspace);
         cudaFree(self->local_buf);
         delete self;
         return -2;
