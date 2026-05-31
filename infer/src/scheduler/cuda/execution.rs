@@ -1102,18 +1102,203 @@ impl<M: ModelForward> Scheduler<M> {
             );
         }
     }
+
+    /// PURE (read-only) classification of which phase a scheduler tick is in,
+    /// derived from the same pending-state reads `step()` branches on.
+    ///
+    /// This is a `&self` method (no `&mut self`, no device handle, no readback
+    /// call, no I/O) that performs only side-effect-free reads on the
+    /// scheduler's own fields and the pure `&self` predicate
+    /// [`deferred_decode_requires_readback_before_launch`]. It mirrors the
+    /// `oplib::linear::plan` purity discipline: "given this pending-state,
+    /// which phase runs?" is answerable on CPU with no GPU.
+    ///
+    /// **It names the entry of a phase, not its exit.** The readback methods
+    /// (`step_prefill_readback` / `step_decode_readback`) are `&mut self`,
+    /// perform the actual device readback, and own whether the phase
+    /// *completes* — that ready/not-ready result is the return value of the
+    /// side-effecting call and is computable nowhere else. `tick_phase` cannot
+    /// and does not call them; it only classifies which of `step()`'s three
+    /// pending-state branches a tick would enter at the moment of the read.
+    ///
+    /// The branch order mirrors `step()` exactly:
+    /// 1. `pending_prefill.is_some()` is checked first (the
+    ///    `step()` prefill-readback guard) → [`TickPhase::ReadbackPrefill`].
+    /// 2. else `pending_decode.is_some()
+    ///    || deferred_decode_requires_readback_before_launch()` (the `step()`
+    ///    decode-readback launch guard) → [`TickPhase::ReadbackDecode`].
+    /// 3. else → [`TickPhase::PlanAndLaunch`].
+    ///
+    /// The idle early-exit (`num == 0 && waiting.is_empty()
+    /// && !has_pending_gpu_work()`) is a pre-classification guard in `step()`
+    /// and is intentionally **not** a `TickPhase` variant — it is checked
+    /// before any phase classification and is not one of `step()`'s three
+    /// pending-state branches.
+    ///
+    /// Step 1 (this commit) is a pure addition: nothing on the hot path calls
+    /// `tick_phase` yet, so runtime behaviour is bit-identical. Step 2 will
+    /// rewire `step()` to `match` over it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn tick_phase(&self) -> TickPhase {
+        classify_tick_phase(
+            self.pending_prefill.is_some(),
+            self.pending_decode.is_some(),
+            self.deferred_decode_requires_readback_before_launch(),
+        )
+    }
+}
+
+/// The three states of one scheduler tick (`step()`), named.
+///
+/// `step()` (`execution.rs`) is already a state machine — three `Option`
+/// fields (`pending_prefill`, `pending_decode`, `deferred_decode_emit`) plus
+/// early-returns encode three branches. This enum names them so the
+/// readback→launch cycle is legible and the "cleared before launch" invariant
+/// becomes a match-arm fact rather than a runtime `assert!`. See
+/// `docs/plans/control-plane-scheduler-phase.md`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TickPhase {
+    /// A prior prefill launch is in flight; this tick reads it back.
+    /// Entered when `pending_prefill.is_some()`.
+    ReadbackPrefill,
+    /// A prior decode launch (or a deferred decode emit that requires a
+    /// readback before the next launch) is in flight; this tick reads it back.
+    /// Entered when `pending_decode.is_some()
+    /// || deferred_decode_requires_readback_before_launch()` and no prefill
+    /// readback is pending.
+    ReadbackDecode,
+    /// No readback is outstanding: this tick plans and launches GPU work
+    /// (snapshot → build_candidate_plan → launch_gpu_command →
+    /// dispatch_decode_emits).
+    PlanAndLaunch,
+}
+
+/// PURE. Classify a tick from the three pending-state predicates `step()`
+/// reads, in `step()`'s exact branch order.
+///
+/// Inputs are the already-evaluated booleans (no `self`, no device, no I/O),
+/// so this is GPU-free and CPU-testable — the killer property the unit-test
+/// sweep below exercises. [`Scheduler::tick_phase`] is the thin `&self`
+/// wrapper that computes these three booleans off the scheduler's own fields.
+///
+/// - `pending_prefill_some` = `self.pending_prefill.is_some()`
+///   (the `step()` prefill-readback guard, checked first).
+/// - `pending_decode_some` = `self.pending_decode.is_some()`.
+/// - `deferred_requires_readback` =
+///   `self.deferred_decode_requires_readback_before_launch()`.
+///
+/// `ReadbackPrefill` takes precedence (prefill is checked first in `step()`
+/// and early-returns), then `ReadbackDecode`, then `PlanAndLaunch`.
+#[must_use]
+pub(super) fn classify_tick_phase(
+    pending_prefill_some: bool,
+    pending_decode_some: bool,
+    deferred_requires_readback: bool,
+) -> TickPhase {
+    if pending_prefill_some {
+        TickPhase::ReadbackPrefill
+    } else if pending_decode_some || deferred_requires_readback {
+        TickPhase::ReadbackDecode
+    } else {
+        TickPhase::PlanAndLaunch
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         CandidatePlan, GpuCommand, PrefillBudget, PrefillCandidate, PrefillCandidateScore,
-        PrefillReservation, PreparedHostMetadata, ScoredPrefillCandidate, StepPlan,
-        cap_prefill_candidates_by_tokens, coalesce_tiny_prefill_tail,
+        PrefillReservation, PreparedHostMetadata, ScoredPrefillCandidate, StepPlan, TickPhase,
+        cap_prefill_candidates_by_tokens, classify_tick_phase, coalesce_tiny_prefill_tail,
         reserve_decode_headroom_for_slots, route_spec_plan, score_prefill_candidates,
         select_prefill_candidates,
     };
     use crate::scheduler::cuda::budget::{PageBudget, PageGrowth, StepTokenBudget};
+
+    /// Reference oracle for [`classify_tick_phase`], written directly against
+    /// `step()`'s control flow (`execution.rs`): prefill readback is the first
+    /// guard (`pending_prefill.is_some()`) and early-returns, so it dominates;
+    /// then the decode-readback launch guard
+    /// (`pending_decode.is_some() || deferred_decode_requires_readback_before_launch()`);
+    /// otherwise the tick falls through to plan-and-launch. If `classify_tick_phase`
+    /// ever diverges from `step()`'s branch order this oracle catches it.
+    fn step_branch_oracle(
+        pending_prefill_some: bool,
+        pending_decode_some: bool,
+        deferred_requires_readback: bool,
+    ) -> TickPhase {
+        // step():935 — prefill readback guard, checked first, early-returns.
+        if pending_prefill_some {
+            return TickPhase::ReadbackPrefill;
+        }
+        // step():968 — decode readback launch guard.
+        if pending_decode_some || deferred_requires_readback {
+            return TickPhase::ReadbackDecode;
+        }
+        // step():990+ — plan → launch fall-through.
+        TickPhase::PlanAndLaunch
+    }
+
+    /// The headline CPU property: over every combination of the three
+    /// pending-state predicates `step()` reads, `classify_tick_phase` returns
+    /// exactly what `step()`'s branch order would select. Pure, no GPU, runs
+    /// under the default / `no-cuda` feature set.
+    #[test]
+    fn classify_tick_phase_matches_step_branch_order_over_full_sweep() {
+        for &pending_prefill_some in &[false, true] {
+            for &pending_decode_some in &[false, true] {
+                for &deferred_requires_readback in &[false, true] {
+                    assert_eq!(
+                        classify_tick_phase(
+                            pending_prefill_some,
+                            pending_decode_some,
+                            deferred_requires_readback,
+                        ),
+                        step_branch_oracle(
+                            pending_prefill_some,
+                            pending_decode_some,
+                            deferred_requires_readback,
+                        ),
+                        "tick phase diverged for (prefill={pending_prefill_some}, \
+                         decode={pending_decode_some}, deferred={deferred_requires_readback})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Spot-check the documented-expected phase for the canonical states so a
+    /// regression in the oracle itself can't silently mask a classifier
+    /// regression.
+    #[test]
+    fn classify_tick_phase_documented_expected_for_canonical_states() {
+        // No pending work → plan-and-launch.
+        assert_eq!(
+            classify_tick_phase(false, false, false),
+            TickPhase::PlanAndLaunch
+        );
+        // Pending prefill alone → readback prefill.
+        assert_eq!(
+            classify_tick_phase(true, false, false),
+            TickPhase::ReadbackPrefill
+        );
+        // Pending decode alone → readback decode.
+        assert_eq!(
+            classify_tick_phase(false, true, false),
+            TickPhase::ReadbackDecode
+        );
+        // Deferred-decode-requires-readback alone → readback decode.
+        assert_eq!(
+            classify_tick_phase(false, false, true),
+            TickPhase::ReadbackDecode
+        );
+        // Prefill takes precedence over decode (step() checks prefill first
+        // and early-returns) — even when decode state is also set.
+        assert_eq!(
+            classify_tick_phase(true, true, true),
+            TickPhase::ReadbackPrefill
+        );
+    }
 
     fn collect_schedulable_indices(
         mut budget: PrefillBudget,
