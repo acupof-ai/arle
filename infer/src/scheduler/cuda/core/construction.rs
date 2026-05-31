@@ -333,11 +333,8 @@ impl<M: ModelForward> Scheduler<M> {
             );
             metrics.set_detokenizer_topology(1, 1);
         }
-        let (emit_tx, emit_events, emit_thread) = spawn_emit_worker(
-            tokenizer.clone(),
-            config.stream_interval,
-            worker_placement.clone(),
-        );
+        let (emit_tx, emit_events, emit_thread) =
+            spawn_emit_worker(tokenizer.clone(), config.stream_interval, worker_placement);
         let max_slots = config.max_slots;
         let max_waiting_requests = config.max_waiting_requests;
         let prefix_cache_keepalive_ticks = config.prefix_cache_keepalive_ticks;

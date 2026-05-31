@@ -65,7 +65,7 @@ impl ModelForward for DeepseekModel {
                 .alloc_zeros_traced(1)
                 .map_err(|e| anyhow::anyhow!("Alloc DeepSeek V4 sample_out failed: {e}"))?,
             reference_tokens: Vec::new(),
-            incremental: Default::default(),
+            incremental: super::state::DeepseekIncrementalState::default(),
         })
     }
 

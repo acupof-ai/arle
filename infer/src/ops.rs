@@ -641,6 +641,4 @@ pub(crate) use recurrent::{
     gated_delta_rule_prefill_chunkwise_batch_into, gdr_decode_batch_into,
 };
 #[cfg(feature = "cuda")]
-pub(crate) use sampling::{
-    argmax_batch_logprob_launch, argmax_batch_readback_into, gpu_sample_launch_raw,
-};
+pub(crate) use sampling::{argmax_batch_logprob_launch, gpu_sample_launch_raw};

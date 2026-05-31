@@ -1,8 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{
-    Arc, Barrier, Mutex,
-    atomic::{AtomicBool, AtomicU32, Ordering},
-};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -16,7 +13,7 @@ use infer::hf_hub;
 use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
-use infer::model::{GenerationState, KVCacheDtype, KVFormat, ModelForward};
+use infer::model::{KVCacheDtype, KVFormat};
 use infer::request_handle::{DistributedSchedulerGroup, NumaSchedulerRouter, NumaSchedulerWorker};
 use infer::runtime_notify::RuntimeNotifyGate;
 use infer::runtime_topology::{
@@ -30,7 +27,6 @@ use infer::scheduler::{
 use infer::server_engine::EnginePoolModelSpec;
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
 use log::info;
-use rand::{SeedableRng, rngs::StdRng};
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 const DEFAULT_SEQ_LEN: usize = 4096;
@@ -471,7 +467,7 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("worker rank {rank} produced no started scheduler"))?;
     let _relay_thread = if let Some(mut relay) = pre_boot_relay {
         info!("[arle-worker rank={rank}] starting relay receiver thread");
-        let handle = scheduler_handle.clone();
+        let handle = scheduler_handle;
         Some(std::thread::spawn(move || -> anyhow::Result<()> {
             use infer::multiproc_relay::RelayEnvelope;
             let mut count: usize = 0;
@@ -495,7 +491,7 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                                 }
                             })
                             .ok();
-                        let mut req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
+                        let req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
                             wire,
                             delta_tx,
                         );
@@ -581,7 +577,7 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
     } else {
         info!("[arle-worker rank={rank}] no ARLE_WORKER_PARENT_FD; sleeping forever");
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+            std::thread::sleep(std::time::Duration::from_hours(1));
         }
     }
     shutdown_started_workers(started);
@@ -1102,7 +1098,7 @@ impl Drop for WorkerChildren {
             .map(|(_, _, pipe)| std::mem::replace(pipe, dummy_file()))
             .collect();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        for (rank, child, _) in self.children.iter_mut() {
+        for (rank, child, _) in &mut self.children {
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {

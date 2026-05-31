@@ -210,7 +210,7 @@ impl Qwen35LoRA {
         let mut layers: Vec<LayerLoRA> = (0..num_layers).map(|_| LayerLoRA::default()).collect();
         let mut tensor_count = 0usize;
 
-        let mut build = |m: &StudentLoraMatrices, label: &str| -> Result<LoraAB> {
+        let build = |m: &StudentLoraMatrices, label: &str| -> Result<LoraAB> {
             ensure!(
                 m.rank == update.rank,
                 "{label}: matrix rank {} != update rank {}",
