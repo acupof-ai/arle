@@ -1209,15 +1209,15 @@ impl Qwen35Model {
             }
             None => None,
         };
-        let (norm, n) = self.norm.offload_to_host(&ctx)?;
-        freed += n;
+        let (norm, norm_n) = self.norm.offload_to_host(&ctx)?;
+        freed += norm_n;
 
         let mut blocks = Vec::with_capacity(self.layers.len());
-        for layer in self.layers.iter_mut() {
-            let (input_layernorm, a) = layer.input_layernorm.offload_to_host(&ctx)?;
-            let (post_attention_layernorm, b) =
+        for layer in &mut self.layers {
+            let (input_layernorm, in_ln_n) = layer.input_layernorm.offload_to_host(&ctx)?;
+            let (post_attention_layernorm, post_ln_n) =
                 layer.post_attention_layernorm.offload_to_host(&ctx)?;
-            freed += a + b;
+            freed += in_ln_n + post_ln_n;
             // OPD time-share offload targets the dense Qwen3.5 OPD model; MoE
             // weight offload is not part of the OPD path.
             let super::moe::Mlp::Dense(dense_mlp) = &mut layer.mlp else {
@@ -1256,8 +1256,8 @@ impl Qwen35Model {
                     let in_proj_z = attn.in_proj_z.offload_to_host(&ctx)?;
                     let in_proj_b = attn.in_proj_b.offload_to_host(&ctx)?;
                     let in_proj_a = attn.in_proj_a.offload_to_host(&ctx)?;
-                    let (conv1d_weight, c) = attn.conv1d_weight.offload_to_host(&ctx)?;
-                    let (dt_bias, d) = attn.dt_bias.offload_to_host(&ctx)?;
+                    let (conv1d_weight, conv_n) = attn.conv1d_weight.offload_to_host(&ctx)?;
+                    let (dt_bias, dt_n) = attn.dt_bias.offload_to_host(&ctx)?;
                     let (a_log, al) = offload_raw_slice(&ctx, &mut attn.a_log)?;
                     let (norm_weight, nw) = offload_raw_slice(&ctx, &mut attn.norm_weight)?;
                     let out_proj = attn.out_proj.offload_to_host(&ctx)?;
@@ -1266,8 +1266,8 @@ impl Qwen35Model {
                         + in_proj_b.freed_bytes()
                         + in_proj_a.freed_bytes()
                         + out_proj.freed_bytes()
-                        + c
-                        + d
+                        + conv_n
+                        + dt_n
                         + al
                         + nw;
                     OffloadedAttn::Linear {
@@ -1354,7 +1354,7 @@ impl Qwen35Model {
             blocks.len(),
             self.layers.len()
         );
-        for (layer, block) in self.layers.iter_mut().zip(blocks.into_iter()) {
+        for (layer, block) in self.layers.iter_mut().zip(blocks) {
             layer
                 .input_layernorm
                 .reload_from_host(&ctx, &block.input_layernorm)?;

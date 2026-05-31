@@ -20,8 +20,6 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 #[cfg(feature = "cuda")]
 use deepseek_spec::{DeepSeekV4Config, DeepSeekV4MoeRoutingKind};
 #[cfg(feature = "cuda")]
-use half::bf16;
-#[cfg(feature = "cuda")]
 use log::info;
 #[cfg(feature = "cuda")]
 use std::sync::OnceLock;
@@ -32,9 +30,7 @@ use std::time::Instant;
 use super::state::{
     DeepseekDsv4GroupedBlockFormat, DeepseekExpertRuntimeScratch,
     DeepseekGroupedExpertActiveScratch, DeepseekGroupedExpertRuntimeScratch,
-    DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_dispatch_payload_scratch,
-    ensure_local_route_scratch, ensure_recv_route_scratch, ensure_route_logits_scratch,
-    ensure_send_route_scratch,
+    DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_local_route_scratch,
 };
 #[cfg(feature = "cuda")]
 use crate::distributed::expert_state::ExpertGroup;
@@ -551,8 +547,8 @@ where
             .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 grouped expert matrix missing scales"))?;
         let (q_ptr, _q_guard) = qweight.device_ptr(&ctx.stream);
         let (s_ptr, _s_guard) = scales.device_ptr(&ctx.stream);
-        weight_ptrs.push(q_ptr as u64);
-        scale_ptrs.push(s_ptr as u64);
+        weight_ptrs.push(q_ptr);
+        scale_ptrs.push(s_ptr);
     }
     Ok(DeepseekGroupedExpertWeightPtrCache {
         weight_ptrs: ctx.stream.clone_htod(&weight_ptrs).map_err(|err| {
@@ -650,6 +646,7 @@ pub(super) fn dsv4_try_build_deepgemm_expert_cache(
     ctx: &DeviceContext,
     experts: &[DeepseekV4Expert],
 ) -> Result<Option<DeepseekDsv4DeepGemmExpertCache>> {
+    static LOGGED_PRECHECK: OnceLock<()> = OnceLock::new();
     let backend = dsv4_expert_backend()?;
     let explicit_cache = dsv4_env_flag("ARLE_DSV4_DEEPGEMM_WEIGHT_CACHE")?;
     let should_build = explicit_cache || !matches!(backend, Dsv4ExpertBackend::Native);
@@ -668,7 +665,6 @@ pub(super) fn dsv4_try_build_deepgemm_expert_cache(
             if matches!(backend, Dsv4ExpertBackend::DeepGemmRequired) {
                 return Err(err);
             }
-            static LOGGED_PRECHECK: OnceLock<()> = OnceLock::new();
             LOGGED_PRECHECK.get_or_init(|| {
                 info!("DeepSeek V4 DeepGEMM FP8 expert cache skipped before build: {err:#}");
             });
@@ -1252,6 +1248,10 @@ fn dsv4_expert_backend() -> Result<Dsv4ExpertBackend> {
         let moe_backend = std::env::var("ARLE_DSV4_MOE_BACKEND")
             .unwrap_or_else(|_| "deepep".to_string())
             .to_ascii_lowercase();
+        // `native-deepep` shares the `DeepGemmAuto` body with the deepep group
+        // but is kept as its own arm so the Phase B-3.2 doc below stays attached
+        // to it — merging would orphan that comment.
+        #[allow(clippy::match_same_arms)]
         match moe_backend.as_str() {
             "" | "deepep" | "deepep_unsafe" | "unsafe_deepep" | "dispatch" | "dispatch_combine"
             | "dispatch_unsafe" => return Ok(Dsv4ExpertBackend::DeepGemmAuto),
@@ -1954,7 +1954,7 @@ impl DeepseekV4MoeBlock {
             offsets
         };
         if hidden.seq_len > 1 && dsv4_local_grouped_experts_enabled()? {
-            if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
+            if let Some(scratch_cache) = moe_scratch {
                 return self.forward_compact_local_routes_gpu(
                     ctx,
                     layer_idx,
@@ -2746,6 +2746,7 @@ impl DeepseekV4MoeBlock {
         route_out: &mut HiddenStates,
         scratch_cache: &mut DeepseekMoeRuntimeCache,
     ) -> Result<bool> {
+        static LOGGED: OnceLock<()> = OnceLock::new();
         if total_local_routes == 0 || max_local_routes == 0 || self.experts.is_empty() {
             return Ok(true);
         }
@@ -2903,7 +2904,6 @@ impl DeepseekV4MoeBlock {
                     if matches!(expert_backend, Dsv4ExpertBackend::DeepGemmRequired) {
                         return Err(err);
                     }
-                    static LOGGED: OnceLock<()> = OnceLock::new();
                     LOGGED.get_or_init(|| {
                         info!(
                             "DeepSeek V4 DeepGEMM auto fallback to native grouped expert path: {err:#}"

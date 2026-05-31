@@ -248,10 +248,10 @@ impl DeepseekModel {
     }
 
     fn layer_communicator_from_config(
-        ctx: &DeviceContext,
+        _ctx: &DeviceContext,
         config: &DeepseekRuntimeConfig,
     ) -> Result<LayerCommunicator> {
-        let mut comm = LayerCommunicator::new_with_ep(
+        let comm = LayerCommunicator::new_with_ep(
             config.tp.rank,
             config.tp.world_size,
             0,
@@ -873,7 +873,7 @@ impl DeepseekModel {
                 self.config.hidden_size * self.config.hc_mult,
                 stream.seq_len,
             )?;
-            attn_stream as *mut HiddenStates
+            std::ptr::from_mut::<HiddenStates>(attn_stream)
         };
         // SAFETY: `attn_stream_ptr` aliases `cache.attn_post`. The attention
         // half writes through it and reads other `cache.*` fields but never
@@ -1430,7 +1430,7 @@ impl DeepseekModel {
         let update_window_cache = cache.is_some();
         let fuse_window_update =
             update_window_cache && token_count == 1 && dsv4_fuse_attn_window_update_enabled()?;
-        let window_cache = if let Some(cache) = cache.as_deref_mut() {
+        let window_cache = if let Some(cache) = cache {
             ensure_swa_window_cache(&self.ctx, cache, cache_len)?
         } else {
             scratch_window = self
@@ -2084,6 +2084,14 @@ impl DeepseekModel {
             &mut local_attn_owned
         };
         {
+            // V2.3 s_q padding (TP>1 only). For TP>1 we already allocate
+            // separate gather/pack/full_out scratches, so padding s_q to the
+            // next multiple of 64 is a localized change: pad q_send, gather,
+            // pack, full_out + fill indices/topk_length pad rows + pass
+            // padded_s_q to FlashMLA. TP=1 keeps the strict verified shape
+            // (q_prepared / local_attn would need their own padding to avoid
+            // OOB and that's a separate cleanup).
+            const FLASHMLA_VERIFIED_S_Q: usize = 16384;
             let (q_ptr, _q_guard) = q_prepared.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
             let compressed_guard;
@@ -2165,14 +2173,6 @@ impl DeepseekModel {
             // Default ON (env knob `ARLE_DSV4_FLASHMLA_PREFILL` defaults to
             // true). Override with `=0` to force legacy for the chunk-1
             // boundary too.
-            // V2.3 s_q padding (TP>1 only). For TP>1 we already allocate
-            // separate gather/pack/full_out scratches, so padding s_q to the
-            // next multiple of 64 is a localized change: pad q_send, gather,
-            // pack, full_out + fill indices/topk_length pad rows + pass
-            // padded_s_q to FlashMLA. TP=1 keeps the strict verified shape
-            // (q_prepared / local_attn would need their own padding to avoid
-            // OOB and that's a separate cleanup).
-            const FLASHMLA_VERIFIED_S_Q: usize = 16384;
             // V2.5 cap-lift: the old hardcoded 24576 total-position cap was a
             // stale V2-era guard, set while the >24K CUDA_ERROR_ILLEGAL_ADDRESS
             // was still hypothesized to be a kv_unified/TMA sizing bound. V2.4
@@ -2450,8 +2450,8 @@ impl DeepseekModel {
                 // ---- TP-AllGather Q (skipped at TP=1) ----
                 // gathered_q / packed_q / full_out are dropped after the dispatch
                 // returns, freeing back to the cudarc pool.
-                let mut gathered_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
-                let mut packed_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+                let gathered_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+                let packed_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
                 let mut full_out_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
 
                 #[cfg(feature = "nccl")]
@@ -2759,7 +2759,7 @@ impl DeepseekModel {
                 // The bf16 SW ring update runs unfused after this branch
                 // (`fuse_window_update = false` for this path) so an env-OFF
                 // fallback during the same session sees a consistent ring.
-                let model_type_int: i32 = if head_dim == 512 { 1 } else { 0 };
+                let model_type_int: i32 = i32::from(head_dim == 512);
                 let sliding_window = self.config.sliding_window;
                 let index_topk = self.config.index_topk;
                 let d_v = head_dim; // MODEL1: d_qk == d_v == 512 at NoPE+RoPE
@@ -2774,9 +2774,9 @@ impl DeepseekModel {
                         local_heads as i32,
                         1_i32,
                         model_type_int,
-                        &mut num_sm_parts,
-                        &mut fixed_overhead_num_blocks,
-                        &mut block_size_topk,
+                        &raw mut num_sm_parts,
+                        &raw mut fixed_overhead_num_blocks,
+                        &raw mut block_size_topk,
                     )
                     .result()
                     .map_err(|err| {
@@ -2864,12 +2864,12 @@ impl DeepseekModel {
                 // Lift device pointers via a scoped borrow so we can hand
                 // raw u64 to the kernel wrapper. The arena fields and the
                 // FP8 pool live in disjoint cache fields.
-                let (indices_ptr_u64, _ig) = cache_mut
+                let (indices_ptr_u64, ig) = cache_mut
                     .fm_decode_indices
                     .as_mut()
                     .expect("indices arena allocated")
                     .device_ptr_mut(&self.ctx.stream);
-                drop(_ig);
+                drop(ig);
                 {
                     let selected_ptr_u64: u64 = if mode_int == 1 {
                         // `selected_ptr` is *const i32 captured above.
@@ -2914,20 +2914,20 @@ impl DeepseekModel {
                         anyhow::anyhow!("DSv4 FlashMLA decode topk_length H2D: {err}")
                     })?;
 
-                let (sched_meta_ptr_u64, _sg) = cache_mut
+                let (sched_meta_ptr_u64, sg) = cache_mut
                     .fm_decode_sched_meta
                     .as_mut()
                     .expect("sched_meta arena allocated")
                     .device_ptr_mut(&self.ctx.stream);
-                drop(_sg);
-                let (num_splits_ptr_u64, _ng) = cache_mut
+                drop(sg);
+                let (num_splits_ptr_u64, ng) = cache_mut
                     .fm_decode_num_splits
                     .as_mut()
                     .expect("num_splits arena allocated")
                     .device_ptr_mut(&self.ctx.stream);
-                drop(_ng);
-                let (topk_length_ptr_u64, _tg) = topk_length_dev.device_ptr(&self.ctx.stream);
-                drop(_tg);
+                drop(ng);
+                let (topk_length_ptr_u64, tg) = topk_length_dev.device_ptr(&self.ctx.stream);
+                drop(tg);
                 unsafe {
                     ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
                         1_i32, // b = 1
@@ -2959,25 +2959,25 @@ impl DeepseekModel {
                     sw_blocks,
                     comp_blocks,
                 )?;
-                let (lse_accum_ptr_u64, _lg) = cache_mut
+                let (lse_accum_ptr_u64, lg) = cache_mut
                     .fm_decode_lse_accum
                     .as_mut()
                     .expect("lse_accum arena allocated")
                     .device_ptr_mut(&self.ctx.stream);
-                drop(_lg);
-                let (o_accum_ptr_u64, _og) = cache_mut
+                drop(lg);
+                let (o_accum_ptr_u64, og) = cache_mut
                     .fm_decode_o_accum
                     .as_mut()
                     .expect("o_accum arena allocated")
                     .device_ptr_mut(&self.ctx.stream);
-                drop(_og);
+                drop(og);
 
                 // attn_sink_f32 with rank offset (decode runs single-rank
                 // at h_q ∈ {64,128} — same convention as the legacy
                 // hybrid kernel: caller indexes the local head range).
-                let (sink_f32_base_ptr, _sf32g) =
+                let (sink_f32_base_ptr, sf32g) =
                     attention.attn_sink_f32.device_ptr(&self.ctx.stream);
-                drop(_sf32g);
+                drop(sf32g);
                 let sink_offset_elems = self.config.tp.rank * local_heads;
                 let sink_f32_local_ptr =
                     unsafe { (sink_f32_base_ptr as *const f32).add(sink_offset_elems) };
@@ -2989,8 +2989,8 @@ impl DeepseekModel {
                     .stream
                     .alloc_zeros_traced::<f32>(local_heads)
                     .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode lse out alloc: {err}"))?;
-                let (lse_out_ptr_u64, _log) = lse_out_dev.device_ptr_mut(&self.ctx.stream);
-                drop(_log);
+                let (lse_out_ptr_u64, log) = lse_out_dev.device_ptr_mut(&self.ctx.stream);
+                drop(log);
 
                 let scale = 1.0_f32 / (head_dim as f32).sqrt();
                 let bytes_per_token = if head_dim == 512 {
@@ -3257,7 +3257,7 @@ impl DeepseekModel {
             },
         )?;
         dsv4_trace_end(&self.ctx, "attn_output_proj", layer_idx, token_count, trace)?;
-        if let Some(cache) = cache.as_deref_mut() {
+        if let Some(cache) = cache {
             if let Some(scratch) = q_prepared_scratch.take() {
                 put_hidden_scratch(&mut cache.q_prepared, scratch);
             }
@@ -3424,7 +3424,7 @@ impl DeepseekModel {
                     self.config.rms_norm_eps,
                     rope_dim as i32,
                     rope_base,
-                    original_seq_len as i32,
+                    original_seq_len,
                     rope_params.factor,
                     rope_params.beta_fast,
                     rope_params.beta_slow,
@@ -3478,7 +3478,7 @@ impl DeepseekModel {
         let end_row = compressed_rows;
 
         // Extract bf16 compressor pointer first (immutable borrow scope).
-        let (comp_bf16_ptr, _comp_g) = {
+        let (comp_bf16_ptr, comp_g) = {
             let c = cache.compressed_gpu.as_ref().expect("checked above");
             let buf = c
                 .compressed
@@ -3487,7 +3487,7 @@ impl DeepseekModel {
             buf.device_ptr(&self.ctx.stream)
         };
         let comp_bf16_ptr_u64 = comp_bf16_ptr;
-        drop(_comp_g);
+        drop(comp_g);
 
         // Resolve the pool base pointer by mode (OFF → per-state lazy-alloc;
         // ON → the bound shared sub-range). This hook only runs at decode time
@@ -3551,13 +3551,12 @@ impl DeepseekModel {
         // because the pointer is a stable device address managed by the
         // CudaSlice; the slice itself isn't reallocated during this hook.
         let (window_ptr_u64, window_len) = {
-            let window_cache_buf = match cache.window_gpu.as_ref() {
-                Some(buf) => buf,
-                // SW window cache hasn't been built yet; nothing to
-                // bootstrap from. The first `finish_attention_gpu` call
-                // will allocate it and the per-step SW pack hook fills
-                // the ring slot-by-slot from there on.
-                None => return Ok(()),
+            // SW window cache hasn't been built yet; nothing to
+            // bootstrap from. The first `finish_attention_gpu` call
+            // will allocate it and the per-step SW pack hook fills
+            // the ring slot-by-slot from there on.
+            let Some(window_cache_buf) = cache.window_gpu.as_ref() else {
+                return Ok(());
             };
             let (p, _g) = window_cache_buf.device_ptr(&self.ctx.stream);
             (p, window_cache_buf.len())
@@ -4008,7 +4007,7 @@ impl DeepseekModel {
                 layer_idx,
                 &self.config.spec,
                 &self.config.ep,
-                &normed,
+                normed,
                 tokens,
                 moe_scratch.as_deref_mut(),
             )?;
@@ -4036,10 +4035,10 @@ impl DeepseekModel {
         };
         let trace = dsv4_trace_begin(&self.ctx)?;
         let ffn_out = if normed.seq_len == 1 {
-            if let Some(scratch) = moe_scratch.as_deref_mut() {
+            if let Some(scratch) = moe_scratch {
                 layer.ffn.add_shared_expert_with_scratch(
                     &self.ctx,
-                    &normed,
+                    normed,
                     routed.hidden,
                     routed.ready,
                     self.config.swiglu_limit,
@@ -4048,7 +4047,7 @@ impl DeepseekModel {
             } else {
                 layer.ffn.add_shared_expert(
                     &self.ctx,
-                    &normed,
+                    normed,
                     routed.hidden,
                     routed.ready,
                     self.config.swiglu_limit,
@@ -4057,7 +4056,7 @@ impl DeepseekModel {
         } else {
             layer.ffn.add_shared_expert(
                 &self.ctx,
-                &normed,
+                normed,
                 routed.hidden,
                 routed.ready,
                 self.config.swiglu_limit,
@@ -6307,6 +6306,10 @@ fn dsv4_moe_deepep_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_MOE_BACKEND").ok() else {
         return Ok(true);
     };
+    // `native-deepep` shares the `Ok(true)` body with the dispatch group but is
+    // kept as its own arm so the Phase B-3.2 boot-semantics doc below stays
+    // attached to it — merging would orphan that comment.
+    #[allow(clippy::match_same_arms)]
     match raw.to_ascii_lowercase().as_str() {
         "" | "deepep" | "dispatch" | "dispatch_combine" | "deepep_unsafe" | "unsafe_deepep"
         | "dispatch_unsafe" => Ok(true),

@@ -325,7 +325,7 @@ impl<M: ModelForward> Scheduler<M> {
         if let Some(span) = lookup_trace.as_ref() {
             let (host_blocks, disk_blocks, remote_blocks) = staged_prefix_plan
                 .as_ref()
-                .map(|staged| staged.source_counts())
+                .map(crate::kv_tier::readmission::ReadmissionPlan::source_counts)
                 .unwrap_or((0, 0, 0));
             let props = vec![
                 ("matched_len", lookup.matched_len.to_string()),

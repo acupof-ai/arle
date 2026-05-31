@@ -586,7 +586,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         handle
     };
     let (ready_tx, ready_rx) = mpsc::channel();
-    let scheduler_thread_placement = worker_placement.clone();
+    let scheduler_thread_placement = worker_placement;
     let scheduler_thread_cuda_ordinal = cuda_device_ordinal;
     let scheduler_thread_model_id = model_id.clone();
     let thread_name = scheduler_thread_placement.as_ref().map_or_else(
