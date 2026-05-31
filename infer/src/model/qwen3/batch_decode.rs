@@ -123,10 +123,10 @@ fn quant_debug_dump_fp8_state(
         "[fp8-debug fire#{fire} stage={stage}] meta: pool_layers={pool_layers} pool_kv_dim={pool_kv_dim} layer_idx={layer_idx} k_data_len={k_data_len} k_scales_len={k_scales_len} sync_err={sync_err:?} slot0_seq_len={slot_seq} slot0_page_indices_first8={slot_pages:?}"
     );
 
-    let row = if !last_token_h.is_empty() {
-        last_token_h[0] as usize
-    } else {
+    let row = if last_token_h.is_empty() {
         0
+    } else {
+        last_token_h[0] as usize
     };
     let kv_dim = num_kv_heads * head_dim;
     let row_off = row * kv_dim;

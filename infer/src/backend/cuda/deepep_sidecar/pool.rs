@@ -142,7 +142,7 @@ impl SidecarPool {
     /// parallel. Returns one response per rank in rank order.
     ///
     /// All ranks call into `intranode::barrier` during boot, then dispatch
-    /// + combine in parallel. We must send the command to every rank
+    /// and combine in parallel. We must send the command to every rank
     /// before reading any response because the kernels block on
     /// cross-rank handshake.
     pub fn round_trip_all(&self, req: RoundTripRequest) -> Result<Vec<RoundTripResponse>> {
@@ -176,9 +176,8 @@ impl Drop for SidecarPool {
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         for r in &self.ranks {
-            let mut guard = match r.child.lock() {
-                Ok(g) => g,
-                Err(_) => continue,
+            let Ok(mut guard) = r.child.lock() else {
+                continue;
             };
             if let Some(mut child) = guard.take() {
                 loop {

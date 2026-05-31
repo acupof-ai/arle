@@ -590,6 +590,7 @@ pub(crate) fn prefill_attention_paged_batch(
     output: &mut HiddenStates,
     heads: &HeadConfig,
 ) -> Result<()> {
+    use crate::oplib::attention::HeadConfigHd128;
     let seq_len = q_batch.seq_len;
     let num_q_heads = heads.num_q_heads;
     let num_kv_heads = heads.num_kv_heads;
@@ -613,7 +614,6 @@ pub(crate) fn prefill_attention_paged_batch(
         // Head-config validation + the unprecompiled-config hard-fail live once
         // in `oplib::attention::head_config_hd128` (CPU-testable); this site only
         // maps the resolved variant onto its prefill FFI fn pointer (a cuda type).
-        use crate::oplib::attention::HeadConfigHd128;
         match crate::oplib::attention::head_config_hd128(num_q_heads, num_kv_heads)
             .map_err(|e| anyhow!(e))?
         {
@@ -1117,6 +1117,7 @@ pub fn tilelang_tc_run_layer(
     // unused causal-mask + Q_indptr indirection internally.
     let is_pure_decode = max_qlen == 1;
     let tilelang_kernel = {
+        use crate::oplib::attention::HeadConfigHd128;
         ensure!(
             heads.head_dim == 128,
             "TileLang TC decode alias requires head_dim=128, got {}",
@@ -1132,7 +1133,6 @@ pub fn tilelang_tc_run_layer(
         // maps the resolved variant onto its FFI fn pointer (a cuda type). Pure
         // decode (max_qlen==1) maps onto the dedicated decode kernels; the
         // mixed/varlen-Q branch reuses the *prefill* kernels as a TC alias.
-        use crate::oplib::attention::HeadConfigHd128;
         let head_config =
             crate::oplib::attention::head_config_hd128(heads.num_qo_heads, heads.num_kv_heads)
                 .map_err(|e| anyhow!(e))?;
