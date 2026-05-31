@@ -69,11 +69,14 @@ grouped GEMM but a fixed ≤256 capacity.
    the stub → `CUDA_ERROR_NOT_SUPPORTED` for *every* GEMM, which read as a kernel/shape bug.
    Rule: a `NOT_SUPPORTED` from a build-flag-gated bridge = "stub linked" until the binary is
    grepped for the real symbol. (`memory/feedback_deepgemm_build_flag_stub.md`.)
-2. **KV-starvation bench artifact.** The first A/B used the toolchain *smoke* default
-   `mem-fraction-static=0.10` (KV pool = 10% of GPU). At ≥1024–2048 tok the KV pool ran dry,
-   the host demotion tier filled, and the scheduler dropped+recomputed KV blocks in a thrash
-   loop (`core.rs:1733`) → 300 s HTTP timeout (`handlers.rs:133`). This is config, not a DSv4
-   cliff. **Perf benches must use `mem-fraction-static=0.85` (the default), not 0.10.**
+2. **A premature root cause that got refuted (record the discipline).** The `mem-fraction-static=0.10`
+   smoke default + a `core.rs:1733` "host tier full, dropped GPU blocks" WARN *looked* like KV
+   starvation causing the ≥1024–2048 timeouts. **A controlled 0.10-vs-0.85 re-run REFUTED it:**
+   the 512/1024 numbers are byte-identical and 2048 still times out at both budgets — so
+   mem-fraction is NOT the cause. The 8 WARNs are a one-time early event (one per rank, same
+   instant), not a thrash loop. (Use 0.85 for perf benches anyway — it's the default — but it
+   is not the lever here.) Lesson: a suggestive WARN + a low config value is a *hypothesis*;
+   the controlled flip is the evidence (§0).
 
 ### 2.1 Problem 1 — the crash (SOLVED, see §3.1)
 `CUDA_ERROR_LAUNCH_FAILED "unspecified launch failure"` / `CUDA_ERROR_UNKNOWN` on every
@@ -118,7 +121,7 @@ surfaced the buried compile error via compute-sanitizer.)
 |---|---|---|
 | 545 tok  | **6.91 s** ✓ (−9.5% vs scalar) | 7.63 s ✓ |
 | 1089 tok | **TIMEOUT >300 s** ✗ (compute cliff §2.2) | 16.70 s ✓ |
-| 2048 tok | timeout ✗ | `<fill from native-0.85 run>` |
+| 2048 tok | timeout ✗ | **TIMEOUT >300 s ✗** (real cliff, root cause OPEN — not mem-fraction) |
 
 deepgemm is **partially solved**: correct + fast for small prefills, **unusable at ≥1024 tok**
 until §2.2 is fixed. Even fully fixed it's a ~10% prefill lever (the expert GEMM is ~1/3 of
@@ -158,9 +161,12 @@ nsys/phase profile of a 1024-tok prefill at 0.85** (do NOT act on stale profilin
    flagged the per-layer `num_recv` host-poll. Cheapest experiment: A/B native-deepep vs
    `allreduce` MoE backend for **prefill only** (native-deepep was +46% at *decode* but
    *slower* at prefill) → consider allreduce-for-prefill / native-deepep-for-decode.
-2. **The 2048 cliff** — confirm from the native-0.85 run whether 2048 still times out at proper
-   budget. If yes, it's a real scaling bug (attention/chunked-prefill); if it now serves, it
-   was purely the §2.0.2 KV-starvation artifact.
+2. **The 2048 cliff (CONFIRMED real, root cause OPEN).** native is 16.7 s @1024 but >300 s
+   @2048 at BOTH 0.10 and 0.85 budgets (mem-fraction refuted, §2.0.2). >18× for 2× tokens is
+   far past quadratic → a threshold, not smooth scaling. Cheapest next experiment: ONE 2048
+   prefill at `RUST_LOG=info` (raise/stream past the 300 s handler cap) to see whether it's
+   compute-superlinear (attention/chunked-prefill), the host-tier demotion path, or a buffer
+   realloc — do NOT guess again.
 3. **§4.1 deepgemm fix** — cheap, makes the FP8 path correct, ~10% where it applies.
 
 ---
