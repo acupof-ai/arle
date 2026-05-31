@@ -3,7 +3,13 @@
 > Root-cause treatment of "架构不清晰". Output of a 6-round ground→design→polish
 > pass (workflow `attn-kv-trait-design`, 2026-05-30), every claim source-verified.
 > Companion: [`gpu-dispatch-governance.md`](gpu-dispatch-governance.md),
-> [`backend-operator-library.md`](backend-operator-library.md).
+> [`backend-operator-library.md`](backend-operator-library.md),
+> [`control-plane-scheduler-phase.md`](control-plane-scheduler-phase.md),
+> [`state-plane-slot-extent-contract.md`](state-plane-slot-extent-contract.md).
+> Together these five cover the three engine planes: **compute** (attention-kv +
+> dispatch-governance + operator-library), **control** (scheduler-phase), and
+> **state** (slot-extent-contract). The state-plane contract closes the
+> `KvLayout` extent gap this doc flags OPEN below (lines 73-77).
 
 ## TL;DR — what the polish established (求真务实)
 
