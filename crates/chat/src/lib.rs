@@ -12,8 +12,10 @@ pub mod protocol;
 
 pub use protocol::{
     ChatMessage, ChatMlMessage, ChatMlSpan, ChatRole, ParsedAssistantResponse, RenderedChatMl,
-    ToolCall, ToolDefinition, VisibleTextStream, build_tool_block, messages_to_prompt,
-    parse_tool_calls, render_chatml, render_chatml_with_spans, render_structured_chatml_with_spans,
+    StreamingToolCalls, ToolCall, ToolChoiceMode, ToolDefinition, VisibleTextStream,
+    build_tool_block, build_tool_block_with_choice, messages_to_prompt,
+    messages_to_prompt_with_tool_choice, parse_tool_calls, render_chatml, render_chatml_with_spans,
+    render_structured_chatml_with_spans,
 };
 
 use serde::{Deserialize, Serialize};
@@ -220,9 +222,19 @@ pub fn openai_messages_to_prompt(
     messages: &[OpenAiChatMessage],
     tools: &[OpenAiToolDefinition],
 ) -> String {
+    openai_messages_to_prompt_with_tool_choice(messages, tools, &ToolChoiceMode::Auto)
+}
+
+/// Convert an OpenAI messages array + optional tool definitions into a ChatML
+/// prompt, honoring an OpenAI `tool_choice` hint.
+pub fn openai_messages_to_prompt_with_tool_choice(
+    messages: &[OpenAiChatMessage],
+    tools: &[OpenAiToolDefinition],
+    choice: &ToolChoiceMode,
+) -> String {
     let protocol_messages = messages.iter().map(ChatMessage::from).collect::<Vec<_>>();
     let protocol_tools = tools.iter().map(ToolDefinition::from).collect::<Vec<_>>();
-    messages_to_prompt(&protocol_messages, &protocol_tools)
+    messages_to_prompt_with_tool_choice(&protocol_messages, &protocol_tools, choice)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
