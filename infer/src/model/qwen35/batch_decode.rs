@@ -18,6 +18,7 @@ use super::weights::{
 };
 use crate::model::kv_cache::KVFormat;
 use crate::model::{DecodeContextOps, ModelForward, PrefillBatchRequest};
+use crate::oplib::kv_dispatch::{self, KvScheme};
 use crate::ops;
 use cuda_kernels::kv_quant;
 use cuda_kernels::kv_turboquant;
@@ -1232,8 +1233,8 @@ impl Qwen35Model {
         {
             let stream = &self.ctx.stream;
 
-            match kv_pool.format {
-                KVFormat::FP8E4M3 => {
+            match kv_dispatch::dispatch(kv_pool.format).scheme {
+                KvScheme::Fp8PerChannel => {
                     // KIVI per-channel K (calibrated at prefill, see
                     // commit_fp8_paged_prefill_if_needed). K uses static
                     // [num_kv_heads, head_dim] scales; V keeps per-(row, head).
@@ -1263,7 +1264,7 @@ impl Qwen35Model {
                         batch_size,
                     )?;
                 }
-                KVFormat::INT8 => {
+                KvScheme::Int8PerChannel => {
                     // KIVI per-channel K (mirrors qwen3 dispatch). When the
                     // pool exposes static per-channel scales, K uses them
                     // (loop-invariant across tokens). V always stays
@@ -1306,7 +1307,7 @@ impl Qwen35Model {
                         batch_size,
                     )?;
                 }
-                KVFormat::INT4 => {
+                KvScheme::Int4PerChannel => {
                     // KIVI per-channel K + per-(row, head) V, 4-bit packed.
                     let k_static_scales_ptr = kv_pool
                         .k_static_scales_ptr(full_idx, stream)
@@ -1335,8 +1336,8 @@ impl Qwen35Model {
                         batch_size,
                     )?;
                 }
-                KVFormat::BF16 => {}
-                KVFormat::TurboQuant { .. } => {
+                KvScheme::Bf16 => {}
+                KvScheme::TurboQuant => {
                     let tq_k = kv_pool.tq_k_state.as_ref().unwrap();
                     kv_turboquant::turboquant_quantize_paged_single(
                         &self.ctx,
@@ -1366,8 +1367,8 @@ impl Qwen35Model {
                 }
             }
 
-            match kv_pool.format {
-                KVFormat::INT8 => {
+            match kv_dispatch::dispatch(kv_pool.format).scheme {
+                KvScheme::Int8PerChannel => {
                     let sm_scale = 1.0 / (head_dim as f32).sqrt();
                     let k_static_scales_ptr = kv_pool
                         .k_static_scales_ptr(full_idx, stream)
@@ -1392,7 +1393,7 @@ impl Qwen35Model {
                         kv_pool.int8_attn_workspace_bytes,
                     )?;
                 }
-                KVFormat::FP8E4M3 => {
+                KvScheme::Fp8PerChannel => {
                     let sm_scale = 1.0 / (head_dim as f32).sqrt();
                     let k_static_scales_ptr = kv_pool
                         .k_static_scales_ptr(full_idx, stream)
@@ -1417,7 +1418,7 @@ impl Qwen35Model {
                         kv_pool.int8_attn_workspace_bytes,
                     )?;
                 }
-                KVFormat::INT4 => {
+                KvScheme::Int4PerChannel => {
                     let sm_scale = 1.0 / (head_dim as f32).sqrt();
                     let k_static_scales_ptr = kv_pool
                         .k_static_scales_ptr(full_idx, stream)
@@ -1443,7 +1444,7 @@ impl Qwen35Model {
                         kv_pool.int8_attn_workspace_bytes,
                     )?;
                 }
-                KVFormat::BF16 => {
+                KvScheme::Bf16 => {
                     // Decode = 1 Q row per request -> max_qlen=1 and
                     // total_q_tokens=batch_size. Mirrors the TC-decode
                     // pattern in qwen3/batch_decode.rs.
@@ -1483,7 +1484,7 @@ impl Qwen35Model {
                         total_pages,
                     )?;
                 }
-                KVFormat::TurboQuant { .. } => {
+                KvScheme::TurboQuant => {
                     // Fused TQ attention: rotate Q once, score from packed K centroids.
                     let tq_k = kv_pool.tq_k_state.as_ref().unwrap();
                     let tq_v = kv_pool.tq_v_state.as_ref().unwrap();

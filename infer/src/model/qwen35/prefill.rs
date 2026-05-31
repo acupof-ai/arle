@@ -16,6 +16,7 @@ use crate::model::kv_cache::{KVCache, KVFormat};
 use crate::model::{
     MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, PrefillBatchRequest,
 };
+use crate::oplib::kv_dispatch::{self, KvScheme};
 use crate::ops;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::{TokenKVPool, ffi, kv_quant};
@@ -2031,8 +2032,8 @@ impl Qwen35Model {
         let stream = &self.ctx.stream;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
-        match pool.format {
-            KVFormat::FP8E4M3 => {
+        match kv_dispatch::dispatch(pool.format).scheme {
+            KvScheme::Fp8PerChannel => {
                 // KIVI per-channel K (mirrors qwen3/prefill.rs FP8 arm).
                 // Calibrate static scales from this batch's K statistics,
                 // then quantize K through the static table. V stays per-
@@ -2089,7 +2090,7 @@ impl Qwen35Model {
                 )?;
                 Ok(())
             }
-            KVFormat::INT8 => {
+            KvScheme::Int8PerChannel => {
                 // KIVI per-channel K path (mirrors qwen3/prefill.rs INT8 arm).
                 // When the pool exposes static per-channel scales, calibrate
                 // from this prefill batch's K statistics and quantize through
@@ -2160,7 +2161,7 @@ impl Qwen35Model {
                 )?;
                 Ok(())
             }
-            KVFormat::INT4 => {
+            KvScheme::Int4PerChannel => {
                 // PoC: KIVI per-channel K + per-(row, head) V, both packed 4-bit
                 // (2 nibbles per byte). Parallel to TQ4 but uses KIVI scaling
                 // instead of Hadamard rotation for outlier handling.
