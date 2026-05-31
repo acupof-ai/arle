@@ -265,9 +265,17 @@ smoke() {
     fi
 
     local server_log="$ARTIFACT_ROOT/server.log"
+    # ARLE_SERVER_WRAP — optional launcher prefix for the serve process,
+    # e.g. `compute-sanitizer --tool memcheck --target-processes all` to
+    # trace device-side OOB across all 8 self-spawned worker ranks (the
+    # coordinator forks them via current_exe; --target-processes all
+    # instruments each, and children inherit the coordinator stderr so all
+    # reports land in this server.log). Unset by default → zero change to
+    # production runs. Intentionally unquoted so the multi-word command
+    # word-splits into argv.
     (
         cd "$ROOT"
-        exec "$SERVER_BIN" \
+        exec ${ARLE_SERVER_WRAP:-} "$SERVER_BIN" \
             --model-path "$MODEL_PATH" \
             --port "$PORT" \
             --num-slots "$NUM_SLOTS" \
