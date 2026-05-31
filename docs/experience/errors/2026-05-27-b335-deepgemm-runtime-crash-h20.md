@@ -258,9 +258,16 @@ The `c++17+fconcepts` combo (commit `38bf157b`) worked on the **old** pod (the c
 **CUDA 12.9 + gcc 13.3** — 12.9's nvcc fully supports `-std=c++20` device-side, so concepts parse natively and
 `-fconcepts` is redundant.
 
-**Fix** (commit pending): JIT uses `-std=c++20`, drop `-fconcepts`. **Ground-truthed without an infer rebuild** by
+**Fix** (landed): JIT uses `-std=c++20`, drop `-fconcepts`. **Ground-truthed without an infer rebuild** by
 recompiling the EXACT failing generated `~/.deep_gemm/tmp/arle-*/kernel.cu` on the pod:
 `c++17+fconcepts` → EXIT=1 (type_traits:2651), `c++20`-no-`fconcepts` → EXIT=0 (clean 83 KB cubin).
+
+**e2e VALIDATED** (2026-05-31, rebuilt with `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1` + `ARLE_DEEPEP_DIR`):
+native-deepep + `EXPERT=deepgemm` smoke returns coherent **"The capital of France is Paris."**, `GEMM_FAILURES=0`,
+no compile failures, 6 JIT kernels compiled cleanly. First request was 20.6 s because it paid the JIT cold-start (6
+serial nvcc compiles) — steady-state needs a warm cache; the perf A/B (deepgemm vs scalar grouped GEMM) warms first.
+NB: a build that sets the deepgemm env but **omits `ARLE_DEEPEP_DIR`** ships a `deepep-sys` stub → native-deepep
+panics at boot ("built in stub mode"); the full build env needs BOTH.
 
 ### Rule
 - **A `NOT_SUPPORTED` / "operation not supported" from a vendored, build-flag-gated bridge is "the stub is linked"
