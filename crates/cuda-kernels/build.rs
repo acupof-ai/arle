@@ -1284,7 +1284,15 @@ fn main() {
     // 147f5673 — FlashMLA submodule pin). Refs sgl-kernel/cmake/flashmla.cmake.
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHMLA");
     let flashmla_root = Path::new("vendor/flashmla");
+    let flashmla_stub = Path::new("csrc/attention/arle_flashmla_decode_stubs.cu");
     let enable_flashmla = flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA");
+    // `collect_cu_files` sees the fallback stub because it lives under csrc/.
+    // Drop it first so FlashMLA builds link exactly one implementation of the
+    // prefill/decode FFI symbols. Otherwise the archive order can satisfy
+    // `arle_flashmla_sm90_sparse_prefill_fwd` from the stub before the real
+    // shim object is considered, turning default-on FlashMLA into a runtime
+    // cudaErrorNotSupported.
+    cu_files.retain(|p| p != flashmla_stub);
     if !enable_flashmla {
         // FlashMLA SM90 disabled (likely SM89-only box or explicit opt-out).
         // Drop the SM90-coupled shims from cu_files — they include vendored
@@ -1298,7 +1306,7 @@ fn main() {
         // symbol set with `cudaErrorNotSupported` returns, so the Rust crate
         // links. The runtime gate `dsv4_flashmla_decode_enabled` defaults OFF
         // so this path is never actually called in practice.
-        cu_files.push(Path::new("csrc/attention/arle_flashmla_decode_stubs.cu").to_path_buf());
+        cu_files.push(flashmla_stub.to_path_buf());
     }
     if enable_flashmla {
         let sparse = flashmla_root.join("csrc/sm90/prefill/sparse");
@@ -1482,6 +1490,11 @@ fn main() {
     }
 
     let cuda_lib = out_dir.join("libkernels_cuda.a");
+    match std::fs::remove_file(&cuda_lib) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => panic!("Failed to remove stale {}: {}", cuda_lib.display(), err),
+    }
     let mut ar_args = vec!["rcs".to_string(), cuda_lib.to_string_lossy().to_string()];
     ar_args.extend(
         obj_files
