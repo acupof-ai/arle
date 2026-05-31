@@ -165,6 +165,9 @@ impl<M: ModelForward> Scheduler<M> {
                 trace_context: victim.trace_context,
                 delta_tx: victim.delta_tx.clone(),
                 distributed: victim.distributed.clone(),
+                // CUDA scheduler does not consume the cooperative cancel flag
+                // (HTTP path uses delta_tx close); requeue without it.
+                cancel: None,
             };
             victim.phase = Phase::Finished;
             (victim.id, generated_tokens, requeue)

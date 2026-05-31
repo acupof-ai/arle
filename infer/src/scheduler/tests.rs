@@ -20,6 +20,7 @@ fn make_request() -> IncomingRequest {
         delta_tx: tx,
         trace_context: None,
         distributed: None,
+        cancel: None,
     }
 }
 

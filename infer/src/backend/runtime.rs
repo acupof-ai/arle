@@ -536,6 +536,7 @@ mod tests {
                 delta_tx,
                 trace_context: None,
                 distributed: None,
+                cancel: None,
             },
             delta_rx,
         )

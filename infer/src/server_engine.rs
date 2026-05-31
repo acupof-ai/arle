@@ -176,6 +176,7 @@ mod tests {
                 logprobs: false,
                 session_id: None,
                 trace_context: None,
+                cancel: None,
             },
             tx,
         );
@@ -257,6 +258,7 @@ mod tests {
                 logprobs: false,
                 session_id: None,
                 trace_context: None,
+                cancel: None,
             },
             tx,
         );
@@ -340,6 +342,7 @@ mod tests {
                 logprobs: false,
                 session_id: None,
                 trace_context: None,
+                cancel: None,
             })
             .expect("complete");
 
@@ -409,6 +412,7 @@ mod tests {
             logprobs: false,
             session_id: None,
             trace_context: None,
+            cancel: None,
         }) {
             Ok(_) => panic!("terminal error delta should fail complete()"),
             Err(err) => err,
@@ -508,6 +512,7 @@ mod tests {
                 logprobs: false,
                 session_id: None,
                 trace_context: None,
+                cancel: None,
             })
             .expect("complete");
 
@@ -602,6 +607,7 @@ mod tests {
                     logprobs: false,
                     session_id: None,
                     trace_context: None,
+                    cancel: None,
                 },
                 tx,
             )
@@ -717,6 +723,7 @@ mod tests {
                     logprobs: false,
                     session_id: None,
                     trace_context: None,
+                    cancel: None,
                 },
                 tx,
             )
@@ -854,6 +861,7 @@ mod tests {
                     logprobs: false,
                     session_id: None,
                     trace_context: None,
+                    cancel: None,
                 },
                 tx,
             )

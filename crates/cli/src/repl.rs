@@ -868,7 +868,7 @@ fn run_agent_turn(
             max_tokens,
             temperature,
         },
-        cancel.as_ref(),
+        Arc::clone(&cancel),
         AgentTurnCallbacks {
             on_text_chunk: Some(&mut on_text_chunk),
             on_trace_event: Some(&mut on_trace_event),

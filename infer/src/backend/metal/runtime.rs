@@ -3,7 +3,7 @@ use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -40,6 +40,9 @@ struct PendingMetalRequest {
     stop: Option<Vec<String>>,
     session_id: Option<SessionId>,
     enqueued_at: Instant,
+    /// Cooperative cancel flag (in-process CLI Ctrl-C path). When set, the
+    /// runtime stops/reaps this request at the next tick/chunk boundary.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl PendingMetalRequest {
@@ -64,6 +67,7 @@ impl PendingMetalRequest {
                 stop: incoming.stop,
                 session_id: incoming.session_id,
                 enqueued_at: Instant::now(),
+                cancel: incoming.cancel,
             },
             map_request_priority(incoming.priority),
         ))
@@ -71,6 +75,17 @@ impl PendingMetalRequest {
 
     fn delta_closed(&self) -> bool {
         self.delta_tx.is_closed()
+    }
+
+    /// True when this request should stop generating: either the streaming
+    /// consumer dropped (`delta_closed`) or the cooperative cancel flag is set
+    /// (in-process CLI Ctrl-C). Drives reap/stop decisions at tick granularity.
+    fn cancel_requested(&self) -> bool {
+        self.delta_closed()
+            || self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed))
     }
 
     fn activate(
@@ -100,6 +115,9 @@ struct ActiveMetalRequest {
     /// ride on the final delta so the cumulative `response_token_ids`
     /// the consumer collates equals every generated token.
     pending_token_ids: Vec<u32>,
+    /// Cooperative cancel flag carried over from the pending request. When set,
+    /// decode/prefill pre-checks stop the request at the next token/chunk.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl ActiveMetalRequest {
@@ -111,6 +129,7 @@ impl ActiveMetalRequest {
     ) -> Result<Self> {
         let prompt_tokens = pending.prompt_tokens;
         let max_tokens = pending.max_tokens;
+        let cancel = pending.cancel;
         let mut sampling = pending.sampling;
         sampling.max_new_tokens = Some(max_tokens);
         // Thread DFlash runtime into the request state so Qwen3StepDriver
@@ -141,11 +160,23 @@ impl ActiveMetalRequest {
             admitted_at: Instant::now(),
             first_token_at: None,
             pending_token_ids: Vec::new(),
+            cancel,
         })
     }
 
     fn delta_closed(&self) -> bool {
         self.delta_tx.is_closed()
+    }
+
+    /// True when this active request should stop generating: streaming consumer
+    /// dropped (`delta_closed`) or the cooperative cancel flag is set (in-process
+    /// CLI Ctrl-C). Drives prefill/decode pre-checks and reap.
+    fn cancel_requested(&self) -> bool {
+        self.delta_closed()
+            || self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed))
     }
 
     fn phase(&self) -> RuntimePhase {
@@ -2232,7 +2263,7 @@ fn execute_prefill_chunk(
             return;
         };
 
-        if request.delta_closed() {
+        if request.cancel_requested() {
             PrefillChunkOutcome::ClientDropped
         } else {
             match request.prefill_chunk(budget) {
@@ -2327,7 +2358,7 @@ fn execute_decode_batch(
 
     let mut open = Vec::with_capacity(staged.len());
     for (req_id, request) in staged {
-        if request.delta_closed() {
+        if request.cancel_requested() {
             scheduler.finish_request(req_id, request_mode(&request));
             continue;
         }
@@ -2804,7 +2835,7 @@ fn execute_decode_single(
         return;
     }
 
-    let outcome = if request.delta_closed() {
+    let outcome = if request.cancel_requested() {
         Outcome::ClientDropped
     } else {
         metrics.record_metal_decode_scalar_row();
@@ -2814,7 +2845,7 @@ fn execute_decode_single(
                 stop_hit: request.stop_hit(),
             },
             Err(err) => {
-                if request.delta_closed() {
+                if request.cancel_requested() {
                     Outcome::ClientDropped
                 } else {
                     Outcome::Failed(err)
@@ -2924,7 +2955,7 @@ fn reap_closed_clients(
 ) {
     let pending_closed: Vec<_> = pending
         .iter()
-        .filter_map(|(req_id, request)| request.delta_closed().then_some(*req_id))
+        .filter_map(|(req_id, request)| request.cancel_requested().then_some(*req_id))
         .collect();
     for req_id in pending_closed {
         handle.consume_one();
@@ -2934,7 +2965,7 @@ fn reap_closed_clients(
 
     let closed: Vec<_> = active
         .iter()
-        .filter_map(|(req_id, request)| request.delta_closed().then_some(*req_id))
+        .filter_map(|(req_id, request)| request.cancel_requested().then_some(*req_id))
         .collect();
 
     for req_id in closed {
@@ -3202,6 +3233,7 @@ mod tests {
             delta_tx,
             trace_context: None,
             distributed: None,
+            cancel: None,
         };
 
         let (pending, priority) =

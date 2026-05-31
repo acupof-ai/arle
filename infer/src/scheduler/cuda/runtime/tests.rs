@@ -170,6 +170,7 @@ mod tests {
             delta_tx: tx,
             trace_context: None,
             distributed: None,
+            cancel: None,
         }
     }
 

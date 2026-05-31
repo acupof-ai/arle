@@ -27,6 +27,9 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
         delta_tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<Option<Vec<u32>>> {
         let prompt_tokens = self.preprocess_prompt_tokens(&req);
+        // Capture the cooperative cancel flag before `req.prompt` is moved into
+        // the IncomingRequest below.
+        let cancel = req.cancel.clone();
         self.handle
             .submit(IncomingRequest {
                 prompt: req.prompt,
@@ -41,6 +44,7 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
                 delta_tx,
                 trace_context: req.trace_context,
                 distributed: None,
+                cancel,
             })
             .map_err(|err| anyhow::anyhow!("request submission failed: {err}"))?;
         Ok(prompt_tokens)

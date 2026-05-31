@@ -57,6 +57,7 @@ fn qwen3_4b_gguf_generate() {
             logprobs: false,
             session_id: None,
             trace_context: None,
+            cancel: None,
         };
         let out = engine.complete(req).unwrap();
         let shown: String = prompt.chars().take(60).collect();

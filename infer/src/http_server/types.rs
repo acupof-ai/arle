@@ -272,6 +272,7 @@ impl RequestExecutionOptions {
             delta_tx,
             trace_context,
             distributed: None,
+            cancel: None,
         }
     }
 }

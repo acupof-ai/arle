@@ -76,6 +76,9 @@ pub mod sampling;
 #[cfg(feature = "metal")]
 #[path = "metal/weights.rs"]
 pub mod weights;
+#[cfg(feature = "metal")]
+#[path = "metal/wired_limit.rs"]
+mod wired_limit;
 
 // Submodules that used to live at the crate root as `metal_*.rs` — moved
 // under `metal_backend/` so that all Metal-specific code lives in one place
@@ -126,6 +129,8 @@ pub use runtime::{
     spawn_metal_scheduler_handle_from_path_with_options,
     spawn_metal_scheduler_handle_from_path_with_options_and_metrics,
 };
+#[cfg(feature = "metal")]
+pub use wired_limit::auto_wired_limit_bytes;
 
 // NOTE: The legacy fused-ops FFI modules (`metal_ffi`, `metal_capi_ffi`) were
 // removed during the mlx-sys migration. Qwen3 now runs on the maintained

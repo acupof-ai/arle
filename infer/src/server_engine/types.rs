@@ -63,6 +63,11 @@ pub struct CompletionRequest {
     /// Forwarded onto `IncomingRequest::trace_context`. `None` for
     /// non-traced callers.
     pub trace_context: Option<fastrace::collector::SpanContext>,
+    /// Optional cooperative cancel flag, forwarded onto
+    /// `IncomingRequest::cancel`. In-process CLI agent callers populate this
+    /// from their SIGINT-driven `Arc<AtomicBool>` so the runtime stops the
+    /// request promptly; HTTP / non-cancellable callers leave it `None`.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
