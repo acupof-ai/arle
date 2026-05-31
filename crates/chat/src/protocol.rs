@@ -156,6 +156,130 @@ impl VisibleTextStream {
     }
 }
 
+/// Incremental filter that mirrors [`VisibleTextStream`]'s hiding of
+/// `<think>...</think>` and `<tool_call>...</tool_call>` blocks, but also
+/// captures the completed tool calls instead of discarding them.
+///
+/// Use this on the streaming path when the request carries tool definitions:
+/// it emits user-visible text exactly as `VisibleTextStream` would while
+/// surfacing each closed `<tool_call>` block as a parsed [`ToolCall`].
+#[derive(Default)]
+pub struct StreamingToolCalls {
+    pending: String,
+    hidden: Option<HiddenBlock>,
+    tool_buf: String,
+}
+
+impl StreamingToolCalls {
+    /// Feed a chunk; returns `(visible_text_to_emit, newly_completed_tool_calls)`.
+    pub fn push(&mut self, chunk: &str) -> (String, Vec<ToolCall>) {
+        self.pending.push_str(chunk);
+        self.drain(false)
+    }
+
+    /// Flush remaining buffered text. An unterminated `<tool_call>` block is
+    /// dropped (no partial tool call is emitted).
+    pub fn finish(&mut self) -> (String, Vec<ToolCall>) {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, flush: bool) -> (String, Vec<ToolCall>) {
+        let mut visible = String::new();
+        let mut calls = Vec::new();
+
+        loop {
+            match self.hidden {
+                None => {
+                    const VISIBLE_TAGS: [&str; 4] = [
+                        TOOL_CALL_BLOCK.open,
+                        TOOL_CALL_BLOCK.close,
+                        THINK_BLOCK.open,
+                        THINK_BLOCK.close,
+                    ];
+                    let Some((idx, tag)) = find_first_tag(&self.pending, &VISIBLE_TAGS) else {
+                        if flush {
+                            visible.push_str(&self.pending);
+                            self.pending.clear();
+                        } else {
+                            let keep = longest_tag_prefix_suffix(&self.pending, &VISIBLE_TAGS);
+                            let emit_len = self.pending.len().saturating_sub(keep);
+                            visible.push_str(&self.pending[..emit_len]);
+                            self.pending.drain(..emit_len);
+                        }
+                        break;
+                    };
+
+                    visible.push_str(&self.pending[..idx]);
+                    self.pending.drain(..idx + tag.len());
+                    self.hidden = match tag {
+                        tag if tag == TOOL_CALL_BLOCK.open => Some(HiddenBlock::ToolCall),
+                        tag if tag == THINK_BLOCK.open => Some(HiddenBlock::Think),
+                        _ => None,
+                    };
+                }
+                Some(HiddenBlock::ToolCall) => {
+                    if let Some(idx) = self.pending.find(TOOL_CALL_BLOCK.close) {
+                        self.tool_buf.push_str(&self.pending[..idx]);
+                        if let Some(call) = parse_tool_call_block(self.tool_buf.trim()) {
+                            calls.push(call);
+                        }
+                        self.tool_buf.clear();
+                        self.pending.drain(..idx + TOOL_CALL_BLOCK.close.len());
+                        self.hidden = None;
+                    } else if flush {
+                        // Unterminated tool_call block: drop it.
+                        self.pending.clear();
+                        self.tool_buf.clear();
+                        self.hidden = None;
+                        break;
+                    } else {
+                        let keep =
+                            longest_tag_prefix_suffix(&self.pending, &[TOOL_CALL_BLOCK.close]);
+                        let take_len = self.pending.len().saturating_sub(keep);
+                        self.tool_buf.push_str(&self.pending[..take_len]);
+                        self.pending.drain(..take_len);
+                        break;
+                    }
+                }
+                Some(HiddenBlock::Think) => {
+                    if let Some(idx) = self.pending.find(THINK_BLOCK.close) {
+                        self.pending.drain(..idx + THINK_BLOCK.close.len());
+                        self.hidden = None;
+                    } else if flush {
+                        self.pending.clear();
+                        self.hidden = None;
+                        break;
+                    } else {
+                        let keep = longest_tag_prefix_suffix(&self.pending, &[THINK_BLOCK.close]);
+                        let drop_len = self.pending.len().saturating_sub(keep);
+                        self.pending.drain(..drop_len);
+                        break;
+                    }
+                }
+            }
+        }
+
+        (visible, calls)
+    }
+}
+
+/// Parse a single `<tool_call>` inner JSON payload into a [`ToolCall`].
+///
+/// Shares the exact decoding contract used by [`parse_tool_calls`].
+fn parse_tool_call_block(json_str: &str) -> Option<ToolCall> {
+    let value = serde_json::from_str::<Value>(json_str).ok()?;
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let arguments = value
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(Map::default()));
+    Some(ToolCall::new(name, arguments))
+}
+
 fn find_first_tag<'a>(text: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
     tags.iter()
         .filter_map(|tag| text.find(tag).map(|idx| (idx, *tag)))
@@ -556,8 +680,36 @@ pub struct ParsedAssistantResponse {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// OpenAI `tool_choice` semantics applied during prompt construction.
+///
+/// Mirrors the OpenAI wire format: `Auto` lets the model decide, `None`
+/// suppresses tool emission entirely, `Required` forces some tool call, and
+/// `Function` forces one named tool.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ToolChoiceMode {
+    #[default]
+    Auto,
+    None,
+    Required,
+    Function(String),
+}
+
 /// Build the tool definitions block for injection into a system prompt.
+///
+/// Thin `Auto` wrapper over [`build_tool_block_with_choice`].
 pub fn build_tool_block(tools: &[ToolDefinition]) -> String {
+    build_tool_block_with_choice(tools, &ToolChoiceMode::Auto)
+}
+
+/// Build the tool definitions block honoring an OpenAI `tool_choice` hint.
+///
+/// `None` returns an empty block (no tools are advertised, so the model
+/// answers as plain text). `Required` and `Function` append a directive that
+/// forces tool emission.
+pub fn build_tool_block_with_choice(tools: &[ToolDefinition], choice: &ToolChoiceMode) -> String {
+    if matches!(choice, ToolChoiceMode::None) {
+        return String::new();
+    }
     if tools.is_empty() {
         return String::new();
     }
@@ -575,12 +727,39 @@ pub fn build_tool_block(tools: &[ToolDefinition]) -> String {
         "\n</tools>\nUse <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. \
 Never echo <tools>, <tool_call>, or <tool_response> in the final user-facing answer.",
     );
+
+    match choice {
+        ToolChoiceMode::Required => {
+            out.push_str(
+                "\nYou MUST respond by emitting a <tool_call> for one of the available tools; \
+do not answer in plain prose.",
+            );
+        }
+        ToolChoiceMode::Function(name) => {
+            out.push_str(&format!(
+                "\nYou MUST call the `{name}` tool via <tool_call> and no other tool; \
+do not answer in plain prose."
+            ));
+        }
+        ToolChoiceMode::Auto | ToolChoiceMode::None => {}
+    }
+
     out
 }
 
 /// Convert structured messages + tool definitions into a ChatML prompt.
 pub fn messages_to_prompt(messages: &[ChatMessage], tools: &[ToolDefinition]) -> String {
-    let tool_block = build_tool_block(tools);
+    messages_to_prompt_with_tool_choice(messages, tools, &ToolChoiceMode::Auto)
+}
+
+/// Convert structured messages + tool definitions into a ChatML prompt,
+/// honoring an OpenAI `tool_choice` hint via [`build_tool_block_with_choice`].
+pub fn messages_to_prompt_with_tool_choice(
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+    choice: &ToolChoiceMode,
+) -> String {
+    let tool_block = build_tool_block_with_choice(tools, choice);
     let mut renderer = PromptRenderer::new(&tool_block);
     for message in messages {
         renderer.push_message(message);
@@ -611,19 +790,7 @@ pub fn render_structured_chatml_with_spans(
 
 /// Parse `<tool_call>...</tool_call>` blocks from raw assistant output.
 pub fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
-    let (stripped, tool_calls) = TOOL_CALL_BLOCK.strip_and_collect(text, |json_str| {
-        let value = serde_json::from_str::<Value>(json_str).ok()?;
-        let name = value
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let arguments = value
-            .get("arguments")
-            .cloned()
-            .unwrap_or(Value::Object(Map::default()));
-        Some(ToolCall::new(name, arguments))
-    });
+    let (stripped, tool_calls) = TOOL_CALL_BLOCK.strip_and_collect(text, parse_tool_call_block);
 
     ParsedAssistantResponse {
         content: THINK_BLOCK.strip_all(&stripped).trim().to_string(),
@@ -916,5 +1083,142 @@ mod tests {
 
         assert!(prompt.contains("<|im_start|>assistant\nresponse<|im_end|>"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    fn drive_streaming(
+        stream: &mut StreamingToolCalls,
+        chunks: &[&str],
+    ) -> (String, Vec<ToolCall>) {
+        let mut visible = String::new();
+        let mut calls = Vec::new();
+        for chunk in chunks {
+            let (text, new_calls) = stream.push(chunk);
+            visible.push_str(&text);
+            calls.extend(new_calls);
+        }
+        let (text, new_calls) = stream.finish();
+        visible.push_str(&text);
+        calls.extend(new_calls);
+        (visible, calls)
+    }
+
+    #[test]
+    fn streaming_tool_calls_single_call_split_across_chunks() {
+        let mut stream = StreamingToolCalls::default();
+        // The `<tool_call>` open tag is split mid-tag across chunk boundaries.
+        let (visible, calls) = drive_streaming(
+            &mut stream,
+            &[
+                "Looking<tool",
+                "_call>{\"name\":\"shell\",\"argum",
+                "ents\":{\"command\":\"pwd\"}}</tool_call> done",
+            ],
+        );
+
+        assert_eq!(visible, "Looking done");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+    }
+
+    #[test]
+    fn streaming_tool_calls_two_sequential_calls() {
+        let mut stream = StreamingToolCalls::default();
+        let (visible, calls) = drive_streaming(
+            &mut stream,
+            &[
+                "<tool_call>{\"name\":\"a\",\"arguments\":{\"x\":1}}</tool_call>",
+                "<tool_call>{\"name\":\"b\",\"arguments\":{\"y\":2}}</tool_call>",
+            ],
+        );
+
+        assert_eq!(visible, "");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[0].arguments["x"], 1);
+        assert_eq!(calls[1].name, "b");
+        assert_eq!(calls[1].arguments["y"], 2);
+    }
+
+    #[test]
+    fn streaming_tool_calls_hides_think_and_keeps_visible_text() {
+        let mut stream = StreamingToolCalls::default();
+        let (visible, calls) = drive_streaming(
+            &mut stream,
+            &[
+                "Hello <think>private</think>world ",
+                "<tool_call>{\"name\":\"shell\",\"arguments\":{}}</tool_call>",
+                "!",
+            ],
+        );
+
+        assert_eq!(visible, "Hello world !");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn streaming_tool_calls_plain_text_passes_through() {
+        let mut stream = StreamingToolCalls::default();
+        let (visible, calls) = drive_streaming(&mut stream, &["just ", "plain ", "text answer"]);
+
+        assert_eq!(visible, "just plain text answer");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn streaming_tool_calls_drops_unterminated_block() {
+        let mut stream = StreamingToolCalls::default();
+        let (visible, calls) =
+            drive_streaming(&mut stream, &["text <tool_call>{\"name\":\"shell\",\"argu"]);
+
+        assert_eq!(visible, "text ");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn build_tool_block_with_choice_none_is_empty() {
+        let block = build_tool_block_with_choice(
+            &[ToolDefinition::new(
+                "shell",
+                "Run a shell command",
+                json!({}),
+            )],
+            &ToolChoiceMode::None,
+        );
+        assert!(block.is_empty());
+    }
+
+    #[test]
+    fn build_tool_block_with_choice_required_appends_directive() {
+        let block = build_tool_block_with_choice(
+            &[ToolDefinition::new(
+                "shell",
+                "Run a shell command",
+                json!({}),
+            )],
+            &ToolChoiceMode::Required,
+        );
+        assert!(block.contains("<tools>"));
+        assert!(block.contains("You MUST respond by emitting a <tool_call>"));
+    }
+
+    #[test]
+    fn build_tool_block_with_choice_function_names_the_tool() {
+        let block = build_tool_block_with_choice(
+            &[ToolDefinition::new(
+                "shell",
+                "Run a shell command",
+                json!({}),
+            )],
+            &ToolChoiceMode::Function("shell".to_string()),
+        );
+        assert!(block.contains("You MUST call the `shell` tool via <tool_call>"));
+    }
+
+    #[test]
+    fn build_tool_block_required_with_no_tools_is_empty() {
+        let block = build_tool_block_with_choice(&[], &ToolChoiceMode::Required);
+        assert!(block.is_empty());
     }
 }

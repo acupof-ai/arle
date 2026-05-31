@@ -341,7 +341,8 @@ fn chat_request_rejects_non_function_tools() {
 }
 
 #[test]
-fn chat_request_rejects_streaming_tools() {
+fn chat_request_accepts_streaming_tools() {
+    // Streaming tool calls are now supported (OpenAI delta format).
     let req: ChatCompletionRequest = serde_json::from_str(
         r#"{
             "messages":[{"role":"user","content":"hi"}],
@@ -350,13 +351,7 @@ fn chat_request_rejects_streaming_tools() {
         }"#,
     )
     .unwrap();
-    let err = req
-        .validate()
-        .expect_err("streaming chat tools should fail until delta.tool_calls exist");
-    assert_eq!(err.body.code, "invalid_parameter");
-    assert_eq!(err.body.param.as_deref(), Some("stream"));
-    assert!(err.body.message.contains("stream=true"));
-    assert!(err.body.message.contains("tool calls"));
+    req.validate().expect("streaming chat tools are supported");
 }
 
 #[test]
@@ -590,4 +585,100 @@ fn responses_request_accepts_tool_choice_and_response_format() {
         other => panic!("expected ToolChoice::Mode(\"auto\"), got {other:?}"),
     }
     assert_eq!(req.response_format.as_ref().unwrap().kind, "json_object");
+}
+
+#[test]
+fn chat_tool_choice_required_without_tools_is_rejected() {
+    let req: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "messages":[{"role":"user","content":"hi"}],
+            "tool_choice":"required"
+        }"#,
+    )
+    .unwrap();
+    let err = req
+        .validate()
+        .expect_err("tool_choice=required without tools should fail");
+    assert_eq!(err.body.code, "invalid_parameter");
+    assert_eq!(err.body.param.as_deref(), Some("tool_choice"));
+    assert!(err.body.message.contains("non-empty `tools`"));
+}
+
+#[test]
+fn chat_tool_choice_function_name_not_in_tools_is_rejected() {
+    let req: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"shell"}}],
+            "tool_choice":{"type":"function","function":{"name":"weather"}}
+        }"#,
+    )
+    .unwrap();
+    let err = req
+        .validate()
+        .expect_err("tool_choice forcing an unknown function should fail");
+    assert_eq!(err.body.code, "invalid_parameter");
+    assert_eq!(err.body.param.as_deref(), Some("tool_choice.function.name"));
+    assert!(err.body.message.contains("weather"));
+}
+
+#[test]
+fn chat_tool_choice_none_is_accepted() {
+    let req: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "messages":[{"role":"user","content":"hi"}],
+            "tool_choice":"none"
+        }"#,
+    )
+    .unwrap();
+    req.validate().expect("tool_choice=none is always allowed");
+    assert_eq!(req.tool_choice_mode(), ToolChoiceMode::None);
+}
+
+#[test]
+fn chat_from_output_with_tool_choice_none_returns_content_no_tool_calls() {
+    let output = CompletionOutput {
+        text: "Sure.\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>"
+            .to_string(),
+        finish_reason: crate::server_engine::FinishReason::Stop,
+        usage: crate::server_engine::TokenUsage {
+            prompt_tokens: 2,
+            completion_tokens: 3,
+            total_tokens: 5,
+        },
+        token_logprobs: Vec::new(),
+        prompt_token_ids: Vec::new(),
+        response_token_ids: Vec::new(),
+    };
+    let response = ChatCompletionResponse::from_output(
+        "Qwen3-4B".to_string(),
+        1,
+        &output,
+        ToolChoiceMode::None,
+    );
+
+    let payload = serde_json::to_value(response).unwrap();
+    assert_eq!(payload["choices"][0]["message"]["content"], "Sure.");
+    assert!(
+        payload["choices"][0]["message"].get("tool_calls").is_none(),
+        "tool_calls must be suppressed when tool_choice=none"
+    );
+    assert_eq!(payload["choices"][0]["finish_reason"], "stop");
+}
+
+#[test]
+fn chat_stream_tool_call_chunk_has_openai_shape() {
+    let call = chat::ToolCall::new("shell", serde_json::json!({ "command": "pwd" }));
+    let chunk = ChatStreamChunk::tool_call_chunk("chatcmpl-x", 1, "Qwen3-4B", 0, &call);
+
+    let payload = serde_json::to_value(chunk).unwrap();
+    let delta = &payload["choices"][0]["delta"];
+    assert_eq!(delta["tool_calls"][0]["index"], 0);
+    assert_eq!(delta["tool_calls"][0]["type"], "function");
+    assert_eq!(delta["tool_calls"][0]["function"]["name"], "shell");
+    assert_eq!(
+        delta["tool_calls"][0]["function"]["arguments"],
+        "{\"command\":\"pwd\"}"
+    );
+    assert!(payload["choices"][0]["finish_reason"].is_null());
 }
