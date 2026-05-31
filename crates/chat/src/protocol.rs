@@ -725,6 +725,9 @@ pub fn build_tool_block_with_choice(tools: &[ToolDefinition], choice: &ToolChoic
 
     out.push_str(
         "\n</tools>\nUse <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. \
+Call a tool only when you need information you don't already have, and never repeat a call \
+you already made. As soon as you have enough information, STOP calling tools and reply to the \
+user with a direct, complete final answer in plain language. \
 Never echo <tools>, <tool_call>, or <tool_response> in the final user-facing answer.",
     );
 
@@ -817,6 +820,31 @@ fn extract_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     while let Some(start) = rest.find(TOOL_CALL_BLOCK.open) {
         out.push_str(&rest[..start]);
         let after = &rest[start + TOOL_CALL_BLOCK.open.len()..];
+
+        // Qwen3.6 NATIVE form: <tool_call><function=NAME><parameter=K>V</parameter>…</function>.
+        // Try it first when `<function=` is the first meaningful content.
+        if let Some(fpos) = after.find("<function=")
+            && after[..fpos].trim().is_empty()
+        {
+            let consumed = if let Some(fend) = after.find("</function>") {
+                let end = fend + "</function>".len();
+                if let Some(call) = parse_native_function_block(&after[..end]) {
+                    calls.push(call);
+                }
+                match after[end..].find(TOOL_CALL_BLOCK.close) {
+                    Some(c) if after[end..end + c].trim().is_empty() => {
+                        end + c + TOOL_CALL_BLOCK.close.len()
+                    }
+                    _ => end,
+                }
+            } else {
+                after.len() // truncated `<function=…` — drop rest, never leak
+            };
+            rest = &after[consumed..];
+            continue;
+        }
+
+        // JSON form: <tool_call>{json}  (close tag optional, brace-matched).
         match after
             .find('{')
             .and_then(|b| json_object_len(&after[b..]).map(|len| (b, len)))
@@ -881,6 +909,42 @@ fn json_object_len(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Parse Qwen3.6's native XML tool-call body
+/// `<function=NAME><parameter=KEY>\nVALUE\n</parameter>…</function>` into a
+/// [`ToolCall`]. Parameter values stay strings unless they parse as JSON
+/// numbers/booleans/objects, mirroring the chat template's `| tojson` rendering
+/// of non-string arguments.
+fn parse_native_function_block(inner: &str) -> Option<ToolCall> {
+    let fstart = inner.find("<function=")?;
+    let after_fn = &inner[fstart + "<function=".len()..];
+    let name_end = after_fn.find('>')?;
+    let name = after_fn[..name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = Map::new();
+    let mut rest = &after_fn[name_end + 1..];
+    while let Some(ps) = rest.find("<parameter=") {
+        let after_p = &rest[ps + "<parameter=".len()..];
+        let Some(key_end) = after_p.find('>') else {
+            break;
+        };
+        let key = after_p[..key_end].trim().to_string();
+        let val_area = &after_p[key_end + 1..];
+        let Some(pe) = val_area.find("</parameter>") else {
+            break;
+        };
+        let raw = val_area[..pe].trim();
+        let value = serde_json::from_str::<Value>(raw)
+            .ok()
+            .filter(|v| !v.is_string())
+            .unwrap_or_else(|| Value::String(raw.to_string()));
+        args.insert(key, value);
+        rest = &val_area[pe + "</parameter>".len()..];
+    }
+    Some(ToolCall::new(name, Value::Object(args)))
 }
 
 /// Render a raw ChatML message list using the canonical `<|im_start|>...`
@@ -1143,6 +1207,27 @@ mod tests {
         );
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.content, "done now.");
+    }
+
+    #[test]
+    fn parse_tool_call_native_xml_function_format() {
+        // Qwen3.6's native XML tool-call form.
+        let parsed = parse_tool_calls(
+            "<tool_call>\n<function=shell>\n<parameter=command>\nls -la\n</parameter>\n</function>\n</tool_call>",
+        );
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].arguments["command"], "ls -la");
+        assert_eq!(parsed.content, "");
+    }
+
+    #[test]
+    fn parse_tool_call_native_xml_numeric_parameter() {
+        let parsed = parse_tool_calls(
+            "<tool_call><function=wait><parameter=seconds>30</parameter></function></tool_call>",
+        );
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].arguments["seconds"], 30);
     }
 
     #[test]
