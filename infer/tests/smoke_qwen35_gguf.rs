@@ -28,6 +28,7 @@ fn qwen35_gguf_generate() {
             logprobs: false,
             session_id: None,
             trace_context: None,
+            cancel: None,
         };
         let out = engine.complete(req).unwrap();
         println!(

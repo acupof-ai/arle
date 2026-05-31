@@ -308,6 +308,7 @@ impl DistributedSchedulerGroup {
             delta_tx,
             trace_context: req.trace_context,
             distributed: Some(distributed),
+            cancel: req.cancel.clone(),
         }
     }
 
@@ -396,6 +397,7 @@ impl DistributedSchedulerGroup {
             delta_tx,
             trace_context: None,
             distributed: None, // scheduler attaches NCCL-backed coord on ingest
+            cancel: None,      // cancel flag does not cross the relay wire
         }
     }
 
@@ -617,6 +619,7 @@ mod tests {
             delta_tx,
             trace_context: None,
             distributed: None,
+            cancel: None,
         }
     }
 

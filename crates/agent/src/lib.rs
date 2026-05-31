@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -409,7 +410,7 @@ impl AgentSession {
         tool_executor: &X,
         tool_policy: &P,
         settings: AgentSettings,
-        cancel: &AtomicBool,
+        cancel: Arc<AtomicBool>,
     ) -> Result<Option<AgentTurnResult>> {
         self.run_turn_interruptibly_with_callbacks(
             engine,
@@ -435,7 +436,7 @@ impl AgentSession {
         tool_executor: &X,
         tool_policy: &P,
         settings: AgentSettings,
-        cancel: &AtomicBool,
+        cancel: Arc<AtomicBool>,
         callbacks: AgentTurnCallbacks<'_>,
     ) -> Result<Option<AgentTurnResult>> {
         self.run_turn_inner(
@@ -458,7 +459,7 @@ impl AgentSession {
         tool_executor: &X,
         tool_policy: &P,
         settings: AgentSettings,
-        cancel: Option<&AtomicBool>,
+        cancel: Option<Arc<AtomicBool>>,
         callbacks: AgentTurnCallbacks<'_>,
     ) -> Result<Option<AgentTurnResult>> {
         let turn_start = self.messages.len();
@@ -577,8 +578,9 @@ impl AgentSession {
                         logprobs: false,
                         session_id: None,
                         trace_context: None,
+                        cancel: cancel.clone(),
                     },
-                    cancel,
+                    cancel.clone(),
                     Some(&mut stream_visible_chunk as &mut dyn FnMut(&str)),
                 )?
                 else {
@@ -699,7 +701,7 @@ impl AgentSession {
                             tools,
                             settings,
                             &output.text,
-                            cancel,
+                            cancel.clone(),
                             // The next free slot — the main generation
                             // already pushed its record above.
                             sub_turns.len(),
@@ -1176,7 +1178,7 @@ fn repair_tool_calls<E: InferenceEngine + ?Sized>(
     tools: &[ToolDefinition],
     settings: AgentSettings,
     assistant_draft: &str,
-    cancel: Option<&AtomicBool>,
+    cancel: Option<Arc<AtomicBool>>,
     sub_turn_index: usize,
 ) -> Result<Option<RepairOutcome>> {
     let mut repair_messages = messages.to_vec();
@@ -1202,6 +1204,7 @@ If no tool is needed, output exactly NO_TOOL.",
             logprobs: false,
             session_id: None,
             trace_context: None,
+            cancel: cancel.clone(),
         },
         cancel,
         None,
@@ -1246,7 +1249,7 @@ If no tool is needed, output exactly NO_TOOL.",
 fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
     engine: &mut E,
     req: CompletionRequest,
-    cancel: Option<&AtomicBool>,
+    cancel: Option<Arc<AtomicBool>>,
     mut on_text_chunk: Option<&mut dyn FnMut(&str)>,
 ) -> Result<Option<CompletionOutput>> {
     if cancel.is_none() && on_text_chunk.is_none() {
@@ -1272,7 +1275,10 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
         let worker = s.spawn(|| engine.complete_stream(req, tx));
 
         loop {
-            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            if cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
                 cancelled = true;
                 rx = None;
                 break;
