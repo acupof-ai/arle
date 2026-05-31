@@ -76,6 +76,7 @@ fn generate_qwen35_test_data() {
                 logprobs: false,
                 session_id: None,
                 trace_context: None,
+                cancel: None,
             })
             .expect("complete() failed");
 

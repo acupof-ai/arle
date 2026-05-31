@@ -64,6 +64,7 @@ fn carnice_27b_q4k_load_and_generate() {
             logprobs: true,
             session_id: None,
             trace_context: None,
+            cancel: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<CompletionStreamDelta>();
         let t0 = Instant::now();
