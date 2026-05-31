@@ -517,7 +517,7 @@ const ROLLOUT_RETAIN_INTERVAL: usize = 2;
 
 fn should_retain_rollout_step(step: usize, rollout_len: usize) -> bool {
     let completed_steps = step + 1;
-    completed_steps % ROLLOUT_RETAIN_INTERVAL == 0 || completed_steps == rollout_len
+    completed_steps.is_multiple_of(ROLLOUT_RETAIN_INTERVAL) || completed_steps == rollout_len
 }
 
 fn retain_rollout_step_tensors(
@@ -898,7 +898,6 @@ fn slice_logits_for_kl(
     slice(logits, &starts, &ends, store, tape).map_err(OpdError::from)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
