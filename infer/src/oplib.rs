@@ -12,11 +12,15 @@
 //!
 //! **Phase 1** lands the `linear` family: the relocated linear / GEMM dispatch
 //! selection. **Phase 2** lands the `attention` family: the relocated HD256
-//! TileLang `(num_qo_heads, num_kv_heads)` head-config resolver. Further
-//! families (KV quant, grouped/MoE GEMM) are added one-per-migrated-family in
-//! later tranches — never stubbed ahead of a real consumer.
+//! TileLang `(num_qo_heads, num_kv_heads)` head-config resolver. **Phase 3**
+//! lands the `kv_dispatch` family: the relocated `KVFormat → scheme` partition
+//! the Qwen3.5 decode / prefill kernel-launch `match`es switch on. Further
+//! families (grouped/MoE GEMM) are added one-per-migrated-family in later
+//! tranches — never stubbed ahead of a real consumer.
 
 #[path = "oplib/attention.rs"]
 pub mod attention;
+#[path = "oplib/kv_dispatch.rs"]
+pub mod kv_dispatch;
 #[path = "oplib/linear.rs"]
 pub mod linear;
