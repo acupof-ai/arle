@@ -738,6 +738,52 @@ fn handle_repl_input(
     Ok(true)
 }
 
+/// Animated "thinking…" spinner shown on stderr while the model is computing
+/// and nothing visible has been printed yet. A complete no-op when stderr is
+/// not a TTY — that keeps `run_one_shot --json` and piped output clean (and
+/// `run_one_shot` doesn't route through `run_agent_turn` anyway, so its stdout
+/// JSON path can never see this).
+///
+/// indicatif draws to stderr by default, which is what we want: the actual
+/// answer tokens go to stdout, so the spinner never collides with them.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+struct ThinkingSpinner {
+    bar: Option<indicatif::ProgressBar>,
+    enabled: bool,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+impl ThinkingSpinner {
+    /// `enabled` should be `io::stderr().is_terminal()`. When false every
+    /// method is inert and `bar` stays `None`.
+    fn new(enabled: bool) -> Self {
+        Self { bar: None, enabled }
+    }
+
+    /// Create + steady-tick a spinner if enabled and none is currently active.
+    /// Idempotent: a second call while one is live is a no-op.
+    fn start(&mut self) {
+        if !self.enabled || self.bar.is_some() {
+            return;
+        }
+        let bar = indicatif::ProgressBar::new_spinner();
+        bar.set_style(
+            indicatif::ProgressStyle::with_template("{spinner:.cyan} thinking… {elapsed}")
+                .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner()),
+        );
+        bar.enable_steady_tick(Duration::from_millis(80));
+        self.bar = Some(bar);
+    }
+
+    /// Clear the spinner line and drop the bar. Idempotent / safe when none
+    /// is active.
+    fn stop(&mut self) {
+        if let Some(bar) = self.bar.take() {
+            bar.finish_and_clear();
+        }
+    }
+}
+
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 fn run_agent_turn(
@@ -757,10 +803,15 @@ fn run_agent_turn(
     let color_on = io::stdout().is_terminal();
     let render_state = RefCell::new((false, false));
     let tps_meter = RefCell::new(crate::tps::TpsMeter::new());
+    let spinner = RefCell::new(ThinkingSpinner::new(io::stderr().is_terminal()));
     let mut on_text_chunk = |chunk: &str| {
         if chunk.is_empty() {
             return;
         }
+        // Clear the spinner the instant visible output starts — before any
+        // stdout write and before tps_meter erases its own status line, so
+        // no leftover spinner glyph collides with the answer tokens.
+        spinner.borrow_mut().stop();
         let mut state = render_state.borrow_mut();
         tps_meter.borrow_mut().hide_before_chunk();
         if color_on && !state.0 {
@@ -784,6 +835,8 @@ fn run_agent_turn(
             // re-emitting it here would just duplicate.
             return;
         };
+        // Clear the spinner before printing the tool-call line.
+        spinner.borrow_mut().stop();
         let mut state = render_state.borrow_mut();
         tps_meter.borrow_mut().hide_before_chunk();
         if color_on && state.0 {
@@ -797,8 +850,14 @@ fn run_agent_turn(
         let line = format_tool_call_line(name, arguments, result);
         println!("{line}");
         let _ = io::stdout().flush();
+        // The model now computes its next step — show the spinner again until
+        // the next visible output (text chunk or tool line) arrives.
+        spinner.borrow_mut().start();
     };
-    match session.run_turn_interruptibly_with_callbacks(
+    // Show the spinner while the model computes before any output appears.
+    // The callbacks stop() it the instant visible output starts.
+    spinner.borrow_mut().start();
+    let turn = session.run_turn_interruptibly_with_callbacks(
         engine,
         input,
         tools,
@@ -814,7 +873,13 @@ fn run_agent_turn(
             on_text_chunk: Some(&mut on_text_chunk),
             on_trace_event: Some(&mut on_trace_event),
         },
-    ) {
+    );
+    // Ensure no spinner survives the turn — including the cancelled / error
+    // paths, and turns that finished without ever streaming. Must precede any
+    // stdout token or tps_meter.print_final() below. stop() is idempotent, so
+    // the arms that already stopped it via the callbacks are unaffected.
+    spinner.borrow_mut().stop();
+    match turn {
         Ok(Some(result)) => {
             let (color_open, streamed_any) = *render_state.borrow();
             if color_on && color_open {
@@ -1435,13 +1500,32 @@ fn print_session_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplCommand, SessionStats, brief_tool_args, brief_tool_result, count_export_turns,
-        detect_family, format_iso8601_utc, format_tool_call_line, handle_export_command,
-        handle_models_command, parse_repl_command, render_history_markdown, resolve_export_path,
-        truncate_one_line,
+        ReplCommand, SessionStats, ThinkingSpinner, brief_tool_args, brief_tool_result,
+        count_export_turns, detect_family, format_iso8601_utc, format_tool_call_line,
+        handle_export_command, handle_models_command, parse_repl_command, render_history_markdown,
+        resolve_export_path, truncate_one_line,
     };
     use chat::ChatMessage;
     use std::time::Duration;
+
+    #[test]
+    fn thinking_spinner_disabled_is_a_no_op() {
+        // enabled=false (e.g. stderr is not a TTY): start()/stop() must never
+        // panic and the bar must stay None so nothing is ever drawn. This is
+        // the path that keeps `run_one_shot --json` / piped output clean.
+        let mut spinner = ThinkingSpinner::new(false);
+        assert!(spinner.bar.is_none());
+        spinner.start();
+        assert!(
+            spinner.bar.is_none(),
+            "disabled spinner must not create a bar"
+        );
+        spinner.start(); // idempotent
+        spinner.stop();
+        assert!(spinner.bar.is_none());
+        spinner.stop(); // idempotent / safe when none active
+        assert!(spinner.bar.is_none());
+    }
 
     #[test]
     fn parse_repl_command_supports_aliases_and_paths() {
