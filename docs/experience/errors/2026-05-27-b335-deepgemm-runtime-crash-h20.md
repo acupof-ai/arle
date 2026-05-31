@@ -235,11 +235,45 @@ FP8-pack scale-stride disagrees with the SFA TMA descriptor stride → OOB). Nex
 3. Rebuild (with the deepgemm env) + re-test; coherent output + no LAUNCH_FAILED confirms it; then bench the
    claimed ~2.5× expert-GEMM win vs the scalar grouped GEMM.
 
+## Update 2026-05-31 (RESOLVED) — root cause was the JIT *failing to compile*, not any kernel/contract bug
+
+candidate-2 is **REFUTED**. The crash was never an IMA, never the Rust calling contract, never the kernel port.
+Running the real deepgemm under the new `ARLE_SERVER_WRAP` compute-sanitizer toolchain hook surfaced the actual
+error buried in `server.log` (which prior greps for `IMA`/`LAUNCH_FAILED` had skipped):
+
+```
+DeepGEMM native bridge failed: NVCC DeepGEMM compile failed:
+/usr/include/c++/13/type_traits(2651): error: identifier "requires" is undefined
+      requires requires { typename _Op<_Args...>; }
+```
+
+The runtime JIT (`compile_with_nvcc`, deepgemm_native.cu) compiled every generated kernel with
+`-std=c++17 --compiler-options=...,-fconcepts`. `-fconcepts` makes host gcc-13 define `__cpp_concepts`, which makes
+its libstdc++ `<type_traits>` expose the **C++20 `requires`-clause** detection idiom (type_traits:2651). NVCC's
+**device** C++17 frontend (cicc/EDG) can't parse `requires`, so the JIT compile died — and the GEMM surfaced that
+failure downstream as `CUDA_ERROR_UNKNOWN` / earlier `CUDA_ERROR_LAUNCH_FAILED`. The kernel never ran; the
+varying `max_m` (88/96/104/112/144) across layers was just per-chunk route counts, never a shape the kernel choked on.
+
+The `c++17+fconcepts` combo (commit `38bf157b`) worked on the **old** pod (the comment said CUDA 12.2). This pod is
+**CUDA 12.9 + gcc 13.3** — 12.9's nvcc fully supports `-std=c++20` device-side, so concepts parse natively and
+`-fconcepts` is redundant.
+
+**Fix** (commit pending): JIT uses `-std=c++20`, drop `-fconcepts`. **Ground-truthed without an infer rebuild** by
+recompiling the EXACT failing generated `~/.deep_gemm/tmp/arle-*/kernel.cu` on the pod:
+`c++17+fconcepts` → EXIT=1 (type_traits:2651), `c++20`-no-`fconcepts` → EXIT=0 (clean 83 KB cubin).
+
 ### Rule
 - **A `NOT_SUPPORTED` / "operation not supported" from a vendored, build-flag-gated bridge is "the stub is linked"
   until proven otherwise.** Check the `#ifdef`/build.rs feature gate and confirm the real TU compiled (grep the
-  binary / the build log for the real symbol) BEFORE theorizing about kernel internals. Hours of TMA/cluster/SFA
-  analysis evaporated against one missing build env var.
+  binary / the build log for the real symbol) BEFORE theorizing about kernel internals.
+- **A device error code names the *surface*, not the *cause* — grep the WHOLE error chain, including subprocess
+  stderr, before theorizing about the device.** `LAUNCH_FAILED`/`UNKNOWN` on a JIT'd kernel sent two sessions down
+  IMA → calling-contract → kernel-port rabbit holes; the real cause (`NVCC ... compile failed: ... "requires"`) was
+  sitting in `server.log` the whole time, skipped because the greps only matched `IMA`/`LAUNCH_FAILED`. For any
+  runtime-JIT path, grep `compile failed`/`error:`/the compiler name first.
+- **When a leftover JIT artifact exists, validate the compiler-flag fix on the exact failing TU before rebuilding the
+  consumer.** `compile_with_nvcc` leaves `$HOME/.deep_gemm/tmp/arle-<digest>/kernel.cu` on failure (it throws before
+  the tmp→cache rename) — recompiling that with candidate flags is a 2-minute experiment vs a 20-minute infer rebuild.
 
 ## Refs
 
