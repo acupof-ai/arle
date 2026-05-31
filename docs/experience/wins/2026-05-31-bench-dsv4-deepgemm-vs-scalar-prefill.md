@@ -42,6 +42,23 @@ native   545-tok times: `[7.619, 7.620, 7.623, 7.652, 7.714]`
 a WORSE scaling cliff (breaks at ~1k tokens vs native's ~2k). **Verdict: deepgemm is NOT
 production-viable as-is.**
 
+### Controlled re-run at mem-fraction-static=0.85 (supersedes the 0.10 framing)
+
+The numbers above were taken at the toolchain smoke default `mem-fraction-static=0.10`. A
+suggestive `core.rs:1733` "host tier full, dropped GPU blocks" WARN made KV starvation look
+like the cause of the timeouts. **A controlled 0.10-vs-0.85 re-run REFUTES that:**
+
+| prefill | 0.10 | 0.85 |
+|---|---|---|
+| native 512 / 1024 | 7.62 / 16.70 s | 7.63 / 16.70 s (identical) |
+| native 2048 | timeout | **timeout** (real cliff, root cause OPEN — NOT mem-fraction) |
+| deepgemm 512 / 1024 | 6.90 ✓ / timeout | 6.91 ✓ / **timeout** (max_m compute cliff, §root-cause) |
+
+mem-fraction made zero difference; the WARNs are a one-time early event (one per rank, same
+instant), not a thrash loop. So: deepgemm's 1024 cliff is the `max_m=total` compute oversizing
+(the one variable that differs from scalar); native's 2048 cliff is a real, still-unrooted
+scaling threshold (>18× for 2× tokens — needs a `RUST_LOG=info` profile, do not guess again).
+
 ## Root-cause hypothesis for the deepgemm cliff (code-grounded, needs profile to confirm)
 
 `forward_deepgemm_all_dsv4_experts_gpu` (mlp.rs) passes `route_capacity = total_local_routes`
