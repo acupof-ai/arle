@@ -18,8 +18,9 @@ use axum::middleware;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use chat::{
-    DeepSeekV4ChatTemplateOptions, openai_messages_to_deepseek_v4_prompt,
+    DeepSeekV4ChatTemplateOptions, StreamingToolCalls, openai_messages_to_deepseek_v4_prompt,
     openai_messages_to_prompt as chat_messages_to_prompt,
+    openai_messages_to_prompt_with_tool_choice,
 };
 use fastrace::Span;
 use fastrace::collector::SpanContext;
@@ -760,15 +761,24 @@ fn is_deepseek_v4_model(model_id: &str) -> bool {
 }
 
 fn build_chat_prompt(model_id: &str, req: &ChatCompletionRequest) -> String {
+    let choice = req.tool_choice_mode();
     if is_deepseek_v4_model(model_id) {
         let kwargs = req.chat_template_kwargs.as_ref();
         let options = DeepSeekV4ChatTemplateOptions {
             thinking: kwargs.and_then(|value| value.thinking).unwrap_or(false),
             reasoning_effort: kwargs.and_then(|value| value.reasoning_effort.clone()),
         };
-        openai_messages_to_deepseek_v4_prompt(&req.messages, &req.tools, &options)
+        // The DeepSeek-V4 prompt builder has no force-tool directive surface;
+        // honor `none` by withholding the tools block, leave Auto/Required/
+        // Function on Auto-equivalent behavior.
+        let tools: &[chat::OpenAiToolDefinition] = if matches!(choice, chat::ToolChoiceMode::None) {
+            &[]
+        } else {
+            &req.tools
+        };
+        openai_messages_to_deepseek_v4_prompt(&req.messages, tools, &options)
     } else {
-        chat_messages_to_prompt(&req.messages, &req.tools)
+        openai_messages_to_prompt_with_tool_choice(&req.messages, &req.tools, &choice)
     }
 }
 
@@ -857,6 +867,140 @@ where
         }
     }
     events
+}
+
+/// Stateful adapter for streaming chat completions that carry tool definitions.
+///
+/// Owns a [`StreamingToolCalls`] extractor plus the per-stream tool index and a
+/// flag tracking whether any tool call was emitted (which decides the terminal
+/// `finish_reason`). The non-tool path keeps using [`delta_sse_events`] so we
+/// never start hiding `<think>` from plain chat streams.
+struct ChatToolStreamState {
+    request_id: String,
+    created: u64,
+    model: String,
+    include_usage: bool,
+    continuous_usage_stats: bool,
+    extractor: StreamingToolCalls,
+    tool_index: usize,
+    saw_tool_call: bool,
+}
+
+impl ChatToolStreamState {
+    /// Build the SSE events for one delta, mirroring `delta_sse_events`'
+    /// usage/error handling while routing text through the tool extractor and
+    /// emitting OpenAI tool-call deltas.
+    fn events_for_delta(&mut self, delta: CompletionStreamDelta) -> Vec<Result<Event, Infallible>> {
+        if let Some(error) = delta.error {
+            let kind = error.kind.clone();
+            let payload = serde_json::json!({
+                "error": {
+                    "message": error.message,
+                    "type": "server_error",
+                    "code": kind,
+                    "details": {
+                        "kind": kind,
+                        "chain": error.chain,
+                    },
+                },
+            });
+            return vec![Ok(Event::default().event("error").data(
+                serde_json::to_string(&payload).expect("error serialization"),
+            ))];
+        }
+
+        let usage = delta.usage;
+        let original_finish = delta.finish_reason;
+        let is_terminal = original_finish.is_some();
+
+        let (visible, calls) = self.extractor.push(&delta.text_delta);
+
+        let mut events: Vec<Result<Event, Infallible>> = Vec::new();
+
+        if !visible.is_empty() {
+            let chunk = ChatStreamChunk::content_chunk(
+                &self.request_id,
+                self.created,
+                &self.model,
+                CompletionStreamDelta::text(visible),
+            );
+            events.push(self.encode(&chunk));
+        }
+        for call in &calls {
+            let chunk = ChatStreamChunk::tool_call_chunk(
+                &self.request_id,
+                self.created,
+                &self.model,
+                self.tool_index,
+                call,
+            );
+            self.tool_index += 1;
+            self.saw_tool_call = true;
+            events.push(self.encode(&chunk));
+        }
+
+        if is_terminal {
+            // Flush any tail buffered inside the extractor before finishing.
+            let (tail_visible, tail_calls) = self.extractor.finish();
+            if !tail_visible.is_empty() {
+                let chunk = ChatStreamChunk::content_chunk(
+                    &self.request_id,
+                    self.created,
+                    &self.model,
+                    CompletionStreamDelta::text(tail_visible),
+                );
+                events.push(self.encode(&chunk));
+            }
+            for call in &tail_calls {
+                let chunk = ChatStreamChunk::tool_call_chunk(
+                    &self.request_id,
+                    self.created,
+                    &self.model,
+                    self.tool_index,
+                    call,
+                );
+                self.tool_index += 1;
+                self.saw_tool_call = true;
+                events.push(self.encode(&chunk));
+            }
+
+            let finish_reason = if self.saw_tool_call {
+                "tool_calls"
+            } else {
+                original_finish
+                    .map(FinishReason::as_openai_str)
+                    .unwrap_or("stop")
+            };
+            let finish = ChatStreamChunk::finish_chunk(
+                &self.request_id,
+                self.created,
+                &self.model,
+                finish_reason,
+            );
+            events.push(self.encode(&finish));
+        }
+
+        // Usage handling mirrors `delta_sse_events`: emit on terminal or when
+        // continuous_usage_stats requests per-chunk usage.
+        let emit_usage = self.include_usage && (is_terminal || self.continuous_usage_stats);
+        if emit_usage {
+            if let Some(u) = usage {
+                let usage_chunk = ChatStreamUsageChunk::from_usage(
+                    &self.request_id,
+                    self.created,
+                    &self.model,
+                    u,
+                );
+                events.push(self.encode(&usage_chunk));
+            }
+        }
+
+        events
+    }
+
+    fn encode<T: serde::Serialize>(&self, chunk: &T) -> Result<Event, Infallible> {
+        Ok(Event::default().data(serde_json::to_string(chunk).expect("chunk serialization")))
+    }
 }
 
 fn sse_json_event<T: serde::Serialize>(event_name: &'static str, payload: &T) -> Event {
@@ -1142,6 +1286,8 @@ pub(super) async fn chat_completions(
         let do_stream = options.stream;
         let include_usage = options.include_usage;
         let continuous_usage_stats = options.continuous_usage_stats;
+        let tool_choice = req.tool_choice_mode();
+        let has_tools = !req.tools.is_empty();
 
         let prompt = build_chat_prompt(&model_id, &req);
 
@@ -1183,15 +1329,44 @@ pub(super) async fn chat_completions(
 
             let req_id = request_id;
             let mid = model_id.clone();
-            let content_stream = UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
-                stream::iter(delta_sse_events(
-                    delta,
+            // Gate on tool presence: when tools are present we route deltas
+            // through the stateful tool extractor (which emits OpenAI tool-call
+            // deltas + a tool_calls finish_reason). When no tools are present we
+            // keep the existing plain `delta_sse_events` path byte-for-byte so we
+            // never start hiding `<think>` from plain chat streams.
+            let content_stream: futures_util::stream::BoxStream<
+                'static,
+                Result<Event, Infallible>,
+            > = if has_tools {
+                let state = ChatToolStreamState {
+                    request_id: req_id,
+                    created,
+                    model: mid,
                     include_usage,
                     continuous_usage_stats,
-                    |d| ChatStreamChunk::content_chunk(&req_id, created, &mid, d),
-                    |u| ChatStreamUsageChunk::from_usage(&req_id, created, &mid, u),
-                ))
-            });
+                    extractor: StreamingToolCalls::default(),
+                    tool_index: 0,
+                    saw_tool_call: false,
+                };
+                UnboundedReceiverStream::new(delta_rx)
+                    .scan(state, |state, delta| {
+                        std::future::ready(Some(stream::iter(state.events_for_delta(delta))))
+                    })
+                    .flatten()
+                    .boxed()
+            } else {
+                UnboundedReceiverStream::new(delta_rx)
+                    .flat_map(move |delta| {
+                        stream::iter(delta_sse_events(
+                            delta,
+                            include_usage,
+                            continuous_usage_stats,
+                            |d| ChatStreamChunk::content_chunk(&req_id, created, &mid, d),
+                            |u| ChatStreamUsageChunk::from_usage(&req_id, created, &mid, u),
+                        ))
+                    })
+                    .boxed()
+            };
 
             let full_stream = stream::once(async move { role_event })
                 .chain(content_stream)
@@ -1217,7 +1392,8 @@ pub(super) async fn chat_completions(
 
             async move {
                 let output = buffered.into_output();
-                let response = ChatCompletionResponse::from_output(model_id, now_secs(), &output);
+                let response =
+                    ChatCompletionResponse::from_output(model_id, now_secs(), &output, tool_choice);
                 Ok(Json(response).into_response())
             }
             .in_span(

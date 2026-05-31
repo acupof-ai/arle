@@ -1194,8 +1194,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completion_streaming_rejects_tools() {
-        let app = build_app(mock_scheduler("Qwen3-4B"));
+    async fn chat_completion_streaming_emits_tool_call_deltas() {
+        let app = build_app(mock_scheduler_with_deltas(
+            "Qwen3-4B",
+            vec![
+                CompletionStreamDelta {
+                    text_delta:
+                        "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>"
+                            .to_string(),
+                    finish_reason: None,
+                    usage: None,
+                    logprob: None,
+                    token_ids: Vec::new(),
+                    error: None,
+                },
+                CompletionStreamDelta {
+                    text_delta: String::new(),
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    }),
+                    logprob: None,
+                    token_ids: Vec::new(),
+                    error: None,
+                },
+            ],
+            false,
+        ));
         let request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -1203,6 +1230,7 @@ mod tests {
             .body(Body::from(
                 r#"{
                     "messages":[{"role":"user","content":"hi"}],
+                    "max_tokens":1,
                     "stream":true,
                     "tools":[{"type":"function","function":{"name":"shell"}}]
                 }"#,
@@ -1210,16 +1238,19 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["error"]["code"], "invalid_parameter");
-        assert_eq!(payload["error"]["param"], "stream");
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+
+        // A tool-call delta in OpenAI streaming shape was emitted.
         assert!(
-            payload["error"]["message"].as_str().is_some_and(|message| {
-                message.contains("stream=true") && message.contains("tool calls")
-            }),
+            payload.contains(r#""tool_calls""#) && payload.contains(r#""name":"shell""#),
+            "payload={payload}"
+        );
+        // The terminal finish chunk reports the tool_calls finish reason.
+        assert!(
+            payload.contains(r#""finish_reason":"tool_calls""#),
             "payload={payload}"
         );
     }

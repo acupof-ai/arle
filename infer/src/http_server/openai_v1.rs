@@ -6,7 +6,7 @@ use crate::server_engine::{CompletionOutput, CompletionStreamDelta, EnginePoolMo
 use crate::types::SessionId;
 use chat::{
     OpenAiChatContent, OpenAiChatMessage, OpenAiToolCall, OpenAiToolDefinition, ToolCall,
-    openai_parse_tool_calls,
+    ToolChoiceMode, openai_parse_tool_calls,
 };
 
 /// Normalize a raw string session hint from a client request. Empty / whitespace
@@ -806,21 +806,19 @@ impl StreamUsageChunk {
 // Shared OpenAI-compatible request hints
 // ============================================================================
 
-/// OpenAI `tool_choice`. Accepted permissively to unblock client tool-loops
-/// (ELI/nexil send this on every chat turn). Current runtime behavior is to
-/// ignore the hint — the model picks. Wiring this into admission / sampler
-/// (e.g. honoring `"none"` to suppress tool emission, or forcing a specific
-/// function) is tracked as agent-workload-api.md G3 follow-up.
+/// OpenAI `tool_choice`. Mapped to [`chat::ToolChoiceMode`] and enforced during
+/// prompt construction (`"none"` suppresses the tools block, `"required"` /
+/// forced-function append a directive). Unknown string modes are treated
+/// permissively as `"auto"`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub(super) enum ToolChoice {
     /// String form: `"none" | "auto" | "required"`.
-    #[allow(dead_code)]
     Mode(String),
     /// Forced function call: `{"type":"function","function":{"name":"..."}}`.
-    #[allow(dead_code)]
     Function {
         #[serde(rename = "type")]
+        #[allow(dead_code)]
         kind: String,
         function: ToolChoiceFunction,
     },
@@ -828,7 +826,6 @@ pub(super) enum ToolChoice {
 
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct ToolChoiceFunction {
-    #[allow(dead_code)]
     pub(super) name: String,
 }
 
@@ -885,9 +882,8 @@ pub(super) struct ChatCompletionRequest {
     /// Tool definitions (OpenAI format).
     #[serde(default)]
     pub(super) tools: Vec<OpenAiToolDefinition>,
-    /// Tool selection hint. Accepted but currently a no-op — see [`ToolChoice`].
+    /// Tool selection hint, enforced via [`ToolChoice`] / [`Self::tool_choice_mode`].
     #[serde(default)]
-    #[allow(dead_code)]
     pub(super) tool_choice: Option<ToolChoice>,
     /// Output format hint. Accepted but currently a no-op — see [`ResponseFormat`].
     #[serde(default)]
@@ -933,12 +929,7 @@ impl ChatCompletionRequest {
             self.presence_penalty,
         )?;
         validate_supported_messages_and_tools(&self.messages, "messages", &self.tools, "tools")?;
-        if self.stream_or_default() && !self.tools.is_empty() {
-            return Err(invalid_parameter(
-                "stream",
-                "stream=true is not supported when tools are present; use non-streaming chat completions for tool calls",
-            ));
-        }
+        self.validate_tool_choice()?;
         if let Some(effort) = self
             .chat_template_kwargs
             .as_ref()
@@ -977,6 +968,50 @@ impl ChatCompletionRequest {
 
     pub(super) fn session_id_parsed(&self) -> Option<SessionId> {
         normalize_session_id(self.session_id.as_deref())
+    }
+
+    /// Map the OpenAI `tool_choice` hint onto the prompt-builder mode.
+    ///
+    /// Absent / `"auto"` (and any unknown string mode) → `Auto`; `"none"` →
+    /// `None`; `"required"` → `Required`; forced function → `Function(name)`.
+    pub(super) fn tool_choice_mode(&self) -> ToolChoiceMode {
+        match &self.tool_choice {
+            None => ToolChoiceMode::Auto,
+            Some(ToolChoice::Mode(mode)) => match mode.as_str() {
+                "none" => ToolChoiceMode::None,
+                "required" => ToolChoiceMode::Required,
+                // "auto" and unknown modes are treated permissively as auto.
+                _ => ToolChoiceMode::Auto,
+            },
+            Some(ToolChoice::Function { function, .. }) => {
+                ToolChoiceMode::Function(function.name.clone())
+            }
+        }
+    }
+
+    fn validate_tool_choice(&self) -> Result<(), ApiError> {
+        match self.tool_choice_mode() {
+            ToolChoiceMode::Required if self.tools.is_empty() => Err(invalid_parameter(
+                "tool_choice",
+                "requires a non-empty `tools` array",
+            )),
+            ToolChoiceMode::Function(name) => {
+                if self.tools.is_empty() {
+                    return Err(invalid_parameter(
+                        "tool_choice",
+                        "requires a non-empty `tools` array",
+                    ));
+                }
+                if !self.tools.iter().any(|tool| tool.function.name == name) {
+                    return Err(invalid_parameter(
+                        "tool_choice.function.name",
+                        format!("tool `{name}` is not in `tools`"),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1039,9 +1074,20 @@ impl From<&ToolCall> for ChatToolCall {
 }
 
 impl ChatCompletionResponse {
-    pub(super) fn from_output(model: String, created: u64, output: &CompletionOutput) -> Self {
+    pub(super) fn from_output(
+        model: String,
+        created: u64,
+        output: &CompletionOutput,
+        tool_choice: ToolChoiceMode,
+    ) -> Self {
+        // `tool_choice="none"` suppresses tool extraction entirely: surface the
+        // stripped text as content and never emit tool calls.
         let (content, parsed_calls) = openai_parse_tool_calls(&output.text);
-        let tool_calls: Vec<ChatToolCall> = parsed_calls.iter().map(ChatToolCall::from).collect();
+        let tool_calls: Vec<ChatToolCall> = if matches!(tool_choice, ToolChoiceMode::None) {
+            Vec::new()
+        } else {
+            parsed_calls.iter().map(ChatToolCall::from).collect()
+        };
 
         let message = AssistantMessage {
             role: "assistant",
@@ -1101,6 +1147,28 @@ struct ChatDelta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChatToolCallDelta>>,
+}
+
+/// Streaming tool-call delta (OpenAI `choices[].delta.tool_calls[]` shape).
+#[derive(Debug, Serialize)]
+struct ChatToolCallDelta {
+    index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    call_type: Option<&'static str>,
+    function: ChatFunctionCallDelta,
+}
+
+/// Function portion of a streaming tool-call delta. We emit the full JSON
+/// arguments in a single delta, which OpenAI clients accept.
+#[derive(Debug, Serialize)]
+struct ChatFunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    arguments: String,
 }
 
 impl ChatStreamChunk {
@@ -1116,6 +1184,7 @@ impl ChatStreamChunk {
                 delta: ChatDelta {
                     role: Some("assistant"),
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -1144,8 +1213,66 @@ impl ChatStreamChunk {
                     } else {
                         Some(delta.text_delta)
                     },
+                    tool_calls: None,
                 },
                 finish_reason,
+            }],
+        }
+    }
+
+    /// Tool-call delta chunk — one completed tool call, no finish_reason.
+    pub(super) fn tool_call_chunk(
+        request_id: &str,
+        created: u64,
+        model: &str,
+        index: usize,
+        call: &ToolCall,
+    ) -> Self {
+        Self {
+            id: request_id.to_string(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.to_string(),
+            choices: vec![ChatStreamChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![ChatToolCallDelta {
+                        index,
+                        id: Some(format!("call_{}", Uuid::new_v4().simple())),
+                        call_type: Some("function"),
+                        function: ChatFunctionCallDelta {
+                            name: Some(call.name.clone()),
+                            arguments: call.arguments.to_string(),
+                        },
+                    }]),
+                },
+                finish_reason: None,
+            }],
+        }
+    }
+
+    /// Terminal chunk — empty delta, carries only `finish_reason`.
+    pub(super) fn finish_chunk(
+        request_id: &str,
+        created: u64,
+        model: &str,
+        finish_reason: &str,
+    ) -> Self {
+        Self {
+            id: request_id.to_string(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.to_string(),
+            choices: vec![ChatStreamChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some(finish_reason.to_string()),
             }],
         }
     }
