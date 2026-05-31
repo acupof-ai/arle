@@ -5687,7 +5687,7 @@ fn cuda_causal_sdpa_decode_gqa_cache(
     let use_online = head_dim == 256 && !env_force_legacy_decode_attn();
     if use_online {
         const BLOCK_ONLINE: u32 = 256; // = HEAD_DIM
-        let n_warps = (BLOCK_ONLINE / 32) as u32;
+        let n_warps = BLOCK_ONLINE / 32;
         let shared_online = n_warps * std::mem::size_of::<f32>() as u32;
         launch_rows(
             &backend.stream,
