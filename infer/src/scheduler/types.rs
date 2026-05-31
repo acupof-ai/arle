@@ -855,6 +855,10 @@ pub struct IncomingRequest {
     /// Optional per-request token coordinator for multi-rank distributed
     /// serving. `None` is the normal single-rank or NUMA-routed path.
     pub distributed: Option<DistributedRequestCoordination>,
+    /// Optional cooperative cancel flag. When set true, the scheduler/runtime
+    /// stops generating this request at the next tick/chunk boundary (in-process
+    /// CLI Ctrl-C path; HTTP uses delta_tx close instead).
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[cfg(feature = "cuda")]

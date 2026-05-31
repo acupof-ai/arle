@@ -218,6 +218,7 @@ fn make_request(
         delta_tx: tx,
         trace_context: None,
         distributed: None,
+        cancel: None,
     };
     (req, rx)
 }

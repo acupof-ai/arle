@@ -99,6 +99,7 @@ fn make_request(prompt: &str, max_tokens: usize) -> CompletionRequest {
         logprobs: false,
         session_id: None,
         trace_context: None,
+        cancel: None,
     }
 }
 
