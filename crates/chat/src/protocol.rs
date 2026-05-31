@@ -790,12 +790,97 @@ pub fn render_structured_chatml_with_spans(
 
 /// Parse `<tool_call>...</tool_call>` blocks from raw assistant output.
 pub fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
-    let (stripped, tool_calls) = TOOL_CALL_BLOCK.strip_and_collect(text, parse_tool_call_block);
+    let (stripped, tool_calls) = extract_tool_calls(text);
 
     ParsedAssistantResponse {
         content: THINK_BLOCK.strip_all(&stripped).trim().to_string(),
         tool_calls,
     }
+}
+
+/// Extract `<tool_call>` blocks tolerantly. Handles the canonical
+/// `<tool_call>{json}</tool_call>` AND the Qwen3.6 quirk of dropping the
+/// `</tool_call>` close tag — the JSON object is located by brace-matching after
+/// the open tag, so a missing close no longer leaves the raw JSON in the visible
+/// content (the old `strip_and_collect` else-branch did exactly that, which made
+/// the agent leak a tool call as its "final answer" and give up). A truncated /
+/// unbalanced JSON after an open tag is dropped to end-of-input rather than
+/// leaked — a partial tool call can't be executed anyway. Returns the text with
+/// every tool-call span removed, plus the parsed calls.
+fn extract_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    if !text.contains(TOOL_CALL_BLOCK.open) {
+        return (text.to_string(), Vec::new());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(TOOL_CALL_BLOCK.open) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + TOOL_CALL_BLOCK.open.len()..];
+        match after
+            .find('{')
+            .and_then(|b| json_object_len(&after[b..]).map(|len| (b, len)))
+        {
+            Some((b, len)) => {
+                if let Some(call) = parse_tool_call_block(after[b..b + len].trim()) {
+                    calls.push(call);
+                }
+                let mut consumed = b + len;
+                // Swallow a trailing `</tool_call>` when present (only whitespace
+                // between the JSON and the close tag) so it doesn't leak.
+                let tail = &after[consumed..];
+                if let Some(close_at) = tail.find(TOOL_CALL_BLOCK.close)
+                    && tail[..close_at].trim().is_empty()
+                {
+                    consumed += close_at + TOOL_CALL_BLOCK.close.len();
+                }
+                rest = &after[consumed..];
+            }
+            None => {
+                // No balanced JSON after the open tag (truncated mid-emission or a
+                // non-JSON tool-call form) — drop the remainder so nothing leaks.
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    (out, calls)
+}
+
+/// Byte length of the balanced `{...}` object at the start of `s`, or `None` if
+/// it never balances (truncated). String contents and `\`-escapes are respected
+/// so braces inside JSON strings don't affect the depth count.
+fn json_object_len(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &c) in bytes.iter().enumerate() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Render a raw ChatML message list using the canonical `<|im_start|>...`
@@ -1025,6 +1110,39 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].name, "shell");
         assert_eq!(parsed.tool_calls[0].arguments["cmd"], "ls");
         assert_eq!(parsed.content, "Sure.");
+    }
+
+    #[test]
+    fn parse_tool_call_missing_close_tag() {
+        // Qwen3.6 quirk: drops `</tool_call>`, sometimes puts `arguments` first.
+        let parsed = parse_tool_calls(
+            "<tool_call>\n\n{\"arguments\":{\"command\":\"ls -la\"},\"name\":\"shell\"}",
+        );
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].arguments["command"], "ls -la");
+        // The raw JSON must NOT leak into the visible content.
+        assert_eq!(parsed.content, "");
+        assert!(!parsed.content.contains("arguments"));
+    }
+
+    #[test]
+    fn parse_tool_call_truncated_is_dropped_not_leaked() {
+        // Generation cut off mid-JSON (unbalanced) — must hide, not leak.
+        let parsed =
+            parse_tool_calls("<tool_call>\n{\"arguments\":{\"command\":\"ls crates/cli/src/\"}");
+        assert!(parsed.tool_calls.is_empty());
+        assert_eq!(parsed.content, "");
+        assert!(!parsed.content.contains("arguments"));
+    }
+
+    #[test]
+    fn parse_tool_call_text_after_close_preserved() {
+        let parsed = parse_tool_calls(
+            "<tool_call>{\"name\":\"shell\",\"arguments\":{\"cmd\":\"ls\"}}</tool_call> done now.",
+        );
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.content, "done now.");
     }
 
     #[test]
