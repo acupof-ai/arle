@@ -38,10 +38,52 @@ impl RequestHandleInferenceEngine<MetalSchedulerHandle> {
             ..Default::default()
         };
         let handle = spawn_metal_scheduler_handle_from_path_with_options(model_path, options, 0)?;
-        Ok(Self {
+        let mut engine = Self {
             model_id: model_id_from_path(model_path),
             handle,
-        })
+        };
+        engine.warmup();
+        Ok(engine)
+    }
+
+    /// Run a short generation at load so the model weights fault into RAM and
+    /// wire (under `wired_limit_bytes`) *before* the first interactive turn —
+    /// otherwise that turn is disk-I/O-bound (~9 tok/s cold vs ~75 warm on
+    /// Qwen3.6; RSS climbs ~0.1 GB → ~18.5 GB as MoE experts fault in). This is
+    /// the in-process analogue of `metal_serve`'s startup warmup. Best-effort:
+    /// a warmup failure must never block CLI startup.
+    fn warmup(&mut self) {
+        use std::io::Write;
+        // Visible status: the first load runs a warmup so the FIRST real turn is
+        // fast instead of disk-I/O-bound. Goes to stderr so it never pollutes
+        // piped stdout.
+        eprint!("  warming up model weights (first run, ~a few seconds)… ");
+        let _ = std::io::stderr().flush();
+        // A long, lexically-diverse prompt prefills many tokens in ONE batched
+        // pass — each token routes to its own MoE experts, so this faults+wires
+        // a broad expert set cheaply (prefill ~200 tok/s) instead of waiting on a
+        // slow token-by-token decode. A short decode confirms the decode path is
+        // hot too.
+        let prompt = "Across mountains, oceans, deserts and frozen tundra, scientists, \
+            engineers, musicians, farmers, doctors and philosophers debate history, \
+            biology, quantum mechanics, economics, poetry, law, medicine, architecture \
+            and cuisine. Rivers carved canyons; satellites mapped distant galaxies; \
+            algorithms sorted petabytes of data; orchestras tuned violins, cellos, \
+            trumpets and drums. Translate, summarize, compute, imagine, remember, \
+            predict and explain — numbers like 3, 17, 256, 1024 and 65536 mingle with \
+            verbs, adjectives, nouns and punctuation across many languages and domains.";
+        let req = CompletionRequest {
+            prompt: prompt.to_string(),
+            max_tokens: 32,
+            sampling: crate::sampler::SamplingParams::default(),
+            stop: None,
+            logprobs: false,
+            session_id: None,
+            trace_context: None,
+            cancel: None,
+        };
+        let _ = self.complete(req);
+        eprintln!("done");
     }
 }
 

@@ -808,7 +808,19 @@ fn run_agent_turn(
         if chunk.is_empty() {
             return;
         }
-        // Clear the spinner the instant visible output starts — before any
+        // Suppress leading whitespace-only output at the start of a turn so the
+        // reply (or first tool line) begins right after the prompt instead of
+        // after blank lines the model emits while "thinking". Once real text
+        // has streamed, internal whitespace is preserved.
+        let to_print = if render_state.borrow().1 {
+            chunk
+        } else {
+            chunk.trim_start()
+        };
+        if to_print.is_empty() {
+            return;
+        }
+        // Clear the spinner the instant *visible* output starts — before any
         // stdout write and before tps_meter erases its own status line, so
         // no leftover spinner glyph collides with the answer tokens.
         spinner.borrow_mut().stop();
@@ -819,9 +831,9 @@ fn run_agent_turn(
             let _ = io::stdout().flush();
             state.0 = true;
         }
-        print!("{chunk}");
+        print!("{to_print}");
         let _ = io::stdout().flush();
-        tps_meter.borrow_mut().record_chunk(chunk.len());
+        tps_meter.borrow_mut().record_chunk(to_print.len());
         state.1 = true;
     };
     let mut on_trace_event = |event: &AgentTraceEvent| {
