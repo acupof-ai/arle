@@ -95,11 +95,11 @@ fn main() -> Result<()> {
         loop {
             match child.try_wait()? {
                 Some(status) => {
-                    if !status.success() {
+                    if status.success() {
+                        eprintln!("[coordinator] rank {rank} exited 0");
+                    } else {
                         eprintln!("[coordinator] rank {rank} exited {:?}", status.code());
                         fail = true;
-                    } else {
-                        eprintln!("[coordinator] rank {rank} exited 0");
                     }
                     break;
                 }
@@ -136,32 +136,26 @@ fn run_worker(rank: usize, port: u16) -> Result<()> {
         .with_context(|| format!("worker rank {rank} connect"))?;
 
     let mut received = 0usize;
-    loop {
-        match worker.recv()? {
-            Some(env) => {
-                received += 1;
-                if let RelayEnvelope::Request {
-                    request_id,
-                    prompt_tokens,
-                    ..
-                } = env
-                {
-                    let expected_first = 100 + (request_id as u32 - 1);
-                    if prompt_tokens.first().copied() != Some(expected_first) {
-                        bail!(
-                            "rank {rank} envelope {request_id} prompt_tokens mismatch: \
-                             got {prompt_tokens:?} expected first={expected_first}"
-                        );
-                    }
-                }
-            }
-            None => {
-                eprintln!("[worker rank={rank}] coordinator EOF after {received} envelopes");
-                if received != CYCLES {
-                    bail!("rank {rank} expected {CYCLES} envelopes, received {received}");
-                }
-                return Ok(());
+    while let Some(env) = worker.recv()? {
+        received += 1;
+        if let RelayEnvelope::Request {
+            request_id,
+            prompt_tokens,
+            ..
+        } = env
+        {
+            let expected_first = 100 + (request_id as u32 - 1);
+            if prompt_tokens.first().copied() != Some(expected_first) {
+                bail!(
+                    "rank {rank} envelope {request_id} prompt_tokens mismatch: \
+                     got {prompt_tokens:?} expected first={expected_first}"
+                );
             }
         }
     }
+    eprintln!("[worker rank={rank}] coordinator EOF after {received} envelopes");
+    if received != CYCLES {
+        bail!("rank {rank} expected {CYCLES} envelopes, received {received}");
+    }
+    Ok(())
 }
