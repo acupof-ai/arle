@@ -193,6 +193,20 @@ nsys/phase profile of a 1024-tok prefill at 0.85** (do NOT act on stale profilin
    sed-patched in place to match origin; they're functionally aligned but comments drift —
    `git -C <build-root> checkout -- scripts/dsv4_toolchain.sh crates/cuda-kernels/csrc/gemm/deepgemm_native.cu`
    then re-pull origin so the pod tree == origin before the next build.
+7. **[review NIT-1] Make the deepgemm JIT c++20 not silently regress on old CUDA.**
+   `compile_with_nvcc` now passes `-std=c++20` unconditionally on **any** SM90 device (gate is
+   `prop.major==9`, not "SM90 AND CUDA≥12.6"). On a hypothetical SM90 + CUDA <12.6 box, nvcc
+   silently falls back (the old comment warned CUDA 12.2 → c++14 → broken cute), reintroducing
+   the bug class. Fix: query `cudaRuntimeGetVersion()` and **error loudly** ("DeepGEMM JIT needs
+   CUDA ≥ 12.6 for c++20 device support; got X") rather than emit a broken kernel — OR, if a
+   c++17 path is wanted for old CUDA, use `-std=c++17` **without** `-fconcepts` (the `-fconcepts`
+   under gcc-13 was the original bug). Per §0, do not leave this silent — explicit guard or an
+   explicit "deferred, SM90 deployment requires CUDA≥12.6" note in the code.
+8. **[review NIT-2] Stale flags in vendored upstream.** `vendor/deepgemm/csrc/jit/compiler.hpp`
+   (~line 206) still carries `c++17 + -fconcepts`. It's **dead from ARLE's view** (upstream
+   DeepGEMM's own Python-side JIT, not in ARLE's C++ build graph or `deepgemm_native.cu`), so no
+   functional action — but add a one-line note so a future reader doesn't "fix" the live JIT by
+   copying the stale vendored combo back in.
 
 ---
 
@@ -256,8 +270,12 @@ nsys/phase profile of a 1024-tok prefill at 0.85** (do NOT act on stale profilin
 - `cargo fmt --check`, `cargo check cuda,no-cuda`, `cargo test --release` — **green**.
 - `cargo clippy --workspace -- -D warnings` was **red on main (pre-existing)**: fixed 5 trivial
   lints (none in the deepgemm work) — `crates/train/src/opd.rs` ×2, `crates/train/src/qwen35.rs`
-  ×1, `infer/src/bin/multiproc_relay_smoke.rs` ×2. Re-verify clippy fully green before handoff
-  (whack-a-mole: each fix can expose the next masked crate).
+  ×1, `infer/src/bin/multiproc_relay_smoke.rs` ×2. Re-verified fully green after the fixes.
+- **Review:** codex review was rate-limited (usage cap), so an independent `general-purpose`
+  reviewer covered the 3 substantive commits (b552275e / a8cd6e3b / e2b3f40e) → overall
+  **APPROVE-WITH-NITS**: a8cd6e3b clean; the 3 nits (NIT-1 CUDA-version guard, NIT-2 stale
+  vendored flags, NIT-3 remove the conservative probe) are folded into §5.1/§5.7/§5.8 above.
+  Re-run `codex review` after the quota resets if an independent codex pass is still wanted.
 
 ---
 
