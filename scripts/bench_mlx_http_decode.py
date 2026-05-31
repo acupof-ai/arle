@@ -87,8 +87,8 @@ def probe(n):
         f"http://{HOST}:{PORT}/v1/completions",
         data=body, headers={"Content-Type": "application/json"})
     t0 = time.time()
-    ttft = first = last = None
-    out = 0
+    ttft = None
+    ts = []
     with urllib.request.urlopen(req, timeout=300) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "ignore").strip()
@@ -105,11 +105,15 @@ def probe(n):
                 now = time.time()
                 if ttft is None:
                     ttft = now - t0
-                    first = now
-                last = now
-                out += 1
-    dtps = (out - 1) / (last - first) if (out > 1 and last > first) else None
-    return ttft, dtps, out
+                ts.append(now)
+    # Steady-state TPOT from token 2 onward (drop the token1->2 prefill-tail
+    # interval) — same fix as bench_mlx_vs_arle_sweep.py so both sides match.
+    if not ts:
+        return ttft, None, 0
+    intervals = [(ts[i] - ts[i - 1]) * 1000.0 for i in range(1, len(ts))]
+    rest = intervals[1:]
+    dtps = (1000.0 / (sum(rest) / len(rest))) if rest else None
+    return ttft, dtps, len(ts)
 
 
 def main():

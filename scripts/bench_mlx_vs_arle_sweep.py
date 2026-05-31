@@ -59,6 +59,29 @@ def avail_gb():
 _REQ = [0]
 
 
+def _decode_stats(ttft, ts):
+    """Steady-state TPOT from streamed token timestamps.
+
+    Returns (ttft_s, decode_tps, out_tokens, first_interval_ms).
+
+    CRITICAL: the steady-state decode rate is measured from token 2 onward —
+    the token1→token2 interval is DROPPED. ARLE's pipelined scheduler emits
+    token 1, then front-loads the bulk prefill into the token1→2 gap (that gap
+    grows with context: ~0.5s @128 → ~28s @8k). Including it in the rate makes
+    a flat ~12ms/token decode look like an O(context) collapse — the metric bug
+    that produced the bogus "40× decode" headline in the first cf364287 entry.
+    `first_interval_ms` is reported separately as the prefill-tail diagnostic.
+    """
+    if not ts:
+        return ttft, None, 0, None
+    out = len(ts)
+    intervals_ms = [(ts[i] - ts[i - 1]) * 1000.0 for i in range(1, out)]
+    first_ms = intervals_ms[0] if intervals_ms else None
+    rest = intervals_ms[1:]  # token 2 onward = steady-state decode
+    decode_tps = (1000.0 / (sum(rest) / len(rest))) if rest else None
+    return ttft, decode_tps, out, first_ms
+
+
 def make_prompt(n):
     """Build a ~n-token prompt with a UNIQUE nonce prefix per request.
 
@@ -133,8 +156,8 @@ def arle_probe(n):
         data=body, headers={"Content-Type": "application/json"},
     )
     t0 = time.time()
-    ttft = first_tok_t = last_tok_t = None
-    out = 0
+    ttft = None
+    ts = []  # wall-clock of every streamed token
     with urllib.request.urlopen(req, timeout=300) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "ignore").strip()
@@ -151,13 +174,8 @@ def arle_probe(n):
                 now = time.time()
                 if ttft is None:
                     ttft = now - t0
-                    first_tok_t = now
-                last_tok_t = now
-                out += 1
-    decode_tps = None
-    if out > 1 and last_tok_t and first_tok_t and last_tok_t > first_tok_t:
-        decode_tps = (out - 1) / (last_tok_t - first_tok_t)
-    return ttft, decode_tps, out
+                ts.append(now)
+    return _decode_stats(ttft, ts)
 
 
 def run_arle():
@@ -190,15 +208,17 @@ def run_arle():
                 log("ARLE: aborted by watchdog")
                 break
             try:
-                ttft, dtps, out = arle_probe(n)
+                ttft, dtps, out, first_ms = arle_probe(n)
             except Exception as e:
                 log(f"ARLE n={n:6d}: probe error {e!r}")
                 continue
-            res[n] = {"ttft_s": ttft, "decode_tps": dtps, "out_tokens": out}
+            res[n] = {"ttft_s": ttft, "decode_tps": dtps, "out_tokens": out,
+                      "first_interval_ms": first_ms}
             dstr = f"{dtps:.1f}" if dtps else "n/a"
             tstr = f"{ttft:.3f}" if ttft else "n/a"
+            fstr = f"{first_ms:.0f}" if first_ms else "n/a"
             log(f"ARLE n={n:6d}: TTFT={tstr}s decode={dstr}tok/s "
-                f"out={out} avail={avail_gb():.1f}GB")
+                f"(first_iv={fstr}ms) out={out} avail={avail_gb():.1f}GB")
     finally:
         log("ARLE: terminating server")
         if p.poll() is None:
