@@ -310,7 +310,7 @@ pub fn finalize_k_per_channel_scales_int8(
 
 /// INT8 KIVI per-channel K quantize for the per-decode-step append path.
 /// Mirrors [`quantize_paged_kv_fp8_per_channel`] but writes INT8 (rounded
-/// + clamped to ±127) using a pre-computed `[num_kv_heads, head_dim]`
+/// then clamped to ±127) using a pre-computed `[num_kv_heads, head_dim]`
 /// scale table.
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_paged_kv_int8_per_channel(
