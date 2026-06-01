@@ -248,10 +248,10 @@ impl DeepseekModel {
     }
 
     fn layer_communicator_from_config(
-        _ctx: &DeviceContext,
+        ctx: &DeviceContext,
         config: &DeepseekRuntimeConfig,
     ) -> Result<LayerCommunicator> {
-        let comm = LayerCommunicator::new_with_ep(
+        let mut comm = LayerCommunicator::new_with_ep(
             config.tp.rank,
             config.tp.world_size,
             0,
@@ -2450,8 +2450,8 @@ impl DeepseekModel {
                 // ---- TP-AllGather Q (skipped at TP=1) ----
                 // gathered_q / packed_q / full_out are dropped after the dispatch
                 // returns, freeing back to the cudarc pool.
-                let gathered_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
-                let packed_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+                let mut gathered_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+                let mut packed_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
                 let mut full_out_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
 
                 #[cfg(feature = "nccl")]

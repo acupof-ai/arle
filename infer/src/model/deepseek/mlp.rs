@@ -20,6 +20,8 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 #[cfg(feature = "cuda")]
 use deepseek_spec::{DeepSeekV4Config, DeepSeekV4MoeRoutingKind};
 #[cfg(feature = "cuda")]
+use half::bf16;
+#[cfg(feature = "cuda")]
 use log::info;
 #[cfg(feature = "cuda")]
 use std::sync::OnceLock;
@@ -30,7 +32,9 @@ use std::time::Instant;
 use super::state::{
     DeepseekDsv4GroupedBlockFormat, DeepseekExpertRuntimeScratch,
     DeepseekGroupedExpertActiveScratch, DeepseekGroupedExpertRuntimeScratch,
-    DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_local_route_scratch,
+    DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_dispatch_payload_scratch,
+    ensure_local_route_scratch, ensure_recv_route_scratch, ensure_route_logits_scratch,
+    ensure_send_route_scratch,
 };
 #[cfg(feature = "cuda")]
 use crate::distributed::expert_state::ExpertGroup;
