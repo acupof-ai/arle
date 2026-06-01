@@ -1,0 +1,18 @@
+[
+  {
+    "case": "default_no_auto_wired",
+    "command": "target/release/metal_serve --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8895 --max-running-requests 1 --max-batch-tokens 4096",
+    "ready": true,
+    "ready_rss_gib": 5.710052490234375,
+    "used_delta_gib": -1.871826171875,
+    "log": "/tmp/mem_probe_default_no_auto_wired.log"
+  },
+  {
+    "case": "opt_in_auto_wired",
+    "command": "target/release/metal_serve --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8896 --max-running-requests 1 --max-batch-tokens 4096 --auto-wired-limit",
+    "ready": true,
+    "ready_rss_gib": 18.60760498046875,
+    "used_delta_gib": 19.090911865234375,
+    "log": "/tmp/mem_probe_opt_in_auto_wired.log"
+  }
+]
