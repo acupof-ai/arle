@@ -103,7 +103,10 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 - **统一的运行时权威。** `infer`、`arle`、OPD 训练共用同一套 Rust 运行时与模型契约 —— OPD teacher 就是生产服务用的同一个 runtime,不再分两套栈。
 
 <p align="center">
-  <a href="docs/experience/wins/2026-06-01-metal-low-rss-analysis.md"><img src="docs/assets/metal-vs-mlxlm-e2e.png" alt="ARLE Metal vs mlx-lm TTFT、TPOT、RSS 对比" width="100%"></a>
+  <img src="docs/assets/metal-vs-mlxlm-e2e.png" alt="ARLE Metal vs mlx-lm TTFT、TPOT、RSS 对比" width="100%">
+</p>
+<p align="center">
+  <sub><a href="docs/experience/wins/2026-06-01-readme-metal-vs-mlxlm-ttft-rss.md">Benchmark 数据</a> · <a href="docs/experience/wins/2026-06-01-metal-low-rss-analysis.md">RSS 分析</a></sub>
 </p>
 
 架构详解:[docs/onboarding.md](docs/onboarding.md)（新人 30 分钟）· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
