@@ -3,9 +3,9 @@
 ## Context
 
 The README benchmark image still showed the older multi-turn end-to-end view.
-After the `--auto-wired-limit` memory fix, the user-facing chart needed the
-current single-request sweep: TTFT as the primary latency axis, steady TPOT for
-decode parity, and process RSS as prompt length grows.
+After the Metal memory fix, the user-facing chart needed the current
+single-request sweep: ARLE vs mlx-lm only, with TTFT as the primary latency
+axis, steady TPOT for decode parity, and process RSS as prompt length grows.
 
 ## Params / Env
 
@@ -13,8 +13,7 @@ decode parity, and process RSS as prompt length grows.
 - Host: Apple Silicon, 48 GB unified memory.
 - Shape: c=1, OpenAI streaming completions, `max_tokens=256`, temperature 0.
 - ARLE: `target/release/metal_serve --max-running-requests 1
-  --max-batch-tokens 4096`, default no-wired mode, plus an explicit
-  `--auto-wired-limit` A/B.
+  --max-batch-tokens 4096`, default no-wired mode.
 - mlx-lm: `mlx_lm server`, same model and host.
 - RSS: process RSS sampled during streaming. On macOS unified memory,
   non-wired Metal pages may not all appear as process RSS; the raw JSON also
@@ -26,18 +25,21 @@ Raw data:
 Figure:
 `docs/assets/metal-vs-mlxlm-e2e.png`
 
+Low-RSS analysis:
+`docs/experience/wins/2026-06-01-metal-low-rss-analysis.md`
+
 ## Results
 
-| input | ARLE TTFT | mlx TTFT | ARLE TPOT | mlx TPOT | ARLE RSS | mlx RSS | wired RSS |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 128 | 0.21 s | 0.16 s | 11.6 ms | 12.9 ms | 2.21 GiB | 10.77 GiB | 18.71 GiB |
-| 256 | 0.33 s | 0.48 s | 11.5 ms | 11.9 ms | 2.21 GiB | 10.77 GiB | 18.69 GiB |
-| 512 | 0.58 s | 0.72 s | 11.7 ms | 12.0 ms | 2.21 GiB | 10.78 GiB | 18.69 GiB |
-| 1k | 1.10 s | 1.23 s | 11.8 ms | 12.2 ms | 2.22 GiB | 10.78 GiB | 18.69 GiB |
-| 2k | 2.12 s | 2.32 s | 11.9 ms | 12.7 ms | 2.22 GiB | 10.78 GiB | 18.70 GiB |
-| 4k | 4.59 s | 4.55 s | 12.4 ms | 12.9 ms | 2.23 GiB | 10.78 GiB | 18.70 GiB |
-| 8k | 9.58 s | 10.86 s | 13.1 ms | - | 2.23 GiB | - | 18.71 GiB |
-| 12k | 16.64 s | 14.50 s | 14.3 ms | 15.3 ms | 2.23 GiB | 10.79 GiB | 18.71 GiB |
+| input | ARLE TTFT | mlx TTFT | ARLE TPOT | mlx TPOT | ARLE RSS | mlx RSS |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 0.21 s | 0.16 s | 11.6 ms | 12.9 ms | 2.21 GiB | 10.77 GiB |
+| 256 | 0.33 s | 0.48 s | 11.5 ms | 11.9 ms | 2.21 GiB | 10.77 GiB |
+| 512 | 0.58 s | 0.72 s | 11.7 ms | 12.0 ms | 2.21 GiB | 10.78 GiB |
+| 1k | 1.10 s | 1.23 s | 11.8 ms | 12.2 ms | 2.22 GiB | 10.78 GiB |
+| 2k | 2.12 s | 2.32 s | 11.9 ms | 12.7 ms | 2.22 GiB | 10.78 GiB |
+| 4k | 4.59 s | 4.55 s | 12.4 ms | 12.9 ms | 2.23 GiB | 10.78 GiB |
+| 8k | 9.58 s | 10.86 s | 13.1 ms | - | 2.23 GiB | - |
+| 12k | 16.64 s | 14.50 s | 14.3 ms | 15.3 ms | 2.23 GiB | 10.79 GiB |
 
 ## Problems
 
@@ -50,11 +52,11 @@ Figure:
 
 ## Learnings
 
-- The default memory issue was weight residency, not decode scaling. With wired
-  residency off by default, nominal TTFT and TPOT stay at mlx-lm parity while
-  process RSS no longer carries the 18+ GiB wired footprint.
-- `--auto-wired-limit` has no nominal TTFT/TPOT win in this no-pressure sweep.
-  It remains a deliberate residency option, not the default memory posture.
+- The default memory issue was weight residency, not decode scaling. In the
+  README-facing default configuration, nominal TTFT and TPOT stay at mlx-lm
+  parity while process RSS no longer carries the previous wired footprint.
+- The README figure should stay focused on the user-facing comparison: ARLE vs
+  mlx-lm. Internal residency tradeoffs belong in the dedicated memory-fix entry.
 
 ## Rule
 
