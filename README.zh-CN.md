@@ -103,13 +103,7 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 - **统一的运行时权威。** `infer`、`arle`、OPD 训练共用同一套 Rust 运行时与模型契约 —— OPD teacher 就是生产服务用的同一个 runtime,不再分两套栈。
 
 <p align="center">
-  <img src="docs/assets/metal-vs-mlxlm-e2e.png" alt="ARLE Metal vs mlx-lm 多轮端到端延迟对比" width="100%">
-</p>
-
-<p align="center">
-  <em>Apple Silicon,Qwen3.6-35B-A3B-4bit,c=1(单用户),与同模型 <code>mlx_lm.server</code> 第一手对照实测。
-  多轮 agent 形态:turn1 冷启动全量 prefill;turn2 扩展上一轮,两个 runtime 都复用缓存前缀、只 prefill 新增 token。
-  <strong>结论:端到端持平</strong> —— 冷启动(2k 2.5 vs 2.3s,6k 7.1 vs 7.0s)与复用轮(均亚秒)ARLE 都与 mlx-lm 相当。真正的提升是内部修复:内存优先前缀缓存消除了一处长上下文首响应停顿(此前使 ARLE 在该场景慢 ~4×;token1→token2 间隔 29.6s → 0.43s @8k)。</em>
+  <a href="docs/experience/wins/2026-06-01-metal-low-rss-analysis.md"><img src="docs/assets/metal-vs-mlxlm-e2e.png" alt="ARLE Metal vs mlx-lm TTFT、TPOT、RSS 对比" width="100%"></a>
 </p>
 
 架构详解:[docs/onboarding.md](docs/onboarding.md)（新人 30 分钟）· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
