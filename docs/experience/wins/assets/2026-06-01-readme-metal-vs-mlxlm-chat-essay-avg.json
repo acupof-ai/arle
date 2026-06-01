@@ -1,11 +1,17 @@
 {
-  "generated_at": "2026-06-01T16:33:59+08:00",
+  "generated_at": "2026-06-01T18:55:00+08:00",
   "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
-  "hardware": "Apple Silicon, 48 GB unified memory",
-  "shape": "c=1, /v1/chat/completions streaming, max_tokens=256, temperature=0, repeats=3",
-  "prompt": "varied source document plus essay instruction; thinking disabled for mlx-lm via chat_template_kwargs.enable_thinking=false; unique cache-neutral prompt per length and repeat",
-  "tpot_definition": "mean over repeats; each sample is (last streamed content time - first streamed content time) / (tokenizer-counted output tokens - 1)",
-  "rss_definition": "peak process RSS during each streaming request; system_used_gb records host memory pressure separately",
+  "hardware": "Apple M4 Pro, 48 GB unified memory",
+  "shape": "c=1, OpenAI chat/completions streaming, max_tokens=256, temperature=0; ARLE after kv-boundary-clear fix n=5 normal run, mlx-lm n=3 existing same prompt family",
+  "metric_policy": {
+    "ttft": "client first content chunk; server request_trace checked for ARLE and prefix matched_tokens=0",
+    "tpot": "(last content chunk - first content chunk)/(completion_tokens - 1)",
+    "rss": "process RSS high-water for ARLE fresh server per length; mlx-lm process RSS mean from existing chat essay sweep"
+  },
+  "sources": {
+    "arle_after_fix_n5": "/tmp/bench_readme_arle_after_fix_all_lengths_n5_normal_20260601.json",
+    "mlx_lm_n3_previous_same_chart": "docs/experience/wins/assets/2026-06-01-readme-metal-vs-mlxlm-chat-essay-avg.json"
+  },
   "lens": [
     128,
     256,
@@ -19,729 +25,1123 @@
   "series": {
     "arle": {
       "label": "ARLE",
-      "cmd": "target/release/metal_serve --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 9035 --max-running-requests 1 --max-batch-tokens 4096",
-      "port": 9035,
-      "log": "/tmp/arle_readme_chat_essay_avg_v2_logs/arle.log",
       "rows": {
         "128": {
           "samples": [
             {
-              "prompt_tokens_actual": 128,
-              "ttft_s": 0.27158594131469727,
-              "tpot_ms": 12.219303236232967,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 3.4508719444274902,
-              "rss_gb": 5.8274688720703125,
-              "system_used_gb": 32.39585876464844,
-              "first_text": "<think>\n\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Source Document Sample:** \"12800. metal tail silicon section runtime serving comparison detailed benchmark training stable residency prefill local p"
+              "label": "measured_1",
+              "elapsed_s": 3.416365146636963,
+              "ttft_s": 0.27755212783813477,
+              "tpot_ms": 12.309070661956188,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1272,
+              "first_text": "The provided provided data string appears to be a repetitive concatenation of technical keywords rat",
+              "after_ps": {
+                "rss_kb": 6150640,
+                "vsz_kb": 457847008,
+                "cpu_pct": 78.7,
+                "mem_pct": 12.2
+              }
             },
             {
-              "prompt_tokens_actual": 128,
-              "ttft_s": 0.27811408042907715,
-              "tpot_ms": 12.408798135171725,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 3.454648971557617,
-              "rss_gb": 2.1638946533203125,
-              "system_used_gb": 28.906234741210938,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct the Input:**\n    *   Source document sample: \"12801\" (This looks like a document ID or a number, likely irrelevant to the content itself, or perhaps a token count? I'll treat"
+              "label": "measured_2",
+              "elapsed_s": 3.4669041633605957,
+              "ttft_s": 0.30939292907714844,
+              "tpot_ms": 12.38239699718999,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1189,
+              "first_text": "The provided provided data string appears to be a corrupted or repetitive log entry rather than a st",
+              "after_ps": {
+                "rss_kb": 6304128,
+                "vsz_kb": 458229408,
+                "cpu_pct": 77.8,
+                "mem_pct": 12.5
+              }
             },
             {
-              "prompt_tokens_actual": 128,
-              "ttft_s": 0.27324485778808594,
-              "tpot_ms": 12.388173989423617,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 3.447216033935547,
-              "rss_gb": 1.4711761474609375,
-              "system_used_gb": 29.09869384765625,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct the Input:**\n    *   Source document sample: \"12802\" (This looks like a document ID or a number, likely irrelevant to the content itself, or perhaps a page number. I'll treat"
+              "label": "measured_3",
+              "elapsed_s": 3.429631233215332,
+              "ttft_s": 0.2698550224304199,
+              "tpot_ms": 12.391279257980047,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1326,
+              "first_text": "The provided provided text appears to be a repetitive concatenation of technical keywords rather tha",
+              "after_ps": {
+                "rss_kb": 6459408,
+                "vsz_kb": 457821984,
+                "cpu_pct": 76.5,
+                "mem_pct": 12.8
+              }
+            },
+            {
+              "label": "measured_4",
+              "elapsed_s": 3.428555965423584,
+              "ttft_s": 0.27079200744628906,
+              "tpot_ms": 12.383388070499196,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1226,
+              "first_text": "The provided provided data string appears to be a corrupted or repetitive log entry rather than a st",
+              "after_ps": {
+                "rss_kb": 6614064,
+                "vsz_kb": 458253824,
+                "cpu_pct": 77.5,
+                "mem_pct": 13.1
+              }
+            },
+            {
+              "label": "measured_5",
+              "elapsed_s": 3.5068142414093018,
+              "ttft_s": 0.3338348865509033,
+              "tpot_ms": 12.443056293562348,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1209,
+              "first_text": "The provided provided input appears to be a corrupted or repetitive data string rather than a valid ",
+              "after_ps": {
+                "rss_kb": 6768864,
+                "vsz_kb": 458660128,
+                "cpu_pct": 76.2,
+                "mem_pct": 13.4
+              }
             }
           ],
           "summary": {
-            "prompt_tokens_actual": 128,
             "ttft_s": {
-              "mean": 0.27431495984395343,
-              "std": 0.0033930795572242405,
-              "min": 0.27158594131469727,
-              "max": 0.27811408042907715,
-              "n": 3
+              "mean": 0.2922853946685791,
+              "median": 0.27755212783813477,
+              "std": 0.028289505358641675,
+              "min": 0.2698550224304199,
+              "max": 0.3338348865509033,
+              "n": 5
             },
             "tpot_ms": {
-              "mean": 12.338758453609437,
-              "std": 0.10396393877592569,
-              "min": 12.219303236232967,
-              "max": 12.408798135171725,
-              "n": 3
+              "mean": 12.381838256237554,
+              "median": 12.383388070499196,
+              "std": 0.047787596458172786,
+              "min": 12.309070661956188,
+              "max": 12.443056293562348,
+              "n": 5
             },
-            "output_tokens_tokenizer": {
-              "mean": 255.0,
-              "std": 0.0,
-              "min": 255,
-              "max": 255,
-              "n": 3
-            },
-            "stream_text_chunks": {
-              "mean": 256.0,
+            "completion_tokens": {
+              "mean": 256,
+              "median": 256,
               "std": 0.0,
               "min": 256,
               "max": 256,
-              "n": 3
+              "n": 5
             },
-            "rss_gb": {
-              "mean": 3.154179890950521,
-              "std": 2.3409015815540775,
-              "min": 1.4711761474609375,
-              "max": 5.8274688720703125,
-              "n": 3
-            },
-            "system_used_gb": {
-              "mean": 30.133595784505207,
-              "std": 1.961539056559498,
-              "min": 28.906234741210938,
-              "max": 32.39585876464844,
-              "n": 3
-            },
-            "total_s": {
-              "mean": 3.4509123166402182,
-              "std": 0.003716633269515231,
-              "min": 3.447216033935547,
-              "max": 3.454648971557617,
-              "n": 3
-            }
+            "run_peak_rss_gb": 14.774002075195312
+          },
+          "prompt_tokens_actual": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "run_peak_rss_gb": 14.774002075195312,
+          "log": "/tmp/arle_after_fix_all_lengths_n5_normal_logs/arle_len128.log",
+          "pre_state": {
+            "label": "len128/pre",
+            "ts": 1780308773.0725708,
+            "load": "Load Avg: 4.01, 4.51, 4.60",
+            "cpu": "CPU usage: 12.50% user, 13.26% sys, 74.22% idle",
+            "physmem": "PhysMem: 22G used (4575M wired, 3410M compressor), 25G unused."
+          },
+          "post_state": {
+            "label": "len128/post",
+            "ts": 1780308816.4503932,
+            "load": "Load Avg: 4.81, 4.74, 4.69",
+            "cpu": "CPU usage: 7.77% user, 11.26% sys, 80.95% idle",
+            "physmem": "PhysMem: 25G used (3959M wired, 2131M compressor), 22G unused."
           }
         },
         "256": {
           "samples": [
             {
-              "prompt_tokens_actual": 256,
-              "ttft_s": 0.36260509490966797,
-              "tpot_ms": 12.227756770577018,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 3.4715142250061035,
-              "rss_gb": 5.812408447265625,
-              "system_used_gb": 32.40162658691406,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Document:**\n    *   The source text is a chaotic list of keywords/phrases: \"practical queue resource operator paragraph compute hypothesis pressure str"
+              "label": "measured_1",
+              "elapsed_s": 3.3956191539764404,
+              "ttft_s": 0.4137582778930664,
+              "tpot_ms": 11.693572063072056,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1254,
+              "first_text": "The provided provided data string appears to be a corrupted or repetitive log entry rather than a va",
+              "after_ps": {
+                "rss_kb": 7033024,
+                "vsz_kb": 458026640,
+                "cpu_pct": 79.9,
+                "mem_pct": 14.0
+              }
             },
             {
-              "prompt_tokens_actual": 256,
-              "ttft_s": 0.3733491897583008,
-              "tpot_ms": 12.356787216006301,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 3.551685094833374,
-              "rss_gb": 2.2470245361328125,
-              "system_used_gb": 28.798019409179688,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Document:**\n    *   The source document is a long list of keywords/phrases, likely extracted from a technical paper or report about AI inference, syste"
+              "label": "measured_2",
+              "elapsed_s": 2.1471521854400635,
+              "ttft_s": 0.39287805557250977,
+              "tpot_ms": 11.933837618146624,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 148,
+              "chunks": 148,
+              "out_chars": 886,
+              "first_text": "The provided provided input appears to be a corrupted or malformed data string rather than a valid t",
+              "after_ps": {
+                "rss_kb": 7198096,
+                "vsz_kb": 458315664,
+                "cpu_pct": 74.9,
+                "mem_pct": 14.3
+              }
             },
             {
-              "prompt_tokens_actual": 256,
-              "ttft_s": 0.3854660987854004,
-              "tpot_ms": 12.647444807638333,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 3.6579198837280273,
-              "rss_gb": 1.6075897216796875,
-              "system_used_gb": 29.233306884765625,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Document:**\n    *   The source document is a long string of keywords/phrases: \"local response allocation token practical queue resource fusion conclusi"
+              "label": "measured_3",
+              "elapsed_s": 3.457488775253296,
+              "ttft_s": 0.44593167304992676,
+              "tpot_ms": 11.810027851777917,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1253,
+              "first_text": "The provided provided data file, identified by the unique hash `measured_3_f4ddf6cd5a4843f4a3831841b",
+              "after_ps": {
+                "rss_kb": 7363360,
+                "vsz_kb": 458771264,
+                "cpu_pct": 76.1,
+                "mem_pct": 14.6
+              }
+            },
+            {
+              "label": "measured_4",
+              "elapsed_s": 3.42563796043396,
+              "ttft_s": 0.39171409606933594,
+              "tpot_ms": 11.897740644567154,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1456,
+              "first_text": "The provided provided input appears to be a corrupted or malformed data string rather than a valid t",
+              "after_ps": {
+                "rss_kb": 7528640,
+                "vsz_kb": 457898416,
+                "cpu_pct": 75.2,
+                "mem_pct": 15.0
+              }
+            },
+            {
+              "label": "measured_5",
+              "elapsed_s": 3.415083169937134,
+              "ttft_s": 0.4121260643005371,
+              "tpot_ms": 11.776302375045478,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1529,
+              "first_text": "The input input data consists of a highly repetitive sequence of technical keywords, specifically fo",
+              "after_ps": {
+                "rss_kb": 7694704,
+                "vsz_kb": 458435776,
+                "cpu_pct": 75.0,
+                "mem_pct": 15.3
+              }
             }
           ],
           "summary": {
-            "prompt_tokens_actual": 256,
             "ttft_s": {
-              "mean": 0.37380679448445636,
-              "std": 0.01143736972015914,
-              "min": 0.36260509490966797,
-              "max": 0.3854660987854004,
-              "n": 3
+              "mean": 0.4112816333770752,
+              "median": 0.4121260643005371,
+              "std": 0.021960488799613136,
+              "min": 0.39171409606933594,
+              "max": 0.44593167304992676,
+              "n": 5
             },
             "tpot_ms": {
-              "mean": 12.410662931407217,
-              "std": 0.21496850151956046,
-              "min": 12.227756770577018,
-              "max": 12.647444807638333,
-              "n": 3
+              "mean": 11.822296110521846,
+              "median": 11.810027851777917,
+              "std": 0.09613688146083169,
+              "min": 11.693572063072056,
+              "max": 11.933837618146624,
+              "n": 5
             },
-            "output_tokens_tokenizer": {
-              "mean": 255.0,
-              "std": 0.0,
-              "min": 255,
-              "max": 255,
-              "n": 3
-            },
-            "stream_text_chunks": {
-              "mean": 256.0,
-              "std": 0.0,
-              "min": 256,
+            "completion_tokens": {
+              "mean": 234.4,
+              "median": 256,
+              "std": 48.299068313995456,
+              "min": 148,
               "max": 256,
-              "n": 3
+              "n": 5
             },
-            "rss_gb": {
-              "mean": 3.2223409016927085,
-              "std": 2.2657353416620087,
-              "min": 1.6075897216796875,
-              "max": 5.812408447265625,
-              "n": 3
-            },
-            "system_used_gb": {
-              "mean": 30.144317626953125,
-              "std": 1.9669650739503337,
-              "min": 28.798019409179688,
-              "max": 32.40162658691406,
-              "n": 3
-            },
-            "total_s": {
-              "mean": 3.560373067855835,
-              "std": 0.09350603219748896,
-              "min": 3.4715142250061035,
-              "max": 3.6579198837280273,
-              "n": 3
-            }
+            "run_peak_rss_gb": 13.707107543945312
+          },
+          "prompt_tokens_actual": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "run_peak_rss_gb": 13.707107543945312,
+          "log": "/tmp/arle_after_fix_all_lengths_n5_normal_logs/arle_len256.log",
+          "pre_state": {
+            "label": "len256/pre",
+            "ts": 1780308817.5398002,
+            "load": "Load Avg: 4.81, 4.74, 4.69",
+            "cpu": "CPU usage: 11.93% user, 13.37% sys, 74.69% idle",
+            "physmem": "PhysMem: 28G used (4867M wired, 2131M compressor), 19G unused."
+          },
+          "post_state": {
+            "label": "len256/post",
+            "ts": 1780308859.484282,
+            "load": "Load Avg: 4.14, 4.58, 4.63",
+            "cpu": "CPU usage: 8.68% user, 9.68% sys, 81.62% idle",
+            "physmem": "PhysMem: 25G used (3588M wired, 2453M compressor), 22G unused."
           }
         },
         "512": {
           "samples": [
             {
-              "prompt_tokens_actual": 512,
-              "ttft_s": 0.6160953044891357,
-              "tpot_ms": 12.391975545507716,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 3.868705987930298,
-              "rss_gb": 5.98321533203125,
-              "system_used_gb": 32.01123046875,
-              "first_text": "<think>\n\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Source Document:** A long, repetitive, and somewhat nonsensical string of technical/computing terms: \"endpoint transition metal tail silicon section"
+              "label": "measured_1",
+              "elapsed_s": 3.774111032485962,
+              "ttft_s": 0.6555259227752686,
+              "tpot_ms": 12.22974552827723,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1193,
+              "first_text": "The provided provided input appears to be a corrupted or malformed data string, likely resulting fro",
+              "after_ps": {
+                "rss_kb": 9760176,
+                "vsz_kb": 458209904,
+                "cpu_pct": 81.9,
+                "mem_pct": 19.4
+              }
             },
             {
-              "prompt_tokens_actual": 512,
-              "ttft_s": 0.6401810646057129,
-              "tpot_ms": 12.577822827917384,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 3.908583879470825,
-              "rss_gb": 2.345245361328125,
-              "system_used_gb": 29.183380126953125,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Text:**\n    *   The source text is a massive block of keywords/phrases repeated in various orders. It looks like a \"word salad\" or a generated sequence"
+              "label": "measured_2",
+              "elapsed_s": 3.712294101715088,
+              "ttft_s": 0.6509809494018555,
+              "tpot_ms": 12.005149616914638,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1245,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed file, likely resulting from ",
+              "after_ps": {
+                "rss_kb": 9935472,
+                "vsz_kb": 458945984,
+                "cpu_pct": 79.3,
+                "mem_pct": 19.7
+              }
             },
             {
-              "prompt_tokens_actual": 512,
-              "ttft_s": 0.7983090877532959,
-              "tpot_ms": 12.66428710907463,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 4.107891321182251,
-              "rss_gb": 1.7675933837890625,
-              "system_used_gb": 29.664230346679688,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Text:**\n    *   The source text is a massive block of keywords/phrases repeated and mixed.\n    *   Key clusters: \"essay validation\", \"attention\", \"prom"
+              "label": "measured_3",
+              "elapsed_s": 3.5704550743103027,
+              "ttft_s": 0.6496899127960205,
+              "tpot_ms": 12.019609718165771,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 244,
+              "chunks": 244,
+              "out_chars": 1418,
+              "first_text": "The provided provided input appears to be a corrupted or malformed data string, likely resulting fro",
+              "after_ps": {
+                "rss_kb": 10110576,
+                "vsz_kb": 459160848,
+                "cpu_pct": 80.7,
+                "mem_pct": 20.1
+              }
+            },
+            {
+              "label": "measured_4",
+              "elapsed_s": 3.717231035232544,
+              "ttft_s": 0.6450989246368408,
+              "tpot_ms": 12.047576904296875,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1170,
+              "first_text": "The provided provided data consists of a repetitive sequence of technical keywords related to large ",
+              "after_ps": {
+                "rss_kb": 10285712,
+                "vsz_kb": 458098800,
+                "cpu_pct": 76.5,
+                "mem_pct": 20.4
+              }
+            },
+            {
+              "label": "measured_5",
+              "elapsed_s": 3.6581172943115234,
+              "ttft_s": 0.6436111927032471,
+              "tpot_ms": 11.821592555326573,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1315,
+              "first_text": "The provided provided data file, identified by the unique hash `measured_5_9407cb7c28af4ea28c3879137",
+              "after_ps": {
+                "rss_kb": 10461056,
+                "vsz_kb": 458897952,
+                "cpu_pct": 76.4,
+                "mem_pct": 20.8
+              }
             }
           ],
           "summary": {
-            "prompt_tokens_actual": 512,
             "ttft_s": {
-              "mean": 0.6848618189493815,
-              "std": 0.09898354943827298,
-              "min": 0.6160953044891357,
-              "max": 0.7983090877532959,
-              "n": 3
+              "mean": 0.6489813804626465,
+              "median": 0.6496899127960205,
+              "std": 0.004776078619074493,
+              "min": 0.6436111927032471,
+              "max": 0.6555259227752686,
+              "n": 5
             },
             "tpot_ms": {
-              "mean": 12.544695160833243,
-              "std": 0.13914553049915987,
-              "min": 12.391975545507716,
-              "max": 12.66428710907463,
-              "n": 3
+              "mean": 12.024734864596217,
+              "median": 12.019609718165771,
+              "std": 0.1451101115263006,
+              "min": 11.821592555326573,
+              "max": 12.22974552827723,
+              "n": 5
             },
-            "output_tokens_tokenizer": {
-              "mean": 255.0,
-              "std": 0.0,
-              "min": 255,
-              "max": 255,
-              "n": 3
-            },
-            "stream_text_chunks": {
-              "mean": 256.0,
-              "std": 0.0,
-              "min": 256,
+            "completion_tokens": {
+              "mean": 253.6,
+              "median": 256,
+              "std": 5.366563145999495,
+              "min": 244,
               "max": 256,
-              "n": 3
+              "n": 5
             },
-            "rss_gb": {
-              "mean": 3.365351359049479,
-              "std": 2.2854604104131018,
-              "min": 1.7675933837890625,
-              "max": 5.98321533203125,
-              "n": 3
-            },
-            "system_used_gb": {
-              "mean": 30.286280314127605,
-              "std": 1.5130743571951912,
-              "min": 29.183380126953125,
-              "max": 32.01123046875,
-              "n": 3
-            },
-            "total_s": {
-              "mean": 3.9617270628611245,
-              "std": 0.1281427109372719,
-              "min": 3.868705987930298,
-              "max": 4.107891321182251,
-              "n": 3
-            }
+            "run_peak_rss_gb": 14.434661865234375
+          },
+          "prompt_tokens_actual": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "run_peak_rss_gb": 14.434661865234375,
+          "log": "/tmp/arle_after_fix_all_lengths_n5_normal_logs/arle_len512.log",
+          "pre_state": {
+            "label": "len512/pre",
+            "ts": 1780308860.544211,
+            "load": "Load Avg: 4.21, 4.59, 4.63",
+            "cpu": "CPU usage: 13.33% user, 12.23% sys, 74.42% idle",
+            "physmem": "PhysMem: 28G used (4496M wired, 2450M compressor), 20G unused."
+          },
+          "post_state": {
+            "label": "len512/post",
+            "ts": 1780308904.7027059,
+            "load": "Load Avg: 4.81, 4.70, 4.67",
+            "cpu": "CPU usage: 6.82% user, 10.99% sys, 82.18% idle",
+            "physmem": "PhysMem: 25G used (3777M wired, 2936M compressor), 23G unused."
           }
         },
         "1024": {
           "samples": [
             {
-              "prompt_tokens_actual": 1024,
-              "ttft_s": 1.1501200199127197,
-              "tpot_ms": 12.581012380404735,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 4.397268056869507,
-              "rss_gb": 6.187408447265625,
-              "system_used_gb": 32.71656799316406,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Text:**\n    *   The source text is a massive block of keywords/phrases repeated in various orders. It looks like a \"word salad\" or a generated sequence"
+              "label": "measured_1",
+              "elapsed_s": 5.624173879623413,
+              "ttft_s": 2.389676809310913,
+              "tpot_ms": 12.684302236519608,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1446,
+              "first_text": "The provided provided input appears to be a corrupted or adversarial data sample, characterized by t",
+              "after_ps": {
+                "rss_kb": 7579952,
+                "vsz_kb": 459469072,
+                "cpu_pct": 80.5,
+                "mem_pct": 15.1
+              }
             },
             {
-              "prompt_tokens_actual": 1024,
-              "ttft_s": 1.2028329372406006,
-              "tpot_ms": 13.003957553172675,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 4.580215215682983,
-              "rss_gb": 2.4434356689453125,
-              "system_used_gb": 30.072296142578125,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Document:**\n    *   The source text is a massive block of keywords/phrases repeated in various orders. It looks like a \"bag of words\" or a sequence of "
+              "label": "measured_2",
+              "elapsed_s": 4.3241050243377686,
+              "ttft_s": 1.2286169528961182,
+              "tpot_ms": 12.139168907614316,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1449,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed log entry, characterized by ",
+              "after_ps": {
+                "rss_kb": 7778480,
+                "vsz_kb": 460456544,
+                "cpu_pct": 81.0,
+                "mem_pct": 15.5
+              }
             },
             {
-              "prompt_tokens_actual": 1024,
-              "ttft_s": 1.4662201404571533,
-              "tpot_ms": 13.003949105270266,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 4.808535099029541,
-              "rss_gb": 1.888336181640625,
-              "system_used_gb": 30.198974609375,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Document:**\n    *   The source text is a massive repetition of keywords and phrases. It looks like a \"word salad\" or a generated sequence of tokens rel"
+              "label": "measured_3",
+              "elapsed_s": 4.6583380699157715,
+              "ttft_s": 1.2293789386749268,
+              "tpot_ms": 13.446898553885665,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1211,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed file identifier, specificall",
+              "after_ps": {
+                "rss_kb": 7975024,
+                "vsz_kb": 457809600,
+                "cpu_pct": 82.7,
+                "mem_pct": 15.8
+              }
+            },
+            {
+              "label": "measured_4",
+              "elapsed_s": 4.3334801197052,
+              "ttft_s": 1.150083065032959,
+              "tpot_ms": 12.483910018322515,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1193,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed file, likely resulting from ",
+              "after_ps": {
+                "rss_kb": 8171040,
+                "vsz_kb": 459113264,
+                "cpu_pct": 85.6,
+                "mem_pct": 16.2
+              }
+            },
+            {
+              "label": "measured_5",
+              "elapsed_s": 4.367082118988037,
+              "ttft_s": 1.228459119796753,
+              "tpot_ms": 12.308325487024643,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1445,
+              "first_text": "The provided provided input data consists of a repetitive sequence of technical keywords related to ",
+              "after_ps": {
+                "rss_kb": 8367296,
+                "vsz_kb": 459601744,
+                "cpu_pct": 79.8,
+                "mem_pct": 16.6
+              }
             }
           ],
           "summary": {
-            "prompt_tokens_actual": 1024,
             "ttft_s": {
-              "mean": 1.2730576992034912,
-              "std": 0.16934715659440477,
-              "min": 1.1501200199127197,
-              "max": 1.4662201404571533,
-              "n": 3
+              "mean": 1.445242977142334,
+              "median": 1.2286169528961182,
+              "std": 0.5290543439361526,
+              "min": 1.150083065032959,
+              "max": 2.389676809310913,
+              "n": 5
             },
             "tpot_ms": {
-              "mean": 12.862973012949226,
-              "std": 0.2441850706871915,
-              "min": 12.581012380404735,
-              "max": 13.003957553172675,
-              "n": 3
+              "mean": 12.61252104067335,
+              "median": 12.483910018322515,
+              "std": 0.5085460516100765,
+              "min": 12.139168907614316,
+              "max": 13.446898553885665,
+              "n": 5
             },
-            "output_tokens_tokenizer": {
-              "mean": 255.0,
-              "std": 0.0,
-              "min": 255,
-              "max": 255,
-              "n": 3
-            },
-            "stream_text_chunks": {
-              "mean": 256.0,
+            "completion_tokens": {
+              "mean": 256,
+              "median": 256,
               "std": 0.0,
               "min": 256,
               "max": 256,
-              "n": 3
+              "n": 5
             },
-            "rss_gb": {
-              "mean": 3.5063934326171875,
-              "std": 2.338357327651027,
-              "min": 1.888336181640625,
-              "max": 6.187408447265625,
-              "n": 3
-            },
-            "system_used_gb": {
-              "mean": 30.995946248372395,
-              "std": 1.4914477027287754,
-              "min": 30.072296142578125,
-              "max": 32.71656799316406,
-              "n": 3
-            },
-            "total_s": {
-              "mean": 4.595339457194011,
-              "std": 0.206050241452731,
-              "min": 4.397268056869507,
-              "max": 4.808535099029541,
-              "n": 3
-            }
+            "run_peak_rss_gb": 14.123519897460938
+          },
+          "prompt_tokens_actual": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "run_peak_rss_gb": 14.123519897460938,
+          "log": "/tmp/arle_after_fix_all_lengths_n5_normal_logs/arle_len1024.log",
+          "pre_state": {
+            "label": "len1024/pre",
+            "ts": 1780308905.7693639,
+            "load": "Load Avg: 4.75, 4.69, 4.66",
+            "cpu": "CPU usage: 15.47% user, 13.37% sys, 71.14% idle",
+            "physmem": "PhysMem: 27G used (4743M wired, 2916M compressor), 20G unused."
+          },
+          "post_state": {
+            "label": "len1024/post",
+            "ts": 1780308955.189455,
+            "load": "Load Avg: 3.54, 4.34, 4.53",
+            "cpu": "CPU usage: 8.27% user, 11.27% sys, 80.45% idle",
+            "physmem": "PhysMem: 23G used (3783M wired, 3950M compressor), 24G unused."
           }
         },
         "2048": {
           "samples": [
             {
-              "prompt_tokens_actual": 2048,
-              "ttft_s": 2.228505849838257,
-              "tpot_ms": 13.4225511175441,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 5.7422096729278564,
-              "rss_gb": 6.4643096923828125,
-              "system_used_gb": 32.98211669921875,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Document:**\n    *   The source text is a massive repetition of keywords and phrases. It looks like a \"word salad\" or a generated sequence of tokens rel"
+              "label": "measured_1",
+              "elapsed_s": 5.483885765075684,
+              "ttft_s": 2.188084840774536,
+              "tpot_ms": 12.924709507063323,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1365,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed log entry, characterized by ",
+              "after_ps": {
+                "rss_kb": 950352,
+                "vsz_kb": 461416784,
+                "cpu_pct": 76.2,
+                "mem_pct": 1.9
+              }
             },
             {
-              "prompt_tokens_actual": 2048,
-              "ttft_s": 2.361077070236206,
-              "tpot_ms": 13.454984492204321,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 5.833184003829956,
-              "rss_gb": 2.640411376953125,
-              "system_used_gb": 30.25970458984375,
-              "first_text": "<think>\n\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Source Document:** A massive, repetitive, keyword-stuffed string of technical terms related to AI/ML systems, LLM inference, hardware, software engi"
+              "label": "measured_2",
+              "elapsed_s": 5.664113759994507,
+              "ttft_s": 2.335927724838257,
+              "tpot_ms": 13.051709941789216,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1285,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed file identifier, specificall",
+              "after_ps": {
+                "rss_kb": 1187184,
+                "vsz_kb": 463345760,
+                "cpu_pct": 77.9,
+                "mem_pct": 2.4
+              }
             },
             {
-              "prompt_tokens_actual": 2048,
-              "ttft_s": 3.0281317234039307,
-              "tpot_ms": 13.546630153505822,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 6.503874063491821,
-              "rss_gb": 2.00067138671875,
-              "system_used_gb": 30.568527221679688,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Document:**\n    *   The source text is a massive repetition of keywords and phrases. It looks like a \"stochastic parrot\" output or a corrupted log, but"
+              "label": "measured_3",
+              "elapsed_s": 5.870036840438843,
+              "ttft_s": 2.1855669021606445,
+              "tpot_ms": 14.448901718738032,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1497,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed file, characterized by the r",
+              "after_ps": {
+                "rss_kb": 1167504,
+                "vsz_kb": 458198784,
+                "cpu_pct": 80.1,
+                "mem_pct": 2.3
+              }
+            },
+            {
+              "label": "measured_4",
+              "elapsed_s": 5.751775026321411,
+              "ttft_s": 2.301949977874756,
+              "tpot_ms": 13.528725680182962,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1234,
+              "first_text": "The provided provided input appears to be a corrupted or malformed data string, likely resulting fro",
+              "after_ps": {
+                "rss_kb": 1414816,
+                "vsz_kb": 460440448,
+                "cpu_pct": 78.4,
+                "mem_pct": 2.8
+              }
+            },
+            {
+              "label": "measured_5",
+              "elapsed_s": 5.789104223251343,
+              "ttft_s": 2.3093361854553223,
+              "tpot_ms": 13.64614916782753,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1477,
+              "first_text": "The provided provided input data appears to be a corrupted or adversarial prompt injection attempt, ",
+              "after_ps": {
+                "rss_kb": 1661648,
+                "vsz_kb": 462427840,
+                "cpu_pct": 80.9,
+                "mem_pct": 3.3
+              }
             }
           ],
           "summary": {
-            "prompt_tokens_actual": 2048,
             "ttft_s": {
-              "mean": 2.539238214492798,
-              "std": 0.4285515481374794,
-              "min": 2.228505849838257,
-              "max": 3.0281317234039307,
-              "n": 3
+              "mean": 2.264173126220703,
+              "median": 2.301949977874756,
+              "std": 0.07173541751848557,
+              "min": 2.1855669021606445,
+              "max": 2.335927724838257,
+              "n": 5
             },
             "tpot_ms": {
-              "mean": 13.474721921084749,
-              "std": 0.06435119552428702,
-              "min": 13.4225511175441,
-              "max": 13.546630153505822,
-              "n": 3
+              "mean": 13.520039203120213,
+              "median": 13.528725680182962,
+              "std": 0.6026015464276814,
+              "min": 12.924709507063323,
+              "max": 14.448901718738032,
+              "n": 5
             },
-            "output_tokens_tokenizer": {
-              "mean": 255.0,
-              "std": 0.0,
-              "min": 255,
-              "max": 255,
-              "n": 3
-            },
-            "stream_text_chunks": {
-              "mean": 256.0,
+            "completion_tokens": {
+              "mean": 256,
+              "median": 256,
               "std": 0.0,
               "min": 256,
               "max": 256,
-              "n": 3
+              "n": 5
             },
-            "rss_gb": {
-              "mean": 3.7017974853515625,
-              "std": 2.413694695746289,
-              "min": 2.00067138671875,
-              "max": 6.4643096923828125,
-              "n": 3
-            },
-            "system_used_gb": {
-              "mean": 31.270116170247395,
-              "std": 1.4906549610430195,
-              "min": 30.25970458984375,
-              "max": 32.98211669921875,
-              "n": 3
-            },
-            "total_s": {
-              "mean": 6.026422580083211,
-              "std": 0.41597959262154055,
-              "min": 5.7422096729278564,
-              "max": 6.503874063491821,
-              "n": 3
-            }
+            "run_peak_rss_gb": 11.444061279296875
+          },
+          "prompt_tokens_actual": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "run_peak_rss_gb": 11.444061279296875,
+          "log": "/tmp/arle_after_fix_all_lengths_n5_normal_logs/arle_len2048.log",
+          "pre_state": {
+            "label": "len2048/pre",
+            "ts": 1780308956.26932,
+            "load": "Load Avg: 3.54, 4.34, 4.53",
+            "cpu": "CPU usage: 16.42% user, 13.16% sys, 70.40% idle",
+            "physmem": "PhysMem: 26G used (5768M wired, 3934M compressor), 21G unused."
+          },
+          "post_state": {
+            "label": "len2048/post",
+            "ts": 1780309017.565635,
+            "load": "Load Avg: 3.46, 4.23, 4.48",
+            "cpu": "CPU usage: 5.50% user, 9.25% sys, 85.23% idle",
+            "physmem": "PhysMem: 21G used (3463M wired, 5353M compressor), 26G unused."
           }
         },
         "4096": {
           "samples": [
             {
-              "prompt_tokens_actual": 4097,
-              "ttft_s": 4.704386949539185,
-              "tpot_ms": 14.192125928683543,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 8.356849908828735,
-              "rss_gb": 6.8230743408203125,
-              "system_used_gb": 33.259429931640625,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Document:**\n    *   The source text is a massive repetition of keywords and phrases. It looks like a \"word salad\" or a generated sequence of tokens rel"
+              "label": "measured_1",
+              "elapsed_s": 7.978821277618408,
+              "ttft_s": 4.716020107269287,
+              "tpot_ms": 12.795298707251455,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1261,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed log entry, characterized by ",
+              "after_ps": {
+                "rss_kb": 1237264,
+                "vsz_kb": 461784272,
+                "cpu_pct": 78.8,
+                "mem_pct": 2.5
+              }
             },
             {
-              "prompt_tokens_actual": 4096,
-              "ttft_s": 4.974261045455933,
-              "tpot_ms": 14.340610016049363,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 8.655581951141357,
-              "rss_gb": 2.8088836669921875,
-              "system_used_gb": 31.8575439453125,
-              "first_text": "<think>\n\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Source Document:** A massive, repetitive, keyword-stuffed text block. It contains repeated sequences of words like: \"storage essay validation attent"
+              "label": "measured_2",
+              "elapsed_s": 8.399442911148071,
+              "ttft_s": 4.987534046173096,
+              "tpot_ms": 13.380034764607748,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1434,
+              "first_text": "The input input data appears to be a corrupted or adversarial prompt consisting of a unique identifi",
+              "after_ps": {
+                "rss_kb": 1556528,
+                "vsz_kb": 462240576,
+                "cpu_pct": 73.7,
+                "mem_pct": 3.1
+              }
             },
             {
-              "prompt_tokens_actual": 4096,
-              "ttft_s": 5.741208076477051,
-              "tpot_ms": 14.135176741232083,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 9.369739055633545,
-              "rss_gb": 2.2634735107421875,
-              "system_used_gb": 32.447784423828125,
-              "first_text": "<think>\n\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Source Document:** A highly repetitive, keyword-stuffed string of technical terms related to AI/ML systems, hardware, and software engineering. It r"
+              "label": "measured_3",
+              "elapsed_s": 8.058657169342041,
+              "ttft_s": 4.755779266357422,
+              "tpot_ms": 12.952462364645566,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1236,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed file, likely resulting from ",
+              "after_ps": {
+                "rss_kb": 1875744,
+                "vsz_kb": 458947072,
+                "cpu_pct": 77.9,
+                "mem_pct": 3.7
+              }
+            },
+            {
+              "label": "measured_4",
+              "elapsed_s": 8.04128098487854,
+              "ttft_s": 4.744933128356934,
+              "tpot_ms": 12.926854339300418,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1565,
+              "first_text": "The input input data consists of a highly repetitive sequence of technical keywords related to large",
+              "after_ps": {
+                "rss_kb": 2204048,
+                "vsz_kb": 463054176,
+                "cpu_pct": 75.9,
+                "mem_pct": 4.4
+              }
+            },
+            {
+              "label": "measured_5",
+              "elapsed_s": 8.220728874206543,
+              "ttft_s": 4.847529888153076,
+              "tpot_ms": 13.228231317856732,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1466,
+              "first_text": "The input input data consists of a repetitive sequence of technical keywords related to large langua",
+              "after_ps": {
+                "rss_kb": 2523376,
+                "vsz_kb": 463513728,
+                "cpu_pct": 70.0,
+                "mem_pct": 5.0
+              }
             }
           ],
           "summary": {
-            "prompt_tokens_actual": 4097,
             "ttft_s": {
-              "mean": 5.139952023824056,
-              "std": 0.5379030001316373,
-              "min": 4.704386949539185,
-              "max": 5.741208076477051,
-              "n": 3
+              "mean": 4.810359287261963,
+              "median": 4.755779266357422,
+              "std": 0.11060288264611509,
+              "min": 4.716020107269287,
+              "max": 4.987534046173096,
+              "n": 5
             },
             "tpot_ms": {
-              "mean": 14.22263756198833,
-              "std": 0.10606096089387589,
-              "min": 14.135176741232083,
-              "max": 14.340610016049363,
-              "n": 3
+              "mean": 13.056576298732384,
+              "median": 12.952462364645566,
+              "std": 0.23980424442501158,
+              "min": 12.795298707251455,
+              "max": 13.380034764607748,
+              "n": 5
             },
-            "output_tokens_tokenizer": {
-              "mean": 255.0,
-              "std": 0.0,
-              "min": 255,
-              "max": 255,
-              "n": 3
-            },
-            "stream_text_chunks": {
-              "mean": 256.0,
+            "completion_tokens": {
+              "mean": 256,
+              "median": 256,
               "std": 0.0,
               "min": 256,
               "max": 256,
-              "n": 3
+              "n": 5
             },
-            "rss_gb": {
-              "mean": 3.965143839518229,
-              "std": 2.4900186991947963,
-              "min": 2.2634735107421875,
-              "max": 6.8230743408203125,
-              "n": 3
-            },
-            "system_used_gb": {
-              "mean": 32.521586100260414,
-              "std": 0.7038509041330824,
-              "min": 31.8575439453125,
-              "max": 33.259429931640625,
-              "n": 3
-            },
-            "total_s": {
-              "mean": 8.79405697186788,
-              "std": 0.520449425451361,
-              "min": 8.356849908828735,
-              "max": 9.369739055633545,
-              "n": 3
-            }
+            "run_peak_rss_gb": 12.013992309570312
+          },
+          "prompt_tokens_actual": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "run_peak_rss_gb": 12.013992309570312,
+          "log": "/tmp/arle_after_fix_all_lengths_n5_normal_logs/arle_len4096.log",
+          "pre_state": {
+            "label": "len4096/pre",
+            "ts": 1780309018.631136,
+            "load": "Load Avg: 3.46, 4.23, 4.48",
+            "cpu": "CPU usage: 10.77% user, 12.80% sys, 76.41% idle",
+            "physmem": "PhysMem: 23G used (4253M wired, 5354M compressor), 24G unused."
+          },
+          "post_state": {
+            "label": "len4096/post",
+            "ts": 1780309091.731752,
+            "load": "Load Avg: 3.39, 4.07, 4.40",
+            "cpu": "CPU usage: 7.4% user, 11.61% sys, 81.34% idle",
+            "physmem": "PhysMem: 21G used (3542M wired, 5582M compressor), 26G unused."
           }
         },
         "8192": {
           "samples": [
             {
-              "prompt_tokens_actual": 8192,
-              "ttft_s": 12.305039882659912,
-              "tpot_ms": 18.607429632051723,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 17.075189113616943,
-              "rss_gb": 6.8419647216796875,
-              "system_used_gb": 33.888031005859375,
-              "first_text": "<think>\n\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Source Document:** A massive, repetitive block of text containing technical jargon related to AI/ML system design, benchmarking, and optimization. K"
+              "label": "measured_1",
+              "elapsed_s": 13.828776836395264,
+              "ttft_s": 10.134285926818848,
+              "tpot_ms": 14.48819964539771,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1241,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed log entry, likely resulting ",
+              "after_ps": {
+                "rss_kb": 1424752,
+                "vsz_kb": 463185456,
+                "cpu_pct": 76.4,
+                "mem_pct": 2.8
+              }
             },
             {
-              "prompt_tokens_actual": 8192,
-              "ttft_s": 10.584871053695679,
-              "tpot_ms": 17.27689814379835,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 15.013206005096436,
-              "rss_gb": 3.0351104736328125,
-              "system_used_gb": 33.38661193847656,
-              "first_text": "<think>\n\nThinking Process:\n\n1.  **Deconstruct and Analyze the Source Document:**\n    *   The source text is a massive wall of keywords, phrases, and repeated structures. It looks like a \"word salad\" or a generated sequen"
+              "label": "measured_2",
+              "elapsed_s": 13.74875020980835,
+              "ttft_s": 10.121634006500244,
+              "tpot_ms": 14.223985111012178,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1283,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed log entry, characterized by ",
+              "after_ps": {
+                "rss_kb": 1908352,
+                "vsz_kb": 463700912,
+                "cpu_pct": 71.1,
+                "mem_pct": 3.8
+              }
             },
             {
-              "prompt_tokens_actual": 8192,
-              "ttft_s": 11.713936805725098,
-              "tpot_ms": 15.554019785302831,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 15.712103843688965,
-              "rss_gb": 2.463531494140625,
-              "system_used_gb": 35.480377197265625,
-              "first_text": "<think>\n\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Source Document:** A massive, repetitive block of text containing technical jargon related to AI/ML systems, specifically large language model (LLM)"
+              "label": "measured_3",
+              "elapsed_s": 13.849796772003174,
+              "ttft_s": 10.295471906661987,
+              "tpot_ms": 14.687292831988373,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 243,
+              "chunks": 243,
+              "out_chars": 1339,
+              "first_text": "The input input data provided for Case ID `measured_3` consists entirely of a highly repetitive stri",
+              "after_ps": {
+                "rss_kb": 1622352,
+                "vsz_kb": 464217856,
+                "cpu_pct": 67.2,
+                "mem_pct": 3.2
+              }
+            },
+            {
+              "label": "measured_4",
+              "elapsed_s": 15.216289043426514,
+              "ttft_s": 11.507221937179565,
+              "tpot_ms": 14.545361200968424,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1254,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed log entry, likely resulting ",
+              "after_ps": {
+                "rss_kb": 1703200,
+                "vsz_kb": 459927952,
+                "cpu_pct": 69.0,
+                "mem_pct": 3.4
+              }
+            },
+            {
+              "label": "measured_5",
+              "elapsed_s": 14.29449200630188,
+              "ttft_s": 10.703990936279297,
+              "tpot_ms": 14.536441579038799,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 248,
+              "chunks": 248,
+              "out_chars": 1417,
+              "first_text": "The provided provided input appears to be a corrupted or malformed data string, likely resulting fro",
+              "after_ps": {
+                "rss_kb": 2162480,
+                "vsz_kb": 465238464,
+                "cpu_pct": 68.3,
+                "mem_pct": 4.3
+              }
             }
           ],
           "summary": {
-            "prompt_tokens_actual": 8192,
             "ttft_s": {
-              "mean": 11.534615914026896,
-              "std": 0.8739920976099407,
-              "min": 10.584871053695679,
-              "max": 12.305039882659912,
-              "n": 3
+              "mean": 10.552520942687988,
+              "median": 10.295471906661987,
+              "std": 0.583321402624654,
+              "min": 10.121634006500244,
+              "max": 11.507221937179565,
+              "n": 5
             },
             "tpot_ms": {
-              "mean": 17.146115853717635,
-              "std": 1.5309003653421864,
-              "min": 15.554019785302831,
-              "max": 18.607429632051723,
-              "n": 3
+              "mean": 14.496256073681097,
+              "median": 14.536441579038799,
+              "std": 0.16934994430221711,
+              "min": 14.223985111012178,
+              "max": 14.687292831988373,
+              "n": 5
             },
-            "output_tokens_tokenizer": {
-              "mean": 255.0,
-              "std": 0.0,
-              "min": 255,
-              "max": 255,
-              "n": 3
-            },
-            "stream_text_chunks": {
-              "mean": 256.0,
-              "std": 0.0,
-              "min": 256,
+            "completion_tokens": {
+              "mean": 251.8,
+              "median": 256,
+              "std": 6.016643582596529,
+              "min": 243,
               "max": 256,
-              "n": 3
+              "n": 5
             },
-            "rss_gb": {
-              "mean": 4.113535563151042,
-              "std": 2.380109217511107,
-              "min": 2.463531494140625,
-              "max": 6.8419647216796875,
-              "n": 3
-            },
-            "system_used_gb": {
-              "mean": 34.25167338053385,
-              "std": 1.093224621119639,
-              "min": 33.38661193847656,
-              "max": 35.480377197265625,
-              "n": 3
-            },
-            "total_s": {
-              "mean": 15.933499654134115,
-              "std": 1.0486685194178247,
-              "min": 15.013206005096436,
-              "max": 17.075189113616943,
-              "n": 3
-            }
+            "run_peak_rss_gb": 12.971954345703125
+          },
+          "prompt_tokens_actual": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "run_peak_rss_gb": 12.971954345703125,
+          "log": "/tmp/arle_after_fix_all_lengths_n5_normal_logs/arle_len8192.log",
+          "pre_state": {
+            "label": "len8192/pre",
+            "ts": 1780309092.801543,
+            "load": "Load Avg: 3.39, 4.07, 4.40",
+            "cpu": "CPU usage: 14.19% user, 12.80% sys, 72.99% idle",
+            "physmem": "PhysMem: 24G used (4686M wired, 5582M compressor), 24G unused."
+          },
+          "post_state": {
+            "label": "len8192/post",
+            "ts": 1780309200.1094642,
+            "load": "Load Avg: 3.85, 4.10, 4.37",
+            "cpu": "CPU usage: 7.18% user, 10.77% sys, 82.4% idle",
+            "physmem": "PhysMem: 19G used (3730M wired, 6293M compressor), 28G unused."
           }
         },
         "12288": {
           "samples": [
             {
-              "prompt_tokens_actual": 12288,
-              "ttft_s": 17.268259286880493,
-              "tpot_ms": 29.531074321176124,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 24.823004007339478,
-              "rss_gb": 2.0343475341796875,
-              "system_used_gb": 34.30763244628906,
-              "first_text": "<think>\n\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Source Document:** A massive, highly repetitive block of text containing technical/computing jargon. It's essentially a \"word salad\" or a generated "
+              "label": "measured_1",
+              "elapsed_s": 20.24202299118042,
+              "ttft_s": 16.392296075820923,
+              "tpot_ms": 15.09696829552744,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1334,
+              "first_text": "The input input data provided for Case ID `measured_1` consists entirely of a single, highly repetit",
+              "after_ps": {
+                "rss_kb": 3832880,
+                "vsz_kb": 465424464,
+                "cpu_pct": 69.8,
+                "mem_pct": 7.6
+              }
             },
             {
-              "prompt_tokens_actual": 12288,
-              "ttft_s": 20.659591913223267,
-              "tpot_ms": 24.653897510738823,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 26.988422870635986,
-              "rss_gb": 2.8646240234375,
-              "system_used_gb": 33.87934875488281,
-              "first_text": "<think>\n\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Source Document:** A massive, repetitive block of text containing technical jargon related to AI/ML system architecture, specifically large language"
+              "label": "measured_2",
+              "elapsed_s": 20.413481950759888,
+              "ttft_s": 16.28702688217163,
+              "tpot_ms": 16.18217673956179,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1507,
+              "first_text": "The input input data consists of a highly repetitive sequence of technical keywords related to large",
+              "after_ps": {
+                "rss_kb": 2882256,
+                "vsz_kb": 466188208,
+                "cpu_pct": 77.5,
+                "mem_pct": 5.7
+              }
             },
             {
-              "prompt_tokens_actual": 12288,
-              "ttft_s": 20.561673879623413,
-              "tpot_ms": 42.859287712517684,
-              "output_tokens_tokenizer": 255,
-              "stream_text_chunks": 256,
-              "total_s": 31.46883201599121,
-              "rss_gb": 2.46722412109375,
-              "system_used_gb": 33.84657287597656,
-              "first_text": "<think>\n\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Source Document:** A massive, repetitive block of text containing technical jargon related to AI/ML system design, specifically large language model"
+              "label": "measured_3",
+              "elapsed_s": 20.326435089111328,
+              "ttft_s": 16.335198402404785,
+              "tpot_ms": 15.651908575319776,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1407,
+              "first_text": "The provided provided input data appears to be a corrupted or malformed log entry, characterized by ",
+              "after_ps": {
+                "rss_kb": 1890384,
+                "vsz_kb": 460440752,
+                "cpu_pct": 84.0,
+                "mem_pct": 3.8
+              }
+            },
+            {
+              "label": "measured_4",
+              "elapsed_s": 20.87161612510681,
+              "ttft_s": 16.75947093963623,
+              "tpot_ms": 16.126059550865026,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1446,
+              "first_text": "The input input data provided for Case ID `measured_4` consists entirely of a repetitive string sequ",
+              "after_ps": {
+                "rss_kb": 1320016,
+                "vsz_kb": 467613024,
+                "cpu_pct": 79.8,
+                "mem_pct": 2.6
+              }
+            },
+            {
+              "label": "measured_5",
+              "elapsed_s": 22.423843145370483,
+              "ttft_s": 18.001455068588257,
+              "tpot_ms": 17.342698340322457,
+              "prompt_tokens_usage": null,
+              "completion_tokens": 256,
+              "chunks": 256,
+              "out_chars": 1407,
+              "first_text": "The input input data provided is a repetitive concatenation of the phrase \"metal tail silicon sectio",
+              "after_ps": {
+                "rss_kb": 1376192,
+                "vsz_kb": 468357584,
+                "cpu_pct": 69.7,
+                "mem_pct": 2.7
+              }
             }
           ],
           "summary": {
-            "prompt_tokens_actual": 12288,
             "ttft_s": {
-              "mean": 19.496508359909058,
-              "std": 1.930341273950155,
-              "min": 17.268259286880493,
-              "max": 20.659591913223267,
-              "n": 3
+              "mean": 16.755089473724365,
+              "median": 16.392296075820923,
+              "std": 0.7211893898712133,
+              "min": 16.28702688217163,
+              "max": 18.001455068588257,
+              "n": 5
             },
             "tpot_ms": {
-              "mean": 32.34808651481088,
-              "std": 9.423944310853688,
-              "min": 24.653897510738823,
-              "max": 42.859287712517684,
-              "n": 3
+              "mean": 16.0799623003193,
+              "median": 16.126059550865026,
+              "std": 0.8301479175067379,
+              "min": 15.09696829552744,
+              "max": 17.342698340322457,
+              "n": 5
             },
-            "output_tokens_tokenizer": {
-              "mean": 255.0,
-              "std": 0.0,
-              "min": 255,
-              "max": 255,
-              "n": 3
-            },
-            "stream_text_chunks": {
-              "mean": 256.0,
+            "completion_tokens": {
+              "mean": 256,
+              "median": 256,
               "std": 0.0,
               "min": 256,
               "max": 256,
-              "n": 3
+              "n": 5
             },
-            "rss_gb": {
-              "mean": 2.4553985595703125,
-              "std": 0.41526454830936155,
-              "min": 2.0343475341796875,
-              "max": 2.8646240234375,
-              "n": 3
-            },
-            "system_used_gb": {
-              "mean": 34.01118469238281,
-              "std": 0.2572538000818738,
-              "min": 33.84657287597656,
-              "max": 34.30763244628906,
-              "n": 3
-            },
-            "total_s": {
-              "mean": 27.76008629798889,
-              "std": 3.389447715186132,
-              "min": 24.823004007339478,
-              "max": 31.46883201599121,
-              "n": 3
-            }
+            "run_peak_rss_gb": 15.469741821289062
+          },
+          "prompt_tokens_actual": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "run_peak_rss_gb": 15.469741821289062,
+          "log": "/tmp/arle_after_fix_all_lengths_n5_normal_logs/arle_len12288.log",
+          "pre_state": {
+            "label": "len12288/pre",
+            "ts": 1780309201.201926,
+            "load": "Load Avg: 3.85, 4.10, 4.37",
+            "cpu": "CPU usage: 19.25% user, 16.14% sys, 64.59% idle",
+            "physmem": "PhysMem: 22G used (4771M wired, 6278M compressor), 26G unused."
+          },
+          "post_state": {
+            "label": "len12288/post",
+            "ts": 1780309349.22358,
+            "load": "Load Avg: 4.59, 4.14, 4.33",
+            "cpu": "CPU usage: 9.45% user, 12.48% sys, 78.6% idle",
+            "physmem": "PhysMem: 17G used (3763M wired, 1947M compressor), 31G unused."
           }
         }
       }
     },
     "mlx_lm": {
       "label": "mlx-lm",
-      "cmd": "/opt/homebrew/opt/python@3.11/bin/python3.11 -m mlx_lm server --model mlx-community/Qwen3.6-35B-A3B-4bit --port 9046 --host 127.0.0.1",
-      "port": 9046,
-      "log": "/tmp/arle_readme_chat_essay_avg_v2_logs/mlx_lm.log",
       "rows": {
         "128": {
           "samples": [
