@@ -1,13 +1,12 @@
 {
-  "generated_at": "2026-06-01T15:25:00+08:00",
+  "generated_at": "2026-06-01T15:49:00+08:00",
   "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
   "hardware": "Apple Silicon, 48 GB unified memory",
-  "shape": "c=1, OpenAI streaming completions, max_tokens=256, temperature=0",
-  "rss_definition": "process RSS sampled during streaming. On macOS unified memory, non-wired Metal pages may not all appear as process RSS; system_used_gb records host memory pressure separately.",
+  "shape": "c=1, /v1/completions streaming, max_tokens=256, temperature=0",
+  "prompt": "conditional stable completion prompt: Continue for <8k, paragraph for >=8k",
+  "rss_definition": "process RSS sampled during streaming; system_used_gb records host memory pressure separately.",
   "sources": {
-    "arle_default": "/tmp/bench_auto_wired_ab_20260601-144758.json",
-    "mlx_lm_full_sweep": "/tmp/bench_mlx_compare_20260601-145454.json",
-    "mlx_lm_8192_same_prompt_ttft_retry": "/tmp/bench_mlx_8192_sameprompt_ttft_20260601.json"
+    "full_retest": "/tmp/bench_readme_full_retest_v2_20260601.json"
   },
   "lens": [
     128,
@@ -22,133 +21,141 @@
   "series": {
     "arle": {
       "label": "ARLE",
-      "cmd": "target/release/metal_serve --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8897 --max-running-requests 1 --max-batch-tokens 4096",
+      "cmd": "target/release/metal_serve --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8915 --max-running-requests 1 --max-batch-tokens 4096",
       "rows": {
         "128": {
-          "ttft_s": 0.21416497230529785,
-          "tpot_ms": 11.638185170691782,
-          "rss_gb": 2.209,
-          "system_used_gb": 32.113,
-          "ntok": 256
+          "ttft_s": 0.2179110050201416,
+          "tpot_ms": 14.304437036589375,
+          "ntok": 256,
+          "rss_gb": 4.5412750244140625,
+          "system_used_gb": 32.81904602050781,
+          "first_text": "\n\n<think><think>\n\n</think>\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word wo"
         },
         "256": {
-          "ttft_s": 0.3267829418182373,
-          "tpot_ms": 11.485464929595707,
-          "rss_gb": 2.211,
-          "system_used_gb": 32.006,
-          "ntok": 256
+          "ttft_s": 0.343703031539917,
+          "tpot_ms": 15.427288107984648,
+          "ntok": 256,
+          "rss_gb": 4.5438995361328125,
+          "system_used_gb": 34.089752197265625,
+          "first_text": "\n\n<think><think>\n\n</think>\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word wo"
         },
         "512": {
-          "ttft_s": 0.5799920558929443,
-          "tpot_ms": 11.684440252349132,
-          "rss_gb": 2.214,
-          "system_used_gb": 32.218,
-          "ntok": 256
+          "ttft_s": 0.6270792484283447,
+          "tpot_ms": 14.418997163847676,
+          "ntok": 256,
+          "rss_gb": 4.5465087890625,
+          "system_used_gb": 33.34663391113281,
+          "first_text": "\n\n<think><think>\n\n</think>\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word wo"
         },
         "1024": {
-          "ttft_s": 1.0971519947052002,
-          "tpot_ms": 11.836854491646834,
-          "rss_gb": 2.217,
-          "system_used_gb": 32.74,
-          "ntok": 256
+          "ttft_s": 1.1632080078125,
+          "tpot_ms": 14.527991062074197,
+          "ntok": 256,
+          "rss_gb": 4.5494842529296875,
+          "system_used_gb": 33.490478515625,
+          "first_text": "\n\n<think><think>\n\n</think>\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word wo"
         },
         "2048": {
-          "ttft_s": 2.1192588806152344,
-          "tpot_ms": 11.939570659727561,
-          "rss_gb": 2.221,
-          "system_used_gb": 32.86,
-          "ntok": 256
+          "ttft_s": 2.2727630138397217,
+          "tpot_ms": 14.327866824593132,
+          "ntok": 256,
+          "rss_gb": 4.552703857421875,
+          "system_used_gb": 34.08622741699219,
+          "first_text": "\n\n<think><think>\n\n</think>\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word wo"
         },
         "4096": {
-          "ttft_s": 4.591060161590576,
-          "tpot_ms": 12.389948987585353,
-          "rss_gb": 2.226,
-          "system_used_gb": 33.702,
-          "ntok": 256
+          "ttft_s": 4.902488708496094,
+          "tpot_ms": 15.010023680258923,
+          "ntok": 256,
+          "rss_gb": 4.55694580078125,
+          "system_used_gb": 35.094512939453125,
+          "first_text": "\n\n<think><think>\n\n</think>\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word wo"
         },
         "8192": {
-          "ttft_s": 9.57982325553894,
-          "tpot_ms": 13.127865753774568,
-          "rss_gb": 2.226,
-          "system_used_gb": 33.579,
-          "ntok": 256
+          "ttft_s": 9.746955871582031,
+          "tpot_ms": 15.645870073573796,
+          "ntok": 256,
+          "rss_gb": 5.3581085205078125,
+          "system_used_gb": 33.87992858886719,
+          "first_text": "\n\n<think><think>\nThinking Process:\n\n1.  **Deconstruct and Analyze the Input:**\n    *   Input: \"Input document 8192: word word word word ... [repeated many times] ... word word word word word word word word word word word"
         },
         "12288": {
-          "ttft_s": 16.640886783599854,
-          "tpot_ms": 14.311259187112643,
-          "rss_gb": 2.228,
-          "system_used_gb": 32.958,
-          "ntok": 256
+          "ttft_s": 15.043637037277222,
+          "tpot_ms": 15.75783106285756,
+          "ntok": 256,
+          "rss_gb": 6.0352325439453125,
+          "system_used_gb": 33.3609619140625,
+          "first_text": "\n\n<think><think>\nThinking Process:\n\n1.  **Deconstruct and Analyze the Input:**\n    *   Input: \"Input document 12288: word word word word ... [repeated many times] ... word word word word word word word word word word wor"
         }
       }
     },
     "mlx_lm": {
       "label": "mlx-lm",
-      "cmd": "/opt/homebrew/opt/python@3.11/bin/python3.11 -m mlx_lm server --model mlx-community/Qwen3.6-35B-A3B-4bit --port 8901 --host 127.0.0.1",
+      "cmd": "/opt/homebrew/opt/python@3.11/bin/python3.11 -m mlx_lm server --model mlx-community/Qwen3.6-35B-A3B-4bit --port 8916 --host 127.0.0.1",
       "rows": {
         "128": {
-          "ttft_s": 0.16230297088623047,
-          "tpot_ms": 12.911725329212933,
-          "rss_gb": 10.771209716796875,
-          "system_used_gb": 32.34281921386719,
+          "ttft_s": 0.29680395126342773,
+          "tpot_ms": 16.342430000761116,
           "ntok": 253,
-          "note": null
+          "rss_gb": 19.025115966796875,
+          "system_used_gb": 30.52880859375,
+          "first_text": "\n\n\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word w"
         },
         "256": {
-          "ttft_s": 0.47643089294433594,
-          "tpot_ms": 11.945024429564457,
-          "rss_gb": 10.774627685546875,
-          "system_used_gb": 31.776992797851562,
+          "ttft_s": 0.7689080238342285,
+          "tpot_ms": 16.16033899831582,
           "ntok": 253,
-          "note": null
+          "rss_gb": 19.027725219726562,
+          "system_used_gb": 30.900314331054688,
+          "first_text": "\n\n\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word w"
         },
         "512": {
-          "ttft_s": 0.7192518711090088,
-          "tpot_ms": 12.014072729771831,
-          "rss_gb": 10.7763671875,
-          "system_used_gb": 31.708999633789062,
+          "ttft_s": 1.0293688774108887,
+          "tpot_ms": 16.157923466655838,
           "ntok": 253,
-          "note": null
+          "rss_gb": 19.027999877929688,
+          "system_used_gb": 31.052993774414062,
+          "first_text": "\n\n\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word w"
         },
         "1024": {
-          "ttft_s": 1.2253210544586182,
-          "tpot_ms": 12.249869654378093,
-          "rss_gb": 10.777313232421875,
-          "system_used_gb": 32.27392578125,
+          "ttft_s": 1.4081499576568604,
+          "tpot_ms": 15.833566863223377,
           "ntok": 253,
-          "note": null
+          "rss_gb": 19.0283203125,
+          "system_used_gb": 31.174301147460938,
+          "first_text": "\n\n\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word w"
         },
         "2048": {
-          "ttft_s": 2.322741985321045,
-          "tpot_ms": 12.733048176860429,
-          "rss_gb": 10.778335571289062,
-          "system_used_gb": 31.320404052734375,
+          "ttft_s": 2.243349075317383,
+          "tpot_ms": 15.514314887058212,
           "ntok": 253,
-          "note": null
+          "rss_gb": 19.031097412109375,
+          "system_used_gb": 30.963607788085938,
+          "first_text": "\n\n\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word w"
         },
         "4096": {
-          "ttft_s": 4.546734094619751,
-          "tpot_ms": 12.948505432007321,
-          "rss_gb": 10.78033447265625,
-          "system_used_gb": 31.552520751953125,
+          "ttft_s": 4.36607813835144,
+          "tpot_ms": 15.12498779600835,
           "ntok": 253,
-          "note": null
+          "rss_gb": 19.0328369140625,
+          "system_used_gb": 32.28877258300781,
+          "first_text": "\n\n\n\nword word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word w"
         },
         "8192": {
-          "ttft_s": 10.864614009857178,
-          "tpot_ms": null,
-          "rss_gb": null,
-          "system_used_gb": 32.65617370605469,
-          "ntok": 1,
-          "note": "same-prompt retry valid for TTFT only; response emitted one non-empty chunk, so TPOT/RSS are omitted"
+          "ttft_s": 9.006756782531738,
+          "tpot_ms": 15.114055739508736,
+          "ntok": 254,
+          "rss_gb": 19.035568237304688,
+          "system_used_gb": 32.659515380859375,
+          "first_text": "The document consists of 8192 words, all of which are the word \"word\" repeated consecutively. There is no additional content, structure, or meaning beyond this repetition. The text does not contain any narrative, argumen"
         },
         "12288": {
-          "ttft_s": 14.503003120422363,
-          "tpot_ms": 15.345551836209035,
-          "rss_gb": 10.78619384765625,
-          "system_used_gb": 33.031982421875,
-          "ntok": 256,
-          "note": null
+          "ttft_s": 14.036365985870361,
+          "tpot_ms": 15.194869324152648,
+          "ntok": 255,
+          "rss_gb": 19.039764404296875,
+          "system_used_gb": 33.29573059082031,
+          "first_text": "The document appears to be a repetitive text file containing the word \"word\" repeated numerous times without any discernible pattern or meaningful content. It lacks any specific structure, narrative, or informational val"
         }
       }
     }
