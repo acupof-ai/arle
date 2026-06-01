@@ -106,30 +106,38 @@ Agent and RL workloads waste compute re-processing the same prompt + history + t
   <img src="docs/assets/metal-vs-mlxlm-essay-avg.png" alt="ARLE Metal vs mlx-lm TTFT, TPOT, and RSS essay sweep" width="100%">
 </p>
 <p align="center">
-  <sub><a href="docs/experience/wins/2026-06-01-readme-metal-vs-mlxlm-ttft-rss.md">Benchmark data</a> · <a href="docs/experience/wins/2026-06-01-metal-low-rss-analysis.md">RSS analysis</a></sub>
+  <sub><a href="docs/experience/wins/2026-06-01-readme-metal-vs-mlxlm-ttft-rss.md">Benchmark data</a> · <a href="docs/experience/wins/2026-06-01-metal-low-rss-analysis.md">RSS accounting note</a></sub>
 </p>
 
 ```mermaid
-flowchart LR
-  S["arle serve / infer<br/>OpenAI HTTP"]
-  A["arle<br/>local agent / REPL"]
-  T["arle train opd<br/>teacher = serving runtime"]
-  R["Shared Rust runtime<br/>OpenAI router + scheduler + model authority"]
-  K["KV / prefix memory plane<br/>radix cache + paged KV + tiered residency"]
-  C["CUDA<br/>TileLang AOT + custom kernels"]
-  M["Metal<br/>MLX bridge + packed varlen decode"]
-  O["OPD loop<br/>rollouts / eval -> student update"]
+flowchart TB
+  subgraph Surface["Entry surfaces"]
+    Serve["arle serve / infer<br/>OpenAI HTTP"]
+    Agent["arle<br/>local agent / REPL"]
+    Train["arle train opd<br/>teacher rollouts + distillation"]
+  end
 
-  S --> R
-  A --> R
-  T --> R
-  R <--> K
-  R --> C
-  R --> M
-  K --> C
-  K --> M
-  R -. teacher samples .-> O
-  O -. updates student .-> T
+  subgraph Runtime["Shared Rust runtime"]
+    Router["OpenAI router<br/>continuous scheduler"]
+    Model["Qwen model authority<br/>weights / tokenizer / decode"]
+    KV["KV memory plane<br/>prefix radix + paged KV + residency tiers"]
+  end
+
+  subgraph Backend["Execution backends"]
+    Metal["Metal<br/>MLX bridge + packed varlen decode"]
+    CUDA["CUDA<br/>TileLang AOT + custom kernels"]
+  end
+
+  Serve --> Router
+  Agent --> Router
+  Train --> Router
+  Router --> Model
+  Model <--> KV
+  Model --> Metal
+  Model --> CUDA
+  KV --> Metal
+  KV --> CUDA
+  Model -. teacher samples .-> Train
 ```
 
 Deep dive: [onboarding](docs/onboarding.md) (30 min) · [architecture](docs/architecture.md) · [codebase-map](docs/codebase-map.md).
