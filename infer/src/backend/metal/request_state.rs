@@ -1750,70 +1750,6 @@ impl<'a> MetalRequestState<'a> {
             .export_drained_prefix_snapshot(token_ids, live_len)?;
         Ok(Some(snapshot))
     }
-
-    pub(crate) fn export_qwen35_disk_prompt_prefixes(
-        &self,
-        block_size: usize,
-    ) -> Result<Vec<Qwen35PrefixSnapshot>> {
-        match &self.inner {
-            MetalRequestStateInner::Qwen35(state) => {
-                let target_lens = qwen35_disk_publish_prefix_lens(
-                    state.prompt_cursor,
-                    state.prompt_tokens.len(),
-                    block_size,
-                );
-                let Some(&aligned_len) = target_lens.last() else {
-                    return Ok(Vec::new());
-                };
-                let mut snapshots = Vec::with_capacity(target_lens.len());
-                state.driver.stream_prefix_snapshots_at_lengths(
-                    &state.prompt_tokens[..aligned_len],
-                    block_size,
-                    &target_lens,
-                    |snapshot| {
-                        snapshots.push(snapshot);
-                        Ok(())
-                    },
-                )?;
-                Ok(snapshots)
-            }
-            MetalRequestStateInner::Qwen3(_) => Ok(Vec::new()),
-        }
-    }
-}
-
-fn qwen35_disk_publish_prefix_lens(
-    prompt_cursor: usize,
-    prompt_len: usize,
-    block_size: usize,
-) -> Vec<usize> {
-    let aligned_len = longest_reusable_aligned_prefix_len(prompt_cursor, prompt_len, block_size);
-    if aligned_len == 0 {
-        return Vec::new();
-    }
-
-    let mut target_lens = Vec::with_capacity(2);
-    if aligned_len >= prompt_len {
-        let importable_len = aligned_len.saturating_sub(block_size);
-        if importable_len > 0 {
-            target_lens.push(importable_len);
-        }
-    }
-    if target_lens.last().copied() != Some(aligned_len) {
-        target_lens.push(aligned_len);
-    }
-    target_lens
-}
-
-fn longest_reusable_aligned_prefix_len(
-    prompt_cursor: usize,
-    prompt_len: usize,
-    block_size: usize,
-) -> usize {
-    if block_size == 0 {
-        return 0;
-    }
-    (prompt_cursor.min(prompt_len) / block_size) * block_size
 }
 
 fn decode_qwen3_batch(
@@ -4688,20 +4624,6 @@ impl<'a> Qwen35StepDriver<'a> {
         }
     }
 
-    fn drain_replay_after_result<T>(&mut self, result: Result<T>, label: &str) -> Result<T> {
-        match result {
-            Ok(value) => Ok(value),
-            Err(err) => {
-                if let Err(drain_err) = self.ensure_cpp_session_drained() {
-                    return Err(err).context(format!(
-                        "{label}; additionally failed to drain replay C++ session: {drain_err:#}"
-                    ));
-                }
-                Err(err)
-            }
-        }
-    }
-
     fn cpp_session_active(&self) -> bool {
         matches!(&self.mode, Qwen35StepMode::Cpp(state) if state.session_active)
     }
@@ -4920,27 +4842,6 @@ impl<'a> Qwen35StepDriver<'a> {
         }
     }
 
-    fn export_current_cpp_snapshot(&mut self, token_ids: Vec<u32>) -> Result<Qwen35PrefixSnapshot> {
-        let cache_len = self.cache_len;
-        ensure!(
-            cache_len > 0,
-            "Qwen3.5 prefix export requires a non-empty cache"
-        );
-        self.ensure_cpp_session_drained()?;
-        match &self.mode {
-            Qwen35StepMode::Cpp(state) => Ok(Qwen35PrefixSnapshot {
-                token_ids,
-                kv_flat: state.kv_flat.clone(),
-                gdr_flat: state.gdr_flat.clone(),
-                cache_len,
-                kv_capacity: self.kv_capacity,
-            }),
-            Qwen35StepMode::Rust(_) => {
-                bail!("Qwen3.5 live prefix export currently requires the compiled C++ step path")
-            }
-        }
-    }
-
     /// Snapshot the live C++ session in place at the requested cache length
     /// without spinning up a second `Qwen35StepDriver`. The caller must have
     /// established that `target_cache_len == self.cache_len` — Qwen3.5's GDR
@@ -4982,85 +4883,6 @@ impl<'a> Qwen35StepDriver<'a> {
                 bail!("Qwen3.5 live prefix snapshot requires the compiled C++ step path")
             }
         }
-    }
-
-    fn stream_prefix_snapshots_at_lengths(
-        &self,
-        prompt_tokens: &[u32],
-        block_size: usize,
-        target_lens: &[usize],
-        mut visit: impl FnMut(Qwen35PrefixSnapshot) -> Result<()>,
-    ) -> Result<()> {
-        ensure!(
-            block_size > 0,
-            "Qwen3.5/Qwen3.6 prefix snapshot block size must be > 0"
-        );
-        ensure!(
-            prompt_tokens.len().is_multiple_of(block_size),
-            "Qwen3.5/Qwen3.6 prefix snapshot build requires a block-aligned prompt"
-        );
-        if !matches!(self.mode, Qwen35StepMode::Cpp(_)) || prompt_tokens.is_empty() {
-            return Ok(());
-        }
-        let mut target_lens = target_lens.to_vec();
-        target_lens.sort_unstable();
-        target_lens.dedup();
-        if target_lens.is_empty() {
-            return Ok(());
-        }
-        for &target_len in &target_lens {
-            ensure!(
-                target_len > 0
-                    && target_len <= prompt_tokens.len()
-                    && target_len.is_multiple_of(block_size),
-                "Qwen3.5/Qwen3.6 selected prefix snapshot target {target_len} must be block-aligned and within {} tokens",
-                prompt_tokens.len()
-            );
-        }
-
-        // The compiled Qwen3.5/Qwen3.6 model owns exactly one live session.
-        // A replay driver built on the same `CppQwen35Model` would attempt a
-        // nested `session_begin`, which is both invalid and, before the C++
-        // fix in this wave, could tear down the active session on error.
-        // Prefix publish is opportunistic, so skip replay-based export while
-        // the live request still owns the compiled session.
-        if self.cpp_session_active() {
-            return Ok(());
-        }
-
-        let mut replay = Qwen35StepDriver::new(
-            self.weights,
-            self.config,
-            &self.params,
-            false, // replay path doesn't need pool — it just rebuilds prefix state
-            prompt_tokens,
-            1,
-            None,
-        )
-        .context("build replay driver for Qwen3.5/Qwen3.6 prefix snapshots")?;
-        let result = (|| -> Result<()> {
-            let mut next_target = 0;
-            for chunk in prompt_tokens.chunks(block_size) {
-                replay
-                    .prefill_tokens(chunk, false)
-                    .context("replay Qwen3.5/Qwen3.6 prompt chunk for prefix snapshot")?;
-                let materialized = replay.cache_len as usize;
-                if next_target < target_lens.len() && target_lens[next_target] == materialized {
-                    let snapshot = replay
-                        .export_current_cpp_snapshot(prompt_tokens[..materialized].to_vec())
-                        .context("export replayed Qwen3.5/Qwen3.6 prefix snapshot")?;
-                    visit(snapshot)?;
-                    next_target += 1;
-                }
-            }
-            ensure!(
-                next_target == target_lens.len(),
-                "Qwen3.5/Qwen3.6 prefix snapshot replay produced {next_target} of {} requested targets",
-                target_lens.len()
-            );
-            Ok(())
-        })();
-        replay.drain_replay_after_result(result, "Qwen3.5/Qwen3.6 prefix snapshot replay")
     }
 }
 
