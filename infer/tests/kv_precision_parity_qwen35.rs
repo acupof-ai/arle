@@ -23,6 +23,7 @@
 //! kv_precision_parity_qwen35 -- --nocapture --test-threads=1`. Knobs
 //! (same as the dense variant): `KV_PARITY_PROMPTS`,
 //! `KV_PARITY_MAX_TOKENS`, `KV_PARITY_MAX_SEQ_LEN`,
+//! `KV_PARITY_PROFILE=smoke` for the explicit 4-token smoke,
 //! `INFER_TEST_MODEL_PATH` (must point at a Qwen3.5 dir),
 //! `INFER_TEST_CUDA_GRAPH=0`. Skipped if the model dir is missing.
 
@@ -30,9 +31,12 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use log::info;
 use tokio::sync::mpsc;
+
+#[path = "support/kv_parity_config.rs"]
+mod kv_parity_config;
 
 use infer::metrics::ServerMetrics;
 use infer::model::qwen35::{Qwen35Model, Qwen35RuntimeConfig};
@@ -161,14 +165,8 @@ fn get_model_path() -> String {
     std::env::var("INFER_TEST_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_HINT.to_string())
 }
 
-fn max_tokens() -> usize {
-    // Default tuned for the snappy iteration grid (4 prompts × 4 tokens).
-    // Override with KV_PARITY_MAX_TOKENS=16 for the stress grid, 256+ for
-    // long-horizon trajectory tracking.
-    std::env::var("KV_PARITY_MAX_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4)
+fn max_tokens() -> Result<usize> {
+    kv_parity_config::max_tokens_from_env()
 }
 
 fn num_prompts() -> usize {
@@ -474,7 +472,7 @@ fn kv_precision_parity_audit_qwen35() -> Result<()> {
         return Ok(());
     }
 
-    let tokens = max_tokens();
+    let tokens = max_tokens()?;
     let prompts: Vec<&str> = DEFAULT_PROMPTS
         .iter()
         .take(num_prompts())
