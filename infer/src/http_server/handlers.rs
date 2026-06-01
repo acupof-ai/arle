@@ -45,6 +45,11 @@ use super::types::{
 };
 use crate::error::ApiError;
 use crate::metrics::ServerMetrics;
+#[cfg(feature = "cuda")]
+use crate::model::deepseek::trace::{
+    Dsv4OperatorTraceEntry, Dsv4OperatorTraceSnapshot, dsv4_operator_trace_snapshot,
+    dsv4_operator_trace_summary_since,
+};
 use crate::server_engine::{
     CompletionStreamDelta, CompletionStreamError, FinishReason, TokenUsage,
 };
@@ -162,6 +167,8 @@ struct RequestTraceState {
     metrics: ServerMetrics,
     #[cfg(feature = "cuda")]
     cuda_alloc_trace_start: Option<cuda_kernels::tensor::CudaAllocTraceSnapshot>,
+    #[cfg(feature = "cuda")]
+    dsv4_operator_trace_start: Option<Dsv4OperatorTraceSnapshot>,
     finished: bool,
 }
 
@@ -189,6 +196,8 @@ impl RequestTraceState {
             metrics,
             #[cfg(feature = "cuda")]
             cuda_alloc_trace_start: cuda_kernels::tensor::cuda_alloc_trace_snapshot(),
+            #[cfg(feature = "cuda")]
+            dsv4_operator_trace_start: dsv4_operator_trace_snapshot(),
             finished: false,
         }
     }
@@ -355,6 +364,40 @@ impl RequestTraceState {
                 "scope": "process_global_delta_since_request_trace_start",
                 "valid_for": "single_inflight_profiling_only",
                 "entries": entries,
+            });
+        }
+
+        #[cfg(feature = "cuda")]
+        if let Some(delta) = self
+            .dsv4_operator_trace_start
+            .as_ref()
+            .and_then(dsv4_operator_trace_summary_since)
+        {
+            let to_json = |entry: Dsv4OperatorTraceEntry| {
+                serde_json::json!({
+                    "phase": entry.phase,
+                    "layer": entry.layer_idx,
+                    "calls": entry.calls,
+                    "tokens": entry.tokens,
+                    "total_us": entry.total_us,
+                    "avg_us": entry.avg_us,
+                    "min_us_process_global": entry.min_us_process_global,
+                    "max_us_process_global": entry.max_us_process_global,
+                })
+            };
+            payload["dsv4_operator_trace_process_delta"] = serde_json::json!({
+                "scope": "process_global_delta_since_request_trace_start",
+                "valid_for": "single_inflight_profiling_only",
+                "operators": delta
+                    .operators
+                    .into_iter()
+                    .map(to_json)
+                    .collect::<Vec<_>>(),
+                "layers": delta
+                    .layers
+                    .into_iter()
+                    .map(to_json)
+                    .collect::<Vec<_>>(),
             });
         }
 
