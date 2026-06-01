@@ -5695,9 +5695,7 @@ impl DeepseekV4MoeBlock {
 
 #[cfg(feature = "cuda")]
 fn dsv4_moe_trace_enabled() -> bool {
-    std::env::var("ARLE_DSV4_TRACE_LAYER")
-        .ok()
-        .is_some_and(|raw| !matches!(raw.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+    super::trace::dsv4_operator_trace_enabled()
 }
 
 #[cfg(feature = "cuda")]
@@ -5734,11 +5732,16 @@ fn dsv4_moe_trace_end(
     ctx.stream
         .synchronize()
         .map_err(|err| anyhow::anyhow!("DeepSeek V4 MoE trace post-sync failed: {err}"))?;
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    info!(
-        "dsv4_trace layer={} phase={} tokens={} elapsed_ms={:.3}",
-        layer_idx, phase, tokens, elapsed_ms
-    );
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
+    let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+    super::trace::record_dsv4_operator_trace(phase, layer_idx, tokens, elapsed_us);
+    if super::trace::dsv4_trace_event_log_enabled() {
+        info!(
+            "dsv4_trace layer={} phase={} tokens={} elapsed_ms={:.3}",
+            layer_idx, phase, tokens, elapsed_ms
+        );
+    }
     Ok(())
 }
 

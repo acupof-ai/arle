@@ -142,10 +142,15 @@ def load_request_traces(path):
 
 request_traces = load_request_traces(server_log)
 alloc_trace = None
+operator_trace = None
 for trace in reversed(request_traces):
     candidate = trace.get("cuda_alloc_trace_process_delta")
     if candidate:
         alloc_trace = candidate
+    candidate = trace.get("dsv4_operator_trace_process_delta")
+    if candidate:
+        operator_trace = candidate
+    if alloc_trace is not None and operator_trace is not None:
         break
 
 (out / "request-traces.json").write_text(
@@ -187,6 +192,54 @@ with (out / "cuda-alloc-trace-process-delta.csv").open(
                     entry.get("bytes"),
                 ]
             )
+
+operator_trace_payload = (
+    operator_trace
+    if operator_trace is not None
+    else {
+        "found": False,
+        "reason": "no dsv4_operator_trace_process_delta field in request_trace",
+    }
+)
+(out / "dsv4-operator-trace-process-delta.json").write_text(
+    json.dumps(operator_trace_payload, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+with (out / "dsv4-operator-trace-process-delta.csv").open(
+    "w", newline="", encoding="utf-8"
+) as f:
+    writer = csv.writer(f, lineterminator="\n")
+    writer.writerow(
+        [
+            "kind",
+            "rank",
+            "phase",
+            "layer",
+            "calls",
+            "tokens",
+            "total_us",
+            "avg_us",
+            "min_us_process_global",
+            "max_us_process_global",
+        ]
+    )
+    if operator_trace is not None:
+        for kind in ("operators", "layers"):
+            for rank, entry in enumerate(operator_trace.get(kind, []), start=1):
+                writer.writerow(
+                    [
+                        kind,
+                        rank,
+                        entry.get("phase"),
+                        entry.get("layer"),
+                        entry.get("calls"),
+                        entry.get("tokens"),
+                        entry.get("total_us"),
+                        entry.get("avg_us"),
+                        entry.get("min_us_process_global"),
+                        entry.get("max_us_process_global"),
+                    ]
+                )
 
 conn = sqlite3.connect(out / "trace.sqlite")
 cur = conn.cursor()
@@ -298,6 +351,8 @@ summary = {
     "request_trace_count": len(request_traces),
     "cuda_alloc_trace_found": alloc_trace is not None,
     "cuda_alloc_trace_process_delta": alloc_trace,
+    "dsv4_operator_trace_found": operator_trace is not None,
+    "dsv4_operator_trace_process_delta": operator_trace,
     "decode_ranges": len(ranges),
     "decode_waves": (len(ranges) // 8) if len(ranges) % 8 == 0 else None,
     "decode_wave_wall_ms": wave_wall_ms,
@@ -375,10 +430,11 @@ NSYS_CMD=(
 )
 
 {
-    printf 'CUDA_VISIBLE_DEVICES=%q INFER_CUDA_DEVICES=%q ARLE_DSV4_MOE_BACKEND=%q ARLE_DSV4_EXPERT_BACKEND=%q ARLE_DSV4_INCREMENTAL_KV=%q ARLE_DSV4_FUSED_DISPATCH_PAYLOAD=%q ARLE_CUDA_ALLOC_TRACE=%q ' \
+    printf 'CUDA_VISIBLE_DEVICES=%q INFER_CUDA_DEVICES=%q ARLE_DSV4_MOE_BACKEND=%q ARLE_DSV4_EXPERT_BACKEND=%q ARLE_DSV4_INCREMENTAL_KV=%q ARLE_DSV4_FUSED_DISPATCH_PAYLOAD=%q ARLE_CUDA_ALLOC_TRACE=%q ARLE_DSV4_OPERATOR_TRACE=%q ARLE_DSV4_TRACE_LAYER=%q ARLE_DSV4_OPERATOR_TRACE_EVENTS=%q ' \
         "$CUDA_VISIBLE_DEVICES" "$INFER_CUDA_DEVICES" "$ARLE_DSV4_MOE_BACKEND" "$ARLE_DSV4_EXPERT_BACKEND" \
         "$ARLE_DSV4_INCREMENTAL_KV" "$ARLE_DSV4_FUSED_DISPATCH_PAYLOAD" \
-        "${ARLE_CUDA_ALLOC_TRACE:-}"
+        "${ARLE_CUDA_ALLOC_TRACE:-}" "${ARLE_DSV4_OPERATOR_TRACE:-}" \
+        "${ARLE_DSV4_TRACE_LAYER:-}" "${ARLE_DSV4_OPERATOR_TRACE_EVENTS:-}"
     printf 'nsys'
     for arg in "${NSYS_CMD[@]:1}"; do printf ' %q' "$arg"; done
     printf '\n'
