@@ -1,5 +1,12 @@
 //! Distributed coordination primitives for multi-GPU / multi-host execution.
 //!
+//! **SCAFFOLD — 非 production multi-GPU serving。**
+//! F0/F1 基础已落地：TCP rendezvous、NCCL smoke、parallel-state 组元数据；
+//! 但 production collectives **尚未接入 model forward**。
+//! 主线默认行为仍是单 rank / 单 scheduler。
+//! 状态真相：[`docs/support-matrix.md`](../../docs/support-matrix.md)（multi-GPU 见
+//! [`docs/architecture.md`](../../docs/architecture.md) §Multi-GPU）。
+//!
 //! F0/F1 foundation: TCP rendezvous (`init_method`), NCCL smoke (`nccl`),
 //! pure parallel-state group layout, and group coordinator metadata — see
 //! [`docs/plans/2026-04-28-single-node-multi-gpu.md`](../../docs/plans/2026-04-28-single-node-multi-gpu.md).

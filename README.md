@@ -16,6 +16,7 @@
   <a href="#quick-start">Quick Start</a> ·
   <a href="docs/http-api.md">HTTP API</a> ·
   <a href="docs/support-matrix.md">Support Matrix</a> ·
+  <a href="docs/onboarding.md">Onboarding</a> ·
   <a href="docs/architecture.md">Architecture</a> ·
   <a href="ROADMAP.md">Roadmap</a> ·
   <a href="CHANGELOG.md">Changelog</a>
@@ -111,7 +112,7 @@ flowchart LR
   R --> Metal["Metal<br/>(Apple Silicon)"]
 ```
 
-Deep dive: [architecture](docs/architecture.md) · [codebase-map](docs/codebase-map.md).
+Deep dive: [onboarding](docs/onboarding.md) (30 min) · [architecture](docs/architecture.md) · [codebase-map](docs/codebase-map.md).
 
 ---
 
