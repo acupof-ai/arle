@@ -5089,6 +5089,48 @@ impl DeepseekV4MoeBlock {
             num_channels,
             ep.experts_per_rank,
         )?;
+        if hidden.seq_len > 1 {
+            // Prefill reuses one NativeDeepEP scratch across layers to avoid
+            // retaining worst-case MoE buffers per layer. Clear metadata tails
+            // that DeepEP combine may read past the valid recv range.
+            dsv4_zero_i32_slice(ctx, &mut scratch.recv_src_idx, scratch.capacity_recv)?;
+            dsv4_zero_i32_slice(
+                ctx,
+                &mut scratch.send_head,
+                scratch.capacity_tokens.saturating_mul(scratch.ep_world),
+            )?;
+            dsv4_zero_i32_slice(
+                ctx,
+                &mut scratch.rank_prefix,
+                scratch.ep_world.saturating_mul(scratch.ep_world),
+            )?;
+            dsv4_zero_i32_slice(
+                ctx,
+                &mut scratch.recv_channel_prefix,
+                scratch.ep_world.saturating_mul(scratch.num_channels),
+            )?;
+            dsv4_zero_i32_slice(
+                ctx,
+                &mut scratch.channel_prefix_matrix,
+                scratch.ep_world.saturating_mul(scratch.num_channels),
+            )?;
+            let route_capacity = scratch.capacity_recv.saturating_mul(scratch.topk);
+            ctx.stream
+                .memset_zeros(&mut scratch.recv_topk_idx.slice_mut(0..route_capacity))
+                .map_err(|err| anyhow::anyhow!("native-deepep recv_topk_idx zero failed: {err}"))?;
+            ctx.stream
+                .memset_zeros(&mut scratch.recv_topk_w.slice_mut(0..route_capacity))
+                .map_err(|err| anyhow::anyhow!("native-deepep recv_topk_w zero failed: {err}"))?;
+            ctx.stream
+                .memset_zeros(
+                    &mut scratch
+                        .combined_topk_w
+                        .slice_mut(0..scratch.capacity_tokens.saturating_mul(scratch.topk)),
+                )
+                .map_err(|err| {
+                    anyhow::anyhow!("native-deepep combined_topk_w zero failed: {err}")
+                })?;
+        }
         {
             let (idx_ptr, _g) = route_indices.device_ptr(&ctx.stream);
             let (dst_ptr, _g2) = scratch.topk_idx_i64.device_ptr_mut(&ctx.stream);
