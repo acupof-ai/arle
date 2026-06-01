@@ -198,3 +198,20 @@ SGLang and ARLE must bench SEQUENTIALLY, not concurrently.**
   `wins/2026-05-29-dsv4-longctx-rope-fix-validated.md`. The campaign can now
   resume throughput work on a CORRECT foundation — prior I1/I2/I3 throughput
   numbers were measured on a long-context-broken model and must be re-taken.
+
+- **I4 (2026-06-01) — ROOFLINE QUEUE RESET AFTER DEFAULT ALLREDUCE FIX**:
+  Native DeepEP was killed as a default for the current replicated-token TP/EP
+  path; DSv4 default is now local routed experts + EP all-reduce, with
+  DeepGEMM-auto expert math when available. Re-measured p2048/o8 with
+  same-server warm pairs because the cold-request number was confounded:
+  request 1 TTFT `5183 ms`, request 2 TTFT `4380 ms`, but TPOT stayed
+  `~112 ms/token` in both. So cold warmup pollutes TTFT, not steady decode.
+  Trace-on attribution (1.25x overhead vs no-trace) ranks the real warm decode
+  blockers: `attn_csa_select_kernel` about `40 ms/token` estimated no-trace,
+  attention total about `73 ms/token`, FFN total about `31 ms/token`. Prefill
+  p2048 also shows block-scaled batch-GEMV gaps in `ffn_shared`, `attn_proj`,
+  and `attn_output_proj`. The corrected optimization queue is documented in
+  [`../plans/2026-06-01-dsv4-roofline-systematic-optimization.md`](../plans/2026-06-01-dsv4-roofline-systematic-optimization.md).
+  Next axis: P0.1 decode CSA select, then P0.2 block-scaled batch GEMV to
+  tensor-core GEMM. Do not use the earlier cold p2048/o32 `113 ms` as a direct
+  SGLang gap proof unless workload and measurement path are matched.
