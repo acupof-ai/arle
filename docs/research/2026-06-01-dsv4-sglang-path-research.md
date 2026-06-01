@@ -38,6 +38,10 @@ changed and re-verified.
 ## Current Evidence
 
 - Runtime SGLang source inspected: `/workspace/sglang`.
+- Runtime SGLang commit inspected read-only on 2026-06-01:
+  `0d51db344d3f` (`feat: add SGLANG_APPLY_CONFIG_BACKUP=auto and default to
+  it (#38)`). The checkout is dirty, so any future numeric baseline must record
+  the exact diff state, not only the commit.
 - Stale non-runtime SGLang source inspected: `/sgl-workspace/sglang`.
 - Remote DSv4 model inspected: `/data01/models/DeepSeek-V4-Flash`.
 - The model config says `architectures=["DeepseekV4ForCausalLM"]` and
@@ -52,10 +56,74 @@ changed and re-verified.
 - The DSv4 model directory includes a standalone reference implementation under
   `inference/`, with V4-specific attention compression/indexing and a simple
   MoE path.
+- Current already-running SGLang process on the pod is explicitly not used as a
+  best-practice baseline for this note. Its command uses TP8, disables CUDA
+  graph, forces `--moe-runner-backend marlin`, and enables HICache/EIC:
+
+```text
+python3 -m sglang.launch_server --model-path /data01/models/DeepSeek-V4-Flash \
+  --host 0.0.0.0 --port 30000 --tp-size 8 --trust-remote-code \
+  --mem-fraction-static 0.8 --disable-cuda-graph --watchdog-timeout 1800 \
+  --moe-runner-backend marlin --enable-hierarchical-cache --enable-eic-cache \
+  --hicache-io-backend kernel
+```
 
 This means the DSv4 SGLang implementation has been identified at source level.
 The remaining gap is not "find the implementation"; it is "lock the exact
 launch contract and run a fresh warm control profile from that implementation."
+
+This update intentionally does not run that profile. It is pure source/artifact
+research. All SGLang-vs-ARLE per-stage claims below are therefore structural
+unless explicitly backed by an existing ARLE artifact.
+
+## Existing ARLE Artifacts Used
+
+No new benchmark, trace, or profiler run was executed for this section. The
+following existing artifacts are the only numeric evidence used:
+
+| Artifact | What it can support | What it cannot support |
+|---|---|---|
+| `docs/trace-artifacts/2026-05-27-allreduce-nsys/summary.json` | ARLE replicated-token all-reduce path has decode wave p50 about 94.8 ms under the captured window; top kernels include NCCL all-reduce, FP8 GEMV, hybrid attention, route, CSA select, and frequent CUDA API alloc/free/launch overhead | It is not a matched SGLang baseline and predates later path fixes |
+| `docs/trace-artifacts/2026-05-27-allreduce-nsys/decode-only-kernel-top.csv` | Per-kernel ordering for the old ARLE all-reduce path | It cannot be added to newer request-trace numbers as if it were same-binary evidence |
+| `docs/experience/wins/2026-06-01-dsv4-operator-request-trace.md` | Existing ARLE request-level operator trace: `ffn_total` and `attn_total` both accumulate about 13 s of trace-on phase time in a 32-token smoke; top phases include `ffn_routed_local`, `attn_swa_all_reduce`, `ffn_all_reduce`, `attn_hybrid_kernel`, and `ffn_expert_loop` | Trace synchronizes CUDA around phases and is diagnostic only |
+| `docs/experience/wins/2026-06-01-dsv4-csa-select-topk-cover-fastpath.md` | Same-binary warm p2047/o8 and p2047/o32 behavior after CSA top-k-cover fast path: 91.1 ms and 117.1 ms TPOT after first token | Not a SGLang-comparable or SLO-shape result |
+| `docs/experience/errors/2026-06-01-dsv4-native-deepep-replicated-token-kill.md` | Native DeepEP on current ARLE replicated-token route over-transports token rows; observed fanout 4.46 matches the top-6-over-8 rank fanout model | Does not quantify the future token-owned DeepEP path |
+
+Remote artifact paths named by older docs under `/sgl-workspace/bench-artifacts`
+were not re-used here as live files. On the current pod, that directory was not
+present during the read-only directory check. Treat those paths as historical
+doc references unless the files are copied into the repo or re-verified later.
+
+## Metric Lanes Are Not Interchangeable
+
+There are two different SGLang metrics that must not be collapsed:
+
+| Lane | Meaning | Status |
+|---|---|---|
+| no-spec raw target-step TPOT | wall time per target model decode forward | Pending validation |
+| spec-on output-token TPOT | wall time per accepted output token with EAGLE/MTP | Pending validation |
+
+The user supplied two SGLang reference fragments during the investigation:
+approximately `18 ms/token`, and a speculative setup with acceptance about
+`2.94` and about `258 output tok/s`. These fragments are not enough to know
+whether the 18 ms number is raw target-step TPOT or effective output-token TPOT.
+
+If the number is output-token TPOT under acceptance `A`, then:
+
+```text
+raw target-step TPOT ~= output-token TPOT * A
+```
+
+If the number is raw target-step TPOT, then:
+
+```text
+output-token TPOT ~= raw target-step TPOT / A
+```
+
+So the same wall-clock run can look very different depending on accounting.
+Until a matched SGLang baseline records both raw target steps and accepted output
+tokens, every SGLang per-stage number in this report is marked as
+`待验证`.
 
 ## DSv4 Model Shape
 
@@ -148,6 +216,87 @@ MoE is also DSv4-specific:
   `deep_gemm.fp8_mega_moe`;
 - `moe_runner/deep_gemm.py` uses grouped masked DeepGEMM and the DSv4 JIT
   `silu_and_mul_masked_post_quant` activation+quant path.
+
+Important SGLang defaults from `/workspace/sglang@0d51db3`:
+
+| Component | Source | Default / behavior |
+|---|---|---|
+| DSv4 hook | `python/sglang/srt/arg_groups/deepseek_v4_hook.py` | forces `attention_backend="dsv4"`, `page_size=256`, FP8 KV on `auto`, EAGLE-only spec if spec is enabled, `swa_full_tokens_ratio=0.1` |
+| DSv4 env defaults | `python/sglang/srt/environ.py` | fused hash top-k, JIT EP activation, fused WQA/WKV, fused SwiGLU clamp, fused store cache, multi-stream overlap, and `SGLANG_PREP_IN_CUDA_GRAPH=True` are all default-on |
+| H200 FP8 cookbook | `test/manual/dsv4/test_h200_fp8_flash.py` | low-latency TP4+EAGLE; balanced/max-throughput TP4/DP4 + DP attention + DeepEP + CUDA graph max BS 128; CP lane uses DeepEP plus context-parallel prefill |
+| Parallel groups | `python/sglang/srt/distributed/parallel_state.py` | builds separate TP, attention-TP/DP/CP, MoE-EP/DP/TP groups inside the TP axis |
+| DeepEP config | `python/sglang/srt/layers/moe/token_dispatcher/deepep.py` | `--deepep-config` feeds normal dispatch/combine `num_sms`; auto mode reserves resources for both normal and low-latency paths |
+| DeepGEMM warmup | `python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py` | JIT DeepGEMM precompile is default-on; without cached precompile it can spend 10-20 minutes warming kernels, which must be outside measured windows |
+
+## Stage Mapping: SGLang vs Current ARLE
+
+This is the core structural answer. "Same" means the contracts are meaningfully
+isomorphic. "Different" means both systems have an implementation for the stage
+but the data layout or runtime contract differs. "Missing" means ARLE has no
+equivalent SGLang fast-path mechanism in the current executable route.
+
+| Stage | SGLang `/workspace/sglang@0d51db3` | Current ARLE route | Classification | Structural consequence |
+|---|---|---|---|---|
+| Process model | one process per rank under SGLang distributed runtime | ARLE has multiproc scaffolding, but request relay still broadcasts the same logical request to all ranks | Different | Native DeepEP can boot, but token ownership is still replicated |
+| Rank layout | TP axis is subdivided into attention DP/CP/TP and MoE EP/DP/TP groups | `MultiAxisConfig` parses SGLang-style axes, but `validate_current_axis_support` rejects anything beyond global TP/EP | Missing in hot path | ARLE cannot express SGLang TP4/DP4+DP-attention+EP semantics yet |
+| Request ownership | DP/attention and MoE groups own distinct row shards where configured | `DistributedSchedulerGroup` submits cloned full requests to every rank | Different | Every rank routes the same rows, so EP transport sees duplicate sources |
+| DSv4 defaults | hook fail-forces `dsv4`, page 256, FP8 KV | ARLE defaults are its own replicated-token DSv4 path; SGLang-path claim fails closed | Different | A short smoke can be correct while still not SGLang-comparable |
+| Attention prep | fused WQA/WKV, fused Q norm/RoPE, fused KV norm/RoPE direct to FlashMLA paged cache | ARLE has fused prep pieces but still runs current route through explicit per-row cache/indexer work | Different | Metadata and cache traffic stay visible as independent phases |
+| Attention metadata | raw decode/verify metadata can be upgraded inside CUDA graph; C4/C128/SWA page indices feed FlashMLA | ARLE has `attn_csa_project`, `attn_csa_select_kernel`, and separate FlashMLA/CSA prep work | Different | Selector work remains per-layer/per-row enough to dominate some shapes |
+| Attention core | one `flash_mla.flash_mla_with_kvcache` call consumes SWA plus optional C4/C128 extra KV with FP8 cache and top-k lengths | `forward_decode_batch` batches FFN but explicitly loops attention per row; `attn_hybrid_kernel` is separate | Different | Attention cost scales like many small launches and per-row work, not a batched SGLang FlashMLA replay |
+| MoE top-k | SGLang can use fused/hash/JIT top-k and DeepEP-aware remap | ARLE route/count uses local kernels plus host-visible metadata in several paths | Different | Routing overhead is not just top-k math; it is orchestration and movement |
+| EP dispatch | DeepEP dispatch receives token-owned rows for the configured EP group | native DeepEP on ARLE receives replicated full token rows unless unsafe trace flag is set | Different and currently blocked | Observed 4.46x fanout is expected, not a mysterious DeepEP slowness |
+| Expert GEMM | grouped masked DeepGEMM or MegaMoE-class fused path, plus JIT activation+quant | ARLE has DeepGEMM-auto for local experts, but still under replicated-token transport and separate scratch/materialization | Different | Even a fast expert GEMM is surrounded by the wrong transport/data contract |
+| SwiGLU + quant | `silu_and_mul_masked_post_quant` fuses activation, clamp, and FP8 quant for DeepGEMM | ARLE has `dsv4_deepgemm_swiglu_quantize_w13_cuda` and scratch-zero work; newest skip-zero change is pending remote perf validation | Different | User-supplied SGLang/vLLM trace points here as a large gap, but ARLE exact delta is pending |
+| Combine | DeepEP combine returns token-owned rows; MegaMoE avoids the same post-FFN all-reduce shape | default ARLE local experts call `post_moe_expert_all_reduce_hidden_states` | Different | `ffn_all_reduce` is a fallback reconciliation tax, not a target SGLang stage |
+| CUDA graph | DSv4 metadata path explicitly supports `SGLANG_PREP_IN_CUDA_GRAPH=True` and graph replay buckets | ARLE has graph support generally, but current DSv4 route still exposes many small kernels, alloc/free, D2H/H2D events in artifacts | Different | Launch and allocation overhead remains first-order in the current ARLE trace |
+| Spec decode | H200 low-latency and balanced lanes use EAGLE/MTP in documented configs | ARLE DSv4 path has no equivalent accepted-token accounting in the current comparison | Missing | Spec-on output-token TPOT can explain a large apparent gap without any kernel difference |
+
+## Gap Waterfall, Without New Runs
+
+A numeric waterfall from SGLang TPOT to ARLE TPOT is not SOLID yet because the
+matched SGLang no-spec/spec traces do not exist in the repo. The waterfall below
+is therefore a structural waterfall. Each row says whether the gap is already
+licensed by existing evidence or remains `待验证`.
+
+| Waterfall item | Evidence status | Why it matters | Required later trace, not run now |
+|---|---|---|---|
+| Speculative decoding accounting | `待验证`; only user-supplied accept/tok/s fragments exist | If SGLang TPOT is output-token TPOT under EAGLE/MTP and ARLE is raw target-step, the apparent gap includes an acceptance-rate multiplier | Same SGLang workload with spec off and spec on; record target steps, accepted tokens, acceptance rate, output-token TPOT |
+| Topology and token ownership | Structurally confirmed by ARLE code and DeepEP fanout artifact | ARLE current route clones the full request to every rank, then sums full hidden states; SGLang intended lanes use TP/DP/EP subgroup ownership | Per-rank request/token counters and DeepEP `num_recv` on a token-owned ARLE candidate |
+| MoE orchestration | Confirmed as current-route cost by ARLE request trace; SGLang exact delta `待验证` | ARLE visible `ffn_routed_local` + `ffn_all_reduce` is not the SGLang DeepEP/MegaMoE contract | SGLang PyTorch profile of the same no-spec target-step workload, plus ARLE request trace on same workload |
+| Expert compute and activation quant | SGLang source confirms DeepGEMM/JIT fused activation path; ARLE delta `待验证` | User-supplied vLLM/SGLang trace says fused SwiGLU+quant and expert GEMM dominate; ARLE still has scratch/materialization around local/DeepGEMM path | Operator trace with `dsv4_deepgemm_*`, scratch memset, and activation quant phases split out |
+| Attention metadata and selector | Confirmed current-route cost by ARLE trace and CSA fast-path artifact; SGLang exact delta `待验证` | SGLang feeds sparse/recent page indices into FlashMLA, while ARLE still has explicit CSA selection and per-row attention | Matched SGLang profile showing DSv4 metadata inside/outside graph and FlashMLA kernel timing |
+| CUDA graph coverage | SGLang source default confirmed; current running SGLang server disables graph and is incomparable | Graph coverage changes launch count and metadata location; disabling graph for visibility changes the path | Two SGLang traces, graph-on for wall clock and graph-profile/expanded trace for attribution, both labeled |
+| Warmup | SGLang source confirmed DeepGEMM precompile can dominate cold startup | A trace including JIT warmup is not steady-state | Log grep for DeepGEMM warmup outside measured window and cache/precompile artifact |
+
+## Why The Current ARLE Stages Look Unreasonable
+
+Assuming the current ARLE stage table is true, the stages are unreasonable
+because they belong to the fallback route, not because each kernel is merely
+poorly tuned.
+
+| ARLE stage | Existing evidence | Structural diagnosis |
+|---|---|---|
+| `ffn_routed_local` | Request trace lists it as a top FFN phase; code calls `forward_local_routed_gpu` on the default route | This is replicated-token local expert work. It should disappear from the SGLang-candidate path as a top-level reconciliation pattern, replaced by token-owned DeepEP/MegaMoE work |
+| `ffn_all_reduce` | Request trace and nsys both expose it; code calls `post_moe_expert_all_reduce_hidden_states` immediately after local routed experts | This is the cost of the fallback data contract. Optimizing this collective cannot make the route SGLang-equivalent because SGLang's intended combine is part of token-owned EP/MoE |
+| `attn_hybrid_kernel` | nsys top kernels and request trace show it as a visible stage; code launches ARLE hybrid attention after separate metadata/selector work | SGLang's DSv4 core call consumes SWA plus C4/C128 extra KV in one FlashMLA API. ARLE's separate hybrid stage is not isomorphic |
+| `attn_csa_select_kernel` | CSA fast-path artifact shows p2047/o8 improves, but p2047/o32 still high; code allocates selected blocks and runs selector separately | It is real current-route work, but SGLang-path optimization should first move selector/index metadata into the FlashMLA/graph contract, not only tune the standalone selector |
+| `ffn_expert_loop` | Request trace still shows expert loop under current path | This is evidence that transport/topology/orchestration still exposes local expert iteration. It is not the DeepGEMM/MegaMoE fused steady path |
+| `attn_all_reduce` / `attn_swa_all_reduce` | Request trace shows large attention all-reduce in the trace-on smoke | This is tied to current TP/attention layout. SGLang DP-attention lanes have different groups and row ownership |
+| Runtime API overhead | Old nsys trace shows hundreds of thousands of kernel launches and large `cuMemAllocAsync`/`cuMemFreeAsync` totals in the filtered decode window | Even if each kernel is small, the path is graph/materialization poor compared with SGLang's DSv4 graph metadata design |
+
+Therefore the current best explanation is not "DeepEP is slow" or "FlashMLA is
+slow". The current best explanation is:
+
+```text
+ARLE is measuring a replicated-token fallback route with per-row attention and
+post-FFN all-reduce, while SGLang's fast DSv4 path is a token-owned multi-axis
+route with DSv4 FlashMLA metadata/cache contracts, DeepEP/MegaMoE-class MoE,
+CUDA graph metadata coverage, and often speculative output-token accounting.
+```
+
+The exact millisecond contribution of each structural item is `待验证` until a
+matched SGLang no-spec/spec artifact exists.
 
 ## Generic SGLang MoE Path
 
@@ -271,7 +420,7 @@ Script risk:
   only after the runtime tree, model package, warmup state, and correctness are
   logged.
 
-## What Must Be Locked Before Running Perf
+## What Must Be Locked Before Any Future Perf Run
 
 1. Keep the SGLang DSv4 implementation identity attached to every run:
    - source tree `/workspace/sglang`;
@@ -304,6 +453,8 @@ Script risk:
    - same prompt, tokenizer, `ignore_eos`, max tokens, and output sanity;
    - decode actual generated text when output is suspicious.
 
+This is a future-run checklist only. It was not executed for this report.
+
 ## Research Conclusion
 
 The actual SGLang DSv4 source path is now identified:
@@ -315,10 +466,31 @@ The actual SGLang DSv4 source path is now identified:
 The earlier negative finding came from inspecting `/sgl-workspace/sglang`, which
 is not the runtime import tree for DSv4.
 
-The next correct step is still not to run an unqualified trace. The correct next
-step is to update the SGLang harness to select a documented lane, record the
-runtime tree and launch contract, warm DeepGEMM with fast warmup/cache, verify
-normal output, then run a warm stage-split PyTorch profile.
+The structural reason SGLang is faster is now clear at source level:
+
+1. SGLang's intended H200 DSv4 lanes use a multi-axis TP/DP/EP contract with DP
+   attention and token-owned MoE rows. ARLE's current executable route still
+   submits replicated full-token requests to every rank and reconciles local
+   expert output with all-reduce.
+2. SGLang's attention path is a DSv4 FlashMLA contract: fused WQA/WKV, fused
+   norm/RoPE/cache write, graph-aware C4/C128/SWA metadata, and one
+   `flash_mla_with_kvcache` core call. ARLE's current route still exposes
+   per-row attention plus standalone CSA selector/hybrid work.
+3. SGLang's MoE path has DeepEP/MegaMoE-class transport plus grouped DeepGEMM
+   and JIT fused activation/quant. ARLE has pieces of DeepGEMM, but they are
+   embedded in the replicated-token route and still carry local routing,
+   materialization, and post-FFN all-reduce costs.
+4. SGLang's DSv4 defaults keep metadata and prep closer to CUDA graph replay.
+   Existing ARLE artifacts still show heavy launch, alloc/free, D2H/H2D, and
+   explicit per-stage overhead.
+5. SGLang cookbook lanes can also use EAGLE/MTP. If the reference metric is
+   output-token TPOT under speculative decoding, ARLE's no-spec path is being
+   penalized by metric definition before any kernel comparison starts.
+
+The exact numeric waterfall from SGLang TPOT to ARLE TPOT remains `待验证`
+because there is no matched SGLang no-spec/spec trace artifact in the repo. The
+report therefore rejects any precise percentage attribution such as "X ms from
+spec decode, Y ms from topology" until a future trace supplies those controls.
 
 For optimization planning, the source-level SGLang best-practice deltas are now
 clear:
@@ -333,3 +505,7 @@ clear:
 4. move ARLE attention toward the SGLang DSv4 metadata/cache/indexer contract
    instead of isolated per-row CSA selector tuning;
 5. keep raw target TPOT and speculative/effective TPOT in separate metric lanes.
+
+The next investigation, when running is allowed again, should start with a
+matched SGLang no-spec target-step baseline and a separate spec-on EAGLE/MTP
+baseline. This report intentionally does not start either run.
