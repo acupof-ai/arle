@@ -11,10 +11,14 @@ axis, steady TPOT for decode parity, and process RSS as prompt length grows.
 
 - Model: `mlx-community/Qwen3.6-35B-A3B-4bit`.
 - Host: Apple Silicon, 48 GB unified memory.
-- Shape: c=1, OpenAI streaming completions, `max_tokens=256`, temperature 0.
-- ARLE: `target/release/metal_serve --max-running-requests 1
-  --max-batch-tokens 4096`, default no-wired mode.
-- mlx-lm: `mlx_lm server`, same model and host.
+- Shape: c=1, `/v1/completions` streaming, `max_tokens=256`, temperature 0.
+- Prompt: stable completion prompt for both runtimes; the 8k/12k points use a
+  paragraph request so mlx-lm does not early-stop.
+- ARLE: `target/release/metal_serve --model-path
+  mlx-community/Qwen3.6-35B-A3B-4bit --port 8915 --max-running-requests 1
+  --max-batch-tokens 4096`.
+- mlx-lm: `/opt/homebrew/opt/python@3.11/bin/python3.11 -m mlx_lm server
+  --model mlx-community/Qwen3.6-35B-A3B-4bit --port 8916 --host 127.0.0.1`.
 - RSS: process RSS sampled during streaming. On macOS unified memory,
   non-wired Metal pages may not all appear as process RSS; the raw JSON also
   records system-used memory.
@@ -32,29 +36,31 @@ Low-RSS analysis:
 
 | input | ARLE TTFT | mlx TTFT | ARLE TPOT | mlx TPOT | ARLE RSS | mlx RSS |
 |---:|---:|---:|---:|---:|---:|---:|
-| 128 | 0.21 s | 0.16 s | 11.6 ms | 12.9 ms | 2.21 GiB | 10.77 GiB |
-| 256 | 0.33 s | 0.48 s | 11.5 ms | 11.9 ms | 2.21 GiB | 10.77 GiB |
-| 512 | 0.58 s | 0.72 s | 11.7 ms | 12.0 ms | 2.21 GiB | 10.78 GiB |
-| 1k | 1.10 s | 1.23 s | 11.8 ms | 12.2 ms | 2.22 GiB | 10.78 GiB |
-| 2k | 2.12 s | 2.32 s | 11.9 ms | 12.7 ms | 2.22 GiB | 10.78 GiB |
-| 4k | 4.59 s | 4.55 s | 12.4 ms | 12.9 ms | 2.23 GiB | 10.78 GiB |
-| 8k | 9.58 s | 10.86 s | 13.1 ms | - | 2.23 GiB | - |
-| 12k | 16.64 s | 14.50 s | 14.3 ms | 15.3 ms | 2.23 GiB | 10.79 GiB |
+| 128 | 0.22 s | 0.30 s | 14.3 ms | 16.3 ms | 4.54 GiB | 19.03 GiB |
+| 256 | 0.34 s | 0.77 s | 15.4 ms | 16.2 ms | 4.54 GiB | 19.03 GiB |
+| 512 | 0.63 s | 1.03 s | 14.4 ms | 16.2 ms | 4.55 GiB | 19.03 GiB |
+| 1k | 1.16 s | 1.41 s | 14.5 ms | 15.8 ms | 4.55 GiB | 19.03 GiB |
+| 2k | 2.27 s | 2.24 s | 14.3 ms | 15.5 ms | 4.55 GiB | 19.03 GiB |
+| 4k | 4.90 s | 4.37 s | 15.0 ms | 15.1 ms | 4.56 GiB | 19.03 GiB |
+| 8k | 9.75 s | 9.01 s | 15.6 ms | 15.1 ms | 5.36 GiB | 19.04 GiB |
+| 12k | 15.04 s | 14.04 s | 15.8 ms | 15.2 ms | 6.04 GiB | 19.04 GiB |
 
 ## Problems
 
-- The same-prompt mlx-lm 8k request emitted only one non-empty text chunk, so
-  TPOT is not valid there. The README plot uses that retry only for TTFT and
-  leaves mlx-lm 8k RSS/TPOT blank instead of fabricating a point.
-- RSS is a process-attributed metric. The default no-wired ARLE curve is useful
-  for the user-visible RSS regression, but it is not a complete unified-memory
-  pressure model; use the raw `system_used` fields for that follow-up.
+- The first prompt form made mlx-lm early-stop at 8k. The final figure uses one
+  full retest with a stable prompt family, so every ARLE and mlx-lm point is
+  present and connected.
+- RSS is process-attributed. It is the right metric for the visible process-RSS
+  regression, but not a full unified-memory pressure model; the raw JSON keeps
+  `system_used_gb` for that follow-up.
 
 ## Learnings
 
-- The default memory issue was weight residency, not decode scaling. In the
-  README-facing default configuration, nominal TTFT and TPOT stay at mlx-lm
-  parity while process RSS no longer carries the previous wired footprint.
+- TTFT has the same shape in both runtimes: ARLE is faster on short prompts,
+  mlx-lm is slightly faster at 4k+ in this retest.
+- Decode is effectively parity: both stay around 14-16 ms/token.
+- The visible difference is process RSS: ARLE is about 4.5-6.0 GiB across the
+  sweep, while mlx-lm stays around 19.0 GiB.
 - The README figure should stay focused on the user-facing comparison: ARLE vs
   mlx-lm. Internal residency tradeoffs belong in the dedicated memory-fix entry.
 
