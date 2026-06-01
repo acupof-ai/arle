@@ -24,11 +24,12 @@ use infer::request_handle::RequestHandle;
 use infer::sampler::SamplingParams;
 use infer::scheduler::{IncomingRequest, RequestPriority};
 use infer::server_engine::{CompletionStreamDelta, EnginePoolModelSpec};
-use log::info;
+use log::{info, warn};
 
 const DEFAULT_WARMUP_PROMPT: &str = "Write one short sentence about Metal inference.";
 const WARMUP_TIMEOUT: Duration = Duration::from_mins(5);
 const DEFAULT_KV_DISK_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+const FALLBACK_KV_MEMORY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -102,6 +103,12 @@ struct Args {
     /// Maximum bytes for the Metal SSD KV cache. Defaults to 20 GiB.
     #[arg(long, value_name = "BYTES")]
     kv_disk_max_bytes: Option<u64>,
+
+    /// Maximum bytes for in-memory Metal prefix KV snapshots. By default this is
+    /// auto-sized from available memory, model weight bytes, and live KV
+    /// estimate; set 0 to disable the in-memory snapshot tier while keeping SSD.
+    #[arg(long, value_name = "BYTES")]
+    kv_memory_max_bytes: Option<u64>,
 
     /// High watermark for Metal SSD KV cache reclamation.
     #[arg(long)]
@@ -180,6 +187,34 @@ impl Args {
         }
     }
 
+    fn kv_memory_max_bytes(&self) -> u64 {
+        if let Some(bytes) = self.kv_memory_max_bytes {
+            return bytes;
+        }
+        infer::backend::metal::auto_kv_memory_max_bytes(
+            &self.model_path,
+            self.max_running_requests,
+            self.max_batch_tokens,
+            self.kv_memory_weight_reserve_limit_bytes(),
+        )
+        .unwrap_or_else(|| {
+            warn!(
+                "Metal in-memory KV snapshot auto-budget unavailable; falling back to {} bytes (pass --kv-memory-max-bytes to override, 0 disables memory snapshots)",
+                FALLBACK_KV_MEMORY_MAX_BYTES
+            );
+            FALLBACK_KV_MEMORY_MAX_BYTES
+        })
+    }
+
+    fn kv_memory_weight_reserve_limit_bytes(&self) -> Option<u64> {
+        match self.wired_limit_bytes {
+            Some(0) => None,
+            Some(limit) => Some(limit as u64),
+            None if self.auto_wired_limit => Some(u64::MAX),
+            None => None,
+        }
+    }
+
     fn kv_disk_options(&self) -> Result<Option<MetalKvDiskOptions>> {
         if self.no_kv_disk {
             return Ok(None);
@@ -243,6 +278,7 @@ mod tests {
             kv_disk_dir: None,
             no_kv_disk: false,
             kv_disk_max_bytes: None,
+            kv_memory_max_bytes: None,
             kv_disk_high_watermark: None,
             kv_disk_low_watermark: None,
             kv_disk_fsync_each_block: false,
@@ -285,6 +321,32 @@ mod tests {
         assert_eq!(options.dir, PathBuf::from("/tmp/arle-metal-kv-test"));
         assert_eq!(options.max_bytes, Some(1024));
     }
+
+    #[test]
+    fn kv_memory_explicit_zero_disables_memory_snapshots() {
+        let mut args = args();
+        args.kv_memory_max_bytes = Some(0);
+        assert_eq!(args.kv_memory_max_bytes(), 0);
+    }
+
+    #[test]
+    fn kv_memory_default_does_not_reserve_unwired_weights() {
+        assert_eq!(args().kv_memory_weight_reserve_limit_bytes(), None);
+    }
+
+    #[test]
+    fn kv_memory_auto_wired_reserves_model_weights() {
+        let mut args = args();
+        args.auto_wired_limit = true;
+        assert_eq!(args.kv_memory_weight_reserve_limit_bytes(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn kv_memory_explicit_wired_zero_does_not_reserve_model_weights() {
+        let mut args = args();
+        args.wired_limit_bytes = Some(0);
+        assert_eq!(args.kv_memory_weight_reserve_limit_bytes(), None);
+    }
 }
 
 #[tokio::main]
@@ -309,6 +371,7 @@ async fn main() -> Result<()> {
             }),
         kv_pool: args.kv_pool_override(),
         kv_disk: args.kv_disk_options()?,
+        kv_memory_max_bytes: Some(args.kv_memory_max_bytes()),
         runtime_limits: args.runtime_limits(),
     };
     let model_id = std::path::Path::new(&args.model_path)
