@@ -28,6 +28,7 @@ use log::info;
 
 const DEFAULT_WARMUP_PROMPT: &str = "Write one short sentence about Metal inference.";
 const WARMUP_TIMEOUT: Duration = Duration::from_mins(5);
+const DEFAULT_KV_DISK_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -89,19 +90,16 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_pool")]
     no_kv_pool: bool,
 
-    /// Directory for Metal SSD KV cache persistence. Default-on as of
-    /// M_e.13 (2026-05-08) — auto-resolves to `$HOME/.cache/arle/metal_kv`
-    /// when neither `--kv-disk-dir` nor `--no-kv-disk` is passed. Wins
-    /// entry: docs/experience/wins/2026-05-08-bench-m_e13-ssd-persistence-c1-win.md
-    /// (mean −25.9% E2E on long-prompt c=1 warm restart, n=2).
+    /// Directory for Metal SSD KV cache persistence. Defaults to
+    /// `$HOME/.cache/arle/metal_kv` with a bounded 20 GiB disk budget.
     #[arg(long, value_name = "DIR", conflicts_with = "no_kv_disk")]
     kv_disk_dir: Option<PathBuf>,
 
-    /// Disable the Metal SSD KV cache (overrides the M_e.13 default-on).
+    /// Disable the Metal SSD KV cache.
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_disk_dir")]
     no_kv_disk: bool,
 
-    /// Maximum bytes for the Metal SSD KV cache.
+    /// Maximum bytes for the Metal SSD KV cache. Defaults to 20 GiB.
     #[arg(long, value_name = "BYTES")]
     kv_disk_max_bytes: Option<u64>,
 
@@ -186,12 +184,17 @@ impl Args {
         if self.no_kv_disk {
             return Ok(None);
         }
-        // M_e.13 default-on: when no explicit --kv-disk-dir and no --no-kv-disk,
-        // auto-resolve to $HOME/.cache/arle/metal_kv. Mirrors HF cache convention.
         let dir = if let Some(dir) = self.kv_disk_dir.clone() {
             dir
         } else {
             let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+                if self.kv_disk_max_bytes.is_some()
+                    || self.kv_disk_high_watermark.is_some()
+                    || self.kv_disk_low_watermark.is_some()
+                    || self.kv_disk_fsync_each_block
+                {
+                    bail!("Metal SSD KV cache options require --kv-disk-dir when HOME is not set");
+                }
                 log::info!(
                     "metal_serve: HOME not set; Metal SSD KV cache disabled (set --kv-disk-dir to override)"
                 );
@@ -199,14 +202,15 @@ impl Args {
             };
             let auto = home.join(".cache").join("arle").join("metal_kv");
             log::info!(
-                "metal_serve: Metal SSD KV cache auto-defaulting to {} (M_e.13 default-on; pass --no-kv-disk to opt out, or --kv-disk-dir <DIR> to override)",
-                auto.display()
+                "metal_serve: Metal SSD KV cache auto-defaulting to {} with {} GiB budget (pass --no-kv-disk to disable, or --kv-disk-max-bytes to override)",
+                auto.display(),
+                DEFAULT_KV_DISK_MAX_BYTES / 1024 / 1024 / 1024
             );
             auto
         };
         let options = MetalKvDiskOptions {
             dir,
-            max_bytes: self.kv_disk_max_bytes,
+            max_bytes: Some(self.kv_disk_max_bytes.unwrap_or(DEFAULT_KV_DISK_MAX_BYTES)),
             high_watermark: self
                 .kv_disk_high_watermark
                 .unwrap_or(MetalKvDiskOptions::DEFAULT_HIGH_WATERMARK),
@@ -217,6 +221,69 @@ impl Args {
         };
         options.validate()?;
         Ok(Some(options))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args() -> Args {
+        Args {
+            model_path: "model".to_string(),
+            port: 8000,
+            bind: "127.0.0.1".to_string(),
+            api_key: None,
+            max_waiting: 256,
+            max_running_requests: 4,
+            max_batch_tokens: 512,
+            dflash_draft_model: None,
+            kv_pool: false,
+            no_kv_pool: false,
+            kv_disk_dir: None,
+            no_kv_disk: false,
+            kv_disk_max_bytes: None,
+            kv_disk_high_watermark: None,
+            kv_disk_low_watermark: None,
+            kv_disk_fsync_each_block: false,
+            memory_limit_bytes: None,
+            cache_limit_bytes: None,
+            wired_limit_bytes: None,
+            auto_wired_limit: false,
+            speculative_tokens: None,
+            warmup: 1,
+            warmup_prompt: DEFAULT_WARMUP_PROMPT.to_string(),
+            warmup_max_new_tokens: 1,
+            train_control_url: None,
+            pool_models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn kv_disk_default_is_bounded() {
+        let options = args()
+            .kv_disk_options()
+            .expect("kv disk options")
+            .expect("default cache enabled when HOME is set");
+        assert_eq!(options.max_bytes, Some(DEFAULT_KV_DISK_MAX_BYTES));
+        assert!(options.dir.ends_with(".cache/arle/metal_kv"));
+    }
+
+    #[test]
+    fn kv_disk_no_flag_disables_cache() {
+        let mut args = args();
+        args.no_kv_disk = true;
+        assert!(args.kv_disk_options().expect("no kv disk").is_none());
+    }
+
+    #[test]
+    fn kv_disk_explicit_max_overrides_default_budget() {
+        let mut args = args();
+        args.kv_disk_dir = Some(PathBuf::from("/tmp/arle-metal-kv-test"));
+        args.kv_disk_max_bytes = Some(1024);
+        let options = args.kv_disk_options().expect("kv disk options").unwrap();
+        assert_eq!(options.dir, PathBuf::from("/tmp/arle-metal-kv-test"));
+        assert_eq!(options.max_bytes, Some(1024));
     }
 }
 

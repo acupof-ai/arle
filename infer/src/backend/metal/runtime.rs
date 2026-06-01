@@ -3754,6 +3754,44 @@ mod tests {
     }
 
     #[test]
+    fn disk_prefix_index_evicts_under_bounded_budget() {
+        let mut index = MetalDiskPrefixIndex::new(Some(100), 0.90, 0.75);
+        index.insert(
+            vec![1],
+            DiskBlockLocation {
+                path: PathBuf::from("one"),
+                payload_len: 30,
+                fingerprint: BlockFingerprint([1; 16]),
+            },
+        );
+        index.insert(
+            vec![2],
+            DiskBlockLocation {
+                path: PathBuf::from("two"),
+                payload_len: 30,
+                fingerprint: BlockFingerprint([2; 16]),
+            },
+        );
+        index.insert(
+            vec![3],
+            DiskBlockLocation {
+                path: PathBuf::from("three"),
+                payload_len: 20,
+                fingerprint: BlockFingerprint([3; 16]),
+            },
+        );
+        index.touch(&[2]);
+
+        let decision = index.reserve_capacity(20);
+        assert!(decision.fits);
+        assert_eq!(index.disk_bytes, 50);
+        assert_eq!(decision.evicted.len(), 1);
+        assert_eq!(decision.evicted[0].path, PathBuf::from("one"));
+        assert!(index.contains(&[2]));
+        assert!(index.contains(&[3]));
+    }
+
+    #[test]
     fn dflash_row_dispatch_plan_preserves_scheduler_order() {
         let plan = dflash_row_dispatch_plan(8, &[0, 2, 5], 3).expect("plan");
 
