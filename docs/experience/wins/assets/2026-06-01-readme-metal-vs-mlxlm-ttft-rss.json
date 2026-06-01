@@ -1,0 +1,218 @@
+{
+  "generated_at": "2026-06-01T15:10:00+08:00",
+  "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+  "hardware": "Apple Silicon, 48 GB unified memory",
+  "shape": "c=1, OpenAI streaming completions, max_tokens=256, temperature=0",
+  "rss_definition": "process RSS sampled during streaming. On macOS unified memory, non-wired Metal pages may not all appear as process RSS; explicit --auto-wired-limit intentionally keeps model buffers resident and visible in RSS.",
+  "sources": {
+    "arle_default_and_auto_wired": "/tmp/bench_auto_wired_ab_20260601-144758.json",
+    "mlx_lm_full_sweep": "/tmp/bench_mlx_compare_20260601-145454.json",
+    "mlx_lm_8192_same_prompt_ttft_retry": "/tmp/bench_mlx_8192_sameprompt_ttft_20260601.json"
+  },
+  "lens": [
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    12288
+  ],
+  "series": {
+    "arle_default_no_wired": {
+      "label": "ARLE default",
+      "cmd": "target/release/metal_serve --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8897 --max-running-requests 1 --max-batch-tokens 4096",
+      "rows": {
+        "128": {
+          "ttft_s": 0.21416497230529785,
+          "tpot_ms": 11.638185170691782,
+          "peak_rss_gb": 2.209,
+          "peak_used_gb": 32.113,
+          "ntok": 256
+        },
+        "256": {
+          "ttft_s": 0.3267829418182373,
+          "tpot_ms": 11.485464929595707,
+          "peak_rss_gb": 2.211,
+          "peak_used_gb": 32.006,
+          "ntok": 256
+        },
+        "512": {
+          "ttft_s": 0.5799920558929443,
+          "tpot_ms": 11.684440252349132,
+          "peak_rss_gb": 2.214,
+          "peak_used_gb": 32.218,
+          "ntok": 256
+        },
+        "1024": {
+          "ttft_s": 1.0971519947052002,
+          "tpot_ms": 11.836854491646834,
+          "peak_rss_gb": 2.217,
+          "peak_used_gb": 32.74,
+          "ntok": 256
+        },
+        "2048": {
+          "ttft_s": 2.1192588806152344,
+          "tpot_ms": 11.939570659727561,
+          "peak_rss_gb": 2.221,
+          "peak_used_gb": 32.86,
+          "ntok": 256
+        },
+        "4096": {
+          "ttft_s": 4.591060161590576,
+          "tpot_ms": 12.389948987585353,
+          "peak_rss_gb": 2.226,
+          "peak_used_gb": 33.702,
+          "ntok": 256
+        },
+        "8192": {
+          "ttft_s": 9.57982325553894,
+          "tpot_ms": 13.127865753774568,
+          "peak_rss_gb": 2.226,
+          "peak_used_gb": 33.579,
+          "ntok": 256
+        },
+        "12288": {
+          "ttft_s": 16.640886783599854,
+          "tpot_ms": 14.311259187112643,
+          "peak_rss_gb": 2.228,
+          "peak_used_gb": 32.958,
+          "ntok": 256
+        }
+      }
+    },
+    "arle_auto_wired_limit": {
+      "label": "ARLE --auto-wired-limit",
+      "cmd": "target/release/metal_serve --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8898 --max-running-requests 1 --max-batch-tokens 4096 --auto-wired-limit",
+      "rows": {
+        "128": {
+          "ttft_s": 0.19801616668701172,
+          "tpot_ms": 11.539763353002353,
+          "peak_rss_gb": 18.706,
+          "peak_used_gb": 32.379,
+          "ntok": 256
+        },
+        "256": {
+          "ttft_s": 0.3317759037017822,
+          "tpot_ms": 11.495122759360967,
+          "peak_rss_gb": 18.686,
+          "peak_used_gb": 32.563,
+          "ntok": 256
+        },
+        "512": {
+          "ttft_s": 0.5774428844451904,
+          "tpot_ms": 11.570417036221722,
+          "peak_rss_gb": 18.688,
+          "peak_used_gb": 32.622,
+          "ntok": 256
+        },
+        "1024": {
+          "ttft_s": 1.0820348262786865,
+          "tpot_ms": 11.70637006834736,
+          "peak_rss_gb": 18.691,
+          "peak_used_gb": 32.972,
+          "ntok": 256
+        },
+        "2048": {
+          "ttft_s": 2.1318130493164062,
+          "tpot_ms": 12.008746777932474,
+          "peak_rss_gb": 18.695,
+          "peak_used_gb": 33.466,
+          "ntok": 256
+        },
+        "4096": {
+          "ttft_s": 4.536401033401489,
+          "tpot_ms": 12.268979718366007,
+          "peak_rss_gb": 18.699,
+          "peak_used_gb": 34.229,
+          "ntok": 256
+        },
+        "8192": {
+          "ttft_s": 9.856241226196289,
+          "tpot_ms": 13.007527261268436,
+          "peak_rss_gb": 18.706,
+          "peak_used_gb": 34.882,
+          "ntok": 256
+        },
+        "12288": {
+          "ttft_s": 15.65175485610962,
+          "tpot_ms": 13.85958645287461,
+          "peak_rss_gb": 18.712,
+          "peak_used_gb": 35.309,
+          "ntok": 256
+        }
+      }
+    },
+    "mlx_lm": {
+      "label": "mlx-lm",
+      "cmd": "/opt/homebrew/opt/python@3.11/bin/python3.11 -m mlx_lm server --model mlx-community/Qwen3.6-35B-A3B-4bit --port 8901 --host 127.0.0.1",
+      "rows": {
+        "128": {
+          "ttft_s": 0.16230297088623047,
+          "tpot_ms": 12.911725329212933,
+          "rss_gb": 10.771209716796875,
+          "sys_used_gb": 32.34281921386719,
+          "ntok": 253,
+          "note": null
+        },
+        "256": {
+          "ttft_s": 0.47643089294433594,
+          "tpot_ms": 11.945024429564457,
+          "rss_gb": 10.774627685546875,
+          "sys_used_gb": 31.776992797851562,
+          "ntok": 253,
+          "note": null
+        },
+        "512": {
+          "ttft_s": 0.7192518711090088,
+          "tpot_ms": 12.014072729771831,
+          "rss_gb": 10.7763671875,
+          "sys_used_gb": 31.708999633789062,
+          "ntok": 253,
+          "note": null
+        },
+        "1024": {
+          "ttft_s": 1.2253210544586182,
+          "tpot_ms": 12.249869654378093,
+          "rss_gb": 10.777313232421875,
+          "sys_used_gb": 32.27392578125,
+          "ntok": 253,
+          "note": null
+        },
+        "2048": {
+          "ttft_s": 2.322741985321045,
+          "tpot_ms": 12.733048176860429,
+          "rss_gb": 10.778335571289062,
+          "sys_used_gb": 31.320404052734375,
+          "ntok": 253,
+          "note": null
+        },
+        "4096": {
+          "ttft_s": 4.546734094619751,
+          "tpot_ms": 12.948505432007321,
+          "rss_gb": 10.78033447265625,
+          "sys_used_gb": 31.552520751953125,
+          "ntok": 253,
+          "note": null
+        },
+        "8192": {
+          "ttft_s": 10.864614009857178,
+          "tpot_ms": null,
+          "rss_gb": null,
+          "sys_used_gb": 32.65617370605469,
+          "ntok": 1,
+          "note": "same prompt as sweep; request emitted too few non-empty chunks for TPOT; RSS omitted from plot because this fresh-server sample is not comparable to the full sequential sweep RSS."
+        },
+        "12288": {
+          "ttft_s": 14.503003120422363,
+          "tpot_ms": 15.345551836209035,
+          "rss_gb": 10.78619384765625,
+          "sys_used_gb": 33.031982421875,
+          "ntok": 256,
+          "note": null
+        }
+      }
+    }
+  }
+}

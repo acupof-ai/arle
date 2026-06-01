@@ -103,13 +103,14 @@ Agent and RL workloads waste compute re-processing the same prompt + history + t
 - **One runtime, three surfaces.** Serving, the local agent, and OPD training all run on the same Rust + model code. The OPD teacher *is* the production server.
 
 <p align="center">
-  <img src="docs/assets/metal-vs-mlxlm-e2e.png" alt="ARLE Metal vs mlx-lm multi-turn end-to-end latency" width="100%">
+  <img src="docs/assets/metal-vs-mlxlm-e2e.png" alt="ARLE Metal vs mlx-lm TTFT, TPOT, and RSS sweep" width="100%">
 </p>
 
 <p align="center">
-  <em>Apple Silicon, Qwen3.6-35B-A3B-4bit, c=1 (single user), measured first-hand against <code>mlx_lm.server</code> on the same model.
-  Multi-turn agent shape: turn 1 is a cold full prefill; turn 2 extends the prior turn, so both runtimes reuse the cached prefix and only prefill the new tokens.
-  <strong>Result: end-to-end parity</strong> — ARLE matches mlx-lm both cold (2.5 vs 2.3 s @2k, 7.1 vs 7.0 s @6k) and on the reused turn (sub-second both). The win was internal: a memory-first prefix cache removed a long-context first-response stall that previously made ARLE ~4× slower here (token1→token2 gap 29.6 s → 0.43 s @8k).</em>
+  <em>Apple Silicon, Qwen3.6-35B-A3B-4bit, c=1, 256 output tokens, OpenAI streaming, measured first-hand against <code>mlx_lm.server</code> on the same model.
+  <strong>TTFT is the key axis</strong>: ARLE tracks mlx-lm from 128 tokens through 12k, while steady TPOT stays in the same 11-15 ms/token band.
+  The RSS panel shows the post-fix default: ARLE no longer auto-pins model weights. <code>--auto-wired-limit</code> remains an explicit residency option and costs about 18.7 GiB process RSS in this run.
+  RSS is process-attributed memory on macOS unified memory; the raw JSON also records system-used memory. Evidence: <a href="docs/experience/wins/2026-06-01-metal-auto-wired-opt-in-memory.md">wired-limit memory fix</a> and <a href="docs/experience/wins/assets/2026-06-01-readme-metal-vs-mlxlm-ttft-rss.json">README sweep data</a>.</em>
 </p>
 
 ```mermaid
