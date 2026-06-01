@@ -48,12 +48,17 @@ Confirmed ARLE evidence:
 
 Confirmed SGLang-source path from remote source survey:
 
+- Runtime source tree is `/workspace/sglang @ 0d51db3`. The older
+  `/sgl-workspace/sglang @ 232982a` tree is not the Python import path for DSv4.
 - DSv4 hook defaults: attention backend `dsv4`, page size 256, FP8 KV cache.
 - Attention fuses Q/KV A projections, norm/RoPE, paged FlashMLA cache write,
   and FlashMLA decode with sparse/recent indices.
 - MoE uses DeepEP low-latency dispatch/combine or MegaMoE fused expert paths.
 - Tested high-end path uses TP/DP style decomposition, DP attention, native
   DeepEP, CUDA graphs, and optional EAGLE/MTP.
+- H200 FP8 cookbook lanes use `sgl-project/DeepSeek-V4-Flash-FP8`,
+  `SGLANG_DSV4_FP4_EXPERTS=0`, and for Balanced/MaxThroughput use
+  `--tp 4 --dp 4 --enable-dp-attention --moe-a2a-backend deepep`.
 
 Invalid or stale SGLang control artifacts:
 
