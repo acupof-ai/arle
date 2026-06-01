@@ -40,7 +40,7 @@ metal/prefix_cache.rs   — Metal prefix cache accounting (always-on)
 metal/gdr.rs            — Metal draft runtime glue (always-on)
 metal/scheduler.rs      — MetalScheduler policy (decode-first step + optional prefill chunk; always-on)
 metal/plan.rs           — `MetalLogicalDecodeRow`: backend-local CPU-only logical row description used by the scheduler runtime to record selected decode work without re-deriving batch structure from legacy DTO fields. Runtime-owned request state remains the authority for MLX cache objects.
-metal/runtime.rs        — `run_metal_scheduler_runtime`: the live hot path (decode-first continuous batching, prefill chunks, packed-decode admission/retire, DFlash dispatch).
+metal/runtime.rs        — `run_metal_scheduler_runtime`: the live hot path (decode-first continuous batching, prefill chunks, packed-decode admission/retire, DFlash dispatch). SSD prefix snapshots default to `$HOME/.cache/arle/metal_kv` with a bounded 20 GiB budget and LRU watermark eviction; `--no-kv-disk` disables them.
 metal/request_state.rs + metal/request_state/  — `MetalRequestState` per-request mutable state plus split helpers (`helpers.rs` for left-pad/strip-padding utilities, `tests.rs` for varlen + admit/retain regressions).
 ```
 
