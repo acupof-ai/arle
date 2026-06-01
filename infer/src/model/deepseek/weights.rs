@@ -234,6 +234,15 @@ impl DeepseekModel {
     pub fn from_config(config: DeepseekRuntimeConfig) -> Result<Self> {
         let ctx = DeviceContext::new()?;
         let layer_communicator = Self::layer_communicator_from_config(&ctx, &config)?;
+        info!(
+            "DeepSeek V4 runtime topology: tp={}/{} ep={}/{} axes={} coord={:?} communicator=global-tp-ep-only",
+            config.tp.rank,
+            config.tp.world_size,
+            config.ep.rank,
+            config.ep.world_size,
+            config.axes.summary(),
+            config.rank_coord,
+        );
         let model = Self {
             config,
             ctx,
@@ -2057,8 +2066,9 @@ impl DeepseekModel {
         // ring inline via `fuse_window_update`; when the FlashMLA decode
         // path fires we skip that kernel entirely and the bf16 SW ring
         // update runs unfused after the dispatch so it stays valid for
-        // future env-OFF fallback (during the one-commit-cycle window
-        // before the legacy path is deleted).
+        // env-OFF fallback and diagnostic A/B runs. The legacy path still
+        // exists; do not assume it is safe to delete without a separate
+        // validated tranche.
         let mode_int_early = match mode {
             deepseek_spec::DeepSeekV4AttentionMode::SlidingWindow => 0,
             deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse => 1,

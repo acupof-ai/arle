@@ -215,3 +215,33 @@ SGLang and ARLE must bench SEQUENTIALLY, not concurrently.**
   Next axis: P0.1 decode CSA select, then P0.2 block-scaled batch GEMV to
   tensor-core GEMM. Do not use the earlier cold p2048/o32 `113 ms` as a direct
   SGLang gap proof unless workload and measurement path are matched.
+
+- **I5 (2026-06-01) — PATH-LEVEL RESET, OPERATOR QUEUE FROZEN FOR SGLANG CLAIM**:
+  User correction: the relevant SGLang reference is about `18 ms/token`, so a
+  `>20%` ARLE win means `<=14.4 ms/token` if the metric is raw target-step
+  TPOT. The older `60-64 ms/token` target is deprecated for this campaign.
+  More importantly, ARLE's current path is still not SGLang's path: it submits
+  the same logical request to every rank, keeps replicated token rows, batches
+  only the FFN half, runs attention per row, and uses FFN all-reduce as the
+  combine primitive. SGLang's DSv4 route uses explicit TP/DP-style rank layout,
+  FP8 paged KV, batched FlashMLA metadata/cache-write/decode, native
+  DeepEP/MegaMoE-style MoE transport, CUDA graph capture, and optional
+  EAGLE/MTP accepted-token accounting. Therefore the campaign now uses
+  [`../plans/2026-06-01-dsv4-sglang-path-alignment.md`](../plans/2026-06-01-dsv4-sglang-path-alignment.md)
+  as the controlling plan. The roofline queue remains a subordinate backlog for
+  the replicated-token route only; it cannot license a SGLang-comparable win
+  until the path contract gates PC0-PC3 pass.
+
+- **I6 (2026-06-01) — USER TRACE PRIORITY RESET: MOE/EP BEFORE ATTENTION MAIN**:
+  New user-supplied vLLM/SGLang trace reference says the cross-runtime gap is
+  mostly MoE MLP plus EP transport: vLLM `swiglu_limit_func` / Triton fused
+  SwiGLU is around `788 ms` vs SGLang fused quant/SwiGLU kernels around
+  `1-15 ms`; vLLM expert GEMM is around `133 ms` vs SGLang DeepGEMM around
+  `30 ms`; vLLM DeepEP combine/dispatch is around `114/181 ms` vs SGLang around
+  `25/60 ms`; and vLLM has visible BF16 fill/materialization cost. The attention
+  main FlashMLA kernel is close between those paths. Therefore the path-aligned
+  P0 after token ownership is MoE/EP: native DeepEP token-owned
+  dispatch/combine, fused SwiGLU+quant, DeepGEMM W13/W2, route metadata
+  device-only, and scratch/materialization elimination. Current ARLE
+  attention/CSA work remains valid only as a replicated-token backlog until a
+  fresh path-aligned ARLE trace proves attention is again the primary blocker.
