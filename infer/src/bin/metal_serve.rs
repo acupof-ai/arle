@@ -129,6 +129,10 @@ struct Args {
     #[arg(long, value_name = "BYTES")]
     wired_limit_bytes: Option<usize>,
 
+    /// Auto-set the MLX allocator wired limit to model weight bytes + 1 GiB.
+    #[arg(long)]
+    auto_wired_limit: bool,
+
     /// Override the DFlash speculative block size.
     /// Defaults to the draft config; lower values can reduce throughput.
     #[arg(long)]
@@ -170,9 +174,11 @@ impl Args {
         MetalRuntimeLimits {
             memory_limit_bytes: self.memory_limit_bytes,
             cache_limit_bytes: self.cache_limit_bytes,
-            wired_limit_bytes: self
-                .wired_limit_bytes
-                .or_else(|| infer::backend::metal::auto_wired_limit_bytes(&self.model_path)),
+            wired_limit_bytes: self.wired_limit_bytes.or_else(|| {
+                self.auto_wired_limit
+                    .then(|| infer::backend::metal::auto_wired_limit_bytes(&self.model_path))
+                    .flatten()
+            }),
         }
     }
 

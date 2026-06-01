@@ -1,14 +1,14 @@
-//! Auto-computed MLX wired-memory limit for warm-loading Qwen3.6-class MoE
-//! weights on Apple Silicon.
+//! Opt-in MLX wired-memory limit for warm-loading Qwen3.6-class MoE weights on
+//! Apple Silicon.
 //!
 //! Pinning the model weights via `mlx::set_wired_limit` stops macOS from paging
 //! out cold expert weights under memory pressure — on the Qwen3.6 35B-A3B
 //! baseline that pageout blows up p99 ITL by 5-20×. Auto-pinning dropped c=1
 //! p99 from 86 ms to 15 ms (-83%) on first validation.
 //!
-//! This helper lives in the lib (not the `metal_serve` binary) so both the HTTP
-//! server entry point and the in-process CLI load path (`server_engine::loaded`)
-//! pin weights identically. See `docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md`.
+//! This helper lives in the lib (not the `metal_serve` binary) so callers that
+//! explicitly choose weight pinning can compute the same limit. See
+//! `docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md`.
 
 use std::path::PathBuf;
 
