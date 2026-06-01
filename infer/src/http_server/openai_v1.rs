@@ -37,6 +37,11 @@ fn canonical_model_id(model: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
+fn is_deepseek_v4_model_id(model_id: &str) -> bool {
+    let normalized = model_id.to_ascii_lowercase().replace(['_', '-'], "");
+    normalized.contains("deepseekv4") || normalized.contains("dsv4")
+}
+
 fn validate_requested_model(
     requested_model: Option<&str>,
     served_model_id: &str,
@@ -906,7 +911,8 @@ pub(super) struct ChatCompletionRequest {
 impl ChatCompletionRequest {
     pub(super) fn validate_for_model(&self, served_model_id: &str) -> Result<(), ApiError> {
         validate_requested_model(self.model.as_deref(), served_model_id)?;
-        self.validate()
+        self.validate()?;
+        self.validate_model_specific_tool_choice(served_model_id)
     }
 
     pub(super) fn validate(&self) -> Result<(), ApiError> {
@@ -990,6 +996,15 @@ impl ChatCompletionRequest {
     }
 
     fn validate_tool_choice(&self) -> Result<(), ApiError> {
+        if let Some(ToolChoice::Function { kind, .. }) = &self.tool_choice
+            && kind.trim() != "function"
+        {
+            return Err(invalid_parameter(
+                "tool_choice.type",
+                "must be `function` for forced function tool_choice",
+            ));
+        }
+
         match self.tool_choice_mode() {
             ToolChoiceMode::Required if self.tools.is_empty() => Err(invalid_parameter(
                 "tool_choice",
@@ -1010,6 +1025,20 @@ impl ChatCompletionRequest {
                 }
                 Ok(())
             }
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_model_specific_tool_choice(&self, served_model_id: &str) -> Result<(), ApiError> {
+        if !is_deepseek_v4_model_id(served_model_id) {
+            return Ok(());
+        }
+
+        match self.tool_choice_mode() {
+            ToolChoiceMode::Required | ToolChoiceMode::Function(_) => Err(invalid_parameter(
+                "tool_choice",
+                "DeepSeek-V4 prompt rendering does not support forced tool selection; use `auto` or `none`",
+            )),
             _ => Ok(()),
         }
     }
