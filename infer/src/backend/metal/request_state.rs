@@ -10,7 +10,7 @@ use super::forward::build_forward_graph;
 use super::gdr::MetalRecurrentState;
 use super::kv_pool::MetalKVPool;
 use super::mlx::{MlxArray, async_eval, concatenate_axis, eval, slice, take_axis, zeros};
-use super::ops::{clear_metal_cache, extend_kv_cache};
+use super::ops::{clear_metal_cache, clear_metal_cache_on_kv_boundary, extend_kv_cache};
 use super::qwen35::{
     CppQwen35Model, Qwen35MetalWeights, qwen35_dflash_supported, qwen35_forward_step,
     qwen35_forward_with_hidden_states,
@@ -1821,7 +1821,7 @@ fn decode_qwen3_batch(
         let cache_len = state.driver.cache_len;
         cache_len > 0 && cache_len % KV_CACHE_CHUNK == 0
     }) {
-        clear_metal_cache();
+        clear_metal_cache_on_kv_boundary();
     }
 
     for state in states.iter_mut() {
@@ -2032,7 +2032,7 @@ fn execute_qwen3_packed_batch(rows: &mut [Qwen3PackedBatchRow<'_>]) -> Result<Ve
         let state = unsafe { &*row.state };
         state.driver.cache_len > 0 && state.driver.cache_len % KV_CACHE_CHUNK == 0
     }) {
-        clear_metal_cache();
+        clear_metal_cache_on_kv_boundary();
     }
 
     let mut packed_tokens = Vec::with_capacity(rows.len() * max_query_len as usize);
@@ -2498,7 +2498,7 @@ fn decode_qwen35_packed_batch<'a>(
     }
 
     if batch.batch_cache_len > 0 && batch.batch_cache_len % KV_CACHE_CHUNK == 0 {
-        clear_metal_cache();
+        clear_metal_cache_on_kv_boundary();
     }
 
     batch.ensure_capacity_for_states(states, batch.batch_cache_len + 1);
@@ -2745,7 +2745,7 @@ fn decode_qwen35_packed_batch_pipelined<'a>(
     });
 
     if batch.batch_cache_len > 0 && batch.batch_cache_len % KV_CACHE_CHUNK == 0 {
-        clear_metal_cache();
+        clear_metal_cache_on_kv_boundary();
     }
     let t_after_clear = phase_timing.then(std::time::Instant::now);
 
@@ -3406,7 +3406,7 @@ fn decode_qwen35_batch(
     }
 
     if cache_len > 0 && cache_len % KV_CACHE_CHUNK == 0 {
-        clear_metal_cache();
+        clear_metal_cache_on_kv_boundary();
     }
 
     for state in states.iter_mut() {
@@ -4107,7 +4107,7 @@ impl StepDriver for Qwen3StepDriver<'_> {
         };
 
         if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
-            clear_metal_cache();
+            clear_metal_cache_on_kv_boundary();
         }
 
         if terminal_prompt {
@@ -4158,7 +4158,7 @@ impl StepDriver for Qwen3StepDriver<'_> {
 
         // ── Standard single-token path ───────────────────────────────────
         if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
-            clear_metal_cache();
+            clear_metal_cache_on_kv_boundary();
         }
         let sampled = self.run_step(token, &self.sample_params.clone())?;
         eval(&[&sampled]);
@@ -5215,7 +5215,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
             let can_prequeue = self.dflash.is_none() && self.cache_len < self.kv_capacity;
             if can_prequeue {
                 if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
-                    clear_metal_cache();
+                    clear_metal_cache_on_kv_boundary();
                 }
                 self.ensure_capacity(self.cache_len + 1)?;
                 let token_arr = super::mlx::reshape(&prev_sampled, &[1]);
@@ -5231,7 +5231,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
             // Cold path: no pre-queued step (first decode call, or previous
             // call hit the kv-capacity ceiling and skipped prequeue).
             if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
-                clear_metal_cache();
+                clear_metal_cache_on_kv_boundary();
             }
             let logits = self.run_step(token)?;
             let sampled = gpu_sample_token(&logits, &self.params);
@@ -5240,7 +5240,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
             let can_prequeue = self.dflash.is_none() && self.cache_len + 2 <= self.kv_capacity;
             if can_prequeue {
                 if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
-                    clear_metal_cache();
+                    clear_metal_cache_on_kv_boundary();
                 }
                 self.ensure_capacity(self.cache_len + 1)?;
                 let token_arr = super::mlx::reshape(&sampled, &[1]);

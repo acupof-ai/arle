@@ -760,13 +760,26 @@ fn is_deepseek_v4_model(model_id: &str) -> bool {
     normalized.contains("deepseekv4") || normalized.contains("dsv4")
 }
 
+fn is_qwen_thinking_model(model_id: &str) -> bool {
+    let normalized = model_id.to_ascii_lowercase().replace(['_', '-', '.'], "");
+    normalized.contains("qwen3")
+}
+
+fn apply_qwen_thinking_prefix(mut prompt: String, enable_thinking: Option<bool>) -> String {
+    match enable_thinking {
+        Some(true) => prompt.push_str("<think>\n"),
+        Some(false) => prompt.push_str("<think>\n\n</think>\n\n"),
+        None => {}
+    }
+    prompt
+}
+
 fn build_chat_prompt(model_id: &str, req: &ChatCompletionRequest) -> String {
     let choice = req.tool_choice_mode();
     if is_deepseek_v4_model(model_id) {
-        let kwargs = req.chat_template_kwargs.as_ref();
         let options = DeepSeekV4ChatTemplateOptions {
-            thinking: kwargs.and_then(|value| value.thinking).unwrap_or(false),
-            reasoning_effort: kwargs.and_then(|value| value.reasoning_effort.clone()),
+            thinking: req.thinking_override().unwrap_or(false),
+            reasoning_effort: req.reasoning_effort(),
         };
         // DeepSeek-V4 has no force-tool directive surface. Validation rejects
         // Required/Function; here we only distinguish Auto from None.
@@ -776,6 +789,9 @@ fn build_chat_prompt(model_id: &str, req: &ChatCompletionRequest) -> String {
             &req.tools
         };
         openai_messages_to_deepseek_v4_prompt(&req.messages, tools, &options)
+    } else if is_qwen_thinking_model(model_id) {
+        let prompt = openai_messages_to_prompt_with_tool_choice(&req.messages, &req.tools, &choice);
+        apply_qwen_thinking_prefix(prompt, req.thinking_override())
     } else {
         openai_messages_to_prompt_with_tool_choice(&req.messages, &req.tools, &choice)
     }
