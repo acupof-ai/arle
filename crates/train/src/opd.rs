@@ -2329,7 +2329,7 @@ mod tests {
         greedy_next_token, kl_distill_loss_for_config, kl_logit_range, map_qwen35_forward_error,
         mix_gkd_losses, next_token_sft_loss_from_logits, sequence_windows,
         shifted_rollout_sft_loss, validate_gkd_lambda, validate_gkd_loss_config,
-        validate_loss_value, validate_rollout_shape, validate_step_config,
+        validate_logits_shape, validate_loss_value, validate_rollout_shape, validate_step_config,
         validate_student_param_ownership, validate_student_params, validate_teacher_params,
     };
     use crate::qwen35::Qwen35Error;
@@ -2683,6 +2683,19 @@ mod tests {
             .expect("chunked KL config should run");
         let value = store.to_host(loss).expect("loss host")[0];
         assert!(value.is_finite(), "chunked KL loss must be finite");
+    }
+
+    #[test]
+    fn validate_logits_shape_rejects_last_row_teacher_logits_for_full_kl() {
+        let err = validate_logits_shape("teacher KL", &[1, 1, 8], 4, 8)
+            .expect_err("last-row teacher logits must not score a 4-token KL window");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("OPD teacher KL logits shape mismatch"));
+        assert!(message.contains("expected [1, 4, 8]"));
+        assert!(message.contains("current logits window"));
     }
 
     #[test]

@@ -172,6 +172,29 @@ pub struct Qwen35Model {
     offloaded: Option<Box<OffloadedWeights>>,
 }
 
+fn first_moe_offload_layer<I>(layers: I) -> Option<usize>
+where
+    I: IntoIterator<Item = (usize, bool)>,
+{
+    layers
+        .into_iter()
+        .find_map(|(idx, is_moe)| is_moe.then_some(idx))
+}
+
+fn ensure_qwen35_moe_offload_supported<I>(layers: I) -> Result<()>
+where
+    I: IntoIterator<Item = (usize, bool)>,
+{
+    if let Some(layer_idx) = first_moe_offload_layer(layers) {
+        anyhow::bail!(
+            "Qwen3.6 MoE weight offload is not supported (OPD is dense-only); \
+             first MoE layer={layer_idx}. Refusing before moving any device \
+             weights to host so the model remains usable."
+        );
+    }
+    Ok(())
+}
+
 impl Qwen35Model {
     #[cfg(test)]
     fn from_safetensors(model_path: &str) -> Result<Self> {
@@ -1171,6 +1194,15 @@ impl Qwen35Model {
         self.offloaded.is_some()
     }
 
+    fn ensure_offload_supported(&self) -> Result<()> {
+        ensure_qwen35_moe_offload_supported(
+            self.layers
+                .iter()
+                .enumerate()
+                .map(|(idx, layer)| (idx, matches!(layer.mlp, super::moe::Mlp::Moe(_)))),
+        )
+    }
+
     /// Move every device weight buffer to host RAM and free the VRAM
     /// (OPD engine time-share). Idempotent: a no-op if already offloaded.
     ///
@@ -1184,6 +1216,7 @@ impl Qwen35Model {
         if self.offloaded.is_some() {
             return Ok(0);
         }
+        self.ensure_offload_supported()?;
         let ctx = self.ctx.clone();
         // Drain ALL in-flight GPU work on the device before snapshotting weights.
         // The OPD step has three co-resident allocators sharing one device/pool
@@ -1681,5 +1714,21 @@ mod tests {
             rank0.mlp_down.size + rank1.mlp_down.size,
             config.intermediate_size
         );
+    }
+
+    #[test]
+    fn qwen35_offload_preflight_accepts_dense_layers() {
+        ensure_qwen35_moe_offload_supported([(0, false), (1, false), (2, false)])
+            .expect("dense-only offload should be supported");
+    }
+
+    #[test]
+    fn qwen35_offload_preflight_rejects_moe_before_destructive_work() {
+        let err = ensure_qwen35_moe_offload_supported([(0, false), (1, true), (2, false)])
+            .expect_err("MoE offload must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("MoE weight offload is not supported"));
+        assert!(message.contains("first MoE layer=1"));
+        assert!(message.contains("Refusing before moving any device weights"));
     }
 }

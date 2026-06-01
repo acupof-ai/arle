@@ -81,6 +81,13 @@ impl<M: ModelForward> Scheduler<M> {
         if incoming.delta_tx.is_closed() {
             return None;
         }
+        if incoming
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return None;
+        }
 
         let prompt_tokens = match incoming.prompt_tokens.take() {
             Some(tokens) if !tokens.is_empty() => tokens,
@@ -375,6 +382,13 @@ impl<M: ModelForward> Scheduler<M> {
                 break;
             };
             if incoming.delta_tx.is_closed() {
+                continue;
+            }
+            if incoming
+                .cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            {
                 continue;
             }
             let Some(prompt_tokens) = incoming.prompt_tokens.take() else {
@@ -690,8 +704,9 @@ impl<M: ModelForward> Scheduler<M> {
             session_id: incoming.session_id,
             ingress_numa_node: incoming.ingress_numa_node,
             trace_context: incoming.trace_context,
-            delta_tx: incoming.delta_tx,
             distributed: incoming.distributed,
+            cancel: incoming.cancel,
+            delta_tx: incoming.delta_tx,
             emit_cursor: super::super::request::EmitCursor::default(),
             phase: if waiting_fetch {
                 Phase::WaitingFetch
