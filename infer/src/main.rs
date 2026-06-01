@@ -491,7 +491,7 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                                 }
                             })
                             .ok();
-                        let req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
+                        let mut req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
                             wire,
                             delta_tx,
                         );
@@ -713,10 +713,14 @@ fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
     {
         use infer::distributed::expert_state::ExpertGroup;
         use infer::model::deepseek::{DeepseekModel, DeepseekRuntimeConfig};
+        use infer::model::{GenerationState, ModelForward};
         use infer::sampler::SamplingParams;
         use infer::tensor_parallel::TpConfig;
         use infer::tokenizer::Tokenizer;
+        use rand::{SeedableRng, rngs::StdRng};
         use serde::Serialize;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::{Barrier, Mutex};
 
         #[derive(Serialize)]
         struct DirectRankPerf {
