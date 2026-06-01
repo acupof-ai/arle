@@ -102,6 +102,16 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 - **Paged KV 池。** `page_size=16`,直接 GPU 页面挂载 + 共享前缀的尾页 CoW —— 计费可预期、共享前缀更便宜。
 - **统一的运行时权威。** `infer`、`arle`、OPD 训练共用同一套 Rust 运行时与模型契约 —— OPD teacher 就是生产服务用的同一个 runtime,不再分两套栈。
 
+<p align="center">
+  <img src="docs/assets/metal-prefix-reuse.png" alt="ARLE Metal 多轮前缀复用与长上下文首响应延迟" width="100%">
+</p>
+
+<p align="center">
+  <em>Apple Silicon,Qwen3.6-35B-A3B-4bit,c=1(单用户),第一手实测。
+  <strong>左:</strong>后续轮复用上一轮 KV —— 只 prefill 新增 token,TTFT 降 6.4×(2k 基底)到 18×(6k 基底)。
+  <strong>右:</strong>内存优先前缀缓存消除了长上下文首响应停顿(token1→token2 间隔缩小 56–68×)。</em>
+</p>
+
 架构详解:[docs/onboarding.md](docs/onboarding.md)（新人 30 分钟）· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
 
 ---
