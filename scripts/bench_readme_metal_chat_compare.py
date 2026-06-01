@@ -410,9 +410,16 @@ def plot_results(json_path: Path, png_path: Path, kind: str = "full") -> None:
     data = json.loads(json_path.read_text())
     lens = [int(n) for n in data["lens"]]
     xs = list(range(len(lens)))
-    labels = ["128", "256", "512", "1K", "2K", "4K", "8K", "12K"]
+    def fmt_len(n: int) -> str:
+        return f"{n // 1024}K" if n >= 1024 and n % 1024 == 0 else str(n)
+
+    labels = [fmt_len(n) for n in lens]
     colors = {"arle": "#E24A0A", "mlx_lm": "#1F6FB2"}
     names = {"arle": "ARLE", "mlx_lm": "mlx-lm"}
+    short_note = (
+        f"n={data['shape']['repeats']}; streaming chat; "
+        "steady TPOT excludes first decode interval; RSS is process high-water"
+    )
 
     def row(series: str, n: int) -> dict[str, Any]:
         return data["series"][series]["rows"][str(n)]["summary"]
@@ -468,6 +475,56 @@ def plot_results(json_path: Path, png_path: Path, kind: str = "full") -> None:
         plt.close(fig)
         return
 
+    if kind == "tpot-rss":
+        fig, axes = plt.subplots(1, 2, figsize=(10.6, 4.2), dpi=200)
+        panels = [
+            ("TPOT vs input length", "TPOT (ms/token)", "tpot_ms", True, False),
+            (
+                "Process RSS high-water",
+                "RSS high-water (GiB)",
+                "rss_request_peak_gib",
+                False,
+                True,
+            ),
+        ]
+        for ax, (title, ylabel, metric, yerr, cumulative) in zip(
+            axes, panels, strict=True
+        ):
+            for series in ("arle", "mlx_lm"):
+                vals = high_water(series, metric) if cumulative else means(series, metric)
+                err = stds(series, metric) if yerr else None
+                ax.errorbar(
+                    xs,
+                    vals,
+                    yerr=err,
+                    marker="o" if series == "arle" else "s",
+                    linewidth=2.0,
+                    markersize=4.0,
+                    capsize=3 if yerr else 0,
+                    color=colors[series],
+                    label=names[series],
+                )
+            ax.set_title(title, fontsize=11)
+            ax.set_ylabel(ylabel, fontsize=9)
+            ax.set_xlabel("Target input tokens", fontsize=9)
+            ax.set_xticks(xs, labels)
+            ax.grid(True, color="#d8d8d8", linewidth=0.6, alpha=0.8)
+            ax.tick_params(labelsize=8)
+            ax.legend(frameon=False, fontsize=8, loc="upper left")
+        fig.text(
+            0.5,
+            0.035,
+            short_note,
+            ha="center",
+            fontsize=8,
+            color="#666666",
+        )
+        fig.tight_layout(rect=(0, 0.06, 1, 1))
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(png_path)
+        plt.close(fig)
+        return
+
     fig, axes = plt.subplots(1, 3, figsize=(15.6, 4.25), dpi=200)
     panels = [
         ("TTFT vs input length", "TTFT (seconds)", "ttft_s", True, False),
@@ -504,7 +561,7 @@ def plot_results(json_path: Path, png_path: Path, kind: str = "full") -> None:
         ax.grid(True, color="#d8d8d8", linewidth=0.6, alpha=0.8)
         ax.tick_params(labelsize=8)
         ax.legend(frameon=False, fontsize=8, loc="upper left")
-    fig.text(0.5, 0.035, data["shape"]["note"], ha="center", fontsize=8, color="#666666")
+    fig.text(0.5, 0.035, short_note, ha="center", fontsize=8, color="#666666")
     fig.tight_layout(rect=(0, 0.06, 1, 1))
     png_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(png_path)
@@ -516,7 +573,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="/tmp/bench_readme_metal_chat_compare.json")
     parser.add_argument("--plot", default="")
     parser.add_argument("--plot-input", default="")
-    parser.add_argument("--plot-kind", choices=("full", "ttft"), default="full")
+    parser.add_argument("--plot-kind", choices=("full", "ttft", "tpot-rss"), default="full")
     parser.add_argument("--log-dir", default="/tmp/bench_readme_metal_chat_compare_logs")
     parser.add_argument("--backends", default="arle,mlx_lm")
     parser.add_argument("--repeats", type=int, default=3)
