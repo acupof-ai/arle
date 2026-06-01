@@ -80,6 +80,8 @@ pub struct DeepseekParallelConfig {
     pub tp_world_size: usize,
     pub ep_rank: usize,
     pub ep_world_size: usize,
+    pub axes: crate::tensor_parallel::MultiAxisConfig,
+    pub coord: crate::tensor_parallel::RankCoord,
 }
 
 #[cfg(feature = "cuda")]
@@ -287,6 +289,8 @@ pub fn load_deepseek_v4_components(
                 parallel.ep_world_size,
                 runtime.spec.n_routed_experts,
             )?;
+            runtime.axes = parallel.axes;
+            runtime.rank_coord = parallel.coord;
         }
         DeepseekModel::from_safetensors(model_path, runtime)
     })
