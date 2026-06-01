@@ -16,7 +16,9 @@
 //! `target/kv-parity-<model_basename>-<unix_ts>.json` and asserts each
 //! precision meets its gate (BF16 self = 100%, INT8 ≥ 99%, FP8 ≥ 95%,
 //! TQ4 ≥ 80%). TQ2 / TQ3 are report-only (env-gated via
-//! `KV_PARITY_INCLUDE_TQ23=1`).
+//! `KV_PARITY_INCLUDE_TQ23=1`). The default horizon is the full 64-token
+//! audit; use `KV_PARITY_PROFILE=smoke` for the old 4-token iteration smoke
+//! or set `KV_PARITY_MAX_TOKENS` explicitly.
 //!
 //! Skipped if `INFER_TEST_MODEL_PATH` is unset and the default
 //! `infer/models/Qwen3-4B` directory is missing (mirrors `greedy_consistency.rs`).
@@ -25,9 +27,12 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use log::info;
 use tokio::sync::mpsc;
+
+#[path = "support/kv_parity_config.rs"]
+mod kv_parity_config;
 
 use infer::metrics::ServerMetrics;
 use infer::model::{KVCacheDtype, KVFormat, ModelRuntimeConfig, Qwen3Model};
@@ -199,15 +204,8 @@ fn get_model_path() -> String {
     std::env::var("INFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())
 }
 
-fn max_tokens() -> usize {
-    // Default: 4 tokens, the snappy iteration grid. Override with
-    // KV_PARITY_MAX_TOKENS=16 for the cross-precision stress grid the
-    // wins entries cite, or 256 for the original FP8 KV Tier 1
-    // multi-page scale-drift gate (2026-05-05 anchor).
-    std::env::var("KV_PARITY_MAX_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4)
+fn max_tokens() -> Result<usize> {
+    kv_parity_config::max_tokens_from_env()
 }
 
 fn num_prompts() -> usize {
@@ -549,7 +547,7 @@ fn kv_precision_parity_audit() -> Result<()> {
         return Ok(());
     }
 
-    let tokens = max_tokens();
+    let tokens = max_tokens()?;
     let prompts: Vec<&str> = DEFAULT_PROMPTS
         .iter()
         .take(num_prompts())

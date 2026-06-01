@@ -1,7 +1,5 @@
 use super::nvtx_scopes::nvtx_scope;
-use super::{
-    FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, Scheduler, error, warn,
-};
+use super::{FinishReason, GenerationState, ModelForward, Phase, Scheduler, error, warn};
 use crate::model::{
     DecodeContextOps, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest,
     PrefillBatchRequest,
@@ -139,6 +137,10 @@ impl<M: ModelForward> Scheduler<M> {
                 self.finish_slot_client_closed(slot_idx);
                 continue;
             }
+            if req.is_cancelled() {
+                self.finish_slot_client_closed(slot_idx);
+                continue;
+            }
             if self.slot_is_runnable_decode(slot_idx) {
                 decode_slots.push(slot_idx);
             }
@@ -152,23 +154,7 @@ impl<M: ModelForward> Scheduler<M> {
                 .request_mut(slot_idx)
                 .expect("preempted decode slot must hold a request");
             let generated_tokens = victim.generated_tokens.len();
-            let requeue = IncomingRequest {
-                prompt: std::mem::take(&mut victim.prompt),
-                prompt_tokens: Some(std::mem::take(&mut victim.prompt_tokens)),
-                max_tokens: victim.max_tokens,
-                sampling: victim.sampling.clone(),
-                stop: victim.stop.take(),
-                speculative: victim.speculative.clone(),
-                priority: victim.priority,
-                session_id: victim.session_id.clone(),
-                ingress_numa_node: victim.ingress_numa_node,
-                trace_context: victim.trace_context,
-                delta_tx: victim.delta_tx.clone(),
-                distributed: victim.distributed.clone(),
-                // CUDA scheduler does not consume the cooperative cancel flag
-                // (HTTP path uses delta_tx close); requeue without it.
-                cancel: None,
-            };
+            let requeue = victim.take_for_preempt_requeue();
             victim.phase = Phase::Finished;
             (victim.id, generated_tokens, requeue)
         };
@@ -488,6 +474,10 @@ impl<M: ModelForward> Scheduler<M> {
                 continue;
             };
             if req.delta_tx.is_closed() {
+                self.finish_slot_client_closed(slot_idx);
+                continue;
+            }
+            if req.is_cancelled() {
                 self.finish_slot_client_closed(slot_idx);
                 continue;
             }

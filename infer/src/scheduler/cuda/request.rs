@@ -2,7 +2,10 @@ use fastrace::Span;
 use fastrace::collector::SpanContext;
 use log::warn;
 
-use super::{CompletionStreamDelta, FinishReason, RequestPriority, TokenUsage, Tokenizer, mpsc};
+use super::{
+    CompletionStreamDelta, FinishReason, IncomingRequest, RequestPriority, TokenUsage, Tokenizer,
+    mpsc,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct AbortReason {
@@ -321,6 +324,10 @@ pub(crate) struct ActiveRequest {
     pub(crate) trace_context: Option<SpanContext>,
     /// Per-request token coordinator for multi-rank HTTP serving.
     pub(crate) distributed: Option<crate::scheduler::DistributedRequestCoordination>,
+    /// Cooperative cancel flag forwarded from `IncomingRequest`.
+    /// Preserved across recompute preemption so Ctrl-C cancellation remains
+    /// visible after the request re-enters the waiting queue.
+    pub(crate) cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
     /// Streaming emit dispatch bookkeeping.
     pub(crate) emit_cursor: EmitCursor,
@@ -360,6 +367,30 @@ pub(crate) struct ActiveRequest {
 impl ActiveRequest {
     pub(crate) fn begin_trace_span(&self, name: &'static str) -> Option<Span> {
         self.trace_context.map(|parent| Span::root(name, parent))
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub(crate) fn take_for_preempt_requeue(&mut self) -> IncomingRequest {
+        IncomingRequest {
+            prompt: std::mem::take(&mut self.prompt),
+            prompt_tokens: Some(std::mem::take(&mut self.prompt_tokens)),
+            max_tokens: self.max_tokens,
+            sampling: self.sampling.clone(),
+            stop: self.stop.take(),
+            speculative: self.speculative.clone(),
+            priority: self.priority,
+            session_id: self.session_id.clone(),
+            ingress_numa_node: self.ingress_numa_node,
+            trace_context: self.trace_context,
+            delta_tx: self.delta_tx.clone(),
+            distributed: self.distributed.clone(),
+            cancel: self.cancel.clone(),
+        }
     }
 
     pub(crate) fn update_trace_context(&mut self, span: Option<&Span>) {
@@ -487,6 +518,7 @@ mod tests {
             ingress_numa_node: None,
             trace_context: None,
             distributed: None,
+            cancel: None,
             delta_tx,
             emit_cursor: EmitCursor::default(),
             phase: Phase::Finished,
@@ -554,5 +586,40 @@ mod tests {
         req.generated_tokens.push(42);
         req.mark_emit_dispatched();
         assert_eq!(req.stops_for_emit_dispatch(), None);
+    }
+
+    #[test]
+    fn active_request_observes_cooperative_cancel_flag() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut req = test_request("hello", vec![1, 2, 3]);
+        req.cancel = Some(flag.clone());
+
+        assert!(!req.is_cancelled());
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(req.is_cancelled());
+    }
+
+    #[test]
+    fn preempt_requeue_preserves_cooperative_cancel_flag() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut req = test_request("hello", vec![1, 2, 3]);
+        req.cancel = Some(flag.clone());
+
+        let incoming = req.take_for_preempt_requeue();
+
+        assert!(
+            incoming
+                .cancel
+                .as_ref()
+                .is_some_and(|c| std::sync::Arc::ptr_eq(c, &flag))
+        );
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            incoming
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        );
+        assert_eq!(incoming.prompt_tokens, Some(vec![1, 2, 3]));
     }
 }

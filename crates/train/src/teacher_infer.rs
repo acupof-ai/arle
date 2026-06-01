@@ -936,6 +936,32 @@ mod tests {
     }
 
     #[test]
+    fn api_teacher_accepts_multitoken_full_sequence_logits() -> Result<()> {
+        let logits = (0..12).map(|i| i as f32).collect::<Vec<_>>();
+        let response = ApiTeacherResponse {
+            shape: vec![3, 4],
+            dtype: "f32".to_owned(),
+            logits: Some(logits.clone()),
+            logits_b64: None,
+        };
+
+        let shape = normalize_api_teacher_shape(&response.shape, 3, 4)?;
+        let decoded = decode_api_teacher_logits(&response, shape_size(&shape))?;
+
+        assert_eq!(shape, vec![1, 3, 4]);
+        assert_eq!(decoded, logits);
+        Ok(())
+    }
+
+    #[test]
+    fn api_teacher_rejects_last_row_shape_for_multitoken_sequence() {
+        let err = normalize_api_teacher_shape(&[1, 4], 3, 4)
+            .expect_err("last-row logits must not masquerade as full sequence logits");
+        assert!(err.to_string().contains("shape mismatch"));
+        assert!(err.to_string().contains("seq_len=3"));
+    }
+
+    #[test]
     fn api_teacher_decodes_bf16_base64_logits() -> Result<()> {
         let values = [
             bf16::from_f32(1.25),
