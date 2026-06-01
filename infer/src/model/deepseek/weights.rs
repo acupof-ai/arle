@@ -3955,9 +3955,13 @@ impl DeepseekModel {
         };
         dsv4_trace_end(&self.ctx, "ffn_pre_norm", layer_idx, stream.seq_len, trace)?;
         let deepep_requested = dsv4_moe_deepep_enabled()?;
-        // DSv4 defaults to the DeepEP-style dispatch/combine route. Operators
-        // can still force the legacy local-routed + EP all-reduce path with
-        // ARLE_DSV4_MOE_BACKEND=allreduce while DeepEP LL integration closes.
+        // DSv4's current TP/EP serving path keeps the same token rows on every
+        // rank, then reduces per-rank expert contributions. DeepEP dispatch /
+        // combine is only correct as the default once the caller owns distinct
+        // token rows per EP rank; otherwise each rank dispatches the full
+        // prompt and combine pays a top-k fanout multiplier. Keep DeepEP as an
+        // explicit experimental transport and default to local experts +
+        // expert all-reduce.
         let use_deepep = deepep_requested && self.config.ep.world_size > 1;
         let routed = if use_deepep {
             #[cfg(feature = "nccl")]
@@ -3965,6 +3969,20 @@ impl DeepseekModel {
                 let native_deepep_active = dsv4_native_deepep_enabled()?
                     && self.layer_communicator.native_deepep().is_some()
                     && moe_scratch.is_some();
+                if native_deepep_active
+                    && self.config.tp.world_size > 1
+                    && self.config.tp.world_size == self.config.ep.world_size
+                    && !dsv4_native_deepep_replicated_tokens_unsafe_enabled()
+                {
+                    bail!(
+                        "ARLE_DSV4_MOE_BACKEND=native-deepep is not a correct default for \
+                         DSv4 replicated-token TP/EP (tp_world={} ep_world={}); use \
+                         ARLE_DSV4_MOE_BACKEND=allreduce or set \
+                         ARLE_DSV4_NATIVE_DEEPEP_REPLICATED_TOKENS_UNSAFE=1 for trace-only experiments",
+                        self.config.tp.world_size,
+                        self.config.ep.world_size
+                    );
+                }
                 let trace = dsv4_trace_begin(&self.ctx)?;
                 let routed = if native_deepep_active {
                     let scratch = moe_scratch
@@ -6350,24 +6368,21 @@ fn dsv4_gpu_contextual_logits_enabled() -> Result<bool> {
 #[cfg(feature = "cuda")]
 fn dsv4_moe_deepep_enabled() -> Result<bool> {
     let Some(raw) = std::env::var("ARLE_DSV4_MOE_BACKEND").ok() else {
-        return Ok(true);
+        return Ok(false);
     };
     // `native-deepep` shares the `Ok(true)` body with the dispatch group but is
     // kept as its own arm so the Phase B-3.2 boot-semantics doc below stays
     // attached to it — merging would orphan that comment.
     #[allow(clippy::match_same_arms)]
-    match raw.to_ascii_lowercase().as_str() {
-        "" | "deepep" | "dispatch" | "dispatch_combine" | "deepep_unsafe" | "unsafe_deepep"
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => Ok(false),
+        "deepep" | "dispatch" | "dispatch_combine" | "deepep_unsafe" | "unsafe_deepep"
         | "dispatch_unsafe" => Ok(true),
-        "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => Ok(false),
         // Phase B-3.2 — native-deepep now boots a real DeepEP Buffer
         // via crates/deepep-sys (see dsv4_native_deepep_enabled below).
-        // The forward-path replacement (Buffer::dispatch + local experts
-        // + Buffer::combine, B-3.3) is still pending — until it lands,
-        // the actual dispatch/combine code path is the legacy NCCL
-        // DeepEP-style fallback even when this returns true. The Buffer
-        // boot itself proves the NativeDeepEp::boot → Buffer::sync
-        // round-trip on the production model-load path.
+        // It remains opt-in because the current DSv4 server path replicates
+        // token rows across TP/EP ranks; correct defaulting requires a
+        // token-owned EP caller.
         "native-deepep" | "native_deepep" => Ok(true),
         _ => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{raw}`"),
     }
@@ -6382,9 +6397,21 @@ fn dsv4_native_deepep_enabled() -> Result<bool> {
         return Ok(false);
     };
     Ok(matches!(
-        raw.to_ascii_lowercase().as_str(),
+        raw.trim().to_ascii_lowercase().as_str(),
         "native-deepep" | "native_deepep"
     ))
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_native_deepep_replicated_tokens_unsafe_enabled() -> bool {
+    std::env::var("ARLE_DSV4_NATIVE_DEEPEP_REPLICATED_TOKENS_UNSAFE")
+        .map(|raw| {
+            matches!(
+                raw.as_str(),
+                "1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
