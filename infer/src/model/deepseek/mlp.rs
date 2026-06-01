@@ -2670,6 +2670,7 @@ impl DeepseekV4MoeBlock {
         expert_weight: &CudaSlice<f32>,
         local_offsets: &CudaSlice<i32>,
         local_counts: &CudaSlice<i32>,
+        local_counts_host: Option<&[i32]>,
         route_capacity: usize,
         route_out: &mut HiddenStates,
         scratch_cache: &mut DeepseekMoeRuntimeCache,
@@ -2677,6 +2678,44 @@ impl DeepseekV4MoeBlock {
         if route_capacity == 0 || self.experts.is_empty() {
             return Ok(());
         }
+        let max_local_routes = if let Some(counts) = local_counts_host {
+            ensure!(
+                counts.len() == self.experts.len(),
+                "DeepSeek V4 DeepGEMM all-expert count length mismatch: counts={} experts={}",
+                counts.len(),
+                self.experts.len()
+            );
+            let mut total = 0usize;
+            let mut max_count = 0usize;
+            for (expert_idx, &count) in counts.iter().enumerate() {
+                ensure!(
+                    count >= 0,
+                    "DeepSeek V4 DeepGEMM all-expert count for expert {} is negative: {}",
+                    expert_idx,
+                    count
+                );
+                let count = usize::try_from(count)
+                    .map_err(|_| anyhow::anyhow!("DeepSeek V4 DeepGEMM count conversion failed"))?;
+                total = total.checked_add(count).ok_or_else(|| {
+                    anyhow::anyhow!("DeepSeek V4 DeepGEMM route count sum overflows usize")
+                })?;
+                max_count = max_count.max(count);
+            }
+            ensure!(
+                total == route_capacity,
+                "DeepSeek V4 DeepGEMM all-expert route count mismatch: host sum={} route_capacity={}",
+                total,
+                route_capacity
+            );
+            max_count
+        } else {
+            route_capacity
+        };
+        ensure!(
+            max_local_routes > 0,
+            "DeepSeek V4 DeepGEMM all-expert route count is zero while route_capacity={}",
+            route_capacity
+        );
         let first = &self.experts[0];
         let scratch = scratch_cache.ensure_grouped_expert_scratch(
             ctx,
@@ -2721,9 +2760,9 @@ impl DeepseekV4MoeBlock {
             expert_weight,
             &active_owned,
             &all_experts,
-            None,
+            local_counts_host,
             route_capacity,
-            route_capacity,
+            max_local_routes,
             route_out,
             scratch,
         );
@@ -4125,6 +4164,7 @@ impl DeepseekV4MoeBlock {
                         &scratch.expert_weight,
                         local_offsets_gpu,
                         local_counts,
+                        None,
                         total_recv_routes,
                         route_out,
                         &mut device_grouped_cache,
@@ -5291,6 +5331,7 @@ impl DeepseekV4MoeBlock {
                     &scratch.packed_weight,
                     &scratch.local_offsets,
                     &scratch.local_counts,
+                    Some(&counts_host),
                     total_local_routes,
                     &mut scratch.expert_out,
                     &mut device_grouped_cache,
