@@ -536,6 +536,23 @@ fn chat_completion_accepts_tool_choice_function_form() {
 }
 
 #[test]
+fn chat_tool_choice_function_type_must_be_function() {
+    let req: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"shell"}}],
+            "tool_choice":{"type":"web_search","function":{"name":"shell"}}
+        }"#,
+    )
+    .unwrap();
+    let err = req
+        .validate()
+        .expect_err("forced tool_choice type must be function");
+    assert_eq!(err.body.code, "invalid_parameter");
+    assert_eq!(err.body.param.as_deref(), Some("tool_choice.type"));
+}
+
+#[test]
 fn chat_completion_accepts_response_format_json_object() {
     let raw = r#"{
         "messages":[{"role":"user","content":"hi"}],
@@ -620,6 +637,42 @@ fn chat_tool_choice_function_name_not_in_tools_is_rejected() {
     assert_eq!(err.body.code, "invalid_parameter");
     assert_eq!(err.body.param.as_deref(), Some("tool_choice.function.name"));
     assert!(err.body.message.contains("weather"));
+}
+
+#[test]
+fn chat_dsv4_rejects_required_tool_choice() {
+    let req: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"shell"}}],
+            "tool_choice":"required"
+        }"#,
+    )
+    .unwrap();
+    let err = req
+        .validate_for_model("DeepSeek-V4-Flash")
+        .expect_err("DSv4 cannot enforce required tool_choice");
+    assert_eq!(err.body.code, "invalid_parameter");
+    assert_eq!(err.body.param.as_deref(), Some("tool_choice"));
+    assert!(err.body.message.contains("DeepSeek-V4"));
+}
+
+#[test]
+fn chat_dsv4_rejects_forced_function_tool_choice() {
+    let req: ChatCompletionRequest = serde_json::from_str(
+        r#"{
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"shell"}}],
+            "tool_choice":{"type":"function","function":{"name":"shell"}}
+        }"#,
+    )
+    .unwrap();
+    let err = req
+        .validate_for_model("dsv4")
+        .expect_err("DSv4 cannot enforce forced function tool_choice");
+    assert_eq!(err.body.code, "invalid_parameter");
+    assert_eq!(err.body.param.as_deref(), Some("tool_choice"));
+    assert!(err.body.message.contains("DeepSeek-V4"));
 }
 
 #[test]

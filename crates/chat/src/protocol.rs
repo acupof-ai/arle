@@ -54,6 +54,16 @@ const TOOL_CALL_BLOCK: TaggedBlock = TaggedBlock {
     close: "</tool_call>",
 };
 
+const DSML_TOOL_CALLS_BLOCK: TaggedBlock = TaggedBlock {
+    open: "<｜DSML｜tool_calls>",
+    close: "</｜DSML｜tool_calls>",
+};
+
+const DSML_INVOKE_OPEN: &str = "<｜DSML｜invoke";
+const DSML_INVOKE_CLOSE: &str = "</｜DSML｜invoke>";
+const DSML_PARAMETER_OPEN: &str = "<｜DSML｜parameter";
+const DSML_PARAMETER_CLOSE: &str = "</｜DSML｜parameter>";
+
 const THINK_BLOCK: TaggedBlock = TaggedBlock {
     open: "<think>",
     close: "</think>",
@@ -62,6 +72,7 @@ const THINK_BLOCK: TaggedBlock = TaggedBlock {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HiddenBlock {
     ToolCall,
+    DsmlToolCalls,
     Think,
 }
 
@@ -91,9 +102,11 @@ impl VisibleTextStream {
         loop {
             match self.hidden {
                 None => {
-                    const VISIBLE_TAGS: [&str; 4] = [
+                    const VISIBLE_TAGS: [&str; 6] = [
                         TOOL_CALL_BLOCK.open,
                         TOOL_CALL_BLOCK.close,
+                        DSML_TOOL_CALLS_BLOCK.open,
+                        DSML_TOOL_CALLS_BLOCK.close,
                         THINK_BLOCK.open,
                         THINK_BLOCK.close,
                     ];
@@ -114,6 +127,9 @@ impl VisibleTextStream {
                     self.pending.drain(..idx + tag.len());
                     self.hidden = match tag {
                         tag if tag == TOOL_CALL_BLOCK.open => Some(HiddenBlock::ToolCall),
+                        tag if tag == DSML_TOOL_CALLS_BLOCK.open => {
+                            Some(HiddenBlock::DsmlToolCalls)
+                        }
                         tag if tag == THINK_BLOCK.open => Some(HiddenBlock::Think),
                         _ => None,
                     };
@@ -129,6 +145,25 @@ impl VisibleTextStream {
                     } else {
                         let keep =
                             longest_tag_prefix_suffix(&self.pending, &[TOOL_CALL_BLOCK.close]);
+                        let drop_len = self.pending.len().saturating_sub(keep);
+                        self.pending.drain(..drop_len);
+                        break;
+                    }
+                }
+                Some(HiddenBlock::DsmlToolCalls) => {
+                    if let Some(idx) = self.pending.find(DSML_TOOL_CALLS_BLOCK.close) {
+                        self.pending
+                            .drain(..idx + DSML_TOOL_CALLS_BLOCK.close.len());
+                        self.hidden = None;
+                    } else if flush {
+                        self.pending.clear();
+                        self.hidden = None;
+                        break;
+                    } else {
+                        let keep = longest_tag_prefix_suffix(
+                            &self.pending,
+                            &[DSML_TOOL_CALLS_BLOCK.close],
+                        );
                         let drop_len = self.pending.len().saturating_sub(keep);
                         self.pending.drain(..drop_len);
                         break;
@@ -190,9 +225,11 @@ impl StreamingToolCalls {
         loop {
             match self.hidden {
                 None => {
-                    const VISIBLE_TAGS: [&str; 4] = [
+                    const VISIBLE_TAGS: [&str; 6] = [
                         TOOL_CALL_BLOCK.open,
                         TOOL_CALL_BLOCK.close,
+                        DSML_TOOL_CALLS_BLOCK.open,
+                        DSML_TOOL_CALLS_BLOCK.close,
                         THINK_BLOCK.open,
                         THINK_BLOCK.close,
                     ];
@@ -213,6 +250,9 @@ impl StreamingToolCalls {
                     self.pending.drain(..idx + tag.len());
                     self.hidden = match tag {
                         tag if tag == TOOL_CALL_BLOCK.open => Some(HiddenBlock::ToolCall),
+                        tag if tag == DSML_TOOL_CALLS_BLOCK.open => {
+                            Some(HiddenBlock::DsmlToolCalls)
+                        }
                         tag if tag == THINK_BLOCK.open => Some(HiddenBlock::Think),
                         _ => None,
                     };
@@ -227,7 +267,13 @@ impl StreamingToolCalls {
                         self.pending.drain(..idx + TOOL_CALL_BLOCK.close.len());
                         self.hidden = None;
                     } else if flush {
-                        // Unterminated tool_call block: drop it.
+                        // Missing `</tool_call>` is common enough in model
+                        // output; execute complete JSON/native payloads but
+                        // still drop malformed partial blocks.
+                        self.tool_buf.push_str(&self.pending);
+                        if let Some(call) = parse_streaming_tool_call_block(self.tool_buf.trim()) {
+                            calls.push(call);
+                        }
                         self.pending.clear();
                         self.tool_buf.clear();
                         self.hidden = None;
@@ -235,6 +281,32 @@ impl StreamingToolCalls {
                     } else {
                         let keep =
                             longest_tag_prefix_suffix(&self.pending, &[TOOL_CALL_BLOCK.close]);
+                        let take_len = self.pending.len().saturating_sub(keep);
+                        self.tool_buf.push_str(&self.pending[..take_len]);
+                        self.pending.drain(..take_len);
+                        break;
+                    }
+                }
+                Some(HiddenBlock::DsmlToolCalls) => {
+                    if let Some(idx) = self.pending.find(DSML_TOOL_CALLS_BLOCK.close) {
+                        self.tool_buf.push_str(&self.pending[..idx]);
+                        calls.extend(parse_dsml_tool_calls_block(self.tool_buf.trim()));
+                        self.tool_buf.clear();
+                        self.pending
+                            .drain(..idx + DSML_TOOL_CALLS_BLOCK.close.len());
+                        self.hidden = None;
+                    } else if flush {
+                        self.tool_buf.push_str(&self.pending);
+                        calls.extend(parse_dsml_tool_calls_block(self.tool_buf.trim()));
+                        self.pending.clear();
+                        self.tool_buf.clear();
+                        self.hidden = None;
+                        break;
+                    } else {
+                        let keep = longest_tag_prefix_suffix(
+                            &self.pending,
+                            &[DSML_TOOL_CALLS_BLOCK.close],
+                        );
                         let take_len = self.pending.len().saturating_sub(keep);
                         self.tool_buf.push_str(&self.pending[..take_len]);
                         self.pending.drain(..take_len);
@@ -298,6 +370,78 @@ fn parse_streaming_tool_call_block(inner: &str) -> Option<ToolCall> {
     }
     let json_len = json_object_len(&inner[json_start..])?;
     parse_tool_call_block(&inner[json_start..json_start + json_len])
+}
+
+fn parse_dsml_tool_calls_block(inner: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    let mut rest = inner;
+
+    while let Some(invoke_start) = rest.find(DSML_INVOKE_OPEN) {
+        let after_open = &rest[invoke_start + DSML_INVOKE_OPEN.len()..];
+        let Some(tag_end) = after_open.find('>') else {
+            break;
+        };
+        let attrs = &after_open[..tag_end];
+        let body_start = tag_end + 1;
+        let body_and_tail = &after_open[body_start..];
+        let Some(invoke_end) = body_and_tail.find(DSML_INVOKE_CLOSE) else {
+            break;
+        };
+
+        if let Some(call) = parse_dsml_invoke_block(attrs, &body_and_tail[..invoke_end]) {
+            calls.push(call);
+        }
+        rest = &body_and_tail[invoke_end + DSML_INVOKE_CLOSE.len()..];
+    }
+
+    calls
+}
+
+fn parse_dsml_invoke_block(attrs: &str, body: &str) -> Option<ToolCall> {
+    let name = quoted_attr_value(attrs, "name")?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut args = Map::new();
+    let mut rest = body;
+    while let Some(param_start) = rest.find(DSML_PARAMETER_OPEN) {
+        let after_open = &rest[param_start + DSML_PARAMETER_OPEN.len()..];
+        let Some(tag_end) = after_open.find('>') else {
+            break;
+        };
+        let attrs = &after_open[..tag_end];
+        let value_start = tag_end + 1;
+        let value_and_tail = &after_open[value_start..];
+        let Some(param_end) = value_and_tail.find(DSML_PARAMETER_CLOSE) else {
+            break;
+        };
+
+        if let Some(key) = quoted_attr_value(attrs, "name").filter(|key| !key.trim().is_empty()) {
+            let key = key.trim().to_string();
+            let raw = value_and_tail[..param_end].trim();
+            let is_string = quoted_attr_value(attrs, "string").as_deref() != Some("false");
+            let value = if is_string {
+                Value::String(raw.to_string())
+            } else {
+                serde_json::from_str::<Value>(raw)
+                    .unwrap_or_else(|_| Value::String(raw.to_string()))
+            };
+            args.insert(key, value);
+        }
+
+        rest = &value_and_tail[param_end + DSML_PARAMETER_CLOSE.len()..];
+    }
+
+    Some(ToolCall::new(name, Value::Object(args)))
+}
+
+fn quoted_attr_value(attrs: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=\"");
+    let start = attrs.find(&needle)? + needle.len();
+    let tail = &attrs[start..];
+    let end = tail.find('"')?;
+    Some(tail[..end].to_string())
 }
 
 fn find_first_tag<'a>(text: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
@@ -831,15 +975,28 @@ pub fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
 /// leaked — a partial tool call can't be executed anyway. Returns the text with
 /// every tool-call span removed, plus the parsed calls.
 fn extract_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
-    if !text.contains(TOOL_CALL_BLOCK.open) {
+    if !text.contains(TOOL_CALL_BLOCK.open) && !text.contains(DSML_TOOL_CALLS_BLOCK.open) {
         return (text.to_string(), Vec::new());
     }
     let mut out = String::with_capacity(text.len());
     let mut calls = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find(TOOL_CALL_BLOCK.open) {
+    while let Some((start, tag)) =
+        find_first_tag(rest, &[TOOL_CALL_BLOCK.open, DSML_TOOL_CALLS_BLOCK.open])
+    {
         out.push_str(&rest[..start]);
-        let after = &rest[start + TOOL_CALL_BLOCK.open.len()..];
+        let after = &rest[start + tag.len()..];
+
+        if tag == DSML_TOOL_CALLS_BLOCK.open {
+            if let Some(end) = after.find(DSML_TOOL_CALLS_BLOCK.close) {
+                calls.extend(parse_dsml_tool_calls_block(after[..end].trim()));
+                rest = &after[end + DSML_TOOL_CALLS_BLOCK.close.len()..];
+            } else {
+                calls.extend(parse_dsml_tool_calls_block(after.trim()));
+                rest = "";
+            }
+            continue;
+        }
 
         // Qwen3.6 NATIVE form: <tool_call><function=NAME><parameter=K>V</parameter>…</function>.
         // Try it first when `<function=` is the first meaningful content.
@@ -1251,6 +1408,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_call_deepseek_dsml_format() {
+        let parsed = parse_tool_calls(
+            "Before <｜DSML｜tool_calls>
+<｜DSML｜invoke name=\"shell\">
+<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>
+<｜DSML｜parameter name=\"count\" string=\"false\">2</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls> after",
+        );
+
+        assert_eq!(parsed.content, "Before  after");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].arguments["command"], "pwd");
+        assert_eq!(parsed.tool_calls[0].arguments["count"], 2);
+    }
+
+    #[test]
     fn parse_strips_think_blocks() {
         let parsed = parse_tool_calls("<think>\nI should check.\n</think>\nHere is the answer.");
         assert!(parsed.tool_calls.is_empty());
@@ -1379,6 +1554,54 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].arguments["command"], "ls -la");
+    }
+
+    #[test]
+    fn streaming_tool_calls_missing_close_json_is_parsed_on_finish() {
+        let mut stream = StreamingToolCalls::default();
+        let (visible, calls) = drive_streaming(
+            &mut stream,
+            &["<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}"],
+        );
+
+        assert_eq!(visible, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+    }
+
+    #[test]
+    fn streaming_tool_calls_missing_close_native_xml_is_parsed_on_finish() {
+        let mut stream = StreamingToolCalls::default();
+        let (visible, calls) = drive_streaming(
+            &mut stream,
+            &["<tool_call><function=shell><parameter=command>pwd</parameter></function>"],
+        );
+
+        assert_eq!(visible, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+    }
+
+    #[test]
+    fn streaming_tool_calls_deepseek_dsml_split_across_chunks() {
+        let mut stream = StreamingToolCalls::default();
+        let (visible, calls) = drive_streaming(
+            &mut stream,
+            &[
+                "Checking <｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"shell\">\n",
+                "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n",
+                "<｜DSML｜parameter name=\"count\" string=\"false\">2</｜DSML｜parameter>\n",
+                "</｜DSML｜invoke>\n</｜DSML｜tool_calls> done",
+            ],
+        );
+
+        assert_eq!(visible, "Checking  done");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+        assert_eq!(calls[0].arguments["count"], 2);
     }
 
     #[test]

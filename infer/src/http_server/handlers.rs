@@ -768,9 +768,8 @@ fn build_chat_prompt(model_id: &str, req: &ChatCompletionRequest) -> String {
             thinking: kwargs.and_then(|value| value.thinking).unwrap_or(false),
             reasoning_effort: kwargs.and_then(|value| value.reasoning_effort.clone()),
         };
-        // The DeepSeek-V4 prompt builder has no force-tool directive surface;
-        // honor `none` by withholding the tools block, leave Auto/Required/
-        // Function on Auto-equivalent behavior.
+        // DeepSeek-V4 has no force-tool directive surface. Validation rejects
+        // Required/Function; here we only distinguish Auto from None.
         let tools: &[chat::OpenAiToolDefinition] = if matches!(choice, chat::ToolChoiceMode::None) {
             &[]
         } else {
@@ -884,6 +883,7 @@ struct ChatToolStreamState {
     extractor: StreamingToolCalls,
     tool_index: usize,
     saw_tool_call: bool,
+    emit_tool_calls: bool,
 }
 
 impl ChatToolStreamState {
@@ -926,17 +926,19 @@ impl ChatToolStreamState {
             );
             events.push(self.encode(&chunk));
         }
-        for call in &calls {
-            let chunk = ChatStreamChunk::tool_call_chunk(
-                &self.request_id,
-                self.created,
-                &self.model,
-                self.tool_index,
-                call,
-            );
-            self.tool_index += 1;
-            self.saw_tool_call = true;
-            events.push(self.encode(&chunk));
+        if self.emit_tool_calls {
+            for call in &calls {
+                let chunk = ChatStreamChunk::tool_call_chunk(
+                    &self.request_id,
+                    self.created,
+                    &self.model,
+                    self.tool_index,
+                    call,
+                );
+                self.tool_index += 1;
+                self.saw_tool_call = true;
+                events.push(self.encode(&chunk));
+            }
         }
 
         if is_terminal {
@@ -951,17 +953,19 @@ impl ChatToolStreamState {
                 );
                 events.push(self.encode(&chunk));
             }
-            for call in &tail_calls {
-                let chunk = ChatStreamChunk::tool_call_chunk(
-                    &self.request_id,
-                    self.created,
-                    &self.model,
-                    self.tool_index,
-                    call,
-                );
-                self.tool_index += 1;
-                self.saw_tool_call = true;
-                events.push(self.encode(&chunk));
+            if self.emit_tool_calls {
+                for call in &tail_calls {
+                    let chunk = ChatStreamChunk::tool_call_chunk(
+                        &self.request_id,
+                        self.created,
+                        &self.model,
+                        self.tool_index,
+                        call,
+                    );
+                    self.tool_index += 1;
+                    self.saw_tool_call = true;
+                    events.push(self.encode(&chunk));
+                }
             }
 
             let finish_reason = if self.saw_tool_call {
@@ -1288,7 +1292,8 @@ pub(super) async fn chat_completions(
         let continuous_usage_stats = options.continuous_usage_stats;
         let tool_choice = req.tool_choice_mode();
         let has_tools = !req.tools.is_empty();
-        let stream_tools_enabled = has_tools && !matches!(&tool_choice, chat::ToolChoiceMode::None);
+        let emit_stream_tool_calls =
+            has_tools && !matches!(&tool_choice, chat::ToolChoiceMode::None);
 
         let prompt = build_chat_prompt(&model_id, &req);
 
@@ -1330,13 +1335,13 @@ pub(super) async fn chat_completions(
 
             let req_id = request_id;
             let mid = model_id.clone();
-            // Gate on effective tool availability: tool_choice=none withholds
-            // tools from the prompt and must not post-process hallucinated
-            // tool_call blocks into OpenAI tool-call deltas.
+            // Any request carrying tools gets hidden-block filtering. With
+            // tool_choice=none we suppress deltas but still strip hallucinated
+            // tool-call markup so raw protocol text never reaches the user.
             let content_stream: futures_util::stream::BoxStream<
                 'static,
                 Result<Event, Infallible>,
-            > = if stream_tools_enabled {
+            > = if has_tools {
                 let state = ChatToolStreamState {
                     request_id: req_id,
                     created,
@@ -1346,6 +1351,7 @@ pub(super) async fn chat_completions(
                     extractor: StreamingToolCalls::default(),
                     tool_index: 0,
                     saw_tool_call: false,
+                    emit_tool_calls: emit_stream_tool_calls,
                 };
                 UnboundedReceiverStream::new(delta_rx)
                     .scan(state, |state, delta| {
