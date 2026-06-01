@@ -103,13 +103,13 @@ Agent and RL workloads waste compute re-processing the same prompt + history + t
 - **One runtime, three surfaces.** Serving, the local agent, and OPD training all run on the same Rust + model code. The OPD teacher *is* the production server.
 
 <p align="center">
-  <img src="docs/assets/metal-prefix-reuse.png" alt="ARLE Metal multi-turn prefix reuse and long-context first-response latency" width="100%">
+  <img src="docs/assets/metal-vs-mlxlm-e2e.png" alt="ARLE Metal vs mlx-lm multi-turn end-to-end latency" width="100%">
 </p>
 
 <p align="center">
-  <em>Apple Silicon, Qwen3.6-35B-A3B-4bit, c=1 (single user), measured first-hand.
-  <strong>Left:</strong> a follow-up turn reuses the prior turn's KV — TTFT drops 6.4× (2k base) to 18× (6k base), since only the new tokens are prefilled.
-  <strong>Right:</strong> the memory-first prefix cache removes the long-context first-response stall (56–68× smaller token1→token2 gap).</em>
+  <em>Apple Silicon, Qwen3.6-35B-A3B-4bit, c=1 (single user), measured first-hand against <code>mlx_lm.server</code> on the same model.
+  Multi-turn agent shape: turn 1 is a cold full prefill; turn 2 extends the prior turn, so both runtimes reuse the cached prefix and only prefill the new tokens.
+  <strong>Result: end-to-end parity</strong> — ARLE matches mlx-lm both cold (2.5 vs 2.3 s @2k, 7.1 vs 7.0 s @6k) and on the reused turn (sub-second both). The win was internal: a memory-first prefix cache removed a long-context first-response stall that previously made ARLE ~4× slower here (token1→token2 gap 29.6 s → 0.43 s @8k).</em>
 </p>
 
 ```mermaid

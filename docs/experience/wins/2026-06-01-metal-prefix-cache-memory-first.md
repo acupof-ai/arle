@@ -137,3 +137,27 @@ gate's actual decisions before claiming it filters anything.
 
 Cross-link: root cause from the earlier instrumented session; supersedes the
 replay-based disk publish in `2026-05-08-bench-m_e13-ssd-persistence-c1-win.md`.
+
+## End-to-end A/B vs mlx-lm (added 2026-06-01, sequential single-model, first-hand)
+Fair multi-turn comparison on the same model (Qwen3.6-35B-A3B-4bit, c=1): turn1 =
+cold full prefill, turn2 = strict prefix-extension of turn1. ARLE `metal_serve`
+and `mlx_lm.server` run sequentially (one 19 GB model resident at a time, RAM
+watchdog), same client, e2e = wall-clock to 32 output tokens.
+
+| shape | ARLE turn1 e2e | mlx turn1 e2e | ARLE turn2 e2e | mlx turn2 e2e |
+|---|---|---|---|---|
+| 2k base | 2.54 s | 2.26 s | 0.70 s | 0.49 s |
+| 6k base | 7.11 s | 6.95 s | 0.77 s | 0.91 s |
+
+**Two honest conclusions:**
+1. **mlx-lm has prompt-prefix caching ON by default** — its server log shows
+   `Prompt Cache: N sequences` growing and turn2 processing only `209/210` new
+   tokens (not the full 2054). So "prefix reuse across turns" is NOT an
+   ARLE-exclusive advantage; both runtimes do it. An earlier README figure that
+   showed ARLE turn1-vs-turn2 implied exclusivity — replaced with this fair A/B
+   figure (`docs/assets/metal-vs-mlxlm-e2e.png`).
+2. **The fix achieved e2e parity, which was the real goal.** Before it, the
+   long-context first-response stall made ARLE ~4× slower on exactly this
+   multi-turn shape; after, ARLE matches mlx-lm cold and on the reused turn
+   (within noise either direction). The win is "caught up to the reference," not
+   "beat it" — stated plainly per §0.
