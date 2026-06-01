@@ -2,64 +2,50 @@
 
 ## TL;DR
 
-The README chart now reports **process RSS high-water** for the whole request
-run. In the 2026-06-01 retest after `71494395`, ARLE reached **11.44-15.47
-GiB** and mlx-lm stayed around **7.23-7.24 GiB**.
+The README chart now uses **cumulative process RSS high-water** from the same
+n=5 ARLE-vs-mlx-lm run. On 2026-06-01 that is:
 
-The older **2.2 GiB** and **2.5-4.1 GiB** ARLE numbers were request-window
-current-RSS samples. They are useful for explaining macOS / MLX residency
-accounting, but they are not the headline memory number for the README chart.
-
-| Measurement | ARLE | mlx-lm | Meaning |
+| Metric | ARLE | mlx-lm | Meaning |
 |---|---:|---:|---|
-| request current RSS, old sweep | 2.5-4.1 GiB | 7.23-7.24 GiB | sampled during streaming; can miss prior high-water pages |
-| process RSS high-water, current README sweep | 11.44-15.47 GiB | 7.23-7.24 GiB | conservative process-level peak for the run |
+| README RSS high-water | 14.54 -> 17.41 GiB | 14.79 -> 14.81 GiB | conservative process RSS peak by target prompt length |
+| raw per-request RSS peak at ARLE 12k | 2.31-15.04 GiB | 14.72-14.77 GiB | current residency can fall after macOS reclaim |
 
-## What The Low Number Meant
+The low ARLE samples are real process RSS samples, but they are **not** proof
+that the full Qwen3.6 model footprint is 2-3 GiB.
 
-The old sweep sampled:
+## Why RSS Can Look Small
 
-```python
-psutil.Process(pid).memory_info().rss
-```
+ARLE loads Qwen3.6 through MLX mmap-backed arrays. With no explicit wired limit,
+macOS can reclaim or re-account non-wired mmap / Metal-managed pages after the
+weights have been faulted and used. That changes current process RSS without
+unloading the model or making inference impossible.
 
-during each streaming request. On Apple unified memory, that current RSS sample
-does not mean the full model consumes only that amount of physical memory.
+This is why the same n=5 run can show ARLE request-window RSS falling at 12k
+while the server still completes 256-token generations. Current RSS is
+residency accounting, not model-size accounting.
 
-The model was still loaded and addressable:
+## Why The README Uses High-Water
 
-- ARLE loaded Qwen3.6 safetensors through MLX mmap-backed arrays.
-- `metal_serve` no longer pinned MLX pages by default with `set_wired_limit`.
-- macOS can reclaim or re-account non-wired mmap / Metal-managed pages.
-- c=1 decode keeps a small KV working set, and Qwen3.6 MoE touches sparse
-  expert subsets per token.
+High-water is the safer README metric because it answers: "how much process RSS
+did this run touch at least once?" It does not let later reclaim turn a memory
+panel into a fake 12k memory reduction.
 
-So the low RSS result was a residency/accounting observation, not proof of a
-2-4 GiB total model footprint.
-
-## Current README Reading
-
-The current chart uses process RSS high-water because it is harder to
-misinterpret. It says:
-
-- ARLE TTFT/TPOT are close to mlx-lm after the KV-boundary clear fix.
-- ARLE process RSS high-water is **higher** than mlx-lm on this retest.
-- The earlier low-RSS explanation remains an accounting note, not a benchmark
-  headline.
+The raw JSON still keeps per-request RSS peaks for follow-up memory diagnostics:
+`docs/experience/wins/assets/2026-06-01-readme-metal-vs-mlxlm-chat-essay-avg.json`.
 
 ## Why `--auto-wired-limit` Exists
 
 `--auto-wired-limit` asks MLX to keep roughly the model bytes plus headroom
-wired/resident. That spends memory to reduce pageout-driven latency tails. It
-is useful for p99-sensitive dedicated serving, but it is not required for the
-model to be loaded or for inference to work.
+wired/resident. That spends memory to reduce pageout-driven p99 latency tails.
+It is useful for dedicated serving, but it is not required for loading weights
+or running inference.
 
-Default mode keeps pages non-wired so macOS can reclaim them. That is better for
-mixed desktop use, but it can expose more latency variance under memory
-pressure.
+Default mode leaves pages non-wired so the OS can reclaim them. That is better
+for mixed desktop use, but it makes current RSS and latency more sensitive to
+memory pressure.
 
-## More Solid Follow-up
+## Follow-up
 
-A full memory proof should add `vmmap -summary`, MLX allocator / wired counters,
-and a memory-pressure p50/p95/p99 A/B with and without `--auto-wired-limit`.
-Until then, README memory claims should use the high-water chart.
+A full memory proof should add `vmmap -summary`, MLX allocator counters, and a
+memory-pressure A/B with and without `--auto-wired-limit`. Until then, README
+claims should stay on process RSS high-water plus raw RSS samples.

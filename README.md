@@ -107,7 +107,7 @@ Quantized KV is available on CUDA (`--kv-cache-dtype int8|fp8|tq4`). Metal uses
 the model-native KV dtype today; MLX-side quantized KV is a separate follow-up.
 
 <p align="center">
-  <img src="docs/assets/metal-vs-mlxlm-essay-avg.png" alt="ARLE Metal vs mlx-lm TTFT, TPOT, and RSS essay sweep" width="100%">
+  <img src="docs/assets/metal-vs-mlxlm-essay-avg.png" alt="ARLE Metal vs mlx-lm TTFT, TPOT, and RSS high-water essay sweep" width="100%">
 </p>
 <p align="center">
   <sub><a href="docs/experience/wins/2026-06-01-readme-metal-vs-mlxlm-ttft-rss.md">Benchmark data</a> · <a href="docs/experience/wins/2026-06-01-metal-low-rss-analysis.md">RSS accounting note</a></sub>
