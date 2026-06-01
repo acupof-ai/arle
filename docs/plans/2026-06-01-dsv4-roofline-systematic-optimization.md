@@ -1,5 +1,27 @@
 # DSv4 roofline-driven optimization queue
 
+## Status
+
+This is no longer the controlling plan for the SGLang-gap campaign. It remains
+an operator backlog for the current ARLE replicated-token route only.
+
+Controlling plan:
+[`2026-06-01-dsv4-sglang-path-alignment.md`](2026-06-01-dsv4-sglang-path-alignment.md).
+
+Reason: the user-supplied SGLang reference is about 18 ms/token, so the
+`>20%` target is `<=14.4 ms/token` if the metric is raw target-step TPOT. The
+older `60-64 ms/token` framing is deprecated for this campaign and must not be
+used as the win gate. The current ARLE route still replicates token rows across
+TP/EP ranks and runs per-row attention, so operator-level roofline work cannot
+license a SGLang-comparable claim until the path contract is fixed.
+
+Additional priority correction: the user-supplied vLLM/SGLang trace says the
+cross-runtime gap is dominated by MoE MLP, expert GEMM, EP dispatch/combine, and
+buffer materialization. Attention main kernels are close in that comparison.
+Therefore this document's attention-first queue is only a current ARLE
+replicated-token backlog; the path-aligned campaign prioritizes MoE/EP first
+after token ownership is fixed.
+
 ## Context
 
 Goal: make DSv4-Flash default-worthy on 8xH20 by optimizing the current
@@ -57,8 +79,8 @@ step. The rough no-trace estimate divides by the observed 1.25 trace overhead.
 
 | Stage | Trace ms/token | Estimated no-trace ms/token | Verdict |
 |---|---:|---:|---|
-| attention total | 92.1 | about 73 | P0 bottleneck |
-| `attn_csa_select_kernel` | 49.7 | about 40 | single largest unreasonable stage |
+| attention total | 92.1 | about 73 | current-route P0, not SGLang-path P0 |
+| `attn_csa_select_kernel` | 49.7 | about 40 | current-route largest stage |
 | attention hybrid kernel/math | 23.0 | about 18 | still high |
 | FFN total | 39.0 | about 31 | over target budget |
 | routed local experts | 13.5 | about 11 | secondary |
@@ -67,11 +89,13 @@ step. The rough no-trace estimate divides by the observed 1.25 trace overhead.
 
 Decode target framing:
 
-- To clear SGLang-on-H20-adjacent `60-64 ms/token`, the warm p2048 TPOT needs
-  about 43-46% reduction.
+- To clear the user-supplied SGLang `18 ms/token` reference by 20%, the warm
+  p2048 TPOT needs to reach `<=14.4 ms/token`, a reduction of about 87% from
+  the 112 ms/token default-path signal.
 - To clear the repo SLO `<=30 ms/token`, it needs about 73% reduction.
 - CSA select alone is already above the full SLO budget, so it is the first
-  license-or-kill axis.
+  license-or-kill axis for the current ARLE path, but not enough for a
+  SGLang-path claim.
 
 ## Warm Prefill Phase Breakdown
 
@@ -95,6 +119,11 @@ reasonable Hopper tensor-core roofline, so the optimization target is not
 DeepGEMM-class kernels.
 
 ## Optimization Queue
+
+This queue is frozen for the SGLang-gap claim until the path-alignment plan's
+PC0-PC3 gates are satisfied. Items here can still be used for local ARLE
+replicated-token improvements, but their wins entries must explicitly say they
+are not SGLang-comparable.
 
 ### P0.1 Decode CSA select
 
@@ -177,4 +206,3 @@ first-request UX, but it does not license a throughput claim.
   where possible greedy output parity against the current default.
 - Do not compare against SGLang unless workload, model, quantization,
   concurrency, and measurement method match.
-
