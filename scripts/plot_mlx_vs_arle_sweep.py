@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Plot the single-machine (c=1) ARLE-vs-mlx-lm sweep — corrected metric.
+"""Plot the single-machine (c=1) ARLE-vs-mlx-lm sweep — three-phase latency view.
 
-Three panels:
-  * TTFT — time to first token (prefill latency), s, lower better.
-  * TPOT — steady-state time per output token (token 2 onward; the token1→2
-           prefill-tail interval is excluded), ms/token, lower better.
-  * first-interval — the ARLE token1→token2 gap (prefill front-loaded by the
-           pipelined scheduler AFTER token 1). This is the real long-context
-           "slow to start" cost; mlx-lm has no equivalent (its prefill is all in
-           TTFT). Diagnostic panel, ARLE only.
+Long-context c=1 on ARLE has THREE distinct phases (server request_trace +
+client per-token timing, both agree):
+  A. TTFT (token 1)          — prefill. ARLE ≈ mlx-lm (at parity).
+  B. token1 → token2 gap     — a stall that scales with context (~3× a full
+                               prefill). NOT decode. This is the entire ARLE
+                               long-context disadvantage. mlx-lm has no analogue.
+  C. token 2 onward (TPOT)   — steady decode. ARLE ≈ mlx-lm (at parity).
+
+Panels:
+  1. TTFT vs length (A) — ARLE vs mlx-lm.
+  2. TPOT vs length (C) — ARLE vs mlx-lm (steady state, token 2+).
+  3. token1→token2 gap (B) — ARLE only; the real long-context cost.
+  4. cumulative time-to-40-tokens (A+B+C) — the end-to-end the user feels.
 
 Usage: python3 scripts/plot_mlx_vs_arle_sweep.py [results.json] [out.png]
 """
@@ -21,34 +26,16 @@ import matplotlib.pyplot as plt
 
 RESULTS = sys.argv[1] if len(sys.argv) > 1 else "/tmp/mlx_arle_sweep.json"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "/tmp/mlx_arle_sweep.png"
+NTOK = 40  # cumulative horizon for panel 4
 
 d = json.load(open(RESULTS))
 lens = [int(x) for x in d["lens"]]
 arle = d.get("arle", {})
-mlx = d.get("mlx", {})            # engine (in-process)
-mlx_http = d.get("mlx_http", {})  # HTTP (transport-matched), optional
+mlx = d.get("mlx", {})
 
 
 def g(src, n, k):
     return (src.get(str(n)) or {}).get(k)
-
-
-def ser(src, key):
-    xs, ys = [], []
-    for n in lens:
-        v = g(src, n, key)
-        if v is not None:
-            xs.append(n); ys.append(v)
-    return xs, ys
-
-
-def tpot(src, key="decode_tps"):
-    xs, ys = [], []
-    for n in lens:
-        v = g(src, n, key)
-        if v:
-            xs.append(n); ys.append(1000.0 / v)
-    return xs, ys
 
 
 def xt(ax):
@@ -59,53 +46,69 @@ def xt(ax):
     ax.grid(True, which="both", alpha=0.3)
 
 
-ARLE_C, HTTP_C, ENG_C = "#d6336c", "#1c7ed6", "#868e96"
-fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5.2))
+ARLE_C, MLX_C = "#d6336c", "#1c7ed6"
+fig, axs = plt.subplots(1, 4, figsize=(22, 5.2))
 fig.suptitle(
     "ARLE Metal vs mlx-lm — Qwen3.6-35B-A3B-4bit, single machine c=1 (48 GB)",
-    fontsize=13, fontweight="bold")
+    fontsize=14, fontweight="bold")
 
-# Panel 1: TTFT
-ax = ax1
-ax.plot(*ser(arle, "ttft_s"), "o-", color=ARLE_C, lw=2, ms=6, label="ARLE")
-if mlx_http:
-    ax.plot(*ser(mlx_http, "ttft_s"), "s-", color=HTTP_C, lw=2, ms=6, label="mlx-lm (HTTP)")
-ax.plot(*ser(mlx, "prefill_s"), "^--", color=ENG_C, lw=1.5, ms=5, label="mlx-lm (engine)")
-xt(ax); ax.set_ylabel("TTFT (s) — lower better"); ax.set_title("TTFT — time to first token"); ax.legend()
+# Panel 1: TTFT (phase A)
+ax = axs[0]
+ax.plot(lens, [g(arle, n, "ttft_s") for n in lens], "o-", color=ARLE_C, lw=2, ms=6, label="ARLE")
+ax.plot(lens, [g(mlx, n, "prefill_s") for n in lens], "s--", color=MLX_C, lw=2, ms=6, label="mlx-lm")
+xt(ax); ax.set_ylabel("TTFT (s)"); ax.set_title("A. TTFT — time to token 1 (prefill)"); ax.legend()
 
-# Panel 2: TPOT (steady-state)
-ax = ax2
-ax.plot(*tpot(arle), "o-", color=ARLE_C, lw=2, ms=6, label="ARLE")
-if mlx_http:
-    ax.plot(*tpot(mlx_http), "s-", color=HTTP_C, lw=2, ms=6, label="mlx-lm (HTTP)")
-ax.plot(*tpot(mlx), "^--", color=ENG_C, lw=1.5, ms=5, label="mlx-lm (engine)")
-xt(ax); ax.set_ylabel("TPOT (ms/token) — lower better")
-ax.set_title("TPOT — steady-state decode (token 2+)")
-ax.set_ylim(0, max(20, max(tpot(arle)[1] + tpot(mlx)[1]) * 1.2)); ax.legend()
+# Panel 2: TPOT (phase C)
+ax = axs[1]
+ax.plot(lens, [1000.0 / g(arle, n, "decode_tps") if g(arle, n, "decode_tps") else None for n in lens],
+        "o-", color=ARLE_C, lw=2, ms=6, label="ARLE")
+ax.plot(lens, [1000.0 / g(mlx, n, "decode_tps") if g(mlx, n, "decode_tps") else None for n in lens],
+        "s--", color=MLX_C, lw=2, ms=6, label="mlx-lm")
+xt(ax); ax.set_ylabel("TPOT (ms/token)"); ax.set_ylim(0, 20)
+ax.set_title("C. TPOT — steady decode (token 2+)"); ax.legend()
 
-# Panel 3: ARLE first-interval (prefill-tail front-load)
-ax = ax3
-x, y = ser(arle, "first_interval_ms")
-ax.plot(x, [v / 1000.0 for v in y], "o-", color=ARLE_C, lw=2, ms=6, label="ARLE token1→2 gap")
-xt(ax); ax.set_ylabel("first inter-token gap (s)")
-ax.set_title("ARLE prefill-tail (front-loaded after token 1)")
-ax.legend()
+# Panel 3: token1->token2 gap (phase B) — ARLE only
+ax = axs[2]
+fi = [(g(arle, n, "first_interval_ms") or 0) / 1000.0 for n in lens]
+ax.plot(lens, fi, "o-", color=ARLE_C, lw=2, ms=6, label="ARLE token1→token2")
+ax.plot(lens, [0.012] * len(lens), "s--", color=MLX_C, lw=1.5, ms=5, label="mlx-lm (~12 ms)")
+xt(ax); ax.set_ylabel("token1→token2 gap (s)")
+ax.set_title("B. THE GAP — long-context stall (not decode)"); ax.legend()
 
-fig.tight_layout(rect=(0, 0, 1, 0.96))
+# Panel 4: cumulative time-to-NTOK (A+B+C)
+ax = axs[3]
+def arle_e2e(n):
+    t1 = g(arle, n, "ttft_s"); gap = (g(arle, n, "first_interval_ms") or 0) / 1000.0
+    tp = g(arle, n, "decode_tps")
+    return t1 + gap + (NTOK - 2) / tp if (t1 and tp) else None
+def mlx_e2e(n):
+    p = g(mlx, n, "prefill_s"); tp = g(mlx, n, "decode_tps")
+    return p + (NTOK - 1) / tp if (p and tp) else None
+ax.plot(lens, [arle_e2e(n) for n in lens], "o-", color=ARLE_C, lw=2, ms=6, label="ARLE")
+ax.plot(lens, [mlx_e2e(n) for n in lens], "s--", color=MLX_C, lw=2, ms=6, label="mlx-lm")
+xt(ax); ax.set_ylabel(f"time to {NTOK} tokens (s)")
+ax.set_title(f"A+B+C — end-to-end ({NTOK} tokens)"); ax.legend()
+for n in lens:
+    a, m = arle_e2e(n), mlx_e2e(n)
+    if a and m:
+        ax.annotate(f"{a/m:.1f}×", (n, a), textcoords="offset points", xytext=(0, 7),
+                    ha="center", fontsize=8, color=ARLE_C)
+
+fig.tight_layout(rect=(0, 0, 1, 0.95))
 fig.savefig(OUT, dpi=140)
 print(f"wrote {OUT}")
 
-# text table
-def f(x, w=9, p=3):
-    return (f"%{w}.{p}f" % x) if isinstance(x, (int, float)) else " " * (w - 1) + "-"
-
-
-print("\n          TTFT(s)              TPOT(ms/tok)          ARLE")
-print("len    ARLE   mlxH   mlxE    ARLE   mlxH   mlxE    first_iv(s)")
+# table
+print("\nlen    TTFT_A(s)        gap_B(s)   TPOT_C(ms)      e2e40(s)        e2e_ratio")
+print("       ARLE   mlx       ARLE       ARLE   mlx       ARLE   mlx")
 for n in lens:
-    at, ht, et = g(arle, n, "ttft_s"), g(mlx_http, n, "ttft_s"), g(mlx, n, "prefill_s")
-    ad, hd, ed = g(arle, n, "decode_tps"), g(mlx_http, n, "decode_tps"), g(mlx, n, "decode_tps")
-    fi = g(arle, n, "first_interval_ms")
-    tp = lambda v: (1000.0 / v) if v else None
-    print(f"{n:6d} {f(at,6,2)} {f(ht,6,2)} {f(et,6,2)}  "
-          f"{f(tp(ad),6,1)} {f(tp(hd),6,1)} {f(tp(ed),6,1)}   {f((fi/1000.0) if fi else None,6,1)}")
+    at, mp = g(arle, n, "ttft_s"), g(mlx, n, "prefill_s")
+    gap = (g(arle, n, "first_interval_ms") or 0) / 1000.0
+    ad, md = g(arle, n, "decode_tps"), g(mlx, n, "decode_tps")
+    a4, m4 = arle_e2e(n), mlx_e2e(n)
+    def f(x, w=6, p=2):
+        return (f"%{w}.{p}f" % x) if isinstance(x, (int, float)) else " " * (w - 1) + "-"
+    r = f"{a4/m4:.2f}x" if (a4 and m4) else "-"
+    print(f"{n:5d} {f(at)} {f(mp)}   {f(gap,7,2)}   "
+          f"{f(1000/ad if ad else None)} {f(1000/md if md else None)}   "
+          f"{f(a4)} {f(m4)}   {r}")
