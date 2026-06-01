@@ -250,6 +250,21 @@ pub(super) fn clear_metal_cache() {
     clear_cache();
 }
 
+#[cfg(feature = "metal")]
+pub(super) fn clear_metal_cache_on_kv_boundary() {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("INFER_METAL_KV_BOUNDARY_CLEAR")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+    });
+    if enabled {
+        clear_cache();
+    }
+}
+
 // M_e.11 — periodic residency-set hygiene.
 //
 // Apple's IOGPUMetalResidencySet aborts at ~4096 entries; every

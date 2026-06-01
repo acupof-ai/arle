@@ -129,6 +129,18 @@ fn chat_completion_request_accepts_chat_template_kwargs() {
 }
 
 #[test]
+fn chat_completion_request_accepts_top_level_enable_thinking() {
+    let raw = r#"{
+        "messages":[{"role":"user","content":"hi"}],
+        "enable_thinking":false
+    }"#;
+    let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+    req.validate().unwrap();
+    assert_eq!(req.enable_thinking, Some(false));
+    assert_eq!(req.thinking_override(), Some(false));
+}
+
+#[test]
 fn chat_completion_request_rejects_invalid_reasoning_effort() {
     let raw = r#"{
         "messages":[{"role":"user","content":"hi"}],
