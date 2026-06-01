@@ -30,8 +30,8 @@ use super::mlp::{
 #[cfg(feature = "cuda")]
 use super::state::{
     DeepseekAttentionRuntimeCache, DeepseekGpuCompressorRuntimeCache, DeepseekHiddenRuntimeScratch,
-    DeepseekLayerRuntimeCache, DeepseekMhcRuntimeScratch, ensure_hidden_scratch,
-    ensure_mhc_scratch, put_hidden_scratch, take_hidden_scratch,
+    DeepseekLayerRuntimeCache, DeepseekMhcRuntimeScratch, DeepseekMoeRuntimeCache,
+    ensure_hidden_scratch, ensure_mhc_scratch, put_hidden_scratch, take_hidden_scratch,
 };
 #[cfg(all(test, feature = "cuda"))]
 use super::state::{DeepseekCompressedRow, DeepseekCompressorRuntimeCache};
@@ -573,6 +573,7 @@ impl DeepseekModel {
             state.base.kv_cache.len()
         );
         state.incremental.ensure_layers(self.layers.len());
+        let mut prefill_moe_scratch = (tokens.len() > 1).then(DeepseekMoeRuntimeCache::default);
 
         let embeddings =
             common::get_embeddings_batch(&self.ctx, embed_tokens, tokens, self.config.hidden_size)?;
@@ -608,6 +609,7 @@ impl DeepseekModel {
                 tokens,
                 start_pos,
                 layer_cache,
+                prefill_moe_scratch.as_mut().map(|scratch| &mut *scratch),
                 &mut next_stream.hidden,
             )?;
             put_hidden_scratch(&mut layer_cache.stream_recycle, stream);
@@ -859,6 +861,7 @@ impl DeepseekModel {
         tokens: &[u32],
         start_pos: usize,
         cache: &mut DeepseekLayerRuntimeCache,
+        prefill_moe_scratch: Option<&mut DeepseekMoeRuntimeCache>,
         out: &mut HiddenStates,
     ) -> Result<()> {
         // Per-row / single-sequence layer = attention half (post-attention
@@ -903,16 +906,29 @@ impl DeepseekModel {
             self.config.hc_mult,
             attn_stream.seq_len,
         )?;
-        self.forward_ffn_layer_stream_with_scratch_into(
-            layer_idx,
-            attn_stream,
-            tokens,
-            Some(&mut cache.moe),
-            Some(ffn_mhc_scratch),
-            Some(&mut cache.ffn_pre),
-            Some(&mut cache.ffn_normed),
-            out,
-        )?;
+        if let Some(moe_scratch) = prefill_moe_scratch {
+            self.forward_ffn_layer_stream_with_scratch_into(
+                layer_idx,
+                attn_stream,
+                tokens,
+                Some(moe_scratch),
+                Some(ffn_mhc_scratch),
+                Some(&mut cache.ffn_pre),
+                Some(&mut cache.ffn_normed),
+                out,
+            )?;
+        } else {
+            self.forward_ffn_layer_stream_with_scratch_into(
+                layer_idx,
+                attn_stream,
+                tokens,
+                Some(&mut cache.moe),
+                Some(ffn_mhc_scratch),
+                Some(&mut cache.ffn_pre),
+                Some(&mut cache.ffn_normed),
+                out,
+            )?;
+        }
         dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, out.seq_len, trace)?;
         Ok(())
     }
