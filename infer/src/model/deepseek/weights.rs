@@ -4050,25 +4050,15 @@ impl DeepseekModel {
             }
         };
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let ffn_out = if normed.seq_len == 1 {
-            if let Some(scratch) = moe_scratch {
-                layer.ffn.add_shared_expert_with_scratch(
-                    &self.ctx,
-                    normed,
-                    routed.hidden,
-                    routed.ready,
-                    self.config.swiglu_limit,
-                    scratch,
-                )?
-            } else {
-                layer.ffn.add_shared_expert(
-                    &self.ctx,
-                    normed,
-                    routed.hidden,
-                    routed.ready,
-                    self.config.swiglu_limit,
-                )?
-            }
+        let ffn_out = if let Some(scratch) = moe_scratch {
+            layer.ffn.add_shared_expert_with_scratch(
+                &self.ctx,
+                normed,
+                routed.hidden,
+                routed.ready,
+                self.config.swiglu_limit,
+                scratch,
+            )?
         } else {
             layer.ffn.add_shared_expert(
                 &self.ctx,
