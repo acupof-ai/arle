@@ -36,8 +36,45 @@ CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features 
 bash -n scripts/profile_dsv4_single_decode_nsys.sh
 ```
 
-Remote CUDA: pending in the same session before using this trace for DSv4
-performance conclusions.
+Remote CUDA:
+
+```bash
+ARTIFACT_ROOT=/data01/build/arle/docs/trace-artifacts/2026-06-01-dsv4-operator-request-trace-remote \
+ARLE_DSV4_OPERATOR_TRACE=1 \
+ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto \
+ARLE_DSV4_MOE_BACKEND=allreduce \
+SERVER_BIN=/data01/build/arle/target-pod/release/infer \
+./scripts/dsv4_toolchain.sh smoke \
+  --model-path /data01/models/DeepSeek-V4-Flash \
+  --max-tokens 32 \
+  --port 18188 \
+  --expert-backend deepgemm-auto \
+  --moe-backend allreduce
+```
+
+Result:
+
+- Build: `/data01/build/arle/target-pod/release/infer` from commit
+  `bf9c51398d5b52d9dd072b712a2a65d1268def80`.
+- Smoke response: 17 prompt tokens, 32 completion tokens, 3.596 s elapsed.
+- `request_trace_count=1`.
+- `dsv4_operator_trace_process_delta` present.
+- `operators=38`, `layers=1308`.
+- Service cleanup verified: no `target-pod/release/infer` process and no
+  response on ports `18188-18194`.
+
+Top request-level operators from the remote trace:
+
+| phase | calls | tokens | total_us | avg_us |
+|---|---:|---:|---:|---:|
+| `ffn_total` | 11008 | 16512 | 13050504 | 1185.5 |
+| `attn_total` | 11008 | 16512 | 12823300 | 1164.9 |
+| `attn_core` | 11008 | 16512 | 11459333 | 1041.0 |
+| `ffn_routed_local` | 11008 | 16512 | 5848363 | 531.3 |
+| `attn_swa_all_reduce` | 512 | 768 | 4726152 | 9230.8 |
+| `ffn_all_reduce` | 11008 | 16512 | 3743755 | 340.1 |
+| `attn_hybrid_kernel` | 10496 | 15744 | 2279870 | 217.2 |
+| `ffn_expert_loop` | 6256 | 11760 | 2033595 | 325.1 |
 
 ## Rule
 
