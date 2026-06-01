@@ -1265,24 +1265,21 @@ enum Dsv4ExpertBackend {
 fn dsv4_expert_backend() -> Result<Dsv4ExpertBackend> {
     let Some(raw) = std::env::var("ARLE_DSV4_EXPERT_BACKEND").ok() else {
         let moe_backend = std::env::var("ARLE_DSV4_MOE_BACKEND")
-            .unwrap_or_else(|_| "deepep".to_string())
+            .unwrap_or_else(|_| "allreduce".to_string())
+            .trim()
             .to_ascii_lowercase();
-        // `native-deepep` shares the `DeepGemmAuto` body with the deepep group
-        // but is kept as its own arm so the Phase B-3.2 doc below stays attached
-        // to it — merging would orphan that comment.
+        // Expert implementation is orthogonal to the transport. The correct
+        // DSv4 default transport is all-reduce for the current replicated-token
+        // TP/EP path, but the expert math should still use DeepGEMM when the
+        // native cache is available.
         #[allow(clippy::match_same_arms)]
         match moe_backend.as_str() {
             "" | "deepep" | "deepep_unsafe" | "unsafe_deepep" | "dispatch" | "dispatch_combine"
-            | "dispatch_unsafe" => return Ok(Dsv4ExpertBackend::DeepGemmAuto),
-            "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => {
-                return Ok(Dsv4ExpertBackend::Native);
+            | "dispatch_unsafe" | "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => {
+                return Ok(Dsv4ExpertBackend::DeepGemmAuto);
             }
             // Phase B-3.2 — native-deepep boots a real Buffer at model
             // construction (see weights.rs dsv4_native_deepep_enabled).
-            // Expert backend selection matches the default deepep path
-            // (DeepGemmAuto) because the forward shape is identical —
-            // the only difference is dispatch/combine transport, which
-            // is plugged in B-3.3.
             "native-deepep" | "native_deepep" => return Ok(Dsv4ExpertBackend::DeepGemmAuto),
             other => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{other}`"),
         }
