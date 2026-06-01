@@ -1745,7 +1745,7 @@ impl DeepseekModel {
             compress_ratio < 16,
             start_pos,
             true,
-            self.config.max_position_embeddings.div_ceil(compress_ratio),
+            dsv4_compressor_required_capacity_rows(start_pos, token_count, compress_ratio),
             cache
                 .compressed_gpu
                 .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
@@ -1815,7 +1815,7 @@ impl DeepseekModel {
                 true,
                 start_pos,
                 false,
-                self.config.max_position_embeddings.div_ceil(compress_ratio),
+                dsv4_compressor_required_capacity_rows(start_pos, token_count, compress_ratio),
                 cache
                     .indexer_gpu
                     .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
@@ -5107,6 +5107,27 @@ fn dsv4_flashmla_pack_compressor_rows(
 }
 
 #[cfg(feature = "cuda")]
+fn dsv4_compressor_required_capacity_rows(
+    start_pos: usize,
+    token_count: usize,
+    ratio: usize,
+) -> usize {
+    start_pos
+        .saturating_add(token_count)
+        .max(1)
+        .div_ceil(ratio.max(1))
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_compressor_grow_capacity(current: usize, required: usize) -> usize {
+    let required = required.max(1);
+    if current == 0 {
+        return required.max(64);
+    }
+    required.max(current.saturating_mul(2))
+}
+
+#[cfg(feature = "cuda")]
 fn ensure_gpu_compressor_cache(
     ctx: &DeviceContext,
     cache: &mut DeepseekGpuCompressorRuntimeCache,
@@ -5152,6 +5173,8 @@ fn ensure_gpu_compressor_cache(
         cache.compressed_rows = 0;
         cache.pending_width = width;
         cache.head_dim = head_dim;
+        cache.compressed = None;
+        cache.compressed_capacity = 0;
     }
     if cache.compressed_capacity < capacity_rows
         || cache
@@ -5159,16 +5182,33 @@ fn ensure_gpu_compressor_cache(
             .as_ref()
             .is_none_or(|buf| buf.len() < compressed_len)
     {
-        cache.compressed = Some(
-            ctx.stream
-                .alloc_zeros_traced::<bf16>(compressed_len)
-                .map_err(|err| {
-                    anyhow::anyhow!("DeepSeek V4 compressed cache alloc failed: {err}")
-                })?,
-        );
-        cache.compressed_capacity = capacity_rows;
-        cache.compressed_rows = 0;
-        cache.pending_len = 0;
+        let target_capacity =
+            dsv4_compressor_grow_capacity(cache.compressed_capacity, capacity_rows);
+        let target_len = target_capacity
+            .checked_mul(head_dim)
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 compressor grow size overflow"))?;
+        let mut grown = ctx
+            .stream
+            .alloc_zeros_traced::<bf16>(target_len)
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 compressed cache alloc failed: {err}"))?;
+        if let Some(old) = cache.compressed.as_ref() {
+            let copy_rows = cache
+                .compressed_rows
+                .min(cache.compressed_capacity)
+                .min(target_capacity);
+            let copy_len = copy_rows
+                .checked_mul(head_dim)
+                .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 compressor copy size overflow"))?;
+            if copy_len > 0 {
+                let src = old.slice(0..copy_len.min(old.len()));
+                let mut dst = grown.slice_mut(0..src.len());
+                ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 compressed cache grow copy failed: {err}")
+                })?;
+            }
+        }
+        cache.compressed = Some(grown);
+        cache.compressed_capacity = target_capacity;
     }
     Ok(())
 }
