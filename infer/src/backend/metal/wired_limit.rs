@@ -18,6 +18,39 @@ use std::path::{Path, PathBuf};
 /// fall back to no pinning).
 pub fn auto_wired_limit_bytes(model_path: &str) -> Option<usize> {
     const HEADROOM: u64 = 1 << 30;
+    let estimate = model_weight_size(model_path)?;
+    let limit = (estimate.bytes + HEADROOM) as usize;
+    log::info!(
+        "auto wired_limit = {} GiB ({} bytes; model dir {})",
+        limit / (1 << 30),
+        limit,
+        estimate.source.display()
+    );
+    Some(limit)
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ModelWeightSize {
+    pub(super) bytes: u64,
+    pub(super) source: PathBuf,
+}
+
+pub(super) fn model_weight_size(model_path: &str) -> Option<ModelWeightSize> {
+    for candidate in model_weight_candidates(model_path) {
+        let estimate = weight_size_for_candidate(&candidate);
+        if let Some(estimate) = estimate.filter(|estimate| estimate.bytes > 0) {
+            return Some(estimate);
+        }
+    }
+
+    None
+}
+
+pub(super) fn model_weight_size_for_path(path: &Path) -> Option<ModelWeightSize> {
+    weight_size_for_candidate(path)
+}
+
+fn model_weight_candidates(model_path: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(2);
     candidates.push(PathBuf::from(model_path));
     if let Some(hub_dir) = runtime_huggingface_hub_dir() {
@@ -27,34 +60,45 @@ pub fn auto_wired_limit_bytes(model_path: &str) -> Option<usize> {
                 .join("snapshots"),
         );
     }
+    candidates
+}
 
-    for candidate in &candidates {
-        let snapshot_dir = if candidate.is_dir() && candidate.ends_with("snapshots") {
-            std::fs::read_dir(candidate)
-                .ok()?
-                .filter_map(Result::ok)
-                .find(|e| e.path().is_dir())
-                .map(|e| e.path())
-        } else if candidate.is_dir() {
-            Some(candidate.clone())
-        } else {
-            None
-        };
-        let Some(dir) = snapshot_dir else { continue };
-        let total = sum_weight_files(&dir).unwrap_or(0);
-        if total == 0 {
-            continue;
-        }
-        let limit = (total + HEADROOM) as usize;
-        log::info!(
-            "auto wired_limit = {} GiB ({} bytes; model dir {})",
-            limit / (1 << 30),
-            limit,
-            dir.display()
-        );
-        return Some(limit);
+fn weight_size_for_candidate(candidate: &Path) -> Option<ModelWeightSize> {
+    if candidate.is_file() {
+        let bytes = weight_file_len(candidate)?;
+        return Some(ModelWeightSize {
+            bytes,
+            source: candidate.to_path_buf(),
+        });
     }
 
+    let snapshot_dir = if candidate.is_dir() && candidate.ends_with("snapshots") {
+        std::fs::read_dir(candidate)
+            .ok()?
+            .filter_map(Result::ok)
+            .find(|e| e.path().is_dir())
+            .map(|e| e.path())
+    } else if candidate.is_dir() {
+        Some(candidate.to_path_buf())
+    } else {
+        None
+    }?;
+
+    let total = sum_weight_files(&snapshot_dir).unwrap_or(0);
+    (total > 0).then_some(ModelWeightSize {
+        bytes: total,
+        source: snapshot_dir,
+    })
+}
+
+fn weight_file_len(path: &Path) -> Option<u64> {
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    if matches!(ext, "safetensors" | "bin" | "gguf" | "npz") {
+        let meta = std::fs::metadata(path).ok()?;
+        if meta.is_file() {
+            return Some(meta.len());
+        }
+    }
     None
 }
 

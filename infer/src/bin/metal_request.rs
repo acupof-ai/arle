@@ -258,6 +258,7 @@ fn main() -> Result<()> {
                 }),
             kv_pool: args.kv_pool_override(),
             kv_disk: args.kv_disk_options()?,
+            kv_memory_max_bytes: None,
             runtime_limits: args.runtime_limits(),
         });
         let load_start = Instant::now();

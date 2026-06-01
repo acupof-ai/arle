@@ -56,6 +56,9 @@ pub mod forward;
 #[path = "metal/generate.rs"]
 pub mod generate;
 #[cfg(feature = "metal")]
+#[path = "metal/kv_memory_budget.rs"]
+mod kv_memory_budget;
+#[cfg(feature = "metal")]
 #[path = "metal/loader.rs"]
 mod loader;
 #[cfg(feature = "metal")]
@@ -115,6 +118,8 @@ use config::{MetalQwen35ArchConfig, MetalQwen35LayerType, QuantConfig};
 #[cfg(feature = "metal")]
 pub use dflash::MetalDflashOptions;
 #[cfg(feature = "metal")]
+pub use kv_memory_budget::auto_kv_memory_max_bytes;
+#[cfg(feature = "metal")]
 use loader::{
     TensorMap, load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
     tie_lm_head_from_embed_tokens,
@@ -163,6 +168,8 @@ pub struct MetalBackend {
     #[cfg(feature = "metal")]
     kv_disk_options: Option<MetalKvDiskOptions>,
     #[cfg(feature = "metal")]
+    kv_memory_max_bytes: Option<u64>,
+    #[cfg(feature = "metal")]
     runtime_limits: MetalRuntimeLimits,
     #[cfg(not(feature = "metal"))]
     _weights: (),
@@ -188,6 +195,7 @@ impl MetalBackend {
             dflash,
             kv_pool,
             kv_disk,
+            kv_memory_max_bytes,
             runtime_limits,
         } = options;
 
@@ -206,6 +214,8 @@ impl MetalBackend {
             kv_pool_enabled: self::generate::resolve_metal_kv_pool_enabled(kv_pool),
             #[cfg(feature = "metal")]
             kv_disk_options: kv_disk,
+            #[cfg(feature = "metal")]
+            kv_memory_max_bytes,
             #[cfg(feature = "metal")]
             runtime_limits,
             #[cfg(not(feature = "metal"))]
@@ -508,6 +518,8 @@ pub struct MetalBackendOptions {
     pub kv_pool: Option<bool>,
     #[cfg(feature = "metal")]
     pub kv_disk: Option<MetalKvDiskOptions>,
+    #[cfg(feature = "metal")]
+    pub kv_memory_max_bytes: Option<u64>,
     #[cfg(feature = "metal")]
     pub runtime_limits: MetalRuntimeLimits,
 }

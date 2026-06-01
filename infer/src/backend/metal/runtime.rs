@@ -288,13 +288,6 @@ impl ActiveMetalRequest {
 }
 
 const METAL_PREFIX_BLOCK_SIZE: usize = 16;
-// In-memory prefix pool sized so that high-session-count agent traffic (e.g.
-// the W3 64-warm-session workload) can keep the most-recently-published
-// snapshot per session, instead of LRU-evicting them within seconds. The
-// underlying KV+GDR arrays are MLX refcounts (no per-snapshot full copy), so
-// the dominant cost is the MLX buffer footprint of the cached requests'
-// resident state.
-const METAL_PREFIX_POOL_MULTIPLIER: usize = 64;
 const METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG: u8 = 0x35;
 const METAL_QWEN35_SNAPSHOT_INDEX_PREFIX_BYTES: usize = 1024 * 1024;
 const METRICS_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
@@ -359,16 +352,18 @@ enum MetalLivePrefixRuntime {
     Qwen35(MetalQwen35PrefixRuntime),
 }
 
-/// Eviction footprint for an in-memory cached snapshot, in token-equivalent
-/// units. The cache budget accounts the resident KV+GDR allocation, not just
-/// the reusable prefix length: the live driver pre-allocates KV to
-/// `prompt_len + max_new_tokens`, and the snapshot retains those full arrays
-/// via `kv_capacity`. Counting only `token_ids.len()` would let a few
-/// long-output requests pin many GB of KV while the cache thinks it has
-/// room for more.
-fn snapshot_footprint(snapshot: &Qwen35PrefixSnapshot) -> usize {
-    let kv_cap = usize::try_from(snapshot.kv_capacity).unwrap_or(0);
-    snapshot.token_ids.len().max(kv_cap)
+/// Resident byte budget for an in-memory cached snapshot. Count the retained
+/// MLX KV+GDR arrays, not token length: the live driver pre-allocates KV to
+/// `prompt_len + max_new_tokens`, and the snapshot keeps those arrays alive.
+/// Token-equivalent accounting let large snapshots hide under an oversized
+/// `max_batch_tokens * multiplier` budget.
+fn snapshot_resident_bytes(snapshot: &Qwen35PrefixSnapshot) -> u64 {
+    snapshot
+        .kv_flat
+        .iter()
+        .chain(snapshot.gdr_flat.iter())
+        .map(|array| array.nbytes() as u64)
+        .sum()
 }
 
 struct MetalQwen35CachedPrefix {
@@ -856,8 +851,8 @@ struct MetalQwen35PrefixRuntime {
     tier_adapter: MetalTierAdapter,
     model_fingerprint: Vec<u8>,
     disk_fsync_each_block: bool,
-    max_cached_tokens: usize,
-    cached_tokens: usize,
+    max_cached_bytes: u64,
+    cached_bytes: u64,
     next_tick: u64,
     block_size: usize,
 }
@@ -868,13 +863,9 @@ struct CachedQwen35DecodeBatch {
 }
 
 impl MetalLivePrefixRuntime {
-    fn new(backend: &'static MetalBackend, config: &MetalSchedulerConfig) -> Result<Option<Self>> {
+    fn new(backend: &'static MetalBackend, _config: &MetalSchedulerConfig) -> Result<Option<Self>> {
         let weights = backend.weights.as_ref().context("weights not loaded")?;
-        let max_total_tokens = (config
-            .max_running_requests
-            .saturating_mul(config.max_batch_tokens)
-            .saturating_mul(METAL_PREFIX_POOL_MULTIPLIER))
-        .max(METAL_PREFIX_BLOCK_SIZE * 8);
+        let max_cached_bytes = backend.kv_memory_max_bytes.unwrap_or(0);
         match weights {
             MetalWeights::Qwen3(_) => {
                 info!(
@@ -889,10 +880,17 @@ impl MetalLivePrefixRuntime {
                     );
                     return Ok(None);
                 }
-                info!(
-                    "Metal live prefix cache enabled for Qwen3.5 snapshot replay: block_size={}, max_cached_tokens={}",
-                    METAL_PREFIX_BLOCK_SIZE, max_total_tokens
-                );
+                if max_cached_bytes == 0 {
+                    info!(
+                        "Metal live prefix memory snapshot replay disabled: block_size={}, max_cached_bytes=0; disk prefix tier still runs when configured",
+                        METAL_PREFIX_BLOCK_SIZE
+                    );
+                } else {
+                    info!(
+                        "Metal live prefix cache enabled for Qwen3.5 snapshot replay: block_size={}, max_cached_bytes={}",
+                        METAL_PREFIX_BLOCK_SIZE, max_cached_bytes
+                    );
+                }
                 let (
                     disk_store,
                     model_fingerprint,
@@ -918,7 +916,7 @@ impl MetalLivePrefixRuntime {
                     (None, Vec::new(), None, 0.90, 0.75, false)
                 };
                 Ok(Some(Self::Qwen35(MetalQwen35PrefixRuntime::new(
-                    max_total_tokens,
+                    max_cached_bytes,
                     METAL_PREFIX_BLOCK_SIZE,
                     disk_store,
                     model_fingerprint,
@@ -956,7 +954,7 @@ impl MetalLivePrefixRuntime {
 
 impl MetalQwen35PrefixRuntime {
     fn new(
-        max_cached_tokens: usize,
+        max_cached_bytes: u64,
         block_size: usize,
         disk_store: Option<Arc<DiskStore>>,
         model_fingerprint: Vec<u8>,
@@ -978,8 +976,8 @@ impl MetalQwen35PrefixRuntime {
             tier_adapter,
             model_fingerprint,
             disk_fsync_each_block,
-            max_cached_tokens,
-            cached_tokens: 0,
+            max_cached_bytes,
+            cached_bytes: 0,
             next_tick: 1,
             block_size,
         };
@@ -1380,14 +1378,14 @@ impl MetalQwen35PrefixRuntime {
             existing.last_used_tick = tick;
             return;
         }
-        let footprint = snapshot_footprint(&snapshot);
-        if footprint > self.max_cached_tokens {
+        let footprint = snapshot_resident_bytes(&snapshot);
+        if footprint > self.max_cached_bytes {
             return;
         }
 
         self.ensure_capacity_for(footprint);
         let key = snapshot.token_ids.clone();
-        self.cached_tokens += footprint;
+        self.cached_bytes += footprint;
         self.entries.insert(
             key,
             MetalQwen35CachedPrefix {
@@ -1524,18 +1522,18 @@ impl MetalQwen35PrefixRuntime {
         Ok(())
     }
 
-    fn ensure_capacity_for(&mut self, needed_tokens: usize) {
-        while self.cached_tokens.saturating_add(needed_tokens) > self.max_cached_tokens {
+    fn ensure_capacity_for(&mut self, needed_bytes: u64) {
+        while self.cached_bytes.saturating_add(needed_bytes) > self.max_cached_bytes {
             let Some((lru_key, lru_footprint)) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_used_tick)
-                .map(|(tokens, entry)| (tokens.clone(), snapshot_footprint(&entry.snapshot)))
+                .map(|(tokens, entry)| (tokens.clone(), snapshot_resident_bytes(&entry.snapshot)))
             else {
                 break;
             };
             self.entries.remove(&lru_key);
-            self.cached_tokens = self.cached_tokens.saturating_sub(lru_footprint);
+            self.cached_bytes = self.cached_bytes.saturating_sub(lru_footprint);
         }
     }
 
@@ -3791,6 +3789,48 @@ mod tests {
         assert!(index.contains(&[3]));
     }
 
+    fn qwen35_test_snapshot(tokens: &[u32], bytes: usize) -> Qwen35PrefixSnapshot {
+        assert!(bytes.is_multiple_of(std::mem::size_of::<i32>()));
+        let values = vec![0_i32; bytes / std::mem::size_of::<i32>()];
+        Qwen35PrefixSnapshot {
+            token_ids: tokens.to_vec(),
+            kv_flat: vec![MlxArray::from_slice_i32(&values, &[values.len() as i32])],
+            gdr_flat: Vec::new(),
+            cache_len: tokens.len() as i32,
+            kv_capacity: tokens.len() as i32,
+        }
+    }
+
+    #[test]
+    fn memory_prefix_runtime_evicts_under_byte_budget() {
+        let _guard = metal_test_guard();
+        let mut runtime =
+            MetalQwen35PrefixRuntime::new(32, 2, None, Vec::new(), None, 0.90, 0.75, false)
+                .expect("runtime");
+
+        runtime.insert_snapshot(qwen35_test_snapshot(&[1, 2], 16));
+        runtime.insert_snapshot(qwen35_test_snapshot(&[3, 4], 16));
+        assert_eq!(runtime.cached_bytes, 32);
+
+        runtime.insert_snapshot(qwen35_test_snapshot(&[5, 6], 16));
+        assert_eq!(runtime.cached_bytes, 32);
+        assert!(!runtime.entries.contains_key(&[1, 2][..]));
+        assert!(runtime.entries.contains_key(&[3, 4][..]));
+        assert!(runtime.entries.contains_key(&[5, 6][..]));
+    }
+
+    #[test]
+    fn memory_prefix_runtime_drops_snapshot_larger_than_budget() {
+        let _guard = metal_test_guard();
+        let mut runtime =
+            MetalQwen35PrefixRuntime::new(8, 2, None, Vec::new(), None, 0.90, 0.75, false)
+                .expect("runtime");
+
+        runtime.insert_snapshot(qwen35_test_snapshot(&[1, 2], 16));
+        assert!(runtime.entries.is_empty());
+        assert_eq!(runtime.cached_bytes, 0);
+    }
+
     #[test]
     fn dflash_row_dispatch_plan_preserves_scheduler_order() {
         let plan = dflash_row_dispatch_plan(8, &[0, 2, 5], 3).expect("plan");
@@ -3929,7 +3969,7 @@ mod tests {
         let store = Arc::new(DiskStore::new(dir.path()));
         let model_fingerprint = b"qwen35-test-model".to_vec();
         let mut runtime = MetalQwen35PrefixRuntime::new(
-            64,
+            1024 * 1024,
             2,
             Some(store.clone()),
             model_fingerprint.clone(),
@@ -3960,7 +4000,7 @@ mod tests {
         assert!(disk_bytes > 0);
 
         let restored = MetalQwen35PrefixRuntime::new(
-            64,
+            1024 * 1024,
             2,
             Some(store.clone()),
             model_fingerprint,
@@ -3974,7 +4014,7 @@ mod tests {
         assert_eq!(restored.lock_disk_index().disk_bytes, disk_bytes);
 
         let wrong_model = MetalQwen35PrefixRuntime::new(
-            64,
+            1024 * 1024,
             2,
             Some(store.clone()),
             b"other-model".to_vec(),

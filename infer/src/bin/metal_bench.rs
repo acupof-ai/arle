@@ -451,6 +451,7 @@ fn run_bench() -> Result<()> {
             }),
         kv_pool: cli.kv_pool_override(),
         kv_disk: cli.kv_disk_options()?,
+        kv_memory_max_bytes: None,
         runtime_limits: cli.runtime_limits(),
     });
     backend.load(std::path::Path::new(&cli.model))?;
@@ -1047,6 +1048,7 @@ fn run_baseline_compare(cli: &Cli) -> Result<()> {
         dflash: None,
         kv_pool: cli.kv_pool_override(),
         kv_disk: cli.kv_disk_options()?,
+        kv_memory_max_bytes: None,
         runtime_limits: cli.runtime_limits(),
     });
     baseline_backend.load(std::path::Path::new(&cli.model))?;
@@ -1068,6 +1070,7 @@ fn run_baseline_compare(cli: &Cli) -> Result<()> {
         }),
         kv_pool: cli.kv_pool_override(),
         kv_disk: cli.kv_disk_options()?,
+        kv_memory_max_bytes: None,
         runtime_limits: cli.runtime_limits(),
     });
     dflash_backend.load(std::path::Path::new(&cli.model))?;
