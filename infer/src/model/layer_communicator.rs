@@ -1,9 +1,10 @@
-//! Layer-level communication skeleton for tensor/context/data parallel forward.
+//! Layer-level communication surface for tensor/context/data/expert parallel
+//! forward paths.
 //!
-//! F0.8 intentionally keeps this module detached from Qwen forward call sites.
-//! It defines the method surface that F1+ TP/DP/CP forward paths will call, with
-//! exact single-rank pass-through behavior so the default runtime path remains
-//! inert.
+//! Qwen paths still use mostly single-rank/no-op behavior, while DeepSeek V4
+//! wires this into real TP/EP NCCL groups and optional native DeepEP state.
+//! Attention-DP/CP and MoE-DP subgroup communicators are represented in the
+//! API surface but are not yet wired for the SGLang-path contract.
 
 use anyhow::{Result, bail};
 
