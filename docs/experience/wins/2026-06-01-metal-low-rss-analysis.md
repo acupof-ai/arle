@@ -2,8 +2,9 @@
 
 ## TL;DR
 
-The earlier README sweep showed about **2.2 GiB RSS**; the full retest now used
-for the README chart shows **4.5-6.0 GiB RSS**. Neither number says the
+The earlier README sweep showed about **2.2 GiB RSS**; the current README
+essay-average chart shows about **2.5-4.1 GiB mean process RSS** for ARLE.
+Neither number says the
 35B-A3B model only needs that much memory, and neither says weights are
 unloaded. Both are process-attributed RSS samples after ARLE stopped pinning MLX
 Metal pages by default.
@@ -88,22 +89,22 @@ The default run has the same model load and warmup, but no wired-limit log.
 That isolates the old ~18-20 GiB process RSS to the residency policy, not to a
 second copy of the weights.
 
-### 3. The full README retest stayed low with prompt length
+### 3. The README essay retest stayed low with prompt length
 
 ARLE default, c=1, output 256:
 
 | input | TTFT | TPOT | process RSS | system used |
 |---:|---:|---:|---:|---:|
-| 128 | 0.22 s | 14.3 ms | 4.54 GiB | 32.82 GiB |
-| 4k | 4.90 s | 15.0 ms | 4.56 GiB | 35.09 GiB |
-| 8k | 9.75 s | 15.6 ms | 5.36 GiB | 33.88 GiB |
-| 12k | 15.04 s | 15.8 ms | 6.04 GiB | 33.36 GiB |
+| 128 | 0.27 s | 12.3 ms | 3.15 GiB | 30.13 GiB |
+| 4k | 5.14 s | 14.2 ms | 3.97 GiB | 32.52 GiB |
+| 8k | 11.53 s | 17.1 ms | 4.11 GiB | 34.25 GiB |
+| 12k | 19.50 s | 32.3 ms | 2.46 GiB | 34.01 GiB |
 
-The RSS curve grows with long prompts but stays far below the wired-weight
-footprint. c=1 prefill does not retain full activations, and the retained KV for
-256 generated tokens is small relative to model weight files. Prompt length
-moves TTFT and some scratch / system-used pressure, but it does not force all
-mmap-backed model pages to be charged to process RSS.
+The mean RSS curve stays far below the wired-weight footprint. It is not
+monotonic because process RSS is page residency/accounting, and macOS can reclaim
+non-wired pages between requests. c=1 prefill does not retain full activations,
+and the retained KV for 256 generated tokens is small relative to model weight
+files.
 
 ## Why Inference Still Works
 
@@ -125,12 +126,12 @@ Qwen3.6 also helps this RSS shape:
 This is why the process can serve a 35B-A3B model while the process RSS sample
 is much smaller than the on-disk model size.
 
-## Why mlx-lm Shows About 19 GiB RSS
+## Why mlx-lm Shows Higher RSS
 
 mlx-lm and ARLE both sit on Apple unified memory, but they do not expose the same
-process RSS shape. In the full README retest, mlx-lm's process RSS stayed
-around 19.03-19.04 GiB while ARLE default stayed around 4.54-6.04 GiB. The
-system-used numbers are closer than the process RSS numbers.
+process RSS shape. In the current README essay retest, mlx-lm's process RSS
+stayed around 7.23-7.24 GiB while ARLE default averaged around 2.46-4.11 GiB.
+The system-used numbers are closer than the process RSS numbers.
 
 That means the chart is best read as:
 
@@ -140,7 +141,7 @@ That means the chart is best read as:
 
 It should not be read as:
 
-> ARLE has proven the whole model consumes only 4.5-6.0 GiB total memory.
+> ARLE has proven the whole model consumes only 2.5-4.1 GiB total memory.
 
 ## Tradeoff
 
@@ -173,8 +174,8 @@ memory-proof would add:
 
 Until then, the precise claim is:
 
-> In the full README retest, ARLE's default process RSS during streaming is
-> about 4.5-6.0 GiB because model weights are loaded through MLX mmap-backed
-> unified-memory tensors and are no longer pinned/wired into
+> In the README essay-average retest, ARLE's default process RSS during
+> streaming averages about 2.5-4.1 GiB because model weights are loaded through
+> MLX mmap-backed unified-memory tensors and are no longer pinned/wired into
 > process-attributed RSS by default. The model is still loaded; the number is a
 > residency/accounting measurement, not total model memory.
