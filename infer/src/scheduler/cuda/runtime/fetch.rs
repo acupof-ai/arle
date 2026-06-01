@@ -9,6 +9,28 @@ use super::helpers::{FetchWaiter, WaitingInsertBias, staged_prefix_direct_host_b
 use crate::model::GenerationState;
 use crate::scheduler::types::RequestLengthContract;
 
+fn logits_last_row_offset(
+    logits_len: usize,
+    seq_len: usize,
+    vocab_size: usize,
+) -> anyhow::Result<usize> {
+    let full_len = seq_len.checked_mul(vocab_size).ok_or_else(|| {
+        anyhow::anyhow!(
+            "forward_token_logits shape overflow: seq_len={seq_len} vocab_size={vocab_size}"
+        )
+    })?;
+    if logits_len == full_len {
+        return Ok((seq_len - 1) * vocab_size);
+    }
+    if logits_len == vocab_size {
+        return Ok(0);
+    }
+    anyhow::bail!(
+        "forward_token_logits expected either one vocab row ({vocab_size}) or full \
+         [seq_len, vocab] logits ({full_len}), got logits len {logits_len}"
+    )
+}
+
 impl<M: ModelForward> Scheduler<M> {
     pub(super) fn adopt_promoted_prefix(&mut self, waiter: &FetchWaiter) -> anyhow::Result<bool> {
         let slot_idx = waiter.slot_idx;
@@ -60,6 +82,10 @@ impl<M: ModelForward> Scheduler<M> {
                 continue;
             }
             if req.delta_tx.is_closed() {
+                self.finish_slot_client_closed(slot_idx);
+                continue;
+            }
+            if req.is_cancelled() {
                 self.finish_slot_client_closed(slot_idx);
                 continue;
             }
@@ -450,27 +476,42 @@ impl<M: ModelForward> Scheduler<M> {
 
         let ctx = self.model.device_context().clone();
         let vocab_size = self.model.vocab_size();
+        let full_len = input_ids.len().checked_mul(vocab_size).ok_or_else(|| {
+            anyhow::anyhow!(
+                "forward_token_logits shape overflow: seq_len={} vocab_size={vocab_size}",
+                input_ids.len()
+            )
+        })?;
+
+        let mut full_state = self.model.create_state()?;
+        full_state.set_max_seq_len(input_ids.len().max(1));
+        let (_tokens, full_forward_logits) =
+            self.model.forward_with_logits(input_ids, &mut full_state)?;
+        if full_forward_logits.len == full_len {
+            return Ok(crate::server_engine::RawLogits {
+                logits: full_forward_logits.with_label("raw_token_logits[seq,vocab]"),
+                shape: [input_ids.len(), vocab_size],
+                device: ctx,
+            });
+        }
+
+        let mut logits = cuda_kernels::prelude::DeviceVec::zeros(&ctx, full_len)?
+            .with_label("raw_token_logits[seq,vocab]");
         let mut state = self.model.create_state()?;
         state.set_max_seq_len(input_ids.len().max(1));
-        let mut logits =
-            cuda_kernels::prelude::DeviceVec::zeros(&ctx, input_ids.len() * vocab_size)?
-                .with_label("raw_token_logits[seq,vocab]");
-
-        // DIAGNOSTIC (2026-05-27): one-shot multi-token forward (exercises
-        // contiguous multi-token prefill via process_all_layers_batch). The
-        // model only fills the last position's logits in this path — earlier
-        // rows of the `logits` buffer are zeros. Reverting after the paged-
-        // prefill bug investigation closes.
-        let (_tokens, token_logits) = self.model.forward_with_logits(input_ids, &mut state)?;
-        anyhow::ensure!(
-            token_logits.len == vocab_size,
-            "forward_token_logits expected one vocab row, got logits len {} \
-             for vocab size {}",
-            token_logits.len,
-            vocab_size,
-        );
-        let last_offset = (input_ids.len() - 1) * vocab_size;
-        logits.copy_region_from_device(&ctx, last_offset, &token_logits, 0, vocab_size)?;
+        for (idx, &token) in input_ids.iter().enumerate() {
+            let seq_len = idx + 1;
+            let (_tokens, token_logits) = self.model.forward_with_logits(&[token], &mut state)?;
+            let src_offset = logits_last_row_offset(token_logits.len, seq_len, vocab_size)?;
+            let dst_offset = idx * vocab_size;
+            logits.copy_region_from_device(
+                &ctx,
+                dst_offset,
+                &token_logits,
+                src_offset,
+                vocab_size,
+            )?;
+        }
 
         Ok(crate::server_engine::RawLogits {
             logits,
@@ -489,5 +530,29 @@ impl<M: ModelForward> Scheduler<M> {
         self.drain_raw_logits_rx();
         self.drain_remerge_lora_rx();
         self.drain_engine_offload_rx();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logits_last_row_offset;
+
+    #[test]
+    fn raw_logits_row_offset_accepts_single_row_logits() {
+        assert_eq!(logits_last_row_offset(128, 4, 128).unwrap(), 0);
+    }
+
+    #[test]
+    fn raw_logits_row_offset_selects_last_row_from_full_prefix_logits() {
+        assert_eq!(logits_last_row_offset(4 * 128, 4, 128).unwrap(), 3 * 128);
+    }
+
+    #[test]
+    fn raw_logits_row_offset_rejects_partial_logits() {
+        let err = logits_last_row_offset(3 * 128, 4, 128).expect_err("partial rows must fail");
+        assert!(
+            err.to_string().contains("expected either one vocab row"),
+            "{err}"
+        );
     }
 }
