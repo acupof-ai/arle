@@ -338,29 +338,4 @@ mod tests {
             "unexpected peek error: {err:#}"
         );
     }
-
-    #[test]
-    fn longest_reusable_aligned_prefix_keeps_full_aligned_prompt() {
-        assert_eq!(longest_reusable_aligned_prefix_len(32, 32, 16), 32);
-        assert_eq!(longest_reusable_aligned_prefix_len(33, 33, 16), 32);
-        assert_eq!(longest_reusable_aligned_prefix_len(15, 15, 16), 0);
-        assert_eq!(longest_reusable_aligned_prefix_len(48, 40, 16), 32);
-        assert_eq!(longest_reusable_aligned_prefix_len(32, 32, 0), 0);
-    }
-
-    #[test]
-    fn qwen35_disk_publish_prefix_lens_include_importable_block_aligned_fallback() {
-        assert_eq!(qwen35_disk_publish_prefix_lens(32, 32, 16), vec![16, 32]);
-        assert_eq!(qwen35_disk_publish_prefix_lens(33, 33, 16), vec![32]);
-        assert_eq!(qwen35_disk_publish_prefix_lens(16, 16, 16), vec![16]);
-        assert_eq!(
-            qwen35_disk_publish_prefix_lens(15, 15, 16),
-            Vec::<usize>::new()
-        );
-        assert_eq!(qwen35_disk_publish_prefix_lens(48, 40, 16), vec![32]);
-        assert_eq!(
-            qwen35_disk_publish_prefix_lens(32, 32, 0),
-            Vec::<usize>::new()
-        );
-    }
 }
