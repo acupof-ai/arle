@@ -109,6 +109,10 @@ the model-native KV dtype today; MLX-side quantized KV is a separate follow-up.
 Benchmark data: [Metal vs mlx-lm sweep](docs/experience/wins/2026-06-01-readme-metal-vs-mlxlm-ttft-rss.md) ·
 [RSS accounting note](docs/experience/wins/2026-06-01-metal-low-rss-analysis.md).
 
+<p align="center">
+  <img src="docs/assets/metal-vs-mlxlm-ttft.png" alt="ARLE Metal vs mlx-lm TTFT sweep" width="100%">
+</p>
+
 ```mermaid
 flowchart TB
   subgraph Surface["Entry surfaces"]
