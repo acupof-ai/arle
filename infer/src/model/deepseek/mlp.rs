@@ -1215,6 +1215,21 @@ fn dsv4_deepgemm_device_counts_enabled() -> Result<bool> {
 }
 
 #[cfg(feature = "cuda")]
+fn dsv4_native_deepep_num_sms() -> Result<u32> {
+    let Some(raw) = std::env::var("ARLE_DSV4_NATIVE_DEEPEP_NUM_SMS").ok() else {
+        return Ok(20);
+    };
+    let num_sms = raw.parse::<u32>().map_err(|err| {
+        anyhow::anyhow!("invalid ARLE_DSV4_NATIVE_DEEPEP_NUM_SMS value `{raw}`: {err}")
+    })?;
+    ensure!(
+        num_sms > 0 && num_sms % 2 == 0,
+        "ARLE_DSV4_NATIVE_DEEPEP_NUM_SMS must be a positive even integer, got {num_sms}"
+    );
+    Ok(num_sms)
+}
+
+#[cfg(feature = "cuda")]
 fn dsv4_env_flag(name: &str) -> Result<bool> {
     let Some(raw) = std::env::var(name).ok() else {
         return Ok(false);
@@ -5075,9 +5090,11 @@ impl DeepseekV4MoeBlock {
 
         // DeepEP intranode::dispatch wants int64_t topk indices; convert.
         let num_route_slots = hidden.seq_len.saturating_mul(config.num_experts_per_tok);
-        // num_sms must be > 0 and even; channels = sms / 2. 20 SMs / 10 channels
-        // matches the phase 1.0a-iv spike + tests/deepep_sidecar_smoke.rs.
-        let num_sms: u32 = 20;
+        // num_sms must be > 0 and even; channels = sms / 2. Default 20 SMs /
+        // 10 channels matches the phase 1.0a-iv spike +
+        // tests/deepep_sidecar_smoke.rs. The env override is for controlled
+        // SLO-shape sweeps; it deliberately does not change the default.
+        let num_sms: u32 = dsv4_native_deepep_num_sms()?;
         let num_channels = (num_sms / 2) as usize;
         let scratch = moe_scratch.ensure_native_deepep_scratch(
             ctx,
