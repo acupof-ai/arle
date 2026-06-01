@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -313,6 +313,7 @@ const METRICS_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
 // `INFER_METAL_PREFIX_PERSIST_SAFETY`) following the `mlx.rs` parse idiom.
 const METAL_PREFIX_READBACK_US_PER_TOKEN_DEFAULT: f64 = 48.0;
 const METAL_PREFIX_PERSIST_SAFETY_DEFAULT: f64 = 2.0;
+const METAL_PREFIX_SSD_PENDING_BYTES_DEFAULT: u64 = 1024 * 1024 * 1024;
 
 fn metal_prefix_readback_us_per_token() -> f64 {
     std::env::var("INFER_METAL_PREFIX_READBACK_US_PER_TOKEN")
@@ -328,6 +329,14 @@ fn metal_prefix_persist_safety() -> f64 {
         .and_then(|raw| raw.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(METAL_PREFIX_PERSIST_SAFETY_DEFAULT)
+}
+
+fn metal_prefix_ssd_pending_bytes_limit() -> u64 {
+    std::env::var("INFER_METAL_PREFIX_SSD_PENDING_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(METAL_PREFIX_SSD_PENDING_BYTES_DEFAULT)
 }
 
 enum PrefillChunkOutcome {
@@ -524,11 +533,35 @@ struct DiskWriteJob {
     estimated_payload_len: u64,
 }
 
+struct PendingDiskPayload {
+    pending_bytes: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl PendingDiskPayload {
+    fn new(pending_bytes: Arc<AtomicU64>, bytes: u64) -> Self {
+        Self {
+            pending_bytes,
+            bytes,
+        }
+    }
+}
+
+impl Drop for PendingDiskPayload {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.pending_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+}
+
 /// Owns the dedicated SSD-writer thread + its job channel. Dropping the handle
 /// closes the channel; the writer drains remaining jobs and exits.
 struct DiskWriteHandle {
     tx: Option<std_mpsc::Sender<DiskWriteJob>>,
     join: Option<std::thread::JoinHandle<()>>,
+    pending_bytes: Arc<AtomicU64>,
+    max_pending_bytes: u64,
 }
 
 impl DiskWriteHandle {
@@ -538,21 +571,79 @@ impl DiskWriteHandle {
         fsync_each_block: bool,
     ) -> Self {
         let (tx, rx) = std_mpsc::channel::<DiskWriteJob>();
+        let pending_bytes = Arc::new(AtomicU64::new(0));
+        let writer_pending_bytes = Arc::clone(&pending_bytes);
         let join = std::thread::Builder::new()
             .name("metal-prefix-ssd-writer".to_string())
-            .spawn(move || disk_writer_loop(rx, &index, &adapter, fsync_each_block))
+            .spawn(move || {
+                disk_writer_loop(rx, &index, &adapter, fsync_each_block, writer_pending_bytes);
+            })
             .expect("spawn Metal prefix SSD-writer thread");
         Self {
             tx: Some(tx),
             join: Some(join),
+            pending_bytes,
+            max_pending_bytes: metal_prefix_ssd_pending_bytes_limit(),
         }
     }
 
-    fn submit(&self, job: DiskWriteJob) {
+    fn try_reserve_pending(&self, bytes: u64, token_count: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        if bytes > self.max_pending_bytes {
+            warn!(
+                "Metal Qwen3.5 SSD prefix persist too large for pending queue; \
+                 tokens={token_count} job_bytes={bytes} limit_bytes={}",
+                self.max_pending_bytes
+            );
+            return false;
+        }
+
+        let mut current = self.pending_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                warn!(
+                    "Metal Qwen3.5 SSD prefix pending-byte counter overflow; \
+                     tokens={token_count} job_bytes={bytes} current_bytes={current}"
+                );
+                return false;
+            };
+            if next > self.max_pending_bytes {
+                warn!(
+                    "Metal Qwen3.5 SSD prefix pending queue full; dropping persist job; \
+                     tokens={token_count} job_bytes={bytes} pending_bytes={current} \
+                     limit_bytes={}",
+                    self.max_pending_bytes
+                );
+                return false;
+            }
+            match self.pending_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release_pending(&self, bytes: u64) {
+        if bytes > 0 {
+            self.pending_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
+    fn submit_reserved(&self, job: DiskWriteJob) {
         let Some(tx) = self.tx.as_ref() else {
+            self.release_pending(job.payload.len() as u64);
             return;
         };
+        let payload_len = job.payload.len() as u64;
         if tx.send(job).is_err() {
+            self.release_pending(payload_len);
             warn!("Metal Qwen3.5 SSD prefix writer thread is gone; dropping persist job");
         }
     }
@@ -579,9 +670,12 @@ fn disk_writer_loop(
     index: &Arc<Mutex<MetalDiskPrefixIndex>>,
     adapter: &MetalTierAdapter,
     fsync_each_block: bool,
+    pending_bytes: Arc<AtomicU64>,
 ) {
     let trace = std::env::var("INFER_M_E13_TRACE").is_ok();
     while let Ok(job) = rx.recv() {
+        let _pending_payload =
+            PendingDiskPayload::new(Arc::clone(&pending_bytes), job.payload.len() as u64);
         // Skip if a concurrent import already re-published this exact key.
         let reserve = {
             let mut guard = match index.lock() {
@@ -1128,6 +1222,9 @@ impl MetalQwen35PrefixRuntime {
                     return;
                 }
             };
+        if !writer.try_reserve_pending(estimated_payload_len, tokens) {
+            return;
+        }
         // Encode here (serving thread): `encode_for_disk` → `to_bytes` calls
         // `eval`, which must not run concurrently with decode `async_eval` on a
         // separate thread (no global MLX lock). The resident full-length KV is
@@ -1136,12 +1233,27 @@ impl MetalQwen35PrefixRuntime {
         let payload = match snapshot.encode_for_disk(&self.model_fingerprint) {
             Ok(payload) => payload,
             Err(err) => {
+                writer.release_pending(estimated_payload_len);
                 warn!("Metal Qwen3.5 SSD prefix encode failed: {err:#}");
                 return;
             }
         };
+        let actual_payload_len = payload.len() as u64;
+        match actual_payload_len.cmp(&estimated_payload_len) {
+            std::cmp::Ordering::Greater => {
+                let delta = actual_payload_len - estimated_payload_len;
+                if !writer.try_reserve_pending(delta, tokens) {
+                    writer.release_pending(estimated_payload_len);
+                    return;
+                }
+            }
+            std::cmp::Ordering::Less => {
+                writer.release_pending(estimated_payload_len - actual_payload_len);
+            }
+            std::cmp::Ordering::Equal => {}
+        }
         let fingerprint = self.fingerprint_for_tokens(&snapshot.token_ids);
-        writer.submit(DiskWriteJob {
+        writer.submit_reserved(DiskWriteJob {
             token_ids: snapshot.token_ids.clone(),
             fingerprint,
             payload,
@@ -3602,6 +3714,27 @@ mod tests {
             PendingMetalRequest::from_incoming(&tokenizer, incoming).expect("pending request");
         assert_eq!(pending.prompt_tokens, vec![42, 43]);
         assert_eq!(priority, MetalRequestPriority::High);
+    }
+
+    #[test]
+    fn disk_write_handle_bounds_pending_payload_bytes() {
+        let (tx, _rx) = std_mpsc::channel();
+        let handle = DiskWriteHandle {
+            tx: Some(tx),
+            join: None,
+            pending_bytes: Arc::new(AtomicU64::new(0)),
+            max_pending_bytes: 10,
+        };
+
+        assert!(handle.try_reserve_pending(6, 16));
+        assert_eq!(handle.pending_bytes.load(Ordering::Acquire), 6);
+        assert!(!handle.try_reserve_pending(5, 16));
+        assert_eq!(handle.pending_bytes.load(Ordering::Acquire), 6);
+        assert!(!handle.try_reserve_pending(11, 16));
+        assert_eq!(handle.pending_bytes.load(Ordering::Acquire), 6);
+
+        handle.release_pending(6);
+        assert_eq!(handle.pending_bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]
