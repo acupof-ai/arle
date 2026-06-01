@@ -897,6 +897,10 @@ pub(super) struct ChatCompletionRequest {
     /// Model-specific prompt rendering options. Currently used by DeepSeek-V4.
     #[serde(default)]
     pub(super) chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// vLLM / transformers-compatible top-level alias for
+    /// `chat_template_kwargs.thinking`.
+    #[serde(default)]
+    pub(super) enable_thinking: Option<bool>,
     /// Optional client-supplied session/conversation identifier.
     ///
     /// See [`CompletionRequest::session_id`] for the routing contract.
@@ -974,6 +978,19 @@ impl ChatCompletionRequest {
 
     pub(super) fn session_id_parsed(&self) -> Option<SessionId> {
         normalize_session_id(self.session_id.as_deref())
+    }
+
+    pub(super) fn thinking_override(&self) -> Option<bool> {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.thinking)
+            .or(self.enable_thinking)
+    }
+
+    pub(super) fn reasoning_effort(&self) -> Option<String> {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.reasoning_effort.clone())
     }
 
     /// Map the OpenAI `tool_choice` hint onto the prompt-builder mode.
