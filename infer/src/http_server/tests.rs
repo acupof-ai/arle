@@ -661,6 +661,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_completion_applies_qwen_enable_thinking_false_prefix() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<IncomingRequest>();
+        let (prompt_tx, prompt_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Some(req) = rx.recv().await {
+                let _ = prompt_tx.send(req.prompt.clone());
+                let _ = req.delta_tx.send(CompletionStreamDelta {
+                    text_delta: "ok".into(),
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    }),
+                    logprob: None,
+                    token_ids: Vec::new(),
+                    error: None,
+                });
+            }
+        });
+        let app = build_app(SchedulerHandle::from_parts(tx, "Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"enable_thinking":false}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let _body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let prompt = prompt_rx.await.expect("prompt capture");
+        assert!(
+            prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "expected non-thinking Qwen prefix, got: {prompt}"
+        );
+    }
+
+    #[tokio::test]
     async fn chat_completion_rejects_empty_messages() {
         let app = build_app(mock_scheduler("Qwen3-4B"));
         let request = Request::builder()
