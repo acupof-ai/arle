@@ -22,6 +22,9 @@ mod mlp;
 mod prefill;
 #[path = "deepseek/state.rs"]
 mod state;
+#[cfg(feature = "cuda")]
+#[path = "deepseek/trace.rs"]
+pub(crate) mod trace;
 #[path = "deepseek/weights.rs"]
 mod weights;
 
