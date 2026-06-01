@@ -102,6 +102,16 @@ Agent and RL workloads waste compute re-processing the same prompt + history + t
 - **Shared prefixes are cheap.** Pages are reused across requests with the same prefix — no duplicate compute, no duplicate memory.
 - **One runtime, three surfaces.** Serving, the local agent, and OPD training all run on the same Rust + model code. The OPD teacher *is* the production server.
 
+<p align="center">
+  <img src="docs/assets/metal-prefix-reuse.png" alt="ARLE Metal multi-turn prefix reuse and long-context first-response latency" width="100%">
+</p>
+
+<p align="center">
+  <em>Apple Silicon, Qwen3.6-35B-A3B-4bit, c=1 (single user), measured first-hand.
+  <strong>Left:</strong> a follow-up turn reuses the prior turn's KV — TTFT drops 6.4× (2k base) to 18× (6k base), since only the new tokens are prefilled.
+  <strong>Right:</strong> the memory-first prefix cache removes the long-context first-response stall (56–68× smaller token1→token2 gap).</em>
+</p>
+
 ```mermaid
 flowchart LR
   S["arle serve<br/>OpenAI HTTP"] --> R
