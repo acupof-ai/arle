@@ -1,5 +1,11 @@
 //! Type-only forward batch surface for future TP/PP execution.
 //!
+//! **SCAFFOLD — inert 元数据，CUDA forward 尚无 consumer。**
+//! F0.7 预留 stage-boundary tensor 槽位；在 P0' multi-GPU F2 collectives
+//! 落地前不要把它拉上 hot path。
+//! 状态真相：[`docs/support-matrix.md`](../../docs/support-matrix.md)；
+//! 架构说明：[`docs/architecture.md`](../../docs/architecture.md) §Multi-GPU。
+//!
 //! F0.7 adds this as inert metadata so later pipeline-parallel work has a
 //! stable slot for stage-boundary tensors. Existing CUDA/model forward
 //! signatures do not consume this module yet.

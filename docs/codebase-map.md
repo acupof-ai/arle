@@ -1,5 +1,8 @@
 # ARLE Codebase Map
 
+> **新人请先读 [`onboarding.md`](onboarding.md)**（30 分钟当前真相 + 验证清单）。
+> 本文是 workspace 拓扑 canonical source；战略变化见下方 pointer。
+
 > **2026-05-08 EOD+18 战略 source of truth:[`projects/2026-05-07-arle-master-strategy.md`](projects/2026-05-07-arle-master-strategy.md)**
 > §0.1 主战场 3 axis(user 2026-05-08 directive):**Agent workload(W3/W4) + 量化全套 + 投机解码(Medusa/EAGLE/DFlash)**。
 > 非主战场 deprecated:Piecewise prefill graph(Phase 0 KILL `8b4a03b`)+ canonical 4-shape 单点优化(6 KILL 全在错的 workload)。
