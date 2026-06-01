@@ -106,9 +106,28 @@ Agent and RL workloads waste compute re-processing the same prompt + history + t
   <a href="docs/experience/wins/2026-06-01-metal-low-rss-analysis.md"><img src="docs/assets/metal-vs-mlxlm-e2e.png" alt="ARLE Metal vs mlx-lm TTFT, TPOT, and RSS sweep" width="100%"></a>
 </p>
 
-<p align="center">
-  <img src="docs/assets/arle-runtime-architecture.png" alt="ARLE shared runtime architecture" width="100%">
-</p>
+```mermaid
+flowchart LR
+  S["arle serve / infer<br/>OpenAI HTTP"]
+  A["arle<br/>local agent / REPL"]
+  T["arle train opd<br/>teacher = serving runtime"]
+  R["Shared Rust runtime<br/>OpenAI router + scheduler + model authority"]
+  K["KV / prefix memory plane<br/>radix cache + paged KV + tiered residency"]
+  C["CUDA<br/>TileLang AOT + custom kernels"]
+  M["Metal<br/>MLX bridge + packed varlen decode"]
+  O["OPD loop<br/>rollouts / eval -> student update"]
+
+  S --> R
+  A --> R
+  T --> R
+  R <--> K
+  R --> C
+  R --> M
+  K --> C
+  K --> M
+  R -. teacher samples .-> O
+  O -. updates student .-> T
+```
 
 Deep dive: [onboarding](docs/onboarding.md) (30 min) · [architecture](docs/architecture.md) · [codebase-map](docs/codebase-map.md).
 
