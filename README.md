@@ -103,7 +103,10 @@ Agent and RL workloads waste compute re-processing the same prompt + history + t
 - **One runtime, three surfaces.** Serving, the local agent, and OPD training all run on the same Rust + model code. The OPD teacher *is* the production server.
 
 <p align="center">
-  <a href="docs/experience/wins/2026-06-01-metal-low-rss-analysis.md"><img src="docs/assets/metal-vs-mlxlm-e2e.png" alt="ARLE Metal vs mlx-lm TTFT, TPOT, and RSS sweep" width="100%"></a>
+  <img src="docs/assets/metal-vs-mlxlm-e2e.png" alt="ARLE Metal vs mlx-lm TTFT, TPOT, and RSS sweep" width="100%">
+</p>
+<p align="center">
+  <sub><a href="docs/experience/wins/2026-06-01-readme-metal-vs-mlxlm-ttft-rss.md">Benchmark data</a> · <a href="docs/experience/wins/2026-06-01-metal-low-rss-analysis.md">RSS analysis</a></sub>
 </p>
 
 ```mermaid
