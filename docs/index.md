@@ -2,6 +2,7 @@
 
 > **Looking for getting-started, install, or HTTP API docs?** Go to
 > [README.md](../README.md), [docs/install.md](install.md),
+> [docs/onboarding.md](onboarding.md),
 > [docs/troubleshooting.md](troubleshooting.md), or
 > [docs/http-api.md](http-api.md) instead. This file is for ARLE maintainers
 > tracking canonical truth surfaces, active plans, and experience logs.
@@ -69,6 +70,7 @@ live in this file.
 
 | Concern | Canonical source | Notes |
 | --- | --- | --- |
+| **New contributor onboarding (30 min)** | [onboarding.md](onboarding.md) | Current truth, paths, feature flags, verify checklist. |
 | Strategic master (positioning, axes, kill criteria) | [projects/2026-05-07-arle-master-strategy.md](projects/2026-05-07-arle-master-strategy.md) | Cited by [`ROADMAP.md`](../ROADMAP.md) as strategic master. |
 | Support status of backends / APIs / model families | [support-matrix.md](support-matrix.md) | README and roadmap summarize only. |
 | Quantization deep map (KV + weights, kernels, status, tests) | [quantization.md](quantization.md) | Canonical for every quant path; support-matrix §4 mirrors a one-glance view. |

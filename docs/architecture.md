@@ -1,7 +1,8 @@
 # ARLE Architecture
 
 This document is the canonical source for ownership boundaries, dependency
-direction, and crate-admission governance. For "what files exist and where
+direction, and crate-admission governance. New contributors: start at
+[onboarding.md](onboarding.md) (30 min). For "what files exist and where
 to start reading", see [codebase-map.md](codebase-map.md). For the
 extraction story behind `crates/cuda-kernels`, see
 [plans/cuda-kernel-crate-extraction.md](plans/cuda-kernel-crate-extraction.md).
@@ -59,6 +60,52 @@ Reverse dependencies from `runtime-*` (or any `infer`-internal layer) into
 - `metal`: serial backend path for Apple Silicon via `mlx-sys`.
 - `cpu`: development-oriented serial backend for smoke tests, CLI wiring, and
   end-to-end validation on non-GPU machines.
+
+## Backend Parity Matrix
+
+Cross-backend differences are intentional — hardware and maturity differ.
+Status labels mirror [`support-matrix.md`](support-matrix.md); this table is
+the architecture-level view only. Do not treat a ✅ in one column as implying
+parity in another.
+
+| Capability | CUDA | Metal | CPU |
+| --- | --- | --- | --- |
+| Production serving target | Supported | Beta | No (smoke only) |
+| Continuous batching scheduler | Yes (`scheduler/cuda/`) | Partial (serial runtime + Metal scheduler; varlen batched decode path exists but not full CUDA parity) | No |
+| Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes (`BatchKVCache` pattern via `mlx-sys`) | No |
+| Chunked prefill + decode-priority | Yes | Partial | No |
+| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8/TQ*) | No (native model dtype) | No |
+| Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots) | No |
+| Speculative decode | Not shipped (plumbing only) | Beta (DFlash for Qwen3.5) | No |
+| Multi-GPU TP/PP/EP | Scaffold (F0–F4; forward not wired) | No | No |
+| OPD teacher surface | Yes | No | No |
+| OpenAI HTTP (`/v1/chat/completions`, SSE) | Yes | Yes | Yes (synthetic) |
+
+Evidence pointers:
+
+- Backend tiers: support-matrix §1
+- Model reach: support-matrix §3
+- Quant / KV: support-matrix §4, §4b
+- Spec decode: support-matrix §4a
+- Multi-GPU scaffold: §Multi-GPU below + `infer/src/distributed/`
+
+## Change Impact Map
+
+Minimum verification after touching a layer. Runtime hot-path changes also
+require a dated entry under `docs/experience/wins/` or `errors/` per
+[`AGENTS.md`](../AGENTS.md) §Benchmarks.
+
+| Layer touched | Minimum verify | Notes |
+| --- | --- | --- |
+| `crates/cuda-kernels/csrc/` or `crates/cuda-kernels/src/` | `cargo test --release -p infer --features cuda`; kernel regressions in `infer/tests/smoke_*` | Bench: `scripts/bench_guidellm.sh` for perf claims |
+| `infer/src/scheduler/cuda/` | `cargo test --release --test e2e` | Scheduler invariants: [`infer/src/scheduler/AGENTS.md`](../infer/src/scheduler/AGENTS.md) |
+| `infer/src/model/qwen35/` (CUDA) | `cargo test --release --test e2e_qwen35` | Golden baselines in `infer/test_data/` |
+| KV quant / paged KV gating | `cargo test --release -p infer --features cuda --test kv_precision_parity -- --nocapture --test-threads=1` | See AGENTS.md §Build & run |
+| `infer/src/backend/metal/` or `crates/mlx-sys/` | `cargo test --release --no-default-features --features metal --test e2e_qwen35` | Canonical Metal model: Qwen3.6 MoE (AGENTS.md) |
+| `infer/src/kv_tier/` or `infer/src/prefix_cache.rs` | `cargo test --release -p infer --features cuda` + tier-specific tests | MR stability: [`infer/src/kv_tier/AGENTS.md`](../infer/src/kv_tier/AGENTS.md) |
+| `crates/agent/`, `crates/cli/`, `crates/chat/` | `cargo test --release -p agent -p cli -p chat` | No GPU required |
+| `crates/train/` OPD path | `cargo test --release -p train` | End-to-end OPD needs CUDA GPU |
+| Docs-only | — | State `docs-only` in commit body; no bench gate |
 
 ## Multi-GPU Parallel Axes (single-node F0–F4 scaffold)
 
