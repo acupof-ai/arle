@@ -8,6 +8,8 @@ use std::path::Path;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
+use std::sync::OnceLock;
+#[cfg(feature = "cuda")]
 use std::time::Instant;
 
 use anyhow::{Result, bail, ensure};
@@ -2066,8 +2068,7 @@ impl DeepseekModel {
         let use_flashmla_decode = sm_major_early == 9
             && (mode_int_early == 1 || mode_int_early == 2)
             && token_count == 1
-            && (head_dim == 512 || head_dim == 576)
-            && (local_heads == 64 || local_heads == 128)
+            && dsv4_flashmla_model1_decode_shape_supported(head_dim, local_heads)
             && cache.is_some()
             && dsv4_flashmla_decode_enabled()?;
         let fuse_window_update = update_window_cache
@@ -2759,7 +2760,7 @@ impl DeepseekModel {
                 //   sm_major == 9
                 //   mode_int ∈ {1 (CSA), 2 (HCA)}
                 //   token_count == 1 (decode)
-                //   head_dim ∈ {512 (MODEL1), 576 (V32)}
+                //   head_dim == 512 (MODEL1; FP8 pool/pack layout is MODEL1-only)
                 //   local_heads ∈ {64, 128} (FlashMLA hard-assert h_q)
                 //   cache is Some (FP8 pool + arena live here)
                 //   env knob ON
@@ -2775,7 +2776,7 @@ impl DeepseekModel {
                 // The bf16 SW ring update runs unfused after this branch
                 // (`fuse_window_update = false` for this path) so an env-OFF
                 // fallback during the same session sees a consistent ring.
-                let model_type_int: i32 = i32::from(head_dim == 512);
+                let model_type_int: i32 = 1; // MODEL1
                 let sliding_window = self.config.sliding_window;
                 let index_topk = self.config.index_topk;
                 let d_v = head_dim; // MODEL1: d_qk == d_v == 512 at NoPE+RoPE
@@ -3009,11 +3010,7 @@ impl DeepseekModel {
                 drop(log);
 
                 let scale = 1.0_f32 / (head_dim as f32).sqrt();
-                let bytes_per_token = if head_dim == 512 {
-                    DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN as i32
-                } else {
-                    656_i32 // V32
-                };
+                let bytes_per_token = DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN as i32;
                 let stride_kv_block_bytes =
                     DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32 * bytes_per_token;
                 // Strides for q [b=1, s_q=1, h_q, d_qk]: elements.
@@ -3471,9 +3468,9 @@ impl DeepseekModel {
         head_dim: usize,
     ) -> Result<()> {
         ensure!(
-            head_dim == DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE,
+            head_dim == DSV4_FLASHMLA_MODEL1_HEAD_DIM,
             "DSv4 FlashMLA compressor pack requires head_dim={}, got {head_dim}",
-            DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE
+            DSV4_FLASHMLA_MODEL1_HEAD_DIM
         );
         let compressed_rows = match cache.compressed_gpu.as_ref() {
             Some(c) => c.compressed_rows,
@@ -3547,9 +3544,9 @@ impl DeepseekModel {
             return Ok(());
         }
         ensure!(
-            head_dim == DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE,
+            head_dim == DSV4_FLASHMLA_MODEL1_HEAD_DIM,
             "DSv4 FlashMLA SW bootstrap requires head_dim={}, got {head_dim}",
-            DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE
+            DSV4_FLASHMLA_MODEL1_HEAD_DIM
         );
         let sliding_window = self.config.sliding_window;
         if sliding_window == 0 {
@@ -4578,6 +4575,8 @@ fn ensure_swa_window_cache<'a>(
 #[cfg(feature = "cuda")]
 const DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE: usize = 64;
 #[cfg(feature = "cuda")]
+const DSV4_FLASHMLA_MODEL1_HEAD_DIM: usize = DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE;
+#[cfg(feature = "cuda")]
 const DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN: usize = 584;
 #[cfg(feature = "cuda")]
 const DSV4_FLASHMLA_MODEL1_BLOCK_BYTES: usize =
@@ -4864,9 +4863,9 @@ fn dsv4_flashmla_bulk_pack_sw_ring_raw(
     }
     // Defensive guard: head_dim must be 512 (MODEL1 contract — NoPE 448 + RoPE 64).
     ensure!(
-        head_dim == DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE,
+        head_dim == DSV4_FLASHMLA_MODEL1_HEAD_DIM,
         "DSv4 FlashMLA FP8 KV pool bootstrap requires head_dim={}, got {head_dim}",
-        DSV4_HEAD_DIM_NOPE + DSV4_HEAD_DIM_ROPE
+        DSV4_FLASHMLA_MODEL1_HEAD_DIM
     );
 
     // Build [n_tokens=sliding_window] block_id + row arrays:
@@ -6530,15 +6529,66 @@ fn build_attn_sink_f32_mirror(
     Ok(dst)
 }
 
+#[cfg(feature = "cuda")]
+fn dsv4_flashmla_model1_decode_shape_supported(head_dim: usize, local_heads: usize) -> bool {
+    head_dim == DSV4_FLASHMLA_MODEL1_HEAD_DIM && matches!(local_heads, 64 | 128)
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_flashmla_runtime_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let bytes_per_token = unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_bytes_per_token(
+                DSV4_FLASHMLA_MODEL1_HEAD_DIM as i32,
+                1_i32, // MODEL1
+            )
+        };
+        let available = bytes_per_token == DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN as i32;
+        if !available {
+            info!(
+                "DeepSeek V4 FlashMLA sparse kernels unavailable or linked to stubs; \
+                 default FlashMLA prefill/decode gates disabled"
+            );
+        }
+        available
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_flashmla_env_gate(name: &str, default: bool) -> Result<bool> {
+    let raw = std::env::var(name).ok();
+    let enabled = match raw.as_deref() {
+        None => default,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
+        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
+        Some(other) => bail!("invalid {name} value `{other}`"),
+    };
+    if enabled && !dsv4_flashmla_runtime_available() {
+        if raw.is_some() {
+            bail!(
+                "{name}=1 requested FlashMLA, but this binary is linked against \
+                 fallback FlashMLA stubs; rebuild with vendor/flashmla present and \
+                 without ARLE_CUDA_DISABLE_FLASHMLA=1"
+            );
+        }
+        return Ok(false);
+    }
+    Ok(enabled)
+}
+
 /// Opt-in route DSv4 CSA-mode prefill attention through the vendored
 /// FlashMLA SM90 sparse prefill kernel (replaces the per-token
 /// `dsv4_hybrid_attention_kernel` for `token_count > 1` only).
 ///
-/// Default ON — FlashMLA SM90 sparse prefill fires for the strict gate
+/// Default ON when real FlashMLA kernels are linked — FlashMLA SM90 sparse
+/// prefill fires for the strict gate
 /// (`token_count == 16384`, SM 9.x, head_dim ∈ {512, 576},
 /// `start_pos + token_count <= 24576`). Outside that envelope the dispatch
-/// falls back to the legacy per-(token, head) grid. FlashMLA tiles M=Q-tokens
-/// per block with WGMMA, which is the structural fix for the 282-second
+/// falls back to the legacy per-(token, head) grid. Stub-linked builds default
+/// this gate OFF so the fallback symbols do not surface as runtime
+/// `cudaErrorNotSupported`. FlashMLA tiles M=Q-tokens per block with WGMMA,
+/// which is the structural fix for the 282-second
 /// 29K-token-prefill measured in `2026-05-27-dsv4-grouped-gemm-marginal-
 /// prefill-kernel-not-blocker.md`.
 ///
@@ -6547,25 +6597,20 @@ fn build_attn_sink_f32_mirror(
 /// regressions).
 #[cfg(feature = "cuda")]
 fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
-    let Some(raw) = std::env::var("ARLE_DSV4_FLASHMLA_PREFILL").ok() else {
-        return Ok(true);
-    };
-    match raw.as_str() {
-        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
-        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
-        _ => bail!("invalid ARLE_DSV4_FLASHMLA_PREFILL value `{raw}`"),
-    }
+    dsv4_flashmla_env_gate("ARLE_DSV4_FLASHMLA_PREFILL", true)
 }
 
 /// Phase D-4 — FlashMLA sparse-FP8 decode dispatch gate
-/// (`ARLE_DSV4_FLASHMLA_DECODE`). Defaults to **ON** (industry-standard
-/// per SGLang DSv4 day-0). Pod parity validated 2026-05-29 on 8×H20 TP=8:
+/// (`ARLE_DSV4_FLASHMLA_DECODE`). Defaults to **ON** only when real FlashMLA
+/// kernels are linked (industry-standard per SGLang DSv4 day-0). Pod parity
+/// validated 2026-05-29 on 8×H20 TP=8:
 /// FlashMLA decode vs the legacy `dsv4_hybrid_attention_cuda` kernel
 /// produced **byte-identical greedy output across two shapes** (the
 /// 137+269 smoke + a 128-token "ocean paragraph" generation), with
 /// neutral-to-positive decode throughput. The SM90 gate (sm_major==9,
-/// head_dim ∈ {512,576}, token_count==1, cache present) means non-SM90 /
-/// out-of-envelope steps still fall back to legacy automatically.
+/// MODEL1 head_dim==512, token_count==1, cache present) means non-SM90 /
+/// out-of-envelope steps still fall back to legacy automatically. Stub-linked
+/// builds also default this gate OFF before the FFI boundary.
 /// Override with `ARLE_DSV4_FLASHMLA_DECODE=0` for A/B or to isolate a
 /// FlashMLA-induced regression.
 ///
@@ -6573,14 +6618,7 @@ fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
 /// `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md`.
 #[cfg(feature = "cuda")]
 pub(super) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
-    let Some(raw) = std::env::var("ARLE_DSV4_FLASHMLA_DECODE").ok() else {
-        return Ok(true);
-    };
-    match raw.as_str() {
-        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
-        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
-        _ => bail!("invalid ARLE_DSV4_FLASHMLA_DECODE value `{raw}`"),
-    }
+    dsv4_flashmla_env_gate("ARLE_DSV4_FLASHMLA_DECODE", true)
 }
 
 /// Phase D-4 (shared-pool) — gate for the **shared persistent FP8 decode KV
@@ -6682,6 +6720,14 @@ mod tests {
 
     fn bf16_vec(values: &[f32]) -> Vec<bf16> {
         values.iter().map(|&value| bf16::from_f32(value)).collect()
+    }
+
+    #[test]
+    fn flashmla_decode_shape_gate_is_model1_only() {
+        assert!(dsv4_flashmla_model1_decode_shape_supported(512, 64));
+        assert!(dsv4_flashmla_model1_decode_shape_supported(512, 128));
+        assert!(!dsv4_flashmla_model1_decode_shape_supported(576, 64));
+        assert!(!dsv4_flashmla_model1_decode_shape_supported(512, 8));
     }
 
     fn tiny_config() -> DeepSeekV4Config {

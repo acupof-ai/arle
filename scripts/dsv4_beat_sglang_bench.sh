@@ -7,12 +7,13 @@
 #
 # Runs INSIDE the pod (invoke via `~/bin/pod 'bash /data01/build/arle/scripts/dsv4_beat_sglang_bench.sh <engine> <phase>'`).
 #   engine: arle | sglang
-#   phase : serve | bench | both   (default both)
+#   phase : serve | bench | both   (default both; both starts a server,
+#           waits for readiness, runs the bench, then stops the server)
 #
 # Standard SLO shape (decode-throughput-dominant): ISL=1024 OSL=512,
 # concurrency sweep {1,8,32}. Writes JSON results to
 # /data01/build/arle/docs/trace-artifacts/beat-sglang/<engine>-<ts>.json
-set -uo pipefail
+set -euo pipefail
 
 ENGINE="${1:-arle}"
 PHASE="${2:-both}"
@@ -24,10 +25,31 @@ ARLE_PORT=18300
 SGL_PORT=30000
 ISL=1024; OSL=512
 CONCURRENCY="1 8 32"
+READY_TIMEOUT_SEC="${READY_TIMEOUT_SEC:-900}"
+SERVER_PID=""
+SERVER_LOG=""
 
-serve_arle() {
-  cd /data01/build/arle
-  pkill -9 -f target-pod/release/infer 2>/dev/null; sleep 2
+usage() {
+  cat >&2 <<'EOF'
+usage: dsv4_beat_sglang_bench.sh <arle|sglang> <serve|bench|both>
+
+  serve: start the selected server in the foreground
+  bench: run the bench against an already-running selected server
+  both : start the selected server in the background, wait /v1/models,
+         run the bench, then stop the server
+EOF
+}
+
+case "$ENGINE" in
+  arle|sglang) ;;
+  *) usage; exit 2 ;;
+esac
+case "$PHASE" in
+  serve|bench|both) ;;
+  *) usage; exit 2 ;;
+esac
+
+run_arle_server() {
   INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 \
   ARLE_DSV4_LOAD_LAYER_WEIGHTS=1 ARLE_DSV4_GPU_FULL_LAYERS=43 \
   ARLE_DSV4_INCREMENTAL_KV=1 ARLE_DSV4_FLASHMLA_PREFILL=1 ARLE_DSV4_FLASHMLA_DECODE=1 \
@@ -37,12 +59,78 @@ serve_arle() {
     --kv-cache-dtype fp8 --deepseek-distributed-layers 43
 }
 
-serve_sglang() {
-  pkill -9 -f sglang.launch_server 2>/dev/null; sleep 2
-  cd /sgl-workspace/sglang
+run_sglang_server() {
   python3 -m sglang.launch_server --model-path "$MODEL" --tp 8 \
     --trust-remote-code --port $SGL_PORT --mem-fraction-static 0.80 \
     --kv-cache-dtype fp8_e4m3 2>&1
+}
+
+serve_arle() {
+  cd /data01/build/arle
+  pkill -9 -f target-pod/release/infer 2>/dev/null || true; sleep 2
+  run_arle_server
+}
+
+serve_sglang() {
+  pkill -9 -f sglang.launch_server 2>/dev/null || true; sleep 2
+  cd /sgl-workspace/sglang
+  run_sglang_server
+}
+
+start_arle() {
+  pkill -9 -f target-pod/release/infer 2>/dev/null || true; sleep 2
+  SERVER_LOG="$OUTDIR/arle-serve-$(date +%Y%m%d-%H%M%S).log"
+  (cd /data01/build/arle && run_arle_server) >"$SERVER_LOG" 2>&1 &
+  SERVER_PID=$!
+  echo "started ARLE pid=$SERVER_PID log=$SERVER_LOG"
+}
+
+start_sglang() {
+  pkill -9 -f sglang.launch_server 2>/dev/null || true; sleep 2
+  SERVER_LOG="$OUTDIR/sglang-serve-$(date +%Y%m%d-%H%M%S).log"
+  (cd /sgl-workspace/sglang && run_sglang_server) >"$SERVER_LOG" 2>&1 &
+  SERVER_PID=$!
+  echo "started SGLang pid=$SERVER_PID log=$SERVER_LOG"
+}
+
+cleanup_server() {
+  if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  case "$ENGINE" in
+    arle) pkill -f target-pod/release/infer 2>/dev/null || true ;;
+    sglang) pkill -f sglang.launch_server 2>/dev/null || true ;;
+  esac
+  SERVER_PID=""
+}
+
+wait_ready() {
+  local port="$1" tag="$2"
+  local waited=0
+  while (( waited < READY_TIMEOUT_SEC )); do
+    if python3 - "$port" <<'PY'
+import sys, urllib.request
+port = sys.argv[1]
+try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=2) as resp:
+        raise SystemExit(0 if 200 <= resp.status < 500 else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+    then
+      echo "$tag ready on port $port after ${waited}s"
+      return 0
+    fi
+    if [[ -n "${SERVER_PID:-}" ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "$tag server exited before readiness; see $SERVER_LOG" >&2
+      return 1
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "$tag server did not become ready within ${READY_TIMEOUT_SEC}s; see $SERVER_LOG" >&2
+  return 1
 }
 
 # Minimal OpenAI-compat throughput bench (no external deps): fire N concurrent
@@ -84,11 +172,26 @@ print("wrote", out)
 PY
 }
 
-case "$ENGINE" in
-  arle)   [[ "$PHASE" =~ (serve|both) ]] && serve_arle ;;
-  sglang) [[ "$PHASE" =~ (serve|both) ]] && serve_sglang ;;
-esac
+bench_tag="${ENGINE}-$(date +%Y%m%d-%H%M%S)"
 case "$ENGINE-$PHASE" in
-  arle-bench)   bench $ARLE_PORT "arle" ;;
-  sglang-bench) bench $SGL_PORT "sglang" ;;
+  arle-serve) serve_arle ;;
+  sglang-serve) serve_sglang ;;
+  arle-bench) bench $ARLE_PORT "$bench_tag" ;;
+  sglang-bench) bench $SGL_PORT "$bench_tag" ;;
+  arle-both)
+    trap cleanup_server EXIT
+    start_arle
+    wait_ready $ARLE_PORT "ARLE"
+    bench $ARLE_PORT "$bench_tag"
+    cleanup_server
+    trap - EXIT
+    ;;
+  sglang-both)
+    trap cleanup_server EXIT
+    start_sglang
+    wait_ready $SGL_PORT "SGLang"
+    bench $SGL_PORT "$bench_tag"
+    cleanup_server
+    trap - EXIT
+    ;;
 esac

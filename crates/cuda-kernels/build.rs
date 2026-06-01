@@ -1283,6 +1283,7 @@ fn main() {
     // CUTLASS ships inside vendor/flashmla/csrc/cutlass/ (NVIDIA tag
     // 147f5673 — FlashMLA submodule pin). Refs sgl-kernel/cmake/flashmla.cmake.
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHMLA");
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_FLASHMLA");
     let flashmla_root = Path::new("vendor/flashmla");
     let flashmla_stub = Path::new("csrc/attention/arle_flashmla_decode_stubs.cu");
     let enable_flashmla = flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA");
