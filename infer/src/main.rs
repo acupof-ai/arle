@@ -25,6 +25,7 @@ use infer::scheduler::{
     SchedulerMixedPolicy,
 };
 use infer::server_engine::EnginePoolModelSpec;
+use infer::tensor_parallel::MultiAxisConfig;
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
 use log::info;
 
@@ -346,11 +347,11 @@ fn main() {
 /// `EnvBootstrap` (MASTER_ADDR/PORT/WORLD_SIZE env, set by the coordinator)
 /// and run a single scheduler thread bound to one CUDA device.
 ///
-/// This skeleton does **not** yet handle request relay from rank-0 — phase
-/// B-1 commit C wires the NCCL `broadcast_bytes` of bincode-serialized
-/// `StepPlan` messages into the scheduler's request_rx. Today the worker
-/// boots, idles until the parent process closes the file-descriptor it
-/// inherited from the coordinator's spawn, then exits.
+/// Request relay is wired through `multiproc_relay`: rank 0 broadcasts each
+/// logical request, workers reconstruct the same `IncomingRequest`, attach
+/// NCCL-backed token synchronization, and submit it to their local scheduler.
+/// This is still replicated-token execution; it is not token-owned DP/EP
+/// sharding.
 ///
 /// Exit semantics: the worker blocks on a `read()` of fd `ARLE_WORKER_PARENT_FD`
 /// (set to a pipe write-end the coordinator holds). When the coordinator
@@ -656,6 +657,13 @@ fn configure_deepseek_serving_env_if_needed(args: &Args) -> Result<()> {
             world_size
         );
     }
+    let tp_world_size =
+        parse_deepseek_axis_world_size("INFER_TP_SIZE", "ARLE_TP_SIZE", world_size, world_size)?;
+    let ep_world_size =
+        parse_deepseek_axis_world_size("INFER_EP_SIZE", "ARLE_EP_SIZE", world_size, world_size)?;
+    let axes = MultiAxisConfig::current_route_from_env_with_defaults(tp_world_size, ep_world_size)
+        .context("loading DeepSeek V4 multi-axis layout env")?;
+    log_deepseek_path_contract(world_size, tp_world_size, ep_world_size, &axes)?;
 
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").context("reserve NCCL rendezvous TCP port")?;
@@ -684,6 +692,117 @@ fn configure_deepseek_serving_env_if_needed(args: &Args) -> Result<()> {
         world_size, layers, resolved_model_path
     );
     Ok(())
+}
+
+fn log_deepseek_path_contract(
+    world_size: usize,
+    tp_world_size: usize,
+    ep_world_size: usize,
+    axes: &MultiAxisConfig,
+) -> Result<()> {
+    let sglang_path_requested = env_flag_enabled("ARLE_DSV4_SGLANG_PATH")?;
+    let mode = if sglang_path_requested {
+        "sglang-path-requested"
+    } else {
+        "replicated-token-default"
+    };
+    info!(
+        "DeepSeek V4 path contract: mode={} workers={} axes={} moe_backend={} shared_kv_pool={} multiproc={}",
+        mode,
+        world_size,
+        axes.summary(),
+        std::env::var("ARLE_DSV4_MOE_BACKEND").unwrap_or_else(|_| "allreduce(default)".into()),
+        std::env::var("ARLE_DSV4_SHARED_KV_POOL").unwrap_or_else(|_| "0(default)".into()),
+        std::env::var("ARLE_MULTIPROC_SERVE").unwrap_or_else(|_| "0(default)".into()),
+    );
+    ensure_deepseek_current_axis_support(tp_world_size, ep_world_size, axes)?;
+    validate_deepseek_sglang_path_contract(world_size, axes, sglang_path_requested)
+}
+
+fn ensure_deepseek_current_axis_support(
+    tp_world_size: usize,
+    ep_world_size: usize,
+    axes: &MultiAxisConfig,
+) -> Result<()> {
+    let axis_tp_size = tp_world_size.max(ep_world_size);
+    if axes.is_global_tp_ep_only(axis_tp_size, ep_world_size) {
+        return Ok(());
+    }
+    bail!(
+        "DeepSeek V4 advanced multi-axis layout is parsed but not wired into execution yet: axes={} tp_world={} ep_world={}. Current executable path supports only global TP/EP; see docs/plans/2026-06-01-dsv4-sglang-path-alignment.md.",
+        axes.summary(),
+        tp_world_size,
+        ep_world_size,
+    );
+}
+
+fn validate_deepseek_sglang_path_contract(
+    world_size: usize,
+    axes: &MultiAxisConfig,
+    requested: bool,
+) -> Result<()> {
+    if !requested {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    if !env_flag_enabled("ARLE_MULTIPROC_SERVE")? {
+        missing.push("ARLE_MULTIPROC_SERVE=1 (one CUDA process per rank)".to_string());
+    }
+    if axes.world_size() != world_size {
+        missing.push(format!(
+            "multi-axis world_size must match CUDA workers: axes.world={} workers={world_size}",
+            axes.world_size()
+        ));
+    }
+    if !env_value_is_one_of("ARLE_DSV4_MOE_BACKEND", &["native-deepep", "native_deepep"]) {
+        missing.push("ARLE_DSV4_MOE_BACKEND=native-deepep".to_string());
+    }
+    if !env_flag_enabled("ARLE_DSV4_SHARED_KV_POOL")? {
+        missing.push("ARLE_DSV4_SHARED_KV_POOL=1 (persistent paged FP8 KV pool)".to_string());
+    }
+
+    // These are code contracts, not env knobs. They intentionally keep
+    // `ARLE_DSV4_SGLANG_PATH=1` fail-closed until ARLE stops running the
+    // replicated-token route.
+    missing.push(
+        "distributed request fanout still submits the full logical request to every rank; token-owned DP/EP request shards are not implemented".to_string(),
+    );
+    missing.push(
+        "DeepSeek decode attention still loops per row in forward_decode_batch; batched FlashMLA with SGLang sparse/recent indices is not wired".to_string(),
+    );
+    missing.push(
+        "LayerCommunicator only attaches global TP/EP groups; attention-DP/CP and MoE-DP subgroup communicators are not wired".to_string(),
+    );
+
+    if !missing.is_empty() {
+        bail!(
+            "ARLE_DSV4_SGLANG_PATH=1 requested, but the DSv4 SGLang path contract is incomplete:\n - {}\nUnset ARLE_DSV4_SGLANG_PATH to run the current replicated-token default path.",
+            missing.join("\n - ")
+        );
+    }
+    Ok(())
+}
+
+fn env_flag_enabled(key: &str) -> Result<bool> {
+    let Some(raw) = std::env::var(key).ok() else {
+        return Ok(false);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("invalid {key} value `{raw}`: expected 0/1, true/false, yes/no, or on/off"),
+    }
+}
+
+fn env_value_is_one_of(key: &str, expected: &[&str]) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            expected.iter().any(|value| normalized == *value)
+        })
+        .unwrap_or(false)
 }
 
 fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
@@ -715,7 +834,7 @@ fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
         use infer::model::deepseek::{DeepseekModel, DeepseekRuntimeConfig};
         use infer::model::{GenerationState, ModelForward};
         use infer::sampler::SamplingParams;
-        use infer::tensor_parallel::TpConfig;
+        use infer::tensor_parallel::{MultiAxisConfig, RankCoord, TpConfig};
         use infer::tokenizer::Tokenizer;
         use rand::{SeedableRng, rngs::StdRng};
         use serde::Serialize;
@@ -873,6 +992,16 @@ fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
                             runtime.tp = TpConfig::new(world_size, rank)?;
                             runtime.ep =
                                 ExpertGroup::new(rank, world_size, runtime.spec.n_routed_experts)?;
+                            runtime.axes = MultiAxisConfig::global_tp_ep(world_size, world_size)
+                                .context("loading DeepSeek direct-generate axis layout")?;
+                            runtime.rank_coord = RankCoord::from_world_rank(runtime.axes, rank)
+                                .context("loading DeepSeek direct-generate rank coordinate")?;
+                            runtime
+                                .validate_current_axis_support(Some(world_size))
+                                .context("validating DeepSeek direct-generate axis layout")?;
+                            runtime
+                                .validate_sglang_path_claim(Some(world_size))
+                                .context("validating DeepSeek direct-generate SGLang path claim")?;
                             let model = {
                                 let _load_span = fastrace::Span::enter_with_parent(
                                     "deepseek_direct_load",
@@ -1448,6 +1577,15 @@ fn deepseek_parallel_config_for_rank(
         parse_deepseek_axis_world_size("INFER_TP_SIZE", "ARLE_TP_SIZE", world_size, world_size)?;
     let ep_world_size =
         parse_deepseek_axis_world_size("INFER_EP_SIZE", "ARLE_EP_SIZE", world_size, world_size)?;
+    let axes = MultiAxisConfig::current_route_from_env_with_defaults(tp_world_size, ep_world_size)
+        .context("loading DeepSeek HTTP multi-axis layout")?;
+    ensure_deepseek_current_axis_support(tp_world_size, ep_world_size, &axes)?;
+    anyhow::ensure!(
+        axes.world_size() == world_size,
+        "DeepSeek HTTP multi-axis world_size ({}) must match CUDA worker count ({world_size}); axes={}",
+        axes.world_size(),
+        axes.summary(),
+    );
     anyhow::ensure!(
         tp_world_size == 1 || tp_world_size == world_size,
         "DeepSeek HTTP TP override must be 1 or total CUDA workers ({world_size}); got {tp_world_size}"
@@ -1460,11 +1598,15 @@ fn deepseek_parallel_config_for_rank(
         tp_world_size > 1 || ep_world_size > 1,
         "DeepSeek distributed HTTP needs TP or EP to span the CUDA workers"
     );
+    let coord = infer::tensor_parallel::RankCoord::from_world_rank(axes, rank)
+        .context("loading DeepSeek HTTP rank coordinate")?;
     Ok(DeepseekParallelConfig {
         tp_rank: if tp_world_size == 1 { 0 } else { rank },
         tp_world_size,
         ep_rank: if ep_world_size == 1 { 0 } else { rank },
         ep_world_size,
+        axes,
+        coord,
     })
 }
 
@@ -1620,29 +1762,12 @@ async fn async_main(args: Args) {
     // The `_worker_children` RAII guard holds parent pipe write-ends; when
     // it drops at end of async_main, workers EOF on their read() and exit.
     //
-    // KNOWN-INCOMPLETE STATE (phase B-1 commit C pending): the cross-process
-    // request relay is NOT wired yet. Without it, rank-0's HTTP handler
-    // submits requests only to its own in-process scheduler. Workers boot
-    // with empty request_rx queues and never enter forward, so any TP/EP
-    // NCCL collective issued by rank-0's forward will block forever waiting
-    // for worker ranks. Setting ARLE_MULTIPROC_SERVE=1 today therefore
-    // panics at the guard below — use ARLE_MULTIPROC_ALLOW_DEADLOCK=1 to
-    // bypass for scaffolding-level smoke tests (e.g. verifying spawn).
-    // Phase B-1 commit C.4.5 — deadlock guard removed. Commits C.4.3/C.4.4
-    // wired request fanout (coordinator broadcasts via relay, worker
-    // relay-receiver pushes to local scheduler), so NCCL collectives no
-    // longer deadlock on missing worker participation. Scheduler-side
-    // NCCL-backed DistributedRequestCoordination attachment (C.4.6) is
-    // still pending — until that lands, token sampling on worker ranks
-    // diverges from rank 0's. That manifests as worker-side hidden-
-    // state drift, not a deadlock — and worker output never reaches the
-    // user anyway (delta_rx drained), so the user-visible response is
-    // still correct (it comes from rank 0).
-    // Phase B-1 commit C.3 — bind the relay coordinator BEFORE spawning
-    // children so its port can be exported via env, then accept N-1
-    // worker connections AFTER spawn. The relay is the cross-process
-    // control plane that ships per-request batch metadata; C.4 wires it
-    // into the DistributedSchedulerGroup submission path.
+    // Multiproc serve: bind the relay coordinator BEFORE spawning children so
+    // its port can be exported via env, then accept N-1 worker connections
+    // AFTER spawn. The relay broadcasts full logical requests to worker ranks;
+    // workers attach NCCL-backed token sync before local scheduler submission.
+    // This prevents collective deadlock but remains replicated-token fanout,
+    // not SGLang-style token-owned DP/EP sharding.
     #[cfg(unix)]
     let pending_relay =
         if std::env::var("ARLE_MULTIPROC_SERVE").is_ok() && worker_bootstrap.len() > 1 {
@@ -1732,13 +1857,10 @@ async fn async_main(args: Args) {
     for (candidate_idx, (kv_cache_dtype, kv_pool_format, kv_mode_label)) in
         kv_candidates.iter().copied().enumerate()
     {
-        // Coordinator passes None — uses enumerate-based rank, world_size=
-        // workers.len(). The B-1 commit B.2 child-spawn already trimmed
-        // `worker_bootstrap_for_coord` to just the rank-0 entry when
-        // ARLE_MULTIPROC_SERVE=1, so rank-0 + world_size=1 reflects the
-        // coordinator-process role correctly. Worker children invoke
-        // spawn_cuda_worker_group via run_worker_mode with the explicit
-        // DistributedShape override.
+        // In multiproc-serve, the coordinator passes an explicit
+        // DistributedShape for rank 0 while worker children pass their own
+        // rank offsets from run_worker_mode. Without multiproc, None preserves
+        // the single-process enumerate-based worker layout.
         match spawn_cuda_worker_group(
             model_path,
             &args,

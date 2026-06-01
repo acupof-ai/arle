@@ -101,6 +101,12 @@ kernel 的 launch param 直接由 device 在 graph 内产，**不出 graph**。
 
 ### A2 · FlashMLA hybrid attention 单 kernel（单卡，~10%→~5% GPU 时间）
 
+**2026-06-01 priority caveat**：保留为 attention 轴，但在 DSv4
+SGLang-path campaign 里低于 A1/MoE transport。用户给的 vLLM/SGLang trace
+显示主要差距在 MoE MLP、expert GEMM、EP dispatch/combine 和 buffer
+materialization；attention main kernel 两边接近。除非 fresh path-aligned trace
+重新证明 attention 是主瓶颈，否则 A2 只作为 current-route backlog。
+
 **SGLang 机制**：SWA（sliding window）和 sparse/dense compressed attention
 **一次 fused kernel call**，"share metadata construction"。Hopper sm_90 head
 padding 到 64 的倍数。

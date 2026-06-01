@@ -22,26 +22,21 @@ The 2026-05-24 backlog
 [`projects/2026-05-24-opd-mainline-task-backlog.md`](projects/2026-05-24-opd-mainline-task-backlog.md)
 predates the methodology shift and is stale.
 
-**DSv4 status snapshot (2026-05-26):** DSv4 DeepEP decode remains the active
-next-model hot path. User-facing target framing is input 32K / output 1.5K,
-H20 qps 8 at concurrency 8, SLO TTFT <= 5000 ms and TPOT <= 30 ms; current
-target baseline is TTFT 4800 ms, TPOT 18 ms, total throughput 8402. Default
-B=1 padded BF16 reduce-scatter combine, fused local-expert prepare, broad
-scratch reuse, DeepEP-style dispatch/combine, and the DeepGEMM auto local
-expert backend have landed. Required DeepGEMM remains a fail-fast validation
-toolchain gate after the 2026-05-26 wall-clock and correctness KILL;
-route-grouped experts remain diagnostic-only. Remaining blockers: replacing the
-DeepEP-style NCCL fallback with native DeepEP low-latency kernels,
-byte-identical grouped expert GEMM, launch churn. `deepep` is the default MoE
-backend today; native DeepEP is now the top DSv4 communication axis, but it is
-not yet the default because the official multi-process DeepEP LL/intranode
-gates pass while ARLE's same-process 8-thread LL/intranode gates fail. The next
-DeepEP step is a process-per-rank transport design, not another same-process
-drop-in attempt. A2.0 fused the B=1 decode attention
-window-cache update into the attention kernels, removing 9504 standalone update
-kernel launches from the measured H20 `max_tokens=32` nsys request. A2.1 fused
-Q/K prepare into one launch, cutting `cudaLaunchKernel` runtime calls 490244 →
-479574 in the same filtered decode framing. Evidence:
+**DSv4 status snapshot (2026-06-01):** DSv4 serving is correct enough to output
+tokens on the current default path, but the current path is not SGLang-path
+aligned. Default MoE transport is local routed experts plus EP all-reduce;
+native DeepEP is explicitly blocked on the replicated-token TP/EP route because
+it over-transports token rows by about 4.4x. The SGLang-gap campaign now uses
+[`plans/2026-06-01-dsv4-sglang-path-alignment.md`](plans/2026-06-01-dsv4-sglang-path-alignment.md)
+as the controlling plan. The user-supplied SGLang reference is about
+18 ms/token, so a `>20%` ARLE win means `<=14.4 ms/token` if the metric is raw
+target-step TPOT; the older `60-64 ms/token` framing is deprecated. The
+operator roofline queue is subordinate to this path contract and cannot
+license a SGLang-comparable win until request ownership, multi-axis TP/DP/EP
+layout, batched FlashMLA paged-KV attention, and native DeepEP/MegaMoE-style
+MoE transport are aligned. A later user-supplied vLLM/SGLang trace makes the
+post-contract P0 MoE/EP first: fused SwiGLU+quant, DeepGEMM expert GEMM,
+DeepEP dispatch/combine, and scratch/materialization elimination. Historical evidence:
 [`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md),

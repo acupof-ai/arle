@@ -336,6 +336,154 @@ impl MultiAxisConfig {
         }
     }
 
+    pub fn global_tp_ep(tp_size: usize, ep_size: usize) -> Result<Self> {
+        let cfg = Self {
+            tp_size,
+            pp_size: 1,
+            ep_size,
+            attn_dp_size: 1,
+            attn_cp_size: 1,
+            moe_dp_size: 1,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Parse SGLang-style multi-axis layout from environment.
+    ///
+    /// This does not by itself enable DP/CP/MoE-DP execution. It is the
+    /// runtime contract input used by DSv4 startup diagnostics and fail-closed
+    /// guards so a run cannot silently claim a SGLang-equivalent layout while
+    /// only wiring global TP/EP.
+    pub fn from_env() -> Result<Self> {
+        Self::from_env_with_defaults(1, 1, 1)
+    }
+
+    pub fn from_env_with_defaults(
+        tp_default: usize,
+        pp_default: usize,
+        ep_default: usize,
+    ) -> Result<Self> {
+        Self::from_lookup_with_defaults(tp_default, pp_default, ep_default, |key| {
+            std::env::var(key).ok()
+        })
+    }
+
+    pub fn current_route_from_env_with_defaults(
+        tp_world_size: usize,
+        ep_world_size: usize,
+    ) -> Result<Self> {
+        Self::current_route_from_lookup_with_defaults(tp_world_size, ep_world_size, |key| {
+            std::env::var(key).ok()
+        })
+    }
+
+    #[cfg(test)]
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        Self::from_lookup_with_defaults(1, 1, 1, &mut lookup)
+    }
+
+    fn current_route_from_lookup_with_defaults(
+        tp_world_size: usize,
+        ep_world_size: usize,
+        mut lookup: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let axis_tp_default = tp_world_size.max(ep_world_size);
+        match Self::from_lookup_with_defaults(axis_tp_default, 1, ep_world_size, &mut lookup) {
+            Ok(cfg) => Ok(cfg),
+            Err(err)
+                if tp_world_size == 1
+                    && ep_world_size > 1
+                    && !subgroup_axis_env_present(&mut lookup) =>
+            {
+                // Current ARLE still supports a legacy EP-only override
+                // (`tp=1, ep=world`). SGLang's axis math represents EP inside
+                // the TP axis, so use `tp=world, ep=world` for diagnostics
+                // while keeping the actual runtime TP config unchanged.
+                Self::global_tp_ep(ep_world_size, ep_world_size).map_err(|fallback_err| {
+                    anyhow::anyhow!(
+                        "failed to build legacy EP-only multi-axis diagnostic fallback: {fallback_err}; original parse error: {err}"
+                    )
+                })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn from_lookup_with_defaults(
+        tp_default: usize,
+        pp_default: usize,
+        ep_default: usize,
+        mut lookup: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let cfg = Self {
+            tp_size: parse_parallel_env_usize(
+                "INFER_TP_SIZE",
+                "ARLE_TP_SIZE",
+                tp_default,
+                &mut lookup,
+            )?,
+            pp_size: parse_parallel_env_usize(
+                "INFER_PP_SIZE",
+                "ARLE_PP_SIZE",
+                pp_default,
+                &mut lookup,
+            )?,
+            ep_size: parse_parallel_env_usize(
+                "INFER_EP_SIZE",
+                "ARLE_EP_SIZE",
+                ep_default,
+                &mut lookup,
+            )?,
+            attn_dp_size: parse_parallel_env_usize(
+                "INFER_ATTN_DP_SIZE",
+                "ARLE_ATTN_DP_SIZE",
+                1,
+                &mut lookup,
+            )?,
+            attn_cp_size: parse_parallel_env_usize(
+                "INFER_ATTN_CP_SIZE",
+                "ARLE_ATTN_CP_SIZE",
+                1,
+                &mut lookup,
+            )?,
+            moe_dp_size: parse_parallel_env_usize(
+                "INFER_MOE_DP_SIZE",
+                "ARLE_MOE_DP_SIZE",
+                1,
+                &mut lookup,
+            )?,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "tp={} pp={} ep={} attn_dp={} attn_cp={} attn_tp={} moe_dp={} moe_tp={} world={}",
+            self.tp_size,
+            self.pp_size,
+            self.ep_size,
+            self.attn_dp_size,
+            self.attn_cp_size,
+            self.attn_tp_size(),
+            self.moe_dp_size,
+            self.moe_tp_size(),
+            self.world_size(),
+        )
+    }
+
+    /// The only multi-rank DSv4 execution shape wired today: global TP and
+    /// global EP, with no attention-DP/CP or MoE-DP subgroups.
+    pub fn is_global_tp_ep_only(&self, tp_size: usize, ep_size: usize) -> bool {
+        self.tp_size == tp_size
+            && self.pp_size == 1
+            && self.ep_size == ep_size
+            && self.attn_dp_size == 1
+            && self.attn_cp_size == 1
+            && self.moe_dp_size == 1
+    }
+
     // SGLang parallel_state.py:1781,1827-1829,1897-1899
     pub fn validate(&self) -> Result<()> {
         if self.tp_size == 0
@@ -390,6 +538,21 @@ impl MultiAxisConfig {
     pub fn moe_tp_size(&self) -> usize {
         self.tp_size / self.ep_size / self.moe_dp_size
     }
+}
+
+fn subgroup_axis_env_present(lookup: &mut impl FnMut(&str) -> Option<String>) -> bool {
+    [
+        "INFER_PP_SIZE",
+        "ARLE_PP_SIZE",
+        "INFER_ATTN_DP_SIZE",
+        "ARLE_ATTN_DP_SIZE",
+        "INFER_ATTN_CP_SIZE",
+        "ARLE_ATTN_CP_SIZE",
+        "INFER_MOE_DP_SIZE",
+        "ARLE_MOE_DP_SIZE",
+    ]
+    .into_iter()
+    .any(|key| lookup(key).is_some())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -919,6 +1082,71 @@ mod tests {
             assert_eq!(coord.attn_cp_rank, (tp_rank / 2) % 2);
             assert_eq!(coord.attn_dp_rank, tp_rank / (2 * 2));
         }
+    }
+
+    #[test]
+    fn multi_axis_from_lookup_uses_runtime_defaults() {
+        let cfg = MultiAxisConfig::from_lookup_with_defaults(8, 1, 8, |_| None).unwrap();
+        assert_eq!(
+            cfg,
+            MultiAxisConfig {
+                tp_size: 8,
+                pp_size: 1,
+                ep_size: 8,
+                attn_dp_size: 1,
+                attn_cp_size: 1,
+                moe_dp_size: 1,
+            }
+        );
+        assert_eq!(
+            cfg.summary(),
+            "tp=8 pp=1 ep=8 attn_dp=1 attn_cp=1 attn_tp=8 moe_dp=1 moe_tp=1 world=8"
+        );
+        assert!(cfg.is_global_tp_ep_only(8, 8));
+    }
+
+    #[test]
+    fn multi_axis_current_route_preserves_legacy_ep_only_override() {
+        let cfg = MultiAxisConfig::current_route_from_lookup_with_defaults(1, 8, |_| None).unwrap();
+        assert_eq!(
+            cfg,
+            MultiAxisConfig {
+                tp_size: 8,
+                pp_size: 1,
+                ep_size: 8,
+                attn_dp_size: 1,
+                attn_cp_size: 1,
+                moe_dp_size: 1,
+            }
+        );
+        assert!(cfg.is_global_tp_ep_only(8, 8));
+    }
+
+    #[test]
+    fn multi_axis_current_route_does_not_hide_advanced_ep_only_axes() {
+        let cfg = MultiAxisConfig::current_route_from_lookup_with_defaults(1, 8, |key| match key {
+            "INFER_ATTN_DP_SIZE" => Some("2".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.attn_dp_size, 2);
+        assert!(!cfg.is_global_tp_ep_only(8, 8));
+    }
+
+    #[test]
+    fn multi_axis_from_lookup_reads_sglang_axes() {
+        let cfg = MultiAxisConfig::from_lookup(|key| match key {
+            "INFER_TP_SIZE" => Some("8".to_string()),
+            "INFER_EP_SIZE" => Some("4".to_string()),
+            "INFER_ATTN_DP_SIZE" => Some("2".to_string()),
+            "INFER_ATTN_CP_SIZE" => Some("1".to_string()),
+            "INFER_MOE_DP_SIZE" => Some("2".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.attn_tp_size(), 4);
+        assert_eq!(cfg.moe_tp_size(), 1);
+        assert!(!cfg.is_global_tp_ep_only(8, 4));
     }
 
     #[test]

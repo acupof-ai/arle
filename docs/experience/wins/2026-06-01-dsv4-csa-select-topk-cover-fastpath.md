@@ -58,7 +58,9 @@ p2047/o32 is still dominated by later non-fast-path tokens.
 ## Problems
 
 - This does not move the long-output target enough. Warm p2047/o32 is still
-  117.1 ms TPOT after first token, above the 60-64 ms campaign target.
+  117.1 ms TPOT after first token. The older 60-64 ms campaign target is now
+  deprecated for SGLang comparison; with the user-supplied 18 ms SGLang
+  reference, a raw-target `>20%` win would require `<=14.4 ms/token`.
 - The paired control is same-binary/near-shape (`p2056`, fast path not hit),
   not a rebuilt same-shape pre-patch binary. Accepting this entry as a local
   optimization is reasonable, but it is not enough for a default/SLO claim.
@@ -69,9 +71,11 @@ p2047/o32 is still dominated by later non-fast-path tokens.
 ## Learnings
 
 Top-k-cover is a valid selector-elision boundary, but it is a narrow boundary.
-For the SGLang-gap campaign, the next useful CSA work is the `available >
-topk` region: scoring and partial sort still cost about 2.49 ms per traced
-sample there.
+For the current replicated-token fallback route, the next useful CSA work is the
+`available > topk` region: scoring and partial sort still cost about 2.49 ms per
+traced sample there. For the SGLang-path campaign, this is subordinate to the
+path contract and the MoE/EP priority reset in
+`docs/plans/2026-06-01-dsv4-sglang-path-alignment.md`.
 
 ## Artifacts
 

@@ -248,18 +248,26 @@ a model path explicitly wires the corresponding collectives.
 | `INFER_CUDA_DEVICE` | yes, by `DeviceContext::new()` | one CUDA ordinal, default `0` | Binds the single process to one GPU. Parse failure is a hard error. |
 | `INFER_CUDA_DEVICES` | yes, by distributed CUDA worker bootstrap | comma-separated ordinals such as `0,1,2,3`; unique, non-empty | Maps local rank threads to CUDA devices for distributed serving. |
 | `INFER_TP_SIZE` | yes for DSv4 / staged for other CUDA models | integer `>= 1`; default `1` | Tensor-parallel axis size. DSv4 also accepts `ARLE_TP_SIZE`; unset DSv4 HTTP runs use the worker world size. |
-| `INFER_PP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future pipeline-parallel world size. `1` means disabled. |
+| `INFER_PP_SIZE` | yes for DSv4 diagnostics / staged for execution | integer `>= 1`; default `1` | Parsed into the DSv4 multi-axis contract. Non-`1` is fail-closed until PP execution is wired. |
 | `INFER_EP_SIZE` | yes for DSv4 / staged for other CUDA models | integer `>= 1`; default `1` | Expert-parallel axis size. DSv4 also accepts `ARLE_EP_SIZE`; unset DSv4 HTTP runs use the worker world size. |
-| `INFER_ATTN_DP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future attention data-parallel axis. |
-| `INFER_ATTN_CP_SIZE` | no, reserved F1+ | integer `>= 1`; default `1` | Future attention context-parallel axis. |
+| `INFER_ATTN_DP_SIZE` | yes for DSv4 diagnostics / staged for execution | integer `>= 1`; default `1` | Parsed into the DSv4 SGLang-path contract. Non-`1` is fail-closed until attention-DP communicators and token ownership are wired. |
+| `INFER_ATTN_CP_SIZE` | yes for DSv4 diagnostics / staged for execution | integer `>= 1`; default `1` | Parsed into the DSv4 SGLang-path contract. Non-`1` is fail-closed until attention-CP communicators are wired. |
+| `INFER_MOE_DP_SIZE` | yes for DSv4 diagnostics / staged for execution | integer `>= 1`; default `1` | Parsed into the DSv4 SGLang-path contract. Non-`1` is fail-closed until MoE-DP token ownership is wired. |
 | `INFER_NCCL_PORT` | no, reserved F1+ | TCP port `1..=65535` | Future convenience alias for `MASTER_PORT` during single-node rendezvous. |
 
-F1+ parser acceptance rules:
+Current DSv4 parser acceptance rules:
 
 - `INFER_CUDA_DEVICES` length must be at least the local rank count.
-- `INFER_TP_SIZE * INFER_PP_SIZE * INFER_EP_SIZE` must equal the model-worker
-  world size for dense TP/PP/EP bootstrap. Attention DP/CP and MoE axes may add
-  further divisibility checks when those phases land.
+- For SGLang-style axes, `world_size = INFER_TP_SIZE * INFER_PP_SIZE`.
+  `INFER_ATTN_DP_SIZE * INFER_ATTN_CP_SIZE` must divide `INFER_TP_SIZE`, and
+  `INFER_EP_SIZE * INFER_MOE_DP_SIZE` must divide `INFER_TP_SIZE`.
+- Current ARLE DSv4 execution also preserves legacy TP-only and EP-only
+  overrides where each of `INFER_TP_SIZE` and `INFER_EP_SIZE` is either `1` or
+  the CUDA worker count.
+- Today's executable DSv4 path accepts only global TP/EP-style layouts for
+  execution. Rich SGLang axes are parsed so that explicit path claims can fail
+  closed with a clear error instead of silently running the replicated-token
+  route.
 - Multi-rank values are rejected if CUDA was not built in, NCCL was not enabled
   for a path that needs collectives, or the machine exposes fewer devices than
   requested.
@@ -284,7 +292,7 @@ model load so bad jobs fail with actionable context. Expected shape:
 ```text
 multi_gpu_config:
   cuda_devices=[0,1]
-  tp_size=2 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1
+  tp_size=2 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1 moe_dp=1
   world_size=2 nccl_port=29500
   status=accepted
 ```
@@ -305,7 +313,7 @@ as diagnostics and validation gates, not stable tuning API.
 
 | Variable | Values | Default | Current behavior |
 |---|---|---|---|
-| `ARLE_DSV4_MOE_BACKEND` | `deepep`, `allreduce`, unset | `deepep` | Selects the DSv4 MoE runtime. Unset means `deepep`. The default high-performance route uses the validated DeepEP-style dispatch/combine path; `allreduce`/`legacy` forces the local-routed + EP all-reduce fallback for diagnosis. Native DeepEP low-latency kernels are not silently enabled by this name until the process-model gate passes. |
+| `ARLE_DSV4_MOE_BACKEND` | `allreduce`, `native-deepep`, `native_deepep`, legacy `deepep`, unset | unset = current all-reduce default | Selects the DSv4 MoE runtime. The current default is local routed experts plus EP all-reduce because native DeepEP is not correct on replicated token rows. `native-deepep` is fail-closed behind the process/token-ownership contract; legacy `deepep` names the older DeepEP-style diagnosis path, not a default-worthy SGLang path. |
 | `ARLE_DSV4_INCREMENTAL_KV` | `1` / unset | unset | Enables the incremental DSv4 KV state path used by the 8-rank HTTP bring-up. |
 | `ARLE_DSV4_TRACE_LAYER` | `1` / unset | unset | Emits CUDA-synchronizing per-layer phase traces. Use for diagnosis only; it changes latency. |
 | `ARLE_DSV4_COUNT_EXCHANGE` | `allgather`, `sendrecv` | `allgather` | Selects the tiny per-layer route-count exchange. `sendrecv` keeps the older grouped P2P fallback. |
@@ -318,6 +326,7 @@ as diagnostics and validation gates, not stable tuning API.
 | `ARLE_DSV4_ROUTE_GROUPED_EXPERTS` | `1` / unset | unset | Enables the route-wise grouped local expert experiment for padded B=1 decode. The opt-in path pairs route-local `w1`/`w3` GEMV when DSv4 block-scaled formats match and applies route weights after BF16 `w2` output to preserve baseline rounding. It removes D2H from the filtered decode nsys summary, but remains default-off: 2026-05-26 validation improved short decode only -4.60% and regressed longseq `max_tokens=32` by +1.36%. Use only for diagnostics until replaced by true grouped GEMM/DeepGEMM with DeepEP overlap. |
 | `ARLE_DSV4_EXPERT_BACKEND` | `native`, `deepgemm-auto`, `deepgemm` | `deepgemm-auto` when MoE default/DeepEP, `native` when `ARLE_DSV4_MOE_BACKEND=allreduce` | Selects the DSv4 local expert backend. `native` keeps the current per-expert/raw grouped GEMV paths. `deepgemm-auto` builds the resident FP8 expert-weight cache, attempts the optional DeepGEMM masked grouped GEMM bridge on SM90, and falls back to native with a one-time reason. `deepgemm` makes that bridge required and fails fast on build/runtime incompatibility; DSv4 validation scripts use this mode by default. |
 | `ARLE_DSV4_DEEPGEMM_DEVICE_COUNTS` | `1`, `0`, unset | `1` | Enables the padded B=1 DeepGEMM local-expert path that keeps recv-side local expert counts and offsets on device. It uses dense all-local-expert metadata, initializes unused compact route slots to `-1`, and skips them during scatter. Set `0` to force the older host `local_counts` D2H path for A/B diagnosis. |
+| `ARLE_DSV4_DEEPGEMM_ZERO_FP8_SCRATCH` | `1` / unset | unset | Forces the pre-2026-06-01 DeepGEMM behavior of clearing FP8 input/activation scratch every expert call. Default unset skips those large FP8 memsets and relies on `masked_m` plus valid-row unpad/scatter; scale buffers are still cleared for TMA-aligned padding safety. |
 | `ARLE_DSV4_DEEPGEMM_WEIGHT_CACHE` | `1` / unset | unset | Builds the DSv4 routed-expert FP8 E4M3 + FP32-scale cache at load time without selecting the runtime DeepGEMM backend. On H20/SM90 this is the required conversion boundary for FP4 Flash experts before DeepGEMM masked/contiguous grouped GEMM can replace raw GEMV. It fuses `w1`/`w3` rows into one gate/up cache and builds a separate `w2` cache. |
 | `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE` | `1` / unset | unset | Build-time switch for the optional raw-pointer DeepGEMM C ABI bridge. Requires CUDA driver/runtime libs and DeepGEMM/CUTLASS sources; runtime JIT uses `${CUDA_HOME}/bin/nvcc` plus `cuobjdump`, so the CUDA bin tools must be present. Without this switch the backend symbol returns `CUDA_ERROR_NOT_SUPPORTED` so `deepgemm-auto` can fall back cleanly. `ARLE_CUDA_ENABLE_DEEPGEMM_TORCH=1` is accepted as a compatibility alias but no longer links PyTorch. |
 | `ARLE_DEEPGEMM_ROOT` | path | `crates/cuda-kernels/vendor/deepgemm` | Build-time DeepGEMM source root for the optional native bridge. Use a recursive upstream clone when the vendored third-party submodules are not populated. |

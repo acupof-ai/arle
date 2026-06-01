@@ -1218,6 +1218,11 @@ fn dsv4_deepgemm_device_counts_enabled() -> Result<bool> {
 }
 
 #[cfg(feature = "cuda")]
+fn dsv4_deepgemm_zero_fp8_scratch_enabled() -> Result<bool> {
+    dsv4_env_flag("ARLE_DSV4_DEEPGEMM_ZERO_FP8_SCRATCH")
+}
+
+#[cfg(feature = "cuda")]
 fn dsv4_native_deepep_num_sms() -> Result<u32> {
     let Some(raw) = std::env::var("ARLE_DSV4_NATIVE_DEEPEP_NUM_SMS").ok() else {
         return Ok(20);
@@ -2518,17 +2523,25 @@ impl DeepseekV4MoeBlock {
                     anyhow::anyhow!("DeepSeek V4 DeepGEMM masked_m D2D failed: {err}")
                 })?;
         }
-        ctx.stream
-            .memset_zeros(&mut dg.input_fp8)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM input zero failed: {err}"))?;
+        let zero_fp8_scratch = dsv4_deepgemm_zero_fp8_scratch_enabled()?;
+        if zero_fp8_scratch {
+            ctx.stream
+                .memset_zeros(&mut dg.input_fp8)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM input zero failed: {err}"))?;
+        }
+        // Keep scale padding deterministic for TMA-aligned descriptors. The
+        // FP8 matrices themselves are protected by masked_m and only valid rows
+        // are read back by the unpad/scatter kernels.
         ctx.stream
             .memset_zeros(&mut dg.input_scales)
             .map_err(|err| {
                 anyhow::anyhow!("DeepSeek V4 DeepGEMM input-scale zero failed: {err}")
             })?;
-        ctx.stream
-            .memset_zeros(&mut dg.act_fp8)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM act zero failed: {err}"))?;
+        if zero_fp8_scratch {
+            ctx.stream
+                .memset_zeros(&mut dg.act_fp8)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM act zero failed: {err}"))?;
+        }
         ctx.stream
             .memset_zeros(&mut dg.act_scales)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 DeepGEMM act-scale zero failed: {err}"))?;
