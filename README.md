@@ -100,7 +100,11 @@ Agent and RL workloads waste compute re-processing the same prompt + history + t
 
 - **KV stays hot across turns.** Prior-turn KV is kept on GPU; spills to host / disk / cluster only when memory pressures it.
 - **Shared prefixes are cheap.** Pages are reused across requests with the same prefix — no duplicate compute, no duplicate memory.
+- **Local disk KV is bounded.** Metal keeps SSD prefix snapshots under `~/.cache/arle/metal_kv` with a 20 GiB budget and LRU watermark eviction; use `--no-kv-disk` to disable or `--kv-disk-max-bytes` to override.
 - **One runtime, three surfaces.** Serving, the local agent, and OPD training all run on the same Rust + model code. The OPD teacher *is* the production server.
+
+Quantized KV is available on CUDA (`--kv-cache-dtype int8|fp8|tq4`). Metal uses
+the model-native KV dtype today; MLX-side quantized KV is a separate follow-up.
 
 <p align="center">
   <img src="docs/assets/metal-vs-mlxlm-essay-avg.png" alt="ARLE Metal vs mlx-lm TTFT, TPOT, and RSS essay sweep" width="100%">
