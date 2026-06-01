@@ -401,7 +401,7 @@ def run_backend(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         terminate(proc)
 
 
-def plot_results(json_path: Path, png_path: Path) -> None:
+def plot_results(json_path: Path, png_path: Path, kind: str = "full") -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -432,6 +432,41 @@ def plot_results(json_path: Path, png_path: Path) -> None:
                 peak = max(peak, value)
             out.append(peak)
         return out
+
+    if kind == "ttft":
+        fig, ax = plt.subplots(1, 1, figsize=(7.8, 4.4), dpi=200)
+        for series in ("arle", "mlx_lm"):
+            ax.errorbar(
+                xs,
+                means(series, "ttft_s"),
+                yerr=stds(series, "ttft_s"),
+                marker="o" if series == "arle" else "s",
+                linewidth=2.0,
+                markersize=4.0,
+                capsize=3,
+                color=colors[series],
+                label=names[series],
+            )
+        ax.set_title("TTFT vs input length", fontsize=12)
+        ax.set_ylabel("TTFT (seconds)", fontsize=10)
+        ax.set_xlabel("Target input tokens", fontsize=10)
+        ax.set_xticks(xs, labels)
+        ax.grid(True, color="#d8d8d8", linewidth=0.6, alpha=0.8)
+        ax.tick_params(labelsize=9)
+        ax.legend(frameon=False, fontsize=9, loc="upper left")
+        fig.text(
+            0.5,
+            0.035,
+            f"n={data['shape']['repeats']}; streaming chat; Qwen3.6 35B-A3B 4-bit",
+            ha="center",
+            fontsize=8,
+            color="#666666",
+        )
+        fig.tight_layout(rect=(0, 0.06, 1, 1))
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(png_path)
+        plt.close(fig)
+        return
 
     fig, axes = plt.subplots(1, 3, figsize=(15.6, 4.25), dpi=200)
     panels = [
@@ -480,6 +515,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default="/tmp/bench_readme_metal_chat_compare.json")
     parser.add_argument("--plot", default="")
+    parser.add_argument("--plot-input", default="")
+    parser.add_argument("--plot-kind", choices=("full", "ttft"), default="full")
     parser.add_argument("--log-dir", default="/tmp/bench_readme_metal_chat_compare_logs")
     parser.add_argument("--backends", default="arle,mlx_lm")
     parser.add_argument("--repeats", type=int, default=3)
@@ -496,6 +533,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.plot_input:
+        if not args.plot:
+            raise SystemExit("--plot is required with --plot-input")
+        plot_results(Path(args.plot_input), Path(args.plot), args.plot_kind)
+        print(f"[{now()}] plotted -> {args.plot}", flush=True)
+        return
     if args.clear_arle_cache and ARLE_CACHE_DIR.exists():
         shutil.rmtree(ARLE_CACHE_DIR)
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
@@ -519,7 +562,7 @@ def main() -> None:
         Path(args.output).write_text(json.dumps(out, indent=2))
     Path(args.output).write_text(json.dumps(out, indent=2))
     if args.plot:
-        plot_results(Path(args.output), Path(args.plot))
+        plot_results(Path(args.output), Path(args.plot), args.plot_kind)
     print(f"[{now()}] done -> {args.output}", flush=True)
 
 
