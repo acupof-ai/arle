@@ -7,8 +7,7 @@ use crate::backend::cpu::CpuBackend;
 use crate::backend::cuda::bootstrap::InferenceEngineOptions;
 #[cfg(feature = "metal")]
 use crate::backend::metal::{
-    MetalBackendOptions, MetalSchedulerHandle, auto_wired_limit_bytes,
-    spawn_metal_scheduler_handle_from_path_with_options,
+    MetalBackendOptions, MetalSchedulerHandle, spawn_metal_scheduler_handle_from_path_with_options,
 };
 
 #[cfg(feature = "cpu")]
@@ -24,19 +23,10 @@ use super::{
 #[cfg(feature = "metal")]
 impl RequestHandleInferenceEngine<MetalSchedulerHandle> {
     pub(super) fn load(model_path: &str) -> Result<Self> {
-        // Warm-load parity with `metal_serve`: pin model weights in RAM via
-        // `mlx::set_wired_limit` (applied by `MetalRuntimeLimits::apply` during
-        // backend load) so macOS doesn't page out cold expert weights under
-        // pressure. Drops c=1 p99 from 86 ms to 15 ms on Qwen3.6
-        // (docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md). The CLI
-        // load path previously left this unset; metal_serve already auto-pins.
-        let options = MetalBackendOptions {
-            runtime_limits: crate::backend::metal::MetalRuntimeLimits {
-                wired_limit_bytes: auto_wired_limit_bytes(model_path),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        // Keep the default load path memory-comparable with mlx-lm: warmup still
+        // compiles/faults the hot path, but it does not pin the full model weight
+        // files resident unless the caller explicitly configures a wired limit.
+        let options = MetalBackendOptions::default();
         let handle = spawn_metal_scheduler_handle_from_path_with_options(model_path, options, 0)?;
         let mut engine = Self {
             model_id: model_id_from_path(model_path),
