@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -298,6 +299,37 @@ const METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG: u8 = 0x35;
 const METAL_QWEN35_SNAPSHOT_INDEX_PREFIX_BYTES: usize = 1024 * 1024;
 const METRICS_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
 
+// SSD persist budget gate (M_e.14 memory-first prefix cache). A full-length
+// snapshot is only worth persisting to SSD when re-prefilling the same prompt
+// from scratch would cost more than reading the snapshot back, with margin.
+//
+//   worth_persist = prefill_cost_us > READBACK_US_PER_TOKEN * tokens * SAFETY
+//
+// `prefill_cost_us = first_token_at - admitted_at` (the wall-clock the live
+// request already paid to reach token1). `READBACK_US_PER_TOKEN` is seeded
+// from the M_e.13 measured `read_us + decode_us + import_us` at 2064 tokens
+// (~48 µs/token); `SAFETY` leaves margin so we only persist clear wins.
+// Both are env-tunable (`INFER_METAL_PREFIX_READBACK_US_PER_TOKEN`,
+// `INFER_METAL_PREFIX_PERSIST_SAFETY`) following the `mlx.rs` parse idiom.
+const METAL_PREFIX_READBACK_US_PER_TOKEN_DEFAULT: f64 = 48.0;
+const METAL_PREFIX_PERSIST_SAFETY_DEFAULT: f64 = 2.0;
+
+fn metal_prefix_readback_us_per_token() -> f64 {
+    std::env::var("INFER_METAL_PREFIX_READBACK_US_PER_TOKEN")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(METAL_PREFIX_READBACK_US_PER_TOKEN_DEFAULT)
+}
+
+fn metal_prefix_persist_safety() -> f64 {
+    std::env::var("INFER_METAL_PREFIX_PERSIST_SAFETY")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(METAL_PREFIX_PERSIST_SAFETY_DEFAULT)
+}
+
 enum PrefillChunkOutcome {
     Progress {
         emitted_token: Option<u32>,
@@ -338,6 +370,276 @@ struct MetalQwen35CachedPrefix {
 struct MetalQwen35DiskPrefix {
     location: DiskBlockLocation,
     last_used_tick: u64,
+}
+
+/// Shared SSD prefix index. Guarded by a `Mutex` because two threads touch it:
+/// the serving thread (lookup / import-side `touch`/`remove` / startup
+/// reconcile) and the dedicated SSD-writer thread (`persist` bookkeeping after
+/// a budget-gated async write). Bytes-on-disk accounting and LRU eviction live
+/// here so the two threads never disagree about disk occupancy. The actual file
+/// I/O (`put`/`get`/`delete`) goes through `MetalTierAdapter` and is keyed by
+/// per-block fingerprint, so concurrent reads/writes hit distinct files and do
+/// not need the index lock held across the syscall.
+struct MetalDiskPrefixIndex {
+    entries: HashMap<Vec<u32>, MetalQwen35DiskPrefix>,
+    disk_bytes: u64,
+    max_disk_bytes: Option<u64>,
+    high_watermark: f64,
+    low_watermark: f64,
+    next_tick: u64,
+}
+
+impl MetalDiskPrefixIndex {
+    fn new(max_disk_bytes: Option<u64>, high_watermark: f64, low_watermark: f64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            disk_bytes: 0,
+            max_disk_bytes,
+            high_watermark,
+            low_watermark,
+            next_tick: 1,
+        }
+    }
+
+    fn bump_tick(&mut self) -> u64 {
+        let tick = self.next_tick;
+        self.next_tick = self.next_tick.saturating_add(1);
+        tick
+    }
+
+    fn contains(&self, key: &[u32]) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn location_for(&self, key: &[u32]) -> Option<DiskBlockLocation> {
+        self.entries.get(key).map(|entry| entry.location.clone())
+    }
+
+    fn lookup_longest_prefix(&self, prompt_tokens: &[u32], block_size: usize) -> Option<Vec<u32>> {
+        self.entries
+            .keys()
+            .filter(|tokens| {
+                let prefix_len = tokens.len();
+                prefix_len >= block_size
+                    && prefix_len < prompt_tokens.len()
+                    && prompt_tokens.starts_with(tokens.as_slice())
+            })
+            .max_by_key(|tokens| tokens.len())
+            .cloned()
+    }
+
+    fn touch(&mut self, key: &[u32]) {
+        let tick = self.bump_tick();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_used_tick = tick;
+        }
+    }
+
+    fn insert(&mut self, key: Vec<u32>, location: DiskBlockLocation) {
+        let tick = self.bump_tick();
+        self.disk_bytes = self.disk_bytes.saturating_add(location.payload_len);
+        self.entries.insert(
+            key,
+            MetalQwen35DiskPrefix {
+                location,
+                last_used_tick: tick,
+            },
+        );
+    }
+
+    /// Remove an index entry. Returns the location so the caller can delete the
+    /// on-disk file outside the lock (file I/O does not need the index held).
+    fn remove(&mut self, key: &[u32]) -> Option<DiskBlockLocation> {
+        let entry = self.entries.remove(key)?;
+        self.disk_bytes = self.disk_bytes.saturating_sub(entry.location.payload_len);
+        Some(entry.location)
+    }
+
+    /// Pop the least-recently-used entry to make room. Returns its location so
+    /// the caller can delete the file outside the lock.
+    fn pop_lru(&mut self) -> Option<DiskBlockLocation> {
+        let lru_key = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used_tick)
+            .map(|(tokens, _)| tokens.clone())?;
+        self.remove(&lru_key)
+    }
+
+    /// Decide whether `needed_bytes` fits under the high watermark, returning
+    /// any LRU locations that must be deleted to make room. Mutates only the
+    /// in-memory accounting; the caller deletes the returned files.
+    fn reserve_capacity(&mut self, needed_bytes: u64) -> DiskCapacityDecision {
+        let Some(max_bytes) = self.max_disk_bytes else {
+            return DiskCapacityDecision {
+                fits: true,
+                evicted: Vec::new(),
+            };
+        };
+        let high = watermark_bytes(max_bytes, self.high_watermark);
+        let low = watermark_bytes(max_bytes, self.low_watermark);
+        if needed_bytes > high {
+            return DiskCapacityDecision {
+                fits: false,
+                evicted: Vec::new(),
+            };
+        }
+        if self.disk_bytes.saturating_add(needed_bytes) <= high {
+            return DiskCapacityDecision {
+                fits: true,
+                evicted: Vec::new(),
+            };
+        }
+
+        let mut evicted = Vec::new();
+        let target = low.saturating_sub(needed_bytes);
+        while self.disk_bytes > target {
+            let Some(location) = self.pop_lru() else {
+                break;
+            };
+            evicted.push(location);
+        }
+        DiskCapacityDecision {
+            fits: self.disk_bytes.saturating_add(needed_bytes) <= high,
+            evicted,
+        }
+    }
+}
+
+struct DiskCapacityDecision {
+    fits: bool,
+    evicted: Vec<DiskBlockLocation>,
+}
+
+/// Job handed to the dedicated SSD-writer thread. The payload is already
+/// encoded (`encode_for_disk` → `to_bytes`/`eval`) on the **serving** thread,
+/// because that `eval` materializes resident MLX arrays and must not run
+/// concurrently with the serving thread's decode `async_eval` (no global MLX
+/// lock; dedicated GPU streams — see `feedback_mlx_async_eval_is_caller_thread`).
+/// The writer therefore does **only** filesystem I/O + index bookkeeping.
+struct DiskWriteJob {
+    token_ids: Vec<u32>,
+    fingerprint: BlockFingerprint,
+    payload: Vec<u8>,
+    estimated_payload_len: u64,
+}
+
+/// Owns the dedicated SSD-writer thread + its job channel. Dropping the handle
+/// closes the channel; the writer drains remaining jobs and exits.
+struct DiskWriteHandle {
+    tx: Option<std_mpsc::Sender<DiskWriteJob>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DiskWriteHandle {
+    fn spawn(
+        index: Arc<Mutex<MetalDiskPrefixIndex>>,
+        adapter: MetalTierAdapter,
+        fsync_each_block: bool,
+    ) -> Self {
+        let (tx, rx) = std_mpsc::channel::<DiskWriteJob>();
+        let join = std::thread::Builder::new()
+            .name("metal-prefix-ssd-writer".to_string())
+            .spawn(move || disk_writer_loop(rx, &index, &adapter, fsync_each_block))
+            .expect("spawn Metal prefix SSD-writer thread");
+        Self {
+            tx: Some(tx),
+            join: Some(join),
+        }
+    }
+
+    fn submit(&self, job: DiskWriteJob) {
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        if tx.send(job).is_err() {
+            warn!("Metal Qwen3.5 SSD prefix writer thread is gone; dropping persist job");
+        }
+    }
+}
+
+impl Drop for DiskWriteHandle {
+    fn drop(&mut self) {
+        // Drop the sender FIRST so the writer's `recv()` returns `Err` and the
+        // loop exits; only then is it safe to join. Joining before dropping the
+        // sender would deadlock (the writer would block forever on `recv`).
+        self.tx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// SSD-writer thread body. The exclusive performer of disk **writes**: budget
+/// has already cleared on the serving thread; here we reserve capacity, write
+/// the block, and record it in the shared index. Reads/imports still happen on
+/// the serving thread against the same `Arc<Mutex<MetalDiskPrefixIndex>>`.
+fn disk_writer_loop(
+    rx: std_mpsc::Receiver<DiskWriteJob>,
+    index: &Arc<Mutex<MetalDiskPrefixIndex>>,
+    adapter: &MetalTierAdapter,
+    fsync_each_block: bool,
+) {
+    let trace = std::env::var("INFER_M_E13_TRACE").is_ok();
+    while let Ok(job) = rx.recv() {
+        // Skip if a concurrent import already re-published this exact key.
+        let reserve = {
+            let mut guard = match index.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if guard.contains(&job.token_ids) {
+                guard.touch(&job.token_ids);
+                continue;
+            }
+            guard.reserve_capacity(job.estimated_payload_len)
+        };
+        for location in &reserve.evicted {
+            if let Err(err) = adapter.delete_disk_block(location) {
+                warn!(
+                    "Metal Qwen3.5 SSD prefix cache failed to evict {}: {err:#}",
+                    location.path.display()
+                );
+            }
+        }
+        if !reserve.fits {
+            continue;
+        }
+
+        let t_write = std::time::Instant::now();
+        let location = match adapter.put_disk_block_with_fsync(
+            job.fingerprint,
+            METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
+            &job.payload,
+            fsync_each_block,
+        ) {
+            Ok(location) => location,
+            Err(err) => {
+                warn!(
+                    "Metal Qwen3.5 SSD prefix publish failed for {} tokens: {err:#}",
+                    job.token_ids.len()
+                );
+                continue;
+            }
+        };
+        let write_us = t_write.elapsed().as_micros();
+        let payload_len = location.payload_len;
+        {
+            let mut guard = match index.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.insert(job.token_ids.clone(), location);
+        }
+        if trace {
+            log::info!(
+                "m_e13_trace ssd_writer persist: tokens={} payload_bytes={} write_us={}",
+                job.token_ids.len(),
+                payload_len,
+                write_us,
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -451,16 +753,17 @@ fn normalize_paged_pool_pressure(pressure: f64) -> f64 {
 
 struct MetalQwen35PrefixRuntime {
     entries: HashMap<Vec<u32>, MetalQwen35CachedPrefix>,
-    disk_entries: HashMap<Vec<u32>, MetalQwen35DiskPrefix>,
+    /// Shared SSD index. Read on the serving thread (lookup/import/reconcile)
+    /// and written on the SSD-writer thread (`persist` bookkeeping). The
+    /// `Mutex` is the single source of disk-bytes accounting truth.
+    disk_index: Arc<Mutex<MetalDiskPrefixIndex>>,
+    /// Dedicated async SSD-writer thread. `None` when no disk tier is wired.
+    disk_writer: Option<DiskWriteHandle>,
     tier_adapter: MetalTierAdapter,
     model_fingerprint: Vec<u8>,
-    max_disk_bytes: Option<u64>,
-    disk_high_watermark: f64,
-    disk_low_watermark: f64,
     disk_fsync_each_block: bool,
     max_cached_tokens: usize,
     cached_tokens: usize,
-    disk_bytes: u64,
     next_tick: u64,
     block_size: usize,
 }
@@ -568,30 +871,47 @@ impl MetalQwen35PrefixRuntime {
         disk_low_watermark: f64,
         disk_fsync_each_block: bool,
     ) -> Result<Self> {
-        let mut runtime = Self {
-            entries: HashMap::new(),
-            disk_entries: HashMap::new(),
-            tier_adapter: MetalTierAdapter::new(disk_store).with_paged_pool_pressure(0.0),
-            model_fingerprint,
+        let tier_adapter = MetalTierAdapter::new(disk_store).with_paged_pool_pressure(0.0);
+        let disk_index = Arc::new(Mutex::new(MetalDiskPrefixIndex::new(
             max_disk_bytes,
             disk_high_watermark,
             disk_low_watermark,
+        )));
+        let mut runtime = Self {
+            entries: HashMap::new(),
+            disk_index,
+            disk_writer: None,
+            tier_adapter,
+            model_fingerprint,
             disk_fsync_each_block,
             max_cached_tokens,
             cached_tokens: 0,
-            disk_bytes: 0,
             next_tick: 1,
             block_size,
         };
         runtime.reconcile_disk_entries()?;
         if runtime.tier_adapter.has_disk_tier() {
-            info!(
-                "Metal Qwen3.5 SSD prefix cache indexed {} entries ({} bytes)",
-                runtime.disk_entries.len(),
-                runtime.disk_bytes
-            );
+            let (entries, bytes) = {
+                let guard = runtime.lock_disk_index();
+                (guard.entries.len(), guard.disk_bytes)
+            };
+            info!("Metal Qwen3.5 SSD prefix cache indexed {entries} entries ({bytes} bytes)");
+            // Spawn the async SSD-writer only when a disk tier exists. It shares
+            // `disk_index` with the serving thread (the writer owns disk writes;
+            // the serving thread owns reads + import-side touch/remove).
+            runtime.disk_writer = Some(DiskWriteHandle::spawn(
+                Arc::clone(&runtime.disk_index),
+                runtime.tier_adapter.clone(),
+                runtime.disk_fsync_each_block,
+            ));
         }
         Ok(runtime)
+    }
+
+    fn lock_disk_index(&self) -> std::sync::MutexGuard<'_, MetalDiskPrefixIndex> {
+        self.disk_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn prepare_request(
@@ -692,6 +1012,24 @@ impl MetalQwen35PrefixRuntime {
         Ok(())
     }
 
+    /// Memory-first prefix publish (M_e.14). Runs on the serving thread between
+    /// token1 and token2, so it must stay cheap:
+    ///
+    /// 1. Snapshot the **already-resident** full-length KV+GDR
+    ///    (`export_qwen35_live_prefix_snapshot` → `export_drained_prefix_snapshot`,
+    ///    no replay) and insert into the in-memory LRU. This is the only publish
+    ///    work on the first-response path and is the same cheap clone the
+    ///    in-memory tier always used.
+    /// 2. If a disk tier is wired, apply the budget gate; on a clear win,
+    ///    `encode_for_disk` (the `eval`/`to_bytes` stays on **this** thread for
+    ///    MLX safety) and hand the encoded bytes to the async SSD-writer.
+    ///
+    /// The old synchronous replay disk-publish — which spun up a fresh replay
+    /// `Qwen35StepDriver` and re-prefilled the whole prompt in blocks (512→1.9s,
+    /// 2k→7.0s, 8k→30.5s on the serving thread) — is gone. SSD warm-restart
+    /// reuse of shorter block-aligned prefixes depended on that replay and is
+    /// intentionally dropped; in-memory warm reuse of the full-length snapshot
+    /// is retained.
     fn publish_prompt_prefix(&mut self, request: &mut ActiveMetalRequest) -> Result<()> {
         let trace = std::env::var("INFER_M_E10_TRACE").is_ok();
         if !request.request_state.can_import_qwen35_prefix_snapshot() {
@@ -704,50 +1042,111 @@ impl MetalQwen35PrefixRuntime {
             return Ok(());
         }
 
-        if self.tier_adapter.has_disk_tier() {
-            request
-                .request_state
-                .drain_qwen35_cpp_session()
-                .context("drain Qwen3.5 C++ session before SSD prefix export")?;
-            let snapshots = request
-                .request_state
-                .export_qwen35_disk_prompt_prefixes(self.block_size)
-                .context("export Qwen3.5 prompt prefix snapshots for SSD")?;
-            if trace {
-                log::info!(
-                    "m_e10_trace publish: disk-tier session={:?} snapshots={} \
-                     snapshot_lens={:?}",
-                    &request.session_id,
-                    snapshots.len(),
-                    snapshots
-                        .iter()
-                        .map(|s| s.token_ids.len())
-                        .collect::<Vec<_>>(),
-                );
-            }
-            for snapshot in snapshots {
-                if let Err(err) = self.persist_snapshot(&snapshot) {
-                    warn!(
-                        "Metal Qwen3.5 SSD prefix publish failed for {} tokens: {err:#}",
-                        snapshot.token_ids.len()
-                    );
-                }
-                self.insert_snapshot(snapshot);
-            }
-            return Ok(());
-        }
-
-        // In-memory tier: snapshot the live C++ session at the largest
-        // block-aligned prompt prefix. Drains the session as a side effect; the
-        // next decode/prefill tick re-attaches via `begin_session`.
-        if let Some(snapshot) = request
+        // Cheap full-length in-memory snapshot (drains the C++ session as a
+        // side effect; the next decode/prefill tick re-attaches via
+        // `begin_session`). `None` when shorter than one block.
+        let Some(snapshot) = request
             .request_state
             .export_qwen35_live_prefix_snapshot(self.block_size)
             .context("snapshot live Qwen3.5 prompt prefix")?
-        {
-            self.insert_snapshot(snapshot);
+        else {
+            return Ok(());
+        };
+
+        // SSD budget gate + async persist. Only the in-memory snapshot is on the
+        // first-response critical path; the disk write is off-thread.
+        if self.tier_adapter.has_disk_tier() {
+            self.maybe_enqueue_disk_persist(request, &snapshot, trace);
         }
+
+        self.insert_snapshot(snapshot);
         Ok(())
+    }
+
+    /// Budget-gate a full-length snapshot for SSD and, on a clear win, encode it
+    /// (on the serving thread, for MLX safety) and hand it to the async writer.
+    /// Returns without blocking on disk I/O.
+    fn maybe_enqueue_disk_persist(
+        &self,
+        request: &ActiveMetalRequest,
+        snapshot: &Qwen35PrefixSnapshot,
+        trace: bool,
+    ) {
+        let tokens = snapshot.token_ids.len();
+        // Persist the resident full-length KV+GDR snapshot at exactly
+        // `cache_len`. Unlike the old replay path (which produced block-aligned
+        // prefix slices), this snapshot is the live drained state, so block
+        // alignment is NOT required — the on-disk format only needs
+        // `token_ids.len() == cache_len`. A future prompt that *extends* this
+        // exact prefix can import it across restarts; the budget gate (below)
+        // is the real control over what's worth persisting.
+        if tokens < self.block_size {
+            return;
+        }
+        let Some(writer) = self.disk_writer.as_ref() else {
+            return;
+        };
+
+        // Budget: re-prefilling this prompt from scratch must cost more than
+        // reading the snapshot back, with margin. Short prompts (cheap prefill)
+        // fail the gate and are dropped — exactly the intended behavior.
+        let prefill_cost_us = match request.first_token_at {
+            Some(first) => first.duration_since(request.admitted_at).as_micros() as f64,
+            None => return,
+        };
+        let readback_us_per_token = metal_prefix_readback_us_per_token();
+        let safety = metal_prefix_persist_safety();
+        let readback_cost_us = readback_us_per_token * tokens as f64 * safety;
+        let worth_persist = prefill_cost_us > readback_cost_us;
+        if trace {
+            log::info!(
+                "m_e10_trace publish budget: tokens={} prefill_cost_us={:.0} \
+                 readback_cost_us={:.0} (per_token={} safety={}) worth_persist={}",
+                tokens,
+                prefill_cost_us,
+                readback_cost_us,
+                readback_us_per_token,
+                safety,
+                worth_persist,
+            );
+        }
+        if !worth_persist {
+            return;
+        }
+
+        // Skip if the index already holds this exact key (e.g. imported from
+        // disk this lifetime). Avoids a redundant encode.
+        if self.lock_disk_index().contains(&snapshot.token_ids) {
+            return;
+        }
+
+        let estimated_payload_len =
+            match snapshot.estimated_disk_payload_len(&self.model_fingerprint) {
+                Ok(len) => len,
+                Err(err) => {
+                    warn!("Metal Qwen3.5 SSD prefix size estimate failed: {err:#}");
+                    return;
+                }
+            };
+        // Encode here (serving thread): `encode_for_disk` → `to_bytes` calls
+        // `eval`, which must not run concurrently with decode `async_eval` on a
+        // separate thread (no global MLX lock). The resident full-length KV is
+        // already materialized, so this eval is the cheap ~persist class, not a
+        // replay.
+        let payload = match snapshot.encode_for_disk(&self.model_fingerprint) {
+            Ok(payload) => payload,
+            Err(err) => {
+                warn!("Metal Qwen3.5 SSD prefix encode failed: {err:#}");
+                return;
+            }
+        };
+        let fingerprint = self.fingerprint_for_tokens(&snapshot.token_ids);
+        writer.submit(DiskWriteJob {
+            token_ids: snapshot.token_ids.clone(),
+            fingerprint,
+            payload,
+            estimated_payload_len,
+        });
     }
 
     fn set_paged_pool_pressure(&mut self, pressure: f64) {
@@ -768,16 +1167,8 @@ impl MetalQwen35PrefixRuntime {
     }
 
     fn lookup_longest_disk_prefix(&self, prompt_tokens: &[u32]) -> Option<Vec<u32>> {
-        self.disk_entries
-            .keys()
-            .filter(|tokens| {
-                let prefix_len = tokens.len();
-                prefix_len >= self.block_size
-                    && prefix_len < prompt_tokens.len()
-                    && prompt_tokens.starts_with(tokens.as_slice())
-            })
-            .max_by_key(|tokens| tokens.len())
-            .cloned()
+        self.lock_disk_index()
+            .lookup_longest_prefix(prompt_tokens, self.block_size)
     }
 
     fn try_import_memory_prefix(
@@ -869,8 +1260,9 @@ impl MetalQwen35PrefixRuntime {
         }
         // In-memory entries hold the live drained KV+GDR at exactly
         // `cache_len`, so block alignment is not required for correctness.
-        // The disk-tier `persist_snapshot` path keeps its own alignment guard
-        // because the on-disk format assumes block-aligned slices.
+        // The SSD persist path keeps its own alignment guard
+        // (`maybe_enqueue_disk_persist`) because the on-disk format assumes
+        // block-aligned slices.
         let tick = self.bump_tick();
         if let Some(existing) = self.entries.get_mut(&snapshot.token_ids) {
             existing.last_used_tick = tick;
@@ -893,59 +1285,6 @@ impl MetalQwen35PrefixRuntime {
         );
     }
 
-    fn persist_snapshot(&mut self, snapshot: &Qwen35PrefixSnapshot) -> Result<()> {
-        if !self.tier_adapter.has_disk_tier() {
-            return Ok(());
-        }
-        let token_count = snapshot.token_ids.len();
-        if token_count < self.block_size || !token_count.is_multiple_of(self.block_size) {
-            return Ok(());
-        }
-
-        let key = snapshot.token_ids.clone();
-        if self.disk_entries.contains_key(&key) {
-            self.touch_disk(&key);
-            return Ok(());
-        }
-
-        let estimated_payload_len = snapshot
-            .estimated_disk_payload_len(&self.model_fingerprint)
-            .context("estimate Qwen3.5 prefix snapshot size for SSD")?;
-        if !self.ensure_disk_capacity_for(estimated_payload_len) {
-            return Ok(());
-        }
-
-        let payload = snapshot
-            .encode_for_disk(&self.model_fingerprint)
-            .context("encode Qwen3.5 prefix snapshot for SSD")?;
-        let payload_len =
-            u64::try_from(payload.len()).context("Qwen3.5 prefix snapshot payload too large")?;
-        if payload_len != estimated_payload_len && !self.ensure_disk_capacity_for(payload_len) {
-            return Ok(());
-        }
-
-        let fingerprint = self.fingerprint_for_tokens(&key);
-        let location = self
-            .tier_adapter
-            .put_disk_block_with_fsync(
-                fingerprint,
-                METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
-                &payload,
-                self.disk_fsync_each_block,
-            )
-            .context("write Qwen3.5 prefix snapshot to DiskStore")?;
-        let tick = self.bump_tick();
-        self.disk_bytes = self.disk_bytes.saturating_add(location.payload_len);
-        self.disk_entries.insert(
-            key,
-            MetalQwen35DiskPrefix {
-                location,
-                last_used_tick: tick,
-            },
-        );
-        Ok(())
-    }
-
     fn try_import_disk_prefix(
         &mut self,
         prefix_key: &[u32],
@@ -955,11 +1294,7 @@ impl MetalQwen35PrefixRuntime {
         if !self.tier_adapter.has_disk_tier() {
             return Ok(false);
         }
-        let Some(location) = self
-            .disk_entries
-            .get(prefix_key)
-            .map(|entry| entry.location.clone())
-        else {
+        let Some(location) = self.lock_disk_index().location_for(prefix_key) else {
             return Ok(false);
         };
         let expected = self.fingerprint_for_tokens(prefix_key);
@@ -998,44 +1333,51 @@ impl MetalQwen35PrefixRuntime {
             );
         }
         if imported {
-            self.touch_disk(prefix_key);
+            self.lock_disk_index().touch(prefix_key);
             self.insert_snapshot(snapshot);
         }
         Ok(imported)
     }
 
+    /// Index existing on-disk snapshots at startup. Single-threaded — runs in
+    /// `new()` before the SSD-writer thread is spawned — so it populates the
+    /// shared index directly.
     fn reconcile_disk_entries(&mut self) -> Result<()> {
         if !self.tier_adapter.has_disk_tier() {
             return Ok(());
         }
         let adapter = self.tier_adapter.clone();
+        let model_fingerprint = &self.model_fingerprint;
+        let block_size = self.block_size;
+        let mut accepted: Vec<(Vec<u32>, DiskBlockLocation)> = Vec::new();
         adapter
             .visit_disk_payload_prefixes(
                 METAL_QWEN35_SNAPSHOT_INDEX_PREFIX_BYTES,
                 |location, payload| {
-                    let token_ids = match Qwen35PrefixSnapshot::peek_disk_token_ids(
-                        payload,
-                        &self.model_fingerprint,
-                    ) {
-                        Ok(token_ids) => token_ids,
-                        Err(err) => {
-                            log::debug!(
-                                "Metal Qwen3.5 SSD prefix cache ignored {}: {err:#}",
-                                location.path.display()
-                            );
-                            if Qwen35PrefixSnapshot::looks_like_disk_payload(payload) {
-                                delete_rejected_qwen35_disk_block(&adapter, &location);
+                    let token_ids =
+                        match Qwen35PrefixSnapshot::peek_disk_token_ids(payload, model_fingerprint)
+                        {
+                            Ok(token_ids) => token_ids,
+                            Err(err) => {
+                                log::debug!(
+                                    "Metal Qwen3.5 SSD prefix cache ignored {}: {err:#}",
+                                    location.path.display()
+                                );
+                                if Qwen35PrefixSnapshot::looks_like_disk_payload(payload) {
+                                    delete_rejected_qwen35_disk_block(&adapter, &location);
+                                }
+                                return Ok(());
                             }
-                            return Ok(());
-                        }
-                    };
-                    if token_ids.len() < self.block_size
-                        || !token_ids.len().is_multiple_of(self.block_size)
-                    {
+                        };
+                    // Persisted snapshots are full-length live KV+GDR at exactly
+                    // `cache_len`; they need not be block-aligned (the old
+                    // replay path's alignment requirement is gone). Only reject
+                    // sub-block fragments.
+                    if token_ids.len() < block_size {
                         delete_rejected_qwen35_disk_block(&adapter, &location);
                         return Ok(());
                     }
-                    let expected = self.fingerprint_for_tokens(&token_ids);
+                    let expected = fingerprint_for_tokens(model_fingerprint, &token_ids);
                     if location.fingerprint != expected {
                         log::debug!(
                             "Metal Qwen3.5 SSD prefix cache ignored {}: fingerprint/token mismatch",
@@ -1044,20 +1386,29 @@ impl MetalQwen35PrefixRuntime {
                         delete_rejected_qwen35_disk_block(&adapter, &location);
                         return Ok(());
                     }
-                    let tick = self.bump_tick();
-                    self.disk_bytes = self.disk_bytes.saturating_add(location.payload_len);
-                    self.disk_entries.insert(
-                        token_ids,
-                        MetalQwen35DiskPrefix {
-                            location,
-                            last_used_tick: tick,
-                        },
-                    );
+                    accepted.push((token_ids, location));
                     Ok(())
                 },
             )
             .context("scan Metal Qwen3.5 SSD prefix cache")?;
-        self.ensure_disk_capacity_for(0);
+
+        let evicted = {
+            let mut index = self.lock_disk_index();
+            for (token_ids, location) in accepted {
+                index.insert(token_ids, location);
+            }
+            // Trim back under the high watermark; capture evictions to delete
+            // their files outside the lock.
+            index.reserve_capacity(0).evicted
+        };
+        for location in &evicted {
+            if let Err(err) = self.tier_adapter.delete_disk_block(location) {
+                warn!(
+                    "Metal Qwen3.5 SSD prefix cache failed to evict {}: {err:#}",
+                    location.path.display()
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1076,35 +1427,6 @@ impl MetalQwen35PrefixRuntime {
         }
     }
 
-    fn ensure_disk_capacity_for(&mut self, needed_bytes: u64) -> bool {
-        let Some(max_bytes) = self.max_disk_bytes else {
-            return true;
-        };
-        let high = watermark_bytes(max_bytes, self.disk_high_watermark);
-        let low = watermark_bytes(max_bytes, self.disk_low_watermark);
-        if needed_bytes > high {
-            return false;
-        }
-        if self.disk_bytes.saturating_add(needed_bytes) <= high {
-            return true;
-        }
-
-        let target = low.saturating_sub(needed_bytes);
-        while self.disk_bytes > target {
-            let Some(lru_key) = self
-                .disk_entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used_tick)
-                .map(|(tokens, _)| tokens.clone())
-            else {
-                break;
-            };
-            self.remove_disk_entry(&lru_key);
-        }
-
-        self.disk_bytes.saturating_add(needed_bytes) <= high
-    }
-
     fn touch(&mut self, key: &[u32]) {
         let tick = self.bump_tick();
         if let Some(entry) = self.entries.get_mut(key) {
@@ -1112,37 +1434,23 @@ impl MetalQwen35PrefixRuntime {
         }
     }
 
-    fn touch_disk(&mut self, key: &[u32]) {
-        let tick = self.bump_tick();
-        if let Some(entry) = self.disk_entries.get_mut(key) {
-            entry.last_used_tick = tick;
-        }
-    }
-
+    /// Drop a stale/corrupt SSD entry: remove it from the shared index, then
+    /// delete the file outside the lock.
     fn remove_disk_entry(&mut self, key: &[u32]) {
-        let Some(entry) = self.disk_entries.remove(key) else {
-            return;
-        };
-        self.disk_bytes = self.disk_bytes.saturating_sub(entry.location.payload_len);
-        if self.tier_adapter.has_disk_tier()
-            && let Err(err) = self.tier_adapter.delete_disk_block(&entry.location)
+        let location = self.lock_disk_index().remove(key);
+        if let Some(location) = location
+            && self.tier_adapter.has_disk_tier()
+            && let Err(err) = self.tier_adapter.delete_disk_block(&location)
         {
             warn!(
                 "Metal Qwen3.5 SSD prefix cache failed to delete {}: {err:#}",
-                entry.location.path.display()
+                location.path.display()
             );
         }
     }
 
     fn fingerprint_for_tokens(&self, token_ids: &[u32]) -> BlockFingerprint {
-        BlockFingerprint::compute(
-            KvContentContext {
-                model_fingerprint: &self.model_fingerprint,
-                kv_format_tag: METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
-                parent: None,
-            },
-            token_ids,
-        )
+        fingerprint_for_tokens(&self.model_fingerprint, token_ids)
     }
 
     fn bump_tick(&mut self) -> u64 {
@@ -1150,6 +1458,60 @@ impl MetalQwen35PrefixRuntime {
         self.next_tick = self.next_tick.saturating_add(1);
         tick
     }
+
+    /// Test-only synchronous persist: encode + write + index insert on the
+    /// calling thread, mirroring `disk_writer_loop` without the channel hop so
+    /// tests can assert on the index immediately. Production persists go through
+    /// the async writer (`maybe_enqueue_disk_persist` → `DiskWriteHandle`).
+    #[cfg(test)]
+    fn persist_snapshot_blocking(&mut self, snapshot: &Qwen35PrefixSnapshot) -> Result<()> {
+        if !self.tier_adapter.has_disk_tier() {
+            return Ok(());
+        }
+        let token_count = snapshot.token_ids.len();
+        if token_count < self.block_size {
+            return Ok(());
+        }
+        let key = snapshot.token_ids.clone();
+        let estimated_payload_len = snapshot
+            .estimated_disk_payload_len(&self.model_fingerprint)
+            .context("estimate Qwen3.5 prefix snapshot size for SSD")?;
+        let reserve = self
+            .lock_disk_index()
+            .reserve_capacity(estimated_payload_len);
+        for location in &reserve.evicted {
+            let _ = self.tier_adapter.delete_disk_block(location);
+        }
+        if !reserve.fits {
+            return Ok(());
+        }
+        let payload = snapshot
+            .encode_for_disk(&self.model_fingerprint)
+            .context("encode Qwen3.5 prefix snapshot for SSD")?;
+        let fingerprint = self.fingerprint_for_tokens(&key);
+        let location = self
+            .tier_adapter
+            .put_disk_block_with_fsync(
+                fingerprint,
+                METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
+                &payload,
+                self.disk_fsync_each_block,
+            )
+            .context("write Qwen3.5 prefix snapshot to DiskStore")?;
+        self.lock_disk_index().insert(key, location);
+        Ok(())
+    }
+}
+
+fn fingerprint_for_tokens(model_fingerprint: &[u8], token_ids: &[u32]) -> BlockFingerprint {
+    BlockFingerprint::compute(
+        KvContentContext {
+            model_fingerprint,
+            kv_format_tag: METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
+            parent: None,
+        },
+        token_ids,
+    )
 }
 
 fn watermark_bytes(max_bytes: u64, watermark: f64) -> u64 {
@@ -3362,14 +3724,16 @@ mod tests {
             kv_capacity: 2,
         };
 
-        runtime.persist_snapshot(&snapshot).expect("persist");
-        assert!(runtime.disk_entries.contains_key(&vec![11, 12]));
+        runtime
+            .persist_snapshot_blocking(&snapshot)
+            .expect("persist");
+        assert!(runtime.lock_disk_index().contains(&[11, 12]));
         let qwen35_fingerprint = runtime.fingerprint_for_tokens(&[11, 12]);
         let foreign_fingerprint = BlockFingerprint([0x7a; 16]);
         store
             .put_block_with_fsync(foreign_fingerprint, 0x99, b"not-a-qwen35-snapshot", false)
             .expect("persist foreign block");
-        let disk_bytes = runtime.disk_bytes;
+        let disk_bytes = runtime.lock_disk_index().disk_bytes;
         assert!(disk_bytes > 0);
 
         let restored = MetalQwen35PrefixRuntime::new(
@@ -3383,8 +3747,8 @@ mod tests {
             false,
         )
         .expect("restored runtime");
-        assert!(restored.disk_entries.contains_key(&vec![11, 12]));
-        assert_eq!(restored.disk_bytes, disk_bytes);
+        assert!(restored.lock_disk_index().contains(&[11, 12]));
+        assert_eq!(restored.lock_disk_index().disk_bytes, disk_bytes);
 
         let wrong_model = MetalQwen35PrefixRuntime::new(
             64,
@@ -3397,7 +3761,7 @@ mod tests {
             false,
         )
         .expect("wrong-model runtime");
-        assert!(wrong_model.disk_entries.is_empty());
+        assert!(wrong_model.lock_disk_index().entries.is_empty());
         assert!(
             !store
                 .contains_block(qwen35_fingerprint)
