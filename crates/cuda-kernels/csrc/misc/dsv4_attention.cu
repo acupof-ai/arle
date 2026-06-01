@@ -1131,6 +1131,16 @@ __global__ void dsv4_csa_select_kernel(
   // (the block straddling the current token), diverging from the reference.
   int available = dsv4_imin(key_count, abs_pos / ratio);
 
+  // When top-k covers every causally available compressed block, scoring and
+  // sorting cannot change the attention set. Emit the full causal range and
+  // skip the O(available * heads * dim + sort) selector work.
+  if (available <= topk) {
+    for (int k = threadIdx.x; k < topk; k += blockDim.x) {
+      selected[token * topk + k] = k < available ? k : -1;
+    }
+    return;
+  }
+
   __shared__ float sort_scores[DSV4_CSA_SORT_MAX_KEYS];
   __shared__ int sort_indices[DSV4_CSA_SORT_MAX_KEYS];
   __shared__ float global_scores[DSV4_CSA_MAX_TOPK];
