@@ -166,6 +166,7 @@ struct NativeRuntime {
 
 std::mutex g_runtime_mu;
 std::unordered_map<std::string, std::shared_ptr<NativeRuntime>> g_runtimes;
+std::unordered_map<std::string, std::string> g_runtime_failures;
 
 template <typename T>
 T ceil_div(T a, T b) {
@@ -818,13 +819,25 @@ std::shared_ptr<NativeRuntime> get_or_build_runtime(
   const auto cubin_path = dir / "kernel.cubin";
   const auto code_path = dir / "kernel.cu";
   std::lock_guard<std::mutex> lock(g_runtime_mu);
+  if (auto it = g_runtime_failures.find(digest); it != g_runtime_failures.end()) {
+    throw std::runtime_error(
+        "DeepGEMM JIT disabled after prior compile/load failure for this kernel:\n" +
+        it->second);
+  }
   if (!std::filesystem::exists(cubin_path)) {
     const auto tmp = cache_root() / "tmp" / ("arle-" + digest);
     std::filesystem::create_directories(tmp);
     const auto tmp_cubin = tmp / "kernel.cubin";
     const auto tmp_code = tmp / "kernel.cu";
     write_binary_file(tmp_code, code);
-    compile_with_nvcc(tmp_code, tmp_cubin, major, minor);
+    try {
+      compile_with_nvcc(tmp_code, tmp_cubin, major, minor);
+    } catch (const std::exception& err) {
+      std::error_code ec;
+      std::filesystem::remove_all(tmp, ec);
+      g_runtime_failures.emplace(digest, err.what());
+      throw;
+    }
     std::filesystem::create_directories(dir.parent_path());
     std::error_code ec;
     std::filesystem::rename(tmp, dir, ec);
@@ -842,12 +855,17 @@ std::shared_ptr<NativeRuntime> get_or_build_runtime(
   }
 
   auto runtime = std::make_shared<NativeRuntime>();
+  try {
 #ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
-  const std::string symbol;
+    const std::string symbol;
 #else
-  const std::string symbol = parse_kernel_symbol(cubin_path);
+    const std::string symbol = parse_kernel_symbol(cubin_path);
 #endif
-  runtime->kernel = load_kernel(cubin_path, symbol, &runtime->library);
+    runtime->kernel = load_kernel(cubin_path, symbol, &runtime->library);
+  } catch (const std::exception& err) {
+    g_runtime_failures.emplace(digest, err.what());
+    throw;
+  }
   runtime->loaded = true;
   g_runtimes.emplace(runtime_key, runtime);
   return runtime;
