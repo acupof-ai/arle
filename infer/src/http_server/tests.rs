@@ -1256,6 +1256,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_completion_streaming_parses_missing_close_tool_call() {
+        let app = build_app(mock_scheduler_with_deltas(
+            "Qwen3-4B",
+            vec![
+                CompletionStreamDelta {
+                    text_delta:
+                        "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}"
+                            .to_string(),
+                    finish_reason: None,
+                    usage: None,
+                    logprob: None,
+                    token_ids: Vec::new(),
+                    error: None,
+                },
+                CompletionStreamDelta {
+                    text_delta: String::new(),
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: None,
+                    logprob: None,
+                    token_ids: Vec::new(),
+                    error: None,
+                },
+            ],
+            false,
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{
+                    "messages":[{"role":"user","content":"hi"}],
+                    "max_tokens":1,
+                    "stream":true,
+                    "tools":[{"type":"function","function":{"name":"shell"}}]
+                }"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            payload.contains(r#""tool_calls""#) && payload.contains(r#""name":"shell""#),
+            "payload={payload}"
+        );
+        assert!(!payload.contains("<tool_call>"), "payload={payload}");
+        assert!(
+            payload.contains(r#""finish_reason":"tool_calls""#),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_streaming_emits_deepseek_dsml_tool_call_deltas() {
+        let app = build_app(mock_scheduler_with_deltas(
+            "DeepSeek-V4-Flash",
+            vec![
+                CompletionStreamDelta {
+                    text_delta: "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"shell\">\n"
+                        .to_string(),
+                    finish_reason: None,
+                    usage: None,
+                    logprob: None,
+                    token_ids: Vec::new(),
+                    error: None,
+                },
+                CompletionStreamDelta {
+                    text_delta:
+                        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n<｜DSML｜parameter name=\"count\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+                            .to_string(),
+                    finish_reason: None,
+                    usage: None,
+                    logprob: None,
+                    token_ids: Vec::new(),
+                    error: None,
+                },
+                CompletionStreamDelta {
+                    text_delta: String::new(),
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: None,
+                    logprob: None,
+                    token_ids: Vec::new(),
+                    error: None,
+                },
+            ],
+            false,
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{
+                    "messages":[{"role":"user","content":"hi"}],
+                    "model":"DeepSeek-V4-Flash",
+                    "max_tokens":1,
+                    "stream":true,
+                    "tools":[{"type":"function","function":{"name":"shell"}}]
+                }"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            payload.contains(r#""tool_calls""#) && payload.contains(r#""name":"shell""#),
+            "payload={payload}"
+        );
+        assert!(
+            payload.contains(r#"\"command\":\"pwd\""#),
+            "payload={payload}"
+        );
+        assert!(payload.contains(r#"\"count\":2"#), "payload={payload}");
+        assert!(!payload.contains("DSML"), "payload={payload}");
+        assert!(
+            payload.contains(r#""finish_reason":"tool_calls""#),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
     async fn chat_completion_streaming_tool_choice_none_suppresses_tool_deltas() {
         let app = build_app(mock_scheduler_with_deltas(
             "Qwen3-4B",
@@ -1303,6 +1432,8 @@ mod tests {
         let payload = String::from_utf8(body.to_vec()).unwrap();
 
         assert!(!payload.contains(r#""tool_calls""#), "payload={payload}");
+        assert!(!payload.contains("<tool_call>"), "payload={payload}");
+        assert!(!payload.contains("command"), "payload={payload}");
         assert!(
             !payload.contains(r#""finish_reason":"tool_calls""#),
             "payload={payload}"
