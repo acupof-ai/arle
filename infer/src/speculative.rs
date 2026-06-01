@@ -1,5 +1,9 @@
 //! Speculative decoding framework.
 //!
+//! **CUDA 路径：plumbing 已存在，但未作为 throughput-positive 能力 ship。**
+//! Metal DFlash 为 Beta（Qwen3.5）；CUDA external/self verifier 实验无生产默认。
+//! 状态真相：[`docs/support-matrix.md`](../../docs/support-matrix.md) §4a。
+//!
 //! Implements the draft-model + target-model verification loop described in
 //! "Fast Inference from Transformers via Speculative Decoding"
 //! (Leviathan et al., 2023) and "Accelerating Large Language Model Decoding
