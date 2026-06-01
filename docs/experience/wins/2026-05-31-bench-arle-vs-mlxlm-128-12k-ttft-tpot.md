@@ -61,34 +61,37 @@ e2e@40 = A + B + 38·C (the latency a 40-token answer actually takes).
   decode; speculative decoding is the wrong lever here.
 - **TTFT (A) is at near-parity** (ARLE ≤ 1.1× mlx-lm) — but this is *misleading*,
   see B.
-- **The entire ARLE long-context disadvantage is phase B — the token1→token2 gap —
-  and it is a deferred-`async_eval` stall, root-caused from server traces (not
-  inferred):**
+- **The entire ARLE long-context disadvantage is phase B — the token1→token2 gap.
+  CONFIRMED from server traces; the exact mechanism is still under investigation
+  (do not over-claim):**
   - Per-chunk trace of an 8k request: prefill runs in 2 chunks (cursor 0→4096
-    `terminal=false`, 4096→8035 `terminal=true`); the terminal chunk *samples
-    token 1* and the client receives it at **9.6 s** (= sum of the two chunk
-    elapsed times). So token 1 comes out right after a single prefill pass — TTFT
-    looks competitive.
-  - **But the prefill MLX graph was only `async_eval`-kicked-off, not
-    materialized.** The very next step (first decode) logs
-    `async_eval_kickoff_us=29590` at `cache_len=8036` — i.e. **30 s spent
-    draining the 8k prefill compute that token 1's sample had merely enqueued.**
-    Subsequent decode steps' kickoff falls 29.6 s → 12.5 → 11.8 → 11.4 ms as the
-    lazy graph drains, then flatten to ~12 ms. `recompute=false` — it is **not** a
-    re-prefill; it is the prefill's own GPU work, deferred past the first emitted
-    token by the `async_eval` boundary.
-  - mlx-lm synchronizes prefill *inside* TTFT (its 8.9 s TTFT is real compute),
-    then decodes at a flat 12 ms. ARLE splits one prefill into "kickoff 9.6 s
-    (reported as TTFT) + materialize 30 s (hidden in the token1→2 gap)" ≈ 40 s
-    total prefill vs mlx's ~14 s.
-- **Fix direction (no speculative decoding needed):** force `eval()` of the
-  terminal prefill chunk's graph *before/at* token-1 sampling so prefill compute
-  lands inside TTFT (as mlx does), instead of deferring it to the first decode
-  step. Expected to collapse phase B → e2e long-context latency drops ~3–4×.
-  Landing site: `request_state.rs:194-215` (terminal `prefill_tokens` →
-  `record_sampled_token`); the relevant lazy boundary is the `async_eval` import
-  at `request_state.rs:12`. Correctness-neutral (same math, earlier sync). Filed
-  as the next Metal work item; NOT attempted in this entry.
+    `terminal=false` 4.6 s, 4096→8035 `terminal=true` 4.96 s). The terminal chunk
+    samples token 1 and the client receives it at **9.6 s** (= 4.6 + 4.96).
+  - **Prefill IS fully materialized before token 1** — the terminal chunk calls
+    `ensure_cpp_prefill_drained()` + `eval(&[logits, sampled, k_caches…, v_caches…])`
+    (`request_state.rs:4152-4162`), and that `eval` is inside the 4.96 s terminal
+    chunk. So phase B is **NOT** deferred prefill (an earlier version of this entry
+    claimed that — it was wrong; corrected after reading the drain code).
+  - The 30 s is the **first decode step itself**: `metal_phase_timing batch=1
+    cache_len=8036 build_graph_us=992 async_eval_kickoff_us=29590`. Subsequent
+    decode steps fall 29.6 s → 12.5 → 11.8 → 11.4 ms then flatten to ~12 ms. So the
+    first decode after an 8k prefill pays a one-time O(context) cost that later
+    decodes don't. `recompute=false` (not a re-prefill).
+  - **Hypothesis (UNVERIFIED, flagged):** the first packed-batch decode after a
+    CPP-session prefill does a one-time conversion of the prefill session's KV
+    (`kv_flat`) into packed-batch KV tensors — a context-sized copy/transpose —
+    and/or `async_eval` caller-thread encoding of that large first graph
+    (`feedback_mlx_async_eval_is_caller_thread.md`). The 30 s sits in the
+    `async_eval(&eval_refs)` call at `request_state.rs:2652`. NOT yet proven by
+    instrumentation; the next step is to split that call's time (KV-transfer vs
+    encode vs GPU) before any fix.
+- **Fix direction (no speculative decoding needed), pending root-cause
+  confirmation:** eliminate the first-decode one-time cost — likely by reusing the
+  prefill session's already-materialized KV directly for the first decode instead
+  of re-deriving it, or by warming the packed-batch KV during the terminal prefill
+  chunk. Expected to collapse phase B → long-context e2e drops ~3–4×. Filed as the
+  next Metal work item; NOT attempted in this entry (root cause must be instrumented
+  first — an earlier guess at this mechanism was already wrong once).
 - **The metric bug that started this.** v1 computed decode rate as
   `(out-1)/(last-first)`, which folds the giant token1→2 prefill-tail interval into
   "decode" → a fake O(context) collapse (1.4 tok/s @8k instead of the real ~76).
