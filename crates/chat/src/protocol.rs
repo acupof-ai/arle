@@ -220,7 +220,7 @@ impl StreamingToolCalls {
                 Some(HiddenBlock::ToolCall) => {
                     if let Some(idx) = self.pending.find(TOOL_CALL_BLOCK.close) {
                         self.tool_buf.push_str(&self.pending[..idx]);
-                        if let Some(call) = parse_tool_call_block(self.tool_buf.trim()) {
+                        if let Some(call) = parse_streaming_tool_call_block(self.tool_buf.trim()) {
                             calls.push(call);
                         }
                         self.tool_buf.clear();
@@ -278,6 +278,26 @@ fn parse_tool_call_block(json_str: &str) -> Option<ToolCall> {
         .cloned()
         .unwrap_or(Value::Object(Map::default()));
     Some(ToolCall::new(name, arguments))
+}
+
+fn parse_streaming_tool_call_block(inner: &str) -> Option<ToolCall> {
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return None;
+    }
+
+    if let Some(function_pos) = inner.find("<function=")
+        && inner[..function_pos].trim().is_empty()
+    {
+        return parse_native_function_block(&inner[function_pos..]);
+    }
+
+    let json_start = inner.find('{')?;
+    if !inner[..json_start].trim().is_empty() {
+        return None;
+    }
+    let json_len = json_object_len(&inner[json_start..])?;
+    parse_tool_call_block(&inner[json_start..json_start + json_len])
 }
 
 fn find_first_tag<'a>(text: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
@@ -1341,6 +1361,24 @@ mod tests {
         assert_eq!(calls[0].arguments["x"], 1);
         assert_eq!(calls[1].name, "b");
         assert_eq!(calls[1].arguments["y"], 2);
+    }
+
+    #[test]
+    fn streaming_tool_calls_native_xml_split_across_chunks() {
+        let mut stream = StreamingToolCalls::default();
+        let (visible, calls) = drive_streaming(
+            &mut stream,
+            &[
+                "Checking <tool_call><function=shell><parameter=command>",
+                "ls -la</parameter></function>",
+                "</tool_call> done",
+            ],
+        );
+
+        assert_eq!(visible, "Checking  done");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
     }
 
     #[test]

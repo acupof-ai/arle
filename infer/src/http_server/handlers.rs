@@ -1288,6 +1288,7 @@ pub(super) async fn chat_completions(
         let continuous_usage_stats = options.continuous_usage_stats;
         let tool_choice = req.tool_choice_mode();
         let has_tools = !req.tools.is_empty();
+        let stream_tools_enabled = has_tools && !matches!(&tool_choice, chat::ToolChoiceMode::None);
 
         let prompt = build_chat_prompt(&model_id, &req);
 
@@ -1329,15 +1330,13 @@ pub(super) async fn chat_completions(
 
             let req_id = request_id;
             let mid = model_id.clone();
-            // Gate on tool presence: when tools are present we route deltas
-            // through the stateful tool extractor (which emits OpenAI tool-call
-            // deltas + a tool_calls finish_reason). When no tools are present we
-            // keep the existing plain `delta_sse_events` path byte-for-byte so we
-            // never start hiding `<think>` from plain chat streams.
+            // Gate on effective tool availability: tool_choice=none withholds
+            // tools from the prompt and must not post-process hallucinated
+            // tool_call blocks into OpenAI tool-call deltas.
             let content_stream: futures_util::stream::BoxStream<
                 'static,
                 Result<Event, Infallible>,
-            > = if has_tools {
+            > = if stream_tools_enabled {
                 let state = ChatToolStreamState {
                     request_id: req_id,
                     created,
