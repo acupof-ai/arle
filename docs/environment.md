@@ -39,6 +39,23 @@ document the debug-only status here.
 
 ---
 
+## 1b. Cargo Feature 决策表（`infer` crate）
+
+来源：`infer/Cargo.toml` `[features]`。完整说明见
+[`onboarding.md`](onboarding.md) §4。
+
+| 目标 | 命令 |
+| --- | --- |
+| Linux + NVIDIA 完整构建 | `cargo build --release --features cuda --bin arle` |
+| Apple Silicon | `cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle` |
+| Mac 上 CUDA Rust 类型检查（无 GPU） | `cargo check -p infer --no-default-features --features cuda,no-cuda` |
+| CPU smoke | `cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle` |
+| Multi-GPU NCCL smoke | `cargo build --release -p infer --features cuda,nccl --bin infer` |
+
+`default = ["unified_scheduler"]` — 默认 feature **不含** cuda/metal，须显式选择 backend。
+
+---
+
 ## 2. User-Facing Runtime Variables
 
 ### `ARLE_MODEL`

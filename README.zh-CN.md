@@ -16,6 +16,7 @@
   <a href="#快速开始">快速开始</a> ·
   <a href="docs/http-api.md">HTTP API</a> ·
   <a href="docs/support-matrix.md">支持矩阵</a> ·
+  <a href="docs/onboarding.md">新人指南</a> ·
   <a href="docs/architecture.md">架构</a> ·
   <a href="ROADMAP.md">路线图</a> ·
   <a href="CHANGELOG.md">变更日志</a>
@@ -101,7 +102,7 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 - **Paged KV 池。** `page_size=16`,直接 GPU 页面挂载 + 共享前缀的尾页 CoW —— 计费可预期、共享前缀更便宜。
 - **统一的运行时权威。** `infer`、`arle`、OPD 训练共用同一套 Rust 运行时与模型契约 —— OPD teacher 就是生产服务用的同一个 runtime,不再分两套栈。
 
-架构详解:[docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
+架构详解:[docs/onboarding.md](docs/onboarding.md)（新人 30 分钟）· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
 
 ---
 

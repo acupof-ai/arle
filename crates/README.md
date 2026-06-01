@@ -1,8 +1,8 @@
 # Workspace crates
 
 This folder hosts the reusable crates around `infer`. The canonical workspace
-map lives in [`../docs/codebase-map.md`](../docs/codebase-map.md); this README
-is a quick orientation.
+map lives in [`../docs/codebase-map.md`](../docs/codebase-map.md); new
+contributors should start at [`../docs/onboarding.md`](../docs/onboarding.md).
 
 Runtime-facing control plane:
 
@@ -30,17 +30,17 @@ Shared model contract:
 - `qwen3-spec`: canonical Qwen3 config + tensor-name contract shared between
   train and infer
 - `qwen35-spec`: canonical Qwen3.5 config + tensor-name contract
+- `deepseek-spec`: DeepSeek V4 config + tensor-name contract (DS0 scaffold)
 
-Train-side runtime extension (per
-[`../docs/projects/agent-rl-self-evolving.md`](../docs/projects/agent-rl-self-evolving.md)):
+Train-side runtime extension (OPD-only since 2026-05-18 pivot — see
+[`../docs/projects/2026-05-18-opd-only-pivot.md`](../docs/projects/2026-05-18-opd-only-pivot.md)):
 
 - `autograd`: from-scratch Rust autograd — `TensorStore` + `Tape` + `Backend`
-  trait with the device-resident / lazy-eval Metal path
-- `train`: generic Qwen-family pretrain / SFT / GRPO / multi-turn trainer
-  (library only — surfaces are reached via `arle train ...` / `arle data ...`,
-  which include `src/bin/*.rs` as in-process dispatch sources), train-side
-  `/v1/train/{status,events,stop,save}` control plane, shared async
-  observability sinks (JSONL + MLflow + OTLP + W&B sidecar)
+  trait with CPU + CUDA + Metal paths
+- `train`: OPD substrate — `opd_step`, LoRA, checkpoint codec, tokenizer,
+  train-side `/v1/train/{status,events,stop,save}` control plane, shared async
+  observability sinks (JSONL + MLflow + OTLP + W&B sidecar). **Retired surfaces:**
+  scratch pretrain, SFT, GRPO, multi-turn RL (commit `bd94c09`).
 
 The 2026-04-15 Route-A refactor folded the experimental `infer-core`,
 `infer-engine`, `infer-observability`, and `infer-policy` crates back into
