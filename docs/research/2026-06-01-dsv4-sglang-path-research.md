@@ -9,23 +9,53 @@ baseline.
 Goal: understand what a valid SGLang DSv4 comparison must mean before running a
 PyTorch profiler trace or making more ARLE changes.
 
+## Correction: Runtime SGLang Tree
+
+The first pass inspected the wrong SGLang tree.
+
+Two SGLang source trees exist on the pod:
+
+| Path | Commit | Runtime relevance |
+|---|---|---|
+| `/workspace/sglang` | `0d51db3` (`feat: add SGLANG_APPLY_CONFIG_BACKUP=auto and default to it (#38)`) | actual Python import path |
+| `/sgl-workspace/sglang` | `232982a` (`Fix NPU docker release workflow (#16253)`) | stale for DSv4 runtime analysis |
+
+Live Python import metadata resolves DSv4 modules from `/workspace/sglang`:
+
+```text
+sglang.srt.models.deepseek_v4 -> /workspace/sglang/python/sglang/srt/models/deepseek_v4.py
+sglang.srt.layers.attention.deepseek_v4_backend -> /workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+sglang.srt.arg_groups.deepseek_v4_hook -> /workspace/sglang/python/sglang/srt/arg_groups/deepseek_v4_hook.py
+sglang.srt.layers.moe.mega_moe -> /workspace/sglang/python/sglang/srt/layers/moe/mega_moe.py
+```
+
+Therefore the earlier statement that the readable SGLang source had no
+`DeepseekV4ForCausalLM` support is false for the runtime tree. It only describes
+the stale `/sgl-workspace/sglang` checkout. All path-comparison work must use
+`/workspace/sglang` as the source reference unless the serving environment is
+changed and re-verified.
+
 ## Current Evidence
 
-- Remote SGLang source inspected: `/sgl-workspace/sglang`.
+- Runtime SGLang source inspected: `/workspace/sglang`.
+- Stale non-runtime SGLang source inspected: `/sgl-workspace/sglang`.
 - Remote DSv4 model inspected: `/data01/models/DeepSeek-V4-Flash`.
 - The model config says `architectures=["DeepseekV4ForCausalLM"]` and
   `model_type="deepseek_v4"`.
-- The inspected SGLang source does not register `DeepseekV4ForCausalLM`; grep for
-  `DeepseekV4`, `deepseek_v4`, and `V4ForCausalLM` under `python/sglang` returned
-  no implementation.
+- The runtime tree registers `DeepseekV4ForCausalLM` via
+  `python/sglang/srt/models/deepseek_v4.py` and `EntryClass =
+  [DeepseekV4ForCausalLM]`.
+- The runtime tree registers the CUDA `dsv4` attention backend in
+  `python/sglang/srt/layers/attention/attention_registry.py`.
+- The runtime tree applies DSv4 defaults through
+  `python/sglang/srt/arg_groups/deepseek_v4_hook.py`.
 - The DSv4 model directory includes a standalone reference implementation under
   `inference/`, with V4-specific attention compression/indexing and a simple
   MoE path.
 
-This means the current readable `/sgl-workspace/sglang` tree is not yet proven to
-be the same SGLang DSv4 path that produced any claimed 18 ms TPOT number. Before
-profiling, we must identify the exact DSv4 SGLang fork/patch or model registry
-that actually supports `DeepseekV4ForCausalLM`.
+This means the DSv4 SGLang implementation has been identified at source level.
+The remaining gap is not "find the implementation"; it is "lock the exact
+launch contract and run a fresh warm control profile from that implementation."
 
 ## DSv4 Model Shape
 
@@ -63,9 +93,66 @@ implementation, not proof of MoE expert-group routing. The generic SGLang
 DeepSeek V3 path uses `n_group/topk_group` grouped top-k, but the V4 config read
 here does not contain those fields.
 
+## SGLang DSv4 Runtime Path
+
+The actual `/workspace/sglang` DSv4 path has model-specific defaults:
+
+- `attention_backend = "dsv4"`;
+- `page_size = 256`;
+- `kv_cache_dtype = "fp8_e4m3"` when the user leaves it on `auto`;
+- `max_running_requests = 256` when not specified;
+- speculative decoding, if enabled, must be EAGLE with
+  `speculative_eagle_topk == 1`;
+- `swa_full_tokens_ratio = 0.1` by default for DSv4.
+
+The H200 FP8 cookbook path uses `sgl-project/DeepSeek-V4-Flash-FP8`, not the raw
+`/data01/models/DeepSeek-V4-Flash` directory. It sets
+`SGLANG_DSV4_FP4_EXPERTS=0`.
+
+Manual test recipes in `/workspace/sglang/test/manual/dsv4/` show the intended
+lanes:
+
+| Lane | Key launch contract |
+|---|---|
+| Low latency | `--tp 4`, EAGLE, `--speculative-num-steps 3`, `--speculative-num-draft-tokens 4` |
+| Balanced | `--tp 4 --dp 4 --enable-dp-attention --moe-a2a-backend deepep`, EAGLE step 1, `--cuda-graph-max-bs 128`, `--max-running-requests 128` |
+| Max throughput | `--tp 4 --dp 4 --enable-dp-attention --moe-a2a-backend deepep`, `--cuda-graph-max-bs 128`, `--max-running-requests 256` |
+| CP | `--tp 4 --moe-a2a-backend deepep --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split --chunked-prefill-size 16384` |
+| TP8 sanity | `--tp 8 --max-running-requests 8`, no explicit DeepEP or speculation |
+
+DeepEP recipes use:
+
+```text
+--deepep-config '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
+SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
+```
+
+or `1024` for the CP recipe.
+
+Attention is DSv4-specific, not a generic FlashMLA call:
+
+- `DeepseekV4AttnBackend` asserts `page_size == 256` and `head_dim == 512`;
+- metadata is built around SWA, C4, and C128 page indices;
+- `MQALayer` fuses Q norm/RoPE through DSv4 JIT helpers;
+- K/V norm/RoPE writes directly into the FlashMLA paged cache;
+- compressor and C4 indexer work are first-class model-layer operations;
+- the backend calls `flash_mla.flash_mla_with_kvcache(...,
+  is_fp8_kvcache=True, indices=..., topk_length=..., extra_k_cache=...)`.
+
+MoE is also DSv4-specific:
+
+- `DeepseekV4DecoderLayer` constructs `DeepseekV2MoE(...,
+  is_deepseek_v4=True)`;
+- hash top-k can use the DSv4 JIT `hash_topk` path;
+- `mega_moe.py` contains an SM90 FP8 MegaMoE path using
+  `deep_gemm.fp8_mega_moe`;
+- `moe_runner/deep_gemm.py` uses grouped masked DeepGEMM and the DSv4 JIT
+  `silu_and_mul_masked_post_quant` activation+quant path.
+
 ## Generic SGLang MoE Path
 
-The inspected SGLang MoE stack has three relevant layers:
+The generic SGLang MoE stack still matters because DSv4's DeepEP and DeepGEMM
+paths are selected through the same server arguments and runner framework:
 
 1. `--moe-a2a-backend`
    - default: `none`;
@@ -85,8 +172,9 @@ The inspected SGLang MoE stack has three relevant layers:
    - resolves to `low_latency` for decode batches.
 
 So a valid SGLang DeepGEMM+DeepEP comparison cannot be inferred from a launch
-command that omits `--moe-a2a-backend deepep` unless a DSv4-specific hook
-overrides it elsewhere.
+command that omits `--moe-a2a-backend deepep` unless the selected DSv4 lane is
+the TP8 sanity lane or another documented no-DeepEP recipe. For the Balanced and
+MaxThroughput lanes, DeepEP is explicit.
 
 ## DeepGEMM Warmup
 
@@ -104,6 +192,8 @@ Key mechanics:
 - without precompile/cache, the first matching DeepGEMM execution may enter a
   "DeepGEMM warmup" loop over many M sizes. Source warning says this can take
   10-20 minutes.
+- the DSv4 manual tests force `SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1` because the
+  exhaustive warmup grid is too broad for routine DSv4 cookbook runs.
 
 Profiling must exclude this warmup. A profile that includes DeepGEMM compile or
 first-use warmup is not a steady-state SGLang baseline.
@@ -174,15 +264,21 @@ Script risk:
 
 - `scripts/dsv4_beat_sglang_bench.sh` launches SGLang with only
   `--tp 8 --kv-cache-dtype fp8_e4m3`; it does not force DeepEP, does not
-  precompile DeepGEMM, and assumes `/sgl-workspace/sglang` supports DSv4.
-- That script is therefore not a valid SGLang-best-practice profiler harness yet.
+  precompile DeepGEMM, and previously assumed `/sgl-workspace/sglang` was the
+  relevant source tree.
+- That script is therefore not a valid SGLang-best-practice profiler harness for
+  the Balanced or MaxThroughput lanes yet. It may approximate the TP8 sanity lane
+  only after the runtime tree, model package, warmup state, and correctness are
+  logged.
 
 ## What Must Be Locked Before Running Perf
 
-1. Identify the exact SGLang DSv4 implementation:
-   - source tree or patch that registers `DeepseekV4ForCausalLM`;
-   - attention backend used for DSv4 Flash;
-   - required kernel package versions.
+1. Keep the SGLang DSv4 implementation identity attached to every run:
+   - source tree `/workspace/sglang`;
+   - commit `0d51db3` unless re-verified;
+   - model package `sgl-project/DeepSeek-V4-Flash-FP8` for the H200 FP8
+     cookbook lanes;
+   - attention backend `dsv4`, page size 256, FP8 KV cache.
 
 2. Lock the SGLang launch contract:
    - TP/DP/EP sizes;
@@ -210,11 +306,30 @@ Script risk:
 
 ## Research Conclusion
 
-The next correct step is not to run another trace immediately. The correct next
-step is to locate or reconstruct the actual SGLang DSv4 path first. The inspected
-SGLang tree explains DeepGEMM warmup, DeepEP grouping, `num_sms`, and profiler
-mechanics, but it does not by itself establish a runnable DSv4 SGLang baseline.
+The actual SGLang DSv4 source path is now identified:
 
-Once the SGLang DSv4 implementation is identified, the first profiler run should
-be a warm, stage-split PyTorch profile with DeepGEMM warmup excluded and with the
-launch contract recorded verbatim.
+```text
+/workspace/sglang @ 0d51db3
+```
+
+The earlier negative finding came from inspecting `/sgl-workspace/sglang`, which
+is not the runtime import tree for DSv4.
+
+The next correct step is still not to run an unqualified trace. The correct next
+step is to update the SGLang harness to select a documented lane, record the
+runtime tree and launch contract, warm DeepGEMM with fast warmup/cache, verify
+normal output, then run a warm stage-split PyTorch profile.
+
+For optimization planning, the source-level SGLang best-practice deltas are now
+clear:
+
+1. match DSv4 defaults first: `dsv4` backend, page size 256, FP8 KV, model
+   package, and request/concurrency lane;
+2. for Balanced/MaxThroughput, match TP4/DP4 with DP attention and DeepEP
+   rather than ARLE's replicated-token TP/EP fallback;
+3. move ARLE's MoE path toward token-owned DeepEP/MegaMoE-style routing plus
+   grouped DeepGEMM and fused `silu_mul_quant`, not BF16 materialization plus
+   post-FFN all-reduce;
+4. move ARLE attention toward the SGLang DSv4 metadata/cache/indexer contract
+   instead of isolated per-row CSA selector tuning;
+5. keep raw target TPOT and speculative/effective TPOT in separate metric lanes.
