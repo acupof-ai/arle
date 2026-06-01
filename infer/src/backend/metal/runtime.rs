@@ -2361,17 +2361,12 @@ fn execute_mixed_batch(
     let Some(prefill_snapshot) = active.get(&prefill_req_id) else {
         return false;
     };
-    if prefill_snapshot.delta_closed()
-        || !prefill_snapshot.request_state.is_qwen3()
-        || prefill_snapshot.request_state.is_dflash_enabled()
-    {
+    if !MixedBatchRequestEligibility::from_request(prefill_snapshot).is_supported() {
         return false;
     }
     if !decode_req_ids.iter().all(|req_id| {
         active.get(req_id).is_some_and(|request| {
-            !request.delta_closed()
-                && request.request_state.is_qwen3()
-                && !request.request_state.is_dflash_enabled()
+            MixedBatchRequestEligibility::from_request(request).is_supported()
         })
     }) {
         return false;
@@ -2387,7 +2382,7 @@ fn execute_mixed_batch(
             scheduler.finish_request(req_id, None);
             continue;
         };
-        if request.delta_closed() {
+        if request.cancel_requested() {
             scheduler.finish_request(req_id, request_mode(&request));
             continue;
         }
@@ -2400,7 +2395,7 @@ fn execute_mixed_batch(
         }
         return false;
     };
-    if prefill_request.delta_closed() {
+    if prefill_request.cancel_requested() {
         scheduler.finish_request(prefill_req_id, request_mode(&prefill_request));
         if let Err(err) = prefill_request.cancel() {
             warn!(
@@ -2501,6 +2496,27 @@ fn execute_mixed_batch(
     }
 
     true
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MixedBatchRequestEligibility {
+    cancel_requested: bool,
+    is_qwen3: bool,
+    is_dflash_enabled: bool,
+}
+
+impl MixedBatchRequestEligibility {
+    fn from_request(request: &ActiveMetalRequest) -> Self {
+        Self {
+            cancel_requested: request.cancel_requested(),
+            is_qwen3: request.request_state.is_qwen3(),
+            is_dflash_enabled: request.request_state.is_dflash_enabled(),
+        }
+    }
+
+    fn is_supported(self) -> bool {
+        !self.cancel_requested && self.is_qwen3 && !self.is_dflash_enabled
+    }
 }
 
 fn abort_runtime_requests(
@@ -2626,7 +2642,7 @@ fn activate_pending_request(
         return;
     };
 
-    if pending_request.delta_closed() {
+    if pending_request.cancel_requested() {
         handle.consume_one();
         scheduler.finish_request(req_id, None);
         return;
@@ -3762,6 +3778,42 @@ mod tests {
         assert!(dflash_row_dispatch_plan(3, &[0, 3], 2).is_err());
         assert!(dflash_row_dispatch_plan(3, &[2, 1], 2).is_err());
         assert!(dflash_row_dispatch_plan(3, &[1, 1], 2).is_err());
+    }
+
+    #[test]
+    fn mixed_batch_eligibility_rejects_cooperative_cancel() {
+        assert!(
+            !MixedBatchRequestEligibility {
+                cancel_requested: true,
+                is_qwen3: true,
+                is_dflash_enabled: false,
+            }
+            .is_supported()
+        );
+        assert!(
+            MixedBatchRequestEligibility {
+                cancel_requested: false,
+                is_qwen3: true,
+                is_dflash_enabled: false,
+            }
+            .is_supported()
+        );
+        assert!(
+            !MixedBatchRequestEligibility {
+                cancel_requested: false,
+                is_qwen3: false,
+                is_dflash_enabled: false,
+            }
+            .is_supported()
+        );
+        assert!(
+            !MixedBatchRequestEligibility {
+                cancel_requested: false,
+                is_qwen3: true,
+                is_dflash_enabled: true,
+            }
+            .is_supported()
+        );
     }
 
     #[test]
