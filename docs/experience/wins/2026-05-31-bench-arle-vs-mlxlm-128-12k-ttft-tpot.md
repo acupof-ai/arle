@@ -38,36 +38,57 @@ decode.
 
 ## Results
 
-| prompt | ARLE TTFT (s) | mlx-lm TTFT (s) | ARLE TPOT (ms) | mlx-lm TPOT (ms) | ARLE first-interval (s) |
-|--------|--------------:|----------------:|---------------:|-----------------:|------------------------:|
-| 128  | 0.22  | 0.28  | 11.3 | 11.3 | 0.5  |
-| 256  | 0.35  | 0.39  | 11.3 | 11.3 | 0.9  |
-| 512  | 0.60  | 0.63  | 11.3 | 11.3 | 1.8  |
-| 1k   | 1.09  | 1.13  | 11.5 | 11.5 | 3.4  |
-| 2k   | 2.12  | 2.18  | 11.7 | 11.6 | 6.8  |
-| 4k   | 4.44  | 4.32  | 12.0 | 11.8 | 13.9 |
-| 8k   | 9.23  | 8.93  | 13.1 | 12.5 | 29.6 |
-| 12k  | 15.56 | 14.22 | 13.7 | 13.1 | 47.2 |
+Three measured phases per request (client SSE timing; server `request_trace`
+`ttft_ms` agrees with client TTFT to <1 %, so these are ground truth):
+A = TTFT (token 1), B = token1→token2 gap, C = steady decode (token 2+).
+e2e@40 = A + B + 38·C (the latency a 40-token answer actually takes).
 
-![ARLE vs mlx-lm TTFT/TPOT sweep](assets/2026-05-31-mlx-vs-arle-128-12k-sweep.png)
+| prompt | A: ARLE TTFT | A: mlx TTFT | C: ARLE TPOT | C: mlx TPOT | B: ARLE gap | e2e@40 ARLE | e2e@40 mlx | ratio |
+|--------|----:|----:|----:|----:|----:|----:|----:|:--:|
+| 128  | 0.22 s | 0.28 s | 11.3 ms | 11.3 ms | 0.55 s | 1.20 s | 0.72 s | 1.7× |
+| 512  | 0.60 s | 0.63 s | 11.3 ms | 11.3 ms | 1.76 s | 2.78 s | 1.08 s | 2.6× |
+| 2k   | 2.12 s | 2.18 s | 11.7 ms | 11.6 ms | 6.77 s | 9.33 s | 2.63 s | 3.6× |
+| 4k   | 4.44 s | 4.32 s | 12.0 ms | 11.8 ms | 13.9 s | 18.8 s | 4.78 s | 3.9× |
+| 8k   | 9.23 s | 8.93 s | 13.1 ms | 12.5 ms | 29.6 s | 39.3 s | 9.42 s | 4.2× |
+| 12k  | 15.6 s | 14.2 s | 13.7 ms | 13.1 ms | 47.2 s | 63.3 s | 14.7 s | 4.3× |
+
+![ARLE vs mlx-lm 4-phase sweep](assets/2026-05-31-mlx-vs-arle-128-12k-sweep.png)
 
 ## Learnings
-- **Decode (TPOT) is at parity.** 11.3 → 13.7 ms/token across 128 → 12k, within
-  1–5 % of mlx-lm at every length, and ~flat in context (the ~15 % rise to 12k is
-  the physical KV-read floor). ARLE is **not** slower at decode — the fused
-  no-mask SDPA decode path (`mask_mode=""` at S=1) is already the default for the
-  c=1 / uniform-batch case. No fix needed or made.
-- **TTFT (prefill) is also at near-parity** (ARLE ≤ 1.1× mlx-lm; both rise ~linearly
-  with length). An earlier "ARLE 2× slower TTFT" claim came from comparing
-  ARLE-over-HTTP against the wrong mlx baseline; against the same in-process MLX,
-  prefill tracks closely.
-- **The one real ARLE-specific long-context cost is the prefill-tail**: the
-  token1→token2 gap grows 0.5 s → 47 s as context goes 128 → 12k (panel 3). ARLE's
-  pipelined scheduler emits token 1, then front-loads the bulk prompt prefill into
-  the token1→2 interval. This is a **scheduling/streaming-shape** characteristic,
-  not a decode cost — but it IS where a user feels "slow to get going" on long
-  agent/multi-turn context. Worth a look: why the prompt-prefill work lands after
-  token 1 instead of fully inside TTFT.
+- **Decode (C, TPOT) is at parity.** 11.3 → 13.7 ms/token across 128 → 12k, within
+  1–5 % of mlx-lm and ~flat in context (the fused no-mask SDPA decode path,
+  `mask_mode=""` at S=1, is already the default at c=1). ARLE is **not** slower at
+  decode; speculative decoding is the wrong lever here.
+- **TTFT (A) is at near-parity** (ARLE ≤ 1.1× mlx-lm) — but this is *misleading*,
+  see B.
+- **The entire ARLE long-context disadvantage is phase B — the token1→token2 gap —
+  and it is a deferred-`async_eval` stall, root-caused from server traces (not
+  inferred):**
+  - Per-chunk trace of an 8k request: prefill runs in 2 chunks (cursor 0→4096
+    `terminal=false`, 4096→8035 `terminal=true`); the terminal chunk *samples
+    token 1* and the client receives it at **9.6 s** (= sum of the two chunk
+    elapsed times). So token 1 comes out right after a single prefill pass — TTFT
+    looks competitive.
+  - **But the prefill MLX graph was only `async_eval`-kicked-off, not
+    materialized.** The very next step (first decode) logs
+    `async_eval_kickoff_us=29590` at `cache_len=8036` — i.e. **30 s spent
+    draining the 8k prefill compute that token 1's sample had merely enqueued.**
+    Subsequent decode steps' kickoff falls 29.6 s → 12.5 → 11.8 → 11.4 ms as the
+    lazy graph drains, then flatten to ~12 ms. `recompute=false` — it is **not** a
+    re-prefill; it is the prefill's own GPU work, deferred past the first emitted
+    token by the `async_eval` boundary.
+  - mlx-lm synchronizes prefill *inside* TTFT (its 8.9 s TTFT is real compute),
+    then decodes at a flat 12 ms. ARLE splits one prefill into "kickoff 9.6 s
+    (reported as TTFT) + materialize 30 s (hidden in the token1→2 gap)" ≈ 40 s
+    total prefill vs mlx's ~14 s.
+- **Fix direction (no speculative decoding needed):** force `eval()` of the
+  terminal prefill chunk's graph *before/at* token-1 sampling so prefill compute
+  lands inside TTFT (as mlx does), instead of deferring it to the first decode
+  step. Expected to collapse phase B → e2e long-context latency drops ~3–4×.
+  Landing site: `request_state.rs:194-215` (terminal `prefill_tokens` →
+  `record_sampled_token`); the relevant lazy boundary is the `async_eval` import
+  at `request_state.rs:12`. Correctness-neutral (same math, earlier sync). Filed
+  as the next Metal work item; NOT attempted in this entry.
 - **The metric bug that started this.** v1 computed decode rate as
   `(out-1)/(last-first)`, which folds the giant token1→2 prefill-tail interval into
   "decode" → a fake O(context) collapse (1.4 tok/s @8k instead of the real ~76).
