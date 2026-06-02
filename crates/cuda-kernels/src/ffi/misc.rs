@@ -240,6 +240,32 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    pub fn dsv4_compressor_update_start_pos_ptr_cuda(
+        kv_raw: *const super::Half,
+        score_raw: *const super::Half,
+        ape: *const super::Half,
+        norm: *const super::Half,
+        pending_kv: *mut super::Half,
+        pending_score: *mut super::Half,
+        prev_overlap_kv: *mut super::Half,
+        prev_overlap_score: *mut super::Half,
+        compressed: *mut super::Half,
+        num_tokens: i32,
+        start_pos: *const i32,
+        head_dim: i32,
+        ratio: i32,
+        width: i32,
+        overlap: i32,
+        eps: f32,
+        rope_dim: i32,
+        rope_base: f32,
+        original_seq_len: i32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_hybrid_attention_cuda(
         q: *const super::Half,
         k_new: *const super::Half,
