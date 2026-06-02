@@ -313,7 +313,7 @@ as diagnostics and validation gates, not stable tuning API.
 
 | Variable | Values | Default | Current behavior |
 |---|---|---|---|
-| `ARLE_DSV4_MOE_BACKEND` | `allreduce`, `native-deepep`, `native_deepep`, legacy `deepep`, unset | unset = current all-reduce default | Selects the DSv4 MoE runtime. The current default is local routed experts plus EP all-reduce because native DeepEP is not correct on replicated token rows. `native-deepep` is fail-closed behind the process/token-ownership contract; legacy `deepep` names the older DeepEP-style diagnosis path, not a default-worthy SGLang path. |
+| `ARLE_DSV4_MOE_BACKEND` | `allreduce`, `native-deepep`, `native_deepep`, legacy `deepep`, unset | unset = current all-reduce default | Selects the DSv4 MoE runtime. The current default is local routed experts plus EP all-reduce because native DeepEP is not correct on replicated token rows. `native-deepep` is reserved for the future token-owned DP/EP path and currently fails during startup on the replicated-token executable route; legacy `deepep` names the older DeepEP-style diagnosis path, not a default-worthy SGLang path. |
 | `ARLE_DSV4_INCREMENTAL_KV` | `1` / unset | unset | Enables the incremental DSv4 KV state path used by the 8-rank HTTP bring-up. |
 | `ARLE_DSV4_TRACE_LAYER` | `1` / unset | unset | Emits CUDA-synchronizing per-layer phase traces and request-level DSv4 operator aggregates. Use for diagnosis only; it changes latency. |
 | `ARLE_DSV4_OPERATOR_TRACE` | `1` / unset | unset | Enables the same CUDA-synchronizing DSv4 operator aggregate in `request_trace` JSON without emitting every per-layer event log line. The field is `dsv4_operator_trace_process_delta` and is valid for single-inflight profiling only. |
