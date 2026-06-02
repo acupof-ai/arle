@@ -82,6 +82,24 @@ pub struct NumaSchedulerWorker {
     pub placement: crate::runtime_topology::WorkerPlacement,
 }
 
+/// Data ownership contract used by a multi-rank request group.
+///
+/// SGLang's fast DSv4 path requires token-owned DP/EP shards. ARLE's current
+/// multiproc and in-process DSv4 group still broadcasts the full logical
+/// request to every rank, so make that fallback contract explicit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DistributedRequestOwnership {
+    ReplicatedToken,
+}
+
+impl DistributedRequestOwnership {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplicatedToken => "replicated-token",
+        }
+    }
+}
+
 pub struct NumaSchedulerRouter {
     topology: crate::runtime_topology::RuntimeTopology,
     workers: Vec<NumaSchedulerWorker>,
@@ -115,6 +133,7 @@ pub struct DistributedSchedulerGroup {
     /// path for envelope-field validation; read by the public accessor
     /// `effective_world_size()`.
     effective_world_size: usize,
+    request_ownership: DistributedRequestOwnership,
     /// Monotonic request ID for relay envelope tagging.
     next_request_id: std::sync::atomic::AtomicU64,
 }
@@ -243,6 +262,13 @@ impl DistributedSchedulerGroup {
         let model_id = Arc::from(workers[0].handle.model_id());
         let tokenizer = workers[0].handle.tokenizer_clone();
         let effective_world_size = workers.len();
+        let request_ownership = DistributedRequestOwnership::ReplicatedToken;
+        log::info!(
+            "Distributed scheduler request ownership: mode={} local_workers={} effective_world_size={} relay=false",
+            request_ownership.as_str(),
+            workers.len(),
+            effective_world_size,
+        );
         Self {
             workers,
             model_id,
@@ -251,6 +277,7 @@ impl DistributedSchedulerGroup {
             submission_lock: Mutex::new(()),
             relay: None,
             effective_world_size,
+            request_ownership,
             next_request_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -278,6 +305,13 @@ impl DistributedSchedulerGroup {
         );
         let model_id = Arc::from(workers[0].handle.model_id());
         let tokenizer = workers[0].handle.tokenizer_clone();
+        let request_ownership = DistributedRequestOwnership::ReplicatedToken;
+        log::info!(
+            "Distributed scheduler request ownership: mode={} local_workers={} effective_world_size={} relay=true",
+            request_ownership.as_str(),
+            workers.len(),
+            effective_world_size,
+        );
         Self {
             workers,
             model_id,
@@ -286,6 +320,7 @@ impl DistributedSchedulerGroup {
             submission_lock: Mutex::new(()),
             relay: Some(relay),
             effective_world_size,
+            request_ownership,
             next_request_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -352,6 +387,10 @@ impl DistributedSchedulerGroup {
     /// Effective distributed world size — see field doc.
     pub fn effective_world_size(&self) -> usize {
         self.effective_world_size
+    }
+
+    pub fn request_ownership(&self) -> DistributedRequestOwnership {
+        self.request_ownership
     }
 
     /// Phase B-1 commit C.4.4 — worker-side inverse of
@@ -771,6 +810,10 @@ mod tests {
                 },
             ],
             crate::metrics::ServerMetrics::new("model"),
+        );
+        assert_eq!(
+            group.request_ownership(),
+            DistributedRequestOwnership::ReplicatedToken
         );
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
         let mut req = test_request(None, Some(0));
