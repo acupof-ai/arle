@@ -15,6 +15,7 @@ use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use cudarc::driver::{CudaSlice, DevicePtrMut};
+use half::bf16;
 use log::info;
 
 /// MODEL1 FlashMLA sparse-FP8 KV block byte size — `page_block_size (64) ×
@@ -161,6 +162,9 @@ pub(super) struct DeepseekFlashMlaDecodeBatchArena {
     pub(super) lse_accum: CudaSlice<f32>,
     pub(super) o_accum: CudaSlice<f32>,
     pub(super) lse_out: CudaSlice<f32>,
+    pub(super) tp_gathered_q: CudaSlice<bf16>,
+    pub(super) tp_packed_q: CudaSlice<bf16>,
+    pub(super) tp_full_out: CudaSlice<bf16>,
 }
 
 #[allow(dead_code)]
@@ -187,6 +191,7 @@ impl DeepseekFlashMlaDecodeBatchArena {
             d_v
         );
         let split_axis = capacity_tokens + num_sm_parts_max;
+        let tp_q_len = capacity_tokens * h_q * d_v;
         Ok(Self {
             capacity_tokens,
             num_sm_parts_max,
@@ -238,6 +243,18 @@ impl DeepseekFlashMlaDecodeBatchArena {
                 .stream
                 .alloc_zeros_traced::<f32>(capacity_tokens * h_q)
                 .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA lse_out alloc: {err}"))?,
+            tp_gathered_q: ctx
+                .stream
+                .alloc_zeros_traced::<bf16>(tp_q_len)
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA TP gathered-Q alloc: {err}"))?,
+            tp_packed_q: ctx
+                .stream
+                .alloc_zeros_traced::<bf16>(tp_q_len)
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA TP packed-Q alloc: {err}"))?,
+            tp_full_out: ctx
+                .stream
+                .alloc_zeros_traced::<bf16>(tp_q_len)
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA TP full-out alloc: {err}"))?,
         })
     }
 
@@ -286,7 +303,10 @@ impl DeepseekFlashMlaDecodeBatchArena {
                     >= num_sm_parts_max * DSV4_FLASHMLA_DECODING_SCHED_META_INTS
                 && self.lse_accum.len() >= split_axis * h_q
                 && self.o_accum.len() >= split_axis * h_q * d_v
-                && self.lse_out.len() >= batch_size * h_q,
+                && self.lse_out.len() >= batch_size * h_q
+                && self.tp_gathered_q.len() >= batch_size * h_q * d_v
+                && self.tp_packed_q.len() >= batch_size * h_q * d_v
+                && self.tp_full_out.len() >= batch_size * h_q * d_v,
             "DSv4 batch FlashMLA arena allocation is smaller than requested shape"
         );
         Ok(())
