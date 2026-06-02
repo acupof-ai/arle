@@ -7416,7 +7416,7 @@ fn dsv4_flashmla_env_gate(name: &str, default: bool) -> Result<bool> {
 /// the chunk-1 boundary (for A/B benching or to isolate FlashMLA-induced
 /// regressions).
 #[cfg(feature = "cuda")]
-fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
+pub(super) fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
     dsv4_flashmla_env_gate("ARLE_DSV4_FLASHMLA_PREFILL", true)
 }
 

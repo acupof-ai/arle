@@ -1278,6 +1278,17 @@ enum Dsv4ExpertBackend {
 }
 
 #[cfg(feature = "cuda")]
+impl Dsv4ExpertBackend {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::DeepGemmAuto => "deepgemm-auto",
+            Self::DeepGemmRequired => "deepgemm",
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
 static DSV4_DEEPGEMM_AUTO_DISABLED_AFTER_FAILURE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "cuda")]
@@ -1353,6 +1364,11 @@ fn dsv4_expert_backend() -> Result<Dsv4ExpertBackend> {
         }
         other => bail!("invalid ARLE_DSV4_EXPERT_BACKEND value `{other}`"),
     }
+}
+
+#[cfg(feature = "cuda")]
+pub(super) fn dsv4_expert_backend_label() -> Result<&'static str> {
+    Ok(dsv4_expert_backend()?.as_str())
 }
 
 #[cfg(feature = "cuda")]
