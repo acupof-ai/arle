@@ -92,6 +92,25 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    pub fn dsv4_prepare_qk_start_pos_ptr_cuda(
+        q_raw: *const super::Half,
+        k_raw: *const super::Half,
+        q_out: *mut super::Half,
+        k_out: *mut super::Half,
+        num_tokens: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        start_pos_ptr: *const i32,
+        rms_eps: f32,
+        rope_base: f32,
+        original_seq_len: i32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_prepare_qk_fused_cuda(
         q_raw: *const super::Half,
         k_raw: *const super::Half,
@@ -102,6 +121,25 @@ unsafe extern "C" {
         head_dim: i32,
         rope_dim: i32,
         start_pos: i32,
+        rms_eps: f32,
+        rope_base: f32,
+        original_seq_len: i32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    pub fn dsv4_prepare_qk_fused_start_pos_ptr_cuda(
+        q_raw: *const super::Half,
+        k_raw: *const super::Half,
+        q_out: *mut super::Half,
+        k_out: *mut super::Half,
+        num_tokens: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        start_pos_ptr: *const i32,
         rms_eps: f32,
         rope_base: f32,
         original_seq_len: i32,
@@ -229,6 +267,24 @@ unsafe extern "C" {
         head_dim: i32,
         rope_dim: i32,
         start_pos: i32,
+        rope_base: f32,
+        original_seq_len: i32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    /// Same as [`arle_dsv4_output_inverse_rope_cuda`], but reads the base
+    /// absolute decode position from a stable device pointer for CUDA graph
+    /// replay.
+    pub fn arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
+        out: *mut super::Half,
+        token_count: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        start_pos_ptr: *const i32,
         rope_base: f32,
         original_seq_len: i32,
         factor: f32,
