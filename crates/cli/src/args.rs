@@ -333,6 +333,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_enum, default_value_t = ServeSpecTypeArg::None)]
     pub(crate) spec_type: ServeSpecTypeArg,
 
+    /// External split MTP drafter model path or HuggingFace repo for Metal.
+    /// Implies the Metal MTP speculative route.
+    #[arg(long, value_name = "PATH_OR_REPO")]
+    pub(crate) mtp_draft_model: Option<String>,
+
     /// Additional engine-pool model metadata to expose from the serving control plane.
     ///
     /// Format: `id=path[,type=text-generation|embedding|reranker][,aliases=a|b][,pinned=true][,memory_bytes=N][,ttl_secs=N]`.

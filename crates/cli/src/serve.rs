@@ -132,6 +132,16 @@ fn resolve_invocation(args: &Args, serve_args: &ServeArgs) -> Result<ServeInvoca
         argv.push(serve_args.spec_type.as_backend_value().to_string());
     }
 
+    if let Some(draft_model) = serve_args.mtp_draft_model.as_deref() {
+        if backend != ServeBackend::Metal {
+            return Err(
+                "--mtp-draft-model is currently only supported by the Metal backend".to_string(),
+            );
+        }
+        argv.push("--mtp-draft-model".to_string());
+        argv.push(draft_model.to_string());
+    }
+
     if let Some(url) = serve_args.train_control_url.as_deref() {
         argv.push("--train-control-url".to_string());
         argv.push(url.to_string());
@@ -340,6 +350,28 @@ mod tests {
     }
 
     #[test]
+    fn metal_serve_forwards_mtp_draft_model() {
+        let mut args = Args::parse_from([
+            "arle",
+            "serve",
+            "--backend",
+            "metal",
+            "--model-path",
+            "model",
+            "--mtp-draft-model",
+            "mlx-community/Qwen3.6-35B-A3B-MTP-4bit",
+        ]);
+        let serve = match args.command.take().expect("serve command") {
+            crate::args::CliCommand::Serve(serve) => *serve,
+            _ => panic!("expected serve"),
+        };
+        let invocation = resolve_invocation(&args, &serve).expect("resolve");
+        assert!(invocation.argv.windows(2).any(|item| {
+            item[0] == "--mtp-draft-model" && item[1] == "mlx-community/Qwen3.6-35B-A3B-MTP-4bit"
+        }));
+    }
+
+    #[test]
     fn non_metal_spec_type_errors() {
         let mut args = Args::parse_from([
             "arle",
@@ -359,6 +391,29 @@ mod tests {
         assert_eq!(
             err,
             "--spec-type is currently only supported by the Metal backend"
+        );
+    }
+
+    #[test]
+    fn non_metal_mtp_draft_model_errors() {
+        let mut args = Args::parse_from([
+            "arle",
+            "serve",
+            "--backend",
+            "cpu",
+            "--model-path",
+            "model",
+            "--mtp-draft-model",
+            "draft",
+        ]);
+        let serve = match args.command.take().expect("serve command") {
+            crate::args::CliCommand::Serve(serve) => *serve,
+            _ => panic!("expected serve"),
+        };
+        let err = resolve_invocation(&args, &serve).expect_err("reject non-Metal MTP draft");
+        assert_eq!(
+            err,
+            "--mtp-draft-model is currently only supported by the Metal backend"
         );
     }
 
