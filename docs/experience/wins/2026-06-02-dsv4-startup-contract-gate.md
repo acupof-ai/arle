@@ -201,8 +201,24 @@ serve on the replicated-token debug lane and still look like a performance run.
   proves the relay can route one token-owned request to local rank 0 and remote
   rank 1 with shard metadata `0/2` and `1/2` while only group rank 0 emits
   visible output. The implementation also unregisters a remote visible-output
-  completion sink if later local submit fails. CUDA/no-CUDA typecheck passed
-  with pre-existing DSv4 warnings.
+  completion sink if later local submit fails. Under CUDA/NCCL, the companion
+  test `distributed_group_token_owned_relay_fails_closed_without_request_sync_nccl`
+  verifies that the same multi-rank relay shape refuses to run without an
+  explicit request-sync communicator. CUDA/no-CUDA typecheck passed with
+  pre-existing DSv4 warnings.
+- PC2 request-sync cleanup remote gate at `d92f82bf`: remote source
+  fast-forwarded cleanly from GitHub to the same HEAD. A first CUDA/NCCL
+  `request_handle` run at `c55114f6` failed 12/13 because the new no-CUDA
+  multi-rank relay routing test incorrectly expected success under NCCL without
+  a `request_token_sync_nccl` communicator. Follow-up `d92f82bf` split that
+  expectation by feature: non-NCCL proves relay routing, NCCL proves fail-closed
+  request-sync gating. Current remote gates passed:
+  `RUSTUP_TOOLCHAIN=stable bash scripts/dsv4_fast_build.sh` used the DSv4
+  prebuilt CUDA artifacts, skipped nvcc/TileLang AOT, and finished in 13.56 s;
+  `cargo test -p infer --lib --no-default-features --features cuda,nccl request_handle -- --nocapture`
+  passed 13/13; and
+  `cargo test -p infer --lib --no-default-features --features cuda,nccl multiproc_relay -- --nocapture`
+  passed 4/4.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.
