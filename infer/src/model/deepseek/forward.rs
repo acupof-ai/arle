@@ -7,14 +7,18 @@
 #[cfg(feature = "cuda")]
 use anyhow::{Result, ensure};
 #[cfg(feature = "cuda")]
-use rand::{RngExt, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 #[cfg(feature = "cuda")]
 use super::batch_decode::DeepseekBatchDecodeBuffers;
 #[cfg(feature = "cuda")]
 use super::prefill::DeepseekPrefillContext;
 #[cfg(feature = "cuda")]
-use super::state::DeepseekState;
+use super::state::{
+    DeepseekGpuCompressorRuntimeCache, DeepseekSpecAttentionSnapshot,
+    DeepseekSpecGpuCompressorSnapshot, DeepseekSpecLayerSnapshot, DeepseekSpecVerifyState,
+    DeepseekState,
+};
 #[cfg(feature = "cuda")]
 use super::weights::{
     DeepseekModel, dsv4_flashmla_decode_enabled, dsv4_flashmla_prefill_enabled,
@@ -26,8 +30,9 @@ use crate::model::generation_state::GenerationStateBase;
 use crate::model::kv_cache::{KVCacheDtype, KVFormat};
 #[cfg(feature = "cuda")]
 use crate::model::{
-    CudaGraphDecodeSupport, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest,
-    ModelForward, PrefillBatchRequest, prepare_paged_prefill_batch,
+    CudaGraphDecodeSupport, DecodeContextOps, MixedBatchFallbackReason, MixedBatchOutcome,
+    MixedBatchRequest, ModelForward, PrefillBatchRequest, SpecVerifyOutput, SpecVerifyRequest,
+    prepare_paged_prefill_batch,
 };
 #[cfg(feature = "cuda")]
 use crate::model_arch::ModelArchInfo;
@@ -41,6 +46,10 @@ use crate::sampler::SamplingParams;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 #[cfg(feature = "cuda")]
 use cuda_kernels::tensor::CudaAllocTraceExt;
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda")]
+use half::bf16;
 
 #[cfg(feature = "cuda")]
 impl ModelForward for DeepseekModel {
@@ -274,6 +283,153 @@ impl ModelForward for DeepseekModel {
         ))
     }
 
+    fn forward_spec_verify_batch(
+        &self,
+        requests: &[SpecVerifyRequest<'_>],
+        states: &mut [Self::State],
+        pool: &mut PagedKVPool,
+    ) -> Result<Vec<SpecVerifyOutput>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        for request in requests {
+            ensure!(
+                request.input_tokens.len() == request.draft_tokens.len() + 1,
+                "DSv4 spec verifier input must be last-token + K draft tokens"
+            );
+            ensure!(
+                request.slot_idx < states.len(),
+                "DSv4 spec verifier slot {} out of range for {} states",
+                request.slot_idx,
+                states.len()
+            );
+        }
+
+        let max_seq_len = requests
+            .iter()
+            .map(|request| states[request.slot_idx].base.kv_cache.max_seq_len())
+            .max();
+        let mut decode_ctx = self.create_decode_context(requests.len(), max_seq_len, pool)?;
+        if let Some(max_seq_len) = decode_ctx.fp8_kv_max_seq_len() {
+            let num_layers = self.loaded_layer_count();
+            for request in requests {
+                let state = &mut states[request.slot_idx];
+                state.incremental.ensure_layers(num_layers);
+                for layer_idx in 0..num_layers {
+                    let layer_cache = state
+                        .incremental
+                        .layers
+                        .get_mut(layer_idx)
+                        .expect("incremental cache layer initialized");
+                    self.bind_fp8_kv_pool_view(
+                        &mut decode_ctx,
+                        &mut layer_cache.attention,
+                        request.slot_idx,
+                        layer_idx,
+                        max_seq_len,
+                    )?;
+                }
+            }
+        }
+
+        for request in requests {
+            let original_len = states[request.slot_idx].base.kv_cache.len();
+            let layers = snapshot_dsv4_spec_layers(&self.ctx, &states[request.slot_idx])?;
+            states[request.slot_idx].incremental.spec_verify = Some(DeepseekSpecVerifyState {
+                original_len,
+                input_tokens: request.input_tokens.to_vec(),
+                layers,
+            });
+        }
+
+        let mut outputs: Vec<SpecVerifyOutput> = requests
+            .iter()
+            .map(|request| SpecVerifyOutput {
+                slot_idx: request.slot_idx,
+                target_argmax_tokens: Vec::with_capacity(request.input_tokens.len()),
+            })
+            .collect();
+        let max_steps = requests
+            .iter()
+            .map(|request| request.input_tokens.len())
+            .max()
+            .unwrap_or(0);
+        let greedy = SamplingParams::default();
+        let mut rng = StdRng::seed_from_u64(0x5eec_dec0de);
+
+        for step in 0..max_steps {
+            let mut tokens = Vec::new();
+            let mut slot_indices = Vec::new();
+            let mut output_indices = Vec::new();
+            for (idx, request) in requests.iter().enumerate() {
+                let Some(&token) = request.input_tokens.get(step) else {
+                    continue;
+                };
+                pool.cow_tail_page_for_append(&self.ctx, request.slot_idx)?;
+                pool.alloc_tokens(request.slot_idx, 1)?;
+                tokens.push(token);
+                slot_indices.push(request.slot_idx);
+                output_indices.push(idx);
+            }
+            decode_ctx.force_eager_once();
+            self.forward_decode_batch(
+                &tokens,
+                states,
+                &slot_indices,
+                Some(pool),
+                &mut decode_ctx,
+                false,
+            )?;
+            for (idx, &slot_idx) in output_indices.iter().zip(&slot_indices) {
+                let (token, _) =
+                    self.select_token_with_logprob(&mut states[slot_idx], &greedy, &mut rng)?;
+                outputs[*idx].target_argmax_tokens.push(token);
+            }
+        }
+
+        Ok(outputs)
+    }
+
+    fn commit_speculative_target_state(
+        &self,
+        states: &mut [Self::State],
+        slot_idx: usize,
+        num_accepted: usize,
+    ) -> Result<()> {
+        ensure!(
+            slot_idx < states.len(),
+            "DSv4 spec commit slot {slot_idx} out of range for {} states",
+            states.len()
+        );
+        let state = &mut states[slot_idx];
+        let snapshot = state
+            .incremental
+            .spec_verify
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 spec commit missing verifier snapshot"))?;
+        let replay_len = 1usize
+            .checked_add(num_accepted)
+            .ok_or_else(|| anyhow::anyhow!("DSv4 spec accepted length overflow"))?;
+        ensure!(
+            replay_len <= snapshot.input_tokens.len(),
+            "DSv4 spec commit accepted inputs {} exceed verifier inputs {}",
+            replay_len,
+            snapshot.input_tokens.len()
+        );
+        let replay_tokens = snapshot.input_tokens[..replay_len].to_vec();
+        let original_len = snapshot.original_len;
+
+        state.reference_tokens.truncate(original_len);
+        state.base.truncate_to(original_len)?;
+        restore_dsv4_spec_layers(state, snapshot.layers, original_len);
+
+        for token in replay_tokens {
+            self.forward_decode(token, state)?;
+        }
+        state.incremental.spec_verify = None;
+        Ok(())
+    }
+
     fn select_token(
         &self,
         state: &mut Self::State,
@@ -459,6 +615,12 @@ impl ModelForward for DeepseekModel {
         if !incremental_kv {
             missing.push("ARLE_DSV4_INCREMENTAL_KV must be enabled".to_string());
         }
+        if self.config.spec.num_nextn_predict_layers > 0 {
+            missing.push(format!(
+                "DSv4 checkpoint declares num_nextn_predict_layers={}, but ARLE CUDA does not load or execute the internal mtp.0/EAGLE draft path yet",
+                self.config.spec.num_nextn_predict_layers
+            ));
+        }
         missing.push(
             "DSv4 graph-captured FlashMLA/SWA/C4/C128 metadata replay is not implemented in this executable route"
                 .to_string(),
@@ -505,6 +667,122 @@ impl ModelForward for DeepseekModel {
             self.loaded_layer_count(),
             sw_blocks + comp_blocks,
         )
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn snapshot_optional_bf16_slice(
+    ctx: &DeviceContext,
+    src: Option<&CudaSlice<bf16>>,
+) -> Result<Option<CudaSlice<bf16>>> {
+    let Some(src) = src else {
+        return Ok(None);
+    };
+    let mut dst = ctx
+        .stream
+        .alloc_zeros_traced::<bf16>(src.len())
+        .map_err(|err| anyhow::anyhow!("DSv4 spec snapshot alloc failed: {err}"))?;
+    ctx.stream
+        .memcpy_dtod(src, &mut dst)
+        .map_err(|err| anyhow::anyhow!("DSv4 spec snapshot copy failed: {err}"))?;
+    Ok(Some(dst))
+}
+
+#[cfg(feature = "cuda")]
+fn snapshot_dsv4_compressor(
+    ctx: &DeviceContext,
+    cache: Option<&DeepseekGpuCompressorRuntimeCache>,
+) -> Result<Option<DeepseekSpecGpuCompressorSnapshot>> {
+    let Some(cache) = cache else {
+        return Ok(None);
+    };
+    Ok(Some(DeepseekSpecGpuCompressorSnapshot {
+        pending_kv: snapshot_optional_bf16_slice(ctx, cache.pending_kv.as_ref())?,
+        pending_score: snapshot_optional_bf16_slice(ctx, cache.pending_score.as_ref())?,
+        prev_overlap_kv: snapshot_optional_bf16_slice(ctx, cache.prev_overlap_kv.as_ref())?,
+        prev_overlap_score: snapshot_optional_bf16_slice(ctx, cache.prev_overlap_score.as_ref())?,
+        pending_len: cache.pending_len,
+        compressed_rows: cache.compressed_rows,
+        pending_width: cache.pending_width,
+        head_dim: cache.head_dim,
+    }))
+}
+
+#[cfg(feature = "cuda")]
+fn snapshot_dsv4_spec_layers(
+    ctx: &DeviceContext,
+    state: &DeepseekState,
+) -> Result<Vec<DeepseekSpecLayerSnapshot>> {
+    state
+        .incremental
+        .layers
+        .iter()
+        .map(|layer| {
+            Ok(DeepseekSpecLayerSnapshot {
+                attention: DeepseekSpecAttentionSnapshot {
+                    compressed_gpu: snapshot_dsv4_compressor(
+                        ctx,
+                        layer.attention.compressed_gpu.as_ref(),
+                    )?,
+                    indexer_gpu: snapshot_dsv4_compressor(
+                        ctx,
+                        layer.attention.indexer_gpu.as_ref(),
+                    )?,
+                    fp8_kv_sw_bootstrapped: layer.attention.fp8_kv_sw_bootstrapped,
+                    fp8_kv_comp_packed_rows: layer.attention.fp8_kv_comp_packed_rows,
+                },
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn restore_dsv4_compressor(
+    cache: &mut Option<DeepseekGpuCompressorRuntimeCache>,
+    snapshot: Option<DeepseekSpecGpuCompressorSnapshot>,
+) {
+    match snapshot {
+        Some(snapshot) => {
+            let cache = cache.get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default);
+            cache.kv_raw = None;
+            cache.score_raw = None;
+            cache.pending_kv = snapshot.pending_kv;
+            cache.pending_score = snapshot.pending_score;
+            cache.prev_overlap_kv = snapshot.prev_overlap_kv;
+            cache.prev_overlap_score = snapshot.prev_overlap_score;
+            cache.pending_len = snapshot.pending_len;
+            cache.compressed_rows = snapshot.compressed_rows;
+            cache.pending_width = snapshot.pending_width;
+            cache.head_dim = snapshot.head_dim;
+            if cache.compressed_capacity < cache.compressed_rows {
+                cache.compressed_capacity = cache.compressed_rows;
+            }
+        }
+        None => {
+            *cache = None;
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn restore_dsv4_spec_layers(
+    state: &mut DeepseekState,
+    layers: Vec<DeepseekSpecLayerSnapshot>,
+    original_len: usize,
+) {
+    state.incremental.processed_tokens = original_len;
+    state.incremental.ensure_layers(layers.len());
+    for (layer_cache, snapshot) in state.incremental.layers.iter_mut().zip(layers) {
+        restore_dsv4_compressor(
+            &mut layer_cache.attention.compressed_gpu,
+            snapshot.attention.compressed_gpu,
+        );
+        restore_dsv4_compressor(
+            &mut layer_cache.attention.indexer_gpu,
+            snapshot.attention.indexer_gpu,
+        );
+        layer_cache.attention.fp8_kv_sw_bootstrapped = snapshot.attention.fp8_kv_sw_bootstrapped;
+        layer_cache.attention.fp8_kv_comp_packed_rows = snapshot.attention.fp8_kv_comp_packed_rows;
     }
 }
 
