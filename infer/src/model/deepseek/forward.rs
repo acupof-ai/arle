@@ -8,6 +8,8 @@
 use anyhow::{Result, ensure};
 #[cfg(feature = "cuda")]
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+#[cfg(feature = "cuda")]
+use std::sync::OnceLock;
 
 #[cfg(feature = "cuda")]
 use super::batch_decode::DeepseekBatchDecodeBuffers;
@@ -350,31 +352,65 @@ impl ModelForward for DeepseekModel {
         let greedy = SamplingParams::default();
         let mut rng = StdRng::seed_from_u64(0x5eec_dec0de);
 
-        // Keep the verifier on the same per-row target path that commit replay
-        // uses. DSv4 batched decode is throughput-oriented and not yet licensed
-        // as byte-identical to the per-row replay path under speculative accept.
-        for step in 0..max_steps {
-            for (idx, request) in requests.iter().enumerate() {
-                let Some(&token) = request.input_tokens.get(step) else {
+        if dsv4_spec_verify_batch_enabled() {
+            for step in 0..max_steps {
+                let mut step_tokens = Vec::with_capacity(requests.len());
+                let mut step_slots = Vec::with_capacity(requests.len());
+                let mut step_output_indices = Vec::with_capacity(requests.len());
+                for (idx, request) in requests.iter().enumerate() {
+                    let Some(&token) = request.input_tokens.get(step) else {
+                        continue;
+                    };
+                    pool.cow_tail_page_for_append(&self.ctx, request.slot_idx)?;
+                    pool.alloc_tokens(request.slot_idx, 1)?;
+                    step_tokens.push(token);
+                    step_slots.push(request.slot_idx);
+                    step_output_indices.push(idx);
+                }
+                if step_tokens.is_empty() {
                     continue;
-                };
-                pool.cow_tail_page_for_append(&self.ctx, request.slot_idx)?;
-                pool.alloc_tokens(request.slot_idx, 1)?;
-                decode_ctx.force_eager_once();
+                }
                 self.forward_decode_batch(
-                    &[token],
+                    &step_tokens,
                     states,
-                    &[request.slot_idx],
-                    Some(pool),
+                    &step_slots,
+                    Some(&mut *pool),
                     decode_ctx,
                     false,
                 )?;
-                let (token, _) = self.select_token_with_logprob(
-                    &mut states[request.slot_idx],
-                    &greedy,
-                    &mut rng,
-                )?;
-                outputs[idx].target_argmax_tokens.push(token);
+                for (&idx, &slot_idx) in step_output_indices.iter().zip(&step_slots) {
+                    let (token, _) =
+                        self.select_token_with_logprob(&mut states[slot_idx], &greedy, &mut rng)?;
+                    outputs[idx].target_argmax_tokens.push(token);
+                }
+            }
+        } else {
+            // Keep the default verifier on the same per-row target path that
+            // commit replay uses. The batched verifier is licensed separately
+            // by ARLE_DSV4_SPEC_VERIFY_BATCH once correctness is measured.
+            for step in 0..max_steps {
+                for (idx, request) in requests.iter().enumerate() {
+                    let Some(&token) = request.input_tokens.get(step) else {
+                        continue;
+                    };
+                    pool.cow_tail_page_for_append(&self.ctx, request.slot_idx)?;
+                    pool.alloc_tokens(request.slot_idx, 1)?;
+                    decode_ctx.force_eager_once();
+                    self.forward_decode_batch(
+                        &[token],
+                        states,
+                        &[request.slot_idx],
+                        Some(&mut *pool),
+                        decode_ctx,
+                        false,
+                    )?;
+                    let (token, _) = self.select_token_with_logprob(
+                        &mut states[request.slot_idx],
+                        &greedy,
+                        &mut rng,
+                    )?;
+                    outputs[idx].target_argmax_tokens.push(token);
+                }
             }
         }
 
@@ -822,6 +858,19 @@ fn restore_dsv4_spec_layers(
         layer_cache.attention.fp8_kv_sw_bootstrapped = snapshot.attention.fp8_kv_sw_bootstrapped;
         layer_cache.attention.fp8_kv_comp_packed_rows = snapshot.attention.fp8_kv_comp_packed_rows;
     }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_spec_verify_batch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ARLE_DSV4_SPEC_VERIFY_BATCH").is_ok_and(|raw| {
+            matches!(
+                raw.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+    })
 }
 
 #[cfg(feature = "cuda")]
