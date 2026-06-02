@@ -121,6 +121,9 @@ serve on the replicated-token debug lane and still look like a performance run.
   `cargo fmt --check`, `git diff --check`,
   `cargo check -p infer --no-default-features --features no-cuda`, and
   `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
+  passed. After the remote CUDA/NCCL build exposed a native-deepep cfg branch
+  type error, the follow-up local gate
+  `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,nccl,no-cuda`
   passed. A local targeted `cargo test -p infer --lib --no-default-features
   --features cuda,no-cuda deepgemm_required_is_the_default_expert_backend`
   was not a valid Mac gate because test linking still resolves CUDA C symbols
