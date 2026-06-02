@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use anyhow::{Result, bail, ensure};
 use half::bf16;
-use log::info;
+use log::{info, warn};
 use safetensors::Dtype;
 
 #[cfg(feature = "cuda")]
@@ -1975,6 +1975,15 @@ impl DeepseekModel {
         num_layers: usize,
     ) -> Result<bool> {
         if slot_indices.len() != start_pos.len() || slot_indices.is_empty() {
+            return Ok(false);
+        }
+        if !dsv4_decode_body_cuda_graph_unsafe_enabled()? {
+            static LOGGED: OnceLock<()> = OnceLock::new();
+            if LOGGED.set(()).is_ok() {
+                warn!(
+                    "ARLE_DSV4_DECODE_BODY_CUDA_GRAPH requested, but full-body DSv4 CUDA graph capture is held in eager mode: FFN routed/shared outputs still use per-step owned GPU scratch. Set ARLE_DSV4_DECODE_BODY_CUDA_GRAPH_UNSAFE=1 only for debug reproduction."
+                );
+            }
             return Ok(false);
         }
         if std::env::var("INFER_DEBUG_DUMP").is_ok() || super::trace::dsv4_operator_trace_enabled()
@@ -9489,6 +9498,10 @@ fn infer_real_reference_enabled() -> Result<bool> {
 
 fn dsv4_decode_body_cuda_graph_enabled() -> Result<bool> {
     Ok(dsv4_env_bool_override("ARLE_DSV4_DECODE_BODY_CUDA_GRAPH")?.unwrap_or(false))
+}
+
+fn dsv4_decode_body_cuda_graph_unsafe_enabled() -> Result<bool> {
+    Ok(dsv4_env_bool_override("ARLE_DSV4_DECODE_BODY_CUDA_GRAPH_UNSAFE")?.unwrap_or(false))
 }
 
 fn dsv4_nccl_graph_capture_enabled() -> Result<bool> {
