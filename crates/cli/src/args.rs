@@ -328,6 +328,11 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub(crate) train_control_url: Option<String>,
 
+    /// Speculative decode route. Currently only `metal` accepts `auto`/`mtp`;
+    /// non-Metal backends should use backend-specific flags after `--`.
+    #[arg(long, value_enum, default_value_t = ServeSpecTypeArg::None)]
+    pub(crate) spec_type: ServeSpecTypeArg,
+
     /// Additional engine-pool model metadata to expose from the serving control plane.
     ///
     /// Format: `id=path[,type=text-generation|embedding|reranker][,aliases=a|b][,pinned=true][,memory_bytes=N][,ttl_secs=N]`.
@@ -339,6 +344,23 @@ pub(crate) struct ServeArgs {
     /// Forward additional backend-specific flags after `--`.
     #[arg(last = true, allow_hyphen_values = true)]
     pub(crate) extra_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ServeSpecTypeArg {
+    None,
+    Auto,
+    Mtp,
+}
+
+impl ServeSpecTypeArg {
+    pub(crate) fn as_backend_value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Auto => "auto",
+            Self::Mtp => "mtp",
+        }
+    }
 }
 
 #[derive(Debug, Clone, clap::Args)]

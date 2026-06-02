@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    args::{Args, ServeArgs, ServeBackendArg},
+    args::{Args, ServeArgs, ServeBackendArg, ServeSpecTypeArg},
     hardware::CompiledBackend,
 };
 
@@ -122,6 +122,14 @@ fn resolve_invocation(args: &Args, serve_args: &ServeArgs) -> Result<ServeInvoca
     {
         argv.push("--cuda-graph-max-bs".to_string());
         argv.push(max_bs.to_string());
+    }
+
+    if serve_args.spec_type != ServeSpecTypeArg::None {
+        if backend != ServeBackend::Metal {
+            return Err("--spec-type is currently only supported by the Metal backend".to_string());
+        }
+        argv.push("--spec-type".to_string());
+        argv.push(serve_args.spec_type.as_backend_value().to_string());
     }
 
     if let Some(url) = serve_args.train_control_url.as_deref() {
@@ -304,6 +312,54 @@ mod tests {
         assert!(invocation.argv.windows(2).any(
             |item| item[0] == "--pool-model" && item[1] == "embed=/models/embed,type=embedding"
         ));
+    }
+
+    #[test]
+    fn metal_serve_forwards_spec_type() {
+        let mut args = Args::parse_from([
+            "arle",
+            "serve",
+            "--backend",
+            "metal",
+            "--model-path",
+            "model",
+            "--spec-type",
+            "mtp",
+        ]);
+        let serve = match args.command.take().expect("serve command") {
+            crate::args::CliCommand::Serve(serve) => *serve,
+            _ => panic!("expected serve"),
+        };
+        let invocation = resolve_invocation(&args, &serve).expect("resolve");
+        assert!(
+            invocation
+                .argv
+                .windows(2)
+                .any(|item| item[0] == "--spec-type" && item[1] == "mtp")
+        );
+    }
+
+    #[test]
+    fn non_metal_spec_type_errors() {
+        let mut args = Args::parse_from([
+            "arle",
+            "serve",
+            "--backend",
+            "cpu",
+            "--model-path",
+            "model",
+            "--spec-type",
+            "mtp",
+        ]);
+        let serve = match args.command.take().expect("serve command") {
+            crate::args::CliCommand::Serve(serve) => *serve,
+            _ => panic!("expected serve"),
+        };
+        let err = resolve_invocation(&args, &serve).expect_err("reject non-Metal spec type");
+        assert_eq!(
+            err,
+            "--spec-type is currently only supported by the Metal backend"
+        );
     }
 
     #[test]
