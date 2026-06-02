@@ -437,6 +437,61 @@ impl ServerMetrics {
         )
         .unwrap();
 
+        out.push_str(
+            "# HELP infer_metal_mtp_blocks_total Total Metal MTP speculative blocks executed.\n",
+        );
+        out.push_str("# TYPE infer_metal_mtp_blocks_total counter\n");
+        writeln!(
+            out,
+            "infer_metal_mtp_blocks_total{{{labels}}} {}",
+            self.metal_mtp_blocks_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_metal_mtp_accepted_inputs_total Total target-verified inputs accepted by Metal MTP.\n",
+        );
+        out.push_str("# TYPE infer_metal_mtp_accepted_inputs_total counter\n");
+        writeln!(
+            out,
+            "infer_metal_mtp_accepted_inputs_total{{{labels}}} {}",
+            self.metal_mtp_accepted_inputs_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_metal_mtp_acceptance_rate Metal MTP suffix acceptance rate [0,1].\n",
+        );
+        out.push_str("# TYPE infer_metal_mtp_acceptance_rate gauge\n");
+        writeln!(
+            out,
+            "infer_metal_mtp_acceptance_rate{{{labels}}} {:.4}",
+            self.metal_mtp_acceptance_rate()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_metal_mtp_utilization Metal MTP accepted inputs divided by proposed block inputs [0,1].\n",
+        );
+        out.push_str("# TYPE infer_metal_mtp_utilization gauge\n");
+        writeln!(
+            out,
+            "infer_metal_mtp_utilization{{{labels}}} {:.4}",
+            self.metal_mtp_utilization()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_metal_mtp_scalar_rows_total Metal MTP rows routed through scalar decode.\n",
+        );
+        out.push_str("# TYPE infer_metal_mtp_scalar_rows_total counter\n");
+        writeln!(
+            out,
+            "infer_metal_mtp_scalar_rows_total{{{labels}}} {}",
+            self.metal_mtp_scalar_rows_total()
+        )
+        .unwrap();
+
         out.push_str("# HELP infer_metal_decode_batches_total Metal decode batches executed on a batched GPU path.\n");
         out.push_str("# TYPE infer_metal_decode_batches_total counter\n");
         writeln!(
@@ -1599,6 +1654,14 @@ impl ServerMetrics {
             "host_pool_high_pressure_ticks_total": self.host_pool_high_pressure_ticks_total(),
             "host_pool_low_pressure_ticks_total": self.host_pool_low_pressure_ticks_total(),
         });
+        let metal_mtp = serde_json::json!({
+            "blocks_total": self.metal_mtp_blocks_total(),
+            "accepted_inputs_total": self.metal_mtp_accepted_inputs_total(),
+            "draft_inputs_total": self.metal_mtp_draft_inputs_total(),
+            "scalar_rows_total": self.metal_mtp_scalar_rows_total(),
+            "acceptance_rate": self.metal_mtp_acceptance_rate(),
+            "utilization": self.metal_mtp_utilization(),
+        });
 
         serde_json::json!({
             "requests": self.requests_total(),
@@ -1622,6 +1685,7 @@ impl ServerMetrics {
             "prefix_lookup_prefetch": self.prefix_lookup_prefetch(),
             "prefix_lookup_recompute": self.prefix_lookup_recompute(),
             "tier_observability": tier_observability,
+            "metal_mtp": metal_mtp,
             "last_request": {
                 "session_id": latest.session_id,
                 "prefix_hit_rate": latest.prefix_hit_rate(),
@@ -1781,6 +1845,18 @@ impl ServerMetrics {
                 dflash_blocks,
                 self.dflash_acceptance_rate() * 100.0,
                 self.dflash_utilization() * 100.0,
+            )
+        } else {
+            String::new()
+        };
+        let mtp_blocks = self.metal_mtp_blocks_total();
+        let mtp_suffix = if mtp_blocks > 0 || self.metal_mtp_scalar_rows_total() > 0 {
+            format!(
+                " mtp_blocks={} mtp_accept={:.1}% mtp_util={:.1}% mtp_scalar={}",
+                mtp_blocks,
+                self.metal_mtp_acceptance_rate() * 100.0,
+                self.metal_mtp_utilization() * 100.0,
+                self.metal_mtp_scalar_rows_total(),
             )
         } else {
             String::new()
@@ -1949,7 +2025,7 @@ impl ServerMetrics {
         );
 
         format!(
-            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{}{}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}{}{}",
+            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={}{}{}{}{}{} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}{}{}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -1984,6 +2060,7 @@ impl ServerMetrics {
             tpot_p50,
             metal_decode_suffix,
             dflash_suffix,
+            mtp_suffix,
             tier_suffix,
             agent_cache_suffix,
             coordinator_suffix,

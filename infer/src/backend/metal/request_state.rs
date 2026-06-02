@@ -49,6 +49,47 @@ pub struct DflashRequestMetrics {
     pub acceptance_rate: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MtpRequestMetrics {
+    pub block_count: usize,
+    pub block_size: usize,
+    pub avg_accepted_inputs: f64,
+    pub acceptance_rate: f64,
+}
+
+fn acceptance_summary(block_count: usize, acceptance_lengths: &[usize]) -> (f64, f64) {
+    if block_count == 0 {
+        return (0.0, 0.0);
+    }
+    let total_accepted: usize = acceptance_lengths.iter().copied().sum();
+    let avg_accepted_inputs = total_accepted as f64 / block_count as f64;
+    let acceptance_rate = if total_accepted > 0 {
+        total_accepted.saturating_sub(block_count) as f64 / total_accepted as f64
+    } else {
+        0.0
+    };
+    (avg_accepted_inputs, acceptance_rate)
+}
+
+fn mtp_acceptance_summary(
+    block_count: usize,
+    acceptance_lengths: &[usize],
+    block_size: usize,
+) -> (f64, f64) {
+    if block_count == 0 {
+        return (0.0, 0.0);
+    }
+    let total_accepted: usize = acceptance_lengths.iter().copied().sum();
+    let avg_accepted_inputs = total_accepted as f64 / block_count as f64;
+    let proposed_suffix = block_count.saturating_mul(block_size.saturating_sub(1));
+    let acceptance_rate = if proposed_suffix > 0 {
+        total_accepted.saturating_sub(block_count) as f64 / proposed_suffix as f64
+    } else {
+        0.0
+    };
+    (avg_accepted_inputs, acceptance_rate)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrefillChunkResult {
     pub processed_tokens: usize,
@@ -1617,13 +1658,8 @@ impl<'a> MetalRequestState<'a> {
     /// Returns `None` if DFlash is disabled or no speculative block executed.
     pub fn dflash_metrics(&self) -> Option<DflashRequestMetrics> {
         let (block_count, acceptance_lengths, block_size) = self.dflash_block_stats()?;
-        let total_accepted: usize = acceptance_lengths.iter().copied().sum();
-        let avg_accepted_inputs = total_accepted as f64 / block_count as f64;
-        let acceptance_rate = if total_accepted > 0 {
-            total_accepted.saturating_sub(block_count) as f64 / total_accepted as f64
-        } else {
-            0.0
-        };
+        let (avg_accepted_inputs, acceptance_rate) =
+            acceptance_summary(block_count, acceptance_lengths);
         Some(DflashRequestMetrics {
             block_count,
             block_size,
@@ -1651,6 +1687,37 @@ impl<'a> MetalRequestState<'a> {
                     d.acceptance_lengths.len(),
                     &d.acceptance_lengths,
                     d.runtime.block_size(),
+                ))
+            }
+        }
+    }
+
+    /// Metal MTP aggregate acceptance metrics for this request.
+    /// Returns `None` if MTP is disabled or no speculative block executed.
+    pub fn mtp_metrics(&self) -> Option<MtpRequestMetrics> {
+        let (block_count, acceptance_lengths, block_size) = self.mtp_block_stats()?;
+        let (avg_accepted_inputs, acceptance_rate) =
+            mtp_acceptance_summary(block_count, acceptance_lengths, block_size);
+        Some(MtpRequestMetrics {
+            block_count,
+            block_size,
+            avg_accepted_inputs,
+            acceptance_rate,
+        })
+    }
+
+    /// Metal MTP per-block acceptance lengths + block size for runtime metrics
+    /// flush. Returns `(block_count, acceptance_lengths, block_size)` or
+    /// `None` if not an MTP request.
+    pub(crate) fn mtp_block_stats(&self) -> Option<(usize, &[usize], usize)> {
+        match &self.inner {
+            MetalRequestStateInner::Qwen3(_) => None,
+            MetalRequestStateInner::Qwen35(state) => {
+                let mtp = state.driver.mtp.as_ref()?;
+                Some((
+                    mtp.acceptance_lengths.len(),
+                    &mtp.acceptance_lengths,
+                    mtp.runtime.block_size(),
                 ))
             }
         }

@@ -160,7 +160,9 @@ What is already real:
 - target verify through the C++ Qwen3.5/Qwen3.6 compiled model;
 - GDR tape rollback on partial accept;
 - seed hidden refreshed from the accepted verifier row;
-- acceptance metrics logged at request cleanup.
+- acceptance metrics logged at request cleanup;
+- server-level MTP counters in Prometheus, `/v1/stats?format=json`, and
+  `metal_bench` artifacts.
 
 Evidence:
 
@@ -175,8 +177,7 @@ Current gaps:
 - Greedy baseline and MTP2 are deterministic independently, but not
   byte-identical to each other on the checked long-output prompt.
 - Acceptance is prompt-sensitive and too low for depth 3 or 4.
-- Server-level metrics do not yet expose MTP accept length/rate the way
-  SGLang exposes spec metrics.
+- Per-request tokenizer-manager-style MTP metadata is not yet exposed.
 
 Evidence:
 
@@ -238,6 +239,11 @@ KILL or block: first divergence cannot be explained by sampling settings,
 prompt template drift, or known benchmark artifact.
 
 ### P2 - Observability parity
+
+Status: partial landed on 2026-06-02. Server metrics and `metal_bench`
+now expose MTP block/acceptance/scalar-fallback counters. Tokenizer-manager
+style per-request surfaced metadata is still deferred behind the parity
+harness.
 
 Expose Metal MTP counters in server stats and bench output:
 
