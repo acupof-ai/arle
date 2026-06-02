@@ -115,6 +115,10 @@ serve on the replicated-token debug lane and still look like a performance run.
   `cargo check -p infer --no-default-features --features no-cuda`, and
   `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
   passed.
+- DSv4 decode-context token-upload remote gate at `40f704cf`:
+  `/data01/build/arle` fast-forwarded from GitHub, then
+  `scripts/dsv4_fast_build.sh` used the DSv4 prebuilt CUDA artifacts,
+  skipped nvcc/TileLang AOT, and finished in 17.25 s.
 - Remote DSv4 pod source was synced by bundle because pod-side GitHub HTTPS
   fetch failed. Follow-up source syncs verified clean remote HEADs through
   `5d4e62bf` and then `204db39f`.
