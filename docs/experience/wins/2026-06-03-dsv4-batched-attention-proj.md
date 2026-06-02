@@ -58,6 +58,9 @@ Remote verification on `/data01/build/arle`, final checked commit
   DeepEP/NCCL collective capture/replay, EAGLE/MTP graph replay,
   graph-captured FlashMLA/SWA/C4/C128 metadata replay, and the remaining
   row-looped cache/metadata attention core.
+- The startup blocker text was tightened after this validation so future logs
+  state the precise remaining gap: the cache/metadata attention core still
+  loops per row, while Q/K/V projections are already batched.
 - After both probes, no `infer` process remained and `nvidia-smi` reported no
   compute apps.
 
