@@ -8,6 +8,17 @@ BIN="${BIN:-infer}"
 PREBUILT_DIR="${ARLE_CUDA_KERNELS_PREBUILT_DIR:-$ROOT/target/dsv4-cuda-kernels-prebuilt}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 MANIFEST_NAME="arle-cuda-kernels.manifest"
+USED_PREBUILT=0
+
+required_dsv4_symbols() {
+    cat <<'EOF'
+dsv4_deepgemm_native_preflight_cuda
+arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda
+arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda
+arle_dsv4_output_inverse_rope_cuda
+dsv4_update_window_cache_start_pos_ptr_cuda
+EOF
+}
 
 detect_cuda() {
     local nvcc=""
@@ -93,7 +104,8 @@ resolve_deepgemm_env() {
 prebuilt_ready() {
     [[ -f "$PREBUILT_DIR/libkernels_cuda.a" ]] &&
         [[ -f "$PREBUILT_DIR/libtilelang_kernels_aot.a" ]] &&
-        manifest_matches
+        manifest_matches &&
+        validate_cuda_archive_symbols "$PREBUILT_DIR/libkernels_cuda.a"
 }
 
 hash_stream() {
@@ -153,6 +165,21 @@ manifest_matches() {
     fi
 }
 
+validate_cuda_archive_symbols() {
+    local archive="$1"
+    local symbols
+    symbols="$(nm -g "$archive" 2>/dev/null || true)"
+    local missing=0
+    while IFS= read -r symbol; do
+        [[ -n "$symbol" ]] || continue
+        if ! grep -Fq "$symbol" <<<"$symbols"; then
+            echo "prebuilt CUDA archive $archive is missing required DSv4 symbol: $symbol"
+            missing=1
+        fi
+    done < <(required_dsv4_symbols)
+    [[ "$missing" == 0 ]]
+}
+
 find_latest_cuda_out() {
     find "$TARGET_DIR/$PROFILE/build" "$TARGET_DIR/release/build" \
         -maxdepth 3 -path '*/cuda-kernels-*/out/libkernels_cuda.a' \
@@ -172,6 +199,10 @@ harvest_prebuilt() {
     [[ -n "$out_dir" ]] || return 0
     [[ -f "$out_dir/libkernels_cuda.a" ]] || return 0
     [[ -f "$out_dir/libtilelang_kernels_aot.a" ]] || return 0
+    validate_cuda_archive_symbols "$out_dir/libkernels_cuda.a" || {
+        echo "refusing to harvest incomplete CUDA prebuilt artifacts from $out_dir"
+        return 1
+    }
 
     mkdir -p "$PREBUILT_DIR"
     cp -f "$out_dir/libkernels_cuda.a" "$PREBUILT_DIR/"
@@ -198,6 +229,7 @@ export ARLE_NVCC_SPLIT_COMPILE="${ARLE_NVCC_SPLIT_COMPILE:-8}"
 
 if prebuilt_ready; then
     export ARLE_CUDA_KERNELS_PREBUILT_DIR="$PREBUILT_DIR"
+    USED_PREBUILT=1
     if [[ -f "$PREBUILT_DIR/arle_deepep_sidecar" ]]; then
         export ARLE_DEEPEP_SIDECAR_PREBUILT="$PREBUILT_DIR/arle_deepep_sidecar"
     fi
@@ -221,4 +253,8 @@ echo "ARLE_DEEPGEMM_LIBRARY_ROOT=${ARLE_DEEPGEMM_LIBRARY_ROOT:-}"
 echo "ARLE_DEEPGEMM_CUTLASS_INCLUDE=${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}"
 
 time cargo build --profile "$PROFILE" -p infer --features "$FEATURES" --bin "$BIN"
-harvest_prebuilt
+if [[ "$USED_PREBUILT" == "1" ]]; then
+    echo "prebuilt fast path used; not harvesting older OUT_DIR artifacts"
+else
+    harvest_prebuilt
+fi
