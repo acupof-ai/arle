@@ -312,9 +312,22 @@ impl ModelForward for DeepseekModel {
                 "CUDA Graph disabled by runtime configuration",
             );
         }
+        if super::trace::dsv4_operator_trace_enabled() {
+            return CudaGraphDecodeSupport::unsupported(
+                "DSv4 operator trace synchronizes CUDA streams for phase timing; disable \
+                 ARLE_DSV4_OPERATOR_TRACE / ARLE_DSV4_TRACE_LAYER before graph capture",
+            );
+        }
+        if self.config.tp.world_size > 1 || self.config.ep.world_size > 1 {
+            return CudaGraphDecodeSupport::unsupported(
+                "DSv4 TP/EP path still launches NCCL collectives and replicated-token \
+                 all-reduce/transport outside a graph-safe collective contract",
+            );
+        }
         CudaGraphDecodeSupport::unsupported(
-            "DSv4 decode is not graph-safe yet: attention start_pos is captured as host launch \
-             params and TP/EP NCCL capture is unvalidated; top-level batched scratch now uses \
+            "DSv4 decode is not graph-safe yet: attention/compressor metadata still uses \
+             host launch params and host-updated cache counters (start_pos, pending_len, \
+             compressed_rows, FP8 pack high-water marks); top-level batched scratch now uses \
              stable decode-context buffers",
         )
     }
