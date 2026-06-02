@@ -57,8 +57,27 @@ Local checks after the slot-offset ABI correction:
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,nccl,no-cuda`
 - `git diff --check`
 
-Pending: rebuild the corrected ABI on the remote pod and rerun the startup
-fail-closed probe.
+Remote verification after the slot-offset ABI correction, on
+`/data01/build/arle` at commit `6c9559dc`:
+
+- remote HEAD matched local HEAD
+  `6c9559dcb198675290e1120260f193e66207e517`, with clean status.
+- release-fast CUDA build passed in 6m59s, rebuilt the CUDA tree because
+  `cuda_kernels_tree` changed, and harvested a fresh DSv4 prebuilt archive.
+- `libkernels_cuda.a` exported
+  `arle_dsv4_flashmla_decode_build_indices_batched_cuda`.
+- TP8 + EAGLE SGLang-best-practice startup probe failed closed, as expected,
+  with the remaining blockers unchanged: full-decode CUDA graph, DeepEP/NCCL
+  capture/replay, frozen-KV EAGLE/MTP graph replay, graph-captured
+  FlashMLA/SWA/C4/C128 metadata replay, and batched decode attention still
+  looping per row.
+- After the probe, no `infer` process remained and `nvidia-smi` reported no
+  compute apps.
+
+Artifacts:
+
+- `/tmp/dsv4_slot_offsets_20260603/build.log`
+- `/tmp/dsv4_slot_offsets_20260603/startup_tp8_eagle.log`
 
 ## Rule
 
