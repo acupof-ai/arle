@@ -55,8 +55,8 @@ serve on the replicated-token debug lane and still look like a performance run.
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
 - `cargo check -p infer --no-default-features --features no-cuda`
 - Remote DSv4 pod source was synced by bundle because pod-side GitHub HTTPS
-  fetch failed; remote HEAD verified through the latest source sync as
-  `eb59f1c8`.
+  fetch failed. Follow-up source syncs verified clean remote HEADs through
+  `5d4e62bf` and then `204db39f`.
 - Remote build: `RUSTUP_TOOLCHAIN=stable bash scripts/dsv4_fast_build.sh`
   completed after one rebuild and harvested DSv4 CUDA artifacts; immediate
   repeat used prebuilt artifacts and finished in 4.92 s while skipping nvcc and
@@ -67,6 +67,19 @@ serve on the replicated-token debug lane and still look like a performance run.
   `ARLE_CUDA_KERNELS_PREBUILT_DIR=/data01/build/arle/target/dsv4-cuda-kernels-prebuilt`:
   `cargo test -p infer --lib --no-default-features --features cuda,nccl deepgemm_required_is_the_default_expert_backend -- --nocapture`
   passed 1/1 in 20.47 s and printed the prebuilt-artifact skip message.
+- PC2 request-ownership follow-up at `5d4e62bf`: remote `dsv4_fast_build.sh`
+  used the prebuilt CUDA artifacts, skipped nvcc/TileLang AOT, and finished in
+  20.52 s. Remote CUDA unit gate
+  `distributed_group_token_owned_mode_fails_closed_until_sharding_exists`
+  passed 1/1 with `--features cuda,nccl`.
+- Replicated-token DeepEP escape-hatch removal at `204db39f`: remote
+  `dsv4_fast_build.sh` used the same prebuilt artifact path, skipped
+  nvcc/TileLang AOT, and finished in 17.10 s. Remote CUDA unit gate
+  `deepgemm_required_is_the_default_expert_backend` passed 1/1 and now asserts
+  `deepep_unsafe` / `unsafe_deepep` are invalid. `strings
+  target-pod/release-fast/infer` contains the new
+  `native-deepep is reserved for the token-owned DP/EP request path` startup
+  message and no old `ARLE_DSV4_NATIVE_DEEPEP_REPLICATED_TOKENS_UNSAFE` symbol.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.
