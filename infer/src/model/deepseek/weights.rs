@@ -794,19 +794,7 @@ impl DeepseekModel {
             );
         }
 
-        let max_compressed_rows = start_pos
-            .iter()
-            .copied()
-            .map(|pos| dsv4_compressor_required_capacity_rows(pos, 1, compress_ratio))
-            .max()
-            .unwrap_or(1);
-        let max_compressed_keys = max_compressed_rows.div_ceil(128) * 128;
-        ensure!(
-            max_compressed_keys <= comp_blocks * DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE,
-            "DSv4 batch FlashMLA HCA topk {} exceeds shared compressed pool capacity {}",
-            max_compressed_keys,
-            comp_blocks * DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE
-        );
+        let max_compressed_keys = dsv4_flashmla_hca_max_compressed_keys_from_pool(comp_blocks)?;
         let topk_unified = self.config.sliding_window + max_compressed_keys;
         ensure!(
             topk_unified.is_multiple_of(128),
@@ -4907,13 +4895,23 @@ impl DeepseekModel {
                 let fixed_overhead_num_blocks = fm_meta.fixed_overhead_num_blocks;
                 let block_size_topk = fm_meta.block_size_topk;
 
-                // max_compressed_keys: CSA uses index_topk, HCA pads
-                // compressed_count up to next multiple of 128 (FlashMLA
-                // invariant `topk % 128 == 0`).
+                // Sliding-window + compressed pool sizing must match the
+                // bootstrap / compressor pack hooks (same source). OFF →
+                // `max_position_embeddings`-based (byte-identical to `main`);
+                // ON → the bound shared sub-range layout stamped at bind time
+                // (bounded by `max_seq_len`).
+                let (sw_blocks, comp_blocks) =
+                    self.dsv4_flashmla_decode_pool_layout(cache_mut, compress_ratio)?;
+
+                // max_compressed_keys: CSA uses fixed index_topk; HCA uses
+                // the fixed compressed sub-pool capacity. The indices builder
+                // masks causally unavailable rows from `start_pos`, so this
+                // keeps FlashMLA's topk/sched_meta shape stable across decode
+                // tokens without widening the visible attention set.
                 let max_compressed_keys: usize = if mode_int == 1 {
                     index_topk
                 } else {
-                    compressed_count.div_ceil(128) * 128
+                    dsv4_flashmla_hca_max_compressed_keys_from_pool(comp_blocks)?
                 };
                 let topk_unified: usize = sliding_window + max_compressed_keys;
                 ensure!(
@@ -4940,13 +4938,6 @@ impl DeepseekModel {
                     d_v,
                 )?;
 
-                // Sliding-window + compressed pool sizing must match the
-                // bootstrap / compressor pack hooks (same source). OFF →
-                // `max_position_embeddings`-based (byte-identical to `main`);
-                // ON → the bound shared sub-range layout stamped at bind time
-                // (bounded by `max_seq_len`).
-                let (sw_blocks, comp_blocks) =
-                    self.dsv4_flashmla_decode_pool_layout(cache_mut, compress_ratio)?;
                 let total_blocks = sw_blocks + comp_blocks;
 
                 let start_pos_ptr_u64 = decode_start_pos_ptr_u64
@@ -7165,8 +7156,21 @@ fn dsv4_flashmla_fp8_kv_pool_blocks(
     max_compressed_keys: usize,
 ) -> (usize, usize) {
     let sw_blocks = sliding_window.div_ceil(DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE);
+    let max_compressed_keys = max_compressed_keys.div_ceil(128) * 128;
     let comp_blocks = max_compressed_keys.div_ceil(DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE);
     (sw_blocks, comp_blocks)
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_flashmla_hca_max_compressed_keys_from_pool(comp_blocks: usize) -> Result<usize> {
+    let capacity = comp_blocks
+        .checked_mul(DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA compressed pool capacity overflow"))?;
+    ensure!(
+        capacity.is_multiple_of(128),
+        "DSv4 FlashMLA HCA compressed pool capacity {capacity} must be 128-key aligned"
+    );
+    Ok(capacity)
 }
 
 /// FlashMLA `DecodingSchedMeta` is `__align__(4*8)` with 8 int32 fields
