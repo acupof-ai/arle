@@ -1401,6 +1401,10 @@ impl DeepseekModel {
 
         let deepep_requested = dsv4_moe_deepep_enabled()?;
         let use_deepep = deepep_requested && self.config.ep.world_size > 1;
+        // MTP FFN tensors carry `gate.bias` and no `gate.tid2eid`; they use
+        // learned-bias routing even though the frozen SW attention borrows
+        // target layer-0 KV.
+        let mtp_routing_layer_idx = self.config.num_hash_layers;
         let routed = if use_deepep {
             #[cfg(feature = "nccl")]
             {
@@ -1413,7 +1417,7 @@ impl DeepseekModel {
                 mtp.ffn.forward_deepep_routed_gpu(
                     &self.ctx,
                     &self.layer_communicator,
-                    0,
+                    mtp_routing_layer_idx,
                     &self.config.spec,
                     &self.config.ep,
                     &normed,
@@ -1430,7 +1434,7 @@ impl DeepseekModel {
         } else {
             let mut hidden = mtp.ffn.forward_local_routed_gpu(
                 &self.ctx,
-                0,
+                mtp_routing_layer_idx,
                 &self.config.spec,
                 &self.config.ep,
                 &normed,
