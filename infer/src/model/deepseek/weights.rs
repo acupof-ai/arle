@@ -3281,19 +3281,44 @@ impl DeepseekModel {
                     .device_ptr_mut(&self.ctx.stream);
                 drop(ig);
                 {
+                    ensure!(
+                        start_pos <= i32::MAX as usize,
+                        "DSv4 FlashMLA decode start_pos {start_pos} overflows i32"
+                    );
+                    let start_pos_ptr_u64 = {
+                        let start_pos_dev = cache_mut
+                            .fm_decode_start_pos
+                            .as_mut()
+                            .expect("start_pos arena allocated");
+                        let (ptr, guard) = start_pos_dev.device_ptr_mut(&self.ctx.stream);
+                        unsafe {
+                            ffi::dsv4_fill_i32_cuda(
+                                ptr as *mut i32,
+                                start_pos as i32,
+                                1_i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DSv4 FlashMLA decode start_pos fill failed: {err}")
+                            })?;
+                        }
+                        drop(guard);
+                        ptr as u64
+                    };
                     let selected_ptr_u64: u64 = if mode_int == 1 {
                         // `selected_ptr` is *const i32 captured above.
                         selected_ptr as u64
                     } else {
                         0
                     };
-                    cuda_kernels::attention::dsv4_flashmla_decode_build_indices_raw(
+                    cuda_kernels::attention::dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
                         &self.ctx,
                         indices_ptr_u64,
                         selected_ptr_u64,
                         sw_blocks,
                         sliding_window,
-                        start_pos,
+                        start_pos_ptr_u64,
                         max_compressed_keys,
                         compress_ratio,
                         mode_int,
@@ -5379,6 +5404,7 @@ fn ensure_fm_decode_arena(
     let num_splits_ints = 2_usize; // b + 1 with b = 1
     let indices_len = topk_unified_max;
     let topk_length_len = 1_usize;
+    let start_pos_len = 1_usize;
     let lse_out_len = h_q;
 
     let need_lse_grow = cache
@@ -5445,6 +5471,17 @@ fn ensure_fm_decode_arena(
             ctx.stream
                 .alloc_zeros_traced::<i32>(topk_length_len)
                 .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode topk_length alloc: {err}"))?,
+        );
+    }
+    let need_start_pos_grow = cache
+        .fm_decode_start_pos
+        .as_ref()
+        .is_none_or(|buf| buf.len() < start_pos_len);
+    if need_start_pos_grow {
+        cache.fm_decode_start_pos = Some(
+            ctx.stream
+                .alloc_zeros_traced::<i32>(start_pos_len)
+                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode start_pos alloc: {err}"))?,
         );
     }
     let need_lse_out_grow = cache
