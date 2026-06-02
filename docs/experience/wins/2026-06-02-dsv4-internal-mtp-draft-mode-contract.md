@@ -44,6 +44,23 @@ math.
 Remote DSv4 fast-build and startup contract verification are pending for the
 next tranche.
 
+Follow-up verification at commit `471acc9c` on remote pod
+`/data01/build/arle`:
+
+- `scripts/dsv4_fast_build.sh` used the prebuilt CUDA archive and completed in
+  26.17 s without nvcc / TileLang AOT.
+- High-performance TP8 probe with `--spec-enabled --spec-draft-model eagle`
+  loaded `mtp_layers=1` on all ranks, then failed closed before serving opened.
+  Artifact: `/tmp/dsv4_internal_mtp_contract_20260602_153458.log`.
+- The failure was still the expected executable-path gap:
+  `CUDA frozen-KV EAGLE draft forward/graph capture is not implemented yet`.
+
+The first remote probe also showed that the speculative decode config log was
+behind the DSv4 best-practice contract failure. The constructor now logs
+`Speculative decode config` before model-specific contract validation so
+operators can see `draft_model=InternalMtp` even when the high-performance path
+fails closed during startup.
+
 ## Rule
 
 Do not overload `self-spec` for DSv4 EAGLE. Internal checkpoint MTP draft,
