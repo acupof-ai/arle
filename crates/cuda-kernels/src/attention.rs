@@ -208,6 +208,35 @@ pub fn dsv4_fp8_kv_fill_sw_slots_from_start_pos_raw(
     Ok(())
 }
 
+/// Pack the just-completed compressor row, if this decode step completes one.
+/// The kernel reads `start_pos_ptr` on device, so a captured CUDA Graph can
+/// replay across decode positions without host-computed row constants.
+pub fn dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw(
+    ctx: &DeviceContext,
+    compressed_ptr: u64,
+    packed_kv_ptr: u64,
+    start_pos_ptr: u64,
+    ratio: usize,
+    sw_blocks: usize,
+    page_block_size: usize,
+    stride_elems: usize,
+) -> Result<()> {
+    unsafe {
+        ffi::arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda(
+            compressed_ptr as *const ffi::Half,
+            packed_kv_ptr as *mut u8,
+            start_pos_ptr as *const i32,
+            ratio as i32,
+            sw_blocks as i32,
+            page_block_size as i32,
+            stride_elems as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Phase D-4 step 1 — DSv4 FlashMLA sparse-decode indices builder.
 ///
 /// Builds the unified per-decode-token indices row in block-paged coords
