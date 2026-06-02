@@ -23,8 +23,10 @@ use super::weights::MetalWeights;
 use super::{MetalBackend, MetalBackendOptions};
 use crate::backend::InferenceBackend;
 use crate::backend::runtime::StopChunkProcessor;
-use crate::kv_tier::transport::disk::{DiskBlockLocation, DiskStore};
-use crate::kv_tier::{BlockId, KvTierAdapter, Tier};
+use crate::kv_tier::{
+    BlockId, ChunkedSnapshotLocation, ChunkedSnapshotManifest, ChunkedSnapshotPartWrite,
+    ChunkedSnapshotRead, ChunkedSnapshotStore, ChunkedSnapshotWrite, KvTierAdapter, Tier,
+};
 use crate::metrics::ServerMetrics;
 use crate::model_arch::ModelArchInfo;
 use crate::sampler::SamplingParams;
@@ -110,6 +112,7 @@ struct ActiveMetalRequest {
     admitted_at: Instant,
     first_token_at: Option<Instant>,
     prefix_reused_tokens: usize,
+    prefix_reuse_source: PrefixReuseSource,
     /// Full generated-token history for cache keys. This is deliberately
     /// separate from `pending_token_ids`, which is only a streaming transport
     /// buffer and may be drained before request finalization.
@@ -166,6 +169,7 @@ impl ActiveMetalRequest {
             admitted_at: Instant::now(),
             first_token_at: None,
             prefix_reused_tokens: 0,
+            prefix_reuse_source: PrefixReuseSource::None,
             generated_token_ids: Vec::new(),
             pending_token_ids: Vec::new(),
             cancel,
@@ -303,9 +307,16 @@ impl ActiveMetalRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrefixReuseSource {
+    None,
+    Memory,
+    Disk,
+}
+
 const METAL_PREFIX_BLOCK_SIZE: usize = 16;
 const METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG: u8 = 0x35;
-const METAL_QWEN35_SNAPSHOT_INDEX_PREFIX_BYTES: usize = 1024 * 1024;
+const METAL_QWEN35_CHUNKED_SNAPSHOT_NAMESPACE: &str = "metal-qwen35-prefix-v1";
 const METRICS_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
 
 // SSD persist budget gate (M_e.14 memory-first prefix cache). A full-length
@@ -431,7 +442,7 @@ struct MetalQwen35CachedPrefix {
 }
 
 struct MetalQwen35DiskPrefix {
-    location: DiskBlockLocation,
+    location: ChunkedSnapshotLocation,
     last_used_tick: u64,
 }
 
@@ -474,7 +485,7 @@ impl MetalDiskPrefixIndex {
         self.entries.contains_key(key)
     }
 
-    fn location_for(&self, key: &[u32]) -> Option<DiskBlockLocation> {
+    fn location_for(&self, key: &[u32]) -> Option<ChunkedSnapshotLocation> {
         self.entries.get(key).map(|entry| entry.location.clone())
     }
 
@@ -501,7 +512,7 @@ impl MetalDiskPrefixIndex {
         }
     }
 
-    fn insert(&mut self, key: Vec<u32>, location: DiskBlockLocation) {
+    fn insert(&mut self, key: Vec<u32>, location: ChunkedSnapshotLocation) {
         let tick = self.bump_tick();
         self.disk_bytes = self.disk_bytes.saturating_add(location.payload_len);
         self.entries.insert(
@@ -515,7 +526,7 @@ impl MetalDiskPrefixIndex {
 
     /// Remove an index entry. Returns the location so the caller can delete the
     /// on-disk file outside the lock (file I/O does not need the index held).
-    fn remove(&mut self, key: &[u32]) -> Option<DiskBlockLocation> {
+    fn remove(&mut self, key: &[u32]) -> Option<ChunkedSnapshotLocation> {
         let entry = self.entries.remove(key)?;
         self.disk_bytes = self.disk_bytes.saturating_sub(entry.location.payload_len);
         Some(entry.location)
@@ -523,7 +534,7 @@ impl MetalDiskPrefixIndex {
 
     /// Pop the least-recently-used entry to make room. Returns its location so
     /// the caller can delete the file outside the lock.
-    fn pop_lru(&mut self) -> Option<DiskBlockLocation> {
+    fn pop_lru(&mut self) -> Option<ChunkedSnapshotLocation> {
         let lru_key = self
             .entries
             .iter()
@@ -574,19 +585,20 @@ impl MetalDiskPrefixIndex {
 
 struct DiskCapacityDecision {
     fits: bool,
-    evicted: Vec<DiskBlockLocation>,
+    evicted: Vec<ChunkedSnapshotLocation>,
 }
 
-/// Job handed to the dedicated SSD-writer thread. The payload is already
-/// encoded (`encode_for_disk` → `to_bytes`/`eval`) on the **serving** thread,
+/// Job handed to the dedicated SSD-writer thread. The snapshot parts are already
+/// encoded (`encode_chunked_for_disk` → `to_bytes`/`eval`) on the **serving** thread,
 /// because that `eval` materializes resident MLX arrays and must not run
 /// concurrently with the serving thread's decode `async_eval` (no global MLX
 /// lock; dedicated GPU streams — see `feedback_mlx_async_eval_is_caller_thread`).
 /// The writer therefore does **only** filesystem I/O + index bookkeeping.
 struct DiskWriteJob {
     token_ids: Vec<u32>,
-    fingerprint: BlockFingerprint,
-    payload: Vec<u8>,
+    manifest_id: BlockFingerprint,
+    metadata: Vec<u8>,
+    parts: Vec<ChunkedSnapshotPartWrite>,
     estimated_payload_len: u64,
 }
 
@@ -695,10 +707,10 @@ impl DiskWriteHandle {
 
     fn submit_reserved(&self, job: DiskWriteJob) {
         let Some(tx) = self.tx.as_ref() else {
-            self.release_pending(job.payload.len() as u64);
+            self.release_pending(job.estimated_payload_len);
             return;
         };
-        let payload_len = job.payload.len() as u64;
+        let payload_len = job.estimated_payload_len;
         if tx.send(job).is_err() {
             self.release_pending(payload_len);
             warn!("Metal Qwen3.5 SSD prefix writer thread is gone; dropping persist job");
@@ -732,7 +744,7 @@ fn disk_writer_loop(
     let trace = std::env::var("INFER_M_E13_TRACE").is_ok();
     while let Ok(job) = rx.recv() {
         let _pending_payload =
-            PendingDiskPayload::new(Arc::clone(&pending_bytes), job.payload.len() as u64);
+            PendingDiskPayload::new(Arc::clone(&pending_bytes), job.estimated_payload_len);
         // Skip if a concurrent import already re-published this exact key.
         let reserve = {
             let mut guard = match index.lock() {
@@ -746,7 +758,7 @@ fn disk_writer_loop(
             guard.reserve_capacity(job.estimated_payload_len)
         };
         for location in &reserve.evicted {
-            if let Err(err) = adapter.delete_disk_block(location) {
+            if let Err(err) = adapter.delete_disk_snapshot(location) {
                 warn!(
                     "Metal Qwen3.5 SSD prefix cache failed to evict {}: {err:#}",
                     location.path.display()
@@ -758,13 +770,14 @@ fn disk_writer_loop(
         }
 
         let t_write = std::time::Instant::now();
-        let location = match adapter.put_disk_block_with_fsync(
-            job.fingerprint,
-            METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
-            &job.payload,
+        let (location, stats) = match adapter.put_disk_snapshot(
+            job.manifest_id,
+            METAL_QWEN35_CHUNKED_SNAPSHOT_NAMESPACE,
+            job.metadata,
+            job.parts,
             fsync_each_block,
         ) {
-            Ok(location) => location,
+            Ok(result) => result,
             Err(err) => {
                 warn!(
                     "Metal Qwen3.5 SSD prefix publish failed for {} tokens: {err:#}",
@@ -784,9 +797,13 @@ fn disk_writer_loop(
         }
         if trace {
             log::info!(
-                "m_e13_trace ssd_writer persist: tokens={} payload_bytes={} write_us={}",
+                "m_e13_trace ssd_writer persist: tokens={} payload_bytes={} chunks_written={} chunks_reused={} physical_chunk_bytes_written={} manifest_bytes_written={} write_us={}",
                 job.token_ids.len(),
                 payload_len,
+                stats.chunks_written,
+                stats.chunks_reused,
+                stats.physical_chunk_bytes_written,
+                stats.manifest_bytes_written,
                 write_us,
             );
         }
@@ -795,14 +812,14 @@ fn disk_writer_loop(
 
 #[derive(Clone)]
 struct MetalTierAdapter {
-    disk_store: Option<Arc<DiskStore>>,
+    snapshot_store: Option<Arc<ChunkedSnapshotStore>>,
     paged_pool_pressure: f64,
 }
 
 impl MetalTierAdapter {
-    fn new(disk_store: Option<Arc<DiskStore>>) -> Self {
+    fn new(snapshot_store: Option<Arc<ChunkedSnapshotStore>>) -> Self {
         Self {
-            disk_store,
+            snapshot_store,
             paged_pool_pressure: 0.0,
         }
     }
@@ -817,60 +834,75 @@ impl MetalTierAdapter {
     }
 
     fn has_disk_tier(&self) -> bool {
-        self.disk_store.is_some()
+        self.snapshot_store.is_some()
     }
 
-    fn put_disk_block_with_fsync(
+    fn put_disk_snapshot(
         &self,
-        fingerprint: BlockFingerprint,
-        kv_format_tag: u8,
-        payload: &[u8],
-        fsync_each_block: bool,
-    ) -> Result<DiskBlockLocation> {
+        manifest_id: BlockFingerprint,
+        namespace: &str,
+        metadata: Vec<u8>,
+        parts: Vec<ChunkedSnapshotPartWrite>,
+        fsync_manifest: bool,
+    ) -> Result<(
+        ChunkedSnapshotLocation,
+        crate::kv_tier::ChunkedSnapshotPutStats,
+    )> {
         let store = self
-            .disk_store
+            .snapshot_store
             .as_ref()
             .context("Metal T2 disk tier not configured")?;
         store
-            .put_block_with_fsync(fingerprint, kv_format_tag, payload, fsync_each_block)
-            .context("write block through Metal T2 adapter")
+            .put_snapshot(
+                ChunkedSnapshotWrite {
+                    manifest_id,
+                    namespace: namespace.to_string(),
+                    metadata,
+                    parts,
+                },
+                fsync_manifest,
+            )
+            .context("write snapshot through Metal T2 adapter")
     }
 
-    fn get_disk_block(
+    fn get_disk_snapshot(
         &self,
-        location: &DiskBlockLocation,
-        expected_fingerprint: Option<BlockFingerprint>,
-    ) -> Result<Vec<u8>> {
+        location: &ChunkedSnapshotLocation,
+        expected_manifest_id: Option<BlockFingerprint>,
+    ) -> Result<ChunkedSnapshotRead> {
         let store = self
-            .disk_store
+            .snapshot_store
             .as_ref()
             .context("Metal T2 disk tier not configured")?;
         store
-            .get_block(location, expected_fingerprint)
-            .context("read block through Metal T2 adapter")
+            .get_snapshot(location, expected_manifest_id)
+            .context("read snapshot through Metal T2 adapter")
     }
 
-    fn visit_disk_payload_prefixes(
+    fn visit_disk_manifests(
         &self,
-        max_payload_prefix_len: usize,
-        visit: impl FnMut(DiskBlockLocation, &[u8]) -> std::io::Result<()>,
+        visit: impl FnMut(ChunkedSnapshotLocation, &ChunkedSnapshotManifest) -> std::io::Result<()>,
     ) -> Result<()> {
-        let Some(store) = self.disk_store.as_ref() else {
+        let Some(store) = self.snapshot_store.as_ref() else {
             return Ok(());
         };
         store
-            .visit_block_payload_prefixes(max_payload_prefix_len, visit)
-            .context("scan Metal T2 adapter block prefixes")
+            .visit_manifests(visit)
+            .context("scan Metal T2 adapter snapshot manifests")
     }
 
-    fn delete_disk_block(&self, location: &DiskBlockLocation) -> Result<()> {
+    fn delete_disk_snapshot(&self, location: &ChunkedSnapshotLocation) -> Result<()> {
         let store = self
-            .disk_store
+            .snapshot_store
             .as_ref()
             .context("Metal T2 disk tier not configured")?;
         store
-            .delete_block(location)
-            .context("delete block through Metal T2 adapter")
+            .delete_snapshot(location)
+            .context("delete snapshot manifest through Metal T2 adapter")?;
+        let _ = store
+            .collect_orphan_chunks()
+            .context("collect orphan snapshot chunks through Metal T2 adapter")?;
+        Ok(())
     }
 }
 
@@ -961,7 +993,7 @@ impl MetalLivePrefixRuntime {
                     disk_low_watermark,
                     disk_fsync_each_block,
                 ) = if let Some(options) = backend.kv_disk_options.as_ref() {
-                    let store = Arc::new(DiskStore::new(&options.dir));
+                    let store = Arc::new(ChunkedSnapshotStore::new(&options.dir));
                     store.create_root().with_context(|| {
                         format!("create Metal Qwen3.5 SSD KV dir {}", options.dir.display())
                     })?;
@@ -1026,14 +1058,14 @@ impl MetalQwen35PrefixRuntime {
     fn new(
         max_cached_bytes: u64,
         block_size: usize,
-        disk_store: Option<Arc<DiskStore>>,
+        snapshot_store: Option<Arc<ChunkedSnapshotStore>>,
         model_fingerprint: Vec<u8>,
         max_disk_bytes: Option<u64>,
         disk_high_watermark: f64,
         disk_low_watermark: f64,
         disk_fsync_each_block: bool,
     ) -> Result<Self> {
-        let tier_adapter = MetalTierAdapter::new(disk_store).with_paged_pool_pressure(0.0);
+        let tier_adapter = MetalTierAdapter::new(snapshot_store).with_paged_pool_pressure(0.0);
         let disk_index = Arc::new(Mutex::new(MetalDiskPrefixIndex::new(
             max_disk_bytes,
             disk_high_watermark,
@@ -1140,10 +1172,12 @@ impl MetalQwen35PrefixRuntime {
         // is closed.
         let force_disk = std::env::var("INFER_M_E13_FORCE_DISK").is_ok();
         let mut reused_tokens = 0;
+        let mut reuse_source = PrefixReuseSource::None;
         if force_disk || disk_len > memory_len {
             if let Some(prefix_key) = disk_key.as_deref() {
                 if self.try_import_disk_prefix_or_remove(prefix_key, request) {
                     reused_tokens = prefix_key.len();
+                    reuse_source = PrefixReuseSource::Disk;
                 }
             }
             if reused_tokens == 0
@@ -1151,18 +1185,21 @@ impl MetalQwen35PrefixRuntime {
                 && self.try_import_memory_prefix(prefix_key, request)?
             {
                 reused_tokens = prefix_key.len();
+                reuse_source = PrefixReuseSource::Memory;
             }
         } else {
             if let Some(prefix_key) = memory_key.as_deref()
                 && self.try_import_memory_prefix(prefix_key, request)?
             {
                 reused_tokens = prefix_key.len();
+                reuse_source = PrefixReuseSource::Memory;
             }
             if reused_tokens == 0
                 && let Some(prefix_key) = disk_key.as_deref()
                 && self.try_import_disk_prefix_or_remove(prefix_key, request)
             {
                 reused_tokens = prefix_key.len();
+                reuse_source = PrefixReuseSource::Disk;
             }
         }
         metrics.record_request_cache(
@@ -1172,6 +1209,7 @@ impl MetalQwen35PrefixRuntime {
             prompt_len.saturating_sub(reused_tokens),
         );
         request.prefix_reused_tokens = reused_tokens;
+        request.prefix_reuse_source = reuse_source;
         Ok(())
     }
 
@@ -1184,7 +1222,7 @@ impl MetalQwen35PrefixRuntime {
     ///    work on the first-response path and is the same cheap clone the
     ///    in-memory tier always used.
     /// 2. If a disk tier is wired, apply the budget gate; on a clear win,
-    ///    `encode_for_disk` (the `eval`/`to_bytes` stays on **this** thread for
+    ///    `encode_chunked_for_disk` (the `eval`/`to_bytes` stays on **this** thread for
     ///    MLX safety) and hand the encoded bytes to the async SSD-writer.
     ///
     /// The old synchronous replay disk-publish — which spun up a fresh replay
@@ -1328,6 +1366,19 @@ impl MetalQwen35PrefixRuntime {
         if !worth_persist {
             return;
         }
+        if request.prefix_reuse_source == PrefixReuseSource::Disk
+            && request.prefix_reused_tokens >= self.block_size
+            && tokens > request.prefix_reused_tokens
+        {
+            if trace {
+                log::info!(
+                    "m_e10_trace publish budget: skip disk-imported extension persist; tokens={} reused_tokens={}",
+                    tokens,
+                    request.prefix_reused_tokens,
+                );
+            }
+            return;
+        }
 
         // Skip if the index already holds this exact key (e.g. imported from
         // disk this lifetime). Avoids a redundant encode.
@@ -1336,7 +1387,7 @@ impl MetalQwen35PrefixRuntime {
         }
 
         let estimated_payload_len =
-            match snapshot.estimated_disk_payload_len(&self.model_fingerprint) {
+            match snapshot.estimated_chunked_disk_payload_len(&self.model_fingerprint) {
                 Ok(len) => len,
                 Err(err) => {
                     warn!("Metal Qwen3.5 SSD prefix size estimate failed: {err:#}");
@@ -1346,20 +1397,20 @@ impl MetalQwen35PrefixRuntime {
         if !writer.try_reserve_pending(estimated_payload_len, tokens) {
             return;
         }
-        // Encode here (serving thread): `encode_for_disk` → `to_bytes` calls
+        // Encode here (serving thread): `encode_chunked_for_disk` → `to_bytes` calls
         // `eval`, which must not run concurrently with decode `async_eval` on a
         // separate thread (no global MLX lock). The resident full-length KV is
         // already materialized, so this eval is the cheap ~persist class, not a
         // replay.
-        let payload = match snapshot.encode_for_disk(&self.model_fingerprint) {
-            Ok(payload) => payload,
-            Err(err) => {
-                writer.release_pending(estimated_payload_len);
-                warn!("Metal Qwen3.5 SSD prefix encode failed: {err:#}");
-                return;
-            }
-        };
-        let actual_payload_len = payload.len() as u64;
+        let (metadata, parts, actual_payload_len) =
+            match snapshot.encode_chunked_for_disk(&self.model_fingerprint) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    writer.release_pending(estimated_payload_len);
+                    warn!("Metal Qwen3.5 SSD prefix encode failed: {err:#}");
+                    return;
+                }
+            };
         match actual_payload_len.cmp(&estimated_payload_len) {
             std::cmp::Ordering::Greater => {
                 let delta = actual_payload_len - estimated_payload_len;
@@ -1376,9 +1427,10 @@ impl MetalQwen35PrefixRuntime {
         let fingerprint = self.fingerprint_for_tokens(&snapshot.token_ids);
         writer.submit_reserved(DiskWriteJob {
             token_ids: snapshot.token_ids.clone(),
-            fingerprint,
-            payload,
-            estimated_payload_len,
+            manifest_id: fingerprint,
+            metadata,
+            parts,
+            estimated_payload_len: actual_payload_len,
         });
     }
 
@@ -1533,16 +1585,17 @@ impl MetalQwen35PrefixRuntime {
         };
         let expected = self.fingerprint_for_tokens(prefix_key);
         let t_read_start = std::time::Instant::now();
-        let payload = self
+        let chunked = self
             .tier_adapter
-            .get_disk_block(&location, Some(expected))
-            .context("read Qwen3.5 prefix snapshot from DiskStore")?;
+            .get_disk_snapshot(&location, Some(expected))
+            .context("read Qwen3.5 prefix snapshot from chunked store")?;
         let t_read_us = t_read_start.elapsed().as_micros();
-        let payload_bytes = payload.len();
+        let payload_bytes = location.payload_len;
 
         let t_decode_start = std::time::Instant::now();
-        let snapshot = Qwen35PrefixSnapshot::decode_from_disk(&payload, &self.model_fingerprint)
-            .context("decode Qwen3.5 prefix snapshot from DiskStore")?;
+        let snapshot =
+            Qwen35PrefixSnapshot::decode_chunked_from_disk(chunked, &self.model_fingerprint)
+                .context("decode Qwen3.5 prefix snapshot from chunked store")?;
         let t_decode_us = t_decode_start.elapsed().as_micros();
         ensure!(
             snapshot.token_ids == prefix_key,
@@ -1583,47 +1636,48 @@ impl MetalQwen35PrefixRuntime {
         let adapter = self.tier_adapter.clone();
         let model_fingerprint = &self.model_fingerprint;
         let block_size = self.block_size;
-        let mut accepted: Vec<(Vec<u32>, DiskBlockLocation)> = Vec::new();
+        let mut accepted: Vec<(Vec<u32>, ChunkedSnapshotLocation)> = Vec::new();
         adapter
-            .visit_disk_payload_prefixes(
-                METAL_QWEN35_SNAPSHOT_INDEX_PREFIX_BYTES,
-                |location, payload| {
-                    let token_ids =
-                        match Qwen35PrefixSnapshot::peek_disk_token_ids(payload, model_fingerprint)
-                        {
-                            Ok(token_ids) => token_ids,
-                            Err(err) => {
-                                log::debug!(
-                                    "Metal Qwen3.5 SSD prefix cache ignored {}: {err:#}",
-                                    location.path.display()
-                                );
-                                if Qwen35PrefixSnapshot::looks_like_disk_payload(payload) {
-                                    delete_rejected_qwen35_disk_block(&adapter, &location);
-                                }
-                                return Ok(());
-                            }
-                        };
-                    // Persisted snapshots are full-length live KV+GDR at exactly
-                    // `cache_len`; they need not be block-aligned (the old
-                    // replay path's alignment requirement is gone). Only reject
-                    // sub-block fragments.
-                    if token_ids.len() < block_size {
-                        delete_rejected_qwen35_disk_block(&adapter, &location);
-                        return Ok(());
-                    }
-                    let expected = fingerprint_for_tokens(model_fingerprint, &token_ids);
-                    if location.fingerprint != expected {
+            .visit_disk_manifests(|location, manifest| {
+                if manifest.namespace != METAL_QWEN35_CHUNKED_SNAPSHOT_NAMESPACE {
+                    return Ok(());
+                }
+                let token_ids = match Qwen35PrefixSnapshot::peek_chunked_disk_token_ids(
+                    &manifest.metadata,
+                    model_fingerprint,
+                ) {
+                    Ok(token_ids) => token_ids,
+                    Err(err) => {
                         log::debug!(
-                            "Metal Qwen3.5 SSD prefix cache ignored {}: fingerprint/token mismatch",
+                            "Metal Qwen3.5 SSD prefix cache ignored {}: {err:#}",
                             location.path.display()
                         );
-                        delete_rejected_qwen35_disk_block(&adapter, &location);
+                        if Qwen35PrefixSnapshot::looks_like_chunked_metadata(&manifest.metadata) {
+                            delete_rejected_qwen35_disk_snapshot(&adapter, &location);
+                        }
                         return Ok(());
                     }
-                    accepted.push((token_ids, location));
-                    Ok(())
-                },
-            )
+                };
+                // Persisted snapshots are full-length live KV+GDR at exactly
+                // `cache_len`; they need not be block-aligned (the old
+                // replay path's alignment requirement is gone). Only reject
+                // sub-block fragments.
+                if token_ids.len() < block_size {
+                    delete_rejected_qwen35_disk_snapshot(&adapter, &location);
+                    return Ok(());
+                }
+                let expected = fingerprint_for_tokens(model_fingerprint, &token_ids);
+                if location.manifest_id != expected {
+                    log::debug!(
+                        "Metal Qwen3.5 SSD prefix cache ignored {}: fingerprint/token mismatch",
+                        location.path.display()
+                    );
+                    delete_rejected_qwen35_disk_snapshot(&adapter, &location);
+                    return Ok(());
+                }
+                accepted.push((token_ids, location));
+                Ok(())
+            })
             .context("scan Metal Qwen3.5 SSD prefix cache")?;
 
         let evicted = {
@@ -1636,7 +1690,7 @@ impl MetalQwen35PrefixRuntime {
             index.reserve_capacity(0).evicted
         };
         for location in &evicted {
-            if let Err(err) = self.tier_adapter.delete_disk_block(location) {
+            if let Err(err) = self.tier_adapter.delete_disk_snapshot(location) {
                 warn!(
                     "Metal Qwen3.5 SSD prefix cache failed to evict {}: {err:#}",
                     location.path.display()
@@ -1674,7 +1728,7 @@ impl MetalQwen35PrefixRuntime {
         let location = self.lock_disk_index().remove(key);
         if let Some(location) = location
             && self.tier_adapter.has_disk_tier()
-            && let Err(err) = self.tier_adapter.delete_disk_block(&location)
+            && let Err(err) = self.tier_adapter.delete_disk_snapshot(&location)
         {
             warn!(
                 "Metal Qwen3.5 SSD prefix cache failed to delete {}: {err:#}",
@@ -1708,30 +1762,33 @@ impl MetalQwen35PrefixRuntime {
         }
         let key = snapshot.token_ids.clone();
         let estimated_payload_len = snapshot
-            .estimated_disk_payload_len(&self.model_fingerprint)
+            .estimated_chunked_disk_payload_len(&self.model_fingerprint)
             .context("estimate Qwen3.5 prefix snapshot size for SSD")?;
         let reserve = self
             .lock_disk_index()
             .reserve_capacity(estimated_payload_len);
         for location in &reserve.evicted {
-            let _ = self.tier_adapter.delete_disk_block(location);
+            let _ = self.tier_adapter.delete_disk_snapshot(location);
         }
         if !reserve.fits {
             return Ok(());
         }
-        let payload = snapshot
-            .encode_for_disk(&self.model_fingerprint)
+        let (metadata, parts, actual_payload_len) = snapshot
+            .encode_chunked_for_disk(&self.model_fingerprint)
             .context("encode Qwen3.5 prefix snapshot for SSD")?;
         let fingerprint = self.fingerprint_for_tokens(&key);
         let location = self
             .tier_adapter
-            .put_disk_block_with_fsync(
+            .put_disk_snapshot(
                 fingerprint,
-                METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
-                &payload,
+                METAL_QWEN35_CHUNKED_SNAPSHOT_NAMESPACE,
+                metadata,
+                parts,
                 self.disk_fsync_each_block,
             )
-            .context("write Qwen3.5 prefix snapshot to DiskStore")?;
+            .context("write Qwen3.5 prefix snapshot to chunked store")?;
+        let (location, _stats) = location;
+        debug_assert_eq!(location.payload_len, actual_payload_len);
         self.lock_disk_index().insert(key, location);
         Ok(())
     }
@@ -1752,10 +1809,13 @@ fn watermark_bytes(max_bytes: u64, watermark: f64) -> u64 {
     ((max_bytes as f64) * watermark).ceil() as u64
 }
 
-fn delete_rejected_qwen35_disk_block(adapter: &MetalTierAdapter, location: &DiskBlockLocation) {
-    if let Err(err) = adapter.delete_disk_block(location) {
+fn delete_rejected_qwen35_disk_snapshot(
+    adapter: &MetalTierAdapter,
+    location: &ChunkedSnapshotLocation,
+) {
+    if let Err(err) = adapter.delete_disk_snapshot(location) {
         warn!(
-            "Metal Qwen3.5 SSD prefix cache failed to delete rejected block {}: {err}",
+            "Metal Qwen3.5 SSD prefix cache failed to delete rejected snapshot {}: {err}",
             location.path.display()
         );
     }
@@ -3993,18 +4053,18 @@ mod tests {
         let mut index = MetalDiskPrefixIndex::new(None, 0.90, 0.75);
         index.insert(
             vec![10, 11, 12],
-            DiskBlockLocation {
+            ChunkedSnapshotLocation {
                 path: PathBuf::from("short"),
                 payload_len: 30,
-                fingerprint: BlockFingerprint([1; 16]),
+                manifest_id: BlockFingerprint([1; 16]),
             },
         );
         index.insert(
             vec![10, 11, 12, 13],
-            DiskBlockLocation {
+            ChunkedSnapshotLocation {
                 path: PathBuf::from("long"),
                 payload_len: 40,
-                fingerprint: BlockFingerprint([2; 16]),
+                manifest_id: BlockFingerprint([2; 16]),
             },
         );
 
@@ -4024,26 +4084,26 @@ mod tests {
         let mut index = MetalDiskPrefixIndex::new(Some(100), 0.90, 0.75);
         index.insert(
             vec![1],
-            DiskBlockLocation {
+            ChunkedSnapshotLocation {
                 path: PathBuf::from("one"),
                 payload_len: 30,
-                fingerprint: BlockFingerprint([1; 16]),
+                manifest_id: BlockFingerprint([1; 16]),
             },
         );
         index.insert(
             vec![2],
-            DiskBlockLocation {
+            ChunkedSnapshotLocation {
                 path: PathBuf::from("two"),
                 payload_len: 30,
-                fingerprint: BlockFingerprint([2; 16]),
+                manifest_id: BlockFingerprint([2; 16]),
             },
         );
         index.insert(
             vec![3],
-            DiskBlockLocation {
+            ChunkedSnapshotLocation {
                 path: PathBuf::from("three"),
                 payload_len: 20,
-                fingerprint: BlockFingerprint([3; 16]),
+                manifest_id: BlockFingerprint([3; 16]),
             },
         );
         index.touch(&[2]);
@@ -4188,7 +4248,7 @@ mod tests {
     fn metal_tier_adapter_disk_snapshot_roundtrip_survives_restart() {
         let _guard = metal_test_guard();
         let dir = tempdir().expect("tempdir");
-        let store = Arc::new(DiskStore::new(dir.path()));
+        let store = Arc::new(ChunkedSnapshotStore::new(dir.path()));
         let adapter = MetalTierAdapter::new(Some(store));
         let model_fingerprint = b"qwen35-adapter-test-model".to_vec();
         let snapshot = Qwen35PrefixSnapshot {
@@ -4198,8 +4258,8 @@ mod tests {
             cache_len: 2,
             kv_capacity: 2,
         };
-        let payload = snapshot
-            .encode_for_disk(&model_fingerprint)
+        let (metadata, parts, _) = snapshot
+            .encode_chunked_for_disk(&model_fingerprint)
             .expect("encode snapshot");
         let fingerprint = BlockFingerprint::compute(
             KvContentContext {
@@ -4209,21 +4269,23 @@ mod tests {
             },
             &snapshot.token_ids,
         );
-        let location = adapter
-            .put_disk_block_with_fsync(
+        let (location, stats) = adapter
+            .put_disk_snapshot(
                 fingerprint,
-                METAL_QWEN35_SNAPSHOT_KV_FORMAT_TAG,
-                &payload,
+                METAL_QWEN35_CHUNKED_SNAPSHOT_NAMESPACE,
+                metadata,
+                parts,
                 false,
             )
             .expect("persist via adapter");
+        assert!(stats.chunks_written > 0);
 
-        let restarted_store = Arc::new(DiskStore::new(dir.path()));
+        let restarted_store = Arc::new(ChunkedSnapshotStore::new(dir.path()));
         let restarted = MetalTierAdapter::new(Some(restarted_store));
         let reloaded = restarted
-            .get_disk_block(&location, Some(fingerprint))
+            .get_disk_snapshot(&location, Some(fingerprint))
             .expect("reload via adapter");
-        let decoded = Qwen35PrefixSnapshot::decode_from_disk(&reloaded, &model_fingerprint)
+        let decoded = Qwen35PrefixSnapshot::decode_chunked_from_disk(reloaded, &model_fingerprint)
             .expect("decode reloaded snapshot");
         assert_eq!(decoded.token_ids, vec![21, 22]);
         assert_eq!(decoded.cache_len, 2);
@@ -4234,7 +4296,7 @@ mod tests {
     fn qwen35_disk_prefix_runtime_reconciles_persisted_snapshot_headers() {
         let _guard = metal_test_guard();
         let dir = tempdir().expect("tempdir");
-        let store = Arc::new(DiskStore::new(dir.path()));
+        let store = Arc::new(ChunkedSnapshotStore::new(dir.path()));
         let model_fingerprint = b"qwen35-test-model".to_vec();
         let mut runtime = MetalQwen35PrefixRuntime::new(
             1024 * 1024,
@@ -4262,7 +4324,15 @@ mod tests {
         let qwen35_fingerprint = runtime.fingerprint_for_tokens(&[11, 12]);
         let foreign_fingerprint = BlockFingerprint([0x7a; 16]);
         store
-            .put_block_with_fsync(foreign_fingerprint, 0x99, b"not-a-qwen35-snapshot", false)
+            .put_snapshot(
+                ChunkedSnapshotWrite {
+                    manifest_id: foreign_fingerprint,
+                    namespace: "foreign-test-snapshot".into(),
+                    metadata: b"not-a-qwen35-snapshot".to_vec(),
+                    parts: Vec::new(),
+                },
+                false,
+            )
             .expect("persist foreign block");
         let disk_bytes = runtime.lock_disk_index().disk_bytes;
         assert!(disk_bytes > 0);
@@ -4295,15 +4365,17 @@ mod tests {
         assert!(wrong_model.lock_disk_index().entries.is_empty());
         assert!(
             !store
-                .contains_block(qwen35_fingerprint)
-                .expect("stat stale block"),
-            "wrong-model Qwen3.5 snapshot blocks should be discarded during reconciliation"
+                .manifest_path_for(qwen35_fingerprint)
+                .try_exists()
+                .expect("stat stale manifest"),
+            "wrong-model Qwen3.5 snapshot manifests should be discarded during reconciliation"
         );
         assert!(
             store
-                .contains_block(foreign_fingerprint)
-                .expect("stat foreign block"),
-            "non-Qwen3.5 DiskStore blocks should not be deleted by Qwen3.5 reconciliation"
+                .manifest_path_for(foreign_fingerprint)
+                .try_exists()
+                .expect("stat foreign manifest"),
+            "non-Qwen3.5 snapshot manifests should not be deleted by Qwen3.5 reconciliation"
         );
     }
 
