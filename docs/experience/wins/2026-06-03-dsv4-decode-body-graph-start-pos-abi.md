@@ -52,10 +52,28 @@ Local:
 
 Remote:
 
-- Pending. This change touches CUDA C and must pass pod-side nvcc build.
-- Pending. Correctness gate must show normal EOS output, forced 32-token
-  decode, and `scripts/dsv4_batched_decode_validate.py` answer pass.
-- Pending. CUDA graph gate must show actual DSv4 body capture/replay in logs.
+- PASS. Pod build at commit `c7caabe5` completed in 7m10s and harvested a new
+  DSv4 prebuilt CUDA archive:
+  `/tmp/dsv4_body_graph_20260603/build.log`.
+- PASS. The harvested archive exports the new ABI symbols:
+  `dsv4_swa_attention_start_pos_ptr_cuda`,
+  `dsv4_hybrid_attention_start_pos_ptr_cuda`,
+  `dsv4_compressor_update_start_pos_ptr_cuda`, and
+  `arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda`.
+- PASS. Body-graph-off 32-token completions gate passed for c1, c4, and c8:
+  every row returned HTTP 200, generated the full token budget, and contained
+  `406`. Artifact:
+  `/tmp/dsv4_body_graph_20260603/validate_off_32tok/completions32.log`.
+- FAIL, contained. The first body-graph-on run captured B=4, then hit
+  `CUDA_ERROR_ILLEGAL_ADDRESS` during sampling sync after only 3 generated
+  tokens. Artifact:
+  `/tmp/dsv4_body_graph_20260603/validate_body_graph_on_32tok/server.log`.
+  Root-cause hypothesis is not performance-related: the captured body still
+  records per-step owned GPU scratch from the FFN routed/shared path, so graph
+  launch can use addresses that are no longer stable.
+- Follow-up guard: `ARLE_DSV4_DECODE_BODY_CUDA_GRAPH=1` now stays in eager mode
+  unless `ARLE_DSV4_DECODE_BODY_CUDA_GRAPH_UNSAFE=1` is explicitly set for
+  debug reproduction.
 - Pending. Performance gate must run the matched DSv4-Flash TP8 + EAGLE +
   CUDA graph 256K/1500 hot-cache workload before comparing with the target
   TPOT ~4.85 ms.
@@ -66,3 +84,7 @@ For DSv4 graph work, a captured graph is not a win by itself. The license order
 is: graph-safe ABI, remote build, output correctness, replay evidence, then
 matched workload performance. Any shorter path risks treating a debug shape or
 fallback eager path as the target CUDA graph result.
+
+Full-body capture must fail closed until every tensor pointer recorded by the
+graph is owned by decode context or per-layer cache for the lifetime of the
+graph. Per-step owned `HiddenStates` are not graph-safe.
