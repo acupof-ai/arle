@@ -324,6 +324,10 @@ pub(crate) struct ActiveRequest {
     pub(crate) trace_context: Option<SpanContext>,
     /// Per-request token coordinator for multi-rank HTTP serving.
     pub(crate) distributed: Option<crate::scheduler::DistributedRequestCoordination>,
+    /// Distributed data-ownership metadata carried independently from token
+    /// synchronization. Preserved across requeue so a distributed request does
+    /// not silently fall back to an unlabelled ownership contract.
+    pub(crate) distributed_shard: crate::scheduler::DistributedRequestShard,
     /// Cooperative cancel flag forwarded from `IncomingRequest`.
     /// Preserved across recompute preemption so Ctrl-C cancellation remains
     /// visible after the request re-enters the waiting queue.
@@ -389,6 +393,7 @@ impl ActiveRequest {
             trace_context: self.trace_context,
             delta_tx: self.delta_tx.clone(),
             distributed: self.distributed.clone(),
+            distributed_shard: self.distributed_shard,
             cancel: self.cancel.clone(),
         }
     }
@@ -518,6 +523,7 @@ mod tests {
             ingress_numa_node: None,
             trace_context: None,
             distributed: None,
+            distributed_shard: crate::scheduler::DistributedRequestShard::single_rank(),
             cancel: None,
             delta_tx,
             emit_cursor: EmitCursor::default(),

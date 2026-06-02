@@ -49,6 +49,97 @@ pub enum DistributedRequestCoordination {
     },
 }
 
+/// Data ownership contract used by a distributed request.
+///
+/// Token synchronization answers "which token should every rank append next?".
+/// This shard contract answers "which token rows does this rank own for
+/// compute?". SGLang-style DSv4 needs token-owned DP/EP rows; the current
+/// fallback path is explicit replicated-token ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DistributedRequestOwnership {
+    ReplicatedToken,
+    TokenOwnedDpEp,
+}
+
+impl DistributedRequestOwnership {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplicatedToken => "replicated-token",
+            Self::TokenOwnedDpEp => "token-owned-dp-ep",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DistributedRequestShard {
+    pub ownership: DistributedRequestOwnership,
+    pub rank: usize,
+    pub world_size: usize,
+    /// Only the visible-output rank streams deltas to the client. Follower
+    /// ranks still execute the request when the ownership contract requires
+    /// them, but their deltas are drained locally.
+    pub emits_visible_output: bool,
+}
+
+impl DistributedRequestShard {
+    pub const fn single_rank() -> Self {
+        Self {
+            ownership: DistributedRequestOwnership::ReplicatedToken,
+            rank: 0,
+            world_size: 1,
+            emits_visible_output: true,
+        }
+    }
+
+    pub fn replicated_token(rank: usize, world_size: usize) -> Self {
+        assert!(
+            world_size > 0,
+            "distributed request world_size must be >= 1"
+        );
+        assert!(
+            rank < world_size,
+            "distributed request rank {rank} out of range for world_size {world_size}"
+        );
+        Self {
+            ownership: DistributedRequestOwnership::ReplicatedToken,
+            rank,
+            world_size,
+            emits_visible_output: rank == 0,
+        }
+    }
+
+    pub fn token_owned_dp_ep(rank: usize, world_size: usize, emits_visible_output: bool) -> Self {
+        assert!(
+            world_size > 0,
+            "distributed request world_size must be >= 1"
+        );
+        assert!(
+            rank < world_size,
+            "distributed request rank {rank} out of range for world_size {world_size}"
+        );
+        Self {
+            ownership: DistributedRequestOwnership::TokenOwnedDpEp,
+            rank,
+            world_size,
+            emits_visible_output,
+        }
+    }
+
+    pub const fn is_distributed(self) -> bool {
+        self.world_size > 1
+    }
+
+    pub fn summary(self) -> String {
+        format!(
+            "{} rank={}/{} visible_output={}",
+            self.ownership.as_str(),
+            self.rank,
+            self.world_size,
+            self.emits_visible_output
+        )
+    }
+}
+
 impl DistributedRequestCoordination {
     pub fn new(rank: usize, coordinator: Arc<DistributedTokenCoordinator>) -> Result<Self> {
         if rank >= coordinator.world_size {
@@ -866,6 +957,10 @@ pub struct IncomingRequest {
     /// Optional per-request token coordinator for multi-rank distributed
     /// serving. `None` is the normal single-rank or NUMA-routed path.
     pub distributed: Option<DistributedRequestCoordination>,
+    /// Per-request distributed data ownership. This is separate from token
+    /// synchronization: a request can synchronize tokens across ranks while
+    /// still running on the legacy replicated-token data contract.
+    pub distributed_shard: DistributedRequestShard,
     /// Optional cooperative cancel flag. When set true, the scheduler/runtime
     /// stops generating this request at the next tick/chunk boundary (in-process
     /// CLI Ctrl-C path; HTTP uses delta_tx close instead).
