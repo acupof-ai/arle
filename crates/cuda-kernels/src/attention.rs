@@ -155,6 +155,30 @@ pub fn dsv4_fp8_kv_pack_strided_raw(
     Ok(())
 }
 
+/// Fill the single `[block_id,row]` scratch pair for FlashMLA decode SW pack
+/// from a device-resident `start_pos` scalar.
+pub fn dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_raw(
+    ctx: &DeviceContext,
+    token_block_id_ptr: u64,
+    token_in_block_row_ptr: u64,
+    start_pos_ptr: u64,
+    sliding_window: usize,
+    page_block_size: usize,
+) -> Result<()> {
+    unsafe {
+        ffi::arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda(
+            token_block_id_ptr as *mut i32,
+            token_in_block_row_ptr as *mut i32,
+            start_pos_ptr as *const i32,
+            sliding_window as i32,
+            page_block_size as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Phase D-4 step 1 — DSv4 FlashMLA sparse-decode indices builder.
 ///
 /// Builds the unified per-decode-token indices row in block-paged coords

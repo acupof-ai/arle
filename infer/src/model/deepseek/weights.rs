@@ -3243,12 +3243,40 @@ impl DeepseekModel {
                     self.dsv4_flashmla_decode_pool_layout(cache_mut, compress_ratio)?;
                 let total_blocks = sw_blocks + comp_blocks;
 
+                ensure!(
+                    start_pos <= i32::MAX as usize,
+                    "DSv4 FlashMLA decode start_pos {start_pos} overflows i32"
+                );
+                let start_pos_ptr_u64 = {
+                    let start_pos_dev = cache_mut
+                        .fm_decode_start_pos
+                        .as_mut()
+                        .expect("start_pos arena allocated");
+                    let (ptr, guard) = start_pos_dev.device_ptr_mut(&self.ctx.stream);
+                    unsafe {
+                        ffi::dsv4_fill_i32_cuda(
+                            ptr as *mut i32,
+                            start_pos as i32,
+                            1_i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|err| {
+                            anyhow::anyhow!("DSv4 FlashMLA decode start_pos fill failed: {err}")
+                        })?;
+                    }
+                    drop(guard);
+                    ptr as u64
+                };
+
                 // Step 3 — per-step SW pack of the current decode token's
                 // K row from k_prepared into FP8 SW sub-pool at
-                // ring slot `start_pos % sliding_window`. The pool base
-                // pointer is resolved by mode: OFF → per-state lazy-alloc
-                // (byte-identical to `main`); ON → the bound shared sub-range
-                // (decode-time only).
+                // ring slot `start_pos % sliding_window`. `start_pos` is
+                // already staged in the stable device metadata slot above, so
+                // the pack slot scratch is generated on stream without a
+                // per-step H2D copy. The pool base pointer is resolved by
+                // mode: OFF → per-state lazy-alloc (byte-identical to `main`);
+                // ON → the bound shared sub-range (decode-time only).
                 {
                     let pool_base_ptr = dsv4_flashmla_fp8_kv_pool_base_ptr(
                         &self.ctx,
@@ -3257,12 +3285,12 @@ impl DeepseekModel {
                         comp_blocks,
                     )?;
                     let mut one_scratch = cache_mut.fp8_kv_one_token_scratch.take();
-                    let ring_idx = start_pos % sliding_window.max(1);
                     let res = dsv4_flashmla_pack_one_sw_token(
                         &self.ctx,
                         k_ptr,
                         pool_base_ptr,
-                        ring_idx,
+                        start_pos_ptr_u64,
+                        sliding_window,
                         head_dim,
                         &mut one_scratch,
                     );
@@ -3281,31 +3309,6 @@ impl DeepseekModel {
                     .device_ptr_mut(&self.ctx.stream);
                 drop(ig);
                 {
-                    ensure!(
-                        start_pos <= i32::MAX as usize,
-                        "DSv4 FlashMLA decode start_pos {start_pos} overflows i32"
-                    );
-                    let start_pos_ptr_u64 = {
-                        let start_pos_dev = cache_mut
-                            .fm_decode_start_pos
-                            .as_mut()
-                            .expect("start_pos arena allocated");
-                        let (ptr, guard) = start_pos_dev.device_ptr_mut(&self.ctx.stream);
-                        unsafe {
-                            ffi::dsv4_fill_i32_cuda(
-                                ptr as *mut i32,
-                                start_pos as i32,
-                                1_i32,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()
-                            .map_err(|err| {
-                                anyhow::anyhow!("DSv4 FlashMLA decode start_pos fill failed: {err}")
-                            })?;
-                        }
-                        drop(guard);
-                        ptr as u64
-                    };
                     let selected_ptr_u64: u64 = if mode_int == 1 {
                         // `selected_ptr` is *const i32 captured above.
                         selected_ptr as u64
@@ -5644,13 +5647,11 @@ fn dsv4_flashmla_pack_one_sw_token(
     ctx: &DeviceContext,
     k_prepared_ptr: u64,
     fp8_pool_base_ptr: u64,
-    ring_idx: usize,
+    start_pos_ptr: u64,
+    sliding_window: usize,
     head_dim: usize,
     one_token_scratch: &mut Option<(CudaSlice<i32>, CudaSlice<i32>)>,
 ) -> Result<()> {
-    let block_idx = (ring_idx / DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE) as i32;
-    let row = (ring_idx % DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE) as i32;
-
     // Lazy-alloc the [1]-element block_ids/rows scratches.
     if one_token_scratch.is_none() {
         let bid = ctx
@@ -5666,16 +5667,19 @@ fn dsv4_flashmla_pack_one_sw_token(
     let (bid_dev, row_dev) = one_token_scratch
         .as_mut()
         .expect("one-token scratch initialized");
-    ctx.stream
-        .memcpy_htod(&[block_idx], bid_dev)
-        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA one-token bid H2D: {err}"))?;
-    ctx.stream
-        .memcpy_htod(&[row], row_dev)
-        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA one-token row H2D: {err}"))?;
-
     let pool_ptr = fp8_pool_base_ptr;
-    let (bid_ptr, _bidg) = bid_dev.device_ptr(&ctx.stream);
-    let (row_ptr, _rowg) = row_dev.device_ptr(&ctx.stream);
+    let (bid_ptr, bidg) = bid_dev.device_ptr_mut(&ctx.stream);
+    let (row_ptr, rowg) = row_dev.device_ptr_mut(&ctx.stream);
+    cuda_kernels::attention::dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_raw(
+        ctx,
+        bid_ptr,
+        row_ptr,
+        start_pos_ptr,
+        sliding_window,
+        DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE,
+    )?;
+    drop(bidg);
+    drop(rowg);
 
     let nope_ptr_u64 = k_prepared_ptr;
     let rope_ptr_u64 =
