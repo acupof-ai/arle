@@ -117,6 +117,13 @@ fn resolve_invocation(args: &Args, serve_args: &ServeArgs) -> Result<ServeInvoca
         argv.push("false".to_string());
     }
 
+    if backend == ServeBackend::Cuda
+        && let Some(max_bs) = args.cuda_graph_max_bs
+    {
+        argv.push("--cuda-graph-max-bs".to_string());
+        argv.push(max_bs.to_string());
+    }
+
     if let Some(url) = serve_args.train_control_url.as_deref() {
         argv.push("--train-control-url".to_string());
         argv.push(url.to_string());
@@ -249,6 +256,31 @@ mod tests {
                 .argv
                 .windows(2)
                 .any(|item| item[0] == "--cuda-graph" && item[1] == "false")
+        );
+    }
+
+    #[test]
+    fn cuda_serve_forwards_cuda_graph_max_bs() {
+        let mut args = Args::parse_from([
+            "arle",
+            "--cuda-graph-max-bs",
+            "16",
+            "serve",
+            "--backend",
+            "cuda",
+            "--model-path",
+            "model",
+        ]);
+        let serve = match args.command.take().expect("serve command") {
+            crate::args::CliCommand::Serve(serve) => *serve,
+            _ => panic!("expected serve"),
+        };
+        let invocation = resolve_invocation(&args, &serve).expect("resolve");
+        assert!(
+            invocation
+                .argv
+                .windows(2)
+                .any(|item| item[0] == "--cuda-graph-max-bs" && item[1] == "16")
         );
     }
 

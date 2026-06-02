@@ -554,12 +554,14 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
          max_num_batched_tokens={} | 16384, \
          chunked_prefill_size={} | {}, \
          max_prefill_tokens={} | 16384, \
+         cuda_graph_max_bs={} | operator-set, \
          mem_fraction_static={:.2} | 0.85, \
          max_slots={} | (n/a — SGLang has no fixed cap)",
         scheduler.max_num_batched_tokens,
         scheduler.chunked_prefill_size,
         sglang_chunk,
         scheduler.max_prefill_tokens,
+        scheduler.cuda_graph_max_bs,
         scheduler.mem_fraction_static,
         scheduler.max_slots,
     );

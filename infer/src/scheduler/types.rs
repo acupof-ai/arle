@@ -311,6 +311,13 @@ pub struct SchedulerConfig {
     /// Stream chunking interval in generated tokens. 1 matches SGLang's
     /// default and flushes every token.
     pub stream_interval: usize,
+    /// Maximum decode batch size to pre-capture for CUDA Graph replay.
+    ///
+    /// This mirrors SGLang's `--cuda-graph-max-bs`: graph-capable models
+    /// capture dense batch sizes up to this cap during startup warmup. Larger
+    /// runtime batches still execute eagerly instead of triggering unbounded
+    /// graph cache growth.
+    pub cuda_graph_max_bs: usize,
     /// Enable Phase 2 speculative decode. Defaults off; P2.3 only routes the
     /// single-token verifier canary. K-token speculation requires the model-side
     /// verifier API and paged-KV rollback path.
@@ -415,6 +422,7 @@ impl Default for SchedulerConfig {
             schedule_policy: SchedulePolicy::Fcfs,
             mixed_policy: SchedulerMixedPolicy::Mixed,
             stream_interval: 1,
+            cuda_graph_max_bs: 256,
             spec_enabled: false,
             spec_draft_k: 5,
             spec_acceptance_threshold: 0.6,
@@ -609,6 +617,9 @@ impl SchedulerConfig {
         }
         if self.stream_interval == 0 {
             anyhow::bail!("stream_interval must be ≥ 1");
+        }
+        if self.cuda_graph_max_bs == 0 {
+            anyhow::bail!("cuda_graph_max_bs must be ≥ 1");
         }
         if self.spec_draft_k == 0 {
             anyhow::bail!("spec_draft_k must be ≥ 1");
@@ -1323,6 +1334,7 @@ mod tests {
         assert_eq!(cfg.admission_policy, SchedulerAdmissionPolicy::QueueBound);
         assert_eq!(cfg.cold_headroom, None);
         assert_eq!(cfg.mixed_policy, SchedulerMixedPolicy::Mixed);
+        assert_eq!(cfg.cuda_graph_max_bs, 256);
         assert!(!cfg.spec_enabled);
         assert_eq!(cfg.spec_draft_k, 5);
         assert_eq!(cfg.spec_acceptance_threshold, 0.6);
@@ -1747,6 +1759,13 @@ mod tests {
     fn scheduler_config_rejects_zero_stream_interval() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.stream_interval = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_zero_cuda_graph_max_bs() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.cuda_graph_max_bs = 0;
         assert!(cfg.validate().is_err());
     }
 
