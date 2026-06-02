@@ -259,6 +259,10 @@ struct Run {
     mtp_block_size: Option<usize>,
     mtp_avg_accepted_inputs: Option<f64>,
     mtp_acceptance_rate: Option<f64>,
+    mtp_adaptive_disable_events: Option<usize>,
+    mtp_adaptive_fallback_steps: Option<usize>,
+    mtp_final_zero_accept_streak: Option<usize>,
+    mtp_cooldown_remaining_steps: Option<usize>,
     token_ids: Vec<u32>,
 }
 
@@ -607,6 +611,10 @@ fn run_bench() -> Result<()> {
                 mtp_block_size: None,
                 mtp_avg_accepted_inputs: None,
                 mtp_acceptance_rate: None,
+                mtp_adaptive_disable_events: None,
+                mtp_adaptive_fallback_steps: None,
+                mtp_final_zero_accept_streak: None,
+                mtp_cooldown_remaining_steps: None,
                 token_ids: Vec::new(),
             }
         };
@@ -649,11 +657,13 @@ fn run_bench() -> Result<()> {
                     run.mtp_acceptance_rate,
                 ) {
                     eprintln!(
-                        "    [mtp] blocks={} block_size={} avg_inputs/block={:.2} acceptance={:.1}%",
+                        "    [mtp] blocks={} block_size={} avg_inputs/block={:.2} acceptance={:.1}% adaptive_disable={} fallback_steps={}",
                         blocks,
                         block_size,
                         avg_inputs,
                         acceptance_rate * 100.0,
+                        run.mtp_adaptive_disable_events.unwrap_or(0),
+                        run.mtp_adaptive_fallback_steps.unwrap_or(0),
                     );
                 }
             }
@@ -724,6 +734,22 @@ fn run_bench() -> Result<()> {
     };
     let mtp_block_size = runs.iter().find_map(|r| r.mtp_block_size);
     let mtp_blocks = runs.iter().find_map(|r| r.mtp_block_count);
+    let mtp_adaptive_disable_events: usize = runs
+        .iter()
+        .filter_map(|r| r.mtp_adaptive_disable_events)
+        .sum();
+    let mtp_adaptive_fallback_steps: usize = runs
+        .iter()
+        .filter_map(|r| r.mtp_adaptive_fallback_steps)
+        .sum();
+    let mtp_final_zero_accept_streak = runs
+        .iter()
+        .filter_map(|r| r.mtp_final_zero_accept_streak)
+        .max();
+    let mtp_cooldown_remaining_steps = runs
+        .iter()
+        .filter_map(|r| r.mtp_cooldown_remaining_steps)
+        .max();
 
     let avg_tokens = runs.iter().map(|r| r.tokens).sum::<usize>() / runs.len().max(1);
     let prompt_tokens = runs.first().map_or(0, |r| r.prompt_tokens);
@@ -782,6 +808,10 @@ fn run_bench() -> Result<()> {
                 "block_size": block_size,
                 "avg_accepted_inputs": avg_inputs,
                 "acceptance_rate": acceptance_rate,
+                "adaptive_disable_events": mtp_adaptive_disable_events,
+                "adaptive_fallback_steps": mtp_adaptive_fallback_steps,
+                "final_zero_accept_streak": mtp_final_zero_accept_streak.unwrap_or(0),
+                "cooldown_remaining_steps": mtp_cooldown_remaining_steps.unwrap_or(0),
             });
         }
         println!("{payload}");
@@ -816,8 +846,10 @@ fn run_bench() -> Result<()> {
                 mean_mtp_acceptance,
             ) {
                 println!(
-                    "  [mtp] blocks={blocks}  block_size={block_size}  avg_inputs/block={avg_inputs:.2}  acceptance={:.1}%",
+                    "  [mtp] blocks={blocks}  block_size={block_size}  avg_inputs/block={avg_inputs:.2}  acceptance={:.1}%  adaptive_disable={}  fallback_steps={}",
                     acceptance_rate * 100.0,
+                    mtp_adaptive_disable_events,
+                    mtp_adaptive_fallback_steps,
                 );
             }
         } else {
@@ -1043,17 +1075,29 @@ fn run_step_driver_once(
         } else {
             (None, None, None, None)
         };
-    let (mtp_block_count, mtp_block_size, mtp_avg_accepted_inputs, mtp_acceptance_rate) =
-        if let Some(metrics) = request_state.mtp_metrics() {
-            (
-                Some(metrics.block_count),
-                Some(metrics.block_size),
-                Some(metrics.avg_accepted_inputs),
-                Some(metrics.acceptance_rate),
-            )
-        } else {
-            (None, None, None, None)
-        };
+    let (
+        mtp_block_count,
+        mtp_block_size,
+        mtp_avg_accepted_inputs,
+        mtp_acceptance_rate,
+        mtp_adaptive_disable_events,
+        mtp_adaptive_fallback_steps,
+        mtp_final_zero_accept_streak,
+        mtp_cooldown_remaining_steps,
+    ) = if let Some(metrics) = request_state.mtp_metrics() {
+        (
+            Some(metrics.block_count),
+            Some(metrics.block_size),
+            Some(metrics.avg_accepted_inputs),
+            Some(metrics.acceptance_rate),
+            Some(metrics.adaptive_disable_events),
+            Some(metrics.adaptive_fallback_steps),
+            Some(metrics.final_zero_accept_streak),
+            Some(metrics.cooldown_remaining_steps),
+        )
+    } else {
+        (None, None, None, None, None, None, None, None)
+    };
 
     Ok(Run {
         total_time_ms,
@@ -1072,6 +1116,10 @@ fn run_step_driver_once(
         mtp_block_size,
         mtp_avg_accepted_inputs,
         mtp_acceptance_rate,
+        mtp_adaptive_disable_events,
+        mtp_adaptive_fallback_steps,
+        mtp_final_zero_accept_streak,
+        mtp_cooldown_remaining_steps,
         token_ids,
     })
 }
@@ -1197,6 +1245,10 @@ fn run_mtp_parity(cli: &Cli) -> Result<()> {
                 "block_size": mtp.mtp_block_size,
                 "avg_accepted_inputs": mtp.mtp_avg_accepted_inputs,
                 "acceptance_rate": mtp.mtp_acceptance_rate,
+                "adaptive_disable_events": mtp.mtp_adaptive_disable_events,
+                "adaptive_fallback_steps": mtp.mtp_adaptive_fallback_steps,
+                "final_zero_accept_streak": mtp.mtp_final_zero_accept_streak,
+                "cooldown_remaining_steps": mtp.mtp_cooldown_remaining_steps,
             }
         });
         println!("{payload}");
@@ -1238,8 +1290,10 @@ fn run_mtp_parity(cli: &Cli) -> Result<()> {
             mtp.mtp_acceptance_rate,
         ) {
             println!(
-                "  [mtp] blocks={blocks} block_size={block_size} avg_inputs/block={avg_inputs:.2} acceptance={:.1}%",
+                "  [mtp] blocks={blocks} block_size={block_size} avg_inputs/block={avg_inputs:.2} acceptance={:.1}% adaptive_disable={} fallback_steps={}",
                 acceptance_rate * 100.0,
+                mtp.mtp_adaptive_disable_events.unwrap_or(0),
+                mtp.mtp_adaptive_fallback_steps.unwrap_or(0),
             );
         }
     }

@@ -250,7 +250,8 @@ prompt template drift, or known benchmark artifact.
 Status: partial landed on 2026-06-02. Server metrics and `metal_bench`
 now expose MTP block/acceptance/scalar-fallback counters. Tokenizer-manager
 style per-request surfaced metadata is still deferred behind the parity
-harness.
+harness. `metal_bench` also reports MTP adaptive-disable and fallback-step
+counters after the adaptive fallback landed.
 
 Expose Metal MTP counters in server stats and bench output:
 
@@ -262,9 +263,25 @@ Expose Metal MTP counters in server stats and bench output:
 - suffix accept rate;
 - average accept length;
 - scalar fallback count for MTP rows.
+- adaptive disable events and fallback token steps.
 
 PASS: every benchmark artifact can explain a speedup or regression from both
 latency and acceptance.
+
+### P2.5 - Adaptive fallback for low acceptance
+
+Status: landed on 2026-06-02.
+
+Each MTP request now tracks consecutive zero-suffix accepts
+(`accepted_inputs == 1`). When the streak reaches
+`ARLE_METAL_MTP_ZERO_ACCEPT_LIMIT` (default `4`), the request pauses MTP for
+`ARLE_METAL_MTP_COOLDOWN_TOKENS` output steps (default `16`) and uses standard
+target decode with MTP seed-hidden capture. `ARLE_METAL_MTP_ADAPTIVE=0`
+disables this policy.
+
+This is a stability guard, not a speedup claim. It prevents pathological MTP
+prompts from paying draft+verify cost indefinitely while preserving exact target
+decode correctness.
 
 ### P3 - Packed target verify for MTP rows
 

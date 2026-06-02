@@ -55,6 +55,60 @@ pub struct MtpRequestMetrics {
     pub block_size: usize,
     pub avg_accepted_inputs: f64,
     pub acceptance_rate: f64,
+    pub adaptive_disable_events: usize,
+    pub adaptive_fallback_steps: usize,
+    pub final_zero_accept_streak: usize,
+    pub cooldown_remaining_steps: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MtpAdaptivePolicy {
+    zero_accept_limit: usize,
+    cooldown_tokens: usize,
+}
+
+impl MtpAdaptivePolicy {
+    const DEFAULT_ZERO_ACCEPT_LIMIT: usize = 4;
+    const DEFAULT_COOLDOWN_TOKENS: usize = 16;
+
+    fn from_env() -> Self {
+        if env_flag_disabled("ARLE_METAL_MTP_ADAPTIVE") {
+            return Self {
+                zero_accept_limit: 0,
+                cooldown_tokens: 0,
+            };
+        }
+        Self {
+            zero_accept_limit: env_usize(
+                "ARLE_METAL_MTP_ZERO_ACCEPT_LIMIT",
+                Self::DEFAULT_ZERO_ACCEPT_LIMIT,
+            ),
+            cooldown_tokens: env_usize(
+                "ARLE_METAL_MTP_COOLDOWN_TOKENS",
+                Self::DEFAULT_COOLDOWN_TOKENS,
+            ),
+        }
+    }
+
+    const fn enabled(self) -> bool {
+        self.zero_accept_limit > 0 && self.cooldown_tokens > 0
+    }
+}
+
+fn env_flag_disabled(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 fn acceptance_summary(block_count: usize, acceptance_lengths: &[usize]) -> (f64, f64) {
@@ -1695,14 +1749,26 @@ impl<'a> MetalRequestState<'a> {
     /// Metal MTP aggregate acceptance metrics for this request.
     /// Returns `None` if MTP is disabled or no speculative block executed.
     pub fn mtp_metrics(&self) -> Option<MtpRequestMetrics> {
-        let (block_count, acceptance_lengths, block_size) = self.mtp_block_stats()?;
+        let MetalRequestStateInner::Qwen35(state) = &self.inner else {
+            return None;
+        };
+        let mtp = state.driver.mtp.as_ref()?;
+        let block_count = mtp.acceptance_lengths.len();
+        if block_count == 0 {
+            return None;
+        }
+        let block_size = mtp.runtime.block_size();
         let (avg_accepted_inputs, acceptance_rate) =
-            mtp_acceptance_summary(block_count, acceptance_lengths, block_size);
+            mtp_acceptance_summary(block_count, &mtp.acceptance_lengths, block_size);
         Some(MtpRequestMetrics {
             block_count,
             block_size,
             avg_accepted_inputs,
             acceptance_rate,
+            adaptive_disable_events: mtp.adaptive_disable_events,
+            adaptive_fallback_steps: mtp.adaptive_fallback_steps,
+            final_zero_accept_streak: mtp.consecutive_zero_accepts,
+            cooldown_remaining_steps: mtp.fallback_steps_remaining,
         })
     }
 
@@ -4426,6 +4492,44 @@ struct Qwen35MtpState {
     seed_hidden: Option<MlxArray>,
     token_buffer: VecDeque<u32>,
     acceptance_lengths: Vec<usize>,
+    adaptive_policy: MtpAdaptivePolicy,
+    consecutive_zero_accepts: usize,
+    fallback_steps_remaining: usize,
+    adaptive_disable_events: usize,
+    adaptive_fallback_steps: usize,
+}
+
+impl Qwen35MtpState {
+    fn take_adaptive_fallback_step(&mut self) -> bool {
+        if !self.adaptive_policy.enabled() || self.fallback_steps_remaining == 0 {
+            return false;
+        }
+        self.fallback_steps_remaining -= 1;
+        self.adaptive_fallback_steps += 1;
+        true
+    }
+
+    fn observe_accepted_inputs(&mut self, accepted_inputs: usize) {
+        if !self.adaptive_policy.enabled() {
+            return;
+        }
+        if accepted_inputs > 1 {
+            self.consecutive_zero_accepts = 0;
+            return;
+        }
+        self.consecutive_zero_accepts += 1;
+        if self.consecutive_zero_accepts >= self.adaptive_policy.zero_accept_limit {
+            self.adaptive_disable_events += 1;
+            self.fallback_steps_remaining = self.adaptive_policy.cooldown_tokens;
+            log::info!(
+                "qwen35_mtp adaptive fallback: zero_accept_streak={} cooldown_tokens={} disable_events={}",
+                self.consecutive_zero_accepts,
+                self.adaptive_policy.cooldown_tokens,
+                self.adaptive_disable_events,
+            );
+            self.consecutive_zero_accepts = 0;
+        }
+    }
 }
 
 struct Qwen35CppState {
@@ -4616,6 +4720,11 @@ impl<'a> Qwen35StepDriver<'a> {
                 seed_hidden: None,
                 token_buffer: VecDeque::new(),
                 acceptance_lengths: Vec::new(),
+                adaptive_policy: MtpAdaptivePolicy::from_env(),
+                consecutive_zero_accepts: 0,
+                fallback_steps_remaining: 0,
+                adaptive_disable_events: 0,
+                adaptive_fallback_steps: 0,
             })
         } else {
             None
@@ -5523,6 +5632,13 @@ impl StepDriver for Qwen35StepDriver<'_> {
 
         // ── Frozen-KV MTP speculative path (Qwen3.6/Qwen3.5-MoE) ───────────
         if self.mtp.is_some() {
+            let adaptive_fallback = self
+                .mtp
+                .as_mut()
+                .is_some_and(Qwen35MtpState::take_adaptive_fallback_step);
+            if adaptive_fallback {
+                return self.run_standard_decode_with_mtp_seed_capture(token);
+            }
             let Some(seed_hidden) = self.mtp.as_mut().and_then(|mtp| mtp.seed_hidden.take()) else {
                 log::warn!("Qwen3.6 MTP seed hidden missing; running one standard target step");
                 return self.run_standard_decode_with_mtp_seed_capture(token);
@@ -5556,6 +5672,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 )?;
 
                 mtp_state.acceptance_lengths.push(block.accepted_inputs);
+                mtp_state.observe_accepted_inputs(block.accepted_inputs);
                 mtp_state.seed_hidden = Some(block.updated_seed_hidden);
                 for &t in &block.accepted_tokens {
                     mtp_state.token_buffer.push_back(t);
@@ -5652,11 +5769,13 @@ impl StepDriver for Qwen35StepDriver<'_> {
             let avg = total as f64 / blocks as f64;
             let drafted = mtp.runtime.block_size().saturating_sub(1).max(1);
             log::info!(
-                "qwen35_mtp metrics: blocks={} block_size={} avg_accepted_inputs={:.2} acceptance_rate={:.3}",
+                "qwen35_mtp metrics: blocks={} block_size={} avg_accepted_inputs={:.2} acceptance_rate={:.3} adaptive_disable_events={} adaptive_fallback_steps={}",
                 blocks,
                 mtp.runtime.block_size(),
                 avg,
                 matched_total as f64 / (blocks * drafted) as f64,
+                mtp.adaptive_disable_events,
+                mtp.adaptive_fallback_steps,
             );
         }
         self.ensure_cpp_session_drained()
