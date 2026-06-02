@@ -1502,6 +1502,43 @@ fn emit_prebuilt_deepep_sidecar(path: &Path) {
     );
 }
 
+const PREBUILT_REQUIRED_DSV4_SYMBOLS: &[&str] = &[
+    "dsv4_deepgemm_native_preflight_cuda",
+    "arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda",
+    "arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda",
+    "arle_dsv4_output_inverse_rope_cuda",
+    "dsv4_update_window_cache_start_pos_ptr_cuda",
+];
+
+fn validate_prebuilt_cuda_archive_symbols(archive: &Path) {
+    let output = Command::new("nm")
+        .arg("-g")
+        .arg(archive)
+        .output()
+        .unwrap_or_else(|err| panic!("Failed to run nm for {}: {err}", archive.display()));
+    if !output.status.success() {
+        panic!(
+            "Failed to inspect prebuilt CUDA archive {} with nm: {}",
+            archive.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let symbols = String::from_utf8_lossy(&output.stdout);
+    let missing = PREBUILT_REQUIRED_DSV4_SYMBOLS
+        .iter()
+        .copied()
+        .filter(|symbol| !symbols.contains(symbol))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        panic!(
+            "ARLE_CUDA_KERNELS_PREBUILT_DIR archive {} is missing required DSv4 symbols: {}. \
+             Rebuild the CUDA prebuilt artifacts instead of linking a stale archive.",
+            archive.display(),
+            missing.join(", ")
+        );
+    }
+}
+
 fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
     println!("cargo:rerun-if-changed=build.rs");
     let required = ["libkernels_cuda.a", "libtilelang_kernels_aot.a"];
@@ -1515,6 +1552,7 @@ fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
         }
         println!("cargo:rerun-if-changed={}", path.display());
     }
+    validate_prebuilt_cuda_archive_symbols(&prebuilt_dir.join("libkernels_cuda.a"));
     println!("cargo:rustc-link-search=native={}", prebuilt_dir.display());
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=static=tilelang_kernels_aot");
