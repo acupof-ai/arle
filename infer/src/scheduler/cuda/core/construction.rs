@@ -102,30 +102,30 @@ impl<M: ModelForward> Scheduler<M> {
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
         let effective_prefill_token_budget = config.max_prefill_tokens;
         let effective_mixed_prefill_token_budget = config.mixed_prefill_workspace_token_budget();
+        let internal_mtp_draft_requested = config.spec_enabled
+            && matches!(
+                config.spec_draft_model,
+                crate::scheduler::DraftMode::InternalMtp
+            );
+
+        info!(
+            "Speculative decode config: enabled={} draft_model={:?} draft_k={} acceptance_threshold={:.3}",
+            config.spec_enabled,
+            config.spec_draft_model,
+            config.spec_draft_k,
+            config.spec_acceptance_threshold,
+        );
 
         model.validate_scheduler_contract(
             kv_cache_dtype,
             kv_pool_format,
             config.cuda_graph_max_bs,
         )?;
-        if config.spec_enabled
-            && matches!(
-                config.spec_draft_model,
-                crate::scheduler::DraftMode::InternalMtp
-            )
-        {
+        if internal_mtp_draft_requested {
             model.validate_internal_mtp_draft_support()?;
             info!(
                 "Speculative decode internal MTP/EAGLE enabled: draft_k={} acceptance_threshold={:.3}",
                 config.spec_draft_k, config.spec_acceptance_threshold,
-            );
-        } else {
-            info!(
-                "Speculative decode config: enabled={} draft_model={:?} draft_k={} acceptance_threshold={:.3}",
-                config.spec_enabled,
-                config.spec_draft_model,
-                config.spec_draft_k,
-                config.spec_acceptance_threshold,
             );
         }
 
