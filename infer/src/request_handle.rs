@@ -6,6 +6,7 @@ use std::fmt;
 use crate::scheduler::{
     DistributedRequestCoordination, DistributedTokenCoordinator, IncomingRequest, SchedulerHandle,
 };
+pub use crate::scheduler::{DistributedRequestOwnership, DistributedRequestShard};
 use crate::server_engine::CompletionStreamDelta;
 
 /// Error returned when a request cannot be submitted to a runtime handle.
@@ -80,26 +81,6 @@ impl RequestHandle for SchedulerHandle {
 pub struct NumaSchedulerWorker {
     pub handle: SchedulerHandle,
     pub placement: crate::runtime_topology::WorkerPlacement,
-}
-
-/// Data ownership contract used by a multi-rank request group.
-///
-/// SGLang's fast DSv4 path requires token-owned DP/EP shards. ARLE's current
-/// multiproc and in-process DSv4 group still broadcasts the full logical
-/// request to every rank, so make that fallback contract explicit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DistributedRequestOwnership {
-    ReplicatedToken,
-    TokenOwnedDpEp,
-}
-
-impl DistributedRequestOwnership {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ReplicatedToken => "replicated-token",
-            Self::TokenOwnedDpEp => "token-owned-dp-ep",
-        }
-    }
 }
 
 pub struct NumaSchedulerRouter {
@@ -334,6 +315,7 @@ impl DistributedSchedulerGroup {
         req: &IncomingRequest,
         delta_tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
         distributed: DistributedRequestCoordination,
+        distributed_shard: DistributedRequestShard,
     ) -> IncomingRequest {
         IncomingRequest {
             prompt: req.prompt.clone(),
@@ -348,6 +330,7 @@ impl DistributedSchedulerGroup {
             delta_tx,
             trace_context: req.trace_context,
             distributed: Some(distributed),
+            distributed_shard,
             cancel: req.cancel.clone(),
         }
     }
@@ -408,6 +391,7 @@ impl DistributedSchedulerGroup {
     pub fn incoming_request_from_wire(
         wire: crate::multiproc_relay::WireRequest,
         delta_tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
+        distributed_shard: DistributedRequestShard,
     ) -> IncomingRequest {
         use crate::sampler::SamplingParams;
         use crate::scheduler::RequestPriority;
@@ -441,7 +425,8 @@ impl DistributedSchedulerGroup {
             delta_tx,
             trace_context: None,
             distributed: None, // scheduler attaches NCCL-backed coord on ingest
-            cancel: None,      // cancel flag does not cross the relay wire
+            distributed_shard,
+            cancel: None, // cancel flag does not cross the relay wire
         }
     }
 
@@ -558,6 +543,8 @@ impl RequestHandle for DistributedSchedulerGroup {
             // model's ep_nccl, exposed via SchedulerHandle::ep_nccl
             // (populated by spawn_scheduler_handle_from_path in C.4.6.2).
             let mut rank0_req = req;
+            rank0_req.distributed_shard =
+                DistributedRequestShard::replicated_token(0, self.effective_world_size);
             #[cfg(feature = "nccl")]
             {
                 if let Some(nccl) = self.workers[0].handle.ep_nccl() {
@@ -588,6 +575,8 @@ impl RequestHandle for DistributedSchedulerGroup {
             DistributedTokenCoordinator::new(self.workers.len()).map_err(|_| SubmitError)?;
         let mut requests = Vec::with_capacity(self.workers.len());
         let mut rank0_req = req;
+        rank0_req.distributed_shard =
+            DistributedRequestShard::replicated_token(0, self.workers.len());
         rank0_req.distributed = Some(
             DistributedRequestCoordination::new(0, Arc::clone(&coordinator))
                 .map_err(|_| SubmitError)?,
@@ -597,7 +586,8 @@ impl RequestHandle for DistributedSchedulerGroup {
             let (sink_tx, sink_rx) = tokio::sync::mpsc::unbounded_channel();
             let distributed = DistributedRequestCoordination::new(rank, Arc::clone(&coordinator))
                 .map_err(|_| SubmitError)?;
-            let rank_req = Self::clone_request_for_rank(&requests[0], sink_tx, distributed);
+            let shard = DistributedRequestShard::replicated_token(rank, self.workers.len());
+            let rank_req = Self::clone_request_for_rank(&requests[0], sink_tx, distributed, shard);
             Self::spawn_rank_delta_drain(sink_rx);
             requests.push(rank_req);
         }
@@ -670,6 +660,7 @@ mod tests {
             delta_tx,
             trace_context: None,
             distributed: None,
+            distributed_shard: DistributedRequestShard::single_rank(),
             cancel: None,
         }
     }
@@ -875,6 +866,38 @@ mod tests {
         );
         assert!(group.submit(test_request(None, Some(0))).is_err());
         assert!(rx0.try_recv().is_err());
+    }
+
+    #[test]
+    fn distributed_group_marks_replicated_rank_shards() {
+        let (tx0, mut rx0) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let worker0 = SchedulerHandle::from_parts(tx0, "model");
+        let worker1 = SchedulerHandle::from_parts(tx1, "model");
+        let group = DistributedSchedulerGroup::new(
+            vec![
+                NumaSchedulerWorker {
+                    handle: worker0,
+                    placement: placement(0, 0),
+                },
+                NumaSchedulerWorker {
+                    handle: worker1,
+                    placement: placement(1, 1),
+                },
+            ],
+            crate::metrics::ServerMetrics::new("model"),
+            DistributedRequestOwnership::ReplicatedToken,
+        );
+
+        group.submit(test_request(None, Some(0))).unwrap();
+        assert_eq!(
+            rx0.try_recv().unwrap().distributed_shard,
+            DistributedRequestShard::replicated_token(0, 2)
+        );
+        assert_eq!(
+            rx1.try_recv().unwrap().distributed_shard,
+            DistributedRequestShard::replicated_token(1, 2)
+        );
     }
 
     #[test]

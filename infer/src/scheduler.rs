@@ -40,8 +40,8 @@ pub use plan::{
     LogicalServePlan, LogicalSparseDraftView, LogicalSpecDecodeRow, LogicalStepOutput,
 };
 pub use types::{
-    DistributedRequestCoordination, DistributedTokenCoordinator, DraftMode, IncomingRequest,
-    RequestPriority, RequestSpecConfig, RuntimeEnvelopeOverrides, SchedulePolicy,
-    SchedulerAdmissionPolicy, SchedulerConfig, SchedulerFull, SchedulerHandle,
-    SchedulerMixedPolicy, pick_chunked_prefill_size_for_hbm,
+    DistributedRequestCoordination, DistributedRequestOwnership, DistributedRequestShard,
+    DistributedTokenCoordinator, DraftMode, IncomingRequest, RequestPriority, RequestSpecConfig,
+    RuntimeEnvelopeOverrides, SchedulePolicy, SchedulerAdmissionPolicy, SchedulerConfig,
+    SchedulerFull, SchedulerHandle, SchedulerMixedPolicy, pick_chunked_prefill_size_for_hbm,
 };

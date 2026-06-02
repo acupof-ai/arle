@@ -44,6 +44,7 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
                 delta_tx,
                 trace_context: req.trace_context,
                 distributed: None,
+                distributed_shard: crate::scheduler::DistributedRequestShard::single_rank(),
                 cancel,
             })
             .map_err(|err| anyhow::anyhow!("request submission failed: {err}"))?;
