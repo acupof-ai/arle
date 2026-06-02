@@ -94,6 +94,13 @@ serve on the replicated-token debug lane and still look like a performance run.
   passed. The request-handle test set now includes
   `distributed_group_marks_replicated_rank_shards`, which proves rank 0 and
   rank 1 carry distinct replicated-token shard metadata.
+- PC2 shard-contract remote gate at `c3fa510c`: the pod source was bundle-synced
+  cleanly. `RUSTUP_TOOLCHAIN=stable bash scripts/dsv4_fast_build.sh` used the
+  DSv4 prebuilt CUDA artifacts, skipped nvcc/TileLang AOT, harvested the
+  artifact cache again, and finished in 26.95 s. The remote CUDA/NCCL unit gate
+  `cargo test -p infer --lib --no-default-features --features cuda,nccl request_handle -- --nocapture`
+  passed 10/10, including both the fail-closed token-owned mode test and the
+  replicated-token rank-shard metadata test.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.
