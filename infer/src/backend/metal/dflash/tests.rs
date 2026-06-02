@@ -709,6 +709,7 @@ fn qwen35_dflash_packed_batch_b2_matches_scalar_runs() -> Result<()> {
             false, // use_kv_pool=false (DFlash disables pool anyway)
             max_new_tokens,
             dflash_tuple,
+            None,
         )
     };
 

@@ -1031,7 +1031,7 @@ fn concat_weight_rows(lhs: &WeightTensor, rhs: &WeightTensor) -> Result<WeightTe
     }
 }
 
-fn qwen35_norm_needs_offset_correction(weight: &MlxArray) -> bool {
+pub(super) fn qwen35_norm_needs_offset_correction(weight: &MlxArray) -> bool {
     let weight_f32 = as_dtype(weight, Dtype::Float32);
     super::mlx::eval(&[&weight_f32]);
     let slice = weight_f32.as_slice_f32();
@@ -1039,7 +1039,7 @@ fn qwen35_norm_needs_offset_correction(weight: &MlxArray) -> bool {
     mean_abs < 0.75
 }
 
-fn qwen35_normalize_direct_norm_weight(
+pub(super) fn qwen35_normalize_direct_norm_weight(
     weight: &MlxArray,
     needs_offset_correction: bool,
 ) -> MlxArray {
@@ -1222,6 +1222,33 @@ pub(crate) fn capture_qwen35_hidden_from_cpp_outputs(
     Ok(Some(concatenate_axis(&squeezed, 1)))
 }
 
+pub(crate) fn capture_qwen35_final_hidden_from_cpp_outputs(
+    cpp_model_raw: *mut std::ffi::c_void,
+) -> Result<Option<MlxArray>> {
+    let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model_raw) };
+    if n_cap <= 0 {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        n_cap == 1,
+        "Qwen3.5 MTP final hidden capture mismatch: expected 1, got {n_cap}"
+    );
+
+    let mut hidden_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+    let rc = unsafe { mlx_sys::qwen35_get_captured_hidden(cpp_model_raw, 0, &raw mut hidden_ptr) };
+    anyhow::ensure!(
+        rc == 0 && !hidden_ptr.is_null(),
+        "Qwen3.5 MTP failed to capture final hidden state"
+    );
+    let hidden = unsafe { MlxArray::from_raw(hidden_ptr) };
+    let shape = hidden.shape();
+    if shape.len() == 3 {
+        Ok(Some(super::mlx::reshape(&hidden, &[shape[1], shape[2]])))
+    } else {
+        Ok(Some(hidden))
+    }
+}
+
 pub(crate) fn append_qwen35_captured_hidden_chunk(
     accumulated: &mut Option<MlxArray>,
     captured_chunk: Option<MlxArray>,
@@ -1253,6 +1280,20 @@ pub(crate) fn with_qwen35_capture_layers<T>(
     let result = f();
     unsafe {
         mlx_sys::qwen35_set_capture_layers(cpp_model_raw, std::ptr::null(), 0);
+    }
+    result
+}
+
+pub(crate) fn with_qwen35_capture_final_hidden<T>(
+    cpp_model_raw: *mut std::ffi::c_void,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    unsafe {
+        mlx_sys::qwen35_set_capture_final_hidden(cpp_model_raw, true);
+    }
+    let result = f();
+    unsafe {
+        mlx_sys::qwen35_set_capture_final_hidden(cpp_model_raw, false);
     }
     result
 }
@@ -3471,7 +3512,12 @@ fn qwen35_full_attention_step(
     linear(&gated, &attn.o_proj)
 }
 
-fn rms_norm_last_dim(x: &MlxArray, weight: &MlxArray, eps: f32, offset: bool) -> MlxArray {
+pub(super) fn rms_norm_last_dim(
+    x: &MlxArray,
+    weight: &MlxArray,
+    eps: f32,
+    offset: bool,
+) -> MlxArray {
     use super::mlx::{reciprocal, sqrt, sum_axis};
 
     if !offset {
@@ -3501,7 +3547,7 @@ fn dense_mlp_forward(mlp: &MetalQwen35DenseMlpWeights, x: &MlxArray) -> MlxArray
     linear(&fused_val, &mlp.down_proj)
 }
 
-fn moe_mlp_forward(x: &MlxArray, moe: &MetalQwen35MoeWeights) -> MlxArray {
+pub(super) fn moe_mlp_forward(x: &MlxArray, moe: &MetalQwen35MoeWeights) -> MlxArray {
     let router = extract_qw(&moe.router).expect("Qwen3.6 MoE router must be quantized");
     let shared_gate =
         extract_qw(&moe.shared_gate).expect("Qwen3.6 shared expert gate_proj must be quantized");
@@ -3909,7 +3955,7 @@ pub(super) fn load_qwen35_metal_weights(
     Ok(weights)
 }
 
-fn load_qwen35_moe_layer_weights(
+pub(super) fn load_qwen35_moe_layer_weights(
     tensors: &super::TensorMap,
     layer_prefix: &str,
     moe_cfg: &super::config::MetalQwen35MoeConfig,

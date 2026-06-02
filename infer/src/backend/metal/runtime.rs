@@ -156,8 +156,17 @@ impl ActiveMetalRequest {
         } else {
             None
         };
-        let request_state =
-            backend.create_request_state_with_dflash(&prompt_tokens, &sampling, dflash_ref)?;
+        let mtp_ref = if enable_dflash {
+            unsafe { backend.mtp_runtime_static() }
+        } else {
+            None
+        };
+        let request_state = backend.create_request_state_with_specs(
+            &prompt_tokens,
+            &sampling,
+            dflash_ref,
+            mtp_ref,
+        )?;
         Ok(Self {
             delta_tx: pending.delta_tx,
             request_state,
@@ -1154,12 +1163,14 @@ impl MetalQwen35PrefixRuntime {
             log::info!(
                 "m_e10_trace prepare_request: session={:?} \
                  prompt_len={} block_size={} dflash_enabled={} \
+                 mtp_enabled={} \
                  can_import_snapshot={} entries_len={} \
                  entries_keys_len_sample={:?} prompt_head={:?}",
                 &request.session_id,
                 prompt_len,
                 self.block_size,
                 request.request_state.is_dflash_enabled(),
+                request.request_state.is_mtp_enabled(),
                 request.request_state.can_import_qwen35_prefix_snapshot(),
                 self.entries.len(),
                 self.entries
@@ -1175,6 +1186,10 @@ impl MetalQwen35PrefixRuntime {
             return Ok(());
         }
         if request.request_state.is_dflash_enabled() {
+            metrics.record_request_cache(request.session_id.as_ref(), 0, prompt_len, prompt_len);
+            return Ok(());
+        }
+        if request.request_state.is_mtp_enabled() {
             metrics.record_request_cache(request.session_id.as_ref(), 0, prompt_len, prompt_len);
             return Ok(());
         }
@@ -3106,13 +3121,19 @@ fn execute_decode_batch(
     //     retracted; the `invalidate_*` sync on the `Ok(None)` arm is the
     //     only path that propagates `packed_kv_flat`/`packed_gdr_flat`
     //     updates into per-request state.
-    // Partition into dflash_rows and plain_rows. Dispatch:
+    // Partition into speculative rows and plain rows. Dispatch:
     //   - plain_rows (≥1): existing `execute_qwen35_packed_decode_batch`.
     //   - dflash_rows (≥2): new `execute_qwen35_dflash_packed_batch`.
     //   - dflash_rows (==1): fall through to the existing per-row
     //     `execute_decode_single` path (batched-stack overhead not worth it).
+    //   - mtp_rows: scalar only for now; the draft has no persistent KV and
+    //     carries a per-row recurrent seed hidden.
     let scheduled_open_len = open.len();
-    let (dflash_requests, non_dflash): (Vec<_>, Vec<_>) = open
+    let (spec_requests, non_speculative): (Vec<_>, Vec<_>) =
+        open.into_iter().partition(|(_, request)| {
+            request.request_state.is_dflash_enabled() || request.request_state.is_mtp_enabled()
+        });
+    let (dflash_requests, mtp_requests): (Vec<_>, Vec<_>) = spec_requests
         .into_iter()
         .partition(|(_, request)| request.request_state.is_dflash_enabled());
 
@@ -3132,7 +3153,10 @@ fn execute_decode_batch(
             execute_decode_single(req_id, request, metrics, prefix_runtime, scheduler, active);
         }
     }
-    let mut open = non_dflash;
+    for (req_id, request) in mtp_requests {
+        execute_decode_single(req_id, request, metrics, prefix_runtime, scheduler, active);
+    }
+    let mut open = non_speculative;
 
     let batch_result =
         match execute_qwen35_packed_decode_batch(&mut open, active, qwen35_decode_batch_cache) {

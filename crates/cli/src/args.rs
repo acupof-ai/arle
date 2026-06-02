@@ -338,6 +338,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "PATH_OR_REPO")]
     pub(crate) mtp_draft_model: Option<String>,
 
+    /// Number of MTP draft tokens to propose per verify block on Metal.
+    #[arg(long, value_name = "N")]
+    pub(crate) mtp_draft_tokens: Option<usize>,
+
     /// Additional engine-pool model metadata to expose from the serving control plane.
     ///
     /// Format: `id=path[,type=text-generation|embedding|reranker][,aliases=a|b][,pinned=true][,memory_bytes=N][,ttl_secs=N]`.

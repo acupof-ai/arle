@@ -177,6 +177,8 @@ pub struct MetalBackend {
     #[cfg(feature = "metal")]
     mtp_draft_probe: Option<MetalMtpDraftProbe>,
     #[cfg(feature = "metal")]
+    mtp: Option<mtp::MetalMtpRuntime>,
+    #[cfg(feature = "metal")]
     kv_pool_enabled: bool,
     #[cfg(feature = "metal")]
     kv_disk_options: Option<MetalKvDiskOptions>,
@@ -230,6 +232,8 @@ impl MetalBackend {
             mtp_probe: None,
             #[cfg(feature = "metal")]
             mtp_draft_probe: None,
+            #[cfg(feature = "metal")]
+            mtp: None,
             #[cfg(feature = "metal")]
             kv_pool_enabled: self::generate::resolve_metal_kv_pool_enabled(kv_pool),
             #[cfg(feature = "metal")]
@@ -324,6 +328,16 @@ impl MetalBackend {
     }
 
     #[cfg(feature = "metal")]
+    pub(crate) unsafe fn mtp_runtime_static(
+        &self,
+    ) -> Option<(&'static mtp::MetalMtpRuntime, &'static MetalModelConfig)> {
+        let rt: &mtp::MetalMtpRuntime = self.mtp.as_ref()?;
+        let cfg: &MetalModelConfig = self.config.as_ref()?;
+        // SAFETY: same lifetime contract as `dflash_runtime_static`.
+        unsafe { Some((&*std::ptr::from_ref(rt), &*std::ptr::from_ref(cfg))) }
+    }
+
+    #[cfg(feature = "metal")]
     pub fn create_request_state(
         &self,
         input_ids: &[u32],
@@ -337,14 +351,21 @@ impl MetalBackend {
             } else {
                 None
             };
-        self.create_request_state_with_dflash(input_ids, params, dflash_runtime)
+        let mtp_runtime = if let (Some(rt), Some(cfg)) = (self.mtp.as_ref(), self.config.as_ref()) {
+            // SAFETY: the returned request state also borrows `self`, so it
+            // cannot outlive the backend-owned runtime/config these refs point to.
+            unsafe { Some((&*std::ptr::from_ref(rt), &*std::ptr::from_ref(cfg))) }
+        } else {
+            None
+        };
+        self.create_request_state_with_specs(input_ids, params, dflash_runtime, mtp_runtime)
     }
 
-    /// Like `create_request_state` but accepts an explicit DFlash runtime
+    /// Like `create_request_state` but accepts explicit speculative runtime
     /// reference with `'static` lifetime. Called from the scheduler runtime
     /// where the backend is leaked to `'static`.
     #[cfg(feature = "metal")]
-    pub(crate) fn create_request_state_with_dflash(
+    pub(crate) fn create_request_state_with_specs(
         &self,
         input_ids: &[u32],
         params: &SamplingParams,
@@ -352,6 +373,7 @@ impl MetalBackend {
             &'static dflash::MetalDflashRuntime,
             &'static MetalModelConfig,
         )>,
+        mtp_runtime: Option<(&'static mtp::MetalMtpRuntime, &'static MetalModelConfig)>,
     ) -> Result<request_state::MetalRequestState<'_>> {
         let config = self.config.as_ref().context("model not loaded")?;
         let weights = self.weights.as_ref().context("weights not loaded")?;
@@ -364,6 +386,7 @@ impl MetalBackend {
             self.kv_pool_enabled,
             max_new_tokens,
             dflash_runtime,
+            mtp_runtime,
         )
     }
 
@@ -656,8 +679,8 @@ fn log_mtp_probe_result(options: &MetalMtpOptions, probe: &MetalMtpProbe) {
 
 #[cfg(feature = "metal")]
 fn log_mtp_draft_probe_result(probe: &MetalMtpDraftProbe) {
-    log::warn!(
-        "Metal MTP external draft model resolved: requested={} path={} model_type={} block_size={} tensors={} [{}], but native MTP draft/verify is not implemented yet; using standard Metal decode",
+    log::info!(
+        "Metal MTP external draft model resolved: requested={} path={} model_type={} block_size={} tensors={} [{}]",
         probe.requested_model,
         probe.resolved_path.display(),
         probe.model_type,
@@ -762,11 +785,7 @@ impl InferenceBackend for MetalBackend {
         };
         #[cfg(feature = "metal")]
         if let Some(options) = &self.mtp_options {
-            if let Some(draft_model) = options.draft_model.as_deref() {
-                let draft_probe = mtp::resolve_mtp_draft_model(draft_model)?;
-                log_mtp_draft_probe_result(&draft_probe);
-                self.mtp_draft_probe = Some(draft_probe);
-            } else {
+            if options.draft_model.is_none() {
                 let probe = mtp::probe_mtp_tensors(source.model_root(), gguf)?;
                 log_mtp_probe_result(options, &probe);
                 self.mtp_probe = Some(probe);
@@ -855,6 +874,26 @@ impl InferenceBackend for MetalBackend {
             } else {
                 None
             };
+
+            let mtp_options = self.mtp_options.clone();
+            self.mtp = None;
+            if let Some(options) = mtp_options.as_ref()
+                && let Some(draft_model) = options.draft_model.as_deref()
+            {
+                let (runtime, draft_probe) =
+                    mtp::load_mtp_runtime(draft_model, options.draft_tokens, &config)?;
+                log_mtp_draft_probe_result(&draft_probe);
+                log::info!(
+                    "Metal MTP runtime loaded: draft_model={} path={} block_size={} quant={}bit/g{}",
+                    runtime.draft_model_id(),
+                    runtime.resolved_path().display(),
+                    runtime.block_size(),
+                    runtime.quantization().bits,
+                    runtime.quantization().group_size,
+                );
+                self.mtp_draft_probe = Some(draft_probe);
+                self.mtp = Some(runtime);
+            }
         }
         #[cfg(not(feature = "metal"))]
         {

@@ -611,6 +611,7 @@ struct Qwen35CompiledModel {
         bool keep_intermediates = false;
         bool record_tapes = false;
         const std::vector<int>* capture_layer_ids = nullptr;
+        bool capture_final_hidden = false;
     };
 
     struct ForwardArtifacts {
@@ -693,6 +694,10 @@ struct Qwen35CompiledModel {
     // When non-empty, forward() captures hidden states after the listed layers
     // and appends them to the output vector (after logits + caches + gdr states).
     std::vector<int> capture_layer_ids;
+    // Capture the post-final-RMSNorm hidden state emitted to lm_head. This is
+    // separate from DFlash's layer captures; Qwen3.5 MTP uses this width-H state
+    // as its recurrent seed.
+    bool capture_final_hidden = false;
     // Per-GDR-layer tape recordings: (innovation_tape, k, g, qkv).
     // Populated during forward() when tape_mode=true, cleared at start of each step.
     mutable std::vector<GdrTapeEntry> gdr_tapes;
@@ -1269,8 +1274,10 @@ struct Qwen35CompiledModel {
         std::vector<array> new_gdr_states(G, array(0));
         std::vector<array> new_conv_states(G, array(0));
         std::vector<array> captured_hidden;
-        if (ctx.capture_layer_ids && !ctx.capture_layer_ids->empty()) {
-            captured_hidden.reserve(ctx.capture_layer_ids->size());
+        if ((ctx.capture_layer_ids && !ctx.capture_layer_ids->empty()) || ctx.capture_final_hidden) {
+            captured_hidden.reserve(
+                (ctx.capture_layer_ids ? ctx.capture_layer_ids->size() : 0)
+                + (ctx.capture_final_hidden ? 1 : 0));
         }
         int full_idx = 0, gdr_idx = 0;
 
@@ -1342,6 +1349,9 @@ struct Qwen35CompiledModel {
 
         // Final norm + lm_head
         auto final_x = fast::rms_norm(x, final_norm_w, rms_eps);
+        if (ctx.capture_final_hidden) {
+            captured_hidden.push_back(final_x);
+        }
         if (ctx.last_logits_only && ctx.seq_len > 1) {
             final_x = slice(
                 final_x,
@@ -1384,6 +1394,7 @@ struct Qwen35CompiledModel {
         ctx.keep_intermediates = keep_step_intermediates(current_seq_len);
         ctx.record_tapes = tape_mode;
         ctx.capture_layer_ids = &capture_layer_ids;
+        ctx.capture_final_hidden = capture_final_hidden;
 
         ForwardArtifacts artifacts;
         if (ctx.keep_intermediates) {
@@ -3554,6 +3565,11 @@ void qwen35_set_capture_layers(void* model, const int32_t* layer_ids, int32_t co
     if (layer_ids && count > 0) {
         m->capture_layer_ids.assign(layer_ids, layer_ids + count);
     }
+}
+
+void qwen35_set_capture_final_hidden(void* model, bool enabled) {
+    auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
+    m->capture_final_hidden = enabled;
 }
 
 int32_t qwen35_get_captured_hidden_count(void* model) {

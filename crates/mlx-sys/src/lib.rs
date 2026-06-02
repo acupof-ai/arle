@@ -1078,6 +1078,7 @@ unsafe extern "C" {
         layer_ids: *const i32,
         count: i32,
     );
+    pub fn qwen35_set_capture_final_hidden(model: *mut std::ffi::c_void, enabled: bool);
     pub fn qwen35_get_captured_hidden_count(model: *mut std::ffi::c_void) -> i32;
     pub fn qwen35_get_captured_hidden(
         model: *mut std::ffi::c_void,
