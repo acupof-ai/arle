@@ -22,9 +22,13 @@ and `model_type`.
 - `cargo fmt --check`
 - `cargo check -p infer --no-default-features --features no-cuda`
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
+- Remote pod worktree `/tmp/arle-dsv4-flashmla-meta-df1102e1`, HEAD
+  `df1102e1e350cf3c54b3a0a1d7d98fd45b94028e`.
+- Remote `git diff --check -- infer/src/model/deepseek/state.rs infer/src/model/deepseek/weights.rs docs/experience/wins/2026-06-02-dsv4-flashmla-meta-cache.md`
+- Remote `cargo +stable check -p infer --no-default-features --features no-cuda --offline`
+- Remote `CUDARC_CUDA_VERSION=12080 cargo +stable check -p infer --no-default-features --features cuda,no-cuda --offline`
 
-Remote pod verification is still pending for the committed SHA. No runtime
-benchmark or TPOT claim is made from this buildability tranche.
+No runtime benchmark or TPOT claim is made from this buildability tranche.
 
 ## Pending Graph Enablement
 
