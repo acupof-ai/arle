@@ -221,6 +221,10 @@ struct Run {
     dflash_block_size: Option<usize>,
     dflash_avg_accepted_inputs: Option<f64>,
     dflash_acceptance_rate: Option<f64>,
+    mtp_block_count: Option<usize>,
+    mtp_block_size: Option<usize>,
+    mtp_avg_accepted_inputs: Option<f64>,
+    mtp_acceptance_rate: Option<f64>,
 }
 
 /// A single metric stat in a baseline file (only mean is required).
@@ -555,6 +559,10 @@ fn run_bench() -> Result<()> {
                 dflash_block_size: None,
                 dflash_avg_accepted_inputs: None,
                 dflash_acceptance_rate: None,
+                mtp_block_count: None,
+                mtp_block_size: None,
+                mtp_avg_accepted_inputs: None,
+                mtp_acceptance_rate: None,
             }
         };
 
@@ -583,6 +591,20 @@ fn run_bench() -> Result<()> {
                 ) {
                     eprintln!(
                         "    [dflash] blocks={} block_size={} avg_inputs/block={:.2} acceptance={:.1}%",
+                        blocks,
+                        block_size,
+                        avg_inputs,
+                        acceptance_rate * 100.0,
+                    );
+                }
+                if let (Some(blocks), Some(block_size), Some(avg_inputs), Some(acceptance_rate)) = (
+                    run.mtp_block_count,
+                    run.mtp_block_size,
+                    run.mtp_avg_accepted_inputs,
+                    run.mtp_acceptance_rate,
+                ) {
+                    eprintln!(
+                        "    [mtp] blocks={} block_size={} avg_inputs/block={:.2} acceptance={:.1}%",
                         blocks,
                         block_size,
                         avg_inputs,
@@ -640,6 +662,23 @@ fn run_bench() -> Result<()> {
     };
     let dflash_block_size = runs.iter().find_map(|r| r.dflash_block_size);
     let dflash_blocks = runs.iter().find_map(|r| r.dflash_block_count);
+    let mtp_acceptance: Vec<f64> = runs.iter().filter_map(|r| r.mtp_acceptance_rate).collect();
+    let mean_mtp_acceptance = if mtp_acceptance.is_empty() {
+        None
+    } else {
+        Some(mtp_acceptance.iter().sum::<f64>() / mtp_acceptance.len() as f64)
+    };
+    let mtp_avg_inputs: Vec<f64> = runs
+        .iter()
+        .filter_map(|r| r.mtp_avg_accepted_inputs)
+        .collect();
+    let mean_mtp_avg_inputs = if mtp_avg_inputs.is_empty() {
+        None
+    } else {
+        Some(mtp_avg_inputs.iter().sum::<f64>() / mtp_avg_inputs.len() as f64)
+    };
+    let mtp_block_size = runs.iter().find_map(|r| r.mtp_block_size);
+    let mtp_blocks = runs.iter().find_map(|r| r.mtp_block_count);
 
     let avg_tokens = runs.iter().map(|r| r.tokens).sum::<usize>() / runs.len().max(1);
     let prompt_tokens = runs.first().map_or(0, |r| r.prompt_tokens);
@@ -687,6 +726,19 @@ fn run_bench() -> Result<()> {
                 "acceptance_rate": acceptance_rate,
             });
         }
+        if let (Some(blocks), Some(block_size), Some(avg_inputs), Some(acceptance_rate)) = (
+            mtp_blocks,
+            mtp_block_size,
+            mean_mtp_avg_inputs,
+            mean_mtp_acceptance,
+        ) {
+            payload["mtp"] = serde_json::json!({
+                "blocks": blocks,
+                "block_size": block_size,
+                "avg_accepted_inputs": avg_inputs,
+                "acceptance_rate": acceptance_rate,
+            });
+        }
         println!("{payload}");
     } else {
         println!();
@@ -709,6 +761,17 @@ fn run_bench() -> Result<()> {
             ) {
                 println!(
                     "  [dflash] blocks={blocks}  block_size={block_size}  avg_inputs/block={avg_inputs:.2}  acceptance={:.1}%",
+                    acceptance_rate * 100.0,
+                );
+            }
+            if let (Some(blocks), Some(block_size), Some(avg_inputs), Some(acceptance_rate)) = (
+                mtp_blocks,
+                mtp_block_size,
+                mean_mtp_avg_inputs,
+                mean_mtp_acceptance,
+            ) {
+                println!(
+                    "  [mtp] blocks={blocks}  block_size={block_size}  avg_inputs/block={avg_inputs:.2}  acceptance={:.1}%",
                     acceptance_rate * 100.0,
                 );
             }
@@ -924,6 +987,17 @@ fn run_step_driver_once(
         } else {
             (None, None, None, None)
         };
+    let (mtp_block_count, mtp_block_size, mtp_avg_accepted_inputs, mtp_acceptance_rate) =
+        if let Some(metrics) = request_state.mtp_metrics() {
+            (
+                Some(metrics.block_count),
+                Some(metrics.block_size),
+                Some(metrics.avg_accepted_inputs),
+                Some(metrics.acceptance_rate),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
     Ok(Run {
         total_time_ms,
@@ -938,6 +1012,10 @@ fn run_step_driver_once(
         dflash_block_size,
         dflash_avg_accepted_inputs,
         dflash_acceptance_rate,
+        mtp_block_count,
+        mtp_block_size,
+        mtp_avg_accepted_inputs,
+        mtp_acceptance_rate,
     })
 }
 
