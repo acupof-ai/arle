@@ -1392,6 +1392,7 @@ mod tests {
         worker_thread.join().unwrap();
     }
 
+    #[cfg(not(feature = "nccl"))]
     #[test]
     fn distributed_group_token_owned_relay_routes_multi_rank_owner_group() {
         let world_size = 2;
@@ -1450,6 +1451,51 @@ mod tests {
             local_req.distributed_shard,
             DistributedRequestShard::token_owned_dp_ep(0, 2, true)
         );
+        worker_thread.join().unwrap();
+    }
+
+    #[cfg(feature = "nccl")]
+    #[test]
+    fn distributed_group_token_owned_relay_fails_closed_without_request_sync_nccl() {
+        let world_size = 2;
+        let pending = crate::multiproc_relay::RelayCoordinator::bind().unwrap();
+        let coord_addr: std::net::SocketAddr =
+            format!("127.0.0.1:{}", pending.port()).parse().unwrap();
+
+        let worker_thread = std::thread::spawn(move || {
+            let mut worker = crate::multiproc_relay::RelayWorker::connect_with_rank(
+                coord_addr,
+                std::time::Duration::from_secs(5),
+                1,
+                world_size,
+            )
+            .unwrap();
+            assert!(worker.recv().unwrap().is_none());
+        });
+
+        let coord = pending
+            .accept(world_size, std::time::Duration::from_secs(5))
+            .expect("worker connected within 5s");
+        let relay = Arc::new(Mutex::new(coord));
+        let (tx0, mut rx0) = mpsc::unbounded_channel();
+        let group = DistributedSchedulerGroup::with_relay_token_owner_groups(
+            vec![NumaSchedulerWorker {
+                handle: SchedulerHandle::from_parts(tx0, "model"),
+                placement: placement(0, 0),
+            }],
+            crate::metrics::ServerMetrics::new("model"),
+            relay,
+            world_size,
+            vec![vec![0, 1]],
+        );
+
+        assert!(
+            group
+                .submit(labeled_test_request("missing-request-sync-nccl"))
+                .is_err()
+        );
+        assert!(rx0.try_recv().is_err());
+        drop(group);
         worker_thread.join().unwrap();
     }
 
