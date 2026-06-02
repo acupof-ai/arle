@@ -34,6 +34,10 @@ serve on the replicated-token debug lane and still look like a performance run.
   request ownership contract. The current multiproc/in-process group logs and
   exposes `replicated-token`; token-owned DP/EP sharding remains a distinct
   missing feature instead of being hidden under a generic distributed name.
+- DeepGEMM is now the DSv4 runtime default expert backend, not
+  `deepgemm-auto`. Missing or incompatible DeepGEMM now fails before serving
+  unless the operator explicitly asks for `ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto`
+  or `native` as a debug fallback.
 
 ## Verification
 
@@ -42,7 +46,8 @@ serve on the replicated-token debug lane and still look like a performance run.
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
 - `cargo check -p infer --no-default-features --features no-cuda`
 - Remote DSv4 pod source was synced by bundle because pod-side GitHub HTTPS
-  fetch failed; remote HEAD verified as `17050ba4`.
+  fetch failed; remote HEAD verified through the latest PC2 source sync as
+  `bc21bfa81`.
 - Remote build: `RUSTUP_TOOLCHAIN=stable bash scripts/dsv4_fast_build.sh`
   completed after one rebuild and harvested DSv4 CUDA artifacts; immediate
   repeat used prebuilt artifacts and finished in 4.92 s while skipping nvcc and
