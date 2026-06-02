@@ -30,7 +30,23 @@ Local checks passed:
 - `cargo check -p infer --no-default-features --features no-cuda`
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,nccl,no-cuda`
 
-Remote validation is pending.
+Remote build and decode correctness passed on the DSv4 pod at commit
+`ab9c40397caa3f9ed022046e44d2859d4347632b`:
+
+- build artifact: `/tmp/dsv4_fixed_topk_20260603_build/build.log`;
+- build time: `release-fast` finished in 18.39s and used the prebuilt CUDA fast
+  path;
+- validation artifact: `/tmp/dsv4_fixed_topk_reach_20260603`;
+- `scripts/dsv4_batched_decode_validate.py 18085` exited 0, printed
+  `ANSWER_PASS`, and completed c8 with zero HTTP errors;
+- operator trace proved both FlashMLA decode paths still executed:
+  `attn_flashmla_decode` 16408 calls and
+  `attn_hca_batch_flashmla_decode` 2240 calls;
+- after cleanup, `nvidia-smi --query-compute-apps` reported no remaining
+  compute apps.
+
+This is a graph-shape prerequisite, not a target performance result. The
+validation used operator trace and `--disable-cuda-graph`.
 
 ## Rule
 
