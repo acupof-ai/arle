@@ -1165,6 +1165,7 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     pub(crate) fm_decode_num_splits: Option<CudaSlice<i32>>,
     pub(crate) fm_decode_indices: Option<CudaSlice<i32>>,
     pub(crate) fm_decode_topk_length: Option<CudaSlice<i32>>,
+    pub(crate) fm_decode_start_pos: Option<CudaSlice<i32>>,
     pub(crate) fm_decode_lse_out: Option<CudaSlice<f32>>,
     pub(crate) fm_decode_meta: Option<DeepseekFlashMlaDecodeMeta>,
     pub(crate) fm_decode_scratch_num_sm_parts: usize,
