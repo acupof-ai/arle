@@ -43,6 +43,8 @@ use crate::ops;
 #[cfg(feature = "cuda")]
 use crate::sampler::SamplingParams;
 #[cfg(feature = "cuda")]
+use crate::scheduler::{DistributedRequestOwnership, SchedulerStartupContract};
+#[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 #[cfg(feature = "cuda")]
 use cuda_kernels::tensor::CudaAllocTraceExt;
@@ -544,7 +546,7 @@ impl ModelForward for DeepseekModel {
         &self,
         kv_cache_dtype: KVCacheDtype,
         kv_pool_format: KVFormat,
-        cuda_graph_max_bs: usize,
+        contract: SchedulerStartupContract,
     ) -> Result<()> {
         let profile = self.config.performance_profile()?;
         let graph_support = self.cuda_graph_decode_support();
@@ -561,7 +563,7 @@ impl ModelForward for DeepseekModel {
         };
 
         log::info!(
-            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
+            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} request_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
             profile.as_str(),
             fallback_lane,
             self.config.tp.rank,
@@ -570,9 +572,12 @@ impl ModelForward for DeepseekModel {
             self.config.ep.world_size,
             self.config.axes.summary(),
             self.config.rank_coord,
+            contract.request_ownership.as_str(),
+            contract.effective_world_size,
+            contract.token_owner_group_count,
             kv_cache_dtype,
             kv_pool_format,
-            cuda_graph_max_bs,
+            contract.cuda_graph_max_bs,
             graph_support.supported(),
             graph_support.mode_label(),
             graph_support.reason,
@@ -594,7 +599,7 @@ impl ModelForward for DeepseekModel {
                 "kv_pool_format must be FP8E4M3 for DSv4 best-practice FP8 KV, got {kv_pool_format:?}"
             ));
         }
-        if cuda_graph_max_bs == 0 {
+        if contract.cuda_graph_max_bs == 0 {
             missing.push("cuda_graph_max_bs must be > 0".to_string());
         }
         if !graph_support.is_full_decode() {
@@ -604,14 +609,29 @@ impl ModelForward for DeepseekModel {
                 graph_support.reason
             ));
         }
-        if self.config.tp.world_size > 1 || self.config.ep.world_size > 1 {
+        let distributed = self.config.tp.world_size > 1 || self.config.ep.world_size > 1;
+        if distributed {
+            if contract.request_ownership != DistributedRequestOwnership::TokenOwnedDpEp {
+                missing.push(format!(
+                    "DSv4 distributed decode requires token-owned DP/EP request routing before graph capture, got request_ownership={}",
+                    contract.request_ownership.as_str(),
+                ));
+            }
+            if contract.token_owner_group_count == 0 {
+                missing.push(
+                    "DSv4 owner-group routing is not configured from the SGLang axis layout"
+                        .to_string(),
+                );
+            }
+            #[cfg(feature = "nccl")]
+            if contract.effective_world_size > 1 && self.request_token_sync_nccl().is_none() {
+                missing.push(
+                    "DSv4 owner-group token sync NCCL communicator is not attached".to_string(),
+                );
+            }
+            #[cfg(not(feature = "nccl"))]
             missing.push(
-                "DSv4 distributed decode still needs token-owned DP/EP request routing before graph capture"
-                    .to_string(),
-            );
-            missing.push(
-                "DSv4 owner-group NCCL/token-sync subgroups are not constructed from the SGLang axis layout"
-                    .to_string(),
+                "DSv4 distributed decode requires NCCL for owner-group token sync".to_string(),
             );
             missing.push(
                 "DSv4 DeepEP/NCCL collective capture/replay contract is not implemented"

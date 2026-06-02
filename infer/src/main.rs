@@ -916,6 +916,29 @@ fn deepseek_request_owner_groups_for_world(world_size: usize) -> Result<Vec<Vec<
     Ok(groups)
 }
 
+fn planned_scheduler_request_contract(
+    model_type: ModelType,
+    world_size: usize,
+) -> Result<(DistributedRequestOwnership, usize, usize)> {
+    if !matches!(model_type, ModelType::DeepSeekV4) {
+        return Ok((DistributedRequestOwnership::ReplicatedToken, 1, 0));
+    }
+    if world_size <= 1 {
+        return Ok((DistributedRequestOwnership::ReplicatedToken, 1, 0));
+    }
+    let profile = dsv4_performance_profile_from_env()
+        .context("loading DeepSeek V4 performance profile for scheduler contract")?;
+    if profile.requires_best_practice() {
+        let owner_groups = deepseek_request_owner_groups_for_world(world_size)?;
+        return Ok((
+            DistributedRequestOwnership::TokenOwnedDpEp,
+            world_size,
+            owner_groups.len(),
+        ));
+    }
+    Ok((DistributedRequestOwnership::ReplicatedToken, world_size, 0))
+}
+
 fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
     let tracing = configure_global_tracing(TraceStartupConfig {
         level: args.trace_level.clone(),
@@ -1555,6 +1578,8 @@ fn spawn_cuda_worker_group(
         .map(|s| s.world_size)
         .unwrap_or_else(|| workers.len());
     let rank_offset = distributed_shape.map(|s| s.rank_offset).unwrap_or(0);
+    let (request_ownership, request_effective_world_size, token_owner_group_count) =
+        planned_scheduler_request_contract(model_type, world_size)?;
     // Startup-warmup gate is only useful when this process spawns multiple
     // threads (single-process N-thread mode). In multi-process mode, each
     // worker process holds its own gate via NCCL barriers, not via the
@@ -1563,11 +1588,15 @@ fn spawn_cuda_worker_group(
     let mut planned = Vec::with_capacity(workers.len());
     for (local_idx, worker) in workers.iter().enumerate() {
         let rank = rank_offset + local_idx;
+        let mut scheduler = scheduler_config_from_args(args, num_slots);
+        scheduler.request_ownership = request_ownership;
+        scheduler.request_effective_world_size = request_effective_world_size;
+        scheduler.token_owner_group_count = token_owner_group_count;
         let runtime = ServerRuntimeConfig {
             engine: InferenceEngineOptions {
                 enable_cuda_graph: args.cuda_graph && !args.disable_cuda_graph,
             },
-            scheduler: scheduler_config_from_args(args, num_slots),
+            scheduler,
             runtime_envelope: infer::scheduler::RuntimeEnvelopeOverrides {
                 chunked_prefill_size: args.chunked_prefill_size,
                 max_prefill_tokens: args.max_prefill_tokens,

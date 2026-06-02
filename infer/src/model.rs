@@ -916,7 +916,7 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         &self,
         _kv_cache_dtype: kv_cache::KVCacheDtype,
         _kv_pool_format: KVFormat,
-        _cuda_graph_max_bs: usize,
+        _contract: crate::scheduler::SchedulerStartupContract,
     ) -> Result<()> {
         Ok(())
     }

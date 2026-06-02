@@ -43,5 +43,6 @@ pub use types::{
     DistributedRequestCoordination, DistributedRequestOwnership, DistributedRequestShard,
     DistributedTokenCoordinator, DraftMode, IncomingRequest, RequestPriority, RequestSpecConfig,
     RuntimeEnvelopeOverrides, SchedulePolicy, SchedulerAdmissionPolicy, SchedulerConfig,
-    SchedulerFull, SchedulerHandle, SchedulerMixedPolicy, pick_chunked_prefill_size_for_hbm,
+    SchedulerFull, SchedulerHandle, SchedulerMixedPolicy, SchedulerStartupContract,
+    pick_chunked_prefill_size_for_hbm,
 };
