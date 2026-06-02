@@ -35,9 +35,16 @@ friendly.
 - `cargo check -p infer --no-default-features --features no-cuda`
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
 - `git diff --check -- infer/src/model/deepseek/state.rs infer/src/model/deepseek/weights.rs`
+- Remote pod worktree `/tmp/arle-dsv4-attn-output-0ef119f1`, HEAD
+  `0ef119f1900989cfa195aac6f83445b4c0e393cc`.
+- Remote `git diff --check -- infer/src/model/deepseek/state.rs infer/src/model/deepseek/weights.rs docs/experience/wins/2026-06-02-dsv4-attention-output-scratch.md`
+- Remote `cargo +stable check -p infer --no-default-features --features no-cuda --offline`
+- Remote `CUDARC_CUDA_VERSION=12080 cargo +stable check -p infer --no-default-features --features cuda,no-cuda --offline`
 
-Remote pod verification is still pending for the committed SHA. No runtime
-benchmark or TPOT claim is made from this local buildability tranche.
+The remote pod's direct `1.95.0` shim attempted a rustup channel sync and timed
+out, so validation used the already-installed `stable` toolchain
+(`cargo 1.92.0`, `rustc 1.92.0`) in offline mode. No runtime benchmark or TPOT
+claim is made from this buildability tranche.
 
 ## Pending Graph Enablement
 
