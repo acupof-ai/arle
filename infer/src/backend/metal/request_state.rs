@@ -61,6 +61,17 @@ pub struct MtpRequestMetrics {
     pub cooldown_remaining_steps: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NgramRequestMetrics {
+    pub block_count: usize,
+    pub max_draft_tokens: usize,
+    pub min_match_tokens: usize,
+    pub total_draft_tokens: usize,
+    pub accepted_draft_tokens: usize,
+    pub avg_accepted_inputs: f64,
+    pub acceptance_rate: f64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MtpAdaptivePolicy {
     zero_accept_limit: usize,
@@ -93,6 +104,15 @@ impl MtpAdaptivePolicy {
     const fn enabled(self) -> bool {
         self.zero_accept_limit > 0 && self.cooldown_tokens > 0
     }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
 }
 
 fn env_flag_disabled(name: &str) -> bool {
@@ -207,6 +227,7 @@ trait StepDriver {
         Ok(emitted)
     }
     fn decode_token(&mut self, token: u32) -> Result<u32>;
+    fn record_committed_token(&mut self, _token: u32) {}
     fn cleanup(&mut self) -> Result<()> {
         Ok(())
     }
@@ -353,6 +374,7 @@ impl<D: StepDriver> ResumableRequestState<D> {
     fn record_sampled_token(&mut self, sampled_token: u32) -> Result<()> {
         self.last_token = Some(sampled_token);
         self.generated_tokens += 1;
+        self.driver.record_committed_token(sampled_token);
         // M_e.11 — residency-set hygiene. Centralized hook here covers
         // ALL three scheduler paths (c=1 step_session, c=1 step_session_paged,
         // c≥2 step_batch_packed) since each commits via record_sampled_token.
@@ -1772,6 +1794,41 @@ impl<'a> MetalRequestState<'a> {
         })
     }
 
+    /// Metal ngram speculative-decode aggregate metrics for this request.
+    /// Returns `None` if ngram is disabled or no ngram block executed.
+    pub fn ngram_metrics(&self) -> Option<NgramRequestMetrics> {
+        let MetalRequestStateInner::Qwen35(state) = &self.inner else {
+            return None;
+        };
+        let ngram = state.driver.ngram.as_ref()?;
+        let block_count = ngram.acceptance_lengths.len();
+        if block_count == 0 {
+            return None;
+        }
+        let total_inputs: usize = ngram.acceptance_lengths.iter().copied().sum();
+        let total_draft_tokens: usize = ngram.draft_lengths.iter().copied().sum();
+        let accepted_draft_tokens: usize = ngram
+            .acceptance_lengths
+            .iter()
+            .map(|accepted| accepted.saturating_sub(1))
+            .sum();
+        let avg_accepted_inputs = total_inputs as f64 / block_count as f64;
+        let acceptance_rate = if total_draft_tokens > 0 {
+            accepted_draft_tokens as f64 / total_draft_tokens as f64
+        } else {
+            0.0
+        };
+        Some(NgramRequestMetrics {
+            block_count,
+            max_draft_tokens: ngram.policy.max_draft_tokens,
+            min_match_tokens: ngram.policy.min_match_tokens,
+            total_draft_tokens,
+            accepted_draft_tokens,
+            avg_accepted_inputs,
+            acceptance_rate,
+        })
+    }
+
     /// Metal MTP per-block acceptance lengths + block size for runtime metrics
     /// flush. Returns `(block_count, acceptance_lengths, block_size)` or
     /// `None` if not an MTP request.
@@ -1804,7 +1861,7 @@ impl<'a> MetalRequestState<'a> {
                     if qwen35.phase() != MetalRequestPhase::Decode {
                         return Ok(None);
                     }
-                    if qwen35.driver.mtp.is_some() {
+                    if qwen35.driver.mtp.is_some() || qwen35.driver.ngram_enabled() {
                         return Ok(None);
                     }
                     qwen35_states.push(&mut **qwen35);
@@ -4532,6 +4589,170 @@ impl Qwen35MtpState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetalNgramPolicy {
+    enabled: bool,
+    max_draft_tokens: usize,
+    min_match_tokens: usize,
+    max_context_tokens: usize,
+    max_misses_without_block: usize,
+}
+
+impl MetalNgramPolicy {
+    const DEFAULT_MAX_DRAFT_TOKENS: usize = 4;
+    const DEFAULT_MIN_MATCH_TOKENS: usize = 3;
+    const DEFAULT_MAX_CONTEXT_TOKENS: usize = 4096;
+    const DEFAULT_MAX_MISSES_WITHOUT_BLOCK: usize = 4;
+
+    fn from_env() -> Self {
+        let enabled = env_flag_enabled("ARLE_METAL_NGRAM_SPEC");
+        let max_draft_tokens = env_usize(
+            "ARLE_METAL_NGRAM_MAX_DRAFT_TOKENS",
+            Self::DEFAULT_MAX_DRAFT_TOKENS,
+        )
+        .clamp(1, 16);
+        let min_match_tokens =
+            env_usize("ARLE_METAL_NGRAM_MIN_MATCH", Self::DEFAULT_MIN_MATCH_TOKENS).clamp(1, 64);
+        let max_context_floor = min_match_tokens + max_draft_tokens + 1;
+        let max_context_tokens = env_usize(
+            "ARLE_METAL_NGRAM_MAX_CONTEXT",
+            Self::DEFAULT_MAX_CONTEXT_TOKENS,
+        )
+        .max(max_context_floor);
+        let max_misses_without_block = env_usize(
+            "ARLE_METAL_NGRAM_MAX_MISSES",
+            Self::DEFAULT_MAX_MISSES_WITHOUT_BLOCK,
+        );
+        Self {
+            enabled,
+            max_draft_tokens,
+            min_match_tokens,
+            max_context_tokens,
+            max_misses_without_block,
+        }
+    }
+}
+
+struct Qwen35NgramState {
+    policy: MetalNgramPolicy,
+    committed_tokens: Vec<u32>,
+    token_buffer: VecDeque<u32>,
+    draft_lengths: Vec<usize>,
+    acceptance_lengths: Vec<usize>,
+    misses_without_block: usize,
+}
+
+impl Qwen35NgramState {
+    fn new(prompt_tokens: &[u32]) -> Self {
+        let policy = MetalNgramPolicy::from_env();
+        let mut state = Self {
+            policy,
+            committed_tokens: prompt_tokens.to_vec(),
+            token_buffer: VecDeque::new(),
+            draft_lengths: Vec::new(),
+            acceptance_lengths: Vec::new(),
+            misses_without_block: 0,
+        };
+        state.trim_history();
+        state
+    }
+
+    fn enabled(&self) -> bool {
+        self.policy.enabled
+    }
+
+    fn record_committed_token(&mut self, token: u32) {
+        self.committed_tokens.push(token);
+        self.trim_history();
+    }
+
+    fn next_draft(&self) -> Option<Vec<u32>> {
+        if !self.policy.enabled {
+            return None;
+        }
+        ngram_draft_from_history(
+            &self.committed_tokens,
+            self.policy.min_match_tokens,
+            self.policy.max_draft_tokens,
+            self.policy.max_context_tokens,
+        )
+    }
+
+    fn observe_block(&mut self, draft_len: usize, accepted_inputs: usize) {
+        self.draft_lengths.push(draft_len);
+        self.acceptance_lengths.push(accepted_inputs);
+        self.misses_without_block = 0;
+    }
+
+    fn observe_miss(&mut self) {
+        if !self.policy.enabled || self.policy.max_misses_without_block == 0 {
+            return;
+        }
+        self.misses_without_block += 1;
+        if self.misses_without_block >= self.policy.max_misses_without_block {
+            self.policy.enabled = false;
+            log::info!(
+                "qwen35_ngram disabled after {} consecutive no-candidate steps",
+                self.misses_without_block
+            );
+        }
+    }
+
+    fn trim_history(&mut self) {
+        let max_len = self.policy.max_context_tokens;
+        if self.committed_tokens.len() <= max_len {
+            return;
+        }
+        let drop_len = self.committed_tokens.len() - max_len;
+        self.committed_tokens.drain(0..drop_len);
+    }
+}
+
+struct Qwen35NgramBlockResult {
+    accepted_tokens: Vec<u32>,
+    accepted_inputs: usize,
+}
+
+fn ngram_draft_from_history(
+    history: &[u32],
+    min_match_tokens: usize,
+    max_draft_tokens: usize,
+    max_context_tokens: usize,
+) -> Option<Vec<u32>> {
+    if min_match_tokens == 0 || max_draft_tokens == 0 {
+        return None;
+    }
+    let end = history.len();
+    if end < min_match_tokens.saturating_mul(2) {
+        return None;
+    }
+    let search_start = end.saturating_sub(max_context_tokens);
+    let max_match_tokens = ((end - search_start) / 2).min(64);
+    if max_match_tokens < min_match_tokens {
+        return None;
+    }
+
+    for match_len in (min_match_tokens..=max_match_tokens).rev() {
+        let suffix_start = end - match_len;
+        let suffix = &history[suffix_start..end];
+        let latest_start = end - (match_len * 2);
+        if search_start > latest_start {
+            continue;
+        }
+        for pos in (search_start..=latest_start).rev() {
+            if &history[pos..pos + match_len] != suffix {
+                continue;
+            }
+            let draft_start = pos + match_len;
+            let draft_end = (draft_start + max_draft_tokens).min(end);
+            if draft_start < draft_end {
+                return Some(history[draft_start..draft_end].to_vec());
+            }
+        }
+    }
+    None
+}
+
 struct Qwen35CppState {
     kv_flat: Vec<MlxArray>,
     gdr_flat: Vec<MlxArray>,
@@ -4593,6 +4814,8 @@ struct Qwen35StepDriver<'a> {
     dflash: Option<Qwen35DFlashState>,
     /// Frozen-KV MTP speculative decode state (None = standard decode).
     mtp: Option<Qwen35MtpState>,
+    /// Local token-history ngram speculative decode state (env-gated).
+    ngram: Option<Qwen35NgramState>,
     /// Pre-queued sampled token (lazy MlxArray) from the step ahead.
     pending_sampled: Option<MlxArray>,
     /// M_e.1 P1 plumbing — placeholder for the paged-KV pool. Always
@@ -4766,6 +4989,7 @@ impl<'a> Qwen35StepDriver<'a> {
             mode,
             dflash,
             mtp,
+            ngram: Some(Qwen35NgramState::new(prompt_tokens)),
             pending_sampled: None,
             kv_pool,
         })
@@ -4824,6 +5048,169 @@ impl<'a> Qwen35StepDriver<'a> {
             &[1, 1],
         ));
         Ok(())
+    }
+
+    fn ngram_enabled(&self) -> bool {
+        self.ngram.as_ref().is_some_and(Qwen35NgramState::enabled)
+    }
+
+    fn try_ngram_speculative_decode(&mut self, token: u32) -> Result<Option<u32>> {
+        if let Some(ngram) = self.ngram.as_mut()
+            && let Some(buffered) = ngram.token_buffer.pop_front()
+        {
+            return Ok(Some(buffered));
+        }
+        if self.dflash.is_some() || !matches!(self.mode, Qwen35StepMode::Cpp(_)) {
+            return Ok(None);
+        }
+        let Some(draft_tokens) = self.ngram.as_ref().and_then(Qwen35NgramState::next_draft) else {
+            if let Some(ngram) = self.ngram.as_mut() {
+                ngram.observe_miss();
+            }
+            return Ok(None);
+        };
+        ensure!(
+            !draft_tokens.is_empty(),
+            "Qwen3.6 ngram candidate unexpectedly empty"
+        );
+        let block_len_i32 = i32::try_from(draft_tokens.len() + 1)
+            .context("Qwen3.6 ngram block_len does not fit i32")?;
+        self.pending_sampled = None;
+        self.ensure_capacity(self.cache_len + block_len_i32)?;
+        let block = self.run_ngram_speculative_block(token, &draft_tokens)?;
+        let ngram = self
+            .ngram
+            .as_mut()
+            .context("Qwen3.6 ngram state disappeared during decode")?;
+        ngram.observe_block(draft_tokens.len(), block.accepted_inputs);
+        for &t in &block.accepted_tokens {
+            ngram.token_buffer.push_back(t);
+        }
+        ngram
+            .token_buffer
+            .pop_front()
+            .map(Some)
+            .context("Qwen3.6 ngram speculative block produced zero tokens")
+    }
+
+    fn run_ngram_speculative_block(
+        &mut self,
+        current_token: u32,
+        draft_tokens: &[u32],
+    ) -> Result<Qwen35NgramBlockResult> {
+        ensure!(
+            !draft_tokens.is_empty(),
+            "Qwen3.6 ngram verifier requires at least one draft token"
+        );
+        let mut token_values = Vec::with_capacity(draft_tokens.len() + 1);
+        token_values.push(current_token as i32);
+        token_values.extend(draft_tokens.iter().map(|&token| token as i32));
+        let block_size = token_values.len();
+        let block_size_i32 =
+            i32::try_from(block_size).context("Qwen3.6 ngram block_size does not fit i32")?;
+        let block_tokens = MlxArray::from_slice_i32(&token_values, &[block_size_i32]);
+        let cpp_model = self
+            .weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3.6 ngram speculative decode requires C++ compiled model")?;
+        let capture_mtp_hidden = self.mtp.is_some();
+        let mut updated_mtp_seed_hidden = None;
+
+        {
+            let Qwen35StepMode::Cpp(cpp_state) = &mut self.mode else {
+                bail!("Qwen3.6 ngram speculative decode requires C++ step mode");
+            };
+            cpp_state.ensure_caches_drained(cpp_model)?;
+
+            let expected_tape_count = cpp_state.gdr_flat.len() / 2;
+            let gdr_snapshot = cpp_state.gdr_flat.clone();
+            unsafe {
+                mlx_sys::qwen35_set_tape_mode(cpp_model.as_raw(), true);
+                mlx_sys::qwen35_set_capture_final_hidden(cpp_model.as_raw(), capture_mtp_hidden);
+            }
+            let _verify_state_guard = dflash::Qwen35VerifyStateGuard {
+                raw: cpp_model.as_raw(),
+            };
+
+            let verify_summary = cpp_model.verify_block_summary(
+                &block_tokens,
+                block_size_i32,
+                self.cache_len,
+                &mut cpp_state.kv_flat,
+                &mut cpp_state.gdr_flat,
+                &self.params,
+                None,
+            )?;
+            let tapes = dflash::drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
+            let final_hidden = if capture_mtp_hidden {
+                Some(
+                    super::qwen35::capture_qwen35_final_hidden_from_cpp_outputs(
+                        cpp_model.as_raw(),
+                    )?
+                    .context("Qwen3.6 ngram verifier did not capture final hidden")?,
+                )
+            } else {
+                None
+            };
+            let matched = verify_summary.matched_prefix_len;
+            ensure!(
+                matched < block_size,
+                "Qwen3.6 ngram verify summary returned matched_prefix_len={} for block_size={}",
+                matched,
+                block_size,
+            );
+            let accepted_inputs = matched + 1;
+            if accepted_inputs < block_size {
+                dflash::qwen35_rollback_to_accepted_varlen(
+                    &mut cpp_state.gdr_flat,
+                    &gdr_snapshot,
+                    &tapes,
+                    &[accepted_inputs as i32],
+                )?;
+            }
+            self.cache_len += accepted_inputs as i32;
+
+            if let Some(final_hidden) = final_hidden {
+                let hidden_shape = final_hidden.shape();
+                ensure!(
+                    hidden_shape.len() == 2 && hidden_shape[0] >= accepted_inputs as i32,
+                    "Qwen3.6 ngram final hidden shape {:?} cannot provide accepted row {}",
+                    hidden_shape,
+                    accepted_inputs,
+                );
+                let hidden_width = hidden_shape[1];
+                let row = accepted_inputs as i32 - 1;
+                updated_mtp_seed_hidden = Some(slice(
+                    &final_hidden,
+                    &[row, 0],
+                    &[row + 1, hidden_width],
+                    &[1, 1],
+                ));
+            }
+
+            let mut to_eval: Vec<&MlxArray> = Vec::new();
+            if let Some(hidden) = updated_mtp_seed_hidden.as_ref() {
+                to_eval.push(hidden);
+            }
+            to_eval.extend(cpp_state.gdr_flat.iter());
+            to_eval.extend(cpp_state.kv_flat.iter());
+            async_eval(&to_eval);
+
+            let mut accepted_tokens = draft_tokens[..matched].to_vec();
+            accepted_tokens.push(verify_summary.next_token);
+
+            if let Some(seed_hidden) = updated_mtp_seed_hidden {
+                if let Some(mtp) = self.mtp.as_mut() {
+                    mtp.seed_hidden = Some(seed_hidden);
+                }
+            }
+
+            Ok(Qwen35NgramBlockResult {
+                accepted_tokens,
+                accepted_inputs,
+            })
+        }
     }
 
     fn run_step(&mut self, token: u32) -> Result<MlxArray> {
@@ -5540,7 +5927,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
     }
 
     fn decode_token(&mut self, token: u32) -> Result<u32> {
-        if self.dflash.is_some() || self.mtp.is_some() {
+        if self.dflash.is_some() || self.mtp.is_some() || self.ngram_enabled() {
             self.pending_sampled = None;
         }
 
@@ -5553,6 +5940,11 @@ impl StepDriver for Qwen35StepDriver<'_> {
         }
         if let Some(mtp) = self.mtp.as_mut()
             && let Some(buffered) = mtp.token_buffer.pop_front()
+        {
+            return Ok(buffered);
+        }
+        if let Some(ngram) = self.ngram.as_mut()
+            && let Some(buffered) = ngram.token_buffer.pop_front()
         {
             return Ok(buffered);
         }
@@ -5628,6 +6020,11 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     .context("Qwen3.5/Qwen3.6 DFlash block produced zero tokens");
             }
             // Rust mode fallback: fall through to standard decode
+        }
+
+        // ── Local ngram speculative path (Qwen3.6/Qwen3.5-MoE) ─────────────
+        if let Some(sampled) = self.try_ngram_speculative_decode(token)? {
+            return Ok(sampled);
         }
 
         // ── Frozen-KV MTP speculative path (Qwen3.6/Qwen3.5-MoE) ───────────
@@ -5706,7 +6103,8 @@ impl StepDriver for Qwen35StepDriver<'_> {
             self.cache_len += 1;
 
             // cache_len is post-increment (committed); prequeue only needs one more slot.
-            let can_prequeue = self.dflash.is_none() && self.cache_len < self.kv_capacity;
+            let can_prequeue =
+                self.dflash.is_none() && !self.ngram_enabled() && self.cache_len < self.kv_capacity;
             if can_prequeue {
                 if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
                     clear_metal_cache_on_kv_boundary();
@@ -5731,7 +6129,9 @@ impl StepDriver for Qwen35StepDriver<'_> {
             let sampled = gpu_sample_token(&logits, &self.params);
             async_eval(&[&sampled]);
 
-            let can_prequeue = self.dflash.is_none() && self.cache_len + 2 <= self.kv_capacity;
+            let can_prequeue = self.dflash.is_none()
+                && !self.ngram_enabled()
+                && self.cache_len + 2 <= self.kv_capacity;
             if can_prequeue {
                 if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
                     clear_metal_cache_on_kv_boundary();
@@ -5749,6 +6149,12 @@ impl StepDriver for Qwen35StepDriver<'_> {
         };
 
         Ok(result)
+    }
+
+    fn record_committed_token(&mut self, token: u32) {
+        if let Some(ngram) = self.ngram.as_mut() {
+            ngram.record_committed_token(token);
+        }
     }
 
     fn cleanup(&mut self) -> Result<()> {
@@ -5776,6 +6182,30 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 matched_total as f64 / (blocks * drafted) as f64,
                 mtp.adaptive_disable_events,
                 mtp.adaptive_fallback_steps,
+            );
+        }
+        if let Some(ngram) = self.ngram.as_ref()
+            && !ngram.acceptance_lengths.is_empty()
+        {
+            let blocks = ngram.acceptance_lengths.len();
+            let total_inputs: usize = ngram.acceptance_lengths.iter().sum();
+            let drafted: usize = ngram.draft_lengths.iter().sum();
+            let accepted_draft: usize = ngram
+                .acceptance_lengths
+                .iter()
+                .map(|accepted| accepted.saturating_sub(1))
+                .sum();
+            log::info!(
+                "qwen35_ngram metrics: blocks={} max_draft={} min_match={} avg_accepted_inputs={:.2} acceptance_rate={:.3}",
+                blocks,
+                ngram.policy.max_draft_tokens,
+                ngram.policy.min_match_tokens,
+                total_inputs as f64 / blocks as f64,
+                if drafted > 0 {
+                    accepted_draft as f64 / drafted as f64
+                } else {
+                    0.0
+                },
             );
         }
         self.ensure_cpp_session_drained()

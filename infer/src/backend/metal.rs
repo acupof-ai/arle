@@ -505,24 +505,18 @@ impl MetalBackend {
         }
     }
 
-    /// Build a deterministic benchmark prompt with an exact token count.
-    pub fn benchmark_prompt_ids(&self, prompt_tokens: usize) -> Result<Vec<u32>> {
+    /// Encode an arbitrary prompt with the loaded model tokenizer.
+    pub fn encode_prompt_ids(&self, prompt: &str) -> Result<Vec<u32>> {
+        anyhow::ensure!(!prompt.is_empty(), "prompt must not be empty");
         let tokenizer = self
             .tokenizer
             .as_ref()
             .context("model not loaded — call load() first")?;
-
-        if prompt_tokens == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut prompt = String::from(BENCHMARK_PROMPT_CHUNK);
-        let mut input_ids = tokenizer.encode(&prompt)?;
-        while input_ids.len() < prompt_tokens {
-            prompt.push_str(BENCHMARK_PROMPT_CHUNK);
-            input_ids = tokenizer.encode(&prompt)?;
-        }
-        input_ids.truncate(prompt_tokens);
+        let input_ids = tokenizer.encode(prompt)?;
+        anyhow::ensure!(
+            !input_ids.is_empty(),
+            "tokenizer produced an empty prompt token sequence"
+        );
         Ok(input_ids)
     }
 }
@@ -943,7 +937,6 @@ impl StreamingInferenceBackend for MetalBackend {
     }
 }
 
-const BENCHMARK_PROMPT_CHUNK: &str = " benchmark throughput";
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

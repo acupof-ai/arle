@@ -11,7 +11,8 @@
 #   ARLE_TARGET              default: mlx-community/Qwen3.5-4B-MLX-4bit
 #   ARLE_DFLASH_DRAFT        default: z-lab/Qwen3.5-4B-DFlash
 #   ARLE_PORT                default: 8000
-#   ARLE_PROMPT_TOK          default: 32 (bench)
+#   ARLE_BENCH_PROMPT        real inline bench prompt
+#   ARLE_BENCH_PROMPT_FILE   real bench prompt file; overrides ARLE_BENCH_PROMPT
 #   ARLE_GEN_TOK             default: 256 (bench)
 #   Legacy AGENT_INFER_* names still work.
 #
@@ -47,7 +48,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET="${ARLE_TARGET:-${AGENT_INFER_TARGET:-mlx-community/Qwen3.5-4B-MLX-4bit}}"
 DRAFT="${ARLE_DFLASH_DRAFT:-${AGENT_INFER_DFLASH_DRAFT:-z-lab/Qwen3.5-4B-DFlash}}"
 PORT="${ARLE_PORT:-${AGENT_INFER_PORT:-8000}}"
-PROMPT_TOK="${ARLE_PROMPT_TOK:-${AGENT_INFER_PROMPT_TOK:-32}}"
+BENCH_PROMPT="${ARLE_BENCH_PROMPT:-${AGENT_INFER_BENCH_PROMPT:-write a concise Python quicksort and explain the pivot choice}}"
+BENCH_PROMPT_FILE="${ARLE_BENCH_PROMPT_FILE:-${AGENT_INFER_BENCH_PROMPT_FILE:-}}"
 GEN_TOK="${ARLE_GEN_TOK:-${AGENT_INFER_GEN_TOK:-256}}"
 
 CARGO_COMMON=(--release -p infer --no-default-features --features metal,no-cuda)
@@ -66,7 +68,7 @@ Defaults:
   target:   ${TARGET}
   draft:    ${DRAFT}
   port:     ${PORT}
-  bench:    prompt_tokens=${PROMPT_TOK}, generation_tokens=${GEN_TOK}
+  bench:    prompt=${BENCH_PROMPT_FILE:-${BENCH_PROMPT}}, generation_tokens=${GEN_TOK}
 
 Override via ARLE_TARGET / ARLE_DFLASH_DRAFT / ARLE_PORT.
 Legacy AGENT_INFER_TARGET / AGENT_INFER_DFLASH_DRAFT / AGENT_INFER_PORT also work.
@@ -90,10 +92,16 @@ run_serve() {
 
 run_bench() {
     cd "${REPO_ROOT}"
+    local prompt_args=()
+    if [ -n "${BENCH_PROMPT_FILE}" ]; then
+        prompt_args=(--prompt-file "${BENCH_PROMPT_FILE}")
+    else
+        prompt_args=(--prompt "${BENCH_PROMPT}")
+    fi
     echo "=== DFlash bench: baseline ==="
     cargo run "${CARGO_COMMON[@]}" --bin metal_bench -- \
         --model "${TARGET}" \
-        --prompt-tokens "${PROMPT_TOK}" \
+        "${prompt_args[@]}" \
         --generation-tokens "${GEN_TOK}" \
         --warmup 1 --runs 3 "$@"
     echo ""
@@ -101,7 +109,7 @@ run_bench() {
     cargo run "${CARGO_COMMON[@]}" --bin metal_bench -- \
         --model "${TARGET}" \
         --dflash-draft-model "${DRAFT}" \
-        --prompt-tokens "${PROMPT_TOK}" \
+        "${prompt_args[@]}" \
         --generation-tokens "${GEN_TOK}" \
         --warmup 1 --runs 3 "$@"
 }

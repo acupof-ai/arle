@@ -111,7 +111,7 @@ run_gputrace() {
     INFER_CAPTURE_PATH="${out_path}" \
         cargo run "${CARGO_COMMON[@]}" --bin metal_bench -- \
             --model "${target}" \
-            --prompt-tokens 8 \
+            --prompt "capture one real Metal decode step" \
             --generation-tokens 2 \
             --warmup 1 \
             --runs 1 \
@@ -167,7 +167,7 @@ run_xctrace() {
         --launch -- \
         "${REPO_ROOT}/target/release/metal_bench" \
             --model "${target}" \
-            --prompt-tokens 8 \
+            --prompt "capture a short real Metal trace" \
             --generation-tokens 8 \
             --warmup 0 \
             --runs 1 "$@"
