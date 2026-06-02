@@ -3,34 +3,35 @@
 
 Gate:
   * c=1, c=4, and c=8 must complete without HTTP errors.
-  * every output must contain the expected answer token.
+  * every raw-completion output must contain the expected answer token.
 
 The c=1 vs c=4 byte-identical check is kept as a diagnostic, not the process
-exit condition. The model may produce extra deterministic text around the
-answer under this debug smoke prompt; that should not hide real failures such as
-HTTP 500s, empty generations, or repeated garbage-token regressions.
+exit condition. The script uses `/v1/completions` instead of chat completions
+so the gate is not coupled to chat-template thinking/refusal text. It should
+not hide real failures such as HTTP 500s, empty generations, or repeated
+garbage-token regressions.
 
 Usage: python3 dsv4_batched_decode_validate.py <port>
 """
 import json, sys, time, urllib.request, threading
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "18300"
-PROMPT = "Repeat exactly this text and nothing else: 406"
+PROMPT = "Compute 137 + 269. Answer with the number only.\nAnswer:"
 EXPECTED = "406"
 MAXTOK = 8
 
 
 def gen(prompt, results, idx):
     body = json.dumps({"model": "DeepSeek-V4-Flash",
-                       "messages": [{"role": "user", "content": prompt}],
+                       "prompt": prompt,
                        "max_tokens": MAXTOK, "temperature": 0, "ignore_eos": True}).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions",
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/completions",
                                  data=body, headers={"Content-Type": "application/json"}, method="POST")
     t0 = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=300) as r:
             d = json.loads(r.read())
-        results[idx] = (time.perf_counter() - t0, d["choices"][0]["message"]["content"],
+        results[idx] = (time.perf_counter() - t0, d["choices"][0]["text"],
                         d.get("usage", {}).get("completion_tokens", 0))
     except Exception as e:
         results[idx] = (time.perf_counter() - t0, f"ERR:{e}", 0)
