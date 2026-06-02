@@ -82,6 +82,20 @@ impl ModelForward for DeepseekModel {
     ) -> Result<Self::DecodeContext> {
         let mut ctx =
             DeepseekBatchDecodeBuffers::new(&self.ctx, max_batch_size, pool.max_total_pages)?;
+        if let Some(head_hc) = self.head_hc.as_ref()
+            && self.embed_tokens.is_some()
+            && self.norm.is_some()
+            && self.lm_head.is_some()
+        {
+            ctx.ensure_batched_scratch(
+                &self.ctx,
+                self.config.hidden_size,
+                self.config.hidden_size * self.config.hc_mult,
+                head_hc.mix_fn.rows,
+                self.config.vocab_size,
+                1,
+            )?;
+        }
         // Phase D-4 (shared-pool, `ARLE_DSV4_SHARED_KV_POOL` ON only): allocate
         // the shared persistent FP8 KV pool once, sized for
         // `num_slots × layers × slot_blocks`, when the FlashMLA decode env knob

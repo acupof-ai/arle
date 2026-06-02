@@ -739,7 +739,7 @@ impl DeepseekModel {
             self.config.vocab_size,
             n,
         )?;
-        scratch.upload_token_ids(&self.ctx, tokens)?;
+        scratch.ensure_token_ids_uploaded(&self.ctx, tokens)?;
 
         // Per-row absolute decode position + bookkeeping prime. Mirror the
         // per-row `compute_gpu_logits_after_decode` preconditions exactly.
