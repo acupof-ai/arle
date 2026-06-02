@@ -90,12 +90,14 @@ pub struct NumaSchedulerWorker {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DistributedRequestOwnership {
     ReplicatedToken,
+    TokenOwnedDpEp,
 }
 
 impl DistributedRequestOwnership {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ReplicatedToken => "replicated-token",
+            Self::TokenOwnedDpEp => "token-owned-dp-ep",
         }
     }
 }
@@ -254,7 +256,11 @@ impl NumaSchedulerRouter {
 }
 
 impl DistributedSchedulerGroup {
-    pub fn new(workers: Vec<NumaSchedulerWorker>, metrics: crate::metrics::ServerMetrics) -> Self {
+    pub fn new(
+        workers: Vec<NumaSchedulerWorker>,
+        metrics: crate::metrics::ServerMetrics,
+        request_ownership: DistributedRequestOwnership,
+    ) -> Self {
         assert!(
             !workers.is_empty(),
             "distributed scheduler group requires at least one worker"
@@ -262,7 +268,6 @@ impl DistributedSchedulerGroup {
         let model_id = Arc::from(workers[0].handle.model_id());
         let tokenizer = workers[0].handle.tokenizer_clone();
         let effective_world_size = workers.len();
-        let request_ownership = DistributedRequestOwnership::ReplicatedToken;
         log::info!(
             "Distributed scheduler request ownership: mode={} local_workers={} effective_world_size={} relay=false",
             request_ownership.as_str(),
@@ -292,6 +297,7 @@ impl DistributedSchedulerGroup {
         metrics: crate::metrics::ServerMetrics,
         relay: Arc<Mutex<crate::multiproc_relay::RelayCoordinator>>,
         effective_world_size: usize,
+        request_ownership: DistributedRequestOwnership,
     ) -> Self {
         assert!(
             !workers.is_empty(),
@@ -305,7 +311,6 @@ impl DistributedSchedulerGroup {
         );
         let model_id = Arc::from(workers[0].handle.model_id());
         let tokenizer = workers[0].handle.tokenizer_clone();
-        let request_ownership = DistributedRequestOwnership::ReplicatedToken;
         log::info!(
             "Distributed scheduler request ownership: mode={} local_workers={} effective_world_size={} relay=true",
             request_ownership.as_str(),
@@ -503,6 +508,13 @@ impl RequestHandle for NumaSchedulerRouter {
 
 impl RequestHandle for DistributedSchedulerGroup {
     fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+        if self.request_ownership == DistributedRequestOwnership::TokenOwnedDpEp {
+            log::error!(
+                "Distributed scheduler request ownership mode={} is selected, but token-owned DP/EP request sharding is not implemented yet",
+                self.request_ownership.as_str()
+            );
+            return Err(SubmitError);
+        }
         let _submission_guard = self
             .submission_lock
             .lock()
@@ -810,6 +822,7 @@ mod tests {
                 },
             ],
             crate::metrics::ServerMetrics::new("model"),
+            DistributedRequestOwnership::ReplicatedToken,
         );
         assert_eq!(
             group.request_ownership(),
@@ -845,6 +858,26 @@ mod tests {
     }
 
     #[test]
+    fn distributed_group_token_owned_mode_fails_closed_until_sharding_exists() {
+        let (tx0, mut rx0) = mpsc::unbounded_channel();
+        let worker0 = SchedulerHandle::from_parts(tx0, "model");
+        let group = DistributedSchedulerGroup::new(
+            vec![NumaSchedulerWorker {
+                handle: worker0,
+                placement: placement(0, 0),
+            }],
+            crate::metrics::ServerMetrics::new("model"),
+            DistributedRequestOwnership::TokenOwnedDpEp,
+        );
+        assert_eq!(
+            group.request_ownership(),
+            DistributedRequestOwnership::TokenOwnedDpEp
+        );
+        assert!(group.submit(test_request(None, Some(0))).is_err());
+        assert!(rx0.try_recv().is_err());
+    }
+
+    #[test]
     fn distributed_group_preserves_rank_queue_order_under_concurrent_submit() {
         let (tx0, mut rx0) = mpsc::unbounded_channel();
         let (tx1, mut rx1) = mpsc::unbounded_channel();
@@ -862,6 +895,7 @@ mod tests {
                 },
             ],
             crate::metrics::ServerMetrics::new("model"),
+            DistributedRequestOwnership::ReplicatedToken,
         ));
         let barrier = Arc::new(std::sync::Barrier::new(5));
         let mut joins = Vec::new();
