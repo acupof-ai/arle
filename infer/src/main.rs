@@ -172,7 +172,7 @@ struct Args {
     #[arg(long, default_value_t = 0.6)]
     spec_acceptance_threshold: f32,
 
-    /// Draft mode: "none", "self"/"self-spec", or "external:<path>".
+    /// Draft mode: "none", "self"/"self-spec", "internal-mtp"/"eagle", or "external:<path>".
     #[arg(long, visible_alias = "spec-draft-mode", default_value = "none")]
     spec_draft_model: String,
 
@@ -2464,6 +2464,7 @@ fn parse_draft_mode(raw: &str) -> anyhow::Result<DraftMode> {
     match trimmed.to_ascii_lowercase().as_str() {
         "none" => Ok(DraftMode::None),
         "self" | "self-spec" | "selfspec" => Ok(DraftMode::SelfSpec),
+        "internal-mtp" | "mtp" | "eagle" | "internal-eagle" => Ok(DraftMode::InternalMtp),
         _ if trimmed.to_ascii_lowercase().starts_with("external:") => {
             let path = trimmed
                 .split_once(':')
@@ -2475,7 +2476,7 @@ fn parse_draft_mode(raw: &str) -> anyhow::Result<DraftMode> {
             Ok(DraftMode::External(PathBuf::from(path)))
         }
         other => anyhow::bail!(
-            "unsupported --spec-draft-model '{other}': expected none, self, self-spec, or external:<path>"
+            "unsupported --spec-draft-model '{other}': expected none, self, self-spec, internal-mtp/eagle, or external:<path>"
         ),
     }
 }

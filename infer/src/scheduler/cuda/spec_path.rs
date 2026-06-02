@@ -1,5 +1,5 @@
 use super::{ModelForward, Phase, Scheduler};
-use crate::model::{SparseKvDraftView, SpecVerifyRequest};
+use crate::model::{InternalMtpDraftRequest, SparseKvDraftView, SpecVerifyRequest};
 use crate::prefix_cache::BlockId;
 use crate::scheduler::DraftMode;
 use crate::server_engine::FinishReason;
@@ -57,21 +57,32 @@ impl SpecPath {
         scheduler: &mut Scheduler<M>,
         force_sparse_view: Option<SparseDraftView>,
     ) {
-        if matches!(scheduler.config.spec_draft_model, DraftMode::SelfSpec) {
-            if scheduler.config.spec_sparse_kv_enabled {
-                Self::draft_self_sparse_then_verify(scheduler, force_sparse_view);
+        match scheduler.config.spec_draft_model {
+            DraftMode::SelfSpec => {
+                if scheduler.config.spec_sparse_kv_enabled {
+                    Self::draft_self_sparse_then_verify(scheduler, force_sparse_view);
+                    return;
+                }
+                if let Some(_view) = force_sparse_view {
+                    scheduler.step_decode_launch();
+                    return;
+                }
+                scheduler.step_spec_decode_launch_from_path();
                 return;
             }
-            if let Some(_view) = force_sparse_view {
-                scheduler.step_decode_launch();
+            DraftMode::InternalMtp => {
+                if let Some(_view) = force_sparse_view {
+                    scheduler.step_decode_launch();
+                    return;
+                }
+                Self::draft_internal_mtp_then_verify(scheduler);
                 return;
             }
-            scheduler.step_spec_decode_launch_from_path();
-            return;
-        }
-        if !matches!(scheduler.config.spec_draft_model, DraftMode::External(_)) {
-            scheduler.step_spec_decode_launch_from_path();
-            return;
+            DraftMode::External(_) => {}
+            DraftMode::None => {
+                scheduler.step_spec_decode_launch_from_path();
+                return;
+            }
         }
         if scheduler.draft_engine.is_none() || scheduler.config.spec_draft_k == 0 {
             scheduler.step_decode_launch();
@@ -518,6 +529,173 @@ impl SpecPath {
                 original_target_len,
                 input_tokens,
                 draft_tokens,
+            });
+        }
+
+        verify_and_commit_rows(scheduler, rows, started);
+    }
+
+    fn draft_internal_mtp_then_verify<M: ModelForward>(scheduler: &mut Scheduler<M>) {
+        let started = std::time::Instant::now();
+        let (mut decode_indices, mut token_ids) = scheduler.collect_decode_batch_inputs();
+        if decode_indices.is_empty() {
+            return;
+        }
+
+        let verifier_tokens = scheduler.config.spec_draft_k.saturating_add(1);
+        let extra_verifier_pages = decode_indices
+            .iter()
+            .map(|&slot_idx| {
+                scheduler
+                    .additional_pages_needed_for_slot(slot_idx, verifier_tokens)
+                    .saturating_sub(scheduler.additional_pages_needed_for_slot(slot_idx, 1))
+            })
+            .sum();
+        scheduler.retract_decode_to_fit(&mut decode_indices, &mut token_ids, extra_verifier_pages);
+        if decode_indices.is_empty() {
+            return;
+        }
+        let verifier_pages_needed: usize = decode_indices
+            .iter()
+            .map(|&slot_idx| scheduler.additional_pages_needed_for_slot(slot_idx, verifier_tokens))
+            .sum();
+        if verifier_pages_needed > scheduler.effective_pool_free_pages() {
+            scheduler.step_decode_launch();
+            return;
+        }
+
+        if !decode_indices.iter().all(|&slot_idx| {
+            scheduler.request(slot_idx).is_some_and(|req| {
+                !req.spec_decode_disabled
+                    && req
+                        .speculative
+                        .as_ref()
+                        .is_none_or(|spec| spec.allows_internal_mtp(scheduler.config.spec_draft_k))
+                    && !req.has_stop_sequences()
+                    && req.sampling.is_greedy()
+                    && !req.sampling.has_penalties()
+            })
+        }) {
+            scheduler.step_decode_launch();
+            return;
+        }
+
+        if scheduler.decode_bufs.is_none() {
+            match scheduler.model.create_decode_context(
+                scheduler.states.len(),
+                scheduler.effective_max_seq_len,
+                &scheduler.paged_kv_pool,
+            ) {
+                Ok(ctx) => scheduler.decode_bufs = Some(ctx),
+                Err(err) => {
+                    log::warn!("internal MTP draft decode context init failed: {err}");
+                    scheduler.step_decode_launch();
+                    return;
+                }
+            }
+        }
+
+        let mut draft_requests = Vec::with_capacity(decode_indices.len());
+        let mut row_meta = HashMap::with_capacity(decode_indices.len());
+        for (&slot_idx, &last_token) in decode_indices.iter().zip(&token_ids) {
+            let Some((request_id, max_tokens, generated_len)) = scheduler
+                .request(slot_idx)
+                .map(|req| (req.id, req.max_tokens, req.generated_tokens.len()))
+            else {
+                continue;
+            };
+            let max_draft_tokens = scheduler
+                .config
+                .spec_draft_k
+                .min(max_tokens.saturating_sub(generated_len));
+            if max_draft_tokens == 0 {
+                continue;
+            }
+            row_meta.insert(
+                slot_idx,
+                (
+                    request_id,
+                    scheduler.paged_kv_pool.seq_len(slot_idx),
+                    last_token,
+                ),
+            );
+            draft_requests.push(InternalMtpDraftRequest {
+                slot_idx,
+                last_token,
+                max_draft_tokens,
+            });
+        }
+        if draft_requests.is_empty() {
+            scheduler.step_decode_launch();
+            return;
+        }
+
+        let Some(decode_ctx) = scheduler.decode_bufs.as_mut() else {
+            scheduler.step_decode_launch();
+            return;
+        };
+        let outputs = match scheduler.model.forward_internal_mtp_draft_batch(
+            &draft_requests,
+            &mut scheduler.states,
+            &mut scheduler.paged_kv_pool,
+            decode_ctx,
+        ) {
+            Ok(outputs) => outputs,
+            Err(err) => {
+                log::error!("internal MTP/EAGLE draft failed before verifier: {err}");
+                for request in draft_requests {
+                    scheduler.finish_slot_with_error(request.slot_idx, "inference_failed", &err);
+                }
+                return;
+            }
+        };
+
+        let mut rows = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            if output.draft_tokens.is_empty() {
+                continue;
+            }
+            let Some(&(request_id, original_target_len, last_token)) =
+                row_meta.get(&output.slot_idx)
+            else {
+                scheduler.finish_slot_with_message(
+                    output.slot_idx,
+                    "inference_failed",
+                    format!(
+                        "internal MTP/EAGLE output missing row metadata for slot {}",
+                        output.slot_idx
+                    ),
+                );
+                continue;
+            };
+            let max_draft_tokens = draft_requests
+                .iter()
+                .find(|request| request.slot_idx == output.slot_idx)
+                .map(|request| request.max_draft_tokens)
+                .unwrap_or(0);
+            if output.draft_tokens.len() > max_draft_tokens {
+                scheduler.finish_slot_with_message(
+                    output.slot_idx,
+                    "inference_failed",
+                    format!(
+                        "internal MTP/EAGLE emitted {} draft tokens for slot {}, max allowed {}",
+                        output.draft_tokens.len(),
+                        output.slot_idx,
+                        max_draft_tokens
+                    ),
+                );
+                continue;
+            }
+            let mut input_tokens = Vec::with_capacity(output.draft_tokens.len() + 1);
+            input_tokens.push(last_token);
+            input_tokens.extend_from_slice(&output.draft_tokens);
+            rows.push(SpecRow {
+                slot_idx: output.slot_idx,
+                request_id,
+                draft_start_position: original_target_len,
+                original_target_len,
+                input_tokens,
+                draft_tokens: output.draft_tokens,
             });
         }
 
