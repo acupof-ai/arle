@@ -133,6 +133,15 @@ serve on the replicated-token debug lane and still look like a performance run.
   `/data01/build/arle` fast-forwarded from GitHub, then
   `scripts/dsv4_fast_build.sh` used the DSv4 prebuilt CUDA artifacts,
   skipped nvcc/TileLang AOT, and finished in 17.25 s.
+- DSv4 DeepGEMM auto-fallback deletion remote gate at `4cdef860`:
+  `/data01/build/arle` was bundle-synced because GitHub HTTPS pull stalled.
+  `scripts/dsv4_fast_build.sh` used `/data01/build/arle/../DeepEP`, accepted
+  the prebuilt CUDA archive and sidecar, skipped nvcc/TileLang AOT, and
+  finished in 17.84 s. Remote CUDA/NCCL unit gate
+  `cargo test -p infer --lib --no-default-features --features cuda,nccl deepgemm_required_is_the_default_expert_backend -- --nocapture`
+  passed 1/1 and verifies that the default is required DeepGEMM, explicit
+  `native` remains a debug backend, and `deepgemm-auto` / `auto-deepgemm` are
+  rejected.
 - Remote DSv4 pod source was synced by bundle because pod-side GitHub HTTPS
   fetch failed. Follow-up source syncs verified clean remote HEADs through
   `5d4e62bf` and then `204db39f`.
