@@ -4,11 +4,13 @@
 //! `infer/models/dsv4-mini-1B-init/`. Infer-side DeepSeek wiring uses
 //! [`deepseek_spec::DeepSeekV4Config`] and its HF tensor-name contract only.
 
+#[cfg(feature = "cuda")]
+use std::collections::HashSet;
 use std::path::Path;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 #[cfg(feature = "cuda")]
 use std::time::Instant;
 
@@ -1982,6 +1984,11 @@ impl DeepseekModel {
         num_layers: usize,
     ) -> Result<bool> {
         if slot_indices.len() != start_pos.len() || slot_indices.is_empty() {
+            dsv4_body_graph_debug_reject(format!(
+                "invalid decode metadata shape slots={} start_pos={}",
+                slot_indices.len(),
+                start_pos.len()
+            ));
             return Ok(false);
         }
         let max_graph_batch = dsv4_decode_body_cuda_graph_max_batch_size()?;
@@ -1993,6 +2000,11 @@ impl DeepseekModel {
                     slot_indices.len()
                 );
             }
+            dsv4_body_graph_debug_reject(format!(
+                "batch {} exceeds max graph batch {}",
+                slot_indices.len(),
+                max_graph_batch
+            ));
             return Ok(false);
         }
         if !dsv4_deepgemm_device_counts_for_body_graph_enabled()? {
@@ -2002,29 +2014,56 @@ impl DeepseekModel {
                     "ARLE_DSV4_DECODE_BODY_CUDA_GRAPH requested, but DSv4 body graph capture needs ARLE_DSV4_DEEPGEMM_DEVICE_COUNTS=1 for graph-safe local routed experts."
                 );
             }
+            dsv4_body_graph_debug_reject(
+                "ARLE_DSV4_DEEPGEMM_DEVICE_COUNTS is disabled".to_string(),
+            );
             return Ok(false);
         }
         if std::env::var("INFER_DEBUG_DUMP").is_ok() || super::trace::dsv4_operator_trace_enabled()
         {
+            dsv4_body_graph_debug_reject(
+                "INFER_DEBUG_DUMP or DSv4 operator trace is enabled".to_string(),
+            );
             return Ok(false);
         }
         #[cfg(all(feature = "cuda", feature = "nccl"))]
         {
-            if dsv4_combine_overlap_enabled() || dsv4_flashmla_tp_overlap_enabled()? {
+            if dsv4_combine_overlap_enabled() {
+                dsv4_body_graph_debug_reject("ARLE_DSV4_COMBINE_OVERLAP is enabled".to_string());
+                return Ok(false);
+            }
+            if dsv4_flashmla_tp_overlap_enabled()? {
+                dsv4_body_graph_debug_reject(
+                    "ARLE_DSV4_FLASHMLA_TP_OVERLAP is enabled".to_string(),
+                );
                 return Ok(false);
             }
         }
         if self.config.tp.world_size > 1 && !dsv4_nccl_graph_capture_enabled()? {
+            dsv4_body_graph_debug_reject(
+                "TP world size > 1 but ARLE_DSV4_NCCL_GRAPH_CAPTURE is disabled".to_string(),
+            );
             return Ok(false);
         }
         if self.config.ep.world_size > 1 && dsv4_moe_deepep_enabled()? {
+            dsv4_body_graph_debug_reject(
+                "EP world size > 1 with DeepEP enabled is not graph-captured".to_string(),
+            );
             return Ok(false);
         }
         for (row, &slot_idx) in slot_indices.iter().enumerate() {
             let Some(state) = states.get(slot_idx) else {
+                dsv4_body_graph_debug_reject(format!(
+                    "slot {slot_idx} missing from {} states",
+                    states.len()
+                ));
                 return Ok(false);
             };
             if state.incremental.layers.len() < num_layers {
+                dsv4_body_graph_debug_reject(format!(
+                    "slot {slot_idx} has {} incremental layers, need {num_layers}",
+                    state.incremental.layers.len()
+                ));
                 return Ok(false);
             }
             for layer_idx in 0..num_layers {
@@ -2038,11 +2077,21 @@ impl DeepseekModel {
                 let attention_cache = &state.incremental.layers[layer_idx].attention;
                 let compressed = attention_cache.compressed_gpu.as_ref();
                 let Some(compressed) = compressed else {
+                    dsv4_body_graph_debug_reject(format!(
+                        "slot {slot_idx} row {row} layer {layer_idx} missing compressed cache"
+                    ));
                     return Ok(false);
                 };
                 if compressed.pending_len != start_pos[row] % compress_ratio
                     || compressed.compressed_rows != start_pos[row] / compress_ratio
                 {
+                    dsv4_body_graph_debug_reject(format!(
+                        "slot {slot_idx} row {row} layer {layer_idx} compressed metadata mismatch pending={} rows={} expected_pending={} expected_rows={}",
+                        compressed.pending_len,
+                        compressed.compressed_rows,
+                        start_pos[row] % compress_ratio,
+                        start_pos[row] / compress_ratio
+                    ));
                     return Ok(false);
                 }
                 let mode = self
@@ -2053,11 +2102,21 @@ impl DeepseekModel {
                     deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse
                 ) {
                     let Some(indexer) = attention_cache.indexer_gpu.as_ref() else {
+                        dsv4_body_graph_debug_reject(format!(
+                            "slot {slot_idx} row {row} layer {layer_idx} missing indexer cache"
+                        ));
                         return Ok(false);
                     };
                     if indexer.pending_len != start_pos[row] % compress_ratio
                         || indexer.compressed_rows != start_pos[row] / compress_ratio
                     {
+                        dsv4_body_graph_debug_reject(format!(
+                            "slot {slot_idx} row {row} layer {layer_idx} indexer metadata mismatch pending={} rows={} expected_pending={} expected_rows={}",
+                            indexer.pending_len,
+                            indexer.compressed_rows,
+                            start_pos[row] % compress_ratio,
+                            start_pos[row] / compress_ratio
+                        ));
                         return Ok(false);
                     }
                 }
@@ -2066,6 +2125,9 @@ impl DeepseekModel {
                     && attention_cache.fp8_kv_pool_ptr != 0
                     && !attention_cache.fp8_kv_sw_bootstrapped
                 {
+                    dsv4_body_graph_debug_reject(format!(
+                        "slot {slot_idx} row {row} layer {layer_idx} FP8 shared KV SW cache not bootstrapped"
+                    ));
                     return Ok(false);
                 }
             }
@@ -9662,6 +9724,34 @@ fn dsv4_deepgemm_device_counts_for_body_graph_enabled() -> Result<bool> {
 
 fn dsv4_nccl_graph_capture_enabled() -> Result<bool> {
     Ok(dsv4_env_bool_override("ARLE_DSV4_NCCL_GRAPH_CAPTURE")?.unwrap_or(false))
+}
+
+fn dsv4_body_graph_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ARLE_DSV4_BODY_GRAPH_DEBUG").is_ok_and(|raw| {
+            matches!(
+                raw.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+    })
+}
+
+fn dsv4_body_graph_debug_reject(reason: String) {
+    if !dsv4_body_graph_debug_enabled() {
+        return;
+    }
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    match seen.lock() {
+        Ok(mut seen) => {
+            if seen.insert(reason.clone()) {
+                warn!("DSv4 body graph not ready: {reason}");
+            }
+        }
+        Err(_) => warn!("DSv4 body graph not ready: {reason}"),
+    }
 }
 
 #[cfg(feature = "cuda")]
