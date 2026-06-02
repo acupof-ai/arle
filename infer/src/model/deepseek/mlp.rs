@@ -1736,6 +1736,35 @@ impl DeepseekV4MoeBlock {
         Ok(routed)
     }
 
+    pub(super) fn add_shared_expert_with_scratch_into(
+        &self,
+        ctx: &DeviceContext,
+        hidden: &HiddenStates,
+        routed: &mut HiddenStates,
+        routed_ready: Option<CudaPipelineFence>,
+        swiglu_limit: f32,
+        scratch_cache: &mut DeepseekMoeRuntimeCache,
+    ) -> Result<()> {
+        let Some(shared) = &self.shared_experts else {
+            if let Some(fence) = routed_ready.as_ref() {
+                ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
+            }
+            return Ok(());
+        };
+        let scratch = scratch_cache.ensure_shared_expert_scratch(
+            ctx,
+            hidden.hidden_dim,
+            shared.w1.rows,
+            shared.w2.rows,
+            hidden.seq_len,
+        )?;
+        let shared = shared.forward_with_scratch(ctx, hidden, swiglu_limit, scratch)?;
+        if let Some(fence) = routed_ready.as_ref() {
+            ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
+        }
+        ops::add_batch_in_place(ctx, routed, shared)
+    }
+
     /// Route tokens with the loaded gate tensors, localize routes to this EP
     /// rank, and run the local MoE contribution.
     #[cfg(test)]
@@ -1775,6 +1804,60 @@ impl DeepseekV4MoeBlock {
         token_ids: &[u32],
         mut moe_scratch: Option<&mut DeepseekMoeRuntimeCache>,
     ) -> Result<HiddenStates> {
+        self.forward_local_routed_gpu_impl(
+            ctx,
+            layer_idx,
+            config,
+            ep,
+            hidden,
+            token_ids,
+            moe_scratch.as_deref_mut(),
+            None,
+            None,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 local routed owned output missing"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_local_routed_gpu_into(
+        &self,
+        ctx: &DeviceContext,
+        layer_idx: usize,
+        config: &DeepSeekV4Config,
+        ep: &ExpertGroup,
+        hidden: &HiddenStates,
+        token_ids: &[u32],
+        moe_scratch: Option<&mut DeepseekMoeRuntimeCache>,
+        token_ids_device_i32: Option<&CudaSlice<i32>>,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        self.forward_local_routed_gpu_impl(
+            ctx,
+            layer_idx,
+            config,
+            ep,
+            hidden,
+            token_ids,
+            moe_scratch,
+            token_ids_device_i32,
+            Some(out),
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_local_routed_gpu_impl(
+        &self,
+        ctx: &DeviceContext,
+        layer_idx: usize,
+        config: &DeepSeekV4Config,
+        ep: &ExpertGroup,
+        hidden: &HiddenStates,
+        token_ids: &[u32],
+        mut moe_scratch: Option<&mut DeepseekMoeRuntimeCache>,
+        token_ids_device_i32: Option<&CudaSlice<i32>>,
+        mut output_scratch: Option<&mut HiddenStates>,
+    ) -> Result<Option<HiddenStates>> {
         ensure!(
             token_ids.len() == hidden.seq_len,
             "DeepSeek V4 GPU route token count {} does not match hidden seq_len {}",
@@ -1811,8 +1894,37 @@ impl DeepseekV4MoeBlock {
         } else {
             None
         };
+        let mut route_logits_scratch_slot = if let Some(cache) = moe_scratch.as_deref_mut() {
+            cache.route_logits.take()
+        } else {
+            None
+        };
         let trace = dsv4_moe_trace_begin(ctx)?;
-        let logits = ops::gemm(ctx, &self.gate_weight, hidden)?;
+        let logits_owned;
+        let mut route_logits_scratch = if moe_scratch.is_some() {
+            Some(ensure_route_logits_scratch(
+                &mut route_logits_scratch_slot,
+                ctx,
+                config.n_routed_experts,
+                hidden.seq_len,
+            )?)
+        } else {
+            None
+        };
+        let logits = if let Some(scratch) = route_logits_scratch.as_deref_mut() {
+            scratch.logits.seq_len = hidden.seq_len;
+            ops::try_gemm_with_phase_into(
+                ctx,
+                &self.gate_weight,
+                hidden,
+                &mut scratch.logits,
+                ops::LinearDispatchPhase::Decode,
+            )?;
+            &scratch.logits
+        } else {
+            logits_owned = ops::gemm(ctx, &self.gate_weight, hidden)?;
+            &logits_owned
+        };
         dsv4_moe_trace_end(ctx, "ffn_route_logits", layer_idx, hidden.seq_len, trace)?;
 
         let trace = dsv4_moe_trace_begin(ctx)?;
@@ -1853,10 +1965,12 @@ impl DeepseekV4MoeBlock {
             packed_token,
             packed_weight,
         ) = if let Some(scratch) = local_routed_scratch {
-            let mut token_dst = scratch.token_ids.slice_mut(0..hidden.seq_len);
-            ctx.stream
-                .memcpy_htod(token_ids, &mut token_dst)
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 token ids H2D failed: {err}"))?;
+            if token_ids_device_i32.is_none() {
+                let mut token_dst = scratch.token_ids.slice_mut(0..hidden.seq_len);
+                ctx.stream
+                    .memcpy_htod(token_ids, &mut token_dst)
+                    .map_err(|err| anyhow::anyhow!("DeepSeek V4 token ids H2D failed: {err}"))?;
+            }
             (
                 &scratch.token_ids,
                 &mut scratch.route_indices,
@@ -1972,7 +2086,19 @@ impl DeepseekV4MoeBlock {
                 tid_guard = None;
                 std::ptr::null()
             };
-            let (token_ptr, _token_guard) = token_ids_gpu.device_ptr(&ctx.stream);
+            let token_guard_i32;
+            let token_guard_u32;
+            let token_ptr = if let Some(device_token_ids) = token_ids_device_i32 {
+                let (ptr, guard) = device_token_ids.device_ptr(&ctx.stream);
+                token_guard_i32 = Some(guard);
+                token_guard_u32 = None;
+                ptr as *const u32
+            } else {
+                let (ptr, guard) = token_ids_gpu.device_ptr(&ctx.stream);
+                token_guard_i32 = None;
+                token_guard_u32 = Some(guard);
+                ptr as *const u32
+            };
             let (idx_ptr, _idx_guard) = route_indices.device_ptr_mut(&ctx.stream);
             let (weight_ptr, _weight_guard) = route_weights.device_ptr_mut(&ctx.stream);
             unsafe {
@@ -1980,7 +2106,7 @@ impl DeepseekV4MoeBlock {
                     logits_ptr as *const ffi::Half,
                     bias_ptr,
                     tid_ptr,
-                    token_ptr as *const u32,
+                    token_ptr,
                     idx_ptr as *mut i32,
                     weight_ptr as *mut f32,
                     hidden.seq_len as i32,
@@ -1994,10 +2120,13 @@ impl DeepseekV4MoeBlock {
                 .result()
                 .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU router failed: {err}"))?;
             }
+            drop(token_guard_i32);
+            drop(token_guard_u32);
             drop(bias_guard);
             drop(tid_guard);
         }
         dsv4_moe_trace_end(ctx, "ffn_route_select", layer_idx, hidden.seq_len, trace)?;
+        drop(route_logits_scratch);
 
         let local_expert_start = ep.local_expert_range().start;
         let local_expert_start_i32 = i32::try_from(local_expert_start)
@@ -2034,6 +2163,11 @@ impl DeepseekV4MoeBlock {
         let use_deepgemm_device_counts = cache_backed_local_route
             && dsv4_should_try_deepgemm_experts(expert_backend)
             && dsv4_deepgemm_device_counts_enabled()?;
+        if output_scratch.is_some() && !use_deepgemm_device_counts {
+            bail!(
+                "DeepSeek V4 graph-safe local routed output requires DeepGEMM device-count experts"
+            );
+        }
         if use_deepgemm_device_counts {
             let trace = dsv4_moe_trace_begin(ctx)?;
             {
@@ -2061,7 +2195,42 @@ impl DeepseekV4MoeBlock {
                 trace,
             )?;
 
-            let mut out = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
+            let mut out_owned = if output_scratch.is_none() {
+                Some(HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?)
+            } else {
+                None
+            };
+            let out = if let Some(out) = output_scratch.as_deref_mut() {
+                ensure!(
+                    out.hidden_dim == hidden.hidden_dim,
+                    "DeepSeek V4 local routed scratch hidden dim {} does not match {}",
+                    out.hidden_dim,
+                    hidden.hidden_dim
+                );
+                ensure!(
+                    out.seq_len >= hidden.seq_len,
+                    "DeepSeek V4 local routed scratch seq_len {} is below {}",
+                    out.seq_len,
+                    hidden.seq_len
+                );
+                out.seq_len = hidden.seq_len;
+                let len = hidden
+                    .hidden_dim
+                    .checked_mul(hidden.seq_len)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("DeepSeek V4 local routed output length overflows")
+                    })?;
+                ctx.stream
+                    .memset_zeros(&mut out.data.slice_mut(0..len))
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 local routed scratch zero failed: {err}")
+                    })?;
+                out
+            } else {
+                out_owned
+                    .as_mut()
+                    .expect("DeepSeek V4 local routed owned output allocated")
+            };
             let route_capacity_i32 =
                 dsv4_usize_to_i32(route_capacity, "local DeepGEMM device-count routes")?;
             let trace = dsv4_moe_trace_begin(ctx)?;
@@ -2153,7 +2322,7 @@ impl DeepseekV4MoeBlock {
                     local_counts,
                     None,
                     route_capacity,
-                    &mut out,
+                    out,
                     &mut device_grouped_cache,
                 )?;
                 dsv4_moe_trace_end(
@@ -2166,8 +2335,9 @@ impl DeepseekV4MoeBlock {
             })();
             cache.grouped = device_grouped_cache.grouped.take();
             cache.local_routed = local_routed_scratch_slot;
+            cache.route_logits = route_logits_scratch_slot;
             result?;
-            return Ok(out);
+            return Ok(out_owned);
         }
         let trace = dsv4_moe_trace_begin(ctx)?;
         let counts_host = ctx
@@ -2223,8 +2393,9 @@ impl DeepseekV4MoeBlock {
         if total_local_routes == 0 {
             if let Some(cache) = moe_scratch.as_deref_mut() {
                 cache.local_routed = local_routed_scratch_slot;
+                cache.route_logits = route_logits_scratch_slot;
             }
-            return Ok(out);
+            return Ok(Some(out));
         }
         if !use_device_offsets {
             let trace = dsv4_moe_trace_begin(ctx)?;
@@ -2260,8 +2431,9 @@ impl DeepseekV4MoeBlock {
                 );
                 if let Some(cache) = moe_scratch.as_deref_mut() {
                     cache.local_routed = local_routed_scratch_slot;
+                    cache.route_logits = route_logits_scratch_slot;
                 }
-                return result;
+                return result.map(Some);
             }
         }
 
@@ -2365,8 +2537,9 @@ impl DeepseekV4MoeBlock {
         dsv4_moe_trace_end(ctx, "ffn_expert_loop", layer_idx, hidden.seq_len, trace)?;
         if let Some(cache) = moe_scratch.as_deref_mut() {
             cache.local_routed = local_routed_scratch_slot;
+            cache.route_logits = route_logits_scratch_slot;
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     #[allow(clippy::too_many_arguments)]
