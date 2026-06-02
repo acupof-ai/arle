@@ -1333,24 +1333,28 @@ fn dsv4_should_try_deepgemm_experts_with_auto_disabled(
 
 #[cfg(feature = "cuda")]
 fn dsv4_expert_backend() -> Result<Dsv4ExpertBackend> {
-    let Some(raw) = std::env::var("ARLE_DSV4_EXPERT_BACKEND").ok() else {
-        let moe_backend = std::env::var("ARLE_DSV4_MOE_BACKEND")
-            .unwrap_or_else(|_| "allreduce".to_string())
+    dsv4_expert_backend_from_env_values(
+        std::env::var("ARLE_DSV4_EXPERT_BACKEND").ok().as_deref(),
+        std::env::var("ARLE_DSV4_MOE_BACKEND").ok().as_deref(),
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_expert_backend_from_env_values(
+    raw: Option<&str>,
+    moe_backend: Option<&str>,
+) -> Result<Dsv4ExpertBackend> {
+    let Some(raw) = raw else {
+        let moe_backend = moe_backend
+            .unwrap_or("allreduce")
             .trim()
             .to_ascii_lowercase();
-        // Expert implementation is orthogonal to the transport. The correct
-        // DSv4 default transport is all-reduce for the current replicated-token
-        // TP/EP path, but the expert math should still use DeepGEMM when the
-        // native cache is available.
-        #[allow(clippy::match_same_arms)]
         match moe_backend.as_str() {
             "" | "deepep" | "deepep_unsafe" | "unsafe_deepep" | "dispatch" | "dispatch_combine"
-            | "dispatch_unsafe" | "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => {
-                return Ok(Dsv4ExpertBackend::DeepGemmAuto);
+            | "dispatch_unsafe" | "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off"
+            | "native-deepep" | "native_deepep" => {
+                return Ok(Dsv4ExpertBackend::DeepGemmRequired);
             }
-            // Phase B-3.2 — native-deepep boots a real Buffer at model
-            // construction (see weights.rs dsv4_native_deepep_enabled).
-            "native-deepep" | "native_deepep" => return Ok(Dsv4ExpertBackend::DeepGemmAuto),
             other => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{other}`"),
         }
     };
@@ -5942,6 +5946,31 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn deepgemm_required_is_the_default_expert_backend() {
+        assert_eq!(
+            dsv4_expert_backend_from_env_values(None, None).unwrap(),
+            Dsv4ExpertBackend::DeepGemmRequired
+        );
+        assert_eq!(
+            dsv4_expert_backend_from_env_values(None, Some("allreduce")).unwrap(),
+            Dsv4ExpertBackend::DeepGemmRequired
+        );
+        assert_eq!(
+            dsv4_expert_backend_from_env_values(None, Some("native-deepep")).unwrap(),
+            Dsv4ExpertBackend::DeepGemmRequired
+        );
+        assert_eq!(
+            dsv4_expert_backend_from_env_values(Some("deepgemm-auto"), None).unwrap(),
+            Dsv4ExpertBackend::DeepGemmAuto
+        );
+        assert_eq!(
+            dsv4_expert_backend_from_env_values(Some("native"), None).unwrap(),
+            Dsv4ExpertBackend::Native
+        );
+        assert!(dsv4_expert_backend_from_env_values(None, Some("not-a-backend")).is_err());
     }
 
     fn tiny_config() -> DeepSeekV4Config {
