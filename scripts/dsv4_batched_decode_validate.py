@@ -64,11 +64,15 @@ w8 = time.perf_counter() - t0
 errs8 = sum(1 for x in r8 if x[1].startswith("ERR"))
 toks8 = sum(x[2] for x in r8)
 print(f"c8 wall={w8:.1f}s errs={errs8} out_tokens={toks8} agg_tok/s={toks8/w8:.2f}")
+c8_answer_match = all(not row[1].startswith("ERR") and EXPECTED in row[1] for row in r8)
+if not c8_answer_match:
+    for i in range(8):
+        print(f"  c8_row{i}: {r8[i][1]!r}")
 answer_ok = (
     not ref.startswith("ERR")
     and EXPECTED in ref
     and all(not row[1].startswith("ERR") and EXPECTED in row[1] for row in r4)
-    and all(not row[1].startswith("ERR") and EXPECTED in row[1] for row in r8)
+    and c8_answer_match
     and errs8 == 0
 )
 print("BYTE_PARITY_PASS" if match else "BYTE_PARITY_DIAGNOSTIC_FAIL")
