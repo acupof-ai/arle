@@ -1984,6 +1984,17 @@ impl DeepseekModel {
         if slot_indices.len() != start_pos.len() || slot_indices.is_empty() {
             return Ok(false);
         }
+        let max_graph_batch = dsv4_decode_body_cuda_graph_max_batch_size()?;
+        if slot_indices.len() > max_graph_batch {
+            static LOGGED: OnceLock<()> = OnceLock::new();
+            if LOGGED.set(()).is_ok() {
+                warn!(
+                    "ARLE_DSV4_DECODE_BODY_CUDA_GRAPH requested, but DSv4 body graph capture is capped at B<={max_graph_batch}; B={} will run eagerly. Set ARLE_DSV4_DECODE_BODY_CUDA_GRAPH_MAX_BS to override after validating larger captures.",
+                    slot_indices.len()
+                );
+            }
+            return Ok(false);
+        }
         if !dsv4_deepgemm_device_counts_for_body_graph_enabled()? {
             static LOGGED: OnceLock<()> = OnceLock::new();
             if LOGGED.set(()).is_ok() {
@@ -9631,8 +9642,18 @@ fn infer_real_reference_enabled() -> Result<bool> {
     }
 }
 
-fn dsv4_decode_body_cuda_graph_enabled() -> Result<bool> {
+pub(super) fn dsv4_decode_body_cuda_graph_enabled() -> Result<bool> {
     Ok(dsv4_env_bool_override("ARLE_DSV4_DECODE_BODY_CUDA_GRAPH")?.unwrap_or(false))
+}
+
+pub(super) fn dsv4_decode_body_cuda_graph_max_batch_size() -> Result<usize> {
+    let Some(raw) = std::env::var("ARLE_DSV4_DECODE_BODY_CUDA_GRAPH_MAX_BS").ok() else {
+        return Ok(4);
+    };
+    let value = raw.trim().parse::<usize>().map_err(|err| {
+        anyhow::anyhow!("invalid ARLE_DSV4_DECODE_BODY_CUDA_GRAPH_MAX_BS value `{raw}`: {err}")
+    })?;
+    Ok(value.max(1))
 }
 
 fn dsv4_deepgemm_device_counts_for_body_graph_enabled() -> Result<bool> {

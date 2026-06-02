@@ -84,14 +84,28 @@ Remote:
   `/tmp/dsv4_body_graph_20260603/validate_body_graph_exact_scratch_marker32/completions32.log`
   and
   `/tmp/dsv4_body_graph_20260603/validate_body_graph_off_marker32_c4_control/completions32.log`.
-- Follow-up fix in progress: batched FlashMLA now pre-stages all shared-pool
-  slot/layer block offsets outside body capture and only passes stable per-layer
-  device-table pointers through the captured body. This targets the remaining
-  graph-on corruption hypothesis: replaying graph-captured H2D nodes from one
-  reused host offset scratch can point multiple layers at the wrong FP8 KV pool
-  sub-range.
-- Pending. Remote body-graph-on 32-token capture/replay gate must show normal
-  output and no `CUDA_ERROR_ILLEGAL_ADDRESS` before this is a correctness win.
+- PASS, partial. Follow-up fix at commit `68f1c7fd` pre-staged all batched
+  FlashMLA shared-pool slot/layer block offsets outside body capture and only
+  passed stable per-layer device-table pointers through the captured body. The
+  body-graph-on marker32 gate then passed c1 and c4: every row generated 32
+  tokens and contained `ZZZ406ZZZ`. Artifact:
+  `/tmp/dsv4_body_graph_20260603/validate_body_graph_offset_table_marker32/completions32.log`.
+- FAIL, contained. The same marker32 gate hung at c8 after all 8 ranks logged
+  `Capturing DSv4 body CUDA Graph: B=8 slots=[0, 1, 2, 3, 4, 5, 6, 7]`. There
+  was no CUDA illegal address and no decode output after capture. Artifact:
+  `/tmp/dsv4_body_graph_20260603/validate_body_graph_offset_table_marker32/server.log`.
+- FAIL, isolated. With `ARLE_DSV4_FLASHMLA_DECODE=0`, c8 still hung at the
+  same `Capturing DSv4 body CUDA Graph: B=8` point. That rules out the
+  FlashMLA slot/layer offset table as the B=8 hang root cause; the remaining
+  target is body capture interaction with FFN/NCCL capture or larger graph
+  capture topology. Artifact:
+  `/tmp/dsv4_body_graph_20260603/validate_body_graph_offset_table_c8_no_flashmla/server.log`.
+- PASS, guarded. Current code caps DSv4 body graph capture at
+  `ARLE_DSV4_DECODE_BODY_CUDA_GRAPH_MAX_BS` (default `4`) and falls back to
+  eager body execution above that cap. Startup contract logs
+  `body_graph_enabled` and `body_graph_max_bs`, and the first oversized decode
+  batch logs an explicit eager fallback warning. This prevents the default DSv4
+  graph path from hanging c8 while preserving the validated c1/c4 graph path.
 - Pending. Performance gate must run the matched DSv4-Flash TP8 + EAGLE +
   CUDA graph 256K/1500 hot-cache workload before comparing with the target
   TPOT ~4.85 ms.
