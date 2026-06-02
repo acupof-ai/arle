@@ -509,3 +509,27 @@ clear:
 The next investigation, when running is allowed again, should start with a
 matched SGLang no-spec target-step baseline and a separate spec-on EAGLE/MTP
 baseline. This report intentionally does not start either run.
+
+## 2026-06-02 Implementation Note: CUDA Graph Capability Surface
+
+ARLE now exposes CUDA Graph decode support as a generic model capability instead
+of a silent boolean. The scheduler logs `supported`, `mode`, and `reason` before
+warmup:
+
+- Qwen3: `full_decode`, unless the runtime disables CUDA Graph or LoRA forces
+  eager decode.
+- Qwen3.5: `piecewise_decode`, matching the existing graph cache over
+  consecutive linear-attention layer groups; Marlin W4A8 remains gated eager by
+  the current model predicate.
+- DSv4: `unsupported` today, with the explicit blockers that must be removed
+  before graph replay is correct:
+  - `start_pos` and related sequence metadata are still host launch parameters
+    in the DSv4 attention path, so replay would reuse capture-time positions;
+  - decode still allocates per-step scratch in parts of the current path;
+  - TP/EP NCCL collective capture is not validated in ARLE's collective layer.
+
+This is not a DSv4 performance win and does not change the DSv4 eager decode
+path. It makes the next optimization step auditable: DSv4 graph enablement must
+first move dynamic metadata to stable device inputs or graph-updated nodes,
+preallocate scratch in `DeepseekBatchDecodeBuffers`, and isolate graph-safe
+collectives before any TPOT claim.

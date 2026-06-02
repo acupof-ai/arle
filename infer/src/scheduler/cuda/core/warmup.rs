@@ -29,7 +29,8 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        let graph_capture_enabled = self.model.supports_cuda_graph_decode();
+        let graph_support = self.model.cuda_graph_decode_support();
+        let graph_capture_enabled = graph_support.supported();
         let decode_warmup_enabled = self.model.supports_decode_warmup();
         // Warm only batch sizes that can map to real scheduler slots. The
         // admission cap may be larger than a test/runtime slot count, but
@@ -37,6 +38,12 @@ impl<M: ModelForward> Scheduler<M> {
         let max_bs = num_slots.min(256);
         let warmup_sizes = Self::cuda_graph_batch_sizes(max_bs);
 
+        info!(
+            "CUDA Graph decode capability: supported={} mode={} reason={}",
+            graph_capture_enabled,
+            graph_support.mode_label(),
+            graph_support.reason,
+        );
         if !decode_warmup_enabled {
             info!("Decode warmup disabled by model capability");
         } else if graph_capture_enabled {
@@ -169,7 +176,9 @@ impl<M: ModelForward> Scheduler<M> {
 
         let prefill_warmed = self.warmup_prefill_pass(num_slots);
 
-        let mode = if graph_capture_enabled {
+        let mode = if !decode_warmup_enabled {
+            "Warmup"
+        } else if graph_capture_enabled {
             "CUDA Graph warmup"
         } else {
             "Eager warmup + cublasLt autotune"

@@ -7,9 +7,10 @@ use super::prefill::{Qwen3PagedPrefillRequest, Qwen3PrefillContext};
 use super::weights::Qwen3Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
-    GenerationState, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
-    PrefillBatchRequest, SchedulerRuntimeWorkspaceBudget, SparseKvDraftView, SpecVerifyOutput,
-    SpecVerifyRequest, decode_metadata_page_capacity, prepare_paged_prefill_batch,
+    CudaGraphDecodeSupport, GenerationState, MixedBatchFallbackReason, MixedBatchOutcome,
+    MixedBatchRequest, ModelForward, PrefillBatchRequest, SchedulerRuntimeWorkspaceBudget,
+    SparseKvDraftView, SpecVerifyOutput, SpecVerifyRequest, decode_metadata_page_capacity,
+    prepare_paged_prefill_batch,
 };
 use crate::model_arch::ModelArchInfo;
 use crate::model_registry::ModelArch;
@@ -804,10 +805,20 @@ impl ModelForward for Qwen3Model {
             .collect())
     }
 
-    fn supports_cuda_graph_decode(&self) -> bool {
+    fn cuda_graph_decode_support(&self) -> CudaGraphDecodeSupport {
+        if !self.enable_cuda_graph {
+            return CudaGraphDecodeSupport::unsupported(
+                "CUDA Graph disabled by runtime configuration",
+            );
+        }
         // LoRA decode allocates per-call temp DeviceVecs inside
         // `apply_lora_{gemv,gemm}_add`; CUDA stream capture rejects those.
-        self.enable_cuda_graph && self.lora.is_none()
+        if self.lora.is_some() {
+            return CudaGraphDecodeSupport::unsupported(
+                "Qwen3 LoRA decode allocates per-call adapter temporaries",
+            );
+        }
+        CudaGraphDecodeSupport::full()
     }
 }
 
