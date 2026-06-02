@@ -667,7 +667,13 @@ fn configure_deepseek_serving_env_if_needed(args: &Args) -> Result<()> {
         parse_deepseek_axis_world_size("INFER_EP_SIZE", "ARLE_EP_SIZE", world_size, world_size)?;
     let axes = MultiAxisConfig::current_route_from_env_with_defaults(tp_world_size, ep_world_size)
         .context("loading DeepSeek V4 multi-axis layout env")?;
-    log_deepseek_path_contract(world_size, tp_world_size, ep_world_size, &axes)?;
+    log_deepseek_path_contract(
+        world_size,
+        tp_world_size,
+        ep_world_size,
+        &axes,
+        runtime.performance_profile()?.as_str(),
+    )?;
 
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").context("reserve NCCL rendezvous TCP port")?;
@@ -703,24 +709,24 @@ fn log_deepseek_path_contract(
     tp_world_size: usize,
     ep_world_size: usize,
     axes: &MultiAxisConfig,
+    performance_profile: &str,
 ) -> Result<()> {
-    let sglang_path_requested = env_flag_enabled("ARLE_DSV4_SGLANG_PATH")?;
-    let mode = if sglang_path_requested {
-        "sglang-path-requested"
-    } else {
-        "replicated-token-default"
-    };
     info!(
-        "DeepSeek V4 path contract: mode={} workers={} axes={} moe_backend={} shared_kv_pool={} multiproc={}",
-        mode,
+        "DeepSeek V4 path contract: profile={} fallback_lane={} workers={} axes={} moe_backend={} expert_backend={} shared_kv_pool={} multiproc={}",
+        performance_profile,
+        if performance_profile == "sglang-best-practice" {
+            "forbidden"
+        } else {
+            "allowed-debug-only"
+        },
         world_size,
         axes.summary(),
         std::env::var("ARLE_DSV4_MOE_BACKEND").unwrap_or_else(|_| "allreduce(default)".into()),
+        std::env::var("ARLE_DSV4_EXPERT_BACKEND").unwrap_or_else(|_| "auto(default)".into()),
         std::env::var("ARLE_DSV4_SHARED_KV_POOL").unwrap_or_else(|_| "0(default)".into()),
         std::env::var("ARLE_MULTIPROC_SERVE").unwrap_or_else(|_| "0(default)".into()),
     );
-    ensure_deepseek_current_axis_support(tp_world_size, ep_world_size, axes)?;
-    validate_deepseek_sglang_path_contract(world_size, axes, sglang_path_requested)
+    ensure_deepseek_current_axis_support(tp_world_size, ep_world_size, axes)
 }
 
 fn ensure_deepseek_current_axis_support(
@@ -738,75 +744,6 @@ fn ensure_deepseek_current_axis_support(
         tp_world_size,
         ep_world_size,
     );
-}
-
-fn validate_deepseek_sglang_path_contract(
-    world_size: usize,
-    axes: &MultiAxisConfig,
-    requested: bool,
-) -> Result<()> {
-    if !requested {
-        return Ok(());
-    }
-
-    let mut missing = Vec::new();
-    if !env_flag_enabled("ARLE_MULTIPROC_SERVE")? {
-        missing.push("ARLE_MULTIPROC_SERVE=1 (one CUDA process per rank)".to_string());
-    }
-    if axes.world_size() != world_size {
-        missing.push(format!(
-            "multi-axis world_size must match CUDA workers: axes.world={} workers={world_size}",
-            axes.world_size()
-        ));
-    }
-    if !env_value_is_one_of("ARLE_DSV4_MOE_BACKEND", &["native-deepep", "native_deepep"]) {
-        missing.push("ARLE_DSV4_MOE_BACKEND=native-deepep".to_string());
-    }
-    if !env_flag_enabled("ARLE_DSV4_SHARED_KV_POOL")? {
-        missing.push("ARLE_DSV4_SHARED_KV_POOL=1 (persistent paged FP8 KV pool)".to_string());
-    }
-
-    // These are code contracts, not env knobs. They intentionally keep
-    // `ARLE_DSV4_SGLANG_PATH=1` fail-closed until ARLE stops running the
-    // replicated-token route.
-    missing.push(
-        "distributed request fanout still submits the full logical request to every rank; token-owned DP/EP request shards are not implemented".to_string(),
-    );
-    missing.push(
-        "DeepSeek decode attention still loops per row in forward_decode_batch; batched FlashMLA with SGLang sparse/recent indices is not wired".to_string(),
-    );
-    missing.push(
-        "LayerCommunicator only attaches global TP/EP groups; attention-DP/CP and MoE-DP subgroup communicators are not wired".to_string(),
-    );
-
-    if !missing.is_empty() {
-        bail!(
-            "ARLE_DSV4_SGLANG_PATH=1 requested, but the DSv4 SGLang path contract is incomplete:\n - {}\nUnset ARLE_DSV4_SGLANG_PATH to run the current replicated-token default path.",
-            missing.join("\n - ")
-        );
-    }
-    Ok(())
-}
-
-fn env_flag_enabled(key: &str) -> Result<bool> {
-    let Some(raw) = std::env::var(key).ok() else {
-        return Ok(false);
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => bail!("invalid {key} value `{raw}`: expected 0/1, true/false, yes/no, or on/off"),
-    }
-}
-
-fn env_value_is_one_of(key: &str, expected: &[&str]) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|raw| {
-            let normalized = raw.trim().to_ascii_lowercase();
-            expected.iter().any(|value| normalized == *value)
-        })
-        .unwrap_or(false)
 }
 
 fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
