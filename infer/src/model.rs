@@ -105,6 +105,60 @@ pub enum MixedBatchOutcome {
     Fallback(MixedBatchFallbackReason),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaGraphDecodeMode {
+    FullDecode,
+    PiecewiseDecode,
+    Unsupported,
+}
+
+impl CudaGraphDecodeMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullDecode => "full_decode",
+            Self::PiecewiseDecode => "piecewise_decode",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CudaGraphDecodeSupport {
+    pub mode: CudaGraphDecodeMode,
+    pub reason: &'static str,
+}
+
+impl CudaGraphDecodeSupport {
+    pub const fn full() -> Self {
+        Self {
+            mode: CudaGraphDecodeMode::FullDecode,
+            reason: "full decode CUDA Graph capture enabled",
+        }
+    }
+
+    pub const fn piecewise(reason: &'static str) -> Self {
+        Self {
+            mode: CudaGraphDecodeMode::PiecewiseDecode,
+            reason,
+        }
+    }
+
+    pub const fn unsupported(reason: &'static str) -> Self {
+        Self {
+            mode: CudaGraphDecodeMode::Unsupported,
+            reason,
+        }
+    }
+
+    pub const fn supported(self) -> bool {
+        !matches!(self.mode, CudaGraphDecodeMode::Unsupported)
+    }
+
+    pub const fn mode_label(self) -> &'static str {
+        self.mode.as_str()
+    }
+}
+
 /// One scheduler-planned speculative verifier row.
 ///
 /// `input_tokens` is `[last_committed_token] + draft_tokens`. Logits row `i`
@@ -796,12 +850,15 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         Ok(())
     }
 
+    /// CUDA Graph decode support exposed to the scheduler for warmup and logs.
+    fn cuda_graph_decode_support(&self) -> CudaGraphDecodeSupport {
+        CudaGraphDecodeSupport::full()
+    }
+
     /// Whether batched decode for this model can be replayed via a captured
-    /// CUDA Graph. Returns `false` when the model forces an eager decode
-    /// path (e.g. LoRA adapters allocate per-call temps which stream
-    /// capture rejects). Scheduler skips warmup/autotune in that case.
+    /// CUDA Graph. Scheduler skips graph warmup/capture when this is false.
     fn supports_cuda_graph_decode(&self) -> bool {
-        true
+        self.cuda_graph_decode_support().supported()
     }
 
     /// Whether scheduler startup should issue synthetic prefill requests to warm
