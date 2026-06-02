@@ -30,8 +30,24 @@ Local checks passed:
 - `cargo check -p infer --no-default-features --features no-cuda`
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,nccl,no-cuda`
 
-Remote validation is pending. This entry cannot claim TPOT improvement until the
-same DSv4 pod rebuilds this commit and passes decode correctness.
+Remote build and decode correctness passed on the DSv4 pod at commit
+`ccd0a5b85685aae4b9caa9ae2ce18f5281fbb6dd`:
+
+- build artifact: `/tmp/dsv4_tp_workspace_20260603_build/build.log`;
+- build time: `release-fast` finished in 21.27s and used the prebuilt CUDA fast
+  path;
+- validation artifact: `/tmp/dsv4_tp_workspace_reach_20260603`;
+- `scripts/dsv4_batched_decode_validate.py 18085` exited 0, printed
+  `ANSWER_PASS`, and completed c8 with zero HTTP errors;
+- operator trace proved the updated decode paths executed:
+  `attn_flashmla_decode` 16408 calls and
+  `attn_hca_batch_flashmla_decode` 2240 calls;
+- after cleanup, `nvidia-smi --query-compute-apps` reported no remaining
+  compute apps.
+
+This is still not the final TPOT number. The validation deliberately used
+operator trace and `--disable-cuda-graph`, so it proves correctness and
+reachability only.
 
 ## Rule
 
