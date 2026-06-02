@@ -1113,18 +1113,8 @@ impl DeepseekModel {
                         dsv4_trace_end(&self.ctx, "attn_output_proj", layer_idx, n, trace)?;
 
                         let trace = dsv4_trace_begin(&self.ctx)?;
-                        for row in 0..n {
-                            extract_hidden_token_with_width_into(
-                                &self.ctx,
-                                attn_out,
-                                row,
-                                hidden_size,
-                                attn_out_row,
-                            )?;
-                            self.layer_communicator
-                                .post_attn_all_reduce_hidden_states(attn_out_row)?;
-                            write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
-                        }
+                        self.layer_communicator
+                            .post_attn_all_reduce_hidden_states(attn_out)?;
                         dsv4_trace_end(&self.ctx, "attn_all_reduce", layer_idx, n, trace)?;
                     }
 
