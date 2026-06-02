@@ -106,6 +106,12 @@ Remote:
   `body_graph_enabled` and `body_graph_max_bs`, and the first oversized decode
   batch logs an explicit eager fallback warning. This prevents the default DSv4
   graph path from hanging c8 while preserving the validated c1/c4 graph path.
+- PASS. Guarded c8 marker32 gate at commit `679f150a` completed: all 8
+  requests returned HTTP 200, generated 32 tokens, and contained `ZZZ406ZZZ`.
+  Startup logs showed `body_graph_enabled=true body_graph_max_bs=4`; oversized
+  batches logged eager fallback; grep found no `Capturing DSv4 body CUDA Graph`
+  lines. Artifact:
+  `/tmp/dsv4_body_graph_20260603/validate_body_graph_cap_c8/completions32.log`.
 - Pending. Performance gate must run the matched DSv4-Flash TP8 + EAGLE +
   CUDA graph 256K/1500 hot-cache workload before comparing with the target
   TPOT ~4.85 ms.
