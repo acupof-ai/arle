@@ -205,3 +205,37 @@ pub fn dsv4_flashmla_decode_build_indices_raw(
     }
     Ok(())
 }
+
+/// Same as [`dsv4_flashmla_decode_build_indices_raw`], but reads
+/// `start_pos` from a single `int32` device scalar. This is the graph-ready
+/// entrypoint for decode paths that stamp per-step metadata on the stream.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
+    ctx: &DeviceContext,
+    indices_ptr: u64,
+    selected_ptr: u64,
+    sw_blocks: usize,
+    sliding_window: usize,
+    start_pos_ptr: u64,
+    max_compressed_keys: usize,
+    compress_ratio: usize,
+    mode_int: i32,
+    page_block_size: usize,
+) -> Result<()> {
+    unsafe {
+        ffi::arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
+            indices_ptr as *mut i32,
+            selected_ptr as *const i32,
+            sw_blocks as i32,
+            sliding_window as i32,
+            start_pos_ptr as *const i32,
+            max_compressed_keys as i32,
+            compress_ratio as i32,
+            mode_int,
+            page_block_size as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
