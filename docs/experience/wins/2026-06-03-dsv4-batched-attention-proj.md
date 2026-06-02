@@ -60,7 +60,10 @@ Remote verification on `/data01/build/arle`, final checked commit
   row-looped cache/metadata attention core.
 - The startup blocker text was tightened after this validation so future logs
   state the precise remaining gap: the cache/metadata attention core still
-  loops per row, while Q/K/V projections are already batched.
+  loops per row, while Q/K/V projections are already batched. A follow-up
+  release-fast build at `2a85c1459e0c4fb53deec8a8da1ea2dd2b7afd95` passed in
+  14.0s, and `strings target/release-fast/infer` confirmed the updated blocker
+  text is in the remote binary.
 - After both probes, no `infer` process remained and `nvidia-smi` reported no
   compute apps.
 
@@ -70,6 +73,7 @@ Artifacts:
 - `/tmp/dsv4_batched_attn_proj_20260603/debug_fallback_server.log`
 - `/tmp/dsv4_batched_attn_proj_20260603/debug_fallback_smoke.log`
 - `/tmp/dsv4_batched_attn_proj_20260603/startup_tp8_eagle_sglang.log`
+- `/tmp/dsv4_batched_attn_proj_20260603/build_after_blocker_text.log`
 
 ## Rule
 
