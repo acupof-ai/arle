@@ -109,6 +109,11 @@ struct ActiveMetalRequest {
     enqueued_at: Instant,
     admitted_at: Instant,
     first_token_at: Option<Instant>,
+    prefix_reused_tokens: usize,
+    /// Full generated-token history for cache keys. This is deliberately
+    /// separate from `pending_token_ids`, which is only a streaming transport
+    /// buffer and may be drained before request finalization.
+    generated_token_ids: Vec<u32>,
     /// Phase 2 trajectory token layer. Each `process_token` pushes the
     /// just-sampled id; whenever a text delta is actually sent
     /// (post stop-processor / decoder buffering), the pending IDs are
@@ -160,6 +165,8 @@ impl ActiveMetalRequest {
             enqueued_at: pending.enqueued_at,
             admitted_at: Instant::now(),
             first_token_at: None,
+            prefix_reused_tokens: 0,
+            generated_token_ids: Vec::new(),
             pending_token_ids: Vec::new(),
             cancel,
         })
@@ -259,6 +266,7 @@ impl ActiveMetalRequest {
         if self.first_token_at.is_none() {
             self.first_token_at = Some(Instant::now());
         }
+        self.generated_token_ids.push(token_id);
         // Record the token id BEFORE asking the incremental decoder for
         // text — the byte chunk may emit later (or never, if a stop
         // sequence withholds it), but the id always counts toward
@@ -280,6 +288,14 @@ impl ActiveMetalRequest {
             send_text_delta_with_ids(&self.delta_tx, delta, ids)?;
         }
         Ok(())
+    }
+
+    fn materialized_session_tokens(&self, cache_len: usize) -> Result<Vec<u32>> {
+        materialized_session_tokens_for_snapshot(
+            &self.prompt_tokens,
+            &self.generated_token_ids,
+            cache_len,
+        )
     }
 
     fn prompt_len(&self) -> usize {
@@ -366,6 +382,49 @@ fn snapshot_resident_bytes(snapshot: &Qwen35PrefixSnapshot) -> u64 {
         .sum()
 }
 
+fn materialized_session_tokens_for_snapshot(
+    prompt_tokens: &[u32],
+    generated_token_ids: &[u32],
+    cache_len: usize,
+) -> Result<Vec<u32>> {
+    ensure!(
+        cache_len >= prompt_tokens.len(),
+        "materialized Qwen3.5 session cache_len {} is shorter than prompt {}",
+        cache_len,
+        prompt_tokens.len()
+    );
+    let generated_len = cache_len - prompt_tokens.len();
+    ensure!(
+        generated_len <= generated_token_ids.len(),
+        "materialized Qwen3.5 session needs {} generated tokens, only {} recorded",
+        generated_len,
+        generated_token_ids.len()
+    );
+
+    let mut tokens = Vec::with_capacity(cache_len);
+    tokens.extend_from_slice(prompt_tokens);
+    tokens.extend_from_slice(&generated_token_ids[..generated_len]);
+    Ok(tokens)
+}
+
+fn should_persist_metal_prefix_snapshot(
+    prefill_cost_us: f64,
+    prompt_len: usize,
+    snapshot_tokens: usize,
+    reused_tokens: usize,
+    block_size: usize,
+    readback_us_per_token: f64,
+    safety: f64,
+) -> bool {
+    if reused_tokens >= block_size && snapshot_tokens > reused_tokens {
+        return true;
+    }
+    let prompt_len = prompt_len.max(1);
+    let saved_prefill_us = prefill_cost_us * (snapshot_tokens as f64 / prompt_len as f64);
+    let readback_cost_us = readback_us_per_token * snapshot_tokens as f64 * safety;
+    saved_prefill_us > readback_cost_us
+}
+
 struct MetalQwen35CachedPrefix {
     snapshot: Qwen35PrefixSnapshot,
     last_used_tick: u64,
@@ -420,6 +479,9 @@ impl MetalDiskPrefixIndex {
     }
 
     fn lookup_longest_prefix(&self, prompt_tokens: &[u32], block_size: usize) -> Option<Vec<u32>> {
+        // Strict extension only. Exact-prompt reuse needs a separate state
+        // transition from imported Prefill to Decode; the current prefill path
+        // must still run the terminal prompt step to sample the first token.
         self.entries
             .keys()
             .filter(|tokens| {
@@ -945,6 +1007,14 @@ impl MetalLivePrefixRuntime {
         }
     }
 
+    fn publish_completed_session_prefix(&mut self, request: &mut ActiveMetalRequest) -> Result<()> {
+        match self {
+            MetalLivePrefixRuntime::Qwen35(runtime) => {
+                runtime.publish_completed_session_prefix(request)
+            }
+        }
+    }
+
     fn set_paged_pool_pressure(&mut self, pressure: f64) {
         match self {
             MetalLivePrefixRuntime::Qwen35(runtime) => runtime.set_paged_pool_pressure(pressure),
@@ -1101,6 +1171,7 @@ impl MetalQwen35PrefixRuntime {
             prompt_len,
             prompt_len.saturating_sub(reused_tokens),
         );
+        request.prefix_reused_tokens = reused_tokens;
         Ok(())
     }
 
@@ -1155,6 +1226,42 @@ impl MetalQwen35PrefixRuntime {
         Ok(())
     }
 
+    /// Publish the longest currently materialized session prefix after request
+    /// completion. This usually means `prompt + generated[..N-1]`: the final
+    /// sampled token has not necessarily been fed back through the model, and
+    /// running an extra decode at finish would put SSD persistence on the
+    /// user-visible boundary. The next turn can still import this prefix and
+    /// prefill the one-token tail plus the new user suffix.
+    fn publish_completed_session_prefix(&mut self, request: &mut ActiveMetalRequest) -> Result<()> {
+        let trace = std::env::var("INFER_M_E10_TRACE").is_ok();
+        if !request.request_state.can_import_qwen35_prefix_snapshot() {
+            return Ok(());
+        }
+        let Some(cache_len) = request.request_state.qwen35_live_cache_len() else {
+            return Ok(());
+        };
+        if cache_len <= request.prompt_tokens.len() {
+            return Ok(());
+        }
+        let token_ids = request
+            .materialized_session_tokens(cache_len)
+            .context("build Qwen3.5 completed-session snapshot token key")?;
+        let Some(snapshot) = request
+            .request_state
+            .export_qwen35_live_session_snapshot(token_ids, self.block_size)
+            .context("snapshot live Qwen3.5 completed session prefix")?
+        else {
+            return Ok(());
+        };
+
+        if self.tier_adapter.has_disk_tier() {
+            self.maybe_enqueue_disk_persist(request, &snapshot, trace);
+        }
+
+        self.insert_snapshot(snapshot);
+        Ok(())
+    }
+
     /// Budget-gate a full-length snapshot for SSD and, on a clear win, encode it
     /// (on the serving thread, for MLX safety) and hand it to the async writer.
     /// Returns without blocking on disk I/O.
@@ -1189,16 +1296,32 @@ impl MetalQwen35PrefixRuntime {
         let readback_us_per_token = metal_prefix_readback_us_per_token();
         let safety = metal_prefix_persist_safety();
         let readback_cost_us = readback_us_per_token * tokens as f64 * safety;
-        let worth_persist = prefill_cost_us > readback_cost_us;
+        let prompt_len = request.prompt_tokens.len().max(1);
+        let saved_prefill_us = prefill_cost_us * (tokens as f64 / prompt_len as f64);
+        let extends_cached_prefix = request.prefix_reused_tokens >= self.block_size
+            && tokens > request.prefix_reused_tokens;
+        let worth_persist = should_persist_metal_prefix_snapshot(
+            prefill_cost_us,
+            request.prompt_tokens.len(),
+            tokens,
+            request.prefix_reused_tokens,
+            self.block_size,
+            readback_us_per_token,
+            safety,
+        );
         if trace {
             log::info!(
                 "m_e10_trace publish budget: tokens={} prefill_cost_us={:.0} \
-                 readback_cost_us={:.0} (per_token={} safety={}) worth_persist={}",
+                 saved_prefill_us={:.0} readback_cost_us={:.0} \
+                 (per_token={} safety={}) reused_tokens={} extends_cached_prefix={} worth_persist={}",
                 tokens,
                 prefill_cost_us,
+                saved_prefill_us,
                 readback_cost_us,
                 readback_us_per_token,
                 safety,
+                request.prefix_reused_tokens,
+                extends_cached_prefix,
                 worth_persist,
             );
         }
@@ -1264,6 +1387,7 @@ impl MetalQwen35PrefixRuntime {
     }
 
     fn lookup_longest_prefix(&self, prompt_tokens: &[u32]) -> Option<Vec<u32>> {
+        // Strict extension only; see `MetalDiskPrefixIndex::lookup_longest_prefix`.
         self.entries
             .keys()
             .filter(|tokens| {
@@ -2207,6 +2331,7 @@ fn guard_schedule_step(
                 guard_decode_batch(
                     batch.req_ids,
                     metrics,
+                    prefix_runtime,
                     scheduler,
                     active,
                     qwen35_decode_batch_cache,
@@ -2229,6 +2354,7 @@ fn guard_schedule_step(
             guard_decode_batch(
                 batch.req_ids,
                 metrics,
+                prefix_runtime,
                 scheduler,
                 active,
                 qwen35_decode_batch_cache,
@@ -2302,6 +2428,7 @@ fn guard_mixed_batch(
 fn guard_decode_batch(
     req_ids: Vec<RequestId>,
     metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
     qwen35_decode_batch_cache: &mut Option<CachedQwen35DecodeBatch>,
@@ -2311,6 +2438,7 @@ fn guard_decode_batch(
         execute_decode_batch(
             req_ids,
             metrics,
+            prefix_runtime,
             scheduler,
             active,
             qwen35_decode_batch_cache,
@@ -2462,7 +2590,14 @@ fn execute_mixed_batch(
             );
             continue;
         }
-        finish_or_requeue_decoded_request(req_id, request, metrics, scheduler, active);
+        finish_or_requeue_decoded_request(
+            req_id,
+            request,
+            metrics,
+            prefix_runtime,
+            scheduler,
+            active,
+        );
     }
 
     if let Some(sampled_token) = prefill.emitted_token {
@@ -2488,7 +2623,13 @@ fn execute_mixed_batch(
     }
 
     if prefill_request.phase() == RuntimePhase::Finished || prefill_request.stop_hit() {
-        finalize_detached_request(prefill_req_id, prefill_request, metrics, scheduler);
+        finalize_detached_request(
+            prefill_req_id,
+            prefill_request,
+            metrics,
+            prefix_runtime,
+            scheduler,
+        );
     } else {
         active.insert(prefill_req_id, prefill_request);
     }
@@ -2787,7 +2928,7 @@ fn execute_prefill_chunk(
             }
 
             if runtime_finished || stop_hit {
-                finalize_request(req_id, metrics, scheduler, active);
+                finalize_request(req_id, metrics, prefix_runtime, scheduler, active);
             }
         }
         PrefillChunkOutcome::ClientDropped => cancel_request(req_id, scheduler, active),
@@ -2826,6 +2967,7 @@ fn drain_other_qwen35_cpp_sessions(
 fn execute_decode_batch(
     req_ids: Vec<RequestId>,
     metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
     qwen35_decode_batch_cache: &mut Option<CachedQwen35DecodeBatch>,
@@ -2873,13 +3015,19 @@ fn execute_decode_batch(
         .partition(|(_, request)| request.request_state.is_dflash_enabled());
 
     if dflash_requests.len() >= 2 {
-        execute_qwen35_dflash_packed_batch(dflash_requests, metrics, scheduler, active);
+        execute_qwen35_dflash_packed_batch(
+            dflash_requests,
+            metrics,
+            prefix_runtime,
+            scheduler,
+            active,
+        );
     } else {
         if scheduled_open_len >= 2 && !dflash_requests.is_empty() {
             metrics.record_metal_decode_batch_fallback(dflash_requests.len());
         }
         for (req_id, request) in dflash_requests {
-            execute_decode_single(req_id, request, metrics, scheduler, active);
+            execute_decode_single(req_id, request, metrics, prefix_runtime, scheduler, active);
         }
     }
     let mut open = non_dflash;
@@ -2948,7 +3096,14 @@ fn execute_decode_batch(
                 );
                 continue;
             }
-            finish_or_requeue_decoded_request(req_id, request, metrics, scheduler, active);
+            finish_or_requeue_decoded_request(
+                req_id,
+                request,
+                metrics,
+                prefix_runtime,
+                scheduler,
+                active,
+            );
         }
 
         // Survivors are exactly the rows whose req_id is back in `active`
@@ -2985,7 +3140,7 @@ fn execute_decode_batch(
         metrics.record_metal_decode_batch_fallback(open.len());
     }
     for (req_id, request) in open {
-        execute_decode_single(req_id, request, metrics, scheduler, active);
+        execute_decode_single(req_id, request, metrics, prefix_runtime, scheduler, active);
     }
 }
 
@@ -3000,6 +3155,7 @@ fn execute_decode_batch(
 fn execute_qwen35_dflash_packed_batch(
     mut rows: Vec<(RequestId, ActiveMetalRequest)>,
     metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -3009,7 +3165,7 @@ fn execute_qwen35_dflash_packed_batch(
             metrics.record_metal_decode_batch_fallback(rows.len());
         }
         for (req_id, request) in rows {
-            execute_decode_single(req_id, request, metrics, scheduler, active);
+            execute_decode_single(req_id, request, metrics, prefix_runtime, scheduler, active);
         }
         return;
     }
@@ -3029,7 +3185,14 @@ fn execute_qwen35_dflash_packed_batch(
                 // and buffered-drain cases cleanly.
                 metrics.record_metal_decode_batch_fallback(rows.len());
                 for (req_id, request) in rows {
-                    execute_decode_single(req_id, request, metrics, scheduler, active);
+                    execute_decode_single(
+                        req_id,
+                        request,
+                        metrics,
+                        prefix_runtime,
+                        scheduler,
+                        active,
+                    );
                 }
                 return;
             }
@@ -3084,9 +3247,16 @@ fn execute_qwen35_dflash_packed_batch(
                 );
                 continue;
             }
-            finish_or_requeue_decoded_request(req_id, request, metrics, scheduler, active);
+            finish_or_requeue_decoded_request(
+                req_id,
+                request,
+                metrics,
+                prefix_runtime,
+                scheduler,
+                active,
+            );
         } else {
-            execute_decode_single(req_id, request, metrics, scheduler, active);
+            execute_decode_single(req_id, request, metrics, prefix_runtime, scheduler, active);
         }
     }
 }
@@ -3298,6 +3468,7 @@ fn execute_decode_single(
     req_id: RequestId,
     mut request: ActiveMetalRequest,
     metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -3348,7 +3519,7 @@ fn execute_decode_single(
             stop_hit,
         } => {
             if runtime_finished || stop_hit {
-                finalize_detached_request(req_id, request, metrics, scheduler);
+                finalize_detached_request(req_id, request, metrics, prefix_runtime, scheduler);
             } else {
                 active.insert(req_id, request);
             }
@@ -3372,13 +3543,14 @@ fn finish_or_requeue_decoded_request(
     req_id: RequestId,
     request: ActiveMetalRequest,
     metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
     let runtime_finished = request.phase() == RuntimePhase::Finished;
     let stop_hit = request.stop_hit();
     if runtime_finished || stop_hit {
-        finalize_detached_request(req_id, request, metrics, scheduler);
+        finalize_detached_request(req_id, request, metrics, prefix_runtime, scheduler);
     } else {
         active.insert(req_id, request);
     }
@@ -3421,10 +3593,27 @@ fn cancel_detached_request(
     drop(request);
 }
 
+fn publish_completed_session_prefix(
+    req_id: RequestId,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
+    request: &mut ActiveMetalRequest,
+) {
+    let Some(prefix_runtime) = prefix_runtime.as_mut() else {
+        return;
+    };
+    if let Err(err) = prefix_runtime.publish_completed_session_prefix(request) {
+        warn!(
+            "Metal completed-session prefix publish failed for {:?}: {err:#}",
+            req_id
+        );
+    }
+}
+
 fn finalize_detached_request(
     req_id: RequestId,
     mut request: ActiveMetalRequest,
     metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
 ) {
     scheduler.finish_request(req_id, Some(InferenceMode::Decode));
@@ -3432,6 +3621,7 @@ fn finalize_detached_request(
     if let Err(err) = request.send_final_delta() {
         warn!("Metal request final delta failed for {:?}: {err:#}", req_id);
     }
+    publish_completed_session_prefix(req_id, prefix_runtime, &mut request);
     drop(request);
 }
 
@@ -3479,6 +3669,7 @@ fn cancel_request(
 fn finalize_request(
     req_id: RequestId,
     metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -3487,13 +3678,14 @@ fn finalize_request(
         return;
     };
     record_request_completed(metrics, &request);
-    if let Err(err) = request.cancel() {
-        warn!("Metal request cleanup failed for {:?}: {err:#}", req_id);
-    }
     if let Err(err) = request.send_final_delta()
         && !request.delta_closed()
     {
         warn!("Metal request final delta failed for {:?}: {err:#}", req_id);
+    }
+    publish_completed_session_prefix(req_id, prefix_runtime, &mut request);
+    if let Err(err) = request.cancel() {
+        warn!("Metal request cleanup failed for {:?}: {err:#}", req_id);
     }
     drop(request);
 }
@@ -3749,6 +3941,82 @@ mod tests {
 
         handle.release_pending(6);
         assert_eq!(handle.pending_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn materialized_session_tokens_use_only_committed_generated_prefix() {
+        let tokens = materialized_session_tokens_for_snapshot(&[10, 11], &[20, 21, 22], 4)
+            .expect("materialized key");
+        assert_eq!(tokens, vec![10, 11, 20, 21]);
+
+        let err = materialized_session_tokens_for_snapshot(&[10, 11], &[20], 4)
+            .expect_err("missing generated token should fail");
+        assert!(
+            err.to_string().contains("only 1 recorded"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn metal_prefix_persist_gate_keeps_session_extensions() {
+        assert!(should_persist_metal_prefix_snapshot(
+            1.0,
+            4096,
+            4100,
+            4096,
+            METAL_PREFIX_BLOCK_SIZE,
+            48.0,
+            2.0,
+        ));
+        assert!(!should_persist_metal_prefix_snapshot(
+            100.0,
+            128,
+            128,
+            0,
+            METAL_PREFIX_BLOCK_SIZE,
+            48.0,
+            2.0,
+        ));
+        assert!(should_persist_metal_prefix_snapshot(
+            15_000_000.0,
+            12_288,
+            12_544,
+            0,
+            METAL_PREFIX_BLOCK_SIZE,
+            48.0,
+            2.0,
+        ));
+    }
+
+    #[test]
+    fn metal_disk_prefix_index_matches_only_strict_extensions() {
+        let mut index = MetalDiskPrefixIndex::new(None, 0.90, 0.75);
+        index.insert(
+            vec![10, 11, 12],
+            DiskBlockLocation {
+                path: PathBuf::from("short"),
+                payload_len: 30,
+                fingerprint: BlockFingerprint([1; 16]),
+            },
+        );
+        index.insert(
+            vec![10, 11, 12, 13],
+            DiskBlockLocation {
+                path: PathBuf::from("long"),
+                payload_len: 40,
+                fingerprint: BlockFingerprint([2; 16]),
+            },
+        );
+
+        assert_eq!(
+            index.lookup_longest_prefix(&[10, 11, 12, 13, 14], 2),
+            Some(vec![10, 11, 12, 13])
+        );
+        assert_eq!(
+            index.lookup_longest_prefix(&[10, 11, 12, 13], 2),
+            Some(vec![10, 11, 12])
+        );
+        assert_eq!(index.lookup_longest_prefix(&[10, 11, 12], 2), None);
     }
 
     #[test]
