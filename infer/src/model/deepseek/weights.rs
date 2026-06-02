@@ -33,9 +33,10 @@ use super::mlp::{
 };
 #[cfg(feature = "cuda")]
 use super::state::{
-    DeepseekAttentionRuntimeCache, DeepseekGpuCompressorRuntimeCache, DeepseekHiddenRuntimeScratch,
-    DeepseekLayerRuntimeCache, DeepseekMhcRuntimeScratch, DeepseekMoeRuntimeCache,
-    ensure_hidden_scratch, ensure_mhc_scratch, put_hidden_scratch, take_hidden_scratch,
+    DeepseekAttentionRuntimeCache, DeepseekFlashMlaDecodeMeta, DeepseekGpuCompressorRuntimeCache,
+    DeepseekHiddenRuntimeScratch, DeepseekLayerRuntimeCache, DeepseekMhcRuntimeScratch,
+    DeepseekMoeRuntimeCache, ensure_hidden_scratch, ensure_mhc_scratch, put_hidden_scratch,
+    take_hidden_scratch,
 };
 #[cfg(all(test, feature = "cuda"))]
 use super::state::{DeepseekCompressedRow, DeepseekCompressorRuntimeCache};
@@ -3189,31 +3190,16 @@ impl DeepseekModel {
                 let index_topk = self.config.index_topk;
                 let d_v = head_dim; // MODEL1: d_qk == d_v == 512 at NoPE+RoPE
                 let d_v_for_decode = 512_i32; // decode kernel d_v hard-assert
+                let cache_mut = cache.as_deref_mut().expect("cache present (gated above)");
 
-                // Step 1 — host meta.
-                let mut num_sm_parts: i32 = 0;
-                let mut fixed_overhead_num_blocks: i32 = 0;
-                let mut block_size_topk: i32 = 0;
-                unsafe {
-                    ffi::arle_flashmla_sm90_sparse_decode_get_meta(
-                        local_heads as i32,
-                        1_i32,
-                        model_type_int,
-                        &raw mut num_sm_parts,
-                        &raw mut fixed_overhead_num_blocks,
-                        &raw mut block_size_topk,
-                    )
-                    .result()
-                    .map_err(|err| {
-                        anyhow::anyhow!("DSv4 FlashMLA decode get_meta failed: {err}")
-                    })?;
-                }
-                ensure!(
-                    num_sm_parts > 0 && block_size_topk > 0,
-                    "DSv4 FlashMLA decode get_meta returned bogus values: num_sm_parts={} block_size_topk={}",
-                    num_sm_parts,
-                    block_size_topk
-                );
+                // Step 1 — host meta. FlashMLA's decode meta for this branch is
+                // shape-only (`local_heads`, `s_q=1`, MODEL1), so cache it per
+                // attention runtime cache instead of calling the host shim every
+                // token.
+                let fm_meta = ensure_fm_decode_meta(cache_mut, local_heads, model_type_int)?;
+                let num_sm_parts = fm_meta.num_sm_parts;
+                let fixed_overhead_num_blocks = fm_meta.fixed_overhead_num_blocks;
+                let block_size_topk = fm_meta.block_size_topk;
 
                 // max_compressed_keys: CSA uses index_topk, HCA pads
                 // compressed_count up to next multiple of 128 (FlashMLA
@@ -3239,7 +3225,6 @@ impl DeepseekModel {
                 let num_sm_parts_max = (num_sm_parts as usize).max(256);
 
                 // Step 2 — ensure arena.
-                let cache_mut = cache.as_deref_mut().expect("cache present (gated above)");
                 ensure_fm_decode_arena(
                     &self.ctx,
                     cache_mut,
@@ -5318,6 +5303,54 @@ const DSV4_FLASHMLA_DECODING_SCHED_META_INTS: usize = 8;
 ///
 /// `b = 1` for ARLE decode (single sequence per `finish_attention_gpu`
 /// call; batching is at the scheduler layer above).
+#[cfg(feature = "cuda")]
+fn ensure_fm_decode_meta(
+    cache: &mut DeepseekAttentionRuntimeCache,
+    local_heads: usize,
+    model_type: i32,
+) -> Result<DeepseekFlashMlaDecodeMeta> {
+    if let Some(meta) = cache.fm_decode_meta {
+        if meta.local_heads == local_heads && meta.model_type == model_type {
+            return Ok(meta);
+        }
+    }
+
+    ensure!(
+        local_heads <= i32::MAX as usize,
+        "DSv4 FlashMLA decode local_heads {local_heads} overflows i32"
+    );
+    let mut num_sm_parts: i32 = 0;
+    let mut fixed_overhead_num_blocks: i32 = 0;
+    let mut block_size_topk: i32 = 0;
+    unsafe {
+        ffi::arle_flashmla_sm90_sparse_decode_get_meta(
+            local_heads as i32,
+            1_i32,
+            model_type,
+            &raw mut num_sm_parts,
+            &raw mut fixed_overhead_num_blocks,
+            &raw mut block_size_topk,
+        )
+        .result()
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode get_meta failed: {err}"))?;
+    }
+    ensure!(
+        num_sm_parts > 0 && block_size_topk > 0,
+        "DSv4 FlashMLA decode get_meta returned bogus values: num_sm_parts={} block_size_topk={}",
+        num_sm_parts,
+        block_size_topk
+    );
+    let meta = DeepseekFlashMlaDecodeMeta {
+        local_heads,
+        model_type,
+        num_sm_parts,
+        fixed_overhead_num_blocks,
+        block_size_topk,
+    };
+    cache.fm_decode_meta = Some(meta);
+    Ok(meta)
+}
+
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn ensure_fm_decode_arena(

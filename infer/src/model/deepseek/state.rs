@@ -1032,6 +1032,16 @@ pub(crate) fn put_hidden_scratch(
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DeepseekFlashMlaDecodeMeta {
+    pub(crate) local_heads: usize,
+    pub(crate) model_type: i32,
+    pub(crate) num_sm_parts: i32,
+    pub(crate) fixed_overhead_num_blocks: i32,
+    pub(crate) block_size_topk: i32,
+}
+
+#[cfg(feature = "cuda")]
 #[derive(Default)]
 pub(crate) struct DeepseekAttentionRuntimeCache {
     #[cfg(test)]
@@ -1156,6 +1166,7 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     pub(crate) fm_decode_indices: Option<CudaSlice<i32>>,
     pub(crate) fm_decode_topk_length: Option<CudaSlice<i32>>,
     pub(crate) fm_decode_lse_out: Option<CudaSlice<f32>>,
+    pub(crate) fm_decode_meta: Option<DeepseekFlashMlaDecodeMeta>,
     pub(crate) fm_decode_scratch_num_sm_parts: usize,
     pub(crate) fm_decode_scratch_topk_unified: usize,
     pub(crate) fm_decode_scratch_h_q: usize,
