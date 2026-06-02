@@ -33,6 +33,14 @@ DeepEP checkout exposes the compatible intranode kernels under
 `csrc/kernels/legacy/api.cuh`, so the build silently skipped
 `arle_deepep_sidecar` and still produced a DSv4 prebuilt cache.
 
+A third startup-contract bug appeared after the sidecar path was baked into
+`infer`: rank 2 exited during the BootResponse read with
+`failed to fill whole buffer`. This was not a DeepEP kernel failure. The Rust
+parent uses fixed child fds 10/11 for the sidecar wire protocol, but `pipe(2)`
+can also hand out fd 10 or 11 as a source fd. When that happened, the child's
+`dup2` sequence clobbered the source fd needed for the sidecar-to-parent pipe,
+so the sidecar could not write its boot response.
+
 ## Fix
 
 `scripts/dsv4_fast_build.sh` now:
@@ -54,6 +62,11 @@ The build script supports both the old flat DeepEP kernel layout and the newer
 itself. A `cargo:rustc-env` emitted by `cuda-kernels/build.rs` is crate-local
 and cannot satisfy `option_env!("ARLE_DEEPEP_SIDECAR_PATH")` inside `infer`.
 
+`infer/src/backend/cuda/deepep_sidecar/pool.rs` now moves any pipe source fd
+that collides with the protocol's reserved fd 10/11 before fork/exec, marks
+source fds close-on-exec, and includes child pid/exit status in sidecar EOF
+diagnostics.
+
 ## Rule
 
 For DSv4, a prebuilt CUDA archive is not valid because its manifest matches.
@@ -61,3 +74,7 @@ It is valid only if `nm -g libkernels_cuda.a` proves the current DSv4 FFI symbol
 set is exported, and if the native DeepEP source tree is present then the
 sidecar must be part of the same prebuilt cache. Build fast paths must fail
 closed before runtime fallback.
+
+Fixed-fd child protocols must reserve their fds before creating pipes, or move
+colliding pipe fds away before `dup2`. Otherwise a valid sidecar binary can
+fail before any CUDA/DeepEP code path is reached.

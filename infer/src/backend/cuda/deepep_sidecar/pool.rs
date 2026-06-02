@@ -253,6 +253,10 @@ fn mk_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    for fd in &mut fds {
+        *fd = move_from_protocol_fd(*fd)?;
+        set_cloexec(*fd)?;
+    }
     // Safety: pipe(2) returns valid owned fds.
     unsafe {
         use std::os::fd::FromRawFd;
@@ -261,6 +265,39 @@ fn mk_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
             std::fs::File::from_raw_fd(fds[1]),
         ))
     }
+}
+
+fn move_from_protocol_fd(fd: i32) -> std::io::Result<i32> {
+    if fd != CHILD_P2C_FD && fd != CHILD_C2P_FD {
+        return Ok(fd);
+    }
+    // The sidecar protocol reserves fd 10/11 after exec. If pipe(2) hands
+    // one of those out as a source fd, dup2 can clobber the other source and
+    // leave the child unable to write its boot response.
+    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD, CHILD_C2P_FD + 1) };
+    if new_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
+    }
+    unsafe {
+        libc::close(fd);
+    }
+    Ok(new_fd)
+}
+
+fn set_cloexec(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn send_message(r: &Rank, cmd: CommandId, payload: &[u8]) -> Result<()> {
@@ -286,12 +323,40 @@ fn recv_message(r: &Rank) -> Result<(Status, Vec<u8>)> {
         .lock()
         .map_err(|_| anyhow!("c2p_rx poisoned on rank {}", r.rank))?;
     let mut hdr_buf = [0u8; MessageHeader::SIZE];
-    rx.read_exact(&mut hdr_buf)?;
+    rx.read_exact(&mut hdr_buf).with_context(|| {
+        format!(
+            "read sidecar header from rank {} ({})",
+            r.rank,
+            child_hint(r)
+        )
+    })?;
     let hdr = MessageHeader::from_le_bytes(&hdr_buf);
     let mut payload = vec![0u8; hdr.payload_bytes as usize];
     if !payload.is_empty() {
-        rx.read_exact(&mut payload)?;
+        rx.read_exact(&mut payload).with_context(|| {
+            format!(
+                "read sidecar payload from rank {} bytes={} ({})",
+                r.rank,
+                hdr.payload_bytes,
+                child_hint(r)
+            )
+        })?;
     }
     let status = Status::from_u32(hdr.cmd_or_status)?;
     Ok((status, payload))
+}
+
+fn child_hint(r: &Rank) -> String {
+    let Ok(mut guard) = r.child.lock() else {
+        return "child lock poisoned".to_string();
+    };
+    let Some(child) = guard.as_mut() else {
+        return "child handle already reaped".to_string();
+    };
+    let pid = child.id();
+    match child.try_wait() {
+        Ok(Some(status)) => format!("pid {pid} exited with {status}"),
+        Ok(None) => format!("pid {pid} still running"),
+        Err(e) => format!("pid {pid} status unavailable: {e}"),
+    }
 }
