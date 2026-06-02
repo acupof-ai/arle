@@ -433,15 +433,6 @@ impl ModelForward for DeepseekModel {
             missing.push("ARLE_DSV4_INCREMENTAL_KV must be enabled".to_string());
         }
         missing.push(
-            "serving startup still selects the replicated-token request lane; token-owned owner-group relay is guarded and not selected by DSv4 startup".to_string(),
-        );
-        missing.push(
-            "axis-derived owner-group request token-sync NCCL communicators are not wired for the SGLang DP/attention topology".to_string(),
-        );
-        missing.push(
-            "token-owned relay output return exists on the control plane, but DSv4 startup/data-plane still does not select it".to_string(),
-        );
-        missing.push(
             "DSv4 graph-captured SWA/C4/C128 metadata replay is not implemented in this executable route"
                 .to_string(),
         );

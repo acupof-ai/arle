@@ -29,6 +29,8 @@ pub(crate) mod trace;
 mod weights;
 
 pub use crate::deepseek_v4_manifest::DeepseekV4CheckpointManifest;
-pub use config::DeepseekRuntimeConfig;
+pub use config::{
+    DeepseekPerformanceProfile, DeepseekRuntimeConfig, dsv4_performance_profile_from_env,
+};
 pub use state::DeepseekState;
 pub use weights::DeepseekModel;

@@ -693,6 +693,28 @@ pub fn build_attn_dp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     group_ranks
 }
 
+// SGLang DataParallelController request ownership groups.
+//
+// Work requests are routed to one attention-DP slice. The slice leader
+// receives from the controller, then broadcasts within ATTN_TP and ATTN_CP.
+// This is intentionally different from `build_attn_dp_groups`: that function
+// builds cross-DP communication groups for gather/scatter, while this function
+// builds per-DP compute-owner groups.
+pub fn build_attn_owner_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
+    let world = cfg.world_size();
+    let num_tp_groups = world / cfg.tp_size;
+    let owner_group_size = cfg.attn_tp_size() * cfg.attn_cp_size;
+    let mut group_ranks = Vec::new();
+    for tp_group_idx in 0..num_tp_groups {
+        for attn_dp_idx in 0..cfg.attn_dp_size {
+            let st = tp_group_idx * cfg.tp_size + attn_dp_idx * owner_group_size;
+            let en = st + owner_group_size;
+            group_ranks.push((st..en).collect());
+        }
+    }
+    group_ranks
+}
+
 // SGLang parallel_state.py:1903-1919
 pub fn build_moe_dp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     if cfg.attn_cp_size > cfg.moe_dp_size {
@@ -1082,6 +1104,45 @@ mod tests {
             assert_eq!(coord.attn_cp_rank, (tp_rank / 2) % 2);
             assert_eq!(coord.attn_dp_rank, tp_rank / (2 * 2));
         }
+    }
+
+    #[test]
+    fn attn_owner_groups_match_sglang_dp_request_slices() {
+        let cfg = MultiAxisConfig {
+            tp_size: 8,
+            pp_size: 1,
+            ep_size: 4,
+            attn_dp_size: 4,
+            attn_cp_size: 1,
+            moe_dp_size: 2,
+        };
+        cfg.validate().unwrap();
+        assert_eq!(cfg.attn_tp_size(), 2);
+        assert_eq!(
+            build_attn_owner_groups(cfg),
+            vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]],
+        );
+        assert_eq!(
+            build_attn_dp_groups(cfg),
+            vec![vec![0, 2, 4, 6], vec![1, 3, 5, 7]],
+        );
+    }
+
+    #[test]
+    fn attn_owner_groups_collapse_to_whole_tp_when_dp_disabled() {
+        let cfg = MultiAxisConfig {
+            tp_size: 8,
+            pp_size: 1,
+            ep_size: 8,
+            attn_dp_size: 1,
+            attn_cp_size: 1,
+            moe_dp_size: 1,
+        };
+        cfg.validate().unwrap();
+        assert_eq!(
+            build_attn_owner_groups(cfg),
+            vec![vec![0, 1, 2, 3, 4, 5, 6, 7]]
+        );
     }
 
     #[test]

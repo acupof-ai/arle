@@ -330,12 +330,15 @@ impl DeepseekModel {
                     comm = comm.with_ep_overlap_nccl(overlap_group)?;
                 }
 
-                if dsv4_native_deepep_enabled()? {
+                if dsv4_native_deepep_enabled()?
+                    && !config.performance_profile()?.requires_best_practice()
+                {
                     bail!(
-                        "ARLE_DSV4_MOE_BACKEND=native-deepep is reserved for the token-owned \
-                         DP/EP request path. The current DSv4 executable route is \
-                         replicated-token; use ARLE_DSV4_MOE_BACKEND=allreduce for the \
-                         debug fallback until token-owned request sharding is wired."
+                        "ARLE_DSV4_MOE_BACKEND=native-deepep is reserved for the \
+                         SGLang best-practice token-owned request path. Set \
+                         ARLE_DSV4_PERFORMANCE_PROFILE=sglang after satisfying the \
+                         startup contract, or use ARLE_DSV4_MOE_BACKEND=allreduce \
+                         for the debug fallback lane."
                     );
                 }
             }
