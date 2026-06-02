@@ -119,7 +119,7 @@ impl<M: ModelForward> Scheduler<M> {
         model.validate_scheduler_contract(
             kv_cache_dtype,
             kv_pool_format,
-            config.cuda_graph_max_bs,
+            config.startup_contract(),
         )?;
         if internal_mtp_draft_requested {
             model.validate_internal_mtp_draft_support()?;

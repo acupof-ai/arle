@@ -71,6 +71,14 @@ impl DistributedRequestOwnership {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchedulerStartupContract {
+    pub cuda_graph_max_bs: usize,
+    pub effective_world_size: usize,
+    pub request_ownership: DistributedRequestOwnership,
+    pub token_owner_group_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DistributedRequestShard {
     pub ownership: DistributedRequestOwnership,
     pub rank: usize,
@@ -424,6 +432,16 @@ pub struct SchedulerConfig {
     /// runtime batches still execute eagerly instead of triggering unbounded
     /// graph cache growth.
     pub cuda_graph_max_bs: usize,
+    /// Planned distributed request ownership visible to model startup checks.
+    ///
+    /// This is not a hot-path routing knob by itself; request routing is owned by
+    /// `RequestHandle`. The field lets strict model contracts fail closed on the
+    /// exact scheduler plan instead of inferring from TP/EP size alone.
+    pub request_ownership: DistributedRequestOwnership,
+    /// Effective distributed world size seen by the request router.
+    pub request_effective_world_size: usize,
+    /// Number of configured token-owner groups for token-owned request routing.
+    pub token_owner_group_count: usize,
     /// Enable Phase 2 speculative decode. Defaults off; P2.3 only routes the
     /// single-token verifier canary. K-token speculation requires the model-side
     /// verifier API and paged-KV rollback path.
@@ -529,6 +547,9 @@ impl Default for SchedulerConfig {
             mixed_policy: SchedulerMixedPolicy::Mixed,
             stream_interval: 1,
             cuda_graph_max_bs: 256,
+            request_ownership: DistributedRequestOwnership::ReplicatedToken,
+            request_effective_world_size: 1,
+            token_owner_group_count: 0,
             spec_enabled: false,
             spec_draft_k: 5,
             spec_acceptance_threshold: 0.6,
@@ -587,6 +608,15 @@ pub fn pick_chunked_prefill_size_for_hbm(gpu_total_bytes: usize) -> usize {
 }
 
 impl SchedulerConfig {
+    pub fn startup_contract(&self) -> SchedulerStartupContract {
+        SchedulerStartupContract {
+            cuda_graph_max_bs: self.cuda_graph_max_bs,
+            effective_world_size: self.request_effective_world_size,
+            request_ownership: self.request_ownership,
+            token_owner_group_count: self.token_owner_group_count,
+        }
+    }
+
     /// Runtime-oriented defaults for the CUDA-backed serving scheduler.
     ///
     /// This keeps the existing `Default` implementation stable for the
@@ -726,6 +756,21 @@ impl SchedulerConfig {
         }
         if self.cuda_graph_max_bs == 0 {
             anyhow::bail!("cuda_graph_max_bs must be ≥ 1");
+        }
+        if self.request_effective_world_size == 0 {
+            anyhow::bail!("request_effective_world_size must be ≥ 1");
+        }
+        if self.token_owner_group_count > 0
+            && self.request_ownership != DistributedRequestOwnership::TokenOwnedDpEp
+        {
+            anyhow::bail!("token_owner_group_count requires request_ownership=token-owned-dp-ep");
+        }
+        if self.request_ownership == DistributedRequestOwnership::TokenOwnedDpEp
+            && self.token_owner_group_count == 0
+        {
+            anyhow::bail!(
+                "request_ownership=token-owned-dp-ep requires token_owner_group_count ≥ 1"
+            );
         }
         if self.spec_draft_k == 0 {
             anyhow::bail!("spec_draft_k must be ≥ 1");
@@ -1445,6 +1490,12 @@ mod tests {
         assert_eq!(cfg.cold_headroom, None);
         assert_eq!(cfg.mixed_policy, SchedulerMixedPolicy::Mixed);
         assert_eq!(cfg.cuda_graph_max_bs, 256);
+        assert_eq!(
+            cfg.request_ownership,
+            DistributedRequestOwnership::ReplicatedToken
+        );
+        assert_eq!(cfg.request_effective_world_size, 1);
+        assert_eq!(cfg.token_owner_group_count, 0);
         assert!(!cfg.spec_enabled);
         assert_eq!(cfg.spec_draft_k, 5);
         assert_eq!(cfg.spec_acceptance_threshold, 0.6);
