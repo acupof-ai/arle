@@ -334,6 +334,7 @@ const METRICS_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
 const METAL_PREFIX_READBACK_US_PER_TOKEN_DEFAULT: f64 = 48.0;
 const METAL_PREFIX_PERSIST_SAFETY_DEFAULT: f64 = 2.0;
 const METAL_PREFIX_SSD_PENDING_BYTES_DEFAULT: u64 = 1024 * 1024 * 1024;
+const METAL_PREFIX_PERSIST_MIN_EXTENSION_TOKENS_DEFAULT: usize = 64;
 
 fn metal_prefix_readback_us_per_token() -> f64 {
     std::env::var("INFER_METAL_PREFIX_READBACK_US_PER_TOKEN")
@@ -357,6 +358,14 @@ fn metal_prefix_ssd_pending_bytes_limit() -> u64 {
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(METAL_PREFIX_SSD_PENDING_BYTES_DEFAULT)
+}
+
+fn metal_prefix_persist_min_extension_tokens() -> usize {
+    std::env::var("INFER_METAL_PREFIX_PERSIST_MIN_EXTENSION_TOKENS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(METAL_PREFIX_PERSIST_MIN_EXTENSION_TOKENS_DEFAULT)
 }
 
 enum PrefillChunkOutcome {
@@ -426,7 +435,14 @@ fn should_persist_metal_prefix_snapshot(
     block_size: usize,
     readback_us_per_token: f64,
     safety: f64,
+    min_extension_tokens: usize,
 ) -> bool {
+    if let Some(extension_delta) =
+        metal_prefix_extension_delta_tokens(prompt_len, snapshot_tokens, reused_tokens, block_size)
+        && extension_delta < min_extension_tokens
+    {
+        return false;
+    }
     if reused_tokens >= block_size && snapshot_tokens > reused_tokens {
         return true;
     }
@@ -434,6 +450,21 @@ fn should_persist_metal_prefix_snapshot(
     let saved_prefill_us = prefill_cost_us * (snapshot_tokens as f64 / prompt_len as f64);
     let readback_cost_us = readback_us_per_token * snapshot_tokens as f64 * safety;
     saved_prefill_us > readback_cost_us
+}
+
+fn metal_prefix_extension_delta_tokens(
+    prompt_len: usize,
+    snapshot_tokens: usize,
+    reused_tokens: usize,
+    block_size: usize,
+) -> Option<usize> {
+    if reused_tokens >= block_size && snapshot_tokens > reused_tokens {
+        return Some(snapshot_tokens - reused_tokens);
+    }
+    if snapshot_tokens > prompt_len {
+        return Some(snapshot_tokens - prompt_len);
+    }
+    None
 }
 
 struct MetalQwen35CachedPrefix {
@@ -1333,11 +1364,18 @@ impl MetalQwen35PrefixRuntime {
         };
         let readback_us_per_token = metal_prefix_readback_us_per_token();
         let safety = metal_prefix_persist_safety();
+        let min_extension_tokens = metal_prefix_persist_min_extension_tokens();
         let readback_cost_us = readback_us_per_token * tokens as f64 * safety;
         let prompt_len = request.prompt_tokens.len().max(1);
         let saved_prefill_us = prefill_cost_us * (tokens as f64 / prompt_len as f64);
         let extends_cached_prefix = request.prefix_reused_tokens >= self.block_size
             && tokens > request.prefix_reused_tokens;
+        let extension_delta_tokens = metal_prefix_extension_delta_tokens(
+            request.prompt_tokens.len(),
+            tokens,
+            request.prefix_reused_tokens,
+            self.block_size,
+        );
         let worth_persist = should_persist_metal_prefix_snapshot(
             prefill_cost_us,
             request.prompt_tokens.len(),
@@ -1346,12 +1384,14 @@ impl MetalQwen35PrefixRuntime {
             self.block_size,
             readback_us_per_token,
             safety,
+            min_extension_tokens,
         );
         if trace {
             log::info!(
                 "m_e10_trace publish budget: tokens={} prefill_cost_us={:.0} \
                  saved_prefill_us={:.0} readback_cost_us={:.0} \
-                 (per_token={} safety={}) reused_tokens={} extends_cached_prefix={} worth_persist={}",
+                 (per_token={} safety={}) reused_tokens={} extends_cached_prefix={} \
+                 extension_delta_tokens={:?} min_extension_tokens={} worth_persist={}",
                 tokens,
                 prefill_cost_us,
                 saved_prefill_us,
@@ -1360,6 +1400,8 @@ impl MetalQwen35PrefixRuntime {
                 safety,
                 request.prefix_reused_tokens,
                 extends_cached_prefix,
+                extension_delta_tokens,
+                min_extension_tokens,
                 worth_persist,
             );
         }
@@ -4018,8 +4060,8 @@ mod tests {
     }
 
     #[test]
-    fn metal_prefix_persist_gate_keeps_session_extensions() {
-        assert!(should_persist_metal_prefix_snapshot(
+    fn metal_prefix_persist_gate_skips_small_session_extensions() {
+        assert!(!should_persist_metal_prefix_snapshot(
             1.0,
             4096,
             4100,
@@ -4027,6 +4069,17 @@ mod tests {
             METAL_PREFIX_BLOCK_SIZE,
             48.0,
             2.0,
+            64,
+        ));
+        assert!(should_persist_metal_prefix_snapshot(
+            1.0,
+            4096,
+            4160,
+            4096,
+            METAL_PREFIX_BLOCK_SIZE,
+            48.0,
+            2.0,
+            64,
         ));
         assert!(!should_persist_metal_prefix_snapshot(
             100.0,
@@ -4036,6 +4089,17 @@ mod tests {
             METAL_PREFIX_BLOCK_SIZE,
             48.0,
             2.0,
+            64,
+        ));
+        assert!(!should_persist_metal_prefix_snapshot(
+            15_000_000.0,
+            64,
+            71,
+            0,
+            METAL_PREFIX_BLOCK_SIZE,
+            48.0,
+            2.0,
+            64,
         ));
         assert!(should_persist_metal_prefix_snapshot(
             15_000_000.0,
@@ -4045,7 +4109,24 @@ mod tests {
             METAL_PREFIX_BLOCK_SIZE,
             48.0,
             2.0,
+            64,
         ));
+    }
+
+    #[test]
+    fn metal_prefix_extension_delta_tracks_reuse_then_prompt_tail() {
+        assert_eq!(
+            metal_prefix_extension_delta_tokens(4096, 4100, 4096, METAL_PREFIX_BLOCK_SIZE),
+            Some(4)
+        );
+        assert_eq!(
+            metal_prefix_extension_delta_tokens(64, 71, 0, METAL_PREFIX_BLOCK_SIZE),
+            Some(7)
+        );
+        assert_eq!(
+            metal_prefix_extension_delta_tokens(64, 64, 0, METAL_PREFIX_BLOCK_SIZE),
+            None
+        );
     }
 
     #[test]
