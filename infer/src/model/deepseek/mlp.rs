@@ -5015,7 +5015,7 @@ impl DeepseekV4MoeBlock {
                 expert_backend,
                 "native-deepep routed experts",
                 &[&first.w1, &first.w3, &first.w2],
-            )?
+            )?;
         };
         let use_deepgemm_experts = dsv4_should_try_deepgemm_experts(expert_backend);
 
