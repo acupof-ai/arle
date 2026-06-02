@@ -173,6 +173,48 @@ impl NcclGroup {
         )
     }
 
+    /// Device-side AllGather for pre-validated raw bf16 pointers.
+    ///
+    /// # Safety
+    ///
+    /// `send_ptr` must point to at least `send_count` bf16 elements and
+    /// `recv_ptr` must point to at least `recv_capacity` bf16 elements on this
+    /// communicator's CUDA stream/context. The pointed-to allocations must
+    /// outlive the enqueued NCCL operation.
+    pub unsafe fn all_gather_bf16_raw(
+        &self,
+        send_ptr: *const c_void,
+        send_count: usize,
+        recv_ptr: *mut c_void,
+        recv_capacity: usize,
+    ) -> Result<()> {
+        if send_count == 0 {
+            return Ok(());
+        }
+        if send_ptr.is_null() || recv_ptr.is_null() {
+            bail!(
+                "NCCL all_gather_bf16_raw rank {} got null pointer",
+                self.rank
+            );
+        }
+        let expected_recv = send_count.saturating_mul(self.world_size);
+        if recv_capacity < expected_recv {
+            bail!(
+                "NCCL all_gather_bf16_raw rank {} recv capacity {} smaller than expected {}",
+                self.rank,
+                recv_capacity,
+                expected_recv
+            );
+        }
+        self.comm.all_gather(
+            send_ptr,
+            recv_ptr,
+            send_count,
+            ncclDataType_t::Bfloat16,
+            &self.stream,
+        )
+    }
+
     pub fn reduce_scatter_bf16_device(
         &self,
         sendbuf: &CudaSlice<bf16>,
