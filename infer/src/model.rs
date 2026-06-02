@@ -154,6 +154,10 @@ impl CudaGraphDecodeSupport {
         !matches!(self.mode, CudaGraphDecodeMode::Unsupported)
     }
 
+    pub const fn is_full_decode(self) -> bool {
+        matches!(self.mode, CudaGraphDecodeMode::FullDecode)
+    }
+
     pub const fn mode_label(self) -> &'static str {
         self.mode.as_str()
     }

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # dsv4_beat_sglang_bench.sh — apples-to-apples DSv4 throughput A/B:
-# ARLE (target-pod/release/infer) vs SGLang (editable /sgl-workspace/sglang),
-# same 8×H20 TP=8, same model, same ISL/OSL, same concurrency sweep.
+# ARLE vs SGLang, same 8×H20 TP=8, same model, same ISL/OSL, same
+# concurrency sweep. This helper is contract-aware: ARLE is always launched
+# through the DSv4 SGLang best-practice profile, so an unsupported binary fails
+# at startup instead of serving on the replicated-token debug lane.
 #
 # Goal: ARLE decode throughput > SGLang × 1.30 (campaign target).
 #
@@ -21,6 +23,8 @@ MODEL="/data01/models/DeepSeek-V4-Flash"
 OUTDIR="/data01/build/arle/docs/trace-artifacts/beat-sglang"
 mkdir -p "$OUTDIR"
 
+ARLE_BIN="${ARLE_BIN:-/data01/build/arle/target/release-fast/infer}"
+SGLANG_DIR="${SGLANG_DIR:-/workspace/sglang@0d51db3}"
 ARLE_PORT=18300
 SGL_PORT=30000
 ISL=1024; OSL=512
@@ -50,16 +54,21 @@ case "$PHASE" in
 esac
 
 run_arle_server() {
+  [[ -x "$ARLE_BIN" ]] || { echo "ARLE_BIN is not executable: $ARLE_BIN" >&2; exit 2; }
   INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 \
+  ARLE_MULTIPROC_SERVE=1 ARLE_DSV4_PERFORMANCE_PROFILE=sglang \
   ARLE_DSV4_LOAD_LAYER_WEIGHTS=1 ARLE_DSV4_GPU_FULL_LAYERS=43 \
+  ARLE_DSV4_SHARED_KV_POOL=1 \
   ARLE_DSV4_INCREMENTAL_KV=1 ARLE_DSV4_FLASHMLA_PREFILL=1 ARLE_DSV4_FLASHMLA_DECODE=1 \
-  ARLE_DSV4_MOE_BACKEND=allreduce ARLE_DSV4_EXPERT_BACKEND=native \
-  ./target-pod/release/infer --model-path "$MODEL" --port $ARLE_PORT \
-    --num-slots 4 --max-seq-len 4096 --mem-fraction-static 0.80 \
-    --kv-cache-dtype fp8 --deepseek-distributed-layers 43
+  ARLE_DSV4_MOE_BACKEND=native-deepep ARLE_DSV4_EXPERT_BACKEND=deepgemm \
+  "$ARLE_BIN" --model-path "$MODEL" --port $ARLE_PORT \
+    --num-slots 128 --max-seq-len 4096 --mem-fraction-static 0.80 \
+    --kv-cache-dtype fp8 --cuda-graph-max-bs 16 \
+    --deepseek-distributed-layers 43
 }
 
 run_sglang_server() {
+  [[ -d "$SGLANG_DIR" ]] || { echo "SGLANG_DIR does not exist: $SGLANG_DIR" >&2; exit 2; }
   python3 -m sglang.launch_server --model-path "$MODEL" --tp 8 \
     --trust-remote-code --port $SGL_PORT --mem-fraction-static 0.80 \
     --kv-cache-dtype fp8_e4m3 2>&1
@@ -67,18 +76,15 @@ run_sglang_server() {
 
 serve_arle() {
   cd /data01/build/arle
-  pkill -9 -f target-pod/release/infer 2>/dev/null || true; sleep 2
   run_arle_server
 }
 
 serve_sglang() {
-  pkill -9 -f sglang.launch_server 2>/dev/null || true; sleep 2
-  cd /sgl-workspace/sglang
+  cd "$SGLANG_DIR"
   run_sglang_server
 }
 
 start_arle() {
-  pkill -9 -f target-pod/release/infer 2>/dev/null || true; sleep 2
   SERVER_LOG="$OUTDIR/arle-serve-$(date +%Y%m%d-%H%M%S).log"
   (cd /data01/build/arle && run_arle_server) >"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
@@ -86,9 +92,8 @@ start_arle() {
 }
 
 start_sglang() {
-  pkill -9 -f sglang.launch_server 2>/dev/null || true; sleep 2
   SERVER_LOG="$OUTDIR/sglang-serve-$(date +%Y%m%d-%H%M%S).log"
-  (cd /sgl-workspace/sglang && run_sglang_server) >"$SERVER_LOG" 2>&1 &
+  (cd "$SGLANG_DIR" && run_sglang_server) >"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
   echo "started SGLang pid=$SERVER_PID log=$SERVER_LOG"
 }
@@ -98,10 +103,6 @@ cleanup_server() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  case "$ENGINE" in
-    arle) pkill -f target-pod/release/infer 2>/dev/null || true ;;
-    sglang) pkill -f sglang.launch_server 2>/dev/null || true ;;
-  esac
   SERVER_PID=""
 }
 

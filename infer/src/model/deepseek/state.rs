@@ -114,6 +114,7 @@ pub(crate) struct DeepseekMoeRuntimeCache {
     pub(crate) dispatch_payload: Option<DeepseekDispatchPayloadRuntimeScratch>,
     pub(crate) send_route: Option<DeepseekSendRouteRuntimeScratch>,
     pub(crate) recv_route: Option<DeepseekRecvRouteRuntimeScratch>,
+    pub(crate) local_routed: Option<DeepseekLocalRoutedRuntimeScratch>,
     pub(crate) local_route: Option<DeepseekLocalRouteRuntimeScratch>,
     pub(crate) expert: Option<DeepseekExpertRuntimeScratch>,
     pub(crate) shared_expert: Option<DeepseekExpertRuntimeScratch>,
@@ -223,6 +224,24 @@ pub(crate) struct DeepseekLocalRouteRuntimeScratch {
     pub(crate) expert_weight: CudaSlice<f32>,
     pub(crate) expert_route_slot: CudaSlice<i32>,
     pub(crate) route_out: HiddenStates,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekLocalRoutedRuntimeScratch {
+    pub(crate) capacity_tokens: usize,
+    pub(crate) capacity_routes: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) topk: usize,
+    pub(crate) experts_per_rank: usize,
+    pub(crate) token_ids: CudaSlice<u32>,
+    pub(crate) route_indices: CudaSlice<i32>,
+    pub(crate) route_weights: CudaSlice<f32>,
+    pub(crate) local_counts: CudaSlice<i32>,
+    pub(crate) local_offsets: CudaSlice<i32>,
+    pub(crate) pack_cursors: CudaSlice<i32>,
+    pub(crate) packed_hidden: HiddenStates,
+    pub(crate) packed_token: CudaSlice<i32>,
+    pub(crate) packed_weight: CudaSlice<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -795,6 +814,52 @@ pub(crate) fn ensure_local_route_scratch<'a>(
     Ok(slot
         .as_mut()
         .expect("DeepSeek V4 local-route scratch allocated"))
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_local_routed_scratch<'a>(
+    slot: &'a mut Option<DeepseekLocalRoutedRuntimeScratch>,
+    ctx: &DeviceContext,
+    hidden_dim: usize,
+    capacity_tokens: usize,
+    topk: usize,
+    experts_per_rank: usize,
+) -> Result<&'a mut DeepseekLocalRoutedRuntimeScratch> {
+    let capacity_tokens = capacity_tokens.max(1);
+    let topk = topk.max(1);
+    let experts_per_rank = experts_per_rank.max(1);
+    let capacity_routes = capacity_tokens.saturating_mul(topk).max(1);
+    let needs_alloc = slot
+        .as_ref()
+        .map(|scratch| {
+            scratch.capacity_tokens < capacity_tokens
+                || scratch.capacity_routes < capacity_routes
+                || scratch.hidden_dim != hidden_dim
+                || scratch.topk != topk
+                || scratch.experts_per_rank != experts_per_rank
+        })
+        .unwrap_or(true);
+    if needs_alloc {
+        *slot = Some(DeepseekLocalRoutedRuntimeScratch {
+            capacity_tokens,
+            capacity_routes,
+            hidden_dim,
+            topk,
+            experts_per_rank,
+            token_ids: unsafe { ctx.stream.alloc_zeros_traced::<u32>(capacity_tokens)? },
+            route_indices: unsafe { ctx.stream.alloc_zeros_traced::<i32>(capacity_routes)? },
+            route_weights: unsafe { ctx.stream.alloc_zeros_traced::<f32>(capacity_routes)? },
+            local_counts: unsafe { ctx.stream.alloc_zeros_traced::<i32>(experts_per_rank)? },
+            local_offsets: unsafe { ctx.stream.alloc_zeros_traced::<i32>(experts_per_rank)? },
+            pack_cursors: unsafe { ctx.stream.alloc_zeros_traced::<i32>(experts_per_rank)? },
+            packed_hidden: unsafe { HiddenStates::uninit(ctx, hidden_dim, capacity_routes)? },
+            packed_token: unsafe { ctx.stream.alloc_traced::<i32>(capacity_routes)? },
+            packed_weight: unsafe { ctx.stream.alloc_traced::<f32>(capacity_routes)? },
+        });
+    }
+    Ok(slot
+        .as_mut()
+        .expect("DeepSeek V4 local-routed scratch allocated"))
 }
 
 #[cfg(feature = "cuda")]
