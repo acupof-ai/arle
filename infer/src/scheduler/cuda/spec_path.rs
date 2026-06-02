@@ -4,6 +4,7 @@ use crate::prefix_cache::BlockId;
 use crate::scheduler::DraftMode;
 use crate::server_engine::FinishReason;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub(super) struct SpecPath;
 
@@ -877,10 +878,23 @@ fn verify_and_commit_rows<M: ModelForward>(
             );
             continue;
         };
-        let result = crate::speculative::verify_tokens_greedy(
+        let mut result = crate::speculative::verify_tokens_greedy(
             &row.draft_tokens,
             &output.target_argmax_tokens,
         );
+        if internal_mtp_draft_acceptance_disabled(scheduler) && result.num_accepted > 0 {
+            static LOGGED: OnceLock<()> = OnceLock::new();
+            if LOGGED.set(()).is_ok() {
+                log::warn!(
+                    "Internal MTP/EAGLE draft acceptance is disabled by default; \
+                     verifier will emit target bonus tokens only. Set \
+                     ARLE_INTERNAL_MTP_ACCEPT_DRAFTS=1 only for parity experiments."
+                );
+            }
+            result.accepted.clear();
+            result.num_accepted = 0;
+            result.rejection_index = 0;
+        }
         let local_bonus = output
             .target_argmax_tokens
             .get(result.num_accepted)
@@ -957,6 +971,18 @@ fn verify_and_commit_rows<M: ModelForward>(
         accepted_total,
         started.elapsed().as_micros() as u64,
     );
+}
+
+fn internal_mtp_draft_acceptance_disabled<M: ModelForward>(scheduler: &Scheduler<M>) -> bool {
+    if scheduler.config.spec_draft_model != DraftMode::InternalMtp {
+        return false;
+    }
+    std::env::var("ARLE_INTERNAL_MTP_ACCEPT_DRAFTS")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !(value == "1" || value == "true" || value == "yes" || value == "on")
+        })
+        .unwrap_or(true)
 }
 
 #[allow(dead_code)]
