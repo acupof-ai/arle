@@ -284,6 +284,104 @@ __global__ void dsv4_fp8_kv_fill_sw_slots_from_start_pos_kernel(
     token_in_block_row[row] = ring_idx % page_block_size;
 }
 
+__global__ void dsv4_fp8_kv_pack_completed_compressor_row_start_pos_kernel(
+    const __nv_bfloat16* __restrict__ compressed,
+    uint8_t* __restrict__ packed_kv,
+    const int* __restrict__ start_pos,
+    int ratio,
+    int sw_blocks,
+    int page_block_size,
+    int stride_elems)
+{
+    if (blockIdx.x != 0) return;
+    const int pos = *start_pos;
+    if (pos < 0 || ratio <= 0 || ((pos + 1) % ratio) != 0) return;
+    const int compressed_row = pos / ratio;
+    const int block_id = sw_blocks + compressed_row / page_block_size;
+    const int row = compressed_row % page_block_size;
+
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* nope = compressed + (int64_t)compressed_row * stride_elems;
+    const __nv_bfloat16* rope = nope + HEAD_DIM_NOPE;
+
+    const int64_t block_stride = (int64_t)page_block_size * TOKEN_BYTES;
+    uint8_t* block_base = packed_kv + (int64_t)block_id * block_stride;
+    uint8_t* token_data_base = block_base + (int64_t)row * TOKEN_DATA_BYTES;
+    uint8_t* token_scales_base =
+        block_base + (int64_t)page_block_size * TOKEN_DATA_BYTES
+        + (int64_t)row * NUM_SCALES;
+
+    __shared__ float s_warp_max[2];
+    __shared__ float s_scale_f;
+
+    const bool is_nope = (tid < NOPE_THREADS);
+    const int nope_lane = is_nope ? tid : -1;
+    const int rope_lane = (tid >= NOPE_THREADS) ? (tid - NOPE_THREADS) : -1;
+
+    #pragma unroll
+    for (int tile = 0; tile < NUM_TILES; ++tile) {
+        float v = 0.0f;
+        if (is_nope) {
+            const int dim_idx = tile * QUANT_TILE_SIZE + nope_lane;
+            v = __bfloat162float(nope[dim_idx]);
+        }
+
+        if (is_nope) {
+            float a = fabsf(v);
+            float warp_max = warp_reduce_max(a);
+            if ((nope_lane & 31) == 0) {
+                s_warp_max[nope_lane >> 5] = warp_max;
+            }
+        }
+        __syncthreads();
+
+        if (is_nope && nope_lane == 0) {
+            float amax = fmaxf(s_warp_max[0], s_warp_max[1]);
+            uint8_t byte;
+            __nv_bfloat16 scale_bf16;
+            if (amax <= 0.0f || !isfinite(amax)) {
+                byte = 0;
+                scale_bf16 = __float2bfloat16(1.0f);
+            } else {
+                int e_amax;
+                (void)frexpf(amax, &e_amax);
+                int e = e_amax - 9;
+                float trial = ldexpf(448.0f, e);
+                if (trial < amax) {
+                    e += 1;
+                }
+                if (e < -126) {
+                    e = -126;
+                } else if (e > 127) {
+                    e = 127;
+                }
+                byte = (uint8_t)(e + 127);
+                scale_bf16 = __float2bfloat16(ldexpf(1.0f, e));
+            }
+            s_scale_f = __bfloat162float(scale_bf16);
+            token_scales_base[tile] = byte;
+            if (tile == NUM_TILES - 1) {
+                token_scales_base[NUM_SCALES - 1] = 0;
+            }
+        }
+        __syncthreads();
+
+        if (is_nope) {
+            float scale_f = s_scale_f;
+            float quantized = (scale_f != 0.0f) ? (v / scale_f) : 0.0f;
+            __nv_fp8_e4m3 fp8_v = __nv_fp8_e4m3(quantized);
+            const int dim_idx = tile * QUANT_TILE_SIZE + nope_lane;
+            token_data_base[dim_idx] = (uint8_t)fp8_v.__x;
+        }
+    }
+
+    if (!is_nope && rope_lane < HEAD_DIM_ROPE) {
+        __nv_bfloat16* rope_base = reinterpret_cast<__nv_bfloat16*>(
+            token_data_base + HEAD_DIM_NOPE);
+        rope_base[rope_lane] = rope[rope_lane];
+    }
+}
+
 } // namespace
 
 // ===== Public C entries =====
@@ -400,5 +498,26 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_fill_sw_slots_from_start_pos_cuda(
     dsv4_fp8_kv_fill_sw_slots_from_start_pos_kernel<<<grid, kBlock, 0, stream>>>(
         token_block_id, token_in_block_row, start_pos, slot_layer_block_offsets,
         n_tokens, sliding_window, page_block_size);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda(
+    const __nv_bfloat16* compressed,
+    uint8_t* packed_kv,
+    const int* start_pos,
+    int ratio,
+    int sw_blocks,
+    int page_block_size,
+    int stride_elems,
+    cudaStream_t stream)
+{
+    if (compressed == nullptr || packed_kv == nullptr || start_pos == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (ratio <= 0 || sw_blocks < 0 || page_block_size <= 0 || stride_elems < HEAD_DIM_NOPE + HEAD_DIM_ROPE) {
+        return cudaErrorInvalidValue;
+    }
+    dsv4_fp8_kv_pack_completed_compressor_row_start_pos_kernel<<<1, THREADS_PER_BLOCK, 0, stream>>>(
+        compressed, packed_kv, start_pos, ratio, sw_blocks, page_block_size, stride_elems);
     return cudaGetLastError();
 }
