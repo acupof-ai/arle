@@ -1047,6 +1047,7 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     pub(crate) k_prepared: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) local_attn: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) output_latent: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) output_out: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) csa_q_i: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) csa_weights: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) csa_selected: Option<CudaSlice<i32>>,
@@ -1172,6 +1173,7 @@ impl DeepseekAttentionRuntimeCache {
         self.k_prepared = None;
         self.local_attn = None;
         self.output_latent = None;
+        self.output_out = None;
         self.csa_q_i = None;
         self.csa_weights = None;
         self.csa_selected = None;
