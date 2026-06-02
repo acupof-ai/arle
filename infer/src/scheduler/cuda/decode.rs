@@ -876,7 +876,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn coordinate_decode_token(
+    pub(super) fn coordinate_decode_token(
         &self,
         slot_idx: usize,
         step_idx: usize,

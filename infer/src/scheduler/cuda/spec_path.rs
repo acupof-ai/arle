@@ -46,6 +46,7 @@ impl SparseDraftView {
 struct SpecRow {
     slot_idx: usize,
     request_id: u64,
+    generated_len: usize,
     draft_start_position: usize,
     original_target_len: usize,
     input_tokens: Vec<u32>,
@@ -195,6 +196,7 @@ impl SpecPath {
             rows.push(SpecRow {
                 slot_idx,
                 request_id,
+                generated_len: generated_tokens.len(),
                 draft_start_position,
                 original_target_len: scheduler.paged_kv_pool.seq_len(slot_idx),
                 input_tokens,
@@ -202,6 +204,7 @@ impl SpecPath {
             });
         }
 
+        let rows = coordinate_spec_draft_rows(scheduler, rows);
         if rows.is_empty() {
             scheduler.step_decode_launch();
             return;
@@ -282,11 +285,16 @@ impl SpecPath {
                 &row.draft_tokens,
                 &output.target_argmax_tokens,
             );
-            let bonus = output
+            let local_bonus = output
                 .target_argmax_tokens
                 .get(result.num_accepted)
                 .copied()
                 .unwrap_or_else(|| row.draft_tokens[result.num_accepted.saturating_sub(1)]);
+            let Some(bonus) =
+                coordinate_spec_bonus_token(scheduler, &row, local_bonus, result.num_accepted)
+            else {
+                continue;
+            };
             let keep_target_len = row
                 .original_target_len
                 .saturating_add(1)
@@ -546,6 +554,7 @@ impl SpecPath {
             rows.push(SpecRow {
                 slot_idx,
                 request_id,
+                generated_len,
                 draft_start_position: original_target_len,
                 original_target_len,
                 input_tokens,
@@ -638,6 +647,7 @@ impl SpecPath {
                     request_id,
                     scheduler.paged_kv_pool.seq_len(slot_idx),
                     last_token,
+                    generated_len,
                 ),
             );
             draft_requests.push(InternalMtpDraftRequest {
@@ -676,7 +686,7 @@ impl SpecPath {
             if output.draft_tokens.is_empty() {
                 continue;
             }
-            let Some(&(request_id, original_target_len, last_token)) =
+            let Some(&(request_id, original_target_len, last_token, generated_len)) =
                 row_meta.get(&output.slot_idx)
             else {
                 scheduler.finish_slot_with_message(
@@ -713,6 +723,7 @@ impl SpecPath {
             rows.push(SpecRow {
                 slot_idx: output.slot_idx,
                 request_id,
+                generated_len,
                 draft_start_position: original_target_len,
                 original_target_len,
                 input_tokens,
@@ -724,11 +735,75 @@ impl SpecPath {
     }
 }
 
+fn coordinate_spec_draft_rows<M: ModelForward>(
+    scheduler: &mut Scheduler<M>,
+    rows: Vec<SpecRow>,
+) -> Vec<SpecRow> {
+    let mut coordinated = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        let Some(&last_token) = row.input_tokens.first() else {
+            scheduler.finish_slot_with_message(
+                row.slot_idx,
+                "inference_failed",
+                format!(
+                    "spec row missing last-token input for request {} slot {}",
+                    row.request_id, row.slot_idx
+                ),
+            );
+            continue;
+        };
+
+        let mut failed = false;
+        for (offset, token) in row.draft_tokens.iter_mut().enumerate() {
+            let step_idx = row.generated_len.saturating_add(offset);
+            match scheduler.coordinate_decode_token(row.slot_idx, step_idx, *token) {
+                Ok(coordinated_token) => *token = coordinated_token,
+                Err(err) => {
+                    let req_id = row.request_id;
+                    log::error!(
+                        "Request {req_id}: distributed spec draft token sync failed: {err}"
+                    );
+                    scheduler.finish_slot_with_error(row.slot_idx, "inference_failed", &err);
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            continue;
+        }
+        row.input_tokens.clear();
+        row.input_tokens.push(last_token);
+        row.input_tokens.extend_from_slice(&row.draft_tokens);
+        coordinated.push(row);
+    }
+    coordinated
+}
+
+fn coordinate_spec_bonus_token<M: ModelForward>(
+    scheduler: &mut Scheduler<M>,
+    row: &SpecRow,
+    local_bonus: u32,
+    num_accepted: usize,
+) -> Option<u32> {
+    let step_idx = row.generated_len.saturating_add(num_accepted);
+    match scheduler.coordinate_decode_token(row.slot_idx, step_idx, local_bonus) {
+        Ok(token) => Some(token),
+        Err(err) => {
+            let req_id = row.request_id;
+            log::error!("Request {req_id}: distributed spec bonus token sync failed: {err}");
+            scheduler.finish_slot_with_error(row.slot_idx, "inference_failed", &err);
+            None
+        }
+    }
+}
+
 fn verify_and_commit_rows<M: ModelForward>(
     scheduler: &mut Scheduler<M>,
     rows: Vec<SpecRow>,
     started: std::time::Instant,
 ) {
+    let rows = coordinate_spec_draft_rows(scheduler, rows);
     if rows.is_empty() {
         scheduler.step_decode_launch();
         return;
@@ -806,11 +881,16 @@ fn verify_and_commit_rows<M: ModelForward>(
             &row.draft_tokens,
             &output.target_argmax_tokens,
         );
-        let bonus = output
+        let local_bonus = output
             .target_argmax_tokens
             .get(result.num_accepted)
             .copied()
             .unwrap_or_else(|| row.draft_tokens[result.num_accepted.saturating_sub(1)]);
+        let Some(bonus) =
+            coordinate_spec_bonus_token(scheduler, &row, local_bonus, result.num_accepted)
+        else {
+            continue;
+        };
         let keep_target_len = row
             .original_target_len
             .saturating_add(1)
