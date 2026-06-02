@@ -291,6 +291,7 @@ pub fn load_deepseek_v4_components(
             )?;
             runtime.axes = parallel.axes;
             runtime.rank_coord = parallel.coord;
+            install_deepseek_parallel_state(parallel, "model-load")?;
         }
         DeepseekModel::from_safetensors(model_path, runtime)
     })
@@ -518,6 +519,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         pre_model_free_bytes,
         worker_placement,
         cuda_device_ordinal,
+        deepseek_parallel,
         startup_warmup_gate,
         ..
     } = runtime;
@@ -594,6 +596,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
     let (ready_tx, ready_rx) = mpsc::channel();
     let scheduler_thread_placement = worker_placement;
     let scheduler_thread_cuda_ordinal = cuda_device_ordinal;
+    let scheduler_thread_deepseek_parallel = deepseek_parallel;
     let scheduler_thread_model_id = model_id.clone();
     let thread_name = scheduler_thread_placement.as_ref().map_or_else(
         || "infer-cuda-scheduler".to_string(),
@@ -603,6 +606,14 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         .name(thread_name)
         .spawn(move || {
             let run_scheduler = move || {
+                if let Some(parallel) = scheduler_thread_deepseek_parallel
+                    && let Err(err) = install_deepseek_parallel_state(parallel, "scheduler")
+                {
+                    warn!(
+                        "DeepSeek V4 scheduler parallel-state initialization failed: {err:#}"
+                    );
+                    return;
+                }
                 if let Some(placement) = scheduler_thread_placement.as_ref() {
                     let affinity = crate::runtime_topology::bind_current_thread_to_placement(
                         placement,
@@ -648,6 +659,36 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         handle,
         SchedulerRuntimeGuard::new(model_id, thread, ready_rx),
     ))
+}
+
+#[cfg(feature = "cuda")]
+fn install_deepseek_parallel_state(parallel: DeepseekParallelConfig, phase: &str) -> Result<()> {
+    use crate::distributed::parallel_state::{initialize_model_parallel, with_parallel_state};
+
+    initialize_model_parallel(parallel.axes, parallel.coord.world_rank).with_context(|| {
+        format!(
+            "initialize DeepSeek V4 parallel state for phase={phase} rank={} axes={}",
+            parallel.coord.world_rank,
+            parallel.axes.summary(),
+        )
+    })?;
+    with_parallel_state(|state| {
+        info!(
+            "DeepSeek V4 parallel state: phase={} rank={} coord={:?} axes={} tp_group={:?} attn_tp_group={:?} attn_dp_group={:?} attn_cp_group={:?} moe_ep_group={:?} moe_dp_group={:?} moe_tp_group={:?}",
+            phase,
+            state.coord.world_rank,
+            state.coord,
+            state.config.summary(),
+            state.get_tp_group().ranks,
+            state.get_attention_tp_group().ranks,
+            state.get_attention_dp_group().ranks,
+            state.get_attention_cp_group().ranks,
+            state.get_moe_ep_group().ranks,
+            state.get_moe_dp_group().ranks,
+            state.get_moe_tp_group().ranks,
+        );
+    })?;
+    Ok(())
 }
 
 #[cfg(all(feature = "cuda", test))]
