@@ -77,6 +77,14 @@ pub struct DeepseekBatchDecodeBuffers {
     /// `batch_size - 1`. Per-slot logits scatter stays outside the graph so
     /// captured destination pointers are scheduler-context stable.
     head_graph_cache: Vec<Option<CudaGraph>>,
+    /// Exact-slot-signature graph cache for the DSv4 layer body. The body graph
+    /// captures per-slot/layer state pointers, so replay is only legal when the
+    /// scheduler presents the same slot list in the same row order.
+    body_graph_cache: Vec<Option<DeepseekBodyGraphEntry>>,
+    /// First time a slot signature appears, run it eagerly to populate lazy
+    /// decode scratch and one-shot attention cache bootstrap. The next matching
+    /// step may capture.
+    body_graph_warm_signature: Vec<Option<Vec<usize>>>,
     /// One-shot eager override used by correctness-sensitive verifier paths.
     force_eager_once: bool,
 }
@@ -85,6 +93,19 @@ pub struct DeepseekBatchDecodeBuffers {
 // on the creating CUDA context/thread. The scheduler owns one decode context and
 // uses it exclusively on the single inference thread.
 unsafe impl Send for DeepseekBatchDecodeBuffers {}
+
+struct DeepseekBodyGraphEntry {
+    slot_signature: Vec<usize>,
+    graph: CudaGraph,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DeepseekBodyGraphRun {
+    Eager,
+    Warmed,
+    Captured,
+    Replayed,
+}
 
 /// Stable DSv4 batched-decode buffers.
 ///
@@ -533,6 +554,8 @@ impl DeepseekBatchDecodeBuffers {
             batched_scratch: None,
             input_graph_cache: (0..max_batch_size).map(|_| None).collect(),
             head_graph_cache: (0..max_batch_size).map(|_| None).collect(),
+            body_graph_cache: (0..max_batch_size).map(|_| None).collect(),
+            body_graph_warm_signature: (0..max_batch_size).map(|_| None).collect(),
             force_eager_once: false,
         })
     }
@@ -810,6 +833,92 @@ impl DeepseekBatchDecodeBuffers {
         Ok(())
     }
 
+    pub(super) fn run_body_graph<F>(
+        &mut self,
+        ctx: &DeviceContext,
+        batch_size: usize,
+        slot_indices: &[usize],
+        force_eager: bool,
+        mut body: F,
+    ) -> Result<DeepseekBodyGraphRun>
+    where
+        F: FnMut(&mut DeepseekBatchDecodeBuffers) -> Result<()>,
+    {
+        ensure!(
+            batch_size >= 1 && batch_size <= self.max_batch_size,
+            "DeepSeek V4 body graph batch {batch_size} exceeds context capacity {}",
+            self.max_batch_size
+        );
+        ensure!(
+            slot_indices.len() == batch_size,
+            "DeepSeek V4 body graph slot count {} does not match batch {batch_size}",
+            slot_indices.len()
+        );
+        let idx = batch_size - 1;
+        if !force_eager
+            && let Some(entry) = self.body_graph_cache[idx].as_ref()
+            && entry.slot_signature == slot_indices
+        {
+            entry
+                .graph
+                .launch()
+                .map_err(|e| anyhow::anyhow!("DSv4 body graph replay (B={}): {e}", batch_size))?;
+            return Ok(DeepseekBodyGraphRun::Replayed);
+        }
+        if force_eager {
+            body(self)?;
+            return Ok(DeepseekBodyGraphRun::Eager);
+        }
+
+        let warmed = self.body_graph_warm_signature[idx]
+            .as_ref()
+            .is_some_and(|signature| signature == slot_indices);
+        if !warmed {
+            body(self)?;
+            self.body_graph_warm_signature[idx] = Some(slot_indices.to_vec());
+            self.body_graph_cache[idx] = None;
+            return Ok(DeepseekBodyGraphRun::Warmed);
+        }
+
+        info!(
+            "Capturing DSv4 body CUDA Graph: B={} slots={:?}",
+            batch_size, slot_indices
+        );
+        ctx.stream
+            .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(|e| anyhow::anyhow!("DSv4 body begin_capture (B={}): {e}", batch_size))?;
+        let body_result = body(self);
+        if let Err(err) = body_result {
+            let end_result = ctx
+                .stream
+                .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
+            if let Err(end_err) = end_result {
+                return Err(anyhow::anyhow!(
+                    "DSv4 body graph capture body failed (B={}): {err}; end_capture after failure also failed: {end_err}",
+                    batch_size,
+                ));
+            }
+            return Err(err);
+        }
+        let graph_opt = ctx
+            .stream
+            .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .map_err(|e| anyhow::anyhow!("DSv4 body end_capture (B={}): {e}", batch_size))?;
+        if let Some(graph) = graph_opt {
+            graph.launch().map_err(|e| {
+                anyhow::anyhow!("DSv4 body graph first launch (B={}): {e}", batch_size)
+            })?;
+            self.body_graph_cache[idx] = Some(DeepseekBodyGraphEntry {
+                slot_signature: slot_indices.to_vec(),
+                graph,
+            });
+            Ok(DeepseekBodyGraphRun::Captured)
+        } else {
+            body(self)?;
+            Ok(DeepseekBodyGraphRun::Eager)
+        }
+    }
+
     /// Record the served `max_seq_len` the shared pool was sized for.
     pub(super) fn set_fp8_kv_max_seq_len(&mut self, max_seq_len: usize) {
         self.fp8_kv_max_seq_len = max_seq_len;
@@ -1015,6 +1124,8 @@ impl DecodeContextOps for DeepseekBatchDecodeBuffers {
         if batch_size >= 1 && batch_size <= self.max_batch_size {
             self.input_graph_cache[batch_size - 1] = None;
             self.head_graph_cache[batch_size - 1] = None;
+            self.body_graph_cache[batch_size - 1] = None;
+            self.body_graph_warm_signature[batch_size - 1] = None;
         }
     }
 
