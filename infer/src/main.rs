@@ -13,6 +13,7 @@ use infer::hf_hub;
 use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
+use infer::model::deepseek::{DeepseekPerformanceProfile, dsv4_performance_profile_from_env};
 use infer::model::{KVCacheDtype, KVFormat};
 use infer::request_handle::{
     DistributedRequestOwnership, DistributedRequestShard, DistributedSchedulerGroup,
@@ -28,7 +29,7 @@ use infer::scheduler::{
     SchedulerMixedPolicy,
 };
 use infer::server_engine::EnginePoolModelSpec;
-use infer::tensor_parallel::MultiAxisConfig;
+use infer::tensor_parallel::{MultiAxisConfig, build_attn_owner_groups};
 use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
 use log::info;
 
@@ -885,6 +886,34 @@ fn ensure_deepseek_current_axis_support(
         tp_world_size,
         ep_world_size,
     );
+}
+
+fn deepseek_request_owner_groups_for_world(world_size: usize) -> Result<Vec<Vec<usize>>> {
+    let tp_world_size =
+        parse_deepseek_axis_world_size("INFER_TP_SIZE", "ARLE_TP_SIZE", world_size, world_size)?;
+    let ep_world_size =
+        parse_deepseek_axis_world_size("INFER_EP_SIZE", "ARLE_EP_SIZE", world_size, world_size)?;
+    let axes = MultiAxisConfig::current_route_from_env_with_defaults(tp_world_size, ep_world_size)
+        .context("loading DeepSeek request-owner multi-axis layout")?;
+    ensure_deepseek_current_axis_support(tp_world_size, ep_world_size, &axes)?;
+    anyhow::ensure!(
+        axes.world_size() == world_size,
+        "DeepSeek request owner axes.world_size ({}) must match effective CUDA workers ({world_size}); axes={}",
+        axes.world_size(),
+        axes.summary(),
+    );
+    let groups = build_attn_owner_groups(axes);
+    anyhow::ensure!(
+        !groups.is_empty(),
+        "DeepSeek request owner group derivation produced no groups for axes={}",
+        axes.summary(),
+    );
+    info!(
+        "DeepSeek V4 request owner groups: axes={} groups={:?}",
+        axes.summary(),
+        groups
+    );
+    Ok(groups)
 }
 
 fn run_deepseek_distributed_generate(args: &Args) -> Result<()> {
@@ -2049,6 +2078,14 @@ async fn async_main(args: Args) {
             placement: worker.placement.clone(),
         })
         .collect::<Vec<_>>();
+    let deepseek_profile = if matches!(model_type, ModelType::DeepSeekV4) {
+        Some(
+            dsv4_performance_profile_from_env()
+                .unwrap_or_else(|err| panic!("loading DeepSeek V4 performance profile: {err:#}")),
+        )
+    } else {
+        None
+    };
     let request_handle: Arc<dyn infer::request_handle::RequestHandle> =
         if matches!(model_type, ModelType::DeepSeekV4) && relay_coordinator.is_some() {
             // Phase B-1 commit C.4.4 — multiproc-serve. The coordinator
@@ -2063,23 +2100,53 @@ async fn async_main(args: Args) {
                 scheduler_workers.len(),
                 effective_world_size
             );
-            Arc::new(DistributedSchedulerGroup::with_relay(
-                router_workers,
-                metrics.clone(),
-                relay,
-                effective_world_size,
-                DistributedRequestOwnership::ReplicatedToken,
-            ))
+            match deepseek_profile {
+                Some(DeepseekPerformanceProfile::SglangBestPractice) => {
+                    let owner_groups =
+                        deepseek_request_owner_groups_for_world(effective_world_size)
+                            .unwrap_or_else(|err| {
+                                panic!("loading DeepSeek V4 request owner groups: {err:#}")
+                            });
+                    Arc::new(DistributedSchedulerGroup::with_relay_token_owner_groups(
+                        router_workers,
+                        metrics.clone(),
+                        relay,
+                        effective_world_size,
+                        owner_groups,
+                    ))
+                }
+                _ => Arc::new(DistributedSchedulerGroup::with_relay(
+                    router_workers,
+                    metrics.clone(),
+                    relay,
+                    effective_world_size,
+                    DistributedRequestOwnership::ReplicatedToken,
+                )),
+            }
         } else if matches!(model_type, ModelType::DeepSeekV4) && scheduler_workers.len() > 1 {
             info!(
                 "Using DeepSeek distributed scheduler group: ranks={}",
                 scheduler_workers.len()
             );
-            Arc::new(DistributedSchedulerGroup::new(
-                router_workers,
-                metrics.clone(),
-                DistributedRequestOwnership::ReplicatedToken,
-            ))
+            match deepseek_profile {
+                Some(DeepseekPerformanceProfile::SglangBestPractice) => {
+                    let owner_groups =
+                        deepseek_request_owner_groups_for_world(scheduler_workers.len())
+                            .unwrap_or_else(|err| {
+                                panic!("loading DeepSeek V4 request owner groups: {err:#}")
+                            });
+                    Arc::new(DistributedSchedulerGroup::with_token_owner_groups(
+                        router_workers,
+                        metrics.clone(),
+                        owner_groups,
+                    ))
+                }
+                _ => Arc::new(DistributedSchedulerGroup::new(
+                    router_workers,
+                    metrics.clone(),
+                    DistributedRequestOwnership::ReplicatedToken,
+                )),
+            }
         } else {
             Arc::new(NumaSchedulerRouter::new(
                 runtime_topology.clone(),
