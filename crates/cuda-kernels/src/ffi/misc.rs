@@ -64,6 +64,15 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    pub fn dsv4_mtp_add_eproj_hproj_cuda(
+        e_proj: *const super::Half,
+        h_proj: *const super::Half,
+        out_stream: *mut super::Half,
+        hidden_size: i32,
+        hc_mult: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_prepare_qk_cuda(
         q_raw: *const super::Half,
         k_raw: *const super::Half,

@@ -50,6 +50,7 @@ pub(crate) struct DeepseekIncrementalState {
     pub(crate) processed_tokens: usize,
     pub(crate) layers: Vec<DeepseekLayerRuntimeCache>,
     pub(crate) stream_recycle: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) last_target_pre_head_stream: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) spec_verify: Option<DeepseekSpecVerifyState>,
 }
 
@@ -91,6 +92,7 @@ impl DeepseekIncrementalState {
         self.processed_tokens = 0;
         self.layers.clear();
         self.stream_recycle = None;
+        self.last_target_pre_head_stream = None;
         self.spec_verify = None;
     }
 

@@ -60,6 +60,8 @@ use crate::model::common;
 #[cfg(feature = "cuda")]
 use crate::model::layer_communicator::LayerCommunicator;
 #[cfg(feature = "cuda")]
+use crate::model::{InternalMtpDraftOutput, InternalMtpDraftRequest};
+#[cfg(feature = "cuda")]
 use crate::ops;
 #[cfg(feature = "cuda")]
 use crate::ops::LinearDispatchPhase;
@@ -658,6 +660,7 @@ impl DeepseekModel {
             stream = next_stream;
         }
         state.incremental.processed_tokens += tokens.len();
+        self.save_target_pre_head_stream(&stream.hidden, tokens.len() - 1, state)?;
 
         if !emit_logits {
             put_hidden_scratch(&mut state.incremental.stream_recycle, stream);
@@ -882,6 +885,9 @@ impl DeepseekModel {
                 )?;
                 dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
             }
+            for (row, &slot_idx) in slot_indices.iter().enumerate() {
+                self.save_target_pre_head_stream(&scratch.stream, row, &mut states[slot_idx])?;
+            }
         }
 
         decode_ctx.run_head_piece_graph(&self.ctx, n, graph_force_eager, |scratch| {
@@ -959,6 +965,525 @@ impl DeepseekModel {
                 .map_err(|err| anyhow::anyhow!("DSv4 logits D2D scatter failed: {err}"))?;
         }
         Ok(())
+    }
+
+    pub(super) fn forward_internal_mtp_draft_batch_greedy(
+        &self,
+        requests: &[InternalMtpDraftRequest],
+        states: &mut [super::state::DeepseekState],
+    ) -> Result<Vec<InternalMtpDraftOutput>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        ensure!(
+            self.loaded_mtp_layer_count() > 0,
+            "DSv4 internal MTP/EAGLE draft requested before mtp.N weights were loaded"
+        );
+        let mut outputs = Vec::with_capacity(requests.len());
+        for request in requests {
+            ensure!(
+                request.slot_idx < states.len(),
+                "DSv4 internal MTP slot {} out of range for {} states",
+                request.slot_idx,
+                states.len()
+            );
+            if request.max_draft_tokens == 0 {
+                outputs.push(InternalMtpDraftOutput {
+                    slot_idx: request.slot_idx,
+                    draft_tokens: Vec::new(),
+                });
+                continue;
+            }
+
+            let state = &mut states[request.slot_idx];
+            let saved = state
+                .incremental
+                .last_target_pre_head_stream
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DSv4 internal MTP slot {} missing target pre-head hidden state; \
+                         run target prefill/decode with hidden capture before drafting",
+                        request.slot_idx
+                    )
+                })?;
+            let mut current_stream =
+                unsafe { HiddenStates::uninit(&self.ctx, saved.hidden.hidden_dim, 1)? };
+            self.ctx
+                .stream
+                .memcpy_dtod(&saved.hidden.data, &mut current_stream.data)
+                .map_err(|err| anyhow::anyhow!("DSv4 MTP seed hidden copy failed: {err}"))?;
+
+            let mut token = request.last_token;
+            let mut draft_tokens = Vec::with_capacity(request.max_draft_tokens);
+            for _ in 0..request.max_draft_tokens {
+                let (next_token, next_stream) =
+                    self.forward_internal_mtp_greedy_step(token, &current_stream, state)?;
+                draft_tokens.push(next_token);
+                token = next_token;
+                current_stream = next_stream;
+            }
+            outputs.push(InternalMtpDraftOutput {
+                slot_idx: request.slot_idx,
+                draft_tokens,
+            });
+        }
+        Ok(outputs)
+    }
+
+    fn forward_internal_mtp_greedy_step(
+        &self,
+        token: u32,
+        previous_pre_head_stream: &HiddenStates,
+        target_state: &mut super::state::DeepseekState,
+    ) -> Result<(u32, HiddenStates)> {
+        let mtp = self
+            .mtp_layers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 internal MTP layer 0 is not loaded"))?;
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 internal MTP requires shared lm_head weights"))?;
+
+        let stream = self.mtp_seed_stream(token, previous_pre_head_stream, mtp)?;
+        let next_stream =
+            self.forward_mtp_decoder_layer_frozen_swa(token, &stream, target_state)?;
+        let hidden = head_hidden_from_stream(
+            &self.ctx,
+            &mtp.hc_head,
+            &next_stream,
+            0,
+            self.config.hidden_size,
+            self.config.hc_mult,
+            self.config.hc_eps,
+        )?;
+        let logits = common::compute_logits_batch(
+            &self.ctx,
+            &hidden,
+            &mtp.norm,
+            lm_head,
+            self.config.rms_norm_eps,
+            false,
+        )?;
+        let next_token = ops::argmax(&self.ctx, &logits)?;
+        Ok((next_token, next_stream))
+    }
+
+    fn save_target_pre_head_stream(
+        &self,
+        stream: &HiddenStates,
+        token_idx: usize,
+        state: &mut super::state::DeepseekState,
+    ) -> Result<()> {
+        let stream_hidden_dim = self.config.hidden_size * self.config.hc_mult;
+        ensure!(
+            stream.hidden_dim == stream_hidden_dim,
+            "DSv4 target pre-head stream dim {} does not match hidden_size {} * hc_mult {}",
+            stream.hidden_dim,
+            self.config.hidden_size,
+            self.config.hc_mult
+        );
+        let out = ensure_hidden_scratch(
+            &mut state.incremental.last_target_pre_head_stream,
+            &self.ctx,
+            stream_hidden_dim,
+            1,
+        )?;
+        extract_hidden_token_with_width_into(&self.ctx, stream, token_idx, stream_hidden_dim, out)
+    }
+
+    fn mtp_seed_stream(
+        &self,
+        token: u32,
+        previous_pre_head_stream: &HiddenStates,
+        mtp: &DeepseekMtpLayer,
+    ) -> Result<HiddenStates> {
+        let embed_tokens = self
+            .embed_tokens
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 internal MTP requires shared embeddings"))?;
+        let hidden_size = self.config.hidden_size;
+        let hc_mult = self.config.hc_mult;
+        let stream_hidden_dim = hidden_size * hc_mult;
+        ensure!(
+            previous_pre_head_stream.hidden_dim == stream_hidden_dim
+                && previous_pre_head_stream.seq_len == 1,
+            "DSv4 MTP seed hidden shape mismatch: got {}x{}, expected 1x{}",
+            previous_pre_head_stream.seq_len,
+            previous_pre_head_stream.hidden_dim,
+            stream_hidden_dim
+        );
+
+        let embeddings =
+            common::get_embeddings_batch(&self.ctx, embed_tokens, &[token], hidden_size)?;
+        let mut e_normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &embeddings,
+            &mtp.enorm,
+            self.config.rms_norm_eps,
+            &mut e_normed,
+        );
+        let e_proj = ops::gemm(&self.ctx, &mtp.e_proj, &e_normed)?;
+
+        let mut h_flat = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, hc_mult)? };
+        self.ctx
+            .stream
+            .memcpy_dtod(&previous_pre_head_stream.data, &mut h_flat.data)
+            .map_err(|err| anyhow::anyhow!("DSv4 MTP h_flat copy failed: {err}"))?;
+        let mut h_normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, hc_mult)? };
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &h_flat,
+            &mtp.hnorm,
+            self.config.rms_norm_eps,
+            &mut h_normed,
+        );
+        let h_proj = ops::gemm(&self.ctx, &mtp.h_proj, &h_normed)?;
+
+        let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_hidden_dim, 1)? };
+        {
+            let (e_ptr, _eg) = e_proj.data.device_ptr(&self.ctx.stream);
+            let (h_ptr, _hg) = h_proj.data.device_ptr(&self.ctx.stream);
+            let (out_ptr, _og) = stream.data.device_ptr_mut(&self.ctx.stream);
+            unsafe {
+                ffi::dsv4_mtp_add_eproj_hproj_cuda(
+                    e_ptr as *const ffi::Half,
+                    h_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    hidden_size as i32,
+                    hc_mult as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DSv4 MTP e/h projection add failed: {err}"))?;
+            }
+        }
+        Ok(stream)
+    }
+
+    fn forward_mtp_decoder_layer_frozen_swa(
+        &self,
+        token: u32,
+        stream: &HiddenStates,
+        target_state: &mut super::state::DeepseekState,
+    ) -> Result<HiddenStates> {
+        let mtp = self
+            .mtp_layers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 internal MTP layer 0 is not loaded"))?;
+        ensure!(
+            !target_state.incremental.layers.is_empty(),
+            "DSv4 internal MTP requires target layer-0 KV cache"
+        );
+        let start_pos = target_state.incremental.processed_tokens.saturating_sub(1);
+        let target_layer0 = target_state
+            .incremental
+            .layers
+            .get_mut(0)
+            .expect("checked non-empty target layer cache");
+
+        let mhc = gen_mhc_params(
+            &self.ctx,
+            &mtp.hc_attn,
+            stream,
+            self.config.hc_mult,
+            self.config.hc_eps,
+            self.config.hc_sinkhorn_iters,
+        )?;
+        let attn_in = hc_pre_from_stream(
+            &self.ctx,
+            stream,
+            &mhc.pre,
+            self.config.hidden_size,
+            self.config.hc_mult,
+        )?;
+        let mut normed = unsafe { HiddenStates::uninit(&self.ctx, self.config.hidden_size, 1)? };
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &attn_in,
+            &mtp.attn_norm,
+            self.config.rms_norm_eps,
+            &mut normed,
+        );
+        let attn_out = self.forward_mtp_swa_attention_frozen(
+            &mtp.attention,
+            &normed,
+            start_pos,
+            &mut target_layer0.attention,
+        )?;
+        let attn_stream = hc_post_to_stream(
+            &self.ctx,
+            &attn_out,
+            stream,
+            &mhc.post,
+            &mhc.comb,
+            self.config.hidden_size,
+            self.config.hc_mult,
+        )?;
+        self.forward_mtp_ffn_layer_stream(token, mtp, &attn_stream)
+    }
+
+    fn forward_mtp_swa_attention_frozen(
+        &self,
+        attention: &DeepseekV4Attention,
+        hidden: &HiddenStates,
+        start_pos: usize,
+        target_cache: &mut DeepseekAttentionRuntimeCache,
+    ) -> Result<HiddenStates> {
+        ensure!(
+            hidden.hidden_dim == self.config.hidden_size && hidden.seq_len == 1,
+            "DSv4 MTP frozen-SWA hidden shape mismatch: got {}x{}, expected 1x{}",
+            hidden.seq_len,
+            hidden.hidden_dim,
+            self.config.hidden_size
+        );
+        let head_dim = self.config.head_dim;
+        let local_width = attention.wq_b.rows;
+        ensure!(
+            local_width.is_multiple_of(head_dim),
+            "DSv4 MTP local q width {} is not divisible by head_dim {}",
+            local_width,
+            head_dim
+        );
+        let local_heads = local_width / head_dim;
+        ensure!(
+            target_cache.window_gpu.is_some(),
+            "DSv4 MTP frozen-SWA target layer-0 SW window is not initialized"
+        );
+
+        let c_q = ops::gemm(&self.ctx, &attention.wq_a, hidden)?;
+        let mut c_q_normed = unsafe { HiddenStates::uninit(&self.ctx, c_q.hidden_dim, 1)? };
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &c_q,
+            &attention.q_norm,
+            self.config.rms_norm_eps,
+            &mut c_q_normed,
+        );
+        let q_raw = ops::gemm(&self.ctx, &attention.wq_b, &c_q_normed)?;
+        let kv_raw = ops::gemm(&self.ctx, &attention.wkv, hidden)?;
+        let mut kv_normed = unsafe { HiddenStates::uninit(&self.ctx, kv_raw.hidden_dim, 1)? };
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &kv_raw,
+            &attention.kv_norm,
+            self.config.rms_norm_eps,
+            &mut kv_normed,
+        );
+
+        let mut q_prepared = unsafe { HiddenStates::uninit(&self.ctx, local_width, 1)? };
+        let mut k_prepared = unsafe { HiddenStates::uninit(&self.ctx, head_dim, 1)? };
+        let rope_params = &self.config.rope_parameters;
+        let rope_base = self.config.rope_theta;
+        let original_seq_len = 0;
+        let start_pos_i32 = i32::try_from(start_pos)
+            .map_err(|_| anyhow::anyhow!("DSv4 MTP start_pos {start_pos} overflows i32"))?;
+        {
+            let (q_raw_ptr, _qg) = q_raw.data.device_ptr(&self.ctx.stream);
+            let (k_raw_ptr, _kg) = kv_normed.data.device_ptr(&self.ctx.stream);
+            let (q_out_ptr, _qog) = q_prepared.data.device_ptr_mut(&self.ctx.stream);
+            let (k_out_ptr, _kog) = k_prepared.data.device_ptr_mut(&self.ctx.stream);
+            unsafe {
+                ffi::dsv4_prepare_qk_cuda(
+                    q_raw_ptr as *const ffi::Half,
+                    k_raw_ptr as *const ffi::Half,
+                    q_out_ptr as *mut ffi::Half,
+                    k_out_ptr as *mut ffi::Half,
+                    1,
+                    local_heads as i32,
+                    head_dim as i32,
+                    self.config.qk_rope_head_dim as i32,
+                    start_pos_i32,
+                    self.config.rms_norm_eps,
+                    rope_base,
+                    original_seq_len,
+                    rope_params.factor,
+                    rope_params.beta_fast,
+                    rope_params.beta_slow,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DSv4 MTP frozen-SWA q/k prep failed: {err}"))?;
+            }
+        }
+
+        let mut local_attn = unsafe { HiddenStates::uninit(&self.ctx, local_width, 1)? };
+        {
+            let (q_ptr, _qg) = q_prepared.data.device_ptr(&self.ctx.stream);
+            let (k_ptr, _kg) = k_prepared.data.device_ptr(&self.ctx.stream);
+            let window = target_cache
+                .window_gpu
+                .as_mut()
+                .expect("checked target SW window");
+            let (window_ptr, _wg) = window.device_ptr_mut(&self.ctx.stream);
+            let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&self.ctx.stream);
+            let (out_ptr, _og) = local_attn.data.device_ptr_mut(&self.ctx.stream);
+            unsafe {
+                ffi::dsv4_swa_attention_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    window_ptr as *mut ffi::Half,
+                    sink_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    1,
+                    local_heads as i32,
+                    head_dim as i32,
+                    self.config.sliding_window as i32,
+                    start_pos_i32,
+                    (self.config.tp.rank * local_heads) as i32,
+                    1.0 / (head_dim as f32).sqrt(),
+                    self.config.qk_rope_head_dim as i32,
+                    rope_base,
+                    original_seq_len,
+                    rope_params.factor,
+                    rope_params.beta_fast,
+                    rope_params.beta_slow,
+                    0,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DSv4 MTP frozen-SWA attention failed: {err}"))?;
+            }
+        }
+
+        let mut latent = unsafe { HiddenStates::uninit(&self.ctx, attention.wo_a.rows, 1)? };
+        ops::try_gemm_with_phase_into(
+            &self.ctx,
+            &attention.wo_a,
+            &local_attn,
+            &mut latent,
+            ops::LinearDispatchPhase::Decode,
+        )?;
+        let mut out = unsafe { HiddenStates::uninit(&self.ctx, attention.wo_b.rows, 1)? };
+        ops::try_gemm_with_phase_into(
+            &self.ctx,
+            &attention.wo_b,
+            &latent,
+            &mut out,
+            ops::LinearDispatchPhase::Decode,
+        )?;
+        self.layer_communicator
+            .post_attn_all_reduce_hidden_states(&mut out)?;
+        Ok(out)
+    }
+
+    fn forward_mtp_ffn_layer_stream(
+        &self,
+        token: u32,
+        mtp: &DeepseekMtpLayer,
+        stream: &HiddenStates,
+    ) -> Result<HiddenStates> {
+        let mhc = gen_mhc_params(
+            &self.ctx,
+            &mtp.hc_ffn,
+            stream,
+            self.config.hc_mult,
+            self.config.hc_eps,
+            self.config.hc_sinkhorn_iters,
+        )?;
+        let sub_in = hc_pre_from_stream(
+            &self.ctx,
+            stream,
+            &mhc.pre,
+            self.config.hidden_size,
+            self.config.hc_mult,
+        )?;
+        let mut normed = unsafe { HiddenStates::uninit(&self.ctx, self.config.hidden_size, 1)? };
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &sub_in,
+            &mtp.ffn_norm,
+            self.config.rms_norm_eps,
+            &mut normed,
+        );
+
+        let deepep_requested = dsv4_moe_deepep_enabled()?;
+        let use_deepep = deepep_requested && self.config.ep.world_size > 1;
+        let routed = if use_deepep {
+            #[cfg(feature = "nccl")]
+            {
+                if dsv4_native_deepep_enabled()? {
+                    bail!(
+                        "DSv4 internal MTP frozen-KV draft does not support native DeepEP on \
+                         replicated-token TP/EP yet"
+                    );
+                }
+                let hidden = mtp.ffn.forward_deepep_routed_gpu(
+                    &self.ctx,
+                    &self.layer_communicator,
+                    0,
+                    &self.config.spec,
+                    &self.config.ep,
+                    &normed,
+                    &[token],
+                    None,
+                )?;
+                DeepseekRoutedMoeOutput {
+                    hidden,
+                    ready: None,
+                }
+            }
+            #[cfg(not(feature = "nccl"))]
+            {
+                bail!(
+                    "DeepSeek V4 ARLE_DSV4_MOE_BACKEND=deepep requires building infer with --features nccl"
+                );
+            }
+        } else {
+            let mut hidden = mtp.ffn.forward_local_routed_gpu(
+                &self.ctx,
+                0,
+                &self.config.spec,
+                &self.config.ep,
+                &normed,
+                &[token],
+                None,
+            )?;
+            let (ready, overlapped) = {
+                #[cfg(feature = "nccl")]
+                {
+                    if dsv4_combine_overlap_enabled() {
+                        let ready = self
+                            .layer_communicator
+                            .post_moe_expert_all_reduce_hidden_states_overlap(
+                                &self.ctx,
+                                &mut hidden,
+                            )?;
+                        (ready, true)
+                    } else {
+                        (None, false)
+                    }
+                }
+                #[cfg(not(feature = "nccl"))]
+                {
+                    (None, false)
+                }
+            };
+            if !overlapped {
+                self.layer_communicator
+                    .post_moe_expert_all_reduce_hidden_states(&mut hidden)?;
+            }
+            DeepseekRoutedMoeOutput { hidden, ready }
+        };
+
+        let ffn_out = mtp.ffn.add_shared_expert(
+            &self.ctx,
+            &normed,
+            routed.hidden,
+            routed.ready,
+            self.config.swiglu_limit,
+        )?;
+        hc_post_to_stream(
+            &self.ctx,
+            &ffn_out,
+            stream,
+            &mhc.post,
+            &mhc.comb,
+            self.config.hidden_size,
+            self.config.hc_mult,
+        )
     }
 
     fn forward_transformer_layer_stream_incremental_into(

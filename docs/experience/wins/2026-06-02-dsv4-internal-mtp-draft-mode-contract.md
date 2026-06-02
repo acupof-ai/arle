@@ -25,11 +25,21 @@ silently run the wrong runtime structure.
 - Added a CUDA scheduler branch that routes internal MTP draft proposals through
   the existing target verifier and commit logic.
 - Added DSv4-specific fail-closed messages that distinguish "MTP weights not
-  loaded" from "frozen-KV MTP draft forward/graph capture not implemented yet".
+  loaded" from "frozen-KV MTP draft is eager-only; graph capture is still
+  missing".
+- Added the first real DSv4 internal MTP draft forward:
+  - target pre-head HC stream is captured after target prefill/decode,
+  - MTP seed uses shared embedding plus `enorm/e_proj` and
+    `hnorm/h_proj` over the captured HC lanes,
+  - MTP decoder runs one frozen-SWA layer that reads target layer-0 SW KV
+    without writing it,
+  - greedy draft tokens are produced from MTP `hc_head + norm + lm_head` and
+    routed into the existing target verifier.
 
-This is not a performance win yet. It is the correct control-plane and
-scheduler contract needed before implementing real DSv4 frozen-KV MTP draft
-math.
+This is still not a performance win yet. It is the first real eager
+frozen-KV MTP draft path. The DSv4 best-practice profile remains fail-closed
+until full decode CUDA graph capture/replay, graph-safe DeepEP/NCCL, and
+SGLang-style top-k tree drafting are implemented.
 
 ## Verification
 
@@ -40,6 +50,8 @@ math.
   - passed.
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
   - passed with pre-existing DSv4 warnings.
+- `git diff --check`
+  - passed.
 
 Remote DSv4 fast-build and startup contract verification are pending for the
 next tranche.

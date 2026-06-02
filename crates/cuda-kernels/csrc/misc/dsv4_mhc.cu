@@ -401,3 +401,34 @@ extern "C" CUresult dsv4_mhc_head_pre_cuda(
       hc_mult, eps);
   return (CUresult)cudaGetLastError();
 }
+
+__global__ void dsv4_mtp_add_eproj_hproj_kernel(
+    const uint16_t *__restrict__ e_proj,
+    const uint16_t *__restrict__ h_proj,
+    uint16_t *__restrict__ out_stream,
+    int hidden_size,
+    int hc_mult) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = hidden_size * hc_mult;
+  if (idx >= total) return;
+  int col = idx % hidden_size;
+  float value = bf16_to_f32(e_proj[col]) + bf16_to_f32(h_proj[idx]);
+  out_stream[idx] = f32_to_bf16_bits(value);
+}
+
+extern "C" CUresult dsv4_mtp_add_eproj_hproj_cuda(
+    const uint16_t *e_proj,
+    const uint16_t *h_proj,
+    uint16_t *out_stream,
+    int hidden_size,
+    int hc_mult,
+    CUstream stream) {
+  if (hidden_size <= 0 || hc_mult <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = hidden_size * hc_mult;
+  int grid = (total + DSV4_MHC_BLOCK - 1) / DSV4_MHC_BLOCK;
+  dsv4_mtp_add_eproj_hproj_kernel<<<grid, DSV4_MHC_BLOCK, 0, (cudaStream_t)stream>>>(
+      e_proj, h_proj, out_stream, hidden_size, hc_mult);
+  return (CUresult)cudaGetLastError();
+}
