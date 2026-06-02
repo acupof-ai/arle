@@ -531,8 +531,7 @@ fn dsv4_moe_backend_label() -> Result<&'static str> {
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => Ok("allreduce"),
-        "deepep" | "dispatch" | "dispatch_combine" | "deepep_unsafe" | "unsafe_deepep"
-        | "dispatch_unsafe" => Ok("deepep-style"),
+        "deepep" | "dispatch" | "dispatch_combine" => Ok("deepep-style"),
         "native-deepep" | "native_deepep" => Ok("native-deepep"),
         other => anyhow::bail!("invalid ARLE_DSV4_MOE_BACKEND value `{other}`"),
     }
