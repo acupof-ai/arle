@@ -3154,6 +3154,7 @@ fn execute_decode_batch(
         }
     }
     for (req_id, request) in mtp_requests {
+        metrics.record_metal_mtp_scalar_row();
         execute_decode_single(req_id, request, metrics, prefix_runtime, scheduler, active);
     }
     let mut open = non_speculative;
@@ -3851,6 +3852,11 @@ fn record_request_completed(metrics: &ServerMetrics, request: &ActiveMetalReques
     if let Some((blocks, accepted, drafted)) = request.request_state.dflash_block_stats() {
         for i in 0..blocks {
             metrics.record_dflash_block(accepted.get(i).copied().unwrap_or(0), drafted);
+        }
+    }
+    if let Some((blocks, accepted, drafted)) = request.request_state.mtp_block_stats() {
+        for i in 0..blocks {
+            metrics.record_metal_mtp_block(accepted.get(i).copied().unwrap_or(0), drafted);
         }
     }
 }
