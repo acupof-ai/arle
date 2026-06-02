@@ -133,6 +133,40 @@ Remote:
   This is a correctness gate only: it used the debug-fallback profile and a
   short 32-token decode window, so its per-request throughput is not comparable
   with the 256K/1500 hot-cache target.
+- PASS, correctness-only. Follow-up commits `ea2fe1a8`, `2735b177`, and
+  `f553d96a` made the internal MTP/EAGLE path fail closed instead of corrupting
+  output:
+  - speculative draft/bonus tokens now use the same distributed token
+    synchronization as normal decode;
+  - DSv4 verifier now uses the same per-row target path as commit replay,
+    rather than accepting tokens under the batched verifier and replaying a
+    different path;
+  - internal MTP/EAGLE draft acceptance is disabled by default
+    (`ARLE_INTERNAL_MTP_ACCEPT_DRAFTS=1` is experiment-only), so the verifier
+    emits target bonus tokens only until MTP draft parity is proven.
+  Remote build at `f553d96a` used the prebuilt CUDA fast path and completed in
+  17.8 s:
+  `/tmp/dsv4_body_graph_20260603/build_spec_mtp_accept_gate/build.log`.
+  Spec-on raw completions gate passed with `ANSWER_PASS`: c1, c4, and c8 all
+  completed without HTTP errors and every output contained `406`; c8 produced
+  64 output tokens at 6.66 aggregate tok/s. Artifact:
+  `/tmp/dsv4_body_graph_20260603/validate_spec_accept_gate_raw406_c8/batched_decode_validate.log`.
+  Spec-on 32-token chat gate also passed under the weaker marker criterion:
+  all 8 requests returned HTTP 200, generated 32 tokens, and contained
+  `ZZZ406ZZZ`. Artifact:
+  `/tmp/dsv4_body_graph_20260603/validate_spec_accept_gate_marker32_c8/completions32.log`.
+  Strict `startswith("ZZZ406ZZZ")` is not a valid sole gate for this prompt:
+  current no-spec c8 also produced one `ZZZZ406ZZZ...` row. The strict prompt
+  remains a diagnostic only.
+- FAIL, performance. The current `--spec-enabled --spec-draft-model eagle`
+  path is correctness-safe but not performance-positive: because draft
+  acceptance is disabled, it is effectively target verification overhead plus
+  fallback normal decode. The marker32 c8 run took about 39.6 s for 32 tokens
+  per request, with request traces around 0.81 completion tok/s per request.
+  This is not comparable with the target DSv4-Flash TP8 + EAGLE + CUDA graph
+  256K/1500 hot-cache line (`~4.85 ms` TPOT, `~196 tok/s`). The next
+  performance tranche must fix internal MTP/EAGLE draft parity and re-enable
+  acceptance before any 256K/1500 performance claim.
 - Pending. Performance gate must run the matched DSv4-Flash TP8 + EAGLE +
   CUDA graph 256K/1500 hot-cache workload before comparing with the target
   TPOT ~4.85 ms.
