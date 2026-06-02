@@ -1618,9 +1618,18 @@ fn main() {
     // 147f5673 — FlashMLA submodule pin). Refs sgl-kernel/cmake/flashmla.cmake.
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHMLA");
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_FLASHMLA");
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHMLA_DECODE");
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_FLASHMLA_DECODE");
     let flashmla_root = Path::new("vendor/flashmla");
     let flashmla_stub = Path::new("csrc/attention/arle_flashmla_decode_stubs.cu");
     let enable_flashmla = flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA");
+    // The sparse-FP8 decode instantiations require CUDA headers with
+    // __nv_fp8_e8m0 and the runtime gate is still default-OFF. Keep decode
+    // real-kernel compilation opt-in so CUDA 12.5 H20 builds can still produce
+    // DSv4-Flash artifacts with real sparse prefill and decode stubs.
+    let enable_flashmla_decode = enable_flashmla
+        && env_flag("ARLE_CUDA_ENABLE_FLASHMLA_DECODE")
+        && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA_DECODE");
     // `collect_cu_files` sees the fallback stub because it lives under csrc/.
     // Drop it first so FlashMLA builds link exactly one implementation of the
     // prefill/decode FFI symbols. Otherwise the archive order can satisfy
@@ -1643,6 +1652,14 @@ fn main() {
         // so this path is never actually called in practice.
         cu_files.push(flashmla_stub.to_path_buf());
     }
+    let flashmla_decode_stub_only = enable_flashmla && !enable_flashmla_decode;
+    if flashmla_decode_stub_only {
+        cu_files.retain(|p| {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            stem != "arle_flashmla_decode_shim"
+        });
+        cu_files.push(flashmla_stub.to_path_buf());
+    }
     if enable_flashmla {
         let sparse = flashmla_root.join("csrc/sm90/prefill/sparse");
         for entry in [
@@ -1655,35 +1672,27 @@ fn main() {
             cu_files.push(sparse.join(entry));
         }
 
-        // FlashMLA SM90 sparse decode — fp8 KV cache + split-KV
-        // combine + CPU-side decode scheduler. 4 model×head instantiations
-        // (MODEL1×{64,128}, V32×{64,128}) + combine + sched-meta kernel.
-        // Compiled with the same flags as prefill — flagged below in the
-        // `is_flashmla_kernel` branch via the shared `vendor/flashmla`
-        // path component.
-        //
-        // NOTE: the kernel hard-asserts `stride_kv_row == BYTES_PER_TOKEN`
-        // where MODEL1 = 584 bytes/token (448 fp8 NoPE + 128 bf16 RoPE +
-        // 8 fp8_e8m0 scales) and V32 = 656 bytes/token (512 fp8 NoPE +
-        // 128 bf16 RoPE + 16 bytes scales). The bf16-pointer typing of
-        // `SparseAttnDecodeParams::kv` in params.h is misleading — the
-        // kernel reinterprets it as `fp8*` (see splitkv_mla.cuh line 491+).
-        // ARLE's current bf16 KV pool cannot satisfy this contract.
-        // Vendored for future wire-up; shim is gated off by default.
-        let decode_sparse_fp8 = flashmla_root.join("csrc/sm90/decode/sparse_fp8");
-        for entry in [
-            "instantiations/model1_persistent_h64.cu",
-            "instantiations/model1_persistent_h128.cu",
-            "instantiations/v32_persistent_h64.cu",
-            "instantiations/v32_persistent_h128.cu",
-        ] {
-            cu_files.push(decode_sparse_fp8.join(entry));
+        if enable_flashmla_decode {
+            // FlashMLA SM90 sparse decode — fp8 KV cache + split-KV combine +
+            // CPU-side decode scheduler. 4 model×head instantiations
+            // (MODEL1×{64,128}, V32×{64,128}) + combine + sched-meta kernel.
+            // Requires CUDA headers with __nv_fp8_e8m0 and is runtime-gated by
+            // ARLE_DSV4_FLASHMLA_DECODE, default OFF.
+            let decode_sparse_fp8 = flashmla_root.join("csrc/sm90/decode/sparse_fp8");
+            for entry in [
+                "instantiations/model1_persistent_h64.cu",
+                "instantiations/model1_persistent_h128.cu",
+                "instantiations/v32_persistent_h64.cu",
+                "instantiations/v32_persistent_h128.cu",
+            ] {
+                cu_files.push(decode_sparse_fp8.join(entry));
+            }
+            cu_files.push(flashmla_root.join("csrc/smxx/decode/combine/combine.cu"));
+            cu_files.push(
+                flashmla_root
+                    .join("csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu"),
+            );
         }
-        cu_files.push(flashmla_root.join("csrc/smxx/decode/combine/combine.cu"));
-        cu_files.push(
-            flashmla_root
-                .join("csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu"),
-        );
     }
 
     // Keep a stable compile order independent of filesystem iteration order.
@@ -1737,6 +1746,9 @@ fn main() {
         }
         if enable_deepgemm_native {
             nvcc_args.push("-DARLE_ENABLE_DEEPGEMM_NATIVE=1".to_string());
+        }
+        if flashmla_decode_stub_only && cu_file == flashmla_stub {
+            nvcc_args.push("-DARLE_FLASHMLA_STUB_DECODE_ONLY=1".to_string());
         }
         if let Some(split_compile) = nvcc_split_compile.as_deref() {
             nvcc_args.push(format!("--split-compile={split_compile}"));
