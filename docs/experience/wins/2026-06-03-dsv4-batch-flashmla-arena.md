@@ -46,8 +46,17 @@ Local checks:
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,nccl,no-cuda`
 - `git diff --check`
 
-Remote verification on `/data01/build/arle` is pending for this entry at the
-time of writing.
+Remote verification on `/data01/build/arle`, commit
+`098b135f0975c425eb2e9e03e017d311e77d87e9`:
+
+- remote HEAD matched local HEAD, with clean status before the build.
+- release-fast CUDA build passed in 24.01s.
+- the build used the DSv4 prebuilt CUDA artifact fast path and skipped nvcc /
+  TileLang AOT, so this Rust-only tranche did not pay a CUDA rebuild.
+
+Artifact:
+
+- `/tmp/dsv4_batch_flashmla_arena_20260603/build.log`
 
 ## Rule
 
