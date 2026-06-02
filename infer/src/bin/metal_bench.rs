@@ -449,6 +449,7 @@ fn run_bench() -> Result<()> {
                 draft_model: draft_model.clone(),
                 speculative_tokens: cli.speculative_tokens,
             }),
+        mtp: None,
         kv_pool: cli.kv_pool_override(),
         kv_disk: cli.kv_disk_options()?,
         kv_memory_max_bytes: None,
@@ -1046,6 +1047,7 @@ fn run_baseline_compare(cli: &Cli) -> Result<()> {
     // ── Phase 1: baseline (no DFlash) ───────────────────────────────────────
     let mut baseline_backend = MetalBackend::with_options(MetalBackendOptions {
         dflash: None,
+        mtp: None,
         kv_pool: cli.kv_pool_override(),
         kv_disk: cli.kv_disk_options()?,
         kv_memory_max_bytes: None,
@@ -1068,6 +1070,7 @@ fn run_baseline_compare(cli: &Cli) -> Result<()> {
             draft_model,
             speculative_tokens: cli.speculative_tokens,
         }),
+        mtp: None,
         kv_pool: cli.kv_pool_override(),
         kv_disk: cli.kv_disk_options()?,
         kv_memory_max_bytes: None,
