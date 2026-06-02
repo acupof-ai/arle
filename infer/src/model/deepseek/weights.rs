@@ -1410,7 +1410,7 @@ impl DeepseekModel {
                          replicated-token TP/EP yet"
                     );
                 }
-                let hidden = mtp.ffn.forward_deepep_routed_gpu(
+                mtp.ffn.forward_deepep_routed_gpu(
                     &self.ctx,
                     &self.layer_communicator,
                     0,
@@ -1419,11 +1419,7 @@ impl DeepseekModel {
                     &normed,
                     &[token],
                     None,
-                )?;
-                DeepseekRoutedMoeOutput {
-                    hidden,
-                    ready: None,
-                }
+                )?
             }
             #[cfg(not(feature = "nccl"))]
             {
