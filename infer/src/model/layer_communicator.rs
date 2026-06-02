@@ -8,8 +8,12 @@
 
 use anyhow::{Result, bail};
 
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+use cuda_kernels::prelude::DeviceContext;
 #[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceVec, HiddenStates};
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+use cuda_kernels::tensor::{CudaPipelineFence, CudaPipelineStreamKind};
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use cudarc::driver::CudaSlice;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -522,6 +526,40 @@ impl LayerCommunicator {
         }
         self.moe_reduce_scatter_bf16(sendbuf, recv_count, recvbuf)?;
         Ok(false)
+    }
+
+    /// EP-axis BF16 all-reduce on the overlap communicator stream.
+    ///
+    /// The caller owns the dependency chain: this method orders comm after the
+    /// compute stream that produced `hidden`, enqueues NCCL on `ctx.comm_stream`
+    /// through the overlap group, then returns a fence that downstream compute
+    /// must wait on before consuming the reduced tensor.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn post_moe_expert_all_reduce_hidden_states_overlap(
+        &self,
+        ctx: &DeviceContext,
+        hidden: &mut HiddenStates,
+    ) -> Result<Option<CudaPipelineFence>> {
+        if self.ep_world_size == 1 {
+            return Ok(None);
+        }
+        let len = hidden.hidden_dim.saturating_mul(hidden.seq_len);
+        if len != hidden.data.len() {
+            bail!(
+                "PostMoeExpertAllReduce overlap buffer len {} does not match logical len {len}",
+                hidden.data.len()
+            );
+        }
+        let Some(nccl) = self.ep_overlap_nccl.as_ref() else {
+            bail!(
+                "PostMoeExpertAllReduce overlap requires overlap EP NCCL backend for world_size={}",
+                self.ep_world_size
+            );
+        };
+        ctx.comm_waits_for_compute()?;
+        nccl.all_reduce_bf16_in_place(&mut hidden.data)?;
+        let fence = ctx.record_pipeline_fence(CudaPipelineStreamKind::Comm)?;
+        Ok(Some(fence))
     }
 
     /// EP-axis grouped I32 send/recv for DeepEP-style MoE metadata exchange.

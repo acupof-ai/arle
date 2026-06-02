@@ -4059,19 +4059,49 @@ impl DeepseekModel {
                 stream.seq_len,
                 trace,
             )?;
-            let trace = dsv4_trace_begin(&self.ctx)?;
-            self.layer_communicator
-                .post_moe_expert_all_reduce_hidden_states(&mut routed)?;
-            dsv4_trace_end(
-                &self.ctx,
-                "ffn_all_reduce",
-                layer_idx,
-                stream.seq_len,
-                trace,
-            )?;
+            let (routed_ready, all_reduce_overlapped) = {
+                #[cfg(feature = "nccl")]
+                {
+                    if dsv4_combine_overlap_enabled() {
+                        let trace = dsv4_trace_begin(&self.ctx)?;
+                        let ready = self
+                            .layer_communicator
+                            .post_moe_expert_all_reduce_hidden_states_overlap(
+                                &self.ctx,
+                                &mut routed,
+                            )?;
+                        dsv4_trace_end(
+                            &self.ctx,
+                            "ffn_all_reduce_overlap_enqueue",
+                            layer_idx,
+                            stream.seq_len,
+                            trace,
+                        )?;
+                        (ready, true)
+                    } else {
+                        (None, false)
+                    }
+                }
+                #[cfg(not(feature = "nccl"))]
+                {
+                    (None, false)
+                }
+            };
+            if !all_reduce_overlapped {
+                let trace = dsv4_trace_begin(&self.ctx)?;
+                self.layer_communicator
+                    .post_moe_expert_all_reduce_hidden_states(&mut routed)?;
+                dsv4_trace_end(
+                    &self.ctx,
+                    "ffn_all_reduce",
+                    layer_idx,
+                    stream.seq_len,
+                    trace,
+                )?;
+            }
             DeepseekRoutedMoeOutput {
                 hidden: routed,
-                ready: None,
+                ready: routed_ready,
             }
         };
         let trace = dsv4_trace_begin(&self.ctx)?;
