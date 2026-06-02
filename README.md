@@ -173,9 +173,9 @@ Operators wanting only the serving binary can use `infer` directly — same HTTP
 
 <!-- Breakthrough-only headlines (shipped capability / perf wins). Research notes + retractions live in docs/. -->
 
-**2026-05-26 — V100 Route B lands; OPD GKD now fits the 512-token corpus.** Per-window forward + `evict_host_mirror` cut peak GPU 19% (31.5 → 25.4 GiB) and turned an OOM into a clean train step on V100 32 GB. [Wins entry](docs/experience/wins/2026-05-26-opd-chunked-kl-route-b-bench.md).
+**2026-06-02 — Metal Qwen3.6 A/B refreshed.** ARLE and mlx-lm are in the same steady TPOT band from 128 to 12k input tokens; the README chart now shows TTFT + steady TPOT only. [Wins entry](docs/experience/wins/2026-06-02-metal-ttft-tpot-steady.md).
 
-**2026-05-25 — V100 (Volta sm_70) inference unlocked.** Qwen3.5-4B/9B serve end-to-end via upstream TileLang patch + per-kernel SM70 filter. MMLU stays at A100/L4 level (4B: 79.9%, 9B: 83.0%). T1 builds untouched. [Wins entry](docs/experience/wins/2026-05-25-v100-sm70-p3-1-capability-qwen35-4b.md).
+**2026-06-02 — Metal SSD KV is segment-backed.** Prefix snapshots now use CRC32C-checked 64 KiB chunks in sequential segment files; short generated tails stay in memory until the 64-token SSD checkpoint cadence. [Segmented KV](docs/experience/wins/2026-06-02-metal-segmented-ssd-kv.md) · [WA cadence](docs/experience/wins/2026-06-02-metal-ssd-kv-wa-cadence.md).
 
 Older history: [CHANGELOG.md](CHANGELOG.md).
 
