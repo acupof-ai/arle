@@ -1047,6 +1047,9 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     pub(crate) k_prepared: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) local_attn: Option<DeepseekHiddenRuntimeScratch>,
     pub(crate) output_latent: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) csa_q_i: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) csa_weights: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) csa_selected: Option<CudaSlice<i32>>,
     #[cfg(test)]
     pub(crate) compressed: Option<DeepseekCompressorRuntimeCache>,
     #[cfg(test)]
@@ -1150,6 +1153,8 @@ pub(crate) struct DeepseekAttentionRuntimeCache {
     pub(crate) fm_decode_sched_meta: Option<CudaSlice<i32>>,
     pub(crate) fm_decode_num_splits: Option<CudaSlice<i32>>,
     pub(crate) fm_decode_indices: Option<CudaSlice<i32>>,
+    pub(crate) fm_decode_topk_length: Option<CudaSlice<i32>>,
+    pub(crate) fm_decode_lse_out: Option<CudaSlice<f32>>,
     pub(crate) fm_decode_scratch_num_sm_parts: usize,
     pub(crate) fm_decode_scratch_topk_unified: usize,
     pub(crate) fm_decode_scratch_h_q: usize,
@@ -1167,6 +1172,9 @@ impl DeepseekAttentionRuntimeCache {
         self.k_prepared = None;
         self.local_attn = None;
         self.output_latent = None;
+        self.csa_q_i = None;
+        self.csa_weights = None;
+        self.csa_selected = None;
         if let Some(cache) = &mut self.compressed_gpu {
             cache.trim_prefill_scratch();
         }
