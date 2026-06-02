@@ -21,8 +21,9 @@ use super::state::{
 };
 #[cfg(feature = "cuda")]
 use super::weights::{
-    DeepseekModel, dsv4_flashmla_decode_enabled, dsv4_flashmla_prefill_enabled,
-    dsv4_incremental_kv_enabled, dsv4_shared_kv_pool_enabled,
+    DeepseekModel, dsv4_decode_body_cuda_graph_enabled, dsv4_decode_body_cuda_graph_max_batch_size,
+    dsv4_flashmla_decode_enabled, dsv4_flashmla_prefill_enabled, dsv4_incremental_kv_enabled,
+    dsv4_shared_kv_pool_enabled,
 };
 #[cfg(feature = "cuda")]
 use crate::model::generation_state::GenerationStateBase;
@@ -561,6 +562,8 @@ impl ModelForward for DeepseekModel {
         let flashmla_decode = dsv4_flashmla_decode_enabled()?;
         let shared_kv_pool = dsv4_shared_kv_pool_enabled()?;
         let incremental_kv = dsv4_incremental_kv_enabled()?;
+        let body_graph_enabled = dsv4_decode_body_cuda_graph_enabled()?;
+        let body_graph_max_bs = dsv4_decode_body_cuda_graph_max_batch_size()?;
         let fallback_lane = if profile.requires_best_practice() {
             "forbidden"
         } else {
@@ -568,7 +571,7 @@ impl ModelForward for DeepseekModel {
         };
 
         log::info!(
-            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} request_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
+            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} request_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
             profile.as_str(),
             fallback_lane,
             self.config.tp.rank,
@@ -586,6 +589,8 @@ impl ModelForward for DeepseekModel {
             graph_support.supported(),
             graph_support.mode_label(),
             graph_support.reason,
+            body_graph_enabled,
+            body_graph_max_bs,
             moe_backend,
             expert_backend,
             flashmla_prefill,
