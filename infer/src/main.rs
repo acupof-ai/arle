@@ -442,9 +442,11 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
             .parse()
             .with_context(|| format!("worker rank {rank} relay addr parse"))?;
-        let relay = infer::multiproc_relay::RelayWorker::connect(
+        let relay = infer::multiproc_relay::RelayWorker::connect_with_rank(
             addr,
             infer::distributed::init_method::socket_timeout(),
+            rank,
+            world_size,
         )
         .with_context(|| format!("worker rank {rank} relay connect"))?;
         info!("[arle-worker rank={rank}] relay pre-connected to {addr}");
@@ -547,6 +549,11 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                         // Legacy boot-ping envelope (C.3). Just log.
                         log::debug!(
                             "[arle-worker rank={rank}] boot-ping envelope request_id={request_id}"
+                        );
+                    }
+                    Some(RelayEnvelope::WorkerHello { .. }) => {
+                        log::warn!(
+                            "[arle-worker rank={rank}] unexpected worker hello after relay accept"
                         );
                     }
                     Some(RelayEnvelope::Shutdown) => {

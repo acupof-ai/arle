@@ -18,6 +18,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -37,6 +38,10 @@ pub fn pick_free_port() -> Result<u16> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RelayEnvelope {
+    /// Worker identity handshake. The coordinator consumes this during
+    /// `PendingRelayCoordinator::accept` and indexes streams by rank. It is
+    /// never forwarded to the scheduler loop.
+    WorkerHello { rank: usize, world_size: usize },
     /// (Phase B-1 commit C.1 boot-ping variant.) Lightweight envelope
     /// used by C.3 boot validation; retained for backward compat.
     Request {
@@ -99,7 +104,7 @@ pub struct WireSamplingParams {
 /// to every worker stream.
 pub struct RelayCoordinator {
     port: u16,
-    workers: Vec<TcpStream>,
+    workers: BTreeMap<usize, TcpStream>,
 }
 
 /// Pending coordinator state — listener is bound and port is known but
@@ -121,22 +126,42 @@ impl PendingRelayCoordinator {
             bail!("RelayCoordinator needs world_size >= 2 (got {world_size})");
         }
         let expected = world_size - 1;
-        let mut workers = Vec::with_capacity(expected);
+        let mut workers = BTreeMap::new();
         let deadline = Instant::now() + accept_timeout;
 
         while workers.len() < expected {
             match self.listener.accept() {
-                Ok((stream, addr)) => {
+                Ok((mut stream, addr)) => {
                     stream
                         .set_nonblocking(false)
                         .context("worker stream set_nonblocking(false)")?;
+                    let hello = read_envelope(&mut stream)
+                        .with_context(|| format!("RelayCoordinator read hello from {addr}"))?;
+                    let Some(RelayEnvelope::WorkerHello {
+                        rank,
+                        world_size: worker_world_size,
+                    }) = hello
+                    else {
+                        bail!("RelayCoordinator expected worker hello from {addr}");
+                    };
+                    if worker_world_size != world_size {
+                        bail!(
+                            "RelayCoordinator worker rank {rank} reported world_size={worker_world_size}, expected {world_size}"
+                        );
+                    }
+                    if rank == 0 || rank >= world_size {
+                        bail!("RelayCoordinator worker rank {rank} out of range [1, {world_size})");
+                    }
+                    if workers.insert(rank, stream).is_some() {
+                        bail!("RelayCoordinator duplicate worker rank {rank}");
+                    }
                     log::info!(
-                        "[relay-coordinator] worker {}/{} connected from {}",
-                        workers.len() + 1,
+                        "[relay-coordinator] worker rank {} ({}/{}) connected from {}",
+                        rank,
+                        workers.len(),
                         expected,
                         addr
                     );
-                    workers.push(stream);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
@@ -192,20 +217,36 @@ impl RelayCoordinator {
         self.workers.len()
     }
 
+    pub fn worker_ranks(&self) -> Vec<usize> {
+        self.workers.keys().copied().collect()
+    }
+
     /// Broadcast an envelope to every connected worker. On the first
     /// write error, returns immediately — caller decides whether to
     /// drop the coordinator (workers exit) or retry.
     pub fn broadcast(&mut self, envelope: &RelayEnvelope) -> Result<()> {
-        let payload =
-            serde_json::to_vec(envelope).context("RelayCoordinator serialize envelope")?;
-        let header = (payload.len() as u32).to_le_bytes();
-        for (idx, stream) in self.workers.iter_mut().enumerate() {
-            stream
-                .write_all(&header)
-                .with_context(|| format!("RelayCoordinator write header to worker {idx}"))?;
-            stream
-                .write_all(&payload)
-                .with_context(|| format!("RelayCoordinator write payload to worker {idx}"))?;
+        for (&rank, stream) in self.workers.iter_mut() {
+            write_envelope(stream, envelope).with_context(|| {
+                format!("RelayCoordinator write envelope to worker rank {rank}")
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Send an envelope to a selected global-rank set. Rank 0 is local to the
+    /// coordinator process and is intentionally skipped.
+    pub fn send_to_ranks(&mut self, ranks: &[usize], envelope: &RelayEnvelope) -> Result<()> {
+        for &rank in ranks {
+            if rank == 0 {
+                continue;
+            }
+            let stream = self
+                .workers
+                .get_mut(&rank)
+                .with_context(|| format!("RelayCoordinator missing worker rank {rank}"))?;
+            write_envelope(stream, envelope).with_context(|| {
+                format!("RelayCoordinator write envelope to worker rank {rank}")
+            })?;
         }
         Ok(())
     }
@@ -222,12 +263,30 @@ impl RelayWorker {
     /// `connect_timeout` since the coordinator may not have called
     /// `bind_and_accept` yet at the moment the worker fires off.
     pub fn connect(coordinator: SocketAddr, connect_timeout: Duration) -> Result<Self> {
+        Self::connect_with_rank(coordinator, connect_timeout, 1, 2)
+    }
+
+    pub fn connect_with_rank(
+        coordinator: SocketAddr,
+        connect_timeout: Duration,
+        rank: usize,
+        world_size: usize,
+    ) -> Result<Self> {
         let deadline = Instant::now() + connect_timeout;
         let mut last_err = None;
         while Instant::now() < deadline {
             match TcpStream::connect_timeout(&coordinator, Duration::from_millis(200)) {
-                Ok(stream) => {
-                    log::info!("[relay-worker] connected to coordinator at {coordinator}");
+                Ok(mut stream) => {
+                    write_envelope(
+                        &mut stream,
+                        &RelayEnvelope::WorkerHello { rank, world_size },
+                    )
+                    .with_context(|| {
+                        format!("RelayWorker rank {rank}/{world_size} write hello to {coordinator}")
+                    })?;
+                    log::info!(
+                        "[relay-worker] rank {rank}/{world_size} connected to coordinator at {coordinator}"
+                    );
                     return Ok(Self { stream });
                 }
                 Err(err) => {
@@ -244,32 +303,43 @@ impl RelayWorker {
     /// Read one envelope. Returns `Ok(None)` on coordinator EOF (clean
     /// shutdown); `Err` on protocol violation or transport failure.
     pub fn recv(&mut self) -> Result<Option<RelayEnvelope>> {
-        let mut header = [0u8; 4];
-        match self.stream.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(None);
-            }
-            Err(err) => return Err(err).context("RelayWorker read header"),
-        }
-        let len = u32::from_le_bytes(header) as usize;
-        if len == 0 {
-            bail!("RelayWorker received empty envelope (corrupt stream?)");
-        }
-        if len > 64 * 1024 * 1024 {
-            bail!(
-                "RelayWorker envelope length {len} exceeds 64 MiB sanity cap — likely corrupted \
-                 stream or version mismatch"
-            );
-        }
-        let mut payload = vec![0u8; len];
-        self.stream
-            .read_exact(&mut payload)
-            .context("RelayWorker read payload")?;
-        let envelope: RelayEnvelope =
-            serde_json::from_slice(&payload).context("RelayWorker deserialize envelope")?;
-        Ok(Some(envelope))
+        read_envelope(&mut self.stream)
     }
+}
+
+fn write_envelope(stream: &mut TcpStream, envelope: &RelayEnvelope) -> Result<()> {
+    let payload = serde_json::to_vec(envelope).context("relay serialize envelope")?;
+    let header = (payload.len() as u32).to_le_bytes();
+    stream.write_all(&header).context("relay write header")?;
+    stream.write_all(&payload).context("relay write payload")?;
+    Ok(())
+}
+
+fn read_envelope(stream: &mut TcpStream) -> Result<Option<RelayEnvelope>> {
+    let mut header = [0u8; 4];
+    match stream.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err).context("relay read header"),
+    }
+    let len = u32::from_le_bytes(header) as usize;
+    if len == 0 {
+        bail!("relay received empty envelope (corrupt stream?)");
+    }
+    if len > 64 * 1024 * 1024 {
+        bail!(
+            "relay envelope length {len} exceeds 64 MiB sanity cap — likely corrupted stream or version mismatch"
+        );
+    }
+    let mut payload = vec![0u8; len];
+    stream
+        .read_exact(&mut payload)
+        .context("relay read payload")?;
+    let envelope: RelayEnvelope =
+        serde_json::from_slice(&payload).context("relay deserialize envelope")?;
+    Ok(Some(envelope))
 }
 
 #[cfg(test)]
@@ -306,16 +376,13 @@ mod tests {
     #[test]
     fn coordinator_worker_round_trip() {
         let world_size = 2;
-        let port = pick_free_port().unwrap();
-        let coord_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
-        // Bind first, then spawn worker. Bind doesn't block on accept until
-        // we call accept(); the worker can connect immediately.
-        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let pending = RelayCoordinator::bind().unwrap();
+        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
 
         let worker_thread = thread::spawn(move || {
-            let mut worker = RelayWorker::connect(coord_addr, Duration::from_secs(5)).unwrap();
+            let mut worker =
+                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, world_size)
+                    .unwrap();
             // Receive one envelope, then EOF on shutdown.
             let env = worker.recv().unwrap().expect("envelope");
             match env {
@@ -333,26 +400,10 @@ mod tests {
             assert!(next.is_none(), "expected EOF after coordinator drop");
         });
 
-        // Coordinator side: accept the worker (poll the listener since we set non-blocking).
-        let mut accepted = None;
-        for _ in 0..100 {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    accepted = Some(stream);
-                    break;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                Err(err) => panic!("accept failed: {err}"),
-            }
-        }
-        let stream = accepted.expect("worker connected within 2s");
-        let mut coord = RelayCoordinator {
-            port,
-            workers: vec![stream],
-        };
+        let mut coord = pending
+            .accept(world_size, Duration::from_secs(5))
+            .expect("worker connected within 5s");
+        assert_eq!(coord.worker_ranks(), vec![1]);
         coord
             .broadcast(&RelayEnvelope::Request {
                 request_id: 7,
@@ -364,6 +415,59 @@ mod tests {
         drop(coord);
 
         worker_thread.join().unwrap();
-        let _ = world_size; // silence unused var
+    }
+
+    #[test]
+    fn coordinator_targeted_send_reaches_only_selected_rank() {
+        let world_size = 3;
+        let pending = RelayCoordinator::bind().unwrap();
+        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
+
+        let rank1_thread = thread::spawn(move || {
+            let mut worker =
+                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, world_size)
+                    .unwrap();
+            assert!(worker.recv().unwrap().is_none());
+        });
+
+        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
+        let rank2_thread = thread::spawn(move || {
+            let mut worker =
+                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 2, world_size)
+                    .unwrap();
+            let env = worker.recv().unwrap().expect("targeted envelope");
+            match env {
+                RelayEnvelope::Request {
+                    request_id,
+                    prompt_tokens,
+                    ..
+                } => {
+                    assert_eq!(request_id, 9);
+                    assert_eq!(prompt_tokens, vec![9]);
+                }
+                other => panic!("expected Request, got {other:?}"),
+            }
+            assert!(worker.recv().unwrap().is_none());
+        });
+
+        let mut coord = pending
+            .accept(world_size, Duration::from_secs(5))
+            .expect("workers connected within 5s");
+        assert_eq!(coord.worker_ranks(), vec![1, 2]);
+        coord
+            .send_to_ranks(
+                &[2],
+                &RelayEnvelope::Request {
+                    request_id: 9,
+                    prompt_tokens: vec![9],
+                    max_new_tokens: 1,
+                    sampling: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        drop(coord);
+
+        rank1_thread.join().unwrap();
+        rank2_thread.join().unwrap();
     }
 }
