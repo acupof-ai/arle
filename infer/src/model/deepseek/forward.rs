@@ -106,6 +106,7 @@ impl ModelForward for DeepseekModel {
                 first_layer.attention.wq_a.rows,
                 first_layer.attention.wq_b.rows,
                 self.config.head_dim,
+                first_layer.attention.wo_a.rows,
                 head_hc.mix_fn.rows,
                 self.config.vocab_size,
                 1,
