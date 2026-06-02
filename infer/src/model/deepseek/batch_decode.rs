@@ -6,6 +6,7 @@
 
 use anyhow::{Result, ensure};
 
+use super::state::DeepseekMhcRuntimeScratch;
 use crate::model::DecodeContextOps;
 use crate::model::kv_cache::KVFormat;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
@@ -99,9 +100,13 @@ pub(super) struct DeepseekBatchedDecodeScratch {
     pub(super) start_pos_gpu: CudaSlice<i32>,
     pub(super) embeddings: HiddenStates,
     pub(super) stream: HiddenStates,
+    pub(super) attn_mhc: Option<DeepseekMhcRuntimeScratch>,
+    pub(super) attn_pre: HiddenStates,
+    pub(super) attn_normed: HiddenStates,
+    pub(super) attn_normed_row: HiddenStates,
+    pub(super) attn_out: HiddenStates,
+    pub(super) attn_out_row: HiddenStates,
     pub(super) attn_stream: HiddenStates,
-    pub(super) row_in: HiddenStates,
-    pub(super) row_out: HiddenStates,
     pub(super) head_stream_row: HiddenStates,
     pub(super) head_mixes: HiddenStates,
     pub(super) head_hidden: DeviceVec,
@@ -139,9 +144,13 @@ impl DeepseekBatchedDecodeScratch {
                 .map_err(|err| anyhow::anyhow!("Alloc DSv4 start_pos_gpu failed: {err}"))?,
             embeddings: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
             stream: HiddenStates::zeros(ctx, stream_hidden_dim, capacity_tokens)?,
+            attn_mhc: None,
+            attn_pre: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
+            attn_normed: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
+            attn_normed_row: HiddenStates::zeros(ctx, hidden_size, 1)?,
+            attn_out: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
+            attn_out_row: HiddenStates::zeros(ctx, hidden_size, 1)?,
             attn_stream: HiddenStates::zeros(ctx, stream_hidden_dim, capacity_tokens)?,
-            row_in: HiddenStates::zeros(ctx, stream_hidden_dim, 1)?,
-            row_out: HiddenStates::zeros(ctx, stream_hidden_dim, 1)?,
             head_stream_row: HiddenStates::zeros(ctx, stream_hidden_dim, 1)?,
             head_mixes: HiddenStates::zeros(ctx, head_mix_dim, 1)?,
             head_hidden: DeviceVec::zeros(ctx, hidden_size)?.with_label("dsv4_head_hidden"),
@@ -159,9 +168,12 @@ impl DeepseekBatchedDecodeScratch {
         );
         self.embeddings.seq_len = batch_size;
         self.stream.seq_len = batch_size;
+        self.attn_pre.seq_len = batch_size;
+        self.attn_normed.seq_len = batch_size;
+        self.attn_normed_row.seq_len = 1;
+        self.attn_out.seq_len = batch_size;
+        self.attn_out_row.seq_len = 1;
         self.attn_stream.seq_len = batch_size;
-        self.row_in.seq_len = 1;
-        self.row_out.seq_len = 1;
         self.head_stream_row.seq_len = 1;
         self.head_mixes.seq_len = 1;
         self.logits_batch.seq_len = batch_size;
