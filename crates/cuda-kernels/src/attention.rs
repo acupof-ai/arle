@@ -263,3 +263,46 @@ pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
     }
     Ok(())
 }
+
+/// Batched `b = N` variant for DSv4 FlashMLA sparse-decode indices.
+///
+/// Emits `indices[b, topk_unified]` and `topk_length[b]` in one launch, reading
+/// per-row absolute positions from `start_pos[b]`. Non-masked slot ids are
+/// shifted by `row * total_blocks * page_block_size`, matching FlashMLA's
+/// absolute slot addressing over one contiguous shared FP8 KV base.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_flashmla_decode_build_indices_batched_raw(
+    ctx: &DeviceContext,
+    indices_ptr: u64,
+    start_pos_ptr: u64,
+    selected_ptr: u64,
+    topk_length_ptr: u64,
+    b: usize,
+    sw_blocks: usize,
+    sliding_window: usize,
+    max_compressed_keys: usize,
+    compress_ratio: usize,
+    mode_int: i32,
+    page_block_size: usize,
+    total_blocks: usize,
+) -> Result<()> {
+    unsafe {
+        ffi::arle_dsv4_flashmla_decode_build_indices_batched_cuda(
+            indices_ptr as *mut i32,
+            start_pos_ptr as *const i32,
+            selected_ptr as *const i32,
+            topk_length_ptr as *mut i32,
+            b as i32,
+            sw_blocks as i32,
+            sliding_window as i32,
+            max_compressed_keys as i32,
+            compress_ratio as i32,
+            mode_int,
+            page_block_size as i32,
+            total_blocks as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}

@@ -682,7 +682,7 @@ impl ModelForward for DeepseekModel {
                 .to_string(),
         );
         missing.push(
-            "DSv4 batched decode attention still loops per row with host start_pos-derived planning"
+            "DSv4 batched decode attention still loops per row with host-selected per-slot/per-layer cache planning"
                 .to_string(),
         );
 
