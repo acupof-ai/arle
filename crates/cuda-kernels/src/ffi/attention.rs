@@ -894,4 +894,26 @@ unsafe extern "C" {
         page_block_size: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Batched `b = N` indices builder for DSv4 FlashMLA sparse decode.
+    ///
+    /// `indices` is `[b, topk_unified]`, `start_pos` is `[b]`, `selected` is
+    /// `[b, max_compressed_keys]` for CSA or null for HCA, and `topk_length` is
+    /// `[b]`. Non-masked slot ids are offset into row-local regions of a shared
+    /// contiguous KV arena using `total_blocks`.
+    pub fn arle_dsv4_flashmla_decode_build_indices_batched_cuda(
+        indices: *mut i32,
+        start_pos: *const i32,
+        selected: *const i32,
+        topk_length: *mut i32,
+        b: i32,
+        sw_blocks: i32,
+        sliding_window: i32,
+        max_compressed_keys: i32,
+        compress_ratio: i32,
+        mode_int: i32,
+        page_block_size: i32,
+        total_blocks: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }

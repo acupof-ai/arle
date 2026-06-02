@@ -165,6 +165,40 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel(
         max_compressed_keys, compress_ratio, mode_int, page_block_size);
 }
 
+__global__ void arle_dsv4_flashmla_decode_build_indices_batched_kernel(
+        int32_t* __restrict__ indices,
+        const int32_t* __restrict__ start_pos,
+        const int32_t* __restrict__ selected,
+        int32_t* __restrict__ topk_length,
+        int b,
+        int sw_blocks,
+        int sliding_window,
+        int max_compressed_keys,
+        int compress_ratio,
+        int mode_int,
+        int page_block_size,
+        int total_blocks,
+        int topk_unified) {
+    const int row = blockIdx.y;
+    if (row >= b) return;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= topk_unified) return;
+
+    if (tid == 0) {
+        topk_length[row] = topk_unified;
+    }
+
+    const int32_t* selected_row =
+        selected != nullptr ? selected + static_cast<int64_t>(row) * max_compressed_keys : nullptr;
+    int32_t out = arle_dsv4_flashmla_decode_index_at(
+        tid, selected_row, sw_blocks, sliding_window, start_pos[row],
+        max_compressed_keys, compress_ratio, mode_int, page_block_size);
+    if (out >= 0) {
+        out += row * total_blocks * page_block_size;
+    }
+    indices[static_cast<int64_t>(row) * topk_unified + tid] = out;
+}
+
 }  // namespace
 
 extern "C" {
@@ -244,6 +278,43 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
     arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel<<<grid, kBlock, 0, stream>>>(
         indices, selected, sw_blocks, sliding_window, start_pos_ptr,
         max_compressed_keys, compress_ratio, mode_int, page_block_size,
+        topk_unified);
+    return cudaGetLastError();
+}
+
+cudaError_t arle_dsv4_flashmla_decode_build_indices_batched_cuda(
+        int32_t* indices,
+        const int32_t* start_pos,
+        const int32_t* selected,
+        int32_t* topk_length,
+        int b,
+        int sw_blocks,
+        int sliding_window,
+        int max_compressed_keys,
+        int compress_ratio,
+        int mode_int,
+        int page_block_size,
+        int total_blocks,
+        cudaStream_t stream) {
+    if (indices == nullptr || start_pos == nullptr || topk_length == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (b <= 0 || sliding_window <= 0) return cudaErrorInvalidValue;
+    if (max_compressed_keys < 0 || page_block_size <= 0) return cudaErrorInvalidValue;
+    if (mode_int != 1 && mode_int != 2) return cudaErrorInvalidValue;
+    if (mode_int == 1 && selected == nullptr) return cudaErrorInvalidValue;
+    if (sw_blocks < 0 || total_blocks <= 0 || sw_blocks > total_blocks) {
+        return cudaErrorInvalidValue;
+    }
+
+    const int topk_unified = sliding_window + max_compressed_keys;
+    if ((topk_unified & 127) != 0) return cudaErrorInvalidValue;  // 2 * B_TOPK = 128
+
+    constexpr int kBlock = 128;
+    dim3 grid((topk_unified + kBlock - 1) / kBlock, static_cast<unsigned>(b), 1);
+    arle_dsv4_flashmla_decode_build_indices_batched_kernel<<<grid, kBlock, 0, stream>>>(
+        indices, start_pos, selected, topk_length, b, sw_blocks, sliding_window,
+        max_compressed_keys, compress_ratio, mode_int, page_block_size, total_blocks,
         topk_unified);
     return cudaGetLastError();
 }
