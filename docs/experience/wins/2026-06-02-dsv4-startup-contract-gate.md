@@ -46,12 +46,21 @@ serve on the replicated-token debug lane and still look like a performance run.
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
 - `cargo check -p infer --no-default-features --features no-cuda`
 - Remote DSv4 pod source was synced by bundle because pod-side GitHub HTTPS
-  fetch failed; remote HEAD verified through the latest PC2 source sync as
-  `bc21bfa81`.
+  fetch failed; remote HEAD verified through the latest source sync as
+  `eb59f1c8`.
 - Remote build: `RUSTUP_TOOLCHAIN=stable bash scripts/dsv4_fast_build.sh`
   completed after one rebuild and harvested DSv4 CUDA artifacts; immediate
   repeat used prebuilt artifacts and finished in 4.92 s while skipping nvcc and
   TileLang AOT.
+- Follow-up remote build after the required-DeepGEMM default change also used
+  the prebuilt CUDA artifacts and finished in 26.42 s at `eb59f1c8`.
+- Remote CUDA unit gate with the correct prebuilt env
+  `ARLE_CUDA_KERNELS_PREBUILT_DIR=/data01/build/arle/target/dsv4-cuda-kernels-prebuilt`:
+  `cargo test -p infer --lib --no-default-features --features cuda,nccl deepgemm_required_is_the_default_expert_backend -- --nocapture`
+  passed 1/1 in 20.47 s and printed the prebuilt-artifact skip message.
+- The same test command with the wrong env name
+  `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
+  back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.
 - Debug/fallback startup contract log:
   `/tmp/dsv4_startup_contract_20260602_095448.log`.
   The log shows `profile=debug-fallback`, `fallback_lane=allowed-debug-only`,
