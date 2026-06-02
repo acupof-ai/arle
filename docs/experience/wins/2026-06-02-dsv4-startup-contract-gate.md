@@ -30,6 +30,10 @@ serve on the replicated-token debug lane and still look like a performance run.
   configured. Startup now prints the SGLang-style TP, attention TP/DP/CP, and
   MoE EP/DP/TP rank groups. No fake NCCL subgroup is attached; unsupported
   subgroup execution still fails closed.
+- PC2 precondition follow-up makes `DistributedSchedulerGroup` publish its
+  request ownership contract. The current multiproc/in-process group logs and
+  exposes `replicated-token`; token-owned DP/EP sharding remains a distinct
+  missing feature instead of being hidden under a generic distributed name.
 
 ## Verification
 
