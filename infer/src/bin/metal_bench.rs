@@ -79,8 +79,26 @@ struct Cli {
     update_baseline: Option<PathBuf>,
 
     /// Enable Metal DFlash with the given draft model path or HuggingFace repo.
-    #[arg(long, value_name = "PATH_OR_REPO")]
+    #[arg(long, value_name = "PATH_OR_REPO", conflicts_with = "mtp_draft_model")]
     dflash_draft_model: Option<String>,
+
+    /// Enable Metal MTP with the given split draft model path or HuggingFace repo.
+    /// Requires --use-step-driver because MTP is only wired through the request
+    /// state / scheduler path, not cpp_model.generate.
+    #[arg(
+        long,
+        value_name = "PATH_OR_REPO",
+        conflicts_with_all = ["dflash_draft_model", "baseline_compare"]
+    )]
+    mtp_draft_model: Option<String>,
+
+    /// Override the Metal MTP draft depth.
+    #[arg(long, requires = "mtp_draft_model")]
+    mtp_draft_tokens: Option<usize>,
+
+    /// Run a baseline-vs-MTP token-id parity gate using the same prompt.
+    #[arg(long, action = ArgAction::SetTrue, requires = "mtp_draft_model")]
+    mtp_parity: bool,
 
     /// Enable the experimental Metal KV pool for the Qwen3 fallback path.
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_kv_pool")]
@@ -184,6 +202,22 @@ impl Cli {
             true
         }
     }
+
+    #[cfg(feature = "metal")]
+    fn mtp_options(&self) -> Option<infer::backend::metal::MetalMtpOptions> {
+        let mut options = if self.mtp_draft_model.is_some() || self.mtp_draft_tokens.is_some() {
+            infer::backend::metal::MetalMtpOptions::explicit()
+        } else {
+            return None;
+        };
+        if let Some(draft_model) = &self.mtp_draft_model {
+            options = options.with_draft_model(draft_model.clone());
+        }
+        if let Some(draft_tokens) = self.mtp_draft_tokens {
+            options = options.with_draft_tokens(draft_tokens);
+        }
+        Some(options)
+    }
 }
 
 /// Pick a default DFlash draft for `--baseline-compare` when the user did
@@ -225,6 +259,7 @@ struct Run {
     mtp_block_size: Option<usize>,
     mtp_avg_accepted_inputs: Option<f64>,
     mtp_acceptance_rate: Option<f64>,
+    token_ids: Vec<u32>,
 }
 
 /// A single metric stat in a baseline file (only mean is required).
@@ -435,6 +470,15 @@ fn run_bench() -> Result<()> {
     if cli.baseline_compare {
         return run_baseline_compare(&cli);
     }
+    if cli.mtp_parity {
+        return run_mtp_parity(&cli);
+    }
+    if cli.mtp_options().is_some() {
+        anyhow::ensure!(
+            cli.use_step_driver,
+            "--mtp-draft-model requires --use-step-driver in metal_bench"
+        );
+    }
 
     let params = SamplingParams {
         temperature: 0.0, // greedy — deterministic runs
@@ -453,7 +497,7 @@ fn run_bench() -> Result<()> {
                 draft_model: draft_model.clone(),
                 speculative_tokens: cli.speculative_tokens,
             }),
-        mtp: None,
+        mtp: cli.mtp_options(),
         kv_pool: cli.kv_pool_override(),
         kv_disk: cli.kv_disk_options()?,
         kv_memory_max_bytes: None,
@@ -563,6 +607,7 @@ fn run_bench() -> Result<()> {
                 mtp_block_size: None,
                 mtp_avg_accepted_inputs: None,
                 mtp_acceptance_rate: None,
+                token_ids: Vec::new(),
             }
         };
 
@@ -914,6 +959,7 @@ fn run_step_driver_once(
         request_state.phase()
     );
 
+    let mut token_ids = Vec::with_capacity(expected_generation_tokens);
     let started_at = Instant::now();
     while request_state.phase() == MetalRequestPhase::Prefill {
         let result = request_state.prefill_chunk(prefill_budget)?;
@@ -921,15 +967,19 @@ fn run_step_driver_once(
             result.processed_tokens > 0,
             "step-driver prefill made no forward progress"
         );
+        if let Some(token) = result.emitted_token {
+            token_ids.push(token);
+        }
     }
 
     let ttft_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     let decode_started = request_state.phase() == MetalRequestPhase::Decode;
     let decode_t0 = Instant::now();
     while request_state.phase() == MetalRequestPhase::Decode {
-        request_state
+        let token = request_state
             .decode_step()?
             .context("step-driver decode_step did not emit a token")?;
+        token_ids.push(token);
     }
     let total_time_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     let decode_elapsed_s = if decode_started {
@@ -960,6 +1010,12 @@ fn run_step_driver_once(
             expected_generation_tokens,
         );
     }
+    anyhow::ensure!(
+        token_ids.len() == request_state.generated_tokens(),
+        "step-driver token capture mismatch: captured={}, request_state={}",
+        token_ids.len(),
+        request_state.generated_tokens(),
+    );
 
     let prompt_tps = if ttft_ms > 0.0 && !prompt_ids.is_empty() {
         prompt_ids.len() as f64 / (ttft_ms / 1000.0).max(1e-9)
@@ -1016,7 +1072,184 @@ fn run_step_driver_once(
         mtp_block_size,
         mtp_avg_accepted_inputs,
         mtp_acceptance_rate,
+        token_ids,
     })
+}
+
+fn first_divergence(left: &[u32], right: &[u32]) -> Option<usize> {
+    let prefix = left.len().min(right.len());
+    for idx in 0..prefix {
+        if left[idx] != right[idx] {
+            return Some(idx);
+        }
+    }
+    (left.len() != right.len()).then_some(prefix)
+}
+
+fn token_window(tokens: &[u32], center: usize) -> Vec<u32> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let start = center.saturating_sub(4);
+    let end = (center + 5).min(tokens.len());
+    tokens[start..end].to_vec()
+}
+
+#[cfg(feature = "metal")]
+fn run_mtp_parity(cli: &Cli) -> Result<()> {
+    use infer::backend::InferenceBackend;
+    use infer::backend::metal::{
+        MetalBackend, MetalBackendOptions, scheduler::MetalSchedulerConfig,
+    };
+    use infer::sampler::SamplingParams;
+
+    let draft_model = cli
+        .mtp_draft_model
+        .as_ref()
+        .context("--mtp-parity requires --mtp-draft-model")?;
+    anyhow::ensure!(
+        cli.generation_tokens > 0,
+        "--mtp-parity requires --generation-tokens >= 1"
+    );
+
+    let params = SamplingParams {
+        temperature: 0.0,
+        ignore_eos: true,
+        max_new_tokens: Some(cli.generation_tokens),
+        ..Default::default()
+    };
+    let prefill_budget = MetalSchedulerConfig::default().max_batch_tokens;
+
+    let mut baseline_backend = MetalBackend::with_options(MetalBackendOptions {
+        dflash: None,
+        mtp: None,
+        kv_pool: cli.kv_pool_override(),
+        kv_disk: cli.kv_disk_options()?,
+        kv_memory_max_bytes: None,
+        runtime_limits: cli.runtime_limits(),
+    });
+    baseline_backend.load(std::path::Path::new(&cli.model))?;
+    let prompt_ids = baseline_backend.benchmark_prompt_ids(cli.prompt_tokens)?;
+    let baseline = run_step_driver_once(
+        &baseline_backend,
+        &prompt_ids,
+        &params,
+        cli.generation_tokens,
+        prefill_budget,
+        infer::backend::metal::request_state::MetalRequestPhase::Prefill,
+    )?;
+    drop(baseline_backend);
+
+    let mut mtp_backend = MetalBackend::with_options(MetalBackendOptions {
+        dflash: None,
+        mtp: cli.mtp_options(),
+        kv_pool: cli.kv_pool_override(),
+        kv_disk: cli.kv_disk_options()?,
+        kv_memory_max_bytes: None,
+        runtime_limits: cli.runtime_limits(),
+    });
+    mtp_backend.load(std::path::Path::new(&cli.model))?;
+    let mtp = run_step_driver_once(
+        &mtp_backend,
+        &prompt_ids,
+        &params,
+        cli.generation_tokens,
+        prefill_budget,
+        infer::backend::metal::request_state::MetalRequestPhase::Prefill,
+    )?;
+
+    let divergence = first_divergence(&baseline.token_ids, &mtp.token_ids);
+    let matched = divergence.is_none();
+    let divergence_payload = divergence.map(|idx| {
+        serde_json::json!({
+            "index": idx,
+            "baseline_token": baseline.token_ids.get(idx).copied(),
+            "mtp_token": mtp.token_ids.get(idx).copied(),
+            "baseline_window": token_window(&baseline.token_ids, idx),
+            "mtp_window": token_window(&mtp.token_ids, idx),
+        })
+    });
+
+    if cli.json {
+        let payload = serde_json::json!({
+            "mode": "mtp-parity",
+            "model": cli.model,
+            "mtp_draft_model": draft_model,
+            "mtp_draft_tokens": cli.mtp_draft_tokens,
+            "prompt_tokens": prompt_ids.len(),
+            "generation_tokens": cli.generation_tokens,
+            "temperature": 0.0,
+            "ignore_eos": true,
+            "matched": matched,
+            "first_divergence": divergence_payload,
+            "baseline": {
+                "tokens": baseline.token_ids,
+                "ttft_ms": baseline.ttft_ms,
+                "total_time_ms": baseline.total_time_ms,
+                "generation_tps": baseline.generation_tps,
+            },
+            "mtp": {
+                "tokens": mtp.token_ids,
+                "ttft_ms": mtp.ttft_ms,
+                "total_time_ms": mtp.total_time_ms,
+                "generation_tps": mtp.generation_tps,
+                "blocks": mtp.mtp_block_count,
+                "block_size": mtp.mtp_block_size,
+                "avg_accepted_inputs": mtp.mtp_avg_accepted_inputs,
+                "acceptance_rate": mtp.mtp_acceptance_rate,
+            }
+        });
+        println!("{payload}");
+    } else {
+        println!();
+        println!("=== Metal MTP Parity: {} ===", cli.model);
+        println!("  Draft model      : {draft_model}");
+        println!("  Prompt tokens    : {}", prompt_ids.len());
+        println!("  Generated tokens : {}", cli.generation_tokens);
+        println!("  Matched          : {matched}");
+        if let Some(idx) = divergence {
+            println!("  First divergence : {idx}");
+            println!(
+                "    baseline token : {:?}",
+                baseline.token_ids.get(idx).copied()
+            );
+            println!("    mtp token      : {:?}", mtp.token_ids.get(idx).copied());
+            println!(
+                "    baseline win   : {:?}",
+                token_window(&baseline.token_ids, idx)
+            );
+            println!(
+                "    mtp win        : {:?}",
+                token_window(&mtp.token_ids, idx)
+            );
+        }
+        println!(
+            "  Baseline         : ttft={:.1}ms total={:.1}ms gen={:.1} tok/s",
+            baseline.ttft_ms, baseline.total_time_ms, baseline.generation_tps
+        );
+        println!(
+            "  MTP              : ttft={:.1}ms total={:.1}ms gen={:.1} tok/s",
+            mtp.ttft_ms, mtp.total_time_ms, mtp.generation_tps
+        );
+        if let (Some(blocks), Some(block_size), Some(avg_inputs), Some(acceptance_rate)) = (
+            mtp.mtp_block_count,
+            mtp.mtp_block_size,
+            mtp.mtp_avg_accepted_inputs,
+            mtp.mtp_acceptance_rate,
+        ) {
+            println!(
+                "  [mtp] blocks={blocks} block_size={block_size} avg_inputs/block={avg_inputs:.2} acceptance={:.1}%",
+                acceptance_rate * 100.0,
+            );
+        }
+    }
+
+    anyhow::ensure!(
+        matched,
+        "MTP parity mismatch: first divergence at token index {:?}",
+        divergence
+    );
+    Ok(())
 }
 
 /// Nearest-rank percentile over a *sorted* slice.
@@ -1323,5 +1556,56 @@ mod tests {
             msg.contains("cannot be used with") || msg.contains("conflict"),
             "expected a conflicts_with error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn mtp_options_build_explicit_draft() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "metal_bench",
+            "--model",
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+            "--mtp-draft-model",
+            "mlx-community/Qwen3.6-35B-A3B-MTP-4bit",
+            "--mtp-draft-tokens",
+            "2",
+        ])
+        .expect("parse mtp args");
+        let options = cli.mtp_options().expect("mtp options");
+        assert_eq!(
+            options.draft_model.as_deref(),
+            Some("mlx-community/Qwen3.6-35B-A3B-MTP-4bit")
+        );
+        assert_eq!(options.draft_tokens, Some(2));
+    }
+
+    #[test]
+    fn mtp_draft_conflicts_with_dflash() {
+        use clap::Parser;
+        let parsed = super::Cli::try_parse_from([
+            "metal_bench",
+            "--model",
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+            "--dflash-draft-model",
+            "z-lab/Qwen3.6-35B-A3B-DFlash",
+            "--mtp-draft-model",
+            "mlx-community/Qwen3.6-35B-A3B-MTP-4bit",
+        ]);
+        let err = match parsed {
+            Err(err) => err,
+            Ok(_) => panic!("clap should reject DFlash + MTP draft models"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be used with") || msg.contains("conflict"),
+            "expected a conflicts_with error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn first_divergence_detects_token_and_length_mismatch() {
+        assert_eq!(super::first_divergence(&[1, 2, 3], &[1, 9, 3]), Some(1));
+        assert_eq!(super::first_divergence(&[1, 2], &[1, 2, 3]), Some(2));
+        assert_eq!(super::first_divergence(&[1, 2], &[1, 2]), None);
     }
 }
