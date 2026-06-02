@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -34,6 +35,10 @@
 
 #ifndef ARLE_DEEPGEMM_DEFAULT_CUDA_HOME
 #define ARLE_DEEPGEMM_DEFAULT_CUDA_HOME "/usr/local/cuda"
+#endif
+
+#ifndef ARLE_DEEPGEMM_DEFAULT_CUTLASS_INCLUDE
+#define ARLE_DEEPGEMM_DEFAULT_CUTLASS_INCLUDE ""
 #endif
 
 namespace {
@@ -191,6 +196,29 @@ std::filesystem::path cuda_home_path() {
   return ARLE_DEEPGEMM_DEFAULT_CUDA_HOME;
 }
 
+std::filesystem::path deepgemm_library_root_path() {
+  return std::filesystem::path(non_empty_env(
+      "ARLE_DEEPGEMM_LIBRARY_ROOT", ARLE_DEEPGEMM_DEFAULT_LIBRARY_ROOT));
+}
+
+std::filesystem::path deepgemm_source_root_path(
+    const std::filesystem::path& library_root) {
+  return library_root.parent_path();
+}
+
+std::filesystem::path deepgemm_cutlass_include_path(
+    const std::filesystem::path& source_root) {
+  const char* cutlass_env = std::getenv("ARLE_DEEPGEMM_CUTLASS_INCLUDE");
+  if (cutlass_env != nullptr && cutlass_env[0] != '\0') {
+    return std::filesystem::path(cutlass_env);
+  }
+  constexpr const char* default_cutlass = ARLE_DEEPGEMM_DEFAULT_CUTLASS_INCLUDE;
+  if (default_cutlass[0] != '\0') {
+    return std::filesystem::path(default_cutlass);
+  }
+  return source_root / "third-party/cutlass/include";
+}
+
 int env_int(const char* name, int fallback) {
   const char* value = std::getenv(name);
   if (value == nullptr || value[0] == '\0') return fallback;
@@ -244,6 +272,82 @@ std::tuple<int, std::string> run_capture(const std::string& command) {
   const int exit_code =
       WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
   return {exit_code, output};
+}
+
+std::filesystem::path cache_root();
+
+bool is_directory(const std::filesystem::path& path) {
+  std::error_code ec;
+  return std::filesystem::is_directory(path, ec);
+}
+
+bool is_regular_file(const std::filesystem::path& path) {
+  std::error_code ec;
+  return std::filesystem::is_regular_file(path, ec);
+}
+
+void write_c_string(char* out, size_t out_len, const std::string& value) {
+  if (out == nullptr || out_len == 0) return;
+  const size_t n = std::min(out_len - 1, value.size());
+  std::memcpy(out, value.data(), n);
+  out[n] = '\0';
+}
+
+struct PreflightReport {
+  bool ok = true;
+  std::string message;
+};
+
+PreflightReport deepgemm_preflight_report() {
+  const auto library_root = deepgemm_library_root_path();
+  const auto source_root = deepgemm_source_root_path(library_root);
+  const auto cuda_home = cuda_home_path();
+  const auto nvcc = cuda_home / "bin" / "nvcc";
+  const auto cuobjdump = cuda_home / "bin" / "cuobjdump";
+  const auto cutlass_include = deepgemm_cutlass_include_path(source_root);
+  const auto deepgemm_include = library_root / "include";
+  const auto deepgemm_header =
+      deepgemm_include / "deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh";
+  const auto cutlass_barrier = cutlass_include / "cutlass/arch/barrier.h";
+
+  std::vector<std::string> missing;
+  if (!is_directory(deepgemm_include)) {
+    missing.push_back("deepgemm_include=" + deepgemm_include.string());
+  }
+  if (!is_regular_file(deepgemm_header)) {
+    missing.push_back("deepgemm_header=" + deepgemm_header.string());
+  }
+  if (!is_directory(cutlass_include)) {
+    missing.push_back("cutlass_include=" + cutlass_include.string());
+  }
+  if (!is_regular_file(cutlass_barrier)) {
+    missing.push_back("cutlass_barrier=" + cutlass_barrier.string());
+  }
+  if (!is_regular_file(nvcc)) {
+    missing.push_back("nvcc=" + nvcc.string());
+  }
+  if (!is_regular_file(cuobjdump)) {
+    missing.push_back("cuobjdump=" + cuobjdump.string());
+  }
+
+  std::ostringstream out;
+  out << "library_root=" << library_root
+      << " source_root=" << source_root
+      << " cutlass_include=" << cutlass_include
+      << " cuda_home=" << cuda_home
+      << " nvcc=" << nvcc
+      << " cuobjdump=" << cuobjdump
+      << " jit_cache=" << cache_root();
+  if (missing.empty()) {
+    return {true, "status=ok " + out.str()};
+  }
+
+  out << " missing=";
+  for (size_t i = 0; i < missing.size(); ++i) {
+    if (i != 0) out << ",";
+    out << missing[i];
+  }
+  return {false, "status=failed " + out.str()};
 }
 
 uint64_t fnv1a(const std::string& data, uint64_t seed) {
@@ -726,17 +830,11 @@ void compile_with_nvcc(
     const std::filesystem::path& cubin_path,
     int major,
     int minor) {
-  const auto library_root =
-      std::filesystem::path(non_empty_env(
-          "ARLE_DEEPGEMM_LIBRARY_ROOT", ARLE_DEEPGEMM_DEFAULT_LIBRARY_ROOT));
-  const auto source_root = library_root.parent_path();
+  const auto library_root = deepgemm_library_root_path();
+  const auto source_root = deepgemm_source_root_path(library_root);
   const auto cuda_home = cuda_home_path();
   const auto nvcc = cuda_home / "bin" / "nvcc";
-  const char* cutlass_env = std::getenv("ARLE_DEEPGEMM_CUTLASS_INCLUDE");
-  const auto cutlass_include =
-      cutlass_env != nullptr && cutlass_env[0] != '\0'
-          ? std::filesystem::path(cutlass_env)
-          : source_root / "third-party/cutlass/include";
+  const auto cutlass_include = deepgemm_cutlass_include_path(source_root);
 
   std::ostringstream command;
   command << shell_quote(nvcc)
@@ -940,6 +1038,19 @@ CUresult launch_sm90_grouped_masked(
 }
 
 }  // namespace
+
+extern "C" CUresult dsv4_deepgemm_native_preflight_cuda(
+    char* out,
+    size_t out_len) {
+  try {
+    const auto report = deepgemm_preflight_report();
+    write_c_string(out, out_len, report.message);
+    return report.ok ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
+  } catch (const std::exception& err) {
+    write_c_string(out, out_len, std::string("status=failed error=") + err.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+}
 
 extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda(
     const unsigned char* a,

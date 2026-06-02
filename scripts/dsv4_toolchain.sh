@@ -24,9 +24,10 @@ NUM_SLOTS="${NUM_SLOTS:-1}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.10}"
 MOE_BACKEND="${ARLE_DSV4_MOE_BACKEND:-allreduce}"
-EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-native}"
+EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
 DEEPGEMM_ROOT="${ARLE_DEEPGEMM_ROOT:-$ROOT/crates/cuda-kernels/vendor/deepgemm}"
 DEEPGEMM_LIBRARY_ROOT="${ARLE_DEEPGEMM_LIBRARY_ROOT:-$DEEPGEMM_ROOT/deep_gemm}"
+DEEPGEMM_CUTLASS_INCLUDE="${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}"
 # DeepEP source tree (deepseek-ai/DeepEP) required for native-deepep MoE
 # backend; left unset → deepep-sys stub mode (NativeDeepEp::boot will bail).
 DEEPEP_DIR="${ARLE_DEEPEP_DIR:-}"
@@ -56,6 +57,7 @@ Options:
 
 Environment:
   CUDA_HOME, ARLE_DEEPGEMM_ROOT, ARLE_DEEPGEMM_LIBRARY_ROOT,
+  ARLE_DEEPGEMM_CUTLASS_INCLUDE,
   ARLE_DSV4_MODEL_PATH, ARLE_DSV4_MOE_BACKEND, ARLE_DSV4_EXPERT_BACKEND,
   ARLE_DEEPEP_DIR, ARTIFACT_ROOT, PORT, SERVER_BIN, MAX_TOKENS, PROMPT.
 EOF
@@ -135,10 +137,20 @@ detect_deepgemm() {
     DEEPGEMM_LIBRARY_ROOT="$(abs_path "$DEEPGEMM_LIBRARY_ROOT")"
     [[ -d "$DEEPGEMM_LIBRARY_ROOT/include" ]] ||
         die "ARLE_DEEPGEMM_LIBRARY_ROOT is unusable; missing include/: $DEEPGEMM_LIBRARY_ROOT"
-    [[ -d "$DEEPGEMM_ROOT/third-party/cutlass/include" ]] ||
-        die "DeepGEMM CUTLASS include dir missing: $DEEPGEMM_ROOT/third-party/cutlass/include"
+    if [[ -n "$DEEPGEMM_CUTLASS_INCLUDE" ]]; then
+        DEEPGEMM_CUTLASS_INCLUDE="$(abs_path "$DEEPGEMM_CUTLASS_INCLUDE")"
+    elif [[ -f "$DEEPGEMM_ROOT/third-party/cutlass/include/cutlass/arch/barrier.h" ]]; then
+        DEEPGEMM_CUTLASS_INCLUDE="$DEEPGEMM_ROOT/third-party/cutlass/include"
+    elif [[ -f "$ROOT/crates/cuda-kernels/vendor/flashmla/csrc/cutlass/include/cutlass/arch/barrier.h" ]]; then
+        DEEPGEMM_CUTLASS_INCLUDE="$ROOT/crates/cuda-kernels/vendor/flashmla/csrc/cutlass/include"
+    else
+        die "DeepGEMM CUTLASS include dir missing; checked $DEEPGEMM_ROOT/third-party/cutlass/include and FlashMLA vendor CUTLASS"
+    fi
+    [[ -f "$DEEPGEMM_CUTLASS_INCLUDE/cutlass/arch/barrier.h" ]] ||
+        die "DeepGEMM CUTLASS barrier header missing: $DEEPGEMM_CUTLASS_INCLUDE/cutlass/arch/barrier.h"
     export ARLE_DEEPGEMM_ROOT="$DEEPGEMM_ROOT"
     export ARLE_DEEPGEMM_LIBRARY_ROOT="$DEEPGEMM_LIBRARY_ROOT"
+    export ARLE_DEEPGEMM_CUTLASS_INCLUDE="$DEEPGEMM_CUTLASS_INCLUDE"
 }
 
 # Validate ARLE_DEEPEP_DIR when MOE_BACKEND=native-deepep. Other backends
@@ -174,6 +186,7 @@ export_runtime_env() {
     # weight reuse. Refs: docs/experience/errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md
     export ARLE_DSV4_LOCAL_GROUPED_EXPERTS="${ARLE_DSV4_LOCAL_GROUPED_EXPERTS:-0}"
     export ARLE_DEEPGEMM_LIBRARY_ROOT="$DEEPGEMM_LIBRARY_ROOT"
+    export ARLE_DEEPGEMM_CUTLASS_INCLUDE="$DEEPGEMM_CUTLASS_INCLUDE"
     # native-deepep needs the source tree available at runtime too (the
     # Buffer lifecycle is driven by the static archive linked at build,
     # but the env var is logged for traceability and consumed by smoke
@@ -211,6 +224,7 @@ env_check() {
     echo "NCCL=found"
     echo "ARLE_DEEPGEMM_ROOT=$ARLE_DEEPGEMM_ROOT"
     echo "ARLE_DEEPGEMM_LIBRARY_ROOT=$ARLE_DEEPGEMM_LIBRARY_ROOT"
+    echo "ARLE_DEEPGEMM_CUTLASS_INCLUDE=$ARLE_DEEPGEMM_CUTLASS_INCLUDE"
     echo "ARLE_DSV4_MODEL_PATH=$MODEL_PATH"
     echo "CUDA_VISIBLE_DEVICES=$DEVICES"
     echo "ARLE_DSV4_MOE_BACKEND=$MOE_BACKEND"
