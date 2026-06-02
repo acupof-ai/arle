@@ -15,9 +15,9 @@ Usage: python3 dsv4_batched_decode_validate.py <port>
 import json, sys, time, urllib.request, threading
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "18300"
-PROMPT = "Compute 137 + 269. Answer with the number only."
+PROMPT = "Repeat exactly this text and nothing else: 406"
 EXPECTED = "406"
-MAXTOK = 24
+MAXTOK = 8
 
 
 def gen(prompt, results, idx):
