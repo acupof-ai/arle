@@ -722,7 +722,8 @@ fn log_deepseek_path_contract(
         world_size,
         axes.summary(),
         std::env::var("ARLE_DSV4_MOE_BACKEND").unwrap_or_else(|_| "allreduce(default)".into()),
-        std::env::var("ARLE_DSV4_EXPERT_BACKEND").unwrap_or_else(|_| "auto(default)".into()),
+        std::env::var("ARLE_DSV4_EXPERT_BACKEND")
+            .unwrap_or_else(|_| "deepgemm(default-required)".into()),
         std::env::var("ARLE_DSV4_SHARED_KV_POOL").unwrap_or_else(|_| "0(default)".into()),
         std::env::var("ARLE_MULTIPROC_SERVE").unwrap_or_else(|_| "0(default)".into()),
     );
