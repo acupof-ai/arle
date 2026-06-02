@@ -1846,6 +1846,11 @@ impl DeepseekModel {
                         hc_mult,
                         n,
                     )?;
+                    let ffn_routed =
+                        scratch.ffn_routed_by_batch.get_mut(n - 1).ok_or_else(|| {
+                            anyhow::anyhow!("DSv4 batched FFN routed scratch missing for B={n}")
+                        })?;
+                    ffn_routed.seq_len = n;
                     self.forward_ffn_layer_stream_with_graph_scratch_into(
                         layer_idx,
                         &scratch.attn_stream,
@@ -1855,7 +1860,7 @@ impl DeepseekModel {
                         ffn_mhc_scratch,
                         &mut layer_cache.ffn_pre,
                         &mut layer_cache.ffn_normed,
-                        &mut scratch.ffn_routed,
+                        ffn_routed,
                         &mut scratch.stream,
                     )?;
                     dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
