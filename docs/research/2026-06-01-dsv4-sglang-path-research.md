@@ -708,6 +708,15 @@ SGLang's CUDA graph model is also concrete:
 - DeepEP graph replay is mode-aware: the captured DeepEP mode is restored before
   graph replay.
 
+The 2026-06-02 source re-read tightened three points that are now treated as
+implementation contract, not hypothesis:
+
+| Area | SGLang source fact | ARLE consequence |
+|---|---|---|
+| DSv4 metadata in graph | `DeepseekV4AttnBackend.init_forward_metadata_decode` returns `DSV4RawDecodeMetadata` when `SGLANG_PREP_IN_CUDA_GRAPH=True`; `_maybe_upgrade_forward_metadata` materializes full SWA/C4/C128 metadata inside the captured forward | ARLE must not claim CUDA graph support while attention metadata is still graph-external host launch state |
+| DeepEP graph replay | `DeepEPCudaGraphRunnerAdapter.capture/replay` records and restores the resolved DeepEP mode before graph replay | ARLE graph capture must integrate DeepEP mode/state explicitly; collectives cannot be treated as incidental graph body calls |
+| MoE fast lane | `DeepEPMoE.forward_impl` is dispatch -> DeepGEMM/runner core -> combine; DeepGEMM pre/post permutes consume `deepep_ll` or `deepep_normal` formats directly | ARLE should delete auto fallback inside DSv4 performance claims; DeepEP/DeepGEMM failure is a startup/runtime error unless the operator explicitly selects a debug backend |
+
 SGLang's routed MoE fast path is:
 
 ```text
@@ -810,6 +819,10 @@ Each tranche needs the same gate:
 ### Current Status Of This Section
 
 This section is source-grounded but not yet runtime-validated. It is a target
-architecture and deletion checklist. The next code change should start with the
-fail-fast contract and startup logs, because that removes the silent fallback
-problem before any benchmark can be trusted.
+architecture and deletion checklist.
+
+The first deletion tranche is the DeepGEMM backend contract: ARLE removes the
+`deepgemm-auto` expert backend so DSv4 no longer falls from required DeepGEMM
+into native grouped expert execution after a preflight or runtime failure. The
+remaining explicit debug escape hatch is `ARLE_DSV4_EXPERT_BACKEND=native`,
+which is not a SGLang-comparable performance lane.

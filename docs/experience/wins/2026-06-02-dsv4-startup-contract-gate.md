@@ -88,8 +88,10 @@ serve on the replicated-token debug lane and still look like a performance run.
   graph-captured.
 - DeepGEMM is now the DSv4 runtime default expert backend, not
   `deepgemm-auto`. Missing or incompatible DeepGEMM now fails before serving
-  unless the operator explicitly asks for `ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto`
-  or `native` as a debug fallback.
+  unless the operator explicitly asks for `ARLE_DSV4_EXPERT_BACKEND=native` as
+  a debug fallback. `deepgemm-auto` is no longer accepted because the SGLang
+  DSv4 fast lane does not silently downgrade DeepGEMM failures into native
+  grouped expert execution.
 - The replicated-token native DeepEP escape hatch was removed. Unsafe
   `deepep_unsafe`/`unsafe_deepep` aliases are no longer accepted, and
   `ARLE_DSV4_MOE_BACKEND=native-deepep` is reserved for the future token-owned
@@ -115,6 +117,15 @@ serve on the replicated-token debug lane and still look like a performance run.
   `cargo check -p infer --no-default-features --features no-cuda`, and
   `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
   passed.
+- DSv4 DeepGEMM auto-fallback deletion local gate:
+  `cargo fmt --check`, `git diff --check`,
+  `cargo check -p infer --no-default-features --features no-cuda`, and
+  `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
+  passed. A local targeted `cargo test -p infer --lib --no-default-features
+  --features cuda,no-cuda deepgemm_required_is_the_default_expert_backend`
+  was not a valid Mac gate because test linking still resolves CUDA C symbols
+  and `/usr/local/cuda/lib64/stubs` is absent; the parser test must run on the
+  remote CUDA/NCCL pod.
 - DSv4 decode-context token-upload remote gate at `40f704cf`:
   `/data01/build/arle` fast-forwarded from GitHub, then
   `scripts/dsv4_fast_build.sh` used the DSv4 prebuilt CUDA artifacts,
