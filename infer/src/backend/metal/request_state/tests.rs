@@ -85,6 +85,27 @@ mod tests {
     }
 
     #[test]
+    fn ngram_draft_copies_tokens_after_prior_suffix_match() {
+        let history = [10, 20, 30, 10, 20];
+        let draft = ngram_draft_from_history(&history, 2, 2, 32);
+        assert_eq!(draft, Some(vec![30, 10]));
+    }
+
+    #[test]
+    fn ngram_draft_returns_none_without_prior_suffix_match() {
+        let history = [10, 20, 30, 40, 50];
+        let draft = ngram_draft_from_history(&history, 2, 4, 32);
+        assert_eq!(draft, None);
+    }
+
+    #[test]
+    fn ngram_draft_respects_min_match_tokens() {
+        let history = [10, 20, 30, 40, 20];
+        let draft = ngram_draft_from_history(&history, 2, 4, 32);
+        assert_eq!(draft, None);
+    }
+
+    #[test]
     fn prefill_chunk_only_emits_a_token_once_the_prompt_finishes() {
         let cleanup_calls = Arc::new(AtomicUsize::new(0));
         let mut state = ResumableRequestState::new(

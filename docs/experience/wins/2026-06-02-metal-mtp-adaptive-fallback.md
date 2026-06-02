@@ -42,13 +42,13 @@ Local parity smoke:
   --model mlx-community/Qwen3.6-35B-A3B-4bit \
   --mtp-draft-model mlx-community/Qwen3.6-35B-A3B-MTP-4bit \
   --mtp-parity \
-  --prompt-tokens 20 --generation-tokens 8 --json
+  --prompt "Write a compact Rust function that reverses a string and explain it briefly." \
+  --generation-tokens 8 --json
 ```
 
-Result: `matched=true`, `acceptance_rate=0.0`,
-`adaptive_disable_events=1`, `adaptive_fallback_steps=3`,
-`cooldown_remaining_steps=13`. Baseline emitted the same token IDs as MTP:
-`[27502, 61610, 27502, 61610, 27502, 61610, 27502, 61610]`.
+Result: pending rerun after replacing token-count synthetic prompts with real
+prompt text. Earlier synthetic-input numbers were implementation smoke only and
+are not retained as benchmark evidence.
 
 This smoke validates the downgrade mechanism and parity on one pathological
 prompt. It is not a performance claim.
@@ -60,13 +60,11 @@ Local MTP-only smoke:
   --model mlx-community/Qwen3.6-35B-A3B-4bit \
   --use-step-driver \
   --mtp-draft-model mlx-community/Qwen3.6-35B-A3B-MTP-4bit \
-  --prompt-tokens 20 --generation-tokens 16 --warmup 0 --runs 1 --json
+  --prompt "Write a compact Rust function that reverses a string and explain it briefly." \
+  --generation-tokens 16 --warmup 0 --runs 1 --json
 ```
 
-Result: `acceptance_rate=0.0`, `adaptive_disable_events=1`,
-`adaptive_fallback_steps=11`, `cooldown_remaining_steps=5`,
-`total_time_ms=6866.9`. The request ran 4 MTP blocks, then stopped paying MTP
-draft cost for the remaining low-acceptance window.
+Result: pending rerun on real prompt text.
 
 ## Rule
 

@@ -42,11 +42,11 @@ QWEN35_MTP_PROFILE=1 ./target/release/metal_bench \
   --model mlx-community/Qwen3.6-35B-A3B-4bit \
   --use-step-driver \
   --mtp-draft-model mlx-community/Qwen3.6-35B-A3B-MTP-4bit \
-  --prompt-tokens 20 --generation-tokens 16 --warmup 0 --runs 1 --json
+  --prompt "Write a compact Rust function that reverses a string and explain it briefly." \
+  --generation-tokens 16 --warmup 0 --runs 1 --json
 ```
 
-Result: `blocks=15`, `block_size=3`, `avg_accepted_inputs=1.0`,
-`acceptance_rate=0.0`, `total_time_ms=8438.2`, `ttft_ms=5617.8`.
+Result: pending rerun after removing token-count synthetic prompt inputs.
 
 Local parity smoke:
 
@@ -55,16 +55,13 @@ Local parity smoke:
   --model mlx-community/Qwen3.6-35B-A3B-4bit \
   --mtp-draft-model mlx-community/Qwen3.6-35B-A3B-MTP-4bit \
   --mtp-parity \
-  --prompt-tokens 20 --generation-tokens 8 --json
+  --prompt "Write a compact Rust function that reverses a string and explain it briefly." \
+  --generation-tokens 8 --json
 ```
 
-Result: `matched=true`; both paths emitted
-`[27502, 61610, 27502, 61610, 27502, 61610, 27502, 61610]`.
-MTP still had `acceptance_rate=0.0`, `total_time_ms=12392.3`, while baseline
-was `total_time_ms=6772.6`.
+Result: pending rerun on real prompt text.
 
-These are smoke checks only (`warmup=0`, `runs=1`) and do not license a
-performance claim.
+These smoke checks do not license a performance claim.
 
 ## Rule
 

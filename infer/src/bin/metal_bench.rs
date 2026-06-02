@@ -6,15 +6,16 @@
 //! # Examples
 //! ```bash
 //! # Basic
-//! ./target/release/metal_bench --model models/Qwen3-0.6B-4bit
+//! ./target/release/metal_bench --model models/Qwen3-0.6B-4bit --prompt-file prompts/code.txt
 //!
 //! # Full options
 //! ./target/release/metal_bench \
 //!   --model models/Qwen3-0.6B-4bit \
-//!   --prompt-tokens 20 --generation-tokens 256 --warmup 3 --runs 5 --json
+//!   --prompt-file prompts/code.txt --generation-tokens 256 --warmup 3 --runs 5 --json
 //! ```
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -35,9 +36,29 @@ struct Cli {
     #[arg(long, short)]
     model: String,
 
-    /// Exact number of prompt tokens to benchmark.
-    #[arg(long, default_value_t = 20)]
-    prompt_tokens: usize,
+    /// Comma-separated prompt files to benchmark in one loaded process.
+    #[arg(
+        long,
+        value_name = "CSV",
+        conflicts_with_all = [
+            "prompt",
+            "prompt_file",
+            "save_baseline",
+            "compare_baseline",
+            "update_baseline",
+            "baseline_compare",
+            "mtp_parity"
+        ]
+    )]
+    prompt_file_sweep: Option<String>,
+
+    /// Prompt text to benchmark.
+    #[arg(long, conflicts_with = "prompt_file")]
+    prompt: Option<String>,
+
+    /// Read prompt text to benchmark from a file.
+    #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+    prompt_file: Option<PathBuf>,
 
     /// Exact number of generated tokens to benchmark.
     #[arg(long, visible_alias = "max-tokens", default_value_t = 256)]
@@ -263,7 +284,20 @@ struct Run {
     mtp_adaptive_fallback_steps: Option<usize>,
     mtp_final_zero_accept_streak: Option<usize>,
     mtp_cooldown_remaining_steps: Option<usize>,
+    ngram_block_count: Option<usize>,
+    ngram_max_draft_tokens: Option<usize>,
+    ngram_min_match_tokens: Option<usize>,
+    ngram_total_draft_tokens: Option<usize>,
+    ngram_accepted_draft_tokens: Option<usize>,
+    ngram_avg_accepted_inputs: Option<f64>,
+    ngram_acceptance_rate: Option<f64>,
     token_ids: Vec<u32>,
+}
+
+struct PromptCase {
+    label: String,
+    source: &'static str,
+    ids: Vec<u32>,
 }
 
 /// A single metric stat in a baseline file (only mean is required).
@@ -446,6 +480,213 @@ fn build_current_metrics(
     m
 }
 
+fn parse_path_csv(raw: &str, flag: &str) -> Result<Vec<PathBuf>> {
+    let mut values = Vec::new();
+    for part in raw.split(',') {
+        let item = part.trim();
+        anyhow::ensure!(!item.is_empty(), "{flag} contains an empty item");
+        values.push(PathBuf::from(item));
+    }
+    anyhow::ensure!(!values.is_empty(), "{flag} must contain at least one value");
+    Ok(values)
+}
+
+#[cfg(feature = "metal")]
+fn load_prompt_cases(
+    cli: &Cli,
+    backend: &infer::backend::metal::MetalBackend,
+) -> Result<Vec<PromptCase>> {
+    match (&cli.prompt, &cli.prompt_file, &cli.prompt_file_sweep) {
+        (Some(prompt), None, None) => {
+            anyhow::ensure!(!prompt.is_empty(), "--prompt must not be empty");
+            Ok(vec![PromptCase {
+                label: "inline-prompt".to_string(),
+                source: "prompt",
+                ids: backend.encode_prompt_ids(prompt)?,
+            }])
+        }
+        (None, Some(path), None) => {
+            let prompt = fs::read_to_string(path)
+                .with_context(|| format!("failed to read prompt file: {}", path.display()))?;
+            anyhow::ensure!(
+                !prompt.is_empty(),
+                "--prompt-file content must not be empty"
+            );
+            Ok(vec![PromptCase {
+                label: path.display().to_string(),
+                source: "prompt-file",
+                ids: backend.encode_prompt_ids(&prompt)?,
+            }])
+        }
+        (None, None, Some(raw_paths)) => {
+            let mut cases = Vec::new();
+            for path in parse_path_csv(raw_paths, "--prompt-file-sweep")? {
+                let prompt = fs::read_to_string(&path).with_context(|| {
+                    format!("failed to read prompt sweep file: {}", path.display())
+                })?;
+                anyhow::ensure!(
+                    !prompt.is_empty(),
+                    "prompt sweep file must not be empty: {}",
+                    path.display()
+                );
+                cases.push(PromptCase {
+                    label: path.display().to_string(),
+                    source: "prompt-file-sweep",
+                    ids: backend.encode_prompt_ids(&prompt)?,
+                });
+            }
+            Ok(cases)
+        }
+        (None, None, None) => bail!(
+            "metal_bench requires a real prompt; pass --prompt, --prompt-file, or --prompt-file-sweep"
+        ),
+        _ => unreachable!("clap enforces prompt source conflicts"),
+    }
+}
+
+fn metric_triplet(values: Vec<f64>) -> (f64, f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut sorted = values;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    (mean, percentile(&sorted, 50.0), percentile(&sorted, 99.0))
+}
+
+fn summarize_runs_json(
+    prompt_label: &str,
+    prompt_source: &str,
+    generation_tokens_requested: usize,
+    use_step_driver: bool,
+    runs: &[Run],
+) -> serde_json::Value {
+    let (mean_prompt_tps, p50_prompt_tps, p99_prompt_tps) =
+        metric_triplet(runs.iter().map(|r| r.prompt_tps).collect());
+    let (mean_generation_tps, p50_generation_tps, p99_generation_tps) =
+        metric_triplet(runs.iter().map(|r| r.generation_tps).collect());
+    let (mean_e2e_tps, p50_e2e_tps, p99_e2e_tps) =
+        metric_triplet(runs.iter().map(|r| r.e2e_tps).collect());
+    let (mean_ttft_ms, p50_ttft_ms, p99_ttft_ms) =
+        metric_triplet(runs.iter().map(|r| r.ttft_ms).collect());
+    let (mean_total_time_ms, p50_total_time_ms, p99_total_time_ms) =
+        metric_triplet(runs.iter().map(|r| r.total_time_ms).collect());
+
+    let avg_tokens = runs.iter().map(|r| r.tokens).sum::<usize>() / runs.len().max(1);
+    let prompt_tokens = runs.first().map_or(0, |r| r.prompt_tokens);
+    let mut payload = serde_json::json!({
+        "prompt_label": prompt_label,
+        "prompt_source": prompt_source,
+        "generation_tokens_requested": generation_tokens_requested,
+        "prompt_tokens": prompt_tokens,
+        "avg_tokens": avg_tokens,
+        "prompt_tps": { "mean": mean_prompt_tps, "p50": p50_prompt_tps, "p99": p99_prompt_tps },
+        "generation_tps": { "mean": mean_generation_tps, "p50": p50_generation_tps, "p99": p99_generation_tps },
+        "ttft_ms": { "mean": mean_ttft_ms, "p50": p50_ttft_ms, "p99": p99_ttft_ms },
+        "total_time_ms": { "mean": mean_total_time_ms, "p50": p50_total_time_ms, "p99": p99_total_time_ms },
+        "repo_e2e_tps": { "mean": mean_e2e_tps, "p50": p50_e2e_tps, "p99": p99_e2e_tps },
+    });
+    if use_step_driver {
+        payload["mode"] = serde_json::Value::String("step-driver".to_string());
+    }
+
+    let dflash_blocks: usize = runs.iter().filter_map(|r| r.dflash_block_count).sum();
+    if dflash_blocks > 0 {
+        let block_size = runs.iter().find_map(|r| r.dflash_block_size).unwrap_or(0);
+        let total_inputs = runs
+            .iter()
+            .filter_map(|r| Some(r.dflash_avg_accepted_inputs? * r.dflash_block_count? as f64))
+            .sum::<f64>();
+        let avg_inputs = total_inputs / dflash_blocks as f64;
+        let acceptance_rate = if block_size > 0 {
+            total_inputs / (dflash_blocks * block_size) as f64
+        } else {
+            0.0
+        };
+        payload["dflash"] = serde_json::json!({
+            "blocks": dflash_blocks,
+            "block_size": block_size,
+            "avg_accepted_inputs": avg_inputs,
+            "acceptance_rate": acceptance_rate,
+        });
+    }
+
+    let mtp_blocks: usize = runs.iter().filter_map(|r| r.mtp_block_count).sum();
+    if mtp_blocks > 0 {
+        let block_size = runs.iter().find_map(|r| r.mtp_block_size).unwrap_or(0);
+        let total_inputs = runs
+            .iter()
+            .filter_map(|r| Some(r.mtp_avg_accepted_inputs? * r.mtp_block_count? as f64))
+            .sum::<f64>();
+        let avg_inputs = total_inputs / mtp_blocks as f64;
+        let acceptance_rate = if block_size > 0 {
+            total_inputs / (mtp_blocks * block_size) as f64
+        } else {
+            0.0
+        };
+        let adaptive_disable_events: usize = runs
+            .iter()
+            .filter_map(|r| r.mtp_adaptive_disable_events)
+            .sum();
+        let adaptive_fallback_steps: usize = runs
+            .iter()
+            .filter_map(|r| r.mtp_adaptive_fallback_steps)
+            .sum();
+        let final_zero_accept_streak = runs
+            .iter()
+            .filter_map(|r| r.mtp_final_zero_accept_streak)
+            .max()
+            .unwrap_or(0);
+        let cooldown_remaining_steps = runs
+            .iter()
+            .filter_map(|r| r.mtp_cooldown_remaining_steps)
+            .max()
+            .unwrap_or(0);
+        payload["mtp"] = serde_json::json!({
+            "blocks": mtp_blocks,
+            "block_size": block_size,
+            "avg_accepted_inputs": avg_inputs,
+            "acceptance_rate": acceptance_rate,
+            "adaptive_disable_events": adaptive_disable_events,
+            "adaptive_fallback_steps": adaptive_fallback_steps,
+            "final_zero_accept_streak": final_zero_accept_streak,
+            "cooldown_remaining_steps": cooldown_remaining_steps,
+        });
+    }
+
+    let ngram_blocks_total: usize = runs.iter().filter_map(|r| r.ngram_block_count).sum();
+    if ngram_blocks_total > 0 {
+        let max_draft_tokens = runs.iter().find_map(|r| r.ngram_max_draft_tokens);
+        let min_match_tokens = runs.iter().find_map(|r| r.ngram_min_match_tokens);
+        let total_draft_tokens: usize =
+            runs.iter().filter_map(|r| r.ngram_total_draft_tokens).sum();
+        let accepted_draft_tokens: usize = runs
+            .iter()
+            .filter_map(|r| r.ngram_accepted_draft_tokens)
+            .sum();
+        let total_inputs = runs
+            .iter()
+            .filter_map(|r| Some(r.ngram_avg_accepted_inputs? * r.ngram_block_count? as f64))
+            .sum::<f64>();
+        let acceptance_rate = if total_draft_tokens > 0 {
+            accepted_draft_tokens as f64 / total_draft_tokens as f64
+        } else {
+            0.0
+        };
+        payload["ngram"] = serde_json::json!({
+            "blocks": ngram_blocks_total,
+            "max_draft_tokens": max_draft_tokens,
+            "min_match_tokens": min_match_tokens,
+            "total_draft_tokens": total_draft_tokens,
+            "accepted_draft_tokens": accepted_draft_tokens,
+            "avg_accepted_inputs": total_inputs / ngram_blocks_total as f64,
+            "acceptance_rate": acceptance_rate,
+        });
+    }
+
+    payload
+}
+
 fn main() -> Result<()> {
     #[cfg(feature = "metal")]
     return run_bench();
@@ -470,6 +711,7 @@ fn run_bench() -> Result<()> {
     use infer::sampler::SamplingParams;
 
     let cli = Cli::parse();
+    anyhow::ensure!(cli.runs > 0, "--runs must be >= 1");
 
     if cli.baseline_compare {
         return run_baseline_compare(&cli);
@@ -483,7 +725,6 @@ fn run_bench() -> Result<()> {
             "--mtp-draft-model requires --use-step-driver in metal_bench"
         );
     }
-
     let params = SamplingParams {
         temperature: 0.0, // greedy — deterministic runs
         ignore_eos: cli.effective_ignore_eos(),
@@ -531,7 +772,16 @@ fn run_bench() -> Result<()> {
         eprintln!("Loaded {load_ms:.0}ms  [{quant_hint}]");
     }
 
-    let prompt_ids = backend.benchmark_prompt_ids(cli.prompt_tokens)?;
+    let mut prompt_cases = load_prompt_cases(&cli, &backend)?;
+    if prompt_cases.len() > 1 {
+        return run_prompt_file_sweep(&cli, &backend, &params, prompt_cases, quant_hint, load_ms);
+    }
+    let prompt_case = prompt_cases
+        .pop()
+        .context("metal_bench prompt loader returned no prompt cases")?;
+    let prompt_ids = prompt_case.ids;
+    let prompt_source = prompt_case.source;
+    let prompt_label = prompt_case.label;
 
     if cli.use_step_driver {
         anyhow::ensure!(
@@ -615,6 +865,13 @@ fn run_bench() -> Result<()> {
                 mtp_adaptive_fallback_steps: None,
                 mtp_final_zero_accept_streak: None,
                 mtp_cooldown_remaining_steps: None,
+                ngram_block_count: None,
+                ngram_max_draft_tokens: None,
+                ngram_min_match_tokens: None,
+                ngram_total_draft_tokens: None,
+                ngram_accepted_draft_tokens: None,
+                ngram_avg_accepted_inputs: None,
+                ngram_acceptance_rate: None,
                 token_ids: Vec::new(),
             }
         };
@@ -664,6 +921,34 @@ fn run_bench() -> Result<()> {
                         acceptance_rate * 100.0,
                         run.mtp_adaptive_disable_events.unwrap_or(0),
                         run.mtp_adaptive_fallback_steps.unwrap_or(0),
+                    );
+                }
+                if let (
+                    Some(blocks),
+                    Some(max_draft),
+                    Some(min_match),
+                    Some(total_draft),
+                    Some(accepted_draft),
+                    Some(avg_inputs),
+                    Some(acceptance_rate),
+                ) = (
+                    run.ngram_block_count,
+                    run.ngram_max_draft_tokens,
+                    run.ngram_min_match_tokens,
+                    run.ngram_total_draft_tokens,
+                    run.ngram_accepted_draft_tokens,
+                    run.ngram_avg_accepted_inputs,
+                    run.ngram_acceptance_rate,
+                ) {
+                    eprintln!(
+                        "    [ngram] blocks={} max_draft={} min_match={} draft_tokens={} accepted_draft={} avg_inputs/block={:.2} acceptance={:.1}%",
+                        blocks,
+                        max_draft,
+                        min_match,
+                        total_draft,
+                        accepted_draft,
+                        avg_inputs,
+                        acceptance_rate * 100.0,
                     );
                 }
             }
@@ -750,6 +1035,29 @@ fn run_bench() -> Result<()> {
         .iter()
         .filter_map(|r| r.mtp_cooldown_remaining_steps)
         .max();
+    let ngram_blocks_total: usize = runs.iter().filter_map(|r| r.ngram_block_count).sum();
+    let ngram_max_draft_tokens = runs.iter().find_map(|r| r.ngram_max_draft_tokens);
+    let ngram_min_match_tokens = runs.iter().find_map(|r| r.ngram_min_match_tokens);
+    let ngram_total_draft_tokens: usize =
+        runs.iter().filter_map(|r| r.ngram_total_draft_tokens).sum();
+    let ngram_accepted_draft_tokens: usize = runs
+        .iter()
+        .filter_map(|r| r.ngram_accepted_draft_tokens)
+        .sum();
+    let mean_ngram_avg_inputs = if ngram_blocks_total > 0 {
+        let total_inputs = runs
+            .iter()
+            .filter_map(|r| Some(r.ngram_avg_accepted_inputs? * r.ngram_block_count? as f64))
+            .sum::<f64>();
+        Some(total_inputs / ngram_blocks_total as f64)
+    } else {
+        None
+    };
+    let mean_ngram_acceptance = if ngram_total_draft_tokens > 0 {
+        Some(ngram_accepted_draft_tokens as f64 / ngram_total_draft_tokens as f64)
+    } else {
+        None
+    };
 
     let avg_tokens = runs.iter().map(|r| r.tokens).sum::<usize>() / runs.len().max(1);
     let prompt_tokens = runs.first().map_or(0, |r| r.prompt_tokens);
@@ -767,7 +1075,8 @@ fn run_bench() -> Result<()> {
         let mut payload = serde_json::json!({
             "model": cli.model,
             "quantization": quant_hint,
-            "prompt_tokens_requested": cli.prompt_tokens,
+            "prompt_label": prompt_label,
+            "prompt_source": prompt_source,
             "generation_tokens_requested": cli.generation_tokens,
             "warmup_runs": cli.warmup,
             "timed_runs": cli.runs,
@@ -814,11 +1123,29 @@ fn run_bench() -> Result<()> {
                 "cooldown_remaining_steps": mtp_cooldown_remaining_steps.unwrap_or(0),
             });
         }
+        if let (Some(max_draft), Some(min_match), Some(avg_inputs), Some(acceptance_rate)) = (
+            ngram_max_draft_tokens,
+            ngram_min_match_tokens,
+            mean_ngram_avg_inputs,
+            mean_ngram_acceptance,
+        ) {
+            payload["ngram"] = serde_json::json!({
+                "blocks": ngram_blocks_total,
+                "max_draft_tokens": max_draft,
+                "min_match_tokens": min_match,
+                "total_draft_tokens": ngram_total_draft_tokens,
+                "accepted_draft_tokens": ngram_accepted_draft_tokens,
+                "avg_accepted_inputs": avg_inputs,
+                "acceptance_rate": acceptance_rate,
+            });
+        }
         println!("{payload}");
     } else {
         println!();
         println!("=== Metal Benchmark: {} [{}] ===", cli.model, quant_hint);
         println!("  Warmup / timed  : {} / {}", cli.warmup, cli.runs);
+        println!("  Prompt source   : {prompt_source}");
+        println!("  Prompt label    : {prompt_label}");
         println!("  Prompt tokens   : {prompt_tokens}");
         println!("  Avg tokens out  : {avg_tokens}");
         println!(
@@ -850,6 +1177,22 @@ fn run_bench() -> Result<()> {
                     acceptance_rate * 100.0,
                     mtp_adaptive_disable_events,
                     mtp_adaptive_fallback_steps,
+                );
+            }
+            if let (Some(max_draft), Some(min_match), Some(avg_inputs), Some(acceptance_rate)) = (
+                ngram_max_draft_tokens,
+                ngram_min_match_tokens,
+                mean_ngram_avg_inputs,
+                mean_ngram_acceptance,
+            ) {
+                println!(
+                    "  [ngram] blocks={}  max_draft={}  min_match={}  draft_tokens={}  accepted_draft={}  avg_inputs/block={avg_inputs:.2}  acceptance={:.1}%",
+                    ngram_blocks_total,
+                    max_draft,
+                    min_match,
+                    ngram_total_draft_tokens,
+                    ngram_accepted_draft_tokens,
+                    acceptance_rate * 100.0,
                 );
             }
         } else {
@@ -884,7 +1227,7 @@ fn run_bench() -> Result<()> {
     let make_baseline = |notes: Option<String>| -> Baseline {
         Baseline {
             model: Some(cli.model.clone()),
-            prompt_tokens: Some(cli.prompt_tokens),
+            prompt_tokens: Some(prompt_tokens),
             generation_tokens: Some(cli.generation_tokens),
             metrics: current_metrics.clone(),
             recorded_at: None,
@@ -910,7 +1253,7 @@ fn run_bench() -> Result<()> {
         validate_baseline_compatibility(
             &baseline,
             &cli.model,
-            cli.prompt_tokens,
+            prompt_tokens,
             cli.generation_tokens,
         )?;
         let passed = compare_baseline(&baseline, &current_metrics);
@@ -938,7 +1281,7 @@ fn run_bench() -> Result<()> {
             validate_baseline_compatibility(
                 &baseline,
                 &cli.model,
-                cli.prompt_tokens,
+                prompt_tokens,
                 cli.generation_tokens,
             )?;
             let passed = compare_baseline(&baseline, &current_metrics);
@@ -966,6 +1309,192 @@ fn run_bench() -> Result<()> {
         anyhow::bail!("benchmark regression detected");
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn run_prompt_file_sweep(
+    cli: &Cli,
+    backend: &infer::backend::metal::MetalBackend,
+    params: &infer::sampler::SamplingParams,
+    prompt_cases: Vec<PromptCase>,
+    quant_hint: &str,
+    load_ms: f64,
+) -> Result<()> {
+    use infer::backend::metal::{
+        request_state::MetalRequestPhase, scheduler::MetalSchedulerConfig,
+    };
+
+    let route = if cli.dflash_draft_model.is_some() {
+        "dflash"
+    } else if cli.mtp_options().is_some() {
+        "mtp"
+    } else {
+        "baseline"
+    };
+    let step_driver_prefill_budget = MetalSchedulerConfig::default().max_batch_tokens;
+    let mut results = Vec::with_capacity(prompt_cases.len());
+    let prompt_labels: Vec<String> = prompt_cases.iter().map(|case| case.label.clone()).collect();
+
+    if !cli.json {
+        eprintln!(
+            "Prompt-file sweep route={} files={:?} gen={} warmup={} runs={}",
+            route, prompt_labels, cli.generation_tokens, cli.warmup, cli.runs
+        );
+    }
+
+    for prompt_case in prompt_cases {
+        let prompt_ids = prompt_case.ids;
+        let prompt_tokens = prompt_ids.len();
+        if cli.use_step_driver {
+            anyhow::ensure!(
+                cli.generation_tokens > 0,
+                "--use-step-driver requires --generation-tokens >= 1"
+            );
+            let request_state = backend.create_request_state(&prompt_ids, params)?;
+            if !request_state.is_qwen35() {
+                bail!("--use-step-driver requires Qwen3.5/Qwen3.6 model");
+            }
+        }
+
+        if !cli.json {
+            eprintln!(
+                "Sweep point label={} source={} prompt_tokens={} gen={}",
+                prompt_case.label, prompt_case.source, prompt_tokens, cli.generation_tokens
+            );
+        }
+
+        for _ in 0..cli.warmup {
+            if cli.use_step_driver {
+                run_step_driver_once(
+                    backend,
+                    &prompt_ids,
+                    params,
+                    cli.generation_tokens,
+                    step_driver_prefill_budget,
+                    MetalRequestPhase::Prefill,
+                )?;
+            } else {
+                backend.generate_from_token_ids(&prompt_ids, params)?;
+            }
+        }
+
+        let mut runs: Vec<Run> = Vec::with_capacity(cli.runs);
+        for i in 0..cli.runs {
+            let run = if cli.use_step_driver {
+                run_step_driver_once(
+                    backend,
+                    &prompt_ids,
+                    params,
+                    cli.generation_tokens,
+                    step_driver_prefill_budget,
+                    MetalRequestPhase::Prefill,
+                )?
+            } else {
+                let result = backend.generate_from_token_ids(&prompt_ids, params)?;
+                if result.finish_reason != "length"
+                    || result.completion_tokens != cli.generation_tokens
+                {
+                    anyhow::bail!(
+                        "benchmark invariant failed on prompt '{}' run {}: finish_reason={}, completion_tokens={}, expected={}",
+                        prompt_case.label,
+                        i + 1,
+                        result.finish_reason,
+                        result.completion_tokens,
+                        cli.generation_tokens,
+                    );
+                }
+                let decode_elapsed_s =
+                    ((result.total_time_ms - result.ttft_ms).max(0.0) / 1000.0).max(1e-9);
+                let e2e_tps =
+                    result.completion_tokens as f64 / (result.total_time_ms / 1000.0).max(1e-9);
+                Run {
+                    total_time_ms: result.total_time_ms,
+                    decode_elapsed_s,
+                    prompt_tokens: result.prompt_tokens,
+                    tokens: result.completion_tokens,
+                    prompt_tps: result.prompt_tps,
+                    generation_tps: result.generation_tps,
+                    ttft_ms: result.ttft_ms,
+                    e2e_tps,
+                    dflash_block_count: None,
+                    dflash_block_size: None,
+                    dflash_avg_accepted_inputs: None,
+                    dflash_acceptance_rate: None,
+                    mtp_block_count: None,
+                    mtp_block_size: None,
+                    mtp_avg_accepted_inputs: None,
+                    mtp_acceptance_rate: None,
+                    mtp_adaptive_disable_events: None,
+                    mtp_adaptive_fallback_steps: None,
+                    mtp_final_zero_accept_streak: None,
+                    mtp_cooldown_remaining_steps: None,
+                    ngram_block_count: None,
+                    ngram_max_draft_tokens: None,
+                    ngram_min_match_tokens: None,
+                    ngram_total_draft_tokens: None,
+                    ngram_accepted_draft_tokens: None,
+                    ngram_avg_accepted_inputs: None,
+                    ngram_acceptance_rate: None,
+                    token_ids: Vec::new(),
+                }
+            };
+
+            if cli.profile || !cli.json {
+                eprintln!(
+                    "  p{:5} run {:2}: prompt {:5} tok @ {:7.1} tok/s  gen {:4} tok @ {:7.1} tok/s  repo-e2e {:7.1} tok/s  ttft {:7.1}ms  total {:7.1}ms",
+                    prompt_tokens,
+                    i + 1,
+                    run.prompt_tokens,
+                    run.prompt_tps,
+                    run.tokens,
+                    run.generation_tps,
+                    run.e2e_tps,
+                    run.ttft_ms,
+                    run.total_time_ms,
+                );
+            }
+
+            runs.push(run);
+        }
+
+        results.push(summarize_runs_json(
+            &prompt_case.label,
+            prompt_case.source,
+            cli.generation_tokens,
+            cli.use_step_driver,
+            &runs,
+        ));
+    }
+
+    let peak_mb = peak_rss_kb() as f64 / 1024.0;
+    let mut payload = serde_json::json!({
+        "mode": "prompt-file-sweep",
+        "route": route,
+        "model": cli.model,
+        "quantization": quant_hint,
+        "prompt_file_sweep": prompt_labels,
+        "generation_tokens_requested": cli.generation_tokens,
+        "warmup_runs": cli.warmup,
+        "timed_runs": cli.runs,
+        "load_ms": load_ms,
+        "results": results,
+        "peak_rss_mb": peak_mb,
+    });
+    if let Some(draft_model) = &cli.dflash_draft_model {
+        payload["dflash_draft_model"] = serde_json::Value::String(draft_model.clone());
+    }
+    if let Some(draft_model) = &cli.mtp_draft_model {
+        payload["mtp_draft_model"] = serde_json::Value::String(draft_model.clone());
+    }
+    if let Some(draft_tokens) = cli.mtp_draft_tokens {
+        payload["mtp_draft_tokens"] = serde_json::json!(draft_tokens);
+    }
+    if cli.use_step_driver {
+        payload["driver"] = serde_json::Value::String("step-driver".to_string());
+    }
+
+    println!("{payload}");
     Ok(())
 }
 
@@ -1098,6 +1627,27 @@ fn run_step_driver_once(
     } else {
         (None, None, None, None, None, None, None, None)
     };
+    let (
+        ngram_block_count,
+        ngram_max_draft_tokens,
+        ngram_min_match_tokens,
+        ngram_total_draft_tokens,
+        ngram_accepted_draft_tokens,
+        ngram_avg_accepted_inputs,
+        ngram_acceptance_rate,
+    ) = if let Some(metrics) = request_state.ngram_metrics() {
+        (
+            Some(metrics.block_count),
+            Some(metrics.max_draft_tokens),
+            Some(metrics.min_match_tokens),
+            Some(metrics.total_draft_tokens),
+            Some(metrics.accepted_draft_tokens),
+            Some(metrics.avg_accepted_inputs),
+            Some(metrics.acceptance_rate),
+        )
+    } else {
+        (None, None, None, None, None, None, None)
+    };
 
     Ok(Run {
         total_time_ms,
@@ -1120,6 +1670,13 @@ fn run_step_driver_once(
         mtp_adaptive_fallback_steps,
         mtp_final_zero_accept_streak,
         mtp_cooldown_remaining_steps,
+        ngram_block_count,
+        ngram_max_draft_tokens,
+        ngram_min_match_tokens,
+        ngram_total_draft_tokens,
+        ngram_accepted_draft_tokens,
+        ngram_avg_accepted_inputs,
+        ngram_acceptance_rate,
         token_ids,
     })
 }
@@ -1177,7 +1734,11 @@ fn run_mtp_parity(cli: &Cli) -> Result<()> {
         runtime_limits: cli.runtime_limits(),
     });
     baseline_backend.load(std::path::Path::new(&cli.model))?;
-    let prompt_ids = baseline_backend.benchmark_prompt_ids(cli.prompt_tokens)?;
+    let prompt_case = load_prompt_cases(cli, &baseline_backend)?
+        .pop()
+        .context("--mtp-parity requires exactly one real prompt")?;
+    let prompt_label = prompt_case.label;
+    let prompt_ids = prompt_case.ids;
     let baseline = run_step_driver_once(
         &baseline_backend,
         &prompt_ids,
@@ -1225,6 +1786,7 @@ fn run_mtp_parity(cli: &Cli) -> Result<()> {
             "mtp_draft_model": draft_model,
             "mtp_draft_tokens": cli.mtp_draft_tokens,
             "prompt_tokens": prompt_ids.len(),
+            "prompt_label": prompt_label,
             "generation_tokens": cli.generation_tokens,
             "temperature": 0.0,
             "ignore_eos": true,
@@ -1256,6 +1818,7 @@ fn run_mtp_parity(cli: &Cli) -> Result<()> {
         println!();
         println!("=== Metal MTP Parity: {} ===", cli.model);
         println!("  Draft model      : {draft_model}");
+        println!("  Prompt label     : {prompt_label}");
         println!("  Prompt tokens    : {}", prompt_ids.len());
         println!("  Generated tokens : {}", cli.generation_tokens);
         println!("  Matched          : {matched}");
@@ -1419,7 +1982,16 @@ fn run_baseline_compare(cli: &Cli) -> Result<()> {
         runtime_limits: cli.runtime_limits(),
     });
     baseline_backend.load(std::path::Path::new(&cli.model))?;
-    let prompt_ids = baseline_backend.benchmark_prompt_ids(cli.prompt_tokens)?;
+    let prompt_case = load_prompt_cases(cli, &baseline_backend)?
+        .pop()
+        .context("--baseline-compare requires exactly one real prompt")?;
+    let prompt_label = prompt_case.label;
+    let prompt_ids = prompt_case.ids;
+    eprintln!(
+        "baseline-compare prompt={} prompt_tokens={}",
+        prompt_label,
+        prompt_ids.len()
+    );
     let (baseline_tpot, baseline_gen_tps) = bench_tpot(
         &baseline_backend,
         &prompt_ids,
