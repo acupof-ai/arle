@@ -99,6 +99,7 @@ pub(super) struct DeepseekBatchedDecodeScratch {
     attn_c_q_dim: usize,
     attn_local_width: usize,
     attn_head_dim: usize,
+    attn_output_latent_dim: usize,
     head_mix_dim: usize,
     vocab_size: usize,
     token_ids_scratch: Vec<i32>,
@@ -120,6 +121,9 @@ pub(super) struct DeepseekBatchedDecodeScratch {
     pub(super) attn_kv_raw: HiddenStates,
     pub(super) attn_kv_normed: HiddenStates,
     pub(super) attn_kv_normed_row: HiddenStates,
+    pub(super) attn_local: HiddenStates,
+    pub(super) attn_local_row: HiddenStates,
+    pub(super) attn_output_latent: HiddenStates,
     pub(super) attn_out: HiddenStates,
     pub(super) attn_out_row: HiddenStates,
     pub(super) attn_stream: HiddenStates,
@@ -321,6 +325,7 @@ impl DeepseekBatchedDecodeScratch {
         attn_c_q_dim: usize,
         attn_local_width: usize,
         attn_head_dim: usize,
+        attn_output_latent_dim: usize,
         head_mix_dim: usize,
         vocab_size: usize,
     ) -> Result<Self> {
@@ -332,6 +337,7 @@ impl DeepseekBatchedDecodeScratch {
             attn_c_q_dim,
             attn_local_width,
             attn_head_dim,
+            attn_output_latent_dim,
             head_mix_dim,
             vocab_size,
             token_ids_scratch: Vec::with_capacity(capacity_tokens),
@@ -359,6 +365,9 @@ impl DeepseekBatchedDecodeScratch {
             attn_kv_raw: HiddenStates::zeros(ctx, attn_head_dim, capacity_tokens)?,
             attn_kv_normed: HiddenStates::zeros(ctx, attn_head_dim, capacity_tokens)?,
             attn_kv_normed_row: HiddenStates::zeros(ctx, attn_head_dim, 1)?,
+            attn_local: HiddenStates::zeros(ctx, attn_local_width, capacity_tokens)?,
+            attn_local_row: HiddenStates::zeros(ctx, attn_local_width, 1)?,
+            attn_output_latent: HiddenStates::zeros(ctx, attn_output_latent_dim, capacity_tokens)?,
             attn_out: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
             attn_out_row: HiddenStates::zeros(ctx, hidden_size, 1)?,
             attn_stream: HiddenStates::zeros(ctx, stream_hidden_dim, capacity_tokens)?,
@@ -390,6 +399,9 @@ impl DeepseekBatchedDecodeScratch {
         self.attn_kv_raw.seq_len = batch_size;
         self.attn_kv_normed.seq_len = batch_size;
         self.attn_kv_normed_row.seq_len = 1;
+        self.attn_local.seq_len = batch_size;
+        self.attn_local_row.seq_len = 1;
+        self.attn_output_latent.seq_len = batch_size;
         self.attn_out.seq_len = batch_size;
         self.attn_out_row.seq_len = 1;
         self.attn_stream.seq_len = batch_size;
@@ -493,6 +505,7 @@ impl DeepseekBatchDecodeBuffers {
         attn_c_q_dim: usize,
         attn_local_width: usize,
         attn_head_dim: usize,
+        attn_output_latent_dim: usize,
         head_mix_dim: usize,
         vocab_size: usize,
         batch_size: usize,
@@ -512,6 +525,7 @@ impl DeepseekBatchDecodeBuffers {
                     || scratch.attn_c_q_dim != attn_c_q_dim
                     || scratch.attn_local_width != attn_local_width
                     || scratch.attn_head_dim != attn_head_dim
+                    || scratch.attn_output_latent_dim != attn_output_latent_dim
                     || scratch.head_mix_dim != head_mix_dim
                     || scratch.vocab_size != vocab_size
             })
@@ -525,6 +539,7 @@ impl DeepseekBatchDecodeBuffers {
                 attn_c_q_dim,
                 attn_local_width,
                 attn_head_dim,
+                attn_output_latent_dim,
                 head_mix_dim,
                 vocab_size,
             )?);

@@ -759,6 +759,7 @@ impl DeepseekModel {
         let attn_c_q_dim = first_attention.wq_a.rows;
         let attn_local_width = first_attention.wq_b.rows;
         let attn_head_dim = self.config.head_dim;
+        let attn_output_latent_dim = first_attention.wo_a.rows;
         {
             let scratch = decode_ctx.ensure_batched_scratch(
                 &self.ctx,
@@ -767,6 +768,7 @@ impl DeepseekModel {
                 attn_c_q_dim,
                 attn_local_width,
                 attn_head_dim,
+                attn_output_latent_dim,
                 head_hc.mix_fn.rows,
                 self.config.vocab_size,
                 n,
@@ -806,6 +808,7 @@ impl DeepseekModel {
                 attn_c_q_dim,
                 attn_local_width,
                 attn_head_dim,
+                attn_output_latent_dim,
                 head_hc.mix_fn.rows,
                 self.config.vocab_size,
                 n,
@@ -847,6 +850,7 @@ impl DeepseekModel {
                 attn_c_q_dim,
                 attn_local_width,
                 attn_head_dim,
+                attn_output_latent_dim,
                 head_hc.mix_fn.rows,
                 self.config.vocab_size,
                 n,
@@ -896,7 +900,15 @@ impl DeepseekModel {
                         attention.wkv.rows,
                         attn_head_dim
                     );
+                    ensure!(
+                        attention.wo_a.rows == attn_output_latent_dim,
+                        "DSv4 batched attention output latent dim changed at layer {}: {} != {}",
+                        layer_idx,
+                        attention.wo_a.rows,
+                        attn_output_latent_dim
+                    );
                     let local_heads = attn_local_width / attn_head_dim;
+                    let batch_output_projection = compress_ratio > 0;
                     let (
                         stream,
                         attn_mhc,
@@ -911,6 +923,9 @@ impl DeepseekModel {
                         attn_kv_raw,
                         attn_kv_normed,
                         attn_kv_normed_row,
+                        attn_local,
+                        attn_local_row,
+                        attn_output_latent,
                         attn_out,
                         attn_out_row,
                         attn_stream,
@@ -928,6 +943,9 @@ impl DeepseekModel {
                         &mut scratch.attn_kv_raw,
                         &mut scratch.attn_kv_normed,
                         &mut scratch.attn_kv_normed_row,
+                        &mut scratch.attn_local,
+                        &mut scratch.attn_local_row,
+                        &mut scratch.attn_output_latent,
                         &mut scratch.attn_out,
                         &mut scratch.attn_out_row,
                         &mut scratch.attn_stream,
@@ -1062,11 +1080,43 @@ impl DeepseekModel {
                             compress_ratio,
                             mode,
                             Some(&mut layer_cache.attention),
-                            attn_out_row,
+                            if batch_output_projection {
+                                attn_local_row
+                            } else {
+                                attn_out_row
+                            },
                         )?;
-                        write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
+                        if batch_output_projection {
+                            write_hidden_row(&self.ctx, attn_local, row, attn_local_row)?;
+                        } else {
+                            write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
+                        }
                     }
                     dsv4_trace_end(&self.ctx, "attn_core", layer_idx, n, trace)?;
+
+                    if batch_output_projection {
+                        let trace = dsv4_trace_begin(&self.ctx)?;
+                        ops::try_gemm_with_phase_into(
+                            &self.ctx,
+                            &attention.wo_a,
+                            attn_local,
+                            attn_output_latent,
+                            ops::LinearDispatchPhase::Decode,
+                        )?;
+                        ops::try_gemm_with_phase_into(
+                            &self.ctx,
+                            &attention.wo_b,
+                            attn_output_latent,
+                            attn_out,
+                            ops::LinearDispatchPhase::Decode,
+                        )?;
+                        dsv4_trace_end(&self.ctx, "attn_output_proj", layer_idx, n, trace)?;
+
+                        let trace = dsv4_trace_begin(&self.ctx)?;
+                        self.layer_communicator
+                            .post_attn_all_reduce_hidden_states(attn_out)?;
+                        dsv4_trace_end(&self.ctx, "attn_all_reduce", layer_idx, n, trace)?;
+                    }
 
                     let trace = dsv4_trace_begin(&self.ctx)?;
                     hc_post_to_stream_into(
@@ -1172,6 +1222,7 @@ impl DeepseekModel {
             attn_c_q_dim,
             attn_local_width,
             attn_head_dim,
+            attn_output_latent_dim,
             head_hc.mix_fn.rows,
             self.config.vocab_size,
             n,
@@ -2728,15 +2779,24 @@ impl DeepseekModel {
         cache: Option<&mut DeepseekAttentionRuntimeCache>,
         out: &mut HiddenStates,
     ) -> Result<()> {
+        let projected_output = out.hidden_dim == attention.wo_b.rows;
+        let local_attn_output = compress_ratio > 0 && out.hidden_dim == local_width;
         ensure!(
-            out.hidden_dim == attention.wo_b.rows && out.seq_len == token_count,
-            "DeepSeek V4 attention output scratch mismatch: got {}x{} expected {}x{}",
+            out.seq_len == token_count && (projected_output || local_attn_output),
+            "DeepSeek V4 attention output scratch mismatch: got {}x{} expected {}x{} projected or {}x{} local-attn",
             out.seq_len,
             out.hidden_dim,
             token_count,
-            attention.wo_b.rows
+            attention.wo_b.rows,
+            token_count,
+            local_width
         );
         if compress_ratio == 0 {
+            ensure!(
+                projected_output,
+                "DeepSeek V4 SWA attention requires projected output scratch, got hidden_dim={}",
+                out.hidden_dim
+            );
             return self.forward_swa_attention_gpu_into(
                 layer_idx,
                 attention,
@@ -3207,13 +3267,17 @@ impl DeepseekModel {
             head_dim,
             token_count
         );
+        let projected_output = out.hidden_dim == attention.wo_b.rows;
+        let local_attn_only = out.hidden_dim == local_width && !projected_output;
         ensure!(
-            out.hidden_dim == attention.wo_b.rows && out.seq_len == token_count,
-            "DeepSeek V4 GPU attention output shape mismatch: got {}x{} expected {}x{}",
+            out.seq_len == token_count && (projected_output || local_attn_only),
+            "DeepSeek V4 GPU attention output shape mismatch: got {}x{} expected {}x{} projected or {}x{} local-attn",
             out.seq_len,
             out.hidden_dim,
             token_count,
-            attention.wo_b.rows
+            attention.wo_b.rows,
+            token_count,
+            local_width
         );
         let rope_params = &self.config.rope_parameters;
         // RoPE for Q and the sliding-window K — and the legacy hybrid kernel's
@@ -3261,7 +3325,7 @@ impl DeepseekModel {
         } else {
             None
         };
-        let mut local_attn_scratch = if reuse_decode_scratch {
+        let mut local_attn_scratch = if reuse_decode_scratch && !local_attn_only {
             if let Some(cache) = cache.as_deref_mut() {
                 Some(take_hidden_scratch(
                     &mut cache.local_attn,
@@ -3290,6 +3354,7 @@ impl DeepseekModel {
             k_prepared_owned = unsafe { HiddenStates::uninit(&self.ctx, head_dim, token_count)? };
             &mut k_prepared_owned
         };
+        let local_attn_is_output = local_attn_only;
         let fuse_qk_prep = dsv4_fuse_qk_prep_enabled()?;
         let mode_int_early = match mode {
             deepseek_spec::DeepSeekV4AttentionMode::SlidingWindow => 0,
@@ -3450,7 +3515,9 @@ impl DeepseekModel {
 
         let trace = dsv4_trace_begin(&self.ctx)?;
         let mut local_attn_owned;
-        let local_attn = if let Some(scratch) = local_attn_scratch.as_mut() {
+        let local_attn = if local_attn_is_output {
+            &mut *out
+        } else if let Some(scratch) = local_attn_scratch.as_mut() {
             &mut scratch.hidden
         } else {
             local_attn_owned =
@@ -4590,6 +4657,18 @@ impl DeepseekModel {
                 token_count,
                 trace,
             )?;
+        }
+
+        if local_attn_is_output {
+            if let Some(cache) = cache {
+                if let Some(scratch) = q_prepared_scratch.take() {
+                    put_hidden_scratch(&mut cache.q_prepared, scratch);
+                }
+                if let Some(scratch) = k_prepared_scratch.take() {
+                    put_hidden_scratch(&mut cache.k_prepared, scratch);
+                }
+            }
+            return Ok(());
         }
 
         let trace = dsv4_trace_begin(&self.ctx)?;
