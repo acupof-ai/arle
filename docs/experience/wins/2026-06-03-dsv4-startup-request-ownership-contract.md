@@ -36,8 +36,25 @@ Local:
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,nccl,no-cuda`
 - `git diff --check`
 
-Remote DSv4 fast-build and startup-contract verification are pending for this
-tranche.
+Follow-up remote verification on pod `/data01/build/arle`, commit `cb1fb328`:
+
+- `scripts/dsv4_fast_build.sh` used the prebuilt fast path and completed in
+  28.61 s without harvesting stale `OUT_DIR` artifacts.
+  Artifact: `/tmp/dsv4_fast_build_cb1fb328_20260602_163334.log`.
+- High-performance TP8 + EAGLE startup with
+  `ARLE_DSV4_PERFORMANCE_PROFILE=sglang`, FP8 KV,
+  `--cuda-graph-max-bs 16`, native DeepEP, DeepGEMM, shared KV pool, and
+  `--spec-draft-model eagle` still failed closed before serving opened.
+  Artifact: `/tmp/dsv4_eagle_contract_cb1fb328_20260602_163421.log`.
+- The startup contract now reports the scheduler-planned route:
+  `request_ownership=token-owned-dp-ep`,
+  `request_effective_world_size=8`, and `token_owner_groups=1`
+  (`groups=[[0,1,2,3,4,5,6,7]]` for the TP8/no-attention-DP target).
+- The stale token-owned/owner-group blockers are gone from the fail-closed
+  list. The remaining blockers are the real executable gaps:
+  full-decode CUDA graph capture/replay, DeepEP/NCCL collective graph replay,
+  frozen-KV EAGLE graph replay, graph-captured FlashMLA/SWA/C4/C128 metadata
+  replay, and batched decode attention without host `start_pos` loops.
 
 ## Rule
 
