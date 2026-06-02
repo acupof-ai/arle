@@ -27,8 +27,29 @@ serve on the replicated-token debug lane and still look like a performance run.
 - `git diff --check`
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
 - `cargo check -p infer --no-default-features --features no-cuda`
+- Remote DSv4 pod source was synced by bundle because pod-side GitHub HTTPS
+  fetch failed; remote HEAD verified as `17050ba4`.
+- Remote build: `RUSTUP_TOOLCHAIN=stable bash scripts/dsv4_fast_build.sh`
+  completed after one rebuild and harvested DSv4 CUDA artifacts; immediate
+  repeat used prebuilt artifacts and finished in 4.92 s while skipping nvcc and
+  TileLang AOT.
+- Debug/fallback startup contract log:
+  `/tmp/dsv4_startup_contract_20260602_095448.log`.
+  The log shows `profile=debug-fallback`, `fallback_lane=allowed-debug-only`,
+  `kv_pool_format=FP8E4M3`, `cuda_graph_supported=false` with the replicated
+  TP/EP graph-safety reason, `moe_backend=allreduce`,
+  `expert_backend=deepgemm`, `flashmla_prefill=true`,
+  `flashmla_decode=true`, `shared_kv_pool=false`, and
+  `incremental_kv=true`.
+- High-performance fail-fast log:
+  `/tmp/dsv4_highperf_failfast_clean_20260602_095547.log`.
+  `ARLE_DSV4_PERFORMANCE_PROFILE=sglang` exited non-zero (`status=101`) before
+  serving and named the missing token-owned DP/EP sharding and batched FlashMLA
+  contract.
 
-Remote DSv4 build/startup-log validation is pending.
+The remote rustup `1.95.0` toolchain currently has a `cargo-fmt` conflict; the
+remote validation used `RUSTUP_TOOLCHAIN=stable` (`cargo 1.92.0`) to avoid
+triggering rustup component reinstall during the build.
 
 ## Rule
 
