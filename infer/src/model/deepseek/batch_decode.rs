@@ -93,8 +93,10 @@ pub(super) struct DeepseekBatchedDecodeScratch {
     head_mix_dim: usize,
     vocab_size: usize,
     token_ids_scratch: Vec<i32>,
+    start_pos_scratch: Vec<i32>,
     token_ids_uploaded: usize,
     pub(super) token_ids_gpu: CudaSlice<i32>,
+    pub(super) start_pos_gpu: CudaSlice<i32>,
     pub(super) embeddings: HiddenStates,
     pub(super) stream: HiddenStates,
     pub(super) attn_stream: HiddenStates,
@@ -125,11 +127,16 @@ impl DeepseekBatchedDecodeScratch {
             head_mix_dim,
             vocab_size,
             token_ids_scratch: Vec::with_capacity(capacity_tokens),
+            start_pos_scratch: Vec::with_capacity(capacity_tokens),
             token_ids_uploaded: 0,
             token_ids_gpu: ctx
                 .stream
                 .alloc_zeros(capacity_tokens)
                 .map_err(|err| anyhow::anyhow!("Alloc DSv4 token_ids_gpu failed: {err}"))?,
+            start_pos_gpu: ctx
+                .stream
+                .alloc_zeros(capacity_tokens)
+                .map_err(|err| anyhow::anyhow!("Alloc DSv4 start_pos_gpu failed: {err}"))?,
             embeddings: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
             stream: HiddenStates::zeros(ctx, stream_hidden_dim, capacity_tokens)?,
             attn_stream: HiddenStates::zeros(ctx, stream_hidden_dim, capacity_tokens)?,
@@ -196,6 +203,27 @@ impl DeepseekBatchedDecodeScratch {
             return Ok(());
         }
         self.upload_token_ids(ctx, tokens)
+    }
+
+    pub(super) fn upload_start_positions(
+        &mut self,
+        ctx: &DeviceContext,
+        start_pos: &[usize],
+    ) -> Result<()> {
+        self.set_batch_size(start_pos.len())?;
+        self.start_pos_scratch.clear();
+        for &pos in start_pos {
+            ensure!(
+                pos <= i32::MAX as usize,
+                "DSv4 start_pos {pos} exceeds i32 device metadata range"
+            );
+            self.start_pos_scratch.push(pos as i32);
+        }
+        let mut dst = self.start_pos_gpu.slice_mut(0..start_pos.len());
+        ctx.stream
+            .memcpy_htod(&self.start_pos_scratch, &mut dst)
+            .map_err(|err| anyhow::anyhow!("H2D DSv4 start_pos: {err}"))?;
+        Ok(())
     }
 }
 
