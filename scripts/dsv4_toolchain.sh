@@ -51,7 +51,10 @@ Options:
   --expert-backend NAME
                     DSv4 expert backend (default: $EXPERT_BACKEND)
   --deepep-dir DIR   path to deepseek-ai/DeepEP source tree; required when
-                    --moe-backend=native-deepep. Overrides ARLE_DEEPEP_DIR.
+                    --moe-backend=native-deepep unless found under standard
+                    pod paths. Supports both csrc/kernels/api.cuh and
+                    csrc/kernels/legacy/api.cuh layouts. Overrides
+                    ARLE_DEEPEP_DIR.
   --prompt TEXT      prompt for smoke/nsys
   -h, --help         show this help
 
@@ -153,19 +156,52 @@ detect_deepgemm() {
     export ARLE_DEEPGEMM_CUTLASS_INCLUDE="$DEEPGEMM_CUTLASS_INCLUDE"
 }
 
+deepep_dir_valid() {
+    local dir="$1"
+    [[ -d "$dir/csrc/kernels" ]] || return 1
+    [[ -f "$dir/csrc/kernels/api.cuh" || -f "$dir/csrc/kernels/legacy/api.cuh" ]]
+}
+
+deepep_layout_label() {
+    local dir="$1"
+    if [[ -f "$dir/csrc/kernels/api.cuh" ]]; then
+        printf 'flat\n'
+    elif [[ -f "$dir/csrc/kernels/legacy/api.cuh" ]]; then
+        printf 'legacy\n'
+    else
+        printf 'unsupported\n'
+    fi
+}
+
 # Validate ARLE_DEEPEP_DIR when MOE_BACKEND=native-deepep. Other backends
 # don't require it — deepep-sys falls back to stub mode without it.
 detect_deepep_dir() {
     if [[ "$MOE_BACKEND" != "native-deepep" ]]; then
         return 0
     fi
+
+    if [[ -n "$DEEPEP_DIR" ]]; then
+        DEEPEP_DIR="$(abs_path "$DEEPEP_DIR")"
+        deepep_dir_valid "$DEEPEP_DIR" ||
+            die "unsupported DeepEP source tree: $DEEPEP_DIR (expected csrc/kernels/api.cuh or csrc/kernels/legacy/api.cuh)"
+    else
+        local candidate
+        for candidate in \
+            "$ROOT/../DeepEP" \
+            "$ROOT/../deepep" \
+            "/data01/build/DeepEP" \
+            "/workspace/DeepEP" \
+            "/workspace/deepep"; do
+            if deepep_dir_valid "$candidate"; then
+                DEEPEP_DIR="$candidate"
+                echo "using DeepEP source tree from $DEEPEP_DIR"
+                break
+            fi
+        done
+    fi
+
     [[ -n "$DEEPEP_DIR" ]] ||
         die "ARLE_DSV4_MOE_BACKEND=native-deepep requires --deepep-dir DIR or ARLE_DEEPEP_DIR"
-    DEEPEP_DIR="$(abs_path "$DEEPEP_DIR")"
-    [[ -d "$DEEPEP_DIR/csrc/kernels" ]] ||
-        die "DeepEP source tree missing csrc/kernels/: $DEEPEP_DIR (expected deepseek-ai/DeepEP layout)"
-    [[ -f "$DEEPEP_DIR/csrc/kernels/api.cuh" ]] ||
-        die "DeepEP api.cuh missing at $DEEPEP_DIR/csrc/kernels/api.cuh"
     export ARLE_DEEPEP_DIR="$DEEPEP_DIR"
 }
 
@@ -231,6 +267,7 @@ env_check() {
     echo "ARLE_DSV4_EXPERT_BACKEND=$EXPERT_BACKEND"
     if [[ "$MOE_BACKEND" == "native-deepep" ]]; then
         echo "ARLE_DEEPEP_DIR=$ARLE_DEEPEP_DIR"
+        echo "ARLE_DEEPEP_LAYOUT=$(deepep_layout_label "$ARLE_DEEPEP_DIR")"
     else
         echo "ARLE_DEEPEP_DIR=(unset — not native-deepep)"
     fi
