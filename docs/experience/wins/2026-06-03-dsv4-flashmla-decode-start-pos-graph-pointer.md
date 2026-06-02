@@ -27,6 +27,16 @@ per-layer `fm_decode_start_pos` device slot before Q/K prep, then reuses the
 same pointer for Q/K prep, SW pack, sparse indices, output inverse-rope, and
 window update.
 
+Follow-up tranche: batched decode now owns a stable `start_pos_gpu` scratch
+buffer and uploads the current per-row decode positions before the decode
+piece. The per-row attention loop passes each row's device pointer through the
+attention path, so cached FlashMLA decode Q/K prep no longer has to restage a
+host scalar per layer. Pure-SWA Q/K prep can also consume the pointer ABI.
+
+This is a graph-enablement fix, not a performance win by itself. The route
+still needs full batch metadata replay, DeepEP/NCCL capture/replay, and
+frozen-KV EAGLE/MTP graph replay before it can target the 4.85ms TPOT baseline.
+
 Local verification:
 
 - `cargo fmt --check`
