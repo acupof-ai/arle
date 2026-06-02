@@ -142,6 +142,16 @@ fn resolve_invocation(args: &Args, serve_args: &ServeArgs) -> Result<ServeInvoca
         argv.push(draft_model.to_string());
     }
 
+    if let Some(draft_tokens) = serve_args.mtp_draft_tokens {
+        if backend != ServeBackend::Metal {
+            return Err(
+                "--mtp-draft-tokens is currently only supported by the Metal backend".to_string(),
+            );
+        }
+        argv.push("--mtp-draft-tokens".to_string());
+        argv.push(draft_tokens.to_string());
+    }
+
     if let Some(url) = serve_args.train_control_url.as_deref() {
         argv.push("--train-control-url".to_string());
         argv.push(url.to_string());
@@ -372,6 +382,31 @@ mod tests {
     }
 
     #[test]
+    fn metal_serve_forwards_mtp_draft_tokens() {
+        let mut args = Args::parse_from([
+            "arle",
+            "serve",
+            "--backend",
+            "metal",
+            "--model-path",
+            "model",
+            "--mtp-draft-tokens",
+            "4",
+        ]);
+        let serve = match args.command.take().expect("serve command") {
+            crate::args::CliCommand::Serve(serve) => *serve,
+            _ => panic!("expected serve"),
+        };
+        let invocation = resolve_invocation(&args, &serve).expect("resolve");
+        assert!(
+            invocation
+                .argv
+                .windows(2)
+                .any(|item| item[0] == "--mtp-draft-tokens" && item[1] == "4")
+        );
+    }
+
+    #[test]
     fn non_metal_spec_type_errors() {
         let mut args = Args::parse_from([
             "arle",
@@ -414,6 +449,29 @@ mod tests {
         assert_eq!(
             err,
             "--mtp-draft-model is currently only supported by the Metal backend"
+        );
+    }
+
+    #[test]
+    fn non_metal_mtp_draft_tokens_errors() {
+        let mut args = Args::parse_from([
+            "arle",
+            "serve",
+            "--backend",
+            "cpu",
+            "--model-path",
+            "model",
+            "--mtp-draft-tokens",
+            "4",
+        ]);
+        let serve = match args.command.take().expect("serve command") {
+            crate::args::CliCommand::Serve(serve) => *serve,
+            _ => panic!("expected serve"),
+        };
+        let err = resolve_invocation(&args, &serve).expect_err("reject non-Metal MTP draft tokens");
+        assert_eq!(
+            err,
+            "--mtp-draft-tokens is currently only supported by the Metal backend"
         );
     }
 

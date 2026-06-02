@@ -103,8 +103,7 @@ struct Args {
     dflash_draft_model: Option<String>,
 
     /// Speculative decode route for Metal. `mtp` probes for native MTP tensors
-    /// or an external `--mtp-draft-model` and currently falls back to standard
-    /// decode until MTP draft/verify lands.
+    /// or loads an external `--mtp-draft-model` when provided.
     #[arg(long, value_enum, default_value_t = MetalSpecTypeArg::None)]
     spec_type: MetalSpecTypeArg,
 
@@ -112,6 +111,11 @@ struct Args {
     /// `--spec-type mtp` and is mutually exclusive with DFlash.
     #[arg(long, value_name = "PATH_OR_REPO")]
     mtp_draft_model: Option<String>,
+
+    /// Number of MTP draft tokens to propose per verify block. Defaults to the
+    /// draft model's declared block_size - 1.
+    #[arg(long, value_name = "N")]
+    mtp_draft_tokens: Option<usize>,
 
     /// Enable the experimental Metal KV pool for Qwen3 (production) and
     /// Qwen3.5 (M_e.1 P2.0: pool is allocated but not yet read/written —
@@ -293,7 +297,7 @@ impl Args {
     fn mtp_options(&self) -> Option<MetalMtpOptions> {
         let mut options = if let Some(options) = self.spec_type.mtp_options() {
             options
-        } else if self.mtp_draft_model.is_some() {
+        } else if self.mtp_draft_model.is_some() || self.mtp_draft_tokens.is_some() {
             MetalMtpOptions::explicit()
         } else {
             return None;
@@ -301,11 +305,16 @@ impl Args {
         if let Some(draft_model) = &self.mtp_draft_model {
             options = options.with_draft_model(draft_model.clone());
         }
+        if let Some(draft_tokens) = self.mtp_draft_tokens {
+            options = options.with_draft_tokens(draft_tokens);
+        }
         Some(options)
     }
 
     fn mtp_route_enabled(&self) -> bool {
-        self.spec_type.mtp_mode().is_some() || self.mtp_draft_model.is_some()
+        self.spec_type.mtp_mode().is_some()
+            || self.mtp_draft_model.is_some()
+            || self.mtp_draft_tokens.is_some()
     }
 }
 
@@ -325,6 +334,7 @@ mod tests {
             dflash_draft_model: None,
             spec_type: MetalSpecTypeArg::None,
             mtp_draft_model: None,
+            mtp_draft_tokens: None,
             kv_pool: false,
             no_kv_pool: false,
             kv_disk_dir: None,
@@ -470,7 +480,12 @@ async fn main() -> Result<()> {
         );
     }
     if let Some(draft_model) = &args.mtp_draft_model {
-        info!("Metal MTP draft configured: draft_model={draft_model}");
+        info!(
+            "Metal MTP draft configured: draft_model={} draft_tokens={}",
+            draft_model,
+            args.mtp_draft_tokens
+                .map_or_else(|| "model-default".to_string(), |value| value.to_string())
+        );
     }
 
     let api_key = resolve_api_key(args.api_key.as_deref());
