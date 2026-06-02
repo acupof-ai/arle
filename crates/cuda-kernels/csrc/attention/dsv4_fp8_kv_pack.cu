@@ -253,6 +253,20 @@ __global__ void dsv4_fp8_kv_pack_kernel(
     }
 }
 
+__global__ void dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_kernel(
+    int* __restrict__ token_block_id,
+    int* __restrict__ token_in_block_row,
+    const int* __restrict__ start_pos,
+    int sliding_window,
+    int page_block_size)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const int pos = *start_pos;
+    const int ring_idx = (sliding_window > 0 && pos >= 0) ? (pos % sliding_window) : 0;
+    token_block_id[0] = ring_idx / page_block_size;
+    token_in_block_row[0] = ring_idx % page_block_size;
+}
+
 } // namespace
 
 // ===== Public C entries =====
@@ -324,5 +338,24 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_strided_cuda(
         token_block_id, token_in_block_row,
         n_tokens, page_block_size,
         stride_nope_elems, stride_rope_elems);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda(
+    int* token_block_id,
+    int* token_in_block_row,
+    const int* start_pos,
+    int sliding_window,
+    int page_block_size,
+    cudaStream_t stream)
+{
+    if (token_block_id == nullptr || token_in_block_row == nullptr || start_pos == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (sliding_window <= 0 || page_block_size <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_kernel<<<1, 1, 0, stream>>>(
+        token_block_id, token_in_block_row, start_pos, sliding_window, page_block_size);
     return cudaGetLastError();
 }
