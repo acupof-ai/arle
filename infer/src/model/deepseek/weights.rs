@@ -3507,7 +3507,7 @@ impl DeepseekModel {
                 kv_normed,
                 token_count,
                 start_pos,
-                None,
+                start_pos_ptr_u64,
                 local_heads,
                 local_width,
                 head_dim,
@@ -3706,19 +3706,38 @@ impl DeepseekModel {
             )
         })?;
         let trace = dsv4_trace_begin(&self.ctx)?;
-        self.update_compressor_gpu_cache(
-            compressor,
-            hidden,
-            head_dim,
-            compress_ratio,
-            compress_ratio < 16,
-            start_pos,
-            true,
-            dsv4_compressor_required_capacity_rows(start_pos, token_count, compress_ratio),
-            cache
-                .compressed_gpu
-                .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
-        )?;
+        let compressed_capacity_rows =
+            dsv4_compressor_required_capacity_rows(start_pos, token_count, compress_ratio);
+        if let Some(start_pos_ptr_u64) = start_pos_ptr_u64 {
+            self.update_compressor_gpu_cache_start_pos_ptr(
+                compressor,
+                hidden,
+                head_dim,
+                compress_ratio,
+                compress_ratio < 16,
+                start_pos,
+                start_pos_ptr_u64,
+                true,
+                compressed_capacity_rows,
+                cache
+                    .compressed_gpu
+                    .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
+            )?;
+        } else {
+            self.update_compressor_gpu_cache(
+                compressor,
+                hidden,
+                head_dim,
+                compress_ratio,
+                compress_ratio < 16,
+                start_pos,
+                true,
+                compressed_capacity_rows,
+                cache
+                    .compressed_gpu
+                    .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
+            )?;
+        }
         dsv4_trace_end(
             &self.ctx,
             "attn_compressor_update",
@@ -3781,19 +3800,38 @@ impl DeepseekModel {
                 )
             })?;
             let trace = dsv4_trace_begin(&self.ctx)?;
-            self.update_compressor_gpu_cache(
-                &indexer.compressor,
-                hidden,
-                self.config.index_head_dim,
-                compress_ratio,
-                true,
-                start_pos,
-                false,
-                dsv4_compressor_required_capacity_rows(start_pos, token_count, compress_ratio),
-                cache
-                    .indexer_gpu
-                    .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
-            )?;
+            let index_capacity_rows =
+                dsv4_compressor_required_capacity_rows(start_pos, token_count, compress_ratio);
+            if let Some(start_pos_ptr_u64) = start_pos_ptr_u64 {
+                self.update_compressor_gpu_cache_start_pos_ptr(
+                    &indexer.compressor,
+                    hidden,
+                    self.config.index_head_dim,
+                    compress_ratio,
+                    true,
+                    start_pos,
+                    start_pos_ptr_u64,
+                    false,
+                    index_capacity_rows,
+                    cache
+                        .indexer_gpu
+                        .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
+                )?;
+            } else {
+                self.update_compressor_gpu_cache(
+                    &indexer.compressor,
+                    hidden,
+                    self.config.index_head_dim,
+                    compress_ratio,
+                    true,
+                    start_pos,
+                    false,
+                    index_capacity_rows,
+                    cache
+                        .indexer_gpu
+                        .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
+                )?;
+            }
             dsv4_trace_end(
                 &self.ctx,
                 "attn_indexer_update",
