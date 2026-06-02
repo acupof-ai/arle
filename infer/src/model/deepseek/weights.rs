@@ -811,11 +811,8 @@ impl DeepseekModel {
                 head_dim,
             )?;
         }
-        let slot_layer_block_offsets_ptr = decode_ctx.stage_flashmla_slot_layer_block_offsets(
-            &self.ctx,
-            slot_indices,
-            layer_idx,
-        )?;
+        let slot_layer_block_offsets_ptr =
+            decode_ctx.flashmla_slot_layer_block_offsets_ptr(&self.ctx, layer_idx)?;
         let pool_base_ptr = decode_ctx.fp8_kv_pool_base_ptr(&self.ctx)?;
         let total_blocks = decode_ctx.fp8_kv_total_blocks()?;
         let arena = decode_ctx.ensure_flashmla_decode_batch_arena(
@@ -1477,6 +1474,9 @@ impl DeepseekModel {
                 n,
             )?;
             scratch.upload_start_positions(&self.ctx, &start_pos)?;
+        }
+        if decode_ctx.fp8_kv_max_seq_len().is_some() {
+            decode_ctx.stage_flashmla_all_slot_layer_block_offsets(&self.ctx, slot_indices)?;
         }
 
         let graph_force_eager = decode_ctx.take_force_eager_once()

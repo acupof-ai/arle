@@ -85,6 +85,11 @@ pub struct DeepseekBatchDecodeBuffers {
     /// decode scratch and one-shot attention cache bootstrap. The next matching
     /// step may capture.
     body_graph_warm_signature: Vec<Option<Vec<usize>>>,
+    /// Graph-safe `[layer][row]` shared-FP8-pool block offsets for batched
+    /// FlashMLA decode. Filled once per decode step outside body capture; the
+    /// captured layer body only slices stable device memory.
+    flashmla_slot_layer_offsets_scratch: Vec<i32>,
+    flashmla_slot_layer_offsets_gpu: Option<CudaSlice<i32>>,
     /// One-shot eager override used by correctness-sensitive verifier paths.
     force_eager_once: bool,
 }
@@ -173,8 +178,6 @@ pub(super) struct DeepseekFlashMlaDecodeBatchArena {
     topk_unified_max: usize,
     h_q: usize,
     d_v: usize,
-    slot_layer_block_offsets_scratch: Vec<i32>,
-    pub(super) slot_layer_block_offsets_gpu: CudaSlice<i32>,
     pub(super) sw_token_block_id: CudaSlice<i32>,
     pub(super) sw_token_in_block_row: CudaSlice<i32>,
     pub(super) indices: CudaSlice<i32>,
@@ -220,11 +223,6 @@ impl DeepseekFlashMlaDecodeBatchArena {
             topk_unified_max,
             h_q,
             d_v,
-            slot_layer_block_offsets_scratch: Vec::with_capacity(capacity_tokens),
-            slot_layer_block_offsets_gpu: ctx
-                .stream
-                .alloc_zeros_traced::<i32>(capacity_tokens)
-                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA slot offsets alloc: {err}"))?,
             sw_token_block_id: ctx
                 .stream
                 .alloc_zeros_traced::<i32>(capacity_tokens)
@@ -315,8 +313,7 @@ impl DeepseekFlashMlaDecodeBatchArena {
         self.set_batch_size(batch_size)?;
         let split_axis = batch_size + num_sm_parts_max;
         ensure!(
-            self.slot_layer_block_offsets_gpu.len() >= batch_size
-                && self.sw_token_block_id.len() >= batch_size
+            self.sw_token_block_id.len() >= batch_size
                 && self.sw_token_in_block_row.len() >= batch_size
                 && self.indices.len() >= batch_size * topk_unified_max
                 && self.topk_length.len() >= batch_size
@@ -332,45 +329,6 @@ impl DeepseekFlashMlaDecodeBatchArena {
             "DSv4 batch FlashMLA arena allocation is smaller than requested shape"
         );
         Ok(())
-    }
-
-    fn upload_slot_layer_block_offsets(
-        &mut self,
-        ctx: &DeviceContext,
-        slot_indices: &[usize],
-        layer_idx: usize,
-        fp8_kv_slots: usize,
-        fp8_kv_layers: usize,
-        fp8_kv_slot_blocks: usize,
-    ) -> Result<u64> {
-        self.set_batch_size(slot_indices.len())?;
-        self.slot_layer_block_offsets_scratch.clear();
-        for &slot_idx in slot_indices {
-            let block_offset = fp8_kv_slot_layer_block_offset_for_layout(
-                slot_idx,
-                layer_idx,
-                fp8_kv_slots,
-                fp8_kv_layers,
-                fp8_kv_slot_blocks,
-            )?;
-            ensure!(
-                block_offset <= i32::MAX as usize,
-                "DSv4 batch FlashMLA slot/layer block offset {block_offset} exceeds i32"
-            );
-            self.slot_layer_block_offsets_scratch
-                .push(block_offset as i32);
-        }
-        let mut dst = self
-            .slot_layer_block_offsets_gpu
-            .slice_mut(0..slot_indices.len());
-        ctx.stream
-            .memcpy_htod(&self.slot_layer_block_offsets_scratch, &mut dst)
-            .map_err(|err| anyhow::anyhow!("H2D DSv4 batch FlashMLA slot offsets: {err}"))?;
-        let (ptr, guard) = self
-            .slot_layer_block_offsets_gpu
-            .device_ptr_mut(&ctx.stream);
-        drop(guard);
-        Ok(ptr)
     }
 }
 
@@ -561,6 +519,8 @@ impl DeepseekBatchDecodeBuffers {
             head_graph_cache: (0..max_batch_size).map(|_| None).collect(),
             body_graph_cache: (0..max_batch_size).map(|_| None).collect(),
             body_graph_warm_signature: (0..max_batch_size).map(|_| None).collect(),
+            flashmla_slot_layer_offsets_scratch: Vec::new(),
+            flashmla_slot_layer_offsets_gpu: None,
             force_eager_once: false,
         })
     }
@@ -665,12 +625,11 @@ impl DeepseekBatchDecodeBuffers {
     }
 
     #[allow(dead_code)]
-    pub(super) fn stage_flashmla_slot_layer_block_offsets(
+    pub(super) fn stage_flashmla_all_slot_layer_block_offsets(
         &mut self,
         ctx: &DeviceContext,
         slot_indices: &[usize],
-        layer_idx: usize,
-    ) -> Result<u64> {
+    ) -> Result<()> {
         ensure!(
             slot_indices.len() <= self.max_batch_size,
             "DSv4 batch FlashMLA offset batch {} exceeds context capacity {}",
@@ -681,21 +640,79 @@ impl DeepseekBatchDecodeBuffers {
             self.fp8_kv_pool.is_some(),
             "DSv4 batch FlashMLA slot offsets require shared FP8 KV pool"
         );
-        let fp8_kv_slots = self.fp8_kv_slots;
-        let fp8_kv_layers = self.fp8_kv_layers;
-        let fp8_kv_slot_blocks = self.fp8_kv_slot_blocks;
-        let arena = self
-            .flashmla_decode_arena
+        ensure!(
+            self.fp8_kv_layers > 0,
+            "DSv4 batch FlashMLA slot offsets require positive layer count"
+        );
+        let stride = self.max_batch_size;
+        let total = self
+            .fp8_kv_layers
+            .checked_mul(stride)
+            .ok_or_else(|| anyhow::anyhow!("DSv4 batch FlashMLA offset table overflow"))?;
+        let need_alloc = self
+            .flashmla_slot_layer_offsets_gpu
+            .as_ref()
+            .is_none_or(|buf| buf.len() < total);
+        if need_alloc {
+            self.flashmla_slot_layer_offsets_gpu =
+                Some(ctx.stream.alloc_zeros_traced::<i32>(total).map_err(|err| {
+                    anyhow::anyhow!("DSv4 batch FlashMLA all-offsets alloc: {err}")
+                })?);
+        }
+        self.flashmla_slot_layer_offsets_scratch.clear();
+        self.flashmla_slot_layer_offsets_scratch.resize(total, 0);
+        for layer_idx in 0..self.fp8_kv_layers {
+            let base = layer_idx * stride;
+            for (row, &slot_idx) in slot_indices.iter().enumerate() {
+                let block_offset = fp8_kv_slot_layer_block_offset_for_layout(
+                    slot_idx,
+                    layer_idx,
+                    self.fp8_kv_slots,
+                    self.fp8_kv_layers,
+                    self.fp8_kv_slot_blocks,
+                )?;
+                ensure!(
+                    block_offset <= i32::MAX as usize,
+                    "DSv4 batch FlashMLA slot/layer block offset {block_offset} exceeds i32"
+                );
+                self.flashmla_slot_layer_offsets_scratch[base + row] = block_offset as i32;
+            }
+        }
+        let offsets = self
+            .flashmla_slot_layer_offsets_gpu
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("DSv4 batch FlashMLA arena not allocated"))?;
-        arena.upload_slot_layer_block_offsets(
-            ctx,
-            slot_indices,
-            layer_idx,
-            fp8_kv_slots,
-            fp8_kv_layers,
-            fp8_kv_slot_blocks,
-        )
+            .expect("DSv4 batch FlashMLA all-offsets allocated");
+        let mut dst = offsets.slice_mut(0..total);
+        ctx.stream
+            .memcpy_htod(&self.flashmla_slot_layer_offsets_scratch, &mut dst)
+            .map_err(|err| anyhow::anyhow!("H2D DSv4 batch FlashMLA all-offsets: {err}"))?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn flashmla_slot_layer_block_offsets_ptr(
+        &mut self,
+        ctx: &DeviceContext,
+        layer_idx: usize,
+    ) -> Result<u64> {
+        ensure!(
+            layer_idx < self.fp8_kv_layers,
+            "DSv4 batch FlashMLA offset layer {layer_idx} out of range for {} layers",
+            self.fp8_kv_layers
+        );
+        let offsets = self
+            .flashmla_slot_layer_offsets_gpu
+            .as_mut()
+            .ok_or_else(|| {
+                anyhow::anyhow!("DSv4 batch FlashMLA offsets used before graph-safe pre-stage")
+            })?;
+        let (base_ptr, guard) = offsets.device_ptr_mut(&ctx.stream);
+        drop(guard);
+        let byte_offset = layer_idx
+            .checked_mul(self.max_batch_size)
+            .and_then(|v| v.checked_mul(std::mem::size_of::<i32>()))
+            .ok_or_else(|| anyhow::anyhow!("DSv4 batch FlashMLA offset pointer overflow"))?;
+        Ok(base_ptr + byte_offset as u64)
     }
 
     pub(super) fn take_force_eager_once(&mut self) -> bool {
