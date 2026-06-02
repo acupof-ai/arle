@@ -1840,7 +1840,7 @@ impl DeepseekModel {
             }
         }
 
-        let selected = if matches!(
+        let mut selected = if matches!(
             mode,
             deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse
         ) {
@@ -1872,24 +1872,35 @@ impl DeepseekModel {
                 token_count,
                 trace,
             )?;
-            let index_cache = cache
+            let index_rows = cache
                 .indexer_gpu
                 .as_ref()
-                .expect("indexer cache initialized");
-            let keys = index_cache
+                .expect("indexer cache initialized")
+                .compressed_rows;
+            let index_keys = cache
+                .indexer_gpu
+                .as_mut()
+                .expect("indexer cache initialized")
                 .compressed
-                .as_ref()
+                .take()
                 .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 indexer GPU cache missing rows"))?;
-            Some(self.csa_selected_blocks_gpu(
+            let selected_result = self.csa_selected_blocks_gpu_cached(
                 layer_idx,
                 indexer,
                 hidden,
                 c_q_normed,
-                keys,
-                index_cache.compressed_rows,
+                &index_keys,
+                index_rows,
                 start_pos,
                 compress_ratio,
-            )?)
+                cache,
+            );
+            cache
+                .indexer_gpu
+                .as_mut()
+                .expect("indexer cache initialized")
+                .compressed = Some(index_keys);
+            Some(selected_result?)
         } else {
             None
         };
@@ -1922,6 +1933,9 @@ impl DeepseekModel {
             mode,
             Some(cache),
         );
+        if let Some(selected_buf) = selected.take() {
+            cache.csa_selected = Some(selected_buf);
+        }
         cache
             .compressed_gpu
             .as_mut()
@@ -2957,23 +2971,24 @@ impl DeepseekModel {
                 // bounds the per-query top-k by the row's effective
                 // length). Pass a single-i32 device array.
                 //
-                // Build a [1]-element topk_length on stream. Reuse the
-                // num_splits scratch's stream alloc bandwidth by stamping
-                // a fresh local CudaSlice — the size is 4 bytes and the
-                // sched_meta call is the gating cost.
-                let mut topk_length_dev =
+                // Reuse the single-i32 topk_length arena entry. The value is
+                // still stamped each step because HCA's compressed top-k grows
+                // with the context length; this only removes the stream alloc.
+                let topk_length_ptr_u64 = {
+                    let topk_length_dev = cache_mut
+                        .fm_decode_topk_length
+                        .as_mut()
+                        .expect("topk_length arena allocated");
                     self.ctx
                         .stream
-                        .alloc_zeros_traced::<i32>(1)
+                        .memcpy_htod(&[topk_unified as i32], topk_length_dev)
                         .map_err(|err| {
-                            anyhow::anyhow!("DSv4 FlashMLA decode topk_length alloc: {err}")
+                            anyhow::anyhow!("DSv4 FlashMLA decode topk_length H2D: {err}")
                         })?;
-                self.ctx
-                    .stream
-                    .memcpy_htod(&[topk_unified as i32], &mut topk_length_dev)
-                    .map_err(|err| {
-                        anyhow::anyhow!("DSv4 FlashMLA decode topk_length H2D: {err}")
-                    })?;
+                    let (ptr, guard) = topk_length_dev.device_ptr(&self.ctx.stream);
+                    drop(guard);
+                    ptr as u64
+                };
 
                 let (sched_meta_ptr_u64, sg) = cache_mut
                     .fm_decode_sched_meta
@@ -2987,8 +3002,6 @@ impl DeepseekModel {
                     .expect("num_splits arena allocated")
                     .device_ptr_mut(&self.ctx.stream);
                 drop(ng);
-                let (topk_length_ptr_u64, tg) = topk_length_dev.device_ptr(&self.ctx.stream);
-                drop(tg);
                 unsafe {
                     ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
                         1_i32, // b = 1
@@ -3043,15 +3056,18 @@ impl DeepseekModel {
                 let sink_f32_local_ptr =
                     unsafe { (sink_f32_base_ptr as *const f32).add(sink_offset_elems) };
 
-                // Allocate a dummy lse output [b=1, h_q, s_q=1] — combine
-                // writes here but ARLE doesn't consume it.
-                let mut lse_out_dev = self
-                    .ctx
-                    .stream
-                    .alloc_zeros_traced::<f32>(local_heads)
-                    .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode lse out alloc: {err}"))?;
-                let (lse_out_ptr_u64, log) = lse_out_dev.device_ptr_mut(&self.ctx.stream);
-                drop(log);
+                // Dummy lse output [b=1, h_q, s_q=1] — combine writes here but
+                // ARLE doesn't consume it. Kept in the arena to avoid per-step
+                // allocation.
+                let lse_out_ptr_u64 = {
+                    let lse_out_dev = cache_mut
+                        .fm_decode_lse_out
+                        .as_mut()
+                        .expect("lse_out arena allocated");
+                    let (ptr, guard) = lse_out_dev.device_ptr_mut(&self.ctx.stream);
+                    drop(guard);
+                    ptr as u64
+                };
 
                 let scale = 1.0_f32 / (head_dim as f32).sqrt();
                 let bytes_per_token = DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN as i32;
@@ -3154,8 +3170,6 @@ impl DeepseekModel {
                         anyhow::anyhow!("DSv4 FlashMLA decode output inverse-rope failed: {err}")
                     })?;
                 }
-                drop(topk_length_dev);
-                drop(lse_out_dev);
             } else {
                 // Acquire bf16 SW window ptr from cache (scoped to this
                 // legacy-kernel launch — drops the &mut after the FFI
@@ -3756,6 +3770,7 @@ impl DeepseekModel {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn csa_selected_blocks_gpu(
         &self,
         layer_idx: usize,
@@ -3795,6 +3810,136 @@ impl DeepseekModel {
             .stream
             .alloc_zeros_traced::<i32>(hidden.seq_len * self.config.index_topk)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 CSA selected alloc failed: {err}"))?;
+        self.run_csa_select_gpu(
+            layer_idx,
+            hidden.seq_len,
+            &q_i,
+            &weights,
+            keys,
+            &mut selected,
+            key_count,
+            start_pos,
+            ratio,
+        )?;
+        Ok(selected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn csa_selected_blocks_gpu_cached(
+        &self,
+        layer_idx: usize,
+        indexer: &DeepseekV4Indexer,
+        hidden: &HiddenStates,
+        c_q: &HiddenStates,
+        keys: &CudaSlice<bf16>,
+        key_count: usize,
+        start_pos: usize,
+        ratio: usize,
+        cache: &mut DeepseekAttentionRuntimeCache,
+    ) -> Result<CudaSlice<i32>> {
+        let trace = dsv4_trace_begin(&self.ctx)?;
+        let mut q_i_scratch = take_hidden_scratch(
+            &mut cache.csa_q_i,
+            &self.ctx,
+            indexer.wq_b.rows,
+            c_q.seq_len,
+        )?;
+        let mut weights_scratch = take_hidden_scratch(
+            &mut cache.csa_weights,
+            &self.ctx,
+            indexer.weights_proj.rows,
+            hidden.seq_len,
+        )?;
+        let project_result = (|| -> Result<()> {
+            ops::try_gemm_with_phase_into(
+                &self.ctx,
+                &indexer.wq_b,
+                c_q,
+                &mut q_i_scratch.hidden,
+                ops::LinearDispatchPhase::Decode,
+            )?;
+            ops::try_gemm_with_phase_into(
+                &self.ctx,
+                &indexer.weights_proj,
+                hidden,
+                &mut weights_scratch.hidden,
+                ops::LinearDispatchPhase::Decode,
+            )?;
+            Ok(())
+        })();
+        if let Err(err) = project_result {
+            put_hidden_scratch(&mut cache.csa_q_i, q_i_scratch);
+            put_hidden_scratch(&mut cache.csa_weights, weights_scratch);
+            return Err(err);
+        }
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_csa_project",
+            layer_idx,
+            hidden.seq_len,
+            trace,
+        )?;
+
+        let selected_len = hidden.seq_len * self.config.index_topk;
+        let mut selected = match cache.csa_selected.take() {
+            Some(buf) if buf.len() >= selected_len => buf,
+            _ => match self.ctx.stream.alloc_zeros_traced::<i32>(selected_len) {
+                Ok(buf) => buf,
+                Err(err) => {
+                    put_hidden_scratch(&mut cache.csa_q_i, q_i_scratch);
+                    put_hidden_scratch(&mut cache.csa_weights, weights_scratch);
+                    return Err(anyhow::anyhow!(
+                        "DeepSeek V4 CSA selected alloc failed: {err}"
+                    ));
+                }
+            },
+        };
+        let result = self.run_csa_select_gpu(
+            layer_idx,
+            hidden.seq_len,
+            &q_i_scratch.hidden,
+            &weights_scratch.hidden,
+            keys,
+            &mut selected,
+            key_count,
+            start_pos,
+            ratio,
+        );
+        put_hidden_scratch(&mut cache.csa_q_i, q_i_scratch);
+        put_hidden_scratch(&mut cache.csa_weights, weights_scratch);
+        if let Err(err) = result {
+            cache.csa_selected = Some(selected);
+            return Err(err);
+        }
+        Ok(selected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_csa_select_gpu(
+        &self,
+        layer_idx: usize,
+        seq_len: usize,
+        q_i: &HiddenStates,
+        weights: &HiddenStates,
+        keys: &CudaSlice<bf16>,
+        selected: &mut CudaSlice<i32>,
+        key_count: usize,
+        start_pos: usize,
+        ratio: usize,
+    ) -> Result<()> {
+        ensure!(
+            q_i.hidden_dim.is_multiple_of(self.config.index_head_dim),
+            "DeepSeek V4 GPU indexer q width {} is not divisible by index_head_dim {}",
+            q_i.hidden_dim,
+            self.config.index_head_dim
+        );
+        let local_index_heads = q_i.hidden_dim / self.config.index_head_dim;
+        ensure!(
+            weights.hidden_dim == local_index_heads,
+            "DeepSeek V4 GPU indexer weights width {} does not match local heads {}",
+            weights.hidden_dim,
+            local_index_heads
+        );
         let score_scale = (self.config.index_head_dim as f32).powf(-0.5)
             * (self.config.index_n_heads as f32).powf(-0.5);
         let trace = dsv4_trace_begin(&self.ctx)?;
@@ -3809,7 +3954,7 @@ impl DeepseekModel {
                     weights_ptr as *const ffi::Half,
                     keys_ptr as *const ffi::Half,
                     selected_ptr as *mut i32,
-                    hidden.seq_len as i32,
+                    seq_len as i32,
                     q_i.hidden_dim as i32,
                     local_index_heads as i32,
                     self.config.index_head_dim as i32,
@@ -3828,10 +3973,10 @@ impl DeepseekModel {
             &self.ctx,
             "attn_csa_select_kernel",
             layer_idx,
-            hidden.seq_len,
+            seq_len,
             trace,
         )?;
-        Ok(selected)
+        Ok(())
     }
 
     fn forward_ffn_layer_stream(
@@ -4808,6 +4953,9 @@ const DSV4_FLASHMLA_DECODING_SCHED_META_INTS: usize = 8;
 /// - `sched_meta` is `num_sm_parts` × `DecodingSchedMetaSize/4` = 8 i32.
 /// - `num_splits` is `b+1` = 2 i32 (b=1).
 /// - `indices` is `s_q=1 × topk_unified` i32.
+/// - `topk_length` is one i32 for the single decode query.
+/// - `lse_out` is `[b=1, h_q, s_q=1]`; FlashMLA combine writes it, ARLE does
+///   not read it.
 ///
 /// `b = 1` for ARLE decode (single sequence per `finish_attention_gpu`
 /// call; batching is at the scheduler layer above).
@@ -4838,6 +4986,8 @@ fn ensure_fm_decode_arena(
     let sched_meta_ints = num_sm_parts_max * DSV4_FLASHMLA_DECODING_SCHED_META_INTS;
     let num_splits_ints = 2_usize; // b + 1 with b = 1
     let indices_len = topk_unified_max;
+    let topk_length_len = 1_usize;
+    let lse_out_len = h_q;
 
     let need_lse_grow = cache
         .fm_decode_lse_accum
@@ -4892,6 +5042,28 @@ fn ensure_fm_decode_arena(
             ctx.stream
                 .alloc_zeros_traced::<i32>(indices_len)
                 .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode indices alloc: {err}"))?,
+        );
+    }
+    let need_topk_length_grow = cache
+        .fm_decode_topk_length
+        .as_ref()
+        .is_none_or(|buf| buf.len() < topk_length_len);
+    if need_topk_length_grow {
+        cache.fm_decode_topk_length = Some(
+            ctx.stream
+                .alloc_zeros_traced::<i32>(topk_length_len)
+                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode topk_length alloc: {err}"))?,
+        );
+    }
+    let need_lse_out_grow = cache
+        .fm_decode_lse_out
+        .as_ref()
+        .is_none_or(|buf| buf.len() < lse_out_len);
+    if need_lse_out_grow {
+        cache.fm_decode_lse_out = Some(
+            ctx.stream
+                .alloc_zeros_traced::<f32>(lse_out_len)
+                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode lse_out alloc: {err}"))?,
         );
     }
 
