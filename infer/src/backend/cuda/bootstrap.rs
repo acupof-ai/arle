@@ -568,13 +568,12 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         scheduler.max_slots,
     );
 
-    // Phase B-1 commit C.4.6.2 — extract the EP NCCL group BEFORE the
-    // model is moved into Scheduler::with_config, so we can attach it to
-    // the returned SchedulerHandle for the multiproc-serve request-
-    // submission path. Models that don't override the default trait
-    // method return None and this is a no-op.
+    // Extract the request token-sync NCCL group BEFORE the model is moved
+    // into Scheduler::with_config, so the returned SchedulerHandle can attach
+    // NCCL-backed DistributedRequestCoordination in multiproc serving.
+    // This is deliberately separate from the model's MoE EP communicator.
     #[cfg(feature = "nccl")]
-    let ep_nccl = model.ep_nccl();
+    let request_token_sync_nccl = model.request_token_sync_nccl();
     let (scheduler, handle) = Scheduler::with_config(
         model,
         tokenizer,
@@ -588,8 +587,8 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         worker_placement.clone(),
     )?;
     #[cfg(feature = "nccl")]
-    let handle = if let Some(nccl) = ep_nccl {
-        handle.with_ep_nccl(nccl)
+    let handle = if let Some(nccl) = request_token_sync_nccl {
+        handle.with_request_token_sync_nccl(nccl)
     } else {
         handle
     };

@@ -1031,14 +1031,14 @@ pub struct SchedulerHandle {
     /// `RequestHandle::server_metrics()`. `None` in legacy / test paths
     /// that build the handle without metrics wiring.
     server_metrics: Option<crate::metrics::ServerMetrics>,
-    /// Phase B-1 commit C.4.6.2 — the model's EP NCCL group, populated
-    /// post-model-load by `spawn_scheduler_handle_from_path`. The
-    /// request-submission path uses this to attach
-    /// `DistributedRequestCoordination::Nccl` in multiproc-serve mode
-    /// (commit C.4.6.3+). `None` for non-distributed models or backends
-    /// without NCCL.
+    /// NCCL group used only for per-request token synchronization.
+    ///
+    /// Do not reuse MoE EP communicators implicitly here. SGLang-style DSv4
+    /// request ownership synchronizes tokens inside the selected owner group
+    /// (attention-TP / DP-owner group), while MoE EP communication is a
+    /// separate data-plane contract.
     #[cfg(feature = "nccl")]
-    ep_nccl: Option<Arc<crate::distributed::nccl::NcclGroup>>,
+    request_token_sync_nccl: Option<Arc<crate::distributed::nccl::NcclGroup>>,
 }
 
 pub struct SchedulerSubmissionPermit<'a> {
@@ -1114,7 +1114,7 @@ impl SchedulerHandle {
             max_waiting: 0,
             server_metrics: None,
             #[cfg(feature = "nccl")]
-            ep_nccl: None,
+            request_token_sync_nccl: None,
         }
     }
 
@@ -1140,7 +1140,7 @@ impl SchedulerHandle {
             max_waiting,
             server_metrics: None,
             #[cfg(feature = "nccl")]
-            ep_nccl: None,
+            request_token_sync_nccl: None,
         }
     }
 
@@ -1167,7 +1167,7 @@ impl SchedulerHandle {
             max_waiting,
             server_metrics: None,
             #[cfg(feature = "nccl")]
-            ep_nccl: None,
+            request_token_sync_nccl: None,
         }
     }
 
@@ -1193,7 +1193,7 @@ impl SchedulerHandle {
             max_waiting,
             server_metrics: None,
             #[cfg(feature = "nccl")]
-            ep_nccl: None,
+            request_token_sync_nccl: None,
         }
     }
 
@@ -1203,23 +1203,23 @@ impl SchedulerHandle {
         self
     }
 
-    /// Phase B-1 commit C.4.6.2 — attach the model's EP NCCL group
-    /// post-construction. `spawn_scheduler_handle_from_path` extracts
-    /// this via `ModelForward::ep_nccl()` and threads it through here so
-    /// the request-submission path can build NCCL-backed
-    /// `DistributedRequestCoordination` instances.
+    /// Attach the model's request token-sync NCCL group post-construction.
+    /// `spawn_scheduler_handle_from_path` extracts this from the loaded model
+    /// before moving the model into the scheduler thread.
     #[cfg(feature = "nccl")]
     #[must_use]
-    pub fn with_ep_nccl(mut self, nccl: Arc<crate::distributed::nccl::NcclGroup>) -> Self {
-        self.ep_nccl = Some(nccl);
+    pub fn with_request_token_sync_nccl(
+        mut self,
+        nccl: Arc<crate::distributed::nccl::NcclGroup>,
+    ) -> Self {
+        self.request_token_sync_nccl = Some(nccl);
         self
     }
 
-    /// Returns the model's EP NCCL group, if one was attached via
-    /// `with_ep_nccl` (multiproc-serve setup).
+    /// Returns the model's request token-sync NCCL group, if one was attached.
     #[cfg(feature = "nccl")]
-    pub fn ep_nccl(&self) -> Option<Arc<crate::distributed::nccl::NcclGroup>> {
-        self.ep_nccl.clone()
+    pub fn request_token_sync_nccl(&self) -> Option<Arc<crate::distributed::nccl::NcclGroup>> {
+        self.request_token_sync_nccl.clone()
     }
 
     #[cfg(feature = "cuda")]

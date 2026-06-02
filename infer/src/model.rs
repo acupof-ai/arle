@@ -524,6 +524,16 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         None
     }
 
+    /// NCCL group used for request-level token synchronization in distributed
+    /// serving. This is separate from MoE EP communication: a SGLang-style
+    /// DSv4 owner group may be smaller than, or different from, the EP group.
+    #[cfg(feature = "nccl")]
+    fn request_token_sync_nccl(
+        &self,
+    ) -> Option<std::sync::Arc<crate::distributed::nccl::NcclGroup>> {
+        None
+    }
+
     /// Whether startup warmup may run synthetic decode work through this model.
     ///
     /// Synthetic decode is a pure performance warmup for models whose decode

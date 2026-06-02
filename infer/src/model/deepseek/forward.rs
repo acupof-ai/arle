@@ -307,6 +307,13 @@ impl ModelForward for DeepseekModel {
         self.layer_communicator.ep_nccl()
     }
 
+    #[cfg(feature = "nccl")]
+    fn request_token_sync_nccl(
+        &self,
+    ) -> Option<std::sync::Arc<crate::distributed::nccl::NcclGroup>> {
+        self.layer_communicator.request_token_sync_nccl()
+    }
+
     fn supports_decode_warmup(&self) -> bool {
         self.config.tp.world_size == 1 && self.config.ep.world_size == 1
     }
@@ -426,13 +433,13 @@ impl ModelForward for DeepseekModel {
             missing.push("ARLE_DSV4_INCREMENTAL_KV must be enabled".to_string());
         }
         missing.push(
-            "serving startup still selects the replicated-token request lane; DP-owner group routing is guarded and not the default DSv4 serve path".to_string(),
+            "serving startup still selects the replicated-token request lane; token-owned owner-group relay is guarded and not selected by DSv4 startup".to_string(),
         );
         missing.push(
-            "owner-group NCCL/token-sync subgroup communicators are not wired for token-owned DP/EP serving".to_string(),
+            "axis-derived owner-group request token-sync NCCL communicators are not wired for the SGLang DP/attention topology".to_string(),
         );
         missing.push(
-            "remote-owner output return is available only as relay control-plane plumbing and is not selected by DSv4 startup".to_string(),
+            "token-owned relay output return exists on the control plane, but DSv4 startup/data-plane still does not select it".to_string(),
         );
         missing.push(
             "DSv4 graph-captured SWA/C4/C128 metadata replay is not implemented in this executable route"

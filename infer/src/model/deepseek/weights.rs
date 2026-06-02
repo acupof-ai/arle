@@ -284,6 +284,7 @@ impl DeepseekModel {
                     ctx.stream.clone(),
                 )?);
                 comm = comm.with_tp_nccl(Arc::clone(&group))?;
+                comm = comm.with_request_token_sync_nccl(Arc::clone(&group));
                 tp_nccl = Some(group);
 
                 // A4 — secondary TP NCCL group bound to `ctx.comm_stream` so
@@ -314,7 +315,10 @@ impl DeepseekModel {
                         ctx.stream.clone(),
                     )?)
                 };
-                comm = comm.with_ep_nccl(group)?;
+                comm = comm.with_ep_nccl(Arc::clone(&group))?;
+                if config.tp.world_size == 1 {
+                    comm = comm.with_request_token_sync_nccl(group);
+                }
 
                 if dsv4_combine_overlap_enabled() {
                     let overlap_group = Arc::new(NcclGroup::new_on_stream(
