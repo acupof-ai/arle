@@ -35,6 +35,9 @@ validated:
   compressor packing can now consume device-resident `start_pos`.
 - Replay advances host compressor/indexer metadata and FP8 compressed-row
   highwater after graph launch.
+- Batched FlashMLA shared-pool slot/layer offsets are pre-staged as a stable
+  `[layer][row]` device table outside body capture. The captured body no longer
+  records per-layer H2D copies from one reused host scratch buffer.
 - DSv4 prebuilt CUDA archive symbol gates include the new start-position ABI
   symbols, so stale prebuilt archives fail closed.
 
@@ -71,12 +74,22 @@ Remote:
   Root-cause hypothesis is not performance-related: the captured body still
   records per-step owned GPU scratch from the FFN routed/shared path, so graph
   launch can use addresses that are no longer stable.
-- Follow-up fix in progress: the batched FFN path now routes local experts into
-  decode-context stable `ffn_routed`, uses per-layer stable route-logits scratch,
-  reads MoE token ids from the already-uploaded decode-context device buffer,
-  and adds the shared expert in-place. Body capture is still gated away from
-  DeepEP, overlap, trace/debug, and explicit
-  `ARLE_DSV4_DEEPGEMM_DEVICE_COUNTS=0`.
+- PASS. Follow-up FFN scratch fix at commit `ecf819e2` removed the graph-on c4
+  `PostMoeExpertAllReduce buffer len 32768 does not match logical len 16384`
+  failure and captured B=4 without illegal address. Artifact:
+  `/tmp/dsv4_body_graph_20260603/validate_body_graph_exact_scratch_marker32/server.log`.
+- FAIL, contained. The same graph-on c4 run completed 32 tokens but generated
+  semantically wrong marker text, while the same commit with
+  `ARLE_DSV4_DECODE_BODY_CUDA_GRAPH=0` passed c4 marker32. Artifacts:
+  `/tmp/dsv4_body_graph_20260603/validate_body_graph_exact_scratch_marker32/completions32.log`
+  and
+  `/tmp/dsv4_body_graph_20260603/validate_body_graph_off_marker32_c4_control/completions32.log`.
+- Follow-up fix in progress: batched FlashMLA now pre-stages all shared-pool
+  slot/layer block offsets outside body capture and only passes stable per-layer
+  device-table pointers through the captured body. This targets the remaining
+  graph-on corruption hypothesis: replaying graph-captured H2D nodes from one
+  reused host offset scratch can point multiple layers at the wrong FP8 KV pool
+  sub-range.
 - Pending. Remote body-graph-on 32-token capture/replay gate must show normal
   output and no `CUDA_ERROR_ILLEGAL_ADDRESS` before this is a correctness win.
 - Pending. Performance gate must run the matched DSv4-Flash TP8 + EAGLE +
