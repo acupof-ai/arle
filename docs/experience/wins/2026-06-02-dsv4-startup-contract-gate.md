@@ -95,6 +95,14 @@ serve on the replicated-token debug lane and still look like a performance run.
   `ARLE_DSV4_MOE_BACKEND=native-deepep` is reserved for the future token-owned
   DP/EP request path instead of running on the measured-wrong replicated-token
   route.
+- DSv4 decode-context token upload is no longer a half-state. When model
+  weights are loaded, `create_decode_context` preallocates the stable batched
+  decode scratch; scheduler/warmup `DecodeContextOps::upload_token_ids` now
+  writes the token IDs into the same GPU buffer used by the model body. The
+  model reuses that upload when it matches and only uploads inside
+  `forward_decode_batch` as a fallback. This does not enable DSv4 CUDA graph
+  yet; it removes one graph-readiness blocker by moving token H2D to the
+  scheduler-owned pre-body hook.
 
 ## Verification
 
@@ -102,6 +110,11 @@ serve on the replicated-token debug lane and still look like a performance run.
 - `git diff --check`
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
 - `cargo check -p infer --no-default-features --features no-cuda`
+- DSv4 decode-context token-upload follow-up local gate:
+  `cargo fmt --check`, `git diff --check`,
+  `cargo check -p infer --no-default-features --features no-cuda`, and
+  `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
+  passed.
 - Remote DSv4 pod source was synced by bundle because pod-side GitHub HTTPS
   fetch failed. Follow-up source syncs verified clean remote HEADs through
   `5d4e62bf` and then `204db39f`.

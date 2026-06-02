@@ -75,6 +75,7 @@ pub(super) struct DeepseekBatchedDecodeScratch {
     head_mix_dim: usize,
     vocab_size: usize,
     token_ids_scratch: Vec<i32>,
+    token_ids_uploaded: usize,
     pub(super) token_ids_gpu: CudaSlice<i32>,
     pub(super) embeddings: HiddenStates,
     pub(super) stream: HiddenStates,
@@ -105,6 +106,7 @@ impl DeepseekBatchedDecodeScratch {
             head_mix_dim,
             vocab_size,
             token_ids_scratch: Vec::with_capacity(capacity_tokens),
+            token_ids_uploaded: 0,
             token_ids_gpu: ctx
                 .stream
                 .alloc_zeros(capacity_tokens)
@@ -141,13 +143,38 @@ impl DeepseekBatchedDecodeScratch {
     pub(super) fn upload_token_ids(&mut self, ctx: &DeviceContext, tokens: &[u32]) -> Result<()> {
         self.set_batch_size(tokens.len())?;
         self.token_ids_scratch.clear();
-        self.token_ids_scratch
-            .extend(tokens.iter().map(|&token| token as i32));
+        for &token in tokens {
+            ensure!(
+                token <= i32::MAX as u32,
+                "DSv4 token id {token} exceeds i32 device metadata range"
+            );
+            self.token_ids_scratch.push(token as i32);
+        }
         let mut dst = self.token_ids_gpu.slice_mut(0..tokens.len());
         ctx.stream
             .memcpy_htod(&self.token_ids_scratch, &mut dst)
             .map_err(|err| anyhow::anyhow!("H2D DSv4 token_ids: {err}"))?;
+        self.token_ids_uploaded = tokens.len();
         Ok(())
+    }
+
+    pub(super) fn ensure_token_ids_uploaded(
+        &mut self,
+        ctx: &DeviceContext,
+        tokens: &[u32],
+    ) -> Result<()> {
+        let already_uploaded = self.token_ids_uploaded == tokens.len()
+            && self.token_ids_scratch.len() == tokens.len()
+            && self
+                .token_ids_scratch
+                .iter()
+                .zip(tokens.iter())
+                .all(|(&cached, &token)| cached >= 0 && cached as u32 == token);
+        if already_uploaded {
+            self.set_batch_size(tokens.len())?;
+            return Ok(());
+        }
+        self.upload_token_ids(ctx, tokens)
     }
 }
 
@@ -333,13 +360,16 @@ impl DeepseekBatchDecodeBuffers {
 }
 
 impl DecodeContextOps for DeepseekBatchDecodeBuffers {
-    fn upload_token_ids(&mut self, _ctx: &DeviceContext, tokens: &[u32]) -> Result<()> {
+    fn upload_token_ids(&mut self, ctx: &DeviceContext, tokens: &[u32]) -> Result<()> {
         ensure!(
             tokens.len() <= self.max_batch_size,
             "DeepSeek V4 Phase 2A.0 decode batch {} exceeds context capacity {}",
             tokens.len(),
             self.max_batch_size
         );
+        if let Some(scratch) = self.batched_scratch.as_mut() {
+            scratch.upload_token_ids(ctx, tokens)?;
+        }
         Ok(())
     }
 
