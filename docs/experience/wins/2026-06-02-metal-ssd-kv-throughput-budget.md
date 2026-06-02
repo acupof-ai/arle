@@ -21,6 +21,9 @@ were deleted after each pass.
 Raw output:
 `docs/experience/wins/assets/2026-06-02-metal-ssd-kv-throughput.json`
 
+Small-block raw output:
+`docs/experience/wins/assets/2026-06-02-metal-ssd-kv-small-block.json`
+
 ## Environment
 
 - Commit: `1847e910`.
@@ -48,6 +51,23 @@ Measured SSD:
 |---|---:|---:|
 | 2 GiB x 3, median | 5.27 GiB/s | 2.77 GiB/s |
 | 16 GiB, conservative | 4.05 GiB/s | 1.09 GiB/s |
+
+Small-block latency and throughput:
+
+| block | seq read | seq read med / p95 | random read | random read med / p95 | seq write incl fsync | write med / p95 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 KiB | 0.115 GiB/s | 0.027 / 0.054 ms | 0.038 GiB/s | 0.089 / 0.134 ms | 0.149 GiB/s | 0.014 / 0.041 ms |
+| 16 KiB | 0.208 GiB/s | 0.032 / 0.158 ms | 0.138 GiB/s | 0.101 / 0.140 ms | 0.187 GiB/s | 0.021 / 0.190 ms |
+| 64 KiB | 0.402 GiB/s | 0.117 / 0.177 ms | 0.403 GiB/s | 0.121 / 0.195 ms | 0.993 GiB/s | 0.019 / 0.074 ms |
+| 256 KiB | 0.978 GiB/s | 0.159 / 1.179 ms | 1.385 GiB/s | 0.158 / 0.198 ms | 1.399 GiB/s | 0.031 / 0.829 ms |
+| 1 MiB | 1.956 GiB/s | 0.452 / 0.629 ms | 2.243 GiB/s | 0.380 / 0.504 ms | 1.637 GiB/s | 0.084 / 3.907 ms |
+| 4 MiB | 4.053 GiB/s | 0.900 / 1.463 ms | 4.834 GiB/s | 0.856 / 1.009 ms | 2.005 GiB/s | 0.820 / 5.981 ms |
+| 16 MiB | 11.785 GiB/s | 1.274 / 1.703 ms | 6.960 GiB/s | 2.401 / 3.412 ms | 1.053 GiB/s | 11.792 / 25.873 ms |
+
+The small-block write latency columns exclude the final `fsync`; write
+throughput includes it. The 16 MiB read result is kept as a measured burst
+number, but the active-KV budget below still uses the more conservative 16 GiB
+sequential read result.
 
 The active-KV calculation below uses the conservative 16 GiB sequence read
 number: 4.05 GiB/s.
@@ -77,6 +97,10 @@ Verdict:
 
 - The 2 GiB 4 MiB random-read probe reported about 10 GiB/s, which is likely
   inflated by caching effects. It was not used for the active-KV verdict.
+- Small-block read latency makes a per-layer SSD pull path unattractive even
+  before bandwidth runs out. A 64 KiB random read is about 0.12 ms median /
+  0.20 ms p95, so dozens of serialized layer-sized reads would consume a large
+  fraction of the 12-15 ms decode budget.
 - This was a local component ceiling probe, not a full HTTP serving benchmark.
 
 ## Learnings
