@@ -63,14 +63,29 @@ serve on the replicated-token debug lane and still look like a performance run.
   `CompletionStreamDelta` envelopes back to the coordinator, the coordinator
   dispatches them by `request_id`, and a guarded token-owned relay route can
   send a single-rank owner request to a remote rank without touching rank0's
-  scheduler queue. Multi-rank owner groups still fail closed because the
-  SGLang-compatible owner-group NCCL/token-sync subgroup communicators are not
-  wired; using the global EP group here would deadlock or over-synchronize.
+  scheduler queue. At that stage, multi-rank owner groups remained a follow-up
+  because the SGLang-compatible owner-group NCCL/token-sync subgroup contract
+  was not separated from the MoE EP communicator.
+- PC2 request-sync cleanup deletes the wrong communicator contract. Scheduler
+  request coordination no longer reaches through `ep_nccl()`; models now expose
+  an explicit request token-sync NCCL capability, and `SchedulerHandle` carries
+  only that request-sync group. This keeps MoE EP transport separate from
+  request token broadcast, matching the SGLang distinction between owner groups
+  and EP data movement.
+- PC2 multi-rank relay follow-up removes the single-rank-only relay half-state.
+  A token-owned relay request can now target every rank in the selected owner
+  group, mark only group rank 0 as visible-output, send remote follower ranks
+  targeted `RequestOwned` envelopes, and submit the local rank only after
+  remote envelopes have been sent. NCCL builds fail closed if a multi-rank
+  local owner request lacks request token-sync NCCL. If a local submit fails
+  after a remote visible-output completion sink was registered, the path
+  unregisters that sink before returning `SubmitError`.
 - High-performance startup messages now name the remaining structural blockers
   precisely: DSv4 startup still selects the replicated-token lane, owner-group
-  NCCL/token-sync subgroup communicators are missing, remote-owner output return
-  is not yet selected by DSv4 startup, batched FlashMLA sparse/recent decode is
-  not wired, and DSv4 metadata replay is not graph-captured.
+  NCCL/token-sync subgroup construction from the SGLang axis layout is missing,
+  the token-owned relay path is not yet selected by DSv4 startup, batched
+  FlashMLA sparse/recent decode is not wired, and DSv4 metadata replay is not
+  graph-captured.
 - DeepGEMM is now the DSv4 runtime default expert backend, not
   `deepgemm-auto`. Missing or incompatible DeepGEMM now fails before serving
   unless the operator explicitly asks for `ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto`
@@ -176,6 +191,18 @@ serve on the replicated-token debug lane and still look like a performance run.
   passed 4/4, and
   `cargo test -p infer --lib --no-default-features --features cuda,nccl request_handle -- --nocapture`
   passed 12/12.
+- PC2 request-sync cleanup local gate: `cargo fmt --check`, `git diff --check`,
+  `cargo test -p infer --no-default-features --features no-cuda multiproc_relay -- --nocapture`,
+  `cargo test -p infer --no-default-features --features no-cuda request_handle -- --nocapture`,
+  `cargo check -p infer --no-default-features --features no-cuda`, and
+  `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
+  passed. The request-handle test set now includes
+  `distributed_group_token_owned_relay_routes_multi_rank_owner_group`, which
+  proves the relay can route one token-owned request to local rank 0 and remote
+  rank 1 with shard metadata `0/2` and `1/2` while only group rank 0 emits
+  visible output. The implementation also unregisters a remote visible-output
+  completion sink if later local submit fails. CUDA/no-CUDA typecheck passed
+  with pre-existing DSv4 warnings.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.

@@ -166,13 +166,13 @@ impl DeepseekRuntimeConfig {
             missing.push("ARLE_DSV4_SHARED_KV_POOL=1 (persistent paged FP8 KV pool)".to_string());
         }
         missing.push(
-            "serving startup still selects the replicated-token request lane; DP-owner group routing is implemented only as a guarded control-plane path and is not the default DSv4 serve path".to_string(),
+            "serving startup still selects the replicated-token request lane; token-owned owner-group relay is guarded and not selected by DSv4 startup".to_string(),
         );
         missing.push(
-            "owner-group NCCL/token-sync subgroup communicators are not wired; using the global EP group for a selected DP owner group would deadlock or over-synchronize".to_string(),
+            "axis-derived owner-group request token-sync NCCL communicators are not wired for the SGLang DP/attention topology".to_string(),
         );
         missing.push(
-            "remote-owner output return exists only on the relay control plane and is not yet selected by DSv4 multiprocess startup".to_string(),
+            "token-owned relay output return exists on the control plane, but DSv4 startup/data-plane still does not select it".to_string(),
         );
         missing.push(
             "DeepSeek decode attention still loops per row in forward_decode_batch; batched FlashMLA with SGLang sparse/recent indices is not wired".to_string(),

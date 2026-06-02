@@ -508,17 +508,11 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                         );
                         #[cfg(feature = "nccl")]
                         let mut req = req;
-                        // Phase B-1 commit C.4.6.4 — attach NCCL-backed
-                        // DistributedRequestCoordination so worker rank R's
-                        // synchronize_token participates in the cross-rank
-                        // broadcast_i32 collective. Group is the worker's
-                        // own model.ep_nccl, exposed via SchedulerHandle::
-                        // ep_nccl (populated by spawn_scheduler_handle_
-                        // from_path in C.4.6.2). Only available under
-                        // --features nccl; non-NCCL worker builds fall back
-                        // to in-process coordination automatically.
+                        // Attach NCCL-backed request token synchronization.
+                        // This is not the MoE EP communicator; DSv4 owner
+                        // routing may synchronize a smaller selected group.
                         #[cfg(feature = "nccl")]
-                        if let Some(nccl) = handle.ep_nccl() {
+                        if let Some(nccl) = handle.request_token_sync_nccl() {
                             match infer::scheduler::DistributedRequestCoordination::new_nccl(
                                 rank, world_size, nccl,
                             ) {
@@ -600,17 +594,44 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                         #[cfg(feature = "nccl")]
                         let mut req = req;
                         #[cfg(feature = "nccl")]
-                        if shard_world_size == world_size {
-                            if let Some(nccl) = handle.ep_nccl() {
-                                match infer::scheduler::DistributedRequestCoordination::new_nccl(
-                                    rank, world_size, nccl,
-                                ) {
-                                    Ok(coord) => req.distributed = Some(coord),
-                                    Err(err) => {
-                                        log::warn!(
-                                            "[arle-worker rank={rank}] new_nccl failed for token-owned req#{req_id}: {err:#}"
-                                        );
+                        if shard_world_size > 1 {
+                            match handle.request_token_sync_nccl() {
+                                Some(nccl) => {
+                                    match infer::scheduler::DistributedRequestCoordination::new_nccl(
+                                        shard_rank,
+                                        shard_world_size,
+                                        nccl,
+                                    ) {
+                                        Ok(coord) => req.distributed = Some(coord),
+                                        Err(err) => {
+                                            log::warn!(
+                                                "[arle-worker rank={rank}] new_nccl failed for token-owned req#{req_id}: {err:#}"
+                                            );
+                                            let _ = req.delta_tx.send(
+                                                infer::server_engine::CompletionStreamDelta::error(
+                                                    "request_token_sync_nccl_mismatch",
+                                                    vec![format!(
+                                                        "worker rank {rank} could not attach token-owned request sync for req#{req_id}: {err:#}"
+                                                    )],
+                                                ),
+                                            );
+                                            continue;
+                                        }
                                     }
+                                }
+                                None => {
+                                    log::warn!(
+                                        "[arle-worker rank={rank}] missing request token-sync NCCL for token-owned req#{req_id}"
+                                    );
+                                    let _ = req.delta_tx.send(
+                                        infer::server_engine::CompletionStreamDelta::error(
+                                            "request_token_sync_nccl_missing",
+                                            vec![format!(
+                                                "worker rank {rank} has no token-owned request sync communicator for req#{req_id}"
+                                            )],
+                                        ),
+                                    );
+                                    continue;
                                 }
                             }
                         }

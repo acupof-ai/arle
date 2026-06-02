@@ -58,6 +58,8 @@ pub struct LayerCommunicator {
     #[cfg(feature = "nccl")]
     ep_nccl: Option<Arc<NcclGroup>>,
     #[cfg(feature = "nccl")]
+    request_token_sync_nccl: Option<Arc<NcclGroup>>,
+    #[cfg(feature = "nccl")]
     ep_overlap_nccl: Option<Arc<NcclGroup>>,
     /// A4 — secondary TP NCCL communicator bound to `ctx.comm_stream` for
     /// compute/comm overlap during prefill AllGather Q. Attached only when
@@ -90,6 +92,8 @@ impl LayerCommunicator {
             tp_nccl: None,
             #[cfg(feature = "nccl")]
             ep_nccl: None,
+            #[cfg(feature = "nccl")]
+            request_token_sync_nccl: None,
             #[cfg(feature = "nccl")]
             ep_overlap_nccl: None,
             #[cfg(feature = "nccl")]
@@ -148,6 +152,8 @@ impl LayerCommunicator {
             #[cfg(feature = "nccl")]
             ep_nccl: None,
             #[cfg(feature = "nccl")]
+            request_token_sync_nccl: None,
+            #[cfg(feature = "nccl")]
             ep_overlap_nccl: None,
             #[cfg(feature = "nccl")]
             tp_overlap_nccl: None,
@@ -194,6 +200,12 @@ impl LayerCommunicator {
         }
         self.ep_nccl = Some(nccl);
         Ok(self)
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn with_request_token_sync_nccl(mut self, nccl: Arc<NcclGroup>) -> Self {
+        self.request_token_sync_nccl = Some(nccl);
+        self
     }
 
     #[cfg(feature = "nccl")]
@@ -288,6 +300,14 @@ impl LayerCommunicator {
     #[cfg(feature = "nccl")]
     pub fn ep_nccl(&self) -> Option<Arc<NcclGroup>> {
         self.ep_nccl.clone()
+    }
+
+    /// Request-level token synchronization communicator. This is intentionally
+    /// not named after TP or EP: SGLang-style DSv4 selects the group from the
+    /// request-owner topology, not from expert placement.
+    #[cfg(feature = "nccl")]
+    pub fn request_token_sync_nccl(&self) -> Option<Arc<NcclGroup>> {
+        self.request_token_sync_nccl.clone()
     }
 
     /// A4 accessor — secondary TP NCCL group bound to `ctx.comm_stream`,
