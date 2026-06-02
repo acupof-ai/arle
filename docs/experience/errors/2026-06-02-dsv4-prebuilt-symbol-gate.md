@@ -67,6 +67,12 @@ that collides with the protocol's reserved fd 10/11 before fork/exec, marks
 source fds close-on-exec, and includes child pid/exit status in sidecar EOF
 diagnostics.
 
+`scripts/dsv4_toolchain.sh` now uses the same DeepEP source-tree contract as
+`scripts/dsv4_fast_build.sh`: native-deepep accepts both the old flat
+`csrc/kernels/api.cuh` layout and the current `csrc/kernels/legacy/api.cuh`
+layout, auto-discovers standard pod paths, and prints the detected layout in
+`env-check`.
+
 ## Verification
 
 - Local: `cargo fmt --check`
@@ -78,6 +84,9 @@ diagnostics.
   and completed in 17.16 s without nvcc / TileLang AOT.
 - Remote pod: `cargo test -p infer --test deepep_sidecar_smoke --no-default-features --features cuda,nccl -- --nocapture --test-threads=1`
   passed with `ARLE_DEEPEP_RUN_SMOKE=1`.
+- Remote pod: `scripts/dsv4_toolchain.sh env-check --moe-backend native-deepep --expert-backend deepgemm`
+  auto-discovered `/data01/build/arle/../DeepEP` and reported
+  `ARLE_DEEPEP_LAYOUT=legacy`.
 
 ## Rule
 
