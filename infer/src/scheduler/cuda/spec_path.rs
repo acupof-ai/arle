@@ -882,6 +882,9 @@ fn verify_and_commit_rows<M: ModelForward>(
             &row.draft_tokens,
             &output.target_argmax_tokens,
         );
+        let raw_num_accepted = result.num_accepted;
+        let raw_rejection_index = result.rejection_index;
+        let raw_accepted = result.accepted.clone();
         if internal_mtp_draft_acceptance_disabled(scheduler) && result.num_accepted > 0 {
             static LOGGED: OnceLock<()> = OnceLock::new();
             if LOGGED.set(()).is_ok() {
@@ -900,6 +903,27 @@ fn verify_and_commit_rows<M: ModelForward>(
             .get(result.num_accepted)
             .copied()
             .unwrap_or_else(|| row.draft_tokens[result.num_accepted.saturating_sub(1)]);
+        if spec_debug_tokens_enabled() {
+            log::info!(
+                "DSv4 spec row slot={} req={} gen_len={} original_target_len={} \
+                 draft_start={} draft={:?} target_argmax={:?} raw_accepted={:?} \
+                 raw_num_accepted={} raw_rejection={} effective_num_accepted={} \
+                 effective_rejection={} local_bonus={}",
+                row.slot_idx,
+                row.request_id,
+                row.generated_len,
+                row.original_target_len,
+                row.draft_start_position,
+                row.draft_tokens,
+                output.target_argmax_tokens,
+                raw_accepted,
+                raw_num_accepted,
+                raw_rejection_index,
+                result.num_accepted,
+                result.rejection_index,
+                local_bonus
+            );
+        }
         let Some(bonus) =
             coordinate_spec_bonus_token(scheduler, &row, local_bonus, result.num_accepted)
         else {
@@ -983,6 +1007,18 @@ fn internal_mtp_draft_acceptance_disabled<M: ModelForward>(scheduler: &Scheduler
             !(value == "1" || value == "true" || value == "yes" || value == "on")
         })
         .unwrap_or(true)
+}
+
+fn spec_debug_tokens_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ARLE_DSV4_SPEC_DEBUG_TOKENS")
+            .map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                value == "1" || value == "true" || value == "yes" || value == "on"
+            })
+            .unwrap_or(false)
+    })
 }
 
 #[allow(dead_code)]
