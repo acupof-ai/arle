@@ -1846,14 +1846,16 @@ impl DeepseekModel {
                         hc_mult,
                         n,
                     )?;
-                    self.forward_ffn_layer_stream_with_scratch_into(
+                    self.forward_ffn_layer_stream_with_graph_scratch_into(
                         layer_idx,
                         &scratch.attn_stream,
                         tokens,
-                        Some(&mut layer_cache.moe),
-                        Some(ffn_mhc_scratch),
-                        Some(&mut layer_cache.ffn_pre),
-                        Some(&mut layer_cache.ffn_normed),
+                        &scratch.token_ids_gpu,
+                        &mut layer_cache.moe,
+                        ffn_mhc_scratch,
+                        &mut layer_cache.ffn_pre,
+                        &mut layer_cache.ffn_normed,
+                        &mut scratch.ffn_routed,
                         &mut scratch.stream,
                     )?;
                     dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
@@ -1977,11 +1979,11 @@ impl DeepseekModel {
         if slot_indices.len() != start_pos.len() || slot_indices.is_empty() {
             return Ok(false);
         }
-        if !dsv4_decode_body_cuda_graph_unsafe_enabled()? {
+        if !dsv4_deepgemm_device_counts_for_body_graph_enabled()? {
             static LOGGED: OnceLock<()> = OnceLock::new();
             if LOGGED.set(()).is_ok() {
                 warn!(
-                    "ARLE_DSV4_DECODE_BODY_CUDA_GRAPH requested, but full-body DSv4 CUDA graph capture is held in eager mode: FFN routed/shared outputs still use per-step owned GPU scratch. Set ARLE_DSV4_DECODE_BODY_CUDA_GRAPH_UNSAFE=1 only for debug reproduction."
+                    "ARLE_DSV4_DECODE_BODY_CUDA_GRAPH requested, but DSv4 body graph capture needs ARLE_DSV4_DEEPGEMM_DEVICE_COUNTS=1 for graph-safe local routed experts."
                 );
             }
             return Ok(false);
@@ -6591,10 +6593,12 @@ impl DeepseekModel {
             layer_idx,
             stream,
             tokens,
+            None,
             moe_scratch,
             mhc_scratch,
             ffn_pre_scratch,
             ffn_normed_scratch,
+            None,
             None,
         )?
         .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 FFN owned output missing"))
@@ -6615,10 +6619,40 @@ impl DeepseekModel {
             layer_idx,
             stream,
             tokens,
+            None,
             moe_scratch,
             mhc_scratch,
             ffn_pre_scratch,
             ffn_normed_scratch,
+            None,
+            Some(out),
+        )?;
+        Ok(())
+    }
+
+    fn forward_ffn_layer_stream_with_graph_scratch_into(
+        &self,
+        layer_idx: usize,
+        stream: &HiddenStates,
+        tokens: &[u32],
+        token_ids_device_i32: &CudaSlice<i32>,
+        moe_scratch: &mut super::state::DeepseekMoeRuntimeCache,
+        mhc_scratch: &mut DeepseekMhcRuntimeScratch,
+        ffn_pre_scratch: &mut Option<DeepseekHiddenRuntimeScratch>,
+        ffn_normed_scratch: &mut Option<DeepseekHiddenRuntimeScratch>,
+        routed_scratch: &mut HiddenStates,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        self.forward_ffn_layer_stream_with_scratch_impl(
+            layer_idx,
+            stream,
+            tokens,
+            Some(token_ids_device_i32),
+            Some(moe_scratch),
+            Some(mhc_scratch),
+            Some(ffn_pre_scratch),
+            Some(ffn_normed_scratch),
+            Some(routed_scratch),
             Some(out),
         )?;
         Ok(())
@@ -6629,10 +6663,12 @@ impl DeepseekModel {
         layer_idx: usize,
         stream: &HiddenStates,
         tokens: &[u32],
+        token_ids_device_i32: Option<&CudaSlice<i32>>,
         mut moe_scratch: Option<&mut super::state::DeepseekMoeRuntimeCache>,
         mhc_scratch: Option<&mut DeepseekMhcRuntimeScratch>,
         ffn_pre_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
         ffn_normed_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
+        ffn_routed_scratch: Option<&mut HiddenStates>,
         post_out: Option<&mut HiddenStates>,
     ) -> Result<Option<HiddenStates>> {
         ensure!(
@@ -6736,6 +6772,100 @@ impl DeepseekModel {
         // explicit experimental transport and default to local experts +
         // expert all-reduce.
         let use_deepep = deepep_requested && self.config.ep.world_size > 1;
+        if let Some(routed_scratch) = ffn_routed_scratch {
+            let out = post_out.ok_or_else(|| {
+                anyhow::anyhow!("DeepSeek V4 graph-safe FFN path requires post output scratch")
+            })?;
+            ensure!(
+                !use_deepep,
+                "DeepSeek V4 graph-safe FFN path is only wired for local-routed all-reduce"
+            );
+            let moe_cache = moe_scratch.as_deref_mut().ok_or_else(|| {
+                anyhow::anyhow!("DeepSeek V4 graph-safe FFN path requires MoE runtime scratch")
+            })?;
+            let trace = dsv4_trace_begin(&self.ctx)?;
+            layer.ffn.forward_local_routed_gpu_into(
+                &self.ctx,
+                layer_idx,
+                &self.config.spec,
+                &self.config.ep,
+                normed,
+                tokens,
+                Some(&mut *moe_cache),
+                token_ids_device_i32,
+                routed_scratch,
+            )?;
+            dsv4_trace_end(
+                &self.ctx,
+                "ffn_routed_local",
+                layer_idx,
+                stream.seq_len,
+                trace,
+            )?;
+            let (routed_ready, all_reduce_overlapped) = {
+                #[cfg(feature = "nccl")]
+                {
+                    if dsv4_combine_overlap_enabled() {
+                        let trace = dsv4_trace_begin(&self.ctx)?;
+                        let ready = self
+                            .layer_communicator
+                            .post_moe_expert_all_reduce_hidden_states_overlap(
+                                &self.ctx,
+                                routed_scratch,
+                            )?;
+                        dsv4_trace_end(
+                            &self.ctx,
+                            "ffn_all_reduce_overlap_enqueue",
+                            layer_idx,
+                            stream.seq_len,
+                            trace,
+                        )?;
+                        (ready, true)
+                    } else {
+                        (None, false)
+                    }
+                }
+                #[cfg(not(feature = "nccl"))]
+                {
+                    (None, false)
+                }
+            };
+            if !all_reduce_overlapped {
+                let trace = dsv4_trace_begin(&self.ctx)?;
+                self.layer_communicator
+                    .post_moe_expert_all_reduce_hidden_states(routed_scratch)?;
+                dsv4_trace_end(
+                    &self.ctx,
+                    "ffn_all_reduce",
+                    layer_idx,
+                    stream.seq_len,
+                    trace,
+                )?;
+            }
+            let trace = dsv4_trace_begin(&self.ctx)?;
+            layer.ffn.add_shared_expert_with_scratch_into(
+                &self.ctx,
+                normed,
+                routed_scratch,
+                routed_ready,
+                self.config.swiglu_limit,
+                moe_cache,
+            )?;
+            dsv4_trace_end(&self.ctx, "ffn_shared", layer_idx, stream.seq_len, trace)?;
+            let trace = dsv4_trace_begin(&self.ctx)?;
+            hc_post_to_stream_into(
+                &self.ctx,
+                routed_scratch,
+                stream,
+                mhc.post(),
+                mhc.comb(),
+                self.config.hidden_size,
+                self.config.hc_mult,
+                out,
+            )?;
+            dsv4_trace_end(&self.ctx, "ffn_post", layer_idx, stream.seq_len, trace)?;
+            return Ok(None);
+        }
         let routed = if use_deepep {
             #[cfg(feature = "nccl")]
             {
@@ -9500,8 +9630,8 @@ fn dsv4_decode_body_cuda_graph_enabled() -> Result<bool> {
     Ok(dsv4_env_bool_override("ARLE_DSV4_DECODE_BODY_CUDA_GRAPH")?.unwrap_or(false))
 }
 
-fn dsv4_decode_body_cuda_graph_unsafe_enabled() -> Result<bool> {
-    Ok(dsv4_env_bool_override("ARLE_DSV4_DECODE_BODY_CUDA_GRAPH_UNSAFE")?.unwrap_or(false))
+fn dsv4_deepgemm_device_counts_for_body_graph_enabled() -> Result<bool> {
+    Ok(dsv4_env_bool_override("ARLE_DSV4_DEEPGEMM_DEVICE_COUNTS")?.unwrap_or(true))
 }
 
 fn dsv4_nccl_graph_capture_enabled() -> Result<bool> {

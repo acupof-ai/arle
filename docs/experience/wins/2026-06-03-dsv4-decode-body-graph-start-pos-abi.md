@@ -71,9 +71,14 @@ Remote:
   Root-cause hypothesis is not performance-related: the captured body still
   records per-step owned GPU scratch from the FFN routed/shared path, so graph
   launch can use addresses that are no longer stable.
-- Follow-up guard: `ARLE_DSV4_DECODE_BODY_CUDA_GRAPH=1` now stays in eager mode
-  unless `ARLE_DSV4_DECODE_BODY_CUDA_GRAPH_UNSAFE=1` is explicitly set for
-  debug reproduction.
+- Follow-up fix in progress: the batched FFN path now routes local experts into
+  decode-context stable `ffn_routed`, uses per-layer stable route-logits scratch,
+  reads MoE token ids from the already-uploaded decode-context device buffer,
+  and adds the shared expert in-place. Body capture is still gated away from
+  DeepEP, overlap, trace/debug, and explicit
+  `ARLE_DSV4_DEEPGEMM_DEVICE_COUNTS=0`.
+- Pending. Remote body-graph-on 32-token capture/replay gate must show normal
+  output and no `CUDA_ERROR_ILLEGAL_ADDRESS` before this is a correctness win.
 - Pending. Performance gate must run the matched DSv4-Flash TP8 + EAGLE +
   CUDA graph 256K/1500 hot-cache workload before comparing with the target
   TPOT ~4.85 ms.
