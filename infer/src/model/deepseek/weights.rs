@@ -2996,13 +2996,82 @@ impl DeepseekModel {
             &mut k_prepared_owned
         };
         let fuse_qk_prep = dsv4_fuse_qk_prep_enabled()?;
+        let mode_int_early = match mode {
+            deepseek_spec::DeepSeekV4AttentionMode::SlidingWindow => 0,
+            deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse => 1,
+            deepseek_spec::DeepSeekV4AttentionMode::HybridCompressed => 2,
+        };
+        let (sm_major_early, _) = self.ctx.compute_capability();
+        let shared_pool_bound_for_decode = if dsv4_shared_kv_pool_enabled()? {
+            cache
+                .as_deref()
+                .map(|cache| cache.fp8_kv_pool_ptr != 0)
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        let use_flashmla_decode = sm_major_early == 9
+            && (mode_int_early == 1 || mode_int_early == 2)
+            && token_count == 1
+            && dsv4_flashmla_model1_decode_shape_supported(head_dim, local_heads)
+            && cache.is_some()
+            && shared_pool_bound_for_decode
+            && dsv4_flashmla_decode_enabled()?;
+        let decode_start_pos_ptr_u64 = if use_flashmla_decode {
+            let cache_mut = cache
+                .as_deref_mut()
+                .expect("FlashMLA decode gate requires attention cache");
+            Some(stage_fm_decode_start_pos(&self.ctx, cache_mut, start_pos)?)
+        } else {
+            None
+        };
         {
             let (q_raw_ptr, _q_raw_guard) = q_raw.data.device_ptr(&self.ctx.stream);
             let (k_raw_ptr, _k_raw_guard) = kv_normed.data.device_ptr(&self.ctx.stream);
             let (q_out_ptr, _q_out_guard) = q_prepared.data.device_ptr_mut(&self.ctx.stream);
             let (k_out_ptr, _k_out_guard) = k_prepared.data.device_ptr_mut(&self.ctx.stream);
             let status = unsafe {
-                if fuse_qk_prep {
+                if let Some(start_pos_ptr_u64) = decode_start_pos_ptr_u64 {
+                    if fuse_qk_prep {
+                        ffi::dsv4_prepare_qk_fused_start_pos_ptr_cuda(
+                            q_raw_ptr as *const ffi::Half,
+                            k_raw_ptr as *const ffi::Half,
+                            q_out_ptr as *mut ffi::Half,
+                            k_out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            self.config.qk_rope_head_dim as i32,
+                            start_pos_ptr_u64 as *const i32,
+                            self.config.rms_norm_eps,
+                            rope_base,
+                            original_seq_len as i32,
+                            rope_params.factor,
+                            rope_params.beta_fast,
+                            rope_params.beta_slow,
+                            self.ctx.stream.cu_stream(),
+                        )
+                    } else {
+                        ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
+                            q_raw_ptr as *const ffi::Half,
+                            k_raw_ptr as *const ffi::Half,
+                            q_out_ptr as *mut ffi::Half,
+                            k_out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            self.config.qk_rope_head_dim as i32,
+                            start_pos_ptr_u64 as *const i32,
+                            self.config.rms_norm_eps,
+                            rope_base,
+                            original_seq_len as i32,
+                            rope_params.factor,
+                            rope_params.beta_fast,
+                            rope_params.beta_slow,
+                            self.ctx.stream.cu_stream(),
+                        )
+                    }
+                } else if fuse_qk_prep {
                     ffi::dsv4_prepare_qk_fused_cuda(
                         q_raw_ptr as *const ffi::Half,
                         k_raw_ptr as *const ffi::Half,
@@ -3059,32 +3128,11 @@ impl DeepseekModel {
         // env-OFF fallback and diagnostic A/B runs. The legacy path still
         // exists; do not assume it is safe to delete without a separate
         // validated tranche.
-        let mode_int_early = match mode {
-            deepseek_spec::DeepSeekV4AttentionMode::SlidingWindow => 0,
-            deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse => 1,
-            deepseek_spec::DeepSeekV4AttentionMode::HybridCompressed => 2,
-        };
-        let (sm_major_early, _) = self.ctx.compute_capability();
-        let shared_pool_bound_for_decode = if dsv4_shared_kv_pool_enabled()? {
-            cache
-                .as_deref()
-                .map(|cache| cache.fp8_kv_pool_ptr != 0)
-                .unwrap_or(false)
-        } else {
-            true
-        };
-        let use_flashmla_decode = sm_major_early == 9
-            && (mode_int_early == 1 || mode_int_early == 2)
-            && token_count == 1
-            && dsv4_flashmla_model1_decode_shape_supported(head_dim, local_heads)
-            && cache.is_some()
-            && shared_pool_bound_for_decode
-            && dsv4_flashmla_decode_enabled()?;
         let fuse_window_update = update_window_cache
             && token_count == 1
             && !use_flashmla_decode
             && dsv4_fuse_attn_window_update_enabled()?;
-        let mut window_update_start_pos_ptr_u64: Option<u64> = None;
+        let window_update_start_pos_ptr_u64 = decode_start_pos_ptr_u64;
         // Lazy-alloc cache.window_gpu without binding the returned mut
         // reference. The bf16 SW window is only re-acquired (mutably)
         // inside the legacy-decode / prefill branches below; the
@@ -3844,32 +3892,8 @@ impl DeepseekModel {
                     self.dsv4_flashmla_decode_pool_layout(cache_mut, compress_ratio)?;
                 let total_blocks = sw_blocks + comp_blocks;
 
-                ensure!(
-                    start_pos <= i32::MAX as usize,
-                    "DSv4 FlashMLA decode start_pos {start_pos} overflows i32"
-                );
-                let start_pos_ptr_u64 = {
-                    let start_pos_dev = cache_mut
-                        .fm_decode_start_pos
-                        .as_mut()
-                        .expect("start_pos arena allocated");
-                    let (ptr, guard) = start_pos_dev.device_ptr_mut(&self.ctx.stream);
-                    unsafe {
-                        ffi::dsv4_fill_i32_cuda(
-                            ptr as *mut i32,
-                            start_pos as i32,
-                            1_i32,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()
-                        .map_err(|err| {
-                            anyhow::anyhow!("DSv4 FlashMLA decode start_pos fill failed: {err}")
-                        })?;
-                    }
-                    drop(guard);
-                    ptr as u64
-                };
-                window_update_start_pos_ptr_u64 = Some(start_pos_ptr_u64);
+                let start_pos_ptr_u64 = decode_start_pos_ptr_u64
+                    .expect("FlashMLA decode staged start_pos before q/k prep");
 
                 // Step 3 — per-step SW pack of the current decode token's
                 // K row from k_prepared into FP8 SW sub-pool at
@@ -4126,13 +4150,13 @@ impl DeepseekModel {
                 // single decode token [token_count=1, local_heads, head_dim]
                 // (= local_attn = out_ptr). MAIN rope_theta, NO YaRN.
                 unsafe {
-                    ffi::arle_dsv4_output_inverse_rope_cuda(
+                    ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
                         out_ptr as *mut ffi::Half,
                         1_i32, // token_count (decode)
                         local_heads as i32,
                         head_dim as i32,
                         self.config.qk_rope_head_dim as i32,
-                        start_pos as i32,
+                        start_pos_ptr_u64 as *const i32,
                         rope_base,
                         original_seq_len as i32,
                         rope_params.factor,
@@ -6183,6 +6207,46 @@ fn ensure_fm_decode_arena(
     cache.fm_decode_scratch_topk_unified = topk_unified_max;
     cache.fm_decode_scratch_h_q = h_q;
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn stage_fm_decode_start_pos(
+    ctx: &DeviceContext,
+    cache: &mut DeepseekAttentionRuntimeCache,
+    start_pos: usize,
+) -> Result<u64> {
+    ensure!(
+        start_pos <= i32::MAX as usize,
+        "DSv4 FlashMLA decode start_pos {start_pos} overflows i32"
+    );
+    if cache
+        .fm_decode_start_pos
+        .as_ref()
+        .is_none_or(|buf| buf.len() < 1)
+    {
+        cache.fm_decode_start_pos = Some(
+            ctx.stream
+                .alloc_zeros_traced::<i32>(1)
+                .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode start_pos alloc: {err}"))?,
+        );
+    }
+    let start_pos_dev = cache
+        .fm_decode_start_pos
+        .as_mut()
+        .expect("start_pos arena allocated");
+    let (ptr, guard) = start_pos_dev.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::dsv4_fill_i32_cuda(
+            ptr as *mut i32,
+            start_pos as i32,
+            1_i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode start_pos fill failed: {err}"))?;
+    }
+    drop(guard);
+    Ok(ptr as u64)
 }
 
 /// Phase D-4 step 2 — one-shot prefill→decode SW bootstrap. Packs the
