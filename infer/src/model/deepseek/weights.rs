@@ -791,6 +791,17 @@ impl DeepseekModel {
             state.incremental.ensure_layers(num_layers);
             start_pos.push(sp);
         }
+        {
+            let scratch = decode_ctx.ensure_batched_scratch(
+                &self.ctx,
+                hidden_size,
+                stream_hidden_dim,
+                head_hc.mix_fn.rows,
+                self.config.vocab_size,
+                n,
+            )?;
+            scratch.upload_start_positions(&self.ctx, &start_pos)?;
+        }
 
         let graph_force_eager = decode_ctx.take_force_eager_once()
             || !<Self as crate::model::ModelForward>::supports_cuda_graph_decode(self);
@@ -827,6 +838,9 @@ impl DeepseekModel {
                 self.config.vocab_size,
                 n,
             )?;
+            let (start_pos_base_ptr, _start_pos_guard) =
+                scratch.start_pos_gpu.device_ptr(&self.ctx.stream);
+            let start_pos_i32_size = std::mem::size_of::<i32>();
             for layer_idx in 0..num_layers {
                 // --- Attention half: per-row, each into its row of attn_stream. ---
                 for (row, &slot_idx) in slot_indices.iter().enumerate() {
@@ -842,10 +856,13 @@ impl DeepseekModel {
                         .layers
                         .get_mut(layer_idx)
                         .expect("incremental cache layer initialized");
+                    let row_start_pos_ptr_u64 =
+                        start_pos_base_ptr as u64 + (row * start_pos_i32_size) as u64;
                     self.forward_attention_half_incremental_into(
                         layer_idx,
                         &scratch.row_in,
                         start_pos[row],
+                        Some(row_start_pos_ptr_u64),
                         layer_cache,
                         &mut scratch.row_out,
                     )?;
@@ -1518,6 +1535,7 @@ impl DeepseekModel {
             layer_idx,
             stream,
             start_pos,
+            None,
             cache,
             unsafe { &mut *attn_stream_ptr },
         )?;
@@ -1576,6 +1594,7 @@ impl DeepseekModel {
         layer_idx: usize,
         stream: &HiddenStates,
         start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
         cache: &mut DeepseekLayerRuntimeCache,
         out: &mut HiddenStates,
     ) -> Result<()> {
@@ -1662,6 +1681,7 @@ impl DeepseekModel {
             &layer.attention,
             normed,
             start_pos,
+            start_pos_ptr_u64,
             &mut cache.attention,
             &mut attn_out_scratch.hidden,
         );
@@ -1841,6 +1861,7 @@ impl DeepseekModel {
             &kv_normed,
             hidden.seq_len,
             0,
+            None,
             local_heads,
             local_width,
             head_dim,
@@ -1856,6 +1877,7 @@ impl DeepseekModel {
         attention: &DeepseekV4Attention,
         hidden: &HiddenStates,
         start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
         cache: &mut DeepseekAttentionRuntimeCache,
         out: &mut HiddenStates,
     ) -> Result<()> {
@@ -1956,6 +1978,7 @@ impl DeepseekModel {
             kv_normed,
             hidden.seq_len,
             start_pos,
+            start_pos_ptr_u64,
             local_heads,
             local_width,
             head_dim,
@@ -1983,6 +2006,7 @@ impl DeepseekModel {
         kv_normed: &HiddenStates,
         token_count: usize,
         start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
         local_heads: usize,
         local_width: usize,
         head_dim: usize,
@@ -1996,6 +2020,7 @@ impl DeepseekModel {
             kv_normed,
             token_count,
             start_pos,
+            start_pos_ptr_u64,
             local_heads,
             local_width,
             head_dim,
@@ -2014,6 +2039,7 @@ impl DeepseekModel {
         kv_normed: &HiddenStates,
         token_count: usize,
         start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
         local_heads: usize,
         local_width: usize,
         head_dim: usize,
@@ -2117,7 +2143,47 @@ impl DeepseekModel {
             let (q_out_ptr, _q_out_guard) = q_prepared.data.device_ptr_mut(&self.ctx.stream);
             let (k_out_ptr, _k_out_guard) = k_prepared.data.device_ptr_mut(&self.ctx.stream);
             let status = unsafe {
-                if fuse_qk_prep {
+                if let Some(start_pos_ptr_u64) = start_pos_ptr_u64 {
+                    if fuse_qk_prep {
+                        ffi::dsv4_prepare_qk_fused_start_pos_ptr_cuda(
+                            q_raw_ptr as *const ffi::Half,
+                            k_raw_ptr as *const ffi::Half,
+                            q_out_ptr as *mut ffi::Half,
+                            k_out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            self.config.qk_rope_head_dim as i32,
+                            start_pos_ptr_u64 as *const i32,
+                            self.config.rms_norm_eps,
+                            rope_base,
+                            original_seq_len,
+                            rope_params.factor,
+                            rope_params.beta_fast,
+                            rope_params.beta_slow,
+                            self.ctx.stream.cu_stream(),
+                        )
+                    } else {
+                        ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
+                            q_raw_ptr as *const ffi::Half,
+                            k_raw_ptr as *const ffi::Half,
+                            q_out_ptr as *mut ffi::Half,
+                            k_out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            self.config.qk_rope_head_dim as i32,
+                            start_pos_ptr_u64 as *const i32,
+                            self.config.rms_norm_eps,
+                            rope_base,
+                            original_seq_len,
+                            rope_params.factor,
+                            rope_params.beta_fast,
+                            rope_params.beta_slow,
+                            self.ctx.stream.cu_stream(),
+                        )
+                    }
+                } else if fuse_qk_prep {
                     ffi::dsv4_prepare_qk_fused_cuda(
                         q_raw_ptr as *const ffi::Half,
                         k_raw_ptr as *const ffi::Half,
@@ -2368,6 +2434,7 @@ impl DeepseekModel {
         kv_normed: &HiddenStates,
         token_count: usize,
         start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
         local_heads: usize,
         local_width: usize,
         head_dim: usize,
@@ -2383,6 +2450,7 @@ impl DeepseekModel {
                 kv_normed,
                 token_count,
                 start_pos,
+                start_pos_ptr_u64,
                 local_heads,
                 local_width,
                 head_dim,
@@ -2399,6 +2467,7 @@ impl DeepseekModel {
                 kv_normed,
                 token_count,
                 start_pos,
+                start_pos_ptr_u64,
                 local_heads,
                 local_width,
                 head_dim,
@@ -2435,6 +2504,7 @@ impl DeepseekModel {
         kv_normed: &HiddenStates,
         token_count: usize,
         start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
         local_heads: usize,
         local_width: usize,
         head_dim: usize,
@@ -2459,6 +2529,7 @@ impl DeepseekModel {
                 kv_normed,
                 token_count,
                 start_pos,
+                start_pos_ptr_u64,
                 local_heads,
                 local_width,
                 head_dim,
@@ -2476,6 +2547,7 @@ impl DeepseekModel {
                 kv_normed,
                 token_count,
                 start_pos,
+                None,
                 local_heads,
                 local_width,
                 head_dim,
@@ -2595,6 +2667,7 @@ impl DeepseekModel {
             selected.as_ref(),
             token_count,
             start_pos,
+            None,
             local_heads,
             local_width,
             head_dim,
@@ -2615,6 +2688,7 @@ impl DeepseekModel {
         kv_normed: &HiddenStates,
         token_count: usize,
         start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
         local_heads: usize,
         local_width: usize,
         head_dim: usize,
@@ -2632,6 +2706,7 @@ impl DeepseekModel {
             kv_normed,
             token_count,
             start_pos,
+            start_pos_ptr_u64,
             local_heads,
             local_width,
             head_dim,
@@ -2654,6 +2729,7 @@ impl DeepseekModel {
         kv_normed: &HiddenStates,
         token_count: usize,
         start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
         local_heads: usize,
         local_width: usize,
         head_dim: usize,
@@ -2819,6 +2895,7 @@ impl DeepseekModel {
             selected.as_ref(),
             token_count,
             start_pos,
+            start_pos_ptr_u64,
             local_heads,
             local_width,
             head_dim,
@@ -2849,6 +2926,7 @@ impl DeepseekModel {
         selected: Option<&CudaSlice<i32>>,
         token_count: usize,
         start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
         local_heads: usize,
         local_width: usize,
         head_dim: usize,
@@ -2866,6 +2944,7 @@ impl DeepseekModel {
             selected,
             token_count,
             start_pos,
+            start_pos_ptr_u64,
             local_heads,
             local_width,
             head_dim,
@@ -2888,6 +2967,7 @@ impl DeepseekModel {
         selected: Option<&CudaSlice<i32>>,
         token_count: usize,
         start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
         local_heads: usize,
         local_width: usize,
         head_dim: usize,
@@ -3018,10 +3098,14 @@ impl DeepseekModel {
             && shared_pool_bound_for_decode
             && dsv4_flashmla_decode_enabled()?;
         let decode_start_pos_ptr_u64 = if use_flashmla_decode {
-            let cache_mut = cache
-                .as_deref_mut()
-                .expect("FlashMLA decode gate requires attention cache");
-            Some(stage_fm_decode_start_pos(&self.ctx, cache_mut, start_pos)?)
+            if let Some(start_pos_ptr_u64) = start_pos_ptr_u64 {
+                Some(start_pos_ptr_u64)
+            } else {
+                let cache_mut = cache
+                    .as_deref_mut()
+                    .expect("FlashMLA decode gate requires attention cache");
+                Some(stage_fm_decode_start_pos(&self.ctx, cache_mut, start_pos)?)
+            }
         } else {
             None
         };
