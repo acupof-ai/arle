@@ -26,13 +26,7 @@ use log::info;
 #[cfg(feature = "cuda")]
 use std::time::Instant;
 #[cfg(feature = "cuda")]
-use std::{
-    ffi::CStr,
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{ffi::CStr, sync::OnceLock};
 
 #[cfg(feature = "cuda")]
 use super::state::{
@@ -656,7 +650,6 @@ pub(super) fn dsv4_try_build_deepgemm_expert_cache(
     ctx: &DeviceContext,
     experts: &[DeepseekV4Expert],
 ) -> Result<Option<DeepseekDsv4DeepGemmExpertCache>> {
-    static LOGGED_PRECHECK: OnceLock<()> = OnceLock::new();
     let backend = dsv4_expert_backend()?;
     let explicit_cache = dsv4_env_flag("ARLE_DSV4_DEEPGEMM_WEIGHT_CACHE")?;
     let should_build = explicit_cache || !matches!(backend, Dsv4ExpertBackend::Native);
@@ -667,24 +660,12 @@ pub(super) fn dsv4_try_build_deepgemm_expert_cache(
         let first = experts
             .first()
             .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 DeepGEMM cache needs local experts"))?;
-        match dsv4_handle_deepgemm_expert_backend(
+        dsv4_handle_deepgemm_expert_backend(
             ctx,
             backend,
             "expert cache",
             &[&first.w1, &first.w3, &first.w2],
-        ) {
-            Ok(true) => {}
-            Ok(false) => return Ok(None),
-            Err(err) => {
-                if matches!(backend, Dsv4ExpertBackend::DeepGemmRequired) {
-                    return Err(err);
-                }
-                LOGGED_PRECHECK.get_or_init(|| {
-                    info!("DeepSeek V4 DeepGEMM FP8 expert cache skipped before build: {err:#}");
-                });
-                return Ok(None);
-            }
-        }
+        )?;
     }
 
     match dsv4_build_deepgemm_expert_cache(ctx, experts) {
@@ -1273,7 +1254,6 @@ fn dsv4_env_flag_default(name: &str, default: bool) -> Result<bool> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Dsv4ExpertBackend {
     Native,
-    DeepGemmAuto,
     DeepGemmRequired,
 }
 
@@ -1282,52 +1262,16 @@ impl Dsv4ExpertBackend {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
-            Self::DeepGemmAuto => "deepgemm-auto",
             Self::DeepGemmRequired => "deepgemm",
         }
     }
 }
 
 #[cfg(feature = "cuda")]
-static DSV4_DEEPGEMM_AUTO_DISABLED_AFTER_FAILURE: AtomicBool = AtomicBool::new(false);
-
-#[cfg(feature = "cuda")]
-fn dsv4_deepgemm_auto_disabled() -> bool {
-    DSV4_DEEPGEMM_AUTO_DISABLED_AFTER_FAILURE.load(Ordering::Relaxed)
-}
-
-#[cfg(feature = "cuda")]
-fn dsv4_disable_deepgemm_auto_after_runtime_failure(err: &anyhow::Error) {
-    if !DSV4_DEEPGEMM_AUTO_DISABLED_AFTER_FAILURE.swap(true, Ordering::Relaxed) {
-        info!("DeepSeek V4 DeepGEMM auto disabled for this process after runtime failure: {err:#}");
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn dsv4_should_try_deepgemm_experts(
-    backend: Dsv4ExpertBackend,
-    backend_usable: bool,
-    cache_present: bool,
-) -> bool {
-    dsv4_should_try_deepgemm_experts_with_auto_disabled(
-        backend,
-        backend_usable,
-        cache_present,
-        dsv4_deepgemm_auto_disabled(),
-    )
-}
-
-#[cfg(feature = "cuda")]
-fn dsv4_should_try_deepgemm_experts_with_auto_disabled(
-    backend: Dsv4ExpertBackend,
-    backend_usable: bool,
-    cache_present: bool,
-    auto_disabled: bool,
-) -> bool {
+fn dsv4_should_try_deepgemm_experts(backend: Dsv4ExpertBackend) -> bool {
     match backend {
         Dsv4ExpertBackend::Native => false,
         Dsv4ExpertBackend::DeepGemmRequired => true,
-        Dsv4ExpertBackend::DeepGemmAuto => backend_usable && cache_present && !auto_disabled,
     }
 }
 
@@ -1359,13 +1303,12 @@ fn dsv4_expert_backend_from_env_values(
     };
     match raw.to_ascii_lowercase().as_str() {
         "" | "native" | "gemv" | "raw-gemv" | "raw_gemv" => Ok(Dsv4ExpertBackend::Native),
-        "deepgemm-auto" | "deepgemm_auto" | "auto-deepgemm" | "auto_deepgemm" => {
-            Ok(Dsv4ExpertBackend::DeepGemmAuto)
-        }
         "deepgemm" | "required-deepgemm" | "required_deepgemm" => {
             Ok(Dsv4ExpertBackend::DeepGemmRequired)
         }
-        other => bail!("invalid ARLE_DSV4_EXPERT_BACKEND value `{other}`"),
+        other => bail!(
+            "invalid ARLE_DSV4_EXPERT_BACKEND value `{other}`: expected `deepgemm` or explicit debug `native`"
+        ),
     }
 }
 
@@ -1466,29 +1409,6 @@ fn dsv4_handle_deepgemm_expert_backend(
         Dsv4ExpertBackend::DeepGemmRequired => {
             dsv4_validate_deepgemm_expert_backend(ctx, path, weights)?;
             let report = dsv4_deepgemm_native_preflight_cached()?;
-            dsv4_log_deepgemm_native_preflight_ok(report);
-            Ok(true)
-        }
-        Dsv4ExpertBackend::DeepGemmAuto => {
-            static LOGGED_VALIDATE: OnceLock<()> = OnceLock::new();
-            static LOGGED_PREFLIGHT: OnceLock<()> = OnceLock::new();
-            if let Err(err) = dsv4_validate_deepgemm_expert_backend(ctx, path, weights) {
-                LOGGED_VALIDATE.get_or_init(|| {
-                    info!("DeepSeek V4 DeepGEMM auto fallback to native expert path: {err:#}");
-                });
-                return Ok(false);
-            }
-            let report = match dsv4_deepgemm_native_preflight_cached() {
-                Ok(report) => report,
-                Err(err) => {
-                    LOGGED_PREFLIGHT.get_or_init(|| {
-                        info!(
-                            "DeepSeek V4 DeepGEMM auto fallback to native expert path before first request: {err:#}"
-                        );
-                    });
-                    return Ok(false);
-                }
-            };
             dsv4_log_deepgemm_native_preflight_ok(report);
             Ok(true)
         }
@@ -3018,7 +2938,7 @@ impl DeepseekV4MoeBlock {
             );
         }
         let expert_backend = dsv4_expert_backend()?;
-        let deepgemm_backend_usable = dsv4_handle_deepgemm_expert_backend(
+        dsv4_handle_deepgemm_expert_backend(
             ctx,
             expert_backend,
             "packed grouped local experts",
@@ -3060,11 +2980,7 @@ impl DeepseekV4MoeBlock {
                     anyhow::anyhow!("DeepSeek V4 active expert count H2D failed: {err}")
                 })?;
         }
-        let should_try_deepgemm = dsv4_should_try_deepgemm_experts(
-            expert_backend,
-            deepgemm_backend_usable,
-            self.deepgemm_cache.is_some(),
-        );
+        let should_try_deepgemm = dsv4_should_try_deepgemm_experts(expert_backend);
         if should_try_deepgemm {
             let active_owned = scratch
                 .active
@@ -3085,20 +3001,8 @@ impl DeepseekV4MoeBlock {
                 scratch,
             );
             scratch.active = Some(active_owned);
-            match deepgemm_result {
-                Ok(()) => return Ok(true),
-                Err(err) => {
-                    if matches!(expert_backend, Dsv4ExpertBackend::DeepGemmRequired) {
-                        return Err(err);
-                    }
-                    dsv4_disable_deepgemm_auto_after_runtime_failure(&err);
-                    LOGGED.get_or_init(|| {
-                        info!(
-                            "DeepSeek V4 DeepGEMM auto fallback to native grouped expert path: {err:#}"
-                        );
-                    });
-                }
-            }
+            deepgemm_result?;
+            return Ok(true);
         }
         let active = scratch
             .active
@@ -3404,9 +3308,8 @@ impl DeepseekV4MoeBlock {
 
         let has_moe_scratch = moe_scratch.is_some();
         let expert_backend = dsv4_expert_backend()?;
-        let mut deepgemm_backend_usable = false;
         if let Some(first) = self.experts.first() {
-            deepgemm_backend_usable = dsv4_handle_deepgemm_expert_backend(
+            dsv4_handle_deepgemm_expert_backend(
                 ctx,
                 expert_backend,
                 "DeepEP routed experts",
@@ -3419,17 +3322,11 @@ impl DeepseekV4MoeBlock {
             && dsv4_padded_dispatch_enabled()?;
         let use_fused_dispatch_payload =
             use_padded_dispatch && dsv4_fused_dispatch_payload_enabled()?;
-        let use_deepgemm_experts = has_moe_scratch
-            && dsv4_should_try_deepgemm_experts(
-                expert_backend,
-                deepgemm_backend_usable,
-                self.deepgemm_cache.is_some(),
-            );
+        let use_deepgemm_experts =
+            has_moe_scratch && dsv4_should_try_deepgemm_experts(expert_backend);
         ensure!(
-            !matches!(expert_backend, Dsv4ExpertBackend::DeepGemmRequired)
-                || use_deepgemm_experts
-                || hidden.seq_len > 1,
-            "ARLE_DSV4_EXPERT_BACKEND=deepgemm requires DeepSeek V4 MoE runtime scratch for decode"
+            !matches!(expert_backend, Dsv4ExpertBackend::DeepGemmRequired) || use_deepgemm_experts,
+            "ARLE_DSV4_EXPERT_BACKEND=deepgemm requires DeepSeek V4 MoE runtime scratch"
         );
         let use_route_grouped_experts =
             use_padded_dispatch && !use_deepgemm_experts && dsv4_route_grouped_experts_enabled()?;
@@ -4316,9 +4213,6 @@ impl DeepseekV4MoeBlock {
                         route_out,
                         &mut device_grouped_cache,
                     ) {
-                        if matches!(expert_backend, Dsv4ExpertBackend::DeepGemmAuto) {
-                            dsv4_disable_deepgemm_auto_after_runtime_failure(&err);
-                        }
                         return Err(err);
                     }
                     route_grouped_scratch_slot = device_grouped_cache.grouped.take();
@@ -5111,26 +5005,19 @@ impl DeepseekV4MoeBlock {
 
         // B-3.3.5 — DeepGEMM grouped-expert dispatch on the post-recv FFN.
         // Mirror the use_deepgemm_experts decision from
-        // forward_deepep_routed_gpu (mlp.rs:3149). When DeepGEMM is auto-
-        // selected or required AND the per-block FP8 cache built ok, the
-        // post-dispatch FFN section calls forward_deepgemm_all_dsv4_experts_
-        // gpu with the packed recv buffers instead of looping per expert.
+        // forward_deepep_routed_gpu. Required DeepGEMM calls
+        // forward_deepgemm_all_dsv4_experts_gpu with packed recv buffers;
+        // explicit native debug mode keeps the per-expert loop.
         let expert_backend = dsv4_expert_backend()?;
-        let deepgemm_backend_usable = if let Some(first) = self.experts.first() {
+        if let Some(first) = self.experts.first() {
             dsv4_handle_deepgemm_expert_backend(
                 ctx,
                 expert_backend,
                 "native-deepep routed experts",
                 &[&first.w1, &first.w3, &first.w2],
             )?
-        } else {
-            false
         };
-        let use_deepgemm_experts = dsv4_should_try_deepgemm_experts(
-            expert_backend,
-            deepgemm_backend_usable,
-            self.deepgemm_cache.is_some(),
-        );
+        let use_deepgemm_experts = dsv4_should_try_deepgemm_experts(expert_backend);
 
         let trace = dsv4_moe_trace_begin(ctx)?;
         let logits = ops::gemm(ctx, &self.gate_weight, hidden)?;
@@ -5530,9 +5417,6 @@ impl DeepseekV4MoeBlock {
                     &mut scratch.expert_out,
                     &mut device_grouped_cache,
                 ) {
-                    if matches!(expert_backend, Dsv4ExpertBackend::DeepGemmAuto) {
-                        dsv4_disable_deepgemm_auto_after_runtime_failure(&err);
-                    }
                     return Err(err);
                 }
                 scratch.grouped = device_grouped_cache.grouped.take();
@@ -5920,30 +5804,10 @@ mod tests {
     }
 
     #[test]
-    fn deepgemm_auto_gate_stops_after_cached_failure() {
-        assert!(dsv4_should_try_deepgemm_experts_with_auto_disabled(
-            Dsv4ExpertBackend::DeepGemmAuto,
-            true,
-            true,
-            false,
-        ));
-        assert!(!dsv4_should_try_deepgemm_experts_with_auto_disabled(
-            Dsv4ExpertBackend::DeepGemmAuto,
-            true,
-            true,
-            true,
-        ));
-        assert!(!dsv4_should_try_deepgemm_experts_with_auto_disabled(
-            Dsv4ExpertBackend::Native,
-            true,
-            true,
-            false,
-        ));
-        assert!(dsv4_should_try_deepgemm_experts_with_auto_disabled(
-            Dsv4ExpertBackend::DeepGemmRequired,
-            false,
-            false,
-            true,
+    fn deepgemm_gate_is_required_or_explicit_native() {
+        assert!(!dsv4_should_try_deepgemm_experts(Dsv4ExpertBackend::Native));
+        assert!(dsv4_should_try_deepgemm_experts(
+            Dsv4ExpertBackend::DeepGemmRequired
         ));
     }
 
@@ -5962,13 +5826,11 @@ mod tests {
             Dsv4ExpertBackend::DeepGemmRequired
         );
         assert_eq!(
-            dsv4_expert_backend_from_env_values(Some("deepgemm-auto"), None).unwrap(),
-            Dsv4ExpertBackend::DeepGemmAuto
-        );
-        assert_eq!(
             dsv4_expert_backend_from_env_values(Some("native"), None).unwrap(),
             Dsv4ExpertBackend::Native
         );
+        assert!(dsv4_expert_backend_from_env_values(Some("deepgemm-auto"), None).is_err());
+        assert!(dsv4_expert_backend_from_env_values(Some("auto-deepgemm"), None).is_err());
         assert!(dsv4_expert_backend_from_env_values(None, Some("not-a-backend")).is_err());
         assert!(dsv4_expert_backend_from_env_values(None, Some("deepep_unsafe")).is_err());
         assert!(dsv4_expert_backend_from_env_values(None, Some("unsafe_deepep")).is_err());
