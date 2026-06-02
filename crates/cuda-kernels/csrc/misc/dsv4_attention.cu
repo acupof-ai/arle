@@ -791,6 +791,7 @@ __global__ void dsv4_compressor_update_kernel(
     uint16_t *__restrict__ compressed,
     int num_tokens,
     int start_pos,
+    const int *__restrict__ start_pos_ptr,
     int pending_len,
     int compressed_base,
     int head_dim,
@@ -805,6 +806,12 @@ __global__ void dsv4_compressor_update_kernel(
     float factor,
     float beta_fast,
     float beta_slow) {
+  if (start_pos_ptr != nullptr) {
+    start_pos = start_pos_ptr[0];
+    pending_len = start_pos % ratio;
+    compressed_base = start_pos / ratio;
+    has_prev_overlap = compressed_base > 0;
+  }
   __shared__ float row[DSV4_ATTN_MAX_HEAD_DIM];
   int total = pending_len + num_tokens;
   int completed = total / ratio;
@@ -983,9 +990,46 @@ extern "C" CUresult dsv4_compressor_update_cuda(
   }
   dsv4_compressor_update_kernel<<<1, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
       kv_raw, score_raw, ape, norm, pending_kv, pending_score, prev_overlap_kv,
-      prev_overlap_score, compressed, num_tokens, start_pos, pending_len,
+      prev_overlap_score, compressed, num_tokens, start_pos, nullptr, pending_len,
       compressed_base, head_dim, ratio, width, overlap, has_prev_overlap, eps,
       rope_dim, rope_base, original_seq_len, factor, beta_fast, beta_slow);
+  return (CUresult)cudaGetLastError();
+}
+
+extern "C" CUresult dsv4_compressor_update_start_pos_ptr_cuda(
+    const uint16_t *kv_raw,
+    const uint16_t *score_raw,
+    const uint16_t *ape,
+    const uint16_t *norm,
+    uint16_t *pending_kv,
+    uint16_t *pending_score,
+    uint16_t *prev_overlap_kv,
+    uint16_t *prev_overlap_score,
+    uint16_t *compressed,
+    int num_tokens,
+    const int *start_pos,
+    int head_dim,
+    int ratio,
+    int width,
+    int overlap,
+    float eps,
+    int rope_dim,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow,
+    CUstream stream) {
+  if (num_tokens < 0 || start_pos == nullptr || head_dim <= 0 ||
+      head_dim > DSV4_ATTN_MAX_HEAD_DIM || ratio <= 0 || ratio > 256 ||
+      width < head_dim || rope_dim < 0 || rope_dim > head_dim) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dsv4_compressor_update_kernel<<<1, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
+      kv_raw, score_raw, ape, norm, pending_kv, pending_score, prev_overlap_kv,
+      prev_overlap_score, compressed, num_tokens, 0, start_pos, 0, 0, head_dim,
+      ratio, width, overlap, 0, eps, rope_dim, rope_base, original_seq_len,
+      factor, beta_fast, beta_slow);
   return (CUresult)cudaGetLastError();
 }
 
