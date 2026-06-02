@@ -16,9 +16,14 @@ use super::prefill::DeepseekPrefillContext;
 #[cfg(feature = "cuda")]
 use super::state::DeepseekState;
 #[cfg(feature = "cuda")]
-use super::weights::{DeepseekModel, dsv4_flashmla_decode_enabled, dsv4_shared_kv_pool_enabled};
+use super::weights::{
+    DeepseekModel, dsv4_flashmla_decode_enabled, dsv4_flashmla_prefill_enabled,
+    dsv4_incremental_kv_enabled, dsv4_shared_kv_pool_enabled,
+};
 #[cfg(feature = "cuda")]
 use crate::model::generation_state::GenerationStateBase;
+#[cfg(feature = "cuda")]
+use crate::model::kv_cache::{KVCacheDtype, KVFormat};
 #[cfg(feature = "cuda")]
 use crate::model::{
     CudaGraphDecodeSupport, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest,
@@ -328,8 +333,112 @@ impl ModelForward for DeepseekModel {
             "DSv4 decode is not graph-safe yet: attention/compressor metadata still uses \
              host launch params and host-updated cache counters (start_pos, pending_len, \
              compressed_rows, FP8 pack high-water marks); top-level batched scratch now uses \
-             stable decode-context buffers",
+            stable decode-context buffers",
         )
+    }
+
+    fn validate_scheduler_contract(
+        &self,
+        kv_cache_dtype: KVCacheDtype,
+        kv_pool_format: KVFormat,
+        cuda_graph_max_bs: usize,
+    ) -> Result<()> {
+        let profile = self.config.performance_profile()?;
+        let graph_support = self.cuda_graph_decode_support();
+        let moe_backend = dsv4_moe_backend_label()?;
+        let expert_backend = super::mlp::dsv4_expert_backend_label()?;
+        let flashmla_prefill = dsv4_flashmla_prefill_enabled()?;
+        let flashmla_decode = dsv4_flashmla_decode_enabled()?;
+        let shared_kv_pool = dsv4_shared_kv_pool_enabled()?;
+        let incremental_kv = dsv4_incremental_kv_enabled()?;
+        let fallback_lane = if profile.requires_best_practice() {
+            "forbidden"
+        } else {
+            "allowed-debug-only"
+        };
+
+        log::info!(
+            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_reason=\"{}\" moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
+            profile.as_str(),
+            fallback_lane,
+            self.config.tp.rank,
+            self.config.tp.world_size,
+            self.config.ep.rank,
+            self.config.ep.world_size,
+            self.config.axes.summary(),
+            self.config.rank_coord,
+            kv_cache_dtype,
+            kv_pool_format,
+            cuda_graph_max_bs,
+            graph_support.supported(),
+            graph_support.mode_label(),
+            graph_support.reason,
+            moe_backend,
+            expert_backend,
+            flashmla_prefill,
+            flashmla_decode,
+            shared_kv_pool,
+            incremental_kv,
+        );
+
+        if !profile.requires_best_practice() {
+            return Ok(());
+        }
+
+        let mut missing = Vec::new();
+        if kv_pool_format != KVFormat::FP8E4M3 {
+            missing.push(format!(
+                "kv_pool_format must be FP8E4M3 for DSv4 best-practice FP8 KV, got {kv_pool_format:?}"
+            ));
+        }
+        if cuda_graph_max_bs == 0 {
+            missing.push("cuda_graph_max_bs must be > 0".to_string());
+        }
+        if !graph_support.supported() {
+            missing.push(format!(
+                "CUDA graph decode must be supported, got mode={} reason={}",
+                graph_support.mode_label(),
+                graph_support.reason
+            ));
+        }
+        if moe_backend != "native-deepep" {
+            missing.push(format!(
+                "ARLE_DSV4_MOE_BACKEND must be native-deepep for the current ARLE DeepEP target, got {moe_backend}"
+            ));
+        }
+        if expert_backend != "deepgemm" {
+            missing.push(format!(
+                "ARLE_DSV4_EXPERT_BACKEND must be deepgemm required mode, got {expert_backend}"
+            ));
+        }
+        if !flashmla_prefill {
+            missing.push("ARLE_DSV4_FLASHMLA_PREFILL must be enabled".to_string());
+        }
+        if !flashmla_decode {
+            missing.push("ARLE_DSV4_FLASHMLA_DECODE must be enabled".to_string());
+        }
+        if !shared_kv_pool {
+            missing.push(
+                "ARLE_DSV4_SHARED_KV_POOL=1 is required for persistent DSv4 FP8 KV".to_string(),
+            );
+        }
+        if !incremental_kv {
+            missing.push("ARLE_DSV4_INCREMENTAL_KV must be enabled".to_string());
+        }
+        missing.push(
+            "token-owned DP/EP request shards are not implemented in this executable route"
+                .to_string(),
+        );
+        missing.push(
+            "DSv4 graph-captured SWA/C4/C128 metadata replay is not implemented in this executable route"
+                .to_string(),
+        );
+
+        anyhow::bail!(
+            "DeepSeek V4 profile `{}` requested, but this binary is not on the SGLang best-practice path:\n - {}\nSet ARLE_DSV4_PERFORMANCE_PROFILE=debug-fallback only for correctness/debug runs.",
+            profile.as_str(),
+            missing.join("\n - ")
+        );
     }
 
     fn supports_prefill_warmup(&self) -> bool {
@@ -413,6 +522,20 @@ fn log_dsv4_sampler_topk(
         top
     );
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_moe_backend_label() -> Result<&'static str> {
+    let Some(raw) = std::env::var("ARLE_DSV4_MOE_BACKEND").ok() else {
+        return Ok("allreduce");
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off" => Ok("allreduce"),
+        "deepep" | "dispatch" | "dispatch_combine" | "deepep_unsafe" | "unsafe_deepep"
+        | "dispatch_unsafe" => Ok("deepep-style"),
+        "native-deepep" | "native_deepep" => Ok("native-deepep"),
+        other => anyhow::bail!("invalid ARLE_DSV4_MOE_BACKEND value `{other}`"),
+    }
 }
 
 #[cfg(feature = "cuda")]
