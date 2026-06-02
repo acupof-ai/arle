@@ -219,6 +219,13 @@ License gate: already killed as default by the 2026-06-02 depth sweep.
 
 ### P1 - Token-level greedy parity harness
 
+Status: partial landed on 2026-06-02. `metal_bench --mtp-parity` now runs the
+same tokenized prompt through baseline target decode and MTP decode, reports
+the generated token IDs, first divergence, timing, and MTP acceptance counters,
+and exits non-zero on mismatch. Block-internal draft-token and cache-cursor
+trace remains deferred behind an explicit diagnostic switch so the production
+path does not gain extra token materialization syncs.
+
 Add a local Metal harness that runs the same prompt through baseline target
 decode and MTP verify under `temperature=0`, then records:
 
