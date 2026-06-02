@@ -1,0 +1,2335 @@
+{
+  "generated_at": "2026-06-02T11:07:16+0800",
+  "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+  "shape": {
+    "endpoint": "/v1/chat/completions",
+    "stream": true,
+    "temperature": 0,
+    "max_tokens": 256,
+    "repeats": 5,
+    "rss": "process RSS sampled during each request; chart uses cumulative high-water by target length",
+    "note": "n=5; steady TPOT drops token1->token2 interval; RSS is cumulative process high-water; ARLE uses bounded 20 GiB SSD KV default"
+  },
+  "lens": [
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    12288
+  ],
+  "series": {
+    "arle": {
+      "label": "ARLE",
+      "port": 9071,
+      "log": "/tmp/2026-06-02-metal-ttft-tpot-n5-logs/arle.log",
+      "ready_rss_gib": 1.5113372802734375,
+      "warm_rss_gib": 9.839447021484375,
+      "final_rss_gib": 1.553924560546875,
+      "arle_cache_gib": 5.6426551807671785,
+      "rows": {
+        "128": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 3.3681588172912598,
+              "ttft_s": 0.2728729248046875,
+              "tpot_ms": 11.888617605674924,
+              "first_interval_ms": 75.26397705078125,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1516,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 32,
+                "rss_start_gib": 9.839447021484375,
+                "rss_peak_gib": 9.962265014648438,
+                "rss_end_gib": 9.962265014648438,
+                "system_used_peak_gib": 32.61944580078125
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 3.3513290882110596,
+              "ttft_s": 0.2718648910522461,
+              "tpot_ms": 11.838361972898948,
+              "first_interval_ms": 72.40700721740723,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1598,
+              "first_text": "The intersection intersection of large language model inference and low-level system optimization on Apple Silicon archi",
+              "rss": {
+                "n": 31,
+                "rss_start_gib": 9.962265014648438,
+                "rss_peak_gib": 10.105575561523438,
+                "rss_end_gib": 10.045059204101562,
+                "system_used_peak_gib": 32.4390869140625
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 3.3822381496429443,
+              "ttft_s": 0.2683751583099365,
+              "tpot_ms": 11.962357468492403,
+              "first_interval_ms": 75.34909248352051,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1507,
+              "first_text": "The intersection intersection of large language model inference and low-level system optimization on Apple Silicon prese",
+              "rss": {
+                "n": 32,
+                "rss_start_gib": 10.045059204101562,
+                "rss_peak_gib": 10.188247680664062,
+                "rss_end_gib": 10.188247680664062,
+                "system_used_peak_gib": 32.40191650390625
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 3.3785312175750732,
+              "ttft_s": 0.2669830322265625,
+              "tpot_ms": 11.945370614059328,
+              "first_interval_ms": 77.34394073486328,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1584,
+              "first_text": "The architectural architectural interplay between the Metal runtime scheduler and the underlying hardware abstraction la",
+              "rss": {
+                "n": 32,
+                "rss_start_gib": 10.188247680664062,
+                "rss_peak_gib": 10.309219360351562,
+                "rss_end_gib": 10.309219360351562,
+                "system_used_peak_gib": 32.126922607421875
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 3.3836781978607178,
+              "ttft_s": 0.2718989849090576,
+              "tpot_ms": 11.948559227890856,
+              "first_interval_ms": 76.57194137573242,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1595,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 32,
+                "rss_start_gib": 10.309219360351562,
+                "rss_peak_gib": 10.451309204101562,
+                "rss_end_gib": 10.451309204101562,
+                "system_used_peak_gib": 32.28363037109375
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 0.27039899826049807,
+              "std": 0.002563389663087298,
+              "min": 0.2669830322265625,
+              "max": 0.2728729248046875
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 11.916653377803291,
+              "std": 0.052074646984985255,
+              "min": 11.838361972898948,
+              "max": 11.962357468492403
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 10.203323364257812,
+              "std": 0.18748464993387481,
+              "min": 9.962265014648438,
+              "max": 10.451309204101562
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 10.191220092773438,
+              "std": 0.19708021297859457,
+              "min": 9.962265014648438,
+              "max": 10.451309204101562
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 32.374200439453126,
+              "std": 0.1833527921560389,
+              "min": 32.126922607421875,
+              "max": 32.61944580078125
+            }
+          }
+        },
+        "256": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 3.537371873855591,
+              "ttft_s": 0.4063119888305664,
+              "tpot_ms": 12.00303975052721,
+              "first_interval_ms": 82.16500282287598,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1558,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 33,
+                "rss_start_gib": 10.451309204101562,
+                "rss_peak_gib": 10.61260986328125,
+                "rss_end_gib": 10.61260986328125,
+                "system_used_peak_gib": 32.53477478027344
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 3.5585150718688965,
+              "ttft_s": 0.40932369232177734,
+              "tpot_ms": 12.091590663579506,
+              "first_interval_ms": 77.82125473022461,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1623,
+              "first_text": "The intersection intersection of large language model inference and specialized hardware acceleration represents one of ",
+              "rss": {
+                "n": 33,
+                "rss_start_gib": 10.61260986328125,
+                "rss_peak_gib": 10.764602661132812,
+                "rss_end_gib": 10.764602661132812,
+                "system_used_peak_gib": 32.56526184082031
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 3.5437140464782715,
+              "ttft_s": 0.4074249267578125,
+              "tpot_ms": 12.050126481243945,
+              "first_interval_ms": 75.48093795776367,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1512,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 33,
+                "rss_start_gib": 10.764602661132812,
+                "rss_peak_gib": 10.918655395507812,
+                "rss_end_gib": 10.918655395507812,
+                "system_used_peak_gib": 32.09454345703125
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 3.5070230960845947,
+              "ttft_s": 0.40877199172973633,
+              "tpot_ms": 11.892180743179923,
+              "first_interval_ms": 76.77388191223145,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1503,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 33,
+                "rss_start_gib": 10.918655395507812,
+                "rss_peak_gib": 11.077499389648438,
+                "rss_end_gib": 11.077499389648438,
+                "system_used_peak_gib": 32.43394470214844
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 3.488178014755249,
+              "ttft_s": 0.4007749557495117,
+              "tpot_ms": 11.83378320979321,
+              "first_interval_ms": 81.51912689208984,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1437,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 33,
+                "rss_start_gib": 11.077499389648438,
+                "rss_peak_gib": 11.236221313476562,
+                "rss_end_gib": 11.2362060546875,
+                "system_used_peak_gib": 32.486175537109375
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 0.40652151107788087,
+              "std": 0.003420520446251377,
+              "min": 0.4007749557495117,
+              "max": 0.40932369232177734
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 11.97414416966476,
+              "std": 0.10819097413411985,
+              "min": 11.83378320979321,
+              "max": 12.091590663579506
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 10.921917724609376,
+              "std": 0.2466892911834143,
+              "min": 10.61260986328125,
+              "max": 11.236221313476562
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 10.921914672851562,
+              "std": 0.24668443097418905,
+              "min": 10.61260986328125,
+              "max": 11.2362060546875
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 32.42294006347656,
+              "std": 0.19021478025509958,
+              "min": 32.09454345703125,
+              "max": 32.56526184082031
+            }
+          }
+        },
+        "512": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 3.813004970550537,
+              "ttft_s": 0.681891918182373,
+              "tpot_ms": 11.948645584226593,
+              "first_interval_ms": 96.08793258666992,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1556,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 35,
+                "rss_start_gib": 11.2362060546875,
+                "rss_peak_gib": 11.411773681640625,
+                "rss_end_gib": 11.411773681640625,
+                "system_used_peak_gib": 32.48286437988281
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 3.783737897872925,
+              "ttft_s": 0.6883687973022461,
+              "tpot_ms": 11.88080705056979,
+              "first_interval_ms": 77.54015922546387,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1564,
+              "first_text": "The intersection intersection of modern large language model architectures and specialized hardware execution environmen",
+              "rss": {
+                "n": 35,
+                "rss_start_gib": 11.411773681640625,
+                "rss_peak_gib": 11.5804443359375,
+                "rss_end_gib": 11.5804443359375,
+                "system_used_peak_gib": 32.34356689453125
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 3.79372501373291,
+              "ttft_s": 0.6807670593261719,
+              "tpot_ms": 11.891425125242218,
+              "first_interval_ms": 91.71295166015625,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1332,
+              "first_text": "The intersection intersection of large language model inference, specifically within the Quantized Mixture of Experts (M",
+              "rss": {
+                "n": 35,
+                "rss_start_gib": 11.5804443359375,
+                "rss_peak_gib": 11.749008178710938,
+                "rss_end_gib": 11.749008178710938,
+                "system_used_peak_gib": 32.50532531738281
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 3.8021020889282227,
+              "ttft_s": 0.6787919998168945,
+              "tpot_ms": 11.91951440075251,
+              "first_interval_ms": 95.65114974975586,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1456,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 35,
+                "rss_start_gib": 11.749008178710938,
+                "rss_peak_gib": 11.908721923828125,
+                "rss_end_gib": 11.908706665039062,
+                "system_used_peak_gib": 32.49305725097656
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 3.792820930480957,
+              "ttft_s": 0.6819939613342285,
+              "tpot_ms": 11.919050704775833,
+              "first_interval_ms": 82.95297622680664,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1504,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 35,
+                "rss_start_gib": 11.908706665039062,
+                "rss_peak_gib": 12.067916870117188,
+                "rss_end_gib": 12.067916870117188,
+                "system_used_peak_gib": 32.64131164550781
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 0.6823627471923828,
+              "std": 0.003596066513357316,
+              "min": 0.6787919998168945,
+              "max": 0.6883687973022461
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 11.911888573113389,
+              "std": 0.026670868871825345,
+              "min": 11.88080705056979,
+              "max": 11.948645584226593
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 11.743572998046876,
+              "std": 0.25942455694978284,
+              "min": 11.411773681640625,
+              "max": 12.067916870117188
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 11.743569946289062,
+              "std": 0.25942212860287395,
+              "min": 11.411773681640625,
+              "max": 12.067916870117188
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 32.49322509765625,
+              "std": 0.10557105590539088,
+              "min": 32.34356689453125,
+              "max": 32.64131164550781
+            }
+          }
+        },
+        "1024": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 4.457945823669434,
+              "ttft_s": 1.2288048267364502,
+              "tpot_ms": 12.109110674520178,
+              "first_interval_ms": 153.35607528686523,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1499,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 41,
+                "rss_start_gib": 12.067916870117188,
+                "rss_peak_gib": 12.262664794921875,
+                "rss_end_gib": 12.262664794921875,
+                "system_used_peak_gib": 32.8836669921875
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 4.486650228500366,
+              "ttft_s": 1.2406680583953857,
+              "tpot_ms": 12.094133482204647,
+              "first_interval_ms": 173.16913604736328,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1484,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 41,
+                "rss_start_gib": 12.262664794921875,
+                "rss_peak_gib": 12.441360473632812,
+                "rss_end_gib": 12.441360473632812,
+                "system_used_peak_gib": 32.95381164550781
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 4.531755208969116,
+              "ttft_s": 1.2506780624389648,
+              "tpot_ms": 12.169122695922852,
+              "first_interval_ms": 190.00887870788574,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1479,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 42,
+                "rss_start_gib": 12.441360473632812,
+                "rss_peak_gib": 12.6202392578125,
+                "rss_end_gib": 12.6202392578125,
+                "system_used_peak_gib": 32.96607971191406
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 4.579586029052734,
+              "ttft_s": 1.2813279628753662,
+              "tpot_ms": 12.342318775146966,
+              "first_interval_ms": 162.49895095825195,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1469,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 42,
+                "rss_start_gib": 12.6202392578125,
+                "rss_peak_gib": 12.799026489257812,
+                "rss_end_gib": 12.799026489257812,
+                "system_used_peak_gib": 33.14418029785156
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 4.527536153793335,
+              "ttft_s": 1.289639949798584,
+              "tpot_ms": 12.213114678390383,
+              "first_interval_ms": 135.67304611206055,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1490,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 41,
+                "rss_start_gib": 12.799026489257812,
+                "rss_peak_gib": 12.9779052734375,
+                "rss_end_gib": 12.9779052734375,
+                "system_used_peak_gib": 32.31884765625
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 1.2582237720489502,
+              "std": 0.02622687084291639,
+              "min": 1.2288048267364502,
+              "max": 1.289639949798584
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 12.185560061237005,
+              "std": 0.09975728842368374,
+              "min": 12.094133482204647,
+              "max": 12.342318775146966
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 12.6202392578125,
+              "std": 0.28273086531278496,
+              "min": 12.262664794921875,
+              "max": 12.9779052734375
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 12.6202392578125,
+              "std": 0.28273086531278496,
+              "min": 12.262664794921875,
+              "max": 12.9779052734375
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 32.85331726074219,
+              "std": 0.313844970664275,
+              "min": 32.31884765625,
+              "max": 33.14418029785156
+            }
+          }
+        },
+        "2048": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 5.9539337158203125,
+              "ttft_s": 2.520803928375244,
+              "tpot_ms": 12.387378009285515,
+              "first_interval_ms": 285.8459949493408,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1426,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 54,
+                "rss_start_gib": 12.9779052734375,
+                "rss_peak_gib": 13.155670166015625,
+                "rss_end_gib": 12.703231811523438,
+                "system_used_peak_gib": 33.28514099121094
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 6.415122032165527,
+              "ttft_s": 2.6036829948425293,
+              "tpot_ms": 13.22883039008914,
+              "first_interval_ms": 451.1761665344238,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1459,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 58,
+                "rss_start_gib": 12.703231811523438,
+                "rss_peak_gib": 12.703231811523438,
+                "rss_end_gib": 10.437179565429688,
+                "system_used_peak_gib": 32.160308837890625
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 6.358052968978882,
+              "ttft_s": 2.646799087524414,
+              "tpot_ms": 13.595850448908768,
+              "first_interval_ms": 257.1067810058594,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1509,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 57,
+                "rss_start_gib": 10.437179565429688,
+                "rss_peak_gib": 10.656143188476562,
+                "rss_end_gib": 9.786041259765625,
+                "system_used_peak_gib": 30.40399169921875
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 6.225894212722778,
+              "ttft_s": 2.787075996398926,
+              "tpot_ms": 12.423783775389664,
+              "first_interval_ms": 283.0390930175781,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1472,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 56,
+                "rss_start_gib": 9.786041259765625,
+                "rss_peak_gib": 9.996963500976562,
+                "rss_end_gib": 9.996963500976562,
+                "system_used_peak_gib": 33.0147705078125
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 5.9400718212127686,
+              "ttft_s": 2.5342681407928467,
+              "tpot_ms": 12.34252058614896,
+              "first_interval_ms": 270.7047462463379,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1468,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 53,
+                "rss_start_gib": 9.996963500976562,
+                "rss_peak_gib": 10.1212158203125,
+                "rss_end_gib": 10.121200561523438,
+                "system_used_peak_gib": 32.25457763671875
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 2.618526029586792,
+              "std": 0.10732867008300692,
+              "min": 2.520803928375244,
+              "max": 2.787075996398926
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 12.79567264196441,
+              "std": 0.5784165409402598,
+              "min": 12.34252058614896,
+              "max": 13.595850448908768
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 11.326644897460938,
+              "std": 1.4925656922663573,
+              "min": 9.996963500976562,
+              "max": 13.155670166015625
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 10.60892333984375,
+              "std": 1.1942704016670427,
+              "min": 9.786041259765625,
+              "max": 12.703231811523438
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 32.223757934570315,
+              "std": 1.1256953048212701,
+              "min": 30.40399169921875,
+              "max": 33.28514099121094
+            }
+          }
+        },
+        "4096": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 11.392143964767456,
+              "ttft_s": 7.951253890991211,
+              "tpot_ms": 12.556661771038385,
+              "first_interval_ms": 250.6880760192871,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1512,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 101,
+                "rss_start_gib": 10.121200561523438,
+                "rss_peak_gib": 10.123245239257812,
+                "rss_end_gib": 1.184356689453125,
+                "system_used_peak_gib": 32.09715270996094
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 9.404428958892822,
+              "ttft_s": 5.2003209590911865,
+              "tpot_ms": 15.968681320430726,
+              "first_interval_ms": 147.7210521697998,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1470,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 83,
+                "rss_start_gib": 1.184356689453125,
+                "rss_peak_gib": 1.2734222412109375,
+                "rss_end_gib": 0.7907867431640625,
+                "system_used_peak_gib": 31.87548828125
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 8.422656059265137,
+              "ttft_s": 5.130529165267944,
+              "tpot_ms": 12.35154294592189,
+              "first_interval_ms": 154.75988388061523,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1474,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 75,
+                "rss_start_gib": 0.7907867431640625,
+                "rss_peak_gib": 0.9952392578125,
+                "rss_end_gib": 0.9952392578125,
+                "system_used_peak_gib": 31.584381103515625
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 8.426893949508667,
+              "ttft_s": 5.127113103866577,
+              "tpot_ms": 12.38759483878068,
+              "first_interval_ms": 153.27787399291992,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1508,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 76,
+                "rss_start_gib": 0.9952392578125,
+                "rss_peak_gib": 1.165374755859375,
+                "rss_end_gib": 1.165374755859375,
+                "system_used_peak_gib": 31.958724975585938
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 8.37465214729309,
+              "ttft_s": 5.086134910583496,
+              "tpot_ms": 12.293318125206655,
+              "first_interval_ms": 165.89117050170898,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1526,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 74,
+                "rss_start_gib": 1.165374755859375,
+                "rss_peak_gib": 1.3526611328125,
+                "rss_end_gib": 1.3526611328125,
+                "system_used_peak_gib": 32.03889465332031
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 5.699070405960083,
+              "std": 1.2596771094488228,
+              "min": 5.086134910583496,
+              "max": 7.951253890991211
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 13.111559800275668,
+              "std": 1.6001816714812855,
+              "min": 12.293318125206655,
+              "max": 15.968681320430726
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 2.981988525390625,
+              "std": 3.994330738461293,
+              "min": 0.9952392578125,
+              "max": 10.123245239257812
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 1.0976837158203125,
+              "std": 0.21318324467346017,
+              "min": 0.7907867431640625,
+              "max": 1.3526611328125
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 31.910928344726564,
+              "std": 0.2007663487149061,
+              "min": 31.584381103515625,
+              "max": 32.09715270996094
+            }
+          }
+        },
+        "8192": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 14.073009967803955,
+              "ttft_s": 10.495466947555542,
+              "tpot_ms": 13.254157201511653,
+              "first_interval_ms": 210.94107627868652,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1530,
+              "first_text": "The intersection intersection of modern large language model architectures and specialized hardware execution environmen",
+              "rss": {
+                "n": 124,
+                "rss_start_gib": 1.3526611328125,
+                "rss_peak_gib": 1.762908935546875,
+                "rss_end_gib": 1.762908935546875,
+                "system_used_peak_gib": 33.8916015625
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 14.951457977294922,
+              "ttft_s": 11.366116046905518,
+              "tpot_ms": 13.194398617181252,
+              "first_interval_ms": 233.1106662750244,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1501,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 133,
+                "rss_start_gib": 1.762908935546875,
+                "rss_peak_gib": 1.7670135498046875,
+                "rss_end_gib": 1.2557373046875,
+                "system_used_peak_gib": 33.36444091796875
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 13.99163818359375,
+              "ttft_s": 10.255710124969482,
+              "tpot_ms": 13.883893884073093,
+              "first_interval_ms": 209.3658447265625,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1580,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 122,
+                "rss_start_gib": 1.2557373046875,
+                "rss_peak_gib": 1.5264892578125,
+                "rss_end_gib": 1.1989898681640625,
+                "system_used_peak_gib": 33.250457763671875
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 13.9876389503479,
+              "ttft_s": 10.451921939849854,
+              "tpot_ms": 13.11441293851597,
+              "first_interval_ms": 204.55598831176758,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1498,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 124,
+                "rss_start_gib": 1.1989898681640625,
+                "rss_peak_gib": 1.2377166748046875,
+                "rss_end_gib": 1.2377166748046875,
+                "system_used_peak_gib": 32.94645690917969
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 14.753671884536743,
+              "ttft_s": 11.152193069458008,
+              "tpot_ms": 13.477555410129817,
+              "first_interval_ms": 177.20508575439453,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1522,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 131,
+                "rss_start_gib": 1.2377166748046875,
+                "rss_peak_gib": 1.35833740234375,
+                "rss_end_gib": 1.35833740234375,
+                "system_used_peak_gib": 33.44258117675781
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 10.74428162574768,
+              "std": 0.4845500063567588,
+              "min": 10.255710124969482,
+              "max": 11.366116046905518
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 13.384883610282357,
+              "std": 0.309890152581623,
+              "min": 13.11441293851597,
+              "max": 13.883893884073093
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 1.5304931640625,
+              "std": 0.2373450515213358,
+              "min": 1.2377166748046875,
+              "max": 1.7670135498046875
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 1.362738037109375,
+              "std": 0.2313271893589773,
+              "min": 1.1989898681640625,
+              "max": 1.762908935546875
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 33.37910766601563,
+              "std": 0.3430129256900213,
+              "min": 32.94645690917969,
+              "max": 33.8916015625
+            }
+          }
+        },
+        "12288": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 20.47830104827881,
+              "ttft_s": 16.379224061965942,
+              "tpot_ms": 14.771771243238074,
+              "first_interval_ms": 346.09103202819824,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1506,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 178,
+                "rss_start_gib": 1.35833740234375,
+                "rss_peak_gib": 2.297119140625,
+                "rss_end_gib": 1.4973602294921875,
+                "system_used_peak_gib": 34.669403076171875
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 19.975893020629883,
+              "ttft_s": 15.757930994033813,
+              "tpot_ms": 15.118271347105972,
+              "first_interval_ms": 377.49719619750977,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1538,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 173,
+                "rss_start_gib": 1.4973602294921875,
+                "rss_peak_gib": 1.917327880859375,
+                "rss_end_gib": 0.7428436279296875,
+                "system_used_peak_gib": 33.6934814453125
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 25.168723344802856,
+              "ttft_s": 20.528847217559814,
+              "tpot_ms": 15.661038751677266,
+              "first_interval_ms": 661.0679626464844,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1529,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 222,
+                "rss_start_gib": 0.7428436279296875,
+                "rss_peak_gib": 1.1410064697265625,
+                "rss_end_gib": 0.789306640625,
+                "system_used_peak_gib": 31.3671875
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 20.163832902908325,
+              "ttft_s": 15.917927026748657,
+              "tpot_ms": 14.779869027025118,
+              "first_interval_ms": 490.88311195373535,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1514,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 180,
+                "rss_start_gib": 0.789306640625,
+                "rss_peak_gib": 1.133575439453125,
+                "rss_end_gib": 1.133575439453125,
+                "system_used_peak_gib": 33.14569091796875
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 19.43811821937561,
+              "ttft_s": 15.652052164077759,
+              "tpot_ms": 13.714977136747105,
+              "first_interval_ms": 302.3419380187988,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1600,
+              "first_text": "The optimization optimization of large language model inference on Apple Silicon architectures requires a granular under",
+              "rss": {
+                "n": 172,
+                "rss_start_gib": 1.133575439453125,
+                "rss_peak_gib": 1.553924560546875,
+                "rss_end_gib": 1.553924560546875,
+                "system_used_peak_gib": 34.78025817871094
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 16.847196292877197,
+              "std": 2.076774018096314,
+              "min": 15.652052164077759,
+              "max": 20.528847217559814
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 14.809185501158707,
+              "std": 0.7107635414966887,
+              "min": 13.714977136747105,
+              "max": 15.661038751677266
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 1.6085906982421876,
+              "std": 0.5041460496101342,
+              "min": 1.133575439453125,
+              "max": 2.297119140625
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 1.143402099609375,
+              "std": 0.38070405014980724,
+              "min": 0.7428436279296875,
+              "max": 1.553924560546875
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 33.53120422363281,
+              "std": 1.3886643939681889,
+              "min": 31.3671875,
+              "max": 34.78025817871094
+            }
+          }
+        }
+      }
+    },
+    "mlx_lm": {
+      "label": "mlx-lm",
+      "port": 9072,
+      "log": "/tmp/2026-06-02-metal-ttft-tpot-n5-logs/mlx_lm.log",
+      "ready_rss_gib": 15.110107421875,
+      "warm_rss_gib": 15.082763671875,
+      "final_rss_gib": 15.134521484375,
+      "arle_cache_gib": null,
+      "rows": {
+        "128": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 3.563102960586548,
+              "ttft_s": 0.44684600830078125,
+              "tpot_ms": 12.234897125424363,
+              "first_interval_ms": 8.543014526367188,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1565,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a profound understanding of t",
+              "rss": {
+                "n": 34,
+                "rss_start_gib": 15.082763671875,
+                "rss_peak_gib": 15.105636596679688,
+                "rss_end_gib": 15.105606079101562,
+                "system_used_peak_gib": 30.761062622070312
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 3.5263688564300537,
+              "ttft_s": 0.4419577121734619,
+              "tpot_ms": 12.107906379098967,
+              "first_interval_ms": 8.974075317382812,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1514,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a deep, systemic understandin",
+              "rss": {
+                "n": 33,
+                "rss_start_gib": 15.105606079101562,
+                "rss_peak_gib": 15.108779907226562,
+                "rss_end_gib": 15.108749389648438,
+                "system_used_peak_gib": 30.917221069335938
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 3.60693621635437,
+              "ttft_s": 0.4424011707305908,
+              "tpot_ms": 12.411444205937423,
+              "first_interval_ms": 11.999845504760742,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1536,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 34,
+                "rss_start_gib": 15.108749389648438,
+                "rss_peak_gib": 15.108840942382812,
+                "rss_end_gib": 15.108810424804688,
+                "system_used_peak_gib": 31.125869750976562
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 3.540375232696533,
+              "ttft_s": 0.4359161853790283,
+              "tpot_ms": 12.175747728723241,
+              "first_interval_ms": 11.783838272094727,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1498,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 33,
+                "rss_start_gib": 15.108810424804688,
+                "rss_peak_gib": 15.108840942382812,
+                "rss_end_gib": 15.108810424804688,
+                "system_used_peak_gib": 31.12554931640625
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 3.4706642627716064,
+              "ttft_s": 0.43013811111450195,
+              "tpot_ms": 12.012929197341677,
+              "first_interval_ms": 13.242959976196289,
+              "chunks": 254,
+              "usage": null,
+              "text_chars": 1321,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a deep, systemic understandin",
+              "rss": {
+                "n": 33,
+                "rss_start_gib": 15.108810424804688,
+                "rss_peak_gib": 15.108856201171875,
+                "rss_end_gib": 15.10882568359375,
+                "system_used_peak_gib": 31.359878540039062
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 0.4394518375396729,
+              "std": 0.00649803953742483,
+              "min": 0.43013811111450195,
+              "max": 0.44684600830078125
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 12.188584927305135,
+              "std": 0.14944884998237656,
+              "min": 12.012929197341677,
+              "max": 12.411444205937423
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 255.6,
+              "std": 0.8944271909999159,
+              "min": 254.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 15.10819091796875,
+              "std": 0.0014282096144904014,
+              "min": 15.105636596679688,
+              "max": 15.108856201171875
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 15.108160400390625,
+              "std": 0.0014282096144904014,
+              "min": 15.105606079101562,
+              "max": 15.10882568359375
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 31.057916259765626,
+              "std": 0.22819418531660093,
+              "min": 30.761062622070312,
+              "max": 31.359878540039062
+            }
+          }
+        },
+        "256": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 3.627678155899048,
+              "ttft_s": 0.5765371322631836,
+              "tpot_ms": 11.96502043506292,
+              "first_interval_ms": 11.999845504760742,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1515,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 34,
+                "rss_start_gib": 15.10882568359375,
+                "rss_peak_gib": 15.109039306640625,
+                "rss_end_gib": 15.1090087890625,
+                "system_used_peak_gib": 31.637176513671875
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 3.6195640563964844,
+              "ttft_s": 0.5788679122924805,
+              "tpot_ms": 11.924248042069083,
+              "first_interval_ms": 11.909246444702148,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1484,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 34,
+                "rss_start_gib": 15.1090087890625,
+                "rss_peak_gib": 15.10992431640625,
+                "rss_end_gib": 15.109878540039062,
+                "system_used_peak_gib": 31.36297607421875
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 3.586552858352661,
+              "ttft_s": 0.5622529983520508,
+              "tpot_ms": 11.891113491508904,
+              "first_interval_ms": 3.9310455322265625,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1462,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a deep, granular understandin",
+              "rss": {
+                "n": 34,
+                "rss_start_gib": 15.109878540039062,
+                "rss_peak_gib": 15.11083984375,
+                "rss_end_gib": 15.110809326171875,
+                "system_used_peak_gib": 31.66156005859375
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 3.6444029808044434,
+              "ttft_s": 0.5679056644439697,
+              "tpot_ms": 12.066460969879872,
+              "first_interval_ms": 11.584043502807617,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1479,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 34,
+                "rss_start_gib": 15.110809326171875,
+                "rss_peak_gib": 15.110885620117188,
+                "rss_end_gib": 15.110855102539062,
+                "system_used_peak_gib": 31.850326538085938
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 3.6763038635253906,
+              "ttft_s": 0.5616397857666016,
+              "tpot_ms": 12.214519846157765,
+              "first_interval_ms": 12.145042419433594,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1516,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 34,
+                "rss_start_gib": 15.110855102539062,
+                "rss_peak_gib": 15.110931396484375,
+                "rss_end_gib": 15.11090087890625,
+                "system_used_peak_gib": 31.987014770507812
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 0.5694406986236572,
+              "std": 0.007970340872391936,
+              "min": 0.5616397857666016,
+              "max": 0.5788679122924805
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 12.01227255693571,
+              "std": 0.13086342830328868,
+              "min": 11.891113491508904,
+              "max": 12.214519846157765
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 15.110324096679687,
+              "std": 0.0008307566394069928,
+              "min": 15.109039306640625,
+              "max": 15.110931396484375
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 15.11029052734375,
+              "std": 0.0008326183047948182,
+              "min": 15.1090087890625,
+              "max": 15.11090087890625
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 31.699810791015626,
+              "std": 0.23663522224147962,
+              "min": 31.36297607421875,
+              "max": 31.987014770507812
+            }
+          }
+        },
+        "512": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 3.919001817703247,
+              "ttft_s": 0.8473007678985596,
+              "tpot_ms": 12.046369041983537,
+              "first_interval_ms": 11.898279190063477,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1466,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 37,
+                "rss_start_gib": 15.11090087890625,
+                "rss_peak_gib": 15.111083984375,
+                "rss_end_gib": 15.111038208007812,
+                "system_used_peak_gib": 32.9248046875
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 4.120784759521484,
+              "ttft_s": 0.8325629234313965,
+              "tpot_ms": 12.8988074505423,
+              "first_interval_ms": 11.883974075317383,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1539,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 38,
+                "rss_start_gib": 15.111038208007812,
+                "rss_peak_gib": 15.111160278320312,
+                "rss_end_gib": 15.111129760742188,
+                "system_used_peak_gib": 32.979156494140625
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 4.009366989135742,
+              "ttft_s": 0.9120540618896484,
+              "tpot_ms": 12.140098519212618,
+              "first_interval_ms": 13.70382308959961,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1522,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 37,
+                "rss_start_gib": 15.111129760742188,
+                "rss_peak_gib": 15.111251831054688,
+                "rss_end_gib": 15.111221313476562,
+                "system_used_peak_gib": 34.4267578125
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 3.992039918899536,
+              "ttft_s": 0.8765780925750732,
+              "tpot_ms": 12.21817215596597,
+              "first_interval_ms": 12.014150619506836,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1483,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 37,
+                "rss_start_gib": 15.111221313476562,
+                "rss_peak_gib": 15.1131591796875,
+                "rss_end_gib": 15.113128662109375,
+                "system_used_peak_gib": 33.592926025390625
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 4.006222724914551,
+              "ttft_s": 0.8621957302093506,
+              "tpot_ms": 12.329543669392743,
+              "first_interval_ms": 12.287139892578125,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1500,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 38,
+                "rss_start_gib": 15.113128662109375,
+                "rss_peak_gib": 15.113265991210938,
+                "rss_end_gib": 15.113235473632812,
+                "system_used_peak_gib": 34.02362060546875
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 0.8661383152008056,
+              "std": 0.03047519008499685,
+              "min": 0.8325629234313965,
+              "max": 0.9120540618896484
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 12.326598167419434,
+              "std": 0.33634016306315534,
+              "min": 12.046369041983537,
+              "max": 12.8988074505423
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 15.111984252929688,
+              "std": 0.0011235173939772602,
+              "min": 15.111083984375,
+              "max": 15.113265991210938
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 15.11195068359375,
+              "std": 0.0011265906109523432,
+              "min": 15.111038208007812,
+              "max": 15.113235473632812
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 33.589453125,
+              "std": 0.6526507728013263,
+              "min": 32.9248046875,
+              "max": 34.4267578125
+            }
+          }
+        },
+        "1024": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 4.623491048812866,
+              "ttft_s": 1.3884658813476562,
+              "tpot_ms": 12.686658093309777,
+              "first_interval_ms": 12.588024139404297,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1461,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 43,
+                "rss_start_gib": 15.113235473632812,
+                "rss_peak_gib": 15.113662719726562,
+                "rss_end_gib": 15.113632202148438,
+                "system_used_peak_gib": 34.22837829589844
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 4.577639818191528,
+              "ttft_s": 1.3926918506622314,
+              "tpot_ms": 12.490149558059812,
+              "first_interval_ms": 12.421131134033203,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1540,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 42,
+                "rss_start_gib": 15.113632202148438,
+                "rss_peak_gib": 15.114166259765625,
+                "rss_end_gib": 15.1141357421875,
+                "system_used_peak_gib": 34.67552185058594
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 4.551207065582275,
+              "ttft_s": 1.3628380298614502,
+              "tpot_ms": 12.503153695834904,
+              "first_interval_ms": 12.542009353637695,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1516,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 42,
+                "rss_start_gib": 15.1141357421875,
+                "rss_peak_gib": 15.114273071289062,
+                "rss_end_gib": 15.1142578125,
+                "system_used_peak_gib": 34.40718078613281
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 4.607537269592285,
+              "ttft_s": 1.4007880687713623,
+              "tpot_ms": 12.577208008353166,
+              "first_interval_ms": 12.109994888305664,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1473,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 43,
+                "rss_start_gib": 15.1142578125,
+                "rss_peak_gib": 15.114303588867188,
+                "rss_end_gib": 15.114242553710938,
+                "system_used_peak_gib": 34.60115051269531
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 4.606184244155884,
+              "ttft_s": 1.4022130966186523,
+              "tpot_ms": 12.565625934150276,
+              "first_interval_ms": 12.274026870727539,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1556,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 43,
+                "rss_start_gib": 15.114242553710938,
+                "rss_peak_gib": 15.114334106445312,
+                "rss_end_gib": 15.114303588867188,
+                "system_used_peak_gib": 34.591278076171875
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 1.3893993854522706,
+              "std": 0.01589898321821363,
+              "min": 1.3628380298614502,
+              "max": 1.4022130966186523
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 12.564559057941587,
+              "std": 0.07806519835578231,
+              "min": 12.490149558059812,
+              "max": 12.686658093309777
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 15.11414794921875,
+              "std": 0.00027853037619884365,
+              "min": 15.113662719726562,
+              "max": 15.114334106445312
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 15.114114379882812,
+              "std": 0.0002764747733728439,
+              "min": 15.113632202148438,
+              "max": 15.114303588867188
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 34.500701904296875,
+              "std": 0.1814954040017439,
+              "min": 34.22837829589844,
+              "max": 34.67552185058594
+            }
+          }
+        },
+        "2048": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 5.95258903503418,
+              "ttft_s": 2.6593780517578125,
+              "tpot_ms": 12.91542447458102,
+              "first_interval_ms": 12.659072875976562,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1479,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 55,
+                "rss_start_gib": 15.114303588867188,
+                "rss_peak_gib": 15.115158081054688,
+                "rss_end_gib": 15.115066528320312,
+                "system_used_peak_gib": 35.21998596191406
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 6.02404522895813,
+              "ttft_s": 2.667386293411255,
+              "tpot_ms": 13.16731933533676,
+              "first_interval_ms": 12.132883071899414,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1531,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 55,
+                "rss_start_gib": 15.115066528320312,
+                "rss_peak_gib": 15.115432739257812,
+                "rss_end_gib": 15.11541748046875,
+                "system_used_peak_gib": 35.35435485839844
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 6.290099859237671,
+              "ttft_s": 2.7823948860168457,
+              "tpot_ms": 13.756176618140513,
+              "first_interval_ms": 13.604164123535156,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1542,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 57,
+                "rss_start_gib": 15.11541748046875,
+                "rss_peak_gib": 15.116104125976562,
+                "rss_end_gib": 15.115707397460938,
+                "system_used_peak_gib": 35.93266296386719
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 6.283151865005493,
+              "ttft_s": 2.7746517658233643,
+              "tpot_ms": 13.765723686518632,
+              "first_interval_ms": 11.976242065429688,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1529,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 57,
+                "rss_start_gib": 15.115707397460938,
+                "rss_peak_gib": 15.116073608398438,
+                "rss_end_gib": 15.116043090820312,
+                "system_used_peak_gib": 35.47676086425781
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 6.233391761779785,
+              "ttft_s": 2.7287509441375732,
+              "tpot_ms": 13.720831533116618,
+              "first_interval_ms": 19.508838653564453,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1571,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 57,
+                "rss_start_gib": 15.116043090820312,
+                "rss_peak_gib": 15.116531372070312,
+                "rss_end_gib": 15.116378784179688,
+                "system_used_peak_gib": 35.463287353515625
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 2.72251238822937,
+              "std": 0.057810419883822795,
+              "min": 2.6593780517578125,
+              "max": 2.7823948860168457
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 13.465095129538708,
+              "std": 0.39727676842714216,
+              "min": 12.91542447458102,
+              "max": 13.765723686518632
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 15.115859985351562,
+              "std": 0.0005547991626799879,
+              "min": 15.115158081054688,
+              "max": 15.116531372070312
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 15.11572265625,
+              "std": 0.0005140649575171819,
+              "min": 15.115066528320312,
+              "max": 15.116378784179688
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 35.489410400390625,
+              "std": 0.26839559741274044,
+              "min": 35.21998596191406,
+              "max": 35.93266296386719
+            }
+          }
+        },
+        "4096": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 8.53942084312439,
+              "ttft_s": 5.05667781829834,
+              "tpot_ms": 13.71092852867639,
+              "first_interval_ms": 13.843059539794922,
+              "chunks": 255,
+              "usage": null,
+              "text_chars": 1503,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures represents a complex intersection of h",
+              "rss": {
+                "n": 76,
+                "rss_start_gib": 15.116378784179688,
+                "rss_peak_gib": 15.117721557617188,
+                "rss_end_gib": 15.117691040039062,
+                "system_used_peak_gib": 35.601470947265625
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 9.082051038742065,
+              "ttft_s": 5.240082025527954,
+              "tpot_ms": 15.073488077779455,
+              "first_interval_ms": 13.26298713684082,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1537,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures represents a complex intersection of h",
+              "rss": {
+                "n": 81,
+                "rss_start_gib": 15.117691040039062,
+                "rss_peak_gib": 15.118316650390625,
+                "rss_end_gib": 15.118179321289062,
+                "system_used_peak_gib": 35.79850769042969
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 8.654231071472168,
+              "ttft_s": 5.1696882247924805,
+              "tpot_ms": 13.663338863943505,
+              "first_interval_ms": 14.028072357177734,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1562,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures represents a complex intersection of h",
+              "rss": {
+                "n": 77,
+                "rss_start_gib": 15.118179321289062,
+                "rss_peak_gib": 15.119125366210938,
+                "rss_end_gib": 15.119094848632812,
+                "system_used_peak_gib": 35.87895202636719
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 8.555240869522095,
+              "ttft_s": 5.148560047149658,
+              "tpot_ms": 13.358601434962956,
+              "first_interval_ms": 13.570070266723633,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1460,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 76,
+                "rss_start_gib": 15.119094848632812,
+                "rss_peak_gib": 15.119674682617188,
+                "rss_end_gib": 15.11956787109375,
+                "system_used_peak_gib": 35.63972473144531
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 8.547280073165894,
+              "ttft_s": 5.0952770709991455,
+              "tpot_ms": 13.50661431710551,
+              "first_interval_ms": 21.286964416503906,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1561,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures represents a complex intersection of h",
+              "rss": {
+                "n": 77,
+                "rss_start_gib": 15.11956787109375,
+                "rss_peak_gib": 15.120132446289062,
+                "rss_end_gib": 15.120101928710938,
+                "system_used_peak_gib": 36.15681457519531
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 5.142057037353515,
+              "std": 0.07052064637551621,
+              "min": 5.05667781829834,
+              "max": 5.240082025527954
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 13.862594244493563,
+              "std": 0.6909593932142545,
+              "min": 13.358601434962956,
+              "max": 15.073488077779455
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 255.8,
+              "std": 0.4472135954999579,
+              "min": 255.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 15.118994140625,
+              "std": 0.0009816513983867366,
+              "min": 15.117721557617188,
+              "max": 15.120132446289062
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 15.118927001953125,
+              "std": 0.0009881759557307237,
+              "min": 15.117691040039062,
+              "max": 15.120101928710938
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 35.815093994140625,
+              "std": 0.22221335115236066,
+              "min": 35.601470947265625,
+              "max": 36.15681457519531
+            }
+          }
+        },
+        "8192": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 14.090090990066528,
+              "ttft_s": 10.388221979141235,
+              "tpot_ms": 14.518507822292058,
+              "first_interval_ms": 14.137744903564453,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1471,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 123,
+                "rss_start_gib": 15.120101928710938,
+                "rss_peak_gib": 15.122451782226562,
+                "rss_end_gib": 15.1221923828125,
+                "system_used_peak_gib": 35.99725341796875
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 13.95664119720459,
+              "ttft_s": 10.361371278762817,
+              "tpot_ms": 14.097251291350117,
+              "first_interval_ms": 14.535903930664062,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1509,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 124,
+                "rss_start_gib": 15.1221923828125,
+                "rss_peak_gib": 15.123291015625,
+                "rss_end_gib": 15.123260498046875,
+                "system_used_peak_gib": 36.010650634765625
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 14.077290058135986,
+              "ttft_s": 10.522666931152344,
+              "tpot_ms": 13.941969458512434,
+              "first_interval_ms": 13.28587532043457,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1529,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 126,
+                "rss_start_gib": 15.123260498046875,
+                "rss_peak_gib": 15.124252319335938,
+                "rss_end_gib": 15.1241455078125,
+                "system_used_peak_gib": 38.0345458984375
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 13.600115060806274,
+              "ttft_s": 9.991532802581787,
+              "tpot_ms": 14.154751469769815,
+              "first_interval_ms": 13.250112533569336,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1465,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 120,
+                "rss_start_gib": 15.1241455078125,
+                "rss_peak_gib": 15.125289916992188,
+                "rss_end_gib": 15.125259399414062,
+                "system_used_peak_gib": 35.26515197753906
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 13.487936019897461,
+              "ttft_s": 10.06208610534668,
+              "tpot_ms": 13.434751765934502,
+              "first_interval_ms": 13.399839401245117,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1515,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 120,
+                "rss_start_gib": 15.125259399414062,
+                "rss_peak_gib": 15.126358032226562,
+                "rss_end_gib": 15.126205444335938,
+                "system_used_peak_gib": 35.135833740234375
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 10.265175819396973,
+              "std": 0.22738817530171793,
+              "min": 9.991532802581787,
+              "max": 10.522666931152344
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 14.029446361571786,
+              "std": 0.393952364396274,
+              "min": 13.434751765934502,
+              "max": 14.518507822292058
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 15.12432861328125,
+              "std": 0.0015530269275226478,
+              "min": 15.122451782226562,
+              "max": 15.126358032226562
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 15.124212646484375,
+              "std": 0.0015858353102698093,
+              "min": 15.1221923828125,
+              "max": 15.126205444335938
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 36.088687133789065,
+              "std": 1.1604908330870265,
+              "min": 35.135833740234375,
+              "max": 38.0345458984375
+            }
+          }
+        },
+        "12288": {
+          "samples": [
+            {
+              "repeat": 1,
+              "attempt": 1,
+              "elapsed_s": 19.58565402030945,
+              "ttft_s": 15.953856945037842,
+              "tpot_ms": 14.24300013564703,
+              "first_interval_ms": 14.039993286132812,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1523,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a deep, granular understandin",
+              "rss": {
+                "n": 171,
+                "rss_start_gib": 15.126205444335938,
+                "rss_peak_gib": 15.1290283203125,
+                "rss_end_gib": 15.128997802734375,
+                "system_used_peak_gib": 36.222503662109375
+              }
+            },
+            {
+              "repeat": 2,
+              "attempt": 1,
+              "elapsed_s": 19.21738290786743,
+              "ttft_s": 15.525020837783813,
+              "tpot_ms": 14.478838349890522,
+              "first_interval_ms": 14.703989028930664,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1498,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a deep, granular understandin",
+              "rss": {
+                "n": 167,
+                "rss_start_gib": 15.128997802734375,
+                "rss_peak_gib": 15.13116455078125,
+                "rss_end_gib": 15.131011962890625,
+                "system_used_peak_gib": 36.440460205078125
+              }
+            },
+            {
+              "repeat": 3,
+              "attempt": 1,
+              "elapsed_s": 20.320520162582397,
+              "ttft_s": 16.043076038360596,
+              "tpot_ms": 16.78189330213652,
+              "first_interval_ms": 14.792919158935547,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1508,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 177,
+                "rss_start_gib": 15.131011962890625,
+                "rss_peak_gib": 15.132171630859375,
+                "rss_end_gib": 15.13214111328125,
+                "system_used_peak_gib": 36.974822998046875
+              }
+            },
+            {
+              "repeat": 4,
+              "attempt": 1,
+              "elapsed_s": 20.38080596923828,
+              "ttft_s": 16.768194913864136,
+              "tpot_ms": 14.165227807412936,
+              "first_interval_ms": 14.617204666137695,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1508,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a granular understanding of t",
+              "rss": {
+                "n": 178,
+                "rss_start_gib": 15.13214111328125,
+                "rss_peak_gib": 15.133346557617188,
+                "rss_end_gib": 15.133255004882812,
+                "system_used_peak_gib": 37.18998718261719
+              }
+            },
+            {
+              "repeat": 5,
+              "attempt": 1,
+              "elapsed_s": 21.146307945251465,
+              "ttft_s": 17.11154317855835,
+              "tpot_ms": 15.823835463035763,
+              "first_interval_ms": 15.474796295166016,
+              "chunks": 256,
+              "usage": null,
+              "text_chars": 1516,
+              "first_text": "The optimization of large language model inference on Apple Silicon architectures requires a deep, granular understandin",
+              "rss": {
+                "n": 184,
+                "rss_start_gib": 15.133255004882812,
+                "rss_peak_gib": 15.134552001953125,
+                "rss_end_gib": 15.134521484375,
+                "system_used_peak_gib": 37.639617919921875
+              }
+            }
+          ],
+          "summary": {
+            "ttft_s": {
+              "n": 5,
+              "mean": 16.28033838272095,
+              "std": 0.6446498178265118,
+              "min": 15.525020837783813,
+              "max": 17.11154317855835
+            },
+            "tpot_ms": {
+              "n": 5,
+              "mean": 15.098559011624554,
+              "std": 1.1561554923737725,
+              "min": 14.165227807412936,
+              "max": 16.78189330213652
+            },
+            "chunks": {
+              "n": 5,
+              "mean": 256.0,
+              "std": 0.0,
+              "min": 256.0,
+              "max": 256.0
+            },
+            "rss_request_peak_gib": {
+              "n": 5,
+              "mean": 15.132052612304687,
+              "std": 0.0021136700207362506,
+              "min": 15.1290283203125,
+              "max": 15.134552001953125
+            },
+            "rss_end_gib": {
+              "n": 5,
+              "mean": 15.131985473632813,
+              "std": 0.0021178517619221786,
+              "min": 15.128997802734375,
+              "max": 15.134521484375
+            },
+            "system_used_peak_gib": {
+              "n": 5,
+              "mean": 36.89347839355469,
+              "std": 0.5715529653512977,
+              "min": 36.222503662109375,
+              "max": 37.639617919921875
+            }
+          }
+        }
+      }
+    }
+  }
+}
