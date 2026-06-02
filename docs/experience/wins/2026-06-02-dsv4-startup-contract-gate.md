@@ -38,6 +38,13 @@ serve on the replicated-token debug lane and still look like a performance run.
   default. Every `DistributedSchedulerGroup` caller now passes an explicit
   ownership mode; the new `token-owned-dp-ep` mode fails closed until real
   request sharding is implemented.
+- PC2 shard-contract follow-up adds scheduler-visible
+  `DistributedRequestShard` metadata to every `IncomingRequest` and
+  `ActiveRequest`. The current in-process and relay fanout now mark each rank
+  as `replicated-token rank=N/world_size`; normal single-rank requests mark
+  `single_rank()`. This does not implement token-owned DP/EP yet, but it
+  removes another hidden assumption that distributed requests are only an
+  unlabelled full-rank broadcast.
 - DeepGEMM is now the DSv4 runtime default expert backend, not
   `deepgemm-auto`. Missing or incompatible DeepGEMM now fails before serving
   unless the operator explicitly asks for `ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto`
@@ -80,6 +87,13 @@ serve on the replicated-token debug lane and still look like a performance run.
   target-pod/release-fast/infer` contains the new
   `native-deepep is reserved for the token-owned DP/EP request path` startup
   message and no old `ARLE_DSV4_NATIVE_DEEPEP_REPLICATED_TOKENS_UNSAFE` symbol.
+- PC2 shard-contract local gate: `cargo fmt --check`, `git diff --check`,
+  `cargo check -p infer --no-default-features --features no-cuda`,
+  `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`,
+  and `cargo test -p infer --no-default-features --features no-cuda request_handle -- --nocapture`
+  passed. The request-handle test set now includes
+  `distributed_group_marks_replicated_rank_shards`, which proves rank 0 and
+  rank 1 carry distinct replicated-token shard metadata.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.

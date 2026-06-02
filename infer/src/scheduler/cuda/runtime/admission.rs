@@ -628,6 +628,14 @@ impl<M: ModelForward> Scheduler<M> {
         };
         let id = self.next_id;
         self.next_id += 1;
+        let distributed_shard = incoming.distributed_shard;
+        if distributed_shard.is_distributed() {
+            info!(
+                "Request {} distributed shard: {}",
+                id,
+                distributed_shard.summary()
+            );
+        }
 
         if let Some(staged) = staged_prefix_plan.as_ref() {
             info!(
@@ -705,6 +713,7 @@ impl<M: ModelForward> Scheduler<M> {
             ingress_numa_node: incoming.ingress_numa_node,
             trace_context: incoming.trace_context,
             distributed: incoming.distributed,
+            distributed_shard,
             cancel: incoming.cancel,
             delta_tx: incoming.delta_tx,
             emit_cursor: super::super::request::EmitCursor::default(),

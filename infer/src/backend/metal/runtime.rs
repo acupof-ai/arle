@@ -4045,6 +4045,7 @@ mod tests {
             delta_tx,
             trace_context: None,
             distributed: None,
+            distributed_shard: crate::scheduler::DistributedRequestShard::single_rank(),
             cancel: None,
         };
 
