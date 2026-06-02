@@ -10,6 +10,7 @@ use super::forward::build_forward_graph;
 use super::gdr::MetalRecurrentState;
 use super::kv_pool::MetalKVPool;
 use super::mlx::{MlxArray, async_eval, concatenate_axis, eval, slice, take_axis, zeros};
+use super::mtp::{self, MetalMtpRuntime};
 use super::ops::{clear_metal_cache, clear_metal_cache_on_kv_boundary, extend_kv_cache};
 use super::qwen35::{
     CppQwen35Model, Qwen35MetalWeights, qwen35_dflash_supported, qwen35_forward_step,
@@ -923,6 +924,7 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
             && std::ptr::eq(self.config, driver.config)
             && std::ptr::eq(self.arch, driver.arch)
             && matches!(driver.mode, Qwen35StepMode::Cpp(_))
+            && driver.mtp.is_none()
     }
 
     fn ensure_capacity_for_states(
@@ -1238,8 +1240,13 @@ impl<'a> MetalRequestState<'a> {
         use_kv_pool: bool,
         max_new_tokens: usize,
         dflash_runtime: Option<(&'static MetalDflashRuntime, &'static MetalModelConfig)>,
+        mtp_runtime: Option<(&'static MetalMtpRuntime, &'static MetalModelConfig)>,
     ) -> Result<Self> {
         validate_metal_sampling_params(params)?;
+        ensure!(
+            dflash_runtime.is_none() || mtp_runtime.is_none(),
+            "Metal DFlash and MTP speculative runtimes are mutually exclusive"
+        );
 
         let inner = match weights {
             MetalWeights::Qwen3(weights) => {
@@ -1273,6 +1280,7 @@ impl<'a> MetalRequestState<'a> {
                     &prompt_tokens,
                     max_new_tokens,
                     dflash_runtime,
+                    mtp_runtime,
                 )?;
                 let state = ResumableRequestState::new(
                     driver,
@@ -1349,7 +1357,9 @@ impl<'a> MetalRequestState<'a> {
 
     pub(crate) fn can_import_qwen35_prefix_snapshot(&self) -> bool {
         match &self.inner {
-            MetalRequestStateInner::Qwen35(state) => state.driver.can_import_prefix_snapshot(),
+            MetalRequestStateInner::Qwen35(state) => {
+                state.driver.mtp.is_none() && state.driver.can_import_prefix_snapshot()
+            }
             MetalRequestStateInner::Qwen3(_) => false,
         }
     }
@@ -1596,6 +1606,13 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
+    pub(crate) fn is_mtp_enabled(&self) -> bool {
+        match &self.inner {
+            MetalRequestStateInner::Qwen3(_) => false,
+            MetalRequestStateInner::Qwen35(state) => state.driver.mtp.is_some(),
+        }
+    }
+
     /// DFlash aggregate acceptance metrics for this request.
     /// Returns `None` if DFlash is disabled or no speculative block executed.
     pub fn dflash_metrics(&self) -> Option<DflashRequestMetrics> {
@@ -1654,6 +1671,9 @@ impl<'a> MetalRequestState<'a> {
                     if qwen35.phase() != MetalRequestPhase::Decode {
                         return Ok(None);
                     }
+                    if qwen35.driver.mtp.is_some() {
+                        return Ok(None);
+                    }
                     qwen35_states.push(&mut **qwen35);
                 }
                 MetalRequestStateInner::Qwen3(_) => return Ok(None),
@@ -1678,6 +1698,7 @@ impl<'a> MetalRequestState<'a> {
                 MetalRequestStateInner::Qwen35(qwen35) => {
                     if qwen35.phase() != MetalRequestPhase::Decode
                         || !batch.matches_driver(&qwen35.driver)
+                        || qwen35.driver.mtp.is_some()
                     {
                         return Ok(None);
                     }
@@ -2390,6 +2411,9 @@ fn try_build_qwen35_packed_decode_batch<'a>(
 
     for state in states.iter_mut() {
         state.driver.ensure_cpp_session_drained()?;
+    }
+    if states.iter().any(|state| state.driver.mtp.is_some()) {
+        return Ok(None);
     }
 
     let first = &states[0].driver;
@@ -4323,6 +4347,20 @@ struct Qwen35DFlashState {
     acceptance_lengths: Vec<usize>,
 }
 
+/// Frozen-KV MTP speculative-decode state for Qwen3.6/Qwen3.5-MoE.
+///
+/// Unlike DFlash, this state intentionally owns no draft KV cache. The MTP
+/// draft layer reads the target C++ full-attention KV prefix and carries only a
+/// width-H recurrent seed hidden between draft steps. Target KV/GDR are mutated
+/// exclusively by the target verifier.
+struct Qwen35MtpState {
+    runtime: &'static MetalMtpRuntime,
+    config: &'static MetalModelConfig,
+    seed_hidden: Option<MlxArray>,
+    token_buffer: VecDeque<u32>,
+    acceptance_lengths: Vec<usize>,
+}
+
 struct Qwen35CppState {
     kv_flat: Vec<MlxArray>,
     gdr_flat: Vec<MlxArray>,
@@ -4382,6 +4420,8 @@ struct Qwen35StepDriver<'a> {
     mode: Qwen35StepMode,
     /// DFlash speculative decode state (None = standard decode).
     dflash: Option<Qwen35DFlashState>,
+    /// Frozen-KV MTP speculative decode state (None = standard decode).
+    mtp: Option<Qwen35MtpState>,
     /// Pre-queued sampled token (lazy MlxArray) from the step ahead.
     pending_sampled: Option<MlxArray>,
     /// M_e.1 P1 plumbing — placeholder for the paged-KV pool. Always
@@ -4402,6 +4442,7 @@ impl<'a> Qwen35StepDriver<'a> {
         prompt_tokens: &[u32],
         max_new_tokens: usize,
         dflash_runtime: Option<(&'static MetalDflashRuntime, &'static MetalModelConfig)>,
+        mtp_runtime: Option<(&'static MetalMtpRuntime, &'static MetalModelConfig)>,
     ) -> Result<Self> {
         let MetalModelArch::Qwen35(arch) = &config.arch else {
             bail!("Qwen3.5 request state requires a Qwen3.5 config");
@@ -4437,6 +4478,22 @@ impl<'a> Qwen35StepDriver<'a> {
             let s = v.to_string_lossy();
             matches!(s.as_ref(), "1" | "true" | "yes" | "on")
         });
+        let mtp_runtime = if force_rust {
+            if mtp_runtime.is_some() {
+                log::warn!("Metal MTP disabled because AGENT_INFER_QWEN35_FORCE_RUST is set");
+            }
+            None
+        } else {
+            mtp_runtime.filter(|_| {
+                let supported = weights.cpp_model.is_some() && weights.embedding.dense().is_some();
+                if !supported {
+                    log::warn!(
+                        "Metal MTP disabled: Qwen3.5/Qwen3.6 MTP requires C++ target state and dense target embeddings"
+                    );
+                }
+                supported
+            })
+        };
         let mode = if weights.cpp_model.is_some() && !force_rust {
             let kv_flat: Vec<MlxArray> = k_caches
                 .iter()
@@ -4485,6 +4542,17 @@ impl<'a> Qwen35StepDriver<'a> {
         } else {
             None
         };
+        let mtp = if let Some((runtime, mtp_config)) = mtp_runtime {
+            Some(Qwen35MtpState {
+                runtime,
+                config: mtp_config,
+                seed_hidden: None,
+                token_buffer: VecDeque::new(),
+                acceptance_lengths: Vec::new(),
+            })
+        } else {
+            None
+        };
 
         // M_e.1 P2.0 — when --kv-pool is on, also pre-allocate a
         // MetalKVPool sized to this request's lifetime token budget.
@@ -4493,7 +4561,7 @@ impl<'a> Qwen35StepDriver<'a> {
         // consumers in subsequent commits. DFlash disables the pool
         // for the same reason Qwen3StepDriver does (its target_state
         // owns KV directly).
-        let effective_kv_pool = use_kv_pool && dflash_runtime.is_none();
+        let effective_kv_pool = use_kv_pool && dflash_runtime.is_none() && mtp_runtime.is_none();
         let kv_pool = if effective_kv_pool {
             let n_layers = arch.num_full_attention_layers();
             let n_kv_heads = config.num_key_value_heads;
@@ -4521,6 +4589,7 @@ impl<'a> Qwen35StepDriver<'a> {
             cache_len: 0,
             mode,
             dflash,
+            mtp,
             pending_sampled: None,
             kv_pool,
         })
@@ -4553,6 +4622,31 @@ impl<'a> Qwen35StepDriver<'a> {
         if reset_prefetch {
             dflash.prefetched_draft = None;
         }
+        Ok(())
+    }
+
+    fn set_mtp_seed_hidden_from_cpp_outputs(
+        &mut self,
+        cpp_model_raw: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        let Some(mtp) = self.mtp.as_mut() else {
+            return Ok(());
+        };
+        let captured = super::qwen35::capture_qwen35_final_hidden_from_cpp_outputs(cpp_model_raw)?
+            .context("Qwen3.6 MTP prefill did not capture target final hidden")?;
+        let shape = captured.shape();
+        ensure!(
+            shape.len() == 2 && shape[0] > 0,
+            "Qwen3.6 MTP captured final hidden expected [S,H], got {shape:?}"
+        );
+        let hidden_width = shape[1];
+        let last = shape[0] - 1;
+        mtp.seed_hidden = Some(slice(
+            &captured,
+            &[last, 0],
+            &[last + 1, hidden_width],
+            &[1, 1],
+        ));
         Ok(())
     }
 
@@ -4896,6 +4990,21 @@ impl<'a> Qwen35StepDriver<'a> {
         (logits, target_hidden)
     }
 
+    fn run_standard_decode_with_mtp_seed_capture(&mut self, token: u32) -> Result<u32> {
+        let cpp_model_raw = self
+            .weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3.6 MTP seed capture requires C++ compiled model")?
+            .as_raw();
+        let logits = super::qwen35::with_qwen35_capture_final_hidden(cpp_model_raw, || {
+            self.run_step(token)
+        })?;
+        self.set_mtp_seed_hidden_from_cpp_outputs(cpp_model_raw)?;
+        let sampled = gpu_sample_token(&logits, &self.params);
+        Ok(sampled.item_i32() as u32)
+    }
+
     fn ensure_capacity(&mut self, needed_tokens: i32) -> Result<()> {
         while needed_tokens > self.kv_capacity {
             let new_cap = self.kv_capacity + KV_CACHE_CHUNK;
@@ -5048,9 +5157,11 @@ impl StepDriver for Qwen35StepDriver<'_> {
             return Ok(None);
         }
 
-        let capture_cpp_hidden =
+        let capture_cpp_dflash_hidden =
             self.dflash.is_some() && matches!(self.mode, Qwen35StepMode::Cpp(_));
-        let cpp_model_raw = if capture_cpp_hidden {
+        let capture_cpp_mtp_hidden =
+            self.mtp.is_some() && matches!(self.mode, Qwen35StepMode::Cpp(_));
+        let cpp_model_raw = if capture_cpp_dflash_hidden || capture_cpp_mtp_hidden {
             Some(
                 self.weights
                     .cpp_model
@@ -5061,7 +5172,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
         } else {
             None
         };
-        let capture_target_layer_ids = if capture_cpp_hidden {
+        let capture_target_layer_ids = if capture_cpp_dflash_hidden {
             self.dflash
                 .as_ref()
                 .map(|dflash| dflash.target_layer_ids.clone())
@@ -5074,11 +5185,15 @@ impl StepDriver for Qwen35StepDriver<'_> {
             super::qwen35::with_qwen35_capture_layers(raw, target_layer_ids, || {
                 self.run_step(token)
             })?
+        } else if let Some(raw) = cpp_model_raw.filter(|_| capture_cpp_mtp_hidden) {
+            super::qwen35::with_qwen35_capture_final_hidden(raw, || self.run_step(token))?
         } else {
             self.run_step(token)?
         };
-        if let Some(raw) = cpp_model_raw {
+        if let Some(raw) = cpp_model_raw.filter(|_| capture_cpp_dflash_hidden) {
             self.append_dflash_target_hidden_from_cpp_outputs(raw)?;
+        } else if let Some(raw) = cpp_model_raw.filter(|_| capture_cpp_mtp_hidden) {
+            self.set_mtp_seed_hidden_from_cpp_outputs(raw)?;
         }
         if terminal_prompt {
             let sampled = gpu_sample_token(&logits, &self.params);
@@ -5151,6 +5266,10 @@ impl StepDriver for Qwen35StepDriver<'_> {
                             )
                         },
                     )?
+                } else if self.mtp.is_some() {
+                    super::qwen35::with_qwen35_capture_final_hidden(cpp_model.as_raw(), || {
+                        cpp_model.prefill_session(&token_arr, tokens.len() as i32, self.cache_len)
+                    })?
                 } else {
                     cpp_model.prefill_session(&token_arr, tokens.len() as i32, self.cache_len)?
                 };
@@ -5170,6 +5289,8 @@ impl StepDriver for Qwen35StepDriver<'_> {
                         captured,
                     );
                     dflash.prefetched_draft = None;
+                } else if self.mtp.is_some() {
+                    self.set_mtp_seed_hidden_from_cpp_outputs(cpp_model.as_raw())?;
                 }
 
                 if terminal_prompt {
@@ -5243,7 +5364,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
     }
 
     fn decode_token(&mut self, token: u32) -> Result<u32> {
-        if self.dflash.is_some() {
+        if self.dflash.is_some() || self.mtp.is_some() {
             self.pending_sampled = None;
         }
 
@@ -5251,6 +5372,11 @@ impl StepDriver for Qwen35StepDriver<'_> {
         // 1. Drain buffer first — cheap, no GPU work, short-lived borrow.
         if let Some(dflash) = self.dflash.as_mut()
             && let Some(buffered) = dflash.token_buffer.pop_front()
+        {
+            return Ok(buffered);
+        }
+        if let Some(mtp) = self.mtp.as_mut()
+            && let Some(buffered) = mtp.token_buffer.pop_front()
         {
             return Ok(buffered);
         }
@@ -5262,9 +5388,14 @@ impl StepDriver for Qwen35StepDriver<'_> {
         //    cache_len + block_size exceeds kv_capacity the C++ verify_block
         //    produces a malformed slice_update and the forward dies with
         //    "Shapes (1,4,16,256) and (1,4,N,256) cannot be broadcast".
-        if let Some(block_size) = self.dflash.as_ref().map(|d| d.runtime.block_size()) {
+        let speculative_block_size = self
+            .dflash
+            .as_ref()
+            .map(|d| d.runtime.block_size())
+            .or_else(|| self.mtp.as_ref().map(|m| m.runtime.block_size()));
+        if let Some(block_size) = speculative_block_size {
             let block_size_i32 = i32::try_from(block_size)
-                .context("Qwen3.5/Qwen3.6 DFlash block_size does not fit i32")?;
+                .context("Qwen3.5/Qwen3.6 speculative block_size does not fit i32")?;
             let needed_cap = self.cache_len + block_size_i32;
             if needed_cap > self.kv_capacity {
                 self.ensure_capacity(needed_cap)?;
@@ -5319,6 +5450,56 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     .token_buffer
                     .pop_front()
                     .context("Qwen3.5/Qwen3.6 DFlash block produced zero tokens");
+            }
+            // Rust mode fallback: fall through to standard decode
+        }
+
+        // ── Frozen-KV MTP speculative path (Qwen3.6/Qwen3.5-MoE) ───────────
+        if self.mtp.is_some() {
+            let Some(seed_hidden) = self.mtp.as_mut().and_then(|mtp| mtp.seed_hidden.take()) else {
+                log::warn!("Qwen3.6 MTP seed hidden missing; running one standard target step");
+                return self.run_standard_decode_with_mtp_seed_capture(token);
+            };
+            if let Qwen35StepMode::Cpp(ref mut cpp_state) = self.mode {
+                let cpp_model = self
+                    .weights
+                    .cpp_model
+                    .as_ref()
+                    .context("Qwen3.6 MTP requires C++ compiled model")?;
+                cpp_state.ensure_caches_drained(cpp_model)?;
+                let mtp_state = self
+                    .mtp
+                    .as_mut()
+                    .context("Qwen3.6 MTP state disappeared during decode")?;
+                let block = mtp::qwen35_mtp_speculative_block(
+                    mtp_state.runtime,
+                    token,
+                    &seed_hidden,
+                    self.weights
+                        .embedding
+                        .dense()
+                        .context("Qwen3.6 MTP requires dense target embeddings")?,
+                    &self.weights.lm_head,
+                    mtp_state.config,
+                    cpp_model,
+                    &self.params,
+                    &mut cpp_state.kv_flat,
+                    &mut cpp_state.gdr_flat,
+                    &mut self.cache_len,
+                )?;
+
+                mtp_state.acceptance_lengths.push(block.accepted_inputs);
+                mtp_state.seed_hidden = Some(block.updated_seed_hidden);
+                for &t in &block.accepted_tokens {
+                    mtp_state.token_buffer.push_back(t);
+                }
+                return mtp_state
+                    .token_buffer
+                    .pop_front()
+                    .context("Qwen3.6 MTP block produced zero tokens");
+            }
+            if let Some(mtp) = self.mtp.as_mut() {
+                mtp.seed_hidden = Some(seed_hidden);
             }
             // Rust mode fallback: fall through to standard decode
         }
@@ -5390,6 +5571,26 @@ impl StepDriver for Qwen35StepDriver<'_> {
         self.pending_sampled = None;
         if let Some(dflash) = self.dflash.as_mut() {
             dflash.prefetched_draft = None;
+        }
+        if let Some(mtp) = self.mtp.as_ref()
+            && !mtp.acceptance_lengths.is_empty()
+        {
+            let total: usize = mtp.acceptance_lengths.iter().sum();
+            let matched_total: usize = mtp
+                .acceptance_lengths
+                .iter()
+                .map(|accepted| accepted.saturating_sub(1))
+                .sum();
+            let blocks = mtp.acceptance_lengths.len();
+            let avg = total as f64 / blocks as f64;
+            let drafted = mtp.runtime.block_size().saturating_sub(1).max(1);
+            log::info!(
+                "qwen35_mtp metrics: blocks={} block_size={} avg_accepted_inputs={:.2} acceptance_rate={:.3}",
+                blocks,
+                mtp.runtime.block_size(),
+                avg,
+                matched_total as f64 / (blocks * drafted) as f64,
+            );
         }
         self.ensure_cpp_session_drained()
     }
