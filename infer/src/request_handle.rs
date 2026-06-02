@@ -715,54 +715,113 @@ impl DistributedSchedulerGroup {
             return Err(SubmitError);
         };
         let owner_ranks = &self.token_owner_groups[group_idx];
-        if owner_ranks.len() > 1 {
-            log::error!(
-                "Distributed scheduler request ownership mode={} selected owner group {:?}, \
-                 but multiproc token-owned execution still lacks owner-group NCCL/token-sync \
-                 subgroup communicators. Refusing to run a partial SGLang path.",
-                self.request_ownership.as_str(),
-                owner_ranks,
-            );
-            return Err(SubmitError);
-        }
-
         let request_id = self
             .next_request_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let visible_rank = owner_ranks[0];
-        let shard = DistributedRequestShard::token_owned_dp_ep(0, 1, true);
-        if visible_rank < self.workers.len() {
-            let permit = selected_local_permits
-                .drain(..)
-                .find(|(permit_rank, _)| *permit_rank == visible_rank)
-                .map(|(_, permit)| permit)
-                .ok_or(SubmitError)?;
-            let mut rank_req = req;
-            rank_req.distributed_shard = shard;
-            rank_req.distributed = None;
-            permit.submit(rank_req).map_err(|_| SubmitError)?;
-            return Ok(());
+        let wire = Self::wire_request_from_incoming(&req, request_id);
+        let mut local_submissions = Vec::new();
+        let mut remote_envelopes = Vec::new();
+        let mut remote_visible = false;
+
+        for (group_rank, &global_rank) in owner_ranks.iter().enumerate() {
+            let emits_visible_output = group_rank == 0;
+            let shard = DistributedRequestShard::token_owned_dp_ep(
+                group_rank,
+                owner_ranks.len(),
+                emits_visible_output,
+            );
+            if global_rank < self.workers.len() {
+                let permit = selected_local_permits
+                    .drain(..)
+                    .find(|(permit_rank, _)| *permit_rank == global_rank)
+                    .map(|(_, permit)| permit)
+                    .ok_or(SubmitError)?;
+                let (delta_tx, delta_rx) = if emits_visible_output {
+                    (req.delta_tx.clone(), None)
+                } else {
+                    let (sink_tx, sink_rx) = tokio::sync::mpsc::unbounded_channel();
+                    (sink_tx, Some(sink_rx))
+                };
+                let rank_req = Self::incoming_request_from_wire(wire.clone(), delta_tx, shard);
+                #[cfg(feature = "nccl")]
+                let mut rank_req = rank_req;
+                #[cfg(feature = "nccl")]
+                if shard.world_size > 1 {
+                    let Some(nccl) = self.workers[global_rank].handle.request_token_sync_nccl()
+                    else {
+                        log::error!(
+                            "Distributed scheduler request ownership mode={} selected local owner group {:?}, but rank {} has no request token-sync NCCL group",
+                            self.request_ownership.as_str(),
+                            owner_ranks,
+                            global_rank,
+                        );
+                        return Err(SubmitError);
+                    };
+                    rank_req.distributed = Some(
+                        DistributedRequestCoordination::new_nccl(
+                            shard.rank,
+                            shard.world_size,
+                            nccl,
+                        )
+                        .map_err(|_| SubmitError)?,
+                    );
+                }
+                if let Some(sink_rx) = delta_rx {
+                    local_submissions.push((permit, rank_req, Some(sink_rx)));
+                } else {
+                    local_submissions.push((permit, rank_req, None));
+                }
+            } else {
+                remote_visible |= emits_visible_output;
+                remote_envelopes.push((
+                    global_rank,
+                    crate::multiproc_relay::RelayEnvelope::RequestOwned {
+                        wire: wire.clone(),
+                        shard_rank: shard.rank,
+                        shard_world_size: shard.world_size,
+                        emits_visible_output,
+                    },
+                ));
+            }
         }
 
-        let wire = Self::wire_request_from_incoming(&req, request_id);
-        let mut relay = self
-            .relay
-            .as_ref()
-            .ok_or(SubmitError)?
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        relay
-            .register_completion_sink(request_id, req.delta_tx.clone())
-            .map_err(|_| SubmitError)?;
-        let envelope = crate::multiproc_relay::RelayEnvelope::RequestOwned {
-            wire,
-            shard_rank: shard.rank,
-            shard_world_size: shard.world_size,
-            emits_visible_output: shard.emits_visible_output,
-        };
-        if relay.send_to_ranks(&[visible_rank], &envelope).is_err() {
-            relay.unregister_completion_sink(request_id);
-            return Err(SubmitError);
+        if !remote_envelopes.is_empty() {
+            let mut relay = self
+                .relay
+                .as_ref()
+                .ok_or(SubmitError)?
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if remote_visible {
+                relay
+                    .register_completion_sink(request_id, req.delta_tx.clone())
+                    .map_err(|_| SubmitError)?;
+            }
+            for (rank, envelope) in &remote_envelopes {
+                if relay.send_to_ranks(&[*rank], envelope).is_err() {
+                    if remote_visible {
+                        relay.unregister_completion_sink(request_id);
+                    }
+                    return Err(SubmitError);
+                }
+            }
+        }
+
+        for (permit, rank_req, sink_rx) in local_submissions {
+            if let Some(sink_rx) = sink_rx {
+                Self::spawn_rank_delta_drain(sink_rx);
+            }
+            if permit.submit(rank_req).is_err() {
+                if remote_visible {
+                    if let Some(relay) = self.relay.as_ref() {
+                        relay
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .unregister_completion_sink(request_id);
+                    }
+                }
+                return Err(SubmitError);
+            }
         }
         Ok(())
     }
@@ -834,13 +893,10 @@ impl RequestHandle for DistributedSchedulerGroup {
             permits.push(permit);
         }
 
-        // Phase B-1 commit C.4.3 — multiproc-serve relay path. When the
-        // relay is set, the local `self.workers` typically has only rank 0
-        // (the coordinator process's own scheduler); ranks 1..N-1 live in
-        // worker processes and receive the request via TCP broadcast.
-        // Their schedulers attach NCCL-backed
-        // DistributedRequestCoordination on ingest using their model's
-        // ep_nccl group; rank 0 does the same here for consistency.
+        // Multiproc replicated-token relay path. The local `self.workers`
+        // typically has only rank 0; ranks 1..N-1 live in worker processes.
+        // Every rank attaches the model's request token-sync NCCL group on
+        // ingest. This is a debug fallback lane, not the SGLang owner path.
         if let Some(relay) = self.relay.as_ref() {
             let request_id = self
                 .next_request_id
@@ -857,18 +913,12 @@ impl RequestHandle for DistributedSchedulerGroup {
                     .broadcast(&crate::multiproc_relay::RelayEnvelope::Request2 { wire })
                     .map_err(|_| SubmitError)?;
             }
-            // Phase B-1 commit C.4.6.3 — attach NCCL-backed
-            // DistributedRequestCoordination so rank 0's
-            // synchronize_token calls participate in NCCL broadcast_i32
-            // alongside worker ranks. The NcclGroup comes from the
-            // model's ep_nccl, exposed via SchedulerHandle::ep_nccl
-            // (populated by spawn_scheduler_handle_from_path in C.4.6.2).
             let mut rank0_req = req;
             rank0_req.distributed_shard =
                 DistributedRequestShard::replicated_token(0, self.effective_world_size);
             #[cfg(feature = "nccl")]
             {
-                if let Some(nccl) = self.workers[0].handle.ep_nccl() {
+                if let Some(nccl) = self.workers[0].handle.request_token_sync_nccl() {
                     rank0_req.distributed = Some(
                         DistributedRequestCoordination::new_nccl(
                             0,
@@ -1338,6 +1388,67 @@ mod tests {
         assert_eq!(
             client_rx.blocking_recv().unwrap().finish_reason,
             Some(crate::server_engine::FinishReason::Length)
+        );
+        worker_thread.join().unwrap();
+    }
+
+    #[test]
+    fn distributed_group_token_owned_relay_routes_multi_rank_owner_group() {
+        let world_size = 2;
+        let pending = crate::multiproc_relay::RelayCoordinator::bind().unwrap();
+        let coord_addr: std::net::SocketAddr =
+            format!("127.0.0.1:{}", pending.port()).parse().unwrap();
+
+        let worker_thread = std::thread::spawn(move || {
+            let mut worker = crate::multiproc_relay::RelayWorker::connect_with_rank(
+                coord_addr,
+                std::time::Duration::from_secs(5),
+                1,
+                world_size,
+            )
+            .unwrap();
+            let env = worker.recv().unwrap().expect("owner follower request");
+            match env {
+                crate::multiproc_relay::RelayEnvelope::RequestOwned {
+                    wire,
+                    shard_rank,
+                    shard_world_size,
+                    emits_visible_output,
+                } => {
+                    assert_eq!(wire.prompt, "local-and-remote-owner");
+                    assert_eq!(shard_rank, 1);
+                    assert_eq!(shard_world_size, 2);
+                    assert!(!emits_visible_output);
+                }
+                other => panic!("expected RequestOwned, got {other:?}"),
+            }
+        });
+
+        let coord = pending
+            .accept(world_size, std::time::Duration::from_secs(5))
+            .expect("worker connected within 5s");
+        let relay = Arc::new(Mutex::new(coord));
+        let (tx0, mut rx0) = mpsc::unbounded_channel();
+        let group = DistributedSchedulerGroup::with_relay_token_owner_groups(
+            vec![NumaSchedulerWorker {
+                handle: SchedulerHandle::from_parts(tx0, "model"),
+                placement: placement(0, 0),
+            }],
+            crate::metrics::ServerMetrics::new("model"),
+            relay,
+            world_size,
+            vec![vec![0, 1]],
+        );
+
+        group
+            .submit(labeled_test_request("local-and-remote-owner"))
+            .unwrap();
+
+        let local_req = rx0.try_recv().unwrap();
+        assert_eq!(local_req.prompt, "local-and-remote-owner");
+        assert_eq!(
+            local_req.distributed_shard,
+            DistributedRequestShard::token_owned_dp_ep(0, 2, true)
         );
         worker_thread.join().unwrap();
     }
