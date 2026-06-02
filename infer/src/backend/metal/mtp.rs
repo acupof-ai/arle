@@ -6,6 +6,8 @@ use std::{
 
 use anyhow::{Context, Result};
 
+use crate::gguf::GgufFile;
+
 const SAFETENSORS_HEADER_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const MTP_EXAMPLE_LIMIT: usize = 8;
 
@@ -38,7 +40,7 @@ impl MetalMtpOptions {
 pub enum MetalMtpTensorSource {
     SafetensorsIndex(PathBuf),
     SafetensorsHeader,
-    GgufUnsupported,
+    Gguf,
     NotFound,
 }
 
@@ -63,13 +65,12 @@ impl MetalMtpProbe {
     }
 }
 
-pub(super) fn probe_mtp_tensors(model_root: &Path, is_gguf: bool) -> Result<MetalMtpProbe> {
-    if is_gguf {
-        return Ok(MetalMtpProbe {
-            tensor_count: 0,
-            examples: Vec::new(),
-            source: MetalMtpTensorSource::GgufUnsupported,
-        });
+pub(super) fn probe_mtp_tensors(
+    model_root: &Path,
+    gguf: Option<&GgufFile>,
+) -> Result<MetalMtpProbe> {
+    if let Some(gguf) = gguf {
+        return Ok(probe_gguf(gguf));
     }
 
     if let Some(probe) = probe_safetensors_index(model_root)? {
@@ -84,6 +85,27 @@ pub(super) fn probe_mtp_tensors(model_root: &Path, is_gguf: bool) -> Result<Meta
         all_matches,
         MetalMtpTensorSource::SafetensorsHeader,
     ))
+}
+
+fn probe_gguf(gguf: &GgufFile) -> MetalMtpProbe {
+    let mut matches = Vec::new();
+    for (key, value) in &gguf.metadata {
+        if is_mtp_metadata_key(key)
+            && value
+                .as_u32()
+                .or_else(|| value.as_str().and_then(|raw| raw.parse::<u32>().ok()))
+                .is_some_and(|n| n > 0)
+        {
+            matches.push(format!("{key}={}", value_label(key, value)));
+        }
+    }
+    matches.extend(
+        gguf.tensors
+            .keys()
+            .filter(|name| is_mtp_tensor_name(name))
+            .cloned(),
+    );
+    probe_from_matches(matches, MetalMtpTensorSource::Gguf)
 }
 
 fn probe_safetensors_index(model_root: &Path) -> Result<Option<MetalMtpProbe>> {
@@ -191,6 +213,25 @@ fn is_mtp_tensor_name(name: &str) -> bool {
         || lower.contains(".mtp.")
         || lower.contains("nextn")
         || lower.contains("next_n")
+        || lower.contains(".eh_proj.")
+        || lower.contains(".enorm.")
+        || lower.contains(".hnorm.")
+}
+
+fn is_mtp_metadata_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.ends_with(".nextn_predict_layers")
+        || lower.contains("nextn_predict_layers")
+        || lower.contains("next_n_predict_layers")
+        || lower.contains("mtp_num_hidden_layers")
+}
+
+fn value_label(key: &str, value: &crate::gguf::GgufValue) -> String {
+    value
+        .as_u32()
+        .map(|v| v.to_string())
+        .or_else(|| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("{key}:present"))
 }
 
 #[cfg(test)]
@@ -206,7 +247,7 @@ mod tests {
         )
         .expect("write index");
 
-        let probe = probe_mtp_tensors(dir.path(), false).expect("probe");
+        let probe = probe_mtp_tensors(dir.path(), None).expect("probe");
         assert_eq!(probe.tensor_count, 3);
         assert_eq!(
             probe.examples,
@@ -225,16 +266,74 @@ mod tests {
     #[test]
     fn explicit_no_index_no_shards_is_not_found() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let probe = probe_mtp_tensors(dir.path(), false).expect("probe");
+        let probe = probe_mtp_tensors(dir.path(), None).expect("probe");
         assert_eq!(probe.tensor_count, 0);
         assert_eq!(probe.source, MetalMtpTensorSource::NotFound);
     }
 
     #[test]
-    fn gguf_is_reported_as_unsupported_probe_surface() {
+    fn detects_mtp_from_gguf_metadata_and_tensor_names() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let probe = probe_mtp_tensors(dir.path(), true).expect("probe");
+        let gguf_path = dir.path().join("mtp.gguf");
+        write_minimal_gguf(
+            &gguf_path,
+            &[("qwen35.nextn_predict_layers", 2)],
+            &[
+                "blk.48.nextn.eh_proj.weight",
+                "blk.48.nextn.enorm.weight",
+                "blk.48.attn_q.weight",
+            ],
+        );
+        let gguf = GgufFile::open(gguf_path.to_str().expect("path")).expect("gguf");
+
+        let probe = probe_mtp_tensors(dir.path(), Some(&gguf)).expect("probe");
+        assert_eq!(probe.tensor_count, 3);
+        assert_eq!(
+            probe.examples,
+            vec![
+                "blk.48.nextn.eh_proj.weight".to_string(),
+                "blk.48.nextn.enorm.weight".to_string(),
+                "qwen35.nextn_predict_layers=2".to_string(),
+            ]
+        );
+        assert_eq!(probe.source, MetalMtpTensorSource::Gguf);
+    }
+
+    #[test]
+    fn gguf_without_mtp_signals_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gguf_path = dir.path().join("plain.gguf");
+        write_minimal_gguf(&gguf_path, &[("qwen35.nextn_predict_layers", 0)], &[]);
+        let gguf = GgufFile::open(gguf_path.to_str().expect("path")).expect("gguf");
+
+        let probe = probe_mtp_tensors(dir.path(), Some(&gguf)).expect("probe");
         assert_eq!(probe.tensor_count, 0);
-        assert_eq!(probe.source, MetalMtpTensorSource::GgufUnsupported);
+        assert_eq!(probe.source, MetalMtpTensorSource::NotFound);
+    }
+
+    fn write_minimal_gguf(path: &Path, metadata: &[(&str, u32)], tensors: &[&str]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        for (key, value) in metadata {
+            push_string(&mut bytes, key);
+            bytes.extend_from_slice(&4u32.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for tensor in tensors {
+            push_string(&mut bytes, tensor);
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+        }
+        std::fs::write(path, bytes).expect("write gguf");
+    }
+
+    fn push_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
     }
 }

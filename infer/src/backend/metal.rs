@@ -627,12 +627,6 @@ impl MetalRuntimeLimits {
 #[cfg(feature = "metal")]
 fn log_mtp_probe_result(options: &MetalMtpOptions, probe: &MetalMtpProbe) {
     match (&options.mode, &probe.source) {
-        (_, MetalMtpTensorSource::GgufUnsupported) => {
-            log::warn!(
-                "Metal MTP {} requested for GGUF weights, but GGUF MTP tensor introspection is not wired yet; falling back to standard Metal decode",
-                mtp_mode_label(options.mode)
-            );
-        }
         (MetalMtpMode::Auto, _) if !probe.has_tensors() => {
             log::info!(
                 "Metal MTP auto: no mtp/nextn tensors detected; using standard Metal decode"
@@ -645,7 +639,7 @@ fn log_mtp_probe_result(options: &MetalMtpOptions, probe: &MetalMtpProbe) {
         }
         (_, _) => {
             log::warn!(
-                "Metal MTP {} found {} tensor(s) [{}], but native MTP draft/verify is not implemented yet; using standard Metal decode",
+                "Metal MTP {} found {} MTP signal(s) [{}], but native MTP draft/verify is not implemented yet; using standard Metal decode",
                 mtp_mode_label(options.mode),
                 probe.tensor_count,
                 probe.examples_label()
@@ -749,7 +743,7 @@ impl InferenceBackend for MetalBackend {
         };
         #[cfg(feature = "metal")]
         if let Some(options) = &self.mtp_options {
-            let probe = mtp::probe_mtp_tensors(source.model_root(), gguf.is_some())?;
+            let probe = mtp::probe_mtp_tensors(source.model_root(), gguf)?;
             log_mtp_probe_result(options, &probe);
             self.mtp_probe = Some(probe);
         }
