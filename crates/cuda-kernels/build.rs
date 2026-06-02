@@ -1484,6 +1484,24 @@ fn emit_cuda_system_link_libs(cuda_path: &str) {
     }
 }
 
+fn emit_prebuilt_deepep_sidecar(path: &Path) {
+    if !path.is_file() {
+        panic!(
+            "ARLE_DEEPEP_SIDECAR_PREBUILT={} is not a file",
+            path.display()
+        );
+    }
+    println!("cargo:rerun-if-changed={}", path.display());
+    println!(
+        "cargo:rustc-env=ARLE_DEEPEP_SIDECAR_PATH={}",
+        path.display()
+    );
+    println!(
+        "cargo:warning=Using prebuilt ARLE DeepEP sidecar at {}.",
+        path.display()
+    );
+}
+
 fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
     println!("cargo:rerun-if-changed=build.rs");
     let required = ["libkernels_cuda.a", "libtilelang_kernels_aot.a"];
@@ -1501,6 +1519,14 @@ fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=static=tilelang_kernels_aot");
     emit_cuda_system_link_libs(cuda_path);
+    if let Some(sidecar) = env_nonempty("ARLE_DEEPEP_SIDECAR_PREBUILT") {
+        emit_prebuilt_deepep_sidecar(Path::new(&sidecar));
+    } else {
+        let sidecar = prebuilt_dir.join("arle_deepep_sidecar");
+        if sidecar.is_file() {
+            emit_prebuilt_deepep_sidecar(&sidecar);
+        }
+    }
     println!(
         "cargo:warning=Using prebuilt CUDA kernel artifacts from {}; skipping nvcc and TileLang AOT.",
         prebuilt_dir.display()
@@ -1550,6 +1576,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_KERNELS_PREBUILT_DIR");
+    println!("cargo:rerun-if-env-changed=ARLE_DEEPEP_SIDECAR_PREBUILT");
     if let Some(prebuilt_dir) = env_nonempty("ARLE_CUDA_KERNELS_PREBUILT_DIR") {
         link_prebuilt_cuda_artifacts(Path::new(&prebuilt_dir), &cuda_path);
         return;
@@ -1836,7 +1863,14 @@ fn main() {
         );
     }
 
-    build_deepep_sidecar(&cuda_path, &nvcc, &out_dir, &sm_targets);
+    build_deepep_sidecar(
+        &cuda_path,
+        &nvcc,
+        &out_dir,
+        &sm_targets,
+        nvcc_wrapper.as_deref(),
+        nvcc_split_compile.as_deref(),
+    );
 
     // Recursive watch — `rerun-if-changed=csrc/` alone only watches the
     // immediate dir entries; subdirectory `.cu`/`.cuh`/`.h` edits would be
@@ -1857,7 +1891,19 @@ fn main() {
 ///
 /// Output: `$OUT_DIR/arle_deepep_sidecar`. The path is published via
 /// `cargo:rustc-env=ARLE_DEEPEP_SIDECAR_PATH=<path>` for runtime discovery.
-fn build_deepep_sidecar(cuda_path: &str, nvcc: &str, out_dir: &Path, sm_targets: &[SmSpec]) {
+fn build_deepep_sidecar(
+    cuda_path: &str,
+    nvcc: &str,
+    out_dir: &Path,
+    sm_targets: &[SmSpec],
+    nvcc_wrapper: Option<&str>,
+    nvcc_split_compile: Option<&str>,
+) {
+    if let Some(sidecar) = env_nonempty("ARLE_DEEPEP_SIDECAR_PREBUILT") {
+        emit_prebuilt_deepep_sidecar(Path::new(&sidecar));
+        return;
+    }
+
     let Ok(deepep_dir) = std::env::var("ARLE_DEEPEP_DIR") else {
         println!(
             "cargo:warning=ARLE_DEEPEP_DIR unset — skipping arle_deepep_sidecar build (set to the deepseek-ai/DeepEP source tree to enable native-deepep backend)."
@@ -1893,7 +1939,7 @@ fn build_deepep_sidecar(cuda_path: &str, nvcc: &str, out_dir: &Path, sm_targets:
     let sidecar_main = csrc.join("sidecar_main.cpp");
     let sidecar_bin = out_dir.join("arle_deepep_sidecar");
 
-    let mut cmd = Command::new(nvcc);
+    let mut cmd = tool_command(nvcc, nvcc_wrapper);
     cmd.arg("-ccbin")
         .arg("g++")
         .arg("-std=c++17")
@@ -1905,6 +1951,9 @@ fn build_deepep_sidecar(cuda_path: &str, nvcc: &str, out_dir: &Path, sm_targets:
         .arg(deepep_root.join("csrc"))
         .arg("-I")
         .arg(&csrc);
+    if let Some(split_compile) = nvcc_split_compile {
+        cmd.arg(format!("--split-compile={split_compile}"));
+    }
     for a in &sidecar_archs {
         cmd.arg(a);
     }

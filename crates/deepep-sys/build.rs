@@ -10,9 +10,33 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn tool_command(tool: &str, wrapper: Option<&str>) -> Command {
+    if let Some(wrapper) = wrapper {
+        let mut parts = wrapper.split_whitespace();
+        let program = parts
+            .next()
+            .expect("ARLE_NVCC_WRAPPER was filtered to non-empty");
+        let mut command = Command::new(program);
+        command.args(parts);
+        command.arg(tool);
+        command
+    } else {
+        Command::new(tool)
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=ARLE_DEEPEP_DIR");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=ARLE_NVCC_WRAPPER");
+    println!("cargo:rerun-if-env-changed=ARLE_NVCC_SPLIT_COMPILE");
     println!("cargo:rerun-if-changed=csrc/deepep_buffer.cpp");
     println!("cargo:rerun-if-changed=csrc/deepep_buffer.hpp");
     println!("cargo:rerun-if-changed=build.rs");
@@ -57,6 +81,8 @@ fn main() {
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let archive = out_dir.join("libarle_deepep.a");
+    let nvcc_wrapper = env_nonempty("ARLE_NVCC_WRAPPER");
+    let nvcc_split_compile = env_nonempty("ARLE_NVCC_SPLIT_COMPILE");
 
     // SM90 only — DSv4 SLO target H100/H20. Other SMs would need TMA-
     // disabled variants of the DeepEP kernels.
@@ -82,7 +108,7 @@ fn main() {
     let mut objs = Vec::with_capacity(sources.len());
     for (src, name) in sources {
         let obj = out_dir.join(name);
-        let mut cmd = Command::new(&nvcc);
+        let mut cmd = tool_command(&nvcc, nvcc_wrapper.as_deref());
         cmd.arg("-ccbin")
             .arg("g++")
             .arg("-std=c++17")
@@ -90,6 +116,9 @@ fn main() {
             .arg("-DDISABLE_NVSHMEM")
             .arg("--expt-relaxed-constexpr")
             .arg("--expt-extended-lambda");
+        if let Some(split_compile) = nvcc_split_compile.as_deref() {
+            cmd.arg(format!("--split-compile={split_compile}"));
+        }
         if is_legacy_layout {
             cmd.arg("-DARLE_DEEPEP_LEGACY_LAYOUT=1");
         }
