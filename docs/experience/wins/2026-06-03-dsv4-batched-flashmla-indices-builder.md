@@ -17,9 +17,17 @@ Added a batched `b = N` DSv4 FlashMLA decode indices builder:
 - `dsv4_flashmla_decode_build_indices_batched_raw`
 
 The kernel reads `start_pos[b]` from device memory and writes
-`indices[b, topk_unified]` plus `topk_length[b]` in one launch. Live slot ids are
-offset by `row * total_blocks * page_block_size`, matching FlashMLA's absolute
-slot addressing over a single contiguous shared FP8 KV arena.
+`indices[b, topk_unified]` plus `topk_length[b]` in one launch. The ABI was
+corrected to also consume `slot_layer_block_offsets[b]`: live slot ids are
+offset by the actual scheduler slot/layer block offset, not by row order. This
+matches ARLE's shared FP8 KV layout, where active rows are not guaranteed to be
+contiguous in slot order.
+
+The DSv4 shared FP8 KV pool allocation also now uses `PagedKVPool::num_slots`
+instead of the decode batch capacity. Normal scheduler decode already passes
+all state slots, but temporary speculative verifier contexts can be sized to
+`requests.len()`; using the real KV pool slot count prevents EAGLE verifier
+contexts from binding a high slot id into an undersized shared FP8 arena.
 
 The startup contract message was also corrected: `start_pos` has a device-buffer
 path now; the remaining attention blocker is the per-row loop with host-selected
@@ -27,14 +35,30 @@ per-slot/per-layer cache planning.
 
 ## Verification
 
-Pending remote CUDA build and symbol check.
+Remote verification before the slot-offset ABI correction, on
+`/data01/build/arle` at commit `75403573`:
 
-Local checks planned:
+- release-fast CUDA build passed in 6m58s and harvested a fresh DSv4 prebuilt
+  archive.
+- `libkernels_cuda.a` exported
+  `arle_dsv4_flashmla_decode_build_indices_batched_cuda`.
+- TP8 + EAGLE SGLang-best-practice startup still failed closed, as expected, on
+  remaining full-graph blockers.
+
+Artifacts:
+
+- `/tmp/dsv4_batched_indices_20260603/build.log`
+- `/tmp/dsv4_batched_indices_20260603/startup_tp8_eagle.log`
+
+Local checks after the slot-offset ABI correction:
 
 - `cargo fmt --check`
 - `cargo check -p infer --no-default-features --features no-cuda`
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,nccl,no-cuda`
 - `git diff --check`
+
+Pending: rebuild the corrected ABI on the remote pod and rerun the startup
+fail-closed probe.
 
 ## Rule
 

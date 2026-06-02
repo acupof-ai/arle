@@ -41,6 +41,11 @@
 //   pool_slot = sw_blocks * page_block_size + r
 //             ∈ [sw_blocks * 64, (sw_blocks + comp_blocks) * 64)
 //
+// Batched decode uses the same local per-(slot, layer) coords, then adds
+// `slot_layer_block_offsets[row] * page_block_size` so indices address the
+// real shared FP8 arena layout. Active scheduler rows are not assumed to occupy
+// contiguous slot/layer regions.
+//
 // Refs:
 //   crates/cuda-kernels/csrc/misc/arle_flashmla_csa_prep.cu (prefill twin)
 //   crates/cuda-kernels/csrc/misc/arle_flashmla_decode_shim.cu (consumer)
@@ -168,6 +173,7 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel(
 __global__ void arle_dsv4_flashmla_decode_build_indices_batched_kernel(
         int32_t* __restrict__ indices,
         const int32_t* __restrict__ start_pos,
+        const int32_t* __restrict__ slot_layer_block_offsets,
         const int32_t* __restrict__ selected,
         int32_t* __restrict__ topk_length,
         int b,
@@ -194,7 +200,12 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_batched_kernel(
         tid, selected_row, sw_blocks, sliding_window, start_pos[row],
         max_compressed_keys, compress_ratio, mode_int, page_block_size);
     if (out >= 0) {
-        out += row * total_blocks * page_block_size;
+        const int block_offset = slot_layer_block_offsets[row];
+        if (block_offset < 0 || block_offset >= total_blocks) {
+            out = -1;
+        } else {
+            out += block_offset * page_block_size;
+        }
     }
     indices[static_cast<int64_t>(row) * topk_unified + tid] = out;
 }
@@ -285,6 +296,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
 cudaError_t arle_dsv4_flashmla_decode_build_indices_batched_cuda(
         int32_t* indices,
         const int32_t* start_pos,
+        const int32_t* slot_layer_block_offsets,
         const int32_t* selected,
         int32_t* topk_length,
         int b,
@@ -296,7 +308,8 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_batched_cuda(
         int page_block_size,
         int total_blocks,
         cudaStream_t stream) {
-    if (indices == nullptr || start_pos == nullptr || topk_length == nullptr) {
+    if (indices == nullptr || start_pos == nullptr || slot_layer_block_offsets == nullptr ||
+        topk_length == nullptr) {
         return cudaErrorInvalidValue;
     }
     if (b <= 0 || sliding_window <= 0) return cudaErrorInvalidValue;
@@ -313,9 +326,9 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_batched_cuda(
     constexpr int kBlock = 128;
     dim3 grid((topk_unified + kBlock - 1) / kBlock, static_cast<unsigned>(b), 1);
     arle_dsv4_flashmla_decode_build_indices_batched_kernel<<<grid, kBlock, 0, stream>>>(
-        indices, start_pos, selected, topk_length, b, sw_blocks, sliding_window,
-        max_compressed_keys, compress_ratio, mode_int, page_block_size, total_blocks,
-        topk_unified);
+        indices, start_pos, slot_layer_block_offsets, selected, topk_length, b, sw_blocks,
+        sliding_window, max_compressed_keys, compress_ratio, mode_int, page_block_size,
+        total_blocks, topk_unified);
     return cudaGetLastError();
 }
 

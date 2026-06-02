@@ -123,7 +123,7 @@ impl ModelForward for DeepseekModel {
             let (sw_blocks, comp_blocks) = self.dsv4_flashmla_pool_slot_blocks(max_seq_len);
             ctx.ensure_fp8_kv_pool(
                 &self.ctx,
-                max_batch_size,
+                pool.num_slots,
                 self.loaded_layer_count(),
                 sw_blocks + comp_blocks,
             )?;
