@@ -25,6 +25,11 @@ serve on the replicated-token debug lane and still look like a performance run.
   performance profile and lets the model/scheduler contract own fail-fast
   behavior, so `ARLE_DSV4_PERFORMANCE_PROFILE=sglang`,
   `ARLE_DSV4_HIGH_PERF=1`, and the old alias cannot drift apart.
+- PC1 follow-up initializes DSv4 thread-local `ParallelState` during both
+  model load and scheduler execution when a distributed DSv4 rank is
+  configured. Startup now prints the SGLang-style TP, attention TP/DP/CP, and
+  MoE EP/DP/TP rank groups. No fake NCCL subgroup is attached; unsupported
+  subgroup execution still fails closed.
 
 ## Verification
 
