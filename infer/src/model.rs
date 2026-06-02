@@ -855,6 +855,20 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         CudaGraphDecodeSupport::full()
     }
 
+    /// Model-specific startup contract that depends on scheduler-owned knobs.
+    ///
+    /// The default is a no-op. Models with strict high-performance contracts
+    /// can fail before slot/materialized-state allocation rather than silently
+    /// serving on a debug fallback path.
+    fn validate_scheduler_contract(
+        &self,
+        _kv_cache_dtype: kv_cache::KVCacheDtype,
+        _kv_pool_format: KVFormat,
+        _cuda_graph_max_bs: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether batched decode for this model can be replayed via a captured
     /// CUDA Graph. Scheduler skips graph warmup/capture when this is false.
     fn supports_cuda_graph_decode(&self) -> bool {

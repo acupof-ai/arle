@@ -103,6 +103,12 @@ impl<M: ModelForward> Scheduler<M> {
         let effective_prefill_token_budget = config.max_prefill_tokens;
         let effective_mixed_prefill_token_budget = config.mixed_prefill_workspace_token_budget();
 
+        model.validate_scheduler_contract(
+            kv_cache_dtype,
+            kv_pool_format,
+            config.cuda_graph_max_bs,
+        )?;
+
         // When the model writes prefill K/V directly to the paged pool, the
         // per-slot contiguous scratch buffer is unused by prefill. Shrink it
         // to the minimum that single-token decode / INT8 working buffers
