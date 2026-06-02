@@ -197,6 +197,10 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub(crate) no_cuda_graph: bool,
 
+    /// Maximum CUDA decode batch size to pre-capture for graph replay.
+    #[arg(long)]
+    pub(crate) cuda_graph_max_bs: Option<usize>,
+
     /// Disable built-in shell/python tools for the local agent runtime.
     #[arg(long, default_value_t = false)]
     pub(crate) no_tools: bool,

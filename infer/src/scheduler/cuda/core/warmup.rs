@@ -32,10 +32,11 @@ impl<M: ModelForward> Scheduler<M> {
         let graph_support = self.model.cuda_graph_decode_support();
         let graph_capture_enabled = graph_support.supported();
         let decode_warmup_enabled = self.model.supports_decode_warmup();
-        // Warm only batch sizes that can map to real scheduler slots. The
-        // admission cap may be larger than a test/runtime slot count, but
-        // decode warmup indexes slot-local state and paged-KV metadata.
-        let max_bs = num_slots.min(256);
+        // Warm only batch sizes that can map to real scheduler slots and the
+        // operator-requested graph cache cap. The admission cap may be larger
+        // than a test/runtime slot count, but decode warmup indexes slot-local
+        // state and paged-KV metadata.
+        let max_bs = num_slots.min(self.config.cuda_graph_max_bs);
         let warmup_sizes = Self::cuda_graph_batch_sizes(max_bs);
 
         info!(

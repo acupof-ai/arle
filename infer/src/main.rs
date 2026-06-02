@@ -50,6 +50,10 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     cuda_graph: bool,
 
+    /// Maximum decode batch size to pre-capture for CUDA Graph replay.
+    #[arg(long, default_value_t = 256)]
+    cuda_graph_max_bs: usize,
+
     /// SGLang-compatible alias for `--cuda-graph=false`.
     #[arg(long)]
     disable_cuda_graph: bool,
@@ -2269,6 +2273,7 @@ fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig 
         schedule_policy,
         mixed_policy,
         stream_interval: args.stream_interval,
+        cuda_graph_max_bs: args.cuda_graph_max_bs,
         spec_enabled: args.spec_enabled,
         spec_draft_k: args.spec_draft_k,
         spec_acceptance_threshold: args.spec_acceptance_threshold,
