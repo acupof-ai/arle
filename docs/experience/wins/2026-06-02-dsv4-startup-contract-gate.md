@@ -45,6 +45,13 @@ serve on the replicated-token debug lane and still look like a performance run.
   `single_rank()`. This does not implement token-owned DP/EP yet, but it
   removes another hidden assumption that distributed requests are only an
   unlabelled full-rank broadcast.
+- PC2 owner-group follow-up starts deleting the wrong request topology instead
+  of tuning it. `DistributedSchedulerGroup` now has explicit SGLang-style token
+  owner groups for `token-owned-dp-ep`: one owner group is selected per request,
+  only ranks in that group receive the request, and ranks in other DP groups do
+  not see the logical request. Relay mode still fails closed because the current
+  relay can only broadcast to all workers; targeted DP-owner relay is a
+  required follow-up before this can be used by multiprocess DSv4 serving.
 - DeepGEMM is now the DSv4 runtime default expert backend, not
   `deepgemm-auto`. Missing or incompatible DeepGEMM now fails before serving
   unless the operator explicitly asks for `ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto`
@@ -101,6 +108,14 @@ serve on the replicated-token debug lane and still look like a performance run.
   `cargo test -p infer --lib --no-default-features --features cuda,nccl request_handle -- --nocapture`
   passed 10/10, including both the fail-closed token-owned mode test and the
   replicated-token rank-shard metadata test.
+- PC2 owner-group local gate: `cargo fmt --check`, `git diff --check`,
+  `cargo test -p infer --no-default-features --features no-cuda request_handle -- --nocapture`,
+  `cargo check -p infer --no-default-features --features no-cuda`, and
+  `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
+  passed. The request-handle test set now includes
+  `distributed_group_token_owned_routes_to_one_owner_group`, which proves two
+  owner groups route two logical requests to separate rank groups without
+  enqueueing the requests on non-owner ranks.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.

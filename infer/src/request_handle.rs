@@ -117,6 +117,13 @@ pub struct DistributedSchedulerGroup {
     /// `effective_world_size()`.
     effective_world_size: usize,
     request_ownership: DistributedRequestOwnership,
+    /// SGLang-style DP owner groups for token-owned request routing.
+    ///
+    /// Each group contains local scheduler indices that should receive the
+    /// request together. The controller selects one group per request; ranks in
+    /// other groups must not see that logical request.
+    token_owner_groups: Vec<Vec<usize>>,
+    next_token_owner_group: std::sync::atomic::AtomicUsize,
     /// Monotonic request ID for relay envelope tagging.
     next_request_id: std::sync::atomic::AtomicU64,
 }
@@ -250,7 +257,7 @@ impl DistributedSchedulerGroup {
         let tokenizer = workers[0].handle.tokenizer_clone();
         let effective_world_size = workers.len();
         log::info!(
-            "Distributed scheduler request ownership: mode={} local_workers={} effective_world_size={} relay=false",
+            "Distributed scheduler request ownership: mode={} local_workers={} effective_world_size={} relay=false token_owner_groups=0",
             request_ownership.as_str(),
             workers.len(),
             effective_world_size,
@@ -264,6 +271,44 @@ impl DistributedSchedulerGroup {
             relay: None,
             effective_world_size,
             request_ownership,
+            token_owner_groups: Vec::new(),
+            next_token_owner_group: std::sync::atomic::AtomicUsize::new(0),
+            next_request_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    pub fn with_token_owner_groups(
+        workers: Vec<NumaSchedulerWorker>,
+        metrics: crate::metrics::ServerMetrics,
+        token_owner_groups: Vec<Vec<usize>>,
+    ) -> Self {
+        assert!(
+            !workers.is_empty(),
+            "distributed scheduler group requires at least one worker"
+        );
+        let token_owner_groups =
+            Self::validate_token_owner_groups(token_owner_groups, workers.len());
+        let model_id = Arc::from(workers[0].handle.model_id());
+        let tokenizer = workers[0].handle.tokenizer_clone();
+        let effective_world_size = workers.len();
+        log::info!(
+            "Distributed scheduler request ownership: mode={} local_workers={} effective_world_size={} relay=false token_owner_groups={}",
+            DistributedRequestOwnership::TokenOwnedDpEp.as_str(),
+            workers.len(),
+            effective_world_size,
+            token_owner_groups.len(),
+        );
+        Self {
+            workers,
+            model_id,
+            tokenizer,
+            metrics,
+            submission_lock: Mutex::new(()),
+            relay: None,
+            effective_world_size,
+            request_ownership: DistributedRequestOwnership::TokenOwnedDpEp,
+            token_owner_groups,
+            next_token_owner_group: std::sync::atomic::AtomicUsize::new(0),
             next_request_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -293,7 +338,7 @@ impl DistributedSchedulerGroup {
         let model_id = Arc::from(workers[0].handle.model_id());
         let tokenizer = workers[0].handle.tokenizer_clone();
         log::info!(
-            "Distributed scheduler request ownership: mode={} local_workers={} effective_world_size={} relay=true",
+            "Distributed scheduler request ownership: mode={} local_workers={} effective_world_size={} relay=true token_owner_groups=0",
             request_ownership.as_str(),
             workers.len(),
             effective_world_size,
@@ -307,6 +352,8 @@ impl DistributedSchedulerGroup {
             relay: Some(relay),
             effective_world_size,
             request_ownership,
+            token_owner_groups: Vec::new(),
+            next_token_owner_group: std::sync::atomic::AtomicUsize::new(0),
             next_request_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -333,6 +380,34 @@ impl DistributedSchedulerGroup {
             distributed_shard,
             cancel: req.cancel.clone(),
         }
+    }
+
+    fn validate_token_owner_groups(
+        token_owner_groups: Vec<Vec<usize>>,
+        worker_count: usize,
+    ) -> Vec<Vec<usize>> {
+        assert!(
+            !token_owner_groups.is_empty(),
+            "token-owned DP/EP routing requires at least one owner group"
+        );
+        for (group_idx, group) in token_owner_groups.iter().enumerate() {
+            assert!(
+                !group.is_empty(),
+                "token-owned owner group {group_idx} cannot be empty"
+            );
+            let mut seen = std::collections::BTreeSet::new();
+            for &rank in group {
+                assert!(
+                    rank < worker_count,
+                    "token-owned owner group {group_idx} rank {rank} out of range for local worker count {worker_count}"
+                );
+                assert!(
+                    seen.insert(rank),
+                    "token-owned owner group {group_idx} contains duplicate rank {rank}"
+                );
+            }
+        }
+        token_owner_groups
     }
 
     /// Phase B-1 commit C.4.3 — translate an `IncomingRequest` into a
@@ -379,6 +454,10 @@ impl DistributedSchedulerGroup {
 
     pub fn request_ownership(&self) -> DistributedRequestOwnership {
         self.request_ownership
+    }
+
+    pub fn token_owner_group_count(&self) -> usize {
+        self.token_owner_groups.len()
     }
 
     /// Phase B-1 commit C.4.4 — worker-side inverse of
@@ -441,6 +520,121 @@ impl DistributedSchedulerGroup {
                 }
             });
     }
+
+    fn token_owner_group_order(&self) -> Result<Vec<usize>, SubmitError> {
+        if self.token_owner_groups.is_empty() {
+            log::error!(
+                "Distributed scheduler request ownership mode={} is selected, but no token owner groups were configured",
+                self.request_ownership.as_str()
+            );
+            return Err(SubmitError);
+        }
+        let len = self.token_owner_groups.len();
+        let start = self
+            .next_token_owner_group
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % len;
+        let mut candidates = (0..len)
+            .map(|offset| {
+                let group_idx = (start + offset) % len;
+                let waiting = self.token_owner_groups[group_idx]
+                    .iter()
+                    .map(|&rank| self.workers[rank].handle.waiting_count())
+                    .sum::<usize>();
+                (waiting, offset, group_idx)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        Ok(candidates
+            .into_iter()
+            .map(|(_, _, group_idx)| group_idx)
+            .collect())
+    }
+
+    fn submit_token_owned_in_process(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+        if self.relay.is_some() {
+            log::error!(
+                "Distributed scheduler request ownership mode={} requires targeted DP-owner relay, but current relay only supports broadcast-all",
+                self.request_ownership.as_str()
+            );
+            return Err(SubmitError);
+        }
+
+        let _submission_guard = self
+            .submission_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut selected_group = None;
+        let mut selected_permits = None;
+        for group_idx in self.token_owner_group_order()? {
+            let owner_ranks = &self.token_owner_groups[group_idx];
+            let mut permits = Vec::with_capacity(owner_ranks.len());
+            let mut reserve_failed = false;
+            for &rank in owner_ranks {
+                match self.workers[rank].handle.reserve_submission() {
+                    Ok(permit) => permits.push((rank, permit)),
+                    Err(_) => {
+                        reserve_failed = true;
+                        break;
+                    }
+                }
+            }
+            if reserve_failed {
+                continue;
+            }
+            selected_group = Some(group_idx);
+            selected_permits = Some(permits);
+            break;
+        }
+
+        let Some(group_idx) = selected_group else {
+            return Err(SubmitError);
+        };
+        let mut permits = selected_permits.ok_or(SubmitError)?;
+        let owner_ranks = &self.token_owner_groups[group_idx];
+        let coordinator = if owner_ranks.len() > 1 {
+            Some(DistributedTokenCoordinator::new(owner_ranks.len()).map_err(|_| SubmitError)?)
+        } else {
+            None
+        };
+        let mut requests = Vec::with_capacity(owner_ranks.len());
+        let first_global_rank = owner_ranks[0];
+        let first_shard = DistributedRequestShard::token_owned_dp_ep(0, owner_ranks.len(), true);
+        let mut owner_req = req;
+        owner_req.distributed_shard = first_shard;
+        if let Some(coordinator) = coordinator.as_ref() {
+            owner_req.distributed = Some(
+                DistributedRequestCoordination::new(0, Arc::clone(coordinator))
+                    .map_err(|_| SubmitError)?,
+            );
+        } else {
+            owner_req.distributed = None;
+        }
+        requests.push((first_global_rank, owner_req));
+
+        for (group_rank, &global_rank) in owner_ranks.iter().enumerate().skip(1) {
+            let shard =
+                DistributedRequestShard::token_owned_dp_ep(group_rank, owner_ranks.len(), false);
+            let (sink_tx, sink_rx) = tokio::sync::mpsc::unbounded_channel();
+            let distributed = DistributedRequestCoordination::new(
+                group_rank,
+                Arc::clone(coordinator.as_ref().ok_or(SubmitError)?),
+            )
+            .map_err(|_| SubmitError)?;
+            let rank_req =
+                Self::clone_request_for_rank(&requests[0].1, sink_tx, distributed, shard);
+            Self::spawn_rank_delta_drain(sink_rx);
+            requests.push((global_rank, rank_req));
+        }
+
+        for ((rank, permit), (request_rank, rank_req)) in
+            permits.drain(..).zip(requests.into_iter())
+        {
+            debug_assert_eq!(rank, request_rank);
+            permit.submit(rank_req).map_err(|_| SubmitError)?;
+        }
+        Ok(())
+    }
 }
 
 fn locality(worker_numa: Option<i32>, ingress_numa: Option<i32>) -> Option<bool> {
@@ -494,11 +688,7 @@ impl RequestHandle for NumaSchedulerRouter {
 impl RequestHandle for DistributedSchedulerGroup {
     fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
         if self.request_ownership == DistributedRequestOwnership::TokenOwnedDpEp {
-            log::error!(
-                "Distributed scheduler request ownership mode={} is selected, but token-owned DP/EP request sharding is not implemented yet",
-                self.request_ownership.as_str()
-            );
-            return Err(SubmitError);
+            return self.submit_token_owned_in_process(req);
         }
         let _submission_guard = self
             .submission_lock
@@ -864,8 +1054,77 @@ mod tests {
             group.request_ownership(),
             DistributedRequestOwnership::TokenOwnedDpEp
         );
+        assert_eq!(group.token_owner_group_count(), 0);
         assert!(group.submit(test_request(None, Some(0))).is_err());
         assert!(rx0.try_recv().is_err());
+    }
+
+    #[test]
+    fn distributed_group_token_owned_routes_to_one_owner_group() {
+        let (tx0, mut rx0) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (tx3, mut rx3) = mpsc::unbounded_channel();
+        let group = DistributedSchedulerGroup::with_token_owner_groups(
+            vec![
+                NumaSchedulerWorker {
+                    handle: SchedulerHandle::from_parts(tx0, "model"),
+                    placement: placement(0, 0),
+                },
+                NumaSchedulerWorker {
+                    handle: SchedulerHandle::from_parts(tx1, "model"),
+                    placement: placement(1, 0),
+                },
+                NumaSchedulerWorker {
+                    handle: SchedulerHandle::from_parts(tx2, "model"),
+                    placement: placement(2, 1),
+                },
+                NumaSchedulerWorker {
+                    handle: SchedulerHandle::from_parts(tx3, "model"),
+                    placement: placement(3, 1),
+                },
+            ],
+            crate::metrics::ServerMetrics::new("model"),
+            vec![vec![0, 1], vec![2, 3]],
+        );
+
+        assert_eq!(
+            group.request_ownership(),
+            DistributedRequestOwnership::TokenOwnedDpEp
+        );
+        assert_eq!(group.token_owner_group_count(), 2);
+
+        group.submit(labeled_test_request("a")).unwrap();
+        let a0 = rx0.try_recv().unwrap();
+        let a1 = rx1.try_recv().unwrap();
+        assert_eq!(a0.prompt, "a");
+        assert_eq!(a1.prompt, "a");
+        assert_eq!(
+            a0.distributed_shard,
+            DistributedRequestShard::token_owned_dp_ep(0, 2, true)
+        );
+        assert_eq!(
+            a1.distributed_shard,
+            DistributedRequestShard::token_owned_dp_ep(1, 2, false)
+        );
+        assert!(rx2.try_recv().is_err());
+        assert!(rx3.try_recv().is_err());
+
+        group.submit(labeled_test_request("b")).unwrap();
+        let b2 = rx2.try_recv().unwrap();
+        let b3 = rx3.try_recv().unwrap();
+        assert_eq!(b2.prompt, "b");
+        assert_eq!(b3.prompt, "b");
+        assert_eq!(
+            b2.distributed_shard,
+            DistributedRequestShard::token_owned_dp_ep(0, 2, true)
+        );
+        assert_eq!(
+            b3.distributed_shard,
+            DistributedRequestShard::token_owned_dp_ep(1, 2, false)
+        );
+        assert!(rx0.try_recv().is_err());
+        assert!(rx1.try_recv().is_err());
     }
 
     #[test]
