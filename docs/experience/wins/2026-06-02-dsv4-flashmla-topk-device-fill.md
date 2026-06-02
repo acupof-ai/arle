@@ -23,9 +23,13 @@ of a capture-safe kernel-only body.
 - `cargo fmt --check`
 - `cargo check -p infer --no-default-features --features no-cuda`
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
+- Remote pod worktree `/tmp/arle-dsv4-topk-fill-5bd28386`, HEAD
+  `5bd283863dd59ef36248961effbca3387beb233f`.
+- Remote `git diff --check -- infer/src/model/deepseek/weights.rs docs/experience/wins/2026-06-02-dsv4-flashmla-topk-device-fill.md`
+- Remote `cargo +stable check -p infer --no-default-features --features no-cuda --offline`
+- Remote `CUDARC_CUDA_VERSION=12080 cargo +stable check -p infer --no-default-features --features cuda,no-cuda --offline`
 
-Remote pod verification is still pending for the committed SHA. No runtime
-benchmark or TPOT claim is made from this buildability tranche.
+No runtime benchmark or TPOT claim is made from this buildability tranche.
 
 ## Pending Graph Enablement
 
