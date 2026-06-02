@@ -126,6 +126,7 @@ struct Dsv4BatchFlashMlaDecodeLaunch {
     max_compressed_keys: usize,
     topk_unified: usize,
     total_blocks: usize,
+    h_q: usize,
     num_sm_parts: i32,
     fixed_overhead_num_blocks: i32,
     block_size_topk: i32,
@@ -739,8 +740,11 @@ impl DeepseekModel {
         {
             return Ok(None);
         }
+        let h_q_for_flashmla =
+            dsv4_flashmla_decode_h_q_for_tp(local_heads, self.config.tp.world_size)?;
         let (sm_major, _) = self.ctx.compute_capability();
-        if sm_major != 9 || !dsv4_flashmla_model1_decode_shape_supported(head_dim, local_heads) {
+        if sm_major != 9 || !dsv4_flashmla_model1_decode_shape_supported(head_dim, h_q_for_flashmla)
+        {
             return Ok(None);
         }
         ensure!(
@@ -763,7 +767,7 @@ impl DeepseekModel {
         if first_cache.fp8_kv_pool_ptr == 0 {
             return Ok(None);
         }
-        let fm_meta = ensure_fm_decode_meta(first_cache, local_heads, 1_i32)?;
+        let fm_meta = ensure_fm_decode_meta(first_cache, h_q_for_flashmla, 1_i32)?;
         let sw_blocks = first_cache.fp8_kv_sw_blocks;
         let comp_blocks = first_cache.fp8_kv_comp_blocks;
         ensure!(
@@ -812,7 +816,7 @@ impl DeepseekModel {
                 batch_size,
                 num_sm_parts_max,
                 topk_unified,
-                local_heads,
+                h_q_for_flashmla,
                 head_dim,
             )?;
         }
@@ -828,7 +832,7 @@ impl DeepseekModel {
             batch_size,
             num_sm_parts_max,
             topk_unified,
-            local_heads,
+            h_q_for_flashmla,
             head_dim,
         )?;
         let (indices_ptr, ig) = arena.indices.device_ptr_mut(&self.ctx.stream);
@@ -867,6 +871,7 @@ impl DeepseekModel {
             max_compressed_keys,
             topk_unified,
             total_blocks,
+            h_q: h_q_for_flashmla,
             num_sm_parts: fm_meta.num_sm_parts,
             fixed_overhead_num_blocks: fm_meta.fixed_overhead_num_blocks,
             block_size_topk: fm_meta.block_size_topk,
@@ -1009,6 +1014,11 @@ impl DeepseekModel {
             .result()
             .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA q/k prep failed: {err}"))?;
         }
+        drop(_qpg);
+        drop(_kpg);
+        drop(_spg);
+        drop(_qrg);
+        drop(_krg);
         dsv4_trace_end(
             &self.ctx,
             "attn_hca_batch_prepare_qk",
@@ -1084,73 +1094,212 @@ impl DeepseekModel {
             })?;
         }
 
+        let tp_world = self.config.tp.world_size;
+        let tp_rank = self.config.tp.rank;
+        let expected_h_q = dsv4_flashmla_decode_h_q_for_tp(local_heads, tp_world)?;
+        ensure!(
+            launch.h_q == expected_h_q,
+            "DSv4 batch FlashMLA decode launch h_q {} does not match TP shape {}",
+            launch.h_q,
+            expected_h_q
+        );
+        let h_q_for_flashmla = launch.h_q;
+        let mut gathered_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+        let mut packed_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+        let mut full_out_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+
+        #[cfg(feature = "nccl")]
+        if tp_world > 1 {
+            let tp_nccl = self.layer_communicator.tp_nccl().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DSv4 batch FlashMLA TP>1 decode requires TP NCCL group; \
+                     build with --features nccl and set TP env-bootstrap vars",
+                )
+            })?;
+            let send_count = batch_size * local_heads * head_dim;
+            let mut gathered = unsafe {
+                self.ctx
+                    .stream
+                    .alloc_traced::<bf16>(send_count * tp_world)
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "DSv4 batch FlashMLA TP allgather Q scratch alloc failed: {err}",
+                        )
+                    })?
+            };
+            tp_nccl.all_gather_bf16_device(&attn_q_prepared.data, send_count, &mut gathered)?;
+            let mut packed = unsafe {
+                self.ctx
+                    .stream
+                    .alloc_traced::<bf16>(send_count * tp_world)
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "DSv4 batch FlashMLA TP packed Q scratch alloc failed: {err}",
+                        )
+                    })?
+            };
+            {
+                let (gathered_ptr, _gg) = gathered.device_ptr(&self.ctx.stream);
+                let (packed_ptr, _pg) = packed.device_ptr_mut(&self.ctx.stream);
+                unsafe {
+                    ffi::dsv4_tp_q_repack_cuda(
+                        gathered_ptr as *const ffi::Half,
+                        packed_ptr as *mut ffi::Half,
+                        tp_world as i32,
+                        batch_size as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DSv4 batch FlashMLA TP Q repack failed: {err}")
+                    })?;
+                }
+            }
+            let full_out_len = batch_size * h_q_for_flashmla * head_dim;
+            let full_out = unsafe {
+                self.ctx
+                    .stream
+                    .alloc_traced::<bf16>(full_out_len)
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "DSv4 batch FlashMLA TP full-out scratch alloc failed: {err}",
+                        )
+                    })?
+            };
+            gathered_q_owned = Some(gathered);
+            packed_q_owned = Some(packed);
+            full_out_owned = Some(full_out);
+        }
+        #[cfg(not(feature = "nccl"))]
+        if tp_world > 1 {
+            anyhow::bail!("DSv4 batch FlashMLA TP>1 decode requires --features nccl");
+        }
+
         let (sink_f32_base_ptr, _sfg) = attention.attn_sink_f32.device_ptr(&self.ctx.stream);
-        let sink_offset_elems = self.config.tp.rank * local_heads;
-        let sink_f32_local_ptr =
-            unsafe { (sink_f32_base_ptr as *const f32).add(sink_offset_elems) };
-        let (local_out_ptr, _log) = attn_local.data.device_ptr_mut(&self.ctx.stream);
+        let sink_offset_elems = tp_rank * local_heads;
+        debug_assert!(
+            if tp_world > 1 {
+                attention.attn_sink_f32.len() >= h_q_for_flashmla
+            } else {
+                attention.attn_sink_f32.len() >= sink_offset_elems + local_heads
+            },
+            "DSv4 attn_sink_f32 mirror len {} cannot cover FlashMLA h_q {} / local_heads {} at rank {}",
+            attention.attn_sink_f32.len(),
+            h_q_for_flashmla,
+            local_heads,
+            tp_rank,
+        );
+        let sink_f32_local_ptr = if tp_world > 1 {
+            sink_f32_base_ptr as *const f32
+        } else {
+            unsafe { (sink_f32_base_ptr as *const f32).add(sink_offset_elems) }
+        };
+        let (local_out_ptr, local_out_guard) = attn_local.data.device_ptr_mut(&self.ctx.stream);
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
         let bytes_per_token = DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN as i32;
         let stride_kv_block_bytes = DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32 * bytes_per_token;
-        let stride_q_b = (local_heads * head_dim) as i32;
+        let stride_q_b = (h_q_for_flashmla * head_dim) as i32;
         let stride_q_s_q = stride_q_b;
         let stride_q_h_q = head_dim as i32;
-        let stride_o_b = (local_heads * head_dim) as i32;
+        let stride_o_b = (h_q_for_flashmla * head_dim) as i32;
         let stride_o_s_q = stride_o_b;
         let stride_o_h_q = head_dim as i32;
         let stride_indices_b = launch.topk_unified as i32;
         let stride_indices_s_q = launch.topk_unified as i32;
-        let stride_lse_b = local_heads as i32;
+        let stride_lse_b = h_q_for_flashmla as i32;
         let stride_lse_s_q = 1_i32;
-        let split_axis_stride = local_heads as i32;
-        let o_split_axis_stride = (local_heads * head_dim) as i32;
-        unsafe {
-            ffi::arle_flashmla_sm90_sparse_decode_fwd(
-                q_prepared_ptr as *const ffi::Half,
-                launch.pool_base_ptr as *const ffi::Half,
-                launch.indices_ptr as *const i32,
-                launch.topk_length_ptr as *const i32,
-                sink_f32_local_ptr,
-                local_out_ptr as *mut ffi::Half,
-                launch.lse_out_ptr as *mut f32,
-                launch.lse_accum_ptr as *mut f32,
-                launch.o_accum_ptr as *mut f32,
-                launch.sched_meta_ptr as *const i32,
-                launch.num_splits_ptr as *const i32,
-                batch_size as i32,
-                1_i32,
-                local_heads as i32,
-                1_i32,
-                head_dim as i32,
-                head_dim as i32,
-                launch.total_blocks as i32,
-                DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32,
-                launch.topk_unified as i32,
-                launch.num_sm_parts,
-                1_i32,
-                scale,
-                stride_q_b,
-                stride_q_s_q,
-                stride_q_h_q,
-                stride_kv_block_bytes,
-                bytes_per_token,
-                stride_indices_b,
-                stride_indices_s_q,
-                stride_lse_b,
-                stride_lse_s_q,
-                stride_o_b,
-                stride_o_s_q,
-                stride_o_h_q,
-                split_axis_stride,
-                split_axis_stride,
-                o_split_axis_stride,
-                o_split_axis_stride,
-                stride_o_h_q,
-                self.ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA decode fwd failed: {err}"))?;
+        let split_axis_stride = h_q_for_flashmla as i32;
+        let o_split_axis_stride = (h_q_for_flashmla * head_dim) as i32;
+        {
+            let (q_for_flashmla_ptr, _q_for_flashmla_guard) =
+                if let Some(ref packed) = packed_q_owned {
+                    let (ptr, guard) = packed.device_ptr(&self.ctx.stream);
+                    (ptr as *const ffi::Half, Some(guard))
+                } else {
+                    (q_prepared_ptr as *const ffi::Half, None)
+                };
+            let (flashmla_out_ptr, flashmla_out_guard) =
+                if let Some(ref mut full_out) = full_out_owned {
+                    let (ptr, guard) = full_out.device_ptr_mut(&self.ctx.stream);
+                    (ptr as *mut ffi::Half, Some(guard))
+                } else {
+                    (local_out_ptr as *mut ffi::Half, None)
+                };
+            unsafe {
+                ffi::arle_flashmla_sm90_sparse_decode_fwd(
+                    q_for_flashmla_ptr,
+                    launch.pool_base_ptr as *const ffi::Half,
+                    launch.indices_ptr as *const i32,
+                    launch.topk_length_ptr as *const i32,
+                    sink_f32_local_ptr,
+                    flashmla_out_ptr,
+                    launch.lse_out_ptr as *mut f32,
+                    launch.lse_accum_ptr as *mut f32,
+                    launch.o_accum_ptr as *mut f32,
+                    launch.sched_meta_ptr as *const i32,
+                    launch.num_splits_ptr as *const i32,
+                    batch_size as i32,
+                    1_i32,
+                    h_q_for_flashmla as i32,
+                    1_i32,
+                    head_dim as i32,
+                    head_dim as i32,
+                    launch.total_blocks as i32,
+                    DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32,
+                    launch.topk_unified as i32,
+                    launch.num_sm_parts,
+                    1_i32,
+                    scale,
+                    stride_q_b,
+                    stride_q_s_q,
+                    stride_q_h_q,
+                    stride_kv_block_bytes,
+                    bytes_per_token,
+                    stride_indices_b,
+                    stride_indices_s_q,
+                    stride_lse_b,
+                    stride_lse_s_q,
+                    stride_o_b,
+                    stride_o_s_q,
+                    stride_o_h_q,
+                    split_axis_stride,
+                    split_axis_stride,
+                    o_split_axis_stride,
+                    o_split_axis_stride,
+                    stride_o_h_q,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA decode fwd failed: {err}"))?;
+            }
+            drop(flashmla_out_guard);
+        }
 
+        if tp_world > 1
+            && let Some(ref full_out) = full_out_owned
+        {
+            let (full_out_ptr_const, _fog) = full_out.device_ptr(&self.ctx.stream);
+            let global_width = h_q_for_flashmla * head_dim;
+            let local_width_elems = local_heads * head_dim;
+            let head_offset_elems = tp_rank * local_width_elems;
+            unsafe {
+                ffi::dsv4_tp_out_slice_cuda(
+                    full_out_ptr_const as *const ffi::Half,
+                    local_out_ptr as *mut ffi::Half,
+                    batch_size as i32,
+                    global_width as i32,
+                    local_width_elems as i32,
+                    head_offset_elems as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA TP out slice failed: {err}"))?;
+            }
+        }
+
+        unsafe {
             ffi::arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
                 local_out_ptr as *mut ffi::Half,
                 batch_size as i32,
@@ -1170,7 +1319,10 @@ impl DeepseekModel {
                 anyhow::anyhow!("DSv4 batch FlashMLA decode output inverse-rope failed: {err}")
             })?;
         }
-        drop(_log);
+        drop(local_out_guard);
+        drop(gathered_q_owned);
+        drop(packed_q_owned);
+        drop(full_out_owned);
         dsv4_trace_end(
             &self.ctx,
             "attn_hca_batch_flashmla_decode",
@@ -3941,10 +4093,12 @@ impl DeepseekModel {
         } else {
             true
         };
+        let h_q_for_flashmla_decode =
+            dsv4_flashmla_decode_h_q_for_tp(local_heads, self.config.tp.world_size)?;
         let use_flashmla_decode = sm_major_early == 9
             && (mode_int_early == 1 || mode_int_early == 2)
             && token_count == 1
-            && dsv4_flashmla_model1_decode_shape_supported(head_dim, local_heads)
+            && dsv4_flashmla_model1_decode_shape_supported(head_dim, h_q_for_flashmla_decode)
             && cache.is_some()
             && shared_pool_bound_for_decode
             && dsv4_flashmla_decode_enabled()?;
@@ -4747,6 +4901,7 @@ impl DeepseekModel {
                 drop(packed_q_owned);
                 drop(full_out_owned);
             } else if use_flashmla_decode {
+                let flashmla_decode_trace = dsv4_trace_begin(&self.ctx)?;
                 // Phase D-4 step 3 — FlashMLA sparse-FP8 decode dispatch.
                 //
                 // Pre-conditions (all checked at the gate):
@@ -4754,7 +4909,8 @@ impl DeepseekModel {
                 //   mode_int ∈ {1 (CSA), 2 (HCA)}
                 //   token_count == 1 (decode)
                 //   head_dim == 512 (MODEL1; FP8 pool/pack layout is MODEL1-only)
-                //   local_heads ∈ {64, 128} (FlashMLA hard-assert h_q)
+                //   FlashMLA h_q ∈ {64, 128}; TP>1 all-gathers local Q
+                //   before dispatch and slices this rank's output slab back.
                 //   cache is Some (FP8 pool + arena live here)
                 //   env knob ON
                 //
@@ -4775,12 +4931,15 @@ impl DeepseekModel {
                 let d_v = head_dim; // MODEL1: d_qk == d_v == 512 at NoPE+RoPE
                 let d_v_for_decode = 512_i32; // decode kernel d_v hard-assert
                 let cache_mut = cache.as_deref_mut().expect("cache present (gated above)");
+                let tp_world = self.config.tp.world_size;
+                let tp_rank = self.config.tp.rank;
+                let h_q_for_flashmla = dsv4_flashmla_decode_h_q_for_tp(local_heads, tp_world)?;
 
                 // Step 1 — host meta. FlashMLA's decode meta for this branch is
-                // shape-only (`local_heads`, `s_q=1`, MODEL1), so cache it per
+                // shape-only (`h_q`, `s_q=1`, MODEL1), so cache it per
                 // attention runtime cache instead of calling the host shim every
                 // token.
-                let fm_meta = ensure_fm_decode_meta(cache_mut, local_heads, model_type_int)?;
+                let fm_meta = ensure_fm_decode_meta(cache_mut, h_q_for_flashmla, model_type_int)?;
                 let num_sm_parts = fm_meta.num_sm_parts;
                 let fixed_overhead_num_blocks = fm_meta.fixed_overhead_num_blocks;
                 let block_size_topk = fm_meta.block_size_topk;
@@ -4814,7 +4973,7 @@ impl DeepseekModel {
                     cache_mut,
                     num_sm_parts_max,
                     topk_unified,
-                    local_heads,
+                    h_q_for_flashmla,
                     d_v,
                 )?;
 
@@ -4980,15 +5139,102 @@ impl DeepseekModel {
                     .device_ptr_mut(&self.ctx.stream);
                 drop(og);
 
-                // attn_sink_f32 with rank offset (decode runs single-rank
-                // at h_q ∈ {64,128} — same convention as the legacy
-                // hybrid kernel: caller indexes the local head range).
+                let mut gathered_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+                let mut packed_q_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+                let mut full_out_owned: Option<cudarc::driver::CudaSlice<bf16>> = None;
+
+                #[cfg(feature = "nccl")]
+                if tp_world > 1 {
+                    let tp_nccl = self.layer_communicator.tp_nccl().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "DSv4 FlashMLA TP>1 decode requires TP NCCL group; \
+                             build with --features nccl and set TP env-bootstrap vars",
+                        )
+                    })?;
+                    let send_count = local_heads * head_dim;
+                    let mut gathered = unsafe {
+                        self.ctx
+                            .stream
+                            .alloc_traced::<bf16>(send_count * tp_world)
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "DSv4 FlashMLA TP allgather Q scratch alloc failed: {err}",
+                                )
+                            })?
+                    };
+                    tp_nccl.all_gather_bf16_device(&q_prepared.data, send_count, &mut gathered)?;
+                    let mut packed = unsafe {
+                        self.ctx
+                            .stream
+                            .alloc_traced::<bf16>(send_count * tp_world)
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "DSv4 FlashMLA TP packed Q scratch alloc failed: {err}",
+                                )
+                            })?
+                    };
+                    {
+                        let (gathered_ptr, _gg) = gathered.device_ptr(&self.ctx.stream);
+                        let (packed_ptr, _pg) = packed.device_ptr_mut(&self.ctx.stream);
+                        unsafe {
+                            ffi::dsv4_tp_q_repack_cuda(
+                                gathered_ptr as *const ffi::Half,
+                                packed_ptr as *mut ffi::Half,
+                                tp_world as i32,
+                                1_i32,
+                                local_heads as i32,
+                                head_dim as i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()
+                            .map_err(|err| {
+                                anyhow::anyhow!("DSv4 FlashMLA TP Q repack failed: {err}")
+                            })?;
+                        }
+                    }
+                    let full_out = unsafe {
+                        self.ctx
+                            .stream
+                            .alloc_traced::<bf16>(h_q_for_flashmla * d_v)
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "DSv4 FlashMLA TP full-out scratch alloc failed: {err}",
+                                )
+                            })?
+                    };
+                    gathered_q_owned = Some(gathered);
+                    packed_q_owned = Some(packed);
+                    full_out_owned = Some(full_out);
+                }
+                #[cfg(not(feature = "nccl"))]
+                if tp_world > 1 {
+                    anyhow::bail!("DSv4 FlashMLA TP>1 decode requires --features nccl");
+                }
+
+                // attn_sink_f32 with rank offset only at TP=1. At TP>1
+                // FlashMLA indexes global heads after Q all-gather, so pass
+                // the full sink base just like the TP-aware prefill path.
                 let (sink_f32_base_ptr, sf32g) =
                     attention.attn_sink_f32.device_ptr(&self.ctx.stream);
                 drop(sf32g);
-                let sink_offset_elems = self.config.tp.rank * local_heads;
-                let sink_f32_local_ptr =
-                    unsafe { (sink_f32_base_ptr as *const f32).add(sink_offset_elems) };
+                let sink_offset_elems = tp_rank * local_heads;
+                debug_assert!(
+                    if tp_world > 1 {
+                        attention.attn_sink_f32.len() >= h_q_for_flashmla
+                    } else {
+                        attention.attn_sink_f32.len() >= sink_offset_elems + local_heads
+                    },
+                    "DSv4 attn_sink_f32 mirror len {} cannot cover FlashMLA h_q {} / local_heads {} at rank {}",
+                    attention.attn_sink_f32.len(),
+                    h_q_for_flashmla,
+                    local_heads,
+                    tp_rank,
+                );
+                let sink_f32_local_ptr = if tp_world > 1 {
+                    sink_f32_base_ptr as *const f32
+                } else {
+                    unsafe { (sink_f32_base_ptr as *const f32).add(sink_offset_elems) }
+                };
 
                 // Dummy lse output [b=1, h_q, s_q=1] — combine writes here but
                 // ARLE doesn't consume it. Kept in the arena to avoid per-step
@@ -5008,73 +5254,114 @@ impl DeepseekModel {
                 let stride_kv_block_bytes =
                     DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32 * bytes_per_token;
                 // Strides for q [b=1, s_q=1, h_q, d_qk]: elements.
-                let stride_q_b = (local_heads * head_dim) as i32;
-                let stride_q_s_q = (local_heads * head_dim) as i32;
+                let stride_q_b = (h_q_for_flashmla * head_dim) as i32;
+                let stride_q_s_q = (h_q_for_flashmla * head_dim) as i32;
                 let stride_q_h_q = head_dim as i32;
                 // Strides for o [b=1, s_q=1, h_q, d_v]: elements.
-                let stride_o_b = (local_heads * d_v_for_decode as usize) as i32;
-                let stride_o_s_q = (local_heads * d_v_for_decode as usize) as i32;
+                let stride_o_b = (h_q_for_flashmla * d_v_for_decode as usize) as i32;
+                let stride_o_s_q = (h_q_for_flashmla * d_v_for_decode as usize) as i32;
                 let stride_o_h_q = d_v_for_decode;
                 // Strides for indices [b=1, s_q=1, topk]: ints.
                 let stride_indices_b = topk_unified as i32;
                 let stride_indices_s_q = topk_unified as i32;
                 // Strides for lse [b=1, h_q, s_q=1]: floats.
-                let stride_lse_b = local_heads as i32;
+                let stride_lse_b = h_q_for_flashmla as i32;
                 let stride_lse_s_q = 1_i32;
                 // Split-axis strides: lse_accum [num_splits, s_q=1, h_q].
-                let stride_lse_accum_split = local_heads as i32;
-                let stride_lse_accum_s_q = local_heads as i32;
+                let stride_lse_accum_split = h_q_for_flashmla as i32;
+                let stride_lse_accum_s_q = h_q_for_flashmla as i32;
                 // o_accum [num_splits, s_q=1, h_q, d_v].
-                let stride_o_accum_split = (local_heads * d_v_for_decode as usize) as i32;
-                let stride_o_accum_s_q = (local_heads * d_v_for_decode as usize) as i32;
+                let stride_o_accum_split = (h_q_for_flashmla * d_v_for_decode as usize) as i32;
+                let stride_o_accum_s_q = (h_q_for_flashmla * d_v_for_decode as usize) as i32;
                 let stride_o_accum_h_q = d_v_for_decode;
 
-                unsafe {
-                    ffi::arle_flashmla_sm90_sparse_decode_fwd(
-                        q_ptr as *const ffi::Half,
-                        kv_pool_ptr_u64 as *const ffi::Half,
-                        indices_ptr_u64 as *const i32,
-                        topk_length_ptr_u64 as *const i32,
-                        sink_f32_local_ptr,
-                        out_ptr as *mut ffi::Half,
-                        lse_out_ptr_u64 as *mut f32,
-                        lse_accum_ptr_u64 as *mut f32,
-                        o_accum_ptr_u64 as *mut f32,
-                        sched_meta_ptr_u64 as *const i32,
-                        num_splits_ptr_u64 as *const i32,
-                        1_i32, // b
-                        1_i32, // s_q
-                        local_heads as i32,
-                        1_i32, // h_kv
-                        head_dim as i32,
-                        d_v_for_decode,
-                        total_blocks as i32,
-                        DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32,
-                        topk_unified as i32,
-                        num_sm_parts,
-                        model_type_int,
-                        scale,
-                        stride_q_b,
-                        stride_q_s_q,
-                        stride_q_h_q,
-                        stride_kv_block_bytes,
-                        bytes_per_token,
-                        stride_indices_b,
-                        stride_indices_s_q,
-                        stride_lse_b,
-                        stride_lse_s_q,
-                        stride_o_b,
-                        stride_o_s_q,
-                        stride_o_h_q,
-                        stride_lse_accum_split,
-                        stride_lse_accum_s_q,
-                        stride_o_accum_split,
-                        stride_o_accum_s_q,
-                        stride_o_accum_h_q,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode fwd failed: {err}"))?;
+                {
+                    let (q_for_flashmla_ptr, _q_for_flashmla_guard) =
+                        if let Some(ref packed) = packed_q_owned {
+                            let (ptr, guard) = packed.device_ptr(&self.ctx.stream);
+                            (ptr as *const ffi::Half, Some(guard))
+                        } else {
+                            (q_ptr as *const ffi::Half, None)
+                        };
+                    let (flashmla_out_ptr, flashmla_out_guard) =
+                        if let Some(ref mut full_out) = full_out_owned {
+                            let (ptr, guard) = full_out.device_ptr_mut(&self.ctx.stream);
+                            (ptr as *mut ffi::Half, Some(guard))
+                        } else {
+                            (out_ptr as *mut ffi::Half, None)
+                        };
+                    unsafe {
+                        ffi::arle_flashmla_sm90_sparse_decode_fwd(
+                            q_for_flashmla_ptr,
+                            kv_pool_ptr_u64 as *const ffi::Half,
+                            indices_ptr_u64 as *const i32,
+                            topk_length_ptr_u64 as *const i32,
+                            sink_f32_local_ptr,
+                            flashmla_out_ptr,
+                            lse_out_ptr_u64 as *mut f32,
+                            lse_accum_ptr_u64 as *mut f32,
+                            o_accum_ptr_u64 as *mut f32,
+                            sched_meta_ptr_u64 as *const i32,
+                            num_splits_ptr_u64 as *const i32,
+                            1_i32, // b
+                            1_i32, // s_q
+                            h_q_for_flashmla as i32,
+                            1_i32, // h_kv
+                            head_dim as i32,
+                            d_v_for_decode,
+                            total_blocks as i32,
+                            DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32,
+                            topk_unified as i32,
+                            num_sm_parts,
+                            model_type_int,
+                            scale,
+                            stride_q_b,
+                            stride_q_s_q,
+                            stride_q_h_q,
+                            stride_kv_block_bytes,
+                            bytes_per_token,
+                            stride_indices_b,
+                            stride_indices_s_q,
+                            stride_lse_b,
+                            stride_lse_s_q,
+                            stride_o_b,
+                            stride_o_s_q,
+                            stride_o_h_q,
+                            stride_lse_accum_split,
+                            stride_lse_accum_s_q,
+                            stride_o_accum_split,
+                            stride_o_accum_s_q,
+                            stride_o_accum_h_q,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|err| anyhow::anyhow!("DSv4 FlashMLA decode fwd failed: {err}"))?;
+                    }
+                    drop(flashmla_out_guard);
+                }
+
+                if tp_world > 1
+                    && let Some(ref full_out) = full_out_owned
+                {
+                    let (full_out_ptr_const, _fog) = full_out.device_ptr(&self.ctx.stream);
+                    let global_width = h_q_for_flashmla * d_v;
+                    let local_width_elems = local_heads * d_v;
+                    let head_offset_elems = tp_rank * local_width_elems;
+                    unsafe {
+                        ffi::dsv4_tp_out_slice_cuda(
+                            full_out_ptr_const as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            1_i32,
+                            global_width as i32,
+                            local_width_elems as i32,
+                            head_offset_elems as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|err| {
+                            anyhow::anyhow!("DSv4 FlashMLA TP out slice failed: {err}")
+                        })?;
+                    }
                 }
 
                 // Attention-output inverse-rope. The legacy hybrid decode
@@ -5104,6 +5391,16 @@ impl DeepseekModel {
                         anyhow::anyhow!("DSv4 FlashMLA decode output inverse-rope failed: {err}")
                     })?;
                 }
+                drop(gathered_q_owned);
+                drop(packed_q_owned);
+                drop(full_out_owned);
+                dsv4_trace_end(
+                    &self.ctx,
+                    "attn_flashmla_decode",
+                    layer_idx,
+                    token_count,
+                    flashmla_decode_trace,
+                )?;
             } else {
                 // Acquire bf16 SW window ptr from cache (scoped to this
                 // legacy-kernel launch — drops the &mut after the FFI
@@ -8999,8 +9296,19 @@ fn build_attn_sink_f32_mirror(
 }
 
 #[cfg(feature = "cuda")]
-fn dsv4_flashmla_model1_decode_shape_supported(head_dim: usize, local_heads: usize) -> bool {
-    head_dim == DSV4_FLASHMLA_MODEL1_HEAD_DIM && matches!(local_heads, 64 | 128)
+fn dsv4_flashmla_decode_h_q_for_tp(local_heads: usize, tp_world: usize) -> Result<usize> {
+    ensure!(
+        tp_world > 0,
+        "DSv4 FlashMLA decode requires positive TP world size"
+    );
+    local_heads
+        .checked_mul(tp_world)
+        .ok_or_else(|| anyhow::anyhow!("DSv4 FlashMLA decode h_q overflow"))
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_flashmla_model1_decode_shape_supported(head_dim: usize, h_q: usize) -> bool {
+    head_dim == DSV4_FLASHMLA_MODEL1_HEAD_DIM && matches!(h_q, 64 | 128)
 }
 
 #[cfg(feature = "cuda")]
@@ -9202,6 +9510,11 @@ mod tests {
         assert!(dsv4_flashmla_model1_decode_shape_supported(512, 128));
         assert!(!dsv4_flashmla_model1_decode_shape_supported(576, 64));
         assert!(!dsv4_flashmla_model1_decode_shape_supported(512, 8));
+        assert_eq!(dsv4_flashmla_decode_h_q_for_tp(8, 8).unwrap(), 64);
+        assert!(dsv4_flashmla_model1_decode_shape_supported(
+            512,
+            dsv4_flashmla_decode_h_q_for_tp(8, 8).unwrap()
+        ));
     }
 
     fn tiny_config() -> DeepSeekV4Config {
