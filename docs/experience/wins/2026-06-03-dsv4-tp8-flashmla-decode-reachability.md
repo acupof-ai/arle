@@ -36,14 +36,39 @@ Local checks on macOS with no CUDA runtime execution:
 
 ## Results
 
-Local checks passed. Remote CUDA build, decode correctness, operator-trace
-reachability, and target workload TPOT are pending.
+Local checks passed.
+
+Remote build and reachability validation passed on the DSv4 pod at commit
+`fd05a7177a2a593749ec2a47e7ba7bcfd6953818`:
+
+- build artifact:
+  `/tmp/dsv4_tp8_flashmla_decode_20260603_build/build.log`;
+- validation artifact:
+  `/tmp/dsv4_tp8_flashmla_decode_reach_20260603`;
+- `scripts/dsv4_batched_decode_validate.py 18085` exited 0, printed
+  `ANSWER_PASS`, and completed c8 with zero HTTP errors;
+- c1/c4 byte parity remained diagnostic-only false, but every c1/c4/c8 output
+  contained the expected `406` answer token;
+- operator trace proved the new paths executed:
+  `attn_flashmla_decode` 16408 calls and
+  `attn_hca_batch_flashmla_decode` 2240 calls;
+- after cleanup, `nvidia-smi --query-compute-apps` reported no remaining
+  compute apps.
+
+Target workload TPOT is still pending. The reachability run deliberately set
+`ARLE_DSV4_OPERATOR_TRACE=1`, `ARLE_DSV4_OPERATOR_TRACE_EVENTS=1`, and
+`--disable-cuda-graph`, so its timing is not performance evidence.
 
 ## Problems
 
 This tranche intentionally allocates TP all-gather/repack/full-output scratch in
 the decode body. That is acceptable for reachability and correctness, but it is
 not the final high-performance CUDA-graph-compatible implementation.
+
+The single-token `attn_flashmla_decode` trace includes per-layer synchronizing
+operator-trace overhead, so its early ~3-4 ms samples should not be compared to
+SGLang TPOT. The phase's presence, not the measured trace latency, is the
+evidence from this run.
 
 ## Learnings
 
