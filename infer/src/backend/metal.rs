@@ -62,6 +62,9 @@ mod kv_memory_budget;
 #[path = "metal/loader.rs"]
 mod loader;
 #[cfg(feature = "metal")]
+#[path = "metal/mtp.rs"]
+mod mtp;
+#[cfg(feature = "metal")]
 #[path = "metal/ops.rs"]
 pub mod ops;
 #[cfg(feature = "metal")]
@@ -125,6 +128,8 @@ use loader::{
     tie_lm_head_from_embed_tokens,
 };
 #[cfg(feature = "metal")]
+pub use mtp::{MetalMtpMode, MetalMtpOptions, MetalMtpProbe, MetalMtpTensorSource};
+#[cfg(feature = "metal")]
 use qwen35::{
     load_qwen35_metal_weights, load_qwen35_metal_weights_from_gguf, metal_generate_qwen35,
 };
@@ -164,6 +169,10 @@ pub struct MetalBackend {
     #[cfg(feature = "metal")]
     dflash: Option<dflash::MetalDflashRuntime>,
     #[cfg(feature = "metal")]
+    mtp_options: Option<MetalMtpOptions>,
+    #[cfg(feature = "metal")]
+    mtp_probe: Option<MetalMtpProbe>,
+    #[cfg(feature = "metal")]
     kv_pool_enabled: bool,
     #[cfg(feature = "metal")]
     kv_disk_options: Option<MetalKvDiskOptions>,
@@ -193,6 +202,7 @@ impl MetalBackend {
         #[cfg(feature = "metal")]
         let MetalBackendOptions {
             dflash,
+            mtp,
             kv_pool,
             kv_disk,
             kv_memory_max_bytes,
@@ -210,6 +220,10 @@ impl MetalBackend {
             dflash_options: dflash,
             #[cfg(feature = "metal")]
             dflash: None,
+            #[cfg(feature = "metal")]
+            mtp_options: mtp,
+            #[cfg(feature = "metal")]
+            mtp_probe: None,
             #[cfg(feature = "metal")]
             kv_pool_enabled: self::generate::resolve_metal_kv_pool_enabled(kv_pool),
             #[cfg(feature = "metal")]
@@ -515,6 +529,8 @@ pub struct MetalBackendOptions {
     #[cfg(feature = "metal")]
     pub dflash: Option<MetalDflashOptions>,
     #[cfg(feature = "metal")]
+    pub mtp: Option<MetalMtpOptions>,
+    #[cfg(feature = "metal")]
     pub kv_pool: Option<bool>,
     #[cfg(feature = "metal")]
     pub kv_disk: Option<MetalKvDiskOptions>,
@@ -608,6 +624,44 @@ impl MetalRuntimeLimits {
     }
 }
 
+#[cfg(feature = "metal")]
+fn log_mtp_probe_result(options: &MetalMtpOptions, probe: &MetalMtpProbe) {
+    match (&options.mode, &probe.source) {
+        (_, MetalMtpTensorSource::GgufUnsupported) => {
+            log::warn!(
+                "Metal MTP {} requested for GGUF weights, but GGUF MTP tensor introspection is not wired yet; falling back to standard Metal decode",
+                mtp_mode_label(options.mode)
+            );
+        }
+        (MetalMtpMode::Auto, _) if !probe.has_tensors() => {
+            log::info!(
+                "Metal MTP auto: no mtp/nextn tensors detected; using standard Metal decode"
+            );
+        }
+        (MetalMtpMode::Explicit, _) if !probe.has_tensors() => {
+            log::warn!(
+                "Metal MTP requested but no mtp/nextn tensors were detected; using standard Metal decode"
+            );
+        }
+        (_, _) => {
+            log::warn!(
+                "Metal MTP {} found {} tensor(s) [{}], but native MTP draft/verify is not implemented yet; using standard Metal decode",
+                mtp_mode_label(options.mode),
+                probe.tensor_count,
+                probe.examples_label()
+            );
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+fn mtp_mode_label(mode: MetalMtpMode) -> &'static str {
+    match mode {
+        MetalMtpMode::Auto => "auto",
+        MetalMtpMode::Explicit => "explicit",
+    }
+}
+
 impl Default for MetalBackend {
     fn default() -> Self {
         Self::new()
@@ -693,6 +747,12 @@ impl InferenceBackend for MetalBackend {
         } else {
             load_metal_config(resolved_path)?
         };
+        #[cfg(feature = "metal")]
+        if let Some(options) = &self.mtp_options {
+            let probe = mtp::probe_mtp_tensors(source.model_root(), gguf.is_some())?;
+            log_mtp_probe_result(options, &probe);
+            self.mtp_probe = Some(probe);
+        }
 
         match &config.arch {
             MetalModelArch::Qwen3 => log::info!(

@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
 use infer::backend::metal::scheduler::MetalSchedulerConfig;
 use infer::backend::metal::{
-    MetalBackendOptions, MetalDflashOptions, MetalKvDiskOptions, MetalRuntimeLimits,
-    spawn_metal_scheduler_handle_from_path_with_options_and_metrics,
+    MetalBackendOptions, MetalDflashOptions, MetalKvDiskOptions, MetalMtpMode, MetalMtpOptions,
+    MetalRuntimeLimits, spawn_metal_scheduler_handle_from_path_with_options_and_metrics,
 };
 use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
 use infer::logging;
@@ -30,6 +30,27 @@ const DEFAULT_WARMUP_PROMPT: &str = "Write one short sentence about Metal infere
 const WARMUP_TIMEOUT: Duration = Duration::from_mins(5);
 const DEFAULT_KV_DISK_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const FALLBACK_KV_MEMORY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum MetalSpecTypeArg {
+    None,
+    Auto,
+    Mtp,
+}
+
+impl MetalSpecTypeArg {
+    fn mtp_options(self) -> Option<MetalMtpOptions> {
+        match self {
+            Self::None => None,
+            Self::Auto => Some(MetalMtpOptions::auto()),
+            Self::Mtp => Some(MetalMtpOptions::explicit()),
+        }
+    }
+
+    fn mtp_mode(self) -> Option<MetalMtpMode> {
+        self.mtp_options().map(|options| options.mode)
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -80,6 +101,11 @@ struct Args {
     /// Enable Metal DFlash with the given draft model path or HuggingFace repo.
     #[arg(long, value_name = "PATH_OR_REPO")]
     dflash_draft_model: Option<String>,
+
+    /// Speculative decode route for Metal. `mtp` probes for native MTP tensors
+    /// and currently falls back to standard decode until MTP draft/verify lands.
+    #[arg(long, value_enum, default_value_t = MetalSpecTypeArg::None)]
+    spec_type: MetalSpecTypeArg,
 
     /// Enable the experimental Metal KV pool for Qwen3 (production) and
     /// Qwen3.5 (M_e.1 P2.0: pool is allocated but not yet read/written —
@@ -273,6 +299,7 @@ mod tests {
             max_running_requests: 4,
             max_batch_tokens: 512,
             dflash_draft_model: None,
+            spec_type: MetalSpecTypeArg::None,
             kv_pool: false,
             no_kv_pool: false,
             kv_disk_dir: None,
@@ -360,6 +387,11 @@ async fn main() -> Result<()> {
     if args.warmup > 0 && args.warmup_max_new_tokens == 0 {
         bail!("--warmup-max-new-tokens must be >= 1 when --warmup > 0");
     }
+    if args.dflash_draft_model.is_some() && args.spec_type.mtp_mode().is_some() {
+        bail!(
+            "--dflash-draft-model and --spec-type cannot be combined; choose one Metal speculative route"
+        );
+    }
 
     let backend_options = MetalBackendOptions {
         dflash: args
@@ -369,6 +401,7 @@ async fn main() -> Result<()> {
                 draft_model: draft_model.clone(),
                 speculative_tokens: args.speculative_tokens,
             }),
+        mtp: args.spec_type.mtp_options(),
         kv_pool: args.kv_pool_override(),
         kv_disk: args.kv_disk_options()?,
         kv_memory_max_bytes: Some(args.kv_memory_max_bytes()),

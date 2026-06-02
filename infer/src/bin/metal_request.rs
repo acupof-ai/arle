@@ -256,6 +256,7 @@ fn main() -> Result<()> {
                     draft_model: draft_model.clone(),
                     speculative_tokens: args.speculative_tokens,
                 }),
+            mtp: None,
             kv_pool: args.kv_pool_override(),
             kv_disk: args.kv_disk_options()?,
             kv_memory_max_bytes: None,
