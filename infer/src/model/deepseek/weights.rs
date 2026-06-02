@@ -18,7 +18,7 @@ use log::info;
 use safetensors::Dtype;
 
 #[cfg(feature = "cuda")]
-use super::batch_decode::DeepseekBatchDecodeBuffers;
+use super::batch_decode::{DeepseekBatchDecodeBuffers, DeepseekBodyGraphRun};
 use super::config::DeepseekRuntimeConfig;
 #[cfg(feature = "cuda")]
 use super::load::load_dsv4_matrix_raw;
@@ -979,6 +979,7 @@ impl DeepseekModel {
                 &mut layer_cache.attention,
                 compress_ratio,
                 head_dim,
+                Some(row_start_pos_ptr_u64),
             )?;
         }
         dsv4_trace_end(
@@ -1504,63 +1505,320 @@ impl DeepseekModel {
             Ok(())
         })?;
 
-        {
-            for layer_idx in 0..num_layers {
-                let layer = &self.layers[layer_idx];
+        let body_graph_enabled = dsv4_decode_body_cuda_graph_enabled()?
+            && self.dsv4_decode_body_graph_ready(states, slot_indices, &start_pos, num_layers)?;
+        let body_graph_force_eager = graph_force_eager || !body_graph_enabled;
+        let body_graph_run = decode_ctx.run_body_graph(
+            &self.ctx,
+            n,
+            slot_indices,
+            body_graph_force_eager,
+            |decode_ctx| {
+                for layer_idx in 0..num_layers {
+                    let layer = &self.layers[layer_idx];
 
-                // --- Attention half: batch MHC/pre/norm/QKV/post. The
-                // per-slot cache-bound FlashMLA/legacy attention core remains
-                // row-looped until batch FlashMLA owns metadata replay.
-                {
-                    let attention = &layer.attention;
-                    let compress_ratio =
-                        *self.config.compress_ratios.get(layer_idx).ok_or_else(|| {
-                            anyhow::anyhow!("DeepSeek V4 layer {layer_idx} missing compress_ratio")
-                        })?;
-                    let mode = self
-                        .config
-                        .attention_mode_for_compress_ratio(compress_ratio);
-                    ensure!(
-                        attention.wq_a.rows == attn_c_q_dim,
-                        "DSv4 batched attention c_q dim changed at layer {}: {} != {}",
-                        layer_idx,
-                        attention.wq_a.rows,
-                        attn_c_q_dim
-                    );
-                    ensure!(
-                        attention.wq_b.rows == attn_local_width,
-                        "DSv4 batched attention local width changed at layer {}: {} != {}",
-                        layer_idx,
-                        attention.wq_b.rows,
-                        attn_local_width
-                    );
-                    ensure!(
-                        attn_head_dim > 0 && attn_local_width % attn_head_dim == 0,
-                        "DSv4 batched attention local width {} is not divisible by head_dim {}",
-                        attn_local_width,
-                        attn_head_dim
-                    );
-                    ensure!(
-                        attention.wkv.rows == attn_head_dim,
-                        "DSv4 batched attention KV dim changed at layer {}: {} != {}",
-                        layer_idx,
-                        attention.wkv.rows,
-                        attn_head_dim
-                    );
-                    let local_heads = attn_local_width / attn_head_dim;
-                    let batch_flashmla_hca = self.prepare_hca_flashmla_decode_batch_launch(
-                        layer_idx,
-                        decode_ctx,
-                        states,
-                        slot_indices,
-                        &start_pos,
-                        n,
-                        local_heads,
-                        attn_head_dim,
-                        compress_ratio,
-                        mode,
-                    )?;
+                    // --- Attention half: batch MHC/pre/norm/QKV/post. The
+                    // per-slot cache-bound FlashMLA/legacy attention core remains
+                    // row-looped until batch FlashMLA owns metadata replay.
+                    {
+                        let attention = &layer.attention;
+                        let compress_ratio =
+                            *self.config.compress_ratios.get(layer_idx).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "DeepSeek V4 layer {layer_idx} missing compress_ratio"
+                                )
+                            })?;
+                        let mode = self
+                            .config
+                            .attention_mode_for_compress_ratio(compress_ratio);
+                        ensure!(
+                            attention.wq_a.rows == attn_c_q_dim,
+                            "DSv4 batched attention c_q dim changed at layer {}: {} != {}",
+                            layer_idx,
+                            attention.wq_a.rows,
+                            attn_c_q_dim
+                        );
+                        ensure!(
+                            attention.wq_b.rows == attn_local_width,
+                            "DSv4 batched attention local width changed at layer {}: {} != {}",
+                            layer_idx,
+                            attention.wq_b.rows,
+                            attn_local_width
+                        );
+                        ensure!(
+                            attn_head_dim > 0 && attn_local_width % attn_head_dim == 0,
+                            "DSv4 batched attention local width {} is not divisible by head_dim {}",
+                            attn_local_width,
+                            attn_head_dim
+                        );
+                        ensure!(
+                            attention.wkv.rows == attn_head_dim,
+                            "DSv4 batched attention KV dim changed at layer {}: {} != {}",
+                            layer_idx,
+                            attention.wkv.rows,
+                            attn_head_dim
+                        );
+                        let local_heads = attn_local_width / attn_head_dim;
+                        let batch_flashmla_hca = self.prepare_hca_flashmla_decode_batch_launch(
+                            layer_idx,
+                            decode_ctx,
+                            states,
+                            slot_indices,
+                            &start_pos,
+                            n,
+                            local_heads,
+                            attn_head_dim,
+                            compress_ratio,
+                            mode,
+                        )?;
 
+                        let scratch = decode_ctx.ensure_batched_scratch(
+                            &self.ctx,
+                            hidden_size,
+                            stream_hidden_dim,
+                            attn_c_q_dim,
+                            attn_local_width,
+                            attn_head_dim,
+                            attn_output_latent_dim,
+                            head_hc.mix_fn.rows,
+                            self.config.vocab_size,
+                            n,
+                        )?;
+                        let (start_pos_base_ptr, _start_pos_guard) =
+                            scratch.start_pos_gpu.device_ptr(&self.ctx.stream);
+                        let start_pos_i32_size = std::mem::size_of::<i32>();
+                        let (
+                            stream,
+                            attn_mhc,
+                            attn_pre,
+                            attn_normed,
+                            attn_normed_row,
+                            attn_c_q,
+                            attn_c_q_normed,
+                            attn_c_q_normed_row,
+                            attn_q_raw,
+                            attn_q_raw_row,
+                            attn_kv_raw,
+                            attn_kv_normed,
+                            attn_kv_normed_row,
+                            attn_q_prepared,
+                            attn_k_prepared,
+                            attn_local,
+                            attn_local_row,
+                            attn_latent_row,
+                            attn_out,
+                            attn_out_row,
+                            attn_stream,
+                        ) = (
+                            &scratch.stream,
+                            &mut scratch.attn_mhc,
+                            &mut scratch.attn_pre,
+                            &mut scratch.attn_normed,
+                            &mut scratch.attn_normed_row,
+                            &mut scratch.attn_c_q,
+                            &mut scratch.attn_c_q_normed,
+                            &mut scratch.attn_c_q_normed_row,
+                            &mut scratch.attn_q_raw,
+                            &mut scratch.attn_q_raw_row,
+                            &mut scratch.attn_kv_raw,
+                            &mut scratch.attn_kv_normed,
+                            &mut scratch.attn_kv_normed_row,
+                            &mut scratch.attn_q_prepared,
+                            &mut scratch.attn_k_prepared,
+                            &mut scratch.attn_local,
+                            &mut scratch.attn_local_row,
+                            &mut scratch.attn_latent_row,
+                            &mut scratch.attn_out,
+                            &mut scratch.attn_out_row,
+                            &mut scratch.attn_stream,
+                        );
+
+                        let trace = dsv4_trace_begin(&self.ctx)?;
+                        let attn_mhc_scratch = ensure_mhc_scratch(
+                            attn_mhc,
+                            &self.ctx,
+                            stream_hidden_dim,
+                            layer.hc_attn.mix_fn.rows,
+                            hc_mult,
+                            n,
+                        )?;
+                        let mhc = MhcParamsView::Cached(gen_mhc_params_cached(
+                            &self.ctx,
+                            &layer.hc_attn,
+                            stream,
+                            hc_mult,
+                            self.config.hc_eps,
+                            self.config.hc_sinkhorn_iters,
+                            attn_mhc_scratch,
+                        )?);
+                        dsv4_trace_end(&self.ctx, "attn_mhc", layer_idx, n, trace)?;
+
+                        let trace = dsv4_trace_begin(&self.ctx)?;
+                        hc_pre_from_stream_into(
+                            &self.ctx,
+                            stream,
+                            mhc.pre(),
+                            hidden_size,
+                            hc_mult,
+                            attn_pre,
+                        )?;
+                        ops::rms_norm_batch_into(
+                            &self.ctx,
+                            attn_pre,
+                            &layer.attn_norm,
+                            self.config.rms_norm_eps,
+                            attn_normed,
+                        );
+                        dsv4_trace_end(&self.ctx, "attn_pre_norm", layer_idx, n, trace)?;
+
+                        let trace = dsv4_trace_begin(&self.ctx)?;
+                        ops::try_gemm_with_phase_into(
+                            &self.ctx,
+                            &attention.wq_a,
+                            attn_normed,
+                            attn_c_q,
+                            ops::LinearDispatchPhase::Decode,
+                        )?;
+                        ops::rms_norm_batch_into(
+                            &self.ctx,
+                            attn_c_q,
+                            &attention.q_norm,
+                            self.config.rms_norm_eps,
+                            attn_c_q_normed,
+                        );
+                        ops::try_gemm_with_phase_into(
+                            &self.ctx,
+                            &attention.wq_b,
+                            attn_c_q_normed,
+                            attn_q_raw,
+                            ops::LinearDispatchPhase::Decode,
+                        )?;
+                        ops::try_gemm_with_phase_into(
+                            &self.ctx,
+                            &attention.wkv,
+                            attn_normed,
+                            attn_kv_raw,
+                            ops::LinearDispatchPhase::Decode,
+                        )?;
+                        ops::rms_norm_batch_into(
+                            &self.ctx,
+                            attn_kv_raw,
+                            &attention.kv_norm,
+                            self.config.rms_norm_eps,
+                            attn_kv_normed,
+                        );
+                        dsv4_trace_end(&self.ctx, "attn_proj", layer_idx, n, trace)?;
+
+                        let trace = dsv4_trace_begin(&self.ctx)?;
+                        let batch_flashmla_done = if let Some(launch) = batch_flashmla_hca.as_ref()
+                        {
+                            self.forward_hca_flashmla_decode_batch_core_into(
+                                layer_idx,
+                                attention,
+                                attn_normed,
+                                attn_normed_row,
+                                attn_q_raw,
+                                attn_kv_normed,
+                                &scratch.start_pos_gpu,
+                                attn_q_prepared,
+                                attn_k_prepared,
+                                attn_local,
+                                attn_local_row,
+                                attn_latent_row,
+                                attn_out,
+                                attn_out_row,
+                                states,
+                                slot_indices,
+                                &start_pos,
+                                local_heads,
+                                attn_local_width,
+                                attn_head_dim,
+                                compress_ratio,
+                                launch,
+                            )?;
+                            true
+                        } else {
+                            false
+                        };
+                        if !batch_flashmla_done {
+                            for (row, &slot_idx) in slot_indices.iter().enumerate() {
+                                extract_hidden_token_with_width_into(
+                                    &self.ctx,
+                                    attn_normed,
+                                    row,
+                                    hidden_size,
+                                    attn_normed_row,
+                                )?;
+                                extract_hidden_token_with_width_into(
+                                    &self.ctx,
+                                    attn_c_q_normed,
+                                    row,
+                                    attn_c_q_dim,
+                                    attn_c_q_normed_row,
+                                )?;
+                                extract_hidden_token_with_width_into(
+                                    &self.ctx,
+                                    attn_q_raw,
+                                    row,
+                                    attn_local_width,
+                                    attn_q_raw_row,
+                                )?;
+                                extract_hidden_token_with_width_into(
+                                    &self.ctx,
+                                    attn_kv_normed,
+                                    row,
+                                    attn_head_dim,
+                                    attn_kv_normed_row,
+                                )?;
+                                let layer_cache = states[slot_idx]
+                                    .incremental
+                                    .layers
+                                    .get_mut(layer_idx)
+                                    .expect("incremental cache layer initialized");
+                                let row_start_pos_ptr_u64 =
+                                    start_pos_base_ptr as u64 + (row * start_pos_i32_size) as u64;
+                                self.forward_attention_gpu_into(
+                                    layer_idx,
+                                    attention,
+                                    attn_normed_row,
+                                    attn_c_q_normed_row,
+                                    attn_q_raw_row,
+                                    attn_kv_normed_row,
+                                    1,
+                                    start_pos[row],
+                                    Some(row_start_pos_ptr_u64),
+                                    local_heads,
+                                    attn_local_width,
+                                    attn_head_dim,
+                                    compress_ratio,
+                                    mode,
+                                    Some(&mut layer_cache.attention),
+                                    attn_out_row,
+                                )?;
+                                write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
+                            }
+                        }
+                        dsv4_trace_end(&self.ctx, "attn_core", layer_idx, n, trace)?;
+
+                        let trace = dsv4_trace_begin(&self.ctx)?;
+                        hc_post_to_stream_into(
+                            &self.ctx,
+                            attn_out,
+                            stream,
+                            mhc.post(),
+                            mhc.comb(),
+                            hidden_size,
+                            hc_mult,
+                            attn_stream,
+                        )?;
+                        dsv4_trace_end(&self.ctx, "attn_post", layer_idx, n, trace)?;
+                    }
+
+                    // --- FFN half: ONE batched call over all N rows. ---
+                    // The routed-MoE expert GEMMs + NCCL all-reduce amortize over N.
+                    // Uses the first row's per-layer FFN/MoE scratch (pure capacity
+                    // scratch, no persistent per-sequence state). `tokens` only sizes
+                    // route capacity; values are row-independent for MoE routing.
                     let scratch = decode_ctx.ensure_batched_scratch(
                         &self.ctx,
                         hidden_size,
@@ -1573,294 +1831,59 @@ impl DeepseekModel {
                         self.config.vocab_size,
                         n,
                     )?;
-                    let (start_pos_base_ptr, _start_pos_guard) =
-                        scratch.start_pos_gpu.device_ptr(&self.ctx.stream);
-                    let start_pos_i32_size = std::mem::size_of::<i32>();
-                    let (
-                        stream,
-                        attn_mhc,
-                        attn_pre,
-                        attn_normed,
-                        attn_normed_row,
-                        attn_c_q,
-                        attn_c_q_normed,
-                        attn_c_q_normed_row,
-                        attn_q_raw,
-                        attn_q_raw_row,
-                        attn_kv_raw,
-                        attn_kv_normed,
-                        attn_kv_normed_row,
-                        attn_q_prepared,
-                        attn_k_prepared,
-                        attn_local,
-                        attn_local_row,
-                        attn_latent_row,
-                        attn_out,
-                        attn_out_row,
-                        attn_stream,
-                    ) = (
-                        &scratch.stream,
-                        &mut scratch.attn_mhc,
-                        &mut scratch.attn_pre,
-                        &mut scratch.attn_normed,
-                        &mut scratch.attn_normed_row,
-                        &mut scratch.attn_c_q,
-                        &mut scratch.attn_c_q_normed,
-                        &mut scratch.attn_c_q_normed_row,
-                        &mut scratch.attn_q_raw,
-                        &mut scratch.attn_q_raw_row,
-                        &mut scratch.attn_kv_raw,
-                        &mut scratch.attn_kv_normed,
-                        &mut scratch.attn_kv_normed_row,
-                        &mut scratch.attn_q_prepared,
-                        &mut scratch.attn_k_prepared,
-                        &mut scratch.attn_local,
-                        &mut scratch.attn_local_row,
-                        &mut scratch.attn_latent_row,
-                        &mut scratch.attn_out,
-                        &mut scratch.attn_out_row,
-                        &mut scratch.attn_stream,
-                    );
-
+                    let ffn_slot = slot_indices[0];
+                    let layer_cache = states[ffn_slot]
+                        .incremental
+                        .layers
+                        .get_mut(layer_idx)
+                        .expect("incremental cache layer initialized");
                     let trace = dsv4_trace_begin(&self.ctx)?;
-                    let attn_mhc_scratch = ensure_mhc_scratch(
-                        attn_mhc,
+                    let ffn_mhc_scratch = ensure_mhc_scratch(
+                        &mut layer_cache.ffn_mhc,
                         &self.ctx,
                         stream_hidden_dim,
-                        layer.hc_attn.mix_fn.rows,
+                        layer.hc_ffn.mix_fn.rows,
                         hc_mult,
                         n,
                     )?;
-                    let mhc = MhcParamsView::Cached(gen_mhc_params_cached(
-                        &self.ctx,
-                        &layer.hc_attn,
-                        stream,
-                        hc_mult,
-                        self.config.hc_eps,
-                        self.config.hc_sinkhorn_iters,
-                        attn_mhc_scratch,
-                    )?);
-                    dsv4_trace_end(&self.ctx, "attn_mhc", layer_idx, n, trace)?;
-
-                    let trace = dsv4_trace_begin(&self.ctx)?;
-                    hc_pre_from_stream_into(
-                        &self.ctx,
-                        stream,
-                        mhc.pre(),
-                        hidden_size,
-                        hc_mult,
-                        attn_pre,
+                    self.forward_ffn_layer_stream_with_scratch_into(
+                        layer_idx,
+                        &scratch.attn_stream,
+                        tokens,
+                        Some(&mut layer_cache.moe),
+                        Some(ffn_mhc_scratch),
+                        Some(&mut layer_cache.ffn_pre),
+                        Some(&mut layer_cache.ffn_normed),
+                        &mut scratch.stream,
                     )?;
-                    ops::rms_norm_batch_into(
-                        &self.ctx,
-                        attn_pre,
-                        &layer.attn_norm,
-                        self.config.rms_norm_eps,
-                        attn_normed,
-                    );
-                    dsv4_trace_end(&self.ctx, "attn_pre_norm", layer_idx, n, trace)?;
-
-                    let trace = dsv4_trace_begin(&self.ctx)?;
-                    ops::try_gemm_with_phase_into(
-                        &self.ctx,
-                        &attention.wq_a,
-                        attn_normed,
-                        attn_c_q,
-                        ops::LinearDispatchPhase::Decode,
-                    )?;
-                    ops::rms_norm_batch_into(
-                        &self.ctx,
-                        attn_c_q,
-                        &attention.q_norm,
-                        self.config.rms_norm_eps,
-                        attn_c_q_normed,
-                    );
-                    ops::try_gemm_with_phase_into(
-                        &self.ctx,
-                        &attention.wq_b,
-                        attn_c_q_normed,
-                        attn_q_raw,
-                        ops::LinearDispatchPhase::Decode,
-                    )?;
-                    ops::try_gemm_with_phase_into(
-                        &self.ctx,
-                        &attention.wkv,
-                        attn_normed,
-                        attn_kv_raw,
-                        ops::LinearDispatchPhase::Decode,
-                    )?;
-                    ops::rms_norm_batch_into(
-                        &self.ctx,
-                        attn_kv_raw,
-                        &attention.kv_norm,
-                        self.config.rms_norm_eps,
-                        attn_kv_normed,
-                    );
-                    dsv4_trace_end(&self.ctx, "attn_proj", layer_idx, n, trace)?;
-
-                    let trace = dsv4_trace_begin(&self.ctx)?;
-                    let batch_flashmla_done = if let Some(launch) = batch_flashmla_hca.as_ref() {
-                        self.forward_hca_flashmla_decode_batch_core_into(
-                            layer_idx,
-                            attention,
-                            attn_normed,
-                            attn_normed_row,
-                            attn_q_raw,
-                            attn_kv_normed,
-                            &scratch.start_pos_gpu,
-                            attn_q_prepared,
-                            attn_k_prepared,
-                            attn_local,
-                            attn_local_row,
-                            attn_latent_row,
-                            attn_out,
-                            attn_out_row,
-                            states,
-                            slot_indices,
-                            &start_pos,
-                            local_heads,
-                            attn_local_width,
-                            attn_head_dim,
-                            compress_ratio,
-                            launch,
-                        )?;
-                        true
-                    } else {
-                        false
-                    };
-                    if !batch_flashmla_done {
-                        for (row, &slot_idx) in slot_indices.iter().enumerate() {
-                            extract_hidden_token_with_width_into(
-                                &self.ctx,
-                                attn_normed,
-                                row,
-                                hidden_size,
-                                attn_normed_row,
-                            )?;
-                            extract_hidden_token_with_width_into(
-                                &self.ctx,
-                                attn_c_q_normed,
-                                row,
-                                attn_c_q_dim,
-                                attn_c_q_normed_row,
-                            )?;
-                            extract_hidden_token_with_width_into(
-                                &self.ctx,
-                                attn_q_raw,
-                                row,
-                                attn_local_width,
-                                attn_q_raw_row,
-                            )?;
-                            extract_hidden_token_with_width_into(
-                                &self.ctx,
-                                attn_kv_normed,
-                                row,
-                                attn_head_dim,
-                                attn_kv_normed_row,
-                            )?;
-                            let layer_cache = states[slot_idx]
-                                .incremental
-                                .layers
-                                .get_mut(layer_idx)
-                                .expect("incremental cache layer initialized");
-                            let row_start_pos_ptr_u64 =
-                                start_pos_base_ptr as u64 + (row * start_pos_i32_size) as u64;
-                            self.forward_attention_gpu_into(
-                                layer_idx,
-                                attention,
-                                attn_normed_row,
-                                attn_c_q_normed_row,
-                                attn_q_raw_row,
-                                attn_kv_normed_row,
-                                1,
-                                start_pos[row],
-                                Some(row_start_pos_ptr_u64),
-                                local_heads,
-                                attn_local_width,
-                                attn_head_dim,
-                                compress_ratio,
-                                mode,
-                                Some(&mut layer_cache.attention),
-                                attn_out_row,
-                            )?;
-                            write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
-                        }
-                    }
-                    dsv4_trace_end(&self.ctx, "attn_core", layer_idx, n, trace)?;
-
-                    let trace = dsv4_trace_begin(&self.ctx)?;
-                    hc_post_to_stream_into(
-                        &self.ctx,
-                        attn_out,
-                        stream,
-                        mhc.post(),
-                        mhc.comb(),
-                        hidden_size,
-                        hc_mult,
-                        attn_stream,
-                    )?;
-                    dsv4_trace_end(&self.ctx, "attn_post", layer_idx, n, trace)?;
+                    dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
                 }
-
-                // --- FFN half: ONE batched call over all N rows. ---
-                // The routed-MoE expert GEMMs + NCCL all-reduce amortize over N.
-                // Uses the first row's per-layer FFN/MoE scratch (pure capacity
-                // scratch, no persistent per-sequence state). `tokens` only sizes
-                // route capacity; values are row-independent for MoE routing.
-                let scratch = decode_ctx.ensure_batched_scratch(
-                    &self.ctx,
-                    hidden_size,
-                    stream_hidden_dim,
-                    attn_c_q_dim,
-                    attn_local_width,
-                    attn_head_dim,
-                    attn_output_latent_dim,
-                    head_hc.mix_fn.rows,
-                    self.config.vocab_size,
-                    n,
-                )?;
-                let ffn_slot = slot_indices[0];
-                let layer_cache = states[ffn_slot]
-                    .incremental
-                    .layers
-                    .get_mut(layer_idx)
-                    .expect("incremental cache layer initialized");
-                let trace = dsv4_trace_begin(&self.ctx)?;
-                let ffn_mhc_scratch = ensure_mhc_scratch(
-                    &mut layer_cache.ffn_mhc,
-                    &self.ctx,
-                    stream_hidden_dim,
-                    layer.hc_ffn.mix_fn.rows,
-                    hc_mult,
-                    n,
-                )?;
-                self.forward_ffn_layer_stream_with_scratch_into(
-                    layer_idx,
-                    &scratch.attn_stream,
-                    tokens,
-                    Some(&mut layer_cache.moe),
-                    Some(ffn_mhc_scratch),
-                    Some(&mut layer_cache.ffn_pre),
-                    Some(&mut layer_cache.ffn_normed),
-                    &mut scratch.stream,
-                )?;
-                dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
-            }
-            let scratch = decode_ctx.ensure_batched_scratch(
-                &self.ctx,
-                hidden_size,
-                stream_hidden_dim,
-                attn_c_q_dim,
-                attn_local_width,
-                attn_head_dim,
-                attn_output_latent_dim,
-                head_hc.mix_fn.rows,
-                self.config.vocab_size,
-                n,
+                Ok(())
+            },
+        )?;
+        if body_graph_run == DeepseekBodyGraphRun::Replayed {
+            self.advance_dsv4_decode_graph_replay_metadata(
+                states,
+                slot_indices,
+                &start_pos,
+                num_layers,
             )?;
-            for (row, &slot_idx) in slot_indices.iter().enumerate() {
-                self.save_target_pre_head_stream(&scratch.stream, row, &mut states[slot_idx])?;
-            }
+        }
+
+        let scratch = decode_ctx.ensure_batched_scratch(
+            &self.ctx,
+            hidden_size,
+            stream_hidden_dim,
+            attn_c_q_dim,
+            attn_local_width,
+            attn_head_dim,
+            attn_output_latent_dim,
+            head_hc.mix_fn.rows,
+            self.config.vocab_size,
+            n,
+        )?;
+        for (row, &slot_idx) in slot_indices.iter().enumerate() {
+            self.save_target_pre_head_stream(&scratch.stream, row, &mut states[slot_idx])?;
         }
 
         decode_ctx.run_head_piece_graph(&self.ctx, n, graph_force_eager, |scratch| {
@@ -1940,6 +1963,153 @@ impl DeepseekModel {
                 .stream
                 .memcpy_dtod(&src, &mut state.decode_logits.data)
                 .map_err(|err| anyhow::anyhow!("DSv4 logits D2D scatter failed: {err}"))?;
+        }
+        Ok(())
+    }
+
+    fn dsv4_decode_body_graph_ready(
+        &self,
+        states: &[super::state::DeepseekState],
+        slot_indices: &[usize],
+        start_pos: &[usize],
+        num_layers: usize,
+    ) -> Result<bool> {
+        if slot_indices.len() != start_pos.len() || slot_indices.is_empty() {
+            return Ok(false);
+        }
+        if std::env::var("INFER_DEBUG_DUMP").is_ok() || super::trace::dsv4_operator_trace_enabled()
+        {
+            return Ok(false);
+        }
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        {
+            if dsv4_combine_overlap_enabled() || dsv4_flashmla_tp_overlap_enabled()? {
+                return Ok(false);
+            }
+        }
+        if self.config.tp.world_size > 1 && !dsv4_nccl_graph_capture_enabled()? {
+            return Ok(false);
+        }
+        if self.config.ep.world_size > 1 && dsv4_moe_deepep_enabled()? {
+            return Ok(false);
+        }
+        for (row, &slot_idx) in slot_indices.iter().enumerate() {
+            let Some(state) = states.get(slot_idx) else {
+                return Ok(false);
+            };
+            if state.incremental.layers.len() < num_layers {
+                return Ok(false);
+            }
+            for layer_idx in 0..num_layers {
+                let compress_ratio =
+                    *self.config.compress_ratios.get(layer_idx).ok_or_else(|| {
+                        anyhow::anyhow!("DeepSeek V4 layer {layer_idx} missing compress_ratio")
+                    })?;
+                if compress_ratio == 0 {
+                    continue;
+                }
+                let attention_cache = &state.incremental.layers[layer_idx].attention;
+                let compressed = attention_cache.compressed_gpu.as_ref();
+                let Some(compressed) = compressed else {
+                    return Ok(false);
+                };
+                if compressed.pending_len != start_pos[row] % compress_ratio
+                    || compressed.compressed_rows != start_pos[row] / compress_ratio
+                {
+                    return Ok(false);
+                }
+                let mode = self
+                    .config
+                    .attention_mode_for_compress_ratio(compress_ratio);
+                if matches!(
+                    mode,
+                    deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse
+                ) {
+                    let Some(indexer) = attention_cache.indexer_gpu.as_ref() else {
+                        return Ok(false);
+                    };
+                    if indexer.pending_len != start_pos[row] % compress_ratio
+                        || indexer.compressed_rows != start_pos[row] / compress_ratio
+                    {
+                        return Ok(false);
+                    }
+                }
+                if dsv4_flashmla_decode_enabled()?
+                    && dsv4_shared_kv_pool_enabled()?
+                    && attention_cache.fp8_kv_pool_ptr != 0
+                    && !attention_cache.fp8_kv_sw_bootstrapped
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn advance_dsv4_decode_graph_replay_metadata(
+        &self,
+        states: &mut [super::state::DeepseekState],
+        slot_indices: &[usize],
+        start_pos: &[usize],
+        num_layers: usize,
+    ) -> Result<()> {
+        ensure!(
+            slot_indices.len() == start_pos.len(),
+            "DSv4 body graph replay metadata shape mismatch: slots={} start_pos={}",
+            slot_indices.len(),
+            start_pos.len()
+        );
+        for (row, &slot_idx) in slot_indices.iter().enumerate() {
+            let state_count = states.len();
+            let state = states.get_mut(slot_idx).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DSv4 body graph replay slot {slot_idx} out of range for {} states",
+                    state_count
+                )
+            })?;
+            state.incremental.ensure_layers(num_layers);
+            for layer_idx in 0..num_layers {
+                let compress_ratio =
+                    *self.config.compress_ratios.get(layer_idx).ok_or_else(|| {
+                        anyhow::anyhow!("DeepSeek V4 layer {layer_idx} missing compress_ratio")
+                    })?;
+                if compress_ratio == 0 {
+                    continue;
+                }
+                let attention_cache = &mut state.incremental.layers[layer_idx].attention;
+                advance_dsv4_compressor_replay_metadata(
+                    attention_cache.compressed_gpu.as_mut(),
+                    start_pos[row],
+                    compress_ratio,
+                    "compressed",
+                )?;
+                let mode = self
+                    .config
+                    .attention_mode_for_compress_ratio(compress_ratio);
+                if matches!(
+                    mode,
+                    deepseek_spec::DeepSeekV4AttentionMode::CompressedSparse
+                ) {
+                    advance_dsv4_compressor_replay_metadata(
+                        attention_cache.indexer_gpu.as_mut(),
+                        start_pos[row],
+                        compress_ratio,
+                        "indexer",
+                    )?;
+                }
+                if dsv4_flashmla_decode_enabled()?
+                    && dsv4_shared_kv_pool_enabled()?
+                    && attention_cache.fp8_kv_pool_ptr != 0
+                {
+                    ensure!(
+                        attention_cache.fp8_kv_sw_bootstrapped,
+                        "DSv4 body graph replay requires slot {slot_idx} layer {layer_idx} SW bootstrap before capture"
+                    );
+                    if let Some(cache) = attention_cache.compressed_gpu.as_ref() {
+                        attention_cache.fp8_kv_comp_packed_rows = cache.compressed_rows;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -3251,30 +3421,56 @@ impl DeepseekModel {
             let (sink_ptr, _sink_guard) = attention.attn_sink.data.device_ptr(&self.ctx.stream);
             let (out_ptr, _out_guard) = local_attn.data.device_ptr_mut(&self.ctx.stream);
             unsafe {
-                ffi::dsv4_swa_attention_cuda(
-                    q_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    window_ptr as *mut ffi::Half,
-                    sink_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    head_dim as i32,
-                    self.config.sliding_window as i32,
-                    start_pos as i32,
-                    (self.config.tp.rank * local_heads) as i32,
-                    1.0 / (head_dim as f32).sqrt(),
-                    self.config.qk_rope_head_dim as i32,
-                    rope_base,
-                    original_seq_len,
-                    rope_params.factor,
-                    rope_params.beta_fast,
-                    rope_params.beta_slow,
-                    i32::from(fuse_window_update),
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU SWA attention failed: {err}"))?;
+                let status = if let Some(start_pos_ptr_u64) = start_pos_ptr_u64 {
+                    ffi::dsv4_swa_attention_start_pos_ptr_cuda(
+                        q_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        sink_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        self.config.sliding_window as i32,
+                        start_pos_ptr_u64 as *const i32,
+                        (self.config.tp.rank * local_heads) as i32,
+                        1.0 / (head_dim as f32).sqrt(),
+                        self.config.qk_rope_head_dim as i32,
+                        rope_base,
+                        original_seq_len,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        i32::from(fuse_window_update),
+                        self.ctx.stream.cu_stream(),
+                    )
+                } else {
+                    ffi::dsv4_swa_attention_cuda(
+                        q_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        sink_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        self.config.sliding_window as i32,
+                        start_pos as i32,
+                        (self.config.tp.rank * local_heads) as i32,
+                        1.0 / (head_dim as f32).sqrt(),
+                        self.config.qk_rope_head_dim as i32,
+                        rope_base,
+                        original_seq_len,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        i32::from(fuse_window_update),
+                        self.ctx.stream.cu_stream(),
+                    )
+                };
+                status.result().map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 GPU SWA attention failed: {err}")
+                })?;
             }
         }
         dsv4_trace_end(&self.ctx, "attn_swa_kernel", layer_idx, token_count, trace)?;
@@ -3784,7 +3980,12 @@ impl DeepseekModel {
                 true
             };
             if pack_compressor {
-                self.dsv4_flashmla_compressor_pack_hook(cache, compress_ratio, head_dim)?;
+                self.dsv4_flashmla_compressor_pack_hook(
+                    cache,
+                    compress_ratio,
+                    head_dim,
+                    start_pos_ptr_u64,
+                )?;
             }
         }
 
@@ -5402,36 +5603,68 @@ impl DeepseekModel {
                         .device_ptr_mut(&self.ctx.stream)
                 };
                 unsafe {
-                    ffi::dsv4_hybrid_attention_cuda(
-                        q_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        window_ptr as *mut ffi::Half,
-                        compressed_ptr,
-                        selected_ptr,
-                        sink_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        token_count as i32,
-                        local_heads as i32,
-                        head_dim as i32,
-                        self.config.sliding_window as i32,
-                        start_pos as i32,
-                        (self.config.tp.rank * local_heads) as i32,
-                        1.0 / (head_dim as f32).sqrt(),
-                        self.config.qk_rope_head_dim as i32,
-                        rope_base,
-                        original_seq_len as i32,
-                        rope_params.factor,
-                        rope_params.beta_fast,
-                        rope_params.beta_slow,
-                        mode_int,
-                        compress_ratio as i32,
-                        compressed_count as i32,
-                        self.config.index_topk as i32,
-                        i32::from(fuse_window_update),
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU attention failed: {err}"))?;
+                    let status = if let Some(start_pos_ptr_u64) = start_pos_ptr_u64 {
+                        ffi::dsv4_hybrid_attention_start_pos_ptr_cuda(
+                            q_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            window_ptr as *mut ffi::Half,
+                            compressed_ptr,
+                            selected_ptr,
+                            sink_ptr as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            self.config.sliding_window as i32,
+                            start_pos_ptr_u64 as *const i32,
+                            (self.config.tp.rank * local_heads) as i32,
+                            1.0 / (head_dim as f32).sqrt(),
+                            self.config.qk_rope_head_dim as i32,
+                            rope_base,
+                            original_seq_len as i32,
+                            rope_params.factor,
+                            rope_params.beta_fast,
+                            rope_params.beta_slow,
+                            mode_int,
+                            compress_ratio as i32,
+                            compressed_count as i32,
+                            self.config.index_topk as i32,
+                            i32::from(fuse_window_update),
+                            self.ctx.stream.cu_stream(),
+                        )
+                    } else {
+                        ffi::dsv4_hybrid_attention_cuda(
+                            q_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            window_ptr as *mut ffi::Half,
+                            compressed_ptr,
+                            selected_ptr,
+                            sink_ptr as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            self.config.sliding_window as i32,
+                            start_pos as i32,
+                            (self.config.tp.rank * local_heads) as i32,
+                            1.0 / (head_dim as f32).sqrt(),
+                            self.config.qk_rope_head_dim as i32,
+                            rope_base,
+                            original_seq_len as i32,
+                            rope_params.factor,
+                            rope_params.beta_fast,
+                            rope_params.beta_slow,
+                            mode_int,
+                            compress_ratio as i32,
+                            compressed_count as i32,
+                            self.config.index_topk as i32,
+                            i32::from(fuse_window_update),
+                            self.ctx.stream.cu_stream(),
+                        )
+                    };
+                    status.result().map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 GPU attention failed: {err}")
+                    })?;
                 }
             }
             drop(compressed_guard);
@@ -5849,6 +6082,7 @@ impl DeepseekModel {
         cache: &mut DeepseekAttentionRuntimeCache,
         compress_ratio: usize,
         head_dim: usize,
+        start_pos_ptr_u64: Option<u64>,
     ) -> Result<()> {
         ensure!(
             head_dim == DSV4_FLASHMLA_MODEL1_HEAD_DIM,
@@ -5859,9 +6093,6 @@ impl DeepseekModel {
             Some(c) => c.compressed_rows,
             None => return Ok(()),
         };
-        if compressed_rows <= cache.fp8_kv_comp_packed_rows {
-            return Ok(());
-        }
 
         // Pool layout — OFF: `max_position_embeddings`-based (byte-identical to
         // `main`); ON: the bound shared sub-range layout stamped at bind time.
@@ -5870,10 +6101,6 @@ impl DeepseekModel {
 
         // Borrow split: pool through the resolver, then read compressed bf16
         // pointer via separate immutable borrow.
-        let start_row = cache.fp8_kv_comp_packed_rows;
-        let end_row = compressed_rows;
-
-        // Extract bf16 compressor pointer first (immutable borrow scope).
         let (comp_bf16_ptr, comp_g) = {
             let c = cache.compressed_gpu.as_ref().expect("checked above");
             let buf = c
@@ -5891,6 +6118,26 @@ impl DeepseekModel {
         // so the ON bind is always present here.
         let pool_base_ptr =
             dsv4_flashmla_fp8_kv_pool_base_ptr(&self.ctx, cache, sw_blocks, comp_blocks)?;
+        if let Some(start_pos_ptr_u64) = start_pos_ptr_u64 {
+            cuda_kernels::attention::dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw(
+                &self.ctx,
+                comp_bf16_ptr_u64,
+                pool_base_ptr,
+                start_pos_ptr_u64,
+                compress_ratio,
+                sw_blocks,
+                DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE,
+                head_dim,
+            )?;
+            cache.fp8_kv_comp_packed_rows = compressed_rows;
+            return Ok(());
+        }
+        if compressed_rows <= cache.fp8_kv_comp_packed_rows {
+            return Ok(());
+        }
+
+        let start_row = cache.fp8_kv_comp_packed_rows;
+        let end_row = compressed_rows;
         // Take the comp_scratch out, run the pack, put it back (disjoint from
         // the pool — the helper writes only through the pool pointer + scratch).
         let mut comp_scratch = cache.fp8_kv_comp_scratch.take();
@@ -9238,6 +9485,54 @@ fn infer_real_reference_enabled() -> Result<bool> {
         "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
         _ => bail!("invalid ARLE_DSV4_INFER_REAL_REFERENCE value `{raw}`"),
     }
+}
+
+fn dsv4_decode_body_cuda_graph_enabled() -> Result<bool> {
+    Ok(dsv4_env_bool_override("ARLE_DSV4_DECODE_BODY_CUDA_GRAPH")?.unwrap_or(false))
+}
+
+fn dsv4_nccl_graph_capture_enabled() -> Result<bool> {
+    Ok(dsv4_env_bool_override("ARLE_DSV4_NCCL_GRAPH_CAPTURE")?.unwrap_or(false))
+}
+
+#[cfg(feature = "cuda")]
+fn advance_dsv4_compressor_replay_metadata(
+    cache: Option<&mut DeepseekGpuCompressorRuntimeCache>,
+    start_pos: usize,
+    ratio: usize,
+    label: &str,
+) -> Result<()> {
+    ensure!(ratio > 0, "DSv4 {label} replay ratio must be non-zero");
+    let cache = cache.ok_or_else(|| {
+        anyhow::anyhow!("DSv4 body graph replay missing {label} compressor cache")
+    })?;
+    ensure!(
+        cache.pending_len == start_pos % ratio,
+        "DSv4 body graph replay {label} pending_len mismatch: cache={} start_pos={} ratio={}",
+        cache.pending_len,
+        start_pos,
+        ratio
+    );
+    ensure!(
+        cache.compressed_rows == start_pos / ratio,
+        "DSv4 body graph replay {label} compressed_rows mismatch: cache={} start_pos={} ratio={}",
+        cache.compressed_rows,
+        start_pos,
+        ratio
+    );
+    let next_pos = start_pos
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("DSv4 body graph replay start_pos overflow"))?;
+    let next_rows = next_pos / ratio;
+    ensure!(
+        next_rows <= cache.compressed_capacity,
+        "DSv4 body graph replay {label} compressed_rows {} exceeds capacity {}",
+        next_rows,
+        cache.compressed_capacity
+    );
+    cache.compressed_rows = next_rows;
+    cache.pending_len = next_pos % ratio;
+    Ok(())
 }
 
 fn dsv4_env_bool_override(key: &str) -> Result<Option<bool>> {

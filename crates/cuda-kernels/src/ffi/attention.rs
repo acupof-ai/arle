@@ -845,6 +845,17 @@ unsafe extern "C" {
         page_block_size: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda(
+        compressed: *const Half,
+        packed_kv: *mut u8,
+        start_pos: *const i32,
+        ratio: i32,
+        sw_blocks: i32,
+        page_block_size: i32,
+        stride_elems: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 // ============================================================================
