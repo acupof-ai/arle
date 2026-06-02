@@ -10,8 +10,8 @@ use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
-    GenerationState, MixedBatchOutcome, MixedBatchRequest, ModelForward, PrefillBatchRequest,
-    SchedulerRuntimeWorkspaceBudget, SpecVerifyOutput, SpecVerifyRequest,
+    CudaGraphDecodeSupport, GenerationState, MixedBatchOutcome, MixedBatchRequest, ModelForward,
+    PrefillBatchRequest, SchedulerRuntimeWorkspaceBudget, SpecVerifyOutput, SpecVerifyRequest,
     decode_metadata_page_capacity, prepare_paged_prefill_batch,
 };
 use crate::model_arch::ModelArchInfo;
@@ -499,8 +499,20 @@ impl ModelForward for Qwen35Model {
         Ok(())
     }
 
-    fn supports_cuda_graph_decode(&self) -> bool {
-        self.enable_cuda_graph && !self.uses_marlin_w4a8()
+    fn cuda_graph_decode_support(&self) -> CudaGraphDecodeSupport {
+        if !self.enable_cuda_graph {
+            return CudaGraphDecodeSupport::unsupported(
+                "CUDA Graph disabled by runtime configuration",
+            );
+        }
+        if self.uses_marlin_w4a8() {
+            return CudaGraphDecodeSupport::unsupported(
+                "Qwen3.5 Marlin W4A8 decode path is currently gated to eager",
+            );
+        }
+        CudaGraphDecodeSupport::piecewise(
+            "Qwen3.5 captures consecutive linear-attention layer groups piecewise",
+        )
     }
 
     fn select_token(

@@ -21,8 +21,8 @@ use super::weights::{DeepseekModel, dsv4_flashmla_decode_enabled, dsv4_shared_kv
 use crate::model::generation_state::GenerationStateBase;
 #[cfg(feature = "cuda")]
 use crate::model::{
-    MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
-    PrefillBatchRequest, prepare_paged_prefill_batch,
+    CudaGraphDecodeSupport, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest,
+    ModelForward, PrefillBatchRequest, prepare_paged_prefill_batch,
 };
 #[cfg(feature = "cuda")]
 use crate::model_arch::ModelArchInfo;
@@ -306,8 +306,16 @@ impl ModelForward for DeepseekModel {
         self.config.tp.world_size == 1 && self.config.ep.world_size == 1
     }
 
-    fn supports_cuda_graph_decode(&self) -> bool {
-        false
+    fn cuda_graph_decode_support(&self) -> CudaGraphDecodeSupport {
+        if !self.config.enable_cuda_graph {
+            return CudaGraphDecodeSupport::unsupported(
+                "CUDA Graph disabled by runtime configuration",
+            );
+        }
+        CudaGraphDecodeSupport::unsupported(
+            "DSv4 decode is not graph-safe yet: start_pos is captured as host launch params, \
+             decode still allocates per-step scratch, and TP/EP NCCL capture is unvalidated",
+        )
     }
 
     fn supports_prefill_warmup(&self) -> bool {
