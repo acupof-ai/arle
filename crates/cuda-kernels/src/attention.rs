@@ -268,13 +268,15 @@ pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
 ///
 /// Emits `indices[b, topk_unified]` and `topk_length[b]` in one launch, reading
 /// per-row absolute positions from `start_pos[b]`. Non-masked slot ids are
-/// shifted by `row * total_blocks * page_block_size`, matching FlashMLA's
-/// absolute slot addressing over one contiguous shared FP8 KV base.
+/// shifted by `slot_layer_block_offsets[row] * page_block_size`, matching
+/// FlashMLA's absolute slot addressing over one contiguous shared FP8 KV base.
+/// Active scheduler slots are not required to be row-contiguous.
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_flashmla_decode_build_indices_batched_raw(
     ctx: &DeviceContext,
     indices_ptr: u64,
     start_pos_ptr: u64,
+    slot_layer_block_offsets_ptr: u64,
     selected_ptr: u64,
     topk_length_ptr: u64,
     b: usize,
@@ -290,6 +292,7 @@ pub fn dsv4_flashmla_decode_build_indices_batched_raw(
         ffi::arle_dsv4_flashmla_decode_build_indices_batched_cuda(
             indices_ptr as *mut i32,
             start_pos_ptr as *const i32,
+            slot_layer_block_offsets_ptr as *const i32,
             selected_ptr as *const i32,
             topk_length_ptr as *mut i32,
             b as i32,
