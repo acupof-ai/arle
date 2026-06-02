@@ -399,6 +399,38 @@ struct TileLangKernelSpec {
     allow_sm70: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelSet {
+    Full,
+    Dsv4Flash,
+}
+
+impl KernelSet {
+    fn from_env() -> Self {
+        println!("cargo:rerun-if-env-changed=ARLE_CUDA_KERNEL_SET");
+        match std::env::var("ARLE_CUDA_KERNEL_SET") {
+            Ok(value) => match value.trim() {
+                "" | "full" | "all" => Self::Full,
+                "dsv4_flash" | "dsv4-flash" => Self::Dsv4Flash,
+                other => panic!(
+                    "Unsupported ARLE_CUDA_KERNEL_SET={other:?}. Supported values: full, dsv4_flash."
+                ),
+            },
+            Err(_) => Self::Full,
+        }
+    }
+
+    fn tilelang_aot_enabled(self) -> bool {
+        match self {
+            Self::Full => true,
+            // DSv4-Flash uses native CUDA C + FlashMLA, not ARLE's TileLang
+            // Qwen/GDR attention families. Stub those FFI symbols so a DSv4
+            // build can link without paying the TileLang AOT tax.
+            Self::Dsv4Flash => false,
+        }
+    }
+}
+
 fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
     let output = Command::new(candidate)
         .args(["-c", "import tilelang"])
@@ -774,6 +806,195 @@ fn build_tilelang_kernel(
         generated_sources.push(c);
     }
     generated_sources.push(wrapper_path);
+}
+
+fn write_tilelang_unsupported_stub(
+    out_dir: &Path,
+    artifact_dir: &str,
+    out_name: &str,
+    kernel_name: &str,
+    public_decl: &str,
+    generated_sources: &mut Vec<PathBuf>,
+) {
+    let public_name = format!("{kernel_name}_cuda");
+    let public_decl = format!("{public_name}({public_decl})");
+    let src = format!(
+        "#include <cuda.h>\n\
+         #include <stdint.h>\n\
+         \n\
+         CUresult {public_decl} {{\n\
+         \x20   return CUDA_ERROR_NOT_SUPPORTED;\n\
+         }}\n"
+    );
+    let stub_dir = out_dir.join("tilelang_stub").join(artifact_dir);
+    std::fs::create_dir_all(&stub_dir).expect("create TileLang stub directory");
+    let stub_path = stub_dir.join(format!("{out_name}_stub.c"));
+    std::fs::write(&stub_path, src).expect("write TileLang unsupported stub");
+    generated_sources.push(stub_path);
+}
+
+fn compile_tilelang_stub_kernels(cuda_path: &str, out_dir: &Path) {
+    let mut generated_sources = Vec::new();
+
+    for &(q, kv) in TILELANG_PREFILL_HD128_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_prefill_paged_hd128_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd128_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd128_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            &mut generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_PREFILL_HD256_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_prefill_paged_hd256_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd256_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd256_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            &mut generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd256_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd256_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            &mut generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_DECODE_HD128_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd128_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            &mut generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_PREFILL_HD64_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_prefill_paged_hd64_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd64_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd64_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            &mut generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_DECODE_HD64_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd64_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd64_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd64_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            &mut generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd128_split_partial_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}_run"),
+            TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL,
+            &mut generated_sources,
+        );
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd128_split_merge_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}_run"),
+            TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL,
+            &mut generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd128_fp8_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}_run"),
+            TILELANG_DISPATCH_FP8_PUBLIC_DECL,
+            &mut generated_sources,
+        );
+    }
+
+    for (artifact_dir, out_name, kernel_name, public_decl) in [
+        (
+            "gated_delta_rule_chunk_prepare",
+            "tilelang_gated_delta_rule_chunk_prepare",
+            "gated_delta_rule_prefill_chunk_prepare",
+            GDR_PREPARE_PUBLIC_DECL,
+        ),
+        (
+            "gated_delta_rule_chunk_cumsum",
+            "tilelang_gated_delta_rule_chunk_cumsum",
+            "gated_delta_rule_prefill_chunk_cumsum",
+            GDR_CUMSUM_PUBLIC_DECL,
+        ),
+        (
+            "gated_delta_rule_chunk_a",
+            "tilelang_gated_delta_rule_chunk_a",
+            "gated_delta_rule_prefill_chunk_a",
+            GDR_A_PUBLIC_DECL,
+        ),
+        (
+            "gated_delta_rule_chunk_recompute",
+            "tilelang_gated_delta_rule_chunk_recompute",
+            "gated_delta_rule_prefill_chunk_recompute",
+            GDR_RECOMPUTE_PUBLIC_DECL,
+        ),
+        (
+            "gated_delta_rule_chunk_state",
+            "tilelang_gated_delta_rule_chunk_state",
+            "gated_delta_rule_prefill_chunk_state",
+            GDR_STATE_PUBLIC_DECL,
+        ),
+        (
+            "gated_delta_rule_chunk_o",
+            "tilelang_gated_delta_rule_chunk_o",
+            "gated_delta_rule_prefill_chunk_o",
+            GDR_O_PUBLIC_DECL,
+        ),
+    ] {
+        write_tilelang_unsupported_stub(
+            out_dir,
+            artifact_dir,
+            out_name,
+            kernel_name,
+            public_decl,
+            &mut generated_sources,
+        );
+    }
+
+    let mut build = cc::Build::new();
+    build
+        .cuda(false)
+        .include(format!("{}/include", cuda_path))
+        .flag("-std=c11")
+        .warnings(false);
+    for source in &generated_sources {
+        build.file(source);
+    }
+    build.compile("tilelang_kernels_aot");
+
+    println!(
+        "cargo:warning=TileLang AOT skipped for ARLE_CUDA_KERNEL_SET=dsv4_flash; linked CUDA_ERROR_NOT_SUPPORTED stubs for non-DSv4 TileLang FFI symbols."
+    );
 }
 
 fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmSpec]) {
@@ -1229,6 +1450,78 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn emit_cuda_system_link_libs(cuda_path: &str) {
+    if cfg!(target_os = "windows") {
+        println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
+    } else {
+        println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
+    }
+    println!("cargo:rustc-link-lib=cuda");
+    println!("cargo:rustc-link-lib=cudart");
+    println!("cargo:rustc-link-lib=cublas");
+    println!("cargo:rustc-link-lib=cublasLt");
+    if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=c++");
+    } else if !cfg!(target_os = "windows") {
+        println!("cargo:rustc-link-lib=stdc++");
+        let gcc_major = Command::new("gcc")
+            .arg("-dumpfullversion")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|version| version.split('.').next()?.trim().parse::<u32>().ok())
+            .unwrap_or(99);
+        if gcc_major < 9 {
+            println!("cargo:rustc-link-lib=stdc++fs");
+        }
+    }
+}
+
+fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
+    println!("cargo:rerun-if-changed=build.rs");
+    let required = ["libkernels_cuda.a", "libtilelang_kernels_aot.a"];
+    for lib in required {
+        let path = prebuilt_dir.join(lib);
+        if !path.is_file() {
+            panic!(
+                "ARLE_CUDA_KERNELS_PREBUILT_DIR={} is missing required artifact {lib}",
+                prebuilt_dir.display()
+            );
+        }
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    println!("cargo:rustc-link-search=native={}", prebuilt_dir.display());
+    println!("cargo:rustc-link-lib=static=kernels_cuda");
+    println!("cargo:rustc-link-lib=static=tilelang_kernels_aot");
+    emit_cuda_system_link_libs(cuda_path);
+    println!(
+        "cargo:warning=Using prebuilt CUDA kernel artifacts from {}; skipping nvcc and TileLang AOT.",
+        prebuilt_dir.display()
+    );
+}
+
+fn tool_command(tool: &str, wrapper: Option<&str>) -> Command {
+    if let Some(wrapper) = wrapper {
+        let mut parts = wrapper.split_whitespace();
+        let program = parts
+            .next()
+            .expect("ARLE_NVCC_WRAPPER was filtered to non-empty");
+        let mut command = Command::new(program);
+        command.args(parts);
+        command.arg(tool);
+        command
+    } else {
+        Command::new(tool)
+    }
+}
+
 fn main() {
     if std::env::var("CARGO_FEATURE_METAL").is_ok() {
         println!("cargo:warning=metal feature active: relying on mlx-sys bridge only.");
@@ -1253,6 +1546,20 @@ fn main() {
     let cuda_path = std::env::var("CUDA_HOME")
         .or_else(|_| std::env::var("CUDA_PATH"))
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_KERNELS_PREBUILT_DIR");
+    if let Some(prebuilt_dir) = env_nonempty("ARLE_CUDA_KERNELS_PREBUILT_DIR") {
+        link_prebuilt_cuda_artifacts(Path::new(&prebuilt_dir), &cuda_path);
+        return;
+    }
+
+    let kernel_set = KernelSet::from_env();
+    println!("cargo:rerun-if-env-changed=ARLE_NVCC_WRAPPER");
+    println!("cargo:rerun-if-env-changed=ARLE_NVCC_SPLIT_COMPILE");
+    let nvcc_wrapper = env_nonempty("ARLE_NVCC_WRAPPER");
+    let nvcc_split_compile = env_nonempty("ARLE_NVCC_SPLIT_COMPILE");
 
     let nvcc = format!("{}/bin/nvcc", cuda_path);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -1404,6 +1711,9 @@ fn main() {
         if enable_deepgemm_native {
             nvcc_args.push("-DARLE_ENABLE_DEEPGEMM_NATIVE=1".to_string());
         }
+        if let Some(split_compile) = nvcc_split_compile.as_deref() {
+            nvcc_args.push(format!("--split-compile={split_compile}"));
+        }
         if legacy_volta_build
             && matches!(
                 stem,
@@ -1476,7 +1786,7 @@ fn main() {
             ]);
         }
 
-        let status = Command::new(&nvcc)
+        let status = tool_command(&nvcc, nvcc_wrapper.as_deref())
             .args(&nvcc_args)
             .status()
             .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
@@ -1510,36 +1820,20 @@ fn main() {
 
     assert!(status.success(), "ar failed");
 
-    compile_tilelang_aot_kernels(&cuda_path, &out_dir, &sm_targets);
+    if kernel_set.tilelang_aot_enabled() {
+        compile_tilelang_aot_kernels(&cuda_path, &out_dir, &sm_targets);
+    } else {
+        compile_tilelang_stub_kernels(&cuda_path, &out_dir);
+    }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    if cfg!(target_os = "windows") {
-        println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
-    } else {
-        println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
-    }
     println!("cargo:rustc-link-lib=static=kernels_cuda");
-    println!("cargo:rustc-link-lib=cudart");
-    println!("cargo:rustc-link-lib=cublas");
-    println!("cargo:rustc-link-lib=cublasLt");
+    emit_cuda_system_link_libs(&cuda_path);
     if enable_deepgemm_native {
         println!(
             "cargo:warning=DeepGEMM native bridge enabled, root={}",
             deepgemm_root.display()
         );
-    }
-    if cfg!(target_os = "macos") {
-        println!("cargo:rustc-link-lib=c++");
-    } else if !cfg!(target_os = "windows") {
-        println!("cargo:rustc-link-lib=stdc++");
-        // GCC < 9 needs explicit -lstdc++fs for std::filesystem symbols.
-        // DeepGEMM's runtime cache (get_or_build_runtime) uses
-        // std::filesystem::{create_directories,remove_all,exists,...};
-        // on the pod's gcc 8.3 these are in libstdc++fs.a, not libstdc++.
-        // No-op on gcc 9+ where filesystem is in libstdc++.
-        if enable_deepgemm_native {
-            println!("cargo:rustc-link-lib=stdc++fs");
-        }
     }
 
     build_deepep_sidecar(&cuda_path, &nvcc, &out_dir, &sm_targets);
