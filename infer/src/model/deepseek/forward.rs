@@ -615,10 +615,19 @@ impl ModelForward for DeepseekModel {
         if !incremental_kv {
             missing.push("ARLE_DSV4_INCREMENTAL_KV must be enabled".to_string());
         }
-        if self.config.spec.num_nextn_predict_layers > 0 {
+        if self.config.spec.num_nextn_predict_layers > 0
+            && self.loaded_mtp_layer_count() < self.config.spec.num_nextn_predict_layers
+        {
             missing.push(format!(
-                "DSv4 checkpoint declares num_nextn_predict_layers={}, but ARLE CUDA does not load or execute the internal mtp.0/EAGLE draft path yet",
-                self.config.spec.num_nextn_predict_layers
+                "DSv4 checkpoint declares num_nextn_predict_layers={}, but ARLE loaded only {} internal mtp.N/EAGLE layers",
+                self.config.spec.num_nextn_predict_layers,
+                self.loaded_mtp_layer_count()
+            ));
+        }
+        if self.loaded_mtp_layer_count() > 0 {
+            missing.push(format!(
+                "DSv4 loaded {} mtp.N layer(s), but CUDA frozen-KV EAGLE draft forward/graph capture is not implemented yet",
+                self.loaded_mtp_layer_count()
             ));
         }
         missing.push(
