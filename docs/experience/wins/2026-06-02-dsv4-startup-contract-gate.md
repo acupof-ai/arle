@@ -42,6 +42,11 @@ serve on the replicated-token debug lane and still look like a performance run.
   `deepgemm-auto`. Missing or incompatible DeepGEMM now fails before serving
   unless the operator explicitly asks for `ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto`
   or `native` as a debug fallback.
+- The replicated-token native DeepEP escape hatch was removed. Unsafe
+  `deepep_unsafe`/`unsafe_deepep` aliases are no longer accepted, and
+  `ARLE_DSV4_MOE_BACKEND=native-deepep` is reserved for the future token-owned
+  DP/EP request path instead of running on the measured-wrong replicated-token
+  route.
 
 ## Verification
 

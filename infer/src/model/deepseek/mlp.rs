@@ -1350,9 +1350,8 @@ fn dsv4_expert_backend_from_env_values(
             .trim()
             .to_ascii_lowercase();
         match moe_backend.as_str() {
-            "" | "deepep" | "deepep_unsafe" | "unsafe_deepep" | "dispatch" | "dispatch_combine"
-            | "dispatch_unsafe" | "allreduce" | "all_reduce" | "legacy" | "0" | "false" | "off"
-            | "native-deepep" | "native_deepep" => {
+            "" | "deepep" | "dispatch" | "dispatch_combine" | "allreduce" | "all_reduce"
+            | "legacy" | "0" | "false" | "off" | "native-deepep" | "native_deepep" => {
                 return Ok(Dsv4ExpertBackend::DeepGemmRequired);
             }
             other => bail!("invalid ARLE_DSV4_MOE_BACKEND value `{other}`"),
@@ -5971,6 +5970,8 @@ mod tests {
             Dsv4ExpertBackend::Native
         );
         assert!(dsv4_expert_backend_from_env_values(None, Some("not-a-backend")).is_err());
+        assert!(dsv4_expert_backend_from_env_values(None, Some("deepep_unsafe")).is_err());
+        assert!(dsv4_expert_backend_from_env_values(None, Some("unsafe_deepep")).is_err());
     }
 
     fn tiny_config() -> DeepSeekV4Config {
