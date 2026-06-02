@@ -533,3 +533,229 @@ path. It makes the next optimization step auditable: DSv4 graph enablement must
 first move dynamic metadata to stable device inputs or graph-updated nodes,
 preallocate scratch in `DeepseekBatchDecodeBuffers`, and isolate graph-safe
 collectives before any TPOT claim.
+
+## 2026-06-02 Best-Practice Target, Not Incremental Tuning
+
+This section is intentionally target-first. It does not derive a roadmap from
+the current ARLE code shape. The reference implementation is the runtime
+SGLang checkout:
+
+```text
+/workspace/sglang @ 0d51db344d3fa7c395f3d94fc7ebed4eac487010
+```
+
+The literal path `/workspace/sglang@0d51db3` is not a checkout directory. The
+runtime checkout is `/workspace/sglang`, and its HEAD is the commit above. The
+pod checkout is dirty/untracked in DSv4-related areas, so code-level
+conclusions cite source paths and any future runtime baseline must record the
+dirty diff.
+
+The relevant SGLang source files are:
+
+| Contract | Source file |
+|---|---|
+| DSv4 launch defaults | `python/sglang/srt/arg_groups/deepseek_v4_hook.py` |
+| H200 FP8 launch lanes | `test/manual/dsv4/test_h200_fp8_flash.py` |
+| DSv4 attention backend | `python/sglang/srt/layers/attention/deepseek_v4_backend.py` |
+| DSv4 graph metadata | `python/sglang/srt/layers/attention/dsv4/metadata.py` |
+| DSv4 indexer | `python/sglang/srt/layers/attention/dsv4/indexer.py` |
+| DSv4 compressor | `python/sglang/srt/layers/attention/dsv4/compressor.py` |
+| CUDA graph runner | `python/sglang/srt/model_executor/cuda_graph_runner.py` |
+| DSv4 KV pool | `python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py` |
+| Compress-state pool | `python/sglang/srt/mem_cache/deepseek_v4_compress_state.py` |
+| EP MoE layer | `python/sglang/srt/layers/moe/ep_moe/layer.py` |
+| DeepEP dispatcher | `python/sglang/srt/layers/moe/token_dispatcher/deepep.py` |
+| DeepGEMM MoE runner | `python/sglang/srt/layers/moe/moe_runner/deep_gemm.py` |
+| MoE fused kernels | `python/sglang/srt/layers/moe/ep_moe/kernels.py` |
+| Spec metric accounting | `python/sglang/bench_serving.py`, `python/sglang/srt/speculative/eagle_info.py`, `python/sglang/srt/managers/io_struct.py` |
+
+The optimization target is therefore not "make the existing ARLE path a little
+faster". The target is to converge ARLE DSv4 onto the same structural contracts
+that make SGLang fast, and to delete or fail-fast paths that pretend to be the
+high-performance DSv4 path while using a different data contract.
+
+### Forced Defaults vs Performance Lanes
+
+SGLang's DSv4 hook and SGLang's best-performance cookbook are related but not
+identical.
+
+The DSv4 hook forces or validates:
+
+- `attention_backend="dsv4"`;
+- `page_size=256`;
+- `kv_cache_dtype="fp8_e4m3"` when the user leaves KV dtype on `auto`, and no
+  other KV dtype is accepted for this path;
+- `max_running_requests=256` when not specified;
+- speculative decoding, if enabled, must be EAGLE with topk 1;
+- `SGLANG_ENABLE_SPEC_V2=True` for the spec path;
+- `swa_full_tokens_ratio=0.1` when not specified.
+
+The H200/H200 Pro performance lanes are cookbook choices, not hook-forced
+defaults:
+
+- balanced/throughput lanes use TP4/DP4 or TP16/DP16, DP attention, DeepEP,
+  CUDA graph max batch commonly 128, and explicit max-running-requests;
+- DeepEP is selected by `--moe-a2a-backend deepep`; in SGLang this can set EP
+  size to TP size;
+- `--deepep-mode auto` resolves by batch mode: prefill/extend use normal
+  DeepEP, decode uses low-latency DeepEP;
+- `--moe-runner-backend deep_gemm` is the high-performance FP8 expert runner
+  choice; `auto` enables DeepGEMM only when SM90+ DeepGEMM is available and the
+  A2A backend is compatible;
+- `--deepep-config` and
+  `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` are part of the measured
+  lane contract, not incidental env noise.
+
+Use canonical long flags when mirroring the lane in ARLE docs or scripts:
+`--tp-size`, `--dp-size`, and `--ep-size/--ep`. The SGLang manual tests use
+short `--tp` and `--dp`, but the exact short-flag acceptance path remains
+`待验证` from source alone.
+
+### Target Contract
+
+| Area | Best-practice target |
+|---|---|
+| Launch defaults | DSv4 forces the DSv4 attention backend, page size 256, FP8 e4m3 KV, and DSv4-specific runtime checks before serving. A high-performance DSv4 launch must not silently fall back to generic grouped experts or eager metadata prep. |
+| Metric lanes | Report no-spec target-step TPOT and spec-on accepted-output TPOT separately. EAGLE/MTP acceptance is a metric transform and cannot be mixed into raw target-step kernel attribution. |
+| Topology | Balanced and throughput lanes use TP4/DP4 with DP attention and DeepEP MoE. TP8 replicated-token all-reduce is a sanity lane, not the performance target. |
+| CUDA graph | Decode uses persistent device input buffers, per-capture-bucket metadata caches, replay-time tensor copies, and DSv4 metadata upgrade inside graph when prep is enabled in graph. Graph unsupported must be a startup error in high-performance DSv4 mode, not a quiet throughput cliff. |
+| Attention | One DSv4 FlashMLA contract consumes SWA plus compressed C4/C128 extra KV using persistent page indices and top-k lengths. Host-side selector/hybrid staging is not the target abstraction. |
+| KV layout | Page size 256 and FP8 cache layout are fixed by DSv4. Cache writes use fused norm/RoPE/store paths into the paged layout, not generic intermediate materialization. |
+| Compressor/indexer | Compressor plans, C4/C128 page metadata, indexer logits, and top-k transforms live as reusable device-side metadata. CUDA graph capture should replay the prep path rather than rebuilding it as graph-external work. |
+| MoE dispatch | DeepEP dispatch/combine owns token rows for the configured EP group. Dispatch alignment, max dispatch tokens per rank, and SMS config are explicit launch contracts. |
+| Expert compute | DeepGEMM grouped masked FP8 GEMM is the default expert runner. Activation, clamp, and FP8 quant are fused into the post-GEMM path. Generic native grouped expert and Marlin-style fallback are not the high-performance DSv4 target. |
+| Spec decode | Speculative decoding is EAGLE topk=1 in the SGLang DSv4 contract. Target-verify graph buckets are part of the performance path, not a separate afterthought. |
+
+The DSv4 attention fast path is not a single mega-kernel. It is a small fixed
+pipeline:
+
+1. `FusedKNormRopeFlashMLAKernel` does K RMSNorm, RoPE, FP8/BF16 packing, and
+   FlashMLA paged cache store.
+2. C4 and C128 compressor kernels build compressed KV.
+3. The C4 indexer computes logits and top-k page metadata.
+4. `flash_mla.flash_mla_with_kvcache` performs the core attention call and reads
+   SWA plus optional C4/C128 extra KV through the same FlashMLA interface.
+
+This matters for ARLE because "fuse everything" is not the best-practice
+lesson. The lesson is stable graph-captured metadata and a small, predictable
+stage set.
+
+SGLang's CUDA graph model is also concrete:
+
+- `DecodeInputBuffers` preallocates stable device addresses for input ids,
+  request-pool indices, sequence lengths, output cache locations, positions,
+  logits buffers, and optional speculative/PP fields;
+- replay copies the live batch into those buffers before graph replay;
+- DSv4 builds metadata per graph bucket and capture batch size:
+  decode-or-idle, target-verify, and draft-extend;
+- when `SGLANG_PREP_IN_CUDA_GRAPH=True`, decode/target-verify capture starts
+  from raw metadata (`req_pool_indices`, `seq_lens`, `out_cache_loc`) and lazily
+  upgrades to full DSv4 metadata inside the captured forward;
+- DeepEP graph replay is mode-aware: the captured DeepEP mode is restored before
+  graph replay.
+
+SGLang's routed MoE fast path is:
+
+```text
+DeepseekV4DecoderLayer.forward
+-> DeepseekV2MoE.forward
+-> FusedMoE.forward_impl
+-> DeepEP dispatcher.dispatch
+-> Fp8MoEMethod.apply / DeepGemmRunnerCore.run
+-> DeepEP dispatcher.combine
+```
+
+For DSv4, the router uses `sqrtsoftplus` scoring and the fused/JIT top-k path
+when enabled. DeepEP normal mode aligns expert segments for DeepGEMM; low
+latency mode feeds packed receive buffers to masked grouped GEMM. The fused
+activation/quant target is the DSv4 DeepGEMM SiLU/mul/clamp/FP8-quant path.
+
+The slow paths to avoid are source-confirmed:
+
+- native MoE fallback with Python/per-expert loop and
+  `tokens_per_expert.cpu().numpy()`;
+- standard non-DeepEP dispatcher for cross-rank EP performance;
+- Triton/local align-block sort/pad structures as the primary EP path;
+- Marlin/WNA16/GPTQ/AWQ compatibility runners for DSv4 FP8 high-performance
+  claims.
+
+Do not overstate route D2H in the high path: source review confirmed D2H in the
+native slow path, not in the DeepEP+DeepGEMM high path.
+
+### Metric Accounting Rule
+
+SGLang's `bench_serving` TPOT is output-token TPOT:
+
+```text
+TPOT = (latency - TTFT) / (output_len - 1)
+```
+
+For no-spec decode, target-step TPOT and output-token TPOT are effectively the
+same lane. For EAGLE/MTP, benchmark TPOT is accepted-output-token TPOT.
+Target verify-step TPOT must be reconstructed from request metadata such as
+`spec_verify_ct` and `spec_accept_length`; SGLang does not directly print that
+raw target-step TPOT in the serving benchmark table. Therefore every ARLE vs
+SGLang number must name the lane before giving a percentage.
+
+### Delete-Style Refactor Rules
+
+The first code pass should remove ambiguity before chasing microseconds:
+
+1. DSv4 high-performance mode must fail fast when DeepGEMM, DeepEP, FP8 KV,
+   page size 256, or CUDA graph capture is not actually active.
+2. Startup logs must print the effective DSv4 backend contract: topology,
+   attention backend, KV dtype/layout, graph mode, DeepEP mode/config,
+   DeepGEMM status, speculative mode, and the exact fallback decision if a
+   non-high-performance mode is explicitly requested.
+3. Remove silent `auto` fallback from the DSv4 performance lane. A fallback can
+   exist only as a named debug lane, and benchmark output must label it as such.
+4. Remove benchmark scripts or presets that compare DSv4 performance using
+   direct-generate, graph-disabled, replicated-token, or wrong-model-package
+   runs as if they were SGLang-comparable.
+5. Replace host-visible route/count/pack/combine staging with device-owned
+   metadata and DeepEP-owned token rows before trying to optimize individual
+   kernels in that staging. Only claim D2H removal where runtime trace or source
+   evidence proves D2H exists in that exact path.
+6. Replace standalone CSA selector/hybrid optimization work with the DSv4
+   FlashMLA metadata contract: SWA, C4, C128, persistent page indices, top-k
+   lengths, and in-graph metadata replay.
+7. Keep one DSv4 default path. Debug fallbacks should be explicit, named, and
+   excluded from "default performance" claims.
+
+### Execution Order
+
+This is the minimum order that avoids repeating earlier mistakes:
+
+1. **Fail-fast contract.** Add a DSv4 high-performance mode that refuses to
+   start unless the SGLang-equivalent contract is active. This is a correctness
+   and observability change, not a performance claim.
+2. **Graph input contract.** Introduce persistent DSv4 decode input buffers and
+   per-bucket metadata cache shaped like SGLang's `DecodeInputBuffers` plus
+   `DSV4AttnMetadata`. The acceptance test is that replay uses current device
+   tensors, not capture-time host launch parameters.
+3. **Attention contract.** Move decode attention to the DSv4 FlashMLA contract:
+   page size 256, FP8 KV, SWA+C4+C128 metadata, and one FlashMLA call per
+   graph replay path.
+4. **MoE contract.** Move routed FFN to token-owned DeepEP plus grouped
+   DeepGEMM with fused activation/quant. Remove the performance-lane post-FFN
+   all-reduce reconciliation tax.
+5. **Spec contract.** Add EAGLE target-verify graph support and report accepted
+   output-token TPOT separately from target-step TPOT.
+
+Each tranche needs the same gate:
+
+```text
+1. startup contract log proves the intended path is active
+2. decode emits real text, not token-id artifacts
+3. 32-token decode completes with EOS-compatible behavior
+4. request_trace names the expected stage structure
+5. TPOT/TTFT/output tok/s are reported in the correct metric lane
+6. if performance regresses, the tranche is reverted or marked debug-only
+```
+
+### Current Status Of This Section
+
+This section is source-grounded but not yet runtime-validated. It is a target
+architecture and deletion checklist. The next code change should start with the
+fail-fast contract and startup logs, because that removes the silent fallback
+problem before any benchmark can be trusted.
