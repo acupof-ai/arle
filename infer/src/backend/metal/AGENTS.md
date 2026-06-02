@@ -213,6 +213,13 @@ first; it carries the prioritized backlog and acceptance gates.
 - **Defensive `eval(&[])` calls travel in clusters.** When one blocks a pipelined path, grep the
   whole backend for siblings before fixing — same author wrote the same pattern elsewhere
   (`feedback_audit_defensive_evals_in_batch.md`).
+- **Metal MTP is opt-in until parity and packed verify are licensed.** The
+  SGLang survey locked the Frozen-KV contract: draft owns no persistent KV,
+  draft reads committed target KV at the last target slot, target verify is
+  the only committer, and acceptance/rollback metrics are mandatory. Do not
+  auto-enable MTP or claim SGLang alignment while MTP rows route through scalar
+  `execute_decode_single`. Start from
+  `docs/plans/2026-06-02-metal-mtp-sglang-alignment.md`.
 
 ## Pointers
 
