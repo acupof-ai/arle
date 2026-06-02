@@ -116,6 +116,12 @@ serve on the replicated-token debug lane and still look like a performance run.
   `distributed_group_token_owned_routes_to_one_owner_group`, which proves two
   owner groups route two logical requests to separate rank groups without
   enqueueing the requests on non-owner ranks.
+- PC2 owner-group remote gate at `27942061`: remote source fast-forwarded
+  cleanly from GitHub. `RUSTUP_TOOLCHAIN=stable bash scripts/dsv4_fast_build.sh`
+  used the DSv4 prebuilt CUDA artifacts, skipped nvcc/TileLang AOT, harvested
+  the cache again, and finished in 21.41 s. The remote CUDA/NCCL unit gate
+  `cargo test -p infer --lib --no-default-features --features cuda,nccl request_handle -- --nocapture`
+  passed 11/11, including the new token-owned owner-group route test.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.
