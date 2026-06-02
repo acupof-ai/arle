@@ -940,7 +940,7 @@ impl DeepSeekV4MtpTensorNames {
             return Some(Shard::Replicated);
         }
         if name == self.e_proj || name == self.h_proj {
-            return Some(Shard::Column { dim: 0 });
+            return Some(Shard::Replicated);
         }
         self.hc_attn
             .shard_for(name)
@@ -1027,6 +1027,9 @@ mod tests {
         assert_eq!(cfg.rope_parameters.factor, 16.0);
         assert_eq!(cfg.compress_ratios.len(), 3);
         assert_eq!(cfg.pad_token_id, None);
+        let mtp = cfg.mtp_tensor_names(0);
+        assert_eq!(mtp.shard_for(&cfg, &mtp.e_proj, 4), Some(Shard::Replicated));
+        assert_eq!(mtp.shard_for(&cfg, &mtp.h_proj, 4), Some(Shard::Replicated));
     }
 
     #[test]

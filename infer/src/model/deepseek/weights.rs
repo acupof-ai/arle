@@ -89,6 +89,24 @@ pub(super) struct DeepseekLayer {
     pub(super) ffn: DeepseekV4MoeBlock,
 }
 
+/// One DeepSeek V4 next-token prediction layer (`mtp.N` in the checkpoint).
+#[cfg(feature = "cuda")]
+#[allow(dead_code)] // loaded before the draft forward path is connected
+pub(super) struct DeepseekMtpLayer {
+    pub(super) enorm: DeviceVec,
+    pub(super) hnorm: DeviceVec,
+    pub(super) e_proj: DeviceMatrix,
+    pub(super) h_proj: DeviceMatrix,
+    pub(super) attn_norm: DeviceVec,
+    pub(super) hc_attn: DeepseekV4HyperConnection,
+    pub(super) attention: DeepseekV4Attention,
+    pub(super) ffn_norm: DeviceVec,
+    pub(super) hc_ffn: DeepseekV4HyperConnection,
+    pub(super) ffn: DeepseekV4MoeBlock,
+    pub(super) norm: DeviceVec,
+    pub(super) hc_head: DeepseekV4HyperConnection,
+}
+
 /// DeepSeek V4 model: immutable weights plus runtime config. Mutable per-slot
 /// state lives in [`super::state::DeepseekState`].
 #[allow(dead_code)] // fields populated by the safetensors loader once kernels land
@@ -106,6 +124,8 @@ pub struct DeepseekModel {
     pub(super) head_hc: Option<DeepseekV4HyperConnection>,
     #[cfg(feature = "cuda")]
     pub(super) layers: Vec<DeepseekLayer>,
+    #[cfg(feature = "cuda")]
+    pub(super) mtp_layers: Vec<DeepseekMtpLayer>,
     #[cfg(feature = "cuda")]
     pub(super) layer_communicator: LayerCommunicator,
     #[cfg(feature = "cuda")]
@@ -249,6 +269,7 @@ impl DeepseekModel {
             norm: None,
             head_hc: None,
             layers: Vec::new(),
+            mtp_layers: Vec::new(),
             layer_communicator,
             reference: None,
         };
@@ -367,7 +388,7 @@ impl DeepseekModel {
         let mut model = Self::from_config(config)?;
         let real_reference = infer_real_reference_enabled()?;
         if real_reference {
-            if load_layer_weights_enabled()? {
+            if model.load_layer_weights_enabled()? {
                 let (mmaps, weight_map) = common::load_safetensors(path, false)?;
                 let shards = common::deserialize_shards(&mmaps)?;
                 model.load_layer_weights(&shards, &weight_map)?;
@@ -428,7 +449,7 @@ impl DeepseekModel {
         model.embed_tokens = Some(embed_tokens);
         model.lm_head = Some(lm_head);
         model.norm = Some(norm);
-        if load_layer_weights_enabled()? {
+        if model.load_layer_weights_enabled()? {
             model.load_layer_weights(&shards, &weight_map)?;
         }
 
@@ -4112,6 +4133,12 @@ impl DeepseekModel {
         self.layers.len()
     }
 
+    /// Number of loaded internal next-token prediction layers (`mtp.N`).
+    #[cfg(feature = "cuda")]
+    pub(super) fn loaded_mtp_layer_count(&self) -> usize {
+        self.mtp_layers.len()
+    }
+
     /// Resolve the `(sw_blocks, comp_blocks)` FP8 KV pool layout for a decode
     /// pack/decode site, dispatching on `ARLE_DSV4_SHARED_KV_POOL`.
     ///
@@ -4819,37 +4846,101 @@ impl DeepseekModel {
         shards: &[safetensors::SafeTensors],
         weight_map: &std::collections::HashMap<String, usize>,
     ) -> Result<()> {
-        if !self.layers.is_empty() {
+        if self.layers.is_empty() {
+            let mut layers = Vec::with_capacity(self.config.num_hidden_layers);
+            self.head_hc = Some(self.load_hyper_connection(
+                shards,
+                weight_map,
+                &self.config.spec.tensor_names().head_hc(),
+            )?);
+            for layer_idx in 0..self.config.num_hidden_layers {
+                let names = self.config.spec.layer_tensor_names(layer_idx);
+                layers.push(DeepseekLayer {
+                    attn_norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.attn_norm)?,
+                    hc_attn: self.load_hyper_connection(shards, weight_map, &names.hc_attn)?,
+                    attention: self.load_attention(shards, weight_map, &names.attn)?,
+                    ffn_norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.ffn_norm)?,
+                    hc_ffn: self.load_hyper_connection(shards, weight_map, &names.hc_ffn)?,
+                    ffn: self.load_moe_block(shards, weight_map, &names.ffn)?,
+                });
+            }
+            info!(
+                "DeepSeek V4 loaded GPU-resident layer weights: layers={} local_experts_per_layer={} tp_rank={}/{} ep_rank={}/{}",
+                layers.len(),
+                self.config.ep.experts_per_rank,
+                self.config.tp.rank,
+                self.config.tp.world_size,
+                self.config.ep.rank,
+                self.config.ep.world_size,
+            );
+            self.layers = layers;
+        }
+        self.load_mtp_weights(shards, weight_map)?;
+        Ok(())
+    }
+
+    fn load_mtp_weights(
+        &mut self,
+        shards: &[safetensors::SafeTensors],
+        weight_map: &std::collections::HashMap<String, usize>,
+    ) -> Result<()> {
+        let expected = self.config.spec.num_nextn_predict_layers;
+        if expected == 0 || !self.mtp_layers.is_empty() {
             return Ok(());
         }
-        let mut layers = Vec::with_capacity(self.config.num_hidden_layers);
-        self.head_hc = Some(self.load_hyper_connection(
-            shards,
-            weight_map,
-            &self.config.spec.tensor_names().head_hc(),
-        )?);
-        for layer_idx in 0..self.config.num_hidden_layers {
-            let names = self.config.spec.layer_tensor_names(layer_idx);
-            layers.push(DeepseekLayer {
+        if !self.load_mtp_weights_enabled()? {
+            info!(
+                "DeepSeek V4 MTP weight loading skipped: checkpoint_nextn_layers={} profile={} ARLE_DSV4_LOAD_MTP_WEIGHTS unset/false",
+                expected,
+                self.config.performance_profile()?.as_str(),
+            );
+            return Ok(());
+        }
+
+        let mut mtp_layers = Vec::with_capacity(expected);
+        for mtp_idx in 0..expected {
+            let names = self.config.spec.mtp_tensor_names(mtp_idx);
+            mtp_layers.push(DeepseekMtpLayer {
+                enorm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.enorm)?,
+                hnorm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.hnorm)?,
+                e_proj: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.e_proj)?,
+                h_proj: load_dsv4_matrix_raw(&self.ctx, shards, weight_map, &names.h_proj)?,
                 attn_norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.attn_norm)?,
                 hc_attn: self.load_hyper_connection(shards, weight_map, &names.hc_attn)?,
                 attention: self.load_attention(shards, weight_map, &names.attn)?,
                 ffn_norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.ffn_norm)?,
                 hc_ffn: self.load_hyper_connection(shards, weight_map, &names.hc_ffn)?,
                 ffn: self.load_moe_block(shards, weight_map, &names.ffn)?,
+                norm: load_dsv4_vec_bf16(&self.ctx, shards, weight_map, &names.norm)?,
+                hc_head: self.load_hyper_connection(shards, weight_map, &names.hc_head)?,
             });
         }
         info!(
-            "DeepSeek V4 loaded GPU-resident layer weights: layers={} local_experts_per_layer={} tp_rank={}/{} ep_rank={}/{}",
-            layers.len(),
+            "DeepSeek V4 loaded GPU-resident MTP weights: mtp_layers={} local_experts_per_layer={} tp_rank={}/{} ep_rank={}/{} profile={}",
+            mtp_layers.len(),
             self.config.ep.experts_per_rank,
             self.config.tp.rank,
             self.config.tp.world_size,
             self.config.ep.rank,
             self.config.ep.world_size,
+            self.config.performance_profile()?.as_str(),
         );
-        self.layers = layers;
+        self.mtp_layers = mtp_layers;
         Ok(())
+    }
+
+    fn load_layer_weights_enabled(&self) -> Result<bool> {
+        if let Some(enabled) = dsv4_env_bool_override("ARLE_DSV4_LOAD_LAYER_WEIGHTS")? {
+            return Ok(enabled);
+        }
+        Ok(self.config.performance_profile()?.requires_best_practice())
+    }
+
+    fn load_mtp_weights_enabled(&self) -> Result<bool> {
+        if let Some(enabled) = dsv4_env_bool_override("ARLE_DSV4_LOAD_MTP_WEIGHTS")? {
+            return Ok(enabled);
+        }
+        Ok(self.config.performance_profile()?.requires_best_practice())
     }
 
     fn load_hyper_connection(
@@ -7197,14 +7288,14 @@ fn infer_real_reference_enabled() -> Result<bool> {
     }
 }
 
-fn load_layer_weights_enabled() -> Result<bool> {
-    let Some(raw) = std::env::var("ARLE_DSV4_LOAD_LAYER_WEIGHTS").ok() else {
-        return Ok(false);
+fn dsv4_env_bool_override(key: &str) -> Result<Option<bool>> {
+    let Some(raw) = std::env::var(key).ok() else {
+        return Ok(None);
     };
     match raw.as_str() {
-        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
-        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
-        _ => bail!("invalid ARLE_DSV4_LOAD_LAYER_WEIGHTS value `{raw}`"),
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(Some(true)),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(Some(false)),
+        _ => bail!("invalid {key} value `{raw}`"),
     }
 }
 
@@ -7915,6 +8006,7 @@ mod tests {
                     shared_experts: None,
                 },
             }],
+            mtp_layers: Vec::new(),
             config,
             ctx,
             layer_communicator: LayerCommunicator::single(),
@@ -7965,6 +8057,7 @@ mod tests {
             norm: None,
             head_hc: None,
             layers: Vec::new(),
+            mtp_layers: Vec::new(),
             layer_communicator: LayerCommunicator::single(),
             reference: None,
         };
@@ -8014,6 +8107,7 @@ mod tests {
             norm: None,
             head_hc: None,
             layers: Vec::new(),
+            mtp_layers: Vec::new(),
             layer_communicator: LayerCommunicator::single(),
             reference: None,
         };
