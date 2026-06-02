@@ -1796,10 +1796,11 @@ impl DeepseekV4MoeBlock {
             ep.experts_per_rank,
             self.experts.len()
         );
+        let expert_backend = dsv4_expert_backend()?;
         if let Some(first) = self.experts.first() {
             let _ = dsv4_handle_deepgemm_expert_backend(
                 ctx,
-                dsv4_expert_backend()?,
+                expert_backend,
                 "local routed experts",
                 &[&first.w1, &first.w3, &first.w2],
             )?;
@@ -2030,6 +2031,144 @@ impl DeepseekV4MoeBlock {
             trace,
         )?;
         let use_device_offsets = cache_backed_local_route || dsv4_a3_phase1_enabled()?;
+        let use_deepgemm_device_counts = cache_backed_local_route
+            && dsv4_should_try_deepgemm_experts(expert_backend)
+            && dsv4_deepgemm_device_counts_enabled()?;
+        if use_deepgemm_device_counts {
+            let trace = dsv4_moe_trace_begin(ctx)?;
+            {
+                let (count_ptr, _count_guard) = local_counts.device_ptr(&ctx.stream);
+                let (offset_ptr, _offset_guard) = local_offsets.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_exclusive_scan_i32_cuda(
+                        count_ptr as *const i32,
+                        offset_ptr as *mut i32,
+                        std::ptr::null_mut(),
+                        experts_per_rank_i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 local route offset scan failed: {err}")
+                    })?;
+                }
+            }
+            dsv4_moe_trace_end(
+                ctx,
+                "ffn_route_offset_scan_gpu",
+                layer_idx,
+                hidden.seq_len,
+                trace,
+            )?;
+
+            let mut out = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
+            let route_capacity_i32 =
+                dsv4_usize_to_i32(route_capacity, "local DeepGEMM device-count routes")?;
+            let trace = dsv4_moe_trace_begin(ctx)?;
+            dsv4_zero_i32_slice(ctx, pack_cursors, ep.experts_per_rank)?;
+            {
+                let (token_ptr, _token_guard) = packed_token.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_fill_i32_cuda(
+                        token_ptr as *mut i32,
+                        -1,
+                        route_capacity_i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 local DeepGEMM route-slot init failed: {err}")
+                    })?;
+                }
+            }
+            packed_hidden.seq_len = route_capacity;
+            dsv4_moe_trace_end(
+                ctx,
+                "ffn_route_device_pack_setup",
+                layer_idx,
+                hidden.seq_len,
+                trace,
+            )?;
+
+            let trace = dsv4_moe_trace_begin(ctx)?;
+            {
+                let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
+                let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
+                let (weight_ptr, _weight_guard) = route_weights.device_ptr(&ctx.stream);
+                let (offset_ptr, _offset_guard) = local_offsets.device_ptr(&ctx.stream);
+                let (cursor_ptr, _cursor_guard) = pack_cursors.device_ptr_mut(&ctx.stream);
+                let (packed_hidden_ptr, _packed_hidden_guard) =
+                    packed_hidden.data.device_ptr_mut(&ctx.stream);
+                let (packed_token_ptr, _packed_token_guard) =
+                    packed_token.device_ptr_mut(&ctx.stream);
+                let (packed_weight_ptr, _packed_weight_guard) =
+                    packed_weight.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_pack_local_experts_cuda(
+                        hidden_ptr as *const ffi::Half,
+                        idx_ptr as *const i32,
+                        weight_ptr as *const f32,
+                        offset_ptr as *const i32,
+                        cursor_ptr as *mut i32,
+                        packed_hidden_ptr as *mut ffi::Half,
+                        packed_token_ptr as *mut i32,
+                        packed_weight_ptr as *mut f32,
+                        hidden.seq_len as i32,
+                        hidden.hidden_dim as i32,
+                        config.num_experts_per_tok as i32,
+                        local_expert_start_i32,
+                        experts_per_rank_i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 local expert pack failed: {err}")
+                    })?;
+                }
+            }
+            dsv4_moe_trace_end(
+                ctx,
+                "ffn_route_pack_kernel",
+                layer_idx,
+                hidden.seq_len,
+                trace,
+            )?;
+
+            let Some(cache) = moe_scratch.as_deref_mut() else {
+                bail!("DeepSeek V4 local DeepGEMM device-count path needs MoE runtime scratch");
+            };
+            let mut device_grouped_cache = DeepseekMoeRuntimeCache {
+                grouped: cache.grouped.take(),
+                ..Default::default()
+            };
+            let result = (|| {
+                let trace = dsv4_moe_trace_begin(ctx)?;
+                self.forward_deepgemm_all_dsv4_experts_gpu(
+                    ctx,
+                    config,
+                    packed_hidden,
+                    packed_token,
+                    packed_weight,
+                    local_offsets,
+                    local_counts,
+                    None,
+                    route_capacity,
+                    &mut out,
+                    &mut device_grouped_cache,
+                )?;
+                dsv4_moe_trace_end(
+                    ctx,
+                    "ffn_expert_deepgemm_device_counts",
+                    layer_idx,
+                    hidden.seq_len,
+                    trace,
+                )
+            })();
+            cache.grouped = device_grouped_cache.grouped.take();
+            cache.local_routed = local_routed_scratch_slot;
+            result?;
+            return Ok(out);
+        }
         let trace = dsv4_moe_trace_begin(ctx)?;
         let counts_host = ctx
             .stream
