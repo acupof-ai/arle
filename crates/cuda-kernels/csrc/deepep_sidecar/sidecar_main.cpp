@@ -36,8 +36,18 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#ifdef ARLE_DEEPEP_LEGACY_LAYOUT
+#include "kernels/legacy/api.cuh"
+namespace deep_ep_compat = deep_ep::legacy;
+#define ARLE_DEEPEP_NUM_WORKSPACE_BYTES LEGACY_NUM_WORKSPACE_BYTES
+#define ARLE_DEEPEP_NUM_MAX_LOCAL_EXPERTS LEGACY_NUM_MAX_LOCAL_EXPERTS
+#else
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
+namespace deep_ep_compat = deep_ep;
+#define ARLE_DEEPEP_NUM_WORKSPACE_BYTES NUM_WORKSPACE_BYTES
+#define ARLE_DEEPEP_NUM_MAX_LOCAL_EXPERTS NUM_MAX_LOCAL_EXPERTS
+#endif
 
 namespace {
 
@@ -252,12 +262,12 @@ Status sidecar_boot(SidecarState& s, const BootRequest& req, BootResponse& resp)
     CK_CUDA(cudaGetDevice(&s.device_id), "cudaGetDevice");
 
     CK_CUDA(cudaMalloc(&s.local_buf, kTotalBytes), "cudaMalloc local_buf");
-    CK_CUDA(cudaMalloc(&s.workspace, NUM_WORKSPACE_BYTES), "cudaMalloc workspace");
+    CK_CUDA(cudaMalloc(&s.workspace, ARLE_DEEPEP_NUM_WORKSPACE_BYTES), "cudaMalloc workspace");
     CK_CUDA(cudaHostAlloc(&s.moe_recv_counter_host, sizeof(int), cudaHostAllocMapped),
             "cudaHostAlloc moe_recv_counter");
     CK_CUDA(cudaHostGetDevicePointer(&s.moe_recv_counter_dev, s.moe_recv_counter_host, 0),
             "cudaHostGetDevicePointer moe_recv_counter");
-    CK_CUDA(cudaHostAlloc(&s.moe_recv_expert_host, sizeof(int) * NUM_MAX_LOCAL_EXPERTS,
+    CK_CUDA(cudaHostAlloc(&s.moe_recv_expert_host, sizeof(int) * ARLE_DEEPEP_NUM_MAX_LOCAL_EXPERTS,
                           cudaHostAllocMapped),
             "cudaHostAlloc moe_recv_expert");
     CK_CUDA(cudaHostGetDevicePointer(&s.moe_recv_expert_dev, s.moe_recv_expert_host, 0),
@@ -265,7 +275,7 @@ Status sidecar_boot(SidecarState& s, const BootRequest& req, BootResponse& resp)
 
     CK_CUDA(cudaStreamCreate(&s.stream), "cudaStreamCreate");
     CK_CUDA(cudaMemsetAsync(s.local_buf, 0, kTotalBytes, s.stream), "memset local_buf");
-    CK_CUDA(cudaMemsetAsync(s.workspace, 0, NUM_WORKSPACE_BYTES, s.stream), "memset workspace");
+    CK_CUDA(cudaMemsetAsync(s.workspace, 0, ARLE_DEEPEP_NUM_WORKSPACE_BYTES, s.stream), "memset workspace");
     CK_CUDA(cudaStreamSynchronize(s.stream), "sync after init memset");
 
     cudaIpcMemHandle_t handle{};
@@ -321,7 +331,7 @@ Status sidecar_sync(SidecarState& s, const PeerEntry* peers) {
             "memcpyAsync barrier_signal_ptrs_gpu");
     CK_CUDA(cudaStreamSynchronize(s.stream), "sync after peer pointer upload");
 
-    deep_ep::intranode::barrier(s.barrier_signal_ptrs_gpu, s.rank, s.world_size, s.stream);
+    deep_ep_compat::intranode::barrier(s.barrier_signal_ptrs_gpu, s.rank, s.world_size, s.stream);
     CK_CUDA(cudaStreamSynchronize(s.stream), "sync after intranode::barrier");
 
     s.synced = true;
@@ -389,7 +399,7 @@ Status sidecar_round_trip(SidecarState& s, const RoundTripRequest& req, RoundTri
     CK_CUDA(cudaMalloc(&d_is_token_in_rank, sizeof(bool) * num_tokens * s.world_size),
             "alloc is_token_in_rank");
 
-    deep_ep::layout::get_dispatch_layout(
+    deep_ep_compat::layout::get_dispatch_layout(
         d_topk, d_num_tokens_per_rank, /*num_tokens_per_rdma_rank=*/nullptr,
         d_num_tokens_per_expert, d_is_token_in_rank, num_tokens, num_topk,
         s.world_size, num_experts, s.stream);
@@ -401,10 +411,10 @@ Status sidecar_round_trip(SidecarState& s, const RoundTripRequest& req, RoundTri
     CK_CUDA(cudaMalloc(&d_channel_prefix_matrix, sizeof(int) * s.world_size * num_channels),
             "alloc channel_prefix_matrix");
     *s.moe_recv_counter_host = -1;
-    for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i) s.moe_recv_expert_host[i] = -1;
+    for (int i = 0; i < ARLE_DEEPEP_NUM_MAX_LOCAL_EXPERTS; ++i) s.moe_recv_expert_host[i] = -1;
     int num_memset_int = num_channels * s.world_size * 4;
 
-    deep_ep::intranode::notify_dispatch(
+    deep_ep_compat::intranode::notify_dispatch(
         d_num_tokens_per_rank, s.moe_recv_counter_dev, s.world_size,
         d_num_tokens_per_expert, s.moe_recv_expert_dev, num_experts,
         num_tokens, d_is_token_in_rank, d_channel_prefix_matrix,
@@ -443,7 +453,7 @@ Status sidecar_round_trip(SidecarState& s, const RoundTripRequest& req, RoundTri
             "alloc recv_channel_prefix");
     CK_CUDA(cudaMalloc(&d_send_head, sizeof(int) * num_tokens * s.world_size), "alloc send_head");
 
-    deep_ep::intranode::dispatch(
+    deep_ep_compat::intranode::dispatch(
         d_recv_x, /*recv_x_scales=*/nullptr, d_recv_src_idx, d_recv_topk_idx,
         d_recv_topk_w, d_recv_channel_prefix, d_send_head,
         d_x, /*x_scales=*/nullptr, d_topk, d_topk_w,
@@ -462,14 +472,14 @@ Status sidecar_round_trip(SidecarState& s, const RoundTripRequest& req, RoundTri
     CK_CUDA(cudaMalloc(&d_combined_topk_weights, sizeof(float) * num_tokens * num_topk),
             "alloc combined_topk_w");
 
-    deep_ep::intranode::cached_notify_combine(
+    deep_ep_compat::intranode::cached_notify_combine(
         s.buffer_ptrs_gpu, d_send_head, num_channels, num_tokens,
         num_channels * s.world_size * 2,
         s.barrier_signal_ptrs_gpu, s.rank, s.world_size, s.stream);
 
     // CRITICAL — pass recv_channel_prefix (exclusive prefix) NOT
     // channel_prefix_matrix (inclusive prefix). Phase 1.0a-iv root cause.
-    deep_ep::intranode::combine(
+    deep_ep_compat::intranode::combine(
         CUDA_R_16BF, d_combined_x, d_combined_topk_weights,
         d_recv_x, /*topk_weights=*/d_recv_topk_w,
         /*bias_0=*/nullptr, /*bias_1=*/nullptr,

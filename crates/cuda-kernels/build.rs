@@ -1563,6 +1563,12 @@ fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
         let sidecar = prebuilt_dir.join("arle_deepep_sidecar");
         if sidecar.is_file() {
             emit_prebuilt_deepep_sidecar(&sidecar);
+        } else if env_nonempty("ARLE_DEEPEP_DIR").is_some() {
+            panic!(
+                "ARLE_CUDA_KERNELS_PREBUILT_DIR={} is missing arle_deepep_sidecar while ARLE_DEEPEP_DIR is set. \
+                 Rebuild the DSv4 prebuilt artifacts with DeepEP enabled.",
+                prebuilt_dir.display()
+            );
         }
     }
     println!(
@@ -1985,14 +1991,35 @@ fn build_deepep_sidecar(
         return;
     };
     let deepep_root = PathBuf::from(&deepep_dir);
-    let kernels_dir = deepep_root.join("csrc").join("kernels");
-    let api_header = kernels_dir.join("api.cuh");
-    if !api_header.exists() {
+    let kernels_root = deepep_root.join("csrc").join("kernels");
+    let flat_api_header = kernels_root.join("api.cuh");
+    let legacy_kernels_dir = kernels_root.join("legacy");
+    let legacy_api_header = legacy_kernels_dir.join("api.cuh");
+    let (kernels_dir, compile_units, legacy_layout) = if flat_api_header.exists() {
+        (
+            kernels_root.clone(),
+            vec!["intranode.cu", "layout.cu", "runtime.cu"],
+            false,
+        )
+    } else if legacy_api_header.exists() {
+        (legacy_kernels_dir, vec!["intranode.cu", "layout.cu"], true)
+    } else {
         println!(
-            "cargo:warning=ARLE_DEEPEP_DIR={} does not contain csrc/kernels/api.cuh — skipping sidecar build.",
+            "cargo:warning=ARLE_DEEPEP_DIR={} does not contain csrc/kernels/api.cuh or csrc/kernels/legacy/api.cuh — skipping sidecar build.",
             deepep_root.display()
         );
         return;
+    };
+    for unit in &compile_units {
+        let path = kernels_dir.join(unit);
+        if !path.exists() {
+            println!(
+                "cargo:warning=ARLE_DEEPEP_DIR={} missing DeepEP sidecar compile unit {} — skipping sidecar build.",
+                deepep_root.display(),
+                path.display()
+            );
+            return;
+        }
     }
 
     // The sidecar only supports SM90 (H100/H20) today — that's where the DSv4
@@ -2025,16 +2052,23 @@ fn build_deepep_sidecar(
         .arg(deepep_root.join("csrc"))
         .arg("-I")
         .arg(&csrc);
+    let deepep_include = deepep_root.join("deep_ep").join("include");
+    if deepep_include.is_dir() {
+        cmd.arg("-I").arg(deepep_include);
+    }
+    if legacy_layout {
+        cmd.arg("-DARLE_DEEPEP_LEGACY_LAYOUT=1");
+    }
     if let Some(split_compile) = nvcc_split_compile {
         cmd.arg(format!("--split-compile={split_compile}"));
     }
     for a in &sidecar_archs {
         cmd.arg(a);
     }
-    cmd.arg(kernels_dir.join("intranode.cu"))
-        .arg(kernels_dir.join("layout.cu"))
-        .arg(kernels_dir.join("runtime.cu"))
-        .arg(&sidecar_main)
+    for unit in &compile_units {
+        cmd.arg(kernels_dir.join(unit));
+    }
+    cmd.arg(&sidecar_main)
         .arg("-lcudart")
         .arg(format!("-L{}/lib64", cuda_path))
         .arg("-o")
@@ -2051,9 +2085,10 @@ fn build_deepep_sidecar(
     }
 
     println!(
-        "cargo:warning=arle_deepep_sidecar built at {} (DeepEP={})",
+        "cargo:warning=arle_deepep_sidecar built at {} (DeepEP={} layout={})",
         sidecar_bin.display(),
-        deepep_root.display()
+        deepep_root.display(),
+        if legacy_layout { "legacy" } else { "flat" }
     );
     println!(
         "cargo:rustc-env=ARLE_DEEPEP_SIDECAR_PATH={}",

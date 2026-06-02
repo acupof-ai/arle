@@ -27,6 +27,12 @@ but the archive was stale.
 The crate build script also trusted `ARLE_CUDA_KERNELS_PREBUILT_DIR` without
 checking the DSv4 symbols it was about to link.
 
+A second build-contract bug was on the same path: ARLE's DeepEP sidecar probe
+looked only for the old `csrc/kernels/api.cuh` layout. The current remote
+DeepEP checkout exposes the compatible intranode kernels under
+`csrc/kernels/legacy/api.cuh`, so the build silently skipped
+`arle_deepep_sidecar` and still produced a DSv4 prebuilt cache.
+
 ## Fix
 
 `scripts/dsv4_fast_build.sh` now:
@@ -38,8 +44,16 @@ checking the DSv4 symbols it was about to link.
 `crates/cuda-kernels/build.rs` now validates required DSv4 symbols before
 linking a caller-provided prebuilt archive.
 
+The fast-build script now auto-discovers a valid DeepEP source tree from the
+standard pod paths and requires the prebuilt cache to contain
+`arle_deepep_sidecar` whenever DeepEP is available or explicitly requested.
+The build script supports both the old flat DeepEP kernel layout and the newer
+`csrc/kernels/legacy` layout.
+
 ## Rule
 
 For DSv4, a prebuilt CUDA archive is not valid because its manifest matches.
 It is valid only if `nm -g libkernels_cuda.a` proves the current DSv4 FFI symbol
-set is exported. Build fast paths must fail closed before runtime fallback.
+set is exported, and if the native DeepEP source tree is present then the
+sidecar must be part of the same prebuilt cache. Build fast paths must fail
+closed before runtime fallback.
