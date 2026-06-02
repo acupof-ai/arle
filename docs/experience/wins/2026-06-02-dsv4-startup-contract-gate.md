@@ -52,6 +52,13 @@ serve on the replicated-token debug lane and still look like a performance run.
   not see the logical request. Relay mode still fails closed because the current
   relay can only broadcast to all workers; targeted DP-owner relay is a
   required follow-up before this can be used by multiprocess DSv4 serving.
+- PC2 relay follow-up removes the unsafe accept-order assumption from the
+  multiprocess request relay. Worker connections now send an explicit
+  rank/world-size hello, the coordinator stores streams by rank, and the relay
+  exposes targeted send by global rank. Token-owned multiprocess serving still
+  remains blocked until remote-owner output return is implemented; this change
+  only proves the control plane can address a selected DP-owner rank set without
+  broadcasting to all ranks.
 - DeepGEMM is now the DSv4 runtime default expert backend, not
   `deepgemm-auto`. Missing or incompatible DeepGEMM now fails before serving
   unless the operator explicitly asks for `ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto`
@@ -122,6 +129,15 @@ serve on the replicated-token debug lane and still look like a performance run.
   the cache again, and finished in 21.41 s. The remote CUDA/NCCL unit gate
   `cargo test -p infer --lib --no-default-features --features cuda,nccl request_handle -- --nocapture`
   passed 11/11, including the new token-owned owner-group route test.
+- PC2 relay local gate: `cargo fmt --check`, `git diff --check`,
+  `cargo test -p infer --no-default-features --features no-cuda multiproc_relay -- --nocapture`,
+  `cargo test -p infer --no-default-features --features no-cuda request_handle -- --nocapture`,
+  `cargo check -p infer --no-default-features --features no-cuda`, and
+  `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
+  passed. The relay test set now includes
+  `coordinator_targeted_send_reaches_only_selected_rank`, which proves a
+  selected worker rank receives the envelope while another connected worker
+  receives only EOF after coordinator drop.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.
