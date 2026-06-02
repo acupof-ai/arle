@@ -755,11 +755,18 @@ impl DeepseekModel {
         let hidden_size = self.config.hidden_size;
         let hc_mult = self.config.hc_mult;
         let stream_hidden_dim = hidden_size * hc_mult;
+        let first_attention = &self.layers[0].attention;
+        let attn_c_q_dim = first_attention.wq_a.rows;
+        let attn_local_width = first_attention.wq_b.rows;
+        let attn_head_dim = self.config.head_dim;
         {
             let scratch = decode_ctx.ensure_batched_scratch(
                 &self.ctx,
                 hidden_size,
                 stream_hidden_dim,
+                attn_c_q_dim,
+                attn_local_width,
+                attn_head_dim,
                 head_hc.mix_fn.rows,
                 self.config.vocab_size,
                 n,
@@ -796,6 +803,9 @@ impl DeepseekModel {
                 &self.ctx,
                 hidden_size,
                 stream_hidden_dim,
+                attn_c_q_dim,
+                attn_local_width,
+                attn_head_dim,
                 head_hc.mix_fn.rows,
                 self.config.vocab_size,
                 n,
@@ -834,6 +844,9 @@ impl DeepseekModel {
                 &self.ctx,
                 hidden_size,
                 stream_hidden_dim,
+                attn_c_q_dim,
+                attn_local_width,
+                attn_head_dim,
                 head_hc.mix_fn.rows,
                 self.config.vocab_size,
                 n,
@@ -844,16 +857,60 @@ impl DeepseekModel {
             for layer_idx in 0..num_layers {
                 let layer = &self.layers[layer_idx];
 
-                // --- Attention half: batch MHC/pre/norm/post, row-loop only
-                // the per-slot KV attention core until batch FlashMLA owns the
-                // full metadata/replay contract.
+                // --- Attention half: batch MHC/pre/norm/QKV/post. The
+                // per-slot cache-bound FlashMLA/legacy attention core remains
+                // row-looped until batch FlashMLA owns metadata replay.
                 {
+                    let attention = &layer.attention;
+                    let compress_ratio =
+                        *self.config.compress_ratios.get(layer_idx).ok_or_else(|| {
+                            anyhow::anyhow!("DeepSeek V4 layer {layer_idx} missing compress_ratio")
+                        })?;
+                    let mode = self
+                        .config
+                        .attention_mode_for_compress_ratio(compress_ratio);
+                    ensure!(
+                        attention.wq_a.rows == attn_c_q_dim,
+                        "DSv4 batched attention c_q dim changed at layer {}: {} != {}",
+                        layer_idx,
+                        attention.wq_a.rows,
+                        attn_c_q_dim
+                    );
+                    ensure!(
+                        attention.wq_b.rows == attn_local_width,
+                        "DSv4 batched attention local width changed at layer {}: {} != {}",
+                        layer_idx,
+                        attention.wq_b.rows,
+                        attn_local_width
+                    );
+                    ensure!(
+                        attn_head_dim > 0 && attn_local_width % attn_head_dim == 0,
+                        "DSv4 batched attention local width {} is not divisible by head_dim {}",
+                        attn_local_width,
+                        attn_head_dim
+                    );
+                    ensure!(
+                        attention.wkv.rows == attn_head_dim,
+                        "DSv4 batched attention KV dim changed at layer {}: {} != {}",
+                        layer_idx,
+                        attention.wkv.rows,
+                        attn_head_dim
+                    );
+                    let local_heads = attn_local_width / attn_head_dim;
                     let (
                         stream,
                         attn_mhc,
                         attn_pre,
                         attn_normed,
                         attn_normed_row,
+                        attn_c_q,
+                        attn_c_q_normed,
+                        attn_c_q_normed_row,
+                        attn_q_raw,
+                        attn_q_raw_row,
+                        attn_kv_raw,
+                        attn_kv_normed,
+                        attn_kv_normed_row,
                         attn_out,
                         attn_out_row,
                         attn_stream,
@@ -863,6 +920,14 @@ impl DeepseekModel {
                         &mut scratch.attn_pre,
                         &mut scratch.attn_normed,
                         &mut scratch.attn_normed_row,
+                        &mut scratch.attn_c_q,
+                        &mut scratch.attn_c_q_normed,
+                        &mut scratch.attn_c_q_normed_row,
+                        &mut scratch.attn_q_raw,
+                        &mut scratch.attn_q_raw_row,
+                        &mut scratch.attn_kv_raw,
+                        &mut scratch.attn_kv_normed,
+                        &mut scratch.attn_kv_normed_row,
                         &mut scratch.attn_out,
                         &mut scratch.attn_out_row,
                         &mut scratch.attn_stream,
@@ -907,6 +972,44 @@ impl DeepseekModel {
                     dsv4_trace_end(&self.ctx, "attn_pre_norm", layer_idx, n, trace)?;
 
                     let trace = dsv4_trace_begin(&self.ctx)?;
+                    ops::try_gemm_with_phase_into(
+                        &self.ctx,
+                        &attention.wq_a,
+                        attn_normed,
+                        attn_c_q,
+                        ops::LinearDispatchPhase::Decode,
+                    )?;
+                    ops::rms_norm_batch_into(
+                        &self.ctx,
+                        attn_c_q,
+                        &attention.q_norm,
+                        self.config.rms_norm_eps,
+                        attn_c_q_normed,
+                    );
+                    ops::try_gemm_with_phase_into(
+                        &self.ctx,
+                        &attention.wq_b,
+                        attn_c_q_normed,
+                        attn_q_raw,
+                        ops::LinearDispatchPhase::Decode,
+                    )?;
+                    ops::try_gemm_with_phase_into(
+                        &self.ctx,
+                        &attention.wkv,
+                        attn_normed,
+                        attn_kv_raw,
+                        ops::LinearDispatchPhase::Decode,
+                    )?;
+                    ops::rms_norm_batch_into(
+                        &self.ctx,
+                        attn_kv_raw,
+                        &attention.kv_norm,
+                        self.config.rms_norm_eps,
+                        attn_kv_normed,
+                    );
+                    dsv4_trace_end(&self.ctx, "attn_proj", layer_idx, n, trace)?;
+
+                    let trace = dsv4_trace_begin(&self.ctx)?;
                     for (row, &slot_idx) in slot_indices.iter().enumerate() {
                         extract_hidden_token_with_width_into(
                             &self.ctx,
@@ -915,6 +1018,27 @@ impl DeepseekModel {
                             hidden_size,
                             attn_normed_row,
                         )?;
+                        extract_hidden_token_with_width_into(
+                            &self.ctx,
+                            attn_c_q_normed,
+                            row,
+                            attn_c_q_dim,
+                            attn_c_q_normed_row,
+                        )?;
+                        extract_hidden_token_with_width_into(
+                            &self.ctx,
+                            attn_q_raw,
+                            row,
+                            attn_local_width,
+                            attn_q_raw_row,
+                        )?;
+                        extract_hidden_token_with_width_into(
+                            &self.ctx,
+                            attn_kv_normed,
+                            row,
+                            attn_head_dim,
+                            attn_kv_normed_row,
+                        )?;
                         let layer_cache = states[slot_idx]
                             .incremental
                             .layers
@@ -922,18 +1046,27 @@ impl DeepseekModel {
                             .expect("incremental cache layer initialized");
                         let row_start_pos_ptr_u64 =
                             start_pos_base_ptr as u64 + (row * start_pos_i32_size) as u64;
-                        self.forward_sliding_window_attention_incremental_into(
+                        self.forward_attention_gpu_into(
                             layer_idx,
-                            &layer.attention,
+                            attention,
                             attn_normed_row,
+                            attn_c_q_normed_row,
+                            attn_q_raw_row,
+                            attn_kv_normed_row,
+                            1,
                             start_pos[row],
                             Some(row_start_pos_ptr_u64),
-                            &mut layer_cache.attention,
+                            local_heads,
+                            attn_local_width,
+                            attn_head_dim,
+                            compress_ratio,
+                            mode,
+                            Some(&mut layer_cache.attention),
                             attn_out_row,
                         )?;
                         write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
                     }
-                    dsv4_trace_end(&self.ctx, "attn_total", layer_idx, n, trace)?;
+                    dsv4_trace_end(&self.ctx, "attn_core", layer_idx, n, trace)?;
 
                     let trace = dsv4_trace_begin(&self.ctx)?;
                     hc_post_to_stream_into(
@@ -1036,6 +1169,9 @@ impl DeepseekModel {
             &self.ctx,
             hidden_size,
             stream_hidden_dim,
+            attn_c_q_dim,
+            attn_local_width,
+            attn_head_dim,
             head_hc.mix_fn.rows,
             self.config.vocab_size,
             n,

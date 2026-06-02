@@ -97,11 +97,15 @@ impl ModelForward for DeepseekModel {
             && self.embed_tokens.is_some()
             && self.norm.is_some()
             && self.lm_head.is_some()
+            && let Some(first_layer) = self.layers.first()
         {
             ctx.ensure_batched_scratch(
                 &self.ctx,
                 self.config.hidden_size,
                 self.config.hidden_size * self.config.hc_mult,
+                first_layer.attention.wq_a.rows,
+                first_layer.attention.wq_b.rows,
+                self.config.head_dim,
                 head_hc.mix_fn.rows,
                 self.config.vocab_size,
                 1,
