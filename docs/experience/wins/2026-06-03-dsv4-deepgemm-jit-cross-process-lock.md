@@ -50,13 +50,37 @@ Local checks:
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,nccl,no-cuda`
 - `git diff --check`
 
-Remote verification is pending:
+Remote verification on `/data01/build/arle` at
+`f409a0a40b85d6edb0ae1e791f832689d8ed721d`:
 
-- release-fast CUDA rebuild on `/data01/build/arle`.
-- Repeat TP8 debug-fallback EAGLE smoke with MTP weights loaded.
-- Confirm the 1K prefill no longer fails with the `kernel.cubin` ptxas output
-  race.
-- Confirm no `infer` process or GPU compute app remains after the smoke.
+- release-fast CUDA rebuild passed in 6m57s. The build detected the
+  `cuda_kernels_tree` manifest change, ignored the old prebuilt archive, rebuilt
+  `cuda-kernels`, and harvested a fresh DSv4 prebuilt archive.
+- Cold-cache smoke used
+  `DG_JIT_CACHE_DIR=/tmp/dsv4_deepgemm_jit_lock_20260603/dg_cache_cold` so no
+  prior DeepGEMM JIT cache could mask the race.
+- Debug-fallback TP8 + EAGLE with FP8 KV, shared KV pool, DeepGEMM experts, and
+  MTP weights loaded returned:
+  - `decode64`: HTTP 200, 64 completion tokens, real text.
+  - `prefill1k`: HTTP 200, `prompt_tokens=1016`, `completion_tokens=1`,
+    output `one`.
+  - `math32`: HTTP 200, output included `406`.
+  - `fanout=4` decode32: all four requests returned HTTP 200 and
+    non-degenerate text.
+- The server log grep for `ptxas fatal`, `kernel.cubin ... could not be opened`,
+  and `NVCC DeepGEMM compile failed` was empty.
+- High-performance TP8 + EAGLE `sglang` startup still failed closed on the
+  known missing full-graph pieces, not on DeepGEMM JIT or MTP loading.
+- After both probes, no `infer` process remained and `nvidia-smi` reported no
+  compute apps.
+
+Artifacts:
+
+- `/tmp/dsv4_deepgemm_jit_lock_20260603/build.log`
+- `/tmp/dsv4_deepgemm_jit_lock_20260603/cold_jit_eagle_server.log`
+- `/tmp/dsv4_deepgemm_jit_lock_20260603/cold_jit_eagle_smoke.log`
+- `/tmp/dsv4_deepgemm_jit_lock_20260603/cold_jit_eagle_smoke.json`
+- `/tmp/dsv4_deepgemm_jit_lock_20260603/startup_tp8_eagle_sglang.log`
 
 ## Rule
 
