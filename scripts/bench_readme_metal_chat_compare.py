@@ -420,9 +420,33 @@ def plot_results(json_path: Path, png_path: Path, kind: str = "full") -> None:
         f"n={data['shape']['repeats']}; streaming chat; "
         "steady TPOT excludes first decode interval; RSS is process high-water"
     )
+    steady_note = (
+        f"n={data['shape']['repeats']}; stable average; "
+        "steady TPOT excludes first decode interval"
+    )
 
     def row(series: str, n: int) -> dict[str, Any]:
         return data["series"][series]["rows"][str(n)]["summary"]
+
+    def samples(series: str, n: int, metric: str) -> list[float]:
+        return [
+            float(sample[metric])
+            for sample in data["series"][series]["rows"][str(n)]["samples"]
+            if sample.get(metric) is not None
+        ]
+
+    def stable_mean(values: list[float]) -> float:
+        if len(values) >= 5:
+            median = statistics.median(values)
+            deviations = [abs(v - median) for v in values]
+            mad = statistics.median(deviations)
+            threshold = max(2.5 * mad, abs(median) * 0.05)
+            filtered = [v for v in values if abs(v - median) <= threshold]
+            values = filtered if len(filtered) >= 3 else sorted(values)[1:-1]
+        return sum(values) / len(values)
+
+    def steady_means(series: str, metric: str) -> list[float]:
+        return [stable_mean(samples(series, n, metric)) for n in lens]
 
     def means(series: str, metric: str) -> list[float]:
         return [row(series, n)[metric]["mean"] for n in lens]
@@ -465,6 +489,44 @@ def plot_results(json_path: Path, png_path: Path, kind: str = "full") -> None:
             0.5,
             0.035,
             f"n={data['shape']['repeats']}; streaming chat; Qwen3.6 35B-A3B 4-bit",
+            ha="center",
+            fontsize=8,
+            color="#666666",
+        )
+        fig.tight_layout(rect=(0, 0.06, 1, 1))
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(png_path)
+        plt.close(fig)
+        return
+
+    if kind == "ttft-tpot":
+        fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.2), dpi=200)
+        panels = [
+            ("TTFT vs input length", "TTFT (seconds)", "ttft_s"),
+            ("TPOT vs input length", "TPOT (ms/token)", "tpot_ms"),
+        ]
+        for ax, (title, ylabel, metric) in zip(axes, panels, strict=True):
+            for series in ("arle", "mlx_lm"):
+                ax.plot(
+                    xs,
+                    steady_means(series, metric),
+                    marker="o" if series == "arle" else "s",
+                    linewidth=2.2,
+                    markersize=4.2,
+                    color=colors[series],
+                    label=names[series],
+                )
+            ax.set_title(title, fontsize=11)
+            ax.set_ylabel(ylabel, fontsize=9)
+            ax.set_xlabel("Target input tokens", fontsize=9)
+            ax.set_xticks(xs, labels)
+            ax.grid(True, color="#d8d8d8", linewidth=0.6, alpha=0.8)
+            ax.tick_params(labelsize=8)
+            ax.legend(frameon=False, fontsize=8, loc="upper left")
+        fig.text(
+            0.5,
+            0.035,
+            steady_note,
             ha="center",
             fontsize=8,
             color="#666666",
@@ -573,7 +635,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="/tmp/bench_readme_metal_chat_compare.json")
     parser.add_argument("--plot", default="")
     parser.add_argument("--plot-input", default="")
-    parser.add_argument("--plot-kind", choices=("full", "ttft", "tpot-rss"), default="full")
+    parser.add_argument(
+        "--plot-kind",
+        choices=("full", "ttft", "ttft-tpot", "tpot-rss"),
+        default="full",
+    )
     parser.add_argument("--log-dir", default="/tmp/bench_readme_metal_chat_compare_logs")
     parser.add_argument("--backends", default="arle,mlx_lm")
     parser.add_argument("--repeats", type=int, default=3)
