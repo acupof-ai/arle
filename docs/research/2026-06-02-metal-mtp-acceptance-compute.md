@@ -93,6 +93,80 @@ Standard target decode if neither source is licensed for the current request.
 Do not mix NGRAM into the MTP state machine as a hidden fallback. It needs its
 own metrics, draft candidates, verify input, and cache rollback contract.
 
+## Landed local ngram prototype
+
+The first ARLE implementation is deliberately narrower than SGLang's NGRAM
+worker:
+
+- draft source: request-local token history only;
+- match: linear suffix scan, longest non-overlapping prior suffix first;
+- verify: existing Qwen3.6 C++ target `verify_block_summary` on
+  `[current_token, ngram_suffix...]`;
+- commit: target verifier remains the only owner of KV/GDR advancement;
+- rollback: rejected GDR suffix is replayed with
+  `qwen35_rollback_to_accepted_varlen`; extra KV columns are ignored because
+  `cache_len` advances only by accepted inputs;
+- MTP coexistence: when MTP state exists, ngram verify captures target final
+  hidden for the accepted row and refreshes the MTP seed hidden.
+
+Runtime knobs:
+
+```text
+ARLE_METAL_NGRAM_SPEC=1
+ARLE_METAL_NGRAM_MAX_DRAFT_TOKENS=4
+ARLE_METAL_NGRAM_MIN_MATCH=3
+ARLE_METAL_NGRAM_MAX_CONTEXT=4096
+ARLE_METAL_NGRAM_MAX_MISSES=4
+```
+
+Default remains off. If enabled but no candidate is found for
+`ARLE_METAL_NGRAM_MAX_MISSES` consecutive decode steps, the request disables
+ngram and the standard decode path can resume its double-buffer prequeue.
+
+Local Qwen3.6 warm-pair evidence on the repeated `metal_bench` prompt:
+
+| route | gen tok/s | ngram acceptance | notes |
+|---|---:|---:|---|
+| standard step-driver | 86.80 | n/a | warmup=1, runs=3 |
+| ngram max_draft=8 | 185.20 | 100% | 12 blocks, 96/96 accepted draft tokens |
+| no-candidate forced (`min_match=64`) | 84.14 | n/a | auto-disabled after misses |
+
+This is a licensed local-repeat win, not a default flip. The workload is highly
+repetitive and c=1. The default-worthy route needs natural prompt/code/JSON
+coverage plus a router that enables ngram only when the request has a real
+candidate signal.
+
+## c=1 benchmarking discipline
+
+For c=1, multiple concurrent requests are not evidence. They change the workload
+into a c>1 scheduler/batching test. Multiple cases are valid only as sequential
+single-request runs (`max_requests=1`, one active request at a time).
+
+The only valid c=1 MTP evidence in this pass is sequential `metal_bench`:
+
+```text
+./target/release/metal_bench \
+  --model mlx-community/Qwen3.6-35B-A3B-4bit \
+  --use-step-driver \
+  --prompt 'Write a compact Rust function that reverses a string and explain it briefly.' \
+  --generation-tokens 64 \
+  --warmup 1 \
+  --runs 3 \
+  --ignore-eos
+```
+
+Matched sequential A/B:
+
+| route | gen tok/s mean | repo-e2e tok/s mean | TTFT mean | total mean | MTP acceptance |
+|---|---:|---:|---:|---:|---:|
+| baseline step-driver | 79.83 | 74.75 | 54.3 ms | 861.6 ms | n/a |
+| MTP split draft | 98.66 | 91.27 | 52.5 ms | 701.3 ms | 68.5% |
+
+Delta for this warm code prompt: +23.6% generation tok/s, +22.1% repo-e2e
+tok/s, and -18.6% total time. This licenses "MTP can win on a warm c=1 code
+shape", not "MTP is default-worthy". GuideLLM/HTTP c=1 natural cases still need
+sequential max_requests=1 replication.
+
 ## Rule
 
 Speculative decode must be adaptive per request, and the fallback must preserve

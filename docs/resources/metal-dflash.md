@@ -199,7 +199,7 @@ Baseline — DFlash off:
 ```bash
 ./target/release/metal_bench \
   --model mlx-community/Qwen3.5-4B-MLX-4bit \
-  --prompt-tokens 32 --generation-tokens 256 --warmup 1 --runs 3
+  --prompt-file prompts/code.txt --generation-tokens 256 --warmup 1 --runs 3
 ```
 
 DFlash on:
@@ -208,7 +208,7 @@ DFlash on:
 ./target/release/metal_bench \
   --model mlx-community/Qwen3.5-4B-MLX-4bit \
   --dflash-draft-model z-lab/Qwen3.5-4B-DFlash \
-  --prompt-tokens 32 --generation-tokens 256 --warmup 1 --runs 3
+  --prompt-file prompts/code.txt --generation-tokens 256 --warmup 1 --runs 3
 ```
 
 ## Parameters
