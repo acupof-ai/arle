@@ -67,6 +67,18 @@ that collides with the protocol's reserved fd 10/11 before fork/exec, marks
 source fds close-on-exec, and includes child pid/exit status in sidecar EOF
 diagnostics.
 
+## Verification
+
+- Local: `cargo fmt --check`
+- Local: `git diff --check`
+- Local: `cargo check -p infer --no-default-features --features no-cuda`
+- Local: `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
+- Remote pod: `scripts/dsv4_fast_build.sh` at commit
+  `5b01234298a625b9b12f45422e9762ee35b83e29` used the prebuilt CUDA archive
+  and completed in 17.16 s without nvcc / TileLang AOT.
+- Remote pod: `cargo test -p infer --test deepep_sidecar_smoke --no-default-features --features cuda,nccl -- --nocapture --test-threads=1`
+  passed with `ARLE_DEEPEP_RUN_SMOKE=1`.
+
 ## Rule
 
 For DSv4, a prebuilt CUDA archive is not valid because its manifest matches.
