@@ -276,12 +276,12 @@ std::tuple<int, std::string> run_capture(const std::string& command) {
 
 std::filesystem::path cache_root();
 
-bool is_directory(const std::filesystem::path& path) {
+bool path_is_directory(const std::filesystem::path& path) {
   std::error_code ec;
   return std::filesystem::is_directory(path, ec);
 }
 
-bool is_regular_file(const std::filesystem::path& path) {
+bool path_is_regular_file(const std::filesystem::path& path) {
   std::error_code ec;
   return std::filesystem::is_regular_file(path, ec);
 }
@@ -311,22 +311,22 @@ PreflightReport deepgemm_preflight_report() {
   const auto cutlass_barrier = cutlass_include / "cutlass/arch/barrier.h";
 
   std::vector<std::string> missing;
-  if (!is_directory(deepgemm_include)) {
+  if (!path_is_directory(deepgemm_include)) {
     missing.push_back("deepgemm_include=" + deepgemm_include.string());
   }
-  if (!is_regular_file(deepgemm_header)) {
+  if (!path_is_regular_file(deepgemm_header)) {
     missing.push_back("deepgemm_header=" + deepgemm_header.string());
   }
-  if (!is_directory(cutlass_include)) {
+  if (!path_is_directory(cutlass_include)) {
     missing.push_back("cutlass_include=" + cutlass_include.string());
   }
-  if (!is_regular_file(cutlass_barrier)) {
+  if (!path_is_regular_file(cutlass_barrier)) {
     missing.push_back("cutlass_barrier=" + cutlass_barrier.string());
   }
-  if (!is_regular_file(nvcc)) {
+  if (!path_is_regular_file(nvcc)) {
     missing.push_back("nvcc=" + nvcc.string());
   }
-  if (!is_regular_file(cuobjdump)) {
+  if (!path_is_regular_file(cuobjdump)) {
     missing.push_back("cuobjdump=" + cuobjdump.string());
   }
 
