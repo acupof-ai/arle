@@ -56,6 +56,27 @@ Reverted both commits:
 The retained DSv4 tranche is the batch FlashMLA arena substrate. It does not
 claim a TPOT win and does not change the old per-row output projection path.
 
+Remote verification after the revert, commit
+`0d8bc089c142cd3b3fc30e49bc0e2d62f46d43b2`:
+
+- release-fast build passed in 18.47s using the DSv4 prebuilt CUDA artifact
+  fast path: `/tmp/dsv4_revert_output_proj_20260603/build.log`.
+- debug-fallback smoke returned HTTP 200 for decode64, prefill1k, prefill4k,
+  math, write_zh, and fanout=4:
+  `/tmp/dsv4_revert_output_proj_20260603/debug_fallback_trace_summary.json`.
+- fanout=4 produced 64 aggregate completion tokens with no HTTP errors; outputs
+  were normal text again, not the repeated garbage-token pattern from the killed
+  output-projection path.
+- `dsv4_batched_decode_validate.py` completed c8 with zero HTTP errors. Its
+  c1-vs-c4 byte-identical check still reported `PARITY_OR_C8_FAIL`, but c4 rows
+  contained the correct `406` answer text rather than garbage tokens. That
+  script currently returns 0 even on the printed parity failure, so strict
+  deterministic parity needs a separate gate fix before it can be used as the
+  sole correctness verdict:
+  `/tmp/dsv4_revert_output_proj_20260603/batched_decode_validate.log`.
+- After the smoke, no `infer` process remained and `nvidia-smi` reported no
+  compute apps.
+
 ## Rule
 
 Do not batch DSv4 compressed-attention output projection until a focused parity
