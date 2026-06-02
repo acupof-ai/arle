@@ -38,6 +38,11 @@ planning mismatch.
   longer matches. It also prefers the newest `/usr/local/cuda-*` toolkit when
   `CUDA_HOME` is unset, instead of blindly using the generic `/usr/local/cuda`
   symlink.
+- Follow-up fix: `scripts/dsv4_fast_build.sh` now defaults
+  `ARLE_CUDA_ENABLE_FLASHMLA_DECODE=1` when `ARLE_CUDA_KERNEL_SET=dsv4_flash`.
+  Without this, a real DSv4-Flash prebuilt artifact could be skipped because
+  the manifest saw `enable_flashmla_decode=` while the intended artifact was
+  built with `enable_flashmla_decode=1`.
 - Added `release-fast`: an iteration profile with no LTO, more codegen units,
   and incremental enabled. Final SLO/perf numbers still use the existing
   `--release` profile.
@@ -57,11 +62,18 @@ planning mismatch.
   reproduced undefined symbols, confirming the manifest guard is required.
 - Remote H20 first full `dsv4_flash` build found the next compile blocker:
   vendored FlashMLA sparse-FP8 decode fails on CUDA 12.5 with undefined
-  `__nv_fp8_e8m0`. The build now stubs decode by default and compiles it only
-  when `ARLE_CUDA_ENABLE_FLASHMLA_DECODE=1`.
+  `__nv_fp8_e8m0`. `build.rs` still stubs decode by default and compiles it
+  only when `ARLE_CUDA_ENABLE_FLASHMLA_DECODE=1`; the DSv4 fast-build helper
+  opts into real decode for the H20/CUDA-12.8 validation lane.
 - The same pod also had `/usr/local/cuda-12.9`; the first failing run used the
   generic `/usr/local/cuda -> 12.5` symlink. The fast-build script now prefers
   the newest explicit toolkit directory.
+- Remote DSv4 pod `/data01/build/arle @ 17050ba4`: after rebuilding once with
+  `enable_flashmla_decode=1`, the immediate follow-up
+  `bash scripts/dsv4_fast_build.sh` printed
+  `using CUDA prebuilt artifacts` and
+  `Using prebuilt CUDA kernel artifacts ... skipping nvcc and TileLang AOT`.
+  Wall time was 4.92 s.
 
 The last check used empty placeholder archives and verified the prebuilt branch
 is selected before any `nvcc` or TileLang probe. A real release build still
