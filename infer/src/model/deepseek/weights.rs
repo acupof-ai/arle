@@ -3329,13 +3329,23 @@ impl DeepseekModel {
                         .fm_decode_topk_length
                         .as_mut()
                         .expect("topk_length arena allocated");
-                    self.ctx
-                        .stream
-                        .memcpy_htod(&[topk_unified as i32], topk_length_dev)
+                    ensure!(
+                        topk_unified <= i32::MAX as usize,
+                        "DSv4 FlashMLA decode topk_unified {topk_unified} overflows i32"
+                    );
+                    let (ptr, guard) = topk_length_dev.device_ptr_mut(&self.ctx.stream);
+                    unsafe {
+                        ffi::dsv4_fill_i32_cuda(
+                            ptr as *mut i32,
+                            topk_unified as i32,
+                            1_i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()
                         .map_err(|err| {
-                            anyhow::anyhow!("DSv4 FlashMLA decode topk_length H2D: {err}")
+                            anyhow::anyhow!("DSv4 FlashMLA decode topk_length fill failed: {err}")
                         })?;
-                    let (ptr, guard) = topk_length_dev.device_ptr(&self.ctx.stream);
+                    }
                     drop(guard);
                     ptr as u64
                 };
