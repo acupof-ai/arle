@@ -1,0 +1,176 @@
+{
+  "generated_at": "2026-06-02T14:43:00+0800",
+  "goal": "diagnose whether active Metal KV can live entirely on SSD",
+  "host": {
+    "os": "macOS 26.3.1 (25D771280a)",
+    "arch": "arm64",
+    "memory_bytes": 51539607552,
+    "volume": "/System/Volumes/Data",
+    "filesystem": "/dev/disk3s1",
+    "volume_size_gib": 460,
+    "volume_used_gib": 356,
+    "volume_available_gib": 58
+  },
+  "path": "~/.cache/arle/ssd_bench",
+  "method": {
+    "fcntl": "F_NOCACHE=48",
+    "buffers": "pre-generated random buffers",
+    "cleanup": "test files removed after each pass"
+  },
+  "kv_shape": {
+    "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+    "full_attention_layers": 10,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "dtype_bytes": 2,
+    "kv_bytes_per_token": 20480
+  },
+  "small_file_2gib_passes": [
+    {
+      "pass": 1,
+      "file_gib": 2.0,
+      "seq_write_gib_s": 2.3909651423997373,
+      "seq_read_gib_s": 5.267204757855317,
+      "rand4m_read_gib_s": 10.06688185104942,
+      "rand4m_read_ms_median": 0.23787503596395254,
+      "rand4m_read_ms_p95": 0.6547499797306955,
+      "rand64k_read_gib_s": 2.496424921405842,
+      "rand64k_read_ms_median": 0.004667090252041817,
+      "rand64k_read_ms_p95": 0.1335207198280841
+    },
+    {
+      "pass": 2,
+      "file_gib": 2.0,
+      "seq_write_gib_s": 3.083847899920764,
+      "seq_read_gib_s": 5.277649445422754,
+      "rand4m_read_gib_s": 10.044686298737288,
+      "rand4m_read_ms_median": 0.23741705808788538,
+      "rand4m_read_ms_p95": 0.695718772476539,
+      "rand64k_read_gib_s": 2.194122824542966,
+      "rand64k_read_ms_median": 0.004625064320862293,
+      "rand64k_read_ms_p95": 0.18158351304009557
+    },
+    {
+      "pass": 3,
+      "file_gib": 2.0,
+      "seq_write_gib_s": 2.768782438078411,
+      "seq_read_gib_s": 3.7181540135384434,
+      "rand4m_read_gib_s": 9.820200288888485,
+      "rand4m_read_ms_median": 0.2547704498283565,
+      "rand4m_read_ms_p95": 0.6655837933067232,
+      "rand64k_read_gib_s": 3.019930026331445,
+      "rand64k_read_ms_median": 0.004541012458503246,
+      "rand64k_read_ms_p95": 0.13004170614294708
+    }
+  ],
+  "small_file_2gib_summary": {
+    "seq_write_gib_s_median": 2.768782438078411,
+    "seq_read_gib_s_median": 5.267204757855317,
+    "rand4m_read_gib_s_median": 10.044686298737288,
+    "rand4m_read_ms_p95_median": 0.6655837933067232,
+    "rand64k_read_gib_s_median": 2.496424921405842,
+    "rand64k_read_ms_p95_median": 0.1335207198280841
+  },
+  "large_file_16gib": {
+    "file_gib": 16.0,
+    "seq_write_gib_s": 1.0912377457270663,
+    "seq_read_gib_s": 4.0526449553056665,
+    "write_seconds": 14.662249415996484,
+    "read_seconds": 3.948038916918449
+  },
+  "bandwidth_budget": {
+    "ssd_seq_read_gib_s_conservative": 4.0526449553056665,
+    "ssd_seq_write_gib_s_long": 1.0912377457270663,
+    "source_tpot": "docs/experience/wins/2026-06-02-metal-ttft-tpot-steady.md",
+    "rows": [
+      {
+        "target_tokens": 128,
+        "arle_tpot_ms": 11.92,
+        "decode_tok_s": 83.89,
+        "active_kv_mib_per_output_token": 2.5,
+        "read_gib_s_if_full_history_each_step": 0.2,
+        "read_to_ssd_ratio": 0.05,
+        "append_write_mib_s": 1.64,
+        "snapshot_read_ms": 0.6,
+        "snapshot_write_ms_long": 2.2
+      },
+      {
+        "target_tokens": 256,
+        "arle_tpot_ms": 11.97,
+        "decode_tok_s": 83.54,
+        "active_kv_mib_per_output_token": 5.0,
+        "read_gib_s_if_full_history_each_step": 0.41,
+        "read_to_ssd_ratio": 0.1,
+        "append_write_mib_s": 1.63,
+        "snapshot_read_ms": 1.2,
+        "snapshot_write_ms_long": 4.5
+      },
+      {
+        "target_tokens": 512,
+        "arle_tpot_ms": 11.91,
+        "decode_tok_s": 83.96,
+        "active_kv_mib_per_output_token": 10.0,
+        "read_gib_s_if_full_history_each_step": 0.82,
+        "read_to_ssd_ratio": 0.2,
+        "append_write_mib_s": 1.64,
+        "snapshot_read_ms": 2.4,
+        "snapshot_write_ms_long": 8.9
+      },
+      {
+        "target_tokens": 1024,
+        "arle_tpot_ms": 12.19,
+        "decode_tok_s": 82.03,
+        "active_kv_mib_per_output_token": 20.0,
+        "read_gib_s_if_full_history_each_step": 1.6,
+        "read_to_ssd_ratio": 0.4,
+        "append_write_mib_s": 1.6,
+        "snapshot_read_ms": 4.8,
+        "snapshot_write_ms_long": 17.9
+      },
+      {
+        "target_tokens": 2048,
+        "arle_tpot_ms": 12.38,
+        "decode_tok_s": 80.78,
+        "active_kv_mib_per_output_token": 40.0,
+        "read_gib_s_if_full_history_each_step": 3.16,
+        "read_to_ssd_ratio": 0.78,
+        "append_write_mib_s": 1.58,
+        "snapshot_read_ms": 9.6,
+        "snapshot_write_ms_long": 35.8
+      },
+      {
+        "target_tokens": 4096,
+        "arle_tpot_ms": 12.4,
+        "decode_tok_s": 80.65,
+        "active_kv_mib_per_output_token": 80.0,
+        "read_gib_s_if_full_history_each_step": 6.3,
+        "read_to_ssd_ratio": 1.55,
+        "append_write_mib_s": 1.58,
+        "snapshot_read_ms": 19.3,
+        "snapshot_write_ms_long": 71.6
+      },
+      {
+        "target_tokens": 8192,
+        "arle_tpot_ms": 13.38,
+        "decode_tok_s": 74.74,
+        "active_kv_mib_per_output_token": 160.0,
+        "read_gib_s_if_full_history_each_step": 11.68,
+        "read_to_ssd_ratio": 2.88,
+        "append_write_mib_s": 1.46,
+        "snapshot_read_ms": 38.6,
+        "snapshot_write_ms_long": 143.2
+      },
+      {
+        "target_tokens": 12288,
+        "arle_tpot_ms": 14.89,
+        "decode_tok_s": 67.16,
+        "active_kv_mib_per_output_token": 240.0,
+        "read_gib_s_if_full_history_each_step": 15.74,
+        "read_to_ssd_ratio": 3.88,
+        "append_write_mib_s": 1.31,
+        "snapshot_read_ms": 57.8,
+        "snapshot_write_ms_long": 214.8
+      }
+    ]
+  }
+}
