@@ -267,6 +267,23 @@ __global__ void dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_kernel(
     token_in_block_row[0] = ring_idx % page_block_size;
 }
 
+__global__ void dsv4_fp8_kv_fill_sw_slots_from_start_pos_kernel(
+    int* __restrict__ token_block_id,
+    int* __restrict__ token_in_block_row,
+    const int* __restrict__ start_pos,
+    const int* __restrict__ slot_layer_block_offsets,
+    int n_tokens,
+    int sliding_window,
+    int page_block_size)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_tokens) return;
+    const int pos = start_pos[row];
+    const int ring_idx = (sliding_window > 0 && pos >= 0) ? (pos % sliding_window) : 0;
+    token_block_id[row] = slot_layer_block_offsets[row] + ring_idx / page_block_size;
+    token_in_block_row[row] = ring_idx % page_block_size;
+}
+
 } // namespace
 
 // ===== Public C entries =====
@@ -357,5 +374,31 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda(
     }
     dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_kernel<<<1, 1, 0, stream>>>(
         token_block_id, token_in_block_row, start_pos, sliding_window, page_block_size);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t arle_dsv4_fp8_kv_fill_sw_slots_from_start_pos_cuda(
+    int* token_block_id,
+    int* token_in_block_row,
+    const int* start_pos,
+    const int* slot_layer_block_offsets,
+    int n_tokens,
+    int sliding_window,
+    int page_block_size,
+    cudaStream_t stream)
+{
+    if (n_tokens == 0) return cudaSuccess;
+    if (token_block_id == nullptr || token_in_block_row == nullptr ||
+        start_pos == nullptr || slot_layer_block_offsets == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (n_tokens < 0 || sliding_window <= 0 || page_block_size <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kBlock = 128;
+    int grid = (n_tokens + kBlock - 1) / kBlock;
+    dsv4_fp8_kv_fill_sw_slots_from_start_pos_kernel<<<grid, kBlock, 0, stream>>>(
+        token_block_id, token_in_block_row, start_pos, slot_layer_block_offsets,
+        n_tokens, sliding_window, page_block_size);
     return cudaGetLastError();
 }
