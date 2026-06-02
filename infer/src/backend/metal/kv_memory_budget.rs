@@ -151,10 +151,10 @@ fn system_memory_snapshot_bytes() -> Option<SystemMemorySnapshot> {
     {
         let total_bytes = sysctl_u64("hw.memsize")?;
         let available_bytes = macos_available_memory_bytes()?;
-        return Some(SystemMemorySnapshot {
+        Some(SystemMemorySnapshot {
             available_bytes,
             total_bytes,
-        });
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -219,7 +219,7 @@ fn parse_macos_vm_stat_available_bytes(raw: &str) -> Option<u64> {
 fn parse_vm_stat_pages(value: &str) -> u64 {
     let digits = value
         .chars()
-        .filter(|ch| ch.is_ascii_digit())
+        .filter(char::is_ascii_digit)
         .collect::<String>();
     digits.parse::<u64>().unwrap_or(0)
 }
