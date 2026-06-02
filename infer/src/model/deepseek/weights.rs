@@ -842,31 +842,111 @@ impl DeepseekModel {
                 scratch.start_pos_gpu.device_ptr(&self.ctx.stream);
             let start_pos_i32_size = std::mem::size_of::<i32>();
             for layer_idx in 0..num_layers {
-                // --- Attention half: per-row, each into its row of attn_stream. ---
-                for (row, &slot_idx) in slot_indices.iter().enumerate() {
-                    extract_hidden_token_with_width_into(
-                        &self.ctx,
+                let layer = &self.layers[layer_idx];
+
+                // --- Attention half: batch MHC/pre/norm/post, row-loop only
+                // the per-slot KV attention core until batch FlashMLA owns the
+                // full metadata/replay contract.
+                {
+                    let (
+                        stream,
+                        attn_mhc,
+                        attn_pre,
+                        attn_normed,
+                        attn_normed_row,
+                        attn_out,
+                        attn_out_row,
+                        attn_stream,
+                    ) = (
                         &scratch.stream,
-                        row,
+                        &mut scratch.attn_mhc,
+                        &mut scratch.attn_pre,
+                        &mut scratch.attn_normed,
+                        &mut scratch.attn_normed_row,
+                        &mut scratch.attn_out,
+                        &mut scratch.attn_out_row,
+                        &mut scratch.attn_stream,
+                    );
+
+                    let trace = dsv4_trace_begin(&self.ctx)?;
+                    let attn_mhc_scratch = ensure_mhc_scratch(
+                        attn_mhc,
+                        &self.ctx,
                         stream_hidden_dim,
-                        &mut scratch.row_in,
+                        layer.hc_attn.mix_fn.rows,
+                        hc_mult,
+                        n,
                     )?;
-                    let layer_cache = states[slot_idx]
-                        .incremental
-                        .layers
-                        .get_mut(layer_idx)
-                        .expect("incremental cache layer initialized");
-                    let row_start_pos_ptr_u64 =
-                        start_pos_base_ptr as u64 + (row * start_pos_i32_size) as u64;
-                    self.forward_attention_half_incremental_into(
-                        layer_idx,
-                        &scratch.row_in,
-                        start_pos[row],
-                        Some(row_start_pos_ptr_u64),
-                        layer_cache,
-                        &mut scratch.row_out,
+                    let mhc = MhcParamsView::Cached(gen_mhc_params_cached(
+                        &self.ctx,
+                        &layer.hc_attn,
+                        stream,
+                        hc_mult,
+                        self.config.hc_eps,
+                        self.config.hc_sinkhorn_iters,
+                        attn_mhc_scratch,
+                    )?);
+                    dsv4_trace_end(&self.ctx, "attn_mhc", layer_idx, n, trace)?;
+
+                    let trace = dsv4_trace_begin(&self.ctx)?;
+                    hc_pre_from_stream_into(
+                        &self.ctx,
+                        stream,
+                        mhc.pre(),
+                        hidden_size,
+                        hc_mult,
+                        attn_pre,
                     )?;
-                    write_hidden_row(&self.ctx, &mut scratch.attn_stream, row, &scratch.row_out)?;
+                    ops::rms_norm_batch_into(
+                        &self.ctx,
+                        attn_pre,
+                        &layer.attn_norm,
+                        self.config.rms_norm_eps,
+                        attn_normed,
+                    );
+                    dsv4_trace_end(&self.ctx, "attn_pre_norm", layer_idx, n, trace)?;
+
+                    let trace = dsv4_trace_begin(&self.ctx)?;
+                    for (row, &slot_idx) in slot_indices.iter().enumerate() {
+                        extract_hidden_token_with_width_into(
+                            &self.ctx,
+                            attn_normed,
+                            row,
+                            hidden_size,
+                            attn_normed_row,
+                        )?;
+                        let layer_cache = states[slot_idx]
+                            .incremental
+                            .layers
+                            .get_mut(layer_idx)
+                            .expect("incremental cache layer initialized");
+                        let row_start_pos_ptr_u64 =
+                            start_pos_base_ptr as u64 + (row * start_pos_i32_size) as u64;
+                        self.forward_sliding_window_attention_incremental_into(
+                            layer_idx,
+                            &layer.attention,
+                            attn_normed_row,
+                            start_pos[row],
+                            Some(row_start_pos_ptr_u64),
+                            &mut layer_cache.attention,
+                            attn_out_row,
+                        )?;
+                        write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
+                    }
+                    dsv4_trace_end(&self.ctx, "attn_total", layer_idx, n, trace)?;
+
+                    let trace = dsv4_trace_begin(&self.ctx)?;
+                    hc_post_to_stream_into(
+                        &self.ctx,
+                        attn_out,
+                        stream,
+                        mhc.post(),
+                        mhc.comb(),
+                        hidden_size,
+                        hc_mult,
+                        attn_stream,
+                    )?;
+                    dsv4_trace_end(&self.ctx, "attn_post", layer_idx, n, trace)?;
                 }
 
                 // --- FFN half: ONE batched call over all N rows. ---
@@ -875,7 +955,6 @@ impl DeepseekModel {
                 // scratch, no persistent per-sequence state). `tokens` only sizes
                 // route capacity; values are row-independent for MoE routing.
                 let ffn_slot = slot_indices[0];
-                let layer = &self.layers[layer_idx];
                 let layer_cache = states[ffn_slot]
                     .incremental
                     .layers
