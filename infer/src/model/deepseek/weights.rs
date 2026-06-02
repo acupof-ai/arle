@@ -17,6 +17,8 @@ use half::bf16;
 use log::info;
 use safetensors::Dtype;
 
+#[cfg(feature = "cuda")]
+use super::batch_decode::DeepseekBatchDecodeBuffers;
 use super::config::DeepseekRuntimeConfig;
 #[cfg(feature = "cuda")]
 use super::load::load_dsv4_matrix_raw;
@@ -58,6 +60,8 @@ use crate::model::common;
 use crate::model::layer_communicator::LayerCommunicator;
 #[cfg(feature = "cuda")]
 use crate::ops;
+#[cfg(feature = "cuda")]
+use crate::ops::LinearDispatchPhase;
 #[cfg(feature = "cuda")]
 use crate::tp::TpLoadContext;
 #[cfg(feature = "cuda")]
@@ -174,6 +178,7 @@ impl DeepseekModel {
         tokens: &[u32],
         states: &mut [super::state::DeepseekState],
         slot_indices: &[usize],
+        decode_ctx: &mut DeepseekBatchDecodeBuffers,
     ) -> Result<bool> {
         // N == 1: per-row path is already optimal and the only validated
         // single-sequence path. Don't route through the batch machinery.
@@ -206,17 +211,9 @@ impl DeepseekModel {
             );
         }
 
-        let logits =
-            self.compute_top_level_logits_incremental_batch(tokens, states, slot_indices)?;
-        ensure!(
-            logits.len() == slot_indices.len(),
-            "DSv4 batched decode produced {} logits for {} rows",
-            logits.len(),
-            slot_indices.len()
-        );
-        for (logit, &slot_idx) in logits.into_iter().zip(slot_indices) {
+        self.compute_top_level_logits_incremental_batch(tokens, states, slot_indices, decode_ctx)?;
+        for &slot_idx in slot_indices {
             let state = &mut states[slot_idx];
-            state.decode_logits = logit;
             state.base.prefill_logits = None;
             state.base.kv_cache.advance_seq_len(1);
         }
@@ -700,7 +697,7 @@ impl DeepseekModel {
     /// GEMM) or a sum-reduce (all-reduce) whose result is identical whether
     /// issued per-row or over the stacked batch, and the attention core is the
     /// unchanged per-row path. Greedy output is therefore byte-identical to the
-    /// per-row loop. Returns one `[1, vocab]` logits buffer per input row in
+    /// per-row loop. Writes logits into each row's `state.decode_logits` in
     /// `slot_indices` order.
     ///
     /// Requires every row to be at `processed_tokens == kv_cache.len()` (a real
@@ -711,7 +708,8 @@ impl DeepseekModel {
         tokens: &[u32],
         states: &mut [super::state::DeepseekState],
         slot_indices: &[usize],
-    ) -> Result<Vec<DeviceVec>> {
+        decode_ctx: &mut DeepseekBatchDecodeBuffers,
+    ) -> Result<()> {
         ensure!(
             tokens.len() == slot_indices.len(),
             "DSv4 batched decode token/slot mismatch: tokens={} slots={}",
@@ -736,6 +734,15 @@ impl DeepseekModel {
         let hidden_size = self.config.hidden_size;
         let hc_mult = self.config.hc_mult;
         let stream_hidden_dim = hidden_size * hc_mult;
+        let scratch = decode_ctx.ensure_batched_scratch(
+            &self.ctx,
+            hidden_size,
+            stream_hidden_dim,
+            head_hc.mix_fn.rows,
+            self.config.vocab_size,
+            n,
+        )?;
+        scratch.upload_token_ids(&self.ctx, tokens)?;
 
         // Per-row absolute decode position + bookkeeping prime. Mirror the
         // per-row `compute_gpu_logits_after_decode` preconditions exactly.
@@ -763,27 +770,36 @@ impl DeepseekModel {
         }
 
         // Batched [N, stream_hidden_dim] residual stream from token embeddings.
-        let embeddings =
-            common::get_embeddings_batch(&self.ctx, embed_tokens, tokens, hidden_size)?;
-        let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_hidden_dim, n)? };
+        ops::embedding_batch(
+            &self.ctx,
+            embed_tokens,
+            &scratch.token_ids_gpu,
+            &mut scratch.embeddings,
+        )?;
+        common::debug_dump_hidden(
+            &self.ctx,
+            &scratch.embeddings,
+            "after embedding",
+            hidden_size,
+        );
         initial_hc_stream_from_embeddings_into(
             &self.ctx,
-            &embeddings,
+            &scratch.embeddings,
             hidden_size,
             hc_mult,
-            &mut stream,
+            &mut scratch.stream,
         )?;
-
-        // Per-row attention scratch (one row in/out), and the batched
-        // post-attention residual stream the FFN half consumes.
-        let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_hidden_dim, n)? };
 
         for layer_idx in 0..num_layers {
             // --- Attention half: per-row, each into its row of attn_stream. ---
             for (row, &slot_idx) in slot_indices.iter().enumerate() {
-                let row_in =
-                    extract_hidden_token_with_width(&self.ctx, &stream, row, stream_hidden_dim)?;
-                let mut row_out = unsafe { HiddenStates::uninit(&self.ctx, stream_hidden_dim, 1)? };
+                extract_hidden_token_with_width_into(
+                    &self.ctx,
+                    &scratch.stream,
+                    row,
+                    stream_hidden_dim,
+                    &mut scratch.row_in,
+                )?;
                 let layer_cache = states[slot_idx]
                     .incremental
                     .layers
@@ -791,12 +807,12 @@ impl DeepseekModel {
                     .expect("incremental cache layer initialized");
                 self.forward_attention_half_incremental_into(
                     layer_idx,
-                    &row_in,
+                    &scratch.row_in,
                     start_pos[row],
                     layer_cache,
-                    &mut row_out,
+                    &mut scratch.row_out,
                 )?;
-                write_hidden_row(&self.ctx, &mut attn_stream, row, &row_out)?;
+                write_hidden_row(&self.ctx, &mut scratch.attn_stream, row, &scratch.row_out)?;
             }
 
             // --- FFN half: ONE batched call over all N rows. ---
@@ -822,13 +838,13 @@ impl DeepseekModel {
             )?;
             self.forward_ffn_layer_stream_with_scratch_into(
                 layer_idx,
-                &attn_stream,
+                &scratch.attn_stream,
                 tokens,
                 Some(&mut layer_cache.moe),
                 Some(ffn_mhc_scratch),
                 Some(&mut layer_cache.ffn_pre),
                 Some(&mut layer_cache.ffn_normed),
-                &mut stream,
+                &mut scratch.stream,
             )?;
             dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
         }
@@ -841,28 +857,46 @@ impl DeepseekModel {
         // Head HC + lm_head logits, one row at a time (head is last-token-only
         // and cheap; the [N, vocab] GEMM would need a stacked head hidden which
         // the head HC kernel does not yet expose — kept per-row for parity).
-        let mut out = Vec::with_capacity(n);
         for row in 0..n {
-            let hidden = head_hidden_from_stream(
+            head_hidden_from_stream_into(
                 &self.ctx,
                 head_hc,
-                &stream,
+                &scratch.stream,
                 row,
                 hidden_size,
                 hc_mult,
                 self.config.hc_eps,
+                &mut scratch.head_stream_row,
+                &mut scratch.head_mixes,
+                &mut scratch.head_hidden,
             )?;
-            let logits = common::compute_logits_batch(
+            ops::rms_norm_into(
                 &self.ctx,
-                &hidden,
+                &scratch.head_hidden,
                 norm,
-                lm_head,
                 self.config.rms_norm_eps,
-                false,
+                &mut scratch.head_normed,
             )?;
-            out.push(logits.with_label("dsv4_incremental_batch_logits"));
+            ops::gemv(
+                &self.ctx,
+                lm_head,
+                &scratch.head_normed,
+                &mut scratch.logits,
+            )?;
+            let state = &mut states[slot_indices[row]];
+            ensure!(
+                state.decode_logits.len == scratch.logits.len,
+                "DSv4 slot {} decode logits len {} does not match scratch len {}",
+                slot_indices[row],
+                state.decode_logits.len,
+                scratch.logits.len
+            );
+            self.ctx
+                .stream
+                .memcpy_dtod(&scratch.logits.data, &mut state.decode_logits.data)
+                .map_err(|err| anyhow::anyhow!("DSv4 logits D2D scatter failed: {err}"))?;
         }
-        Ok(out)
+        Ok(())
     }
 
     fn forward_transformer_layer_stream_incremental_into(
@@ -6113,6 +6147,103 @@ fn head_hidden_from_stream(
 }
 
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn head_hidden_from_stream_into(
+    ctx: &DeviceContext,
+    head_hc: &DeepseekV4HyperConnection,
+    stream: &HiddenStates,
+    token_idx: usize,
+    hidden_size: usize,
+    hc_mult: usize,
+    hc_eps: f32,
+    stream_row: &mut HiddenStates,
+    mixes: &mut HiddenStates,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    ensure!(
+        token_idx < stream.seq_len,
+        "DeepSeek V4 head token {} out of range for stream seq_len {}",
+        token_idx,
+        stream.seq_len
+    );
+    ensure!(
+        stream.hidden_dim == hidden_size * hc_mult,
+        "DeepSeek V4 head stream dim {} does not match hidden_size {} * hc_mult {}",
+        stream.hidden_dim,
+        hidden_size,
+        hc_mult
+    );
+    ensure!(
+        head_hc.mix_fn.cols == stream.hidden_dim && head_hc.mix_fn.rows >= hc_mult,
+        "DeepSeek V4 head HC mix shape {}x{} cannot produce {} pre weights from stream dim {}",
+        head_hc.mix_fn.rows,
+        head_hc.mix_fn.cols,
+        hc_mult,
+        stream.hidden_dim
+    );
+    ensure!(
+        head_hc.base.len >= hc_mult && head_hc.scale.len >= 1,
+        "DeepSeek V4 head HC base/scale too short: base={} scale={} hc_mult={}",
+        head_hc.base.len,
+        head_hc.scale.len,
+        hc_mult
+    );
+    ensure!(
+        stream_row.hidden_dim == stream.hidden_dim && stream_row.seq_len == 1,
+        "DeepSeek V4 head stream-row scratch shape mismatch: {}x{} expected 1x{}",
+        stream_row.seq_len,
+        stream_row.hidden_dim,
+        stream.hidden_dim
+    );
+    ensure!(
+        mixes.hidden_dim == head_hc.mix_fn.rows && mixes.seq_len == 1,
+        "DeepSeek V4 head mix scratch shape mismatch: {}x{} expected 1x{}",
+        mixes.seq_len,
+        mixes.hidden_dim,
+        head_hc.mix_fn.rows
+    );
+    ensure!(
+        out.len == hidden_size,
+        "DeepSeek V4 head output len {} does not match hidden_size {}",
+        out.len,
+        hidden_size
+    );
+
+    extract_hidden_token_with_width_into(ctx, stream, token_idx, stream.hidden_dim, stream_row)?;
+    ops::try_gemm_with_phase_into(
+        ctx,
+        &head_hc.mix_fn,
+        stream_row,
+        mixes,
+        LinearDispatchPhase::Decode,
+    )?;
+    {
+        let (row_ptr, _row_guard) = stream_row.data.device_ptr(&ctx.stream);
+        let (mixes_ptr, _mixes_guard) = mixes.data.device_ptr(&ctx.stream);
+        let (base_ptr, _base_guard) = head_hc.base.data.device_ptr(&ctx.stream);
+        let (scale_ptr, _scale_guard) = head_hc.scale.data.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_mhc_head_pre_cuda(
+                row_ptr as *const ffi::Half,
+                mixes_ptr as *const ffi::Half,
+                base_ptr as *const ffi::Half,
+                scale_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                stream.hidden_dim as i32,
+                hidden_size as i32,
+                hc_mult as i32,
+                hc_eps,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| anyhow::anyhow!("DeepSeek V4 head HC pre CUDA failed: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn extract_hidden_token_with_width(
     ctx: &DeviceContext,
     hidden: &HiddenStates,
@@ -6132,12 +6263,43 @@ fn extract_hidden_token_with_width(
         hidden.hidden_dim
     );
     let mut out = unsafe { HiddenStates::uninit(ctx, width, 1)? };
+    extract_hidden_token_with_width_into(ctx, hidden, token_idx, width, &mut out)?;
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+fn extract_hidden_token_with_width_into(
+    ctx: &DeviceContext,
+    hidden: &HiddenStates,
+    token_idx: usize,
+    width: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        token_idx < hidden.seq_len,
+        "DeepSeek V4 token {} out of range for seq_len {}",
+        token_idx,
+        hidden.seq_len
+    );
+    ensure!(
+        hidden.hidden_dim == width,
+        "DeepSeek V4 token extract width {} does not match hidden dim {}",
+        width,
+        hidden.hidden_dim
+    );
+    ensure!(
+        out.hidden_dim == width && out.seq_len == 1,
+        "DeepSeek V4 token extract output shape mismatch: out={}x{} expected=1x{}",
+        out.seq_len,
+        out.hidden_dim,
+        width
+    );
     let start = token_idx * width;
     let src = hidden.data.slice(start..start + width);
     ctx.stream
         .memcpy_dtod(&src, &mut out.data)
         .map_err(|err| anyhow::anyhow!("DeepSeek V4 token extract copy: {err}"))?;
-    Ok(out)
+    Ok(())
 }
 
 /// Write a single `[1, width]` row into row `row_idx` of a batched
