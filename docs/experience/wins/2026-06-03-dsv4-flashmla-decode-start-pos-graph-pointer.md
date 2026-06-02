@@ -34,9 +34,24 @@ Local verification:
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,nccl,no-cuda`
 - `git diff --check`
 
-Remote nvcc build and DSv4 startup/correctness probe are pending for the next
-step because this change adds CUDA symbols and intentionally invalidates older
-prebuilt archives.
+Remote verification on `/data01/build/arle` at commit
+`232c41761173dc9fd1100fbaedf738624ee50009`:
+
+- release-fast CUDA build passed in 7m01s, rebuilt the CUDA tree, and harvested
+  fresh prebuilt artifacts.
+- `libkernels_cuda.a` exports `dsv4_prepare_qk_start_pos_ptr_cuda`,
+  `dsv4_prepare_qk_fused_start_pos_ptr_cuda`, and
+  `arle_dsv4_output_inverse_rope_start_pos_ptr_cuda`.
+- TP8 + EAGLE SGLang-best-practice startup probe still fails closed, as
+  expected, on remaining full graph blockers: decode is still `piecewise`,
+  DeepEP/NCCL capture/replay is missing, frozen-KV EAGLE/MTP graph replay is
+  missing, FlashMLA/SWA/C4/C128 metadata replay is missing, and attention still
+  has per-row host-side planning.
+
+Artifacts:
+
+- `/tmp/dsv4_graph_start_pos_20260603/build.log`
+- `/tmp/dsv4_graph_start_pos_20260603/startup_tp8_eagle.log`
 
 ## Rule
 
