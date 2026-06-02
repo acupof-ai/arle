@@ -1506,7 +1506,10 @@ const PREBUILT_REQUIRED_DSV4_SYMBOLS: &[&str] = &[
     "dsv4_deepgemm_native_preflight_cuda",
     "arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda",
     "arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda",
+    "dsv4_prepare_qk_start_pos_ptr_cuda",
+    "dsv4_prepare_qk_fused_start_pos_ptr_cuda",
     "arle_dsv4_output_inverse_rope_cuda",
+    "arle_dsv4_output_inverse_rope_start_pos_ptr_cuda",
     "dsv4_update_window_cache_start_pos_ptr_cuda",
     "dsv4_mtp_add_eproj_hproj_cuda",
 ];
