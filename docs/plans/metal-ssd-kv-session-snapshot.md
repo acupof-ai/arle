@@ -148,7 +148,10 @@ MetalRequestState::export_qwen35_live_session_snapshot(
 Contract:
 
 - `token_ids.len()` must equal the driver's live `cache_len`.
-- For a normal completed request, `token_ids = prompt_tokens + generated_token_ids`.
+- For a normal completed request, `token_ids = prompt_tokens + generated_token_ids`
+  up to the currently materialized `cache_len`. The final sampled token can be
+  absent because the standard decode loop queues the next-token forward pass one
+  step behind the token returned to the client.
 - Export is allowed only when the Qwen3.5/Qwen3.6 C++ session can be drained.
 - Export must not truncate because Qwen3.6 GDR recurrent state cannot be
   rewound without replay.
@@ -218,6 +221,20 @@ Acceptance:
 
 The existing lookup already supports "stored key is a strict prefix of the new
 prompt":
+
+Status as of 2026-06-02:
+
+- Implemented for strict token-prefix extensions: restarted SSD cache hit
+  imported 45 tokens and prefetched only the 12-token suffix in a raw
+  `/v1/completions` smoke.
+- Exact-prompt reuse is intentionally still not imported. The Qwen3.5 prefill
+  state machine must run a terminal prompt step to sample the first token; exact
+  import needs a separate imported-prefill-to-decode transition.
+- OpenAI Chat history with `enable_thinking:false` is a separate product
+  semantic issue. The current request appends a hidden non-thinking prefix at
+  the active assistant generation position, while user-supplied prior assistant
+  history usually contains only visible text. Raw token-prefix identity is not
+  guaranteed across those two renderings.
 
 - Memory: `lookup_longest_prefix()`
 - Disk: `lookup_longest_disk_prefix()`

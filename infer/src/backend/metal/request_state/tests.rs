@@ -338,4 +338,24 @@ mod tests {
             "unexpected peek error: {err:#}"
         );
     }
+
+    #[test]
+    fn qwen35_prefix_snapshot_disk_payload_rejects_token_cache_len_mismatch() {
+        let _guard = metal_test_guard();
+        let snapshot = Qwen35PrefixSnapshot {
+            token_ids: vec![101, 102],
+            kv_flat: vec![MlxArray::from_slice_i32(&[10, 20], &[2])],
+            gdr_flat: Vec::new(),
+            cache_len: 3,
+            kv_capacity: 3,
+        };
+
+        let err = snapshot
+            .encode_for_disk(b"qwen35-a")
+            .expect_err("token/cache_len mismatch should fail");
+        assert!(
+            err.to_string().contains("does not match cache_len"),
+            "unexpected mismatch error: {err:#}"
+        );
+    }
 }

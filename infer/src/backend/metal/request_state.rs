@@ -1263,6 +1263,13 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
+    pub(crate) fn qwen35_live_cache_len(&self) -> Option<usize> {
+        match &self.inner {
+            MetalRequestStateInner::Qwen35(state) => usize::try_from(state.driver.cache_len).ok(),
+            MetalRequestStateInner::Qwen3(_) => None,
+        }
+    }
+
     pub fn finish_reason(&self) -> Option<&'static str> {
         match &self.inner {
             MetalRequestStateInner::Qwen3(state) => state.finish_reason(),
@@ -1745,6 +1752,37 @@ impl<'a> MetalRequestState<'a> {
             return Ok(None);
         }
         let token_ids = state.prompt_tokens[..live_len].to_vec();
+        let snapshot = state
+            .driver
+            .export_drained_prefix_snapshot(token_ids, live_len)?;
+        Ok(Some(snapshot))
+    }
+
+    /// Snapshot the live Qwen3.5/Qwen3.6 C++ session at the driver's currently
+    /// materialized cache cursor. `token_ids` must name exactly that prefix.
+    ///
+    /// The last sampled token may not yet be materialized into KV: standard
+    /// decode queues the next token's forward pass one step ahead and commits
+    /// `cache_len` on the following call. We intentionally snapshot only the
+    /// materialized prefix instead of running an extra decode at request finish.
+    pub(crate) fn export_qwen35_live_session_snapshot(
+        &mut self,
+        token_ids: Vec<u32>,
+        block_size: usize,
+    ) -> Result<Option<Qwen35PrefixSnapshot>> {
+        let MetalRequestStateInner::Qwen35(state) = &mut self.inner else {
+            return Ok(None);
+        };
+        let live_len = usize::try_from(state.driver.cache_len)
+            .context("Qwen3.5 live session cache_len is negative")?;
+        if live_len < block_size {
+            return Ok(None);
+        }
+        ensure!(
+            token_ids.len() == live_len,
+            "Qwen3.5 live session snapshot token_ids ({}) must match materialized cache_len {live_len}",
+            token_ids.len()
+        );
         let snapshot = state
             .driver
             .export_drained_prefix_snapshot(token_ids, live_len)?;
