@@ -22,9 +22,9 @@ pub use protocol::{
     RoundTripResponse, Status,
 };
 
-/// Path to the sidecar binary baked in at build time when `ARLE_DEEPEP_DIR`
-/// is set. `None` indicates the sidecar wasn't built — the native-deepep
-/// backend cannot be used in this binary.
+/// Path to the sidecar binary baked into the `infer` crate by `infer/build.rs`.
+/// The path comes from `ARLE_DEEPEP_SIDECAR_PREBUILT`, `ARLE_DEEPEP_SIDECAR_PATH`,
+/// or `ARLE_CUDA_KERNELS_PREBUILT_DIR/arle_deepep_sidecar`.
 pub fn baked_binary_path() -> Option<&'static str> {
     option_env!("ARLE_DEEPEP_SIDECAR_PATH")
 }

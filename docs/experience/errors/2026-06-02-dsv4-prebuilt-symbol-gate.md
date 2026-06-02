@@ -50,6 +50,10 @@ standard pod paths and requires the prebuilt cache to contain
 The build script supports both the old flat DeepEP kernel layout and the newer
 `csrc/kernels/legacy` layout.
 
+`infer/build.rs` now publishes the prebuilt sidecar path into the `infer` crate
+itself. A `cargo:rustc-env` emitted by `cuda-kernels/build.rs` is crate-local
+and cannot satisfy `option_env!("ARLE_DEEPEP_SIDECAR_PATH")` inside `infer`.
+
 ## Rule
 
 For DSv4, a prebuilt CUDA archive is not valid because its manifest matches.
