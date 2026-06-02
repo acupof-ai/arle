@@ -2169,11 +2169,16 @@ impl DeepseekModel {
         // then only writes the bf16 SW/compressed buffers and never touches the
         // FP8 pool.
         if dsv4_flashmla_decode_enabled()? {
-            if token_count == 1 {
+            let shared_pool_bound_for_decode_hooks = if dsv4_shared_kv_pool_enabled()? {
+                cache.fp8_kv_pool_ptr != 0
+            } else {
+                true
+            };
+            if token_count == 1 && shared_pool_bound_for_decode_hooks {
                 self.dsv4_flashmla_sw_bootstrap_hook(cache, compress_ratio, head_dim)?;
             }
             let pack_compressor = if dsv4_shared_kv_pool_enabled()? {
-                token_count == 1
+                token_count == 1 && shared_pool_bound_for_decode_hooks
             } else {
                 true
             };

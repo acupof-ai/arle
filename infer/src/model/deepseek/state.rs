@@ -50,6 +50,39 @@ pub(crate) struct DeepseekIncrementalState {
     pub(crate) processed_tokens: usize,
     pub(crate) layers: Vec<DeepseekLayerRuntimeCache>,
     pub(crate) stream_recycle: Option<DeepseekHiddenRuntimeScratch>,
+    pub(crate) spec_verify: Option<DeepseekSpecVerifyState>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekSpecVerifyState {
+    pub(crate) original_len: usize,
+    pub(crate) input_tokens: Vec<u32>,
+    pub(crate) layers: Vec<DeepseekSpecLayerSnapshot>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekSpecLayerSnapshot {
+    pub(crate) attention: DeepseekSpecAttentionSnapshot,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekSpecAttentionSnapshot {
+    pub(crate) compressed_gpu: Option<DeepseekSpecGpuCompressorSnapshot>,
+    pub(crate) indexer_gpu: Option<DeepseekSpecGpuCompressorSnapshot>,
+    pub(crate) fp8_kv_sw_bootstrapped: bool,
+    pub(crate) fp8_kv_comp_packed_rows: usize,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeepseekSpecGpuCompressorSnapshot {
+    pub(crate) pending_kv: Option<CudaSlice<bf16>>,
+    pub(crate) pending_score: Option<CudaSlice<bf16>>,
+    pub(crate) prev_overlap_kv: Option<CudaSlice<bf16>>,
+    pub(crate) prev_overlap_score: Option<CudaSlice<bf16>>,
+    pub(crate) pending_len: usize,
+    pub(crate) compressed_rows: usize,
+    pub(crate) pending_width: usize,
+    pub(crate) head_dim: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -58,6 +91,7 @@ impl DeepseekIncrementalState {
         self.processed_tokens = 0;
         self.layers.clear();
         self.stream_recycle = None;
+        self.spec_verify = None;
     }
 
     pub(crate) fn ensure_layers(&mut self, layers: usize) {
