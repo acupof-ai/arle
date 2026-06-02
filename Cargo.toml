@@ -107,6 +107,14 @@ codegen-units = 1
 [profile.release.package."*"]
 debug = false
 
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+strip = "none"
+debug = false
+
 [profile.dev]
 debug = "line-tables-only"
 
