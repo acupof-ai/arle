@@ -350,33 +350,31 @@ impl ModelForward for DeepseekModel {
         let greedy = SamplingParams::default();
         let mut rng = StdRng::seed_from_u64(0x5eec_dec0de);
 
+        // Keep the verifier on the same per-row target path that commit replay
+        // uses. DSv4 batched decode is throughput-oriented and not yet licensed
+        // as byte-identical to the per-row replay path under speculative accept.
         for step in 0..max_steps {
-            let mut tokens = Vec::new();
-            let mut slot_indices = Vec::new();
-            let mut output_indices = Vec::new();
             for (idx, request) in requests.iter().enumerate() {
                 let Some(&token) = request.input_tokens.get(step) else {
                     continue;
                 };
                 pool.cow_tail_page_for_append(&self.ctx, request.slot_idx)?;
                 pool.alloc_tokens(request.slot_idx, 1)?;
-                tokens.push(token);
-                slot_indices.push(request.slot_idx);
-                output_indices.push(idx);
-            }
-            decode_ctx.force_eager_once();
-            self.forward_decode_batch(
-                &tokens,
-                states,
-                &slot_indices,
-                Some(pool),
-                decode_ctx,
-                false,
-            )?;
-            for (idx, &slot_idx) in output_indices.iter().zip(&slot_indices) {
-                let (token, _) =
-                    self.select_token_with_logprob(&mut states[slot_idx], &greedy, &mut rng)?;
-                outputs[*idx].target_argmax_tokens.push(token);
+                decode_ctx.force_eager_once();
+                self.forward_decode_batch(
+                    &[token],
+                    states,
+                    &[request.slot_idx],
+                    Some(pool),
+                    decode_ctx,
+                    false,
+                )?;
+                let (token, _) = self.select_token_with_logprob(
+                    &mut states[request.slot_idx],
+                    &greedy,
+                    &mut rng,
+                )?;
+                outputs[idx].target_argmax_tokens.push(token);
             }
         }
 
