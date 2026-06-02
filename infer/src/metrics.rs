@@ -42,6 +42,11 @@
 //! | `infer_metal_decode_batch_fallback_rows_total` | counter | Metal decode rows scheduled together but forced to scalar fallback |
 //! | `infer_metal_qwen35_packed_decode_batches_total` | counter | Qwen3.5 packed decode batches executed |
 //! | `infer_metal_qwen35_packed_decode_rows_total` | counter | Qwen3.5 packed decode rows executed |
+//! | `infer_metal_mtp_blocks_total` | counter | Metal MTP speculative blocks executed |
+//! | `infer_metal_mtp_accepted_inputs_total` | counter | Target-verified inputs accepted by Metal MTP |
+//! | `infer_metal_mtp_acceptance_rate` | gauge | Metal MTP suffix acceptance rate |
+//! | `infer_metal_mtp_utilization` | gauge | Metal MTP accepted inputs divided by proposed block inputs |
+//! | `infer_metal_mtp_scalar_rows_total` | counter | Metal MTP rows forced through scalar decode |
 //! | `infer_kv_coordinator_queue_capacity` | gauge | Coordinator queue capacity |
 //! | `infer_kv_fetch_queue_depth` | gauge | In-flight staged KV fetch tickets |
 //! | `infer_kv_fetch_waiters` | gauge | Requests waiting on staged KV fetches |
@@ -330,6 +335,10 @@ struct MetricsInner {
     pub dflash_blocks_total: AtomicU64,
     pub dflash_accepted_tokens_total: AtomicU64,
     pub dflash_draft_tokens_total: AtomicU64,
+    pub metal_mtp_blocks_total: AtomicU64,
+    pub metal_mtp_accepted_inputs_total: AtomicU64,
+    pub metal_mtp_draft_inputs_total: AtomicU64,
+    pub metal_mtp_scalar_rows_total: AtomicU64,
     pub metal_decode_batches_total: AtomicU64,
     pub metal_decode_batched_rows_total: AtomicU64,
     pub metal_decode_scalar_rows_total: AtomicU64,
@@ -471,6 +480,10 @@ impl ServerMetrics {
                 dflash_blocks_total: AtomicU64::new(0),
                 dflash_accepted_tokens_total: AtomicU64::new(0),
                 dflash_draft_tokens_total: AtomicU64::new(0),
+                metal_mtp_blocks_total: AtomicU64::new(0),
+                metal_mtp_accepted_inputs_total: AtomicU64::new(0),
+                metal_mtp_draft_inputs_total: AtomicU64::new(0),
+                metal_mtp_scalar_rows_total: AtomicU64::new(0),
                 metal_decode_batches_total: AtomicU64::new(0),
                 metal_decode_batched_rows_total: AtomicU64::new(0),
                 metal_decode_scalar_rows_total: AtomicU64::new(0),
@@ -1948,6 +1961,26 @@ impl ServerMetrics {
             .fetch_add(block_size as u64, Ordering::Relaxed);
     }
 
+    /// Record one Metal MTP speculative block execution.
+    pub fn record_metal_mtp_block(&self, accepted_inputs: usize, block_size: usize) {
+        self.inner
+            .metal_mtp_blocks_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .metal_mtp_accepted_inputs_total
+            .fetch_add(accepted_inputs as u64, Ordering::Relaxed);
+        self.inner
+            .metal_mtp_draft_inputs_total
+            .fetch_add(block_size as u64, Ordering::Relaxed);
+    }
+
+    /// Record a Metal MTP row routed through scalar decode.
+    pub fn record_metal_mtp_scalar_row(&self) {
+        self.inner
+            .metal_mtp_scalar_rows_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record one Metal decode batch that stayed on a batched GPU path.
     pub fn record_metal_decode_batch(&self, rows: usize) {
         self.inner
@@ -2025,6 +2058,53 @@ impl ServerMetrics {
             .dflash_accepted_tokens_total
             .load(Ordering::Relaxed) as f64
             / drafted as f64
+    }
+
+    pub fn metal_mtp_blocks_total(&self) -> u64 {
+        self.inner.metal_mtp_blocks_total.load(Ordering::Relaxed)
+    }
+
+    pub fn metal_mtp_accepted_inputs_total(&self) -> u64 {
+        self.inner
+            .metal_mtp_accepted_inputs_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn metal_mtp_draft_inputs_total(&self) -> u64 {
+        self.inner
+            .metal_mtp_draft_inputs_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn metal_mtp_scalar_rows_total(&self) -> u64 {
+        self.inner
+            .metal_mtp_scalar_rows_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// Metal MTP suffix acceptance rate: accepted draft suffix inputs divided
+    /// by proposed draft suffix inputs. The block's first input is the current
+    /// target token and does not count as a draft suffix prediction.
+    pub fn metal_mtp_acceptance_rate(&self) -> f64 {
+        let blocks = self.metal_mtp_blocks_total();
+        let proposed = self.metal_mtp_draft_inputs_total().saturating_sub(blocks);
+        if proposed == 0 {
+            return 0.0;
+        }
+        let accepted = self
+            .metal_mtp_accepted_inputs_total()
+            .saturating_sub(blocks);
+        accepted as f64 / proposed as f64
+    }
+
+    /// Metal MTP utilization: accepted target-verified inputs divided by the
+    /// full proposed verify block size.
+    pub fn metal_mtp_utilization(&self) -> f64 {
+        let proposed = self.metal_mtp_draft_inputs_total();
+        if proposed == 0 {
+            return 0.0;
+        }
+        self.metal_mtp_accepted_inputs_total() as f64 / proposed as f64
     }
 }
 
@@ -2161,6 +2241,9 @@ mod tests {
         m.record_metal_decode_scalar_row();
         m.record_metal_decode_batch_fallback(2);
         m.record_metal_qwen35_packed_decode_batch(3);
+        m.record_metal_mtp_block(2, 3);
+        m.record_metal_mtp_block(3, 3);
+        m.record_metal_mtp_scalar_row();
         m.set_memory_bytes(1234, 5678, 42);
 
         let rendered = m.render_prometheus();
@@ -2355,6 +2438,11 @@ mod tests {
         assert!(
             rendered.contains("infer_metal_qwen35_packed_decode_rows_total{model=\"Qwen3-4B\",} 3")
         );
+        assert!(rendered.contains("infer_metal_mtp_blocks_total{model=\"Qwen3-4B\",} 2"));
+        assert!(rendered.contains("infer_metal_mtp_accepted_inputs_total{model=\"Qwen3-4B\",} 5"));
+        assert!(rendered.contains("infer_metal_mtp_acceptance_rate{model=\"Qwen3-4B\",} 0.7500"));
+        assert!(rendered.contains("infer_metal_mtp_utilization{model=\"Qwen3-4B\",} 0.8333"));
+        assert!(rendered.contains("infer_metal_mtp_scalar_rows_total{model=\"Qwen3-4B\",} 1"));
         assert!(rendered.contains("infer_memory_active_bytes{model=\"Qwen3-4B\",} 1234"));
         assert!(rendered.contains("infer_queue_wait_seconds_count"));
         assert!(rendered.contains("infer_active_ttft_seconds_count"));
@@ -2387,6 +2475,8 @@ mod tests {
         m.record_metal_decode_scalar_row();
         m.record_metal_decode_batch_fallback(3);
         m.record_metal_qwen35_packed_decode_batch(4);
+        m.record_metal_mtp_block(2, 3);
+        m.record_metal_mtp_scalar_row();
         m.set_scheduler_step_phase_us(11.0, 22.0, 33.0, 44.0, 110.0);
         m.set_scheduler_loop_phase_us(55.0, 165.0);
         m.set_preprocess_stage(1, 7, 8);
@@ -2408,6 +2498,9 @@ mod tests {
         m.record_prefill_path_mixed_ok_false("scheduler_pre_dispatch_fallback");
         let s = m.render_summary();
         assert!(s.contains("requests=0"));
+        assert!(s.contains("mtp_blocks=1"));
+        assert!(s.contains("mtp_accept=50.0%"));
+        assert!(s.contains("mtp_scalar=1"));
         assert!(s.contains("active=0"));
         assert!(s.contains("scheduled=0"));
         assert!(s.contains(
@@ -2540,6 +2633,23 @@ mod tests {
         assert_eq!(
             stats["tier_observability"]["host_pool_low_pressure_ticks_total"],
             serde_json::json!(1)
+        );
+        assert_eq!(stats["metal_mtp"]["blocks_total"], serde_json::json!(1));
+        assert_eq!(
+            stats["metal_mtp"]["accepted_inputs_total"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            stats["metal_mtp"]["draft_inputs_total"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            stats["metal_mtp"]["scalar_rows_total"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            stats["metal_mtp"]["acceptance_rate"],
+            serde_json::json!(0.5)
         );
 
         let summary = m.render_summary();
