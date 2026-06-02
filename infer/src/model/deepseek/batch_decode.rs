@@ -91,6 +91,9 @@ pub(super) struct DeepseekBatchedDecodeScratch {
     capacity_tokens: usize,
     hidden_size: usize,
     stream_hidden_dim: usize,
+    attn_c_q_dim: usize,
+    attn_local_width: usize,
+    attn_head_dim: usize,
     head_mix_dim: usize,
     vocab_size: usize,
     token_ids_scratch: Vec<i32>,
@@ -104,6 +107,14 @@ pub(super) struct DeepseekBatchedDecodeScratch {
     pub(super) attn_pre: HiddenStates,
     pub(super) attn_normed: HiddenStates,
     pub(super) attn_normed_row: HiddenStates,
+    pub(super) attn_c_q: HiddenStates,
+    pub(super) attn_c_q_normed: HiddenStates,
+    pub(super) attn_c_q_normed_row: HiddenStates,
+    pub(super) attn_q_raw: HiddenStates,
+    pub(super) attn_q_raw_row: HiddenStates,
+    pub(super) attn_kv_raw: HiddenStates,
+    pub(super) attn_kv_normed: HiddenStates,
+    pub(super) attn_kv_normed_row: HiddenStates,
     pub(super) attn_out: HiddenStates,
     pub(super) attn_out_row: HiddenStates,
     pub(super) attn_stream: HiddenStates,
@@ -121,6 +132,9 @@ impl DeepseekBatchedDecodeScratch {
         capacity_tokens: usize,
         hidden_size: usize,
         stream_hidden_dim: usize,
+        attn_c_q_dim: usize,
+        attn_local_width: usize,
+        attn_head_dim: usize,
         head_mix_dim: usize,
         vocab_size: usize,
     ) -> Result<Self> {
@@ -129,6 +143,9 @@ impl DeepseekBatchedDecodeScratch {
             capacity_tokens,
             hidden_size,
             stream_hidden_dim,
+            attn_c_q_dim,
+            attn_local_width,
+            attn_head_dim,
             head_mix_dim,
             vocab_size,
             token_ids_scratch: Vec::with_capacity(capacity_tokens),
@@ -148,6 +165,14 @@ impl DeepseekBatchedDecodeScratch {
             attn_pre: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
             attn_normed: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
             attn_normed_row: HiddenStates::zeros(ctx, hidden_size, 1)?,
+            attn_c_q: HiddenStates::zeros(ctx, attn_c_q_dim, capacity_tokens)?,
+            attn_c_q_normed: HiddenStates::zeros(ctx, attn_c_q_dim, capacity_tokens)?,
+            attn_c_q_normed_row: HiddenStates::zeros(ctx, attn_c_q_dim, 1)?,
+            attn_q_raw: HiddenStates::zeros(ctx, attn_local_width, capacity_tokens)?,
+            attn_q_raw_row: HiddenStates::zeros(ctx, attn_local_width, 1)?,
+            attn_kv_raw: HiddenStates::zeros(ctx, attn_head_dim, capacity_tokens)?,
+            attn_kv_normed: HiddenStates::zeros(ctx, attn_head_dim, capacity_tokens)?,
+            attn_kv_normed_row: HiddenStates::zeros(ctx, attn_head_dim, 1)?,
             attn_out: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
             attn_out_row: HiddenStates::zeros(ctx, hidden_size, 1)?,
             attn_stream: HiddenStates::zeros(ctx, stream_hidden_dim, capacity_tokens)?,
@@ -171,6 +196,14 @@ impl DeepseekBatchedDecodeScratch {
         self.attn_pre.seq_len = batch_size;
         self.attn_normed.seq_len = batch_size;
         self.attn_normed_row.seq_len = 1;
+        self.attn_c_q.seq_len = batch_size;
+        self.attn_c_q_normed.seq_len = batch_size;
+        self.attn_c_q_normed_row.seq_len = 1;
+        self.attn_q_raw.seq_len = batch_size;
+        self.attn_q_raw_row.seq_len = 1;
+        self.attn_kv_raw.seq_len = batch_size;
+        self.attn_kv_normed.seq_len = batch_size;
+        self.attn_kv_normed_row.seq_len = 1;
         self.attn_out.seq_len = batch_size;
         self.attn_out_row.seq_len = 1;
         self.attn_stream.seq_len = batch_size;
@@ -270,6 +303,9 @@ impl DeepseekBatchDecodeBuffers {
         ctx: &DeviceContext,
         hidden_size: usize,
         stream_hidden_dim: usize,
+        attn_c_q_dim: usize,
+        attn_local_width: usize,
+        attn_head_dim: usize,
         head_mix_dim: usize,
         vocab_size: usize,
         batch_size: usize,
@@ -286,6 +322,9 @@ impl DeepseekBatchDecodeBuffers {
                 scratch.capacity_tokens < self.max_batch_size
                     || scratch.hidden_size != hidden_size
                     || scratch.stream_hidden_dim != stream_hidden_dim
+                    || scratch.attn_c_q_dim != attn_c_q_dim
+                    || scratch.attn_local_width != attn_local_width
+                    || scratch.attn_head_dim != attn_head_dim
                     || scratch.head_mix_dim != head_mix_dim
                     || scratch.vocab_size != vocab_size
             })
@@ -296,6 +335,9 @@ impl DeepseekBatchDecodeBuffers {
                 self.max_batch_size,
                 hidden_size,
                 stream_hidden_dim,
+                attn_c_q_dim,
+                attn_local_width,
+                attn_head_dim,
                 head_mix_dim,
                 vocab_size,
             )?);
