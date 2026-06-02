@@ -591,6 +591,11 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_deepgemm_native_preflight_cuda(
+        out: *mut std::ffi::c_char,
+        out_len: usize,
+    ) -> CUresult;
+
     pub fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda(
         a: *const u8,
         sfa: *const f32,

@@ -55,6 +55,41 @@ prefer_sccache() {
     fi
 }
 
+abs_path() {
+    local path="$1"
+    if [[ "$path" = /* ]]; then
+        printf '%s\n' "$path"
+    else
+        printf '%s\n' "$ROOT/$path"
+    fi
+}
+
+resolve_deepgemm_env() {
+    local native="${ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE:-${ARLE_CUDA_ENABLE_DEEPGEMM_TORCH:-}}"
+    if [[ "$native" != "1" && "$native" != "true" && "$native" != "TRUE" && "$native" != "yes" && "$native" != "YES" ]]; then
+        return 0
+    fi
+
+    local root="${ARLE_DEEPGEMM_ROOT:-$ROOT/crates/cuda-kernels/vendor/deepgemm}"
+    root="$(abs_path "$root")"
+    local library_root="${ARLE_DEEPGEMM_LIBRARY_ROOT:-$root/deep_gemm}"
+    library_root="$(abs_path "$library_root")"
+    export ARLE_DEEPGEMM_ROOT="$root"
+    export ARLE_DEEPGEMM_LIBRARY_ROOT="$library_root"
+
+    if [[ -z "${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}" ]]; then
+        local bundled="$root/third-party/cutlass/include"
+        local flashmla="$ROOT/crates/cuda-kernels/vendor/flashmla/csrc/cutlass/include"
+        if [[ -f "$bundled/cutlass/arch/barrier.h" ]]; then
+            export ARLE_DEEPGEMM_CUTLASS_INCLUDE="$bundled"
+        elif [[ -f "$flashmla/cutlass/arch/barrier.h" ]]; then
+            export ARLE_DEEPGEMM_CUTLASS_INCLUDE="$flashmla"
+        fi
+    else
+        export ARLE_DEEPGEMM_CUTLASS_INCLUDE="$(abs_path "$ARLE_DEEPGEMM_CUTLASS_INCLUDE")"
+    fi
+}
+
 prebuilt_ready() {
     [[ -f "$PREBUILT_DIR/libkernels_cuda.a" ]] &&
         [[ -f "$PREBUILT_DIR/libtilelang_kernels_aot.a" ]] &&
@@ -93,6 +128,8 @@ torch_cuda_arch_list=${TORCH_CUDA_ARCH_LIST:-}
 kernel_set=${ARLE_CUDA_KERNEL_SET:-}
 deepgemm_native=${ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE:-}
 deepgemm_root=${ARLE_DEEPGEMM_ROOT:-}
+deepgemm_library_root=${ARLE_DEEPGEMM_LIBRARY_ROOT:-}
+deepgemm_cutlass_include=${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}
 deepep_dir=${ARLE_DEEPEP_DIR:-}
 disable_flashmla=${ARLE_CUDA_DISABLE_FLASHMLA:-}
 enable_flashmla_decode=${ARLE_CUDA_ENABLE_FLASHMLA_DECODE:-}
@@ -150,6 +187,7 @@ harvest_prebuilt() {
 cd "$ROOT"
 detect_cuda
 prefer_sccache
+resolve_deepgemm_env
 
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 export ARLE_CUDA_KERNEL_SET="${ARLE_CUDA_KERNEL_SET:-dsv4_flash}"
@@ -174,6 +212,10 @@ echo "ARLE_CUDA_KERNEL_SET=$ARLE_CUDA_KERNEL_SET"
 echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-}"
 echo "ARLE_NVCC_WRAPPER=${ARLE_NVCC_WRAPPER:-}"
 echo "ARLE_NVCC_SPLIT_COMPILE=$ARLE_NVCC_SPLIT_COMPILE"
+echo "ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=${ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE:-}"
+echo "ARLE_DEEPGEMM_ROOT=${ARLE_DEEPGEMM_ROOT:-}"
+echo "ARLE_DEEPGEMM_LIBRARY_ROOT=${ARLE_DEEPGEMM_LIBRARY_ROOT:-}"
+echo "ARLE_DEEPGEMM_CUTLASS_INCLUDE=${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}"
 
 time cargo build --profile "$PROFILE" -p infer --features "$FEATURES" --bin "$BIN"
 harvest_prebuilt
