@@ -28,6 +28,18 @@ shape: TTFT ~0.44s, TPOT ~4.85ms, E2E ~7.7s, output throughput ~196 tok/s.
 - `cargo check -p infer --no-default-features --features no-cuda`
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
 - `cargo test -p deepseek-spec v4::tests::parses_hf_flash_alias_config_fields`
+- Remote pod `/data01/build/arle` at commit `dfca260e`:
+  `scripts/dsv4_fast_build.sh` used prebuilt CUDA artifacts and completed in
+  22.15s.
+- Remote tensor-index check on `/data01/models/DeepSeek-V4-Flash` confirmed
+  `mtp.0.enorm.weight`, `mtp.0.hnorm.weight`, `mtp.0.e_proj.weight`,
+  `mtp.0.h_proj.weight`, `mtp.0.norm.weight`, and `mtp.0.hc_head_fn` exist in
+  `model-00046-of-00046.safetensors`.
+- Remote high-perf startup contract probe:
+  `/tmp/dsv4_mtp_contract_20260602_151015.log`. All 8 ranks loaded
+  `layers=43` and `mtp_layers=1`, then failed closed at the expected remaining
+  missing executable path:
+  `CUDA frozen-KV EAGLE draft forward/graph capture is not implemented yet`.
 
 `cargo test -p deepseek-spec` was not a valid local gate on this Mac because
 three existing tests require `infer/models/dsv4-mini-1B-init/config.json`, which
