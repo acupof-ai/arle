@@ -864,4 +864,21 @@ unsafe extern "C" {
         page_block_size: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Build the unified decode indices row using a device-resident
+    /// `start_pos` scalar. This keeps the kernel replay-safe for CUDA graph
+    /// decode once ARLE stamps per-step scalars into graph-visible device
+    /// metadata.
+    pub fn arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
+        indices: *mut i32,
+        selected: *const i32,
+        sw_blocks: i32,
+        sliding_window: i32,
+        start_pos: *const i32,
+        max_compressed_keys: i32,
+        compress_ratio: i32,
+        mode_int: i32,
+        page_block_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }

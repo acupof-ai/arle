@@ -51,11 +51,8 @@
 
 namespace {
 
-// One block, 128 threads. Each thread handles one position of the
-// `topk_unified` row. `mode_int`: 1 = CSA (selected != nullptr),
-//                                 2 = HCA (selected == nullptr, identity range).
-__global__ void arle_dsv4_flashmla_decode_build_indices_kernel(
-        int32_t* __restrict__ indices,          // [topk_unified] int32 (s_q=1)
+__device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
+        int tid,
         const int32_t* __restrict__ selected,   // [max_compressed_keys] int32 (CSA) or nullptr (HCA)
         int sw_blocks,                          // SW sub-pool block count (= ceil(sliding_window / page_block_size))
         int sliding_window,
@@ -63,11 +60,8 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_kernel(
         int max_compressed_keys,                // index_topk (CSA) or padded compressed_count (HCA)
         int compress_ratio,
         int mode_int,
-        int page_block_size,
-        int topk_unified) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= topk_unified) return;
-
+        int page_block_size) {
+    if (start_pos < 0) return -1;
     // SW slot count for this decode token. Decode is single-token (s_q=1)
     // so the SW window covers positions [max(0, start_pos - sw + 1), start_pos].
     int sw_start = start_pos - sliding_window + 1;
@@ -75,16 +69,16 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_kernel(
     const int sw_count = start_pos - sw_start + 1;  // ∈ [1, sliding_window]
 
     // Segment dispatch.
-    int32_t out;
     if (tid < sw_count) {
         // SW slot region.
         const int p = sw_start + tid;
         const int ring_idx = p % sliding_window;
         const int block_id = ring_idx / page_block_size;
         const int row_in_block = ring_idx % page_block_size;
-        out = block_id * page_block_size + row_in_block;
+        int32_t out = block_id * page_block_size + row_in_block;
         // Defensive: if a position would map past sw_blocks (config drift), mask.
         if (block_id >= sw_blocks) out = -1;
+        return out;
     } else if (tid < sw_count + max_compressed_keys) {
         const int k = tid - sw_count;
         if (mode_int == 1) {
@@ -100,9 +94,9 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_kernel(
             if (valid) {
                 const int abs_block = sw_blocks + c / page_block_size;
                 const int row_in_block = c % page_block_size;
-                out = abs_block * page_block_size + row_in_block;
+                return abs_block * page_block_size + row_in_block;
             } else {
-                out = -1;
+                return -1;
             }
         } else {
             // HCA — identity 0..comp_keys-1 into compressed; causality cap
@@ -121,16 +115,54 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_kernel(
                 const int r = k;
                 const int abs_block = sw_blocks + r / page_block_size;
                 const int row_in_block = r % page_block_size;
-                out = abs_block * page_block_size + row_in_block;
+                return abs_block * page_block_size + row_in_block;
             } else {
-                out = -1;
+                return -1;
             }
         }
-    } else {
-        // Padding tail.
-        out = -1;
     }
-    indices[tid] = out;
+    // Padding tail.
+    return -1;
+}
+
+// One block, 128 threads. Each thread handles one position of the
+// `topk_unified` row. `mode_int`: 1 = CSA (selected != nullptr),
+//                                 2 = HCA (selected == nullptr, identity range).
+__global__ void arle_dsv4_flashmla_decode_build_indices_kernel(
+        int32_t* __restrict__ indices,          // [topk_unified] int32 (s_q=1)
+        const int32_t* __restrict__ selected,   // [max_compressed_keys] int32 (CSA) or nullptr (HCA)
+        int sw_blocks,                          // SW sub-pool block count (= ceil(sliding_window / page_block_size))
+        int sliding_window,
+        int start_pos,                          // absolute position of the (single) decode token
+        int max_compressed_keys,                // index_topk (CSA) or padded compressed_count (HCA)
+        int compress_ratio,
+        int mode_int,
+        int page_block_size,
+        int topk_unified) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= topk_unified) return;
+    indices[tid] = arle_dsv4_flashmla_decode_index_at(
+        tid, selected, sw_blocks, sliding_window, start_pos,
+        max_compressed_keys, compress_ratio, mode_int, page_block_size);
+}
+
+__global__ void arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel(
+        int32_t* __restrict__ indices,
+        const int32_t* __restrict__ selected,
+        int sw_blocks,
+        int sliding_window,
+        const int32_t* __restrict__ start_pos_ptr,
+        int max_compressed_keys,
+        int compress_ratio,
+        int mode_int,
+        int page_block_size,
+        int topk_unified) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= topk_unified) return;
+    const int start_pos = *start_pos_ptr;
+    indices[tid] = arle_dsv4_flashmla_decode_index_at(
+        tid, selected, sw_blocks, sliding_window, start_pos,
+        max_compressed_keys, compress_ratio, mode_int, page_block_size);
 }
 
 }  // namespace
@@ -181,6 +213,36 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_cuda(
     const int grid = (topk_unified + kBlock - 1) / kBlock;
     arle_dsv4_flashmla_decode_build_indices_kernel<<<grid, kBlock, 0, stream>>>(
         indices, selected, sw_blocks, sliding_window, start_pos,
+        max_compressed_keys, compress_ratio, mode_int, page_block_size,
+        topk_unified);
+    return cudaGetLastError();
+}
+
+cudaError_t arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
+        int32_t* indices,
+        const int32_t* selected,
+        int sw_blocks,
+        int sliding_window,
+        const int32_t* start_pos_ptr,
+        int max_compressed_keys,
+        int compress_ratio,
+        int mode_int,
+        int page_block_size,
+        cudaStream_t stream) {
+    if (indices == nullptr || start_pos_ptr == nullptr) return cudaErrorInvalidValue;
+    if (sliding_window <= 0) return cudaErrorInvalidValue;
+    if (max_compressed_keys < 0 || page_block_size <= 0) return cudaErrorInvalidValue;
+    if (mode_int != 1 && mode_int != 2) return cudaErrorInvalidValue;
+    if (mode_int == 1 && selected == nullptr) return cudaErrorInvalidValue;
+    if (sw_blocks < 0) return cudaErrorInvalidValue;
+
+    const int topk_unified = sliding_window + max_compressed_keys;
+    if ((topk_unified & 127) != 0) return cudaErrorInvalidValue;  // 2 * B_TOPK = 128
+
+    constexpr int kBlock = 128;
+    const int grid = (topk_unified + kBlock - 1) / kBlock;
+    arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel<<<grid, kBlock, 0, stream>>>(
+        indices, selected, sw_blocks, sliding_window, start_pos_ptr,
         max_compressed_keys, compress_ratio, mode_int, page_block_size,
         topk_unified);
     return cudaGetLastError();
