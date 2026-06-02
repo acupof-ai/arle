@@ -118,6 +118,13 @@ Remote:
   marker). That means the current internal MTP/EAGLE path is not yet
   correctness-licensed, even though non-spec decode is. Artifact:
   `/tmp/dsv4_body_graph_20260603/validate_body_graph_cap_eagle_c4/completions32.log`.
+- Fix in progress. The EAGLE corruption root cause is the DSv4 verifier creating
+  its own short-lived decode context. With `ARLE_DSV4_SHARED_KV_POOL=1`, the
+  FP8 KV pool is decode-context-owned; the verifier rebound per-slot attention
+  caches to that temporary pool, then `commit_speculative_target_state` replayed
+  accepted tokens through `forward_decode` without rebinding to the scheduler's
+  persistent pool. The fix is to pass the scheduler-owned decode context into
+  `forward_spec_verify_batch` and remove the DSv4 verifier's temporary context.
 - Pending. Performance gate must run the matched DSv4-Flash TP8 + EAGLE +
   CUDA graph 256K/1500 hot-cache workload before comparing with the target
   TPOT ~4.85 ms.
