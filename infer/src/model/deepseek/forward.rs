@@ -329,7 +329,7 @@ impl ModelForward for DeepseekModel {
     }
 
     fn supports_decode_warmup(&self) -> bool {
-        self.config.tp.world_size == 1 && self.config.ep.world_size == 1
+        self.cuda_graph_decode_support().supported()
     }
 
     fn cuda_graph_decode_support(&self) -> CudaGraphDecodeSupport {
@@ -344,17 +344,16 @@ impl ModelForward for DeepseekModel {
                  ARLE_DSV4_OPERATOR_TRACE / ARLE_DSV4_TRACE_LAYER before graph capture",
             );
         }
-        if self.config.tp.world_size > 1 || self.config.ep.world_size > 1 {
+        if std::env::var("INFER_DEBUG_DUMP").is_ok() {
             return CudaGraphDecodeSupport::unsupported(
-                "DSv4 TP/EP path still launches NCCL collectives and replicated-token \
-                 all-reduce/transport outside a graph-safe collective contract",
+                "INFER_DEBUG_DUMP performs device-to-host copies inside model code; disable it \
+                 before DSv4 CUDA graph capture",
             );
         }
-        CudaGraphDecodeSupport::unsupported(
-            "DSv4 decode is not graph-safe yet: attention/compressor metadata still uses \
-             host launch params and host-updated cache counters (start_pos, pending_len, \
-             compressed_rows, FP8 pack high-water marks); top-level batched scratch now uses \
-            stable decode-context buffers",
+        CudaGraphDecodeSupport::piecewise(
+            "DSv4 captures decode input staging and head/logits staging piecewise; attention, \
+             MoE orchestration, and collectives remain eager until FlashMLA/SWA/C4/C128 \
+             metadata replay and token-owned DP/EP are graph-safe",
         )
     }
 
@@ -379,7 +378,7 @@ impl ModelForward for DeepseekModel {
         };
 
         log::info!(
-            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_reason=\"{}\" moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
+            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
             profile.as_str(),
             fallback_lane,
             self.config.tp.rank,
@@ -415,12 +414,26 @@ impl ModelForward for DeepseekModel {
         if cuda_graph_max_bs == 0 {
             missing.push("cuda_graph_max_bs must be > 0".to_string());
         }
-        if !graph_support.supported() {
+        if !graph_support.is_full_decode() {
             missing.push(format!(
-                "CUDA graph decode must be supported, got mode={} reason={}",
+                "CUDA graph decode must be full_decode for DSv4 SGLang best-practice, got mode={} reason={}",
                 graph_support.mode_label(),
                 graph_support.reason
             ));
+        }
+        if self.config.tp.world_size > 1 || self.config.ep.world_size > 1 {
+            missing.push(
+                "DSv4 distributed decode still needs token-owned DP/EP request routing before graph capture"
+                    .to_string(),
+            );
+            missing.push(
+                "DSv4 owner-group NCCL/token-sync subgroups are not constructed from the SGLang axis layout"
+                    .to_string(),
+            );
+            missing.push(
+                "DSv4 DeepEP/NCCL collective capture/replay contract is not implemented"
+                    .to_string(),
+            );
         }
         if moe_backend != "native-deepep" {
             missing.push(format!(
@@ -447,7 +460,11 @@ impl ModelForward for DeepseekModel {
             missing.push("ARLE_DSV4_INCREMENTAL_KV must be enabled".to_string());
         }
         missing.push(
-            "DSv4 graph-captured SWA/C4/C128 metadata replay is not implemented in this executable route"
+            "DSv4 graph-captured FlashMLA/SWA/C4/C128 metadata replay is not implemented in this executable route"
+                .to_string(),
+        );
+        missing.push(
+            "DSv4 batched decode attention still loops per row with host start_pos-derived planning"
                 .to_string(),
         );
 

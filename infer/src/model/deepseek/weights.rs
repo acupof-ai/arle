@@ -731,15 +731,17 @@ impl DeepseekModel {
         let hidden_size = self.config.hidden_size;
         let hc_mult = self.config.hc_mult;
         let stream_hidden_dim = hidden_size * hc_mult;
-        let scratch = decode_ctx.ensure_batched_scratch(
-            &self.ctx,
-            hidden_size,
-            stream_hidden_dim,
-            head_hc.mix_fn.rows,
-            self.config.vocab_size,
-            n,
-        )?;
-        scratch.ensure_token_ids_uploaded(&self.ctx, tokens)?;
+        {
+            let scratch = decode_ctx.ensure_batched_scratch(
+                &self.ctx,
+                hidden_size,
+                stream_hidden_dim,
+                head_hc.mix_fn.rows,
+                self.config.vocab_size,
+                n,
+            )?;
+            scratch.ensure_token_ids_uploaded(&self.ctx, tokens)?;
+        }
 
         // Per-row absolute decode position + bookkeeping prime. Mirror the
         // per-row `compute_gpu_logits_after_decode` preconditions exactly.
@@ -766,131 +768,173 @@ impl DeepseekModel {
             start_pos.push(sp);
         }
 
-        // Batched [N, stream_hidden_dim] residual stream from token embeddings.
-        ops::embedding_batch(
-            &self.ctx,
-            embed_tokens,
-            &scratch.token_ids_gpu,
-            &mut scratch.embeddings,
-        )?;
-        common::debug_dump_hidden(
-            &self.ctx,
-            &scratch.embeddings,
-            "after embedding",
-            hidden_size,
-        );
-        initial_hc_stream_from_embeddings_into(
-            &self.ctx,
-            &scratch.embeddings,
-            hidden_size,
-            hc_mult,
-            &mut scratch.stream,
-        )?;
+        let graph_force_eager = decode_ctx.take_force_eager_once()
+            || !<Self as crate::model::ModelForward>::supports_cuda_graph_decode(self);
+        decode_ctx.run_input_piece_graph(&self.ctx, n, graph_force_eager, |scratch| {
+            // Batched [N, stream_hidden_dim] residual stream from token embeddings.
+            ops::embedding_batch(
+                &self.ctx,
+                embed_tokens,
+                &scratch.token_ids_gpu,
+                &mut scratch.embeddings,
+            )?;
+            common::debug_dump_hidden(
+                &self.ctx,
+                &scratch.embeddings,
+                "after embedding",
+                hidden_size,
+            );
+            initial_hc_stream_from_embeddings_into(
+                &self.ctx,
+                &scratch.embeddings,
+                hidden_size,
+                hc_mult,
+                &mut scratch.stream,
+            )?;
+            Ok(())
+        })?;
 
-        for layer_idx in 0..num_layers {
-            // --- Attention half: per-row, each into its row of attn_stream. ---
-            for (row, &slot_idx) in slot_indices.iter().enumerate() {
-                extract_hidden_token_with_width_into(
-                    &self.ctx,
-                    &scratch.stream,
-                    row,
-                    stream_hidden_dim,
-                    &mut scratch.row_in,
-                )?;
-                let layer_cache = states[slot_idx]
+        {
+            let scratch = decode_ctx.ensure_batched_scratch(
+                &self.ctx,
+                hidden_size,
+                stream_hidden_dim,
+                head_hc.mix_fn.rows,
+                self.config.vocab_size,
+                n,
+            )?;
+            for layer_idx in 0..num_layers {
+                // --- Attention half: per-row, each into its row of attn_stream. ---
+                for (row, &slot_idx) in slot_indices.iter().enumerate() {
+                    extract_hidden_token_with_width_into(
+                        &self.ctx,
+                        &scratch.stream,
+                        row,
+                        stream_hidden_dim,
+                        &mut scratch.row_in,
+                    )?;
+                    let layer_cache = states[slot_idx]
+                        .incremental
+                        .layers
+                        .get_mut(layer_idx)
+                        .expect("incremental cache layer initialized");
+                    self.forward_attention_half_incremental_into(
+                        layer_idx,
+                        &scratch.row_in,
+                        start_pos[row],
+                        layer_cache,
+                        &mut scratch.row_out,
+                    )?;
+                    write_hidden_row(&self.ctx, &mut scratch.attn_stream, row, &scratch.row_out)?;
+                }
+
+                // --- FFN half: ONE batched call over all N rows. ---
+                // The routed-MoE expert GEMMs + NCCL all-reduce amortize over N.
+                // Uses the first row's per-layer FFN/MoE scratch (pure capacity
+                // scratch, no persistent per-sequence state). `tokens` only sizes
+                // route capacity; values are row-independent for MoE routing.
+                let ffn_slot = slot_indices[0];
+                let layer = &self.layers[layer_idx];
+                let layer_cache = states[ffn_slot]
                     .incremental
                     .layers
                     .get_mut(layer_idx)
                     .expect("incremental cache layer initialized");
-                self.forward_attention_half_incremental_into(
-                    layer_idx,
-                    &scratch.row_in,
-                    start_pos[row],
-                    layer_cache,
-                    &mut scratch.row_out,
+                let trace = dsv4_trace_begin(&self.ctx)?;
+                let ffn_mhc_scratch = ensure_mhc_scratch(
+                    &mut layer_cache.ffn_mhc,
+                    &self.ctx,
+                    stream_hidden_dim,
+                    layer.hc_ffn.mix_fn.rows,
+                    hc_mult,
+                    n,
                 )?;
-                write_hidden_row(&self.ctx, &mut scratch.attn_stream, row, &scratch.row_out)?;
+                self.forward_ffn_layer_stream_with_scratch_into(
+                    layer_idx,
+                    &scratch.attn_stream,
+                    tokens,
+                    Some(&mut layer_cache.moe),
+                    Some(ffn_mhc_scratch),
+                    Some(&mut layer_cache.ffn_pre),
+                    Some(&mut layer_cache.ffn_normed),
+                    &mut scratch.stream,
+                )?;
+                dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
             }
-
-            // --- FFN half: ONE batched call over all N rows. ---
-            // The routed-MoE expert GEMMs + NCCL all-reduce amortize over N.
-            // Uses the first row's per-layer FFN/MoE scratch (pure capacity
-            // scratch, no persistent per-sequence state). `tokens` only sizes
-            // route capacity; values are row-independent for MoE routing.
-            let ffn_slot = slot_indices[0];
-            let layer = &self.layers[layer_idx];
-            let layer_cache = states[ffn_slot]
-                .incremental
-                .layers
-                .get_mut(layer_idx)
-                .expect("incremental cache layer initialized");
-            let trace = dsv4_trace_begin(&self.ctx)?;
-            let ffn_mhc_scratch = ensure_mhc_scratch(
-                &mut layer_cache.ffn_mhc,
-                &self.ctx,
-                stream_hidden_dim,
-                layer.hc_ffn.mix_fn.rows,
-                hc_mult,
-                n,
-            )?;
-            self.forward_ffn_layer_stream_with_scratch_into(
-                layer_idx,
-                &scratch.attn_stream,
-                tokens,
-                Some(&mut layer_cache.moe),
-                Some(ffn_mhc_scratch),
-                Some(&mut layer_cache.ffn_pre),
-                Some(&mut layer_cache.ffn_normed),
-                &mut scratch.stream,
-            )?;
-            dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
         }
 
-        // Advance per-row bookkeeping (one token consumed each).
-        for &slot_idx in slot_indices {
+        decode_ctx.run_head_piece_graph(&self.ctx, n, graph_force_eager, |scratch| {
+            // Head HC + lm_head logits, one row at a time (head is last-token-only
+            // and cheap; the [N, vocab] GEMM would need a stacked head hidden which
+            // the head HC kernel does not yet expose — kept per-row for parity).
+            for row in 0..n {
+                head_hidden_from_stream_into(
+                    &self.ctx,
+                    head_hc,
+                    &scratch.stream,
+                    row,
+                    hidden_size,
+                    hc_mult,
+                    self.config.hc_eps,
+                    &mut scratch.head_stream_row,
+                    &mut scratch.head_mixes,
+                    &mut scratch.head_hidden,
+                )?;
+                ops::rms_norm_into(
+                    &self.ctx,
+                    &scratch.head_hidden,
+                    norm,
+                    self.config.rms_norm_eps,
+                    &mut scratch.head_normed,
+                )?;
+                ops::gemv(
+                    &self.ctx,
+                    lm_head,
+                    &scratch.head_normed,
+                    &mut scratch.logits,
+                )?;
+                let start = row * self.config.vocab_size;
+                let mut dst = scratch
+                    .logits_batch
+                    .data
+                    .slice_mut(start..start + self.config.vocab_size);
+                self.ctx
+                    .stream
+                    .memcpy_dtod(&scratch.logits.data, &mut dst)
+                    .map_err(|err| anyhow::anyhow!("DSv4 logits batch row write failed: {err}"))?;
+            }
+            Ok(())
+        })?;
+
+        // Advance per-row bookkeeping and scatter decode-context logits back to
+        // each slot outside graph capture. Captured graphs must never bake in
+        // per-request state pointers.
+        let scratch = decode_ctx.ensure_batched_scratch(
+            &self.ctx,
+            hidden_size,
+            stream_hidden_dim,
+            head_hc.mix_fn.rows,
+            self.config.vocab_size,
+            n,
+        )?;
+        for (row, &slot_idx) in slot_indices.iter().enumerate() {
             states[slot_idx].incremental.processed_tokens += 1;
-        }
-
-        // Head HC + lm_head logits, one row at a time (head is last-token-only
-        // and cheap; the [N, vocab] GEMM would need a stacked head hidden which
-        // the head HC kernel does not yet expose — kept per-row for parity).
-        for row in 0..n {
-            head_hidden_from_stream_into(
-                &self.ctx,
-                head_hc,
-                &scratch.stream,
-                row,
-                hidden_size,
-                hc_mult,
-                self.config.hc_eps,
-                &mut scratch.head_stream_row,
-                &mut scratch.head_mixes,
-                &mut scratch.head_hidden,
-            )?;
-            ops::rms_norm_into(
-                &self.ctx,
-                &scratch.head_hidden,
-                norm,
-                self.config.rms_norm_eps,
-                &mut scratch.head_normed,
-            )?;
-            ops::gemv(
-                &self.ctx,
-                lm_head,
-                &scratch.head_normed,
-                &mut scratch.logits,
-            )?;
-            let state = &mut states[slot_indices[row]];
+            let state = &mut states[slot_idx];
             ensure!(
-                state.decode_logits.len == scratch.logits.len,
-                "DSv4 slot {} decode logits len {} does not match scratch len {}",
-                slot_indices[row],
+                state.decode_logits.len == self.config.vocab_size,
+                "DSv4 slot {} decode logits len {} does not match vocab_size {}",
+                slot_idx,
                 state.decode_logits.len,
-                scratch.logits.len
+                self.config.vocab_size
             );
+            let start = row * self.config.vocab_size;
+            let src = scratch
+                .logits_batch
+                .data
+                .slice(start..start + self.config.vocab_size);
             self.ctx
                 .stream
-                .memcpy_dtod(&scratch.logits.data, &mut state.decode_logits.data)
+                .memcpy_dtod(&src, &mut state.decode_logits.data)
                 .map_err(|err| anyhow::anyhow!("DSv4 logits D2D scatter failed: {err}"))?;
         }
         Ok(())
@@ -2470,11 +2514,20 @@ impl DeepseekModel {
             deepseek_spec::DeepSeekV4AttentionMode::HybridCompressed => 2,
         };
         let (sm_major_early, _) = self.ctx.compute_capability();
+        let shared_pool_bound_for_decode = if dsv4_shared_kv_pool_enabled()? {
+            cache
+                .as_deref()
+                .map(|cache| cache.fp8_kv_pool_ptr != 0)
+                .unwrap_or(false)
+        } else {
+            true
+        };
         let use_flashmla_decode = sm_major_early == 9
             && (mode_int_early == 1 || mode_int_early == 2)
             && token_count == 1
             && dsv4_flashmla_model1_decode_shape_supported(head_dim, local_heads)
             && cache.is_some()
+            && shared_pool_bound_for_decode
             && dsv4_flashmla_decode_enabled()?;
         let fuse_window_update = update_window_cache
             && token_count == 1
