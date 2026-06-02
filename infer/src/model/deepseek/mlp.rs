@@ -24,12 +24,15 @@ use half::bf16;
 #[cfg(feature = "cuda")]
 use log::info;
 #[cfg(feature = "cuda")]
-use std::sync::{
-    OnceLock,
-    atomic::{AtomicBool, Ordering},
-};
-#[cfg(feature = "cuda")]
 use std::time::Instant;
+#[cfg(feature = "cuda")]
+use std::{
+    ffi::CStr,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 #[cfg(feature = "cuda")]
 use super::state::{
@@ -664,18 +667,23 @@ pub(super) fn dsv4_try_build_deepgemm_expert_cache(
         let first = experts
             .first()
             .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 DeepGEMM cache needs local experts"))?;
-        if let Err(err) = dsv4_validate_deepgemm_expert_backend(
+        match dsv4_handle_deepgemm_expert_backend(
             ctx,
+            backend,
             "expert cache",
             &[&first.w1, &first.w3, &first.w2],
         ) {
-            if matches!(backend, Dsv4ExpertBackend::DeepGemmRequired) {
-                return Err(err);
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(err) => {
+                if matches!(backend, Dsv4ExpertBackend::DeepGemmRequired) {
+                    return Err(err);
+                }
+                LOGGED_PRECHECK.get_or_init(|| {
+                    info!("DeepSeek V4 DeepGEMM FP8 expert cache skipped before build: {err:#}");
+                });
+                return Ok(None);
             }
-            LOGGED_PRECHECK.get_or_init(|| {
-                info!("DeepSeek V4 DeepGEMM FP8 expert cache skipped before build: {err:#}");
-            });
-            return Ok(None);
         }
     }
 
@@ -1395,6 +1403,39 @@ fn dsv4_validate_deepgemm_expert_backend(
 }
 
 #[cfg(feature = "cuda")]
+fn dsv4_deepgemm_native_preflight_uncached() -> Result<String> {
+    let mut report = vec![0 as std::ffi::c_char; 4096];
+    let result =
+        unsafe { ffi::dsv4_deepgemm_native_preflight_cuda(report.as_mut_ptr(), report.len()) };
+    let report = unsafe { CStr::from_ptr(report.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    result.result().map_err(|err| {
+        anyhow::anyhow!("DeepSeek V4 DeepGEMM native bridge preflight failed: {err}; {report}")
+    })?;
+    Ok(report)
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_deepgemm_native_preflight_cached() -> Result<&'static str> {
+    static PREFLIGHT: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+    match PREFLIGHT
+        .get_or_init(|| dsv4_deepgemm_native_preflight_uncached().map_err(|err| format!("{err:#}")))
+    {
+        Ok(report) => Ok(report.as_str()),
+        Err(err) => bail!("{err}"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_log_deepgemm_native_preflight_ok(report: &str) {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    LOGGED.get_or_init(|| {
+        info!("DeepSeek V4 DeepGEMM native bridge preflight ok: {report}");
+    });
+}
+
+#[cfg(feature = "cuda")]
 fn dsv4_handle_deepgemm_expert_backend(
     ctx: &DeviceContext,
     backend: Dsv4ExpertBackend,
@@ -1405,16 +1446,31 @@ fn dsv4_handle_deepgemm_expert_backend(
         Dsv4ExpertBackend::Native => Ok(false),
         Dsv4ExpertBackend::DeepGemmRequired => {
             dsv4_validate_deepgemm_expert_backend(ctx, path, weights)?;
+            let report = dsv4_deepgemm_native_preflight_cached()?;
+            dsv4_log_deepgemm_native_preflight_ok(report);
             Ok(true)
         }
         Dsv4ExpertBackend::DeepGemmAuto => {
-            static LOGGED: OnceLock<()> = OnceLock::new();
+            static LOGGED_VALIDATE: OnceLock<()> = OnceLock::new();
+            static LOGGED_PREFLIGHT: OnceLock<()> = OnceLock::new();
             if let Err(err) = dsv4_validate_deepgemm_expert_backend(ctx, path, weights) {
-                LOGGED.get_or_init(|| {
+                LOGGED_VALIDATE.get_or_init(|| {
                     info!("DeepSeek V4 DeepGEMM auto fallback to native expert path: {err:#}");
                 });
                 return Ok(false);
             }
+            let report = match dsv4_deepgemm_native_preflight_cached() {
+                Ok(report) => report,
+                Err(err) => {
+                    LOGGED_PREFLIGHT.get_or_init(|| {
+                        info!(
+                            "DeepSeek V4 DeepGEMM auto fallback to native expert path before first request: {err:#}"
+                        );
+                    });
+                    return Ok(false);
+                }
+            };
+            dsv4_log_deepgemm_native_preflight_ok(report);
             Ok(true)
         }
     }
