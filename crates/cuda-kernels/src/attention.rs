@@ -179,6 +179,35 @@ pub fn dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_raw(
     Ok(())
 }
 
+/// Fill the `[block_id,row]` scratch arrays for a batch of FlashMLA decode SW
+/// packs. `token_block_id[row]` is absolute in the shared FP8 KV arena.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_fp8_kv_fill_sw_slots_from_start_pos_raw(
+    ctx: &DeviceContext,
+    token_block_id_ptr: u64,
+    token_in_block_row_ptr: u64,
+    start_pos_ptr: u64,
+    slot_layer_block_offsets_ptr: u64,
+    n_tokens: usize,
+    sliding_window: usize,
+    page_block_size: usize,
+) -> Result<()> {
+    unsafe {
+        ffi::arle_dsv4_fp8_kv_fill_sw_slots_from_start_pos_cuda(
+            token_block_id_ptr as *mut i32,
+            token_in_block_row_ptr as *mut i32,
+            start_pos_ptr as *const i32,
+            slot_layer_block_offsets_ptr as *const i32,
+            n_tokens as i32,
+            sliding_window as i32,
+            page_block_size as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Phase D-4 step 1 — DSv4 FlashMLA sparse-decode indices builder.
 ///
 /// Builds the unified per-decode-token indices row in block-paged coords
