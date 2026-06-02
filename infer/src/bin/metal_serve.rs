@@ -653,6 +653,7 @@ fn submit_warmup_request(
             delta_tx,
             trace_context: None,
             distributed: None,
+            distributed_shard: infer::scheduler::DistributedRequestShard::single_rank(),
             cancel: None,
         })
         .map_err(|_| anyhow::anyhow!("backend warmup queue rejected the request"))?;

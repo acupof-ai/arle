@@ -15,8 +15,8 @@ use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
 use infer::request_handle::{
-    DistributedRequestOwnership, DistributedSchedulerGroup, NumaSchedulerRouter,
-    NumaSchedulerWorker,
+    DistributedRequestOwnership, DistributedRequestShard, DistributedSchedulerGroup,
+    NumaSchedulerRouter, NumaSchedulerWorker,
 };
 use infer::runtime_notify::RuntimeNotifyGate;
 use infer::runtime_topology::{
@@ -502,6 +502,7 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                         let mut req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
                             wire,
                             delta_tx,
+                            DistributedRequestShard::replicated_token(rank, world_size),
                         );
                         // Phase B-1 commit C.4.6.4 — attach NCCL-backed
                         // DistributedRequestCoordination so worker rank R's
