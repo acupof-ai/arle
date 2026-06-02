@@ -133,8 +133,9 @@ impl DeepseekRuntimeConfig {
     }
 
     /// Fail closed for explicit SGLang-path claims. This is intentionally
-    /// stricter than the default path because ARLE does not yet have
-    /// token-owned DP/EP request shards or batched FlashMLA attention wired.
+    /// stricter than the default path because ARLE does not yet wire the full
+    /// SGLang DP-owner request topology, owner-group communicators, or batched
+    /// FlashMLA attention into serving.
     pub fn validate_sglang_path_claim(&self, worker_count: Option<usize>) -> Result<()> {
         let profile = self.performance_profile()?;
         if !profile.requires_best_practice() {
@@ -165,13 +166,20 @@ impl DeepseekRuntimeConfig {
             missing.push("ARLE_DSV4_SHARED_KV_POOL=1 (persistent paged FP8 KV pool)".to_string());
         }
         missing.push(
-            "distributed request fanout still submits the full logical request to every rank; token-owned DP/EP request shards are not implemented".to_string(),
+            "serving startup still selects the replicated-token request lane; DP-owner group routing is implemented only as a guarded control-plane path and is not the default DSv4 serve path".to_string(),
+        );
+        missing.push(
+            "owner-group NCCL/token-sync subgroup communicators are not wired; using the global EP group for a selected DP owner group would deadlock or over-synchronize".to_string(),
+        );
+        missing.push(
+            "remote-owner output return exists only on the relay control plane and is not yet selected by DSv4 multiprocess startup".to_string(),
         );
         missing.push(
             "DeepSeek decode attention still loops per row in forward_decode_batch; batched FlashMLA with SGLang sparse/recent indices is not wired".to_string(),
         );
         missing.push(
-            "LayerCommunicator only attaches global TP/EP groups; attention-DP/CP and MoE-DP subgroup communicators are not wired".to_string(),
+            "DSv4 graph-captured SWA/C4/C128 metadata replay is not wired into CUDA graph capture"
+                .to_string(),
         );
 
         bail!(

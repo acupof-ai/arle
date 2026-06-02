@@ -18,10 +18,16 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
+
+use crate::server_engine::CompletionStreamDelta;
 
 /// Free-port picker mirroring `infer/src/distributed.rs`. Binds 127.0.0.1:0,
 /// reads the assigned port, drops the listener. Caller races to use the
@@ -57,6 +63,19 @@ pub enum RelayEnvelope {
     /// incoming chat completion; every worker reconstructs an
     /// `IncomingRequest` from it on receive.
     Request2 { wire: WireRequest },
+    /// Token-owned request payload. The coordinator sends this only to the
+    /// selected DP-owner ranks, not to every worker rank.
+    RequestOwned {
+        wire: WireRequest,
+        shard_rank: usize,
+        shard_world_size: usize,
+        emits_visible_output: bool,
+    },
+    /// Worker-to-coordinator output for a remote visible-output owner rank.
+    Completion {
+        request_id: u64,
+        delta: CompletionStreamDelta,
+    },
     /// Graceful shutdown notice; workers should drain in-flight then
     /// exit. (Coordinator can also just drop streams; this is the
     /// nicer path for telemetry/log capture.)
@@ -105,6 +124,9 @@ pub struct WireSamplingParams {
 pub struct RelayCoordinator {
     port: u16,
     workers: BTreeMap<usize, TcpStream>,
+    completion_sinks:
+        Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>>>>,
+    completion_shutdown: Arc<AtomicBool>,
 }
 
 /// Pending coordinator state — listener is bound and port is known but
@@ -176,10 +198,31 @@ impl PendingRelayCoordinator {
                 Err(err) => return Err(err).context("RelayCoordinator accept"),
             }
         }
+        let completion_sinks = Arc::new(Mutex::new(HashMap::new()));
+        let completion_shutdown = Arc::new(AtomicBool::new(false));
+        for (&rank, stream) in &workers {
+            let stream = stream
+                .try_clone()
+                .with_context(|| format!("RelayCoordinator clone worker rank {rank} stream"))?;
+            spawn_completion_reader(
+                rank,
+                stream,
+                Arc::clone(&completion_sinks),
+                Arc::clone(&completion_shutdown),
+            );
+        }
         Ok(RelayCoordinator {
             port: self.port,
             workers,
+            completion_sinks,
+            completion_shutdown,
         })
+    }
+}
+
+impl Drop for RelayCoordinator {
+    fn drop(&mut self) {
+        self.completion_shutdown.store(true, Ordering::Relaxed);
     }
 }
 
@@ -219,6 +262,29 @@ impl RelayCoordinator {
 
     pub fn worker_ranks(&self) -> Vec<usize> {
         self.workers.keys().copied().collect()
+    }
+
+    pub fn register_completion_sink(
+        &mut self,
+        request_id: u64,
+        sink: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
+    ) -> Result<()> {
+        let mut sinks = self
+            .completion_sinks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sinks.insert(request_id, sink).is_some() {
+            bail!("RelayCoordinator duplicate completion sink for request_id={request_id}");
+        }
+        Ok(())
+    }
+
+    pub fn unregister_completion_sink(&mut self, request_id: u64) {
+        let mut sinks = self
+            .completion_sinks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sinks.remove(&request_id);
     }
 
     /// Broadcast an envelope to every connected worker. On the first
@@ -305,6 +371,93 @@ impl RelayWorker {
     pub fn recv(&mut self) -> Result<Option<RelayEnvelope>> {
         read_envelope(&mut self.stream)
     }
+
+    pub fn send(&mut self, envelope: &RelayEnvelope) -> Result<()> {
+        write_envelope(&mut self.stream, envelope)
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        let stream = self
+            .stream
+            .try_clone()
+            .context("RelayWorker clone stream")?;
+        Ok(Self { stream })
+    }
+}
+
+fn spawn_completion_reader(
+    rank: usize,
+    mut stream: TcpStream,
+    completion_sinks: Arc<
+        Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>>>,
+    >,
+    shutdown: Arc<AtomicBool>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = std::thread::Builder::new()
+        .name(format!("arle-relay-rank{rank}-completion-reader"))
+        .spawn(move || loop {
+            match read_envelope(&mut stream) {
+                Ok(Some(RelayEnvelope::Completion { request_id, delta })) => {
+                    let done = delta.finish_reason.is_some() || delta.error.is_some();
+                    let sink = {
+                        let sinks = completion_sinks
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        sinks.get(&request_id).cloned()
+                    };
+                    let remove = match sink {
+                        Some(tx) => tx.send(delta).is_err() || done,
+                        None => {
+                            log::warn!(
+                                "[relay-coordinator] completion for unknown request_id={request_id} from rank {rank}"
+                            );
+                            done
+                        }
+                    };
+                    if remove {
+                        let mut sinks = completion_sinks
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        sinks.remove(&request_id);
+                    }
+                }
+                Ok(Some(other)) => {
+                    log::warn!(
+                        "[relay-coordinator] unexpected worker->coordinator envelope from rank {rank}: {other:?}"
+                    );
+                }
+                Ok(None) => {
+                    log::info!("[relay-coordinator] worker rank {rank} completion stream EOF");
+                    break;
+                }
+                Err(err) if is_timeout_error(&err) => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[relay-coordinator] worker rank {rank} completion reader failed: {err:#}"
+                    );
+                    break;
+                }
+            }
+        });
+}
+
+fn is_timeout_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn write_envelope(stream: &mut TcpStream, envelope: &RelayEnvelope) -> Result<()> {
@@ -469,5 +622,67 @@ mod tests {
 
         rank1_thread.join().unwrap();
         rank2_thread.join().unwrap();
+    }
+
+    #[test]
+    fn coordinator_dispatches_worker_completion_to_registered_sink() {
+        let world_size = 2;
+        let pending = RelayCoordinator::bind().unwrap();
+        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
+
+        let worker_thread = thread::spawn(move || {
+            let mut worker =
+                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, world_size)
+                    .unwrap();
+            match worker.recv().unwrap().expect("request signal") {
+                RelayEnvelope::Request { request_id, .. } => assert_eq!(request_id, 11),
+                other => panic!("expected request signal, got {other:?}"),
+            }
+            worker
+                .send(&RelayEnvelope::Completion {
+                    request_id: 11,
+                    delta: CompletionStreamDelta::text("remote".to_string()),
+                })
+                .unwrap();
+            worker
+                .send(&RelayEnvelope::Completion {
+                    request_id: 11,
+                    delta: CompletionStreamDelta {
+                        text_delta: String::new(),
+                        finish_reason: Some(crate::server_engine::FinishReason::Length),
+                        usage: None,
+                        logprob: None,
+                        token_ids: Vec::new(),
+                        error: None,
+                    },
+                })
+                .unwrap();
+        });
+
+        let mut coord = pending
+            .accept(world_size, Duration::from_secs(5))
+            .expect("worker connected within 5s");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        coord.register_completion_sink(11, tx).unwrap();
+        coord
+            .send_to_ranks(
+                &[1],
+                &RelayEnvelope::Request {
+                    request_id: 11,
+                    prompt_tokens: vec![11],
+                    max_new_tokens: 1,
+                    sampling: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        let first = rx.blocking_recv().expect("text completion");
+        assert_eq!(first.text_delta, "remote");
+        let second = rx.blocking_recv().expect("finish completion");
+        assert_eq!(
+            second.finish_reason,
+            Some(crate::server_engine::FinishReason::Length)
+        );
+
+        worker_thread.join().unwrap();
     }
 }
