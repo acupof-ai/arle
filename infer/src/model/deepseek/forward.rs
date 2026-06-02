@@ -227,7 +227,7 @@ impl ModelForward for DeepseekModel {
         // gated by `try_decode_batch`; on any unsupported config it returns
         // `false` and we fall through to the per-row loop, which stays the
         // correctness reference + fallback and is NEVER deleted.
-        if self.try_decode_batch(tokens, states, slot_indices)? {
+        if self.try_decode_batch(tokens, states, slot_indices, decode_ctx)? {
             return Ok(());
         }
         for (&token, &slot_idx) in tokens.iter().zip(slot_indices) {
@@ -313,8 +313,9 @@ impl ModelForward for DeepseekModel {
             );
         }
         CudaGraphDecodeSupport::unsupported(
-            "DSv4 decode is not graph-safe yet: start_pos is captured as host launch params, \
-             decode still allocates per-step scratch, and TP/EP NCCL capture is unvalidated",
+            "DSv4 decode is not graph-safe yet: attention start_pos is captured as host launch \
+             params and TP/EP NCCL capture is unvalidated; top-level batched scratch now uses \
+             stable decode-context buffers",
         )
     }
 

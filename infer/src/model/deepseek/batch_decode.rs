@@ -8,7 +8,7 @@ use anyhow::{Result, ensure};
 
 use crate::model::DecodeContextOps;
 use crate::model::kv_cache::KVFormat;
-use cuda_kernels::prelude::{DeviceContext, PagedKVPool};
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
 use cuda_kernels::tensor::CudaAllocTraceExt;
 use cudarc::driver::{CudaSlice, DevicePtrMut};
 
@@ -58,6 +58,97 @@ pub struct DeepseekBatchDecodeBuffers {
     /// Served `max_seq_len` the pool was sized for; the per-step binding reads
     /// it back so the layout matches the allocation.
     fp8_kv_max_seq_len: usize,
+    batched_scratch: Option<DeepseekBatchedDecodeScratch>,
+}
+
+/// Stable DSv4 batched-decode buffers.
+///
+/// The current DSv4 graph blocker is dynamic attention metadata, but the
+/// batched decode body should still be allocation-free before graph capture is
+/// considered. These buffers replace per-step embedding / stream / row / head /
+/// logits allocations with stable pointers owned by the scheduler decode
+/// context.
+pub(super) struct DeepseekBatchedDecodeScratch {
+    capacity_tokens: usize,
+    hidden_size: usize,
+    stream_hidden_dim: usize,
+    head_mix_dim: usize,
+    vocab_size: usize,
+    token_ids_scratch: Vec<i32>,
+    pub(super) token_ids_gpu: CudaSlice<i32>,
+    pub(super) embeddings: HiddenStates,
+    pub(super) stream: HiddenStates,
+    pub(super) attn_stream: HiddenStates,
+    pub(super) row_in: HiddenStates,
+    pub(super) row_out: HiddenStates,
+    pub(super) head_stream_row: HiddenStates,
+    pub(super) head_mixes: HiddenStates,
+    pub(super) head_hidden: DeviceVec,
+    pub(super) head_normed: DeviceVec,
+    pub(super) logits: DeviceVec,
+}
+
+impl DeepseekBatchedDecodeScratch {
+    fn new(
+        ctx: &DeviceContext,
+        capacity_tokens: usize,
+        hidden_size: usize,
+        stream_hidden_dim: usize,
+        head_mix_dim: usize,
+        vocab_size: usize,
+    ) -> Result<Self> {
+        let capacity_tokens = capacity_tokens.max(1);
+        Ok(Self {
+            capacity_tokens,
+            hidden_size,
+            stream_hidden_dim,
+            head_mix_dim,
+            vocab_size,
+            token_ids_scratch: Vec::with_capacity(capacity_tokens),
+            token_ids_gpu: ctx
+                .stream
+                .alloc_zeros(capacity_tokens)
+                .map_err(|err| anyhow::anyhow!("Alloc DSv4 token_ids_gpu failed: {err}"))?,
+            embeddings: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
+            stream: HiddenStates::zeros(ctx, stream_hidden_dim, capacity_tokens)?,
+            attn_stream: HiddenStates::zeros(ctx, stream_hidden_dim, capacity_tokens)?,
+            row_in: HiddenStates::zeros(ctx, stream_hidden_dim, 1)?,
+            row_out: HiddenStates::zeros(ctx, stream_hidden_dim, 1)?,
+            head_stream_row: HiddenStates::zeros(ctx, stream_hidden_dim, 1)?,
+            head_mixes: HiddenStates::zeros(ctx, head_mix_dim, 1)?,
+            head_hidden: DeviceVec::zeros(ctx, hidden_size)?.with_label("dsv4_head_hidden"),
+            head_normed: DeviceVec::zeros(ctx, hidden_size)?.with_label("dsv4_head_normed"),
+            logits: DeviceVec::zeros(ctx, vocab_size)?.with_label("dsv4_batched_logits_scratch"),
+        })
+    }
+
+    pub(super) fn set_batch_size(&mut self, batch_size: usize) -> Result<()> {
+        ensure!(
+            batch_size <= self.capacity_tokens,
+            "DSv4 batched scratch batch {batch_size} exceeds capacity {}",
+            self.capacity_tokens
+        );
+        self.embeddings.seq_len = batch_size;
+        self.stream.seq_len = batch_size;
+        self.attn_stream.seq_len = batch_size;
+        self.row_in.seq_len = 1;
+        self.row_out.seq_len = 1;
+        self.head_stream_row.seq_len = 1;
+        self.head_mixes.seq_len = 1;
+        Ok(())
+    }
+
+    pub(super) fn upload_token_ids(&mut self, ctx: &DeviceContext, tokens: &[u32]) -> Result<()> {
+        self.set_batch_size(tokens.len())?;
+        self.token_ids_scratch.clear();
+        self.token_ids_scratch
+            .extend(tokens.iter().map(|&token| token as i32));
+        let mut dst = self.token_ids_gpu.slice_mut(0..tokens.len());
+        ctx.stream
+            .memcpy_htod(&self.token_ids_scratch, &mut dst)
+            .map_err(|err| anyhow::anyhow!("H2D DSv4 token_ids: {err}"))?;
+        Ok(())
+    }
 }
 
 impl DeepseekBatchDecodeBuffers {
@@ -79,7 +170,51 @@ impl DeepseekBatchDecodeBuffers {
             fp8_kv_layers: 0,
             fp8_kv_slot_blocks: 0,
             fp8_kv_max_seq_len: 0,
+            batched_scratch: None,
         })
+    }
+
+    pub(super) fn ensure_batched_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        hidden_size: usize,
+        stream_hidden_dim: usize,
+        head_mix_dim: usize,
+        vocab_size: usize,
+        batch_size: usize,
+    ) -> Result<&mut DeepseekBatchedDecodeScratch> {
+        ensure!(
+            batch_size <= self.max_batch_size,
+            "DeepSeek V4 batched scratch batch {batch_size} exceeds context capacity {}",
+            self.max_batch_size
+        );
+        let need_alloc = self
+            .batched_scratch
+            .as_ref()
+            .map(|scratch| {
+                scratch.capacity_tokens < self.max_batch_size
+                    || scratch.hidden_size != hidden_size
+                    || scratch.stream_hidden_dim != stream_hidden_dim
+                    || scratch.head_mix_dim != head_mix_dim
+                    || scratch.vocab_size != vocab_size
+            })
+            .unwrap_or(true);
+        if need_alloc {
+            self.batched_scratch = Some(DeepseekBatchedDecodeScratch::new(
+                ctx,
+                self.max_batch_size,
+                hidden_size,
+                stream_hidden_dim,
+                head_mix_dim,
+                vocab_size,
+            )?);
+        }
+        let scratch = self
+            .batched_scratch
+            .as_mut()
+            .expect("DSv4 batched scratch allocated");
+        scratch.set_batch_size(batch_size)?;
+        Ok(scratch)
     }
 
     /// Record the served `max_seq_len` the shared pool was sized for.
