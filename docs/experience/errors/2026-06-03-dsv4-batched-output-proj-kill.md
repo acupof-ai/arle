@@ -77,6 +77,20 @@ Remote verification after the revert, commit
 - After the smoke, no `infer` process remained and `nvidia-smi` reported no
   compute apps.
 
+Follow-up validation gate fix, commit
+`221edfc9bf0fd1bb5c43547973a1043ee794da18`:
+
+- `scripts/dsv4_batched_decode_validate.py` now uses `/v1/completions` rather
+  than `/v1/chat/completions`, so the correctness gate is not coupled to chat
+  template thinking/refusal text.
+- The hard gate is: c1, c4, and c8 complete without HTTP errors, c8 has zero
+  errors, and every output contains the expected answer token `406`.
+- c1-vs-c4 byte-identical output remains a diagnostic only.
+- Remote validation passed on the pod:
+  `/tmp/dsv4_validate_raw_completions_20260603/batched_decode_validate.log`.
+  The run printed `ANSWER_PASS` and exited with `validate_status=0`; c8
+  completed 64 output tokens with zero errors.
+
 ## Rule
 
 Do not batch DSv4 compressed-attention output projection until a focused parity
