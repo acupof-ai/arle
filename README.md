@@ -107,16 +107,12 @@ Agent and RL workloads waste compute re-processing the same prompt + history + t
 Quantized KV is available on CUDA (`--kv-cache-dtype int8|fp8|tq4`). Metal uses
 the model-native KV dtype today; MLX-side quantized KV is a separate follow-up.
 
-Benchmark data: [TTFT/TPOT/RSS sweep](docs/experience/wins/2026-06-01-metal-tpot-rss-after-memory-budget.md) ·
-[RSS accounting note](docs/experience/wins/2026-06-01-metal-low-rss-analysis.md) ·
+Benchmark data: [TTFT/TPOT steady sweep](docs/experience/wins/2026-06-02-metal-ttft-tpot-steady.md) ·
+[Metal memory accounting note](docs/experience/wins/2026-06-01-metal-low-rss-analysis.md) ·
 [Metal KV memory budget](docs/experience/wins/2026-06-01-metal-memory-kv-cache-auto-budget.md).
 
 <p align="center">
-  <img src="docs/assets/metal-vs-mlxlm-ttft.png" alt="ARLE Metal vs mlx-lm TTFT sweep" width="100%">
-</p>
-
-<p align="center">
-  <img src="docs/assets/metal-vs-mlxlm-tpot-rss.png" alt="ARLE Metal vs mlx-lm TPOT and RSS sweep" width="100%">
+  <img src="docs/assets/metal-vs-mlxlm-ttft-tpot.png" alt="ARLE Metal vs mlx-lm TTFT and TPOT sweep" width="100%">
 </p>
 
 ```mermaid

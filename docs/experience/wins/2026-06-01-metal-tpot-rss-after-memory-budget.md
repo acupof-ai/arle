@@ -56,8 +56,11 @@ Raw data:
 `docs/experience/wins/assets/2026-06-01-metal-tpot-rss-after-memory-budget-n5.json`
 
 Figures:
-`docs/assets/metal-vs-mlxlm-ttft.png`,
-`docs/assets/metal-vs-mlxlm-tpot-rss.png`
+The README figure from this run was superseded by
+`docs/assets/metal-vs-mlxlm-ttft-tpot.png` in
+`docs/experience/wins/2026-06-02-metal-ttft-tpot-steady.md`. The process-RSS
+comparison figure was removed because process RSS is not a scientific Metal
+memory-footprint metric on Apple unified memory.
 
 ## Results
 
