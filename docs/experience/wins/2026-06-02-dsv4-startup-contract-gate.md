@@ -138,6 +138,14 @@ serve on the replicated-token debug lane and still look like a performance run.
   `coordinator_targeted_send_reaches_only_selected_rank`, which proves a
   selected worker rank receives the envelope while another connected worker
   receives only EOF after coordinator drop.
+- PC2 relay remote gate at `91747279`: remote source fast-forwarded cleanly.
+  `RUSTUP_TOOLCHAIN=stable bash scripts/dsv4_fast_build.sh` used the DSv4
+  prebuilt CUDA artifacts, skipped nvcc/TileLang AOT, harvested the cache
+  again, and finished in 21.68 s. Remote CUDA/NCCL unit gates passed:
+  `cargo test -p infer --lib --no-default-features --features cuda,nccl multiproc_relay -- --nocapture`
+  passed 3/3, and
+  `cargo test -p infer --lib --no-default-features --features cuda,nccl request_handle -- --nocapture`
+  passed 11/11.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.
