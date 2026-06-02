@@ -109,6 +109,28 @@ pub(super) struct DeepseekMtpLayer {
     pub(super) hc_head: DeepseekV4HyperConnection,
 }
 
+#[cfg(feature = "cuda")]
+struct Dsv4BatchFlashMlaDecodeLaunch {
+    pool_base_ptr: u64,
+    indices_ptr: u64,
+    topk_length_ptr: u64,
+    num_splits_ptr: u64,
+    sched_meta_ptr: u64,
+    lse_accum_ptr: u64,
+    o_accum_ptr: u64,
+    lse_out_ptr: u64,
+    sw_token_block_id_ptr: u64,
+    sw_token_in_block_row_ptr: u64,
+    slot_layer_block_offsets_ptr: u64,
+    sw_blocks: usize,
+    max_compressed_keys: usize,
+    topk_unified: usize,
+    total_blocks: usize,
+    num_sm_parts: i32,
+    fixed_overhead_num_blocks: i32,
+    block_size_topk: i32,
+}
+
 /// DeepSeek V4 model: immutable weights plus runtime config. Mutable per-slot
 /// state lives in [`super::state::DeepseekState`].
 #[allow(dead_code)] // fields populated by the safetensors loader once kernels land
@@ -694,6 +716,505 @@ impl DeepseekModel {
         Ok(Some(logits.with_label("dsv4_incremental_top_level_logits")))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_hca_flashmla_decode_batch_launch(
+        &self,
+        layer_idx: usize,
+        decode_ctx: &mut DeepseekBatchDecodeBuffers,
+        states: &mut [super::state::DeepseekState],
+        slot_indices: &[usize],
+        start_pos: &[usize],
+        batch_size: usize,
+        local_heads: usize,
+        head_dim: usize,
+        compress_ratio: usize,
+        mode: deepseek_spec::DeepSeekV4AttentionMode,
+    ) -> Result<Option<Dsv4BatchFlashMlaDecodeLaunch>> {
+        if batch_size < 2
+            || mode != deepseek_spec::DeepSeekV4AttentionMode::HybridCompressed
+            || compress_ratio == 0
+            || !dsv4_flashmla_decode_enabled()?
+            || !dsv4_shared_kv_pool_enabled()?
+            || decode_ctx.fp8_kv_max_seq_len().is_none()
+        {
+            return Ok(None);
+        }
+        let (sm_major, _) = self.ctx.compute_capability();
+        if sm_major != 9 || !dsv4_flashmla_model1_decode_shape_supported(head_dim, local_heads) {
+            return Ok(None);
+        }
+        ensure!(
+            start_pos.len() == batch_size && slot_indices.len() == batch_size,
+            "DSv4 batch FlashMLA decode launch shape mismatch: start_pos={} slots={} batch={}",
+            start_pos.len(),
+            slot_indices.len(),
+            batch_size
+        );
+
+        let first_slot = *slot_indices
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 batch FlashMLA decode requires a slot"))?;
+        let first_cache = &mut states[first_slot]
+            .incremental
+            .layers
+            .get_mut(layer_idx)
+            .ok_or_else(|| anyhow::anyhow!("DSv4 batch FlashMLA layer {layer_idx} cache missing"))?
+            .attention;
+        if first_cache.fp8_kv_pool_ptr == 0 {
+            return Ok(None);
+        }
+        let fm_meta = ensure_fm_decode_meta(first_cache, local_heads, 1_i32)?;
+        let sw_blocks = first_cache.fp8_kv_sw_blocks;
+        let comp_blocks = first_cache.fp8_kv_comp_blocks;
+        ensure!(
+            sw_blocks > 0 && comp_blocks > 0,
+            "DSv4 batch FlashMLA decode requires bound shared pool blocks (sw={sw_blocks}, comp={comp_blocks})"
+        );
+        for &slot_idx in slot_indices {
+            let cache = &states[slot_idx]
+                .incremental
+                .layers
+                .get(layer_idx)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("DSv4 batch FlashMLA layer {layer_idx} cache missing")
+                })?
+                .attention;
+            ensure!(
+                cache.fp8_kv_pool_ptr != 0
+                    && cache.fp8_kv_sw_blocks == sw_blocks
+                    && cache.fp8_kv_comp_blocks == comp_blocks,
+                "DSv4 batch FlashMLA decode requires uniform bound shared pool views"
+            );
+        }
+
+        let max_compressed_rows = start_pos
+            .iter()
+            .copied()
+            .map(|pos| dsv4_compressor_required_capacity_rows(pos, 1, compress_ratio))
+            .max()
+            .unwrap_or(1);
+        let max_compressed_keys = max_compressed_rows.div_ceil(128) * 128;
+        ensure!(
+            max_compressed_keys <= comp_blocks * DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE,
+            "DSv4 batch FlashMLA HCA topk {} exceeds shared compressed pool capacity {}",
+            max_compressed_keys,
+            comp_blocks * DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE
+        );
+        let topk_unified = self.config.sliding_window + max_compressed_keys;
+        ensure!(
+            topk_unified.is_multiple_of(128),
+            "DSv4 batch FlashMLA decode topk_unified {topk_unified} must be multiple of 128"
+        );
+        let num_sm_parts_max = (fm_meta.num_sm_parts as usize).max(256);
+        {
+            decode_ctx.ensure_flashmla_decode_batch_arena(
+                &self.ctx,
+                batch_size,
+                num_sm_parts_max,
+                topk_unified,
+                local_heads,
+                head_dim,
+            )?;
+        }
+        let slot_layer_block_offsets_ptr = decode_ctx.stage_flashmla_slot_layer_block_offsets(
+            &self.ctx,
+            slot_indices,
+            layer_idx,
+        )?;
+        let pool_base_ptr = decode_ctx.fp8_kv_pool_base_ptr(&self.ctx)?;
+        let total_blocks = decode_ctx.fp8_kv_total_blocks()?;
+        let arena = decode_ctx.ensure_flashmla_decode_batch_arena(
+            &self.ctx,
+            batch_size,
+            num_sm_parts_max,
+            topk_unified,
+            local_heads,
+            head_dim,
+        )?;
+        let (indices_ptr, ig) = arena.indices.device_ptr_mut(&self.ctx.stream);
+        drop(ig);
+        let (topk_length_ptr, tg) = arena.topk_length.device_ptr_mut(&self.ctx.stream);
+        drop(tg);
+        let (num_splits_ptr, ng) = arena.num_splits.device_ptr_mut(&self.ctx.stream);
+        drop(ng);
+        let (sched_meta_ptr, sg) = arena.sched_meta.device_ptr_mut(&self.ctx.stream);
+        drop(sg);
+        let (lse_accum_ptr, lg) = arena.lse_accum.device_ptr_mut(&self.ctx.stream);
+        drop(lg);
+        let (o_accum_ptr, og) = arena.o_accum.device_ptr_mut(&self.ctx.stream);
+        drop(og);
+        let (lse_out_ptr, log) = arena.lse_out.device_ptr_mut(&self.ctx.stream);
+        drop(log);
+        let (sw_token_block_id_ptr, bg) = arena.sw_token_block_id.device_ptr_mut(&self.ctx.stream);
+        drop(bg);
+        let (sw_token_in_block_row_ptr, rg) =
+            arena.sw_token_in_block_row.device_ptr_mut(&self.ctx.stream);
+        drop(rg);
+
+        Ok(Some(Dsv4BatchFlashMlaDecodeLaunch {
+            pool_base_ptr,
+            indices_ptr,
+            topk_length_ptr,
+            num_splits_ptr,
+            sched_meta_ptr,
+            lse_accum_ptr,
+            o_accum_ptr,
+            lse_out_ptr,
+            sw_token_block_id_ptr,
+            sw_token_in_block_row_ptr,
+            slot_layer_block_offsets_ptr,
+            sw_blocks,
+            max_compressed_keys,
+            topk_unified,
+            total_blocks,
+            num_sm_parts: fm_meta.num_sm_parts,
+            fixed_overhead_num_blocks: fm_meta.fixed_overhead_num_blocks,
+            block_size_topk: fm_meta.block_size_topk,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_hca_flashmla_decode_batch_core_into(
+        &self,
+        layer_idx: usize,
+        attention: &DeepseekV4Attention,
+        attn_normed: &HiddenStates,
+        attn_normed_row: &mut HiddenStates,
+        attn_q_raw: &HiddenStates,
+        attn_kv_normed: &HiddenStates,
+        start_pos_gpu: &CudaSlice<i32>,
+        attn_q_prepared: &mut HiddenStates,
+        attn_k_prepared: &mut HiddenStates,
+        attn_local: &mut HiddenStates,
+        attn_local_row: &mut HiddenStates,
+        attn_latent_row: &mut HiddenStates,
+        attn_out: &mut HiddenStates,
+        attn_out_row: &mut HiddenStates,
+        states: &mut [super::state::DeepseekState],
+        slot_indices: &[usize],
+        start_pos: &[usize],
+        local_heads: usize,
+        local_width: usize,
+        head_dim: usize,
+        compress_ratio: usize,
+        launch: &Dsv4BatchFlashMlaDecodeLaunch,
+    ) -> Result<()> {
+        let batch_size = slot_indices.len();
+        ensure!(
+            batch_size > 1
+                && start_pos.len() == batch_size
+                && attn_normed.seq_len == batch_size
+                && attn_q_raw.seq_len == batch_size
+                && attn_kv_normed.seq_len == batch_size,
+            "DSv4 batch FlashMLA decode core shape mismatch"
+        );
+        ensure!(
+            attn_q_prepared.hidden_dim == local_width
+                && attn_q_prepared.seq_len == batch_size
+                && attn_k_prepared.hidden_dim == head_dim
+                && attn_k_prepared.seq_len == batch_size
+                && attn_local.hidden_dim == local_width
+                && attn_local.seq_len == batch_size
+                && attn_out.hidden_dim == attention.wo_b.rows
+                && attn_out.seq_len == batch_size,
+            "DSv4 batch FlashMLA decode scratch shape mismatch"
+        );
+        ensure!(
+            attn_latent_row.hidden_dim == attention.wo_a.rows && attn_latent_row.seq_len == 1,
+            "DSv4 batch FlashMLA decode latent row shape mismatch"
+        );
+        let compressor = attention.compressor.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepSeek V4 layer {} has HCA compress_ratio {} but no compressor weights",
+                layer_idx,
+                compress_ratio
+            )
+        })?;
+
+        for (row, &slot_idx) in slot_indices.iter().enumerate() {
+            extract_hidden_token_with_width_into(
+                &self.ctx,
+                attn_normed,
+                row,
+                self.config.hidden_size,
+                attn_normed_row,
+            )?;
+            let layer_cache = states[slot_idx]
+                .incremental
+                .layers
+                .get_mut(layer_idx)
+                .expect("incremental cache layer initialized");
+            self.update_compressor_gpu_cache(
+                compressor,
+                attn_normed_row,
+                head_dim,
+                compress_ratio,
+                compress_ratio < 16,
+                start_pos[row],
+                true,
+                dsv4_compressor_required_capacity_rows(start_pos[row], 1, compress_ratio),
+                layer_cache
+                    .attention
+                    .compressed_gpu
+                    .get_or_insert_with(DeepseekGpuCompressorRuntimeCache::default),
+            )?;
+            self.dsv4_flashmla_sw_bootstrap_hook(
+                &mut layer_cache.attention,
+                compress_ratio,
+                head_dim,
+            )?;
+            self.dsv4_flashmla_compressor_pack_hook(
+                &mut layer_cache.attention,
+                compress_ratio,
+                head_dim,
+            )?;
+        }
+
+        let rope_params = &self.config.rope_parameters;
+        let rope_base = self.config.rope_theta;
+        let original_seq_len = 0_i32;
+        let (q_raw_ptr, _qrg) = attn_q_raw.data.device_ptr(&self.ctx.stream);
+        let (k_raw_ptr, _krg) = attn_kv_normed.data.device_ptr(&self.ctx.stream);
+        let (q_prepared_ptr, _qpg) = attn_q_prepared.data.device_ptr_mut(&self.ctx.stream);
+        let (k_prepared_ptr, _kpg) = attn_k_prepared.data.device_ptr_mut(&self.ctx.stream);
+        let (start_pos_ptr, _spg) = start_pos_gpu.device_ptr(&self.ctx.stream);
+        unsafe {
+            ffi::dsv4_prepare_qk_fused_batch_start_pos_cuda(
+                q_raw_ptr as *const ffi::Half,
+                k_raw_ptr as *const ffi::Half,
+                q_prepared_ptr as *mut ffi::Half,
+                k_prepared_ptr as *mut ffi::Half,
+                batch_size as i32,
+                local_heads as i32,
+                head_dim as i32,
+                self.config.qk_rope_head_dim as i32,
+                start_pos_ptr as *const i32,
+                self.config.rms_norm_eps,
+                rope_base,
+                original_seq_len,
+                rope_params.factor,
+                rope_params.beta_fast,
+                rope_params.beta_slow,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA q/k prep failed: {err}"))?;
+        }
+
+        cuda_kernels::attention::dsv4_fp8_kv_fill_sw_slots_from_start_pos_raw(
+            &self.ctx,
+            launch.sw_token_block_id_ptr,
+            launch.sw_token_in_block_row_ptr,
+            start_pos_ptr as u64,
+            launch.slot_layer_block_offsets_ptr,
+            batch_size,
+            self.config.sliding_window,
+            DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE,
+        )?;
+        let rope_ptr_u64 = k_prepared_ptr as u64
+            + (DSV4_HEAD_DIM_NOPE as u64) * (std::mem::size_of::<bf16>() as u64);
+        unsafe {
+            ffi::arle_dsv4_fp8_kv_pack_strided_cuda(
+                k_prepared_ptr as *const ffi::Half,
+                rope_ptr_u64 as *const ffi::Half,
+                launch.pool_base_ptr as *mut u8,
+                launch.sw_token_block_id_ptr as *const i32,
+                launch.sw_token_in_block_row_ptr as *const i32,
+                batch_size as i32,
+                DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32,
+                head_dim as i32,
+                head_dim as i32,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA SW pack failed: {err}"))?;
+        }
+
+        cuda_kernels::attention::dsv4_flashmla_decode_build_indices_batched_raw(
+            &self.ctx,
+            launch.indices_ptr,
+            start_pos_ptr as u64,
+            launch.slot_layer_block_offsets_ptr,
+            0,
+            launch.topk_length_ptr,
+            batch_size,
+            launch.sw_blocks,
+            self.config.sliding_window,
+            launch.max_compressed_keys,
+            compress_ratio,
+            2_i32,
+            DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE,
+            launch.total_blocks,
+        )?;
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
+                batch_size as i32,
+                1_i32,
+                launch.block_size_topk,
+                launch.fixed_overhead_num_blocks,
+                launch.topk_unified as i32,
+                0_i32,
+                launch.topk_length_ptr as *const i32,
+                std::ptr::null(),
+                launch.sched_meta_ptr as *mut i32,
+                launch.num_splits_ptr as *mut i32,
+                launch.num_sm_parts,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| {
+                anyhow::anyhow!("DSv4 batch FlashMLA decode sched_meta failed: {err}")
+            })?;
+        }
+
+        let (sink_f32_base_ptr, _sfg) = attention.attn_sink_f32.device_ptr(&self.ctx.stream);
+        let sink_offset_elems = self.config.tp.rank * local_heads;
+        let sink_f32_local_ptr =
+            unsafe { (sink_f32_base_ptr as *const f32).add(sink_offset_elems) };
+        let (local_out_ptr, _log) = attn_local.data.device_ptr_mut(&self.ctx.stream);
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        let bytes_per_token = DSV4_FLASHMLA_MODEL1_BYTES_PER_TOKEN as i32;
+        let stride_kv_block_bytes = DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32 * bytes_per_token;
+        let stride_q_b = (local_heads * head_dim) as i32;
+        let stride_q_s_q = stride_q_b;
+        let stride_q_h_q = head_dim as i32;
+        let stride_o_b = (local_heads * head_dim) as i32;
+        let stride_o_s_q = stride_o_b;
+        let stride_o_h_q = head_dim as i32;
+        let stride_indices_b = launch.topk_unified as i32;
+        let stride_indices_s_q = launch.topk_unified as i32;
+        let stride_lse_b = local_heads as i32;
+        let stride_lse_s_q = 1_i32;
+        let split_axis_stride = local_heads as i32;
+        let o_split_axis_stride = (local_heads * head_dim) as i32;
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_fwd(
+                q_prepared_ptr as *const ffi::Half,
+                launch.pool_base_ptr as *const ffi::Half,
+                launch.indices_ptr as *const i32,
+                launch.topk_length_ptr as *const i32,
+                sink_f32_local_ptr,
+                local_out_ptr as *mut ffi::Half,
+                launch.lse_out_ptr as *mut f32,
+                launch.lse_accum_ptr as *mut f32,
+                launch.o_accum_ptr as *mut f32,
+                launch.sched_meta_ptr as *const i32,
+                launch.num_splits_ptr as *const i32,
+                batch_size as i32,
+                1_i32,
+                local_heads as i32,
+                1_i32,
+                head_dim as i32,
+                head_dim as i32,
+                launch.total_blocks as i32,
+                DSV4_FLASHMLA_MODEL1_PAGE_BLOCK_SIZE as i32,
+                launch.topk_unified as i32,
+                launch.num_sm_parts,
+                1_i32,
+                scale,
+                stride_q_b,
+                stride_q_s_q,
+                stride_q_h_q,
+                stride_kv_block_bytes,
+                bytes_per_token,
+                stride_indices_b,
+                stride_indices_s_q,
+                stride_lse_b,
+                stride_lse_s_q,
+                stride_o_b,
+                stride_o_s_q,
+                stride_o_h_q,
+                split_axis_stride,
+                split_axis_stride,
+                o_split_axis_stride,
+                o_split_axis_stride,
+                stride_o_h_q,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA decode fwd failed: {err}"))?;
+
+            ffi::arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
+                local_out_ptr as *mut ffi::Half,
+                batch_size as i32,
+                local_heads as i32,
+                head_dim as i32,
+                self.config.qk_rope_head_dim as i32,
+                start_pos_ptr as *const i32,
+                rope_base,
+                original_seq_len,
+                rope_params.factor,
+                rope_params.beta_fast,
+                rope_params.beta_slow,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|err| {
+                anyhow::anyhow!("DSv4 batch FlashMLA decode output inverse-rope failed: {err}")
+            })?;
+        }
+        drop(_log);
+
+        for (row, &slot_idx) in slot_indices.iter().enumerate() {
+            let row_start_pos_ptr_u64 =
+                start_pos_ptr as u64 + (row * std::mem::size_of::<i32>()) as u64;
+            let layer_cache = states[slot_idx]
+                .incremental
+                .layers
+                .get_mut(layer_idx)
+                .expect("incremental cache layer initialized");
+            let window_buf = ensure_swa_window_cache(
+                &self.ctx,
+                &mut layer_cache.attention,
+                self.config.sliding_window * head_dim,
+            )?;
+            let (window_ptr, _wg) = window_buf.device_ptr_mut(&self.ctx.stream);
+            let k_row_ptr =
+                k_prepared_ptr as u64 + (row * head_dim * std::mem::size_of::<bf16>()) as u64;
+            unsafe {
+                ffi::dsv4_update_window_cache_start_pos_ptr_cuda(
+                    k_row_ptr as *const ffi::Half,
+                    window_ptr as *mut ffi::Half,
+                    1_i32,
+                    row_start_pos_ptr_u64 as *const i32,
+                    self.config.sliding_window as i32,
+                    head_dim as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|err| {
+                    anyhow::anyhow!("DSv4 batch FlashMLA SW cache update failed: {err}")
+                })?;
+            }
+
+            extract_hidden_token_with_width_into(
+                &self.ctx,
+                attn_local,
+                row,
+                local_width,
+                attn_local_row,
+            )?;
+            ops::try_gemm_with_phase_into(
+                &self.ctx,
+                &attention.wo_a,
+                attn_local_row,
+                attn_latent_row,
+                ops::LinearDispatchPhase::Decode,
+            )?;
+            ops::try_gemm_with_phase_into(
+                &self.ctx,
+                &attention.wo_b,
+                attn_latent_row,
+                attn_out_row,
+                ops::LinearDispatchPhase::Decode,
+            )?;
+            self.layer_communicator
+                .post_attn_all_reduce_hidden_states(attn_out_row)?;
+            write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
+        }
+        Ok(())
+    }
+
     /// TRUE batched incremental decode for N concurrent single-token sequences.
     ///
     /// Each `(token, state)` pair is one decode step at the state's own
@@ -759,6 +1280,7 @@ impl DeepseekModel {
         let attn_c_q_dim = first_attention.wq_a.rows;
         let attn_local_width = first_attention.wq_b.rows;
         let attn_head_dim = self.config.head_dim;
+        let attn_output_latent_dim = first_attention.wo_a.rows;
         {
             let scratch = decode_ctx.ensure_batched_scratch(
                 &self.ctx,
@@ -767,6 +1289,7 @@ impl DeepseekModel {
                 attn_c_q_dim,
                 attn_local_width,
                 attn_head_dim,
+                attn_output_latent_dim,
                 head_hc.mix_fn.rows,
                 self.config.vocab_size,
                 n,
@@ -806,6 +1329,7 @@ impl DeepseekModel {
                 attn_c_q_dim,
                 attn_local_width,
                 attn_head_dim,
+                attn_output_latent_dim,
                 head_hc.mix_fn.rows,
                 self.config.vocab_size,
                 n,
@@ -840,20 +1364,6 @@ impl DeepseekModel {
         })?;
 
         {
-            let scratch = decode_ctx.ensure_batched_scratch(
-                &self.ctx,
-                hidden_size,
-                stream_hidden_dim,
-                attn_c_q_dim,
-                attn_local_width,
-                attn_head_dim,
-                head_hc.mix_fn.rows,
-                self.config.vocab_size,
-                n,
-            )?;
-            let (start_pos_base_ptr, _start_pos_guard) =
-                scratch.start_pos_gpu.device_ptr(&self.ctx.stream);
-            let start_pos_i32_size = std::mem::size_of::<i32>();
             for layer_idx in 0..num_layers {
                 let layer = &self.layers[layer_idx];
 
@@ -897,6 +1407,34 @@ impl DeepseekModel {
                         attn_head_dim
                     );
                     let local_heads = attn_local_width / attn_head_dim;
+                    let batch_flashmla_hca = self.prepare_hca_flashmla_decode_batch_launch(
+                        layer_idx,
+                        decode_ctx,
+                        states,
+                        slot_indices,
+                        &start_pos,
+                        n,
+                        local_heads,
+                        attn_head_dim,
+                        compress_ratio,
+                        mode,
+                    )?;
+
+                    let scratch = decode_ctx.ensure_batched_scratch(
+                        &self.ctx,
+                        hidden_size,
+                        stream_hidden_dim,
+                        attn_c_q_dim,
+                        attn_local_width,
+                        attn_head_dim,
+                        attn_output_latent_dim,
+                        head_hc.mix_fn.rows,
+                        self.config.vocab_size,
+                        n,
+                    )?;
+                    let (start_pos_base_ptr, _start_pos_guard) =
+                        scratch.start_pos_gpu.device_ptr(&self.ctx.stream);
+                    let start_pos_i32_size = std::mem::size_of::<i32>();
                     let (
                         stream,
                         attn_mhc,
@@ -911,6 +1449,11 @@ impl DeepseekModel {
                         attn_kv_raw,
                         attn_kv_normed,
                         attn_kv_normed_row,
+                        attn_q_prepared,
+                        attn_k_prepared,
+                        attn_local,
+                        attn_local_row,
+                        attn_latent_row,
                         attn_out,
                         attn_out_row,
                         attn_stream,
@@ -928,6 +1471,11 @@ impl DeepseekModel {
                         &mut scratch.attn_kv_raw,
                         &mut scratch.attn_kv_normed,
                         &mut scratch.attn_kv_normed_row,
+                        &mut scratch.attn_q_prepared,
+                        &mut scratch.attn_k_prepared,
+                        &mut scratch.attn_local,
+                        &mut scratch.attn_local_row,
+                        &mut scratch.attn_latent_row,
                         &mut scratch.attn_out,
                         &mut scratch.attn_out_row,
                         &mut scratch.attn_stream,
@@ -1010,61 +1558,92 @@ impl DeepseekModel {
                     dsv4_trace_end(&self.ctx, "attn_proj", layer_idx, n, trace)?;
 
                     let trace = dsv4_trace_begin(&self.ctx)?;
-                    for (row, &slot_idx) in slot_indices.iter().enumerate() {
-                        extract_hidden_token_with_width_into(
-                            &self.ctx,
-                            attn_normed,
-                            row,
-                            hidden_size,
-                            attn_normed_row,
-                        )?;
-                        extract_hidden_token_with_width_into(
-                            &self.ctx,
-                            attn_c_q_normed,
-                            row,
-                            attn_c_q_dim,
-                            attn_c_q_normed_row,
-                        )?;
-                        extract_hidden_token_with_width_into(
-                            &self.ctx,
-                            attn_q_raw,
-                            row,
-                            attn_local_width,
-                            attn_q_raw_row,
-                        )?;
-                        extract_hidden_token_with_width_into(
-                            &self.ctx,
-                            attn_kv_normed,
-                            row,
-                            attn_head_dim,
-                            attn_kv_normed_row,
-                        )?;
-                        let layer_cache = states[slot_idx]
-                            .incremental
-                            .layers
-                            .get_mut(layer_idx)
-                            .expect("incremental cache layer initialized");
-                        let row_start_pos_ptr_u64 =
-                            start_pos_base_ptr as u64 + (row * start_pos_i32_size) as u64;
-                        self.forward_attention_gpu_into(
+                    let batch_flashmla_done = if let Some(launch) = batch_flashmla_hca.as_ref() {
+                        self.forward_hca_flashmla_decode_batch_core_into(
                             layer_idx,
                             attention,
+                            attn_normed,
                             attn_normed_row,
-                            attn_c_q_normed_row,
-                            attn_q_raw_row,
-                            attn_kv_normed_row,
-                            1,
-                            start_pos[row],
-                            Some(row_start_pos_ptr_u64),
+                            attn_q_raw,
+                            attn_kv_normed,
+                            &scratch.start_pos_gpu,
+                            attn_q_prepared,
+                            attn_k_prepared,
+                            attn_local,
+                            attn_local_row,
+                            attn_latent_row,
+                            attn_out,
+                            attn_out_row,
+                            states,
+                            slot_indices,
+                            &start_pos,
                             local_heads,
                             attn_local_width,
                             attn_head_dim,
                             compress_ratio,
-                            mode,
-                            Some(&mut layer_cache.attention),
-                            attn_out_row,
+                            launch,
                         )?;
-                        write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
+                        true
+                    } else {
+                        false
+                    };
+                    if !batch_flashmla_done {
+                        for (row, &slot_idx) in slot_indices.iter().enumerate() {
+                            extract_hidden_token_with_width_into(
+                                &self.ctx,
+                                attn_normed,
+                                row,
+                                hidden_size,
+                                attn_normed_row,
+                            )?;
+                            extract_hidden_token_with_width_into(
+                                &self.ctx,
+                                attn_c_q_normed,
+                                row,
+                                attn_c_q_dim,
+                                attn_c_q_normed_row,
+                            )?;
+                            extract_hidden_token_with_width_into(
+                                &self.ctx,
+                                attn_q_raw,
+                                row,
+                                attn_local_width,
+                                attn_q_raw_row,
+                            )?;
+                            extract_hidden_token_with_width_into(
+                                &self.ctx,
+                                attn_kv_normed,
+                                row,
+                                attn_head_dim,
+                                attn_kv_normed_row,
+                            )?;
+                            let layer_cache = states[slot_idx]
+                                .incremental
+                                .layers
+                                .get_mut(layer_idx)
+                                .expect("incremental cache layer initialized");
+                            let row_start_pos_ptr_u64 =
+                                start_pos_base_ptr as u64 + (row * start_pos_i32_size) as u64;
+                            self.forward_attention_gpu_into(
+                                layer_idx,
+                                attention,
+                                attn_normed_row,
+                                attn_c_q_normed_row,
+                                attn_q_raw_row,
+                                attn_kv_normed_row,
+                                1,
+                                start_pos[row],
+                                Some(row_start_pos_ptr_u64),
+                                local_heads,
+                                attn_local_width,
+                                attn_head_dim,
+                                compress_ratio,
+                                mode,
+                                Some(&mut layer_cache.attention),
+                                attn_out_row,
+                            )?;
+                            write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
+                        }
                     }
                     dsv4_trace_end(&self.ctx, "attn_core", layer_idx, n, trace)?;
 
@@ -1087,6 +1666,18 @@ impl DeepseekModel {
                 // Uses the first row's per-layer FFN/MoE scratch (pure capacity
                 // scratch, no persistent per-sequence state). `tokens` only sizes
                 // route capacity; values are row-independent for MoE routing.
+                let scratch = decode_ctx.ensure_batched_scratch(
+                    &self.ctx,
+                    hidden_size,
+                    stream_hidden_dim,
+                    attn_c_q_dim,
+                    attn_local_width,
+                    attn_head_dim,
+                    attn_output_latent_dim,
+                    head_hc.mix_fn.rows,
+                    self.config.vocab_size,
+                    n,
+                )?;
                 let ffn_slot = slot_indices[0];
                 let layer_cache = states[ffn_slot]
                     .incremental
@@ -1114,6 +1705,18 @@ impl DeepseekModel {
                 )?;
                 dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
             }
+            let scratch = decode_ctx.ensure_batched_scratch(
+                &self.ctx,
+                hidden_size,
+                stream_hidden_dim,
+                attn_c_q_dim,
+                attn_local_width,
+                attn_head_dim,
+                attn_output_latent_dim,
+                head_hc.mix_fn.rows,
+                self.config.vocab_size,
+                n,
+            )?;
             for (row, &slot_idx) in slot_indices.iter().enumerate() {
                 self.save_target_pre_head_stream(&scratch.stream, row, &mut states[slot_idx])?;
             }
@@ -1172,6 +1775,7 @@ impl DeepseekModel {
             attn_c_q_dim,
             attn_local_width,
             attn_head_dim,
+            attn_output_latent_dim,
             head_hc.mix_fn.rows,
             self.config.vocab_size,
             n,

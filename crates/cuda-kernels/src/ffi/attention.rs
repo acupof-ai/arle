@@ -834,6 +834,17 @@ unsafe extern "C" {
         page_block_size: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn arle_dsv4_fp8_kv_fill_sw_slots_from_start_pos_cuda(
+        token_block_id: *mut i32,
+        token_in_block_row: *mut i32,
+        start_pos: *const i32,
+        slot_layer_block_offsets: *const i32,
+        n_tokens: i32,
+        sliding_window: i32,
+        page_block_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 // ============================================================================
