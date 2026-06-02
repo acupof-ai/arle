@@ -34,6 +34,10 @@ serve on the replicated-token debug lane and still look like a performance run.
   request ownership contract. The current multiproc/in-process group logs and
   exposes `replicated-token`; token-owned DP/EP sharding remains a distinct
   missing feature instead of being hidden under a generic distributed name.
+- PC2 ownership follow-up removes the hidden replicated-token constructor
+  default. Every `DistributedSchedulerGroup` caller now passes an explicit
+  ownership mode; the new `token-owned-dp-ep` mode fails closed until real
+  request sharding is implemented.
 - DeepGEMM is now the DSv4 runtime default expert backend, not
   `deepgemm-auto`. Missing or incompatible DeepGEMM now fails before serving
   unless the operator explicitly asks for `ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto`

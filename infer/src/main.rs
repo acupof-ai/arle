@@ -14,7 +14,10 @@ use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_co
 use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
-use infer::request_handle::{DistributedSchedulerGroup, NumaSchedulerRouter, NumaSchedulerWorker};
+use infer::request_handle::{
+    DistributedRequestOwnership, DistributedSchedulerGroup, NumaSchedulerRouter,
+    NumaSchedulerWorker,
+};
 use infer::runtime_notify::RuntimeNotifyGate;
 use infer::runtime_topology::{
     AffinityApplyResult, RuntimeTopology, WorkerPlacement, bind_process_to_placement,
@@ -1928,6 +1931,7 @@ async fn async_main(args: Args) {
                 metrics.clone(),
                 relay,
                 effective_world_size,
+                DistributedRequestOwnership::ReplicatedToken,
             ))
         } else if matches!(model_type, ModelType::DeepSeekV4) && scheduler_workers.len() > 1 {
             info!(
@@ -1937,6 +1941,7 @@ async fn async_main(args: Args) {
             Arc::new(DistributedSchedulerGroup::new(
                 router_workers,
                 metrics.clone(),
+                DistributedRequestOwnership::ReplicatedToken,
             ))
         } else {
             Arc::new(NumaSchedulerRouter::new(
