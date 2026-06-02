@@ -4,10 +4,15 @@
 
 #include <cuda_runtime.h>
 
+#include <sys/file.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
@@ -275,6 +280,40 @@ std::tuple<int, std::string> run_capture(const std::string& command) {
 }
 
 std::filesystem::path cache_root();
+
+class ScopedFileLock {
+ public:
+  explicit ScopedFileLock(const std::filesystem::path& path) {
+    std::filesystem::create_directories(path.parent_path());
+    fd_ = ::open(path.c_str(), O_CREAT | O_RDWR, 0666);
+    if (fd_ < 0) {
+      throw std::runtime_error(
+          "failed to open DeepGEMM JIT lock " + path.string() + ": " +
+          std::strerror(errno));
+    }
+    while (::flock(fd_, LOCK_EX) != 0) {
+      if (errno == EINTR) continue;
+      const std::string err = std::strerror(errno);
+      ::close(fd_);
+      fd_ = -1;
+      throw std::runtime_error(
+          "failed to lock DeepGEMM JIT lock " + path.string() + ": " + err);
+    }
+  }
+
+  ScopedFileLock(const ScopedFileLock&) = delete;
+  ScopedFileLock& operator=(const ScopedFileLock&) = delete;
+
+  ~ScopedFileLock() {
+    if (fd_ >= 0) {
+      ::flock(fd_, LOCK_UN);
+      ::close(fd_);
+    }
+  }
+
+ private:
+  int fd_ = -1;
+};
 
 bool path_is_directory(const std::filesystem::path& path) {
   std::error_code ec;
@@ -817,6 +856,23 @@ std::filesystem::path cache_root() {
   return std::filesystem::path(home) / ".deep_gemm";
 }
 
+std::filesystem::path lock_path_for_kernel(
+    const std::string& name,
+    const std::string& digest) {
+  return cache_root() / "locks" / ("kernel." + name + "." + digest + ".lock");
+}
+
+std::filesystem::path unique_tmp_path_for_kernel(const std::string& digest) {
+  static std::atomic<uint64_t> counter{0};
+  const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+  return cache_root() / "tmp" /
+         ("arle-" + digest + "-" + std::to_string(static_cast<long long>(::getpid())) +
+          "-" + std::to_string(static_cast<long long>(now_ns)) + "-" +
+          std::to_string(counter.fetch_add(1, std::memory_order_relaxed)));
+}
+
 std::string arch_flag(int major, int minor, int cuda_major, int cuda_minor) {
   if (major == 10 && minor != 1) {
     return (cuda_major > 12 || (cuda_major == 12 && cuda_minor >= 9)) ? "100a"
@@ -922,29 +978,43 @@ std::shared_ptr<NativeRuntime> get_or_build_runtime(
         "DeepGEMM JIT disabled after prior compile/load failure for this kernel:\n" +
         it->second);
   }
-  if (!std::filesystem::exists(cubin_path)) {
-    const auto tmp = cache_root() / "tmp" / ("arle-" + digest);
-    std::filesystem::create_directories(tmp);
-    const auto tmp_cubin = tmp / "kernel.cubin";
-    const auto tmp_code = tmp / "kernel.cu";
-    write_binary_file(tmp_code, code);
-    try {
-      compile_with_nvcc(tmp_code, tmp_cubin, major, minor);
-    } catch (const std::exception& err) {
+  if (!std::filesystem::exists(cubin_path) || !std::filesystem::exists(code_path)) {
+    ScopedFileLock jit_lock(lock_path_for_kernel(name, digest));
+    if (!std::filesystem::exists(cubin_path)) {
+      if (std::filesystem::exists(dir)) {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+      }
+      const auto tmp = unique_tmp_path_for_kernel(digest);
+      std::filesystem::create_directories(tmp);
+      const auto tmp_cubin = tmp / "kernel.cubin";
+      const auto tmp_code = tmp / "kernel.cu";
+      write_binary_file(tmp_code, code);
+      try {
+        compile_with_nvcc(tmp_code, tmp_cubin, major, minor);
+      } catch (const std::exception& err) {
+        std::error_code ec;
+        std::filesystem::remove_all(tmp, ec);
+        g_runtime_failures.emplace(digest, err.what());
+        throw;
+      }
+      std::filesystem::create_directories(dir.parent_path());
       std::error_code ec;
-      std::filesystem::remove_all(tmp, ec);
-      g_runtime_failures.emplace(digest, err.what());
-      throw;
+      std::filesystem::rename(tmp, dir, ec);
+      if (ec) {
+        std::filesystem::remove_all(tmp, ec);
+        if (!std::filesystem::exists(cubin_path)) {
+          g_runtime_failures.emplace(
+              digest,
+              "DeepGEMM JIT cache publish failed for " + dir.string() + ": " +
+                  ec.message());
+          throw std::runtime_error(g_runtime_failures.at(digest));
+        }
+      }
     }
-    std::filesystem::create_directories(dir.parent_path());
-    std::error_code ec;
-    std::filesystem::rename(tmp, dir, ec);
-    if (ec) {
-      std::filesystem::remove_all(tmp, ec);
+    if (!std::filesystem::exists(code_path)) {
+      write_binary_file(code_path, code);
     }
-  }
-  if (!std::filesystem::exists(code_path)) {
-    write_binary_file(code_path, code);
   }
 
   const std::string runtime_key = digest + "$$" + current_context_key();
