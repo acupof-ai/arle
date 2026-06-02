@@ -285,13 +285,13 @@ impl ModelForward for DeepseekModel {
 
     fn forward_internal_mtp_draft_batch(
         &self,
-        _requests: &[InternalMtpDraftRequest],
-        _states: &mut [Self::State],
+        requests: &[InternalMtpDraftRequest],
+        states: &mut [Self::State],
         _pool: &mut PagedKVPool,
         _decode_ctx: &mut Self::DecodeContext,
     ) -> Result<Vec<InternalMtpDraftOutput>> {
         self.validate_internal_mtp_draft_support()?;
-        Ok(Vec::new())
+        self.forward_internal_mtp_draft_batch_greedy(requests, states)
     }
 
     fn forward_spec_verify_batch(
@@ -512,10 +512,7 @@ impl ModelForward for DeepseekModel {
                 self.config.spec.num_nextn_predict_layers,
             );
         }
-        anyhow::bail!(
-            "DSv4 internal MTP/EAGLE requested and {} mtp.N layer(s) are loaded, but CUDA frozen-KV MTP draft forward/graph capture is not implemented yet",
-            self.loaded_mtp_layer_count(),
-        );
+        Ok(())
     }
 
     fn cuda_graph_decode_support(&self) -> CudaGraphDecodeSupport {
@@ -656,7 +653,7 @@ impl ModelForward for DeepseekModel {
         }
         if self.loaded_mtp_layer_count() > 0 {
             missing.push(format!(
-                "DSv4 loaded {} mtp.N layer(s), but CUDA frozen-KV EAGLE draft forward/graph capture is not implemented yet",
+                "DSv4 loaded {} mtp.N layer(s), but frozen-KV EAGLE draft is eager-only; CUDA graph capture/replay is not implemented yet",
                 self.loaded_mtp_layer_count()
             ));
         }
