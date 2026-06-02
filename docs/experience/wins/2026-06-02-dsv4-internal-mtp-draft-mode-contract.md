@@ -73,6 +73,39 @@ behind the DSv4 best-practice contract failure. The constructor now logs
 operators can see `draft_model=InternalMtp` even when the high-performance path
 fails closed during startup.
 
+Follow-up verification at commit `f266b9fd` on remote pod
+`/data01/build/arle`:
+
+- `scripts/dsv4_fast_build.sh` used the DSv4 prebuilt CUDA archive and
+  completed in 18.20 s without nvcc / TileLang AOT.
+  Artifact: `/tmp/dsv4_fast_build_f266b9fd_20260602_161632.log`.
+- High-performance TP8 + EAGLE startup with
+  `ARLE_DSV4_PERFORMANCE_PROFILE=sglang`, FP8 KV,
+  `--cuda-graph-max-bs 16`, and `--spec-draft-model eagle` still fails closed
+  before serving opens. Artifact:
+  `/tmp/dsv4_eagle_contract_373d0b1e_20260602_161225.log`.
+- The explicit missing best-practice pieces are still:
+  full-decode CUDA graph capture/replay, token-owned DP/EP request routing,
+  owner-group NCCL/token-sync subgroups, DeepEP/NCCL graph replay,
+  graph-captured FlashMLA/SWA/C4/C128 metadata replay, and batched attention
+  planning without host start-pos loops.
+- Debug-fallback TP8 EAGLE with allreduce MoE and DeepGEMM experts now serves
+  and returns real tokens on a 32-token cap request:
+  `137 + 269 = 406.</think><|end_of_text|>`. Usage:
+  `prompt_tokens=17`, `completion_tokens=16`, `total_tokens=33`; request_trace
+  reported `error=null`, `ttft_ms=99.04`, and total latency 3.53 s.
+  Artifact:
+  `/tmp/dsv4_eagle_debug_f266b9fd_20260602_161711.log`.
+- The correctness fix was to route MTP FFN through learned-bias MoE routing.
+  The checkpoint has `mtp.0.ffn.gate.bias` and no `mtp.0.ffn.gate.tid2eid`;
+  using target layer 0's hash routing made the draft path fail with
+  `hash-routed DeepSeek V4 MoE layer missing tid2eid`.
+
+This remains a correctness milestone, not a performance win. The measured
+debug-fallback decode steps were hundreds of milliseconds and are not
+comparable to the DSv4-Flash TP8 + EAGLE + 256K/1500 hot-cache target
+(`~0.44 s TTFT`, `~4.85 ms TPOT`, `~7.7 s E2E`, `~196 tok/s`).
+
 ## Rule
 
 Do not overload `self-spec` for DSv4 EAGLE. Internal checkpoint MTP draft,
