@@ -1,8 +1,8 @@
 //! DeepSeek V4 batched-decode scratch buffers.
 //!
-//! Tracks scheduler batch capacity for DSv4 decode. The model currently uses a
-//! sequential per-slot decode fallback for B>1; vectorized V4 decode kernels
-//! will add real scratch buffers here.
+//! Tracks scheduler batch capacity for DSv4 decode. The model batches the
+//! stable projection/head pieces today; the cache/metadata attention core still
+//! needs a batch FlashMLA path before full decode CUDA graph replay is viable.
 
 use anyhow::{Result, ensure};
 
@@ -24,6 +24,9 @@ use log::info;
 /// `DSV4_FLASHMLA_MODEL1_*` constants in `weights.rs` (compile-time `const`s, no
 /// drift across a single build).
 const DSV4_FLASHMLA_MODEL1_BLOCK_BYTES: usize = 64 * 584;
+/// `DecodingSchedMetaSize == 32 B == 8 × int32` in FlashMLA's params.h.
+#[allow(dead_code)]
+const DSV4_FLASHMLA_DECODING_SCHED_META_INTS: usize = 8;
 
 /// Pre-allocated decode context.
 ///
@@ -63,6 +66,8 @@ pub struct DeepseekBatchDecodeBuffers {
     /// Served `max_seq_len` the pool was sized for; the per-step binding reads
     /// it back so the layout matches the allocation.
     fp8_kv_max_seq_len: usize,
+    #[allow(dead_code)]
+    flashmla_decode_arena: Option<DeepseekFlashMlaDecodeBatchArena>,
     batched_scratch: Option<DeepseekBatchedDecodeScratch>,
     /// Piecewise graph cache for stable token-id input staging
     /// (embedding + initial HC stream), indexed by `batch_size - 1`.
@@ -124,6 +129,187 @@ pub(super) struct DeepseekBatchedDecodeScratch {
     pub(super) head_normed: DeviceVec,
     pub(super) logits: DeviceVec,
     pub(super) logits_batch: HiddenStates,
+}
+
+/// Batch-shaped FlashMLA sparse-decode scratch.
+///
+/// This is deliberately owned by the scheduler decode context, not by a
+/// per-slot attention cache: FlashMLA's decode ABI is batch-first (`b=N`), uses
+/// one shared FP8 KV base, and sizes split/combine scratch as
+/// `[b + num_sm_parts, ...]`.
+#[allow(dead_code)]
+pub(super) struct DeepseekFlashMlaDecodeBatchArena {
+    capacity_tokens: usize,
+    num_sm_parts_max: usize,
+    topk_unified_max: usize,
+    h_q: usize,
+    d_v: usize,
+    slot_layer_block_offsets_scratch: Vec<i32>,
+    pub(super) slot_layer_block_offsets_gpu: CudaSlice<i32>,
+    pub(super) indices: CudaSlice<i32>,
+    pub(super) topk_length: CudaSlice<i32>,
+    pub(super) num_splits: CudaSlice<i32>,
+    pub(super) sched_meta: CudaSlice<i32>,
+    pub(super) lse_accum: CudaSlice<f32>,
+    pub(super) o_accum: CudaSlice<f32>,
+    pub(super) lse_out: CudaSlice<f32>,
+}
+
+#[allow(dead_code)]
+impl DeepseekFlashMlaDecodeBatchArena {
+    fn new(
+        ctx: &DeviceContext,
+        capacity_tokens: usize,
+        num_sm_parts_max: usize,
+        topk_unified_max: usize,
+        h_q: usize,
+        d_v: usize,
+    ) -> Result<Self> {
+        ensure!(
+            capacity_tokens > 0
+                && num_sm_parts_max > 0
+                && topk_unified_max > 0
+                && h_q > 0
+                && d_v > 0,
+            "DSv4 batch FlashMLA arena requires positive sizing (capacity={}, num_sm_parts={}, topk={}, h_q={}, d_v={})",
+            capacity_tokens,
+            num_sm_parts_max,
+            topk_unified_max,
+            h_q,
+            d_v
+        );
+        let split_axis = capacity_tokens + num_sm_parts_max;
+        Ok(Self {
+            capacity_tokens,
+            num_sm_parts_max,
+            topk_unified_max,
+            h_q,
+            d_v,
+            slot_layer_block_offsets_scratch: Vec::with_capacity(capacity_tokens),
+            slot_layer_block_offsets_gpu: ctx
+                .stream
+                .alloc_zeros_traced::<i32>(capacity_tokens)
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA slot offsets alloc: {err}"))?,
+            indices: ctx
+                .stream
+                .alloc_zeros_traced::<i32>(capacity_tokens * topk_unified_max)
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA indices alloc: {err}"))?,
+            topk_length: ctx
+                .stream
+                .alloc_zeros_traced::<i32>(capacity_tokens)
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA topk_length alloc: {err}"))?,
+            num_splits: ctx
+                .stream
+                .alloc_zeros_traced::<i32>(capacity_tokens + 1)
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA num_splits alloc: {err}"))?,
+            sched_meta: ctx
+                .stream
+                .alloc_zeros_traced::<i32>(
+                    num_sm_parts_max * DSV4_FLASHMLA_DECODING_SCHED_META_INTS,
+                )
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA sched_meta alloc: {err}"))?,
+            lse_accum: ctx
+                .stream
+                .alloc_zeros_traced::<f32>(split_axis * h_q)
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA lse_accum alloc: {err}"))?,
+            o_accum: ctx
+                .stream
+                .alloc_zeros_traced::<f32>(split_axis * h_q * d_v)
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA o_accum alloc: {err}"))?,
+            lse_out: ctx
+                .stream
+                .alloc_zeros_traced::<f32>(capacity_tokens * h_q)
+                .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA lse_out alloc: {err}"))?,
+        })
+    }
+
+    fn has_capacity(
+        &self,
+        capacity_tokens: usize,
+        num_sm_parts_max: usize,
+        topk_unified_max: usize,
+        h_q: usize,
+        d_v: usize,
+    ) -> bool {
+        self.capacity_tokens >= capacity_tokens
+            && self.num_sm_parts_max >= num_sm_parts_max
+            && self.topk_unified_max >= topk_unified_max
+            && self.h_q == h_q
+            && self.d_v == d_v
+    }
+
+    pub(super) fn set_batch_size(&mut self, batch_size: usize) -> Result<()> {
+        ensure!(
+            batch_size <= self.capacity_tokens,
+            "DSv4 batch FlashMLA arena batch {batch_size} exceeds capacity {}",
+            self.capacity_tokens
+        );
+        Ok(())
+    }
+
+    fn validate_shape(
+        &mut self,
+        batch_size: usize,
+        num_sm_parts_max: usize,
+        topk_unified_max: usize,
+        h_q: usize,
+        d_v: usize,
+    ) -> Result<()> {
+        self.set_batch_size(batch_size)?;
+        let split_axis = batch_size + num_sm_parts_max;
+        ensure!(
+            self.slot_layer_block_offsets_gpu.len() >= batch_size
+                && self.indices.len() >= batch_size * topk_unified_max
+                && self.topk_length.len() >= batch_size
+                && self.num_splits.len() > batch_size
+                && self.sched_meta.len()
+                    >= num_sm_parts_max * DSV4_FLASHMLA_DECODING_SCHED_META_INTS
+                && self.lse_accum.len() >= split_axis * h_q
+                && self.o_accum.len() >= split_axis * h_q * d_v
+                && self.lse_out.len() >= batch_size * h_q,
+            "DSv4 batch FlashMLA arena allocation is smaller than requested shape"
+        );
+        Ok(())
+    }
+
+    fn upload_slot_layer_block_offsets(
+        &mut self,
+        ctx: &DeviceContext,
+        slot_indices: &[usize],
+        layer_idx: usize,
+        fp8_kv_slots: usize,
+        fp8_kv_layers: usize,
+        fp8_kv_slot_blocks: usize,
+    ) -> Result<u64> {
+        self.set_batch_size(slot_indices.len())?;
+        self.slot_layer_block_offsets_scratch.clear();
+        for &slot_idx in slot_indices {
+            let block_offset = fp8_kv_slot_layer_block_offset_for_layout(
+                slot_idx,
+                layer_idx,
+                fp8_kv_slots,
+                fp8_kv_layers,
+                fp8_kv_slot_blocks,
+            )?;
+            ensure!(
+                block_offset <= i32::MAX as usize,
+                "DSv4 batch FlashMLA slot/layer block offset {block_offset} exceeds i32"
+            );
+            self.slot_layer_block_offsets_scratch
+                .push(block_offset as i32);
+        }
+        let mut dst = self
+            .slot_layer_block_offsets_gpu
+            .slice_mut(0..slot_indices.len());
+        ctx.stream
+            .memcpy_htod(&self.slot_layer_block_offsets_scratch, &mut dst)
+            .map_err(|err| anyhow::anyhow!("H2D DSv4 batch FlashMLA slot offsets: {err}"))?;
+        let (ptr, guard) = self
+            .slot_layer_block_offsets_gpu
+            .device_ptr_mut(&ctx.stream);
+        drop(guard);
+        Ok(ptr)
+    }
 }
 
 impl DeepseekBatchedDecodeScratch {
@@ -291,6 +477,7 @@ impl DeepseekBatchDecodeBuffers {
             fp8_kv_layers: 0,
             fp8_kv_slot_blocks: 0,
             fp8_kv_max_seq_len: 0,
+            flashmla_decode_arena: None,
             batched_scratch: None,
             input_graph_cache: (0..max_batch_size).map(|_| None).collect(),
             head_graph_cache: (0..max_batch_size).map(|_| None).collect(),
@@ -348,6 +535,84 @@ impl DeepseekBatchDecodeBuffers {
             .expect("DSv4 batched scratch allocated");
         scratch.set_batch_size(batch_size)?;
         Ok(scratch)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub(super) fn ensure_flashmla_decode_batch_arena(
+        &mut self,
+        ctx: &DeviceContext,
+        batch_size: usize,
+        num_sm_parts_max: usize,
+        topk_unified_max: usize,
+        h_q: usize,
+        d_v: usize,
+    ) -> Result<&mut DeepseekFlashMlaDecodeBatchArena> {
+        ensure!(
+            batch_size <= self.max_batch_size,
+            "DSv4 batch FlashMLA arena batch {batch_size} exceeds context capacity {}",
+            self.max_batch_size
+        );
+        let capacity_tokens = self.max_batch_size;
+        let need_alloc = self.flashmla_decode_arena.as_ref().is_none_or(|arena| {
+            !arena.has_capacity(
+                capacity_tokens,
+                num_sm_parts_max,
+                topk_unified_max,
+                h_q,
+                d_v,
+            )
+        });
+        if need_alloc {
+            self.flashmla_decode_arena = Some(DeepseekFlashMlaDecodeBatchArena::new(
+                ctx,
+                capacity_tokens,
+                num_sm_parts_max,
+                topk_unified_max,
+                h_q,
+                d_v,
+            )?);
+        }
+        let arena = self
+            .flashmla_decode_arena
+            .as_mut()
+            .expect("DSv4 batch FlashMLA arena allocated");
+        arena.validate_shape(batch_size, num_sm_parts_max, topk_unified_max, h_q, d_v)?;
+        Ok(arena)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn stage_flashmla_slot_layer_block_offsets(
+        &mut self,
+        ctx: &DeviceContext,
+        slot_indices: &[usize],
+        layer_idx: usize,
+    ) -> Result<u64> {
+        ensure!(
+            slot_indices.len() <= self.max_batch_size,
+            "DSv4 batch FlashMLA offset batch {} exceeds context capacity {}",
+            slot_indices.len(),
+            self.max_batch_size
+        );
+        ensure!(
+            self.fp8_kv_pool.is_some(),
+            "DSv4 batch FlashMLA slot offsets require shared FP8 KV pool"
+        );
+        let fp8_kv_slots = self.fp8_kv_slots;
+        let fp8_kv_layers = self.fp8_kv_layers;
+        let fp8_kv_slot_blocks = self.fp8_kv_slot_blocks;
+        let arena = self
+            .flashmla_decode_arena
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 batch FlashMLA arena not allocated"))?;
+        arena.upload_slot_layer_block_offsets(
+            ctx,
+            slot_indices,
+            layer_idx,
+            fp8_kv_slots,
+            fp8_kv_layers,
+            fp8_kv_slot_blocks,
+        )
     }
 
     pub(super) fn take_force_eager_once(&mut self) -> bool {
@@ -556,6 +821,43 @@ impl DeepseekBatchDecodeBuffers {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub(super) fn fp8_kv_pool_base_ptr(&mut self, ctx: &DeviceContext) -> Result<u64> {
+        let pool = self
+            .fp8_kv_pool
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 shared FP8 KV pool not allocated"))?;
+        let (base_ptr, guard) = pool.device_ptr_mut(&ctx.stream);
+        drop(guard);
+        Ok(base_ptr)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn fp8_kv_total_blocks(&self) -> Result<usize> {
+        ensure!(
+            self.fp8_kv_pool.is_some(),
+            "DSv4 shared FP8 KV pool not allocated"
+        );
+        self.fp8_kv_slots
+            .checked_mul(self.fp8_kv_layers)
+            .and_then(|v| v.checked_mul(self.fp8_kv_slot_blocks))
+            .ok_or_else(|| anyhow::anyhow!("DSv4 shared FP8 KV pool total block overflow"))
+    }
+
+    pub(super) fn fp8_kv_slot_layer_block_offset(
+        &self,
+        slot_idx: usize,
+        layer_idx: usize,
+    ) -> Result<usize> {
+        fp8_kv_slot_layer_block_offset_for_layout(
+            slot_idx,
+            layer_idx,
+            self.fp8_kv_slots,
+            self.fp8_kv_layers,
+            self.fp8_kv_slot_blocks,
+        )
+    }
+
     /// Device base pointer + byte length of the (slot, layer) sub-range inside
     /// the shared pool. The returned pointer is the start of the slot's
     /// `slot_blocks`-block window; the pack/decode kernels index block ids
@@ -587,8 +889,8 @@ impl DeepseekBatchDecodeBuffers {
             "DSv4 FP8 KV pool slot_blocks {slot_blocks} exceeds pool capacity {}",
             self.fp8_kv_slot_blocks
         );
-        let slot_layer_bytes = self.fp8_kv_slot_blocks * DSV4_FLASHMLA_MODEL1_BLOCK_BYTES;
-        let byte_offset = (slot_idx * self.fp8_kv_layers + layer_idx) * slot_layer_bytes;
+        let block_offset = self.fp8_kv_slot_layer_block_offset(slot_idx, layer_idx)?;
+        let byte_offset = block_offset * DSV4_FLASHMLA_MODEL1_BLOCK_BYTES;
         let view_bytes = slot_blocks * DSV4_FLASHMLA_MODEL1_BLOCK_BYTES;
         let pool = self
             .fp8_kv_pool
@@ -663,6 +965,66 @@ impl DecodeContextOps for DeepseekBatchDecodeBuffers {
 
     fn force_eager_once(&mut self) {
         self.force_eager_once = true;
+    }
+}
+
+fn fp8_kv_slot_layer_block_offset_for_layout(
+    slot_idx: usize,
+    layer_idx: usize,
+    fp8_kv_slots: usize,
+    fp8_kv_layers: usize,
+    fp8_kv_slot_blocks: usize,
+) -> Result<usize> {
+    ensure!(
+        slot_idx < fp8_kv_slots,
+        "DSv4 FP8 KV pool slot {slot_idx} out of range for {fp8_kv_slots} slots"
+    );
+    ensure!(
+        layer_idx < fp8_kv_layers,
+        "DSv4 FP8 KV pool layer {layer_idx} out of range for {fp8_kv_layers} layers"
+    );
+    ensure!(
+        fp8_kv_slot_blocks > 0,
+        "DSv4 FP8 KV pool slot block count must be positive"
+    );
+    let slot_layer_idx = slot_idx
+        .checked_mul(fp8_kv_layers)
+        .and_then(|v| v.checked_add(layer_idx))
+        .ok_or_else(|| anyhow::anyhow!("DSv4 FP8 KV pool slot/layer index overflow"))?;
+    slot_layer_idx
+        .checked_mul(fp8_kv_slot_blocks)
+        .ok_or_else(|| anyhow::anyhow!("DSv4 FP8 KV pool block offset overflow"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fp8_kv_slot_layer_block_offset_for_layout;
+
+    #[test]
+    fn fp8_kv_slot_layer_block_offset_is_slot_major() {
+        assert_eq!(
+            fp8_kv_slot_layer_block_offset_for_layout(0, 0, 4, 3, 11).unwrap(),
+            0
+        );
+        assert_eq!(
+            fp8_kv_slot_layer_block_offset_for_layout(0, 2, 4, 3, 11).unwrap(),
+            22
+        );
+        assert_eq!(
+            fp8_kv_slot_layer_block_offset_for_layout(1, 0, 4, 3, 11).unwrap(),
+            33
+        );
+        assert_eq!(
+            fp8_kv_slot_layer_block_offset_for_layout(3, 2, 4, 3, 11).unwrap(),
+            121
+        );
+    }
+
+    #[test]
+    fn fp8_kv_slot_layer_block_offset_rejects_out_of_range() {
+        assert!(fp8_kv_slot_layer_block_offset_for_layout(4, 0, 4, 3, 11).is_err());
+        assert!(fp8_kv_slot_layer_block_offset_for_layout(0, 3, 4, 3, 11).is_err());
+        assert!(fp8_kv_slot_layer_block_offset_for_layout(0, 0, 4, 3, 0).is_err());
     }
 }
 
