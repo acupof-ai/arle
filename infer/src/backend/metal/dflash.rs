@@ -1829,7 +1829,7 @@ fn sample_rows_array_suppress(
     ))
 }
 
-fn materialize_token_array(tokens: &MlxArray) -> Vec<u32> {
+pub(super) fn materialize_token_array(tokens: &MlxArray) -> Vec<u32> {
     let tokens_i32 = if tokens.dtype() == Dtype::Int32 {
         tokens.clone()
     } else {
@@ -1862,15 +1862,15 @@ fn packed_verify_needs_attn_mask(left_padding: &[i32]) -> bool {
 }
 
 #[derive(Clone)]
-struct Qwen35GdrTape {
+pub(super) struct Qwen35GdrTape {
     innovation_tape: MlxArray,
     k: MlxArray,
     g: MlxArray,
     qkv: MlxArray,
 }
 
-struct Qwen35VerifyStateGuard {
-    raw: *mut std::ffi::c_void,
+pub(super) struct Qwen35VerifyStateGuard {
+    pub(super) raw: *mut std::ffi::c_void,
 }
 
 impl Drop for Qwen35VerifyStateGuard {
@@ -1878,11 +1878,12 @@ impl Drop for Qwen35VerifyStateGuard {
         unsafe {
             mlx_sys::qwen35_set_tape_mode(self.raw, false);
             mlx_sys::qwen35_set_capture_layers(self.raw, std::ptr::null(), 0);
+            mlx_sys::qwen35_set_capture_final_hidden(self.raw, false);
         }
     }
 }
 
-fn drain_current_qwen35_gdr_tapes(
+pub(super) fn drain_current_qwen35_gdr_tapes(
     cpp_model: &super::qwen35::CppQwen35Model,
     expected_tapes: usize,
 ) -> Result<Vec<Qwen35GdrTape>> {
@@ -2052,7 +2053,7 @@ fn qwen35_rollback_to_accepted(
 /// Layer 2c.4 will call this from the packed verify path. Until then the
 /// only caller is the bit-ident test below; a `dead_code` warning in release
 /// is expected and will retire together with the other 2c staging functions.
-fn qwen35_rollback_to_accepted_varlen(
+pub(super) fn qwen35_rollback_to_accepted_varlen(
     gdr_flat: &mut [MlxArray],
     gdr_snapshot: &[MlxArray],
     tapes: &[Qwen35GdrTape],
