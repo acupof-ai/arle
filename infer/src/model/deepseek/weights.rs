@@ -1064,25 +1064,38 @@ impl DeepseekModel {
         );
         dsv4_trace_end(&self.ctx, "attn_pre_norm", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let attn_out = self.forward_sliding_window_attention_incremental(
+        let mut attn_out_scratch = take_hidden_scratch(
+            &mut cache.attention.output_out,
+            &self.ctx,
+            layer.attention.wo_b.rows,
+            stream.seq_len,
+        )?;
+        let attn_result = self.forward_sliding_window_attention_incremental_into(
             layer_idx,
             &layer.attention,
             normed,
             start_pos,
             &mut cache.attention,
-        )?;
+            &mut attn_out_scratch.hidden,
+        );
+        if let Err(err) = attn_result {
+            put_hidden_scratch(&mut cache.attention.output_out, attn_out_scratch);
+            return Err(err);
+        }
         dsv4_trace_end(&self.ctx, "attn_total", layer_idx, stream.seq_len, trace)?;
         let trace = dsv4_trace_begin(&self.ctx)?;
-        hc_post_to_stream_into(
+        let post_result = hc_post_to_stream_into(
             &self.ctx,
-            &attn_out,
+            &attn_out_scratch.hidden,
             stream,
             mhc.post(),
             mhc.comb(),
             self.config.hidden_size,
             self.config.hc_mult,
             out,
-        )?;
+        );
+        put_hidden_scratch(&mut cache.attention.output_out, attn_out_scratch);
+        post_result?;
         dsv4_trace_end(&self.ctx, "attn_post", layer_idx, out.seq_len, trace)?;
         Ok(())
     }
@@ -1250,14 +1263,15 @@ impl DeepseekModel {
         )
     }
 
-    fn forward_sliding_window_attention_incremental(
+    fn forward_sliding_window_attention_incremental_into(
         &self,
         layer_idx: usize,
         attention: &DeepseekV4Attention,
         hidden: &HiddenStates,
         start_pos: usize,
         cache: &mut DeepseekAttentionRuntimeCache,
-    ) -> Result<HiddenStates> {
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         let compress_ratio = *self.config.compress_ratios.get(layer_idx).ok_or_else(|| {
             anyhow::anyhow!("DeepSeek V4 layer {layer_idx} missing compress_ratio")
         })?;
@@ -1346,7 +1360,7 @@ impl DeepseekModel {
         dsv4_trace_end(&self.ctx, "attn_proj", layer_idx, hidden.seq_len, trace)?;
 
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let result = self.forward_attention_gpu(
+        let result = self.forward_attention_gpu_into(
             layer_idx,
             attention,
             hidden,
@@ -1361,15 +1375,16 @@ impl DeepseekModel {
             compress_ratio,
             mode,
             Some(&mut *cache),
+            out,
         );
         put_hidden_scratch(&mut cache.c_q, c_q_scratch);
         put_hidden_scratch(&mut cache.c_q_normed, c_q_normed_scratch);
         put_hidden_scratch(&mut cache.q_raw, q_raw_scratch);
         put_hidden_scratch(&mut cache.kv_raw, kv_raw_scratch);
         put_hidden_scratch(&mut cache.kv_normed, kv_normed_scratch);
-        result.and_then(|out| {
+        result.and_then(|()| {
             dsv4_trace_end(&self.ctx, "attn_core", layer_idx, hidden.seq_len, trace)?;
-            Ok(out)
+            Ok(())
         })
     }
 
@@ -1384,8 +1399,40 @@ impl DeepseekModel {
         local_heads: usize,
         local_width: usize,
         head_dim: usize,
-        mut cache: Option<&mut DeepseekAttentionRuntimeCache>,
+        cache: Option<&mut DeepseekAttentionRuntimeCache>,
     ) -> Result<HiddenStates> {
+        let mut out = unsafe { HiddenStates::uninit(&self.ctx, attention.wo_b.rows, token_count)? };
+        self.forward_swa_attention_gpu_into(
+            layer_idx,
+            attention,
+            q_raw,
+            kv_normed,
+            token_count,
+            start_pos,
+            local_heads,
+            local_width,
+            head_dim,
+            cache,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_swa_attention_gpu_into(
+        &self,
+        layer_idx: usize,
+        attention: &DeepseekV4Attention,
+        q_raw: &HiddenStates,
+        kv_normed: &HiddenStates,
+        token_count: usize,
+        start_pos: usize,
+        local_heads: usize,
+        local_width: usize,
+        head_dim: usize,
+        mut cache: Option<&mut DeepseekAttentionRuntimeCache>,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         ensure!(
             q_raw.hidden_dim == local_width && q_raw.seq_len == token_count,
             "DeepSeek V4 GPU SWA q shape mismatch: got {}x{} expected {}x{}",
@@ -1419,13 +1466,63 @@ impl DeepseekModel {
             local_heads,
             self.config.tp.rank
         );
+        ensure!(
+            out.hidden_dim == attention.wo_b.rows && out.seq_len == token_count,
+            "DeepSeek V4 GPU SWA output shape mismatch: got {}x{} expected {}x{}",
+            out.seq_len,
+            out.hidden_dim,
+            token_count,
+            attention.wo_b.rows
+        );
 
         let rope_params = &self.config.rope_parameters;
         let rope_base = self.config.rope_theta;
         let original_seq_len = 0;
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let mut q_prepared = unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
-        let mut k_prepared = unsafe { HiddenStates::uninit(&self.ctx, head_dim, token_count)? };
+        let reuse_decode_scratch = token_count == 1;
+        let mut q_prepared_scratch = if reuse_decode_scratch {
+            if let Some(cache) = cache.as_deref_mut() {
+                Some(take_hidden_scratch(
+                    &mut cache.q_prepared,
+                    &self.ctx,
+                    local_width,
+                    token_count,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut k_prepared_scratch = if reuse_decode_scratch {
+            if let Some(cache) = cache.as_deref_mut() {
+                Some(take_hidden_scratch(
+                    &mut cache.k_prepared,
+                    &self.ctx,
+                    head_dim,
+                    token_count,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut q_prepared_owned;
+        let mut k_prepared_owned;
+        let q_prepared = if let Some(scratch) = q_prepared_scratch.as_mut() {
+            &mut scratch.hidden
+        } else {
+            q_prepared_owned =
+                unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
+            &mut q_prepared_owned
+        };
+        let k_prepared = if let Some(scratch) = k_prepared_scratch.as_mut() {
+            &mut scratch.hidden
+        } else {
+            k_prepared_owned = unsafe { HiddenStates::uninit(&self.ctx, head_dim, token_count)? };
+            &mut k_prepared_owned
+        };
         let fuse_qk_prep = dsv4_fuse_qk_prep_enabled()?;
         {
             let (q_raw_ptr, _q_raw_guard) = q_raw.data.device_ptr(&self.ctx.stream);
@@ -1491,7 +1588,29 @@ impl DeepseekModel {
         let update_window_cache = cache.is_some();
         let fuse_window_update =
             update_window_cache && token_count == 1 && dsv4_fuse_attn_window_update_enabled()?;
-        let window_cache = if let Some(cache) = cache {
+        let mut local_attn_scratch = if reuse_decode_scratch {
+            if let Some(cache) = cache.as_deref_mut() {
+                Some(take_hidden_scratch(
+                    &mut cache.local_attn,
+                    &self.ctx,
+                    local_width,
+                    token_count,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut local_attn_owned;
+        let local_attn = if let Some(scratch) = local_attn_scratch.as_mut() {
+            &mut scratch.hidden
+        } else {
+            local_attn_owned =
+                unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
+            &mut local_attn_owned
+        };
+        let window_cache = if let Some(cache) = cache.as_deref_mut() {
             ensure_swa_window_cache(&self.ctx, cache, cache_len)?
         } else {
             scratch_window = self
@@ -1512,7 +1631,6 @@ impl DeepseekModel {
         )?;
 
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let mut local_attn = unsafe { HiddenStates::uninit(&self.ctx, local_width, token_count)? };
         {
             let (q_ptr, _q_guard) = q_prepared.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _k_guard) = k_prepared.data.device_ptr(&self.ctx.stream);
@@ -1575,8 +1693,50 @@ impl DeepseekModel {
         }
 
         let trace = dsv4_trace_begin(&self.ctx)?;
-        let latent = ops::gemm(&self.ctx, &attention.wo_a, &local_attn)?;
-        let mut out = ops::gemm(&self.ctx, &attention.wo_b, &latent)?;
+        let mut latent_scratch = if reuse_decode_scratch {
+            if let Some(cache) = cache.as_deref_mut() {
+                Some(take_hidden_scratch(
+                    &mut cache.output_latent,
+                    &self.ctx,
+                    attention.wo_a.rows,
+                    token_count,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut latent_owned;
+        let latent = if let Some(scratch) = latent_scratch.as_mut() {
+            &mut scratch.hidden
+        } else {
+            latent_owned =
+                unsafe { HiddenStates::uninit(&self.ctx, attention.wo_a.rows, token_count)? };
+            &mut latent_owned
+        };
+        ops::try_gemm_with_phase_into(
+            &self.ctx,
+            &attention.wo_a,
+            &*local_attn,
+            latent,
+            if token_count > 1 {
+                ops::LinearDispatchPhase::Prefill
+            } else {
+                ops::LinearDispatchPhase::Decode
+            },
+        )?;
+        ops::try_gemm_with_phase_into(
+            &self.ctx,
+            &attention.wo_b,
+            &*latent,
+            out,
+            if token_count > 1 {
+                ops::LinearDispatchPhase::Prefill
+            } else {
+                ops::LinearDispatchPhase::Decode
+            },
+        )?;
         dsv4_trace_end(
             &self.ctx,
             "attn_swa_output_proj",
@@ -1584,9 +1744,23 @@ impl DeepseekModel {
             token_count,
             trace,
         )?;
+        if let Some(cache) = cache {
+            if let Some(scratch) = q_prepared_scratch.take() {
+                put_hidden_scratch(&mut cache.q_prepared, scratch);
+            }
+            if let Some(scratch) = k_prepared_scratch.take() {
+                put_hidden_scratch(&mut cache.k_prepared, scratch);
+            }
+            if let Some(scratch) = local_attn_scratch.take() {
+                put_hidden_scratch(&mut cache.local_attn, scratch);
+            }
+            if let Some(scratch) = latent_scratch.take() {
+                put_hidden_scratch(&mut cache.output_latent, scratch);
+            }
+        }
         let trace = dsv4_trace_begin(&self.ctx)?;
         self.layer_communicator
-            .post_attn_all_reduce_hidden_states(&mut out)?;
+            .post_attn_all_reduce_hidden_states(out)?;
         dsv4_trace_end(
             &self.ctx,
             "attn_swa_all_reduce",
@@ -1594,7 +1768,7 @@ impl DeepseekModel {
             token_count,
             trace,
         )?;
-        Ok(out)
+        Ok(())
     }
 
     fn forward_attention_gpu(
@@ -1660,6 +1834,93 @@ impl DeepseekModel {
                 compress_ratio,
                 mode,
             ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attention_gpu_into(
+        &self,
+        layer_idx: usize,
+        attention: &DeepseekV4Attention,
+        hidden: &HiddenStates,
+        c_q_normed: &HiddenStates,
+        q_raw: &HiddenStates,
+        kv_normed: &HiddenStates,
+        token_count: usize,
+        start_pos: usize,
+        local_heads: usize,
+        local_width: usize,
+        head_dim: usize,
+        compress_ratio: usize,
+        mode: deepseek_spec::DeepSeekV4AttentionMode,
+        cache: Option<&mut DeepseekAttentionRuntimeCache>,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        ensure!(
+            out.hidden_dim == attention.wo_b.rows && out.seq_len == token_count,
+            "DeepSeek V4 attention output scratch mismatch: got {}x{} expected {}x{}",
+            out.seq_len,
+            out.hidden_dim,
+            token_count,
+            attention.wo_b.rows
+        );
+        if compress_ratio == 0 {
+            return self.forward_swa_attention_gpu_into(
+                layer_idx,
+                attention,
+                q_raw,
+                kv_normed,
+                token_count,
+                start_pos,
+                local_heads,
+                local_width,
+                head_dim,
+                cache,
+                out,
+            );
+        }
+        match cache {
+            Some(cache) => self.forward_attention_gpu_cached_into(
+                layer_idx,
+                attention,
+                hidden,
+                c_q_normed,
+                q_raw,
+                kv_normed,
+                token_count,
+                start_pos,
+                local_heads,
+                local_width,
+                head_dim,
+                compress_ratio,
+                mode,
+                cache,
+                out,
+            ),
+            None => {
+                let owned = self.forward_attention_gpu_uncached(
+                    layer_idx,
+                    attention,
+                    hidden,
+                    c_q_normed,
+                    q_raw,
+                    kv_normed,
+                    token_count,
+                    start_pos,
+                    local_heads,
+                    local_width,
+                    head_dim,
+                    compress_ratio,
+                    mode,
+                )?;
+                self.ctx
+                    .stream
+                    .memcpy_dtod(&owned.data, &mut out.data)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DSv4 uncached attention output D2D copy failed: {err}")
+                    })?;
+                Ok(())
+            }
         }
     }
 
@@ -1774,6 +2035,46 @@ impl DeepseekModel {
         mode: deepseek_spec::DeepSeekV4AttentionMode,
         cache: &mut DeepseekAttentionRuntimeCache,
     ) -> Result<HiddenStates> {
+        let mut out = unsafe { HiddenStates::uninit(&self.ctx, attention.wo_b.rows, token_count)? };
+        self.forward_attention_gpu_cached_into(
+            layer_idx,
+            attention,
+            hidden,
+            c_q_normed,
+            q_raw,
+            kv_normed,
+            token_count,
+            start_pos,
+            local_heads,
+            local_width,
+            head_dim,
+            compress_ratio,
+            mode,
+            cache,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attention_gpu_cached_into(
+        &self,
+        layer_idx: usize,
+        attention: &DeepseekV4Attention,
+        hidden: &HiddenStates,
+        c_q_normed: &HiddenStates,
+        q_raw: &HiddenStates,
+        kv_normed: &HiddenStates,
+        token_count: usize,
+        start_pos: usize,
+        local_heads: usize,
+        local_width: usize,
+        head_dim: usize,
+        compress_ratio: usize,
+        mode: deepseek_spec::DeepSeekV4AttentionMode,
+        cache: &mut DeepseekAttentionRuntimeCache,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         let compressor = attention.compressor.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "DeepSeek V4 layer {} has compress_ratio {} but no compressor weights",
@@ -1917,7 +2218,7 @@ impl DeepseekModel {
             .compressed
             .take()
             .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 compressed GPU cache missing rows"))?;
-        let result = self.finish_attention_gpu(
+        let result = self.finish_attention_gpu_into(
             layer_idx,
             attention,
             q_raw,
@@ -1932,6 +2233,7 @@ impl DeepseekModel {
             compress_ratio,
             mode,
             Some(cache),
+            out,
         );
         if let Some(selected_buf) = selected.take() {
             cache.csa_selected = Some(selected_buf);
@@ -1960,8 +2262,48 @@ impl DeepseekModel {
         head_dim: usize,
         compress_ratio: usize,
         mode: deepseek_spec::DeepSeekV4AttentionMode,
-        mut cache: Option<&mut DeepseekAttentionRuntimeCache>,
+        cache: Option<&mut DeepseekAttentionRuntimeCache>,
     ) -> Result<HiddenStates> {
+        let mut out = unsafe { HiddenStates::uninit(&self.ctx, attention.wo_b.rows, token_count)? };
+        self.finish_attention_gpu_into(
+            layer_idx,
+            attention,
+            q_raw,
+            kv_normed,
+            compressed,
+            selected,
+            token_count,
+            start_pos,
+            local_heads,
+            local_width,
+            head_dim,
+            compress_ratio,
+            mode,
+            cache,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_attention_gpu_into(
+        &self,
+        layer_idx: usize,
+        attention: &DeepseekV4Attention,
+        q_raw: &HiddenStates,
+        kv_normed: &HiddenStates,
+        compressed: Option<(&CudaSlice<bf16>, usize)>,
+        selected: Option<&CudaSlice<i32>>,
+        token_count: usize,
+        start_pos: usize,
+        local_heads: usize,
+        local_width: usize,
+        head_dim: usize,
+        compress_ratio: usize,
+        mode: deepseek_spec::DeepSeekV4AttentionMode,
+        mut cache: Option<&mut DeepseekAttentionRuntimeCache>,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         ensure!(
             q_raw.hidden_dim == local_width && q_raw.seq_len == token_count,
             "DeepSeek V4 GPU attention q shape mismatch: got {}x{} expected {}x{}",
@@ -1977,6 +2319,14 @@ impl DeepseekModel {
             kv_normed.seq_len,
             head_dim,
             token_count
+        );
+        ensure!(
+            out.hidden_dim == attention.wo_b.rows && out.seq_len == token_count,
+            "DeepSeek V4 GPU attention output shape mismatch: got {}x{} expected {}x{}",
+            out.seq_len,
+            out.hidden_dim,
+            token_count,
+            attention.wo_b.rows
         );
         let rope_params = &self.config.rope_parameters;
         // RoPE for Q and the sliding-window K — and the legacy hybrid kernel's
@@ -3315,12 +3665,11 @@ impl DeepseekModel {
                 ops::LinearDispatchPhase::Decode
             },
         )?;
-        let mut out = unsafe { HiddenStates::uninit(&self.ctx, attention.wo_b.rows, token_count)? };
         ops::try_gemm_with_phase_into(
             &self.ctx,
             &attention.wo_b,
             &*latent,
-            &mut out,
+            out,
             if token_count > 1 {
                 ops::LinearDispatchPhase::Prefill
             } else {
@@ -3344,9 +3693,9 @@ impl DeepseekModel {
         }
         let trace = dsv4_trace_begin(&self.ctx)?;
         self.layer_communicator
-            .post_attn_all_reduce_hidden_states(&mut out)?;
+            .post_attn_all_reduce_hidden_states(out)?;
         dsv4_trace_end(&self.ctx, "attn_all_reduce", layer_idx, token_count, trace)?;
-        Ok(out)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
