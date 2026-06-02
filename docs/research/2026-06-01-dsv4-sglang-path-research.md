@@ -228,6 +228,60 @@ Important SGLang defaults from `/workspace/sglang@0d51db3`:
 | DeepEP config | `python/sglang/srt/layers/moe/token_dispatcher/deepep.py` | `--deepep-config` feeds normal dispatch/combine `num_sms`; auto mode reserves resources for both normal and low-latency paths |
 | DeepGEMM warmup | `python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py` | JIT DeepGEMM precompile is default-on; without cached precompile it can spend 10-20 minutes warming kernels, which must be outside measured windows |
 
+## Best-Practice Target And Deletion Refactor
+
+This is the implementation target for future ARLE DSv4 work. It is based on
+the runtime SGLang tree at `/workspace/sglang@0d51db3`, not on trying to tune
+ARLE's current slow fallback into shape.
+
+SGLang's DSv4 path treats the fast lane as a closed contract:
+
+- DSv4 startup sets `attention_backend="dsv4"`, `page_size=256`, and FP8 KV.
+  Unsupported KV types and speculative algorithms fail at startup.
+- Low-latency DSv4 uses EAGLE topk=1; spec-on TPOT must be reported separately
+  from raw target-step TPOT.
+- The balanced/max-throughput lane is TP4/DP4 with DP attention, MoE EP,
+  DeepEP, DeepGEMM, and CUDA graph buckets sized with max-running requests.
+- Decode overlap is part of the algorithm: attention prepare yields before
+  attention core; MoE gate/select yields before DeepEP dispatch; shared experts
+  overlap with dispatch/expert/combine windows.
+- DeepEP's `num_sms` reservation is paired with DeepGEMM SM allocation, not a
+  free tuning knob.
+
+ARLE should converge to the same shape by deleting or fail-closing non-target
+performance paths:
+
+| Area | Keep as target path | Delete / fail-close as perf path |
+|---|---|---|
+| Startup defaults | DSv4 implies `dsv4` attention, page 256, FP8 KV, EAGLE-only spec when enabled | silent fallback to generic attention, BF16/INT KV, non-EAGLE speculation, or "native grouped expert" without a warning that the SLO lane is disabled |
+| Rank topology | token-owned TP4/DP4 + DP attention + MoE EP groups | replicated-token TP8 as a claimed SGLang-comparable lane |
+| MoE transport | DeepEP dispatch/combine on owned rows with one sidecar/process-per-rank contract that passes boot/sync smoke | host-visible route/count orchestration, D2H/H2D exchange, per-layer post-FFN all-reduce as a normal path |
+| Expert compute | DeepGEMM FP8 grouped/masked expert path plus fused activation/quant | Marlin/native grouped expert fallback for DSv4 Flash SLO claims |
+| Attention | fused DSv4 FlashMLA path consuming SWA/C4/C128 metadata and FP8 paged KV | separate selector/prep work outside graph that is still counted as acceptable decode steady state |
+| CUDA graph | graph-captured decode metadata and replay buckets for the SLO batch sizes | graph-disabled decode as a performance baseline |
+| Build/runtime gating | prebuilt archive symbol gate, DeepEP sidecar presence, and smoke-tested fixed-fd launch | accepting stale prebuilt archives, missing sidecar binaries, or sidecar boot skips as "available" |
+
+The deletion order should follow recoverable wall-clock, not code convenience:
+
+1. Make DSv4 SLO startup fail closed unless the SGLang-profile components are
+   active: FP8 KV, DSv4 attention, CUDA graph decode, EAGLE when comparing
+   spec-on output-token TPOT, DeepEP sidecar present, and DeepGEMM enabled.
+2. Replace replicated-token MoE with token-owned EP data movement. Until this
+   lands, `ffn_all_reduce` and over-transported DeepEP fanout are structural
+   taxes, not kernel tuning targets.
+3. Move DSv4 decode prep/metadata into CUDA graph-compatible buckets. The
+   current small-kernel path should become a correctness fallback only.
+4. Collapse MoE activation/quant/expert orchestration around the DeepGEMM
+   runner. Do not preserve Marlin/native grouped experts as DSv4 Flash
+   performance alternatives.
+5. Keep build fast paths strict: cache hits must prove exported symbols and
+   sidecar availability before linking, because a false fast path hides missing
+   high-performance components.
+
+The 2026-06-02 sidecar build/startup fixes are prerequisite only. They make the
+DeepEP sidecar real and smoke-testable, but they do not by themselves make the
+serving path SGLang-equivalent or improve DSv4 TPOT.
+
 ## Stage Mapping: SGLang vs Current ARLE
 
 This is the core structural answer. "Same" means the contracts are meaningfully
