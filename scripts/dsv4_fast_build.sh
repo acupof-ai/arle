@@ -101,11 +101,62 @@ resolve_deepgemm_env() {
     fi
 }
 
+deepep_dir_valid() {
+    local dir="$1"
+    [[ -d "$dir/csrc/kernels" ]] || return 1
+    [[ -f "$dir/csrc/kernels/api.cuh" || -f "$dir/csrc/kernels/legacy/api.cuh" ]]
+}
+
+resolve_deepep_env() {
+    if [[ -n "${ARLE_DEEPEP_DIR:-}" ]]; then
+        export ARLE_DEEPEP_DIR="$(abs_path "$ARLE_DEEPEP_DIR")"
+        deepep_dir_valid "$ARLE_DEEPEP_DIR" || {
+            echo "ARLE_DEEPEP_DIR=$ARLE_DEEPEP_DIR is not a supported DeepEP source tree; expected csrc/kernels/api.cuh or csrc/kernels/legacy/api.cuh" >&2
+            return 1
+        }
+        return 0
+    fi
+
+    local candidate
+    for candidate in \
+        "$ROOT/../DeepEP" \
+        "$ROOT/../deepep" \
+        "/data01/build/DeepEP" \
+        "/workspace/DeepEP" \
+        "/workspace/deepep"; do
+        if deepep_dir_valid "$candidate"; then
+            export ARLE_DEEPEP_DIR="$candidate"
+            echo "using DeepEP source tree from $ARLE_DEEPEP_DIR"
+            return 0
+        fi
+    done
+
+    if [[ "${ARLE_DSV4_MOE_BACKEND:-}" == "native-deepep" ||
+          "${ARLE_DSV4_MOE_BACKEND:-}" == "native_deepep" ||
+          "${ARLE_DSV4_PERFORMANCE_PROFILE:-}" == "sglang" ||
+          "${ARLE_DSV4_PERFORMANCE_PROFILE:-}" == "sglang-best-practice" ]]; then
+        echo "DeepEP source tree not found; native-deepep / sglang profile requires ARLE_DEEPEP_DIR" >&2
+        return 1
+    fi
+
+    echo "DeepEP source tree not found; building without arle_deepep_sidecar"
+}
+
+prebuilt_sidecar_ready() {
+    if [[ -n "${ARLE_DEEPEP_DIR:-}" ]]; then
+        [[ -f "$PREBUILT_DIR/arle_deepep_sidecar" ]] || {
+            echo "prebuilt artifacts missing arle_deepep_sidecar while ARLE_DEEPEP_DIR=$ARLE_DEEPEP_DIR"
+            return 1
+        }
+    fi
+}
+
 prebuilt_ready() {
     [[ -f "$PREBUILT_DIR/libkernels_cuda.a" ]] &&
         [[ -f "$PREBUILT_DIR/libtilelang_kernels_aot.a" ]] &&
         manifest_matches &&
-        validate_cuda_archive_symbols "$PREBUILT_DIR/libkernels_cuda.a"
+        validate_cuda_archive_symbols "$PREBUILT_DIR/libkernels_cuda.a" &&
+        prebuilt_sidecar_ready
 }
 
 hash_stream() {
@@ -219,6 +270,7 @@ cd "$ROOT"
 detect_cuda
 prefer_sccache
 resolve_deepgemm_env
+resolve_deepep_env
 
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 export ARLE_CUDA_KERNEL_SET="${ARLE_CUDA_KERNEL_SET:-dsv4_flash}"
@@ -251,6 +303,7 @@ echo "ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=${ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE:-}"
 echo "ARLE_DEEPGEMM_ROOT=${ARLE_DEEPGEMM_ROOT:-}"
 echo "ARLE_DEEPGEMM_LIBRARY_ROOT=${ARLE_DEEPGEMM_LIBRARY_ROOT:-}"
 echo "ARLE_DEEPGEMM_CUTLASS_INCLUDE=${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}"
+echo "ARLE_DEEPEP_DIR=${ARLE_DEEPEP_DIR:-}"
 
 time cargo build --profile "$PROFILE" -p infer --features "$FEATURES" --bin "$BIN"
 if [[ "$USED_PREBUILT" == "1" ]]; then
