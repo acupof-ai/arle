@@ -151,7 +151,7 @@ pub(super) struct DeepseekBatchedDecodeScratch {
     pub(super) attn_out: HiddenStates,
     pub(super) attn_out_row: HiddenStates,
     pub(super) attn_stream: HiddenStates,
-    pub(super) ffn_routed: HiddenStates,
+    pub(super) ffn_routed_by_batch: Vec<HiddenStates>,
     pub(super) head_stream_row: HiddenStates,
     pub(super) head_mixes: HiddenStates,
     pub(super) head_hidden: DeviceVec,
@@ -388,6 +388,9 @@ impl DeepseekBatchedDecodeScratch {
         vocab_size: usize,
     ) -> Result<Self> {
         let capacity_tokens = capacity_tokens.max(1);
+        let ffn_routed_by_batch = (1..=capacity_tokens)
+            .map(|batch| HiddenStates::zeros(ctx, hidden_size, batch))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             capacity_tokens,
             hidden_size,
@@ -431,7 +434,7 @@ impl DeepseekBatchedDecodeScratch {
             attn_out: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
             attn_out_row: HiddenStates::zeros(ctx, hidden_size, 1)?,
             attn_stream: HiddenStates::zeros(ctx, stream_hidden_dim, capacity_tokens)?,
-            ffn_routed: HiddenStates::zeros(ctx, hidden_size, capacity_tokens)?,
+            ffn_routed_by_batch,
             head_stream_row: HiddenStates::zeros(ctx, stream_hidden_dim, 1)?,
             head_mixes: HiddenStates::zeros(ctx, head_mix_dim, 1)?,
             head_hidden: DeviceVec::zeros(ctx, hidden_size)?.with_label("dsv4_head_hidden"),
@@ -468,7 +471,6 @@ impl DeepseekBatchedDecodeScratch {
         self.attn_out.seq_len = batch_size;
         self.attn_out_row.seq_len = 1;
         self.attn_stream.seq_len = batch_size;
-        self.ffn_routed.seq_len = batch_size;
         self.head_stream_row.seq_len = 1;
         self.head_mixes.seq_len = 1;
         self.logits_batch.seq_len = batch_size;
