@@ -299,6 +299,7 @@ pub enum DraftMode {
     #[default]
     None,
     SelfSpec,
+    InternalMtp,
     External(PathBuf),
 }
 
@@ -334,6 +335,20 @@ impl RequestSpecConfig {
             matches!(
                 raw.trim().to_ascii_lowercase().as_str(),
                 "self" | "self-spec" | "selfspec"
+            )
+        })
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn allows_internal_mtp(&self, default_draft_k: usize) -> bool {
+        if self.enabled == Some(false) || self.draft_k.unwrap_or(default_draft_k) != default_draft_k
+        {
+            return false;
+        }
+        self.draft_model.as_deref().is_none_or(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "internal-mtp" | "mtp" | "eagle" | "internal-eagle"
             )
         })
     }
@@ -1557,6 +1572,17 @@ mod tests {
     }
 
     #[test]
+    fn internal_mtp_allows_multi_token_without_sparse_kv() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.spec_enabled = true;
+        cfg.spec_draft_model = DraftMode::InternalMtp;
+        cfg.spec_draft_k = 5;
+
+        cfg.validate()
+            .expect("internal MTP/EAGLE uses checkpoint mtp.N weights, not sparse self-spec");
+    }
+
+    #[test]
     fn request_spec_canary_rejects_multi_token_override() {
         let spec = RequestSpecConfig {
             enabled: Some(true),
@@ -1612,6 +1638,41 @@ mod tests {
             draft_model: Some("self-spec".to_string()),
         };
         assert!(spec.allows_sparse_self_spec(5));
+    }
+
+    #[test]
+    fn request_spec_internal_mtp_honors_aliases_and_opt_outs() {
+        let spec = RequestSpecConfig {
+            enabled: Some(false),
+            draft_k: None,
+            acceptance_threshold: None,
+            draft_model: Some("eagle".to_string()),
+        };
+        assert!(!spec.allows_internal_mtp(5));
+
+        let spec = RequestSpecConfig {
+            enabled: Some(true),
+            draft_k: Some(4),
+            acceptance_threshold: None,
+            draft_model: Some("internal-mtp".to_string()),
+        };
+        assert!(!spec.allows_internal_mtp(5));
+
+        let spec = RequestSpecConfig {
+            enabled: Some(true),
+            draft_k: Some(5),
+            acceptance_threshold: None,
+            draft_model: Some("self-spec".to_string()),
+        };
+        assert!(!spec.allows_internal_mtp(5));
+
+        let spec = RequestSpecConfig {
+            enabled: Some(true),
+            draft_k: Some(5),
+            acceptance_threshold: None,
+            draft_model: Some("internal-eagle".to_string()),
+        };
+        assert!(spec.allows_internal_mtp(5));
     }
 
     #[test]

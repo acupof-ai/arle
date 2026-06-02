@@ -30,9 +30,9 @@ use crate::model::generation_state::GenerationStateBase;
 use crate::model::kv_cache::{KVCacheDtype, KVFormat};
 #[cfg(feature = "cuda")]
 use crate::model::{
-    CudaGraphDecodeSupport, DecodeContextOps, MixedBatchFallbackReason, MixedBatchOutcome,
-    MixedBatchRequest, ModelForward, PrefillBatchRequest, SpecVerifyOutput, SpecVerifyRequest,
-    prepare_paged_prefill_batch,
+    CudaGraphDecodeSupport, DecodeContextOps, InternalMtpDraftOutput, InternalMtpDraftRequest,
+    MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
+    PrefillBatchRequest, SpecVerifyOutput, SpecVerifyRequest, prepare_paged_prefill_batch,
 };
 #[cfg(feature = "cuda")]
 use crate::model_arch::ModelArchInfo;
@@ -283,6 +283,17 @@ impl ModelForward for DeepseekModel {
         ))
     }
 
+    fn forward_internal_mtp_draft_batch(
+        &self,
+        _requests: &[InternalMtpDraftRequest],
+        _states: &mut [Self::State],
+        _pool: &mut PagedKVPool,
+        _decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<Vec<InternalMtpDraftOutput>> {
+        self.validate_internal_mtp_draft_support()?;
+        Ok(Vec::new())
+    }
+
     fn forward_spec_verify_batch(
         &self,
         requests: &[SpecVerifyRequest<'_>],
@@ -486,6 +497,25 @@ impl ModelForward for DeepseekModel {
 
     fn supports_decode_warmup(&self) -> bool {
         self.cuda_graph_decode_support().supported()
+    }
+
+    fn validate_internal_mtp_draft_support(&self) -> Result<()> {
+        if self.config.spec.num_nextn_predict_layers == 0 {
+            anyhow::bail!(
+                "DSv4 internal MTP/EAGLE requested, but checkpoint config declares num_nextn_predict_layers=0"
+            );
+        }
+        if self.loaded_mtp_layer_count() < self.config.spec.num_nextn_predict_layers {
+            anyhow::bail!(
+                "DSv4 internal MTP/EAGLE requested, but ARLE loaded only {} of {} mtp.N layer(s)",
+                self.loaded_mtp_layer_count(),
+                self.config.spec.num_nextn_predict_layers,
+            );
+        }
+        anyhow::bail!(
+            "DSv4 internal MTP/EAGLE requested and {} mtp.N layer(s) are loaded, but CUDA frozen-KV MTP draft forward/graph capture is not implemented yet",
+            self.loaded_mtp_layer_count(),
+        );
     }
 
     fn cuda_graph_decode_support(&self) -> CudaGraphDecodeSupport {
