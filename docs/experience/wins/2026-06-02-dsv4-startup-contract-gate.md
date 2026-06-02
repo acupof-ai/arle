@@ -20,6 +20,11 @@ serve on the replicated-token debug lane and still look like a performance run.
   contract is not active. The current binary still reports token-owned DP/EP
   sharding and graph-captured DSv4 metadata as missing, so this is a guardrail,
   not a performance claim.
+- Follow-up cleanup removed the stale `main.rs`-local
+  `ARLE_DSV4_SGLANG_PATH` validator. Startup now logs the unified DSv4
+  performance profile and lets the model/scheduler contract own fail-fast
+  behavior, so `ARLE_DSV4_PERFORMANCE_PROFILE=sglang`,
+  `ARLE_DSV4_HIGH_PERF=1`, and the old alias cannot drift apart.
 
 ## Verification
 
