@@ -931,6 +931,7 @@ impl DeepseekModel {
             )
         })?;
 
+        let trace = dsv4_trace_begin(&self.ctx)?;
         for (row, &slot_idx) in slot_indices.iter().enumerate() {
             extract_hidden_token_with_width_into(
                 &self.ctx,
@@ -969,7 +970,15 @@ impl DeepseekModel {
                 head_dim,
             )?;
         }
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_hca_batch_cache_pack",
+            layer_idx,
+            batch_size,
+            trace,
+        )?;
 
+        let trace = dsv4_trace_begin(&self.ctx)?;
         let rope_params = &self.config.rope_parameters;
         let rope_base = self.config.rope_theta;
         let original_seq_len = 0_i32;
@@ -1000,7 +1009,15 @@ impl DeepseekModel {
             .result()
             .map_err(|err| anyhow::anyhow!("DSv4 batch FlashMLA q/k prep failed: {err}"))?;
         }
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_hca_batch_prepare_qk",
+            layer_idx,
+            batch_size,
+            trace,
+        )?;
 
+        let trace = dsv4_trace_begin(&self.ctx)?;
         cuda_kernels::attention::dsv4_fp8_kv_fill_sw_slots_from_start_pos_raw(
             &self.ctx,
             launch.sw_token_block_id_ptr,
@@ -1154,7 +1171,15 @@ impl DeepseekModel {
             })?;
         }
         drop(_log);
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_hca_batch_flashmla_decode",
+            layer_idx,
+            batch_size,
+            trace,
+        )?;
 
+        let trace = dsv4_trace_begin(&self.ctx)?;
         for (row, &slot_idx) in slot_indices.iter().enumerate() {
             let row_start_pos_ptr_u64 =
                 start_pos_ptr as u64 + (row * std::mem::size_of::<i32>()) as u64;
@@ -1212,6 +1237,13 @@ impl DeepseekModel {
                 .post_attn_all_reduce_hidden_states(attn_out_row)?;
             write_hidden_row(&self.ctx, attn_out, row, attn_out_row)?;
         }
+        dsv4_trace_end(
+            &self.ctx,
+            "attn_hca_batch_output_proj_rowloop",
+            layer_idx,
+            batch_size,
+            trace,
+        )?;
         Ok(())
     }
 
