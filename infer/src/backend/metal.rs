@@ -128,7 +128,9 @@ use loader::{
     tie_lm_head_from_embed_tokens,
 };
 #[cfg(feature = "metal")]
-pub use mtp::{MetalMtpMode, MetalMtpOptions, MetalMtpProbe, MetalMtpTensorSource};
+pub use mtp::{
+    MetalMtpDraftProbe, MetalMtpMode, MetalMtpOptions, MetalMtpProbe, MetalMtpTensorSource,
+};
 #[cfg(feature = "metal")]
 use qwen35::{
     load_qwen35_metal_weights, load_qwen35_metal_weights_from_gguf, metal_generate_qwen35,
@@ -172,6 +174,8 @@ pub struct MetalBackend {
     mtp_options: Option<MetalMtpOptions>,
     #[cfg(feature = "metal")]
     mtp_probe: Option<MetalMtpProbe>,
+    #[cfg(feature = "metal")]
+    mtp_draft_probe: Option<MetalMtpDraftProbe>,
     #[cfg(feature = "metal")]
     kv_pool_enabled: bool,
     #[cfg(feature = "metal")]
@@ -224,6 +228,8 @@ impl MetalBackend {
             mtp_options: mtp,
             #[cfg(feature = "metal")]
             mtp_probe: None,
+            #[cfg(feature = "metal")]
+            mtp_draft_probe: None,
             #[cfg(feature = "metal")]
             kv_pool_enabled: self::generate::resolve_metal_kv_pool_enabled(kv_pool),
             #[cfg(feature = "metal")]
@@ -649,6 +655,19 @@ fn log_mtp_probe_result(options: &MetalMtpOptions, probe: &MetalMtpProbe) {
 }
 
 #[cfg(feature = "metal")]
+fn log_mtp_draft_probe_result(probe: &MetalMtpDraftProbe) {
+    log::warn!(
+        "Metal MTP external draft model resolved: requested={} path={} model_type={} block_size={} tensors={} [{}], but native MTP draft/verify is not implemented yet; using standard Metal decode",
+        probe.requested_model,
+        probe.resolved_path.display(),
+        probe.model_type,
+        probe.block_size_label(),
+        probe.tensor_count,
+        probe.examples_label()
+    );
+}
+
+#[cfg(feature = "metal")]
 fn mtp_mode_label(mode: MetalMtpMode) -> &'static str {
     match mode {
         MetalMtpMode::Auto => "auto",
@@ -743,9 +762,15 @@ impl InferenceBackend for MetalBackend {
         };
         #[cfg(feature = "metal")]
         if let Some(options) = &self.mtp_options {
-            let probe = mtp::probe_mtp_tensors(source.model_root(), gguf)?;
-            log_mtp_probe_result(options, &probe);
-            self.mtp_probe = Some(probe);
+            if let Some(draft_model) = options.draft_model.as_deref() {
+                let draft_probe = mtp::resolve_mtp_draft_model(draft_model)?;
+                log_mtp_draft_probe_result(&draft_probe);
+                self.mtp_draft_probe = Some(draft_probe);
+            } else {
+                let probe = mtp::probe_mtp_tensors(source.model_root(), gguf)?;
+                log_mtp_probe_result(options, &probe);
+                self.mtp_probe = Some(probe);
+            }
         }
 
         match &config.arch {
