@@ -33,8 +33,8 @@ use super::state::{
     DeepseekDsv4GroupedBlockFormat, DeepseekExpertRuntimeScratch,
     DeepseekGroupedExpertActiveScratch, DeepseekGroupedExpertRuntimeScratch,
     DeepseekGroupedExpertWeightPtrCache, DeepseekMoeRuntimeCache, ensure_dispatch_payload_scratch,
-    ensure_local_route_scratch, ensure_recv_route_scratch, ensure_route_logits_scratch,
-    ensure_send_route_scratch,
+    ensure_local_route_scratch, ensure_local_routed_scratch, ensure_recv_route_scratch,
+    ensure_route_logits_scratch, ensure_send_route_scratch,
 };
 #[cfg(feature = "cuda")]
 use crate::distributed::expert_state::ExpertGroup;
@@ -1805,23 +1805,127 @@ impl DeepseekV4MoeBlock {
             )?;
         }
 
+        let mut local_routed_scratch_slot = if let Some(cache) = moe_scratch.as_deref_mut() {
+            cache.local_routed.take()
+        } else {
+            None
+        };
         let trace = dsv4_moe_trace_begin(ctx)?;
         let logits = ops::gemm(ctx, &self.gate_weight, hidden)?;
         dsv4_moe_trace_end(ctx, "ffn_route_logits", layer_idx, hidden.seq_len, trace)?;
 
         let trace = dsv4_moe_trace_begin(ctx)?;
-        let token_ids_gpu = ctx
-            .stream
-            .clone_htod(token_ids)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 token ids H2D failed: {err}"))?;
-        let mut route_indices = ctx
-            .stream
-            .alloc_zeros_traced::<i32>(hidden.seq_len * config.num_experts_per_tok)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 route index alloc failed: {err}"))?;
-        let mut route_weights = ctx
-            .stream
-            .alloc_zeros_traced::<f32>(hidden.seq_len * config.num_experts_per_tok)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 route weight alloc failed: {err}"))?;
+        let route_capacity = hidden
+            .seq_len
+            .checked_mul(config.num_experts_per_tok)
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 local route capacity overflows"))?;
+        let token_ids_gpu_owned: CudaSlice<u32>;
+        let mut route_indices_owned: CudaSlice<i32>;
+        let mut route_weights_owned: CudaSlice<f32>;
+        let mut local_counts_owned: CudaSlice<i32>;
+        let mut local_offsets_owned: CudaSlice<i32>;
+        let mut pack_cursors_owned: CudaSlice<i32>;
+        let mut packed_hidden_owned: HiddenStates;
+        let mut packed_token_owned: CudaSlice<i32>;
+        let mut packed_weight_owned: CudaSlice<f32>;
+        let cache_backed_local_route = moe_scratch.is_some();
+        let local_routed_scratch = if cache_backed_local_route {
+            Some(ensure_local_routed_scratch(
+                &mut local_routed_scratch_slot,
+                ctx,
+                hidden.hidden_dim,
+                hidden.seq_len,
+                config.num_experts_per_tok,
+                ep.experts_per_rank,
+            )?)
+        } else {
+            None
+        };
+        let (
+            token_ids_gpu,
+            route_indices,
+            route_weights,
+            local_counts,
+            local_offsets,
+            pack_cursors,
+            packed_hidden,
+            packed_token,
+            packed_weight,
+        ) = if let Some(scratch) = local_routed_scratch {
+            let mut token_dst = scratch.token_ids.slice_mut(0..hidden.seq_len);
+            ctx.stream
+                .memcpy_htod(token_ids, &mut token_dst)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 token ids H2D failed: {err}"))?;
+            (
+                &scratch.token_ids,
+                &mut scratch.route_indices,
+                &mut scratch.route_weights,
+                &mut scratch.local_counts,
+                &mut scratch.local_offsets,
+                &mut scratch.pack_cursors,
+                &mut scratch.packed_hidden,
+                &mut scratch.packed_token,
+                &mut scratch.packed_weight,
+            )
+        } else {
+            token_ids_gpu_owned = ctx
+                .stream
+                .clone_htod(token_ids)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 token ids H2D failed: {err}"))?;
+            route_indices_owned = ctx
+                .stream
+                .alloc_zeros_traced::<i32>(route_capacity)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 route index alloc failed: {err}"))?;
+            route_weights_owned = ctx
+                .stream
+                .alloc_zeros_traced::<f32>(route_capacity)
+                .map_err(|err| anyhow::anyhow!("DeepSeek V4 route weight alloc failed: {err}"))?;
+            local_counts_owned = ctx
+                .stream
+                .alloc_zeros_traced::<i32>(ep.experts_per_rank)
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 local route count alloc failed: {err}")
+                })?;
+            local_offsets_owned = ctx
+                .stream
+                .alloc_zeros_traced::<i32>(ep.experts_per_rank)
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 local route offset alloc failed: {err}")
+                })?;
+            pack_cursors_owned = ctx
+                .stream
+                .alloc_zeros_traced::<i32>(ep.experts_per_rank)
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 local route cursor alloc failed: {err}")
+                })?;
+            packed_hidden_owned =
+                unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, route_capacity)? };
+            packed_token_owned = unsafe {
+                ctx.stream
+                    .alloc_traced::<i32>(route_capacity)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 packed token alloc failed: {err}")
+                    })?
+            };
+            packed_weight_owned = unsafe {
+                ctx.stream
+                    .alloc_traced::<f32>(route_capacity)
+                    .map_err(|err| {
+                        anyhow::anyhow!("DeepSeek V4 packed weight alloc failed: {err}")
+                    })?
+            };
+            (
+                &token_ids_gpu_owned,
+                &mut route_indices_owned,
+                &mut route_weights_owned,
+                &mut local_counts_owned,
+                &mut local_offsets_owned,
+                &mut pack_cursors_owned,
+                &mut packed_hidden_owned,
+                &mut packed_token_owned,
+                &mut packed_weight_owned,
+            )
+        };
         dsv4_moe_trace_end(ctx, "ffn_route_setup", layer_idx, hidden.seq_len, trace)?;
 
         let routing_kind = match config.moe_routing_kind(layer_idx) {
@@ -1899,11 +2003,8 @@ impl DeepseekV4MoeBlock {
             .map_err(|_| anyhow::anyhow!("DeepSeek V4 local expert start overflows i32"))?;
         let experts_per_rank_i32 = i32::try_from(ep.experts_per_rank)
             .map_err(|_| anyhow::anyhow!("DeepSeek V4 experts_per_rank overflows i32"))?;
-        let mut local_counts = ctx
-            .stream
-            .alloc_zeros_traced::<i32>(ep.experts_per_rank)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route count alloc failed: {err}"))?;
         let trace = dsv4_moe_trace_begin(ctx)?;
+        dsv4_zero_i32_slice(ctx, local_counts, ep.experts_per_rank)?;
         {
             let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
             let (count_ptr, _count_guard) = local_counts.device_ptr_mut(&ctx.stream);
@@ -1928,19 +2029,11 @@ impl DeepseekV4MoeBlock {
             hidden.seq_len,
             trace,
         )?;
-        // A3 Phase 1 (per docs/plans/2026-05-26-dsv4-a3-in-graph-metadata.md):
-        // device-side scan produces offsets_gpu, so the legacy
-        // `clone_htod(offsets_host)` step is skipped. counts_host is still
-        // built from a wide D2H because the non-compact per-expert pack loop
-        // below (~mlp.rs:2078) indexes counts_host[i] for every expert. That
-        // loop is the next phase's target (persistent grouped-GEMM) and not
-        // safe to remove here without rewriting the loop into a single
-        // device-driven kernel.
-        let use_a3_phase1 = dsv4_a3_phase1_enabled()?;
+        let use_device_offsets = cache_backed_local_route || dsv4_a3_phase1_enabled()?;
         let trace = dsv4_moe_trace_begin(ctx)?;
         let counts_host = ctx
             .stream
-            .clone_dtoh(&local_counts)
+            .clone_dtoh(local_counts)
             .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route count D2H failed: {err}"))?;
         dsv4_moe_trace_end(ctx, "ffn_route_count_d2h", layer_idx, hidden.seq_len, trace)?;
         let mut offsets_host = Vec::with_capacity(ep.experts_per_rank);
@@ -1959,18 +2052,11 @@ impl DeepseekV4MoeBlock {
                 .map_err(|_| anyhow::anyhow!("DeepSeek V4 local route count overflows usize"))?;
         }
 
-        let mut offsets_gpu_owned: Option<cudarc::driver::CudaSlice<i32>> = None;
-        if use_a3_phase1 && total_local_routes > 0 {
+        if use_device_offsets && total_local_routes > 0 {
             let trace = dsv4_moe_trace_begin(ctx)?;
-            let mut gpu_offsets = ctx
-                .stream
-                .alloc_zeros_traced::<i32>(ep.experts_per_rank)
-                .map_err(|err| {
-                    anyhow::anyhow!("DeepSeek V4 local route offset alloc failed: {err}")
-                })?;
             {
                 let (count_ptr, _count_guard) = local_counts.device_ptr(&ctx.stream);
-                let (offset_ptr, _offset_guard) = gpu_offsets.device_ptr_mut(&ctx.stream);
+                let (offset_ptr, _offset_guard) = local_offsets.device_ptr_mut(&ctx.stream);
                 unsafe {
                     ffi::dsv4_exclusive_scan_i32_cuda(
                         count_ptr as *const i32,
@@ -1992,20 +2078,22 @@ impl DeepseekV4MoeBlock {
                 hidden.seq_len,
                 trace,
             )?;
-            offsets_gpu_owned = Some(gpu_offsets);
         }
 
         let mut out = HiddenStates::zeros(ctx, hidden.hidden_dim, hidden.seq_len)?;
         if total_local_routes == 0 {
+            if let Some(cache) = moe_scratch.as_deref_mut() {
+                cache.local_routed = local_routed_scratch_slot;
+            }
             return Ok(out);
         }
-        let offsets_gpu = if let Some(gpu) = offsets_gpu_owned {
-            gpu
-        } else {
+        if !use_device_offsets {
             let trace = dsv4_moe_trace_begin(ctx)?;
-            let offsets = ctx.stream.clone_htod(&offsets_host).map_err(|err| {
-                anyhow::anyhow!("DeepSeek V4 local route offsets H2D failed: {err}")
-            })?;
+            ctx.stream
+                .memcpy_htod(&offsets_host, local_offsets)
+                .map_err(|err| {
+                    anyhow::anyhow!("DeepSeek V4 local route offsets H2D failed: {err}")
+                })?;
             dsv4_moe_trace_end(
                 ctx,
                 "ffn_route_offsets_h2d",
@@ -2013,49 +2101,38 @@ impl DeepseekV4MoeBlock {
                 hidden.seq_len,
                 trace,
             )?;
-            offsets
-        };
+        }
         if hidden.seq_len > 1 && dsv4_local_grouped_experts_enabled()? {
-            if let Some(scratch_cache) = moe_scratch {
-                return self.forward_compact_local_routes_gpu(
+            if let Some(scratch_cache) = moe_scratch.as_deref_mut() {
+                let result = self.forward_compact_local_routes_gpu(
                     ctx,
                     layer_idx,
                     config,
                     hidden,
-                    &route_indices,
-                    &route_weights,
+                    route_indices,
+                    route_weights,
                     &counts_host,
                     &offsets_host,
-                    &offsets_gpu,
+                    local_offsets,
                     total_local_routes,
                     local_expert_start_i32,
                     experts_per_rank_i32,
                     scratch_cache,
                 );
+                if let Some(cache) = moe_scratch.as_deref_mut() {
+                    cache.local_routed = local_routed_scratch_slot;
+                }
+                return result;
             }
         }
 
         let trace = dsv4_moe_trace_begin(ctx)?;
         // pack_cursors MUST stay zero-init (kernel uses atomicAdd from 0).
-        let mut pack_cursors = ctx
-            .stream
-            .alloc_zeros_traced::<i32>(ep.experts_per_rank)
-            .map_err(|err| anyhow::anyhow!("DeepSeek V4 local route cursor alloc failed: {err}"))?;
+        dsv4_zero_i32_slice(ctx, pack_cursors, ep.experts_per_rank)?;
         // packed_hidden / packed_token / packed_weight: pack kernel fully
         // writes [0..total_local_routes] (atomicAdd cursors guarantees each
         // slot is hit exactly once), so the prior zero-fill is wasted work.
-        let mut packed_hidden =
-            unsafe { HiddenStates::uninit(ctx, hidden.hidden_dim, total_local_routes)? };
-        let mut packed_token = unsafe {
-            ctx.stream
-                .alloc_traced::<i32>(total_local_routes)
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 packed token alloc failed: {err}"))?
-        };
-        let mut packed_weight = unsafe {
-            ctx.stream
-                .alloc_traced::<f32>(total_local_routes)
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 packed weight alloc failed: {err}"))?
-        };
+        packed_hidden.seq_len = total_local_routes;
         dsv4_moe_trace_end(
             ctx,
             "ffn_route_pack_setup",
@@ -2068,7 +2145,7 @@ impl DeepseekV4MoeBlock {
             let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
             let (idx_ptr, _idx_guard) = route_indices.device_ptr(&ctx.stream);
             let (weight_ptr, _weight_guard) = route_weights.device_ptr(&ctx.stream);
-            let (offset_ptr, _offset_guard) = offsets_gpu.device_ptr(&ctx.stream);
+            let (offset_ptr, _offset_guard) = local_offsets.device_ptr(&ctx.stream);
             let (cursor_ptr, _cursor_guard) = pack_cursors.device_ptr_mut(&ctx.stream);
             let (packed_hidden_ptr, _packed_hidden_guard) =
                 packed_hidden.data.device_ptr_mut(&ctx.stream);
@@ -2147,6 +2224,9 @@ impl DeepseekV4MoeBlock {
             }
         }
         dsv4_moe_trace_end(ctx, "ffn_expert_loop", layer_idx, hidden.seq_len, trace)?;
+        if let Some(cache) = moe_scratch.as_deref_mut() {
+            cache.local_routed = local_routed_scratch_slot;
+        }
         Ok(out)
     }
 

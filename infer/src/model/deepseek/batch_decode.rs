@@ -10,7 +10,11 @@ use crate::model::DecodeContextOps;
 use crate::model::kv_cache::KVFormat;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
 use cuda_kernels::tensor::CudaAllocTraceExt;
+use cudarc::driver::safe::CudaGraph;
+use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use cudarc::driver::{CudaSlice, DevicePtrMut};
+use log::info;
 
 /// MODEL1 FlashMLA sparse-FP8 KV block byte size — `page_block_size (64) ×
 /// bytes_per_token (584)` = 37376 B per block per layer. Kept here (instead of
@@ -59,7 +63,21 @@ pub struct DeepseekBatchDecodeBuffers {
     /// it back so the layout matches the allocation.
     fp8_kv_max_seq_len: usize,
     batched_scratch: Option<DeepseekBatchedDecodeScratch>,
+    /// Piecewise graph cache for stable token-id input staging
+    /// (embedding + initial HC stream), indexed by `batch_size - 1`.
+    input_graph_cache: Vec<Option<CudaGraph>>,
+    /// Piecewise graph cache for stable head/logits staging, indexed by
+    /// `batch_size - 1`. Per-slot logits scatter stays outside the graph so
+    /// captured destination pointers are scheduler-context stable.
+    head_graph_cache: Vec<Option<CudaGraph>>,
+    /// One-shot eager override used by correctness-sensitive verifier paths.
+    force_eager_once: bool,
 }
+
+// SAFETY: `DeepseekBatchDecodeBuffers` owns CUDA graph handles, which must stay
+// on the creating CUDA context/thread. The scheduler owns one decode context and
+// uses it exclusively on the single inference thread.
+unsafe impl Send for DeepseekBatchDecodeBuffers {}
 
 /// Stable DSv4 batched-decode buffers.
 ///
@@ -87,6 +105,7 @@ pub(super) struct DeepseekBatchedDecodeScratch {
     pub(super) head_hidden: DeviceVec,
     pub(super) head_normed: DeviceVec,
     pub(super) logits: DeviceVec,
+    pub(super) logits_batch: HiddenStates,
 }
 
 impl DeepseekBatchedDecodeScratch {
@@ -121,6 +140,7 @@ impl DeepseekBatchedDecodeScratch {
             head_hidden: DeviceVec::zeros(ctx, hidden_size)?.with_label("dsv4_head_hidden"),
             head_normed: DeviceVec::zeros(ctx, hidden_size)?.with_label("dsv4_head_normed"),
             logits: DeviceVec::zeros(ctx, vocab_size)?.with_label("dsv4_batched_logits_scratch"),
+            logits_batch: HiddenStates::zeros(ctx, vocab_size, capacity_tokens)?,
         })
     }
 
@@ -137,6 +157,7 @@ impl DeepseekBatchedDecodeScratch {
         self.row_out.seq_len = 1;
         self.head_stream_row.seq_len = 1;
         self.head_mixes.seq_len = 1;
+        self.logits_batch.seq_len = batch_size;
         Ok(())
     }
 
@@ -198,6 +219,9 @@ impl DeepseekBatchDecodeBuffers {
             fp8_kv_slot_blocks: 0,
             fp8_kv_max_seq_len: 0,
             batched_scratch: None,
+            input_graph_cache: (0..max_batch_size).map(|_| None).collect(),
+            head_graph_cache: (0..max_batch_size).map(|_| None).collect(),
+            force_eager_once: false,
         })
     }
 
@@ -242,6 +266,146 @@ impl DeepseekBatchDecodeBuffers {
             .expect("DSv4 batched scratch allocated");
         scratch.set_batch_size(batch_size)?;
         Ok(scratch)
+    }
+
+    pub(super) fn take_force_eager_once(&mut self) -> bool {
+        std::mem::take(&mut self.force_eager_once)
+    }
+
+    pub(super) fn run_input_piece_graph<F>(
+        &mut self,
+        ctx: &DeviceContext,
+        batch_size: usize,
+        force_eager: bool,
+        body: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut DeepseekBatchedDecodeScratch) -> Result<()>,
+    {
+        self.run_piece_graph(
+            ctx,
+            batch_size,
+            force_eager,
+            DeepseekDecodeGraphPiece::Input,
+            body,
+        )
+    }
+
+    pub(super) fn run_head_piece_graph<F>(
+        &mut self,
+        ctx: &DeviceContext,
+        batch_size: usize,
+        force_eager: bool,
+        body: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut DeepseekBatchedDecodeScratch) -> Result<()>,
+    {
+        self.run_piece_graph(
+            ctx,
+            batch_size,
+            force_eager,
+            DeepseekDecodeGraphPiece::Head,
+            body,
+        )
+    }
+
+    fn run_piece_graph<F>(
+        &mut self,
+        ctx: &DeviceContext,
+        batch_size: usize,
+        force_eager: bool,
+        piece: DeepseekDecodeGraphPiece,
+        mut body: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut DeepseekBatchedDecodeScratch) -> Result<()>,
+    {
+        ensure!(
+            batch_size >= 1 && batch_size <= self.max_batch_size,
+            "DeepSeek V4 graph piece batch {batch_size} exceeds context capacity {}",
+            self.max_batch_size
+        );
+        let idx = batch_size - 1;
+        let cache = match piece {
+            DeepseekDecodeGraphPiece::Input => &mut self.input_graph_cache,
+            DeepseekDecodeGraphPiece::Head => &mut self.head_graph_cache,
+        };
+        if !force_eager && let Some(graph) = cache[idx].as_ref() {
+            graph.launch().map_err(|e| {
+                anyhow::anyhow!(
+                    "DSv4 {} graph replay (B={}): {e}",
+                    piece.label(),
+                    batch_size
+                )
+            })?;
+            return Ok(());
+        }
+        if force_eager {
+            let scratch = self
+                .batched_scratch
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("DSv4 batched scratch not allocated"))?;
+            return body(scratch);
+        }
+
+        info!(
+            "Capturing DSv4 piecewise CUDA Graph: piece={} B={}",
+            piece.label(),
+            batch_size
+        );
+        ctx.stream
+            .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "DSv4 {} begin_capture (B={}): {e}",
+                    piece.label(),
+                    batch_size
+                )
+            })?;
+        let body_result = {
+            let scratch = self
+                .batched_scratch
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("DSv4 batched scratch not allocated"))?;
+            body(scratch)
+        };
+        if let Err(err) = body_result {
+            let end_result = ctx
+                .stream
+                .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
+            if let Err(end_err) = end_result {
+                return Err(anyhow::anyhow!(
+                    "DSv4 {} graph capture body failed (B={}): {err}; end_capture after failure also failed: {end_err}",
+                    piece.label(),
+                    batch_size,
+                ));
+            }
+            return Err(err);
+        }
+        let graph_opt = ctx
+            .stream
+            .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .map_err(|e| {
+                anyhow::anyhow!("DSv4 {} end_capture (B={}): {e}", piece.label(), batch_size)
+            })?;
+        if let Some(graph) = graph_opt {
+            graph.launch().map_err(|e| {
+                anyhow::anyhow!(
+                    "DSv4 {} graph first launch (B={}): {e}",
+                    piece.label(),
+                    batch_size
+                )
+            })?;
+            cache[idx] = Some(graph);
+        } else {
+            let scratch = self
+                .batched_scratch
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("DSv4 batched scratch not allocated"))?;
+            body(scratch)?;
+        }
+        Ok(())
     }
 
     /// Record the served `max_seq_len` the shared pool was sized for.
@@ -408,5 +572,29 @@ impl DecodeContextOps for DeepseekBatchDecodeBuffers {
 
     fn set_batch_size(&mut self, _bs: usize) {}
 
-    fn invalidate_graph_cache(&mut self, _batch_size: usize) {}
+    fn invalidate_graph_cache(&mut self, batch_size: usize) {
+        if batch_size >= 1 && batch_size <= self.max_batch_size {
+            self.input_graph_cache[batch_size - 1] = None;
+            self.head_graph_cache[batch_size - 1] = None;
+        }
+    }
+
+    fn force_eager_once(&mut self) {
+        self.force_eager_once = true;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DeepseekDecodeGraphPiece {
+    Input,
+    Head,
+}
+
+impl DeepseekDecodeGraphPiece {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Head => "head",
+        }
+    }
 }
