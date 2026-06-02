@@ -10,6 +10,10 @@ mod tests {
 
     use super::super::*;
     use crate::backend::metal::mlx::{Dtype, MlxArray, eval};
+    use crate::kv_tier::{
+        ChunkedSnapshotManifest, ChunkedSnapshotPartRead, ChunkedSnapshotPartWrite,
+        ChunkedSnapshotRead, crc32c,
+    };
     use crate::test_support::metal_test_guard;
 
     struct FakeDriver {
@@ -48,6 +52,35 @@ mod tests {
         fn cleanup(&mut self) -> Result<()> {
             self.cleanup_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        }
+    }
+
+    fn chunked_read(
+        metadata: Vec<u8>,
+        parts: Vec<ChunkedSnapshotPartWrite>,
+    ) -> ChunkedSnapshotRead {
+        let payload_len = parts
+            .iter()
+            .map(|part| part.bytes.len() as u64)
+            .sum::<u64>();
+        let metadata_crc32c = crc32c::checksum(&metadata);
+        let metadata_checksum = *blake3::hash(&metadata).as_bytes();
+        ChunkedSnapshotRead {
+            manifest: ChunkedSnapshotManifest {
+                namespace: "test".into(),
+                metadata,
+                payload_len,
+                metadata_crc32c,
+                metadata_checksum,
+                parts: Vec::new(),
+            },
+            parts: parts
+                .into_iter()
+                .map(|part| ChunkedSnapshotPartRead {
+                    name: part.name,
+                    bytes: part.bytes,
+                })
+                .collect(),
         }
     }
 
@@ -183,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_prefix_snapshot_disk_payload_roundtrips_arrays() {
+    fn qwen35_prefix_snapshot_chunked_payload_roundtrips_arrays() {
         let _guard = metal_test_guard();
         let snapshot = Qwen35PrefixSnapshot {
             token_ids: vec![101, 102],
@@ -193,20 +226,25 @@ mod tests {
             kv_capacity: 4,
         };
 
-        let payload = snapshot.encode_for_disk(b"qwen35-test").expect("encode");
+        let (metadata, parts, logical_len) = snapshot
+            .encode_chunked_for_disk(b"qwen35-test")
+            .expect("encode");
         assert_eq!(
             snapshot
-                .estimated_disk_payload_len(b"qwen35-test")
+                .estimated_chunked_disk_payload_len(b"qwen35-test")
                 .expect("estimate"),
-            payload.len() as u64
+            logical_len
         );
-        let restored =
-            Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-test").expect("decode");
+        let restored = Qwen35PrefixSnapshot::decode_chunked_from_disk(
+            chunked_read(metadata, parts),
+            b"qwen35-test",
+        )
+        .expect("decode");
         eval(&[&restored.kv_flat[0], &restored.gdr_flat[0]]);
 
         assert_eq!(restored.token_ids, vec![101, 102]);
         assert_eq!(restored.cache_len, 2);
-        assert_eq!(restored.kv_capacity, 4);
+        assert_eq!(restored.kv_capacity, 2);
         assert_eq!(restored.kv_flat.len(), 1);
         assert_eq!(restored.gdr_flat.len(), 1);
         assert_eq!(restored.kv_flat[0].shape(), &[2]);
@@ -218,22 +256,42 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_prefix_snapshot_disk_payload_rejects_wrong_model_fingerprint() {
+    fn qwen35_chunked_prefix_snapshot_trims_kv_capacity_on_disk() {
         let _guard = metal_test_guard();
         let snapshot = Qwen35PrefixSnapshot {
-            token_ids: vec![101],
-            kv_flat: vec![MlxArray::from_slice_i32(&[10], &[1])],
+            token_ids: vec![101, 102],
+            kv_flat: vec![MlxArray::from_slice_i32(&[10, 20, 30, 40], &[1, 1, 4, 1])],
             gdr_flat: Vec::new(),
-            cache_len: 1,
-            kv_capacity: 1,
+            cache_len: 2,
+            kv_capacity: 4,
         };
 
-        let payload = snapshot.encode_for_disk(b"qwen35-a").expect("encode");
-        assert!(Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-b").is_err());
+        let (metadata, parts, logical_len) = snapshot
+            .encode_chunked_for_disk(b"qwen35-a")
+            .expect("encode chunked");
+        assert_eq!(
+            snapshot
+                .estimated_chunked_disk_payload_len(b"qwen35-a")
+                .expect("estimate chunked"),
+            logical_len
+        );
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].bytes.len(), 2 * std::mem::size_of::<i32>());
+        let restored = Qwen35PrefixSnapshot::decode_chunked_from_disk(
+            chunked_read(metadata, parts),
+            b"qwen35-a",
+        )
+        .expect("decode");
+        eval(&[&restored.kv_flat[0]]);
+        assert_eq!(restored.token_ids, vec![101, 102]);
+        assert_eq!(restored.cache_len, 2);
+        assert_eq!(restored.kv_capacity, 2);
+        assert_eq!(restored.kv_flat[0].shape(), &[1, 1, 2, 1]);
+        assert_eq!(restored.kv_flat[0].as_slice_i32(), vec![10, 20]);
     }
 
     #[test]
-    fn qwen35_prefix_snapshot_disk_payload_rejects_corrupt_body() {
+    fn qwen35_prefix_snapshot_chunked_payload_rejects_wrong_model_fingerprint() {
         let _guard = metal_test_guard();
         let snapshot = Qwen35PrefixSnapshot {
             token_ids: vec![101],
@@ -243,11 +301,39 @@ mod tests {
             kv_capacity: 1,
         };
 
-        let mut payload = snapshot.encode_for_disk(b"qwen35-a").expect("encode");
-        let last = payload.last_mut().expect("payload body byte");
+        let (metadata, parts, _) = snapshot
+            .encode_chunked_for_disk(b"qwen35-a")
+            .expect("encode");
+        assert!(
+            Qwen35PrefixSnapshot::decode_chunked_from_disk(
+                chunked_read(metadata, parts),
+                b"qwen35-b"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn qwen35_prefix_snapshot_chunked_payload_rejects_corrupt_body() {
+        let _guard = metal_test_guard();
+        let snapshot = Qwen35PrefixSnapshot {
+            token_ids: vec![101],
+            kv_flat: vec![MlxArray::from_slice_i32(&[10], &[1])],
+            gdr_flat: Vec::new(),
+            cache_len: 1,
+            kv_capacity: 1,
+        };
+
+        let (metadata, mut parts, _) = snapshot
+            .encode_chunked_for_disk(b"qwen35-a")
+            .expect("encode");
+        let last = parts[0].bytes.last_mut().expect("payload body byte");
         *last ^= 0x01;
 
-        let err = match Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-a") {
+        let err = match Qwen35PrefixSnapshot::decode_chunked_from_disk(
+            chunked_read(metadata, parts),
+            b"qwen35-a",
+        ) {
             Ok(_) => panic!("corrupt body should fail"),
             Err(err) => err,
         };
@@ -268,9 +354,11 @@ mod tests {
             kv_capacity: 1,
         };
 
-        let payload = snapshot.encode_for_disk(b"qwen35-a").expect("encode");
+        let (metadata, _parts, _) = snapshot
+            .encode_chunked_for_disk(b"qwen35-a")
+            .expect("encode");
         let (mut header, _body) =
-            decode_qwen35_prefix_snapshot_header(&payload, b"qwen35-a", false)
+            decode_qwen35_prefix_snapshot_header(&metadata, b"qwen35-a", false)
                 .expect("decode header");
         header.kv_capacity += 1;
 
@@ -283,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_prefix_snapshot_disk_payload_rejects_wrong_model_before_body() {
+    fn qwen35_prefix_snapshot_chunked_payload_rejects_wrong_model_before_body() {
         let _guard = metal_test_guard();
         let snapshot = Qwen35PrefixSnapshot {
             token_ids: vec![101],
@@ -293,10 +381,15 @@ mod tests {
             kv_capacity: 1,
         };
 
-        let mut payload = snapshot.encode_for_disk(b"qwen35-a").expect("encode");
-        payload.pop().expect("payload body byte");
+        let (metadata, mut parts, _) = snapshot
+            .encode_chunked_for_disk(b"qwen35-a")
+            .expect("encode");
+        parts[0].bytes.pop().expect("payload body byte");
 
-        let wrong_model = match Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-b") {
+        let wrong_model = match Qwen35PrefixSnapshot::decode_chunked_from_disk(
+            chunked_read(metadata.clone(), parts.clone()),
+            b"qwen35-b",
+        ) {
             Ok(_) => panic!("wrong model should be rejected"),
             Err(err) => err,
         };
@@ -305,7 +398,10 @@ mod tests {
             "unexpected wrong-model error: {wrong_model:#}"
         );
 
-        let truncated_body = match Qwen35PrefixSnapshot::decode_from_disk(&payload, b"qwen35-a") {
+        let truncated_body = match Qwen35PrefixSnapshot::decode_chunked_from_disk(
+            chunked_read(metadata, parts),
+            b"qwen35-a",
+        ) {
             Ok(_) => panic!("truncated body should be rejected"),
             Err(err) => err,
         };
@@ -316,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_prefix_snapshot_disk_payload_peeks_tokens_without_import() {
+    fn qwen35_prefix_snapshot_chunked_payload_peeks_tokens_without_import() {
         let _guard = metal_test_guard();
         let snapshot = Qwen35PrefixSnapshot {
             token_ids: vec![101, 102, 103],
@@ -326,12 +422,14 @@ mod tests {
             kv_capacity: 4,
         };
 
-        let payload = snapshot.encode_for_disk(b"qwen35-a").expect("encode");
-        let token_ids =
-            Qwen35PrefixSnapshot::peek_disk_token_ids(&payload, b"qwen35-a").expect("peek");
+        let (metadata, _parts, _) = snapshot
+            .encode_chunked_for_disk(b"qwen35-a")
+            .expect("encode");
+        let token_ids = Qwen35PrefixSnapshot::peek_chunked_disk_token_ids(&metadata, b"qwen35-a")
+            .expect("peek");
         assert_eq!(token_ids, vec![101, 102, 103]);
 
-        let err = Qwen35PrefixSnapshot::peek_disk_token_ids(&payload, b"qwen35-b")
+        let err = Qwen35PrefixSnapshot::peek_chunked_disk_token_ids(&metadata, b"qwen35-b")
             .expect_err("wrong model should fail");
         assert!(
             err.to_string().contains("model fingerprint"),
@@ -340,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_prefix_snapshot_disk_payload_rejects_token_cache_len_mismatch() {
+    fn qwen35_prefix_snapshot_chunked_payload_rejects_token_cache_len_mismatch() {
         let _guard = metal_test_guard();
         let snapshot = Qwen35PrefixSnapshot {
             token_ids: vec![101, 102],
@@ -351,7 +449,7 @@ mod tests {
         };
 
         let err = snapshot
-            .encode_for_disk(b"qwen35-a")
+            .encode_chunked_for_disk(b"qwen35-a")
             .expect_err("token/cache_len mismatch should fail");
         assert!(
             err.to_string().contains("does not match cache_len"),

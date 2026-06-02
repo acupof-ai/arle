@@ -17,6 +17,7 @@ use super::qwen35::{
 };
 use super::sampling::{gpu_sample_token, gpu_sample_token_batched, validate_metal_sampling_params};
 use super::weights::{MetalWeights, StandardMetalWeights};
+use crate::kv_tier::{ChunkedSnapshotPartWrite, ChunkedSnapshotRead};
 use crate::sampler::SamplingParams;
 
 const METAL_REQUEST_STATE_ID: usize = 0;
@@ -346,128 +347,154 @@ struct MlxArrayBytesHeader {
 }
 
 impl Qwen35PrefixSnapshot {
-    pub(crate) fn encode_for_disk(&self, model_fingerprint: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn encode_chunked_for_disk(
+        &self,
+        model_fingerprint: &[u8],
+    ) -> Result<(Vec<u8>, Vec<ChunkedSnapshotPartWrite>, u64)> {
         ensure!(
             !model_fingerprint.is_empty(),
-            "Qwen3.5 prefix snapshot encode requires a model fingerprint"
+            "Qwen3.5 chunked prefix snapshot encode requires a model fingerprint"
         );
         ensure!(
             self.cache_len > 0 && self.kv_capacity >= self.cache_len,
-            "Qwen3.5 prefix snapshot has invalid cache_len/capacity: {}/{}",
+            "Qwen3.5 chunked prefix snapshot has invalid cache_len/capacity: {}/{}",
             self.cache_len,
             self.kv_capacity
         );
         ensure!(
             self.token_ids.len() == self.cache_len as usize,
-            "Qwen3.5 prefix snapshot token count {} does not match cache_len {}",
+            "Qwen3.5 chunked prefix snapshot token count {} does not match cache_len {}",
             self.token_ids.len(),
             self.cache_len
         );
 
-        let mut body = Vec::new();
-        let kv_flat = encode_mlx_array_headers("kv", &self.kv_flat, &mut body)?;
-        let gdr_flat = encode_mlx_array_headers("gdr", &self.gdr_flat, &mut body)?;
+        let disk_cache_len = self.cache_len;
+        let disk_kv_capacity = self.cache_len;
+        let mut parts = Vec::new();
+        let kv_flat =
+            encode_mlx_array_chunk_parts("kv", &self.kv_flat, disk_cache_len, true, &mut parts)?;
+        let gdr_flat =
+            encode_mlx_array_chunk_parts("gdr", &self.gdr_flat, disk_cache_len, false, &mut parts)?;
         let metadata_checksum = qwen35_prefix_snapshot_metadata_checksum(
             model_fingerprint,
             &self.token_ids,
-            self.cache_len,
-            self.kv_capacity,
+            disk_cache_len,
+            disk_kv_capacity,
             &kv_flat,
             &gdr_flat,
         );
-        let body_checksum = blake3::hash(&body).as_bytes().to_vec();
+        let body_checksum = qwen35_chunked_parts_body_checksum(&parts);
         let header = Qwen35PrefixSnapshotHeader {
             model_fingerprint: model_fingerprint.to_vec(),
             token_ids: self.token_ids.clone(),
-            cache_len: self.cache_len,
-            kv_capacity: self.kv_capacity,
+            cache_len: disk_cache_len,
+            kv_capacity: disk_kv_capacity,
             metadata_checksum,
             body_checksum,
             kv_flat,
             gdr_flat,
         };
-        let header_bytes =
-            postcard::to_allocvec(&header).context("encode Qwen3.5 prefix snapshot header")?;
+        let header_bytes = postcard::to_allocvec(&header)
+            .context("encode Qwen3.5 chunked prefix snapshot header")?;
         let header_len = u32::try_from(header_bytes.len())
-            .context("Qwen3.5 prefix snapshot header is too large")?;
+            .context("Qwen3.5 chunked prefix snapshot header is too large")?;
 
-        let mut payload = Vec::with_capacity(
-            QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN + header_bytes.len() + body.len(),
-        );
-        payload.extend_from_slice(&QWEN35_PREFIX_SNAPSHOT_MAGIC);
-        payload.extend_from_slice(&QWEN35_PREFIX_SNAPSHOT_VERSION.to_le_bytes());
-        payload.extend_from_slice(&header_len.to_le_bytes());
-        payload.extend_from_slice(&header_bytes);
-        payload.extend_from_slice(&body);
-        Ok(payload)
+        let mut metadata =
+            Vec::with_capacity(QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN + header_bytes.len());
+        metadata.extend_from_slice(&QWEN35_PREFIX_SNAPSHOT_MAGIC);
+        metadata.extend_from_slice(&QWEN35_PREFIX_SNAPSHOT_VERSION.to_le_bytes());
+        metadata.extend_from_slice(&header_len.to_le_bytes());
+        metadata.extend_from_slice(&header_bytes);
+        let logical_len = parts.iter().try_fold(metadata.len() as u64, |acc, part| {
+            acc.checked_add(part.bytes.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("Qwen3.5 chunked snapshot length overflow"))
+        })?;
+        Ok((metadata, parts, logical_len))
     }
 
-    pub(crate) fn estimated_disk_payload_len(&self, model_fingerprint: &[u8]) -> Result<u64> {
+    pub(crate) fn estimated_chunked_disk_payload_len(
+        &self,
+        model_fingerprint: &[u8],
+    ) -> Result<u64> {
         ensure!(
             !model_fingerprint.is_empty(),
-            "Qwen3.5 prefix snapshot estimate requires a model fingerprint"
+            "Qwen3.5 chunked prefix snapshot estimate requires a model fingerprint"
         );
         ensure!(
             self.cache_len > 0 && self.kv_capacity >= self.cache_len,
-            "Qwen3.5 prefix snapshot has invalid cache_len/capacity: {}/{}",
+            "Qwen3.5 chunked prefix snapshot has invalid cache_len/capacity: {}/{}",
             self.cache_len,
             self.kv_capacity
         );
         ensure!(
             self.token_ids.len() == self.cache_len as usize,
-            "Qwen3.5 prefix snapshot token count {} does not match cache_len {}",
+            "Qwen3.5 chunked prefix snapshot token count {} does not match cache_len {}",
             self.token_ids.len(),
             self.cache_len
         );
 
-        let (kv_flat, kv_bytes) = describe_mlx_array_headers("kv", &self.kv_flat)?;
-        let (gdr_flat, gdr_bytes) = describe_mlx_array_headers("gdr", &self.gdr_flat)?;
+        let disk_cache_len = self.cache_len;
+        let disk_kv_capacity = self.cache_len;
+        let (kv_flat, kv_bytes) =
+            describe_mlx_array_chunk_parts("kv", &self.kv_flat, disk_cache_len, true)?;
+        let (gdr_flat, gdr_bytes) =
+            describe_mlx_array_chunk_parts("gdr", &self.gdr_flat, disk_cache_len, false)?;
         let metadata_checksum = qwen35_prefix_snapshot_metadata_checksum(
             model_fingerprint,
             &self.token_ids,
-            self.cache_len,
-            self.kv_capacity,
+            disk_cache_len,
+            disk_kv_capacity,
             &kv_flat,
             &gdr_flat,
         );
         let header = Qwen35PrefixSnapshotHeader {
             model_fingerprint: model_fingerprint.to_vec(),
             token_ids: self.token_ids.clone(),
-            cache_len: self.cache_len,
-            kv_capacity: self.kv_capacity,
+            cache_len: disk_cache_len,
+            kv_capacity: disk_kv_capacity,
             metadata_checksum,
             body_checksum: vec![0; blake3::OUT_LEN],
             kv_flat,
             gdr_flat,
         };
         let header_bytes = postcard::to_allocvec(&header)
-            .context("encode Qwen3.5 prefix snapshot header estimate")?;
+            .context("encode Qwen3.5 chunked prefix snapshot header estimate")?;
         let fixed_len = u64::try_from(QWEN35_PREFIX_SNAPSHOT_FIXED_HEADER_LEN)
-            .context("Qwen3.5 prefix fixed header length exceeds u64")?;
+            .context("Qwen3.5 chunked prefix fixed header length exceeds u64")?;
         let header_len = u64::try_from(header_bytes.len())
-            .context("Qwen3.5 prefix snapshot header length exceeds u64")?;
+            .context("Qwen3.5 chunked prefix snapshot header length exceeds u64")?;
         fixed_len
             .checked_add(header_len)
             .and_then(|len| len.checked_add(kv_bytes))
             .and_then(|len| len.checked_add(gdr_bytes))
-            .context("Qwen3.5 prefix snapshot estimated payload length overflow")
+            .context("Qwen3.5 chunked prefix snapshot estimated payload length overflow")
     }
 
-    pub(crate) fn decode_from_disk(
-        bytes: &[u8],
+    pub(crate) fn decode_chunked_from_disk(
+        snapshot: ChunkedSnapshotRead,
         expected_model_fingerprint: &[u8],
     ) -> Result<Self> {
-        let (header, body) =
-            decode_qwen35_prefix_snapshot_header(bytes, expected_model_fingerprint, true)?;
+        let (header, _body) = decode_qwen35_prefix_snapshot_header(
+            &snapshot.manifest.metadata,
+            expected_model_fingerprint,
+            false,
+        )?;
+        let mut body = Vec::with_capacity(
+            usize::try_from(snapshot.manifest.payload_len)
+                .context("Qwen3.5 chunked prefix payload length exceeds usize")?,
+        );
+        for part in &snapshot.parts {
+            body.extend_from_slice(&part.bytes);
+        }
+        validate_qwen35_prefix_snapshot_body(&header, &body)?;
         let mut cursor = 0usize;
-        let kv_flat = decode_mlx_array_headers("kv", &header.kv_flat, body, &mut cursor)?;
-        let gdr_flat = decode_mlx_array_headers("gdr", &header.gdr_flat, body, &mut cursor)?;
+        let kv_flat = decode_mlx_array_headers("kv", &header.kv_flat, &body, &mut cursor)?;
+        let gdr_flat = decode_mlx_array_headers("gdr", &header.gdr_flat, &body, &mut cursor)?;
         ensure!(
             cursor == body.len(),
-            "Qwen3.5 prefix snapshot body has {} trailing bytes",
+            "Qwen3.5 chunked prefix snapshot body has {} trailing bytes",
             body.len() - cursor
         );
-
         Ok(Self {
             token_ids: header.token_ids,
             kv_flat,
@@ -477,16 +504,16 @@ impl Qwen35PrefixSnapshot {
         })
     }
 
-    pub(crate) fn peek_disk_token_ids(
-        bytes: &[u8],
+    pub(crate) fn peek_chunked_disk_token_ids(
+        metadata: &[u8],
         expected_model_fingerprint: &[u8],
     ) -> Result<Vec<u32>> {
         let (header, _body) =
-            decode_qwen35_prefix_snapshot_header(bytes, expected_model_fingerprint, false)?;
+            decode_qwen35_prefix_snapshot_header(metadata, expected_model_fingerprint, false)?;
         Ok(header.token_ids)
     }
 
-    pub(crate) fn looks_like_disk_payload(bytes: &[u8]) -> bool {
+    pub(crate) fn looks_like_chunked_metadata(bytes: &[u8]) -> bool {
         bytes.starts_with(&QWEN35_PREFIX_SNAPSHOT_MAGIC)
     }
 }
@@ -700,50 +727,114 @@ fn validate_mlx_array_header_layout(
     Ok(())
 }
 
-fn encode_mlx_array_headers(
+fn encode_mlx_array_chunk_parts(
     prefix: &str,
     arrays: &[MlxArray],
-    body: &mut Vec<u8>,
+    cache_len: i32,
+    trim_kv_capacity: bool,
+    parts: &mut Vec<ChunkedSnapshotPartWrite>,
 ) -> Result<Vec<MlxArrayBytesHeader>> {
     arrays
         .iter()
         .enumerate()
         .map(|(idx, array)| {
-            let bytes = array
+            let name = format!("{prefix}.{idx}");
+            let disk_array = disk_snapshot_array_view(array, cache_len, trim_kv_capacity)
+                .with_context(|| format!("prepare Qwen3.5 chunked prefix array {name}"))?;
+            let bytes = disk_array
                 .to_bytes()
-                .with_context(|| format!("export Qwen3.5 prefix array {prefix}.{idx}"))?;
-            body.extend_from_slice(&bytes);
-            Ok(MlxArrayBytesHeader {
-                name: format!("{prefix}.{idx}"),
-                dtype: array.dtype().to_raw(),
-                shape: array.shape().to_vec(),
+                .with_context(|| format!("export Qwen3.5 chunked prefix array {name}"))?;
+            let header = MlxArrayBytesHeader {
+                name: name.clone(),
+                dtype: disk_array.dtype().to_raw(),
+                shape: disk_array.shape().to_vec(),
                 byte_len: u64::try_from(bytes.len())
-                    .context("Qwen3.5 prefix array byte length exceeds u64")?,
-            })
+                    .context("Qwen3.5 chunked prefix array byte length exceeds u64")?,
+            };
+            parts.push(ChunkedSnapshotPartWrite { name, bytes });
+            Ok(header)
         })
         .collect()
 }
 
-fn describe_mlx_array_headers(
+fn describe_mlx_array_chunk_parts(
     prefix: &str,
     arrays: &[MlxArray],
+    cache_len: i32,
+    trim_kv_capacity: bool,
 ) -> Result<(Vec<MlxArrayBytesHeader>, u64)> {
     let mut total_bytes = 0u64;
     let mut headers = Vec::with_capacity(arrays.len());
     for (idx, array) in arrays.iter().enumerate() {
-        let byte_len = u64::try_from(array.nbytes())
-            .context("Qwen3.5 prefix array byte length exceeds u64")?;
+        let shape = disk_snapshot_array_shape(array, cache_len, trim_kv_capacity)
+            .with_context(|| format!("describe Qwen3.5 chunked prefix array {prefix}.{idx}"))?;
+        let byte_len = mlx_nbytes_for_shape(&shape, array.dtype())?;
         total_bytes = total_bytes
             .checked_add(byte_len)
-            .context("Qwen3.5 prefix array byte length sum overflow")?;
+            .context("Qwen3.5 chunked prefix array byte length sum overflow")?;
         headers.push(MlxArrayBytesHeader {
             name: format!("{prefix}.{idx}"),
             dtype: array.dtype().to_raw(),
-            shape: array.shape().to_vec(),
+            shape,
             byte_len,
         });
     }
     Ok((headers, total_bytes))
+}
+
+fn disk_snapshot_array_view(
+    array: &MlxArray,
+    cache_len: i32,
+    trim_kv_capacity: bool,
+) -> Result<MlxArray> {
+    let shape = disk_snapshot_array_shape(array, cache_len, trim_kv_capacity)?;
+    if shape == array.shape() {
+        return Ok(array.clone());
+    }
+    let start = vec![0; shape.len()];
+    let strides = vec![1; shape.len()];
+    Ok(slice(array, &start, &shape, &strides))
+}
+
+fn disk_snapshot_array_shape(
+    array: &MlxArray,
+    cache_len: i32,
+    trim_kv_capacity: bool,
+) -> Result<Vec<i32>> {
+    ensure!(
+        cache_len > 0,
+        "Qwen3.5 chunked prefix snapshot requires positive cache_len"
+    );
+    let mut shape = array.shape().to_vec();
+    if trim_kv_capacity && shape.len() == 4 {
+        ensure!(
+            shape[2] >= cache_len,
+            "Qwen3.5 KV array shape {:?} is shorter than cache_len {}",
+            shape,
+            cache_len
+        );
+        shape[2] = cache_len;
+    }
+    Ok(shape)
+}
+
+fn mlx_nbytes_for_shape(shape: &[i32], dtype: super::mlx::Dtype) -> Result<u64> {
+    let elements = shape.iter().try_fold(1u64, |acc, &dim| {
+        ensure!(dim >= 0, "MLX shape contains negative dim: {shape:?}");
+        acc.checked_mul(dim as u64)
+            .context("MLX shape byte length overflow")
+    })?;
+    elements
+        .checked_mul(dtype.byte_size() as u64)
+        .context("MLX shape byte length overflow")
+}
+
+fn qwen35_chunked_parts_body_checksum(parts: &[ChunkedSnapshotPartWrite]) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(&part.bytes);
+    }
+    hasher.finalize().as_bytes().to_vec()
 }
 
 fn decode_mlx_array_headers(

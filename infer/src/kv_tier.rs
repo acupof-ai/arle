@@ -133,12 +133,14 @@ pub mod backend;
 pub mod chunk;
 #[allow(clippy::match_same_arms)]
 pub mod coordinator;
+pub mod crc32c;
 pub mod host_pool;
 pub mod id;
 pub mod io;
 pub mod lookup;
 pub mod policy;
 pub mod readmission;
+pub mod snapshot_store;
 pub mod tier;
 pub mod transport;
 
@@ -182,5 +184,10 @@ pub use io::{
 pub use lookup::{HitKind, LookupBlock, LookupHeuristics, LookupOutcome};
 pub use policy::{PrefetchPolicy, WritePolicy};
 pub use readmission::{ReadmissionBlock, ReadmissionKey, ReadmissionPlan, ReadmissionSource};
+pub use snapshot_store::{
+    ChunkedSnapshotChunkRef, ChunkedSnapshotLocation, ChunkedSnapshotManifest,
+    ChunkedSnapshotPartManifest, ChunkedSnapshotPartRead, ChunkedSnapshotPartWrite,
+    ChunkedSnapshotPutStats, ChunkedSnapshotRead, ChunkedSnapshotStore, ChunkedSnapshotWrite,
+};
 pub use tier::{BlockLocation, MemKind, RemoteBlockDesc, Tier, TransportId};
 pub use transport::{DiskStore, KVTransport, SharedFsStore, TransferOp, TransportError};
