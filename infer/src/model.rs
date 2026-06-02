@@ -180,6 +180,19 @@ pub struct SpecVerifyOutput {
     pub target_argmax_tokens: Vec<u32>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct InternalMtpDraftRequest {
+    pub slot_idx: usize,
+    pub last_token: u32,
+    pub max_draft_tokens: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct InternalMtpDraftOutput {
+    pub slot_idx: usize,
+    pub draft_tokens: Vec<u32>,
+}
+
 /// One sparse-KV draft attention view for MagicDec-style self speculation.
 ///
 /// `page_ids` are physical paged-KV page IDs selected by the scheduler. Model
@@ -465,6 +478,22 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         anyhow::bail!("model does not support sparse-KV draft decode")
     }
 
+    /// Draft tokens from an internal MTP/EAGLE head using the target model's
+    /// frozen KV context.
+    ///
+    /// This is intentionally separate from `SelfSpec`: DSv4's SGLang-aligned
+    /// path uses checkpoint `mtp.N` weights and frozen target KV, while
+    /// `SelfSpec` is reserved for sparse-KV/MagicDec-style approximation.
+    fn forward_internal_mtp_draft_batch(
+        &self,
+        _requests: &[InternalMtpDraftRequest],
+        _states: &mut [Self::State],
+        _pool: &mut PagedKVPool,
+        _decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<Vec<InternalMtpDraftOutput>> {
+        anyhow::bail!("model does not support internal MTP draft decode")
+    }
+
     /// Convenience: dispatch to prefill or decode based on token count.
     /// Callers that know the phase should use `forward_prefill`/`forward_decode` directly.
     fn forward(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
@@ -547,6 +576,15 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
     /// the CUDA context before HTTP readiness opens.
     fn supports_decode_warmup(&self) -> bool {
         true
+    }
+
+    /// Startup contract for `--spec-draft-model internal-mtp` / `eagle`.
+    ///
+    /// Construction calls this before serving opens so unsupported models fail
+    /// with a visible message instead of silently decoding on the slow target-only
+    /// path.
+    fn validate_internal_mtp_draft_support(&self) -> Result<()> {
+        anyhow::bail!("model does not support internal MTP draft decode")
     }
 
     /// Batched sampling: launch all sampling kernels, sync once, readback all.

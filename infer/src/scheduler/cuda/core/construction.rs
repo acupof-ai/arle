@@ -108,6 +108,26 @@ impl<M: ModelForward> Scheduler<M> {
             kv_pool_format,
             config.cuda_graph_max_bs,
         )?;
+        if config.spec_enabled
+            && matches!(
+                config.spec_draft_model,
+                crate::scheduler::DraftMode::InternalMtp
+            )
+        {
+            model.validate_internal_mtp_draft_support()?;
+            info!(
+                "Speculative decode internal MTP/EAGLE enabled: draft_k={} acceptance_threshold={:.3}",
+                config.spec_draft_k, config.spec_acceptance_threshold,
+            );
+        } else {
+            info!(
+                "Speculative decode config: enabled={} draft_model={:?} draft_k={} acceptance_threshold={:.3}",
+                config.spec_enabled,
+                config.spec_draft_model,
+                config.spec_draft_k,
+                config.spec_acceptance_threshold,
+            );
+        }
 
         // When the model writes prefill K/V directly to the paged pool, the
         // per-slot contiguous scratch buffer is unused by prefill. Shrink it
