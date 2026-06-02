@@ -686,7 +686,7 @@ impl ModelForward for DeepseekModel {
                 .to_string(),
         );
         missing.push(
-            "DSv4 batched decode attention still loops per row with host-selected per-slot/per-layer cache planning"
+            "DSv4 decode attention cache/metadata core still loops per row with host-selected per-slot/per-layer planning; Q/K/V projections are batched"
                 .to_string(),
         );
 
