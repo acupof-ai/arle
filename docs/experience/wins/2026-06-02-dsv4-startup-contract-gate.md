@@ -167,6 +167,15 @@ serve on the replicated-token debug lane and still look like a performance run.
   `coordinator_dispatches_worker_completion_to_registered_sink`, and the
   request-handle test set now includes
   `distributed_group_token_owned_relay_routes_remote_owner_output`.
+- PC2 remote-owner output remote gate at `d5ac7262`: remote source
+  fast-forwarded cleanly from GitHub to the same HEAD. `RUSTUP_TOOLCHAIN=stable
+  bash scripts/dsv4_fast_build.sh` used the DSv4 prebuilt CUDA artifacts,
+  skipped nvcc/TileLang AOT, harvested the cache again, and finished in
+  23.78 s. Remote CUDA/NCCL unit gates passed:
+  `cargo test -p infer --lib --no-default-features --features cuda,nccl multiproc_relay -- --nocapture`
+  passed 4/4, and
+  `cargo test -p infer --lib --no-default-features --features cuda,nccl request_handle -- --nocapture`
+  passed 12/12.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.
