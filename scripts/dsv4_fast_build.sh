@@ -191,6 +191,9 @@ resolve_deepgemm_env
 
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 export ARLE_CUDA_KERNEL_SET="${ARLE_CUDA_KERNEL_SET:-dsv4_flash}"
+if [[ "$ARLE_CUDA_KERNEL_SET" == "dsv4_flash" ]]; then
+    export ARLE_CUDA_ENABLE_FLASHMLA_DECODE="${ARLE_CUDA_ENABLE_FLASHMLA_DECODE:-1}"
+fi
 export ARLE_NVCC_SPLIT_COMPILE="${ARLE_NVCC_SPLIT_COMPILE:-8}"
 
 if prebuilt_ready; then
