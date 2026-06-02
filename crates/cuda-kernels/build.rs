@@ -1704,6 +1704,7 @@ fn main() {
     // PyTorch bridge; it selects the native raw-pointer DeepGEMM bridge.
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_DEEPGEMM_TORCH");
     println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_ROOT");
+    println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_CUTLASS_INCLUDE");
     let enable_deepgemm_native =
         env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE") || env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_TORCH");
     let deepgemm_root = std::env::var("ARLE_DEEPGEMM_ROOT")
@@ -1717,6 +1718,28 @@ fn main() {
             .join(deepgemm_root)
     };
     let deepgemm_library_root = deepgemm_root.join("deep_gemm");
+    let deepgemm_cutlass_include = std::env::var("ARLE_DEEPGEMM_CUTLASS_INCLUDE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let bundled = deepgemm_root.join("third-party/cutlass/include");
+            if bundled.join("cutlass/arch/barrier.h").is_file() {
+                bundled
+            } else {
+                let flashmla_cutlass = flashmla_root.join("csrc/cutlass/include");
+                if flashmla_cutlass.join("cutlass/arch/barrier.h").is_file() {
+                    flashmla_cutlass
+                } else {
+                    bundled
+                }
+            }
+        });
+    let deepgemm_cutlass_include = if deepgemm_cutlass_include.is_absolute() {
+        deepgemm_cutlass_include
+    } else {
+        std::env::current_dir()
+            .expect("failed to resolve cuda-kernels build cwd")
+            .join(deepgemm_cutlass_include)
+    };
     let ccbin = std::env::var("NVCC_CCBIN").ok();
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_MARLIN_W4_FP8");
     let legacy_volta_build = has_legacy_volta(&sm_targets);
@@ -1775,10 +1798,7 @@ fn main() {
                 format!("-I{}/include", cuda_path),
                 format!("-I{}", deepgemm_root.join("csrc").display()),
                 format!("-I{}", deepgemm_library_root.join("include").display()),
-                format!(
-                    "-I{}",
-                    deepgemm_root.join("third-party/cutlass/include").display()
-                ),
+                format!("-I{}", deepgemm_cutlass_include.display()),
                 format!(
                     "-I{}",
                     deepgemm_root.join("third-party/fmt/include").display()
@@ -1788,6 +1808,10 @@ fn main() {
                     deepgemm_library_root.display()
                 ),
                 format!("-DARLE_DEEPGEMM_DEFAULT_CUDA_HOME=\"{}\"", cuda_path),
+                format!(
+                    "-DARLE_DEEPGEMM_DEFAULT_CUTLASS_INCLUDE=\"{}\"",
+                    deepgemm_cutlass_include.display()
+                ),
             ]);
         }
 
