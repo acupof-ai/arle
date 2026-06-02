@@ -297,8 +297,14 @@ impl DraftEngine {
             draft_tokens,
         };
 
-        let outputs =
-            target_model.forward_spec_verify_batch(&[request], target_states, target_pool)?;
+        let mut decode_ctx =
+            target_model.create_decode_context(target_states.len(), None, target_pool)?;
+        let outputs = target_model.forward_spec_verify_batch(
+            &[request],
+            target_states,
+            target_pool,
+            &mut decode_ctx,
+        )?;
 
         outputs
             .into_iter()

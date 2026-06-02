@@ -307,6 +307,7 @@ impl ModelForward for DeepseekModel {
         requests: &[SpecVerifyRequest<'_>],
         states: &mut [Self::State],
         pool: &mut PagedKVPool,
+        decode_ctx: &mut Self::DecodeContext,
     ) -> Result<Vec<SpecVerifyOutput>> {
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -322,33 +323,6 @@ impl ModelForward for DeepseekModel {
                 request.slot_idx,
                 states.len()
             );
-        }
-
-        let max_seq_len = requests
-            .iter()
-            .map(|request| states[request.slot_idx].base.kv_cache.max_seq_len())
-            .max();
-        let mut decode_ctx = self.create_decode_context(requests.len(), max_seq_len, pool)?;
-        if let Some(max_seq_len) = decode_ctx.fp8_kv_max_seq_len() {
-            let num_layers = self.loaded_layer_count();
-            for request in requests {
-                let state = &mut states[request.slot_idx];
-                state.incremental.ensure_layers(num_layers);
-                for layer_idx in 0..num_layers {
-                    let layer_cache = state
-                        .incremental
-                        .layers
-                        .get_mut(layer_idx)
-                        .expect("incremental cache layer initialized");
-                    self.bind_fp8_kv_pool_view(
-                        &mut decode_ctx,
-                        &mut layer_cache.attention,
-                        request.slot_idx,
-                        layer_idx,
-                        max_seq_len,
-                    )?;
-                }
-            }
         }
 
         for request in requests {
@@ -396,7 +370,7 @@ impl ModelForward for DeepseekModel {
                 states,
                 &slot_indices,
                 Some(pool),
-                &mut decode_ctx,
+                decode_ctx,
                 false,
             )?;
             for (idx, &slot_idx) in output_indices.iter().zip(&slot_indices) {

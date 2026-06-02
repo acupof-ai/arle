@@ -883,6 +883,7 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
         _requests: &[SpecVerifyRequest<'_>],
         _states: &mut [Self::State],
         _pool: &mut PagedKVPool,
+        _decode_ctx: &mut Self::DecodeContext,
     ) -> Result<Vec<SpecVerifyOutput>> {
         anyhow::bail!("model does not support speculative verifier batch")
     }

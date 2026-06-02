@@ -215,10 +215,31 @@ impl SpecPath {
                 draft_tokens: &row.draft_tokens,
             })
             .collect();
+        if scheduler.decode_bufs.is_none() {
+            match scheduler.model.create_decode_context(
+                scheduler.states.len(),
+                scheduler.effective_max_seq_len,
+                &scheduler.paged_kv_pool,
+            ) {
+                Ok(ctx) => scheduler.decode_bufs = Some(ctx),
+                Err(err) => {
+                    log::warn!("spec verifier decode context init failed: {err}");
+                    release_draft_states(scheduler, &rows, None);
+                    scheduler.step_decode_launch();
+                    return;
+                }
+            }
+        }
+        let Some(decode_ctx) = scheduler.decode_bufs.as_mut() else {
+            release_draft_states(scheduler, &rows, None);
+            scheduler.step_decode_launch();
+            return;
+        };
         let outputs = match scheduler.model.forward_spec_verify_batch(
             &verify_requests,
             &mut scheduler.states,
             &mut scheduler.paged_kv_pool,
+            decode_ctx,
         ) {
             Ok(outputs) => outputs,
             Err(err) => {
@@ -721,10 +742,34 @@ fn verify_and_commit_rows<M: ModelForward>(
             draft_tokens: &row.draft_tokens,
         })
         .collect();
+    if scheduler.decode_bufs.is_none() {
+        match scheduler.model.create_decode_context(
+            scheduler.states.len(),
+            scheduler.effective_max_seq_len,
+            &scheduler.paged_kv_pool,
+        ) {
+            Ok(ctx) => scheduler.decode_bufs = Some(ctx),
+            Err(err) => {
+                log::warn!("spec verifier decode context init failed: {err}");
+                for row in &rows {
+                    let _ = scheduler
+                        .paged_kv_pool
+                        .truncate_slot(row.slot_idx, row.original_target_len);
+                }
+                scheduler.step_decode_launch();
+                return;
+            }
+        }
+    }
+    let Some(decode_ctx) = scheduler.decode_bufs.as_mut() else {
+        scheduler.step_decode_launch();
+        return;
+    };
     let outputs = match scheduler.model.forward_spec_verify_batch(
         &verify_requests,
         &mut scheduler.states,
         &mut scheduler.paged_kv_pool,
+        decode_ctx,
     ) {
         Ok(outputs) => outputs,
         Err(err) => {

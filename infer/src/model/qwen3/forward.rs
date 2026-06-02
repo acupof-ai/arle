@@ -742,6 +742,7 @@ impl ModelForward for Qwen3Model {
         requests: &[SpecVerifyRequest<'_>],
         states: &mut [Self::State],
         pool: &mut PagedKVPool,
+        decode_ctx: &mut Self::DecodeContext,
     ) -> Result<Vec<SpecVerifyOutput>> {
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -765,7 +766,6 @@ impl ModelForward for Qwen3Model {
             .map(|request| request.input_tokens.len())
             .max()
             .unwrap_or(0);
-        let mut decode_ctx = self.create_decode_context(requests.len(), None, pool)?;
         let greedy = SamplingParams::default();
         let mut rng = StdRng::seed_from_u64(0x5eec_dec0de);
 
@@ -788,7 +788,7 @@ impl ModelForward for Qwen3Model {
                 states,
                 &slot_indices,
                 Some(pool),
-                &mut decode_ctx,
+                decode_ctx,
                 false,
             )?;
             for (idx, &slot_idx) in output_indices.iter().zip(&slot_indices) {
