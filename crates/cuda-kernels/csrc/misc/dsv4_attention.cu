@@ -282,6 +282,88 @@ __global__ void dsv4_prepare_qk_fused_kernel(
   }
 }
 
+__global__ void dsv4_prepare_qk_fused_batch_start_pos_kernel(
+    const uint16_t *__restrict__ q_raw,
+    const uint16_t *__restrict__ k_raw,
+    uint16_t *__restrict__ q_out,
+    uint16_t *__restrict__ k_out,
+    int num_tokens,
+    int local_heads,
+    int head_dim,
+    int rope_dim,
+    const int *__restrict__ start_pos,
+    float rms_eps,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow) {
+  int row = blockIdx.x;
+  int q_rows = num_tokens * local_heads;
+  if (row < q_rows) {
+    int token = row / local_heads;
+    int head = row - token * local_heads;
+    int local_width = local_heads * head_dim;
+    int base = token * local_width + head * head_dim;
+    int abs_pos = start_pos[token];
+
+    float sumsq = 0.0f;
+    for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
+      float value = dsv4_attn_bf16_to_f32(q_raw[base + col]);
+      sumsq += value * value;
+    }
+    sumsq = dsv4_attn_block_sum(sumsq);
+    __shared__ float scale;
+    if (threadIdx.x == 0) {
+      scale = rsqrtf(sumsq / fmaxf((float)head_dim, 1.0f) + rms_eps);
+    }
+    __syncthreads();
+
+    int rope_start = head_dim - rope_dim;
+    for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
+      float value = dsv4_attn_bf16_to_f32(q_raw[base + col]) * scale;
+      if (rope_dim > 0 && col >= rope_start) {
+        int local = col - rope_start;
+        int pair = local / 2;
+        int pair_col = rope_start + pair * 2;
+        float a = dsv4_attn_bf16_to_f32(q_raw[base + pair_col]) * scale;
+        float b = dsv4_attn_bf16_to_f32(q_raw[base + pair_col + 1]) * scale;
+        float out_a;
+        float out_b;
+        dsv4_apply_rope_pair(
+            a, b, pair, abs_pos, rope_dim, rope_base, original_seq_len,
+            factor, beta_fast, beta_slow, 1.0f, &out_a, &out_b);
+        value = (local & 1) == 0 ? out_a : out_b;
+      }
+      q_out[base + col] = dsv4_attn_f32_to_bf16_bits(value);
+    }
+    return;
+  }
+
+  int token = row - q_rows;
+  if (token >= num_tokens) return;
+  int base = token * head_dim;
+  int abs_pos = start_pos[token];
+  int rope_start = head_dim - rope_dim;
+  for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
+    float value = dsv4_attn_bf16_to_f32(k_raw[base + col]);
+    if (rope_dim > 0 && col >= rope_start) {
+      int local = col - rope_start;
+      int pair = local / 2;
+      int pair_col = rope_start + pair * 2;
+      float a = dsv4_attn_bf16_to_f32(k_raw[base + pair_col]);
+      float b = dsv4_attn_bf16_to_f32(k_raw[base + pair_col + 1]);
+      float out_a;
+      float out_b;
+      dsv4_apply_rope_pair(
+          a, b, pair, abs_pos, rope_dim, rope_base, original_seq_len,
+          factor, beta_fast, beta_slow, 1.0f, &out_a, &out_b);
+      value = (local & 1) == 0 ? out_a : out_b;
+    }
+    k_out[base + col] = dsv4_attn_f32_to_bf16_bits(value);
+  }
+}
+
 extern "C" CUresult dsv4_prepare_qk_cuda(
     const uint16_t *q_raw,
     const uint16_t *k_raw,
@@ -404,6 +486,36 @@ extern "C" CUresult dsv4_prepare_qk_fused_start_pos_ptr_cuda(
   dsv4_prepare_qk_fused_kernel<<<rows, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
       q_raw, k_raw, q_out, k_out, num_tokens, local_heads, head_dim, rope_dim,
       0, start_pos_ptr, rms_eps, rope_base, original_seq_len, factor, beta_fast,
+      beta_slow);
+  return (CUresult)cudaGetLastError();
+}
+
+extern "C" CUresult dsv4_prepare_qk_fused_batch_start_pos_cuda(
+    const uint16_t *q_raw,
+    const uint16_t *k_raw,
+    uint16_t *q_out,
+    uint16_t *k_out,
+    int num_tokens,
+    int local_heads,
+    int head_dim,
+    int rope_dim,
+    const int *start_pos,
+    float rms_eps,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow,
+    CUstream stream) {
+  if (num_tokens < 0 || local_heads <= 0 || head_dim <= 0 || rope_dim < 0 ||
+      rope_dim > head_dim || start_pos == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (num_tokens == 0) return CUDA_SUCCESS;
+  int rows = num_tokens * (local_heads + 1);
+  dsv4_prepare_qk_fused_batch_start_pos_kernel<<<rows, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
+      q_raw, k_raw, q_out, k_out, num_tokens, local_heads, head_dim, rope_dim,
+      start_pos, rms_eps, rope_base, original_seq_len, factor, beta_fast,
       beta_slow);
   return (CUresult)cudaGetLastError();
 }
@@ -1193,6 +1305,41 @@ __global__ void dsv4_output_inverse_rope_kernel(
   out[base + pair_col + 1] = dsv4_attn_f32_to_bf16_bits(out_b);
 }
 
+__global__ void dsv4_output_inverse_rope_batch_start_pos_kernel(
+    uint16_t *__restrict__ out,
+    int token_count,
+    int local_heads,
+    int head_dim,
+    int rope_dim,
+    const int *__restrict__ start_pos,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow) {
+  int row = blockIdx.x;
+  if (row >= token_count * local_heads) return;
+  int token = row / local_heads;
+  int head = row - token * local_heads;
+  int local_width = local_heads * head_dim;
+  int abs_pos = start_pos[token];
+  int rope_start = head_dim - rope_dim;
+  int base = token * local_width + head * head_dim;
+
+  int pair = threadIdx.x;
+  if (pair >= rope_dim / 2) return;
+  int pair_col = rope_start + pair * 2;
+  float a = dsv4_attn_bf16_to_f32(out[base + pair_col]);
+  float b = dsv4_attn_bf16_to_f32(out[base + pair_col + 1]);
+  float out_a;
+  float out_b;
+  dsv4_apply_rope_pair(
+      a, b, pair, abs_pos, rope_dim, rope_base, original_seq_len, factor,
+      beta_fast, beta_slow, -1.0f, &out_a, &out_b);
+  out[base + pair_col] = dsv4_attn_f32_to_bf16_bits(out_a);
+  out[base + pair_col + 1] = dsv4_attn_f32_to_bf16_bits(out_b);
+}
+
 extern "C" cudaError_t arle_dsv4_output_inverse_rope_cuda(
     uint16_t *out,
     int token_count,
@@ -1241,6 +1388,32 @@ extern "C" cudaError_t arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
   if (out == nullptr) return cudaErrorInvalidValue;
   dsv4_output_inverse_rope_kernel<<<token_count * local_heads, rope_dim / 2, 0, stream>>>(
       out, token_count, local_heads, head_dim, rope_dim, 0, start_pos_ptr, rope_base,
+      original_seq_len, factor, beta_fast, beta_slow);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
+    uint16_t *out,
+    int token_count,
+    int local_heads,
+    int head_dim,
+    int rope_dim,
+    const int *start_pos,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow,
+    cudaStream_t stream) {
+  if (token_count < 0 || local_heads <= 0 || head_dim <= 0 ||
+      head_dim > DSV4_ATTN_MAX_HEAD_DIM || rope_dim < 0 || rope_dim > head_dim ||
+      start_pos == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  if (token_count == 0 || rope_dim == 0) return cudaSuccess;
+  if (out == nullptr) return cudaErrorInvalidValue;
+  dsv4_output_inverse_rope_batch_start_pos_kernel<<<token_count * local_heads, rope_dim / 2, 0, stream>>>(
+      out, token_count, local_heads, head_dim, rope_dim, start_pos, rope_base,
       original_seq_len, factor, beta_fast, beta_slow);
   return cudaGetLastError();
 }
