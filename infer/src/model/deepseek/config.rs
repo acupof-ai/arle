@@ -132,10 +132,11 @@ impl DeepseekRuntimeConfig {
         dsv4_performance_profile_from_env()
     }
 
-    /// Fail closed for explicit SGLang-path claims. This is intentionally
-    /// stricter than the default path because ARLE does not yet wire the full
-    /// SGLang DP-owner request topology, owner-group communicators, or batched
-    /// FlashMLA attention into serving.
+    /// Fail closed for explicit SGLang-path claims at config-load time.
+    ///
+    /// This checks only static env/topology prerequisites. Runtime contracts
+    /// that require loaded model state, scheduler knobs, or graph capability are
+    /// validated later by the serving startup path.
     pub fn validate_sglang_path_claim(&self, worker_count: Option<usize>) -> Result<()> {
         let profile = self.performance_profile()?;
         if !profile.requires_best_practice() {
@@ -165,32 +166,18 @@ impl DeepseekRuntimeConfig {
         if !dsv4_env_flag_enabled("ARLE_DSV4_SHARED_KV_POOL")? {
             missing.push("ARLE_DSV4_SHARED_KV_POOL=1 (persistent paged FP8 KV pool)".to_string());
         }
-        missing.push(
-            "serving startup still selects the replicated-token request lane; token-owned owner-group relay is guarded and not selected by DSv4 startup".to_string(),
-        );
-        missing.push(
-            "axis-derived owner-group request token-sync NCCL communicators are not wired for the SGLang DP/attention topology".to_string(),
-        );
-        missing.push(
-            "token-owned relay output return exists on the control plane, but DSv4 startup/data-plane still does not select it".to_string(),
-        );
-        missing.push(
-            "DeepSeek decode attention still loops per row in forward_decode_batch; batched FlashMLA with SGLang sparse/recent indices is not wired".to_string(),
-        );
-        missing.push(
-            "DSv4 graph-captured SWA/C4/C128 metadata replay is not wired into CUDA graph capture"
-                .to_string(),
-        );
-
-        bail!(
-            "DeepSeek V4 profile `{}` requested, but the DSv4 SGLang best-practice contract is incomplete:\n - {}\nSet ARLE_DSV4_PERFORMANCE_PROFILE=debug-fallback to run the current replicated-token debug lane.",
-            profile.as_str(),
-            missing.join("\n - ")
-        );
+        if !missing.is_empty() {
+            bail!(
+                "DeepSeek V4 profile `{}` requested, but the DSv4 SGLang best-practice static contract is incomplete:\n - {}\nSet ARLE_DSV4_PERFORMANCE_PROFILE=debug-fallback to run the current replicated-token debug lane.",
+                profile.as_str(),
+                missing.join("\n - ")
+            );
+        }
+        Ok(())
     }
 }
 
-fn dsv4_performance_profile_from_env() -> Result<DeepseekPerformanceProfile> {
+pub fn dsv4_performance_profile_from_env() -> Result<DeepseekPerformanceProfile> {
     if let Some(raw) = std::env::var("ARLE_DSV4_PERFORMANCE_PROFILE").ok() {
         return match raw.trim().to_ascii_lowercase().as_str() {
             "" | "debug" | "debug-fallback" | "fallback" | "replicated-token"
