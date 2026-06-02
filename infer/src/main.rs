@@ -501,11 +501,13 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                                 }
                             })
                             .ok();
-                        let mut req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
+                        let req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
                             wire,
                             delta_tx,
                             DistributedRequestShard::replicated_token(rank, world_size),
                         );
+                        #[cfg(feature = "nccl")]
+                        let mut req = req;
                         // Phase B-1 commit C.4.6.4 — attach NCCL-backed
                         // DistributedRequestCoordination so worker rank R's
                         // synchronize_token participates in the cross-rank
@@ -545,6 +547,107 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    Some(RelayEnvelope::RequestOwned {
+                        wire,
+                        shard_rank,
+                        shard_world_size,
+                        emits_visible_output,
+                    }) => {
+                        count += 1;
+                        let req_id = wire.request_id;
+                        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<
+                            infer::server_engine::CompletionStreamDelta,
+                        >();
+                        let mut output_relay = if emits_visible_output {
+                            Some(relay.try_clone()?)
+                        } else {
+                            None
+                        };
+                        std::thread::Builder::new()
+                            .name(format!("arle-worker-rank{rank}-owned-delta-drain"))
+                            .spawn(move || {
+                                while let Some(delta) = delta_rx.blocking_recv() {
+                                    let done =
+                                        delta.finish_reason.is_some() || delta.error.is_some();
+                                    if let Some(relay) = output_relay.as_mut() {
+                                        if relay
+                                            .send(&RelayEnvelope::Completion {
+                                                request_id: req_id,
+                                                delta,
+                                            })
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    } else if done {
+                                        break;
+                                    }
+                                    if done {
+                                        break;
+                                    }
+                                }
+                            })
+                            .ok();
+                        let req = infer::request_handle::DistributedSchedulerGroup::incoming_request_from_wire(
+                            wire,
+                            delta_tx,
+                            DistributedRequestShard::token_owned_dp_ep(
+                                shard_rank,
+                                shard_world_size,
+                                emits_visible_output,
+                            ),
+                        );
+                        #[cfg(feature = "nccl")]
+                        let mut req = req;
+                        #[cfg(feature = "nccl")]
+                        if shard_world_size == world_size {
+                            if let Some(nccl) = handle.ep_nccl() {
+                                match infer::scheduler::DistributedRequestCoordination::new_nccl(
+                                    rank, world_size, nccl,
+                                ) {
+                                    Ok(coord) => req.distributed = Some(coord),
+                                    Err(err) => {
+                                        log::warn!(
+                                            "[arle-worker rank={rank}] new_nccl failed for token-owned req#{req_id}: {err:#}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "nccl"))]
+                        let _ = world_size;
+                        match handle.reserve_submission() {
+                            Ok(permit) => {
+                                if let Err(failure) = permit.submit(req) {
+                                    log::warn!(
+                                        "[arle-worker rank={rank}] submit failed for token-owned req#{req_id}"
+                                    );
+                                    let failed_req = failure.into_request();
+                                    let _ = failed_req.delta_tx.send(
+                                        infer::server_engine::CompletionStreamDelta::error(
+                                            "scheduler_submit_failed",
+                                            vec![format!(
+                                                "worker rank {rank} submit failed for token-owned req#{req_id}"
+                                            )],
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                log::warn!(
+                                    "[arle-worker rank={rank}] reserve_submission failed for token-owned req#{req_id}"
+                                );
+                                let _ = req.delta_tx.send(
+                                    infer::server_engine::CompletionStreamDelta::error(
+                                        "scheduler_full",
+                                        vec![format!(
+                                            "worker rank {rank} reserve_submission failed for token-owned req#{req_id}"
+                                        )],
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     Some(RelayEnvelope::Request { request_id, .. }) => {
                         // Legacy boot-ping envelope (C.3). Just log.
                         log::debug!(
@@ -554,6 +657,11 @@ fn run_worker_mode(args: &Args, rank: usize) -> anyhow::Result<()> {
                     Some(RelayEnvelope::WorkerHello { .. }) => {
                         log::warn!(
                             "[arle-worker rank={rank}] unexpected worker hello after relay accept"
+                        );
+                    }
+                    Some(RelayEnvelope::Completion { request_id, .. }) => {
+                        log::warn!(
+                            "[arle-worker rank={rank}] unexpected completion envelope request_id={request_id}"
                         );
                     }
                     Some(RelayEnvelope::Shutdown) => {

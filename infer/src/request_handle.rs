@@ -358,6 +358,49 @@ impl DistributedSchedulerGroup {
         }
     }
 
+    pub fn with_relay_token_owner_groups(
+        workers: Vec<NumaSchedulerWorker>,
+        metrics: crate::metrics::ServerMetrics,
+        relay: Arc<Mutex<crate::multiproc_relay::RelayCoordinator>>,
+        effective_world_size: usize,
+        token_owner_groups: Vec<Vec<usize>>,
+    ) -> Self {
+        assert!(
+            !workers.is_empty(),
+            "distributed scheduler group requires at least one worker"
+        );
+        assert!(
+            effective_world_size >= workers.len(),
+            "effective_world_size {} cannot be less than local workers.len() {}",
+            effective_world_size,
+            workers.len()
+        );
+        let token_owner_groups =
+            Self::validate_token_owner_groups(token_owner_groups, effective_world_size);
+        let model_id = Arc::from(workers[0].handle.model_id());
+        let tokenizer = workers[0].handle.tokenizer_clone();
+        log::info!(
+            "Distributed scheduler request ownership: mode={} local_workers={} effective_world_size={} relay=true token_owner_groups={}",
+            DistributedRequestOwnership::TokenOwnedDpEp.as_str(),
+            workers.len(),
+            effective_world_size,
+            token_owner_groups.len(),
+        );
+        Self {
+            workers,
+            model_id,
+            tokenizer,
+            metrics,
+            submission_lock: Mutex::new(()),
+            relay: Some(relay),
+            effective_world_size,
+            request_ownership: DistributedRequestOwnership::TokenOwnedDpEp,
+            token_owner_groups,
+            next_token_owner_group: std::sync::atomic::AtomicUsize::new(0),
+            next_request_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
     fn clone_request_for_rank(
         req: &IncomingRequest,
         delta_tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
@@ -539,7 +582,12 @@ impl DistributedSchedulerGroup {
                 let group_idx = (start + offset) % len;
                 let waiting = self.token_owner_groups[group_idx]
                     .iter()
-                    .map(|&rank| self.workers[rank].handle.waiting_count())
+                    .map(|&rank| {
+                        self.workers
+                            .get(rank)
+                            .map(|worker| worker.handle.waiting_count())
+                            .unwrap_or(0)
+                    })
                     .sum::<usize>();
                 (waiting, offset, group_idx)
             })
@@ -551,13 +599,9 @@ impl DistributedSchedulerGroup {
             .collect())
     }
 
-    fn submit_token_owned_in_process(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+    fn submit_token_owned(&self, req: IncomingRequest) -> Result<(), SubmitError> {
         if self.relay.is_some() {
-            log::error!(
-                "Distributed scheduler request ownership mode={} requires targeted DP-owner relay, but current relay only supports broadcast-all",
-                self.request_ownership.as_str()
-            );
-            return Err(SubmitError);
+            return self.submit_token_owned_relay(req);
         }
 
         let _submission_guard = self
@@ -635,6 +679,93 @@ impl DistributedSchedulerGroup {
         }
         Ok(())
     }
+
+    fn submit_token_owned_relay(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+        let _submission_guard = self
+            .submission_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut selected_group = None;
+        let mut selected_local_permits = Vec::new();
+        for group_idx in self.token_owner_group_order()? {
+            let owner_ranks = &self.token_owner_groups[group_idx];
+            let mut permits = Vec::new();
+            let mut reserve_failed = false;
+            for &rank in owner_ranks {
+                let Some(worker) = self.workers.get(rank) else {
+                    continue;
+                };
+                match worker.handle.reserve_submission() {
+                    Ok(permit) => permits.push((rank, permit)),
+                    Err(_) => {
+                        reserve_failed = true;
+                        break;
+                    }
+                }
+            }
+            if reserve_failed {
+                continue;
+            }
+            selected_group = Some(group_idx);
+            selected_local_permits = permits;
+            break;
+        }
+
+        let Some(group_idx) = selected_group else {
+            return Err(SubmitError);
+        };
+        let owner_ranks = &self.token_owner_groups[group_idx];
+        if owner_ranks.len() > 1 {
+            log::error!(
+                "Distributed scheduler request ownership mode={} selected owner group {:?}, \
+                 but multiproc token-owned execution still lacks owner-group NCCL/token-sync \
+                 subgroup communicators. Refusing to run a partial SGLang path.",
+                self.request_ownership.as_str(),
+                owner_ranks,
+            );
+            return Err(SubmitError);
+        }
+
+        let request_id = self
+            .next_request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let visible_rank = owner_ranks[0];
+        let shard = DistributedRequestShard::token_owned_dp_ep(0, 1, true);
+        if visible_rank < self.workers.len() {
+            let permit = selected_local_permits
+                .drain(..)
+                .find(|(permit_rank, _)| *permit_rank == visible_rank)
+                .map(|(_, permit)| permit)
+                .ok_or(SubmitError)?;
+            let mut rank_req = req;
+            rank_req.distributed_shard = shard;
+            rank_req.distributed = None;
+            permit.submit(rank_req).map_err(|_| SubmitError)?;
+            return Ok(());
+        }
+
+        let wire = Self::wire_request_from_incoming(&req, request_id);
+        let mut relay = self
+            .relay
+            .as_ref()
+            .ok_or(SubmitError)?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        relay
+            .register_completion_sink(request_id, req.delta_tx.clone())
+            .map_err(|_| SubmitError)?;
+        let envelope = crate::multiproc_relay::RelayEnvelope::RequestOwned {
+            wire,
+            shard_rank: shard.rank,
+            shard_world_size: shard.world_size,
+            emits_visible_output: shard.emits_visible_output,
+        };
+        if relay.send_to_ranks(&[visible_rank], &envelope).is_err() {
+            relay.unregister_completion_sink(request_id);
+            return Err(SubmitError);
+        }
+        Ok(())
+    }
 }
 
 fn locality(worker_numa: Option<i32>, ingress_numa: Option<i32>) -> Option<bool> {
@@ -688,7 +819,7 @@ impl RequestHandle for NumaSchedulerRouter {
 impl RequestHandle for DistributedSchedulerGroup {
     fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
         if self.request_ownership == DistributedRequestOwnership::TokenOwnedDpEp {
-            return self.submit_token_owned_in_process(req);
+            return self.submit_token_owned(req);
         }
         let _submission_guard = self
             .submission_lock
@@ -1125,6 +1256,90 @@ mod tests {
         );
         assert!(rx0.try_recv().is_err());
         assert!(rx1.try_recv().is_err());
+    }
+
+    #[test]
+    fn distributed_group_token_owned_relay_routes_remote_owner_output() {
+        let world_size = 2;
+        let pending = crate::multiproc_relay::RelayCoordinator::bind().unwrap();
+        let coord_addr: std::net::SocketAddr =
+            format!("127.0.0.1:{}", pending.port()).parse().unwrap();
+
+        let worker_thread = std::thread::spawn(move || {
+            let mut worker = crate::multiproc_relay::RelayWorker::connect_with_rank(
+                coord_addr,
+                std::time::Duration::from_secs(5),
+                1,
+                world_size,
+            )
+            .unwrap();
+            let env = worker.recv().unwrap().expect("owner request");
+            match env {
+                crate::multiproc_relay::RelayEnvelope::RequestOwned {
+                    wire,
+                    shard_rank,
+                    shard_world_size,
+                    emits_visible_output,
+                } => {
+                    assert_eq!(wire.prompt, "remote-owner");
+                    assert_eq!(shard_rank, 0);
+                    assert_eq!(shard_world_size, 1);
+                    assert!(emits_visible_output);
+                    worker
+                        .send(&crate::multiproc_relay::RelayEnvelope::Completion {
+                            request_id: wire.request_id,
+                            delta: CompletionStreamDelta::text("rank1".to_string()),
+                        })
+                        .unwrap();
+                    worker
+                        .send(&crate::multiproc_relay::RelayEnvelope::Completion {
+                            request_id: wire.request_id,
+                            delta: CompletionStreamDelta {
+                                text_delta: String::new(),
+                                finish_reason: Some(crate::server_engine::FinishReason::Length),
+                                usage: None,
+                                logprob: None,
+                                token_ids: Vec::new(),
+                                error: None,
+                            },
+                        })
+                        .unwrap();
+                }
+                other => panic!("expected RequestOwned, got {other:?}"),
+            }
+        });
+
+        let coord = pending
+            .accept(world_size, std::time::Duration::from_secs(5))
+            .expect("worker connected within 5s");
+        let relay = Arc::new(Mutex::new(coord));
+        let (tx0, mut rx0) = mpsc::unbounded_channel();
+        let group = DistributedSchedulerGroup::with_relay_token_owner_groups(
+            vec![NumaSchedulerWorker {
+                handle: SchedulerHandle::from_parts(tx0, "model"),
+                placement: placement(0, 0),
+            }],
+            crate::metrics::ServerMetrics::new("model"),
+            relay,
+            world_size,
+            vec![vec![1]],
+        );
+
+        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+        let mut req = labeled_test_request("remote-owner");
+        req.delta_tx = client_tx;
+        group.submit(req).unwrap();
+
+        assert!(rx0.try_recv().is_err());
+        assert_eq!(
+            client_rx.blocking_recv().unwrap().text_delta,
+            "rank1".to_string()
+        );
+        assert_eq!(
+            client_rx.blocking_recv().unwrap().finish_reason,
+            Some(crate::server_engine::FinishReason::Length)
+        );
+        worker_thread.join().unwrap();
     }
 
     #[test]

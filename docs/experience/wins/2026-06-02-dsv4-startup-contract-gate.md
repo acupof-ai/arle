@@ -49,16 +49,28 @@ serve on the replicated-token debug lane and still look like a performance run.
   of tuning it. `DistributedSchedulerGroup` now has explicit SGLang-style token
   owner groups for `token-owned-dp-ep`: one owner group is selected per request,
   only ranks in that group receive the request, and ranks in other DP groups do
-  not see the logical request. Relay mode still fails closed because the current
-  relay can only broadcast to all workers; targeted DP-owner relay is a
-  required follow-up before this can be used by multiprocess DSv4 serving.
+  not see the logical request. Multiprocess serving remained blocked until the
+  relay could address selected owner ranks and return output from a non-rank0
+  owner.
 - PC2 relay follow-up removes the unsafe accept-order assumption from the
   multiprocess request relay. Worker connections now send an explicit
   rank/world-size hello, the coordinator stores streams by rank, and the relay
-  exposes targeted send by global rank. Token-owned multiprocess serving still
-  remains blocked until remote-owner output return is implemented; this change
-  only proves the control plane can address a selected DP-owner rank set without
-  broadcasting to all ranks.
+  exposes targeted send by global rank. This change proved the control plane
+  could address a selected DP-owner rank set without broadcasting to all ranks;
+  output return and owner-group communicators remained separate follow-ups.
+- PC2 remote-owner output follow-up adds the missing relay return path for
+  token-owned control-plane requests. Workers can now send
+  `CompletionStreamDelta` envelopes back to the coordinator, the coordinator
+  dispatches them by `request_id`, and a guarded token-owned relay route can
+  send a single-rank owner request to a remote rank without touching rank0's
+  scheduler queue. Multi-rank owner groups still fail closed because the
+  SGLang-compatible owner-group NCCL/token-sync subgroup communicators are not
+  wired; using the global EP group here would deadlock or over-synchronize.
+- High-performance startup messages now name the remaining structural blockers
+  precisely: DSv4 startup still selects the replicated-token lane, owner-group
+  NCCL/token-sync subgroup communicators are missing, remote-owner output return
+  is not yet selected by DSv4 startup, batched FlashMLA sparse/recent decode is
+  not wired, and DSv4 metadata replay is not graph-captured.
 - DeepGEMM is now the DSv4 runtime default expert backend, not
   `deepgemm-auto`. Missing or incompatible DeepGEMM now fails before serving
   unless the operator explicitly asks for `ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto`
@@ -146,6 +158,15 @@ serve on the replicated-token debug lane and still look like a performance run.
   passed 3/3, and
   `cargo test -p infer --lib --no-default-features --features cuda,nccl request_handle -- --nocapture`
   passed 11/11.
+- PC2 remote-owner output local gate: `cargo fmt --check`, `git diff --check`,
+  `cargo test -p infer --no-default-features --features no-cuda multiproc_relay -- --nocapture`,
+  `cargo test -p infer --no-default-features --features no-cuda request_handle -- --nocapture`,
+  `cargo check -p infer --no-default-features --features no-cuda`, and
+  `CUDARC_CUDA_VERSION=12080 cargo check -p infer --no-default-features --features cuda,no-cuda`
+  passed. The relay test set now includes
+  `coordinator_dispatches_worker_completion_to_registered_sink`, and the
+  request-handle test set now includes
+  `distributed_group_token_owned_relay_routes_remote_owner_output`.
 - The same test command with the wrong env name
   `ARLE_CUDA_PREBUILT_ARTIFACTS` was stopped after `ps` showed it had fallen
   back to `nvcc`; the valid fast-path env is `ARLE_CUDA_KERNELS_PREBUILT_DIR`.

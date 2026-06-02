@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::model_arch::ModelArchSummary;
@@ -70,7 +70,7 @@ pub struct CompletionRequest {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FinishReason {
     Length,
     Stop,
@@ -102,13 +102,14 @@ pub struct CompletionOutput {
     pub response_token_ids: Vec<u32>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TokenUsage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompletionStreamDelta {
     pub text_delta: String,
     pub finish_reason: Option<FinishReason>,
@@ -127,7 +128,7 @@ pub struct CompletionStreamDelta {
     pub error: Option<CompletionStreamError>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompletionStreamError {
     pub kind: String,
     pub message: String,
