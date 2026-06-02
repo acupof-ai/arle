@@ -71,7 +71,7 @@ Recommended smoke command:
 cargo run -p infer --bin metal_request --release --no-default-features --features metal,no-cuda -- \
   --model mlx-community/Qwen3-4B-bf16 \
   --dflash-draft-model z-lab/Qwen3-4B-DFlash-b16 \
-  --prompt "benchmark throughput" \
+  --prompt "write a concise Python quicksort and explain the pivot choice" \
   --raw-prompt \
   --warmup 0 \
   --max-new-tokens 16
@@ -90,7 +90,7 @@ Command shape:
 cargo run -p infer --bin metal_bench --release --no-default-features --features metal,no-cuda -- \
   --model mlx-community/Qwen3-4B-bf16 \
   --dflash-draft-model z-lab/Qwen3-4B-DFlash-b16 \
-  --prompt-tokens 20 \
+  --prompt "write a concise Python quicksort and explain the pivot choice" \
   --generation-tokens 256 \
   --warmup 1 \
   --runs 3
@@ -99,7 +99,9 @@ cargo run -p infer --bin metal_bench --release --no-default-features --features 
 | Parameter | Required | Default | Meaning | Notes |
 | --- | --- | --- | --- | --- |
 | `--model`, `-m <MODEL>` | Yes | none | Target model path or HF repo id | Same target meaning as `metal_request` |
-| `--prompt-tokens <N>` | No | `20` | Exact prompt token count for the synthetic benchmark prompt | Use a longer prompt to test prefill-heavy cases |
+| `--prompt <TEXT>` | One prompt source required | none | Inline real prompt text | Use for quick local A/B only |
+| `--prompt-file <PATH>` | One prompt source required | none | Read one real prompt from a file | Preferred for reproducible benches |
+| `--prompt-file-sweep <CSV>` | No | none | Run multiple real prompt files in one loaded process | Use for c=1 length curves without reloading the model between prompts |
 | `--generation-tokens <N>` | No | `256` | Exact output token count | Alias: `--max-tokens` |
 | `--warmup <N>` | No | `3` | Warmup runs excluded from stats | Use `1` for quick local comparisons |
 | `--runs <N>` | No | `5` | Timed runs | Mean / p50 / p99 are computed across these |
@@ -121,7 +123,7 @@ Baseline:
 ```bash
 cargo run -p infer --bin metal_bench --release --no-default-features --features metal,no-cuda -- \
   --model mlx-community/Qwen3-4B-bf16 \
-  --prompt-tokens 20 \
+  --prompt-file prompts/code.txt \
   --generation-tokens 256 \
   --warmup 1 \
   --runs 3
@@ -133,25 +135,22 @@ DFlash:
 cargo run -p infer --bin metal_bench --release --no-default-features --features metal,no-cuda -- \
   --model mlx-community/Qwen3-4B-bf16 \
   --dflash-draft-model z-lab/Qwen3-4B-DFlash-b16 \
-  --prompt-tokens 20 \
+  --prompt-file prompts/code.txt \
   --generation-tokens 256 \
   --warmup 1 \
   --runs 3
 ```
 
-Recommended first workload:
-
-- `--prompt-tokens 20`
-- `--generation-tokens 256`
-
-That is the currently validated generation-heavy case.
+Recommended first workload: a checked-in or artifacted real prompt file plus
+`--generation-tokens 256`. Do not use synthetic token-count prompts for
+DFlash performance claims.
 
 ### `--baseline-compare` one-shot
 
 Purpose:
 
 - Single invocation loads the target twice (baseline Metal, then DFlash) with
-  matched warmup / runs / prompt-tokens / generation-tokens and prints a delta
+  matched warmup / runs / prompt / generation-tokens and prints a delta
   row on the last stdout line.
 - Saves you from maintaining two matched command lines when you just want
   "did DFlash help?"
@@ -174,7 +173,7 @@ Example:
 cargo run -p infer --bin metal_bench --release --no-default-features --features metal,no-cuda -- \
   --model mlx-community/Qwen3-4B-bf16 \
   --baseline-compare \
-  --prompt-tokens 20 \
+  --prompt-file prompts/code.txt \
   --generation-tokens 256 \
   --warmup 1 \
   --runs 3
