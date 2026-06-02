@@ -103,9 +103,15 @@ struct Args {
     dflash_draft_model: Option<String>,
 
     /// Speculative decode route for Metal. `mtp` probes for native MTP tensors
-    /// and currently falls back to standard decode until MTP draft/verify lands.
+    /// or an external `--mtp-draft-model` and currently falls back to standard
+    /// decode until MTP draft/verify lands.
     #[arg(long, value_enum, default_value_t = MetalSpecTypeArg::None)]
     spec_type: MetalSpecTypeArg,
+
+    /// External split MTP drafter model path or HuggingFace repo. Implies
+    /// `--spec-type mtp` and is mutually exclusive with DFlash.
+    #[arg(long, value_name = "PATH_OR_REPO")]
+    mtp_draft_model: Option<String>,
 
     /// Enable the experimental Metal KV pool for Qwen3 (production) and
     /// Qwen3.5 (M_e.1 P2.0: pool is allocated but not yet read/written —
@@ -283,6 +289,24 @@ impl Args {
         options.validate()?;
         Ok(Some(options))
     }
+
+    fn mtp_options(&self) -> Option<MetalMtpOptions> {
+        let mut options = if let Some(options) = self.spec_type.mtp_options() {
+            options
+        } else if self.mtp_draft_model.is_some() {
+            MetalMtpOptions::explicit()
+        } else {
+            return None;
+        };
+        if let Some(draft_model) = &self.mtp_draft_model {
+            options = options.with_draft_model(draft_model.clone());
+        }
+        Some(options)
+    }
+
+    fn mtp_route_enabled(&self) -> bool {
+        self.spec_type.mtp_mode().is_some() || self.mtp_draft_model.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +324,7 @@ mod tests {
             max_batch_tokens: 512,
             dflash_draft_model: None,
             spec_type: MetalSpecTypeArg::None,
+            mtp_draft_model: None,
             kv_pool: false,
             no_kv_pool: false,
             kv_disk_dir: None,
@@ -387,9 +412,9 @@ async fn main() -> Result<()> {
     if args.warmup > 0 && args.warmup_max_new_tokens == 0 {
         bail!("--warmup-max-new-tokens must be >= 1 when --warmup > 0");
     }
-    if args.dflash_draft_model.is_some() && args.spec_type.mtp_mode().is_some() {
+    if args.dflash_draft_model.is_some() && args.mtp_route_enabled() {
         bail!(
-            "--dflash-draft-model and --spec-type cannot be combined; choose one Metal speculative route"
+            "--dflash-draft-model cannot be combined with --spec-type auto|mtp or --mtp-draft-model; choose one Metal speculative route"
         );
     }
 
@@ -401,7 +426,7 @@ async fn main() -> Result<()> {
                 draft_model: draft_model.clone(),
                 speculative_tokens: args.speculative_tokens,
             }),
-        mtp: args.spec_type.mtp_options(),
+        mtp: args.mtp_options(),
         kv_pool: args.kv_pool_override(),
         kv_disk: args.kv_disk_options()?,
         kv_memory_max_bytes: Some(args.kv_memory_max_bytes()),
@@ -443,6 +468,9 @@ async fn main() -> Result<()> {
             args.speculative_tokens
                 .map_or_else(|| "draft-default".to_string(), |value| value.to_string(),)
         );
+    }
+    if let Some(draft_model) = &args.mtp_draft_model {
+        info!("Metal MTP draft configured: draft_model={draft_model}");
     }
 
     let api_key = resolve_api_key(args.api_key.as_deref());
