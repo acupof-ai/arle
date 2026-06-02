@@ -821,6 +821,19 @@ unsafe extern "C" {
         stride_rope_elems: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Fill one `[block_id,row]` pair for FlashMLA decode's SW FP8 pack from
+    /// a device-resident `start_pos` scalar. The following
+    /// `arle_dsv4_fp8_kv_pack_strided_cuda(..., n_tokens=1, ...)` consumes
+    /// these scratch values.
+    pub fn arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda(
+        token_block_id: *mut i32,
+        token_in_block_row: *mut i32,
+        start_pos: *const i32,
+        sliding_window: i32,
+        page_block_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 // ============================================================================
