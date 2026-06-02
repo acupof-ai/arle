@@ -7,6 +7,46 @@ FEATURES="${FEATURES:-cuda,nccl}"
 BIN="${BIN:-infer}"
 PREBUILT_DIR="${ARLE_CUDA_KERNELS_PREBUILT_DIR:-$ROOT/target/dsv4-cuda-kernels-prebuilt}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+MANIFEST_NAME="arle-cuda-kernels.manifest"
+
+detect_cuda() {
+    local nvcc=""
+    if [[ -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/nvcc" ]]; then
+        nvcc="$CUDA_HOME/bin/nvcc"
+    else
+        for version in 13.1 13.0 12.9 12.8 12.7 12.6 12.5 12.4 12.3 12.2 12.1 12.0; do
+            local candidate="/usr/local/cuda-$version/bin/nvcc"
+            if [[ -x "$candidate" ]]; then
+                nvcc="$candidate"
+                break
+            fi
+        done
+        for candidate in /usr/local/cuda/bin/nvcc /opt/cuda/bin/nvcc; do
+            [[ -n "$nvcc" ]] && break
+            if [[ -x "$candidate" ]]; then
+                nvcc="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [[ -n "$nvcc" ]]; then
+        export CUDA_HOME="$(cd "$(dirname "$nvcc")/.." && pwd)"
+        export PATH="$CUDA_HOME/bin:$PATH"
+        if [[ -z "${CUDARC_CUDA_VERSION:-}" ]]; then
+            local major_minor major minor
+            major_minor="$("$nvcc" --version |
+                sed -n 's/.*release \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p' |
+                head -1)"
+            if [[ -n "$major_minor" ]]; then
+                read -r major minor <<<"$major_minor"
+                export CUDARC_CUDA_VERSION="$((major * 1000 + minor * 10))"
+            fi
+        fi
+    fi
+
+    export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-12080}"
+}
 
 prefer_sccache() {
     if command -v sccache >/dev/null 2>&1; then
@@ -17,7 +57,63 @@ prefer_sccache() {
 
 prebuilt_ready() {
     [[ -f "$PREBUILT_DIR/libkernels_cuda.a" ]] &&
-        [[ -f "$PREBUILT_DIR/libtilelang_kernels_aot.a" ]]
+        [[ -f "$PREBUILT_DIR/libtilelang_kernels_aot.a" ]] &&
+        manifest_matches
+}
+
+hash_stream() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        shasum -a 256 | awk '{print $1}'
+    fi
+}
+
+tree_hash() {
+    local path="$1"
+    git rev-parse "HEAD:$path" 2>/dev/null || printf 'missing'
+}
+
+dirty_hash() {
+    {
+        git diff --binary HEAD -- Cargo.toml crates/cuda-kernels crates/deepep-sys 2>/dev/null || true
+        git diff --binary --cached HEAD -- Cargo.toml crates/cuda-kernels crates/deepep-sys 2>/dev/null || true
+    } | hash_stream
+}
+
+artifact_manifest() {
+    cat <<EOF
+cargo_toml=$(tree_hash Cargo.toml)
+cuda_kernels_tree=$(tree_hash crates/cuda-kernels)
+deepep_sys_tree=$(tree_hash crates/deepep-sys)
+dirty_hash=$(dirty_hash)
+cuda_home=${CUDA_HOME:-}
+cudarc_cuda_version=${CUDARC_CUDA_VERSION:-}
+torch_cuda_arch_list=${TORCH_CUDA_ARCH_LIST:-}
+kernel_set=${ARLE_CUDA_KERNEL_SET:-}
+deepgemm_native=${ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE:-}
+deepgemm_root=${ARLE_DEEPGEMM_ROOT:-}
+deepep_dir=${ARLE_DEEPEP_DIR:-}
+disable_flashmla=${ARLE_CUDA_DISABLE_FLASHMLA:-}
+enable_flashmla_decode=${ARLE_CUDA_ENABLE_FLASHMLA_DECODE:-}
+disable_flashmla_decode=${ARLE_CUDA_DISABLE_FLASHMLA_DECODE:-}
+disable_marlin_w4_fp8=${ARLE_CUDA_DISABLE_MARLIN_W4_FP8:-}
+nvcc_ccbin=${NVCC_CCBIN:-}
+tilelang_python=${INFER_TILELANG_PYTHON:-}
+EOF
+}
+
+manifest_matches() {
+    local manifest="$PREBUILT_DIR/$MANIFEST_NAME"
+    if [[ ! -f "$manifest" ]]; then
+        echo "prebuilt artifacts missing $MANIFEST_NAME; ignoring stale/manual cache"
+        return 1
+    fi
+    if ! diff -u "$manifest" <(artifact_manifest) >/tmp/arle-cuda-kernels-manifest.diff 2>/dev/null; then
+        echo "prebuilt artifact manifest mismatch; ignoring $PREBUILT_DIR"
+        cat /tmp/arle-cuda-kernels-manifest.diff || true
+        return 1
+    fi
 }
 
 find_latest_cuda_out() {
@@ -47,10 +143,12 @@ harvest_prebuilt() {
         cp -f "$out_dir/arle_deepep_sidecar" "$PREBUILT_DIR/"
         chmod +x "$PREBUILT_DIR/arle_deepep_sidecar" || true
     fi
+    artifact_manifest >"$PREBUILT_DIR/$MANIFEST_NAME"
     echo "harvested CUDA prebuilt artifacts from $out_dir -> $PREBUILT_DIR"
 }
 
 cd "$ROOT"
+detect_cuda
 prefer_sccache
 
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
@@ -70,6 +168,8 @@ fi
 
 echo "profile=$PROFILE features=$FEATURES bin=$BIN"
 echo "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
+echo "CUDA_HOME=${CUDA_HOME:-}"
+echo "CUDARC_CUDA_VERSION=$CUDARC_CUDA_VERSION"
 echo "ARLE_CUDA_KERNEL_SET=$ARLE_CUDA_KERNEL_SET"
 echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-}"
 echo "ARLE_NVCC_WRAPPER=${ARLE_NVCC_WRAPPER:-}"

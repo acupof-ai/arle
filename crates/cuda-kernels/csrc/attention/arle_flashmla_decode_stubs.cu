@@ -24,6 +24,7 @@ struct __half;
 
 extern "C" {
 
+#ifndef ARLE_FLASHMLA_STUB_DECODE_ONLY
 cudaError_t arle_flashmla_sm90_sparse_prefill_fwd(
     const __half* /*q*/, const __half* /*kv*/, const int32_t* /*indices*/,
     const float* /*attn_sink*/, const int32_t* /*topk_length*/,
@@ -37,6 +38,7 @@ cudaError_t arle_flashmla_sm90_sparse_prefill_fwd(
 ) {
     return cudaErrorNotSupported;
 }
+#endif
 
 cudaError_t arle_flashmla_sm90_sparse_decode_fwd(
     const __half* /*q*/,
