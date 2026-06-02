@@ -937,6 +937,9 @@ impl DeepseekModel {
         })?;
 
         let trace = dsv4_trace_begin(&self.ctx)?;
+        let (batch_start_pos_ptr, _batch_start_pos_guard) =
+            start_pos_gpu.device_ptr(&self.ctx.stream);
+        let start_pos_i32_size = std::mem::size_of::<i32>();
         for (row, &slot_idx) in slot_indices.iter().enumerate() {
             extract_hidden_token_with_width_into(
                 &self.ctx,
@@ -950,13 +953,16 @@ impl DeepseekModel {
                 .layers
                 .get_mut(layer_idx)
                 .expect("incremental cache layer initialized");
-            self.update_compressor_gpu_cache(
+            let row_start_pos_ptr_u64 =
+                batch_start_pos_ptr as u64 + (row * start_pos_i32_size) as u64;
+            self.update_compressor_gpu_cache_start_pos_ptr(
                 compressor,
                 attn_normed_row,
                 head_dim,
                 compress_ratio,
                 compress_ratio < 16,
                 start_pos[row],
+                row_start_pos_ptr_u64,
                 true,
                 dsv4_compressor_required_capacity_rows(start_pos[row], 1, compress_ratio),
                 layer_cache
@@ -5566,6 +5572,71 @@ impl DeepseekModel {
         capacity_rows: usize,
         cache: &mut DeepseekGpuCompressorRuntimeCache,
     ) -> Result<()> {
+        self.update_compressor_gpu_cache_impl(
+            compressor,
+            hidden,
+            head_dim,
+            ratio,
+            overlap,
+            start_pos,
+            None,
+            apply_rope,
+            capacity_rows,
+            cache,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_compressor_gpu_cache_start_pos_ptr(
+        &self,
+        compressor: &DeepseekV4Compressor,
+        hidden: &HiddenStates,
+        head_dim: usize,
+        ratio: usize,
+        overlap: bool,
+        start_pos: usize,
+        start_pos_ptr_u64: u64,
+        apply_rope: bool,
+        capacity_rows: usize,
+        cache: &mut DeepseekGpuCompressorRuntimeCache,
+    ) -> Result<()> {
+        ensure!(
+            hidden.seq_len == 1,
+            "DeepSeek V4 start-pos-pointer compressor update is decode-only, got seq_len={}",
+            hidden.seq_len
+        );
+        ensure!(
+            start_pos_ptr_u64 != 0,
+            "DeepSeek V4 start-pos-pointer compressor update needs a non-null start_pos pointer"
+        );
+        self.update_compressor_gpu_cache_impl(
+            compressor,
+            hidden,
+            head_dim,
+            ratio,
+            overlap,
+            start_pos,
+            Some(start_pos_ptr_u64),
+            apply_rope,
+            capacity_rows,
+            cache,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_compressor_gpu_cache_impl(
+        &self,
+        compressor: &DeepseekV4Compressor,
+        hidden: &HiddenStates,
+        head_dim: usize,
+        ratio: usize,
+        overlap: bool,
+        start_pos: usize,
+        start_pos_ptr_u64: Option<u64>,
+        apply_rope: bool,
+        capacity_rows: usize,
+        cache: &mut DeepseekGpuCompressorRuntimeCache,
+    ) -> Result<()> {
         ensure!(ratio > 0, "DeepSeek V4 compressor ratio must be non-zero");
         let width = if overlap { 2 * head_dim } else { head_dim };
         ensure!(
@@ -5589,6 +5660,22 @@ impl DeepseekModel {
             completed,
             cache.compressed_capacity
         );
+        if start_pos_ptr_u64.is_some() {
+            ensure!(
+                cache.pending_len == start_pos % ratio,
+                "DeepSeek V4 graph-safe compressor pending_len mismatch: cache={} start_pos={} ratio={}",
+                cache.pending_len,
+                start_pos,
+                ratio
+            );
+            ensure!(
+                cache.compressed_rows == start_pos / ratio,
+                "DeepSeek V4 graph-safe compressor compressed_rows mismatch: cache={} start_pos={} ratio={}",
+                cache.compressed_rows,
+                start_pos,
+                ratio
+            );
+        }
         let rope_params = &self.config.rope_parameters;
         // Compressed-key RoPE uses `compress_rope_theta` (correct — only the
         // compressed keys do) with NO YaRN: the CPU reference builds the
@@ -5640,37 +5727,69 @@ impl DeepseekModel {
                 .as_mut()
                 .expect("compressed rows allocated")
                 .device_ptr_mut(&self.ctx.stream);
-            unsafe {
-                ffi::dsv4_compressor_update_cuda(
-                    kv_ptr as *const ffi::Half,
-                    score_ptr as *const ffi::Half,
-                    ape_ptr as *const ffi::Half,
-                    norm_ptr as *const ffi::Half,
-                    pending_kv_ptr as *mut ffi::Half,
-                    pending_score_ptr as *mut ffi::Half,
-                    prev_kv_ptr as *mut ffi::Half,
-                    prev_score_ptr as *mut ffi::Half,
-                    compressed_ptr as *mut ffi::Half,
-                    hidden.seq_len as i32,
-                    start_pos as i32,
-                    cache.pending_len as i32,
-                    cache.compressed_rows as i32,
-                    head_dim as i32,
-                    ratio as i32,
-                    width as i32,
-                    i32::from(overlap),
-                    i32::from(cache.compressed_rows > 0),
-                    self.config.rms_norm_eps,
-                    rope_dim as i32,
-                    rope_base,
-                    original_seq_len,
-                    rope_params.factor,
-                    rope_params.beta_fast,
-                    rope_params.beta_slow,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU compressor failed: {err}"))?;
+            if let Some(start_pos_ptr_u64) = start_pos_ptr_u64 {
+                unsafe {
+                    ffi::dsv4_compressor_update_start_pos_ptr_cuda(
+                        kv_ptr as *const ffi::Half,
+                        score_ptr as *const ffi::Half,
+                        ape_ptr as *const ffi::Half,
+                        norm_ptr as *const ffi::Half,
+                        pending_kv_ptr as *mut ffi::Half,
+                        pending_score_ptr as *mut ffi::Half,
+                        prev_kv_ptr as *mut ffi::Half,
+                        prev_score_ptr as *mut ffi::Half,
+                        compressed_ptr as *mut ffi::Half,
+                        hidden.seq_len as i32,
+                        start_pos_ptr_u64 as *const i32,
+                        head_dim as i32,
+                        ratio as i32,
+                        width as i32,
+                        i32::from(overlap),
+                        self.config.rms_norm_eps,
+                        rope_dim as i32,
+                        rope_base,
+                        original_seq_len,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU compressor failed: {err}"))?;
+                }
+            } else {
+                unsafe {
+                    ffi::dsv4_compressor_update_cuda(
+                        kv_ptr as *const ffi::Half,
+                        score_ptr as *const ffi::Half,
+                        ape_ptr as *const ffi::Half,
+                        norm_ptr as *const ffi::Half,
+                        pending_kv_ptr as *mut ffi::Half,
+                        pending_score_ptr as *mut ffi::Half,
+                        prev_kv_ptr as *mut ffi::Half,
+                        prev_score_ptr as *mut ffi::Half,
+                        compressed_ptr as *mut ffi::Half,
+                        hidden.seq_len as i32,
+                        start_pos as i32,
+                        cache.pending_len as i32,
+                        cache.compressed_rows as i32,
+                        head_dim as i32,
+                        ratio as i32,
+                        width as i32,
+                        i32::from(overlap),
+                        i32::from(cache.compressed_rows > 0),
+                        self.config.rms_norm_eps,
+                        rope_dim as i32,
+                        rope_base,
+                        original_seq_len,
+                        rope_params.factor,
+                        rope_params.beta_fast,
+                        rope_params.beta_slow,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU compressor failed: {err}"))?;
+                }
             }
         }
         cache.compressed_rows += completed;
