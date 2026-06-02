@@ -135,6 +135,16 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    pub fn dsv4_update_window_cache_start_pos_ptr_cuda(
+        k_new: *const super::Half,
+        window_cache: *mut super::Half,
+        num_tokens: i32,
+        start_pos: *const i32,
+        sliding_window: i32,
+        head_dim: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_compressor_update_cuda(
         kv_raw: *const super::Half,
         score_raw: *const super::Half,

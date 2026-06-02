@@ -2484,6 +2484,7 @@ impl DeepseekModel {
             && token_count == 1
             && !use_flashmla_decode
             && dsv4_fuse_attn_window_update_enabled()?;
+        let mut window_update_start_pos_ptr_u64: Option<u64> = None;
         // Lazy-alloc cache.window_gpu without binding the returned mut
         // reference. The bf16 SW window is only re-acquired (mutably)
         // inside the legacy-decode / prefill branches below; the
@@ -3268,6 +3269,7 @@ impl DeepseekModel {
                     drop(guard);
                     ptr as u64
                 };
+                window_update_start_pos_ptr_u64 = Some(start_pos_ptr_u64);
 
                 // Step 3 — per-step SW pack of the current decode token's
                 // K row from k_prepared into FP8 SW sub-pool at
@@ -3633,17 +3635,30 @@ impl DeepseekModel {
                 .expect("SW window cache allocated above");
             let (window_ptr, _window_guard) = window_buf.device_ptr_mut(&self.ctx.stream);
             unsafe {
-                ffi::dsv4_update_window_cache_cuda(
-                    k_ptr as *const ffi::Half,
-                    window_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    start_pos as i32,
-                    self.config.sliding_window as i32,
-                    head_dim as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU cache update failed: {err}"))?;
+                let status = if let Some(start_pos_ptr_u64) = window_update_start_pos_ptr_u64 {
+                    ffi::dsv4_update_window_cache_start_pos_ptr_cuda(
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        start_pos_ptr_u64 as *const i32,
+                        self.config.sliding_window as i32,
+                        head_dim as i32,
+                        self.ctx.stream.cu_stream(),
+                    )
+                } else {
+                    ffi::dsv4_update_window_cache_cuda(
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        start_pos as i32,
+                        self.config.sliding_window as i32,
+                        head_dim as i32,
+                        self.ctx.stream.cu_stream(),
+                    )
+                };
+                status
+                    .result()
+                    .map_err(|err| anyhow::anyhow!("DeepSeek V4 GPU cache update failed: {err}"))?;
             }
             dsv4_trace_end(
                 &self.ctx,
