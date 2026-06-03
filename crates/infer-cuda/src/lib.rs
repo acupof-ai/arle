@@ -63,6 +63,12 @@ pub mod shard_slice;
 // arithmetic (MoE-3). Feature-agnostic CPU logic.
 pub mod moe_config;
 
+// Single-GPU BF16 MoE forward (MoE-4). The host route→assignment flattening
+// (`flatten_routing`) is feature-agnostic + CPU-tested; the device `moe_forward`
+// (grouped GEMM + DSv4/Qwen3.6 dispatch kernels) lives in the inner `cuda`-gated
+// module. Not cuda-gated at the `mod` level so the CPU plumbing test always runs.
+mod moe;
+
 /// Host-side paged KV bookkeeping for the CUDA backend.
 ///
 /// Pages are logical indices (`u32`); the device-side KV buffers they map to are
@@ -332,6 +338,28 @@ impl CudaExecutor {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
                 executor::RealCudaExecutor::from_qwen3_bf16_safetensors(
+                    model_path,
+                    num_slots,
+                    total_pages,
+                )?,
+            )),
+        })
+    }
+
+    /// Build the real CUDA executor for a single-GPU BF16 Qwen3.5/3.6 **MoE**
+    /// checkpoint (MoE-4). All experts are local (single GPU); dense vs sparse
+    /// layers are resolved per `Qwen35Config::is_moe_layer`. The W4/4-bit Qwen3.6
+    /// canonical (e.g. Qwen3.6-35B-A3B-4bit) needs the W4 grouped-GEMM follow-up;
+    /// this path is BF16 only.
+    #[cfg(feature = "cuda")]
+    pub fn from_qwen35_moe_safetensors(
+        model_path: impl AsRef<Path>,
+        num_slots: usize,
+        total_pages: usize,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: CudaExecutorInner::Real(Box::new(
+                executor::RealCudaExecutor::from_qwen35_moe_safetensors(
                     model_path,
                     num_slots,
                     total_pages,
