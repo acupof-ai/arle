@@ -33,9 +33,10 @@ use crate::model::generation_state::GenerationStateBase;
 use crate::model::kv_cache::{KVCacheDtype, KVFormat};
 #[cfg(feature = "cuda")]
 use crate::model::{
-    CudaGraphDecodeSupport, DecodeContextOps, InternalMtpDraftOutput, InternalMtpDraftRequest,
-    MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
-    PrefillBatchRequest, SpecVerifyOutput, SpecVerifyRequest, prepare_paged_prefill_batch,
+    CudaGraphDecodeSupport, DecodeBatchRequest, DecodeContextOps, InternalMtpDraftOutput,
+    InternalMtpDraftRequest, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest,
+    ModelForward, PrefillBatchRequest, SpecVerifyOutput, SpecVerifyRequest,
+    prepare_paged_prefill_batch,
 };
 #[cfg(feature = "cuda")]
 use crate::model_arch::ModelArchInfo;
@@ -277,6 +278,49 @@ impl ModelForward for DeepseekModel {
             self.forward_decode(token, &mut states[slot_idx])?;
         }
         Ok(())
+    }
+
+    fn forward_decode_batch_with_request(
+        &self,
+        batch: DecodeBatchRequest<'_>,
+        states: &mut [Self::State],
+        paged_kv_pool: Option<&mut PagedKVPool>,
+        decode_ctx: &mut Self::DecodeContext,
+        skip_logit_scatter: bool,
+    ) -> Result<()> {
+        batch.validate()?;
+        let distributed_rows = batch
+            .distributed_shards
+            .iter()
+            .filter(|shard| shard.is_distributed())
+            .count();
+        if distributed_rows > 0 {
+            static ROW_METADATA_LOGGED: OnceLock<()> = OnceLock::new();
+            ROW_METADATA_LOGGED.get_or_init(|| {
+                let token_owned_rows = batch
+                    .distributed_shards
+                    .iter()
+                    .filter(|shard| {
+                        shard.ownership == DistributedRequestOwnership::TokenOwnedDpEp
+                    })
+                    .count();
+                log::info!(
+                    "DeepSeek V4 decode batch receives distributed_shard metadata: rows={} distributed_rows={} token_owned_rows={} first_shard={}",
+                    batch.slot_indices.len(),
+                    distributed_rows,
+                    token_owned_rows,
+                    batch.distributed_shards[0].summary()
+                );
+            });
+        }
+        self.forward_decode_batch(
+            batch.tokens,
+            states,
+            batch.slot_indices,
+            paged_kv_pool,
+            decode_ctx,
+            skip_logit_scatter,
+        )
     }
 
     fn forward_mixed_batch(
@@ -572,6 +616,7 @@ impl ModelForward for DeepseekModel {
         let incremental_kv = dsv4_incremental_kv_enabled()?;
         let body_graph_enabled = dsv4_decode_body_cuda_graph_enabled()?;
         let body_graph_max_bs = dsv4_decode_body_cuda_graph_max_batch_size()?;
+        let model_row_metadata = "decode-batch-distributed-shard-visible";
         let model_row_ownership = "replicated-token";
         let communicator_layout = self.layer_communicator.layout_label();
         let communicator_axes = self.layer_communicator.axis_summary();
@@ -582,7 +627,7 @@ impl ModelForward for DeepseekModel {
         };
 
         log::info!(
-            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} communicator_layout={} communicator_axes={} request_ownership={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
+            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} communicator_layout={} communicator_axes={} request_ownership={} model_row_metadata={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
             profile.as_str(),
             fallback_lane,
             self.config.tp.rank,
@@ -594,6 +639,7 @@ impl ModelForward for DeepseekModel {
             communicator_layout,
             communicator_axes,
             contract.request_ownership.as_str(),
+            model_row_metadata,
             model_row_ownership,
             contract.effective_world_size,
             contract.token_owner_group_count,

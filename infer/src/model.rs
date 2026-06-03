@@ -50,6 +50,38 @@ impl PrefillBatchRequest<'_> {
     }
 }
 
+/// One scheduler-planned decode batch with per-row request ownership metadata.
+///
+/// `tokens[i]`, `slot_indices[i]`, and `distributed_shards[i]` are ordered
+/// together. Models that do not consume distributed row ownership should route
+/// through the legacy `forward_decode_batch` default below.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeBatchRequest<'a> {
+    pub tokens: &'a [u32],
+    pub slot_indices: &'a [usize],
+    pub distributed_shards: &'a [crate::scheduler::DistributedRequestShard],
+}
+
+impl DecodeBatchRequest<'_> {
+    pub fn validate(&self) -> Result<()> {
+        if self.tokens.len() != self.slot_indices.len() {
+            anyhow::bail!(
+                "decode batch token/slot mismatch: tokens={} slots={}",
+                self.tokens.len(),
+                self.slot_indices.len()
+            );
+        }
+        if self.distributed_shards.len() != self.slot_indices.len() {
+            anyhow::bail!(
+                "decode batch shard/slot mismatch: shards={} slots={}",
+                self.distributed_shards.len(),
+                self.slot_indices.len()
+            );
+        }
+        Ok(())
+    }
+}
+
 /// One scheduler-planned mixed decode + packed-prefill batch.
 ///
 /// `prefills[i]` and `prefill_start_positions[i]` are ordered together; model
@@ -850,6 +882,30 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
             self.forward_decode(token, &mut states[slot_indices[i]])?;
         }
         Ok(())
+    }
+
+    /// Batched decode with scheduler-visible per-row request ownership.
+    ///
+    /// The default keeps existing model behavior unchanged while letting
+    /// distributed-aware models inspect `DecodeBatchRequest::distributed_shards`
+    /// before deciding whether a row-owned execution path is implemented.
+    fn forward_decode_batch_with_request(
+        &self,
+        batch: DecodeBatchRequest<'_>,
+        states: &mut [Self::State],
+        paged_kv_pool: Option<&mut PagedKVPool>,
+        decode_ctx: &mut Self::DecodeContext,
+        skip_logit_scatter: bool,
+    ) -> Result<()> {
+        batch.validate()?;
+        self.forward_decode_batch(
+            batch.tokens,
+            states,
+            batch.slot_indices,
+            paged_kv_pool,
+            decode_ctx,
+            skip_logit_scatter,
+        )
     }
 
     /// Whether this model has a validated mixed decode + prefill path for the
