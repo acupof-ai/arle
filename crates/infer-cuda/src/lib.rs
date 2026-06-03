@@ -31,7 +31,15 @@ use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvAllocator, KvPool, KvPrefixStore, KvQuery, PollResult};
 
 #[cfg(feature = "cuda")]
+mod attention;
+#[cfg(feature = "cuda")]
+mod executor;
+#[cfg(feature = "cuda")]
+mod loader;
+#[cfg(feature = "cuda")]
 mod model;
+#[cfg(feature = "cuda")]
+mod ops;
 
 /// Host-side paged KV bookkeeping for the CUDA backend.
 ///
@@ -261,7 +269,7 @@ enum CudaExecutorInner {
     #[default]
     Placeholder,
     #[cfg(feature = "cuda")]
-    Real(Box<model::RealCudaExecutor>),
+    Real(Box<executor::RealCudaExecutor>),
 }
 
 impl fmt::Debug for CudaExecutor {
@@ -301,7 +309,7 @@ impl CudaExecutor {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
-                model::RealCudaExecutor::from_qwen3_bf16_safetensors(
+                executor::RealCudaExecutor::from_qwen3_bf16_safetensors(
                     model_path,
                     num_slots,
                     total_pages,
