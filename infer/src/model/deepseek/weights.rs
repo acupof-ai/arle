@@ -1510,6 +1510,7 @@ impl DeepseekModel {
         let body_graph_enabled = dsv4_decode_body_cuda_graph_enabled()?
             && self.dsv4_decode_body_graph_ready(states, slot_indices, &start_pos, num_layers)?;
         let body_graph_force_eager = graph_force_eager || !body_graph_enabled;
+        let graph_safe_ffn_body = !dsv4_moe_deepep_enabled()?;
         let body_graph_run = decode_ctx.run_body_graph(
             &self.ctx,
             n,
@@ -1848,23 +1849,35 @@ impl DeepseekModel {
                         hc_mult,
                         n,
                     )?;
-                    let ffn_routed =
-                        scratch.ffn_routed_by_batch.get_mut(n - 1).ok_or_else(|| {
-                            anyhow::anyhow!("DSv4 batched FFN routed scratch missing for B={n}")
-                        })?;
-                    ffn_routed.seq_len = n;
-                    self.forward_ffn_layer_stream_with_graph_scratch_into(
-                        layer_idx,
-                        &scratch.attn_stream,
-                        tokens,
-                        &scratch.token_ids_gpu,
-                        &mut layer_cache.moe,
-                        ffn_mhc_scratch,
-                        &mut layer_cache.ffn_pre,
-                        &mut layer_cache.ffn_normed,
-                        ffn_routed,
-                        &mut scratch.stream,
-                    )?;
+                    if graph_safe_ffn_body {
+                        let ffn_routed =
+                            scratch.ffn_routed_by_batch.get_mut(n - 1).ok_or_else(|| {
+                                anyhow::anyhow!("DSv4 batched FFN routed scratch missing for B={n}")
+                            })?;
+                        ffn_routed.seq_len = n;
+                        self.forward_ffn_layer_stream_with_graph_scratch_into(
+                            layer_idx,
+                            &scratch.attn_stream,
+                            tokens,
+                            &scratch.token_ids_gpu,
+                            &mut layer_cache.moe,
+                            ffn_mhc_scratch,
+                            &mut layer_cache.ffn_pre,
+                            &mut layer_cache.ffn_normed,
+                            ffn_routed,
+                            &mut scratch.stream,
+                        )?;
+                    } else {
+                        scratch.stream = self.forward_ffn_layer_stream_with_scratch(
+                            layer_idx,
+                            &scratch.attn_stream,
+                            tokens,
+                            Some(&mut layer_cache.moe),
+                            Some(ffn_mhc_scratch),
+                            Some(&mut layer_cache.ffn_pre),
+                            Some(&mut layer_cache.ffn_normed),
+                        )?;
+                    }
                     dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
                 }
                 Ok(())
