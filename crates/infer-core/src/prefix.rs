@@ -1,12 +1,9 @@
 //! Radix prefix-cache choreography for [`Engine`].
 //!
-//! These `impl Engine` methods orchestrate `self.radix` (the host-side trie in
-//! `radix.rs`) together with the `KvPrefixStore`/`KvAllocator` ops on `self.kv`:
-//! attaching a matched prefix to an admitted request, publishing sealed blocks
-//! on finish, releasing reused pages, and reclaiming pages via LRU eviction when
-//! allocation would otherwise fail. Split out of the coordinator (`lib.rs`)
-//! because prefix reuse is a high-churn axis. Identical numerics — pure
-//! reorganization.
+//! `impl Engine` methods orchestrating `self.radix` (the trie in `radix.rs`) with
+//! the `KvPrefixStore`/`KvAllocator` ops on `self.kv`: attach a matched prefix,
+//! publish sealed blocks on finish, release reused pages, and reclaim via LRU
+//! eviction when allocation would fail.
 
 use anyhow::{Result, anyhow};
 use infer_seam::{BackendExecutor, KvPool};

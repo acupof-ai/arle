@@ -1,34 +1,13 @@
-//! CPU reference MoE routing — the device-independent ground truth.
+//! CPU reference MoE routing — the device-independent ground truth, unified in
+//! [`route`] driven by [`MoeConfig`]. Faithful port of two legacy routers
+//! (source line refs inline); they share a selection-then-weight skeleton and
+//! differ only in scoring func, selection key (bias vs none), and renorm timing.
 //!
-//! Every numeric here is a faithful port; the source line refs are inline. Two
-//! legacy routers are reproduced:
-//!
-//! ## DSv4 (`crates/deepseek-spec/src/v4.rs` + `csrc/moe/dsv4_route.cu`)
-//!
-//! 1. `scores = router_scores_from_logits(logits)` — softmax / sigmoid /
-//!    sqrt(softplus) over all experts (`v4.rs:305`).
-//! 2. Select top-k with the bias-corrected key `scores[e] + bias[e]`, tie-break
-//!    lower expert index (`topk_indices_by_score`, `v4.rs:556`). The bias is the
-//!    `e_score_correction_bias` and is used **only** for selection.
-//! 3. `normalize = scoring_func != softmax`; `denom = selected_sum + 1e-9` if
-//!    normalize else `1.0`; `weight = scores[e] / denom * routed_scaling_factor`
-//!    (`moe_routes_from_scores`, `v4.rs:382`). Note: softmax DSv4 does **not**
-//!    renormalize the top-k in the router.
-//!
-//! ## Qwen3.6 (`infer/src/model/qwen35/moe.rs` + `csrc/moe/qwen36_route.cu`)
-//!
-//! 1. `scores = softmax(logits)` over all experts.
-//! 2. Greedy top-k over the scores (no bias; the CUDA kernel feeds an all-zero
-//!    bias). Masked argmax: strictly-greater wins, tie-break lower index
-//!    (`dsv4_route.cu:421`).
-//! 3. Weights are the raw softmax probs (`routed_scaling_factor = 1.0`,
-//!    `denom = 1.0`), then **if `norm_topk_prob`** a separate renorm divides
-//!    each selected weight by the sum of the selected weights
-//!    (`qwen36_renorm_topk_weights`, `qwen36_route.cu:23`).
-//!
-//! Both share the same selection-then-weight skeleton; the only differences are
-//! the scoring func, the selection key (bias vs none), and when the top-k
-//! renormalization runs. They are unified in [`route`] driven by [`MoeConfig`].
+//! - **DSv4** (`v4.rs` + `dsv4_route.cu`): scores via softmax/sigmoid/
+//!   sqrt(softplus); top-k by bias-corrected key; `denom = 1.0` (softmax) else
+//!   `selected_sum + 1e-9`; `× routed_scaling_factor`. No softmax renorm.
+//! - **Qwen3.6** (`qwen35/moe.rs` + `qwen36_route.cu`): softmax scores; greedy
+//!   top-k (zero bias); raw probs, then a separate `norm_topk_prob` renorm.
 
 use crate::config::{MoeConfig, ScoringFunc, TopkMethod};
 use crate::error::{Result, bail};
@@ -121,12 +100,9 @@ pub fn scores_from_logits(logits: &[f32], scoring_func: ScoringFunc) -> Result<V
 
 // ── Selection — ported from `topk_indices_by_score` (`v4.rs:556`). ──────────
 
-/// Select the top-`k` expert indices by descending `scores[e] + bias[e]`,
-/// tie-broken by lower expert index. Port of `topk_indices_by_score`.
-///
-/// `bias` must be either empty (no correction — additive identity) or exactly
-/// `scores.len()` long. The mask, if present, marks ineligible experts (used by
-/// group-limited routing) with `false`; ineligible experts are never selected.
+/// Select the top-`k` experts by descending `scores[e] + bias[e]`, tie-broken by
+/// lower index. `bias` is empty (identity) or `scores.len()` long; `mask` (if
+/// present) marks ineligible experts `false` (group-limited routing).
 fn topk_indices_by_score(
     scores: &[f32],
     bias: &[f32],
@@ -149,15 +125,12 @@ fn topk_indices_by_score(
 }
 
 // ── Group-limited routing — DeepSeek-V2/V3 `n_group`/`topk_group`. ──────────
-//
-// NOT exercised by either ARLE legacy router (DSv4 here is `noaux_tc` with no
-// grouping, Qwen3.6 is plain greedy). Provided so this same CPU reference can
-// verify a grouped GPU kernel if a future checkpoint sets `n_group`. The group
-// score is the sum of the top-2 expert scores within the group — the canonical
-// DeepSeek-V3 rule — and the `topk_group` highest-scoring groups stay eligible.
+// Not exercised by either ARLE router; here so this reference can verify a
+// grouped kernel. Group score = top-2 expert scores summed (DeepSeek-V3 rule);
+// the `topk_group` highest groups stay eligible.
 
-/// Compute the per-group selection score: the sum of the top-2 (corrected)
-/// scores inside each contiguous equal-size group.
+/// Per-group selection score: the sum of the top-2 corrected scores in each
+/// contiguous equal-size group.
 fn group_scores(corrected: &[f32], n_group: usize) -> Vec<f32> {
     let experts_per_group = corrected.len() / n_group;
     (0..n_group)
@@ -203,12 +176,8 @@ pub fn group_limited_mask(corrected: &[f32], n_group: usize, topk_group: usize) 
     mask
 }
 
-/// Route one token from its router logits.
-///
-/// `gate_logits` is `[num_experts]` (the `gate @ x` output for this token).
-/// `bias` is the optional DSv4 `e_score_correction_bias` (`[num_experts]`, or
-/// empty for none). Returns the [`RoutingDecision`] — selected experts and
-/// their normalized weights, matching the legacy math exactly.
+/// Route one token. `gate_logits` is `[num_experts]`; `bias` is the optional DSv4
+/// `e_score_correction_bias` (or empty). Returns the selected experts + weights.
 pub fn route_token(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result<RoutingDecision> {
     cfg.validate()?;
     if gate_logits.len() != cfg.num_experts {
@@ -231,8 +200,7 @@ pub fn route_token(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result
 
     // ── 1. Scores over all experts. ────────────────────────────────────────
     let scores = scores_from_logits(gate_logits, cfg.scoring_func)?;
-    // The DSv4 reference asserts scores are finite and non-negative
-    // (`v4.rs:334`). Softmax / sigmoid / sqrt(softplus) all satisfy this.
+    // DSv4 asserts scores finite + non-negative (`v4.rs:334`).
     if scores.iter().any(|v| !v.is_finite() || *v < 0.0) {
         bail!("router scores must be finite and non-negative");
     }
@@ -260,12 +228,9 @@ pub fn route_token(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result
     let selected = topk_indices_by_score(&scores, selection_bias, cfg.top_k, mask.as_deref());
 
     // ── 4. Weights. ─────────────────────────────────────────────────────────
-    // DSv4 rule (`moe_routes_from_scores`, `v4.rs:386`): normalize iff the
-    // scoring func is not softmax; weight = scores[e] / denom * scaling.
-    // For softmax this leaves the raw probs (denom = 1.0). The Qwen3.6
-    // `norm_topk_prob` renorm — which only the greedy/softmax path uses — is a
-    // separate step below, mirroring that neither the DSv4 reference nor the
-    // CUDA `dsv4_route` kernel renormalizes the softmax path inside the router.
+    // DSv4 rule (`moe_routes_from_scores`, `v4.rs:386`): normalize iff scoring
+    // func != softmax; `weight = scores[e] / denom * scaling`. Softmax keeps raw
+    // probs (denom 1.0); the Qwen3.6 `norm_topk_prob` renorm is a separate step.
     let selected_sum: f32 = selected.iter().map(|&e| scores[e]).sum();
     let normalize = cfg.scoring_func != ScoringFunc::Softmax;
     let denom = if normalize {
@@ -282,17 +247,10 @@ pub fn route_token(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result
         })
         .collect();
 
-    // ── 5. Qwen3.6 norm_topk_prob renorm. ───────────────────────────────────
-    // Port of `qwen36_renorm_topk_weights` (`qwen36_route.cu:23`): divide each
-    // selected weight by the sum of the selected weights so they sum to 1.
-    //
-    // This is the **Qwen3.6 path only** (`TopkMethod::Greedy`), applied as a
-    // separate step gated on `norm_topk_prob`. The DSv4 reference router
-    // (`TopkMethod::NoAuxTc`) never runs it — its softmax path is fixed to
-    // denom = 1.0 (`v4.rs:386` `normalize = scoring_func != softmax`), and its
-    // sigmoid/sqrtsoftplus path was already normalized above by the DSv4 denom
-    // rule. Guarding on `!normalize` here is belt-and-suspenders: the Qwen path
-    // is always softmax, so it is always un-normalized at this point.
+    // ── 5. Qwen3.6 norm_topk_prob renorm (`qwen36_route.cu:23`). ─────────────
+    // Greedy path only: renorm the selected weights to sum 1. DSv4 (`NoAuxTc`)
+    // never runs it. The `!normalize` guard is belt-and-suspenders (the Qwen path
+    // is always softmax, hence un-normalized here).
     if cfg.norm_topk_prob && cfg.topk_method == TopkMethod::Greedy && !normalize {
         let sum: f32 = experts.iter().map(|ew| ew.weight).sum();
         let inv = if sum > 1.0e-20 { 1.0 / sum } else { 0.0 };
@@ -304,12 +262,8 @@ pub fn route_token(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result
     Ok(RoutingDecision { experts })
 }
 
-/// Route a flat batch of token logits.
-///
-/// `gate_logits` is `[num_tokens * num_experts]` row-major (token-major, the
-/// `gate @ x` layout the CUDA `dsv4_route` kernel consumes). `bias` is the
-/// shared `[num_experts]` correction bias (or empty). Returns one
-/// [`RoutingDecision`] per token.
+/// Route a flat batch. `gate_logits` is `[num_tokens * num_experts]` token-major;
+/// `bias` is the shared `[num_experts]` correction (or empty). One decision/token.
 pub fn route(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result<Vec<RoutingDecision>> {
     cfg.validate()?;
     if cfg.num_experts == 0 || !gate_logits.len().is_multiple_of(cfg.num_experts) {

@@ -1,53 +1,14 @@
-"""TileLang batch decode HD128 paged attention.
+"""TileLang batch decode HD128 paged attention (BF16, kv_heads=8 GQA family).
 
-TileLang HD128 paged decode path used by smaller Qwen3.5 full-attention
-shapes (head_dim=128 with kv_heads=8 GQA family).
-Decode = single-token Q per request (qo_len == 1), so the kernel reads
-paged K/V, runs one row of Q against the full kv_total_len for that
-request, and writes one output row.
+Decode = one Q row per request (qo_len == 1): read paged K/V, run that row
+against the full kv_total_len, write one output row. Sister to the HD256 decode
+template (deltas: HEAD_DIM=128, SM_SCALE=1/sqrt(128), the HD128 SUPPORTED_HEADS).
+Tile tunables and the int32 scalar args mirror HD256 (so gen_tilelang_aot.py's
+WRAPPER_FILL_RULES works unchanged).
 
-Sister to ``batch_decode_paged_hd256.py``. Deltas vs the HD256 template:
-
-  * ``HEAD_DIM = 128`` (vs 256).
-  * ``SM_SCALE = 1.0 / sqrt(128)``.
-  * ``SUPPORTED_HEADS`` covers the smaller HD128 GQA shapes; HD256
-    covers the larger Qwen3.5 full-attn family.
-
-Everything else (BLOCK_M=64, BLOCK_N=16=PAGE_SIZE, NUM_STAGES=2,
-NUM_THREADS=128, no causal mask, padded BLOCK_M layout) is identical to
-the HD256 decode template — TileLang's tile/pipeline tunables are
-HEAD_DIM-independent at this scale.
-
-Symbolic runtime int32 args (``batch_size``, ``total_q_tokens``,
-``max_qlen``, ``num_pages``, ``total_pages``) are kept identical to the
-HD256 decode kernel so ``gen_tilelang_aot.py::WRAPPER_FILL_RULES`` works
-without modification.
-
-Supported (num_q_heads, num_kv_heads) configurations (HD128 GQA full-attn
-shapes, mirrors ``TILELANG_PREFILL_HD128_HEAD_CONFIGS``):
-  (16, 8)
-  (32, 8)
-  (40, 8)
-  (64, 8)
-
-Tile / pipeline tunables (mirror HD256 decode):
-
-  BLOCK_M = 64
-  BLOCK_N = 16        (= PAGE_SIZE)
-  NUM_STAGES = 2
-  NUM_THREADS = 128   (4 warps)
-
-Shared-memory budget (HD128 is half of HD256, so the budget is well
-below every SM target's cap):
-
-  Q tile : BLOCK_M * HEAD_DIM * 2 B   = 64 * 128 * 2 =  16_384 B
-  K tile : BLOCK_N * HEAD_DIM * 2 B   = 16 * 128 * 2 =   4_096 B
-  V tile : BLOCK_N * HEAD_DIM * 2 B   = 16 * 128 * 2 =   4_096 B
-  Single-buffered total                              =  24_576 B (~24 KB)
-  With NUM_STAGES=2 double-buffering K/V:
-    Q(16 KB) + 2 * (K 4 KB + V 4 KB) = 32 KB.
-  Fits H100 (228 KB), L4 / sm_89 (99 KB), and every other SM target the
-  generator builds for.
+Tile tunables: BLOCK_M=64, BLOCK_N=16 (=PAGE_SIZE), NUM_STAGES=2, NUM_THREADS=128,
+no causal mask. Shared-mem ~32 KB double-buffered (Q 16 KB + 2*(K 4 KB + V 4 KB)),
+well under every SM target's cap.
 """
 
 import math
@@ -58,16 +19,14 @@ import tilelang.language as T
 HEAD_DIM = 128
 PAGE_SIZE = 16
 BLOCK_M = 64
-# Decode keeps the prefill-compatible BLOCK_M=64 fragment layout, then lowers
-# BLOCK_N to one page so dynamic shared memory remains SM-cap-safe.
+# BLOCK_N = one page keeps dynamic shared memory SM-cap-safe.
 BLOCK_N = 16
 NUM_STAGES = 2
 NUM_THREADS = 128
 MAX_SPLITS = 16
 
-# (num_q_heads, num_kv_heads) configurations. Mirrors the HD128 GQA
-# full-attn family. Extend here + the build.rs list + the matching
-# FFI/Rust dispatch arms in lockstep when adding a new size.
+# (num_q_heads, num_kv_heads). Extend here + build.rs + the FFI/Rust dispatch
+# arms in lockstep.
 SUPPORTED_HEADS = (
     (16, 8),
     (32, 8),
@@ -98,18 +57,14 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
         KV_indices: T.Tensor((T.symbolic("total_pages"),), index_dtype),
         KV_last_page_len: T.Tensor((T.symbolic("batch_size"),), index_dtype),
         Output: T.Tensor((T.symbolic("total_q_tokens"), num_q_heads * HEAD_DIM), dtype),
-        # TileLang 0.1.9 cannot use T.symbolic in grid extents — symbols
-        # there must come from a tensor shape or a kernel scalar arg.
-        # Keep the same scalar-arg shape as the HD256 decode kernel even
-        # though `max_qlen` is always 1 for decode; this lets
-        # gen_tilelang_aot.py's WRAPPER_FILL_RULES fill them without any
-        # changes.
+        # TileLang 0.1.9 can't use T.symbolic in grid extents; keep the HD256
+        # scalar-arg shape (max_qlen unused for decode) so WRAPPER_FILL_RULES
+        # fills them unchanged.
         batch_size: T.int32,
         max_qlen: T.int32,
     ):
-        # Grid: (1, num_q_heads, batch_size). One Q row per (request,
-        # head). Outer-x extent is fixed at 1 because qlen == 1 always
-        # for decode (no varlen Q-tile sweep).
+        # Grid: (1, num_q_heads, batch_size). One Q row per (request, head);
+        # outer-x is 1 (qlen == 1 for decode).
         with T.Kernel(
             1,
             num_q_heads,
@@ -126,8 +81,7 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
 
             T.use_swizzle(panel_size=8)
 
-            # Decode: bz indexes the request; bx == 0 always (grid x == 1).
-            # Single Q row per request, no q_start/qlen arithmetic.
+            # bz indexes the request; bx == 0 always. Single Q row, no qlen math.
             kv_page_start = KV_indptr[bz]
             kv_page_end = KV_indptr[bz + 1]
             num_kv_pages = kv_page_end - kv_page_start
@@ -140,10 +94,8 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             T.fill(m_i, -T.infinity(accum_dtype))
             T.fill(l_i, 0)
 
-            # Load the single real Q row for (request bz, head by) into
-            # q_tile[0, :]. Rows 1..63 are padding to satisfy TileLang's
-            # tensor-core M-divisibility constraint; they are masked out below
-            # and never written to Output.
+            # Real Q row → q_tile[0, :]; rows 1..63 are M-divisibility padding,
+            # masked out below and never written to Output.
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
                 q_tile[i, d] = T.if_then_else(
                     i == 0,
@@ -176,9 +128,7 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 T.clear(scores)
                 T.gemm(q_tile, k_tile, scores, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
-                # No causal mask: qlen == 1 means the single Q row
-                # legally attends to every KV position in
-                # [0, kv_total_len). Keep only the bounds clause.
+                # No causal mask (qlen == 1 attends to all of [0, kv_total_len)).
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
                     col = col0 + j
                     in_bounds = (i == 0) and (col < kv_total_len)
@@ -202,9 +152,7 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                         T.exp2((scores[i, j] - m_new[i]) * log2e),
                         T.cast(0, accum_dtype),
                     )
-                # Hoist the per-row alpha into its own fragment then drive
-                # the acc_o rescale as a 2D T.Parallel — same layout pattern
-                # as the HD256 decode kernel.
+                # Hoist per-row alpha + rescale acc_o as a 2D T.Parallel.
                 scale_i = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 for i in T.Parallel(BLOCK_M):
                     scale_i[i] = T.exp2((m_prev[i] - m_new[i]) * log2e)
@@ -216,23 +164,20 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 for i in T.Parallel(BLOCK_M):
                     l_i[i] = l_i[i] + row_sum[i]
                     m_i[i] = m_new[i]
-                # Narrow the f32 softmax output to bf16 to match v_tile
-                # before the P @ V matmul. TileLang 0.1.9's gemm asserts
-                # A.dtype == B.dtype.
+                # Narrow f32 softmax to bf16 to match v_tile (gemm asserts
+                # A.dtype == B.dtype).
                 p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
                 T.copy(p, p_bf16)
                 T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
-            # Single output row per (request, head). bz indexes the request
-            # directly; padded rows are intentionally dropped.
+            # One output row per (request, head); padded rows dropped.
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
                 if i == 0:
                     Output[bz, by * HEAD_DIM + d] = T.cast(
                         acc_o[i, d] / l_i[i], dtype
                     )
 
-    # Pin the kernel name so the generated symbol matches what the AOT
-    # build.rs / FFI side will look up: batch_decode_paged_hd128_q{Q}_kv{K}_run.
+    # Pin the symbol name the AOT build.rs / FFI side looks up.
     kernel.__name__ = f"batch_decode_paged_hd128_q{num_q_heads}_kv{num_kv_heads}_run"
     return kernel
 

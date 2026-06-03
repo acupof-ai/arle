@@ -1,10 +1,8 @@
 //! Real CUDA executor: the engine-facing step driver and sampling tail.
 //!
 //! Wraps the loaded [`CudaModel`] + device [`PagedKVPool`], validates the
-//! single-row R6 plan, mirrors host→device page allocation, and runs the forward
-//! that emits the next token. `sample_cuda_token` is the greedy/host-sampled
-//! decision applied to the final logits. Pure relocation from `model.rs` —
-//! identical numerics, with the Fix 0 sampling wiring preserved.
+//! single-row plan, mirrors host→device page allocation, runs the forward, and
+//! samples the next token (`sample_cuda_token`: greedy argmax / host sampling).
 
 use std::path::Path;
 
@@ -23,15 +21,12 @@ use crate::ops::argmax;
 
 const SUPPORTED_PAGE_SIZE: usize = 16;
 
-/// Sequence-length budget the captured decode graph's fixed `kv_indices` buffer is
-/// sized to. Bounds the page-table length so the buffer never reallocates mid-serve
-/// (design §5). Pages beyond this force eager fallback rather than a stale replay.
+/// Seq-len budget the captured decode graph's fixed `kv_indices` is sized to;
+/// pages beyond it fall back to eager rather than replay a stale graph.
 const DECODE_GRAPH_MAX_SEQ_LEN: usize = 32_768;
 
-/// Whether the captured B=1 decode graph is enabled. Opt-in so the eager path
-/// (the numerically-verified Phase-0 correctness floor) stays the default until
-/// the lead runs the H20 eager-vs-replay parity + perf A/B. Flip with
-/// `INFER_CUDA_DECODE_GRAPH=1`.
+/// Captured B=1 decode graph enabled? Opt-in via `INFER_CUDA_DECODE_GRAPH=1`;
+/// the eager path (correctness floor) is the default.
 fn decode_graph_enabled() -> bool {
     matches!(
         std::env::var("INFER_CUDA_DECODE_GRAPH").as_deref(),
@@ -43,14 +38,13 @@ pub(crate) struct RealCudaExecutor {
     model: CudaModel,
     kv: PagedKVPool,
     num_slots: usize,
-    /// Fixed device buffers for the B=1 captured decode path (CG-2). Lazily built
-    /// at warmup; `None` until then (and on capture failure, which falls back to
-    /// the eager path — capture is never load-bearing for correctness).
+    /// Fixed device buffers for the B=1 captured decode path. Built lazily at
+    /// warmup; `None` until then / on capture failure (capture is never
+    /// load-bearing for correctness — eager is the floor).
     decode_ctx: Option<DecodeGraphContext>,
-    /// Per-shape captured decode graphs (CG-1/CG-4). Keyed by page-table length
-    /// (`num_pages`) for this B=1 landing: batch is always
-    /// [`DECODE_GRAPH_BATCH`], so the page count is the only shape that varies the
-    /// captured TileLang `total_pages` launch scalar. A new page count recaptures.
+    /// Per-shape captured decode graphs, keyed by page-table length: batch is
+    /// fixed at [`DECODE_GRAPH_BATCH`], so `num_pages` is the only varying capture
+    /// scalar. A new page count recaptures.
     graphs: Option<GraphBucket>,
 }
 
@@ -115,10 +109,8 @@ impl RealCudaExecutor {
         })
     }
 
-    /// Build the real CUDA executor for a single-GPU BF16 Qwen3.5/3.6 **MoE**
-    /// checkpoint (MoE-4). Same KV/page setup as the dense path; the model loader
-    /// ([`CudaModel::from_qwen35_moe_safetensors`]) populates dense vs MoE layers
-    /// per `Qwen35Config::is_moe_layer`. Single-GPU only (all experts local).
+    /// Build the real CUDA executor for a single-GPU BF16 Qwen3.5/3.6 MoE
+    /// checkpoint (all experts local). Same KV/page setup as the dense path.
     pub(crate) fn from_qwen35_moe_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
@@ -237,9 +229,7 @@ impl RealCudaExecutor {
             );
             self.kv.alloc_tokens(row.slot, 1)?;
             let position = row.kv_seq_len.saturating_add(1) as u64;
-            // CG-3: try the captured B=1 decode graph first; on any miss (graphs
-            // disabled, page count over budget, capture failure) fall back to the
-            // verified eager path below. Eager is the correctness floor.
+            // Try the captured graph; on any miss fall back to the eager path.
             match self.try_captured_decode(row.slot, row.last_token, row.kv_seq_len)? {
                 Some(()) => self.sample_decode_logits(&row.params, position)?,
                 None => self.model.forward_tokens(
@@ -267,28 +257,17 @@ impl RealCudaExecutor {
         })
     }
 
-    /// CG-4: warmup the B=1 decode graph before serving.
+    /// Warmup the B=1 decode graph before serving.
     ///
-    /// Builds the fixed [`DecodeGraphContext`], reserves a dummy slot, writes dummy
-    /// metadata, then captures the decode graph for the smallest shape
-    /// (`num_pages = 1`) so the capture machinery is proven before the first real
-    /// request. Subsequent page counts capture lazily on first decode at that shape
-    /// (legacy `run_or_capture` semantics — capture-once, replay-after, per key),
-    /// which adapts the design's "warmup captures every bucket" to the page-count
-    /// key this B=1 landing uses (see [`DecodeGraphContext`] docs).
-    ///
-    /// Capture is opt-in via `INFER_CUDA_DECODE_GRAPH=1` so the lead can run a
-    /// matched eager-vs-replay A/B on H20 with one env flip. Any failure during
-    /// warmup capture is logged and downgrades to eager-only (graphs left `None`);
-    /// it is never fatal, because the eager path is the correctness floor.
+    /// Captures the smallest shape (`num_pages = 1`) so the machinery is proven
+    /// before the first request; later page counts capture lazily on first decode
+    /// (capture-once, replay-after, per key). Opt-in via
+    /// `INFER_CUDA_DECODE_GRAPH=1`; any capture failure downgrades to eager-only
+    /// (never fatal — eager is the correctness floor).
     pub(crate) fn warmup(&mut self) -> Result<()> {
-        // TP × CUDA-graph guard: NCCL all-reduce is NOT graph-capturable
-        // (`NcclBackend::supports_graph_capture() == false`), and the row-parallel
-        // forward issues an all-reduce per layer under TP. Capturing would bake a
-        // graph that silently skips the collective and produce wrong logits, so
-        // multi-rank TP stays on the eager `forward_tokens` path (the correctness
-        // floor). CUDA-graph decode remains a single-GPU optimization. Follow-up:
-        // graph-capturable collectives (CustomAR / SymmMem) would lift this.
+        // NCCL all-reduce is not graph-capturable, so multi-rank TP stays eager
+        // (a captured graph would silently skip the collective → wrong logits).
+        // CUDA-graph decode is a single-GPU optimization.
         if self.model.tp.is_collective() {
             info!(
                 "CUDA decode graph disabled under tensor parallelism \
@@ -319,8 +298,8 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Allocate the fixed buffers + capture the `num_pages = 1` decode graph using a
-    /// dummy slot. Isolated so a capture failure leaves the executor eager-only.
+    /// Allocate the fixed buffers + capture `num_pages = 1` on a dummy slot.
+    /// Isolated so a capture failure leaves the executor eager-only.
     fn build_and_capture_warmup(&mut self) -> Result<()> {
         let cfg = &self.model.config;
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
@@ -351,13 +330,11 @@ impl RealCudaExecutor {
         Ok(())
     }
 
-    /// CG-3 fast path: write Stage-1 metadata into the fixed buffers and replay (or
-    /// lazily capture-then-replay) the decode graph for this step's page count.
-    ///
-    /// Returns `Ok(Some(()))` when the captured graph wrote `decode_ctx.logits`
-    /// (caller samples from there), or `Ok(None)` to signal eager fallback (graphs
-    /// disabled, or page count exceeds the fixed buffer budget). The KV token for
-    /// this step must already be allocated in `self.kv` before calling.
+    /// Write Stage-1 metadata and replay (or lazily capture) the decode graph for
+    /// this step's page count. Returns `Ok(Some(()))` when the graph wrote
+    /// `decode_ctx.logits` (sample from there), `Ok(None)` for eager fallback
+    /// (disabled, or page count over budget). The step's KV token must already be
+    /// allocated.
     fn try_captured_decode(
         &mut self,
         slot: usize,
@@ -367,7 +344,7 @@ impl RealCudaExecutor {
         if self.decode_ctx.is_none() || self.graphs.is_none() {
             return Ok(None);
         }
-        // Page count over the fixed buffer budget → eager (never a stale replay).
+        // Page count over budget → eager (never a stale replay).
         let total_len = kv_seq_len + 1;
         let num_pages = total_len.div_ceil(self.kv.page_size);
         if num_pages > DECODE_GRAPH_MAX_SEQ_LEN.div_ceil(self.kv.page_size) {
@@ -377,19 +354,17 @@ impl RealCudaExecutor {
         Ok(Some(()))
     }
 
-    /// Stage-1 write + `run_or_capture` for the current decode state.
-    ///
-    /// Captures the graph the first time a `num_pages` shape is seen and replays it
-    /// on every later call at that shape. The page-table length is the capture key
-    /// (B=1, so batch is fixed); a new page count gets its own graph entry.
+    /// Stage-1 write + `run_or_capture` for the current decode state. Captures on
+    /// first sight of a `num_pages` shape, replays after; a new page count gets
+    /// its own graph entry.
     fn capture_decode_for_current_state(
         &mut self,
         slot: usize,
         token: u32,
         kv_seq_len: usize,
     ) -> Result<()> {
-        // Split borrows: stage1 needs &self.kv + &mut decode_ctx; replay needs
-        // &self.model + &mut self.kv + &mut decode_ctx + &mut graphs.
+        // Split borrows: stage1 needs &kv + &mut decode_ctx; replay needs &model +
+        // &mut kv + &mut decode_ctx + &mut graphs.
         let key: DecodeGraphKey = {
             let decode_ctx = self
                 .decode_ctx
@@ -417,9 +392,7 @@ impl RealCudaExecutor {
     }
 
     /// Sample the next token from the captured graph's fixed logits buffer.
-    ///
-    /// Sampling stays OUTSIDE the graph (design §7): the replay ends at
-    /// `decode_ctx.logits`; greedy argmax / host sampling runs here, eager.
+    /// Sampling stays outside the graph (replay ends at `decode_ctx.logits`).
     fn sample_decode_logits(&self, params: &SamplingParams, position: u64) -> Result<u32> {
         let decode_ctx = self
             .decode_ctx
@@ -454,8 +427,8 @@ pub(crate) fn sample_cuda_token(
         return argmax(ctx, logits);
     }
 
-    // TODO(Fix 0 follow-up): repetition/frequency/presence penalties need the
-    // per-request generated-token history threaded through the executor.
+    // TODO: repetition/frequency/presence penalties need the per-request
+    // generated-token history threaded through the executor.
     let logits_host = logits.to_host(ctx)?;
     Ok(infer_plan::sample_token(&logits_host, params, position))
 }
