@@ -7,6 +7,36 @@ means porting the legacy DSv4 path into `infer-cuda`. **Kernels are SHARED** (`c
 FlashMLA, DeepGEMM, DeepEP) — reusable as-is; this is a **rewrite-side orchestration port**,
 but MLA attention is a genuinely new subsystem (not a GEMM swap).
 
+## Parity oracle (legacy DSv4, captured 2026-06-04, 8-GPU TP=8)
+
+Build OK on pod (`scripts/dsv4_fast_build.sh`, release-fast): cuda/nccl + DeepGEMM-native +
+FlashMLA + FP8-KV + DeepEP sidecar. Recipe: `CUDA_VISIBLE_DEVICES=0..7`,
+`ARLE_DSV4_{LOAD_LAYER_WEIGHTS,GPU_FULL_LAYERS=43,INCREMENTAL_KV,FLASHMLA_PREFILL,FLASHMLA_DECODE}=1`,
+`ARLE_DSV4_MOE_BACKEND=allreduce ARLE_DSV4_EXPERT_BACKEND=native`, `--kv-cache-dtype fp8`.
+Prompt "The capital of France is", 16 new →
+`[11111,603,671,6102,294,8760,344,11111,603,671,6102,294,8760,344,11111,603]`
+= " Paris.\nThe capital of France is Paris.\n…" (coherent). **This is the rewrite-port
+parity target.** Timing seed (debug, not baseline): decode ~51.7 ms/tok.
+
+**Legacy gap (motivates reorganize-while-porting):** native DeepEP *boots* (8 ranks,
+transport attached) but dispatch/combine is NOT served through the legacy path (fail-closed);
+the oracle ran the native-scalar-expert fallback. DeepGEMM expert backend works (1-tok probe
+`[11111]`). The port should wire DeepEP serving properly + default DeepGEMM experts, not
+copy the fallback.
+
+## Port philosophy — reorganize + optimize, NOT 1:1 copy
+
+Legacy DSv4 (`infer/`) may carry bugs/cruft (debug fallbacks, dead paths, the custom
+M-tile=32 GEMM that SGLang routes through native DeepGEMM). The port is the chance to
+converge to best-practice (first-principles, deletion-refactor): clean structure, drop
+cruft, and carry the SGLang-survey optimizations where correctness-safe (native DeepGEMM
+default, decode low-latency DeepEP dispatch, SBO/TBO overlap, un-absorbed MHA prefill at
+prefix==0). Verification discipline: greedy parity vs the legacy oracle CATCHES porting
+errors, but the oracle is legacy — where legacy diverges from best practice (the survey's
+flagged items), FIX it in the port and verify the output stays correct (coherent gen /
+known-good ref), don't propagate a legacy bug. Perf-only changes must preserve the token
+sequence (verify same output).
+
 ## Pieces (effort, dependency)
 
 | # | Piece | Effort | Into | Reuses (shared) | Net-new |
