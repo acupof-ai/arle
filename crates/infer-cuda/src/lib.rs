@@ -35,11 +35,26 @@ mod attention;
 #[cfg(feature = "cuda")]
 mod executor;
 #[cfg(feature = "cuda")]
+pub mod graph;
+#[cfg(feature = "cuda")]
 mod loader;
 #[cfg(feature = "cuda")]
 mod model;
 #[cfg(feature = "cuda")]
 mod ops;
+
+// Tensor-parallel runtime config + communicator handle (TP-1). The env→config
+// resolution is feature-agnostic and CPU-tested; only the NCCL comm variant is
+// feature-gated, so this module is NOT cuda-gated.
+pub mod tp;
+
+// Per-rank weight-shard byte slicing (TP-2). Pure-CPU byte-range math; the
+// device upload that consumes it stays in the cuda-gated `loader`.
+pub mod shard_slice;
+
+// MoeConfig bridge qwen35-spec → infer-moe (MoE-1) + per-rank expert split
+// arithmetic (MoE-3). Feature-agnostic CPU logic.
+pub mod moe_config;
 
 /// Host-side paged KV bookkeeping for the CUDA backend.
 ///
