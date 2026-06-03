@@ -1,0 +1,26 @@
+[package]
+name = "infer-topo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Phase-1 (Tensor Parallel) FOUNDATION crate for the ARLE rewrite.
+#
+# Pure-Rust, CPU-verifiable topology + sharding math ported from the legacy
+# `infer/src/tensor_parallel.rs`. Zero device/GPU/NCCL deps by design: this is
+# durable, unit-testable foundation code. Communicator wiring (NCCL) is
+# intentionally NOT here — it is gated on H20 verification and lands later.
+#
+# Depends on nothing but std (+ optional serde for config (de)serialization).
+
+[dependencies]
+serde = { workspace = true, features = ["derive"], optional = true }
+
+[features]
+# Derive serde traits on the config/topology types. Off by default to keep the
+# foundation crate std-only.
+serde = ["dep:serde"]
+
+[lints]
+workspace = true
