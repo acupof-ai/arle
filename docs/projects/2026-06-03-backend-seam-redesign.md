@@ -2,8 +2,9 @@
 
 **Status:** design (hypothesis-grade; SGLang-grounded, ARLE-audited). Not yet
 licensed for L1+ — see §Open hypotheses.
-**Driver:** ckl — "现在的架构不支持横向扩展到 hip 和不同的后端;架构设计有些问题。
-自底向上的优化,参考 sglang。"
+**Driver:** ckl — "the current architecture does not support scaling horizontally
+to HIP and other backends; the architectural design has problems. Optimize
+bottom-up, taking SGLang as reference."
 **Anchor scan:** [`wins/2026-06-03-sglang-backend-seam-scan.md`](../experience/wins/2026-06-03-sglang-backend-seam-scan.md)
 
 ## Problem
