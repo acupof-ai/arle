@@ -71,6 +71,11 @@ Do not run or publish the 256K/1500 target as a hot-cache result until the
 measured request trace proves `direct_gpu_attach=true` or an equivalent DSv4
 prefix-restore path with near-zero `resume_prefill_tokens`.
 
+Follow-up guard: the DSv4 startup contract now logs
+`hot_prefix_attach_supported` and includes this blocker in the explicit
+SGLang best-practice missing list. That keeps target-profile runs fail-closed
+instead of silently reporting a prefix-recompute request as hot-cache.
+
 The next implementation tranche needs one of:
 
 - a DSv4 cross-slot prefix attach contract that reconstructs or carries

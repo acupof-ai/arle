@@ -733,6 +733,7 @@ impl ModelForward for DeepseekModel {
         let incremental_kv = dsv4_incremental_kv_enabled()?;
         let body_graph_enabled = dsv4_decode_body_cuda_graph_enabled()?;
         let body_graph_max_bs = dsv4_decode_body_cuda_graph_max_batch_size()?;
+        let hot_prefix_attach_supported = self.supports_cross_slot_prefix_attach();
         let model_row_metadata = "decode-batch-distributed-shard-visible";
         let (model_row_ownership, model_row_ownership_error) =
             match self.startup_model_row_ownership(contract) {
@@ -748,7 +749,7 @@ impl ModelForward for DeepseekModel {
         };
 
         log::info!(
-            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} communicator_layout={} communicator_axes={} request_ownership={} model_row_metadata={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} spec_enabled={} spec_internal_mtp={} spec_draft_k={} internal_mtp_accepts_drafts={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
+            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} communicator_layout={} communicator_axes={} request_ownership={} model_row_metadata={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} spec_enabled={} spec_internal_mtp={} spec_draft_k={} internal_mtp_accepts_drafts={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} hot_prefix_attach_supported={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
             profile.as_str(),
             fallback_lane,
             self.config.tp.rank,
@@ -776,6 +777,7 @@ impl ModelForward for DeepseekModel {
             graph_support.reason,
             body_graph_enabled,
             body_graph_max_bs,
+            hot_prefix_attach_supported,
             moe_backend,
             expert_backend,
             flashmla_prefill,
@@ -814,6 +816,11 @@ impl ModelForward for DeepseekModel {
                 graph_support.mode_label(),
                 graph_support.reason
             ));
+        }
+        if !hot_prefix_attach_supported {
+            missing.push(
+                "DSv4-Flash 256K/1500 hot-cache target requires direct GPU prefix attach, but Deepseek::supports_cross_slot_prefix_attach() is false; repeated prompts can radix-hit while still recomputing prefill".to_string(),
+            );
         }
         let distributed = self.config.tp.world_size > 1 || self.config.ep.world_size > 1;
         if distributed {
