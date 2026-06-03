@@ -1,15 +1,15 @@
 use super::nvtx_scopes::nvtx_scope;
 use super::{FinishReason, GenerationState, ModelForward, Phase, Scheduler, error, warn};
 use crate::model::{
-    DecodeContextOps, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest,
-    PrefillBatchRequest,
+    DecodeBatchRequest, DecodeContextOps, MixedBatchFallbackReason, MixedBatchOutcome,
+    MixedBatchRequest, PrefillBatchRequest,
 };
-use crate::scheduler::DraftMode;
 use crate::scheduler::cuda::core::{
     GpuStageKind, PendingDecode, PendingMixedPrefill, PendingPrefill, PendingPrefillRow,
 };
 use crate::scheduler::cuda::execution::PrefillCandidate;
 use crate::scheduler::cuda::runtime::WaitingInsertBias;
+use crate::scheduler::{DistributedRequestShard, DraftMode};
 
 fn retract_victim_score(
     generated_tokens: usize,
@@ -251,6 +251,14 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let slot_indices = decode_indices.clone();
+        let distributed_shards: Vec<DistributedRequestShard> = slot_indices
+            .iter()
+            .map(|&slot_idx| {
+                self.request(slot_idx)
+                    .map(|req| req.distributed_shard)
+                    .unwrap_or_else(DistributedRequestShard::single_rank)
+            })
+            .collect();
         let sampling_params: Vec<crate::sampler::SamplingParams> = decode_indices
             .iter()
             .filter_map(|&slot_idx| self.request(slot_idx).map(|req| req.sampling.clone()))
@@ -280,10 +288,14 @@ impl<M: ModelForward> Scheduler<M> {
             decode_ctx.force_eager_once();
         }
 
-        let forward_result = self.model.forward_decode_batch(
-            &token_ids,
+        let decode_batch = DecodeBatchRequest {
+            tokens: &token_ids,
+            slot_indices: &slot_indices,
+            distributed_shards: &distributed_shards,
+        };
+        let forward_result = self.model.forward_decode_batch_with_request(
+            decode_batch,
             &mut self.states,
-            &slot_indices,
             Some(&mut self.paged_kv_pool),
             decode_ctx,
             all_greedy,
