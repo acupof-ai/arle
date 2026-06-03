@@ -2663,22 +2663,15 @@ impl DeepseekModel {
         let routed = if use_deepep {
             #[cfg(feature = "nccl")]
             {
-                if dsv4_native_deepep_enabled()? {
-                    bail!(
-                        "DSv4 internal MTP frozen-KV draft does not support native DeepEP on \
-                         replicated-token TP/EP yet"
-                    );
-                }
-                mtp.ffn.forward_deepep_routed_gpu(
-                    &self.ctx,
-                    &self.layer_communicator,
-                    mtp_routing_layer_idx,
-                    &self.config.spec,
-                    &self.config.ep,
-                    &normed,
-                    &[token],
-                    Some(moe_scratch),
-                )?
+                let backend = if dsv4_native_deepep_enabled()? {
+                    "native DeepEP"
+                } else {
+                    "DeepEP-style dispatch"
+                };
+                bail!(
+                    "DSv4 internal MTP frozen-KV draft does not support {backend} on \
+                     replicated-token TP/EP yet"
+                );
             }
             #[cfg(not(feature = "nccl"))]
             {
