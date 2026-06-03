@@ -67,6 +67,8 @@ use crate::model::{InternalMtpDraftOutput, InternalMtpDraftRequest};
 use crate::ops;
 #[cfg(feature = "cuda")]
 use crate::ops::LinearDispatchPhase;
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+use crate::tensor_parallel::{build_attn_cp_groups, build_attn_dp_groups, build_attn_owner_groups};
 #[cfg(feature = "cuda")]
 use crate::tp::TpLoadContext;
 #[cfg(feature = "cuda")]
@@ -230,10 +232,19 @@ impl DeepseekModel {
         states: &mut [super::state::DeepseekState],
         slot_indices: &[usize],
         decode_ctx: &mut DeepseekBatchDecodeBuffers,
+        token_owned_rows_validated: bool,
     ) -> Result<bool> {
-        // N == 1: per-row path is already optimal and the only validated
-        // single-sequence path. Don't route through the batch machinery.
-        if tokens.len() < 2 {
+        let native_deepep_token_owned = dsv4_native_deepep_request_batch_required(
+            token_owned_rows_validated,
+            dsv4_native_deepep_enabled()?,
+        );
+        // N == 1: per-row path is already optimal unless the request-aware
+        // token-owned DSv4 path needs to carry validated row ownership into
+        // NativeDeepEP, or explicit body-graph capture is being validated. The
+        // per-row fallback has no request metadata and cannot reach the DSv4
+        // body graph run site.
+        if tokens.len() < 2 && !native_deepep_token_owned && !dsv4_decode_body_cuda_graph_enabled()?
+        {
             return Ok(false);
         }
         // CPU reference model active → batch method does not replicate it.
@@ -262,7 +273,13 @@ impl DeepseekModel {
             );
         }
 
-        self.compute_top_level_logits_incremental_batch(tokens, states, slot_indices, decode_ctx)?;
+        self.compute_top_level_logits_incremental_batch(
+            tokens,
+            states,
+            slot_indices,
+            decode_ctx,
+            token_owned_rows_validated,
+        )?;
         for &slot_idx in slot_indices {
             let state = &mut states[slot_idx];
             state.base.prefill_logits = None;
@@ -282,14 +299,16 @@ impl DeepseekModel {
     pub fn from_config(config: DeepseekRuntimeConfig) -> Result<Self> {
         let ctx = DeviceContext::new()?;
         let layer_communicator = Self::layer_communicator_from_config(&ctx, &config)?;
+        let communicator_layout = layer_communicator.layout_label();
         info!(
-            "DeepSeek V4 runtime topology: tp={}/{} ep={}/{} axes={} coord={:?} communicator=global-tp-ep-only",
+            "DeepSeek V4 runtime topology: tp={}/{} ep={}/{} axes={} coord={:?} communicator={}",
             config.tp.rank,
             config.tp.world_size,
             config.ep.rank,
             config.ep.world_size,
             config.axes.summary(),
             config.rank_coord,
+            communicator_layout,
         );
         let model = Self {
             config,
@@ -311,16 +330,61 @@ impl DeepseekModel {
         ctx: &DeviceContext,
         config: &DeepseekRuntimeConfig,
     ) -> Result<LayerCommunicator> {
-        let mut comm = LayerCommunicator::new_with_ep(
-            config.tp.rank,
-            config.tp.world_size,
-            0,
-            1,
-            0,
-            1,
+        config.axes.validate()?;
+        let axes_match_runtime_tp = config.axes.world_size() == config.tp.world_size
+            && config.rank_coord.world_rank == config.tp.rank;
+        let (
+            comm_tp_rank,
+            comm_tp_world_size,
+            comm_dp_rank,
+            comm_dp_world_size,
+            comm_cp_rank,
+            comm_cp_world_size,
+        ) = if axes_match_runtime_tp {
+            (
+                config.rank_coord.attn_tp_rank,
+                config.axes.attn_tp_size(),
+                config.rank_coord.attn_dp_rank,
+                config.axes.attn_dp_size,
+                config.rank_coord.attn_cp_rank,
+                config.axes.attn_cp_size,
+            )
+        } else {
+            (config.tp.rank, config.tp.world_size, 0, 1, 0, 1)
+        };
+        let comm = LayerCommunicator::new_with_ep(
+            comm_tp_rank,
+            comm_tp_world_size,
+            comm_dp_rank,
+            comm_dp_world_size,
+            comm_cp_rank,
+            comm_cp_world_size,
             config.ep.rank,
             config.ep.world_size,
         )?;
+        #[cfg(feature = "nccl")]
+        let mut comm = comm;
+        #[cfg(feature = "nccl")]
+        let comm_matches_global_tp =
+            comm.tp_rank() == config.tp.rank && comm.tp_world_size() == config.tp.world_size;
+        #[cfg(feature = "nccl")]
+        let owner_token_sync_group = if comm_matches_global_tp {
+            None
+        } else {
+            dsv4_request_owner_token_sync_group(config)?
+        };
+        #[cfg(feature = "nccl")]
+        let attention_dp_group = if comm_matches_global_tp {
+            None
+        } else {
+            dsv4_attention_dp_group(config)?
+        };
+        #[cfg(feature = "nccl")]
+        let attention_cp_group = if comm_matches_global_tp {
+            None
+        } else {
+            dsv4_attention_cp_group(config)?
+        };
 
         #[cfg(feature = "nccl")]
         {
@@ -328,28 +392,111 @@ impl DeepseekModel {
 
             let mut tp_nccl = None;
             if config.tp.world_size > 1 {
-                let group = Arc::new(NcclGroup::new_on_stream(
-                    config.tp.rank,
-                    config.tp.world_size,
-                    NcclInitMethod::EnvBootstrap,
-                    ctx.stream.clone(),
-                )?);
-                comm = comm.with_tp_nccl(Arc::clone(&group))?;
-                comm = comm.with_request_token_sync_nccl(Arc::clone(&group));
-                tp_nccl = Some(group);
-
-                // A4 — secondary TP NCCL group bound to `ctx.comm_stream` so
-                // FlashMLA prefill AllGather Q can overlap with kv_pack /
-                // build_indices on the compute stream. Default off until
-                // the pod PASS at 24K reproduces the wash-case improvement.
-                if dsv4_flashmla_tp_overlap_enabled()? {
-                    let overlap_group = Arc::new(NcclGroup::new_on_stream(
+                if comm_matches_global_tp {
+                    let group = Arc::new(NcclGroup::new_on_stream(
                         config.tp.rank,
                         config.tp.world_size,
-                        dsv4_nccl_env_bootstrap_with_port_offset(2)?,
-                        ctx.comm_stream.clone(),
+                        NcclInitMethod::EnvBootstrap,
+                        ctx.stream.clone(),
                     )?);
-                    comm = comm.with_tp_overlap_nccl(overlap_group)?;
+                    comm = comm.with_tp_nccl(Arc::clone(&group))?;
+                    comm = comm.with_request_token_sync_nccl(Arc::clone(&group));
+                    tp_nccl = Some(group);
+
+                    // A4 — secondary TP NCCL group bound to `ctx.comm_stream` so
+                    // FlashMLA prefill AllGather Q can overlap with kv_pack /
+                    // build_indices on the compute stream. Default off until
+                    // the pod PASS at 24K reproduces the wash-case improvement.
+                    if dsv4_flashmla_tp_overlap_enabled()? {
+                        let overlap_group = Arc::new(NcclGroup::new_on_stream(
+                            config.tp.rank,
+                            config.tp.world_size,
+                            dsv4_nccl_env_bootstrap_with_port_offset(2)?,
+                            ctx.comm_stream.clone(),
+                        )?);
+                        comm = comm.with_tp_overlap_nccl(overlap_group)?;
+                    }
+                } else {
+                    if dsv4_flashmla_tp_overlap_enabled()? {
+                        bail!(
+                            "ARLE_DSV4_FLASHMLA_TP_OVERLAP requires a global TP communicator; \
+                             current communicator_axes={} global_tp={}/{} axes={}",
+                            comm.axis_summary(),
+                            config.tp.rank,
+                            config.tp.world_size,
+                            config.axes.summary(),
+                        );
+                    }
+                    info!(
+                        "DeepSeek V4 owner-group communicator axes declared without global TP NCCL attach: communicator_axes={} global_tp={}/{} axes={}",
+                        comm.axis_summary(),
+                        config.tp.rank,
+                        config.tp.world_size,
+                        config.axes.summary(),
+                    );
+                }
+            }
+            if let Some(owner_sync) = owner_token_sync_group {
+                if owner_sync.world_size > 1 {
+                    let port_offset = dsv4_owner_group_nccl_port_offset(owner_sync.group_index)?;
+                    let group = Arc::new(NcclGroup::new_on_stream(
+                        owner_sync.rank,
+                        owner_sync.world_size,
+                        dsv4_nccl_env_bootstrap_with_port_offset(port_offset)?,
+                        ctx.stream.clone(),
+                    )?);
+                    comm = comm.with_request_token_sync_nccl(Arc::clone(&group));
+                    info!(
+                        "DeepSeek V4 owner-group token-sync NCCL attached: group_index={} ranks={:?} request_sync_rank={}/{} communicator_axes={} port_offset={}",
+                        owner_sync.group_index,
+                        owner_sync.ranks,
+                        owner_sync.rank,
+                        owner_sync.world_size,
+                        comm.axis_summary(),
+                        port_offset,
+                    );
+                }
+            }
+            if let Some(attn_dp) = attention_dp_group {
+                if attn_dp.world_size > 1 {
+                    let port_offset = dsv4_attention_dp_nccl_port_offset(attn_dp.group_index)?;
+                    let group = Arc::new(NcclGroup::new_on_stream(
+                        attn_dp.rank,
+                        attn_dp.world_size,
+                        dsv4_nccl_env_bootstrap_with_port_offset(port_offset)?,
+                        ctx.stream.clone(),
+                    )?);
+                    comm = comm.with_attn_dp_nccl(Arc::clone(&group))?;
+                    info!(
+                        "DeepSeek V4 attention-DP NCCL attached: group_index={} ranks={:?} attn_dp_rank={}/{} communicator_axes={} port_offset={}",
+                        attn_dp.group_index,
+                        attn_dp.ranks,
+                        attn_dp.rank,
+                        attn_dp.world_size,
+                        comm.axis_summary(),
+                        port_offset,
+                    );
+                }
+            }
+            if let Some(attn_cp) = attention_cp_group {
+                if attn_cp.world_size > 1 {
+                    let port_offset = dsv4_attention_cp_nccl_port_offset(attn_cp.group_index)?;
+                    let group = Arc::new(NcclGroup::new_on_stream(
+                        attn_cp.rank,
+                        attn_cp.world_size,
+                        dsv4_nccl_env_bootstrap_with_port_offset(port_offset)?,
+                        ctx.stream.clone(),
+                    )?);
+                    comm = comm.with_attn_cp_nccl(Arc::clone(&group))?;
+                    info!(
+                        "DeepSeek V4 attention-CP NCCL attached: group_index={} ranks={:?} attn_cp_rank={}/{} communicator_axes={} port_offset={}",
+                        attn_cp.group_index,
+                        attn_cp.ranks,
+                        attn_cp.rank,
+                        attn_cp.world_size,
+                        comm.axis_summary(),
+                        port_offset,
+                    );
                 }
             }
             if config.ep.world_size > 1 {
@@ -368,7 +515,7 @@ impl DeepseekModel {
                 };
                 comm = comm.with_ep_nccl(Arc::clone(&group))?;
                 if config.tp.world_size == 1 {
-                    comm = comm.with_request_token_sync_nccl(group);
+                    comm = comm.with_request_token_sync_nccl(Arc::clone(&group));
                 }
 
                 if dsv4_combine_overlap_enabled() {
@@ -381,22 +528,35 @@ impl DeepseekModel {
                     comm = comm.with_ep_overlap_nccl(overlap_group)?;
                 }
 
-                if dsv4_native_deepep_enabled()?
-                    && !config.performance_profile()?.requires_best_practice()
-                {
-                    bail!(
-                        "ARLE_DSV4_MOE_BACKEND=native-deepep is reserved for the \
-                         SGLang best-practice token-owned request path. Set \
-                         ARLE_DSV4_PERFORMANCE_PROFILE=sglang after satisfying the \
-                         startup contract, or use ARLE_DSV4_MOE_BACKEND=allreduce \
-                         for the debug fallback lane."
+                if dsv4_native_deepep_enabled()? {
+                    if !config.performance_profile()?.requires_best_practice() {
+                        bail!(
+                            "ARLE_DSV4_MOE_BACKEND=native-deepep is reserved for the \
+                             SGLang best-practice token-owned request path. Set \
+                             ARLE_DSV4_PERFORMANCE_PROFILE=sglang after satisfying the \
+                             startup contract, or use ARLE_DSV4_MOE_BACKEND=allreduce \
+                             for the debug fallback lane."
+                        );
+                    }
+                    let native_deepep = crate::native_deepep::NativeDeepEp::boot(
+                        config.ep.rank as u32,
+                        config.ep.world_size as u32,
+                        &group,
+                    )?;
+                    info!(
+                        "DeepSeek V4 native DeepEP transport attached: rank={}/{} communicator_axes={}",
+                        config.ep.rank,
+                        config.ep.world_size,
+                        comm.axis_summary(),
                     );
+                    comm = comm.with_native_deepep(native_deepep);
                 }
             }
         }
 
         #[cfg(not(feature = "nccl"))]
         {
+            let _ = ctx;
             if config.tp.world_size > 1 || config.ep.world_size > 1 {
                 bail!(
                     "DeepSeek V4 TP/EP world_size > 1 requires building infer with --features nccl"
@@ -1392,6 +1552,7 @@ impl DeepseekModel {
         states: &mut [super::state::DeepseekState],
         slot_indices: &[usize],
         decode_ctx: &mut DeepseekBatchDecodeBuffers,
+        token_owned_rows_validated: bool,
     ) -> Result<()> {
         ensure!(
             tokens.len() == slot_indices.len(),
@@ -1876,6 +2037,7 @@ impl DeepseekModel {
                             Some(ffn_mhc_scratch),
                             Some(&mut layer_cache.ffn_pre),
                             Some(&mut layer_cache.ffn_normed),
+                            token_owned_rows_validated,
                         )?;
                     }
                     dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
@@ -1883,6 +2045,12 @@ impl DeepseekModel {
                 Ok(())
             },
         )?;
+        dsv4_body_graph_debug_run(
+            n,
+            body_graph_enabled,
+            body_graph_force_eager,
+            body_graph_run,
+        );
         if body_graph_run == DeepseekBodyGraphRun::Replayed {
             self.advance_dsv4_decode_graph_replay_metadata(
                 states,
@@ -6665,7 +6833,7 @@ impl DeepseekModel {
         tokens: &[u32],
     ) -> Result<HiddenStates> {
         self.forward_ffn_layer_stream_with_scratch(
-            layer_idx, stream, tokens, None, None, None, None,
+            layer_idx, stream, tokens, None, None, None, None, false,
         )
     }
 
@@ -6678,6 +6846,7 @@ impl DeepseekModel {
         mhc_scratch: Option<&mut DeepseekMhcRuntimeScratch>,
         ffn_pre_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
         ffn_normed_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
+        token_owned_rows_validated: bool,
     ) -> Result<HiddenStates> {
         self.forward_ffn_layer_stream_with_scratch_impl(
             layer_idx,
@@ -6690,6 +6859,7 @@ impl DeepseekModel {
             ffn_normed_scratch,
             None,
             None,
+            token_owned_rows_validated,
         )?
         .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 FFN owned output missing"))
     }
@@ -6716,6 +6886,7 @@ impl DeepseekModel {
             ffn_normed_scratch,
             None,
             Some(out),
+            false,
         )?;
         Ok(())
     }
@@ -6744,6 +6915,7 @@ impl DeepseekModel {
             Some(ffn_normed_scratch),
             Some(routed_scratch),
             Some(out),
+            false,
         )?;
         Ok(())
     }
@@ -6760,6 +6932,7 @@ impl DeepseekModel {
         ffn_normed_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
         ffn_routed_scratch: Option<&mut HiddenStates>,
         post_out: Option<&mut HiddenStates>,
+        token_owned_rows_validated: bool,
     ) -> Result<Option<HiddenStates>> {
         ensure!(
             tokens.len() == stream.seq_len,
@@ -6774,6 +6947,8 @@ impl DeepseekModel {
             self.config.hidden_size,
             self.config.hc_mult
         );
+        #[cfg(not(feature = "nccl"))]
+        let _ = token_owned_rows_validated;
         let layer = self.layers.get(layer_idx).ok_or_else(|| {
             anyhow::anyhow!(
                 "DeepSeek V4 GPU FFN layer {} out of range for {} loaded layers",
@@ -6962,11 +7137,16 @@ impl DeepseekModel {
                 let native_deepep_active = dsv4_native_deepep_enabled()?
                     && self.layer_communicator.native_deepep().is_some()
                     && moe_scratch.is_some();
-                if native_deepep_active {
+                if !dsv4_native_deepep_dispatch_allowed(
+                    native_deepep_active,
+                    token_owned_rows_validated,
+                ) {
                     bail!(
-                        "ARLE_DSV4_MOE_BACKEND=native-deepep cannot run on the current \
-                         DSv4 replicated-token TP/EP route (tp_world={} ep_world={}); \
-                         native DeepEP requires token-owned DP/EP request rows.",
+                        "ARLE_DSV4_MOE_BACKEND=native-deepep requires request-aware \
+                         token-owned DP/EP rows before dispatch/combine (tp_world={} \
+                         ep_world={}); direct replicated-token decode must use \
+                         ARLE_DSV4_MOE_BACKEND=allreduce or enter through \
+                         forward_decode_batch_with_request.",
                         self.config.tp.world_size,
                         self.config.ep.world_size
                     );
@@ -9750,19 +9930,59 @@ fn dsv4_body_graph_debug_enabled() -> bool {
     })
 }
 
+fn dsv4_body_graph_debug_phase_label() -> &'static str {
+    if crate::model::in_synthetic_decode_warmup() {
+        "synthetic-warmup"
+    } else {
+        "serving-decode"
+    }
+}
+
 fn dsv4_body_graph_debug_reject(reason: String) {
     if !dsv4_body_graph_debug_enabled() {
         return;
     }
+    let phase = dsv4_body_graph_debug_phase_label();
+    let message = format!("{phase}: {reason}");
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     match seen.lock() {
         Ok(mut seen) => {
-            if seen.insert(reason.clone()) {
-                warn!("DSv4 body graph not ready: {reason}");
+            if seen.insert(message) {
+                warn!("DSv4 body graph not ready [{phase}]: {reason}");
             }
         }
-        Err(_) => warn!("DSv4 body graph not ready: {reason}"),
+        Err(_) => warn!("DSv4 body graph not ready [{phase}]: {reason}"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_body_graph_debug_run(
+    batch_size: usize,
+    body_ready: bool,
+    graph_force_eager: bool,
+    run: DeepseekBodyGraphRun,
+) {
+    if !dsv4_body_graph_debug_enabled() {
+        return;
+    }
+    let phase = dsv4_body_graph_debug_phase_label();
+    let message = format!(
+        "{phase}: B={batch_size} ready={body_ready} force_eager={graph_force_eager} run={run:?}"
+    );
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    match seen.lock() {
+        Ok(mut seen) => {
+            if seen.insert(message) {
+                warn!(
+                    "DSv4 body graph run [{phase}]: B={batch_size} ready={body_ready} force_eager={graph_force_eager} run={run:?}"
+                );
+            }
+        }
+        Err(_) => warn!(
+            "DSv4 body graph run [{phase}]: B={batch_size} ready={body_ready} force_eager={graph_force_eager} run={run:?}"
+        ),
     }
 }
 
@@ -9878,6 +10098,21 @@ fn dsv4_native_deepep_enabled() -> Result<bool> {
     ))
 }
 
+fn dsv4_native_deepep_request_batch_required(
+    token_owned_rows_validated: bool,
+    native_deepep_enabled: bool,
+) -> bool {
+    token_owned_rows_validated && native_deepep_enabled
+}
+
+#[cfg_attr(not(feature = "nccl"), allow(dead_code))]
+fn dsv4_native_deepep_dispatch_allowed(
+    native_deepep_active: bool,
+    token_owned_rows_validated: bool,
+) -> bool {
+    !native_deepep_active || token_owned_rows_validated
+}
+
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn dsv4_combine_overlap_enabled() -> bool {
     std::env::var("ARLE_DSV4_COMBINE_OVERLAP")
@@ -9926,6 +10161,91 @@ fn dsv4_nccl_env_bootstrap_with_port_offset(
         .next()
         .ok_or_else(|| anyhow::anyhow!("NCCL overlap addr {host}:{port} resolved to zero addrs"))?;
     Ok(crate::distributed::nccl::NcclInitMethod::TcpStore(addr))
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+struct Dsv4RankSubgroup {
+    group_index: usize,
+    ranks: Vec<usize>,
+    rank: usize,
+    world_size: usize,
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_request_owner_token_sync_group(
+    config: &DeepseekRuntimeConfig,
+) -> Result<Option<Dsv4RankSubgroup>> {
+    dsv4_rank_subgroup_from_groups(
+        config,
+        "request-owner token-sync",
+        build_attn_owner_groups(config.axes),
+    )
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_attention_dp_group(config: &DeepseekRuntimeConfig) -> Result<Option<Dsv4RankSubgroup>> {
+    dsv4_rank_subgroup_from_groups(config, "attention-DP", build_attn_dp_groups(config.axes))
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_attention_cp_group(config: &DeepseekRuntimeConfig) -> Result<Option<Dsv4RankSubgroup>> {
+    dsv4_rank_subgroup_from_groups(config, "attention-CP", build_attn_cp_groups(config.axes))
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_rank_subgroup_from_groups(
+    config: &DeepseekRuntimeConfig,
+    label: &str,
+    groups: Vec<Vec<usize>>,
+) -> Result<Option<Dsv4RankSubgroup>> {
+    if config.axes.world_size() != config.tp.world_size
+        || config.rank_coord.world_rank != config.tp.rank
+    {
+        return Ok(None);
+    }
+
+    let world_rank = config.rank_coord.world_rank;
+    for (group_index, ranks) in groups.into_iter().enumerate() {
+        if let Some(rank) = ranks.iter().position(|&candidate| candidate == world_rank) {
+            return Ok(Some(Dsv4RankSubgroup {
+                group_index,
+                world_size: ranks.len(),
+                ranks,
+                rank,
+            }));
+        }
+    }
+
+    bail!(
+        "DeepSeek V4 rank {} has no {label} group for axes={}",
+        world_rank,
+        config.axes.summary()
+    );
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_owner_group_nccl_port_offset(group_index: usize) -> Result<u16> {
+    dsv4_nccl_group_port_offset(10, "owner-group", group_index)
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_attention_dp_nccl_port_offset(group_index: usize) -> Result<u16> {
+    dsv4_nccl_group_port_offset(20, "attention-DP", group_index)
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_attention_cp_nccl_port_offset(group_index: usize) -> Result<u16> {
+    dsv4_nccl_group_port_offset(40, "attention-CP", group_index)
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_nccl_group_port_offset(base: u16, label: &str, group_index: usize) -> Result<u16> {
+    let group_index = u16::try_from(group_index).map_err(|err| {
+        anyhow::anyhow!("DSv4 {label} index {group_index} exceeds u16 range: {err}")
+    })?;
+    base.checked_add(group_index).ok_or_else(|| {
+        anyhow::anyhow!("DSv4 {label} port offset overflow for group index {group_index}")
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -10196,6 +10516,22 @@ mod tests {
     use super::*;
     use crate::distributed::expert_state::ExpertGroup;
     use half::bf16;
+
+    #[test]
+    fn native_deepep_c1_requires_request_aware_batch_only_when_validated() {
+        assert!(dsv4_native_deepep_request_batch_required(true, true));
+        assert!(!dsv4_native_deepep_request_batch_required(false, true));
+        assert!(!dsv4_native_deepep_request_batch_required(true, false));
+        assert!(!dsv4_native_deepep_request_batch_required(false, false));
+    }
+
+    #[test]
+    fn native_deepep_dispatch_guard_requires_validated_rows() {
+        assert!(dsv4_native_deepep_dispatch_allowed(false, false));
+        assert!(dsv4_native_deepep_dispatch_allowed(false, true));
+        assert!(dsv4_native_deepep_dispatch_allowed(true, true));
+        assert!(!dsv4_native_deepep_dispatch_allowed(true, false));
+    }
 
     fn bf16_vec(values: &[f32]) -> Vec<bf16> {
         values.iter().map(|&value| bf16::from_f32(value)).collect()
