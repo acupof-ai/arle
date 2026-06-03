@@ -573,6 +573,8 @@ impl ModelForward for DeepseekModel {
         let body_graph_enabled = dsv4_decode_body_cuda_graph_enabled()?;
         let body_graph_max_bs = dsv4_decode_body_cuda_graph_max_batch_size()?;
         let model_row_ownership = "replicated-token";
+        let communicator_layout = self.layer_communicator.layout_label();
+        let communicator_axes = self.layer_communicator.axis_summary();
         let fallback_lane = if profile.requires_best_practice() {
             "forbidden"
         } else {
@@ -580,7 +582,7 @@ impl ModelForward for DeepseekModel {
         };
 
         log::info!(
-            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} request_ownership={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
+            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} communicator_layout={} communicator_axes={} request_ownership={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
             profile.as_str(),
             fallback_lane,
             self.config.tp.rank,
@@ -589,6 +591,8 @@ impl ModelForward for DeepseekModel {
             self.config.ep.world_size,
             self.config.axes.summary(),
             self.config.rank_coord,
+            communicator_layout,
+            communicator_axes,
             contract.request_ownership.as_str(),
             model_row_ownership,
             contract.effective_world_size,
@@ -645,6 +649,11 @@ impl ModelForward for DeepseekModel {
                     "DSv4 owner-group routing is not configured from the SGLang axis layout"
                         .to_string(),
                 );
+            }
+            if communicator_layout == "global-tp-ep-only" {
+                missing.push(format!(
+                    "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); SGLang-path native DeepEP needs explicit attention/MoE owner-group communicator mapping before it is comparable"
+                ));
             }
             #[cfg(feature = "nccl")]
             if contract.effective_world_size > 1 && self.request_token_sync_nccl().is_none() {

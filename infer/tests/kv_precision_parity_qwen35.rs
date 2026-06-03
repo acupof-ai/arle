@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::info;
 use tokio::sync::mpsc;
 
@@ -42,7 +42,9 @@ use infer::metrics::ServerMetrics;
 use infer::model::qwen35::{Qwen35Model, Qwen35RuntimeConfig};
 use infer::model::{KVCacheDtype, KVFormat};
 use infer::sampler::SamplingParams;
-use infer::scheduler::{IncomingRequest, RequestPriority, Scheduler, SchedulerConfig};
+use infer::scheduler::{
+    DistributedRequestShard, IncomingRequest, RequestPriority, Scheduler, SchedulerConfig,
+};
 use infer::server_engine::CompletionStreamDelta;
 use infer::tokenizer::Tokenizer;
 
@@ -216,6 +218,7 @@ fn make_request(
         delta_tx: tx,
         trace_context: None,
         distributed: None,
+        distributed_shard: DistributedRequestShard::single_rank(),
         cancel: None,
     };
     (req, rx)

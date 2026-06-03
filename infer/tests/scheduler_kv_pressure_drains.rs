@@ -34,7 +34,9 @@ use tokio::sync::mpsc;
 use infer::metrics::ServerMetrics;
 use infer::model::{KVCacheDtype, KVFormat, ModelRuntimeConfig, Qwen3Model};
 use infer::sampler::SamplingParams;
-use infer::scheduler::{IncomingRequest, RequestPriority, Scheduler, SchedulerConfig};
+use infer::scheduler::{
+    DistributedRequestShard, IncomingRequest, RequestPriority, Scheduler, SchedulerConfig,
+};
 use infer::server_engine::CompletionStreamDelta;
 use infer::tokenizer::Tokenizer;
 
@@ -70,6 +72,7 @@ fn make_request(
         delta_tx: tx,
         trace_context: None,
         distributed: None,
+        distributed_shard: DistributedRequestShard::single_rank(),
         cancel: None,
     };
     (req, rx)
