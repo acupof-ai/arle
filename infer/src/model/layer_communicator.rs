@@ -284,6 +284,28 @@ impl LayerCommunicator {
         self.ep_world_size
     }
 
+    pub fn axis_summary(&self) -> String {
+        format!(
+            "tp={}/{} dp={}/{} cp={}/{} ep={}/{}",
+            self.tp_rank,
+            self.tp_world_size,
+            self.dp_rank,
+            self.dp_world_size,
+            self.cp_rank,
+            self.cp_world_size,
+            self.ep_rank,
+            self.ep_world_size
+        )
+    }
+
+    pub fn layout_label(&self) -> &'static str {
+        if self.dp_world_size == 1 && self.cp_world_size == 1 {
+            "global-tp-ep-only"
+        } else {
+            "declared-dp-cp-no-collectives"
+        }
+    }
+
     /// Phase B-1 commit C.4 accessor: shared TP NCCL group, if one was
     /// attached via `with_tp_nccl`. Lets the scheduler thread reach into
     /// the model's NCCL group to build NCCL-backed
@@ -905,5 +927,16 @@ mod tests {
     fn constructor_validates_axis_ranks() {
         assert!(LayerCommunicator::new(1, 1, 0, 1, 0, 1).is_err());
         assert!(LayerCommunicator::new(0, 0, 0, 1, 0, 1).is_err());
+    }
+
+    #[test]
+    fn axis_summary_and_layout_label_expose_current_contract() {
+        let comm = LayerCommunicator::new_with_ep(1, 4, 0, 1, 0, 1, 1, 4).unwrap();
+
+        assert_eq!(comm.axis_summary(), "tp=1/4 dp=0/1 cp=0/1 ep=1/4");
+        assert_eq!(comm.layout_label(), "global-tp-ep-only");
+
+        let advanced = LayerCommunicator::new_with_ep(0, 4, 1, 2, 0, 1, 0, 4).unwrap();
+        assert_eq!(advanced.layout_label(), "declared-dp-cp-no-collectives");
     }
 }
