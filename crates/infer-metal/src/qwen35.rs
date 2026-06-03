@@ -186,7 +186,6 @@ pub(crate) fn load_qwen35_metal_weights(
             MetalQwen35LayerType::LinearAttention => {
                 let attn_prefix = format!("{layer_prefix}.linear_attn");
                 build_qwen35_linear_attention(
-                    arch,
                     load_proj(&format!("{attn_prefix}.in_proj_qkv"))?,
                     load_proj(&format!("{attn_prefix}.in_proj_z"))?,
                     load_proj(&format!("{attn_prefix}.in_proj_b"))?,
@@ -235,7 +234,7 @@ pub(crate) fn load_qwen35_metal_weights(
         embed_quantized,
         cpp_model: None,
     };
-    weights.cpp_model = CppQwen35Model::build(&weights, config, arch, false);
+    weights.cpp_model = CppQwen35Model::build(&weights, config, arch);
     anyhow::ensure!(
         weights.cpp_model.is_some(),
         "R3a requires the Qwen3.5 C++ compiled model; Rust fallback is intentionally not ported"
@@ -262,7 +261,6 @@ fn build_qwen35_full_attention(
 }
 
 fn build_qwen35_linear_attention(
-    _arch: &MetalQwen35ArchConfig,
     qkv_proj: WeightTensor,
     z_proj: WeightTensor,
     beta_proj: WeightTensor,
@@ -360,20 +358,11 @@ fn load_qwen35_moe_layer_weights(
         switch_gate: load_stacked_quantized(
             tensors,
             &format!("{mlp_prefix}.switch_mlp.gate_proj"),
-            moe_cfg.expert_group_size,
-            moe_cfg.expert_bits,
         )?,
-        switch_up: load_stacked_quantized(
-            tensors,
-            &format!("{mlp_prefix}.switch_mlp.up_proj"),
-            moe_cfg.expert_group_size,
-            moe_cfg.expert_bits,
-        )?,
+        switch_up: load_stacked_quantized(tensors, &format!("{mlp_prefix}.switch_mlp.up_proj"))?,
         switch_down: load_stacked_quantized(
             tensors,
             &format!("{mlp_prefix}.switch_mlp.down_proj"),
-            moe_cfg.expert_group_size,
-            moe_cfg.expert_bits,
         )?,
         shared_gate: load_quantized_with_bits(
             tensors,
@@ -573,15 +562,10 @@ impl CppQwen35Model {
         weights: &Qwen35MetalWeights,
         config: &MetalModelConfig,
         arch: &MetalQwen35ArchConfig,
-        disable_gdr_metal_kernel: bool,
     ) -> Option<Self> {
         let model = unsafe { mlx_sys::qwen35_compiled_new() };
         if model.is_null() {
             return None;
-        }
-
-        if disable_gdr_metal_kernel {
-            unsafe { mlx_sys::qwen35_compiled_set_gdr_metal_kernel_enabled(model, 0) };
         }
 
         let add_weight = |weight: &WeightTensor| -> Option<i32> {

@@ -1,4 +1,4 @@
-//! Minimal model-source resolver for R3a Metal weights.
+//! Model-source resolver for Metal weights (local path or HuggingFace id).
 
 use std::path::{Path, PathBuf};
 

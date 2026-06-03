@@ -1,22 +1,15 @@
 //! Host-side paged KV bookkeeping for the Metal backend.
 //!
-//! [`MetalKvPool`] is a **complete, real** host-side page manager: it implements
-//! the host-indexed [`KvPool`] seam (page allocation, slot growth/truncation,
-//! prefix-share retain/release). Because the seam is host-only, none of this
-//! needs a device tensor — it is identical in spirit to any backend's pool.
-//!
-//! This module is available **without** the `metal` feature: the host page
-//! manager is pure CPU bookkeeping used by default `infer-server`/agent builds.
+//! [`MetalKvPool`] implements the host-only [`KvPool`] seam (page allocation,
+//! slot growth/truncation, prefix-share retain/release). It is pure CPU
+//! bookkeeping and compiles without the `metal` feature; the device KV buffers
+//! its `u32` page ids map to are allocated by the executor's MLX layer.
 
 use std::collections::HashMap;
 
 use infer_seam::{KvAllocator, KvPrefixStore, KvQuery};
 
 /// Host-side paged KV bookkeeping for the Metal backend.
-///
-/// Pages are logical indices (`u32`); the device-side KV buffers they map to are
-/// allocated by the MLX layer in R3. Page lifetime, slot growth, and the
-/// prefix-cache retain/release protocol are fully handled here.
 #[derive(Debug)]
 pub struct MetalKvPool {
     page_size: usize,
