@@ -216,6 +216,11 @@ pub fn compute_attention_factor(scaling: Option<&RopeScalingConfig>) -> f32 {
     }
 }
 
+/// Default RoPE base for the Qwen3 family when neither a top-level
+/// `rope_theta` nor a nested `rope_parameters.rope_theta` is present.
+/// Every shipped Qwen3 config uses 1e6.
+pub const DEFAULT_ROPE_THETA: f32 = 1_000_000.0;
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Qwen3Config {
     pub hidden_size: usize,
@@ -232,6 +237,69 @@ pub struct Qwen3Config {
     pub rope_scaling: Option<RopeScalingConfig>,
     pub tie_word_embeddings: bool,
     pub max_position_embeddings: usize,
+}
+
+/// Nested RoPE block emitted by newer HF transformers exports, e.g.
+/// `"rope_parameters": {"rope_theta": 1000000, "rope_type": "default"}`.
+/// Older exports keep `rope_theta` at the top level instead. We capture
+/// the nested block here so deserialization succeeds under either layout.
+#[derive(Debug, Deserialize)]
+struct RopeParameters {
+    #[serde(default)]
+    rope_theta: Option<f32>,
+}
+
+/// Wire-format mirror of [`Qwen3Config`] used only during deserialization.
+/// `rope_theta` is optional and a sibling `rope_parameters` block is
+/// captured so configs that nest the base under `rope_parameters` (newer
+/// HF exports) parse without a "missing field rope_theta" error. The
+/// normalize step in [`Qwen3Config::from_json_value`] resolves the final
+/// `rope_theta`.
+#[derive(Debug, Deserialize)]
+struct Qwen3ConfigRaw {
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    #[serde(alias = "num_kv_heads")]
+    num_key_value_heads: usize,
+    head_dim: usize,
+    vocab_size: usize,
+    rms_norm_eps: f32,
+    #[serde(default)]
+    rope_theta: Option<f32>,
+    #[serde(default)]
+    rope_parameters: Option<RopeParameters>,
+    #[serde(default)]
+    rope_scaling: Option<RopeScalingConfig>,
+    tie_word_embeddings: bool,
+    max_position_embeddings: usize,
+}
+
+impl From<Qwen3ConfigRaw> for Qwen3Config {
+    fn from(raw: Qwen3ConfigRaw) -> Self {
+        // Resolution order, HF-consistent: an explicit top-level `rope_theta`
+        // wins (preserves the existing Qwen3-0.6B path exactly), else fall
+        // back to `rope_parameters.rope_theta`, else the family default 1e6.
+        let rope_theta = raw
+            .rope_theta
+            .or_else(|| raw.rope_parameters.and_then(|p| p.rope_theta))
+            .unwrap_or(DEFAULT_ROPE_THETA);
+        Qwen3Config {
+            hidden_size: raw.hidden_size,
+            intermediate_size: raw.intermediate_size,
+            num_hidden_layers: raw.num_hidden_layers,
+            num_attention_heads: raw.num_attention_heads,
+            num_key_value_heads: raw.num_key_value_heads,
+            head_dim: raw.head_dim,
+            vocab_size: raw.vocab_size,
+            rms_norm_eps: raw.rms_norm_eps,
+            rope_theta,
+            rope_scaling: raw.rope_scaling,
+            tie_word_embeddings: raw.tie_word_embeddings,
+            max_position_embeddings: raw.max_position_embeddings,
+        }
+    }
 }
 
 impl Qwen3Config {
@@ -254,7 +322,8 @@ impl Qwen3Config {
     }
 
     pub fn from_json_value(value: &serde_json::Value) -> Result<Self> {
-        let config: Self = serde_json::from_value(value.clone())?;
+        let raw: Qwen3ConfigRaw = serde_json::from_value(value.clone())?;
+        let config: Self = raw.into();
         config.validate()?;
         Ok(config)
     }
@@ -361,6 +430,92 @@ mod tests {
         assert_eq!(cfg.norm_tensor_name(), "model.norm.weight");
         assert_eq!(cfg.lm_head_tensor_name(), "model.embed_tokens.weight");
         assert_eq!(cfg.rope_cache_len_hint(), Some(32768));
+    }
+
+    #[test]
+    fn top_level_rope_theta_is_used_verbatim() {
+        // Existing Qwen3-0.6B layout: rope_theta at top level. Must keep
+        // parsing exactly as before (no regression to the shipped path).
+        let cfg = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 1024, "intermediate_size": 3072, "num_hidden_layers": 28,
+                "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 128,
+                "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+                "tie_word_embeddings": true, "max_position_embeddings": 40960
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rope_theta, 1_000_000.0);
+    }
+
+    #[test]
+    fn nested_rope_parameters_rope_theta_is_used() {
+        // Newer HF transformers export: rope_theta nested under
+        // rope_parameters, no top-level field. Used to fail with
+        // "missing field rope_theta" — must now parse.
+        let cfg = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 1024, "intermediate_size": 3072, "num_hidden_layers": 28,
+                "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 128,
+                "vocab_size": 151936, "rms_norm_eps": 1e-6,
+                "rope_parameters": { "rope_theta": 1000000, "rope_type": "default" },
+                "tie_word_embeddings": true, "max_position_embeddings": 40960
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rope_theta, 1_000_000.0);
+    }
+
+    #[test]
+    fn missing_rope_theta_falls_back_to_family_default() {
+        // Neither top-level nor nested rope_theta present: use the Qwen3
+        // family default (1e6) rather than failing to deserialize.
+        let cfg = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 1024, "intermediate_size": 3072, "num_hidden_layers": 28,
+                "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 128,
+                "vocab_size": 151936, "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": true, "max_position_embeddings": 40960
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rope_theta, DEFAULT_ROPE_THETA);
+        assert_eq!(cfg.rope_theta, 1_000_000.0);
+    }
+
+    #[test]
+    fn top_level_rope_theta_wins_over_nested() {
+        // HF-consistent rule: an explicit top-level rope_theta takes
+        // precedence over a nested rope_parameters.rope_theta.
+        let cfg = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 1024, "intermediate_size": 3072, "num_hidden_layers": 28,
+                "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 128,
+                "vocab_size": 151936, "rms_norm_eps": 1e-6,
+                "rope_theta": 5000000.0,
+                "rope_parameters": { "rope_theta": 1000000, "rope_type": "default" },
+                "tie_word_embeddings": true, "max_position_embeddings": 40960
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rope_theta, 5_000_000.0);
+    }
+
+    #[test]
+    fn nested_rope_parameters_without_rope_theta_falls_back_to_default() {
+        // rope_parameters present but with no rope_theta inside (e.g. only
+        // rope_type) must still resolve via the family default.
+        let cfg = Qwen3Config::from_json_str(
+            r#"{
+                "hidden_size": 1024, "intermediate_size": 3072, "num_hidden_layers": 28,
+                "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 128,
+                "vocab_size": 151936, "rms_norm_eps": 1e-6,
+                "rope_parameters": { "rope_type": "default" },
+                "tie_word_embeddings": true, "max_position_embeddings": 40960
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rope_theta, DEFAULT_ROPE_THETA);
     }
 
     #[test]
