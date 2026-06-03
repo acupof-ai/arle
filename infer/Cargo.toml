@@ -130,6 +130,7 @@ tower = "0.5"
 tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+infer-core = { path = "../crates/infer-core" }
 infer-metal = { path = "../crates/infer-metal", default-features = false, features = ["metal"] }
 infer-plan = { path = "../crates/infer-plan" }
 infer-seam = { path = "../crates/infer-seam" }

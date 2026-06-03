@@ -1053,7 +1053,8 @@ mod r3a_clean_metal_parity_tests {
     use std::path::Path;
 
     use anyhow::Result;
-    use infer_plan::{ForwardMode, ForwardPlan, PrefillRow};
+    use infer_core::{Engine, SchedulerConfig};
+    use infer_plan::{FinishReason, ForwardMode, ForwardPlan, PrefillRow};
     use infer_seam::{BackendExecutor, KvPool, PollResult};
 
     use super::MetalBackend;
@@ -1119,6 +1120,71 @@ mod r3a_clean_metal_parity_tests {
         let new_token = output.tokens[0].token;
         eprintln!("R3a Metal parity token ids: legacy={legacy_token} new={new_token}");
         assert_eq!(new_token, legacy_token);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Apple Silicon Metal + Qwen3.5-0.8B MLX weights"]
+    fn r3b_clean_engine_full_sequence_matches_legacy_metal_backend() -> Result<()> {
+        let model =
+            std::env::var("R3A_METAL_TEST_MODEL").unwrap_or_else(|_| DEFAULT_R3A_MODEL.to_string());
+        let prompt = "The capital of France is";
+        let max_new_tokens = 16;
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_k: 1,
+            ignore_eos: true,
+            max_new_tokens: Some(max_new_tokens),
+            ..Default::default()
+        };
+
+        let mut legacy = MetalBackend::new();
+        legacy.load(Path::new(&model))?;
+        let prompt_ids = legacy.tokenize(prompt)?;
+        let mut legacy_tokens = Vec::new();
+        let legacy_result =
+            legacy.generate_from_token_ids_with_callback(&prompt_ids, &params, |token| {
+                legacy_tokens.push(token);
+                Ok(())
+            })?;
+        assert_eq!(
+            legacy_result.completion_tokens, max_new_tokens,
+            "legacy run should emit exactly {max_new_tokens} tokens"
+        );
+        drop(legacy);
+
+        let executor = infer_metal::MetalExecutor::from_model_path(&model)?;
+        let kv = infer_metal::MetalKvPool::new(1, 4096, 16);
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_num_batched_tokens: 2_048,
+            max_prefill_tokens: 2_048,
+            prefill_max_requests: Some(1),
+            max_prompt_tokens: 2_048,
+            max_total_tokens: prompt_ids.len() + max_new_tokens,
+            prefix_cache_low_water_pages: 0,
+            chunked_prefill_size: 2_048,
+        };
+        let mut engine = Engine::with_config(executor, kv, config);
+        let handle = engine.submit_request(prompt_ids, max_new_tokens);
+        engine.run_to_idle()?;
+
+        let completed = engine
+            .completed(handle)
+            .expect("clean engine request should complete");
+        assert!(matches!(
+            completed.finish.as_ref(),
+            Some(FinishReason::Length)
+        ));
+        assert_eq!(completed.generated_tokens.len(), max_new_tokens);
+        eprintln!(
+            "R3b Metal engine parity token ids: legacy={:?} new={:?}",
+            legacy_tokens, completed.generated_tokens
+        );
+        assert_eq!(completed.generated_tokens, legacy_tokens);
+        assert!(engine.is_idle());
+        assert_eq!(engine.active_count(), 0);
+        assert_eq!(engine.waiting_count(), 0);
         Ok(())
     }
 }
