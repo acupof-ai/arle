@@ -47,12 +47,24 @@ turns=3 total_gen=144 total_wall=768.8ms tok_per_s=187.3
 (radix prefix cache) making subsequent agent turns faster, measured on the real
 engine. This is the AI-PC north-star behavior, working.
 
-## OS-impact (G3) — partial
+## OS-impact (G3) — peak RSS now measured
 
-`os_impact.peak_rss_bytes = 0` is the `PeakMemProbe` stub; the macOS peak-RSS syscall
-(`mach_task_basic_info.resident_size_max`) + a foreground-responsiveness proxy are the
-remaining wiring. The scheduler's 0.56 µs/tick already establishes it is not a CPU
-hog. Full G3 PASS/FAIL gate lands with the RSS syscall.
+The `PeakMemProbe` stub is gone — it now reads the real OS high-water mark once per
+turn (`mach_task_basic_info.resident_size_max` on macOS via `task_info`, `/proc/self/status`
+`VmHWM` on Linux) and folds it via `.max(..)`. Re-running the multi-turn agent workflow
+on Qwen3.5-0.8B-4bit:
+
+```
+turns=3 total_gen=144 total_wall=736.6ms tok_per_s=195.5
+os_impact=OsImpactReport { samples: 3, peak_rss_bytes: 465780736 }
+```
+
+**Peak RSS ≈ 444 MiB** to serve the whole 3-turn workflow — model weights (0.8B 4-bit ≈
+0.4 GB) plus the engine + KV pages, with no runaway growth across turns. Combined with
+the scheduler's **0.56 µs/tick** (not a CPU hog), the AI-PC OS-citizen claim now rests on
+a measured memory number, not a stub. Remaining G3 wiring: a foreground-responsiveness
+proxy (main-thread / UI-tick stall while decoding) for the full PASS/FAIL gate; the
+memory leg is done.
 
 ## Remaining for the full goal
 

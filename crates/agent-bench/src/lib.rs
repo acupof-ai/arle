@@ -69,15 +69,13 @@ impl OsImpactProbe for NoopProbe {
 
 /// Real-backend OS-impact probe.
 ///
-/// Counts samples today and is the seam for the on-device north-star metric.
-///
-/// TODO(R3): on real-backend runs, sample peak resident set size (e.g. via
-/// `task_info`/`mach_task_basic_info` `resident_size_max` on macOS, or
-/// `/proc/self/status` `VmHWM` on Linux) and a foreground-responsiveness proxy
-/// (main-thread / UI-tick stall while the engine is decoding). Until R3 lands a
-/// real MLX forward there is no device memory pressure to measure, so this stub
-/// only tracks `samples` and leaves `peak_rss_bytes` at 0 — wiring the platform
-/// syscall is the only remaining work, the seam is already threaded.
+/// Once per turn it reads this process's *peak* resident set size — the OS
+/// high-water mark, so a discrete poll still captures the true peak reached
+/// between samples — and folds it into [`OsImpactReport::peak_rss_bytes`] via
+/// `.max(..)`. This is the north-star "did serving this agent workflow degrade
+/// the AI-PC?" memory metric, measured against the engine driving a real
+/// backend forward. Platform source: `mach_task_basic_info.resident_size_max`
+/// on macOS, `/proc/self/status` `VmHWM` on Linux; other targets report 0.
 #[derive(Debug, Default)]
 pub struct PeakMemProbe {
     samples: u64,
@@ -95,9 +93,7 @@ impl PeakMemProbe {
 impl OsImpactProbe for PeakMemProbe {
     fn sample(&mut self) {
         self.samples += 1;
-        // TODO(R3): read this process's peak RSS here and fold it into
-        // `self.peak_rss_bytes` via `.max(..)`. No-op until a real backend
-        // makes the number meaningful.
+        self.peak_rss_bytes = self.peak_rss_bytes.max(current_peak_rss_bytes());
     }
 
     fn report(&self) -> OsImpactReport {
@@ -106,6 +102,60 @@ impl OsImpactProbe for PeakMemProbe {
             peak_rss_bytes: self.peak_rss_bytes,
         }
     }
+}
+
+/// Read this process's peak resident set size in bytes (OS high-water mark).
+///
+/// macOS: `task_info(MACH_TASK_BASIC_INFO).resident_size_max`. The kernel tracks
+/// the peak continuously, so a single poll reflects the max reached so far.
+#[cfg(target_os = "macos")]
+// libc 0.2 deprecates its `mach` bindings in favor of the `mach2` crate; the
+// symbols are stable within 0.2 (semver) and identical, so a scoped allow beats
+// pulling a whole extra crate into a bench harness for one syscall.
+#[allow(deprecated)]
+fn current_peak_rss_bytes() -> u64 {
+    // SAFETY: `task_info` writes into a correctly-sized, zeroed
+    // `mach_task_basic_info` and reads `count` for the buffer length; on
+    // `KERN_SUCCESS` the struct is fully initialized.
+    unsafe {
+        let mut info: libc::mach_task_basic_info = std::mem::zeroed();
+        let mut count: libc::mach_msg_type_number_t = libc::MACH_TASK_BASIC_INFO_COUNT;
+        let kr = libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO as libc::task_flavor_t,
+            std::ptr::addr_of_mut!(info).cast::<libc::integer_t>(),
+            &mut count,
+        );
+        if kr == libc::KERN_SUCCESS {
+            info.resident_size_max as u64
+        } else {
+            0
+        }
+    }
+}
+
+/// Linux: `/proc/self/status` `VmHWM` (peak RSS), reported in kB.
+#[cfg(target_os = "linux")]
+fn current_peak_rss_bytes() -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            return kb.saturating_mul(1024);
+        }
+    }
+    0
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn current_peak_rss_bytes() -> u64 {
+    0
 }
 
 /// Deterministic, synchronous executor for scheduler-layer benchmarking.
@@ -571,7 +621,13 @@ mod tests {
         let m = run_agent_workflow_with_probe(&mut engine, &ttft, &wf, &mut probe)?;
         // One sample per turn folded into the report.
         assert_eq!(m.os_impact.samples, 5);
-        assert_eq!(m.os_impact.peak_rss_bytes, 0); // stub: no RSS sampling yet
+        // On macOS/Linux the peak-RSS syscall returns this running test binary's
+        // high-water mark, always > 0. Other targets are a documented no-op.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(
+            m.os_impact.peak_rss_bytes > 0,
+            "peak RSS should be measured on this platform"
+        );
         Ok(())
     }
 
