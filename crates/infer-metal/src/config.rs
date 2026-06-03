@@ -1,4 +1,4 @@
-//! Qwen35 Metal config parsing for the R3a executor.
+//! Qwen3.5/Qwen3.6 config parsing for the Metal executor.
 
 use std::path::Path;
 
@@ -19,7 +19,6 @@ pub(crate) enum MetalQwen35LayerType {
 }
 
 /// Configuration for Qwen3.5 linear-attention/GDR layers.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct MetalGdrConfig {
     pub(crate) num_key_heads: usize,
@@ -27,7 +26,6 @@ pub(crate) struct MetalGdrConfig {
     pub(crate) num_value_heads: usize,
     pub(crate) value_dim: usize,
     pub(crate) conv_kernel: usize,
-    pub(crate) hidden_size: usize,
     pub(crate) rms_norm_eps: f32,
 }
 
@@ -41,7 +39,6 @@ impl MetalGdrConfig {
 }
 
 /// Mixture-of-Experts architectural parameters for Qwen3.5/3.6.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct MetalQwen35MoeConfig {
     pub(crate) num_experts: usize,
@@ -87,7 +84,9 @@ impl MetalQwen35ArchConfig {
     }
 }
 
-/// Qwen35 model config needed by the clean Metal executor.
+/// Qwen3.5/Qwen3.6 model config for the Metal executor. `vocab_size` and the
+/// model-default stop tokens are parsed for the serving adapter to consult; the
+/// executor itself does not read them.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct MetalModelConfig {
@@ -281,7 +280,6 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
                 num_value_heads: get_usize(model, "linear_num_value_heads", 0),
                 value_dim: get_usize(model, "linear_value_head_dim", 0),
                 conv_kernel: get_usize(model, "linear_conv_kernel_dim", 4),
-                hidden_size,
                 rms_norm_eps: rms_norm_eps as f32,
             },
             moe,

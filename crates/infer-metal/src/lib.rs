@@ -1,29 +1,12 @@
 //! Metal backend executor (Apple Silicon) — the primary AI-PC backend.
 //!
-//! Scope of this crate at R2:
-//! - [`MetalKvPool`] is a **complete, real** host-side page manager: it implements
-//!   the host-indexed [`infer_seam::KvPool`] seam (page allocation, slot
-//!   growth/truncation, prefix-share retain/release). Because the seam is
-//!   host-only, none of this needs a device tensor — it is identical in spirit to
-//!   any backend's pool.
-//! - [`MetalExecutor`] implements the [`infer_seam::BackendExecutor`] seam
-//!   plumbing (submit/poll overlap shape). The actual MLX forward + on-device KV
-//!   buffers are wired in R3 (model port via `crates/mlx-sys`); until then
-//!   `submit` runs a clearly-marked **placeholder** forward so the seam is
-//!   testable.
-//!
-//! Nothing here references engine-core; this crate depends only on the stable
-//! `infer-plan` + `infer-seam` contracts.
-//!
-//! Internal layout (pure reorganization — same numerics):
-//! - [`kv_pool`] — the host page manager [`MetalKvPool`] (feature-free).
-//! - [`executor`] — the executor + session machine: [`MetalExecutor`] /
-//!   `MetalInflight` placeholder seam (feature-free) plus the real MLX
-//!   `RealMetalExecutor` / slot state / page store (`#[cfg(feature = "metal")]`).
+//! Implements the host-only [`infer_seam`] contracts: [`MetalKvPool`] is the
+//! host page manager and [`MetalExecutor`] the submit/poll seam. The real MLX
+//! Qwen3.5 forward + on-device KV live behind `#[cfg(feature = "metal")]`; the
+//! feature-free path keeps a CPU placeholder so the seam is testable.
 
-// `MetalKvPool` and the `MetalExecutor` placeholder seam must compile WITHOUT
-// the `metal` feature — they are exercised by default `infer-server`/agent-bench
-// builds and by feature-free unit tests.
+// `kv_pool` and the `MetalExecutor` placeholder seam stay feature-free so default
+// `infer-server`/agent-bench builds and unit tests compile without `metal`.
 mod executor;
 mod kv_pool;
 

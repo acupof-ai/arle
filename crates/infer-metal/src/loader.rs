@@ -1,4 +1,4 @@
-//! Safetensors loading helpers for R3a.
+//! Safetensors loading helpers for the Metal executor.
 
 use std::{
     collections::HashMap,
