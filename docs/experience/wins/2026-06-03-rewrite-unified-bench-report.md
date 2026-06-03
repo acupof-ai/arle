@@ -18,6 +18,38 @@ as the cross-backend view; that entry keeps the per-step Metal detail.
 - **Cutover (R5): in flight** — serving facade is the one blocker to deleting legacy
   `infer/`; consumer coupling measured shallow.
 
+## Post-refactor update (sampling functional + internal cohesion) — EOD 2026-06-03
+
+Two rounds landed after the sections below; **all numerics preserved** (greedy parity held through every commit).
+
+**Sampling (Fix 0) — the system can now run real agent workflows, not just greedy.**
+`ForwardPlan` rows carry per-request `SamplingParams`; a shared pure host sampler
+`infer_plan::sample_token` (temperature/top-k/top-p/min-p, deterministic by `(seed,position)`)
+is wired into **both** backends (Metal `a9b05afb`, CUDA `901b9f78`). Greedy (`temp≤0`) keeps the
+verified device-argmax path → **parity unchanged**; `temp>0` materializes host f32 logits and
+draws (one D2H/token, sub-ms at c=1, no new GPU kernel). Stop-token + `ignore_eos` honored in the
+engine. 4 sampler unit tests green. Before this, both executors hardcoded `argmax` — the system
+provably could not serve temperature/stop workloads.
+
+**Internal-cohesion refactor (Ousterhout deep-modules, churn-weighted v2).** Every runtime crate
+hid a wide-shallow god-file; split by isolating HOT optimization axes, consolidating COLD code:
+
+| crate | god-file before | after | what was isolated |
+|---|--:|--:|---|
+| infer-seam | `KvPool` 18-method trait | `KvQuery`+`KvAllocator`+`KvPrefixStore` (composed) | paging no longer leaks to the scheduler |
+| infer-cuda | `model.rs` 1347 L | 191 L + `attention`/`ops`/`loader`/`executor` | the two perf hotspots (attention, ops) |
+| infer-metal | `lib.rs` 1001 L | 46 L + `executor`/`kv_pool` | session machine vs host pool |
+| infer-server | `openai.rs` 712 L | `execution`/`http`/`tokenizer`/`schema` | engine loop vs fixed wire schema |
+| infer-core | `lib.rs` 1854 L | 1600 L + `planner`/`prefix` | scheduling + prefix-cache axes |
+
+Two large files remain **by design** (churn-weighted): `infer-core/lib.rs` 1600 L (the COLD
+coordinator + 40 in-file tests; the HOT axes are extracted) and `infer-metal/qwen35.rs` 894 L (the
+stable C++ bridge — split deferred until FFI churn justifies it). Rule applied: *a file boundary
+must earn its interface by isolating an axis you'll re-edit often.* clone density was 7.88% pre-split.
+
+Post-refactor greedy multi-turn (Qwen3.5-0.8B, Metal): **193.9 tok/s, 144 tok, TTFT 6→3, RSS ~444 MiB**
+— statistically identical to the 195.5 pre-refactor (run noise); the reorg changed zero behavior.
+
 ## Correctness
 
 ### Metal — all bit-identical vs legacy MetalBackend (independently re-verified at HEAD)
