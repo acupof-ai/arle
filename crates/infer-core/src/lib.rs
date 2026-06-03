@@ -6,7 +6,11 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, VecDeque};
 
-use anyhow::{Result, bail};
+mod radix;
+
+pub use radix::{BlockId, PrefixMatch, RadixCache};
+
+use anyhow::{Result, anyhow, bail};
 use infer_plan::{
     DecodeRow, FinishReason, ForwardMode, ForwardPlan, PrefillRow, SlotToken, StepOutput,
 };
@@ -55,6 +59,8 @@ pub struct SchedulerConfig {
     pub max_prompt_tokens: usize,
     /// Maximum prompt plus generated length for one request.
     pub max_total_tokens: usize,
+    /// Target minimum free pages after prefix-cache reclamation.
+    pub prefix_cache_low_water_pages: usize,
 }
 
 impl SchedulerConfig {
@@ -85,6 +91,7 @@ impl Default for SchedulerConfig {
             prefill_max_requests: None,
             max_prompt_tokens: 16_384,
             max_total_tokens: 32_768,
+            prefix_cache_low_water_pages: 0,
         }
     }
 }
@@ -148,6 +155,8 @@ struct RequestState {
     priority: RequestPriority,
     max_tokens: usize,
     phase: RequestPhase,
+    prefill_start_pos: usize,
+    reused_prefix_pages: Vec<BlockId>,
     finish: Option<FinishReason>,
     waiting_hint: WaitingRequestHint,
 }
@@ -166,6 +175,8 @@ impl RequestState {
             priority,
             max_tokens,
             phase: RequestPhase::Prefilling { progress: 0 },
+            prefill_start_pos: 0,
+            reused_prefix_pages: Vec::new(),
             finish: None,
             waiting_hint: WaitingRequestHint::default(),
         }
@@ -180,6 +191,8 @@ impl RequestState {
     fn reset_for_recompute(mut self) -> Self {
         self.generated_tokens.clear();
         self.phase = RequestPhase::Prefilling { progress: 0 };
+        self.prefill_start_pos = 0;
+        self.reused_prefix_pages.clear();
         self.finish = None;
         self.waiting_hint = WaitingRequestHint::default();
         self
@@ -203,14 +216,14 @@ impl From<RequestState> for CompletedRequest {
 
 /// Backend-agnostic engine loop.
 ///
-/// R1b ports the host-side admission and slot lifecycle only. Radix prefix
-/// reuse and tiered-KV readmission are intentionally deferred; the hooks stay
-/// at waiting-request hints and host page-fit admission.
+/// Prefix reuse is host-indexed: the engine carries token blocks and page ids,
+/// while executor/model-specific storage stays below the seam.
 pub struct Engine<E: BackendExecutor, K: KvPool> {
     executor: E,
     kv: K,
     config: SchedulerConfig,
     governor: Box<dyn ResourceGovernor>,
+    radix: RadixCache,
     next_request_id: u64,
     active: BTreeMap<usize, RequestState>,
     waiting: VecDeque<RequestState>,
@@ -239,11 +252,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         config: SchedulerConfig,
         governor: Box<dyn ResourceGovernor>,
     ) -> Self {
+        let radix = RadixCache::new(kv.page_size().max(1));
         Self {
             executor,
             kv,
             config,
             governor,
+            radix,
             next_request_id: 0,
             active: BTreeMap::new(),
             waiting: VecDeque::new(),
@@ -452,7 +467,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         };
         request.phase = RequestPhase::Finished;
         request.finish = Some(reason);
+        self.publish_prefix_blocks(slot, &request);
+        self.release_reused_prefix(&request.reused_prefix_pages);
         self.kv.free_slot(slot);
+        self.evict_prefix_cache_if_below_low_water();
         self.completed.insert(request.handle, request.into());
     }
 
@@ -471,33 +489,52 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let mut active_prefills = self.active_prefill_count();
         let max_prefills = self.config.max_concurrent_prefill();
         let mut remaining_pages = self.kv.free_pages();
+        self.evict_prefix_cache_if_below_low_water();
 
         while !free_slots.is_empty() && !self.waiting.is_empty() {
-            if active_prefills >= max_prefills {
-                break;
-            }
-
             let Some(candidate) = self.waiting.front() else {
                 break;
             };
-            let prompt_tokens = candidate.prompt_len();
-            if prompt_tokens > remaining_prefill_tokens {
+            let prefix_match = self
+                .radix
+                .peek_longest_prefix_match(&candidate.prompt_tokens);
+            let prefill_tokens = candidate
+                .prompt_len()
+                .saturating_sub(prefix_match.matched_len);
+            if prefill_tokens > 0 && active_prefills >= max_prefills {
+                break;
+            }
+            if prefill_tokens > remaining_prefill_tokens {
                 break;
             }
 
-            let pages_needed = self.full_request_pages_needed(candidate);
+            let pages_needed =
+                self.request_pages_needed_after_prefix(candidate, prefix_match.matched_len);
             if self.kv.is_active() && pages_needed > remaining_pages {
-                break;
+                let reclaimed = self.evict_prefix_cache_for_pages(pages_needed - remaining_pages);
+                remaining_pages = remaining_pages.saturating_add(reclaimed);
+                if pages_needed > remaining_pages {
+                    break;
+                }
             }
 
             let slot = free_slots.remove(0);
-            let request = self
+            let mut request = self
                 .waiting
                 .pop_front()
                 .expect("waiting.front() was Some above");
-            remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(prompt_tokens);
+            let prefix_match = self.radix.longest_prefix_match(&request.prompt_tokens);
+            self.attach_prefix_to_request(slot, &mut request, prefix_match)?;
+
+            remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(
+                request
+                    .prompt_len()
+                    .saturating_sub(request.prefill_start_pos),
+            );
             remaining_pages = remaining_pages.saturating_sub(pages_needed);
-            active_prefills += 1;
+            if matches!(request.phase, RequestPhase::Prefilling { .. }) {
+                active_prefills += 1;
+            }
             self.active.insert(slot, request);
         }
 
@@ -517,13 +554,57 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .count()
     }
 
-    fn full_request_pages_needed(&self, request: &RequestState) -> usize {
+    fn request_pages_needed_after_prefix(
+        &self,
+        request: &RequestState,
+        matched_tokens: usize,
+    ) -> usize {
         let page_size = self.kv.page_size().max(1);
         let tokens = request
             .prompt_tokens
             .len()
+            .saturating_sub(matched_tokens)
             .saturating_add(request.max_tokens);
         tokens.div_ceil(page_size)
+    }
+
+    fn attach_prefix_to_request(
+        &mut self,
+        slot: usize,
+        request: &mut RequestState,
+        prefix_match: PrefixMatch,
+    ) -> Result<()> {
+        if prefix_match.is_empty() {
+            request.prefill_start_pos = 0;
+            request.phase = RequestPhase::Prefilling { progress: 0 };
+            request.waiting_hint.immediate_reuse_tokens = 0;
+            request.waiting_hint.total_reuse_tokens = 0;
+            return Ok(());
+        }
+
+        self.kv.retain_pages(&prefix_match.block_ids);
+        self.radix.retain_blocks(&prefix_match.block_ids);
+        if let Err(err) =
+            self.kv
+                .attach_pages(slot, &prefix_match.block_ids, prefix_match.matched_len)
+        {
+            self.radix.release_blocks(&prefix_match.block_ids);
+            self.kv.release_pages(&prefix_match.block_ids);
+            return Err(err);
+        }
+
+        request.prefill_start_pos = prefix_match.matched_len.min(request.prompt_len());
+        request.reused_prefix_pages = prefix_match.block_ids;
+        request.waiting_hint.immediate_reuse_tokens = request.prefill_start_pos;
+        request.waiting_hint.total_reuse_tokens = request.prefill_start_pos;
+        request.phase = if request.prefill_start_pos == request.prompt_len() {
+            RequestPhase::Decoding
+        } else {
+            RequestPhase::Prefilling {
+                progress: request.prefill_start_pos,
+            }
+        };
+        Ok(())
     }
 
     fn build_forward_plan(&self) -> ForwardPlan {
@@ -533,15 +614,25 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         for (&slot, request) in &self.active {
             match request.phase {
                 RequestPhase::Prefilling { .. } => {
+                    let start_pos = request.prefill_start_pos.min(request.prompt_tokens.len());
+                    let tokens = request.prompt_tokens[start_pos..].to_vec();
+                    if tokens.is_empty() {
+                        continue;
+                    }
                     prefill_rows.push(PrefillRow {
                         slot,
-                        tokens: request.prompt_tokens.clone(),
-                        start_pos: 0,
+                        tokens,
+                        start_pos,
                         total_tokens: request.prompt_tokens.len(),
                     });
                 }
                 RequestPhase::Decoding => {
-                    let Some(&last_token) = request.generated_tokens.last() else {
+                    let Some(last_token) = request
+                        .generated_tokens
+                        .last()
+                        .copied()
+                        .or_else(|| request.prompt_tokens.last().copied())
+                    else {
                         continue;
                     };
                     decode_rows.push(DecodeRow {
@@ -599,6 +690,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let Some(request) = self.active.remove(&slot) else {
             return;
         };
+        self.release_reused_prefix(&request.reused_prefix_pages);
         self.kv.free_slot(slot);
         self.enqueue_waiting_request(
             request.reset_for_recompute(),
@@ -622,12 +714,95 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
     fn allocate_for_plan(&mut self, plan: &ForwardPlan) -> Result<()> {
         for row in &plan.prefill_rows {
-            self.kv.alloc(row.slot, row.tokens.len())?;
+            self.alloc_with_prefix_reclaim(row.slot, row.tokens.len())?;
         }
         for row in &plan.decode_rows {
-            self.kv.alloc(row.slot, 1)?;
+            self.alloc_with_prefix_reclaim(row.slot, 1)?;
         }
         Ok(())
+    }
+
+    fn alloc_with_prefix_reclaim(&mut self, slot: usize, tokens: usize) -> Result<()> {
+        let needed = self.kv.append_pages_needed(slot, tokens);
+        if needed > self.kv.free_pages() {
+            self.evict_prefix_cache_for_pages(needed - self.kv.free_pages());
+        }
+
+        match self.kv.alloc(slot, tokens) {
+            Ok(()) => Ok(()),
+            Err(first_err) => {
+                let needed = self.kv.append_pages_needed(slot, tokens);
+                let reclaimed = self.evict_prefix_cache_for_pages(needed);
+                if reclaimed == 0 {
+                    return Err(first_err);
+                }
+                self.kv.alloc(slot, tokens).map_err(|retry_err| {
+                    anyhow!(
+                        "KV alloc retry failed after reclaiming {reclaimed} pages: first error: {first_err}; retry error: {retry_err}"
+                    )
+                })
+            }
+        }
+    }
+
+    fn publish_prefix_blocks(&mut self, slot: usize, request: &RequestState) {
+        if !self.kv.is_active() {
+            return;
+        }
+
+        let block_size = self.radix.block_size().max(1);
+        let publishable_tokens = request.prompt_len().min(self.kv.seq_len(slot));
+        let sealed_blocks = publishable_tokens / block_size;
+        if sealed_blocks == 0 {
+            return;
+        }
+
+        let sealed_tokens = sealed_blocks * block_size;
+        let pages = self
+            .kv
+            .page_indices_for_token_range(slot, 0, sealed_tokens)
+            .to_vec();
+        let publish_blocks = sealed_blocks.min(pages.len());
+        if publish_blocks == 0 {
+            return;
+        }
+
+        let token_len = publish_blocks * block_size;
+        let newly_cached = self.radix.insert(
+            &request.prompt_tokens[..token_len],
+            &pages[..publish_blocks],
+        );
+        if !newly_cached.is_empty() {
+            self.kv.retain_pages(&newly_cached);
+        }
+    }
+
+    fn release_reused_prefix(&mut self, pages: &[BlockId]) {
+        if pages.is_empty() {
+            return;
+        }
+        self.radix.release_blocks(pages);
+        self.kv.release_pages(pages);
+    }
+
+    fn evict_prefix_cache_if_below_low_water(&mut self) -> usize {
+        let low_water = self.config.prefix_cache_low_water_pages;
+        if low_water <= self.kv.free_pages() {
+            return 0;
+        }
+        self.evict_prefix_cache_for_pages(low_water - self.kv.free_pages())
+    }
+
+    fn evict_prefix_cache_for_pages(&mut self, pages_needed: usize) -> usize {
+        if pages_needed == 0 {
+            return 0;
+        }
+        let pages = self.radix.evict_lru(pages_needed);
+        let reclaimed = pages.len();
+        if reclaimed > 0 {
+            self.kv.release_pages(&pages);
+        }
+        reclaimed
     }
 }
 
@@ -696,7 +871,7 @@ fn finish_reason_for(request: &RequestState, token: &SlotToken) -> Option<Finish
 
 #[cfg(test)]
 mod testing {
-    use std::collections::HashSet;
+    use std::collections::BTreeMap;
 
     use anyhow::{Result, bail};
     use infer_plan::{SlotToken, StepOutput};
@@ -714,7 +889,9 @@ mod testing {
         slot_epochs: Vec<u64>,
         free_pages: Vec<u32>,
         next_page: u32,
-        retained_pages: HashSet<u32>,
+        total_pages: usize,
+        page_ref_counts: BTreeMap<u32, usize>,
+        page_attach_counts: BTreeMap<u32, usize>,
     }
 
     impl MockKvPool {
@@ -735,8 +912,14 @@ mod testing {
                 slot_epochs: vec![0; num_slots],
                 free_pages: (1..=capped_pages as u32).rev().collect(),
                 next_page: capped_pages as u32 + 1,
-                retained_pages: HashSet::new(),
+                total_pages: capped_pages,
+                page_ref_counts: BTreeMap::new(),
+                page_attach_counts: BTreeMap::new(),
             }
+        }
+
+        pub(super) fn total_pages(&self) -> usize {
+            self.total_pages
         }
 
         fn ensure_slot(&self, slot: usize) -> Result<()> {
@@ -764,6 +947,51 @@ mod testing {
             while self.free_pages.len() < count && self.next_page < u32::MAX {
                 self.free_pages.push(self.next_page);
                 self.next_page = self.next_page.saturating_add(1);
+                self.total_pages = self.total_pages.saturating_add(1);
+            }
+        }
+
+        fn remove_from_free_list(&mut self, page: u32) {
+            if let Some(pos) = self.free_pages.iter().position(|&free| free == page) {
+                self.free_pages.swap_remove(pos);
+            }
+        }
+
+        fn retain_page(&mut self, page: u32) {
+            self.remove_from_free_list(page);
+            *self.page_ref_counts.entry(page).or_insert(0) += 1;
+        }
+
+        fn release_page(&mut self, page: u32) {
+            if let Some(count) = self.page_ref_counts.get_mut(&page) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.page_ref_counts.remove(&page);
+                }
+            }
+            self.recycle_if_unused(page);
+        }
+
+        fn attach_page(&mut self, page: u32) {
+            self.remove_from_free_list(page);
+            *self.page_attach_counts.entry(page).or_insert(0) += 1;
+        }
+
+        fn detach_page(&mut self, page: u32) {
+            if let Some(count) = self.page_attach_counts.get_mut(&page) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.page_attach_counts.remove(&page);
+                }
+            }
+            self.recycle_if_unused(page);
+        }
+
+        fn recycle_if_unused(&mut self, page: u32) {
+            let retained = self.page_ref_counts.get(&page).copied().unwrap_or(0);
+            let attached = self.page_attach_counts.get(&page).copied().unwrap_or(0);
+            if retained == 0 && attached == 0 && !self.free_pages.iter().any(|&free| free == page) {
+                self.free_pages.push(page);
             }
         }
     }
@@ -824,6 +1052,9 @@ mod testing {
             self.ensure_slot(slot)?;
             let new_pages = self.append_pages_needed(slot, tokens);
             let pages = self.alloc_pages(new_pages)?;
+            for &page in &pages {
+                self.attach_page(page);
+            }
             self.pages[slot].extend_from_slice(&pages);
             self.seq_lens[slot] += tokens;
             Ok(())
@@ -832,14 +1063,22 @@ mod testing {
         fn alloc_detached_pages(&mut self, pages: usize) -> Result<Vec<u32>> {
             self.ensure_total_capacity_for_detached(pages);
             let pages = self.alloc_pages(pages)?;
-            self.retained_pages.extend(pages.iter().copied());
+            for &page in &pages {
+                self.retain_page(page);
+            }
             Ok(pages)
         }
 
         fn attach_pages(&mut self, slot: usize, pages: &[u32], token_count: usize) -> Result<()> {
             self.ensure_slot(slot)?;
-            self.pages[slot].clear();
+            let old_pages = std::mem::take(&mut self.pages[slot]);
+            for page in old_pages {
+                self.detach_page(page);
+            }
             self.pages[slot].extend_from_slice(pages);
+            for &page in pages {
+                self.attach_page(page);
+            }
             self.seq_lens[slot] = token_count;
             self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
             Ok(())
@@ -854,14 +1093,18 @@ mod testing {
             let keep_pages = new_len.div_ceil(self.page_size);
             let slot_page_len = self.pages[slot].len();
             let removed = self.pages[slot].split_off(keep_pages.min(slot_page_len));
-            self.free_pages.extend(removed);
+            for page in removed {
+                self.detach_page(page);
+            }
             self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
             Ok(())
         }
 
         fn free_slot(&mut self, slot: usize) {
             let pages = std::mem::take(&mut self.pages[slot]);
-            self.free_pages.extend(pages);
+            for page in pages {
+                self.detach_page(page);
+            }
             self.seq_lens[slot] = 0;
             self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
         }
@@ -876,17 +1119,19 @@ mod testing {
         }
 
         fn retained_count(&self) -> usize {
-            self.retained_pages.len()
+            self.page_ref_counts.len()
         }
 
         fn release_pages(&mut self, pages: &[u32]) {
             for page in pages {
-                self.retained_pages.remove(page);
+                self.release_page(*page);
             }
         }
 
         fn retain_pages(&mut self, pages: &[u32]) {
-            self.retained_pages.extend(pages.iter().copied());
+            for page in pages {
+                self.retain_page(*page);
+            }
         }
     }
 
@@ -1188,7 +1433,7 @@ mod tests {
             MockKvPool::with_capacity(1, 16, 2),
             test_config(1),
         );
-        let handle = engine.submit_request(vec![3; 16], 1);
+        let handle = engine.submit_request(vec![3; 15], 1);
         let initial_free = engine.kv_free_pages();
 
         engine.step()?;
@@ -1215,6 +1460,170 @@ mod tests {
         assert_eq!(engine.active_count(), 0);
         assert_eq!(engine.waiting_count(), 1);
         assert!(!engine.has_inflight());
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_hit_reuses_pages() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 4, 8),
+            test_config(1),
+        );
+        let first = engine.submit_request(vec![1, 2, 3, 4, 9], 1);
+
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+
+        let hit = engine.radix.peek_longest_prefix_match(&[1, 2, 3, 4]);
+        assert_eq!(hit.matched_len, 4);
+        assert_eq!(hit.block_ids.len(), 1);
+        let cached_page = hit.block_ids[0];
+        let free_after_publish = engine.kv_free_pages();
+
+        let second = engine.submit_request(vec![1, 2, 3, 4, 10, 11], 1);
+        engine.step()?;
+
+        let (&slot, request) = engine
+            .active
+            .iter()
+            .find(|(_, request)| request.handle == second)
+            .expect("second admitted");
+        assert_eq!(request.prefill_start_pos, 4);
+        assert_eq!(request.reused_prefix_pages, vec![cached_page]);
+        assert_eq!(engine.kv.page_indices(slot)[0], cached_page);
+        assert_eq!(engine.kv_free_pages(), free_after_publish - 1);
+
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        Ok(())
+    }
+
+    #[test]
+    fn cross_turn_reuse() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 4, 4),
+            test_config(1),
+        );
+        let first = engine.submit_request(vec![7, 7, 7, 7], 1);
+        engine.run_to_idle()?;
+        assert_eq!(
+            engine
+                .completed(first)
+                .expect("first completed")
+                .generated_tokens,
+            vec![8]
+        );
+
+        let second = engine.submit_request(vec![7, 7, 7, 7], 1);
+        engine.run_to_idle()?;
+        assert_eq!(
+            engine
+                .completed(second)
+                .expect("second completed")
+                .generated_tokens,
+            vec![8]
+        );
+
+        let third = engine.submit_request(vec![7, 7, 7, 7], 1);
+        engine.run_to_idle()?;
+        assert_eq!(
+            engine
+                .completed(third)
+                .expect("third completed")
+                .generated_tokens,
+            vec![8]
+        );
+        assert_eq!(engine.radix.cached_page_count(), 1);
+        assert_eq!(engine.kv_free_pages(), engine.kv.total_pages() - 1);
+        Ok(())
+    }
+
+    #[test]
+    fn eviction_frees_lru_not_active() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 2, 5),
+            test_config(1),
+        );
+        let first = engine.submit_request(vec![1, 1], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+
+        let second = engine.submit_request(vec![2, 2], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+
+        let active = engine.submit_request(vec![1, 1, 3], 1);
+        engine.step()?;
+        assert!(
+            engine
+                .active
+                .values()
+                .any(|request| request.handle == active)
+        );
+
+        let evicted = engine.evict_prefix_cache_for_pages(1);
+        assert_eq!(evicted, 1);
+        assert_eq!(
+            engine.radix.peek_longest_prefix_match(&[2, 2]).matched_len,
+            0
+        );
+        assert_eq!(
+            engine.radix.peek_longest_prefix_match(&[1, 1]).matched_len,
+            2
+        );
+
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(active).expect("active completed"));
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_refcount_no_double_free() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 2, 4),
+            test_config(1),
+        );
+        let first = engine.submit_request(vec![5, 5], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+        assert_eq!(engine.radix.cached_page_count(), 1);
+        assert_eq!(engine.kv_free_pages(), engine.kv.total_pages() - 1);
+
+        let second = engine.submit_request(vec![5, 5], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        assert_eq!(engine.radix.cached_page_count(), 1);
+        assert_eq!(engine.kv_free_pages(), engine.kv.total_pages() - 1);
+
+        assert_eq!(engine.evict_prefix_cache_for_pages(1), 1);
+        assert_eq!(engine.kv_free_pages(), engine.kv.total_pages());
+        assert_eq!(engine.evict_prefix_cache_for_pages(1), 0);
+        assert_eq!(engine.kv_free_pages(), engine.kv.total_pages());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_block_not_published() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 4, 8),
+            test_config(1),
+        );
+        let partial = engine.submit_request(vec![9, 9, 9], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(partial).expect("partial completed"));
+        assert_eq!(engine.radix.cached_page_count(), 0);
+
+        let with_tail = engine.submit_request(vec![1, 2, 3, 4, 5, 6], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(with_tail).expect("with tail completed"));
+        let hit = engine.radix.peek_longest_prefix_match(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(hit.matched_len, 4);
+        assert_eq!(hit.block_ids.len(), 1);
         Ok(())
     }
 }
