@@ -29,6 +29,15 @@ use infer_core::{CompletedRequest, Engine, RequestHandle, SchedulerConfig};
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
 
+mod openai;
+pub use openai::{
+    ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
+    OpenAiTokenizer, openai_router,
+};
+
+#[cfg(feature = "metal")]
+pub use openai::metal_openai_router_from_model_path;
+
 /// How long the engine thread parks on the submit channel when fully idle.
 ///
 /// Short enough that a freshly-submitted request is picked up promptly, long
@@ -132,6 +141,53 @@ where
             submit_tx: Some(submit_tx),
             join: Some(join),
             _backend: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<E, K> ServeHandle<E, K>
+where
+    E: BackendExecutor + 'static,
+    K: KvPool + 'static,
+{
+    /// Spawn an engine thread and build the engine inside that thread.
+    ///
+    /// This is for backends whose executor owns thread-affine handles. The
+    /// builder itself must be sendable, but the constructed `E` and `K` never
+    /// cross a thread boundary; they are created and consumed by the engine
+    /// thread in place.
+    pub fn spawn_with_engine_builder<B>(builder: B) -> Result<Self>
+    where
+        B: FnOnce() -> Result<Engine<E, K>> + Send + 'static,
+    {
+        let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
+        let join = thread::Builder::new()
+            .name("infer-engine".to_string())
+            .spawn(move || match builder() {
+                Ok(engine) => {
+                    let _ = ready_tx.send(Ok(()));
+                    engine_loop(engine, submit_rx);
+                }
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err.to_string()));
+                }
+            })
+            .expect("spawn infer-engine thread");
+
+        match ready_rx
+            .recv()
+            .map_err(|_| anyhow!("engine thread exited before signalling readiness"))?
+        {
+            Ok(()) => Ok(Self {
+                submit_tx: Some(submit_tx),
+                join: Some(join),
+                _backend: std::marker::PhantomData,
+            }),
+            Err(err) => {
+                let _ = join.join();
+                Err(anyhow!("engine build failed: {err}"))
+            }
         }
     }
 
