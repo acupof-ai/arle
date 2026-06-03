@@ -1,60 +1,33 @@
 //! Public `InferenceEngine` adapter over the rewrite stack.
 //!
-//! `infer-api` exposes the SAME public contract the legacy `infer::server_engine`
-//! provides — the [`InferenceEngine`] trait, [`LoadedInferenceEngine`] enum, and
-//! the request/output/stream/telemetry types — implemented over the rewrite
-//! stack (`infer-core` `Engine` + `infer-server` `ServeHandle` + `infer-plan`
-//! `SamplingParams`). Consumers (`agent` / `cli` / `train`) can later swap
-//! `infer` -> `infer-api` with zero code changes. This crate is **additive**: it
-//! migrates no consumer.
-//!
-//! Backend selection is by compiled feature flag, mirroring `infer`:
-//! `metal` (Apple Silicon), `cuda` (Linux + NVIDIA), `cpu` (portable smoke / CI).
-//!
-//! # Wiring
-//!
-//! Every request flows `tokenize -> ServeHandle::submit -> collect ->
-//! detokenize`, projecting the rewrite `CompletedRequest` back into the legacy
-//! [`CompletionOutput`] shape (finish reason, [`TokenUsage`], token ids). The
-//! shared body lives in [`ServeInferenceEngine`]; each [`LoadedInferenceEngine`]
-//! variant dispatches to it.
+//! Exposes the same public contract as the legacy `infer::server_engine` (the
+//! [`InferenceEngine`] trait, [`LoadedInferenceEngine`] enum, request/output/
+//! stream/telemetry types) over the rewrite stack, so consumers can later swap
+//! `infer` -> `infer-api` with zero code changes. Backend selection is by
+//! compiled feature (`metal`/`cuda`/`cpu`). Every request flows
+//! `tokenize -> ServeHandle::submit -> collect -> detokenize` via
+//! [`ServeInferenceEngine`].
 //!
 //! # Gaps vs. the legacy contract (follow-ups)
 //!
-//! These are the precise points where the rewrite stack cannot yet match the
-//! legacy surface. The public types still carry the fields so the swap stays
-//! zero-change; the data is simply unavailable until the rewrite stack grows
-//! the hook.
+//! Public types carry the fields so the swap stays zero-change; the data is
+//! unavailable until the rewrite stack grows the hook.
 //!
-//! - **Streaming** — the rewrite `ServeHandle` exposes blocking `collect` only,
-//!   with no per-token streaming hook. [`InferenceEngine::complete_stream`] runs
-//!   the request to completion, then emits the full text + a terminal finish
-//!   delta. Consumers receive a correct result but not incremental tokens. True
-//!   token-granular streaming needs a `ServeHandle` streaming API.
-//! - **Telemetry** — the rewrite `ServeHandle` does not surface scheduler
-//!   counters (queue depth, occupancy, TTFT, ITL) across its thread channel.
-//!   [`InferenceEngine::telemetry`] returns the empty [`EngineTelemetry`] shape.
-//!   (`EngineTelemetry` also omits the legacy `model_arch` field, which is an
-//!   `infer`-internal `ModelArchSummary` type.)
-//! - **Per-token logprobs** — not surfaced by the rewrite stack;
-//!   [`CompletionOutput::token_logprobs`] is always empty.
+//! - **Streaming** — `ServeHandle` is blocking-`collect` only.
+//!   [`InferenceEngine::complete_stream`] emits the full text + a terminal delta,
+//!   not incremental tokens.
+//! - **Telemetry** — [`InferenceEngine::telemetry`] returns empty
+//!   [`EngineTelemetry`] (no scheduler counters across the thread channel; also
+//!   omits the legacy `model_arch` field).
+//! - **Per-token logprobs** — [`CompletionOutput::token_logprobs`] is always empty.
 //! - **`session_id` / `trace_context` / `cancel`** — carried on
-//!   [`CompletionRequest`] for surface compatibility but not yet honored by the
-//!   rewrite engine (no sticky routing, no trace propagation, no mid-generation
-//!   cancel). Every current consumer passes `None`.
-//! - **CUDA backend** — structurally wired (the [`LoadedInferenceEngine::Cuda`]
-//!   variant + dispatch typecheck under the Mac CUDA-Rust recipe), but
-//!   [`LoadedInferenceEngine::load`] on CUDA returns an error: the real CUDA
-//!   forward + `CudaExecutor` model builder + tokenizer resolution are Phase-0 /
-//!   lead-owned and this crate may not edit them.
+//!   [`CompletionRequest`] but not yet honored; every current consumer passes `None`.
+//! - **CUDA backend** — wired + typechecks, but [`LoadedInferenceEngine::load`]
+//!   errors: the real CUDA forward + builder are lead-owned.
 //! - **Train-only CUDA methods + LoRA types** — `forward_token_logits`,
-//!   `remerge_student_lora`, `offload_engine_weights`, `reload_engine_weights`,
-//!   and the `StudentLora{Layer,Matrices,Update}` types that `train` uses are
-//!   NOT yet ported. They depend on the CUDA scheduler's direct model access,
-//!   which the rewrite `ServeHandle` (thread-isolated, host-only seam) does not
-//!   expose. `train` must stay on legacy `infer` until the rewrite CUDA path
-//!   grows an OPD control surface. This is the single largest blocker to
-//!   deleting `infer` for the `train` consumer specifically.
+//!   `remerge_student_lora`, weight offload/reload, and the `StudentLora*` types
+//!   need direct model access the host-only `ServeHandle` doesn't expose; `train`
+//!   stays on legacy `infer` until the CUDA path grows an OPD control surface.
 
 mod loaded;
 mod serve_engine;

@@ -1,15 +1,9 @@
 //! `LoadedInferenceEngine` — the backend-dispatching public engine.
 //!
-//! Mirrors `infer::server_engine::LoadedInferenceEngine`: a feature-gated enum
-//! over the available backends with a `load(model_path, enable_cuda_graph)`
-//! constructor and an [`InferenceEngine`] impl that dispatches to the active
-//! variant. The backend is selected by compiled feature flags (`metal` / `cuda`
-//! / `cpu`), exactly as in the legacy crate — there is no runtime backend arg.
-//!
-//! [`EngineLoadConfig`] (pure slot/page data) is always available; the
-//! [`LoadedInferenceEngine`] enum and its impls exist only when a backend
-//! feature is enabled, matching the legacy crate's
-//! `#[cfg(any(cuda, metal, cpu))]` gate on the type.
+//! A feature-gated enum over the available backends (`metal`/`cuda`/`cpu`,
+//! selected at compile time) with a `load(model_path, enable_cuda_graph)`
+//! constructor dispatching to the active variant. [`EngineLoadConfig`] is always
+//! available; the enum + impls require a backend feature.
 
 /// Slot / page configuration for [`LoadedInferenceEngine::load_with_config`].
 #[derive(Debug, Clone, Copy)]
@@ -30,7 +24,7 @@ pub struct EngineLoadConfig {
 
 impl Default for EngineLoadConfig {
     fn default() -> Self {
-        // Matches `infer_server::metal_openai_router_from_model_path` defaults.
+        // Matches `metal_openai_router_from_model_path` defaults.
         Self {
             num_slots: 4,
             total_pages: 8192,
@@ -74,40 +68,31 @@ mod backend {
         }
     }
 
-    /// Backend-dispatching public engine.
-    ///
-    /// One variant per compiled backend. Construct with [`Self::load`]; drive
-    /// through the [`InferenceEngine`] trait.
+    /// Backend-dispatching public engine; one variant per compiled backend.
     pub enum LoadedInferenceEngine {
-        /// Metal backend (Apple Silicon, MLX). Fully wired and runnable today.
+        /// Metal backend (Apple Silicon, MLX). Fully wired and runnable.
         #[cfg(feature = "metal")]
         Metal(ServeInferenceEngine<MetalExecutor, MetalKvPool>),
-        /// CUDA backend (Linux + NVIDIA). Structurally wired here; the real CUDA
-        /// forward is Phase-0 / lead-owned and not yet runnable, but this path
-        /// typechecks via the Mac CUDA-Rust recipe.
+        /// CUDA backend (Linux + NVIDIA). Structurally wired (typechecks); the
+        /// real forward is lead-owned and not yet runnable.
         #[cfg(feature = "cuda")]
         Cuda(ServeInferenceEngine<CudaExecutor, CudaKvPool>),
-        /// Portable CPU backend: the feature-free placeholder `MetalExecutor`
-        /// over the real host `MetalKvPool` (no MLX, no CUDA). For smoke / CI.
+        /// Portable CPU backend: the placeholder `MetalExecutor` over the real
+        /// host `MetalKvPool` (no MLX, no CUDA). Smoke / CI.
         #[cfg(all(feature = "cpu", not(feature = "metal")))]
         Cpu(ServeInferenceEngine<MetalExecutor, MetalKvPool>),
     }
 
     impl LoadedInferenceEngine {
         /// Load the inference engine for the compiled backend.
-        ///
-        /// Signature matches the legacy
-        /// `infer::server_engine::LoadedInferenceEngine::load` so the `infer` ->
-        /// `infer-api` swap needs no caller change. `enable_cuda_graph` is
-        /// honored by the CUDA path only; other backends ignore it.
+        /// `enable_cuda_graph` is honored by the CUDA path only.
         pub fn load(model_path: &str, enable_cuda_graph: bool) -> Result<Self> {
             Self::load_with_config(model_path, enable_cuda_graph, EngineLoadConfig::default())
         }
 
         /// Load with explicit slot / page configuration.
-        // Each backend arm is a feature-gated `return`; which one is the
-        // function tail depends on the enabled features, so a bare expression
-        // would not compile across all single-backend builds.
+        // Each arm is a feature-gated `return` (the tail arm varies by feature
+        // set), so a bare expression would not compile in single-backend builds.
         #[allow(clippy::needless_return)]
         pub fn load_with_config(
             model_path: &str,
@@ -176,18 +161,10 @@ mod backend {
         ) -> Result<Self> {
             use infer_server::OpenAiTokenizer;
 
-            // GAP (documented): the real CUDA forward + model build is Phase-0 /
-            // lead-owned (the CUDA model.rs/executor.rs are being fixed
-            // separately, and this crate may not edit them). The path below is
-            // wired structurally — same tokenize/submit/collect/detokenize shape
-            // as Metal — so the surface typechecks under the Mac CUDA-Rust
-            // recipe and the engine thread is built exactly as it will be when
-            // the real forward lands. It is NOT runnable today: the executor
-            // builder requires a device and the Phase-0 forward, so
-            // `spawn_with_engine_builder` surfaces that error at load. The CUDA
-            // tokenizer is resolved from the local model dir (no HF fetch
-            // helper exists in infer-cuda yet); `enable_cuda_graph` is reserved
-            // for the real executor builder.
+            // GAP: structurally wired (same shape as Metal, typechecks) but NOT
+            // runnable — the executor builder needs a device + the real forward,
+            // so `spawn_with_engine_builder` errors at load. Tokenizer resolves
+            // from the local model dir; `enable_cuda_graph` is reserved.
             let _ = enable_cuda_graph;
             let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
             let model_id = crate::serve_engine::model_id_from_path(model_path);
@@ -215,9 +192,8 @@ mod backend {
         fn load_cpu(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
             use infer_server::OpenAiTokenizer;
 
-            // The CPU smoke path drives the feature-free placeholder executor
-            // over a real host KV pool. It still needs a tokenizer dir for
-            // encode/decode.
+            // CPU smoke: placeholder executor over a real host KV pool; still
+            // needs a tokenizer dir for encode/decode.
             let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
             let model_id = crate::serve_engine::model_id_from_path(model_path);
             let executor = MetalExecutor::new();

@@ -1,33 +1,16 @@
-//! Fixed device buffers for the B=1 captured decode path (CG-2).
+//! Fixed device buffers for the B=1 captured decode path.
 //!
-//! This is the additive companion to the eager [`crate::model::CudaModel::forward_tokens`]
-//! path (which stays the numerically-verified correctness floor — Phase 0 closed
-//! 2026-06-03 with exact HF-gold parity, see the R6 CUDA eager parity gate). The
-//! eager path allocates the activation scratch (`HiddenStates::zeros`) and the
-//! per-step paging metadata (`PageMeta::for_slot`) fresh on every call. A captured
-//! CUDA graph cannot contain `cudaMalloc`, so the captured decode path instead
-//! READS/WRITES the **fixed** buffers held here: the host overwrites their contents
-//! (Stage 1) before each `graph.launch()` (Stage 2), exactly as the design doc
-//! `docs/projects/2026-06-03-cuda-graph-design.md` §5 specifies.
+//! A captured CUDA graph cannot contain `cudaMalloc`, so instead of the eager
+//! path's per-call `HiddenStates::zeros` / `PageMeta::for_slot`, the captured
+//! decode reads/writes the FIXED buffers here: the host overwrites their contents
+//! (Stage 1) before each `graph.launch()` (Stage 2). B=1 decode only; batch
+//! buckets are deferred. See `docs/projects/2026-06-03-cuda-graph-design.md`.
 //!
-//! Scope (per design §9, the recommended first landing): **B=1 decode only**. The
-//! batch-size buckets and pad-up logic the design describes for the server case are
-//! deferred to R6b; this module sizes everything to a single decode row.
-//!
-//! # The page-table-length capture key (design §5 vs the TileLang scalar ABI)
-//!
-//! The clean R6 attention path issues the TileLang paged decode kernel with the
-//! page-table length (`meta.num_pages`) as a **scalar launch argument** (see
-//! `attention.rs` `run_tilelang_paged`, the `total_pages` arg). A captured graph
-//! bakes that scalar in. The KV positions themselves are read from the fixed
-//! `kv_indices`/`kv_indptr`/`kv_last_page_len` device buffers (overwritable), but
-//! the page-*count* is frozen at capture. Because the decode sequence grows one
-//! token per step, `num_pages` increments every `page_size` (16) tokens. So the
-//! capture key is `(batch_size, num_pages)`: while the page count is unchanged the
-//! graph replays; when a page boundary is crossed the executor recaptures for the
-//! new page count. This is the design's "invalidate + recapture on shape change"
-//! rule (§5/§8 `reallocated → invalidate_graph_cache`) applied to the page-table
-//! length, and it keeps the captured kernel reading exactly the valid page span.
+//! Capture key = `(batch_size, num_pages)`: the TileLang decode kernel takes the
+//! page-table length (`meta.num_pages`) as a scalar launch arg, which the graph
+//! bakes in. KV positions live in overwritable buffers, but the page count is
+//! frozen at capture, so crossing a page boundary (every `page_size` tokens)
+//! recaptures.
 
 use anyhow::{Result, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
@@ -36,15 +19,11 @@ use cudarc::driver::CudaSlice;
 use crate::decode_graph_key::{DECODE_GRAPH_BATCH, DecodeGraphKey, decode_graph_key_for};
 use crate::loader::PageMeta;
 
-/// Fixed device buffers for one captured B=1 decode shape.
-///
-/// Holds the activation scratch (sized to `seq_len == 1`) and the paging metadata
-/// buffers, all allocated once and reused across every replay at the same capture
-/// key. The host overwrites the metadata contents each step via [`Self::stage1_write`]
-/// before launching the graph; the buffer **addresses** never change, so the captured
-/// kernels keep dereferencing valid pointers.
+/// Fixed device buffers for one captured B=1 decode shape: activation scratch
+/// (sized to `seq_len == 1`) + paging metadata, allocated once and reused across
+/// replays. The host overwrites the metadata contents each step via
+/// [`Self::stage1_write`]; buffer addresses never change.
 pub(crate) struct DecodeGraphContext {
-    // -- activation scratch (was `HiddenStates::zeros` / `DeviceVec::zeros` per call) --
     pub(crate) hidden: HiddenStates,
     pub(crate) normed: HiddenStates,
     pub(crate) q_batch: HiddenStates,
@@ -58,33 +37,25 @@ pub(crate) struct DecodeGraphContext {
     pub(crate) act_out: HiddenStates,
     pub(crate) last_hidden: DeviceVec,
     pub(crate) last_normed: DeviceVec,
-    /// LM-head output. The captured graph ends here; sampling runs eager afterward
-    /// (design §7 — sampling stays outside the graph).
+    /// LM-head output. The captured graph ends here; sampling runs eager after.
     pub(crate) logits: DeviceVec,
 
-    // -- fixed token id buffer (was `upload_i32(token_ids)` per call) --
     pub(crate) token_ids: CudaSlice<i32>,
 
-    // -- fixed paging metadata (was `PageMeta::for_slot`, which uploads 7 fresh
-    //    `CudaSlice<i32>` per call). This OWNS the fixed metadata buffers; Stage-1
-    //    overwrites their CONTENTS in place each step (never reallocates), so the
-    //    captured attention kernel keeps dereferencing the same stable addresses.
-    //    `kv_indices` is sized to `max_pages` so it survives sequence growth; only
-    //    the first `num_pages` entries are valid each step, and `meta.num_pages`
-    //    (the captured TileLang `total_pages` scalar) bounds the kernel's walk. --
+    /// Fixed paging metadata; Stage-1 overwrites contents in place each step.
+    /// `kv_indices` is sized to `max_pages` so it survives sequence growth; only
+    /// the first `num_pages` entries are valid and bound the kernel's walk.
     pub(crate) meta: PageMeta,
-    /// Max page-table entries `meta.kv_indices` can hold (sizing bound, never resized).
+    /// Max page-table entries `meta.kv_indices` holds (never resized).
     max_pages: usize,
 
-    /// Capture key this context was last written for: `(batch_size, num_pages)`.
-    /// `None` until the first Stage-1 write. A change in `num_pages` (page-boundary
-    /// crossing) means the captured graph's baked page-table length is stale.
+    /// Capture key last written for; `None` until the first Stage-1 write. A change
+    /// in `num_pages` means the captured page-table length is stale.
     key: Option<DecodeGraphKey>,
 }
 
 impl DecodeGraphContext {
-    /// Allocate the fixed buffers once for the model's config and a sequence-length
-    /// budget. `max_seq_len` bounds the page-table buffer (`kv_indices`) so it is
+    /// Allocate the fixed buffers once. `max_seq_len` bounds `kv_indices` so it is
     /// never reallocated mid-serve.
     pub(crate) fn new(
         ctx: &DeviceContext,
@@ -131,16 +102,10 @@ impl DecodeGraphContext {
         })
     }
 
-    /// Stage 1: overwrite the fixed metadata buffers with this step's contents.
-    ///
-    /// Mirrors [`PageMeta::for_slot`] arithmetic but writes into the **existing**
-    /// device allocations (in-place H2D) instead of allocating fresh ones. Returns
-    /// the `(batch, num_pages)` key the captured graph must match to be replay-valid.
-    ///
-    /// `token` is this decode step's input token, `kv_seq_len` is the cache length
-    /// BEFORE appending it (so the new position is `kv_seq_len`, and the new total
-    /// length is `kv_seq_len + 1`). The pool must already have the appended token's
-    /// page allocated (the executor calls `alloc_tokens(slot, 1)` before this).
+    /// Stage 1: overwrite the fixed metadata in place (no alloc) with this step's
+    /// contents; returns the `(batch, num_pages)` replay key. `kv_seq_len` is the
+    /// cache length BEFORE appending `token`; the pool must already have the
+    /// appended page allocated.
     pub(crate) fn stage1_write(
         &mut self,
         ctx: &DeviceContext,
@@ -179,7 +144,7 @@ impl DecodeGraphContext {
             last_page_len
         };
 
-        // In-place overwrites of the fixed buffers — addresses never change.
+        // In-place overwrites; buffer addresses never change.
         write_i32(ctx, &mut self.token_ids, &[token as i32])?;
         write_i32(
             ctx,
@@ -188,8 +153,7 @@ impl DecodeGraphContext {
         )?;
         write_i32(ctx, &mut self.meta.kv_indptr, &[0, num_pages as i32])?;
         let page_ids: Vec<i32> = pages[..num_pages].iter().map(|&p| p as i32).collect();
-        // Write only the valid prefix; trailing entries stay as previously written
-        // but are never walked because the kernel's page-table length is num_pages.
+        // Only the valid prefix is written; the kernel walks just num_pages.
         write_i32_prefix(ctx, &mut self.meta.kv_indices, &page_ids)?;
         write_i32(
             ctx,
@@ -199,8 +163,6 @@ impl DecodeGraphContext {
         write_i32(ctx, &mut self.meta.page_table_offsets, &[0])?;
         write_i32(ctx, &mut self.meta.start_positions, &[kv_seq_len as i32])?;
         write_i32(ctx, &mut self.meta.positions, &[(total_len - 1) as i32])?;
-        // The captured TileLang kernel reads num_pages as a scalar launch arg, so
-        // it is part of the capture key (see module docs).
         self.meta.num_pages = num_pages;
         self.meta.seq_len = DECODE_GRAPH_BATCH;
 

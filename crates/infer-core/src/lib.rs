@@ -1083,17 +1083,9 @@ mod testing {
         }
     }
 
-    /// Mock executor that mirrors the real CUDA executor's *internal* device KV
-    /// pool advancement and its decode-step length invariant.
-    ///
-    /// `infer_cuda::RealCudaExecutor` owns a device-side `PagedKVPool` that it
-    /// advances itself inside `submit` (prefill: `alloc_tokens(slot, prompt_len)`,
-    /// decode: `alloc_tokens(slot, 1)`), separate from the host scheduler
-    /// `KvPool`. Before each decode it asserts the two counters agree:
-    /// `device.seq_len(slot) == DecodeRow.kv_seq_len`. This mock reproduces both
-    /// the advancement and the assertion against the *real* engine + planner, so
-    /// a host-side off-by-one in `DecodeRow.kv_seq_len` surfaces as a CPU test
-    /// failure instead of only on an H20.
+    /// Mirrors the real CUDA executor's device KV advancement + its decode-step
+    /// length invariant (`device.seq_len(slot) == DecodeRow.kv_seq_len`), so a
+    /// host-side `kv_seq_len` off-by-one fails on CPU rather than only on an H20.
     #[derive(Debug, Clone, Default)]
     pub(super) struct DeviceMirrorExecutor {
         /// Per-slot materialized device KV length, mirroring the executor pool.
@@ -1259,16 +1251,9 @@ mod tests {
         Ok(())
     }
 
-    /// Regression for the R6 CUDA decode-path off-by-one: `DecodeRow.kv_seq_len`
-    /// must equal the executor's *materialized* device KV length at every decode
-    /// step. `DeviceMirrorExecutor` reproduces the real executor's two-pool
-    /// bookkeeping + assertion against the real engine + planner, so a host-side
-    /// counter drift fails here on CPU rather than only on an H20.
-    ///
-    /// Per-decode invariant (the H20 assertion): the materialized device length
-    /// observed at decode step k equals that decode row's `kv_seq_len`, and both
-    /// equal `prompt_len + k` (the prefill forward emits the first token, so the
-    /// k-th decode, 0-indexed, attends over `prompt_len + k` materialized rows).
+    /// Decode-path off-by-one regression: at decode step k the materialized device
+    /// length == that row's `kv_seq_len` == `prompt_len + k` (the prefill forward
+    /// emits the first token).
     fn assert_decode_kv_seq_len_matches_materialized(prompt_len: usize, max_new: usize) {
         // Single-chunk prefill: the whole prompt lands in one prefill row.
         assert_decode_kv_seq_len_with_chunk(prompt_len, max_new, prompt_len.max(1));
@@ -1340,16 +1325,9 @@ mod tests {
         assert_decode_kv_seq_len_with_chunk(10, 3, 4);
     }
 
-    /// Prefix-reuse characterization for the R6 single-row executor.
-    ///
-    /// When a second request shares a cached prefix, the host scheduler attaches
-    /// the prefix pages (host `seq_len` jumps to `matched_len`) but the device
-    /// `PagedKVPool` for the fresh slot starts at 0. The executor's prefill guard
-    /// `ensure_slot_ready_for_prefill` (executor.rs:187) requires device
-    /// `materialized == start_pos`; a `start_pos > 0` prefill row with a 0 device
-    /// pool must be *rejected explicitly*, not silently drift the decode counter.
-    /// `DeviceMirrorExecutor` mirrors that guard, so this asserts the failure mode
-    /// is the loud prefill guard rather than a +1 decode mismatch.
+    /// Prefix reuse on the single-row executor must either run cleanly or fail
+    /// loud at the prefill-readiness guard (device `materialized == start_pos`),
+    /// never silently drift the decode counter.
     #[test]
     fn prefix_reuse_either_decodes_cleanly_or_fails_loud_at_prefill() {
         let executor = DeviceMirrorExecutor::default();
