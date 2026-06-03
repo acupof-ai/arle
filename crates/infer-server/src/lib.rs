@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use infer_core::{CompletedRequest, Engine, RequestHandle, SchedulerConfig};
-use infer_plan::{ForwardPlan, SlotToken, StepOutput};
+use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
 
 mod execution;
@@ -193,7 +193,12 @@ where
     /// Blocks only until the engine thread assigns a [`RequestHandle`] (a single
     /// channel round-trip), not until the request finishes. Use the returned
     /// ticket to [`collect`](RequestTicket::collect) the result.
-    pub fn submit(&self, prompt: Vec<u32>, max_tokens: usize) -> Result<RequestTicket> {
+    pub fn submit(
+        &self,
+        prompt: Vec<u32>,
+        max_tokens: usize,
+        sampling: SamplingParams,
+    ) -> Result<RequestTicket> {
         let submit_tx = self
             .submit_tx
             .as_ref()
@@ -204,6 +209,7 @@ where
             .send(Submission {
                 prompt,
                 max_tokens,
+                sampling,
                 handle_tx,
                 completion_tx,
             })
@@ -313,8 +319,8 @@ mod tests {
         let kv = MetalKvPool::new(2, 256, 16);
         let serve = ServeHandle::spawn(EchoExecutor, kv, config);
 
-        let first = serve.submit(vec![10, 11, 12], 5)?;
-        let second = serve.submit(vec![100, 101], 3)?;
+        let first = serve.submit(vec![10, 11, 12], 5, SamplingParams::default())?;
+        let second = serve.submit(vec![100, 101], 3, SamplingParams::default())?;
 
         // Handles are distinct and ordered by submission.
         assert_ne!(first.handle(), second.handle());
@@ -353,7 +359,7 @@ mod tests {
         let kv = MetalKvPool::new(1, 64, 16);
         let serve = ServeHandle::spawn(EchoExecutor, kv, config);
 
-        let ticket = serve.submit(vec![1, 2, 3], 4)?;
+        let ticket = serve.submit(vec![1, 2, 3], 4, SamplingParams::default())?;
         let done = ticket
             .collect_timeout(Duration::from_secs(5))
             .map_err(|_| anyhow!("rejected request did not complete in time"))?;
