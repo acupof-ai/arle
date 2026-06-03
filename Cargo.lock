@@ -1929,11 +1929,19 @@ name = "infer-server"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "axum",
+ "hf-hub",
  "infer-core",
  "infer-metal",
  "infer-plan",
  "infer-seam",
  "log",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
+ "tower",
+ "uuid",
 ]
 
 [[package]]

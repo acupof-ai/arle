@@ -7,11 +7,25 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1.0"
+axum = "0.8"
+hf-hub = { version = "0.5", features = ["tokio"], optional = true }
 infer-core = { path = "../infer-core" }
-infer-metal = { path = "../infer-metal" }
-infer-plan = { path = "../infer-plan" }
+infer-metal = { path = "../infer-metal", default-features = false }
+infer-plan = { path = "../infer-plan", features = ["serde"] }
 infer-seam = { path = "../infer-seam" }
 log = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokenizers = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+default = []
+metal = ["dep:hf-hub", "infer-metal/metal"]
+
+[dev-dependencies]
+tower = "0.5"
 
 [lints]
 workspace = true

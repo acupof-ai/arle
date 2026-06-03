@@ -608,7 +608,7 @@ impl MetalPageStore {
         // GDR state is prefix-wide, not page-local. Only publish a hot-prefix
         // snapshot at an exact page boundary where the exported recurrent/conv
         // state corresponds to the same token length as the page-id prefix.
-        if slot.cache_len % page_size == 0 && publish_pages == full_pages {
+        if slot.cache_len.is_multiple_of(page_size) && publish_pages == full_pages {
             let key = page_ids[..full_pages].to_vec();
             if key.iter().all(|page| self.pages.contains_key(page)) {
                 self.prefixes.insert(
@@ -634,7 +634,7 @@ impl MetalPageStore {
     ) -> anyhow::Result<MetalSlotState> {
         let page_size = kv.page_size().max(1);
         anyhow::ensure!(
-            prefix_tokens % page_size == 0,
+            prefix_tokens.is_multiple_of(page_size),
             "Metal prefix attach requires page-aligned prefix: prefix_tokens={}, page_size={}",
             prefix_tokens,
             page_size
