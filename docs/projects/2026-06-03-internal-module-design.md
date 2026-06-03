@@ -17,7 +17,39 @@ public seam is unchanged.
 
 ---
 
-## 1. `infer-core` — split the 1854-line `lib.rs` god-module (highest severity)
+## v2 — churn-weighted re-design (SUPERSEDES the per-crate sections below)
+
+The v1 sections below split each god-file by *concern*. Re-reviewed against **(a) cohesion +
+the other half of Ousterhout — deep modules, NOT many shallow ones; (b) the actual workload
+(AI-PC c=1 agent, prefix-reuse, growing context); (c) where future iteration/optimization
+volume actually lands** — v1 **over-decomposes**: it shatters cold, stable code into shallow
+modules whose inter-file interfaces cost more than they save. v2 isolates one **deep module per
+HOT axis** and consolidates the **COLD** code into the coordinator.
+
+**Churn map (grounded in this repo's bench/opt history — `docs/experience/{wins,errors}`):**
+
+| HOT — frequent perf/feature change → isolate as a deep module | COLD — stable once correct → consolidate |
+|---|---|
+| attention kernels (paged/decode/prefill, TileLang/FlashMLA) | IR data types (ForwardPlan/StepOutput) |
+| KV format/quant + prefix cache / radix | request lifecycle, queue discipline, normalization |
+| scheduling (chunked prefill, overlap, retract/clamp) | safetensors loading |
+| sampling features (penalties, grammar) | config |
+| MoE/EP, new backends, new models | HTTP OpenAI wire schema (fixed external contract) |
+| | output / finish handling |
+
+**v2 per-crate target (fewer, deeper files than v1):**
+
+- **`infer-core` → 4 files** (was 7): `planner.rs` (HOT: build_forward_plan + chunked + retract/preempt + mixed) · `prefix.rs` (HOT: radix policy + attach/publish/release/evict choreography over `KvPrefixStore`) · `radix.rs` (the trie data structure, exists) · `engine.rs` (COLD coordinator: orchestration + admission + output/finish + queue + slot/page helpers + RequestState + config). **Drop** v1's separate admission/output/slot/queue files — they're cold and cohesive with orchestration. The two `high` issues still get fixed: the `admit_waiting` god-fn shrinks once prefix-match moves to `prefix.rs`; planning legality moves to `planner.rs`.
+- **`infer-cuda` → 6 files** (was 7): `attention.rs` (HOT) · `ops.rs` (HOT: gemm/rms/silu/embedding/add) · `model.rs` (forward dataflow) · `loader.rs` (COLD: safetensors + PageMeta + config-validate folded) · `executor.rs` (RealCudaExecutor + `sample_cuda_token`) · `lib.rs` (CudaExecutor + CudaKvPool seam).
+- **`infer-metal` → split only the `lib.rs` god-file** (was 8-file blow-up): `executor.rs` (MetalExecutor + MetalInflight + sample_inflight + RealMetalExecutor + MetalSlotState + MetalPageStore — the session machine is one cohesive unit) · `kv_pool.rs` (MetalKvPool seam) · keep existing config/loader/mlx/qwen35/weights/wired_limit. Splitting `qwen35.rs`'s cpp-bridge is deferred unless FFI churn justifies it (it's stable).
+- **`infer-server` → 5 files** (was 6): `execution.rs` (HOT-ish: engine loop) · `http.rs` (router + handlers) · `tokenizer.rs` (COLD) · `schema.rs` (COLD: OpenAI types) · `lib.rs` (ServeHandle + error + submission folded).
+- **`infer-seam`/KvPool** — already done (Step 1, `bca44fa9`); the 3-way split maps to churn (KvPrefixStore = the prefix-cache axis).
+
+Net: infer-core 7→4, cuda 7→6, metal 8→2-new, server 6→5. Same parity gates. The rule: **a file boundary must earn its interface — either by cohesion you can't otherwise get, or by isolating an axis you'll re-edit often.**
+
+---
+
+## 1. `infer-core` — split the 1854-line `lib.rs` god-module (highest severity)  [v1 raw analysis]
 
 `lib.rs` tangles admission + planning + output + prefix-reuse + slot/page lifecycle +
 queue discipline. Two `high` issues: `admit_waiting()` (69-line god-fn mixing governor /
