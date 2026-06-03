@@ -1,19 +1,8 @@
-//! CUDA Graph capture/replay for the decode path (CG-1).
+//! CUDA Graph capture/replay for the decode path.
 //!
-//! This is the concrete home of the graph machinery the deleted seam-level
-//! `GraphRunner` trait used to abstract. Per the architecture verdict the graph
-//! lives **inside** `infer-cuda` (a concrete struct), not behind a cross-backend
-//! seam trait. It is gated on the `cuda` feature so the rest of the crate stays
-//! CPU-testable.
-//!
-//! Ported from the legacy `infer/src/model/cuda_graph.rs` `CudaGraphState`:
-//! first decode call captures the kernel sequence into a graph, subsequent calls
-//! replay it. The instantiate flag `AUTO_FREE_ON_LAUNCH` matches the legacy
-//! behaviour so async-pool allocations made during capture are freed on launch.
-//!
-//! cudarc 0.19 API used: [`CudaStream::begin_capture`] / [`CudaStream::end_capture`]
-//! (the latter takes `&Arc<CudaStream>`), [`CudaGraph::launch`], and
-//! [`CudaGraph::upload`].
+//! First decode call captures the kernel sequence into a graph, later calls
+//! replay it. The `AUTO_FREE_ON_LAUNCH` instantiate flag frees async-pool
+//! allocations made during capture on launch.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,22 +18,17 @@ use log::debug;
 /// The first [`Self::run_or_capture`] call captures the kernel closure into a
 /// graph and launches it; every later call launches the captured graph only.
 pub struct CudaGraphState {
-    /// The compute stream the graph is captured on and replayed to. `end_capture`
-    /// requires `&Arc<CudaStream>`, so the owning `Arc` is held here.
+    /// Compute stream the graph is captured on and replayed to (`end_capture`
+    /// needs `&Arc<CudaStream>`, so the `Arc` is held here).
     stream: Arc<CudaStream>,
     graph: Option<CudaGraph>,
 }
 
-// SAFETY: `CudaGraphState` wraps a `cudarc::driver::safe::CudaGraph` which holds
-// raw CUDA graph and instantiated-graph handles (`CUgraph`, `CUgraphExec`). Those
-// are `!Send` because a CUDA graph must be captured, launched, and destroyed on
-// the thread/context that created it.
-//
-// Invariant upheld: `CudaGraphState` (and the `GraphBucket` that owns it) live
-// inside the single CUDA executor that is driven exclusively from one blocking
-// inference thread. Capture and replay both run on that thread against the same
-// `stream`. Violating this — replaying or dropping from another thread — would
-// race the owning thread's CUDA stream and cause undefined GPU behaviour.
+// SAFETY: the wrapped `CudaGraph` holds `!Send` handles (a CUDA graph must be
+// captured, launched, and destroyed on its owning thread/context). The invariant:
+// `CudaGraphState` lives inside the single CUDA executor driven from one blocking
+// inference thread, so capture and replay always run there. Touching it from
+// another thread would race the stream — undefined GPU behaviour.
 unsafe impl Send for CudaGraphState {}
 
 impl CudaGraphState {
@@ -119,12 +103,8 @@ impl CudaGraphState {
     }
 }
 
-/// One captured decode graph, keyed by its decode batch size.
-///
-/// Decode steps are captured per padded batch size: a batch of size `b` replays
-/// the graph captured for `b`. This wraps a [`CudaGraphState`] so a future
-/// stage can carry per-bucket device buffers alongside it without changing the
-/// bucket map's shape.
+/// One captured decode graph keyed by its decode batch size. Wraps a
+/// [`CudaGraphState`] so a later stage can carry per-bucket buffers alongside it.
 pub struct CapturedDecodeGraph {
     /// Decode batch size (number of rows) this graph was captured for.
     pub batch_size: usize,
@@ -143,11 +123,8 @@ impl CapturedDecodeGraph {
     }
 }
 
-/// Per-decode-batch-size pool of captured graphs.
-///
-/// Decode shapes vary only by batch size (the padded number of active decode
-/// rows), so one captured graph per batch size is reused for every step at that
-/// size. The compute stream is held so new buckets can be created on demand.
+/// Per-batch-size pool of captured graphs (one per batch size, reused across
+/// steps). Holds the compute stream so new buckets can be created on demand.
 pub struct GraphBucket {
     stream: Arc<CudaStream>,
     graphs: HashMap<usize, CapturedDecodeGraph>,

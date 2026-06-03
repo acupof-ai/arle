@@ -1,9 +1,6 @@
-//! Generic adapter wrapping a rewrite-stack [`ServeHandle`] + tokenizer as an
-//! [`InferenceEngine`].
-//!
-//! This is the byte-for-byte bridge described in the cutover map:
-//! `tokenize -> submit -> collect -> detokenize`, projecting the rewrite
-//! `CompletedRequest` back into the legacy [`CompletionOutput`] shape.
+//! Generic adapter wrapping a [`ServeHandle`] + tokenizer as an
+//! [`InferenceEngine`]: `tokenize -> submit -> collect -> detokenize`, projecting
+//! the rewrite `CompletedRequest` back into [`CompletionOutput`].
 
 use anyhow::{Result, anyhow};
 use infer_core::CompletedRequest;
@@ -16,12 +13,9 @@ use crate::types::{
     InferenceEngine, TokenUsage,
 };
 
-/// Adapter over one running [`ServeHandle`] + its tokenizer.
-///
-/// Generic over the rewrite executor / KV pool so the same wiring serves Metal,
-/// CUDA, and the CPU placeholder. Construct a backend-specific instance through
-/// [`crate::LoadedInferenceEngine::load`]; this type is the shared body behind
-/// every variant's [`InferenceEngine`] impl.
+/// Adapter over one running [`ServeHandle`] + its tokenizer, generic over the
+/// executor / KV pool so the same wiring serves every backend. The shared body
+/// behind each [`crate::LoadedInferenceEngine`] variant's impl.
 pub struct ServeInferenceEngine<E: BackendExecutor, K: KvPool> {
     model_id: String,
     tokenizer: OpenAiTokenizer,
@@ -43,12 +37,9 @@ where
         }
     }
 
-    /// Shared `tokenize -> submit -> collect -> detokenize` body.
-    ///
-    /// Returns the projected [`CompletionOutput`]; both `complete` and
-    /// `complete_stream` build on it (the rewrite `ServeHandle` exposes blocking
-    /// `collect` only, so `complete_stream` emits a single terminal delta — see
-    /// the streaming gap in the crate docs).
+    /// Shared `tokenize -> submit -> collect -> detokenize` body returning the
+    /// projected [`CompletionOutput`]; both `complete` and `complete_stream`
+    /// build on it.
     fn run(&self, req: &CompletionRequest) -> Result<CompletionOutput> {
         let prompt_token_ids = self
             .tokenizer
@@ -71,9 +62,8 @@ where
             .decode(&response_token_ids)
             .map_err(|err| anyhow!("decode generated tokens failed: {err}"))?;
 
-        // Host-side stop-string truncation (the rewrite engine stops on token
-        // ids, not strings; OpenAI `stop` strings are applied here, matching the
-        // legacy backend's `truncate_at_first_stop`).
+        // Host-side stop-string truncation (the engine stops on token ids; OpenAI
+        // `stop` strings are applied here).
         let (text, stop_truncated) = match req.stop.as_deref() {
             Some(stops) => match truncate_at_first_stop(&raw_text, stops) {
                 Some(truncated) => (truncated, true),
@@ -101,19 +91,17 @@ where
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
             },
-            // The rewrite stack does not surface per-token logprobs yet.
-            token_logprobs: Vec::new(),
+            token_logprobs: Vec::new(), // not yet surfaced
             prompt_token_ids,
             response_token_ids,
         })
     }
 }
 
-// The `InferenceEngine: Send` supertrait is satisfied via the auto-trait:
-// `ServeInferenceEngine` only stores a `ServeHandle<E, K>` (a `Send` channel +
-// `JoinHandle` + `PhantomData<fn() -> (E, K)>`), never an `E`/`K` value, so it
-// is `Send` even for a `!Send` executor like the MLX-backed `MetalExecutor`
-// (the executor lives on the engine thread and never crosses the seam).
+// `Send` holds via the auto-trait: `ServeInferenceEngine` stores only a
+// `ServeHandle<E, K>` (Send channel + JoinHandle + PhantomData), never an `E`/`K`
+// value, so a `!Send` executor (e.g. MLX `MetalExecutor`, which lives on the
+// engine thread) is fine.
 impl<E, K> InferenceEngine for ServeInferenceEngine<E, K>
 where
     E: BackendExecutor + 'static,
@@ -132,12 +120,8 @@ where
         req: CompletionRequest,
         tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()> {
-        // GAP (documented): the rewrite `ServeHandle` exposes blocking `collect`
-        // only — no per-token streaming hook. The adapter runs the request to
-        // completion, then emits the full text plus a terminal finish delta so
-        // streaming consumers receive a correct (if not incremental) result.
-        // True token-granular streaming requires a `ServeHandle` streaming hook
-        // (follow-up).
+        // GAP: `ServeHandle` is blocking-`collect` only, so emit the full text +
+        // a terminal finish delta (correct but not incremental).
         match self.run(&req) {
             Ok(output) => {
                 if !output.text.is_empty() {
@@ -177,19 +161,14 @@ where
     }
 
     fn telemetry(&self) -> EngineTelemetry {
-        // GAP (documented): the rewrite `ServeHandle` does not surface scheduler
-        // counters (queue depth / occupancy / TTFT / ITL) across its thread
-        // channel today. Returns the empty shape; callers treat empty as
-        // "unavailable", never zero.
+        // GAP: `ServeHandle` surfaces no scheduler counters; empty means
+        // "unavailable", not zero.
         EngineTelemetry::default()
     }
 }
 
-/// Truncate at the first occurrence of any non-empty stop string.
-///
-/// Returns the prefix of `text` up to (but not including) the earliest stop, or
-/// `None` if no stop matched. Mirrors the legacy
-/// `infer::server_engine::stream::truncate_at_first_stop`.
+/// Truncate at the first occurrence of any non-empty stop string, returning the
+/// prefix before it (or `None` if none matched).
 fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
     let mut earliest = None::<usize>;
     for stop in stops {
@@ -207,9 +186,7 @@ fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
 }
 
 /// Derive a model id from the final path segment of a model path or HF id.
-///
-/// Mirrors the legacy `model_id_from_path` helper. Used by the backend variants
-/// (`#[cfg(any(metal, cuda, cpu))]`); unused on a no-backend lib build.
+/// Used by the backend variants; unused on a no-backend lib build.
 #[must_use]
 #[cfg_attr(
     not(any(feature = "metal", feature = "cuda", feature = "cpu")),

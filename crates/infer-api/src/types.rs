@@ -1,29 +1,18 @@
-//! Public types mirroring the legacy `infer::server_engine` contract.
-//!
-//! These are re-exported from the crate root so a consumer that imports
-//! `infer_api::{CompletionRequest, CompletionOutput, ...}` sees the SAME shape
-//! it imports today from `infer::server_engine::{...}`. Where the rewrite stack
-//! already ships a field-identical type (`SamplingParams`), it is re-exported
-//! directly instead of duplicated.
+//! Public types mirroring the legacy `infer::server_engine` contract, so a
+//! consumer importing `infer_api::{...}` sees the same shape it imports from
+//! `infer::server_engine::{...}` today. `SamplingParams` is re-exported from
+//! `infer-plan` rather than duplicated.
 
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-// `SamplingParams` in `infer-plan` is field-for-field identical to the legacy
-// `infer::sampler::SamplingParams` (temperature, top_k, top_p, min_p,
-// repetition_penalty, frequency_penalty, presence_penalty, ignore_eos,
-// stop_token_ids, seed, max_new_tokens). Re-export it so the public surface
-// converges on one canonical sampling contract.
 pub use infer_plan::SamplingParams;
 
-/// Sticky-routing / prefix-cache affinity key.
-///
-/// Mirrors `infer::types::SessionId` (a cheap `Arc<str>` newtype). Carried on
-/// [`CompletionRequest::session_id`] so the swap from `infer` -> `infer-api`
-/// needs no caller change; the rewrite engine does not yet consume it
-/// (host-side sticky routing is a follow-up), so it is currently advisory.
+/// Sticky-routing / prefix-cache affinity key (an `Arc<str>` newtype). Carried
+/// on [`CompletionRequest::session_id`]; advisory until the rewrite engine wires
+/// host-side sticky routing.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SessionId(std::sync::Arc<str>);
 
@@ -47,12 +36,9 @@ impl From<String> for SessionId {
     }
 }
 
-/// A single completion request.
-///
-/// Field-for-field compatible with `infer::server_engine::CompletionRequest`.
-/// `session_id` / `trace_context` / `cancel` are accepted but only partially
-/// honored by the rewrite stack today (see [`super::LoadedInferenceEngine`]
-/// doc gaps): a caller passing `None` (every current consumer) works unchanged.
+/// A single completion request (field-for-field compatible with the legacy
+/// `CompletionRequest`). `session_id`/`trace_context`/`cancel` are accepted but
+/// only partially honored (see the crate-level doc gaps).
 #[derive(Debug)]
 pub struct CompletionRequest {
     pub prompt: String,
@@ -62,24 +48,17 @@ pub struct CompletionRequest {
     pub stop: Option<Vec<String>>,
     /// Return per-token log-probabilities (greedy sampling only).
     pub logprobs: bool,
-    /// Optional client-supplied session identifier for sticky routing / prefix
-    /// affinity. Advisory until the rewrite engine wires host-side sticky
-    /// routing.
+    /// Session identifier for sticky routing / prefix affinity (advisory).
     pub session_id: Option<SessionId>,
-    /// Parent tracing context to attach to the engine-side request. Carried for
-    /// surface-compatibility; the rewrite engine does not yet propagate it.
+    /// Parent tracing context (carried for compatibility; not yet propagated).
     pub trace_context: Option<fastrace::collector::SpanContext>,
-    /// Cooperative cancel flag. The blocking `complete()` path observes this on
-    /// finish; full mid-generation cancellation is a follow-up (the rewrite
-    /// `ServeHandle` exposes blocking `collect` only).
+    /// Cooperative cancel flag (observed on finish; mid-generation cancel is a
+    /// follow-up).
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// Why generation stopped.
-///
-/// The rewrite `infer_plan::FinishReason` adds an `Abort` variant; this 2-state
-/// enum is the legacy public shape. [`from_plan`](FinishReason::from_plan) maps
-/// `Abort` -> `Stop` so the public surface stays binary.
+/// Why generation stopped (the legacy 2-state public shape;
+/// [`from_plan`](FinishReason::from_plan) maps the rewrite's `Abort` -> `Stop`).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FinishReason {
     Length,
@@ -96,8 +75,8 @@ impl FinishReason {
         }
     }
 
-    /// Map a rewrite-stack `infer_plan::FinishReason` into this binary shape.
-    /// `Abort` collapses to `Stop` (the legacy enum has no abort variant).
+    /// Map a rewrite `infer_plan::FinishReason` into this binary shape
+    /// (`Abort` -> `Stop`).
     #[must_use]
     pub fn from_plan(reason: &infer_plan::FinishReason) -> Self {
         match reason {
@@ -107,15 +86,12 @@ impl FinishReason {
     }
 }
 
-/// A completed (non-streaming) generation result.
-///
-/// Field-for-field compatible with `infer::server_engine::CompletionOutput`.
+/// A completed (non-streaming) generation result (legacy `CompletionOutput`).
 pub struct CompletionOutput {
     pub text: String,
     pub finish_reason: FinishReason,
     pub usage: TokenUsage,
-    /// Per-token log-probabilities (greedy only). Empty if not requested or the
-    /// backend does not surface them (the rewrite stack does not yet).
+    /// Per-token log-probabilities (greedy only); always empty (not yet surfaced).
     pub token_logprobs: Vec<f32>,
     /// Tokenized prompt the engine actually saw.
     pub prompt_token_ids: Vec<u32>,
@@ -131,9 +107,7 @@ pub struct TokenUsage {
     pub total_tokens: usize,
 }
 
-/// One streamed delta.
-///
-/// Field-for-field compatible with `infer::server_engine::CompletionStreamDelta`.
+/// One streamed delta (legacy `CompletionStreamDelta`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompletionStreamDelta {
     pub text_delta: String,
@@ -218,14 +192,9 @@ pub struct PrefillPathStats {
     pub ok_false_reasons: HashMap<String, u64>,
 }
 
-/// Backend-agnostic engine-level telemetry snapshot.
-///
-/// Field-for-field compatible with `infer::server_engine::EngineTelemetry`
-/// minus the `model_arch` field (legacy `ModelArchSummary` is an infer-internal
-/// type the rewrite stack does not yet model; see the doc gaps in
-/// [`super::LoadedInferenceEngine`]). The rewrite `ServeHandle` does not surface
-/// any of these counters today, so the adapter returns the default (empty)
-/// shape — callers must treat empty as "unavailable", never as zero.
+/// Backend-agnostic engine-level telemetry snapshot (legacy `EngineTelemetry`
+/// minus `model_arch`). The rewrite `ServeHandle` surfaces none of these today,
+/// so the adapter returns the default — treat empty as "unavailable", not zero.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct EngineTelemetry {
     pub ttft_us: Option<f64>,
@@ -240,11 +209,8 @@ pub struct EngineTelemetry {
     pub timestamp_ms: u64,
 }
 
-/// The public inference contract.
-///
-/// Identical in signature to `infer::server_engine::InferenceEngine`, so a
-/// consumer's `&mut dyn InferenceEngine` / `impl InferenceEngine` bounds compile
-/// unchanged after the `infer` -> `infer-api` swap.
+/// The public inference contract (signature-identical to the legacy
+/// `InferenceEngine`, so consumer bounds compile unchanged after the swap).
 pub trait InferenceEngine: Send {
     /// The model identifier (e.g. `"Qwen3-8B"`).
     fn model_id(&self) -> &str;
@@ -259,12 +225,8 @@ pub trait InferenceEngine: Send {
         tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()>;
 
-    /// Encode `text` to token ids with the backend's loaded tokenizer.
-    ///
-    /// The default impl errors so the trait stays object-safe; backends with a
-    /// tokenizer override it. Callers must treat `Err(_)` as "tokenize
-    /// unavailable" and downgrade `tokens` to `None`, never substitute an empty
-    /// `Vec`.
+    /// Encode `text` to token ids with the backend's tokenizer. The default
+    /// errors (object-safety); treat `Err(_)` as "unavailable", never empty `Vec`.
     fn tokenize(&self, _text: &str) -> Result<Vec<u32>> {
         Err(anyhow!("backend does not expose tokenize()"))
     }

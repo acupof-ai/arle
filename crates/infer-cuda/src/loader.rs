@@ -1,10 +1,7 @@
 //! Cold path: safetensors loading, paging metadata, and config validation.
 //!
-//! Stable once correct — consolidated per the v2 churn-weighted module design.
-//! Holds the BF16 safetensors loader (`SafetensorLoader`/`SafetensorIndex`/
-//! `OwnedTensor`), `CudaModel::from_safetensors` weight upload, the per-step
-//! paging metadata (`PageMeta`/`for_slot`), and the clean-BF16 config gate.
-//! Pure relocation from `model.rs` — identical numerics.
+//! Holds the BF16 safetensors loader, `CudaModel::from_safetensors` weight
+//! upload, the per-step paging metadata (`PageMeta`), and the BF16 config gate.
 
 use std::collections::HashMap;
 use std::fs;
@@ -23,15 +20,12 @@ const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 
 impl CudaModel {
     pub(crate) fn from_safetensors(model_path: &Path) -> Result<Self> {
-        // Resolve tensor-parallel placement from the environment (TP-1). On a
-        // single GPU this is `world_size == 1`, the no-op communicator, and the
-        // full (unsharded) weight load — byte-identical to the pre-TP path.
         let tp = build_tp_runtime()?;
         Self::from_safetensors_with_tp(model_path, tp)
     }
 
-    /// Load with an explicit [`crate::tp::TpRuntime`] (the env path threads its
-    /// resolved runtime through here; tests can inject a single-GPU runtime).
+    /// Load with an explicit [`crate::tp::TpRuntime`] (tests inject a single-GPU
+    /// runtime).
     pub(crate) fn from_safetensors_with_tp(
         model_path: &Path,
         tp: crate::tp::TpRuntime,
@@ -41,10 +35,9 @@ impl CudaModel {
         validate_clean_bf16_config(&config)?;
 
         let tp_cfg = *tp.config();
-        // Per-rank head counts (GQA-aware). `head_shard` errors unless both head
-        // counts divide the world size, which keeps every rank's attention shape
-        // uniform — the precondition the kv8 TileLang kernels and the all-reduce
-        // both rely on.
+        // Per-rank GQA head counts. `head_shard` requires both counts divide the
+        // world size, keeping every rank's attention shape uniform — the kv8
+        // TileLang kernels and the all-reduce both rely on it.
         let (local_q_heads, local_kv_heads) = if tp_cfg.is_single() {
             (config.num_attention_heads, config.num_key_value_heads)
         } else {
@@ -59,9 +52,8 @@ impl CudaModel {
         let ctx = DeviceContext::new()?;
         let loader = SafetensorLoader::new(model_path)?;
 
-        // lm_head / embed_tokens stay REPLICATED across ranks (v1 design: avoids an
-        // all-gather of logits; the final gemv runs the full vocab projection on
-        // each rank). Only the per-layer Q/K/V/O and MLP projections are sharded.
+        // lm_head / embed_tokens stay replicated across ranks (avoids an
+        // all-gather of logits); only per-layer Q/K/V/O + MLP are sharded.
         let embed_tokens = loader.load_matrix(&ctx, config.embed_tokens_tensor_name())?;
         let lm_head = if config.tie_word_embeddings {
             None
@@ -75,7 +67,7 @@ impl CudaModel {
             let names = config.layer_tensor_names(layer_idx);
             let (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj) =
                 if tp_cfg.is_single() {
-                    // Single GPU: full tensors, identical to the pre-TP path.
+                    // Single GPU: full tensors.
                     (
                         loader.load_matrix(&ctx, &names.q_proj)?,
                         loader.load_matrix(&ctx, &names.k_proj)?,
@@ -86,10 +78,9 @@ impl CudaModel {
                         loader.load_matrix(&ctx, &names.mlp_down_proj)?,
                     )
                 } else {
-                    // TP: Q/K/V are column-parallel but must split on whole-head
-                    // boundaries (head-aligned), so the o_proj input shard and the
-                    // attention head count agree. gate/up are plain column-parallel
-                    // (intermediate dim); o_proj/down_proj are row-parallel.
+                    // TP: Q/K/V column-parallel on whole-head boundaries (so the
+                    // o_proj input shard and head count agree); gate/up plain
+                    // column-parallel; o_proj/down_proj row-parallel.
                     (
                         loader.load_qkv_head_sharded(
                             &ctx,
@@ -154,7 +145,6 @@ impl CudaModel {
                     up_proj,
                     down_proj,
                 }),
-                // Dense Qwen3 path: no MoE layer (keeps the forward byte-identical).
                 moe: None,
             });
         }
@@ -185,32 +175,19 @@ impl CudaModel {
             tp,
             local_q_heads,
             local_kv_heads,
-            // Dense Qwen3 checkpoint — no MoE router.
             moe_config: None,
         })
     }
 
-    /// Load a single-GPU BF16 Qwen3.5/3.6 **MoE** checkpoint (MoE-4).
+    /// Load a single-GPU BF16 Qwen3.5/3.6 MoE checkpoint (all experts local).
     ///
-    /// Single-GPU only (`world_size == 1`, all experts local). Dense layers
-    /// (`mlp_only_layers`, or any layer where [`Qwen35Config::is_moe_layer`] is
-    /// false) load the classic SwiGLU MLP; sparse layers load their per-expert
-    /// gate/up/down stacks + router + shared expert via
-    /// [`SafetensorLoader::load_moe_layer_experts`] and run [`crate::moe::moe_forward`].
-    ///
-    /// Scope gates (errored on, not silently mis-loaded — these are the lead's
-    /// pod-side follow-ups that need the real model to verify):
-    /// - **non-gated full-attention only.** Qwen3.5/3.6 ship a per-head sigmoid
-    ///   gate on `q_proj` (`full_attn_gated`); the clean CUDA attention kernels
-    ///   here are the vanilla-Qwen3 (ungated) shape. A gated checkpoint errors.
-    /// - **full-attention layers only.** Hybrid linear-attention (Gated DeltaNet)
-    ///   layers are not wired into the clean CUDA attention path yet.
-    /// - **`head_dim == 128`, `kv_heads == 8`** (the TileLang HD128/kv8 kernels).
-    ///
-    /// The model's `config` is a numeric [`Qwen3Config`] mirror (the forward only
-    /// reads numeric fields + the resolved weights, never re-derives tensor
-    /// names), so the ungated full-attention forward is shared with the dense
-    /// path verbatim.
+    /// Dense layers load the SwiGLU MLP; sparse layers load per-expert
+    /// gate/up/down + router + shared expert and run [`crate::moe::moe_forward`].
+    /// Scope gates (errored, not silently mis-loaded — pod-side follow-ups):
+    /// ungated full-attention only (gated `q_proj` errors), full-attention layers
+    /// only (no hybrid linear-attention), `head_dim==128`/`kv_heads==8` (the
+    /// TileLang HD128/kv8 kernels). `config` is a numeric [`Qwen3Config`] mirror
+    /// (the forward reads numeric fields only, never re-derives tensor names).
     pub(crate) fn from_qwen35_moe_safetensors(model_path: &Path) -> Result<Self> {
         let tp = build_tp_runtime()?;
         let tp_cfg = *tp.config();
@@ -246,24 +223,19 @@ impl CudaModel {
             m.num_key_value_heads
         );
 
-        // Router description shared with the CPU reference + every sparse layer.
         let moe_config = crate::moe_config::moe_config_from_qwen35(&m)?;
         let split = crate::moe_config::ExpertSplit::single(m.num_experts);
 
-        // `qwen3_spec` and `qwen35_spec` define DISTINCT `RopeScalingConfig`
-        // types; there is no numeric bridge yet. qwen35-spec's parser does not
-        // populate rope_scaling today (Phase 1a leaves it `None`), so the mirror
-        // below is exact. Error loudly if that ever changes rather than silently
-        // dropping the scaling (which would corrupt long-context RoPE).
+        // qwen3_spec and qwen35_spec have distinct RopeScalingConfig types with no
+        // bridge yet; qwen35-spec leaves rope_scaling None today. Error if that
+        // changes rather than silently dropping it (corrupts long-context RoPE).
         ensure!(
             m.rope_scaling.is_none(),
             "Qwen3.5 rope_scaling is set but the qwen3↔qwen35 RopeScalingConfig bridge \
              is not wired; refusing to silently drop it (pod follow-up)"
         );
 
-        // Numeric Qwen3Config mirror for the model's `config` field. Tensor names
-        // are NOT derived from this (the loader resolves Qwen3.5 names directly);
-        // only the numeric forward fields matter.
+        // Numeric Qwen3Config mirror; tensor names are resolved from `m` directly.
         let config = Qwen3Config {
             hidden_size: m.hidden_size,
             intermediate_size: m.intermediate_size,
@@ -296,7 +268,6 @@ impl CudaModel {
             let attn = match &names.attention {
                 qwen35_spec::Qwen35AttentionTensorNames::Full(full) => full,
                 qwen35_spec::Qwen35AttentionTensorNames::Linear(_) => {
-                    // Guarded above; defensive.
                     return Err(anyhow!("unexpected linear-attention layer {layer_idx}"));
                 }
             };
@@ -363,13 +334,9 @@ impl CudaModel {
     }
 }
 
-/// Build the tensor-parallel runtime for model load.
-///
-/// On a multi-rank `nccl` build the launcher hands the NCCL `unique_id` in via
-/// the `INFER_NCCL_UNIQUE_ID` env var (128 hex-encoded bytes — the launcher reads
-/// it from `ncclGetUniqueId` on rank 0 and broadcasts it over its own transport;
-/// see [`crate::tp::TpRuntime::from_env_with_nccl`]). Without that var, or on a
-/// non-`nccl`/single-GPU build, this is the no-op single runtime.
+/// Build the tensor-parallel runtime for model load. Multi-rank `nccl` builds
+/// take the NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID`; otherwise the no-op
+/// single runtime.
 fn build_tp_runtime() -> Result<crate::tp::TpRuntime> {
     #[cfg(feature = "nccl")]
     {
@@ -382,8 +349,8 @@ fn build_tp_runtime() -> Result<crate::tp::TpRuntime> {
     crate::tp::TpRuntime::from_env().map_err(|e| anyhow!("{e}"))
 }
 
-/// Decode the launcher-supplied NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID`
-/// (128 lowercase-hex-encoded bytes, i.e. a 256-char string).
+/// Decode the NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID` (128 hex bytes = 256
+/// chars).
 #[cfg(feature = "nccl")]
 fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclUniqueId> {
     let hex = std::env::var("INFER_NCCL_UNIQUE_ID").map_err(|_| {
@@ -408,13 +375,10 @@ fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclUniqueId> {
 }
 
 pub(crate) fn validate_clean_bf16_config(config: &Qwen3Config) -> Result<()> {
-    // NOTE: Qwen3 DECOUPLES head_dim from hidden_size/num_heads — e.g. Qwen3-0.6B
-    // has hidden_size=1024, num_attention_heads=16, head_dim=128 (q_proj maps
-    // 1024 -> 16*128=2048, o_proj maps back to 1024). So `hidden_size ==
-    // num_attention_heads * head_dim` is NOT an invariant; the forward already
-    // uses q_dim = num_attention_heads * head_dim for the projections. The real
-    // constraints are head_dim==128 (TileLang HD128, checked in model.rs) + GQA
-    // divisibility below.
+    // Qwen3 decouples head_dim from hidden_size/num_heads (e.g. Qwen3-0.6B:
+    // hidden 1024, heads 16, head_dim 128), so `hidden_size == heads*head_dim`
+    // is NOT an invariant. Real constraints: head_dim==128 (checked in model.rs)
+    // + GQA divisibility below.
     ensure!(
         config
             .num_attention_heads
@@ -490,9 +454,8 @@ struct SafetensorLoader {
     base: PathBuf,
     shards: Vec<PathBuf>,
     weight_map: HashMap<String, usize>,
-    /// Read-once cache of shard bytes. Without this, loading N tensors re-reads +
-    /// re-deserializes the whole shard file N times — O(N × file_size) I/O, which
-    /// stalls model load for minutes on a multi-hundred-tensor model.
+    /// Read-once cache of shard bytes: without it, loading N tensors re-reads the
+    /// whole shard N times (O(N × file_size) I/O).
     shard_cache: std::cell::RefCell<HashMap<usize, Vec<u8>>>,
 }
 
@@ -578,17 +541,9 @@ impl SafetensorLoader {
             .with_context(|| format!("upload tensor {name}"))
     }
 
-    /// Load a 2D BF16 weight, slice it to this TP rank, and upload the shard.
-    ///
-    /// The host-side byte slicing is the feature-agnostic
-    /// [`crate::shard_slice`] math:
-    /// - [`ParallelLinearKind::Column`] (`q/k/v/gate/up_proj`) slices the output
-    ///   dim (rows) via [`infer_topo::column_shard`].
-    /// - [`ParallelLinearKind::Row`] (`o_proj/down_proj`) slices the input dim
-    ///   (cols) via [`infer_topo::row_shard`].
-    ///
-    /// On a single-GPU [`TpConfig`] this is the identity slice — same bytes as
-    /// [`Self::load_matrix`].
+    /// Load a 2D BF16 weight, slice it to this TP rank via [`crate::shard_slice`],
+    /// and upload the shard. Column kind (`q/k/v/gate/up`) slices rows; row kind
+    /// (`o/down`) slices cols. Single-GPU is the identity slice.
     fn load_matrix_sharded(
         &self,
         ctx: &DeviceContext,
@@ -632,17 +587,11 @@ impl SafetensorLoader {
 
     /// Load a head-aligned column-parallel Q/K/V projection for this TP rank.
     ///
-    /// Q/K/V are column-parallel (the output dim = `num_heads * head_dim` is
-    /// split), but the split MUST land on whole-head boundaries so the per-rank
-    /// attention head count, the o_proj input shard, and the kernel's RoPE/RMSNorm
-    /// all agree. A plain [`infer_topo::column_shard`] on the raw output dim would
-    /// dump the GQA remainder onto the last rank mid-head; instead we shard the
-    /// HEAD dimension (`head_shard`, already done by the caller) and convert to a
-    /// row [`ShardingSpec`] of `local_heads * head_dim` rows at the matching offset.
-    ///
-    /// `local_heads` is this rank's head count from [`infer_topo::head_shard`];
-    /// since `head_shard` requires the global head count to divide the world size,
-    /// every rank owns exactly `local_heads` and the offset is `rank * local_heads`.
+    /// The split MUST land on whole-head boundaries (so head count, o_proj input
+    /// shard, and RoPE/RMSNorm agree); a plain `column_shard` on the raw output
+    /// dim would split a head on the last rank. `local_heads` (from `head_shard`,
+    /// which requires global heads divide world size) gives a contiguous shard at
+    /// offset `rank * local_heads * head_dim`.
     fn load_qkv_head_sharded(
         &self,
         ctx: &DeviceContext,
@@ -685,19 +634,11 @@ impl SafetensorLoader {
             .with_context(|| format!("upload head-sharded tensor {name}"))
     }
 
-    /// Load this EP rank's per-expert MoE weight stacks for one layer
-    /// (`gate_proj` / `up_proj` / `down_proj`), the router gate, and the shared
-    /// expert, then build the device-resident per-expert weight-pointer tables.
-    ///
-    /// Tensor naming follows the mlx-lm `qwen3_5_moe` HF convention:
-    /// `<layer>.mlp.experts.{e}.{gate,up,down}_proj.weight`,
-    /// `<layer>.mlp.gate.weight` (router), and `<layer>.mlp.shared_expert.*`.
-    ///
-    /// Only the experts owned by `split` (per [`crate::moe_config::ExpertSplit`])
-    /// are loaded; single-GPU (`ep_size == 1`) loads every expert. The owned
-    /// range is `split.local_expert_start .. split.local_expert_end()`, which is
-    /// the contiguous slice the EP group from [`infer_topo::build_moe_ep_groups`]
-    /// assigns to this rank.
+    /// Load this EP rank's per-expert MoE weights for one layer (gate/up/down +
+    /// router gate + shared expert) and build the per-expert weight-pointer
+    /// tables. Naming follows the mlx-lm `qwen3_5_moe` HF convention. Only the
+    /// experts in `split.local_expert_start..local_expert_end()` are loaded
+    /// (single-GPU loads all).
     pub(crate) fn load_moe_layer_experts(
         &self,
         ctx: &DeviceContext,
@@ -766,8 +707,7 @@ impl SafetensorLoader {
             .shards
             .get(idx)
             .ok_or_else(|| anyhow!("shard index {idx} out of range"))?;
-        // Read each shard at most once (the data views below are zero-copy over
-        // these bytes; re-reading per tensor was O(tensors × file_size)).
+        // Read each shard at most once (views below are zero-copy over the bytes).
         if !self.shard_cache.borrow().contains_key(&idx) {
             let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
             self.shard_cache.borrow_mut().insert(idx, bytes);
@@ -801,14 +741,10 @@ struct OwnedTensor {
     bytes: Vec<u8>,
 }
 
-/// This EP rank's loaded MoE weights for one sparse layer (MoE-3).
-///
-/// Holds the per-rank-owned routed-expert `gate`/`up`/`down` stacks (one
-/// [`DeviceMatrix`] per owned expert), their device-resident weight-pointer
-/// tables for the grouped GEMM, the router gate, and the single shared expert
-/// (gate/up/down + its sigmoid gate). Built by
-/// [`SafetensorLoader::load_moe_layer_experts`] and consumed by
-/// [`crate::moe::moe_forward`].
+/// This EP rank's loaded MoE weights for one sparse layer: per-expert
+/// gate/up/down stacks + their weight-pointer tables, the router gate, and the
+/// shared expert. Built by [`SafetensorLoader::load_moe_layer_experts`],
+/// consumed by [`crate::moe::moe_forward`].
 pub(crate) struct MoeLayerWeights {
     pub(crate) gate: Vec<DeviceMatrix>,
     pub(crate) up: Vec<DeviceMatrix>,

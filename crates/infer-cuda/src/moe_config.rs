@@ -1,16 +1,9 @@
-//! MoE config bridge qwen35-spec → infer-moe (MoE-1) + per-rank expert-split
-//! arithmetic (MoE-3).
+//! MoE config bridge qwen35-spec → infer-moe + per-rank expert-split math.
 //!
-//! Pure-CPU, feature-agnostic. [`moe_config_from_qwen35`] maps a parsed
-//! [`qwen35_spec::Qwen35Config`] onto the device-independent
-//! [`infer_moe::MoeConfig`] router description, so the GPU MoE kernel and the
-//! `infer-moe` CPU reference share one config. Qwen3.6 routes with plain softmax,
-//! greedy top-k, no bias, scaling = 1.0, and exactly one always-on shared
-//! expert — exactly [`infer_moe::MoeConfig::qwen36`].
-//!
-//! [`ExpertSplit`] holds the EP per-rank expert ownership math, used by the
-//! per-expert weight loaders (MoE-3). Single-GPU (ep_size = 1) keeps all experts
-//! local; multi-rank EP slices the expert range evenly across ranks.
+//! [`moe_config_from_qwen35`] maps a [`qwen35_spec::Qwen35Config`] onto the
+//! device-independent [`infer_moe::MoeConfig`] (= [`infer_moe::MoeConfig::qwen36`]),
+//! so the GPU kernel and the CPU reference share one config. [`ExpertSplit`]
+//! holds the EP per-rank expert ownership (single-GPU keeps all experts local).
 
 use anyhow::{Result, ensure};
 use infer_moe::MoeConfig;
@@ -113,8 +106,7 @@ mod tests {
     use super::*;
     use infer_moe::{ScoringFunc, TopkMethod, route};
 
-    // A minimal MoE Qwen3.6-style config built directly (the JSON parser is
-    // exercised by qwen35-spec's own tests; here we only test the bridge math).
+    // Minimal MoE config built directly; only the bridge math is under test.
     fn moe_config_fixture(num_experts: usize, top_k: usize, norm: bool) -> Qwen35Config {
         Qwen35Config {
             hidden_size: 16,

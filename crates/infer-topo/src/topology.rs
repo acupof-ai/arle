@@ -1,23 +1,11 @@
 //! Multi-axis parallelism topology (TP/PP/EP + attention-DP/CP + MoE-DP) and
 //! rank-group math.
 //!
-//! Ported verbatim from `infer/src/tensor_parallel.rs`
-//! ([`MultiAxisConfig`] L317-556, [`RankCoord`] L558-601, and the `build_*_groups`
-//! functions L603-782). This is a port of SGLang `parallel_state.py` /
-//! `dp_attention.py`; the per-function SGLang line references are preserved on
-//! the comments below. The `anyhow` error handling is swapped for the
-//! crate-local std-only [`crate::TopoError`]; the integer/shape arithmetic is
-//! unchanged.
-//!
-//! The legacy file's `NcclComm` (GPU-required collectives, all bodies were
-//! `todo!("GPU required: ...")`) is intentionally **not** ported here — it is
-//! device-coupled and lands in a later, H20-gated phase.
+//! Port of SGLang `parallel_state.py` / `dp_attention.py` (per-function line
+//! refs kept on the comments below). Device-coupled NCCL collectives land in a
+//! later H20-gated phase.
 
 use crate::error::{Result, bail};
-
-// ============================================================================
-// MultiAxisConfig
-// ============================================================================
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -300,10 +288,6 @@ fn subgroup_axis_env_present(lookup: &mut impl FnMut(&str) -> Option<String>) ->
     .any(|key| lookup(key).is_some())
 }
 
-// ============================================================================
-// RankCoord
-// ============================================================================
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RankCoord {
@@ -353,10 +337,6 @@ impl RankCoord {
         })
     }
 }
-
-// ============================================================================
-// Group builders
-// ============================================================================
 
 /// SGLang `parallel_state.py:1789-1800`.
 #[must_use]
@@ -547,10 +527,6 @@ pub fn build_moe_tp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     }
     group_ranks
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

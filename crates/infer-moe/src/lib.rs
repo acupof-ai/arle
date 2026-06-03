@@ -1,11 +1,6 @@
-//! `infer-moe` — Phase-2 (EP / MoE) FOUNDATION for the ARLE rewrite.
-//!
-//! Pure, **CPU-verifiable**, device-independent MoE routing / gating math. This
-//! is a faithful port of the numerics in the two legacy ARLE routers, with all
-//! GPU / CUDA coupling deliberately dropped. The GPU MoE kernel is verified
-//! against this reference later — the same role `infer-topo` plays for TP
-//! sharding. The crate depends on nothing but `std` (plus an optional `serde`
-//! feature for (de)serializing the config types).
+//! `infer-moe` — pure, CPU-verifiable, device-independent MoE routing / gating
+//! math (the reference the GPU kernel is verified against). Ported from the two
+//! legacy ARLE routers with GPU coupling dropped; depends on `std` (+ `serde`).
 //!
 //! # Which model uses which routing rule
 //!
@@ -19,10 +14,9 @@
 //! | shared experts    | `n_shared_experts` always-on            | exactly one, sigmoid-gated       |
 //! | `n_group`/`topk_group` | **absent** (no group-limited routing) | **absent**                  |
 //!
-//! Group-limited routing (`n_group` / `topk_group`) is the upstream
-//! DeepSeek-V2/V3 mechanism, **not** wired by either ARLE router. The
-//! [`MoeConfig`] fields + [`group_limited_mask`] helper are provided so the same
-//! foundation can verify a grouped GPU kernel if a future checkpoint sets them.
+//! Group-limited routing (`n_group`/`topk_group`) is the DeepSeek-V2/V3 mechanism
+//! neither ARLE router wires; the fields + [`group_limited_mask`] exist so this
+//! reference can verify a grouped kernel if a future checkpoint sets them.
 //!
 //! # Routing skeleton (unified in [`route`])
 //!
@@ -33,7 +27,6 @@
 //!     └─ × routed_scaling_factor
 //! ```
 
-// Flat module layout, no `mod.rs` (ARLE convention).
 #[path = "config.rs"]
 mod config;
 #[path = "error.rs"]

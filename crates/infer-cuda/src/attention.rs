@@ -1,9 +1,7 @@
-//! Paged attention kernel-call paths for the clean dense-BF16 Qwen3 forward (HOT axis).
+//! Paged attention kernel-call paths for the dense-BF16 Qwen3 forward (HOT axis).
 //!
-//! Holds the prefill/decode prep + TileLang paged-attention dispatch. The prep
-//! kernels fuse Q/K RMSNorm + RoPE + KV-cache write; the TileLang kernels run the
-//! HD128 / kv8 paged attention. Pure relocation from `model.rs` — identical
-//! numerics, identical FFI call sites.
+//! Prep kernels fuse Q/K RMSNorm + RoPE + KV-cache write; the TileLang kernels
+//! run the HD128/kv8 paged attention.
 
 use anyhow::{Result, bail, ensure};
 use cuda_kernels::ffi;
@@ -245,10 +243,8 @@ fn run_tilelang_paged(
     let v_pool_ptr = pool.v_ptr(layer_idx, &ctx.stream);
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    // Ground-truth arg dump (gated): set R6_ATTN_DEBUG=1 to print the exact
-    // scalar args + device-array contents fed to the TileLang paged kernel.
-    // Used to localize the prefill-kernel spin that static arg comparison vs the
-    // legacy call could not explain.
+    // Set R6_ATTN_DEBUG=1 to dump the scalar args + device arrays fed to the
+    // TileLang paged kernel.
     if std::env::var("R6_ATTN_DEBUG").is_ok() {
         eprintln!(
             "[r6-attn] decode={decode} layer={layer_idx} q_heads={num_q_heads} kv_heads={num_kv_heads} head_dim={head_dim} seq_len={} num_pages(meta)={} max_total_pages={} page_size={} kv_dim={} sm_scale={sm_scale}",
@@ -267,17 +263,10 @@ fn run_tilelang_paged(
         }
     }
 
-    // NOTE on the two TileLang symbolic-shape args (mirrors the legacy
-    // `infer/src/ops/attention.rs` call, which is the contract of record):
-    //   - `num_pages`  (arg 12) = the K/V *pool capacity* = `pool.max_total_pages`.
-    //                  It is the first-dim extent of the k_pool/v_pool tensors,
-    //                  so it must be the whole pool, NOT this request's page count.
-    //   - `total_pages`(arg 13) = the *page-table length* = the number of valid
-    //                  entries in `kv_indices` (= `meta.num_pages` here, since
-    //                  `PageMeta::for_slot` sizes kv_indices to exactly that).
-    // Swapping these two passes a tiny capacity (→ wrong pool strides) and an
-    // oversized page-table walk (→ OOB read past kv_indices) — an illegal access
-    // that hangs the kernel (Xid 43). Keep capacity first, page-table length second.
+    // TileLang arg order (load-bearing): `num_pages` (arg 12) = pool capacity
+    // (`pool.max_total_pages`, the k_pool/v_pool first-dim extent); `total_pages`
+    // (arg 13) = page-table length (`meta.num_pages`). Swapping them gives wrong
+    // pool strides + an OOB kv_indices walk that hangs the kernel (Xid 43).
     unsafe {
         match (decode, num_q_heads) {
             (false, 16) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda(

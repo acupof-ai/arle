@@ -1,9 +1,7 @@
-//! CUDA op wrappers for the clean dense-BF16 Qwen3 forward (HOT axis).
+//! CUDA op wrappers for the dense-BF16 Qwen3 forward (HOT axis).
 //!
-//! Thin, crate-private wrappers over `cuda-kernels` FFI entry points: embedding,
-//! RMSNorm, GEMM/GEMV, elementwise add, SwiGLU, row copy, argmax, host uploads,
-//! and the RoPE cache precompute. Pure relocation from `model.rs` — identical
-//! numerics, identical FFI call sites.
+//! Thin crate-private wrappers over `cuda-kernels` FFI: embedding, RMSNorm,
+//! GEMM/GEMV, add, SwiGLU, row copy, argmax, host uploads, RoPE precompute.
 
 use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::ffi;

@@ -1,37 +1,25 @@
-//! Pure host arithmetic for the B=1 decode-graph capture key (CG bookkeeping).
+//! Pure host arithmetic for the B=1 decode-graph capture key.
 //!
-//! Feature-agnostic on purpose: the `GraphBucket` HashMap that stores captured
-//! decode graphs is keyed by the page-table length the captured TileLang kernel
-//! walks (batch is the fixed [`DECODE_GRAPH_BATCH`] for this B=1 landing). That key
-//! derivation is plain `usize` math with no device types, so it lives here — outside
-//! the `cuda` feature gate — and is CPU-unit-testable on a Mac without nvcc, even
-//! though the live `GraphBucket` / capture machinery in `decode_graph.rs` is gated.
+//! Not cuda-gated: this is plain `usize` math (no device types), so it is
+//! CPU-unit-testable without nvcc even though `GraphBucket` in `decode_graph.rs`
+//! is gated.
 
-/// Decode batch size this first landing captures. B=1 is the AI-PC headline win
-/// (design §7): at batch 1 the decode step is purely launch-bound, so collapsing
-/// the ~250-400 per-token `cuLaunchKernel` calls into one `cuGraphLaunch` removes
-/// essentially all per-token CPU launch overhead.
+/// Decode batch size captured. B=1 is purely launch-bound, so one `cuGraphLaunch`
+/// removes ~250-400 per-token `cuLaunchKernel` calls.
 pub(crate) const DECODE_GRAPH_BATCH: usize = 1;
 
-/// Identifies a captured decode graph by the shape baked into its launch args.
-///
-/// `batch_size` is always [`DECODE_GRAPH_BATCH`] in this B=1 landing; `num_pages`
-/// is the page-table length the captured TileLang kernel walks (its `total_pages`
-/// scalar launch arg). A captured graph is only replay-valid when both match the
-/// current step.
+/// Identifies a captured decode graph by its baked launch shape. `batch_size` is
+/// always [`DECODE_GRAPH_BATCH`]; `num_pages` is the kernel's `total_pages`
+/// scalar. A graph replays only when both match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DecodeGraphKey {
     pub(crate) batch_size: usize,
     pub(crate) num_pages: usize,
 }
 
-/// Pure derivation of the B=1 decode capture key from the cache state.
-///
-/// `kv_seq_len` is the cache length BEFORE appending this step's token, so the new
-/// total length is `kv_seq_len + 1` and the page-table length is that rounded up by
-/// `page_size`. The `GraphBucket` keys captured graphs by `num_pages`, so this is
-/// the lookup key the bucket bookkeeping inserts and looks up against; the
-/// page-boundary recapture trigger is exactly a change in `num_pages`.
+/// Derive the B=1 capture key from the cache state. `kv_seq_len` is the length
+/// BEFORE appending this step's token; `num_pages` is `(kv_seq_len + 1)` rounded
+/// up by `page_size`, and a change in it is the recapture trigger.
 #[allow(dead_code)] // used by the cuda-gated decode_graph.rs; pure path stays testable
 pub(crate) fn decode_graph_key_for(page_size: usize, kv_seq_len: usize) -> DecodeGraphKey {
     let total_len = kv_seq_len + 1;
@@ -45,12 +33,6 @@ pub(crate) fn decode_graph_key_for(page_size: usize, kv_seq_len: usize) -> Decod
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // GraphBucket bookkeeping is keyed by the page-table length the captured
-    // TileLang decode kernel walks (batch is the fixed DECODE_GRAPH_BATCH for this
-    // B=1 landing). These cover the pure key derivation the bucket inserts/looks up
-    // against, plus the page-boundary recapture trigger — no GPU needed. The
-    // `GraphBucket` HashMap itself needs a live CudaStream and is exercised on H20.
 
     #[test]
     fn key_batch_is_one_and_pages_round_up() {

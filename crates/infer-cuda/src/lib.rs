@@ -1,26 +1,13 @@
-//! CUDA backend executor (consumer NVIDIA + datacenter) — R6 track.
+//! CUDA backend executor.
 //!
-//! Scope of this crate today:
-//! - [`CudaKvPool`] is a **complete, real** host-side page manager: it implements
-//!   the host-indexed [`KvPool`] seam (page allocation, slot growth/truncation,
-//!   prefix-share retain/release). The seam is host-only, so page lifetime, slot
-//!   growth, and the prefix-cache retain/release protocol are fully handled here
-//!   without any device tensor — structurally identical to
-//!   [`infer_metal::MetalKvPool`].
-//! - [`CudaExecutor`] implements the [`BackendExecutor`] seam. Without the
-//!   `cuda` feature it stays a CPU-testable placeholder; with `cuda`, callers can
-//!   construct it from a BF16 Qwen3 safetensors model and run the real
-//!   cuda-kernels path.
+//! [`CudaKvPool`] is the host-side page manager implementing the host-only
+//! [`KvPool`] seam (alloc/grow/truncate + prefix retain/release), structurally
+//! identical to [`infer_metal::MetalKvPool`]. [`CudaExecutor`] implements
+//! [`BackendExecutor`]: a CPU-testable placeholder without `cuda`, the real
+//! cuda-kernels path with it. Scope: dense BF16 Qwen3, safetensors, single
+//! scheduled row, device argmax greedy / host temperature sampling.
 //!
-//! R6 keeps the first real path intentionally narrow: dense BF16 Qwen3,
-//! safetensors only, single scheduled row, device argmax for greedy sampling,
-//! host sampling for temperature > 0, and paged KV backed by
-//! `crates/cuda-kernels`. Quantized variants, GGUF, TP/NCCL, graphs, sparse
-//! hooks, MTP/spec decode, and scheduler/server references are deliberately not
-//! carried into this crate.
-//!
-//! Nothing here references engine-core; this crate depends only on the stable
-//! `infer-plan` + `infer-seam` contracts.
+//! Depends only on `infer-plan` + `infer-seam`, never engine-core.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -34,10 +21,7 @@ use infer_seam::{BackendExecutor, KvAllocator, KvPool, KvPrefixStore, KvQuery, P
 mod attention;
 #[cfg(feature = "cuda")]
 mod decode_graph;
-// Pure host arithmetic for the decode-graph capture key. Feature-agnostic so the
-// `GraphBucket` bookkeeping (key derivation, page-boundary recapture trigger) is
-// CPU-unit-testable without nvcc; the live capture machinery in `decode_graph` is
-// `cuda`-gated.
+// Not cuda-gated: pure host capture-key math, CPU-testable without nvcc.
 mod decode_graph_key;
 #[cfg(feature = "cuda")]
 mod executor;
@@ -50,30 +34,26 @@ mod model;
 #[cfg(feature = "cuda")]
 mod ops;
 
-// Tensor-parallel runtime config + communicator handle (TP-1). The env→config
-// resolution is feature-agnostic and CPU-tested; only the NCCL comm variant is
-// feature-gated, so this module is NOT cuda-gated.
+// Not cuda-gated: env→TpConfig resolution is CPU-testable; only the NCCL comm
+// variant is feature-gated.
 pub mod tp;
 
-// Per-rank weight-shard byte slicing (TP-2). Pure-CPU byte-range math; the
-// device upload that consumes it stays in the cuda-gated `loader`.
+// Not cuda-gated: pure-CPU per-rank weight-shard byte slicing; the device upload
+// that consumes it stays in `loader`.
 pub mod shard_slice;
 
-// MoeConfig bridge qwen35-spec → infer-moe (MoE-1) + per-rank expert split
-// arithmetic (MoE-3). Feature-agnostic CPU logic.
+// Not cuda-gated: Qwen35Config → infer_moe::MoeConfig bridge + per-rank expert
+// split arithmetic.
 pub mod moe_config;
 
-// Single-GPU BF16 MoE forward (MoE-4). The host route→assignment flattening
-// (`flatten_routing`) is feature-agnostic + CPU-tested; the device `moe_forward`
-// (grouped GEMM + DSv4/Qwen3.6 dispatch kernels) lives in the inner `cuda`-gated
-// module. Not cuda-gated at the `mod` level so the CPU plumbing test always runs.
+// Not cuda-gated: the host route→assignment flattening is CPU-tested; the device
+// `moe_forward` lives in the inner `cuda`-gated module.
 mod moe;
 
 /// Host-side paged KV bookkeeping for the CUDA backend.
 ///
-/// Pages are logical indices (`u32`); the device-side KV buffers they map to are
-/// allocated by the cuda-kernels layer in R6. Page lifetime, slot growth, and the
-/// prefix-cache retain/release protocol are fully handled here.
+/// Pages are logical `u32` indices; the device-side KV buffers they map to are
+/// allocated by the cuda-kernels layer.
 #[derive(Debug)]
 pub struct CudaKvPool {
     page_size: usize,
@@ -225,8 +205,8 @@ impl KvAllocator for CudaKvPool {
     }
 
     fn migrate(&mut self, _slot: usize, _start: usize, _len: usize) -> anyhow::Result<()> {
-        // Host page mapping is unchanged by migration; the device-buffer copy is
-        // a cuda-kernels concern wired in R6. No-op at the host-indexing layer.
+        // No-op: migration leaves the host page mapping unchanged; the
+        // device-buffer copy is a cuda-kernels concern.
         Ok(())
     }
 }
@@ -272,11 +252,7 @@ impl KvPrefixStore for CudaKvPool {
     }
 }
 
-/// In-flight handle for a submitted CUDA step.
-///
-/// The current clean CUDA forward resolves synchronously after greedy readback.
-/// A later async stage can replace the payload with a stream event + device
-/// logits without changing the engine-facing seam.
+/// In-flight handle for a submitted CUDA step. Resolves synchronously today.
 #[derive(Debug)]
 pub struct CudaInflight {
     output: StepOutput,
@@ -284,9 +260,9 @@ pub struct CudaInflight {
 
 /// CUDA backend executor.
 ///
-/// `new()` keeps the no-GPU placeholder used by host tests. Use
-/// [`CudaExecutor::from_qwen3_bf16_safetensors`] with the `cuda` feature for the
-/// real dense BF16 Qwen3 path.
+/// `new()` is the no-GPU placeholder for host tests;
+/// [`CudaExecutor::from_qwen3_bf16_safetensors`] (feature `cuda`) is the real
+/// dense BF16 Qwen3 path.
 #[derive(Default)]
 pub struct CudaExecutor {
     inner: CudaExecutorInner,
@@ -324,11 +300,10 @@ impl CudaExecutor {
         }
     }
 
-    /// Build the real CUDA executor for the clean R6 path.
+    /// Build the real CUDA executor for dense BF16 Qwen3 safetensors.
     ///
-    /// This path is intentionally one-model/one-format: dense BF16 Qwen3 loaded
-    /// from safetensors. `total_pages` must match the host [`CudaKvPool`] used by
-    /// the engine so device-side page allocation mirrors host logical pages.
+    /// `total_pages` must match the host [`CudaKvPool`] so device page
+    /// allocation mirrors host logical pages.
     #[cfg(feature = "cuda")]
     pub fn from_qwen3_bf16_safetensors(
         model_path: impl AsRef<Path>,
@@ -346,11 +321,9 @@ impl CudaExecutor {
         })
     }
 
-    /// Build the real CUDA executor for a single-GPU BF16 Qwen3.5/3.6 **MoE**
-    /// checkpoint (MoE-4). All experts are local (single GPU); dense vs sparse
-    /// layers are resolved per `Qwen35Config::is_moe_layer`. The W4/4-bit Qwen3.6
-    /// canonical (e.g. Qwen3.6-35B-A3B-4bit) needs the W4 grouped-GEMM follow-up;
-    /// this path is BF16 only.
+    /// Build the real CUDA executor for a single-GPU BF16 Qwen3.5/3.6 MoE
+    /// checkpoint (all experts local). BF16 only; the W4/4-bit canonical needs
+    /// the W4 grouped-GEMM follow-up.
     #[cfg(feature = "cuda")]
     pub fn from_qwen35_moe_safetensors(
         model_path: impl AsRef<Path>,

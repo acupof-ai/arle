@@ -1,10 +1,8 @@
 //! Scheduling / planning hot path for [`Engine`].
 //!
-//! These `impl Engine` methods decide which rows run this tick: chunked-prefill
-//! row construction, decode-priority ordering, and the retract/preempt repair
-//! that keeps a plan within the KV page budget. They are split out of the
-//! coordinator (`lib.rs`) because this is the highest-churn axis. Identical
-//! numerics — pure reorganization.
+//! `impl Engine` methods deciding which rows run this tick: chunked-prefill row
+//! construction, decode-priority ordering, and the retract/preempt repair that
+//! keeps a plan within the KV page budget.
 
 use std::cmp::Reverse;
 

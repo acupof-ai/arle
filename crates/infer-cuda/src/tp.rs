@@ -1,23 +1,12 @@
-//! Tensor-parallel runtime config + communicator handle (TP-1).
+//! Tensor-parallel runtime config + communicator handle.
 //!
-//! Per the architecture verdict the real communicator is a concrete `infer-cuda`
-//! struct, not a seam trait. This module holds:
-//!
-//! - [`resolve_tp_config`] — the feature-agnostic env → [`TpConfig`] resolution.
-//!   It honours `INFER_CUDA_DEVICES` (the TP world-size trigger: a comma-separated
-//!   ordinal list whose *count* is the TP size), plus the
-//!   `INFER_TP_SIZE`/`ARLE_TP_SIZE` and `INFER_TP_RANK`/`ARLE_TP_RANK` overrides.
-//!   This is pure CPU logic verified without a GPU.
-//! - [`TpRuntime`] — pairs the resolved [`TpConfig`] with a communicator handle.
-//!   The NCCL handle is gated behind `cfg(feature = "nccl")`; a `world_size == 1`
-//!   no-op path keeps non-NCCL builds (including this CPU test build) compiling.
-//!
-//! The sharding math itself lives in `infer-topo` ([`infer_topo::column_shard`]
-//! etc.); this module only resolves *which* rank/world this process is.
+//! [`resolve_tp_config`] resolves env → [`TpConfig`] (CPU-testable);
+//! [`TpRuntime`] pairs it with a communicator (the NCCL handle is
+//! `nccl`-gated; `world_size == 1` is the no-op path). The sharding math lives in
+//! `infer-topo`.
 
 use infer_topo::TpConfig;
 
-/// Environment key resolution result for one parallel-size value.
 fn lookup_usize(
     primary: &str,
     alias: &str,
@@ -28,12 +17,8 @@ fn lookup_usize(
         .and_then(|value| value.trim().parse::<usize>().ok())
 }
 
-/// Count the CUDA worker ordinals in an `INFER_CUDA_DEVICES`-style list.
-///
-/// The list is comma-separated; empty/whitespace entries are ignored. Returns
-/// `None` when the variable is absent or contains no usable entry. The *count*
-/// (not the ordinal values) is the tensor-parallel world size — this is the
-/// `INFER_CUDA_DEVICES` TP-size trigger (e.g. 8 ordinals ⇒ TP=8).
+/// Count the ordinals in a comma-separated `INFER_CUDA_DEVICES` list (empty
+/// entries ignored). The count is the TP world size (8 ordinals ⇒ TP=8).
 fn count_cuda_devices(value: &str) -> Option<usize> {
     let count = value
         .split(',')
@@ -42,20 +27,11 @@ fn count_cuda_devices(value: &str) -> Option<usize> {
     (count > 0).then_some(count)
 }
 
-/// Resolve the tensor-parallel [`TpConfig`] from an env lookup.
-///
-/// World-size precedence (highest first):
-/// 1. `INFER_TP_SIZE` / `ARLE_TP_SIZE` if set,
-/// 2. else the count of `INFER_CUDA_DEVICES` ordinals,
-/// 3. else `1` (single GPU).
-///
-/// Rank comes from `INFER_TP_RANK` / `ARLE_TP_RANK` (default `0`).
-///
-/// This is feature-agnostic and CPU-testable via an injected `lookup`.
+/// Resolve [`TpConfig`] from an env lookup. World size: `INFER_TP_SIZE`/`ARLE_*`,
+/// else `INFER_CUDA_DEVICES` count, else 1. Rank: `INFER_TP_RANK`/`ARLE_*` (0).
 ///
 /// # Errors
-/// Errors if the resolved `(world_size, rank)` pair is invalid
-/// (`rank >= world_size`), via [`TpConfig::new`].
+/// Errors if the resolved `(world_size, rank)` is invalid, via [`TpConfig::new`].
 pub fn resolve_tp_config(
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> infer_topo::Result<TpConfig> {
@@ -76,12 +52,9 @@ pub fn resolve_tp_config_from_env() -> infer_topo::Result<TpConfig> {
     resolve_tp_config(|key| std::env::var(key).ok())
 }
 
-/// Tensor-parallel communicator handle.
-///
-/// The concrete NCCL handle wraps the existing
-/// `cuda_kernels::collective::NcclBackend`; it is only present in `nccl` builds.
-/// Every other build (CPU tests, single-GPU CUDA) uses the [`Self::Single`]
-/// no-op path so `all_reduce` is a no-op and the code compiles GPU-free.
+/// Tensor-parallel communicator handle. [`Self::Nccl`] (only in `nccl` builds)
+/// wraps `cuda_kernels::collective::NcclBackend`; everything else uses the
+/// [`Self::Single`] no-op so the code compiles GPU-free.
 pub enum TpComm {
     /// Single rank: no collectives needed.
     Single,
@@ -125,10 +98,8 @@ impl TpRuntime {
     }
 
     /// Build a runtime from a resolved [`TpConfig`] with the no-op communicator.
-    ///
-    /// Multi-rank NCCL wiring is installed separately (H20-gated); a
-    /// `world_size > 1` config with the no-op communicator is a valid
-    /// CPU/typecheck shape but performs no collectives.
+    /// A `world_size > 1` config here is a valid CPU/typecheck shape that
+    /// performs no collectives (NCCL is wired separately).
     #[must_use]
     pub fn new(config: TpConfig) -> Self {
         Self {
@@ -143,8 +114,7 @@ impl TpRuntime {
         Self { config, comm }
     }
 
-    /// Resolve the runtime from the process environment with the no-op
-    /// communicator. NCCL wiring is layered on later (H20-gated).
+    /// Resolve the runtime from env with the no-op communicator.
     ///
     /// # Errors
     /// Errors if the resolved `(world_size, rank)` pair is invalid.
@@ -152,22 +122,11 @@ impl TpRuntime {
         Ok(Self::new(resolve_tp_config_from_env()?))
     }
 
-    /// Resolve the runtime from env and, on a multi-rank `nccl` build, bring up
-    /// the real NCCL communicator from a caller-supplied `ncclUniqueId`.
-    ///
-    /// World-size resolution is the env logic in [`resolve_tp_config_from_env`].
-    /// For `world_size == 1` this is exactly [`Self::from_env`] — a no-op
-    /// communicator, single-GPU behaviour unchanged — so this is safe to call on
-    /// every path. For `world_size > 1` the NCCL backend is initialised via
-    /// `ncclCommInitRank(unique_id, world_size, rank)`.
-    ///
-    /// **Unique-id ownership.** Acquiring (`ncclGetUniqueId` on rank 0) and
-    /// distributing the 128-byte id to ranks `1..world_size` is the *launcher's*
-    /// job — it owns the inter-process transport (the TCP rendezvous in the legacy
-    /// `infer::distributed::init_method`, or `torchrun`-style env). This crate has
-    /// no inter-process dependency, so it takes the resolved id as bytes. The
-    /// caller MUST hand every rank the *same* id, and the active CUDA device must
-    /// already be bound to this rank's ordinal before the call.
+    /// Resolve from env and, on a multi-rank `nccl` build, bring up the real NCCL
+    /// communicator via `ncclCommInitRank(unique_id, world_size, rank)`.
+    /// `world_size == 1` is exactly [`Self::from_env`] (no-op), so this is safe on
+    /// every path. The launcher owns acquiring + broadcasting the same `unique_id`
+    /// to all ranks; the CUDA device must already be bound to this rank.
     ///
     /// # Errors
     /// Errors if the resolved `(world_size, rank)` is invalid or NCCL init fails.
@@ -213,22 +172,11 @@ impl TpRuntime {
 
     /// All-reduce (sum) a row-parallel GEMM output across the TP group, in place.
     ///
-    /// Row-parallel linears (`o_proj` / `down_proj`) produce a *partial* result on
-    /// each rank — the contribution from that rank's input-dim shard. Summing the
-    /// partials across ranks reconstructs the full output (see
-    /// [`crate::shard_slice`] and the `row_parallel_sharded_gemm_all_reduces_to_unsharded`
-    /// parity test in this module).
-    ///
-    /// The collective runs **in place on the compute stream** (`ctx.stream`): the
-    /// GEMM that produced `buf` and the residual-add that consumes the reduced
-    /// value also run on the compute stream, so stream ordering alone guarantees
-    /// the all-reduce sees the finished GEMM and the add sees the finished
-    /// all-reduce — no extra cross-stream event is needed. (A dedicated comm
-    /// stream would overlap nothing here because the very next kernel consumes the
-    /// result; it would only add an event-wait pair.)
-    ///
-    /// For [`TpComm::Single`] this is a no-op: a single rank already holds the full
-    /// output, so the single-GPU forward is byte-identical to the non-TP path.
+    /// Row-parallel linears (`o_proj`/`down_proj`) produce a partial per rank;
+    /// summing reconstructs the full output. Runs in place on the compute stream
+    /// — stream ordering alone sequences GEMM → all-reduce → residual-add, so no
+    /// cross-stream event is needed. [`TpComm::Single`] is a no-op (single rank
+    /// already holds the full output).
     ///
     /// # Errors
     /// Propagates the NCCL all-reduce error on multi-rank builds.
@@ -366,16 +314,10 @@ mod tests {
         assert!(!rt.comm().is_collective());
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // TP-4: CPU mock-communicator parity.
-    //
-    // Proves the TP sharding + all-reduce math the GPU path will run, with no
-    // NCCL: for a row-parallel linear `y = x @ W^T`, the sum over ranks of each
-    // rank's partial GEMM on its input-dim shard equals the unsharded GEMM.
-    // ─────────────────────────────────────────────────────────────────────────
+    // CPU mock-communicator parity: for a row-parallel `y = x @ W^T`, the sum
+    // over ranks of each rank's partial GEMM equals the unsharded GEMM.
 
-    /// A CPU stand-in for the collective: sums per-rank host output vectors,
-    /// exactly what an NCCL all-reduce produces for a row-parallel layer.
+    /// CPU stand-in for the all-reduce: sums per-rank host output vectors.
     struct MockCommunicator;
 
     impl MockCommunicator {

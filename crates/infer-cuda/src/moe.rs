@@ -1,16 +1,4 @@
-//! Single-GPU BF16 MoE forward (MoE-4) — Qwen3.5/3.6 SparseMoeBlock.
-//!
-//! Wires the committed MoE foundation into the CUDA executor's forward:
-//!   - [`crate::moe_config::moe_config_from_qwen35`] / [`infer_moe::route`] —
-//!     the device-independent router (plain softmax + greedy top-k + optional
-//!     `norm_topk_prob` renorm), shared with the CPU reference.
-//!   - [`crate::loader::MoeLayerWeights`] — this layer's per-expert gate/up/down
-//!     stacks + weight-ptr tables + router gate + shared expert.
-//!   - the `cuda_kernels::moe` safe wrappers over the grouped-GEMM + DSv4/Qwen3.6
-//!     expert-dispatch kernels.
-//!
-//! ## Pipeline (single GPU, all experts local — `local_expert_start = 0`,
-//! `experts_per_rank = num_experts`)
+//! Single-GPU BF16 MoE forward — Qwen3.5/3.6 SparseMoeBlock (all experts local).
 //!
 //! ```text
 //!  router gemm  → logits[T, E]
@@ -29,32 +17,17 @@
 //!    → shared expert dense SwiGLU + qwen36_add_shared_expert_gated
 //! ```
 //!
-//! Host routing is the simplest correct choice for a first landing: the router
-//! gemm output is a small `[T, E]` BF16 tensor, copied to host, run through the
-//! CPU `infer_moe::route` (the verified reference), flattened, and re-uploaded.
-//! A device router (`dsv4_route_cuda`) is a perf follow-up; correctness first.
-//!
-//! W4/4-bit (Qwen3.6-35B-A3B canonical is 4bit) is a SEPARATE follow-up: it needs
-//! a W4 grouped GEMM. The two `moe_bf16_grouped_gemm_*` call sites below are the
-//! exact swap points for a W4 variant; everything else (route, pack, scatter,
-//! combine, shared expert) is dtype-agnostic on BF16 activations.
+//! Routing runs on the host (the small `[T, E]` logits are cheap to round-trip
+//! through the verified `infer_moe::route`); a device router is a perf follow-up.
+//! W4/4-bit is a separate follow-up: the two `moe_bf16_grouped_gemm_*` call sites
+//! are the swap points; everything else is dtype-agnostic on BF16 activations.
 
 use infer_moe::RoutingDecision;
 
 /// Flatten per-token [`RoutingDecision`]s into the token-major flat buffers the
-/// `dsv4_*` route kernels consume: `route_indices[token * topk + k]` is the
-/// selected expert id, `route_weights[token * topk + k]` its gate weight.
-///
-/// This is the host glue between the CPU router ([`infer_moe::route`]) and the
-/// device pack/count kernels, which read `indices[route]` / `weights[route]`
-/// with `route = token * topk + k` (see `dsv4_route.cu`
-/// `dsv4_pack_local_experts_with_slots_kernel`: `token = route / topk`). Each
+/// `dsv4_*` kernels read at `route = token * topk + k`: `route_indices` (expert
+/// id), `route_weights` (gate weight), each length `num_tokens * topk`. Each
 /// decision must carry exactly `topk` experts; selection order is preserved.
-///
-/// Returns `(route_indices, route_weights)`, each length `num_tokens * topk`.
-/// Feature-agnostic + CPU-tested so the route→assignment plumbing is verified
-/// without a GPU. Consumed by [`gpu::moe_forward`] under `cuda`; on a non-CUDA
-/// build it is exercised only by the unit tests below.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn flatten_routing(
     decisions: &[RoutingDecision],
@@ -93,14 +66,9 @@ mod gpu {
     use crate::loader::MoeLayerWeights;
     use crate::ops::{gemm_batch, silu_mul};
 
-    /// Single-GPU BF16 MoE forward for one sparse layer.
-    ///
-    /// `normed` is the post-attention-layernorm hidden (`[num_tokens, hidden]`,
-    /// token-major). Returns the MoE block output (routed experts + sigmoid-gated
-    /// shared expert) as a fresh `[num_tokens, hidden]` [`HiddenStates`].
-    ///
-    /// All experts are local (single GPU): `local_expert_start = 0`,
-    /// `experts_per_rank = num_experts`.
+    /// Single-GPU BF16 MoE forward for one sparse layer (all experts local).
+    /// `normed` is the post-LN hidden `[num_tokens, hidden]`; returns the block
+    /// output (routed + sigmoid-gated shared expert) as a fresh `HiddenStates`.
     pub(crate) fn moe_forward(
         ctx: &DeviceContext,
         weights: &MoeLayerWeights,
@@ -134,10 +102,8 @@ mod gpu {
         let mut logits = HiddenStates::zeros(ctx, num_experts, num_tokens)?;
         gemm_batch(ctx, &weights.router_gate, normed, &mut logits)?;
 
-        // ── 2. HOST route (the verified infer_moe reference). ───────────────
-        // Copy the small [T, E] logits to host, route, flatten back to the
-        // token-major route_indices/route_weights the kernels read. Sync first
-        // so the gemm has landed before the D2H read.
+        // ── 2. HOST route (verified infer_moe reference). ───────────────────
+        // Sync so the gemm has landed before the D2H read.
         ctx.sync()?;
         let logits_bf16: Vec<bf16> = ctx
             .stream
@@ -163,8 +129,7 @@ mod gpu {
             .map_err(|e| anyhow::anyhow!("MoE route-weight H2D failed: {e}"))?;
 
         // ── 3. Per-expert route counts → group offsets. ─────────────────────
-        // These buffers are written by the kernels through raw device pointers
-        // (cache_ptr takes `&`), so no Rust-level `mut` binding is needed.
+        // Kernels write these through raw device pointers, so no Rust `mut`.
         let counts = ctx
             .stream
             .alloc_zeros::<i32>(num_experts)
@@ -198,9 +163,6 @@ mod gpu {
         }
 
         // ── 4. Pack routed tokens grouped-by-expert (with route slots). ─────
-        // Reads `normed` token rows; writes packed_hidden[R,H], the route slot
-        // map packed_route_slot[R], and packed_weight[R]. cursors[E] scratch.
-        // All written via raw device pointers, so no Rust-level `mut`.
         let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, total_routes)?;
         let packed_route_slot = ctx
             .stream
@@ -234,10 +196,9 @@ mod gpu {
             )?;
         }
 
-        // Identity compact→global expert remap. Single GPU runs every expert, so
-        // compact index == global index; the grouped GEMM treats a 0..E table as
-        // the identity walk (it also accepts a null pointer, but an explicit
-        // table keeps the safe-wrapper RawDevicePtr contract — no null hack).
+        // Identity compact→global remap: single GPU runs every expert, so the
+        // 0..E table is the identity walk (explicit table keeps the RawDevicePtr
+        // contract — no null hack).
         let expert_index_table: Vec<i32> = (0..num_experts as i32).collect();
         let expert_indices = ctx
             .stream
@@ -304,9 +265,8 @@ mod gpu {
         }
 
         // ── 8. Scatter weighted expert outputs to route slots, combine topk. ─
-        // route_out[route_slot] = weight · expert_out[slot]; unwritten slots
-        // (none on single GPU — every route is local) read zero, so the buffer
-        // is zero-initialised by HiddenStates::zeros. combine sums over topk.
+        // route_out[slot] = weight · expert_out[slot] (zero-init covers unwritten
+        // slots); combine sums over topk.
         let route_out = HiddenStates::zeros(ctx, hidden_dim, total_routes)?;
         let routed = HiddenStates::zeros(ctx, hidden_dim, num_tokens)?;
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
@@ -402,8 +362,7 @@ mod tests {
 
     #[test]
     fn flatten_matches_route_token_major() {
-        // Two tokens, 4 experts, top-2. Build logits so the selected experts and
-        // their order are deterministic, then check the flat buffers mirror the
+        // 2 tokens, 4 experts, top-2: check the flat buffers mirror the
         // route → (token*topk + k) layout the kernels read.
         let c = cfg(4, 2, true);
         // token 0: experts 3,2 ; token 1: experts 0,1 (descending logit).

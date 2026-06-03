@@ -1,33 +1,13 @@
-//! MoE routing / gating configuration.
-//!
-//! `MoeConfig` is the device-independent description of one MoE block's router,
-//! collecting exactly the knobs the legacy routers read:
-//!
-//! - **DSv4** (`crates/deepseek-spec/src/v4.rs`): `n_routed_experts`,
-//!   `n_shared_experts`, `num_experts_per_tok`, `routed_scaling_factor`,
-//!   `norm_topk_prob`, `scoring_func`, `topk_method`. DSv4 in this codebase
-//!   selects with a learned score-correction bias (`topk_method = "noaux_tc"`)
-//!   and has **no** group-limited routing (`n_group` / `topk_group` absent).
-//! - **Qwen3.6** (`infer/src/model/qwen35/moe.rs`): `num_experts`,
-//!   `num_experts_per_tok`, `norm_topk_prob`, one always-on shared expert.
-//!   Routes with plain softmax + argmax top-k, no bias, scaling = 1.0.
-//!
-//! Group-limited routing (`n_group` / `topk_group`) is the upstream
-//! DeepSeek-V2/V3 mechanism. It is **not** wired by either legacy ARLE router,
-//! but the fields + [`crate::route`] grouping helper are provided so the same
-//! foundation can verify a grouped GPU kernel if a future checkpoint sets them.
+//! MoE routing / gating configuration — the device-independent description of
+//! one MoE block's router, covering the knobs both legacy routers read (DSv4:
+//! `noaux_tc` bias selection, no grouping; Qwen3.6: softmax + greedy top-k, one
+//! shared expert). Group-limited routing fields exist for a future grouped
+//! kernel but are wired by neither ARLE router.
 
 use crate::error::{Result, bail};
 
-/// How the per-expert router logits are turned into selection scores.
-///
-/// Ported from `DeepSeekV4Config::router_scores_from_logits`
-/// (`crates/deepseek-spec/src/v4.rs:305`). The `&str` config value maps:
-/// `"softmax" → Softmax`, `"sigmoid" → Sigmoid`, `"sqrtsoftplus" → SqrtSoftplus`.
-///
-/// The integer discriminants match the CUDA `dsv4_route` kernel's
-/// `scoring_kind` argument (`crates/cuda-kernels/csrc/moe/dsv4_route.cu:196`):
-/// `0 = softmax`, `1 = sigmoid`, `2 = sqrt(softplus)`.
+/// How per-expert router logits become selection scores. [`Self::scoring_kind`]
+/// matches the CUDA `dsv4_route` `scoring_kind` arg (0/1/2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ScoringFunc {
@@ -40,8 +20,7 @@ pub enum ScoringFunc {
 }
 
 impl ScoringFunc {
-    /// Parse the legacy `scoring_func` config string. Mirrors the match arms in
-    /// `DeepSeekV4Config::router_scores_from_logits`.
+    /// Parse the legacy `scoring_func` config string.
     pub fn from_config_str(s: &str) -> Result<Self> {
         match s {
             "softmax" => Ok(Self::Softmax),
@@ -64,13 +43,10 @@ impl ScoringFunc {
 
 /// How the top-k experts are selected from the per-expert scores.
 ///
-/// - [`TopkMethod::Greedy`]: plain top-k over the scores themselves. This is
-///   the Qwen3.6 path (`softmax → argmax top-k`).
-/// - [`TopkMethod::NoAuxTc`]: DeepSeek-V4 no-aux-loss top-k. Selection uses the
-///   bias-corrected key `scores[e] + bias[e]` (the `e_score_correction_bias`),
-///   while the *weight* still reads the un-biased `scores[e]`. Ported from
-///   `topk_indices_by_score` + `moe_routes_from_scores`
-///   (`crates/deepseek-spec/src/v4.rs:319`).
+/// - [`TopkMethod::Greedy`]: plain top-k over the scores (Qwen3.6).
+/// - [`TopkMethod::NoAuxTc`]: DSv4 no-aux-loss top-k — selection uses the
+///   bias-corrected key `scores[e] + bias[e]`, the weight reads un-biased
+///   `scores[e]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TopkMethod {
@@ -96,59 +72,39 @@ impl TopkMethod {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MoeConfig {
-    /// Number of routed experts (DSv4 `n_routed_experts` / Qwen3.6
-    /// `num_experts`). The router emits one logit per routed expert.
+    /// Number of routed experts (one router logit each).
     pub num_experts: usize,
-    /// Number of always-on shared experts that run for every token in addition
-    /// to the routed top-k (DSv4 `n_shared_experts`; Qwen3.6 has exactly one
-    /// sigmoid-gated shared expert, expressed as `1` here). The shared experts
-    /// do not participate in routing — this field is carried so consumers can
-    /// account for them; see [`MoeConfig::has_shared_expert`].
+    /// Always-on shared experts run for every token (Qwen3.6 = 1). They do not
+    /// route; see [`MoeConfig::has_shared_expert`].
     pub num_shared_experts: usize,
-    /// Experts selected per token (DSv4 / Qwen3.6 `num_experts_per_tok`).
+    /// Experts selected per token (`num_experts_per_tok`).
     pub top_k: usize,
-    /// Per-expert score → selection-key correction bias presence. DSv4
-    /// `noaux_tc` selection adds a learned `e_score_correction_bias[e]` to the
-    /// score before top-k (`bias` passed to `moe_routes_from_scores`). When
-    /// `None`, selection is over the raw scores. Qwen3.6 passes no bias (its
-    /// CUDA path supplies an all-zero buffer, the additive identity).
+    /// Scoring function; the selection bias presence comes from `topk_method`.
     pub scoring_func: ScoringFunc,
     /// Top-k selection rule (`noaux_tc` vs greedy).
     pub topk_method: TopkMethod,
-    /// Renormalize the selected top-k weights to sum to 1 per token.
+    /// Renormalize the selected top-k weights to sum to 1.
     ///
-    /// Semantics differ subtly by scoring func, faithfully matching the legacy:
-    /// - **softmax** (`ScoringFunc::Softmax`): the DSv4 reference + the CUDA
-    ///   `dsv4_route` kernel *never* renormalize inside the router (denom is
-    ///   pinned to `1.0`). Qwen3.6 applies the renorm as a *separate* step
-    ///   (`qwen36_renorm_topk_weights`) gated on `norm_topk_prob`. So for the
-    ///   softmax path this flag drives that explicit post-renorm.
-    /// - **sigmoid / sqrtsoftplus**: the DSv4 reference *always* normalizes the
-    ///   selected scores (`denom = selected_sum + 1e-9`) regardless of this
-    ///   flag — see [`crate::route`]. This field then only documents intent.
+    /// - **softmax**: drives Qwen3.6's separate post-renorm; the DSv4 reference +
+    ///   kernel never renorm inside the router (denom pinned to 1.0).
+    /// - **sigmoid / sqrtsoftplus**: DSv4 always normalizes regardless of this
+    ///   flag (`denom = selected_sum + 1e-9`); the flag only documents intent.
     pub norm_topk_prob: bool,
-    /// Final multiplicative scaling applied to every routed weight
-    /// (DSv4 `routed_scaling_factor`; Qwen3.6 uses `1.0`).
+    /// Final multiplicative scaling on every routed weight (Qwen3.6 = 1.0).
     pub routed_scaling_factor: f32,
-    /// Group-limited routing: number of expert groups. Upstream DeepSeek-V2/V3
-    /// `n_group`. `None` ⇒ no grouping (the ARLE DSv4 + Qwen3.6 path). When set,
-    /// experts are partitioned into `n_group` equal contiguous groups and only
-    /// `topk_group` groups are eligible — see [`crate::route::group_limited_mask`].
+    /// Group-limited routing: expert-group count (DeepSeek-V2/V3 `n_group`).
+    /// `None` ⇒ no grouping. See [`crate::route::group_limited_mask`].
     pub n_group: Option<usize>,
-    /// Group-limited routing: number of groups kept per token (`topk_group`).
-    /// Must be `Some` iff `n_group` is `Some`.
+    /// Groups kept per token; `Some` iff `n_group` is `Some`.
     pub topk_group: Option<usize>,
-    /// Router (gate) projection dims: `[num_experts, hidden_size]`. The router
-    /// is `logits = gate @ x` → `[num_experts]` per token. Carried for shape
-    /// validation against a GPU kernel; this crate routes from pre-computed
-    /// logits and does not multiply the gate matrix.
+    /// Router projection input dim; carried for shape validation (this crate
+    /// routes from pre-computed logits, never multiplies the gate).
     pub hidden_size: usize,
 }
 
 impl MoeConfig {
-    /// Construct the Qwen3.6 router config: plain softmax, greedy top-k, no
-    /// bias, scaling = 1.0, one sigmoid-gated shared expert, optional
-    /// `norm_topk_prob`. Mirrors `infer/src/model/qwen35/moe.rs`.
+    /// Qwen3.6 router config: softmax, greedy top-k, no bias, scaling 1.0, one
+    /// sigmoid-gated shared expert, optional `norm_topk_prob`.
     #[must_use]
     pub fn qwen36(
         num_experts: usize,
@@ -176,9 +132,7 @@ impl MoeConfig {
         self.num_shared_experts > 0
     }
 
-    /// Validate the config. Mirrors the legacy `DeepSeekV4Config::validate`
-    /// MoE checks (`n_routed_experts != 0`, `num_experts_per_tok != 0`,
-    /// `num_experts_per_tok <= n_routed_experts`).
+    /// Validate the config (experts > 0, valid top_k, consistent group fields).
     pub fn validate(&self) -> Result<()> {
         if self.num_experts == 0 {
             bail!("MoE config requires num_experts > 0");

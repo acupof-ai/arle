@@ -134,28 +134,16 @@ fn ensure_mask_args(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MoE-2: safe wrappers over the existing MoE FFI.
-//
-// These wrap the `extern "C"` grouped-GEMM + DSv4/Qwen3.6 expert-dispatch
-// kernels declared in `ffi/gemm.rs` + `ffi/moe.rs`. They centralize the
-// device-pointer extraction and `i32`-ABI casts so model code calls a typed
-// Rust surface instead of re-writing the `unsafe` block at each call site.
-//
-// `RawDevicePtr<T>` (built once via `crate::tensor::cache_ptr`) carries the bulk
-// device buffers; `CUstream` (from `ctx.stream.cu_stream()`) carries the stream.
-// The dense BF16 weight buffers are `bf16` on the Rust side and `Half` (`u16`)
-// on the kernel ABI — same 16-bit layout, so the pointers are cast directly.
-// ─────────────────────────────────────────────────────────────────────────────
+// Safe wrappers over the grouped-GEMM + DSv4/Qwen3.6 expert-dispatch FFI: they
+// centralize device-pointer extraction + the i32-ABI casts. `RawDevicePtr<T>`
+// (from `cache_ptr`) carries buffers; bf16 (Rust) and Half (u16, kernel ABI)
+// share a 16-bit layout, so pointers cast directly.
 
 /// Build the device-resident per-expert weight-pointer table the grouped-GEMM
-/// kernels consume (`*const u64`, one dense `data` device pointer per expert).
-///
-/// Mirrors the legacy `infer/src/model/qwen35/moe.rs` `ptr_vec` + `clone_htod`
-/// idiom. Returns the host-built table uploaded to the device.
+/// kernels consume (`*const u64`, one dense `data` pointer per expert).
 ///
 /// # Errors
-/// Errors if the host→device upload of the pointer table fails.
+/// Errors if the host→device upload fails.
 pub fn build_expert_weight_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
@@ -167,17 +155,12 @@ pub fn build_expert_weight_ptr_table(
 }
 
 /// Single grouped expert GEMM: `output[token] = input[token] @ W_expert^T`,
-/// M-grouped by expert. Wraps [`ffi::moe_bf16_grouped_gemm_batch_cuda`].
-///
-/// `weight_ptrs` is the table from [`build_expert_weight_ptr_table`]. `input` /
-/// `output` are dense BF16 row blocks; `offsets` / `counts` / `expert_indices`
-/// are the per-expert M-grouping metadata. `n` / `k` are the GEMM output / input
-/// dims (one expert's weight is `[n, k]`).
+/// M-grouped by expert. `weight_ptrs` is the [`build_expert_weight_ptr_table`]
+/// table; `n`/`k` are one expert's `[n, k]` weight dims.
 ///
 /// # Safety
-/// `stream` must be the stream the input/output/metadata buffers are valid on,
-/// and all pointer lengths must match the `num_experts` / `n` / `k` / `max_count`
-/// shape (checked by the kernel, not here).
+/// All buffers must be valid on `stream` with lengths matching the shape (checked
+/// by the kernel, not here).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn moe_bf16_grouped_gemm_batch(
     weight_ptrs: &CudaSlice<u64>,

@@ -1,15 +1,9 @@
-//! Clean dense-BF16 Qwen3 CUDA forward for the R6 seam port.
+//! Dense-BF16 Qwen3 CUDA forward.
 //!
-//! This is deliberately not a relocation of the legacy `infer/src/model/qwen3`
-//! tree. It keeps the tested CUDA kernel calls and the transformer dataflow, but
-//! deletes quantized variants, GGUF, TP/NCCL, LoRA, CUDA graphs, spec decode,
-//! server/scheduler coupling, and multi-shape dispatch.
-//!
-//! This file holds the model state (`CudaModel`/`TransformerBlock`/`Attention`/
-//! `Mlp`) and the forward dataflow (`forward_tokens`) that drives the layer loop
-//! by calling the `ops`/`attention` kernel wrappers. Weight loading lives in
-//! `loader`, the op wrappers in `ops`, the attention kernels in `attention`, and
-//! the step driver + sampling in `executor`.
+//! Holds the model state (`CudaModel`/`TransformerBlock`/`Attention`/`Mlp`) and
+//! the forward dataflow (`forward_tokens`) driving the layer loop over the
+//! `ops`/`attention` kernel wrappers. Weight loading is in `loader`, the step
+//! driver + sampling in `executor`.
 
 use anyhow::{Result, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
@@ -35,24 +29,15 @@ pub(crate) struct CudaModel {
     pub(crate) norm: DeviceVec,
     pub(crate) cos_cache: DeviceVec,
     pub(crate) sin_cache: DeviceVec,
-    /// Tensor-parallel runtime: the resolved rank placement plus its
-    /// communicator. For `world_size == 1` this is [`TpRuntime::single`] — the
-    /// no-op communicator — so the forward below is byte-identical to the non-TP
-    /// path: every `all_reduce_sum` returns immediately and the weights are the
-    /// full (unsharded) tensors.
+    /// Tensor-parallel runtime. `world_size == 1` uses the no-op communicator, so
+    /// every `all_reduce_sum` returns immediately.
     pub(crate) tp: crate::tp::TpRuntime,
-    /// This rank's attention head counts and projection dims, computed at load
-    /// time. On a single GPU these equal the global config values; under TP they
-    /// are the per-rank shard sizes (Q/KV heads split by [`infer_topo::head_shard`],
-    /// dims = `local_heads * head_dim`). The forward sizes its activation buffers
-    /// and the attention launch from THESE locals, not the global config.
+    /// This rank's per-shard head counts (= global config on a single GPU). The
+    /// forward sizes its buffers and attention launch from these, not the config.
     pub(crate) local_q_heads: usize,
     pub(crate) local_kv_heads: usize,
-    /// MoE router description (MoE-4). `None` for the dense Qwen3 path — the
-    /// forward then never touches any MoE branch, so the dense path is
-    /// byte-identical. `Some` for a Qwen3.5/3.6 MoE checkpoint, shared by every
-    /// sparse layer's [`moe_forward`] router (the per-layer expert weights live
-    /// on [`TransformerBlock::moe`]).
+    /// MoE router. `None` for dense Qwen3 (no MoE branch taken); `Some` for a
+    /// MoE checkpoint, shared by every sparse layer's [`moe_forward`].
     pub(crate) moe_config: Option<infer_moe::MoeConfig>,
 }
 
@@ -72,15 +57,10 @@ pub(crate) struct TransformerBlock {
     pub(crate) input_layernorm: DeviceVec,
     pub(crate) attention: Attention,
     pub(crate) post_attention_layernorm: DeviceVec,
-    /// Dense SwiGLU MLP. `Some` for every dense layer (the byte-identical Qwen3
-    /// path always sets this); `None` only on a MoE checkpoint's sparse layer,
-    /// where `moe` drives the forward and no dense projections exist in the
-    /// checkpoint. Exactly one of `mlp` / `moe` is `Some` per layer.
+    /// Dense SwiGLU MLP. Exactly one of `mlp` / `moe` is `Some` per layer.
     pub(crate) mlp: Option<Mlp>,
-    /// Per-layer MoE expert weights (MoE-4). `None` ⇒ dense MLP layer (the
-    /// byte-identical Qwen3 path and any `mlp_only_layers` on a MoE checkpoint).
-    /// `Some` ⇒ sparse layer: the forward runs [`moe_forward`] instead of the
-    /// dense gate/up/silu/down block.
+    /// Per-layer MoE expert weights; `Some` runs [`moe_forward`] instead of the
+    /// dense block.
     pub(crate) moe: Option<MoeLayerWeights>,
 }
 
@@ -104,16 +84,13 @@ impl CudaModel {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 
-    /// Logits/vocab dimension (rows of the LM-head projection). Used to size the
-    /// fixed `logits` buffer of the captured decode path.
+    /// Logits/vocab dimension (rows of the LM-head projection).
     pub(crate) fn logits_dim(&self) -> usize {
         self.output_projection().rows
     }
 
-    /// This rank's MLP intermediate width. `gate_proj`/`up_proj` are
-    /// column-parallel (their output dim is `intermediate_size`), so under TP each
-    /// rank holds the column shard; `down_proj` (row-parallel) consumes the same
-    /// shard as its input. On a single GPU this is the full `intermediate_size`.
+    /// This rank's MLP intermediate width (= full `intermediate_size` on a single
+    /// GPU; the column shard under TP).
     fn local_intermediate_size(&self) -> usize {
         let tp = self.tp.config();
         if tp.is_single() {
@@ -149,10 +126,8 @@ impl CudaModel {
 
         let seq_len = tokens.len();
         let hidden_size = self.config.hidden_size;
-        // Per-rank head counts and projection dims (locals equal the global config
-        // on a single GPU; under TP they are this rank's head shard). The QKV/O
-        // GEMMs run on the sharded weights, so the activation buffers and the
-        // attention launch must use the local dims, not the global config.
+        // Local per-rank dims (= global config on a single GPU): the buffers and
+        // attention launch must match the sharded QKV/O GEMM outputs.
         let q_dim = self.local_q_heads * self.config.head_dim;
         let kv_dim = self.local_kv_heads * self.config.head_dim;
         let inter = self.local_intermediate_size();
@@ -204,9 +179,7 @@ impl CudaModel {
                 &mut attn_output,
             )?;
             gemm_batch(&self.ctx, &layer.attention.o_proj, &attn_output, &mut o_buf)?;
-            // Row-parallel: each rank produced a partial o_proj output over its
-            // attention-head shard; sum across ranks before the residual add.
-            // No-op on a single GPU.
+            // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
             self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
             add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
             std::mem::swap(&mut hidden, &mut hidden_out);
@@ -219,8 +192,6 @@ impl CudaModel {
                 &mut normed,
             )?;
             if let Some(moe) = &layer.moe {
-                // Sparse layer (MoE-4): route → grouped experts → combine →
-                // shared expert. Produces the block output into `o_buf`.
                 let cfg = self.moe_config.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("MoE layer present but model has no moe_config")
                 })?;
@@ -238,9 +209,7 @@ impl CudaModel {
                 silu_mul(&self.ctx, &gate_out, &up_out, &mut act_out)?;
                 gemm_batch(&self.ctx, &mlp.down_proj, &act_out, &mut o_buf)?;
             }
-            // Row-parallel: each rank produced a partial down_proj / MoE-combine
-            // output over its intermediate / expert shard; sum across ranks before
-            // the residual add. No-op on a single GPU.
+            // Row-parallel down_proj / MoE-combine: sum the partials (no-op single-GPU).
             self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
             add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
             std::mem::swap(&mut hidden, &mut hidden_out);
@@ -266,20 +235,13 @@ impl CudaModel {
         sample_cuda_token(&self.ctx, &logits, params, position)
     }
 
-    /// Captured-graph B=1 decode forward (CG-2, ADDITIVE).
+    /// Captured-graph B=1 decode forward.
     ///
-    /// Runs the **same per-layer math** as [`Self::forward_tokens`] but reads and
-    /// writes the FIXED buffers in `decode_ctx` instead of allocating fresh
-    /// `HiddenStates`/`DeviceVec`/`PageMeta` each call. This is the body the warmup
-    /// path records into a CUDA graph and the submit path replays: it contains
-    /// **only GPU kernels** — no host allocation, no host/device sync, no sampling
-    /// (sampling stays outside the graph, design §7; the graph ends at
-    /// `decode_ctx.logits`).
-    ///
-    /// Stage-1 metadata (token id, positions, page table) must already be written
-    /// into `decode_ctx` via [`DecodeGraphContext::stage1_write`] before calling
-    /// this. `forward_tokens` (the numerically-verified eager path) is intentionally
-    /// left untouched — this is a parallel fast path that produces the same logits.
+    /// Same per-layer math as [`Self::forward_tokens`] but reads/writes the FIXED
+    /// `decode_ctx` buffers (no per-call alloc), so the body is graph-capturable:
+    /// only GPU kernels, no host alloc/sync/sampling (the graph ends at
+    /// `decode_ctx.logits`). Stage-1 metadata must already be written via
+    /// [`DecodeGraphContext::stage1_write`].
     ///
     /// # Errors
     /// Propagates kernel-wrapper errors.
@@ -304,12 +266,10 @@ impl CudaModel {
             "forward_decode_captured before stage1_write (metadata not staged)"
         );
 
-        // Borrow the fixed buffers as locals so the layer loop reads like the eager
-        // path. `meta` is borrowed immutably (its CudaSlice buffers stay at fixed
-        // addresses — Stage-1 only overwrote their contents). `hidden`/`hidden_out`
-        // are swapped each layer exactly as in the eager forward; that host-side swap
-        // fixes which baked pointer each layer's kernel uses, and it is reproduced
-        // identically on every capture, so replay matches.
+        // Borrow the fixed buffers as locals (addresses stable; Stage-1 only
+        // overwrote contents). The per-layer hidden/hidden_out swap fixes which
+        // baked pointer each kernel uses and is reproduced identically on every
+        // capture, so replay matches.
         let DecodeGraphContext {
             ref mut hidden,
             ref mut normed,
@@ -362,10 +322,8 @@ impl CudaModel {
                 attn_output,
             )?;
             gemm_batch(&self.ctx, &layer.attention.o_proj, attn_output, o_buf)?;
-            // Row-parallel all-reduce (no-op on a single GPU). The captured-graph
-            // path only runs when TP is single (multi-rank disables capture in
-            // executor.rs because NCCL is not graph-capturable), so this call is
-            // always the no-op here; it stays for parity with the eager forward.
+            // Always the no-op here (capture only runs single-GPU); kept for
+            // parity with the eager forward.
             self.tp.all_reduce_sum(&self.ctx, o_buf)?;
             add_batch(&self.ctx, hidden, o_buf, hidden_out)?;
             std::mem::swap(hidden, hidden_out);
@@ -377,10 +335,8 @@ impl CudaModel {
                 self.config.rms_norm_eps,
                 normed,
             )?;
-            // The captured B=1 decode graph is the dense Qwen3 fast path only;
-            // a MoE checkpoint's host-routed `moe_forward` is not graph-capturable
-            // (it syncs + reads logits on the host each step). MoE layers run the
-            // eager `forward_tokens` path, so a MoE layer here is a wiring bug.
+            // Dense fast path only: MoE's host-routed `moe_forward` is not
+            // graph-capturable, so a MoE layer here is a wiring bug.
             let mlp = layer.mlp.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("captured decode path does not support MoE layers")
             })?;
@@ -388,7 +344,6 @@ impl CudaModel {
             gemm_batch(&self.ctx, &mlp.up_proj, normed, up_out)?;
             silu_mul(&self.ctx, gate_out, up_out, act_out)?;
             gemm_batch(&self.ctx, &mlp.down_proj, act_out, o_buf)?;
-            // Row-parallel all-reduce (no-op on a single GPU; see o_proj note above).
             self.tp.all_reduce_sum(&self.ctx, o_buf)?;
             add_batch(&self.ctx, hidden, o_buf, hidden_out)?;
             std::mem::swap(hidden, hidden_out);
