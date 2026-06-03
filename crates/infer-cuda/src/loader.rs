@@ -87,13 +87,13 @@ impl CudaModel {
 }
 
 pub(crate) fn validate_clean_bf16_config(config: &Qwen3Config) -> Result<()> {
-    ensure!(
-        config.hidden_size == config.num_attention_heads * config.head_dim,
-        "Qwen3 hidden_size {} must equal num_attention_heads {} * head_dim {}",
-        config.hidden_size,
-        config.num_attention_heads,
-        config.head_dim
-    );
+    // NOTE: Qwen3 DECOUPLES head_dim from hidden_size/num_heads — e.g. Qwen3-0.6B
+    // has hidden_size=1024, num_attention_heads=16, head_dim=128 (q_proj maps
+    // 1024 -> 16*128=2048, o_proj maps back to 1024). So `hidden_size ==
+    // num_attention_heads * head_dim` is NOT an invariant; the forward already
+    // uses q_dim = num_attention_heads * head_dim for the projections. The real
+    // constraints are head_dim==128 (TileLang HD128, checked in model.rs) + GQA
+    // divisibility below.
     ensure!(
         config
             .num_attention_heads
