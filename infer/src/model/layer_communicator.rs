@@ -60,6 +60,10 @@ pub struct LayerCommunicator {
     #[cfg(feature = "nccl")]
     request_token_sync_nccl: Option<Arc<NcclGroup>>,
     #[cfg(feature = "nccl")]
+    attn_dp_nccl: Option<Arc<NcclGroup>>,
+    #[cfg(feature = "nccl")]
+    attn_cp_nccl: Option<Arc<NcclGroup>>,
+    #[cfg(feature = "nccl")]
     ep_overlap_nccl: Option<Arc<NcclGroup>>,
     /// A4 — secondary TP NCCL communicator bound to `ctx.comm_stream` for
     /// compute/comm overlap during prefill AllGather Q. Attached only when
@@ -94,6 +98,10 @@ impl LayerCommunicator {
             ep_nccl: None,
             #[cfg(feature = "nccl")]
             request_token_sync_nccl: None,
+            #[cfg(feature = "nccl")]
+            attn_dp_nccl: None,
+            #[cfg(feature = "nccl")]
+            attn_cp_nccl: None,
             #[cfg(feature = "nccl")]
             ep_overlap_nccl: None,
             #[cfg(feature = "nccl")]
@@ -154,6 +162,10 @@ impl LayerCommunicator {
             #[cfg(feature = "nccl")]
             request_token_sync_nccl: None,
             #[cfg(feature = "nccl")]
+            attn_dp_nccl: None,
+            #[cfg(feature = "nccl")]
+            attn_cp_nccl: None,
+            #[cfg(feature = "nccl")]
             ep_overlap_nccl: None,
             #[cfg(feature = "nccl")]
             tp_overlap_nccl: None,
@@ -206,6 +218,46 @@ impl LayerCommunicator {
     pub fn with_request_token_sync_nccl(mut self, nccl: Arc<NcclGroup>) -> Self {
         self.request_token_sync_nccl = Some(nccl);
         self
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn with_attn_dp_nccl(mut self, nccl: Arc<NcclGroup>) -> Result<Self> {
+        if self.dp_world_size != nccl.world_size {
+            bail!(
+                "LayerCommunicator attention-DP world_size {} does not match NCCL world_size {}",
+                self.dp_world_size,
+                nccl.world_size
+            );
+        }
+        if self.dp_rank != nccl.rank {
+            bail!(
+                "LayerCommunicator attention-DP rank {} does not match NCCL rank {}",
+                self.dp_rank,
+                nccl.rank
+            );
+        }
+        self.attn_dp_nccl = Some(nccl);
+        Ok(self)
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn with_attn_cp_nccl(mut self, nccl: Arc<NcclGroup>) -> Result<Self> {
+        if self.cp_world_size != nccl.world_size {
+            bail!(
+                "LayerCommunicator attention-CP world_size {} does not match NCCL world_size {}",
+                self.cp_world_size,
+                nccl.world_size
+            );
+        }
+        if self.cp_rank != nccl.rank {
+            bail!(
+                "LayerCommunicator attention-CP rank {} does not match NCCL rank {}",
+                self.cp_rank,
+                nccl.rank
+            );
+        }
+        self.attn_cp_nccl = Some(nccl);
+        Ok(self)
     }
 
     #[cfg(feature = "nccl")]
@@ -303,6 +355,8 @@ impl LayerCommunicator {
             "global-tp-ep-only"
         } else if self.owner_group_collectives_ready() {
             "owner-groups-collectives-ready"
+        } else if self.owner_group_attention_subgroups_ready() {
+            "owner-groups-attn-subgroups-ready"
         } else if self.owner_group_token_sync_ready() {
             "owner-groups-token-sync-ready"
         } else {
@@ -315,10 +369,28 @@ impl LayerCommunicator {
             return true;
         }
 
-        // The current communicator stores only the global TP/EP NCCL groups.
-        // SGLang-style owner groups also need attention-DP/CP token sync
-        // collectives before this can be treated as comparable execution.
+        // Attention-DP/CP subgroup construction is necessary but not sufficient:
+        // the DSv4 SGLang path still needs the forward path and graph replay
+        // contract to consume those groups before this label can pass.
         false
+    }
+
+    pub fn owner_group_attention_subgroups_ready(&self) -> bool {
+        if self.dp_world_size == 1 && self.cp_world_size == 1 {
+            return true;
+        }
+        if !self.owner_group_token_sync_ready() {
+            return false;
+        }
+        #[cfg(feature = "nccl")]
+        {
+            (self.dp_world_size == 1 || self.attn_dp_nccl.is_some())
+                && (self.cp_world_size == 1 || self.attn_cp_nccl.is_some())
+        }
+        #[cfg(not(feature = "nccl"))]
+        {
+            false
+        }
     }
 
     pub fn owner_group_token_sync_ready(&self) -> bool {
@@ -359,6 +431,16 @@ impl LayerCommunicator {
     #[cfg(feature = "nccl")]
     pub fn request_token_sync_nccl(&self) -> Option<Arc<NcclGroup>> {
         self.request_token_sync_nccl.clone()
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn attn_dp_nccl(&self) -> Option<Arc<NcclGroup>> {
+        self.attn_dp_nccl.clone()
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn attn_cp_nccl(&self) -> Option<Arc<NcclGroup>> {
+        self.attn_cp_nccl.clone()
     }
 
     /// A4 accessor — secondary TP NCCL group bound to `ctx.comm_stream`,
@@ -967,6 +1049,7 @@ mod tests {
 
         let advanced = LayerCommunicator::new_with_ep(0, 4, 1, 2, 0, 1, 0, 4).unwrap();
         assert!(!advanced.owner_group_token_sync_ready());
+        assert!(!advanced.owner_group_attention_subgroups_ready());
         assert!(!advanced.owner_group_collectives_ready());
         assert_eq!(
             advanced.layout_label(),

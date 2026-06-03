@@ -68,7 +68,7 @@ use crate::ops;
 #[cfg(feature = "cuda")]
 use crate::ops::LinearDispatchPhase;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-use crate::tensor_parallel::build_attn_owner_groups;
+use crate::tensor_parallel::{build_attn_cp_groups, build_attn_dp_groups, build_attn_owner_groups};
 #[cfg(feature = "cuda")]
 use crate::tp::TpLoadContext;
 #[cfg(feature = "cuda")]
@@ -358,6 +358,18 @@ impl DeepseekModel {
         } else {
             dsv4_request_owner_token_sync_group(config)?
         };
+        #[cfg(feature = "nccl")]
+        let attention_dp_group = if comm_matches_global_tp {
+            None
+        } else {
+            dsv4_attention_dp_group(config)?
+        };
+        #[cfg(feature = "nccl")]
+        let attention_cp_group = if comm_matches_global_tp {
+            None
+        } else {
+            dsv4_attention_cp_group(config)?
+        };
 
         #[cfg(feature = "nccl")]
         {
@@ -425,6 +437,48 @@ impl DeepseekModel {
                         owner_sync.ranks,
                         owner_sync.rank,
                         owner_sync.world_size,
+                        comm.axis_summary(),
+                        port_offset,
+                    );
+                }
+            }
+            if let Some(attn_dp) = attention_dp_group {
+                if attn_dp.world_size > 1 {
+                    let port_offset = dsv4_attention_dp_nccl_port_offset(attn_dp.group_index)?;
+                    let group = Arc::new(NcclGroup::new_on_stream(
+                        attn_dp.rank,
+                        attn_dp.world_size,
+                        dsv4_nccl_env_bootstrap_with_port_offset(port_offset)?,
+                        ctx.stream.clone(),
+                    )?);
+                    comm = comm.with_attn_dp_nccl(Arc::clone(&group))?;
+                    info!(
+                        "DeepSeek V4 attention-DP NCCL attached: group_index={} ranks={:?} attn_dp_rank={}/{} communicator_axes={} port_offset={}",
+                        attn_dp.group_index,
+                        attn_dp.ranks,
+                        attn_dp.rank,
+                        attn_dp.world_size,
+                        comm.axis_summary(),
+                        port_offset,
+                    );
+                }
+            }
+            if let Some(attn_cp) = attention_cp_group {
+                if attn_cp.world_size > 1 {
+                    let port_offset = dsv4_attention_cp_nccl_port_offset(attn_cp.group_index)?;
+                    let group = Arc::new(NcclGroup::new_on_stream(
+                        attn_cp.rank,
+                        attn_cp.world_size,
+                        dsv4_nccl_env_bootstrap_with_port_offset(port_offset)?,
+                        ctx.stream.clone(),
+                    )?);
+                    comm = comm.with_attn_cp_nccl(Arc::clone(&group))?;
+                    info!(
+                        "DeepSeek V4 attention-CP NCCL attached: group_index={} ranks={:?} attn_cp_rank={}/{} communicator_axes={} port_offset={}",
+                        attn_cp.group_index,
+                        attn_cp.ranks,
+                        attn_cp.rank,
+                        attn_cp.world_size,
                         comm.axis_summary(),
                         port_offset,
                     );
@@ -10008,7 +10062,7 @@ fn dsv4_nccl_env_bootstrap_with_port_offset(
 }
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-struct Dsv4OwnerTokenSyncGroup {
+struct Dsv4RankSubgroup {
     group_index: usize,
     ranks: Vec<usize>,
     rank: usize,
@@ -10018,7 +10072,30 @@ struct Dsv4OwnerTokenSyncGroup {
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn dsv4_request_owner_token_sync_group(
     config: &DeepseekRuntimeConfig,
-) -> Result<Option<Dsv4OwnerTokenSyncGroup>> {
+) -> Result<Option<Dsv4RankSubgroup>> {
+    dsv4_rank_subgroup_from_groups(
+        config,
+        "request-owner token-sync",
+        build_attn_owner_groups(config.axes),
+    )
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_attention_dp_group(config: &DeepseekRuntimeConfig) -> Result<Option<Dsv4RankSubgroup>> {
+    dsv4_rank_subgroup_from_groups(config, "attention-DP", build_attn_dp_groups(config.axes))
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_attention_cp_group(config: &DeepseekRuntimeConfig) -> Result<Option<Dsv4RankSubgroup>> {
+    dsv4_rank_subgroup_from_groups(config, "attention-CP", build_attn_cp_groups(config.axes))
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_rank_subgroup_from_groups(
+    config: &DeepseekRuntimeConfig,
+    label: &str,
+    groups: Vec<Vec<usize>>,
+) -> Result<Option<Dsv4RankSubgroup>> {
     if config.axes.world_size() != config.tp.world_size
         || config.rank_coord.world_rank != config.tp.rank
     {
@@ -10026,9 +10103,9 @@ fn dsv4_request_owner_token_sync_group(
     }
 
     let world_rank = config.rank_coord.world_rank;
-    for (group_index, ranks) in build_attn_owner_groups(config.axes).into_iter().enumerate() {
+    for (group_index, ranks) in groups.into_iter().enumerate() {
         if let Some(rank) = ranks.iter().position(|&candidate| candidate == world_rank) {
-            return Ok(Some(Dsv4OwnerTokenSyncGroup {
+            return Ok(Some(Dsv4RankSubgroup {
                 group_index,
                 world_size: ranks.len(),
                 ranks,
@@ -10038,7 +10115,7 @@ fn dsv4_request_owner_token_sync_group(
     }
 
     bail!(
-        "DeepSeek V4 rank {} has no request owner group for axes={}",
+        "DeepSeek V4 rank {} has no {label} group for axes={}",
         world_rank,
         config.axes.summary()
     );
@@ -10046,11 +10123,26 @@ fn dsv4_request_owner_token_sync_group(
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn dsv4_owner_group_nccl_port_offset(group_index: usize) -> Result<u16> {
+    dsv4_nccl_group_port_offset(10, "owner-group", group_index)
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_attention_dp_nccl_port_offset(group_index: usize) -> Result<u16> {
+    dsv4_nccl_group_port_offset(20, "attention-DP", group_index)
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_attention_cp_nccl_port_offset(group_index: usize) -> Result<u16> {
+    dsv4_nccl_group_port_offset(40, "attention-CP", group_index)
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_nccl_group_port_offset(base: u16, label: &str, group_index: usize) -> Result<u16> {
     let group_index = u16::try_from(group_index).map_err(|err| {
-        anyhow::anyhow!("DSv4 owner-group index {group_index} exceeds u16 range: {err}")
+        anyhow::anyhow!("DSv4 {label} index {group_index} exceeds u16 range: {err}")
     })?;
-    10u16.checked_add(group_index).ok_or_else(|| {
-        anyhow::anyhow!("DSv4 owner-group port offset overflow for group index {group_index}")
+    base.checked_add(group_index).ok_or_else(|| {
+        anyhow::anyhow!("DSv4 {label} port offset overflow for group index {group_index}")
     })
 }
 
