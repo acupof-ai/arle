@@ -32,6 +32,12 @@ HF gold      = [12095, 13, 576, 6722, 315, 9625, 374, 1083, 279, 6722, 315, 279,
 
 **Exact match — 16/16 tokens.** The clean R6 CUDA forward is numerically correct.
 
+**Multi-shape confirmation:** a 22-token prompt ("In a quiet Paris library, the young
+engineer carefully compared the new CUDA runtime against a trusted reference before
+shipping.") → clean_tokens `[576,5785,572,264,21789,2530,315,1995,11,323,279,23576,1030,311,17188,389]`
+= HF gold, **16/16 exact**. Two shapes (5-tok, 22-tok) both exact → the decode-kernel
+chunk=1 path is correct at longer KV, not just the bring-up shape.
+
 The sibling decode `cache_len != kv_seq_len` invariant error did **not** recur once the
 pod was rebuilt against current `infer-core` — confirming it was a stale-pod-binary
 artifact (current `planner.rs:36` captures `kv_seq_len` pre-allocate; regression guards
