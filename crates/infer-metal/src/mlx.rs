@@ -265,6 +265,31 @@ pub fn zeros(shape: &[i32], dtype: Dtype) -> MlxArray {
     )
 }
 
+pub fn slice(a: &MlxArray, start: &[i32], stop: &[i32], strides: &[i32]) -> MlxArray {
+    assert_eq!(
+        start.len(),
+        stop.len(),
+        "mlx_slice start/stop rank mismatch"
+    );
+    assert_eq!(
+        start.len(),
+        strides.len(),
+        "mlx_slice start/stride rank mismatch"
+    );
+    mlx_array_from_raw_or_panic(
+        unsafe {
+            mlx_sys::mlx_slice(
+                a.0,
+                start.as_ptr(),
+                stop.as_ptr(),
+                strides.as_ptr(),
+                start.len(),
+            )
+        },
+        "mlx_slice",
+    )
+}
+
 pub fn concatenate_axis(arrays: &[MlxArray], axis: i32) -> MlxArray {
     let raw: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
     mlx_array_from_raw_or_panic(

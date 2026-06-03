@@ -1190,6 +1190,78 @@ mod r3a_clean_metal_parity_tests {
     }
 
     #[test]
+    #[ignore = "requires Apple Silicon Metal + Qwen3.5-0.8B MLX weights"]
+    fn r3c_chunked_prefill_matches_legacy_metal_backend() -> Result<()> {
+        let model =
+            std::env::var("R3A_METAL_TEST_MODEL").unwrap_or_else(|_| DEFAULT_R3A_MODEL.to_string());
+        let prompt = "Explain why prefix caching matters for multi-turn coding agents.";
+        let max_new_tokens = 16;
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_k: 1,
+            ignore_eos: true,
+            max_new_tokens: Some(max_new_tokens),
+            ..Default::default()
+        };
+
+        let mut legacy = MetalBackend::new();
+        legacy.load(Path::new(&model))?;
+        let mut prompt_ids = legacy.tokenize(prompt)?;
+        let seed = if prompt_ids.is_empty() {
+            vec![1_u32]
+        } else {
+            prompt_ids.clone()
+        };
+        while prompt_ids.len() < 96 {
+            prompt_ids.extend_from_slice(&seed);
+        }
+        prompt_ids.truncate(96);
+
+        let mut legacy_tokens = Vec::new();
+        let legacy_result =
+            legacy.generate_from_token_ids_with_callback(&prompt_ids, &params, |token| {
+                legacy_tokens.push(token);
+                Ok(())
+            })?;
+        assert_eq!(
+            legacy_result.completion_tokens, max_new_tokens,
+            "legacy run should emit exactly {max_new_tokens} tokens"
+        );
+        drop(legacy);
+
+        let executor = infer_metal::MetalExecutor::from_model_path(&model)?;
+        let kv = infer_metal::MetalKvPool::new(1, 4096, 16);
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_num_batched_tokens: 32,
+            max_prefill_tokens: 32,
+            prefill_max_requests: Some(1),
+            max_prompt_tokens: 2_048,
+            max_total_tokens: prompt_ids.len() + max_new_tokens,
+            prefix_cache_low_water_pages: 0,
+            chunked_prefill_size: 32,
+        };
+        let mut engine = Engine::with_config(executor, kv, config);
+        let handle = engine.submit_request(prompt_ids, max_new_tokens);
+        engine.run_to_idle()?;
+
+        let completed = engine
+            .completed(handle)
+            .expect("clean engine request should complete");
+        assert!(matches!(
+            completed.finish.as_ref(),
+            Some(FinishReason::Length)
+        ));
+        assert_eq!(completed.generated_tokens.len(), max_new_tokens);
+        eprintln!(
+            "R3c chunked-prefill Metal parity token ids: legacy={:?} new={:?}",
+            legacy_tokens, completed.generated_tokens
+        );
+        assert_eq!(completed.generated_tokens, legacy_tokens);
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires Apple Silicon Metal + Qwen3.6-35B-A3B MLX weights"]
     fn r3e_qwen36_clean_engine_matches_legacy_and_reports_throughput() -> Result<()> {
         let model =

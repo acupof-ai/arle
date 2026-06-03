@@ -471,7 +471,9 @@ pub fn metal_engine_from_model_path(
     let mut config = SchedulerConfig::for_slots(4);
     config.max_prompt_tokens = 32_768;
     config.max_total_tokens = 65_536;
-    config.chunked_prefill_size = 512;
+    // Keep the real Metal agent bench visibly chunked: turn 1 spans several
+    // prefill chunks, while later radix hits only prefill the uncached suffix.
+    config.chunked_prefill_size = 64;
     let executor = infer_metal::MetalExecutor::from_model_path(model_path)?;
     let (executor, ttft) = TtftObserver::new(executor);
     // page_size 16, 8192 pages -> 131072 token capacity
@@ -614,12 +616,10 @@ mod tests {
     fn bench_agent_workflow_metal_qwen35_08b() -> Result<()> {
         let model = "mlx-community/Qwen3.5-0.8B-MLX-4bit";
         let (mut engine, ttft) = metal_engine_from_model_path(model)?;
-        // R3a/b MetalExecutor is single-row (no prefix reuse / chunked prefill yet —
-        // those land in R3c). So use a SINGLE turn whose prompt fits one chunk:
-        // a real single-request generation bench on the new engine. The multi-turn
-        // workflow (growing context -> chunked prefill + radix reuse) is enabled
-        // once R3c lands.
-        let wf = AgentWorkflow::synthetic(128, 1, 64, 128);
+        // Multi-turn growing context: turn 1 chunks the full prompt; later
+        // turns attach the page-aligned radix prefix and prefill only the new
+        // suffix before greedy decode.
+        let wf = AgentWorkflow::synthetic(256, 3, 32, 48);
         let mut probe = PeakMemProbe::new();
         let m = run_agent_workflow_with_probe(&mut engine, &ttft, &wf, &mut probe)?;
         let tok_per_s = m.total_generated as f64 / m.total_wall.as_secs_f64();
@@ -638,6 +638,13 @@ mod tests {
                 t.turn, t.prompt_len, t.generated, t.ticks_to_first_token, t.wall
             );
         }
+        assert!(m.turns.len() >= 2);
+        assert!(
+            m.turns[1].ticks_to_first_token < m.turns[0].ticks_to_first_token,
+            "turn 2 should reuse turn 1's prefix and reach first token faster: turn1={} turn2={}",
+            m.turns[0].ticks_to_first_token,
+            m.turns[1].ticks_to_first_token
+        );
         Ok(())
     }
 }
