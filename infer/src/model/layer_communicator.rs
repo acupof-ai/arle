@@ -355,6 +355,8 @@ impl LayerCommunicator {
             "global-tp-ep-only"
         } else if self.owner_group_collectives_ready() {
             "owner-groups-collectives-ready"
+        } else if self.owner_group_moe_transport_ready() {
+            "owner-groups-moe-transport-ready"
         } else if self.owner_group_attention_subgroups_ready() {
             "owner-groups-attn-subgroups-ready"
         } else if self.owner_group_token_sync_ready() {
@@ -373,6 +375,23 @@ impl LayerCommunicator {
         // the DSv4 SGLang path still needs the forward path and graph replay
         // contract to consume those groups before this label can pass.
         false
+    }
+
+    pub fn owner_group_moe_transport_ready(&self) -> bool {
+        if self.dp_world_size == 1 && self.cp_world_size == 1 {
+            return true;
+        }
+        if !self.owner_group_attention_subgroups_ready() {
+            return false;
+        }
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        {
+            self.ep_nccl.is_some() && self.native_deepep.is_some()
+        }
+        #[cfg(not(all(feature = "cuda", feature = "nccl")))]
+        {
+            false
+        }
     }
 
     pub fn owner_group_attention_subgroups_ready(&self) -> bool {
@@ -1050,6 +1069,7 @@ mod tests {
         let advanced = LayerCommunicator::new_with_ep(0, 4, 1, 2, 0, 1, 0, 4).unwrap();
         assert!(!advanced.owner_group_token_sync_ready());
         assert!(!advanced.owner_group_attention_subgroups_ready());
+        assert!(!advanced.owner_group_moe_transport_ready());
         assert!(!advanced.owner_group_collectives_ready());
         assert_eq!(
             advanced.layout_label(),
