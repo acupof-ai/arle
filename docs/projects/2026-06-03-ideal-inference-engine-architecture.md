@@ -1,8 +1,16 @@
 # Ideal Architecture for an Efficient, High-Performance, Evolvable Inference Engine
 
-**Type:** Architecture north star (survey + ideal design). Guides the ARLE backend seam refactor.
+> **SINGLE SOURCE OF TRUTH for the rewrite.** This is the authoritative design + status doc.
+> The siblings are subordinate: `backend-seam-redesign` (the SGLang survey that *seeded* the
+> seam — historical), `infer-clean-rewrite-plan` (keep/port/rewrite boundary + correctness gate),
+> `r3-metal-port-plan` / `r6-cuda-port-plan` (per-backend execution detail),
+> `rewrite-verification-targets` (gate definitions), `aipc-pivot-and-northstar` (why AI-PC).
+> They are archive/execution-detail, **not authority** — when they disagree with §6 here, §6 wins
+> ([[feedback_docs_are_not_truth]]).
+
+**Type:** Architecture north star (survey + ideal design) **+ executed-state record (§6)**.
 **Branch:** `arch/ideal-inference-engine`
-**Related:** [`2026-06-03-backend-seam-redesign.md`](2026-06-03-backend-seam-redesign.md) (ARLE current-state audit + migration sequence)
+**Related:** [`2026-06-03-backend-seam-redesign.md`](2026-06-03-backend-seam-redesign.md) (the survey that seeded the seam — historical, not current state; current state is §6 here)
 **Method:** `arle-upstream-runtime-scan`. SGLang from source (`sgl-project/sglang@3e681d7`),
 vLLM/Dynamo from official docs, the rest from architectural knowledge — **all hypothesis-grade**, to be
 license-or-kill'd against local bench/test before landing in ARLE. Sources in the final section.
@@ -181,6 +189,13 @@ dynamic metadata (seq_lens, page table) is prepared by CPU stages outside captur
 `ModelArch` (layer definitions) spans above them: writing TP/EP collectives via `Communicator`, reading/writing KV via `KvPool`,
 driven by `BackendExecutor`. Model and device are decoupled — adding a model doesn't touch the backend, adding a backend doesn't touch the model.
 
+**Proven vs hypothesis (2026-06-03, sharp).** Only **`BackendExecutor` + `KvPool` are exercised by real
+forward paths** (Metal MLX + CUDA BF16). `Communicator`, `Sampler`, `GraphRunner`, and `ModelArch` are
+**defined but not yet driven by a real caller** (`infer-models` is a skeleton). Per
+[[feedback_no_speculative_interface_shaping]] those four stay **hypothesis-grade** — do not lock their
+signatures until a second real model / multi-GPU / graph caller forces them. The seam earned its keep on
+the two-backend commonality; the rest is a sketch awaiting evidence.
+
 ---
 
 ## 5. Evolvability: each axis of change = one local plugin
@@ -199,34 +214,41 @@ making the "engine" itself swappable and doing dataflow orchestration above it; 
 
 ---
 
-## 6. Mapping back to ARLE: what exists, what's missing, how to proceed
+## 6. Execution reality (what was actually built — supersedes the incremental L-plan)
 
-ARLE current state (see backend-seam-redesign.md audit): **2 schedulers** (cuda 13.7k + metal 1.1k),
-`ModelForward` 50-method god-trait, scheduler directly holds `PagedKVPool`. But the good news — **only 3.7% of the core loop
-touches CUDA**, and **ARLE already has most of the ideal architecture's parts**:
+**The incremental in-place plan below was abandoned.** The original adoption sequence (L0.1 ForwardPlan
+normalization → L0.3 split the `ModelForward` god-trait in place → L1+L2 merge `scheduler/cuda` with
+`MetalScheduler`) was superseded by a **greenfield clean rewrite** (壮士断腕): build fresh `crates/infer-*`
+beside the legacy tree, prove them, then cut over. Don't refactor the 167k-LOC welded tree in place.
 
-| Ideal part | ARLE current state | Gap |
-|---|---|---|
-| ForwardPlan IR | ✅ `LogicalServePlan` (CUDA+Metal **already share the same type**) | CUDA still converts from a `StepPlan` shadow (round-trip) → normalize |
-| Overlap scheduler | ⚠️ already has async `pending_decode`/`pending_prefill` across loop turns | but bound to `ModelForward`, not an explicit future-buffer contract |
-| Communicator | ✅ `LayerCommunicator` already exists | not split out of the god-trait into an independent seam |
-| EP all-to-all | ✅ DeepEP already integrated (DSv4) | not abstracted into `Communicator::all_to_all` |
-| KvPool | ❌ concrete `PagedKVPool` type held directly by scheduler | extract `KvPool` trait (L0.2, seam ~14 methods already mapped) |
-| BackendExecutor | ❌ fused into `ModelForward` 50 methods | split a narrow seam (L0.3) |
-| Backend-agnostic scheduler | ❌ `scheduler/cuda/` + standalone `MetalScheduler` | merge into one (L1+L2) |
-| DP-attention (MoE) | ❌ | required for Qwen3.6-MoE, new axis |
-| PP microbatch | ❌ | reference `scheduler_pp_mixin` |
-| disagg P/D | ❌ | long-term (Dynamo layer) |
+**What exists now (branch `arch/ideal-inference-engine`):**
 
-**Adoption priority (continuing backend-seam-redesign's L sequence, by ROI):**
-1. **L0.1 ForwardPlan normalization** — CUDA directly produces `LogicalServePlan` (like Metal), removing the `StepPlan` round-trip +
-   `unified_scheduler` flag. Self-contained, already approved by you.
-2. **L0.3 split the god-trait** — `BackendExecutor`/`Sampler`/`Communicator` (LayerComm promoted)/`KvPool`
-   carved out of `ModelForward`; overlap rewritten as an explicit future-buffer contract (aligned with SGLang `FutureMap`).
-3. **L1+L2 merge the scheduler** — `scheduler/cuda`→`scheduler/`, generic `<B:BackendExecutor,K:KvPool>`,
-   removing `MetalScheduler`. **ARLE has one scheduler from then on.**
-4. **DP-attention + EP** wired into Communicator/topology as MoE parallel axes (Qwen3.6 benefits directly).
-5. **L3 HIP** to validate the abstraction; **disagg** long-term.
+| New crate | LOC | Status |
+|---|--:|---|
+| `infer-plan` (ForwardPlan/StepOutput/SamplingParams) | 180 | ✅ |
+| `infer-seam` (BackendExecutor/KvPool + hypothesis contracts) | 235 | ✅ proven seam; rest hypothesis (§4.3) |
+| `infer-core` (device-neutral scheduler/radix/overlap) | 2.1k | ✅ 18 CPU tests; **replaces 18.3k `scheduler/cuda` + the separate Metal scheduler** |
+| `infer-metal` (real MLX Qwen forward) | 3.2k | ✅ **shipped** — 4-config bit-identical parity, 195.5 tok/s, TTFT 6→3, peak RSS 444 MiB |
+| `infer-cuda` (clean BF16 Qwen forward) | 1.78k | ✅ local check+clippy green; **GPU parity pending-remote** (pod infra, not code) |
+| `infer-models` / `infer-server` | 0.66k | skeleton / in-flight facade |
+
+**The kernel-library lesson (the most expensive miss — encode it).** Port effort is set by the kernel
+library's **abstraction level**, *not* the backend name. MLX exposes a **high-level** `qwen35_compiled`
+forward → `infer-metal` ports thin (3.2k). `cuda-kernels` exposes only **low-level** ops (bare
+attention/gemm/moe) → the CUDA forward orchestration is irreducible and had to be **written clean**
+(deletion-refactor: a 25.6k coupled closure → 1.78k single canonical BF16 path), not wrapped. The original
+"R2: wrap CUDA, not one kernel line changes" assumption was wrong because it ignored this.
+
+**Honest framing (no self-deception).** `167k → 8.2k` is **misleading** — the new stack is incomplete (no
+HTTP server, single CUDA BF16 path, partial model coverage). Cite the *fair, same-functionality* numbers:
+scheduler **18.3k → 2.1k** (one device-neutral scheduler vs CUDA-welded + separate Metal); CUDA forward
+**25.6k → 1.78k**; new-stack clone density **7.88%**. See
+[`../experience/wins/2026-06-03-rewrite-unified-bench-report.md`](../experience/wins/2026-06-03-rewrite-unified-bench-report.md).
+
+**Remaining (real, sequenced):**
+1. **CUDA GPU parity** — open correctness gate; blocked on pod toolchain/network infra (use `RUSTUP_TOOLCHAIN=1.92.0` to skip the 1.95.0 download; sync repo + oniond model). Unblock recipe in the unified report.
+2. **R5 cutover** — serving facade (OpenAI v1 over new `ServeHandle`, in flight) → flip 4 shallow consumers (`cli`/`agent`/`train`; `arle` bin has zero `infer::` refs) → delete `infer/src`. Final delete gated on (1). Consumer surface compiler-probe-verified: only `server_engine` + `sampler` + `hf_hub`.
+3. **DP-attention + EP** (Qwen3.6-MoE), **PP microbatch**, **HIP** (validates abstraction), **disagg** — all post-cutover.
 
 ---
 
@@ -247,6 +269,68 @@ static-shape graph; KV as a first-class citizen; DP/TP/EP/PP composed orthogonal
 
 ---
 
+## 8. Module-design review against elegant-systems standards (2026-06-03, code-grounded)
+
+**Standard applied** (Ousterhout, *A Philosophy of Software Design*): a module is good when it is
+**deep** — a **narrow interface** hiding a **deep implementation**. Interface width = cognitive load +
+information leakage. Plus classic cohesion (one reason to change per module) / low coupling. The test
+isn't "is it split into crates" — it's "is each boundary narrow and does it hide its internals."
+
+### Boundary clarity — clean cross-crate, two interface-width problems
+
+| Contract | Width | Verdict |
+|---|---|---|
+| `BackendExecutor` (submit/poll/warmup) | 3 methods | **deep ✓** — a narrow interface over the *entire* MLX/CUDA forward. The model boundary; the rewrite's best module. |
+| `KvPool` | **19 methods** | **too wide / leaky ✗** — exposes pages/epochs/retain/release/attach/detached/migrate. `infer-core`'s radix cache drives the page-level ops (`retain_pages`/`attach_pages`/`page_indices_for_token_range`, lib.rs:638-870) → paging mechanics leak into the scheduler. |
+| `Communicator` (all_reduce/all_to_all/send_recv) | 3 methods | **right idea, wrong shape** — flat, no process-group / device-mesh; can't express TP×EP×PP composition (real NCCL keeps *hierarchical* communicators per parallel dimension). |
+
+**Fix 1 — split `KvPool` by cohesion into two narrow traits.** `KvAllocator`
+(`alloc`/`free_slot`/`seq_len`/`free_pages`/`free_tokens` — what the scheduler needs for admission) and
+`KvPrefixStore` (`page_indices`/`attach`/`retain`/`release`/`detached` — what the radix cache needs).
+Page-id vocabulary is intrinsic to a *host-side* radix cache, but isolating it stops the scheduler from
+seeing paging internals. Drop `migrate` until KV tiering has a real caller (currently unused = speculative).
+
+### Internal cohesion — `infer-cuda` mixes 4 concerns in one 1315-line file
+
+`infer-cuda/src/model.rs` holds the forward (`CudaModel`/blocks), op wrappers
+(`gemm_batch`/`rms_norm`/`*_attention`/`silu_mul`), the safetensors loader, and KV paging (`PageMeta`).
+`infer-metal` already splits these (config/loader/mlx/qwen35/weights). **Fix 2:** split `model.rs` →
+`model.rs` (forward) + `ops.rs` (kernel-call wrappers) + `loader.rs` (safetensors) + `kv.rs` (paging),
+matching `infer-metal` + the flat-module convention. Same numerics, four cohesive files.
+
+### Multi-card + communication — where each parallelism axis lands
+
+| Axis | Where it lives | Seam fit |
+|---|---|---|
+| **TP** (tensor) | `all_reduce` inside the model forward, **below the executor seam**; executor owns the rank group | ✓ scheduler stays device/rank-neutral — the deep-module property pays off |
+| **EP** (expert/MoE) | `all_to_all` dispatch/combine inside the MoE layer, **below the seam** (DeepEP-class) | ✓ hidden in the executor |
+| **DP** (data) | **above the `Engine`** — N `Engine` instances + a router in `infer-server` | ✓ the `Engine` is the DP unit |
+| **PP** (pipeline) | microbatches across stages + `send_recv` at boundaries | ✗ **the one real gap** |
+
+**The single multi-card gap is PP.** TP/EP hide cleanly *below* the executor (adding them changes executor
+internals, not the scheduler — exactly what the deep seam buys); DP sits *above* the `Engine`. PP is the
+exception: the single `inflight: Option` + single executor can't express pipeline stages
+(`microbatch: Option<u32>` is an unwired hook). PP needs the **core** to keep ≥2 in-flight microbatches in a
+small ring and the executor to be stage-aware. Defer until a model needs PP — but that single-inflight
+assumption is what to revisit then. **Fix 3 (when PP lands):** in-flight ring + stage-tagged plan;
+**Fix 4:** `Communicator` carries a process-group / device-mesh before TP×EP×PP compose.
+
+### Sampling — the abstraction that's currently *non-functional* for real workflows
+
+`ForwardPlan` carries **no `SamplingParams`**; both executors hardcode `argmax`; the `Sampler` trait is
+wired nowhere. The system can only greedy-decode → it cannot run a real agent at temperature>0 / with
+stop sequences. **Fix 0 (highest priority, bites the c=1 north-star itself):** thread per-row
+`SamplingParams` through `ForwardPlan`, executor calls `Sampler` (temp==0 → argmax fast-path preserves
+parity). This is a prerequisite for the serving facade and the cutover.
+
+### Priority (pre-cutover hygiene, by north-star bite)
+
+0. **Sampling** (Fix 0) — only gap that breaks the actual agent workflow. Do first.
+1. **Split `KvPool`** (Fix 1) + **split `infer-cuda/model.rs`** (Fix 2) — interface-width + cohesion; cheap, before more callers depend on the wide shapes.
+2. **PP ring + `Communicator` mesh** (Fix 3/4) — defer to when a model needs PP; record the single-inflight assumption as the revisit point.
+
+---
+
 ## Sources and method
 
 - **SGLang** `sgl-project/sglang@3e681d7` (from source): `base_attn_backend.py` (24 attn backends,
@@ -261,6 +345,11 @@ static-shape graph; KV as a first-class citizen; DP/TP/EP/PP composed orthogonal
   KVBM, NIXL point-to-point KV movement), NIXL background: <https://www.spheron.network/blog/nvidia-nixl-disaggregated-inference-guide/>.
 - TRT-LLM / DeepSpeed-FastGen / Mooncake / LMDeploy / TGI / llama.cpp / MLC-LLM: architectural knowledge,
   **hypothesis-grade**, not read source-by-source.
+
+**§8 module-design standards:** Ousterhout, *A Philosophy of Software Design* (deep modules / narrow
+interface / information hiding / cohesion). Multi-card: vLLM & SGLang distributed docs (per-rank engine,
+Megatron TP, DP-as-separate-engine), NCCL hierarchical-communicator + DeepEP/EP-API papers
+(arxiv 2603.13606) for the process-group/mesh shape.
 
 **Discipline (skill requirement):** the above survey is hypothesis-grade; before landing any L step in ARLE, license-or-kill with local
 `bench_guidellm` + `greedy_consistency` + nsys on the binding SLO shape.
