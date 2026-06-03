@@ -806,6 +806,11 @@ impl ModelForward for DeepseekModel {
                         "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); SGLang-path native DeepEP needs explicit attention/MoE owner-group communicator mapping before it is comparable"
                     ));
                 }
+                "owner-groups-token-sync-ready" => {
+                    missing.push(format!(
+                        "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); owner-group token sync NCCL is attached but attention-DP/CP and MoE owner-group collectives are not fully wired"
+                    ));
+                }
                 _ => {
                     missing.push(format!(
                         "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); owner-group axes are declared but attention-DP/CP token-sync collectives are not wired"
