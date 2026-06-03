@@ -1,0 +1,52 @@
+[package]
+name = "infer-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Public `InferenceEngine` adapter over the rewrite stack (infer-core Engine +
+# infer-server ServeHandle + infer-plan SamplingParams). Exposes the SAME public
+# contract the legacy `infer::server_engine` provides so agent/cli/train can
+# later swap `infer` -> `infer-api` with zero code changes. This crate is
+# additive: it does not migrate any consumer.
+
+[dependencies]
+anyhow = "1.0"
+fastrace = { version = "0.7.16", features = ["enable"] }
+infer-core = { path = "../infer-core" }
+infer-plan = { path = "../infer-plan", features = ["serde"] }
+infer-seam = { path = "../infer-seam" }
+infer-server = { path = "../infer-server" }
+serde = { workspace = true }
+tokio = { version = "1", features = ["sync", "rt"] }
+
+infer-metal = { path = "../infer-metal", default-features = false, optional = true }
+infer-cuda = { path = "../infer-cuda", default-features = false, optional = true }
+
+[features]
+# No backend defaulted, mirroring the legacy `infer` crate: callers pick one.
+#   --features cuda            Linux + NVIDIA
+#   --features metal,no-cuda   Apple Silicon
+#   --features cpu,no-cuda     portable smoke / CI
+default = []
+# CUDA backend (structurally wired; the real forward is Phase-0 / lead-owned).
+cuda = ["dep:infer-cuda", "infer-cuda/cuda"]
+# Marker feature for builds without a CUDA toolchain (macOS, dev CI).
+no-cuda = ["infer-cuda?/no-cuda"]
+# Metal backend via infer-metal (Apple Silicon).
+metal = ["dep:infer-metal", "infer-metal/metal", "infer-server/metal"]
+# Portable CPU backend: drives the engine over infer-metal's feature-free
+# host KV pool + the placeholder MetalExecutor (no MLX, no CUDA). Used for
+# smoke / CI and the adapter integration test.
+cpu = ["dep:infer-metal"]
+
+[dev-dependencies]
+infer-core = { path = "../infer-core" }
+infer-metal = { path = "../infer-metal", default-features = false }
+infer-server = { path = "../infer-server" }
+tempfile = "3"
+tokenizers = { workspace = true }
+
+[lints]
+workspace = true

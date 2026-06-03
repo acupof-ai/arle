@@ -1859,6 +1859,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-api"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "fastrace",
+ "infer-core",
+ "infer-cuda",
+ "infer-metal",
+ "infer-plan",
+ "infer-seam",
+ "infer-server",
+ "serde",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+]
+
+[[package]]
 name = "infer-core"
 version = "0.1.5"
 dependencies = [
