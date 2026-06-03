@@ -370,11 +370,12 @@ impl LayerCommunicator {
         if self.dp_world_size == 1 && self.cp_world_size == 1 {
             return true;
         }
-
-        // Attention-DP/CP subgroup construction is necessary but not sufficient:
-        // the DSv4 SGLang path still needs the forward path and graph replay
-        // contract to consume those groups before this label can pass.
-        false
+        // Runtime owner-group collectives are ready once request token sync,
+        // attention subgroups, EP NCCL, and NativeDeepEP transport are all
+        // present. CUDA graph capture/replay is a separate startup contract
+        // blocker; do not hide a ready runtime transport behind that graph
+        // work.
+        self.owner_group_moe_transport_ready()
     }
 
     pub fn owner_group_moe_transport_ready(&self) -> bool {
