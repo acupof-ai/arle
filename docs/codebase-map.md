@@ -30,6 +30,17 @@ what each crate owns, and where to start reading. For ownership boundaries
 and crate-admission governance see [architecture.md](architecture.md);
 support status by surface lives in [support-matrix.md](support-matrix.md).
 
+> **2026-06-03 — two trees coexist (branch `arch/ideal-inference-engine`).**
+> The shipped product is still legacy `infer/` (Sections 2–3 below). A
+> greenfield rewrite — the `crates/infer-*` device-neutral crate graph — is
+> being built beside it as the *target* stack and is **pending the R5 cutover**
+> (legacy `infer/` is deleted only then, gated on CUDA GPU parity). The new
+> crates are mapped in [§7 New-stack crate map](#7-new-stack-crate-map-rewrite-pending-cutover).
+> Legacy paths in Sections 2–3 are accurate but **pending-cutover**. Source of
+> truth for the rewrite: architecture.md §New Architecture +
+> [`projects/2026-06-03-ideal-inference-engine-architecture.md`](projects/2026-06-03-ideal-inference-engine-architecture.md)
+> §6.
+
 ## 1. Workspace at a glance
 
 The repository has four practical layers:
@@ -49,7 +60,7 @@ Current workspace members (ownership and boundaries are listed in
 [architecture.md §Package Boundaries](architecture.md#package-boundaries)):
 
 - workspace root package
-- `infer`
+- `infer` (legacy runtime; pending-cutover)
 - `crates/cuda-kernels`
 - `crates/mlx-sys`
 - `crates/agent`
@@ -60,6 +71,11 @@ Current workspace members (ownership and boundaries are listed in
 - `crates/autograd`
 - `crates/train`
 - `crates/kv-native-sys`
+- `crates/deepep-sys`
+- **rewrite stack (target, pending-cutover):** `crates/infer-plan`,
+  `crates/infer-seam`, `crates/infer-core`, `crates/infer-metal`,
+  `crates/infer-cuda`, `crates/infer-models`, `crates/infer-server`
+  — see [§7](#7-new-stack-crate-map-rewrite-pending-cutover)
 
 ## 2. Main execution paths
 
@@ -290,3 +306,70 @@ infer
   `infer/src/scheduler/cuda/`
 - Agent CLI path: `src/main.rs` → `crates/cli/src/lib.rs` →
   `infer/src/server_engine.rs` → `crates/agent/src/lib.rs`
+
+## 7. New-stack crate map (rewrite, pending-cutover)
+
+> Branch `arch/ideal-inference-engine`. This is the *target* architecture
+> built beside legacy `infer/`, **not yet the shipped product**. It is wired
+> through but partially proven: the Metal forward is shipped + bit-identical;
+> the CUDA forward is refactored with GPU parity **pending-remote**; the HTTP
+> facade is in flight; `infer-models` is a skeleton. Legacy `infer/` (Sections
+> 2–3) stays authoritative until the R5 cutover deletes it. Crate boundaries +
+> status table: [architecture.md §New Architecture](architecture.md#new-architecture-rewrite-target).
+
+### Crate roles and dependency direction
+
+```text
+infer-plan      data IR only (ForwardPlan / ForwardMode / SamplingParams / StepOutput / sample_token)
+   ▲
+infer-seam      host-only trait seam (BackendExecutor, KvPool=KvQuery+KvAllocator+KvPrefixStore;
+   │              Communicator/Sampler/GraphRunner/ModelArch/ResourceGovernor = hypothesis, undriven)
+   ▲
+infer-core      device-neutral Engine<E,K> + scheduler + radix prefix + overlap (no backend dep)
+   ▲                         ▲
+infer-metal              infer-cuda
+   ▲                         ▲
+infer-server    ServeHandle<E,K> engine thread + OpenAI/axum HTTP facade
+                (depends on infer-core + infer-metal + infer-plan + infer-seam;
+                 infer-cuda is NOT yet a dependency — CUDA executor not wired into the facade)
+```
+
+### Where the new-stack files live
+
+- `crates/infer-plan/src/{lib.rs,sample.rs}`: the `ForwardPlan` data contract +
+  pure host `sample_token` (temp/top-k/top-p/min-p, deterministic by
+  `(seed,position)`).
+- `crates/infer-seam/src/{lib.rs,kv.rs,kv_query.rs,allocator.rs,prefix_store.rs}`:
+  the trait seam. `BackendExecutor` (submit/poll/warmup) + the three-way
+  `KvPool` split are proven; `Communicator`/`Sampler`/`GraphRunner`/`ModelArch`/`ResourceGovernor`
+  in `lib.rs` are defined but undriven (hypothesis-grade).
+- `crates/infer-core/src/{lib.rs,planner.rs,prefix.rs,radix.rs}`: the one
+  device-neutral scheduler. `lib.rs` holds `Engine<E,K>` + `SchedulerConfig`
+  (the cold coordinator + in-file tests); the hot axes are extracted to
+  `planner.rs` (scheduling) and `prefix.rs`/`radix.rs` (prefix cache).
+- `crates/infer-metal/src/{executor.rs,kv_pool.rs,qwen35.rs,mlx.rs,loader.rs,weights.rs,config.rs,model_source.rs,wired_limit.rs}`:
+  real MLX Qwen3.5/3.6 forward as a thin seam impl. `qwen35.rs` is the stable
+  C++ bridge (split deferred until FFI churn justifies it).
+- `crates/infer-cuda/src/{model.rs,attention.rs,ops.rs,loader.rs,executor.rs}`:
+  clean BF16 dense-Qwen3 forward over `cuda-kernels`. `model.rs` = forward,
+  `ops.rs`/`attention.rs` = the two perf hotspots, `loader.rs` = safetensors,
+  `executor.rs` = the `BackendExecutor` impl. No TP/EP/quant/DSv4 here.
+- `crates/infer-server/src/{lib.rs,execution.rs,http.rs,tokenizer.rs,schema.rs}`:
+  `ServeHandle` engine loop (`lib.rs`/`execution.rs`) vs the fixed OpenAI wire
+  schema (`http.rs`/`schema.rs`). Metal wired via the `metal` feature; non-Metal
+  builds fall back to an `EchoExecutor`.
+- `crates/infer-models/src/lib.rs`: skeleton home for device-neutral
+  `ModelArch` definitions; not yet driven.
+
+### Where to start reading the new stack
+
+- Data contract first: `crates/infer-plan/src/lib.rs` (`ForwardPlan` /
+  `ForwardMode`) — every layer speaks this.
+- The seam: `crates/infer-seam/src/lib.rs` (`BackendExecutor`) +
+  `crates/infer-seam/src/kv.rs` (the `KvPool` split).
+- The scheduler: `crates/infer-core/src/lib.rs` (`Engine<E,K>`), then
+  `planner.rs`.
+- A real backend end-to-end: `crates/infer-metal/src/executor.rs` (shipped,
+  parity-verified) — the cleanest example of a thin seam impl.
+- Serving: `crates/infer-server/src/lib.rs` (`ServeHandle::spawn` / `submit` /
+  `collect`).
