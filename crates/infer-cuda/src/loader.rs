@@ -23,13 +23,45 @@ const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 
 impl CudaModel {
     pub(crate) fn from_safetensors(model_path: &Path) -> Result<Self> {
+        // Resolve tensor-parallel placement from the environment (TP-1). On a
+        // single GPU this is `world_size == 1`, the no-op communicator, and the
+        // full (unsharded) weight load — byte-identical to the pre-TP path.
+        let tp = build_tp_runtime()?;
+        Self::from_safetensors_with_tp(model_path, tp)
+    }
+
+    /// Load with an explicit [`crate::tp::TpRuntime`] (the env path threads its
+    /// resolved runtime through here; tests can inject a single-GPU runtime).
+    pub(crate) fn from_safetensors_with_tp(
+        model_path: &Path,
+        tp: crate::tp::TpRuntime,
+    ) -> Result<Self> {
         let config = Qwen3Config::from_json_file(model_path.join("config.json"))
             .with_context(|| format!("load Qwen3 config from {}", model_path.display()))?;
         validate_clean_bf16_config(&config)?;
 
+        let tp_cfg = *tp.config();
+        // Per-rank head counts (GQA-aware). `head_shard` errors unless both head
+        // counts divide the world size, which keeps every rank's attention shape
+        // uniform — the precondition the kv8 TileLang kernels and the all-reduce
+        // both rely on.
+        let (local_q_heads, local_kv_heads) = if tp_cfg.is_single() {
+            (config.num_attention_heads, config.num_key_value_heads)
+        } else {
+            infer_topo::head_shard(
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                &tp_cfg,
+            )
+            .map_err(|e| anyhow!("TP head shard failed: {e}"))?
+        };
+
         let ctx = DeviceContext::new()?;
         let loader = SafetensorLoader::new(model_path)?;
 
+        // lm_head / embed_tokens stay REPLICATED across ranks (v1 design: avoids an
+        // all-gather of logits; the final gemv runs the full vocab projection on
+        // each rank). Only the per-layer Q/K/V/O and MLP projections are sharded.
         let embed_tokens = loader.load_matrix(&ctx, config.embed_tokens_tensor_name())?;
         let lm_head = if config.tie_word_embeddings {
             None
@@ -37,24 +69,90 @@ impl CudaModel {
             Some(loader.load_matrix(&ctx, config.lm_head_tensor_name())?)
         };
 
+        let head_dim = config.head_dim;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
             let names = config.layer_tensor_names(layer_idx);
+            let (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj) =
+                if tp_cfg.is_single() {
+                    // Single GPU: full tensors, identical to the pre-TP path.
+                    (
+                        loader.load_matrix(&ctx, &names.q_proj)?,
+                        loader.load_matrix(&ctx, &names.k_proj)?,
+                        loader.load_matrix(&ctx, &names.v_proj)?,
+                        loader.load_matrix(&ctx, &names.o_proj)?,
+                        loader.load_matrix(&ctx, &names.mlp_gate_proj)?,
+                        loader.load_matrix(&ctx, &names.mlp_up_proj)?,
+                        loader.load_matrix(&ctx, &names.mlp_down_proj)?,
+                    )
+                } else {
+                    // TP: Q/K/V are column-parallel but must split on whole-head
+                    // boundaries (head-aligned), so the o_proj input shard and the
+                    // attention head count agree. gate/up are plain column-parallel
+                    // (intermediate dim); o_proj/down_proj are row-parallel.
+                    (
+                        loader.load_qkv_head_sharded(
+                            &ctx,
+                            &names.q_proj,
+                            local_q_heads,
+                            head_dim,
+                            &tp_cfg,
+                        )?,
+                        loader.load_qkv_head_sharded(
+                            &ctx,
+                            &names.k_proj,
+                            local_kv_heads,
+                            head_dim,
+                            &tp_cfg,
+                        )?,
+                        loader.load_qkv_head_sharded(
+                            &ctx,
+                            &names.v_proj,
+                            local_kv_heads,
+                            head_dim,
+                            &tp_cfg,
+                        )?,
+                        loader.load_matrix_sharded(
+                            &ctx,
+                            &names.o_proj,
+                            infer_topo::ParallelLinearKind::Row,
+                            &tp_cfg,
+                        )?,
+                        loader.load_matrix_sharded(
+                            &ctx,
+                            &names.mlp_gate_proj,
+                            infer_topo::ParallelLinearKind::Column,
+                            &tp_cfg,
+                        )?,
+                        loader.load_matrix_sharded(
+                            &ctx,
+                            &names.mlp_up_proj,
+                            infer_topo::ParallelLinearKind::Column,
+                            &tp_cfg,
+                        )?,
+                        loader.load_matrix_sharded(
+                            &ctx,
+                            &names.mlp_down_proj,
+                            infer_topo::ParallelLinearKind::Row,
+                            &tp_cfg,
+                        )?,
+                    )
+                };
             layers.push(TransformerBlock {
                 input_layernorm: loader.load_vec(&ctx, &names.input_layernorm)?,
                 attention: Attention {
-                    q_proj: loader.load_matrix(&ctx, &names.q_proj)?,
-                    k_proj: loader.load_matrix(&ctx, &names.k_proj)?,
-                    v_proj: loader.load_matrix(&ctx, &names.v_proj)?,
-                    o_proj: loader.load_matrix(&ctx, &names.o_proj)?,
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
                     q_norm: loader.load_vec(&ctx, &names.q_norm)?,
                     k_norm: loader.load_vec(&ctx, &names.k_norm)?,
                 },
                 post_attention_layernorm: loader.load_vec(&ctx, &names.post_attention_layernorm)?,
                 mlp: Mlp {
-                    gate_proj: loader.load_matrix(&ctx, &names.mlp_gate_proj)?,
-                    up_proj: loader.load_matrix(&ctx, &names.mlp_up_proj)?,
-                    down_proj: loader.load_matrix(&ctx, &names.mlp_down_proj)?,
+                    gate_proj,
+                    up_proj,
+                    down_proj,
                 },
             });
         }
@@ -82,8 +180,55 @@ impl CudaModel {
             norm,
             cos_cache,
             sin_cache,
+            tp,
+            local_q_heads,
+            local_kv_heads,
         })
     }
+}
+
+/// Build the tensor-parallel runtime for model load.
+///
+/// On a multi-rank `nccl` build the launcher hands the NCCL `unique_id` in via
+/// the `INFER_NCCL_UNIQUE_ID` env var (128 hex-encoded bytes — the launcher reads
+/// it from `ncclGetUniqueId` on rank 0 and broadcasts it over its own transport;
+/// see [`crate::tp::TpRuntime::from_env_with_nccl`]). Without that var, or on a
+/// non-`nccl`/single-GPU build, this is the no-op single runtime.
+fn build_tp_runtime() -> Result<crate::tp::TpRuntime> {
+    #[cfg(feature = "nccl")]
+    {
+        let cfg = crate::tp::resolve_tp_config_from_env().map_err(|e| anyhow!("{e}"))?;
+        if !cfg.is_single() {
+            let unique_id = nccl_unique_id_from_env()?;
+            return crate::tp::TpRuntime::from_env_with_nccl(unique_id);
+        }
+    }
+    crate::tp::TpRuntime::from_env().map_err(|e| anyhow!("{e}"))
+}
+
+/// Decode the launcher-supplied NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID`
+/// (128 lowercase-hex-encoded bytes, i.e. a 256-char string).
+#[cfg(feature = "nccl")]
+fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclUniqueId> {
+    let hex = std::env::var("INFER_NCCL_UNIQUE_ID").map_err(|_| {
+        anyhow!(
+            "multi-rank TP requires INFER_NCCL_UNIQUE_ID (128 hex-encoded bytes \
+             from the launcher's ncclGetUniqueId broadcast)"
+        )
+    })?;
+    let hex = hex.trim();
+    ensure!(
+        hex.len() == 256,
+        "INFER_NCCL_UNIQUE_ID must be 256 hex chars (128 bytes), got {}",
+        hex.len()
+    );
+    let mut internal = [0i8; 128];
+    for (i, slot) in internal.iter_mut().enumerate() {
+        let byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .with_context(|| format!("INFER_NCCL_UNIQUE_ID bad hex at byte {i}"))?;
+        *slot = byte as i8;
+    }
+    Ok(cuda_kernels::ffi::nccl::ncclUniqueId { internal })
 }
 
 pub(crate) fn validate_clean_bf16_config(config: &Qwen3Config) -> Result<()> {
@@ -268,7 +413,6 @@ impl SafetensorLoader {
     ///
     /// On a single-GPU [`TpConfig`] this is the identity slice — same bytes as
     /// [`Self::load_matrix`].
-    #[allow(dead_code)]
     fn load_matrix_sharded(
         &self,
         ctx: &DeviceContext,
@@ -308,6 +452,61 @@ impl SafetensorLoader {
         };
         DeviceMatrix::from_safetensors(ctx, &sharded.bytes, sharded.rows, sharded.cols)
             .with_context(|| format!("upload sharded tensor {name}"))
+    }
+
+    /// Load a head-aligned column-parallel Q/K/V projection for this TP rank.
+    ///
+    /// Q/K/V are column-parallel (the output dim = `num_heads * head_dim` is
+    /// split), but the split MUST land on whole-head boundaries so the per-rank
+    /// attention head count, the o_proj input shard, and the kernel's RoPE/RMSNorm
+    /// all agree. A plain [`infer_topo::column_shard`] on the raw output dim would
+    /// dump the GQA remainder onto the last rank mid-head; instead we shard the
+    /// HEAD dimension (`head_shard`, already done by the caller) and convert to a
+    /// row [`ShardingSpec`] of `local_heads * head_dim` rows at the matching offset.
+    ///
+    /// `local_heads` is this rank's head count from [`infer_topo::head_shard`];
+    /// since `head_shard` requires the global head count to divide the world size,
+    /// every rank owns exactly `local_heads` and the offset is `rank * local_heads`.
+    fn load_qkv_head_sharded(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        local_heads: usize,
+        head_dim: usize,
+        tp: &infer_topo::TpConfig,
+    ) -> Result<DeviceMatrix> {
+        const BF16_ELEM_SIZE: usize = 2;
+        let tensor = self.load_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D BF16 tensor, got shape {:?}",
+            tensor.shape
+        );
+        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+        let total_rows = rows;
+        let local_rows = local_heads * head_dim;
+        let offset = tp.rank * local_rows;
+        ensure!(
+            offset + local_rows <= total_rows,
+            "{name}: head shard [{offset}, {}) exceeds rows {total_rows} \
+             (local_heads={local_heads}, head_dim={head_dim}, rank={})",
+            offset + local_rows,
+            tp.rank
+        );
+        let spec = infer_topo::ShardingSpec {
+            offset,
+            size: local_rows,
+            total: total_rows,
+        };
+        let sharded = crate::shard_slice::shard_column_parallel(
+            &tensor.bytes,
+            rows,
+            cols,
+            BF16_ELEM_SIZE,
+            &spec,
+        )?;
+        DeviceMatrix::from_safetensors(ctx, &sharded.bytes, sharded.rows, sharded.cols)
+            .with_context(|| format!("upload head-sharded tensor {name}"))
     }
 
     /// Load this EP rank's per-expert MoE weight stacks for one layer
