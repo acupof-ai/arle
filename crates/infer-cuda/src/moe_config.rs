@@ -221,6 +221,25 @@ mod tests {
     }
 
     #[test]
+    fn expert_split_dsv4_256_experts_ep8_owns_32_per_rank() {
+        // DSv4-Flash: 256 routed experts over EP=8 → 32 experts/rank, contiguous.
+        let mut covered = 0;
+        for ep_rank in 0..8 {
+            let s = ExpertSplit::new(256, 8, ep_rank).unwrap();
+            assert_eq!(s.experts_per_rank, 32, "rank {ep_rank} owns 256/8");
+            assert_eq!(s.local_expert_start, ep_rank * 32);
+            assert_eq!(s.local_expert_end(), ep_rank * 32 + 32);
+            assert!(s.owns(ep_rank * 32) && s.owns(ep_rank * 32 + 31));
+            assert!(!s.owns(ep_rank * 32 + 32)); // next rank's first expert
+            covered += s.experts_per_rank;
+        }
+        assert_eq!(
+            covered, 256,
+            "all 256 experts owned exactly once across EP=8"
+        );
+    }
+
+    #[test]
     fn expert_split_rejects_indivisible_and_bad_rank() {
         assert!(ExpertSplit::new(10, 4, 0).is_err()); // 10 not divisible by 4
         assert!(ExpertSplit::new(8, 0, 0).is_err()); // ep_size 0
