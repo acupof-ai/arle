@@ -149,11 +149,13 @@ impl CudaModel {
                     k_norm: loader.load_vec(&ctx, &names.k_norm)?,
                 },
                 post_attention_layernorm: loader.load_vec(&ctx, &names.post_attention_layernorm)?,
-                mlp: Mlp {
+                mlp: Some(Mlp {
                     gate_proj,
                     up_proj,
                     down_proj,
-                },
+                }),
+                // Dense Qwen3 path: no MoE layer (keeps the forward byte-identical).
+                moe: None,
             });
         }
         let norm = loader.load_vec(&ctx, config.norm_tensor_name())?;
@@ -183,6 +185,180 @@ impl CudaModel {
             tp,
             local_q_heads,
             local_kv_heads,
+            // Dense Qwen3 checkpoint — no MoE router.
+            moe_config: None,
+        })
+    }
+
+    /// Load a single-GPU BF16 Qwen3.5/3.6 **MoE** checkpoint (MoE-4).
+    ///
+    /// Single-GPU only (`world_size == 1`, all experts local). Dense layers
+    /// (`mlp_only_layers`, or any layer where [`Qwen35Config::is_moe_layer`] is
+    /// false) load the classic SwiGLU MLP; sparse layers load their per-expert
+    /// gate/up/down stacks + router + shared expert via
+    /// [`SafetensorLoader::load_moe_layer_experts`] and run [`crate::moe::moe_forward`].
+    ///
+    /// Scope gates (errored on, not silently mis-loaded — these are the lead's
+    /// pod-side follow-ups that need the real model to verify):
+    /// - **non-gated full-attention only.** Qwen3.5/3.6 ship a per-head sigmoid
+    ///   gate on `q_proj` (`full_attn_gated`); the clean CUDA attention kernels
+    ///   here are the vanilla-Qwen3 (ungated) shape. A gated checkpoint errors.
+    /// - **full-attention layers only.** Hybrid linear-attention (Gated DeltaNet)
+    ///   layers are not wired into the clean CUDA attention path yet.
+    /// - **`head_dim == 128`, `kv_heads == 8`** (the TileLang HD128/kv8 kernels).
+    ///
+    /// The model's `config` is a numeric [`Qwen3Config`] mirror (the forward only
+    /// reads numeric fields + the resolved weights, never re-derives tensor
+    /// names), so the ungated full-attention forward is shared with the dense
+    /// path verbatim.
+    pub(crate) fn from_qwen35_moe_safetensors(model_path: &Path) -> Result<Self> {
+        let tp = build_tp_runtime()?;
+        let tp_cfg = *tp.config();
+        ensure!(
+            tp_cfg.is_single(),
+            "from_qwen35_moe_safetensors is single-GPU only (all experts local); \
+             got world_size {}",
+            tp_cfg.world_size
+        );
+
+        let m = qwen35_spec::Qwen35Config::from_model_dir(model_path)
+            .map_err(|e| anyhow!("load Qwen3.5 MoE config from {}: {e}", model_path.display()))?;
+        ensure!(
+            m.is_moe(),
+            "from_qwen35_moe_safetensors requires a MoE checkpoint (num_experts > 0)"
+        );
+        ensure!(
+            !m.full_attn_gated,
+            "Qwen3.5/3.6 gated full-attention (q_proj per-head sigmoid gate) is not yet \
+             wired into the clean CUDA attention path; needs the gated-q kernel (pod follow-up)"
+        );
+        ensure!(
+            m.layer_types
+                .iter()
+                .all(|&t| t == qwen35_spec::LayerType::FullAttention),
+            "hybrid linear-attention layers are not yet wired into the clean CUDA path \
+             (pod follow-up); this loader handles full-attention MoE only"
+        );
+        ensure!(
+            m.head_dim == 128 && m.num_key_value_heads == 8,
+            "clean CUDA MoE path only wires TileLang HD128/kv8 kernels, got head_dim={} kv_heads={}",
+            m.head_dim,
+            m.num_key_value_heads
+        );
+
+        // Router description shared with the CPU reference + every sparse layer.
+        let moe_config = crate::moe_config::moe_config_from_qwen35(&m)?;
+        let split = crate::moe_config::ExpertSplit::single(m.num_experts);
+
+        // `qwen3_spec` and `qwen35_spec` define DISTINCT `RopeScalingConfig`
+        // types; there is no numeric bridge yet. qwen35-spec's parser does not
+        // populate rope_scaling today (Phase 1a leaves it `None`), so the mirror
+        // below is exact. Error loudly if that ever changes rather than silently
+        // dropping the scaling (which would corrupt long-context RoPE).
+        ensure!(
+            m.rope_scaling.is_none(),
+            "Qwen3.5 rope_scaling is set but the qwen3↔qwen35 RopeScalingConfig bridge \
+             is not wired; refusing to silently drop it (pod follow-up)"
+        );
+
+        // Numeric Qwen3Config mirror for the model's `config` field. Tensor names
+        // are NOT derived from this (the loader resolves Qwen3.5 names directly);
+        // only the numeric forward fields matter.
+        let config = Qwen3Config {
+            hidden_size: m.hidden_size,
+            intermediate_size: m.intermediate_size,
+            num_hidden_layers: m.num_hidden_layers,
+            num_attention_heads: m.num_attention_heads,
+            num_key_value_heads: m.num_key_value_heads,
+            head_dim: m.head_dim,
+            vocab_size: m.vocab_size,
+            rms_norm_eps: m.rms_norm_eps,
+            rope_theta: m.rope_theta,
+            rope_scaling: None,
+            tie_word_embeddings: m.tie_word_embeddings,
+            max_position_embeddings: m.rope_cache_len_hint.unwrap_or(DEFAULT_ROPE_CACHE_LEN),
+        };
+        validate_clean_bf16_config(&config)?;
+
+        let ctx = DeviceContext::new()?;
+        let loader = SafetensorLoader::new(model_path)?;
+
+        let embed_tokens = loader.load_matrix(&ctx, m.embed_tokens_tensor_name())?;
+        let lm_head = if m.tie_word_embeddings {
+            None
+        } else {
+            Some(loader.load_matrix(&ctx, m.lm_head_tensor_name())?)
+        };
+
+        let mut layers = Vec::with_capacity(m.num_hidden_layers);
+        for layer_idx in 0..m.num_hidden_layers {
+            let names = m.layer_tensor_names(layer_idx);
+            let attn = match &names.attention {
+                qwen35_spec::Qwen35AttentionTensorNames::Full(full) => full,
+                qwen35_spec::Qwen35AttentionTensorNames::Linear(_) => {
+                    // Guarded above; defensive.
+                    return Err(anyhow!("unexpected linear-attention layer {layer_idx}"));
+                }
+            };
+            let attention = Attention {
+                q_proj: loader.load_matrix(&ctx, &attn.q_proj)?,
+                k_proj: loader.load_matrix(&ctx, &attn.k_proj)?,
+                v_proj: loader.load_matrix(&ctx, &attn.v_proj)?,
+                o_proj: loader.load_matrix(&ctx, &attn.o_proj)?,
+                q_norm: loader.load_vec(&ctx, &attn.q_norm)?,
+                k_norm: loader.load_vec(&ctx, &attn.k_norm)?,
+            };
+
+            let (mlp, moe) = if m.is_moe_layer(layer_idx) {
+                let moe =
+                    loader.load_moe_layer_experts(&ctx, &names.common.layer_prefix, &split)?;
+                (None, Some(moe))
+            } else {
+                let mlp = Mlp {
+                    gate_proj: loader.load_matrix(&ctx, &names.common.mlp_gate_proj)?,
+                    up_proj: loader.load_matrix(&ctx, &names.common.mlp_up_proj)?,
+                    down_proj: loader.load_matrix(&ctx, &names.common.mlp_down_proj)?,
+                };
+                (Some(mlp), None)
+            };
+
+            layers.push(TransformerBlock {
+                input_layernorm: loader.load_vec(&ctx, &names.common.input_layernorm)?,
+                attention,
+                post_attention_layernorm: loader
+                    .load_vec(&ctx, &names.common.post_attention_layernorm)?,
+                mlp,
+                moe,
+            });
+        }
+        let norm = loader.load_vec(&ctx, m.norm_tensor_name())?;
+
+        let rope_len = m
+            .rope_cache_len_hint()
+            .unwrap_or(DEFAULT_ROPE_CACHE_LEN)
+            .max(DEFAULT_ROPE_CACHE_LEN);
+        let (cos_cache, sin_cache) = precompute_rope(
+            &ctx,
+            config.head_dim,
+            rope_len,
+            config.rope_theta,
+            config.rope_scaling.as_ref(),
+        )?;
+        ctx.sync()?;
+
+        Ok(Self {
+            ctx,
+            config,
+            embed_tokens,
+            lm_head,
+            layers,
+            norm,
+            cos_cache,
+            sin_cache,
+            tp,
+            local_q_heads: m.num_attention_heads,
+            local_kv_heads: m.num_key_value_heads,
+            moe_config: Some(moe_config),
         })
     }
 }
@@ -522,8 +698,7 @@ impl SafetensorLoader {
     /// range is `split.local_expert_start .. split.local_expert_end()`, which is
     /// the contiguous slice the EP group from [`infer_topo::build_moe_ep_groups`]
     /// assigns to this rank.
-    #[allow(dead_code)]
-    fn load_moe_layer_experts(
+    pub(crate) fn load_moe_layer_experts(
         &self,
         ctx: &DeviceContext,
         layer_prefix: &str,
@@ -632,18 +807,18 @@ struct OwnedTensor {
 /// [`DeviceMatrix`] per owned expert), their device-resident weight-pointer
 /// tables for the grouped GEMM, the router gate, and the single shared expert
 /// (gate/up/down + its sigmoid gate). Built by
-/// [`SafetensorLoader::load_moe_layer_experts`].
-#[allow(dead_code)]
-struct MoeLayerWeights {
-    gate: Vec<DeviceMatrix>,
-    up: Vec<DeviceMatrix>,
-    down: Vec<DeviceMatrix>,
-    gate_ptrs: CudaSlice<u64>,
-    up_ptrs: CudaSlice<u64>,
-    down_ptrs: CudaSlice<u64>,
-    router_gate: DeviceMatrix,
-    shared_gate: DeviceMatrix,
-    shared_up: DeviceMatrix,
-    shared_down: DeviceMatrix,
-    shared_gate_router: DeviceMatrix,
+/// [`SafetensorLoader::load_moe_layer_experts`] and consumed by
+/// [`crate::moe::moe_forward`].
+pub(crate) struct MoeLayerWeights {
+    pub(crate) gate: Vec<DeviceMatrix>,
+    pub(crate) up: Vec<DeviceMatrix>,
+    pub(crate) down: Vec<DeviceMatrix>,
+    pub(crate) gate_ptrs: CudaSlice<u64>,
+    pub(crate) up_ptrs: CudaSlice<u64>,
+    pub(crate) down_ptrs: CudaSlice<u64>,
+    pub(crate) router_gate: DeviceMatrix,
+    pub(crate) shared_gate: DeviceMatrix,
+    pub(crate) shared_up: DeviceMatrix,
+    pub(crate) shared_down: DeviceMatrix,
+    pub(crate) shared_gate_router: DeviceMatrix,
 }
