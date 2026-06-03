@@ -1047,3 +1047,78 @@ mod tests {
         run_bench(&model_dir, "Qwen3-0.6B BF16");
     }
 }
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod r3a_clean_metal_parity_tests {
+    use std::path::Path;
+
+    use anyhow::Result;
+    use infer_plan::{ForwardMode, ForwardPlan, PrefillRow};
+    use infer_seam::{BackendExecutor, KvPool, PollResult};
+
+    use super::MetalBackend;
+    use crate::backend::InferenceBackend;
+    use crate::sampler::SamplingParams;
+
+    const DEFAULT_R3A_MODEL: &str = "mlx-community/Qwen3.5-0.8B-MLX-4bit";
+
+    #[test]
+    #[ignore = "requires Apple Silicon Metal + Qwen3.5-0.8B MLX weights"]
+    fn r3a_single_row_prefill_first_token_matches_legacy_metal_backend() -> Result<()> {
+        let model =
+            std::env::var("R3A_METAL_TEST_MODEL").unwrap_or_else(|_| DEFAULT_R3A_MODEL.to_string());
+        let prompt = "The capital of France is";
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_k: 1,
+            ignore_eos: true,
+            max_new_tokens: Some(1),
+            ..Default::default()
+        };
+
+        let mut legacy = MetalBackend::new();
+        legacy.load(Path::new(&model))?;
+        let prompt_ids = legacy.tokenize(prompt)?;
+        let mut legacy_tokens = Vec::new();
+        let legacy_result =
+            legacy.generate_from_token_ids_with_callback(&prompt_ids, &params, |token| {
+                legacy_tokens.push(token);
+                Ok(())
+            })?;
+        assert_eq!(
+            legacy_result.completion_tokens, 1,
+            "legacy run should emit exactly one token"
+        );
+        let legacy_token = *legacy_tokens
+            .first()
+            .expect("legacy callback must capture first token");
+        drop(legacy);
+
+        let mut executor = infer_metal::MetalExecutor::from_model_path(&model)?;
+        let mut kv = infer_metal::MetalKvPool::new(1, 4096, 16);
+        kv.alloc(0, prompt_ids.len())?;
+        let plan = ForwardPlan {
+            mode: ForwardMode::Prefill,
+            decode_rows: Vec::new(),
+            prefill_rows: vec![PrefillRow {
+                slot: 0,
+                tokens: prompt_ids.clone(),
+                start_pos: 0,
+                total_tokens: prompt_ids.len(),
+            }],
+            microbatch: None,
+            spec: None,
+        };
+
+        let inflight = executor.submit(&plan, &mut kv)?;
+        let output = match executor.poll(inflight)? {
+            PollResult::Ready(output) => output,
+            PollResult::NotReady(_) => panic!("R3a MetalExecutor should resolve synchronously"),
+        };
+        assert_eq!(output.tokens.len(), 1);
+        let new_token = output.tokens[0].token;
+        eprintln!("R3a Metal parity token ids: legacy={legacy_token} new={new_token}");
+        assert_eq!(new_token, legacy_token);
+        Ok(())
+    }
+}
