@@ -173,6 +173,33 @@ fn dsv4_sqrtsoftplus_matches_oracle() {
     );
 }
 
+/// The `MoeConfig::dsv4` constructor wires the DSv4 router fields and routes
+/// identically to the hand-built `dsv4_cfg` fixture (sqrtsoftplus + noaux_tc +
+/// bias-driven selection, config scaling, no grouping).
+#[test]
+fn dsv4_constructor_matches_fixture_and_routes() {
+    let cfg = MoeConfig::dsv4(
+        /*num_experts=*/ 6, /*num_shared_experts=*/ 1, /*top_k=*/ 4,
+        /*routed_scaling_factor=*/ 1.5, /*hidden_size=*/ 16,
+    );
+    assert_eq!(cfg.scoring_func, ScoringFunc::SqrtSoftplus);
+    assert_eq!(cfg.topk_method, TopkMethod::NoAuxTc);
+    assert_eq!(cfg.num_shared_experts, 1);
+    assert_eq!(cfg.routed_scaling_factor, 1.5);
+    assert!(cfg.n_group.is_none() && cfg.topk_group.is_none());
+    cfg.validate().unwrap();
+
+    // Routes identically to the fixture + oracle for a biased top-k selection.
+    let logits = [0.7, 3.1, -2.0, 1.1, 0.0, 25.0];
+    let bias = [0.1, -0.2, 0.0, 0.05, 0.0, 0.0];
+    let (oid, ow) = dsv4_oracle(&logits, &bias, ScoringFunc::SqrtSoftplus, 4, 1.5);
+    let dec = route_token(&logits, &bias, &cfg).unwrap();
+    assert_eq!(dec.expert_ids(), oid, "ctor selection matches oracle");
+    for (i, (&w, &o)) in dec.weights().iter().zip(ow.iter()).enumerate() {
+        assert_close(w, o, &format!("ctor weight[{i}]"));
+    }
+}
+
 /// DSv4 softmax path does NOT renormalize the top-k in the router (denom=1.0),
 /// even though `norm_topk_prob = true` — the renorm is a Qwen-only step. This is
 /// the faithful legacy behavior (`v4.rs:386` normalize = scoring != softmax).

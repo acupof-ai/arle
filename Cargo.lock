@@ -1893,6 +1893,8 @@ dependencies = [
  "anyhow",
  "cuda-kernels",
  "cudarc",
+ "deepep-sys",
+ "deepseek-spec",
  "half",
  "infer-moe",
  "infer-plan",

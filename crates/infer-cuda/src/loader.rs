@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool};
 use cudarc::driver::CudaSlice;
 use qwen3_spec::Qwen3Config;
@@ -352,7 +352,7 @@ fn build_tp_runtime() -> Result<crate::tp::TpRuntime> {
 /// Decode the NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID` (128 hex bytes = 256
 /// chars).
 #[cfg(feature = "nccl")]
-fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclUniqueId> {
+pub(crate) fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclUniqueId> {
     let hex = std::env::var("INFER_NCCL_UNIQUE_ID").map_err(|_| {
         anyhow!(
             "multi-rank TP requires INFER_NCCL_UNIQUE_ID (128 hex-encoded bytes \
@@ -450,7 +450,7 @@ impl PageMeta {
     }
 }
 
-struct SafetensorLoader {
+pub(crate) struct SafetensorLoader {
     base: PathBuf,
     shards: Vec<PathBuf>,
     weight_map: HashMap<String, usize>,
@@ -460,7 +460,7 @@ struct SafetensorLoader {
 }
 
 impl SafetensorLoader {
-    fn new(base: &Path) -> Result<Self> {
+    pub(crate) fn new(base: &Path) -> Result<Self> {
         let index_path = base.join("model.safetensors.index.json");
         if index_path.exists() {
             let content = fs::read_to_string(&index_path)
@@ -703,11 +703,22 @@ impl SafetensorLoader {
     }
 
     fn load_tensor_from_shard(&self, idx: usize, name: &str) -> Result<OwnedTensor> {
+        let tensor = self.load_raw_from_shard(idx, name)?;
+        ensure!(
+            tensor.dtype == Dtype::BF16,
+            "{name}: R6 clean CUDA path accepts BF16 only, got {:?}",
+            tensor.dtype
+        );
+        Ok(tensor)
+    }
+
+    /// Dtype-agnostic shard read (DSv4 FP8/FP4/E8M0). Same read-once cache as the
+    /// BF16 path; the typed gate lives in the callers.
+    fn load_raw_from_shard(&self, idx: usize, name: &str) -> Result<OwnedTensor> {
         let path = self
             .shards
             .get(idx)
             .ok_or_else(|| anyhow!("shard index {idx} out of range"))?;
-        // Read each shard at most once (views below are zero-copy over the bytes).
         if !self.shard_cache.borrow().contains_key(&idx) {
             let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
             self.shard_cache.borrow_mut().insert(idx, bytes);
@@ -719,14 +730,223 @@ impl SafetensorLoader {
         let view = tensors
             .tensor(name)
             .with_context(|| format!("find tensor {name} in {}", path.display()))?;
-        ensure!(
-            view.dtype() == Dtype::BF16,
-            "{name}: R6 clean CUDA path accepts BF16 only, got {:?}",
-            view.dtype()
-        );
         Ok(OwnedTensor {
             shape: view.shape().to_vec(),
             bytes: view.data().to_vec(),
+            dtype: view.dtype(),
+        })
+    }
+}
+
+// DSv4 FP8/FP4 + E8M0 loaders. Loader-only milestone: reachable from
+// `Dsv4Model::from_dsv4_fp8_safetensors`, which the executor enum branch wires
+// with the Piece 2/3 forward (see `feedback_necessity_not_callers`).
+#[allow(dead_code)]
+impl SafetensorLoader {
+    fn load_raw_tensor(&self, name: &str) -> Result<OwnedTensor> {
+        if let Some(&idx) = self.weight_map.get(name) {
+            return self.load_raw_from_shard(idx, name);
+        }
+        for idx in 0..self.shards.len() {
+            if let Ok(tensor) = self.load_raw_from_shard(idx, name) {
+                return Ok(tensor);
+            }
+        }
+        Err(anyhow!(
+            "tensor {name} not found in safetensors under {}",
+            self.base.display()
+        ))
+    }
+
+    /// Load a DSv4 BF16 1D norm/bias vector (q_norm, kv_norm, attn_sink, layer
+    /// norms, gate bias). DSv4 keeps these small tensors in BF16.
+    pub(crate) fn load_dsv4_vec(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
+        let tensor = self.load_raw_tensor(name)?;
+        ensure!(
+            tensor.dtype == Dtype::BF16,
+            "{name}: DSv4 1D tensor expected BF16, got {:?}",
+            tensor.dtype
+        );
+        ensure!(
+            tensor.shape.len() == 1,
+            "{name}: expected 1D tensor, got shape {:?}",
+            tensor.shape
+        );
+        DeviceVec::from_safetensors(ctx, &tensor.bytes)
+            .with_context(|| format!("upload DSv4 vec {name}"))
+    }
+
+    /// Load a DSv4 BF16 2D matrix (the router gate — the only non-FP8 2D weight).
+    pub(crate) fn load_dsv4_bf16_matrix(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+    ) -> Result<DeviceMatrix> {
+        let tensor = self.load_raw_tensor(name)?;
+        ensure!(
+            tensor.dtype == Dtype::BF16,
+            "{name}: DSv4 router gate expected BF16, got {:?}",
+            tensor.dtype
+        );
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D tensor, got shape {:?}",
+            tensor.shape
+        );
+        DeviceMatrix::from_safetensors(ctx, &tensor.bytes, tensor.shape[0], tensor.shape[1])
+            .with_context(|| format!("upload DSv4 gate {name}"))
+    }
+
+    /// Load a DSv4 block-scaled FP8 (`F8_E4M3`) or packed FP4 (`I8`) `<name>` plus
+    /// its sibling `<prefix>.scale` (`F8_E8M0`) into a [`DeviceMatrix`]. The whole
+    /// tensor is loaded (EP rank selection happens by expert index in the caller;
+    /// TP weight sharding is Piece 4). Returns the block-scaled `DeviceMatrix` the
+    /// shared `Dsv4Fp8DeepGemmWeightCache` consumes.
+    pub(crate) fn load_dsv4_block_scaled(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+    ) -> Result<DeviceMatrix> {
+        let tensor = self.load_raw_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D quantized tensor, got shape {:?}",
+            tensor.shape
+        );
+        let scale_name = name
+            .strip_suffix(".weight")
+            .map(|prefix| format!("{prefix}.scale"))
+            .ok_or_else(|| anyhow!("{name}: quantized DSv4 tensor must end with .weight"))?;
+        let scale = self.load_raw_tensor(&scale_name)?;
+        ensure!(
+            scale.dtype == Dtype::F8_E8M0,
+            "{scale_name}: expected F8_E8M0 block scale, got {:?}",
+            scale.dtype
+        );
+        ensure!(
+            scale.shape.len() == 2,
+            "{scale_name}: expected 2D scale, got shape {:?}",
+            scale.shape
+        );
+        let (scale_rows, scale_cols) = (scale.shape[0], scale.shape[1]);
+
+        match tensor.dtype {
+            Dtype::F8_E4M3 => {
+                let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+                DeviceMatrix::from_dsv4_fp8_block_scaled(
+                    ctx,
+                    &tensor.bytes,
+                    &scale.bytes,
+                    rows,
+                    cols,
+                    scale_rows,
+                    scale_cols,
+                )
+                .with_context(|| format!("upload DSv4 FP8 matrix {name}"))
+            }
+            // FP4 E2M1 is row-major, 2 nibbles per byte → logical_cols = 2 * bytes.
+            Dtype::I8 => {
+                let (rows, packed_cols) = (tensor.shape[0], tensor.shape[1]);
+                let logical_cols = packed_cols * 2;
+                DeviceMatrix::from_dsv4_fp4_block_scaled(
+                    ctx,
+                    &tensor.bytes,
+                    &scale.bytes,
+                    rows,
+                    logical_cols,
+                    scale_rows,
+                    scale_cols,
+                )
+                .with_context(|| format!("upload DSv4 FP4 matrix {name}"))
+            }
+            other => bail!("{name}: unsupported DSv4 block-scaled dtype {other:?}"),
+        }
+    }
+
+    /// Build the per-rank DSv4 MoE layer (FP8 DeepGEMM expert caches + router).
+    pub(crate) fn load_dsv4_moe_layer(
+        &self,
+        ctx: &DeviceContext,
+        names: &deepseek_spec::DeepSeekV4MoeTensorNames,
+        split: &crate::moe_config::ExpertSplit,
+    ) -> Result<crate::dsv4::Dsv4MoeLayer> {
+        use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
+
+        let mut w13 = Vec::with_capacity(split.experts_per_rank);
+        let mut w2 = Vec::with_capacity(split.experts_per_rank);
+        for e in split.local_expert_start..split.local_expert_end() {
+            let expert = names.expert(e);
+            // w1 (gate) over w3 (up), row-stacked into one fused FP8 cache so the
+            // masked grouped GEMM produces [gate | up] in a single launch.
+            let w1 = self.load_dsv4_block_scaled(ctx, &expert.w1)?;
+            let w3 = self.load_dsv4_block_scaled(ctx, &expert.w3)?;
+            w13.push(Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_pair_rows(
+                ctx, &w1, &w3,
+            )?);
+            let down = self.load_dsv4_block_scaled(ctx, &expert.w2)?;
+            w2.push(Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &down)?);
+        }
+
+        let gate = self.load_dsv4_bf16_matrix(ctx, &names.gate_weight)?;
+        let gate_bias_name = names
+            .gate_bias
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 bias-routed MoE layer missing gate.bias"))?;
+        let gate_bias = self.load_dsv4_vec(ctx, gate_bias_name)?;
+
+        let shared = names
+            .shared_experts
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 expects an always-on shared expert"))?;
+        let shared_w1 = self.load_dsv4_block_scaled(ctx, &shared.w1)?;
+        let shared_w3 = self.load_dsv4_block_scaled(ctx, &shared.w3)?;
+        let shared_w13 =
+            Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_pair_rows(ctx, &shared_w1, &shared_w3)?;
+        let shared_down = self.load_dsv4_block_scaled(ctx, &shared.w2)?;
+        let shared_w2 = Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &shared_down)?;
+
+        Ok(crate::dsv4::Dsv4MoeLayer {
+            w13,
+            w2,
+            gate,
+            gate_bias,
+            shared_w13,
+            shared_w2,
+        })
+    }
+
+    /// Load a DSv4 2D matrix dispatching on its on-disk dtype: BF16 →
+    /// `from_safetensors`, F8_E4M3/I8 → block-scaled. Used for embed/head, which
+    /// DSv4 checkpoints may ship in either precision.
+    pub(crate) fn load_dsv4_global_matrix(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+    ) -> Result<DeviceMatrix> {
+        let dtype = self.load_raw_tensor(name)?.dtype;
+        match dtype {
+            Dtype::BF16 => self.load_dsv4_bf16_matrix(ctx, name),
+            Dtype::F8_E4M3 | Dtype::I8 => self.load_dsv4_block_scaled(ctx, name),
+            other => bail!("{name}: unsupported DSv4 global matrix dtype {other:?}"),
+        }
+    }
+
+    /// Build one DSv4 MLA attention block (SW-mode FP8 LoRA weights). CSA/HCA
+    /// compressor + indexer weights are Piece 2.
+    pub(crate) fn load_dsv4_attention(
+        &self,
+        ctx: &DeviceContext,
+        names: &deepseek_spec::DeepSeekV4AttentionTensorNames,
+    ) -> Result<crate::dsv4::Dsv4Attention> {
+        Ok(crate::dsv4::Dsv4Attention {
+            wq_a: self.load_dsv4_block_scaled(ctx, &names.wq_a)?,
+            q_norm: self.load_dsv4_vec(ctx, &names.q_norm)?,
+            wq_b: self.load_dsv4_block_scaled(ctx, &names.wq_b)?,
+            wkv: self.load_dsv4_block_scaled(ctx, &names.wkv)?,
+            kv_norm: self.load_dsv4_vec(ctx, &names.kv_norm)?,
+            wo_a: self.load_dsv4_block_scaled(ctx, &names.wo_a)?,
+            wo_b: self.load_dsv4_block_scaled(ctx, &names.wo_b)?,
+            attn_sink: self.load_dsv4_vec(ctx, &names.attn_sink)?,
         })
     }
 }
@@ -739,6 +959,7 @@ struct SafetensorIndex {
 struct OwnedTensor {
     shape: Vec<usize>,
     bytes: Vec<u8>,
+    dtype: Dtype,
 }
 
 /// This EP rank's loaded MoE weights for one sparse layer: per-expert

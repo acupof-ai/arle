@@ -126,6 +126,34 @@ impl MoeConfig {
         }
     }
 
+    /// DeepSeek-V4 router config: `sqrtsoftplus` scoring, `noaux_tc` top-k
+    /// (selection bias is a runtime gate tensor, not a config field), config
+    /// `routed_scaling_factor`, `n_shared_experts` always-on. DSv4-Flash ships
+    /// no group-limited routing, so `n_group`/`topk_group` stay `None`.
+    #[must_use]
+    pub fn dsv4(
+        num_experts: usize,
+        num_shared_experts: usize,
+        top_k: usize,
+        routed_scaling_factor: f32,
+        hidden_size: usize,
+    ) -> Self {
+        Self {
+            num_experts,
+            num_shared_experts,
+            top_k,
+            scoring_func: ScoringFunc::SqrtSoftplus,
+            topk_method: TopkMethod::NoAuxTc,
+            // sqrtsoftplus always normalizes the selected weights; the flag is
+            // documentary for this path (see route.rs `normalize` derivation).
+            norm_topk_prob: true,
+            routed_scaling_factor,
+            n_group: None,
+            topk_group: None,
+            hidden_size,
+        }
+    }
+
     /// Whether at least one always-on shared expert runs for every token.
     #[must_use]
     pub fn has_shared_expert(&self) -> bool {
