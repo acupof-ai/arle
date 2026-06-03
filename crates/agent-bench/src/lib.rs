@@ -13,6 +13,8 @@
 //! produces the real on-device agent-workflow + OS-impact report (G3 of the
 //! rewrite verification targets).
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -21,6 +23,90 @@ use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
 
 pub use infer_metal::MetalKvPool;
+
+// ---------------------------------------------------------------------------
+// OS-impact probe
+// ---------------------------------------------------------------------------
+
+/// OS-impact accounting for a workflow run.
+///
+/// On the EchoExecutor (scheduler-only) path this stays all-zero — there is no
+/// device memory pressure or foreground-responsiveness cost to attribute. On a
+/// real-backend run a probe ([`PeakMemProbe`]) fills these in so the north-star
+/// report can answer "did serving this agent workflow degrade the AI-PC?".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OsImpactReport {
+    /// Number of times the probe was sampled (once per turn).
+    pub samples: u64,
+    /// Peak resident set size observed across samples, in bytes.
+    pub peak_rss_bytes: u64,
+}
+
+/// A pluggable sampler of OS-level impact, driven once per workflow turn.
+///
+/// `sample` is called by [`run_agent_workflow`] after each turn completes;
+/// `report` is folded into [`WorkflowMetrics`] at the end. The trait is
+/// deliberately tiny so the scheduler-layer bench can run with a zero-cost
+/// [`NoopProbe`] while a real-backend harness swaps in [`PeakMemProbe`].
+pub trait OsImpactProbe {
+    /// Take one OS-impact sample (called once per turn).
+    fn sample(&mut self);
+    /// Summarize all samples taken so far.
+    fn report(&self) -> OsImpactReport;
+}
+
+/// Default probe: records nothing. Used for EchoExecutor / scheduler-layer runs
+/// where there is no device memory or responsiveness cost to attribute.
+#[derive(Debug, Default)]
+pub struct NoopProbe;
+
+impl OsImpactProbe for NoopProbe {
+    fn sample(&mut self) {}
+    fn report(&self) -> OsImpactReport {
+        OsImpactReport::default()
+    }
+}
+
+/// Real-backend OS-impact probe.
+///
+/// Counts samples today and is the seam for the on-device north-star metric.
+///
+/// TODO(R3): on real-backend runs, sample peak resident set size (e.g. via
+/// `task_info`/`mach_task_basic_info` `resident_size_max` on macOS, or
+/// `/proc/self/status` `VmHWM` on Linux) and a foreground-responsiveness proxy
+/// (main-thread / UI-tick stall while the engine is decoding). Until R3 lands a
+/// real MLX forward there is no device memory pressure to measure, so this stub
+/// only tracks `samples` and leaves `peak_rss_bytes` at 0 — wiring the platform
+/// syscall is the only remaining work, the seam is already threaded.
+#[derive(Debug, Default)]
+pub struct PeakMemProbe {
+    samples: u64,
+    peak_rss_bytes: u64,
+}
+
+impl PeakMemProbe {
+    /// Build a fresh peak-memory probe.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl OsImpactProbe for PeakMemProbe {
+    fn sample(&mut self) {
+        self.samples += 1;
+        // TODO(R3): read this process's peak RSS here and fold it into
+        // `self.peak_rss_bytes` via `.max(..)`. No-op until a real backend
+        // makes the number meaningful.
+    }
+
+    fn report(&self) -> OsImpactReport {
+        OsImpactReport {
+            samples: self.samples,
+            peak_rss_bytes: self.peak_rss_bytes,
+        }
+    }
+}
 
 /// Deterministic, synchronous executor for scheduler-layer benchmarking.
 ///
@@ -97,7 +183,9 @@ impl AgentWorkflow {
         }
     }
 
-    fn total_user_tokens(&self) -> usize {
+    /// Total user-message tokens across all turns.
+    #[must_use]
+    pub fn total_user_tokens(&self) -> usize {
         self.turns.iter().map(|t| t.user_tokens.len()).sum()
     }
 }
@@ -109,6 +197,11 @@ pub struct TurnMetric {
     pub prompt_len: usize,
     pub generated: usize,
     pub ticks: u64,
+    /// Time-to-first-token, measured in `engine.step()` calls: the number of
+    /// ticks from submitting this turn's request until it first holds a
+    /// generated token (i.e. prefill completed and decode produced token #1).
+    /// `0` means no token was ever generated for this turn.
+    pub ticks_to_first_token: u64,
     pub wall: Duration,
 }
 
@@ -119,6 +212,9 @@ pub struct WorkflowMetrics {
     pub total_wall: Duration,
     pub total_generated: usize,
     pub total_ticks: u64,
+    /// OS-level impact folded from the [`OsImpactProbe`] (all-zero for
+    /// EchoExecutor / scheduler-only runs).
+    pub os_impact: OsImpactReport,
 }
 
 impl WorkflowMetrics {
@@ -129,16 +225,151 @@ impl WorkflowMetrics {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TTFT observation
+// ---------------------------------------------------------------------------
+
+/// Shared, single-threaded observation cell for [`TtftObserver`].
+///
+/// The bench keeps a clone of this handle so it can drive the per-step tick and
+/// read back the first-token tick without an `Engine::executor_mut` accessor
+/// (engine-core exposes none, and this crate may not add one).
+#[derive(Debug, Default, Clone)]
+pub struct TtftHandle(Rc<RefCell<TtftState>>);
+
+#[derive(Debug, Default)]
+struct TtftState {
+    /// Tick the bench is currently on (1-based; set before each `step()`).
+    current_tick: u64,
+    /// Tick at which the first generated token first exists, once observed.
+    first_token_tick: Option<u64>,
+}
+
+impl TtftHandle {
+    fn set_tick(&self, tick: u64) {
+        self.0.borrow_mut().current_tick = tick;
+    }
+
+    fn reset_turn(&self) {
+        let mut s = self.0.borrow_mut();
+        s.current_tick = 0;
+        s.first_token_tick = None;
+    }
+
+    fn take_first_token_tick(&self) -> u64 {
+        self.0.borrow_mut().first_token_tick.take().unwrap_or(0)
+    }
+
+    fn note_first_token(&self) {
+        let mut s = self.0.borrow_mut();
+        if s.first_token_tick.is_none() {
+            // Token is committed when this plan's output is applied, which is at
+            // the top of the *next* step — so it first exists one tick later.
+            s.first_token_tick = Some(s.current_tick + 1);
+        }
+    }
+
+    fn observed(&self) -> bool {
+        self.0.borrow().first_token_tick.is_some()
+    }
+}
+
+/// Executor wrapper that observes per-request time-to-first-token in scheduler
+/// ticks, without reaching into engine-core internals.
+///
+/// The engine commits a request's **first** generated token exactly when its
+/// final prefill chunk lands (the chunk whose `start_pos + tokens.len()` reaches
+/// `total_tokens`) or, after that, on any decode row. That fact is visible in
+/// the [`ForwardPlan`] the engine hands the executor on `submit`. The bench tags
+/// each tick via the shared [`TtftHandle`]; the first plan that will commit a
+/// token records `tick + 1` — the token is applied at the *start* of the
+/// following `step()`, so it first exists one tick later.
+///
+/// This is correct for the single-request-per-turn drive regardless of how many
+/// chunked-prefill steps or poll-drain (`NotReady`) ticks the wrapped backend
+/// inserts, because it keys off the plan content, not a tick count.
+#[derive(Debug)]
+pub struct TtftObserver<E> {
+    inner: E,
+    handle: TtftHandle,
+}
+
+impl<E> TtftObserver<E> {
+    /// Wrap a backend executor for TTFT observation, returning the executor and
+    /// a shared [`TtftHandle`] the bench drives.
+    pub fn new(inner: E) -> (Self, TtftHandle) {
+        let handle = TtftHandle::default();
+        (
+            Self {
+                inner,
+                handle: handle.clone(),
+            },
+            handle,
+        )
+    }
+
+    /// Whether `plan` commits the request's first generated token: any decode
+    /// row (already past first token), or a final prefill chunk.
+    fn plan_commits_first_token(plan: &ForwardPlan) -> bool {
+        if !plan.decode_rows.is_empty() {
+            return true;
+        }
+        plan.prefill_rows
+            .iter()
+            .any(|row| row.start_pos + row.tokens.len() >= row.total_tokens)
+    }
+}
+
+impl<E: BackendExecutor> BackendExecutor for TtftObserver<E> {
+    type Inflight = E::Inflight;
+
+    fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+        if !self.handle.observed() && Self::plan_commits_first_token(plan) {
+            self.handle.note_first_token();
+        }
+        self.inner.submit(plan, kv)
+    }
+
+    fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+        self.inner.poll(inflight)
+    }
+}
+
 /// Drive a single-agent (c=1) workflow turn by turn through `engine`, returning
-/// per-turn and aggregate metrics. The context grows each turn so the engine's
-/// radix cache reuses the shared prefix across turns.
+/// per-turn and aggregate metrics with an all-zero OS-impact report (the
+/// scheduler-layer default). The context grows each turn so the engine's radix
+/// cache reuses the shared prefix across turns.
+///
+/// `engine`'s executor must be a [`TtftObserver`]; pass the [`TtftHandle`] it
+/// returned so per-turn TTFT can be read from the forward plan without
+/// engine-core internals.
 pub fn run_agent_workflow<E, K>(
-    engine: &mut Engine<E, K>,
+    engine: &mut Engine<TtftObserver<E>, K>,
+    ttft: &TtftHandle,
     workflow: &AgentWorkflow,
 ) -> Result<WorkflowMetrics>
 where
     E: BackendExecutor,
     K: KvPool,
+{
+    run_agent_workflow_with_probe(engine, ttft, workflow, &mut NoopProbe)
+}
+
+/// Drive a single-agent (c=1) workflow turn by turn through `engine`, sampling
+/// `probe` once after each turn and folding its report into the result.
+///
+/// For EchoExecutor runs the probe is a [`NoopProbe`] (no OS impact to
+/// attribute); a real-backend harness threads a [`PeakMemProbe`].
+pub fn run_agent_workflow_with_probe<E, K, P>(
+    engine: &mut Engine<TtftObserver<E>, K>,
+    ttft: &TtftHandle,
+    workflow: &AgentWorkflow,
+    probe: &mut P,
+) -> Result<WorkflowMetrics>
+where
+    E: BackendExecutor,
+    K: KvPool,
+    P: OsImpactProbe + ?Sized,
 {
     let mut context: Vec<u32> = workflow.system_tokens.clone();
     let mut turns = Vec::with_capacity(workflow.turns.len());
@@ -151,14 +382,19 @@ where
         prompt.extend_from_slice(&turn.user_tokens);
         let prompt_len = prompt.len();
 
+        ttft.reset_turn();
         let handle = engine.submit_request(prompt, turn.gen_tokens);
         let start = Instant::now();
         let mut ticks = 0u64;
         while !engine.is_idle() {
-            engine.step()?;
             ticks += 1;
+            // Attribute this step's submit to `ticks` so the observer can map
+            // the first-token-committing plan to a tick.
+            ttft.set_tick(ticks);
+            engine.step()?;
         }
         let wall = start.elapsed();
+        let ticks_to_first_token = ttft.take_first_token_tick();
 
         let generated = engine
             .completed(handle)
@@ -177,8 +413,12 @@ where
             prompt_len,
             generated: generated.len(),
             ticks,
+            ticks_to_first_token,
             wall,
         });
+
+        // One OS-impact sample per turn.
+        probe.sample();
     }
 
     Ok(WorkflowMetrics {
@@ -186,27 +426,68 @@ where
         total_wall: total_start.elapsed(),
         total_generated,
         total_ticks,
+        os_impact: probe.report(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Engine constructors
+// ---------------------------------------------------------------------------
+
+/// Build the default (MLX-free) scheduler-layer engine: an [`EchoExecutor`]
+/// wrapped in a [`TtftObserver`], backed by a host-side [`MetalKvPool`].
+///
+/// Returns the engine and the shared [`TtftHandle`] to pass into
+/// [`run_agent_workflow`].
+#[must_use]
+pub fn echo_engine() -> (Engine<TtftObserver<EchoExecutor>, MetalKvPool>, TtftHandle) {
+    let mut config = SchedulerConfig::for_slots(4);
+    config.max_prompt_tokens = 32_768;
+    config.max_total_tokens = 65_536;
+    config.chunked_prefill_size = 512;
+    let (executor, ttft) = TtftObserver::new(EchoExecutor);
+    // page_size 16, 8192 pages -> 131072 token capacity
+    let engine = Engine::with_config(executor, MetalKvPool::new(4, 8192, 16), config);
+    (engine, ttft)
+}
+
+/// Build the REAL Metal (MLX) engine from a model path or HuggingFace id,
+/// wrapping `infer_metal::MetalExecutor` in a [`TtftObserver`] backed by an
+/// `infer_metal::MetalKvPool`. Available only under the `metal` feature; the
+/// default build stays EchoExecutor + MLX-free.
+///
+/// This is the harness entry point for driving the on-device agent workflow
+/// once R3 lands the real MLX generation loop. Returns the engine and the
+/// shared [`TtftHandle`] to pass into [`run_agent_workflow_with_probe`]
+/// together with a [`PeakMemProbe`].
+#[cfg(feature = "metal")]
+#[allow(clippy::type_complexity)]
+pub fn metal_engine_from_model_path(
+    model_path: impl AsRef<std::path::Path>,
+) -> Result<(
+    Engine<TtftObserver<infer_metal::MetalExecutor>, MetalKvPool>,
+    TtftHandle,
+)> {
+    let mut config = SchedulerConfig::for_slots(4);
+    config.max_prompt_tokens = 32_768;
+    config.max_total_tokens = 65_536;
+    config.chunked_prefill_size = 512;
+    let executor = infer_metal::MetalExecutor::from_model_path(model_path)?;
+    let (executor, ttft) = TtftObserver::new(executor);
+    // page_size 16, 8192 pages -> 131072 token capacity
+    let engine = Engine::with_config(executor, MetalKvPool::new(4, 8192, 16), config);
+    Ok((engine, ttft))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn bench_engine() -> Engine<EchoExecutor, MetalKvPool> {
-        let mut config = SchedulerConfig::for_slots(4);
-        config.max_prompt_tokens = 32_768;
-        config.max_total_tokens = 65_536;
-        config.chunked_prefill_size = 512;
-        // page_size 16, 8192 pages -> 131072 token capacity
-        Engine::with_config(EchoExecutor, MetalKvPool::new(4, 8192, 16), config)
-    }
-
     #[test]
     fn agent_workflow_runs_and_grows_context() -> Result<()> {
-        let mut engine = bench_engine();
+        let (mut engine, ttft) = echo_engine();
         let wf = AgentWorkflow::synthetic(64, 3, 8, 4);
-        let m = run_agent_workflow(&mut engine, &wf)?;
+        let m = run_agent_workflow(&mut engine, &ttft, &wf)?;
         assert_eq!(m.turns.len(), 3);
         // Each turn's prompt is longer than the previous (context grows).
         assert!(m.turns[1].prompt_len > m.turns[0].prompt_len);
@@ -218,16 +499,91 @@ mod tests {
     }
 
     #[test]
+    fn ttft_is_observed_and_precedes_decode() -> Result<()> {
+        let (mut engine, ttft) = echo_engine();
+        // Small prompts that fit one prefill chunk (chunked_prefill_size=512).
+        let wf = AgentWorkflow::synthetic(64, 3, 8, 4);
+        let m = run_agent_workflow(&mut engine, &ttft, &wf)?;
+        for t in &m.turns {
+            // A token was produced, so TTFT is a real (non-zero) tick.
+            assert!(
+                t.ticks_to_first_token > 0,
+                "turn {} never observed a first token",
+                t.turn
+            );
+            // First token cannot arrive after the turn finished decoding.
+            assert!(
+                t.ticks_to_first_token <= t.ticks,
+                "turn {} TTFT {} exceeds total ticks {}",
+                t.turn,
+                t.ticks_to_first_token,
+                t.ticks
+            );
+            // With 4 generated tokens, decode adds 3 ticks after first token,
+            // so TTFT is at most ticks - (generated - 1).
+            assert!(
+                t.ticks_to_first_token <= t.ticks - (t.generated as u64 - 1),
+                "turn {} TTFT {} leaves no room for {} decode ticks (total {})",
+                t.turn,
+                t.ticks_to_first_token,
+                t.generated - 1,
+                t.ticks
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ttft_counts_chunked_prefill_steps() -> Result<()> {
+        let (mut engine, ttft) = echo_engine();
+        // System prompt (1024) far exceeds chunked_prefill_size (512), so the
+        // first turn's prefill spans multiple ticks before the first token.
+        let wf = AgentWorkflow::synthetic(1024, 1, 8, 2);
+        let m = run_agent_workflow(&mut engine, &ttft, &wf)?;
+        let t = &m.turns[0];
+        // > 512 prompt tokens => at least 2 prefill ticks before first token.
+        assert!(
+            t.ticks_to_first_token >= 2,
+            "chunked prefill should take >=2 ticks to first token, got {}",
+            t.ticks_to_first_token
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn noop_probe_yields_zero_os_impact() -> Result<()> {
+        let (mut engine, ttft) = echo_engine();
+        let wf = AgentWorkflow::synthetic(64, 3, 8, 4);
+        // Default path uses NoopProbe.
+        let m = run_agent_workflow(&mut engine, &ttft, &wf)?;
+        assert_eq!(m.os_impact, OsImpactReport::default());
+        assert_eq!(m.os_impact.peak_rss_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn probe_is_sampled_once_per_turn() -> Result<()> {
+        let (mut engine, ttft) = echo_engine();
+        let wf = AgentWorkflow::synthetic(64, 5, 8, 4);
+        let mut probe = PeakMemProbe::new();
+        let m = run_agent_workflow_with_probe(&mut engine, &ttft, &wf, &mut probe)?;
+        // One sample per turn folded into the report.
+        assert_eq!(m.os_impact.samples, 5);
+        assert_eq!(m.os_impact.peak_rss_bytes, 0); // stub: no RSS sampling yet
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
     fn bench_agent_workflow_scheduler() -> Result<()> {
         // Representative coding-agent shape: 512-token system prompt, 6 turns,
         // 64-token user msgs, 96-token replies. Context grows each turn.
         let wf = AgentWorkflow::synthetic(512, 6, 64, 96);
-        let mut engine = bench_engine();
-        let m = run_agent_workflow(&mut engine, &wf)?;
+        let (mut engine, ttft) = echo_engine();
+        let m = run_agent_workflow(&mut engine, &ttft, &wf)?;
         eprintln!(
             "[agent-workflow scheduler] turns={} system={} total_user={} total_gen={} \
-             total_wall={:?} total_ticks={} ticks_per_token={:.3}",
+             total_wall={:?} total_ticks={} ticks_per_token={:.3} os_impact={:?}",
             wf.turns.len(),
             wf.system_tokens.len(),
             wf.total_user_tokens(),
@@ -235,11 +591,13 @@ mod tests {
             m.total_wall,
             m.total_ticks,
             m.ticks_per_token(),
+            m.os_impact,
         );
         for t in &m.turns {
             eprintln!(
-                "  turn {} prompt_len={} gen={} ticks={} wall={:?} (per-turn task latency)",
-                t.turn, t.prompt_len, t.generated, t.ticks, t.wall
+                "  turn {} prompt_len={} gen={} ticks={} ttft_ticks={} wall={:?} \
+                 (per-turn task latency)",
+                t.turn, t.prompt_len, t.generated, t.ticks, t.ticks_to_first_token, t.wall
             );
         }
         Ok(())
