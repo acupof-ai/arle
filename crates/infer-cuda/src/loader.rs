@@ -169,6 +169,10 @@ struct SafetensorLoader {
     base: PathBuf,
     shards: Vec<PathBuf>,
     weight_map: HashMap<String, usize>,
+    /// Read-once cache of shard bytes. Without this, loading N tensors re-reads +
+    /// re-deserializes the whole shard file N times — O(N × file_size) I/O, which
+    /// stalls model load for minutes on a multi-hundred-tensor model.
+    shard_cache: std::cell::RefCell<HashMap<usize, Vec<u8>>>,
 }
 
 impl SafetensorLoader {
@@ -198,6 +202,7 @@ impl SafetensorLoader {
                 base: base.to_path_buf(),
                 shards,
                 weight_map,
+                shard_cache: std::cell::RefCell::new(HashMap::new()),
             });
         }
 
@@ -207,6 +212,7 @@ impl SafetensorLoader {
                 base: base.to_path_buf(),
                 shards: vec![single],
                 weight_map: HashMap::new(),
+                shard_cache: std::cell::RefCell::new(HashMap::new()),
             });
         }
 
@@ -225,6 +231,7 @@ impl SafetensorLoader {
             base: base.to_path_buf(),
             shards,
             weight_map: HashMap::new(),
+            shard_cache: std::cell::RefCell::new(HashMap::new()),
         })
     }
 
@@ -270,8 +277,15 @@ impl SafetensorLoader {
             .shards
             .get(idx)
             .ok_or_else(|| anyhow!("shard index {idx} out of range"))?;
-        let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        let tensors = SafeTensors::deserialize(&bytes)
+        // Read each shard at most once (the data views below are zero-copy over
+        // these bytes; re-reading per tensor was O(tensors × file_size)).
+        if !self.shard_cache.borrow().contains_key(&idx) {
+            let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            self.shard_cache.borrow_mut().insert(idx, bytes);
+        }
+        let cache = self.shard_cache.borrow();
+        let bytes = cache.get(&idx).expect("shard bytes just cached");
+        let tensors = SafeTensors::deserialize(bytes)
             .with_context(|| format!("deserialize {}", path.display()))?;
         let view = tensors
             .tensor(name)
