@@ -877,6 +877,10 @@ impl DeepseekBatchDecodeBuffers {
             slot_indices.len()
         );
         let idx = batch_size - 1;
+        if crate::model::in_synthetic_decode_warmup() {
+            body(self)?;
+            return Ok(DeepseekBodyGraphRun::Eager);
+        }
         if !force_eager
             && let Some(entry) = self.body_graph_cache[idx].as_ref()
             && entry.slot_signature == slot_indices

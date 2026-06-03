@@ -240,8 +240,11 @@ impl DeepseekModel {
         );
         // N == 1: per-row path is already optimal unless the request-aware
         // token-owned DSv4 path needs to carry validated row ownership into
-        // NativeDeepEP. The per-row fallback has no request metadata.
-        if tokens.len() < 2 && !native_deepep_token_owned {
+        // NativeDeepEP, or explicit body-graph capture is being validated. The
+        // per-row fallback has no request metadata and cannot reach the DSv4
+        // body graph run site.
+        if tokens.len() < 2 && !native_deepep_token_owned && !dsv4_decode_body_cuda_graph_enabled()?
+        {
             return Ok(false);
         }
         // CPU reference model active → batch method does not replicate it.
@@ -2042,6 +2045,12 @@ impl DeepseekModel {
                 Ok(())
             },
         )?;
+        dsv4_body_graph_debug_run(
+            n,
+            body_graph_enabled,
+            body_graph_force_eager,
+            body_graph_run,
+        );
         if body_graph_run == DeepseekBodyGraphRun::Replayed {
             self.advance_dsv4_decode_graph_replay_metadata(
                 states,
@@ -9921,19 +9930,59 @@ fn dsv4_body_graph_debug_enabled() -> bool {
     })
 }
 
+fn dsv4_body_graph_debug_phase_label() -> &'static str {
+    if crate::model::in_synthetic_decode_warmup() {
+        "synthetic-warmup"
+    } else {
+        "serving-decode"
+    }
+}
+
 fn dsv4_body_graph_debug_reject(reason: String) {
     if !dsv4_body_graph_debug_enabled() {
         return;
     }
+    let phase = dsv4_body_graph_debug_phase_label();
+    let message = format!("{phase}: {reason}");
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     match seen.lock() {
         Ok(mut seen) => {
-            if seen.insert(reason.clone()) {
-                warn!("DSv4 body graph not ready: {reason}");
+            if seen.insert(message) {
+                warn!("DSv4 body graph not ready [{phase}]: {reason}");
             }
         }
-        Err(_) => warn!("DSv4 body graph not ready: {reason}"),
+        Err(_) => warn!("DSv4 body graph not ready [{phase}]: {reason}"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dsv4_body_graph_debug_run(
+    batch_size: usize,
+    body_ready: bool,
+    graph_force_eager: bool,
+    run: DeepseekBodyGraphRun,
+) {
+    if !dsv4_body_graph_debug_enabled() {
+        return;
+    }
+    let phase = dsv4_body_graph_debug_phase_label();
+    let message = format!(
+        "{phase}: B={batch_size} ready={body_ready} force_eager={graph_force_eager} run={run:?}"
+    );
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    match seen.lock() {
+        Ok(mut seen) => {
+            if seen.insert(message) {
+                warn!(
+                    "DSv4 body graph run [{phase}]: B={batch_size} ready={body_ready} force_eager={graph_force_eager} run={run:?}"
+                );
+            }
+        }
+        Err(_) => warn!(
+            "DSv4 body graph run [{phase}]: B={batch_size} ready={body_ready} force_eager={graph_force_eager} run={run:?}"
+        ),
     }
 }
 

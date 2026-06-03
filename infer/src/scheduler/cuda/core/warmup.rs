@@ -411,14 +411,17 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
 
-            if let Err(e) = self.model.forward_decode_batch(
-                tokens,
-                &mut self.states,
-                si,
-                Some(&mut self.paged_kv_pool),
-                decode_ctx,
-                false,
-            ) {
+            let forward_result = crate::model::with_synthetic_decode_warmup_scope(|| {
+                self.model.forward_decode_batch(
+                    tokens,
+                    &mut self.states,
+                    si,
+                    Some(&mut self.paged_kv_pool),
+                    decode_ctx,
+                    false,
+                )
+            });
+            if let Err(e) = forward_result {
                 info!(
                     "Warmup: graph capture for B={} failed ({}), skipping larger sizes",
                     bs, e

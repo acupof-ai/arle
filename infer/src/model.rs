@@ -1,5 +1,7 @@
 //! Model implementations: Qwen3 and Qwen3.5.
 
+use std::cell::Cell;
+
 use anyhow::Result;
 use rand::rngs::StdRng;
 
@@ -34,6 +36,58 @@ pub use qwen35::{
     Qwen35Model, Qwen35RuntimeConfig, Qwen35State, StudentLoraLayer, StudentLoraMatrices,
     StudentLoraUpdate,
 };
+
+thread_local! {
+    static SYNTHETIC_DECODE_WARMUP_DEPTH: Cell<usize> = Cell::new(0);
+}
+
+struct SyntheticDecodeWarmupGuard;
+
+impl SyntheticDecodeWarmupGuard {
+    fn enter() -> Self {
+        SYNTHETIC_DECODE_WARMUP_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_add(1));
+        });
+        Self
+    }
+}
+
+impl Drop for SyntheticDecodeWarmupGuard {
+    fn drop(&mut self) {
+        SYNTHETIC_DECODE_WARMUP_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "synthetic decode warmup scope underflow");
+            depth.set(current.saturating_sub(1));
+        });
+    }
+}
+
+pub(crate) fn with_synthetic_decode_warmup_scope<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = SyntheticDecodeWarmupGuard::enter();
+    f()
+}
+
+pub(crate) fn in_synthetic_decode_warmup() -> bool {
+    SYNTHETIC_DECODE_WARMUP_DEPTH.with(|depth| depth.get() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{in_synthetic_decode_warmup, with_synthetic_decode_warmup_scope};
+
+    #[test]
+    fn synthetic_decode_warmup_scope_is_thread_local_and_nested() {
+        assert!(!in_synthetic_decode_warmup());
+        with_synthetic_decode_warmup_scope(|| {
+            assert!(in_synthetic_decode_warmup());
+            with_synthetic_decode_warmup_scope(|| {
+                assert!(in_synthetic_decode_warmup());
+            });
+            assert!(in_synthetic_decode_warmup());
+        });
+        assert!(!in_synthetic_decode_warmup());
+    }
+}
 
 /// One request worth of prefill work inside a scheduler-planned prefill batch.
 #[derive(Clone, Copy, Debug)]
