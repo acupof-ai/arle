@@ -1,4 +1,4 @@
-//! Weight tensor representation for the R3a Qwen35 Metal port.
+//! Weight tensor representation for the Qwen3.5/Qwen3.6 Metal port.
 
 use anyhow::{Context, Result};
 
@@ -37,14 +37,12 @@ impl WeightTensor {
     }
 }
 
-/// A 3-D stack of affine-quantized expert weights for Qwen3.6 MoE.
-#[allow(dead_code)]
+/// A 3-D stack of affine-quantized expert weights for Qwen3.6 MoE. Group size
+/// and bits come from the MoE config, not the tensor, so they are not carried here.
 pub(crate) struct StackedQuantized {
     pub(crate) weight: MlxArray,
     pub(crate) scales: MlxArray,
     pub(crate) biases: MlxArray,
-    pub(crate) group_size: i32,
-    pub(crate) bits: i32,
 }
 
 /// Load a 2-D affine-quantized projection with explicit bits/group size.
@@ -76,12 +74,7 @@ pub(crate) fn load_quantized_with_bits(
 }
 
 /// Load a 3-D affine-quantized expert stack from safetensors.
-pub(crate) fn load_stacked_quantized(
-    tensors: &TensorMap,
-    base: &str,
-    group_size: i32,
-    bits: i32,
-) -> Result<StackedQuantized> {
+pub(crate) fn load_stacked_quantized(tensors: &TensorMap, base: &str) -> Result<StackedQuantized> {
     let weight = tensors
         .get(&format!("{base}.weight"))
         .cloned()
@@ -103,12 +96,11 @@ pub(crate) fn load_stacked_quantized(
         weight,
         scales,
         biases,
-        group_size,
-        bits,
     })
 }
 
-/// MLP input projections for one dense Qwen3.5 layer.
+/// MLP input projections for one dense Qwen3.5 layer. `Split` is a
+/// merge-failed sentinel the C++ builder rejects, so its fields are not read.
 #[allow(dead_code)]
 pub(crate) enum MlpInputProjection {
     Split {

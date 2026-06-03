@@ -1,10 +1,8 @@
 //! Metal backend executor + session machinery.
 //!
-//! [`MetalExecutor`] implements the [`BackendExecutor`] seam plumbing
-//! (submit/poll overlap shape). `new()` keeps the R2 CPU placeholder so the seam
-//! stays testable **without** the `metal` feature; `from_model_path()` builds the
-//! R3a real MLX Qwen3.5 executor. The real executor plus all MLX-touching session
-//! state (`RealMetalExecutor`, `MetalSlotState`, `MetalPageStore`) is gated behind
+//! `new()` keeps a CPU placeholder so the submit/poll seam stays testable without
+//! the `metal` feature; `from_model_path()` builds the real MLX Qwen3.5 executor.
+//! `RealMetalExecutor` and all MLX-touching session state are gated behind
 //! `#[cfg(feature = "metal")]`.
 
 #[cfg(feature = "metal")]
@@ -22,10 +20,6 @@ use crate::{config, mlx, model_source, qwen35, wired_limit};
 const KV_CACHE_CHUNK: i32 = 256;
 
 /// In-flight handle for a submitted Metal step.
-///
-/// The R2 skeleton resolves synchronously, so this carries the resolved output.
-/// R3 replaces this with an MLX async handle (command-buffer + future tokens)
-/// to keep CPU scheduling overlapped with the GPU forward.
 pub enum MetalInflight {
     /// CPU placeholder output.
     Ready(StepOutput),
@@ -50,10 +44,9 @@ impl std::fmt::Debug for MetalInflight {
 
 /// Turn a logits array into an in-flight result under `params`.
 ///
-/// Greedy (`temperature <= 0`) keeps the device `argmax` + async path — the
-/// verified greedy parity is untouched. For `temperature > 0` it materializes
-/// the logits as host f32 and draws via the shared `infer_plan::sample_token`
-/// (one D2H per token; sub-millisecond at c=1, no new GPU sampling kernel).
+/// Greedy keeps the device `argmax` + async path; `temperature > 0` materializes
+/// host f32 logits and draws via the shared `infer_plan::sample_token` (one D2H
+/// per token, no GPU sampling kernel).
 #[cfg(feature = "metal")]
 fn sample_inflight(
     slot: usize,
@@ -80,9 +73,6 @@ fn sample_inflight(
 }
 
 /// Metal backend executor.
-///
-/// `new()` keeps the R2 CPU placeholder for seam tests. `from_model_path()`
-/// builds the R3a real MLX Qwen3.5 executor.
 #[derive(Default)]
 pub struct MetalExecutor {
     #[cfg(feature = "metal")]
@@ -136,12 +126,8 @@ impl MetalExecutor {
         })
     }
 
-    /// Placeholder forward — produces one deterministic token per scheduled row.
-    ///
-    /// TODO(R3): replace with the real MLX forward via `crates/mlx-sys`
-    /// (Qwen3.6 MoE step), reading KV pages from `kv.page_indices(slot)` and
-    /// sampling real logits. This identity-ish stub exists only so the
-    /// submit/poll seam is exercisable on CPU.
+    /// Feature-free placeholder forward: one deterministic token per scheduled
+    /// row, so the submit/poll seam is exercisable on CPU without MLX.
     fn placeholder_forward(plan: &ForwardPlan) -> StepOutput {
         let mut tokens = Vec::with_capacity(plan.decode_rows.len() + plan.prefill_rows.len());
         for row in &plan.decode_rows {
@@ -354,8 +340,8 @@ impl RealMetalExecutor {
             .get(&slot)
             .is_some_and(|state| state.slot_epoch != epoch);
         if stale {
-            // TODO(R3b): replace this host-epoch observation with an explicit
-            // executor slot-release callback owned by the seam.
+            // Host-epoch bump is the slot-release signal until the seam grows an
+            // explicit executor release callback.
             if let Some(mut state) = self.slots.remove(&slot)
                 && state.session_active
             {
