@@ -572,6 +572,7 @@ impl ModelForward for DeepseekModel {
         let incremental_kv = dsv4_incremental_kv_enabled()?;
         let body_graph_enabled = dsv4_decode_body_cuda_graph_enabled()?;
         let body_graph_max_bs = dsv4_decode_body_cuda_graph_max_batch_size()?;
+        let model_row_ownership = "replicated-token";
         let fallback_lane = if profile.requires_best_practice() {
             "forbidden"
         } else {
@@ -579,7 +580,7 @@ impl ModelForward for DeepseekModel {
         };
 
         log::info!(
-            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} request_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
+            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} request_ownership={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
             profile.as_str(),
             fallback_lane,
             self.config.tp.rank,
@@ -589,6 +590,7 @@ impl ModelForward for DeepseekModel {
             self.config.axes.summary(),
             self.config.rank_coord,
             contract.request_ownership.as_str(),
+            model_row_ownership,
             contract.effective_world_size,
             contract.token_owner_group_count,
             kv_cache_dtype,
@@ -629,6 +631,9 @@ impl ModelForward for DeepseekModel {
         }
         let distributed = self.config.tp.world_size > 1 || self.config.ep.world_size > 1;
         if distributed {
+            missing.push(format!(
+                "DSv4 model forward must consume token-owned distributed_shard rows before native DeepEP can be comparable, got model_row_ownership={model_row_ownership}"
+            ));
             if contract.request_ownership != DistributedRequestOwnership::TokenOwnedDpEp {
                 missing.push(format!(
                     "DSv4 distributed decode requires token-owned DP/EP request routing before graph capture, got request_ownership={}",
