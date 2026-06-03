@@ -40,12 +40,35 @@ impl MetalGdrConfig {
     }
 }
 
-/// Qwen3.5 architecture parameters used by the C++ compiled builder.
+/// Mixture-of-Experts architectural parameters for Qwen3.5/3.6.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct MetalQwen35MoeConfig {
+    pub(crate) num_experts: usize,
+    pub(crate) num_experts_per_tok: usize,
+    pub(crate) decoder_sparse_step: usize,
+    pub(crate) norm_topk_prob: bool,
+    pub(crate) mlp_only_layers: Vec<usize>,
+    pub(crate) router_bits: i32,
+    pub(crate) router_group_size: i32,
+    pub(crate) expert_bits: i32,
+    pub(crate) expert_group_size: i32,
+}
+
+impl MetalQwen35MoeConfig {
+    pub(crate) fn is_moe_layer(&self, idx: usize) -> bool {
+        !self.mlp_only_layers.contains(&idx)
+            && (idx + 1).is_multiple_of(self.decoder_sparse_step.max(1))
+    }
+}
+
+/// Qwen3.5/Qwen3.6 architecture parameters used by the C++ compiled builder.
 #[derive(Debug, Clone)]
 pub(crate) struct MetalQwen35ArchConfig {
     pub(crate) layer_types: Vec<MetalQwen35LayerType>,
     pub(crate) rotary_dim: usize,
     pub(crate) linear: MetalGdrConfig,
+    pub(crate) moe: Option<MetalQwen35MoeConfig>,
 }
 
 impl MetalQwen35ArchConfig {
@@ -64,7 +87,7 @@ impl MetalQwen35ArchConfig {
     }
 }
 
-/// Qwen35 model config needed by R3a.
+/// Qwen35 model config needed by the clean Metal executor.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct MetalModelConfig {
@@ -82,7 +105,7 @@ pub(crate) struct MetalModelConfig {
     pub(crate) arch: MetalQwen35ArchConfig,
 }
 
-/// Load a safetensors Qwen3.5 config. Qwen3/Qwen3.6 MoE/GGUF stay deferred.
+/// Load a safetensors Qwen3.5/Qwen3.6 config for the clean Metal executor.
 pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
     let path = model_dir.join("config.json");
     let raw = std::fs::read_to_string(&path)
@@ -133,17 +156,6 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         num_hidden_layers
     );
 
-    let num_experts = get_usize(model, "num_experts", 0).max(
-        model
-            .get("moe_config")
-            .and_then(serde_json::Value::as_object)
-            .map_or(0, |moe| get_usize(moe, "num_experts", 0)),
-    );
-    anyhow::ensure!(
-        num_experts == 0,
-        "R3a Metal executor targets dense Qwen3.5 only; Qwen3.6 MoE is deferred"
-    );
-
     let rms_norm_eps = get_f64(model, "rms_norm_eps", 1e-6);
     let rope_parameters = model
         .get("rope_parameters")
@@ -170,6 +182,80 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
                 .and_then(serde_json::Value::as_i64)
                 .map_or(4, |n| n as i32),
         });
+
+    let moe = {
+        let nested_moe = model
+            .get("moe_config")
+            .and_then(serde_json::Value::as_object);
+        let mut raw_num_experts = get_usize(model, "num_experts", 0);
+        let mut raw_top_k = get_usize(model, "num_experts_per_tok", 0);
+        let mut decoder_sparse_step = get_usize(model, "decoder_sparse_step", 1).max(1);
+        let mut norm_topk_prob = model
+            .get("norm_topk_prob")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let mut mlp_only_layers = model
+            .get("mlp_only_layers")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as usize))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if let Some(nested) = nested_moe {
+            let nested_num_experts = get_usize(nested, "num_experts", 0);
+            if nested_num_experts > 0 {
+                raw_num_experts = nested_num_experts;
+            }
+            let nested_top_k = get_usize(nested, "num_experts_per_tok", 0);
+            if nested_top_k > 0 {
+                raw_top_k = nested_top_k;
+            }
+            let nested_sparse_step = get_usize(nested, "decoder_sparse_step", 1);
+            if nested_sparse_step > 1 {
+                decoder_sparse_step = nested_sparse_step;
+            }
+            if nested
+                .get("norm_topk_prob")
+                .and_then(serde_json::Value::as_bool)
+                .is_some_and(|value| !value)
+            {
+                norm_topk_prob = false;
+            }
+            if let Some(nested_layers) = nested
+                .get("mlp_only_layers")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|layers| !layers.is_empty())
+            {
+                mlp_only_layers = nested_layers;
+            }
+        }
+
+        if raw_num_experts > 0 {
+            let (group_size_default, bits_default) =
+                quantization.map_or((64, 4), |qc| (qc.group_size, qc.bits));
+            Some(MetalQwen35MoeConfig {
+                num_experts: raw_num_experts,
+                num_experts_per_tok: raw_top_k,
+                decoder_sparse_step,
+                norm_topk_prob,
+                mlp_only_layers,
+                router_bits: 8.max(bits_default),
+                router_group_size: group_size_default,
+                expert_bits: bits_default,
+                expert_group_size: group_size_default,
+            })
+        } else {
+            None
+        }
+    };
 
     let stop_token_ids = resolve_stop_token_ids(model_dir, root, model)?;
     let eos_token_id = stop_token_ids.first().copied().unwrap_or(151_645);
@@ -198,6 +284,7 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
                 hidden_size,
                 rms_norm_eps: rms_norm_eps as f32,
             },
+            moe,
         },
     })
 }

@@ -32,6 +32,8 @@ mod model_source;
 mod qwen35;
 #[cfg(feature = "metal")]
 mod weights;
+#[cfg(feature = "metal")]
+mod wired_limit;
 
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
@@ -298,6 +300,14 @@ impl MetalExecutor {
         let model_source = model_path.as_ref().to_string_lossy();
         let resolved = model_source::resolve_model_path(&model_source)?;
         let _guard = mlx_sys::mlx_guard();
+        if let Some(limit) = wired_limit::auto_wired_limit_bytes(&resolved) {
+            let previous = mlx::set_wired_limit_bytes(limit as u64);
+            log::info!(
+                "Metal executor wired limit set to {} bytes (previous {})",
+                limit,
+                previous
+            );
+        }
         let config = config::load_metal_config(&resolved)?;
         let weights = qwen35::load_qwen35_metal_weights(&resolved, &config)?;
         Ok(Self {

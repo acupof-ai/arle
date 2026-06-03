@@ -1050,18 +1050,19 @@ mod tests {
 
 #[cfg(all(test, feature = "metal", target_os = "macos"))]
 mod r3a_clean_metal_parity_tests {
-    use std::path::Path;
+    use std::{path::Path, time::Instant};
 
     use anyhow::Result;
     use infer_core::{Engine, SchedulerConfig};
     use infer_plan::{FinishReason, ForwardMode, ForwardPlan, PrefillRow};
     use infer_seam::{BackendExecutor, KvPool, PollResult};
 
-    use super::MetalBackend;
+    use super::{MetalBackend, MetalBackendOptions, MetalRuntimeLimits, auto_wired_limit_bytes};
     use crate::backend::InferenceBackend;
     use crate::sampler::SamplingParams;
 
     const DEFAULT_R3A_MODEL: &str = "mlx-community/Qwen3.5-0.8B-MLX-4bit";
+    const DEFAULT_R3E_MODEL: &str = "mlx-community/Qwen3.6-35B-A3B-4bit";
 
     #[test]
     #[ignore = "requires Apple Silicon Metal + Qwen3.5-0.8B MLX weights"]
@@ -1185,6 +1186,86 @@ mod r3a_clean_metal_parity_tests {
         assert!(engine.is_idle());
         assert_eq!(engine.active_count(), 0);
         assert_eq!(engine.waiting_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Apple Silicon Metal + Qwen3.6-35B-A3B MLX weights"]
+    fn r3e_qwen36_clean_engine_matches_legacy_and_reports_throughput() -> Result<()> {
+        let model =
+            std::env::var("R3E_METAL_TEST_MODEL").unwrap_or_else(|_| DEFAULT_R3E_MODEL.to_string());
+        let prompt = "The capital of France is";
+        let max_new_tokens = 16;
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_k: 1,
+            ignore_eos: true,
+            max_new_tokens: Some(max_new_tokens),
+            ..Default::default()
+        };
+
+        let wired_limit_bytes = auto_wired_limit_bytes(&model);
+        let mut legacy = MetalBackend::with_options(MetalBackendOptions {
+            runtime_limits: MetalRuntimeLimits {
+                wired_limit_bytes,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        legacy.load(Path::new(&model))?;
+        let prompt_ids = legacy.tokenize(prompt)?;
+        let mut legacy_tokens = Vec::new();
+        let legacy_start = Instant::now();
+        let legacy_result =
+            legacy.generate_from_token_ids_with_callback(&prompt_ids, &params, |token| {
+                legacy_tokens.push(token);
+                Ok(())
+            })?;
+        let legacy_elapsed = legacy_start.elapsed();
+        assert_eq!(
+            legacy_result.completion_tokens, max_new_tokens,
+            "legacy run should emit exactly {max_new_tokens} tokens"
+        );
+        drop(legacy);
+
+        let executor = infer_metal::MetalExecutor::from_model_path(&model)?;
+        let kv = infer_metal::MetalKvPool::new(1, 4096, 16);
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_num_batched_tokens: 2_048,
+            max_prefill_tokens: 2_048,
+            prefill_max_requests: Some(1),
+            max_prompt_tokens: 2_048,
+            max_total_tokens: prompt_ids.len() + max_new_tokens,
+            prefix_cache_low_water_pages: 0,
+            chunked_prefill_size: 2_048,
+        };
+        let mut engine = Engine::with_config(executor, kv, config);
+        let handle = engine.submit_request(prompt_ids, max_new_tokens);
+        let clean_start = Instant::now();
+        engine.run_to_idle()?;
+        let clean_elapsed = clean_start.elapsed();
+
+        let completed = engine
+            .completed(handle)
+            .expect("clean engine request should complete");
+        assert!(matches!(
+            completed.finish.as_ref(),
+            Some(FinishReason::Length)
+        ));
+        assert_eq!(completed.generated_tokens.len(), max_new_tokens);
+        let legacy_tps = legacy_tokens.len() as f64 / legacy_elapsed.as_secs_f64().max(1e-9);
+        let clean_tps =
+            completed.generated_tokens.len() as f64 / clean_elapsed.as_secs_f64().max(1e-9);
+        eprintln!(
+            "R3e Qwen3.6 Metal parity token ids: legacy={:?} new={:?}",
+            legacy_tokens, completed.generated_tokens
+        );
+        eprintln!(
+            "R3e Qwen3.6 Metal request throughput: legacy={legacy_tps:.2} tok/s new={clean_tps:.2} tok/s"
+        );
+        assert_eq!(completed.generated_tokens, legacy_tokens);
+        assert!(engine.is_idle());
         Ok(())
     }
 }
