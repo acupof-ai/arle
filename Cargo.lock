@@ -1811,6 +1811,7 @@ dependencies = [
  "futures-util",
  "half",
  "hf-hub",
+ "infer-core",
  "infer-metal",
  "infer-plan",
  "infer-seam",
