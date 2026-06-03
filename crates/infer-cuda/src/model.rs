@@ -141,7 +141,7 @@ impl RealCudaExecutor {
                 row.slot
             );
             ensure!(
-                host_kv.seq_len(row.slot) >= row.kv_seq_len + 1,
+                host_kv.seq_len(row.slot) > row.kv_seq_len,
                 "host KV length {} is behind decode materialization end {} for slot {}",
                 host_kv.seq_len(row.slot),
                 row.kv_seq_len + 1,
