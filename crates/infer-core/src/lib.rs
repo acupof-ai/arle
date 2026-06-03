@@ -61,6 +61,9 @@ pub struct SchedulerConfig {
     pub max_total_tokens: usize,
     /// Target minimum free pages after prefix-cache reclamation.
     pub prefix_cache_low_water_pages: usize,
+    /// Per-request prefill chunk size. A prompt longer than this is prefilled
+    /// across multiple ticks so decode rows can interleave (chunked prefill).
+    pub chunked_prefill_size: usize,
 }
 
 impl SchedulerConfig {
@@ -80,6 +83,10 @@ impl SchedulerConfig {
     fn prefill_step_budget(&self) -> usize {
         self.max_num_batched_tokens.min(self.max_prefill_tokens)
     }
+
+    fn prefill_chunk_size(&self) -> usize {
+        self.chunked_prefill_size.max(1)
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -92,6 +99,7 @@ impl Default for SchedulerConfig {
             max_prompt_tokens: 16_384,
             max_total_tokens: 32_768,
             prefix_cache_low_water_pages: 0,
+            chunked_prefill_size: 2_048,
         }
     }
 }
@@ -229,6 +237,9 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     waiting: VecDeque<RequestState>,
     completed: BTreeMap<RequestHandle, CompletedRequest>,
     inflight: Option<E::Inflight>,
+    /// Plan submitted with `inflight`, kept so `apply_output` can advance chunked
+    /// prefill progress and resolve which rows produced tokens.
+    pending_plan: Option<ForwardPlan>,
 }
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
@@ -264,6 +275,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             waiting: VecDeque::new(),
             completed: BTreeMap::new(),
             inflight: None,
+            pending_plan: None,
         }
     }
 
@@ -319,7 +331,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     pub fn step(&mut self) -> Result<()> {
         if let Some(inflight) = self.inflight.take() {
             match self.executor.poll(inflight)? {
-                PollResult::Ready(output) => self.apply_output(output),
+                PollResult::Ready(output) => {
+                    let plan = self.pending_plan.take().unwrap_or_else(ForwardPlan::idle);
+                    self.apply_output(&plan, output);
+                }
                 PollResult::NotReady(inflight) => {
                     self.inflight = Some(inflight);
                     return Ok(());
@@ -341,6 +356,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.allocate_for_plan(&plan)?;
         log::trace!("infer-core submit plan: mode={:?}", plan.mode);
         self.inflight = Some(self.executor.submit(&plan, &mut self.kv)?);
+        self.pending_plan = Some(plan);
         Ok(())
     }
 
@@ -437,22 +453,56 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.waiting.insert(insert_at, request);
     }
 
-    fn apply_output(&mut self, output: StepOutput) {
+    fn apply_output(&mut self, plan: &ForwardPlan, output: StepOutput) {
+        let mut tokens_by_slot: BTreeMap<usize, SlotToken> = BTreeMap::new();
+        for token in output.tokens {
+            tokens_by_slot.insert(token.slot, token);
+        }
         let mut finished_slots = Vec::new();
 
-        for token in output.tokens {
-            let Some(request) = self.active.get_mut(&token.slot) else {
+        // Advance chunked prefill. A non-final chunk only moves progress; the
+        // final chunk transitions the slot to decode and consumes its first token.
+        for row in &plan.prefill_rows {
+            let Some(request) = self.active.get_mut(&row.slot) else {
                 continue;
             };
-
-            if let RequestPhase::Prefilling { progress } = &mut request.phase {
-                *progress = request.prompt_tokens.len();
+            if !matches!(request.phase, RequestPhase::Prefilling { .. }) {
+                continue;
+            }
+            let prompt_len = request.prompt_tokens.len();
+            let new_start = (row.start_pos + row.tokens.len()).min(prompt_len);
+            request.prefill_start_pos = new_start;
+            if new_start >= prompt_len {
                 request.phase = RequestPhase::Decoding;
+                if let Some(token) = tokens_by_slot.remove(&row.slot) {
+                    request.generated_tokens.push(token.token);
+                    if let Some(finish) = finish_reason_for(request, &token) {
+                        finished_slots.push((row.slot, finish));
+                    }
+                }
+            } else {
+                request.phase = RequestPhase::Prefilling {
+                    progress: new_start,
+                };
+                // A non-final chunk produces no committed token.
+                tokens_by_slot.remove(&row.slot);
+            }
+        }
+
+        // Decode rows: append the sampled token and check stop/length.
+        for row in &plan.decode_rows {
+            let Some(token) = tokens_by_slot.remove(&row.slot) else {
+                continue;
+            };
+            let Some(request) = self.active.get_mut(&row.slot) else {
+                continue;
+            };
+            if !matches!(request.phase, RequestPhase::Decoding) {
+                continue;
             }
             request.generated_tokens.push(token.token);
-
             if let Some(finish) = finish_reason_for(request, &token) {
-                finished_slots.push((token.slot, finish));
+                finished_slots.push((row.slot, finish));
             }
         }
 
@@ -504,7 +554,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             if prefill_tokens > 0 && active_prefills >= max_prefills {
                 break;
             }
-            if prefill_tokens > remaining_prefill_tokens {
+            // Long prompts are admitted and chunked across ticks (the planner
+            // caps per-tick prefill tokens). The per-tick budget only throttles
+            // how many NEW requests we admit at once: stop once it is consumed.
+            if prefill_tokens > 0 && remaining_prefill_tokens == 0 {
                 break;
             }
 
@@ -611,38 +664,52 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let mut prefill_rows = Vec::new();
         let mut decode_rows = Vec::new();
 
+        // Decode rows first (decode-priority). `active` is a BTreeMap, so this
+        // iterates in deterministic slot order.
         for (&slot, request) in &self.active {
-            match request.phase {
-                RequestPhase::Prefilling { .. } => {
-                    let start_pos = request.prefill_start_pos.min(request.prompt_tokens.len());
-                    let tokens = request.prompt_tokens[start_pos..].to_vec();
-                    if tokens.is_empty() {
-                        continue;
-                    }
-                    prefill_rows.push(PrefillRow {
-                        slot,
-                        tokens,
-                        start_pos,
-                        total_tokens: request.prompt_tokens.len(),
-                    });
-                }
-                RequestPhase::Decoding => {
-                    let Some(last_token) = request
-                        .generated_tokens
-                        .last()
-                        .copied()
-                        .or_else(|| request.prompt_tokens.last().copied())
-                    else {
-                        continue;
-                    };
-                    decode_rows.push(DecodeRow {
-                        slot,
-                        last_token,
-                        kv_seq_len: self.kv.seq_len(slot),
-                    });
-                }
-                RequestPhase::Finished => {}
+            if matches!(request.phase, RequestPhase::Decoding) {
+                let Some(last_token) = request
+                    .generated_tokens
+                    .last()
+                    .copied()
+                    .or_else(|| request.prompt_tokens.last().copied())
+                else {
+                    continue;
+                };
+                decode_rows.push(DecodeRow {
+                    slot,
+                    last_token,
+                    kv_seq_len: self.kv.seq_len(slot),
+                });
             }
+        }
+
+        // Chunked prefill under the per-tick token budget and concurrency cap.
+        // A prompt longer than `prefill_chunk_size` is split across ticks so
+        // decode rows keep interleaving (interactivity + mixed batching).
+        let mut budget = self.config.prefill_step_budget();
+        let chunk_cap = self.config.prefill_chunk_size();
+        let max_prefills = self.config.max_concurrent_prefill();
+        for (&slot, request) in &self.active {
+            if prefill_rows.len() >= max_prefills || budget == 0 {
+                break;
+            }
+            if !matches!(request.phase, RequestPhase::Prefilling { .. }) {
+                continue;
+            }
+            let start_pos = request.prefill_start_pos.min(request.prompt_tokens.len());
+            let remaining = request.prompt_tokens.len() - start_pos;
+            let chunk = remaining.min(chunk_cap).min(budget);
+            if chunk == 0 {
+                continue;
+            }
+            prefill_rows.push(PrefillRow {
+                slot,
+                tokens: request.prompt_tokens[start_pos..start_pos + chunk].to_vec(),
+                start_pos,
+                total_tokens: request.prompt_tokens.len(),
+            });
+            budget -= chunk;
         }
 
         ForwardPlan {
@@ -858,15 +925,16 @@ fn plan_mode(prefill_empty: bool, decode_empty: bool) -> ForwardMode {
 }
 
 fn finish_reason_for(request: &RequestState, token: &SlotToken) -> Option<FinishReason> {
-    token.finish.clone().or_else(|| {
-        if token.token == STOP_TOKEN_ID {
-            Some(FinishReason::Stop)
-        } else if request.generated_tokens.len() >= request.max_tokens {
-            Some(FinishReason::Length)
-        } else {
-            None
-        }
-    })
+    if let Some(finish) = token.finish.clone() {
+        return Some(finish);
+    }
+    if token.token == STOP_TOKEN_ID {
+        Some(FinishReason::Stop)
+    } else if request.generated_tokens.len() >= request.max_tokens {
+        Some(FinishReason::Length)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1624,6 +1692,76 @@ mod tests {
         let hit = engine.radix.peek_longest_prefix_match(&[1, 2, 3, 4, 5, 6]);
         assert_eq!(hit.matched_len, 4);
         assert_eq!(hit.block_ids.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn r1d_admits_long_prompt_over_budget_and_chunks() -> Result<()> {
+        let mut config = test_config(1);
+        config.chunked_prefill_size = 2;
+        // Per-tick budget < prompt: relies on the chunked-prefill admit relaxation.
+        config.max_num_batched_tokens = 3;
+        config.max_prefill_tokens = 3;
+        let mut engine = Engine::with_config(MockExecutor::ready(), MockKvPool::new(1), config);
+        engine.submit_request(vec![1, 2, 3, 4, 5], 4);
+
+        engine.admit_waiting()?;
+        assert_eq!(
+            engine.active.len(),
+            1,
+            "a prompt longer than the per-tick budget must still admit (chunked across ticks)"
+        );
+
+        let plan = engine.build_forward_plan();
+        assert_eq!(plan.prefill_rows.len(), 1);
+        assert_eq!(
+            plan.prefill_rows[0].tokens,
+            vec![1, 2],
+            "prefill must be chunked to chunked_prefill_size, not the whole prompt"
+        );
+        assert_eq!(plan.prefill_rows[0].start_pos, 0);
+        assert_eq!(plan.prefill_rows[0].total_tokens, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn r1d_chunked_prefill_completes_long_prompt() -> Result<()> {
+        let mut config = test_config(1);
+        config.chunked_prefill_size = 2;
+        let mut engine = Engine::with_config(MockExecutor::ready(), MockKvPool::new(1), config);
+        let handle = engine.submit_request(vec![1, 2, 3, 4, 5], 2);
+
+        engine.run_to_idle()?;
+
+        let completed = engine.completed(handle).expect("request completed");
+        // chunks [1,2] [3,4] [5]; the final chunk's committed token is 5 + 1 = 6, then decode -> 7.
+        assert_eq!(completed.generated_tokens, vec![6, 7]);
+        assert_finished(completed);
+        Ok(())
+    }
+
+    #[test]
+    fn r1d_chunked_prefill_advances_progress_across_ticks() -> Result<()> {
+        let mut config = test_config(1);
+        config.chunked_prefill_size = 2;
+        let mut engine = Engine::with_config(MockExecutor::ready(), MockKvPool::new(1), config);
+        engine.submit_request(vec![1, 2, 3, 4, 5], 4);
+
+        let mut prefill_start_positions = Vec::new();
+        for _ in 0..6 {
+            engine.step()?;
+            if let Some(request) = engine.active.values().next() {
+                if matches!(request.phase, RequestPhase::Prefilling { .. }) {
+                    prefill_start_positions.push(request.prefill_start_pos);
+                }
+            }
+        }
+        // start_pos advances in chunk-sized steps (0 -> 2 -> 4) across ticks,
+        // proving the prompt was prefilled over multiple ticks, not all at once.
+        assert!(
+            prefill_start_positions.contains(&2) && prefill_start_positions.contains(&4),
+            "expected chunked progress across ticks, got {prefill_start_positions:?}"
+        );
         Ok(())
     }
 }
