@@ -33,6 +33,13 @@ use infer_seam::{BackendExecutor, KvAllocator, KvPool, KvPrefixStore, KvQuery, P
 #[cfg(feature = "cuda")]
 mod attention;
 #[cfg(feature = "cuda")]
+mod decode_graph;
+// Pure host arithmetic for the decode-graph capture key. Feature-agnostic so the
+// `GraphBucket` bookkeeping (key derivation, page-boundary recapture trigger) is
+// CPU-unit-testable without nvcc; the live capture machinery in `decode_graph` is
+// `cuda`-gated.
+mod decode_graph_key;
+#[cfg(feature = "cuda")]
 mod executor;
 #[cfg(feature = "cuda")]
 pub mod graph;
@@ -375,6 +382,14 @@ impl BackendExecutor for CudaExecutor {
 
     fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>> {
         Ok(PollResult::Ready(inflight.output))
+    }
+
+    fn warmup(&mut self) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => Ok(()),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.warmup(),
+        }
     }
 }
 
