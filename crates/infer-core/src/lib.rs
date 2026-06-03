@@ -3,18 +3,16 @@
 //! This crate depends only on the plan and seam contracts. Runtime-specific
 //! buffers and model implementation details stay below `infer-seam`.
 
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, VecDeque};
 
+mod planner;
+mod prefix;
 mod radix;
 
 pub use radix::{BlockId, PrefixMatch, RadixCache};
 
-use anyhow::{Result, anyhow, bail};
-use infer_plan::{
-    DecodeRow, FinishReason, ForwardMode, ForwardPlan, PrefillRow, SamplingParams, SlotToken,
-    StepOutput,
-};
+use anyhow::{Result, bail};
+use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
     AdmissionVerdict, BackendExecutor, KvPool, PermissiveGovernor, PollResult, ResourceGovernor,
 };
@@ -605,180 +603,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .count()
     }
 
-    fn request_pages_needed_after_prefix(
-        &self,
-        request: &RequestState,
-        matched_tokens: usize,
-    ) -> usize {
-        let page_size = self.kv.page_size().max(1);
-        let tokens = request
-            .prompt_tokens
-            .len()
-            .saturating_sub(matched_tokens)
-            .saturating_add(request.max_tokens);
-        tokens.div_ceil(page_size)
-    }
-
-    fn attach_prefix_to_request(
-        &mut self,
-        slot: usize,
-        request: &mut RequestState,
-        prefix_match: PrefixMatch,
-    ) -> Result<()> {
-        if prefix_match.is_empty() {
-            request.prefill_start_pos = 0;
-            request.phase = RequestPhase::Prefilling { progress: 0 };
-            request.waiting_hint.immediate_reuse_tokens = 0;
-            request.waiting_hint.total_reuse_tokens = 0;
-            return Ok(());
-        }
-
-        self.kv.retain_pages(&prefix_match.block_ids);
-        self.radix.retain_blocks(&prefix_match.block_ids);
-        if let Err(err) =
-            self.kv
-                .attach_pages(slot, &prefix_match.block_ids, prefix_match.matched_len)
-        {
-            self.radix.release_blocks(&prefix_match.block_ids);
-            self.kv.release_pages(&prefix_match.block_ids);
-            return Err(err);
-        }
-
-        request.prefill_start_pos = prefix_match.matched_len.min(request.prompt_len());
-        request.reused_prefix_pages = prefix_match.block_ids;
-        request.waiting_hint.immediate_reuse_tokens = request.prefill_start_pos;
-        request.waiting_hint.total_reuse_tokens = request.prefill_start_pos;
-        request.phase = if request.prefill_start_pos == request.prompt_len() {
-            RequestPhase::Decoding
-        } else {
-            RequestPhase::Prefilling {
-                progress: request.prefill_start_pos,
-            }
-        };
-        Ok(())
-    }
-
-    fn build_forward_plan(&self) -> ForwardPlan {
-        let mut prefill_rows = Vec::new();
-        let mut decode_rows = Vec::new();
-
-        // Decode rows first (decode-priority). `active` is a BTreeMap, so this
-        // iterates in deterministic slot order.
-        for (&slot, request) in &self.active {
-            if matches!(request.phase, RequestPhase::Decoding) {
-                let Some(last_token) = request
-                    .generated_tokens
-                    .last()
-                    .copied()
-                    .or_else(|| request.prompt_tokens.last().copied())
-                else {
-                    continue;
-                };
-                decode_rows.push(DecodeRow {
-                    slot,
-                    last_token,
-                    kv_seq_len: self.kv.seq_len(slot),
-                    params: request.sampling.clone(),
-                });
-            }
-        }
-
-        // Chunked prefill under the per-tick token budget and concurrency cap.
-        // A prompt longer than `prefill_chunk_size` is split across ticks so
-        // decode rows keep interleaving (interactivity + mixed batching).
-        let mut budget = self.config.prefill_step_budget();
-        let chunk_cap = self.config.prefill_chunk_size();
-        let max_prefills = self.config.max_concurrent_prefill();
-        for (&slot, request) in &self.active {
-            if prefill_rows.len() >= max_prefills || budget == 0 {
-                break;
-            }
-            if !matches!(request.phase, RequestPhase::Prefilling { .. }) {
-                continue;
-            }
-            let start_pos = request.prefill_start_pos.min(request.prompt_tokens.len());
-            let remaining = request.prompt_tokens.len() - start_pos;
-            let chunk = remaining.min(chunk_cap).min(budget);
-            if chunk == 0 {
-                continue;
-            }
-            prefill_rows.push(PrefillRow {
-                slot,
-                tokens: request.prompt_tokens[start_pos..start_pos + chunk].to_vec(),
-                start_pos,
-                total_tokens: request.prompt_tokens.len(),
-                params: request.sampling.clone(),
-            });
-            budget -= chunk;
-        }
-
-        ForwardPlan {
-            mode: plan_mode(prefill_rows.is_empty(), decode_rows.is_empty()),
-            decode_rows,
-            prefill_rows,
-            microbatch: None,
-            spec: None,
-        }
-    }
-
-    fn retract_decode_to_fit(&mut self, plan: &mut ForwardPlan) {
-        while self.kv.is_active()
-            && self.plan_new_pages_needed(plan) > self.kv.free_pages()
-            && plan.decode_rows.len() > 1
-        {
-            let Some(victim_pos) = self.retract_victim_pos(&plan.decode_rows) else {
-                break;
-            };
-            let victim_slot = plan.decode_rows[victim_pos].slot;
-            self.requeue_preempted_decode(victim_slot);
-            plan.decode_rows.remove(victim_pos);
-            plan.mode = plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
-        }
-    }
-
-    fn retract_victim_pos(&self, decode_rows: &[DecodeRow]) -> Option<usize> {
-        decode_rows
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, row)| {
-                self.active
-                    .get(&row.slot)
-                    .map_or((usize::MAX, Reverse(0)), |request| {
-                        (
-                            request.generated_tokens.len(),
-                            Reverse(request.prompt_tokens.len()),
-                        )
-                    })
-            })
-            .map(|(pos, _)| pos)
-    }
-
-    fn requeue_preempted_decode(&mut self, slot: usize) {
-        let Some(request) = self.active.remove(&slot) else {
-            return;
-        };
-        self.release_reused_prefix(&request.reused_prefix_pages);
-        self.kv.free_slot(slot);
-        self.enqueue_waiting_request(
-            request.reset_for_recompute(),
-            WaitingInsertBias::BeforeEqual,
-        );
-    }
-
-    fn plan_new_pages_needed(&self, plan: &ForwardPlan) -> usize {
-        let prefill_pages = plan
-            .prefill_rows
-            .iter()
-            .map(|row| self.kv.append_pages_needed(row.slot, row.tokens.len()))
-            .sum::<usize>();
-        let decode_pages = plan
-            .decode_rows
-            .iter()
-            .map(|row| self.kv.append_pages_needed(row.slot, 1))
-            .sum::<usize>();
-        prefill_pages + decode_pages
-    }
-
     fn allocate_for_plan(&mut self, plan: &ForwardPlan) -> Result<()> {
         for row in &plan.prefill_rows {
             self.alloc_with_prefix_reclaim(row.slot, row.tokens.len())?;
@@ -789,87 +613,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         Ok(())
     }
 
-    fn alloc_with_prefix_reclaim(&mut self, slot: usize, tokens: usize) -> Result<()> {
-        let needed = self.kv.append_pages_needed(slot, tokens);
-        if needed > self.kv.free_pages() {
-            self.evict_prefix_cache_for_pages(needed - self.kv.free_pages());
-        }
-
-        match self.kv.alloc(slot, tokens) {
-            Ok(()) => Ok(()),
-            Err(first_err) => {
-                let needed = self.kv.append_pages_needed(slot, tokens);
-                let reclaimed = self.evict_prefix_cache_for_pages(needed);
-                if reclaimed == 0 {
-                    return Err(first_err);
-                }
-                self.kv.alloc(slot, tokens).map_err(|retry_err| {
-                    anyhow!(
-                        "KV alloc retry failed after reclaiming {reclaimed} pages: first error: {first_err}; retry error: {retry_err}"
-                    )
-                })
-            }
-        }
-    }
-
-    fn publish_prefix_blocks(&mut self, slot: usize, request: &RequestState) {
-        if !self.kv.is_active() {
-            return;
-        }
-
-        let block_size = self.radix.block_size().max(1);
-        let publishable_tokens = request.prompt_len().min(self.kv.seq_len(slot));
-        let sealed_blocks = publishable_tokens / block_size;
-        if sealed_blocks == 0 {
-            return;
-        }
-
-        let sealed_tokens = sealed_blocks * block_size;
-        let pages = self
-            .kv
-            .page_indices_for_token_range(slot, 0, sealed_tokens)
-            .to_vec();
-        let publish_blocks = sealed_blocks.min(pages.len());
-        if publish_blocks == 0 {
-            return;
-        }
-
-        let token_len = publish_blocks * block_size;
-        let newly_cached = self.radix.insert(
-            &request.prompt_tokens[..token_len],
-            &pages[..publish_blocks],
-        );
-        if !newly_cached.is_empty() {
-            self.kv.retain_pages(&newly_cached);
-        }
-    }
-
-    fn release_reused_prefix(&mut self, pages: &[BlockId]) {
-        if pages.is_empty() {
-            return;
-        }
-        self.radix.release_blocks(pages);
-        self.kv.release_pages(pages);
-    }
-
     fn evict_prefix_cache_if_below_low_water(&mut self) -> usize {
         let low_water = self.config.prefix_cache_low_water_pages;
         if low_water <= self.kv.free_pages() {
             return 0;
         }
         self.evict_prefix_cache_for_pages(low_water - self.kv.free_pages())
-    }
-
-    fn evict_prefix_cache_for_pages(&mut self, pages_needed: usize) -> usize {
-        if pages_needed == 0 {
-            return 0;
-        }
-        let pages = self.radix.evict_lru(pages_needed);
-        let reclaimed = pages.len();
-        if reclaimed > 0 {
-            self.kv.release_pages(&pages);
-        }
-        reclaimed
     }
 }
 
@@ -912,15 +661,6 @@ fn waiting_request_precedes(
             std::cmp::Ordering::Less => false,
             std::cmp::Ordering::Equal => matches!(bias, WaitingInsertBias::BeforeEqual),
         },
-    }
-}
-
-fn plan_mode(prefill_empty: bool, decode_empty: bool) -> ForwardMode {
-    match (prefill_empty, decode_empty) {
-        (true, true) => ForwardMode::Idle,
-        (false, true) => ForwardMode::Prefill,
-        (true, false) => ForwardMode::Decode,
-        (false, false) => ForwardMode::Mixed,
     }
 }
 
