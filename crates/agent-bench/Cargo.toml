@@ -1,0 +1,16 @@
+[package]
+name = "agent-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+infer-plan = { path = "../infer-plan" }
+infer-seam = { path = "../infer-seam" }
+infer-core = { path = "../infer-core" }
+infer-metal = { path = "../infer-metal" }
+
+[lints]
+workspace = true
