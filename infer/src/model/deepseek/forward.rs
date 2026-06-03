@@ -49,6 +49,8 @@ use crate::sampler::SamplingParams;
 #[cfg(feature = "cuda")]
 use crate::scheduler::{DistributedRequestOwnership, SchedulerStartupContract};
 #[cfg(feature = "cuda")]
+use crate::tensor_parallel::build_attn_owner_groups;
+#[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 #[cfg(feature = "cuda")]
 use cuda_kernels::tensor::CudaAllocTraceExt;
@@ -56,6 +58,96 @@ use cuda_kernels::tensor::CudaAllocTraceExt;
 use cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
 use half::bf16;
+
+#[cfg(feature = "cuda")]
+const DSV4_TOKEN_OWNED_ROW_OWNERSHIP: &str = "token-owned-dp-ep-shard-validated";
+
+#[cfg(feature = "cuda")]
+impl DeepseekModel {
+    fn token_owned_request_shard_expectation(&self) -> Result<(usize, usize, bool)> {
+        self.config.axes.validate()?;
+        let attn_tp = self.config.axes.attn_tp_size();
+        let shard_world = attn_tp * self.config.axes.attn_cp_size;
+        ensure!(shard_world > 0, "DSv4 token-owned shard world must be > 0");
+        let shard_rank =
+            self.config.rank_coord.attn_cp_rank * attn_tp + self.config.rank_coord.attn_tp_rank;
+        ensure!(
+            shard_rank < shard_world,
+            "DSv4 token-owned shard rank {shard_rank} must be < shard_world {shard_world}"
+        );
+        Ok((shard_rank, shard_world, shard_rank == 0))
+    }
+
+    fn startup_model_row_ownership(
+        &self,
+        contract: SchedulerStartupContract,
+    ) -> Result<&'static str> {
+        if contract.request_ownership != DistributedRequestOwnership::TokenOwnedDpEp {
+            return Ok("replicated-token");
+        }
+        let owner_groups = build_attn_owner_groups(self.config.axes);
+        ensure!(
+            owner_groups.len() == contract.token_owner_group_count,
+            "DSv4 model owner-group count mismatch: model_axes_groups={} scheduler_contract_groups={} axes={}",
+            owner_groups.len(),
+            contract.token_owner_group_count,
+            self.config.axes.summary()
+        );
+        let (_, shard_world, _) = self.token_owned_request_shard_expectation()?;
+        ensure!(
+            shard_world > 0,
+            "DSv4 model token-owned shard world must be positive"
+        );
+        Ok(DSV4_TOKEN_OWNED_ROW_OWNERSHIP)
+    }
+
+    fn validate_decode_batch_request_ownership(
+        &self,
+        batch: DecodeBatchRequest<'_>,
+    ) -> Result<&'static str> {
+        let token_owned_rows = batch
+            .distributed_shards
+            .iter()
+            .filter(|shard| shard.ownership == DistributedRequestOwnership::TokenOwnedDpEp)
+            .count();
+        if token_owned_rows == 0 {
+            return Ok("replicated-token");
+        }
+        ensure!(
+            token_owned_rows == batch.distributed_shards.len(),
+            "DSv4 mixed decode row ownership is unsupported: token_owned_rows={} rows={}",
+            token_owned_rows,
+            batch.distributed_shards.len()
+        );
+        let (expected_rank, expected_world, expected_visible) =
+            self.token_owned_request_shard_expectation()?;
+        for (row_idx, shard) in batch.distributed_shards.iter().enumerate() {
+            ensure!(
+                shard.rank == expected_rank,
+                "DSv4 decode row {row_idx} shard rank mismatch: got {}/{} expected {}/{}",
+                shard.rank,
+                shard.world_size,
+                expected_rank,
+                expected_world
+            );
+            ensure!(
+                shard.world_size == expected_world,
+                "DSv4 decode row {row_idx} shard world mismatch: got {} expected {}",
+                shard.world_size,
+                expected_world
+            );
+            ensure!(
+                shard.emits_visible_output == expected_visible,
+                "DSv4 decode row {row_idx} visible-output mismatch: got {} expected {} for shard {}/{}",
+                shard.emits_visible_output,
+                expected_visible,
+                expected_rank,
+                expected_world
+            );
+        }
+        Ok(DSV4_TOKEN_OWNED_ROW_OWNERSHIP)
+    }
+}
 
 #[cfg(feature = "cuda")]
 impl ModelForward for DeepseekModel {
@@ -289,6 +381,7 @@ impl ModelForward for DeepseekModel {
         skip_logit_scatter: bool,
     ) -> Result<()> {
         batch.validate()?;
+        let model_row_ownership = self.validate_decode_batch_request_ownership(batch)?;
         let distributed_rows = batch
             .distributed_shards
             .iter()
@@ -305,10 +398,11 @@ impl ModelForward for DeepseekModel {
                     })
                     .count();
                 log::info!(
-                    "DeepSeek V4 decode batch receives distributed_shard metadata: rows={} distributed_rows={} token_owned_rows={} first_shard={}",
+                    "DeepSeek V4 decode batch receives distributed_shard metadata: rows={} distributed_rows={} token_owned_rows={} model_row_ownership={} first_shard={}",
                     batch.slot_indices.len(),
                     distributed_rows,
                     token_owned_rows,
+                    model_row_ownership,
                     batch.distributed_shards[0].summary()
                 );
             });
@@ -617,7 +711,11 @@ impl ModelForward for DeepseekModel {
         let body_graph_enabled = dsv4_decode_body_cuda_graph_enabled()?;
         let body_graph_max_bs = dsv4_decode_body_cuda_graph_max_batch_size()?;
         let model_row_metadata = "decode-batch-distributed-shard-visible";
-        let model_row_ownership = "replicated-token";
+        let (model_row_ownership, model_row_ownership_error) =
+            match self.startup_model_row_ownership(contract) {
+                Ok(label) => (label, None),
+                Err(err) => ("replicated-token-invalid", Some(err)),
+            };
         let communicator_layout = self.layer_communicator.layout_label();
         let communicator_axes = self.layer_communicator.axis_summary();
         let fallback_lane = if profile.requires_best_practice() {
@@ -681,9 +779,14 @@ impl ModelForward for DeepseekModel {
         }
         let distributed = self.config.tp.world_size > 1 || self.config.ep.world_size > 1;
         if distributed {
-            missing.push(format!(
-                "DSv4 model forward must consume token-owned distributed_shard rows before native DeepEP can be comparable, got model_row_ownership={model_row_ownership}"
-            ));
+            if let Some(err) = model_row_ownership_error {
+                missing.push(format!("DSv4 model row ownership contract invalid: {err}"));
+            }
+            if model_row_ownership != DSV4_TOKEN_OWNED_ROW_OWNERSHIP {
+                missing.push(format!(
+                    "DSv4 model forward must consume token-owned distributed_shard rows before native DeepEP can be comparable, got model_row_ownership={model_row_ownership}"
+                ));
+            }
             if contract.request_ownership != DistributedRequestOwnership::TokenOwnedDpEp {
                 missing.push(format!(
                     "DSv4 distributed decode requires token-owned DP/EP request routing before graph capture, got request_ownership={}",
