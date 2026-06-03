@@ -282,14 +282,16 @@ impl DeepseekModel {
     pub fn from_config(config: DeepseekRuntimeConfig) -> Result<Self> {
         let ctx = DeviceContext::new()?;
         let layer_communicator = Self::layer_communicator_from_config(&ctx, &config)?;
+        let communicator_layout = layer_communicator.layout_label();
         info!(
-            "DeepSeek V4 runtime topology: tp={}/{} ep={}/{} axes={} coord={:?} communicator=global-tp-ep-only",
+            "DeepSeek V4 runtime topology: tp={}/{} ep={}/{} axes={} coord={:?} communicator={}",
             config.tp.rank,
             config.tp.world_size,
             config.ep.rank,
             config.ep.world_size,
             config.axes.summary(),
             config.rank_coord,
+            communicator_layout,
         );
         let model = Self {
             config,
@@ -311,16 +313,43 @@ impl DeepseekModel {
         ctx: &DeviceContext,
         config: &DeepseekRuntimeConfig,
     ) -> Result<LayerCommunicator> {
-        let mut comm = LayerCommunicator::new_with_ep(
-            config.tp.rank,
-            config.tp.world_size,
-            0,
-            1,
-            0,
-            1,
+        config.axes.validate()?;
+        let axes_match_runtime_tp = config.axes.world_size() == config.tp.world_size
+            && config.rank_coord.world_rank == config.tp.rank;
+        let (
+            comm_tp_rank,
+            comm_tp_world_size,
+            comm_dp_rank,
+            comm_dp_world_size,
+            comm_cp_rank,
+            comm_cp_world_size,
+        ) = if axes_match_runtime_tp {
+            (
+                config.rank_coord.attn_tp_rank,
+                config.axes.attn_tp_size(),
+                config.rank_coord.attn_dp_rank,
+                config.axes.attn_dp_size,
+                config.rank_coord.attn_cp_rank,
+                config.axes.attn_cp_size,
+            )
+        } else {
+            (config.tp.rank, config.tp.world_size, 0, 1, 0, 1)
+        };
+        let comm = LayerCommunicator::new_with_ep(
+            comm_tp_rank,
+            comm_tp_world_size,
+            comm_dp_rank,
+            comm_dp_world_size,
+            comm_cp_rank,
+            comm_cp_world_size,
             config.ep.rank,
             config.ep.world_size,
         )?;
+        #[cfg(feature = "nccl")]
+        let mut comm = comm;
+        #[cfg(feature = "nccl")]
+        let comm_matches_global_tp =
+            comm.tp_rank() == config.tp.rank && comm.tp_world_size() == config.tp.world_size;
 
         #[cfg(feature = "nccl")]
         {
@@ -328,28 +357,48 @@ impl DeepseekModel {
 
             let mut tp_nccl = None;
             if config.tp.world_size > 1 {
-                let group = Arc::new(NcclGroup::new_on_stream(
-                    config.tp.rank,
-                    config.tp.world_size,
-                    NcclInitMethod::EnvBootstrap,
-                    ctx.stream.clone(),
-                )?);
-                comm = comm.with_tp_nccl(Arc::clone(&group))?;
-                comm = comm.with_request_token_sync_nccl(Arc::clone(&group));
-                tp_nccl = Some(group);
-
-                // A4 — secondary TP NCCL group bound to `ctx.comm_stream` so
-                // FlashMLA prefill AllGather Q can overlap with kv_pack /
-                // build_indices on the compute stream. Default off until
-                // the pod PASS at 24K reproduces the wash-case improvement.
-                if dsv4_flashmla_tp_overlap_enabled()? {
-                    let overlap_group = Arc::new(NcclGroup::new_on_stream(
+                if comm_matches_global_tp {
+                    let group = Arc::new(NcclGroup::new_on_stream(
                         config.tp.rank,
                         config.tp.world_size,
-                        dsv4_nccl_env_bootstrap_with_port_offset(2)?,
-                        ctx.comm_stream.clone(),
+                        NcclInitMethod::EnvBootstrap,
+                        ctx.stream.clone(),
                     )?);
-                    comm = comm.with_tp_overlap_nccl(overlap_group)?;
+                    comm = comm.with_tp_nccl(Arc::clone(&group))?;
+                    comm = comm.with_request_token_sync_nccl(Arc::clone(&group));
+                    tp_nccl = Some(group);
+
+                    // A4 — secondary TP NCCL group bound to `ctx.comm_stream` so
+                    // FlashMLA prefill AllGather Q can overlap with kv_pack /
+                    // build_indices on the compute stream. Default off until
+                    // the pod PASS at 24K reproduces the wash-case improvement.
+                    if dsv4_flashmla_tp_overlap_enabled()? {
+                        let overlap_group = Arc::new(NcclGroup::new_on_stream(
+                            config.tp.rank,
+                            config.tp.world_size,
+                            dsv4_nccl_env_bootstrap_with_port_offset(2)?,
+                            ctx.comm_stream.clone(),
+                        )?);
+                        comm = comm.with_tp_overlap_nccl(overlap_group)?;
+                    }
+                } else {
+                    if dsv4_flashmla_tp_overlap_enabled()? {
+                        bail!(
+                            "ARLE_DSV4_FLASHMLA_TP_OVERLAP requires a global TP communicator; \
+                             current communicator_axes={} global_tp={}/{} axes={}",
+                            comm.axis_summary(),
+                            config.tp.rank,
+                            config.tp.world_size,
+                            config.axes.summary(),
+                        );
+                    }
+                    info!(
+                        "DeepSeek V4 owner-group communicator axes declared without global TP NCCL attach: communicator_axes={} global_tp={}/{} axes={}",
+                        comm.axis_summary(),
+                        config.tp.rank,
+                        config.tp.world_size,
+                        config.axes.summary(),
+                    );
                 }
             }
             if config.ep.world_size > 1 {
@@ -397,6 +446,7 @@ impl DeepseekModel {
 
         #[cfg(not(feature = "nccl"))]
         {
+            let _ = ctx;
             if config.tp.world_size > 1 || config.ep.world_size > 1 {
                 bail!(
                     "DeepSeek V4 TP/EP world_size > 1 requires building infer with --features nccl"

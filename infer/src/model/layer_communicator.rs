@@ -2,9 +2,9 @@
 //! forward paths.
 //!
 //! Qwen paths still use mostly single-rank/no-op behavior, while DeepSeek V4
-//! wires this into real TP/EP NCCL groups and optional native DeepEP state.
-//! Attention-DP/CP and MoE-DP subgroup communicators are represented in the
-//! API surface but are not yet wired for the SGLang-path contract.
+//! wires this into real global TP/EP NCCL groups and optional native DeepEP
+//! state. Attention-DP/CP and MoE-DP subgroup communicators are represented in
+//! the API surface but are not yet wired for the SGLang-path contract.
 
 use anyhow::{Result, bail};
 
@@ -301,9 +301,22 @@ impl LayerCommunicator {
     pub fn layout_label(&self) -> &'static str {
         if self.dp_world_size == 1 && self.cp_world_size == 1 {
             "global-tp-ep-only"
+        } else if self.owner_group_collectives_ready() {
+            "owner-groups-collectives-ready"
         } else {
-            "declared-dp-cp-no-collectives"
+            "declared-owner-groups-no-collectives"
         }
+    }
+
+    pub fn owner_group_collectives_ready(&self) -> bool {
+        if self.dp_world_size == 1 && self.cp_world_size == 1 {
+            return true;
+        }
+
+        // The current communicator stores only the global TP/EP NCCL groups.
+        // SGLang-style owner groups also need attention-DP/CP token sync
+        // collectives before this can be treated as comparable execution.
+        false
     }
 
     /// Phase B-1 commit C.4 accessor: shared TP NCCL group, if one was
@@ -937,6 +950,10 @@ mod tests {
         assert_eq!(comm.layout_label(), "global-tp-ep-only");
 
         let advanced = LayerCommunicator::new_with_ep(0, 4, 1, 2, 0, 1, 0, 4).unwrap();
-        assert_eq!(advanced.layout_label(), "declared-dp-cp-no-collectives");
+        assert!(!advanced.owner_group_collectives_ready());
+        assert_eq!(
+            advanced.layout_label(),
+            "declared-owner-groups-no-collectives"
+        );
     }
 }

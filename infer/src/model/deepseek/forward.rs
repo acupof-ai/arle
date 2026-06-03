@@ -799,10 +799,18 @@ impl ModelForward for DeepseekModel {
                         .to_string(),
                 );
             }
-            if communicator_layout == "global-tp-ep-only" {
-                missing.push(format!(
-                    "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); SGLang-path native DeepEP needs explicit attention/MoE owner-group communicator mapping before it is comparable"
-                ));
+            match communicator_layout {
+                "owner-groups-collectives-ready" => {}
+                "global-tp-ep-only" => {
+                    missing.push(format!(
+                        "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); SGLang-path native DeepEP needs explicit attention/MoE owner-group communicator mapping before it is comparable"
+                    ));
+                }
+                _ => {
+                    missing.push(format!(
+                        "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); owner-group axes are declared but attention-DP/CP token-sync collectives are not wired"
+                    ));
+                }
             }
             #[cfg(feature = "nccl")]
             if contract.effective_world_size > 1 && self.request_token_sync_nccl().is_none() {
