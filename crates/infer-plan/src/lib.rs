@@ -235,7 +235,7 @@ pub fn sample_token(logits: &[f32], params: &SamplingParams, position: u64) -> u
     let mut cand: Vec<(u32, f32)> = logits
         .iter()
         .enumerate()
-        .map(|(i, &l)| (i as u32, (((l - max) * inv_t) as f32).exp()))
+        .map(|(i, &l)| (i as u32, ((l - max) * inv_t).exp()))
         .collect();
     let sum: f32 = cand.iter().map(|(_, p)| *p).sum();
     if sum > 0.0 {
