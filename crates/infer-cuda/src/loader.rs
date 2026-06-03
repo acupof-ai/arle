@@ -257,6 +257,121 @@ impl SafetensorLoader {
             .with_context(|| format!("upload tensor {name}"))
     }
 
+    /// Load a 2D BF16 weight, slice it to this TP rank, and upload the shard.
+    ///
+    /// The host-side byte slicing is the feature-agnostic
+    /// [`crate::shard_slice`] math:
+    /// - [`ParallelLinearKind::Column`] (`q/k/v/gate/up_proj`) slices the output
+    ///   dim (rows) via [`infer_topo::column_shard`].
+    /// - [`ParallelLinearKind::Row`] (`o_proj/down_proj`) slices the input dim
+    ///   (cols) via [`infer_topo::row_shard`].
+    ///
+    /// On a single-GPU [`TpConfig`] this is the identity slice — same bytes as
+    /// [`Self::load_matrix`].
+    #[allow(dead_code)]
+    fn load_matrix_sharded(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        kind: infer_topo::ParallelLinearKind,
+        tp: &infer_topo::TpConfig,
+    ) -> Result<DeviceMatrix> {
+        const BF16_ELEM_SIZE: usize = 2;
+        let tensor = self.load_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D BF16 tensor, got shape {:?}",
+            tensor.shape
+        );
+        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+        let sharded = match kind {
+            infer_topo::ParallelLinearKind::Column => {
+                let spec = infer_topo::column_shard(rows, tp);
+                crate::shard_slice::shard_column_parallel(
+                    &tensor.bytes,
+                    rows,
+                    cols,
+                    BF16_ELEM_SIZE,
+                    &spec,
+                )?
+            }
+            infer_topo::ParallelLinearKind::Row => {
+                let spec = infer_topo::row_shard(cols, tp);
+                crate::shard_slice::shard_row_parallel(
+                    &tensor.bytes,
+                    rows,
+                    cols,
+                    BF16_ELEM_SIZE,
+                    &spec,
+                )?
+            }
+        };
+        DeviceMatrix::from_safetensors(ctx, &sharded.bytes, sharded.rows, sharded.cols)
+            .with_context(|| format!("upload sharded tensor {name}"))
+    }
+
+    /// Load this EP rank's per-expert MoE weight stacks for one layer
+    /// (`gate_proj` / `up_proj` / `down_proj`), the router gate, and the shared
+    /// expert, then build the device-resident per-expert weight-pointer tables.
+    ///
+    /// Tensor naming follows the mlx-lm `qwen3_5_moe` HF convention:
+    /// `<layer>.mlp.experts.{e}.{gate,up,down}_proj.weight`,
+    /// `<layer>.mlp.gate.weight` (router), and `<layer>.mlp.shared_expert.*`.
+    ///
+    /// Only the experts owned by `split` (per [`crate::moe_config::ExpertSplit`])
+    /// are loaded; single-GPU (`ep_size == 1`) loads every expert. The owned
+    /// range is `split.local_expert_start .. split.local_expert_end()`, which is
+    /// the contiguous slice the EP group from [`infer_topo::build_moe_ep_groups`]
+    /// assigns to this rank.
+    #[allow(dead_code)]
+    fn load_moe_layer_experts(
+        &self,
+        ctx: &DeviceContext,
+        layer_prefix: &str,
+        split: &crate::moe_config::ExpertSplit,
+    ) -> Result<MoeLayerWeights> {
+        let mut gate = Vec::with_capacity(split.experts_per_rank);
+        let mut up = Vec::with_capacity(split.experts_per_rank);
+        let mut down = Vec::with_capacity(split.experts_per_rank);
+        for e in split.local_expert_start..split.local_expert_end() {
+            let base = format!("{layer_prefix}.mlp.experts.{e}");
+            gate.push(self.load_matrix(ctx, &format!("{base}.gate_proj.weight"))?);
+            up.push(self.load_matrix(ctx, &format!("{base}.up_proj.weight"))?);
+            down.push(self.load_matrix(ctx, &format!("{base}.down_proj.weight"))?);
+        }
+        let router_gate = self.load_matrix(ctx, &format!("{layer_prefix}.mlp.gate.weight"))?;
+        let shared_prefix = format!("{layer_prefix}.mlp.shared_expert");
+        let shared_gate = self.load_matrix(ctx, &format!("{shared_prefix}.gate_proj.weight"))?;
+        let shared_up = self.load_matrix(ctx, &format!("{shared_prefix}.up_proj.weight"))?;
+        let shared_down = self.load_matrix(ctx, &format!("{shared_prefix}.down_proj.weight"))?;
+        let shared_gate_router = self.load_matrix(
+            ctx,
+            &format!("{layer_prefix}.mlp.shared_expert_gate.weight"),
+        )?;
+
+        // Per-expert weight-pointer tables (one device pointer per owned expert).
+        let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
+        let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
+        let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
+        let gate_ptrs = cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &gate_refs)?;
+        let up_ptrs = cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &up_refs)?;
+        let down_ptrs = cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &down_refs)?;
+
+        Ok(MoeLayerWeights {
+            gate,
+            up,
+            down,
+            gate_ptrs,
+            up_ptrs,
+            down_ptrs,
+            router_gate,
+            shared_gate,
+            shared_up,
+            shared_down,
+            shared_gate_router,
+        })
+    }
+
     fn load_tensor(&self, name: &str) -> Result<OwnedTensor> {
         if let Some(&idx) = self.weight_map.get(name) {
             return self.load_tensor_from_shard(idx, name);
@@ -310,4 +425,26 @@ struct SafetensorIndex {
 struct OwnedTensor {
     shape: Vec<usize>,
     bytes: Vec<u8>,
+}
+
+/// This EP rank's loaded MoE weights for one sparse layer (MoE-3).
+///
+/// Holds the per-rank-owned routed-expert `gate`/`up`/`down` stacks (one
+/// [`DeviceMatrix`] per owned expert), their device-resident weight-pointer
+/// tables for the grouped GEMM, the router gate, and the single shared expert
+/// (gate/up/down + its sigmoid gate). Built by
+/// [`SafetensorLoader::load_moe_layer_experts`].
+#[allow(dead_code)]
+struct MoeLayerWeights {
+    gate: Vec<DeviceMatrix>,
+    up: Vec<DeviceMatrix>,
+    down: Vec<DeviceMatrix>,
+    gate_ptrs: CudaSlice<u64>,
+    up_ptrs: CudaSlice<u64>,
+    down_ptrs: CudaSlice<u64>,
+    router_gate: DeviceMatrix,
+    shared_gate: DeviceMatrix,
+    shared_up: DeviceMatrix,
+    shared_down: DeviceMatrix,
+    shared_gate_router: DeviceMatrix,
 }

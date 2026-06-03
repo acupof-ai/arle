@@ -79,15 +79,6 @@ pub trait Sampler {
     fn sample(&mut self, logits: &Self::Logits, params: &[SamplingParams]) -> Vec<u32>;
 }
 
-/// Backend-internal graph capture and replay seam.
-pub trait GraphRunner {
-    /// Capture a graph bucket for `batch`.
-    fn capture(&mut self, batch: usize) -> anyhow::Result<()>;
-
-    /// Replay a captured graph bucket for `batch`.
-    fn replay(&mut self, batch: usize) -> anyhow::Result<()>;
-}
-
 /// Backend-internal model architecture seam.
 ///
 /// Model implementations use backend tensors and communicators below the

@@ -235,6 +235,9 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     /// Plan submitted with `inflight`, kept so `apply_output` can advance chunked
     /// prefill progress and resolve which rows produced tokens.
     pending_plan: Option<ForwardPlan>,
+    /// Set once [`Engine::warmup`] has run the backend warmup. The first
+    /// [`Engine::step`] triggers it lazily so callers need not warm up by hand.
+    warmed_up: bool,
 }
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
@@ -271,7 +274,25 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             completed: BTreeMap::new(),
             inflight: None,
             pending_plan: None,
+            warmed_up: false,
         }
+    }
+
+    /// Run backend warmup exactly once.
+    ///
+    /// Delegates to [`BackendExecutor::warmup`] (default no-op for Metal/mock).
+    /// Idempotent: subsequent calls are a no-op so the first [`Engine::step`]
+    /// can call it lazily without re-warming.
+    ///
+    /// # Errors
+    /// Propagates any error returned by the backend executor's warmup.
+    pub fn warmup(&mut self) -> Result<()> {
+        if self.warmed_up {
+            return Ok(());
+        }
+        self.executor.warmup()?;
+        self.warmed_up = true;
+        Ok(())
     }
 
     /// Submit a normal-priority request into the waiting queue.
@@ -324,6 +345,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// previous step completes, the CPU side admits requests and builds plan
     /// N+1 while the executor had already run plan N behind the seam.
     pub fn step(&mut self) -> Result<()> {
+        // Lazily warm the backend before the first step does any real work.
+        self.warmup()?;
+
         if let Some(inflight) = self.inflight.take() {
             match self.executor.poll(inflight)? {
                 PollResult::Ready(output) => {
@@ -1014,6 +1038,51 @@ mod testing {
         }
     }
 
+    /// Mock executor that records how many times `warmup` was called, so a test
+    /// can assert the engine warms the backend exactly once.
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct WarmupCountingExecutor {
+        pub(super) warmup_calls: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+
+    impl BackendExecutor for WarmupCountingExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            let mut tokens = Vec::new();
+            for row in &plan.prefill_rows {
+                let token = row.tokens.last().copied().map_or(1, |last| last + 1);
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                });
+            }
+            for row in &plan.decode_rows {
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token: row.last_token + 1,
+                    logprob: None,
+                    finish: None,
+                });
+            }
+            Ok(MockInflight {
+                output: StepOutput { tokens },
+                return_not_ready_once: false,
+            })
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            Ok(PollResult::Ready(inflight.output))
+        }
+
+        fn warmup(&mut self) -> Result<()> {
+            self.warmup_calls.set(self.warmup_calls.get() + 1);
+            Ok(())
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     pub(super) struct HoldGovernor;
 
@@ -1037,8 +1106,30 @@ mod tests {
     use infer_plan::FinishReason;
     use infer_seam::{KvAllocator, KvQuery};
 
-    use super::testing::{HoldGovernor, MockExecutor, MockKvPool};
+    use super::testing::{HoldGovernor, MockExecutor, MockKvPool, WarmupCountingExecutor};
     use super::*;
+
+    #[test]
+    fn engine_warms_backend_exactly_once_across_steps() -> Result<()> {
+        let executor = WarmupCountingExecutor::default();
+        let warmup_calls = executor.warmup_calls.clone();
+        let mut engine = Engine::new(executor, MockKvPool::new(1), 1);
+
+        // No warmup until the first step runs.
+        assert_eq!(warmup_calls.get(), 0);
+
+        let handle = engine.submit_request(vec![10], 3);
+        engine.run_to_idle()?;
+
+        // The backend was warmed exactly once even though many steps ran.
+        assert_eq!(warmup_calls.get(), 1);
+        assert!(engine.completed(handle).is_some());
+
+        // An explicit warmup after the lazy one is a no-op.
+        engine.warmup()?;
+        assert_eq!(warmup_calls.get(), 1);
+        Ok(())
+    }
 
     fn test_config(num_slots: usize) -> SchedulerConfig {
         SchedulerConfig {
