@@ -602,4 +602,42 @@ mod tests {
         }
         Ok(())
     }
+
+    /// First REAL end-to-end agent-workflow bench on the new engine: drives
+    /// `Engine<MetalExecutor, MetalKvPool>` over a multi-turn workflow with the
+    /// real MLX Qwen3.5-0.8B forward. Run:
+    ///   CUDARC_CUDA_VERSION=12060 cargo test --release -p agent-bench --features metal \
+    ///     bench_agent_workflow_metal_qwen35_08b -- --ignored --nocapture
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "real Metal e2e bench; needs --features metal + the cached model"]
+    fn bench_agent_workflow_metal_qwen35_08b() -> Result<()> {
+        let model = "mlx-community/Qwen3.5-0.8B-MLX-4bit";
+        let (mut engine, ttft) = metal_engine_from_model_path(model)?;
+        // R3a/b MetalExecutor is single-row (no prefix reuse / chunked prefill yet —
+        // those land in R3c). So use a SINGLE turn whose prompt fits one chunk:
+        // a real single-request generation bench on the new engine. The multi-turn
+        // workflow (growing context -> chunked prefill + radix reuse) is enabled
+        // once R3c lands.
+        let wf = AgentWorkflow::synthetic(128, 1, 64, 128);
+        let mut probe = PeakMemProbe::new();
+        let m = run_agent_workflow_with_probe(&mut engine, &ttft, &wf, &mut probe)?;
+        let tok_per_s = m.total_generated as f64 / m.total_wall.as_secs_f64();
+        eprintln!(
+            "[agent-workflow METAL Qwen3.5-0.8B] turns={} total_gen={} total_wall={:?} \
+             tok_per_s={:.1} os_impact={:?}",
+            wf.turns.len(),
+            m.total_generated,
+            m.total_wall,
+            tok_per_s,
+            m.os_impact
+        );
+        for t in &m.turns {
+            eprintln!(
+                "  turn {} prompt_len={} gen={} ttft_ticks={} wall={:?}",
+                t.turn, t.prompt_len, t.generated, t.ticks_to_first_token, t.wall
+            );
+        }
+        Ok(())
+    }
 }
