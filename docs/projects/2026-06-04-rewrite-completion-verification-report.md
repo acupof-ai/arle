@@ -54,7 +54,7 @@ no circular blocker for cutover).
 | MoE forward (Qwen3.6) single-GPU | CUDA | **pending** | gated on Phase 0; kernels already exist (`ffi/moe.rs`) |
 | EP all-to-all + DeepEP | CUDA | **pending** | gated; `deepep-sys` + legacy `native_deepep.rs` exist → port |
 | DeepGEMM FP8 grouped GEMM | CUDA | **pending** | build-gated FFI exists; runtime wiring greenfield |
-| CUDA Graph capture/replay | CUDA | **foundation verified** | `6d4a3254` (graph.rs + Engine::warmup); impl+verify gated on Phase 0 |
+| CUDA Graph capture/replay | CUDA | **VERIFIED** | H20 eager==replay==HF gold (16/16); nsys: cuGraphLaunch×16 + capture×2 (impl `20274cdb`, `INFER_CUDA_DECODE_GRAPH=1`) |
 | CUDA toolchain build (sm_70) | V100 | **verified (build/CPU)** | V100 node: GPU-free suite 64/0; native CUDA-C compiles sm_70 |
 | HTTP OpenAI v1 (non-stream) | both | **partial** | infer-server completions; streaming/`/v1/models`/`/v1/stats` pending |
 
