@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 
+use crate::loader::TensorMap;
 use crate::mlx::{MlxArray, concatenate_axis, eval};
 
 /// A projection weight registered with the Qwen35 compiled model.
@@ -34,6 +35,77 @@ impl WeightTensor {
                 .context("quantized projection missing output dimension"),
         }
     }
+}
+
+/// A 3-D stack of affine-quantized expert weights for Qwen3.6 MoE.
+#[allow(dead_code)]
+pub(crate) struct StackedQuantized {
+    pub(crate) weight: MlxArray,
+    pub(crate) scales: MlxArray,
+    pub(crate) biases: MlxArray,
+    pub(crate) group_size: i32,
+    pub(crate) bits: i32,
+}
+
+/// Load a 2-D affine-quantized projection with explicit bits/group size.
+pub(crate) fn load_quantized_with_bits(
+    tensors: &TensorMap,
+    base: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<WeightTensor> {
+    let w = tensors
+        .get(&format!("{base}.weight"))
+        .cloned()
+        .with_context(|| format!("missing quantized weight '{base}.weight'"))?;
+    let scales = tensors
+        .get(&format!("{base}.scales"))
+        .cloned()
+        .with_context(|| format!("missing quantized scales '{base}.scales'"))?;
+    let biases = tensors
+        .get(&format!("{base}.biases"))
+        .cloned()
+        .with_context(|| format!("missing quantized biases '{base}.biases'"))?;
+    Ok(WeightTensor::Quantized {
+        w,
+        scales,
+        biases,
+        group_size,
+        bits,
+    })
+}
+
+/// Load a 3-D affine-quantized expert stack from safetensors.
+pub(crate) fn load_stacked_quantized(
+    tensors: &TensorMap,
+    base: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<StackedQuantized> {
+    let weight = tensors
+        .get(&format!("{base}.weight"))
+        .cloned()
+        .with_context(|| format!("missing stacked quantized weight '{base}.weight'"))?;
+    let scales = tensors
+        .get(&format!("{base}.scales"))
+        .cloned()
+        .with_context(|| format!("missing stacked quantized scales '{base}.scales'"))?;
+    let biases = tensors
+        .get(&format!("{base}.biases"))
+        .cloned()
+        .with_context(|| format!("missing stacked quantized biases '{base}.biases'"))?;
+    anyhow::ensure!(
+        weight.shape().len() == 3,
+        "stacked quantized weight '{base}.weight' must be 3-D, got shape {:?}",
+        weight.shape()
+    );
+    Ok(StackedQuantized {
+        weight,
+        scales,
+        biases,
+        group_size,
+        bits,
+    })
 }
 
 /// MLP input projections for one dense Qwen3.5 layer.

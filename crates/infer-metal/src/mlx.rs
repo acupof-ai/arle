@@ -306,6 +306,12 @@ pub fn async_eval(arrays: &[&MlxArray]) {
     panic_if_mlx_error("mlx_async_eval");
 }
 
+pub fn set_wired_limit_bytes(limit: u64) -> u64 {
+    let previous = unsafe { mlx_sys::mlx_set_wired_limit(limit as usize) as u64 };
+    panic_if_mlx_error("mlx_set_wired_limit");
+    previous
+}
+
 pub fn load_safetensors(path: &str) -> anyhow::Result<std::collections::HashMap<String, MlxArray>> {
     let path = std::ffi::CString::new(path)?;
     let mut names: *mut *const i8 = std::ptr::null_mut();
