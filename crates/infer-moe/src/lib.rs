@@ -1,0 +1,53 @@
+//! `infer-moe` — Phase-2 (EP / MoE) FOUNDATION for the ARLE rewrite.
+//!
+//! Pure, **CPU-verifiable**, device-independent MoE routing / gating math. This
+//! is a faithful port of the numerics in the two legacy ARLE routers, with all
+//! GPU / CUDA coupling deliberately dropped. The GPU MoE kernel is verified
+//! against this reference later — the same role `infer-topo` plays for TP
+//! sharding. The crate depends on nothing but `std` (plus an optional `serde`
+//! feature for (de)serializing the config types).
+//!
+//! # Which model uses which routing rule
+//!
+//! | Aspect            | DSv4 (`deepseek-spec/src/v4.rs`)        | Qwen3.6 (`qwen35/moe.rs`)        |
+//! |-------------------|-----------------------------------------|----------------------------------|
+//! | Scoring func      | `softmax` / `sigmoid` / `sqrtsoftplus`  | `softmax` (plain)                |
+//! | Selection         | top-k by `score + bias` (`noaux_tc`)    | greedy top-k by score (no bias)  |
+//! | Weight denom      | `1.0` (softmax) / `selected_sum+1e-9`   | `1.0`, then optional norm renorm |
+//! | `norm_topk_prob`  | softmax: no renorm; else always norm    | optional separate renorm step    |
+//! | `routed_scaling`  | config (`routed_scaling_factor`)        | `1.0`                            |
+//! | shared experts    | `n_shared_experts` always-on            | exactly one, sigmoid-gated       |
+//! | `n_group`/`topk_group` | **absent** (no group-limited routing) | **absent**                  |
+//!
+//! Group-limited routing (`n_group` / `topk_group`) is the upstream
+//! DeepSeek-V2/V3 mechanism, **not** wired by either ARLE router. The
+//! [`MoeConfig`] fields + [`group_limited_mask`] helper are provided so the same
+//! foundation can verify a grouped GPU kernel if a future checkpoint sets them.
+//!
+//! # Routing skeleton (unified in [`route`])
+//!
+//! ```text
+//! logits[E] ──scoring_func──▶ scores[E] ──topk(score[+bias], mask?)──▶ selected[k]
+//!     └─ softmax: weight = score (denom 1.0); optional norm_topk_prob renorm
+//!     └─ sigmoid/sqrtsoftplus: weight = score / (selected_sum + 1e-9)
+//!     └─ × routed_scaling_factor
+//! ```
+
+// Flat module layout, no `mod.rs` (ARLE convention).
+#[path = "config.rs"]
+mod config;
+#[path = "error.rs"]
+mod error;
+#[path = "route.rs"]
+mod route;
+
+pub use config::{MoeConfig, ScoringFunc, TopkMethod};
+pub use error::{MoeError, Result};
+pub use route::{
+    ExpertWeight, RoutingDecision, group_limited_mask, route, route_token, scores_from_logits,
+    sigmoid, stable_softmax, stable_softplus,
+};
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

@@ -14,6 +14,7 @@ members = [
     "crates/infer-cuda",
     "crates/infer-metal",
     "crates/infer-models",
+    "crates/infer-moe",
     "crates/infer-plan",
     "crates/infer-seam",
     "crates/infer-server",
