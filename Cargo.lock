@@ -1910,6 +1910,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-moe"
+version = "0.1.5"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "infer-plan"
 version = "0.1.5"
 dependencies = [
