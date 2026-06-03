@@ -1,15 +1,18 @@
 //! Backend-agnostic inference engine loop.
 //!
-//! This crate depends only on the plan and seam contracts. It does not know
-//! about backend runtimes, device buffers, or model implementation details.
+//! This crate depends only on the plan and seam contracts. Runtime-specific
+//! buffers and model implementation details stay below `infer-seam`.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, VecDeque};
 
 use anyhow::{Result, bail};
 use infer_plan::{
     DecodeRow, FinishReason, ForwardMode, ForwardPlan, PrefillRow, SlotToken, StepOutput,
 };
-use infer_seam::{BackendExecutor, KvPool, PollResult};
+use infer_seam::{
+    AdmissionVerdict, BackendExecutor, KvPool, PermissiveGovernor, PollResult, ResourceGovernor,
+};
 
 const STOP_TOKEN_ID: u32 = 0;
 
@@ -22,6 +25,85 @@ impl RequestHandle {
     #[must_use]
     pub fn id(self) -> u64 {
         self.0
+    }
+}
+
+/// Request priority level. Higher-priority requests are admitted first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum RequestPriority {
+    /// Background or batch work.
+    Low = 0,
+    /// Normal API work.
+    #[default]
+    Normal = 1,
+    /// Interactive or latency-sensitive work.
+    High = 2,
+}
+
+/// Scheduler admission knobs used by `infer-core`.
+#[derive(Debug, Clone)]
+pub struct SchedulerConfig {
+    /// Maximum number of concurrently active request slots.
+    pub num_slots: usize,
+    /// Maximum total tokens assigned to one scheduler tick.
+    pub max_num_batched_tokens: usize,
+    /// Maximum prompt tokens admitted for prefill in one scheduler tick.
+    pub max_prefill_tokens: usize,
+    /// Maximum number of requests allowed to be prefilling at once.
+    pub prefill_max_requests: Option<usize>,
+    /// Maximum prompt length accepted at ingress.
+    pub max_prompt_tokens: usize,
+    /// Maximum prompt plus generated length for one request.
+    pub max_total_tokens: usize,
+}
+
+impl SchedulerConfig {
+    /// Build runtime defaults for a fixed logical slot count.
+    #[must_use]
+    pub fn for_slots(num_slots: usize) -> Self {
+        Self {
+            num_slots,
+            ..Self::default()
+        }
+    }
+
+    fn max_concurrent_prefill(&self) -> usize {
+        self.prefill_max_requests.unwrap_or(self.num_slots).max(1)
+    }
+
+    fn prefill_step_budget(&self) -> usize {
+        self.max_num_batched_tokens.min(self.max_prefill_tokens)
+    }
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            num_slots: 4,
+            max_num_batched_tokens: 16_384,
+            max_prefill_tokens: 16_384,
+            prefill_max_requests: None,
+            max_prompt_tokens: 16_384,
+            max_total_tokens: 32_768,
+        }
+    }
+}
+
+/// Options accepted at request ingress.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestOptions {
+    /// Admission priority.
+    pub priority: RequestPriority,
+    /// Cooperative cancellation observed before queue insertion.
+    pub cancelled: bool,
+}
+
+impl Default for RequestOptions {
+    fn default() -> Self {
+        Self {
+            priority: RequestPriority::Normal,
+            cancelled: false,
+        }
     }
 }
 
@@ -38,34 +120,73 @@ pub struct CompletedRequest {
     pub finish: Option<FinishReason>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WaitingRequestHint {
+    session_affinity_tokens: usize,
+    immediate_reuse_tokens: usize,
+    total_reuse_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitingInsertBias {
+    BeforeEqual,
+    AfterEqual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestPhase {
+    Prefilling { progress: usize },
+    Decoding,
+    Finished,
+}
+
 #[derive(Debug, Clone)]
 struct RequestState {
     handle: RequestHandle,
     prompt_tokens: Vec<u32>,
     generated_tokens: Vec<u32>,
+    priority: RequestPriority,
     max_tokens: usize,
-    prefilled: bool,
-    done: bool,
+    phase: RequestPhase,
     finish: Option<FinishReason>,
+    waiting_hint: WaitingRequestHint,
 }
 
 impl RequestState {
-    fn new(handle: RequestHandle, prompt_tokens: Vec<u32>, max_tokens: usize) -> Self {
+    fn new(
+        handle: RequestHandle,
+        prompt_tokens: Vec<u32>,
+        priority: RequestPriority,
+        max_tokens: usize,
+    ) -> Self {
         Self {
             handle,
             prompt_tokens,
             generated_tokens: Vec::new(),
+            priority,
             max_tokens,
-            prefilled: false,
-            done: false,
+            phase: RequestPhase::Prefilling { progress: 0 },
             finish: None,
+            waiting_hint: WaitingRequestHint::default(),
         }
     }
 
     fn complete_immediately(mut self, finish: FinishReason) -> Self {
-        self.done = true;
+        self.phase = RequestPhase::Finished;
         self.finish = Some(finish);
         self
+    }
+
+    fn reset_for_recompute(mut self) -> Self {
+        self.generated_tokens.clear();
+        self.phase = RequestPhase::Prefilling { progress: 0 };
+        self.finish = None;
+        self.waiting_hint = WaitingRequestHint::default();
+        self
+    }
+
+    fn prompt_len(&self) -> usize {
+        self.prompt_tokens.len()
     }
 }
 
@@ -80,14 +201,16 @@ impl From<RequestState> for CompletedRequest {
     }
 }
 
-/// Minimal backend-agnostic engine loop.
+/// Backend-agnostic engine loop.
 ///
-/// R1a intentionally keeps scheduling simple: first-come admission into empty
-/// slots, full-prompt prefill, then one-token decode until completion.
+/// R1b ports the host-side admission and slot lifecycle only. Radix prefix
+/// reuse and tiered-KV readmission are intentionally deferred; the hooks stay
+/// at waiting-request hints and host page-fit admission.
 pub struct Engine<E: BackendExecutor, K: KvPool> {
     executor: E,
     kv: K,
-    max_slots: usize,
+    config: SchedulerConfig,
+    governor: Box<dyn ResourceGovernor>,
     next_request_id: u64,
     active: BTreeMap<usize, RequestState>,
     waiting: VecDeque<RequestState>,
@@ -96,13 +219,31 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
 }
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
-    /// Create an engine with a fixed number of logical slots.
+    /// Create an engine with permissive resource governance.
     #[must_use]
     pub fn new(executor: E, kv: K, max_slots: usize) -> Self {
+        Self::with_config(executor, kv, SchedulerConfig::for_slots(max_slots))
+    }
+
+    /// Create an engine with explicit scheduler config.
+    #[must_use]
+    pub fn with_config(executor: E, kv: K, config: SchedulerConfig) -> Self {
+        Self::with_config_and_governor(executor, kv, config, Box::new(PermissiveGovernor))
+    }
+
+    /// Create an engine with explicit scheduler config and resource governor.
+    #[must_use]
+    pub fn with_config_and_governor(
+        executor: E,
+        kv: K,
+        config: SchedulerConfig,
+        governor: Box<dyn ResourceGovernor>,
+    ) -> Self {
         Self {
             executor,
             kv,
-            max_slots,
+            config,
+            governor,
             next_request_id: 0,
             active: BTreeMap::new(),
             waiting: VecDeque::new(),
@@ -111,12 +252,46 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
     }
 
-    /// Submit a request into the waiting queue.
+    /// Submit a normal-priority request into the waiting queue.
     pub fn submit_request(&mut self, prompt_tokens: Vec<u32>, max_tokens: usize) -> RequestHandle {
-        let handle = RequestHandle(self.next_request_id);
-        self.next_request_id = self.next_request_id.saturating_add(1);
-        self.waiting
-            .push_back(RequestState::new(handle, prompt_tokens, max_tokens));
+        self.submit_request_with_options(prompt_tokens, max_tokens, RequestOptions::default())
+    }
+
+    /// Submit a request with a specific priority.
+    pub fn submit_request_with_priority(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        priority: RequestPriority,
+    ) -> RequestHandle {
+        self.submit_request_with_options(
+            prompt_tokens,
+            max_tokens,
+            RequestOptions {
+                priority,
+                cancelled: false,
+            },
+        )
+    }
+
+    /// Submit a request with full ingress options.
+    pub fn submit_request_with_options(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        options: RequestOptions,
+    ) -> RequestHandle {
+        let handle = self.next_handle();
+        let request = self.normalize_request(handle, prompt_tokens, max_tokens, options);
+        match request {
+            NormalizedRequest::Waiting(request) => {
+                self.enqueue_waiting_request(request, WaitingInsertBias::AfterEqual);
+            }
+            NormalizedRequest::Completed(request) => {
+                self.completed.insert(handle, request.into());
+            }
+            NormalizedRequest::Skipped => {}
+        }
         handle
     }
 
@@ -138,7 +313,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         self.admit_waiting()?;
-        let plan = self.build_forward_plan();
+        let mut plan = self.build_forward_plan();
+        if plan.is_idle() {
+            return Ok(());
+        }
+
+        self.retract_decode_to_fit(&mut plan);
         if plan.is_idle() {
             return Ok(());
         }
@@ -181,10 +361,65 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.waiting.len()
     }
 
+    /// Return currently free host-indexed KV pages.
+    #[must_use]
+    pub fn kv_free_pages(&self) -> usize {
+        self.kv.free_pages()
+    }
+
     /// Return a completed request by handle.
     #[must_use]
     pub fn completed(&self, handle: RequestHandle) -> Option<&CompletedRequest> {
         self.completed.get(&handle)
+    }
+
+    fn next_handle(&mut self) -> RequestHandle {
+        let handle = RequestHandle(self.next_request_id);
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        handle
+    }
+
+    fn normalize_request(
+        &self,
+        handle: RequestHandle,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        options: RequestOptions,
+    ) -> NormalizedRequest {
+        if options.cancelled {
+            return NormalizedRequest::Skipped;
+        }
+
+        if prompt_tokens.is_empty() || prompt_tokens.len() > self.config.max_prompt_tokens {
+            return NormalizedRequest::Completed(
+                RequestState::new(handle, prompt_tokens, options.priority, 0)
+                    .complete_immediately(FinishReason::Abort),
+            );
+        }
+
+        let max_tokens = max_tokens.min(
+            self.config
+                .max_total_tokens
+                .saturating_sub(prompt_tokens.len()),
+        );
+        if max_tokens == 0 {
+            return NormalizedRequest::Completed(
+                RequestState::new(handle, prompt_tokens, options.priority, 0)
+                    .complete_immediately(FinishReason::Length),
+            );
+        }
+
+        NormalizedRequest::Waiting(RequestState::new(
+            handle,
+            prompt_tokens,
+            options.priority,
+            max_tokens,
+        ))
+    }
+
+    fn enqueue_waiting_request(&mut self, request: RequestState, bias: WaitingInsertBias) {
+        let insert_at = waiting_insert_position(&self.waiting, &request, bias);
+        self.waiting.insert(insert_at, request);
     }
 
     fn apply_output(&mut self, output: StepOutput) {
@@ -195,48 +430,100 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 continue;
             };
 
-            request.prefilled = true;
+            if let RequestPhase::Prefilling { progress } = &mut request.phase {
+                *progress = request.prompt_tokens.len();
+                request.phase = RequestPhase::Decoding;
+            }
             request.generated_tokens.push(token.token);
 
             if let Some(finish) = finish_reason_for(request, &token) {
-                request.done = true;
-                request.finish = Some(finish);
-                finished_slots.push(token.slot);
+                finished_slots.push((token.slot, finish));
             }
         }
 
-        for slot in finished_slots {
-            if let Some(request) = self.active.remove(&slot) {
-                self.kv.free_slot(slot);
-                self.completed.insert(request.handle, request.into());
-            }
+        for (slot, reason) in finished_slots {
+            self.finish_slot(slot, reason);
         }
     }
 
+    fn finish_slot(&mut self, slot: usize, reason: FinishReason) {
+        let Some(mut request) = self.active.remove(&slot) else {
+            return;
+        };
+        request.phase = RequestPhase::Finished;
+        request.finish = Some(reason);
+        self.kv.free_slot(slot);
+        self.completed.insert(request.handle, request.into());
+    }
+
     fn admit_waiting(&mut self) -> Result<()> {
-        if self.max_slots == 0 && !self.waiting.is_empty() {
+        match self.governor.admission_gate() {
+            AdmissionVerdict::Admit | AdmissionVerdict::ShedTo(_) => {}
+            AdmissionVerdict::Hold => return Ok(()),
+        }
+
+        if self.config.num_slots == 0 && !self.waiting.is_empty() {
             bail!("infer-core engine has waiting requests but zero slots");
         }
 
-        for slot in 0..self.max_slots {
-            if self.waiting.is_empty() {
+        let mut free_slots = self.free_slots();
+        let mut remaining_prefill_tokens = self.config.prefill_step_budget();
+        let mut active_prefills = self.active_prefill_count();
+        let max_prefills = self.config.max_concurrent_prefill();
+        let mut remaining_pages = self.kv.free_pages();
+
+        while !free_slots.is_empty() && !self.waiting.is_empty() {
+            if active_prefills >= max_prefills {
                 break;
-            }
-            if self.active.contains_key(&slot) {
-                continue;
             }
 
-            let Some(request) = self.waiting.pop_front() else {
+            let Some(candidate) = self.waiting.front() else {
                 break;
             };
-            if request.max_tokens == 0 {
-                let completed = request.complete_immediately(FinishReason::Length);
-                self.completed.insert(completed.handle, completed.into());
-            } else {
-                self.active.insert(slot, request);
+            let prompt_tokens = candidate.prompt_len();
+            if prompt_tokens > remaining_prefill_tokens {
+                break;
             }
+
+            let pages_needed = self.full_request_pages_needed(candidate);
+            if self.kv.is_active() && pages_needed > remaining_pages {
+                break;
+            }
+
+            let slot = free_slots.remove(0);
+            let request = self
+                .waiting
+                .pop_front()
+                .expect("waiting.front() was Some above");
+            remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(prompt_tokens);
+            remaining_pages = remaining_pages.saturating_sub(pages_needed);
+            active_prefills += 1;
+            self.active.insert(slot, request);
         }
+
         Ok(())
+    }
+
+    fn free_slots(&self) -> Vec<usize> {
+        (0..self.config.num_slots)
+            .filter(|slot| !self.active.contains_key(slot))
+            .collect()
+    }
+
+    fn active_prefill_count(&self) -> usize {
+        self.active
+            .values()
+            .filter(|request| matches!(request.phase, RequestPhase::Prefilling { .. }))
+            .count()
+    }
+
+    fn full_request_pages_needed(&self, request: &RequestState) -> usize {
+        let page_size = self.kv.page_size().max(1);
+        let tokens = request
+            .prompt_tokens
+            .len()
+            .saturating_add(request.max_tokens);
+        tokens.div_ceil(page_size)
     }
 
     fn build_forward_plan(&self) -> ForwardPlan {
@@ -244,44 +531,93 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let mut decode_rows = Vec::new();
 
         for (&slot, request) in &self.active {
-            if request.done {
-                continue;
+            match request.phase {
+                RequestPhase::Prefilling { .. } => {
+                    prefill_rows.push(PrefillRow {
+                        slot,
+                        tokens: request.prompt_tokens.clone(),
+                        start_pos: 0,
+                        total_tokens: request.prompt_tokens.len(),
+                    });
+                }
+                RequestPhase::Decoding => {
+                    let Some(&last_token) = request.generated_tokens.last() else {
+                        continue;
+                    };
+                    decode_rows.push(DecodeRow {
+                        slot,
+                        last_token,
+                        kv_seq_len: self.kv.seq_len(slot),
+                    });
+                }
+                RequestPhase::Finished => {}
             }
-
-            if !request.prefilled {
-                prefill_rows.push(PrefillRow {
-                    slot,
-                    tokens: request.prompt_tokens.clone(),
-                    start_pos: 0,
-                    total_tokens: request.prompt_tokens.len(),
-                });
-                continue;
-            }
-
-            let Some(&last_token) = request.generated_tokens.last() else {
-                continue;
-            };
-            decode_rows.push(DecodeRow {
-                slot,
-                last_token,
-                kv_seq_len: self.kv.seq_len(slot),
-            });
         }
 
-        let mode = match (prefill_rows.is_empty(), decode_rows.is_empty()) {
-            (true, true) => ForwardMode::Idle,
-            (false, true) => ForwardMode::Prefill,
-            (true, false) => ForwardMode::Decode,
-            (false, false) => ForwardMode::Mixed,
-        };
-
         ForwardPlan {
-            mode,
+            mode: plan_mode(prefill_rows.is_empty(), decode_rows.is_empty()),
             decode_rows,
             prefill_rows,
             microbatch: None,
             spec: None,
         }
+    }
+
+    fn retract_decode_to_fit(&mut self, plan: &mut ForwardPlan) {
+        while self.kv.is_active()
+            && self.plan_new_pages_needed(plan) > self.kv.free_pages()
+            && plan.decode_rows.len() > 1
+        {
+            let Some(victim_pos) = self.retract_victim_pos(&plan.decode_rows) else {
+                break;
+            };
+            let victim_slot = plan.decode_rows[victim_pos].slot;
+            self.requeue_preempted_decode(victim_slot);
+            plan.decode_rows.remove(victim_pos);
+            plan.mode = plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
+        }
+    }
+
+    fn retract_victim_pos(&self, decode_rows: &[DecodeRow]) -> Option<usize> {
+        decode_rows
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, row)| {
+                self.active
+                    .get(&row.slot)
+                    .map_or((usize::MAX, Reverse(0)), |request| {
+                        (
+                            request.generated_tokens.len(),
+                            Reverse(request.prompt_tokens.len()),
+                        )
+                    })
+            })
+            .map(|(pos, _)| pos)
+    }
+
+    fn requeue_preempted_decode(&mut self, slot: usize) {
+        let Some(request) = self.active.remove(&slot) else {
+            return;
+        };
+        self.kv.free_slot(slot);
+        self.enqueue_waiting_request(
+            request.reset_for_recompute(),
+            WaitingInsertBias::BeforeEqual,
+        );
+    }
+
+    fn plan_new_pages_needed(&self, plan: &ForwardPlan) -> usize {
+        let prefill_pages = plan
+            .prefill_rows
+            .iter()
+            .map(|row| self.kv.append_pages_needed(row.slot, row.tokens.len()))
+            .sum::<usize>();
+        let decode_pages = plan
+            .decode_rows
+            .iter()
+            .map(|row| self.kv.append_pages_needed(row.slot, 1))
+            .sum::<usize>();
+        prefill_pages + decode_pages
     }
 
     fn allocate_for_plan(&mut self, plan: &ForwardPlan) -> Result<()> {
@@ -292,6 +628,57 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.kv.alloc(row.slot, 1)?;
         }
         Ok(())
+    }
+}
+
+enum NormalizedRequest {
+    Waiting(RequestState),
+    Completed(RequestState),
+    Skipped,
+}
+
+fn waiting_insert_position(
+    waiting: &VecDeque<RequestState>,
+    incoming: &RequestState,
+    bias: WaitingInsertBias,
+) -> usize {
+    waiting
+        .iter()
+        .position(|queued| waiting_request_precedes(incoming, queued, bias))
+        .unwrap_or(waiting.len())
+}
+
+fn waiting_request_precedes(
+    incoming: &RequestState,
+    queued: &RequestState,
+    bias: WaitingInsertBias,
+) -> bool {
+    match incoming.priority.cmp(&queued.priority) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match (
+            incoming.waiting_hint.session_affinity_tokens,
+            incoming.waiting_hint.immediate_reuse_tokens,
+            incoming.waiting_hint.total_reuse_tokens,
+        )
+            .cmp(&(
+                queued.waiting_hint.session_affinity_tokens,
+                queued.waiting_hint.immediate_reuse_tokens,
+                queued.waiting_hint.total_reuse_tokens,
+            )) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => matches!(bias, WaitingInsertBias::BeforeEqual),
+        },
+    }
+}
+
+fn plan_mode(prefill_empty: bool, decode_empty: bool) -> ForwardMode {
+    match (prefill_empty, decode_empty) {
+        (true, true) => ForwardMode::Idle,
+        (false, true) => ForwardMode::Prefill,
+        (true, false) => ForwardMode::Decode,
+        (false, false) => ForwardMode::Mixed,
     }
 }
 
@@ -313,7 +700,9 @@ mod testing {
 
     use anyhow::{Result, bail};
     use infer_plan::{SlotToken, StepOutput};
-    use infer_seam::{BackendExecutor, KvPool, PollResult};
+    use infer_seam::{
+        AdmissionVerdict, BackendExecutor, KvPool, PollResult, ResourceGovernor, StepBudget,
+    };
 
     use super::ForwardPlan;
 
@@ -323,18 +712,29 @@ mod testing {
         seq_lens: Vec<usize>,
         pages: Vec<Vec<u32>>,
         slot_epochs: Vec<u64>,
+        free_pages: Vec<u32>,
         next_page: u32,
         retained_pages: HashSet<u32>,
     }
 
     impl MockKvPool {
         pub(super) fn new(num_slots: usize) -> Self {
+            Self::with_capacity(num_slots, 16, 4096)
+        }
+
+        pub(super) fn with_capacity(
+            num_slots: usize,
+            page_size: usize,
+            total_pages: usize,
+        ) -> Self {
+            let capped_pages = total_pages.min(u32::MAX as usize);
             Self {
-                page_size: 16,
+                page_size,
                 seq_lens: vec![0; num_slots],
                 pages: vec![Vec::new(); num_slots],
                 slot_epochs: vec![0; num_slots],
-                next_page: 1,
+                free_pages: (1..=capped_pages as u32).rev().collect(),
+                next_page: capped_pages as u32 + 1,
                 retained_pages: HashSet::new(),
             }
         }
@@ -346,13 +746,25 @@ mod testing {
             Ok(())
         }
 
-        fn alloc_pages(&mut self, count: usize) -> Vec<u32> {
+        fn alloc_pages(&mut self, count: usize) -> Result<Vec<u32>> {
+            if count > self.free_pages.len() {
+                bail!(
+                    "mock pool out of pages: requested {count}, free {}",
+                    self.free_pages.len()
+                );
+            }
             let mut pages = Vec::with_capacity(count);
             for _ in 0..count {
-                pages.push(self.next_page);
+                pages.push(self.free_pages.pop().expect("free page count checked"));
+            }
+            Ok(pages)
+        }
+
+        fn ensure_total_capacity_for_detached(&mut self, count: usize) {
+            while self.free_pages.len() < count && self.next_page < u32::MAX {
+                self.free_pages.push(self.next_page);
                 self.next_page = self.next_page.saturating_add(1);
             }
-            pages
         }
     }
 
@@ -366,11 +778,19 @@ mod testing {
         }
 
         fn free_pages(&self) -> usize {
-            usize::MAX / self.page_size
+            self.free_pages.len()
         }
 
         fn free_tokens(&self) -> usize {
-            usize::MAX / 2
+            let partial_capacity = self
+                .seq_lens
+                .iter()
+                .map(|seq_len| {
+                    let tail = seq_len % self.page_size;
+                    if tail == 0 { 0 } else { self.page_size - tail }
+                })
+                .sum::<usize>();
+            self.free_pages.len() * self.page_size + partial_capacity
         }
 
         fn seq_len(&self, slot: usize) -> usize {
@@ -403,14 +823,15 @@ mod testing {
         fn alloc(&mut self, slot: usize, tokens: usize) -> Result<()> {
             self.ensure_slot(slot)?;
             let new_pages = self.append_pages_needed(slot, tokens);
-            let pages = self.alloc_pages(new_pages);
+            let pages = self.alloc_pages(new_pages)?;
             self.pages[slot].extend_from_slice(&pages);
             self.seq_lens[slot] += tokens;
             Ok(())
         }
 
         fn alloc_detached_pages(&mut self, pages: usize) -> Result<Vec<u32>> {
-            let pages = self.alloc_pages(pages);
+            self.ensure_total_capacity_for_detached(pages);
+            let pages = self.alloc_pages(pages)?;
             self.retained_pages.extend(pages.iter().copied());
             Ok(pages)
         }
@@ -431,13 +852,16 @@ mod testing {
             }
             self.seq_lens[slot] = new_len;
             let keep_pages = new_len.div_ceil(self.page_size);
-            self.pages[slot].truncate(keep_pages);
+            let slot_page_len = self.pages[slot].len();
+            let removed = self.pages[slot].split_off(keep_pages.min(slot_page_len));
+            self.free_pages.extend(removed);
             self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
             Ok(())
         }
 
         fn free_slot(&mut self, slot: usize) {
-            self.pages[slot].clear();
+            let pages = std::mem::take(&mut self.pages[slot]);
+            self.free_pages.extend(pages);
             self.seq_lens[slot] = 0;
             self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
         }
@@ -528,14 +952,47 @@ mod testing {
             }
         }
     }
+
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct HoldGovernor;
+
+    impl ResourceGovernor for HoldGovernor {
+        fn admission_gate(&self) -> AdmissionVerdict {
+            AdmissionVerdict::Hold
+        }
+
+        fn step_budget(&self) -> StepBudget {
+            StepBudget::UNBOUNDED
+        }
+
+        fn should_yield(&self) -> bool {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use infer_plan::FinishReason;
 
-    use super::testing::{MockExecutor, MockKvPool};
+    use super::testing::{HoldGovernor, MockExecutor, MockKvPool};
     use super::*;
+
+    fn test_config(num_slots: usize) -> SchedulerConfig {
+        SchedulerConfig {
+            num_slots,
+            max_prompt_tokens: 128,
+            max_total_tokens: 512,
+            ..SchedulerConfig::default()
+        }
+    }
+
+    fn assert_finished(completed: &CompletedRequest) {
+        assert!(matches!(
+            completed.finish,
+            Some(FinishReason::Length | FinishReason::Stop | FinishReason::Abort)
+        ));
+    }
 
     #[test]
     fn test_single_request_decodes_to_max_tokens() -> Result<()> {
@@ -599,6 +1056,165 @@ mod tests {
         assert!(!engine.has_inflight());
         assert_eq!(engine.active_count(), 0);
         assert_eq!(engine.waiting_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn admit_respects_priority() -> Result<()> {
+        let mut engine =
+            Engine::with_config(MockExecutor::ready(), MockKvPool::new(1), test_config(1));
+        let low = engine.submit_request_with_priority(vec![10], 1, RequestPriority::Low);
+        let high = engine.submit_request_with_priority(vec![100], 1, RequestPriority::High);
+
+        engine.step()?;
+
+        assert_eq!(engine.active_count(), 1);
+        assert_eq!(engine.waiting_count(), 1);
+        assert!(engine.active.values().any(|request| request.handle == high));
+        assert!(engine.waiting.iter().any(|request| request.handle == low));
+        Ok(())
+    }
+
+    #[test]
+    fn admission_holds_when_pool_full_then_admits_after_free() -> Result<()> {
+        let config = SchedulerConfig {
+            num_slots: 2,
+            max_prompt_tokens: 64,
+            max_total_tokens: 128,
+            ..SchedulerConfig::default()
+        };
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(2, 16, 2),
+            config,
+        );
+        let first = engine.submit_request(vec![1; 16], 1);
+        let second = engine.submit_request(vec![2; 16], 1);
+
+        engine.step()?;
+        assert_eq!(engine.active_count(), 1);
+        assert_eq!(engine.waiting_count(), 1);
+        assert!(
+            engine
+                .active
+                .values()
+                .any(|request| request.handle == first)
+        );
+
+        engine.step()?;
+        assert_eq!(engine.active_count(), 1);
+        assert_eq!(engine.waiting_count(), 0);
+        assert!(
+            engine
+                .active
+                .values()
+                .any(|request| request.handle == second)
+        );
+        assert!(engine.completed(first).is_some());
+
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_too_long_is_rejected() -> Result<()> {
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_prompt_tokens: 2,
+            max_total_tokens: 16,
+            ..SchedulerConfig::default()
+        };
+        let mut engine = Engine::with_config(MockExecutor::ready(), MockKvPool::new(1), config);
+
+        let handle = engine.submit_request(vec![1, 2, 3], 4);
+        engine.step()?;
+
+        assert_eq!(engine.active_count(), 0);
+        assert_eq!(engine.waiting_count(), 0);
+        let completed = engine.completed(handle).expect("request rejected");
+        assert!(matches!(completed.finish, Some(FinishReason::Abort)));
+        assert!(completed.generated_tokens.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn preempt_requeues_least_progressed() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(3, 1, 8),
+            test_config(3),
+        );
+        let longer = engine.next_handle();
+        let shorter = engine.next_handle();
+
+        let mut long_req =
+            RequestState::new(longer, vec![1, 1, 1, 1, 1], RequestPriority::Normal, 8);
+        long_req.generated_tokens = vec![9, 10];
+        long_req.phase = RequestPhase::Decoding;
+        let mut short_req = RequestState::new(shorter, vec![2, 2], RequestPriority::Normal, 8);
+        short_req.generated_tokens = vec![7, 8];
+        short_req.phase = RequestPhase::Decoding;
+
+        engine.kv.alloc(0, 5)?;
+        engine.kv.alloc(1, 2)?;
+        engine.active.insert(0, long_req);
+        engine.active.insert(1, short_req);
+
+        engine.step()?;
+
+        assert_eq!(engine.active_count(), 1);
+        assert_eq!(engine.waiting_count(), 1);
+        assert!(
+            engine
+                .active
+                .values()
+                .any(|request| request.handle == shorter)
+        );
+        let requeued = engine.waiting.front().expect("victim requeued");
+        assert_eq!(requeued.handle, longer);
+        assert!(requeued.generated_tokens.is_empty());
+        assert!(matches!(
+            requeued.phase,
+            RequestPhase::Prefilling { progress: 0 }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn finish_frees_slot_and_pages() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 16, 2),
+            test_config(1),
+        );
+        let handle = engine.submit_request(vec![3; 16], 1);
+        let initial_free = engine.kv_free_pages();
+
+        engine.step()?;
+        assert!(engine.kv_free_pages() < initial_free);
+
+        engine.step()?;
+        assert_eq!(engine.kv_free_pages(), initial_free);
+        assert_finished(engine.completed(handle).expect("request completed"));
+        Ok(())
+    }
+
+    #[test]
+    fn admission_respects_governor_hold() -> Result<()> {
+        let mut engine = Engine::with_config_and_governor(
+            MockExecutor::ready(),
+            MockKvPool::new(1),
+            test_config(1),
+            Box::new(HoldGovernor),
+        );
+        engine.submit_request(vec![1, 2, 3], 1);
+
+        engine.step()?;
+
+        assert_eq!(engine.active_count(), 0);
+        assert_eq!(engine.waiting_count(), 1);
+        assert!(!engine.has_inflight());
         Ok(())
     }
 }
