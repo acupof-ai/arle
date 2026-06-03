@@ -232,10 +232,16 @@ impl DeepseekModel {
         states: &mut [super::state::DeepseekState],
         slot_indices: &[usize],
         decode_ctx: &mut DeepseekBatchDecodeBuffers,
+        token_owned_rows_validated: bool,
     ) -> Result<bool> {
-        // N == 1: per-row path is already optimal and the only validated
-        // single-sequence path. Don't route through the batch machinery.
-        if tokens.len() < 2 {
+        let native_deepep_token_owned = dsv4_native_deepep_request_batch_required(
+            token_owned_rows_validated,
+            dsv4_native_deepep_enabled()?,
+        );
+        // N == 1: per-row path is already optimal unless the request-aware
+        // token-owned DSv4 path needs to carry validated row ownership into
+        // NativeDeepEP. The per-row fallback has no request metadata.
+        if tokens.len() < 2 && !native_deepep_token_owned {
             return Ok(false);
         }
         // CPU reference model active → batch method does not replicate it.
@@ -264,7 +270,13 @@ impl DeepseekModel {
             );
         }
 
-        self.compute_top_level_logits_incremental_batch(tokens, states, slot_indices, decode_ctx)?;
+        self.compute_top_level_logits_incremental_batch(
+            tokens,
+            states,
+            slot_indices,
+            decode_ctx,
+            token_owned_rows_validated,
+        )?;
         for &slot_idx in slot_indices {
             let state = &mut states[slot_idx];
             state.base.prefill_logits = None;
@@ -1537,6 +1549,7 @@ impl DeepseekModel {
         states: &mut [super::state::DeepseekState],
         slot_indices: &[usize],
         decode_ctx: &mut DeepseekBatchDecodeBuffers,
+        token_owned_rows_validated: bool,
     ) -> Result<()> {
         ensure!(
             tokens.len() == slot_indices.len(),
@@ -2021,6 +2034,7 @@ impl DeepseekModel {
                             Some(ffn_mhc_scratch),
                             Some(&mut layer_cache.ffn_pre),
                             Some(&mut layer_cache.ffn_normed),
+                            token_owned_rows_validated,
                         )?;
                     }
                     dsv4_trace_end(&self.ctx, "ffn_total", layer_idx, n, trace)?;
@@ -6810,7 +6824,7 @@ impl DeepseekModel {
         tokens: &[u32],
     ) -> Result<HiddenStates> {
         self.forward_ffn_layer_stream_with_scratch(
-            layer_idx, stream, tokens, None, None, None, None,
+            layer_idx, stream, tokens, None, None, None, None, false,
         )
     }
 
@@ -6823,6 +6837,7 @@ impl DeepseekModel {
         mhc_scratch: Option<&mut DeepseekMhcRuntimeScratch>,
         ffn_pre_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
         ffn_normed_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
+        token_owned_rows_validated: bool,
     ) -> Result<HiddenStates> {
         self.forward_ffn_layer_stream_with_scratch_impl(
             layer_idx,
@@ -6835,6 +6850,7 @@ impl DeepseekModel {
             ffn_normed_scratch,
             None,
             None,
+            token_owned_rows_validated,
         )?
         .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 FFN owned output missing"))
     }
@@ -6861,6 +6877,7 @@ impl DeepseekModel {
             ffn_normed_scratch,
             None,
             Some(out),
+            false,
         )?;
         Ok(())
     }
@@ -6889,6 +6906,7 @@ impl DeepseekModel {
             Some(ffn_normed_scratch),
             Some(routed_scratch),
             Some(out),
+            false,
         )?;
         Ok(())
     }
@@ -6905,6 +6923,7 @@ impl DeepseekModel {
         ffn_normed_scratch: Option<&mut Option<DeepseekHiddenRuntimeScratch>>,
         ffn_routed_scratch: Option<&mut HiddenStates>,
         post_out: Option<&mut HiddenStates>,
+        token_owned_rows_validated: bool,
     ) -> Result<Option<HiddenStates>> {
         ensure!(
             tokens.len() == stream.seq_len,
@@ -6919,6 +6938,8 @@ impl DeepseekModel {
             self.config.hidden_size,
             self.config.hc_mult
         );
+        #[cfg(not(feature = "nccl"))]
+        let _ = token_owned_rows_validated;
         let layer = self.layers.get(layer_idx).ok_or_else(|| {
             anyhow::anyhow!(
                 "DeepSeek V4 GPU FFN layer {} out of range for {} loaded layers",
@@ -7107,11 +7128,16 @@ impl DeepseekModel {
                 let native_deepep_active = dsv4_native_deepep_enabled()?
                     && self.layer_communicator.native_deepep().is_some()
                     && moe_scratch.is_some();
-                if native_deepep_active {
+                if !dsv4_native_deepep_dispatch_allowed(
+                    native_deepep_active,
+                    token_owned_rows_validated,
+                ) {
                     bail!(
-                        "ARLE_DSV4_MOE_BACKEND=native-deepep cannot run on the current \
-                         DSv4 replicated-token TP/EP route (tp_world={} ep_world={}); \
-                         native DeepEP requires token-owned DP/EP request rows.",
+                        "ARLE_DSV4_MOE_BACKEND=native-deepep requires request-aware \
+                         token-owned DP/EP rows before dispatch/combine (tp_world={} \
+                         ep_world={}); direct replicated-token decode must use \
+                         ARLE_DSV4_MOE_BACKEND=allreduce or enter through \
+                         forward_decode_batch_with_request.",
                         self.config.tp.world_size,
                         self.config.ep.world_size
                     );
@@ -10023,6 +10049,21 @@ fn dsv4_native_deepep_enabled() -> Result<bool> {
     ))
 }
 
+fn dsv4_native_deepep_request_batch_required(
+    token_owned_rows_validated: bool,
+    native_deepep_enabled: bool,
+) -> bool {
+    token_owned_rows_validated && native_deepep_enabled
+}
+
+#[cfg_attr(not(feature = "nccl"), allow(dead_code))]
+fn dsv4_native_deepep_dispatch_allowed(
+    native_deepep_active: bool,
+    token_owned_rows_validated: bool,
+) -> bool {
+    !native_deepep_active || token_owned_rows_validated
+}
+
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn dsv4_combine_overlap_enabled() -> bool {
     std::env::var("ARLE_DSV4_COMBINE_OVERLAP")
@@ -10426,6 +10467,22 @@ mod tests {
     use super::*;
     use crate::distributed::expert_state::ExpertGroup;
     use half::bf16;
+
+    #[test]
+    fn native_deepep_c1_requires_request_aware_batch_only_when_validated() {
+        assert!(dsv4_native_deepep_request_batch_required(true, true));
+        assert!(!dsv4_native_deepep_request_batch_required(false, true));
+        assert!(!dsv4_native_deepep_request_batch_required(true, false));
+        assert!(!dsv4_native_deepep_request_batch_required(false, false));
+    }
+
+    #[test]
+    fn native_deepep_dispatch_guard_requires_validated_rows() {
+        assert!(dsv4_native_deepep_dispatch_allowed(false, false));
+        assert!(dsv4_native_deepep_dispatch_allowed(false, true));
+        assert!(dsv4_native_deepep_dispatch_allowed(true, true));
+        assert!(!dsv4_native_deepep_dispatch_allowed(true, false));
+    }
 
     fn bf16_vec(values: &[f32]) -> Vec<bf16> {
         values.iter().map(|&value| bf16::from_f32(value)).collect()

@@ -147,6 +147,89 @@ impl DeepseekModel {
         }
         Ok(DSV4_TOKEN_OWNED_ROW_OWNERSHIP)
     }
+
+    fn forward_decode_batch_internal(
+        &self,
+        tokens: &[u32],
+        states: &mut [DeepseekState],
+        slot_indices: &[usize],
+        decode_ctx: &mut DeepseekBatchDecodeBuffers,
+        token_owned_rows_validated: bool,
+    ) -> Result<()> {
+        ensure!(
+            tokens.len() == slot_indices.len(),
+            "DeepSeek V4 decode token/slot mismatch: tokens={} slots={}",
+            tokens.len(),
+            slot_indices.len()
+        );
+        if tokens.is_empty() {
+            return Ok(());
+        }
+
+        // Phase D-4 (shared-pool, `ARLE_DSV4_SHARED_KV_POOL` ON only): bind every
+        // active (slot, layer) attention cache to its fixed sub-range in the
+        // shared FP8 KV pool BEFORE any decode hook runs. This is the single
+        // site that owns both the decode context AND the slot identity, so both
+        // the N≥2 batched path and the N==1 request-aware native-DeepEP path read
+        // pre-bound views — no slot/ctx threading through the attention chain,
+        // and no bind on the prefill path (prefill never reaches here).
+        //
+        // No-op when the shared pool is off: `fp8_kv_max_seq_len()` returns
+        // `None` (the pool was never allocated), so the loop is skipped and the
+        // per-state lazy pool path runs unchanged.
+        if let Some(max_seq_len) = decode_ctx.fp8_kv_max_seq_len() {
+            let num_layers = self.loaded_layer_count();
+            for &slot_idx in slot_indices {
+                ensure!(
+                    slot_idx < states.len(),
+                    "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
+                    states.len()
+                );
+                let state = &mut states[slot_idx];
+                state.incremental.ensure_layers(num_layers);
+                for layer_idx in 0..num_layers {
+                    let layer_cache = state
+                        .incremental
+                        .layers
+                        .get_mut(layer_idx)
+                        .expect("incremental cache layer initialized");
+                    self.bind_fp8_kv_pool_view(
+                        decode_ctx,
+                        &mut layer_cache.attention,
+                        slot_idx,
+                        layer_idx,
+                        max_seq_len,
+                    )?;
+                }
+            }
+        }
+
+        // TRUE batched decode: process all N decode tokens as ONE forward (the
+        // routed-MoE FFN half + NCCL all-reduce amortize over the batch; the
+        // per-sequence attention core still loops per row). Eligibility is
+        // gated by `try_decode_batch`; on unsupported configs it returns false
+        // and we fall through to the per-row loop. For request-aware native
+        // DeepEP, N==1 also stays on this path so row ownership evidence is not
+        // lost before dispatch/combine.
+        if self.try_decode_batch(
+            tokens,
+            states,
+            slot_indices,
+            decode_ctx,
+            token_owned_rows_validated,
+        )? {
+            return Ok(());
+        }
+        for (&token, &slot_idx) in tokens.iter().zip(slot_indices) {
+            ensure!(
+                slot_idx < states.len(),
+                "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
+                states.len()
+            );
+            self.forward_decode(token, &mut states[slot_idx])?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -304,81 +387,16 @@ impl ModelForward for DeepseekModel {
         decode_ctx: &mut Self::DecodeContext,
         _skip_logit_scatter: bool,
     ) -> Result<()> {
-        ensure!(
-            tokens.len() == slot_indices.len(),
-            "DeepSeek V4 decode token/slot mismatch: tokens={} slots={}",
-            tokens.len(),
-            slot_indices.len()
-        );
-        if tokens.is_empty() {
-            return Ok(());
-        }
-
-        // Phase D-4 (shared-pool, `ARLE_DSV4_SHARED_KV_POOL` ON only): bind every
-        // active (slot, layer) attention cache to its fixed sub-range in the
-        // shared FP8 KV pool BEFORE any decode hook runs. This is the single
-        // site that owns both the decode context AND the slot identity, so both
-        // the N≥2 batched path and the N==1 per-row fallback below read
-        // pre-bound views — no slot/ctx threading through the attention chain,
-        // and no bind on the prefill path (prefill never reaches here).
-        //
-        // No-op when the shared pool is off: `fp8_kv_max_seq_len()` returns
-        // `None` (the pool was never allocated), so the loop is skipped and the
-        // per-state lazy pool path runs unchanged.
-        if let Some(max_seq_len) = decode_ctx.fp8_kv_max_seq_len() {
-            let num_layers = self.loaded_layer_count();
-            for &slot_idx in slot_indices {
-                ensure!(
-                    slot_idx < states.len(),
-                    "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
-                    states.len()
-                );
-                let state = &mut states[slot_idx];
-                state.incremental.ensure_layers(num_layers);
-                for layer_idx in 0..num_layers {
-                    let layer_cache = state
-                        .incremental
-                        .layers
-                        .get_mut(layer_idx)
-                        .expect("incremental cache layer initialized");
-                    self.bind_fp8_kv_pool_view(
-                        decode_ctx,
-                        &mut layer_cache.attention,
-                        slot_idx,
-                        layer_idx,
-                        max_seq_len,
-                    )?;
-                }
-            }
-        }
-
-        // TRUE batched decode: process all N decode tokens as ONE forward (the
-        // routed-MoE FFN half + NCCL all-reduce amortize over the batch; the
-        // per-sequence attention core still loops per row). Eligibility is
-        // gated by `try_decode_batch`; on any unsupported config it returns
-        // `false` and we fall through to the per-row loop, which stays the
-        // correctness reference + fallback and is NEVER deleted.
-        if self.try_decode_batch(tokens, states, slot_indices, decode_ctx)? {
-            return Ok(());
-        }
-        for (&token, &slot_idx) in tokens.iter().zip(slot_indices) {
-            ensure!(
-                slot_idx < states.len(),
-                "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
-                states.len()
-            );
-            self.forward_decode(token, &mut states[slot_idx])?;
-        }
-        Ok(())
+        self.forward_decode_batch_internal(tokens, states, slot_indices, decode_ctx, false)
     }
 
     fn forward_decode_batch_with_request(
         &self,
         batch: DecodeBatchRequest<'_>,
         states: &mut [Self::State],
-        paged_kv_pool: Option<&mut PagedKVPool>,
+        _paged_kv_pool: Option<&mut PagedKVPool>,
         decode_ctx: &mut Self::DecodeContext,
-        skip_logit_scatter: bool,
+        _skip_logit_scatter: bool,
     ) -> Result<()> {
         batch.validate()?;
         let model_row_ownership = self.validate_decode_batch_request_ownership(batch)?;
@@ -407,13 +425,12 @@ impl ModelForward for DeepseekModel {
                 );
             });
         }
-        self.forward_decode_batch(
+        self.forward_decode_batch_internal(
             batch.tokens,
             states,
             batch.slot_indices,
-            paged_kv_pool,
             decode_ctx,
-            skip_logit_scatter,
+            model_row_ownership == DSV4_TOKEN_OWNED_ROW_OWNERSHIP,
         )
     }
 
