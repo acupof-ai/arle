@@ -1811,6 +1811,9 @@ dependencies = [
  "futures-util",
  "half",
  "hf-hub",
+ "infer-metal",
+ "infer-plan",
+ "infer-seam",
  "kv-native-sys",
  "libc",
  "log",
@@ -1866,9 +1869,13 @@ name = "infer-metal"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "hf-hub",
  "infer-plan",
  "infer-seam",
  "log",
+ "mlx-sys",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
