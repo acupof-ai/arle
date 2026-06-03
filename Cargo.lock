@@ -32,6 +32,7 @@ dependencies = [
  "infer-metal",
  "infer-plan",
  "infer-seam",
+ "libc",
 ]
 
 [[package]]
