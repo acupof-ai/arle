@@ -291,7 +291,7 @@ impl RelayCoordinator {
     /// write error, returns immediately — caller decides whether to
     /// drop the coordinator (workers exit) or retry.
     pub fn broadcast(&mut self, envelope: &RelayEnvelope) -> Result<()> {
-        for (&rank, stream) in self.workers.iter_mut() {
+        for (&rank, stream) in &mut self.workers {
             write_envelope(stream, envelope).with_context(|| {
                 format!("RelayCoordinator write envelope to worker rank {rank}")
             })?;
@@ -406,14 +406,13 @@ fn spawn_completion_reader(
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         sinks.get(&request_id).cloned()
                     };
-                    let remove = match sink {
-                        Some(tx) => tx.send(delta).is_err() || done,
-                        None => {
-                            log::warn!(
-                                "[relay-coordinator] completion for unknown request_id={request_id} from rank {rank}"
-                            );
-                            done
-                        }
+                    let remove = if let Some(tx) = sink {
+                        tx.send(delta).is_err() || done
+                    } else {
+                        log::warn!(
+                            "[relay-coordinator] completion for unknown request_id={request_id} from rank {rank}"
+                        );
+                        done
                     };
                     if remove {
                         let mut sinks = completion_sinks
