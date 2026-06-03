@@ -120,7 +120,7 @@ path = "src/bin/bench_serving.rs"
 required-features = ["cuda"]
 
 [build-dependencies]
-cc = "1.0"
+cc = "1.2"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
