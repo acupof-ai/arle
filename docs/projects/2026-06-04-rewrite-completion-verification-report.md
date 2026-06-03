@@ -44,7 +44,8 @@ no circular blocker for cutover).
 |---|---|---|---|
 | Engine / scheduler / RadixCache | host | **verified (CPU)** | infer-core 19 tests; prefix-reuse + chunked prefill (#8) |
 | Metal forward + parity | Metal | **verified** | tasks #1/#2/#8; PR #53 "Metal verified"; Qwen3.5 on M-series |
-| CUDA eager forward (Phase 0) | CUDA | **IN PROGRESS** | root cause locked (§4); TileLang 0.1.9 fix A/B in flight on H20 |
+| CUDA eager forward (Phase 0) | CUDA | **VERIFIED** | exact HF-gold greedy parity (16/16 tok) on H20 via chunk=1 decode-kernel prefill — `wins/2026-06-04-r6-cuda-eager-parity-verified.md` |
+| CUDA batched-prefill cubin (perf) | CUDA | **known-issue** | HD128 FullRow-WGMMA TileLang codegen spin (§4); perf-only, decode+chunk=1 is the correct path |
 | TP sharding math | host | **verified (CPU)** | infer-topo 42 tests |
 | TP wiring (tp.rs, shard, mock-comm) | CUDA | **foundation verified** | `6d4a3254`; infer-cuda 28 tests incl. row-parallel all-reduce parity |
 | TP all-reduce in forward + TP=8 | CUDA | **pending** | gated on Phase 0 + 8×H20; insert at model.rs o_proj/down_proj |
