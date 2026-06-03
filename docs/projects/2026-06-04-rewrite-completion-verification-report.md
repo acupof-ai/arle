@@ -51,9 +51,9 @@ no circular blocker for cutover).
 | TP all-reduce in forward + TP=8 | CUDA | **pending** | gated on Phase 0 + 8×H20; insert at model.rs o_proj/down_proj |
 | MoE routing math | host | **verified (CPU)** | infer-moe 17 tests |
 | MoE wrappers + expert load + config | CUDA | **foundation verified** | `6d4a3254`; cuda,no-cuda typecheck clean |
-| MoE forward (Qwen3.6) single-GPU | CUDA | **pending** | gated on Phase 0; kernels already exist (`ffi/moe.rs`) |
-| EP all-to-all + DeepEP | CUDA | **pending** | gated; `deepep-sys` + legacy `native_deepep.rs` exist → port |
-| DeepGEMM FP8 grouped GEMM | CUDA | **pending** | build-gated FFI exists; runtime wiring greenfield |
+| BF16 MoE forward (SparseMoeBlock) | CUDA | **wired (Mac-verified)** | `96f65bdc` moe.rs (route→pack→grouped-gemm→silu_mul→scatter→combine→shared); GPU-verify gated on a compatible BF16 ungated/full-attn HD128-kv8 MoE (none cached) |
+| MoE/EP single-GPU + EP/DeepEP/DeepGEMM | CUDA | **scoped — DSv4 port** | `2026-06-04-dsv4-port-plan.md`: cached DSv4-Flash FP8; kernels shared; pieces L/L/M/L (MLA = new subsystem). Multi-day port |
+| W4 grouped GEMM (Qwen3.6-4bit) | CUDA | **pending** | 2 swap points in moe.rs flagged; Qwen3.6 canonical is 4-bit |
 | CUDA Graph capture/replay | CUDA | **VERIFIED** | H20 eager==replay==HF gold (16/16); nsys: cuGraphLaunch×16 + capture×2 (impl `20274cdb`, `INFER_CUDA_DECODE_GRAPH=1`) |
 | CUDA toolchain build (sm_70) | V100 | **verified (build/CPU)** | V100 node: GPU-free suite 64/0; native CUDA-C compiles sm_70 |
 | HTTP OpenAI v1 (non-stream) | both | **partial** | infer-server completions; streaming/`/v1/models`/`/v1/stats` pending |
