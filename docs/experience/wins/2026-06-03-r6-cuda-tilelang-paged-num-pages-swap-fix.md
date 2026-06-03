@@ -109,14 +109,34 @@ routes `max_qlen==1` to the structurally different *decode* kernel
 Ruled out (high confidence): host stream/sync omission (symptom is 100%-util device
 spin, not host idle) and generic `T.Pipelined` trip-1 deadlock (decode survives it).
 
-### Probes in flight (read-only, no rebuild)
+### Probes (done, 2026-06-04)
 
-- [ ] TileLang `__version__` resolved by the pod build interpreter (if 0.1.10 → likely the whole bug).
-- [ ] `device_kernel.cu` mbarrier/cp.async/wait_group diff: prefill q16_kv8_sm90 vs decode q16_kv8_sm90.
-- [ ] dyn-shmem byte literal + `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` baked into the prefill vs decode launcher.
+- [x] TileLang version resolved by the pod build = **0.1.10** (system `/usr/bin/python3`, no venv).
+- [x] `device_kernel.cu`: **no** `mbarrier`/`cp.async`/`wait_group` in either prefill or decode (only `__syncthreads`) → not an async-pipeline/mbarrier wedge.
+- [x] prefill dyn-shmem = 49152 B = `q+k+v` tiles = correctly sized (decode 24576) → not mis-sized.
+
+### TileLang 0.1.9 pin — FALSIFIED (2026-06-04)
+
+Installed TileLang 0.1.9 in a dedicated venv, **forced AOT cubin regen** (confirmed
+new prefill device-source sha `5ccc…` vs old 0.1.10 `ffea…`), rebuilt, re-ran
+`seq_len=64`: **still hangs** (100 % util, no Xid, no `clean_tokens`). So the prior
+"pin 0.1.9" verdict from `errors/2026-05-27` does **not** transfer to this case —
+**the TileLang version is ruled out as the cause** of the sm_90 HD128 prefill hang.
+
+### Narrowed direction — sm_90a / HD128-FullRow-WGMMA (probe in flight)
+
+The 2026-05-30 H20 win ran the **HD256** prefill FullRow-WGMMA kernel correctly on
+sm_90; the **HD128 q16_kv8** prefill (Qwen3-0.6B) may have **never** run on sm_90
+before R6. `gen_tilelang_aot.py:538-563` is *supposed* to compile the AOT `.cu` with
+`-gencode=arch=compute_90a,code=sm_90a` (the WGMMA-enabling target) when
+`cuda_arch==90`. Open question (A vs B): (A) the actual build did **not** apply
+sm_90a → build bug; (B) it did, and HD128 FullRow-WGMMA is miscompiled on sm_90a
+regardless of version → kernel-level fix (GemmWarpPolicy / tile shape). Read-only
+arch + WGMMA-instruction-count probe in flight to decide.
 
 ## Verification (pending-remote)
 
-- [ ] Apply the single-variable fix the probes indict (pin TileLang <0.1.10, or fix dyn-shmem heuristic), rebuild, re-run.
+- [ ] Settle A vs B (prefill cubin actual arch + WGMMA instr count; HD256 cubin arch).
+- [ ] Apply the indicated fix (sm_90a build flag, or HD128 prefill warp-policy/tile change), rebuild, re-run.
 - [ ] clean `clean_tokens` == HF gold `[12095,13,576,6722,315,9625,374,1083,279,6722,315,279,5429,315,9625,13]` (Qwen3-0.6B, greedy, 16 new).
-- [ ] Then: longer prompt + multi-shape greedy parity before declaring Phase 0 closed.
+- [ ] Then: separate guarded-`exp2` patch (partial-tile NaN) + multi-shape greedy parity before declaring Phase 0 closed.
