@@ -466,6 +466,218 @@ pub unsafe fn qwen36_add_shared_expert_gated(
     Ok(())
 }
 
+// ── DSv4 FP8 DeepGEMM MoE pipeline (f8f8bf16, 128-block scale) ─────────────
+// The 5-call native DeepGEMM expert path: pack/quantize the packed grouped
+// hidden to FP8 → masked grouped GEMM (w13 fused gate+up) → SwiGLU+requant →
+// masked grouped GEMM (w2 down) → unpad the padded grouped output back to
+// compact rows. `pack`/`swiglu`/`unpad` index per-group via the compact
+// `active_experts` / `active_offsets` / `active_counts` metadata (each length
+// `active_count`); the masked GEMM reads the dense per-group `masked_m`.
+
+/// Pack + per-128-block quantize the packed grouped BF16 hidden to FP8 padded
+/// `[num_groups * max_m, cols]` for the masked GEMM. Wraps
+/// [`ffi::dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda`].
+///
+/// # Safety
+/// All pointers must be valid on `stream` for the given shape; `output` is the
+/// FP8 scratch (`u8`), `scales` the FP32 per-block scale scratch.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+    input: RawDevicePtr<bf16>,
+    output: RawDevicePtr<u8>,
+    scales: RawDevicePtr<f32>,
+    active_experts: RawDevicePtr<i32>,
+    active_offsets: RawDevicePtr<i32>,
+    active_counts: RawDevicePtr<i32>,
+    active_count: usize,
+    max_m: usize,
+    cols: usize,
+    scale_stride_m: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
+            input.as_ptr() as *const Half,
+            output.as_mut_ptr(),
+            scales.as_mut_ptr(),
+            active_experts.as_ptr(),
+            active_offsets.as_ptr(),
+            active_counts.as_ptr(),
+            i32::try_from(active_count)?,
+            i32::try_from(max_m)?,
+            i32::try_from(cols)?,
+            i32::try_from(scale_stride_m)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Masked m-grouped FP8 GEMM (`f8f8bf16`, NT): `d = a @ b^T` per group, with
+/// each group's valid row count read from `masked_m`. Wraps
+/// [`ffi::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda`]. `a`/`b` are FP8
+/// bytes, `sfa`/`sfb` the FP32 128-block scales, `d` the BF16 output.
+///
+/// # Safety
+/// All pointers must be valid on `stream`; `m` is the padded per-group capacity
+/// (`max_m`), `n`/`k` the GEMM output/contraction dims, `num_groups` the local
+/// expert count.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
+    a: RawDevicePtr<u8>,
+    sfa: RawDevicePtr<f32>,
+    b: RawDevicePtr<u8>,
+    sfb: RawDevicePtr<f32>,
+    d: RawDevicePtr<bf16>,
+    masked_m: RawDevicePtr<i32>,
+    num_groups: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    sfa_aligned_m: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda(
+            a.as_ptr(),
+            sfa.as_ptr(),
+            b.as_ptr(),
+            sfb.as_ptr(),
+            d.as_mut_ptr() as *mut Half,
+            masked_m.as_ptr(),
+            i32::try_from(num_groups)?,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(sfa_aligned_m)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Fused clamped-SwiGLU over the `[gate | up]` w13 GEMM output + per-128-block
+/// requantize to the FP8 activation the w2 GEMM reads. Wraps
+/// [`ffi::dsv4_deepgemm_swiglu_quantize_w13_cuda`]; `limit` is the SwiGLU clamp.
+///
+/// # Safety
+/// All pointers must be valid on `stream` for the given shape; `w13` is the
+/// padded BF16 w13 output, `act`/`scales` the FP8 + scale scratch.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_swiglu_quantize_w13(
+    w13: RawDevicePtr<bf16>,
+    act: RawDevicePtr<u8>,
+    scales: RawDevicePtr<f32>,
+    active_experts: RawDevicePtr<i32>,
+    active_counts: RawDevicePtr<i32>,
+    active_count: usize,
+    max_m: usize,
+    intermediate_dim: usize,
+    scale_stride_m: usize,
+    limit: f32,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_swiglu_quantize_w13_cuda(
+            w13.as_ptr() as *const Half,
+            act.as_mut_ptr(),
+            scales.as_mut_ptr(),
+            active_experts.as_ptr(),
+            active_counts.as_ptr(),
+            i32::try_from(active_count)?,
+            i32::try_from(max_m)?,
+            i32::try_from(intermediate_dim)?,
+            i32::try_from(scale_stride_m)?,
+            limit,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Unpad the padded `[num_groups * max_m, hidden]` grouped GEMM output back to
+/// the compact `[total_routes, hidden]` row layout (per-group `active_offsets`).
+/// Wraps [`ffi::dsv4_deepgemm_unpad_grouped_bf16_cuda`].
+///
+/// # Safety
+/// All pointers must be valid on `stream` for the given shape.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_unpad_grouped_bf16(
+    grouped: RawDevicePtr<bf16>,
+    compact: RawDevicePtr<bf16>,
+    active_experts: RawDevicePtr<i32>,
+    active_offsets: RawDevicePtr<i32>,
+    active_counts: RawDevicePtr<i32>,
+    active_count: usize,
+    max_m: usize,
+    hidden_dim: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_unpad_grouped_bf16_cuda(
+            grouped.as_ptr() as *const Half,
+            compact.as_mut_ptr() as *mut Half,
+            active_experts.as_ptr(),
+            active_offsets.as_ptr(),
+            active_counts.as_ptr(),
+            i32::try_from(active_count)?,
+            i32::try_from(max_m)?,
+            i32::try_from(hidden_dim)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Fail-loud preflight: confirm the native DeepGEMM bridge is compiled in (a
+/// stub binary returns `CUDA_ERROR_NOT_SUPPORTED`). Returns the device report
+/// string on success. Wraps [`ffi::dsv4_deepgemm_native_preflight_cuda`].
+pub fn dsv4_deepgemm_native_preflight() -> Result<String> {
+    let mut report = vec![0 as std::ffi::c_char; 4096];
+    let result =
+        unsafe { ffi::dsv4_deepgemm_native_preflight_cuda(report.as_mut_ptr(), report.len()) };
+    let report = unsafe { std::ffi::CStr::from_ptr(report.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    result
+        .result()
+        .map_err(|err| anyhow::anyhow!("DSv4 DeepGEMM native preflight failed: {err}; {report}"))?;
+    Ok(report)
+}
+
+/// Dense clamped SwiGLU over a `[seq_len, intermediate]` batch:
+/// `out = silu(min(gate, limit)) * clamp(up, -limit, limit)`. Used by the DSv4
+/// shared expert (not the routed grouped path). Wraps
+/// [`ffi::dsv4_swiglu_clamped_cuda`].
+///
+/// # Safety
+/// `gate` / `up` / `out` must be valid on `stream` for `n` elements.
+pub unsafe fn dsv4_swiglu_clamped_batch(
+    gate: RawDevicePtr<bf16>,
+    up: RawDevicePtr<bf16>,
+    out: RawDevicePtr<bf16>,
+    n: usize,
+    limit: f32,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_swiglu_clamped_cuda(
+            gate.as_ptr() as *const Half,
+            up.as_ptr() as *const Half,
+            out.as_mut_ptr() as *mut Half,
+            i32::try_from(n)?,
+            limit,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Convenience: build a [`RawDevicePtr`] over a [`DeviceVec`]'s dense data.
 #[must_use]
 pub fn device_vec_ptr(vec: &DeviceVec, ctx: &DeviceContext) -> RawDevicePtr<bf16> {
