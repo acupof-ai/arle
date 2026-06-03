@@ -67,6 +67,8 @@ use crate::model::{InternalMtpDraftOutput, InternalMtpDraftRequest};
 use crate::ops;
 #[cfg(feature = "cuda")]
 use crate::ops::LinearDispatchPhase;
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+use crate::tensor_parallel::build_attn_owner_groups;
 #[cfg(feature = "cuda")]
 use crate::tp::TpLoadContext;
 #[cfg(feature = "cuda")]
@@ -350,6 +352,12 @@ impl DeepseekModel {
         #[cfg(feature = "nccl")]
         let comm_matches_global_tp =
             comm.tp_rank() == config.tp.rank && comm.tp_world_size() == config.tp.world_size;
+        #[cfg(feature = "nccl")]
+        let owner_token_sync_group = if comm_matches_global_tp {
+            None
+        } else {
+            dsv4_request_owner_token_sync_group(config)?
+        };
 
         #[cfg(feature = "nccl")]
         {
@@ -398,6 +406,27 @@ impl DeepseekModel {
                         config.tp.rank,
                         config.tp.world_size,
                         config.axes.summary(),
+                    );
+                }
+            }
+            if let Some(owner_sync) = owner_token_sync_group {
+                if owner_sync.world_size > 1 {
+                    let port_offset = dsv4_owner_group_nccl_port_offset(owner_sync.group_index)?;
+                    let group = Arc::new(NcclGroup::new_on_stream(
+                        owner_sync.rank,
+                        owner_sync.world_size,
+                        dsv4_nccl_env_bootstrap_with_port_offset(port_offset)?,
+                        ctx.stream.clone(),
+                    )?);
+                    comm = comm.with_request_token_sync_nccl(Arc::clone(&group));
+                    info!(
+                        "DeepSeek V4 owner-group token-sync NCCL attached: group_index={} ranks={:?} request_sync_rank={}/{} communicator_axes={} port_offset={}",
+                        owner_sync.group_index,
+                        owner_sync.ranks,
+                        owner_sync.rank,
+                        owner_sync.world_size,
+                        comm.axis_summary(),
+                        port_offset,
                     );
                 }
             }
@@ -9976,6 +10005,53 @@ fn dsv4_nccl_env_bootstrap_with_port_offset(
         .next()
         .ok_or_else(|| anyhow::anyhow!("NCCL overlap addr {host}:{port} resolved to zero addrs"))?;
     Ok(crate::distributed::nccl::NcclInitMethod::TcpStore(addr))
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+struct Dsv4OwnerTokenSyncGroup {
+    group_index: usize,
+    ranks: Vec<usize>,
+    rank: usize,
+    world_size: usize,
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_request_owner_token_sync_group(
+    config: &DeepseekRuntimeConfig,
+) -> Result<Option<Dsv4OwnerTokenSyncGroup>> {
+    if config.axes.world_size() != config.tp.world_size
+        || config.rank_coord.world_rank != config.tp.rank
+    {
+        return Ok(None);
+    }
+
+    let world_rank = config.rank_coord.world_rank;
+    for (group_index, ranks) in build_attn_owner_groups(config.axes).into_iter().enumerate() {
+        if let Some(rank) = ranks.iter().position(|&candidate| candidate == world_rank) {
+            return Ok(Some(Dsv4OwnerTokenSyncGroup {
+                group_index,
+                world_size: ranks.len(),
+                ranks,
+                rank,
+            }));
+        }
+    }
+
+    bail!(
+        "DeepSeek V4 rank {} has no request owner group for axes={}",
+        world_rank,
+        config.axes.summary()
+    );
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn dsv4_owner_group_nccl_port_offset(group_index: usize) -> Result<u16> {
+    let group_index = u16::try_from(group_index).map_err(|err| {
+        anyhow::anyhow!("DSv4 owner-group index {group_index} exceeds u16 range: {err}")
+    })?;
+    10u16.checked_add(group_index).ok_or_else(|| {
+        anyhow::anyhow!("DSv4 owner-group port offset overflow for group index {group_index}")
+    })
 }
 
 #[cfg(feature = "cuda")]

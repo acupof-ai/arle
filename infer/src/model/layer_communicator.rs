@@ -303,6 +303,8 @@ impl LayerCommunicator {
             "global-tp-ep-only"
         } else if self.owner_group_collectives_ready() {
             "owner-groups-collectives-ready"
+        } else if self.owner_group_token_sync_ready() {
+            "owner-groups-token-sync-ready"
         } else {
             "declared-owner-groups-no-collectives"
         }
@@ -317,6 +319,20 @@ impl LayerCommunicator {
         // SGLang-style owner groups also need attention-DP/CP token sync
         // collectives before this can be treated as comparable execution.
         false
+    }
+
+    pub fn owner_group_token_sync_ready(&self) -> bool {
+        if self.dp_world_size == 1 && self.cp_world_size == 1 {
+            return true;
+        }
+        #[cfg(feature = "nccl")]
+        {
+            self.request_token_sync_nccl.is_some()
+        }
+        #[cfg(not(feature = "nccl"))]
+        {
+            false
+        }
     }
 
     /// Phase B-1 commit C.4 accessor: shared TP NCCL group, if one was
@@ -950,6 +966,7 @@ mod tests {
         assert_eq!(comm.layout_label(), "global-tp-ep-only");
 
         let advanced = LayerCommunicator::new_with_ep(0, 4, 1, 2, 0, 1, 0, 4).unwrap();
+        assert!(!advanced.owner_group_token_sync_ready());
         assert!(!advanced.owner_group_collectives_ready());
         assert_eq!(
             advanced.layout_label(),
