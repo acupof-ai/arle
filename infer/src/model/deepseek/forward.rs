@@ -525,6 +525,12 @@ impl ModelForward for DeepseekModel {
                 if step_tokens.is_empty() {
                     continue;
                 }
+                // The sparse verifier appends speculative target tokens and
+                // may roll them back. Until DSv4 verifier body replay is
+                // separately licensed, keep the body graph out of this path.
+                if dsv4_decode_body_cuda_graph_enabled()? {
+                    decode_ctx.force_eager_once();
+                }
                 self.forward_decode_batch(
                     &step_tokens,
                     states,
