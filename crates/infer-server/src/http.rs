@@ -19,6 +19,7 @@ use axum::{Json, Router};
 use infer_core::CompletedRequest;
 #[cfg(feature = "metal")]
 use infer_core::{Engine, SchedulerConfig};
+use infer_plan::SamplingParams;
 use infer_seam::{BackendExecutor, KvPool};
 
 use crate::ServeHandle;
@@ -185,7 +186,7 @@ where
     let sampling = request.sampling_params();
     let max_tokens = sampling.max_new_tokens.unwrap_or(16);
     let prompt_tokens = encode(&state, &request.prompt)?;
-    let completed = generate(&state, prompt_tokens, max_tokens)?;
+    let completed = generate(&state, prompt_tokens, max_tokens, sampling)?;
     let text = decode(&state, &completed.generated_tokens)?;
     Ok(Json(CompletionResponse::from_completed(
         state.model.clone(),
@@ -213,7 +214,7 @@ where
         tokenizer.render_chat(&request.messages)?
     };
     let prompt_tokens = encode(&state, &prompt)?;
-    let completed = generate(&state, prompt_tokens, max_tokens)?;
+    let completed = generate(&state, prompt_tokens, max_tokens, sampling)?;
     let content = decode(&state, &completed.generated_tokens)?;
     Ok(Json(ChatCompletionResponse::from_completed(
         state.model.clone(),
@@ -248,6 +249,7 @@ fn generate<E, K>(
     state: &Arc<HttpState<E, K>>,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
+    sampling: SamplingParams,
 ) -> Result<CompletedRequest, ApiError>
 where
     E: BackendExecutor + 'static,
@@ -258,7 +260,7 @@ where
             .serve
             .lock()
             .map_err(|_| ApiError::internal("serve lock poisoned"))?;
-        serve.submit(prompt_tokens, max_tokens)?
+        serve.submit(prompt_tokens, max_tokens, sampling)?
     };
     ticket.collect().map_err(ApiError::from)
 }

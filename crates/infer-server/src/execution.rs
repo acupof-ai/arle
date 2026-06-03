@@ -9,7 +9,8 @@
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use infer_core::{CompletedRequest, Engine, RequestHandle};
+use infer_core::{CompletedRequest, Engine, RequestHandle, RequestOptions};
+use infer_plan::SamplingParams;
 use infer_seam::{BackendExecutor, KvPool};
 
 /// How long the engine thread parks on the submit channel when fully idle.
@@ -23,6 +24,8 @@ const IDLE_PARK: Duration = Duration::from_millis(2);
 pub(crate) struct Submission {
     pub(crate) prompt: Vec<u32>,
     pub(crate) max_tokens: usize,
+    /// Per-request sampling/stop parameters parsed at the HTTP boundary.
+    pub(crate) sampling: SamplingParams,
     /// Carries the engine-assigned handle back to the submitting caller.
     pub(crate) handle_tx: Sender<RequestHandle>,
     /// Carries the request's single completion back to the submitting caller.
@@ -96,7 +99,14 @@ fn admit_submission<E, K>(
     E: BackendExecutor,
     K: KvPool,
 {
-    let handle = engine.submit_request(submission.prompt, submission.max_tokens);
+    let handle = engine.submit_request_with_options(
+        submission.prompt,
+        submission.max_tokens,
+        RequestOptions {
+            sampling: submission.sampling,
+            ..RequestOptions::default()
+        },
+    );
     // If the submitter dropped its ticket before we replied, just don't track it.
     let _ = submission.handle_tx.send(handle);
     pending.insert(handle, submission.completion_tx);
