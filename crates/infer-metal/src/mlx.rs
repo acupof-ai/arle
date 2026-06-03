@@ -1,9 +1,8 @@
-//! Minimal MLX wrapper for the R3a Metal executor.
+//! Minimal MLX wrapper for the Metal executor.
 //!
-//! This is a narrow port of the legacy Metal wrapper: enough to load MLX
-//! safetensors, register weights with the Qwen35 C++ compiled model, allocate
-//! contiguous session KV/GDR arrays, and run greedy argmax sampling. Device
-//! tensors stay below the executor seam.
+//! Enough to load MLX safetensors, register weights with the Qwen3.5 C++
+//! compiled model, allocate session KV/GDR arrays, and sample. Device tensors
+//! stay below the executor seam.
 
 use std::ffi::CStr;
 use std::os::raw::c_void;
