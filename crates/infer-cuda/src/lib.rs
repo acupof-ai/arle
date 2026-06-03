@@ -28,7 +28,7 @@ use std::fmt;
 use std::path::Path;
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvPool, PollResult};
+use infer_seam::{BackendExecutor, KvAllocator, KvPool, KvPrefixStore, KvQuery, PollResult};
 
 #[cfg(feature = "cuda")]
 mod model;
@@ -78,7 +78,7 @@ impl CudaKvPool {
     }
 }
 
-impl KvPool for CudaKvPool {
+impl KvQuery for CudaKvPool {
     fn is_active(&self) -> bool {
         self.total_pages > 0
     }
@@ -99,6 +99,16 @@ impl KvPool for CudaKvPool {
         self.slot_len.get(slot).copied().unwrap_or(0)
     }
 
+    fn slot_epoch(&self, slot: usize) -> u64 {
+        self.slot_epoch.get(slot).copied().unwrap_or(0)
+    }
+
+    fn append_pages_needed(&self, slot: usize, tokens: usize) -> usize {
+        let have = self.slot_pages.get(slot).map_or(0, Vec::len);
+        let after = self.pages_for_tokens(self.seq_len(slot) + tokens);
+        after.saturating_sub(have)
+    }
+
     fn page_indices(&self, slot: usize) -> &[u32] {
         self.slot_pages.get(slot).map_or(&[], Vec::as_slice)
     }
@@ -114,17 +124,9 @@ impl KvPool for CudaKvPool {
         }
         &pages[start_page..end_page]
     }
+}
 
-    fn slot_epoch(&self, slot: usize) -> u64 {
-        self.slot_epoch.get(slot).copied().unwrap_or(0)
-    }
-
-    fn append_pages_needed(&self, slot: usize, tokens: usize) -> usize {
-        let have = self.slot_pages.get(slot).map_or(0, Vec::len);
-        let after = self.pages_for_tokens(self.seq_len(slot) + tokens);
-        after.saturating_sub(have)
-    }
-
+impl KvAllocator for CudaKvPool {
     fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()> {
         let need = self.append_pages_needed(slot, tokens);
         if need > self.free.len() {
@@ -153,21 +155,19 @@ impl KvPool for CudaKvPool {
             .collect())
     }
 
-    fn attach_pages(
-        &mut self,
-        slot: usize,
-        pages: &[u32],
-        token_count: usize,
-    ) -> anyhow::Result<()> {
-        // Prefix-reuse: a fresh slot adopts already-allocated (retained) pages.
-        let dst = self
-            .slot_pages
-            .get_mut(slot)
-            .ok_or_else(|| anyhow::anyhow!("attach_pages: slot {slot} out of range"))?;
-        dst.extend_from_slice(pages);
-        self.slot_len[slot] = self.slot_len[slot].max(token_count);
+    fn free_slot(&mut self, slot: usize) {
+        let Some(pages) = self.slot_pages.get_mut(slot) else {
+            return;
+        };
+        let taken = std::mem::take(pages);
+        for page in taken {
+            // Retained pages (held by the prefix cache) survive the slot's release.
+            if self.page_refs.get(&page).copied().unwrap_or(0) == 0 {
+                self.free.push(page);
+            }
+        }
+        self.slot_len[slot] = 0;
         self.slot_epoch[slot] = self.slot_epoch[slot].wrapping_add(1);
-        Ok(())
     }
 
     fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()> {
@@ -188,29 +188,18 @@ impl KvPool for CudaKvPool {
         Ok(())
     }
 
-    fn free_slot(&mut self, slot: usize) {
-        let Some(pages) = self.slot_pages.get_mut(slot) else {
-            return;
-        };
-        let taken = std::mem::take(pages);
-        for page in taken {
-            // Retained pages (held by the prefix cache) survive the slot's release.
-            if self.page_refs.get(&page).copied().unwrap_or(0) == 0 {
-                self.free.push(page);
-            }
-        }
-        self.slot_len[slot] = 0;
-        self.slot_epoch[slot] = self.slot_epoch[slot].wrapping_add(1);
-    }
-
     fn migrate(&mut self, _slot: usize, _start: usize, _len: usize) -> anyhow::Result<()> {
         // Host page mapping is unchanged by migration; the device-buffer copy is
         // a cuda-kernels concern wired in R6. No-op at the host-indexing layer.
         Ok(())
     }
+}
 
-    fn retained_count(&self) -> usize {
-        self.page_refs.values().filter(|&&c| c > 0).count()
+impl KvPrefixStore for CudaKvPool {
+    fn retain_pages(&mut self, pages: &[u32]) {
+        for &page in pages {
+            *self.page_refs.entry(page).or_insert(0) += 1;
+        }
     }
 
     fn release_pages(&mut self, pages: &[u32]) {
@@ -225,10 +214,25 @@ impl KvPool for CudaKvPool {
         }
     }
 
-    fn retain_pages(&mut self, pages: &[u32]) {
-        for &page in pages {
-            *self.page_refs.entry(page).or_insert(0) += 1;
-        }
+    fn retained_count(&self) -> usize {
+        self.page_refs.values().filter(|&&c| c > 0).count()
+    }
+
+    fn attach_pages(
+        &mut self,
+        slot: usize,
+        pages: &[u32],
+        token_count: usize,
+    ) -> anyhow::Result<()> {
+        // Prefix-reuse: a fresh slot adopts already-allocated (retained) pages.
+        let dst = self
+            .slot_pages
+            .get_mut(slot)
+            .ok_or_else(|| anyhow::anyhow!("attach_pages: slot {slot} out of range"))?;
+        dst.extend_from_slice(pages);
+        self.slot_len[slot] = self.slot_len[slot].max(token_count);
+        self.slot_epoch[slot] = self.slot_epoch[slot].wrapping_add(1);
+        Ok(())
     }
 }
 
@@ -421,11 +425,13 @@ mod tests {
                     slot: 0,
                     last_token: 10,
                     kv_seq_len: 4,
+                    params: infer_plan::SamplingParams::default(),
                 },
                 DecodeRow {
                     slot: 1,
                     last_token: 20,
                     kv_seq_len: 7,
+                    params: infer_plan::SamplingParams::default(),
                 },
             ],
             prefill_rows: Vec::new(),
@@ -455,6 +461,7 @@ mod tests {
                 tokens: vec![1, 2, 3],
                 start_pos: 0,
                 total_tokens: 3,
+                params: infer_plan::SamplingParams::default(),
             }],
             microbatch: None,
             spec: None,

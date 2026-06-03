@@ -107,6 +107,8 @@ impl ModelArch for SkeletonModel {
 
 #[cfg(test)]
 mod tests {
+    use infer_seam::{KvAllocator, KvPrefixStore, KvQuery};
+
     use super::*;
 
     /// Minimal inline [`KvPool`] mock: every method returns a default / inert
@@ -115,7 +117,7 @@ mod tests {
     #[derive(Default)]
     struct MockKvPool;
 
-    impl KvPool for MockKvPool {
+    impl KvQuery for MockKvPool {
         fn is_active(&self) -> bool {
             false
         }
@@ -136,14 +138,6 @@ mod tests {
             0
         }
 
-        fn page_indices(&self, _slot: usize) -> &[u32] {
-            &[]
-        }
-
-        fn page_indices_for_token_range(&self, _slot: usize, _start: usize, _len: usize) -> &[u32] {
-            &[]
-        }
-
         fn slot_epoch(&self, _slot: usize) -> u64 {
             0
         }
@@ -152,12 +146,42 @@ mod tests {
             0
         }
 
+        fn page_indices(&self, _slot: usize) -> &[u32] {
+            &[]
+        }
+
+        fn page_indices_for_token_range(&self, _slot: usize, _start: usize, _len: usize) -> &[u32] {
+            &[]
+        }
+    }
+
+    impl KvAllocator for MockKvPool {
         fn alloc(&mut self, _slot: usize, _tokens: usize) -> anyhow::Result<()> {
             Ok(())
         }
 
         fn alloc_detached_pages(&mut self, _pages: usize) -> anyhow::Result<Vec<u32>> {
             Ok(Vec::new())
+        }
+
+        fn free_slot(&mut self, _slot: usize) {}
+
+        fn truncate_slot(&mut self, _slot: usize, _new_len: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn migrate(&mut self, _slot: usize, _start: usize, _len: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl KvPrefixStore for MockKvPool {
+        fn retain_pages(&mut self, _pages: &[u32]) {}
+
+        fn release_pages(&mut self, _pages: &[u32]) {}
+
+        fn retained_count(&self) -> usize {
+            0
         }
 
         fn attach_pages(
@@ -168,24 +192,6 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
-
-        fn truncate_slot(&mut self, _slot: usize, _new_len: usize) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn free_slot(&mut self, _slot: usize) {}
-
-        fn migrate(&mut self, _slot: usize, _start: usize, _len: usize) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn retained_count(&self) -> usize {
-            0
-        }
-
-        fn release_pages(&mut self, _pages: &[u32]) {}
-
-        fn retain_pages(&mut self, _pages: &[u32]) {}
     }
 
     #[test]
