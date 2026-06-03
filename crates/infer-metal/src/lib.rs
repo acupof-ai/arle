@@ -14,9 +14,27 @@
 //! `infer-plan` + `infer-seam` contracts.
 
 use std::collections::HashMap;
+#[cfg(feature = "metal")]
+use std::path::Path;
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
+
+#[cfg(feature = "metal")]
+mod config;
+#[cfg(feature = "metal")]
+mod loader;
+#[cfg(feature = "metal")]
+mod mlx;
+#[cfg(feature = "metal")]
+mod model_source;
+#[cfg(feature = "metal")]
+mod qwen35;
+#[cfg(feature = "metal")]
+mod weights;
+
+#[cfg(feature = "metal")]
+const KV_CACHE_CHUNK: i32 = 256;
 
 /// Host-side paged KV bookkeeping for the Metal backend.
 ///
@@ -222,24 +240,74 @@ impl KvPool for MetalKvPool {
 /// The R2 skeleton resolves synchronously, so this carries the resolved output.
 /// R3 replaces this with an MLX async handle (command-buffer + future tokens)
 /// to keep CPU scheduling overlapped with the GPU forward.
-#[derive(Debug)]
-pub struct MetalInflight {
-    output: StepOutput,
+pub enum MetalInflight {
+    /// CPU placeholder output.
+    Ready(StepOutput),
+    /// Real MLX greedy sample. `poll` materializes this scalar token.
+    #[cfg(feature = "metal")]
+    Sampled { slot: usize, sampled: mlx::MlxArray },
+}
+
+impl std::fmt::Debug for MetalInflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready(output) => f.debug_tuple("Ready").field(output).finish(),
+            #[cfg(feature = "metal")]
+            Self::Sampled { slot, sampled } => f
+                .debug_struct("Sampled")
+                .field("slot", slot)
+                .field("sampled", sampled)
+                .finish(),
+        }
+    }
 }
 
 /// Metal backend executor.
 ///
-/// R2: seam plumbing only. R3 wires the real MLX Qwen forward + device KV.
-#[derive(Debug, Default)]
+/// `new()` keeps the R2 CPU placeholder for seam tests. `from_model_path()`
+/// builds the R3a real MLX Qwen3.5 executor.
+#[derive(Default)]
 pub struct MetalExecutor {
-    _private: (),
+    #[cfg(feature = "metal")]
+    real: Option<RealMetalExecutor>,
+}
+
+impl std::fmt::Debug for MetalExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("MetalExecutor");
+        #[cfg(feature = "metal")]
+        debug.field("real", &self.real.is_some());
+        debug.finish()
+    }
 }
 
 impl MetalExecutor {
     /// Build a Metal executor.
     #[must_use]
     pub fn new() -> Self {
-        Self { _private: () }
+        Self {
+            #[cfg(feature = "metal")]
+            real: None,
+        }
+    }
+
+    /// Build a real single-row greedy MLX Qwen3.5 executor from a local model
+    /// path or HuggingFace id.
+    #[cfg(feature = "metal")]
+    pub fn from_model_path(model_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let model_source = model_path.as_ref().to_string_lossy();
+        let resolved = model_source::resolve_model_path(&model_source)?;
+        let _guard = mlx_sys::mlx_guard();
+        let config = config::load_metal_config(&resolved)?;
+        let weights = qwen35::load_qwen35_metal_weights(&resolved, &config)?;
+        Ok(Self {
+            real: Some(RealMetalExecutor {
+                config,
+                weights,
+                slots: HashMap::new(),
+                active_session_slot: None,
+            }),
+        })
     }
 
     /// Placeholder forward — produces one deterministic token per scheduled row.
@@ -277,16 +345,265 @@ impl BackendExecutor for MetalExecutor {
     fn submit(
         &mut self,
         plan: &ForwardPlan,
-        _kv: &mut dyn KvPool,
+        kv: &mut dyn KvPool,
     ) -> anyhow::Result<Self::Inflight> {
-        Ok(MetalInflight {
-            output: Self::placeholder_forward(plan),
-        })
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_mut() {
+            return real.submit(plan, kv);
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = kv;
+
+        Ok(MetalInflight::Ready(Self::placeholder_forward(plan)))
     }
 
     fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>> {
-        Ok(PollResult::Ready(inflight.output))
+        match inflight {
+            MetalInflight::Ready(output) => Ok(PollResult::Ready(output)),
+            #[cfg(feature = "metal")]
+            MetalInflight::Sampled { slot, sampled } => {
+                let _guard = mlx_sys::mlx_guard();
+                mlx::eval(&[&sampled]);
+                let token = sampled.item_i32() as u32;
+                Ok(PollResult::Ready(StepOutput {
+                    tokens: vec![SlotToken {
+                        slot,
+                        token,
+                        logprob: None,
+                        finish: None,
+                    }],
+                }))
+            }
+        }
     }
+}
+
+#[cfg(feature = "metal")]
+struct RealMetalExecutor {
+    config: config::MetalModelConfig,
+    weights: qwen35::Qwen35MetalWeights,
+    slots: HashMap<usize, MetalSlotState>,
+    active_session_slot: Option<usize>,
+}
+
+#[cfg(feature = "metal")]
+impl RealMetalExecutor {
+    fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> anyhow::Result<MetalInflight> {
+        let _guard = mlx_sys::mlx_guard();
+        let row_count = plan.prefill_rows.len() + plan.decode_rows.len();
+        anyhow::ensure!(
+            row_count == 1,
+            "R3a MetalExecutor supports exactly one prefill or decode row, got {row_count}"
+        );
+
+        if let Some(row) = plan.prefill_rows.first() {
+            return self.submit_prefill(row, kv);
+        }
+        if let Some(row) = plan.decode_rows.first() {
+            return self.submit_decode(row, kv);
+        }
+        anyhow::bail!("R3a MetalExecutor received a non-idle plan with no rows")
+    }
+
+    fn submit_prefill(
+        &mut self,
+        row: &infer_plan::PrefillRow,
+        kv: &mut dyn KvPool,
+    ) -> anyhow::Result<MetalInflight> {
+        anyhow::ensure!(
+            row.start_pos == 0,
+            "R3a MetalExecutor does not support prefix reuse or chunked prefill yet"
+        );
+        anyhow::ensure!(
+            !row.tokens.is_empty(),
+            "R3a MetalExecutor prefill row must contain at least one token"
+        );
+        if let Some(active) = self.active_session_slot {
+            anyhow::ensure!(
+                active == row.slot,
+                "R3a scalar Qwen3.5 C++ sessions support only one active slot"
+            );
+        }
+
+        self.reset_slot_if_epoch_changed(row.slot, kv)?;
+        if !self.slots.contains_key(&row.slot) {
+            let reservation = kv
+                .seq_len(row.slot)
+                .max(row.total_tokens.saturating_add(512))
+                .max(row.tokens.len().saturating_add(1));
+            self.slots.insert(
+                row.slot,
+                MetalSlotState::new(row.slot, kv.slot_epoch(row.slot), &self.config, reservation),
+            );
+        }
+
+        let model = self.weights.cpp_model()?;
+        let slot = self.slots.get_mut(&row.slot).expect("slot inserted above");
+        slot.ensure_session_active(model)?;
+        let token_values: Vec<i32> = row.tokens.iter().map(|&token| token as i32).collect();
+        let token_arr = mlx::MlxArray::from_slice_i32(&token_values, &[token_values.len() as i32]);
+        let logits = model.prefill_session(&token_arr, token_values.len() as i32, 0)?;
+        mlx::async_eval(&[&logits]);
+        slot.cache_len = row.tokens.len();
+
+        let sampled = mlx::argmax(&logits);
+        mlx::async_eval(&[&sampled]);
+        self.active_session_slot = Some(row.slot);
+        Ok(MetalInflight::Sampled {
+            slot: row.slot,
+            sampled,
+        })
+    }
+
+    fn submit_decode(
+        &mut self,
+        row: &infer_plan::DecodeRow,
+        kv: &mut dyn KvPool,
+    ) -> anyhow::Result<MetalInflight> {
+        if let Some(active) = self.active_session_slot {
+            anyhow::ensure!(
+                active == row.slot,
+                "R3a scalar Qwen3.5 C++ sessions support only one active slot"
+            );
+        }
+        self.reset_slot_if_epoch_changed(row.slot, kv)?;
+        let model = self.weights.cpp_model()?;
+        let slot = self
+            .slots
+            .get_mut(&row.slot)
+            .ok_or_else(|| anyhow::anyhow!("decode for slot {} before prefill", row.slot))?;
+        anyhow::ensure!(
+            row.kv_seq_len == slot.cache_len,
+            "decode kv_seq_len mismatch for slot {}: plan={}, metal_state={}",
+            row.slot,
+            row.kv_seq_len,
+            slot.cache_len
+        );
+        slot.ensure_session_active(model)?;
+        let token_arr = mlx::MlxArray::from_slice_i32(&[row.last_token as i32], &[1]);
+        let logits = model.step_session(&token_arr, slot.cache_len as i32)?;
+        mlx::async_eval(&[&logits]);
+        slot.cache_len = slot.cache_len.saturating_add(1);
+
+        let sampled = mlx::argmax(&logits);
+        mlx::async_eval(&[&sampled]);
+        self.active_session_slot = Some(row.slot);
+        Ok(MetalInflight::Sampled {
+            slot: row.slot,
+            sampled,
+        })
+    }
+
+    fn reset_slot_if_epoch_changed(&mut self, slot: usize, kv: &dyn KvPool) -> anyhow::Result<()> {
+        let epoch = kv.slot_epoch(slot);
+        let stale = self
+            .slots
+            .get(&slot)
+            .is_some_and(|state| state.slot_epoch != epoch);
+        if stale {
+            // TODO(R3b): replace this host-epoch observation with an explicit
+            // executor slot-release callback owned by the seam.
+            if let Some(mut state) = self.slots.remove(&slot)
+                && state.session_active
+            {
+                let model = self.weights.cpp_model()?;
+                state.drain_session(model)?;
+            }
+            if self.active_session_slot == Some(slot) {
+                self.active_session_slot = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "metal")]
+struct MetalSlotState {
+    _slot: usize,
+    slot_epoch: u64,
+    cache_len: usize,
+    kv_flat: Vec<mlx::MlxArray>,
+    gdr_flat: Vec<mlx::MlxArray>,
+    session_active: bool,
+}
+
+#[cfg(feature = "metal")]
+impl MetalSlotState {
+    fn new(
+        slot: usize,
+        slot_epoch: u64,
+        config: &config::MetalModelConfig,
+        capacity_tokens: usize,
+    ) -> Self {
+        let capacity = round_up_capacity(capacity_tokens);
+        let cache_shape = [
+            1,
+            config.num_key_value_heads as i32,
+            capacity,
+            config.head_dim as i32,
+        ];
+        let mut kv_flat = Vec::with_capacity(config.arch.num_full_attention_layers() * 2);
+        for _ in 0..config.arch.num_full_attention_layers() {
+            kv_flat.push(mlx::zeros(&cache_shape, mlx::Dtype::Bfloat16));
+            kv_flat.push(mlx::zeros(&cache_shape, mlx::Dtype::Bfloat16));
+        }
+
+        let mut gdr_flat = Vec::with_capacity(config.arch.num_linear_attention_layers() * 2);
+        for _ in 0..config.arch.num_linear_attention_layers() {
+            gdr_flat.push(mlx::zeros(
+                &[
+                    1,
+                    config.arch.linear.num_value_heads as i32,
+                    config.arch.linear.value_dim as i32,
+                    config.arch.linear.key_dim as i32,
+                ],
+                mlx::Dtype::Float32,
+            ));
+            gdr_flat.push(mlx::zeros(
+                &[
+                    1,
+                    (config.arch.linear.conv_kernel - 1) as i32,
+                    config.arch.linear.qkv_dim() as i32,
+                ],
+                mlx::Dtype::Bfloat16,
+            ));
+        }
+
+        Self {
+            _slot: slot,
+            slot_epoch,
+            cache_len: 0,
+            kv_flat,
+            gdr_flat,
+            session_active: false,
+        }
+    }
+
+    fn ensure_session_active(&mut self, model: &qwen35::CppQwen35Model) -> anyhow::Result<()> {
+        if self.session_active {
+            return Ok(());
+        }
+        model.begin_session(&self.kv_flat, &self.gdr_flat)?;
+        self.session_active = true;
+        Ok(())
+    }
+
+    fn drain_session(&mut self, model: &qwen35::CppQwen35Model) -> anyhow::Result<()> {
+        if !self.session_active {
+            return Ok(());
+        }
+        let (kv_flat, gdr_flat) = model.end_session(self.kv_flat.len(), self.gdr_flat.len())?;
+        self.kv_flat = kv_flat;
+        self.gdr_flat = gdr_flat;
+        self.session_active = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "metal")]
+fn round_up_capacity(tokens: usize) -> i32 {
+    let tokens = tokens.max(1) as i32;
+    ((tokens + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK) * KV_CACHE_CHUNK
 }
 
 #[cfg(test)]
