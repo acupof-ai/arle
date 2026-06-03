@@ -500,7 +500,7 @@ impl DeepseekModel {
                 };
                 comm = comm.with_ep_nccl(Arc::clone(&group))?;
                 if config.tp.world_size == 1 {
-                    comm = comm.with_request_token_sync_nccl(group);
+                    comm = comm.with_request_token_sync_nccl(Arc::clone(&group));
                 }
 
                 if dsv4_combine_overlap_enabled() {
@@ -513,16 +513,28 @@ impl DeepseekModel {
                     comm = comm.with_ep_overlap_nccl(overlap_group)?;
                 }
 
-                if dsv4_native_deepep_enabled()?
-                    && !config.performance_profile()?.requires_best_practice()
-                {
-                    bail!(
-                        "ARLE_DSV4_MOE_BACKEND=native-deepep is reserved for the \
-                         SGLang best-practice token-owned request path. Set \
-                         ARLE_DSV4_PERFORMANCE_PROFILE=sglang after satisfying the \
-                         startup contract, or use ARLE_DSV4_MOE_BACKEND=allreduce \
-                         for the debug fallback lane."
+                if dsv4_native_deepep_enabled()? {
+                    if !config.performance_profile()?.requires_best_practice() {
+                        bail!(
+                            "ARLE_DSV4_MOE_BACKEND=native-deepep is reserved for the \
+                             SGLang best-practice token-owned request path. Set \
+                             ARLE_DSV4_PERFORMANCE_PROFILE=sglang after satisfying the \
+                             startup contract, or use ARLE_DSV4_MOE_BACKEND=allreduce \
+                             for the debug fallback lane."
+                        );
+                    }
+                    let native_deepep = crate::native_deepep::NativeDeepEp::boot(
+                        config.ep.rank as u32,
+                        config.ep.world_size as u32,
+                        &group,
+                    )?;
+                    info!(
+                        "DeepSeek V4 native DeepEP transport attached: rank={}/{} communicator_axes={}",
+                        config.ep.rank,
+                        config.ep.world_size,
+                        comm.axis_summary(),
                     );
+                    comm = comm.with_native_deepep(native_deepep);
                 }
             }
         }
