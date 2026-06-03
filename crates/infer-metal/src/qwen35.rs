@@ -1,4 +1,4 @@
-//! Dense Qwen3.5 C++ compiled-model port for R3a.
+//! Qwen3.5/Qwen3.6 C++ compiled-model port for the clean Metal executor.
 
 use std::path::Path;
 
@@ -13,7 +13,8 @@ use crate::loader::{
 };
 use crate::mlx::{self, Dtype, MlxArray, add, as_dtype, reshape, transpose_axes};
 use crate::weights::{
-    MlpInputProjection, WeightTensor, concat_weight_rows, merge_quantized_projection_rows,
+    MlpInputProjection, StackedQuantized, WeightTensor, concat_weight_rows,
+    load_quantized_with_bits, load_stacked_quantized, merge_quantized_projection_rows,
 };
 
 pub(crate) struct MetalQwen35FullAttentionWeights {
@@ -53,8 +54,27 @@ pub(crate) struct MetalQwen35DenseMlpWeights {
     pub(crate) up_proj: WeightTensor,
 }
 
+pub(crate) struct MetalQwen35MoeWeights {
+    pub(crate) router: WeightTensor,
+    pub(crate) switch_gate: StackedQuantized,
+    pub(crate) switch_up: StackedQuantized,
+    pub(crate) switch_down: StackedQuantized,
+    pub(crate) shared_gate: WeightTensor,
+    pub(crate) shared_up: WeightTensor,
+    pub(crate) shared_down: WeightTensor,
+    pub(crate) shared_expert_gate: WeightTensor,
+    pub(crate) num_experts: i32,
+    pub(crate) top_k: i32,
+    pub(crate) norm_topk_prob: bool,
+    pub(crate) router_bits: i32,
+    pub(crate) router_group_size: i32,
+    pub(crate) expert_bits: i32,
+    pub(crate) expert_group_size: i32,
+}
+
 pub(crate) enum MlpKind {
     Dense(MetalQwen35DenseMlpWeights),
+    Moe(MetalQwen35MoeWeights),
 }
 
 pub(crate) struct MetalQwen35BlockWeights {
@@ -139,10 +159,13 @@ pub(crate) fn load_qwen35_metal_weights(
     )?;
 
     log::info!(
-        "  {} dense Qwen3.5 layers ({} full attention, {} GDR)",
+        "  {} Qwen3.5/Qwen3.6 layers ({} full attention, {} GDR, {} MoE)",
         config.num_hidden_layers,
         arch.num_full_attention_layers(),
         arch.num_linear_attention_layers(),
+        (0..config.num_hidden_layers)
+            .filter(|&idx| arch.moe.as_ref().is_some_and(|moe| moe.is_moe_layer(idx)))
+            .count(),
     );
 
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -180,11 +203,19 @@ pub(crate) fn load_qwen35_metal_weights(
             }
         };
 
-        let mlp = build_qwen35_dense_mlp(
-            load_proj(&format!("{layer_prefix}.mlp.gate_proj"))?,
-            load_proj(&format!("{layer_prefix}.mlp.up_proj"))?,
-            load_proj(&format!("{layer_prefix}.mlp.down_proj"))?,
-        )?;
+        let mlp = if let Some(moe_cfg) = arch.moe.as_ref().filter(|moe| moe.is_moe_layer(i)) {
+            MlpKind::Moe(load_qwen35_moe_layer_weights(
+                &tensors,
+                &layer_prefix,
+                moe_cfg,
+            )?)
+        } else {
+            build_qwen35_dense_mlp(
+                load_proj(&format!("{layer_prefix}.mlp.gate_proj"))?,
+                load_proj(&format!("{layer_prefix}.mlp.up_proj"))?,
+                load_proj(&format!("{layer_prefix}.mlp.down_proj"))?,
+            )?
+        };
 
         layers.push(MetalQwen35BlockWeights {
             input_layernorm: load_norm(&format!("{layer_prefix}.input_layernorm.weight"))?,
@@ -304,6 +335,80 @@ fn build_qwen35_dense_mlp(
     }))
 }
 
+fn load_qwen35_moe_layer_weights(
+    tensors: &TensorMap,
+    layer_prefix: &str,
+    moe_cfg: &crate::config::MetalQwen35MoeConfig,
+) -> Result<MetalQwen35MoeWeights> {
+    let mlp_prefix = format!("{layer_prefix}.mlp");
+    let num_experts =
+        i32::try_from(moe_cfg.num_experts).context("Qwen3.6 num_experts does not fit in i32")?;
+    let top_k = i32::try_from(moe_cfg.num_experts_per_tok)
+        .context("Qwen3.6 num_experts_per_tok does not fit in i32")?;
+    anyhow::ensure!(
+        num_experts > 0 && top_k > 0 && top_k <= num_experts,
+        "invalid Qwen3.6 MoE config: num_experts={num_experts}, top_k={top_k}"
+    );
+
+    Ok(MetalQwen35MoeWeights {
+        router: load_quantized_with_bits(
+            tensors,
+            &format!("{mlp_prefix}.gate"),
+            moe_cfg.router_group_size,
+            moe_cfg.router_bits,
+        )?,
+        switch_gate: load_stacked_quantized(
+            tensors,
+            &format!("{mlp_prefix}.switch_mlp.gate_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        switch_up: load_stacked_quantized(
+            tensors,
+            &format!("{mlp_prefix}.switch_mlp.up_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        switch_down: load_stacked_quantized(
+            tensors,
+            &format!("{mlp_prefix}.switch_mlp.down_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        shared_gate: load_quantized_with_bits(
+            tensors,
+            &format!("{mlp_prefix}.shared_expert.gate_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        shared_up: load_quantized_with_bits(
+            tensors,
+            &format!("{mlp_prefix}.shared_expert.up_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        shared_down: load_quantized_with_bits(
+            tensors,
+            &format!("{mlp_prefix}.shared_expert.down_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        shared_expert_gate: load_quantized_with_bits(
+            tensors,
+            &format!("{mlp_prefix}.shared_expert_gate"),
+            moe_cfg.router_group_size,
+            moe_cfg.router_bits,
+        )?,
+        num_experts,
+        top_k,
+        norm_topk_prob: moe_cfg.norm_topk_prob,
+        router_bits: moe_cfg.router_bits,
+        router_group_size: moe_cfg.router_group_size,
+        expert_bits: moe_cfg.expert_bits,
+        expert_group_size: moe_cfg.expert_group_size,
+    })
+}
+
 fn load_lm_head(
     tensors: &TensorMap,
     candidates: &[String],
@@ -355,6 +460,99 @@ fn qwen35_normalize_direct_norm_weight(
 
 fn use_qwen35_cpp_separate_proj() -> bool {
     std::env::var("AGENT_INFER_QWEN35_CPP_SEPARATE").map_or(true, |value| value != "0")
+}
+
+fn extract_qw(
+    wt: &WeightTensor,
+) -> Option<(
+    *mut mlx_sys::mlx_array,
+    *mut mlx_sys::mlx_array,
+    *mut mlx_sys::mlx_array,
+    i32,
+    i32,
+)> {
+    match wt {
+        WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        } => Some((
+            w.as_raw(),
+            scales.as_raw(),
+            biases.as_raw(),
+            *group_size,
+            *bits,
+        )),
+        WeightTensor::Dense(_) => None,
+    }
+}
+
+fn register_qwen35_moe_layer(model: *mut std::ffi::c_void, moe: &MetalQwen35MoeWeights) -> bool {
+    let Some(router) = extract_qw(&moe.router) else {
+        log::warn!("C++ Qwen3.5 MoE registration requires quantized router weights");
+        return false;
+    };
+    let Some(shared_gate) = extract_qw(&moe.shared_gate) else {
+        log::warn!("C++ Qwen3.5 MoE registration requires quantized shared gate weights");
+        return false;
+    };
+    let Some(shared_up) = extract_qw(&moe.shared_up) else {
+        log::warn!("C++ Qwen3.5 MoE registration requires quantized shared up weights");
+        return false;
+    };
+    let Some(shared_down) = extract_qw(&moe.shared_down) else {
+        log::warn!("C++ Qwen3.5 MoE registration requires quantized shared down weights");
+        return false;
+    };
+    let Some(shared_expert_gate) = extract_qw(&moe.shared_expert_gate) else {
+        log::warn!("C++ Qwen3.5 MoE registration requires quantized shared expert gate weights");
+        return false;
+    };
+
+    unsafe {
+        mlx_sys::qwen35_compiled_set_last_moe_mlp(
+            model,
+            router.0,
+            router.1,
+            router.2,
+            moe.router_group_size,
+            moe.router_bits,
+            moe.switch_gate.weight.as_raw(),
+            moe.switch_gate.scales.as_raw(),
+            moe.switch_gate.biases.as_raw(),
+            moe.switch_up.weight.as_raw(),
+            moe.switch_up.scales.as_raw(),
+            moe.switch_up.biases.as_raw(),
+            moe.switch_down.weight.as_raw(),
+            moe.switch_down.scales.as_raw(),
+            moe.switch_down.biases.as_raw(),
+            moe.expert_group_size,
+            moe.expert_bits,
+            shared_gate.0,
+            shared_gate.1,
+            shared_gate.2,
+            shared_up.0,
+            shared_up.1,
+            shared_up.2,
+            shared_down.0,
+            shared_down.1,
+            shared_down.2,
+            shared_expert_gate.0,
+            shared_expert_gate.1,
+            shared_expert_gate.2,
+            moe.num_experts,
+            moe.top_k,
+            moe.norm_topk_prob,
+        );
+    }
+
+    if let Err(err) = mlx::check_mlx_error() {
+        log::warn!("C++ Qwen3.5 MoE registration failed: {err}");
+        return false;
+    }
+    true
 }
 
 /// Owned C++ Qwen35 compiled model handle.
@@ -469,22 +667,29 @@ impl CppQwen35Model {
         for layer in &weights.layers {
             let input_ln = layer.input_layernorm.as_raw();
             let post_ln = layer.post_attention_layernorm.as_raw();
-            let MlpKind::Dense(dense) = &layer.mlp;
-            let (gate_up_id, gate_dim, down_id) = match &dense.inputs {
-                MlpInputProjection::MergedQuantized {
-                    gate_up_proj,
-                    gate_dim,
-                    ..
-                } => (
-                    add_or_free!(gate_up_proj),
-                    *gate_dim,
-                    add_or_free!(&dense.down_proj),
-                ),
-                MlpInputProjection::Split { .. } => {
-                    log::warn!("C++ Qwen3.5 model requires merged MLP inputs");
-                    unsafe { mlx_sys::qwen35_compiled_free(model) };
-                    return None;
+            let dense = match &layer.mlp {
+                MlpKind::Dense(dense) => Some(dense),
+                MlpKind::Moe(_) => None,
+            };
+            let (gate_up_id, gate_dim, down_id) = if let Some(dense) = dense {
+                match &dense.inputs {
+                    MlpInputProjection::MergedQuantized {
+                        gate_up_proj,
+                        gate_dim,
+                        ..
+                    } => (
+                        add_or_free!(gate_up_proj),
+                        *gate_dim,
+                        add_or_free!(&dense.down_proj),
+                    ),
+                    MlpInputProjection::Split { .. } => {
+                        log::warn!("C++ Qwen3.5 model requires merged MLP inputs");
+                        unsafe { mlx_sys::qwen35_compiled_free(model) };
+                        return None;
+                    }
                 }
+            } else {
+                (-1, 0, -1)
             };
 
             match &layer.attention {
@@ -554,14 +759,17 @@ impl CppQwen35Model {
                         let z_id = add_or_free!(&attn.in_proj_z);
                         let b_id = add_or_free!(&attn.in_proj_b);
                         let a_id = add_or_free!(&attn.in_proj_a);
-                        let gate_id = add_or_free!(&dense.gate_proj);
-                        let up_id = add_or_free!(&dense.up_proj);
+                        let (gate_id, up_id) = if let Some(dense) = dense {
+                            (add_or_free!(&dense.gate_proj), add_or_free!(&dense.up_proj))
+                        } else {
+                            (-1, -1)
+                        };
                         unsafe {
                             mlx_sys::qwen35_compiled_set_separate_proj_v2(
                                 model, qkv_id, z_id, b_id, a_id, gate_id, up_id,
                             );
                         }
-                    } else {
+                    } else if let Some(dense) = dense {
                         let gate_id = add_or_free!(&dense.gate_proj);
                         let up_id = add_or_free!(&dense.up_proj);
                         unsafe {
@@ -569,6 +777,13 @@ impl CppQwen35Model {
                         }
                     }
                 }
+            }
+
+            if let MlpKind::Moe(moe) = &layer.mlp
+                && !register_qwen35_moe_layer(model, moe)
+            {
+                unsafe { mlx_sys::qwen35_compiled_free(model) };
+                return None;
             }
         }
 
