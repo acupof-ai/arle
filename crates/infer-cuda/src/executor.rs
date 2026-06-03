@@ -233,6 +233,21 @@ impl RealCudaExecutor {
     /// warmup capture is logged and downgrades to eager-only (graphs left `None`);
     /// it is never fatal, because the eager path is the correctness floor.
     pub(crate) fn warmup(&mut self) -> Result<()> {
+        // TP × CUDA-graph guard: NCCL all-reduce is NOT graph-capturable
+        // (`NcclBackend::supports_graph_capture() == false`), and the row-parallel
+        // forward issues an all-reduce per layer under TP. Capturing would bake a
+        // graph that silently skips the collective and produce wrong logits, so
+        // multi-rank TP stays on the eager `forward_tokens` path (the correctness
+        // floor). CUDA-graph decode remains a single-GPU optimization. Follow-up:
+        // graph-capturable collectives (CustomAR / SymmMem) would lift this.
+        if self.model.tp.is_collective() {
+            info!(
+                "CUDA decode graph disabled under tensor parallelism \
+                 (world_size>1, NCCL collectives are not graph-capturable); \
+                 using eager forward"
+            );
+            return Ok(());
+        }
         if !decode_graph_enabled() {
             info!("CUDA decode graph disabled (set INFER_CUDA_DECODE_GRAPH=1 to enable)");
             return Ok(());
