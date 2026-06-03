@@ -12,7 +12,8 @@ pub use radix::{BlockId, PrefixMatch, RadixCache};
 
 use anyhow::{Result, anyhow, bail};
 use infer_plan::{
-    DecodeRow, FinishReason, ForwardMode, ForwardPlan, PrefillRow, SlotToken, StepOutput,
+    DecodeRow, FinishReason, ForwardMode, ForwardPlan, PrefillRow, SamplingParams, SlotToken,
+    StepOutput,
 };
 use infer_seam::{
     AdmissionVerdict, BackendExecutor, KvPool, PermissiveGovernor, PollResult, ResourceGovernor,
@@ -105,21 +106,14 @@ impl Default for SchedulerConfig {
 }
 
 /// Options accepted at request ingress.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct RequestOptions {
     /// Admission priority.
     pub priority: RequestPriority,
     /// Cooperative cancellation observed before queue insertion.
     pub cancelled: bool,
-}
-
-impl Default for RequestOptions {
-    fn default() -> Self {
-        Self {
-            priority: RequestPriority::Normal,
-            cancelled: false,
-        }
-    }
+    /// Per-request sampling parameters (default: greedy / argmax).
+    pub sampling: SamplingParams,
 }
 
 /// Completed request state retained after its slot has been freed.
@@ -162,6 +156,7 @@ struct RequestState {
     generated_tokens: Vec<u32>,
     priority: RequestPriority,
     max_tokens: usize,
+    sampling: SamplingParams,
     phase: RequestPhase,
     prefill_start_pos: usize,
     reused_prefix_pages: Vec<BlockId>,
@@ -175,6 +170,7 @@ impl RequestState {
         prompt_tokens: Vec<u32>,
         priority: RequestPriority,
         max_tokens: usize,
+        sampling: SamplingParams,
     ) -> Self {
         Self {
             handle,
@@ -182,6 +178,7 @@ impl RequestState {
             generated_tokens: Vec::new(),
             priority,
             max_tokens,
+            sampling,
             phase: RequestPhase::Prefilling { progress: 0 },
             prefill_start_pos: 0,
             reused_prefix_pages: Vec::new(),
@@ -296,7 +293,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             max_tokens,
             RequestOptions {
                 priority,
-                cancelled: false,
+                ..RequestOptions::default()
             },
         )
     }
@@ -423,7 +420,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         if prompt_tokens.is_empty() || prompt_tokens.len() > self.config.max_prompt_tokens {
             return NormalizedRequest::Completed(
-                RequestState::new(handle, prompt_tokens, options.priority, 0)
+                RequestState::new(handle, prompt_tokens, options.priority, 0, options.sampling)
                     .complete_immediately(FinishReason::Abort),
             );
         }
@@ -435,7 +432,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         );
         if max_tokens == 0 {
             return NormalizedRequest::Completed(
-                RequestState::new(handle, prompt_tokens, options.priority, 0)
+                RequestState::new(handle, prompt_tokens, options.priority, 0, options.sampling)
                     .complete_immediately(FinishReason::Length),
             );
         }
@@ -445,6 +442,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             prompt_tokens,
             options.priority,
             max_tokens,
+            options.sampling,
         ))
     }
 
@@ -680,6 +678,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     slot,
                     last_token,
                     kv_seq_len: self.kv.seq_len(slot),
+                    params: request.sampling.clone(),
                 });
             }
         }
@@ -708,6 +707,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 tokens: request.prompt_tokens[start_pos..start_pos + chunk].to_vec(),
                 start_pos,
                 total_tokens: request.prompt_tokens.len(),
+                params: request.sampling.clone(),
             });
             budget -= chunk;
         }
@@ -928,7 +928,10 @@ fn finish_reason_for(request: &RequestState, token: &SlotToken) -> Option<Finish
     if let Some(finish) = token.finish.clone() {
         return Some(finish);
     }
-    if token.token == STOP_TOKEN_ID {
+    let sampling = &request.sampling;
+    // Default EOS unless the request opts out; plus any per-request stop ids.
+    let hits_eos = !sampling.ignore_eos && token.token == STOP_TOKEN_ID;
+    if hits_eos || sampling.stop_token_ids.contains(&token.token) {
         Some(FinishReason::Stop)
     } else if request.generated_tokens.len() >= request.max_tokens {
         Some(FinishReason::Length)
@@ -1461,11 +1464,22 @@ mod tests {
         let longer = engine.next_handle();
         let shorter = engine.next_handle();
 
-        let mut long_req =
-            RequestState::new(longer, vec![1, 1, 1, 1, 1], RequestPriority::Normal, 8);
+        let mut long_req = RequestState::new(
+            longer,
+            vec![1, 1, 1, 1, 1],
+            RequestPriority::Normal,
+            8,
+            SamplingParams::default(),
+        );
         long_req.generated_tokens = vec![9, 10];
         long_req.phase = RequestPhase::Decoding;
-        let mut short_req = RequestState::new(shorter, vec![2, 2], RequestPriority::Normal, 8);
+        let mut short_req = RequestState::new(
+            shorter,
+            vec![2, 2],
+            RequestPriority::Normal,
+            8,
+            SamplingParams::default(),
+        );
         short_req.generated_tokens = vec![7, 8];
         short_req.phase = RequestPhase::Decoding;
 
