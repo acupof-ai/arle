@@ -1852,6 +1852,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-cuda"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "infer-plan",
+ "infer-seam",
+ "log",
+]
+
+[[package]]
+name = "infer-metal"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "infer-plan",
+ "infer-seam",
+ "log",
+]
+
+[[package]]
+name = "infer-models"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "infer-plan",
+ "infer-seam",
+ "log",
+]
+
+[[package]]
 name = "infer-plan"
 version = "0.1.5"
 dependencies = [
