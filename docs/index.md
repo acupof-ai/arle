@@ -22,21 +22,30 @@ The 2026-05-24 backlog
 [`projects/2026-05-24-opd-mainline-task-backlog.md`](projects/2026-05-24-opd-mainline-task-backlog.md)
 predates the methodology shift and is stale.
 
-**DSv4 status snapshot (2026-06-01):** DSv4 serving is correct enough to output
-tokens on the current default path, but the current path is not SGLang-path
-aligned. Default MoE transport is local routed experts plus EP all-reduce;
-native DeepEP is explicitly blocked on the replicated-token TP/EP route because
-it over-transports token rows by about 4.4x. The SGLang-gap campaign now uses
+**DSv4 status snapshot (2026-06-03):** DSv4 serving is correct enough to output
+tokens on the current debug/default path, but the current path is not
+SGLang-path aligned. The active target is DSv4-Flash TP8 + EAGLE on one 8-GPU
+node, 256K/1500, hot GPU-cache hit: TTFT ~0.44 s, TPOT ~4.85 ms, E2E ~7.7 s,
+and output throughput ~196 tok/s. The SGLang-gap campaign now uses
 [`plans/2026-06-01-dsv4-sglang-path-alignment.md`](plans/2026-06-01-dsv4-sglang-path-alignment.md)
-as the controlling plan. The user-supplied SGLang reference is about
-18 ms/token, so a `>20%` ARLE win means `<=14.4 ms/token` if the metric is raw
-target-step TPOT; the older `60-64 ms/token` framing is deprecated. The
-operator roofline queue is subordinate to this path contract and cannot
-license a SGLang-comparable win until request ownership, multi-axis TP/DP/EP
-layout, batched FlashMLA paged-KV attention, and native DeepEP/MegaMoE-style
-MoE transport are aligned. A later user-supplied vLLM/SGLang trace makes the
-post-contract P0 MoE/EP first: fused SwiGLU+quant, DeepGEMM expert GEMM,
-DeepEP dispatch/combine, and scratch/materialization elimination. Historical evidence:
+as the controlling plan. A result does not pass until that workload clears
+TTFT, TPOT, E2E, and output throughput together.
+
+Default MoE transport is local routed experts plus EP all-reduce; native DeepEP
+is explicitly blocked on the replicated-token TP/EP route because it
+over-transports token rows by about 4.4x. The latest fail-closed startup
+contract also logs `model_row_ownership=replicated-token`; request routing can
+print `request_ownership=token-owned-dp-ep`, but that is not evidence that the
+DeepSeek model forward consumes distinct token-owned hidden rows. Debug
+all-reduce, DeepEP-style replicated-token dispatch, cold-cache runs, or raw
+target-model TPOT without EAGLE/effective-token accounting cannot license a
+win. The operator roofline queue is subordinate to this path contract and
+cannot license a SGLang-comparable win until request ownership, model row
+ownership, multi-axis TP/DP/EP layout, batched FlashMLA paged-KV attention, and
+native DeepEP/MegaMoE-style MoE transport are aligned. A later user-supplied
+vLLM/SGLang trace makes the post-contract P0 MoE/EP first: fused SwiGLU+quant,
+DeepGEMM expert GEMM, DeepEP dispatch/combine, and scratch/materialization
+elimination. Historical evidence:
 [`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md),
 [`experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md),
