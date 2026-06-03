@@ -1764,4 +1764,77 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Micro-benchmark of the device-neutral engine-core scheduler (mock backend,
+    /// synchronous — so this isolates the CPU-side scheduling cost: admission,
+    /// radix, chunked planning, apply_output). Run:
+    ///   CUDARC_CUDA_VERSION=12060 cargo test --release -p infer-core \
+    ///     bench_engine_core_scheduler_throughput -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_engine_core_scheduler_throughput() -> Result<()> {
+        use std::time::Instant;
+
+        // Scenario 1: c=1 single long request (AI-PC focus — per-decode-tick cost).
+        {
+            let mut config = test_config(1);
+            config.max_prompt_tokens = 8192;
+            config.max_total_tokens = 16_384;
+            let mut engine = Engine::with_config(MockExecutor::ready(), MockKvPool::new(1), config);
+            let prompt: Vec<u32> = (0..1024).map(|i| (i % 50_000) as u32 + 2).collect();
+            let max_tokens = 512usize;
+            let handle = engine.submit_request(prompt, max_tokens);
+            let mut ticks = 0u64;
+            let start = Instant::now();
+            while !engine.is_idle() {
+                engine.step()?;
+                ticks += 1;
+            }
+            let elapsed = start.elapsed();
+            let generated = engine
+                .completed(handle)
+                .map_or(0, |c| c.generated_tokens.len());
+            eprintln!(
+                "[engine-core c=1 long] gen={generated} ticks={ticks} wall={elapsed:?} \
+                 us_per_tick={:.3} sched_tok_per_s={:.0}",
+                elapsed.as_micros() as f64 / ticks.max(1) as f64,
+                generated as f64 / elapsed.as_secs_f64(),
+            );
+        }
+
+        // Scenario 2: batched concurrency (8 slots, 64 distinct requests).
+        {
+            let mut config = test_config(8);
+            config.max_prompt_tokens = 8192;
+            config.max_total_tokens = 16_384;
+            config.chunked_prefill_size = 256;
+            let mut engine = Engine::with_config(MockExecutor::ready(), MockKvPool::new(8), config);
+            let n = 64usize;
+            let max_tokens = 128usize;
+            let mut handles = Vec::with_capacity(n);
+            for r in 0..n {
+                let mut prompt: Vec<u32> = vec![1u32; 384];
+                prompt[0] = r as u32 + 2; // distinct prefix -> no radix reuse
+                handles.push(engine.submit_request(prompt, max_tokens));
+            }
+            let mut ticks = 0u64;
+            let start = Instant::now();
+            while !engine.is_idle() {
+                engine.step()?;
+                ticks += 1;
+            }
+            let elapsed = start.elapsed();
+            let total_gen: usize = handles
+                .iter()
+                .map(|h| engine.completed(*h).map_or(0, |c| c.generated_tokens.len()))
+                .sum();
+            eprintln!(
+                "[engine-core batched c=8 n=64] gen={total_gen} ticks={ticks} wall={elapsed:?} \
+                 us_per_tick={:.3} sched_tok_per_s={:.0}",
+                elapsed.as_micros() as f64 / ticks.max(1) as f64,
+                total_gen as f64 / elapsed.as_secs_f64(),
+            );
+        }
+        Ok(())
+    }
 }
