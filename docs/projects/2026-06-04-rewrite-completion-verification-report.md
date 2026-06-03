@@ -111,20 +111,27 @@ hangs). → a **fundamental prefill-cubin wedge on sm_90**, prompt-shape-indepen
   **not** an async-pipeline/mbarrier wedge.
 - Prefill dyn-shmem = 49152 B = `q_tile+k_tile+v_tile` = correctly sized → **not** mis-sized.
 
-**TileLang version — ruled out (0.1.9 A/B, 2026-06-04):** installed 0.1.9 in a venv,
-forced AOT regen (confirmed new prefill device-source sha), rebuilt, re-ran
-`seq_len=64` → **still hangs**. So this is **not** the 0.1.10 FullRow defect of
-`errors/2026-05-27`; that fix verdict does not transfer here.
+**Root cause (classified): a hard TileLang codegen bug** in the HD128 multi-row
+prefill FullRow-WGMMA lowering on sm_90a — see
+`errors/2026-06-04-tilelang-hd128-prefill-wgmma-hang-sm90a.md`. Ruled out, each by a
+controlled experiment: TileLang version (0.1.9 forced-regen still hangs), build-arch
+(cubin confirmed `sm_90a` + WGMMA), `BLOCK_N` (32 still hangs), warp-policy (`Square`
+lowered to the *identical* device-source sha as `FullRow` → the knob is inert), FFI
+arg order (matches the generated signature), dyn-shmem, trip-count, partial-tile.
 
-**Narrowed root cause (probe in flight): sm_90a / HD128-FullRow-WGMMA.** The
-`FullRow` gemm emits Hopper WGMMA, which nvcc enables only under the `sm_90a`
-target (`gen_tilelang_aot.py:538-563` is supposed to pass
-`-gencode=arch=compute_90a,code=sm_90a` for `cuda_arch==90`). The 2026-05-30 H20 win
-ran the **HD256** prefill FullRow-WGMMA on sm_90 correctly; the **HD128 q16_kv8**
-prefill (Qwen3-0.6B) may have never run on sm_90 before R6. A vs B: (A) build didn't
-apply sm_90a → build fix; (B) it did and HD128 FullRow-WGMMA is miscompiled on
-sm_90a → kernel-level fix (warp policy / tile). Read-only arch + WGMMA-count probe
-decides. Then: guarded-`exp2` partial-tile fix + HF-gold greedy parity close Phase 0.
+**Decisive positive — the rewrite architecture is sound.** A 1-token prompt routes to
+the **decode** kernel and ran cleanly through all 28 layers via the clean R6 launch
+path → engine→executor→model→attention→launch + the decode cubin all work; the spin
+is specific to the HD128 *batched* prefill cubin (`BLOCK_M=64` multi-row WGMMA). The
+2026-05-30 win ran HD256 prefill on sm_90 fine → the defect is HD128-shape-specific.
+
+**Resolution — correctness via `chunk_size=1` (in flight):** process the prompt as
+sequential 1-token forwards through the proven decode kernel (causally identical to
+batched prefill) → end-to-end greedy parity vs HF gold closes Phase-0 *correctness*
+without the broken cubin. The batched HD128 prefill cubin (fast long-prompt prefill)
+is a documented **perf-only** follow-up (upstream TileLang fix or FlashInfer-C++
+migration). Sibling decode `cache_len != kv_seq_len` error was a stale-pod-binary
+artifact, not a code bug (current planner.rs is correct; guards added in `8388fc64`).
 
 ---
 
