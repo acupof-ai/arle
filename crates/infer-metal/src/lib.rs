@@ -315,6 +315,7 @@ impl MetalExecutor {
                 config,
                 weights,
                 slots: HashMap::new(),
+                page_store: MetalPageStore::default(),
                 active_session_slot: None,
             }),
         })
@@ -393,6 +394,7 @@ struct RealMetalExecutor {
     config: config::MetalModelConfig,
     weights: qwen35::Qwen35MetalWeights,
     slots: HashMap<usize, MetalSlotState>,
+    page_store: MetalPageStore,
     active_session_slot: Option<usize>,
 }
 
@@ -421,19 +423,10 @@ impl RealMetalExecutor {
         kv: &mut dyn KvPool,
     ) -> anyhow::Result<MetalInflight> {
         anyhow::ensure!(
-            row.start_pos == 0,
-            "R3a MetalExecutor does not support prefix reuse or chunked prefill yet"
-        );
-        anyhow::ensure!(
             !row.tokens.is_empty(),
-            "R3a MetalExecutor prefill row must contain at least one token"
+            "MetalExecutor prefill row must contain at least one token"
         );
-        if let Some(active) = self.active_session_slot {
-            anyhow::ensure!(
-                active == row.slot,
-                "R3a scalar Qwen3.5 C++ sessions support only one active slot"
-            );
-        }
+        self.ensure_no_other_active_session(row.slot)?;
 
         self.reset_slot_if_epoch_changed(row.slot, kv)?;
         if !self.slots.contains_key(&row.slot) {
@@ -441,24 +434,43 @@ impl RealMetalExecutor {
                 .seq_len(row.slot)
                 .max(row.total_tokens.saturating_add(512))
                 .max(row.tokens.len().saturating_add(1));
-            self.slots.insert(
-                row.slot,
-                MetalSlotState::new(row.slot, kv.slot_epoch(row.slot), &self.config, reservation),
-            );
+            let state = if row.start_pos == 0 {
+                MetalSlotState::new(row.slot, kv.slot_epoch(row.slot), &self.config, reservation)
+            } else {
+                self.page_store.materialize_slot_from_prefix(
+                    row.slot,
+                    kv.slot_epoch(row.slot),
+                    kv,
+                    row.start_pos,
+                    reservation,
+                )?
+            };
+            self.slots.insert(row.slot, state);
         }
 
         let model = self.weights.cpp_model()?;
         let slot = self.slots.get_mut(&row.slot).expect("slot inserted above");
+        anyhow::ensure!(
+            row.start_pos == slot.cache_len,
+            "prefill start_pos mismatch for slot {}: plan={}, metal_state={}",
+            row.slot,
+            row.start_pos,
+            slot.cache_len
+        );
         slot.ensure_session_active(model)?;
+        self.active_session_slot = Some(row.slot);
         let token_values: Vec<i32> = row.tokens.iter().map(|&token| token as i32).collect();
         let token_arr = mlx::MlxArray::from_slice_i32(&token_values, &[token_values.len() as i32]);
-        let logits = model.prefill_session(&token_arr, token_values.len() as i32, 0)?;
+        let logits =
+            model.prefill_session(&token_arr, token_values.len() as i32, row.start_pos as i32)?;
         mlx::async_eval(&[&logits]);
-        slot.cache_len = row.tokens.len();
+        slot.cache_len = row.start_pos + row.tokens.len();
+        slot.drain_session(model)?;
+        self.active_session_slot = None;
+        self.page_store.publish_slot(slot, kv)?;
 
         let sampled = mlx::argmax(&logits);
         mlx::async_eval(&[&sampled]);
-        self.active_session_slot = Some(row.slot);
         Ok(MetalInflight::Sampled {
             slot: row.slot,
             sampled,
@@ -470,14 +482,25 @@ impl RealMetalExecutor {
         row: &infer_plan::DecodeRow,
         kv: &mut dyn KvPool,
     ) -> anyhow::Result<MetalInflight> {
-        if let Some(active) = self.active_session_slot {
-            anyhow::ensure!(
-                active == row.slot,
-                "R3a scalar Qwen3.5 C++ sessions support only one active slot"
-            );
-        }
+        self.ensure_no_other_active_session(row.slot)?;
         self.reset_slot_if_epoch_changed(row.slot, kv)?;
         let model = self.weights.cpp_model()?;
+        if !self.slots.contains_key(&row.slot) {
+            anyhow::ensure!(
+                row.kv_seq_len > 0,
+                "decode for slot {} before prefill with empty host prefix",
+                row.slot
+            );
+            let reservation = kv.seq_len(row.slot).max(row.kv_seq_len.saturating_add(512));
+            let state = self.page_store.materialize_slot_from_prefix(
+                row.slot,
+                kv.slot_epoch(row.slot),
+                kv,
+                row.kv_seq_len,
+                reservation,
+            )?;
+            self.slots.insert(row.slot, state);
+        }
         let slot = self
             .slots
             .get_mut(&row.slot)
@@ -490,18 +513,31 @@ impl RealMetalExecutor {
             slot.cache_len
         );
         slot.ensure_session_active(model)?;
+        self.active_session_slot = Some(row.slot);
         let token_arr = mlx::MlxArray::from_slice_i32(&[row.last_token as i32], &[1]);
         let logits = model.step_session(&token_arr, slot.cache_len as i32)?;
         mlx::async_eval(&[&logits]);
         slot.cache_len = slot.cache_len.saturating_add(1);
+        slot.drain_session(model)?;
+        self.active_session_slot = None;
+        self.page_store.publish_slot(slot, kv)?;
 
         let sampled = mlx::argmax(&logits);
         mlx::async_eval(&[&sampled]);
-        self.active_session_slot = Some(row.slot);
         Ok(MetalInflight::Sampled {
             slot: row.slot,
             sampled,
         })
+    }
+
+    fn ensure_no_other_active_session(&self, slot: usize) -> anyhow::Result<()> {
+        if let Some(active) = self.active_session_slot {
+            anyhow::ensure!(
+                active == slot,
+                "scalar Qwen3.5 C++ sessions support only one active slot"
+            );
+        }
+        Ok(())
     }
 
     fn reset_slot_if_epoch_changed(&mut self, slot: usize, kv: &dyn KvPool) -> anyhow::Result<()> {
@@ -528,8 +564,152 @@ impl RealMetalExecutor {
 }
 
 #[cfg(feature = "metal")]
+#[derive(Default)]
+struct MetalPageStore {
+    pages: HashMap<u32, MetalPageBlock>,
+    prefixes: HashMap<Vec<u32>, MetalPrefixSnapshot>,
+}
+
+#[cfg(feature = "metal")]
+struct MetalPageBlock {
+    kv_flat: Vec<mlx::MlxArray>,
+}
+
+#[cfg(feature = "metal")]
+struct MetalPrefixSnapshot {
+    cache_len: usize,
+    gdr_flat: Vec<mlx::MlxArray>,
+}
+
+#[cfg(feature = "metal")]
+impl MetalPageStore {
+    fn publish_slot(&mut self, slot: &MetalSlotState, kv: &dyn KvPool) -> anyhow::Result<()> {
+        let page_size = kv.page_size().max(1);
+        let full_pages = slot.cache_len / page_size;
+        if full_pages == 0 {
+            return Ok(());
+        }
+
+        let page_ids = kv.page_indices(slot.slot);
+        let publish_pages = full_pages.min(page_ids.len());
+        for (page_idx, page_id) in page_ids.iter().take(publish_pages).enumerate() {
+            let start = page_idx * page_size;
+            let end = start + page_size;
+            let mut kv_flat = Vec::with_capacity(slot.kv_flat.len());
+            for array in &slot.kv_flat {
+                kv_flat.push(slice_kv_tokens(array, start, end)?);
+            }
+            // Host page ids may be reused after the seam frees a slot. Overwrite
+            // with the current slot's contents; retained/shared pages cannot be
+            // reallocated by the host pool, so this does not corrupt live reuse.
+            self.pages.insert(*page_id, MetalPageBlock { kv_flat });
+        }
+
+        // GDR state is prefix-wide, not page-local. Only publish a hot-prefix
+        // snapshot at an exact page boundary where the exported recurrent/conv
+        // state corresponds to the same token length as the page-id prefix.
+        if slot.cache_len % page_size == 0 && publish_pages == full_pages {
+            let key = page_ids[..full_pages].to_vec();
+            if key.iter().all(|page| self.pages.contains_key(page)) {
+                self.prefixes.insert(
+                    key,
+                    MetalPrefixSnapshot {
+                        cache_len: slot.cache_len,
+                        gdr_flat: slot.gdr_flat.clone(),
+                    },
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn materialize_slot_from_prefix(
+        &self,
+        slot: usize,
+        slot_epoch: u64,
+        kv: &dyn KvPool,
+        prefix_tokens: usize,
+        capacity_tokens: usize,
+    ) -> anyhow::Result<MetalSlotState> {
+        let page_size = kv.page_size().max(1);
+        anyhow::ensure!(
+            prefix_tokens % page_size == 0,
+            "Metal prefix attach requires page-aligned prefix: prefix_tokens={}, page_size={}",
+            prefix_tokens,
+            page_size
+        );
+        let prefix_pages = prefix_tokens / page_size;
+        let slot_pages = kv.page_indices(slot);
+        anyhow::ensure!(
+            slot_pages.len() >= prefix_pages,
+            "Metal prefix attach for slot {slot} needs {prefix_pages} pages, host slot has {}",
+            slot_pages.len()
+        );
+        let key = slot_pages[..prefix_pages].to_vec();
+        let snapshot = self.prefixes.get(&key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Metal prefix attach missing GDR snapshot for slot {slot}, prefix_tokens={prefix_tokens}, pages={key:?}"
+            )
+        })?;
+        anyhow::ensure!(
+            snapshot.cache_len == prefix_tokens,
+            "Metal prefix snapshot length mismatch for slot {slot}: requested={}, snapshot={}",
+            prefix_tokens,
+            snapshot.cache_len
+        );
+
+        let first_page = key
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Metal prefix attach got empty page key"))?;
+        let first_block = self.pages.get(first_page).ok_or_else(|| {
+            anyhow::anyhow!("Metal prefix attach missing K/V page {first_page} for slot {slot}")
+        })?;
+
+        let mut kv_flat = Vec::with_capacity(first_block.kv_flat.len());
+        let capacity = round_up_capacity(capacity_tokens.max(prefix_tokens)) as usize;
+        for array_idx in 0..first_block.kv_flat.len() {
+            let mut page_arrays = Vec::with_capacity(key.len());
+            for page in &key {
+                let block = self.pages.get(page).ok_or_else(|| {
+                    anyhow::anyhow!("Metal prefix attach missing K/V page {page} for slot {slot}")
+                })?;
+                let array = block.kv_flat.get(array_idx).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Metal prefix attach K/V page {page} is missing array index {array_idx}"
+                    )
+                })?;
+                page_arrays.push(array.clone());
+            }
+            let prefix_array = concatenate_or_single(page_arrays);
+            let shape = prefix_array.shape().to_vec();
+            anyhow::ensure!(
+                shape.len() == 4 && shape[2] as usize == prefix_tokens,
+                "Metal prefix K/V materialization shape mismatch for slot {slot}: shape={shape:?}, prefix_tokens={prefix_tokens}"
+            );
+            if capacity > prefix_tokens {
+                let mut zero_shape = shape;
+                zero_shape[2] = usize_to_i32(capacity - prefix_tokens)?;
+                let zeros = mlx::zeros(&zero_shape, prefix_array.dtype());
+                kv_flat.push(mlx::concatenate_axis(&[prefix_array, zeros], 2));
+            } else {
+                kv_flat.push(prefix_array);
+            }
+        }
+
+        Ok(MetalSlotState::from_arrays(
+            slot,
+            slot_epoch,
+            prefix_tokens,
+            kv_flat,
+            snapshot.gdr_flat.clone(),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
 struct MetalSlotState {
-    _slot: usize,
+    slot: usize,
     slot_epoch: u64,
     cache_len: usize,
     kv_flat: Vec<mlx::MlxArray>,
@@ -580,9 +760,26 @@ impl MetalSlotState {
         }
 
         Self {
-            _slot: slot,
+            slot,
             slot_epoch,
             cache_len: 0,
+            kv_flat,
+            gdr_flat,
+            session_active: false,
+        }
+    }
+
+    fn from_arrays(
+        slot: usize,
+        slot_epoch: u64,
+        cache_len: usize,
+        kv_flat: Vec<mlx::MlxArray>,
+        gdr_flat: Vec<mlx::MlxArray>,
+    ) -> Self {
+        Self {
+            slot,
+            slot_epoch,
+            cache_len,
             kv_flat,
             gdr_flat,
             session_active: false,
@@ -608,6 +805,42 @@ impl MetalSlotState {
         self.session_active = false;
         Ok(())
     }
+}
+
+#[cfg(feature = "metal")]
+fn slice_kv_tokens(
+    array: &mlx::MlxArray,
+    start_token: usize,
+    end_token: usize,
+) -> anyhow::Result<mlx::MlxArray> {
+    let shape = array.shape().to_vec();
+    anyhow::ensure!(
+        shape.len() == 4,
+        "expected Qwen3.5 flat K/V array to be rank-4, got shape={shape:?}"
+    );
+    anyhow::ensure!(
+        start_token <= end_token && end_token <= shape[2] as usize,
+        "K/V slice token range [{start_token}, {end_token}) exceeds shape={shape:?}"
+    );
+    let start = [0, 0, usize_to_i32(start_token)?, 0];
+    let stop = [shape[0], shape[1], usize_to_i32(end_token)?, shape[3]];
+    let strides = [1, 1, 1, 1];
+    Ok(mlx::slice(array, &start, &stop, &strides))
+}
+
+#[cfg(feature = "metal")]
+fn concatenate_or_single(mut arrays: Vec<mlx::MlxArray>) -> mlx::MlxArray {
+    debug_assert!(!arrays.is_empty());
+    if arrays.len() == 1 {
+        arrays.pop().expect("len checked")
+    } else {
+        mlx::concatenate_axis(&arrays, 2)
+    }
+}
+
+#[cfg(feature = "metal")]
+fn usize_to_i32(value: usize) -> anyhow::Result<i32> {
+    i32::try_from(value).map_err(|_| anyhow::anyhow!("value {value} exceeds i32::MAX"))
 }
 
 #[cfg(feature = "metal")]
