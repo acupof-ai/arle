@@ -13,6 +13,8 @@ cudarc = { version = "0.19", features = [
     "cublas",
     "f16",
 ], optional = true }
+deepep-sys = { path = "../deepep-sys", optional = true }
+deepseek-spec = { path = "../deepseek-spec", optional = true }
 half = { version = "2.4", features = ["num-traits"], optional = true }
 infer-moe = { path = "../infer-moe" }
 infer-plan = { path = "../infer-plan" }
@@ -31,6 +33,7 @@ cuda = [
     "dep:cudarc",
     "dep:half",
     "dep:qwen3-spec",
+    "dep:deepseek-spec",
     "dep:safetensors",
     "dep:serde",
     "dep:serde_json",
@@ -41,6 +44,9 @@ no-cuda = ["cuda-kernels/no-cuda"]
 # Implies `cuda`; the real NCCL wiring is H20-gated and lands later — declaring
 # the feature here makes the `cfg(feature = "nccl")` gate in `tp.rs` a known cfg.
 nccl = ["cuda", "cuda-kernels/nccl"]
+# DSv4 expert-parallel DeepEP dispatch/combine (Piece 4). Implies `nccl` (the EP
+# group rides the same NCCL substrate) and pulls the native deepep-sys transport.
+deepep = ["nccl", "dep:deepep-sys", "deepep-sys/deepep"]
 
 [lints]
 workspace = true
