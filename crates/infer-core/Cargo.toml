@@ -1,0 +1,15 @@
+[package]
+name = "infer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+infer-plan = { path = "../infer-plan" }
+infer-seam = { path = "../infer-seam" }
+log = "0.4"
+
+[lints]
+workspace = true

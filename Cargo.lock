@@ -1842,6 +1842,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-core"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "infer-plan",
+ "infer-seam",
+ "log",
+]
+
+[[package]]
 name = "infer-plan"
 version = "0.1.5"
 dependencies = [
