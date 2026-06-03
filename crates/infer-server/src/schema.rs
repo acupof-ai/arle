@@ -1,0 +1,335 @@
+//! OpenAI v1 wire types and the API error shape (COLD — fixed external contract).
+//!
+//! Request/response bodies for `/v1/completions` and `/v1/chat/completions`, the
+//! sampling-field mapping into the shared [`SamplingParams`] contract, and
+//! [`ApiError`] / its [`IntoResponse`] rendering. The HTTP handlers in
+//! [`crate::http`] own request ingress; this file owns only the wire shapes and
+//! their validation/conversion.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use infer_core::CompletedRequest;
+use infer_plan::{FinishReason, SamplingParams};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+/// Minimal `/v1/completions` request body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompletionRequest {
+    pub model: Option<String>,
+    pub prompt: String,
+    #[serde(default, alias = "max_completion_tokens")]
+    pub max_tokens: Option<usize>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<i32>,
+    pub min_p: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub stop_token_ids: Option<Vec<u32>>,
+    pub ignore_eos: Option<bool>,
+    pub seed: Option<u64>,
+    pub stream: Option<bool>,
+    pub stop: Option<Vec<String>>,
+}
+
+impl CompletionRequest {
+    pub(crate) fn validate(&self) -> Result<(), ApiError> {
+        if self.prompt.trim().is_empty() {
+            return Err(ApiError::bad_request("prompt must not be empty"));
+        }
+        validate_common(self.stream, self.max_tokens)
+    }
+
+    /// Convert compatible sampling fields into the shared pure-data contract.
+    #[must_use]
+    pub fn sampling_params(&self) -> SamplingParams {
+        sampling_params(
+            self.max_tokens,
+            self.temperature,
+            self.top_k,
+            self.top_p,
+            self.min_p,
+            self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+            self.ignore_eos,
+            self.stop_token_ids.clone(),
+            self.seed,
+        )
+    }
+}
+
+/// Minimal `/v1/chat/completions` request body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatCompletionRequest {
+    pub model: Option<String>,
+    pub messages: Vec<ChatMessage>,
+    #[serde(default, alias = "max_completion_tokens")]
+    pub max_tokens: Option<usize>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<i32>,
+    pub min_p: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub stop_token_ids: Option<Vec<u32>>,
+    pub ignore_eos: Option<bool>,
+    pub seed: Option<u64>,
+    pub stream: Option<bool>,
+    pub stop: Option<Vec<String>>,
+}
+
+impl ChatCompletionRequest {
+    pub(crate) fn validate(&self) -> Result<(), ApiError> {
+        if self.messages.is_empty() {
+            return Err(ApiError::bad_request(
+                "messages must contain at least one message",
+            ));
+        }
+        validate_common(self.stream, self.max_tokens)
+    }
+
+    /// Convert compatible sampling fields into the shared pure-data contract.
+    #[must_use]
+    pub fn sampling_params(&self) -> SamplingParams {
+        sampling_params(
+            self.max_tokens,
+            self.temperature,
+            self.top_k,
+            self.top_p,
+            self.min_p,
+            self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+            self.ignore_eos,
+            self.stop_token_ids.clone(),
+            self.seed,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: Option<String>,
+}
+
+fn validate_common(stream: Option<bool>, max_tokens: Option<usize>) -> Result<(), ApiError> {
+    if stream.unwrap_or(false) {
+        return Err(ApiError::bad_request(
+            "stream=true is deferred in R5 tranche 2",
+        ));
+    }
+    if matches!(max_tokens, Some(0)) {
+        return Err(ApiError::bad_request(
+            "max_tokens must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sampling_params(
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_k: Option<i32>,
+    top_p: Option<f32>,
+    min_p: Option<f32>,
+    repetition_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    ignore_eos: Option<bool>,
+    stop_token_ids: Option<Vec<u32>>,
+    seed: Option<u64>,
+) -> SamplingParams {
+    let default = SamplingParams::default();
+    SamplingParams {
+        temperature: temperature.unwrap_or(default.temperature),
+        top_k: top_k.unwrap_or(default.top_k),
+        top_p: top_p.unwrap_or(default.top_p),
+        min_p: min_p.unwrap_or(default.min_p),
+        repetition_penalty: repetition_penalty.unwrap_or(default.repetition_penalty),
+        frequency_penalty: frequency_penalty.unwrap_or(default.frequency_penalty),
+        presence_penalty: presence_penalty.unwrap_or(default.presence_penalty),
+        ignore_eos: ignore_eos.unwrap_or(default.ignore_eos),
+        stop_token_ids: stop_token_ids.unwrap_or_default(),
+        seed,
+        max_new_tokens: max_tokens,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,
+}
+
+impl CompletionResponse {
+    pub(crate) fn from_completed(model: String, completed: CompletedRequest, text: String) -> Self {
+        let usage = Usage::new(
+            completed.prompt_tokens.len(),
+            completed.generated_tokens.len(),
+        );
+        Self {
+            id: format!("cmpl-{}", uuid::Uuid::new_v4().simple()),
+            object: "text_completion",
+            created: unix_time_secs(),
+            model,
+            choices: vec![CompletionChoice {
+                text,
+                index: 0,
+                logprobs: None,
+                finish_reason: finish_reason(completed.finish.as_ref()).to_string(),
+            }],
+            usage,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionChoice {
+    pub text: String,
+    pub index: usize,
+    pub logprobs: Option<serde_json::Value>,
+    pub finish_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatCompletionResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChatChoice>,
+    pub usage: Usage,
+}
+
+impl ChatCompletionResponse {
+    pub(crate) fn from_completed(
+        model: String,
+        completed: CompletedRequest,
+        content: String,
+    ) -> Self {
+        let usage = Usage::new(
+            completed.prompt_tokens.len(),
+            completed.generated_tokens.len(),
+        );
+        Self {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+            object: "chat.completion",
+            created: unix_time_secs(),
+            model,
+            choices: vec![ChatChoice {
+                index: 0,
+                message: AssistantMessage {
+                    role: "assistant",
+                    content,
+                },
+                finish_reason: finish_reason(completed.finish.as_ref()).to_string(),
+            }],
+            usage,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatChoice {
+    pub index: usize,
+    pub message: AssistantMessage,
+    pub finish_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AssistantMessage {
+    pub role: &'static str,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Usage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+}
+
+impl Usage {
+    fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        }
+    }
+}
+
+fn finish_reason(reason: Option<&FinishReason>) -> &'static str {
+    match reason {
+        Some(FinishReason::Stop) => "stop",
+        Some(FinishReason::Length) | None => "length",
+        Some(FinishReason::Abort) => "abort",
+    }
+}
+
+fn unix_time_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+#[derive(Debug)]
+pub(crate) struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(value: anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: value.to_string(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({
+                "error": {
+                    "message": self.message,
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": null
+                }
+            })),
+        )
+            .into_response()
+    }
+}
