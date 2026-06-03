@@ -2458,7 +2458,12 @@ impl DeepseekModel {
             self.config.hidden_size,
             self.config.hc_mult,
         )?;
-        self.forward_mtp_ffn_layer_stream(token, mtp, &attn_stream)
+        self.forward_mtp_ffn_layer_stream(
+            token,
+            mtp,
+            &attn_stream,
+            &mut target_state.incremental.mtp_moe,
+        )
     }
 
     fn forward_mtp_swa_attention_frozen(
@@ -2610,6 +2615,7 @@ impl DeepseekModel {
         token: u32,
         mtp: &DeepseekMtpLayer,
         stream: &HiddenStates,
+        moe_scratch: &mut DeepseekMoeRuntimeCache,
     ) -> Result<HiddenStates> {
         let mhc = gen_mhc_params(
             &self.ctx,
@@ -2658,7 +2664,7 @@ impl DeepseekModel {
                     &self.config.ep,
                     &normed,
                     &[token],
-                    None,
+                    Some(moe_scratch),
                 )?
             }
             #[cfg(not(feature = "nccl"))]
@@ -2675,7 +2681,7 @@ impl DeepseekModel {
                 &self.config.ep,
                 &normed,
                 &[token],
-                None,
+                Some(moe_scratch),
             )?;
             let (ready, overlapped) = {
                 #[cfg(feature = "nccl")]
