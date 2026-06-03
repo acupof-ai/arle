@@ -111,20 +111,20 @@ hangs). → a **fundamental prefill-cubin wedge on sm_90**, prompt-shape-indepen
   **not** an async-pipeline/mbarrier wedge.
 - Prefill dyn-shmem = 49152 B = `q_tile+k_tile+v_tile` = correctly sized → **not** mis-sized.
 
-**Root cause:** TileLang 0.1.10's `GemmWarpPolicy.FullRow` codegen is broken on this
-SKU. Corroborated by two prior in-repo error entries with identical SKU/symptom and
-the same fix verdict: `errors/2026-05-27-tilelang-0110-fullrow-warp23-nan-sm80.md`
-(every kernel-level workaround failed; pin 0.1.9) and
-`errors/2026-05-30-gated-delta-short-seq-prefill-hang-h20.md` (sm_90 prefill 100%
-util / no Xid). The 2026-05-30 sm_90 success used a 0.1.9-pinned build; the R6 build
-silently fell to system 0.1.10.
+**TileLang version — ruled out (0.1.9 A/B, 2026-06-04):** installed 0.1.9 in a venv,
+forced AOT regen (confirmed new prefill device-source sha), rebuilt, re-ran
+`seq_len=64` → **still hangs**. So this is **not** the 0.1.10 FullRow defect of
+`errors/2026-05-27`; that fix verdict does not transfer here.
 
-**Fix (single-variable A/B in flight):** install TileLang 0.1.9 in a dedicated venv,
-force AOT cubin regen, rebuild, re-run `seq_len=64` (full tile, isolates the hang fix
-from a separate latent unguarded-`exp2`→NaN-on-padding-rows bug) then `seq_len=5`.
-Expected: `clean_tokens` returns. A second single-variable fix (guarded `exp2` mirror
-of the decode kernel) follows for the partial-tile NaN. Then HF-gold greedy parity
-closes Phase 0.
+**Narrowed root cause (probe in flight): sm_90a / HD128-FullRow-WGMMA.** The
+`FullRow` gemm emits Hopper WGMMA, which nvcc enables only under the `sm_90a`
+target (`gen_tilelang_aot.py:538-563` is supposed to pass
+`-gencode=arch=compute_90a,code=sm_90a` for `cuda_arch==90`). The 2026-05-30 H20 win
+ran the **HD256** prefill FullRow-WGMMA on sm_90 correctly; the **HD128 q16_kv8**
+prefill (Qwen3-0.6B) may have never run on sm_90 before R6. A vs B: (A) build didn't
+apply sm_90a → build fix; (B) it did and HD128 FullRow-WGMMA is miscompiled on
+sm_90a → kernel-level fix (warp policy / tile). Read-only arch + WGMMA-count probe
+decides. Then: guarded-`exp2` partial-tile fix + HF-gold greedy parity close Phase 0.
 
 ---
 
