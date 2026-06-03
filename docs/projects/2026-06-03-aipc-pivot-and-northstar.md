@@ -1,99 +1,119 @@
-# 北极星转向:AI PC 推理引擎(agent-workflow benchmark + OS 良民)
+# North Star Pivot: AI PC Inference Engine (agent-workflow benchmark + OS good citizen)
 
-**类型:** 战略转向 + rewrite 重排序。叠加在
+**Type:** Strategic pivot + rewrite reordering. Layered on top of
 [`ideal-inference-engine-architecture.md`](2026-06-03-ideal-inference-engine-architecture.md)
-与 [`infer-clean-rewrite-plan.md`](2026-06-03-infer-clean-rewrite-plan.md) 之上。
-**分支:** `arch/ideal-inference-engine`
-**驱动:** ckl —「新的未来是 AI PC 的 AI 推理引擎;benchmark 应该是 agent 的实行工作流,
-并且不影响用户的操作系统的使用。」
+and [`infer-clean-rewrite-plan.md`](2026-06-03-infer-clean-rewrite-plan.md).
+**Branch:** `arch/ideal-inference-engine`
+**Driver:** ckl — "The new future is the AI inference engine for AI PCs; the benchmark
+should be the agent's actual working workflow, and it must not interfere with the
+user's use of the operating system."
 
 ---
 
-## 0. 转向的本质:服务器引擎 → 个人设备引擎
+## 0. The essence of the pivot: server engine → personal-device engine
 
-主流引擎(vLLM/SGLang/TRT-LLM/Dynamo)都假设**专属硬件 + 吞吐最大化**。AI PC 反过来:
-**共享设备 + 用户体验最大化**。三条公理因此重写:
+Mainstream engines (vLLM/SGLang/TRT-LLM/Dynamo) all assume **dedicated hardware +
+throughput maximization**. The AI PC inverts this: **shared device + user-experience
+maximization**. Three axioms are therefore rewritten:
 
-1. **设备是借来的,不是占有的。** 引擎跑在用户**正在用**的机器上。占满 GPU/CPU/内存 =
-   卡死用户的 OS = 产品死亡。**"不影响 OS 使用" 是硬约束,不是优化项。**
-2. **指标是任务,不是 token。** benchmark = **agent 完成一个真实工作流**(多轮 + 工具调用 +
-   代码编辑)的端到端表现 + **OS 影响**(前台是否流畅、内存是否还够、有没有热/电拖累),
-   不是 guidellm 的 tok/s sweep。
-3. **并发是 1,不是 N。** 单用户、单 agent、c=1 是常态([[feedback_metal_focus_c1_local]])。
-   服务器的 DP/EP/TP/PP-at-scale、disaggregation 不是 AI PC 的主轴。
+1. **The device is borrowed, not owned.** The engine runs on the machine the user is
+   **actively using**. Saturating GPU/CPU/memory = locking up the user's OS = product
+   death. **"Do not interfere with OS use" is a hard constraint, not an optimization
+   item.**
+2. **The metric is the task, not the token.** benchmark = **end-to-end performance of an
+   agent completing a real workflow** (multi-turn + tool calls + code editing) +
+   **OS impact** (whether the foreground stays smooth, whether memory is still
+   sufficient, whether there is thermal/power drag), not a guidellm tok/s sweep.
+3. **Concurrency is 1, not N.** Single user, single agent, c=1 is the norm
+   ([[feedback_metal_focus_c1_local]]). The server's DP/EP/TP/PP-at-scale and
+   disaggregation are not the AI PC's main axis.
 
 ---
 
-## 1. 架构含义:新增一个 seam,重排优先级
+## 1. Architectural implications: add one seam, reorder priorities
 
-### 1.1 新一等公民:`ResourceGovernor`(OS 良民层)
+### 1.1 New first-class citizen: `ResourceGovernor` (OS good-citizen layer)
 
-理想架构(§4.3 五契约)**补第六个**:engine-core 在 admission 与 step 边界**咨询** governor。
+The ideal architecture (§4.3 five contracts) **adds a sixth**: engine-core **consults**
+the governor at admission and step boundaries.
 
 ```rust
 pub trait ResourceGovernor {
-    /// 现在可以再 admit 工作吗?(内存压力 / 前台活跃 / 电池 / 热)
+    /// May we admit more work now? (memory pressure / foreground active / battery / thermal)
     fn admission_gate(&self) -> AdmissionVerdict;     // Admit | Hold | ShedTo(n)
-    /// 这一 tick GPU 给多少预算才不卡前台?(token / 时间)
+    /// How much GPU budget this tick to keep the foreground responsive? (tokens / time)
     fn step_budget(&self) -> StepBudget;
-    /// 该让路吗?(前台 app 抢资源 / 内存告警 / 降温)
+    /// Should we yield? (foreground app contends / memory alarm / cooling)
     fn should_yield(&self) -> bool;
 }
+// Landed in crates/infer-seam (commit 6cd0afc5) with PermissiveGovernor default.
 ```
 
-后端各自提供 OS 信号读取:Metal 读 macOS memory-pressure + wired-limit 余量 + 前台/电池;
-CUDA(消费级)读 nvml 显存 + 是否独显/核显;AMD APU 读统一内存压力。**host 侧、契约干净**,
-和现有 host-only seam 哲学一致。
+Each backend provides its own OS-signal reads: Metal reads macOS memory-pressure +
+wired-limit headroom + foreground/battery; CUDA (consumer) reads nvml VRAM + whether it
+is discrete/integrated GPU; AMD APU reads unified-memory pressure. **Host-side, clean
+contract**, consistent with the existing host-only seam philosophy.
 
-这条直接对应已知教训:overlap scheduler **绝不能 busy-spin**(H5 cuEventQuery 2.71M/29s 那次)——
-busy-spin 在服务器是浪费,在 AI PC 是**抢用户的核**。governor + 让路是它的架构归宿。
+This maps directly to a known lesson: the overlap scheduler **must never busy-spin** (the
+H5 cuEventQuery 2.71M/29s incident) — busy-spin is waste on a server, but on an AI PC it
+**steals the user's cores**. governor + yielding is its architectural home.
 
-### 1.2 新北极星 benchmark:agent-workflow harness
+### 1.2 New North Star benchmark: agent-workflow harness
 
-替代 tok/s sweep。一套跑**代表性 agent 任务**(多轮工具调用 / 代码改 / 检索)的 harness,测:
-- **任务维度**:端到端完成时延、每轮 TTFT(交互性命脉)、轮间 KV 复用命中率;
-- **OS 影响维度**:峰值内存、前台响应代理指标(并行跑一个 UI/输入延迟探针)、CPU 争用、
-  热/功耗。**"引擎跑时用户机器还能不能流畅用" 是 PASS/FAIL gate。**
+Replaces the tok/s sweep. A harness that runs **representative agent tasks** (multi-turn
+tool calls / code edits / retrieval), measuring:
+- **Task dimension**: end-to-end completion latency, per-turn TTFT (the interactivity
+  lifeline), cross-turn KV reuse hit rate;
+- **OS-impact dimension**: peak memory, foreground-responsiveness proxy metric (run a
+  UI/input-latency probe concurrently), CPU contention, thermal/power. **"Can the user's
+  machine still be used smoothly while the engine runs" is a PASS/FAIL gate.**
 
-agent 工作流的引擎侧含义(全部抬为一等):**多轮 session KV 复用**(radix + session cache)、
-**低 TTFT**、**快速模型加载/切换**(AI PC 会换模型)、**on-device MoE**(Qwen3.6-A3B 的 experts
-在单设备路由,非跨设备 EP)。
+The engine-side implications of agent workflows (all elevated to first-class):
+**multi-turn session KV reuse** (radix + session cache), **low TTFT**, **fast model
+load/switch** (an AI PC will switch models), **on-device MoE** (Qwen3.6-A3B's experts
+routed on a single device, not cross-device EP).
 
-### 1.3 异构 AI PC 硅:后端无关比服务器更值钱
+### 1.3 Heterogeneous AI PC silicon: backend-agnosticism is worth more than on servers
 
-AI PC 硅是天然异构:**Apple Silicon(Metal)· 消费 NVIDIA(CUDA)· AMD APU(HIP)·
-Intel NPU/XPU**。这正是后端无关 core 的最大价值场景——一个 engine-core,每种 PC 芯片一个薄
-executor。**Metal 升为首要后端**(Apple Silicon = AI PC 的典范)。
+AI PC silicon is inherently heterogeneous: **Apple Silicon (Metal) · consumer NVIDIA
+(CUDA) · AMD APU (HIP) · Intel NPU/XPU**. This is precisely the highest-value scenario
+for a backend-agnostic core — one engine-core, one thin executor per PC chip. **Metal is
+promoted to the primary backend** (Apple Silicon = the archetype of the AI PC).
 
 ---
 
-## 2. rewrite 重排序(覆盖 infer-clean-rewrite-plan §R 序列)
+## 2. Rewrite reordering (overrides the infer-clean-rewrite-plan §R sequence)
 
-| 步 | 原计划 | AI PC 重排后 |
+| Step | Original plan | AI PC reorder |
 |---|---|---|
 | R0 contracts | ✅ | ✅ `322d9d76` |
 | R1a engine loop | ✅ | ✅ `37359c14` |
-| R1b-d | 港 admission/radix/chunked | **不变**(后端无关);admission 留 `ResourceGovernor` 钩子 |
-| **R2** | CudaExecutor first | **MetalExecutor first**(本地验,Apple Silicon 主场) |
-| **R2.5** | — | **新增 `ResourceGovernor` seam + Metal 实现**(OS 良民) |
-| R3 | 港 model 数值 | 港 model 数值,**Qwen3.6-35B-A3B-4bit MoE 为 canonical** |
-| **R4** | frontend | frontend + **agent-workflow bench harness**(新北极星) |
-| R5 | parity-gate cutover | cutover gate = **agent-workflow bench + OS-impact** 通过(本地 Metal) |
-| R6 | Metal | **CudaExecutor**(消费 NVIDIA;V100/H20 验) |
-| R7 | DP-attention/EP, HIP, disagg | **HIP(AMD APU)· Intel NPU/XPU**;on-device MoE 路由。**服务器 DP/EP/TP-at-scale / disagg 显式推迟为可选 server track** |
+| R1b-d | Port admission/radix/chunked | **Unchanged** (backend-agnostic); admission keeps the `ResourceGovernor` hook |
+| **R2** | CudaExecutor first | **MetalExecutor first** (local validation, Apple Silicon home turf) |
+| **R2.5** | — | **Add `ResourceGovernor` seam + Metal implementation** (OS good citizen) |
+| R3 | Port model numerics | Port model numerics, **Qwen3.6-35B-A3B-4bit MoE as canonical** |
+| **R4** | frontend | frontend + **agent-workflow bench harness** (new North Star) |
+| R5 | parity-gate cutover | cutover gate = **agent-workflow bench + OS-impact** passing (local Metal) |
+| R6 | Metal | **CudaExecutor** (consumer NVIDIA; V100/H20 validation) |
+| R7 | DP-attention/EP, HIP, disagg | **HIP (AMD APU) · Intel NPU/XPU**; on-device MoE routing. **Server DP/EP/TP-at-scale / disagg explicitly deferred as an optional server track** |
 
-**de-scope(AI PC 不追,留作可选 server 分支):** 跨节点 TP/PP、跨设备 EP、DP 副本扩缩、
-disaggregated P/D。这些是服务器吞吐轴,不是个人设备体验轴。on-device 单设备 MoE 路由保留。
+**de-scope (AI PC does not pursue these; kept as an optional server branch):**
+cross-node TP/PP, cross-device EP, DP-replica scale-out, disaggregated P/D. These are
+server throughput axes, not personal-device experience axes. On-device single-device MoE
+routing is retained.
 
 ---
 
-## 3. 不变的地基
+## 3. Unchanged foundation
 
-R0/R1a 已证明的东西**全部仍成立**,只是服务对象换了:
-- host-only seam(ForwardPlan/StepOutput/KvPool)—— 异构 PC 硅更需要它。
-- overlap loop —— 现在多一层意义:不 busy-spin = 不抢用户的核。
-- 后端无关 engine-core —— AI PC 异构硅是它的杀手场景。
-- KV-中心 + radix —— 多轮 agent session 复用的命脉。
+Everything R0/R1a already proved **still holds**, only the served target has changed:
+- host-only seam (ForwardPlan/StepOutput/KvPool) — heterogeneous PC silicon needs it even
+  more.
+- overlap loop — now with one extra meaning: not busy-spinning = not stealing the user's
+  cores.
+- backend-agnostic engine-core — heterogeneous AI PC silicon is its killer scenario.
+- KV-centric + radix — the lifeline of multi-turn agent session reuse.
 
-转向不推翻架构,只**补一个 seam(ResourceGovernor)、换一个 benchmark(agent-workflow)、
-调一个优先级(Metal-first,server-parallelism 推迟)**。
+The pivot does not overturn the architecture; it only **adds one seam (ResourceGovernor),
+swaps one benchmark (agent-workflow), and adjusts one priority (Metal-first,
+server-parallelism deferred)**.
