@@ -1,17 +1,9 @@
 //! Tensor-parallel rank placement + per-rank sharding math.
 //!
-//! Ported verbatim from `infer/src/tensor_parallel.rs`
-//! ([`TpConfig`] L32-96, [`ShardingSpec`] L102-130, [`column_shard`] L143-163,
-//! [`row_shard`] L169-171, [`head_shard`] L195-213,
-//! [`ParallelLinearKind`]/[`TpLinearConfig`] L220-256). The `anyhow` error
-//! handling is swapped for the crate-local std-only [`crate::TopoError`]; the
-//! arithmetic and `bail!` message strings are unchanged.
+//! Ported from the legacy `infer/src/tensor_parallel.rs`; arithmetic and `bail!`
+//! messages unchanged, `anyhow` swapped for the std-only [`crate::TopoError`].
 
 use crate::error::{Result, bail};
-
-// ============================================================================
-// TpConfig
-// ============================================================================
 
 /// Tensor parallel configuration: one rank's placement in the TP group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,10 +83,6 @@ impl Default for TpConfig {
     }
 }
 
-// ============================================================================
-// ShardingSpec
-// ============================================================================
-
 /// Describes a rank's slice of a dimension of size `total`.
 ///
 /// The rank owns `self.size` elements starting at `self.offset`.
@@ -128,10 +116,6 @@ impl ShardingSpec {
         self.offset == 0 && self.size == self.total
     }
 }
-
-// ============================================================================
-// Sharding functions
-// ============================================================================
 
 /// Compute the shard for a **column-parallel** dimension (output features split
 /// across TP ranks).
@@ -219,10 +203,6 @@ pub fn head_shard(
     Ok((num_q_heads / tp.world_size, num_kv_heads / tp.world_size))
 }
 
-// ============================================================================
-// TpLinearConfig
-// ============================================================================
-
 /// Type of parallel linear layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -272,15 +252,9 @@ impl TpLinearConfig {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---------------------------------------------------------------- TpConfig
 
     #[test]
     fn tp_config_single() {

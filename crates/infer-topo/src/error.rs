@@ -1,21 +1,12 @@
-//! std-only error type for `infer-topo`.
-//!
-//! The legacy `infer/src/tensor_parallel.rs` used `anyhow::Result` + `bail!`.
-//! This foundation crate is std-only, so we carry a tiny owned-message error
-//! that implements [`std::error::Error`]. The error *messages* are ported
-//! verbatim from the legacy `bail!` strings so callers (and tests) that match
-//! on substrings behave identically.
+//! std-only error type for `infer-topo`. Messages are ported verbatim from the
+//! legacy `bail!` strings so substring-matching callers behave identically.
 
 use std::fmt;
 
-/// Crate-local result alias mirroring the legacy `anyhow::Result` signature.
+/// Crate-local result alias.
 pub type Result<T> = std::result::Result<T, TopoError>;
 
-/// A topology/sharding configuration error.
-///
-/// Carries an owned message string. This is intentionally simple — the only
-/// error paths in this crate are config validation and out-of-range ranks,
-/// none of which need structured fields or a source chain.
+/// A topology/sharding configuration error (an owned message string).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopoError(pub(crate) String);
 

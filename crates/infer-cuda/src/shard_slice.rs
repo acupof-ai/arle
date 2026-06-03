@@ -1,25 +1,11 @@
-//! Per-rank weight-shard byte slicing (TP-2).
+//! Per-rank weight-shard byte slicing (pure-CPU, GPU-testable).
 //!
-//! Pure-CPU, feature-agnostic byte-range math: given a host-side 2D safetensors
-//! weight buffer (`[rows, cols]`, row-major, fixed element size) and an
-//! [`infer_topo::ShardingSpec`], produce this rank's slice of the weight before
-//! the device upload. The GPU upload itself stays in the cuda-gated loader; only
-//! the slicing arithmetic lives here so it tests without a GPU.
+//! Slices a host 2D safetensors weight (`[rows, cols]`, row-major) to one rank's
+//! [`infer_topo::ShardingSpec`] before upload. HF `nn.Linear` layout: dim 0 =
+//! `out_features`, dim 1 = `in_features`.
 //!
-//! HF `nn.Linear` safetensors layout: dim 0 is `out_features`, dim 1 is
-//! `in_features`.
-//!
-//! - **Column-parallel** (`q/k/v/gate/up_proj`): split the *output* dim (dim 0 =
-//!   rows). A rank owns a contiguous block of whole rows
-//!   (`offset..offset+size`), so the byte slice is one contiguous range.
-//! - **Row-parallel** (`o_proj/down_proj`): split the *input* dim (dim 1 =
-//!   cols). A rank owns columns `offset..offset+size` of *every* row, so the
-//!   byte slice is strided (gathered row by row).
-//!
-//! The [`infer_topo::ShardingSpec`] is produced by
-//! [`infer_topo::column_shard`] / [`infer_topo::row_shard`] / the head-aware
-//! [`infer_topo::head_shard`] (for fused QKV); this module just consumes its
-//! `offset`/`size`/`total`.
+//! - **Column-parallel** (`q/k/v/gate/up`): split rows → one contiguous range.
+//! - **Row-parallel** (`o/down`): split cols → strided (gathered per row).
 
 use anyhow::{Result, ensure};
 use infer_topo::ShardingSpec;
@@ -220,18 +206,9 @@ mod tests {
         assert_eq!((r.rows, r.cols), (6, 3));
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // TP head-aligned Q/K/V column shard (the load-bearing GQA invariant).
-    //
-    // q_proj rows = num_q_heads * head_dim. The TP loader (`loader::
-    // load_qkv_head_sharded`) shards on WHOLE-HEAD boundaries: a head_shard gives
-    // `local_heads` per rank, so the row ShardingSpec is
-    // `{ offset: rank * local_heads * head_dim, size: local_heads * head_dim }`.
-    // These tests prove that (a) the shards tile the full projection with no gap /
-    // overlap (concatenation == original), and (b) every shard boundary is a
-    // multiple of head_dim — i.e. no rank ever splits a head, which is what keeps
-    // the per-rank attention kernel + o_proj input shard consistent.
-    // ─────────────────────────────────────────────────────────────────────────
+    // Head-aligned Q/K/V column shard (GQA invariant): shards land on whole-head
+    // boundaries. These prove the shards tile the projection with no gap/overlap
+    // and never split a head.
     fn head_aligned_spec(
         local_heads: usize,
         head_dim: usize,
