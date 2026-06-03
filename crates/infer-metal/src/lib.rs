@@ -264,6 +264,37 @@ impl std::fmt::Debug for MetalInflight {
     }
 }
 
+/// Turn a logits array into an in-flight result under `params`.
+///
+/// Greedy (`temperature <= 0`) keeps the device `argmax` + async path — the
+/// verified greedy parity is untouched. For `temperature > 0` it materializes
+/// the logits as host f32 and draws via the shared `infer_plan::sample_token`
+/// (one D2H per token; sub-millisecond at c=1, no new GPU sampling kernel).
+#[cfg(feature = "metal")]
+fn sample_inflight(
+    slot: usize,
+    logits: &mlx::MlxArray,
+    params: &infer_plan::SamplingParams,
+    position: u64,
+) -> MetalInflight {
+    if params.is_greedy() {
+        let sampled = mlx::argmax(logits);
+        mlx::async_eval(&[&sampled]);
+        return MetalInflight::Sampled { slot, sampled };
+    }
+    let logits_f32 = mlx::as_dtype(logits, mlx::Dtype::Float32);
+    mlx::eval(&[&logits_f32]);
+    let token = infer_plan::sample_token(logits_f32.as_slice_f32(), params, position);
+    MetalInflight::Ready(StepOutput {
+        tokens: vec![SlotToken {
+            slot,
+            token,
+            logprob: None,
+            finish: None,
+        }],
+    })
+}
+
 /// Metal backend executor.
 ///
 /// `new()` keeps the R2 CPU placeholder for seam tests. `from_model_path()`
@@ -465,16 +496,12 @@ impl RealMetalExecutor {
             model.prefill_session(&token_arr, token_values.len() as i32, row.start_pos as i32)?;
         mlx::async_eval(&[&logits]);
         slot.cache_len = row.start_pos + row.tokens.len();
+        let position = slot.cache_len as u64;
         slot.drain_session(model)?;
         self.active_session_slot = None;
         self.page_store.publish_slot(slot, kv)?;
 
-        let sampled = mlx::argmax(&logits);
-        mlx::async_eval(&[&sampled]);
-        Ok(MetalInflight::Sampled {
-            slot: row.slot,
-            sampled,
-        })
+        Ok(sample_inflight(row.slot, &logits, &row.params, position))
     }
 
     fn submit_decode(
@@ -518,16 +545,12 @@ impl RealMetalExecutor {
         let logits = model.step_session(&token_arr, slot.cache_len as i32)?;
         mlx::async_eval(&[&logits]);
         slot.cache_len = slot.cache_len.saturating_add(1);
+        let position = slot.cache_len as u64;
         slot.drain_session(model)?;
         self.active_session_slot = None;
         self.page_store.publish_slot(slot, kv)?;
 
-        let sampled = mlx::argmax(&logits);
-        mlx::async_eval(&[&sampled]);
-        Ok(MetalInflight::Sampled {
-            slot: row.slot,
-            sampled,
-        })
+        Ok(sample_inflight(row.slot, &logits, &row.params, position))
     }
 
     fn ensure_no_other_active_session(&self, slot: usize) -> anyhow::Result<()> {
