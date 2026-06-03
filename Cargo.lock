@@ -29,6 +29,7 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "infer-core",
+ "infer-cuda",
  "infer-metal",
  "infer-plan",
  "infer-seam",
@@ -1942,6 +1943,13 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "infer-topo"
+version = "0.1.5"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
