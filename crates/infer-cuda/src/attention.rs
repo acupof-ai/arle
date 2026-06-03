@@ -245,6 +245,17 @@ fn run_tilelang_paged(
     let v_pool_ptr = pool.v_ptr(layer_idx, &ctx.stream);
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
+    // NOTE on the two TileLang symbolic-shape args (mirrors the legacy
+    // `infer/src/ops/attention.rs` call, which is the contract of record):
+    //   - `num_pages`  (arg 12) = the K/V *pool capacity* = `pool.max_total_pages`.
+    //                  It is the first-dim extent of the k_pool/v_pool tensors,
+    //                  so it must be the whole pool, NOT this request's page count.
+    //   - `total_pages`(arg 13) = the *page-table length* = the number of valid
+    //                  entries in `kv_indices` (= `meta.num_pages` here, since
+    //                  `PageMeta::for_slot` sizes kv_indices to exactly that).
+    // Swapping these two passes a tiny capacity (→ wrong pool strides) and an
+    // oversized page-table walk (→ OOB read past kv_indices) — an illegal access
+    // that hangs the kernel (Xid 43). Keep capacity first, page-table length second.
     unsafe {
         match (decode, num_q_heads) {
             (false, 16) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda(
@@ -259,8 +270,8 @@ fn run_tilelang_paged(
                 1,
                 meta.seq_len as i32,
                 meta.seq_len as i32,
-                meta.num_pages as i32,
                 pool.max_total_pages as i32,
+                meta.num_pages as i32,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 pool.page_size as i32,
@@ -280,8 +291,8 @@ fn run_tilelang_paged(
                 1,
                 meta.seq_len as i32,
                 meta.seq_len as i32,
-                meta.num_pages as i32,
                 pool.max_total_pages as i32,
+                meta.num_pages as i32,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 pool.page_size as i32,
@@ -301,8 +312,8 @@ fn run_tilelang_paged(
                 1,
                 meta.seq_len as i32,
                 meta.seq_len as i32,
-                meta.num_pages as i32,
                 pool.max_total_pages as i32,
+                meta.num_pages as i32,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 pool.page_size as i32,
@@ -322,8 +333,8 @@ fn run_tilelang_paged(
                 1,
                 meta.seq_len as i32,
                 meta.seq_len as i32,
-                meta.num_pages as i32,
                 pool.max_total_pages as i32,
+                meta.num_pages as i32,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 pool.page_size as i32,
@@ -343,8 +354,8 @@ fn run_tilelang_paged(
                 1,
                 1,
                 1,
-                meta.num_pages as i32,
                 pool.max_total_pages as i32,
+                meta.num_pages as i32,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 pool.page_size as i32,
@@ -364,8 +375,8 @@ fn run_tilelang_paged(
                 1,
                 1,
                 1,
-                meta.num_pages as i32,
                 pool.max_total_pages as i32,
+                meta.num_pages as i32,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 pool.page_size as i32,
@@ -385,8 +396,8 @@ fn run_tilelang_paged(
                 1,
                 1,
                 1,
-                meta.num_pages as i32,
                 pool.max_total_pages as i32,
+                meta.num_pages as i32,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 pool.page_size as i32,
@@ -406,8 +417,8 @@ fn run_tilelang_paged(
                 1,
                 1,
                 1,
-                meta.num_pages as i32,
                 pool.max_total_pages as i32,
+                meta.num_pages as i32,
                 num_q_heads as i32,
                 num_kv_heads as i32,
                 pool.page_size as i32,
