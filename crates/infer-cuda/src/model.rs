@@ -34,6 +34,19 @@ pub(crate) struct CudaModel {
     pub(crate) norm: DeviceVec,
     pub(crate) cos_cache: DeviceVec,
     pub(crate) sin_cache: DeviceVec,
+    /// Tensor-parallel runtime: the resolved rank placement plus its
+    /// communicator. For `world_size == 1` this is [`TpRuntime::single`] — the
+    /// no-op communicator — so the forward below is byte-identical to the non-TP
+    /// path: every `all_reduce_sum` returns immediately and the weights are the
+    /// full (unsharded) tensors.
+    pub(crate) tp: crate::tp::TpRuntime,
+    /// This rank's attention head counts and projection dims, computed at load
+    /// time. On a single GPU these equal the global config values; under TP they
+    /// are the per-rank shard sizes (Q/KV heads split by [`infer_topo::head_shard`],
+    /// dims = `local_heads * head_dim`). The forward sizes its activation buffers
+    /// and the attention launch from THESE locals, not the global config.
+    pub(crate) local_q_heads: usize,
+    pub(crate) local_kv_heads: usize,
 }
 
 impl std::fmt::Debug for CudaModel {
@@ -81,6 +94,19 @@ impl CudaModel {
         self.output_projection().rows
     }
 
+    /// This rank's MLP intermediate width. `gate_proj`/`up_proj` are
+    /// column-parallel (their output dim is `intermediate_size`), so under TP each
+    /// rank holds the column shard; `down_proj` (row-parallel) consumes the same
+    /// shard as its input. On a single GPU this is the full `intermediate_size`.
+    fn local_intermediate_size(&self) -> usize {
+        let tp = self.tp.config();
+        if tp.is_single() {
+            self.config.intermediate_size
+        } else {
+            infer_topo::column_shard(self.config.intermediate_size, tp).size
+        }
+    }
+
     pub(crate) fn forward_tokens(
         &self,
         slot: usize,
@@ -107,9 +133,13 @@ impl CudaModel {
 
         let seq_len = tokens.len();
         let hidden_size = self.config.hidden_size;
-        let q_dim = self.config.num_attention_heads * self.config.head_dim;
-        let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
-        let inter = self.config.intermediate_size;
+        // Per-rank head counts and projection dims (locals equal the global config
+        // on a single GPU; under TP they are this rank's head shard). The QKV/O
+        // GEMMs run on the sharded weights, so the activation buffers and the
+        // attention launch must use the local dims, not the global config.
+        let q_dim = self.local_q_heads * self.config.head_dim;
+        let kv_dim = self.local_kv_heads * self.config.head_dim;
+        let inter = self.local_intermediate_size();
 
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let token_ids = upload_i32(&self.ctx, &token_ids)?;
@@ -152,12 +182,16 @@ impl CudaModel {
                 &self.sin_cache,
                 self.config.rms_norm_eps,
                 &meta,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
+                self.local_q_heads,
+                self.local_kv_heads,
                 self.config.head_dim,
                 &mut attn_output,
             )?;
             gemm_batch(&self.ctx, &layer.attention.o_proj, &attn_output, &mut o_buf)?;
+            // Row-parallel: each rank produced a partial o_proj output over its
+            // attention-head shard; sum across ranks before the residual add.
+            // No-op on a single GPU.
+            self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
             add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
             std::mem::swap(&mut hidden, &mut hidden_out);
 
@@ -172,6 +206,10 @@ impl CudaModel {
             gemm_batch(&self.ctx, &layer.mlp.up_proj, &normed, &mut up_out)?;
             silu_mul(&self.ctx, &gate_out, &up_out, &mut act_out)?;
             gemm_batch(&self.ctx, &layer.mlp.down_proj, &act_out, &mut o_buf)?;
+            // Row-parallel: each rank produced a partial down_proj output over its
+            // intermediate shard; sum across ranks before the residual add. No-op
+            // on a single GPU.
+            self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
             add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
             std::mem::swap(&mut hidden, &mut hidden_out);
         }
@@ -286,12 +324,17 @@ impl CudaModel {
                 &self.sin_cache,
                 self.config.rms_norm_eps,
                 meta,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
+                self.local_q_heads,
+                self.local_kv_heads,
                 self.config.head_dim,
                 attn_output,
             )?;
             gemm_batch(&self.ctx, &layer.attention.o_proj, attn_output, o_buf)?;
+            // Row-parallel all-reduce (no-op on a single GPU). The captured-graph
+            // path only runs when TP is single (multi-rank disables capture in
+            // executor.rs because NCCL is not graph-capturable), so this call is
+            // always the no-op here; it stays for parity with the eager forward.
+            self.tp.all_reduce_sum(&self.ctx, o_buf)?;
             add_batch(&self.ctx, hidden, o_buf, hidden_out)?;
             std::mem::swap(hidden, hidden_out);
 
@@ -306,6 +349,8 @@ impl CudaModel {
             gemm_batch(&self.ctx, &layer.mlp.up_proj, normed, up_out)?;
             silu_mul(&self.ctx, gate_out, up_out, act_out)?;
             gemm_batch(&self.ctx, &layer.mlp.down_proj, act_out, o_buf)?;
+            // Row-parallel all-reduce (no-op on a single GPU; see o_proj note above).
+            self.tp.all_reduce_sum(&self.ctx, o_buf)?;
             add_batch(&self.ctx, hidden, o_buf, hidden_out)?;
             std::mem::swap(hidden, hidden_out);
         }

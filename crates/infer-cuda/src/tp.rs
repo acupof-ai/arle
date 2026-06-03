@@ -152,6 +152,41 @@ impl TpRuntime {
         Ok(Self::new(resolve_tp_config_from_env()?))
     }
 
+    /// Resolve the runtime from env and, on a multi-rank `nccl` build, bring up
+    /// the real NCCL communicator from a caller-supplied `ncclUniqueId`.
+    ///
+    /// World-size resolution is the env logic in [`resolve_tp_config_from_env`].
+    /// For `world_size == 1` this is exactly [`Self::from_env`] — a no-op
+    /// communicator, single-GPU behaviour unchanged — so this is safe to call on
+    /// every path. For `world_size > 1` the NCCL backend is initialised via
+    /// `ncclCommInitRank(unique_id, world_size, rank)`.
+    ///
+    /// **Unique-id ownership.** Acquiring (`ncclGetUniqueId` on rank 0) and
+    /// distributing the 128-byte id to ranks `1..world_size` is the *launcher's*
+    /// job — it owns the inter-process transport (the TCP rendezvous in the legacy
+    /// `infer::distributed::init_method`, or `torchrun`-style env). This crate has
+    /// no inter-process dependency, so it takes the resolved id as bytes. The
+    /// caller MUST hand every rank the *same* id, and the active CUDA device must
+    /// already be bound to this rank's ordinal before the call.
+    ///
+    /// # Errors
+    /// Errors if the resolved `(world_size, rank)` is invalid or NCCL init fails.
+    #[cfg(feature = "nccl")]
+    pub fn from_env_with_nccl(
+        unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
+    ) -> anyhow::Result<Self> {
+        let config = resolve_tp_config_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if config.is_single() {
+            return Ok(Self::new(config));
+        }
+        let backend = cuda_kernels::collective::NcclBackend::init_rank(
+            unique_id,
+            config.world_size,
+            config.rank,
+        )?;
+        Ok(Self::with_comm(config, TpComm::Nccl(Box::new(backend))))
+    }
+
     /// The resolved tensor-parallel placement.
     #[must_use]
     pub fn config(&self) -> &TpConfig {
@@ -174,6 +209,63 @@ impl TpRuntime {
     #[must_use]
     pub fn is_collective(&self) -> bool {
         self.comm.is_collective()
+    }
+
+    /// All-reduce (sum) a row-parallel GEMM output across the TP group, in place.
+    ///
+    /// Row-parallel linears (`o_proj` / `down_proj`) produce a *partial* result on
+    /// each rank — the contribution from that rank's input-dim shard. Summing the
+    /// partials across ranks reconstructs the full output (see
+    /// [`crate::shard_slice`] and the `row_parallel_sharded_gemm_all_reduces_to_unsharded`
+    /// parity test in this module).
+    ///
+    /// The collective runs **in place on the compute stream** (`ctx.stream`): the
+    /// GEMM that produced `buf` and the residual-add that consumes the reduced
+    /// value also run on the compute stream, so stream ordering alone guarantees
+    /// the all-reduce sees the finished GEMM and the add sees the finished
+    /// all-reduce — no extra cross-stream event is needed. (A dedicated comm
+    /// stream would overlap nothing here because the very next kernel consumes the
+    /// result; it would only add an event-wait pair.)
+    ///
+    /// For [`TpComm::Single`] this is a no-op: a single rank already holds the full
+    /// output, so the single-GPU forward is byte-identical to the non-TP path.
+    ///
+    /// # Errors
+    /// Propagates the NCCL all-reduce error on multi-rank builds.
+    #[cfg(feature = "cuda")]
+    // Without `nccl` the only arm is `Single => Ok(())`, so the args are unused;
+    // that is the intended single-GPU no-op, not a bug.
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
+    pub fn all_reduce_sum(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: &mut cuda_kernels::prelude::HiddenStates,
+    ) -> anyhow::Result<()> {
+        match &self.comm {
+            TpComm::Single => Ok(()),
+            #[cfg(feature = "nccl")]
+            TpComm::Nccl(backend) => {
+                use cuda_kernels::collective::{CollectiveBackend, DType, ReduceOp};
+                use cudarc::driver::DevicePtrMut;
+
+                let count = buf.data.len();
+                let (ptr, _guard) = buf.data.device_ptr_mut(&ctx.stream);
+                // SAFETY: `ptr` is a valid device allocation of `count` BF16
+                // elements on this context's device; `ctx.stream` is a stream on
+                // the same device. The `_guard` keeps the slice borrowed (and thus
+                // un-reallocated) for the duration of the FFI call.
+                unsafe {
+                    backend.all_reduce(
+                        ptr as *mut std::ffi::c_void,
+                        count,
+                        DType::BF16,
+                        ReduceOp::Sum,
+                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                    )?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -259,6 +351,19 @@ mod tests {
         // No NCCL feature in this build ⇒ the no-op communicator: no collectives.
         assert!(!rt.is_collective());
         assert_eq!(rt.config().world_size, 8);
+    }
+
+    #[test]
+    fn single_runtime_is_not_collective_so_graph_guard_keeps_capture() {
+        // The executor disables the decode-graph capture iff `is_collective()`.
+        // A single-GPU runtime must report `false` so capture stays enabled and
+        // the single-GPU forward (no all-reduce) is unchanged from the pre-TP path.
+        let rt = TpRuntime::single();
+        assert!(
+            !rt.is_collective(),
+            "single GPU: graph capture stays enabled"
+        );
+        assert!(!rt.comm().is_collective());
     }
 
     // ─────────────────────────────────────────────────────────────────────────
