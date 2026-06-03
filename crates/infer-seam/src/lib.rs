@@ -164,3 +164,72 @@ pub trait ModelArch {
         comm: &Self::Comm,
     ) -> anyhow::Result<Self::Logits>;
 }
+
+/// Verdict returned by the resource governor at the admission boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionVerdict {
+    /// Admit waiting work normally.
+    Admit,
+    /// Admit nothing this tick (memory pressure, foreground contention, …).
+    Hold,
+    /// Shed running work down to at most `n` concurrent requests.
+    ShedTo(usize),
+}
+
+/// Per-tick GPU work budget the engine must respect to stay an OS good citizen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepBudget {
+    /// Upper bound on tokens to process this tick.
+    pub max_tokens: usize,
+    /// Soft wall-clock budget for this tick, in microseconds.
+    pub max_micros: u64,
+}
+
+impl StepBudget {
+    /// Unbounded budget — the server-style "use all the hardware" default.
+    pub const UNBOUNDED: StepBudget = StepBudget {
+        max_tokens: usize::MAX,
+        max_micros: u64::MAX,
+    };
+}
+
+/// OS-citizen resource governance (AI PC north-star).
+///
+/// Engine-core consults the governor at the admission boundary and at step
+/// boundaries so the engine never degrades the user's interactive OS use:
+/// no busy-spin, bounded memory, yield to the foreground. This is the one
+/// seam the AI-PC pivot adds; it is host-side and backend-neutral. Backends
+/// supply the OS-signal readers (Metal: macOS memory-pressure + wired-limit
+/// headroom + foreground/battery; CUDA: nvml free VRAM; AMD APU: unified-memory
+/// pressure). See docs/projects/2026-06-03-aipc-pivot-and-northstar.md.
+pub trait ResourceGovernor {
+    /// May the engine admit more waiting work right now?
+    fn admission_gate(&self) -> AdmissionVerdict;
+
+    /// How much GPU work may this tick do without harming foreground UX?
+    fn step_budget(&self) -> StepBudget;
+
+    /// Should the engine back off this tick to keep the OS responsive?
+    fn should_yield(&self) -> bool;
+}
+
+/// Permissive default: admit freely, unbounded budget, never yield.
+///
+/// This is the server-style baseline and the engine-core default until a
+/// backend installs a real governor that reads OS pressure signals.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PermissiveGovernor;
+
+impl ResourceGovernor for PermissiveGovernor {
+    fn admission_gate(&self) -> AdmissionVerdict {
+        AdmissionVerdict::Admit
+    }
+
+    fn step_budget(&self) -> StepBudget {
+        StepBudget::UNBOUNDED
+    }
+
+    fn should_yield(&self) -> bool {
+        false
+    }
+}
