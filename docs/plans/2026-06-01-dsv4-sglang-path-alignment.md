@@ -19,6 +19,19 @@ contract below is satisfied.
 
 ## Target framing
 
+Latest accepted target (2026-06-03): DSv4-Flash TP8 + EAGLE, single-node
+8-GPU, 256K/1500, hot GPU-cache hit:
+
+| Scenario | TTFT | TPOT | E2E | Output throughput |
+|---|---:|---:|---:|---:|
+| GPU cache hot hit | ~0.44 s | ~4.85 ms/token | ~7.7 s | ~196 tok/s |
+
+This is the current hard pass/kill bar for the campaign. ARLE does not pass
+until the same workload clears TTFT, TPOT, E2E, and output throughput together.
+Debug-fallback all-reduce, DeepEP-style replicated-token dispatch, cold-cache
+runs, or raw target-model TPOT without EAGLE/effective-token accounting do not
+count as a win against this target.
+
 The user-supplied SGLang reference is about 18 ms/token. If that number is the
 accepted apples-to-apples target-step TPOT, then "ARLE exceeds SGLang by 20%"
 requires:
