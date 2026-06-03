@@ -21,11 +21,18 @@ Legacy source: `infer/src/model/deepseek/mlp.rs` (DeepGEMM MoE: route `:5930`, F
 SW `:3400`, FlashMLA decode `:886`/`:1041`/`:1355`), `crates/deepseek-spec/src/v4.rs`,
 `infer/src/native_deepep.rs`, `infer/src/model/layer_communicator.rs`.
 
-## Minimal single-GPU DSv4 parity (sidesteps EP)
-Pieces 1 + 2(SW arm only) + 3, `ExpertSplit::single(256)`, gate CSA/HCA/hash/MTP/HC off
-(`ensure!`-error, mirroring `loader.rs:231`), eager B=1 forward (no captured graph — `model.rs:384`
-rejects MoE), greedy next-token parity vs the legacy DSv4 path on the same cached model.
-**Then** Piece 4 layers EP (local-routed + expert all-reduce first, DeepEP transport second; 2-rank → 8-rank).
+## DSv4 is MULTI-GPU ONLY — TP=8/EP=8 from the start (no single-GPU path)
+
+The 256 FP8 experts + MLA sharding do not fit one GPU; DSv4 only runs multi-rank
+(legacy runs it TP=8/EP=8 on the 8×H20). So:
+- **DeepEP/EP (Piece 4) is MANDATORY**, concurrent with the MoE forward — not a later add-on.
+- **Full MLA (Piece 2 = XL)** — SW-only is not viable (config: `hc_mult=4`, CSA/HCA, 3 hash layers).
+- A **multi-process launcher** (NCCL TP+EP groups + `NativeDeepEp::boot` + per-rank GPU bind +
+  `ncclGetUniqueId`→hex broadcast + per-rank logit compare) is a **shared early prerequisite**
+  for both DSv4 and TP=8 Qwen — build it first.
+- Per-rank EP-aware FP8 expert load (`ExpertSplit::new(256, 8, rank)` → 32 experts/rank).
+- Verify: **TP=8/EP=8 DSv4 greedy parity vs the legacy DSv4 path** (the oracle, also multi-GPU)
+  on the cached DeepSeek-V4-Flash.
 
 ## Build flags (H20 pod; both legacy + rewrite link the same kernels)
 - DeepGEMM: build `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1` + `ARLE_DEEPGEMM_ROOT` (else stubbed/no-op — `build.rs:1761`). Runtime `dsv4_deepgemm_native_preflight_cuda` to fail loud.
