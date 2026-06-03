@@ -7,24 +7,30 @@
 //!   growth, and the prefix-cache retain/release protocol are fully handled here
 //!   without any device tensor — structurally identical to
 //!   [`infer_metal::MetalKvPool`].
-//! - [`CudaExecutor`] implements the [`BackendExecutor`] seam plumbing
-//!   (submit/poll overlap shape) with a clearly-marked **placeholder** forward so
-//!   the seam is testable on CPU.
+//! - [`CudaExecutor`] implements the [`BackendExecutor`] seam. Without the
+//!   `cuda` feature it stays a CPU-testable placeholder; with `cuda`, callers can
+//!   construct it from a BF16 Qwen3 safetensors model and run the real
+//!   cuda-kernels path.
 //!
-//! DEFERRED to R6: the real device-resident KV buffers backed by
-//! `crates/cuda-kernels` and the TileLang/FlashMLA forward (paged prefill/decode,
-//! quantized decode, DSv4 MLA) are wired and **verified on V100 (Qwen) / H20
-//! (DSv4)** per the verification-targets doc. This module is the **host-indexing
-//! skeleton** only; the page ids below are logical (`u32`) and map to device KV
-//! buffers that the cuda-kernels layer allocates in R6.
+//! R6 keeps the first real path intentionally narrow: dense BF16 Qwen3,
+//! safetensors only, single scheduled row, greedy sampling, and paged KV backed
+//! by `crates/cuda-kernels`. Quantized variants, GGUF, TP/NCCL, graphs, sparse
+//! hooks, MTP/spec decode, and scheduler/server references are deliberately not
+//! carried into this crate.
 //!
 //! Nothing here references engine-core; this crate depends only on the stable
-//! `infer-plan` + `infer-seam` contracts (no `cuda-kernels` dependency yet).
+//! `infer-plan` + `infer-seam` contracts.
 
 use std::collections::HashMap;
+use std::fmt;
+#[cfg(feature = "cuda")]
+use std::path::Path;
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
+
+#[cfg(feature = "cuda")]
+mod model;
 
 /// Host-side paged KV bookkeeping for the CUDA backend.
 ///
@@ -227,9 +233,9 @@ impl KvPool for CudaKvPool {
 
 /// In-flight handle for a submitted CUDA step.
 ///
-/// The skeleton resolves synchronously, so this carries the resolved output.
-/// R6 replaces this with a CUDA async handle (stream event + device logits)
-/// to keep CPU scheduling overlapped with the GPU forward.
+/// The current clean CUDA forward resolves synchronously after greedy readback.
+/// A later async stage can replace the payload with a stream event + device
+/// logits without changing the engine-facing seam.
 #[derive(Debug)]
 pub struct CudaInflight {
     output: StepOutput,
@@ -237,27 +243,67 @@ pub struct CudaInflight {
 
 /// CUDA backend executor.
 ///
-/// Seam plumbing only today. R6 wires the real cuda-kernels / TileLang / FlashMLA
-/// forward + device KV, verified on V100 (Qwen) / H20 (DSv4).
-#[derive(Debug, Default)]
+/// `new()` keeps the no-GPU placeholder used by host tests. Use
+/// [`CudaExecutor::from_qwen3_bf16_safetensors`] with the `cuda` feature for the
+/// real dense BF16 Qwen3 path.
+#[derive(Default)]
 pub struct CudaExecutor {
-    _private: (),
+    inner: CudaExecutorInner,
+}
+
+#[derive(Default)]
+enum CudaExecutorInner {
+    #[default]
+    Placeholder,
+    #[cfg(feature = "cuda")]
+    Real(model::RealCudaExecutor),
+}
+
+impl fmt::Debug for CudaExecutor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => f
+                .debug_struct("CudaExecutor")
+                .field("inner", &"placeholder")
+                .finish(),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => {
+                f.debug_struct("CudaExecutor").field("inner", real).finish()
+            }
+        }
+    }
 }
 
 impl CudaExecutor {
     /// Build a CUDA executor.
     #[must_use]
     pub fn new() -> Self {
-        Self { _private: () }
+        Self {
+            inner: CudaExecutorInner::Placeholder,
+        }
+    }
+
+    /// Build the real CUDA executor for the clean R6 path.
+    ///
+    /// This path is intentionally one-model/one-format: dense BF16 Qwen3 loaded
+    /// from safetensors. `total_pages` must match the host [`CudaKvPool`] used by
+    /// the engine so device-side page allocation mirrors host logical pages.
+    #[cfg(feature = "cuda")]
+    pub fn from_qwen3_bf16_safetensors(
+        model_path: impl AsRef<Path>,
+        num_slots: usize,
+        total_pages: usize,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: CudaExecutorInner::Real(model::RealCudaExecutor::from_qwen3_bf16_safetensors(
+                model_path,
+                num_slots,
+                total_pages,
+            )?),
+        })
     }
 
     /// Placeholder forward — produces one deterministic token per scheduled row.
-    ///
-    /// TODO(R6): replace with the real cuda-kernels forward (TileLang paged
-    /// prefill/decode for BF16 attention, custom CUDA C for quantized decode,
-    /// FlashMLA for DSv4), reading KV pages from `kv.page_indices(slot)` and
-    /// sampling real logits. This identity-ish stub exists only so the
-    /// submit/poll seam is exercisable on CPU.
     fn placeholder_forward(plan: &ForwardPlan) -> StepOutput {
         let mut tokens = Vec::with_capacity(plan.decode_rows.len() + plan.prefill_rows.len());
         for row in &plan.decode_rows {
@@ -289,9 +335,12 @@ impl BackendExecutor for CudaExecutor {
         plan: &ForwardPlan,
         _kv: &mut dyn KvPool,
     ) -> anyhow::Result<Self::Inflight> {
-        Ok(CudaInflight {
-            output: Self::placeholder_forward(plan),
-        })
+        let output = match &mut self.inner {
+            CudaExecutorInner::Placeholder => Self::placeholder_forward(plan),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.submit(plan, _kv)?,
+        };
+        Ok(CudaInflight { output })
     }
 
     fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>> {

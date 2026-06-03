@@ -7,9 +7,33 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+cuda-kernels = { path = "../cuda-kernels", default-features = false }
+cudarc = { version = "0.19", features = [
+    "cuda-version-from-build-system",
+    "cublas",
+    "f16",
+], optional = true }
+half = { version = "2.4", features = ["num-traits"], optional = true }
 infer-plan = { path = "../infer-plan" }
 infer-seam = { path = "../infer-seam" }
 log = "0.4"
+qwen3-spec = { path = "../qwen3-spec", optional = true }
+safetensors = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+cuda = [
+    "dep:cudarc",
+    "dep:half",
+    "dep:qwen3-spec",
+    "dep:safetensors",
+    "dep:serde",
+    "dep:serde_json",
+    "cuda-kernels/cuda",
+]
+no-cuda = ["cuda-kernels/no-cuda"]
 
 [lints]
 workspace = true
