@@ -1,0 +1,166 @@
+//! Inference execution seam traits.
+//!
+//! The engine-core facing seam is host-only: [`ForwardPlan`], [`StepOutput`],
+//! and [`KvPool`] expose slots, page ids, token ids, and lengths. Device
+//! tensors remain inside backend executors, model implementations, and the
+//! lower-seam traits in this crate.
+
+use infer_plan::{ForwardPlan, SamplingParams, StepOutput};
+
+/// Host-indexed KV pool surface visible to engine-core.
+///
+/// Implementations may own GPU, Metal, CPU, or remote buffers internally, but
+/// every method in this trait is expressed in host slot ids, page ids, token
+/// counts, and logical positions. The trait is dyn-safe so engine-core can hold
+/// `&mut dyn KvPool` without knowing the backend.
+pub trait KvPool {
+    /// Return whether the pool has live storage backing it.
+    fn is_active(&self) -> bool;
+
+    /// Return the number of tokens stored per physical page.
+    fn page_size(&self) -> usize;
+
+    /// Return the number of free physical pages.
+    fn free_pages(&self) -> usize;
+
+    /// Return the number of logical tokens still allocatable without eviction.
+    fn free_tokens(&self) -> usize;
+
+    /// Return the logical sequence length for `slot`.
+    fn seq_len(&self, slot: usize) -> usize;
+
+    /// Return physical page ids for `slot` in logical-page order.
+    fn page_indices(&self, slot: usize) -> &[u32];
+
+    /// Return physical page ids that cover a logical token range in `slot`.
+    fn page_indices_for_token_range(&self, slot: usize, start: usize, len: usize) -> &[u32];
+
+    /// Return the current logical occupant epoch for `slot`.
+    fn slot_epoch(&self, slot: usize) -> u64;
+
+    /// Return the number of extra pages needed to append `tokens` to `slot`.
+    fn append_pages_needed(&self, slot: usize, tokens: usize) -> usize;
+
+    /// Allocate `tokens` logical tokens for `slot`.
+    fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()>;
+
+    /// Allocate physical pages that are not yet attached to a slot.
+    fn alloc_detached_pages(&mut self, pages: usize) -> anyhow::Result<Vec<u32>>;
+
+    /// Attach retained physical pages to an empty slot.
+    fn attach_pages(
+        &mut self,
+        slot: usize,
+        pages: &[u32],
+        token_count: usize,
+    ) -> anyhow::Result<()>;
+
+    /// Truncate a slot to `new_len` logical tokens.
+    fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()>;
+
+    /// Free all pages currently attached to `slot`.
+    fn free_slot(&mut self, slot: usize);
+
+    /// Migrate a logical token range for `slot` into this pool.
+    fn migrate(&mut self, slot: usize, start: usize, len: usize) -> anyhow::Result<()>;
+
+    /// Return the number of pages retained by an external owner.
+    fn retained_count(&self) -> usize;
+
+    /// Release externally retained pages.
+    fn release_pages(&mut self, pages: &[u32]);
+
+    /// Retain pages for an external owner such as a prefix cache.
+    fn retain_pages(&mut self, pages: &[u32]);
+}
+
+/// Result of polling a submitted executor step.
+#[derive(Debug, Clone)]
+pub enum PollResult<I> {
+    /// The executor step finished and produced host-visible tokens.
+    Ready(StepOutput),
+    /// The executor step is still in flight and should be polled again.
+    NotReady(I),
+}
+
+/// Host-only engine-core to backend-executor seam.
+///
+/// The plan and step output contain only host data. Any device tensors needed
+/// for KV, logits, collectives, graphs, or sampling remain inside the executor
+/// and lower-seam implementations.
+pub trait BackendExecutor {
+    /// Opaque backend-owned in-flight handle.
+    type Inflight;
+
+    /// Submit a forward plan for asynchronous or synchronous execution.
+    fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool)
+    -> anyhow::Result<Self::Inflight>;
+
+    /// Poll an in-flight forward step for completion.
+    fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>>;
+
+    /// Perform optional backend warmup before serving.
+    fn warmup(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Backend-internal collective communication seam.
+///
+/// `Tensor` is deliberately associated with the backend implementation and is
+/// never exposed through the engine-core executor boundary.
+pub trait Communicator {
+    /// Backend tensor type used by collectives.
+    type Tensor;
+
+    /// Run an in-place all-reduce over a tensor-parallel group.
+    fn all_reduce(&self, tensor: &mut Self::Tensor);
+
+    /// Run all-to-all dispatch/combine between expert-parallel ranks.
+    fn all_to_all(&self, send: &Self::Tensor, recv: &mut Self::Tensor);
+
+    /// Run a pipeline-stage point-to-point send/recv exchange.
+    fn send_recv(&self, stage: u32, tensor: &mut Self::Tensor);
+}
+
+/// Backend-internal sampling seam.
+pub trait Sampler {
+    /// Backend logits representation consumed by the sampler.
+    type Logits;
+
+    /// Sample one token per logits row using the provided per-row parameters.
+    fn sample(&mut self, logits: &Self::Logits, params: &[SamplingParams]) -> Vec<u32>;
+}
+
+/// Backend-internal graph capture and replay seam.
+pub trait GraphRunner {
+    /// Capture a graph bucket for `batch`.
+    fn capture(&mut self, batch: usize) -> anyhow::Result<()>;
+
+    /// Replay a captured graph bucket for `batch`.
+    fn replay(&mut self, batch: usize) -> anyhow::Result<()>;
+}
+
+/// Backend-internal model architecture seam.
+///
+/// Model implementations use backend tensors and communicators below the
+/// executor seam. The only engine-core input is the host-only [`ForwardPlan`]
+/// plus a host-indexed [`KvPool`] handle.
+pub trait ModelArch {
+    /// Backend tensor type used for intermediate activations.
+    type Tensor;
+
+    /// Backend logits representation returned by the model.
+    type Logits;
+
+    /// Backend communicator implementation used by this model.
+    type Comm: Communicator<Tensor = Self::Tensor>;
+
+    /// Execute model forward for `plan` using backend-owned tensors.
+    fn forward(
+        &mut self,
+        plan: &ForwardPlan,
+        kv: &mut dyn KvPool,
+        comm: &Self::Comm,
+    ) -> anyhow::Result<Self::Logits>;
+}
