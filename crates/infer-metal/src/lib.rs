@@ -44,3 +44,5 @@ mod wired_limit;
 
 pub use executor::{MetalExecutor, MetalInflight};
 pub use kv_pool::MetalKvPool;
+#[cfg(feature = "metal")]
+pub use model_source::resolve_model_path;
