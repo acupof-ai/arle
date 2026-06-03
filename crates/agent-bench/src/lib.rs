@@ -531,6 +531,28 @@ pub fn metal_engine_from_model_path(
     Ok((engine, ttft))
 }
 
+/// Build an `Engine` driving the real CUDA executor (clean BF16 Qwen3) over
+/// `infer_cuda::CudaKvPool`. Available only under the `cuda` feature; this is the
+/// H20 greedy-parity harness entry point. The clean R6 CUDA forward is single
+/// scheduled row, so the engine runs one request at a time (`num_slots = 1`).
+#[cfg(feature = "cuda")]
+pub fn cuda_engine_from_model_path(
+    model_path: impl AsRef<std::path::Path>,
+) -> Result<Engine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool>> {
+    let total_pages = 8192; // page_size 16 -> 131072 token capacity
+    let mut config = SchedulerConfig::for_slots(1);
+    config.max_prompt_tokens = 32_768;
+    config.max_total_tokens = 65_536;
+    let executor =
+        infer_cuda::CudaExecutor::from_qwen3_bf16_safetensors(model_path, 1, total_pages)?;
+    let engine = Engine::with_config(
+        executor,
+        infer_cuda::CudaKvPool::new(1, total_pages, 16),
+        config,
+    );
+    Ok(engine)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +722,42 @@ mod tests {
             "turn 2 should reuse turn 1's prefix and reach first token faster: turn1={} turn2={}",
             m.turns[0].ticks_to_first_token,
             m.turns[1].ticks_to_first_token
+        );
+        Ok(())
+    }
+
+    /// H20 greedy-parity harness for the clean CUDA BF16 Qwen3 forward.
+    ///
+    /// Raw token ids (no tokenizer): greedy decode is deterministic given the ids,
+    /// so the legacy CUDA path on the SAME ids + model must produce the SAME
+    /// continuation. Run this (prints NEW token ids), then run the legacy CUDA
+    /// greedy path on the same `PARITY_MODEL` + prompt and compare the arrays.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "real CUDA H20 greedy parity; needs --features cuda + a BF16 Qwen3 safetensors model + GPU"]
+    fn cuda_qwen3_greedy_parity() -> Result<()> {
+        let model = std::env::var("PARITY_MODEL")
+            .unwrap_or_else(|_| "/data01/models/Qwen3-0.6B".to_string());
+        let max_new: usize = std::env::var("PARITY_MAX_NEW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        // Fixed prompt token ids (avoid 0 = engine STOP id). Greedy continuation
+        // of these exact ids is the parity fingerprint.
+        let prompt: Vec<u32> = vec![9707, 11, 1879, 358, 1079, 264, 6722, 13];
+        let mut engine = cuda_engine_from_model_path(&model)?;
+        let handle = engine.submit_request(prompt.clone(), max_new);
+        engine.run_to_idle()?;
+        let completed = engine
+            .completed(handle)
+            .ok_or_else(|| anyhow::anyhow!("request did not complete"))?;
+        eprintln!(
+            "[cuda-parity NEW] model={model} prompt={prompt:?} gen={:?} finish={:?}",
+            completed.generated_tokens, completed.finish
+        );
+        assert!(
+            !completed.generated_tokens.is_empty(),
+            "expected at least one generated token"
         );
         Ok(())
     }
