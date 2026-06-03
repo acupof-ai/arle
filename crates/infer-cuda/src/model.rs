@@ -19,7 +19,8 @@ use qwen3_spec::Qwen3Config;
 use crate::attention::paged_attention;
 use crate::decode_graph::DecodeGraphContext;
 use crate::executor::sample_cuda_token;
-use crate::loader::PageMeta;
+use crate::loader::{MoeLayerWeights, PageMeta};
+use crate::moe::moe_forward;
 use crate::ops::{
     add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, rms_norm_batch, rms_norm_vec,
     silu_mul, upload_i32,
@@ -47,6 +48,12 @@ pub(crate) struct CudaModel {
     /// and the attention launch from THESE locals, not the global config.
     pub(crate) local_q_heads: usize,
     pub(crate) local_kv_heads: usize,
+    /// MoE router description (MoE-4). `None` for the dense Qwen3 path — the
+    /// forward then never touches any MoE branch, so the dense path is
+    /// byte-identical. `Some` for a Qwen3.5/3.6 MoE checkpoint, shared by every
+    /// sparse layer's [`moe_forward`] router (the per-layer expert weights live
+    /// on [`TransformerBlock::moe`]).
+    pub(crate) moe_config: Option<infer_moe::MoeConfig>,
 }
 
 impl std::fmt::Debug for CudaModel {
@@ -65,7 +72,16 @@ pub(crate) struct TransformerBlock {
     pub(crate) input_layernorm: DeviceVec,
     pub(crate) attention: Attention,
     pub(crate) post_attention_layernorm: DeviceVec,
-    pub(crate) mlp: Mlp,
+    /// Dense SwiGLU MLP. `Some` for every dense layer (the byte-identical Qwen3
+    /// path always sets this); `None` only on a MoE checkpoint's sparse layer,
+    /// where `moe` drives the forward and no dense projections exist in the
+    /// checkpoint. Exactly one of `mlp` / `moe` is `Some` per layer.
+    pub(crate) mlp: Option<Mlp>,
+    /// Per-layer MoE expert weights (MoE-4). `None` ⇒ dense MLP layer (the
+    /// byte-identical Qwen3 path and any `mlp_only_layers` on a MoE checkpoint).
+    /// `Some` ⇒ sparse layer: the forward runs [`moe_forward`] instead of the
+    /// dense gate/up/silu/down block.
+    pub(crate) moe: Option<MoeLayerWeights>,
 }
 
 pub(crate) struct Attention {
@@ -202,13 +218,29 @@ impl CudaModel {
                 self.config.rms_norm_eps,
                 &mut normed,
             )?;
-            gemm_batch(&self.ctx, &layer.mlp.gate_proj, &normed, &mut gate_out)?;
-            gemm_batch(&self.ctx, &layer.mlp.up_proj, &normed, &mut up_out)?;
-            silu_mul(&self.ctx, &gate_out, &up_out, &mut act_out)?;
-            gemm_batch(&self.ctx, &layer.mlp.down_proj, &act_out, &mut o_buf)?;
-            // Row-parallel: each rank produced a partial down_proj output over its
-            // intermediate shard; sum across ranks before the residual add. No-op
-            // on a single GPU.
+            if let Some(moe) = &layer.moe {
+                // Sparse layer (MoE-4): route → grouped experts → combine →
+                // shared expert. Produces the block output into `o_buf`.
+                let cfg = self.moe_config.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("MoE layer present but model has no moe_config")
+                })?;
+                let moe_out = moe_forward(&self.ctx, moe, &normed, cfg)?;
+                self.ctx
+                    .stream
+                    .memcpy_dtod(&moe_out.data, &mut o_buf.data)
+                    .map_err(|e| anyhow::anyhow!("MoE output D2D into o_buf failed: {e}"))?;
+            } else {
+                let mlp = layer.mlp.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("dense layer missing both mlp and moe weights")
+                })?;
+                gemm_batch(&self.ctx, &mlp.gate_proj, &normed, &mut gate_out)?;
+                gemm_batch(&self.ctx, &mlp.up_proj, &normed, &mut up_out)?;
+                silu_mul(&self.ctx, &gate_out, &up_out, &mut act_out)?;
+                gemm_batch(&self.ctx, &mlp.down_proj, &act_out, &mut o_buf)?;
+            }
+            // Row-parallel: each rank produced a partial down_proj / MoE-combine
+            // output over its intermediate / expert shard; sum across ranks before
+            // the residual add. No-op on a single GPU.
             self.tp.all_reduce_sum(&self.ctx, &mut o_buf)?;
             add_batch(&self.ctx, &hidden, &o_buf, &mut hidden_out)?;
             std::mem::swap(&mut hidden, &mut hidden_out);
@@ -345,10 +377,17 @@ impl CudaModel {
                 self.config.rms_norm_eps,
                 normed,
             )?;
-            gemm_batch(&self.ctx, &layer.mlp.gate_proj, normed, gate_out)?;
-            gemm_batch(&self.ctx, &layer.mlp.up_proj, normed, up_out)?;
+            // The captured B=1 decode graph is the dense Qwen3 fast path only;
+            // a MoE checkpoint's host-routed `moe_forward` is not graph-capturable
+            // (it syncs + reads logits on the host each step). MoE layers run the
+            // eager `forward_tokens` path, so a MoE layer here is a wiring bug.
+            let mlp = layer.mlp.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("captured decode path does not support MoE layers")
+            })?;
+            gemm_batch(&self.ctx, &mlp.gate_proj, normed, gate_out)?;
+            gemm_batch(&self.ctx, &mlp.up_proj, normed, up_out)?;
             silu_mul(&self.ctx, gate_out, up_out, act_out)?;
-            gemm_batch(&self.ctx, &layer.mlp.down_proj, act_out, o_buf)?;
+            gemm_batch(&self.ctx, &mlp.down_proj, act_out, o_buf)?;
             // Row-parallel all-reduce (no-op on a single GPU; see o_proj note above).
             self.tp.all_reduce_sum(&self.ctx, o_buf)?;
             add_batch(&self.ctx, hidden, o_buf, hidden_out)?;

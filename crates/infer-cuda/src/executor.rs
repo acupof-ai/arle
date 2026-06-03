@@ -115,6 +115,55 @@ impl RealCudaExecutor {
         })
     }
 
+    /// Build the real CUDA executor for a single-GPU BF16 Qwen3.5/3.6 **MoE**
+    /// checkpoint (MoE-4). Same KV/page setup as the dense path; the model loader
+    /// ([`CudaModel::from_qwen35_moe_safetensors`]) populates dense vs MoE layers
+    /// per `Qwen35Config::is_moe_layer`. Single-GPU only (all experts local).
+    pub(crate) fn from_qwen35_moe_safetensors(
+        model_path: impl AsRef<Path>,
+        num_slots: usize,
+        total_pages: usize,
+    ) -> Result<Self> {
+        ensure!(num_slots > 0, "CudaExecutor requires at least one slot");
+        ensure!(
+            total_pages > 0,
+            "CudaExecutor requires at least one KV page"
+        );
+
+        let model = CudaModel::from_qwen35_moe_safetensors(model_path.as_ref())?;
+        let token_budget = total_pages * SUPPORTED_PAGE_SIZE;
+        let budget_bytes = PagedKVPool::budget_bytes_for_tokens(
+            model.config.num_hidden_layers,
+            model.config.num_key_value_heads,
+            model.config.head_dim,
+            token_budget,
+            KVFormat::BF16,
+        );
+        let kv = PagedKVPool::with_format(
+            &model.ctx,
+            model.config.num_hidden_layers,
+            model.config.num_key_value_heads,
+            model.config.head_dim,
+            num_slots,
+            budget_bytes,
+            KVFormat::BF16,
+        )?;
+        ensure!(
+            kv.page_size == SUPPORTED_PAGE_SIZE,
+            "BF16 Qwen3.5 MoE expects cuda-kernels page_size={SUPPORTED_PAGE_SIZE}, got {}",
+            kv.page_size
+        );
+
+        Ok(Self {
+            model,
+            kv,
+            num_slots,
+            // MoE host routing syncs + reads logits per step → not graph-capturable.
+            decode_ctx: None,
+            graphs: None,
+        })
+    }
+
     pub(crate) fn submit(
         &mut self,
         plan: &ForwardPlan,
