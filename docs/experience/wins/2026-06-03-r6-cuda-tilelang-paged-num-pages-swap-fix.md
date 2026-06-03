@@ -62,7 +62,31 @@ Typechecks under `cuda,no-cuda`.
   point**, not the faulting kernel. `CUDA_LAUNCH_BLOCKING=1` is the cheap, decisive
   localizer (no rebuild) — reach for it before host-backtrace theorizing.
 
+## Update — a SECOND bug behind the first (under investigation)
+
+After the swap fix, `CUDA_LAUNCH_BLOCKING=1` shows the prefill kernel **still hangs**
+— but now with **no Xid** (before: Xid 43). So the swap removed the OOB illegal
+access, and a second, *control-flow* bug remains (a spin, not a memory fault). All
+4 kernel calls (prefill/decode prep+run) match the legacy contract arg-for-arg.
+
+**Leading hypothesis — short-prompt pipeline trip-count deadlock.** The kernel
+(`tools/tilelang/batch_prefill_paged_hd128.py`) walks KV with
+`T.Pipelined(T.ceildiv(kv_visible_end, BLOCK_N=64), num_stages=2)`. For the
+5-token bring-up prompt, `kv_total_len=5` → trip count `ceildiv(5,64)=1`. A 2-stage
+software pipeline with trip count `1 < num_stages` is a classic mbarrier deadlock:
+the prologue prefetches a stage that never executes and the consumer waits forever
+on an mbarrier that never fills — a spin with no Xid, exactly the symptom. Latent
+for legacy (its prefill benches use long prompts → trip count ≥ 2); only the clean
+harness's short prompt trips it.
+
+Discriminating tests (in flight): (a) `R6_ATTN_DEBUG=1` dump of the exact
+runtime args + device arrays to confirm `kv_total_len`/trip count; (b) re-run the
+clean harness with a ≥65-KV-token prompt (trip count ≥ 2) — if it passes long but
+hangs short, the pipeline hypothesis is confirmed. Fix then lives in the kernel
+template (guard trip-count < num_stages, or drop to num_stages=1 for short loops).
+
 ## Verification (pending-remote)
 
 - [ ] clean `clean_tokens` == HF gold `[12095,13,576,6722,315,9625,374,1083,279,6722,315,279,5429,315,9625,13]` (Qwen3-0.6B, greedy, 16 new).
+- [ ] Confirm/refute the short-prompt pipeline-deadlock hypothesis (dump values + long-prompt A/B).
 - [ ] Then: longer prompt + multi-shape greedy parity before declaring Phase 0 closed.
