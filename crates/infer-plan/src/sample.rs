@@ -84,8 +84,14 @@ pub fn sample_token(logits: &[f32], params: &SamplingParams, position: u64) -> u
         cand.retain(|(_, p)| *p >= thresh);
     }
 
-    // Multinomial draw over the surviving candidates.
+    // Degenerate distribution (all logits -inf/NaN, or filters emptied the set):
+    // fall back to greedy rather than silently returning token 0.
     let total: f32 = cand.iter().map(|(_, p)| *p).sum();
+    if cand.is_empty() || !total.is_finite() || total <= 0.0 {
+        return argmax_logit(logits);
+    }
+
+    // Multinomial draw over the surviving candidates.
     let bits = splitmix64(
         params
             .seed
@@ -120,6 +126,24 @@ mod sampler_tests {
         assert!(p.is_greedy());
         assert_eq!(sample_token(&logits, &p, 0), 1);
         assert_eq!(argmax_logit(&logits), 1);
+    }
+
+    #[test]
+    fn degenerate_logits_fall_back_to_greedy() {
+        // All -inf (e.g. a fully-masked row): must NOT silently return token 0
+        // via a NaN-emptied candidate set — fall back to argmax cleanly.
+        let all_neg = vec![f32::NEG_INFINITY; 8];
+        let p = SamplingParams {
+            temperature: 1.0,
+            min_p: 0.5,
+            ..SamplingParams::default()
+        };
+        assert_eq!(sample_token(&all_neg, &p, 3), argmax_logit(&all_neg));
+        // One finite logit among -inf with aggressive min_p: pick the finite one,
+        // never an empty-set token 0.
+        let mut one = vec![f32::NEG_INFINITY; 8];
+        one[5] = 4.0;
+        assert_eq!(sample_token(&one, &p, 0), 5);
     }
 
     #[test]
