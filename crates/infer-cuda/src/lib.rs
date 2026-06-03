@@ -13,8 +13,9 @@
 //!   cuda-kernels path.
 //!
 //! R6 keeps the first real path intentionally narrow: dense BF16 Qwen3,
-//! safetensors only, single scheduled row, greedy sampling, and paged KV backed
-//! by `crates/cuda-kernels`. Quantized variants, GGUF, TP/NCCL, graphs, sparse
+//! safetensors only, single scheduled row, device argmax for greedy sampling,
+//! host sampling for temperature > 0, and paged KV backed by
+//! `crates/cuda-kernels`. Quantized variants, GGUF, TP/NCCL, graphs, sparse
 //! hooks, MTP/spec decode, and scheduler/server references are deliberately not
 //! carried into this crate.
 //!
