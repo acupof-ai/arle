@@ -15,7 +15,7 @@ use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
-use infer_plan::{ForwardPlan, SlotToken, StepOutput};
+use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::KvPool;
 use qwen3_spec::Qwen3Config;
 use safetensors::{SafeTensors, tensor::Dtype};
@@ -123,8 +123,15 @@ impl RealCudaExecutor {
             );
             self.ensure_slot_ready_for_prefill(row.slot, row.start_pos)?;
             self.kv.alloc_tokens(row.slot, row.tokens.len())?;
-            self.model
-                .forward_tokens(row.slot, &row.tokens, row.start_pos, &mut self.kv)?
+            let position = expected_len as u64;
+            self.model.forward_tokens(
+                row.slot,
+                &row.tokens,
+                row.start_pos,
+                &mut self.kv,
+                &row.params,
+                position,
+            )?
         } else {
             let row = &plan.decode_rows[0];
             ensure!(
@@ -148,8 +155,15 @@ impl RealCudaExecutor {
                 row.slot
             );
             self.kv.alloc_tokens(row.slot, 1)?;
-            self.model
-                .forward_tokens(row.slot, &[row.last_token], row.kv_seq_len, &mut self.kv)?
+            let position = row.kv_seq_len.saturating_add(1) as u64;
+            self.model.forward_tokens(
+                row.slot,
+                &[row.last_token],
+                row.kv_seq_len,
+                &mut self.kv,
+                &row.params,
+                position,
+            )?
         };
 
         Ok(StepOutput {
@@ -301,6 +315,8 @@ impl CudaModel {
         tokens: &[u32],
         start_pos: usize,
         pool: &mut PagedKVPool,
+        params: &SamplingParams,
+        position: u64,
     ) -> Result<u32> {
         ensure!(
             !tokens.is_empty(),
@@ -405,7 +421,7 @@ impl CudaModel {
             &last_normed,
             &mut logits,
         )?;
-        argmax(&self.ctx, &logits)
+        sample_cuda_token(&self.ctx, &logits, params, position)
     }
 }
 
@@ -1312,4 +1328,20 @@ fn argmax(ctx: &DeviceContext, logits: &DeviceVec) -> Result<u32> {
         .clone_dtoh(&out)
         .map_err(|e| anyhow!("D2H argmax token failed: {e}"))?;
     Ok(token[0] as u32)
+}
+
+fn sample_cuda_token(
+    ctx: &DeviceContext,
+    logits: &DeviceVec,
+    params: &SamplingParams,
+    position: u64,
+) -> Result<u32> {
+    if params.is_greedy() {
+        return argmax(ctx, logits);
+    }
+
+    // TODO(Fix 0 follow-up): repetition/frequency/presence penalties need the
+    // per-request generated-token history threaded through the executor.
+    let logits_host = logits.to_host(ctx)?;
+    Ok(infer_plan::sample_token(&logits_host, params, position))
 }
