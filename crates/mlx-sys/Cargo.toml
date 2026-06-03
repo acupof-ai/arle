@@ -7,7 +7,7 @@ publish = false
 
 [build-dependencies]
 cmake = "0.1"
-cc = "1.0"
+cc = "1.2"
 
 [lints]
 workspace = true
