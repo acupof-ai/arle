@@ -1,5 +1,7 @@
 # `infer/` Clean-Rewrite Plan (Amputate to Survive)
 
+> ↳ **Subordinate to [ideal-inference-engine-architecture.md §6](2026-06-03-ideal-inference-engine-architecture.md) — single source of truth.** Keep/port/rewrite boundary + correctness gate detail; current status is §6 there. On conflict, §6 wins.
+
 **Type:** Full refactor strategy (greenfield rewrite plan).
 **Branch:** `arch/ideal-inference-engine`
 **Foundation:** [`2026-06-03-ideal-inference-engine-architecture.md`](2026-06-03-ideal-inference-engine-architecture.md) (ideal architecture)
