@@ -9,6 +9,8 @@ members = [
     "crates/cuda-kernels",
     "crates/deepep-sys",
     "crates/deepseek-spec",
+    "crates/infer-plan",
+    "crates/infer-seam",
     "crates/kv-native-sys",
     "crates/mlx-sys",
     "crates/qwen3-spec",
