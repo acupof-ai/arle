@@ -24,6 +24,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-bench"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "infer-core",
+ "infer-metal",
+ "infer-plan",
+ "infer-seam",
+]
+
+[[package]]
 name = "agent-infer"
 version = "0.1.5"
 dependencies = [
@@ -1903,6 +1914,18 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "infer-plan",
+]
+
+[[package]]
+name = "infer-server"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "infer-core",
+ "infer-metal",
+ "infer-plan",
+ "infer-seam",
+ "log",
 ]
 
 [[package]]
