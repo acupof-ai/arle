@@ -1871,9 +1871,16 @@ name = "infer-cuda"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "cuda-kernels",
+ "cudarc",
+ "half",
  "infer-plan",
  "infer-seam",
  "log",
+ "qwen3-spec",
+ "safetensors",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
