@@ -256,7 +256,7 @@ enum CudaExecutorInner {
     #[default]
     Placeholder,
     #[cfg(feature = "cuda")]
-    Real(model::RealCudaExecutor),
+    Real(Box<model::RealCudaExecutor>),
 }
 
 impl fmt::Debug for CudaExecutor {
@@ -295,11 +295,13 @@ impl CudaExecutor {
         total_pages: usize,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: CudaExecutorInner::Real(model::RealCudaExecutor::from_qwen3_bf16_safetensors(
-                model_path,
-                num_slots,
-                total_pages,
-            )?),
+            inner: CudaExecutorInner::Real(Box::new(
+                model::RealCudaExecutor::from_qwen3_bf16_safetensors(
+                    model_path,
+                    num_slots,
+                    total_pages,
+                )?,
+            )),
         })
     }
 
