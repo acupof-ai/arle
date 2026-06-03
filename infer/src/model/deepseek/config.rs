@@ -100,17 +100,30 @@ impl DeepseekRuntimeConfig {
         Ok(runtime)
     }
 
-    /// Current executable DSv4 code supports global TP/EP only. Parsing a
-    /// richer SGLang-style layout is useful for diagnostics, but accepting it
-    /// silently would make benchmark output non-comparable.
+    /// Current debug/default DSv4 code supports global TP/EP only.
+    ///
+    /// The explicit SGLang profile may carry richer axes as contract input so
+    /// request-owner groups and startup diagnostics can be validated before the
+    /// model fails closed on missing communicators/row ownership. That profile
+    /// must still reject before serving opens until the execution path consumes
+    /// the richer layout.
     pub fn validate_current_axis_support(&self, worker_count: Option<usize>) -> Result<()> {
+        self.validate_current_axis_support_for_profile(worker_count, self.performance_profile()?)
+    }
+
+    fn validate_current_axis_support_for_profile(
+        &self,
+        worker_count: Option<usize>,
+        profile: DeepseekPerformanceProfile,
+    ) -> Result<()> {
         let axis_tp_size = self.tp.world_size.max(self.ep.world_size);
         if !self
             .axes
             .is_global_tp_ep_only(axis_tp_size, self.ep.world_size)
+            && !profile.requires_best_practice()
         {
             bail!(
-                "DeepSeek V4 advanced multi-axis layout is parsed but not wired into execution yet: axes={} tp_world={} ep_world={}. Current executable path supports only global TP/EP; see docs/plans/2026-06-01-dsv4-sglang-path-alignment.md.",
+                "DeepSeek V4 advanced multi-axis layout is parsed but not wired into debug execution yet: axes={} tp_world={} ep_world={}. Use ARLE_DSV4_PERFORMANCE_PROFILE=sglang only for fail-closed SGLang contract validation; see docs/plans/2026-06-01-dsv4-sglang-path-alignment.md.",
                 self.axes.summary(),
                 self.tp.world_size,
                 self.ep.world_size,
@@ -228,5 +241,118 @@ impl Deref for DeepseekRuntimeConfig {
 
     fn deref(&self) -> &Self::Target {
         &self.spec
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distributed::expert_state::ExpertGroup;
+    use crate::tensor_parallel::{MultiAxisConfig, RankCoord, TpConfig};
+
+    fn runtime_with_axes(axes: MultiAxisConfig) -> DeepseekRuntimeConfig {
+        let spec = DeepSeekV4Config::from_json_str(
+            r#"{
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "model_type": "deepseek_v4",
+                "torch_dtype": "bfloat16",
+                "vocab_size": 128,
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "hidden_act": "silu",
+                "swiglu_limit": 10.0,
+                "q_lora_rank": 1,
+                "o_lora_rank": 1,
+                "o_groups": 1,
+                "qk_rope_head_dim": 1,
+                "n_routed_experts": 8,
+                "n_shared_experts": 0,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 4,
+                "routed_scaling_factor": 1.0,
+                "norm_topk_prob": false,
+                "scoring_func": "softmax",
+                "topk_method": "noaux_tc",
+                "index_n_heads": 1,
+                "index_head_dim": 1,
+                "index_topk": 1,
+                "num_hash_layers": 0,
+                "sliding_window": 16,
+                "compress_ratios": [0],
+                "compress_rope_theta": 160000.0,
+                "hc_mult": 1,
+                "hc_sinkhorn_iters": 1,
+                "hc_eps": 1.0e-6,
+                "num_nextn_predict_layers": 0,
+                "max_position_embeddings": 128,
+                "rope_theta": 10000.0,
+                "rope_scaling": {
+                    "type": "yarn",
+                    "factor": 1.0,
+                    "original_max_position_embeddings": 128,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0
+                },
+                "rms_norm_eps": 1.0e-6,
+                "initializer_range": 0.02,
+                "tie_word_embeddings": false,
+                "attention_bias": false,
+                "attention_dropout": 0.0,
+                "bos_token_id": 0,
+                "eos_token_id": 1
+            }"#,
+        )
+        .expect("tiny DSv4 config");
+        DeepseekRuntimeConfig {
+            spec,
+            enable_cuda_graph: true,
+            tp: TpConfig::new(8, 0).expect("tp"),
+            ep: ExpertGroup::new(0, 4, 8).expect("ep"),
+            axes,
+            rank_coord: RankCoord::from_world_rank(axes, 0).expect("rank coord"),
+        }
+    }
+
+    #[test]
+    fn advanced_axes_remain_blocked_for_debug_profile() {
+        let axes = MultiAxisConfig {
+            tp_size: 8,
+            pp_size: 1,
+            ep_size: 4,
+            attn_dp_size: 4,
+            attn_cp_size: 1,
+            moe_dp_size: 2,
+        };
+        let runtime = runtime_with_axes(axes);
+        let err = runtime
+            .validate_current_axis_support_for_profile(
+                Some(8),
+                DeepseekPerformanceProfile::DebugFallback,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("advanced multi-axis layout"), "got: {err}");
+    }
+
+    #[test]
+    fn advanced_axes_are_allowed_only_as_sglang_contract_input() {
+        let axes = MultiAxisConfig {
+            tp_size: 8,
+            pp_size: 1,
+            ep_size: 4,
+            attn_dp_size: 4,
+            attn_cp_size: 1,
+            moe_dp_size: 2,
+        };
+        let runtime = runtime_with_axes(axes);
+        runtime
+            .validate_current_axis_support_for_profile(
+                Some(8),
+                DeepseekPerformanceProfile::SglangBestPractice,
+            )
+            .expect("SGLang profile may carry advanced axes to fail-closed startup contract");
     }
 }

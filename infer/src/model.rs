@@ -1,5 +1,7 @@
 //! Model implementations: Qwen3 and Qwen3.5.
 
+use std::cell::Cell;
+
 use anyhow::Result;
 use rand::rngs::StdRng;
 
@@ -35,6 +37,58 @@ pub use qwen35::{
     StudentLoraUpdate,
 };
 
+thread_local! {
+    static SYNTHETIC_DECODE_WARMUP_DEPTH: Cell<usize> = Cell::new(0);
+}
+
+struct SyntheticDecodeWarmupGuard;
+
+impl SyntheticDecodeWarmupGuard {
+    fn enter() -> Self {
+        SYNTHETIC_DECODE_WARMUP_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_add(1));
+        });
+        Self
+    }
+}
+
+impl Drop for SyntheticDecodeWarmupGuard {
+    fn drop(&mut self) {
+        SYNTHETIC_DECODE_WARMUP_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "synthetic decode warmup scope underflow");
+            depth.set(current.saturating_sub(1));
+        });
+    }
+}
+
+pub(crate) fn with_synthetic_decode_warmup_scope<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = SyntheticDecodeWarmupGuard::enter();
+    f()
+}
+
+pub(crate) fn in_synthetic_decode_warmup() -> bool {
+    SYNTHETIC_DECODE_WARMUP_DEPTH.with(|depth| depth.get() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{in_synthetic_decode_warmup, with_synthetic_decode_warmup_scope};
+
+    #[test]
+    fn synthetic_decode_warmup_scope_is_thread_local_and_nested() {
+        assert!(!in_synthetic_decode_warmup());
+        with_synthetic_decode_warmup_scope(|| {
+            assert!(in_synthetic_decode_warmup());
+            with_synthetic_decode_warmup_scope(|| {
+                assert!(in_synthetic_decode_warmup());
+            });
+            assert!(in_synthetic_decode_warmup());
+        });
+        assert!(!in_synthetic_decode_warmup());
+    }
+}
+
 /// One request worth of prefill work inside a scheduler-planned prefill batch.
 #[derive(Clone, Copy, Debug)]
 pub struct PrefillBatchRequest<'a> {
@@ -47,6 +101,38 @@ pub struct PrefillBatchRequest<'a> {
 impl PrefillBatchRequest<'_> {
     pub fn is_final_chunk(&self) -> bool {
         self.start_pos.saturating_add(self.tokens.len()) >= self.total_tokens
+    }
+}
+
+/// One scheduler-planned decode batch with per-row request ownership metadata.
+///
+/// `tokens[i]`, `slot_indices[i]`, and `distributed_shards[i]` are ordered
+/// together. Models that do not consume distributed row ownership should route
+/// through the legacy `forward_decode_batch` default below.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeBatchRequest<'a> {
+    pub tokens: &'a [u32],
+    pub slot_indices: &'a [usize],
+    pub distributed_shards: &'a [crate::scheduler::DistributedRequestShard],
+}
+
+impl DecodeBatchRequest<'_> {
+    pub fn validate(&self) -> Result<()> {
+        if self.tokens.len() != self.slot_indices.len() {
+            anyhow::bail!(
+                "decode batch token/slot mismatch: tokens={} slots={}",
+                self.tokens.len(),
+                self.slot_indices.len()
+            );
+        }
+        if self.distributed_shards.len() != self.slot_indices.len() {
+            anyhow::bail!(
+                "decode batch shard/slot mismatch: shards={} slots={}",
+                self.distributed_shards.len(),
+                self.slot_indices.len()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -850,6 +936,30 @@ pub trait ModelForward: crate::model_arch::ModelArchInfo + Send {
             self.forward_decode(token, &mut states[slot_indices[i]])?;
         }
         Ok(())
+    }
+
+    /// Batched decode with scheduler-visible per-row request ownership.
+    ///
+    /// The default keeps existing model behavior unchanged while letting
+    /// distributed-aware models inspect `DecodeBatchRequest::distributed_shards`
+    /// before deciding whether a row-owned execution path is implemented.
+    fn forward_decode_batch_with_request(
+        &self,
+        batch: DecodeBatchRequest<'_>,
+        states: &mut [Self::State],
+        paged_kv_pool: Option<&mut PagedKVPool>,
+        decode_ctx: &mut Self::DecodeContext,
+        skip_logit_scatter: bool,
+    ) -> Result<()> {
+        batch.validate()?;
+        self.forward_decode_batch(
+            batch.tokens,
+            states,
+            batch.slot_indices,
+            paged_kv_pool,
+            decode_ctx,
+            skip_logit_scatter,
+        )
     }
 
     /// Whether this model has a validated mixed decode + prefill path for the

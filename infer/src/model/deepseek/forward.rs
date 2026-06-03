@@ -33,9 +33,10 @@ use crate::model::generation_state::GenerationStateBase;
 use crate::model::kv_cache::{KVCacheDtype, KVFormat};
 #[cfg(feature = "cuda")]
 use crate::model::{
-    CudaGraphDecodeSupport, DecodeContextOps, InternalMtpDraftOutput, InternalMtpDraftRequest,
-    MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest, ModelForward,
-    PrefillBatchRequest, SpecVerifyOutput, SpecVerifyRequest, prepare_paged_prefill_batch,
+    CudaGraphDecodeSupport, DecodeBatchRequest, DecodeContextOps, InternalMtpDraftOutput,
+    InternalMtpDraftRequest, MixedBatchFallbackReason, MixedBatchOutcome, MixedBatchRequest,
+    ModelForward, PrefillBatchRequest, SpecVerifyOutput, SpecVerifyRequest,
+    prepare_paged_prefill_batch,
 };
 #[cfg(feature = "cuda")]
 use crate::model_arch::ModelArchInfo;
@@ -48,6 +49,8 @@ use crate::sampler::SamplingParams;
 #[cfg(feature = "cuda")]
 use crate::scheduler::{DistributedRequestOwnership, SchedulerStartupContract};
 #[cfg(feature = "cuda")]
+use crate::tensor_parallel::build_attn_owner_groups;
+#[cfg(feature = "cuda")]
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 #[cfg(feature = "cuda")]
 use cuda_kernels::tensor::CudaAllocTraceExt;
@@ -55,6 +58,179 @@ use cuda_kernels::tensor::CudaAllocTraceExt;
 use cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
 use half::bf16;
+
+#[cfg(feature = "cuda")]
+const DSV4_TOKEN_OWNED_ROW_OWNERSHIP: &str = "token-owned-dp-ep-shard-validated";
+
+#[cfg(feature = "cuda")]
+impl DeepseekModel {
+    fn token_owned_request_shard_expectation(&self) -> Result<(usize, usize, bool)> {
+        self.config.axes.validate()?;
+        let attn_tp = self.config.axes.attn_tp_size();
+        let shard_world = attn_tp * self.config.axes.attn_cp_size;
+        ensure!(shard_world > 0, "DSv4 token-owned shard world must be > 0");
+        let shard_rank =
+            self.config.rank_coord.attn_cp_rank * attn_tp + self.config.rank_coord.attn_tp_rank;
+        ensure!(
+            shard_rank < shard_world,
+            "DSv4 token-owned shard rank {shard_rank} must be < shard_world {shard_world}"
+        );
+        Ok((shard_rank, shard_world, shard_rank == 0))
+    }
+
+    fn startup_model_row_ownership(
+        &self,
+        contract: SchedulerStartupContract,
+    ) -> Result<&'static str> {
+        if contract.request_ownership != DistributedRequestOwnership::TokenOwnedDpEp {
+            return Ok("replicated-token");
+        }
+        let owner_groups = build_attn_owner_groups(self.config.axes);
+        ensure!(
+            owner_groups.len() == contract.token_owner_group_count,
+            "DSv4 model owner-group count mismatch: model_axes_groups={} scheduler_contract_groups={} axes={}",
+            owner_groups.len(),
+            contract.token_owner_group_count,
+            self.config.axes.summary()
+        );
+        let (_, shard_world, _) = self.token_owned_request_shard_expectation()?;
+        ensure!(
+            shard_world > 0,
+            "DSv4 model token-owned shard world must be positive"
+        );
+        Ok(DSV4_TOKEN_OWNED_ROW_OWNERSHIP)
+    }
+
+    fn validate_decode_batch_request_ownership(
+        &self,
+        batch: DecodeBatchRequest<'_>,
+    ) -> Result<&'static str> {
+        let token_owned_rows = batch
+            .distributed_shards
+            .iter()
+            .filter(|shard| shard.ownership == DistributedRequestOwnership::TokenOwnedDpEp)
+            .count();
+        if token_owned_rows == 0 {
+            return Ok("replicated-token");
+        }
+        ensure!(
+            token_owned_rows == batch.distributed_shards.len(),
+            "DSv4 mixed decode row ownership is unsupported: token_owned_rows={} rows={}",
+            token_owned_rows,
+            batch.distributed_shards.len()
+        );
+        let (expected_rank, expected_world, expected_visible) =
+            self.token_owned_request_shard_expectation()?;
+        for (row_idx, shard) in batch.distributed_shards.iter().enumerate() {
+            ensure!(
+                shard.rank == expected_rank,
+                "DSv4 decode row {row_idx} shard rank mismatch: got {}/{} expected {}/{}",
+                shard.rank,
+                shard.world_size,
+                expected_rank,
+                expected_world
+            );
+            ensure!(
+                shard.world_size == expected_world,
+                "DSv4 decode row {row_idx} shard world mismatch: got {} expected {}",
+                shard.world_size,
+                expected_world
+            );
+            ensure!(
+                shard.emits_visible_output == expected_visible,
+                "DSv4 decode row {row_idx} visible-output mismatch: got {} expected {} for shard {}/{}",
+                shard.emits_visible_output,
+                expected_visible,
+                expected_rank,
+                expected_world
+            );
+        }
+        Ok(DSV4_TOKEN_OWNED_ROW_OWNERSHIP)
+    }
+
+    fn forward_decode_batch_internal(
+        &self,
+        tokens: &[u32],
+        states: &mut [DeepseekState],
+        slot_indices: &[usize],
+        decode_ctx: &mut DeepseekBatchDecodeBuffers,
+        token_owned_rows_validated: bool,
+    ) -> Result<()> {
+        ensure!(
+            tokens.len() == slot_indices.len(),
+            "DeepSeek V4 decode token/slot mismatch: tokens={} slots={}",
+            tokens.len(),
+            slot_indices.len()
+        );
+        if tokens.is_empty() {
+            return Ok(());
+        }
+
+        // Phase D-4 (shared-pool, `ARLE_DSV4_SHARED_KV_POOL` ON only): bind every
+        // active (slot, layer) attention cache to its fixed sub-range in the
+        // shared FP8 KV pool BEFORE any decode hook runs. This is the single
+        // site that owns both the decode context AND the slot identity, so both
+        // the N≥2 batched path and the N==1 request-aware native-DeepEP path read
+        // pre-bound views — no slot/ctx threading through the attention chain,
+        // and no bind on the prefill path (prefill never reaches here).
+        //
+        // No-op when the shared pool is off: `fp8_kv_max_seq_len()` returns
+        // `None` (the pool was never allocated), so the loop is skipped and the
+        // per-state lazy pool path runs unchanged.
+        if let Some(max_seq_len) = decode_ctx.fp8_kv_max_seq_len() {
+            let num_layers = self.loaded_layer_count();
+            for &slot_idx in slot_indices {
+                ensure!(
+                    slot_idx < states.len(),
+                    "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
+                    states.len()
+                );
+                let state = &mut states[slot_idx];
+                state.incremental.ensure_layers(num_layers);
+                for layer_idx in 0..num_layers {
+                    let layer_cache = state
+                        .incremental
+                        .layers
+                        .get_mut(layer_idx)
+                        .expect("incremental cache layer initialized");
+                    self.bind_fp8_kv_pool_view(
+                        decode_ctx,
+                        &mut layer_cache.attention,
+                        slot_idx,
+                        layer_idx,
+                        max_seq_len,
+                    )?;
+                }
+            }
+        }
+
+        // TRUE batched decode: process all N decode tokens as ONE forward (the
+        // routed-MoE FFN half + NCCL all-reduce amortize over the batch; the
+        // per-sequence attention core still loops per row). Eligibility is
+        // gated by `try_decode_batch`; on unsupported configs it returns false
+        // and we fall through to the per-row loop. For request-aware native
+        // DeepEP, N==1 also stays on this path so row ownership evidence is not
+        // lost before dispatch/combine.
+        if self.try_decode_batch(
+            tokens,
+            states,
+            slot_indices,
+            decode_ctx,
+            token_owned_rows_validated,
+        )? {
+            return Ok(());
+        }
+        for (&token, &slot_idx) in tokens.iter().zip(slot_indices) {
+            ensure!(
+                slot_idx < states.len(),
+                "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
+                states.len()
+            );
+            self.forward_decode(token, &mut states[slot_idx])?;
+        }
+        Ok(())
+    }
+}
 
 #[cfg(feature = "cuda")]
 impl ModelForward for DeepseekModel {
@@ -211,72 +387,51 @@ impl ModelForward for DeepseekModel {
         decode_ctx: &mut Self::DecodeContext,
         _skip_logit_scatter: bool,
     ) -> Result<()> {
-        ensure!(
-            tokens.len() == slot_indices.len(),
-            "DeepSeek V4 decode token/slot mismatch: tokens={} slots={}",
-            tokens.len(),
-            slot_indices.len()
-        );
-        if tokens.is_empty() {
-            return Ok(());
-        }
+        self.forward_decode_batch_internal(tokens, states, slot_indices, decode_ctx, false)
+    }
 
-        // Phase D-4 (shared-pool, `ARLE_DSV4_SHARED_KV_POOL` ON only): bind every
-        // active (slot, layer) attention cache to its fixed sub-range in the
-        // shared FP8 KV pool BEFORE any decode hook runs. This is the single
-        // site that owns both the decode context AND the slot identity, so both
-        // the N≥2 batched path and the N==1 per-row fallback below read
-        // pre-bound views — no slot/ctx threading through the attention chain,
-        // and no bind on the prefill path (prefill never reaches here).
-        //
-        // No-op when the shared pool is off: `fp8_kv_max_seq_len()` returns
-        // `None` (the pool was never allocated), so the loop is skipped and the
-        // per-state lazy pool path runs unchanged.
-        if let Some(max_seq_len) = decode_ctx.fp8_kv_max_seq_len() {
-            let num_layers = self.loaded_layer_count();
-            for &slot_idx in slot_indices {
-                ensure!(
-                    slot_idx < states.len(),
-                    "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
-                    states.len()
+    fn forward_decode_batch_with_request(
+        &self,
+        batch: DecodeBatchRequest<'_>,
+        states: &mut [Self::State],
+        _paged_kv_pool: Option<&mut PagedKVPool>,
+        decode_ctx: &mut Self::DecodeContext,
+        _skip_logit_scatter: bool,
+    ) -> Result<()> {
+        batch.validate()?;
+        let model_row_ownership = self.validate_decode_batch_request_ownership(batch)?;
+        let distributed_rows = batch
+            .distributed_shards
+            .iter()
+            .filter(|shard| shard.is_distributed())
+            .count();
+        if distributed_rows > 0 {
+            static ROW_METADATA_LOGGED: OnceLock<()> = OnceLock::new();
+            ROW_METADATA_LOGGED.get_or_init(|| {
+                let token_owned_rows = batch
+                    .distributed_shards
+                    .iter()
+                    .filter(|shard| {
+                        shard.ownership == DistributedRequestOwnership::TokenOwnedDpEp
+                    })
+                    .count();
+                log::info!(
+                    "DeepSeek V4 decode batch receives distributed_shard metadata: rows={} distributed_rows={} token_owned_rows={} model_row_ownership={} first_shard={}",
+                    batch.slot_indices.len(),
+                    distributed_rows,
+                    token_owned_rows,
+                    model_row_ownership,
+                    batch.distributed_shards[0].summary()
                 );
-                let state = &mut states[slot_idx];
-                state.incremental.ensure_layers(num_layers);
-                for layer_idx in 0..num_layers {
-                    let layer_cache = state
-                        .incremental
-                        .layers
-                        .get_mut(layer_idx)
-                        .expect("incremental cache layer initialized");
-                    self.bind_fp8_kv_pool_view(
-                        decode_ctx,
-                        &mut layer_cache.attention,
-                        slot_idx,
-                        layer_idx,
-                        max_seq_len,
-                    )?;
-                }
-            }
+            });
         }
-
-        // TRUE batched decode: process all N decode tokens as ONE forward (the
-        // routed-MoE FFN half + NCCL all-reduce amortize over the batch; the
-        // per-sequence attention core still loops per row). Eligibility is
-        // gated by `try_decode_batch`; on any unsupported config it returns
-        // `false` and we fall through to the per-row loop, which stays the
-        // correctness reference + fallback and is NEVER deleted.
-        if self.try_decode_batch(tokens, states, slot_indices, decode_ctx)? {
-            return Ok(());
-        }
-        for (&token, &slot_idx) in tokens.iter().zip(slot_indices) {
-            ensure!(
-                slot_idx < states.len(),
-                "DeepSeek V4 decode slot {slot_idx} out of range for {} states",
-                states.len()
-            );
-            self.forward_decode(token, &mut states[slot_idx])?;
-        }
-        Ok(())
+        self.forward_decode_batch_internal(
+            batch.tokens,
+            states,
+            batch.slot_indices,
+            decode_ctx,
+            model_row_ownership == DSV4_TOKEN_OWNED_ROW_OWNERSHIP,
+        )
     }
 
     fn forward_mixed_batch(
@@ -369,6 +524,12 @@ impl ModelForward for DeepseekModel {
                 }
                 if step_tokens.is_empty() {
                     continue;
+                }
+                // The sparse verifier appends speculative target tokens and
+                // may roll them back. Until DSv4 verifier body replay is
+                // separately licensed, keep the body graph out of this path.
+                if dsv4_decode_body_cuda_graph_enabled()? {
+                    decode_ctx.force_eager_once();
                 }
                 self.forward_decode_batch(
                     &step_tokens,
@@ -572,7 +733,13 @@ impl ModelForward for DeepseekModel {
         let incremental_kv = dsv4_incremental_kv_enabled()?;
         let body_graph_enabled = dsv4_decode_body_cuda_graph_enabled()?;
         let body_graph_max_bs = dsv4_decode_body_cuda_graph_max_batch_size()?;
-        let model_row_ownership = "replicated-token";
+        let hot_prefix_attach_supported = self.supports_cross_slot_prefix_attach();
+        let model_row_metadata = "decode-batch-distributed-shard-visible";
+        let (model_row_ownership, model_row_ownership_error) =
+            match self.startup_model_row_ownership(contract) {
+                Ok(label) => (label, None),
+                Err(err) => ("replicated-token-invalid", Some(err)),
+            };
         let communicator_layout = self.layer_communicator.layout_label();
         let communicator_axes = self.layer_communicator.axis_summary();
         let fallback_lane = if profile.requires_best_practice() {
@@ -582,7 +749,7 @@ impl ModelForward for DeepseekModel {
         };
 
         log::info!(
-            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} communicator_layout={} communicator_axes={} request_ownership={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
+            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} communicator_layout={} communicator_axes={} request_ownership={} model_row_metadata={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} spec_enabled={} spec_internal_mtp={} spec_draft_k={} internal_mtp_accepts_drafts={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} hot_prefix_attach_supported={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
             profile.as_str(),
             fallback_lane,
             self.config.tp.rank,
@@ -594,9 +761,14 @@ impl ModelForward for DeepseekModel {
             communicator_layout,
             communicator_axes,
             contract.request_ownership.as_str(),
+            model_row_metadata,
             model_row_ownership,
             contract.effective_world_size,
             contract.token_owner_group_count,
+            contract.spec_enabled,
+            contract.internal_mtp_draft_requested,
+            contract.spec_draft_k,
+            contract.internal_mtp_accepts_drafts,
             kv_cache_dtype,
             kv_pool_format,
             contract.cuda_graph_max_bs,
@@ -605,6 +777,7 @@ impl ModelForward for DeepseekModel {
             graph_support.reason,
             body_graph_enabled,
             body_graph_max_bs,
+            hot_prefix_attach_supported,
             moe_backend,
             expert_backend,
             flashmla_prefill,
@@ -626,6 +799,17 @@ impl ModelForward for DeepseekModel {
         if contract.cuda_graph_max_bs == 0 {
             missing.push("cuda_graph_max_bs must be > 0".to_string());
         }
+        if !contract.spec_enabled || !contract.internal_mtp_draft_requested {
+            missing.push(format!(
+                "DSv4-Flash 256K/1500 target requires EAGLE/internal-MTP speculation; got spec_enabled={} internal_mtp_draft_requested={}",
+                contract.spec_enabled, contract.internal_mtp_draft_requested
+            ));
+        }
+        if contract.internal_mtp_draft_requested && !contract.internal_mtp_accepts_drafts {
+            missing.push(
+                "ARLE_INTERNAL_MTP_ACCEPT_DRAFTS=1 is required for the DSv4-Flash + EAGLE performance comparison; otherwise the verifier clears accepted draft tokens and reports target-only effective output".to_string(),
+            );
+        }
         if !graph_support.is_full_decode() {
             missing.push(format!(
                 "CUDA graph decode must be full_decode for DSv4 SGLang best-practice, got mode={} reason={}",
@@ -633,11 +817,21 @@ impl ModelForward for DeepseekModel {
                 graph_support.reason
             ));
         }
+        if !hot_prefix_attach_supported {
+            missing.push(
+                "DSv4-Flash 256K/1500 hot-cache target requires direct GPU prefix attach, but Deepseek::supports_cross_slot_prefix_attach() is false; repeated prompts can radix-hit while still recomputing prefill".to_string(),
+            );
+        }
         let distributed = self.config.tp.world_size > 1 || self.config.ep.world_size > 1;
         if distributed {
-            missing.push(format!(
-                "DSv4 model forward must consume token-owned distributed_shard rows before native DeepEP can be comparable, got model_row_ownership={model_row_ownership}"
-            ));
+            if let Some(err) = model_row_ownership_error {
+                missing.push(format!("DSv4 model row ownership contract invalid: {err}"));
+            }
+            if model_row_ownership != DSV4_TOKEN_OWNED_ROW_OWNERSHIP {
+                missing.push(format!(
+                    "DSv4 model forward must consume token-owned distributed_shard rows before native DeepEP can be comparable, got model_row_ownership={model_row_ownership}"
+                ));
+            }
             if contract.request_ownership != DistributedRequestOwnership::TokenOwnedDpEp {
                 missing.push(format!(
                     "DSv4 distributed decode requires token-owned DP/EP request routing before graph capture, got request_ownership={}",
@@ -650,10 +844,33 @@ impl ModelForward for DeepseekModel {
                         .to_string(),
                 );
             }
-            if communicator_layout == "global-tp-ep-only" {
-                missing.push(format!(
-                    "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); SGLang-path native DeepEP needs explicit attention/MoE owner-group communicator mapping before it is comparable"
-                ));
+            match communicator_layout {
+                "owner-groups-collectives-ready" => {}
+                "global-tp-ep-only" => {
+                    missing.push(format!(
+                        "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); SGLang-path native DeepEP needs explicit attention/MoE owner-group communicator mapping before it is comparable"
+                    ));
+                }
+                "owner-groups-token-sync-ready" => {
+                    missing.push(format!(
+                        "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); owner-group token sync NCCL is attached but attention-DP/CP and MoE owner-group collectives are not fully wired"
+                    ));
+                }
+                "owner-groups-attn-subgroups-ready" => {
+                    missing.push(format!(
+                        "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); owner-group token sync and attention-DP/CP subgroups are attached, but MoE owner-group collectives plus graph capture/replay are not fully wired"
+                    ));
+                }
+                "owner-groups-moe-transport-ready" => {
+                    missing.push(format!(
+                        "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); native DeepEP MoE transport is booted, but DeepEP/NCCL graph capture/replay is not wired"
+                    ));
+                }
+                _ => {
+                    missing.push(format!(
+                        "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); owner-group axes are declared but attention-DP/CP token-sync collectives are not wired"
+                    ));
+                }
             }
             #[cfg(feature = "nccl")]
             if contract.effective_world_size > 1 && self.request_token_sync_nccl().is_none() {
