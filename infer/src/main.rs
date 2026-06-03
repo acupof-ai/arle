@@ -880,8 +880,13 @@ fn ensure_deepseek_current_axis_support(
     if axes.is_global_tp_ep_only(axis_tp_size, ep_world_size) {
         return Ok(());
     }
+    let profile = dsv4_performance_profile_from_env()
+        .context("loading DeepSeek V4 performance profile for multi-axis support check")?;
+    if profile.requires_best_practice() {
+        return Ok(());
+    }
     bail!(
-        "DeepSeek V4 advanced multi-axis layout is parsed but not wired into execution yet: axes={} tp_world={} ep_world={}. Current executable path supports only global TP/EP; see docs/plans/2026-06-01-dsv4-sglang-path-alignment.md.",
+        "DeepSeek V4 advanced multi-axis layout is parsed but not wired into debug execution yet: axes={} tp_world={} ep_world={}. Use ARLE_DSV4_PERFORMANCE_PROFILE=sglang only for fail-closed SGLang contract validation; see docs/plans/2026-06-01-dsv4-sglang-path-alignment.md.",
         axes.summary(),
         tp_world_size,
         ep_world_size,

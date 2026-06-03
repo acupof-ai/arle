@@ -76,6 +76,10 @@ pub struct SchedulerStartupContract {
     pub effective_world_size: usize,
     pub request_ownership: DistributedRequestOwnership,
     pub token_owner_group_count: usize,
+    pub spec_enabled: bool,
+    pub internal_mtp_draft_requested: bool,
+    pub spec_draft_k: usize,
+    pub internal_mtp_accepts_drafts: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,6 +313,17 @@ pub enum DraftMode {
     SelfSpec,
     InternalMtp,
     External(PathBuf),
+}
+
+pub(crate) fn internal_mtp_accept_drafts_enabled() -> bool {
+    std::env::var("ARLE_INTERNAL_MTP_ACCEPT_DRAFTS")
+        .map(|value| internal_mtp_accept_drafts_value_enabled(&value))
+        .unwrap_or(false)
+}
+
+fn internal_mtp_accept_drafts_value_enabled(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    matches!(value.as_str(), "1" | "true" | "yes" | "on")
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -614,6 +629,11 @@ impl SchedulerConfig {
             effective_world_size: self.request_effective_world_size,
             request_ownership: self.request_ownership,
             token_owner_group_count: self.token_owner_group_count,
+            spec_enabled: self.spec_enabled,
+            internal_mtp_draft_requested: self.spec_enabled
+                && matches!(self.spec_draft_model, DraftMode::InternalMtp),
+            spec_draft_k: self.spec_draft_k,
+            internal_mtp_accepts_drafts: internal_mtp_accept_drafts_enabled(),
         }
     }
 
@@ -1631,6 +1651,29 @@ mod tests {
 
         cfg.validate()
             .expect("internal MTP/EAGLE uses checkpoint mtp.N weights, not sparse self-spec");
+    }
+
+    #[test]
+    fn startup_contract_carries_internal_mtp_target_shape() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.spec_enabled = true;
+        cfg.spec_draft_model = DraftMode::InternalMtp;
+        cfg.spec_draft_k = 5;
+
+        let contract = cfg.startup_contract();
+        assert!(contract.spec_enabled);
+        assert!(contract.internal_mtp_draft_requested);
+        assert_eq!(contract.spec_draft_k, 5);
+    }
+
+    #[test]
+    fn internal_mtp_accept_draft_flag_requires_explicit_on_value() {
+        for value in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(internal_mtp_accept_drafts_value_enabled(value));
+        }
+        for value in ["", "0", "false", "no", "off", "maybe"] {
+            assert!(!internal_mtp_accept_drafts_value_enabled(value));
+        }
     }
 
     #[test]
