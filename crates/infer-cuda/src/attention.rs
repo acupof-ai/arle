@@ -245,6 +245,28 @@ fn run_tilelang_paged(
     let v_pool_ptr = pool.v_ptr(layer_idx, &ctx.stream);
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
+    // Ground-truth arg dump (gated): set R6_ATTN_DEBUG=1 to print the exact
+    // scalar args + device-array contents fed to the TileLang paged kernel.
+    // Used to localize the prefill-kernel spin that static arg comparison vs the
+    // legacy call could not explain.
+    if std::env::var("R6_ATTN_DEBUG").is_ok() {
+        eprintln!(
+            "[r6-attn] decode={decode} layer={layer_idx} q_heads={num_q_heads} kv_heads={num_kv_heads} head_dim={head_dim} seq_len={} num_pages(meta)={} max_total_pages={} page_size={} kv_dim={} sm_scale={sm_scale}",
+            meta.seq_len, meta.num_pages, pool.max_total_pages, pool.page_size, pool.kv_dim
+        );
+        for (name, slice) in [
+            ("q_indptr", &meta.q_indptr),
+            ("kv_indptr", &meta.kv_indptr),
+            ("kv_indices", &meta.kv_indices),
+            ("kv_last_page_len", &meta.kv_last_page_len),
+        ] {
+            match ctx.stream.clone_dtoh(slice) {
+                Ok(v) => eprintln!("[r6-attn]   {name} = {v:?}"),
+                Err(e) => eprintln!("[r6-attn]   {name} dtoh err: {e}"),
+            }
+        }
+    }
+
     // NOTE on the two TileLang symbolic-shape args (mirrors the legacy
     // `infer/src/ops/attention.rs` call, which is the contract of record):
     //   - `num_pages`  (arg 12) = the K/V *pool capacity* = `pool.max_total_pages`.
