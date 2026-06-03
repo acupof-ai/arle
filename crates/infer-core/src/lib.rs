@@ -947,7 +947,8 @@ mod testing {
     use anyhow::{Result, bail};
     use infer_plan::{SlotToken, StepOutput};
     use infer_seam::{
-        AdmissionVerdict, BackendExecutor, KvPool, PollResult, ResourceGovernor, StepBudget,
+        AdmissionVerdict, BackendExecutor, KvAllocator, KvPool, KvPrefixStore, KvQuery, PollResult,
+        ResourceGovernor, StepBudget,
     };
 
     use super::ForwardPlan;
@@ -1061,13 +1062,13 @@ mod testing {
         fn recycle_if_unused(&mut self, page: u32) {
             let retained = self.page_ref_counts.get(&page).copied().unwrap_or(0);
             let attached = self.page_attach_counts.get(&page).copied().unwrap_or(0);
-            if retained == 0 && attached == 0 && !self.free_pages.iter().any(|&free| free == page) {
+            if retained == 0 && attached == 0 && !self.free_pages.contains(&page) {
                 self.free_pages.push(page);
             }
         }
     }
 
-    impl KvPool for MockKvPool {
+    impl KvQuery for MockKvPool {
         fn is_active(&self) -> bool {
             true
         }
@@ -1096,16 +1097,6 @@ mod testing {
             self.seq_lens[slot]
         }
 
-        fn page_indices(&self, slot: usize) -> &[u32] {
-            &self.pages[slot]
-        }
-
-        fn page_indices_for_token_range(&self, slot: usize, start: usize, len: usize) -> &[u32] {
-            let start_page = start / self.page_size;
-            let end_page = (start + len).div_ceil(self.page_size);
-            &self.pages[slot][start_page..end_page]
-        }
-
         fn slot_epoch(&self, slot: usize) -> u64 {
             self.slot_epochs[slot]
         }
@@ -1119,6 +1110,18 @@ mod testing {
             tokens.saturating_sub(available).div_ceil(self.page_size)
         }
 
+        fn page_indices(&self, slot: usize) -> &[u32] {
+            &self.pages[slot]
+        }
+
+        fn page_indices_for_token_range(&self, slot: usize, start: usize, len: usize) -> &[u32] {
+            let start_page = start / self.page_size;
+            let end_page = (start + len).div_ceil(self.page_size);
+            &self.pages[slot][start_page..end_page]
+        }
+    }
+
+    impl KvAllocator for MockKvPool {
         fn alloc(&mut self, slot: usize, tokens: usize) -> Result<()> {
             self.ensure_slot(slot)?;
             let new_pages = self.append_pages_needed(slot, tokens);
@@ -1140,19 +1143,13 @@ mod testing {
             Ok(pages)
         }
 
-        fn attach_pages(&mut self, slot: usize, pages: &[u32], token_count: usize) -> Result<()> {
-            self.ensure_slot(slot)?;
-            let old_pages = std::mem::take(&mut self.pages[slot]);
-            for page in old_pages {
+        fn free_slot(&mut self, slot: usize) {
+            let pages = std::mem::take(&mut self.pages[slot]);
+            for page in pages {
                 self.detach_page(page);
             }
-            self.pages[slot].extend_from_slice(pages);
-            for &page in pages {
-                self.attach_page(page);
-            }
-            self.seq_lens[slot] = token_count;
+            self.seq_lens[slot] = 0;
             self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
-            Ok(())
         }
 
         fn truncate_slot(&mut self, slot: usize, new_len: usize) -> Result<()> {
@@ -1171,15 +1168,6 @@ mod testing {
             Ok(())
         }
 
-        fn free_slot(&mut self, slot: usize) {
-            let pages = std::mem::take(&mut self.pages[slot]);
-            for page in pages {
-                self.detach_page(page);
-            }
-            self.seq_lens[slot] = 0;
-            self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
-        }
-
         fn migrate(&mut self, slot: usize, start: usize, len: usize) -> Result<()> {
             self.ensure_slot(slot)?;
             let target = start.saturating_add(len);
@@ -1188,9 +1176,13 @@ mod testing {
             }
             Ok(())
         }
+    }
 
-        fn retained_count(&self) -> usize {
-            self.page_ref_counts.len()
+    impl KvPrefixStore for MockKvPool {
+        fn retain_pages(&mut self, pages: &[u32]) {
+            for page in pages {
+                self.retain_page(*page);
+            }
         }
 
         fn release_pages(&mut self, pages: &[u32]) {
@@ -1199,10 +1191,23 @@ mod testing {
             }
         }
 
-        fn retain_pages(&mut self, pages: &[u32]) {
-            for page in pages {
-                self.retain_page(*page);
+        fn retained_count(&self) -> usize {
+            self.page_ref_counts.len()
+        }
+
+        fn attach_pages(&mut self, slot: usize, pages: &[u32], token_count: usize) -> Result<()> {
+            self.ensure_slot(slot)?;
+            let old_pages = std::mem::take(&mut self.pages[slot]);
+            for page in old_pages {
+                self.detach_page(page);
             }
+            self.pages[slot].extend_from_slice(pages);
+            for &page in pages {
+                self.attach_page(page);
+            }
+            self.seq_lens[slot] = token_count;
+            self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
+            Ok(())
         }
     }
 
@@ -1290,6 +1295,7 @@ mod testing {
 #[cfg(test)]
 mod tests {
     use infer_plan::FinishReason;
+    use infer_seam::{KvAllocator, KvQuery};
 
     use super::testing::{HoldGovernor, MockExecutor, MockKvPool};
     use super::*;
