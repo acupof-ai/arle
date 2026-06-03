@@ -1083,6 +1083,102 @@ mod testing {
         }
     }
 
+    /// Mock executor that mirrors the real CUDA executor's *internal* device KV
+    /// pool advancement and its decode-step length invariant.
+    ///
+    /// `infer_cuda::RealCudaExecutor` owns a device-side `PagedKVPool` that it
+    /// advances itself inside `submit` (prefill: `alloc_tokens(slot, prompt_len)`,
+    /// decode: `alloc_tokens(slot, 1)`), separate from the host scheduler
+    /// `KvPool`. Before each decode it asserts the two counters agree:
+    /// `device.seq_len(slot) == DecodeRow.kv_seq_len`. This mock reproduces both
+    /// the advancement and the assertion against the *real* engine + planner, so
+    /// a host-side off-by-one in `DecodeRow.kv_seq_len` surfaces as a CPU test
+    /// failure instead of only on an H20.
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct DeviceMirrorExecutor {
+        /// Per-slot materialized device KV length, mirroring the executor pool.
+        materialized: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<usize, usize>>>,
+        /// Recorded `(materialized_before, kv_seq_len)` for every decode row.
+        decode_log: std::rc::Rc<std::cell::RefCell<Vec<(usize, usize, usize)>>>,
+    }
+
+    impl DeviceMirrorExecutor {
+        pub(super) fn materialized(&self, slot: usize) -> usize {
+            self.materialized.borrow().get(&slot).copied().unwrap_or(0)
+        }
+
+        /// `(slot, materialized_before_decode, decode_row.kv_seq_len)` per decode.
+        pub(super) fn decode_log(&self) -> Vec<(usize, usize, usize)> {
+            self.decode_log.borrow().clone()
+        }
+    }
+
+    impl BackendExecutor for DeviceMirrorExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            let mut tokens = Vec::new();
+            let mut materialized = self.materialized.borrow_mut();
+
+            for row in &plan.prefill_rows {
+                // Mirrors RealCudaExecutor::ensure_slot_ready_for_prefill: a fresh
+                // prefill (start_pos == 0) of a reused slot drops the stale device
+                // pages before re-allocating.
+                let entry = materialized.entry(row.slot).or_insert(0);
+                if row.start_pos == 0 {
+                    *entry = 0;
+                } else if *entry != row.start_pos {
+                    bail!(
+                        "device mirror: chunked prefill expects materialized {} == start_pos {} for slot {}",
+                        *entry,
+                        row.start_pos,
+                        row.slot
+                    );
+                }
+                *entry += row.tokens.len();
+                let token = row.tokens.last().copied().map_or(1, |last| last + 1);
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                });
+            }
+
+            for row in &plan.decode_rows {
+                let entry = materialized.entry(row.slot).or_insert(0);
+                self.decode_log
+                    .borrow_mut()
+                    .push((row.slot, *entry, row.kv_seq_len));
+                // The invariant the real executor asserts at executor.rs:139.
+                if *entry != row.kv_seq_len {
+                    bail!(
+                        "CUDA materialized cache_len {} != DecodeRow.kv_seq_len {} for slot {}",
+                        *entry,
+                        row.kv_seq_len,
+                        row.slot
+                    );
+                }
+                *entry += 1;
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token: row.last_token + 1,
+                    logprob: None,
+                    finish: None,
+                });
+            }
+
+            Ok(MockInflight {
+                output: StepOutput { tokens },
+                return_not_ready_once: false,
+            })
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            Ok(PollResult::Ready(inflight.output))
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     pub(super) struct HoldGovernor;
 
@@ -1106,7 +1202,9 @@ mod tests {
     use infer_plan::FinishReason;
     use infer_seam::{KvAllocator, KvQuery};
 
-    use super::testing::{HoldGovernor, MockExecutor, MockKvPool, WarmupCountingExecutor};
+    use super::testing::{
+        DeviceMirrorExecutor, HoldGovernor, MockExecutor, MockKvPool, WarmupCountingExecutor,
+    };
     use super::*;
 
     #[test]
@@ -1159,6 +1257,169 @@ mod tests {
         assert!(matches!(completed.finish, Some(FinishReason::Length)));
         assert!(engine.is_idle());
         Ok(())
+    }
+
+    /// Regression for the R6 CUDA decode-path off-by-one: `DecodeRow.kv_seq_len`
+    /// must equal the executor's *materialized* device KV length at every decode
+    /// step. `DeviceMirrorExecutor` reproduces the real executor's two-pool
+    /// bookkeeping + assertion against the real engine + planner, so a host-side
+    /// counter drift fails here on CPU rather than only on an H20.
+    ///
+    /// Per-decode invariant (the H20 assertion): the materialized device length
+    /// observed at decode step k equals that decode row's `kv_seq_len`, and both
+    /// equal `prompt_len + k` (the prefill forward emits the first token, so the
+    /// k-th decode, 0-indexed, attends over `prompt_len + k` materialized rows).
+    fn assert_decode_kv_seq_len_matches_materialized(prompt_len: usize, max_new: usize) {
+        // Single-chunk prefill: the whole prompt lands in one prefill row.
+        assert_decode_kv_seq_len_with_chunk(prompt_len, max_new, prompt_len.max(1));
+    }
+
+    fn assert_decode_kv_seq_len_with_chunk(prompt_len: usize, max_new: usize, chunk: usize) {
+        let executor = DeviceMirrorExecutor::default();
+        let probe = executor.clone();
+        let mut config = test_config(1);
+        config.chunked_prefill_size = chunk.max(1);
+        let mut engine = Engine::with_config(executor, MockKvPool::new(1), config);
+
+        let prompt: Vec<u32> = (0..prompt_len as u32).map(|t| t + 1).collect();
+        let handle = engine.submit_request(prompt, max_new);
+        engine
+            .run_to_idle()
+            .unwrap_or_else(|e| panic!("kv_seq_len drift for prompt_len={prompt_len}: {e}"));
+
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(
+            completed.generated_tokens.len(),
+            max_new,
+            "expected {max_new} generated tokens for prompt_len={prompt_len}"
+        );
+        // The prefill forward emits the first token, so the number of *decode*
+        // forwards is max_new - 1, and the device KV ends at prompt_len + decodes.
+        let decode_steps = max_new.saturating_sub(1);
+        let log = probe.decode_log();
+        assert_eq!(
+            log.len(),
+            decode_steps,
+            "expected {decode_steps} decode rows for prompt_len={prompt_len}, got {log:?}"
+        );
+        for (k, &(slot, materialized, kv_seq_len)) in log.iter().enumerate() {
+            assert_eq!(slot, 0);
+            assert_eq!(
+                materialized, kv_seq_len,
+                "decode step {k}: device materialized {materialized} != kv_seq_len {kv_seq_len}"
+            );
+            assert_eq!(
+                kv_seq_len,
+                prompt_len + k,
+                "decode step {k}: kv_seq_len {kv_seq_len} != prompt_len+{k} ({})",
+                prompt_len + k
+            );
+        }
+        assert_eq!(probe.materialized(0), prompt_len + decode_steps);
+    }
+
+    #[test]
+    fn decode_kv_seq_len_matches_materialized_one_token_prompt() {
+        // The exact H20 repro shape: 1-token prompt, several decode steps.
+        assert_decode_kv_seq_len_matches_materialized(1, 4);
+    }
+
+    #[test]
+    fn decode_kv_seq_len_matches_materialized_multi_token_prompt() {
+        assert_decode_kv_seq_len_matches_materialized(8, 5);
+        assert_decode_kv_seq_len_matches_materialized(16, 3);
+    }
+
+    /// Chunked prefill (prompt split across ticks) must still hand the first
+    /// decode the correct `kv_seq_len`: the device materializes the prompt one
+    /// chunk per tick, so the prefill→decode boundary is the off-by-one's most
+    /// likely hiding spot.
+    #[test]
+    fn decode_kv_seq_len_matches_materialized_chunked_prefill() {
+        assert_decode_kv_seq_len_with_chunk(8, 4, 3);
+        assert_decode_kv_seq_len_with_chunk(10, 3, 4);
+    }
+
+    /// Prefix-reuse characterization for the R6 single-row executor.
+    ///
+    /// When a second request shares a cached prefix, the host scheduler attaches
+    /// the prefix pages (host `seq_len` jumps to `matched_len`) but the device
+    /// `PagedKVPool` for the fresh slot starts at 0. The executor's prefill guard
+    /// `ensure_slot_ready_for_prefill` (executor.rs:187) requires device
+    /// `materialized == start_pos`; a `start_pos > 0` prefill row with a 0 device
+    /// pool must be *rejected explicitly*, not silently drift the decode counter.
+    /// `DeviceMirrorExecutor` mirrors that guard, so this asserts the failure mode
+    /// is the loud prefill guard rather than a +1 decode mismatch.
+    #[test]
+    fn prefix_reuse_either_decodes_cleanly_or_fails_loud_at_prefill() {
+        let executor = DeviceMirrorExecutor::default();
+        let mut config = test_config(2);
+        config.chunked_prefill_size = 64;
+        let mut engine = Engine::with_config(executor, MockKvPool::new(2), config);
+
+        // Prime a prefix, then submit a request that shares it.
+        let first = engine.submit_request(vec![1, 2, 3, 4], 2);
+        engine.run_to_idle().expect("primer drains");
+        let second = engine.submit_request(vec![1, 2, 3, 4, 5, 6], 2);
+
+        // The R6 executor never silently inherits a device/host counter gap: it
+        // either runs the request to completion (prefix not reused on the device
+        // path) or surfaces the explicit prefill-readiness guard.
+        match engine.run_to_idle() {
+            Ok(()) => {
+                assert!(engine.completed(first).is_some());
+                assert!(engine.completed(second).is_some());
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("start_pos") || msg.contains("materialized"),
+                    "expected explicit prefill-readiness guard, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Slot reuse: a second request lands on slot 0 after the first frees it.
+    /// The device pool must be reset on the fresh prefill (start_pos == 0) so the
+    /// second request's decode kv_seq_len does not inherit the first's count.
+    #[test]
+    fn decode_kv_seq_len_matches_materialized_across_slot_reuse() {
+        let executor = DeviceMirrorExecutor::default();
+        let probe = executor.clone();
+        let mut config = test_config(1);
+        config.chunked_prefill_size = 64;
+        let mut engine = Engine::with_config(executor, MockKvPool::new(1), config);
+
+        let first = engine.submit_request(vec![1, 2, 3], 3);
+        engine.run_to_idle().expect("first request drains");
+        let second = engine.submit_request(vec![7, 7, 7, 7], 3);
+        engine.run_to_idle().expect("second request drains");
+
+        assert_eq!(
+            engine
+                .completed(first)
+                .expect("first done")
+                .generated_tokens
+                .len(),
+            3
+        );
+        assert_eq!(
+            engine
+                .completed(second)
+                .expect("second done")
+                .generated_tokens
+                .len(),
+            3
+        );
+        // Every recorded decode kept materialized == kv_seq_len (no drift / no
+        // cross-request inheritance).
+        for (k, &(_, materialized, kv_seq_len)) in probe.decode_log().iter().enumerate() {
+            assert_eq!(
+                materialized, kv_seq_len,
+                "decode {k}: materialized {materialized} != kv_seq_len {kv_seq_len}"
+            );
+        }
     }
 
     #[test]
