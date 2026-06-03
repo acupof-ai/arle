@@ -69,24 +69,54 @@ After the swap fix, `CUDA_LAUNCH_BLOCKING=1` shows the prefill kernel **still ha
 access, and a second, *control-flow* bug remains (a spin, not a memory fault). All
 4 kernel calls (prefill/decode prep+run) match the legacy contract arg-for-arg.
 
-**Leading hypothesis — short-prompt pipeline trip-count deadlock.** The kernel
-(`tools/tilelang/batch_prefill_paged_hd128.py`) walks KV with
-`T.Pipelined(T.ceildiv(kv_visible_end, BLOCK_N=64), num_stages=2)`. For the
-5-token bring-up prompt, `kv_total_len=5` → trip count `ceildiv(5,64)=1`. A 2-stage
-software pipeline with trip count `1 < num_stages` is a classic mbarrier deadlock:
-the prologue prefetches a stage that never executes and the consumer waits forever
-on an mbarrier that never fills — a spin with no Xid, exactly the symptom. Latent
-for legacy (its prefill benches use long prompts → trip count ≥ 2); only the clean
-harness's short prompt trips it.
+### Empirical A/B (2026-06-04) — trip-count hypothesis FALSIFIED
 
-Discriminating tests (in flight): (a) `R6_ATTN_DEBUG=1` dump of the exact
-runtime args + device arrays to confirm `kv_total_len`/trip count; (b) re-run the
-clean harness with a ≥65-KV-token prompt (trip count ≥ 2) — if it passes long but
-hangs short, the pipeline hypothesis is confirmed. Fix then lives in the kernel
-template (guard trip-count < num_stages, or drop to num_stages=1 for short loops).
+Single-variable prompt-length sweep on the H20 (R6_ATTN_DEBUG=1 + CUDA_LAUNCH_BLOCKING=1),
+all args confirmed correct each run:
+
+| Prompt | qlen | grid bx | KV trip count | Q-tile | Result |
+|---|---|---|---|---|---|
+| 5 tokens  | 5  | `ceildiv(5,64)=1`  | `ceildiv(5,64)=1`  | partial | **hang** (no Xid) |
+| 64 tokens | 64 | `ceildiv(64,64)=1` | `ceildiv(64,64)=1` | **FULL** | **hang** (no Xid) |
+| 70 tokens | 70 | `ceildiv(70,64)=2` | `ceildiv(70,64)=2` | mixed   | **hang** (no Xid) |
+
+This **falsifies** the short-prompt pipeline trip-count-deadlock hypothesis and the
+partial-tile-NaN hypothesis:
+- qlen=70 has trip count 2 / grid bx 2 yet hangs → not trip-count-1, not single-block.
+- qlen=64 is a FULL tile (zero padding rows → zero `exp2(-inf - -inf)=NaN` injection)
+  yet hangs → not partial-tile / not NaN-in-PV-operand.
+
+The prefill cubin hangs at **every** geometry → a **fundamental prefill-cubin /
+launch wedge on sm_90**, independent of prompt shape.
+
+### Multi-lens root cause (3-agent read-only Workflow, 2026-06-04)
+
+Verdict: a **prefill-specific FullRow-WGMMA wedge** in the TileLang HD128 prefill
+cubin. The "decode survives trip-count-1" control does **not** transfer — legacy
+routes `max_qlen==1` to the structurally different *decode* kernel
+(`is_pure_decode` at `infer/src/ops/attention.rs:1118`), so the *prefill* cubin had
+**never been exercised at this SKU before R6**. Top suspects that hang full tiles too:
+
+1. **TileLang 0.1.10 FullRow codegen defect** — corroborated by two prior error
+   entries on the identical SKU/symptom:
+   `errors/2026-05-27-tilelang-0110-fullrow-warp23-nan-sm80.md` (0.1.10 FullRow
+   miscompile; pin 0.1.9) and `errors/2026-05-30-gated-delta-short-seq-prefill-hang-h20.md`
+   (sm_90 prefill 100% util / no Xid). Pod build dir is literally `tl010`.
+2. **dyn-shmem mis-sizing** — prefill BLOCK_N=64 needs ~80 KB dynamic shared vs
+   decode's ~32 KB; if `gen_tilelang_aot.py`'s heuristic baked decode's budget into
+   the prefill launcher, the block live-waits on undersized shared.
+
+Ruled out (high confidence): host stream/sync omission (symptom is 100%-util device
+spin, not host idle) and generic `T.Pipelined` trip-1 deadlock (decode survives it).
+
+### Probes in flight (read-only, no rebuild)
+
+- [ ] TileLang `__version__` resolved by the pod build interpreter (if 0.1.10 → likely the whole bug).
+- [ ] `device_kernel.cu` mbarrier/cp.async/wait_group diff: prefill q16_kv8_sm90 vs decode q16_kv8_sm90.
+- [ ] dyn-shmem byte literal + `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` baked into the prefill vs decode launcher.
 
 ## Verification (pending-remote)
 
+- [ ] Apply the single-variable fix the probes indict (pin TileLang <0.1.10, or fix dyn-shmem heuristic), rebuild, re-run.
 - [ ] clean `clean_tokens` == HF gold `[12095,13,576,6722,315,9625,374,1083,279,6722,315,279,5429,315,9625,13]` (Qwen3-0.6B, greedy, 16 new).
-- [ ] Confirm/refute the short-prompt pipeline-deadlock hypothesis (dump values + long-prompt A/B).
 - [ ] Then: longer prompt + multi-shape greedy parity before declaring Phase 0 closed.
