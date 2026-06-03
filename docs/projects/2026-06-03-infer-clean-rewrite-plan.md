@@ -142,6 +142,24 @@ The old tree keeps serving in parallel; the new tree grows in `crates/infer-*`, 
 - **R7 new axes** — DP-attention+EP (Qwen3.6-MoE), PP microbatch (`scheduler_pp_mixin` pattern), HIP
   (`infer-hip`, validates the abstraction), disagg (long-term).
 
+### R5 cutover scope (measured 2026-06-03, not estimated)
+
+The bulk of legacy `infer` (167k LOC) is the **internals** the new crates already replace
+(scheduler/cuda, model/qwen3, ops, kv_tier). The cutover blocker is the **serving surface +
+consumer rewire**, and the consumer coupling is *shallow* — measured by symbol grep:
+
+- **arle binary (`src/main.rs`): zero direct `infer::` refs** — already decoupled (delegates to `cli`).
+- **`crates/cli`:** `infer::hf_hub::{resolve_local_model_path,resolve_model_source,resolve_model_path,discover_local_model,build_api}` + `infer::server_engine::{InferenceEngine}` + `infer::logging::init_stderr`.
+- **`crates/agent`:** `infer::server_engine::*` + `infer::sampler::SamplingParams`.
+- **`crates/train`:** `infer::server_engine::LoadedInferenceEngine` + `infer::InferTeacher` (OPD teacher).
+
+So R5 is bounded, not a 167k-LOC rewrite: (1) `infer-server` must grow the **HTTP OpenAI v1 surface**
+(legacy `infer/src/http_server` — axum/stream/`session_id`; today `infer-server` is only an in-process
+`ServeHandle`), (2) re-expose the `InferenceEngine`/`LoadedInferenceEngine` contract + `hf_hub` resolution
+over the new stack (a small facade), (3) re-express `InferTeacher` (OPD) over the new engine, (4) rewire the
+~4 shallow call sites, (5) delete `infer/src` internals. **Architecture thesis = done + proven (Metal);
+remaining = this serving/consumer integration tranche, gated on CUDA G2/G4.**
+
 ---
 
 ## 4. Correctness Preservation (the biggest fatal risk of a rewrite — SOLID-enforced)
