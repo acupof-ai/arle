@@ -8,7 +8,12 @@ use hf_hub::{
     api::sync::{ApiBuilder, ApiRepo},
 };
 
-pub(crate) fn resolve_model_path(model_id_or_path: &str) -> Result<PathBuf> {
+/// Resolve a model id or filesystem path to a local directory containing the
+/// model's `config.json`, safetensors weights, and `tokenizer.json` (HF cache
+/// snapshots colocate all three). Downloads from HuggingFace if not found
+/// locally. Exposed so the `infer-api` adapter can resolve the same directory
+/// for both the executor weights and the `OpenAiTokenizer`.
+pub fn resolve_model_path(model_id_or_path: &str) -> Result<PathBuf> {
     if let Some(local) = resolve_local_weighted_model_path(model_id_or_path) {
         log::info!("Using local model path: {}", local.display());
         return Ok(local);
