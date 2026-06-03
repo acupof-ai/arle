@@ -615,12 +615,11 @@ impl DistributedSchedulerGroup {
             let mut permits = Vec::with_capacity(owner_ranks.len());
             let mut reserve_failed = false;
             for &rank in owner_ranks {
-                match self.workers[rank].handle.reserve_submission() {
-                    Ok(permit) => permits.push((rank, permit)),
-                    Err(_) => {
-                        reserve_failed = true;
-                        break;
-                    }
+                if let Ok(permit) = self.workers[rank].handle.reserve_submission() {
+                    permits.push((rank, permit));
+                } else {
+                    reserve_failed = true;
+                    break;
                 }
             }
             if reserve_failed {
@@ -671,9 +670,7 @@ impl DistributedSchedulerGroup {
             requests.push((global_rank, rank_req));
         }
 
-        for ((rank, permit), (request_rank, rank_req)) in
-            permits.drain(..).zip(requests.into_iter())
-        {
+        for ((rank, permit), (request_rank, rank_req)) in permits.drain(..).zip(requests) {
             debug_assert_eq!(rank, request_rank);
             permit.submit(rank_req).map_err(|_| SubmitError)?;
         }
@@ -695,12 +692,11 @@ impl DistributedSchedulerGroup {
                 let Some(worker) = self.workers.get(rank) else {
                     continue;
                 };
-                match worker.handle.reserve_submission() {
-                    Ok(permit) => permits.push((rank, permit)),
-                    Err(_) => {
-                        reserve_failed = true;
-                        break;
-                    }
+                if let Ok(permit) = worker.handle.reserve_submission() {
+                    permits.push((rank, permit));
+                } else {
+                    reserve_failed = true;
+                    break;
                 }
             }
             if reserve_failed {
@@ -794,7 +790,7 @@ impl DistributedSchedulerGroup {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if remote_visible {
                 relay
-                    .register_completion_sink(request_id, req.delta_tx.clone())
+                    .register_completion_sink(request_id, req.delta_tx)
                     .map_err(|_| SubmitError)?;
             }
             for (rank, envelope) in &remote_envelopes {
