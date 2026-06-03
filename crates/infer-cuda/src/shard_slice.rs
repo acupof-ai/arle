@@ -220,6 +220,86 @@ mod tests {
         assert_eq!((r.rows, r.cols), (6, 3));
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // TP head-aligned Q/K/V column shard (the load-bearing GQA invariant).
+    //
+    // q_proj rows = num_q_heads * head_dim. The TP loader (`loader::
+    // load_qkv_head_sharded`) shards on WHOLE-HEAD boundaries: a head_shard gives
+    // `local_heads` per rank, so the row ShardingSpec is
+    // `{ offset: rank * local_heads * head_dim, size: local_heads * head_dim }`.
+    // These tests prove that (a) the shards tile the full projection with no gap /
+    // overlap (concatenation == original), and (b) every shard boundary is a
+    // multiple of head_dim — i.e. no rank ever splits a head, which is what keeps
+    // the per-rank attention kernel + o_proj input shard consistent.
+    // ─────────────────────────────────────────────────────────────────────────
+    fn head_aligned_spec(
+        local_heads: usize,
+        head_dim: usize,
+        total_heads: usize,
+        rank: usize,
+    ) -> ShardingSpec {
+        let local_rows = local_heads * head_dim;
+        ShardingSpec {
+            offset: rank * local_rows,
+            size: local_rows,
+            total: total_heads * head_dim,
+        }
+    }
+
+    #[test]
+    fn qkv_head_aligned_shard_tiles_full_projection_on_head_boundaries() {
+        use infer_topo::head_shard;
+        // Qwen3-ish Q: 32 heads, head_dim 128 → q_proj rows = 4096, cols = hidden.
+        let total_heads = 32usize;
+        let head_dim = 128usize;
+        let rows = total_heads * head_dim; // 4096
+        let cols = 8usize; // small fake hidden for a cheap byte check
+        let w = fake_weight(rows, cols);
+
+        for world in [2usize, 4, 8] {
+            let mut joined = Vec::new();
+            let mut covered_heads = 0usize;
+            for rank in 0..world {
+                let tp = TpConfig::new(world, rank).unwrap();
+                // head_shard is the GQA-aware split the loader uses.
+                let (local_q_heads, _local_kv) = head_shard(total_heads, 8, &tp).unwrap();
+                let spec = head_aligned_spec(local_q_heads, head_dim, total_heads, rank);
+                // Boundary is a whole-head multiple (no head ever split across ranks).
+                assert_eq!(
+                    spec.offset % head_dim,
+                    0,
+                    "world={world} rank={rank} offset on-head"
+                );
+                assert_eq!(
+                    spec.size % head_dim,
+                    0,
+                    "world={world} rank={rank} size on-head"
+                );
+                let r = shard_column_parallel(&w, rows, cols, 2, &spec).unwrap();
+                covered_heads += local_q_heads;
+                joined.extend_from_slice(&r.bytes);
+            }
+            // Every head accounted for exactly once; concatenation == original.
+            assert_eq!(covered_heads, total_heads, "world={world} head coverage");
+            assert_eq!(joined, w, "world={world} concat reconstructs full q_proj");
+        }
+    }
+
+    #[test]
+    fn single_gpu_head_aligned_shard_is_identity() {
+        // world_size == 1 must be byte-identical to the full load (no-op path).
+        let total_heads = 16usize;
+        let head_dim = 128usize;
+        let rows = total_heads * head_dim;
+        let cols = 4usize;
+        let w = fake_weight(rows, cols);
+        let tp = TpConfig::single();
+        let spec = head_aligned_spec(total_heads, head_dim, total_heads, tp.rank);
+        let r = shard_column_parallel(&w, rows, cols, 2, &spec).unwrap();
+        assert_eq!(r.bytes, w);
+        assert_eq!((r.rows, r.cols), (rows, cols));
+    }
+
     #[test]
     fn column_shard_remainder_lands_on_last_rank() {
         // 10 rows over TP=4: ranks get 2,2,2,4. Concatenation reproduces the source.
