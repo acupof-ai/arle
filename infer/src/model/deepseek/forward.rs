@@ -742,7 +742,7 @@ impl ModelForward for DeepseekModel {
         };
 
         log::info!(
-            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} communicator_layout={} communicator_axes={} request_ownership={} model_row_metadata={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
+            "DeepSeek V4 startup contract: profile={} fallback_lane={} tp={}/{} ep={}/{} axes={} coord={:?} communicator_layout={} communicator_axes={} request_ownership={} model_row_metadata={} model_row_ownership={} request_effective_world_size={} token_owner_groups={} spec_enabled={} spec_internal_mtp={} spec_draft_k={} internal_mtp_accepts_drafts={} kv_cache_dtype={:?} kv_pool_format={:?} cuda_graph_max_bs={} cuda_graph_supported={} cuda_graph_mode={} cuda_graph_required=full_decode cuda_graph_reason=\"{}\" body_graph_enabled={} body_graph_max_bs={} moe_backend={} expert_backend={} flashmla_prefill={} flashmla_decode={} shared_kv_pool={} incremental_kv={}",
             profile.as_str(),
             fallback_lane,
             self.config.tp.rank,
@@ -758,6 +758,10 @@ impl ModelForward for DeepseekModel {
             model_row_ownership,
             contract.effective_world_size,
             contract.token_owner_group_count,
+            contract.spec_enabled,
+            contract.internal_mtp_draft_requested,
+            contract.spec_draft_k,
+            contract.internal_mtp_accepts_drafts,
             kv_cache_dtype,
             kv_pool_format,
             contract.cuda_graph_max_bs,
@@ -786,6 +790,17 @@ impl ModelForward for DeepseekModel {
         }
         if contract.cuda_graph_max_bs == 0 {
             missing.push("cuda_graph_max_bs must be > 0".to_string());
+        }
+        if !contract.spec_enabled || !contract.internal_mtp_draft_requested {
+            missing.push(format!(
+                "DSv4-Flash 256K/1500 target requires EAGLE/internal-MTP speculation; got spec_enabled={} internal_mtp_draft_requested={}",
+                contract.spec_enabled, contract.internal_mtp_draft_requested
+            ));
+        }
+        if contract.internal_mtp_draft_requested && !contract.internal_mtp_accepts_drafts {
+            missing.push(
+                "ARLE_INTERNAL_MTP_ACCEPT_DRAFTS=1 is required for the DSv4-Flash + EAGLE performance comparison; otherwise the verifier clears accepted draft tokens and reports target-only effective output".to_string(),
+            );
         }
         if !graph_support.is_full_decode() {
             missing.push(format!(

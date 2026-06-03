@@ -1,3 +1,4 @@
+use super::super::types::internal_mtp_accept_drafts_enabled;
 use super::{ModelForward, Phase, Scheduler};
 use crate::model::{InternalMtpDraftRequest, SparseKvDraftView, SpecVerifyRequest};
 use crate::prefix_cache::BlockId;
@@ -891,7 +892,8 @@ fn verify_and_commit_rows<M: ModelForward>(
                 log::warn!(
                     "Internal MTP/EAGLE draft acceptance is disabled by default; \
                      verifier will emit target bonus tokens only. Set \
-                     ARLE_INTERNAL_MTP_ACCEPT_DRAFTS=1 only for parity experiments."
+                     ARLE_INTERNAL_MTP_ACCEPT_DRAFTS=1 only for explicit EAGLE \
+                     acceptance/performance runs after parity gating."
                 );
             }
             result.accepted.clear();
@@ -1001,12 +1003,7 @@ fn internal_mtp_draft_acceptance_disabled<M: ModelForward>(scheduler: &Scheduler
     if scheduler.config.spec_draft_model != DraftMode::InternalMtp {
         return false;
     }
-    std::env::var("ARLE_INTERNAL_MTP_ACCEPT_DRAFTS")
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            !(value == "1" || value == "true" || value == "yes" || value == "on")
-        })
-        .unwrap_or(true)
+    !internal_mtp_accept_drafts_enabled()
 }
 
 fn spec_debug_tokens_enabled() -> bool {
