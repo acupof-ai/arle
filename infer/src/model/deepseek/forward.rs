@@ -811,6 +811,11 @@ impl ModelForward for DeepseekModel {
                         "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); owner-group token sync NCCL is attached but attention-DP/CP and MoE owner-group collectives are not fully wired"
                     ));
                 }
+                "owner-groups-attn-subgroups-ready" => {
+                    missing.push(format!(
+                        "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); owner-group token sync and attention-DP/CP subgroups are attached, but MoE owner-group collectives plus graph capture/replay are not fully wired"
+                    ));
+                }
                 _ => {
                     missing.push(format!(
                         "DSv4 LayerCommunicator is {communicator_layout} ({communicator_axes}); owner-group axes are declared but attention-DP/CP token-sync collectives are not wired"
