@@ -36,6 +36,78 @@ impl Default for EngineLoadConfig {
     }
 }
 
+/// Which CUDA forward a checkpoint needs, classified from its `config.json`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaModelKind {
+    /// Dense Qwen3 (BF16).
+    Qwen3Dense,
+    /// Qwen3.5 / 3.6 MoE (BF16).
+    Qwen3Moe,
+    /// DeepSeek-V4-Flash (multi-GPU only).
+    Dsv4,
+}
+
+/// Pure classification of a parsed `config.json`: DeepSeek-V4 by
+/// `model_type`/`architectures`, else MoE if an expert count or `*Moe*`
+/// architecture is present, else dense Qwen3. Kept dependency-light + testable.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
+    let model_type = v.get("model_type").and_then(|x| x.as_str()).unwrap_or("");
+    let arch_contains = |needle: &str| {
+        v.get("architectures")
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|s| s.as_str().is_some_and(|s| s.contains(needle)))
+            })
+    };
+    if model_type == "deepseek_v4" || arch_contains("DeepseekV4") {
+        return CudaModelKind::Dsv4;
+    }
+    let expert_count = |key: &str| v.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
+    let is_moe = arch_contains("Moe")
+        || expert_count("num_experts") > 0
+        || expert_count("n_routed_experts") > 0;
+    if is_moe {
+        CudaModelKind::Qwen3Moe
+    } else {
+        CudaModelKind::Qwen3Dense
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::{CudaModelKind, classify_cuda_model};
+    use serde_json::json;
+
+    #[test]
+    fn classifies_cuda_checkpoints_from_config() {
+        assert_eq!(
+            classify_cuda_model(
+                &json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"})
+            ),
+            CudaModelKind::Qwen3Dense
+        );
+        assert_eq!(
+            classify_cuda_model(&json!({"architectures": ["Qwen3MoeForCausalLM"]})),
+            CudaModelKind::Qwen3Moe
+        );
+        assert_eq!(
+            classify_cuda_model(&json!({"model_type": "qwen3", "num_experts": 128})),
+            CudaModelKind::Qwen3Moe
+        );
+        assert_eq!(
+            classify_cuda_model(
+                &json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"})
+            ),
+            CudaModelKind::Dsv4
+        );
+        // Unknown / minimal config falls back to dense Qwen3.
+        assert_eq!(classify_cuda_model(&json!({})), CudaModelKind::Qwen3Dense);
+    }
+}
+
 #[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
 mod backend {
     use anyhow::Result;
@@ -43,6 +115,8 @@ mod backend {
     use infer_server::ServeHandle;
     use tokio::sync::mpsc::UnboundedSender;
 
+    #[cfg(feature = "cuda")]
+    use super::CudaModelKind;
     use super::EngineLoadConfig;
     use crate::serve_engine::ServeInferenceEngine;
     use crate::types::{
@@ -161,13 +235,14 @@ mod backend {
         ) -> Result<Self> {
             use infer_server::OpenAiTokenizer;
 
-            // GAP: structurally wired (same shape as Metal, typechecks) but NOT
-            // runnable — the executor builder needs a device + the real forward,
-            // so `spawn_with_engine_builder` errors at load. Tokenizer resolves
-            // from the local model dir; `enable_cuda_graph` is reserved.
+            // Single-GPU CUDA load: dispatch by checkpoint kind from config.json.
+            // Qwen3 dense + Qwen3.5/3.6 MoE run here; DSv4 is multi-GPU only and
+            // errors with a pointer to the launcher. `enable_cuda_graph` is honored
+            // via the runtime env (INFER_CUDA_DECODE_GRAPH), reserved here.
             let _ = enable_cuda_graph;
             let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
             let model_id = crate::serve_engine::model_id_from_path(model_path);
+            let kind = detect_cuda_model_kind(model_path)?;
 
             let model_source = model_path.to_string();
             let scheduler = config.scheduler_config();
@@ -175,11 +250,22 @@ mod backend {
             let total_pages = config.total_pages;
             let page_size = config.page_size;
             let serve = ServeHandle::spawn_with_engine_builder(move || {
-                let executor = CudaExecutor::from_qwen3_bf16_safetensors(
-                    &model_source,
-                    num_slots,
-                    total_pages,
-                )?;
+                let executor = match kind {
+                    CudaModelKind::Qwen3Dense => CudaExecutor::from_qwen3_bf16_safetensors(
+                        &model_source,
+                        num_slots,
+                        total_pages,
+                    )?,
+                    CudaModelKind::Qwen3Moe => CudaExecutor::from_qwen35_moe_safetensors(
+                        &model_source,
+                        num_slots,
+                        total_pages,
+                    )?,
+                    CudaModelKind::Dsv4 => anyhow::bail!(
+                        "DSv4 is multi-GPU only (TP=8/EP=8); launch via \
+                         scripts/dsv4_multigpu_parity.sh, not the single-process loader"
+                    ),
+                };
                 let kv = CudaKvPool::new(num_slots, total_pages, page_size);
                 Ok(infer_core::Engine::with_config(executor, kv, scheduler))
             })?;
@@ -203,6 +289,17 @@ mod backend {
                 model_id, tokenizer, serve,
             )))
         }
+    }
+
+    /// Read a CUDA checkpoint's `config.json` and classify it for `load_cuda`.
+    #[cfg(feature = "cuda")]
+    fn detect_cuda_model_kind(model_path: &str) -> Result<super::CudaModelKind> {
+        use anyhow::Context;
+        let cfg_path = std::path::Path::new(model_path).join("config.json");
+        let raw = std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("read {}", cfg_path.display()))?;
+        let v: serde_json::Value = serde_json::from_str(&raw).context("parse config.json")?;
+        Ok(super::classify_cuda_model(&v))
     }
 
     impl InferenceEngine for LoadedInferenceEngine {
