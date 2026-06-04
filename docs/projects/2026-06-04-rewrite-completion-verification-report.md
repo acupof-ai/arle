@@ -66,18 +66,28 @@ infer-topo 42, infer-moe 17, qwen35-spec 30 — all green.
 
 ## 3. Backend verification detail
 
-### Metal (verified)
+### Metal (verified — incl. canonical MoE)
 Continuous-batch decode via the MLX bridge with variable-length packed decode;
 Qwen3.5 forward + greedy parity landed (#1/#2), prefix reuse + chunked prefill (#8).
-Canonical production target Qwen3.6-35B-A3B-4bit per the backend matrix.
+**Canonical Qwen3.6-35B-A3B-4bit MoE verified end-to-end on the rewrite Metal path
+(2026-06-04)**: 3-turn agent workflow, ~48 tok/s steady-state decode (turns 1-2),
+prefix reuse ttft 6→3 ticks, peak RSS 19.5 GB —
+`wins/2026-06-04-metal-qwen36-canonical-moe-verify.md`. Dense 0.8B re-verify: 132.8 tok/s.
 
-### V100 (build + CPU-test node only)
-Tesla V100-SXM2-32GB, sm_70, CUDA 11.8. GPU-free workspace suite **64/0 green** on a
-real Linux CUDA toolchain (independent of this Mac). All native CUDA-C kernel
-families compile clean for sm_70 (no CUDA-11.8 API gap). **Cannot** run the GPU
-forward: FlashMLA is sm_80+ hardcoded and TileLang's BF16 paged attention needs
-sm_80+ (`cp.async`/WGMMA). Role: second build matrix point + CPU-test verifier.
-Follow-up nicety: auto-disable FlashMLA when `sm_targets` is Volta.
+### V100 (build + CPU-test node only — rewrite GPU forward BLOCKED on sm_70)
+Tesla V100-SXM2-32GB, sm_70, CUDA 12.4. GPU-free workspace suite **64/0 green** on a
+real Linux CUDA toolchain (independent of this Mac). **Cannot run the rewrite GPU
+forward.** A 2026-06-04 bring-up attempt (Qwen3.5-4B HYBRID) got the build through
+cuda-kernels C compilation into TileLang AOT, then HARD-blocked: the rewrite's
+TileLang paged-attention kernels fail TVM `LayoutInference` on sm_70 (`m_new` vs
+`scale_i` GemmFMA-fallback online-softmax rescale conflict) on **all** relevant
+shapes — HD128 q32/kv8 AND the HD256 q16/kv4 the model needs. The current TileLang
+attn kernels (post-`1d6b7836`) have **never** built on Volta; the older V100 Qwen3.5
+wins predate that migration. FlashMLA also needs `ARLE_CUDA_DISABLE_FLASHMLA=1` on
+sm_70. Full detail + recovered build env: `errors/2026-06-04-v100-sm70-tilelang-layoutinference-block.md`.
+**Decision:** sm_70 is a deferred legacy tier; Qwen3.5 hybrid parity is redirected
+to H20/sm_90 (`agent-bench cuda_qwen35_greedy_parity`). Fixing sm_70 = a
+`crates/cuda-kernels` TileLang LayoutInference fix (or a TileLang bump).
 
 ### CUDA (Phase 0 — see §4)
 
