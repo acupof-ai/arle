@@ -58,6 +58,22 @@ pub trait BackendExecutor {
     fn model_stop_token_ids(&self) -> Vec<u32> {
         Vec::new()
     }
+
+    /// Move the model's device weights to host RAM and free the VRAM (OPD teacher
+    /// time-share), returning the device bytes freed. The default is a no-op
+    /// (returns 0) so backends that do not support weight offload are unaffected.
+    /// After a successful offload the executor must NOT run a forward step until
+    /// [`BackendExecutor::reload_weights`].
+    fn offload_weights(&mut self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    /// Restore the model's device weights from the host snapshot (OPD teacher
+    /// time-share). The default is a no-op so non-offloading backends are
+    /// unaffected; idempotent if no offload is pending.
+    fn reload_weights(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Verdict returned by the resource governor at the admission boundary.

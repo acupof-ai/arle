@@ -23,9 +23,7 @@ use anyhow::{Result, anyhow, bail};
 #[cfg(feature = "cuda")]
 use autograd::{Backend, TensorId, TensorStore};
 #[cfg(feature = "cuda")]
-use infer::server_engine::{
-    LoadedInferenceEngine, StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate,
-};
+use infer_api::{LoadedInferenceEngine, StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 
 #[cfg(feature = "cuda")]
 use crate::lora::LoraConfig;

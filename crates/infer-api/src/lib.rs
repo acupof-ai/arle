@@ -37,6 +37,13 @@ pub use loaded::EngineLoadConfig;
 #[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
 pub use loaded::LoadedInferenceEngine;
 pub use serve_engine::ServeInferenceEngine;
+// Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
+// so consumers see them at the `infer-api` surface (mirrors the legacy
+// `infer::server_engine::StudentLora*` path the `train` crate couples to).
+#[cfg(feature = "cuda")]
+pub use infer_cuda::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
+#[cfg(feature = "cuda")]
+pub use types::RawLogits;
 pub use types::{
     CompletionOutput, CompletionRequest, CompletionStreamDelta, CompletionStreamError,
     EngineTelemetry, FinishReason, InferenceEngine, PrefillPathStats, SamplingParams, SessionId,

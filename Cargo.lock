@@ -1865,6 +1865,8 @@ name = "infer-api"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "cuda-kernels",
+ "cudarc",
  "fastrace",
  "infer-core",
  "infer-cuda",
@@ -4183,7 +4185,7 @@ dependencies = [
  "deepseek-spec",
  "half",
  "hf-hub",
- "infer",
+ "infer-api",
  "memmap2",
  "opentelemetry",
  "opentelemetry-otlp",
