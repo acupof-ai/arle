@@ -1556,9 +1556,11 @@ __global__ void dsv4_csa_select_kernel(
     int ratio,
     int topk,
     float score_scale,
-    int start_pos) {
+    int start_pos,
+    const int *__restrict__ start_pos_ptr) {
   int token = blockIdx.x;
   if (token >= num_tokens) return;
+  start_pos = dsv4_graph_start_pos(start_pos, start_pos_ptr);
   int abs_pos = start_pos + token;
   // Causal compressed-block count must match the CPU reference exactly:
   // reference.rs gates `block < t / ratio` (block fully before the query in
@@ -1705,6 +1707,33 @@ extern "C" CUresult dsv4_csa_select_cuda(
   if (num_tokens == 0) return CUDA_SUCCESS;
   dsv4_csa_select_kernel<<<num_tokens, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
       q, weights, keys, selected, num_tokens, q_width, local_heads, index_dim,
-      key_count, ratio, topk, score_scale, start_pos);
+      key_count, ratio, topk, score_scale, start_pos, nullptr);
+  return (CUresult)cudaGetLastError();
+}
+
+extern "C" CUresult dsv4_csa_select_start_pos_ptr_cuda(
+    const uint16_t *q,
+    const uint16_t *weights,
+    const uint16_t *keys,
+    int32_t *selected,
+    int num_tokens,
+    int q_width,
+    int local_heads,
+    int index_dim,
+    int key_count,
+    int ratio,
+    int topk,
+    float score_scale,
+    const int *start_pos,
+    CUstream stream) {
+  if (num_tokens < 0 || q_width <= 0 || local_heads <= 0 || index_dim <= 0 ||
+      key_count < 0 || ratio <= 0 || topk <= 0 || topk > DSV4_CSA_MAX_TOPK ||
+      start_pos == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (num_tokens == 0) return CUDA_SUCCESS;
+  dsv4_csa_select_kernel<<<num_tokens, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
+      q, weights, keys, selected, num_tokens, q_width, local_heads, index_dim,
+      key_count, ratio, topk, score_scale, 0, start_pos);
   return (CUresult)cudaGetLastError();
 }
