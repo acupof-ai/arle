@@ -64,8 +64,7 @@ jobs:
           restore-keys: macos-arm64-cargo-
 
       - name: cargo check (Metal infer lib)
-        working-directory: infer
-        run: cargo check --no-default-features --features metal,no-cuda --lib
+        run: cargo check -p infer-api --no-default-features --features metal,no-cuda --lib
 
       - name: cargo check (Metal CLI surface)
         run: cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
@@ -110,8 +109,7 @@ jobs:
 
       # Keep Rust CI focused on the infer library's CPU-only surface.
       - name: cargo check (CPU-only)
-        working-directory: infer
-        run: cargo check --no-default-features --features no-cuda --lib
+        run: cargo check -p infer-api --no-default-features --features cpu,no-cuda --lib
 
       - name: cargo check (ARLE CPU smoke path)
         run: cargo check -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle
@@ -142,8 +140,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: cargo test (CPU-only)
-        working-directory: infer
-        run: cargo test --no-default-features --features no-cuda --lib
+        run: cargo test -p infer-api --no-default-features --features cpu,no-cuda --lib
 
       - name: cargo test (CLI crate)
         run: cargo test -p cli --release --no-default-features --features no-cuda
@@ -180,8 +177,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: cargo clippy (CPU-only)
-        working-directory: infer
-        run: cargo clippy --no-default-features --features no-cuda --lib -- -D warnings
+        run: cargo clippy -p infer-api --no-default-features --features cpu,no-cuda --lib -- -D warnings
 
       - name: cargo clippy (CLI crate)
         run: cargo clippy -p cli --release --no-default-features --features no-cuda -- -D warnings
