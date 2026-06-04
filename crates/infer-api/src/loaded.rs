@@ -321,9 +321,11 @@ mod backend {
 
             // Single-GPU CUDA load: dispatch by checkpoint kind from config.json.
             // Qwen3 dense + Qwen3.5/3.6 MoE run here; DSv4 is multi-GPU only and
-            // errors with a pointer to the launcher. `enable_cuda_graph` is honored
-            // via the runtime env (INFER_CUDA_DECODE_GRAPH), reserved here.
-            let _ = enable_cuda_graph;
+            // errors with a pointer to the launcher. Wire `enable_cuda_graph` (CLI
+            // `--cuda-graph`/`--no-cuda-graph`, default on) into the decode-graph
+            // default; `INFER_CUDA_DECODE_GRAPH` still overrides at runtime, and
+            // `warmup` gates the graph off under TP (NCCL) and MoE (host routing).
+            infer_cuda::set_decode_graph_default(enable_cuda_graph);
             let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
             let model_id = crate::serve_engine::model_id_from_path(model_path);
             let kind = detect_cuda_model_kind(model_path)?;
