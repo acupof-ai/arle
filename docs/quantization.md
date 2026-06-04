@@ -46,9 +46,12 @@ with concrete evidence.
 ## 1. KV-cache quantization (CUDA-paged)
 
 All four KV formats live in the same Rust enum: see
-`crates/cuda-kernels/src/kv_types.rs::KVFormat`. Dispatch fans out at
-`infer/src/model/qwen3/{prefill,batch_decode}.rs` and the underlying
-CUDA kernels are in `crates/cuda-kernels/csrc/{kv,attention}/`.
+`crates/cuda-kernels/src/kv_types.rs::KVFormat`. The underlying CUDA kernels
+are in `crates/cuda-kernels/csrc/{kv,attention}/`. The Rust runtime dispatch
+that fans these out per request is legacy `infer/`-only and is being re-ported
+below the executor seam into `crates/infer-cuda` (see
+[`support-matrix.md`](support-matrix.md) §0); the kernel-level details below
+describe the `crates/cuda-kernels` surface that survives the rewrite.
 
 ### 1.1 BF16 (reference)
 
@@ -122,8 +125,8 @@ in commit `ba74dd49`:
 
 - 1052 lines deleted across `decode_attention_quantized.cu`, the
   Rust wrappers, FFI, and a smoke test.
-- All dispatch sites in `qwen3/{prefill,batch_decode}.rs` and
-  `qwen35/{prefill,batch_decode}.rs` route exclusively through the
+- All KV dispatch sites in the legacy `infer/` qwen3 / qwen35
+  prefill + batch-decode paths route exclusively through the
   per-channel K kernels.
 - Kept: `quantize_paged_kv_single` and `quantize_paged_kv_fp8`,
   because V still uses per-(row, head) scales (KIVI's asymmetric
@@ -144,9 +147,9 @@ in commit `ba74dd49`:
 - **Decode-attn kernel**:
   `decode_attention_turboquant_*` — fused dequant inline.
 - **Prefill path**: `page_size = 1` triggers the contiguous BF16
-  prefill path (`forward.rs` §1 dispatch at line 446-470, see also
-  `infer/src/scheduler/cuda/prefill.rs::prepare` §537) rather than the
-  HD128 batched paged kernel that BF16/INT8/FP8 use.
+  prefill path (legacy `infer/` qwen3 forward dispatch + the CUDA
+  scheduler `prefill::prepare` path) rather than the HD128 batched
+  paged kernel that BF16/INT8/FP8 use.
 - **Status**: experimental. **As of 2026-05-27, TQ4 is the only KV
   format that produced the HF-reference first token (`151667 = <think>`)
   in the audit on Qwen3-4B chat**; BF16/INT8/FP8 produced token 0
@@ -161,10 +164,11 @@ in commit `ba74dd49`:
 
 ## 2. Weight quantization (CUDA)
 
-All weight formats live in `crates/cuda-kernels/src/tensor.rs::WeightFormat`
-(line 818). Format detection runs at safetensors load
-(`infer/src/model/qwen3/weights.rs`); kernels live in
-`crates/cuda-kernels/csrc/gemm/`.
+All weight formats live in `crates/cuda-kernels/src/tensor.rs::WeightFormat`;
+kernels live in `crates/cuda-kernels/csrc/gemm/`. Format detection at
+safetensors load runs in the CUDA weight loader (`crates/infer-cuda/src/loader.rs`;
+the legacy `infer/` qwen3 weights path is being re-ported there per
+[`support-matrix.md`](support-matrix.md) §0).
 
 | Format | Bits | Scale | Kernel | Status |
 |---|---|---|---|---|
@@ -220,8 +224,10 @@ kernel. Opt-in lossy conversion to MLX-native q4 group64 via
 INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1
 ```
 
-Source: `infer/src/main.rs::parse_kv_cache_mode` (line 2000),
-`kv_mode_candidates` (line 2043), `Args.kv_cache_dtype` (line 240).
+Source: the `--kv-cache-dtype` CLI parser. In the rewrite this moves to the
+serving front door under `crates/cli` / `crates/infer-server`; the legacy
+`infer/` `parse_kv_cache_mode` / `kv_mode_candidates` / `Args.kv_cache_dtype`
+plumbing is being re-ported per [`support-matrix.md`](support-matrix.md) §0.
 
 ---
 
@@ -254,8 +260,8 @@ clean. Neither implies "matches the HF reference on a chat prompt"
 | `kv_precision_parity` TQ4 | Contiguous BF16 prefill (page_size=1 bypass) | `151667 (<think>)` ✓ |
 
 The shared variable across the failing cases is the **TileLang HD128
-batched paged prefill kernel**, dispatched at
-`infer/src/model/qwen3/forward.rs:454` when
+batched paged prefill kernel**, dispatched in the legacy `infer/` qwen3
+forward path when
 `pool.page_size == 16 && self.prefill_uses_paged_pool() && pool.is_active()`.
 TQ4 bypasses by allocating `page_size = 1` and falling through to
 `forward_prefill_batch` (contiguous BF16 prefill).

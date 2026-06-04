@@ -64,6 +64,15 @@ elimination. Historical evidence:
 [`experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md`](experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md),
 `trace-artifacts/2026-05-15-dsv4-deepep/`.
 
+**Rewrite + DSv4/Qwen final verdict (2026-06-04):** the device-neutral `infer-*`
+rewrite is the serving truth (monolithic `infer` deleted); for the consolidated
+verification + performance verdict — Metal + CUDA, TP/EP, FP8 DeepGEMM MoE, DeepEP,
+the honest "DSv4 incremental decode is broken (prefill-only correctness)" correction,
+and the path to SGLang-class decode — see
+[`projects/2026-06-04-qwen35-dsv4-final-report.md`](projects/2026-06-04-qwen35-dsv4-final-report.md)
+and the DSv4 decode perf roadmap
+[`plans/2026-06-04-dsv4-decode-sglang-class-perf.md`](plans/2026-06-04-dsv4-decode-sglang-class-perf.md).
+
 **Qwen3.5 Medusa is not pickup-ready** — recurrent-state accepted-length
 commit/rollback contract is the gate. Active plan:
 [`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md);
@@ -83,7 +92,7 @@ live in this file.
 | Quantization deep map (KV + weights, kernels, status, tests) | [quantization.md](quantization.md) | Canonical for every quant path; support-matrix §4 mirrors a one-glance view. |
 | Stability levels and compatibility posture | [stability-policy.md](stability-policy.md) | Do not redefine tiers elsewhere. |
 | Workspace topology and module entry points | [codebase-map.md](codebase-map.md) | Source of truth for "what exists today". |
-| Architecture ownership and boundaries | [architecture.md](architecture.md) | `infer` owns runtime truth. |
+| Architecture ownership and boundaries | [architecture.md](architecture.md) | The `infer-*` rewrite crates (`infer-core`/`-seam`/`-cuda`/`-metal`/`-server`/`-api`) own runtime truth. |
 | Benchmark and trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) | `guidellm` is the canonical e2e benchmark path. |
 | Canonical e2e bench tool + parameter set | [plans/guidellm-integration.md](plans/guidellm-integration.md) | Wrapper script `scripts/bench_guidellm.sh` uses these params verbatim. |
 | OPD mainline execution queue | [projects/2026-05-24-opd-mainline-task-backlog.md](projects/2026-05-24-opd-mainline-task-backlog.md) | Live CPU/GPU task order, deferred gates, and fdb021c→HEAD artifact ledger. |
@@ -93,9 +102,14 @@ live in this file.
 
 `ARLE` is a runtime-first Rust workspace.
 
-- `infer` is the primary serving/runtime surface.
-- `arle` is the unified local front door for agent, train, eval, and data
-  workflows built on that runtime.
+- The `infer-*` rewrite crates are the primary serving/runtime surface. The
+  monolithic `infer` crate is deleted; the stack is now `infer-plan` (IR) →
+  `infer-seam` (host-only traits) → `infer-core` (Engine/scheduler/RadixCache)
+  → `infer-cuda`/`infer-metal` (executors) → `infer-server`/`infer-api`, with
+  `infer-topo`/`infer-moe`/`infer-util` as shared leaves. `infer-api` is the
+  single front door (`LoadedInferenceEngine`, OPD-teacher surface).
+- `arle` is the unified local front door binary (`arle serve` for HTTP) for
+  agent, train, eval, and data workflows built on that runtime.
 - Train/RL work is strategic because it strengthens the runtime loop; it does
   not create a second equal project identity.
 
@@ -106,6 +120,7 @@ marked as the current source of truth, treat it as historical context.
 
 | Path | Status | Use this when |
 | --- | --- | --- |
+| [projects/2026-06-04-qwen35-dsv4-final-report.md](projects/2026-06-04-qwen35-dsv4-final-report.md) | Active — rewrite verification + perf | The question is the post-rewrite (`infer-*` crates, branch `arch/ideal-inference-engine`) verification & performance verdict across Metal + CUDA, TP/EP, FP8 DeepGEMM MoE, DeepEP — including the honest DSv4 incremental-decode-broken correction and the SGLang-class perf push. Companion detail: [projects/2026-06-04-rewrite-completion-verification-report.md](projects/2026-06-04-rewrite-completion-verification-report.md). |
 | [projects/2026-05-24-opd-mainline-task-backlog.md](projects/2026-05-24-opd-mainline-task-backlog.md) | Active — live queue | The question is the current OPD mainline task order, CPU-only shipped work, GPU-deferred gates, or session artifact ledger. |
 | [projects/2026-05-18-opd-only-pivot.md](projects/2026-05-18-opd-only-pivot.md) | Active — product boundary | The question is why training scope is OPD-only and why scratch pretrain/SFT/GRPO/multi-turn surfaces stay deleted. |
 | [projects/2026-05-01-deepseek-v4-readiness.md](projects/2026-05-01-deepseek-v4-readiness.md) | Active — #1 next-model | The question is DeepSeek V4 readiness, the DS0–DS8 gap matrix, and current 8xH20 DeepEP decode hot path. |
@@ -123,6 +138,7 @@ marked as the current source of truth, treat it as historical context.
 
 | Path | Status | Use this when |
 | --- | --- | --- |
+| [plans/2026-06-04-dsv4-decode-sglang-class-perf.md](plans/2026-06-04-dsv4-decode-sglang-class-perf.md) | Active roadmap — gated on decode fix | The question is the DSv4-Flash TP=8/EP=8 decode path to SGLang-class 5–6 ms/token: on-device MoE routing (kill per-layer H2D/D2H), DeepEP low-latency decode mode, graph-capturable all-reduce, full decode-graph capture. Sequenced behind the incremental-decode correctness fix (#23). |
 | [plans/2026-05-27-flashinfer-paged-prefill-migration.md](plans/2026-05-27-flashinfer-paged-prefill-migration.md) | Active design | The question is whether/how to drop TileLang HD128 paged prefill for FlashInfer on sm_80. Driven by two TileLang 0.1.10 regressions in one week. |
 | [plans/2026-06-02-metal-mtp-sglang-alignment.md](plans/2026-06-02-metal-mtp-sglang-alignment.md) | Active control plan | The question is Metal Qwen3.6 MTP after the SGLang survey: frozen-KV invariants, parity-first gates, packed verify order, why MTP remains opt-in, or the bottom-level acceptance compute note at [research/2026-06-02-metal-mtp-acceptance-compute.md](research/2026-06-02-metal-mtp-acceptance-compute.md). |
 | [plans/2026-05-24-sglang-pipeline-cuda-mlx-gap-analysis.md](plans/2026-05-24-sglang-pipeline-cuda-mlx-gap-analysis.md) | Active — OPD/runtime gap queue | The question is G1–G7 license-or-kill work, SGLang parity gaps, or GPU/Metal-deferred runtime experiments. |
@@ -199,7 +215,7 @@ brings them back.
 | [projects/2026-04-29-throughput-gap-analysis.md](projects/2026-04-29-throughput-gap-analysis.md) | "Why we're 28% behind SGLang at c=16" snapshot; cited by the longctx project. |
 | [projects/2026-04-30-arle-vs-sglang-admission.md](projects/2026-04-30-arle-vs-sglang-admission.md) | Admission policy gap matrix; sibling to active SGLang admission research note. |
 | [projects/2026-05-02-tilekernels-integration-decision.md](projects/2026-05-02-tilekernels-integration-decision.md) | Decision record (don't-submodule, port-selectively) for `cklxx/TileKernels`; referenced from the multi-backend plan. |
-| [projects/2026-05-07-eli-arle-native-provider-design.md](projects/2026-05-07-eli-arle-native-provider-design.md) | Layer-2 nexil ↔ arle native-provider design; shipped 2026-05-07 (`http_server/openai_v1.rs` session_id forwarding). Kept as post-implementation reference. |
+| [projects/2026-05-07-eli-arle-native-provider-design.md](projects/2026-05-07-eli-arle-native-provider-design.md) | Layer-2 nexil ↔ arle native-provider design; shipped 2026-05-07 (`session_id` forwarding, now in `infer-api` + `infer-server`). Kept as post-implementation reference. |
 
 ## Historical Material
 

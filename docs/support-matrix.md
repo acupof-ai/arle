@@ -6,41 +6,45 @@ It states what the repository currently supports, what is still limited, and
 what validation exists for each area. If something is not listed as supported
 here, do not assume it is supported just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-05-10.
-Sections 1–7 below describe the **legacy `infer/` runtime — the currently
-shipped product.** The new rewrite stack (`crates/infer-*`) has a *separate,
-much narrower* support surface tracked in [§0](#0-rewrite-stack-support-new-crate-graph-not-yet-shipped).
-Project framing lives in [index.md §Current Positioning](index.md#current-positioning).
+State reflected here is based on repository evidence as of 2026-06-04.
+**The device-neutral rewrite (`crates/infer-*`) IS the product** — PR #53 merged
+to `main` 2026-06-04, and the legacy monolithic `infer/` crate is **deleted**.
+Sections 1–7 below were written against the legacy runtime; those capabilities
+are now served by the rewrite, and a per-capability re-verification pass is
+ongoing — read §0 for the **current** new-stack status, and treat any §1–§7
+"Supported" as the *capability intent*, verified on the rewrite only where §0 or
+a dated `wins/` entry says so. Project framing:
+[index.md §Current Positioning](index.md#current-positioning).
 
 ---
 
-## 0. Rewrite-stack support (new crate graph, NOT yet shipped)
+## 0. Rewrite-stack support (the shipped `crates/infer-*` graph)
 
-> **Branch `arch/ideal-inference-engine`. This is the *target* stack built
-> beside legacy `infer/`, pending the R5 cutover. It is NOT the product, and
-> its support surface is far narrower than the legacy matrix in §1–§7.** Do not
-> read a legacy "Supported" as covering the new stack. Source of truth:
-> [`projects/2026-06-03-ideal-inference-engine-architecture.md`](projects/2026-06-03-ideal-inference-engine-architecture.md)
-> §6, [`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md),
-> and the unified bench report
-> [`experience/wins/2026-06-03-rewrite-unified-bench-report.md`](experience/wins/2026-06-03-rewrite-unified-bench-report.md).
+> **Merged to `main` (PR #53, 2026-06-04); legacy `infer/` deleted. This is the
+> product.** The stack is `infer-plan` (IR) → `infer-seam` (host-only traits) →
+> `infer-core` (`Engine<E,K>`) → `infer-cuda` / `infer-metal` (executors) →
+> `infer-server` / `infer-api` (serving front door). Per-capability
+> re-verification on the new stack is ongoing; the rows below are current status.
+> Source of truth:
+> [`projects/2026-06-04-qwen35-dsv4-final-report.md`](projects/2026-06-04-qwen35-dsv4-final-report.md)
+> + [`projects/2026-06-04-rewrite-completion-verification-report.md`](projects/2026-06-04-rewrite-completion-verification-report.md).
 
-| Backend | New-stack status | What is verified | What is NOT in the new stack |
+| Backend | New-stack status | What is verified | Open |
 | --- | --- | --- | --- |
-| Metal (`infer-metal`) | **Verified** | Real MLX Qwen3.5/3.6 forward, **bit-identical greedy parity** vs legacy MetalBackend across 4 configs (Qwen3.5-0.8B single-token / full 16-tok / chunked prefill, and canonical Qwen3.6-35B-A3B-4bit MoE). Benched ~195 tok/s multi-turn, peak RSS ≈444 MiB. | — (this is the most-proven new-stack path) |
-| CUDA (`infer-cuda`) | **In progress** | Clean **BF16 dense Qwen3** forward only. Local typecheck + clippy green. | GPU **greedy parity vs legacy is PENDING-REMOTE** (pod toolchain/network infra, not a code gap — see the bench report's Blocker). |
+| Metal (`infer-metal`) | **Verified** | Real MLX Qwen3.5/3.6 forward, **bit-identical greedy parity** vs legacy across 4 configs (Qwen3.5-0.8B single-token / full 16-tok / chunked prefill, and canonical Qwen3.6-35B-A3B-4bit MoE). Cross-step decode pipeline recovered the perf regression. | c≥2 multi-slot Metal decode (single-row guard); FP8/4-bit Metal MoE quant swap points. |
+| CUDA (`infer-cuda`) | **Verified (prefill) — decode in progress** | Qwen3 dense **16/16** vs HF gold; DSv4-Flash **TP=8/EP=8** (MLA+CSA/HCA+HC+hash+FP8 DeepGEMM MoE) **prefill** matches the bf16 oracle on 8×H20; **DeepGEMM** 16/16; **DeepEP** transport verified; CUDA-graph capture/replay parity. | DSv4 **incremental decode (`start_pos>0`) is broken** (#23); decode-perf + the SGLang-class roadmap (#24/#25) gate on it. |
 
-**New-stack model coverage:** Qwen3.5 / Qwen3.6 on Metal (verified); BF16 dense
-Qwen3 on CUDA (parity in progress). No other family is in the new stack.
+**New-stack model coverage:** Qwen3.5 / Qwen3.6 on Metal (verified); Qwen3 dense +
+DeepSeek-V4-Flash (TP=8/EP=8) on CUDA (prefill verified, decode in progress);
+Qwen3.5/3.6 hybrid on CUDA (parity follow-up).
 
-**Explicitly NOT in the new stack yet (legacy `infer/`-only):** TP / PP / EP /
-DeepEP multi-GPU, DeepGEMM (FP8 grouped GEMM), DSv4 (MLA + FP8/INT8 KV), all
-weight/KV **quantization** paths, tiered KV (T1–T3), speculative decode, and the
-full HTTP/serving surface (the new `infer-server` facade is **in flight**, Metal
-executor wired, CUDA executor not yet wired). Each must be re-ported below the
-executor seam and verified before the cutover — sequenced in the multi-GPU port
-roadmap. Until then those capabilities are available **only** through legacy
-`infer/`, as documented in §1–§7.
+**Now in the new stack (was legacy-only):** TP / EP / DeepEP multi-GPU, DeepGEMM
+(FP8 grouped GEMM), DSv4 (MLA + FP8 KV), and the HTTP/serving surface
+(`infer-server` + `infer-api`, both executors wired). **Still pending re-port /
+verification:** PP (pipeline parallel), the full weight/KV **quantization** Rust
+dispatch, tiered KV (T1–T3), speculative decode (IR hooks only), and DSv4
+incremental decode — tracked in §1–§7 + the active tasks. The capability detail
+in §1–§7 below predates the rewrite; verify against §0 + dated `wins/` entries.
 
 ---
 
@@ -98,7 +102,7 @@ Notes:
 | --- | --- | --- |
 | Qwen3.5 | Supported | Primary supported family. Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B has two measured Metal single-request paths: MLX SafeTensors 4bit step-driver reaches 305.5 tok/s for `1024/256`, while GGUF Q4_K_M exact default is 202.1 tok/s direct and its opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s step-driver on the same `1024/256` profile. RoPE scaling (YARN / Linear / NtkAware) wired through `Qwen35Config::rope_scaling` for long-ctx extend (Phase 1+2 closed; Phase 3 bench pending). Metal DFlash is Beta; see §4a for the current validation note. |
 | Qwen3.6 / Qwen3.5-MoE | Beta (Metal), CUDA stub | Metal loads and runs `mlx-community/Qwen3.6-35B-A3B-4bit` locally. A 2026-04-27 M4 Pro short diagnostic confirmed load/execute behavior, but DFlash performance decisions for this family should use long-context / ultra-long-sequence workloads only. CUDA intentionally returns a GPU-required stub for Qwen3.6 MoE. Full Qwen 3.6 serving coverage is the **#2 next-model priority** — see roadmap note below. |
-| DeepSeek V4 | In progress — V4-only substrate + CPU reference smoke | `crates/deepseek-spec` is V4-only for the local `infer/models/dsv4-mini-1B-init` checkpoint. `cpu_serve` has a slow Rust reference path that mmaps the 2.0 GB safetensors and runs a 1-token HTTP completion smoke. CUDA optimized V4 attention/MoE/MTP kernels remain pending, so this is not a serving-performance target yet. The `arle train pretrain-dsv4` command was retired in the 2026-05-18 OPD-only pivot; DSv4 scratch pretrain is not a supported ARLE workflow. **#1 next-model priority for inference.** |
+| DeepSeek V4 | In progress — V4-only substrate + CPU reference smoke | `crates/deepseek-spec` is V4-only for the local `models/dsv4-mini-1B-init` checkpoint. The CPU serving path (`arle serve --backend cpu`) has a slow Rust reference path that mmaps the 2.0 GB safetensors and runs a 1-token HTTP completion smoke. CUDA optimized V4 attention/MoE/MTP kernels remain pending, so this is not a serving-performance target yet. The `arle train pretrain-dsv4` command was retired in the 2026-05-18 OPD-only pivot; DSv4 scratch pretrain is not a supported ARLE workflow. **#1 next-model priority for inference.** |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Not carried | Deleted from the current registry/spec/train surface; reintroduction would require a new explicit project, not a compatibility branch inside DSv4. |
 | Mistral / Mixtral / Gemma / Phi | Planned | Not yet supported. |
@@ -145,8 +149,8 @@ Backend reach:
 
 The KV-reuse architecture that the README calls out (slot-sticky multi-turn
 reuse + radix-backed `T0 GPU → T1 host pinned → T2 NVMe → T3 cluster-shared`).
-Code lives in `infer/src/prefix_cache.rs` (radix tree) and
-`infer/src/kv_tier/` (tiered-KV plumbing); see
+Code lives in `crates/infer-core/src/{prefix,radix}.rs` (radix tree) and the
+`crates/kv-native-sys` persistence substrate (tiered-KV plumbing); see
 [`docs/codebase-map.md`](codebase-map.md) for the per-file map.
 
 | Capability | Status | Notes |
@@ -154,8 +158,8 @@ Code lives in `infer/src/prefix_cache.rs` (radix tree) and
 | Slot-sticky multi-turn KV reuse | Supported (CUDA), Beta (Metal) | Prior-turn KV stays in slot for the next turn so only new user tokens prefill. CUDA is the primary path; Metal Qwen3.5 ships live prefix reuse via replayed compiled-path snapshots (see §1). |
 | Radix-backed prefix cache (T0 GPU) | Supported (CUDA) | Direct GPU-page attach + tail-page CoW on shared prefixes; `RadixNode` carries `hit_count`, `tier_location`, `session_id`, `fingerprint`, `soft_pin_until`, `byte_len`. |
 | T1 host-pinned spillover | Beta (CUDA) | Cold blocks demote from GPU to host pinned memory via `HostPinnedPool` (`kv-native-sys` arena); promote-on-use through `ReadmissionPlan`. |
-| T2 NVMe local-disk transport | Beta (CUDA) | Node-local persistence via `kv_tier/transport/disk.rs` on top of `crates/kv-native-sys` (file/block ABI, mmap, WAL). |
-| T3 cluster-shared backend | Experimental | Minimal `transport/shared_fs.rs` reference backend ships; **NIXL transport remains stub-only** (`nixl-sys` activates the stub feature, no real link). Treat T3 as scaffolding, not a production tier today. |
+| T2 NVMe local-disk transport | Beta (CUDA) | Node-local persistence on top of `crates/kv-native-sys` (file/block ABI, mmap, WAL). The disk transport was legacy `infer/`-only; re-porting below the executor seam is sequenced in the multi-GPU port roadmap (see §0). |
+| T3 cluster-shared backend | Experimental | A minimal shared-FS reference backend shipped in the legacy tree; **NIXL transport remains stub-only** (`nixl-sys` activates the stub feature, no real link). Treat T3 as scaffolding, not a production tier today; not yet re-ported into the rewrite stack (see §0). |
 
 ---
 
@@ -165,7 +169,7 @@ Code lives in `infer/src/prefix_cache.rs` (radix tree) and
 | --- | --- | --- |
 | Metal DFlash (Qwen3.5) | Beta | End-to-end correctness landed 2026-04-17 (commits `4db4fe9`, `439293d`); benchmark before production use. |
 | Metal DFlash (Qwen3.6 / Qwen3.5-MoE) | Beta / diagnostic | Target/draft pairing is wired for `mlx-community/Qwen3.6-35B-A3B-4bit` + `z-lab/Qwen3.6-35B-A3B-DFlash`. Short checks are smoke diagnostics only; future DFlash optimization claims must come from long-context / ultra-long-sequence runs. |
-| CUDA speculative decoding | Not shipped | CUDA plumbing exists (`infer/src/speculative.rs`, `infer/src/speculative/cuda.rs`, `infer/src/scheduler/cuda/spec_path.rs`) for external/self verifier experiments, but no CUDA spec-decode mode is shipped as throughput-positive. Classical/self/external paths are killed or regressed; Qwen3.5 Medusa is blocked on recurrent-state accepted-length rollback. See [`plans/2026-05-01-longctx-spec-decode-phase2.md`](plans/2026-05-01-longctx-spec-decode-phase2.md) and [`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md). |
+| CUDA speculative decoding | Not shipped | CUDA spec-decode plumbing existed in the legacy `infer/` tree for external/self verifier experiments, but no CUDA spec-decode mode shipped as throughput-positive and it has not been re-ported into the rewrite crate graph. Classical/self/external paths are killed or regressed; Qwen3.5 Medusa is blocked on recurrent-state accepted-length rollback. See [`plans/2026-05-01-longctx-spec-decode-phase2.md`](plans/2026-05-01-longctx-spec-decode-phase2.md) and [`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md). |
 
 ---
 
@@ -180,8 +184,8 @@ Code lives in `infer/src/prefix_cache.rs` (radix tree) and
 | SSE streaming | Stable at high level | Intended to remain OpenAI-style; edge behavior may improve. |
 | `/metrics` | Stable | Prometheus endpoint; Metal now reports live queue / latency / MLX memory gauges. |
 | `/v1/stats` | Stable | Human-readable stats endpoint; Metal now reports live queue / latency / MLX memory gauges. |
-| Train-side `/v1/train/status|events|stop|save` | Substrate landed; OPD-CLI wiring pending | Control-plane truth lives in `crates/train/src/server.rs` and survives the 2026-05-18 OPD-only pivot. The per-binary `pretrain --serve` / `train_sft --serve` / `train_grpo --serve` / `train_multi_turn --serve` wiring was retired alongside those binaries. OPD CLI (`arle train opd <dir>`) shipped 2026-05-24 (`14c3be9`) as a one-shot runner without `--serve`; reusing the control plane via `arle train opd --serve` is a separate task not yet licensed. `infer` can still expose the surface as an optional proxy via `--train-control-url`. |
-| Metal runtime memory knobs | Beta | `metal_request`, `metal_bench`, and `metal_serve` expose `--memory-limit-bytes`, `--cache-limit-bytes`, and `--wired-limit-bytes` for MLX allocator control. |
+| Train-side `/v1/train/status|events|stop|save` | Substrate landed; OPD-CLI wiring pending | Control-plane truth lives in `crates/train/src/server.rs` and survives the 2026-05-18 OPD-only pivot. The per-binary `pretrain --serve` / `train_sft --serve` / `train_grpo --serve` / `train_multi_turn --serve` wiring was retired alongside those binaries. OPD CLI (`arle train opd <dir>`) shipped 2026-05-24 (`14c3be9`) as a one-shot runner without `--serve`; reusing the control plane via `arle train opd --serve` is a separate task not yet licensed. The CUDA serving path can still expose the surface as an optional proxy via `--train-control-url`. |
+| Metal runtime memory knobs | Beta | The Metal serving path (`arle serve --backend metal`) exposes `--memory-limit-bytes`, `--cache-limit-bytes`, and `--wired-limit-bytes` for MLX allocator control. |
 | CLI agent slash commands | Beta | Usable and documented, but not yet treated like the HTTP API for compatibility. |
 | `arle serve` front door | Beta | Launches the matching serving binary (`infer`, `metal_serve`, or `cpu_serve`) from the release artifact or PATH. This is a packaging/DX front door over existing server binaries, not a second HTTP implementation. |
 | CLI built-in shell/python tools | Beta | Enabled by default for local trusted agent use. `--no-tools` disables them, and `arle --doctor` reports the detected sandbox backend (`nsjail`, `sandbox-exec`, or `bare`). Do not expose tool-enabled local agent prompts to untrusted users. |
