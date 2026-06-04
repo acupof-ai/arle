@@ -8,8 +8,9 @@ this is the consolidated headline.
 
 ## 1. Verdict
 
-The rewrite is **verified and complete on serving** across Metal + CUDA, TP/EP, and
-the FP8 DeepGEMM MoE path. The Metal decode regression flagged this session was
+The rewrite is **verified and complete on serving** across Metal + CUDA, TP/EP, the
+FP8 DeepGEMM MoE backend, and the DeepEP all-to-all transport — **all five goal axes
+of correctness are now closed** (DeepEP transport verified by moe_out parity + token-1). The Metal decode regression flagged this session was
 root-caused and **recovered to ≈ legacy parity**, now on by default. The one
 deferred item is deleting legacy `infer/`, gated solely on porting train's CUDA
 OPD-teacher surface (scoped, ~3-4 wk — see the deletion-gate doc); `infer/` is
@@ -25,7 +26,7 @@ retained only as a train-only OPD dependency, off every serving path.
 | DSv4 production DeepGEMM FP8-MoE | 8×H20 | **16/16** vs bf16 oracle (routed + shared expert) |
 | TP=8 / EP=8 row-parallel all-reduce | 8×H20 | verified via DSv4 (the model that needs sharding) |
 | CUDA Graph capture/replay | H20 | eager == replay == HF gold (16/16) |
-| DeepEP native dispatch/combine | 8×H20 | **wiring complete; parity run in final verification** |
+| DeepEP native dispatch/combine | 8×H20 | **VERIFIED** — layer-0 `moe_out` parity vs allreduce = bf16 float-order noise (max_abs 0.0039, rms 4.4e-4, all 8 ranks); token-1 `[260]`==`[260]` |
 
 ## 3. Performance
 
@@ -74,7 +75,9 @@ door. No parallel old+new paths; backends are thin plug-ins behind one seam.
 
 ## 5. Remaining
 
-1. **DeepEP parity** — final verification in progress (host-sync bring-up run).
+1. **DeepEP wiring repo-mirror** — transport VERIFIED on H20 (§2); landing Codex's
+   focused wiring diff into the repo (opt-in `ARLE_DSV4_MOE_TRANSPORT=deepep`,
+   all_reduce stays default). Verification is done; only the mirror remains.
 2. **CUDA per-op perf profiling (#16)** — DSv4 / Qwen CUDA throughput + TP scaling
    + compute/comm overlap (SGLang-ref); the perf half of this report.
 3. **`infer/` deletion** — train's CUDA OPD-teacher surface (~3-4 wk, roadmap in
