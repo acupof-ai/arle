@@ -99,18 +99,12 @@ pub(crate) fn load_stacked_quantized(tensors: &TensorMap, base: &str) -> Result<
     })
 }
 
-/// MLP input projections for one dense Qwen3.5 layer. `Split` is a
-/// merge-failed sentinel the C++ builder rejects, so its fields are not read.
-#[allow(dead_code)]
+/// Merged gate+up input projection for one dense Qwen3.5 layer. Dense bf16
+/// weights concat by output rows; quantized weights merge in place.
 pub(crate) enum MlpInputProjection {
-    Split {
-        gate_proj: WeightTensor,
-        up_proj: WeightTensor,
-    },
     MergedQuantized {
         gate_up_proj: WeightTensor,
         gate_dim: i32,
-        up_dim: i32,
     },
 }
 
