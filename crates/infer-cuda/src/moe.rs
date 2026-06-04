@@ -557,10 +557,14 @@ mod dsv4_gpu {
 
         // ── 4. Pack routed tokens grouped-by-local-expert (compact rows). ───────
         let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, total_routes.max(1))?;
+        // Initialize to -1 (the invalid sentinel), NOT 0. The scatter kernel
+        // treats only route_slot < 0 as invalid; zero-init left unfilled compact
+        // rows looking like valid slot-0 rows, which in m=1 decode overwrote
+        // route slot 0 with zero output (DeepGEMM-path divergence, fixed H20).
         let packed_route_slot = ctx
             .stream
-            .alloc_zeros::<i32>(total_routes.max(1))
-            .map_err(|e| anyhow::anyhow!("DSv4 packed_route_slot alloc failed: {e}"))?;
+            .clone_htod(&vec![-1i32; total_routes.max(1)])
+            .map_err(|e| anyhow::anyhow!("DSv4 packed_route_slot H2D failed: {e}"))?;
         let packed_weight = ctx
             .stream
             .alloc_zeros::<f32>(total_routes.max(1))
@@ -708,7 +712,11 @@ mod dsv4_gpu {
 
         // Upper-bound padded capacity per group = total routes (every route could
         // land on one expert). scale_stride_m mirrors legacy TMA-aligned padding.
-        let max_m = packed_hidden.seq_len.max(1);
+        // Floor at 128: DeepGEMM's grouped GEMM small-m tile path diverges below
+        // 128 (m=1 decode flips tight-margin tokens); the >=128 floor matches the
+        // verified production path (H20 TP=8/EP=8 16/16). NOT a block-scale issue
+        // (scale_stride_m=128 alone did not fix it).
+        let max_m = packed_hidden.seq_len.max(128);
         let scale_stride_m = max_m.div_ceil(4) * 4;
         let rows = num_groups * max_m;
         let hidden_scale_cols = hidden_dim.div_ceil(128);
