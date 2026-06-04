@@ -253,6 +253,18 @@ pub struct TurnMetric {
     /// `0` means no token was ever generated for this turn.
     pub ticks_to_first_token: u64,
     pub wall: Duration,
+    /// Wall time attributed to the prefill phase of this turn: the sum of
+    /// `engine.step()` walls from request submit up to and including the step
+    /// that commits the first generated token. This is the turn-local analog of
+    /// `metal_bench`'s `ttft_ms`.
+    pub prefill_wall: Duration,
+    /// Wall time attributed to the decode phase of this turn: the sum of
+    /// `engine.step()` walls after the first generated token is committed. This
+    /// is the turn-local analog of `metal_bench`'s decode window
+    /// (`total_time - ttft`), so `generated / decode_wall` is the rewrite's
+    /// PURE steady decode tok/s — the apples-to-apples comparison to the legacy
+    /// `generation_tps`.
+    pub decode_wall: Duration,
 }
 
 /// Aggregate workflow measurement.
@@ -272,6 +284,33 @@ impl WorkflowMetrics {
     #[must_use]
     pub fn ticks_per_token(&self) -> f64 {
         self.total_ticks as f64 / self.total_generated.max(1) as f64
+    }
+
+    /// Total prefill-phase wall across all turns.
+    #[must_use]
+    pub fn total_prefill_wall(&self) -> Duration {
+        self.turns.iter().map(|t| t.prefill_wall).sum()
+    }
+
+    /// Total decode-phase wall across all turns.
+    #[must_use]
+    pub fn total_decode_wall(&self) -> Duration {
+        self.turns.iter().map(|t| t.decode_wall).sum()
+    }
+
+    /// Turn-wall tok/s: `total_generated / total_wall`. Folds in per-turn
+    /// prefill + scheduler/poll ticks — the confounded framing.
+    #[must_use]
+    pub fn turn_wall_tok_s(&self) -> f64 {
+        self.total_generated as f64 / self.total_wall.as_secs_f64().max(1e-9)
+    }
+
+    /// PURE decode tok/s: `total_generated / total_decode_wall`. The
+    /// apples-to-apples analog of `metal_bench`'s `generation_tps` — excludes
+    /// prefill and the to-first-token window.
+    #[must_use]
+    pub fn pure_decode_tok_s(&self) -> f64 {
+        self.total_generated as f64 / self.total_decode_wall().as_secs_f64().max(1e-9)
     }
 }
 
@@ -436,12 +475,28 @@ where
         let handle = engine.submit_request(prompt, turn.gen_tokens);
         let start = Instant::now();
         let mut ticks = 0u64;
+        // Split per-step wall into prefill vs decode phases. The first generated
+        // token is committed at the *start* of the step following the
+        // first-token-committing plan (see `TtftHandle::note_first_token`), so a
+        // step belongs to the prefill phase iff no first token had been observed
+        // when the step began. Summing per-phase step walls gives the turn-local
+        // analog of `metal_bench`'s ttft / decode windows.
+        let mut prefill_wall = Duration::ZERO;
+        let mut decode_wall = Duration::ZERO;
         while !engine.is_idle() {
             ticks += 1;
             // Attribute this step's submit to `ticks` so the observer can map
             // the first-token-committing plan to a tick.
             ttft.set_tick(ticks);
+            let in_prefill_phase = !ttft.observed();
+            let step_start = Instant::now();
             engine.step()?;
+            let step_wall = step_start.elapsed();
+            if in_prefill_phase {
+                prefill_wall += step_wall;
+            } else {
+                decode_wall += step_wall;
+            }
         }
         let wall = start.elapsed();
         let ticks_to_first_token = ttft.take_first_token_tick();
@@ -465,6 +520,8 @@ where
             ticks,
             ticks_to_first_token,
             wall,
+            prefill_wall,
+            decode_wall,
         });
 
         // One OS-impact sample per turn.
@@ -723,20 +780,33 @@ mod tests {
         let wf = AgentWorkflow::synthetic(256, 3, 32, 48);
         let mut probe = PeakMemProbe::new();
         let m = run_agent_workflow_with_probe(&mut engine, &ttft, &wf, &mut probe)?;
-        let tok_per_s = m.total_generated as f64 / m.total_wall.as_secs_f64();
         eprintln!(
             "[agent-workflow METAL Qwen3.5-0.8B] turns={} total_gen={} total_wall={:?} \
-             tok_per_s={:.1} os_impact={:?}",
+             turn_wall_tok_s={:.1} prefill_wall={:?} decode_wall={:?} PURE_decode_tok_s={:.1} \
+             peak_rss_gb={:.2} os_impact={:?}",
             wf.turns.len(),
             m.total_generated,
             m.total_wall,
-            tok_per_s,
+            m.turn_wall_tok_s(),
+            m.total_prefill_wall(),
+            m.total_decode_wall(),
+            m.pure_decode_tok_s(),
+            m.os_impact.peak_rss_bytes as f64 / (1u64 << 30) as f64,
             m.os_impact
         );
         for t in &m.turns {
+            let turn_decode_tok_s = t.generated as f64 / t.decode_wall.as_secs_f64().max(1e-9);
             eprintln!(
-                "  turn {} prompt_len={} gen={} ttft_ticks={} wall={:?}",
-                t.turn, t.prompt_len, t.generated, t.ticks_to_first_token, t.wall
+                "  turn {} prompt_len={} gen={} ttft_ticks={} wall={:?} \
+                 prefill_wall={:?} decode_wall={:?} decode_tok_s={:.1}",
+                t.turn,
+                t.prompt_len,
+                t.generated,
+                t.ticks_to_first_token,
+                t.wall,
+                t.prefill_wall,
+                t.decode_wall,
+                turn_decode_tok_s,
             );
         }
         assert!(m.turns.len() >= 2);
@@ -766,20 +836,33 @@ mod tests {
         let wf = AgentWorkflow::synthetic(256, 3, 32, 48);
         let mut probe = PeakMemProbe::new();
         let m = run_agent_workflow_with_probe(&mut engine, &ttft, &wf, &mut probe)?;
-        let tok_per_s = m.total_generated as f64 / m.total_wall.as_secs_f64();
         eprintln!(
             "[agent-workflow METAL Qwen3.6-35B-A3B-4bit] turns={} total_gen={} \
-             total_wall={:?} tok_per_s={:.1} os_impact={:?}",
+             total_wall={:?} turn_wall_tok_s={:.1} prefill_wall={:?} decode_wall={:?} \
+             PURE_decode_tok_s={:.1} peak_rss_gb={:.2} os_impact={:?}",
             wf.turns.len(),
             m.total_generated,
             m.total_wall,
-            tok_per_s,
+            m.turn_wall_tok_s(),
+            m.total_prefill_wall(),
+            m.total_decode_wall(),
+            m.pure_decode_tok_s(),
+            m.os_impact.peak_rss_bytes as f64 / (1u64 << 30) as f64,
             m.os_impact
         );
         for t in &m.turns {
+            let turn_decode_tok_s = t.generated as f64 / t.decode_wall.as_secs_f64().max(1e-9);
             eprintln!(
-                "  turn {} prompt_len={} gen={} ttft_ticks={} wall={:?}",
-                t.turn, t.prompt_len, t.generated, t.ticks_to_first_token, t.wall
+                "  turn {} prompt_len={} gen={} ttft_ticks={} wall={:?} \
+                 prefill_wall={:?} decode_wall={:?} decode_tok_s={:.1}",
+                t.turn,
+                t.prompt_len,
+                t.generated,
+                t.ticks_to_first_token,
+                t.wall,
+                t.prefill_wall,
+                t.decode_wall,
+                turn_decode_tok_s,
             );
         }
         assert!(m.turns.len() >= 2);
