@@ -47,14 +47,30 @@ need dedicated pod benches not yet run — the GPU time this session went to clo
 correctness (sink-offset, DeepGEMM small-m, DeepEP wiring). FP8 MoE is verified on
 both the native-grouped bypass and the production DeepGEMM backend.
 
-## 4. Architecture
+## 4. Architecture (elegant / clean / extensible — substantiated)
 
 Device-neutral rewrite: `infer-plan` (IR) → `infer-seam` (host-only traits) →
 `infer-core` (Engine/scheduler/RadixCache) → `infer-cuda`/`infer-metal` (executors) →
-`infer-server`/`infer-api`. This session: extracted `infer-util` (hf_hub/logging leaf
-crate), deleted the speculative `infer-models` crate + 3 orphaned seam traits,
-migrated `agent` + `cli` off direct `infer`. One canonical engine contract; backends
-are thin plug-ins behind the seam.
+`infer-server`/`infer-api`.
+
+**Extensibility is demonstrated, not asserted.** The same `infer-core::Engine` —
+generic over `infer_seam::{BackendExecutor, KvPool}` — drives **two structurally
+divergent backends today**: the CUDA continuous-batching scheduler (paged KV,
+TileLang/native-CUDA kernels, TP/EP/DeepGEMM/DeepEP) and the Metal MLX runtime
+(MLX bridge, packed varlen decode). Both run as `Engine<E, K>` with the *identical*
+scheduler / RadixCache / chunked-prefill / plan / sampling / streaming / telemetry
+code above the seam (proof: `agent-bench` instantiates `Engine<MetalExecutor,
+MetalKvPool>` and `Engine<CudaExecutor, CudaKvPool>` over one harness). Adding a 3rd
+backend (e.g. ROCm/HIP) is implementing exactly two host-only traits
+(`BackendExecutor` submit/poll + `KvPool`) — the scheduler, cache, IR, server, and
+API are untouched. This is the backend-agnostic-scheduler goal the arch review set:
+no per-backend scheduler rewrite.
+
+**Clean / one canonical flow.** This session converged divergence rather than
+layering adapters: extracted `infer-util` (backend-agnostic hf_hub/logging leaf
+crate), deleted the speculative `infer-models` crate + 3 orphaned seam traits (zero
+impls), migrated `agent` + `cli` off direct `infer` to the single `infer-api` front
+door. No parallel old+new paths; backends are thin plug-ins behind one seam.
 
 ## 5. Remaining
 
