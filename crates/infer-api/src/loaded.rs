@@ -377,6 +377,41 @@ mod backend {
         }
     }
 
+    /// Build the OpenAI v1 axum router for the compiled backend.
+    ///
+    /// Mirrors [`LoadedInferenceEngine::load_with_config`] but returns the bare
+    /// [`axum::Router`] the in-process [`crate::serve_http`] loop binds, rather
+    /// than the [`InferenceEngine`] adapter the agent/OPD callers use. Each arm
+    /// spawns the same [`ServeHandle`] the matching `load_*` method spawns, then
+    /// hands it to [`infer_server::openai_router`] (the Metal arm reuses the
+    /// existing [`infer_server::metal_openai_router_from_model_path`] facade, which
+    /// also resolves the tokenizer via the HF cache).
+    // Each arm is a feature-gated `return` (the tail arm varies by feature set),
+    // so a bare expression would not compile in single-backend builds.
+    #[allow(clippy::needless_return)]
+    pub(crate) fn router_for_backend(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        config: EngineLoadConfig,
+    ) -> Result<axum::Router> {
+        #[cfg(feature = "metal")]
+        {
+            let _ = (enable_cuda_graph, &config);
+            return infer_server::metal_openai_router_from_model_path(model_path);
+        }
+
+        #[cfg(all(not(feature = "metal"), feature = "cuda"))]
+        {
+            return router_cuda(model_path, enable_cuda_graph, &config);
+        }
+
+        #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "cpu"))]
+        {
+            let _ = enable_cuda_graph;
+            return router_cpu(model_path, &config);
+        }
+    }
+
     /// Read a CUDA checkpoint's `config.json` and classify it for `load_cuda`.
     #[cfg(feature = "cuda")]
     fn detect_cuda_model_kind(model_path: &str) -> Result<super::CudaModelKind> {
@@ -386,6 +421,67 @@ mod backend {
             .with_context(|| format!("read {}", cfg_path.display()))?;
         let v: serde_json::Value = serde_json::from_str(&raw).context("parse config.json")?;
         Ok(super::classify_cuda_model(&v))
+    }
+
+    /// Single-GPU CUDA serve router. Spawns the same `ServeHandle` as
+    /// [`LoadedInferenceEngine::load_cuda`] (dispatching by checkpoint kind;
+    /// DSv4 is multi-GPU only and errors), then wraps it in
+    /// [`infer_server::openai_router`].
+    #[cfg(feature = "cuda")]
+    fn router_cuda(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        config: &EngineLoadConfig,
+    ) -> Result<axum::Router> {
+        use infer_server::{OpenAiTokenizer, openai_router};
+
+        infer_cuda::set_decode_graph_default(enable_cuda_graph);
+        let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
+        let model_id = crate::serve_engine::model_id_from_path(model_path);
+        let kind = detect_cuda_model_kind(model_path)?;
+
+        let model_source = model_path.to_string();
+        let scheduler = config.scheduler_config();
+        let num_slots = config.num_slots;
+        let total_pages = config.total_pages;
+        let page_size = config.page_size;
+        let serve = ServeHandle::spawn_with_engine_builder(move || {
+            let executor = match kind {
+                CudaModelKind::Qwen3Dense => CudaExecutor::from_qwen3_bf16_safetensors(
+                    &model_source,
+                    num_slots,
+                    total_pages,
+                )?,
+                CudaModelKind::Qwen3Moe => CudaExecutor::from_qwen35_moe_safetensors(
+                    &model_source,
+                    num_slots,
+                    total_pages,
+                )?,
+                CudaModelKind::Dsv4 => anyhow::bail!(
+                    "DSv4 is multi-GPU only (TP=8/EP=8); launch via \
+                     scripts/dsv4_multigpu_parity.sh, not the single-process loader"
+                ),
+            };
+            let kv = CudaKvPool::new(num_slots, total_pages, page_size);
+            Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+        })?;
+        Ok(openai_router(serve, tokenizer, model_id))
+    }
+
+    /// Portable CPU serve router: the placeholder `MetalExecutor` over the real
+    /// host `MetalKvPool` (no MLX, no CUDA), wrapped in
+    /// [`infer_server::openai_router`]. Mirrors
+    /// [`LoadedInferenceEngine::load_cpu`].
+    #[cfg(all(feature = "cpu", not(feature = "metal")))]
+    fn router_cpu(model_path: &str, config: &EngineLoadConfig) -> Result<axum::Router> {
+        use infer_server::{OpenAiTokenizer, openai_router};
+
+        let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
+        let model_id = crate::serve_engine::model_id_from_path(model_path);
+        let executor = MetalExecutor::new();
+        let kv = MetalKvPool::new(config.num_slots, config.total_pages, config.page_size);
+        let serve = ServeHandle::spawn(executor, kv, config.scheduler_config());
+        Ok(openai_router(serve, tokenizer, model_id))
     }
 
     impl InferenceEngine for LoadedInferenceEngine {
@@ -452,3 +548,5 @@ mod backend {
 
 #[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
 pub use backend::LoadedInferenceEngine;
+#[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
+pub(crate) use backend::router_for_backend;

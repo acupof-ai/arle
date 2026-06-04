@@ -30,12 +30,14 @@
 //!   stays on legacy `infer` until the CUDA path grows an OPD control surface.
 
 mod loaded;
+mod serve;
 mod serve_engine;
 mod types;
 
 pub use loaded::EngineLoadConfig;
 #[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
 pub use loaded::LoadedInferenceEngine;
+pub use serve::{ServeHttpOptions, serve_http};
 pub use serve_engine::ServeInferenceEngine;
 // Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
 // so consumers see them at the `infer-api` surface (mirrors the legacy

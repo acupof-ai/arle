@@ -957,6 +957,10 @@ fn gpu_label(info: &hardware::GpuInfo) -> String {
     }
 }
 
+// cfg arms are additive: in single-backend builds only one `return` is live, so
+// clippy sees it as needless; the `return`s are required so the multi-backend
+// (`cuda` + `metal`) build still compiles. Matches `CompiledBackend::detect`.
+#[allow(clippy::needless_return)]
 fn default_train_backend() -> &'static str {
     #[cfg(feature = "cuda")]
     {

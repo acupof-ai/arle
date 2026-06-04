@@ -13,14 +13,25 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+axum = "0.8"
 fastrace = { version = "0.7.16", features = ["enable"] }
 infer-core = { path = "../infer-core" }
 infer-plan = { path = "../infer-plan", features = ["serde"] }
 infer-seam = { path = "../infer-seam" }
 infer-server = { path = "../infer-server" }
+log = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { version = "1", features = ["sync", "rt"] }
+# `rt-multi-thread` + `net` + `signal` back the in-process `serve_http` server
+# loop (the legacy `infer`/`metal_serve` bins were `#[tokio::main]`; the sync CLI
+# now drives the same axum::serve loop on an owned runtime).
+tokio = { version = "1", features = [
+    "sync",
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "signal",
+] }
 
 infer-metal = { path = "../infer-metal", default-features = false, optional = true }
 infer-cuda = { path = "../infer-cuda", default-features = false, optional = true }

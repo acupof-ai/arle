@@ -362,16 +362,6 @@ pub(crate) enum ServeSpecTypeArg {
     Mtp,
 }
 
-impl ServeSpecTypeArg {
-    pub(crate) fn as_backend_value(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Auto => "auto",
-            Self::Mtp => "mtp",
-        }
-    }
-}
-
 #[derive(Debug, Clone, clap::Args)]
 #[command(
     arg_required_else_help = true,
