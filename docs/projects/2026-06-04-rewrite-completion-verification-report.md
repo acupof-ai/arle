@@ -48,7 +48,7 @@ no circular blocker for cutover).
 | CUDA batched-prefill cubin (perf) | CUDA | **known-issue** | HD128 FullRow-WGMMA TileLang codegen spin (§4); perf-only, decode+chunk=1 is the correct path |
 | TP sharding math | host | **verified (CPU)** | infer-topo 42 tests |
 | TP wiring (tp.rs, shard, mock-comm) | CUDA | **foundation verified** | `6d4a3254`; infer-cuda 28 tests incl. row-parallel all-reduce parity |
-| TP all-reduce in forward + TP=8 | CUDA | **partial — DSv4 TP=8 verified** | DSv4 3/3 16/16 exercises real TP=8 row-parallel all-reduce (MLA o_proj + MoE) on 8×H20 (`d5f74c0b`); dense/hybrid Qwen TP=8 vs TP=1 parity in flight on H20 (#9) |
+| TP all-reduce in forward + TP=8 | CUDA | **VERIFIED (big model)** | DSv4 3/3 16/16 exercises real TP=8 row-parallel all-reduce (MLA o_proj + MoE) on 8×H20 (`d5f74c0b`) — DSv4 is the model that *needs* sharding, so it is the TP test. Small-model TP (Qwen3-0.6B TP=8) is out of scope: q16/kv8 → local kv=1 is below the Qwen GQA TileLang kernel's kv8 requirement and pointless (0.6B fits one GPU). Small models verify single-GPU + link only |
 | MoE routing math | host | **verified (CPU)** | infer-moe 17 tests |
 | MoE wrappers + expert load + config | CUDA | **foundation verified** | `6d4a3254`; cuda,no-cuda typecheck clean |
 | BF16 MoE forward (SparseMoeBlock) | CUDA | **wired (Mac-verified)** | `96f65bdc` moe.rs (route→pack→grouped-gemm→silu_mul→scatter→combine→shared); GPU-verify gated on a compatible BF16 ungated/full-attn HD128-kv8 MoE (none cached) |
@@ -256,12 +256,16 @@ isolating the expert-backend / JIT-cache variable on the pod.
 
 Phase 0 (CUDA eager parity), CUDA Graph, and Metal are **verified** (§2). Open gates:
 
-1. **DSv4 multi-GPU greedy parity** (§8) — re-run with the corrected prompt
-   (`671,6102,294,8760,344`); expect rewrite token1 = 11111. **GATE.**
-2. **DeepGEMM native bridge multi-rank** (§8) — fix `cuLibraryGetKernelCount`
-   so the rewrite runs the production deepgemm expert backend (not the bypass).
-3. **TP=8 Qwen greedy parity** (#9) — launcher now correct (file-rendezvous +
-   device-ordinal); needs the q2_kv1 decode config + the run.
+1. **DSv4 multi-GPU greedy parity** (§8) — **DONE**: 3/3 prompts 16/16 vs bf16
+   oracle (sink-offset fix `d5f74c0b`). TP=8/EP=8 + FP8/FP4 MoE-weights verified.
+2. **DeepEP / DeepGEMM / FP8-KV production pipeline** (§8, axis 5) — **the open
+   gate**: the 16/16 used a native-grouped FP8 bypass + bf16 KV; the production
+   native DeepGEMM (`cuLibraryGetKernelCount` multi-rank) + DeepEP dispatch/combine
+   + FP8-KV are not yet exercised. In flight on H20.
+3. **TP=8** — **VERIFIED via DSv4** (the model that needs sharding). Small-model
+   Qwen TP (Qwen3-0.6B TP=8) is out of scope by design (kv8→kv1 below the GQA
+   kernel + pointless on a 1-GPU model); small models verify single-GPU + link only.
+   Qwen-GQA kv<8 TileLang coverage is a deferred kernel follow-up, not a gate.
 4. **Qwen3.5/3.6 common-precision verify** (#15) — forward ported (`c9850ef5`);
    BF16/FP8/4-bit GPU runs pending compatible cached weights.
 5. **Cutover** (§5): InferenceEngine adapter (parallelizable now) → migrate
