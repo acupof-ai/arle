@@ -215,6 +215,33 @@ impl TpRuntime {
             }
         }
     }
+
+    /// Host-visible all-gather for small byte payloads such as CUDA IPC handles.
+    ///
+    /// Thin TP-level wrapper over the NCCL backend helper. DeepEP boot uses this
+    /// for CUDA IPC handles and device ids after NCCL is initialized.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn all_gather_bytes(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        input: &[u8],
+        per_rank_bytes: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        use anyhow::ensure;
+
+        ensure!(
+            input.len() == per_rank_bytes,
+            "all_gather_bytes input len {} must equal per-rank bytes {per_rank_bytes}",
+            input.len()
+        );
+        if per_rank_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        match &self.comm {
+            TpComm::Single => Ok(input.to_vec()),
+            TpComm::Nccl(backend) => backend.all_gather_bytes(ctx, input, per_rank_bytes),
+        }
+    }
 }
 
 #[cfg(test)]

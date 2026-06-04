@@ -646,6 +646,213 @@ mod dsv4_gpu {
         Ok(())
     }
 
+    #[cfg(feature = "deepep")]
+    pub(crate) fn dsv4_moe_forward_deepep(
+        model: &Dsv4Model,
+        transport: &crate::deepep::DeepEpTransport,
+        layer: &Dsv4MoeLayer,
+        tokens: &[u32],
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        let split = &model.split;
+        let swiglu_limit = model.config.swiglu_limit;
+
+        let num_tokens = hidden.seq_len;
+        let hidden_dim = hidden.hidden_dim;
+        let topk = cfg.top_k;
+        let experts_per_rank = split.experts_per_rank;
+
+        ensure!(
+            tokens.len() == num_tokens,
+            "DSv4 DeepEP token count {} != hidden seq_len {num_tokens}",
+            tokens.len()
+        );
+        ensure!(
+            out.hidden_dim == hidden_dim && out.seq_len == num_tokens,
+            "DSv4 DeepEP out shape {}x{} != hidden {}x{}",
+            out.hidden_dim,
+            out.seq_len,
+            hidden_dim,
+            num_tokens
+        );
+        ensure!(
+            layer.w13.len() == experts_per_rank && layer.w2.len() == experts_per_rank,
+            "DSv4 DeepEP expert cache count mismatch: w13={} w2={} experts_per_rank={}",
+            layer.w13.len(),
+            layer.w2.len(),
+            experts_per_rank
+        );
+        // Local DSv4 MoE is DeepGEMM-only (no scalar/native expert fallback exists
+        // in this tree), so the production path is always the DeepGEMM backend. The
+        // preflight below is the real guard against a build-time stub.
+        moe::dsv4_deepgemm_native_preflight()?;
+
+        // Route exactly like the allreduce path. DeepEP dispatch consumes global
+        // expert ids as i64 and remaps received ids to rank-local expert ids.
+        let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
+        gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
+        ctx.sync()?;
+        let logits_bf16: Vec<bf16> = ctx
+            .stream
+            .clone_dtoh(&logits.data)
+            .map_err(|e| anyhow::anyhow!("DSv4 DeepEP router logits D2H failed: {e}"))?;
+        let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+        let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
+        let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
+        let total_routes = num_tokens * topk;
+        let indices_i64: Vec<i64> = indices_host.iter().map(|&v| i64::from(v)).collect();
+        let topk_idx_i64 = ctx
+            .stream
+            .clone_htod(&indices_i64)
+            .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 H2D failed: {e}"))?;
+        let route_weights = ctx
+            .stream
+            .clone_htod(&weights_host)
+            .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-weight H2D failed: {e}"))?;
+
+        let num_sms = crate::deepep::DeepEpTransport::num_sms()?;
+        let mut scratch =
+            transport.alloc_scratch(ctx, hidden_dim, num_tokens, topk, cfg.num_experts, num_sms)?;
+        let num_recv = transport.dispatch(
+            ctx,
+            &mut scratch,
+            hidden,
+            &topk_idx_i64,
+            &route_weights,
+            cfg.num_experts,
+            topk,
+            num_sms,
+        )?;
+
+        let recv_slots = num_recv.saturating_mul(topk);
+        let local_routed = HiddenStates::zeros(ctx, hidden_dim, scratch.capacity_recv)?;
+        if recv_slots > 0 {
+            // DeepEP gives rank-local expert ids as i64. Convert the valid prefix
+            // to i32 for the existing local count/pack kernels.
+            let recv_i64 = ctx
+                .stream
+                .clone_dtoh(&scratch.recv_topk_idx)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP recv_topk_idx D2H failed: {e}"))?;
+            let mut recv_i32 = vec![0i32; scratch.capacity_recv.saturating_mul(topk)];
+            for (dst, &src) in recv_i32.iter_mut().zip(recv_i64.iter()).take(recv_slots) {
+                *dst = i32::try_from(src).map_err(|_| {
+                    anyhow::anyhow!("DSv4 DeepEP recv expert id {src} overflows i32")
+                })?;
+            }
+            let recv_topk_i32 = ctx
+                .stream
+                .clone_htod(&recv_i32)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP recv_topk_i32 H2D failed: {e}"))?;
+            let counts = ctx
+                .stream
+                .alloc_zeros::<i32>(experts_per_rank)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP local count alloc failed: {e}"))?;
+            let offsets = ctx
+                .stream
+                .alloc_zeros::<i32>(experts_per_rank)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP local offset alloc failed: {e}"))?;
+            let scan_total = ctx
+                .stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP scan-total alloc failed: {e}"))?;
+            unsafe {
+                moe::dsv4_count_local_experts(
+                    cache_ptr(&recv_topk_i32, ctx),
+                    cache_ptr(&counts, ctx),
+                    num_recv,
+                    topk,
+                    0,
+                    experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+                moe::dsv4_exclusive_scan_i32(
+                    cache_ptr(&counts, ctx),
+                    cache_ptr(&offsets, ctx),
+                    cache_ptr(&scan_total, ctx),
+                    experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+
+            let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, recv_slots.max(1))?;
+            let packed_route_slot = ctx
+                .stream
+                .clone_htod(&vec![-1i32; recv_slots.max(1)])
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP packed_route_slot H2D failed: {e}"))?;
+            let packed_weight = ctx
+                .stream
+                .alloc_zeros::<f32>(recv_slots.max(1))
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP packed_weight alloc failed: {e}"))?;
+            let cursors = ctx
+                .stream
+                .alloc_zeros::<i32>(experts_per_rank)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP cursors alloc failed: {e}"))?;
+            unsafe {
+                moe::dsv4_pack_local_experts_with_slots(
+                    cache_ptr(&scratch.recv_x.data, ctx),
+                    cache_ptr(&recv_topk_i32, ctx),
+                    cache_ptr(&scratch.recv_topk_weights, ctx),
+                    cache_ptr(&offsets, ctx),
+                    cache_ptr(&cursors, ctx),
+                    cache_ptr(&packed_hidden.data, ctx),
+                    cache_ptr(&packed_route_slot, ctx),
+                    cache_ptr(&packed_weight, ctx),
+                    num_recv,
+                    hidden_dim,
+                    topk,
+                    0,
+                    experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+
+            let expert_out = deepgemm_grouped_experts(
+                ctx,
+                layer,
+                &packed_hidden,
+                &counts,
+                &offsets,
+                swiglu_limit,
+            )?;
+            let route_out = HiddenStates::zeros(ctx, hidden_dim, recv_slots.max(1))?;
+            unsafe {
+                moe::dsv4_scatter_all_route_slots(
+                    cache_ptr(&expert_out.data, ctx),
+                    cache_ptr(&route_out.data, ctx),
+                    cache_ptr(&packed_route_slot, ctx),
+                    cache_ptr(&packed_weight, ctx),
+                    recv_slots,
+                    hidden_dim,
+                    ctx.stream.cu_stream(),
+                )?;
+                moe::dsv4_combine_route_slot_outputs(
+                    cache_ptr(&route_out.data, ctx),
+                    cache_ptr(&local_routed.data, ctx),
+                    num_recv,
+                    topk,
+                    hidden_dim,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+        }
+
+        transport.combine(
+            ctx,
+            &mut scratch,
+            &local_routed,
+            out,
+            num_recv,
+            num_tokens,
+            topk,
+            num_sms,
+        )?;
+        let _ = total_routes;
+        Ok(())
+    }
+
     pub(crate) fn dsv4_shared_expert_forward(
         ctx: &DeviceContext,
         layer: &Dsv4MoeLayer,
@@ -1059,6 +1266,8 @@ mod dsv4_gpu {
     }
 }
 
+#[cfg(feature = "deepep")]
+pub(crate) use dsv4_gpu::dsv4_moe_forward_deepep;
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{dsv4_moe_forward, dsv4_shared_expert_forward};
