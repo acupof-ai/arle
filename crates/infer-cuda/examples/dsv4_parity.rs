@@ -59,7 +59,8 @@ mod real {
     pub(super) fn run() -> anyhow::Result<()> {
         eprintln!(
             "dsv4_parity is a CUDA harness; rebuild with \
-             --features cuda (parity forward) or --features cuda,nccl (--gen-nccl-id)."
+             --features cuda (single-rank) or --features cuda,nccl (multi-rank \
+             NCCL file-rendezvous via INFER_NCCL_ID_FILE)."
         );
         Ok(())
     }
