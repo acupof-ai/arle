@@ -73,6 +73,7 @@ mod real {
     use infer_cuda::{CudaExecutor, CudaKvPool};
     use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
     use infer_seam::{BackendExecutor, KvPool, PollResult};
+    use std::time::Instant;
 
     /// Default prompt: "The capital of France is" in the **DeepSeek-V4** tokenizer
     /// (vocab 128000). These ids match the captured oracle, whose tokens 3-7 are
@@ -83,6 +84,11 @@ mod real {
     /// being scored on a different prompt than the legacy oracle.)
     const DEFAULT_PROMPT_IDS: &str = "671,6102,294,8760,344";
     const DEFAULT_MAX_NEW: usize = 16;
+
+    unsafe extern "C" {
+        fn cudaProfilerStart() -> i32;
+        fn cudaProfilerStop() -> i32;
+    }
 
     pub(super) fn run() -> Result<()> {
         parity_forward()
@@ -186,8 +192,11 @@ mod real {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        let prompt_head: Vec<u32> = prompt.iter().copied().take(16).collect();
         eprintln!(
-            "[dsv4-parity rank={rank}] model={model_path} prompt={prompt:?} max_new={max_new}"
+            "[dsv4-parity rank={rank}] model={model_path} prompt_len={} \
+             prompt_head={prompt_head:?} max_new={max_new}",
+            prompt.len()
         );
 
         // Multi-rank NCCL bootstrap: file-rendezvous BEFORE building the executor
@@ -199,12 +208,35 @@ mod real {
         // DSv4 owns its MLA KV state inside the forward, so the host pool is only
         // present to satisfy the `submit(.., &mut dyn KvPool)` signature — the
         // DSv4 executor never touches it. A 1-slot/1-page pool is sufficient.
+        let load_t0 = Instant::now();
         let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1)
             .context("from_dsv4_fp8_safetensors failed (build/config?)")?;
+        let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
         let mut kv = CudaKvPool::new(1, 1, 16);
 
         // ── Step 1: full-prefix prefill at start_pos = 0 → the first token.
-        let first = forward_once(&mut exec, &mut kv, prefill_plan(&prompt, 0))?;
+        let chunk1_prompt = matches!(
+            std::env::var("INFER_DSV4_PROMPT_CHUNK1").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        );
+        let profile_prefill = env_flag("INFER_DSV4_PROFILE_PREFILL");
+        if profile_prefill {
+            cuda_profiler_start().context("cudaProfilerStart before DSv4 prefill failed")?;
+        }
+        let prefill_t0 = Instant::now();
+        let first = if chunk1_prompt {
+            let mut first = None;
+            for (idx, &tok) in prompt.iter().enumerate() {
+                first = Some(forward_once(&mut exec, &mut kv, prefill_plan(&[tok], idx))?);
+            }
+            first.expect("prompt is non-empty")
+        } else {
+            forward_once(&mut exec, &mut kv, prefill_plan(&prompt, 0))?
+        };
+        let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
+        if profile_prefill {
+            cuda_profiler_stop().context("cudaProfilerStop after DSv4 prefill failed")?;
+        }
         let mut clean_tokens = vec![first];
         eprintln!("[dsv4-parity rank={rank}] prefill argmax (token #1) = {first}");
 
@@ -212,6 +244,11 @@ mod real {
         // reallocated fresh per call, so this is the gated/unproven path — attempt
         // it, but stop cleanly at the first bail and report how far we reached.
         let mut bail_at: Option<(usize, String)> = None;
+        let profile_decode = env_flag("INFER_DSV4_PROFILE_DECODE");
+        if profile_decode {
+            cuda_profiler_start().context("cudaProfilerStart before DSv4 decode loop failed")?;
+        }
+        let decode_t0 = Instant::now();
         for step in 1..max_new {
             // KV length already materialized = prompt + tokens emitted so far.
             let kv_seq_len = prompt.len() + step - 1;
@@ -224,8 +261,31 @@ mod real {
                 }
             }
         }
+        let decode_ms = decode_t0.elapsed().as_secs_f64() * 1000.0;
+        if profile_decode {
+            cuda_profiler_stop().context("cudaProfilerStop after DSv4 decode loop failed")?;
+        }
 
         println!("clean_tokens={clean_tokens:?}");
+        let decode_steps = clean_tokens.len().saturating_sub(1);
+        if rank == 0 {
+            let decode_tok_s = if decode_ms > 0.0 {
+                (decode_steps as f64) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[dsv4-parity timing rank=0] prompt_tokens={} max_new={} load_ms={:.3} \
+                 prefill_ms={:.3} decode_steps={} decode_ms={:.3} decode_tok_s={:.3}",
+                prompt.len(),
+                max_new,
+                load_ms,
+                prefill_ms,
+                decode_steps,
+                decode_ms,
+                decode_tok_s
+            );
+        }
         match bail_at {
             None => eprintln!(
                 "[dsv4-parity rank={rank}] reached max_new={max_new} \
@@ -242,6 +302,34 @@ mod real {
                 clean_tokens.len() + 1
             ),
         }
+        Ok(())
+    }
+
+    fn env_flag(name: &str) -> bool {
+        matches!(
+            std::env::var(name).as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    }
+
+    fn cuda_profiler_start() -> Result<()> {
+        // SAFETY: CUDA runtime profiler API has process-global side effects only;
+        // called at the single decode-loop boundary in this short-lived harness.
+        let code = unsafe { cudaProfilerStart() };
+        anyhow::ensure!(
+            code == 0,
+            "cudaProfilerStart returned CUDA error code {code}"
+        );
+        Ok(())
+    }
+
+    fn cuda_profiler_stop() -> Result<()> {
+        // SAFETY: pairs with `cuda_profiler_start` above.
+        let code = unsafe { cudaProfilerStop() };
+        anyhow::ensure!(
+            code == 0,
+            "cudaProfilerStop returned CUDA error code {code}"
+        );
         Ok(())
     }
 
