@@ -3,4 +3,4 @@
 tilelang
 
 # HuggingFace Hub: model weight download.
-huggingface_hub==0.36.2
+huggingface_hub==1.17.0

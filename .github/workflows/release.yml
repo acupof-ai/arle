@@ -19,13 +19,13 @@ jobs:
     runs-on: macos-14
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -54,7 +54,7 @@ jobs:
           target/release/arle
 
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-arm64
           path: arle-${{ github.ref_name }}-macos-arm64.tar.gz
@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -82,7 +82,7 @@ jobs:
         run: pip install --no-cache-dir -r requirements-build.txt
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -113,7 +113,7 @@ jobs:
           tar -czf arle-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist .
 
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-x86_64
           path: arle-${{ github.ref_name }}-linux-x86_64.tar.gz
@@ -130,17 +130,17 @@ jobs:
 
     steps:
       - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: macos-arm64
 
       - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: linux-x86_64
 
       - name: Check out repo (for install.sh)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: src
 
@@ -151,17 +151,17 @@ jobs:
         run: sha256sum arle-${{ github.ref_name }}-*.tar.gz > SHA256SUMS.txt
 
       - name: Attest macOS artifact provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: arle-${{ github.ref_name }}-macos-arm64.tar.gz
 
       - name: Attest Linux artifact provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: arle-${{ github.ref_name }}-linux-x86_64.tar.gz
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
@@ -180,7 +180,7 @@ jobs:
     if: ${{ !contains(github.ref_name, '-') }}  # skip pre-releases (e.g. v0.1.0-rc1)
     steps:
       - name: Update Formula/arle.rb in cklxx/homebrew-tap
-        uses: mislav/bump-homebrew-formula-action@v3
+        uses: mislav/bump-homebrew-formula-action@v4
         with:
           formula-name: arle
           formula-path: Formula/arle.rb
