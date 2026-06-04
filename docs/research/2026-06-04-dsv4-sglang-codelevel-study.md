@@ -1,12 +1,16 @@
 # DeepSeek-V4 on SGLang — code-level study & ARLE borrowable map
 
 **Date:** 2026-06-04. **Type:** research (learning + cross-reference, not a wins/bench entry).
-**Mechanism sources (verifiable):**
-- SGLang side: source-read at commit `c048ebd1` (2026-05, upstream main) for the architecture
-  mechanisms, cross-checked against the in-repo HEAD `8980eb82` survey
-  ([`2026-06-04-sglang-operator-selection-dsv4-qwen3moe.md`](2026-06-04-sglang-operator-selection-dsv4-qwen3moe.md))
-  for the overlap/scheduling items.
-- ARLE side: every "ARLE state" cell below is grounded in current source
+**Mechanism sources (verifiable — "code is truth", not analysis prose):**
+- SGLang side: read directly from an upstream checkout at **exactly commit
+  `c048ebd10d61fc5904dc342fd0cb63d273b21afc`** ("`[Hicache]: skip flaky test (#26764)`",
+  2026-05, upstream main) — the same commit the source analysis anchors to. Every code
+  block in the [Appendix](#appendix--code-details-sglang-c048ebd10--arle) is a *real excerpt*
+  at that commit (`sglang@c048ebd10 python/sglang/...`), and every `file:line` SGLang anchor
+  in the matrix was line-verified against that tree, not taken from the prose. Overlap/scheduling
+  items cross-check the in-repo HEAD `8980eb82` survey
+  ([`2026-06-04-sglang-operator-selection-dsv4-qwen3moe.md`](2026-06-04-sglang-operator-selection-dsv4-qwen3moe.md)).
+- ARLE side: every "ARLE state" cell and code block is grounded in current source
   (`crates/deepseek-spec`, `crates/infer-cuda`, `crates/infer-moe`,
   `crates/cuda-kernels`, legacy `infer/src/model/deepseek/`), not inferred from docs.
 
@@ -76,7 +80,8 @@ Status key: ✅ implemented · 🟡 partial / contract-only · ❌ missing · �
 | Output inverse-RoPE (strip position before O-proj) | `deepseek_v4.py#L881` `fused_rope_inplace(..., inverse=True)` | `cuda-kernels/csrc/misc/dsv4_attention.cu` (`arle_dsv4_output_inverse_rope`); fused into SW kernel (`attention.rs:864-866`) | ✅ |
 | Grouped low-rank output proj `wo_a`/`wo_b` (FP8 DeepGEMM einsum, UE8M0) | `deepseek_v4.py#L902,395` | `deepseek-spec/src/v4.rs` `output_projection_shape:273`; O-LoRA in `attention.rs` | ✅ (shape + path) |
 | Compress-layer RoPE base split (`compress_rope_theta` vs `rope_theta`) | `deepseek_v4.py#L271` | `attention.rs:806-811` (Q/SW-K/output = `rope_theta`, no YaRN; compress θ inside `compressor_forward`) | ✅ |
-| 584-byte KV (nope-FP8 448B + rope-BF16 128B + scales), 4-pool layout | `deepseek_v4_memory_pool.py` `#L356,93` | `dsv4.rs` `DSV4_FLASH_KV_BYTES_PER_TOKEN=584:52`, `Dsv4MlaKvArena:55` | ✅ |
+| 584-byte KV (nope-FP8 448B + rope-BF16 128B + scales), 4-pool layout | `deepseek_v4_memory_pool.py` `get_bytes_per_token:93` (`assert ==448+64*2+8`, `:108`) | `dsv4.rs` `DSV4_FLASH_KV_BYTES_PER_TOKEN=584:51`, `Dsv4MlaKvArena::from_config:54` (asserts NoPE=448/RoPE=64) | ✅ layout / ⚖️ FP8 decode gated |
+| FP8-KV *decode* path live (FlashMLA reads FP8 cache directly) | default decode reads FP8 cache | `dsv4.rs:83-104` — FP8 arena `alloc_fp8_arena` is `bail!`-gated; correctness path attends the **bf16 SW ring + bf16 compressed pool** (`dsv4_hybrid_attention_cuda`) until bf16 parity-matches the oracle | 🟡 (deliberate: correctness-first) |
 | Hadamard-before-FP8 on indexer Q/KV (QuaRot) | `indexer.py` `fused_q_indexer_rope_hadamard_quant:578` | `dsv4_attention.cu` indexer Q prep | ✅ (kernel present) |
 | HiSparse host↔device tiering for compressed pages | `hisparse_coordinator.py:42`; `load_cache_to_device_buffer_dsv4_mla` | substrate only: `infer/src/kv_tier/host_pool.rs`, `coordinator/`; **no DSv4 compressed-page path** | 🟡 |
 
@@ -219,6 +224,182 @@ here so a refactor does not regress them:
   *does* model hash routing as a first-class branch (`moe_routing_kind:284`, `gate.tid2eid`
   tensor names, `moe_routes_from_scores` Hash arm). ARLE keeps it wired and config-gated;
   confirm against a real checkpoint `config.json` before assuming any layer is hash-routed.
+
+---
+
+## Appendix — code details: SGLang `c048ebd10` ↔ ARLE
+
+Every SGLang block is a real excerpt at commit `c048ebd10`; every ARLE block is current
+source. Kernels (`csrc/`) are the durable anchors; rewrite-file (`attention.rs`/`dsv4.rs`)
+line numbers drift under concurrent edits so they are paired with symbol names.
+
+### 1. Router scoring — `sqrt(softplus)`
+**SGLang** (`python/sglang/srt/layers/moe/topk.py:856-871`):
+```python
+if scoring_func == "sigmoid":
+    scores = gating_output.sigmoid()
+elif scoring_func == "sqrtsoftplus":
+    scores = torch.nn.functional.softplus(gating_output).sqrt()
+...
+scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+_, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, ...)  # select on score+bias
+topk_weights = scores.gather(1, topk_ids)                          # weight on raw score
+```
+**ARLE** (`crates/cuda-kernels/csrc/moe/dsv4_route.cu:196-203`):
+```cuda
+__device__ __forceinline__ float dsv4_route_score(float logit, int scoring_kind) {
+  if (scoring_kind == DSV4_ROUTE_SIGMOID) return dsv4_route_sigmoid(logit);
+  return sqrtf(dsv4_route_softplus(logit));        // sqrtsoftplus
+}
+```
+ARLE Rust reference mirror: `deepseek-spec/src/v4.rs:305-316` (`router_scores_from_logits`)
+and `:378` (select on `score+bias`, weight on raw `score`). **Identical contract.**
+
+### 2. Compressor — learned online-softmax (the `ape` bias, NOT pooling)
+**SGLang** (`python/sglang/jit_kernel/csrc/deepseek_v4/c4.cuh:181-208`):
+```cuda
+for (int32_t j = 0; j < 8; ++j)
+  score_fp32[j] = cast<float>(score[j][i]) + cast<float>(bias[j][i]);   // bias == ape [8, head_dim]
+... max_value = fmaxf(...);                                             // safe online softmax
+for (int32_t j = 0; j < 8; ++j) {
+  const auto exp_score = expf(score_fp32[j] - max_value);
+  sum_product  += cast<float>(kv[j][i]) * exp_score;
+  sum_exp_value += exp_score;
+}
+result[i] = cast<OutFloat>(sum_product / sum_exp_value);               // Σ softmax(score+ape)·kv
+```
+**ARLE** (`crates/cuda-kernels/csrc/misc/dsv4_attention.cu`, `:815/:865` ape index, `:919` weighted sum):
+```cuda
+float bias = dsv4_attn_bf16_to_f32(ape[(abs_pos % ratio) * width + col]); // learned per-rel-pos bias
+...
+float weight = expf(logit - max_logit);                                  // online softmax, same shape
+```
+The `ape` is a learned per-relative-position bias indexed `abs_pos % ratio` — a *selective*
+summary, not a mean/strided pool. SGLang's `score_bias` is `[8, head_dim]` (= the analysis's `ape`).
+
+### 3. Attention sink — folded into the sparse-MLA softmax denominator
+**SGLang** (`python/sglang/srt/models/deepseek_v4.py:345,877`):
+```python
+self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+... o = self.attn_mqa(..., attn_sink=self.attn_sink, ...)   # passed straight into FlashMLA
+```
+**ARLE** (`crates/cuda-kernels/csrc/misc/dsv4_attention.cu:592,604`):
+```cuda
+float sink = dsv4_attn_bf16_to_f32(attn_sink[sink_offset + head]);
+if (threadIdx.x == 0) local_max = fmaxf(local_max, sink);   // sink competes in the max
+...
+if (threadIdx.x == 0) denom += expf(sink - max_shared);     // and in the denominator
+```
+A per-head learned escape slot in the softmax denom (StreamingLLM idea). When the selected
+512 hold nothing relevant, mass flows to the sink instead of being smeared over noise.
+
+### 4. Output inverse-RoPE — strip position phase before O-proj
+**SGLang** (`python/sglang/srt/models/deepseek_v4.py:881-887`):
+```python
+fused_rope_inplace(o[..., -self.qk_rope_head_dim:], None, self.freqs_cis,
+                   positions=positions, inverse=True)   # un-rotate the rope tail
+```
+**ARLE**: fused into the SW kernel (`dsv4_attention.cu`, "un-rotates the rope tail of" the
+output), exposed as `arle_dsv4_output_inverse_rope` and cited at `attention.rs` SW path
+("attends ... adds the sink, and un-rotates the rope tail"). Dropping this collapses
+long-context output — the documented gotcha.
+
+### 5. MHC — Sinkhorn doubly-stochastic mix + pre/post
+**SGLang** Sinkhorn (`python/sglang/srt/layers/mhc.py:71-85`):
+```python
+T.reduce_sum(comb_frag, row_sum, dim=1)
+comb_frag[j, k] = comb_frag[j, k] / row_sum[j] + eps          # FIRST iter: eps AFTER divide
+T.reduce_sum(comb_frag, col_sum, dim=0)
+comb_frag[j, k] = comb_frag[j, k] / (col_sum[k] + eps)
+for _ in T.serial(sinkhorn_iters - 1):                        # then n-1 standard iters
+    ... comb_frag[j, k] = comb_frag[j, k] / (row_sum[j] + eps)
+    ... comb_frag[j, k] = comb_frag[j, k] / (col_sum[k] + eps)
+```
+SGLang post-mix (`deepseek_v4.py:1110-1114`):
+```python
+return (post.unsqueeze(-1) * x.unsqueeze(1)
+        + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)).type_as(x)
+```
+**ARLE** Sinkhorn (`crates/cuda-kernels/csrc/misc/dsv4_mhc.cu:39-76`):
+```cuda
+__device__ void row_softmax_plus_eps(float *raw, int n, float eps) {  // FIRST iter
+  ... raw[row*n+col] = raw[row*n+col] / denom + eps;                  // eps AFTER divide — matches
+}
+__device__ void row_normalize(float *raw, int n, float eps) { sum = eps; ... raw[...] /= sum; }
+__device__ void column_normalize(float *raw, int n, float eps) { ... }
+```
+ARLE orchestration (`crates/infer-cuda/src/hc.rs:72-141` `gen_mhc_params`, `:145` `hc_pre`):
+```rust
+let mix_dim = (2 + hc_mult) * hc_mult;                 // == 24 for hc_mult=4, == SGLang mix_hc
+dsv4_linear(ctx, &hc.mix_fn, stream, &mut mixes)?;      // project wide stream → mix weights
+ffi::dsv4_mhc_params_cuda(.., pre_ptr, post_ptr, comb_ptr, .., config.hc_eps,
+                          config.hc_sinkhorn_iters, ..) // sinkhorn → pre/post/comb
+```
+The **first-iteration `value/denom + eps` asymmetry** (eps added *after* the divide on the
+very first row pass, standard `/(sum+eps)` thereafter) is present in *both* trees — the
+strongest evidence ARLE's MHC is a faithful port, not an approximation.
+
+### 6. Indexer — relu-scored lightning select
+**SGLang** scoring (`python/sglang/srt/layers/attention/dsv4/indexer.py:87-92`):
+```python
+scores = torch.bmm(kv_values, q_float.transpose(1, 2))
+scores = F.relu(scores)                 # negatives → 0 (reward only positive correlation)
+scores = scores * weight.unsqueeze(1)   # learned per-head weight (weights_proj)
+scores = scores.sum(dim=2) * kv_scales  # sum over 64 heads → per-token relevance scalar
+```
+SGLang fused Q (`indexer.py:584-588`): `fused_q_indexer_rope_hadamard_quant(q, weight, ...)`
+(RoPE → Hadamard → FP8 in one kernel). **ARLE**: `attention.rs` `csa_select:1155` →
+`dsv4_csa_select_cuda` (top-k block selector over the FP8 indexer pool); indexer Q prep in
+`dsv4_attention.cu`. Fixed `k=512` → fixed output buffer → CUDA-graph-safe (same rationale both sides).
+
+### 7. KV layout — 584 B/token, nope-FP8 / rope-BF16
+**SGLang** (`python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py:108`):
+```python
+assert bytes_per_token == 448 + 64 * 2 + 8, (
+    "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 ...")
+```
+**ARLE** (`crates/infer-cuda/src/dsv4.rs:51,69-78`):
+```rust
+const DSV4_FLASH_KV_BYTES_PER_TOKEN: usize = 584;
+ensure!(nope_dim == 448 && rope_dim == 64,
+    "DSv4 MLA KV arena only wires the FlashMLA MODEL1 NoPE=448/RoPE=64 pack (584 B/token) ...");
+```
+Same 448(FP8)+128(BF16)+8(scale) byte budget. **Divergence**: ARLE gates the FP8 *decode*
+(`alloc_fp8_arena` is `bail!`) and runs a bf16 SW-ring + bf16 compressed-pool forward until
+that bf16 path parity-matches the oracle (`dsv4.rs:83-104`) — correctness before the FP8 perf flip.
+
+### 8. Waterfill — shared expert as the 9th routed expert (**ARLE: missing**)
+**SGLang** weight + LCG sample (`python/sglang/srt/layers/moe/deepep_waterfill.py:181-217`):
+```python
+w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0)   # waterline headroom
+w_vec = tl.where(src_rank == r, w_vec, (w_vec * 10) // 11)                # remote ranks ×10/11
+total_w += tl.where(present, w_vec, 0)
+token_seed = token_seed * 1664525 + 1013904223                            # LCG hash
+u = token_seed % total_w
+... pick = (u >= cum) & (u < cum + w_vec); chosen = tl.where(pick, r, chosen)  # cumulative scan
+```
+Expert-id remap + fused slot (`:243`, `:44`):
+```python
+new_id = old_id + (old_id // old_experts_per_rank)   # shift ids to make room for the shared slot
+torch.empty(0, topk + 1, ...)                        # topk 8 → 9 (shared = the +1 slot)
+```
+Skip on small decode batch (`:364,412`): `MIN_BATCH_FOR_BALANCE = 64`.
+**ARLE**: none. Lands as a routing-layer load shaper in `infer-moe/src/route.rs` (target-expert
+set) + fused-shared gating in `infer-cuda/src/moe.rs`; **downstream of DeepEP dispatch being
+served** (port-plan Piece 4) — nothing to balance until then.
+
+### 9. MTP NextN — draft consumes the un-collapsed `[n, 4·d]` stream
+**SGLang** (`python/sglang/srt/models/deepseek_v4_nextn.py:147-154`):
+```python
+hc_flat = forward_batch.spec_info.hidden_states.view(n_tokens * self.hc_mult, d)
+h_proj_hidden_states = self.h_proj(self.hnorm(hc_flat)).view(n_tokens, self.hc_mult, d)  # per-lane
+e_proj_hidden_states = self.e_proj(self.enorm(hidden_states))                            # new embed
+hidden_states = e_proj_hidden_states[:, None, :] + h_proj_hidden_states                  # broadcast → [n,4,d]
+```
+**ARLE**: structure modeled in `deepseek-spec/src/v4.rs` `DeepSeekV4MtpTensorNames`
+(`enorm`/`hnorm`/`e_proj`/`h_proj`/`hc_head`); the 4-lane seed mirrors
+`hc.rs:initial_stream_from_embeddings`. Draft layer forces `compress_ratio=0` (cheapest SW-MQA)
+both sides. Full 4-lane draft consumption is the in-progress piece (🟡, MTP contract wins).
 
 ---
 
