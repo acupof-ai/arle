@@ -1436,6 +1436,18 @@ pub fn reload_raw_slice<T: DeviceRepr>(
 }
 
 impl DeviceMatrix {
+    /// Raw device pointer to the dense BF16 `data` buffer as a `u64`.
+    ///
+    /// Used to build the per-expert weight-pointer table (`*const u64`) the MoE
+    /// grouped-GEMM kernels consume: each entry is one expert's `DeviceMatrix`
+    /// device pointer. Only valid for the dense BF16 path (`data` populated);
+    /// quantized formats store weights in the side buffers, not `data`.
+    pub fn device_ptr(&self, ctx: &DeviceContext) -> u64 {
+        use cudarc::driver::DevicePtr;
+        let (ptr, _sync) = self.data.device_ptr(&ctx.stream);
+        ptr
+    }
+
     /// Move every device weight buffer to host RAM and free the VRAM.
     ///
     /// Returns a [`HostMatrixSnapshot`] the caller holds until reload. The

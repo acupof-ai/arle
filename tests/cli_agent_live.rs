@@ -15,7 +15,7 @@ fn live_model_available() -> bool {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .is_some()
-        || infer::hf_hub::discover_local_model().is_some()
+        || infer_util::hf_hub::discover_local_model().is_some()
 }
 
 fn live_test_guard() -> MutexGuard<'static, ()> {

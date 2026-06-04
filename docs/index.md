@@ -29,7 +29,10 @@ node, 256K/1500, hot GPU-cache hit: TTFT ~0.44 s, TPOT ~4.85 ms, E2E ~7.7 s,
 and output throughput ~196 tok/s. The SGLang-gap campaign now uses
 [`plans/2026-06-01-dsv4-sglang-path-alignment.md`](plans/2026-06-01-dsv4-sglang-path-alignment.md)
 as the controlling plan. A result does not pass until that workload clears
-TTFT, TPOT, E2E, and output throughput together.
+TTFT, TPOT, E2E, and output throughput together. For the mechanism-by-mechanism
+SGLang↔ARLE code-level cross-reference (what V4 does, where ARLE already does it,
+and the borrowable deltas), see
+[`research/2026-06-04-dsv4-sglang-codelevel-study.md`](research/2026-06-04-dsv4-sglang-codelevel-study.md).
 
 Default MoE transport is local routed experts plus EP all-reduce; native DeepEP
 is explicitly blocked on the replicated-token TP/EP route because it

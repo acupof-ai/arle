@@ -39,9 +39,7 @@ mod app {
     };
 
     use autograd::{Backend, Tape, TensorId, TensorStore, backend_cuda::CudaBackend, optim::AdamW};
-    use infer::server_engine::{
-        InferenceEngineOptions, LoadedInferenceEngine, ServerRuntimeConfig,
-    };
+    use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use train::{
         LoraAdapterConfig, LoraConfig, LoraTargetSet,
         infer_student::InferStudent,
@@ -715,24 +713,19 @@ mod app {
         enable_cuda_graph: bool,
     ) -> anyhow::Result<LoadedInferenceEngine> {
         let max_seq_len = max_seq_len.max(128);
-        let mut runtime = ServerRuntimeConfig {
-            engine: InferenceEngineOptions { enable_cuda_graph },
-            max_seq_len: Some(max_seq_len),
-            ..ServerRuntimeConfig::default()
-        };
-        runtime.scheduler.max_slots = 1;
-        runtime.scheduler.chunked_prefill_size = max_seq_len;
-        runtime.scheduler.max_num_batched_tokens = max_seq_len;
-        runtime.scheduler.max_prefill_tokens = max_seq_len;
-        runtime.scheduler.long_prefill_token_threshold = max_seq_len;
-        runtime.scheduler.prefill_max_requests = Some(1);
-        runtime.scheduler.mem_fraction_static = 0.05;
-        runtime.scheduler.kv_pool_fallback_bytes = 128 * 1024 * 1024;
-        LoadedInferenceEngine::load_with_runtime_config(
+        // Single-slot OPD teacher (migrated off the legacy ServerRuntimeConfig
+        // knobs to the rewrite's EngineLoadConfig).
+        let page_size = 16usize;
+        LoadedInferenceEngine::load_with_config(
             model_dir
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?,
-            runtime,
+            enable_cuda_graph,
+            EngineLoadConfig {
+                num_slots: 1,
+                page_size,
+                total_pages: max_seq_len.div_ceil(page_size),
+            },
         )
     }
 

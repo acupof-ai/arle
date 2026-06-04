@@ -712,13 +712,13 @@ fn inspect_resolved_model_dir(model_dir: &Path) -> Result<ModelDirSummary> {
 
 fn resolve_model_dir_allow_download(source: &Path) -> Result<PathBuf> {
     let source_text = source.display().to_string();
-    infer::hf_hub::resolve_model_path(&source_text)
+    infer_util::hf_hub::resolve_model_path(&source_text)
         .with_context(|| format!("resolving model source {source_text}"))
 }
 
 fn resolve_model_dir_local_only(source: &Path) -> Option<PathBuf> {
     let source_text = source.display().to_string();
-    infer::hf_hub::resolve_local_model_path(&source_text)
+    infer_util::hf_hub::resolve_local_model_path(&source_text)
 }
 
 fn resolve_local_tokenizer_path(source: &Path) -> Result<PathBuf> {
@@ -732,7 +732,7 @@ fn resolve_local_tokenizer_path(source: &Path) -> Result<PathBuf> {
         }
     }
     let source_text = source.display().to_string();
-    if let Some(model_dir) = infer::hf_hub::resolve_local_model_path(&source_text) {
+    if let Some(model_dir) = infer_util::hf_hub::resolve_local_model_path(&source_text) {
         let candidate = model_dir.join("tokenizer.json");
         if candidate.is_file() {
             return Ok(candidate);

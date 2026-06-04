@@ -1,0 +1,60 @@
+[package]
+name = "infer-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+cuda-kernels = { path = "../cuda-kernels", default-features = false }
+cudarc = { version = "0.19", features = [
+    "cuda-version-from-build-system",
+    "cublas",
+    "f16",
+], optional = true }
+deepep-sys = { path = "../deepep-sys", optional = true }
+deepseek-spec = { path = "../deepseek-spec", optional = true }
+half = { version = "2.4", features = ["num-traits"], optional = true }
+infer-moe = { path = "../infer-moe" }
+infer-plan = { path = "../infer-plan" }
+infer-seam = { path = "../infer-seam" }
+infer-topo = { path = "../infer-topo" }
+log = "0.4"
+qwen3-spec = { path = "../qwen3-spec", optional = true }
+qwen35-spec = { path = "../qwen35-spec" }
+safetensors = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+cuda = [
+    "dep:cudarc",
+    "dep:half",
+    "dep:qwen3-spec",
+    "dep:deepseek-spec",
+    "dep:safetensors",
+    "dep:serde",
+    "dep:serde_json",
+    "cuda-kernels/cuda",
+]
+no-cuda = ["cuda-kernels/no-cuda"]
+# Multi-rank NCCL collectives for the TP communicator (`tp::TpComm::Nccl`).
+# Implies `cuda`; the real NCCL wiring is H20-gated and lands later — declaring
+# the feature here makes the `cfg(feature = "nccl")` gate in `tp.rs` a known cfg.
+nccl = ["cuda", "cuda-kernels/nccl"]
+# DSv4 expert-parallel DeepEP dispatch/combine (Piece 4). Implies `nccl` (the EP
+# group rides the same NCCL substrate) and pulls the native deepep-sys transport.
+deepep = ["nccl", "dep:deepep-sys", "deepep-sys/deepep"]
+
+# DSv4 TP=8/EP=8 greedy-parity harness + rank-0 NCCL unique_id generator. The
+# parity forward needs `cuda`; the `--gen-nccl-id` mode is additively enabled
+# under `nccl`. Skipped under the default (host-only / no-cuda) build.
+[[example]]
+name = "dsv4_parity"
+path = "examples/dsv4_parity.rs"
+required-features = ["cuda"]
+
+[lints]
+workspace = true

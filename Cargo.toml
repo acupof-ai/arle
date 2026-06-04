@@ -1,14 +1,24 @@
 [workspace]
 members = [
     ".",
-    "infer",
     "crates/agent",
+    "crates/agent-bench",
     "crates/autograd",
     "crates/chat",
     "crates/cli",
     "crates/cuda-kernels",
     "crates/deepep-sys",
     "crates/deepseek-spec",
+    "crates/infer-api",
+    "crates/infer-core",
+    "crates/infer-cuda",
+    "crates/infer-metal",
+    "crates/infer-moe",
+    "crates/infer-plan",
+    "crates/infer-seam",
+    "crates/infer-server",
+    "crates/infer-topo",
+    "crates/infer-util",
     "crates/kv-native-sys",
     "crates/mlx-sys",
     "crates/qwen3-spec",
@@ -83,7 +93,7 @@ cpu = ["cli/cpu"]
 # Metal backend via mlx-sys (Apple Silicon). Pair with `no-cuda`.
 metal = ["cli/metal"]
 # NCCL FFI for multi-GPU collectives. Implies `cuda`.
-# Forwards through `cli` → `infer` → `cuda-kernels`.
+# Forwards through `cli` → `infer-api` → `infer-cuda` → `cuda-kernels`.
 nccl = ["cuda", "cli/nccl"]
 
 [dependencies]
@@ -91,7 +101,7 @@ anyhow = "1.0"
 cli = { path = "crates/cli", default-features = false, optional = true }
 
 [dev-dependencies]
-infer = { path = "infer", default-features = false }
+infer-util = { path = "crates/infer-util" }
 serde_json = { workspace = true }
 
 [[bin]]

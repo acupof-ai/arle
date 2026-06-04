@@ -6,7 +6,7 @@ use std::{
 };
 
 use autograd::{Backend, Tape, TensorStore, backend_cuda::CudaBackend};
-use infer::server_engine::{InferenceEngineOptions, LoadedInferenceEngine, ServerRuntimeConfig};
+use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
 use train::{
     qwen35_loader::load_qwen35_from_hf_dir,
     teacher_infer::{InProcessTeacher, InferTeacher, TeacherForward},
@@ -82,26 +82,19 @@ fn infer_teacher_matches_in_process_on_dominant_logits() -> TestResult {
 }
 
 fn load_infer_engine(model_dir: &Path) -> anyhow::Result<LoadedInferenceEngine> {
-    let mut runtime = ServerRuntimeConfig {
-        engine: InferenceEngineOptions {
-            enable_cuda_graph: false,
-        },
-        max_seq_len: Some(128),
-        ..ServerRuntimeConfig::default()
-    };
-    runtime.scheduler.max_slots = 1;
-    runtime.scheduler.chunked_prefill_size = 128;
-    runtime.scheduler.max_num_batched_tokens = 128;
-    runtime.scheduler.max_prefill_tokens = 128;
-    runtime.scheduler.long_prefill_token_threshold = 128;
-    runtime.scheduler.prefill_max_requests = Some(1);
-    runtime.scheduler.mem_fraction_static = 0.10;
-    runtime.scheduler.kv_pool_fallback_bytes = 128 * 1024 * 1024;
-    LoadedInferenceEngine::load_with_runtime_config(
+    // Single-forward logits-parity check (not serving): one slot, a small KV
+    // budget. (Migrated off the legacy ServerRuntimeConfig knobs to the rewrite's
+    // EngineLoadConfig; 8 pages x 16 = 128 token capacity matches the old 128 cap.)
+    LoadedInferenceEngine::load_with_config(
         model_dir
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?,
-        runtime,
+        false, // enable_cuda_graph
+        EngineLoadConfig {
+            num_slots: 1,
+            total_pages: 8,
+            page_size: 16,
+        },
     )
 }
 

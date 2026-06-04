@@ -7,11 +7,46 @@ what validation exists for each area. If something is not listed as supported
 here, do not assume it is supported just because it compiled locally.
 
 State reflected here is based on repository evidence as of 2026-05-10.
+Sections 1–7 below describe the **legacy `infer/` runtime — the currently
+shipped product.** The new rewrite stack (`crates/infer-*`) has a *separate,
+much narrower* support surface tracked in [§0](#0-rewrite-stack-support-new-crate-graph-not-yet-shipped).
 Project framing lives in [index.md §Current Positioning](index.md#current-positioning).
 
 ---
 
+## 0. Rewrite-stack support (new crate graph, NOT yet shipped)
+
+> **Branch `arch/ideal-inference-engine`. This is the *target* stack built
+> beside legacy `infer/`, pending the R5 cutover. It is NOT the product, and
+> its support surface is far narrower than the legacy matrix in §1–§7.** Do not
+> read a legacy "Supported" as covering the new stack. Source of truth:
+> [`projects/2026-06-03-ideal-inference-engine-architecture.md`](projects/2026-06-03-ideal-inference-engine-architecture.md)
+> §6, [`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md),
+> and the unified bench report
+> [`experience/wins/2026-06-03-rewrite-unified-bench-report.md`](experience/wins/2026-06-03-rewrite-unified-bench-report.md).
+
+| Backend | New-stack status | What is verified | What is NOT in the new stack |
+| --- | --- | --- | --- |
+| Metal (`infer-metal`) | **Verified** | Real MLX Qwen3.5/3.6 forward, **bit-identical greedy parity** vs legacy MetalBackend across 4 configs (Qwen3.5-0.8B single-token / full 16-tok / chunked prefill, and canonical Qwen3.6-35B-A3B-4bit MoE). Benched ~195 tok/s multi-turn, peak RSS ≈444 MiB. | — (this is the most-proven new-stack path) |
+| CUDA (`infer-cuda`) | **In progress** | Clean **BF16 dense Qwen3** forward only. Local typecheck + clippy green. | GPU **greedy parity vs legacy is PENDING-REMOTE** (pod toolchain/network infra, not a code gap — see the bench report's Blocker). |
+
+**New-stack model coverage:** Qwen3.5 / Qwen3.6 on Metal (verified); BF16 dense
+Qwen3 on CUDA (parity in progress). No other family is in the new stack.
+
+**Explicitly NOT in the new stack yet (legacy `infer/`-only):** TP / PP / EP /
+DeepEP multi-GPU, DeepGEMM (FP8 grouped GEMM), DSv4 (MLA + FP8/INT8 KV), all
+weight/KV **quantization** paths, tiered KV (T1–T3), speculative decode, and the
+full HTTP/serving surface (the new `infer-server` facade is **in flight**, Metal
+executor wired, CUDA executor not yet wired). Each must be re-ported below the
+executor seam and verified before the cutover — sequenced in the multi-GPU port
+roadmap. Until then those capabilities are available **only** through legacy
+`infer/`, as documented in §1–§7.
+
+---
+
 ## 1. Runtime Backends
+
+> Legacy `infer/` (shipped product). For the new rewrite stack see [§0](#0-rewrite-stack-support-new-crate-graph-not-yet-shipped).
 
 | Backend | Status | Meaning |
 | --- | --- | --- |

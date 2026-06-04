@@ -1098,6 +1098,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires checkpoint at infer/models/dsv4-mini-1B-init (gitignored dev asset)"]
     fn parses_hf_replica_config() {
         let cfg = replica_config();
         assert_eq!(cfg.model_type, "deepseek_v4");
@@ -1134,6 +1135,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires checkpoint at infer/models/dsv4-mini-1B-init (gitignored dev asset)"]
     fn tensor_names_match_hf_replica_layout() {
         let cfg = replica_config();
         let top = cfg.tensor_names();
@@ -1180,6 +1182,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires checkpoint at infer/models/dsv4-mini-1B-init (gitignored dev asset)"]
     fn shard_policy_handles_dsv4_shapes() {
         let cfg = replica_config();
         let csa = cfg.layer_tensor_names(2);
