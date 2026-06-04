@@ -19,6 +19,39 @@ use crate::{config, mlx, model_source, qwen35, wired_limit};
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
 
+/// Cross-step decode pipelining (env-gated, default OFF).
+///
+/// HEAD decode is strictly submit(N) → poll(N) blocks on `eval` → apply(N) →
+/// submit(N+1): the GPU idles for the host gap between poll(N)'s eval finishing
+/// and submit(N+1) kicking `step_session` again (apply_output + admission +
+/// plan-N+1 build + a fresh `begin_session`). With the flag set the decode
+/// session is held open across steps and `submit_decode` eagerly issues the
+/// NEXT greedy step's `step_session` (async) inside the current submit, so step
+/// N+1's GPU forward overlaps step N's host token materialization — the proven
+/// legacy `pending_sampled` shape, kept one step deep. Single-slot greedy only;
+/// any other plan shape drains and falls back to the HEAD path.
+#[cfg(feature = "metal")]
+fn pipeline_decode_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = std::env::var("INFER_METAL_PIPELINE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        eprintln!("[infer-metal] decode pipeline (INFER_METAL_PIPELINE) = {on}");
+        on
+    })
+}
+
+/// One-shot probe printed the first time the pipeline fast path runs, so a bench
+/// can prove the overlapped path is actually live (not just enabled).
+#[cfg(feature = "metal")]
+fn probe_pipeline_fast_path() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| eprintln!("[infer-metal] pipeline fast path LIVE (overlapped decode)"));
+}
+
 /// In-flight handle for a submitted Metal step.
 pub enum MetalInflight {
     /// CPU placeholder output.
@@ -122,6 +155,7 @@ impl MetalExecutor {
                 slots: HashMap::new(),
                 page_store: MetalPageStore::default(),
                 active_session_slot: None,
+                pending: None,
             }),
         })
     }
@@ -198,6 +232,16 @@ impl BackendExecutor for MetalExecutor {
     }
 }
 
+/// A greedy decode step whose `step_session` was already issued (async) for the
+/// slot's next token inside the previous submit. `submit_decode` returns this on
+/// the following tick without re-running the forward, so the GPU stayed busy
+/// across the host gap. At most one is outstanding; single-slot greedy only.
+#[cfg(feature = "metal")]
+struct PendingStep {
+    slot: usize,
+    sampled: mlx::MlxArray,
+}
+
 #[cfg(feature = "metal")]
 struct RealMetalExecutor {
     config: config::MetalModelConfig,
@@ -205,6 +249,8 @@ struct RealMetalExecutor {
     slots: HashMap<usize, MetalSlotState>,
     page_store: MetalPageStore,
     active_session_slot: Option<usize>,
+    /// Cross-step decode prequeue (see `pipeline_decode_enabled`).
+    pending: Option<PendingStep>,
 }
 
 #[cfg(feature = "metal")]
@@ -274,10 +320,15 @@ impl RealMetalExecutor {
             model.prefill_session(&token_arr, token_values.len() as i32, row.start_pos as i32)?;
         mlx::async_eval(&[&logits]);
         slot.cache_len = row.start_pos + row.tokens.len();
+        slot.committed_len = slot.cache_len;
+        slot.last_sampled = None;
         let position = slot.cache_len as u64;
         slot.drain_session(model)?;
         self.active_session_slot = None;
         self.page_store.publish_slot(slot, kv)?;
+        // A new prefill restarts this slot's token stream; any decode prequeue
+        // from a prior turn is stale.
+        self.pending = None;
 
         Ok(sample_inflight(row.slot, &logits, &row.params, position))
     }
@@ -287,6 +338,37 @@ impl RealMetalExecutor {
         row: &infer_plan::DecodeRow,
         kv: &mut dyn KvPool,
     ) -> anyhow::Result<MetalInflight> {
+        // Pipeline fast path: this step's `step_session` was already issued
+        // (async) inside the previous submit, with the session left open one step
+        // ahead. Drain + publish that now-committed step (valid page ids, correct
+        // gdr), prequeue the next one, and return the already-sampled token —
+        // no forward on the engine's critical poll path. Greedy + single-slot
+        // only. The guard validates the pending against the LIVE slot before
+        // reuse: the slot must still be the SAME live state we prequeued from
+        // (same epoch — not recycled by `finish_slot` into a different request),
+        // its session must still be open, and the engine's committed length must
+        // match ours. An exact prefix-cache hit can admit a NEW request straight
+        // into `Decoding` on a recycled slot index, which would otherwise return
+        // the prior request's stale token; these checks send that case to the
+        // cold path (which resets the slot and drops the stale pending).
+        if pipeline_decode_enabled()
+            && row.params.is_greedy()
+            && self.pending_matches_live_slot(row, kv)
+        {
+            probe_pipeline_fast_path();
+            let ready = self.pending.take().expect("pending checked above");
+            self.commit_pending_then_prequeue(row, kv)?;
+            return Ok(MetalInflight::Sampled {
+                slot: ready.slot,
+                sampled: ready.sampled,
+            });
+        }
+        // A pending that did not pass the live-slot guard is stale (slot
+        // recycled, length drift, …); drop it before the cold path rebuilds.
+        if self.pending.as_ref().is_some_and(|p| p.slot == row.slot) {
+            self.pending = None;
+        }
+
         self.ensure_no_other_active_session(row.slot)?;
         self.reset_slot_if_epoch_changed(row.slot, kv)?;
         let model = self.weights.cpp_model()?;
@@ -311,10 +393,11 @@ impl RealMetalExecutor {
             .get_mut(&row.slot)
             .ok_or_else(|| anyhow::anyhow!("decode for slot {} before prefill", row.slot))?;
         anyhow::ensure!(
-            row.kv_seq_len == slot.cache_len,
-            "decode kv_seq_len mismatch for slot {}: plan={}, metal_state={}",
+            row.kv_seq_len == slot.committed_len && slot.committed_len == slot.cache_len,
+            "decode kv_seq_len mismatch for slot {}: plan={}, committed={}, metal_state={}",
             row.slot,
             row.kv_seq_len,
+            slot.committed_len,
             slot.cache_len
         );
         slot.ensure_session_active(model)?;
@@ -323,12 +406,125 @@ impl RealMetalExecutor {
         let logits = model.step_session(&token_arr, slot.cache_len as i32)?;
         mlx::async_eval(&[&logits]);
         slot.cache_len = slot.cache_len.saturating_add(1);
+        slot.committed_len = slot.cache_len;
         let position = slot.cache_len as u64;
         slot.drain_session(model)?;
         self.active_session_slot = None;
         self.page_store.publish_slot(slot, kv)?;
 
-        Ok(sample_inflight(row.slot, &logits, &row.params, position))
+        let inflight = sample_inflight(row.slot, &logits, &row.params, position);
+
+        // Cold start of a greedy decode run: seed the pipeline. Record this
+        // step's sampled token and issue the next step's forward so subsequent
+        // ticks take the fast path and overlap.
+        if pipeline_decode_enabled()
+            && row.params.is_greedy()
+            && let MetalInflight::Sampled { sampled, .. } = &inflight
+        {
+            if let Some(slot) = self.slots.get_mut(&row.slot) {
+                slot.last_sampled = Some(sampled.clone());
+            }
+            self.prequeue_decode(row.slot, kv)?;
+        }
+
+        Ok(inflight)
+    }
+
+    /// Whether the outstanding `pending` decode genuinely belongs to `row`'s
+    /// LIVE slot and may be returned. Guards against a recycled slot index: an
+    /// exact prefix-cache hit can admit a fresh request directly into decode on
+    /// the same slot number a finished request left a `pending` on. We require
+    /// the same slot, an unchanged epoch (the host has not freed/reallocated the
+    /// slot), a still-open one-ahead session, and a matching committed length.
+    fn pending_matches_live_slot(&self, row: &infer_plan::DecodeRow, kv: &dyn KvPool) -> bool {
+        let Some(pending) = self.pending.as_ref() else {
+            return false;
+        };
+        if pending.slot != row.slot {
+            return false;
+        }
+        let Some(slot) = self.slots.get(&row.slot) else {
+            return false;
+        };
+        slot.session_active
+            && slot.slot_epoch == kv.slot_epoch(row.slot)
+            && row.kv_seq_len == slot.committed_len
+            && slot.cache_len == slot.committed_len + 1
+    }
+
+    /// Pipeline fast path: the slot's session is open one step ahead (the step
+    /// whose token we are about to return). Drain it to extract the committed
+    /// K/V + gdr, publish the committed prefix while the host page ids are still
+    /// valid, then prequeue the following step (leaving the session open again).
+    fn commit_pending_then_prequeue(
+        &mut self,
+        row: &infer_plan::DecodeRow,
+        kv: &mut dyn KvPool,
+    ) -> anyhow::Result<()> {
+        let model = self.weights.cpp_model()?;
+        {
+            let slot = self
+                .slots
+                .get_mut(&row.slot)
+                .ok_or_else(|| anyhow::anyhow!("pipeline commit missing slot {}", row.slot))?;
+            // The just-completed prequeue advanced `cache_len` one past the
+            // committed length; that step is now the committed token.
+            debug_assert_eq!(
+                row.kv_seq_len, slot.committed_len,
+                "pipeline decode committed_len drift on slot {}",
+                row.slot
+            );
+            slot.committed_len = slot.cache_len;
+            slot.drain_session(model)?;
+            self.active_session_slot = None;
+            self.page_store.publish_slot(slot, kv)?;
+        }
+        self.prequeue_decode(row.slot, kv)
+    }
+
+    /// Issue (async) the next greedy step on `slot`'s session, feeding the slot's
+    /// `last_sampled` deferred token straight into `step_session` (no host token
+    /// round-trip), and stash the resulting sampled token as `pending`. The
+    /// session is left OPEN one step ahead so the following submit can drain +
+    /// publish it. Capacity-bounded: if the slot's reserved K/V is full, the
+    /// prequeue is skipped and the next submit falls back to the cold path.
+    fn prequeue_decode(&mut self, slot_idx: usize, kv: &mut dyn KvPool) -> anyhow::Result<()> {
+        let _ = kv;
+        let seed = self
+            .slots
+            .get(&slot_idx)
+            .and_then(|s| s.last_sampled.clone());
+        let Some(seed) = seed else {
+            return Ok(());
+        };
+        let model = self.weights.cpp_model()?;
+        let token_arr = mlx::reshape(&seed, &[1]);
+        let slot = self
+            .slots
+            .get_mut(&slot_idx)
+            .ok_or_else(|| anyhow::anyhow!("prequeue missing slot {slot_idx}"))?;
+        // Bound the prequeue to the slot's reserved cache (kv_flat capacity).
+        let capacity = slot
+            .kv_flat
+            .first()
+            .map(|a| a.shape().get(2).copied().unwrap_or(0) as usize)
+            .unwrap_or(0);
+        if capacity != 0 && slot.cache_len + 1 > capacity {
+            return Ok(());
+        }
+        slot.ensure_session_active(model)?;
+        self.active_session_slot = Some(slot_idx);
+        let logits = model.step_session(&token_arr, slot.cache_len as i32)?;
+        mlx::async_eval(&[&logits]);
+        slot.cache_len = slot.cache_len.saturating_add(1);
+        let next = mlx::argmax(&logits);
+        mlx::async_eval(&[&next]);
+        slot.last_sampled = Some(next.clone());
+        self.pending = Some(PendingStep {
+            slot: slot_idx,
+            sampled: next,
+        });
+        Ok(())
     }
 
     fn ensure_no_other_active_session(&self, slot: usize) -> anyhow::Result<()> {
@@ -358,6 +554,10 @@ impl RealMetalExecutor {
             }
             if self.active_session_slot == Some(slot) {
                 self.active_session_slot = None;
+            }
+            // The discarded slot's prequeued step is gone.
+            if self.pending.as_ref().is_some_and(|p| p.slot == slot) {
+                self.pending = None;
             }
         }
         Ok(())
@@ -512,10 +712,21 @@ impl MetalPageStore {
 struct MetalSlotState {
     slot: usize,
     slot_epoch: u64,
+    /// Session position: number of tokens whose `step_session` has been issued.
+    /// In pipeline mode this runs one ahead of `committed_len` (the prequeued
+    /// step). In HEAD mode the two stay equal.
     cache_len: usize,
+    /// Tokens the engine has committed for this slot (its `kv_seq_len`). Decode
+    /// admission is validated against this, not `cache_len`, so the prequeued
+    /// step does not trip the seam's length invariant.
+    committed_len: usize,
     kv_flat: Vec<mlx::MlxArray>,
     gdr_flat: Vec<mlx::MlxArray>,
     session_active: bool,
+    /// Deferred sampled token (greedy argmax, async-evaluated) from the most
+    /// recent step issued on this slot — the input the next prequeue feeds into
+    /// `step_session`. `None` outside pipeline mode.
+    last_sampled: Option<mlx::MlxArray>,
 }
 
 #[cfg(feature = "metal")]
@@ -564,9 +775,11 @@ impl MetalSlotState {
             slot,
             slot_epoch,
             cache_len: 0,
+            committed_len: 0,
             kv_flat,
             gdr_flat,
             session_active: false,
+            last_sampled: None,
         }
     }
 
@@ -581,9 +794,11 @@ impl MetalSlotState {
             slot,
             slot_epoch,
             cache_len,
+            committed_len: cache_len,
             kv_flat,
             gdr_flat,
             session_active: false,
+            last_sampled: None,
         }
     }
 
