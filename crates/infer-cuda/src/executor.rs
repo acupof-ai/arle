@@ -34,12 +34,16 @@ fn decode_graph_enabled() -> bool {
     )
 }
 
-/// The real cuda-kernels executor. Qwen3 dense / Qwen3.5-3.6 MoE run the paged
-/// continuous-batching path ([`QwenCudaExecutor`]); DSv4-Flash runs the MLA +
-/// hyper-connection + FP8 DeepGEMM MoE forward ([`Dsv4CudaExecutor`]), which owns
-/// its own MLA KV state (no `PagedKVPool`) and disables the decode graph.
+/// The real cuda-kernels executor. Dense Qwen3 runs the paged continuous-batching
+/// path ([`QwenCudaExecutor`]); Qwen3.5/3.6 HYBRID MoE runs the gated-delta +
+/// periodic-full-attention forward ([`Qwen35CudaExecutor`]), which owns its KV
+/// state (per-slot full-attn caches + recurrent state, no `PagedKVPool`);
+/// DSv4-Flash runs the MLA + hyper-connection + FP8 DeepGEMM MoE forward
+/// ([`Dsv4CudaExecutor`]), which also owns its own MLA KV state. Both
+/// state-owning executors disable the decode graph.
 pub(crate) enum RealCudaExecutor {
     Qwen(Box<QwenCudaExecutor>),
+    Qwen35(Box<Qwen35CudaExecutor>),
     Dsv4(Box<Dsv4CudaExecutor>),
 }
 
@@ -47,6 +51,7 @@ impl std::fmt::Debug for RealCudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Qwen(q) => q.fmt(f),
+            Self::Qwen35(q) => q.fmt(f),
             Self::Dsv4(d) => d.fmt(f),
         }
     }
@@ -68,8 +73,8 @@ impl RealCudaExecutor {
         num_slots: usize,
         total_pages: usize,
     ) -> Result<Self> {
-        Ok(Self::Qwen(Box::new(
-            QwenCudaExecutor::from_qwen35_moe_safetensors(model_path, num_slots, total_pages)?,
+        Ok(Self::Qwen35(Box::new(
+            Qwen35CudaExecutor::from_qwen35_moe_safetensors(model_path, num_slots, total_pages)?,
         )))
     }
 
@@ -90,6 +95,7 @@ impl RealCudaExecutor {
     ) -> Result<StepOutput> {
         match self {
             Self::Qwen(q) => q.submit(plan, host_kv),
+            Self::Qwen35(q) => q.submit(plan),
             Self::Dsv4(d) => d.submit(plan),
         }
     }
@@ -97,8 +103,9 @@ impl RealCudaExecutor {
     pub(crate) fn warmup(&mut self) -> Result<()> {
         match self {
             Self::Qwen(q) => q.warmup(),
-            // DSv4 has no captured decode graph (MLA host-routing + recompute).
-            Self::Dsv4(_) => Ok(()),
+            // Qwen3.5 hybrid / DSv4 have no captured decode graph (MoE host-routing
+            // + recurrent/recompute state are not graph-capturable).
+            Self::Qwen35(_) | Self::Dsv4(_) => Ok(()),
         }
     }
 }
@@ -173,53 +180,6 @@ impl QwenCudaExecutor {
             model,
             kv,
             num_slots,
-            decode_ctx: None,
-            graphs: None,
-        })
-    }
-
-    /// Build the real CUDA executor for a single-GPU BF16 Qwen3.5/3.6 MoE
-    /// checkpoint (all experts local). Same KV/page setup as the dense path.
-    pub(crate) fn from_qwen35_moe_safetensors(
-        model_path: impl AsRef<Path>,
-        num_slots: usize,
-        total_pages: usize,
-    ) -> Result<Self> {
-        ensure!(num_slots > 0, "CudaExecutor requires at least one slot");
-        ensure!(
-            total_pages > 0,
-            "CudaExecutor requires at least one KV page"
-        );
-
-        let model = CudaModel::from_qwen35_moe_safetensors(model_path.as_ref())?;
-        let token_budget = total_pages * SUPPORTED_PAGE_SIZE;
-        let budget_bytes = PagedKVPool::budget_bytes_for_tokens(
-            model.config.num_hidden_layers,
-            model.config.num_key_value_heads,
-            model.config.head_dim,
-            token_budget,
-            KVFormat::BF16,
-        );
-        let kv = PagedKVPool::with_format(
-            &model.ctx,
-            model.config.num_hidden_layers,
-            model.config.num_key_value_heads,
-            model.config.head_dim,
-            num_slots,
-            budget_bytes,
-            KVFormat::BF16,
-        )?;
-        ensure!(
-            kv.page_size == SUPPORTED_PAGE_SIZE,
-            "BF16 Qwen3.5 MoE expects cuda-kernels page_size={SUPPORTED_PAGE_SIZE}, got {}",
-            kv.page_size
-        );
-
-        Ok(Self {
-            model,
-            kv,
-            num_slots,
-            // MoE host routing syncs + reads logits per step → not graph-capturable.
             decode_ctx: None,
             graphs: None,
         })
@@ -555,6 +515,136 @@ impl Dsv4CudaExecutor {
             );
             let position = row.kv_seq_len.saturating_add(1) as u64;
             let token = self.model.forward_tokens(
+                &[row.last_token],
+                row.kv_seq_len,
+                &row.params,
+                position,
+            )?;
+            (row.slot, token)
+        };
+
+        Ok(StepOutput {
+            tokens: vec![SlotToken {
+                slot,
+                token,
+                logprob: None,
+                finish: None,
+            }],
+        })
+    }
+}
+
+/// Qwen3.5 / Qwen3.6 HYBRID executor: drives
+/// [`crate::qwen35::Qwen35Model::forward_tokens`] over a single scheduled row.
+/// Owns per-slot KV state inside the model (full-attn contiguous caches +
+/// gated-delta recurrent state), so it does NOT use a [`PagedKVPool`]; it relies
+/// on the host [`KvPool`] only for the slot's logical `seq_len` to derive
+/// `start_pos`. Decode graph disabled (MoE host-routing + recurrent state).
+///
+/// First-runnable scope: single-row prefill/decode, uncached full-prefix (each
+/// full-attn layer recomputes over its contiguous cache; each linear-attn layer
+/// advances the recurrent state in place). A continuous-batching paged +
+/// packed-batch path is the perf follow-up (legacy `infer/src/model/qwen35`).
+pub(crate) struct Qwen35CudaExecutor {
+    model: crate::qwen35::Qwen35Model,
+    /// Per-slot KV + recurrent state (one [`crate::qwen35::Qwen35SlotState`] per slot).
+    slots: Vec<crate::qwen35::Qwen35SlotState>,
+    num_slots: usize,
+}
+
+impl std::fmt::Debug for Qwen35CudaExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Qwen35CudaExecutor")
+            .field("model", &self.model)
+            .field("num_slots", &self.num_slots)
+            .finish()
+    }
+}
+
+impl Qwen35CudaExecutor {
+    pub(crate) fn from_qwen35_moe_safetensors(
+        model_path: impl AsRef<Path>,
+        num_slots: usize,
+        total_pages: usize,
+    ) -> Result<Self> {
+        ensure!(
+            num_slots > 0,
+            "Qwen35CudaExecutor requires at least one slot"
+        );
+        ensure!(
+            total_pages > 0,
+            "Qwen35CudaExecutor requires at least one KV page"
+        );
+        // The host CudaKvPool pages the logical seq budget; size each slot's
+        // contiguous full-attn cache to the same token budget.
+        let max_seq_len = total_pages * SUPPORTED_PAGE_SIZE;
+        let model = crate::qwen35::Qwen35Model::from_qwen35_moe_safetensors(
+            model_path.as_ref(),
+            max_seq_len,
+        )?;
+        let mut slots = Vec::with_capacity(num_slots);
+        for _ in 0..num_slots {
+            slots.push(model.new_slot_state()?);
+        }
+        Ok(Self {
+            model,
+            slots,
+            num_slots,
+        })
+    }
+
+    fn submit(&mut self, plan: &ForwardPlan) -> Result<StepOutput> {
+        let rows = plan.decode_rows.len() + plan.prefill_rows.len();
+        if rows == 0 {
+            return Ok(StepOutput { tokens: Vec::new() });
+        }
+        ensure!(
+            rows == 1,
+            "Qwen3.5 hybrid CUDA forward is single-row only, got {} prefill + {} decode rows",
+            plan.prefill_rows.len(),
+            plan.decode_rows.len()
+        );
+
+        let (slot, token) = if let Some(row) = plan.prefill_rows.first() {
+            ensure!(
+                row.slot < self.num_slots,
+                "prefill slot {} outside Qwen3.5 executor slots {}",
+                row.slot,
+                self.num_slots
+            );
+            ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
+            // A fresh prefill (start_pos == 0) rewinds this slot's recurrent +
+            // conv state and cache cursor before appending.
+            if row.start_pos == 0 {
+                self.slots[row.slot].reset(&self.model.ctx)?;
+            }
+            let position = (row.start_pos + row.tokens.len()) as u64;
+            let token = self.model.forward_tokens(
+                &mut self.slots[row.slot],
+                &row.tokens,
+                row.start_pos,
+                &row.params,
+                position,
+            )?;
+            (row.slot, token)
+        } else {
+            let row = &plan.decode_rows[0];
+            ensure!(
+                row.slot < self.num_slots,
+                "decode slot {} outside Qwen3.5 executor slots {}",
+                row.slot,
+                self.num_slots
+            );
+            ensure!(
+                self.slots[row.slot].seq_len() == row.kv_seq_len,
+                "Qwen3.5 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
+                self.slots[row.slot].seq_len(),
+                row.kv_seq_len,
+                row.slot
+            );
+            let position = row.kv_seq_len.saturating_add(1) as u64;
+            let token = self.model.forward_tokens(
+                &mut self.slots[row.slot],
                 &[row.last_token],
                 row.kv_seq_len,
                 &row.params,
