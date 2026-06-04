@@ -27,6 +27,59 @@ pub(crate) struct MhcParams {
     pub comb: CudaSlice<f32>,
 }
 
+/// Fixed B=1 decode scratch for one HC mixer. CUDA graph replay requires these
+/// outputs to live at stable addresses; eager prefill continues using
+/// [`gen_mhc_params`].
+pub(crate) struct MhcDecodeScratch {
+    mixes: HiddenStates,
+    pub pre: CudaSlice<f32>,
+    pub post: CudaSlice<f32>,
+    pub comb: CudaSlice<f32>,
+}
+
+pub(crate) struct MhcParamsRef<'a> {
+    pub pre: &'a CudaSlice<f32>,
+}
+
+impl MhcDecodeScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        hc: &Dsv4HyperConnection,
+    ) -> Result<Self> {
+        let hc_mult = config.hc_mult;
+        ensure!(hc_mult > 0, "DSv4 MHC scratch requires non-zero hc_mult");
+        let mix_dim = (2 + hc_mult) * hc_mult;
+        ensure!(
+            hc.mix_fn.rows >= mix_dim,
+            "DSv4 MHC scratch mix rows {} cannot cover {mix_dim}",
+            hc.mix_fn.rows
+        );
+        let mixes = unsafe { HiddenStates::uninit(ctx, hc.mix_fn.rows, 1)? };
+        let pre = unsafe {
+            ctx.stream
+                .alloc::<f32>(hc_mult)
+                .map_err(|e| anyhow!("DSv4 HC pre scratch alloc failed: {e}"))?
+        };
+        let post = unsafe {
+            ctx.stream
+                .alloc::<f32>(hc_mult)
+                .map_err(|e| anyhow!("DSv4 HC post scratch alloc failed: {e}"))?
+        };
+        let comb = unsafe {
+            ctx.stream
+                .alloc::<f32>(hc_mult * hc_mult)
+                .map_err(|e| anyhow!("DSv4 HC comb scratch alloc failed: {e}"))?
+        };
+        Ok(Self {
+            mixes,
+            pre,
+            post,
+            comb,
+        })
+    }
+}
+
 /// Expand token embeddings `[hidden_size, seq]` into the initial wide HC stream
 /// `[hidden_size * hc_mult, seq]` (each lane seeded from the embedding).
 pub(crate) fn initial_stream_from_embeddings(
@@ -142,6 +195,71 @@ pub(crate) fn gen_mhc_params(
         }
     }
     Ok(MhcParams { pre, post, comb })
+}
+
+/// Decode-only MHC parameter generation into fixed scratch buffers.
+pub(crate) fn gen_mhc_params_into<'a>(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    hc: &Dsv4HyperConnection,
+    stream: &HiddenStates,
+    scratch: &'a mut MhcDecodeScratch,
+) -> Result<MhcParamsRef<'a>> {
+    let hc_mult = config.hc_mult;
+    ensure!(
+        stream.seq_len == 1,
+        "DSv4 MHC decode scratch only supports B=1 decode, got seq_len={}",
+        stream.seq_len
+    );
+    let mix_dim = (2 + hc_mult) * hc_mult;
+    ensure!(
+        hc.mix_fn.cols == stream.hidden_dim && hc.mix_fn.rows >= mix_dim,
+        "DSv4 HC mix shape {}x{} cannot produce {mix_dim} weights from stream dim {}",
+        hc.mix_fn.rows,
+        hc.mix_fn.cols,
+        stream.hidden_dim
+    );
+    ensure!(
+        scratch.mixes.hidden_dim == hc.mix_fn.rows && scratch.mixes.seq_len == 1,
+        "DSv4 HC scratch mix shape {}x{} != {}x1",
+        scratch.mixes.hidden_dim,
+        scratch.mixes.seq_len,
+        hc.mix_fn.rows
+    );
+
+    crate::attention::dsv4_linear(ctx, &hc.mix_fn, stream, &mut scratch.mixes)?;
+
+    {
+        let (stream_ptr, _gs) = stream.data.device_ptr(&ctx.stream);
+        let (mixes_ptr, _gm) = scratch.mixes.data.device_ptr(&ctx.stream);
+        let (base_ptr, _gb) = hc.base.data.device_ptr(&ctx.stream);
+        let (scale_ptr, _gsc) = hc.scale.data.device_ptr(&ctx.stream);
+        let (pre_ptr, _gp) = scratch.pre.device_ptr_mut(&ctx.stream);
+        let (post_ptr, _gpo) = scratch.post.device_ptr_mut(&ctx.stream);
+        let (comb_ptr, _gc) = scratch.comb.device_ptr_mut(&ctx.stream);
+        // SAFETY: all buffers valid on ctx.stream; scratch shapes checked above.
+        unsafe {
+            ffi::dsv4_mhc_params_cuda(
+                stream_ptr as *const ffi::Half,
+                mixes_ptr as *const ffi::Half,
+                base_ptr as *const ffi::Half,
+                scale_ptr as *const ffi::Half,
+                pre_ptr as *mut f32,
+                post_ptr as *mut f32,
+                comb_ptr as *mut f32,
+                stream.seq_len as i32,
+                stream.hidden_dim as i32,
+                scratch.mixes.hidden_dim as i32,
+                hc_mult as i32,
+                config.hc_eps,
+                config.hc_sinkhorn_iters as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    Ok(MhcParamsRef { pre: &scratch.pre })
 }
 
 /// Collapse the wide stream to one `hidden_size` row per token using the pre-mix

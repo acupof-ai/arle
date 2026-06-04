@@ -430,7 +430,7 @@ mod dsv4_gpu {
     use anyhow::{Result, ensure};
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, HiddenStates};
-    use cuda_kernels::tensor::{Dsv4Fp8DeepGemmWeightCache, cache_ptr};
+    use cuda_kernels::tensor::{Dsv4Fp8DeepGemmWeightCache, RawDevicePtr, cache_ptr};
     use cudarc::driver::{CudaSlice, DevicePtrMut};
     use half::bf16;
 
@@ -452,6 +452,7 @@ mod dsv4_gpu {
         route_indices: CudaSlice<i32>,
         route_weights: CudaSlice<f32>,
         token_ids: CudaSlice<u32>,
+        router_logits: HiddenStates,
         counts: CudaSlice<i32>,
         offsets: CudaSlice<i32>,
         scan_total: CudaSlice<i32>,
@@ -527,6 +528,7 @@ mod dsv4_gpu {
                 .stream
                 .alloc_zeros::<u32>(1)
                 .map_err(|e| anyhow::anyhow!("DSv4 decode token-id scratch alloc failed: {e}"))?;
+            let router_logits = unsafe { HiddenStates::uninit(ctx, cfg.num_experts, 1)? };
             let counts = ctx
                 .stream
                 .alloc_zeros::<i32>(num_groups)
@@ -565,6 +567,7 @@ mod dsv4_gpu {
                 route_indices,
                 route_weights,
                 token_ids,
+                router_logits,
                 counts,
                 offsets,
                 scan_total,
@@ -838,6 +841,89 @@ mod dsv4_gpu {
         })
     }
 
+    /// Decode-graph MoE path: all mutable buffers are fixed scratch addresses,
+    /// and the token id is read from a caller-staged device buffer so graph
+    /// replay does not bake the capture step's host token value.
+    pub(crate) fn dsv4_moe_forward_decode_graph(
+        model: &Dsv4Model,
+        layer: &Dsv4MoeLayer,
+        token_ids: &CudaSlice<u32>,
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        scratch: &mut Dsv4MoeDecodeScratch,
+    ) -> Result<()> {
+        use deepseek_spec::DeepSeekV4MoeRoutingKind;
+
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        let split = &model.split;
+        let swiglu_limit = model.config.swiglu_limit;
+        let topk = cfg.top_k;
+        let hidden_dim = hidden.hidden_dim;
+        ensure!(
+            hidden.seq_len == 1 && token_ids.len() == 1,
+            "DSv4 decode-graph MoE requires B=1, got hidden seq={} token_ids={}",
+            hidden.seq_len,
+            token_ids.len()
+        );
+        scratch.validate_routed(hidden_dim, topk, layer)?;
+        scratch.reset_routed(ctx)?;
+        moe::dsv4_deepgemm_native_preflight()?;
+
+        gemm_batch(ctx, &layer.gate, hidden, &mut scratch.router_logits)?;
+
+        let routing_kind = match layer.routing_kind {
+            DeepSeekV4MoeRoutingKind::Hash => 0,
+            DeepSeekV4MoeRoutingKind::LearnedBias => 1,
+        };
+        let bias = layer
+            .gate_bias
+            .as_ref()
+            .map(|bias| cache_ptr(&bias.data, ctx));
+        let tid2eid = layer
+            .hash_tid2eid_device
+            .as_ref()
+            .map(|table| cache_ptr(table, ctx));
+        let token_ids_ptr = if matches!(layer.routing_kind, DeepSeekV4MoeRoutingKind::Hash) {
+            Some(cache_ptr(token_ids, ctx))
+        } else {
+            None
+        };
+        unsafe {
+            moe::dsv4_route(
+                cache_ptr(&scratch.router_logits.data, ctx),
+                bias,
+                tid2eid,
+                token_ids_ptr,
+                cache_ptr(&scratch.route_indices, ctx),
+                cache_ptr(&scratch.route_weights, ctx),
+                1,
+                cfg.num_experts,
+                cfg.top_k,
+                routing_kind,
+                cfg.scoring_func.scoring_kind(),
+                cfg.routed_scaling_factor,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+
+        let route_indices = cache_ptr(&scratch.route_indices, ctx);
+        let route_weights = cache_ptr(&scratch.route_weights, ctx);
+        dsv4_moe_forward_decode_pooled(
+            ctx,
+            layer,
+            split,
+            route_indices,
+            route_weights,
+            hidden,
+            out,
+            topk,
+            split.local_expert_start,
+            swiglu_limit,
+            scratch,
+        )
+    }
+
     /// FP8 DeepGEMM MoE forward for one DSv4 routed-MoE layer (this EP rank's
     /// experts only). Mirrors the BF16 [`super::gpu::moe_forward`] route/pack/
     /// scatter/combine plumbing but swaps the two BF16 grouped GEMMs for the
@@ -958,12 +1044,14 @@ mod dsv4_gpu {
         };
 
         if let Some(scratch) = decode_scratch.as_deref_mut() {
+            let route_indices = cache_ptr(&route_indices, ctx);
+            let route_weights = cache_ptr(&route_weights, ctx);
             return dsv4_moe_forward_decode_pooled(
                 ctx,
                 layer,
                 split,
-                &route_indices,
-                &route_weights,
+                route_indices,
+                route_weights,
                 hidden,
                 out,
                 topk,
@@ -1125,8 +1213,8 @@ mod dsv4_gpu {
         ctx: &DeviceContext,
         layer: &Dsv4MoeLayer,
         split: &ExpertSplit,
-        route_indices: &CudaSlice<i32>,
-        route_weights: &CudaSlice<f32>,
+        route_indices: RawDevicePtr<i32>,
+        route_weights: RawDevicePtr<f32>,
         hidden: &HiddenStates,
         out: &mut HiddenStates,
         topk: usize,
@@ -1146,7 +1234,7 @@ mod dsv4_gpu {
 
         unsafe {
             moe::dsv4_count_local_experts(
-                cache_ptr(route_indices, ctx),
+                route_indices,
                 cache_ptr(&scratch.counts, ctx),
                 num_tokens,
                 topk,
@@ -1163,8 +1251,8 @@ mod dsv4_gpu {
             )?;
             moe::dsv4_pack_local_experts_with_slots(
                 cache_ptr(&hidden.data, ctx),
-                cache_ptr(route_indices, ctx),
-                cache_ptr(route_weights, ctx),
+                route_indices,
+                route_weights,
                 cache_ptr(&scratch.offsets, ctx),
                 cache_ptr(&scratch.cursors, ctx),
                 cache_ptr(&scratch.packed_hidden.data, ctx),
@@ -2225,7 +2313,7 @@ pub(crate) use dsv4_gpu::dsv4_moe_forward_deepep;
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
     Dsv4MoeDecodeScratch, GroupedCache, build_grouped_cache, dsv4_moe_forward,
-    dsv4_shared_expert_forward,
+    dsv4_moe_forward_decode_graph, dsv4_shared_expert_forward,
 };
 #[cfg(feature = "cuda")]
 pub(crate) use gpu::moe_forward;

@@ -140,6 +140,24 @@ impl Dsv4LayerAttentionState {
         }
         Ok(())
     }
+
+    pub(crate) fn advance_decode_len(
+        &mut self,
+        mode: DeepSeekV4AttentionMode,
+        ratio: usize,
+        total_len: usize,
+    ) {
+        if mode == DeepSeekV4AttentionMode::SlidingWindow {
+            return;
+        }
+        let compressed_rows = total_len / ratio;
+        if let Some(compressor) = &mut self.compressor {
+            compressor.compressed.seq_len = compressed_rows;
+        }
+        if let Some(indexer) = &mut self.indexer {
+            indexer.compressed.seq_len = compressed_rows;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -676,6 +694,74 @@ pub(crate) fn mla_linear(
     Ok(())
 }
 
+pub(crate) fn mla_linear_vec(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &DeviceVec,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        weight.cols == x.len,
+        "mla_linear_vec input dim mismatch: weight cols {}, x len {}",
+        weight.cols,
+        x.len
+    );
+    ensure!(
+        weight.rows == out.hidden_dim && out.seq_len == 1,
+        "mla_linear_vec output shape mismatch: weight rows {}, out {}x{}",
+        weight.rows,
+        out.hidden_dim,
+        out.seq_len
+    );
+    let qw = weight
+        .qweight
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DSv4 MLA matrix missing raw quant bytes (qweight)"))?;
+    let scales = weight
+        .dsv4_scales
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DSv4 MLA matrix missing block scales (dsv4_scales)"))?;
+    let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let stream = ctx.stream.cu_stream();
+    // SAFETY: all buffers are valid on ctx.stream; shapes are checked above.
+    unsafe {
+        let res = match weight.weight_format {
+            WeightFormat::Dsv4Fp8BlockScaled => ffi::dsv4_fp8_gemv_batch_cuda(
+                qw_ptr as *const u8,
+                scales_ptr as *const u8,
+                x_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                1,
+                weight.rows as i32,
+                weight.cols as i32,
+                weight.dsv4_scale_rows as i32,
+                weight.dsv4_scale_cols as i32,
+                stream,
+            ),
+            WeightFormat::Dsv4Fp4BlockScaled => ffi::dsv4_fp4_gemv_batch_cuda(
+                qw_ptr as *const u8,
+                scales_ptr as *const u8,
+                x_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                1,
+                weight.rows as i32,
+                weight.cols as i32,
+                weight.dsv4_scale_rows as i32,
+                weight.dsv4_scale_cols as i32,
+                stream,
+            ),
+            other => {
+                bail!("mla_linear_vec: expected DSv4 FP8/FP4 block-scaled weight, got {other:?}")
+            }
+        };
+        res.result()?;
+    }
+    Ok(())
+}
+
 /// Run one DSv4 linear `out = W · x` dispatching on the weight's on-disk format:
 /// bf16 dense → [`crate::ops::gemm_batch`]; FP8/FP4 block-scaled → [`mla_linear`].
 /// DSv4 checkpoints ship the compressor / indexer / HC-mix matrices in either
@@ -752,6 +838,7 @@ pub(crate) fn mla_attention(
     hidden: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
     start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
     tp_rank: usize,
     out: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
@@ -857,25 +944,48 @@ pub(crate) fn mla_attention(
         let (k_out_ptr, _ko) = k_prepared.data.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; head/dim args checked above.
         unsafe {
-            ffi::dsv4_prepare_qk_cuda(
-                q_raw_ptr as *const ffi::Half,
-                k_raw_ptr as *const ffi::Half,
-                q_out_ptr as *mut ffi::Half,
-                k_out_ptr as *mut ffi::Half,
-                token_count as i32,
-                local_heads as i32,
-                head_dim as i32,
-                config.qk_rope_head_dim as i32,
-                start_pos_i32,
-                config.rms_norm_eps,
-                rope_base,
-                original_seq_len,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            if let Some(start_pos_device) = start_pos_device {
+                let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
+                ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
+                    q_raw_ptr as *const ffi::Half,
+                    k_raw_ptr as *const ffi::Half,
+                    q_out_ptr as *mut ffi::Half,
+                    k_out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    start_ptr as *const i32,
+                    config.rms_norm_eps,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else {
+                ffi::dsv4_prepare_qk_cuda(
+                    q_raw_ptr as *const ffi::Half,
+                    k_raw_ptr as *const ffi::Half,
+                    q_out_ptr as *mut ffi::Half,
+                    k_out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    start_pos_i32,
+                    config.rms_norm_eps,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
     }
     keepalive.keep_hidden(&q_prepared);
@@ -898,29 +1008,56 @@ pub(crate) fn mla_attention(
         // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
         // skips to this rank's head block in the whole-loaded attn_sink vector.
         unsafe {
-            ffi::dsv4_swa_attention_cuda(
-                q_ptr as *const ffi::Half,
-                k_ptr as *const ffi::Half,
-                window_ptr as *mut ffi::Half,
-                sink_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                token_count as i32,
-                local_heads as i32,
-                head_dim as i32,
-                config.sliding_window as i32,
-                start_pos_i32,
-                sink_offset as i32,
-                sm_scale,
-                config.qk_rope_head_dim as i32,
-                rope_base,
-                original_seq_len,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-                1,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            if let Some(start_pos_device) = start_pos_device {
+                let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                ffi::dsv4_swa_attention_start_pos_ptr_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    window_ptr as *mut ffi::Half,
+                    sink_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.sliding_window as i32,
+                    start_ptr as *const i32,
+                    sink_offset as i32,
+                    sm_scale,
+                    config.qk_rope_head_dim as i32,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    1,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else {
+                ffi::dsv4_swa_attention_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    window_ptr as *mut ffi::Half,
+                    sink_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.sliding_window as i32,
+                    start_pos_i32,
+                    sink_offset as i32,
+                    sm_scale,
+                    config.qk_rope_head_dim as i32,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    1,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
     } else {
         // ── 4b. CSA / HCA: compressor → (CSA) indexer top-k select → hybrid
@@ -943,6 +1080,7 @@ pub(crate) fn mla_attention(
                 compress_ratio,
                 overlap,
                 start_pos,
+                start_pos_device,
                 true,
                 keepalive,
             )?;
@@ -972,6 +1110,7 @@ pub(crate) fn mla_attention(
                     compress_ratio,
                     true,
                     start_pos,
+                    start_pos_device,
                     false,
                     keepalive,
                 )?;
@@ -989,6 +1128,7 @@ pub(crate) fn mla_attention(
                 &c_q_normed,
                 index_keys,
                 start_pos,
+                start_pos_device,
                 compress_ratio,
                 keepalive,
             )?)
@@ -1002,6 +1142,15 @@ pub(crate) fn mla_attention(
             .expect("compressor state checked above")
             .compressed;
         let compressed_count = compressed.seq_len;
+        let compressed_capacity = compressed.data.len() / head_dim;
+        let compressed_count_arg = if start_pos_device.is_some() {
+            // CUDA graph replay bakes scalar launch args. In decode, the causal
+            // bound is `abs_pos / compress_ratio`, so the kernel may safely see
+            // the fixed capacity instead of the current compressed seq_len.
+            compressed_capacity
+        } else {
+            compressed_count
+        };
         let mode_int = match mode {
             DeepSeekV4AttentionMode::CompressedSparse => 1,
             DeepSeekV4AttentionMode::HybridCompressed => 2,
@@ -1012,7 +1161,7 @@ pub(crate) fn mla_attention(
         let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
         let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
         let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
-        let (comp_ptr, _cg, _cguard) = if compressed_count > 0 {
+        let (comp_ptr, _cg, _cguard) = if compressed_count_arg > 0 {
             let (p, g) = compressed.data.device_ptr(&ctx.stream);
             (p as *const ffi::Half, true, Some(g))
         } else {
@@ -1029,35 +1178,68 @@ pub(crate) fn mla_attention(
         // (the kernel branches on compressed_count / mode). write_window_cache=1
         // updates the bf16 SW ring inline.
         unsafe {
-            ffi::dsv4_hybrid_attention_cuda(
-                q_ptr as *const ffi::Half,
-                k_ptr as *const ffi::Half,
-                window_ptr as *mut ffi::Half,
-                comp_ptr,
-                sel_ptr,
-                sink_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                token_count as i32,
-                local_heads as i32,
-                head_dim as i32,
-                config.sliding_window as i32,
-                start_pos_i32,
-                sink_offset as i32,
-                sm_scale,
-                config.qk_rope_head_dim as i32,
-                rope_base,
-                original_seq_len,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-                mode_int,
-                compress_ratio as i32,
-                compressed_count as i32,
-                config.index_topk as i32,
-                1,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            if let Some(start_pos_device) = start_pos_device {
+                let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                ffi::dsv4_hybrid_attention_start_pos_ptr_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    window_ptr as *mut ffi::Half,
+                    comp_ptr,
+                    sel_ptr,
+                    sink_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.sliding_window as i32,
+                    start_ptr as *const i32,
+                    sink_offset as i32,
+                    sm_scale,
+                    config.qk_rope_head_dim as i32,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    mode_int,
+                    compress_ratio as i32,
+                    compressed_count_arg as i32,
+                    config.index_topk as i32,
+                    1,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else {
+                ffi::dsv4_hybrid_attention_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    window_ptr as *mut ffi::Half,
+                    comp_ptr,
+                    sel_ptr,
+                    sink_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.sliding_window as i32,
+                    start_pos_i32,
+                    sink_offset as i32,
+                    sm_scale,
+                    config.qk_rope_head_dim as i32,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    mode_int,
+                    compress_ratio as i32,
+                    compressed_count_arg as i32,
+                    config.index_topk as i32,
+                    1,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
         if let Some(sel) = selected.as_ref() {
             keepalive.keep_i32(sel);
@@ -1094,6 +1276,7 @@ fn compressor_forward(
     ratio: usize,
     overlap: bool,
     start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
     apply_rope: bool,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
@@ -1158,35 +1341,65 @@ fn compressor_forward(
         // SAFETY: all buffers valid on ctx.stream; state carries the pending and
         // overlap rows from previous contiguous appends.
         unsafe {
-            ffi::dsv4_compressor_update_cuda(
-                kv_ptr as *const ffi::Half,
-                score_ptr as *const ffi::Half,
-                ape_ptr as *const ffi::Half,
-                norm_ptr as *const ffi::Half,
-                pkv_ptr as *mut ffi::Half,
-                psc_ptr as *mut ffi::Half,
-                prkv_ptr as *mut ffi::Half,
-                prsc_ptr as *mut ffi::Half,
-                comp_ptr as *mut ffi::Half,
-                token_count as i32,
-                start_pos_i32,
-                pending_len_i32,
-                compressed_base_i32,
-                head_dim as i32,
-                ratio as i32,
-                width as i32,
-                i32::from(overlap),
-                has_prev_overlap,
-                config.rms_norm_eps,
-                rope_dim as i32,
-                rope_base,
-                0,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            if let Some(start_pos_device) = start_pos_device {
+                let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                ffi::dsv4_compressor_update_start_pos_ptr_cuda(
+                    kv_ptr as *const ffi::Half,
+                    score_ptr as *const ffi::Half,
+                    ape_ptr as *const ffi::Half,
+                    norm_ptr as *const ffi::Half,
+                    pkv_ptr as *mut ffi::Half,
+                    psc_ptr as *mut ffi::Half,
+                    prkv_ptr as *mut ffi::Half,
+                    prsc_ptr as *mut ffi::Half,
+                    comp_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    start_ptr as *const i32,
+                    head_dim as i32,
+                    ratio as i32,
+                    width as i32,
+                    i32::from(overlap),
+                    config.rms_norm_eps,
+                    rope_dim as i32,
+                    rope_base,
+                    0,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else {
+                ffi::dsv4_compressor_update_cuda(
+                    kv_ptr as *const ffi::Half,
+                    score_ptr as *const ffi::Half,
+                    ape_ptr as *const ffi::Half,
+                    norm_ptr as *const ffi::Half,
+                    pkv_ptr as *mut ffi::Half,
+                    psc_ptr as *mut ffi::Half,
+                    prkv_ptr as *mut ffi::Half,
+                    prsc_ptr as *mut ffi::Half,
+                    comp_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    start_pos_i32,
+                    pending_len_i32,
+                    compressed_base_i32,
+                    head_dim as i32,
+                    ratio as i32,
+                    width as i32,
+                    i32::from(overlap),
+                    has_prev_overlap,
+                    config.rms_norm_eps,
+                    rope_dim as i32,
+                    rope_base,
+                    0,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
     }
     state.compressed.seq_len = compressed_rows;
@@ -1205,6 +1418,7 @@ fn csa_select(
     c_q_normed: &HiddenStates,
     keys: &HiddenStates,
     start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
     ratio: usize,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<CudaSlice<i32>> {
@@ -1231,7 +1445,14 @@ fn csa_select(
         weights.hidden_dim
     );
 
-    let key_count = keys.seq_len;
+    let key_count = if start_pos_device.is_some() {
+        // Graph replay must not bake the current compressed-key seq_len. The
+        // selector computes `available = min(key_count, abs_pos / ratio)`, so
+        // capacity preserves the same causal set while staying replay-safe.
+        keys.data.len() / keys.hidden_dim
+    } else {
+        keys.seq_len
+    };
     let mut selected = ctx
         .stream
         .alloc_zeros::<i32>(hidden.seq_len * config.index_topk)
@@ -1245,23 +1466,44 @@ fn csa_select(
         let (sel_ptr, _sg) = selected.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; selected sized seq*index_topk.
         unsafe {
-            ffi::dsv4_csa_select_cuda(
-                q_ptr as *const ffi::Half,
-                w_ptr as *const ffi::Half,
-                keys_ptr as *const ffi::Half,
-                sel_ptr as *mut i32,
-                hidden.seq_len as i32,
-                q_i.hidden_dim as i32,
-                local_index_heads as i32,
-                config.index_head_dim as i32,
-                key_count as i32,
-                ratio as i32,
-                config.index_topk as i32,
-                score_scale,
-                start_pos as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            if let Some(start_pos_device) = start_pos_device {
+                let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                ffi::dsv4_csa_select_start_pos_ptr_cuda(
+                    q_ptr as *const ffi::Half,
+                    w_ptr as *const ffi::Half,
+                    keys_ptr as *const ffi::Half,
+                    sel_ptr as *mut i32,
+                    hidden.seq_len as i32,
+                    q_i.hidden_dim as i32,
+                    local_index_heads as i32,
+                    config.index_head_dim as i32,
+                    key_count as i32,
+                    ratio as i32,
+                    config.index_topk as i32,
+                    score_scale,
+                    start_ptr as *const i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else {
+                ffi::dsv4_csa_select_cuda(
+                    q_ptr as *const ffi::Half,
+                    w_ptr as *const ffi::Half,
+                    keys_ptr as *const ffi::Half,
+                    sel_ptr as *mut i32,
+                    hidden.seq_len as i32,
+                    q_i.hidden_dim as i32,
+                    local_index_heads as i32,
+                    config.index_head_dim as i32,
+                    key_count as i32,
+                    ratio as i32,
+                    config.index_topk as i32,
+                    score_scale,
+                    start_pos as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
     }
     Ok(selected)
