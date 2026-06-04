@@ -52,7 +52,7 @@ no circular blocker for cutover).
 | MoE routing math | host | **verified (CPU)** | infer-moe 17 tests |
 | MoE wrappers + expert load + config | CUDA | **foundation verified** | `6d4a3254`; cuda,no-cuda typecheck clean |
 | BF16 MoE forward (SparseMoeBlock) | CUDA | **wired (Mac-verified)** | `96f65bdc` moe.rs (route→pack→grouped-gemm→silu_mul→scatter→combine→shared); GPU-verify gated on a compatible BF16 ungated/full-attn HD128-kv8 MoE (none cached) |
-| MoE/EP single-GPU + EP/DeepEP/DeepGEMM | CUDA | **scoped — DSv4 port** | `2026-06-04-dsv4-port-plan.md`: cached DSv4-Flash FP8; kernels shared; pieces L/L/M/L (MLA = new subsystem). Multi-day port |
+| MoE/EP single-GPU + EP/DeepEP/DeepGEMM | CUDA | **port done; multi-GPU verify in flight** | forward ported (`9def46fb`); 8-rank load OK on 8×H20; blocker = DeepGEMM native bridge multi-rank (§8) |
 | W4 grouped GEMM (Qwen3.6-4bit) | CUDA | **pending** | 2 swap points in moe.rs flagged; Qwen3.6 canonical is 4-bit |
 | CUDA Graph capture/replay | CUDA | **VERIFIED** | H20 eager==replay==HF gold (16/16); nsys: cuGraphLaunch×16 + capture×2 (impl `20274cdb`, `INFER_CUDA_DECODE_GRAPH=1`) |
 | CUDA toolchain build (sm_70) | V100 | **verified (build/CPU)** | V100 node: GPU-free suite 64/0; native CUDA-C compiles sm_70 |
@@ -161,16 +161,52 @@ Deletion scope: `infer/` = 213 files ~167k LOC / 7.1 MB; new `infer-*` = ~42 fil
 
 ---
 
-## 7. Remaining work & sequencing
+## 8. DSv4 multi-GPU verification frontier (2026-06-04)
 
-Critical path is serial through Phase 0:
+Forward fully ported (`9def46fb`); 8-rank load succeeds on 8×H20 (~19.6 GB/rank).
+Infra blockers cleared and **mirrored into the repo** (were pod-only hotpatches):
 
-1. **Phase 0** (CUDA eager parity) — TileLang 0.1.9 fix A/B in flight. **GATE.**
-2. **GPU wiring** (gated on 1, serialized on `model.rs::forward_tokens`): CUDA-graph
-   decode refactor → TP all-reduce inserts → MoE forward branch. Foundation already
-   committed (`6d4a3254`); these are the model.rs/executor.rs edits + H20 verify.
-3. **Verification** (parallel once 2 lands): TP=8 greedy parity; MoE single-GPU then
-   EP+DeepEP; DeepGEMM FP8; CUDA-graph eager-vs-replay — all on 8×H20.
-4. **Cutover** (§5): InferenceEngine adapter (parallelizable now) → migrate
+- NCCL bootstrap → **file rendezvous** (`e91cf0da`): the throwaway `--gen-nccl-id`
+  helper minted an id embedding a listener socket that died on exit → every rank
+  `Connection refused`. Rank 0 now mints in-process and shares via `INFER_NCCL_ID_FILE`.
+- MTP layers → **tolerated** (`7a7bd70d`): production config has
+  `num_nextn_predict_layers=1`; the base forward loops only `num_hidden_layers`, so
+  the rejection (forcing a base-43 symlink config) is gone.
+- Launcher device ordinal → **`INFER_CUDA_DEVICE=0`** (`3889ed5d`): under per-rank
+  `CUDA_VISIBLE_DEVICES=$r` the GPU is ordinal 0, not physical `$r` (ranks 1-7 were
+  `CUDA_ERROR_INVALID_DEVICE`).
+
+**Apparent parity failure was a confounder, not a forward bug.** The harness
+default prompt was Qwen ids `785,6722,315,9625,374`, which decode to garbage
+`" ar造成 thATE v"` under the DeepSeek tokenizer (vocab 128000); the rewrite was
+scored on a *different* prompt than the legacy oracle and emitted `'.'` (token 16),
+a plausible garbage continuation — vs the oracle's `' Paris'` (11111). Fixed
+(`a882823b`): default now the correct DeepSeek ids `671,6102,294,8760,344` (verified
+— they appear at oracle positions 3-7). Reinforces the distilled lesson
+*garbage output = config-suspect first*. **Valid greedy-parity re-run (correct
+prompt) is the open gate.**
+
+**Separate, still-open infra blocker:** the native DeepGEMM bridge fails
+`cuLibraryGetKernelCount → CUDA_ERROR_UNKNOWN` in multi-rank (single-process legacy
+works). This is why the rewrite fell back to a native-grouped FP8 bypass. The
+bridge's JIT cache already has per-kernel lock + unique-tmp (`deepgemm_native.cu`),
+so a naive cache race is unlikely; suspect is the kernel-signature digest or
+multi-rank JIT/preflight conditions diverging from legacy's warm cache. Codex is
+isolating the expert-backend / JIT-cache variable on the pod.
+
+## 9. Remaining work & sequencing
+
+Phase 0 (CUDA eager parity), CUDA Graph, and Metal are **verified** (§2). Open gates:
+
+1. **DSv4 multi-GPU greedy parity** (§8) — re-run with the corrected prompt
+   (`671,6102,294,8760,344`); expect rewrite token1 = 11111. **GATE.**
+2. **DeepGEMM native bridge multi-rank** (§8) — fix `cuLibraryGetKernelCount`
+   so the rewrite runs the production deepgemm expert backend (not the bypass).
+3. **TP=8 Qwen greedy parity** (#9) — launcher now correct (file-rendezvous +
+   device-ordinal); needs the q2_kv1 decode config + the run.
+4. **Qwen3.5/3.6 common-precision verify** (#15) — forward ported (`c9850ef5`);
+   BF16/FP8/4-bit GPU runs pending compatible cached weights.
+5. **Cutover** (§5): InferenceEngine adapter (parallelizable now) → migrate
    agent/cli/train → delete `infer/`.
-5. **Report**: finalize this document with bench numbers + parity verdicts.
+6. **Report**: finalize this document + the Qwen3.5/DSv4 performance report with
+   per-op latency, overlap, and parity verdicts.
