@@ -703,7 +703,8 @@ fn mla_rms_norm(
     weight: &DeviceVec,
     eps: f32,
 ) -> Result<HiddenStates> {
-    let mut out = HiddenStates::zeros(ctx, x.hidden_dim, x.seq_len)?;
+    // SAFETY: rms_norm_batched_cuda writes the full output buffer.
+    let mut out = unsafe { HiddenStates::uninit(ctx, x.hidden_dim, x.seq_len)? };
     {
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
@@ -826,25 +827,29 @@ pub(crate) fn mla_attention(
         .map_err(|_| anyhow::anyhow!("DSv4 MLA start_pos {start_pos} overflows i32"))?;
 
     // ── 1. Q-LoRA: wq_a (down) → q_norm RMSNorm → wq_b (up to per-head Q).
-    let mut c_q = HiddenStates::zeros(ctx, attention.wq_a.rows, token_count)?;
+    // SAFETY: dsv4_linear writes the full c_q buffer.
+    let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
     dsv4_linear(ctx, &attention.wq_a, hidden, &mut c_q)?;
     keepalive.keep_hidden(&c_q);
     let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
     keepalive.keep_hidden(&c_q_normed);
-    let mut q_raw = HiddenStates::zeros(ctx, local_width, token_count)?;
+    // SAFETY: dsv4_linear writes the full q_raw buffer.
+    let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
     dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)?;
     keepalive.keep_hidden(&q_raw);
 
     // ── 2. KV latent: wkv (down to the single compressed latent) → kv_norm.
-    let mut kv_raw = HiddenStates::zeros(ctx, head_dim, token_count)?;
+    // SAFETY: dsv4_linear writes the full kv_raw buffer.
+    let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
     dsv4_linear(ctx, &attention.wkv, hidden, &mut kv_raw)?;
     keepalive.keep_hidden(&kv_raw);
     let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
     keepalive.keep_hidden(&kv_normed);
 
     // ── 3. Partial RoPE on the trailing rope_dim cols of Q (per head) and K.
-    let mut q_prepared = HiddenStates::zeros(ctx, local_width, token_count)?;
-    let mut k_prepared = HiddenStates::zeros(ctx, head_dim, token_count)?;
+    // SAFETY: dsv4_prepare_qk_cuda writes both full output buffers.
+    let mut q_prepared = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
+    let mut k_prepared = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
     {
         let (q_raw_ptr, _qr) = q_raw.data.device_ptr(&ctx.stream);
         let (k_raw_ptr, _kr) = kv_normed.data.device_ptr(&ctx.stream);
@@ -877,7 +882,8 @@ pub(crate) fn mla_attention(
     keepalive.keep_hidden(&k_prepared);
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
-    let mut local_attn = HiddenStates::zeros(ctx, local_width, token_count)?;
+    // SAFETY: the SW/hybrid attention kernel writes the full local_attn buffer.
+    let mut local_attn = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
 
     if mode == DeepSeekV4AttentionMode::SlidingWindow {
         // ── 4a. SW: windowed attention + per-head sink + output inverse-RoPE.
@@ -1061,7 +1067,8 @@ pub(crate) fn mla_attention(
 
     // ── 5. O-LoRA: wo_a (per o-group, down to the output latent) → wo_b (up
     // back to hidden). Row-parallel: the all-reduce-sum is the model's concern.
-    let mut latent = HiddenStates::zeros(ctx, attention.wo_a.rows, token_count)?;
+    // SAFETY: dsv4_linear writes the full latent buffer.
+    let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a.rows, token_count)? };
     dsv4_linear(ctx, &attention.wo_a, &local_attn, &mut latent)?;
     keepalive.keep_hidden(&latent);
     dsv4_linear(ctx, &attention.wo_b, &latent, out)?;
@@ -1121,10 +1128,12 @@ fn compressor_forward(
         "DSv4 compressor compressed rows {compressed_rows} exceed state capacity {compressed_capacity}"
     );
 
-    let mut kv_raw = HiddenStates::zeros(ctx, width, token_count)?;
+    // SAFETY: dsv4_linear writes the full compressor kv buffer.
+    let mut kv_raw = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
     dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv_raw)?;
     keepalive.keep_hidden(&kv_raw);
-    let mut score_raw = HiddenStates::zeros(ctx, width, token_count)?;
+    // SAFETY: dsv4_linear writes the full compressor score buffer.
+    let mut score_raw = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
     dsv4_linear(ctx, &compressor.wgate, hidden, &mut score_raw)?;
     keepalive.keep_hidden(&score_raw);
 
@@ -1199,10 +1208,13 @@ fn csa_select(
     ratio: usize,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<CudaSlice<i32>> {
-    let mut q_i = HiddenStates::zeros(ctx, indexer.wq_b.rows, c_q_normed.seq_len)?;
+    // SAFETY: dsv4_linear writes the full index-query buffer.
+    let mut q_i = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, c_q_normed.seq_len)? };
     dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)?;
     keepalive.keep_hidden(&q_i);
-    let mut weights = HiddenStates::zeros(ctx, indexer.weights_proj.rows, hidden.seq_len)?;
+    // SAFETY: dsv4_linear writes the full index-weight buffer.
+    let mut weights =
+        unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, hidden.seq_len)? };
     dsv4_linear(ctx, &indexer.weights_proj, hidden, &mut weights)?;
     keepalive.keep_hidden(&weights);
 
