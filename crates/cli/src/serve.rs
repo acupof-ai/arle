@@ -1,8 +1,15 @@
-use std::{
-    env,
-    path::PathBuf,
-    process::{Command, ExitCode},
-};
+//! `arle serve` — in-process OpenAI v1 serving entry.
+//!
+//! Builds the backend router and runs `axum::serve` inside this process via
+//! [`infer_api::serve_http`]. There is no standalone serve binary to exec: the
+//! rewrite ships only the `arle` binary, so serving is in-process. The requested
+//! backend must match the one compiled into this binary
+//! ([`CompiledBackend::detect`]); a mismatch is rejected up front rather than
+//! silently serving the compiled backend.
+
+use std::{env, process::ExitCode};
+
+use infer_api::{EngineLoadConfig, ServeHttpOptions, serve_http};
 
 use crate::{
     args::{Args, ServeArgs, ServeBackendArg, ServeSpecTypeArg},
@@ -17,14 +24,6 @@ enum ServeBackend {
 }
 
 impl ServeBackend {
-    fn binary_name(self) -> &'static str {
-        match self {
-            Self::Cuda => "infer",
-            Self::Metal => "metal_serve",
-            Self::Cpu => "cpu_serve",
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             Self::Cuda => "cuda",
@@ -34,17 +33,19 @@ impl ServeBackend {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ServeInvocation {
+/// Resolved, validated serve configuration ready to hand to
+/// [`infer_api::serve_http`]. Holds the in-process options plus the diagnostics
+/// the CLI prints before binding.
+#[derive(Debug)]
+struct ServeConfig {
     backend: ServeBackend,
-    binary: PathBuf,
-    argv: Vec<String>,
+    options: ServeHttpOptions,
     bind_warning: Option<String>,
 }
 
 pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
-    match resolve_invocation(args, &serve_args) {
-        Ok(invocation) => run_invocation(invocation),
+    match resolve_config(args, &serve_args) {
+        Ok(config) => run_config(config),
         Err(err) => {
             eprintln!("[ARLE serve] error: {err}");
             ExitCode::FAILURE
@@ -52,33 +53,28 @@ pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
     }
 }
 
-fn run_invocation(invocation: ServeInvocation) -> ExitCode {
-    if let Some(warning) = invocation.bind_warning.as_deref() {
+fn run_config(config: ServeConfig) -> ExitCode {
+    if let Some(warning) = config.bind_warning.as_deref() {
         eprintln!("[ARLE serve] warning: {warning}");
     }
     eprintln!(
-        "[ARLE serve] launching {} backend via {}",
-        invocation.backend.label(),
-        invocation.binary.display()
+        "[ARLE serve] starting {} backend in-process on {}:{}",
+        config.backend.label(),
+        config.options.bind,
+        config.options.port,
     );
-    let status = Command::new(&invocation.binary)
-        .args(&invocation.argv)
-        .status();
-    match status {
-        Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+    match serve_http(config.options) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!(
-                "[ARLE serve] error: failed to launch {}: {err}",
-                invocation.binary.display()
-            );
+            eprintln!("[ARLE serve] error: {err:#}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn resolve_invocation(args: &Args, serve_args: &ServeArgs) -> Result<ServeInvocation, String> {
+fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, String> {
     let backend = resolve_backend(serve_args.backend)?;
+
     let model_path = serve_args
         .model_path
         .as_deref()
@@ -91,102 +87,109 @@ fn resolve_invocation(args: &Args, serve_args: &ServeArgs) -> Result<ServeInvoca
             "no model selected; pass `arle serve --model-path ...`, top-level `--model-path`, or set ARLE_MODEL".to_string()
         })?;
 
-    let mut argv = vec![
-        "--model-path".to_string(),
-        model_path,
-        "--port".to_string(),
-        serve_args.port.to_string(),
-    ];
-
+    // Metal is the only backend whose router honors a custom bind address today;
+    // CUDA/CPU still bind, but flag a non-default `--bind` as Metal-only so the
+    // surface matches what the legacy `metal_serve` bin exposed.
     let bind_warning = if backend == ServeBackend::Metal {
-        argv.push("--bind".to_string());
-        argv.push(serve_args.bind.clone());
         None
     } else if serve_args.bind != "127.0.0.1" {
         Some(format!(
-            "--bind={} is only supported by the Metal serving binary today; {} will use its backend default",
+            "--bind={} was historically Metal-only; the {} backend now honors it in-process",
             serve_args.bind,
-            backend.binary_name()
+            backend.label()
         ))
     } else {
         None
     };
 
-    if backend == ServeBackend::Cuda && args.no_cuda_graph {
-        argv.push("--cuda-graph".to_string());
-        argv.push("false".to_string());
+    // Speculative / MTP routing is Metal-only on the rewrite serve stack today.
+    // The CLI rejects it elsewhere so the error surface matches the old front
+    // door; the router itself does not yet thread these through (follow-up).
+    if serve_args.spec_type != ServeSpecTypeArg::None && backend != ServeBackend::Metal {
+        return Err("--spec-type is currently only supported by the Metal backend".to_string());
+    }
+    if serve_args.mtp_draft_model.is_some() && backend != ServeBackend::Metal {
+        return Err(
+            "--mtp-draft-model is currently only supported by the Metal backend".to_string(),
+        );
+    }
+    if serve_args.mtp_draft_tokens.is_some() && backend != ServeBackend::Metal {
+        return Err(
+            "--mtp-draft-tokens is currently only supported by the Metal backend".to_string(),
+        );
     }
 
-    if backend == ServeBackend::Cuda
-        && let Some(max_bs) = args.cuda_graph_max_bs
-    {
-        argv.push("--cuda-graph-max-bs".to_string());
-        argv.push(max_bs.to_string());
+    // Surfaces the rewrite serve router does not expose yet. Reject rather than
+    // silently ignore so the user is not misled into thinking they took effect.
+    if serve_args.train_control_url.is_some() {
+        return Err(
+            "--train-control-url is not yet supported by the in-process serve stack (the rewrite router has no /v1/train/* routes)".to_string(),
+        );
+    }
+    if !serve_args.pool_models.is_empty() {
+        return Err(
+            "--pool-model is not yet supported by the in-process serve stack (the rewrite router has no engine-pool /v1/models metadata)".to_string(),
+        );
+    }
+    if !serve_args.extra_args.is_empty() {
+        return Err(format!(
+            "unrecognized backend flags after `--`: {}; the in-process serve stack does not forward to a standalone binary",
+            serve_args.extra_args.join(" ")
+        ));
     }
 
-    if serve_args.spec_type != ServeSpecTypeArg::None {
-        if backend != ServeBackend::Metal {
-            return Err("--spec-type is currently only supported by the Metal backend".to_string());
-        }
-        argv.push("--spec-type".to_string());
-        argv.push(serve_args.spec_type.as_backend_value().to_string());
-    }
+    let options = ServeHttpOptions {
+        model_path,
+        bind: serve_args.bind.clone(),
+        port: serve_args.port,
+        // `--no-cuda-graph` flips the CUDA decode-graph default off; honored by
+        // the CUDA backend only (Metal/CPU ignore it).
+        enable_cuda_graph: !args.no_cuda_graph,
+        engine_config: EngineLoadConfig::default(),
+    };
 
-    if let Some(draft_model) = serve_args.mtp_draft_model.as_deref() {
-        if backend != ServeBackend::Metal {
-            return Err(
-                "--mtp-draft-model is currently only supported by the Metal backend".to_string(),
-            );
-        }
-        argv.push("--mtp-draft-model".to_string());
-        argv.push(draft_model.to_string());
-    }
-
-    if let Some(draft_tokens) = serve_args.mtp_draft_tokens {
-        if backend != ServeBackend::Metal {
-            return Err(
-                "--mtp-draft-tokens is currently only supported by the Metal backend".to_string(),
-            );
-        }
-        argv.push("--mtp-draft-tokens".to_string());
-        argv.push(draft_tokens.to_string());
-    }
-
-    if let Some(url) = serve_args.train_control_url.as_deref() {
-        argv.push("--train-control-url".to_string());
-        argv.push(url.to_string());
-    }
-
-    for spec in &serve_args.pool_models {
-        argv.push("--pool-model".to_string());
-        argv.push(spec.clone());
-    }
-
-    argv.extend(serve_args.extra_args.iter().cloned());
-
-    Ok(ServeInvocation {
+    Ok(ServeConfig {
         backend,
-        binary: resolve_binary(backend.binary_name()),
-        argv,
+        options,
         bind_warning,
     })
 }
 
 fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
-    match arg {
-        ServeBackendArg::Cuda => Ok(ServeBackend::Cuda),
-        ServeBackendArg::Metal => Ok(ServeBackend::Metal),
-        ServeBackendArg::Cpu => Ok(ServeBackend::Cpu),
-        ServeBackendArg::Auto => match CompiledBackend::detect() {
-            CompiledBackend::Cuda => Ok(ServeBackend::Cuda),
-            CompiledBackend::Metal => Ok(ServeBackend::Metal),
-            CompiledBackend::Cpu => Ok(ServeBackend::Cpu),
-            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
-            CompiledBackend::None => Err(
-                "serve requires a backend build; rebuild with cuda, metal/no-cuda, or cpu/no-cuda"
-                    .to_string(),
-            ),
-        },
+    let requested = match arg {
+        ServeBackendArg::Cuda => Some(ServeBackend::Cuda),
+        ServeBackendArg::Metal => Some(ServeBackend::Metal),
+        ServeBackendArg::Cpu => Some(ServeBackend::Cpu),
+        ServeBackendArg::Auto => None,
+    };
+
+    let compiled = match CompiledBackend::detect() {
+        CompiledBackend::Cuda => Some(ServeBackend::Cuda),
+        CompiledBackend::Metal => Some(ServeBackend::Metal),
+        CompiledBackend::Cpu => Some(ServeBackend::Cpu),
+        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+        CompiledBackend::None => None,
+    };
+
+    let Some(compiled) = compiled else {
+        return Err(
+            "serve requires a backend build; rebuild with cuda, metal/no-cuda, or cpu/no-cuda"
+                .to_string(),
+        );
+    };
+
+    match requested {
+        // `auto` always serves the compiled backend.
+        None => Ok(compiled),
+        // An explicit backend must match the one compiled in: serving is
+        // in-process, so a mismatch cannot be satisfied.
+        Some(requested) if requested == compiled => Ok(requested),
+        Some(requested) => Err(format!(
+            "requested --backend {} but this binary was built with the {} backend; rebuild with the matching feature or use --backend {}/auto",
+            requested.label(),
+            compiled.label(),
+            compiled.label(),
+        )),
     }
 }
 
@@ -198,231 +201,191 @@ fn model_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn resolve_binary(name: &str) -> PathBuf {
-    if let Some(sibling) = current_exe_sibling(name)
-        && sibling.is_file()
-    {
-        return sibling;
-    }
-    PathBuf::from(name)
-}
-
-fn current_exe_sibling(name: &str) -> Option<PathBuf> {
-    let exe = env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    Some(dir.join(platform_binary_name(name)))
-}
-
-fn platform_binary_name(name: &str) -> String {
-    if cfg!(target_os = "windows") {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
     use super::*;
 
-    #[test]
-    fn serve_uses_subcommand_model_path() {
-        let mut args = Args::parse_from([
-            "arle",
-            "serve",
-            "--backend",
-            "cpu",
-            "--model-path",
-            "from-sub",
-        ]);
+    fn parse_serve(argv: &[&str]) -> (Args, ServeArgs) {
+        let mut args = Args::parse_from(argv);
         let serve = match args.command.take().expect("serve command") {
             crate::args::CliCommand::Serve(serve) => *serve,
             _ => panic!("expected serve"),
         };
-        let invocation = resolve_invocation(&args, &serve).expect("resolve");
-        assert_eq!(invocation.argv[1], "from-sub");
+        (args, serve)
+    }
+
+    /// The compiled backend (what `--backend auto` / a matching explicit backend
+    /// resolves to). Tests pick the backend the current binary was built with so
+    /// the in-process backend-match check passes.
+    fn compiled_backend_flag() -> &'static str {
+        match CompiledBackend::detect() {
+            CompiledBackend::Cuda => "cuda",
+            CompiledBackend::Metal => "metal",
+            CompiledBackend::Cpu => "cpu",
+            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            CompiledBackend::None => "auto",
+        }
+    }
+
+    #[test]
+    fn serve_uses_subcommand_model_path() {
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "from-sub",
+        ]);
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert_eq!(config.options.model_path, "from-sub");
     }
 
     #[test]
     fn serve_uses_top_level_model_path() {
-        let mut args = Args::parse_from([
+        let (args, serve) = parse_serve(&[
             "arle",
             "--model-path",
             "from-root",
             "serve",
             "--backend",
-            "cpu",
+            compiled_backend_flag(),
         ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let invocation = resolve_invocation(&args, &serve).expect("resolve");
-        assert_eq!(invocation.argv[1], "from-root");
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert_eq!(config.options.model_path, "from-root");
     }
 
     #[test]
-    fn cuda_serve_forwards_no_cuda_graph() {
-        let mut args = Args::parse_from([
+    fn no_cuda_graph_flag_disables_decode_graph_default() {
+        let (args, serve) = parse_serve(&[
             "arle",
             "--no-cuda-graph",
             "serve",
             "--backend",
-            "cuda",
+            compiled_backend_flag(),
             "--model-path",
             "model",
         ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let invocation = resolve_invocation(&args, &serve).expect("resolve");
-        assert!(
-            invocation
-                .argv
-                .windows(2)
-                .any(|item| item[0] == "--cuda-graph" && item[1] == "false")
-        );
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert!(!config.options.enable_cuda_graph);
     }
 
     #[test]
-    fn cuda_serve_forwards_cuda_graph_max_bs() {
-        let mut args = Args::parse_from([
+    fn default_enables_decode_graph_default() {
+        let (args, serve) = parse_serve(&[
             "arle",
-            "--cuda-graph-max-bs",
-            "16",
             "serve",
             "--backend",
-            "cuda",
+            compiled_backend_flag(),
             "--model-path",
             "model",
         ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let invocation = resolve_invocation(&args, &serve).expect("resolve");
-        assert!(
-            invocation
-                .argv
-                .windows(2)
-                .any(|item| item[0] == "--cuda-graph-max-bs" && item[1] == "16")
-        );
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert!(config.options.enable_cuda_graph);
     }
 
     #[test]
-    fn serve_forwards_pool_model_specs() {
-        let mut args = Args::parse_from([
+    fn port_and_bind_flow_into_options() {
+        let (args, serve) = parse_serve(&[
             "arle",
             "serve",
             "--backend",
-            "metal",
+            compiled_backend_flag(),
             "--model-path",
-            "main",
+            "model",
+            "--port",
+            "8123",
+        ]);
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert_eq!(config.options.port, 8123);
+        assert_eq!(config.options.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn explicit_backend_mismatch_is_rejected() {
+        // Pick a backend that is NOT the compiled one (or skip if no backend is
+        // compiled in, where every explicit backend is rejected anyway).
+        let other = match CompiledBackend::detect() {
+            CompiledBackend::Metal => "cuda",
+            CompiledBackend::Cuda | CompiledBackend::Cpu => "metal",
+            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            CompiledBackend::None => return,
+        };
+        let (args, serve) =
+            parse_serve(&["arle", "serve", "--backend", other, "--model-path", "model"]);
+        let err = resolve_config(&args, &serve).expect_err("backend mismatch rejected");
+        assert!(err.contains("but this binary was built with"), "got: {err}");
+    }
+
+    #[test]
+    fn train_control_url_is_rejected() {
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--train-control-url",
+            "http://localhost:9000",
+        ]);
+        let err = resolve_config(&args, &serve).expect_err("train control url rejected");
+        assert!(err.contains("--train-control-url"), "got: {err}");
+    }
+
+    #[test]
+    fn pool_model_is_rejected() {
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
             "--pool-model",
             "embed=/models/embed,type=embedding",
         ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let invocation = resolve_invocation(&args, &serve).expect("resolve");
-        assert!(invocation.argv.windows(2).any(
-            |item| item[0] == "--pool-model" && item[1] == "embed=/models/embed,type=embedding"
-        ));
+        let err = resolve_config(&args, &serve).expect_err("pool model rejected");
+        assert!(err.contains("--pool-model"), "got: {err}");
     }
 
     #[test]
-    fn metal_serve_forwards_spec_type() {
-        let mut args = Args::parse_from([
+    fn extra_args_after_dashes_are_rejected() {
+        let (args, serve) = parse_serve(&[
             "arle",
             "serve",
             "--backend",
-            "metal",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--",
+            "--num-slots",
+            "8",
+        ]);
+        let err = resolve_config(&args, &serve).expect_err("extra args rejected");
+        assert!(err.contains("unrecognized backend flags"), "got: {err}");
+    }
+
+    #[test]
+    fn non_metal_spec_type_errors_when_compiled_non_metal() {
+        // Only meaningful when the compiled backend is not Metal; on a Metal
+        // build `--spec-type mtp` is accepted, so skip there.
+        if CompiledBackend::detect() == CompiledBackend::Metal {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
             "--model-path",
             "model",
             "--spec-type",
             "mtp",
         ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let invocation = resolve_invocation(&args, &serve).expect("resolve");
-        assert!(
-            invocation
-                .argv
-                .windows(2)
-                .any(|item| item[0] == "--spec-type" && item[1] == "mtp")
-        );
-    }
-
-    #[test]
-    fn metal_serve_forwards_mtp_draft_model() {
-        let mut args = Args::parse_from([
-            "arle",
-            "serve",
-            "--backend",
-            "metal",
-            "--model-path",
-            "model",
-            "--mtp-draft-model",
-            "mlx-community/Qwen3.6-35B-A3B-MTP-4bit",
-        ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let invocation = resolve_invocation(&args, &serve).expect("resolve");
-        assert!(invocation.argv.windows(2).any(|item| {
-            item[0] == "--mtp-draft-model" && item[1] == "mlx-community/Qwen3.6-35B-A3B-MTP-4bit"
-        }));
-    }
-
-    #[test]
-    fn metal_serve_forwards_mtp_draft_tokens() {
-        let mut args = Args::parse_from([
-            "arle",
-            "serve",
-            "--backend",
-            "metal",
-            "--model-path",
-            "model",
-            "--mtp-draft-tokens",
-            "4",
-        ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let invocation = resolve_invocation(&args, &serve).expect("resolve");
-        assert!(
-            invocation
-                .argv
-                .windows(2)
-                .any(|item| item[0] == "--mtp-draft-tokens" && item[1] == "4")
-        );
-    }
-
-    #[test]
-    fn non_metal_spec_type_errors() {
-        let mut args = Args::parse_from([
-            "arle",
-            "serve",
-            "--backend",
-            "cpu",
-            "--model-path",
-            "model",
-            "--spec-type",
-            "mtp",
-        ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let err = resolve_invocation(&args, &serve).expect_err("reject non-Metal spec type");
+        let err = resolve_config(&args, &serve).expect_err("reject non-Metal spec type");
         assert_eq!(
             err,
             "--spec-type is currently only supported by the Metal backend"
@@ -430,54 +393,27 @@ mod tests {
     }
 
     #[test]
-    fn non_metal_mtp_draft_model_errors() {
-        let mut args = Args::parse_from([
+    fn metal_spec_type_accepted_when_compiled_metal() {
+        if CompiledBackend::detect() != CompiledBackend::Metal {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
             "arle",
             "serve",
             "--backend",
-            "cpu",
+            "metal",
             "--model-path",
             "model",
-            "--mtp-draft-model",
-            "draft",
+            "--spec-type",
+            "mtp",
         ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let err = resolve_invocation(&args, &serve).expect_err("reject non-Metal MTP draft");
-        assert_eq!(
-            err,
-            "--mtp-draft-model is currently only supported by the Metal backend"
-        );
-    }
-
-    #[test]
-    fn non_metal_mtp_draft_tokens_errors() {
-        let mut args = Args::parse_from([
-            "arle",
-            "serve",
-            "--backend",
-            "cpu",
-            "--model-path",
-            "model",
-            "--mtp-draft-tokens",
-            "4",
-        ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
-        let err = resolve_invocation(&args, &serve).expect_err("reject non-Metal MTP draft tokens");
-        assert_eq!(
-            err,
-            "--mtp-draft-tokens is currently only supported by the Metal backend"
-        );
+        let config = resolve_config(&args, &serve).expect("metal accepts spec type");
+        assert_eq!(config.backend, ServeBackend::Metal);
     }
 
     #[test]
     fn serve_backend_arle_alias_selects_compiled_backend() {
-        let mut args = Args::parse_from([
+        let (_args, serve) = parse_serve(&[
             "arle",
             "serve",
             "--backend",
@@ -485,10 +421,6 @@ mod tests {
             "--model-path",
             "/models/main",
         ]);
-        let serve = match args.command.take().expect("serve command") {
-            crate::args::CliCommand::Serve(serve) => *serve,
-            _ => panic!("expected serve"),
-        };
         assert_eq!(serve.backend, ServeBackendArg::Auto);
     }
 }
