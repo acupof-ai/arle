@@ -1,0 +1,249 @@
+//! DSv4-Flash multi-GPU (TP=8/EP=8) greedy-parity harness + NCCL `unique_id`
+//! generator for the R6 clean-CUDA rewrite.
+//!
+//! Two modes, selected by argv:
+//!
+//! * `--gen-nccl-id` (build with `--features cuda,nccl`): rank-0 helper for the
+//!   launcher. Calls `ncclGetUniqueId`, hex-encodes the 128-byte id (256 hex
+//!   chars), prints it on a single stdout line, and exits. The launcher captures
+//!   it and exports `INFER_NCCL_UNIQUE_ID=<hex>` to all ranks (the same value the
+//!   `infer-cuda` loader decodes via `nccl_unique_id_from_env`).
+//!
+//! * default (the parity forward): mirrors the R6 Qwen one-prefill-row harness
+//!   (`crates/agent-bench` `cuda_qwen3_greedy_parity`) but for DSv4. It builds
+//!   `CudaExecutor::from_dsv4_fp8_safetensors(path, 1)` and drives
+//!   `BackendExecutor::submit` with a single-row `ForwardPlan`:
+//!     1. one **full-prefix prefill** at `start_pos = 0` over the whole prompt
+//!        → the FIRST generated token (the prefill argmax). Every layer type
+//!        (SW / CSA / HCA) recomputes its attention over `[0, len)`, so this is
+//!        the runnable correctness shape on every layer today.
+//!     2. then incremental decode steps (`start_pos > 0`, a single `[last_token]`
+//!        row). This is the path DSv4 has NOT proven: the SW ring caches are
+//!        reallocated fresh per `forward_tokens` call (see `dsv4.rs`
+//!        `alloc_sw_window_caches`), so an incremental single-token step cannot
+//!        see prior KV. The harness attempts each step, **catches the bail**, and
+//!        reports how far it got before printing `clean_tokens=[...]` (always at
+//!        least the prefill argmax).
+//!
+//! Env (parity mode):
+//!   * `INFER_DSV4_MODEL_PATH`  — DSv4 FP8 safetensors dir (required).
+//!   * `INFER_DSV4_PROMPT_IDS`  — comma-separated u32 ids; default
+//!     `785,6722,315,9625,374` = "The capital of France is".
+//!   * `INFER_DSV4_MAX_NEW`     — max new tokens to attempt (default 16).
+//!   * `INFER_CUDA_DEVICES` / `INFER_TP_RANK` / `INFER_TP_SIZE` /
+//!     `INFER_NCCL_UNIQUE_ID` — resolved inside the loader's TP runtime; the
+//!     launcher binds one rank per GPU. This binary is rank-agnostic — every rank
+//!     runs the identical forward; only rank 0's `clean_tokens` is the oracle the
+//!     launcher compares.
+//!
+//! Build / run (pod, sm_90a, CUDA 12.9):
+//!   See `scripts/dsv4_multigpu_parity.sh` for the full 8-rank launch + build
+//!   flags (`ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`, FlashMLA, `ARLE_DEEPEP_DIR`,
+//!   nccl).
+
+// This example only does anything under `cuda`; `--gen-nccl-id` additionally
+// needs `nccl`. Under a host-only build it is an explanatory no-op so
+// `cargo build -p infer-cuda` (default, no-cuda) stays clean.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
+fn main() -> anyhow::Result<()> {
+    real::run()
+}
+
+#[cfg(not(feature = "cuda"))]
+mod real {
+    pub(super) fn run() -> anyhow::Result<()> {
+        eprintln!(
+            "dsv4_parity is a CUDA harness; rebuild with \
+             --features cuda (parity forward) or --features cuda,nccl (--gen-nccl-id)."
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+mod real {
+    use anyhow::{Context, Result};
+    use infer_cuda::{CudaExecutor, CudaKvPool};
+    use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
+    use infer_seam::{BackendExecutor, KvPool, PollResult};
+
+    /// Default prompt: "The capital of France is" (Qwen tokenizer ids).
+    const DEFAULT_PROMPT_IDS: &str = "785,6722,315,9625,374";
+    const DEFAULT_MAX_NEW: usize = 16;
+
+    pub(super) fn run() -> Result<()> {
+        if std::env::args().any(|a| a == "--gen-nccl-id") {
+            return gen_nccl_id();
+        }
+        parity_forward()
+    }
+
+    /// rank-0 launcher helper: print the hex-encoded NCCL `unique_id`.
+    #[cfg(feature = "nccl")]
+    fn gen_nccl_id() -> Result<()> {
+        use cuda_kernels::ffi::nccl;
+
+        let mut id = nccl::ncclUniqueId {
+            internal: [0i8; 128],
+        };
+        // SAFETY: `id` is a valid, fully-initialized 128-byte ncclUniqueId; NCCL
+        // writes the rendezvous handle into it. Single-threaded, no aliasing.
+        let res = unsafe { nccl::ncclGetUniqueId(&mut id) };
+        nccl::check(res).context("ncclGetUniqueId failed")?;
+
+        // 128 signed bytes → 256 lowercase hex chars; the loader's
+        // `nccl_unique_id_from_env` decodes exactly this layout (i8 round-trips
+        // through u8 bit-for-bit).
+        let mut hex = String::with_capacity(256);
+        for &b in &id.internal {
+            use std::fmt::Write;
+            write!(hex, "{:02x}", b as u8).expect("write to String is infallible");
+        }
+        debug_assert_eq!(hex.len(), 256);
+        // Single clean stdout line — the launcher captures this verbatim.
+        println!("{hex}");
+        Ok(())
+    }
+
+    #[cfg(not(feature = "nccl"))]
+    fn gen_nccl_id() -> Result<()> {
+        anyhow::bail!("--gen-nccl-id needs the nccl feature; rebuild with --features cuda,nccl");
+    }
+
+    fn parity_forward() -> Result<()> {
+        let model_path = std::env::var("INFER_DSV4_MODEL_PATH")
+            .context("INFER_DSV4_MODEL_PATH must point at the DSv4 FP8 safetensors directory")?;
+        let prompt = parse_prompt_ids(
+            &std::env::var("INFER_DSV4_PROMPT_IDS")
+                .unwrap_or_else(|_| DEFAULT_PROMPT_IDS.to_string()),
+        )?;
+        let max_new: usize = std::env::var("INFER_DSV4_MAX_NEW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_NEW);
+        anyhow::ensure!(!prompt.is_empty(), "INFER_DSV4_PROMPT_IDS resolved empty");
+        anyhow::ensure!(max_new >= 1, "INFER_DSV4_MAX_NEW must be >= 1");
+
+        let rank = std::env::var("INFER_TP_RANK").unwrap_or_else(|_| "0".to_string());
+        eprintln!(
+            "[dsv4-parity rank={rank}] model={model_path} prompt={prompt:?} max_new={max_new}"
+        );
+
+        // DSv4 owns its MLA KV state inside the forward, so the host pool is only
+        // present to satisfy the `submit(.., &mut dyn KvPool)` signature — the
+        // DSv4 executor never touches it. A 1-slot/1-page pool is sufficient.
+        let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1)
+            .context("from_dsv4_fp8_safetensors failed (build/config?)")?;
+        let mut kv = CudaKvPool::new(1, 1, 16);
+
+        // ── Step 1: full-prefix prefill at start_pos = 0 → the first token.
+        let first = forward_once(&mut exec, &mut kv, prefill_plan(&prompt, 0))?;
+        let mut clean_tokens = vec![first];
+        eprintln!("[dsv4-parity rank={rank}] prefill argmax (token #1) = {first}");
+
+        // ── Step 2: incremental decode steps (start_pos > 0). The DSv4 SW ring is
+        // reallocated fresh per call, so this is the gated/unproven path — attempt
+        // it, but stop cleanly at the first bail and report how far we reached.
+        let mut bail_at: Option<(usize, String)> = None;
+        for step in 1..max_new {
+            // KV length already materialized = prompt + tokens emitted so far.
+            let kv_seq_len = prompt.len() + step - 1;
+            let last = *clean_tokens.last().expect("clean_tokens is non-empty");
+            match forward_once(&mut exec, &mut kv, decode_plan(last, kv_seq_len)) {
+                Ok(tok) => clean_tokens.push(tok),
+                Err(e) => {
+                    bail_at = Some((step, format!("{e:#}")));
+                    break;
+                }
+            }
+        }
+
+        println!("clean_tokens={clean_tokens:?}");
+        match bail_at {
+            None => eprintln!(
+                "[dsv4-parity rank={rank}] reached max_new={max_new} \
+                 ({} tokens) without an incremental-decode bail",
+                clean_tokens.len()
+            ),
+            Some((step, msg)) => eprintln!(
+                "[dsv4-parity rank={rank}] incremental decode bailed at decode \
+                 step {step} (token #{}): {msg}\n  → verified TODAY: prefill argmax \
+                 (token #1) on every layer type (SW/CSA/HCA recompute over [0,len)).\n  \
+                 → GATED: incremental start_pos>0 decode (CSA/HCA per-step KV reuse) — \
+                 the full {DEFAULT_MAX_NEW}-token oracle needs the continuous-batching \
+                 follow-up.",
+                clean_tokens.len() + 1
+            ),
+        }
+        Ok(())
+    }
+
+    /// Build a one-row prefill `ForwardPlan` over the whole prompt at `start_pos`.
+    fn prefill_plan(tokens: &[u32], start_pos: usize) -> ForwardPlan {
+        ForwardPlan {
+            mode: ForwardMode::Prefill,
+            decode_rows: Vec::new(),
+            prefill_rows: vec![PrefillRow {
+                slot: 0,
+                tokens: tokens.to_vec(),
+                start_pos,
+                total_tokens: start_pos + tokens.len(),
+                params: greedy(),
+            }],
+            microbatch: None,
+            spec: None,
+        }
+    }
+
+    /// Build a one-row incremental-decode `ForwardPlan` for `last_token` at the
+    /// given materialized KV length (the `start_pos > 0` path).
+    fn decode_plan(last_token: u32, kv_seq_len: usize) -> ForwardPlan {
+        ForwardPlan {
+            mode: ForwardMode::Decode,
+            decode_rows: vec![infer_plan::DecodeRow {
+                slot: 0,
+                last_token,
+                kv_seq_len,
+                params: greedy(),
+            }],
+            prefill_rows: Vec::new(),
+            microbatch: None,
+            spec: None,
+        }
+    }
+
+    /// Submit one plan and synchronously resolve its single sampled token.
+    fn forward_once(
+        exec: &mut CudaExecutor,
+        kv: &mut CudaKvPool,
+        plan: ForwardPlan,
+    ) -> Result<u32> {
+        let inflight = exec.submit(&plan, kv as &mut dyn KvPool)?;
+        match exec.poll(inflight)? {
+            PollResult::Ready(out) => out
+                .tokens
+                .first()
+                .map(|t| t.token)
+                .context("DSv4 step produced no token"),
+            PollResult::NotReady(_) => {
+                anyhow::bail!("DSv4 executor resolves synchronously; got NotReady")
+            }
+        }
+    }
+
+    fn greedy() -> SamplingParams {
+        SamplingParams::default() // temperature 0.0 → greedy argmax
+    }
+
+    fn parse_prompt_ids(s: &str) -> Result<Vec<u32>> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                t.parse::<u32>()
+                    .with_context(|| format!("bad token id `{t}` in INFER_DSV4_PROMPT_IDS"))
+            })
+            .collect()
+    }
+}
