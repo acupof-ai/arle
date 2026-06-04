@@ -53,6 +53,12 @@ mod qwen35;
 #[cfg(feature = "cuda")]
 pub use qwen35::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 
+// Load-time decode-graph default setter (CLI `--cuda-graph` → engine). Lets the
+// `enable_cuda_graph` load flag actually gate the B=1 decode graph instead of
+// being discarded; the `INFER_CUDA_DECODE_GRAPH` env var still overrides.
+#[cfg(feature = "cuda")]
+pub use executor::set_decode_graph_default;
+
 // Not cuda-gated: env→TpConfig resolution is CPU-testable; only the NCCL comm
 // variant is feature-gated.
 pub mod tp;
