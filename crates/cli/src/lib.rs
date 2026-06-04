@@ -34,7 +34,7 @@ use anyhow::Result;
 use args::{Args, CliCommand, RunArgs};
 use clap::Parser;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer::server_engine::{InferenceEngine, LoadedInferenceEngine};
+use infer_api::{InferenceEngine, LoadedInferenceEngine};
 
 pub fn run() -> ExitCode {
     let mut args = Args::parse();
@@ -98,7 +98,7 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
 
         // Keep the interactive CLI quiet by default. Users can opt into
         // verbose internals by setting RUST_LOG explicitly.
-        infer::logging::init_stderr("warn");
+        infer_util::logging::init_stderr("warn");
 
         // Interactive startup: hardware detection + model picker + download.
         // Falls back to resolve_model_source() when non-interactive.

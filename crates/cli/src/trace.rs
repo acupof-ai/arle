@@ -281,7 +281,7 @@ mod tests {
         use agent::{AgentSession, AgentSettings, ToolExecutor, ToolPolicy};
         use anyhow::Result;
         use chat::ToolCall;
-        use infer::server_engine::{
+        use infer_api::{
             CompletionOutput, CompletionRequest, CompletionStreamDelta, FinishReason,
             InferenceEngine, TokenUsage,
         };

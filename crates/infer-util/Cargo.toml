@@ -1,0 +1,23 @@
+[package]
+name = "infer-util"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Dependency-light leaf crate for cross-cutting runtime utilities that are NOT
+# backend-coupled: HuggingFace model-path resolution (`hf_hub`) and process
+# logging (`logging`). Consumers (cli, and the legacy `infer` during cutover)
+# depend on this directly instead of pulling the whole backend-gated `infer-api`
+# for host-only commands. Relocated out of `infer/src/{hf_hub,logging}.rs` so the
+# legacy `infer` crate can be deleted without losing these utilities.
+
+[dependencies]
+anyhow = "1.0"
+log = "0.4"
+hf-hub = { version = "0.5", features = ["tokio"] }
+logforth = { version = "0.29", features = ["starter-log", "layout-text", "diagnostic-task-local"] }
+colored = "3"
+
+[lints]
+workspace = true

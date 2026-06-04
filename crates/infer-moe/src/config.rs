@@ -1,0 +1,207 @@
+//! MoE routing / gating configuration — the device-independent description of
+//! one MoE block's router, covering the knobs both legacy routers read (DSv4:
+//! `noaux_tc` bias selection, no grouping; Qwen3.6: softmax + greedy top-k, one
+//! shared expert). Group-limited routing fields exist for a future grouped
+//! kernel but are wired by neither ARLE router.
+
+use crate::error::{Result, bail};
+
+/// How per-expert router logits become selection scores. [`Self::scoring_kind`]
+/// matches the CUDA `dsv4_route` `scoring_kind` arg (0/1/2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ScoringFunc {
+    /// `scores = stable_softmax(logits)` over all experts.
+    Softmax,
+    /// `scores[e] = sigmoid(logits[e])` (independent per expert).
+    Sigmoid,
+    /// `scores[e] = sqrt(softplus(logits[e]))` (DeepSeek-V4 `sqrtsoftplus`).
+    SqrtSoftplus,
+}
+
+impl ScoringFunc {
+    /// Parse the legacy `scoring_func` config string.
+    pub fn from_config_str(s: &str) -> Result<Self> {
+        match s {
+            "softmax" => Ok(Self::Softmax),
+            "sigmoid" => Ok(Self::Sigmoid),
+            "sqrtsoftplus" => Ok(Self::SqrtSoftplus),
+            other => bail!("unsupported DSV4 router scoring_func `{other}`"),
+        }
+    }
+
+    /// The CUDA `dsv4_route` `scoring_kind` integer for this scoring func.
+    #[must_use]
+    pub fn scoring_kind(self) -> i32 {
+        match self {
+            Self::Softmax => 0,
+            Self::Sigmoid => 1,
+            Self::SqrtSoftplus => 2,
+        }
+    }
+}
+
+/// How the top-k experts are selected from the per-expert scores.
+///
+/// - [`TopkMethod::Greedy`]: plain top-k over the scores (Qwen3.6).
+/// - [`TopkMethod::NoAuxTc`]: DSv4 no-aux-loss top-k — selection uses the
+///   bias-corrected key `scores[e] + bias[e]`, the weight reads un-biased
+///   `scores[e]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TopkMethod {
+    /// Top-k directly over the scores (Qwen3.6).
+    Greedy,
+    /// No-aux-loss top-k with score-correction bias (DSv4 `noaux_tc`).
+    NoAuxTc,
+}
+
+impl TopkMethod {
+    /// Parse the legacy `topk_method` config string. DSv4 ships `"noaux_tc"`;
+    /// any plain greedy method maps to [`TopkMethod::Greedy`].
+    pub fn from_config_str(s: &str) -> Result<Self> {
+        match s {
+            "noaux_tc" => Ok(Self::NoAuxTc),
+            "greedy" | "group_limited_greedy" => Ok(Self::Greedy),
+            other => bail!("unsupported MoE topk_method `{other}`"),
+        }
+    }
+}
+
+/// Device-independent description of one MoE block's router.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MoeConfig {
+    /// Number of routed experts (one router logit each).
+    pub num_experts: usize,
+    /// Always-on shared experts run for every token (Qwen3.6 = 1). They do not
+    /// route; see [`MoeConfig::has_shared_expert`].
+    pub num_shared_experts: usize,
+    /// Experts selected per token (`num_experts_per_tok`).
+    pub top_k: usize,
+    /// Scoring function; the selection bias presence comes from `topk_method`.
+    pub scoring_func: ScoringFunc,
+    /// Top-k selection rule (`noaux_tc` vs greedy).
+    pub topk_method: TopkMethod,
+    /// Renormalize the selected top-k weights to sum to 1.
+    ///
+    /// - **softmax**: drives Qwen3.6's separate post-renorm; the DSv4 reference +
+    ///   kernel never renorm inside the router (denom pinned to 1.0).
+    /// - **sigmoid / sqrtsoftplus**: DSv4 always normalizes regardless of this
+    ///   flag (`denom = selected_sum + 1e-9`); the flag only documents intent.
+    pub norm_topk_prob: bool,
+    /// Final multiplicative scaling on every routed weight (Qwen3.6 = 1.0).
+    pub routed_scaling_factor: f32,
+    /// Group-limited routing: expert-group count (DeepSeek-V2/V3 `n_group`).
+    /// `None` ⇒ no grouping. See [`crate::route::group_limited_mask`].
+    pub n_group: Option<usize>,
+    /// Groups kept per token; `Some` iff `n_group` is `Some`.
+    pub topk_group: Option<usize>,
+    /// Router projection input dim; carried for shape validation (this crate
+    /// routes from pre-computed logits, never multiplies the gate).
+    pub hidden_size: usize,
+}
+
+impl MoeConfig {
+    /// Qwen3.6 router config: softmax, greedy top-k, no bias, scaling 1.0, one
+    /// sigmoid-gated shared expert, optional `norm_topk_prob`.
+    #[must_use]
+    pub fn qwen36(
+        num_experts: usize,
+        top_k: usize,
+        norm_topk_prob: bool,
+        hidden_size: usize,
+    ) -> Self {
+        Self {
+            num_experts,
+            num_shared_experts: 1,
+            top_k,
+            scoring_func: ScoringFunc::Softmax,
+            topk_method: TopkMethod::Greedy,
+            norm_topk_prob,
+            routed_scaling_factor: 1.0,
+            n_group: None,
+            topk_group: None,
+            hidden_size,
+        }
+    }
+
+    /// DeepSeek-V4 router config: `sqrtsoftplus` scoring, `noaux_tc` top-k
+    /// (selection bias is a runtime gate tensor, not a config field), config
+    /// `routed_scaling_factor`, `n_shared_experts` always-on. DSv4-Flash ships
+    /// no group-limited routing, so `n_group`/`topk_group` stay `None`.
+    #[must_use]
+    pub fn dsv4(
+        num_experts: usize,
+        num_shared_experts: usize,
+        top_k: usize,
+        routed_scaling_factor: f32,
+        hidden_size: usize,
+    ) -> Self {
+        Self {
+            num_experts,
+            num_shared_experts,
+            top_k,
+            scoring_func: ScoringFunc::SqrtSoftplus,
+            topk_method: TopkMethod::NoAuxTc,
+            // sqrtsoftplus always normalizes the selected weights; the flag is
+            // documentary for this path (see route.rs `normalize` derivation).
+            norm_topk_prob: true,
+            routed_scaling_factor,
+            n_group: None,
+            topk_group: None,
+            hidden_size,
+        }
+    }
+
+    /// Whether at least one always-on shared expert runs for every token.
+    #[must_use]
+    pub fn has_shared_expert(&self) -> bool {
+        self.num_shared_experts > 0
+    }
+
+    /// Validate the config (experts > 0, valid top_k, consistent group fields).
+    pub fn validate(&self) -> Result<()> {
+        if self.num_experts == 0 {
+            bail!("MoE config requires num_experts > 0");
+        }
+        if self.top_k == 0 {
+            bail!("MoE config requires top_k (num_experts_per_tok) > 0");
+        }
+        if self.top_k > self.num_experts {
+            bail!(
+                "num_experts_per_tok ({}) must not exceed num_experts ({})",
+                self.top_k,
+                self.num_experts
+            );
+        }
+        match (self.n_group, self.topk_group) {
+            (None, None) => {}
+            (Some(n_group), Some(topk_group)) => {
+                if n_group == 0 {
+                    bail!("group-limited routing requires n_group > 0");
+                }
+                if !self.num_experts.is_multiple_of(n_group) {
+                    bail!(
+                        "num_experts ({}) must be divisible by n_group ({n_group})",
+                        self.num_experts
+                    );
+                }
+                if topk_group == 0 || topk_group > n_group {
+                    bail!("topk_group ({topk_group}) must be in 1..=n_group ({n_group})");
+                }
+                // top_k must be reachable from the kept groups.
+                let experts_per_group = self.num_experts / n_group;
+                if self.top_k > topk_group * experts_per_group {
+                    bail!(
+                        "top_k ({}) exceeds capacity of topk_group*experts_per_group ({})",
+                        self.top_k,
+                        topk_group * experts_per_group
+                    );
+                }
+            }
+            _ => bail!("n_group and topk_group must both be set or both unset"),
+        }
+        Ok(())
+    }
+}
