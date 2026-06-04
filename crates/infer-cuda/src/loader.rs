@@ -758,25 +758,43 @@ impl SafetensorLoader {
         ))
     }
 
-    /// Load a DSv4 BF16 1D norm/bias vector (q_norm, kv_norm, attn_sink, layer
-    /// norms, gate bias). DSv4 keeps these small tensors in BF16.
+    /// Normalize a DSv4 small 1D/2D tensor to BF16 bytes — these ship as BF16
+    /// (norms) or F32 (attn_sink, router gate) depending on the checkpoint.
+    fn dsv4_bytes_to_bf16<'a>(
+        name: &str,
+        tensor: &'a OwnedTensor,
+    ) -> Result<std::borrow::Cow<'a, [u8]>> {
+        match tensor.dtype {
+            Dtype::BF16 => Ok(std::borrow::Cow::Borrowed(tensor.bytes.as_slice())),
+            Dtype::F32 => Ok(std::borrow::Cow::Owned(
+                tensor
+                    .bytes
+                    .chunks_exact(4)
+                    .flat_map(|c| {
+                        half::bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .to_le_bytes()
+                    })
+                    .collect(),
+            )),
+            other => anyhow::bail!("{name}: DSv4 tensor expected BF16/F32, got {other:?}"),
+        }
+    }
+
+    /// Load a DSv4 1D norm/bias vector (q_norm, kv_norm, attn_sink, layer norms,
+    /// gate bias) — BF16 or F32 in the checkpoint, normalized to BF16.
     pub(crate) fn load_dsv4_vec(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
         let tensor = self.load_raw_tensor(name)?;
-        ensure!(
-            tensor.dtype == Dtype::BF16,
-            "{name}: DSv4 1D tensor expected BF16, got {:?}",
-            tensor.dtype
-        );
         ensure!(
             tensor.shape.len() == 1,
             "{name}: expected 1D tensor, got shape {:?}",
             tensor.shape
         );
-        DeviceVec::from_safetensors(ctx, &tensor.bytes)
+        DeviceVec::from_safetensors(ctx, Self::dsv4_bytes_to_bf16(name, &tensor)?.as_ref())
             .with_context(|| format!("upload DSv4 vec {name}"))
     }
 
-    /// Load a DSv4 BF16 2D matrix (the router gate — the only non-FP8 2D weight).
+    /// Load a DSv4 2D router gate (the only non-FP8 2D weight) — BF16 or F32 in
+    /// the checkpoint, normalized to BF16.
     pub(crate) fn load_dsv4_bf16_matrix(
         &self,
         ctx: &DeviceContext,
@@ -784,17 +802,17 @@ impl SafetensorLoader {
     ) -> Result<DeviceMatrix> {
         let tensor = self.load_raw_tensor(name)?;
         ensure!(
-            tensor.dtype == Dtype::BF16,
-            "{name}: DSv4 router gate expected BF16, got {:?}",
-            tensor.dtype
-        );
-        ensure!(
             tensor.shape.len() == 2,
             "{name}: expected 2D tensor, got shape {:?}",
             tensor.shape
         );
-        DeviceMatrix::from_safetensors(ctx, &tensor.bytes, tensor.shape[0], tensor.shape[1])
-            .with_context(|| format!("upload DSv4 gate {name}"))
+        DeviceMatrix::from_safetensors(
+            ctx,
+            Self::dsv4_bytes_to_bf16(name, &tensor)?.as_ref(),
+            tensor.shape[0],
+            tensor.shape[1],
+        )
+        .with_context(|| format!("upload DSv4 gate {name}"))
     }
 
     /// Load a DSv4 block-scaled FP8 (`F8_E4M3`) or packed FP4 (`I8`) `<name>` plus
