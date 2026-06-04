@@ -2,10 +2,10 @@
 //!
 //! The engine-core facing seam is host-only: [`ForwardPlan`], [`StepOutput`],
 //! and [`KvPool`] expose slots, page ids, token ids, and lengths. Device
-//! tensors remain inside backend executors, model implementations, and the
-//! lower-seam traits in this crate.
+//! tensors, collectives, sampling, and the model forward all live inside the
+//! backend executors ([`BackendExecutor`]), never crossing this seam.
 
-use infer_plan::{ForwardPlan, SamplingParams, StepOutput};
+use infer_plan::{ForwardPlan, StepOutput};
 
 #[path = "allocator.rs"]
 mod allocator;
@@ -33,8 +33,7 @@ pub enum PollResult<I> {
 /// Host-only engine-core to backend-executor seam.
 ///
 /// The plan and step output contain only host data. Any device tensors needed
-/// for KV, logits, collectives, graphs, or sampling remain inside the executor
-/// and lower-seam implementations.
+/// for KV, logits, collectives, graphs, or sampling remain inside the executor.
 pub trait BackendExecutor {
     /// Opaque backend-owned in-flight handle.
     type Inflight;
@@ -59,57 +58,6 @@ pub trait BackendExecutor {
     fn model_stop_token_ids(&self) -> Vec<u32> {
         Vec::new()
     }
-}
-
-/// Backend-internal collective communication seam.
-///
-/// `Tensor` is deliberately associated with the backend implementation and is
-/// never exposed through the engine-core executor boundary.
-pub trait Communicator {
-    /// Backend tensor type used by collectives.
-    type Tensor;
-
-    /// Run an in-place all-reduce over a tensor-parallel group.
-    fn all_reduce(&self, tensor: &mut Self::Tensor);
-
-    /// Run all-to-all dispatch/combine between expert-parallel ranks.
-    fn all_to_all(&self, send: &Self::Tensor, recv: &mut Self::Tensor);
-
-    /// Run a pipeline-stage point-to-point send/recv exchange.
-    fn send_recv(&self, stage: u32, tensor: &mut Self::Tensor);
-}
-
-/// Backend-internal sampling seam.
-pub trait Sampler {
-    /// Backend logits representation consumed by the sampler.
-    type Logits;
-
-    /// Sample one token per logits row using the provided per-row parameters.
-    fn sample(&mut self, logits: &Self::Logits, params: &[SamplingParams]) -> Vec<u32>;
-}
-
-/// Backend-internal model architecture seam.
-///
-/// Model implementations use backend tensors and communicators below the
-/// executor seam. The only engine-core input is the host-only [`ForwardPlan`]
-/// plus a host-indexed [`KvPool`] handle.
-pub trait ModelArch {
-    /// Backend tensor type used for intermediate activations.
-    type Tensor;
-
-    /// Backend logits representation returned by the model.
-    type Logits;
-
-    /// Backend communicator implementation used by this model.
-    type Comm: Communicator<Tensor = Self::Tensor>;
-
-    /// Execute model forward for `plan` using backend-owned tensors.
-    fn forward(
-        &mut self,
-        plan: &ForwardPlan,
-        kv: &mut dyn KvPool,
-        comm: &Self::Comm,
-    ) -> anyhow::Result<Self::Logits>;
 }
 
 /// Verdict returned by the resource governor at the admission boundary.
