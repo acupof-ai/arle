@@ -30,8 +30,8 @@ export const DOCS_NAV: DocsGroup[] = [
     heading: "Concepts",
     links: [
       { label: "Front door & verbs", href: "https://github.com/cklxx/arle/tree/main/crates/cli" },
-      { label: "Runtime spine", href: "https://github.com/cklxx/arle/tree/main/infer/src" },
-      { label: "Backend dispatch", href: "https://github.com/cklxx/arle/blob/main/infer/src/backend/AGENTS.md" },
+      { label: "Runtime spine", href: "https://github.com/cklxx/arle/tree/main/crates/infer-core" },
+      { label: "Backend dispatch", href: "https://github.com/cklxx/arle/tree/main/crates/infer-seam" },
       { label: "Stability levels", href: "https://github.com/cklxx/arle/blob/main/docs/stability-policy.md" },
     ],
   },
