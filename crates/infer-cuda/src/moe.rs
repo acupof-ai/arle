@@ -433,7 +433,7 @@ mod dsv4_gpu {
     use cuda_kernels::tensor::{Dsv4Fp8DeepGemmWeightCache, cache_ptr};
     use half::bf16;
 
-    use crate::dsv4::{Dsv4Model, Dsv4MoeLayer};
+    use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
     use crate::ops::gemm_batch;
 
     /// FP8 DeepGEMM MoE forward for one DSv4 routed-MoE layer (this EP rank's
@@ -456,6 +456,7 @@ mod dsv4_gpu {
         tokens: &[u32],
         hidden: &HiddenStates,
         out: &mut HiddenStates,
+        keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
@@ -506,6 +507,7 @@ mod dsv4_gpu {
         // ── 1+2. Router gemm → logits[T, E] → HOST route (bias or hash). ────────
         let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
         gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
+        keepalive.keep_hidden(&logits);
         ctx.sync()?;
         let logits_bf16: Vec<bf16> = ctx
             .stream
@@ -524,6 +526,8 @@ mod dsv4_gpu {
             .stream
             .clone_htod(&weights_host)
             .map_err(|e| anyhow::anyhow!("DSv4 route-weight H2D failed: {e}"))?;
+        keepalive.keep_i32(&route_indices);
+        keepalive.keep_f32(&route_weights);
 
         // ── 3. Per-local-expert counts → group offsets (EP-aware start/range). ──
         let counts = ctx
@@ -538,6 +542,9 @@ mod dsv4_gpu {
             .stream
             .alloc_zeros::<i32>(1)
             .map_err(|e| anyhow::anyhow!("DSv4 scan-total alloc failed: {e}"))?;
+        keepalive.keep_i32(&counts);
+        keepalive.keep_i32(&offsets);
+        keepalive.keep_i32(&scan_total);
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
         unsafe {
             moe::dsv4_count_local_experts(
@@ -560,6 +567,7 @@ mod dsv4_gpu {
 
         // ── 4. Pack routed tokens grouped-by-local-expert (compact rows). ───────
         let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, total_routes.max(1))?;
+        keepalive.keep_hidden(&packed_hidden);
         // Initialize to -1 (the invalid sentinel), NOT 0. The scatter kernel
         // treats only route_slot < 0 as invalid; zero-init left unfilled compact
         // rows looking like valid slot-0 rows, which in m=1 decode overwrote
@@ -576,6 +584,9 @@ mod dsv4_gpu {
             .stream
             .alloc_zeros::<i32>(experts_per_rank)
             .map_err(|e| anyhow::anyhow!("DSv4 cursors alloc failed: {e}"))?;
+        keepalive.keep_i32(&packed_route_slot);
+        keepalive.keep_f32(&packed_weight);
+        keepalive.keep_i32(&cursors);
         // SAFETY: buffers valid on ctx.stream; shapes checked by the kernel.
         unsafe {
             moe::dsv4_pack_local_experts_with_slots(
@@ -619,11 +630,20 @@ mod dsv4_gpu {
             intermediate
         );
 
-        let expert_out =
-            deepgemm_grouped_experts(ctx, layer, &packed_hidden, &counts, &offsets, swiglu_limit)?;
+        let expert_out = deepgemm_grouped_experts(
+            ctx,
+            layer,
+            &packed_hidden,
+            &counts,
+            &offsets,
+            swiglu_limit,
+            keepalive,
+        )?;
+        keepalive.keep_hidden(&expert_out);
 
         // ── 6. Scatter weighted expert outputs to route slots, combine topk. ────
         let route_out = HiddenStates::zeros(ctx, hidden_dim, total_routes.max(1))?;
+        keepalive.keep_hidden(&route_out);
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
         unsafe {
             moe::dsv4_scatter_all_route_slots(
@@ -659,6 +679,7 @@ mod dsv4_gpu {
         tokens: &[u32],
         hidden: &HiddenStates,
         out: &mut HiddenStates,
+        keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
@@ -702,6 +723,7 @@ mod dsv4_gpu {
         // expert ids as i64 and remaps received ids to rank-local expert ids.
         let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
         gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
+        keepalive.keep_hidden(&logits);
         ctx.sync()?;
         let logits_bf16: Vec<bf16> = ctx
             .stream
@@ -720,10 +742,24 @@ mod dsv4_gpu {
             .stream
             .clone_htod(&weights_host)
             .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-weight H2D failed: {e}"))?;
+        keepalive.keep_i64(&topk_idx_i64);
+        keepalive.keep_f32(&route_weights);
 
         let num_sms = crate::deepep::DeepEpTransport::num_sms()?;
         let mut scratch =
             transport.alloc_scratch(ctx, hidden_dim, num_tokens, topk, cfg.num_experts, num_sms)?;
+        keepalive.keep_hidden(&scratch.recv_x);
+        keepalive.keep_i32(&scratch.recv_src_idx);
+        keepalive.keep_i64(&scratch.recv_topk_idx);
+        keepalive.keep_f32(&scratch.recv_topk_weights);
+        keepalive.keep_i32(&scratch.rank_prefix);
+        keepalive.keep_i32(&scratch.recv_channel_prefix);
+        keepalive.keep_i32(&scratch.send_head);
+        keepalive.keep_i32(&scratch.num_tokens_per_rank);
+        keepalive.keep_i32(&scratch.num_tokens_per_expert);
+        keepalive.keep_u8(&scratch.is_token_in_rank);
+        keepalive.keep_i32(&scratch.channel_prefix_matrix);
+        keepalive.keep_f32(&scratch.combined_topk_weights);
         let num_recv = transport.dispatch(
             ctx,
             &mut scratch,
@@ -766,6 +802,10 @@ mod dsv4_gpu {
                 .stream
                 .alloc_zeros::<i32>(1)
                 .map_err(|e| anyhow::anyhow!("DSv4 DeepEP scan-total alloc failed: {e}"))?;
+            keepalive.keep_i32(&recv_topk_i32);
+            keepalive.keep_i32(&counts);
+            keepalive.keep_i32(&offsets);
+            keepalive.keep_i32(&scan_total);
             unsafe {
                 moe::dsv4_count_local_experts(
                     cache_ptr(&recv_topk_i32, ctx),
@@ -798,6 +838,10 @@ mod dsv4_gpu {
                 .stream
                 .alloc_zeros::<i32>(experts_per_rank)
                 .map_err(|e| anyhow::anyhow!("DSv4 DeepEP cursors alloc failed: {e}"))?;
+            keepalive.keep_hidden(&packed_hidden);
+            keepalive.keep_i32(&packed_route_slot);
+            keepalive.keep_f32(&packed_weight);
+            keepalive.keep_i32(&cursors);
             unsafe {
                 moe::dsv4_pack_local_experts_with_slots(
                     cache_ptr(&scratch.recv_x.data, ctx),
@@ -824,8 +868,11 @@ mod dsv4_gpu {
                 &counts,
                 &offsets,
                 swiglu_limit,
+                keepalive,
             )?;
+            keepalive.keep_hidden(&expert_out);
             let route_out = HiddenStates::zeros(ctx, hidden_dim, recv_slots.max(1))?;
+            keepalive.keep_hidden(&route_out);
             unsafe {
                 moe::dsv4_scatter_all_route_slots(
                     cache_ptr(&expert_out.data, ctx),
@@ -866,8 +913,9 @@ mod dsv4_gpu {
         layer: &Dsv4MoeLayer,
         hidden: &HiddenStates,
         swiglu_limit: f32,
+        keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<HiddenStates> {
-        dsv4_shared_expert(ctx, layer, hidden, swiglu_limit)
+        dsv4_shared_expert(ctx, layer, hidden, swiglu_limit, keepalive)
     }
 
     /// Dispatch DSv4 host routing for one layer: bias-routed → learned router +
@@ -915,6 +963,7 @@ mod dsv4_gpu {
         counts: &cudarc::driver::CudaSlice<i32>,
         offsets: &cudarc::driver::CudaSlice<i32>,
         swiglu_limit: f32,
+        keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<HiddenStates> {
         let num_groups = layer.num_groups;
         let hidden_dim = packed_hidden.hidden_dim;
@@ -962,12 +1011,20 @@ mod dsv4_gpu {
         let act_scales = alloc_zeros_f32(ctx, num_groups * scale_stride_m * inter_scale_cols)?;
         let out_padded = HiddenStates::zeros(ctx, hidden_dim, rows)?;
         let mut out_compact = HiddenStates::zeros(ctx, hidden_dim, packed_hidden.seq_len.max(1))?;
+        keepalive.keep_u8(&input_fp8);
+        keepalive.keep_f32(&input_scales);
+        keepalive.keep_hidden(&w13_out);
+        keepalive.keep_u8(&act_fp8);
+        keepalive.keep_f32(&act_scales);
+        keepalive.keep_hidden(&out_padded);
+        keepalive.keep_hidden(&out_compact);
 
         // masked_m = per-group valid row count = the local-expert counts (D2D).
         let mut masked_m = ctx
             .stream
             .alloc_zeros::<i32>(num_groups)
             .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM masked_m alloc failed: {e}"))?;
+        keepalive.keep_i32(&masked_m);
         {
             let src = counts.slice(0..num_groups);
             let mut dst = masked_m.slice_mut(0..num_groups);
@@ -981,6 +1038,7 @@ mod dsv4_gpu {
             .stream
             .clone_htod(&(0..num_groups as i32).collect::<Vec<i32>>())
             .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM active-expert H2D failed: {e}"))?;
+        keepalive.keep_i32(&active_experts);
 
         let p_hidden = cache_ptr(&packed_hidden.data, ctx);
         let p_in_fp8 = cache_ptr(&input_fp8, ctx);
@@ -1077,6 +1135,7 @@ mod dsv4_gpu {
         layer: &Dsv4MoeLayer,
         hidden: &HiddenStates,
         swiglu_limit: f32,
+        keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<HiddenStates> {
         let hidden_dim = hidden.hidden_dim;
         let num_tokens = hidden.seq_len;
@@ -1115,6 +1174,12 @@ mod dsv4_gpu {
         let act_fp8 = alloc_u8(ctx, max_m * shared_inter)?;
         let act_scales = alloc_zeros_f32(ctx, scale_stride_m * inter_scale_cols)?;
         let out = HiddenStates::zeros(ctx, hidden_dim, num_tokens)?;
+        keepalive.keep_u8(&input_fp8);
+        keepalive.keep_f32(&input_scales);
+        keepalive.keep_hidden(&w13_out);
+        keepalive.keep_u8(&act_fp8);
+        keepalive.keep_f32(&act_scales);
+        keepalive.keep_hidden(&out);
 
         // Single group spanning all tokens: identity expert 0, offset 0, count T.
         let active_experts = ctx
@@ -1133,6 +1198,10 @@ mod dsv4_gpu {
             .stream
             .clone_htod(&[num_tokens as i32])
             .map_err(|e| anyhow::anyhow!("DSv4 shared masked_m H2D failed: {e}"))?;
+        keepalive.keep_i32(&active_experts);
+        keepalive.keep_i32(&active_offsets);
+        keepalive.keep_i32(&counts);
+        keepalive.keep_i32(&masked_m);
 
         let p_hidden = cache_ptr(&hidden.data, ctx);
         let p_in_fp8 = cache_ptr(&input_fp8, ctx);
