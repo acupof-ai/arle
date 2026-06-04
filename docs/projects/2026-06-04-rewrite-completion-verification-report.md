@@ -164,8 +164,13 @@ artifact, not a code bug (current planner.rs is correct; guards added in `8388fc
 
 ## 5. Cutover readiness (delete legacy `infer/`)
 
-~55% ready. No new crate imports legacy `infer/` (no circular blocker). Consumers of
-`infer::server_engine`: `agent`, `cli`, `train` (+ root dev-dep).
+**DECISION (2026-06-04): pragmatic boundary.** The rewrite is the serving truth.
+`agent` and `cli` are **off direct `infer`** (`d11bf3f8`, `63d968c5`); `train` is the
+**sole remaining dependent**, solely for its CUDA OPD-teacher surface. Rather than
+pre-shape that API speculatively, `infer/` is retained **only as train's OPD-teacher
+backend — off every serving path** — and deleted when the OPD surface is built (a
+scoped ~3-4 week GPU-verified project; roadmap:
+[`2026-06-04-train-opd-surface-deletion-gate.md`](2026-06-04-train-opd-surface-deletion-gate.md)).
 
 **Adapter — DONE (this session).** `infer-api` exposes the public `InferenceEngine`
 trait + `LoadedInferenceEngine` dispatch, now consumer-ready:
@@ -179,15 +184,16 @@ trait + `LoadedInferenceEngine` dispatch, now consumer-ready:
 - **HTTP** `/v1/models` added (`c0d78626`); `/v1/completions` + `/v1/chat/completions`
   present (SSE `stream=true` still deferred — in-process consumers use the trait).
 
-**Remaining blockers:**
-1. `cli` / `agent` migration off legacy `infer::server_engine` → `infer-api`
-   (import-only for cli; **not GPU-gated** — the proof step, now unblocked).
-2. **`train`** still needs the CUDA-only OPD control surface (`forward_token_logits`,
-   `remerge_student_lora`, `offload/reload_engine_weights`) that lives behind
-   `infer-cuda` and isn't on the `InferenceEngine` trait — **this is the binding
-   blocker for deleting `infer/` entirely** (cross-agent dependency on the
-   infer-cuda/OPD side).
-3. DSv4 multi-prompt correctness (§8) + the GPU model ports' full verification.
+**Status:**
+1. `agent` migration → `infer-api` — **DONE** (`d11bf3f8`, pure type swap; agent is
+   generic over `InferenceEngine`).
+2. `cli` migration → `infer-api` (engine) + `infer-util` (hf_hub/logging) — **DONE**
+   (`63d968c5`; added `nccl` to infer-api, fixed train's `no-cuda` propagation).
+3. **`train`** — the SOLE remaining `infer` dependent, only for its CUDA OPD-teacher
+   surface (`forward_token_logits`, `remerge_student_lora`, `offload/reload_engine_weights`).
+   Deferred by the §5 decision: the OPD surface is a ~3-4 week GPU-verified build
+   (full-seq logits + offload/reload + per-step LoRA re-merge across 3 executors), not
+   on any serving path. `infer/` deletes when it lands.
 
 Deletion scope: `infer/` = 213 files ~167k LOC / 7.1 MB; new `infer-*` = ~41 files
 ~12k LOC (`infer-models` speculative crate removed this session, `72ebaae4`).
