@@ -633,6 +633,92 @@ pub fn cuda_qwen35_engine_from_model_path(
     Ok(engine)
 }
 
+// ---------------------------------------------------------------------------
+// Concurrent (c>=2) drive — validates the Metal executor's behavior when the
+// planner batches >1 row into a single tick (two requests admitted at once).
+// ---------------------------------------------------------------------------
+
+/// Result of driving N concurrent requests through an engine to completion.
+#[derive(Debug, Clone)]
+pub struct ConcurrentResult {
+    /// Per-request generated token ids, in submission order.
+    pub generated: Vec<Vec<u32>>,
+    /// `Err` message if any `engine.step()` failed (e.g. the Metal executor's
+    /// single-row guard tripping on a multi-row plan), else `None`.
+    pub step_error: Option<String>,
+    /// Scheduler ticks taken to drain (0 if a step errored).
+    pub ticks: u64,
+}
+
+impl ConcurrentResult {
+    /// FNV-1a fingerprint of every request's token stream (order-stable), for a
+    /// cross-process matched A/B of greedy determinism.
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for tokens in &self.generated {
+            for &t in tokens {
+                for byte in t.to_le_bytes() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+            }
+            // separator so [[1],[2]] != [[1,2]]
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+}
+
+/// Submit all `requests` (`(prompt, gen_tokens)`) into `engine` at once, then
+/// drive to idle. Returns each request's generated tokens, the first step error
+/// (if any), and the tick count. A step error is captured rather than
+/// propagated so a caller can assert the Metal single-row guard fires (a
+/// multi-row plan must error loud, never silently mis-decode).
+pub fn drive_concurrent<E, K>(
+    engine: &mut Engine<E, K>,
+    requests: &[(Vec<u32>, usize)],
+) -> ConcurrentResult
+where
+    E: BackendExecutor,
+    K: KvPool,
+{
+    let mut handles = Vec::with_capacity(requests.len());
+    for (prompt, gen_tokens) in requests {
+        handles.push(engine.submit_request(prompt.clone(), *gen_tokens));
+    }
+    let mut ticks = 0u64;
+    let mut step_error = None;
+    while !engine.is_idle() {
+        ticks += 1;
+        if let Err(e) = engine.step() {
+            step_error = Some(e.to_string());
+            break;
+        }
+        // Guard against a runaway loop if a step error leaves work stuck.
+        if ticks > 1_000_000 {
+            step_error = Some("drive_concurrent exceeded tick cap".to_string());
+            break;
+        }
+    }
+    let generated = handles
+        .iter()
+        .map(|h| {
+            engine
+                .completed(*h)
+                .map(|c| c.generated_tokens.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    let ticks = if step_error.is_some() { 0 } else { ticks };
+    ConcurrentResult {
+        generated,
+        step_error,
+        ticks,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,6 +957,224 @@ mod tests {
             "turn 2 should reuse turn 1's prefix: turn1={} turn2={}",
             m.turns[0].ticks_to_first_token,
             m.turns[1].ticks_to_first_token
+        );
+        Ok(())
+    }
+
+    /// c>=2 plan-shape fact (CPU, no MLX): with two requests admitted at once
+    /// and `num_slots=2`, the planner batches both into a single tick's plan —
+    /// proving a genuine concurrent workload produces a multi-row `ForwardPlan`.
+    /// This is the shape the Metal executor's single-row guard must reject.
+    #[test]
+    fn concurrent_plan_batches_multiple_rows() -> Result<()> {
+        // Probe executor that records the max rows seen in any single plan.
+        #[derive(Default)]
+        struct MaxRowProbe {
+            max_rows: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl BackendExecutor for MaxRowProbe {
+            type Inflight = StepOutput;
+            fn submit(
+                &mut self,
+                plan: &ForwardPlan,
+                _kv: &mut dyn KvPool,
+            ) -> Result<Self::Inflight> {
+                let rows = plan.prefill_rows.len() + plan.decode_rows.len();
+                self.max_rows.set(self.max_rows.get().max(rows));
+                let mut tokens = Vec::new();
+                for row in &plan.prefill_rows {
+                    tokens.push(SlotToken {
+                        slot: row.slot,
+                        token: row.tokens.last().copied().unwrap_or(0).wrapping_add(1),
+                        logprob: None,
+                        finish: None,
+                    });
+                }
+                for row in &plan.decode_rows {
+                    tokens.push(SlotToken {
+                        slot: row.slot,
+                        token: row.last_token.wrapping_add(1),
+                        logprob: None,
+                        finish: None,
+                    });
+                }
+                Ok(StepOutput { tokens })
+            }
+            fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+                Ok(PollResult::Ready(inflight))
+            }
+        }
+
+        let executor = MaxRowProbe::default();
+        let max_rows = executor.max_rows.clone();
+        let mut config = SchedulerConfig::for_slots(2);
+        config.chunked_prefill_size = 64;
+        let mut engine = Engine::with_config(executor, MetalKvPool::new(2, 256, 16), config);
+        let res = drive_concurrent(
+            &mut engine,
+            &[(vec![10, 11, 12, 13], 4), (vec![20, 21, 22, 23], 4)],
+        );
+        assert!(res.step_error.is_none(), "echo path should not error");
+        assert_eq!(res.generated.len(), 2);
+        assert!(
+            max_rows.get() >= 2,
+            "two concurrent requests must batch >=2 rows into one plan, saw max {}",
+            max_rows.get()
+        );
+        Ok(())
+    }
+
+    /// REAL Metal c>=2 validation (Qwen3.5-0.8B, fast). Submits two greedy
+    /// requests at once through the Metal engine and drives to idle. The
+    /// rewrite Metal executor supports exactly one row per plan, so the planner's
+    /// multi-row concurrent plan must surface a LOUD error (never silently
+    /// mis-decode), and the pipeline fast path must NOT fire on any concurrent
+    /// step. Prints the per-request fingerprint + pipeline hit count for a
+    /// cross-process matched A/B (run once with `INFER_METAL_PIPELINE=1`, once
+    /// without; the captured-error string and hit count must match).
+    ///   CUDARC_CUDA_VERSION=12060 cargo test --release -p agent-bench \
+    ///     --no-default-features --features metal,no-cuda \
+    ///     metal_c2_fall_to_head_qwen35_08b -- --ignored --nocapture
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "real Metal c>=2 validation; needs --features metal + cached Qwen3.5-0.8B-MLX-4bit"]
+    fn metal_c2_fall_to_head_qwen35_08b() -> Result<()> {
+        let model = "mlx-community/Qwen3.5-0.8B-MLX-4bit";
+        let hits_before = infer_metal::pipeline_fast_path_hits();
+        let (mut engine, _ttft) = metal_engine_from_model_path(model)?;
+        // Two distinct greedy requests, submitted concurrently.
+        let requests = vec![
+            (
+                (0u32..24).map(|i| (i % 30_000) + 2).collect::<Vec<u32>>(),
+                16,
+            ),
+            (
+                (0u32..24)
+                    .map(|i| ((i + 1000) % 30_000) + 2)
+                    .collect::<Vec<u32>>(),
+                16,
+            ),
+        ];
+        let res = drive_concurrent(&mut engine, &requests);
+        let hits_after = infer_metal::pipeline_fast_path_hits();
+        eprintln!(
+            "[metal c>=2 Qwen3.5-0.8B] pipeline_env={:?} step_error={:?} ticks={} \
+             gen_lens={:?} fingerprint={:#018x} pipeline_hits_delta={}",
+            std::env::var("INFER_METAL_PIPELINE").ok(),
+            res.step_error,
+            res.ticks,
+            res.generated.iter().map(Vec::len).collect::<Vec<_>>(),
+            res.fingerprint(),
+            hits_after - hits_before,
+        );
+        // The single-row guard MUST fire: a concurrent plan is multi-row.
+        let err = res
+            .step_error
+            .as_deref()
+            .expect("c>=2 multi-row plan must surface a loud error, not silently decode");
+        assert!(
+            err.contains("exactly one prefill or decode row"),
+            "expected the Metal single-row guard, got: {err}"
+        );
+        // The pipeline fast path must never fire during a concurrent run.
+        assert_eq!(
+            hits_after - hits_before,
+            0,
+            "pipeline fast path fired during a c>=2 run (gating gap!)"
+        );
+        Ok(())
+    }
+
+    /// REAL Metal c>=2 validation on the CANONICAL MoE model
+    /// (`mlx-community/Qwen3.6-35B-A3B-4bit`). Same contract as the 0.8B variant:
+    /// the multi-row concurrent plan must surface the single-row guard, and the
+    /// pipeline must not fire concurrently.
+    ///   cargo test --release -p agent-bench --no-default-features \
+    ///     --features metal,no-cuda \
+    ///     metal_c2_fall_to_head_qwen36_canonical -- --ignored --nocapture
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "real Metal MoE c>=2 validation; needs --features metal + ~19GB cached Qwen3.6-35B-A3B-4bit"]
+    fn metal_c2_fall_to_head_qwen36_canonical() -> Result<()> {
+        let model = "mlx-community/Qwen3.6-35B-A3B-4bit";
+        let hits_before = infer_metal::pipeline_fast_path_hits();
+        let (mut engine, _ttft) = metal_engine_from_model_path(model)?;
+        let requests = vec![
+            (
+                (0u32..24).map(|i| (i % 30_000) + 2).collect::<Vec<u32>>(),
+                16,
+            ),
+            (
+                (0u32..24)
+                    .map(|i| ((i + 1000) % 30_000) + 2)
+                    .collect::<Vec<u32>>(),
+                16,
+            ),
+        ];
+        let res = drive_concurrent(&mut engine, &requests);
+        let hits_after = infer_metal::pipeline_fast_path_hits();
+        eprintln!(
+            "[metal c>=2 Qwen3.6-35B-A3B-4bit] pipeline_env={:?} step_error={:?} ticks={} \
+             gen_lens={:?} fingerprint={:#018x} pipeline_hits_delta={}",
+            std::env::var("INFER_METAL_PIPELINE").ok(),
+            res.step_error,
+            res.ticks,
+            res.generated.iter().map(Vec::len).collect::<Vec<_>>(),
+            res.fingerprint(),
+            hits_after - hits_before,
+        );
+        let err = res
+            .step_error
+            .as_deref()
+            .expect("c>=2 multi-row plan must surface a loud error, not silently decode");
+        assert!(
+            err.contains("exactly one prefill or decode row"),
+            "expected the Metal single-row guard, got: {err}"
+        );
+        assert_eq!(
+            hits_after - hits_before,
+            0,
+            "pipeline fast path fired during a c>=2 run (gating gap!)"
+        );
+        Ok(())
+    }
+
+    /// REAL Metal c=1 greedy fingerprint (Qwen3.5-0.8B). Drives a single greedy
+    /// request to a fixed length and prints the FNV fingerprint of the generated
+    /// ids + the pipeline fast-path hit count. Run once with
+    /// `INFER_METAL_PIPELINE=1` (or default-on) and once with `=0`; greedy is
+    /// deterministic given the prompt, so the fingerprints MUST match
+    /// bit-for-bit — the pipeline path feeds the same argmax token into the next
+    /// `step_session` the HEAD path would. The hit count proves the fast path
+    /// fired (on) / stayed silent (off) at c=1.
+    ///   CUDARC_CUDA_VERSION=12060 cargo test --release -p agent-bench \
+    ///     --no-default-features --features metal,no-cuda \
+    ///     metal_c1_greedy_fingerprint_qwen35_08b -- --ignored --nocapture
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "real Metal c=1 greedy fingerprint; needs --features metal + cached Qwen3.5-0.8B-MLX-4bit"]
+    fn metal_c1_greedy_fingerprint_qwen35_08b() -> Result<()> {
+        let model = "mlx-community/Qwen3.5-0.8B-MLX-4bit";
+        let hits_before = infer_metal::pipeline_fast_path_hits();
+        let (mut engine, _ttft) = metal_engine_from_model_path(model)?;
+        let prompt: Vec<u32> = vec![9707, 11, 1879, 358, 1079, 264, 6722, 13];
+        let res = drive_concurrent(&mut engine, &[(prompt, 32)]);
+        let hits_after = infer_metal::pipeline_fast_path_hits();
+        eprintln!(
+            "[metal c=1 greedy Qwen3.5-0.8B] pipeline_env={:?} step_error={:?} \
+             gen_len={} fingerprint={:#018x} pipeline_hits_delta={} gen={:?}",
+            std::env::var("INFER_METAL_PIPELINE").ok(),
+            res.step_error,
+            res.generated.first().map_or(0, Vec::len),
+            res.fingerprint(),
+            hits_after - hits_before,
+            res.generated.first(),
+        );
+        assert!(res.step_error.is_none(), "c=1 must not error: {res:?}");
+        assert_eq!(
+            res.generated.first().map_or(0, Vec::len),
+            32,
+            "expected 32 greedy tokens"
         );
         Ok(())
     }
