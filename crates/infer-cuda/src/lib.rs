@@ -42,6 +42,8 @@ mod loader;
 #[cfg(feature = "cuda")]
 mod model;
 #[cfg(feature = "cuda")]
+mod nvtx;
+#[cfg(feature = "cuda")]
 mod ops;
 // Qwen3.5 / Qwen3.6 HYBRID model (gated-delta linear attention + periodic full
 // attention, BF16 MoE). cuda-gated: device weight matrices + recurrent state.
