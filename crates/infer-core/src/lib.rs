@@ -239,7 +239,15 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     /// Model-default stop token ids (EOS + configured stops) read once from the
     /// executor. Used as the fallback stop set for requests that supply none.
     model_stop_token_ids: Vec<u32>,
+    /// Optional per-token observer invoked as each token is committed to a
+    /// request, so a serving layer can stream tokens live. `None` by default —
+    /// when unset, token commit behavior is byte-identical to before.
+    on_token: Option<TokenObserver>,
 }
+
+/// Per-token observer: invoked with `(handle, &token)` as each token is committed
+/// to its request. The seam a serving layer installs to stream tokens live.
+pub type TokenObserver = Box<dyn FnMut(RequestHandle, &SlotToken)>;
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Create an engine with permissive resource governance.
@@ -278,7 +286,16 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             pending_plan: None,
             warmed_up: false,
             model_stop_token_ids,
+            on_token: None,
         }
+    }
+
+    /// Install a per-token observer invoked with `(handle, &token)` as each token
+    /// is committed to its request — the seam a serving layer uses to stream
+    /// tokens live. Replaces any previously installed observer; the default
+    /// (no observer) leaves token-commit behavior byte-identical.
+    pub fn set_token_observer(&mut self, observer: TokenObserver) {
+        self.on_token = Some(observer);
     }
 
     /// Run backend warmup exactly once.
@@ -482,6 +499,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             tokens_by_slot.insert(token.slot, token);
         }
         let mut finished_slots = Vec::new();
+        // Tokens committed this step, in commit order (prefill rows then decode
+        // rows), forwarded to `on_token` after the request-borrowing loops so the
+        // `self.active` and `self.on_token` borrows stay disjoint.
+        let mut committed: Vec<(RequestHandle, SlotToken)> = Vec::new();
         let model_stops: &[u32] = &self.model_stop_token_ids;
 
         // Advance chunked prefill. A non-final chunk only moves progress; the
@@ -503,6 +524,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     if let Some(finish) = finish_reason_for(request, &token, model_stops) {
                         finished_slots.push((row.slot, finish));
                     }
+                    committed.push((request.handle, token));
                 }
             } else {
                 request.phase = RequestPhase::Prefilling {
@@ -527,6 +549,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             request.generated_tokens.push(token.token);
             if let Some(finish) = finish_reason_for(request, &token, model_stops) {
                 finished_slots.push((row.slot, finish));
+            }
+            committed.push((request.handle, token));
+        }
+
+        // Stream committed tokens to the observer (if any) before finishing slots,
+        // so a serving layer sees the terminal token ahead of completion.
+        if let Some(observer) = &mut self.on_token {
+            for (handle, token) in &committed {
+                observer(*handle, token);
             }
         }
 
