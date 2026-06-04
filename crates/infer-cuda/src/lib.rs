@@ -23,6 +23,8 @@ mod attention;
 mod decode_graph;
 // Not cuda-gated: pure host capture-key math, CPU-testable without nvcc.
 mod decode_graph_key;
+#[cfg(all(feature = "cuda", feature = "deepep"))]
+mod deepep;
 // DSv4-Flash FP8 model (loader + structs + MLA KV arena). cuda-gated: holds
 // device weight matrices + the shared DSv4 FP8 DeepGEMM caches.
 #[cfg(feature = "cuda")]
