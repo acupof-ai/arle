@@ -41,6 +41,7 @@ mod http;
 mod schema;
 mod tokenizer;
 
+pub use execution::StreamItem;
 use execution::{Submission, engine_loop};
 
 pub use http::openai_router;
@@ -212,6 +213,7 @@ where
                 sampling,
                 handle_tx,
                 completion_tx,
+                stream_tx: None,
             })
             .map_err(|_| anyhow!("engine thread closed; cannot submit"))?;
         let handle = handle_rx
@@ -221,6 +223,47 @@ where
             handle,
             completion_rx,
         })
+    }
+
+    /// Submit a request and additionally receive its tokens live.
+    ///
+    /// Like [`submit`](Self::submit) but returns a [`StreamItem`] receiver that
+    /// yields each token as it commits, then a terminal [`StreamItem::Done`]. The
+    /// returned [`RequestTicket`] still resolves the full completion via
+    /// [`collect`](RequestTicket::collect) — streaming is additive.
+    pub fn submit_streaming(
+        &self,
+        prompt: Vec<u32>,
+        max_tokens: usize,
+        sampling: SamplingParams,
+    ) -> Result<(RequestTicket, Receiver<StreamItem>)> {
+        let submit_tx = self
+            .submit_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("ServeHandle already shut down"))?;
+        let (handle_tx, handle_rx) = mpsc::channel::<RequestHandle>();
+        let (completion_tx, completion_rx) = mpsc::channel::<CompletedRequest>();
+        let (stream_tx, stream_rx) = mpsc::channel::<StreamItem>();
+        submit_tx
+            .send(Submission {
+                prompt,
+                max_tokens,
+                sampling,
+                handle_tx,
+                completion_tx,
+                stream_tx: Some(stream_tx),
+            })
+            .map_err(|_| anyhow!("engine thread closed; cannot submit"))?;
+        let handle = handle_rx
+            .recv()
+            .map_err(|_| anyhow!("engine thread closed before assigning a request handle"))?;
+        Ok((
+            RequestTicket {
+                handle,
+                completion_rx,
+            },
+            stream_rx,
+        ))
     }
 
     /// Block until the request behind `ticket` completes and return its result.
@@ -341,6 +384,47 @@ mod tests {
         // Echo rule: final prefill chunk commits last_prompt + 1, then +1/decode.
         assert_eq!(first_done.generated_tokens, vec![13, 14, 15, 16, 17]);
         assert_eq!(second_done.generated_tokens, vec![102, 103, 104]);
+
+        serve.shutdown().expect("engine thread joins cleanly");
+        Ok(())
+    }
+
+    /// `submit_streaming` yields each token live in commit order, then exactly one
+    /// terminal `Done`; the ticket still resolves the same full completion.
+    #[test]
+    fn submit_streaming_yields_each_token_then_done() -> Result<()> {
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_prompt_tokens: 4096,
+            max_total_tokens: 8192,
+            ..SchedulerConfig::default()
+        };
+        let kv = MetalKvPool::new(1, 256, 16);
+        let serve = ServeHandle::spawn(EchoExecutor, kv, config);
+
+        let (ticket, stream_rx) =
+            serve.submit_streaming(vec![10, 11, 12], 5, SamplingParams::default())?;
+
+        let mut streamed = Vec::new();
+        let mut done = None;
+        while let Ok(item) = stream_rx.recv() {
+            match item {
+                StreamItem::Token { token, .. } => streamed.push(token),
+                StreamItem::Done(completed) => {
+                    done = Some(completed);
+                    break;
+                }
+            }
+        }
+        // Echo rule: final prefill chunk commits last_prompt+1, then +1/decode.
+        assert_eq!(
+            streamed,
+            vec![13, 14, 15, 16, 17],
+            "tokens stream in commit order"
+        );
+        let done = done.expect("terminal Done item");
+        assert_eq!(done.generated_tokens, streamed);
+        assert_eq!(ticket.collect()?.generated_tokens, streamed);
 
         serve.shutdown().expect("engine thread joins cleanly");
         Ok(())
