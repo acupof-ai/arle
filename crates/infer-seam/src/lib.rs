@@ -50,6 +50,15 @@ pub trait BackendExecutor {
     fn warmup(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Model-default stop token ids (EOS + configured stop ids).
+    ///
+    /// Engine-core uses these as the fallback stop set for a request that did
+    /// not supply its own `stop_token_ids`. The default is empty so backends
+    /// that do not expose model defaults keep their existing behavior.
+    fn model_stop_token_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// Backend-internal collective communication seam.
