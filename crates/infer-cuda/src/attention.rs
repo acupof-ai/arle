@@ -10,7 +10,7 @@ use cuda_kernels::tensor::WeightFormat;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 
-use crate::dsv4::{Dsv4Attention, Dsv4Compressor, Dsv4Indexer};
+use crate::dsv4::{Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer};
 use crate::loader::PageMeta;
 
 pub(crate) struct Dsv4CompressorState {
@@ -753,6 +753,7 @@ pub(crate) fn mla_attention(
     start_pos: usize,
     tp_rank: usize,
     out: &mut HiddenStates,
+    keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
     ensure!(
         hidden.hidden_dim == config.hidden_size,
@@ -827,14 +828,19 @@ pub(crate) fn mla_attention(
     // ── 1. Q-LoRA: wq_a (down) → q_norm RMSNorm → wq_b (up to per-head Q).
     let mut c_q = HiddenStates::zeros(ctx, attention.wq_a.rows, token_count)?;
     dsv4_linear(ctx, &attention.wq_a, hidden, &mut c_q)?;
+    keepalive.keep_hidden(&c_q);
     let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
+    keepalive.keep_hidden(&c_q_normed);
     let mut q_raw = HiddenStates::zeros(ctx, local_width, token_count)?;
     dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)?;
+    keepalive.keep_hidden(&q_raw);
 
     // ── 2. KV latent: wkv (down to the single compressed latent) → kv_norm.
     let mut kv_raw = HiddenStates::zeros(ctx, head_dim, token_count)?;
     dsv4_linear(ctx, &attention.wkv, hidden, &mut kv_raw)?;
+    keepalive.keep_hidden(&kv_raw);
     let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
+    keepalive.keep_hidden(&kv_normed);
 
     // ── 3. Partial RoPE on the trailing rope_dim cols of Q (per head) and K.
     let mut q_prepared = HiddenStates::zeros(ctx, local_width, token_count)?;
@@ -867,6 +873,8 @@ pub(crate) fn mla_attention(
             .result()?;
         }
     }
+    keepalive.keep_hidden(&q_prepared);
+    keepalive.keep_hidden(&k_prepared);
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
     let mut local_attn = HiddenStates::zeros(ctx, local_width, token_count)?;
@@ -930,6 +938,7 @@ pub(crate) fn mla_attention(
                 overlap,
                 start_pos,
                 true,
+                keepalive,
             )?;
         }
 
@@ -958,6 +967,7 @@ pub(crate) fn mla_attention(
                     true,
                     start_pos,
                     false,
+                    keepalive,
                 )?;
             }
             let index_keys = &state
@@ -974,6 +984,7 @@ pub(crate) fn mla_attention(
                 index_keys,
                 start_pos,
                 compress_ratio,
+                keepalive,
             )?)
         } else {
             None
@@ -1042,12 +1053,17 @@ pub(crate) fn mla_attention(
             )
             .result()?;
         }
+        if let Some(sel) = selected.as_ref() {
+            keepalive.keep_i32(sel);
+        }
     }
+    keepalive.keep_hidden(&local_attn);
 
     // ── 5. O-LoRA: wo_a (per o-group, down to the output latent) → wo_b (up
     // back to hidden). Row-parallel: the all-reduce-sum is the model's concern.
     let mut latent = HiddenStates::zeros(ctx, attention.wo_a.rows, token_count)?;
     dsv4_linear(ctx, &attention.wo_a, &local_attn, &mut latent)?;
+    keepalive.keep_hidden(&latent);
     dsv4_linear(ctx, &attention.wo_b, &latent, out)?;
     Ok(())
 }
@@ -1072,6 +1088,7 @@ fn compressor_forward(
     overlap: bool,
     start_pos: usize,
     apply_rope: bool,
+    keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
     ensure!(ratio > 0, "DSv4 compressor ratio must be non-zero");
     let width = if overlap { 2 * head_dim } else { head_dim };
@@ -1106,8 +1123,10 @@ fn compressor_forward(
 
     let mut kv_raw = HiddenStates::zeros(ctx, width, token_count)?;
     dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv_raw)?;
+    keepalive.keep_hidden(&kv_raw);
     let mut score_raw = HiddenStates::zeros(ctx, width, token_count)?;
     dsv4_linear(ctx, &compressor.wgate, hidden, &mut score_raw)?;
+    keepalive.keep_hidden(&score_raw);
 
     let rope = &config.rope_parameters;
     // Compressed keys use compress_rope_theta with NO YaRN (original_seq_len = 0).
@@ -1178,11 +1197,14 @@ fn csa_select(
     keys: &HiddenStates,
     start_pos: usize,
     ratio: usize,
+    keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<CudaSlice<i32>> {
     let mut q_i = HiddenStates::zeros(ctx, indexer.wq_b.rows, c_q_normed.seq_len)?;
     dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)?;
+    keepalive.keep_hidden(&q_i);
     let mut weights = HiddenStates::zeros(ctx, indexer.weights_proj.rows, hidden.seq_len)?;
     dsv4_linear(ctx, &indexer.weights_proj, hidden, &mut weights)?;
+    keepalive.keep_hidden(&weights);
 
     ensure!(
         q_i.hidden_dim.is_multiple_of(config.index_head_dim),
