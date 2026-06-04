@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool};
 use cudarc::driver::CudaSlice;
+use deepseek_spec::Shard;
+use infer_topo::{ShardingSpec, TpConfig};
 use qwen3_spec::Qwen3Config;
 use safetensors::{SafeTensors, tensor::Dtype};
 
@@ -782,6 +784,130 @@ impl SafetensorLoader {
         }
     }
 
+    fn dsv4_scale_shard_for_value_shard(
+        name: &str,
+        value: &ShardingSpec,
+        scale_total: usize,
+        block: usize,
+    ) -> Result<ShardingSpec> {
+        ensure!(block > 0, "{name}: FP8 scale block must be non-zero");
+        ensure!(
+            value.total.div_ceil(block) == scale_total,
+            "{name}: scale total {scale_total} does not match ceil({}/{block})",
+            value.total
+        );
+        ensure!(
+            value.offset.is_multiple_of(block) && value.size.is_multiple_of(block),
+            "{name}: TP shard {:?} is not aligned to FP8 block size {block}",
+            value.range()
+        );
+        Ok(ShardingSpec {
+            offset: value.offset / block,
+            size: value.size / block,
+            total: scale_total,
+        })
+    }
+
+    /// Load a DSv4 block-scaled FP8 matrix and apply a TP shard before upload.
+    /// The FP8 payload and E8M0 block scales must be sliced together; otherwise
+    /// the shard reads valid FP8 bytes with the wrong scale blocks.
+    pub(crate) fn load_dsv4_block_scaled_sharded(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        shard: Shard,
+        tp: &TpConfig,
+    ) -> Result<DeviceMatrix> {
+        if tp.is_single() || shard == Shard::Replicated {
+            return self.load_dsv4_block_scaled(ctx, name);
+        }
+
+        let tensor = self.load_raw_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D quantized tensor, got shape {:?}",
+            tensor.shape
+        );
+        let scale_name = name
+            .strip_suffix(".weight")
+            .map(|prefix| format!("{prefix}.scale"))
+            .ok_or_else(|| anyhow!("{name}: quantized DSv4 tensor must end with .weight"))?;
+        let scale = self.load_raw_tensor(&scale_name)?;
+        ensure!(
+            scale.dtype == Dtype::F8_E8M0,
+            "{scale_name}: expected F8_E8M0 block scale, got {:?}",
+            scale.dtype
+        );
+        ensure!(
+            scale.shape.len() == 2,
+            "{scale_name}: expected 2D scale, got shape {:?}",
+            scale.shape
+        );
+
+        match tensor.dtype {
+            Dtype::F8_E4M3 => {
+                let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+                let (scale_rows, scale_cols) = (scale.shape[0], scale.shape[1]);
+                let (weight, scales) = match shard {
+                    Shard::Column { dim: 0 } => {
+                        let spec = infer_topo::column_shard(rows, tp);
+                        let weight = crate::shard_slice::shard_column_parallel(
+                            &tensor.bytes,
+                            rows,
+                            cols,
+                            1,
+                            &spec,
+                        )?;
+                        let scale_spec =
+                            Self::dsv4_scale_shard_for_value_shard(name, &spec, scale_rows, 128)?;
+                        let scales = crate::shard_slice::shard_column_parallel(
+                            &scale.bytes,
+                            scale_rows,
+                            scale_cols,
+                            1,
+                            &scale_spec,
+                        )?;
+                        (weight, scales)
+                    }
+                    Shard::Row { dim: 1 } => {
+                        let spec = infer_topo::row_shard(cols, tp);
+                        let weight = crate::shard_slice::shard_row_parallel(
+                            &tensor.bytes,
+                            rows,
+                            cols,
+                            1,
+                            &spec,
+                        )?;
+                        let scale_spec =
+                            Self::dsv4_scale_shard_for_value_shard(name, &spec, scale_cols, 128)?;
+                        let scales = crate::shard_slice::shard_row_parallel(
+                            &scale.bytes,
+                            scale_rows,
+                            scale_cols,
+                            1,
+                            &scale_spec,
+                        )?;
+                        (weight, scales)
+                    }
+                    Shard::Replicated => unreachable!("replicated handled above"),
+                    other => bail!("{name}: unsupported DSv4 FP8 TP shard policy {other:?}"),
+                };
+                DeviceMatrix::from_dsv4_fp8_block_scaled(
+                    ctx,
+                    &weight.bytes,
+                    &scales.bytes,
+                    weight.rows,
+                    weight.cols,
+                    scales.rows,
+                    scales.cols,
+                )
+                .with_context(|| format!("upload sharded DSv4 FP8 matrix {name}"))
+            }
+            Dtype::I8 => bail!("{name}: non-replicated DSv4 FP4 TP sharding is not implemented"),
+            other => bail!("{name}: unsupported DSv4 block-scaled dtype {other:?}"),
+        }
+    }
+
     /// Build the per-rank DSv4 MoE layer (FP8 DeepGEMM expert caches + router).
     /// Bias-routed layers load `gate.bias`; hash-routed layers load the host
     /// `gate.tid2eid` table instead (and skip the bias).
@@ -809,6 +935,37 @@ impl SafetensorLoader {
             let down = self.load_dsv4_block_scaled(ctx, &expert.w2)?;
             w2.push(Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &down)?);
         }
+        let first_w13 = w13
+            .first()
+            .ok_or_else(|| anyhow!("DSv4 MoE layer has no local experts"))?;
+        let first_w2 = w2
+            .first()
+            .ok_or_else(|| anyhow!("DSv4 MoE layer has no local down experts"))?;
+        let hidden_dim = first_w13.cols;
+        let intermediate = first_w2.cols;
+        ensure!(
+            first_w13.rows == 2 * intermediate,
+            "DSv4 grouped w13 rows {} != 2*intermediate {}",
+            first_w13.rows,
+            2 * intermediate
+        );
+        ensure!(
+            first_w2.rows == hidden_dim,
+            "DSv4 grouped w2 rows {} != hidden_dim {hidden_dim}",
+            first_w2.rows
+        );
+        let w13_grouped =
+            crate::moe::build_grouped_cache(ctx, w13.as_slice(), 2 * intermediate, hidden_dim)?;
+        let w2_grouped =
+            crate::moe::build_grouped_cache(ctx, w2.as_slice(), hidden_dim, intermediate)?;
+        let num_groups = w13_grouped.groups;
+        ensure!(
+            num_groups == split.experts_per_rank && w2_grouped.groups == num_groups,
+            "DSv4 grouped expert count mismatch: w13={} w2={} expected {}",
+            w13_grouped.groups,
+            w2_grouped.groups,
+            split.experts_per_rank
+        );
 
         let gate = self.load_dsv4_bf16_matrix(ctx, &names.gate_weight)?;
         let (gate_bias, hash_tid2eid) = match routing_kind {
@@ -840,8 +997,11 @@ impl SafetensorLoader {
         let shared_w2 = Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &shared_down)?;
 
         Ok(crate::dsv4::Dsv4MoeLayer {
-            w13,
-            w2,
+            w13_grouped,
+            w2_grouped,
+            num_groups,
+            hidden_dim,
+            intermediate,
             gate,
             gate_bias,
             hash_tid2eid,
@@ -898,7 +1058,7 @@ impl SafetensorLoader {
     ) -> Result<DeviceMatrix> {
         let dtype = self.load_raw_tensor(name)?.dtype;
         match dtype {
-            Dtype::BF16 => self.load_dsv4_bf16_matrix(ctx, name),
+            Dtype::BF16 | Dtype::F32 => self.load_dsv4_bf16_matrix(ctx, name),
             Dtype::F8_E4M3 | Dtype::I8 => self.load_dsv4_block_scaled(ctx, name),
             other => bail!("{name}: unsupported DSv4 global matrix dtype {other:?}"),
         }
@@ -911,16 +1071,39 @@ impl SafetensorLoader {
     pub(crate) fn load_dsv4_attention(
         &self,
         ctx: &DeviceContext,
+        config: &deepseek_spec::DeepSeekV4Config,
         names: &deepseek_spec::DeepSeekV4AttentionTensorNames,
+        tp: &TpConfig,
     ) -> Result<crate::dsv4::Dsv4Attention> {
         Ok(crate::dsv4::Dsv4Attention {
             wq_a: self.load_dsv4_block_scaled(ctx, &names.wq_a)?,
             q_norm: self.load_dsv4_vec(ctx, &names.q_norm)?,
-            wq_b: self.load_dsv4_block_scaled(ctx, &names.wq_b)?,
+            wq_b: self.load_dsv4_block_scaled_sharded(
+                ctx,
+                &names.wq_b,
+                names
+                    .shard_for(config, &names.wq_b, tp.world_size)
+                    .unwrap_or(Shard::Replicated),
+                tp,
+            )?,
             wkv: self.load_dsv4_block_scaled(ctx, &names.wkv)?,
             kv_norm: self.load_dsv4_vec(ctx, &names.kv_norm)?,
-            wo_a: self.load_dsv4_block_scaled(ctx, &names.wo_a)?,
-            wo_b: self.load_dsv4_block_scaled(ctx, &names.wo_b)?,
+            wo_a: self.load_dsv4_block_scaled_sharded(
+                ctx,
+                &names.wo_a,
+                names
+                    .shard_for(config, &names.wo_a, tp.world_size)
+                    .unwrap_or(Shard::Replicated),
+                tp,
+            )?,
+            wo_b: self.load_dsv4_block_scaled_sharded(
+                ctx,
+                &names.wo_b,
+                names
+                    .shard_for(config, &names.wo_b, tp.world_size)
+                    .unwrap_or(Shard::Replicated),
+                tp,
+            )?,
             attn_sink: self.load_dsv4_vec(ctx, &names.attn_sink)?,
             compressor: names
                 .compressor
