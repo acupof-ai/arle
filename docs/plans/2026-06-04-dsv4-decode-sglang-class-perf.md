@@ -66,3 +66,46 @@ Steps 2–5 are a multi-commit architecture arc, not a single fix. The hard prer
 the biggest host-overhead kill is step 2 (on-device routing). Sources are upstream
 precedent (hypothesis-grade per the upstream-scan skill); each lands only on a local
 H20 A/B at the production shape.
+
+## 5. Measured 卡点 — host-route baseline decode profile (2026-06-05)
+
+Full-chain nsys profile, per-stage NVTX (`infer-cuda/src/nvtx.rs`), DSv4-Flash FP8
+TP=8/EP=8 on 8×H20, decode steady-state (16/16 correct, `clean_tokens` ==
+oracle), **236.8 ms/token** (4.223 tok/s under nsys). This is the ground-truth
+that re-prioritizes the levers above (replaces the earlier API-level estimate).
+
+| Stage (NVTX) | ms/token | wall % | Dominated by (API) |
+|---|---|---|---|
+| `moe_route` | 98.1 | **41.4%** | `cuStreamSynchronize` 93.7 (39.6%) — host-route D2H+sync → **#24** |
+| `deepgemm_grouped` | 92.0 | **38.8%** | `cuMemAllocAsync` 87.4 (36.9%) — per-step grouped-GEMM allocs → **#29** |
+| `mla_attn` | 11.9 | 5.0% | real kernel (FlashMLA path) |
+| `shared_hc` | 9.3 | 3.9% | real kernel (shared expert + hyperconnections) |
+| `moe_allreduce` | 1.1 | 0.5% | NCCL |
+| `combine_scatter` | 1.1 | 0.5% | DeepEP combine |
+| `attn_allreduce` | 0.8 | 0.4% | NCCL |
+| `lm_head_sample` | 0.8 | 0.3% | |
+
+API cross-check (per token): `cuStreamSynchronize` 93.7 ms (39.6%) +
+`cuMemAllocAsync` 87.4 ms (36.9%) = **~76% host overhead**; `cudaLaunchKernel`
+7.8 ms (3.3%); `cuMemcpyDtoHAsync` 1.2 ms (0.5%). Real kernel floor (MLA + HC +
+GEMM compute + launches) ≈ 15–20%.
+
+**Re-prioritized levers (quantified):**
+- **#24 on-device routing** kills `moe_route`'s 41.4% (the `cuStreamSynchronize`).
+  Route kernel already licensed (0-diff); async wiring blocked on #29.
+- **#29 persistent scratch pool** kills `deepgemm_grouped`'s 38.8% (the
+  `cuMemAllocAsync`) — *and* is the async-router correctness fix: the garbage
+  under sync-free was localized (post-MoE keepalive / keepalive-all / same-stream
+  event all FAIL) to a `cudaMallocAsync`/free/raw-pointer **reuse-boundary**, not
+  buffer lifetime. Fixed device addresses remove both the alloc cost and the
+  race. Scoped to decode/B=1 (prefill stays on-demand — avoid 512/2048 resident
+  workspace peak).
+- #24 + #29 together attack **~80% of decode wall-clock** → 236.8 ms/token should
+  drop toward the ~40–50 ms kernel floor. **#25 full decode graph** then attacks
+  the residual launch overhead. Whether 5–6 ms is physically reachable on H20
+  (vs H100/H800) is a kernel-floor question answered *after* host+launch overhead
+  is removed — license-or-kill on wall-clock, not asserted.
+
+Artifacts (pod): `dsv4_hostroute_decode2.{nsys-rep,log}`. The NVTX instrumentation
+commits with the #29 patch; the before/after profile pair lands as the #29 wins
+entry.
