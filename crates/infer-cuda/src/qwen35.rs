@@ -25,14 +25,17 @@
 //! points for FP8 (`dsv4_fp8_grouped_gemm`) / 4-bit (Qwen3.6-4bit q4k) are inside
 //! [`crate::moe::moe_forward`]'s two `moe_bf16_grouped_gemm_*` calls — a follow-up.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use cuda_kernels::tensor::{HostMatrixSnapshot, offload_raw_slice, reload_raw_slice};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use half::bf16;
 use infer_plan::SamplingParams;
-use qwen35_spec::{Qwen35AttentionTensorNames, Qwen35Config};
+use qwen35_spec::{LayerType, Qwen35AttentionTensorNames, Qwen35Config};
 
 use crate::executor::sample_cuda_token;
 use crate::loader::SafetensorLoader;
@@ -42,6 +45,42 @@ use crate::ops::{
 };
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
+
+/// Raw (un-scaled) LoRA A/B matrices for one full-attention q/v projection,
+/// pushed from the train crate's OPD student loop for the per-step re-merge.
+///
+/// `a` is row-major `[rank, in_features]`, `b` is row-major
+/// `[out_features, rank]` — the PEFT on-disk convention (mirrors the legacy
+/// `infer/src/model/qwen35/lora.rs::StudentLoraMatrices`). Values are raw;
+/// `scale = alpha / rank` is applied exactly once at merge time.
+#[derive(Debug, Clone)]
+pub struct StudentLoraMatrices {
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+    pub rank: usize,
+    pub in_features: usize,
+    pub out_features: usize,
+}
+
+/// One full-attention layer's optional q/v adapter for the in-memory re-merge
+/// sync. `layer_idx` is the absolute model-layer index (must name a
+/// full-attention layer).
+#[derive(Debug, Clone)]
+pub struct StudentLoraLayer {
+    pub layer_idx: usize,
+    pub q_proj: Option<StudentLoraMatrices>,
+    pub v_proj: Option<StudentLoraMatrices>,
+}
+
+/// A full LoRA update pushed from the train crate into the infer student
+/// engine. Carries raw A/B per full-attention layer plus `rank`/`alpha`; the
+/// merge path applies `scale = alpha / rank` once.
+#[derive(Debug, Clone)]
+pub struct StudentLoraUpdate {
+    pub layers: Vec<StudentLoraLayer>,
+    pub rank: usize,
+    pub alpha: f32,
+}
 
 /// Per-slot full-attention K/V cache (one contiguous bf16 cache per full-attn
 /// layer) + per-slot gated-delta recurrent state (state + conv ring per
@@ -181,6 +220,85 @@ pub(crate) struct Qwen35Model {
     moe_config: Option<infer_moe::MoeConfig>,
     /// Per-slot cache capacity (full-attn contiguous cache rows).
     max_seq_len: usize,
+    /// Host-resident weight snapshot while the engine is offloaded for the OPD
+    /// teacher time-share. `Some` iff [`Qwen35Model::offload_engine_weights`] ran
+    /// without a matching [`Qwen35Model::reload_engine_weights`]; the device
+    /// weight buffers are 1-element placeholders in that state and must NOT be
+    /// forwarded through until reloaded.
+    offloaded: Option<Box<OffloadedWeights>>,
+    /// Pristine base-weight cache for the per-step student LoRA re-merge, keyed
+    /// by absolute (full-attention) layer index. Populated lazily on the first
+    /// [`Qwen35Model::remerge_student_lora`] call (before any merge mutates the
+    /// resident weights) so every re-merge recomputes `W = base + scale·B·A`
+    /// from the *original* checkpoint weight, never from an already-merged one.
+    /// Each entry is `(q_proj base bf16, v_proj base bf16)` row-major host copies.
+    lora_base: HashMap<usize, LoraBaseWeights>,
+}
+
+/// Pristine host copies of one full-attention layer's q/v projection weights,
+/// captured on the first re-merge so subsequent merges start from the original
+/// checkpoint values, not the previously-merged ones.
+#[derive(Debug, Clone, Default)]
+struct LoraBaseWeights {
+    q_proj: Option<Vec<bf16>>,
+    v_proj: Option<Vec<bf16>>,
+}
+
+/// Host-resident snapshot of one transformer block's device weight buffers,
+/// captured by [`Qwen35Model::offload_engine_weights`]. Reload restores in the
+/// same field order.
+struct OffloadedBlock {
+    input_layernorm: Vec<bf16>,
+    post_attention_layernorm: Vec<bf16>,
+    attn: OffloadedAttn,
+    /// Dense MLP snapshot — `Some` iff this layer is dense (mutually exclusive
+    /// with `moe`, mirroring [`Qwen35Layer`]).
+    mlp: Option<OffloadedDenseMlp>,
+}
+
+struct OffloadedDenseMlp {
+    gate_proj: HostMatrixSnapshot,
+    up_proj: HostMatrixSnapshot,
+    down_proj: HostMatrixSnapshot,
+}
+
+/// Host snapshot of a full-attention block (mirrors [`FullAttn`]).
+struct OffloadedFullAttn {
+    q_proj: HostMatrixSnapshot,
+    k_proj: HostMatrixSnapshot,
+    v_proj: HostMatrixSnapshot,
+    o_proj: HostMatrixSnapshot,
+    q_norm: Vec<bf16>,
+    k_norm: Vec<bf16>,
+}
+
+/// Host snapshot of a gated-delta linear-attention block (mirrors [`LinearAttn`]).
+struct OffloadedLinearAttn {
+    in_proj_qkv: HostMatrixSnapshot,
+    in_proj_z: HostMatrixSnapshot,
+    in_proj_b: HostMatrixSnapshot,
+    in_proj_a: HostMatrixSnapshot,
+    conv1d_weight: Vec<bf16>,
+    dt_bias: Vec<bf16>,
+    a_log: Vec<f32>,
+    norm_weight: Vec<f32>,
+    out_proj: HostMatrixSnapshot,
+}
+
+enum OffloadedAttn {
+    // Boxed: mirrors the device-side `Qwen35Attn` (large, size-skewed variants);
+    // boxing keeps the enum small (clippy::large_enum_variant).
+    Full(Box<OffloadedFullAttn>),
+    Linear(Box<OffloadedLinearAttn>),
+}
+
+/// Full host-resident snapshot of all model device weights while offloaded.
+/// `embed_tokens` doubles as the (tied) lm_head when `lm_head` is `None`.
+struct OffloadedWeights {
+    embed_tokens: HostMatrixSnapshot,
+    lm_head: Option<HostMatrixSnapshot>,
+    norm: Vec<bf16>,
+    blocks: Vec<OffloadedBlock>,
 }
 
 impl std::fmt::Debug for Qwen35Model {
@@ -330,7 +448,252 @@ impl Qwen35Model {
             sin_cache,
             moe_config: Some(moe_config),
             max_seq_len,
+            offloaded: None,
+            lora_base: HashMap::new(),
         })
+    }
+
+    /// Move every device weight buffer to host RAM and free the VRAM (OPD teacher
+    /// time-share). Idempotent: a no-op (returns 0) if already offloaded.
+    ///
+    /// Returns the total device VRAM (bytes) freed. After this returns the model
+    /// must NOT be forwarded through until [`Qwen35Model::reload_engine_weights`].
+    /// The freed weight blocks return to the device's async memory pool, which the
+    /// co-resident OPD student/autograd allocator reuses for the backward pass —
+    /// the VRAM headroom the time-share buys. Per-slot KV / recurrent state
+    /// ([`Qwen35SlotState`]) is owned by the executor and untouched here.
+    ///
+    /// MoE expert weight offload is NOT supported (OPD is dense-only): a MoE
+    /// layer bails so the caller does not silently keep ~19 GB of expert VRAM
+    /// resident while believing the engine is offloaded.
+    pub(crate) fn offload_engine_weights(&mut self) -> Result<usize> {
+        if self.offloaded.is_some() {
+            return Ok(0);
+        }
+        let ctx = self.ctx.clone();
+        // Drain ALL in-flight GPU work before snapshotting. The OPD step has
+        // co-resident allocators (infer-teacher + train autograd) sharing one
+        // device/pool on separate streams; a full synchronize quiesces every
+        // stream so the D2H snapshot and the subsequent block frees do not race
+        // other-stream allocations from the shared async pool.
+        ctx.sync()?;
+        let mut freed = 0usize;
+
+        let embed_tokens = self.embed_tokens.offload_to_host(&ctx)?;
+        freed += embed_tokens.freed_bytes();
+        let lm_head = match self.lm_head.as_mut() {
+            Some(head) => {
+                let snap = head.offload_to_host(&ctx)?;
+                freed += snap.freed_bytes();
+                Some(snap)
+            }
+            None => None,
+        };
+        let (norm, norm_n) = self.norm.offload_to_host(&ctx)?;
+        freed += norm_n;
+
+        let mut blocks = Vec::with_capacity(self.layers.len());
+        for layer in &mut self.layers {
+            ensure!(
+                layer.moe.is_none(),
+                "Qwen3.6 MoE weight offload is not supported (OPD teacher time-share is dense-only)"
+            );
+            let (input_layernorm, in_ln_n) = layer.input_layernorm.offload_to_host(&ctx)?;
+            let (post_attention_layernorm, post_ln_n) =
+                layer.post_attention_layernorm.offload_to_host(&ctx)?;
+            freed += in_ln_n + post_ln_n;
+
+            let mlp = match layer.mlp.as_mut() {
+                Some(dense) => {
+                    let gate_proj = dense.gate_proj.offload_to_host(&ctx)?;
+                    let up_proj = dense.up_proj.offload_to_host(&ctx)?;
+                    let down_proj = dense.down_proj.offload_to_host(&ctx)?;
+                    freed +=
+                        gate_proj.freed_bytes() + up_proj.freed_bytes() + down_proj.freed_bytes();
+                    Some(OffloadedDenseMlp {
+                        gate_proj,
+                        up_proj,
+                        down_proj,
+                    })
+                }
+                None => None,
+            };
+
+            let attn = match &mut layer.attn {
+                Qwen35Attn::Full(full) => {
+                    let q_proj = full.q_proj.offload_to_host(&ctx)?;
+                    let k_proj = full.k_proj.offload_to_host(&ctx)?;
+                    let v_proj = full.v_proj.offload_to_host(&ctx)?;
+                    let o_proj = full.o_proj.offload_to_host(&ctx)?;
+                    let (q_norm, qn) = full.q_norm.offload_to_host(&ctx)?;
+                    let (k_norm, kn) = full.k_norm.offload_to_host(&ctx)?;
+                    freed += q_proj.freed_bytes()
+                        + k_proj.freed_bytes()
+                        + v_proj.freed_bytes()
+                        + o_proj.freed_bytes()
+                        + qn
+                        + kn;
+                    OffloadedAttn::Full(Box::new(OffloadedFullAttn {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        o_proj,
+                        q_norm,
+                        k_norm,
+                    }))
+                }
+                Qwen35Attn::Linear(lin) => {
+                    let in_proj_qkv = lin.in_proj_qkv.offload_to_host(&ctx)?;
+                    let in_proj_z = lin.in_proj_z.offload_to_host(&ctx)?;
+                    let in_proj_b = lin.in_proj_b.offload_to_host(&ctx)?;
+                    let in_proj_a = lin.in_proj_a.offload_to_host(&ctx)?;
+                    let (conv1d_weight, conv_n) = lin.conv1d_weight.offload_to_host(&ctx)?;
+                    let (dt_bias, dt_n) = lin.dt_bias.offload_to_host(&ctx)?;
+                    let (a_log, al) = offload_raw_slice(&ctx, &mut lin.a_log)?;
+                    let (norm_weight, nw) = offload_raw_slice(&ctx, &mut lin.norm_weight)?;
+                    let out_proj = lin.out_proj.offload_to_host(&ctx)?;
+                    freed += in_proj_qkv.freed_bytes()
+                        + in_proj_z.freed_bytes()
+                        + in_proj_b.freed_bytes()
+                        + in_proj_a.freed_bytes()
+                        + out_proj.freed_bytes()
+                        + conv_n
+                        + dt_n
+                        + al
+                        + nw;
+                    OffloadedAttn::Linear(Box::new(OffloadedLinearAttn {
+                        in_proj_qkv,
+                        in_proj_z,
+                        in_proj_b,
+                        in_proj_a,
+                        conv1d_weight,
+                        dt_bias,
+                        a_log,
+                        norm_weight,
+                        out_proj,
+                    }))
+                }
+            };
+
+            blocks.push(OffloadedBlock {
+                input_layernorm,
+                post_attention_layernorm,
+                attn,
+                mlp,
+            });
+        }
+
+        // Quiesce again after the block frees so reload (or a co-resident
+        // backward) sees a settled pool. We deliberately do NOT trim the pool to
+        // the OS: the freed blocks must stay in the shared async pool for the
+        // student backward to reuse.
+        ctx.sync()?;
+
+        self.offloaded = Some(Box::new(OffloadedWeights {
+            embed_tokens,
+            lm_head,
+            norm,
+            blocks,
+        }));
+        Ok(freed)
+    }
+
+    /// Restore every device weight buffer from the host snapshot, re-allocating
+    /// VRAM (OPD teacher time-share). Idempotent: a no-op if not offloaded.
+    pub(crate) fn reload_engine_weights(&mut self) -> Result<()> {
+        let Some(snapshot) = self.offloaded.take() else {
+            return Ok(());
+        };
+        let ctx = self.ctx.clone();
+        // Quiesce the whole device before re-allocating weight VRAM so the H2D
+        // restores do not race the train/optimizer allocations still draining
+        // from the shared async pool (see offload note).
+        ctx.sync()?;
+        let OffloadedWeights {
+            embed_tokens,
+            lm_head,
+            norm,
+            blocks,
+        } = *snapshot;
+
+        self.embed_tokens.reload_from_host(&ctx, &embed_tokens)?;
+        match (self.lm_head.as_mut(), &lm_head) {
+            (Some(head), Some(snap)) => head.reload_from_host(&ctx, snap)?,
+            (None, None) => {}
+            _ => anyhow::bail!("offload/reload lm_head presence mismatch"),
+        }
+        self.norm.reload_from_host(&ctx, &norm)?;
+
+        ensure!(
+            blocks.len() == self.layers.len(),
+            "offload/reload layer count mismatch: snapshot {} vs model {}",
+            blocks.len(),
+            self.layers.len()
+        );
+        for (layer, block) in self.layers.iter_mut().zip(blocks) {
+            layer
+                .input_layernorm
+                .reload_from_host(&ctx, &block.input_layernorm)?;
+            layer
+                .post_attention_layernorm
+                .reload_from_host(&ctx, &block.post_attention_layernorm)?;
+
+            match (layer.mlp.as_mut(), block.mlp) {
+                (Some(dense), Some(snap)) => {
+                    dense.gate_proj.reload_from_host(&ctx, &snap.gate_proj)?;
+                    dense.up_proj.reload_from_host(&ctx, &snap.up_proj)?;
+                    dense.down_proj.reload_from_host(&ctx, &snap.down_proj)?;
+                }
+                (None, None) => {
+                    anyhow::bail!("Qwen3.6 MoE weight reload is not supported (OPD is dense-only)")
+                }
+                _ => anyhow::bail!("offload/reload dense-MLP presence mismatch"),
+            }
+
+            match (&mut layer.attn, block.attn) {
+                (Qwen35Attn::Full(full), OffloadedAttn::Full(snap)) => {
+                    let OffloadedFullAttn {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        o_proj,
+                        q_norm,
+                        k_norm,
+                    } = *snap;
+                    full.q_proj.reload_from_host(&ctx, &q_proj)?;
+                    full.k_proj.reload_from_host(&ctx, &k_proj)?;
+                    full.v_proj.reload_from_host(&ctx, &v_proj)?;
+                    full.o_proj.reload_from_host(&ctx, &o_proj)?;
+                    full.q_norm.reload_from_host(&ctx, &q_norm)?;
+                    full.k_norm.reload_from_host(&ctx, &k_norm)?;
+                }
+                (Qwen35Attn::Linear(lin), OffloadedAttn::Linear(snap)) => {
+                    let OffloadedLinearAttn {
+                        in_proj_qkv,
+                        in_proj_z,
+                        in_proj_b,
+                        in_proj_a,
+                        conv1d_weight,
+                        dt_bias,
+                        a_log,
+                        norm_weight,
+                        out_proj,
+                    } = *snap;
+                    lin.in_proj_qkv.reload_from_host(&ctx, &in_proj_qkv)?;
+                    lin.in_proj_z.reload_from_host(&ctx, &in_proj_z)?;
+                    lin.in_proj_b.reload_from_host(&ctx, &in_proj_b)?;
+                    lin.in_proj_a.reload_from_host(&ctx, &in_proj_a)?;
+                    lin.conv1d_weight.reload_from_host(&ctx, &conv1d_weight)?;
+                    lin.dt_bias.reload_from_host(&ctx, &dt_bias)?;
+                    reload_raw_slice(&ctx, &mut lin.a_log, &a_log)?;
+                    reload_raw_slice(&ctx, &mut lin.norm_weight, &norm_weight)?;
+                    lin.out_proj.reload_from_host(&ctx, &out_proj)?;
+                }
+                _ => anyhow::bail!("offload/reload attention-kind mismatch"),
+            }
+        }
+        ctx.sync()?;
+        Ok(())
     }
 
     /// Run prefill or decode for one row. `start_pos` is the absolute position of
@@ -434,6 +797,296 @@ impl Qwen35Model {
             &mut logits,
         )?;
         sample_cuda_token(&self.ctx, &logits, params, position)
+    }
+
+    /// Run the full forward over `tokens` and return the FULL `[seq_len, vocab]`
+    /// logits (every row, not just the last) WITHOUT sampling. Mirrors
+    /// [`Self::forward_tokens`]'s layer stack but, instead of slicing the last
+    /// row + a single `gemv`, applies the final offset-RMSNorm over the whole
+    /// batch and a batched lm-head GEMM, returning the device logits buffer plus
+    /// its `[seq_len, vocab]` shape.
+    ///
+    /// This is the OPD teacher raw-logits path: the distillation loss needs the
+    /// teacher's per-position logit distribution over the prompt, so it cannot
+    /// use the sampling tail. `slot` carries the per-slot KV + recurrent state
+    /// exactly like [`Self::forward_tokens`].
+    pub(crate) fn forward_token_logits_full(
+        &self,
+        slot: &mut Qwen35SlotState,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(DeviceVec, [usize; 2])> {
+        ensure!(
+            !tokens.is_empty(),
+            "forward_token_logits_full requires at least one token"
+        );
+        ensure!(
+            slot.seq_len == start_pos,
+            "Qwen3.5 hybrid slot seq_len {} != start_pos {start_pos} (uncached full-prefix \
+             path requires contiguous appends)",
+            slot.seq_len
+        );
+        let seq_len = tokens.len();
+        ensure!(
+            start_pos + seq_len <= self.max_seq_len,
+            "Qwen3.5 hybrid sequence {} exceeds KV cache budget {}",
+            start_pos + seq_len,
+            self.max_seq_len
+        );
+        let c = &self.config;
+        let eps = c.rms_norm_eps;
+        let hidden_size = c.hidden_size;
+
+        let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let token_ids = upload_i32(&self.ctx, &token_ids)?;
+        let mut hidden = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+        embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)?;
+
+        let mut full_idx = 0usize;
+        let mut linear_idx = 0usize;
+        for layer in &self.layers {
+            let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            rms_norm_offset(&self.ctx, &hidden, &layer.input_layernorm, eps, &mut normed)?;
+
+            let attn_out = match &layer.attn {
+                Qwen35Attn::Full(full) => {
+                    let out = self.full_attention(full, &normed, slot, full_idx, start_pos)?;
+                    full_idx += 1;
+                    out
+                }
+                Qwen35Attn::Linear(lin) => {
+                    let out = self.linear_attention(lin, &normed, slot, linear_idx)?;
+                    linear_idx += 1;
+                    out
+                }
+            };
+
+            let mut hidden_mid = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            add_batch(&self.ctx, &hidden, &attn_out, &mut hidden_mid)?;
+
+            rms_norm_offset(
+                &self.ctx,
+                &hidden_mid,
+                &layer.post_attention_layernorm,
+                eps,
+                &mut normed,
+            )?;
+            let mlp_out = if let Some(moe) = &layer.moe {
+                let cfg = self
+                    .moe_config
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
+                moe_forward(&self.ctx, moe, &normed, cfg)?
+            } else {
+                let mlp = layer
+                    .mlp
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
+                self.dense_mlp(mlp, &normed)?
+            };
+
+            let mut hidden_next = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut hidden_next)?;
+            hidden = hidden_next;
+        }
+
+        slot.seq_len += seq_len;
+
+        // Final norm (offset) over the WHOLE batch, then the batched lm-head GEMM
+        // produces every row's logits — no last-row slice, no sampling.
+        let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+        rms_norm_offset(&self.ctx, &hidden, &self.norm, eps, &mut normed)?;
+        let vocab = self.output_projection().rows;
+        let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
+        gemm_batch(&self.ctx, self.output_projection(), &normed, &mut logits)?;
+        self.ctx.sync()?;
+
+        // `HiddenStates` is a `[vocab, seq_len]` column-batch over a flat device
+        // buffer; reinterpret it as a `[seq_len, vocab]` row-major `DeviceVec`
+        // (the train OPD bridge reads it as `[1, seq_len, vocab]`).
+        let logits_vec = DeviceVec {
+            data: logits.data,
+            len: seq_len * vocab,
+            label: "qwen35_token_logits[seq,vocab]",
+        };
+        Ok((logits_vec, [seq_len, vocab]))
+    }
+
+    /// Per-step student LoRA re-merge (OPD P2).
+    ///
+    /// Folds a fresh [`StudentLoraUpdate`] into the resident full-attention
+    /// q/v projection weights in place. On the first call the pristine base
+    /// weight of every touched projection is cached host-side; each call then
+    /// recomputes `W = base + (alpha/rank)·(B·A)` from that pristine base — so
+    /// re-merging never compounds onto an already-merged weight.
+    ///
+    /// `A` is `[rank, in]`, `B` is `[out, rank]`, matching the legacy disk
+    /// loader / `infer/src/model/qwen35/lora.rs` contract. The forward path
+    /// recomputes attention from these resident matrices every step, so the
+    /// merged weight is picked up by the next `forward_tokens` automatically.
+    pub(crate) fn remerge_student_lora(&mut self, update: StudentLoraUpdate) -> Result<()> {
+        ensure!(update.rank > 0, "student LoRA update has rank=0");
+        let scale = update.alpha / update.rank as f32;
+        let num_layers = self.config.num_hidden_layers;
+
+        for layer in &update.layers {
+            let layer_idx = layer.layer_idx;
+            ensure!(
+                layer_idx < num_layers,
+                "student LoRA references layer {layer_idx} but model has {num_layers} layers"
+            );
+            ensure!(
+                self.config.layer_types[layer_idx] == LayerType::FullAttention,
+                "student LoRA layer {layer_idx} is not a full-attention layer; \
+                 the OPD q/v adapter merge only targets gated full-attention projections"
+            );
+
+            // Cache the pristine base weights for this layer once, before the
+            // first merge mutates them. Split-borrow safe: we read the resident
+            // q/v `DeviceMatrix` (immutable) into host, then later overwrite.
+            self.ensure_lora_base_cached(layer_idx, layer)?;
+
+            if let Some(q) = &layer.q_proj {
+                self.merge_lora_proj(layer_idx, q, scale, /* is_q = */ true)?;
+            }
+            if let Some(v) = &layer.v_proj {
+                self.merge_lora_proj(layer_idx, v, scale, /* is_q = */ false)?;
+            }
+        }
+        self.ctx.sync()?;
+        Ok(())
+    }
+
+    /// Capture pristine host copies of this layer's q/v base weights on first
+    /// touch (only for the projections the update actually carries).
+    fn ensure_lora_base_cached(
+        &mut self,
+        layer_idx: usize,
+        layer: &StudentLoraLayer,
+    ) -> Result<()> {
+        let attn = match &self.layers[layer_idx].attn {
+            Qwen35Attn::Full(full) => full,
+            Qwen35Attn::Linear(_) => {
+                // Guarded by the caller's FullAttention check; defensive only.
+                return Err(anyhow!(
+                    "student LoRA layer {layer_idx} resolved to a linear-attention block"
+                ));
+            }
+        };
+        let entry = self.lora_base.entry(layer_idx).or_default();
+        if layer.q_proj.is_some() && entry.q_proj.is_none() {
+            entry.q_proj = Some(clone_matrix_to_host(
+                &self.ctx,
+                &attn.q_proj,
+                layer_idx,
+                "q_proj",
+            )?);
+        }
+        if layer.v_proj.is_some() && entry.v_proj.is_none() {
+            entry.v_proj = Some(clone_matrix_to_host(
+                &self.ctx,
+                &attn.v_proj,
+                layer_idx,
+                "v_proj",
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Recompute `W = base + scale·(B·A)` for one projection and upload it into
+    /// the resident `DeviceMatrix`. `base` is the pristine cached host copy.
+    fn merge_lora_proj(
+        &mut self,
+        layer_idx: usize,
+        adapter: &StudentLoraMatrices,
+        scale: f32,
+        is_q: bool,
+    ) -> Result<()> {
+        let label = if is_q { "q_proj" } else { "v_proj" };
+        // Pull the pristine base + the resident matrix shape under split borrows.
+        let base = {
+            let cached = self
+                .lora_base
+                .get(&layer_idx)
+                .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight not cached"))?;
+            let base = if is_q { &cached.q_proj } else { &cached.v_proj };
+            base.clone()
+                .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight missing"))?
+        };
+
+        let attn = match &self.layers[layer_idx].attn {
+            Qwen35Attn::Full(full) => full,
+            Qwen35Attn::Linear(_) => {
+                return Err(anyhow!(
+                    "student LoRA layer {layer_idx} resolved to a linear-attention block"
+                ));
+            }
+        };
+        let matrix = if is_q { &attn.q_proj } else { &attn.v_proj };
+        ensure!(
+            matrix.is_dense_bf16(),
+            "layer {layer_idx} {label}: LoRA re-merge requires dense BF16 base weights; got {:?}",
+            matrix.weight_format()
+        );
+        let rows = matrix.rows;
+        let cols = matrix.cols;
+        ensure!(
+            base.len() == rows * cols,
+            "layer {layer_idx} {label}: cached base len {} != rows*cols {}",
+            base.len(),
+            rows * cols
+        );
+        ensure!(
+            adapter.in_features == cols,
+            "layer {layer_idx} {label}: lora_A in_features {} != base cols {cols}",
+            adapter.in_features
+        );
+        ensure!(
+            adapter.out_features == rows,
+            "layer {layer_idx} {label}: lora_B out_features {} != base rows {rows}",
+            adapter.out_features
+        );
+        ensure!(
+            adapter.a.len() == adapter.rank * cols,
+            "layer {layer_idx} {label}: lora_A len {} != rank*in {}",
+            adapter.a.len(),
+            adapter.rank * cols
+        );
+        ensure!(
+            adapter.b.len() == rows * adapter.rank,
+            "layer {layer_idx} {label}: lora_B len {} != out*rank {}",
+            adapter.b.len(),
+            rows * adapter.rank
+        );
+
+        // W[r, c] = base[r, c] + scale · Σ_k B[r, k] · A[k, c].
+        let rank = adapter.rank;
+        let mut merged = vec![bf16::ZERO; rows * cols];
+        for row in 0..rows {
+            let b_row = &adapter.b[row * rank..row * rank + rank];
+            for col in 0..cols {
+                let mut delta = 0.0f32;
+                for (k, &b_rk) in b_row.iter().enumerate() {
+                    delta += b_rk * adapter.a[k * cols + col];
+                }
+                let idx = row * cols + col;
+                merged[idx] = bf16::from_f32(base[idx].to_f32() + scale * delta);
+            }
+        }
+
+        let uploaded = DeviceMatrix::from_host(&self.ctx, &merged, rows, cols)
+            .map_err(|e| anyhow!("layer {layer_idx} {label}: upload merged weight failed: {e}"))?;
+        match &mut self.layers[layer_idx].attn {
+            Qwen35Attn::Full(full) => {
+                if is_q {
+                    full.q_proj = uploaded;
+                } else {
+                    full.v_proj = uploaded;
+                }
+            }
+            Qwen35Attn::Linear(_) => unreachable!("FullAttention checked above"),
+        }
+        Ok(())
     }
 
     fn dense_mlp(&self, mlp: &DenseMlp, normed: &HiddenStates) -> Result<HiddenStates> {
@@ -707,6 +1360,33 @@ impl Qwen35Model {
         gemm_batch(&self.ctx, &attn.out_proj, &normed_out, &mut out)?;
         Ok(out)
     }
+}
+
+/// Copy a dense BF16 `DeviceMatrix`'s `data` buffer to a row-major host `Vec`.
+/// Used to snapshot the pristine LoRA base weight before the first re-merge.
+fn clone_matrix_to_host(
+    ctx: &DeviceContext,
+    matrix: &DeviceMatrix,
+    layer_idx: usize,
+    label: &str,
+) -> Result<Vec<bf16>> {
+    ensure!(
+        matrix.is_dense_bf16(),
+        "layer {layer_idx} {label}: LoRA base snapshot requires dense BF16; got {:?}",
+        matrix.weight_format()
+    );
+    let host = ctx
+        .stream
+        .clone_dtoh(&matrix.data)
+        .map_err(|e| anyhow!("layer {layer_idx} {label}: D2H base weight copy failed: {e}"))?;
+    ctx.sync()?;
+    ensure!(
+        host.len() == matrix.rows * matrix.cols,
+        "layer {layer_idx} {label}: base copy len {} != rows*cols {}",
+        host.len(),
+        matrix.rows * matrix.cols
+    );
+    Ok(host)
 }
 
 /// Offset RMSNorm (1+weight) over a batch — Qwen3.5 norms store `weight - 1`.

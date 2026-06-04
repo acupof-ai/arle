@@ -24,6 +24,15 @@ tokio = { version = "1", features = ["sync", "rt"] }
 
 infer-metal = { path = "../infer-metal", default-features = false, optional = true }
 infer-cuda = { path = "../infer-cuda", default-features = false, optional = true }
+# CUDA-only: `RawLogits` carries a `cuda_kernels` device buffer/context and reads
+# its raw device pointer via the `cudarc` `DevicePtr` trait for the OPD-teacher
+# raw-logits surface. Both engage only under `--features cuda`.
+cuda-kernels = { path = "../cuda-kernels", default-features = false, optional = true }
+cudarc = { version = "0.19", features = [
+    "cuda-version-from-build-system",
+    "cublas",
+    "f16",
+], optional = true }
 
 [features]
 # No backend defaulted, mirroring the legacy `infer` crate: callers pick one.
@@ -32,9 +41,16 @@ infer-cuda = { path = "../infer-cuda", default-features = false, optional = true
 #   --features cpu,no-cuda     portable smoke / CI
 default = []
 # CUDA backend (structurally wired; the real forward is Phase-0 / lead-owned).
-cuda = ["dep:infer-cuda", "infer-cuda/cuda"]
+# Pulls `cuda-kernels` + `cudarc` for the OPD-teacher `RawLogits` device surface.
+cuda = [
+    "dep:infer-cuda",
+    "infer-cuda/cuda",
+    "dep:cuda-kernels",
+    "cuda-kernels/cuda",
+    "dep:cudarc",
+]
 # Marker feature for builds without a CUDA toolchain (macOS, dev CI).
-no-cuda = ["infer-cuda?/no-cuda"]
+no-cuda = ["infer-cuda?/no-cuda", "cuda-kernels?/no-cuda"]
 # Metal backend via infer-metal (Apple Silicon).
 metal = ["dep:infer-metal", "infer-metal/metal", "infer-server/metal"]
 # Portable CPU backend: drives the engine over infer-metal's feature-free

@@ -298,6 +298,16 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.on_token = Some(observer);
     }
 
+    /// Mutable access to the backend executor.
+    ///
+    /// The serving layer runs out-of-band control closures (OPD raw-logits
+    /// forward, weight offload/reload, LoRA re-merge) against the executor
+    /// between scheduler steps. Not for the request hot path — the scheduler
+    /// drives the executor through [`Engine::step`].
+    pub fn executor_mut(&mut self) -> &mut E {
+        &mut self.executor
+    }
+
     /// Run backend warmup exactly once.
     ///
     /// Delegates to [`BackendExecutor::warmup`] (default no-op for Metal/mock).
@@ -313,6 +323,29 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.executor.warmup()?;
         self.warmed_up = true;
         Ok(())
+    }
+
+    /// Move the backend's device weights to host RAM (OPD teacher time-share),
+    /// returning the device bytes freed.
+    ///
+    /// Delegates to [`BackendExecutor::offload_weights`] (default no-op for
+    /// backends without weight offload). The engine must be idle — no in-flight
+    /// step — when this is called; the serving loop drains its work before
+    /// dispatching the control request.
+    ///
+    /// # Errors
+    /// Propagates any error returned by the backend executor's offload.
+    pub fn offload_engine_weights(&mut self) -> Result<usize> {
+        self.executor.offload_weights()
+    }
+
+    /// Restore the backend's device weights from the host snapshot (OPD teacher
+    /// time-share). Delegates to [`BackendExecutor::reload_weights`].
+    ///
+    /// # Errors
+    /// Propagates any error returned by the backend executor's reload.
+    pub fn reload_engine_weights(&mut self) -> Result<()> {
+        self.executor.reload_weights()
     }
 
     /// Submit a normal-priority request into the waiting queue.

@@ -48,6 +48,11 @@ mod ops;
 #[cfg(feature = "cuda")]
 mod qwen35;
 
+// Per-step student LoRA re-merge contract (OPD P2). The host-side data types
+// the train crate pushes into the student engine; re-exported from `infer-api`.
+#[cfg(feature = "cuda")]
+pub use qwen35::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
+
 // Not cuda-gated: env→TpConfig resolution is CPU-testable; only the NCCL comm
 // variant is feature-gated.
 pub mod tp;
@@ -374,6 +379,54 @@ impl CudaExecutor {
         })
     }
 
+    /// OPD teacher raw-logits forward (Qwen3.5/3.6 hybrid only).
+    ///
+    /// Runs the full hybrid forward over `(input_ids, positions)` and returns the
+    /// FULL `[seq_len, vocab]` logits (every row, no sampling) plus a clone of the
+    /// model's [`DeviceContext`] so the caller can sync/consume the device buffer.
+    /// `infer-api` wraps this triple into its public `RawLogits`. The placeholder
+    /// (no real GPU executor) bails.
+    #[cfg(feature = "cuda")]
+    pub fn forward_token_logits(
+        &mut self,
+        input_ids: &[u32],
+        positions: &[u32],
+    ) -> anyhow::Result<(
+        cuda_kernels::prelude::DeviceVec,
+        [usize; 2],
+        cuda_kernels::prelude::DeviceContext,
+    )> {
+        match &mut self.inner {
+            CudaExecutorInner::Real(real) => {
+                let (logits, shape) = real.forward_token_logits(input_ids, positions)?;
+                let device = real.device().clone();
+                Ok((logits, shape, device))
+            }
+            CudaExecutorInner::Placeholder => {
+                anyhow::bail!(
+                    "forward_token_logits requires a loaded CUDA model, not the placeholder executor"
+                )
+            }
+        }
+    }
+
+    /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6 q/v
+    /// projection weights (OPD per-step re-merge). Errors on the no-GPU
+    /// placeholder and on non-student CUDA models (dense Qwen3 / DSv4).
+    #[cfg(feature = "cuda")]
+    pub fn remerge_student_lora(
+        &mut self,
+        update: qwen35::StudentLoraUpdate,
+    ) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => anyhow::bail!(
+                "student LoRA re-merge requires the real CUDA executor; \
+                 the no-GPU placeholder has no resident weights"
+            ),
+            CudaExecutorInner::Real(real) => real.remerge_student_lora(update),
+        }
+    }
+
     /// Placeholder forward — produces one deterministic token per scheduled row.
     fn placeholder_forward(plan: &ForwardPlan) -> StepOutput {
         let mut tokens = Vec::with_capacity(plan.decode_rows.len() + plan.prefill_rows.len());
@@ -423,6 +476,23 @@ impl BackendExecutor for CudaExecutor {
             CudaExecutorInner::Placeholder => Ok(()),
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.warmup(),
+        }
+    }
+
+    fn offload_weights(&mut self) -> anyhow::Result<usize> {
+        match &mut self.inner {
+            // No real device weights to offload without the cuda backend.
+            CudaExecutorInner::Placeholder => Ok(0),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.offload_engine_weights(),
+        }
+    }
+
+    fn reload_weights(&mut self) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => Ok(()),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.reload_engine_weights(),
         }
     }
 }
