@@ -25,7 +25,7 @@ use anyhow::Result;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use chat::{ChatMessage, ParsedAssistantResponse, ToolCall, ToolDefinition};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer::server_engine::InferenceEngine;
+use infer_api::InferenceEngine;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::DefaultEditor;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
