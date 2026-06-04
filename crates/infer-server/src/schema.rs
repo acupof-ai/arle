@@ -196,6 +196,36 @@ impl CompletionResponse {
     }
 }
 
+/// `GET /v1/models` response — the OpenAI model-list shape. The server serves a
+/// single loaded model, so `data` always has one card.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelsResponse {
+    pub object: &'static str,
+    pub data: Vec<ModelCard>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelCard {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub owned_by: &'static str,
+}
+
+impl ModelsResponse {
+    pub(crate) fn single(model: String) -> Self {
+        Self {
+            object: "list",
+            data: vec![ModelCard {
+                id: model,
+                object: "model",
+                created: unix_time_secs(),
+                owned_by: "arle",
+            }],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CompletionChoice {
     pub text: String,
@@ -331,5 +361,22 @@ impl IntoResponse for ApiError {
             })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_response_is_openai_single_model_list() {
+        let resp = ModelsResponse::single("Qwen3-8B".to_string());
+        let v = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["data"].as_array().expect("data array").len(), 1);
+        assert_eq!(v["data"][0]["id"], "Qwen3-8B");
+        assert_eq!(v["data"][0]["object"], "model");
+        assert_eq!(v["data"][0]["owned_by"], "arle");
+        assert!(v["data"][0]["created"].is_u64());
     }
 }
