@@ -25,6 +25,8 @@ mod weights;
 #[cfg(feature = "metal")]
 mod wired_limit;
 
+#[cfg(feature = "metal")]
+pub use executor::pipeline_fast_path_hits;
 pub use executor::{MetalExecutor, MetalInflight};
 pub use kv_pool::MetalKvPool;
 #[cfg(feature = "metal")]
