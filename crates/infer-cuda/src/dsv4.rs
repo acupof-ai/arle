@@ -535,22 +535,26 @@ fn build_dsv4_tp_runtime() -> Result<crate::tp::TpRuntime> {
 
 /// Refuse the genuinely-unported variants up front so the loader never
 /// half-loads a shape the forward can't run. CSA/HCA attention, hyper-connections
-/// (`hc_mult > 1`), and hash-routed MoE layers are all wired now; only the MTP
-/// (speculative-draft) layers remain deferred — they're a separate forward path
-/// with no consumer in the base decode loop. Called by [`crate::loader`] before
-/// any device I/O.
+/// (`hc_mult > 1`), and hash-routed MoE layers are all wired now. MTP
+/// (speculative-draft) layers are tolerated but **not loaded**: the base forward
+/// loops `0..num_hidden_layers` (see [`Dsv4Model::from_fp8_safetensors`]) and the
+/// MTP predictor head is a separate path with no consumer in the base decode
+/// loop, so we run the production config (`num_nextn_predict_layers=1`) directly
+/// rather than forcing a hand-trimmed base-only config view. Called by
+/// [`crate::loader`] before any device I/O.
 pub(crate) fn ensure_loadable(config: &DeepSeekV4Config) -> Result<()> {
     ensure!(
         config.num_key_value_heads == 1,
         "DSv4 MLA expects num_key_value_heads=1, got {}",
         config.num_key_value_heads
     );
-    ensure!(
-        config.num_nextn_predict_layers == 0,
-        "DSv4 MTP draft layers (num_nextn_predict_layers={}) are deferred (separate \
-         speculative-decode path, no consumer in the base decode loop)",
-        config.num_nextn_predict_layers
-    );
+    if config.num_nextn_predict_layers > 0 {
+        eprintln!(
+            "[dsv4] num_nextn_predict_layers={} present; loading the {} base layers \
+             only (MTP draft head deferred — separate speculative-decode path).",
+            config.num_nextn_predict_layers, config.num_hidden_layers
+        );
+    }
     ensure!(
         config.hc_mult >= 1,
         "DSv4 hc_mult must be >= 1, got {}",
