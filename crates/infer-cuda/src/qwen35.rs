@@ -470,6 +470,16 @@ impl Qwen35Model {
         if self.offloaded.is_some() {
             return Ok(0);
         }
+        // PREFLIGHT (before ANY mutation): MoE weight offload is unsupported.
+        // Bailing mid-loop after embed/lm_head/norm are already swapped to
+        // placeholders — with `self.offloaded` still unset — would make reload a
+        // no-op and the next forward run on corrupted placeholder weights.
+        for layer in &self.layers {
+            ensure!(
+                layer.moe.is_none(),
+                "Qwen3.6 MoE weight offload is not supported (OPD teacher time-share is dense-only)"
+            );
+        }
         let ctx = self.ctx.clone();
         // Drain ALL in-flight GPU work before snapshotting. The OPD step has
         // co-resident allocators (infer-teacher + train autograd) sharing one
@@ -494,10 +504,7 @@ impl Qwen35Model {
 
         let mut blocks = Vec::with_capacity(self.layers.len());
         for layer in &mut self.layers {
-            ensure!(
-                layer.moe.is_none(),
-                "Qwen3.6 MoE weight offload is not supported (OPD teacher time-share is dense-only)"
-            );
+            // (MoE guard hoisted to the preflight above — no mid-loop bail.)
             let (input_layernorm, in_ln_n) = layer.input_layernorm.offload_to_host(&ctx)?;
             let (post_attention_layernorm, post_ln_n) =
                 layer.post_attention_layernorm.offload_to_host(&ctx)?;
