@@ -131,16 +131,23 @@ overhead gone: `moe_route` 41.4%→3.7%, `deepgemm_grouped` 38.8%→4.3%,
 | `lm_head_sample` (GEMV + argmax + D2H) | ~0.6 | ~1.2% | **ruled out** (see below) |
 
 **Evidence-based lever ranking (replaces assumption):**
-1. **Buffer/D2D/zeroing/alloc — next.** D2D 9.03 + memset 5.29 + alloc 5.02 =
-   ~19.3 ms/token (~38% wall), *bigger* than launch overhead and *lower-risk*
-   than full graph. Extend the #29 scratch philosophy: per-layer non-MoE temps
-   into a persistent arena, per-step D2D → in-place/reuse, memset only when the
-   consumer reads-before-writes.
-2. **#25 full decode graph** — launch API 22.5% is worth it, but needs a
-   capturable all-reduce + capturable DeepEP (high complexity, align SGLang);
-   do *after* buffer reuse.
+1. **[DONE `7bdb3819`] Buffer/D2D/zeroing/alloc.** Was ~19.3 ms/token (38% wall).
+   Root cause: the #23 keepalive's `CudaSlice::clone()` is a device-to-device copy
+   — redundant once #29's scratch pool gives stable addresses → default-off.
+   D2D −86%, memset −88%, alloc+free −65%. Decode 21.615 → **25.129 tok/s**,
+   wall 50.7 → **41.2 ms/token**. Wins
+   [`2026-06-05-dsv4-decode-buffer-d2d-reduction.md`](../experience/wins/2026-06-05-dsv4-decode-buffer-d2d-reduction.md).
+2. **#25 full decode graph — NOW #1.** Launch API (`cudaLaunchKernel` +
+   `cuLaunchKernelEx`) ≈ 13.36 ms/token = **32% of the 41.2 ms**. Align SGLang:
+   evaluate breakable cuda graph (capture graphable segments, re-invoke NCCL
+   all-reduce + DeepEP combine at break points) before a custom capturable
+   all-reduce; prereq — confirm DeepEP decode combine is capturable or switch to
+   low-latency decode mode. Extends the single-GPU decode graph (gated off under
+   TP/MoE at `executor.rs:408`) to TP=8/EP=8.
 3. **MLA attn ~11.79 ms/token** — the real kernel floor; deepest, align SGLang
    FlashMLA decode, last.
+
+Cumulative decode: 4.365 → 25.129 tok/s (**~5.75×**), 236.8 → 41.2 ms/token.
 
 **`lm_head_sample` ruled out (§0 framing-trap, falsified):** its 9.4 ms/token
 NVTX range *included* the step-end `sample_cuda_token → ctx.sync()`, so it was
