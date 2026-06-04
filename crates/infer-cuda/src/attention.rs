@@ -13,6 +13,135 @@ use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use crate::dsv4::{Dsv4Attention, Dsv4Compressor, Dsv4Indexer};
 use crate::loader::PageMeta;
 
+pub(crate) struct Dsv4CompressorState {
+    pending_kv: CudaSlice<half::bf16>,
+    pending_score: CudaSlice<half::bf16>,
+    prev_overlap_kv: CudaSlice<half::bf16>,
+    prev_overlap_score: CudaSlice<half::bf16>,
+    compressed: HiddenStates,
+}
+
+impl Dsv4CompressorState {
+    fn new(
+        ctx: &DeviceContext,
+        head_dim: usize,
+        ratio: usize,
+        overlap: bool,
+        max_seq_len: usize,
+    ) -> Result<Self> {
+        let width = if overlap { 2 * head_dim } else { head_dim };
+        let compressed_rows = max_seq_len.div_ceil(ratio).max(1);
+        Ok(Self {
+            pending_kv: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(ratio * width)
+                .map_err(|e| anyhow::anyhow!("DSv4 compressor pending kv alloc failed: {e}"))?,
+            pending_score: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(ratio * width)
+                .map_err(|e| anyhow::anyhow!("DSv4 compressor pending score alloc failed: {e}"))?,
+            prev_overlap_kv: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(ratio * head_dim)
+                .map_err(|e| anyhow::anyhow!("DSv4 compressor prev kv alloc failed: {e}"))?,
+            prev_overlap_score: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(ratio * head_dim)
+                .map_err(|e| anyhow::anyhow!("DSv4 compressor prev score alloc failed: {e}"))?,
+            compressed: HiddenStates::zeros(ctx, head_dim, compressed_rows)?,
+        })
+    }
+
+    fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+        ctx.stream
+            .memset_zeros(&mut self.pending_kv)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor pending kv reset failed: {e}"))?;
+        ctx.stream
+            .memset_zeros(&mut self.pending_score)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor pending score reset failed: {e}"))?;
+        ctx.stream
+            .memset_zeros(&mut self.prev_overlap_kv)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor prev kv reset failed: {e}"))?;
+        ctx.stream
+            .memset_zeros(&mut self.prev_overlap_score)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor prev score reset failed: {e}"))?;
+        ctx.stream
+            .memset_zeros(&mut self.compressed.data)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor compressed reset failed: {e}"))?;
+        self.compressed.seq_len = 0;
+        Ok(())
+    }
+}
+
+pub(crate) struct Dsv4LayerAttentionState {
+    sw_window_cache: CudaSlice<half::bf16>,
+    compressor: Option<Dsv4CompressorState>,
+    indexer: Option<Dsv4CompressorState>,
+}
+
+impl Dsv4LayerAttentionState {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        mode: DeepSeekV4AttentionMode,
+        compress_ratio: usize,
+        max_seq_len: usize,
+    ) -> Result<Self> {
+        let sw_len = config.sliding_window * config.head_dim;
+        ensure!(
+            sw_len > 0,
+            "DSv4 SW window cache len is zero (sliding_window={} head_dim={})",
+            config.sliding_window,
+            config.head_dim
+        );
+        let sw_window_cache = ctx
+            .stream
+            .alloc_zeros::<half::bf16>(sw_len)
+            .map_err(|e| anyhow::anyhow!("DSv4 SW window cache alloc failed: {e}"))?;
+        let overlap = compress_ratio < 16;
+        let compressor = if mode == DeepSeekV4AttentionMode::SlidingWindow {
+            None
+        } else {
+            Some(Dsv4CompressorState::new(
+                ctx,
+                config.head_dim,
+                compress_ratio,
+                overlap,
+                max_seq_len,
+            )?)
+        };
+        let indexer = if mode == DeepSeekV4AttentionMode::CompressedSparse {
+            Some(Dsv4CompressorState::new(
+                ctx,
+                config.index_head_dim,
+                compress_ratio,
+                true,
+                max_seq_len,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            sw_window_cache,
+            compressor,
+            indexer,
+        })
+    }
+
+    pub(crate) fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+        ctx.stream
+            .memset_zeros(&mut self.sw_window_cache)
+            .map_err(|e| anyhow::anyhow!("DSv4 SW window cache reset failed: {e}"))?;
+        if let Some(compressor) = &mut self.compressor {
+            compressor.reset(ctx)?;
+        }
+        if let Some(indexer) = &mut self.indexer {
+            indexer.reset(ctx)?;
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paged_attention(
     ctx: &DeviceContext,
@@ -600,16 +729,11 @@ fn mla_rms_norm(
 /// HybridCompressed, dispatched on `mode` / `compress_ratio`).
 ///
 /// `hidden` is the post-attn-LN input `[hidden_size, token_count]`;
-/// `sw_window_cache` is this layer's bf16 sliding-window ring cache
-/// (`sliding_window * head_dim` elements), read+written in place by the windowed
-/// kernel. `start_pos` is the absolute position of `hidden`'s first token (0 for
-/// a fresh prefill). Writes `[hidden_size, token_count]` into `out` (the O-LoRA
-/// output, pre-TP-all-reduce — the model layer-loop owns the row-parallel sum).
-///
-/// The compressed pool is recomputed per call from `hidden` over the absolute
-/// `[0, start_pos + token_count)` range (the uncached correctness path); a
-/// continuous-batching executor will instead retain it per slot. The
-/// FlashMLA-FP8 decode launch stays gated (perf path).
+/// `state` holds this layer's per-slot bf16 sliding-window ring plus compressor
+/// pending/compressed pools. `start_pos` is the absolute position of `hidden`'s
+/// first token (0 for a fresh prefill). Writes `[hidden_size, token_count]` into
+/// `out` (the O-LoRA output, pre-TP-all-reduce — the model layer-loop owns the
+/// row-parallel sum). FlashMLA-FP8 decode stays gated (perf path).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mla_attention(
     ctx: &DeviceContext,
@@ -619,7 +743,7 @@ pub(crate) fn mla_attention(
     compress_ratio: usize,
     layer_idx: usize,
     hidden: &HiddenStates,
-    sw_window_cache: &mut CudaSlice<half::bf16>,
+    state: &mut Dsv4LayerAttentionState,
     start_pos: usize,
     out: &mut HiddenStates,
 ) -> Result<()> {
@@ -668,9 +792,9 @@ pub(crate) fn mla_attention(
         config.qk_rope_head_dim
     );
     ensure!(
-        sw_window_cache.len() == config.sliding_window * head_dim,
+        state.sw_window_cache.len() == config.sliding_window * head_dim,
         "DSv4 MLA SW window cache len {} != sliding_window*head_dim {}",
-        sw_window_cache.len(),
+        state.sw_window_cache.len(),
         config.sliding_window * head_dim
     );
     ensure!(
@@ -743,7 +867,7 @@ pub(crate) fn mla_attention(
         // the OUTPUT (sign = -1) before returning.
         let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
         let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-        let (window_ptr, _wg) = sw_window_cache.device_ptr_mut(&ctx.stream);
+        let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
         let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
         let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
@@ -781,17 +905,23 @@ pub(crate) fn mla_attention(
             anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
         })?;
         let overlap = compress_ratio < 16;
-        let compressed = compressor_forward(
-            ctx,
-            config,
-            compressor,
-            hidden,
-            head_dim,
-            compress_ratio,
-            overlap,
-            start_pos,
-            true,
-        )?;
+        {
+            let compressor_state = state.compressor.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
+            })?;
+            compressor_forward(
+                ctx,
+                config,
+                compressor,
+                hidden,
+                compressor_state,
+                head_dim,
+                compress_ratio,
+                overlap,
+                start_pos,
+                true,
+            )?;
+        }
 
         let selected = if mode == DeepSeekV4AttentionMode::CompressedSparse {
             let indexer = attention.indexer.as_ref().ok_or_else(|| {
@@ -801,24 +931,37 @@ pub(crate) fn mla_attention(
             })?;
             // Indexer keys: a second compressor over index_head_dim keys (no APE
             // gate on the keys — `apply_rope = true`, head_dim = index_head_dim).
-            let index_keys = compressor_forward(
-                ctx,
-                config,
-                &indexer.compressor,
-                hidden,
-                config.index_head_dim,
-                compress_ratio,
-                true,
-                start_pos,
-                false,
-            )?;
+            {
+                let indexer_state = state.indexer.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DSv4 layer {layer_idx} is CompressedSparse but has no indexer state"
+                    )
+                })?;
+                compressor_forward(
+                    ctx,
+                    config,
+                    &indexer.compressor,
+                    hidden,
+                    indexer_state,
+                    config.index_head_dim,
+                    compress_ratio,
+                    true,
+                    start_pos,
+                    false,
+                )?;
+            }
+            let index_keys = &state
+                .indexer
+                .as_ref()
+                .expect("indexer state checked above")
+                .compressed;
             Some(csa_select(
                 ctx,
                 config,
                 indexer,
                 hidden,
                 &c_q_normed,
-                &index_keys,
+                index_keys,
                 start_pos,
                 compress_ratio,
             )?)
@@ -826,6 +969,11 @@ pub(crate) fn mla_attention(
             None
         };
 
+        let compressed = &state
+            .compressor
+            .as_ref()
+            .expect("compressor state checked above")
+            .compressed;
         let compressed_count = compressed.seq_len;
         let mode_int = match mode {
             DeepSeekV4AttentionMode::CompressedSparse => 1,
@@ -834,7 +982,7 @@ pub(crate) fn mla_attention(
         };
         let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
         let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-        let (window_ptr, _wg) = sw_window_cache.device_ptr_mut(&ctx.stream);
+        let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
         let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
         let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
         let (comp_ptr, _cg, _cguard) = if compressed_count > 0 {
@@ -894,9 +1042,8 @@ pub(crate) fn mla_attention(
     Ok(())
 }
 
-/// Run one compressor sub-block over `hidden`, producing the bf16 compressed-key
-/// pool `[head_dim, compressed_rows]` for the absolute `[0, start_pos +
-/// token_count)` range (uncached: a fresh pending/overlap buffer per call).
+/// Run one compressor sub-block over `hidden`, updating the per-slot bf16
+/// compressed-key pool for the absolute `[0, start_pos + token_count)` range.
 ///
 /// `wkv`/`wgate` project the hidden into the per-block KV / gating-score streams
 /// (`width = 2*head_dim` when `overlap`, else `head_dim`); `dsv4_compressor_update_cuda`
@@ -909,24 +1056,14 @@ fn compressor_forward(
     config: &DeepSeekV4Config,
     compressor: &Dsv4Compressor,
     hidden: &HiddenStates,
+    state: &mut Dsv4CompressorState,
     head_dim: usize,
     ratio: usize,
     overlap: bool,
     start_pos: usize,
     apply_rope: bool,
-) -> Result<HiddenStates> {
+) -> Result<()> {
     ensure!(ratio > 0, "DSv4 compressor ratio must be non-zero");
-    // Uncached full-prefix contract: `hidden` must span the whole sequence from
-    // position 0, so the fresh (zeroed) pending/overlap scratch is the correct
-    // empty prior. Incremental decode of CSA/HCA layers (start_pos > 0, one new
-    // token) needs the prior pending tokens + compressed rows retained per slot —
-    // that's the continuous-batching follow-up; the bf16 SW ring caches already
-    // carry the windowed contribution, but the compressed pool is recomputed here.
-    ensure!(
-        start_pos == 0,
-        "DSv4 CSA/HCA compressor is the uncached full-prefix path (start_pos must be 0); \
-         incremental compressed-pool retention is the continuous-batching follow-up"
-    );
     let width = if overlap { 2 * head_dim } else { head_dim };
     ensure!(
         compressor.wkv.rows == width && compressor.wgate.rows == width,
@@ -935,42 +1072,32 @@ fn compressor_forward(
         compressor.wgate.rows
     );
     let token_count = hidden.seq_len;
-    let total = token_count;
+    let total = start_pos + token_count;
     let compressed_rows = total / ratio;
-    // Capacity (rows) the kernel may write into; one full block per `ratio` tokens.
-    let capacity_rows = total.max(1).div_ceil(ratio);
+    let start_pos_i32 = i32::try_from(start_pos)
+        .map_err(|_| anyhow::anyhow!("DSv4 compressor start_pos {start_pos} exceeds i32"))?;
+    let pending_len = start_pos % ratio;
+    let pending_len_i32 = i32::try_from(pending_len)
+        .map_err(|_| anyhow::anyhow!("DSv4 compressor pending_len {pending_len} exceeds i32"))?;
+    let compressed_base = start_pos / ratio;
+    let compressed_base_i32 = i32::try_from(compressed_base).map_err(|_| {
+        anyhow::anyhow!("DSv4 compressor compressed_base {compressed_base} exceeds i32")
+    })?;
+    ensure!(
+        state.compressed.hidden_dim == head_dim,
+        "DSv4 compressor state hidden_dim {} != head_dim {head_dim}",
+        state.compressed.hidden_dim
+    );
+    let compressed_capacity = state.compressed.data.len() / head_dim;
+    ensure!(
+        compressed_rows <= compressed_capacity,
+        "DSv4 compressor compressed rows {compressed_rows} exceed state capacity {compressed_capacity}"
+    );
 
     let mut kv_raw = HiddenStates::zeros(ctx, width, token_count)?;
     dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv_raw)?;
     let mut score_raw = HiddenStates::zeros(ctx, width, token_count)?;
     dsv4_linear(ctx, &compressor.wgate, hidden, &mut score_raw)?;
-
-    // Fresh pending / overlap scratch (uncached full-prefix path: empty prior).
-    let pending_kv = ctx
-        .stream
-        .alloc_zeros::<half::bf16>(ratio * width)
-        .map_err(|e| anyhow::anyhow!("DSv4 compressor pending kv alloc failed: {e}"))?;
-    let pending_score = ctx
-        .stream
-        .alloc_zeros::<half::bf16>(ratio * width)
-        .map_err(|e| anyhow::anyhow!("DSv4 compressor pending score alloc failed: {e}"))?;
-    let prev_overlap_kv = ctx
-        .stream
-        .alloc_zeros::<half::bf16>(ratio * head_dim)
-        .map_err(|e| anyhow::anyhow!("DSv4 compressor prev kv alloc failed: {e}"))?;
-    let prev_overlap_score = ctx
-        .stream
-        .alloc_zeros::<half::bf16>(ratio * head_dim)
-        .map_err(|e| anyhow::anyhow!("DSv4 compressor prev score alloc failed: {e}"))?;
-    let compressed = HiddenStates::zeros(ctx, head_dim, capacity_rows.max(1))?;
-    if compressed_rows == 0 {
-        // No completed blocks yet — return the empty pool (seq_len 0).
-        return Ok(HiddenStates {
-            data: compressed.data,
-            hidden_dim: head_dim,
-            seq_len: 0,
-        });
-    }
 
     let rope = &config.rope_parameters;
     // Compressed keys use compress_rope_theta with NO YaRN (original_seq_len = 0).
@@ -979,24 +1106,19 @@ fn compressor_forward(
     } else {
         (0, config.compress_rope_theta)
     };
-    let mut pending_kv = pending_kv;
-    let mut pending_score = pending_score;
-    let mut prev_overlap_kv = prev_overlap_kv;
-    let mut prev_overlap_score = prev_overlap_score;
-    let mut compressed = compressed;
     {
         let (kv_ptr, _kg) = kv_raw.data.device_ptr(&ctx.stream);
         let (score_ptr, _scg) = score_raw.data.device_ptr(&ctx.stream);
         let (ape_ptr, _ag) = compressor.ape.data.device_ptr(&ctx.stream);
         let (norm_ptr, _ng) = compressor.norm.data.device_ptr(&ctx.stream);
-        let (pkv_ptr, _pkg) = pending_kv.device_ptr_mut(&ctx.stream);
-        let (psc_ptr, _psg) = pending_score.device_ptr_mut(&ctx.stream);
-        let (prkv_ptr, _prkg) = prev_overlap_kv.device_ptr_mut(&ctx.stream);
-        let (prsc_ptr, _prsg) = prev_overlap_score.device_ptr_mut(&ctx.stream);
-        let (comp_ptr, _cg) = compressed.data.device_ptr_mut(&ctx.stream);
-        // SAFETY: all buffers valid on ctx.stream; capacity sized for compressed_rows.
-        // Uncached full-prefix: start_pos=0, pending_len=0, compressed_base=0,
-        // has_prev_overlap=0 (the fresh zeroed scratch is the correct empty prior).
+        let (pkv_ptr, _pkg) = state.pending_kv.device_ptr_mut(&ctx.stream);
+        let (psc_ptr, _psg) = state.pending_score.device_ptr_mut(&ctx.stream);
+        let (prkv_ptr, _prkg) = state.prev_overlap_kv.device_ptr_mut(&ctx.stream);
+        let (prsc_ptr, _prsg) = state.prev_overlap_score.device_ptr_mut(&ctx.stream);
+        let (comp_ptr, _cg) = state.compressed.data.device_ptr_mut(&ctx.stream);
+        let has_prev_overlap = i32::from(compressed_base > 0);
+        // SAFETY: all buffers valid on ctx.stream; state carries the pending and
+        // overlap rows from previous contiguous appends.
         unsafe {
             ffi::dsv4_compressor_update_cuda(
                 kv_ptr as *const ffi::Half,
@@ -1009,14 +1131,14 @@ fn compressor_forward(
                 prsc_ptr as *mut ffi::Half,
                 comp_ptr as *mut ffi::Half,
                 token_count as i32,
-                0,
-                0,
-                0,
+                start_pos_i32,
+                pending_len_i32,
+                compressed_base_i32,
                 head_dim as i32,
                 ratio as i32,
                 width as i32,
                 i32::from(overlap),
-                0,
+                has_prev_overlap,
                 config.rms_norm_eps,
                 rope_dim as i32,
                 rope_base,
@@ -1029,11 +1151,8 @@ fn compressor_forward(
             .result()?;
         }
     }
-    Ok(HiddenStates {
-        data: compressed.data,
-        hidden_dim: head_dim,
-        seq_len: compressed_rows,
-    })
+    state.compressed.seq_len = compressed_rows;
+    Ok(())
 }
 
 /// CSA top-k block selection: project the index query (`wq_b`) + per-head gating
