@@ -1,6 +1,6 @@
 <p align="center">
   <strong>ARLE</strong><br>
-  <em>Pure-Rust 运行时,统一服务、本地 agent、On-Policy Distillation 训练与评测。<code>infer</code> 是 OpenAI 兼容的服务二进制;<code>arle</code> 是统一的用户入口。</em>
+  <em>Pure-Rust 运行时,统一服务、本地 agent、On-Policy Distillation 训练与评测。<code>arle serve</code> 是 OpenAI 兼容的服务入口;<code>arle</code> 是统一的用户入口。</em>
 </p>
 
 <p align="center">
@@ -100,7 +100,7 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 
 - **跨轮 KV 复用。** Slot-sticky 复用 + radix 支撑的分层 KV(`T0 GPU → T1 host → T2 盘 → T3 集群`)保持上一轮 KV 热。
 - **Paged KV 池。** `page_size=16`,直接 GPU 页面挂载 + 共享前缀的尾页 CoW —— 计费可预期、共享前缀更便宜。
-- **统一的运行时权威。** `infer`、`arle`、OPD 训练共用同一套 Rust 运行时与模型契约 —— OPD teacher 就是生产服务用的同一个 runtime,不再分两套栈。
+- **统一的运行时权威。** `arle serve`、`arle`、OPD 训练共用同一套 Rust 运行时与模型契约 —— OPD teacher 就是生产服务用的同一个 runtime,不再分两套栈。
 
 <p align="center">
   <img src="docs/assets/metal-vs-mlxlm-essay-avg.png" alt="ARLE Metal vs mlx-lm TTFT、TPOT、RSS 作文压测对比" width="100%">
@@ -122,10 +122,10 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 | `arle`(无参) | 交互式 agent REPL,内置 `python` 与 `shell` 工具。 |
 | `arle run --prompt "…"` | 脚本友好的一次性 prompt。`--no-tools` 关闭工具。 |
 | `arle serve --backend …` | OpenAI 兼容 HTTP 服务。 |
-| `arle train opd` | **On-Policy Distillation** —— teacher 跑 `infer`,student 跑 `train`,共享 runtime。[使用手册](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md)。 |
+| `arle train opd` | **On-Policy Distillation** —— teacher 跑在服务运行时(`infer-api`),student 跑 `train`,共享 runtime。[使用手册](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md)。 |
 | `arle --doctor [--json]` | 后端 / 硬件 / 模型解析自检。 |
 
-只要服务二进制的运维同学可直接用 `infer`(`cargo build -p infer --release --features cuda`)—— 同一份 HTTP 契约,不带 agent / train 表面。
+只需要服务的运维同学可直接用 `arle serve`(`cargo build --release --features cuda --bin arle`)—— 同一份 HTTP 契约,不带 agent / train 表面。
 
 ---
 
@@ -144,7 +144,7 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 | 显存峰值 (GB) | 12.6 | 15.4 | **3.93**(4 GB 显卡可跑) |
 | held-out KL(500 步) | -5.5 % | **-18.5 %** | **-36.4 %** |
 
-**跨 runtime 大 teacher 路径已端到端验证。** Qwen3.5-4B BF16 teacher 在 `infer`,Qwen3.5-0.8B-Base LoRA r=16 student 在 `train`,通过 `InferTeacher` device-logits bridge 对接。200 步真实文本 run:**5.66 s/step**、**14.8 GiB 峰值**、KL 单调下降(held-out -2.05%)。跨 runtime 开销实测仅 **占 step 时间 1.5%** —— 生产级 teacher 集成成本可忽略。
+**跨 runtime 大 teacher 路径已端到端验证。** Qwen3.5-4B BF16 teacher 跑在服务运行时(`infer-api`),Qwen3.5-0.8B-Base LoRA r=16 student 在 `train`,通过 `InferTeacher` device-logits bridge 对接。200 步真实文本 run:**5.66 s/step**、**14.8 GiB 峰值**、KL 单调下降(held-out -2.05%)。跨 runtime 开销实测仅 **占 step 时间 1.5%** —— 生产级 teacher 集成成本可忽略。
 
 端到端收敛:lr=1e-7、5000 步,held-out exact-overlap **50% → 82.8%**。
 

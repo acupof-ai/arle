@@ -84,9 +84,8 @@ When the release surface changes:
 - the shared macOS packaging script is
   `scripts/package_macos_metal_artifact.sh`
 - for Metal-facing changes, make sure branch validation still covers the
-  exact `cargo build --no-default-features --features metal,no-cuda --bin metal_serve --release`
-  path and the matching `cargo build --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle --release`
-  path, not just library checks
+  exact `cargo build --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle --release`
+  path (the Metal release artifact), not just library checks
 
 ---
 
@@ -95,9 +94,9 @@ When the release surface changes:
 Current release automation publishes:
 
 - Linux x86_64 CUDA artifacts named `arle-<version>-linux-x86_64.tar.gz`
-  containing `arle`, `infer`, and `bench_serving`
+  containing `arle` (CUDA serving runs via `arle serve`)
 - macOS arm64 Metal artifacts named `arle-<version>-macos-arm64.tar.gz`
-  containing `arle` and `metal_serve`
+  containing `arle` (Metal serving runs via `arle serve --backend metal`)
 - the `install.sh` shell installer (uploaded as a top-level release asset
   so `curl -fsSL .../releases/latest/download/install.sh | sh` resolves)
 - `SHA256SUMS.txt` (consumed by `install.sh` for verification)
@@ -113,8 +112,7 @@ Before release, verify:
 - `scripts/install.sh` still matches the artifact naming used by
   release packaging (platform string, binary list)
 - artifact names are correct
-- packaged binaries are the intended ones (`arle`, `infer`, `bench_serving` on
-  Linux; `arle`, `metal_serve` on macOS)
+- packaged binaries are the intended ones (`arle` on both Linux and macOS)
 - unpacked artifacts pass the local smoke check:
   `./arle --doctor --json` and `./arle serve --help`
 

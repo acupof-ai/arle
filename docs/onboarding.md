@@ -15,11 +15,11 @@
 
 | 组件 | 职责 |
 | --- | --- |
-| `infer` | serving/runtime 真相：scheduler、backend、HTTP、模型 |
-| `arle` | 本地 CLI 入口：agent REPL、`serve`、`train opd` |
+| `crates/infer-*`（plan/seam/core/cuda/metal/server/api/topo/moe/util） | serving/runtime 真相：device-neutral IR、host-only seam、Engine/scheduler、backend executor、HTTP、模型 |
+| `arle`（`src/main.rs` → `crates/cli`） | 本地 CLI 入口：agent REPL、`arle serve`、`train opd` |
 | `train` | OPD 训练延伸（2026-05-18 pivot 后**仅 OPD**；pretrain/SFT/GRPO 已删除，见 [`projects/2026-05-18-opd-only-pivot.md`](projects/2026-05-18-opd-only-pivot.md)） |
 
-统一契约：`infer::server_engine::InferenceEngine`（HTTP 与 agent CLI 共用）。
+统一契约：`infer-api`（`crates/infer-api/src/serve_engine.rs`、`LoadedInferenceEngine`），HTTP 与 agent CLI 共用；后端通过 `infer-seam` 的 `BackendExecutor` + `KvPool` 插入同一个 `infer-core` Engine。
 
 ---
 
@@ -47,11 +47,10 @@
 
 | 能力 | 状态 | 代码位置 | 证据 |
 | --- | --- | --- | --- |
-| Multi-GPU TP/PP/EP (F0–F4) | Scaffold — NCCL smoke 通过，**forward 未接线** | `infer/src/distributed/` | architecture §Multi-GPU；`distributed.rs` 模块注释 |
-| CUDA speculative decode | **Not shipped** — plumbing 存在，无吞吐收益 | `infer/src/speculative/`、`scheduler/cuda/spec_path.rs` | support-matrix §4a |
+| Multi-GPU TP/EP | DSv4 路径已接线（TP=8/EP=8）；通用 Qwen TP/PP 仍 staged | `crates/infer-topo`（sharding）、`crates/infer-cuda/src/{tp,deepep,dsv4}.rs` | architecture §Multi-GPU；support-matrix §0 |
+| CUDA speculative decode | **Not shipped** — 未移植到 rewrite（原 legacy `infer/`-only） | 未移植到 rewrite stack | support-matrix §0、§4a |
 | Qwen3.5 Medusa | **Blocked** — 需 recurrent-state rollback | — | support-matrix §4a；[`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md) |
-| ForwardBatch TP/PP 元数据 | Inert — 类型槽位，无 consumer | `infer/src/scheduler/forward_batch.rs` | 文件头注释 + architecture §Multi-GPU |
-| KV T3 / NIXL | Experimental / stub | `infer/src/kv_tier/` | support-matrix §4b |
+| 分层 KV T1–T3 / NIXL | 未移植到 rewrite stack（原 legacy `infer/`-only） | `crates/kv-native-sys`（持久化 substrate） | support-matrix §0、§4b |
 | xgrammar 结构化输出 | Scaffold Phase 1 | `crates/xgrammar-sys` | support-matrix §5 |
 
 ---
@@ -63,18 +62,18 @@
 ### Agent CLI
 
 ```text
-src/main.rs → crates/cli → infer::server_engine → crates/agent
+src/main.rs → crates/cli → infer-api (LoadedInferenceEngine) → crates/agent
 ```
 
-关键文件：`crates/cli/src/lib.rs`、`infer/src/server_engine.rs`、`crates/agent/src/lib.rs`
+关键文件：`crates/cli/src/lib.rs`、`crates/infer-api/src/serve_engine.rs`、`crates/agent/src/lib.rs`
 
 ### CUDA Serving（主线）
 
 ```text
-infer/src/main.rs → backend/cuda/bootstrap.rs → scheduler/cuda/* → model/* → ops/*
+infer-api → infer-core (Engine/scheduler) → infer-seam (BackendExecutor) → infer-cuda (executor) → cuda-kernels
 ```
 
-关键文件：`infer/src/backend/cuda/bootstrap.rs`、`infer/src/scheduler/cuda/`、`infer/src/model/qwen35.rs`
+关键文件：`crates/infer-cuda/src/executor.rs`、`crates/infer-cuda/src/loader.rs`、`crates/infer-cuda/src/qwen35.rs`
 
 ### OPD 训练
 
@@ -88,41 +87,33 @@ crates/cli/src/train_cli.rs → train::opd → autograd
 
 ## 4. Cargo Feature 决策表
 
-来源：`infer/Cargo.toml` `[features]` + [`AGENTS.md`](../AGENTS.md) §Build & run。
+来源：根 `Cargo.toml` `[features]` + [`AGENTS.md`](../AGENTS.md) §Build & run。
 
 | 目标 | 命令 | 说明 |
 | --- | --- | --- |
 | Linux + NVIDIA 完整构建 | `cargo build --release --features cuda --bin arle` | 需要 nvcc |
 | Apple Silicon | `cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle` | 无 CUDA 链接 |
-| Mac 上 CUDA Rust 类型检查 | `cargo check -p infer --no-default-features --features cuda,no-cuda` | 无 GPU 也可过类型 |
+| Mac 上 CUDA Rust 类型检查 | `CUDARC_CUDA_VERSION=12060 cargo check -p infer-api --no-default-features --features cuda,no-cuda` | 无 GPU 也可过类型 |
 | CPU smoke | `cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle` | 合成 token，非真实推理 |
-| Multi-GPU NCCL smoke | `cargo build --release -p infer --features cuda,nccl --bin infer` | 需 ≥2 GPU；`infer --nccl-smoke` |
-| 默认 feature | `unified_scheduler` only | **不含** cuda/metal；须显式选 backend |
+| Multi-GPU NCCL | `cargo build --release --features cuda,nccl --bin arle` | 需 ≥2 GPU；`nccl` feature 经 cli → infer-api → infer-cuda → cuda-kernels 透传 |
+| 默认 feature | `cli` only | **不含** cuda/metal；须显式选 backend |
 
-`default = ["unified_scheduler"]` — 不会隐式拉 CUDA/Metal 依赖（`infer/Cargo.toml:108`）。
+`default = ["cli"]` — 不会隐式拉 CUDA/Metal 依赖（根 `Cargo.toml`）。
 
 ---
 
 ## 5. 按任务选阅读清单
 
-| 你要改… | 先读 | 再读模块 AGENTS.md |
+| 你要改… | 先读 | 模块入口 crate |
 | --- | --- | --- |
-| HTTP / OpenAI API | `infer/src/http_server/openai_v1.rs` | [`infer/src/http_server/AGENTS.md`](../infer/src/http_server/AGENTS.md) |
-| CUDA scheduler / batching | `infer/src/scheduler/cuda/runtime/scheduler_loop.rs` | [`infer/src/scheduler/AGENTS.md`](../infer/src/scheduler/AGENTS.md) |
-| KV tier / prefix cache | `infer/src/prefix_cache.rs`、`infer/src/kv_tier/` | [`infer/src/kv_tier/AGENTS.md`](../infer/src/kv_tier/AGENTS.md) |
+| HTTP / OpenAI API | `crates/infer-server/src/http.rs`、`schema.rs` | `infer-server` |
+| 连续批调度 / batching | `crates/infer-core/src/planner.rs`、`lib.rs`（Engine） | `infer-core` |
+| KV pool / prefix cache | `crates/infer-core/src/prefix.rs`、`radix.rs`；seam 契约 `crates/infer-seam/src/kv.rs` | `infer-core` + `infer-seam` |
 | CUDA kernel | `crates/cuda-kernels/csrc/` | [`crates/cuda-kernels/AGENTS.md`](../crates/cuda-kernels/AGENTS.md) |
-| Metal backend | `infer/src/backend/metal/` | [`infer/src/backend/metal/AGENTS.md`](../infer/src/backend/metal/AGENTS.md) |
-| 模型 forward | `infer/src/model/qwen35.rs` | [`infer/src/model/AGENTS.md`](../infer/src/model/AGENTS.md) |
-| Agent 对话循环 | `crates/agent/src/lib.rs` | — |
+| Metal backend | `crates/infer-metal/src/executor.rs`、`qwen35.rs`、`kv_pool.rs` | `infer-metal` |
+| 模型 forward | `crates/infer-cuda/src/qwen35.rs`（CUDA）、`crates/infer-metal/src/qwen35.rs`（Metal） | `infer-cuda` / `infer-metal` |
+| Agent 对话循环 | `crates/agent/src/lib.rs` | `agent` |
 | OPD 训练 | `crates/train/src/opd.rs` | [`crates/autograd/AGENTS.md`](../crates/autograd/AGENTS.md) |
-
-**大文件提示**（单文件认知负担高，读前先查 module map）：
-
-| 文件 | 行数（2026-06-01 `wc -l`） | 说明 |
-| --- | --- | --- |
-| `infer/src/backend/metal/request_state.rs` | 5267 | Metal 请求状态机 |
-| `infer/src/model/deepseek/weights.rs` | 7122 | DSv4 权重加载（scaffold） |
-| `infer/src/backend/metal/qwen35.rs` | 4030 | Metal Qwen3.5 forward |
 
 ---
 
@@ -132,11 +123,11 @@ Runtime 改动**必须**有 bench wins/errors 条目（[`AGENTS.md`](../AGENTS.m
 
 | 改动目录 | 最低验证 | 额外（优化/架构级） |
 | --- | --- | --- |
-| `crates/cuda-kernels/csrc/` | `cargo test --release -p infer --features cuda` | `scripts/bench_guidellm.sh` + nsys |
-| `infer/src/scheduler/cuda/` | `cargo test --release --test e2e` | guidellm sweep |
-| `infer/src/model/qwen35/` | `cargo test --release --test e2e_qwen35` | guidellm |
-| KV quant / dtype | `cargo test --release -p infer --features cuda --test kv_precision_parity` | guidellm + parity JSON |
-| `infer/src/backend/metal/` | `cargo test --release --no-default-features --features metal --test e2e_qwen35` | Metal Qwen3.6 bench（见 AGENTS.md §Metal canonical model） |
+| `crates/cuda-kernels/csrc/` | `cargo test --release -p infer-cuda --features cuda` | `scripts/bench_guidellm.sh` + nsys |
+| `crates/infer-core/`（Engine/调度） | `cargo test --release -p infer-core` | guidellm sweep |
+| `crates/infer-cuda/`（model/qwen35） | `cargo test --release -p infer-cuda --features cuda` | guidellm |
+| KV quant / dtype | KV-precision parity audit (`kv_precision_parity`) is legacy `infer/`-only, pending re-port into `infer-cuda` (see support-matrix §0) | guidellm + parity JSON |
+| `crates/infer-metal/` | `cargo test --release -p infer-metal --no-default-features --features metal,no-cuda` | Metal Qwen3.6 bench（见 AGENTS.md §Metal canonical model） |
 | `crates/agent/`、`crates/cli/` | `cargo test --release -p agent -p cli -p chat` | — |
 | `crates/train/` OPD | `cargo test --release -p train` | OPD smoke on CUDA GPU |
 | 文档 only | — | 无需 bench；commit body 注明 `docs-only` |
