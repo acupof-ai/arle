@@ -1,49 +1,53 @@
-//! DSv4-Flash multi-GPU (TP=8/EP=8) greedy-parity harness + NCCL `unique_id`
-//! generator for the R6 clean-CUDA rewrite.
+//! DSv4-Flash multi-GPU (TP=8/EP=8) greedy-parity harness for the R6 clean-CUDA
+//! rewrite. Every rank runs the identical single-row DSv4 forward; only rank 0's
+//! `clean_tokens` line is the oracle the launcher compares.
 //!
-//! Two modes, selected by argv:
+//! The forward mirrors the R6 Qwen one-prefill-row harness
+//! (`crates/agent-bench` `cuda_qwen3_greedy_parity`) but for DSv4. It builds
+//! `CudaExecutor::from_dsv4_fp8_safetensors(path, 1)` and drives
+//! `BackendExecutor::submit` with a single-row `ForwardPlan`:
+//!   1. one **full-prefix prefill** at `start_pos = 0` over the whole prompt →
+//!      the FIRST generated token (the prefill argmax). Every layer type
+//!      (SW / CSA / HCA) recomputes its attention over `[0, len)`, so this is the
+//!      runnable correctness shape on every layer today.
+//!   2. then incremental decode steps (`start_pos > 0`, a single `[last_token]`
+//!      row). DSv4 reallocates its SW ring caches fresh per `forward_tokens`
+//!      call (see `dsv4.rs` `alloc_sw_window_caches`), so an incremental step
+//!      cannot yet see prior KV. The harness attempts each step, **catches the
+//!      bail**, and reports how far it got before printing `clean_tokens=[...]`
+//!      (always at least the prefill argmax).
 //!
-//! * `--gen-nccl-id` (build with `--features cuda,nccl`): rank-0 helper for the
-//!   launcher. Calls `ncclGetUniqueId`, hex-encodes the 128-byte id (256 hex
-//!   chars), prints it on a single stdout line, and exits. The launcher captures
-//!   it and exports `INFER_NCCL_UNIQUE_ID=<hex>` to all ranks (the same value the
-//!   `infer-cuda` loader decodes via `nccl_unique_id_from_env`).
+//! ## NCCL bootstrap — file rendezvous (not a throwaway mint)
 //!
-//! * default (the parity forward): mirrors the R6 Qwen one-prefill-row harness
-//!   (`crates/agent-bench` `cuda_qwen3_greedy_parity`) but for DSv4. It builds
-//!   `CudaExecutor::from_dsv4_fp8_safetensors(path, 1)` and drives
-//!   `BackendExecutor::submit` with a single-row `ForwardPlan`:
-//!     1. one **full-prefix prefill** at `start_pos = 0` over the whole prompt
-//!        → the FIRST generated token (the prefill argmax). Every layer type
-//!        (SW / CSA / HCA) recomputes its attention over `[0, len)`, so this is
-//!        the runnable correctness shape on every layer today.
-//!     2. then incremental decode steps (`start_pos > 0`, a single `[last_token]`
-//!        row). This is the path DSv4 has NOT proven: the SW ring caches are
-//!        reallocated fresh per `forward_tokens` call (see `dsv4.rs`
-//!        `alloc_sw_window_caches`), so an incremental single-token step cannot
-//!        see prior KV. The harness attempts each step, **catches the bail**, and
-//!        reports how far it got before printing `clean_tokens=[...]` (always at
-//!        least the prefill argmax).
+//! `ncclGetUniqueId` embeds the bootstrap **listener socket of the calling
+//! process**. A separate short-lived "mint the id and exit" helper is therefore
+//! broken: its listener dies on exit and every rank fails `ncclCommInitRank`
+//! with `Connection refused` / NCCL `RemoteError`. Instead, when
+//! `INFER_NCCL_ID_FILE` is set, rank 0 mints the id **in this process** (the one
+//! that becomes the live NCCL rank 0), writes it atomically to that file, and
+//! exports `INFER_NCCL_UNIQUE_ID`; every other rank blocks on the file then
+//! exports the same value. The loader's `nccl_unique_id_from_env` then decodes
+//! it unchanged.
 //!
 //! Env (parity mode):
 //!   * `INFER_DSV4_MODEL_PATH`  — DSv4 FP8 safetensors dir (required).
 //!   * `INFER_DSV4_PROMPT_IDS`  — comma-separated u32 ids; default
 //!     `785,6722,315,9625,374` = "The capital of France is".
 //!   * `INFER_DSV4_MAX_NEW`     — max new tokens to attempt (default 16).
-//!   * `INFER_CUDA_DEVICES` / `INFER_TP_RANK` / `INFER_TP_SIZE` /
-//!     `INFER_NCCL_UNIQUE_ID` — resolved inside the loader's TP runtime; the
-//!     launcher binds one rank per GPU. This binary is rank-agnostic — every rank
-//!     runs the identical forward; only rank 0's `clean_tokens` is the oracle the
-//!     launcher compares.
+//!   * `INFER_CUDA_DEVICES` / `INFER_TP_RANK` / `INFER_TP_SIZE` — TP world/rank
+//!     (resolved inside the loader's TP runtime; the launcher binds one rank per
+//!     GPU).
+//!   * `INFER_NCCL_ID_FILE` — shared rendezvous path (multi-rank only). The
+//!     launcher points all ranks at one file under its work dir.
 //!
 //! Build / run (pod, sm_90a, CUDA 12.9):
 //!   See `scripts/dsv4_multigpu_parity.sh` for the full 8-rank launch + build
 //!   flags (`ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`, FlashMLA, `ARLE_DEEPEP_DIR`,
 //!   nccl).
 
-// This example only does anything under `cuda`; `--gen-nccl-id` additionally
-// needs `nccl`. Under a host-only build it is an explanatory no-op so
-// `cargo build -p infer-cuda` (default, no-cuda) stays clean.
+// This example only does anything under `cuda`; the NCCL file-rendezvous
+// additionally needs `nccl`. Under a host-only build it is an explanatory no-op
+// so `cargo build -p infer-cuda` (default, no-cuda) stays clean.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 fn main() -> anyhow::Result<()> {
@@ -73,15 +77,16 @@ mod real {
     const DEFAULT_MAX_NEW: usize = 16;
 
     pub(super) fn run() -> Result<()> {
-        if std::env::args().any(|a| a == "--gen-nccl-id") {
-            return gen_nccl_id();
-        }
         parity_forward()
     }
 
-    /// rank-0 launcher helper: print the hex-encoded NCCL `unique_id`.
+    /// Mint a fresh NCCL `unique_id` in THIS process and hex-encode it (128
+    /// signed bytes → 256 lowercase hex chars; the loader's
+    /// `nccl_unique_id_from_env` decodes exactly this layout, i8 round-tripping
+    /// through u8 bit-for-bit). The caller must stay alive after minting — the id
+    /// embeds this process's bootstrap listener socket.
     #[cfg(feature = "nccl")]
-    fn gen_nccl_id() -> Result<()> {
+    fn mint_nccl_id_hex() -> Result<String> {
         use cuda_kernels::ffi::nccl;
 
         let mut id = nccl::ncclUniqueId {
@@ -92,23 +97,67 @@ mod real {
         let res = unsafe { nccl::ncclGetUniqueId(&mut id) };
         nccl::check(res).context("ncclGetUniqueId failed")?;
 
-        // 128 signed bytes → 256 lowercase hex chars; the loader's
-        // `nccl_unique_id_from_env` decodes exactly this layout (i8 round-trips
-        // through u8 bit-for-bit).
         let mut hex = String::with_capacity(256);
         for &b in &id.internal {
             use std::fmt::Write;
             write!(hex, "{:02x}", b as u8).expect("write to String is infallible");
         }
         debug_assert_eq!(hex.len(), 256);
-        // Single clean stdout line — the launcher captures this verbatim.
-        println!("{hex}");
+        Ok(hex)
+    }
+
+    /// Set `INFER_NCCL_UNIQUE_ID` for the in-process loader to pick up.
+    ///
+    /// SAFETY: called once at process start, single-threaded, before any NCCL
+    /// init / executor build / thread spawn. Edition-2024 requires `unsafe` for
+    /// env mutation; the no-other-threads precondition is what makes it sound.
+    #[cfg(feature = "nccl")]
+    fn export_nccl_id(hex: &str) {
+        unsafe { std::env::set_var("INFER_NCCL_UNIQUE_ID", hex) };
+    }
+
+    /// File-rendezvous for the NCCL `unique_id` (multi-rank only). Rank 0 mints
+    /// it in-process (staying alive as the live NCCL rank 0), writes it
+    /// atomically (tmp + rename), and exports it; every other rank blocks on the
+    /// file then exports the same value. Replaces the broken throwaway-process
+    /// mint whose bootstrap socket died on exit (`Connection refused`).
+    #[cfg(feature = "nccl")]
+    fn nccl_file_rendezvous(rank: usize, id_file: &std::path::Path) -> Result<()> {
+        use std::time::{Duration, Instant};
+
+        if rank == 0 {
+            let hex = mint_nccl_id_hex()?;
+            let tmp = id_file.with_extension("hex.tmp");
+            std::fs::write(&tmp, &hex).with_context(|| format!("write NCCL id to {tmp:?}"))?;
+            std::fs::rename(&tmp, id_file)
+                .with_context(|| format!("rename NCCL id -> {id_file:?}"))?;
+            export_nccl_id(&hex);
+            eprintln!("[dsv4-parity rank=0] minted NCCL id -> {id_file:?}");
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                if let Ok(s) = std::fs::read_to_string(id_file) {
+                    let s = s.trim();
+                    if s.len() == 256 {
+                        export_nccl_id(s);
+                        break;
+                    }
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "rank {rank} timed out (120s) waiting for NCCL id at {id_file:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         Ok(())
     }
 
     #[cfg(not(feature = "nccl"))]
-    fn gen_nccl_id() -> Result<()> {
-        anyhow::bail!("--gen-nccl-id needs the nccl feature; rebuild with --features cuda,nccl");
+    fn nccl_file_rendezvous(_rank: usize, _id_file: &std::path::Path) -> Result<()> {
+        anyhow::bail!(
+            "INFER_NCCL_ID_FILE needs the nccl feature; rebuild with --features cuda,nccl"
+        );
     }
 
     fn parity_forward() -> Result<()> {
@@ -125,10 +174,19 @@ mod real {
         anyhow::ensure!(!prompt.is_empty(), "INFER_DSV4_PROMPT_IDS resolved empty");
         anyhow::ensure!(max_new >= 1, "INFER_DSV4_MAX_NEW must be >= 1");
 
-        let rank = std::env::var("INFER_TP_RANK").unwrap_or_else(|_| "0".to_string());
+        let rank: usize = std::env::var("INFER_TP_RANK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         eprintln!(
             "[dsv4-parity rank={rank}] model={model_path} prompt={prompt:?} max_new={max_new}"
         );
+
+        // Multi-rank NCCL bootstrap: file-rendezvous BEFORE building the executor
+        // (the loader's TP runtime calls ncclCommInitRank during construction).
+        if let Ok(id_file) = std::env::var("INFER_NCCL_ID_FILE") {
+            nccl_file_rendezvous(rank, std::path::Path::new(&id_file))?;
+        }
 
         // DSv4 owns its MLA KV state inside the forward, so the host pool is only
         // present to satisfy the `submit(.., &mut dyn KvPool)` signature — the
