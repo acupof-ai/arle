@@ -20,6 +20,7 @@ use crate::model::CudaModel;
 use crate::ops::argmax;
 
 const SUPPORTED_PAGE_SIZE: usize = 16;
+const DSV4_DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
 /// Seq-len budget the captured decode graph's fixed `kv_indices` is sized to;
 /// pages beyond it fall back to eager rather than replay a stale graph.
@@ -447,17 +448,12 @@ impl QwenCudaExecutor {
 }
 
 /// DSv4-Flash executor: drives [`crate::dsv4::Dsv4Model::forward_tokens`] over a
-/// single scheduled row. DSv4 owns its MLA KV state inside the forward (the bf16
-/// SW ring + recomputed compressed pool), so it does NOT use a [`PagedKVPool`];
-/// it relies on the host [`KvPool`] only for the slot's logical `seq_len` to
-/// derive `start_pos`. The decode graph is disabled (MLA host-routing per step).
-///
-/// First-runnable scope: single-row prefill/decode, the uncached correctness
-/// path (each step recomputes the compressed pool from `[0, start_pos+len)`). A
-/// continuous-batching path that retains per-slot SW/compressed state across
-/// decode steps is the perf follow-up.
+/// single scheduled row. DSv4 owns its MLA KV state inside the forward (bf16 SW
+/// rings + compressor pending/compressed pools), so it does NOT use a
+/// [`PagedKVPool`]. The decode graph is disabled (MLA host-routing per step).
 pub(crate) struct Dsv4CudaExecutor {
     model: crate::dsv4::Dsv4Model,
+    slots: Vec<crate::dsv4::Dsv4SlotState>,
     num_slots: usize,
 }
 
@@ -477,7 +473,16 @@ impl Dsv4CudaExecutor {
     ) -> Result<Self> {
         ensure!(num_slots > 0, "Dsv4CudaExecutor requires at least one slot");
         let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(model_path.as_ref())?;
-        Ok(Self { model, num_slots })
+        let max_seq_len = dsv4_max_seq_len();
+        let mut slots = Vec::with_capacity(num_slots);
+        for _ in 0..num_slots {
+            slots.push(model.new_slot_state(max_seq_len)?);
+        }
+        Ok(Self {
+            model,
+            slots,
+            num_slots,
+        })
     }
 
     fn submit(&mut self, plan: &ForwardPlan) -> Result<StepOutput> {
@@ -500,10 +505,17 @@ impl Dsv4CudaExecutor {
                 self.num_slots
             );
             ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
+            if row.start_pos == 0 {
+                self.slots[row.slot].reset(&self.model.ctx)?;
+            }
             let position = (row.start_pos + row.tokens.len()) as u64;
-            let token =
-                self.model
-                    .forward_tokens(&row.tokens, row.start_pos, &row.params, position)?;
+            let token = self.model.forward_tokens(
+                &mut self.slots[row.slot],
+                &row.tokens,
+                row.start_pos,
+                &row.params,
+                position,
+            )?;
             (row.slot, token)
         } else {
             let row = &plan.decode_rows[0];
@@ -513,8 +525,16 @@ impl Dsv4CudaExecutor {
                 row.slot,
                 self.num_slots
             );
+            ensure!(
+                self.slots[row.slot].seq_len() == row.kv_seq_len,
+                "DSv4 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
+                self.slots[row.slot].seq_len(),
+                row.kv_seq_len,
+                row.slot
+            );
             let position = row.kv_seq_len.saturating_add(1) as u64;
             let token = self.model.forward_tokens(
+                &mut self.slots[row.slot],
                 &[row.last_token],
                 row.kv_seq_len,
                 &row.params,
@@ -532,6 +552,14 @@ impl Dsv4CudaExecutor {
             }],
         })
     }
+}
+
+fn dsv4_max_seq_len() -> usize {
+    std::env::var("INFER_DSV4_MAX_SEQ_LEN")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DSV4_DEFAULT_MAX_SEQ_LEN)
 }
 
 /// Qwen3.5 / Qwen3.6 HYBRID executor: drives

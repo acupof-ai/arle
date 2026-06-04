@@ -18,7 +18,6 @@ use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates
 use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
 use cudarc::driver::CudaSlice;
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config, DeepSeekV4MoeRoutingKind};
-use half::bf16;
 use infer_moe::MoeConfig;
 use infer_plan::SamplingParams;
 
@@ -213,6 +212,45 @@ pub(crate) struct Dsv4Model {
     pub tp: crate::tp::TpRuntime,
 }
 
+pub(crate) struct Dsv4SlotState {
+    attention: Vec<crate::attention::Dsv4LayerAttentionState>,
+    seq_len: usize,
+    max_seq_len: usize,
+}
+
+impl Dsv4SlotState {
+    fn new(model: &Dsv4Model, max_seq_len: usize) -> Result<Self> {
+        ensure!(max_seq_len > 0, "DSv4 slot max_seq_len must be positive");
+        let mut attention = Vec::with_capacity(model.layers.len());
+        for layer in &model.layers {
+            attention.push(crate::attention::Dsv4LayerAttentionState::new(
+                &model.ctx,
+                &model.config,
+                layer.mode,
+                layer.compress_ratio,
+                max_seq_len,
+            )?);
+        }
+        Ok(Self {
+            attention,
+            seq_len: 0,
+            max_seq_len,
+        })
+    }
+
+    pub(crate) fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    pub(crate) fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+        self.seq_len = 0;
+        for layer in &mut self.attention {
+            layer.reset(ctx)?;
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for Dsv4Model {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dsv4Model")
@@ -307,30 +345,8 @@ impl Dsv4Model {
         })
     }
 
-    /// Allocate this rank's per-layer bf16 sliding-window ring caches.
-    ///
-    /// Each SlidingWindow MLA layer holds `sliding_window * head_dim` bf16
-    /// elements that [`crate::attention::mla_attention`] reads and updates in
-    /// place. Zero-initialized = an empty window (a fresh prefill from
-    /// `start_pos == 0`); a continuous-batching executor (Piece 4) will instead
-    /// retain these across decode steps per slot.
-    pub(crate) fn alloc_sw_window_caches(&self) -> Result<Vec<CudaSlice<bf16>>> {
-        let cache_len = self.config.sliding_window * self.config.head_dim;
-        ensure!(
-            cache_len > 0,
-            "DSv4 SW window cache len is zero (sliding_window={} head_dim={})",
-            self.config.sliding_window,
-            self.config.head_dim
-        );
-        self.layers
-            .iter()
-            .map(|_| {
-                self.ctx
-                    .stream
-                    .alloc_zeros::<bf16>(cache_len)
-                    .map_err(|e| anyhow!("DSv4 SW window cache alloc failed: {e}"))
-            })
-            .collect()
+    pub(crate) fn new_slot_state(&self, max_seq_len: usize) -> Result<Dsv4SlotState> {
+        Dsv4SlotState::new(self, max_seq_len)
     }
 
     /// Forward one prefill/decode step over `tokens` starting at `start_pos`,
@@ -344,6 +360,7 @@ impl Dsv4Model {
     ///   wide stream to one hidden row before the final RMSNorm + lm_head + sample.
     pub(crate) fn forward_tokens(
         &self,
+        slot: &mut Dsv4SlotState,
         tokens: &[u32],
         start_pos: usize,
         params: &SamplingParams,
@@ -352,6 +369,17 @@ impl Dsv4Model {
         ensure!(
             !tokens.is_empty(),
             "DSv4 forward requires at least one token"
+        );
+        ensure!(
+            slot.seq_len == start_pos,
+            "DSv4 slot seq_len {} != start_pos {start_pos}; decode requires contiguous appends",
+            slot.seq_len
+        );
+        ensure!(
+            start_pos + tokens.len() <= slot.max_seq_len,
+            "DSv4 sequence {} exceeds slot max_seq_len {}",
+            start_pos + tokens.len(),
+            slot.max_seq_len
         );
 
         let hidden_size = self.config.hidden_size;
@@ -374,9 +402,6 @@ impl Dsv4Model {
             hc_mult,
             &mut stream,
         )?;
-
-        let mut sw_caches = self.alloc_sw_window_caches()?;
-
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // ── Attention half: HC-wrap MLA attention.
             let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)?;
@@ -400,7 +425,7 @@ impl Dsv4Model {
                 layer.compress_ratio,
                 layer_idx,
                 &normed,
-                &mut sw_caches[layer_idx],
+                &mut slot.attention[layer_idx],
                 start_pos,
                 &mut attn_out,
             )?;
@@ -434,12 +459,21 @@ impl Dsv4Model {
             crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)?;
             let mut moe_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
             crate::moe::dsv4_moe_forward(self, &layer.moe, tokens, &normed, &mut moe_out)?;
-            // Row-parallel down/combine: sum the per-rank partials.
+            // Routed experts are EP-sharded; sum them first, then add the replicated
+            // shared expert exactly once per rank.
             self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+            let shared = crate::moe::dsv4_shared_expert_forward(
+                &self.ctx,
+                &layer.moe,
+                &normed,
+                self.config.swiglu_limit,
+            )?;
+            let mut moe_with_shared = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
             let mut ffn_stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
             crate::hc::hc_post(
                 &self.ctx,
-                &moe_out,
+                &moe_with_shared,
                 &stream,
                 &mhc.post,
                 &mhc.comb,
@@ -449,6 +483,8 @@ impl Dsv4Model {
             )?;
             stream = ffn_stream;
         }
+
+        slot.seq_len += seq_len;
 
         // ── Head HC: fold the last token's wide stream row → one hidden vector.
         let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
