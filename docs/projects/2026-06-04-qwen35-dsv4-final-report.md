@@ -19,13 +19,30 @@ was built on `infer-api` (the rewrite Qwen3.5 path) + typecheck-gated; its GPU n
 verify (logits parity / offload / lora-merge) is the fix-forward follow-up on the pod
 (the rewrite is the committed truth, so no `infer` fallback is retained).
 
+**Update 2026-06-04 (perf push + honest corrections).** The rewrite-completion milestones
+above stand (infer deleted + merged, arch, Metal+CUDA serving, TP/EP, DeepGEMM, DeepEP).
+The performance pass since surfaced + fixed several things and one honest correction:
+- **CUDA-graph "support" wired** (`6a01e8cc`): the `--cuda-graph` flag was a no-op
+  (`let _ = enable_cuda_graph`); now real + default-on for single-GPU Qwen dense (TP/MoE
+  stay eager). Single-GPU A/B pending.
+- **DSv4 grouped-cache prebuild + wq_b TP-shard fix** (`d5115de5`): the MoE rebuilt static
+  expert weights every layer/token (~529 ms/token, eliminated); the wq_b TP-shard fix
+  cleared a pre-existing `wo_a cols != local_width` load error. Prefill-verified.
+- **CI was red on main** since the PR #53 merge (workflows referenced the deleted `infer/`
+  crate); fixed + green (`5bd92749`). Task #13's "green main CI" had been false.
+- **Honest correction:** DSv4 **incremental decode (`start_pos>0`) is broken** — the prior
+  "3/3 16/16" was prefill-only. Root-cause in progress (#23), jointly with Codex.
+- **SGLang-class perf roadmap** (`ee230308`, `docs/plans/2026-06-04-dsv4-decode-sglang-class-perf.md`):
+  on-device MoE routing (kill per-layer H2D/D2H) + full decode CUDA-graph (capturable
+  all-reduce) → 5–6 ms/token target, sequenced behind the decode-correctness fix.
+
 ## 2. Correctness matrix (all greedy, exact-token unless noted)
 
 | Path | SKU | Result |
 |---|---|---|
 | Qwen3 dense CUDA forward (R6) | H20 | **16/16** vs HF gold (2 shapes) |
 | Qwen3.5 / Qwen3.6 MoE Metal forward | M4 Pro | end-to-end correct, prefix reuse, greedy |
-| DSv4-Flash bf16 multi-GPU (MLA+CSA/HCA+HC+hash+FP8-MoE) | 8×H20 TP=8/EP=8 | **3/3 prompts 16/16** vs bf16 oracle |
+| DSv4-Flash bf16 multi-GPU (MLA+CSA/HCA+HC+hash+FP8-MoE) — **PREFILL** | 8×H20 TP=8/EP=8 | prefill argmax matches bf16 oracle (token#1=11111, 6-tok-prefix=603) ✓; **incremental decode `start_pos>0` is BROKEN** — diverges from prefill, a pre-existing never-completed path (#23, in progress 2026-06-04). The earlier "3/3 16/16" was prefill-only. |
 | DSv4 production DeepGEMM FP8-MoE | 8×H20 | **16/16** vs bf16 oracle (routed + shared expert) |
 | TP=8 / EP=8 row-parallel all-reduce | 8×H20 | verified via DSv4 (the model that needs sharding) |
 | CUDA Graph capture/replay | H20 | eager == replay == HF gold (16/16) |
