@@ -39,7 +39,11 @@ Source-localized each bucket from the nsys-rep, then eliminated:
 | `cuMemAllocAsync`+`cuMemFreeAsync` | 5.02 ms/tok | 1.76 | −65% |
 
 Correctness: `clean_tokens` == oracle, 16/16. Cumulative from the 4.365 baseline:
-**~5.75×.**
+**~5.75×.** The deep-copy-keepalive-off change is correctness-sensitive (#23
+class), so a follow-up **64-token guard** confirmed it holds beyond the 16-token
+gate: 64 decode steps, no incremental bail, first 16 exact oracle, stable
+repeating tail, 24.521 tok/s. The `ARLE_DSV4_DEEP_COPY_KEEPALIVE=1` fallback is
+retained as a safety valve.
 
 **Next lever (now #1):** launch overhead — `cudaLaunchKernel` + `cuLaunchKernelEx`
 ≈ 13.36 ms/token (32% of 41.2 ms) → #25 full decode graph. Residual D2D/memset are
