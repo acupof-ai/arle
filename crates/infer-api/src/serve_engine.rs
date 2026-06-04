@@ -236,9 +236,19 @@ where
     }
 
     fn telemetry(&self) -> EngineTelemetry {
-        // GAP: `ServeHandle` surfaces no scheduler counters; empty means
-        // "unavailable", not zero.
-        EngineTelemetry::default()
+        // Real scheduler occupancy from the engine's live counters. Latency /
+        // batch-occupancy / spec metrics need per-request timestamps the engine
+        // does not track yet, so they stay at their "unavailable" defaults.
+        let counters = self.serve.counters();
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        EngineTelemetry {
+            queue_depth: counters.queue_depth as u32,
+            active_requests: counters.active_requests as u32,
+            timestamp_ms,
+            ..EngineTelemetry::default()
+        }
     }
 }
 
