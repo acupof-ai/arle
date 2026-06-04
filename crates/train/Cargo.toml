@@ -14,7 +14,7 @@ autobins = false
 
 [features]
 default = []
-no-cuda = ["autograd/no-cuda"]
+no-cuda = ["autograd/no-cuda", "infer?/no-cuda"]
 metal = ["autograd/metal"]
 cuda = ["autograd/cuda", "dep:infer", "infer/cuda", "infer/unified_scheduler"]
 

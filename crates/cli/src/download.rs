@@ -15,7 +15,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 ///
 /// Returns the local cache directory containing all downloaded files.
 pub(crate) fn download_model_with_progress(model_id: &str) -> Result<PathBuf> {
-    let api = infer::hf_hub::build_api().context("failed to initialise HuggingFace API")?;
+    let api = infer_util::hf_hub::build_api().context("failed to initialise HuggingFace API")?;
     let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
 
     let info = repo

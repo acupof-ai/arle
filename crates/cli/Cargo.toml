@@ -11,11 +11,11 @@ publish = false
 #   --features metal,no-cuda   Apple Silicon
 #   --features cpu,no-cuda     portable smoke
 default = []
-cuda = ["infer/cuda", "train/cuda", "autograd/cuda"]
-no-cuda = ["infer/no-cuda", "train/no-cuda", "autograd/no-cuda"]
-cpu = ["infer/cpu"]
-metal = ["infer/metal", "train/metal", "autograd/metal"]
-nccl = ["cuda", "infer/nccl"]
+cuda = ["infer-api/cuda", "train/cuda", "autograd/cuda"]
+no-cuda = ["infer-api/no-cuda", "train/no-cuda", "autograd/no-cuda"]
+cpu = ["infer-api/cpu"]
+metal = ["infer-api/metal", "train/metal", "autograd/metal"]
+nccl = ["cuda", "infer-api/nccl"]
 
 [dependencies]
 anyhow = "1.0"
@@ -28,7 +28,8 @@ indicatif = "0.18"
 agent = { path = "../agent" }
 autograd = { path = "../autograd", default-features = false }
 chat = { path = "../chat" }
-infer = { path = "../../infer", default-features = false }
+infer-api = { path = "../infer-api" }
+infer-util = { path = "../infer-util" }
 deepseek-spec = { path = "../deepseek-spec" }
 qwen3-spec = { path = "../qwen3-spec" }
 qwen35-spec = { path = "../qwen35-spec" }

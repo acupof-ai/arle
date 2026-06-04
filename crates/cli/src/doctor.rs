@@ -195,7 +195,7 @@ fn collect_snapshot(args: &Args) -> DoctorSnapshot {
     let env_model = preferred_model_env_value();
     let arg_model_path = non_empty_value(args.model_path.as_deref()).map(ToOwned::to_owned);
     let hf_cache_root = hub_discovery::hub_cache_root();
-    let discovered = infer::hf_hub::discover_local_model();
+    let discovered = infer_util::hf_hub::discover_local_model();
     let snapshots = hub_discovery::discover_hub_snapshots();
     let recommendations = model_catalog::recommend_models(&info);
     let selected = select_model_source(
@@ -700,7 +700,7 @@ impl SelectedModelSource {
     fn local_path(&self) -> Option<PathBuf> {
         match self {
             Self::Explicit(value) | Self::Environment(value) => {
-                infer::hf_hub::resolve_local_model_path(value)
+                infer_util::hf_hub::resolve_local_model_path(value)
             }
             Self::AutoDiscovered { path, .. } => Some(path.clone()),
         }
