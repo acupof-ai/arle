@@ -109,3 +109,47 @@ GEMM compute + launches) ≈ 15–20%.
 Artifacts (pod): `dsv4_hostroute_decode2.{nsys-rep,log}`. The NVTX instrumentation
 commits with the #29 patch; the before/after profile pair lands as the #29 wins
 entry.
+
+## 6. After #24+#29 — decode 4.365 → 21.615 tok/s (~5×), re-profiled (2026-06-05)
+
+#24 (on-device router) + #29 (persistent `Dsv4MoeDecodeScratch`) landed
+(`4d62062a`, wins
+[`2026-06-05-dsv4-decode-scratch-pool-5x.md`](../experience/wins/2026-06-05-dsv4-decode-scratch-pool-5x.md)).
+Decode **21.615 tok/s** (non-nsys) / 19.724 (nsys), async sync-free, 16/16. Host
+overhead gone: `moe_route` 41.4%→3.7%, `deepgemm_grouped` 38.8%→4.3%,
+`cuMemAllocAsync` 87.4→2.81 ms/token, route D2H → 0.018 ms/token.
+
+**Clean #29 wall-clock breakdown (nsys, 50.70 ms/token):**
+
+| Bucket | ms/token | % wall | Lever |
+|---|---|---|---|
+| `cuMemcpyDtoD` (D2D copies) | 9.03 | 17.8% | **next: buffer reuse / in-place** |
+| `mla_attn` kernel | 11.79 | 23.3% | kernel floor — FlashMLA (align SGLang), last |
+| launch API (`cudaLaunchKernel` 8.82 + `cuLaunchKernelEx` 2.56) | 11.39 | 22.5% | **#25 full decode graph** |
+| `cuMemset` (zeroing) | 5.29 | 10.4% | **next: skip unnecessary zeroing** |
+| alloc/free residual (non-MoE per-layer temps) | 5.02 | 9.9% | **next: extend scratch arena** |
+| `lm_head_sample` (GEMV + argmax + D2H) | ~0.6 | ~1.2% | **ruled out** (see below) |
+
+**Evidence-based lever ranking (replaces assumption):**
+1. **Buffer/D2D/zeroing/alloc — next.** D2D 9.03 + memset 5.29 + alloc 5.02 =
+   ~19.3 ms/token (~38% wall), *bigger* than launch overhead and *lower-risk*
+   than full graph. Extend the #29 scratch philosophy: per-layer non-MoE temps
+   into a persistent arena, per-step D2D → in-place/reuse, memset only when the
+   consumer reads-before-writes.
+2. **#25 full decode graph** — launch API 22.5% is worth it, but needs a
+   capturable all-reduce + capturable DeepEP (high complexity, align SGLang);
+   do *after* buffer reuse.
+3. **MLA attn ~11.79 ms/token** — the real kernel floor; deepest, align SGLang
+   FlashMLA decode, last.
+
+**`lm_head_sample` ruled out (§0 framing-trap, falsified):** its 9.4 ms/token
+NVTX range *included* the step-end `sample_cuda_token → ctx.sync()`, so it was
+timing the whole step's GPU backlog, not the LM head. A `sync_before_lm_head`
+probe drops it 9.42→0.565 ms/token with decode tok/s unchanged
+(19.724→19.534); the LM-head GEMV is ~0.4 ms, argmax 0.009 ms, D2H 0.018 ms.
+(`ARLE_DSV4_FP8_GEMV_MMA=1` is also a kill — corrupts token1, slower.) **Lesson:
+an NVTX range that ends in a sync absorbs the upstream backlog and reads as a
+phantom 卡点 — always cross-check with a sync-before probe before chasing it.**
+
+Artifacts (pod): `dsv4_scratch_pool_clean_profile_{api,nvtx,gpu}.txt`,
+`dsv4_lmhead_presync_profile_{api,nvtx,gpu}.txt`.
