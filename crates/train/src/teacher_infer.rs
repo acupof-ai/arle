@@ -20,7 +20,7 @@ use autograd::{AutogradError, Tape, Tensor, TensorId, TensorStore};
 use base64::{Engine as _, engine::general_purpose};
 use half::bf16;
 #[cfg(feature = "cuda")]
-use infer::server_engine::LoadedInferenceEngine;
+use infer_api::LoadedInferenceEngine;
 use serde::{Deserialize, Serialize};
 
 use crate::qwen35::{Qwen35Error, Qwen35Model, SequenceWindow};

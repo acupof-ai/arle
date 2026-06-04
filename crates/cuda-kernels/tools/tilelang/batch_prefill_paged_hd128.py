@@ -1,19 +1,11 @@
-"""TileLang batch prefill HD128 paged attention.
+"""TileLang batch prefill HD128 paged attention (BF16, causal, page_size=16).
 
-HD128, BF16, causal, page_size=16. One kernel is AOT-specialized per
-(num_q_heads, num_kv_heads) pair in SUPPORTED_HEADS — keeping these as
-compile-time constants gives TileLang the freedom to specialize codegen
-per shape instead of paying for runtime parameterization. Add a new
-HD128 head config by extending the lockstep lists in this module,
-cuda-kernels/build.rs, cuda-kernels/src/ffi/attention.rs, and
-infer/src/ops/attention.rs.
+One kernel is AOT-specialized per (num_q_heads, num_kv_heads) in SUPPORTED_HEADS
+(compile-time constants → per-shape codegen). Add a head config by extending the
+lockstep lists here + build.rs + ffi/attention.rs + infer/src/ops/attention.rs.
 
-Tile / pipeline tunables (chosen as Hopper defaults; tuned during the
-H100 spike per docs/plans/tilelang-integration.md §6):
-  BLOCK_M = 64   q-tile rows
-  BLOCK_N = 64   kv-tile cols (= PAGE_SIZE * 4)
-  NUM_STAGES = 2
-  NUM_THREADS = 128 (4 warps)
+Tile tunables (Hopper defaults, docs/plans/tilelang-integration.md §6):
+BLOCK_M=64 q-tile rows, BLOCK_N=64 kv-tile cols, NUM_STAGES=2, NUM_THREADS=128.
 """
 
 import math
@@ -28,9 +20,8 @@ BLOCK_N = 64
 NUM_STAGES = 2
 NUM_THREADS = 128
 
-# (num_q_heads, num_kv_heads) configurations the Phase 0 build emits.
-# Mirrors the HD128 GQA family at the time of writing. Extend here +
-# the build.rs list + the matching FFI/Rust dispatch arms in lockstep.
+# (num_q_heads, num_kv_heads) the build emits. Extend here + build.rs + the
+# FFI/Rust dispatch arms in lockstep.
 SUPPORTED_HEADS = (
     (16, 8),
     (32, 8),
@@ -61,16 +52,13 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
         KV_indices: T.Tensor((T.symbolic("total_pages"),), index_dtype),
         KV_last_page_len: T.Tensor((T.symbolic("batch_size"),), index_dtype),
         Output: T.Tensor((T.symbolic("total_q_tokens"), num_q_heads * HEAD_DIM), dtype),
-        # TileLang 0.1.9 cannot use T.symbolic in grid extents — symbols
-        # there must come from a tensor shape or a kernel scalar arg.
-        # Pass batch / max_qlen as int32 runtime scalars instead, mirroring
-        # tile-ai/tilelang's example_gqa_fwd_varlen pattern.
+        # TileLang 0.1.9 can't use T.symbolic in grid extents (must come from a
+        # tensor shape or scalar arg), so batch/max_qlen are int32 scalars.
         batch_size: T.int32,
         max_qlen: T.int32,
     ):
-        # Grid: (q_tile_blocks_for_longest_request, num_q_heads, batch_size).
-        # Each block handles BLOCK_M consecutive q rows of one request, for
-        # one query head. KV pages walked sequentially via KV_indices.
+        # Grid: (q_tile_blocks, num_q_heads, batch_size). Each block = BLOCK_M q
+        # rows of one request/head; KV pages walked via KV_indices.
         with T.Kernel(
             T.ceildiv(max_qlen, BLOCK_M),
             num_q_heads,
@@ -95,25 +83,14 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             num_kv_pages = kv_page_end - kv_page_start
             last_page_len = KV_last_page_len[bz]
             kv_total_len = (num_kv_pages - 1) * PAGE_SIZE + last_page_len
-            # Hoisted out of the KV loop — same per-request constant the mask
-            # below references; precomputing here also feeds the causal-bound
-            # loop count.
-            kv_offset = kv_total_len - qlen
+            kv_offset = kv_total_len - qlen  # hoisted: also feeds the causal bound
 
             row0 = bx * BLOCK_M
             kv_head = by // gqa_group
 
-            # Causal-bound KV loop: rows row0..min(row0+BLOCK_M, qlen)-1
-            # attend at most to KV col `kv_offset + last_row` (the last
-            # real row's diagonal). For full Q-tiles (row0+BLOCK_M ≤ qlen)
-            # the bound is `kv_offset + row0 + BLOCK_M`; for the last
-            # partial Q-tile (row0+BLOCK_M > qlen) the actual rows stop at
-            # qlen-1, so the tighter bound is `kv_offset + qlen = kv_total_len`.
-            # Pick the tighter of the two — `min(row0+BLOCK_M, qlen)`. The
-            # outer `min(_, kv_total_len)` then clamps to the cache extent.
-            # Mirrors the standard causal tiled-attention visible-window bound.
-            # For 4096-in cold prefill this drops ~35-50% of the per-tile
-            # QK + softmax + PV work the unbounded loop wasted.
+            # Causal-bound KV loop: a Q-tile attends at most to KV col
+            # `kv_offset + min(row0+BLOCK_M, qlen)`, clamped to kv_total_len. Drops
+            # ~35-50% of per-tile work vs an unbounded loop on cold 4096-in prefill.
             q_rows_in_tile = T.if_then_else(
                 row0 + BLOCK_M < qlen, row0 + BLOCK_M, qlen
             )
@@ -135,10 +112,9 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                     T.cast(0, dtype),
                 )
 
-            # Per-tile page-index precomputes — only depend on j, not on
-            # the head-dim d. Hoisting these into a 1D fragment kills the
-            # ~128x duplicate divmod + KV_indices gather the original
-            # (j, d) loop incurred in the straightforward implementation.
+            # Per-tile page-index precomputes (depend on j only, not d): hoisting
+            # to a 1D fragment kills the ~128x duplicate divmod + KV_indices gather
+            # a (j, d) loop would incur.
             page_idx_j = T.alloc_fragment((BLOCK_N,), index_dtype)
             in_page_j = T.alloc_fragment((BLOCK_N,), index_dtype)
             valid_j = T.alloc_fragment((BLOCK_N,), index_dtype)
@@ -171,8 +147,7 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 T.clear(scores)
                 T.gemm(q_tile, k_tile, scores, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
-                # Causal mask: q's absolute pos = (kv_total_len - qlen) + row.
-                # `kv_offset` was hoisted above the loop.
+                # Causal mask: q's absolute pos = kv_offset + row.
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
                     row = row0 + i
                     col = col0 + j
@@ -188,24 +163,18 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 m_new = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 p = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
                 T.copy(m_i, m_prev)
-                # `clear=True` initializes m_new to -inf before the reduction.
-                # The previous `clear=False` left m_new uninitialized — TileLang
-                # codegen emits `m_new[i] = max(m_new[i], m_new_clear[i])`
-                # reading uninit stack memory, which is the actual root cause
-                # of the short-qlen NaN regression: any nonzero garbage (incl.
-                # NaN) leaks into m_new even on valid rows. See
+                # clear=True is load-bearing: clear=False leaves m_new uninit, and
+                # codegen's `max(m_new[i], m_new_clear[i])` then leaks stack garbage
+                # (incl. NaN) → short-qlen NaN regression. See
                 # docs/experience/errors/2026-04-28-tilelang-prefill-short-qlen-nan.md.
                 T.reduce_max(scores, m_new, dim=1, clear=True)
                 for i in T.Parallel(BLOCK_M):
                     m_new[i] = T.max(m_prev[i], m_new[i])
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
                     p[i, j] = T.exp2((scores[i, j] - m_new[i]) * log2e)
-                # Hoist the per-row alpha into its own fragment then drive
-                # the acc_o rescale as a 2D T.Parallel — the nested
-                # T.serial(HEAD_DIM) inside T.Parallel(BLOCK_M) version
-                # produced a layout TileLang 0.1.9's LayoutInferencer can't
-                # map to threads (`loop_var_to_thread ... contains inner
-                # var d`).
+                # Hoist per-row alpha to a fragment + rescale acc_o as a 2D
+                # T.Parallel: the nested T.serial(HEAD_DIM) form trips TileLang
+                # 0.1.9's LayoutInferencer (`loop_var_to_thread ... inner var d`).
                 scale_i = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 for i in T.Parallel(BLOCK_M):
                     scale_i[i] = T.exp2((m_prev[i] - m_new[i]) * log2e)
@@ -217,10 +186,8 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 for i in T.Parallel(BLOCK_M):
                     l_i[i] = l_i[i] + row_sum[i]
                     m_i[i] = m_new[i]
-                # Narrow the f32 softmax output to bf16 to match v_tile
-                # before the P @ V matmul (standard FlashAttention-2
-                # pattern). TileLang 0.1.9's gemm asserts A.dtype ==
-                # B.dtype; older versions auto-cast silently.
+                # Narrow f32 softmax to bf16 to match v_tile before P @ V (gemm
+                # asserts A.dtype == B.dtype in TileLang 0.1.9).
                 p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
                 T.copy(p, p_bf16)
                 T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
