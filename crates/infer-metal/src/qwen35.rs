@@ -305,26 +305,14 @@ fn build_qwen35_dense_mlp(
     down_proj: WeightTensor,
 ) -> Result<MlpKind> {
     let gate_dim = gate_proj.output_dim()?;
-    let up_dim = up_proj.output_dim()?;
-    let inputs =
-        if let Some(gate_up_proj) = merge_quantized_projection_rows(&[&gate_proj, &up_proj])? {
-            MlpInputProjection::MergedQuantized {
-                gate_up_proj,
-                gate_dim,
-                up_dim,
-            }
-        } else if let Ok(gate_up_proj) = concat_weight_rows(&gate_proj, &up_proj) {
-            MlpInputProjection::MergedQuantized {
-                gate_up_proj,
-                gate_dim,
-                up_dim,
-            }
-        } else {
-            MlpInputProjection::Split {
-                gate_proj: gate_proj.clone(),
-                up_proj: up_proj.clone(),
-            }
-        };
+    let gate_up_proj = match merge_quantized_projection_rows(&[&gate_proj, &up_proj])? {
+        Some(gate_up_proj) => gate_up_proj,
+        None => concat_weight_rows(&gate_proj, &up_proj)?,
+    };
+    let inputs = MlpInputProjection::MergedQuantized {
+        gate_up_proj,
+        gate_dim,
+    };
     Ok(MlpKind::Dense(MetalQwen35DenseMlpWeights {
         inputs,
         down_proj,
@@ -656,22 +644,15 @@ impl CppQwen35Model {
                 MlpKind::Moe(_) => None,
             };
             let (gate_up_id, gate_dim, down_id) = if let Some(dense) = dense {
-                match &dense.inputs {
-                    MlpInputProjection::MergedQuantized {
-                        gate_up_proj,
-                        gate_dim,
-                        ..
-                    } => (
-                        add_or_free!(gate_up_proj),
-                        *gate_dim,
-                        add_or_free!(&dense.down_proj),
-                    ),
-                    MlpInputProjection::Split { .. } => {
-                        log::warn!("C++ Qwen3.5 model requires merged MLP inputs");
-                        unsafe { mlx_sys::qwen35_compiled_free(model) };
-                        return None;
-                    }
-                }
+                let MlpInputProjection::MergedQuantized {
+                    gate_up_proj,
+                    gate_dim,
+                } = &dense.inputs;
+                (
+                    add_or_free!(gate_up_proj),
+                    *gate_dim,
+                    add_or_free!(&dense.down_proj),
+                )
             } else {
                 (-1, 0, -1)
             };
