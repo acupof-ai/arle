@@ -224,6 +224,7 @@ pub(crate) struct Dsv4Model {
 
 pub(crate) struct Dsv4SlotState {
     attention: Vec<crate::attention::Dsv4LayerAttentionState>,
+    moe_decode_scratch: Vec<crate::moe::Dsv4MoeDecodeScratch>,
     seq_len: usize,
     max_seq_len: usize,
 }
@@ -341,6 +342,7 @@ impl Dsv4SlotState {
     fn new(model: &Dsv4Model, max_seq_len: usize) -> Result<Self> {
         ensure!(max_seq_len > 0, "DSv4 slot max_seq_len must be positive");
         let mut attention = Vec::with_capacity(model.layers.len());
+        let mut moe_decode_scratch = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
             attention.push(crate::attention::Dsv4LayerAttentionState::new(
                 &model.ctx,
@@ -349,9 +351,16 @@ impl Dsv4SlotState {
                 layer.compress_ratio,
                 max_seq_len,
             )?);
+            moe_decode_scratch.push(crate::moe::Dsv4MoeDecodeScratch::new(
+                &model.ctx,
+                &model.moe_config,
+                &model.split,
+                &layer.moe,
+            )?);
         }
         Ok(Self {
             attention,
+            moe_decode_scratch,
             seq_len: 0,
             max_seq_len,
         })
@@ -510,9 +519,13 @@ impl Dsv4Model {
         let stream_dim = hidden_size * hc_mult;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
+        let use_gpu_router = std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some();
+        let use_deepep_transport = dsv4_use_deepep_transport()?;
+        let use_moe_decode_scratch = use_gpu_router && seq_len == 1 && !use_deepep_transport;
         let mut keepalive = Dsv4ForwardKeepalive::new(seq_len == 1);
 
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let nvtx_embed = crate::nvtx::range("dsv4/embed");
         let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids_host)?;
         keepalive.keep_i32(&token_ids);
         let mut embeddings = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
@@ -529,7 +542,9 @@ impl Dsv4Model {
             &mut stream,
         )?;
         keepalive.keep_hidden(&stream);
+        drop(nvtx_embed);
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC-wrap MLA attention.
             let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)?;
             keepalive.keep_f32(&mhc.pre);
@@ -549,23 +564,29 @@ impl Dsv4Model {
             crate::ops::rms_norm_batch(&self.ctx, &attn_in, &layer.attn_norm, eps, &mut normed)?;
             keepalive.keep_hidden(&normed);
             let mut attn_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            crate::attention::mla_attention(
-                &self.ctx,
-                &self.config,
-                &layer.attention,
-                layer.mode,
-                layer.compress_ratio,
-                layer_idx,
-                &normed,
-                &mut slot.attention[layer_idx],
-                start_pos,
-                self.tp.config().rank,
-                &mut attn_out,
-                &mut keepalive,
-            )?;
+            {
+                let _nvtx = crate::nvtx::range("dsv4/mla_attn");
+                crate::attention::mla_attention(
+                    &self.ctx,
+                    &self.config,
+                    &layer.attention,
+                    layer.mode,
+                    layer.compress_ratio,
+                    layer_idx,
+                    &normed,
+                    &mut slot.attention[layer_idx],
+                    start_pos,
+                    self.tp.config().rank,
+                    &mut attn_out,
+                    &mut keepalive,
+                )?;
+            }
             keepalive.keep_hidden(&attn_out);
             // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
-            self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
+            {
+                let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
+                self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
+            }
             let mut attn_stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
             crate::hc::hc_post(
                 &self.ctx,
@@ -599,7 +620,7 @@ impl Dsv4Model {
             crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)?;
             keepalive.keep_hidden(&normed);
             let mut moe_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            if dsv4_use_deepep_transport()? {
+            if use_deepep_transport {
                 #[cfg(feature = "deepep")]
                 {
                     let transport = self.deepep.as_ref().ok_or_else(|| {
@@ -620,24 +641,39 @@ impl Dsv4Model {
                     bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
                 }
             } else {
+                let decode_scratch = if use_moe_decode_scratch {
+                    Some(&mut slot.moe_decode_scratch[layer_idx])
+                } else {
+                    None
+                };
                 crate::moe::dsv4_moe_forward(
                     self,
                     &layer.moe,
                     tokens,
                     &normed,
                     &mut moe_out,
+                    decode_scratch,
                     &mut keepalive,
                 )?;
                 // Routed experts are EP-sharded; sum them first, then add the replicated
                 // shared expert exactly once per rank.
-                self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                {
+                    let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
+                    self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                }
             }
             keepalive.keep_hidden(&moe_out);
+            let nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
             let shared = crate::moe::dsv4_shared_expert_forward(
                 &self.ctx,
                 &layer.moe,
                 &normed,
                 self.config.swiglu_limit,
+                if use_moe_decode_scratch {
+                    Some(&mut slot.moe_decode_scratch[layer_idx])
+                } else {
+                    None
+                },
                 &mut keepalive,
             )?;
             keepalive.keep_hidden(&shared);
@@ -655,33 +691,37 @@ impl Dsv4Model {
                 hc_mult,
                 &mut ffn_stream,
             )?;
+            drop(nvtx_shared_hc);
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
         }
 
         slot.seq_len += seq_len;
 
-        // ── Head HC: fold the last token's wide stream row → one hidden vector.
-        let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        crate::hc::head_hidden_from_stream(
-            &self.ctx,
-            &self.config,
-            &self.head_hc,
-            &stream,
-            seq_len - 1,
-            &mut last_hidden,
-        )?;
-        keepalive.keep_hidden(&stream);
-        keepalive.keep_vec(&last_hidden);
+        let token = {
+            let _nvtx = crate::nvtx::range("dsv4/lm_head_sample");
+            // ── Head HC: fold the last token's wide stream row → one hidden vector.
+            let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
+            crate::hc::head_hidden_from_stream(
+                &self.ctx,
+                &self.config,
+                &self.head_hc,
+                &stream,
+                seq_len - 1,
+                &mut last_hidden,
+            )?;
+            keepalive.keep_hidden(&stream);
+            keepalive.keep_vec(&last_hidden);
 
-        // ── Final norm + lm_head projection + sample (last token row).
-        let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        crate::ops::rms_norm_vec(&self.ctx, &last_hidden, &self.norm, eps, &mut last_normed)?;
-        keepalive.keep_vec(&last_normed);
-        let mut logits = DeviceVec::zeros(&self.ctx, self.lm_head.rows)?;
-        self.lm_head_project(&last_normed, &mut logits)?;
-        keepalive.keep_vec(&logits);
-        let token = crate::executor::sample_cuda_token(&self.ctx, &logits, params, position)?;
+            // ── Final norm + lm_head projection + sample (last token row).
+            let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
+            crate::ops::rms_norm_vec(&self.ctx, &last_hidden, &self.norm, eps, &mut last_normed)?;
+            keepalive.keep_vec(&last_normed);
+            let mut logits = DeviceVec::zeros(&self.ctx, self.lm_head.rows)?;
+            self.lm_head_project(&last_normed, &mut logits)?;
+            keepalive.keep_vec(&logits);
+            crate::executor::sample_cuda_token(&self.ctx, &logits, params, position)?
+        };
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(token)
