@@ -43,7 +43,7 @@ jobs:
             ${{ runner.os }}-cuda-
 
       - name: cargo check (cuda + no-cuda infer lib)
-        run: cargo check -p infer --release --no-default-features --features cuda,no-cuda --lib
+        run: cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
 
       - name: cargo check (cuda + no-cuda CLI)
         run: >
