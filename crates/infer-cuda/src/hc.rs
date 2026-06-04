@@ -92,21 +92,25 @@ pub(crate) fn gen_mhc_params(
         hc.scale.len
     );
 
-    let mut mixes = HiddenStates::zeros(ctx, hc.mix_fn.rows, stream.seq_len)?;
+    // SAFETY: dsv4_linear writes the full mix buffer.
+    let mut mixes = unsafe { HiddenStates::uninit(ctx, hc.mix_fn.rows, stream.seq_len)? };
     crate::attention::dsv4_linear(ctx, &hc.mix_fn, stream, &mut mixes)?;
 
-    let mut pre = ctx
-        .stream
-        .alloc_zeros::<f32>(stream.seq_len * hc_mult)
-        .map_err(|e| anyhow!("DSv4 HC pre alloc failed: {e}"))?;
-    let mut post = ctx
-        .stream
-        .alloc_zeros::<f32>(stream.seq_len * hc_mult)
-        .map_err(|e| anyhow!("DSv4 HC post alloc failed: {e}"))?;
-    let mut comb = ctx
-        .stream
-        .alloc_zeros::<f32>(stream.seq_len * hc_mult * hc_mult)
-        .map_err(|e| anyhow!("DSv4 HC comb alloc failed: {e}"))?;
+    let mut pre = unsafe {
+        ctx.stream
+            .alloc::<f32>(stream.seq_len * hc_mult)
+            .map_err(|e| anyhow!("DSv4 HC pre alloc failed: {e}"))?
+    };
+    let mut post = unsafe {
+        ctx.stream
+            .alloc::<f32>(stream.seq_len * hc_mult)
+            .map_err(|e| anyhow!("DSv4 HC post alloc failed: {e}"))?
+    };
+    let mut comb = unsafe {
+        ctx.stream
+            .alloc::<f32>(stream.seq_len * hc_mult * hc_mult)
+            .map_err(|e| anyhow!("DSv4 HC comb alloc failed: {e}"))?
+    };
 
     {
         let (stream_ptr, _gs) = stream.data.device_ptr(&ctx.stream);
@@ -290,9 +294,11 @@ pub(crate) fn head_hidden_from_stream(
     );
 
     // Extract the single stream row, project it through mix_fn (batch=1).
-    let mut stream_row = HiddenStates::zeros(ctx, stream.hidden_dim, 1)?;
+    // SAFETY: copy_row_to_hidden writes the full one-token stream row.
+    let mut stream_row = unsafe { HiddenStates::uninit(ctx, stream.hidden_dim, 1)? };
     crate::ops::copy_row_to_hidden(ctx, stream, token_idx, &mut stream_row)?;
-    let mut mixes = HiddenStates::zeros(ctx, head_hc.mix_fn.rows, 1)?;
+    // SAFETY: dsv4_linear writes the full head-HC mix buffer.
+    let mut mixes = unsafe { HiddenStates::uninit(ctx, head_hc.mix_fn.rows, 1)? };
     crate::attention::dsv4_linear(ctx, &head_hc.mix_fn, &stream_row, &mut mixes)?;
 
     let (row_ptr, _gr) = stream_row.data.device_ptr(&ctx.stream);

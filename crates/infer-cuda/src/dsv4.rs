@@ -236,6 +236,12 @@ pub(crate) struct Dsv4SlotState {
 /// long chain of kernels over per-call buffers; without an owner that lives until
 /// the final host-sync sample, Rust can drop/reuse those allocations while the
 /// stream still has in-flight work that reads them.
+///
+/// #29's decode scratch pool now owns the small DeepGEMM/MoE temporaries that
+/// originally needed this bridge. Leave the deep-copy keepalive as an explicit
+/// diagnostic fallback only: `CudaSlice::clone()` is a device-to-device copy,
+/// not a cheap handle clone, so enabling it in production reintroduces tens of
+/// thousands of D2D API calls per decode window.
 pub(crate) struct Dsv4ForwardKeepalive {
     active: bool,
     bf16: Vec<CudaSlice<half::bf16>>,
@@ -249,6 +255,7 @@ pub(crate) struct Dsv4ForwardKeepalive {
 
 impl Dsv4ForwardKeepalive {
     fn new(active: bool) -> Self {
+        let active = active && std::env::var_os("ARLE_DSV4_DEEP_COPY_KEEPALIVE").is_some();
         Self {
             active,
             bf16: Vec::with_capacity(512),
@@ -304,28 +311,42 @@ impl Dsv4ForwardKeepalive {
         self.u8.push(value.clone());
     }
 
-    /// Keep small device-router buffers alive even during large prefill. The
-    /// decode keepalive is gated to avoid retaining every layer's full hidden
-    /// intermediates, but these router buffers are tiny and otherwise can be
-    /// freed while the async route/count/pack kernels still read them.
+    /// Legacy deep-copy fallback for small device-router buffers. Default-off:
+    /// #29's persistent scratch owns the decode buffers, and `CudaSlice::clone`
+    /// would otherwise add a D2D copy for each retained slice.
     pub(crate) fn keep_route_hidden(&mut self, value: &HiddenStates) {
+        if !self.active {
+            return;
+        }
         self.bf16.push(value.data.clone());
     }
 
     pub(crate) fn keep_route_f32(&mut self, value: &CudaSlice<f32>) {
+        if !self.active {
+            return;
+        }
         self.f32.push(value.clone());
     }
 
     pub(crate) fn keep_route_i32(&mut self, value: &CudaSlice<i32>) {
+        if !self.active {
+            return;
+        }
         self.i32.push(value.clone());
     }
 
     #[cfg(feature = "deepep")]
     pub(crate) fn keep_route_i64(&mut self, value: &CudaSlice<i64>) {
+        if !self.active {
+            return;
+        }
         self.i64.push(value.clone());
     }
 
     pub(crate) fn keep_route_u32(&mut self, value: &CudaSlice<u32>) {
+        if !self.active {
+            return;
+        }
         self.u32.push(value.clone());
     }
 
@@ -528,12 +549,14 @@ impl Dsv4Model {
         let nvtx_embed = crate::nvtx::range("dsv4/embed");
         let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids_host)?;
         keepalive.keep_i32(&token_ids);
-        let mut embeddings = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+        // SAFETY: embedding_batch writes the full [seq_len, hidden_size] buffer.
+        let mut embeddings = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
         crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)?;
         keepalive.keep_hidden(&embeddings);
 
         // Wide HC residual stream from the token embeddings.
-        let mut stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
+        // SAFETY: initial_stream_from_embeddings writes the full stream buffer.
+        let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
         crate::hc::initial_stream_from_embeddings(
             &self.ctx,
             &embeddings,
@@ -550,7 +573,8 @@ impl Dsv4Model {
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
-            let mut attn_in = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
+            let mut attn_in = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             crate::hc::hc_pre(
                 &self.ctx,
                 &stream,
@@ -560,10 +584,12 @@ impl Dsv4Model {
                 &mut attn_in,
             )?;
             keepalive.keep_hidden(&attn_in);
-            let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             crate::ops::rms_norm_batch(&self.ctx, &attn_in, &layer.attn_norm, eps, &mut normed)?;
             keepalive.keep_hidden(&normed);
-            let mut attn_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
+            let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             {
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn");
                 crate::attention::mla_attention(
@@ -587,7 +613,8 @@ impl Dsv4Model {
                 let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
                 self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
             }
-            let mut attn_stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
+            // SAFETY: hc_post writes the full stream buffer.
+            let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             crate::hc::hc_post(
                 &self.ctx,
                 &attn_out,
@@ -606,7 +633,8 @@ impl Dsv4Model {
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
-            let mut ffn_in = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
+            let mut ffn_in = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             crate::hc::hc_pre(
                 &self.ctx,
                 &stream,
@@ -616,10 +644,12 @@ impl Dsv4Model {
                 &mut ffn_in,
             )?;
             keepalive.keep_hidden(&ffn_in);
-            let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)?;
             keepalive.keep_hidden(&normed);
-            let mut moe_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            // SAFETY: the MoE forward writes the full routed output buffer.
+            let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             if use_deepep_transport {
                 #[cfg(feature = "deepep")]
                 {
@@ -664,10 +694,13 @@ impl Dsv4Model {
             }
             keepalive.keep_hidden(&moe_out);
             let nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
-            let shared = crate::moe::dsv4_shared_expert_forward(
+            // SAFETY: dsv4_shared_expert_forward writes the full shared output.
+            let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::moe::dsv4_shared_expert_forward(
                 &self.ctx,
                 &layer.moe,
                 &normed,
+                &mut shared,
                 self.config.swiglu_limit,
                 if use_moe_decode_scratch {
                     Some(&mut slot.moe_decode_scratch[layer_idx])
@@ -677,10 +710,13 @@ impl Dsv4Model {
                 &mut keepalive,
             )?;
             keepalive.keep_hidden(&shared);
-            let mut moe_with_shared = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
+            let mut moe_with_shared =
+                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
             keepalive.keep_hidden(&moe_with_shared);
-            let mut ffn_stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
+            // SAFETY: hc_post writes the full stream buffer.
+            let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             crate::hc::hc_post(
                 &self.ctx,
                 &moe_with_shared,
@@ -750,7 +786,8 @@ impl Dsv4Model {
                     hidden_dim: x.len,
                     seq_len: 1,
                 };
-                let mut out_batch = HiddenStates::zeros(&self.ctx, logits.len, 1)?;
+                // SAFETY: mla_linear writes the full one-token logits batch.
+                let mut out_batch = unsafe { HiddenStates::uninit(&self.ctx, logits.len, 1)? };
                 crate::attention::mla_linear(&self.ctx, &self.lm_head, &x_batch, &mut out_batch)?;
                 self.ctx
                     .stream
