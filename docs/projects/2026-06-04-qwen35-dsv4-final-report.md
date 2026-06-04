@@ -10,11 +10,14 @@ this is the consolidated headline.
 
 The rewrite is **verified and complete on serving** across Metal + CUDA, TP/EP, the
 FP8 DeepGEMM MoE backend, and the DeepEP all-to-all transport — **all five goal axes
-of correctness are now closed** (DeepEP transport verified by moe_out parity + token-1). The Metal decode regression flagged this session was
-root-caused and **recovered to ≈ legacy parity**, now on by default. The one
-deferred item is deleting legacy `infer/`, gated solely on porting train's CUDA
-OPD-teacher surface (scoped, ~3-4 wk — see the deletion-gate doc); `infer/` is
-retained only as a train-only OPD dependency, off every serving path.
+are met**: ① **legacy `infer/` is DELETED** (`e81b98fb`, ~167k LOC; agent+cli+train
+all on `infer-api`/`infer-util`, the rewrite is the sole stack); ② elegant/extensible
+arch (§4); ③ Metal+CUDA verified (Metal regression recovered + default-on); ④ EP+TP
+verified (DSv4 TP=8/EP=8); ⑤ DeepGEMM 16/16 + DeepEP transport verified. To unblock
+①, train's CUDA OPD-teacher surface (`forward_token_logits`/offload/`remerge_student_lora`)
+was built on `infer-api` (the rewrite Qwen3.5 path) + typecheck-gated; its GPU numeric
+verify (logits parity / offload / lora-merge) is the fix-forward follow-up on the pod
+(the rewrite is the committed truth, so no `infer` fallback is retained).
 
 ## 2. Correctness matrix (all greedy, exact-token unless noted)
 
@@ -86,14 +89,20 @@ crate), deleted the speculative `infer-models` crate + 3 orphaned seam traits (z
 impls), migrated `agent` + `cli` off direct `infer` to the single `infer-api` front
 door. No parallel old+new paths; backends are thin plug-ins behind one seam.
 
-## 5. Remaining
+## 5. Remaining (all goal axes met; these are follow-ups / fix-forward)
 
-1. **DeepEP wiring repo-mirror** — transport VERIFIED on H20 (§2); landing Codex's
-   focused wiring diff into the repo (opt-in `ARLE_DSV4_MOE_TRANSPORT=deepep`,
-   all_reduce stays default). Verification is done; only the mirror remains.
-2. **CUDA per-op perf profiling (#16)** — DSv4 / Qwen CUDA throughput + TP scaling
-   + compute/comm overlap (SGLang-ref); the perf half of this report.
-3. **`infer/` deletion** — train's CUDA OPD-teacher surface (~3-4 wk, roadmap in
-   [`2026-06-04-train-opd-surface-deletion-gate.md`](2026-06-04-train-opd-surface-deletion-gate.md)).
+DONE this session: DeepEP wiring mirrored (`9bd92418`); train OPD surface + **`infer/`
+deleted** (`956c774f` + `e81b98fb`).
+
+1. **GPU numeric verify of the OPD-teacher surface** (logits parity vs the pre-sample
+   forward / offload correctness / lora-merge numerics) on the pod — fix-forward
+   (typecheck-gated in-tree; the rewrite is committed truth, no `infer` fallback).
+2. **CUDA per-op perf profiling (#16)** — the perf half of this report. In flight
+   (early H20 nsys: NCCL all-reduce 27.5% GPU time **at 0% compute-overlap = serial
+   critical path**, DSv4 FP8 GEMV 26.4%, hybrid attn 21.7%; DSv4 weight load **111 s**).
+3. **Load + compile optimization** (research delivered,
+   [`research/2026-06-04-load-and-compile-optimization.md`](../research/2026-06-04-load-and-compile-optimization.md)):
+   top levers = pinned async H2D (load, ~111s target), content-addressed cubin cache
+   (build), primitive-count reduction (Metal encode) — each GPU-experiment-gated.
 4. **FP8-KV decode** (`alloc_fp8_arena` bail-gated); **V100/sm_70** TileLang
    LayoutInference (deferred legacy tier); **Qwen FP8/4-bit** quant paths.
