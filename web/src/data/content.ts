@@ -116,7 +116,7 @@ export type Locale = {
     files: { title: string } & Files;
   };
   footer: {
-    /** Plain-text left meta (e.g. "arle(1) · April 2026 · v0.4.2"). */
+    /** Plain-text left meta (e.g. "arle(1) · April 2026 · v0.1.5"). */
     left: string;
     /** Right meta as a link. */
     right: { label: string; href: string };
@@ -128,7 +128,7 @@ const SIGNALS: Signal[] = [
   { html: '<b>metal</b> beta · apple silicon', dot: "warn" },
   { html: '<b>cpu</b> dev only', dot: "dim" },
   { html: '<b>api</b> openai · v1' },
-  { html: '<b>release</b> v0.1.4 · 2026-04-28' },
+  { html: '<b>release</b> v0.1.5 · 2026-04-28' },
 ];
 
 const TERMINAL_LINES_EN = [
@@ -176,8 +176,8 @@ const INSTALL_CARDS_EN: InstallCard[] = [
     channel: "workspace",
     lines: [
       '<span class="p">$</span> git clone https://github.com/cklxx/arle &amp;&amp; cd arle',
-      '<span class="p">$</span> cargo install --path crates/cli --features cuda',
-      '<span class="c"># --features cuda is opt-in; cpu builds out of the box</span>',
+      '<span class="p">$</span> cargo build --release --features cuda --bin arle',
+      '<span class="c"># cli is default-on; cpu: --no-default-features --features cpu,no-cuda</span>',
     ],
   },
 ];
@@ -215,8 +215,8 @@ const INSTALL_CARDS_ZH: InstallCard[] = [
     channel: "workspace",
     lines: [
       '<span class="p">$</span> git clone https://github.com/cklxx/arle &amp;&amp; cd arle',
-      '<span class="p">$</span> cargo install --path crates/cli --features cuda',
-      '<span class="c"># --features cuda 可选; cpu 默认就能编</span>',
+      '<span class="p">$</span> cargo build --release --features cuda --bin arle',
+      '<span class="c"># cli 默认开启; cpu: --no-default-features --features cpu,no-cuda</span>',
     ],
   },
 ];
@@ -275,7 +275,7 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "decode", value: "4.7", unit: "ms/tok" },
       { key: "ttft", value: "223", unit: "ms" },
     ],
-    cmd: "metal_bench --model Qwen3.5-0.8B-Q4_K_M.gguf",
+    cmd: "arle serve --backend metal --model-path Qwen3.5-0.8B-Q4_K_M.gguf",
     href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md",
   },
 ];
@@ -334,7 +334,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "decode", value: "4.7", unit: "ms/tok" },
       { key: "TTFT", value: "223", unit: "ms" },
     ],
-    cmd: "metal_bench --model Qwen3.5-0.8B-Q4_K_M.gguf",
+    cmd: "arle serve --backend metal --model-path Qwen3.5-0.8B-Q4_K_M.gguf",
     href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md",
   },
 ];
@@ -400,7 +400,7 @@ const FILES_EN: FileRow[] = [
   { path: "/docs/stability-policy.md", desc: "stability levels · compatibility posture", href: "https://github.com/cklxx/arle/blob/main/docs/stability-policy.md" },
   { path: "/docs/experience/wins/", desc: "dated benchmark snapshots", href: "https://github.com/cklxx/arle/tree/main/docs/experience/wins" },
   { path: "/crates/cli/", desc: "arle binary · verbs · doctor", href: "https://github.com/cklxx/arle/tree/main/crates/cli" },
-  { path: "/infer/", desc: "runtime spine · scheduler · loader · http", href: "https://github.com/cklxx/arle/tree/main/infer" },
+  { path: "/crates/infer-core/", desc: "runtime spine · engine · scheduler · radix cache", href: "https://github.com/cklxx/arle/tree/main/crates/infer-core" },
   { path: "/crates/cuda-kernels/", desc: "cuda kernel crate · csrc · prelude", href: "https://github.com/cklxx/arle/tree/main/crates/cuda-kernels" },
   { path: "/crates/mlx-sys/", desc: "metal bridge · cmake + cc", href: "https://github.com/cklxx/arle/tree/main/crates/mlx-sys" },
   { path: "/examples/", desc: "copyable curl · Docker · Metal · tiny train smokes", href: "https://github.com/cklxx/arle/tree/main/examples" },
@@ -414,7 +414,7 @@ const FILES_ZH: FileRow[] = [
   { path: "/docs/stability-policy.md", desc: "稳定性分级 · 兼容性姿态", href: "https://github.com/cklxx/arle/blob/main/docs/stability-policy.md" },
   { path: "/docs/experience/wins/", desc: "带日期的基准快照", href: "https://github.com/cklxx/arle/tree/main/docs/experience/wins" },
   { path: "/crates/cli/", desc: "arle 二进制 · 子命令 · doctor", href: "https://github.com/cklxx/arle/tree/main/crates/cli" },
-  { path: "/infer/", desc: "运行时主干 · scheduler · loader · http", href: "https://github.com/cklxx/arle/tree/main/infer" },
+  { path: "/crates/infer-core/", desc: "运行时主干 · engine · scheduler · radix cache", href: "https://github.com/cklxx/arle/tree/main/crates/infer-core" },
   { path: "/crates/cuda-kernels/", desc: "cuda kernel crate · csrc · prelude", href: "https://github.com/cklxx/arle/tree/main/crates/cuda-kernels" },
   { path: "/crates/mlx-sys/", desc: "metal 桥接 · cmake + cc", href: "https://github.com/cklxx/arle/tree/main/crates/mlx-sys" },
   { path: "/examples/", desc: "curl · Docker · Metal · tiny train 冒烟示例", href: "https://github.com/cklxx/arle/tree/main/examples" },
@@ -427,10 +427,10 @@ export const EN: Locale = {
   meta: {
     title: "arle(1) — runtime-first rust workspace",
     description:
-      "ARLE is a runtime-first Rust workspace for serving Qwen3/Qwen3.5 on CUDA, Metal, and CPU. infer serves OpenAI-compatible traffic; arle is the unified front door for run, serve, train, and data flows.",
+      "ARLE is a runtime-first Rust workspace for serving Qwen3/Qwen3.5 on CUDA, Metal, and CPU. arle serve is the OpenAI-compatible serving path; arle is the unified front door for run, serve, train, and data flows.",
     ogTitle: "arle — runtime-first Rust workspace",
     ogDescription:
-      "infer serves OpenAI-compatible traffic on CUDA, Metal, and CPU. arle is the unified front door for run, serve, train, and data.",
+      "arle serve is the OpenAI-compatible serving path on CUDA, Metal, and CPU. arle is the unified front door for run, serve, train, and data.",
     ogUrl: "https://cklxx.github.io/arle/",
     canonical: "https://cklxx.github.io/arle/",
   },
@@ -446,7 +446,7 @@ export const EN: Locale = {
   hero: {
     wordmark: "arle",
     lede:
-      "A runtime-first Rust workspace. <b>infer</b> serves OpenAI-compatible traffic on CUDA, Metal, and CPU; <b>arle</b> is the unified front door for run, serve, train, and data flows.",
+      "A runtime-first Rust workspace. <b>arle serve</b> is the OpenAI-compatible serving path on CUDA, Metal, and CPU; <b>arle</b> is the unified front door for run, serve, train, and data flows.",
     signals: SIGNALS,
     primaryCta: { label: "$ Quickstart", href: "#install" },
     secondaryCta: { label: "cklxx/arle ↗", href: "https://github.com/cklxx/arle" },
@@ -484,7 +484,7 @@ export const EN: Locale = {
     },
   },
   footer: {
-    left: "arle(1) · April 2026 · v0.1.4",
+    left: "arle(1) · April 2026 · v0.1.5",
     right: { label: "github.com/cklxx/arle", href: "https://github.com/cklxx/arle" },
   },
 };
@@ -495,10 +495,10 @@ export const ZH: Locale = {
   meta: {
     title: "arle(1) — 以 runtime 为主干的 rust workspace",
     description:
-      "ARLE 是以 runtime 为主干的 Rust workspace，覆盖 CUDA、Metal、CPU 上 Qwen3 / Qwen3.5 的 serving。infer 提供 OpenAI 兼容服务；arle 是 run / serve / train / data 的统一前门。",
+      "ARLE 是以 runtime 为主干的 Rust workspace，覆盖 CUDA、Metal、CPU 上 Qwen3 / Qwen3.5 的 serving。arle serve 是 OpenAI 兼容的 serving 路径；arle 是 run / serve / train / data 的统一前门。",
     ogTitle: "arle — runtime-first Rust workspace",
     ogDescription:
-      "infer 在 CUDA、Metal、CPU 上提供 OpenAI 兼容 serving；arle 是 run / serve / train / data 的统一前门。",
+      "arle serve 在 CUDA、Metal、CPU 上提供 OpenAI 兼容 serving；arle 是 run / serve / train / data 的统一前门。",
     ogUrl: "https://cklxx.github.io/arle/zh-cn/",
     canonical: "https://cklxx.github.io/arle/zh-cn/",
   },
@@ -514,7 +514,7 @@ export const ZH: Locale = {
   hero: {
     wordmark: "arle",
     lede:
-      "以 runtime 为主干的 Rust workspace。<b>infer</b> 在 CUDA、Metal、CPU 上提供 OpenAI 兼容服务；<b>arle</b> 是 run / serve / train / data 的统一前门。",
+      "以 runtime 为主干的 Rust workspace。<b>arle serve</b> 是 CUDA、Metal、CPU 上的 OpenAI 兼容 serving 路径；<b>arle</b> 是 run / serve / train / data 的统一前门。",
     signals: SIGNALS,
     primaryCta: { label: "$ Quickstart", href: "#install" },
     secondaryCta: { label: "cklxx/arle ↗", href: "https://github.com/cklxx/arle" },
@@ -552,7 +552,7 @@ export const ZH: Locale = {
     },
   },
   footer: {
-    left: "arle(1) · 2026 年 4 月 · v0.1.4",
+    left: "arle(1) · 2026 年 4 月 · v0.1.5",
     right: { label: "github.com/cklxx/arle", href: "https://github.com/cklxx/arle" },
   },
 };
