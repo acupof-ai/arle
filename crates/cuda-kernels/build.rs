@@ -1467,6 +1467,21 @@ fn emit_cuda_system_link_libs(cuda_path: &str) {
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cublasLt");
+    // NCCL feature: link libnccl so multi-rank TP/EP builds don't need a manual
+    // `RUSTFLAGS=-lnccl` workaround. cargo sets CARGO_FEATURE_NCCL when the
+    // `nccl` feature (=> `cuda`) is active, so this is inert on no-cuda builds.
+    if std::env::var_os("CARGO_FEATURE_NCCL").is_some() {
+        // NCCL ships either with CUDA (lib64, already searched above) or as a
+        // system package; add the common Linux multiarch dir + an NCCL_HOME
+        // override so `-lnccl` resolves without per-invocation link flags.
+        if let Some(nccl_home) = env_nonempty("NCCL_HOME") {
+            println!("cargo:rustc-link-search=native={nccl_home}/lib");
+        }
+        if !cfg!(target_os = "windows") {
+            println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
+        }
+        println!("cargo:rustc-link-lib=nccl");
+    }
     if cfg!(target_os = "macos") {
         println!("cargo:rustc-link-lib=c++");
     } else if !cfg!(target_os = "windows") {
