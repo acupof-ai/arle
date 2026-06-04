@@ -490,11 +490,14 @@ mod dsv4_gpu {
             cfg.num_experts
         );
         ensure!(
-            layer.w13.len() == experts_per_rank && layer.w2.len() == experts_per_rank,
-            "DSv4 expert cache count mismatch: w13={} w2={} experts_per_rank={}",
-            layer.w13.len(),
-            layer.w2.len(),
-            experts_per_rank
+            layer.num_groups == experts_per_rank,
+            "DSv4 expert group count {} != experts_per_rank {experts_per_rank}",
+            layer.num_groups
+        );
+        ensure!(
+            layer.hidden_dim == hidden_dim,
+            "DSv4 expert hidden dim {} != runtime hidden dim {hidden_dim}",
+            layer.hidden_dim
         );
 
         // Fail loud if the native DeepGEMM bridge is a build-time stub.
@@ -594,24 +597,26 @@ mod dsv4_gpu {
         }
 
         // ── 5. FP8 DeepGEMM 5-call grouped expert pipeline → compact rows. ──────
-        let intermediate = layer.w2[0].cols;
+        let intermediate = layer.intermediate;
         ensure!(
             hidden_dim.is_multiple_of(128) && intermediate.is_multiple_of(128),
             "DSv4 DeepGEMM needs H and I aligned to 128, got H={hidden_dim} I={intermediate}"
         );
         ensure!(
-            layer.w13[0].rows == intermediate * 2 && layer.w13[0].cols == hidden_dim,
-            "DSv4 w13 cache shape {}x{} != [2*I={}, H={}]",
-            layer.w13[0].rows,
-            layer.w13[0].cols,
+            layer.w13_grouped.rows == intermediate * 2 && layer.w13_grouped.cols == hidden_dim,
+            "DSv4 grouped w13 cache shape {}x{} != [2*I={}, H={}]",
+            layer.w13_grouped.rows,
+            layer.w13_grouped.cols,
             intermediate * 2,
             hidden_dim
         );
         ensure!(
-            layer.w2[0].rows == hidden_dim,
-            "DSv4 w2 cache rows {} != hidden {}",
-            layer.w2[0].rows,
-            hidden_dim
+            layer.w2_grouped.rows == hidden_dim && layer.w2_grouped.cols == intermediate,
+            "DSv4 grouped w2 cache shape {}x{} != [H={}, I={}]",
+            layer.w2_grouped.rows,
+            layer.w2_grouped.cols,
+            hidden_dim,
+            intermediate
         );
 
         let expert_out =
@@ -679,11 +684,14 @@ mod dsv4_gpu {
             num_tokens
         );
         ensure!(
-            layer.w13.len() == experts_per_rank && layer.w2.len() == experts_per_rank,
-            "DSv4 DeepEP expert cache count mismatch: w13={} w2={} experts_per_rank={}",
-            layer.w13.len(),
-            layer.w2.len(),
-            experts_per_rank
+            layer.num_groups == experts_per_rank,
+            "DSv4 DeepEP expert group count {} != experts_per_rank {experts_per_rank}",
+            layer.num_groups
+        );
+        ensure!(
+            layer.hidden_dim == hidden_dim,
+            "DSv4 DeepEP expert hidden dim {} != runtime hidden dim {hidden_dim}",
+            layer.hidden_dim
         );
         // Local DSv4 MoE is DeepGEMM-only (no scalar/native expert fallback exists
         // in this tree), so the production path is always the DeepGEMM backend. The
@@ -908,14 +916,32 @@ mod dsv4_gpu {
         offsets: &cudarc::driver::CudaSlice<i32>,
         swiglu_limit: f32,
     ) -> Result<HiddenStates> {
-        let num_groups = layer.w13.len();
+        let num_groups = layer.num_groups;
         let hidden_dim = packed_hidden.hidden_dim;
-        let intermediate = layer.w2[0].cols;
-        // Concatenate the per-expert FP8 caches into one contiguous group-major
-        // buffer the masked GEMM strides per group (w13 = fused [gate|up], w2 =
-        // down). See `build_grouped_cache` for the 128-aligned scale-concat note.
-        let w13 = build_grouped_cache(ctx, layer.w13.as_slice(), 2 * intermediate, hidden_dim)?;
-        let w2 = build_grouped_cache(ctx, layer.w2.as_slice(), hidden_dim, intermediate)?;
+        let intermediate = layer.intermediate;
+        let w13 = &layer.w13_grouped;
+        let w2 = &layer.w2_grouped;
+        ensure!(
+            layer.hidden_dim == hidden_dim,
+            "DSv4 grouped expert hidden dim {} != packed hidden dim {hidden_dim}",
+            layer.hidden_dim
+        );
+        ensure!(
+            w13.groups == num_groups
+                && w2.groups == num_groups
+                && w13.rows == 2 * intermediate
+                && w13.cols == hidden_dim
+                && w2.rows == hidden_dim
+                && w2.cols == intermediate,
+            "DSv4 grouped expert cache metadata mismatch: groups={} w13={}x{} g={} w2={}x{} g={} hidden={hidden_dim} inter={intermediate}",
+            num_groups,
+            w13.rows,
+            w13.cols,
+            w13.groups,
+            w2.rows,
+            w2.cols,
+            w2.groups,
+        );
 
         // Upper-bound padded capacity per group = total routes (every route could
         // land on one expert). scale_stride_m mirrors legacy TMA-aligned padding.
@@ -1184,22 +1210,21 @@ mod dsv4_gpu {
 
     /// One contiguous group-major FP8 weight + scale buffer the masked GEMM
     /// strides per group (`b + g * n * k`, `sfb + g * scale_rows * scale_cols`).
-    struct GroupedCache {
-        weight: cudarc::driver::CudaSlice<u8>,
-        scales: cudarc::driver::CudaSlice<f32>,
+    pub(crate) struct GroupedCache {
+        pub(crate) weight: cudarc::driver::CudaSlice<u8>,
+        pub(crate) scales: cudarc::driver::CudaSlice<f32>,
+        pub(crate) groups: usize,
+        pub(crate) rows: usize,
+        pub(crate) cols: usize,
     }
 
     /// Concatenate the per-expert FP8 caches into one contiguous group-major
     /// buffer (D2D), validating uniform `[rows, cols]` shape + 128-row alignment.
     ///
-    /// Piece 1's loader stores each local expert as a separate
-    /// [`Dsv4Fp8DeepGemmWeightCache`] allocation, but the masked grouped GEMM
-    /// reads a single `[num_groups, rows, cols]` weight (and matching scale grid).
-    /// Because `rows` (`2*intermediate` / `hidden`) is 128-aligned, per-expert
-    /// scale grids concatenate exactly into the fused layout legacy builds at load
-    /// (`from_dsv4_weight_pair_rows`). Persisting this concat is a Piece 4 / perf
-    /// follow-up; the functional port packs per call.
-    fn build_grouped_cache(
+    /// The loader stores this grouped cache in [`crate::dsv4::Dsv4MoeLayer`] and
+    /// drops the per-expert Vecs. The weights are static after load; rebuilding
+    /// this concat during decode would copy hundreds of MiB per layer per token.
+    pub(crate) fn build_grouped_cache(
         ctx: &DeviceContext,
         caches: &[Dsv4Fp8DeepGemmWeightCache],
         rows: usize,
@@ -1250,7 +1275,13 @@ mod dsv4_gpu {
                 .memcpy_dtod(&cache.scales, &mut dst)
                 .map_err(|e| anyhow::anyhow!("DSv4 grouped scale D2D failed: {e}"))?;
         }
-        Ok(GroupedCache { weight, scales })
+        Ok(GroupedCache {
+            weight,
+            scales,
+            groups: num_groups,
+            rows,
+            cols,
+        })
     }
 
     fn alloc_u8(ctx: &DeviceContext, len: usize) -> Result<cudarc::driver::CudaSlice<u8>> {
@@ -1270,7 +1301,9 @@ mod dsv4_gpu {
 pub(crate) use dsv4_gpu::dsv4_moe_forward_deepep;
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
-pub(crate) use dsv4_gpu::{dsv4_moe_forward, dsv4_shared_expert_forward};
+pub(crate) use dsv4_gpu::{
+    GroupedCache, build_grouped_cache, dsv4_moe_forward, dsv4_shared_expert_forward,
+};
 #[cfg(feature = "cuda")]
 pub(crate) use gpu::moe_forward;
 
