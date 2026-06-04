@@ -7,8 +7,8 @@ the supported platforms; pick the one that matches your environment.
 
 | Platform | Backend | Binaries shipped |
 |---|---|---|
-| macOS arm64 (Apple Silicon) | Metal / MLX | `arle`, `metal_serve` |
-| Linux x86_64 | CUDA 12.x (driver required on host) | `arle`, `infer`, `bench_serving` |
+| macOS arm64 (Apple Silicon) | Metal / MLX | `arle` |
+| Linux x86_64 | CUDA 12.x (driver required on host) | `arle` |
 | Other (macOS x86_64, Linux aarch64, Windows) | — | Build from source |
 
 CUDA binaries are linked against `cudart` 12.x and need a matching NVIDIA
@@ -78,7 +78,7 @@ sh install.sh
 To uninstall, just delete the binaries:
 
 ```bash
-rm -f ~/.local/bin/arle ~/.local/bin/metal_serve ~/.local/bin/infer ~/.local/bin/bench_serving
+rm -f ~/.local/bin/arle
 ```
 
 ## 3. Docker (Linux + NVIDIA)

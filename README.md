@@ -1,6 +1,6 @@
 <p align="center">
   <strong>ARLE</strong><br>
-  <em>Pure-Rust runtime for serving, local agents, On-Policy Distillation, and evaluation. <code>infer</code> is the OpenAI-compatible serving binary; <code>arle</code> is the unified front door.</em>
+  <em>Pure-Rust runtime for serving, local agents, On-Policy Distillation, and evaluation. <code>arle serve</code> is the OpenAI-compatible serving path; <code>arle</code> is the unified front door.</em>
 </p>
 
 <p align="center">
@@ -121,7 +121,7 @@ Benchmark data: [TTFT/TPOT steady sweep](docs/experience/wins/2026-06-02-metal-t
 ```mermaid
 flowchart TB
   subgraph Surface["Entry surfaces"]
-    Serve["arle serve / infer<br/>OpenAI HTTP"]
+    Serve["arle serve<br/>OpenAI HTTP"]
     Agent["arle<br/>local agent / REPL"]
     Train["arle train opd<br/>teacher rollouts + distillation"]
   end
@@ -162,10 +162,10 @@ Deep dive: [onboarding](docs/onboarding.md) (30 min) · [architecture](docs/arch
 | `arle` (no args) | Interactive agent REPL with `python` and `shell` tools. |
 | `arle run --prompt "…"` | One-shot agent prompt. `--no-tools` to disable tools. |
 | `arle serve --backend …` | OpenAI-compatible HTTP server. |
-| `arle train opd` | **On-Policy Distillation** — teacher in `infer`, student in `train`. CUDA path. [Usage manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). |
+| `arle train opd` | **On-Policy Distillation** — teacher on the serving runtime (`infer-api`), student in `train`. CUDA path. [Usage manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). |
 | `arle --doctor [--json]` | Backend / hardware / model-resolution self-check. |
 
-Operators wanting only the serving binary can use `infer` directly — same HTTP contract, without agent / train surfaces.
+Operators wanting only serving can run `arle serve` — the same HTTP contract, without touching the agent / train surfaces.
 
 ---
 
