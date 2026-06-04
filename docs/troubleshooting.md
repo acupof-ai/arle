@@ -100,22 +100,27 @@ to the backend's default bind. This is a documented Beta gap; use
 
 ### `metal_serve` / `cpu_serve` / `infer` not found by `arle serve`
 
-`arle serve` looks for the matching binary next to the `arle` executable
-first, then on `PATH`. If you built only `arle` you also need to build the
-serving binary:
+`arle serve` is a thin front door that spawns a matching native backend
+binary by name (`infer` for CUDA, `metal_serve` for Metal, `cpu_serve` for
+CPU), looking next to the `arle` executable first, then on `PATH`. Build
+`arle` with the matching backend feature:
 
 ```bash
 # Apple Silicon
-cargo build --release --no-default-features --features metal,no-cuda --bin metal_serve -p infer
+cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle
 
 # Linux + NVIDIA
-cargo build --release --features cuda -p infer
+cargo build --release --features cuda --bin arle
 ```
 
 The release tarballs at
-[GitHub Releases](https://github.com/cklxx/arle/releases) ship `arle` next to
-the matching backend binary, so `arle serve` "just works" for the prebuilt
-artifact.
+[GitHub Releases](https://github.com/cklxx/arle/releases) ship the `arle`
+binary built for the platform's backend.
+
+> Note: the workspace no longer produces standalone `infer` / `metal_serve` /
+> `cpu_serve` binary targets after the rewrite (the only `[[bin]]` is `arle`).
+> If `arle serve` reports a missing backend binary, that is a known gap in the
+> serve front door, not a missing build step on your side.
 
 ---
 

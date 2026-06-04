@@ -7,23 +7,17 @@ to start reading", see [codebase-map.md](codebase-map.md). For the
 extraction story behind `crates/cuda-kernels`, see
 [plans/cuda-kernel-crate-extraction.md](plans/cuda-kernel-crate-extraction.md).
 
-Project framing (also in [index.md](index.md) §Current Positioning):
-`infer` owns serving/runtime truth, `arle` is the local front door built on
-top of it, and the train stack extends the same runtime/model authority
-rather than defining a second equal architecture.
+Project framing (also in [index.md](index.md) §Current Positioning): the
+`infer-*` crate graph owns serving/runtime truth, `arle` is the local front
+door built on top of it, and the train stack extends the same runtime/model
+authority rather than defining a second equal architecture.
 
-> **Two architectures coexist today (branch `arch/ideal-inference-engine`).**
-> The shipped product is still the legacy welded `infer/` monolith documented
-> in the bulk of this file. A greenfield rewrite — the device-neutral
-> `crates/infer-*` crate graph — is being built **beside** the legacy tree and
-> is the *target* architecture, **not yet the product**. It is partially
-> proven (Metal forward shipped + bit-identical; CUDA forward refactored but
-> GPU parity pending-remote; HTTP serving facade in flight; no TP/EP/quant).
-> Legacy `infer/`
-> remains authoritative until the R5 cutover deletes it. The new graph is
-> described in [§New Architecture (rewrite, target)](#new-architecture-rewrite-target);
-> everything else in this document describes legacy `infer/`. Source of truth
-> for the rewrite's executed state:
+> **The device-neutral rewrite is the product (PR #53, merged to `main`).**
+> The legacy welded `infer/` monolith has been **deleted**. The runtime is
+> now the `crates/infer-*` crate graph: a **device-neutral engine core → a
+> narrow host-only seam → thin per-device executors** — one scheduler serves
+> all backends; a backend is a seam impl, not a scheduler fork. Source of
+> truth for the rewrite's executed state:
 > [`projects/2026-06-03-ideal-inference-engine-architecture.md`](projects/2026-06-03-ideal-inference-engine-architecture.md)
 > §6 + the multi-GPU port roadmap
 > [`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md).
@@ -32,117 +26,126 @@ rather than defining a second equal architecture.
 
 | Crate | Owns | Does not own |
 | --- | --- | --- |
-| workspace root package | `arle` binary entrypoint only | REPL logic, backend loading |
+| workspace root package (`agent-infer`) | `arle` binary entrypoint only | REPL logic, backend loading |
 | `cli` | CLI args, REPL commands, terminal UX | Session state, runtime internals |
 | `agent` | Conversation state, tool recovery, request/response contract for agent turns | Concrete backend/runtime implementations |
 | `tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |
 | `chat` | Shared protocol formatting/parsing, OpenAI chat surface types | Runtime scheduling and backend logic |
-| `infer` | Scheduler, HTTP server, backend runtime, model/kernel integration, `server_engine::InferenceEngine` contract | Terminal UX and agent-session orchestration |
+| `infer-plan` | Backend-neutral data IR: `ForwardPlan`, `ForwardMode`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device. | Any device or backend type |
+| `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll) + `KvPool` (`KvQuery`/`KvAllocator`/`KvPrefixStore`). No device types. | Concrete kernels, scheduler, model code |
+| `infer-core` | The one device-neutral `Engine<E,K>`: admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry. No backend dependency. | Device kernels, HTTP, CLI |
+| `infer-cuda` | CUDA `BackendExecutor` + KV pool: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, over `cuda-kernels` | Scheduler logic, HTTP, terminal UX |
+| `infer-metal` | Metal MLX `BackendExecutor` (packed varlen decode) + the feature-free host/CPU KV pool used for cpu smoke, over `mlx-sys` | Scheduler logic, HTTP, terminal UX |
+| `infer-topo` | TP/EP sharding: `head_shard`, column/row shard | Kernels, scheduler, HTTP |
+| `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig` | Backend kernels, scheduler |
+| `infer-server` | OpenAI v1 HTTP frontend + tokenizer; `ServeHandle<E,K>` engine thread | Terminal UX, agent-session orchestration |
+| `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, `RawLogits`, OPD-teacher surface. Backends plug in behind it. | Terminal UX, REPL logic |
+| `infer-util` | Backend-agnostic `hf_hub` + logging leaf crate | Anything backend- or model-specific |
 | `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / TileLang metadata / graph-pool / tensor / kv_quant / kv_turboquant) | Model code, scheduler logic, tokenizer |
 | `mlx-sys` | MLX C++ bridge for the Metal backend | Anything that is not the Metal bridge |
 | `kv-native-sys` | Local persistence substrate (file/block ABI, mmap, WAL, shm descriptors) for the KV-tier disk/shared transport path | Tier policy, scheduler, GPU code |
 | `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
-| `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations | Runtime model code, MLA/MoE kernels (gated on F0–F4 multi-GPU collectives in forward) |
+| `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations | Runtime model code beyond the spec |
 | `autograd` | From-scratch autograd: `TensorStore` + `Tape` + `Backend` trait | Trainer loop, control plane |
-| `train` | On-Policy Distillation substrate (teacher in `infer`, student LoRA), train-side `/v1/train/*` control plane, shared async observability. Pretrain / SFT / GRPO / multi-turn retired 2026-05-18 — see `docs/projects/2026-05-18-opd-only-pivot.md`. | GPU kernels, scheduler |
+| `train` | On-Policy Distillation substrate (teacher via `infer-api`, student LoRA), train-side `/v1/train/*` control plane, shared async observability. Pretrain / SFT / GRPO / multi-turn retired 2026-05-18 — see `docs/projects/2026-05-18-opd-only-pivot.md`. | GPU kernels, scheduler |
 
 ## Dependency Direction
 
+The spine is **IR → host-only seam → device-neutral engine → executors →
+serving**. The IR (`infer-plan`) has no dependencies; the seam
+(`infer-seam`) names only host types; the engine (`infer-core`) depends on
+plan + seam but never on a backend. Executors (`infer-cuda` / `infer-metal`)
+implement the seam against plan + seam only — they do **not** depend on
+`infer-core`. The serving layer (`infer-server` / `infer-api`) wires a chosen
+executor into `Engine<E,K>`.
+
 ```text
-workspace root package
+infer-plan        (no deps — the IR)
+  ▲
+infer-seam        -> infer-plan
+  ▲
+infer-core        -> infer-plan, infer-seam            (the one Engine<E,K>; no backend dep)
+
+infer-cuda        -> infer-plan, infer-seam, infer-topo, infer-moe, cuda-kernels, [deepep-sys, deepseek-spec, qwen3-spec], qwen35-spec
+infer-metal       -> infer-plan, infer-seam, [mlx-sys]
+
+infer-server      -> infer-core, infer-seam, infer-plan, infer-metal
+infer-api         -> infer-core, infer-seam, infer-plan, infer-server, [infer-metal, infer-cuda, cuda-kernels]
+
+workspace root package (agent-infer)
   -> cli
-     -> infer
-     -> agent
+     -> infer-api
+     -> agent (-> infer-api, chat, tools)
      -> chat
      -> tools
-
-agent
-  -> infer
-  -> chat
-
-infer
-  -> chat
-  -> cuda-kernels  (one-way; never the reverse)
-  -> mlx-sys (feature = "metal")
+     -> autograd, train, infer-util, deepseek-spec, qwen3-spec, qwen35-spec
 ```
 
-Reverse dependencies from `runtime-*` (or any `infer`-internal layer) into
-`http`/`cli` are rejected on sight.
+The backend-agnostic-scheduler win: one `Engine<E,K>` in `infer-core` drives
+both CUDA and Metal. Adding a third backend means implementing the **two
+host-only seam traits** (`BackendExecutor` + `KvPool`) — no scheduler fork,
+no `infer-core` change.
 
-## New Architecture (rewrite, target)
+Reverse dependencies from any runtime layer (`infer-core` / `infer-cuda` /
+`infer-metal`) into `infer-server` / `infer-api` / `cli` are rejected on
+sight.
 
-> Status: **partially proven, not yet the product.** Built on branch
-> `arch/ideal-inference-engine` beside legacy `infer/`. Cut over (and legacy
-> `infer/` deleted) only at R5, gated on CUDA GPU parity. The note that closes
-> [Route-A](#route-a-note-historical) is about a *different, earlier* set of
-> crates folded back into `infer` in 2026-04-15; the `infer-core` below is a
-> new, unrelated greenfield crate.
+## Engine Core, Seam, and Executors
 
-The rewrite answers one structural problem with legacy `infer/`: device,
-parallelism, and kernel concerns are welded into the scheduler, so adding a
-backend means a second scheduler. The new shape is a **device-neutral engine
-core → a narrow host-only seam → thin per-device executors** — one scheduler
-serves all backends; a backend is a seam impl, not a scheduler fork.
+The runtime answers one structural problem: device, parallelism, and kernel
+concerns must not be welded into the scheduler, because then adding a backend
+means a second scheduler. The shape is a **device-neutral engine core → a
+narrow host-only seam → thin per-device executors** — one scheduler serves all
+backends; a backend is a seam impl, not a scheduler fork.
 
 ```text
 infer-plan      data IR (ForwardPlan / ForwardMode / SamplingParams / StepOutput)
    ▲
 infer-seam      host-only trait seam (no device types):
-   │              BackendExecutor (proven), KvPool = KvQuery+KvAllocator+KvPrefixStore (proven),
-   │              Communicator / Sampler / GraphRunner / ModelArch / ResourceGovernor (hypothesis)
+   │              BackendExecutor (submit/poll), KvPool = KvQuery+KvAllocator+KvPrefixStore
    ▲
-infer-core      device-neutral Engine + scheduler + radix prefix + overlap (no backend dep)
-   ▲                         ▲
-infer-metal              infer-cuda          thin executors, one seam impl each
- (real MLX Qwen          (clean BF16 Qwen3      (~1.8–3.3k LOC, zero scheduler)
-  forward, shipped)       forward; GPU parity
-                          pending-remote)
-   ▲                         ▲
-infer-server    serving facade: ServeHandle<E,K> engine thread + OpenAI/axum HTTP
-                (Metal executor wired today; CUDA not yet wired into the facade)
+infer-core      device-neutral Engine<E,K> + scheduler + radix prefix + overlap (no backend dep)
 
-infer-models    skeleton (247 LOC) — device-neutral ModelArch home; not yet driven
+infer-metal              infer-cuda          thin executors, one seam impl each
+ (real MLX Qwen          (CUDA paged KV,       (implement plan + seam only;
+  forward + packed         TileLang + native     zero scheduler)
+  varlen decode)           kernels, TP/EP,
+                           DeepGEMM, DeepEP,
+                           DSv4-Flash)
+   ▲                         ▲
+infer-server    OpenAI v1 HTTP frontend: ServeHandle<E,K> engine thread + tokenizer
+   ▲
+infer-api       single front-door lib (LoadedInferenceEngine, EngineLoadConfig,
+                RawLogits, OPD teacher); backends plug in behind it
 ```
 
-### New-stack crate boundaries
+### Engine-core crate boundaries
 
-| Crate | Owns | Status |
-| --- | --- | --- |
-| `infer-plan` | The data contract: `ForwardPlan`, `ForwardMode{Prefill,Decode,Mixed,Idle,Verify,Draft}`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device. | Proven; the sole engine↔executor bridge. |
-| `infer-seam` | Host-only trait seam. `BackendExecutor` + the `KvPool` split (`KvQuery`/`KvAllocator`/`KvPrefixStore`) are exercised by real forward paths. `Communicator`/`Sampler`/`GraphRunner`/`ModelArch`/`ResourceGovernor` are **defined but undriven**. | Two contracts proven; the rest **hypothesis-grade** — signatures not locked until a real caller forces them. |
-| `infer-core` | The one device-neutral scheduler: admission, continuous batch, radix prefix cache, overlap, slot lifecycle, `Engine<E,K>`. No backend dependency. | Proven; 18 CPU tests. Replaces legacy `scheduler/cuda` + the separate Metal scheduler. |
-| `infer-metal` | Real MLX Qwen3.5/3.6 forward as a thin `BackendExecutor` + `MetalKvPool`. | **Shipped** — bit-identical parity vs legacy MetalBackend across 4 configs. |
-| `infer-cuda` | Clean BF16 dense-Qwen3 forward (`attention`/`ops`/`loader`/`executor`/`model`) as a thin seam impl over `cuda-kernels`. | Local typecheck + clippy green; **GPU numerical parity PENDING-REMOTE** (pod infra, not code). TP/EP/DeepEP/DeepGEMM/DSv4/quant **not ported** — legacy-only. |
-| `infer-models` | Intended device-neutral `ModelArch` definitions. | Skeleton, not yet driven by a real caller. |
-| `infer-server` | Serving facade: `ServeHandle<E,K>` (engine thread owning `Engine<E,K>`, submit/collect) + OpenAI-shaped axum HTTP. | **In flight** — the one blocker to the R5 cutover. Metal executor wired (`metal` feature → real `infer-metal`); CUDA executor **not yet wired** into the facade; non-Metal builds use an `EchoExecutor`. |
+| Crate | Owns |
+| --- | --- |
+| `infer-plan` | The data contract: `ForwardPlan`, `ForwardMode{Prefill,Decode,Mixed,Idle,Verify,Draft}`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device — the sole engine↔executor bridge. |
+| `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll) + the `KvPool` split (`KvQuery`/`KvAllocator`/`KvPrefixStore`). No device types. |
+| `infer-core` | The one device-neutral scheduler: admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry, `Engine<E,K>`. No backend dependency. |
+| `infer-metal` | Metal MLX Qwen3.5/3.6 forward (packed varlen decode) as a thin `BackendExecutor` + KV pool; also hosts the feature-free host/CPU KV pool used for cpu smoke. |
+| `infer-cuda` | CUDA executor as a thin seam impl over `cuda-kernels`: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, dense Qwen3 + Qwen3.5 MoE. |
+| `infer-topo` | TP/EP sharding helpers: `head_shard`, column/row shard. |
+| `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig`. |
+| `infer-server` | OpenAI v1 HTTP frontend + tokenizer; `ServeHandle<E,K>` (engine thread owning `Engine<E,K>`, submit/collect). |
+| `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, `RawLogits`, OPD-teacher surface. Backends plug in behind it via Cargo features (`cuda`/`metal`). |
 
-### What is NOT in the new stack yet (legacy-only)
-
-These exist only in legacy `infer/` and were deliberately dropped in the
-rewrite's deletion-refactor (BF16-dense-Qwen3 is the new stack's whole CUDA
-surface today). Each must be re-ported below the executor seam and verified
-before the cutover — sequenced in
-[`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md):
-
-- **TP / PP / EP / DeepEP** multi-GPU parallelism (port as `Communicator` +
-  `ModelArch` impls; flat `Communicator` needs hierarchical process-groups
-  before TP×EP compose).
-- **DeepGEMM** FP8 grouped GEMM, **DSv4** (MLA + FP8/INT8 KV), all weight/KV
-  **quantization** paths.
-- **Tiered KV** (T1–T3), **speculative decode**, the full **HTTP/serving**
-  surface beyond the in-flight facade.
-
-### How the new stack maps onto the parallelism axes (design, not yet built)
+### How the parallelism axes map onto the stack
 
 | Axis | Where it lands | Seam fit |
 | --- | --- | --- |
-| TP (tensor) | `all_reduce` inside `ModelArch::forward`, below the executor | clean — scheduler stays rank-neutral |
-| EP (expert/MoE) | `all_to_all` dispatch/combine inside the MoE `ModelArch`, below the seam | clean — hidden in the executor |
+| TP (tensor) | `all_reduce` inside the executor's model forward, below the seam | clean — scheduler stays rank-neutral |
+| EP (expert/MoE) | `all_to_all` dispatch/combine (DeepEP) inside the executor, below the seam | clean — hidden in the executor |
 | DP (data) | N `Engine` instances + router above, in `infer-server` | clean — the `Engine` is the DP unit |
-| PP (pipeline) | microbatch ring in `infer-core` + stage-aware executor | **the one known gap** — single-inflight assumption + flat `Communicator` must be revisited |
+| PP (pipeline) | microbatch ring in `infer-core` + stage-aware executor | the one known gap — single-inflight assumption must be revisited |
 
-This is the *target*. None of TP/PP/EP is wired into a new-stack forward path
-today; the table records where each will plug in, per the rewrite design doc §8.
+CUDA TP=8 / EP=8 (DeepGEMM FP8 MoE + DeepEP) is live in `infer-cuda` for
+DeepSeek-V4-Flash; PP is not yet wired into a forward path. Multi-GPU
+sequencing is tracked in
+[`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md).
 
 ## Backend Split
 
@@ -162,13 +165,13 @@ parity in another.
 | Capability | CUDA | Metal | CPU |
 | --- | --- | --- | --- |
 | Production serving target | Supported | Beta | No (smoke only) |
-| Continuous batching scheduler | Yes (`scheduler/cuda/`) | Partial (serial runtime + Metal scheduler; varlen batched decode path exists but not full CUDA parity) | No |
+| Continuous batching scheduler | Yes (one `Engine<E,K>` in `infer-core`) | Yes (same `Engine<E,K>`; packed varlen batched decode) | No |
 | Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes (`BatchKVCache` pattern via `mlx-sys`) | No |
 | Chunked prefill + decode-priority | Yes | Partial | No |
 | Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8/TQ*) | No (native model dtype) | No |
 | Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots) | No |
 | Speculative decode | Not shipped (plumbing only) | Beta (DFlash for Qwen3.5) | No |
-| Multi-GPU TP/PP/EP | Scaffold (F0–F4; forward not wired) | No | No |
+| Multi-GPU TP/PP/EP | TP=8 / EP=8 live (DSv4: DeepGEMM + DeepEP); PP not wired | No | No |
 | OPD teacher surface | Yes | No | No |
 | OpenAI HTTP (`/v1/chat/completions`, SSE) | Yes | Yes | Yes (synthetic) |
 
@@ -178,7 +181,7 @@ Evidence pointers:
 - Model reach: support-matrix §3
 - Quant / KV: support-matrix §4, §4b
 - Spec decode: support-matrix §4a
-- Multi-GPU scaffold: §Multi-GPU below + `infer/src/distributed/`
+- Multi-GPU: §Multi-GPU below + `crates/infer-cuda/src/{tp,deepep,moe,dsv4}.rs`
 
 ## Change Impact Map
 
@@ -188,46 +191,39 @@ require a dated entry under `docs/experience/wins/` or `errors/` per
 
 | Layer touched | Minimum verify | Notes |
 | --- | --- | --- |
-| `crates/cuda-kernels/csrc/` or `crates/cuda-kernels/src/` | `cargo test --release -p infer --features cuda`; kernel regressions in `infer/tests/smoke_*` | Bench: `scripts/bench_guidellm.sh` for perf claims |
-| `infer/src/scheduler/cuda/` | `cargo test --release --test e2e` | Scheduler invariants: [`infer/src/scheduler/AGENTS.md`](../infer/src/scheduler/AGENTS.md) |
-| `infer/src/model/qwen35/` (CUDA) | `cargo test --release --test e2e_qwen35` | Golden baselines in `infer/test_data/` |
-| KV quant / paged KV gating | `cargo test --release -p infer --features cuda --test kv_precision_parity -- --nocapture --test-threads=1` | See AGENTS.md §Build & run |
-| `infer/src/backend/metal/` or `crates/mlx-sys/` | `cargo test --release --no-default-features --features metal --test e2e_qwen35` | Canonical Metal model: Qwen3.6 MoE (AGENTS.md) |
-| `infer/src/kv_tier/` or `infer/src/prefix_cache.rs` | `cargo test --release -p infer --features cuda` + tier-specific tests | MR stability: [`infer/src/kv_tier/AGENTS.md`](../infer/src/kv_tier/AGENTS.md) |
+| `crates/cuda-kernels/csrc/` or `crates/cuda-kernels/src/` | `cargo test --release -p cuda-kernels --features cuda` + the affected `infer-cuda` path | Bench: `scripts/bench_guidellm.sh` for perf claims; kernel heat map in [`crates/cuda-kernels/AGENTS.md`](../crates/cuda-kernels/AGENTS.md) |
+| `crates/infer-core/` (scheduler / RadixCache / chunked prefill) | `cargo test --release -p infer-core` | One `Engine<E,K>` drives both backends — a scheduler change touches all of them |
+| `crates/infer-cuda/` (CUDA executor, model, TP/EP, DSv4) | `cargo test --release -p infer-cuda --features cuda` (GPU) | Golden parity validated on the multi-GPU pod, not locally on a Mac |
+| KV quant / paged KV gating (`crates/infer-cuda/`) | `cargo test --release -p infer-cuda --features cuda` (GPU) | See AGENTS.md §Build & run |
+| `crates/infer-metal/` or `crates/mlx-sys/` | `cargo test --release -p infer-metal --no-default-features --features metal,no-cuda` | Canonical Metal model: Qwen3.6 MoE (AGENTS.md); MLX bridge in [`crates/mlx-sys/AGENTS.md`](../crates/mlx-sys/AGENTS.md) |
+| `crates/infer-seam/` or `crates/infer-plan/` (the host-only contract) | `cargo test --release -p infer-core -p infer-api` | A seam-signature change ripples through every executor |
 | `crates/agent/`, `crates/cli/`, `crates/chat/` | `cargo test --release -p agent -p cli -p chat` | No GPU required |
-| `crates/train/` OPD path | `cargo test --release -p train` | End-to-end OPD needs CUDA GPU |
+| `crates/train/` OPD path | `cargo test --release -p train --features no-cuda --lib` | End-to-end OPD needs CUDA GPU |
 | Docs-only | — | State `docs-only` in commit body; no bench gate |
 
-## Multi-GPU Parallel Axes (single-node F0–F4 scaffold)
+## Multi-GPU Parallel Axes
 
-The single-node multi-GPU foundation lives under `infer/src/distributed/`
-and is currently a scaffold: type surfaces, group metadata, and an NCCL
-group-coordinator smoke are proven, but real production collectives are
-**not yet wired into model forward**. Mainline default behavior is one
-rank, one model load, one scheduler — unchanged.
+Multi-GPU lives entirely below the seam, inside `infer-cuda` — the
+`infer-core` scheduler stays rank-neutral. The default build is one rank, one
+model load, one `Engine` — unchanged; collectives only engage when a
+multi-GPU config is selected.
 
-Axes scaffolded today (see
-[`docs/projects/2026-05-01-multi-gpu-f0-readiness.md`](projects/2026-05-01-multi-gpu-f0-readiness.md)
-and [`docs/plans/2026-04-28-single-node-multi-gpu.md`](plans/2026-04-28-single-node-multi-gpu.md)):
+- **TP (tensor parallel):** `crates/infer-cuda/src/tp.rs` — `TpRuntime` /
+  `TpConfig` / `resolve_tp_config_from_env`, `all_reduce_sum` post-attn /
+  post-MLP. TP=1 is no-op; TP>1 collectives are live (DSv4 prefill verified at
+  TP=8). Sharding helpers come from `infer-topo` (`head_shard`, column/row).
+- **EP (expert parallel):** `crates/infer-cuda/src/{moe,deepep}.rs` —
+  DeepEP `all_to_all` dispatch/combine, gated by the `deepep` feature; routing
+  is the backend-neutral `infer-moe`. Live at EP=8 for DSv4.
+- **PP (pipeline parallel):** not yet wired into a forward path — the one
+  known gap (microbatch ring in `infer-core` + a stage-aware executor).
+- **NCCL backend:** `--features cuda,nccl` gate forwards
+  `infer-cuda/nccl → cuda-kernels/nccl`; `deepep` implies `nccl`.
 
-- **TP (tensor parallel):** F1 `parallel_state.rs` + `TpLoadContext` shard
-  helpers; F2 Qwen3.5 forward sharding through
-  `LayerCommunicator` (`post_attn_all_reduce`, `post_mlp_all_reduce`,
-  DP-attention gather hook). TP=1 is no-op; TP>1 production model load
-  fails fast until F2 collectives complete.
-- **PP (pipeline parallel):** F0.7 `ForwardBatch.pp_proxy:
-  Option<IntermediateTensors>` + F3 `pipeline_state.rs` scaffold.
-- **EP (expert parallel):** F4 `expert_state.rs` scaffold; no CUDA MoE
-  forward consumer yet.
-- **NCCL backend:** `--features cuda,nccl` gate; 2-thread `all_reduce(sum)`
-  smoke passes via `infer --nccl-smoke` and
-  `infer/tests/distributed_nccl_smoke.rs`.
-
-These axes are the dependency floor for both the longctx Phase 3
-(disaggregated prefill/decode) lever and the DeepSeek V4 readiness path
-(`crates/deepseek-spec` DS0 scaffold + DS3 MLA + DS4 CUDA MoE + DS5 NCCL
-collectives in forward). They must complete real collectives in forward
-before either downstream consumer can claim multi-rank serving.
+DeepSeek-V4-Flash is the binding multi-GPU consumer (TP=8 / EP=8, FP8
+DeepGEMM MoE + DeepEP). The DSv4 contract scaffold lives in
+`crates/deepseek-spec`. Multi-GPU sequencing is tracked in
+[`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md).
 
 DeepSeek V4 is the #1 next-model priority and Qwen 3.6 is #2; the canonical
 ranking and rationale live in
@@ -237,52 +233,48 @@ with current support status in
 
 ## Speculative Decode Framework
 
-The Phase 2 spec-decode plumbing landed but does not yet produce a
-throughput lift:
+Speculative decode survives in the rewrite as IR hooks only: `infer-plan`
+carries `ForwardMode::{Verify, Draft}` and a minimal spec-decode plan
+placeholder (`draft_rows`), so the seam can express verify/draft steps. The
+full verifier machinery — `SpecConfig`, `DraftMode`, per-request draft state,
+greedy verifier accounting, bonus-token commit, the per-step `SpecPath`
+dispatch — was **not ported** below the executor seam and must be re-built on
+the new stack before spec-on results are valid.
 
-- `infer/src/speculative.rs`: `SpecConfig`, `DraftMode`, persistent
-  per-request external draft state, K-token proposals, greedy verifier
-  accounting, bonus-token commit, and live spec counters.
-- `infer/src/speculative/cuda.rs`: CUDA integration entry points.
-- `infer/src/scheduler/cuda/spec_path.rs`: per-step `SpecPath` dispatch
-  threading through the CUDA execution loop.
+The historical caveats still bound any port:
 
-The first end-to-end real-spec bench regressed -62.8% vs the Phase 1
-SGLang-row close because the correctness-first verifier still runs the
-target paged decode once per verifier position. Phase 2 throughput
-claims are paused until a packed K+1 verifier or MagicDec sparse-KV
-self-spec lands. See
-[`docs/projects/2026-04-30-longctx-32k-128k-leadership.md`](projects/2026-04-30-longctx-32k-128k-leadership.md)
-§13 and the regression entry in
-[`docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`](experience/errors/2026-05-01-phase2-real-spec-regression.md).
-
-For Qwen3.5 / Medusa specifically, the current gate is recurrent-state
-rollback: paged KV can be truncated, but hybrid linear-attention recurrent
-state needs a model-owned accepted-length commit/rollback before spec-on
-results are valid. See
-[`docs/plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md).
+- The first end-to-end real-spec bench regressed -62.8% because the
+  correctness-first verifier ran the target paged decode once per verifier
+  position; a packed K+1 verifier (or MagicDec sparse-KV self-spec) is the
+  prerequisite for a throughput lift. See
+  [`docs/projects/2026-04-30-longctx-32k-128k-leadership.md`](projects/2026-04-30-longctx-32k-128k-leadership.md)
+  §13 and
+  [`docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`](experience/errors/2026-05-01-phase2-real-spec-regression.md).
+- For Qwen3.5 / Medusa the gate is recurrent-state rollback: paged KV can be
+  truncated, but hybrid linear-attention recurrent state needs a model-owned
+  accepted-length commit/rollback. See
+  [`docs/plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md).
 
 ## Route-A Note (Historical)
 
-The 2026-04-15 Route-A refactor folded the experimental `infer-core`,
-`infer-observability`, `infer-policy`, and `infer-engine` crates back into
-`infer` because the split never achieved real independence. A follow-up the
-same day deleted `infer/src/agent_engine.rs` after confirming every `Agent*`
-type duplicated a corresponding `Completion*` / `InferenceEngine` type in
-`server_engine.rs`.
+The 2026-04-15 Route-A refactor folded an earlier experimental `infer-core`,
+`infer-observability`, `infer-policy`, and `infer-engine` set back into the
+(now-deleted) monolithic `infer` crate because that split never achieved real
+independence. A follow-up the same day deleted the legacy `agent_engine.rs`
+after confirming every `Agent*` type duplicated a corresponding `Completion*` /
+`InferenceEngine` type.
 
-> Note: the 2026-04-15 `infer-core` named here is unrelated to the
-> `crates/infer-core` of the
-> [New Architecture (rewrite, target)](#new-architecture-rewrite-target). The
-> 2026-04-15 crate was dissolved; the rewrite's `infer-core` is a fresh,
-> independent device-neutral scheduler. Same name, different crate.
+> Note: the 2026-04-15 `infer-core` named here is unrelated to today's
+> `crates/infer-core` (the device-neutral scheduler in
+> [§Engine Core, Seam, and Executors](#engine-core-seam-and-executors)). The
+> 2026-04-15 crate was dissolved into the old monolith; the current
+> `infer-core` is the fresh, independent device-neutral scheduler from the
+> PR #53 rewrite. Same name, different crate.
 
-The old agent-facing adapter (`AgentEngine` / `LoadedAgentEngine`) is gone;
-`server_engine::InferenceEngine` and `LoadedInferenceEngine` now serve both
-the HTTP server and the agent CLI through one contract. `resolve_model_source`
-moved into `infer::hf_hub`. Shared runtime contracts (request/session ids,
-scheduler policies, event sinks) live inside `infer` as `types.rs`,
-`scheduler/policy.rs`, and `events.rs`.
+The lesson carried into the rewrite: one contract serves both the HTTP server
+and the agent CLI. Today that single front door is `infer-api`'s
+`LoadedInferenceEngine` / `EngineLoadConfig`, with model resolution in
+`infer-util`'s `hf_hub` and the OpenAI HTTP surface in `infer-server`.
 
 ## Crate-Split Governance
 
@@ -307,17 +299,21 @@ The kernel-crate extraction (`a4e12f5`, 2026-04-15) was deliberately narrow.
 The items below remain anti-goals **unless** a concrete second consumer
 forces them.
 
-- **No `infer-ops` crate.** Ops are tightly coupled to model data layouts.
-- **No `infer-scheduler-core` crate.** The CUDA scheduler reaches into
-  `PagedKVPool`, `TileLangDecodeMetadata`, and model-specific types in
-  `bootstrap`.
-- **No `infer-runtime-api` trait crate.** Already covered by
-  `infer::server_engine::InferenceEngine`.
+- **No `infer-ops` crate.** Ops are tightly coupled to model data layouts and
+  live inside each executor (`infer-cuda` / `infer-metal`).
+- **Scheduler extraction already done.** The PR #53 rewrite extracted the
+  scheduler into `infer-core` cleanly by pushing all device coupling
+  (`PagedKVPool`, TileLang metadata, model-specific bootstrap) below the
+  host-only seam into the executors. Do not re-couple the scheduler to a
+  backend — that is the regression this split exists to prevent.
+- **No `infer-runtime-api` trait crate beyond what exists.** The runtime
+  contract is already the `infer-seam` traits (`BackendExecutor` + `KvPool`)
+  plus the `infer-api` front door; a further trait crate would be redundant.
 - **No `*-sys` / Rust-types split for the kernel crate.** One crate holds
   both layers; splitting them creates a `*-sys` boundary with one consumer.
-- **No CPU backend extraction.** `infer/src/backend/cpu.rs` is a 309-line
-  smoke-test backend that generates synthetic responses; extracting it
-  would create a one-consumer crate with zero independence benefit.
+- **No CPU backend extraction.** The feature-free host/CPU KV pool lives in
+  `infer-metal` and exists only for smoke tests; extracting it would create a
+  one-consumer crate with zero independence benefit.
 
 The original kernel-crate trip wires (T1 NCCL, T2 FA-3, T3 MLA/FP8 GEMM,
 T4 spec decoding, T5 second external consumer) are arguments for the

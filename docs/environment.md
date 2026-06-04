@@ -15,7 +15,7 @@ Current truth is simple: prefer `ARLE_*` for the `arle` front door, keep
 debug/diagnostic runtime overrides.**
 
 **Tuning knobs go on structs**, not env vars. The canonical example is
-`SchedulerConfig` in `infer/src/scheduler/types.rs`: prefix-cache
+`SchedulerConfig` in `crates/infer-core/src/lib.rs`: prefix-cache
 watermarks (`prefix_cache_high_water`, `prefix_cache_low_water`,
 `prefix_cache_retain_hard_cap`), keepalive ticks
 (`prefix_cache_keepalive_ticks`, `t1_host_pinned_keepalive_ticks`), and
@@ -39,20 +39,20 @@ document the debug-only status here.
 
 ---
 
-## 1b. Cargo Feature 决策表（`infer` crate）
+## 1b. Cargo Feature 决策表（root `agent-infer` 包）
 
-来源：`infer/Cargo.toml` `[features]`。完整说明见
+来源：根 `Cargo.toml` `[features]`。完整说明见
 [`onboarding.md`](onboarding.md) §4。
 
 | 目标 | 命令 |
 | --- | --- |
 | Linux + NVIDIA 完整构建 | `cargo build --release --features cuda --bin arle` |
 | Apple Silicon | `cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle` |
-| Mac 上 CUDA Rust 类型检查（无 GPU） | `cargo check -p infer --no-default-features --features cuda,no-cuda` |
+| Mac 上 CUDA Rust 类型检查（无 GPU） | `CUDARC_CUDA_VERSION=12060 cargo check -p infer-api --no-default-features --features cuda,no-cuda` |
 | CPU smoke | `cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle` |
-| Multi-GPU NCCL smoke | `cargo build --release -p infer --features cuda,nccl --bin infer` |
+| Multi-GPU NCCL | `cargo build --release --features cuda,nccl --bin arle` |
 
-`default = ["unified_scheduler"]` — 默认 feature **不含** cuda/metal，须显式选择 backend。
+`default = ["cli"]` — 默认 feature **不含** cuda/metal，须显式选择 backend。
 
 ---
 
@@ -77,20 +77,21 @@ Default Bearer token for HTTP serving entry points that opt into API auth.
 
 Current use:
 
-- `metal_serve` uses this when `--api-key` is omitted.
+- The Metal serving path (`arle serve --backend metal`) uses this when
+  `--api-key` is omitted.
 
 Example:
 
 ```bash
 export AGENT_INFER_API_KEY=dev-secret
-./target/release/metal_serve --model-path mlx-community/Qwen3.5-4B-bf16
+./target/release/arle serve --backend metal --model-path mlx-community/Qwen3.5-4B-bf16
 ```
 
 ### Apple Silicon one-command bring-up
 
 The canonical first-time Metal serving entrypoint is
 [`scripts/start_metal_serve.sh`](../scripts/start_metal_serve.sh). It hides the
-Cargo feature flags, builds `metal_serve`, and starts the server on
+Cargo feature flags, builds the Metal `arle` binary, and starts the server on
 `127.0.0.1:8000`.
 
 Defaults:
@@ -106,7 +107,7 @@ Examples:
 ./scripts/start_metal_serve.sh mlx-community/Qwen3.5-4B-bf16 8012 -- --warmup 0
 ```
 
-Extra `metal_serve` flags go after `--`. For example, you can still pass
+Extra Metal serving flags go after `--`. For example, you can still pass
 `--api-key`, `--memory-limit-bytes`, `--cache-limit-bytes`, or
 `--wired-limit-bytes` through the wrapper.
 
@@ -120,9 +121,8 @@ Legacy compatibility fallback for the experimental Metal KV pool path.
 
 Current use:
 
-- `metal_request`
-- `metal_bench`
-- `metal_serve`
+- The Metal serving path (`arle serve --backend metal`) and Metal bench
+  harnesses under `scripts/`.
 
 Behavior:
 
@@ -143,9 +143,8 @@ environment variables:
 
 Current use:
 
-- `metal_request`
-- `metal_bench`
-- `metal_serve`
+- The Metal serving path (`arle serve --backend metal`) and Metal bench
+  harnesses under `scripts/`.
 
 These are applied before model load and affect the whole process-local MLX
 allocator state.
@@ -169,9 +168,9 @@ quality-sensitive paths. See
 [`docs/experience/wins/2026-05-07-bench-qwen36-moe-topk-runtime-knob.md`](experience/wins/2026-05-07-bench-qwen36-moe-topk-runtime-knob.md).
 
 ```bash
-INFER_MOE_TOP_K=6 ./target/release/metal_serve \
+INFER_MOE_TOP_K=6 ./target/release/arle serve --backend metal \
   --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
-  --port 8765 --max-running-requests 16
+  --port 8765 -- --max-running-requests 16
 ```
 
 ### `MLX_MAX_OPS_PER_BUFFER` / `MLX_MAX_MB_PER_BUFFER` (MLX upstream)
@@ -189,9 +188,9 @@ technique #2.
 ```bash
 MLX_MAX_OPS_PER_BUFFER=200 \
 MLX_MAX_MB_PER_BUFFER=200 \
-./target/release/metal_serve \
+./target/release/arle serve --backend metal \
   --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
-  --port 8765 --max-running-requests 16
+  --port 8765 -- --max-running-requests 16
 ```
 
 ### `AGENT_INFER_GDR_METAL_KERNEL`
@@ -358,8 +357,8 @@ export ARLE_DEEPGEMM_LIBRARY_ROOT=${ARLE_DEEPGEMM_ROOT}/deep_gemm
 ```
 
 The helper validates CUDA/NVCC, NCCL, DeepGEMM/CUTLASS, model path, and
-decode token count before running. Build uses `cargo build --release -p infer
---features cuda,nccl --bin infer` with `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`.
+decode token count before running. Build uses `cargo build --release
+--features cuda,nccl --bin arle` with `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`.
 Smoke/nsys default to the 8-rank DSv4 validation envelope (`num_slots=1`,
 `mem_fraction_static=0.10`, FP8 KV, 43 distributed layers). `max_tokens=1`
 must only be used for explicit prefill/TTFT smoke outside this helper; decode
@@ -457,9 +456,9 @@ Example:
 INFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release --test e2e
 
 # Metal — bench the canonical Qwen3.6 35B-A3B MoE:
-./target/release/metal_serve \
+./target/release/arle serve --backend metal \
   --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
-  --port 8765 --max-running-requests 16
+  --port 8765 -- --max-running-requests 16
 ```
 
 ### `INFER_E2E_MODEL_PATH`
@@ -502,7 +501,7 @@ CLI-side live-agent integration test model path override
 ### `HF_TOKEN`
 
 HuggingFace API token used for private-model downloads in
-`infer/src/hf_hub.rs`. Unset by default; required for gated
+`crates/infer-util/src/hf_hub.rs`. Unset by default; required for gated
 models on the `resolve_model_path` path.
 
 ### `HF_HOME`
@@ -577,10 +576,10 @@ docs promote them more clearly:
   Set to `0`, `false`, `off`, or `no` to skip the pass for cold-start A/B
   measurements; this is a diagnostic escape hatch, not a runtime tuning knob.
 - `AGENT_INFER_QWEN35_CPP_SEPARATE` — toggle the Rust→C++ separate-proj
-  path in `infer/src/backend/metal/qwen35.rs`. Default on; set to `0`
+  path in `crates/infer-metal/src/qwen35.rs`. Default on; set to `0`
   to force the fused route for A/B comparison
 - `METAL_NO_CPP` — disable the Metal Qwen3.5 C++ route entirely
-  (`infer/src/backend/metal/qwen35.rs:1255`). Default unset (C++
+  (`crates/infer-metal/src/qwen35.rs`). Default unset (C++
   route enabled). Set to any value to fall back to the Rust reference
   path for debugging
 - `AGENT_INFER_QWEN35_CPP_KEEP_PREFILL_INTERMEDIATES` — keep prefill

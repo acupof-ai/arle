@@ -27,7 +27,7 @@ candle or directly at PyTorch.
 
 | | Language | Models | Multi-turn KV reuse | Train / RL surface | Best fit |
 |---|---|---|---|---|---|
-| **ARLE** | Pure Rust | Qwen3.5 family | Slot-sticky + radix-backed tiered KV (T0 GPU → T1 host → T2 disk → T3 cluster-shared); CUDA + Metal | Same runtime, in-tree On-Policy Distillation only (`arle train opd`) — teacher hosted in `infer`, student LoRA on the same backend. Pretrain / SFT / GRPO / multi-turn surfaces retired 2026-05-18. | Rust shops doing OPD on Qwen3.5; agent workloads that pay a heavy prefill tax per turn |
+| **ARLE** | Pure Rust | Qwen3.5 family | Slot-sticky + radix-backed tiered KV (T0 GPU → T1 host → T2 disk → T3 cluster-shared); CUDA + Metal | Same runtime, in-tree On-Policy Distillation only (`arle train opd`) — teacher hosted in the runtime (`crates/infer-*`), student LoRA on the same backend. Pretrain / SFT / GRPO / multi-turn surfaces retired 2026-05-18. | Rust shops doing OPD on Qwen3.5; agent workloads that pay a heavy prefill tax per turn |
 | **vLLM** | Python (CUDA / ROCm) | Broad (Llama, Qwen, Mistral, DeepSeek, …) | PagedAttention + prefix cache | Separate (vLLM serves; train is your problem) | Production Python serving with a wide model menu |
 | **SGLang** | Python | Broad | RadixAttention prefix tree | Structured generation / multi-step prompting strengths | Python serving with structured / agent prompting |
 | **mistral.rs** | Pure Rust | Broad (multimodal too) | KV cache + prefix cache | Inference-focused | Rust serving with broad model coverage |
@@ -47,17 +47,18 @@ shows. Read each project's own docs before committing.
    spill / promote design is built for the agent loop's working-set pattern,
    not the multi-tenant LLM-as-a-service pattern.
 
-2. **One Rust runtime, no Python control plane.** `infer`, the local `arle`
-   agent runtime, and the in-tree train / RL stack all share the same Rust
-   model and scheduler code. There is no `engine.py` driving a C++ engine
+2. **One Rust runtime, no Python control plane.** The `crates/infer-*`
+   runtime, the local `arle` agent runtime, and the in-tree train / RL stack
+   all share the same Rust model and scheduler code. There is no `engine.py`
+   driving a C++ engine
    and re-implementing model logic on top. For mixed serving + RL workloads
    (rollouts → reward → update) this removes a class of "the trainer's
    model definition drifted from the server's" bugs.
 
 3. **Two backends from one trait.** CUDA (Linux) and Metal (Apple Silicon)
-   plug into the same `server_engine::InferenceEngine` contract, so a Rust
-   shop can develop on a MacBook and ship on Linux GPUs without rewriting
-   model code. CPU is dev-only.
+   plug into the same host-only `infer-seam::BackendExecutor` + `KvPool`
+   contract behind `infer-api`, so a Rust shop can develop on a MacBook and
+   ship on Linux GPUs without rewriting model code. CPU is dev-only.
 
 ## What ARLE is intentionally not racing
 
@@ -72,14 +73,14 @@ shows. Read each project's own docs before committing.
   4-bit are Beta — see
   [support-matrix.md §Quantization](support-matrix.md). Production-critical
   exotic quants live in vLLM / llama.cpp.
-- **Python ergonomics.** Embedding ARLE means linking the Rust `infer` crate,
-  not `pip install`. There is no `from arle import LLM`-style API.
+- **Python ergonomics.** Embedding ARLE means linking the Rust `infer-api`
+  crate, not `pip install`. There is no `from arle import LLM`-style API.
 
 ## When to pick ARLE specifically
 
 - You are building or evaluating an **agent / RL** workload on **Qwen3.5**
   and want serving + rollout / training to share runtime code.
-- You want a **pure-Rust serving binary** (`infer`) that you can embed
+- You want a **pure-Rust serving binary** (`arle`) that you can embed
   without a Python sidecar.
 - You are on **Apple Silicon** and want a runtime where Metal is a
   first-class backend, not a port.
