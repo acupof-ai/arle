@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
 use cudarc::driver::CudaSlice;
@@ -210,6 +210,8 @@ pub(crate) struct Dsv4Model {
     /// row before the final RMSNorm + lm_head projection.
     pub head_hc: Dsv4HyperConnection,
     pub tp: crate::tp::TpRuntime,
+    #[cfg(feature = "deepep")]
+    pub deepep: Option<crate::deepep::DeepEpTransport>,
 }
 
 pub(crate) struct Dsv4SlotState {
@@ -296,6 +298,8 @@ impl Dsv4Model {
         let kv_arena = Dsv4MlaKvArena::from_config(&config)?;
 
         let ctx = DeviceContext::new()?;
+        #[cfg(feature = "deepep")]
+        let deepep = crate::deepep::DeepEpTransport::maybe_boot(&ctx, &tp)?;
         let loader = SafetensorLoader::new(model_path)?;
         let names = config.tensor_names();
 
@@ -342,6 +346,8 @@ impl Dsv4Model {
             norm,
             head_hc,
             tp,
+            #[cfg(feature = "deepep")]
+            deepep,
         })
     }
 
@@ -459,10 +465,31 @@ impl Dsv4Model {
             let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
             crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)?;
             let mut moe_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            crate::moe::dsv4_moe_forward(self, &layer.moe, tokens, &normed, &mut moe_out)?;
-            // Routed experts are EP-sharded; sum them first, then add the replicated
-            // shared expert exactly once per rank.
-            self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+            if dsv4_use_deepep_transport()? {
+                #[cfg(feature = "deepep")]
+                {
+                    let transport = self.deepep.as_ref().ok_or_else(|| {
+                        anyhow!("ARLE_DSV4_MOE_TRANSPORT=deepep but DeepEP transport is not booted")
+                    })?;
+                    crate::moe::dsv4_moe_forward_deepep(
+                        self,
+                        transport,
+                        &layer.moe,
+                        tokens,
+                        &normed,
+                        &mut moe_out,
+                    )?;
+                }
+                #[cfg(not(feature = "deepep"))]
+                {
+                    bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
+                }
+            } else {
+                crate::moe::dsv4_moe_forward(self, &layer.moe, tokens, &normed, &mut moe_out)?;
+                // Routed experts are EP-sharded; sum them first, then add the replicated
+                // shared expert exactly once per rank.
+                self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+            }
             let shared = crate::moe::dsv4_shared_expert_forward(
                 &self.ctx,
                 &layer.moe,
@@ -556,6 +583,20 @@ impl Dsv4Model {
     }
 }
 
+fn dsv4_use_deepep_transport() -> Result<bool> {
+    let value = std::env::var("ARLE_DSV4_MOE_TRANSPORT")
+        .or_else(|_| std::env::var("ARLE_DSV4_MOE_BACKEND"))
+        .unwrap_or_else(|_| "allreduce".to_string());
+    match value.as_str() {
+        "allreduce" | "all_reduce" | "native" | "scalar" | "static" | "deepgemm" | "" => Ok(false),
+        "deepep" | "native-deepep" | "native_deepep" => Ok(true),
+        other => bail!(
+            "unsupported ARLE_DSV4_MOE_TRANSPORT/ARLE_DSV4_MOE_BACKEND `{other}` \
+             (expected allreduce or deepep)"
+        ),
+    }
+}
+
 /// TP runtime for DSv4 load — multi-rank `nccl` builds resolve the NCCL
 /// `unique_id` like the dense path; otherwise the no-op single runtime.
 fn build_dsv4_tp_runtime() -> Result<crate::tp::TpRuntime> {
@@ -563,6 +604,9 @@ fn build_dsv4_tp_runtime() -> Result<crate::tp::TpRuntime> {
     {
         let cfg = crate::tp::resolve_tp_config_from_env().map_err(|e| anyhow!("{e}"))?;
         if !cfg.is_single() {
+            let ordinal = cuda_kernels::tensor::parse_device_ordinal_from_env()?;
+            cudarc::runtime::result::device::set(ordinal as i32)
+                .map_err(|e| anyhow!("cudaSetDevice({ordinal}) before NCCL init failed: {e}"))?;
             let unique_id = crate::loader::nccl_unique_id_from_env()?;
             return crate::tp::TpRuntime::from_env_with_nccl(unique_id);
         }
