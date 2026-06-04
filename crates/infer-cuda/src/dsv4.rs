@@ -17,10 +17,13 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow, ensure};
-use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
+use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
+use cudarc::driver::CudaSlice;
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
+use half::bf16;
 use infer_moe::MoeConfig;
+use infer_plan::SamplingParams;
 
 use crate::loader::SafetensorLoader;
 use crate::moe_config::ExpertSplit;
@@ -79,6 +82,28 @@ impl Dsv4MlaKvArena {
             bytes_per_token: DSV4_FLASH_KV_BYTES_PER_TOKEN,
             num_layers: config.num_hidden_layers,
         })
+    }
+
+    /// Allocate the flat device FP8 KV arena (`num_blocks * page_block_size *
+    /// bytes_per_token` bytes) the FlashMLA sparse-FP8 decode reads.
+    ///
+    /// GATED to Piece 2b: only the FlashMLA decode launch (`dsv4_fp8_kv_pack` →
+    /// `dsv4_flashmla_decode_build_indices_*` → `*_sched_meta` →
+    /// `arle_flashmla_sm90_sparse_decode_fwd` → `arle_dsv4_output_inverse_rope_*`)
+    /// consumes this arena. The correctness-complete SlidingWindow MLA core
+    /// ([`crate::attention::mla_attention`]) uses the bf16 SW ring cache
+    /// ([`Dsv4Model::alloc_sw_window_caches`]) instead, so this stays unwired —
+    /// allocating it now would reserve device bytes nothing reads yet.
+    #[allow(dead_code)]
+    pub(crate) fn alloc_fp8_arena(
+        &self,
+        _ctx: &DeviceContext,
+        _num_blocks: usize,
+    ) -> Result<CudaSlice<u8>> {
+        anyhow::bail!(
+            "DSv4 MLA FP8 KV arena alloc (FlashMLA sparse-FP8 decode) is Piece 2b; the \
+             SlidingWindow MLA core uses the bf16 SW ring cache (alloc_sw_window_caches)"
+        )
     }
 }
 
@@ -223,15 +248,142 @@ impl Dsv4Model {
         })
     }
 
-    /// Forward one prefill/decode step. Piece 2 (MLA) + Piece 3 (FP8 MoE) land
-    /// the body; the loader stands alone behind this gate.
-    pub(crate) fn forward_tokens(&self, _tokens: &[u32]) -> Result<u32> {
-        // Surfaces both unimplemented forwards in one place so callers wired
-        // before Pieces 2/3 fail loud rather than silently no-op.
-        todo!(
-            "DSv4 forward: MLA attention (Piece 2) + FP8 DeepGEMM MoE (Piece 3) \
-             not yet ported; loader-only milestone"
-        )
+    /// Allocate this rank's per-layer bf16 sliding-window ring caches.
+    ///
+    /// Each SlidingWindow MLA layer holds `sliding_window * head_dim` bf16
+    /// elements that [`crate::attention::mla_attention`] reads and updates in
+    /// place. Zero-initialized = an empty window (a fresh prefill from
+    /// `start_pos == 0`); a continuous-batching executor (Piece 4) will instead
+    /// retain these across decode steps per slot.
+    pub(crate) fn alloc_sw_window_caches(&self) -> Result<Vec<CudaSlice<bf16>>> {
+        let cache_len = self.config.sliding_window * self.config.head_dim;
+        ensure!(
+            cache_len > 0,
+            "DSv4 SW window cache len is zero (sliding_window={} head_dim={})",
+            self.config.sliding_window,
+            self.config.head_dim
+        );
+        self.layers
+            .iter()
+            .map(|_| {
+                self.ctx
+                    .stream
+                    .alloc_zeros::<bf16>(cache_len)
+                    .map_err(|e| anyhow!("DSv4 SW window cache alloc failed: {e}"))
+            })
+            .collect()
+    }
+
+    /// Forward one prefill/decode step over `tokens` starting at `start_pos`,
+    /// returning the next greedy/sampled token.
+    ///
+    /// Per-layer: `attn_norm → mla_attention (SW-mode) → residual (+TP all-reduce)
+    /// → ffn_norm → dsv4_moe_forward (Piece 3) → residual (+TP all-reduce)`, then
+    /// the final RMSNorm + lm_head projection + sample. The MLA core is Piece 2a
+    /// (this file); the FP8 DeepGEMM MoE block is Piece 3's
+    /// [`crate::moe::dsv4_moe_forward`] (concurrent — its body may not be in this
+    /// worktree yet; a typecheck shim covers the missing symbol).
+    pub(crate) fn forward_tokens(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<u32> {
+        ensure!(
+            !tokens.is_empty(),
+            "DSv4 forward requires at least one token"
+        );
+
+        let hidden_size = self.config.hidden_size;
+        let seq_len = tokens.len();
+        let eps = self.config.rms_norm_eps;
+
+        let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids)?;
+        let mut hidden = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+        crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)?;
+
+        let mut sw_caches = self.alloc_sw_window_caches()?;
+        let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+        let mut attn_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+        let mut hidden_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+        let mut moe_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // ── Attention block.
+            crate::ops::rms_norm_batch(&self.ctx, &hidden, &layer.attn_norm, eps, &mut normed)?;
+            // Hyper-connection pre-mix (hc_mult > 1) is Piece 2b: the loader
+            // already `ensure!`s hc_mult == 1, so the dense (hc_mult == 1) stream
+            // is the identity wrap — no hc_pre/hc_post mixing on this path.
+            crate::attention::mla_attention(
+                &self.ctx,
+                &self.config,
+                &layer.attention,
+                layer.mode,
+                layer_idx,
+                &normed,
+                &mut sw_caches[layer_idx],
+                start_pos,
+                &mut attn_out,
+            )?;
+            // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
+            self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
+            crate::ops::add_batch(&self.ctx, &hidden, &attn_out, &mut hidden_out)?;
+            std::mem::swap(&mut hidden, &mut hidden_out);
+
+            // ── MoE block (Piece 3).
+            crate::ops::rms_norm_batch(&self.ctx, &hidden, &layer.ffn_norm, eps, &mut normed)?;
+            crate::moe::dsv4_moe_forward(self, &layer.moe, &normed, &mut moe_out)?;
+            // Row-parallel down/combine: sum the per-rank partials.
+            self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+            crate::ops::add_batch(&self.ctx, &hidden, &moe_out, &mut hidden_out)?;
+            std::mem::swap(&mut hidden, &mut hidden_out);
+        }
+
+        // ── Final norm + lm_head projection + sample (last token row).
+        let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
+        crate::ops::copy_row_to_vec(&self.ctx, &hidden, seq_len - 1, &mut last_hidden)?;
+        let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
+        crate::ops::rms_norm_vec(&self.ctx, &last_hidden, &self.norm, eps, &mut last_normed)?;
+        let mut logits = DeviceVec::zeros(&self.ctx, self.lm_head.rows)?;
+        self.lm_head_project(&last_normed, &mut logits)?;
+        crate::executor::sample_cuda_token(&self.ctx, &logits, params, position)
+    }
+
+    /// Project the final hidden vector through the LM head into `logits`. The
+    /// head can be plain bf16 or DSv4 FP8/FP4 block-scaled, so dispatch the
+    /// matching single-vector kernel (`seq_len == 1`).
+    fn lm_head_project(&self, x: &DeviceVec, logits: &mut DeviceVec) -> Result<()> {
+        use cuda_kernels::tensor::WeightFormat;
+        ensure!(
+            self.lm_head.cols == x.len && self.lm_head.rows == logits.len,
+            "DSv4 lm_head shape mismatch: [{}x{}] x.len {} logits.len {}",
+            self.lm_head.rows,
+            self.lm_head.cols,
+            x.len,
+            logits.len
+        );
+        match self.lm_head.weight_format {
+            WeightFormat::DenseBf16 => crate::ops::gemv(&self.ctx, &self.lm_head, x, logits),
+            // FP8/FP4 block-scaled: run the batched GEMV path at batch=1, then
+            // copy the one-token output row into the caller's logits vec.
+            WeightFormat::Dsv4Fp8BlockScaled | WeightFormat::Dsv4Fp4BlockScaled => {
+                let x_batch = HiddenStates {
+                    data: x.data.clone(),
+                    hidden_dim: x.len,
+                    seq_len: 1,
+                };
+                let mut out_batch = HiddenStates::zeros(&self.ctx, logits.len, 1)?;
+                crate::attention::mla_linear(&self.ctx, &self.lm_head, &x_batch, &mut out_batch)?;
+                self.ctx
+                    .stream
+                    .memcpy_dtod(&out_batch.data, &mut logits.data)
+                    .map_err(|e| anyhow!("DSv4 lm_head logits copy-back failed: {e}"))?;
+                Ok(())
+            }
+            other => anyhow::bail!("DSv4 lm_head unsupported weight format {other:?}"),
+        }
     }
 
     /// MoE config built from the DSv4 router fields (sqrtsoftplus + noaux_tc).
