@@ -14,7 +14,7 @@ use anyhow::Result;
 #[cfg(feature = "metal")]
 use anyhow::{Context, anyhow};
 use axum::extract::State;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use infer_core::CompletedRequest;
 #[cfg(feature = "metal")]
@@ -25,6 +25,7 @@ use infer_seam::{BackendExecutor, KvPool};
 use crate::ServeHandle;
 use crate::schema::{
     ApiError, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
+    ModelsResponse,
 };
 use crate::tokenizer::OpenAiTokenizer;
 
@@ -52,6 +53,7 @@ where
     Router::new()
         .route("/v1/completions", post(completions::<E, K>))
         .route("/v1/chat/completions", post(chat_completions::<E, K>))
+        .route("/v1/models", get(list_models::<E, K>))
         .with_state(state)
 }
 
@@ -172,6 +174,16 @@ fn looks_like_local_path(input: &str) -> bool {
         || trimmed.starts_with("../")
         || trimmed.starts_with('~')
         || trimmed.matches('/').count() > 1
+}
+
+/// `GET /v1/models` — list the single served model (OpenAI-compatible; clients
+/// like openai-python call this to discover the model id).
+async fn list_models<E, K>(State(state): State<Arc<HttpState<E, K>>>) -> Json<ModelsResponse>
+where
+    E: BackendExecutor + 'static,
+    K: KvPool + 'static,
+{
+    Json(ModelsResponse::single(state.model.clone()))
 }
 
 async fn completions<E, K>(
