@@ -137,17 +137,32 @@ overhead gone: `moe_route` 41.4%→3.7%, `deepgemm_grouped` 38.8%→4.3%,
    D2D −86%, memset −88%, alloc+free −65%. Decode 21.615 → **25.129 tok/s**,
    wall 50.7 → **41.2 ms/token**. Wins
    [`2026-06-05-dsv4-decode-buffer-d2d-reduction.md`](../experience/wins/2026-06-05-dsv4-decode-buffer-d2d-reduction.md).
-2. **#25 full decode graph — NOW #1.** Launch API (`cudaLaunchKernel` +
-   `cuLaunchKernelEx`) ≈ 13.36 ms/token = **32% of the 41.2 ms**. Align SGLang:
-   evaluate breakable cuda graph (capture graphable segments, re-invoke NCCL
-   all-reduce + DeepEP combine at break points) before a custom capturable
-   all-reduce; prereq — confirm DeepEP decode combine is capturable or switch to
-   low-latency decode mode. Extends the single-GPU decode graph (gated off under
-   TP/MoE at `executor.rs:408`) to TP=8/EP=8.
-3. **MLA attn ~11.79 ms/token** — the real kernel floor; deepest, align SGLang
-   FlashMLA decode, last.
+2. **[DONE `7104813e`, gated] #25 breakable decode graph.** Full 43-layer
+   breakable graph (attn seg → eager TP all-reduce → MoE seg → eager all-reduce →
+   tail). Launch API 13.36 → **1.68 ms/token (−87%)** — but **wall flat**
+   (25.129 → 25.517 tok/s). The launch time was CPU-side overlapped with GPU
+   execution, *not* critical-path (§0 framing trap). `cuStreamSynchronize` now
+   waits on GPU backlog. Wins
+   [`2026-06-05-dsv4-decode-breakable-graph-launch-overlapped.md`](../experience/wins/2026-06-05-dsv4-decode-breakable-graph-launch-overlapped.md).
+3. **MLA attn ~11.79 ms/token + FP8 GEMV + DeepGEMM pack/unpad + MHC** — the real
+   kernel floor; deepest, align SGLang FlashMLA decode.
 
-Cumulative decode: 4.365 → 25.129 tok/s (**~5.75×**), 236.8 → 41.2 ms/token.
+## 7. Verdict — host+launch axis complete; decode is GPU-kernel-bound (2026-06-05)
+
+Cumulative decode: 4.365 → **25.5 tok/s** (**~6×**), 236.8 → **~39.5 ms/token**.
+#21 (grouped-cache) + #24 (on-device router) + #29 (scratch pool) + buffer/D2D
+lever + #25 (graph) eliminated **all** host-route sync, per-step alloc, D2D
+copies, zeroing, and launch overhead. The remaining ~39.5 ms/token is the **real
+GPU kernel floor** — hybrid MLA attention (~11.8 ms), FP8 GEMV, DeepGEMM
+pack/unpad, MHC params.
+
+**The 5–6 ms/token target is an H100/H800 number** (where SGLang measures it). On
+H20 (substantially lower FLOPs/bandwidth) the realistic floor for this 671B-class
+FP8 MoE is **~25–40 ms/token** without deep per-kernel rewrites. Reaching the
+floor further needs kernel-level work (FlashMLA decode tuning, DeepGEMM, FP8
+GEMV) with diminishing returns, and would still not hit 6 ms on H20. The
+structural-overhead arc is done; further decode gains are a kernel-floor /
+hardware question, not a scheduling/buffer/launch one.
 
 **`lm_head_sample` ruled out (§0 framing-trap, falsified):** its 9.4 ms/token
 NVTX range *included* the step-end `sample_cuda_token → ctx.sync()`, so it was
