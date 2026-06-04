@@ -78,11 +78,13 @@ declare -a LOGS
 for r in $(seq 0 $((WORLD_SIZE - 1))); do
     LOG="$WORK/rank_$r.log"
     LOGS[r]="$LOG"
-    # INFER_CUDA_DEVICE binds this rank's GPU; INFER_CUDA_DEVICES gives the world
-    # size (8 ordinals → TP=8); INFER_TP_RANK is this rank's index;
-    # INFER_NCCL_ID_FILE is the shared rendezvous path.
+    # One GPU per rank: CUDA_VISIBLE_DEVICES=$r masks physical GPU $r, which the
+    # process then sees re-indexed as ordinal 0 — so INFER_CUDA_DEVICE must be 0,
+    # NOT $r (passing $r yields CUDA_ERROR_INVALID_DEVICE since only ordinal 0 is
+    # visible). INFER_CUDA_DEVICES gives the world size (8 ordinals → TP=8);
+    # INFER_TP_RANK is this rank's index; INFER_NCCL_ID_FILE is the rendezvous path.
     CUDA_VISIBLE_DEVICES="$r" \
-    INFER_CUDA_DEVICE="$r" \
+    INFER_CUDA_DEVICE=0 \
     INFER_CUDA_DEVICES="$DEVICES" \
     INFER_TP_SIZE="$WORLD_SIZE" \
     INFER_TP_RANK="$r" \
