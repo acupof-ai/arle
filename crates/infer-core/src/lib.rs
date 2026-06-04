@@ -17,8 +17,6 @@ use infer_seam::{
     AdmissionVerdict, BackendExecutor, KvPool, PermissiveGovernor, PollResult, ResourceGovernor,
 };
 
-const STOP_TOKEN_ID: u32 = 0;
-
 /// Stable handle returned to callers when a request is submitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestHandle(u64);
@@ -238,6 +236,9 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     /// Set once [`Engine::warmup`] has run the backend warmup. The first
     /// [`Engine::step`] triggers it lazily so callers need not warm up by hand.
     warmed_up: bool,
+    /// Model-default stop token ids (EOS + configured stops) read once from the
+    /// executor. Used as the fallback stop set for requests that supply none.
+    model_stop_token_ids: Vec<u32>,
 }
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
@@ -262,6 +263,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         governor: Box<dyn ResourceGovernor>,
     ) -> Self {
         let radix = RadixCache::new(kv.page_size().max(1));
+        let model_stop_token_ids = executor.model_stop_token_ids();
         Self {
             executor,
             kv,
@@ -275,6 +277,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             inflight: None,
             pending_plan: None,
             warmed_up: false,
+            model_stop_token_ids,
         }
     }
 
@@ -479,6 +482,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             tokens_by_slot.insert(token.slot, token);
         }
         let mut finished_slots = Vec::new();
+        let model_stops: &[u32] = &self.model_stop_token_ids;
 
         // Advance chunked prefill. A non-final chunk only moves progress; the
         // final chunk transitions the slot to decode and consumes its first token.
@@ -496,7 +500,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 request.phase = RequestPhase::Decoding;
                 if let Some(token) = tokens_by_slot.remove(&row.slot) {
                     request.generated_tokens.push(token.token);
-                    if let Some(finish) = finish_reason_for(request, &token) {
+                    if let Some(finish) = finish_reason_for(request, &token, model_stops) {
                         finished_slots.push((row.slot, finish));
                     }
                 }
@@ -521,7 +525,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 continue;
             }
             request.generated_tokens.push(token.token);
-            if let Some(finish) = finish_reason_for(request, &token) {
+            if let Some(finish) = finish_reason_for(request, &token, model_stops) {
                 finished_slots.push((row.slot, finish));
             }
         }
@@ -688,14 +692,23 @@ fn waiting_request_precedes(
     }
 }
 
-fn finish_reason_for(request: &RequestState, token: &SlotToken) -> Option<FinishReason> {
+fn finish_reason_for(
+    request: &RequestState,
+    token: &SlotToken,
+    model_stop_token_ids: &[u32],
+) -> Option<FinishReason> {
     if let Some(finish) = token.finish.clone() {
         return Some(finish);
     }
     let sampling = &request.sampling;
-    // Default EOS unless the request opts out; plus any per-request stop ids.
-    let hits_eos = !sampling.ignore_eos && token.token == STOP_TOKEN_ID;
-    if hits_eos || sampling.stop_token_ids.contains(&token.token) {
+    // Request-supplied stops take priority; the model defaults are the fallback
+    // used only when the request supplies none. Both honor `ignore_eos`.
+    let stop_ids: &[u32] = if sampling.stop_token_ids.is_empty() {
+        model_stop_token_ids
+    } else {
+        &sampling.stop_token_ids
+    };
+    if !sampling.ignore_eos && stop_ids.contains(&token.token) {
         Some(FinishReason::Stop)
     } else if request.generated_tokens.len() >= request.max_tokens {
         Some(FinishReason::Length)
@@ -1038,6 +1051,39 @@ mod testing {
         }
     }
 
+    /// Mock executor that reports model-default stop tokens, mirroring how a
+    /// real backend (e.g. Metal) exposes its config EOS/stop ids to the engine.
+    #[derive(Debug, Clone)]
+    pub(super) struct StopTokenExecutor {
+        inner: MockExecutor,
+        model_stops: Vec<u32>,
+    }
+
+    impl StopTokenExecutor {
+        pub(super) fn with_model_stops(model_stops: Vec<u32>) -> Self {
+            Self {
+                inner: MockExecutor::ready(),
+                model_stops,
+            }
+        }
+    }
+
+    impl BackendExecutor for StopTokenExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        fn model_stop_token_ids(&self) -> Vec<u32> {
+            self.model_stops.clone()
+        }
+    }
+
     /// Mock executor that records how many times `warmup` was called, so a test
     /// can assert the engine warms the backend exactly once.
     #[derive(Debug, Clone, Default)]
@@ -1195,9 +1241,98 @@ mod tests {
     use infer_seam::{KvAllocator, KvQuery};
 
     use super::testing::{
-        DeviceMirrorExecutor, HoldGovernor, MockExecutor, MockKvPool, WarmupCountingExecutor,
+        DeviceMirrorExecutor, HoldGovernor, MockExecutor, MockKvPool, StopTokenExecutor,
+        WarmupCountingExecutor,
     };
     use super::*;
+
+    fn submit_with_sampling(
+        engine: &mut Engine<StopTokenExecutor, MockKvPool>,
+        prompt: Vec<u32>,
+        max_tokens: usize,
+        sampling: SamplingParams,
+    ) -> RequestHandle {
+        engine.submit_request_with_options(
+            prompt,
+            max_tokens,
+            RequestOptions {
+                sampling,
+                ..RequestOptions::default()
+            },
+        )
+    }
+
+    /// A request that supplies no stop tokens falls back to the model EOS:
+    /// MockExecutor emits 11, 12, 13, ... for prompt [10]; model EOS 12 halts
+    /// generation at the second token with a Stop reason, not Length.
+    #[test]
+    fn request_without_stops_falls_back_to_model_eos() -> Result<()> {
+        let executor = StopTokenExecutor::with_model_stops(vec![12]);
+        let mut engine = Engine::new(executor, MockKvPool::new(1), 1);
+        let handle = engine.submit_request(vec![10], 8);
+
+        engine.run_to_idle()?;
+
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(completed.generated_tokens, vec![11, 12]);
+        assert!(matches!(completed.finish, Some(FinishReason::Stop)));
+        Ok(())
+    }
+
+    /// Request-supplied stops take priority over the model EOS: stop id 11 halts
+    /// before the model EOS 12 is ever produced.
+    #[test]
+    fn request_stops_take_priority_over_model_eos() -> Result<()> {
+        let executor = StopTokenExecutor::with_model_stops(vec![12]);
+        let mut engine = Engine::new(executor, MockKvPool::new(1), 1);
+        let sampling = SamplingParams {
+            stop_token_ids: vec![11],
+            ..SamplingParams::default()
+        };
+        let handle = submit_with_sampling(&mut engine, vec![10], 8, sampling);
+
+        engine.run_to_idle()?;
+
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(completed.generated_tokens, vec![11]);
+        assert!(matches!(completed.finish, Some(FinishReason::Stop)));
+        Ok(())
+    }
+
+    /// `ignore_eos` disables the model EOS fallback: the request runs to its
+    /// length limit instead of stopping on the model stop token.
+    #[test]
+    fn ignore_eos_disables_model_eos_fallback() -> Result<()> {
+        let executor = StopTokenExecutor::with_model_stops(vec![12]);
+        let mut engine = Engine::new(executor, MockKvPool::new(1), 1);
+        let sampling = SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        };
+        let handle = submit_with_sampling(&mut engine, vec![10], 4, sampling);
+
+        engine.run_to_idle()?;
+
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(completed.generated_tokens, vec![11, 12, 13, 14]);
+        assert!(matches!(completed.finish, Some(FinishReason::Length)));
+        Ok(())
+    }
+
+    /// An executor that exposes no model stops (the CUDA/mock default) keeps the
+    /// prior behavior: a request with no stops runs to its length limit.
+    #[test]
+    fn no_model_stops_runs_to_length() -> Result<()> {
+        let mut engine = Engine::new(MockExecutor::ready(), MockKvPool::new(1), 1);
+        let handle = engine.submit_request(vec![10], 3);
+
+        engine.run_to_idle()?;
+
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(completed.generated_tokens, vec![11, 12, 13]);
+        assert!(matches!(completed.finish, Some(FinishReason::Length)));
+        Ok(())
+    }
 
     #[test]
     fn engine_warms_backend_exactly_once_across_steps() -> Result<()> {

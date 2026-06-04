@@ -188,6 +188,14 @@ impl BackendExecutor for MetalExecutor {
             }
         }
     }
+
+    fn model_stop_token_ids(&self) -> Vec<u32> {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_ref() {
+            return real.config.stop_token_ids.clone();
+        }
+        Vec::new()
+    }
 }
 
 #[cfg(feature = "metal")]
