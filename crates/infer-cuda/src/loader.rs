@@ -968,20 +968,25 @@ impl SafetensorLoader {
         );
 
         let gate = self.load_dsv4_bf16_matrix(ctx, &names.gate_weight)?;
-        let (gate_bias, hash_tid2eid) = match routing_kind {
+        let (gate_bias, hash_tid2eid, hash_tid2eid_device) = match routing_kind {
             DeepSeekV4MoeRoutingKind::LearnedBias => {
                 let bias_name = names
                     .gate_bias
                     .as_ref()
                     .ok_or_else(|| anyhow!("DSv4 bias-routed MoE layer missing gate.bias"))?;
-                (Some(self.load_dsv4_vec(ctx, bias_name)?), None)
+                (Some(self.load_dsv4_vec(ctx, bias_name)?), None, None)
             }
             DeepSeekV4MoeRoutingKind::Hash => {
                 let tid_name = names
                     .gate_tid2eid
                     .as_ref()
                     .ok_or_else(|| anyhow!("DSv4 hash-routed MoE layer missing gate.tid2eid"))?;
-                (None, Some(self.load_dsv4_i64_host(tid_name)?))
+                let table = self.load_dsv4_i64_host(tid_name)?;
+                let device = ctx
+                    .stream
+                    .clone_htod(&table)
+                    .map_err(|e| anyhow!("DSv4 tid2eid H2D failed for {tid_name}: {e}"))?;
+                (None, Some(table), Some(device))
             }
         };
 
@@ -1005,6 +1010,7 @@ impl SafetensorLoader {
             gate,
             gate_bias,
             hash_tid2eid,
+            hash_tid2eid_device,
             routing_kind,
             shared_w13,
             shared_w2,
@@ -1012,8 +1018,8 @@ impl SafetensorLoader {
     }
 
     /// Load a DSv4 1D `i64` table (hash routing `gate.tid2eid`) into a host
-    /// `Vec<i64>`. Hash routing reads it per-token on the host (slice token_id ×
-    /// topk), so it never goes to the device.
+    /// `Vec<i64>`. The loader also uploads a device copy for the on-device
+    /// router; the host copy remains the A/B oracle.
     pub(crate) fn load_dsv4_i64_host(&self, name: &str) -> Result<Vec<i64>> {
         use safetensors::tensor::Dtype;
         let tensor = self.load_raw_tensor(name)?;

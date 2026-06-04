@@ -273,6 +273,93 @@ pub unsafe fn dsv4_count_local_experts(
     Ok(())
 }
 
+/// DSv4 on-device router: router logits `[num_tokens, n_experts]` to flat
+/// token-major `indices` / `weights` (`[num_tokens * topk]`). `routing_kind=0`
+/// is hash routing and requires `tid2eid` + `token_ids`; `routing_kind=1` is
+/// learned-bias noaux routing and requires `bias`.
+///
+/// # Safety
+/// All pointers must be valid on `stream` for the given shape. Optional
+/// pointers are only dereferenced by the matching routing-kind branch.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_route(
+    logits: RawDevicePtr<bf16>,
+    bias: Option<RawDevicePtr<bf16>>,
+    tid2eid: Option<RawDevicePtr<i64>>,
+    token_ids: Option<RawDevicePtr<u32>>,
+    indices: RawDevicePtr<i32>,
+    weights: RawDevicePtr<f32>,
+    num_tokens: usize,
+    n_experts: usize,
+    topk: usize,
+    routing_kind: i32,
+    scoring_kind: i32,
+    routed_scaling_factor: f32,
+    stream: CUstream,
+) -> Result<()> {
+    ensure!(
+        routing_kind == 0 || routing_kind == 1,
+        "DSv4 route routing_kind must be 0(hash) or 1(learned-bias), got {routing_kind}"
+    );
+    ensure!(
+        scoring_kind == 0 || scoring_kind == 1 || scoring_kind == 2,
+        "DSv4 route scoring_kind must be 0/1/2, got {scoring_kind}"
+    );
+    ensure!(n_experts > 0, "DSv4 route n_experts must be > 0");
+    ensure!(topk > 0, "DSv4 route topk must be > 0");
+    let bias_ptr = match (routing_kind, bias) {
+        (1, Some(ptr)) => ptr.as_ptr() as *const Half,
+        (1, None) => anyhow::bail!("DSv4 learned-bias route requires bias pointer"),
+        _ => std::ptr::null(),
+    };
+    let tid2eid_ptr = match (routing_kind, tid2eid) {
+        (0, Some(ptr)) => ptr.as_ptr(),
+        (0, None) => anyhow::bail!("DSv4 hash route requires tid2eid pointer"),
+        _ => std::ptr::null(),
+    };
+    let token_ids_ptr = match (routing_kind, token_ids) {
+        (0, Some(ptr)) => ptr.as_ptr(),
+        (0, None) => anyhow::bail!("DSv4 hash route requires token_ids pointer"),
+        _ => std::ptr::null(),
+    };
+    unsafe {
+        ffi::dsv4_route_cuda(
+            logits.as_ptr() as *const Half,
+            bias_ptr,
+            tid2eid_ptr,
+            token_ids_ptr,
+            indices.as_mut_ptr(),
+            weights.as_mut_ptr(),
+            i32::try_from(num_tokens)?,
+            i32::try_from(n_experts)?,
+            i32::try_from(topk)?,
+            routing_kind,
+            scoring_kind,
+            routed_scaling_factor,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Cast a flat `i32` device buffer to `i64` on-device.
+///
+/// # Safety
+/// `src` / `dst` must be valid on `stream` for `n` elements.
+pub unsafe fn dsv4_cast_i32_to_i64(
+    src: RawDevicePtr<i32>,
+    dst: RawDevicePtr<i64>,
+    n: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_cast_i32_to_i64_cuda(src.as_ptr(), dst.as_mut_ptr(), i32::try_from(n)?, stream)
+            .result()?;
+    }
+    Ok(())
+}
+
 /// Exclusive prefix-sum over per-expert counts → offsets (+ total).
 /// Wraps [`ffi::dsv4_exclusive_scan_i32_cuda`].
 ///

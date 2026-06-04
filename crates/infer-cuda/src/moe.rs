@@ -431,10 +431,193 @@ mod dsv4_gpu {
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, HiddenStates};
     use cuda_kernels::tensor::{Dsv4Fp8DeepGemmWeightCache, cache_ptr};
+    use cudarc::driver::CudaSlice;
     use half::bf16;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
     use crate::ops::gemm_batch;
+
+    static GPU_ROUTE_COMPARE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct DeviceRouting {
+        indices: CudaSlice<i32>,
+        weights: CudaSlice<f32>,
+    }
+
+    fn use_gpu_router() -> bool {
+        std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some()
+    }
+
+    fn dsv4_route_device(
+        model: &Dsv4Model,
+        layer: &Dsv4MoeLayer,
+        tokens: &[u32],
+        logits: &HiddenStates,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<DeviceRouting> {
+        use deepseek_spec::DeepSeekV4MoeRoutingKind;
+
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        let num_tokens = logits.seq_len;
+        let total_routes = num_tokens * cfg.top_k;
+        ensure!(
+            tokens.len() == num_tokens,
+            "DSv4 device route token count {} != logits seq_len {num_tokens}",
+            tokens.len()
+        );
+        ensure!(
+            logits.hidden_dim == cfg.num_experts,
+            "DSv4 device route logits hidden_dim {} != num_experts {}",
+            logits.hidden_dim,
+            cfg.num_experts
+        );
+
+        let route_indices = ctx
+            .stream
+            .alloc_zeros::<i32>(total_routes)
+            .map_err(|e| anyhow::anyhow!("DSv4 device route-index alloc failed: {e}"))?;
+        let route_weights = ctx
+            .stream
+            .alloc_zeros::<f32>(total_routes)
+            .map_err(|e| anyhow::anyhow!("DSv4 device route-weight alloc failed: {e}"))?;
+
+        let routing_kind = match layer.routing_kind {
+            DeepSeekV4MoeRoutingKind::Hash => 0,
+            DeepSeekV4MoeRoutingKind::LearnedBias => 1,
+        };
+        let token_ids = if matches!(layer.routing_kind, DeepSeekV4MoeRoutingKind::Hash) {
+            let token_ids = ctx
+                .stream
+                .clone_htod(tokens)
+                .map_err(|e| anyhow::anyhow!("DSv4 device route token-id H2D failed: {e}"))?;
+            keepalive.keep_route_u32(&token_ids);
+            Some(token_ids)
+        } else {
+            None
+        };
+        let bias = layer
+            .gate_bias
+            .as_ref()
+            .map(|bias| cache_ptr(&bias.data, ctx));
+        let tid2eid = layer
+            .hash_tid2eid_device
+            .as_ref()
+            .map(|table| cache_ptr(table, ctx));
+        let token_ids_ptr = token_ids.as_ref().map(|ids| cache_ptr(ids, ctx));
+
+        keepalive.keep_route_hidden(logits);
+        keepalive.keep_route_i32(&route_indices);
+        keepalive.keep_route_f32(&route_weights);
+        if std::env::var_os("ARLE_DSV4_GPU_ROUTER_SYNC_BEFORE_ROUTE").is_some() {
+            ctx.sync()?;
+        }
+        // SAFETY: buffers are allocated for `[num_tokens * topk]`; optional
+        // pointers are validated by the wrapper according to `routing_kind`.
+        unsafe {
+            moe::dsv4_route(
+                cache_ptr(&logits.data, ctx),
+                bias,
+                tid2eid,
+                token_ids_ptr,
+                cache_ptr(&route_indices, ctx),
+                cache_ptr(&route_weights, ctx),
+                num_tokens,
+                cfg.num_experts,
+                cfg.top_k,
+                routing_kind,
+                cfg.scoring_func.scoring_kind(),
+                cfg.routed_scaling_factor,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+        if std::env::var_os("ARLE_DSV4_GPU_ROUTER_SYNC_AFTER_ROUTE").is_some() {
+            ctx.sync()?;
+        }
+        maybe_compare_device_route(
+            model,
+            layer,
+            tokens,
+            logits,
+            &route_indices,
+            &route_weights,
+            routing_kind,
+        )?;
+        Ok(DeviceRouting {
+            indices: route_indices,
+            weights: route_weights,
+        })
+    }
+
+    fn maybe_compare_device_route(
+        model: &Dsv4Model,
+        layer: &Dsv4MoeLayer,
+        tokens: &[u32],
+        logits: &HiddenStates,
+        route_indices: &CudaSlice<i32>,
+        route_weights: &CudaSlice<f32>,
+        routing_kind: i32,
+    ) -> Result<()> {
+        let Some(limit) = std::env::var_os("ARLE_DSV4_GPU_ROUTER_COMPARE")
+            .and_then(|value| value.to_string_lossy().parse::<usize>().ok())
+        else {
+            return Ok(());
+        };
+        if limit == 0 || model.tp.config().rank != 0 {
+            return Ok(());
+        }
+        let call = GPU_ROUTE_COMPARE_CALLS.fetch_add(1, Ordering::Relaxed);
+        if call >= limit {
+            return Ok(());
+        }
+
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        ctx.sync()?;
+        let indices_dev = ctx
+            .stream
+            .clone_dtoh(route_indices)
+            .map_err(|e| anyhow::anyhow!("DSv4 device route-index D2H compare failed: {e}"))?;
+        let weights_dev = ctx
+            .stream
+            .clone_dtoh(route_weights)
+            .map_err(|e| anyhow::anyhow!("DSv4 device route-weight D2H compare failed: {e}"))?;
+        let logits_bf16: Vec<bf16> = ctx
+            .stream
+            .clone_dtoh(&logits.data)
+            .map_err(|e| anyhow::anyhow!("DSv4 device route logits D2H compare failed: {e}"))?;
+        let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+        let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
+        let (indices_host, weights_host) = super::flatten_routing(&decisions, cfg.top_k)?;
+        let first_index_diff = indices_dev
+            .iter()
+            .zip(indices_host.iter())
+            .position(|(a, b)| a != b);
+        let first_weight_diff = weights_dev
+            .iter()
+            .zip(weights_host.iter())
+            .position(|(a, b)| (*a - *b).abs() > 1.0e-5);
+        let max_weight_diff = weights_dev
+            .iter()
+            .zip(weights_host.iter())
+            .map(|(a, b)| (*a - *b).abs())
+            .fold(0.0_f32, f32::max);
+        eprintln!(
+            "[dsv4-gpu-route-compare rank=0] call={} routing_kind={} tokens={} first_index_diff={:?} first_weight_diff={:?} max_weight_diff={:.6} dev_idx_head={:?} host_idx_head={:?} dev_w_head={:?} host_w_head={:?}",
+            call,
+            routing_kind,
+            tokens.len(),
+            first_index_diff,
+            first_weight_diff,
+            max_weight_diff,
+            &indices_dev[..indices_dev.len().min(12)],
+            &indices_host[..indices_host.len().min(12)],
+            &weights_dev[..weights_dev.len().min(12)],
+            &weights_host[..weights_host.len().min(12)],
+        );
+        Ok(())
+    }
 
     /// FP8 DeepGEMM MoE forward for one DSv4 routed-MoE layer (this EP rank's
     /// experts only). Mirrors the BF16 [`super::gpu::moe_forward`] route/pack/
@@ -504,30 +687,61 @@ mod dsv4_gpu {
         // Fail loud if the native DeepGEMM bridge is a build-time stub.
         moe::dsv4_deepgemm_native_preflight()?;
 
-        // ── 1+2. Router gemm → logits[T, E] → HOST route (bias or hash). ────────
+        // ── 1+2. Router gemm → logits[T, E] → route (host oracle or device). ───
+        let route_timing =
+            std::env::var_os("ARLE_DSV4_ROUTE_TIMING").is_some() && model.tp.config().rank == 0;
         let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
         gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
-        keepalive.keep_hidden(&logits);
-        ctx.sync()?;
-        let logits_bf16: Vec<bf16> = ctx
-            .stream
-            .clone_dtoh(&logits.data)
-            .map_err(|e| anyhow::anyhow!("DSv4 router logits D2H failed: {e}"))?;
-        let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
-        let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
-        let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
         let total_routes = num_tokens * topk;
+        let (route_indices, route_weights) = if use_gpu_router() {
+            let routing = dsv4_route_device(model, layer, tokens, &logits, keepalive)?;
+            (routing.indices, routing.weights)
+        } else {
+            keepalive.keep_hidden(&logits);
+            let sync_t0 = std::time::Instant::now();
+            ctx.sync()?;
+            let sync_ms = sync_t0.elapsed().as_secs_f64() * 1000.0;
+            let dtoh_t0 = std::time::Instant::now();
+            let logits_bf16: Vec<bf16> = ctx
+                .stream
+                .clone_dtoh(&logits.data)
+                .map_err(|e| anyhow::anyhow!("DSv4 router logits D2H failed: {e}"))?;
+            let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+            let dtoh_ms = dtoh_t0.elapsed().as_secs_f64() * 1000.0;
+            let route_t0 = std::time::Instant::now();
+            let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
+            let route_ms = route_t0.elapsed().as_secs_f64() * 1000.0;
+            let flatten_t0 = std::time::Instant::now();
+            let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
+            let flatten_ms = flatten_t0.elapsed().as_secs_f64() * 1000.0;
 
-        let route_indices = ctx
-            .stream
-            .clone_htod(&indices_host)
-            .map_err(|e| anyhow::anyhow!("DSv4 route-index H2D failed: {e}"))?;
-        let route_weights = ctx
-            .stream
-            .clone_htod(&weights_host)
-            .map_err(|e| anyhow::anyhow!("DSv4 route-weight H2D failed: {e}"))?;
-        keepalive.keep_i32(&route_indices);
-        keepalive.keep_f32(&route_weights);
+            let h2d_t0 = std::time::Instant::now();
+            let route_indices = ctx
+                .stream
+                .clone_htod(&indices_host)
+                .map_err(|e| anyhow::anyhow!("DSv4 route-index H2D failed: {e}"))?;
+            let route_weights = ctx
+                .stream
+                .clone_htod(&weights_host)
+                .map_err(|e| anyhow::anyhow!("DSv4 route-weight H2D failed: {e}"))?;
+            let h2d_ms = h2d_t0.elapsed().as_secs_f64() * 1000.0;
+            if route_timing {
+                eprintln!(
+                    "[dsv4-route-timing rank=0] tokens={} routes={} sync_ms={:.3} dtoh_ms={:.3} route_ms={:.3} flatten_ms={:.3} h2d_ms={:.3} total_ms={:.3}",
+                    num_tokens,
+                    total_routes,
+                    sync_ms,
+                    dtoh_ms,
+                    route_ms,
+                    flatten_ms,
+                    h2d_ms,
+                    sync_ms + dtoh_ms + route_ms + flatten_ms + h2d_ms,
+                );
+            }
+            keepalive.keep_i32(&route_indices);
+            keepalive.keep_f32(&route_weights);
+            (route_indices, route_weights)
+        };
 
         // ── 3. Per-local-expert counts → group offsets (EP-aware start/range). ──
         let counts = ctx
@@ -664,6 +878,9 @@ mod dsv4_gpu {
                 ctx.stream.cu_stream(),
             )?;
         }
+        if use_gpu_router() && std::env::var_os("ARLE_DSV4_GPU_ROUTER_SYNC_AFTER_MOE").is_some() {
+            ctx.sync()?;
+        }
 
         // The shared expert is replicated on every rank. Callers must all-reduce
         // the routed local expert contribution first, then add the shared expert
@@ -723,27 +940,46 @@ mod dsv4_gpu {
         // expert ids as i64 and remaps received ids to rank-local expert ids.
         let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
         gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
-        keepalive.keep_hidden(&logits);
-        ctx.sync()?;
-        let logits_bf16: Vec<bf16> = ctx
-            .stream
-            .clone_dtoh(&logits.data)
-            .map_err(|e| anyhow::anyhow!("DSv4 DeepEP router logits D2H failed: {e}"))?;
-        let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
-        let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
-        let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
         let total_routes = num_tokens * topk;
-        let indices_i64: Vec<i64> = indices_host.iter().map(|&v| i64::from(v)).collect();
-        let topk_idx_i64 = ctx
-            .stream
-            .clone_htod(&indices_i64)
-            .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 H2D failed: {e}"))?;
-        let route_weights = ctx
-            .stream
-            .clone_htod(&weights_host)
-            .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-weight H2D failed: {e}"))?;
-        keepalive.keep_i64(&topk_idx_i64);
-        keepalive.keep_f32(&route_weights);
+        let (topk_idx_i64, route_weights) = if use_gpu_router() {
+            let routing = dsv4_route_device(model, layer, tokens, &logits, keepalive)?;
+            let topk_idx_i64 = ctx
+                .stream
+                .alloc_zeros::<i64>(total_routes)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 alloc failed: {e}"))?;
+            keepalive.keep_route_i64(&topk_idx_i64);
+            unsafe {
+                moe::dsv4_cast_i32_to_i64(
+                    cache_ptr(&routing.indices, ctx),
+                    cache_ptr(&topk_idx_i64, ctx),
+                    total_routes,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+            (topk_idx_i64, routing.weights)
+        } else {
+            keepalive.keep_hidden(&logits);
+            ctx.sync()?;
+            let logits_bf16: Vec<bf16> = ctx
+                .stream
+                .clone_dtoh(&logits.data)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP router logits D2H failed: {e}"))?;
+            let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+            let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
+            let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
+            let indices_i64: Vec<i64> = indices_host.iter().map(|&v| i64::from(v)).collect();
+            let topk_idx_i64 = ctx
+                .stream
+                .clone_htod(&indices_i64)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 H2D failed: {e}"))?;
+            let route_weights = ctx
+                .stream
+                .clone_htod(&weights_host)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-weight H2D failed: {e}"))?;
+            keepalive.keep_i64(&topk_idx_i64);
+            keepalive.keep_f32(&route_weights);
+            (topk_idx_i64, route_weights)
+        };
 
         let num_sms = crate::deepep::DeepEpTransport::num_sms()?;
         let mut scratch =
@@ -904,6 +1140,9 @@ mod dsv4_gpu {
             topk,
             num_sms,
         )?;
+        if use_gpu_router() && std::env::var_os("ARLE_DSV4_GPU_ROUTER_SYNC_AFTER_MOE").is_some() {
+            ctx.sync()?;
+        }
         let _ = total_routes;
         Ok(())
     }
