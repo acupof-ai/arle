@@ -7,10 +7,9 @@ use anyhow::{Context, Result, anyhow};
 use chat::{
     ChatMessage, ChatRole, ParsedAssistantResponse, ToolCall, ToolDefinition, VisibleTextStream,
 };
-use infer::sampler::SamplingParams;
-use infer::server_engine::{
+use infer_api::{
     CompletionOutput, CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,
-    TokenUsage,
+    SamplingParams, TokenUsage,
 };
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -1358,7 +1357,7 @@ mod tests {
 
     use anyhow::{Result, anyhow};
     use chat::{ParsedAssistantResponse, ToolCall, ToolDefinition};
-    use infer::server_engine::{
+    use infer_api::{
         CompletionOutput, CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,
         TokenUsage,
     };

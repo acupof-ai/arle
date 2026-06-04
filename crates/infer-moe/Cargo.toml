@@ -1,0 +1,28 @@
+[package]
+name = "infer-moe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Phase-2 (EP / MoE) FOUNDATION crate for the ARLE rewrite.
+#
+# Pure-Rust, CPU-verifiable MoE routing / gating math, ported faithfully from
+# the legacy DSv4 (`crates/deepseek-spec/src/v4.rs` + the `dsv4_route` CUDA
+# kernel) and Qwen3.6 (`infer/src/model/qwen35/moe.rs` + the `qwen36_route`
+# CUDA kernel) routers. Zero device/GPU/CUDA deps by design: this is durable,
+# unit-testable foundation code that the GPU MoE kernel is verified against
+# later (the same role `infer-topo` plays for TP sharding).
+#
+# Depends on nothing but std (+ optional serde for config (de)serialization).
+
+[dependencies]
+serde = { workspace = true, features = ["derive"], optional = true }
+
+[features]
+# Derive serde traits on the config types. Off by default to keep the
+# foundation crate std-only.
+serde = ["dep:serde"]
+
+[lints]
+workspace = true

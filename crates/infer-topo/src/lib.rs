@@ -1,0 +1,24 @@
+//! `infer-topo` — pure, CPU-verifiable, device-independent topology + sharding
+//! math (TP rank placement, weight/head sharding, the SGLang-style multi-axis
+//! layout, and rank-group builders). Ported from `infer/src/tensor_parallel.rs`
+//! with all GPU/NCCL coupling dropped; depends on `std` (+ optional `serde`).
+//!
+//! Column-parallel splits the output dim (all-reduce to sum partials);
+//! row-parallel splits the input dim (pre-sharded input, all-reduce at output).
+
+#[path = "error.rs"]
+mod error;
+#[path = "sharding.rs"]
+mod sharding;
+#[path = "topology.rs"]
+mod topology;
+
+pub use error::{Result, TopoError};
+pub use sharding::{
+    ParallelLinearKind, ShardingSpec, TpConfig, TpLinearConfig, column_shard, head_shard, row_shard,
+};
+pub use topology::{
+    MultiAxisConfig, RankCoord, build_attn_cp_groups, build_attn_dp_groups,
+    build_attn_owner_groups, build_attn_tp_groups, build_moe_dp_groups, build_moe_ep_groups,
+    build_moe_tp_groups, build_pp_groups, build_tp_groups,
+};

@@ -20,7 +20,7 @@ use crate::model_picker::{self, PickerResult};
 
 /// Run the interactive startup flow and return the resolved model source.
 ///
-/// Falls back to `infer::hf_hub::resolve_model_source` when:
+/// Falls back to `infer_util::hf_hub::resolve_model_source` when:
 /// - `--model-path` is provided
 /// - `--non-interactive` flag is set
 /// - stdin/stdout is not a TTY (piped)
@@ -34,7 +34,7 @@ pub(crate) fn resolve_model_interactive(args: &Args) -> Result<String> {
 
     // Non-interactive: fall back to existing auto-discovery.
     if args.non_interactive || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        return infer::hf_hub::resolve_model_source(args.model_path.as_deref());
+        return infer_util::hf_hub::resolve_model_source(args.model_path.as_deref());
     }
 
     // ── Interactive startup ──────────────────────────────────────────────

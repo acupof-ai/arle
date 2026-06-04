@@ -172,6 +172,70 @@ mod nccl_backend {
             })
         }
 
+        /// Host-visible all-gather for small byte payloads such as CUDA IPC
+        /// handles. The payload is staged through an `i32` device buffer so this
+        /// reuses NCCL all-gather without adding a host-side rendezvous path.
+        #[cfg(feature = "cuda")]
+        pub fn all_gather_bytes(
+            &self,
+            ctx: &crate::prelude::DeviceContext,
+            input: &[u8],
+            per_rank_bytes: usize,
+        ) -> anyhow::Result<Vec<u8>> {
+            use anyhow::{bail, ensure};
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+            ensure!(
+                input.len() == per_rank_bytes,
+                "all_gather_bytes input len {} must equal per-rank bytes {per_rank_bytes}",
+                input.len()
+            );
+            ensure!(
+                per_rank_bytes.is_multiple_of(4),
+                "all_gather_bytes currently requires 4-byte alignment, got {per_rank_bytes}"
+            );
+            if per_rank_bytes == 0 {
+                return Ok(Vec::new());
+            }
+
+            let send_words: Vec<i32> = input
+                .chunks_exact(4)
+                .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("4-byte chunk")))
+                .collect();
+            let per_rank_words = send_words.len();
+            let send = ctx.stream.clone_htod(&send_words)?;
+            let mut recv = ctx
+                .stream
+                .alloc_zeros::<i32>(per_rank_words * self.world_size)?;
+            {
+                let (src, _src_guard) = send.device_ptr(&ctx.stream);
+                let (dst, _dst_guard) = recv.device_ptr_mut(&ctx.stream);
+                unsafe {
+                    self.all_gather(
+                        src as *const std::ffi::c_void,
+                        dst as *mut std::ffi::c_void,
+                        per_rank_words,
+                        DType::I32,
+                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                    )?;
+                }
+            }
+            ctx.stream.synchronize()?;
+            let recv_words = ctx.stream.clone_dtoh(&recv)?;
+            let mut out = Vec::with_capacity(per_rank_bytes * self.world_size);
+            for word in recv_words {
+                out.extend_from_slice(&word.to_ne_bytes());
+            }
+            if out.len() != per_rank_bytes * self.world_size {
+                bail!(
+                    "all_gather_bytes produced {} bytes, expected {}",
+                    out.len(),
+                    per_rank_bytes * self.world_size
+                );
+            }
+            Ok(out)
+        }
+
         fn map_dtype(dtype: DType) -> nccl::ncclDataType_t {
             match dtype {
                 DType::F16 => nccl::ncclDataType_t::Float16,
