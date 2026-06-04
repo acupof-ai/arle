@@ -6,7 +6,8 @@ Follow-on to `2026-06-04-dsv4-multigpu-token1-parity.md` (token-1 gate). R6 clea
 DSv4-Flash forward, 8×H20 sm_90a, TP=8/EP=8, canonical model
 `/data01/models/DeepSeek-V4-Flash` (NOT the base-43 workaround view — loaded directly
 via the MTP-tolerant `ensure_loadable`, commit `7a7bd70d`). `pending-remote` (no local
-CUDA); repo mirror of the verified pod fixes in progress.
+CUDA). Verified pod fixes mirrored to the repo in `08b74b35` (per-slot decode state +
+MoE shared-after-allreduce contract; typecheck + clippy clean on Mac).
 
 ## What Worked
 
