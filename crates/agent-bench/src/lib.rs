@@ -553,6 +553,29 @@ pub fn cuda_engine_from_model_path(
     Ok(engine)
 }
 
+/// Build a CUDA engine over the Qwen3.5/3.6 HYBRID forward (gated-delta linear +
+/// periodic full attention, BF16 MoE / dense MLP — `crate::qwen35`). Same
+/// `Engine<CudaExecutor, CudaKvPool>` type as the dense path; only the executor
+/// constructor differs. The Qwen3.5 executor owns its KV state internally, so
+/// the host `CudaKvPool` just paginates the logical token budget.
+#[cfg(feature = "cuda")]
+pub fn cuda_qwen35_engine_from_model_path(
+    model_path: impl AsRef<std::path::Path>,
+) -> Result<Engine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool>> {
+    let total_pages = 8192; // page_size 16 -> 131072 token capacity
+    let mut config = SchedulerConfig::for_slots(1);
+    config.max_prompt_tokens = 32_768;
+    config.max_total_tokens = 65_536;
+    let executor =
+        infer_cuda::CudaExecutor::from_qwen35_moe_safetensors(model_path, 1, total_pages)?;
+    let engine = Engine::with_config(
+        executor,
+        infer_cuda::CudaKvPool::new(1, total_pages, 16),
+        config,
+    );
+    Ok(engine)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +749,49 @@ mod tests {
         Ok(())
     }
 
+    /// CANONICAL Metal verification on the project's production model
+    /// (`mlx-community/Qwen3.6-35B-A3B-4bit`, MoE — per CLAUDE.md the unified
+    /// Metal target). Drives the rewrite `Engine<MetalExecutor, MetalKvPool>`
+    /// over a multi-turn agent workflow: confirms the rewrite Metal MoE forward
+    /// runs end-to-end + prefix reuse holds on the real MoE shape, and reports
+    /// tok/s. Run:
+    ///   cargo test --release -p agent-bench --no-default-features --features metal,no-cuda \
+    ///     bench_agent_workflow_metal_qwen36_canonical -- --ignored --nocapture
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "real Metal MoE e2e bench; needs --features metal + the ~19GB cached Qwen3.6-35B-A3B-4bit"]
+    fn bench_agent_workflow_metal_qwen36_canonical() -> Result<()> {
+        let model = "mlx-community/Qwen3.6-35B-A3B-4bit";
+        let (mut engine, ttft) = metal_engine_from_model_path(model)?;
+        let wf = AgentWorkflow::synthetic(256, 3, 32, 48);
+        let mut probe = PeakMemProbe::new();
+        let m = run_agent_workflow_with_probe(&mut engine, &ttft, &wf, &mut probe)?;
+        let tok_per_s = m.total_generated as f64 / m.total_wall.as_secs_f64();
+        eprintln!(
+            "[agent-workflow METAL Qwen3.6-35B-A3B-4bit] turns={} total_gen={} \
+             total_wall={:?} tok_per_s={:.1} os_impact={:?}",
+            wf.turns.len(),
+            m.total_generated,
+            m.total_wall,
+            tok_per_s,
+            m.os_impact
+        );
+        for t in &m.turns {
+            eprintln!(
+                "  turn {} prompt_len={} gen={} ttft_ticks={} wall={:?}",
+                t.turn, t.prompt_len, t.generated, t.ticks_to_first_token, t.wall
+            );
+        }
+        assert!(m.turns.len() >= 2);
+        assert!(
+            m.turns[1].ticks_to_first_token < m.turns[0].ticks_to_first_token,
+            "turn 2 should reuse turn 1's prefix: turn1={} turn2={}",
+            m.turns[0].ticks_to_first_token,
+            m.turns[1].ticks_to_first_token
+        );
+        Ok(())
+    }
+
     /// H20 greedy-parity harness for the clean CUDA BF16 Qwen3 forward.
     ///
     /// Raw token ids (no tokenizer): greedy decode is deterministic given the ids,
@@ -755,6 +821,50 @@ mod tests {
             "[cuda-parity NEW] model={model} prompt={prompt:?} gen={:?} finish={:?}",
             completed.generated_tokens, completed.finish
         );
+        assert!(
+            !completed.generated_tokens.is_empty(),
+            "expected at least one generated token"
+        );
+        Ok(())
+    }
+
+    /// Greedy-parity harness for the clean CUDA Qwen3.5/3.6 HYBRID BF16 forward
+    /// (gated-delta linear + periodic full attention). Same contract as
+    /// [`cuda_qwen3_greedy_parity`] but drives the `qwen35` executor path.
+    ///
+    /// Env: `QWEN35_PARITY_MODEL` (safetensors dir), `PARITY_MAX_NEW` (default
+    /// 16), `PARITY_PROMPT_IDS` (comma-separated u32; default below). Prints
+    /// `clean_tokens=[...]`; compare against the HF/legacy greedy reference on
+    /// the SAME ids + model (raw-id greedy decode is deterministic).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "real CUDA greedy parity; needs --features cuda + a BF16 Qwen3.5 safetensors model + GPU"]
+    fn cuda_qwen35_greedy_parity() -> Result<()> {
+        let model = std::env::var("QWEN35_PARITY_MODEL")
+            .map_err(|_| anyhow::anyhow!("set QWEN35_PARITY_MODEL to a Qwen3.5 safetensors dir"))?;
+        let max_new: usize = std::env::var("PARITY_MAX_NEW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let prompt: Vec<u32> = match std::env::var("PARITY_PROMPT_IDS") {
+            Ok(s) => s
+                .split(',')
+                .map(|t| t.trim().parse::<u32>())
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| anyhow::anyhow!("bad PARITY_PROMPT_IDS: {e}"))?,
+            Err(_) => vec![9707, 11, 1879, 358, 1079, 264, 6722, 13],
+        };
+        let mut engine = cuda_qwen35_engine_from_model_path(&model)?;
+        let handle = engine.submit_request(prompt.clone(), max_new);
+        engine.run_to_idle()?;
+        let completed = engine
+            .completed(handle)
+            .ok_or_else(|| anyhow::anyhow!("request did not complete"))?;
+        eprintln!(
+            "[qwen35-cuda-parity] model={model} prompt={prompt:?} finish={:?}",
+            completed.finish
+        );
+        eprintln!("clean_tokens={:?}", completed.generated_tokens);
         assert!(
             !completed.generated_tokens.is_empty(),
             "expected at least one generated token"
