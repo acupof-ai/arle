@@ -736,23 +736,21 @@ fn waiting_request_precedes(
     queued: &RequestState,
     bias: WaitingInsertBias,
 ) -> bool {
-    match incoming.priority.cmp(&queued.priority) {
+    // Admission order is a single lexicographic key: higher priority first, then
+    // more reusable KV (session-affinity, then immediate, then total reuse). On a
+    // full tie the bias decides whether `incoming` sorts before an equal `queued`.
+    let key = |r: &RequestState| {
+        (
+            r.priority,
+            r.waiting_hint.session_affinity_tokens,
+            r.waiting_hint.immediate_reuse_tokens,
+            r.waiting_hint.total_reuse_tokens,
+        )
+    };
+    match key(incoming).cmp(&key(queued)) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => match (
-            incoming.waiting_hint.session_affinity_tokens,
-            incoming.waiting_hint.immediate_reuse_tokens,
-            incoming.waiting_hint.total_reuse_tokens,
-        )
-            .cmp(&(
-                queued.waiting_hint.session_affinity_tokens,
-                queued.waiting_hint.immediate_reuse_tokens,
-                queued.waiting_hint.total_reuse_tokens,
-            )) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => matches!(bias, WaitingInsertBias::BeforeEqual),
-        },
+        std::cmp::Ordering::Equal => matches!(bias, WaitingInsertBias::BeforeEqual),
     }
 }
 
