@@ -179,6 +179,10 @@ pub(crate) struct Dsv4MoeLayer {
     /// Hash-routed layers only: host `tid2eid` table (`vocab_size * topk` i64),
     /// sliced per token to pick experts without the learned router.
     pub hash_tid2eid: Option<Vec<i64>>,
+    /// Hash-routed layers only: device `tid2eid` table used by the on-device
+    /// router. Kept alongside the host table so the existing host route remains
+    /// available as an A/B oracle.
+    pub hash_tid2eid_device: Option<CudaSlice<i64>>,
     pub routing_kind: DeepSeekV4MoeRoutingKind,
     /// Dense shared expert FP8 caches (always-on, n_shared_experts == 1).
     pub shared_w13: Dsv4Fp8DeepGemmWeightCache,
@@ -232,50 +236,104 @@ pub(crate) struct Dsv4SlotState {
 /// the final host-sync sample, Rust can drop/reuse those allocations while the
 /// stream still has in-flight work that reads them.
 pub(crate) struct Dsv4ForwardKeepalive {
+    active: bool,
     bf16: Vec<CudaSlice<half::bf16>>,
     f32: Vec<CudaSlice<f32>>,
     i32: Vec<CudaSlice<i32>>,
+    #[cfg(feature = "deepep")]
     i64: Vec<CudaSlice<i64>>,
+    u32: Vec<CudaSlice<u32>>,
     u8: Vec<CudaSlice<u8>>,
 }
 
 impl Dsv4ForwardKeepalive {
-    fn new() -> Self {
+    fn new(active: bool) -> Self {
         Self {
+            active,
             bf16: Vec::with_capacity(512),
             f32: Vec::with_capacity(256),
             i32: Vec::with_capacity(128),
+            #[cfg(feature = "deepep")]
             i64: Vec::with_capacity(32),
+            u32: Vec::with_capacity(16),
             u8: Vec::with_capacity(128),
         }
     }
 
     pub(crate) fn keep_hidden(&mut self, value: &HiddenStates) {
+        if !self.active {
+            return;
+        }
         self.bf16.push(value.data.clone());
     }
 
     pub(crate) fn keep_vec(&mut self, value: &DeviceVec) {
+        if !self.active {
+            return;
+        }
         self.bf16.push(value.data.clone());
     }
 
     pub(crate) fn keep_f32(&mut self, value: &CudaSlice<f32>) {
+        if !self.active {
+            return;
+        }
         self.f32.push(value.clone());
     }
 
     pub(crate) fn keep_i32(&mut self, value: &CudaSlice<i32>) {
+        if !self.active {
+            return;
+        }
         self.i32.push(value.clone());
     }
 
+    #[cfg(feature = "deepep")]
     pub(crate) fn keep_i64(&mut self, value: &CudaSlice<i64>) {
+        if !self.active {
+            return;
+        }
         self.i64.push(value.clone());
     }
 
     pub(crate) fn keep_u8(&mut self, value: &CudaSlice<u8>) {
+        if !self.active {
+            return;
+        }
         self.u8.push(value.clone());
     }
 
+    /// Keep small device-router buffers alive even during large prefill. The
+    /// decode keepalive is gated to avoid retaining every layer's full hidden
+    /// intermediates, but these router buffers are tiny and otherwise can be
+    /// freed while the async route/count/pack kernels still read them.
+    pub(crate) fn keep_route_hidden(&mut self, value: &HiddenStates) {
+        self.bf16.push(value.data.clone());
+    }
+
+    pub(crate) fn keep_route_f32(&mut self, value: &CudaSlice<f32>) {
+        self.f32.push(value.clone());
+    }
+
+    pub(crate) fn keep_route_i32(&mut self, value: &CudaSlice<i32>) {
+        self.i32.push(value.clone());
+    }
+
+    #[cfg(feature = "deepep")]
+    pub(crate) fn keep_route_i64(&mut self, value: &CudaSlice<i64>) {
+        self.i64.push(value.clone());
+    }
+
+    pub(crate) fn keep_route_u32(&mut self, value: &CudaSlice<u32>) {
+        self.u32.push(value.clone());
+    }
+
     fn len(&self) -> usize {
-        self.bf16.len() + self.f32.len() + self.i32.len() + self.i64.len() + self.u8.len()
+        let len =
+            self.bf16.len() + self.f32.len() + self.i32.len() + self.u32.len() + self.u8.len();
+        #[cfg(feature = "deepep")]
+        let len = len + self.i64.len();
+        len
     }
 }
 
@@ -452,7 +510,7 @@ impl Dsv4Model {
         let stream_dim = hidden_size * hc_mult;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
-        let mut keepalive = Dsv4ForwardKeepalive::new();
+        let mut keepalive = Dsv4ForwardKeepalive::new(seq_len == 1);
 
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids_host)?;
