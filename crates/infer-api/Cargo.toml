@@ -19,6 +19,7 @@ infer-plan = { path = "../infer-plan", features = ["serde"] }
 infer-seam = { path = "../infer-seam" }
 infer-server = { path = "../infer-server" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { version = "1", features = ["sync", "rt"] }
 
 infer-metal = { path = "../infer-metal", default-features = false, optional = true }
