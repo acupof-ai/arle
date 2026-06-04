@@ -41,6 +41,10 @@ mod loader;
 mod model;
 #[cfg(feature = "cuda")]
 mod ops;
+// Qwen3.5 / Qwen3.6 HYBRID model (gated-delta linear attention + periodic full
+// attention, BF16 MoE). cuda-gated: device weight matrices + recurrent state.
+#[cfg(feature = "cuda")]
+mod qwen35;
 
 // Not cuda-gated: env→TpConfig resolution is CPU-testable; only the NCCL comm
 // variant is feature-gated.
