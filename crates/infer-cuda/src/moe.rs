@@ -919,7 +919,8 @@ mod dsv4_gpu {
         let mut decode_scratch = decode_scratch;
         let (route_indices, route_weights) = {
             let _nvtx = crate::nvtx::range("dsv4/moe_route");
-            let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
+            // SAFETY: router gemm writes the full logits buffer.
+            let mut logits = unsafe { HiddenStates::uninit(ctx, cfg.num_experts, num_tokens)? };
             gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
             if use_gpu_router() {
                 let routing = dsv4_route_device(
@@ -1475,10 +1476,11 @@ mod dsv4_gpu {
         ctx: &DeviceContext,
         layer: &Dsv4MoeLayer,
         hidden: &HiddenStates,
+        out: &mut HiddenStates,
         swiglu_limit: f32,
         decode_scratch: Option<&mut Dsv4MoeDecodeScratch>,
         keepalive: &mut Dsv4ForwardKeepalive,
-    ) -> Result<HiddenStates> {
+    ) -> Result<()> {
         if let Some(scratch) = decode_scratch {
             ensure!(
                 hidden.seq_len == 1
@@ -1495,11 +1497,27 @@ mod dsv4_gpu {
                 ctx,
                 layer,
                 hidden,
+                out,
                 swiglu_limit,
                 &mut scratch.shared,
             );
         }
-        dsv4_shared_expert(ctx, layer, hidden, swiglu_limit, keepalive)
+        let shared = dsv4_shared_expert(ctx, layer, hidden, swiglu_limit, keepalive)?;
+        ensure!(
+            shared.hidden_dim == out.hidden_dim && shared.seq_len >= out.seq_len,
+            "DSv4 shared expert shape {}x{} != output {}x{}",
+            shared.hidden_dim,
+            shared.seq_len,
+            out.hidden_dim,
+            out.seq_len
+        );
+        let elems = out.hidden_dim * out.seq_len;
+        let src = shared.data.slice(0..elems);
+        ctx.stream
+            .memcpy_dtod(&src, &mut out.data)
+            .map_err(|e| anyhow::anyhow!("DSv4 shared expert output D2D failed: {e}"))?;
+        keepalive.keep_hidden(&shared);
+        Ok(())
     }
 
     /// Dispatch DSv4 host routing for one layer: bias-routed → learned router +
@@ -1857,9 +1875,10 @@ mod dsv4_gpu {
         ctx: &DeviceContext,
         layer: &Dsv4MoeLayer,
         hidden: &HiddenStates,
+        out: &mut HiddenStates,
         swiglu_limit: f32,
         scratch: &mut Dsv4SharedDecodeScratch,
-    ) -> Result<HiddenStates> {
+    ) -> Result<()> {
         let hidden_dim = hidden.hidden_dim;
         let num_tokens = hidden.seq_len;
         let shared_inter = layer.shared_w2.cols;
@@ -1868,6 +1887,14 @@ mod dsv4_gpu {
                 && scratch.out.hidden_dim == hidden_dim
                 && scratch.w13_out.hidden_dim == 2 * shared_inter,
             "DSv4 pooled shared scratch mismatch: tokens={num_tokens} H={hidden_dim} I={shared_inter}"
+        );
+        ensure!(
+            out.hidden_dim == hidden_dim && out.seq_len == num_tokens,
+            "DSv4 pooled shared out shape {}x{} != hidden {}x{}",
+            out.hidden_dim,
+            out.seq_len,
+            hidden_dim,
+            num_tokens
         );
         let p_hidden = cache_ptr(&hidden.data, ctx);
         let p_in_fp8 = cache_ptr(&scratch.input_fp8, ctx);
@@ -1939,11 +1966,12 @@ mod dsv4_gpu {
             )?;
         }
 
-        Ok(HiddenStates {
-            data: scratch.out.data.clone(),
-            hidden_dim,
-            seq_len: num_tokens,
-        })
+        let elems = hidden_dim * num_tokens;
+        let src = scratch.out.data.slice(0..elems);
+        ctx.stream
+            .memcpy_dtod(&src, &mut out.data)
+            .map_err(|e| anyhow::anyhow!("DSv4 pooled shared output D2D failed: {e}"))?;
+        Ok(())
     }
 
     /// DSv4 dense shared expert via a single-group FP8 DeepGEMM pass: w13 fused
