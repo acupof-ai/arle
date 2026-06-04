@@ -175,3 +175,33 @@ phantom 卡点 — always cross-check with a sync-before probe before chasing it
 
 Artifacts (pod): `dsv4_scratch_pool_clean_profile_{api,nvtx,gpu}.txt`,
 `dsv4_lmhead_presync_profile_{api,nvtx,gpu}.txt`.
+
+## 8. Prefill profile (#28) — host-route already gone, now allreduce-wait + kernel floor (2026-06-05)
+
+The decode work transferred: **DSv4 prefill 512 dropped 14.66s → 1.204s** (the
+early "93% GPU idle from host-route" is gone — `moe_route` is now 6–11 ms total,
+not the bottleneck). Profiled under `ARLE_DSV4_GPU_ROUTER=1` + NVTX, no-nsys wall
+(nsys perturbs 512 heavily, used only for attribution):
+
+| shape | wall (no-nsys) | rank0 GPU kernels | result |
+|---|---|---|---|
+| 512 | 1.204 s | 0.893 s | clean `[294]` |
+| 2048 | 10.917 s | 3.974 s | clean `[671]` |
+
+Per-stage NVTX (512 / 2048): MLA attn 211 / 846 ms · MoE route 5.9 / 10.8 ms
+(host-route non-issue) · DeepGEMM grouped 843 / 2199 ms (mostly pack/quant/unpad
+wrapper, not WGMMA) · combine 47 / 193 ms · **attn+moe allreduce 607 / 4963 ms**
+(2048 dominated by a single ~4.96 s *first* attn-allreduce wait) · shared+HC
+539 / 548 ms · lm_head_sample 311 / 1367 ms (end-sync framing trap, not LM head).
+
+**Kernel-floor top (512 / 2048), shared with decode:** FP8 block-scaled GEMV
+365 / 1464 ms (#1) · hybrid attention 189 / 1190 ms (#2) · DeepGEMM unpad
+106 / 425 ms · DeepGEMM pack/quant 82.5 / 330 ms · compressor update 55 / 228 ms.
+
+**Verdict + next:** the 2048 prefill bottleneck is (a) a ~4.96 s first
+attn_allreduce wait — **pending-proof**: per-rank arrival instrumentation must
+show whether it's true cross-rank skew, a one-time NCCL-warmup cost, or a
+profiling artifact (don't chase until proven — the 4th potential framing trap);
+and (b) the real kernel floor in **FP8 block-scaled GEMV + hybrid attention** —
+the *same* kernels that floor decode, so per-kernel work there is a prefill+decode
+double-win (align SGLang FlashMLA). Host routing is no longer a prefill lever.
