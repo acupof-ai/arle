@@ -154,19 +154,23 @@ pub(crate) struct Dsv4Attention {
     pub indexer: Option<Dsv4Indexer>,
 }
 
-/// One DSv4 routed-MoE block: per-(local)-expert FP8 DeepGEMM caches for w1/w3
-/// (gate/up) and w2 (down), the router gate, and the dense shared expert. Only
-/// this rank's `ExpertSplit` slice is resident.
+/// One DSv4 routed-MoE block: prebuilt group-major FP8 DeepGEMM caches for
+/// w1/w3 (gate/up) and w2 (down), the router gate, and the dense shared expert.
+/// Only this rank's `ExpertSplit` slice is resident.
 ///
 /// Routing kind is per-layer: bias-routed layers carry `gate_bias` (the
 /// `noaux_tc` correction); hash-routed layers (`layer_idx < num_hash_layers`)
 /// carry `hash_tid2eid` (a host `[vocab_size * topk]` table mapping token id →
 /// experts directly) and ignore the learned router gate. Exactly one is `Some`.
 pub(crate) struct Dsv4MoeLayer {
-    /// Per-local-expert fused gate+up FP8 cache (w1 over w3, row-stacked) and the
-    /// down cache (w2). The masked-grouped GEMM reads these.
-    pub w13: Vec<Dsv4Fp8DeepGemmWeightCache>,
-    pub w2: Vec<Dsv4Fp8DeepGemmWeightCache>,
+    /// Contiguous per-rank group-major fused gate+up FP8 cache (w1 over w3,
+    /// row-stacked) and down cache (w2). Built once by the loader; the masked
+    /// grouped GEMM reads these directly every step.
+    pub w13_grouped: crate::moe::GroupedCache,
+    pub w2_grouped: crate::moe::GroupedCache,
+    pub num_groups: usize,
+    pub hidden_dim: usize,
+    pub intermediate: usize,
     /// Router gate `[n_routed_experts, hidden]` (BF16 — the small router GEMM is
     /// not FP8). Read by bias-routed layers; hash layers still load it (harmless).
     pub gate: DeviceMatrix,
@@ -312,7 +316,7 @@ impl Dsv4Model {
                 .attention_layer_plan(layer_idx)
                 .ok_or_else(|| anyhow!("DSv4 layer {layer_idx} has no attention plan"))?;
             let lnames = config.layer_tensor_names(layer_idx);
-            let attention = loader.load_dsv4_attention(&ctx, &lnames.attn)?;
+            let attention = loader.load_dsv4_attention(&ctx, &config, &lnames.attn, &tp_cfg)?;
             let moe = loader.load_dsv4_moe_layer(
                 &ctx,
                 &lnames.ffn,
