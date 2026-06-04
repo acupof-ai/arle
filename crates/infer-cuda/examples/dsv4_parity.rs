@@ -73,8 +73,14 @@ mod real {
     use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
     use infer_seam::{BackendExecutor, KvPool, PollResult};
 
-    /// Default prompt: "The capital of France is" (Qwen tokenizer ids).
-    const DEFAULT_PROMPT_IDS: &str = "785,6722,315,9625,374";
+    /// Default prompt: "The capital of France is" in the **DeepSeek-V4** tokenizer
+    /// (vocab 128000). These ids match the captured oracle, whose tokens 3-7 are
+    /// exactly [671,6102,294,8760,344] = the model echoing the prompt back. The
+    /// model's greedy continuation is [11111,…] = " Paris.\nThe capital of France
+    /// is Paris.\n…". (The prior default 785,6722,315,9625,374 were *Qwen* ids —
+    /// they decode to garbage " ar造成 thATE v" under DeepSeek, so the rewrite was
+    /// being scored on a different prompt than the legacy oracle.)
+    const DEFAULT_PROMPT_IDS: &str = "671,6102,294,8760,344";
     const DEFAULT_MAX_NEW: usize = 16;
 
     pub(super) fn run() -> Result<()> {
