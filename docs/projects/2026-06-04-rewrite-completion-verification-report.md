@@ -52,7 +52,7 @@ no circular blocker for cutover).
 | MoE routing math | host | **verified (CPU)** | infer-moe 17 tests |
 | MoE wrappers + expert load + config | CUDA | **foundation verified** | `6d4a3254`; cuda,no-cuda typecheck clean |
 | BF16 MoE forward (SparseMoeBlock) | CUDA | **wired (Mac-verified)** | `96f65bdc` moe.rs (route→pack→grouped-gemm→silu_mul→scatter→combine→shared); GPU-verify gated on a compatible BF16 ungated/full-attn HD128-kv8 MoE (none cached) |
-| MoE/EP single-GPU + EP/DeepEP/DeepGEMM | CUDA | **port done; multi-GPU verify in flight** | forward ported (`9def46fb`); 8-rank load OK on 8×H20; blocker = DeepGEMM native bridge multi-rank (§8) |
+| DSv4 forward TP=8/EP=8 token-1 parity | CUDA | **token-1 VERIFIED** | rank-0 prefill argmax = 11111 = oracle on 8×H20 (correct DeepSeek prompt); full stack/all layer types. Full-seq + DeepGEMM backend open (§8) — `wins/2026-06-04-dsv4-multigpu-token1-parity.md` |
 | W4 grouped GEMM (Qwen3.6-4bit) | CUDA | **pending** | 2 swap points in moe.rs flagged; Qwen3.6 canonical is 4-bit |
 | CUDA Graph capture/replay | CUDA | **VERIFIED** | H20 eager==replay==HF gold (16/16); nsys: cuGraphLaunch×16 + capture×2 (impl `20274cdb`, `INFER_CUDA_DECODE_GRAPH=1`) |
 | CUDA toolchain build (sm_70) | V100 | **verified (build/CPU)** | V100 node: GPU-free suite 64/0; native CUDA-C compiles sm_70 |
@@ -183,8 +183,10 @@ scored on a *different* prompt than the legacy oracle and emitted `'.'` (token 1
 a plausible garbage continuation — vs the oracle's `' Paris'` (11111). Fixed
 (`a882823b`): default now the correct DeepSeek ids `671,6102,294,8760,344` (verified
 — they appear at oracle positions 3-7). Reinforces the distilled lesson
-*garbage output = config-suspect first*. **Valid greedy-parity re-run (correct
-prompt) is the open gate.**
+*garbage output = config-suspect first*. **Re-run on the correct prompt PASSES**:
+rank-0 prefill argmax = 11111 = oracle, TP=8/EP=8, all layer types (the native
+bypass forward was never broken). Full 16-token sequence (incremental decode) +
+multi-prompt remain open. See `errors/2026-06-04-dsv4-parity-prompt-id-confounder.md`.
 
 **Separate, still-open infra blocker:** the native DeepGEMM bridge fails
 `cuLibraryGetKernelCount → CUDA_ERROR_UNKNOWN` in multi-rank (single-process legacy
