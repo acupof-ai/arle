@@ -26,13 +26,33 @@ const DSV4_DEFAULT_MAX_SEQ_LEN: usize = 4096;
 /// pages beyond it fall back to eager rather than replay a stale graph.
 const DECODE_GRAPH_MAX_SEQ_LEN: usize = 32_768;
 
-/// Captured B=1 decode graph enabled? Opt-in via `INFER_CUDA_DECODE_GRAPH=1`;
-/// the eager path (correctness floor) is the default.
+/// Decode-graph default when `INFER_CUDA_DECODE_GRAPH` is unset. Set once at load
+/// from the `enable_cuda_graph` load flag (CLI `--cuda-graph`/`--no-cuda-graph`,
+/// default on) via [`set_decode_graph_default`]; the env var, when present, always
+/// overrides it. Single-GPU Qwen dense only — `warmup` still hard-disables the
+/// graph under TP (NCCL not graph-capturable) and MoE (host routing per step).
+static DECODE_GRAPH_DEFAULT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Set the load-time decode-graph default (honored only when the env override is
+/// unset). Wired from `LoadedInferenceEngine::load(.., enable_cuda_graph)` so the
+/// CLI `--cuda-graph`/`--no-cuda-graph` flag actually controls the graph instead
+/// of being discarded — single set at load, read once at `warmup`.
+pub fn set_decode_graph_default(enabled: bool) {
+    DECODE_GRAPH_DEFAULT_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Captured B=1 decode graph enabled? `INFER_CUDA_DECODE_GRAPH` is an explicit
+/// override (`1`/`true`/`on` → on, `0`/`false`/`off` → off); when unset, falls
+/// back to the load-time default ([`set_decode_graph_default`], CLI-driven,
+/// default on). The eager path stays the correctness floor; `warmup` still gates
+/// TP and MoE off regardless of this.
 fn decode_graph_enabled() -> bool {
-    matches!(
-        std::env::var("INFER_CUDA_DECODE_GRAPH").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    match std::env::var("INFER_CUDA_DECODE_GRAPH").as_deref() {
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON") => true,
+        Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF") => false,
+        _ => DECODE_GRAPH_DEFAULT_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 /// The real cuda-kernels executor. Dense Qwen3 runs the paged continuous-batching
