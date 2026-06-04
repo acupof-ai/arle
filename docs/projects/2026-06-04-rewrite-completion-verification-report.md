@@ -52,7 +52,7 @@ no circular blocker for cutover).
 | MoE routing math | host | **verified (CPU)** | infer-moe 17 tests |
 | MoE wrappers + expert load + config | CUDA | **foundation verified** | `6d4a3254`; cuda,no-cuda typecheck clean |
 | BF16 MoE forward (SparseMoeBlock) | CUDA | **wired (Mac-verified)** | `96f65bdc` moe.rs (route→pack→grouped-gemm→silu_mul→scatter→combine→shared); GPU-verify gated on a compatible BF16 ungated/full-attn HD128-kv8 MoE (none cached) |
-| DSv4 forward TP=8/EP=8 token-1 parity | CUDA | **token-1 VERIFIED** | rank-0 prefill argmax = 11111 = oracle on 8×H20 (correct DeepSeek prompt); full stack/all layer types. Full-seq + DeepGEMM backend open (§8) — `wins/2026-06-04-dsv4-multigpu-token1-parity.md` |
+| DSv4 forward TP=8/EP=8 full-16-token parity | CUDA | **VERIFIED (native+bf16)** | full `clean_tokens == oracle` on 8×H20, canonical model, all 16 tokens (per-slot decode state + MoE shared-after-allreduce contract). Multi-prompt + DeepEP-serving + DeepGEMM-backend + FP8-KV-decode open (§8) — `wins/2026-06-04-dsv4-multigpu-fullseq-parity.md` |
 | W4 grouped GEMM (Qwen3.6-4bit) | CUDA | **pending** | 2 swap points in moe.rs flagged; Qwen3.6 canonical is 4-bit |
 | CUDA Graph capture/replay | CUDA | **VERIFIED** | H20 eager==replay==HF gold (16/16); nsys: cuGraphLaunch×16 + capture×2 (impl `20274cdb`, `INFER_CUDA_DECODE_GRAPH=1`) |
 | CUDA toolchain build (sm_70) | V100 | **verified (build/CPU)** | V100 node: GPU-free suite 64/0; native CUDA-C compiles sm_70 |
@@ -185,8 +185,17 @@ a plausible garbage continuation — vs the oracle's `' Paris'` (11111). Fixed
 — they appear at oracle positions 3-7). Reinforces the distilled lesson
 *garbage output = config-suspect first*. **Re-run on the correct prompt PASSES**:
 rank-0 prefill argmax = 11111 = oracle, TP=8/EP=8, all layer types (the native
-bypass forward was never broken). Full 16-token sequence (incremental decode) +
-multi-prompt remain open. See `errors/2026-06-04-dsv4-parity-prompt-id-confounder.md`.
+bypass forward was never broken). See `errors/2026-06-04-dsv4-parity-prompt-id-confounder.md`.
+
+**Full 16-token canonical parity now PASSES** (`wins/2026-06-04-dsv4-multigpu-fullseq-parity.md`):
+`clean_tokens == oracle` end-to-end after fixing (a) per-slot decode state (SW
+ring + compressor buffers retained across `start_pos>0`, no bail) and (b) the
+MoE shared-expert contract (shared added **after** the routed all-reduce, not
+folded in before where the replicated shared weights got summed 8×). Verified on
+the **native** expert backend + **bf16** KV path. Open: multi-prompt, DeepEP
+*serving* (today fail-closed → scalar), the DeepGEMM production expert backend
+(`cuLibraryGetKernelCount` multi-rank), and FP8-KV decode (`alloc_fp8_arena`
+still `bail!`-gated). Repo mirror of the verified pod fixes in progress.
 
 **Separate, still-open infra blocker:** the native DeepGEMM bridge fails
 `cuLibraryGetKernelCount → CUDA_ERROR_UNKNOWN` in multi-rank (single-process legacy
