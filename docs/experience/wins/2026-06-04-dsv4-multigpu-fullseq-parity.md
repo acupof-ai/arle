@@ -39,6 +39,20 @@ Two bugs were fixed to get here, both with direct evidence:
    shared-after-all-reduce contract took canonical token-1 from a regressed 223 back to
    11111 (clean argmax, margin 2.25), then the full 16 to oracle.
 
+## Update (multi-prompt breadth — same day)
+
+The single-prompt pass did **not** generalize. Gate-1 breadth (native+bf16, 3 distinct
+prompts vs re-captured legacy oracles): "pancakes" MATCH 16/16; "largest planet" MISMATCH
+at decode step 4 (270 vs 260); "hash table" MISMATCH at step 3 (396 vs 778) — **1/3 clean**.
+Prime suspect is a **precision confound**, not necessarily a forward bug: the rewrite runs
+the **bf16-KV** correctness path while the legacy oracle recipe uses `--kv-cache-dtype fp8`,
+so tight-margin decode steps flip under bf16-vs-FP8. Isolation in flight: (1) logit margin
+at first divergence, (2) legacy-**bf16** vs rewrite-bf16 same-precision A/B. If legacy-bf16
+== rewrite-bf16, the per-slot decode state is correct and the real gate is FP8-KV decode
+(`alloc_fp8_arena`) vs the FP8 oracle (ckl: "fp8 验证好就行"); if not, a per-slot
+decode-state bug. **This entry's PASS is scoped to one prompt; full DSv4 correctness is
+NOT yet established.**
+
 ## Rule
 
 Full-sequence (not just token-1) greedy parity on the canonical model is the real DSv4

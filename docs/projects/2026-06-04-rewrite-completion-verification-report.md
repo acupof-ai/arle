@@ -52,7 +52,7 @@ no circular blocker for cutover).
 | MoE routing math | host | **verified (CPU)** | infer-moe 17 tests |
 | MoE wrappers + expert load + config | CUDA | **foundation verified** | `6d4a3254`; cuda,no-cuda typecheck clean |
 | BF16 MoE forward (SparseMoeBlock) | CUDA | **wired (Mac-verified)** | `96f65bdc` moe.rs (route→pack→grouped-gemm→silu_mul→scatter→combine→shared); GPU-verify gated on a compatible BF16 ungated/full-attn HD128-kv8 MoE (none cached) |
-| DSv4 forward TP=8/EP=8 full-16-token parity | CUDA | **VERIFIED (native+bf16)** | full `clean_tokens == oracle` on 8×H20, canonical model, all 16 tokens (per-slot decode state + MoE shared-after-allreduce contract). Multi-prompt + DeepEP-serving + DeepGEMM-backend + FP8-KV-decode open (§8) — `wins/2026-06-04-dsv4-multigpu-fullseq-parity.md` |
+| DSv4 forward TP=8/EP=8 full-16-token parity | CUDA | **partial — 1/3 prompts** | one prompt full `clean_tokens == oracle` (per-slot state + MoE contract, mirrored `08b74b35`); but 2/3 multi-prompt diverge at decode step 3-4 — likely **bf16-vs-FP8 precision** (rewrite bf16 vs FP8 oracle), isolation in flight (§8). Not yet full DSv4 correctness — `wins/2026-06-04-dsv4-multigpu-fullseq-parity.md` |
 | W4 grouped GEMM (Qwen3.6-4bit) | CUDA | **pending** | 2 swap points in moe.rs flagged; Qwen3.6 canonical is 4-bit |
 | CUDA Graph capture/replay | CUDA | **VERIFIED** | H20 eager==replay==HF gold (16/16); nsys: cuGraphLaunch×16 + capture×2 (impl `20274cdb`, `INFER_CUDA_DECODE_GRAPH=1`) |
 | CUDA toolchain build (sm_70) | V100 | **verified (build/CPU)** | V100 node: GPU-free suite 64/0; native CUDA-C compiles sm_70 |
@@ -192,10 +192,18 @@ bypass forward was never broken). See `errors/2026-06-04-dsv4-parity-prompt-id-c
 ring + compressor buffers retained across `start_pos>0`, no bail) and (b) the
 MoE shared-expert contract (shared added **after** the routed all-reduce, not
 folded in before where the replicated shared weights got summed 8×). Verified on
-the **native** expert backend + **bf16** KV path. Open: multi-prompt, DeepEP
-*serving* (today fail-closed → scalar), the DeepGEMM production expert backend
-(`cuLibraryGetKernelCount` multi-rank), and FP8-KV decode (`alloc_fp8_arena`
-still `bail!`-gated). Repo mirror of the verified pod fixes in progress.
+the **native** expert backend + **bf16** KV path; mirrored to repo `08b74b35`.
+
+**Multi-prompt breadth corrects the scope:** of 3 distinct prompts, only 1 matches
+16/16; "largest planet" diverges at decode step 4, "hash table" at step 3. The
+rewrite runs **bf16-KV** but the legacy oracle was captured with `--kv-cache-dtype
+fp8`, so the leading hypothesis is a **bf16-vs-FP8 precision** flip on tight-margin
+steps, not a forward bug — but a real per-slot decode-state bug would equally
+corrupt FP8, so the isolation (logit margin at first divergence + legacy-bf16 vs
+rewrite-bf16 same-precision A/B) gates the verdict. **DSv4 full correctness is not
+yet established.** Still open: DeepEP *serving* (fail-closed → scalar), the
+DeepGEMM production backend (`cuLibraryGetKernelCount` multi-rank), FP8-KV decode
+(`alloc_fp8_arena` `bail!`-gated), TP=8 Qwen.
 
 **Separate, still-open infra blocker:** the native DeepGEMM bridge fails
 `cuLibraryGetKernelCount → CUDA_ERROR_UNKNOWN` in multi-rank (single-process legacy
