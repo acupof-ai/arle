@@ -31,6 +31,8 @@ cudarc = { version = "0.19", features = [
 memmap2 = { version = "0.9", optional = true }
 # HuggingFace Hub: auto-download model weights + tokenizer by model ID
 hf-hub = { version = "0.5", features = ["tokio"] }
+# hf_hub + logging modules relocated here; re-exported from lib.rs during cutover.
+infer-util = { path = "../crates/infer-util" }
 # MLX Metal backend (Apple Silicon)
 # mlx-sys: direct MLX C API bindings (bindgen). No mlx-rs wrapper.
 mlx-sys = { path = "../crates/mlx-sys", optional = true }

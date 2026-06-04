@@ -18,10 +18,13 @@ pub mod distributed;
 pub mod error;
 pub mod events;
 pub mod gguf;
-pub mod hf_hub;
+// Relocated to the `infer-util` leaf crate; re-exported so this crate's internal
+// callers (and any external `infer::hf_hub` users) keep compiling during the
+// cutover. Deleted together with this crate once consumers point at infer-util.
+pub use infer_util::hf_hub;
 pub mod http_server;
 pub mod kv_tier;
-pub mod logging;
+pub use infer_util::logging;
 pub mod metrics;
 pub mod model_arch;
 pub mod model_registry;
