@@ -199,9 +199,19 @@ wrapper, not WGMMA) · combine 47 / 193 ms · **attn+moe allreduce 607 / 4963 ms
 106 / 425 ms · DeepGEMM pack/quant 82.5 / 330 ms · compressor update 55 / 228 ms.
 
 **Verdict + next:** the 2048 prefill bottleneck is (a) a ~4.96 s first
-attn_allreduce wait — **pending-proof**: per-rank arrival instrumentation must
-show whether it's true cross-rank skew, a one-time NCCL-warmup cost, or a
-profiling artifact (don't chase until proven — the 4th potential framing trap);
-and (b) the real kernel floor in **FP8 block-scaled GEMV + hybrid attention** —
-the *same* kernels that floor decode, so per-kernel work there is a prefill+decode
-double-win (align SGLang FlashMLA). Host routing is no longer a prefill lever.
+attn_allreduce wait — **PROVEN a warmup / rank-start artifact, not a 卡点**
+(per-rank timing: layer0 arrival skew 1871 ms from staggered model-load entry, but
+each rank's own layer0 MLA is balanced 89.7–97.0 ms; **layers 1–42 allreduce max
+0.01–0.09 ms, median 0.015 ms** — essentially zero). The whole 4.96 s is the first
+collective waiting on the slowest-loaded rank; remove it from cold TTFT with a
+warmup allreduce / rank barrier at init, *not* attention/allreduce overlap.
+And (b) the real steady-state kernel floor in **FP8 block-scaled GEMV + hybrid
+attention** — the *same* kernels that floor decode, so per-kernel work there is a
+prefill+decode double-win (align SGLang FlashMLA). Host routing is no longer a
+prefill lever.
+
+**DSv4 perf arc — structural scope complete.** Decode 6×, prefill 512 12×, both
+now bound by the shared FP8-GEMV + hybrid-attention kernel floor. The only
+remaining perf axis is deep per-kernel optimization of those two (align SGLang,
+H20-capped, diminishing) plus a cheap cold-TTFT warmup fix; everything
+scheduling / host / buffer / launch / routing has been eliminated and measured.
