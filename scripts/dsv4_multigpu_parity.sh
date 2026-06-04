@@ -2,9 +2,9 @@
 # DSv4-Flash TP=8 / EP=8 greedy-parity launcher (pod-side, 8×H20 / sm_90a).
 #
 # Drives the R6 clean-CUDA `dsv4_parity` example across 8 GPUs: rank 0 mints the
-# NCCL unique_id, all 8 ranks join the same NCCL group and run the identical
-# single-row DSv4 forward, and rank 0's `clean_tokens` line is compared to the
-# greedy oracle.
+# NCCL unique_id in-process and shares it via a file rendezvous, all 8 ranks join
+# the same NCCL group and run the identical single-row DSv4 forward, and rank 0's
+# `clean_tokens` line is compared to the greedy oracle.
 #
 # ── What this verifies TODAY ──────────────────────────────────────────────────
 #   The FIRST generated token (the full-prefix prefill argmax at start_pos=0) on
@@ -28,7 +28,7 @@
 #         --features cuda,nccl,deepep --example dsv4_parity
 #
 #   The example binary lands at:  target/release/examples/dsv4_parity
-#   (--gen-nccl-id mode needs the `nccl` feature, already in the line above.)
+#   (the NCCL file-rendezvous needs the `nccl` feature, already in the line above.)
 #
 # ── Run ────────────────────────────────────────────────────────────────────────
 #     INFER_DSV4_MODEL_PATH=/path/to/dsv4-fp8-safetensors \
@@ -64,17 +64,15 @@ WORK="$(mktemp -d -t dsv4-parity.XXXXXX)"
 ID_FILE="$WORK/nccl_id.hex"
 trap 'rm -rf "$WORK"' EXIT
 
-# ── Step 1: rank 0 mints the NCCL unique_id, share via a file. ────────────────
-echo "[launcher] generating NCCL unique_id (rank 0) ..." >&2
-INFER_CUDA_DEVICE=0 "$BIN" --gen-nccl-id >"$ID_FILE"
-NCCL_ID="$(tr -d '[:space:]' <"$ID_FILE")"
-[[ ${#NCCL_ID} -eq 256 ]] || {
-    echo "ERROR: NCCL unique_id is ${#NCCL_ID} hex chars, expected 256" >&2
-    exit 1
-}
-echo "[launcher] NCCL unique_id ready (256 hex chars)." >&2
+# ── Spawn WORLD_SIZE ranks, one per GPU, all on the same NCCL group. ──────────
+# NCCL bootstrap is a FILE RENDEZVOUS, not a throwaway mint: `ncclGetUniqueId`
+# embeds the calling process's bootstrap listener socket, so a separate
+# "mint-and-exit" helper leaves a dead socket (Connection refused at
+# ncclCommInitRank). All ranks share INFER_NCCL_ID_FILE; the example's rank 0
+# mints the id in-process (staying alive), writes it atomically, and the other
+# ranks block on the file then read it. See examples/dsv4_parity.rs.
+echo "[launcher] NCCL file-rendezvous at $ID_FILE (rank 0 mints in-process)." >&2
 
-# ── Step 2: spawn WORLD_SIZE ranks, one per GPU, all on the same NCCL group. ──
 declare -a PIDS
 declare -a LOGS
 for r in $(seq 0 $((WORLD_SIZE - 1))); do
@@ -82,13 +80,13 @@ for r in $(seq 0 $((WORLD_SIZE - 1))); do
     LOGS[r]="$LOG"
     # INFER_CUDA_DEVICE binds this rank's GPU; INFER_CUDA_DEVICES gives the world
     # size (8 ordinals → TP=8); INFER_TP_RANK is this rank's index;
-    # INFER_NCCL_UNIQUE_ID is the shared rendezvous handle.
+    # INFER_NCCL_ID_FILE is the shared rendezvous path.
     CUDA_VISIBLE_DEVICES="$r" \
     INFER_CUDA_DEVICE="$r" \
     INFER_CUDA_DEVICES="$DEVICES" \
     INFER_TP_SIZE="$WORLD_SIZE" \
     INFER_TP_RANK="$r" \
-    INFER_NCCL_UNIQUE_ID="$NCCL_ID" \
+    INFER_NCCL_ID_FILE="$ID_FILE" \
         "$BIN" >"$LOG" 2>&1 &
     PIDS[r]=$!
     echo "[launcher] spawned rank $r (pid ${PIDS[r]}, gpu $r)" >&2
