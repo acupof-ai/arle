@@ -19,25 +19,34 @@ use crate::{config, mlx, model_source, qwen35, wired_limit};
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
 
-/// Cross-step decode pipelining (env-gated, default OFF).
+/// Cross-step decode pipelining (env-gated, default ON since the c>=2 fall-safe
+/// validation — `wins/2026-06-04-metal-decode-pipeline-c2-safe-default-on.md`).
 ///
 /// HEAD decode is strictly submit(N) → poll(N) blocks on `eval` → apply(N) →
 /// submit(N+1): the GPU idles for the host gap between poll(N)'s eval finishing
 /// and submit(N+1) kicking `step_session` again (apply_output + admission +
-/// plan-N+1 build + a fresh `begin_session`). With the flag set the decode
+/// plan-N+1 build + a fresh `begin_session`). With the pipeline on the decode
 /// session is held open across steps and `submit_decode` eagerly issues the
 /// NEXT greedy step's `step_session` (async) inside the current submit, so step
 /// N+1's GPU forward overlaps step N's host token materialization — the proven
 /// legacy `pending_sampled` shape, kept one step deep. Single-slot greedy only;
-/// any other plan shape drains and falls back to the HEAD path.
+/// a non-greedy or recycled-slot single-row decode drains and takes the cold
+/// (HEAD) path via the `pending_matches_live_slot` guard.
+///
+/// c>=2 safety: the rewrite Metal executor accepts exactly one row per plan
+/// (`submit` guard), so a concurrent (multi-row) plan errors loud at that guard
+/// BEFORE any pipeline logic — identical error + bit-identical (empty) output
+/// with the pipeline on or off, and the fast path provably never fires
+/// concurrently. The default-on flip therefore changes only the c=1 greedy path.
+/// Opt OUT with `INFER_METAL_PIPELINE=0`.
 #[cfg(feature = "metal")]
 fn pipeline_decode_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let on = std::env::var("INFER_METAL_PIPELINE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
         eprintln!("[infer-metal] decode pipeline (INFER_METAL_PIPELINE) = {on}");
         on
     })
@@ -50,6 +59,23 @@ fn probe_pipeline_fast_path() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| eprintln!("[infer-metal] pipeline fast path LIVE (overlapped decode)"));
+    PIPELINE_FAST_PATH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Monotonic count of pipeline fast-path firings (process-wide). A test or bench
+/// reads this to prove which decode path each step took — at c>=2 it must stay
+/// pinned at whatever it was before the concurrent phase, since the planner's
+/// multi-row plans never reach the single-row pipeline path. Harmless in
+/// production: a single relaxed counter on an already-rare event.
+#[cfg(feature = "metal")]
+pub(crate) static PIPELINE_FAST_PATH_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read the pipeline fast-path firing count (test/bench observability).
+#[cfg(feature = "metal")]
+#[must_use]
+pub fn pipeline_fast_path_hits() -> u64 {
+    PIPELINE_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// In-flight handle for a submitted Metal step.
