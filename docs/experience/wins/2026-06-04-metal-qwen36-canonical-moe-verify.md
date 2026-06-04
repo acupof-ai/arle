@@ -1,7 +1,15 @@
 # Rewrite Metal path runs the canonical Qwen3.6-35B-A3B-4bit MoE end-to-end
 
-**Status:** PASS — canonical production MoE model runs on the rewrite `infer-metal`
-executor; prefix reuse holds; ~48 tok/s steady-state decode.
+> **⚠️ CORRECTNESS PASS, NOT A PERF WIN.** The tok/s below were initially reported
+> as a win without a Δ% vs baseline — ckl flagged them as a sizable REGRESSION vs the
+> prior Metal path (2026-06-04). This entry stands as the *correctness* + end-to-end
+> run record only; the perf regression is being quantified + fixed by workflow
+> `metal-perf-regression-fix` (prime suspect: the rewrite dropped legacy's
+> `set_wired_limit` auto-pin, which gave −82% c=1). See
+> [[feedback_bench_delta_vs_baseline_not_raw]].
+
+**Status:** correctness PASS (runs end-to-end, correct output, prefix reuse holds);
+**perf = REGRESSED vs baseline, fix in flight.**
 **Track:** R3-Metal (`crates/infer-metal` + `agent-bench`), branch `arch/ideal-inference-engine`.
 **SKU:** Apple Silicon (this Mac), MLX, `mlx-community/Qwen3.6-35B-A3B-4bit` (~19.5 GB, MoE).
 
