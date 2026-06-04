@@ -70,17 +70,18 @@ infer-topo 42, infer-moe 17, qwen35-spec 30 — all green.
 Continuous-batch decode via the MLX bridge with variable-length packed decode;
 Qwen3.5 forward + greedy parity landed (#1/#2), prefix reuse + chunked prefill (#8).
 Canonical Qwen3.6-35B-A3B-4bit MoE runs end-to-end (correct, prefix reuse ttft
-6→3). **PERF: REGRESSED vs the legacy Metal backend.** Matched same-session A/B
-(`metal_perf-regression-fix` workflow, 2026-06-04): rewrite turn-wall steady decode
-**56.1 tok/s vs legacy `metal_bench` 84.3 tok/s = −33.5%** on Qwen3.6 (Qwen3.5-0.8B
-−26%: 209 vs 282.5). The first fix hypothesis (per-token publish/drain decode
-cadence) was **rigorously KILLED** by isolated env-gated A/Bs — moved within noise,
-RSS unchanged (`errors/2026-06-04-metal-rewrite-publish-drain-cadence-kill.md`).
-Re-localizing: (a) the 56-vs-84.3 is **framing-confounded** (rewrite turn-wall folds
-in per-turn suffix re-prefill + scheduler/poll; legacy 84.3 is pure `generation_tps`)
-→ decompose prefill-wall vs decode-wall; (b) **wired-limit auto-pin** — rewrite pins
-2× residency (19.55 GB vs legacy 8.9-11 GB) unconditionally, never A/B-toggled on the
-rewrite binary. Investigation in flight.
+6→3). **PERF: real but modest decode regression vs legacy, de-confounded.** The
+initial "−33.5%" was mostly a **turn-wall framing artifact** (rewrite turn-wall vs
+legacy pure `generation_tps`); instrumenting pure decode gives **~70 tok/s vs legacy
+84.3 = ~−17%** on Qwen3.6 (Qwen3.5-0.8B ~−14%), the extra turn-wall gap being turn-0
+cold prefill (graph build + first MoE encode over 3 turns)
+(`wins/2026-06-04-metal-rewrite-decode-deconfound-wired-limit-kill.md`). Two
+hypotheses KILLED by matched A/B: per-token publish/drain cadence
+(`errors/2026-06-04-metal-rewrite-publish-drain-cadence-kill.md`) and wired-limit
+auto-pin — auto-pin is in fact the *correct* default (OFF makes cold prefill +69%
+worse; RSS 19.55→10.22 GB but no decode gain). **Leading remaining lever (in flight):**
+the rewrite `step()` two-phase submit→poll eval round-trip (3 evals/token vs legacy's
+1) — collapsing to a single eval is the candidate ~−17% fix.
 
 ### V100 (build + CPU-test node only — rewrite GPU forward BLOCKED on sm_70)
 Tesla V100-SXM2-32GB, sm_70, CUDA 12.4. GPU-free workspace suite **64/0 green** on a
