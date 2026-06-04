@@ -734,6 +734,12 @@ fn mla_rms_norm(
 /// first token (0 for a fresh prefill). Writes `[hidden_size, token_count]` into
 /// `out` (the O-LoRA output, pre-TP-all-reduce — the model layer-loop owns the
 /// row-parallel sum). FlashMLA-FP8 decode stays gated (perf path).
+///
+/// `tp_rank` is this rank's tensor-parallel index. The per-head `attn_sink`
+/// vector is loaded WHOLE on every rank (no TP slice), so the SW/hybrid kernels
+/// must skip to this rank's head block via `sink_offset = tp_rank * local_heads`
+/// — otherwise every non-zero rank reads rank-0's sink logits and the attention
+/// output diverges by a small head-dependent margin (multi-GPU only).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mla_attention(
     ctx: &DeviceContext,
@@ -745,6 +751,7 @@ pub(crate) fn mla_attention(
     hidden: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
     start_pos: usize,
+    tp_rank: usize,
     out: &mut HiddenStates,
 ) -> Result<()> {
     ensure!(
@@ -763,6 +770,9 @@ pub(crate) fn mla_attention(
     );
     let local_heads = local_width / head_dim;
     ensure!(local_heads > 0, "DSv4 MLA requires at least one local head");
+    // This rank owns global heads [tp_rank*local_heads, +local_heads); the
+    // whole-loaded attn_sink must be indexed from that offset (see fn docs).
+    let sink_offset = tp_rank * local_heads;
     ensure!(
         attention.wkv.rows == head_dim,
         "DSv4 MLA wkv rows {} != head_dim {head_dim}",
@@ -798,9 +808,10 @@ pub(crate) fn mla_attention(
         config.sliding_window * head_dim
     );
     ensure!(
-        attention.attn_sink.len >= local_heads,
-        "DSv4 MLA attn_sink len {} cannot cover local heads {local_heads}",
-        attention.attn_sink.len
+        attention.attn_sink.len >= sink_offset + local_heads,
+        "DSv4 MLA attn_sink len {} cannot cover rank {tp_rank} heads [{sink_offset}, {})",
+        attention.attn_sink.len,
+        sink_offset + local_heads
     );
 
     let rope = &config.rope_parameters;
@@ -871,8 +882,7 @@ pub(crate) fn mla_attention(
         let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
         let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
-        // is 0 (per-rank local heads index the per-rank attn_sink slice directly;
-        // EP/TP head sharding is a multi-rank follow-up).
+        // skips to this rank's head block in the whole-loaded attn_sink vector.
         unsafe {
             ffi::dsv4_swa_attention_cuda(
                 q_ptr as *const ffi::Half,
@@ -885,7 +895,7 @@ pub(crate) fn mla_attention(
                 head_dim as i32,
                 config.sliding_window as i32,
                 start_pos_i32,
-                0,
+                sink_offset as i32,
                 sm_scale,
                 config.qk_rope_head_dim as i32,
                 rope_base,
@@ -1015,7 +1025,7 @@ pub(crate) fn mla_attention(
                 head_dim as i32,
                 config.sliding_window as i32,
                 start_pos_i32,
-                0,
+                sink_offset as i32,
                 sm_scale,
                 config.qk_rope_head_dim as i32,
                 rope_base,

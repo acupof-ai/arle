@@ -427,6 +427,7 @@ impl Dsv4Model {
                 &normed,
                 &mut slot.attention[layer_idx],
                 start_pos,
+                self.tp.config().rank,
                 &mut attn_out,
             )?;
             // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
