@@ -866,7 +866,12 @@ mod dsv4_gpu {
             "DSv4 shared expert needs H and I aligned to 128, got H={hidden_dim} I={shared_inter}"
         );
 
-        let max_m = num_tokens.max(1);
+        // Floor at 128 for the SAME reason as the routed grouped path: the shared
+        // expert runs the identical `dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked`
+        // kernel, whose small-m (m=1 decode) tile path diverges below 128. The
+        // routed-only floor left this reachable (codex review P2); a prompt whose
+        // next-token margin leans on the shared expert could flip at m<128.
+        let max_m = num_tokens.max(128);
         let scale_stride_m = max_m.div_ceil(4) * 4;
         let hidden_scale_cols = hidden_dim.div_ceil(128);
         let inter_scale_cols = shared_inter.div_ceil(128);
