@@ -89,27 +89,16 @@ export AGENT_INFER_API_KEY=dev-secret
 
 ### Apple Silicon one-command bring-up
 
-The canonical first-time Metal serving entrypoint is
-[`scripts/start_metal_serve.sh`](../scripts/start_metal_serve.sh). It hides the
-Cargo feature flags, builds the Metal `arle` binary, and starts the server on
-`127.0.0.1:8000`.
-
-Defaults:
-
-- model: `ARLE_MODEL` if set, otherwise legacy `AGENT_INFER_MODEL`, otherwise `mlx-community/Qwen3.5-0.8B-MLX-4bit`
-- port: `8000`
-- bind: `127.0.0.1`
-
-Examples:
+The canonical Metal serving entrypoint is `arle serve --backend metal`. The rewrite
+removed the separate `metal_serve` binary; `arle serve` loads the model **in-process**
+and serves the OpenAI v1 API on `--bind`:`--port` (default `127.0.0.1:8000`).
 
 ```bash
-./scripts/start_metal_serve.sh
-./scripts/start_metal_serve.sh mlx-community/Qwen3.5-4B-bf16 8012 -- --warmup 0
+arle serve --backend metal --model-path mlx-community/Qwen3.5-0.8B-MLX-4bit
+arle serve --backend metal --model-path mlx-community/Qwen3.5-4B-bf16 --port 8012
 ```
 
-Extra Metal serving flags go after `--`. For example, you can still pass
-`--api-key`, `--memory-limit-bytes`, `--cache-limit-bytes`, or
-`--wired-limit-bytes` through the wrapper.
+Run `arle serve --help` for the full flag surface.
 
 ### `AGENT_INFER_TEST_MODEL_PATH`
 
