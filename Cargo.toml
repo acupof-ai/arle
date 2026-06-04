@@ -19,6 +19,7 @@ members = [
     "crates/infer-seam",
     "crates/infer-server",
     "crates/infer-topo",
+    "crates/infer-util",
     "crates/kv-native-sys",
     "crates/mlx-sys",
     "crates/qwen3-spec",
