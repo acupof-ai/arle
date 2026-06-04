@@ -164,13 +164,14 @@ artifact, not a code bug (current planner.rs is correct; guards added in `8388fc
 
 ## 5. Cutover readiness (delete legacy `infer/`)
 
-**DECISION (2026-06-04): pragmatic boundary.** The rewrite is the serving truth.
-`agent` and `cli` are **off direct `infer`** (`d11bf3f8`, `63d968c5`); `train` is the
-**sole remaining dependent**, solely for its CUDA OPD-teacher surface. Rather than
-pre-shape that API speculatively, `infer/` is retained **only as train's OPD-teacher
-backend — off every serving path** — and deleted when the OPD surface is built (a
-scoped ~3-4 week GPU-verified project; roadmap:
-[`2026-06-04-train-opd-surface-deletion-gate.md`](2026-06-04-train-opd-surface-deletion-gate.md)).
+**DONE (2026-06-04): legacy `infer/` DELETED (`e81b98fb`, ~167k LOC).** The rewrite is
+the sole stack. `agent` (`d11bf3f8`), `cli` (`63d968c5`), and `train` (`956c774f`) are
+all on `infer-api`/`infer-util`. The pragmatic-boundary plan (defer deletion behind a
+~3-4 wk OPD-surface build) was **superseded** — the OPD-teacher CUDA surface
+(`forward_token_logits`/offload/`remerge_student_lora` on the rewrite Qwen3.5 path) was
+built + typecheck-gated this session, train was migrated, and `infer/` was removed;
+workspace builds green without it across cpu/cuda-rust/metal. GPU numeric verify of the
+OPD methods is the fix-forward follow-up (no `infer` fallback retained).
 
 **Adapter — DONE (this session).** `infer-api` exposes the public `InferenceEngine`
 trait + `LoadedInferenceEngine` dispatch, now consumer-ready:
