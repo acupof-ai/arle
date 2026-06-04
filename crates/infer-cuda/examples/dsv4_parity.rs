@@ -32,7 +32,8 @@
 //! Env (parity mode):
 //!   * `INFER_DSV4_MODEL_PATH`  — DSv4 FP8 safetensors dir (required).
 //!   * `INFER_DSV4_PROMPT_IDS`  — comma-separated u32 ids; default
-//!     `785,6722,315,9625,374` = "The capital of France is".
+//!     `671,6102,294,8760,344` = "The capital of France is" in the DeepSeek-V4
+//!     tokenizer (matches the oracle; NOT the Qwen ids).
 //!   * `INFER_DSV4_MAX_NEW`     — max new tokens to attempt (default 16).
 //!   * `INFER_CUDA_DEVICES` / `INFER_TP_RANK` / `INFER_TP_SIZE` — TP world/rank
 //!     (resolved inside the loader's TP runtime; the launcher binds one rank per
