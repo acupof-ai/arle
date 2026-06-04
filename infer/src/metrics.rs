@@ -2559,6 +2559,10 @@ mod tests {
         m.record_host_pool_pressure_tick(0.90, 0.70, 0.85);
         m.record_host_pool_pressure_tick(0.50, 0.70, 0.85);
         m.record_host_pool_pressure_tick(0.80, 0.70, 0.85);
+        // 1 MTP block, 2 accepted inputs, draft block_size 3 → blocks_total=1,
+        // accepted=2, draft=3, acceptance_rate=(2-1)/(3-1)=0.5; plus 1 scalar row.
+        m.record_metal_mtp_block(2, 3);
+        m.record_metal_mtp_scalar_row();
 
         assert_eq!(m.tier_recompute_advised_fallback_total(), 1);
         assert_eq!(m.tier_fetch_queue_saturated_fallback_total(), 1);
