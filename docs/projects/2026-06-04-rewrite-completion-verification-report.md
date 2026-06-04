@@ -79,9 +79,15 @@ cold prefill (graph build + first MoE encode over 3 turns)
 hypotheses KILLED by matched A/B: per-token publish/drain cadence
 (`errors/2026-06-04-metal-rewrite-publish-drain-cadence-kill.md`) and wired-limit
 auto-pin — auto-pin is in fact the *correct* default (OFF makes cold prefill +69%
-worse; RSS 19.55→10.22 GB but no decode gain). **Leading remaining lever (in flight):**
-the rewrite `step()` two-phase submit→poll eval round-trip (3 evals/token vs legacy's
-1) — collapsing to a single eval is the candidate ~−17% fix.
+worse; RSS 19.55→10.22 GB but no decode gain). A THIRD lever — collapsing the
+`step()` two-phase eval to one — was also **KILLED** (+0.6%/+1.7%, noise): HEAD
+already has only 1 blocking sync/token, the 2nd `async_eval` is a free host kickoff
+(`errors/2026-06-04-metal-eval-count-kill-pipelining-is-real-lever.md`). **Real
+remaining lever: cross-step pipelining.** The rewrite's `poll` does a blocking
+`eval`, draining step N's GPU before step N+1 is built; legacy double-buffers
+(`pending_sampled`) to overlap step-N readback with step-N+1 forward. The fix is a
+seam/Engine change (async `submit` + `NotReady` `poll`, preserving c≥2) — the
+leading ~−17% candidate, larger than a backend-local flag.
 
 ### V100 (build + CPU-test node only — rewrite GPU forward BLOCKED on sm_70)
 Tesla V100-SXM2-32GB, sm_70, CUDA 12.4. GPU-free workspace suite **64/0 green** on a
