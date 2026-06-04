@@ -42,11 +42,24 @@ Greedy bit-identical; prefix-reuse ttft 6→3; c≥2 errors loud at the single-r
 (no multi-slot Metal decode — pre-existing). FP8/4-bit Metal MoE quant swap points
 remain a follow-up.
 
-**CUDA — correctness complete; per-op perf characterization is the remaining work
-(#16).** Throughput/latency sweeps (DSv4 tok/s, TP=8 scaling curve, Qwen CUDA tok/s)
-need dedicated pod benches not yet run — the GPU time this session went to closing
-correctness (sink-offset, DeepGEMM small-m, DeepEP wiring). FP8 MoE is verified on
-both the native-grouped bypass and the production DeepGEMM backend.
+**CUDA — correctness complete; per-op perf characterization underway (#16).** FP8 MoE
+is verified on both the native-grouped bypass and the production DeepGEMM backend.
+
+*Op-ceiling characterization (Colab A100 sm_80, secondary to the H20 production
+target; cuBLAS BF16 + STREAM, warmup-excluded):* HBM 1228 GB/s achieved (79% of
+1555). DSv4/Qwen3.6 **prefill** projection + MoE GEMMs are **compute-bound and a
+competent kernel clears ~70-87% of the 312 TFLOP/s BF16 peak** (q_proj 83%, o_proj
+85%, MoE gate+up 76%, lm_head 87%; weakest = MoE down `n=7168,k=2048` at 69%, a
+thin-K shape to watch). **Decode (m=8) GEMM runs at ~3% of peak** → latency/launch-
+bound, so decode tok/s is governed by **KV-read HBM bandwidth, not FLOPs** (matches
+the Metal finding that decode is bandwidth/pipelining-bound). **Architectural finding:
+FP8 tensor-core matmul does NOT exist on A100 (sm_80) — it is Ada/Hopper-only
+(sm_89/sm_90)**, so cuBLASLt FP8 returns `NOT_SUPPORTED` on A100; **the production
+DSv4 DeepGEMM FP8-MoE throughput ceiling has no A100 analog and must be measured on
+the H20 Hopper path** (Codex profiling in flight).
+
+*Production H20 numbers* (DSv4/Qwen tok/s, TP=8 scaling, per-op nsys breakdown +
+compute/comm overlap) — the remaining input, Codex profiling on 8×H20 now.
 
 ## 4. Architecture (elegant / clean / extensible — substantiated)
 
