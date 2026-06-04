@@ -56,7 +56,7 @@ no circular blocker for cutover).
 | W4 grouped GEMM (Qwen3.6-4bit) | CUDA | **pending** | 2 swap points in moe.rs flagged; Qwen3.6 canonical is 4-bit |
 | CUDA Graph capture/replay | CUDA | **VERIFIED** | H20 eager==replay==HF gold (16/16); nsys: cuGraphLaunch×16 + capture×2 (impl `20274cdb`, `INFER_CUDA_DECODE_GRAPH=1`) |
 | CUDA toolchain build (sm_70) | V100 | **verified (build/CPU)** | V100 node: GPU-free suite 64/0; native CUDA-C compiles sm_70 |
-| HTTP OpenAI v1 (non-stream) | both | **partial** | infer-server completions; streaming/`/v1/models`/`/v1/stats` pending |
+| HTTP / serving adapter | both | **consumer-ready** | infer-api `InferenceEngine` adapter: real incremental streaming (`ed72defc`) + telemetry from live counters (`f2273d43`) + CUDA model dispatch (`c65cd33e`); `/v1/models`+completions (HTTP SSE `stream=true` deferred). 15 infer-server/api unit tests |
 
 CPU-test foundation totals (this Mac, 2026-06-04): infer-core 19, infer-cuda 28,
 infer-topo 42, infer-moe 17, qwen35-spec 30 — all green.
@@ -138,19 +138,33 @@ artifact, not a code bug (current planner.rs is correct; guards added in `8388fc
 
 ## 5. Cutover readiness (delete legacy `infer/`)
 
-~30% ready. No new crate imports legacy `infer/` (no circular blocker). Consumers of
-`infer::server_engine`: `agent`, `cli`, `train` (+ root dev-dep). Blockers:
+~55% ready. No new crate imports legacy `infer/` (no circular blocker). Consumers of
+`infer::server_engine`: `agent`, `cli`, `train` (+ root dev-dep).
 
-1. **CRITICAL** — no public `InferenceEngine` trait + `LoadedInferenceEngine` dispatch
-   in the new stack (the new stack exposes `Engine`/`ServeHandle` with `Vec<u32>` +
-   blocking collect, not the trait + `String` + streaming contract). Needs an adapter
-   (new `infer-api` crate or in `infer-server`). **Not GPU-gated** — buildable in parallel.
-2. CUDA Phase-0 parity (§4).
-3. Qwen3.6 / DSv4 CUDA model ports.
-4. `infer-server` HTTP: non-streaming only.
+**Adapter — DONE (this session).** `infer-api` exposes the public `InferenceEngine`
+trait + `LoadedInferenceEngine` dispatch, now consumer-ready:
+- **Real incremental streaming** (`ed72defc`): infer-core token-observer hook →
+  infer-server `submit_streaming` channel → infer-api `complete_stream` with
+  incremental detokenize + stop-boundary holdback (was a full-text stub).
+- **Real telemetry** (`f2273d43`): live scheduler counters (active/queue/free-pages)
+  published each tick → `EngineTelemetry`.
+- **CUDA model dispatch** (`c65cd33e`): `load_cuda` classifies Qwen3 / Qwen3.5 / DSv4
+  from `config.json` and picks the executor (DSv4 → multi-GPU launcher).
+- **HTTP** `/v1/models` added (`c0d78626`); `/v1/completions` + `/v1/chat/completions`
+  present (SSE `stream=true` still deferred — in-process consumers use the trait).
 
-Deletion scope: `infer/` = 213 files ~167k LOC / 7.1 MB; new `infer-*` = ~42 files
-~12k LOC.
+**Remaining blockers:**
+1. `cli` / `agent` migration off legacy `infer::server_engine` → `infer-api`
+   (import-only for cli; **not GPU-gated** — the proof step, now unblocked).
+2. **`train`** still needs the CUDA-only OPD control surface (`forward_token_logits`,
+   `remerge_student_lora`, `offload/reload_engine_weights`) that lives behind
+   `infer-cuda` and isn't on the `InferenceEngine` trait — **this is the binding
+   blocker for deleting `infer/` entirely** (cross-agent dependency on the
+   infer-cuda/OPD side).
+3. DSv4 multi-prompt correctness (§8) + the GPU model ports' full verification.
+
+Deletion scope: `infer/` = 213 files ~167k LOC / 7.1 MB; new `infer-*` = ~41 files
+~12k LOC (`infer-models` speculative crate removed this session, `72ebaae4`).
 
 ---
 
