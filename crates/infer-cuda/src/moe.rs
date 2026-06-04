@@ -434,13 +434,12 @@ mod dsv4_gpu {
     use half::bf16;
 
     use crate::dsv4::{Dsv4Model, Dsv4MoeLayer};
-    use crate::ops::{add_batch, gemm_batch};
+    use crate::ops::gemm_batch;
 
     /// FP8 DeepGEMM MoE forward for one DSv4 routed-MoE layer (this EP rank's
     /// experts only). Mirrors the BF16 [`super::gpu::moe_forward`] route/pack/
     /// scatter/combine plumbing but swaps the two BF16 grouped GEMMs for the
-    /// native DeepGEMM 5-call FP8 pipeline (`f8f8bf16`, 128-block scale) and runs
-    /// the DSv4 dense shared expert (clamped SwiGLU, no sigmoid gate).
+    /// native DeepGEMM 5-call FP8 pipeline (`f8f8bf16`, 128-block scale).
     ///
     /// Routing is per-layer: bias-routed layers run the learned router gemm +
     /// `noaux_tc` correction bias through `infer_moe::route`; hash-routed layers
@@ -448,7 +447,9 @@ mod dsv4_gpu {
     /// table by token id (no router gate), weighting them by the router scores.
     ///
     /// `tokens` are the input token ids (needed for hash routing); `hidden` is
-    /// the post-LN `[num_tokens, hidden]`; `out` receives routed + shared.
+    /// the post-LN `[num_tokens, hidden]`; `out` receives routed experts only.
+    /// Callers all-reduce this EP-sharded output, then add the replicated shared
+    /// expert exactly once per rank via [`dsv4_shared_expert_forward`].
     pub(crate) fn dsv4_moe_forward(
         model: &Dsv4Model,
         layer: &Dsv4MoeLayer,
@@ -635,15 +636,19 @@ mod dsv4_gpu {
             )?;
         }
 
-        // ── 7. DSv4 dense shared expert (clamped SwiGLU) accumulated into out. ──
-        // Routing already applied routed_scaling_factor per weight; the shared
-        // expert adds unscaled (DSv4 has no sigmoid gate, unlike Qwen3.6).
-        let shared = dsv4_shared_expert(ctx, layer, hidden, swiglu_limit)?;
-        let mut combined = HiddenStates::zeros(ctx, hidden_dim, num_tokens)?;
-        add_batch(ctx, out, &shared, &mut combined)?;
-        out.data = combined.data;
-
+        // The shared expert is replicated on every rank. Callers must all-reduce
+        // the routed local expert contribution first, then add the shared expert
+        // exactly once per rank.
         Ok(())
+    }
+
+    pub(crate) fn dsv4_shared_expert_forward(
+        ctx: &DeviceContext,
+        layer: &Dsv4MoeLayer,
+        hidden: &HiddenStates,
+        swiglu_limit: f32,
+    ) -> Result<HiddenStates> {
+        dsv4_shared_expert(ctx, layer, hidden, swiglu_limit)
     }
 
     /// Dispatch DSv4 host routing for one layer: bias-routed → learned router +
@@ -1043,7 +1048,7 @@ mod dsv4_gpu {
 
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
-pub(crate) use dsv4_gpu::dsv4_moe_forward;
+pub(crate) use dsv4_gpu::{dsv4_moe_forward, dsv4_shared_expert_forward};
 #[cfg(feature = "cuda")]
 pub(crate) use gpu::moe_forward;
 
