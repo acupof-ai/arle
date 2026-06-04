@@ -1923,16 +1923,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "infer-models"
-version = "0.1.5"
-dependencies = [
- "anyhow",
- "infer-plan",
- "infer-seam",
- "log",
-]
-
-[[package]]
 name = "infer-moe"
 version = "0.1.5"
 dependencies = [
