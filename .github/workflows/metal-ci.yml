@@ -4,10 +4,7 @@ on:
   push:
     branches: [ main, master ]
     paths:
-      - 'infer/src/**'
-      - 'crates/mlx-sys/**'
-      - 'infer/build.rs'
-      - 'infer/Cargo.toml'
+      - 'crates/**'
       - 'crates/cli/**'
       - 'crates/train/**'
       - 'crates/kv-native-sys/**'
@@ -31,10 +28,7 @@ on:
   pull_request:
     branches: [ main, master ]
     paths:
-      - 'infer/src/**'
-      - 'crates/mlx-sys/**'
-      - 'infer/build.rs'
-      - 'infer/Cargo.toml'
+      - 'crates/**'
       - 'crates/cli/**'
       - 'crates/train/**'
       - 'crates/kv-native-sys/**'
@@ -88,8 +82,7 @@ jobs:
 
       # Verify Metal C++ shim compiles and Rust type-checks cleanly.
       - name: cargo check (metal + no-cuda infer lib)
-        working-directory: infer
-        run: cargo check --no-default-features --features metal,no-cuda --lib --release
+        run: cargo check -p infer-api --no-default-features --features metal,no-cuda --lib --release
 
       - name: cargo check (metal + no-cuda CLI)
         run: cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --release --bin arle
@@ -107,9 +100,8 @@ jobs:
           cargo clippy -p kv-native-sys --release --all-targets -- -D warnings
 
       - name: cargo test (metal + no-cuda)
-        working-directory: infer
         run: >
-          cargo test
+          cargo test -p infer-api
           --no-default-features --features metal,no-cuda
           --lib --release
           -- --test-threads 1
@@ -117,21 +109,9 @@ jobs:
       - name: cargo test (metal + no-cuda CLI unit tests)
         run: cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer --release
 
-      - name: cargo build metal_serve
-        working-directory: infer
-        run: >
-          cargo build
-          --no-default-features --features metal,no-cuda
-          --bin metal_serve --release
-
-      # Keep metal_bench in CI as compile coverage only.
-      - name: cargo build metal_bench
-        working-directory: infer
-        run: >
-          cargo build
-          --no-default-features --features metal,no-cuda
-          --bin metal_bench --release
-
+      # `metal_serve`/`metal_bench` were `infer`-crate bins; the rewrite deleted
+      # them — serving is now `arle serve` (cli/src/serve.rs). The `arle` build
+      # below is the Metal serve/bench surface.
       - name: cargo build ARLE CLI
         run: >
           cargo build
@@ -149,7 +129,6 @@ jobs:
         run: >
           ./scripts/package_macos_metal_artifact.sh
           arle-macos-arm64.tar.gz
-          target/release/metal_serve
           target/release/arle
 
       - name: Upload macOS Metal artifact
