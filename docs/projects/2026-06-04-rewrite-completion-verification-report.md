@@ -43,16 +43,17 @@ no circular blocker for cutover).
 | Subsystem | Backend | Status | Evidence / gate |
 |---|---|---|---|
 | Engine / scheduler / RadixCache | host | **verified (CPU)** | infer-core 19 tests; prefix-reuse + chunked prefill (#8) |
-| Metal forward + parity | Metal | **verified** | tasks #1/#2/#8; PR #53 "Metal verified"; Qwen3.5 on M-series |
+| Metal forward + parity | Metal | **verified** | tasks #1/#2/#8; PR #53 "Metal verified"; Qwen3.5 on M-series. Local re-verify 2026-06-04: rewrite Metal 3-turn agent workflow (Qwen3.5-0.8B-MLX-4bit) **132.8 tok/s**, prefix-reuse ttft 6→3 ticks, peak RSS 465 MB |
 | CUDA eager forward (Phase 0) | CUDA | **VERIFIED** | exact HF-gold greedy parity (16/16 tok) on H20 via chunk=1 decode-kernel prefill — `wins/2026-06-04-r6-cuda-eager-parity-verified.md` |
 | CUDA batched-prefill cubin (perf) | CUDA | **known-issue** | HD128 FullRow-WGMMA TileLang codegen spin (§4); perf-only, decode+chunk=1 is the correct path |
 | TP sharding math | host | **verified (CPU)** | infer-topo 42 tests |
 | TP wiring (tp.rs, shard, mock-comm) | CUDA | **foundation verified** | `6d4a3254`; infer-cuda 28 tests incl. row-parallel all-reduce parity |
-| TP all-reduce in forward + TP=8 | CUDA | **pending** | gated on Phase 0 + 8×H20; insert at model.rs o_proj/down_proj |
+| TP all-reduce in forward + TP=8 | CUDA | **partial — DSv4 TP=8 verified** | DSv4 3/3 16/16 exercises real TP=8 row-parallel all-reduce (MLA o_proj + MoE) on 8×H20 (`d5f74c0b`); dense/hybrid Qwen TP=8 vs TP=1 parity in flight on H20 (#9) |
 | MoE routing math | host | **verified (CPU)** | infer-moe 17 tests |
 | MoE wrappers + expert load + config | CUDA | **foundation verified** | `6d4a3254`; cuda,no-cuda typecheck clean |
 | BF16 MoE forward (SparseMoeBlock) | CUDA | **wired (Mac-verified)** | `96f65bdc` moe.rs (route→pack→grouped-gemm→silu_mul→scatter→combine→shared); GPU-verify gated on a compatible BF16 ungated/full-attn HD128-kv8 MoE (none cached) |
-| DSv4 forward TP=8/EP=8 full-16-token parity | CUDA | **partial — 1/3 prompts** | one prompt full `clean_tokens == oracle` (per-slot state + MoE contract, mirrored `08b74b35`); but 2/3 multi-prompt diverge at decode step 3-4 — likely **bf16-vs-FP8 precision** (rewrite bf16 vs FP8 oracle), isolation in flight (§8). Not yet full DSv4 correctness — `wins/2026-06-04-dsv4-multigpu-fullseq-parity.md` |
+| DSv4 forward TP=8/EP=8 multi-prompt parity (FP8 MoE-weight + bf16 KV) | CUDA | **VERIFIED — 3/3 prompts 16/16** | exact `clean_tokens == legacy bf16 oracle` on all 3 prompts after the TP `attn_sink` offset fix (`d5f74c0b`); root cause was sink_offset=0 hardcoded on non-zero ranks, NOT bf16-vs-FP8 noise (§8) — `wins/2026-06-04-dsv4-tp-attn-sink-offset-parity.md`. FP8/FP4 MoE-weights via native grouped kernels |
+| DSv4 production EP/quant pipeline (DeepEP / DeepGEMM / FP8-KV) | CUDA | **open** | 16/16 used native-grouped FP8 bypass + bf16 KV; native DeepEP, vendored DeepGEMM (`cuLibraryGetKernelCount` multi-rank), and FP8-KV decode (`alloc_fp8_arena` bail-gated) not yet exercised (§8) |
 | W4 grouped GEMM (Qwen3.6-4bit) | CUDA | **pending** | 2 swap points in moe.rs flagged; Qwen3.6 canonical is 4-bit |
 | CUDA Graph capture/replay | CUDA | **VERIFIED** | H20 eager==replay==HF gold (16/16); nsys: cuGraphLaunch×16 + capture×2 (impl `20274cdb`, `INFER_CUDA_DECODE_GRAPH=1`) |
 | CUDA toolchain build (sm_70) | V100 | **verified (build/CPU)** | V100 node: GPU-free suite 64/0; native CUDA-C compiles sm_70 |
@@ -208,16 +209,30 @@ MoE shared-expert contract (shared added **after** the routed all-reduce, not
 folded in before where the replicated shared weights got summed 8×). Verified on
 the **native** expert backend + **bf16** KV path; mirrored to repo `08b74b35`.
 
-**Multi-prompt breadth corrects the scope:** of 3 distinct prompts, only 1 matches
-16/16; "largest planet" diverges at decode step 4, "hash table" at step 3. The
-rewrite runs **bf16-KV** but the legacy oracle was captured with `--kv-cache-dtype
-fp8`, so the leading hypothesis is a **bf16-vs-FP8 precision** flip on tight-margin
-steps, not a forward bug — but a real per-slot decode-state bug would equally
-corrupt FP8, so the isolation (logit margin at first divergence + legacy-bf16 vs
-rewrite-bf16 same-precision A/B) gates the verdict. **DSv4 full correctness is not
-yet established.** Still open: DeepEP *serving* (fail-closed → scalar), the
-DeepGEMM production backend (`cuLibraryGetKernelCount` multi-rank), FP8-KV decode
-(`alloc_fp8_arena` `bail!`-gated), TP=8 Qwen.
+**Multi-prompt divergence ROOT-CAUSED — DSv4 bf16 multi-GPU parity now CLOSED**
+(`wins/2026-06-04-dsv4-tp-attn-sink-offset-parity.md`, fix `d5f74c0b`). The
+earlier "2/3 diverge = bf16-vs-FP8 precision noise" hypothesis was **wrong**. A
+layer-bisect (legacy-bf16 vs rewrite-bf16, same precision) localized the first
+divergence to the **attention output on non-zero TP ranks**. Cause: the per-head
+`attn_sink` is loaded WHOLE on every rank, but `mla_attention` launched the
+SW/hybrid kernels with `sink_offset=0` hardcoded, so every non-zero rank applied
+rank-0's sink logits to its own heads — invisible single-GPU, surfacing multi-GPU
+as prompt-dependent token flips. Fix threads `tp_rank` →
+`sink_offset = tp_rank*local_heads` (FFI already exposed the param). **Result:
+3/3 prompts 16/16 exact** vs the legacy bf16 oracle on H20 TP=8/EP=8 ("hash
+table", "largest planet", "pancakes"), zero divergence. Deterministic exact
+parity — confirming it was a sharding-offset bug, not numerical noise.
+
+**FP8 acceptance status (the user's gate is "FP8 verified").** Those 16/16 runs
+exercised **FP8/FP4 MoE-weight correctness through native grouped kernels + bf16
+KV** (DeepSeek-V4-Flash config = `fp8 e4m3`, `weight_block_size [128,128]`). So
+**FP8 MoE-weight correctness is verified** (rewrite matches legacy on the same FP8
+weights). Still NOT exercised by these runs (production-pipeline pieces):
+- **FP8-KV decode** — rewrite `alloc_fp8_arena` is still `bail!`-gated; KV ran bf16.
+- **Native DeepEP** dispatch/combine — the production EP pipeline, not the path used.
+- **Full DeepGEMM production backend** (`cuLibraryGetKernelCount` multi-rank) — the
+  runs used the native-grouped FP8 bypass, not the vendored DeepGEMM pipeline.
+- **TP=8 Qwen** (dense/hybrid TP, separate from DSv4 MLA) — in flight on H20.
 
 **Separate, still-open infra blocker:** the native DeepGEMM bridge fails
 `cuLibraryGetKernelCount → CUDA_ERROR_UNKNOWN` in multi-rank (single-process legacy
