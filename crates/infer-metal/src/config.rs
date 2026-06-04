@@ -84,21 +84,17 @@ impl MetalQwen35ArchConfig {
     }
 }
 
-/// Qwen3.5/Qwen3.6 model config for the Metal executor. `vocab_size` and the
-/// model-default stop tokens are parsed for the serving adapter to consult; the
-/// executor itself does not read them.
-#[allow(dead_code)]
+/// Qwen3.5/Qwen3.6 model config for the Metal executor. `stop_token_ids` is the
+/// model-default stop set the executor exposes via `model_stop_token_ids`.
 #[derive(Debug, Clone)]
 pub(crate) struct MetalModelConfig {
     pub(crate) hidden_size: usize,
     pub(crate) num_attention_heads: usize,
     pub(crate) num_key_value_heads: usize,
     pub(crate) num_hidden_layers: usize,
-    pub(crate) vocab_size: usize,
     pub(crate) rms_norm_eps: f64,
     pub(crate) rope_theta: f64,
     pub(crate) head_dim: usize,
-    pub(crate) eos_token_id: u32,
     pub(crate) stop_token_ids: Vec<u32>,
     pub(crate) quantization: Option<QuantConfig>,
     pub(crate) arch: MetalQwen35ArchConfig,
@@ -257,18 +253,15 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
     };
 
     let stop_token_ids = resolve_stop_token_ids(model_dir, root, model)?;
-    let eos_token_id = stop_token_ids.first().copied().unwrap_or(151_645);
 
     Ok(MetalModelConfig {
         hidden_size,
         num_attention_heads,
         num_key_value_heads: get_usize(model, "num_key_value_heads", 8),
         num_hidden_layers,
-        vocab_size: get_usize(model, "vocab_size", 151_936),
         rms_norm_eps,
         rope_theta,
         head_dim,
-        eos_token_id,
         stop_token_ids,
         quantization,
         arch: MetalQwen35ArchConfig {
