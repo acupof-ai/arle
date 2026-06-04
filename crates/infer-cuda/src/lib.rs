@@ -31,6 +31,10 @@ mod dsv4;
 mod executor;
 #[cfg(feature = "cuda")]
 pub mod graph;
+// DSv4 hyper-connections (`hc_mult > 1`): the wide residual stream wrap. cuda-
+// gated (device kernels + DSv4 weight matrices).
+#[cfg(feature = "cuda")]
+mod hc;
 #[cfg(feature = "cuda")]
 mod loader;
 #[cfg(feature = "cuda")]
@@ -341,6 +345,25 @@ impl CudaExecutor {
                     num_slots,
                     total_pages,
                 )?,
+            )),
+        })
+    }
+
+    /// Build the real CUDA executor for a DSv4-Flash FP8 checkpoint (MLA + HC +
+    /// FP8 DeepGEMM MoE). DSv4 is multi-GPU only (TP=8/EP=8): the per-rank EP
+    /// expert split + NCCL TP groups resolve from the env (`INFER_NCCL_UNIQUE_ID`,
+    /// `INFER_CUDA_DEVICES`/world-size), so the launcher binds one rank per GPU.
+    /// DSv4 owns its MLA KV state inside the forward, so no `total_pages`/
+    /// `CudaKvPool` page budget is needed (a host pool is still attached for slot
+    /// bookkeeping).
+    #[cfg(feature = "cuda")]
+    pub fn from_dsv4_fp8_safetensors(
+        model_path: impl AsRef<Path>,
+        num_slots: usize,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: CudaExecutorInner::Real(Box::new(
+                executor::RealCudaExecutor::from_dsv4_fp8_safetensors(model_path, num_slots)?,
             )),
         })
     }

@@ -1,18 +1,15 @@
 //! DeepSeek-V4-Flash FP8 model: weight structs, MLA KV arena, EP-aware loader.
 //!
-//! Piece 1 of the DSv4 port: loads the FP8 block-scaled weights (reusing the
-//! shared `cuda-kernels` DSv4 tensors) and stands up the MLA latent KV arena.
-//! The MLA attention forward (Piece 2) and the FP8 DeepGEMM MoE forward
-//! (Piece 3) are gated [`todo!`]/`ensure!` here so the loader compiles and the
-//! state shape is the contract those pieces build on. DSv4 is multi-GPU only
+//! The DSv4 port lives here: it loads the FP8 block-scaled weights (reusing the
+//! shared `cuda-kernels` DSv4 tensors), stands up the MLA latent KV arena, and
+//! drives the full forward — SlidingWindow / CompressedSparse / HybridCompressed
+//! MLA attention (`attention.rs`), hyper-connections (`hc_mult > 1`, this file),
+//! hash- and bias-routed FP8 DeepGEMM MoE (`moe.rs`). DSv4 is multi-GPU only
 //! (256 FP8 experts + MLA sharding don't fit one GPU); `ExpertSplit` carries the
 //! per-rank EP ownership, `ExpertSplit::single` is the dev/typecheck fallback.
 //!
-//! Loader-only milestone: the model state + forward seam exist but no executor
-//! consumes them yet (the `RealCudaExecutor` enum branch lands with the Piece 2/3
-//! forward + MLA KV arena allocation). The `allow(dead_code)` marks pending-
-//! consumer infra, not cruft — see `feedback_necessity_not_callers`.
-#![allow(dead_code)]
+//! The `RealCudaExecutor` Dsv4 branch (`executor.rs`) constructs + runs this
+//! model; the lead wires the multi-process TP=8/EP=8 launcher + bench entry.
 
 use std::path::Path;
 
@@ -20,7 +17,7 @@ use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
 use cudarc::driver::CudaSlice;
-use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
+use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config, DeepSeekV4MoeRoutingKind};
 use half::bf16;
 use infer_moe::MoeConfig;
 use infer_plan::SamplingParams;
@@ -84,16 +81,17 @@ impl Dsv4MlaKvArena {
         })
     }
 
-    /// Allocate the flat device FP8 KV arena (`num_blocks * page_block_size *
-    /// bytes_per_token` bytes) the FlashMLA sparse-FP8 decode reads.
+    /// Allocate the flat device FP8 KV arena the FlashMLA sparse-FP8 decode reads.
     ///
-    /// GATED to Piece 2b: only the FlashMLA decode launch (`dsv4_fp8_kv_pack` →
-    /// `dsv4_flashmla_decode_build_indices_*` → `*_sched_meta` →
+    /// GATED (perf path, not correctness): only the FlashMLA decode launch
+    /// (`dsv4_fp8_kv_pack` → `*_decode_sched_meta` →
     /// `arle_flashmla_sm90_sparse_decode_fwd` → `arle_dsv4_output_inverse_rope_*`)
-    /// consumes this arena. The correctness-complete SlidingWindow MLA core
-    /// ([`crate::attention::mla_attention`]) uses the bf16 SW ring cache
-    /// ([`Dsv4Model::alloc_sw_window_caches`]) instead, so this stays unwired —
-    /// allocating it now would reserve device bytes nothing reads yet.
+    /// consumes this arena. The correctness-complete bf16 MLA core
+    /// ([`crate::attention::mla_attention`]) attends over the bf16 SW ring cache +
+    /// bf16 compressed pool (`dsv4_hybrid_attention_cuda`) instead, so this stays
+    /// unwired — allocating it now reserves device bytes nothing reads yet. The
+    /// lead can flip on the FP8 decode path once the bf16 forward parity-matches
+    /// the oracle.
     #[allow(dead_code)]
     pub(crate) fn alloc_fp8_arena(
         &self,
@@ -101,18 +99,49 @@ impl Dsv4MlaKvArena {
         _num_blocks: usize,
     ) -> Result<CudaSlice<u8>> {
         anyhow::bail!(
-            "DSv4 MLA FP8 KV arena alloc (FlashMLA sparse-FP8 decode) is Piece 2b; the \
-             SlidingWindow MLA core uses the bf16 SW ring cache (alloc_sw_window_caches)"
+            "DSv4 MLA FP8 KV arena alloc (FlashMLA sparse-FP8 decode) is a perf path; the \
+             bf16 MLA core attends over the SW ring + bf16 compressed pool"
         )
     }
 }
 
-/// One DSv4 MLA attention block's FP8 weights (compress_ratio == 0 / SW mode).
+/// Compressor sub-block for CSA/HCA layers (`compress_ratio > 0`): projects the
+/// wide hidden into the compressed-key latent stream the sparse attention reads.
+/// `wkv`/`wgate`/`ape` may be FP8/FP4 block-scaled or bf16 (`dsv4_linear`
+/// dispatches on `weight_format`); `norm` is bf16.
+pub(crate) struct Dsv4Compressor {
+    pub wkv: DeviceMatrix,
+    pub wgate: DeviceMatrix,
+    pub ape: DeviceMatrix,
+    pub norm: DeviceVec,
+}
+
+/// Sparse indexer sub-block (CompressedSparse mode only): a second compressor
+/// over `index_head_dim` keys + `wq_b`/`weights_proj` projections that feed the
+/// `dsv4_csa_select_cuda` top-k block selector.
+pub(crate) struct Dsv4Indexer {
+    pub wq_b: DeviceMatrix,
+    pub weights_proj: DeviceMatrix,
+    pub compressor: Dsv4Compressor,
+}
+
+/// One hyper-connection mixing block (`hc_attn` / `hc_ffn` per layer, `hc_head`
+/// at the head). `mix_fn` projects the wide stream into the `(2+hc_mult)*hc_mult`
+/// mixing weights; `base`/`scale` are the learned bias + scale read by the
+/// sinkhorn `dsv4_mhc_params_cuda`.
+pub(crate) struct Dsv4HyperConnection {
+    pub base: DeviceVec,
+    pub mix_fn: DeviceMatrix,
+    pub scale: DeviceVec,
+}
+
+/// One DSv4 MLA attention block's weights.
 ///
 /// Q-LoRA: `wq_a` (down) → `q_norm` → `wq_b` (up to per-head Q). KV is the
 /// compressed latent: `wkv` → `kv_norm`. Output is also low-rank: `wo_a` (per
 /// o-group) → `wo_b` (back to hidden). `attn_sink` is the per-head sink logit.
-/// CSA/HCA compressor + indexer weights are Piece 2 — see [`Dsv4Layer::mode`].
+/// `compressor`/`indexer` are present on CSA/HCA layers (`compress_ratio > 0`):
+/// the compressor on both CSA and HCA, the indexer on CSA only.
 pub(crate) struct Dsv4Attention {
     pub wq_a: DeviceMatrix,
     pub q_norm: DeviceVec,
@@ -122,34 +151,49 @@ pub(crate) struct Dsv4Attention {
     pub wo_a: DeviceMatrix,
     pub wo_b: DeviceMatrix,
     pub attn_sink: DeviceVec,
+    pub compressor: Option<Dsv4Compressor>,
+    pub indexer: Option<Dsv4Indexer>,
 }
 
 /// One DSv4 routed-MoE block: per-(local)-expert FP8 DeepGEMM caches for w1/w3
-/// (gate/up) and w2 (down), the router gate + its `noaux_tc` correction bias,
-/// and the dense shared expert. Only this rank's `ExpertSplit` slice is resident.
+/// (gate/up) and w2 (down), the router gate, and the dense shared expert. Only
+/// this rank's `ExpertSplit` slice is resident.
+///
+/// Routing kind is per-layer: bias-routed layers carry `gate_bias` (the
+/// `noaux_tc` correction); hash-routed layers (`layer_idx < num_hash_layers`)
+/// carry `hash_tid2eid` (a host `[vocab_size * topk]` table mapping token id →
+/// experts directly) and ignore the learned router gate. Exactly one is `Some`.
 pub(crate) struct Dsv4MoeLayer {
     /// Per-local-expert fused gate+up FP8 cache (w1 over w3, row-stacked) and the
-    /// down cache (w2). Piece 3's masked-grouped GEMM reads these.
+    /// down cache (w2). The masked-grouped GEMM reads these.
     pub w13: Vec<Dsv4Fp8DeepGemmWeightCache>,
     pub w2: Vec<Dsv4Fp8DeepGemmWeightCache>,
     /// Router gate `[n_routed_experts, hidden]` (BF16 — the small router GEMM is
-    /// not FP8) and the per-expert correction bias `[n_routed_experts]`.
+    /// not FP8). Read by bias-routed layers; hash layers still load it (harmless).
     pub gate: DeviceMatrix,
-    pub gate_bias: DeviceVec,
+    /// Bias-routed layers only: per-expert `noaux_tc` correction `[n_routed]`.
+    pub gate_bias: Option<DeviceVec>,
+    /// Hash-routed layers only: host `tid2eid` table (`vocab_size * topk` i64),
+    /// sliced per token to pick experts without the learned router.
+    pub hash_tid2eid: Option<Vec<i64>>,
+    pub routing_kind: DeepSeekV4MoeRoutingKind,
     /// Dense shared expert FP8 caches (always-on, n_shared_experts == 1).
     pub shared_w13: Dsv4Fp8DeepGemmWeightCache,
     pub shared_w2: Dsv4Fp8DeepGemmWeightCache,
 }
 
-/// One DSv4 transformer layer (pre-attn / pre-ffn norms + attention + MoE).
-/// Hyper-connection (`hc_mult > 1`) mixing weights are Piece 2; `mode` records
-/// the attention variant so the forward can dispatch / refuse unsupported modes.
+/// One DSv4 transformer layer: hyper-connection mixers (`hc_attn`/`hc_ffn`),
+/// pre-attn / pre-ffn norms, attention, and MoE. `mode` records the attention
+/// variant (SW / CSA / HCA) the forward dispatches on.
 pub(crate) struct Dsv4Layer {
+    pub hc_attn: Dsv4HyperConnection,
+    pub hc_ffn: Dsv4HyperConnection,
     pub attn_norm: DeviceVec,
     pub ffn_norm: DeviceVec,
     pub attention: Dsv4Attention,
     pub moe: Dsv4MoeLayer,
     pub mode: DeepSeekV4AttentionMode,
+    pub compress_ratio: usize,
 }
 
 /// Loaded DSv4-Flash model for one TP/EP rank.
@@ -163,6 +207,9 @@ pub(crate) struct Dsv4Model {
     pub lm_head: DeviceMatrix,
     pub layers: Vec<Dsv4Layer>,
     pub norm: DeviceVec,
+    /// Head hyper-connection: folds the wide residual stream back to one hidden
+    /// row before the final RMSNorm + lm_head projection.
+    pub head_hc: Dsv4HyperConnection,
     pub tp: crate::tp::TpRuntime,
 }
 
@@ -219,19 +266,30 @@ impl Dsv4Model {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
-            let mode = Self::supported_attention_mode(&config, layer_idx)?;
+            let plan = config
+                .attention_layer_plan(layer_idx)
+                .ok_or_else(|| anyhow!("DSv4 layer {layer_idx} has no attention plan"))?;
             let lnames = config.layer_tensor_names(layer_idx);
             let attention = loader.load_dsv4_attention(&ctx, &lnames.attn)?;
-            let moe = loader.load_dsv4_moe_layer(&ctx, &lnames.ffn, &split)?;
+            let moe = loader.load_dsv4_moe_layer(
+                &ctx,
+                &lnames.ffn,
+                &split,
+                config.moe_routing_kind(layer_idx),
+            )?;
             layers.push(Dsv4Layer {
+                hc_attn: loader.load_dsv4_hyper_connection(&ctx, &lnames.hc_attn)?,
+                hc_ffn: loader.load_dsv4_hyper_connection(&ctx, &lnames.hc_ffn)?,
                 attn_norm: loader.load_dsv4_vec(&ctx, &lnames.attn_norm)?,
                 ffn_norm: loader.load_dsv4_vec(&ctx, &lnames.ffn_norm)?,
                 attention,
                 moe,
-                mode,
+                mode: plan.mode,
+                compress_ratio: plan.compress_ratio,
             });
         }
         let norm = loader.load_dsv4_vec(&ctx, names.norm())?;
+        let head_hc = loader.load_dsv4_hyper_connection(&ctx, &names.head_hc())?;
         ctx.sync()?;
 
         Ok(Self {
@@ -244,6 +302,7 @@ impl Dsv4Model {
             lm_head,
             layers,
             norm,
+            head_hc,
             tp,
         })
     }
@@ -277,12 +336,12 @@ impl Dsv4Model {
     /// Forward one prefill/decode step over `tokens` starting at `start_pos`,
     /// returning the next greedy/sampled token.
     ///
-    /// Per-layer: `attn_norm → mla_attention (SW-mode) → residual (+TP all-reduce)
-    /// → ffn_norm → dsv4_moe_forward (Piece 3) → residual (+TP all-reduce)`, then
-    /// the final RMSNorm + lm_head projection + sample. The MLA core is Piece 2a
-    /// (this file); the FP8 DeepGEMM MoE block is Piece 3's
-    /// [`crate::moe::dsv4_moe_forward`] (concurrent — its body may not be in this
-    /// worktree yet; a typecheck shim covers the missing symbol).
+    /// The residual is the `hidden_size * hc_mult`-wide hyper-connection STREAM,
+    /// not a plain hidden vector. Per layer the flow is:
+    ///   `gen_mhc(hc_attn) → hc_pre → attn_norm → mla_attention → hc_post`
+    ///   (+TP all-reduce of the O-LoRA partials) then the same wrap around
+    ///   `ffn_norm → dsv4_moe_forward` via `hc_ffn`. The head HC then folds the
+    ///   wide stream to one hidden row before the final RMSNorm + lm_head + sample.
     pub(crate) fn forward_tokens(
         &self,
         tokens: &[u32],
@@ -296,31 +355,49 @@ impl Dsv4Model {
         );
 
         let hidden_size = self.config.hidden_size;
+        let hc_mult = self.config.hc_mult;
+        let stream_dim = hidden_size * hc_mult;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
 
-        let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids)?;
-        let mut hidden = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)?;
+        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids_host)?;
+        let mut embeddings = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+        crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)?;
+
+        // Wide HC residual stream from the token embeddings.
+        let mut stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
+        crate::hc::initial_stream_from_embeddings(
+            &self.ctx,
+            &embeddings,
+            hidden_size,
+            hc_mult,
+            &mut stream,
+        )?;
 
         let mut sw_caches = self.alloc_sw_window_caches()?;
-        let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        let mut attn_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        let mut hidden_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        let mut moe_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // ── Attention block.
-            crate::ops::rms_norm_batch(&self.ctx, &hidden, &layer.attn_norm, eps, &mut normed)?;
-            // Hyper-connection pre-mix (hc_mult > 1) is Piece 2b: the loader
-            // already `ensure!`s hc_mult == 1, so the dense (hc_mult == 1) stream
-            // is the identity wrap — no hc_pre/hc_post mixing on this path.
+            // ── Attention half: HC-wrap MLA attention.
+            let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)?;
+            let mut attn_in = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            crate::hc::hc_pre(
+                &self.ctx,
+                &stream,
+                &mhc.pre,
+                hidden_size,
+                hc_mult,
+                &mut attn_in,
+            )?;
+            let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            crate::ops::rms_norm_batch(&self.ctx, &attn_in, &layer.attn_norm, eps, &mut normed)?;
+            let mut attn_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
             crate::attention::mla_attention(
                 &self.ctx,
                 &self.config,
                 &layer.attention,
                 layer.mode,
+                layer.compress_ratio,
                 layer_idx,
                 &normed,
                 &mut sw_caches[layer_idx],
@@ -329,21 +406,62 @@ impl Dsv4Model {
             )?;
             // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
             self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
-            crate::ops::add_batch(&self.ctx, &hidden, &attn_out, &mut hidden_out)?;
-            std::mem::swap(&mut hidden, &mut hidden_out);
+            let mut attn_stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
+            crate::hc::hc_post(
+                &self.ctx,
+                &attn_out,
+                &stream,
+                &mhc.post,
+                &mhc.comb,
+                hidden_size,
+                hc_mult,
+                &mut attn_stream,
+            )?;
+            stream = attn_stream;
 
-            // ── MoE block (Piece 3).
-            crate::ops::rms_norm_batch(&self.ctx, &hidden, &layer.ffn_norm, eps, &mut normed)?;
-            crate::moe::dsv4_moe_forward(self, &layer.moe, &normed, &mut moe_out)?;
+            // ── MoE half: HC-wrap the FP8 DeepGEMM MoE block.
+            let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
+            let mut ffn_in = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            crate::hc::hc_pre(
+                &self.ctx,
+                &stream,
+                &mhc.pre,
+                hidden_size,
+                hc_mult,
+                &mut ffn_in,
+            )?;
+            let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)?;
+            let mut moe_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
+            crate::moe::dsv4_moe_forward(self, &layer.moe, tokens, &normed, &mut moe_out)?;
             // Row-parallel down/combine: sum the per-rank partials.
             self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
-            crate::ops::add_batch(&self.ctx, &hidden, &moe_out, &mut hidden_out)?;
-            std::mem::swap(&mut hidden, &mut hidden_out);
+            let mut ffn_stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
+            crate::hc::hc_post(
+                &self.ctx,
+                &moe_out,
+                &stream,
+                &mhc.post,
+                &mhc.comb,
+                hidden_size,
+                hc_mult,
+                &mut ffn_stream,
+            )?;
+            stream = ffn_stream;
         }
 
-        // ── Final norm + lm_head projection + sample (last token row).
+        // ── Head HC: fold the last token's wide stream row → one hidden vector.
         let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        crate::ops::copy_row_to_vec(&self.ctx, &hidden, seq_len - 1, &mut last_hidden)?;
+        crate::hc::head_hidden_from_stream(
+            &self.ctx,
+            &self.config,
+            &self.head_hc,
+            &stream,
+            seq_len - 1,
+            &mut last_hidden,
+        )?;
+
+        // ── Final norm + lm_head projection + sample (last token row).
         let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
         crate::ops::rms_norm_vec(&self.ctx, &last_hidden, &self.norm, eps, &mut last_normed)?;
         let mut logits = DeviceVec::zeros(&self.ctx, self.lm_head.rows)?;
@@ -399,30 +517,6 @@ impl Dsv4Model {
             .map_err(|e| anyhow::anyhow!("DSv4 MoE config invalid: {e}"))?;
         Ok(moe)
     }
-
-    /// Pin the attention mode for a layer, refusing the modes whose compressor /
-    /// indexer / hyper-connection weights Piece 2 still owns. Keeps Piece 1 from
-    /// silently mis-loading a CSA/HCA layer as plain sliding-window.
-    pub(crate) fn supported_attention_mode(
-        config: &DeepSeekV4Config,
-        layer_idx: usize,
-    ) -> Result<DeepSeekV4AttentionMode> {
-        let plan = config
-            .attention_layer_plan(layer_idx)
-            .ok_or_else(|| anyhow::anyhow!("DSv4 layer {layer_idx} has no attention plan"))?;
-        ensure!(
-            plan.mode == DeepSeekV4AttentionMode::SlidingWindow,
-            "DSv4 layer {layer_idx} is {:?}; CSA/HCA compressor+indexer attention is Piece 2 \
-             (not yet ported)",
-            plan.mode
-        );
-        ensure!(
-            config.hc_mult == 1,
-            "DSv4 hyper-connections (hc_mult={}) are Piece 2 (not yet ported)",
-            config.hc_mult
-        );
-        Ok(plan.mode)
-    }
 }
 
 /// TP runtime for DSv4 load — multi-rank `nccl` builds resolve the NCCL
@@ -439,8 +533,12 @@ fn build_dsv4_tp_runtime() -> Result<crate::tp::TpRuntime> {
     crate::tp::TpRuntime::from_env().map_err(|e| anyhow!("{e}"))
 }
 
-/// Refuse the not-yet-ported variants up front so the loader never half-loads a
-/// shape Piece 2/3 can't run. Called by [`crate::loader`] before any device I/O.
+/// Refuse the genuinely-unported variants up front so the loader never
+/// half-loads a shape the forward can't run. CSA/HCA attention, hyper-connections
+/// (`hc_mult > 1`), and hash-routed MoE layers are all wired now; only the MTP
+/// (speculative-draft) layers remain deferred — they're a separate forward path
+/// with no consumer in the base decode loop. Called by [`crate::loader`] before
+/// any device I/O.
 pub(crate) fn ensure_loadable(config: &DeepSeekV4Config) -> Result<()> {
     ensure!(
         config.num_key_value_heads == 1,
@@ -449,13 +547,14 @@ pub(crate) fn ensure_loadable(config: &DeepSeekV4Config) -> Result<()> {
     );
     ensure!(
         config.num_nextn_predict_layers == 0,
-        "DSv4 MTP layers (num_nextn_predict_layers={}) are deferred (Piece 2 follow-up)",
+        "DSv4 MTP draft layers (num_nextn_predict_layers={}) are deferred (separate \
+         speculative-decode path, no consumer in the base decode loop)",
         config.num_nextn_predict_layers
     );
     ensure!(
-        config.num_hash_layers == 0,
-        "DSv4 hash-routed MoE layers (num_hash_layers={}) are Piece 3 (not yet ported)",
-        config.num_hash_layers
+        config.hc_mult >= 1,
+        "DSv4 hc_mult must be >= 1, got {}",
+        config.hc_mult
     );
     Ok(())
 }

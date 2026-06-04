@@ -24,6 +24,77 @@
 
 use infer_moe::RoutingDecision;
 
+/// Host hash routing for a DSv4 hash-routed MoE layer: each token's experts come
+/// straight from the `tid2eid` table (`token_id * topk .. + topk`), weighted by
+/// the layer's router scores (sqrtsoftplus + normalize + `routed_scaling_factor`,
+/// via `config.moe_routes_from_scores`). No learned router gate / bias.
+///
+/// `logits` is the row-major `[num_tokens, n_routed_experts]` router gemm output
+/// (used only for the SCORES that weight the hash-picked experts). Returns one
+/// [`RoutingDecision`] per token with exactly `topk` experts, matching the bias
+/// path's contract so `flatten_routing` is shared. DSv4-only, so gated on `cuda`
+/// (the `deepseek-spec` dep is a `cuda`-feature dependency).
+#[cfg(feature = "cuda")]
+pub(crate) fn hash_route(
+    config: &deepseek_spec::DeepSeekV4Config,
+    tid2eid: &[i64],
+    tokens: &[u32],
+    logits: &[f32],
+) -> anyhow::Result<Vec<RoutingDecision>> {
+    use infer_moe::ExpertWeight;
+
+    let num_experts = config.n_routed_experts;
+    let topk = config.num_experts_per_tok;
+    anyhow::ensure!(
+        logits.len() == tokens.len() * num_experts,
+        "DSv4 hash route logits len {} != tokens {} * experts {num_experts}",
+        logits.len(),
+        tokens.len()
+    );
+    let mut decisions = Vec::with_capacity(tokens.len());
+    for (token_idx, &token) in tokens.iter().enumerate() {
+        let token = token as usize;
+        anyhow::ensure!(
+            token < config.vocab_size,
+            "DSv4 hash route token {token} exceeds vocab_size {}",
+            config.vocab_size
+        );
+        let start = token * topk;
+        let end = start + topk;
+        anyhow::ensure!(
+            end <= tid2eid.len(),
+            "DSv4 tid2eid too short: need {end} for token {token}, have {}",
+            tid2eid.len()
+        );
+        let experts: Vec<usize> = tid2eid[start..end]
+            .iter()
+            .map(|&e| {
+                anyhow::ensure!(e >= 0, "DSv4 tid2eid has negative expert id {e}");
+                usize::try_from(e)
+                    .map_err(|_| anyhow::anyhow!("DSv4 tid2eid expert id {e} overflow"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+
+        let row = &logits[token_idx * num_experts..(token_idx + 1) * num_experts];
+        let scores = config
+            .router_scores_from_logits(row)
+            .map_err(|e| anyhow::anyhow!("DSv4 hash route scores: {e}"))?;
+        let routes = config
+            .moe_routes_from_scores(0, token_idx, &scores, None, Some(&experts))
+            .map_err(|e| anyhow::anyhow!("DSv4 hash route weights: {e}"))?;
+        decisions.push(RoutingDecision {
+            experts: routes
+                .into_iter()
+                .map(|r| ExpertWeight {
+                    expert: r.expert_idx,
+                    weight: r.weight,
+                })
+                .collect(),
+        });
+    }
+    Ok(decisions)
+}
+
 /// Flatten per-token [`RoutingDecision`]s into the token-major flat buffers the
 /// `dsv4_*` kernels read at `route = token * topk + k`: `route_indices` (expert
 /// id), `route_weights` (gate weight), each length `num_tokens * topk`. Each
@@ -368,16 +439,20 @@ mod dsv4_gpu {
     /// FP8 DeepGEMM MoE forward for one DSv4 routed-MoE layer (this EP rank's
     /// experts only). Mirrors the BF16 [`super::gpu::moe_forward`] route/pack/
     /// scatter/combine plumbing but swaps the two BF16 grouped GEMMs for the
-    /// native DeepGEMM 5-call FP8 pipeline (`f8f8bf16`, 128-block scale), threads
-    /// the real `noaux_tc` gate bias through the router, and runs the DSv4 dense
-    /// shared expert (clamped SwiGLU, no sigmoid gate).
+    /// native DeepGEMM 5-call FP8 pipeline (`f8f8bf16`, 128-block scale) and runs
+    /// the DSv4 dense shared expert (clamped SwiGLU, no sigmoid gate).
     ///
-    /// `hidden` is the post-LN `[num_tokens, hidden]`; `out` receives routed +
-    /// shared. Same `&HiddenStates` / `&mut HiddenStates` shape contract Piece 2
-    /// calls from `model.rs`.
+    /// Routing is per-layer: bias-routed layers run the learned router gemm +
+    /// `noaux_tc` correction bias through `infer_moe::route`; hash-routed layers
+    /// (`layer.hash_tid2eid` present) pick experts directly from the `tid2eid`
+    /// table by token id (no router gate), weighting them by the router scores.
+    ///
+    /// `tokens` are the input token ids (needed for hash routing); `hidden` is
+    /// the post-LN `[num_tokens, hidden]`; `out` receives routed + shared.
     pub(crate) fn dsv4_moe_forward(
         model: &Dsv4Model,
         layer: &Dsv4MoeLayer,
+        tokens: &[u32],
         hidden: &HiddenStates,
         out: &mut HiddenStates,
     ) -> Result<()> {
@@ -392,6 +467,11 @@ mod dsv4_gpu {
         let experts_per_rank = split.experts_per_rank;
         let local_start = split.local_expert_start;
 
+        ensure!(
+            tokens.len() == num_tokens,
+            "DSv4 MoE token count {} != hidden seq_len {num_tokens}",
+            tokens.len()
+        );
         ensure!(
             out.hidden_dim == hidden_dim && out.seq_len == num_tokens,
             "DSv4 MoE out shape {}x{} != hidden {}x{}",
@@ -409,12 +489,6 @@ mod dsv4_gpu {
             cfg.num_experts
         );
         ensure!(
-            layer.gate_bias.len == cfg.num_experts,
-            "DSv4 gate bias len {} != num_experts {}",
-            layer.gate_bias.len,
-            cfg.num_experts
-        );
-        ensure!(
             layer.w13.len() == experts_per_rank && layer.w2.len() == experts_per_rank,
             "DSv4 expert cache count mismatch: w13={} w2={} experts_per_rank={}",
             layer.w13.len(),
@@ -425,24 +499,16 @@ mod dsv4_gpu {
         // Fail loud if the native DeepGEMM bridge is a build-time stub.
         moe::dsv4_deepgemm_native_preflight()?;
 
-        // ── 1. Router gemm → logits[T, E] (BF16 gate; small router stays BF16). ─
+        // ── 1+2. Router gemm → logits[T, E] → HOST route (bias or hash). ────────
         let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
         gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
-
-        // ── 2. HOST route — thread the REAL noaux_tc gate bias (not &[]). ───────
         ctx.sync()?;
         let logits_bf16: Vec<bf16> = ctx
             .stream
             .clone_dtoh(&logits.data)
             .map_err(|e| anyhow::anyhow!("DSv4 router logits D2H failed: {e}"))?;
         let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
-        let bias_bf16: Vec<bf16> = ctx
-            .stream
-            .clone_dtoh(&layer.gate_bias.data)
-            .map_err(|e| anyhow::anyhow!("DSv4 gate bias D2H failed: {e}"))?;
-        let bias_host: Vec<f32> = bias_bf16.iter().map(|&v| v.to_f32()).collect();
-        let decisions = infer_moe::route(&logits_host, &bias_host, cfg)
-            .map_err(|e| anyhow::anyhow!("DSv4 host route failed: {e}"))?;
+        let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
         let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
         let total_routes = num_tokens * topk;
 
@@ -578,6 +644,42 @@ mod dsv4_gpu {
         out.data = combined.data;
 
         Ok(())
+    }
+
+    /// Dispatch DSv4 host routing for one layer: bias-routed → learned router +
+    /// `noaux_tc` correction bias via `infer_moe::route` (the validated path);
+    /// hash-routed → `tid2eid` table via [`super::hash_route`]. Returns one
+    /// [`RoutingDecision`] per token.
+    pub(crate) fn dsv4_route(
+        ctx: &DeviceContext,
+        config: &deepseek_spec::DeepSeekV4Config,
+        moe_config: &infer_moe::MoeConfig,
+        layer: &Dsv4MoeLayer,
+        tokens: &[u32],
+        logits_host: &[f32],
+    ) -> Result<Vec<infer_moe::RoutingDecision>> {
+        use deepseek_spec::DeepSeekV4MoeRoutingKind;
+        match layer.routing_kind {
+            DeepSeekV4MoeRoutingKind::Hash => {
+                let tid2eid = layer.hash_tid2eid.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("DSv4 hash-routed MoE layer missing tid2eid table")
+                })?;
+                super::hash_route(config, tid2eid, tokens, logits_host)
+            }
+            DeepSeekV4MoeRoutingKind::LearnedBias => {
+                let gate_bias = layer.gate_bias.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("DSv4 bias-routed MoE layer missing gate bias")
+                })?;
+                // bias D2H is cheap (one [n_routed] vec); thread the REAL bias.
+                let bias_bf16: Vec<bf16> = ctx
+                    .stream
+                    .clone_dtoh(&gate_bias.data)
+                    .map_err(|e| anyhow::anyhow!("DSv4 gate bias D2H failed: {e}"))?;
+                let bias_host: Vec<f32> = bias_bf16.iter().map(|&v| v.to_f32()).collect();
+                infer_moe::route(logits_host, &bias_host, moe_config)
+                    .map_err(|e| anyhow::anyhow!("DSv4 host route failed: {e}"))
+            }
+        }
     }
 
     /// Run the FP8 DeepGEMM 5-call grouped expert pipeline over this rank's local
@@ -1040,5 +1142,79 @@ mod tests {
             "weight ≈ routed_scaling 2.5, got {}",
             w[0]
         );
+    }
+
+    // ── DSv4 hash routing (`super::hash_route`). Hash layers pick experts from
+    // the tid2eid table by token id (ignoring the router gate selection), then
+    // weight them by the sqrtsoftplus router scores. cuda-gated: `deepseek_spec`
+    // is a `cuda`-feature dep.
+    #[cfg(feature = "cuda")]
+    fn hash_test_config() -> deepseek_spec::DeepSeekV4Config {
+        deepseek_spec::DeepSeekV4Config::from_json_str(
+            r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4", "torch_dtype": "bfloat16",
+            "vocab_size": 8, "hidden_size": 256, "num_hidden_layers": 3,
+            "num_attention_heads": 8, "num_key_value_heads": 1, "head_dim": 512,
+            "hidden_act": "silu", "swiglu_limit": 10.0, "q_lora_rank": 256,
+            "o_lora_rank": 256, "o_groups": 8, "qk_rope_head_dim": 64,
+            "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
+            "moe_intermediate_size": 256, "routed_scaling_factor": 1.0,
+            "norm_topk_prob": true, "scoring_func": "sqrtsoftplus",
+            "topk_method": "noaux_tc", "index_n_heads": 8, "index_head_dim": 64,
+            "index_topk": 64, "num_hash_layers": 3, "sliding_window": 64,
+            "compress_ratios": [0, 4, 0], "compress_rope_theta": 160000.0,
+            "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1.0e-6,
+            "num_nextn_predict_layers": 0, "max_position_embeddings": 4096,
+            "rope_theta": 10000.0,
+            "rope_scaling": {"type": "yarn", "factor": 16.0,
+                "original_max_position_embeddings": 2048, "beta_fast": 32.0, "beta_slow": 1.0},
+            "rms_norm_eps": 1.0e-6, "initializer_range": 0.02,
+            "tie_word_embeddings": false, "attention_bias": false,
+            "attention_dropout": 0.0, "bos_token_id": 0, "eos_token_id": 1
+        }"#,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn hash_route_picks_tid2eid_experts_ignoring_logits() {
+        let cfg = hash_test_config();
+        // tid2eid: token 0 → experts [1,2]; token 1 → experts [3,0]. topk=2.
+        let tid2eid: Vec<i64> = vec![1, 2, /*tok0*/ 3, 0 /*tok1*/];
+        let tokens = vec![0u32, 1u32];
+        // Logits rank expert 3 highest for both tokens; hash must IGNORE that
+        // for selection (experts come from tid2eid), using logits only to weight.
+        let logits = vec![
+            0.1f32, 0.2, 0.3, 0.9, // token 0
+            0.1, 0.2, 0.3, 0.9, // token 1
+        ];
+        let decisions = super::hash_route(&cfg, &tid2eid, &tokens, &logits).unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(
+            decisions[0].expert_ids(),
+            vec![1, 2],
+            "token 0 from tid2eid"
+        );
+        assert_eq!(
+            decisions[1].expert_ids(),
+            vec![3, 0],
+            "token 1 from tid2eid"
+        );
+        // Weights are positive normalized scores (each token's two weights sum ~1).
+        let (idx, w) = flatten_routing(&decisions, cfg.num_experts_per_tok).unwrap();
+        assert_eq!(idx, vec![1, 2, 3, 0]);
+        assert!((w[0] + w[1] - 1.0).abs() < 1e-3, "token 0 weights sum ~1");
+        assert!((w[2] + w[3] - 1.0).abs() < 1e-3, "token 1 weights sum ~1");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn hash_route_rejects_token_beyond_table() {
+        let cfg = hash_test_config();
+        let tid2eid: Vec<i64> = vec![0, 1]; // only token 0's two experts present
+        // token 1 needs entries [2,3] which the short table can't supply.
+        assert!(super::hash_route(&cfg, &tid2eid, &[0u32, 1u32], &[0.0; 8]).is_err());
     }
 }

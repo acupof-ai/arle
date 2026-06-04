@@ -864,13 +864,17 @@ impl SafetensorLoader {
     }
 
     /// Build the per-rank DSv4 MoE layer (FP8 DeepGEMM expert caches + router).
+    /// Bias-routed layers load `gate.bias`; hash-routed layers load the host
+    /// `gate.tid2eid` table instead (and skip the bias).
     pub(crate) fn load_dsv4_moe_layer(
         &self,
         ctx: &DeviceContext,
         names: &deepseek_spec::DeepSeekV4MoeTensorNames,
         split: &crate::moe_config::ExpertSplit,
+        routing_kind: deepseek_spec::DeepSeekV4MoeRoutingKind,
     ) -> Result<crate::dsv4::Dsv4MoeLayer> {
         use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
+        use deepseek_spec::DeepSeekV4MoeRoutingKind;
 
         let mut w13 = Vec::with_capacity(split.experts_per_rank);
         let mut w2 = Vec::with_capacity(split.experts_per_rank);
@@ -888,11 +892,22 @@ impl SafetensorLoader {
         }
 
         let gate = self.load_dsv4_bf16_matrix(ctx, &names.gate_weight)?;
-        let gate_bias_name = names
-            .gate_bias
-            .as_ref()
-            .ok_or_else(|| anyhow!("DSv4 bias-routed MoE layer missing gate.bias"))?;
-        let gate_bias = self.load_dsv4_vec(ctx, gate_bias_name)?;
+        let (gate_bias, hash_tid2eid) = match routing_kind {
+            DeepSeekV4MoeRoutingKind::LearnedBias => {
+                let bias_name = names
+                    .gate_bias
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("DSv4 bias-routed MoE layer missing gate.bias"))?;
+                (Some(self.load_dsv4_vec(ctx, bias_name)?), None)
+            }
+            DeepSeekV4MoeRoutingKind::Hash => {
+                let tid_name = names
+                    .gate_tid2eid
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("DSv4 hash-routed MoE layer missing gate.tid2eid"))?;
+                (None, Some(self.load_dsv4_i64_host(tid_name)?))
+            }
+        };
 
         let shared = names
             .shared_experts
@@ -910,8 +925,47 @@ impl SafetensorLoader {
             w2,
             gate,
             gate_bias,
+            hash_tid2eid,
+            routing_kind,
             shared_w13,
             shared_w2,
+        })
+    }
+
+    /// Load a DSv4 1D `i64` table (hash routing `gate.tid2eid`) into a host
+    /// `Vec<i64>`. Hash routing reads it per-token on the host (slice token_id ×
+    /// topk), so it never goes to the device.
+    pub(crate) fn load_dsv4_i64_host(&self, name: &str) -> Result<Vec<i64>> {
+        use safetensors::tensor::Dtype;
+        let tensor = self.load_raw_tensor(name)?;
+        ensure!(
+            tensor.dtype == Dtype::I64,
+            "{name}: DSv4 tid2eid expected I64, got {:?}",
+            tensor.dtype
+        );
+        ensure!(
+            tensor.bytes.len() % 8 == 0,
+            "{name}: I64 byte length {} is not a multiple of 8",
+            tensor.bytes.len()
+        );
+        Ok(tensor
+            .bytes
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+            .collect())
+    }
+
+    /// Load one DSv4 hyper-connection block (`base` bf16 vec, `mix_fn` matrix —
+    /// bf16 or FP8/FP4 block-scaled, `scale` bf16 vec).
+    pub(crate) fn load_dsv4_hyper_connection(
+        &self,
+        ctx: &DeviceContext,
+        names: &deepseek_spec::DeepSeekV4HyperConnectionTensorNames,
+    ) -> Result<crate::dsv4::Dsv4HyperConnection> {
+        Ok(crate::dsv4::Dsv4HyperConnection {
+            base: self.load_dsv4_vec(ctx, &names.base)?,
+            mix_fn: self.load_dsv4_global_matrix(ctx, &names.mix_fn)?,
+            scale: self.load_dsv4_vec(ctx, &names.scale)?,
         })
     }
 
@@ -931,8 +985,10 @@ impl SafetensorLoader {
         }
     }
 
-    /// Build one DSv4 MLA attention block (SW-mode FP8 LoRA weights). CSA/HCA
-    /// compressor + indexer weights are Piece 2.
+    /// Build one DSv4 MLA attention block. The Q/KV/O LoRA matrices are FP8/FP4
+    /// block-scaled; CSA/HCA layers also carry a `compressor` (and CSA an
+    /// `indexer`) — their matrices may be FP8/FP4 or bf16, so they route through
+    /// the dtype-dispatching [`Self::load_dsv4_global_matrix`].
     pub(crate) fn load_dsv4_attention(
         &self,
         ctx: &DeviceContext,
@@ -947,6 +1003,43 @@ impl SafetensorLoader {
             wo_a: self.load_dsv4_block_scaled(ctx, &names.wo_a)?,
             wo_b: self.load_dsv4_block_scaled(ctx, &names.wo_b)?,
             attn_sink: self.load_dsv4_vec(ctx, &names.attn_sink)?,
+            compressor: names
+                .compressor
+                .as_ref()
+                .map(|c| self.load_dsv4_compressor(ctx, c))
+                .transpose()?,
+            indexer: names
+                .indexer
+                .as_ref()
+                .map(|i| self.load_dsv4_indexer(ctx, i))
+                .transpose()?,
+        })
+    }
+
+    /// Load one compressor sub-block (`wkv`/`wgate`/`ape` matrices + `norm` vec).
+    pub(crate) fn load_dsv4_compressor(
+        &self,
+        ctx: &DeviceContext,
+        names: &deepseek_spec::DeepSeekV4CompressorTensorNames,
+    ) -> Result<crate::dsv4::Dsv4Compressor> {
+        Ok(crate::dsv4::Dsv4Compressor {
+            wkv: self.load_dsv4_global_matrix(ctx, &names.wkv)?,
+            wgate: self.load_dsv4_global_matrix(ctx, &names.wgate)?,
+            ape: self.load_dsv4_global_matrix(ctx, &names.ape)?,
+            norm: self.load_dsv4_vec(ctx, &names.norm)?,
+        })
+    }
+
+    /// Load one CSA indexer sub-block (`wq_b`/`weights_proj` + a key compressor).
+    pub(crate) fn load_dsv4_indexer(
+        &self,
+        ctx: &DeviceContext,
+        names: &deepseek_spec::DeepSeekV4IndexerTensorNames,
+    ) -> Result<crate::dsv4::Dsv4Indexer> {
+        Ok(crate::dsv4::Dsv4Indexer {
+            wq_b: self.load_dsv4_global_matrix(ctx, &names.wq_b)?,
+            weights_proj: self.load_dsv4_global_matrix(ctx, &names.weights_proj)?,
+            compressor: self.load_dsv4_compressor(ctx, &names.compressor)?,
         })
     }
 }

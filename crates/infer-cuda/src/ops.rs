@@ -267,6 +267,29 @@ pub(crate) fn copy_row_to_vec(
         .map_err(|e| anyhow!("D2D copy last hidden row failed: {e}"))
 }
 
+/// Copy one token row of a batch into a single-token `HiddenStates` (`seq_len ==
+/// 1`, same `hidden_dim`). The HC head needs the last stream row as a batch-of-1
+/// so the mix_fn GEMM can run on it.
+pub(crate) fn copy_row_to_hidden(
+    ctx: &DeviceContext,
+    batch: &HiddenStates,
+    token_idx: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        out.hidden_dim == batch.hidden_dim && out.seq_len == 1,
+        "copy_row_to_hidden out shape {}x{} != {}x1",
+        out.hidden_dim,
+        out.seq_len,
+        batch.hidden_dim
+    );
+    let offset = token_idx * batch.hidden_dim;
+    let src = batch.data.slice(offset..offset + batch.hidden_dim);
+    ctx.stream
+        .memcpy_dtod(&src, &mut out.data)
+        .map_err(|e| anyhow!("D2D copy stream row failed: {e}"))
+}
+
 pub(crate) fn argmax(ctx: &DeviceContext, logits: &DeviceVec) -> Result<u32> {
     let mut out = ctx
         .stream

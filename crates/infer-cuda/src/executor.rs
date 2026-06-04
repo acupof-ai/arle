@@ -34,7 +34,76 @@ fn decode_graph_enabled() -> bool {
     )
 }
 
-pub(crate) struct RealCudaExecutor {
+/// The real cuda-kernels executor. Qwen3 dense / Qwen3.5-3.6 MoE run the paged
+/// continuous-batching path ([`QwenCudaExecutor`]); DSv4-Flash runs the MLA +
+/// hyper-connection + FP8 DeepGEMM MoE forward ([`Dsv4CudaExecutor`]), which owns
+/// its own MLA KV state (no `PagedKVPool`) and disables the decode graph.
+pub(crate) enum RealCudaExecutor {
+    Qwen(Box<QwenCudaExecutor>),
+    Dsv4(Box<Dsv4CudaExecutor>),
+}
+
+impl std::fmt::Debug for RealCudaExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Qwen(q) => q.fmt(f),
+            Self::Dsv4(d) => d.fmt(f),
+        }
+    }
+}
+
+impl RealCudaExecutor {
+    pub(crate) fn from_qwen3_bf16_safetensors(
+        model_path: impl AsRef<Path>,
+        num_slots: usize,
+        total_pages: usize,
+    ) -> Result<Self> {
+        Ok(Self::Qwen(Box::new(
+            QwenCudaExecutor::from_qwen3_bf16_safetensors(model_path, num_slots, total_pages)?,
+        )))
+    }
+
+    pub(crate) fn from_qwen35_moe_safetensors(
+        model_path: impl AsRef<Path>,
+        num_slots: usize,
+        total_pages: usize,
+    ) -> Result<Self> {
+        Ok(Self::Qwen(Box::new(
+            QwenCudaExecutor::from_qwen35_moe_safetensors(model_path, num_slots, total_pages)?,
+        )))
+    }
+
+    /// Build the DSv4-Flash executor (MLA + HC + FP8 MoE, multi-GPU TP/EP).
+    pub(crate) fn from_dsv4_fp8_safetensors(
+        model_path: impl AsRef<Path>,
+        num_slots: usize,
+    ) -> Result<Self> {
+        Ok(Self::Dsv4(Box::new(
+            Dsv4CudaExecutor::from_dsv4_fp8_safetensors(model_path, num_slots)?,
+        )))
+    }
+
+    pub(crate) fn submit(
+        &mut self,
+        plan: &ForwardPlan,
+        host_kv: &mut dyn KvPool,
+    ) -> Result<StepOutput> {
+        match self {
+            Self::Qwen(q) => q.submit(plan, host_kv),
+            Self::Dsv4(d) => d.submit(plan),
+        }
+    }
+
+    pub(crate) fn warmup(&mut self) -> Result<()> {
+        match self {
+            Self::Qwen(q) => q.warmup(),
+            // DSv4 has no captured decode graph (MLA host-routing + recompute).
+            Self::Dsv4(_) => Ok(()),
+        }
+    }
+}
+
+pub(crate) struct QwenCudaExecutor {
     model: CudaModel,
     kv: PagedKVPool,
     num_slots: usize,
@@ -48,9 +117,9 @@ pub(crate) struct RealCudaExecutor {
     graphs: Option<GraphBucket>,
 }
 
-impl std::fmt::Debug for RealCudaExecutor {
+impl std::fmt::Debug for QwenCudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RealCudaExecutor")
+        f.debug_struct("QwenCudaExecutor")
             .field("model", &self.model)
             .field("num_slots", &self.num_slots)
             .field("page_size", &self.kv.page_size)
@@ -64,7 +133,7 @@ impl std::fmt::Debug for RealCudaExecutor {
     }
 }
 
-impl RealCudaExecutor {
+impl QwenCudaExecutor {
     pub(crate) fn from_qwen3_bf16_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
@@ -414,6 +483,94 @@ impl RealCudaExecutor {
             "chunked prefill requires materialized CUDA cache_len == start_pos; got cache_len={materialized}, start_pos={start_pos}"
         );
         Ok(())
+    }
+}
+
+/// DSv4-Flash executor: drives [`crate::dsv4::Dsv4Model::forward_tokens`] over a
+/// single scheduled row. DSv4 owns its MLA KV state inside the forward (the bf16
+/// SW ring + recomputed compressed pool), so it does NOT use a [`PagedKVPool`];
+/// it relies on the host [`KvPool`] only for the slot's logical `seq_len` to
+/// derive `start_pos`. The decode graph is disabled (MLA host-routing per step).
+///
+/// First-runnable scope: single-row prefill/decode, the uncached correctness
+/// path (each step recomputes the compressed pool from `[0, start_pos+len)`). A
+/// continuous-batching path that retains per-slot SW/compressed state across
+/// decode steps is the perf follow-up.
+pub(crate) struct Dsv4CudaExecutor {
+    model: crate::dsv4::Dsv4Model,
+    num_slots: usize,
+}
+
+impl std::fmt::Debug for Dsv4CudaExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dsv4CudaExecutor")
+            .field("model", &self.model)
+            .field("num_slots", &self.num_slots)
+            .finish()
+    }
+}
+
+impl Dsv4CudaExecutor {
+    pub(crate) fn from_dsv4_fp8_safetensors(
+        model_path: impl AsRef<Path>,
+        num_slots: usize,
+    ) -> Result<Self> {
+        ensure!(num_slots > 0, "Dsv4CudaExecutor requires at least one slot");
+        let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(model_path.as_ref())?;
+        Ok(Self { model, num_slots })
+    }
+
+    fn submit(&mut self, plan: &ForwardPlan) -> Result<StepOutput> {
+        let rows = plan.decode_rows.len() + plan.prefill_rows.len();
+        if rows == 0 {
+            return Ok(StepOutput { tokens: Vec::new() });
+        }
+        ensure!(
+            rows == 1,
+            "DSv4 CUDA forward is single-row only, got {} prefill + {} decode rows",
+            plan.prefill_rows.len(),
+            plan.decode_rows.len()
+        );
+
+        let (slot, token) = if let Some(row) = plan.prefill_rows.first() {
+            ensure!(
+                row.slot < self.num_slots,
+                "prefill slot {} outside DSv4 executor slots {}",
+                row.slot,
+                self.num_slots
+            );
+            ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
+            let position = (row.start_pos + row.tokens.len()) as u64;
+            let token =
+                self.model
+                    .forward_tokens(&row.tokens, row.start_pos, &row.params, position)?;
+            (row.slot, token)
+        } else {
+            let row = &plan.decode_rows[0];
+            ensure!(
+                row.slot < self.num_slots,
+                "decode slot {} outside DSv4 executor slots {}",
+                row.slot,
+                self.num_slots
+            );
+            let position = row.kv_seq_len.saturating_add(1) as u64;
+            let token = self.model.forward_tokens(
+                &[row.last_token],
+                row.kv_seq_len,
+                &row.params,
+                position,
+            )?;
+            (row.slot, token)
+        };
+
+        Ok(StepOutput {
+            tokens: vec![SlotToken {
+                slot,
+                token,
+                logprob: None,
+                finish: None,
+            }],
+        })
     }
 }
 
