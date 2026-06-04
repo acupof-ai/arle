@@ -28,6 +28,7 @@
 //! - [`schema`] — the OpenAI wire types and `ApiError` (COLD).
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -41,7 +42,7 @@ mod http;
 mod schema;
 mod tokenizer;
 
-pub use execution::StreamItem;
+pub use execution::{CounterSnapshot, StreamItem};
 use execution::{Submission, engine_loop};
 
 pub use http::openai_router;
@@ -63,6 +64,8 @@ pub use http::metal_openai_router_from_model_path;
 pub struct ServeHandle<E: BackendExecutor, K: KvPool> {
     submit_tx: Option<Sender<Submission>>,
     join: Option<JoinHandle<()>>,
+    /// Latest scheduler counters, republished by the engine loop each tick.
+    counters: Arc<Mutex<CounterSnapshot>>,
     _backend: std::marker::PhantomData<fn() -> (E, K)>,
 }
 
@@ -131,13 +134,22 @@ where
     /// [`ServeHandle::collect`].
     pub fn spawn(executor: E, kv: K, config: SchedulerConfig) -> Self {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
+        let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
+        let loop_counters = Arc::clone(&counters);
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
-            .spawn(move || engine_loop(Engine::with_config(executor, kv, config), submit_rx))
+            .spawn(move || {
+                engine_loop(
+                    Engine::with_config(executor, kv, config),
+                    submit_rx,
+                    loop_counters,
+                )
+            })
             .expect("spawn infer-engine thread");
         Self {
             submit_tx: Some(submit_tx),
             join: Some(join),
+            counters,
             _backend: std::marker::PhantomData,
         }
     }
@@ -160,12 +172,14 @@ where
     {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
+        let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
+        let loop_counters = Arc::clone(&counters);
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
             .spawn(move || match builder() {
                 Ok(engine) => {
                     let _ = ready_tx.send(Ok(()));
-                    engine_loop(engine, submit_rx);
+                    engine_loop(engine, submit_rx, loop_counters);
                 }
                 Err(err) => {
                     let _ = ready_tx.send(Err(err.to_string()));
@@ -180,6 +194,7 @@ where
             Ok(()) => Ok(Self {
                 submit_tx: Some(submit_tx),
                 join: Some(join),
+                counters,
                 _backend: std::marker::PhantomData,
             }),
             Err(err) => {
@@ -271,6 +286,14 @@ where
     /// Convenience wrapper over [`RequestTicket::collect`].
     pub fn collect(&self, ticket: RequestTicket) -> Result<CompletedRequest> {
         ticket.collect()
+    }
+
+    /// Snapshot of the engine's live scheduler counters (active requests, queue
+    /// depth, free KV pages), republished by the engine loop each tick. Defaults
+    /// to zero before the first tick (or if the engine thread has gone).
+    #[must_use]
+    pub fn counters(&self) -> CounterSnapshot {
+        self.counters.lock().map(|c| *c).unwrap_or_default()
     }
 
     /// Close the submit channel and join the engine thread.
@@ -425,6 +448,38 @@ mod tests {
         let done = done.expect("terminal Done item");
         assert_eq!(done.generated_tokens, streamed);
         assert_eq!(ticket.collect()?.generated_tokens, streamed);
+
+        serve.shutdown().expect("engine thread joins cleanly");
+        Ok(())
+    }
+
+    /// The engine loop republishes scheduler counters each tick; after a request
+    /// runs, `counters()` reflects a live (non-default) snapshot — proving the
+    /// publish path, vs the all-zero default before the first tick.
+    #[test]
+    fn counters_are_published_each_tick() -> Result<()> {
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_prompt_tokens: 4096,
+            max_total_tokens: 8192,
+            ..SchedulerConfig::default()
+        };
+        let kv = MetalKvPool::new(1, 256, 16);
+        let serve = ServeHandle::spawn(EchoExecutor, kv, config);
+
+        serve
+            .submit(vec![10, 11, 12], 4, SamplingParams::default())?
+            .collect()?;
+
+        // After ticks ran, the snapshot reflects the (now idle) engine: requests
+        // drained and the KV pool restored to its non-zero free-page count.
+        let snap = serve.counters();
+        assert_eq!(snap.active_requests, 0, "request drained");
+        assert_eq!(snap.queue_depth, 0, "queue drained");
+        assert!(
+            snap.kv_free_pages > 0,
+            "free-page count published, not default"
+        );
 
         serve.shutdown().expect("engine thread joins cleanly");
         Ok(())

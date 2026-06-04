@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use infer_core::{CompletedRequest, Engine, RequestHandle, RequestOptions};
@@ -35,6 +36,32 @@ pub enum StreamItem {
 /// so `Rc<RefCell<_>>` is sound; every borrow is short and never spans a step.
 type Streamers = Rc<RefCell<HashMap<RequestHandle, Sender<StreamItem>>>>;
 
+/// Live scheduler counters the engine loop publishes each tick for the frontend
+/// (`ServeHandle::counters`). Only counters the engine already tracks — no
+/// fabricated latency metrics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CounterSnapshot {
+    pub active_requests: usize,
+    pub queue_depth: usize,
+    pub kv_free_pages: usize,
+}
+
+/// Cross-thread handle to the latest [`CounterSnapshot`]: the engine loop writes
+/// it each tick, the frontend reads it.
+type CounterHandle = Arc<Mutex<CounterSnapshot>>;
+
+/// Publish the engine's current counters to the shared snapshot.
+fn publish_counters<E: BackendExecutor, K: KvPool>(
+    engine: &Engine<E, K>,
+    counters: &CounterHandle,
+) {
+    if let Ok(mut snap) = counters.lock() {
+        snap.active_requests = engine.active_count();
+        snap.queue_depth = engine.waiting_count();
+        snap.kv_free_pages = engine.kv_free_pages();
+    }
+}
+
 /// One unit of frontend->engine work: a prompt plus a place to send back the
 /// engine-assigned handle and (later) the completion.
 pub(crate) struct Submission {
@@ -52,8 +79,11 @@ pub(crate) struct Submission {
 }
 
 /// The engine thread body: own the engine, drain submits, step, deliver.
-pub(crate) fn engine_loop<E, K>(mut engine: Engine<E, K>, submit_rx: Receiver<Submission>)
-where
+pub(crate) fn engine_loop<E, K>(
+    mut engine: Engine<E, K>,
+    submit_rx: Receiver<Submission>,
+    counters: CounterHandle,
+) where
     E: BackendExecutor,
     K: KvPool,
 {
@@ -96,6 +126,7 @@ where
                 }
             }
         }
+        publish_counters(&engine, &counters);
 
         // 2. If there is engine work, run one tick and deliver any completions.
         //    Looping here (rather than one tick per outer pass) keeps latency low
@@ -109,6 +140,7 @@ where
                 return;
             }
             deliver_completions(&engine, &mut pending, &streamers);
+            publish_counters(&engine, &counters);
             continue;
         }
 
