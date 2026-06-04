@@ -41,6 +41,10 @@ metal = ["dep:infer-metal", "infer-metal/metal", "infer-server/metal"]
 # host KV pool + the placeholder MetalExecutor (no MLX, no CUDA). Used for
 # smoke / CI and the adapter integration test.
 cpu = ["dep:infer-metal"]
+# Multi-rank NCCL collectives for the TP communicator. Implies `cuda`; forwards
+# to infer-cuda's `nccl` feature (declared optionally so it only engages when
+# the CUDA backend is pulled in).
+nccl = ["cuda", "infer-cuda?/nccl"]
 
 [dev-dependencies]
 infer-core = { path = "../infer-core" }
