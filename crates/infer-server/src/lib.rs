@@ -42,8 +42,8 @@ mod http;
 mod schema;
 mod tokenizer;
 
+use execution::{ControlMessage, Submission, engine_loop};
 pub use execution::{CounterSnapshot, StreamItem};
-use execution::{Submission, engine_loop};
 
 pub use http::openai_router;
 pub use schema::{
@@ -63,6 +63,11 @@ pub use http::metal_openai_router_from_model_path;
 /// separate thread.
 pub struct ServeHandle<E: BackendExecutor, K: KvPool> {
     submit_tx: Option<Sender<Submission>>,
+    /// Out-of-band control channel: runs a `FnOnce(&mut E)` on the engine thread
+    /// between steps. The OPD control surface (raw-logits forward, weight
+    /// offload/reload, student-LoRA re-merge) reaches the thread-owned executor
+    /// through here without crossing the request hot path.
+    control_tx: Option<Sender<ControlMessage<E>>>,
     join: Option<JoinHandle<()>>,
     /// Latest scheduler counters, republished by the engine loop each tick.
     counters: Arc<Mutex<CounterSnapshot>>,
@@ -134,6 +139,7 @@ where
     /// [`ServeHandle::collect`].
     pub fn spawn(executor: E, kv: K, config: SchedulerConfig) -> Self {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
+        let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E>>();
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
         let join = thread::Builder::new()
@@ -142,12 +148,14 @@ where
                 engine_loop(
                     Engine::with_config(executor, kv, config),
                     submit_rx,
+                    control_rx,
                     loop_counters,
                 )
             })
             .expect("spawn infer-engine thread");
         Self {
             submit_tx: Some(submit_tx),
+            control_tx: Some(control_tx),
             join: Some(join),
             counters,
             _backend: std::marker::PhantomData,
@@ -171,6 +179,7 @@ where
         B: FnOnce() -> Result<Engine<E, K>> + Send + 'static,
     {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
+        let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E>>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
@@ -179,7 +188,7 @@ where
             .spawn(move || match builder() {
                 Ok(engine) => {
                     let _ = ready_tx.send(Ok(()));
-                    engine_loop(engine, submit_rx, loop_counters);
+                    engine_loop(engine, submit_rx, control_rx, loop_counters);
                 }
                 Err(err) => {
                     let _ = ready_tx.send(Err(err.to_string()));
@@ -193,6 +202,7 @@ where
         {
             Ok(()) => Ok(Self {
                 submit_tx: Some(submit_tx),
+                control_tx: Some(control_tx),
                 join: Some(join),
                 counters,
                 _backend: std::marker::PhantomData,
@@ -296,6 +306,51 @@ where
         self.counters.lock().map(|c| *c).unwrap_or_default()
     }
 
+    /// Run `f` against the engine-thread-owned executor and return its result.
+    ///
+    /// The closure executes on the engine thread (between scheduler steps), so it
+    /// has exclusive `&mut E` access without racing the request hot path. This is
+    /// the out-of-band control seam the OPD surface uses to reach the executor's
+    /// non-serving methods (raw-logits forward, weight offload/reload, LoRA
+    /// re-merge) which the request/response channels cannot express. Blocks until
+    /// the engine thread runs the closure and returns its value.
+    pub fn run_on_executor<R, F>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut E) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let control_tx = self
+            .control_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("ServeHandle already shut down"))?;
+        let (response_tx, response_rx) = mpsc::channel::<R>();
+        control_tx
+            .send(Box::new(move |executor: &mut E| {
+                // If the caller dropped the receiver, discard the result.
+                let _ = response_tx.send(f(executor));
+            }))
+            .map_err(|_| anyhow!("engine thread closed; cannot run control closure"))?;
+        response_rx
+            .recv()
+            .map_err(|_| anyhow!("engine thread closed before running control closure"))
+    }
+
+    /// Offload the engine's device weights to host RAM (OPD teacher weight
+    /// time-share), returning the device bytes freed.
+    ///
+    /// Runs on the engine thread (between scheduler steps) via the out-of-band
+    /// control seam, so the weight movement never races an in-flight forward
+    /// step. Blocks until the round-trip completes.
+    pub fn offload_engine_weights(&self) -> Result<usize> {
+        self.run_on_executor(|executor| executor.offload_weights())?
+    }
+
+    /// Reload the engine's device weights from the host snapshot (OPD teacher
+    /// weight time-share). Blocks until the H2D round-trip completes.
+    pub fn reload_engine_weights(&self) -> Result<()> {
+        self.run_on_executor(|executor| executor.reload_weights())?
+    }
+
     /// Close the submit channel and join the engine thread.
     ///
     /// The engine drains its in-flight and waiting work to completion before the
@@ -304,6 +359,7 @@ where
     /// engine thread.
     pub fn shutdown(mut self) -> thread::Result<()> {
         self.submit_tx.take();
+        self.control_tx.take();
         match self.join.take() {
             Some(join) => join.join(),
             None => Ok(()),
@@ -313,9 +369,10 @@ where
 
 impl<E: BackendExecutor, K: KvPool> Drop for ServeHandle<E, K> {
     fn drop(&mut self) {
-        // Close the submit channel so the engine loop can observe shutdown,
-        // then join so the engine thread fully drains before we return.
+        // Close the submit + control channels so the engine loop can observe
+        // shutdown, then join so the engine thread fully drains before we return.
         self.submit_tx.take();
+        self.control_tx.take();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }

@@ -37,6 +37,19 @@ where
         }
     }
 
+    /// Offload the engine's device weights to host RAM (OPD teacher weight
+    /// time-share), returning the device bytes freed. Threads down to the backend
+    /// executor on the engine thread via the [`ServeHandle`] control channel.
+    pub fn offload_engine_weights(&self) -> Result<usize> {
+        self.serve.offload_engine_weights()
+    }
+
+    /// Reload the engine's device weights from the host snapshot (OPD teacher
+    /// weight time-share).
+    pub fn reload_engine_weights(&self) -> Result<()> {
+        self.serve.reload_engine_weights()
+    }
+
     /// Shared `tokenize -> submit -> collect -> detokenize` body returning the
     /// projected [`CompletionOutput`]; both `complete` and `complete_stream`
     /// build on it.
@@ -95,6 +108,42 @@ where
             prompt_token_ids,
             response_token_ids,
         })
+    }
+}
+
+/// OPD-teacher raw-logits surface (CUDA only).
+///
+/// `forward_token_logits` runs the full `[seq_len, vocab]` teacher forward on the
+/// engine-thread-owned [`CudaExecutor`] (no sampling) via the [`ServeHandle`]
+/// out-of-band control channel, then returns the device logits as [`RawLogits`].
+/// The closure builds `RawLogits` on the engine thread so the device buffer +
+/// context cross back to the caller as a single `Send` value.
+#[cfg(feature = "cuda")]
+impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
+    pub fn forward_token_logits(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<crate::types::RawLogits> {
+        let input_ids = input_ids.to_vec();
+        let positions = positions.to_vec();
+        self.serve.run_on_executor(move |executor| {
+            let (logits, shape, device) = executor.forward_token_logits(&input_ids, &positions)?;
+            Ok(crate::types::RawLogits {
+                logits,
+                shape,
+                device,
+            })
+        })?
+    }
+
+    /// Fold a fresh student LoRA update into the resident q/v projection weights
+    /// (OPD per-step re-merge). Runs the merge on the engine-thread-owned
+    /// [`CudaExecutor`] via the [`ServeHandle`] out-of-band control channel, so
+    /// the resident weight mutation never races an in-flight forward step.
+    pub fn remerge_student_lora(&self, update: infer_cuda::StudentLoraUpdate) -> Result<()> {
+        self.serve
+            .run_on_executor(move |executor| executor.remerge_student_lora(update))?
     }
 }
 

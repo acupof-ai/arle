@@ -204,6 +204,90 @@ mod backend {
             }
         }
 
+        /// OPD-teacher raw-logits forward: run the full `[seq_len, vocab]` teacher
+        /// forward over `(input_ids, positions)` (no sampling) and return the
+        /// device logits. CUDA-only; Metal/CPU bail. The `train` OPD path couples
+        /// to this method on the runtime-led engine.
+        #[cfg(feature = "cuda")]
+        pub fn forward_token_logits(
+            &self,
+            input_ids: &[u32],
+            positions: &[u32],
+        ) -> Result<crate::types::RawLogits> {
+            match self {
+                Self::Cuda(engine) => engine.forward_token_logits(input_ids, positions),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {
+                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
+                }
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => {
+                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
+                }
+            }
+        }
+
+        /// Offload the engine's device weights to host RAM (OPD teacher weight
+        /// time-share), returning the device bytes freed. CUDA-only: the
+        /// Qwen3.5/3.6 hybrid OPD teacher path moves its weights off-device so a
+        /// co-resident student backward reuses the VRAM. Metal/CPU have no
+        /// device-weight offload path and bail.
+        pub fn offload_engine_weights(&self) -> Result<usize> {
+            match self {
+                #[cfg(feature = "cuda")]
+                Self::Cuda(engine) => engine.offload_engine_weights(),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
+            }
+        }
+
+        /// Reload the engine's device weights from the host snapshot (OPD teacher
+        /// weight time-share). CUDA-only; Metal/CPU bail.
+        pub fn reload_engine_weights(&self) -> Result<()> {
+            match self {
+                #[cfg(feature = "cuda")]
+                Self::Cuda(engine) => engine.reload_engine_weights(),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
+            }
+        }
+
+        /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6 q/v
+        /// projection weights (OPD per-step re-merge). CUDA-only: the Metal /
+        /// CPU arms reject it.
+        ///
+        /// The CUDA forward path implements the merge (see
+        /// [`infer_cuda::CudaExecutor::remerge_student_lora`] +
+        /// `infer_cuda::qwen35::Qwen35Model::remerge_student_lora`): the resident
+        /// q/v `DeviceMatrix` weights are re-merged in place from a pristine
+        /// base-weight cache, and the next forward picks them up. The executor
+        /// lives on the [`infer_server::ServeHandle`] engine thread; this routes
+        /// the merge through the out-of-band `run_on_executor` control seam (the
+        /// same seam the raw-logits forward + weight offload/reload use), so it
+        /// runs between scheduler steps with exclusive `&mut E` access. Takes
+        /// `&self` (interior mutability via the control channel) so the train OPD
+        /// loop can call it on a shared `MutexGuard` binding.
+        #[cfg(feature = "cuda")]
+        pub fn remerge_student_lora(&self, update: infer_cuda::StudentLoraUpdate) -> Result<()> {
+            match self {
+                Self::Cuda(engine) => engine.remerge_student_lora(update),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {
+                    let _ = update;
+                    anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is Metal")
+                }
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => {
+                    let _ = update;
+                    anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is CPU")
+                }
+            }
+        }
+
         #[cfg(feature = "metal")]
         fn load_metal(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
             use infer_server::OpenAiTokenizer;

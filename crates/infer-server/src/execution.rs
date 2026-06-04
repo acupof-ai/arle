@@ -62,6 +62,14 @@ fn publish_counters<E: BackendExecutor, K: KvPool>(
     }
 }
 
+/// An out-of-band control closure run against the engine-thread-owned executor.
+///
+/// The OPD control surface (raw-logits forward, weight offload/reload, student
+/// LoRA re-merge) reaches the thread-owned `&mut E` through these between steps,
+/// off the request hot path. The closure carries its own response channel, so the
+/// loop body only has to invoke it.
+pub(crate) type ControlMessage<E> = Box<dyn FnOnce(&mut E) + Send>;
+
 /// One unit of frontend->engine work: a prompt plus a place to send back the
 /// engine-assigned handle and (later) the completion.
 pub(crate) struct Submission {
@@ -82,6 +90,7 @@ pub(crate) struct Submission {
 pub(crate) fn engine_loop<E, K>(
     mut engine: Engine<E, K>,
     submit_rx: Receiver<Submission>,
+    control_rx: Receiver<ControlMessage<E>>,
     counters: CounterHandle,
 ) where
     E: BackendExecutor,
@@ -112,6 +121,12 @@ pub(crate) fn engine_loop<E, K>(
     }
 
     loop {
+        // 0. Run any queued out-of-band control closures against the executor
+        //    (OPD raw-logits forward, weight offload/reload, LoRA re-merge). These
+        //    run between steps with no request in flight, so `&mut E` access is
+        //    exclusive. A disconnected control channel is benign (frontend gone).
+        drain_control(&mut engine, &control_rx);
+
         // 1. Drain every queued submission without blocking. Each one is handed
         //    to the engine and registered for completion delivery.
         loop {
@@ -158,6 +173,20 @@ pub(crate) fn engine_loop<E, K>(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => submit_open = false,
         }
+    }
+}
+
+/// Run every queued control closure against the engine's executor without
+/// blocking. Each closure carries its own response channel, so the loop only
+/// invokes it. A disconnected channel is benign (the frontend dropped its
+/// `ServeHandle`); the loop's normal shutdown path still runs.
+fn drain_control<E, K>(engine: &mut Engine<E, K>, control_rx: &Receiver<ControlMessage<E>>)
+where
+    E: BackendExecutor,
+    K: KvPool,
+{
+    while let Ok(closure) = control_rx.try_recv() {
+        closure(engine.executor_mut());
     }
 }
 

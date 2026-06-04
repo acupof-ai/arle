@@ -109,6 +109,96 @@ impl RealCudaExecutor {
             Self::Qwen35(_) | Self::Dsv4(_) => Ok(()),
         }
     }
+
+    /// OPD teacher raw-logits forward (Qwen3.5/3.6 hybrid only). Returns the full
+    /// `[seq_len, vocab]` logits without sampling. Dense Qwen3 / DSv4 are not OPD
+    /// teacher targets on this surface and bail.
+    pub(crate) fn forward_token_logits(
+        &mut self,
+        input_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<(DeviceVec, [usize; 2])> {
+        match self {
+            Self::Qwen35(q) => q.forward_token_logits(input_ids, positions),
+            Self::Qwen(_) => {
+                anyhow::bail!(
+                    "forward_token_logits is wired for the Qwen3.5/3.6 hybrid OPD teacher, not dense Qwen3"
+                )
+            }
+            Self::Dsv4(_) => {
+                anyhow::bail!(
+                    "forward_token_logits is wired for the Qwen3.5/3.6 hybrid OPD teacher, not DSv4"
+                )
+            }
+        }
+    }
+
+    /// Device context of the underlying model (for the OPD raw-logits surface to
+    /// build a `RawLogits` carrying a sync/consume handle).
+    pub(crate) fn device(&self) -> &DeviceContext {
+        match self {
+            Self::Qwen35(q) => q.device(),
+            Self::Qwen(q) => &q.model.ctx,
+            Self::Dsv4(d) => &d.model.ctx,
+        }
+    }
+
+    /// Offload the model's device weights to host RAM for the OPD teacher
+    /// time-share, returning the device bytes freed. Only the Qwen3.5/3.6 hybrid
+    /// arm (the OPD teacher target) supports this; the dense-Qwen3 and DSv4 arms
+    /// bail (DSv4 is multi-GPU FP8 + the dense path is not an OPD teacher).
+    pub(crate) fn offload_engine_weights(&mut self) -> Result<usize> {
+        match self {
+            Self::Qwen35(q) => q.offload_engine_weights(),
+            Self::Qwen(_) => {
+                anyhow::bail!(
+                    "offload_engine_weights is only supported on the Qwen3.5/3.6 hybrid OPD teacher path"
+                )
+            }
+            Self::Dsv4(_) => {
+                anyhow::bail!(
+                    "offload_engine_weights is not supported on the DSv4 multi-GPU FP8 path"
+                )
+            }
+        }
+    }
+
+    /// Reload the model's device weights from the host snapshot.
+    pub(crate) fn reload_engine_weights(&mut self) -> Result<()> {
+        match self {
+            Self::Qwen35(q) => q.reload_engine_weights(),
+            Self::Qwen(_) => {
+                anyhow::bail!(
+                    "reload_engine_weights is only supported on the Qwen3.5/3.6 hybrid OPD teacher path"
+                )
+            }
+            Self::Dsv4(_) => {
+                anyhow::bail!(
+                    "reload_engine_weights is not supported on the DSv4 multi-GPU FP8 path"
+                )
+            }
+        }
+    }
+
+    /// Per-step student LoRA re-merge (OPD P2). Only the Qwen3.5/3.6 hybrid
+    /// executor carries the OPD student; dense Qwen3 / DSv4 are not student
+    /// targets and reject the update.
+    pub(crate) fn remerge_student_lora(
+        &mut self,
+        update: crate::qwen35::StudentLoraUpdate,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen35(q) => q.remerge_student_lora(update),
+            Self::Qwen(_) => anyhow::bail!(
+                "student LoRA re-merge is only wired for the Qwen3.5/3.6 hybrid OPD student; \
+                 the dense Qwen3 executor is not a student target"
+            ),
+            Self::Dsv4(_) => anyhow::bail!(
+                "student LoRA re-merge is only wired for the Qwen3.5/3.6 hybrid OPD student; \
+                 the DSv4-Flash executor is not a student target"
+            ),
+        }
+    }
 }
 
 pub(crate) struct QwenCudaExecutor {
@@ -621,6 +711,18 @@ impl Qwen35CudaExecutor {
         })
     }
 
+    /// Offload the model's device weights to host RAM (OPD teacher time-share),
+    /// returning the device bytes freed. Per-slot KV / recurrent state is left
+    /// resident — only the shared model weights move.
+    fn offload_engine_weights(&mut self) -> Result<usize> {
+        self.model.offload_engine_weights()
+    }
+
+    /// Reload the model's device weights from the host snapshot.
+    fn reload_engine_weights(&mut self) -> Result<()> {
+        self.model.reload_engine_weights()
+    }
+
     fn submit(&mut self, plan: &ForwardPlan) -> Result<StepOutput> {
         let rows = plan.decode_rows.len() + plan.prefill_rows.len();
         if rows == 0 {
@@ -689,6 +791,59 @@ impl Qwen35CudaExecutor {
                 finish: None,
             }],
         })
+    }
+
+    /// OPD teacher raw-logits forward: run the full hybrid forward over
+    /// `(input_ids, positions)` on a FRESH transient slot state and return the
+    /// FULL `[seq_len, vocab]` logits (every row) plus the model's device
+    /// context, WITHOUT sampling.
+    ///
+    /// This does not touch the serving slots: the teacher scores a sequence
+    /// in one shot (positions are contiguous from `positions[0]`), so a private
+    /// slot state is allocated, advanced once, and dropped. `positions` must be
+    /// the contiguous absolute positions of `input_ids` (the OPD teacher always
+    /// scores a full prompt starting at `positions[0]`).
+    pub(crate) fn forward_token_logits(
+        &mut self,
+        input_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<(DeviceVec, [usize; 2])> {
+        ensure!(
+            !input_ids.is_empty(),
+            "forward_token_logits requires a non-empty token sequence"
+        );
+        ensure!(
+            input_ids.len() == positions.len(),
+            "forward_token_logits token/position length mismatch: tokens={} positions={}",
+            input_ids.len(),
+            positions.len()
+        );
+        let start_pos = positions[0] as usize;
+        for (i, &p) in positions.iter().enumerate() {
+            ensure!(
+                p as usize == start_pos + i,
+                "forward_token_logits requires contiguous positions; positions[{i}]={p} != {}",
+                start_pos + i
+            );
+        }
+        // Private transient slot: the teacher scores the whole sequence in one
+        // forward, so it never shares the serving slots' KV/recurrent state.
+        let mut slot = self.model.new_slot_state()?;
+        self.model
+            .forward_token_logits_full(&mut slot, input_ids, start_pos)
+    }
+
+    pub(crate) fn device(&self) -> &DeviceContext {
+        &self.model.ctx
+    }
+
+    /// Fold a fresh student LoRA update into the resident q/v projection weights
+    /// (OPD per-step re-merge). Delegates to [`crate::qwen35::Qwen35Model`].
+    pub(crate) fn remerge_student_lora(
+        &mut self,
+        update: crate::qwen35::StudentLoraUpdate,
+    ) -> Result<()> {
+        self.model.remerge_student_lora(update)
     }
 }
 
