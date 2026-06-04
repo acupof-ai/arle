@@ -14,7 +14,7 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "chat",
- "infer",
+ "infer-api",
  "log",
  "serde",
  "serde_json",
@@ -1828,6 +1828,7 @@ dependencies = [
  "infer-metal",
  "infer-plan",
  "infer-seam",
+ "infer-util",
  "kv-native-sys",
  "libc",
  "log",
@@ -1971,6 +1972,17 @@ name = "infer-topo"
 version = "0.1.5"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "infer-util"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "colored",
+ "hf-hub",
+ "log",
+ "logforth",
 ]
 
 [[package]]

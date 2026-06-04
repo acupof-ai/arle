@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
-infer = { path = "../../infer", default-features = false }
+infer-api = { path = "../infer-api" }
 chat = { path = "../chat" }
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
