@@ -200,6 +200,19 @@ pub(crate) struct Dsv4Layer {
     pub compress_ratio: usize,
 }
 
+/// One shipped DSv4 MTP draft head (`mtp.0.*`): a full transformer layer plus
+/// the DeepSeek MTP input-combine and output-head tensors. Loaded only under
+/// `ARLE_DSV4_SPEC_DECODE=1`; the verify loop and KV rollback are Phase 2.
+pub(crate) struct Dsv4MtpLayer {
+    pub layer: Dsv4Layer,
+    pub head_hc: Dsv4HyperConnection,
+    pub enorm: DeviceVec,
+    pub hnorm: DeviceVec,
+    pub e_proj: DeviceMatrix,
+    pub h_proj: DeviceMatrix,
+    pub norm: DeviceVec,
+}
+
 /// Loaded DSv4-Flash model for one TP/EP rank.
 pub(crate) struct Dsv4Model {
     pub ctx: DeviceContext,
@@ -214,6 +227,7 @@ pub(crate) struct Dsv4Model {
     /// Head hyper-connection: folds the wide residual stream back to one hidden
     /// row before the final RMSNorm + lm_head projection.
     pub head_hc: Dsv4HyperConnection,
+    pub mtp: Option<Dsv4MtpLayer>,
     pub tp: crate::tp::TpRuntime,
     #[cfg(feature = "deepep")]
     pub deepep: Option<crate::deepep::DeepEpTransport>,
@@ -519,6 +533,7 @@ impl std::fmt::Debug for Dsv4Model {
             .field("experts", &self.config.n_routed_experts)
             .field("experts_per_rank", &self.split.experts_per_rank)
             .field("kv_bytes_per_token", &self.kv_arena.bytes_per_token)
+            .field("mtp_loaded", &self.mtp.is_some())
             .finish()
     }
 }
@@ -589,6 +604,42 @@ impl Dsv4Model {
         }
         let norm = loader.load_dsv4_vec(&ctx, names.norm())?;
         let head_hc = loader.load_dsv4_hyper_connection(&ctx, &names.head_hc())?;
+        let mtp = if dsv4_spec_decode_enabled() && config.num_nextn_predict_layers > 0 {
+            ensure!(
+                config.num_nextn_predict_layers == 1,
+                "DSv4 Phase-1 MTP loader supports exactly one nextn layer, got {}",
+                config.num_nextn_predict_layers
+            );
+            let mtp_names = config.mtp_tensor_names(0);
+            let attention = loader.load_dsv4_attention(&ctx, &config, &mtp_names.attn, &tp_cfg)?;
+            let moe = loader.load_dsv4_moe_layer(
+                &ctx,
+                &mtp_names.ffn,
+                &split,
+                DeepSeekV4MoeRoutingKind::LearnedBias,
+            )?;
+            let compress_ratio = 0;
+            Some(Dsv4MtpLayer {
+                layer: Dsv4Layer {
+                    hc_attn: loader.load_dsv4_hyper_connection(&ctx, &mtp_names.hc_attn)?,
+                    hc_ffn: loader.load_dsv4_hyper_connection(&ctx, &mtp_names.hc_ffn)?,
+                    attn_norm: loader.load_dsv4_vec(&ctx, &mtp_names.attn_norm)?,
+                    ffn_norm: loader.load_dsv4_vec(&ctx, &mtp_names.ffn_norm)?,
+                    attention,
+                    moe,
+                    mode: config.attention_mode_for_compress_ratio(compress_ratio),
+                    compress_ratio,
+                },
+                head_hc: loader.load_dsv4_hyper_connection(&ctx, &mtp_names.hc_head)?,
+                enorm: loader.load_dsv4_vec(&ctx, &mtp_names.enorm)?,
+                hnorm: loader.load_dsv4_vec(&ctx, &mtp_names.hnorm)?,
+                e_proj: loader.load_dsv4_global_matrix(&ctx, &mtp_names.e_proj)?,
+                h_proj: loader.load_dsv4_global_matrix(&ctx, &mtp_names.h_proj)?,
+                norm: loader.load_dsv4_vec(&ctx, &mtp_names.norm)?,
+            })
+        } else {
+            None
+        };
         ctx.sync()?;
 
         Ok(Self {
@@ -602,6 +653,7 @@ impl Dsv4Model {
             layers,
             norm,
             head_hc,
+            mtp,
             tp,
             #[cfg(feature = "deepep")]
             deepep,
@@ -629,6 +681,38 @@ impl Dsv4Model {
         params: &SamplingParams,
         position: u64,
     ) -> Result<u32> {
+        self.forward_tokens_impl(slot, tokens, start_pos, params, position, None)
+    }
+
+    pub(crate) fn forward_tokens_with_hidden(
+        &self,
+        slot: &mut Dsv4SlotState,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<(u32, DeviceVec)> {
+        let mut last_hidden = DeviceVec::zeros(&self.ctx, self.config.hidden_size)?;
+        let token = self.forward_tokens_impl(
+            slot,
+            tokens,
+            start_pos,
+            params,
+            position,
+            Some(&mut last_hidden),
+        )?;
+        Ok((token, last_hidden))
+    }
+
+    fn forward_tokens_impl(
+        &self,
+        slot: &mut Dsv4SlotState,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+        mut last_hidden_out: Option<&mut DeviceVec>,
+    ) -> Result<u32> {
         ensure!(
             !tokens.is_empty(),
             "DSv4 forward requires at least one token"
@@ -653,6 +737,7 @@ impl Dsv4Model {
         let use_gpu_router = std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some();
         let use_deepep_transport = dsv4_use_deepep_transport()?;
         if dsv4_decode_graph_enabled()
+            && last_hidden_out.is_none()
             && !crate::attention::dsv4_flashmla_decode_enabled()?
             && seq_len == 1
             && use_gpu_router
@@ -911,6 +996,18 @@ impl Dsv4Model {
             })?;
             keepalive.keep_hidden(&stream);
             keepalive.keep_vec(&last_hidden);
+            if let Some(out) = last_hidden_out.as_deref_mut() {
+                ensure!(
+                    out.len == hidden_size,
+                    "DSv4 hidden capture len {} != hidden_size {hidden_size}",
+                    out.len
+                );
+                self.ctx
+                    .stream
+                    .memcpy_dtod(&last_hidden.data, &mut out.data)
+                    .map_err(|e| anyhow!("DSv4 hidden capture D2D failed: {e}"))?;
+                keepalive.keep_vec(out);
+            }
 
             // ── Final norm + lm_head projection + sample (last token row).
             let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
@@ -930,6 +1027,227 @@ impl Dsv4Model {
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(token)
+    }
+
+    pub(crate) fn mtp_forward(
+        &self,
+        h_prev: &DeviceVec,
+        next_token: u32,
+        position: u64,
+    ) -> Result<u32> {
+        ensure!(
+            dsv4_spec_decode_enabled(),
+            "DSv4 MTP forward called while ARLE_DSV4_SPEC_DECODE is disabled"
+        );
+        ensure!(
+            !dsv4_use_deepep_transport()?,
+            "DSv4 MTP Phase 1 supports allreduce transport only"
+        );
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| anyhow!("ARLE_DSV4_SPEC_DECODE=1 but DSv4 MTP head is not loaded"))?;
+        ensure!(
+            h_prev.len == self.config.hidden_size,
+            "DSv4 MTP h_prev len {} != hidden_size {}",
+            h_prev.len,
+            self.config.hidden_size
+        );
+
+        // The Phase-1 MTP probe must not write through the base FlashMLA decode
+        // KV arena. Run its one-token attention on the scalar SW path; Phase 2
+        // owns retained draft KV + rollback.
+        struct FlashMlaDecodeOverrideGuard;
+        impl Drop for FlashMlaDecodeOverrideGuard {
+            fn drop(&mut self) {
+                crate::attention::set_dsv4_flashmla_decode_override(None);
+            }
+        }
+        crate::attention::set_dsv4_flashmla_decode_override(Some(false));
+        let _flashmla_guard = FlashMlaDecodeOverrideGuard;
+
+        let hidden_size = self.config.hidden_size;
+        let hc_mult = self.config.hc_mult;
+        let eps = self.config.rms_norm_eps;
+        let ctx = &self.ctx;
+
+        let token_ids = crate::ops::upload_i32(ctx, &[next_token as i32])?;
+        // SAFETY: embedding_batch writes the full [1, hidden_size] row.
+        let mut emb = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+        crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids, &mut emb)?;
+
+        // h' = e_proj(enorm(emb)) + h_proj(hnorm(h_prev)).
+        let mut emb_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+        crate::ops::rms_norm_batch(ctx, &emb, &mtp.enorm, eps, &mut emb_normed)?;
+        let mut e_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+        crate::attention::dsv4_linear(ctx, &mtp.e_proj, &emb_normed, &mut e_proj)?;
+
+        let mut h_prev_batch = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+        ctx.stream
+            .memcpy_dtod(&h_prev.data, &mut h_prev_batch.data)
+            .map_err(|e| anyhow!("DSv4 MTP h_prev D2D batch copy failed: {e}"))?;
+        let mut h_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+        crate::ops::rms_norm_batch(ctx, &h_prev_batch, &mtp.hnorm, eps, &mut h_normed)?;
+        let mut h_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+        crate::attention::dsv4_linear(ctx, &mtp.h_proj, &h_normed, &mut h_proj)?;
+
+        let mut combined = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+        crate::ops::add_batch(ctx, &e_proj, &h_proj, &mut combined)?;
+        let mut stream = unsafe { HiddenStates::uninit(ctx, hidden_size * hc_mult, 1)? };
+        crate::hc::initial_stream_from_embeddings(
+            ctx,
+            &combined,
+            hidden_size,
+            hc_mult,
+            &mut stream,
+        )?;
+
+        let stream = self.run_mtp_transformer_layer(mtp, stream, next_token)?;
+
+        let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
+        crate::hc::head_hidden_from_stream(
+            ctx,
+            &self.config,
+            &mtp.head_hc,
+            &stream,
+            0,
+            &mut last_hidden,
+        )?;
+        let mut last_normed = DeviceVec::zeros(ctx, hidden_size)?;
+        crate::ops::rms_norm_vec(ctx, &last_hidden, &mtp.norm, eps, &mut last_normed)?;
+        let mut logits = DeviceVec::zeros(ctx, self.lm_head.rows)?;
+        self.lm_head_project(&last_normed, &mut logits)?;
+        crate::executor::sample_cuda_token(ctx, &logits, &SamplingParams::default(), position)
+    }
+
+    fn run_mtp_transformer_layer(
+        &self,
+        mtp: &Dsv4MtpLayer,
+        stream: HiddenStates,
+        token: u32,
+    ) -> Result<HiddenStates> {
+        let layer = &mtp.layer;
+        let ctx = &self.ctx;
+        let hidden_size = self.config.hidden_size;
+        let hc_mult = self.config.hc_mult;
+        let stream_dim = hidden_size * hc_mult;
+        let eps = self.config.rms_norm_eps;
+        let seq_len = 1;
+        let start_pos = 0;
+        let start_pos_device = ctx
+            .stream
+            .clone_htod(&[0_i32])
+            .map_err(|e| anyhow!("DSv4 MTP start_pos H2D failed: {e}"))?;
+        let local_width = layer.attention.wq_b.rows;
+        ensure!(
+            local_width.is_multiple_of(self.config.head_dim),
+            "DSv4 MTP attention local width {local_width} is not a multiple of head_dim {}",
+            self.config.head_dim
+        );
+        let mut attention_state = crate::attention::Dsv4LayerAttentionState::new(
+            ctx,
+            &self.config,
+            layer.mode,
+            layer.compress_ratio,
+            1,
+            &self.kv_arena,
+            local_width / self.config.head_dim,
+            self.tp.config().world_size,
+        )?;
+        let mut moe_scratch =
+            crate::moe::Dsv4MoeDecodeScratch::new(ctx, &self.moe_config, &self.split, &layer.moe)?;
+        let mut keepalive = Dsv4ForwardKeepalive::new(false);
+        let tokens = [token];
+
+        let attn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, &stream)?;
+        let mut attn_in = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
+        crate::hc::hc_pre(
+            ctx,
+            &stream,
+            &attn_mhc.pre,
+            hidden_size,
+            hc_mult,
+            &mut attn_in,
+        )?;
+        let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
+        crate::ops::rms_norm_batch(ctx, &attn_in, &layer.attn_norm, eps, &mut attn_normed)?;
+        let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
+        crate::attention::mla_attention(
+            ctx,
+            &self.config,
+            &layer.attention,
+            layer.mode,
+            layer.compress_ratio,
+            0,
+            &attn_normed,
+            &mut attention_state,
+            start_pos,
+            Some(&start_pos_device),
+            &self.tp,
+            &mut attn_out,
+            &mut keepalive,
+        )?;
+        self.tp.all_reduce_sum(ctx, &mut attn_out)?;
+        let mut attn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, seq_len)? };
+        crate::hc::hc_post(
+            ctx,
+            &attn_out,
+            &stream,
+            &attn_mhc.post,
+            &attn_mhc.comb,
+            hidden_size,
+            hc_mult,
+            &mut attn_stream,
+        )?;
+
+        let ffn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, &attn_stream)?;
+        let mut ffn_in = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
+        crate::hc::hc_pre(
+            ctx,
+            &attn_stream,
+            &ffn_mhc.pre,
+            hidden_size,
+            hc_mult,
+            &mut ffn_in,
+        )?;
+        let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
+        crate::ops::rms_norm_batch(ctx, &ffn_in, &layer.ffn_norm, eps, &mut ffn_normed)?;
+        let mut moe_out = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
+        crate::moe::dsv4_moe_forward(
+            self,
+            &layer.moe,
+            &tokens,
+            &ffn_normed,
+            &mut moe_out,
+            Some(&mut moe_scratch),
+            &mut keepalive,
+        )?;
+        self.tp.all_reduce_sum(ctx, &mut moe_out)?;
+        let mut shared = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
+        crate::moe::dsv4_shared_expert_forward(
+            ctx,
+            &layer.moe,
+            &ffn_normed,
+            &mut shared,
+            self.config.swiglu_limit,
+            Some(&mut moe_scratch),
+            &mut keepalive,
+        )?;
+        let mut moe_with_shared = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
+        crate::ops::add_batch(ctx, &moe_out, &shared, &mut moe_with_shared)?;
+        let mut ffn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, seq_len)? };
+        crate::hc::hc_post(
+            ctx,
+            &moe_with_shared,
+            &attn_stream,
+            &ffn_mhc.post,
+            &ffn_mhc.comb,
+            hidden_size,
+            hc_mult,
+            &mut ffn_stream,
+        )?;
+        ctx.sync()?;
+        Ok(ffn_stream)
     }
 
     fn forward_tokens_decode_graph(
@@ -1352,6 +1670,13 @@ fn dsv4_decode_graph_enabled() -> bool {
     )
 }
 
+pub(crate) fn dsv4_spec_decode_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_SPEC_DECODE").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
 /// TP runtime for DSv4 load — multi-rank `nccl` builds resolve the NCCL
 /// `unique_id` like the dense path; otherwise the no-op single runtime.
 fn build_dsv4_tp_runtime() -> Result<crate::tp::TpRuntime> {
@@ -1385,11 +1710,19 @@ pub(crate) fn ensure_loadable(config: &DeepSeekV4Config) -> Result<()> {
         config.num_key_value_heads
     );
     if config.num_nextn_predict_layers > 0 {
-        eprintln!(
-            "[dsv4] num_nextn_predict_layers={} present; loading the {} base layers \
-             only (MTP draft head deferred — separate speculative-decode path).",
-            config.num_nextn_predict_layers, config.num_hidden_layers
-        );
+        if dsv4_spec_decode_enabled() {
+            eprintln!(
+                "[dsv4] num_nextn_predict_layers={} present; ARLE_DSV4_SPEC_DECODE=1, \
+                 loading base layers plus mtp.0 draft head.",
+                config.num_nextn_predict_layers
+            );
+        } else {
+            eprintln!(
+                "[dsv4] num_nextn_predict_layers={} present; loading the {} base layers \
+                 only (MTP draft head deferred — separate speculative-decode path).",
+                config.num_nextn_predict_layers, config.num_hidden_layers
+            );
+        }
     }
     ensure!(
         config.hc_mult >= 1,
