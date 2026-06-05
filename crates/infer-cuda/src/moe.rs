@@ -2008,21 +2008,18 @@ mod dsv4_gpu {
             w2.cols,
             w2.groups,
         );
-        {
-            let src = counts.slice(0..num_groups);
-            let mut dst = scratch.masked_m.slice_mut(0..num_groups);
-            ctx.stream
-                .memcpy_dtod(&src, &mut dst)
-                .map_err(|e| anyhow::anyhow!("DSv4 pooled DeepGEMM masked_m D2D failed: {e}"))?;
-        }
-
+        // `masked_m` is the per-group valid-row count = `counts`; alias it directly
+        // (the masked GEMM only reads it, and `counts` is already passed read-only to
+        // pack_quantize + swiglu below) instead of a per-layer D2D copy into
+        // `scratch.masked_m` — kills one cuMemcpyDtoD/layer (the 17.8% D2D bucket).
         let p_hidden = cache_ptr(&packed_hidden.data, ctx);
         let p_in_fp8 = cache_ptr(&scratch.input_fp8, ctx);
         let p_in_scales = cache_ptr(&scratch.input_scales, ctx);
         let p_active = cache_ptr(&scratch.active_experts, ctx);
         let p_offsets = cache_ptr(offsets, ctx);
         let p_counts = cache_ptr(counts, ctx);
-        let p_masked = cache_ptr(&scratch.masked_m, ctx);
+        // Alias masked_m to counts (same data, read-only in the masked GEMM).
+        let p_masked = p_counts;
         let p_w13_out = cache_ptr(&scratch.w13_out.data, ctx);
         let p_act_fp8 = cache_ptr(&scratch.act_fp8, ctx);
         let p_act_scales = cache_ptr(&scratch.act_scales, ctx);
