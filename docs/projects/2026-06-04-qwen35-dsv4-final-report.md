@@ -107,9 +107,16 @@ compressor + HC) and **hybrid MLA attention**. ncu shows the FP8 linear runs as 
 hand-written *scalar* CUDA-core kernel — tensor-core (WGMMA) <1%, HBM BW ~10% —
 so a large chunk of the "floor" is ~10× headroom, not silicon (lever: DeepGEMM
 dense FP8 GEMM for prefill M>1; a bandwidth-bound FP8 GEMV for decode M=1; in
-progress). **5–6 ms/token is an H100/H800 number** (SGLang's reference SKU);
-the H20 floor after the kernel pass is the open question, but the structural arc
-(scheduling / host / buffer / launch / routing) is closed and measured. Roadmap +
+progress). **5–6 ms/token is an H100/H800 number** (SGLang's reference SKU) —
+confirmed by running **SGLang on the same 8×H20** (DeepSeek-V3.2, TP=8, FP8,
+FlashMLA): it gets **15.89 ms/token (62.95 tok/s)**, not 6 ms. So the real H20
+target is ~16 ms, and ARLE (39.5 ms) has a genuine **~2.47× gap** — the kernel
+pass is *licensed*, not diminishing. SGLang's per-op shows exactly where: FP8
+dense GEMM 4.94 ms (its `sm90_fp8_gemm_1d2d` WGMMA vs ARLE's scalar — the #1
+lever) and MLA attention 2.02 ms (FlashMLA vs ARLE's ~11.8 ms hybrid — the #2).
+The structural arc (scheduling / host / buffer / launch / routing) is closed and
+measured; the remaining gap is these two kernels, with concrete per-op targets
+(roadmap §10). Roadmap +
 per-stage evidence:
 [`docs/plans/2026-06-04-dsv4-decode-sglang-class-perf.md`](../plans/2026-06-04-dsv4-decode-sglang-class-perf.md)
 §§5–9; per-stage wins under `docs/experience/wins/2026-06-05-dsv4-*`.
