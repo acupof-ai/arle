@@ -1258,4 +1258,206 @@ mod tests {
         );
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Metal greedy-parity regression harness.
+    //
+    // The legacy `infer/src/backend/metal` path was deleted, so Metal numeric
+    // changes shipped with NO oracle (CUDA has `cuda_qwen3_greedy_parity` /
+    // `cuda_qwen35_greedy_parity`; Metal had none). These tests close that gap.
+    //
+    // ORACLE MODEL: there is no live legacy Metal path to diff against, so the
+    // oracle is a PINNED snapshot — a committed gold continuation + FNV-1a
+    // fingerprint per (model, prompt, max_new). Raw-id greedy decode is
+    // deterministic, so the MLX Qwen3.5 forward must reproduce the exact same
+    // ids across refactors. The gold lives at
+    // `crates/agent-bench/test_data/metal_greedy_parity_gold.json`.
+    //
+    // To FIRST establish the gold (or re-bless after an intended numeric
+    // change), run with `METAL_PARITY_BLESS=1`: the test prints the fresh
+    // continuation + fingerprint and SKIPS the assertion. Paste those into the
+    // JSON, commit, and from then on the test is a hard regression gate.
+    //
+    // Cross-check against an *independent* oracle (HF transformers greedy on
+    // the same ids) once at bless time — see the module doc on the JSON file —
+    // so the pinned snapshot is anchored to ground truth, not just to itself.
+    // -----------------------------------------------------------------------
+
+    /// Parse one model's gold entry (`gen`, `fingerprint`) out of the committed
+    /// `metal_greedy_parity_gold.json` without pulling a JSON dep into the bench
+    /// crate. Returns `(prompt_ids, max_new, gold_gen, gold_fingerprint)`.
+    /// `gold_gen` empty / fingerprint 0 means the entry is still PENDING.
+    #[cfg(feature = "metal")]
+    fn load_metal_gold(model: &str) -> Result<(Vec<u32>, usize, Vec<u32>, u64)> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/metal_greedy_parity_gold.json"
+        );
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read gold {path}: {e}"))?;
+
+        // Tiny hand-rolled extraction (top-level `prompt_ids`, `max_new`, and
+        // the per-model `gen` / `fingerprint`) — avoids a serde_json dep in the
+        // bench crate while staying robust to whitespace/formatting.
+        fn u32_array_after(haystack: &str, key: &str) -> Option<Vec<u32>> {
+            let start = haystack.find(key)? + key.len();
+            let open = haystack[start..].find('[')? + start;
+            let close = haystack[open..].find(']')? + open;
+            let inner = &haystack[open + 1..close];
+            let mut out = Vec::new();
+            for tok in inner.split(',') {
+                let t = tok.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                out.push(
+                    t.parse::<u32>()
+                        .map_err(|e| anyhow::anyhow!("bad id '{t}': {e}"))
+                        .ok()?,
+                );
+            }
+            Some(out)
+        }
+
+        let prompt_ids = u32_array_after(&raw, "\"prompt_ids\":")
+            .ok_or_else(|| anyhow::anyhow!("missing prompt_ids in gold"))?;
+        let max_new = {
+            let k = "\"max_new\":";
+            let s = raw
+                .find(k)
+                .ok_or_else(|| anyhow::anyhow!("missing max_new"))?
+                + k.len();
+            raw[s..]
+                .trim_start()
+                .split([',', '\n', '}'])
+                .next()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .ok_or_else(|| anyhow::anyhow!("bad max_new"))?
+        };
+
+        // Scope to the model's object: slice from the model key to the next `}`.
+        let model_key = format!("\"{model}\"");
+        let mstart = raw
+            .find(&model_key)
+            .ok_or_else(|| anyhow::anyhow!("model '{model}' absent from gold"))?;
+        let mslice = &raw[mstart..];
+        let mend = mslice.find('}').unwrap_or(mslice.len());
+        let mslice = &mslice[..mend];
+
+        let gold_gen = u32_array_after(mslice, "\"gen\":").unwrap_or_default();
+        let gold_fp = {
+            let k = "\"fingerprint\":";
+            mslice
+                .find(k)
+                .and_then(|i| {
+                    let s = &mslice[i + k.len()..];
+                    let q1 = s.find('"')? + 1;
+                    let q2 = s[q1..].find('"')? + q1;
+                    let hex = s[q1..q2].trim_start_matches("0x");
+                    u64::from_str_radix(hex, 16).ok()
+                })
+                .unwrap_or(0)
+        };
+
+        Ok((prompt_ids, max_new, gold_gen, gold_fp))
+    }
+
+    /// Drive `max_new` greedy tokens through the real Metal engine for `model`
+    /// against the committed gold continuation. Shared body for the small-model
+    /// CI gate and the canonical-MoE gate.
+    ///
+    /// `METAL_PARITY_BLESS=1` prints the fresh continuation + fingerprint and
+    /// skips the assertion (use to establish / re-bless the gold).
+    #[cfg(feature = "metal")]
+    fn run_metal_greedy_parity(model: &str) -> Result<()> {
+        let (prompt, max_new, gold_gen, gold_fp) = load_metal_gold(model)?;
+
+        let (mut engine, _ttft) = metal_engine_from_model_path(model)?;
+        // Single greedy request to a fixed length. `drive_concurrent` with one
+        // request gives us the FNV fingerprint helper for free and captures any
+        // step error instead of panicking.
+        let res = drive_concurrent(&mut engine, &[(prompt.clone(), max_new)]);
+        assert!(
+            res.step_error.is_none(),
+            "c=1 greedy step errored: {:?}",
+            res.step_error
+        );
+        let gen_tokens = res.generated.first().cloned().unwrap_or_default();
+        let fp = res.fingerprint();
+
+        let bless = std::env::var("METAL_PARITY_BLESS").as_deref() == Ok("1");
+        eprintln!(
+            "[metal-greedy-parity] model={model} bless={bless} prompt={prompt:?} \
+             max_new={max_new} gen_len={} fingerprint={fp:#018x} gen={gen_tokens:?}",
+            gen_tokens.len()
+        );
+
+        if bless {
+            eprintln!(
+                "[metal-greedy-parity BLESS] paste into test_data/metal_greedy_parity_gold.json \
+                 under \"{model}\":\n  \"gen\": {gen_tokens:?},\n  \"fingerprint\": \"{fp:#018x}\""
+            );
+            // Bless mode is generative, not a gate.
+            return Ok(());
+        }
+
+        assert!(
+            !gold_gen.is_empty() && gold_fp != 0,
+            "no gold committed for '{model}' yet — run once with METAL_PARITY_BLESS=1, \
+             paste the printed gen/fingerprint into \
+             crates/agent-bench/test_data/metal_greedy_parity_gold.json, then commit"
+        );
+        // gen_len must hit max_new (no early STOP) for the snapshot to be
+        // meaningful; a short gen means the prompt hit an EOS — pick a prompt
+        // that doesn't, or shorten max_new at bless time.
+        assert_eq!(
+            gen_tokens.len(),
+            max_new,
+            "expected {max_new} greedy tokens, got {} (early stop?)",
+            gen_tokens.len()
+        );
+        // Hard regression gate: token-exact + fingerprint match.
+        assert_eq!(
+            fp, gold_fp,
+            "Metal greedy fingerprint drifted for '{model}': got {fp:#018x}, gold {gold_fp:#018x} \
+             — the MLX forward changed numerically. If intended, re-bless via METAL_PARITY_BLESS=1."
+        );
+        assert_eq!(
+            gen_tokens, gold_gen,
+            "Metal greedy continuation drifted for '{model}' (fingerprint collision or partial \
+             change): got {gen_tokens:?}, gold {gold_gen:?}"
+        );
+        Ok(())
+    }
+
+    /// CHEAP CI GATE — Metal greedy parity on the small model
+    /// (`Qwen3.5-0.8B-MLX-4bit`, ~0.5 GB). Token-exact regression gate against
+    /// the committed gold: the MLX Qwen3.5 forward must reproduce the pinned
+    /// greedy continuation bit-for-bit. This is the oracle that was missing —
+    /// any numeric change to `infer-metal` / `mlx-sys` Qwen3.5 ops now fails
+    /// here instead of shipping silently.
+    ///   CUDARC_CUDA_VERSION=12060 cargo test --release -p agent-bench \
+    ///     --no-default-features --features metal,no-cuda \
+    ///     metal_qwen35_greedy_parity -- --ignored --nocapture
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "real Metal greedy parity; needs --features metal + cached Qwen3.5-0.8B-MLX-4bit"]
+    fn metal_qwen35_greedy_parity() -> Result<()> {
+        run_metal_greedy_parity("mlx-community/Qwen3.5-0.8B-MLX-4bit")
+    }
+
+    /// CANONICAL GATE — Metal greedy parity on the production MoE model
+    /// (`Qwen3.6-35B-A3B-4bit`, ~19 GB — per CLAUDE.md the unified Metal
+    /// target). Catches MoE-specific numeric regressions (router / expert /
+    /// gated-delta paths) that the dense 0.8B model cannot surface. Heavier;
+    /// run on demand, not every CI tick.
+    ///   cargo test --release -p agent-bench --no-default-features \
+    ///     --features metal,no-cuda \
+    ///     metal_qwen36_greedy_parity -- --ignored --nocapture
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "real Metal MoE greedy parity; needs --features metal + ~19GB cached Qwen3.6-35B-A3B-4bit"]
+    fn metal_qwen36_greedy_parity() -> Result<()> {
+        run_metal_greedy_parity("mlx-community/Qwen3.6-35B-A3B-4bit")
+    }
 }
