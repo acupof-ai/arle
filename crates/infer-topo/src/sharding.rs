@@ -159,7 +159,7 @@ pub fn row_shard(total: usize, tp: &TpConfig) -> ShardingSpec {
     column_shard(total, tp)
 }
 
-fn parse_parallel_env_usize(
+pub(crate) fn parse_parallel_env_usize(
     primary: &str,
     alias: &str,
     default: usize,
@@ -188,18 +188,17 @@ pub fn head_shard(
     num_kv_heads: usize,
     tp: &TpConfig,
 ) -> Result<(usize, usize)> {
-    if !num_q_heads.is_multiple_of(tp.world_size) {
-        bail!(
-            "num_q_heads ({num_q_heads}) not divisible by world_size ({})",
-            tp.world_size
-        );
-    }
-    if !num_kv_heads.is_multiple_of(tp.world_size) {
-        bail!(
-            "num_kv_heads ({num_kv_heads}) not divisible by world_size ({})",
-            tp.world_size
-        );
-    }
+    let require_divisible = |label: &str, n: usize| -> Result<()> {
+        if !n.is_multiple_of(tp.world_size) {
+            bail!(
+                "{label} ({n}) not divisible by world_size ({})",
+                tp.world_size
+            );
+        }
+        Ok(())
+    };
+    require_divisible("num_q_heads", num_q_heads)?;
+    require_divisible("num_kv_heads", num_kv_heads)?;
     Ok((num_q_heads / tp.world_size, num_kv_heads / tp.world_size))
 }
 

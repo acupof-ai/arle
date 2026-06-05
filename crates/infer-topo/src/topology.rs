@@ -6,6 +6,7 @@
 //! later H20-gated phase.
 
 use crate::error::{Result, bail};
+use crate::sharding::parse_parallel_env_usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -254,23 +255,6 @@ impl MultiAxisConfig {
     pub fn moe_tp_size(&self) -> usize {
         self.tp_size / self.ep_size / self.moe_dp_size
     }
-}
-
-fn parse_parallel_env_usize(
-    primary: &str,
-    alias: &str,
-    default: usize,
-    lookup: &mut impl FnMut(&str) -> Option<String>,
-) -> Result<usize> {
-    let value = lookup(primary).or_else(|| lookup(alias));
-    let Some(value) = value else {
-        return Ok(default);
-    };
-    value.parse::<usize>().map_err(|err| {
-        crate::error::TopoError::new(format!(
-            "invalid {primary}/{alias} value `{value}`: expected usize: {err}"
-        ))
-    })
 }
 
 fn subgroup_axis_env_present(lookup: &mut impl FnMut(&str) -> Option<String>) -> bool {
