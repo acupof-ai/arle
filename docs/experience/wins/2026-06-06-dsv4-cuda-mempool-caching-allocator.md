@@ -1,9 +1,22 @@
 # DSv4/CUDA: caching allocator — raise cuMemAllocAsync release threshold to MAX (kill per-step decode alloc churn)
 
 **Date:** 2026-06-06. **Backend:** CUDA. **Scope:** `crates/cuda-kernels/src/tensor.rs`
-(`DeviceContext::on_device`). **Status:** landed default-on (opt-out
-`ARLE_CUDA_MEMPOOL_RETAIN=0`); decode `tok/s` A/B **pending-remote**. Found by ckl
-("怀疑你弄的不对" re memory reuse — correct suspicion).
+(`DeviceContext::on_device`). **Status:** landed default-on (opt-out `ARLE_CUDA_MEMPOOL_RETAIN=0`). Found by ckl
+("怀疑你弄的不对" re memory reuse — root-cause correct). **A/B verdict (2026-06-06,
+TP=8/EP=8 pod, 64-tok): WASH for decode tok/s — 29.581 (on) vs 29.672 (off), noise;
+token-exact both; prefill-512 no-OOM. Kept for correctness/hygiene + likely
+concurrency/prefill benefit, NOT a decode-tok/s win.**
+
+## A/B verdict — correct root, wash wall (the §0 framing trap, 3rd this arc)
+
+The threshold=0 root cause is real, but at **B=1 decode the per-step alloc churn
+overlaps GPU execution**, so caching it doesn't move the wall — identical pattern to
+the decode-graph launch-overhead finding (−87% launches, +1.5% wall) and the
+`cudaLaunchKernel`-aggregate-is-overlapped lesson. **B=1 decode is GPU-bound;
+overhead-removal (alloc/launch) is wash. The wall levers are GPU compute (the 11.8ms
+MLA attention), comm overlap (shared-expert behind the moe all-reduce), and EAGLE
+amortization.** Verify the alloc win, if any, on the *prefill* / *concurrent* shape
+where alloc pressure is on the critical path, not B=1 decode.
 
 ## Context
 
