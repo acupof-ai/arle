@@ -422,6 +422,17 @@ impl<E: BackendExecutor> BackendExecutor for TtftObserver<E> {
     fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
         self.inner.poll(inflight)
     }
+
+    // The observer must be transparent: forward the remaining seam methods to the
+    // inner executor so wrapped benches exercise the real backend's warmup
+    // (graph JIT / prewarm) and stop-token contract, not the seam's no-op default.
+    fn warmup(&mut self) -> Result<()> {
+        self.inner.warmup()
+    }
+
+    fn model_stop_token_ids(&self) -> Vec<u32> {
+        self.inner.model_stop_token_ids()
+    }
 }
 
 /// Drive a single-agent (c=1) workflow turn by turn through `engine`, returning
