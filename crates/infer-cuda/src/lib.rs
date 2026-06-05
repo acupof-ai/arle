@@ -477,6 +477,16 @@ impl CudaExecutor {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    pub fn dsv4_verify_forward_selftest(&mut self, prompt: &[u32]) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                anyhow::bail!("DSv4 verify-forward selftest requires the real CUDA executor")
+            }
+            CudaExecutorInner::Real(real) => real.dsv4_verify_forward_selftest(prompt),
+        }
+    }
+
     /// Placeholder forward — produces one deterministic token per scheduled row.
     fn placeholder_forward(plan: &ForwardPlan) -> StepOutput {
         let mut tokens = Vec::with_capacity(plan.decode_rows.len() + plan.prefill_rows.len());

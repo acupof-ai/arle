@@ -522,6 +522,25 @@ impl Dsv4SlotState {
         }
         Ok(())
     }
+
+    pub(crate) fn truncate(&mut self, layers: &[Dsv4Layer], new_len: usize) -> Result<()> {
+        ensure!(
+            new_len <= self.seq_len,
+            "DSv4 slot truncate cannot grow from {} to {new_len}",
+            self.seq_len
+        );
+        ensure!(
+            layers.len() == self.attention.len(),
+            "DSv4 slot truncate layer count {} != attention states {}",
+            layers.len(),
+            self.attention.len()
+        );
+        self.seq_len = new_len;
+        for (layer, state) in layers.iter().zip(&mut self.attention) {
+            state.truncate_decode_len(layer.mode, layer.compress_ratio, new_len);
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Dsv4Model {
@@ -664,6 +683,10 @@ impl Dsv4Model {
         Dsv4SlotState::new(self, max_seq_len)
     }
 
+    pub(crate) fn truncate_slot(&self, slot: &mut Dsv4SlotState, new_len: usize) -> Result<()> {
+        slot.truncate(&self.layers, new_len)
+    }
+
     /// Forward one prefill/decode step over `tokens` starting at `start_pos`,
     /// returning the next greedy/sampled token.
     ///
@@ -713,6 +736,133 @@ impl Dsv4Model {
         position: u64,
         mut last_hidden_out: Option<&mut DeviceVec>,
     ) -> Result<u32> {
+        let seq_len = tokens.len();
+        let use_gpu_router = std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some();
+        let use_deepep_transport = dsv4_use_deepep_transport()?;
+        if dsv4_decode_graph_enabled()
+            && last_hidden_out.is_none()
+            && !crate::attention::dsv4_flashmla_decode_enabled()?
+            && seq_len == 1
+            && use_gpu_router
+            && !use_deepep_transport
+        {
+            return self.forward_tokens_decode_graph(slot, tokens[0], start_pos, params, position);
+        }
+
+        let (stream, mut keepalive) = self.forward_tokens_stream_impl(slot, tokens, start_pos)?;
+        let token = self.forward_stream_last_token(
+            &stream,
+            seq_len,
+            params,
+            position,
+            last_hidden_out.as_deref_mut(),
+            &mut keepalive,
+        )?;
+        std::hint::black_box(keepalive.len());
+        drop(keepalive);
+        Ok(token)
+    }
+
+    pub(crate) fn forward_tokens_verify(
+        &self,
+        slot: &mut Dsv4SlotState,
+        tokens: &[u32],
+        start_pos: usize,
+        position: u64,
+    ) -> Result<(Vec<u32>, Vec<DeviceVec>)> {
+        ensure!(
+            !tokens.is_empty(),
+            "DSv4 verify forward requires at least one token"
+        );
+        let mut argmax_tokens = Vec::with_capacity(tokens.len());
+        let mut hiddens = Vec::with_capacity(tokens.len());
+        let _nvtx = crate::nvtx::range("dsv4/lm_head_verify");
+        let params = SamplingParams::default();
+        for (row, &token_id) in tokens.iter().enumerate() {
+            let row_start = start_pos + row;
+            let row_position = position + row as u64;
+            let (stream, mut keepalive) =
+                self.forward_tokens_stream_impl(slot, &[token_id], row_start)?;
+            let mut row_hidden = DeviceVec::zeros(&self.ctx, self.config.hidden_size)?;
+            let token = self.forward_stream_last_token(
+                &stream,
+                1,
+                &params,
+                row_position,
+                Some(&mut row_hidden),
+                &mut keepalive,
+            )?;
+            argmax_tokens.push(token);
+            hiddens.push(row_hidden);
+            std::hint::black_box(keepalive.len());
+            drop(keepalive);
+        }
+        Ok((argmax_tokens, hiddens))
+    }
+
+    fn forward_stream_last_token(
+        &self,
+        stream: &HiddenStates,
+        seq_len: usize,
+        params: &SamplingParams,
+        position: u64,
+        last_hidden_out: Option<&mut DeviceVec>,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<u32> {
+        ensure!(seq_len > 0, "DSv4 head stage requires seq_len > 0");
+        let hidden_size = self.config.hidden_size;
+        let eps = self.config.rms_norm_eps;
+        let ctx = &self.ctx;
+
+        let _nvtx = crate::nvtx::range("dsv4/lm_head_sample");
+        // ── Head HC: fold the last token's wide stream row → one hidden vector.
+        let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
+        crate::stage_profile::profile(ctx, "dsv4/stage/head_hc", || {
+            crate::hc::head_hidden_from_stream(
+                ctx,
+                &self.config,
+                &self.head_hc,
+                stream,
+                seq_len - 1,
+                &mut last_hidden,
+            )
+        })?;
+        keepalive.keep_hidden(stream);
+        keepalive.keep_vec(&last_hidden);
+        if let Some(out) = last_hidden_out {
+            ensure!(
+                out.len == hidden_size,
+                "DSv4 hidden capture len {} != hidden_size {hidden_size}",
+                out.len
+            );
+            ctx.stream
+                .memcpy_dtod(&last_hidden.data, &mut out.data)
+                .map_err(|e| anyhow!("DSv4 hidden capture D2D failed: {e}"))?;
+            keepalive.keep_vec(out);
+        }
+
+        // ── Final norm + lm_head projection + sample (last token row).
+        let mut last_normed = DeviceVec::zeros(ctx, hidden_size)?;
+        crate::stage_profile::profile(ctx, "dsv4/stage/head_norm", || {
+            crate::ops::rms_norm_vec(ctx, &last_hidden, &self.norm, eps, &mut last_normed)
+        })?;
+        keepalive.keep_vec(&last_normed);
+        let mut logits = DeviceVec::zeros(ctx, self.lm_head.rows)?;
+        crate::stage_profile::profile(ctx, "dsv4/stage/lm_head_project", || {
+            self.lm_head_project(&last_normed, &mut logits)
+        })?;
+        keepalive.keep_vec(&logits);
+        crate::stage_profile::profile(ctx, "dsv4/stage/sample", || {
+            crate::executor::sample_cuda_token(ctx, &logits, params, position)
+        })
+    }
+
+    fn forward_tokens_stream_impl(
+        &self,
+        slot: &mut Dsv4SlotState,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
         ensure!(
             !tokens.is_empty(),
             "DSv4 forward requires at least one token"
@@ -736,15 +886,6 @@ impl Dsv4Model {
         let eps = self.config.rms_norm_eps;
         let use_gpu_router = std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some();
         let use_deepep_transport = dsv4_use_deepep_transport()?;
-        if dsv4_decode_graph_enabled()
-            && last_hidden_out.is_none()
-            && !crate::attention::dsv4_flashmla_decode_enabled()?
-            && seq_len == 1
-            && use_gpu_router
-            && !use_deepep_transport
-        {
-            return self.forward_tokens_decode_graph(slot, tokens[0], start_pos, params, position);
-        }
         let use_moe_decode_scratch = use_gpu_router && seq_len == 1 && !use_deepep_transport;
         let mut keepalive = Dsv4ForwardKeepalive::new(seq_len == 1);
         let ctx = &self.ctx;
@@ -1044,54 +1185,7 @@ impl Dsv4Model {
         }
 
         slot.seq_len += seq_len;
-
-        let token = {
-            let _nvtx = crate::nvtx::range("dsv4/lm_head_sample");
-            // ── Head HC: fold the last token's wide stream row → one hidden vector.
-            let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
-            crate::stage_profile::profile(ctx, "dsv4/stage/head_hc", || {
-                crate::hc::head_hidden_from_stream(
-                    &self.ctx,
-                    &self.config,
-                    &self.head_hc,
-                    &stream,
-                    seq_len - 1,
-                    &mut last_hidden,
-                )
-            })?;
-            keepalive.keep_hidden(&stream);
-            keepalive.keep_vec(&last_hidden);
-            if let Some(out) = last_hidden_out.as_deref_mut() {
-                ensure!(
-                    out.len == hidden_size,
-                    "DSv4 hidden capture len {} != hidden_size {hidden_size}",
-                    out.len
-                );
-                self.ctx
-                    .stream
-                    .memcpy_dtod(&last_hidden.data, &mut out.data)
-                    .map_err(|e| anyhow!("DSv4 hidden capture D2D failed: {e}"))?;
-                keepalive.keep_vec(out);
-            }
-
-            // ── Final norm + lm_head projection + sample (last token row).
-            let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
-            crate::stage_profile::profile(ctx, "dsv4/stage/head_norm", || {
-                crate::ops::rms_norm_vec(&self.ctx, &last_hidden, &self.norm, eps, &mut last_normed)
-            })?;
-            keepalive.keep_vec(&last_normed);
-            let mut logits = DeviceVec::zeros(&self.ctx, self.lm_head.rows)?;
-            crate::stage_profile::profile(ctx, "dsv4/stage/lm_head_project", || {
-                self.lm_head_project(&last_normed, &mut logits)
-            })?;
-            keepalive.keep_vec(&logits);
-            crate::stage_profile::profile(ctx, "dsv4/stage/sample", || {
-                crate::executor::sample_cuda_token(&self.ctx, &logits, params, position)
-            })?
-        };
-        std::hint::black_box(keepalive.len());
-        drop(keepalive);
-        Ok(token)
+        Ok((stream, keepalive))
     }
 
     pub(crate) fn mtp_forward(

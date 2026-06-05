@@ -130,6 +130,15 @@ impl RealCudaExecutor {
         }
     }
 
+    pub(crate) fn dsv4_verify_forward_selftest(&mut self, prompt: &[u32]) -> Result<()> {
+        match self {
+            Self::Dsv4(d) => d.verify_forward_selftest(prompt),
+            Self::Qwen(_) | Self::Qwen35(_) => {
+                anyhow::bail!("DSv4 verify-forward selftest requires a DSv4 executor")
+            }
+        }
+    }
+
     /// OPD teacher raw-logits forward (Qwen3.5/3.6 hybrid only). Returns the full
     /// `[seq_len, vocab]` logits without sampling. Dense Qwen3 / DSv4 are not OPD
     /// teacher targets on this surface and bail.
@@ -564,8 +573,16 @@ impl QwenCudaExecutor {
 pub(crate) struct Dsv4CudaExecutor {
     model: crate::dsv4::Dsv4Model,
     slots: Vec<crate::dsv4::Dsv4SlotState>,
+    spec_slots: Vec<Dsv4SpecSlotState>,
     num_slots: usize,
-    mtp_probe_printed: bool,
+    mtp_accepts: usize,
+    mtp_rejects: usize,
+}
+
+#[derive(Default)]
+struct Dsv4SpecSlotState {
+    pending: Option<u32>,
+    hidden: Option<DeviceVec>,
 }
 
 impl std::fmt::Debug for Dsv4CudaExecutor {
@@ -589,23 +606,29 @@ impl Dsv4CudaExecutor {
         for _ in 0..num_slots {
             slots.push(model.new_slot_state(max_seq_len)?);
         }
+        let spec_slots = (0..num_slots)
+            .map(|_| Dsv4SpecSlotState::default())
+            .collect();
         Ok(Self {
             model,
             slots,
+            spec_slots,
             num_slots,
-            mtp_probe_printed: false,
+            mtp_accepts: 0,
+            mtp_rejects: 0,
         })
     }
 
-    fn forward_tokens_maybe_mtp_probe(
+    fn forward_prefill_tokens(
         &mut self,
         slot_idx: usize,
         tokens: &[u32],
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
-    ) -> Result<u32> {
-        if crate::dsv4::dsv4_spec_decode_enabled() && !self.mtp_probe_printed {
+        final_prefill: bool,
+    ) -> Result<Vec<u32>> {
+        if crate::dsv4::dsv4_spec_decode_enabled() {
             let (token, hidden) = self.model.forward_tokens_with_hidden(
                 &mut self.slots[slot_idx],
                 tokens,
@@ -613,20 +636,103 @@ impl Dsv4CudaExecutor {
                 params,
                 position,
             )?;
-            let draft = self.model.mtp_forward(&hidden, token, position + 1)?;
-            if self.model.tp.config().rank == 0 {
-                eprintln!("[dsv4-mtp] base_token={token} draft_token={draft}");
+            if final_prefill {
+                self.spec_slots[slot_idx].pending = Some(token);
+                self.spec_slots[slot_idx].hidden = Some(hidden);
+            } else {
+                self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
             }
-            self.mtp_probe_printed = true;
-            Ok(token)
+            Ok(vec![token])
         } else {
-            self.model.forward_tokens(
+            Ok(vec![self.model.forward_tokens(
                 &mut self.slots[slot_idx],
                 tokens,
                 start_pos,
                 params,
                 position,
-            )
+            )?])
+        }
+    }
+
+    fn forward_decode_tokens(
+        &mut self,
+        slot_idx: usize,
+        last_token: u32,
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<Vec<u32>> {
+        if !crate::dsv4::dsv4_spec_decode_enabled() {
+            return Ok(vec![self.model.forward_tokens(
+                &mut self.slots[slot_idx],
+                &[last_token],
+                start_pos,
+                params,
+                position,
+            )?]);
+        }
+
+        ensure!(
+            params.is_greedy(),
+            "DSv4 MTP greedy verify currently supports greedy sampling only"
+        );
+        let spec = &mut self.spec_slots[slot_idx];
+        let pending = spec
+            .pending
+            .ok_or_else(|| anyhow::anyhow!("DSv4 MTP decode missing pending token"))?;
+        ensure!(
+            pending == last_token,
+            "DSv4 MTP pending token {pending} != DecodeRow.last_token {last_token}"
+        );
+        let hidden = spec
+            .hidden
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 MTP decode missing previous hidden"))?
+            .clone();
+
+        let draft_position = start_pos.saturating_add(1) as u64;
+        let draft = self.model.mtp_forward(&hidden, pending, draft_position)?;
+        let (argmax, mut hiddens) = self.model.forward_tokens_verify(
+            &mut self.slots[slot_idx],
+            &[pending, draft],
+            start_pos,
+            position,
+        )?;
+        ensure!(
+            argmax.len() == 2 && hiddens.len() == 2,
+            "DSv4 MTP depth-1 verify expected 2 rows, got argmax={} hidden={}",
+            argmax.len(),
+            hiddens.len()
+        );
+        let base_next = argmax[0];
+        let bonus = argmax[1];
+        if base_next == draft {
+            let hidden_for_draft = hiddens.remove(1);
+            spec.pending = Some(bonus);
+            spec.hidden = Some(hidden_for_draft);
+            self.mtp_accepts += 1;
+            if self.model.tp.config().rank == 0 {
+                eprintln!(
+                    "[dsv4-mtp] accept_total={} reject_total={} pending={} draft={} bonus={}",
+                    self.mtp_accepts, self.mtp_rejects, pending, draft, bonus
+                );
+            }
+            Ok(vec![draft, bonus])
+        } else {
+            let keep_len = start_pos + 1;
+            self.model
+                .truncate_slot(&mut self.slots[slot_idx], keep_len)?;
+            let hidden_for_pending = hiddens.remove(0);
+            spec.pending = Some(base_next);
+            spec.hidden = Some(hidden_for_pending);
+            self.mtp_rejects += 1;
+            if self.model.tp.config().rank == 0 {
+                eprintln!(
+                    "[dsv4-mtp] accept_total={} reject_total={} pending={} draft={} base_next={}",
+                    self.mtp_accepts, self.mtp_rejects, pending, draft, base_next
+                );
+            }
+            Ok(vec![base_next])
         }
     }
 
@@ -652,16 +758,19 @@ impl Dsv4CudaExecutor {
             ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
             if row.start_pos == 0 {
                 self.slots[row.slot].reset(&self.model.ctx)?;
+                self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
             }
             let position = (row.start_pos + row.tokens.len()) as u64;
-            let token = self.forward_tokens_maybe_mtp_probe(
+            let final_prefill = row.start_pos + row.tokens.len() >= row.total_tokens;
+            let tokens = self.forward_prefill_tokens(
                 row.slot,
                 &row.tokens,
                 row.start_pos,
                 &row.params,
                 position,
+                final_prefill,
             )?;
-            (row.slot, token)
+            (row.slot, tokens)
         } else {
             let row = &plan.decode_rows[0];
             ensure!(
@@ -678,24 +787,124 @@ impl Dsv4CudaExecutor {
                 row.slot
             );
             let position = row.kv_seq_len.saturating_add(1) as u64;
-            let token = self.forward_tokens_maybe_mtp_probe(
+            let tokens = self.forward_decode_tokens(
                 row.slot,
-                &[row.last_token],
+                row.last_token,
                 row.kv_seq_len,
                 &row.params,
                 position,
             )?;
-            (row.slot, token)
+            (row.slot, tokens)
         };
 
         Ok(StepOutput {
-            tokens: vec![SlotToken {
-                slot,
-                token,
-                logprob: None,
-                finish: None,
-            }],
+            tokens: token
+                .into_iter()
+                .map(|token| SlotToken {
+                    slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                })
+                .collect(),
         })
+    }
+
+    pub(crate) fn verify_forward_selftest(&mut self, prompt: &[u32]) -> Result<()> {
+        ensure!(
+            !prompt.is_empty(),
+            "DSv4 verify-forward selftest requires a non-empty prompt"
+        );
+        let slot_idx = 0;
+        let params = SamplingParams::default();
+        let start_pos = prompt.len();
+
+        self.slots[slot_idx].reset(&self.model.ctx)?;
+        let token_a = self.model.forward_tokens(
+            &mut self.slots[slot_idx],
+            prompt,
+            0,
+            &params,
+            start_pos as u64,
+        )?;
+        let (verify_one, _) = self.model.forward_tokens_verify(
+            &mut self.slots[slot_idx],
+            &[token_a],
+            start_pos,
+            (start_pos + 1) as u64,
+        )?;
+
+        self.slots[slot_idx].reset(&self.model.ctx)?;
+        let token_a_again = self.model.forward_tokens(
+            &mut self.slots[slot_idx],
+            prompt,
+            0,
+            &params,
+            start_pos as u64,
+        )?;
+        ensure!(
+            token_a == token_a_again,
+            "DSv4 verify selftest prefill token drifted: {token_a} != {token_a_again}"
+        );
+        let normal_one = self.model.forward_tokens(
+            &mut self.slots[slot_idx],
+            &[token_a],
+            start_pos,
+            &params,
+            (start_pos + 1) as u64,
+        )?;
+        ensure!(
+            verify_one.first().copied() == Some(normal_one),
+            "DSv4 verify selftest one-token mismatch: verify={verify_one:?} normal={normal_one}"
+        );
+
+        self.slots[slot_idx].reset(&self.model.ctx)?;
+        let token_a = self.model.forward_tokens(
+            &mut self.slots[slot_idx],
+            prompt,
+            0,
+            &params,
+            start_pos as u64,
+        )?;
+        let (verify_one, _) = self.model.forward_tokens_verify(
+            &mut self.slots[slot_idx],
+            &[token_a],
+            start_pos,
+            (start_pos + 1) as u64,
+        )?;
+        let token_b = verify_one[0];
+        let mut wrong_b = token_b.wrapping_add(2);
+        if wrong_b == token_b {
+            wrong_b = token_b.wrapping_add(3);
+        }
+
+        self.slots[slot_idx].reset(&self.model.ctx)?;
+        let token_a = self.model.forward_tokens(
+            &mut self.slots[slot_idx],
+            prompt,
+            0,
+            &params,
+            start_pos as u64,
+        )?;
+        let (verify_two, _) = self.model.forward_tokens_verify(
+            &mut self.slots[slot_idx],
+            &[token_a, wrong_b],
+            start_pos,
+            (start_pos + 1) as u64,
+        )?;
+        ensure!(
+            verify_two.first() == verify_one.first(),
+            "DSv4 verify selftest two-token row0 mismatch: one={verify_one:?} two={verify_two:?}"
+        );
+
+        self.slots[slot_idx].reset(&self.model.ctx)?;
+        self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
+        if self.model.tp.config().rank == 0 {
+            eprintln!(
+                "[dsv4-mtp-selftest] PASS token_a={token_a} token_b={token_b} wrong_b={wrong_b} verify_two={verify_two:?}"
+            );
+        }
+        Ok(())
     }
 }
 

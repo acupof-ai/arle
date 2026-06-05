@@ -221,6 +221,10 @@ mod real {
             .context("from_dsv4_fp8_safetensors failed (build/config?)")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
         let mut kv = CudaKvPool::new(1, 1, 16);
+        if env_flag("INFER_DSV4_MTP_STEP_A_SELFTEST") {
+            exec.dsv4_verify_forward_selftest(&prompt)
+                .context("DSv4 MTP Step A verify-forward selftest failed")?;
+        }
 
         // ── Step 1: full-prefix prefill at start_pos = 0 → the first token.
         let chunk1_prompt = matches!(
@@ -238,11 +242,20 @@ mod real {
         let first = if chunk1_prompt {
             let mut first = None;
             for (idx, &tok) in prompt.iter().enumerate() {
-                first = Some(forward_once(&mut exec, &mut kv, prefill_plan(&[tok], idx))?);
+                let tokens = forward_once(&mut exec, &mut kv, prefill_plan(&[tok], idx))?;
+                first = Some(
+                    tokens
+                        .first()
+                        .copied()
+                        .context("DSv4 chunked prefill produced no token")?,
+                );
             }
             first.expect("prompt is non-empty")
         } else {
             forward_once(&mut exec, &mut kv, prefill_plan(&prompt, 0))?
+                .first()
+                .copied()
+                .context("DSv4 prefill produced no token")?
         };
         let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
         set_dsv4_stage_profile_active(false);
@@ -262,14 +275,21 @@ mod real {
             cuda_profiler_start().context("cudaProfilerStart before DSv4 decode loop failed")?;
         }
         let decode_t0 = Instant::now();
-        for step in 1..max_new {
+        while clean_tokens.len() < max_new {
             // KV length already materialized = prompt + tokens emitted so far.
-            let kv_seq_len = prompt.len() + step - 1;
+            let kv_seq_len = prompt.len() + clean_tokens.len() - 1;
             let last = *clean_tokens.last().expect("clean_tokens is non-empty");
             match forward_once(&mut exec, &mut kv, decode_plan(last, kv_seq_len)) {
-                Ok(tok) => clean_tokens.push(tok),
+                Ok(tokens) => {
+                    for tok in tokens {
+                        if clean_tokens.len() >= max_new {
+                            break;
+                        }
+                        clean_tokens.push(tok);
+                    }
+                }
                 Err(e) => {
-                    bail_at = Some((step, format!("{e:#}")));
+                    bail_at = Some((clean_tokens.len(), format!("{e:#}")));
                     break;
                 }
             }
@@ -411,14 +431,14 @@ mod real {
         exec: &mut CudaExecutor,
         kv: &mut CudaKvPool,
         plan: ForwardPlan,
-    ) -> Result<u32> {
+    ) -> Result<Vec<u32>> {
         let inflight = exec.submit(&plan, kv as &mut dyn KvPool)?;
         match exec.poll(inflight)? {
-            PollResult::Ready(out) => out
-                .tokens
-                .first()
-                .map(|t| t.token)
-                .context("DSv4 step produced no token"),
+            PollResult::Ready(out) => {
+                let tokens: Vec<u32> = out.tokens.into_iter().map(|t| t.token).collect();
+                anyhow::ensure!(!tokens.is_empty(), "DSv4 step produced no token");
+                Ok(tokens)
+            }
             PollResult::NotReady(_) => {
                 anyhow::bail!("DSv4 executor resolves synchronously; got NotReady")
             }

@@ -405,7 +405,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             match self.executor.poll(inflight)? {
                 PollResult::Ready(output) => {
                     let plan = self.pending_plan.take().unwrap_or_else(ForwardPlan::idle);
-                    self.apply_output(&plan, output);
+                    self.apply_output(&plan, output)?;
                 }
                 PollResult::NotReady(inflight) => {
                     self.inflight = Some(inflight);
@@ -526,17 +526,20 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.waiting.insert(insert_at, request);
     }
 
-    fn apply_output(&mut self, plan: &ForwardPlan, output: StepOutput) {
-        let mut tokens_by_slot: BTreeMap<usize, SlotToken> = BTreeMap::new();
+    fn apply_output(&mut self, plan: &ForwardPlan, output: StepOutput) -> Result<()> {
+        let mut tokens_by_slot: BTreeMap<usize, VecDeque<SlotToken>> = BTreeMap::new();
         for token in output.tokens {
-            tokens_by_slot.insert(token.slot, token);
+            tokens_by_slot
+                .entry(token.slot)
+                .or_default()
+                .push_back(token);
         }
         let mut finished_slots = Vec::new();
         // Tokens committed this step, in commit order (prefill rows then decode
         // rows), forwarded to `on_token` after the request-borrowing loops so the
         // `self.active` and `self.on_token` borrows stay disjoint.
         let mut committed: Vec<(RequestHandle, SlotToken)> = Vec::new();
-        let model_stops: &[u32] = &self.model_stop_token_ids;
+        let model_stops = self.model_stop_token_ids.clone();
 
         // Advance chunked prefill. A non-final chunk only moves progress; the
         // final chunk transitions the slot to decode and consumes its first token.
@@ -552,9 +555,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             request.prefill_start_pos = new_start;
             if new_start >= prompt_len {
                 request.phase = RequestPhase::Decoding;
-                if let Some(token) = tokens_by_slot.remove(&row.slot) {
+                if let Some(token) = tokens_by_slot
+                    .get_mut(&row.slot)
+                    .and_then(VecDeque::pop_front)
+                {
                     request.generated_tokens.push(token.token);
-                    if let Some(finish) = finish_reason_for(request, &token, model_stops) {
+                    if let Some(finish) = finish_reason_for(request, &token, &model_stops) {
                         finished_slots.push((row.slot, finish));
                     }
                     committed.push((request.handle, token));
@@ -568,22 +574,35 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         }
 
-        // Decode rows: append the sampled token and check stop/length.
+        // Decode rows: append sampled token(s) and check stop/length after each.
+        // Speculative backends may return multiple committed tokens for one
+        // decode row; the host KV pool pre-allocated the first one in
+        // `allocate_for_plan`, so each extra token gets one more logical append
+        // before it is exposed to scheduling.
         for row in &plan.decode_rows {
-            let Some(token) = tokens_by_slot.remove(&row.slot) else {
+            let Some(mut tokens) = tokens_by_slot.remove(&row.slot) else {
                 continue;
             };
-            let Some(request) = self.active.get_mut(&row.slot) else {
-                continue;
-            };
-            if !matches!(request.phase, RequestPhase::Decoding) {
-                continue;
+            let mut token_idx = 0usize;
+            while let Some(token) = tokens.pop_front() {
+                if token_idx > 0 {
+                    self.alloc_with_prefix_reclaim(row.slot, 1)?;
+                }
+                let Some(request) = self.active.get_mut(&row.slot) else {
+                    break;
+                };
+                if !matches!(request.phase, RequestPhase::Decoding) {
+                    break;
+                }
+                request.generated_tokens.push(token.token);
+                let finished = finish_reason_for(request, &token, &model_stops);
+                committed.push((request.handle, token));
+                token_idx += 1;
+                if let Some(finish) = finished {
+                    finished_slots.push((row.slot, finish));
+                    break;
+                }
             }
-            request.generated_tokens.push(token.token);
-            if let Some(finish) = finish_reason_for(request, &token, model_stops) {
-                finished_slots.push((row.slot, finish));
-            }
-            committed.push((request.handle, token));
         }
 
         // Stream committed tokens to the observer (if any) before finishing slots,
@@ -597,6 +616,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         for (slot, reason) in finished_slots {
             self.finish_slot(slot, reason);
         }
+        Ok(())
     }
 
     fn finish_slot(&mut self, slot: usize, reason: FinishReason) {
@@ -1338,6 +1358,93 @@ mod testing {
         }
     }
 
+    /// Mirrors a depth-1 speculative backend: each decode forward materializes
+    /// two device-token positions and returns two committed tokens. This catches
+    /// host-side `kv_seq_len` drift when the scheduler has to advance by the real
+    /// accepted-token count, not by a hard-coded one token per row.
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct SpecMirrorExecutor {
+        materialized: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<usize, usize>>>,
+        decode_log: std::rc::Rc<std::cell::RefCell<Vec<(usize, usize, usize)>>>,
+    }
+
+    impl SpecMirrorExecutor {
+        pub(super) fn materialized(&self, slot: usize) -> usize {
+            self.materialized.borrow().get(&slot).copied().unwrap_or(0)
+        }
+
+        pub(super) fn decode_log(&self) -> Vec<(usize, usize, usize)> {
+            self.decode_log.borrow().clone()
+        }
+    }
+
+    impl BackendExecutor for SpecMirrorExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            let mut tokens = Vec::new();
+            let mut materialized = self.materialized.borrow_mut();
+
+            for row in &plan.prefill_rows {
+                let entry = materialized.entry(row.slot).or_insert(0);
+                if row.start_pos == 0 {
+                    *entry = 0;
+                } else if *entry != row.start_pos {
+                    bail!(
+                        "spec mirror: chunked prefill expects materialized {} == start_pos {} for slot {}",
+                        *entry,
+                        row.start_pos,
+                        row.slot
+                    );
+                }
+                *entry += row.tokens.len();
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token: row.tokens.last().copied().map_or(1, |last| last + 1),
+                    logprob: None,
+                    finish: None,
+                });
+            }
+
+            for row in &plan.decode_rows {
+                let entry = materialized.entry(row.slot).or_insert(0);
+                self.decode_log
+                    .borrow_mut()
+                    .push((row.slot, *entry, row.kv_seq_len));
+                if *entry != row.kv_seq_len {
+                    bail!(
+                        "spec mirror: materialized cache_len {} != DecodeRow.kv_seq_len {} for slot {}",
+                        *entry,
+                        row.kv_seq_len,
+                        row.slot
+                    );
+                }
+                *entry += 2;
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token: row.last_token + 1,
+                    logprob: None,
+                    finish: None,
+                });
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token: row.last_token + 2,
+                    logprob: None,
+                    finish: None,
+                });
+            }
+
+            Ok(MockInflight {
+                output: StepOutput { tokens },
+                return_not_ready_once: false,
+            })
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            Ok(PollResult::Ready(inflight.output))
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     pub(super) struct HoldGovernor;
 
@@ -1363,7 +1470,7 @@ mod tests {
 
     use super::testing::{
         DeviceMirrorExecutor, HoldGovernor, MockExecutor, MockKvPool, SamplingExecutor,
-        StopTokenExecutor, WarmupCountingExecutor,
+        SpecMirrorExecutor, StopTokenExecutor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -1648,6 +1755,33 @@ mod tests {
     fn decode_kv_seq_len_matches_materialized_multi_token_prompt() {
         assert_decode_kv_seq_len_matches_materialized(8, 5);
         assert_decode_kv_seq_len_matches_materialized(16, 3);
+    }
+
+    #[test]
+    fn decode_kv_seq_len_advances_by_speculative_output_count() {
+        let executor = SpecMirrorExecutor::default();
+        let probe = executor.clone();
+        let prompt_len = 8usize;
+        let max_new = 5usize;
+        let mut engine = Engine::with_config(executor, MockKvPool::new(1), test_config(1));
+        let prompt: Vec<u32> = (0..prompt_len as u32).map(|t| t + 1).collect();
+
+        let handle = engine.submit_request(prompt, max_new);
+        engine
+            .run_to_idle()
+            .unwrap_or_else(|e| panic!("speculative kv_seq_len drift: {e}"));
+
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(completed.generated_tokens, vec![9, 10, 11, 12, 13]);
+        assert!(matches!(completed.finish, Some(FinishReason::Length)));
+        assert_eq!(
+            probe.decode_log(),
+            vec![
+                (0, prompt_len, prompt_len),
+                (0, prompt_len + 2, prompt_len + 2)
+            ]
+        );
+        assert_eq!(probe.materialized(0), prompt_len + max_new - 1);
     }
 
     /// Chunked prefill (prompt split across ticks) must still hand the first
