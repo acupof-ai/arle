@@ -3,15 +3,17 @@
 //! Prep kernels fuse Q/K RMSNorm + RoPE + KV-cache write; the TileLang kernels
 //! run the HD128/kv8 paged attention.
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{anyhow, bail, ensure, Result};
 use cuda_kernels::attention as flash_kv;
 use cuda_kernels::ffi;
 use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
-use cuda_kernels::tensor::{WeightFormat, cache_ptr};
+use cuda_kernels::tensor::{cache_ptr, WeightFormat};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::dsv4::{
     Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer, Dsv4MlaKvArena,
@@ -44,6 +46,29 @@ pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
         None => DSV4_FLASHMLA_OVERRIDE_ENV,
     };
     DSV4_FUSED_WQKV_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
+}
+
+fn maybe_probe_flashmla_decode_path(
+    layer_idx: usize,
+    mode: DeepSeekV4AttentionMode,
+    flashmla_used: bool,
+    token_count: usize,
+    start_pos: usize,
+) {
+    if std::env::var("ARLE_DSV4_FLASHMLA_PROBE").as_deref() != Ok("1")
+        || std::env::var("INFER_TP_RANK").as_deref() != Ok("0")
+        || token_count != 1
+        || start_pos == 0
+    {
+        return;
+    }
+
+    static SEEN: OnceLock<Mutex<HashSet<(usize, String)>>> = OnceLock::new();
+    let mode_key = format!("{mode:?}");
+    let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if set.lock().unwrap().insert((layer_idx, mode_key)) {
+        eprintln!("[flashmla-probe] layer={layer_idx} mode={mode:?} flashmla_used={flashmla_used}");
+    }
 }
 
 pub(crate) struct Dsv4CompressorState {
@@ -2448,6 +2473,7 @@ pub(crate) fn mla_attention(
         } else {
             false
         };
+        maybe_probe_flashmla_decode_path(layer_idx, mode, flashmla_used, token_count, start_pos);
         if !flashmla_used {
             let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
             let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
@@ -2660,6 +2686,7 @@ pub(crate) fn mla_attention(
         } else {
             false
         };
+        maybe_probe_flashmla_decode_path(layer_idx, mode, flashmla_used, token_count, start_pos);
         if !flashmla_used {
             let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
             let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
