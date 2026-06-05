@@ -431,6 +431,33 @@ pub unsafe fn dsv4_pack_local_experts_with_slots(
     Ok(())
 }
 
+/// Fill DeepGEMM contiguous `m_indices` from compact per-local-expert counts.
+///
+/// # Safety
+/// `counts`, `offsets`, and `m_indices` must be valid on `stream`;
+/// `m_indices` must have at least `row_capacity` rows.
+pub unsafe fn dsv4_fill_m_indices_from_counts(
+    counts: RawDevicePtr<i32>,
+    offsets: RawDevicePtr<i32>,
+    m_indices: RawDevicePtr<i32>,
+    experts_per_rank: usize,
+    row_capacity: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_fill_m_indices_from_counts_cuda(
+            counts.as_ptr(),
+            offsets.as_ptr(),
+            m_indices.as_mut_ptr(),
+            i32::try_from(experts_per_rank)?,
+            i32::try_from(row_capacity)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Pack routed tokens and emit the contiguous DeepGEMM `m_indices` row→local
 /// expert map alongside the compact route-slot metadata.
 ///
