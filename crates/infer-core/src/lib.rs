@@ -1456,6 +1456,31 @@ mod tests {
     }
 
     #[test]
+    fn token_observer_streams_prefill_and_decode_tokens_before_completion() -> Result<()> {
+        let executor = StopTokenExecutor::with_model_stops(vec![12]);
+        let mut engine = Engine::new(executor, MockKvPool::new(1), 1);
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed_sink = observed.clone();
+        engine.set_token_observer(Box::new(move |handle, token| {
+            observed_sink.borrow_mut().push((handle.id(), token.token));
+        }));
+
+        let handle = engine.submit_request(vec![10], 8);
+        engine.run_to_idle()?;
+
+        let expected = vec![(handle.id(), 11), (handle.id(), 12)];
+        assert_eq!(
+            *observed.borrow(),
+            expected,
+            "serving observer must see the prefill token and terminal decode token in commit order"
+        );
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(completed.generated_tokens, vec![11, 12]);
+        assert!(matches!(completed.finish, Some(FinishReason::Stop)));
+        Ok(())
+    }
+
+    #[test]
     fn engine_warms_backend_exactly_once_across_steps() -> Result<()> {
         let executor = WarmupCountingExecutor::default();
         let warmup_calls = executor.warmup_calls.clone();
