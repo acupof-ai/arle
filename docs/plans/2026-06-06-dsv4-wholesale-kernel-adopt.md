@@ -63,6 +63,32 @@ decode-graph/deepep for v1.
      `kv.seq_len==row.kv_seq_len` assertion is the consistency gate. Control experiment:
      drive accept(+2) then reject(+1) and assert materialized==logical each step.
   Coding the verify loop before these two controls pass is still a guess (§0).
+- **Phase 1 LANDED** (`2e0cde16`, gated `ARLE_DSV4_SPEC_DECODE`): `Dsv4MtpLayer` load
+  (dsv4.rs:206/607), `mtp_forward` (dsv4.rs:1032), `forward_tokens_with_hidden`
+  (dsv4.rs:687); validated on the TP=8/EP=8 pod (MTP loads, drafts `base=11111
+  draft=16`, no crash). The executor seam is the one-shot probe at executor.rs:608.
+- **Phase 2 spec (grounded in the real primitives):**
+  - Rollback primitive EXISTS: `truncate_slot(slot, new_len)` (lib.rs:258) rolls the
+    host+device KV back; pair it with `advance_decode_len(mode, ratio, accepted_total)`
+    (attention.rs:411, resets compressor/indexer `compressed.seq_len`) + a FP8-pool
+    `fp8_kv_comp_packed_rows` decrement → the full per-slot rollback helper.
+  - Verify loop (replaces the executor.rs:608 probe, gated): when `pending_draft`
+    is Some — `kv.alloc_tokens(slot, 2)`; forward the 2-token batch `[last_accepted,
+    draft]` (a new "decode-2" forward that returns argmax at BOTH positions + the
+    hidden); `real_next = argmax@pos`. **Accept** (`draft == real_next`): emit
+    `[real_next, real_next2]`, both KV positions stay, re-draft from
+    `mtp_forward(hidden, real_next2)`. **Reject**: `truncate_slot(slot, kv_seq_len+1)`
+    + counter rollback, emit `[real_next]`, re-draft from `mtp_forward(hidden,
+    real_next)`. Greedy accept is lossless (verify is the base model's own forward).
+  - Cross-crate: `StepOutput.tokens` is already a `Vec`, so emit-1-or-2 is
+    schema-compatible, but the scheduler must advance `row.kv_seq_len` by the emitted
+    count and the `kv.seq_len(slot)==row.kv_seq_len` assertion (executor.rs:356) must
+    hold across +2 — the lockstep control experiment gates this.
+  - Control experiments first: (1) rollback parity — forward `[..tN]` then a wrong
+    speculative `tN+1` then `truncate_slot(slot, N+1)`+counter-reset, assert KV state
+    bit-identical to a no-spec forward to N+1; (2) emit-1-or-2 seq_len lockstep.
+  - Verify (DSv4 non-deterministic → not 4096-token-exact): greedy-lossless at the
+    deterministic short shape (spec-on == spec-off) + measured α + wall tok/s Δ.
 - Acceptance gate: greedy-lossless parity (spec-on == spec-off greedy, non-negotiable)
   + measured α on the SLO shape + wall-clock tok/s Δ. ~1.9× is the α≈1 ceiling, not the claim.
 
