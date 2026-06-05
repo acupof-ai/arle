@@ -431,6 +431,53 @@ pub unsafe fn dsv4_pack_local_experts_with_slots(
     Ok(())
 }
 
+/// Pack routed tokens and emit the contiguous DeepGEMM `m_indices` row→local
+/// expert map alongside the compact route-slot metadata.
+///
+/// # Safety
+/// All pointers must be valid on `stream`; `packed_m_indices` has the same row
+/// capacity as `packed_hidden`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_pack_local_experts_with_slots_and_indices(
+    hidden: RawDevicePtr<bf16>,
+    indices: RawDevicePtr<i32>,
+    weights: RawDevicePtr<f32>,
+    offsets: RawDevicePtr<i32>,
+    cursors: RawDevicePtr<i32>,
+    packed_hidden: RawDevicePtr<bf16>,
+    packed_route_slot: RawDevicePtr<i32>,
+    packed_weight: RawDevicePtr<f32>,
+    packed_m_indices: RawDevicePtr<i32>,
+    num_tokens: usize,
+    hidden_dim: usize,
+    topk: usize,
+    local_expert_start: usize,
+    experts_per_rank: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_pack_local_experts_with_slots_and_indices_cuda(
+            hidden.as_ptr() as *const Half,
+            indices.as_ptr(),
+            weights.as_ptr(),
+            offsets.as_ptr(),
+            cursors.as_mut_ptr(),
+            packed_hidden.as_mut_ptr() as *mut Half,
+            packed_route_slot.as_mut_ptr(),
+            packed_weight.as_mut_ptr(),
+            packed_m_indices.as_mut_ptr(),
+            i32::try_from(num_tokens)?,
+            i32::try_from(hidden_dim)?,
+            i32::try_from(topk)?,
+            i32::try_from(local_expert_start)?,
+            i32::try_from(experts_per_rank)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// SwiGLU with the DSv4 route-clamp over packed per-expert rows.
 /// Wraps [`ffi::dsv4_swiglu_clamped_routes_cuda`].
 ///
@@ -633,6 +680,47 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
             sfb.as_ptr(),
             d.as_mut_ptr() as *mut Half,
             masked_m.as_ptr(),
+            i32::try_from(num_groups)?,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(sfa_aligned_m)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Contiguous m-grouped FP8 GEMM (`f8f8bf16`, NT): `d = a @ b^T` where each
+/// activation row's expert group is read from `m_indices`.
+///
+/// # Safety
+/// All pointers must be valid on `stream`; `m_indices` must contain one local
+/// expert id in `[0, num_groups)` per activation row.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+    a: RawDevicePtr<u8>,
+    sfa: RawDevicePtr<f32>,
+    b: RawDevicePtr<u8>,
+    sfb: RawDevicePtr<f32>,
+    d: RawDevicePtr<bf16>,
+    m_indices: RawDevicePtr<i32>,
+    num_groups: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    sfa_aligned_m: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
+            a.as_ptr(),
+            sfa.as_ptr(),
+            b.as_ptr(),
+            sfb.as_ptr(),
+            d.as_mut_ptr() as *mut Half,
+            m_indices.as_ptr(),
             i32::try_from(num_groups)?,
             i32::try_from(m)?,
             i32::try_from(n)?,
