@@ -50,9 +50,15 @@ fn model_weight_size_for_path(path: &Path) -> Option<ModelWeightSize> {
     })
 }
 
-fn weight_file_len(path: &Path) -> Option<u64> {
+/// Accept the weight-file extensions MLX loads (`safetensors`/`bin`/`gguf`/`npz`),
+/// so the wired-limit size estimate counts the same files the loader reads.
+fn is_weight_file_ext(path: &Path) -> bool {
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    if matches!(ext, "safetensors" | "bin" | "gguf" | "npz") {
+    matches!(ext, "safetensors" | "bin" | "gguf" | "npz")
+}
+
+fn weight_file_len(path: &Path) -> Option<u64> {
+    if is_weight_file_ext(path) {
         let meta = std::fs::metadata(path).ok()?;
         if meta.is_file() {
             return Some(meta.len());
@@ -72,8 +78,7 @@ fn sum_weight_files(dir: &Path) -> std::io::Result<u64> {
         if !meta.is_file() {
             continue;
         }
-        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if matches!(ext, "safetensors" | "bin" | "gguf" | "npz") {
+        if is_weight_file_ext(&path) {
             total += meta.len();
         }
     }

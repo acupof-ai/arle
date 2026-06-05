@@ -48,6 +48,14 @@ impl MetalKvPool {
     fn pages_for_tokens(&self, tokens: usize) -> usize {
         tokens.div_ceil(self.page_size)
     }
+
+    /// Return `page` to the free list unless it is still retained by an
+    /// external owner (e.g. the prefix cache holding a ref via `page_refs`).
+    fn reclaim_page(&mut self, page: u32) {
+        if self.page_refs.get(&page).copied().unwrap_or(0) == 0 {
+            self.free.push(page);
+        }
+    }
 }
 
 impl KvQuery for MetalKvPool {
@@ -134,9 +142,7 @@ impl KvAllocator for MetalKvPool {
         let taken = std::mem::take(pages);
         for page in taken {
             // Retained pages (held by the prefix cache) survive the slot's release.
-            if self.page_refs.get(&page).copied().unwrap_or(0) == 0 {
-                self.free.push(page);
-            }
+            self.reclaim_page(page);
         }
         self.slot_len[slot] = 0;
         self.slot_epoch[slot] = self.slot_epoch[slot].wrapping_add(1);
@@ -152,9 +158,7 @@ impl KvAllocator for MetalKvPool {
         let removed: Vec<u32> = pages.split_off(cut);
         for page in removed {
             // Only physically free pages not retained by a prefix owner.
-            if self.page_refs.get(&page).copied().unwrap_or(0) == 0 {
-                self.free.push(page);
-            }
+            self.reclaim_page(page);
         }
         self.slot_len[slot] = new_len;
         Ok(())
