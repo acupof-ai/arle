@@ -38,8 +38,9 @@ mod real {
 mod real {
     use anyhow::{Context, Result, bail};
     use infer_cuda::{
-        CudaExecutor, CudaKvPool, print_dsv4_linear_profile, reset_dsv4_linear_profile,
-        set_dsv4_flashmla_decode_override, set_dsv4_fused_wqkv_decode_override,
+        CudaExecutor, CudaKvPool, print_dsv4_linear_profile, print_dsv4_stage_profile,
+        reset_dsv4_linear_profile, reset_dsv4_stage_profile, set_dsv4_flashmla_decode_override,
+        set_dsv4_fused_wqkv_decode_override, set_dsv4_stage_profile_active,
     };
     use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
     use infer_seam::{BackendExecutor, KvPool, PollResult};
@@ -240,6 +241,7 @@ mod real {
         set_dsv4_fused_wqkv_decode_override(Some(variant.fused_wqkv));
         set_env_var("INFER_DSV4_AB_CURRENT_VARIANT", variant.name);
         reset_dsv4_linear_profile();
+        reset_dsv4_stage_profile();
 
         // DSv4 does not use the host page pool, but the BackendExecutor seam
         // still carries one. Recreate it per variant so host bookkeeping starts
@@ -252,6 +254,8 @@ mod real {
         let mut tokens = vec![first];
 
         let profile_this = profile_variant == Some(variant.name);
+        let stage_profile_this = std::env::var_os("ARLE_DSV4_STAGE_PROFILE").is_some()
+            && (profile_variant.is_none() || profile_this);
         let warmup_decode_steps = warmup_new.min(max_new.saturating_sub(1));
         let mut bail_at = None;
         let mut profiler_on = false;
@@ -265,6 +269,7 @@ mod real {
                         .with_context(|| format!("cudaProfilerStart for {}", variant.name))?;
                     profiler_on = true;
                 }
+                set_dsv4_stage_profile_active(stage_profile_this);
                 timed_t0 = Some(Instant::now());
             }
 
@@ -287,9 +292,11 @@ mod real {
             cuda_profiler_stop()
                 .with_context(|| format!("cudaProfilerStop for {}", variant.name))?;
         }
+        set_dsv4_stage_profile_active(false);
         print_dsv4_linear_profile(variant.name);
         let decode_steps = tokens.len().saturating_sub(1);
         let timed_decode_steps = decode_steps.saturating_sub(warmup_decode_steps);
+        print_dsv4_stage_profile(variant.name, timed_decode_steps, timed_decode_ms);
 
         Ok(VariantResult {
             name: variant.name,

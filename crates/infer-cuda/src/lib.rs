@@ -47,6 +47,8 @@ mod model;
 mod nvtx;
 #[cfg(feature = "cuda")]
 mod ops;
+#[cfg(feature = "cuda")]
+mod stage_profile;
 // Qwen3.5 / Qwen3.6 HYBRID model (gated-delta linear attention + periodic full
 // attention, BF16 MoE). cuda-gated: device weight matrices + recurrent state.
 #[cfg(feature = "cuda")]
@@ -84,6 +86,21 @@ pub fn reset_dsv4_linear_profile() {
 #[cfg(feature = "cuda")]
 pub fn print_dsv4_linear_profile(tag: &str) {
     linear_profile::print_rank0(tag);
+}
+
+#[cfg(feature = "cuda")]
+pub fn reset_dsv4_stage_profile() {
+    stage_profile::reset();
+}
+
+#[cfg(feature = "cuda")]
+pub fn set_dsv4_stage_profile_active(active: bool) {
+    stage_profile::set_active(active);
+}
+
+#[cfg(feature = "cuda")]
+pub fn print_dsv4_stage_profile(tag: &str, timed_tokens: usize, timed_wall_ms: f64) {
+    stage_profile::print_rank0(tag, timed_tokens, timed_wall_ms);
 }
 
 // Not cuda-gated: env→TpConfig resolution is CPU-testable; only the NCCL comm
