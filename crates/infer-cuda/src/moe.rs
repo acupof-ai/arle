@@ -438,6 +438,8 @@ mod dsv4_gpu {
     use crate::moe_config::ExpertSplit;
     use crate::ops::gemm_batch;
 
+    const CONTIG_ROUTE_ALIGN: usize = 128;
+
     struct DeviceRouting {
         indices: CudaSlice<i32>,
         weights: CudaSlice<f32>,
@@ -462,6 +464,7 @@ mod dsv4_gpu {
         cursors: CudaSlice<i32>,
         route_out: HiddenStates,
         grouped: Dsv4GroupedDecodeScratch,
+        grouped_contig: Dsv4GroupedContiguousDecodeScratch,
         shared: Dsv4SharedDecodeScratch,
     }
 
@@ -477,6 +480,24 @@ mod dsv4_gpu {
         out_compact: HiddenStates,
         masked_m: CudaSlice<i32>,
         active_experts: CudaSlice<i32>,
+    }
+
+    struct Dsv4GroupedContiguousDecodeScratch {
+        rows: usize,
+        scale_stride_m: usize,
+        input_fp8: CudaSlice<u8>,
+        input_scales: CudaSlice<f32>,
+        w13_out: HiddenStates,
+        act_fp8: CudaSlice<u8>,
+        act_scales: CudaSlice<f32>,
+        out: HiddenStates,
+        packed_hidden: HiddenStates,
+        packed_route_slot: CudaSlice<i32>,
+        packed_weight: CudaSlice<f32>,
+        m_indices: CudaSlice<i32>,
+        active_experts: CudaSlice<i32>,
+        active_offsets: CudaSlice<i32>,
+        active_counts: CudaSlice<i32>,
     }
 
     struct Dsv4SharedDecodeScratch {
@@ -556,6 +577,8 @@ mod dsv4_gpu {
             let route_out = HiddenStates::zeros(ctx, hidden_dim, topk)?;
             let grouped =
                 Dsv4GroupedDecodeScratch::new(ctx, num_groups, hidden_dim, intermediate, topk)?;
+            let grouped_contig =
+                Dsv4GroupedContiguousDecodeScratch::new(ctx, hidden_dim, intermediate, topk)?;
             let shared = Dsv4SharedDecodeScratch::new(ctx, hidden_dim, shared_intermediate)?;
 
             Ok(Self {
@@ -577,6 +600,7 @@ mod dsv4_gpu {
                 cursors,
                 route_out,
                 grouped,
+                grouped_contig,
                 shared,
             })
         }
@@ -597,6 +621,8 @@ mod dsv4_gpu {
                 .memset_zeros(&mut self.route_out.data)
                 .map_err(|e| anyhow::anyhow!("DSv4 decode route-out scratch reset failed: {e}"))?;
             memset_i32_minus_one(ctx, &mut self.packed_route_slot)?;
+            memset_i32_minus_one(ctx, &mut self.grouped_contig.packed_route_slot)?;
+            memset_i32_minus_one(ctx, &mut self.grouped_contig.m_indices)?;
             Ok(())
         }
 
@@ -670,6 +696,70 @@ mod dsv4_gpu {
         }
     }
 
+    impl Dsv4GroupedContiguousDecodeScratch {
+        fn new(
+            ctx: &DeviceContext,
+            hidden_dim: usize,
+            intermediate: usize,
+            route_capacity: usize,
+        ) -> Result<Self> {
+            // DeepGEMM's contiguous grouped layout expects each expert segment
+            // to be M-tile aligned, with invalid padding rows marked -1. Decode
+            // has at most `topk` active routes, so give each route one aligned
+            // tile instead of materialising every local expert group.
+            let rows = route_capacity.max(1) * CONTIG_ROUTE_ALIGN;
+            let scale_stride_m = rows.div_ceil(4) * 4;
+            let hidden_scale_cols = hidden_dim.div_ceil(128);
+            let inter_scale_cols = intermediate.div_ceil(128);
+            let input_fp8 = alloc_u8(ctx, rows * hidden_dim)?;
+            let input_scales = alloc_zeros_f32(ctx, scale_stride_m * hidden_scale_cols)?;
+            let w13_out = HiddenStates::zeros(ctx, 2 * intermediate, rows)?;
+            let act_fp8 = alloc_u8(ctx, rows * intermediate)?;
+            let act_scales = alloc_zeros_f32(ctx, scale_stride_m * inter_scale_cols)?;
+            let out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
+            let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, rows)?;
+            let packed_route_slot = ctx.stream.alloc_zeros::<i32>(rows).map_err(|e| {
+                anyhow::anyhow!("DSv4 contiguous route-slot scratch alloc failed: {e}")
+            })?;
+            let packed_weight = ctx.stream.alloc_zeros::<f32>(rows).map_err(|e| {
+                anyhow::anyhow!("DSv4 contiguous packed-weight scratch alloc failed: {e}")
+            })?;
+            let m_indices = ctx
+                .stream
+                .alloc_zeros::<i32>(rows)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode contiguous m-index alloc failed: {e}"))?;
+            let active_experts = ctx
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| anyhow::anyhow!("DSv4 contiguous active scratch H2D failed: {e}"))?;
+            let active_offsets = ctx
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| anyhow::anyhow!("DSv4 contiguous offset scratch H2D failed: {e}"))?;
+            let active_counts = ctx
+                .stream
+                .clone_htod(&[i32::try_from(rows)?])
+                .map_err(|e| anyhow::anyhow!("DSv4 contiguous count scratch H2D failed: {e}"))?;
+            Ok(Self {
+                rows,
+                scale_stride_m,
+                input_fp8,
+                input_scales,
+                w13_out,
+                act_fp8,
+                act_scales,
+                out,
+                packed_hidden,
+                packed_route_slot,
+                packed_weight,
+                m_indices,
+                active_experts,
+                active_offsets,
+                active_counts,
+            })
+        }
+    }
+
     impl Dsv4SharedDecodeScratch {
         fn new(ctx: &DeviceContext, hidden_dim: usize, shared_inter: usize) -> Result<Self> {
             let max_m = 128usize;
@@ -727,6 +817,13 @@ mod dsv4_gpu {
 
     fn use_gpu_router() -> bool {
         std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some()
+    }
+
+    fn use_contiguous_decode_moe() -> bool {
+        matches!(
+            std::env::var("ARLE_DSV4_MOE_CONTIG_DECODE").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
     }
 
     fn dsv4_route_device(
@@ -1232,6 +1329,7 @@ mod dsv4_gpu {
             "DSv4 pooled decode MoE expected one token/topk routes, got tokens={num_tokens} routes={total_routes} scratch_topk={}",
             scratch.topk
         );
+        let use_contiguous = use_contiguous_decode_moe();
         crate::stage_profile::profile(ctx, "dsv4/stage/moe_pack", || -> Result<()> {
             scratch.reset_routed(ctx)?;
             unsafe {
@@ -1251,22 +1349,42 @@ mod dsv4_gpu {
                     split.experts_per_rank,
                     ctx.stream.cu_stream(),
                 )?;
-                moe::dsv4_pack_local_experts_with_slots(
-                    cache_ptr(&hidden.data, ctx),
-                    route_indices,
-                    route_weights,
-                    cache_ptr(&scratch.offsets, ctx),
-                    cache_ptr(&scratch.cursors, ctx),
-                    cache_ptr(&scratch.packed_hidden.data, ctx),
-                    cache_ptr(&scratch.packed_route_slot, ctx),
-                    cache_ptr(&scratch.packed_weight, ctx),
-                    num_tokens,
-                    hidden_dim,
-                    topk,
-                    local_start,
-                    split.experts_per_rank,
-                    ctx.stream.cu_stream(),
-                )?;
+                if use_contiguous {
+                    moe::dsv4_pack_local_experts_with_slots_and_indices(
+                        cache_ptr(&hidden.data, ctx),
+                        route_indices,
+                        route_weights,
+                        cache_ptr(&scratch.offsets, ctx),
+                        cache_ptr(&scratch.cursors, ctx),
+                        cache_ptr(&scratch.grouped_contig.packed_hidden.data, ctx),
+                        cache_ptr(&scratch.grouped_contig.packed_route_slot, ctx),
+                        cache_ptr(&scratch.grouped_contig.packed_weight, ctx),
+                        cache_ptr(&scratch.grouped_contig.m_indices, ctx),
+                        num_tokens,
+                        hidden_dim,
+                        topk,
+                        local_start,
+                        split.experts_per_rank,
+                        ctx.stream.cu_stream(),
+                    )?;
+                } else {
+                    moe::dsv4_pack_local_experts_with_slots(
+                        cache_ptr(&hidden.data, ctx),
+                        route_indices,
+                        route_weights,
+                        cache_ptr(&scratch.offsets, ctx),
+                        cache_ptr(&scratch.cursors, ctx),
+                        cache_ptr(&scratch.packed_hidden.data, ctx),
+                        cache_ptr(&scratch.packed_route_slot, ctx),
+                        cache_ptr(&scratch.packed_weight, ctx),
+                        num_tokens,
+                        hidden_dim,
+                        topk,
+                        local_start,
+                        split.experts_per_rank,
+                        ctx.stream.cu_stream(),
+                    )?;
+                }
             }
             Ok(())
         })?;
@@ -1274,30 +1392,51 @@ mod dsv4_gpu {
         let expert_out = {
             let _nvtx = crate::nvtx::range("dsv4/deepgemm_grouped");
             crate::stage_profile::profile(ctx, "dsv4/stage/moe_deepgemm_grouped", || {
-                deepgemm_grouped_experts_pooled(
-                    ctx,
-                    layer,
-                    &scratch.packed_hidden,
-                    &scratch.counts,
-                    &scratch.offsets,
-                    swiglu_limit,
-                    &mut scratch.grouped,
-                )
+                if use_contiguous {
+                    deepgemm_grouped_experts_contiguous_pooled(
+                        ctx,
+                        layer,
+                        swiglu_limit,
+                        &mut scratch.grouped_contig,
+                    )
+                } else {
+                    deepgemm_grouped_experts_pooled(
+                        ctx,
+                        layer,
+                        &scratch.packed_hidden,
+                        &scratch.counts,
+                        &scratch.offsets,
+                        swiglu_limit,
+                        &mut scratch.grouped,
+                    )
+                }
             })?
         };
 
         let nvtx_combine = crate::nvtx::range("dsv4/combine_scatter");
         crate::stage_profile::profile(ctx, "dsv4/stage/moe_combine_scatter", || -> Result<()> {
             unsafe {
-                moe::dsv4_scatter_all_route_slots(
-                    cache_ptr(&expert_out.data, ctx),
-                    cache_ptr(&scratch.route_out.data, ctx),
-                    cache_ptr(&scratch.packed_route_slot, ctx),
-                    cache_ptr(&scratch.packed_weight, ctx),
-                    total_routes,
-                    hidden_dim,
-                    ctx.stream.cu_stream(),
-                )?;
+                if use_contiguous {
+                    moe::dsv4_scatter_all_route_slots(
+                        cache_ptr(&expert_out.data, ctx),
+                        cache_ptr(&scratch.route_out.data, ctx),
+                        cache_ptr(&scratch.grouped_contig.packed_route_slot, ctx),
+                        cache_ptr(&scratch.grouped_contig.packed_weight, ctx),
+                        expert_out.seq_len,
+                        hidden_dim,
+                        ctx.stream.cu_stream(),
+                    )?;
+                } else {
+                    moe::dsv4_scatter_all_route_slots(
+                        cache_ptr(&expert_out.data, ctx),
+                        cache_ptr(&scratch.route_out.data, ctx),
+                        cache_ptr(&scratch.packed_route_slot, ctx),
+                        cache_ptr(&scratch.packed_weight, ctx),
+                        total_routes,
+                        hidden_dim,
+                        ctx.stream.cu_stream(),
+                    )?;
+                }
                 moe::dsv4_combine_route_slot_outputs(
                     cache_ptr(&scratch.route_out.data, ctx),
                     cache_ptr(&out.data, ctx),
@@ -1961,6 +2100,122 @@ mod dsv4_gpu {
 
         Ok(HiddenStates {
             data: scratch.out_compact.data.clone(),
+            hidden_dim,
+            seq_len: packed_hidden.seq_len,
+        })
+    }
+
+    fn deepgemm_grouped_experts_contiguous_pooled(
+        ctx: &DeviceContext,
+        layer: &Dsv4MoeLayer,
+        swiglu_limit: f32,
+        scratch: &mut Dsv4GroupedContiguousDecodeScratch,
+    ) -> Result<HiddenStates> {
+        let num_groups = layer.num_groups;
+        let packed_hidden = &scratch.packed_hidden;
+        let hidden_dim = packed_hidden.hidden_dim;
+        let intermediate = layer.intermediate;
+        let w13 = &layer.w13_grouped;
+        let w2 = &layer.w2_grouped;
+        ensure!(
+            scratch.rows >= packed_hidden.seq_len
+                && scratch.out.hidden_dim == hidden_dim
+                && scratch.w13_out.hidden_dim == 2 * intermediate,
+            "DSv4 contiguous grouped scratch mismatch: rows={} packed={} H={} I={}",
+            scratch.rows,
+            packed_hidden.seq_len,
+            hidden_dim,
+            intermediate
+        );
+        ensure!(
+            w13.groups == num_groups
+                && w2.groups == num_groups
+                && w13.rows == 2 * intermediate
+                && w13.cols == hidden_dim
+                && w2.rows == hidden_dim
+                && w2.cols == intermediate,
+            "DSv4 contiguous grouped cache metadata mismatch: groups={} w13={}x{} g={} w2={}x{} g={} hidden={hidden_dim} inter={intermediate}",
+            num_groups,
+            w13.rows,
+            w13.cols,
+            w13.groups,
+            w2.rows,
+            w2.cols,
+            w2.groups,
+        );
+
+        let p_hidden = cache_ptr(&packed_hidden.data, ctx);
+        let p_in_fp8 = cache_ptr(&scratch.input_fp8, ctx);
+        let p_in_scales = cache_ptr(&scratch.input_scales, ctx);
+        let p_active = cache_ptr(&scratch.active_experts, ctx);
+        let p_offsets = cache_ptr(&scratch.active_offsets, ctx);
+        let p_counts = cache_ptr(&scratch.active_counts, ctx);
+        let p_m_indices = cache_ptr(&scratch.m_indices, ctx);
+        let p_w13_out = cache_ptr(&scratch.w13_out.data, ctx);
+        let p_act_fp8 = cache_ptr(&scratch.act_fp8, ctx);
+        let p_act_scales = cache_ptr(&scratch.act_scales, ctx);
+        let p_out = cache_ptr(&scratch.out.data, ctx);
+        let stream = ctx.stream.cu_stream();
+
+        unsafe {
+            moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                p_hidden,
+                p_in_fp8,
+                p_in_scales,
+                p_active,
+                p_offsets,
+                p_counts,
+                1,
+                scratch.rows,
+                hidden_dim,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                p_in_fp8,
+                p_in_scales,
+                cache_ptr(&w13.weight, ctx),
+                cache_ptr(&w13.scales, ctx),
+                p_w13_out,
+                p_m_indices,
+                num_groups,
+                scratch.rows,
+                2 * intermediate,
+                hidden_dim,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_swiglu_quantize_w13(
+                p_w13_out,
+                p_act_fp8,
+                p_act_scales,
+                p_active,
+                p_counts,
+                1,
+                scratch.rows,
+                intermediate,
+                scratch.scale_stride_m,
+                swiglu_limit,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                p_act_fp8,
+                p_act_scales,
+                cache_ptr(&w2.weight, ctx),
+                cache_ptr(&w2.scales, ctx),
+                p_out,
+                p_m_indices,
+                num_groups,
+                scratch.rows,
+                hidden_dim,
+                intermediate,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+        }
+
+        Ok(HiddenStates {
+            data: scratch.out.data.clone(),
             hidden_dim,
             seq_len: packed_hidden.seq_len,
         })
