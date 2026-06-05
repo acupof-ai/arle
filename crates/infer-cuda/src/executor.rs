@@ -565,6 +565,7 @@ pub(crate) struct Dsv4CudaExecutor {
     model: crate::dsv4::Dsv4Model,
     slots: Vec<crate::dsv4::Dsv4SlotState>,
     num_slots: usize,
+    mtp_probe_printed: bool,
 }
 
 impl std::fmt::Debug for Dsv4CudaExecutor {
@@ -592,7 +593,41 @@ impl Dsv4CudaExecutor {
             model,
             slots,
             num_slots,
+            mtp_probe_printed: false,
         })
+    }
+
+    fn forward_tokens_maybe_mtp_probe(
+        &mut self,
+        slot_idx: usize,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<u32> {
+        if crate::dsv4::dsv4_spec_decode_enabled() && !self.mtp_probe_printed {
+            let (token, hidden) = self.model.forward_tokens_with_hidden(
+                &mut self.slots[slot_idx],
+                tokens,
+                start_pos,
+                params,
+                position,
+            )?;
+            let draft = self.model.mtp_forward(&hidden, token, position + 1)?;
+            if self.model.tp.config().rank == 0 {
+                eprintln!("[dsv4-mtp] base_token={token} draft_token={draft}");
+            }
+            self.mtp_probe_printed = true;
+            Ok(token)
+        } else {
+            self.model.forward_tokens(
+                &mut self.slots[slot_idx],
+                tokens,
+                start_pos,
+                params,
+                position,
+            )
+        }
     }
 
     fn submit(&mut self, plan: &ForwardPlan) -> Result<StepOutput> {
@@ -619,8 +654,8 @@ impl Dsv4CudaExecutor {
                 self.slots[row.slot].reset(&self.model.ctx)?;
             }
             let position = (row.start_pos + row.tokens.len()) as u64;
-            let token = self.model.forward_tokens(
-                &mut self.slots[row.slot],
+            let token = self.forward_tokens_maybe_mtp_probe(
+                row.slot,
                 &row.tokens,
                 row.start_pos,
                 &row.params,
@@ -643,8 +678,8 @@ impl Dsv4CudaExecutor {
                 row.slot
             );
             let position = row.kv_seq_len.saturating_add(1) as u64;
-            let token = self.model.forward_tokens(
-                &mut self.slots[row.slot],
+            let token = self.forward_tokens_maybe_mtp_probe(
+                row.slot,
                 &[row.last_token],
                 row.kv_seq_len,
                 &row.params,
