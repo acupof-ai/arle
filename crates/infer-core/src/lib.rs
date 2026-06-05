@@ -784,7 +784,7 @@ mod testing {
     use std::collections::BTreeMap;
 
     use anyhow::{Result, bail};
-    use infer_plan::{SlotToken, StepOutput};
+    use infer_plan::{SamplingParams, SlotToken, StepOutput, sample_token};
     use infer_seam::{
         AdmissionVerdict, BackendExecutor, KvAllocator, KvPool, KvPrefixStore, KvQuery, PollResult,
         ResourceGovernor, StepBudget,
@@ -1185,6 +1185,71 @@ mod testing {
         }
     }
 
+    /// Mock executor that exercises the full host sampling seam instead of
+    /// echoing input tokens: it samples from a fixed logits row using the
+    /// `SamplingParams` and logical position supplied by each plan row.
+    #[derive(Debug, Clone)]
+    pub(super) struct SamplingExecutor {
+        logits: std::rc::Rc<Vec<f32>>,
+        observed: std::rc::Rc<std::cell::RefCell<Vec<(usize, u64, SamplingParams)>>>,
+    }
+
+    impl SamplingExecutor {
+        pub(super) fn new(logits: Vec<f32>) -> Self {
+            Self {
+                logits: std::rc::Rc::new(logits),
+                observed: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            }
+        }
+
+        pub(super) fn observed(&self) -> Vec<(usize, u64, SamplingParams)> {
+            self.observed.borrow().clone()
+        }
+    }
+
+    impl BackendExecutor for SamplingExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            let mut tokens = Vec::new();
+
+            for row in &plan.prefill_rows {
+                let position = (row.start_pos + row.tokens.len()) as u64;
+                self.observed
+                    .borrow_mut()
+                    .push((row.slot, position, row.params.clone()));
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token: sample_token(&self.logits, &row.params, position),
+                    logprob: None,
+                    finish: None,
+                });
+            }
+
+            for row in &plan.decode_rows {
+                let position = row.kv_seq_len.saturating_add(1) as u64;
+                self.observed
+                    .borrow_mut()
+                    .push((row.slot, position, row.params.clone()));
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token: sample_token(&self.logits, &row.params, position),
+                    logprob: None,
+                    finish: None,
+                });
+            }
+
+            Ok(MockInflight {
+                output: StepOutput { tokens },
+                return_not_ready_once: false,
+            })
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            Ok(PollResult::Ready(inflight.output))
+        }
+    }
+
     /// Mirrors the real CUDA executor's device KV advancement + its decode-step
     /// length invariant (`device.seq_len(slot) == DecodeRow.kv_seq_len`), so a
     /// host-side `kv_seq_len` off-by-one fails on CPU rather than only on an H20.
@@ -1293,12 +1358,12 @@ mod testing {
 
 #[cfg(test)]
 mod tests {
-    use infer_plan::FinishReason;
+    use infer_plan::{FinishReason, argmax_logit, sample_token};
     use infer_seam::{KvAllocator, KvQuery};
 
     use super::testing::{
-        DeviceMirrorExecutor, HoldGovernor, MockExecutor, MockKvPool, StopTokenExecutor,
-        WarmupCountingExecutor,
+        DeviceMirrorExecutor, HoldGovernor, MockExecutor, MockKvPool, SamplingExecutor,
+        StopTokenExecutor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -1409,6 +1474,60 @@ mod tests {
         // An explicit warmup after the lazy one is a no-op.
         engine.warmup()?;
         assert_eq!(warmup_calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_params_flow_through_prefill_and_decode_to_executor() -> Result<()> {
+        let logits: Vec<f32> = (0..32).map(|i| i as f32 * 0.05).collect();
+        let sampling = SamplingParams {
+            temperature: 1.0,
+            top_k: 8,
+            top_p: 0.85,
+            min_p: 0.0,
+            seed: Some(0xC0FFEE),
+            ..SamplingParams::default()
+        };
+        let executor = SamplingExecutor::new(logits.clone());
+        let probe = executor.clone();
+        let mut engine = Engine::new(executor, MockKvPool::new(1), 1);
+        let prompt = vec![10, 11, 12];
+        let max_tokens = 3;
+        let handle = engine.submit_request_with_options(
+            prompt.clone(),
+            max_tokens,
+            RequestOptions {
+                sampling: sampling.clone(),
+                ..RequestOptions::default()
+            },
+        );
+
+        engine.run_to_idle()?;
+
+        let expected: Vec<u32> = (0..max_tokens)
+            .map(|step| sample_token(&logits, &sampling, (prompt.len() + step) as u64))
+            .collect();
+        assert_ne!(
+            expected,
+            vec![argmax_logit(&logits); max_tokens],
+            "test fixture must exercise non-greedy sampling, not collapse to argmax"
+        );
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(
+            completed.generated_tokens, expected,
+            "completed output must come from the request sampling params carried through the plan"
+        );
+
+        let observed = probe.observed();
+        assert_eq!(observed.len(), max_tokens);
+        for (step, (slot, position, params)) in observed.iter().enumerate() {
+            assert_eq!(*slot, 0);
+            assert_eq!(*position, (prompt.len() + step) as u64);
+            assert_eq!(params.temperature, sampling.temperature);
+            assert_eq!(params.top_k, sampling.top_k);
+            assert_eq!(params.top_p, sampling.top_p);
+            assert_eq!(params.seed, sampling.seed);
+        }
         Ok(())
     }
 
