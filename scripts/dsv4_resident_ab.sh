@@ -16,7 +16,10 @@
 #   INFER_DSV4_AB_VARIANTS         default scalar,flashmla
 #   INFER_DSV4_AB_MAX_NEW          default 128
 #   INFER_DSV4_AB_WARMUP_NEW       default 16
+#   INFER_DSV4_AB_REPEAT           repeat variant list after one load, default 1
 #   INFER_DSV4_AB_PROFILE_VARIANT  optional scalar|flashmla profiler window
+#   INFER_DSV4_DUMP_TOPK_POSITIONS optional comma-separated sample positions
+#                                  for rank-0 logits top-k diagnostics
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

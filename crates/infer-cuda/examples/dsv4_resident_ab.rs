@@ -11,6 +11,8 @@
 //!   * `INFER_DSV4_AB_MAX_NEW`       generated-token count, default 128.
 //!   * `INFER_DSV4_AB_WARMUP_NEW`    decode steps excluded from steady timing,
 //!                                  default 16.
+//!   * `INFER_DSV4_AB_REPEAT`        repeat the variant list after one load,
+//!                                  default 1.
 //!   * `INFER_DSV4_AB_PROFILE_VARIANT` optional variant name; starts CUDA
 //!                                  profiler after warmup for ncu/nsys attach.
 
@@ -149,7 +151,9 @@ mod real {
 
         let max_new = parse_usize_env("INFER_DSV4_AB_MAX_NEW", DEFAULT_MAX_NEW)?;
         let warmup_new = parse_usize_env("INFER_DSV4_AB_WARMUP_NEW", DEFAULT_WARMUP_NEW)?;
+        let repeat = parse_usize_env("INFER_DSV4_AB_REPEAT", 1)?;
         anyhow::ensure!(max_new >= 1, "INFER_DSV4_AB_MAX_NEW must be >= 1");
+        anyhow::ensure!(repeat >= 1, "INFER_DSV4_AB_REPEAT must be >= 1");
         let variants = parse_variants(
             &std::env::var("INFER_DSV4_AB_VARIANTS")
                 .unwrap_or_else(|_| "scalar,flashmla".to_string()),
@@ -173,7 +177,7 @@ mod real {
         eprintln!(
             "[dsv4-ab rank={rank}] model={model_path} prompt_len={} \
              prompt_head={prompt_head:?} max_new={max_new} warmup_new={warmup_new} \
-             variants={}",
+             repeat={repeat} variants={}",
             prompt.len(),
             variants
                 .iter()
@@ -187,23 +191,28 @@ mod real {
             .context("from_dsv4_fp8_safetensors failed")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
 
-        let mut scalar_tokens: Option<Vec<u32>> = None;
-        for variant in variants {
-            let result = run_variant(
-                &mut exec,
-                &prompt,
-                variant,
-                max_new,
-                warmup_new,
-                profile_variant.as_deref(),
-            )?;
-            let oracle16 = compare_prefix(&result.tokens, &ORACLE_16);
-            let scalar_ref = scalar_ref_text(scalar_tokens.as_deref(), &result);
-            if result.name == "scalar" {
-                scalar_tokens = Some(result.tokens.clone());
+        for rep in 0..repeat {
+            let mut results = Vec::with_capacity(variants.len());
+            for &variant in &variants {
+                results.push(run_variant(
+                    &mut exec,
+                    &prompt,
+                    variant,
+                    max_new,
+                    warmup_new,
+                    profile_variant.as_deref(),
+                )?);
             }
+            let scalar_tokens = results
+                .iter()
+                .find(|result| result.name == "scalar")
+                .map(|result| result.tokens.as_slice());
             if rank == 0 {
-                print_rank0_result(load_ms, warmup_new, &result, oracle16, &scalar_ref);
+                for result in &results {
+                    let oracle16 = compare_prefix(&result.tokens, &ORACLE_16);
+                    let scalar_ref = scalar_ref_text(scalar_tokens, result);
+                    print_rank0_result(rep, load_ms, warmup_new, result, oracle16, &scalar_ref);
+                }
             }
         }
         set_dsv4_flashmla_decode_override(None);
@@ -219,6 +228,7 @@ mod real {
         profile_variant: Option<&str>,
     ) -> Result<VariantResult> {
         set_dsv4_flashmla_decode_override(Some(variant.flashmla));
+        set_env_var("INFER_DSV4_AB_CURRENT_VARIANT", variant.name);
 
         // DSv4 does not use the host page pool, but the BackendExecutor seam
         // still carries one. Recreate it per variant so host bookkeeping starts
@@ -283,6 +293,7 @@ mod real {
     }
 
     fn print_rank0_result(
+        rep: usize,
         load_ms: f64,
         warmup_new: usize,
         result: &VariantResult,
@@ -304,11 +315,12 @@ mod real {
             Some(idx) => format!("FAIL@{idx}"),
         };
         println!(
-            "ab_variant={} flashmla={} tokens={:?} oracle16={} scalar_ref={} \
+            "ab_variant={} rep={} flashmla={} tokens={:?} oracle16={} scalar_ref={} \
              load_ms={:.3} prefill_ms={:.3} decode_steps={} decode_ms={:.3} \
              decode_tok_s={:.3} warmup_decode_steps={} timed_decode_steps={} \
              timed_decode_ms={:.3} steady_tok_s={:.3}",
             result.name,
+            rep,
             u8::from(result.flashmla),
             result.tokens,
             oracle16_text,
