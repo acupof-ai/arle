@@ -71,9 +71,11 @@ __global__ void dsv4_deepgemm_pack_quantize_bf16_to_fp8_kernel(
     int cols,
     int scale_stride_m,
     int scale_k_blocks) {
-  const int k_block = blockIdx.x;
-  const int row = blockIdx.y;
-  const int active = blockIdx.z;
+  int64_t linear = blockIdx.x;
+  const int k_block = static_cast<int>(linear % scale_k_blocks);
+  linear /= scale_k_blocks;
+  const int row = static_cast<int>(linear % max_m);
+  const int active = static_cast<int>(linear / max_m);
   if (active >= active_count) return;
   const int count = active_counts[active];
   if (row >= count) return;
@@ -126,9 +128,11 @@ __global__ void dsv4_deepgemm_swiglu_quantize_w13_kernel(
     int scale_stride_m,
     int scale_k_blocks,
     float limit) {
-  const int k_block = blockIdx.x;
-  const int row = blockIdx.y;
-  const int active = blockIdx.z;
+  int64_t linear = blockIdx.x;
+  const int k_block = static_cast<int>(linear % scale_k_blocks);
+  linear /= scale_k_blocks;
+  const int row = static_cast<int>(linear % max_m);
+  const int active = static_cast<int>(linear / max_m);
   if (active >= active_count) return;
   const int count = active_counts[active];
   if (row >= count) return;
@@ -179,8 +183,8 @@ __global__ void dsv4_deepgemm_unpad_grouped_bf16_kernel(
     int active_count,
     int max_m,
     int hidden_dim) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = active_count * max_m * hidden_dim;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = static_cast<int64_t>(active_count) * max_m * hidden_dim;
   if (idx >= total) return;
   const int col = idx % hidden_dim;
   const int row = (idx / hidden_dim) % max_m;
@@ -218,8 +222,9 @@ extern "C" CUresult dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   int scale_k_blocks = (cols + DSV4_DEEPGEMM_GRAN_K - 1) / DSV4_DEEPGEMM_GRAN_K;
-  dim3 grid(scale_k_blocks, max_m, active_count);
-  dsv4_deepgemm_pack_quantize_bf16_to_fp8_kernel<<<grid, DSV4_DEEPGEMM_BLOCK, 0, (cudaStream_t)stream>>>(
+  int64_t grid = static_cast<int64_t>(scale_k_blocks) * max_m * active_count;
+  if (grid > INT_MAX) return CUDA_ERROR_INVALID_VALUE;
+  dsv4_deepgemm_pack_quantize_bf16_to_fp8_kernel<<<static_cast<int>(grid), DSV4_DEEPGEMM_BLOCK, 0, (cudaStream_t)stream>>>(
       input, output, scales, active_experts, active_offsets, active_counts,
       active_count, max_m, cols, scale_stride_m, scale_k_blocks);
   return (CUresult)cudaGetLastError();
@@ -249,8 +254,9 @@ extern "C" CUresult dsv4_deepgemm_swiglu_quantize_w13_cuda(
   }
   int scale_k_blocks =
       (intermediate_dim + DSV4_DEEPGEMM_GRAN_K - 1) / DSV4_DEEPGEMM_GRAN_K;
-  dim3 grid(scale_k_blocks, max_m, active_count);
-  dsv4_deepgemm_swiglu_quantize_w13_kernel<<<grid, DSV4_DEEPGEMM_BLOCK, 0, (cudaStream_t)stream>>>(
+  int64_t grid = static_cast<int64_t>(scale_k_blocks) * max_m * active_count;
+  if (grid > INT_MAX) return CUDA_ERROR_INVALID_VALUE;
+  dsv4_deepgemm_swiglu_quantize_w13_kernel<<<static_cast<int>(grid), DSV4_DEEPGEMM_BLOCK, 0, (cudaStream_t)stream>>>(
       w13, act, scales, active_experts, active_counts, active_count, max_m,
       intermediate_dim, scale_stride_m, scale_k_blocks, limit);
   return (CUresult)cudaGetLastError();
@@ -271,13 +277,13 @@ extern "C" CUresult dsv4_deepgemm_unpad_grouped_bf16_cuda(
   }
   if (active_count == 0) return CUDA_SUCCESS;
   if (grouped == nullptr || compact == nullptr || active_experts == nullptr ||
-      active_offsets == nullptr || active_counts == nullptr ||
-      dg_product_exceeds_i32(active_count, max_m, hidden_dim)) {
+      active_offsets == nullptr || active_counts == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  int total = active_count * max_m * hidden_dim;
-  int grid = (total + DSV4_DEEPGEMM_BLOCK - 1) / DSV4_DEEPGEMM_BLOCK;
-  dsv4_deepgemm_unpad_grouped_bf16_kernel<<<grid, DSV4_DEEPGEMM_BLOCK, 0, (cudaStream_t)stream>>>(
+  int64_t total = static_cast<int64_t>(active_count) * max_m * hidden_dim;
+  int64_t grid = (total + DSV4_DEEPGEMM_BLOCK - 1) / DSV4_DEEPGEMM_BLOCK;
+  if (grid > INT_MAX) return CUDA_ERROR_INVALID_VALUE;
+  dsv4_deepgemm_unpad_grouped_bf16_kernel<<<static_cast<int>(grid), DSV4_DEEPGEMM_BLOCK, 0, (cudaStream_t)stream>>>(
       grouped, compact, active_experts, active_offsets, active_counts,
       active_count, max_m, hidden_dim);
   return (CUresult)cudaGetLastError();

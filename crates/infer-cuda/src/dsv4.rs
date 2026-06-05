@@ -81,26 +81,21 @@ impl Dsv4MlaKvArena {
     }
 
     /// Allocate the flat device FP8 KV arena the FlashMLA sparse-FP8 decode reads.
-    ///
-    /// GATED (perf path, not correctness): only the FlashMLA decode launch
-    /// (`dsv4_fp8_kv_pack` → `*_decode_sched_meta` →
-    /// `arle_flashmla_sm90_sparse_decode_fwd` → `arle_dsv4_output_inverse_rope_*`)
-    /// consumes this arena. The correctness-complete bf16 MLA core
-    /// ([`crate::attention::mla_attention`]) attends over the bf16 SW ring cache +
-    /// bf16 compressed pool (`dsv4_hybrid_attention_cuda`) instead, so this stays
-    /// unwired — allocating it now reserves device bytes nothing reads yet. The
-    /// lead can flip on the FP8 decode path once the bf16 forward parity-matches
-    /// the oracle.
-    #[allow(dead_code)]
     pub(crate) fn alloc_fp8_arena(
         &self,
-        _ctx: &DeviceContext,
-        _num_blocks: usize,
+        ctx: &DeviceContext,
+        num_blocks: usize,
     ) -> Result<CudaSlice<u8>> {
-        anyhow::bail!(
-            "DSv4 MLA FP8 KV arena alloc (FlashMLA sparse-FP8 decode) is a perf path; the \
-             bf16 MLA core attends over the SW ring + bf16 compressed pool"
-        )
+        ensure!(num_blocks > 0, "DSv4 FP8 KV arena needs at least one block");
+        let rows = num_blocks
+            .checked_mul(self.page_block_size)
+            .ok_or_else(|| anyhow!("DSv4 FP8 KV arena row count overflow"))?;
+        let bytes = rows
+            .checked_mul(self.bytes_per_token)
+            .ok_or_else(|| anyhow!("DSv4 FP8 KV arena byte size overflow"))?;
+        ctx.stream
+            .alloc_zeros::<u8>(bytes)
+            .map_err(|e| anyhow!("DSv4 FP8 KV arena alloc failed ({bytes} bytes): {e}"))
     }
 }
 
@@ -143,6 +138,7 @@ pub(crate) struct Dsv4HyperConnection {
 /// the compressor on both CSA and HCA, the indexer on CSA only.
 pub(crate) struct Dsv4Attention {
     pub wq_a: DeviceMatrix,
+    pub wqkv_a_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub q_norm: DeviceVec,
     pub wq_b: DeviceMatrix,
     pub wkv: DeviceMatrix,
@@ -150,6 +146,7 @@ pub(crate) struct Dsv4Attention {
     pub wo_a: DeviceMatrix,
     pub wo_b: DeviceMatrix,
     pub attn_sink: DeviceVec,
+    pub attn_sink_f32: CudaSlice<f32>,
     pub compressor: Option<Dsv4Compressor>,
     pub indexer: Option<Dsv4Indexer>,
 }
@@ -179,6 +176,10 @@ pub(crate) struct Dsv4MoeLayer {
     /// Hash-routed layers only: host `tid2eid` table (`vocab_size * topk` i64),
     /// sliced per token to pick experts without the learned router.
     pub hash_tid2eid: Option<Vec<i64>>,
+    /// Hash-routed layers only: device `tid2eid` table used by the on-device
+    /// router. Kept alongside the host table so the existing host route remains
+    /// available as an A/B oracle.
+    pub hash_tid2eid_device: Option<CudaSlice<i64>>,
     pub routing_kind: DeepSeekV4MoeRoutingKind,
     /// Dense shared expert FP8 caches (always-on, n_shared_experts == 1).
     pub shared_w13: Dsv4Fp8DeepGemmWeightCache,
@@ -220,8 +221,103 @@ pub(crate) struct Dsv4Model {
 
 pub(crate) struct Dsv4SlotState {
     attention: Vec<crate::attention::Dsv4LayerAttentionState>,
+    moe_decode_scratch: Vec<crate::moe::Dsv4MoeDecodeScratch>,
+    start_pos_device: CudaSlice<i32>,
+    decode_graph: Option<Dsv4DecodeGraphScratch>,
     seq_len: usize,
     max_seq_len: usize,
+}
+
+pub(crate) struct Dsv4DecodeGraphScratch {
+    token_ids: CudaSlice<i32>,
+    token_ids_u32: CudaSlice<u32>,
+    embeddings: HiddenStates,
+    initial_stream: HiddenStates,
+    layers: Vec<Dsv4DecodeLayerGraphScratch>,
+    tail_graph: crate::graph::CudaGraphState,
+    last_hidden: DeviceVec,
+    last_normed: DeviceVec,
+    logits_batch: HiddenStates,
+    logits: DeviceVec,
+}
+
+struct Dsv4DecodeLayerGraphScratch {
+    attn_graph: crate::graph::CudaGraphState,
+    moe_graph: crate::graph::CudaGraphState,
+    attn_mhc: crate::hc::MhcDecodeScratch,
+    ffn_mhc: crate::hc::MhcDecodeScratch,
+    attn_in: HiddenStates,
+    attn_normed: HiddenStates,
+    attn_out: HiddenStates,
+    attn_stream: HiddenStates,
+    ffn_in: HiddenStates,
+    ffn_normed: HiddenStates,
+    moe_out: HiddenStates,
+    shared: HiddenStates,
+    moe_with_shared: HiddenStates,
+    ffn_stream: HiddenStates,
+}
+
+impl Dsv4DecodeGraphScratch {
+    fn new(model: &Dsv4Model) -> Result<Self> {
+        let hidden_size = model.config.hidden_size;
+        let stream_dim = hidden_size * model.config.hc_mult;
+        let token_ids = model
+            .ctx
+            .stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| anyhow!("DSv4 decode graph token-id scratch alloc failed: {e}"))?;
+        let token_ids_u32 = model
+            .ctx
+            .stream
+            .alloc_zeros::<u32>(1)
+            .map_err(|e| anyhow!("DSv4 decode graph u32 token-id scratch alloc failed: {e}"))?;
+        let embeddings = unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? };
+        let initial_stream = unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? };
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for layer in &model.layers {
+            layers.push(Dsv4DecodeLayerGraphScratch::new(model, layer)?);
+        }
+        let last_hidden = DeviceVec::zeros(&model.ctx, hidden_size)?;
+        let last_normed = DeviceVec::zeros(&model.ctx, hidden_size)?;
+        let logits_batch = unsafe { HiddenStates::uninit(&model.ctx, model.lm_head.rows, 1)? };
+        let logits = DeviceVec::zeros(&model.ctx, model.lm_head.rows)?;
+        Ok(Self {
+            token_ids,
+            token_ids_u32,
+            embeddings,
+            initial_stream,
+            layers,
+            tail_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
+            last_hidden,
+            last_normed,
+            logits_batch,
+            logits,
+        })
+    }
+}
+
+impl Dsv4DecodeLayerGraphScratch {
+    fn new(model: &Dsv4Model, layer: &Dsv4Layer) -> Result<Self> {
+        let hidden_size = model.config.hidden_size;
+        let stream_dim = hidden_size * model.config.hc_mult;
+        Ok(Self {
+            attn_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
+            moe_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
+            attn_mhc: crate::hc::MhcDecodeScratch::new(&model.ctx, &model.config, &layer.hc_attn)?,
+            ffn_mhc: crate::hc::MhcDecodeScratch::new(&model.ctx, &model.config, &layer.hc_ffn)?,
+            attn_in: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            attn_normed: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            attn_out: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            attn_stream: unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? },
+            ffn_in: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            ffn_normed: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            moe_out: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            shared: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            moe_with_shared: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            ffn_stream: unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? },
+        })
+    }
 }
 
 /// Explicit lifetime owner for DSv4 eager forward temporaries.
@@ -231,51 +327,126 @@ pub(crate) struct Dsv4SlotState {
 /// long chain of kernels over per-call buffers; without an owner that lives until
 /// the final host-sync sample, Rust can drop/reuse those allocations while the
 /// stream still has in-flight work that reads them.
+///
+/// #29's decode scratch pool now owns the small DeepGEMM/MoE temporaries that
+/// originally needed this bridge. Leave the deep-copy keepalive as an explicit
+/// diagnostic fallback only: `CudaSlice::clone()` is a device-to-device copy,
+/// not a cheap handle clone, so enabling it in production reintroduces tens of
+/// thousands of D2D API calls per decode window.
 pub(crate) struct Dsv4ForwardKeepalive {
+    active: bool,
     bf16: Vec<CudaSlice<half::bf16>>,
     f32: Vec<CudaSlice<f32>>,
     i32: Vec<CudaSlice<i32>>,
+    #[cfg(feature = "deepep")]
     i64: Vec<CudaSlice<i64>>,
+    u32: Vec<CudaSlice<u32>>,
     u8: Vec<CudaSlice<u8>>,
 }
 
 impl Dsv4ForwardKeepalive {
-    fn new() -> Self {
+    fn new(active: bool) -> Self {
+        let active = active && std::env::var_os("ARLE_DSV4_DEEP_COPY_KEEPALIVE").is_some();
         Self {
+            active,
             bf16: Vec::with_capacity(512),
             f32: Vec::with_capacity(256),
             i32: Vec::with_capacity(128),
+            #[cfg(feature = "deepep")]
             i64: Vec::with_capacity(32),
+            u32: Vec::with_capacity(16),
             u8: Vec::with_capacity(128),
         }
     }
 
     pub(crate) fn keep_hidden(&mut self, value: &HiddenStates) {
+        if !self.active {
+            return;
+        }
         self.bf16.push(value.data.clone());
     }
 
     pub(crate) fn keep_vec(&mut self, value: &DeviceVec) {
+        if !self.active {
+            return;
+        }
         self.bf16.push(value.data.clone());
     }
 
     pub(crate) fn keep_f32(&mut self, value: &CudaSlice<f32>) {
+        if !self.active {
+            return;
+        }
         self.f32.push(value.clone());
     }
 
     pub(crate) fn keep_i32(&mut self, value: &CudaSlice<i32>) {
+        if !self.active {
+            return;
+        }
         self.i32.push(value.clone());
     }
 
+    #[cfg(feature = "deepep")]
     pub(crate) fn keep_i64(&mut self, value: &CudaSlice<i64>) {
+        if !self.active {
+            return;
+        }
         self.i64.push(value.clone());
     }
 
     pub(crate) fn keep_u8(&mut self, value: &CudaSlice<u8>) {
+        if !self.active {
+            return;
+        }
         self.u8.push(value.clone());
     }
 
+    /// Legacy deep-copy fallback for small device-router buffers. Default-off:
+    /// #29's persistent scratch owns the decode buffers, and `CudaSlice::clone`
+    /// would otherwise add a D2D copy for each retained slice.
+    pub(crate) fn keep_route_hidden(&mut self, value: &HiddenStates) {
+        if !self.active {
+            return;
+        }
+        self.bf16.push(value.data.clone());
+    }
+
+    pub(crate) fn keep_route_f32(&mut self, value: &CudaSlice<f32>) {
+        if !self.active {
+            return;
+        }
+        self.f32.push(value.clone());
+    }
+
+    pub(crate) fn keep_route_i32(&mut self, value: &CudaSlice<i32>) {
+        if !self.active {
+            return;
+        }
+        self.i32.push(value.clone());
+    }
+
+    #[cfg(feature = "deepep")]
+    pub(crate) fn keep_route_i64(&mut self, value: &CudaSlice<i64>) {
+        if !self.active {
+            return;
+        }
+        self.i64.push(value.clone());
+    }
+
+    pub(crate) fn keep_route_u32(&mut self, value: &CudaSlice<u32>) {
+        if !self.active {
+            return;
+        }
+        self.u32.push(value.clone());
+    }
+
     fn len(&self) -> usize {
-        self.bf16.len() + self.f32.len() + self.i32.len() + self.i64.len() + self.u8.len()
+        let len =
+            self.bf16.len() + self.f32.len() + self.i32.len() + self.u32.len() + self.u8.len();
+        #[cfg(feature = "deepep")]
+        let len = len + self.i64.len();
+        len
     }
 }
 
@@ -283,17 +454,41 @@ impl Dsv4SlotState {
     fn new(model: &Dsv4Model, max_seq_len: usize) -> Result<Self> {
         ensure!(max_seq_len > 0, "DSv4 slot max_seq_len must be positive");
         let mut attention = Vec::with_capacity(model.layers.len());
+        let mut moe_decode_scratch = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
+            let local_width = layer.attention.wq_b.rows;
+            ensure!(
+                local_width.is_multiple_of(model.config.head_dim),
+                "DSv4 slot attention local width {local_width} is not a multiple of head_dim {}",
+                model.config.head_dim
+            );
             attention.push(crate::attention::Dsv4LayerAttentionState::new(
                 &model.ctx,
                 &model.config,
                 layer.mode,
                 layer.compress_ratio,
                 max_seq_len,
+                &model.kv_arena,
+                local_width / model.config.head_dim,
+                model.tp.config().world_size,
+            )?);
+            moe_decode_scratch.push(crate::moe::Dsv4MoeDecodeScratch::new(
+                &model.ctx,
+                &model.moe_config,
+                &model.split,
+                &layer.moe,
             )?);
         }
+        let start_pos_device = model
+            .ctx
+            .stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| anyhow!("DSv4 slot start_pos device scalar alloc failed: {e}"))?;
         Ok(Self {
             attention,
+            moe_decode_scratch,
+            start_pos_device,
+            decode_graph: None,
             seq_len: 0,
             max_seq_len,
         })
@@ -305,6 +500,9 @@ impl Dsv4SlotState {
 
     pub(crate) fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
         self.seq_len = 0;
+        ctx.stream
+            .memset_zeros(&mut self.start_pos_device)
+            .map_err(|e| anyhow!("DSv4 slot start_pos reset failed: {e}"))?;
         for layer in &mut self.attention {
             layer.reset(ctx)?;
         }
@@ -452,96 +650,160 @@ impl Dsv4Model {
         let stream_dim = hidden_size * hc_mult;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
-        let mut keepalive = Dsv4ForwardKeepalive::new();
+        let use_gpu_router = std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some();
+        let use_deepep_transport = dsv4_use_deepep_transport()?;
+        if dsv4_decode_graph_enabled()
+            && !crate::attention::dsv4_flashmla_decode_enabled()?
+            && seq_len == 1
+            && use_gpu_router
+            && !use_deepep_transport
+        {
+            return self.forward_tokens_decode_graph(slot, tokens[0], start_pos, params, position);
+        }
+        let use_moe_decode_scratch = use_gpu_router && seq_len == 1 && !use_deepep_transport;
+        let mut keepalive = Dsv4ForwardKeepalive::new(seq_len == 1);
+        let ctx = &self.ctx;
+        let start_pos_device = if seq_len == 1 {
+            let start_pos_i32 = i32::try_from(start_pos)
+                .map_err(|_| anyhow!("DSv4 start_pos {start_pos} overflows i32"))?;
+            self.ctx
+                .stream
+                .memcpy_htod(&[start_pos_i32], &mut slot.start_pos_device)
+                .map_err(|e| anyhow!("DSv4 start_pos H2D failed: {e}"))?;
+            Some(&slot.start_pos_device)
+        } else {
+            None
+        };
 
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let nvtx_embed = crate::nvtx::range("dsv4/embed");
         let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids_host)?;
         keepalive.keep_i32(&token_ids);
-        let mut embeddings = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)?;
+        // SAFETY: embedding_batch writes the full [seq_len, hidden_size] buffer.
+        let mut embeddings = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+        crate::stage_profile::profile(ctx, "dsv4/stage/embed", || {
+            crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)
+        })?;
         keepalive.keep_hidden(&embeddings);
 
         // Wide HC residual stream from the token embeddings.
-        let mut stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
-        crate::hc::initial_stream_from_embeddings(
-            &self.ctx,
-            &embeddings,
-            hidden_size,
-            hc_mult,
-            &mut stream,
-        )?;
+        // SAFETY: initial_stream_from_embeddings writes the full stream buffer.
+        let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+        crate::stage_profile::profile(ctx, "dsv4/stage/embed_hc_expand", || {
+            crate::hc::initial_stream_from_embeddings(
+                &self.ctx,
+                &embeddings,
+                hidden_size,
+                hc_mult,
+                &mut stream,
+            )
+        })?;
         keepalive.keep_hidden(&stream);
+        drop(nvtx_embed);
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC-wrap MLA attention.
-            let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)?;
+            let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_params", || {
+                crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)
+            })?;
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
-            let mut attn_in = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            crate::hc::hc_pre(
-                &self.ctx,
-                &stream,
-                &mhc.pre,
-                hidden_size,
-                hc_mult,
-                &mut attn_in,
-            )?;
+            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
+            let mut attn_in = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre", || {
+                crate::hc::hc_pre(
+                    &self.ctx,
+                    &stream,
+                    &mhc.pre,
+                    hidden_size,
+                    hc_mult,
+                    &mut attn_in,
+                )
+            })?;
             keepalive.keep_hidden(&attn_in);
-            let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            crate::ops::rms_norm_batch(&self.ctx, &attn_in, &layer.attn_norm, eps, &mut normed)?;
+            // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::stage_profile::profile(ctx, "dsv4/stage/attn_norm", || {
+                crate::ops::rms_norm_batch(&self.ctx, &attn_in, &layer.attn_norm, eps, &mut normed)
+            })?;
             keepalive.keep_hidden(&normed);
-            let mut attn_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            crate::attention::mla_attention(
-                &self.ctx,
-                &self.config,
-                &layer.attention,
-                layer.mode,
-                layer.compress_ratio,
-                layer_idx,
-                &normed,
-                &mut slot.attention[layer_idx],
-                start_pos,
-                self.tp.config().rank,
-                &mut attn_out,
-                &mut keepalive,
-            )?;
+            // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
+            let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            {
+                let _nvtx = crate::nvtx::range("dsv4/mla_attn");
+                crate::stage_profile::profile(ctx, "dsv4/stage/mla_attn", || {
+                    crate::attention::mla_attention(
+                        &self.ctx,
+                        &self.config,
+                        &layer.attention,
+                        layer.mode,
+                        layer.compress_ratio,
+                        layer_idx,
+                        &normed,
+                        &mut slot.attention[layer_idx],
+                        start_pos,
+                        start_pos_device,
+                        &self.tp,
+                        &mut attn_out,
+                        &mut keepalive,
+                    )
+                })?;
+            }
             keepalive.keep_hidden(&attn_out);
             // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
-            self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
-            let mut attn_stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
-            crate::hc::hc_post(
-                &self.ctx,
-                &attn_out,
-                &stream,
-                &mhc.post,
-                &mhc.comb,
-                hidden_size,
-                hc_mult,
-                &mut attn_stream,
-            )?;
+            {
+                let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
+                crate::stage_profile::profile(ctx, "dsv4/stage/attn_allreduce", || {
+                    self.tp.all_reduce_sum(&self.ctx, &mut attn_out)
+                })?;
+            }
+            // SAFETY: hc_post writes the full stream buffer.
+            let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+            crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
+                crate::hc::hc_post(
+                    &self.ctx,
+                    &attn_out,
+                    &stream,
+                    &mhc.post,
+                    &mhc.comb,
+                    hidden_size,
+                    hc_mult,
+                    &mut attn_stream,
+                )
+            })?;
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
 
             // ── MoE half: HC-wrap the FP8 DeepGEMM MoE block.
-            let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
+            let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_params", || {
+                crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)
+            })?;
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
-            let mut ffn_in = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            crate::hc::hc_pre(
-                &self.ctx,
-                &stream,
-                &mhc.pre,
-                hidden_size,
-                hc_mult,
-                &mut ffn_in,
-            )?;
+            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
+            let mut ffn_in = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre", || {
+                crate::hc::hc_pre(
+                    &self.ctx,
+                    &stream,
+                    &mhc.pre,
+                    hidden_size,
+                    hc_mult,
+                    &mut ffn_in,
+                )
+            })?;
             keepalive.keep_hidden(&ffn_in);
-            let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)?;
+            // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::stage_profile::profile(ctx, "dsv4/stage/ffn_norm", || {
+                crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)
+            })?;
             keepalive.keep_hidden(&normed);
-            let mut moe_out = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            if dsv4_use_deepep_transport()? {
+            // SAFETY: the MoE forward writes the full routed output buffer.
+            let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            if use_deepep_transport {
                 #[cfg(feature = "deepep")]
                 {
                     let transport = self.deepep.as_ref().ok_or_else(|| {
@@ -562,71 +824,422 @@ impl Dsv4Model {
                     bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
                 }
             } else {
+                let decode_scratch = if use_moe_decode_scratch {
+                    Some(&mut slot.moe_decode_scratch[layer_idx])
+                } else {
+                    None
+                };
                 crate::moe::dsv4_moe_forward(
                     self,
                     &layer.moe,
                     tokens,
                     &normed,
                     &mut moe_out,
+                    decode_scratch,
                     &mut keepalive,
                 )?;
                 // Routed experts are EP-sharded; sum them first, then add the replicated
                 // shared expert exactly once per rank.
-                self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                {
+                    let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
+                    crate::stage_profile::profile(ctx, "dsv4/stage/moe_allreduce", || {
+                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)
+                    })?;
+                }
             }
             keepalive.keep_hidden(&moe_out);
-            let shared = crate::moe::dsv4_shared_expert_forward(
-                &self.ctx,
-                &layer.moe,
-                &normed,
-                self.config.swiglu_limit,
-                &mut keepalive,
-            )?;
+            let nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
+            // SAFETY: dsv4_shared_expert_forward writes the full shared output.
+            let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
+                crate::moe::dsv4_shared_expert_forward(
+                    &self.ctx,
+                    &layer.moe,
+                    &normed,
+                    &mut shared,
+                    self.config.swiglu_limit,
+                    if use_moe_decode_scratch {
+                        Some(&mut slot.moe_decode_scratch[layer_idx])
+                    } else {
+                        None
+                    },
+                    &mut keepalive,
+                )
+            })?;
             keepalive.keep_hidden(&shared);
-            let mut moe_with_shared = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
+            // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
+            let mut moe_with_shared =
+                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::stage_profile::profile(ctx, "dsv4/stage/shared_add", || {
+                crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)
+            })?;
             keepalive.keep_hidden(&moe_with_shared);
-            let mut ffn_stream = HiddenStates::zeros(&self.ctx, stream_dim, seq_len)?;
-            crate::hc::hc_post(
-                &self.ctx,
-                &moe_with_shared,
-                &stream,
-                &mhc.post,
-                &mhc.comb,
-                hidden_size,
-                hc_mult,
-                &mut ffn_stream,
-            )?;
+            // SAFETY: hc_post writes the full stream buffer.
+            let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+            crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_post", || {
+                crate::hc::hc_post(
+                    &self.ctx,
+                    &moe_with_shared,
+                    &stream,
+                    &mhc.post,
+                    &mhc.comb,
+                    hidden_size,
+                    hc_mult,
+                    &mut ffn_stream,
+                )
+            })?;
+            drop(nvtx_shared_hc);
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
         }
 
         slot.seq_len += seq_len;
 
-        // ── Head HC: fold the last token's wide stream row → one hidden vector.
-        let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        crate::hc::head_hidden_from_stream(
-            &self.ctx,
-            &self.config,
-            &self.head_hc,
-            &stream,
-            seq_len - 1,
-            &mut last_hidden,
-        )?;
-        keepalive.keep_hidden(&stream);
-        keepalive.keep_vec(&last_hidden);
+        let token = {
+            let _nvtx = crate::nvtx::range("dsv4/lm_head_sample");
+            // ── Head HC: fold the last token's wide stream row → one hidden vector.
+            let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
+            crate::stage_profile::profile(ctx, "dsv4/stage/head_hc", || {
+                crate::hc::head_hidden_from_stream(
+                    &self.ctx,
+                    &self.config,
+                    &self.head_hc,
+                    &stream,
+                    seq_len - 1,
+                    &mut last_hidden,
+                )
+            })?;
+            keepalive.keep_hidden(&stream);
+            keepalive.keep_vec(&last_hidden);
 
-        // ── Final norm + lm_head projection + sample (last token row).
-        let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        crate::ops::rms_norm_vec(&self.ctx, &last_hidden, &self.norm, eps, &mut last_normed)?;
-        keepalive.keep_vec(&last_normed);
-        let mut logits = DeviceVec::zeros(&self.ctx, self.lm_head.rows)?;
-        self.lm_head_project(&last_normed, &mut logits)?;
-        keepalive.keep_vec(&logits);
-        let token = crate::executor::sample_cuda_token(&self.ctx, &logits, params, position)?;
+            // ── Final norm + lm_head projection + sample (last token row).
+            let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
+            crate::stage_profile::profile(ctx, "dsv4/stage/head_norm", || {
+                crate::ops::rms_norm_vec(&self.ctx, &last_hidden, &self.norm, eps, &mut last_normed)
+            })?;
+            keepalive.keep_vec(&last_normed);
+            let mut logits = DeviceVec::zeros(&self.ctx, self.lm_head.rows)?;
+            crate::stage_profile::profile(ctx, "dsv4/stage/lm_head_project", || {
+                self.lm_head_project(&last_normed, &mut logits)
+            })?;
+            keepalive.keep_vec(&logits);
+            crate::stage_profile::profile(ctx, "dsv4/stage/sample", || {
+                crate::executor::sample_cuda_token(&self.ctx, &logits, params, position)
+            })?
+        };
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(token)
+    }
+
+    fn forward_tokens_decode_graph(
+        &self,
+        slot: &mut Dsv4SlotState,
+        token: u32,
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<u32> {
+        ensure!(
+            slot.seq_len == start_pos,
+            "DSv4 graph decode slot seq_len {} != start_pos {start_pos}",
+            slot.seq_len
+        );
+        ensure!(
+            start_pos + 1 <= slot.max_seq_len,
+            "DSv4 graph decode sequence {} exceeds slot max_seq_len {}",
+            start_pos + 1,
+            slot.max_seq_len
+        );
+        ensure!(
+            !dsv4_use_deepep_transport()?,
+            "DSv4 decode graph v1 supports the allreduce transport only"
+        );
+
+        if slot.decode_graph.is_none() {
+            slot.decode_graph = Some(Dsv4DecodeGraphScratch::new(self)?);
+        }
+        let graph = slot
+            .decode_graph
+            .as_mut()
+            .expect("decode graph scratch initialized");
+        let start_pos_i32 = i32::try_from(start_pos)
+            .map_err(|_| anyhow!("DSv4 start_pos {start_pos} overflows i32"))?;
+        self.ctx
+            .stream
+            .memcpy_htod(&[start_pos_i32], &mut slot.start_pos_device)
+            .map_err(|e| anyhow!("DSv4 graph start_pos H2D failed: {e}"))?;
+        self.ctx
+            .stream
+            .memcpy_htod(&[token as i32], &mut graph.token_ids)
+            .map_err(|e| anyhow!("DSv4 graph token-id H2D failed: {e}"))?;
+        self.ctx
+            .stream
+            .memcpy_htod(&[token], &mut graph.token_ids_u32)
+            .map_err(|e| anyhow!("DSv4 graph u32 token-id H2D failed: {e}"))?;
+
+        let hidden_size = self.config.hidden_size;
+        let hc_mult = self.config.hc_mult;
+        let eps = self.config.rms_norm_eps;
+        let mut keepalive = Dsv4ForwardKeepalive::new(false);
+
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
+            if layer_idx == 0 {
+                let current = &mut graph.layers[0];
+                let Dsv4DecodeLayerGraphScratch {
+                    attn_graph,
+                    attn_mhc,
+                    attn_in,
+                    attn_normed,
+                    attn_out,
+                    ..
+                } = current;
+                let attn_state = &mut slot.attention[layer_idx];
+                attn_graph.run_or_capture(|| {
+                    crate::ops::embedding_batch(
+                        &self.ctx,
+                        &self.embed_tokens,
+                        &graph.token_ids,
+                        &mut graph.embeddings,
+                    )?;
+                    crate::hc::initial_stream_from_embeddings(
+                        &self.ctx,
+                        &graph.embeddings,
+                        hidden_size,
+                        hc_mult,
+                        &mut graph.initial_stream,
+                    )?;
+                    let mhc = crate::hc::gen_mhc_params_into(
+                        &self.ctx,
+                        &self.config,
+                        &layer.hc_attn,
+                        &graph.initial_stream,
+                        attn_mhc,
+                    )?;
+                    crate::hc::hc_pre(
+                        &self.ctx,
+                        &graph.initial_stream,
+                        mhc.pre,
+                        hidden_size,
+                        hc_mult,
+                        attn_in,
+                    )?;
+                    crate::ops::rms_norm_batch(
+                        &self.ctx,
+                        attn_in,
+                        &layer.attn_norm,
+                        eps,
+                        attn_normed,
+                    )?;
+                    crate::attention::mla_attention(
+                        &self.ctx,
+                        &self.config,
+                        &layer.attention,
+                        layer.mode,
+                        layer.compress_ratio,
+                        layer_idx,
+                        attn_normed,
+                        attn_state,
+                        start_pos,
+                        Some(&slot.start_pos_device),
+                        &self.tp,
+                        attn_out,
+                        &mut keepalive,
+                    )
+                })?;
+            } else {
+                let (prev_layers, current_layers) = graph.layers.split_at_mut(layer_idx);
+                let prev = &mut prev_layers[layer_idx - 1];
+                let current = &mut current_layers[0];
+                let Dsv4DecodeLayerGraphScratch {
+                    attn_graph,
+                    attn_mhc,
+                    attn_in,
+                    attn_normed,
+                    attn_out,
+                    ..
+                } = current;
+                let attn_state = &mut slot.attention[layer_idx];
+                attn_graph.run_or_capture(|| {
+                    crate::ops::add_batch(
+                        &self.ctx,
+                        &prev.moe_out,
+                        &prev.shared,
+                        &mut prev.moe_with_shared,
+                    )?;
+                    crate::hc::hc_post(
+                        &self.ctx,
+                        &prev.moe_with_shared,
+                        &prev.attn_stream,
+                        &prev.ffn_mhc.post,
+                        &prev.ffn_mhc.comb,
+                        hidden_size,
+                        hc_mult,
+                        &mut prev.ffn_stream,
+                    )?;
+                    let mhc = crate::hc::gen_mhc_params_into(
+                        &self.ctx,
+                        &self.config,
+                        &layer.hc_attn,
+                        &prev.ffn_stream,
+                        attn_mhc,
+                    )?;
+                    crate::hc::hc_pre(
+                        &self.ctx,
+                        &prev.ffn_stream,
+                        mhc.pre,
+                        hidden_size,
+                        hc_mult,
+                        attn_in,
+                    )?;
+                    crate::ops::rms_norm_batch(
+                        &self.ctx,
+                        attn_in,
+                        &layer.attn_norm,
+                        eps,
+                        attn_normed,
+                    )?;
+                    crate::attention::mla_attention(
+                        &self.ctx,
+                        &self.config,
+                        &layer.attention,
+                        layer.mode,
+                        layer.compress_ratio,
+                        layer_idx,
+                        attn_normed,
+                        attn_state,
+                        start_pos,
+                        Some(&slot.start_pos_device),
+                        &self.tp,
+                        attn_out,
+                        &mut keepalive,
+                    )?;
+                    Ok(())
+                })?;
+            }
+            slot.attention[layer_idx].advance_decode_len(
+                layer.mode,
+                layer.compress_ratio,
+                start_pos + 1,
+            );
+            self.tp
+                .all_reduce_sum(&self.ctx, &mut graph.layers[layer_idx].attn_out)?;
+
+            let (stream_in, layer_scratch) = if layer_idx == 0 {
+                (&graph.initial_stream, &mut graph.layers[0])
+            } else {
+                let (prev_layers, current_layers) = graph.layers.split_at_mut(layer_idx);
+                (
+                    &prev_layers[layer_idx - 1].ffn_stream,
+                    &mut current_layers[0],
+                )
+            };
+            let Dsv4DecodeLayerGraphScratch {
+                moe_graph,
+                attn_mhc,
+                ffn_mhc,
+                attn_out,
+                attn_stream,
+                ffn_in,
+                ffn_normed,
+                moe_out,
+                shared,
+                ..
+            } = layer_scratch;
+            let moe_scratch = &mut slot.moe_decode_scratch[layer_idx];
+            moe_graph.run_or_capture(|| {
+                crate::hc::hc_post(
+                    &self.ctx,
+                    attn_out,
+                    stream_in,
+                    &attn_mhc.post,
+                    &attn_mhc.comb,
+                    hidden_size,
+                    hc_mult,
+                    attn_stream,
+                )?;
+                let mhc = crate::hc::gen_mhc_params_into(
+                    &self.ctx,
+                    &self.config,
+                    &layer.hc_ffn,
+                    attn_stream,
+                    ffn_mhc,
+                )?;
+                crate::hc::hc_pre(
+                    &self.ctx,
+                    attn_stream,
+                    mhc.pre,
+                    hidden_size,
+                    hc_mult,
+                    ffn_in,
+                )?;
+                crate::ops::rms_norm_batch(&self.ctx, ffn_in, &layer.ffn_norm, eps, ffn_normed)?;
+                crate::moe::dsv4_moe_forward_decode_graph(
+                    self,
+                    &layer.moe,
+                    &graph.token_ids_u32,
+                    ffn_normed,
+                    moe_out,
+                    moe_scratch,
+                )?;
+                crate::moe::dsv4_shared_expert_forward(
+                    &self.ctx,
+                    &layer.moe,
+                    ffn_normed,
+                    shared,
+                    self.config.swiglu_limit,
+                    Some(moe_scratch),
+                    &mut keepalive,
+                )
+            })?;
+            self.tp
+                .all_reduce_sum(&self.ctx, &mut graph.layers[layer_idx].moe_out)?;
+        }
+
+        let final_idx = self.layers.len() - 1;
+        let Dsv4DecodeGraphScratch {
+            layers,
+            tail_graph,
+            last_hidden,
+            last_normed,
+            logits_batch,
+            logits,
+            ..
+        } = graph;
+        let final_scratch = &mut layers[final_idx];
+        tail_graph.run_or_capture(|| {
+            crate::ops::add_batch(
+                &self.ctx,
+                &final_scratch.moe_out,
+                &final_scratch.shared,
+                &mut final_scratch.moe_with_shared,
+            )?;
+            crate::hc::hc_post(
+                &self.ctx,
+                &final_scratch.moe_with_shared,
+                &final_scratch.attn_stream,
+                &final_scratch.ffn_mhc.post,
+                &final_scratch.ffn_mhc.comb,
+                hidden_size,
+                hc_mult,
+                &mut final_scratch.ffn_stream,
+            )?;
+            crate::hc::head_hidden_from_stream(
+                &self.ctx,
+                &self.config,
+                &self.head_hc,
+                &final_scratch.ffn_stream,
+                0,
+                last_hidden,
+            )?;
+            crate::ops::rms_norm_vec(&self.ctx, last_hidden, &self.norm, eps, last_normed)?;
+            self.lm_head_project_decode_graph(last_normed, logits_batch, logits)?;
+            Ok(())
+        })?;
+
+        slot.seq_len += 1;
+        crate::executor::sample_cuda_token(&self.ctx, logits, params, position)
     }
 
     /// Project the final hidden vector through the LM head into `logits`. The
@@ -652,12 +1265,51 @@ impl Dsv4Model {
                     hidden_dim: x.len,
                     seq_len: 1,
                 };
-                let mut out_batch = HiddenStates::zeros(&self.ctx, logits.len, 1)?;
+                // SAFETY: mla_linear writes the full one-token logits batch.
+                let mut out_batch = unsafe { HiddenStates::uninit(&self.ctx, logits.len, 1)? };
                 crate::attention::mla_linear(&self.ctx, &self.lm_head, &x_batch, &mut out_batch)?;
                 self.ctx
                     .stream
                     .memcpy_dtod(&out_batch.data, &mut logits.data)
                     .map_err(|e| anyhow!("DSv4 lm_head logits copy-back failed: {e}"))?;
+                Ok(())
+            }
+            other => anyhow::bail!("DSv4 lm_head unsupported weight format {other:?}"),
+        }
+    }
+
+    fn lm_head_project_decode_graph(
+        &self,
+        x: &DeviceVec,
+        logits_batch: &mut HiddenStates,
+        logits: &mut DeviceVec,
+    ) -> Result<()> {
+        use cuda_kernels::tensor::WeightFormat;
+        ensure!(
+            self.lm_head.cols == x.len && self.lm_head.rows == logits.len,
+            "DSv4 lm_head shape mismatch: [{}x{}] x.len {} logits.len {}",
+            self.lm_head.rows,
+            self.lm_head.cols,
+            x.len,
+            logits.len
+        );
+        match self.lm_head.weight_format {
+            WeightFormat::DenseBf16 => crate::ops::gemv(&self.ctx, &self.lm_head, x, logits),
+            WeightFormat::Dsv4Fp8BlockScaled | WeightFormat::Dsv4Fp4BlockScaled => {
+                ensure!(
+                    logits_batch.hidden_dim == logits.len && logits_batch.seq_len == 1,
+                    "DSv4 decode graph lm_head batch shape {}x{} != {}x1",
+                    logits_batch.hidden_dim,
+                    logits_batch.seq_len,
+                    logits.len
+                );
+                crate::attention::mla_linear_vec(&self.ctx, &self.lm_head, x, logits_batch)?;
+                self.ctx
+                    .stream
+                    .memcpy_dtod(&logits_batch.data, &mut logits.data)
+                    .map_err(|e| {
+                        anyhow!("DSv4 decode graph lm_head logits copy-back failed: {e}")
+                    })?;
                 Ok(())
             }
             other => anyhow::bail!("DSv4 lm_head unsupported weight format {other:?}"),
@@ -691,6 +1343,13 @@ fn dsv4_use_deepep_transport() -> Result<bool> {
              (expected allreduce or deepep)"
         ),
     }
+}
+
+fn dsv4_decode_graph_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
 }
 
 /// TP runtime for DSv4 load — multi-rank `nccl` builds resolve the NCCL

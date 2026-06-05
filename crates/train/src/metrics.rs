@@ -164,10 +164,7 @@ impl MetricSink for JsonlSink {
         map.insert("phase".to_string(), serde_json::Value::from(sample.phase));
         map.insert("step".to_string(), serde_json::Value::from(sample.step));
         for (k, v) in sample.fields {
-            let value = serde_json::Number::from_f64(*v)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null);
-            map.insert((*k).to_string(), value);
+            map.insert((*k).to_string(), f64_to_json(*v));
         }
         self.write_json_map(map);
     }
@@ -182,10 +179,7 @@ impl MetricSink for JsonlSink {
             map.insert((*k).to_string(), serde_json::Value::from(*v));
         }
         for (k, v) in event.scalars {
-            let value = serde_json::Number::from_f64(*v)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null);
-            map.insert((*k).to_string(), value);
+            map.insert((*k).to_string(), f64_to_json(*v));
         }
         for (k, v) in event.bools {
             map.insert((*k).to_string(), serde_json::Value::from(*v));
@@ -204,6 +198,15 @@ impl Drop for JsonlSink {
     fn drop(&mut self) {
         let _ = self.writer.flush();
     }
+}
+
+/// Convert an `f64` to a JSON value, mapping non-finite values to `Null`
+/// (mirrors `serde_json::Number::from_f64` semantics). Shared by `JsonlSink`'s
+/// `emit` and `event`.
+fn f64_to_json(v: f64) -> serde_json::Value {
+    serde_json::Number::from_f64(v)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
