@@ -212,6 +212,36 @@ prefill lever.
 
 **DSv4 perf arc — structural scope complete.** Decode 6×, prefill 512 12×, both
 now bound by the shared FP8-GEMV + hybrid-attention kernel floor. The only
-remaining perf axis is deep per-kernel optimization of those two (align SGLang,
-H20-capped, diminishing) plus a cheap cold-TTFT warmup fix; everything
-scheduling / host / buffer / launch / routing has been eliminated and measured.
+remaining perf axis is deep per-kernel optimization of those two (align SGLang)
+plus a cheap cold-TTFT warmup fix; everything scheduling / host / buffer / launch
+/ routing has been eliminated and measured.
+
+## 9. Kernel-floor ncu (#28/#16) — the FP8 GEMV "floor" is an unoptimized scalar kernel (2026-06-05)
+
+The #1 floor kernel is **not** hardware-limited. The attention-side FP8
+block-scaled linear (`dsv4_fp8_gemv_batch_cuda`, `attention.rs:769` →
+`crates/cuda-kernels/csrc/gemm/quantized_gemv.cu:374` decode / `:422` prefill;
+used by MLA wq_a/wq_b/wkv/wo_a/wo_b + compressor + indexer + HC mix — **not** the
+MoE DeepGEMM path) is a **hand-written scalar CUDA-core kernel**:
+
+| ncu (standalone microbench, N=K=7168) | prefill B=2048 | decode B=1 |
+|---|---|---|
+| Tensor pipe (WGMMA) | **0.45%** | **0%** |
+| DRAM throughput | 0.93% (37 GB/s) | 7.0% (283 GB/s) |
+| ALU / FMA | 53% / 22% | 68% / 30% |
+| occupancy | 49.7% | 87.3% |
+| verdict | scalar ALU/FFMA/dequant-bound | scalar, ~10% of HBM BW |
+
+So a large chunk of the "H20 floor" is a kernel leaving **tensor cores idle and
+~90% of memory bandwidth unused** — ~10× headroom, *not* a hardware wall. The
+earlier §7 "H20 realistic floor ~25–40 ms" was too pessimistic for this part.
+
+**Levers (split by M):** prefill (B>1, real GEMM) → route through DeepGEMM dense
+FP8 block-scaled GEMM (tensor-core; DeepGEMM already handles E8M0 block-scaling
+correctly for MoE) — lower risk than hand-writing WGMMA. Decode (B=1, GEMV) →
+tensor cores don't help (M=1), but a proper memory-bound FP8 GEMV (efficient E8M0
+dequant + vectorized load) should hit HBM BW: 187 µs → ~17 µs order. Caveat: the
+old `ARLE_DSV4_FP8_GEMV_MMA` path was corrupt+slower (token1) — don't flip it;
+fix the block-scale handling or go through DeepGEMM. License: prefill+decode
+wall-clock A/B (double-win), 16/16, ncu tensor/BW re-check. (Hybrid attention is
+the second shared floor — next after the GEMV.)
