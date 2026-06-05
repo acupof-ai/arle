@@ -1,98 +1,7 @@
-diff --git a/src/backend/cuda/op/copy.cc b/src/backend/cuda/op/copy.cc
-index 997b046a..b2864554 100644
---- a/src/backend/cuda/op/copy.cc
-+++ b/src/backend/cuda/op/copy.cc
-@@ -353,6 +353,11 @@ private:
-   static LayoutMap InferBulkLayout(const CopyNode &op, const LayoutInferArgs &T,
-                                    InferLevel level, CopyInst copy_inst);
- 
-+  static bool NeedsVoltaFragmentStaging(const CopyNode &op, Target target);
-+
-+  static Stmt LowerVoltaFragmentStaging(const CopyNode &op, const LowerArgs &T,
-+                                        arith::Analyzer *analyzer);
-+
-   static Stmt LowerNormal(const CopyNode &op, const LowerArgs &T,
-                           arith::Analyzer *analyzer);
- 
-@@ -429,6 +434,10 @@ LayoutMap Copy::InferLayout(const CopyNode &op, const LayoutInferArgs &T,
-       SelectInst(op, T.target, T.layout_map, T.analyzer, T.buffer_oob);
-   CheckParallelLoopLayout(op, copy_inst);
- 
-+  if (NeedsVoltaFragmentStaging(op, T.target)) {
-+    return {};
-+  }
-+
-   if (copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
-     return InferTMemLayout(op, T, copy_inst);
-   }
-@@ -591,6 +600,11 @@ LayoutMap Copy::InferBulkLayout(const CopyNode &op, const LayoutInferArgs &T,
-   return result_map;
- }
- 
-+bool Copy::NeedsVoltaFragmentStaging(const CopyNode &op, Target target) {
-+  return TargetIsVolta(target) && IsFragmentBuffer(op.src) &&
-+         IsFragmentBuffer(op.dst) && op.src->dtype != op.dst->dtype;
-+}
-+
- CopyInst Copy::SelectInst(const CopyNode &op, Target target,
-                           const LayoutMap &layout_map,
-                           arith::Analyzer *analyzer, bool buffer_oob) {
-@@ -615,6 +629,10 @@ Stmt Copy::Lower(const CopyNode &op, const LowerArgs &T,
-         << "Got target=" << T.target;
-     return LowerCluster(op, T, analyzer);
-   }
-+  if (copy_inst == CopyInst::kNormal &&
-+      NeedsVoltaFragmentStaging(op, T.target)) {
-+    return LowerVoltaFragmentStaging(op, T, analyzer);
-+  }
-   if (copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
-     auto tmem_copy = LowerTmem(op, T, analyzer);
-     ICHECK(tmem_copy.defined()) << "Failed to lower tensor memory copy";
-@@ -649,6 +667,40 @@ Stmt Copy::Lower(const CopyNode &op, const LowerArgs &T,
-   }
- }
- 
-+Stmt Copy::LowerVoltaFragmentStaging(const CopyNode &op, const LowerArgs &T,
-+                                     arith::Analyzer *analyzer) {
-+  Array<PrimExpr> staging_shape;
-+  Array<Range> staging_range;
-+  staging_shape.reserve(op.dst_range.size());
-+  staging_range.reserve(op.dst_range.size());
-+  for (const auto &range : op.dst_range) {
-+    staging_shape.push_back(range->extent);
-+    staging_range.push_back(
-+        Range::FromMinExtent(make_zero(range->extent.dtype()), range->extent));
-+  }
-+
-+  Buffer staging =
-+      decl_buffer(staging_shape, op.dst->dtype, "tl_frag_copy", "shared");
-+
-+  CopyNode src_to_shared;
-+  src_to_shared.src = op.src;
-+  src_to_shared.dst = staging;
-+  src_to_shared.src_range = op.src_range;
-+  src_to_shared.dst_range = staging_range;
-+
-+  CopyNode shared_to_dst;
-+  shared_to_dst.src = staging;
-+  shared_to_dst.dst = op.dst;
-+  shared_to_dst.src_range = staging_range;
-+  shared_to_dst.dst_range = op.dst_range;
-+
-+  Stmt store = tl::LowerNormalCopy(src_to_shared, T, analyzer);
-+  Stmt sync = Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
-+                            {StringImm("shared")}));
-+  Stmt load = tl::LowerNormalCopy(shared_to_dst, T, analyzer);
-+  return SeqStmt({AllocBuffer(staging), store, sync, load});
-+}
-+
- Stmt Copy::LowerCPAsync(const CopyNode &op, const LowerArgs &T,
-                         arith::Analyzer *analyzer) {
-   using namespace tvm::transform;
-diff --git a/src/backend/cuda/op/gemm.cc b/src/backend/cuda/op/gemm.cc
-index 72b5ada5..2516f1bd 100644
---- a/src/backend/cuda/op/gemm.cc
-+++ b/src/backend/cuda/op/gemm.cc
+diff --git a/src/cuda/op/gemm.cc b/src/cuda/op/gemm.cc
+index d23fac73..c29c1348 100644
+--- a/src/cuda/op/gemm.cc
++++ b/src/cuda/op/gemm.cc
 @@ -31,6 +31,7 @@ namespace cuda {
  namespace {
  
@@ -157,19 +66,6 @@ index 72b5ada5..2516f1bd 100644
      return "unknown";
    }
  };
-diff --git a/src/tl_templates/cuda/instruction/mma_sm70.h b/src/tl_templates/cuda/instruction/mma_sm70.h
-index 7a44b921..e8ea4239 100644
---- a/src/tl_templates/cuda/instruction/mma_sm70.h
-+++ b/src/tl_templates/cuda/instruction/mma_sm70.h
-@@ -325,7 +325,7 @@ TL_DEFINE_MMA_SM70_DISPATCHER(kFloat16, kFloat16, kFloat32, false, false)
- 
- /// SM70 MMA synchronous instruction wrapper
- /// Supports m16n16k4 shape (m8n8k4 instruction at warp level) with FP16 inputs
--/// and FP16/FP32 accumulation
-+/// and FP16/FP32 accumulation.
- ///
- /// @tparam AType Input A data type (kFloat16)
- /// @tparam BType Input B data type (kFloat16)
 diff --git a/testing/python/cuda/test_cuda_mma_sm75_dispatch.py b/testing/python/cuda/test_cuda_mma_sm75_dispatch.py
 index 240e8b14..e027e159 100644
 --- a/testing/python/cuda/test_cuda_mma_sm75_dispatch.py
@@ -192,10 +88,10 @@ index 240e8b14..e027e159 100644
  def test_sm75_fp16_emitter_uses_m16n8k8_shape():
 diff --git a/testing/python/kernel/test_tilelang_kernel_sm70_fragment_copy.py b/testing/python/kernel/test_tilelang_kernel_sm70_fragment_copy.py
 new file mode 100644
-index 00000000..5a6a0626
+index 00000000..bef2f331
 --- /dev/null
 +++ b/testing/python/kernel/test_tilelang_kernel_sm70_fragment_copy.py
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,48 @@
 +import torch
 +
 +import tilelang
@@ -235,6 +131,8 @@ index 00000000..5a6a0626
 +@tilelang.testing.requires_cuda_compute_version_eq(7, 0)
 +def test_sm70_fragment_cast_copy_feeds_rs_gemm():
 +    kernel = tilelang.compile(_make_fragment_cast_into_rs_gemm(), target="cuda", out_idx=[2])
++    source = kernel.get_kernel_source()
++    assert "tl_frag_copy" not in source
 +
 +    a = torch.randn((64, 16), device="cuda", dtype=torch.float16)
 +    b = torch.randn((16, 16), device="cuda", dtype=torch.float16)
@@ -369,10 +267,10 @@ index 52aa4d44..310c9e60 100644
  register_gemm_impl("cuda.tcgen05", GEMM_INST_TCGEN05, _match_tcgen05, GemmTCGEN5)
 diff --git a/tilelang/cuda/op/gemm/gemm_fma.py b/tilelang/cuda/op/gemm/gemm_fma.py
 new file mode 100644
-index 00000000..237858cc
+index 00000000..e8974fa1
 --- /dev/null
 +++ b/tilelang/cuda/op/gemm/gemm_fma.py
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,149 @@
 +"""CUDA scalar FMA fallback GEMM.
 +
 +Used when a tensor-core MMA path is unavailable for the requested dtype, layout,
@@ -399,10 +297,10 @@ index 00000000..237858cc
 +    """Round-robin a multi-dim fragment across threads.
 +
 +    The buffer is flattened in row-major order and each element ``flat`` is
-+    mapped to ``(flat % thread_nums, flat // thread_nums)`` — i.e. thread id
++    mapped to ``(flat % thread_nums, flat // thread_nums)``: thread id
 +    and per-thread local index. This is the simplest layout that gives every
-+    thread an equal share of the tile and is sufficient for the FMA fallback
-+    where throughput is bound by scalar CUDA-core FFMA, not by layout choice.
++    thread an equal share of the tile. The FMA path is a correctness fallback,
++    not a performance-tuned replacement for tensor-core MMA.
 +    """
 +    shape = list(local_buf.shape)
 +    strides = [1 for _ in shape]
@@ -442,12 +340,12 @@ index 00000000..237858cc
 +    ):
 +        """Emit the FMA-fallback GEMM prim_func.
 +
-+        Stages ``A`` and ``B`` into shared memory cooperatively, then has each
-+        thread accumulate its assigned output elements with a scalar
-+        ``C[i, j] += cast(A[..]) * cast(B[..])`` loop over ``K`` — nvcc lowers
-+        the cast/multiply/add chain to ``FFMA``. Casts widen the operands to
-+        ``accum_dtype`` before multiplication so the path stays numerically
-+        sound for narrow input dtypes (e.g. BF16 → FP32 accumulation on Volta).
++        Stages ``A`` and ``B`` into shared memory cooperatively, then lets each
++        thread accumulate its assigned output elements with a scalar loop over
++        ``K``. Casts widen operands to ``accum_dtype`` before multiplication so
++        narrow input dtypes stay numerically sound (e.g. BF16 to FP32
++        accumulation on Volta). This path favors correctness and coverage over
++        peak throughput.
 +        """
 +        M, N, K = self.M, self.N, self.K
 +        A_region = self.ARegion
@@ -461,6 +359,10 @@ index 00000000..237858cc
 +        assert len(A_region.region) >= 2, "FMA GEMM requires at least 2D A"
 +        assert len(B_region.region) >= 2, "FMA GEMM requires at least 2D B"
 +        assert len(C_region.region) >= 2, "FMA GEMM requires at least 2D C"
++        if is_fragment(self.A):
++            assert is_full_region(A_region), "Fragment input A must be a full region"
++        if is_fragment(self.B):
++            assert is_full_region(B_region), "Fragment input B must be a full region"
 +        if is_fragment(self.C):
 +            assert is_full_region(C_region), "Fragment output C must be a full region"
 +
@@ -482,15 +384,17 @@ index 00000000..237858cc
 +        trans_A = self.trans_A
 +        trans_B = self.trans_B
 +        clear_accum = self.clear_accum
-+        in_dtype = self.in_dtype
++        a_dtype = self.a_dtype
++        b_dtype = self.b_dtype
 +        accum_dtype = self.accum_dtype
 +        thread_nums = thread_bounds.extent
 +
 +        @T.prim_func
 +        def _gemm_fma() -> None:
 +            """Stage A/B into shared memory, then accumulate C via scalar FMA."""
-+            A_stage = T.alloc_shared((a_rows, a_cols), in_dtype)
-+            B_stage = T.alloc_shared((b_rows, b_cols), in_dtype)
++            A_stage = T.alloc_shared((a_rows, a_cols), a_dtype)
++            B_stage = T.alloc_shared((b_rows, b_cols), b_dtype)
++            accum = T.alloc_local((1,), accum_dtype)
 +
 +            for a_flat in T.serial(thread_var, a_rows * a_cols, thread_nums):
 +                ai = a_flat // a_cols
@@ -506,12 +410,13 @@ index 00000000..237858cc
 +                i = c_flat // N
 +                j = c_flat % N
 +                if clear_accum:
-+                    C_buf[tuple(C_other) + (c0 + i, c1 + j)] = T.cast(0, accum_dtype)
++                    accum[0] = T.cast(0, accum_dtype)
++                else:
++                    accum[0] = T.cast(C_buf[tuple(C_other) + (c0 + i, c1 + j)], accum_dtype)
 +                for k in T.serial(K):
-+                    C_buf[tuple(C_other) + (c0 + i, c1 + j)] += T.cast(
-+                        T.cast(A_stage[k if trans_A else i, i if trans_A else k], accum_dtype)
-+                        * T.cast(B_stage[j if trans_B else k, k if trans_B else j], accum_dtype),
-+                        accum_dtype,
++                    accum[0] += T.cast(A_stage[k if trans_A else i, i if trans_A else k], accum_dtype) * T.cast(
++                        B_stage[j if trans_B else k, k if trans_B else j], accum_dtype
 +                    )
++                C_buf[tuple(C_other) + (c0 + i, c1 + j)] = accum[0]
 +
 +        return _Simplify(_gemm_fma, inline_let=True)
