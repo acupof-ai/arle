@@ -87,6 +87,10 @@ mod real {
     /// being scored on a different prompt than the legacy oracle.)
     const DEFAULT_PROMPT_IDS: &str = "671,6102,294,8760,344";
     const DEFAULT_MAX_NEW: usize = 16;
+    const SLOT_MAX_SEQ_HEADROOM: usize = 64;
+    const DSV4_PARITY_NUM_SLOTS: usize = 1;
+    const DSV4_FLASH_KV_BYTES_PER_TOKEN: usize = 584;
+    const DSV4_FLASH_BASE_LAYERS: usize = 43;
 
     unsafe extern "C" {
         fn cudaProfilerStart() -> i32;
@@ -201,6 +205,7 @@ mod real {
              prompt_head={prompt_head:?} max_new={max_new}",
             prompt.len()
         );
+        let slot_max_seq_len = configure_slot_max_seq_len(prompt.len(), max_new, rank)?;
 
         // Multi-rank NCCL bootstrap: file-rendezvous BEFORE building the executor
         // (the loader's TP runtime calls ncclCommInitRank during construction).
@@ -212,7 +217,7 @@ mod real {
         // present to satisfy the `submit(.., &mut dyn KvPool)` signature — the
         // DSv4 executor never touches it. A 1-slot/1-page pool is sufficient.
         let load_t0 = Instant::now();
-        let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1)
+        let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, DSV4_PARITY_NUM_SLOTS)
             .context("from_dsv4_fp8_safetensors failed (build/config?)")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
         let mut kv = CudaKvPool::new(1, 1, 16);
@@ -284,7 +289,8 @@ mod real {
             };
             eprintln!(
                 "[dsv4-parity timing rank=0] prompt_tokens={} max_new={} load_ms={:.3} \
-                 prefill_ms={:.3} decode_steps={} decode_ms={:.3} decode_tok_s={:.3}",
+                 prefill_ms={:.3} decode_steps={} decode_ms={:.3} decode_tok_s={:.3} \
+                 slot_max_seq_len={slot_max_seq_len}",
                 prompt.len(),
                 max_new,
                 load_ms,
@@ -311,6 +317,31 @@ mod real {
             ),
         }
         Ok(())
+    }
+
+    fn configure_slot_max_seq_len(prompt_len: usize, max_new: usize, rank: usize) -> Result<usize> {
+        let slot_max_seq_len = prompt_len
+            .checked_add(max_new)
+            .and_then(|v| v.checked_add(SLOT_MAX_SEQ_HEADROOM))
+            .context("DSv4 parity slot max_seq_len overflow")?;
+        let kv_bytes = slot_max_seq_len
+            .checked_mul(DSV4_FLASH_KV_BYTES_PER_TOKEN)
+            .and_then(|v| v.checked_mul(DSV4_FLASH_BASE_LAYERS))
+            .and_then(|v| v.checked_mul(DSV4_PARITY_NUM_SLOTS))
+            .context("DSv4 parity FP8 KV arena byte estimate overflow")?;
+        let kv_mib = kv_bytes as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "[dsv4-parity rank={rank}] slot_max_seq_len={slot_max_seq_len} \
+             (= prompt_len {prompt_len} + max_new {max_new} + headroom \
+             {SLOT_MAX_SEQ_HEADROOM}); fp8_kv_arena_est={kv_bytes} bytes \
+             ({kv_mib:.2} MiB/rank for {DSV4_PARITY_NUM_SLOTS} slot × \
+             {DSV4_FLASH_BASE_LAYERS} layers × {DSV4_FLASH_KV_BYTES_PER_TOKEN} B/token)"
+        );
+        // SAFETY: this harness is still single-threaded and has not constructed
+        // CUDA/NCCL/model state yet. The executor reads this env var while
+        // allocating DSv4 slot state below.
+        unsafe { std::env::set_var("INFER_DSV4_MAX_SEQ_LEN", slot_max_seq_len.to_string()) };
+        Ok(slot_max_seq_len)
     }
 
     fn env_flag(name: &str) -> bool {
