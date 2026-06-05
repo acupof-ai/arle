@@ -64,13 +64,29 @@ in `2026-06-06-dsv4-wholesale-kernel-adopt.md` §3. Independent of the per-kerne
 amortizes the whole forward. The single biggest step toward 6ms-effective
 (26.6 / 1.9 ≈ 14 ms; with lever 1 → ~10 ms).
 
-## Prefill axis (separate)
+## Prefill axis (separate) — clean profile 2026-06-06 (4096-tok, GPU activity)
 
-The 9.46ms scalar `dsv4_hybrid_attention_kernel` is **prefill** (CSA/HCA on scalar,
-FlashMLA-prefill killed +36%). The lever is the **prepare-chain overlap** (compressor/
-indexer on `comm_stream` behind the wq_b GEMM), same fence infra as lever 1. Needs a
-clean prefill per-stage profile first (§0 — confirm the prepare chain dominates TTFT
-post-FlashMLA-decode).
+Prefill is **attention+prepare bound, NOT MoE-bound** (DeepGEMM ~2.3%). Breakdown:
+
+| Stage | %prefill GPU | Lever |
+|---|---|---|
+| scalar `dsv4_hybrid_attention_kernel` (CSA/HCA math) | 23.6% | **hard** — FlashMLA-prefill killed (+36%; its prepare overhead > the attention-math savings) |
+| FP8 GEMV projections | 22.8% | **#1: extend fused-wqkv (DeepGEMM) to prefill** — the proven +18.4% decode pattern, lifted to multi-token (review #9 "extend to prefill") |
+| `dsv4_csa_select_kernel` (bitonic top-512) | 17.7% | #2: fused top-k (SGLang Indexer) / overlap |
+| compressor update | 4.2% | prepare-chain overlap (only if it hides csa_select+compressor+GEMV behind attention) |
+
+**Plan:**
+1. **Extend fused-wqkv to prefill** (#1, 22.8%, lowest-risk — mirrors the proven decode
+   fused path): remove the `token_count==1` restriction in `run_fused_wqkv_decode`
+   (attention.rs:~2296), make the fused `wqkv_a` DeepGEMM handle multi-token shapes.
+   Gate + token-exact + prefill_ms A/B like the decode flip.
+2. **CSA-select** (#2, 17.7%): the scalar bitonic `dsv4_csa_bitonic_sort_desc` →
+   adopt a fused top-k; SGLang also reuses the index cross-layer (`skip_topk`).
+3. **prepare-chain overlap** (compressor/indexer on `comm_stream` behind the attention/
+   GEMV) — same fence infra as decode lever 1; licensed *only* if it overlaps
+   csa_select+compressor+GEMV with the attention path (the prepare chain is serial today).
+- NVTX wall shows `dsv4/attn_allreduce` 17.9% but that range absorbs async backlog/skew —
+  use the GPU-activity column for attribution, not the NVTX wall (§0 framing).
 
 ## Method (proven this session — do not regress)
 path-probe to kill profile confounders → **clean** decode-window profile (short prompt
