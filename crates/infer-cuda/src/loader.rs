@@ -8,8 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::Shard;
 use infer_topo::{ShardingSpec, TpConfig};
 use qwen3_spec::Qwen3Config;
@@ -1081,6 +1082,27 @@ impl SafetensorLoader {
         names: &deepseek_spec::DeepSeekV4AttentionTensorNames,
         tp: &TpConfig,
     ) -> Result<crate::dsv4::Dsv4Attention> {
+        let attn_sink = self.load_dsv4_vec(ctx, &names.attn_sink)?;
+        let attn_sink_f32 = {
+            let mut dst = ctx
+                .stream
+                .alloc_zeros::<f32>(attn_sink.len)
+                .map_err(|e| anyhow!("DSv4 attn_sink f32 mirror alloc failed: {e}"))?;
+            let (src_ptr, _sg) = attn_sink.data.device_ptr(&ctx.stream);
+            let (dst_ptr, _dg) = dst.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::arle_bf16_to_f32_cuda(
+                    src_ptr as *const ffi::Half,
+                    dst_ptr as *mut f32,
+                    attn_sink.len as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 attn_sink bf16->f32 mirror failed: {e}"))?;
+            }
+            drop(_dg);
+            dst
+        };
         Ok(crate::dsv4::Dsv4Attention {
             wq_a: self.load_dsv4_block_scaled(ctx, &names.wq_a)?,
             q_norm: self.load_dsv4_vec(ctx, &names.q_norm)?,
@@ -1110,7 +1132,8 @@ impl SafetensorLoader {
                     .unwrap_or(Shard::Replicated),
                 tp,
             )?,
-            attn_sink: self.load_dsv4_vec(ctx, &names.attn_sink)?,
+            attn_sink,
+            attn_sink_f32,
             compressor: names
                 .compressor
                 .as_ref()
