@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
+use cuda_kernels::tensor::{CudaPipelineStreamKind, Dsv4Fp8DeepGemmWeightCache};
 use cudarc::driver::CudaSlice;
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config, DeepSeekV4MoeRoutingKind};
 use infer_moe::MoeConfig;
@@ -886,8 +886,20 @@ impl Dsv4Model {
                 crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)
             })?;
             keepalive.keep_hidden(&normed);
+            let use_comm_overlap =
+                dsv4_comm_overlap_enabled() && seq_len == 1 && !use_deepep_transport;
+            let normed_ready = if use_comm_overlap {
+                let fence = ctx.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
+                ctx.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Comm)?;
+                Some(fence)
+            } else {
+                None
+            };
             // SAFETY: the MoE forward writes the full routed output buffer.
             let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            // DeepEP combine already reduces the EP-sharded routed output; the
+            // non-deepep path needs the explicit TP all-reduce below.
+            let needs_moe_allreduce = !use_deepep_transport;
             if use_deepep_transport {
                 #[cfg(feature = "deepep")]
                 {
@@ -923,35 +935,88 @@ impl Dsv4Model {
                     decode_scratch,
                     &mut keepalive,
                 )?;
-                // Routed experts are EP-sharded; sum them first, then add the replicated
-                // shared expert exactly once per rank.
-                {
-                    let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
-                    crate::stage_profile::profile(ctx, "dsv4/stage/moe_allreduce", || {
-                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)
-                    })?;
-                }
             }
             keepalive.keep_hidden(&moe_out);
             let nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
-            // SAFETY: dsv4_shared_expert_forward writes the full shared output.
-            let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
-                crate::moe::dsv4_shared_expert_forward(
-                    &self.ctx,
-                    &layer.moe,
-                    &normed,
-                    &mut shared,
-                    self.config.swiglu_limit,
-                    if use_moe_decode_scratch {
-                        Some(&mut slot.moe_decode_scratch[layer_idx])
-                    } else {
-                        None
-                    },
-                    &mut keepalive,
-                )
-            })?;
+            let mut shared_opt = None;
+            let shared_ready = if use_comm_overlap {
+                let len = hidden_size * seq_len;
+                let data = unsafe {
+                    self.ctx
+                        .comm_stream
+                        .alloc::<half::bf16>(len)
+                        .map_err(|e| anyhow!("DSv4 shared expert comm-stream alloc failed: {e}"))?
+                };
+                let mut shared = HiddenStates {
+                    data,
+                    hidden_dim: hidden_size,
+                    seq_len,
+                };
+                let _normed_ready = normed_ready
+                    .as_ref()
+                    .expect("comm-overlap path records normed fence");
+                crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
+                    crate::moe::dsv4_shared_expert_forward(
+                        &self.ctx,
+                        &self.ctx.comm_stream,
+                        &layer.moe,
+                        &normed,
+                        &mut shared,
+                        self.config.swiglu_limit,
+                        if use_moe_decode_scratch {
+                            Some(&mut slot.moe_decode_scratch[layer_idx])
+                        } else {
+                            None
+                        },
+                        &mut keepalive,
+                    )
+                })?;
+                shared_opt = Some(shared);
+                Some(ctx.record_pipeline_fence(CudaPipelineStreamKind::Comm)?)
+            } else {
+                None
+            };
+            // Routed experts are EP-sharded; sum them first, then add the replicated
+            // shared expert exactly once per rank. In the comm-overlap path, shared
+            // expert depends on `normed`, while this compute-stream collective depends
+            // on the routed `moe_out`; the two can run concurrently.
+            if needs_moe_allreduce {
+                let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
+                crate::stage_profile::profile(ctx, "dsv4/stage/moe_allreduce", || {
+                    self.tp.all_reduce_sum(&self.ctx, &mut moe_out)
+                })?;
+            }
+            let shared = if let Some(shared) = shared_opt {
+                shared
+            } else {
+                // Keep the default masked path order byte-for-byte with main:
+                // routed MoE → all-reduce → allocate/run shared expert. Moving
+                // shared scratch allocation before all-reduce can reuse in-flight
+                // helper buffers under disabled cudarc event tracking.
+                // SAFETY: dsv4_shared_expert_forward writes the full shared output.
+                let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+                crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
+                    crate::moe::dsv4_shared_expert_forward(
+                        &self.ctx,
+                        &self.ctx.stream,
+                        &layer.moe,
+                        &normed,
+                        &mut shared,
+                        self.config.swiglu_limit,
+                        if use_moe_decode_scratch {
+                            Some(&mut slot.moe_decode_scratch[layer_idx])
+                        } else {
+                            None
+                        },
+                        &mut keepalive,
+                    )
+                })?;
+                shared
+            };
             keepalive.keep_hidden(&shared);
+            if let Some(fence) = shared_ready.as_ref() {
+                ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
+            }
             // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
             let mut moe_with_shared =
                 unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
@@ -1226,6 +1291,7 @@ impl Dsv4Model {
         let mut shared = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
         crate::moe::dsv4_shared_expert_forward(
             ctx,
+            &ctx.stream,
             &layer.moe,
             &ffn_normed,
             &mut shared,
@@ -1503,6 +1569,7 @@ impl Dsv4Model {
                 )?;
                 crate::moe::dsv4_shared_expert_forward(
                     &self.ctx,
+                    &self.ctx.stream,
                     &layer.moe,
                     ffn_normed,
                     shared,
@@ -1666,6 +1733,13 @@ fn dsv4_use_deepep_transport() -> Result<bool> {
 fn dsv4_decode_graph_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+fn dsv4_comm_overlap_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_COMM_OVERLAP").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }
