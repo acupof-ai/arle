@@ -81,26 +81,21 @@ impl Dsv4MlaKvArena {
     }
 
     /// Allocate the flat device FP8 KV arena the FlashMLA sparse-FP8 decode reads.
-    ///
-    /// GATED (perf path, not correctness): only the FlashMLA decode launch
-    /// (`dsv4_fp8_kv_pack` → `*_decode_sched_meta` →
-    /// `arle_flashmla_sm90_sparse_decode_fwd` → `arle_dsv4_output_inverse_rope_*`)
-    /// consumes this arena. The correctness-complete bf16 MLA core
-    /// ([`crate::attention::mla_attention`]) attends over the bf16 SW ring cache +
-    /// bf16 compressed pool (`dsv4_hybrid_attention_cuda`) instead, so this stays
-    /// unwired — allocating it now reserves device bytes nothing reads yet. The
-    /// lead can flip on the FP8 decode path once the bf16 forward parity-matches
-    /// the oracle.
-    #[allow(dead_code)]
     pub(crate) fn alloc_fp8_arena(
         &self,
-        _ctx: &DeviceContext,
-        _num_blocks: usize,
+        ctx: &DeviceContext,
+        num_blocks: usize,
     ) -> Result<CudaSlice<u8>> {
-        anyhow::bail!(
-            "DSv4 MLA FP8 KV arena alloc (FlashMLA sparse-FP8 decode) is a perf path; the \
-             bf16 MLA core attends over the SW ring + bf16 compressed pool"
-        )
+        ensure!(num_blocks > 0, "DSv4 FP8 KV arena needs at least one block");
+        let rows = num_blocks
+            .checked_mul(self.page_block_size)
+            .ok_or_else(|| anyhow!("DSv4 FP8 KV arena row count overflow"))?;
+        let bytes = rows
+            .checked_mul(self.bytes_per_token)
+            .ok_or_else(|| anyhow!("DSv4 FP8 KV arena byte size overflow"))?;
+        ctx.stream
+            .alloc_zeros::<u8>(bytes)
+            .map_err(|e| anyhow!("DSv4 FP8 KV arena alloc failed ({bytes} bytes): {e}"))
     }
 }
 
@@ -150,6 +145,7 @@ pub(crate) struct Dsv4Attention {
     pub wo_a: DeviceMatrix,
     pub wo_b: DeviceMatrix,
     pub attn_sink: DeviceVec,
+    pub attn_sink_f32: CudaSlice<f32>,
     pub compressor: Option<Dsv4Compressor>,
     pub indexer: Option<Dsv4Indexer>,
 }
@@ -459,12 +455,21 @@ impl Dsv4SlotState {
         let mut attention = Vec::with_capacity(model.layers.len());
         let mut moe_decode_scratch = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
+            let local_width = layer.attention.wq_b.rows;
+            ensure!(
+                local_width.is_multiple_of(model.config.head_dim),
+                "DSv4 slot attention local width {local_width} is not a multiple of head_dim {}",
+                model.config.head_dim
+            );
             attention.push(crate::attention::Dsv4LayerAttentionState::new(
                 &model.ctx,
                 &model.config,
                 layer.mode,
                 layer.compress_ratio,
                 max_seq_len,
+                &model.kv_arena,
+                local_width / model.config.head_dim,
+                model.tp.config().world_size,
             )?);
             moe_decode_scratch.push(crate::moe::Dsv4MoeDecodeScratch::new(
                 &model.ctx,
@@ -646,7 +651,12 @@ impl Dsv4Model {
         let eps = self.config.rms_norm_eps;
         let use_gpu_router = std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some();
         let use_deepep_transport = dsv4_use_deepep_transport()?;
-        if dsv4_decode_graph_enabled() && seq_len == 1 && use_gpu_router && !use_deepep_transport {
+        if dsv4_decode_graph_enabled()
+            && !crate::attention::dsv4_flashmla_decode_enabled()?
+            && seq_len == 1
+            && use_gpu_router
+            && !use_deepep_transport
+        {
             return self.forward_tokens_decode_graph(slot, tokens[0], start_pos, params, position);
         }
         let use_moe_decode_scratch = use_gpu_router && seq_len == 1 && !use_deepep_transport;
@@ -721,7 +731,7 @@ impl Dsv4Model {
                     &mut slot.attention[layer_idx],
                     start_pos,
                     start_pos_device,
-                    self.tp.config().rank,
+                    &self.tp,
                     &mut attn_out,
                     &mut keepalive,
                 )?;
@@ -993,7 +1003,7 @@ impl Dsv4Model {
                         attn_state,
                         start_pos,
                         Some(&slot.start_pos_device),
-                        self.tp.config().rank,
+                        &self.tp,
                         attn_out,
                         &mut keepalive,
                     )
@@ -1061,7 +1071,7 @@ impl Dsv4Model {
                         attn_state,
                         start_pos,
                         Some(&slot.start_pos_device),
-                        self.tp.config().rank,
+                        &self.tp,
                         attn_out,
                         &mut keepalive,
                     )?;
