@@ -37,7 +37,10 @@ mod real {
 #[cfg(feature = "cuda")]
 mod real {
     use anyhow::{Context, Result, bail};
-    use infer_cuda::{CudaExecutor, CudaKvPool, set_dsv4_flashmla_decode_override};
+    use infer_cuda::{
+        CudaExecutor, CudaKvPool, print_dsv4_linear_profile, reset_dsv4_linear_profile,
+        set_dsv4_flashmla_decode_override, set_dsv4_fused_wqkv_decode_override,
+    };
     use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
     use infer_seam::{BackendExecutor, KvPool, PollResult};
     use std::time::Instant;
@@ -58,12 +61,14 @@ mod real {
     struct Variant {
         name: &'static str,
         flashmla: bool,
+        fused_wqkv: bool,
     }
 
     #[derive(Debug)]
     struct VariantResult {
         name: &'static str,
         flashmla: bool,
+        fused_wqkv: bool,
         tokens: Vec<u32>,
         prefill_ms: f64,
         decode_ms: f64,
@@ -165,6 +170,9 @@ mod real {
         // variant is scalar. Dispatch is controlled by the process-local override
         // below; allocation is a separate load-time capability gate.
         set_env_var("ARLE_DSV4_FLASHMLA_DECODE_ALLOC", "1");
+        if variants.iter().any(|v| v.fused_wqkv) {
+            set_env_var("ARLE_DSV4_FUSED_WQKV_DECODE_ALLOC", "1");
+        }
         if !env_flag("INFER_DSV4_AB_ALLOW_GRAPH") {
             set_env_var("ARLE_DSV4_DECODE_GRAPH", "0");
         }
@@ -216,6 +224,7 @@ mod real {
             }
         }
         set_dsv4_flashmla_decode_override(None);
+        set_dsv4_fused_wqkv_decode_override(None);
         Ok(())
     }
 
@@ -228,7 +237,9 @@ mod real {
         profile_variant: Option<&str>,
     ) -> Result<VariantResult> {
         set_dsv4_flashmla_decode_override(Some(variant.flashmla));
+        set_dsv4_fused_wqkv_decode_override(Some(variant.fused_wqkv));
         set_env_var("INFER_DSV4_AB_CURRENT_VARIANT", variant.name);
+        reset_dsv4_linear_profile();
 
         // DSv4 does not use the host page pool, but the BackendExecutor seam
         // still carries one. Recreate it per variant so host bookkeeping starts
@@ -276,12 +287,14 @@ mod real {
             cuda_profiler_stop()
                 .with_context(|| format!("cudaProfilerStop for {}", variant.name))?;
         }
+        print_dsv4_linear_profile(variant.name);
         let decode_steps = tokens.len().saturating_sub(1);
         let timed_decode_steps = decode_steps.saturating_sub(warmup_decode_steps);
 
         Ok(VariantResult {
             name: variant.name,
             flashmla: variant.flashmla,
+            fused_wqkv: variant.fused_wqkv,
             tokens,
             prefill_ms,
             decode_ms,
@@ -315,13 +328,14 @@ mod real {
             Some(idx) => format!("FAIL@{idx}"),
         };
         println!(
-            "ab_variant={} rep={} flashmla={} tokens={:?} oracle16={} scalar_ref={} \
+            "ab_variant={} rep={} flashmla={} fused_wqkv={} tokens={:?} oracle16={} scalar_ref={} \
              load_ms={:.3} prefill_ms={:.3} decode_steps={} decode_ms={:.3} \
              decode_tok_s={:.3} warmup_decode_steps={} timed_decode_steps={} \
              timed_decode_ms={:.3} steady_tok_s={:.3}",
             result.name,
             rep,
             u8::from(result.flashmla),
+            u8::from(result.fused_wqkv),
             result.tokens,
             oracle16_text,
             scalar_ref_text,
@@ -466,14 +480,28 @@ mod real {
                 "scalar" | "bf16" | "baseline" => variants.push(Variant {
                     name: "scalar",
                     flashmla: false,
+                    fused_wqkv: false,
                 }),
-                "flashmla" | "flash" | "fused" => variants.push(Variant {
+                "flashmla" | "flash" => variants.push(Variant {
                     name: "flashmla",
                     flashmla: true,
+                    fused_wqkv: false,
+                }),
+                "fused_wqkv" | "fused_linear" | "flashmla_fused" | "flashmla_fused_wqkv" => {
+                    variants.push(Variant {
+                        name: "flashmla_fused_wqkv",
+                        flashmla: true,
+                        fused_wqkv: true,
+                    })
+                }
+                "scalar_fused_wqkv" => variants.push(Variant {
+                    name: "scalar_fused_wqkv",
+                    flashmla: false,
+                    fused_wqkv: true,
                 }),
                 other => bail!(
                     "unsupported INFER_DSV4_AB_VARIANTS item `{other}` \
-                     (expected scalar or flashmla)"
+                     (expected scalar, flashmla, flashmla_fused_wqkv)"
                 ),
             }
         }
