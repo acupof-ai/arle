@@ -245,3 +245,39 @@ old `ARLE_DSV4_FP8_GEMV_MMA` path was corrupt+slower (token1) — don't flip it;
 fix the block-scale handling or go through DeepGEMM. License: prefill+decode
 wall-clock A/B (double-win), 16/16, ncu tensor/BW re-check. (Hybrid attention is
 the second shared floor — next after the GEMV.)
+
+## 10. SGLang on the SAME H20 — the real ceiling is ~16 ms, ARLE has a 2.47× gap (2026-06-05)
+
+Ground-truth A/B (not source survey): SGLang run on the same 8×H20 pod, DeepSeek
+**V3.2** (the V4-Flash checkpoint's FP8 layout isn't SGLang-loadable — `_load_w13`
+shape mismatch — so V3.2, same MLA + FP8-MoE family), TP=8, FP8, kv_cache fp8,
+FlashMLA backend (`nsa`/`flashmla_kv`). Unprofiled steady-state decode, single
+request:
+
+| | decode | ms/token |
+|---|---|---|
+| **SGLang (V3.2, H20)** | **62.95 tok/s** | **15.89** |
+| ARLE (DSv4, H20) | 25.5 tok/s | 39.5 |
+
+**So 5–6 ms is confirmed an H100/H800 number — even SGLang only does ~16 ms on
+H20. The real H20 target is ~16 ms, and ARLE has a genuine ~2.47× gap** (kernel
+work is *licensed*, not diminishing). SGLang's torch-profile per-op (16 ms/token,
+8-rank kernel-only aggregate):
+
+| Stage | SGLang ms/token | % | ARLE comparison |
+|---|---|---|---|
+| FP8 dense GEMM (`sm90_fp8_gemm_1d2d` WGMMA) | 4.94 | 31.1% | ARLE = scalar `dsv4_fp8_gemv` (the #1 floor) → **DeepGEMM dense, §9** |
+| MoE route + MoE GEMM | 4.78 | 30.1% | ARLE already DeepGEMM (close) |
+| Norm / HC misc | 2.21 | 13.9% | |
+| MLA attention (`flash_fwd_splitkv_mla_fp8_sparse`) | 2.02 | 12.7% | ARLE hybrid ≈ 11.8 ms → **~6× gap, FlashMLA, the #2 lever** |
+| allreduce / comm | 1.61 | 10.1% | |
+| quant/dequant | 0.93 | 5.8% | |
+| lm_head / sample | 0.17 | 1.1% | |
+
+The two ARLE levers and their concrete targets: **FP8 dense GEMM → 4.94 ms** (the
+in-progress DeepGEMM `sm90_fp8_gemm_1d2d` alignment) and **hybrid MLA attention →
+2.02 ms** (FlashMLA `splitkv_mla` port + ARLE's SW/CSA/HCA on top). Closing both
+moves ARLE from 39.5 → toward ~16–20 ms on H20. Profile artifacts (pod):
+`sglang_h20_profile_v32_decode/`. Caveat: V3.2 vs DSv4 (same family, same HW) —
+directionally decisive, the per-DSv4-op target re-confirms once the DeepGEMM
+dense lands.
