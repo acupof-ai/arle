@@ -256,6 +256,14 @@ impl BackendExecutor for MetalExecutor {
         }
         Vec::new()
     }
+
+    fn warmup(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_mut() {
+            return real.warmup();
+        }
+        Ok(())
+    }
 }
 
 /// A greedy decode step whose `step_session` was already issued (async) for the
@@ -281,6 +289,43 @@ struct RealMetalExecutor {
 
 #[cfg(feature = "metal")]
 impl RealMetalExecutor {
+    /// Pre-build (JIT-compile) the prefill + decode MLX graphs at load so turn-0
+    /// is not cold. After the steady-decode pipeline recovery
+    /// (`wins/2026-06-04-metal-rewrite-decode-pipeline-recovery`), the residual
+    /// turn-wall gap is turn-0's lazy graph build + first MoE encode landing on
+    /// the first real request. A tiny throwaway forward on a reserved warmup slot
+    /// (never published to the kv pool) pre-pays that JIT at load instead. Opt
+    /// out with `INFER_METAL_WARMUP=0`.
+    fn warmup(&mut self) -> anyhow::Result<()> {
+        let on = std::env::var("INFER_METAL_WARMUP")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        eprintln!("[infer-metal] warmup (INFER_METAL_WARMUP) = {on}");
+        if !on {
+            return Ok(());
+        }
+        let _guard = mlx_sys::mlx_guard();
+        let model = self.weights.cpp_model()?;
+        // Throwaway warmup state: a reserved slot id, tiny cache, never inserted
+        // into `self.slots` or published to the kv pool. Token id 0 is a valid
+        // vocab index; the output is discarded — only the graph JIT matters.
+        let mut state = MetalSlotState::new(usize::MAX, 0, &self.config, 8);
+        state.ensure_session_active(model)?;
+        // Tiny prefill → JIT the prefill graph + first MoE encode.
+        let prefill = mlx::MlxArray::from_slice_i32(&[0, 0], &[2]);
+        let logits = model.prefill_session(&prefill, 2, 0)?;
+        mlx::async_eval(&[&logits]);
+        state.cache_len = 2;
+        // One decode step → JIT the decode-step graph.
+        let step = mlx::MlxArray::from_slice_i32(&[0], &[1]);
+        let logits = model.step_session(&step, state.cache_len as i32)?;
+        mlx::async_eval(&[&logits]);
+        state.cache_len += 1;
+        // Blocking materialize so the JIT completes before the first request.
+        state.drain_session(model)?;
+        Ok(())
+    }
+
     fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> anyhow::Result<MetalInflight> {
         let _guard = mlx_sys::mlx_guard();
         let row_count = plan.prefill_rows.len() + plan.decode_rows.len();
