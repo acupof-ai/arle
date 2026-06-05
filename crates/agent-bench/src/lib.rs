@@ -1260,6 +1260,584 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // DSv4 KV-precision-parity gate (re-port of the deleted
+    // `infer/tests/kv_precision_parity.rs`).
+    //
+    // WHY: every DSv4 decode win this session (FlashMLA +18%, fused wqkv +5%,
+    // contiguous MoE +12.78%) ships default-OFF because there was no re-ported
+    // cross-precision gate to license a default flip. This is that gate.
+    //
+    // DSv4 KV PRECISION SURFACE (verified against `infer-cuda/src/attention.rs`
+    // + `dsv4.rs`, 2026-06): the DSv4 decode attention path exposes exactly two
+    // KV precisions, selected at runtime — not via a `KVCacheDtype`/`KVFormat`
+    // enum (those were `infer::model::*` types deleted in the R5 cutover), but
+    // via process-local dispatch overrides + gate envs:
+    //   * scalar bf16 REFERENCE — `set_dsv4_flashmla_decode_override(Some(false))`
+    //     (== `ARLE_DSV4_FLASHMLA_DECODE=0`). Decode reads the BF16 window cache.
+    //   * FlashMLA FP8-KV     — `set_dsv4_flashmla_decode_override(Some(true))`
+    //     (== `ARLE_DSV4_FLASHMLA_DECODE=1`). Decode packs the KV into the FP8
+    //     arena (`dsv4.rs` `fp8_kv_pool`, `dsv4_fp8_kv_pack`).
+    // There is NO INT8 / TQ4 / TurboQuant KV path for DSv4 — the legacy
+    // `KVFormat::{INT8, FP8E4M3, TurboQuant}` matrix targeted the dense Qwen3
+    // paged pool, which DSv4 does not use. So INT8 ≥ 99% / TQ4 ≥ 80% gates have
+    // no precision to bind to here and are intentionally OMITTED (documented,
+    // not faked). The fused-wqkv / contiguous-MoE wins are decode *compute*
+    // variants on top of the FP8-KV path; they are exercised as extra
+    // report-only rows so a single audit covers all three default-flip
+    // candidates against the same scalar reference.
+    //
+    // GATE (legacy thresholds, mapped to the precisions that exist):
+    //   * scalar self-parity = 100% (sanity: the reference vs itself).
+    //   * FlashMLA FP8-KV ≥ 95% trajectory match vs scalar bf16 — THIS is the
+    //     gate that licenses the `ARLE_DSV4_FLASHMLA_DECODE` default flip.
+    //   * fused-wqkv / contig-MoE rows are report-only (compute fusions, not a
+    //     new KV precision; license via the perf A/B + this trajectory monitor).
+    //
+    // DEGENERATE-BASELINE GUARD (per
+    // `errors/2026-05-26-fp8-kv-catastrophic-was-test-artifact.md`): if the
+    // scalar reference collapses to a single-token repetition loop, trajectory
+    // match measures noise-fidelity, not quality — warn loudly and skip the
+    // gate assertion rather than draw a false conclusion.
+    //
+    // OUTPUT: per-precision metrics to `target/kv-parity-dsv4-<unix>.json`.
+    //
+    // ENV KNOBS (mirroring the legacy gate where they map):
+    //   * INFER_DSV4_MODEL_PATH  required — DSv4 FP8 safetensors dir.
+    //   * INFER_DSV4_PROMPT_IDS  comma-separated DeepSeek ids per prompt; repeat
+    //                            the flag-less list separated by `;` for multiple
+    //                            prompts. Defaults to one ORACLE-anchored prompt.
+    //   * KV_PARITY_PROMPTS      cap the number of prompts used (default = all).
+    //   * KV_PARITY_MAX_TOKENS / KV_PARITY_PROFILE  decode horizon (64 full /
+    //                            4 smoke), same semantics as the legacy gate.
+    // -----------------------------------------------------------------------
+
+    /// One DSv4 KV/attention precision (or compute variant) under audit.
+    #[cfg(feature = "cuda")]
+    #[derive(Clone, Copy, Debug)]
+    struct Dsv4PrecisionCase {
+        name: &'static str,
+        /// `ARLE_DSV4_FLASHMLA_DECODE` dispatch (false = scalar bf16 reference).
+        flashmla: bool,
+        /// Fused wqkv decode linear (compute variant on the FP8-KV path).
+        fused_wqkv: bool,
+        /// Contiguous-MoE decode (compute variant on the FP8-KV path).
+        contig_moe: bool,
+        /// Minimum trajectory match (mean over prompts) to pass the gate.
+        /// `None` = report-only.
+        gate_trajectory: Option<f32>,
+    }
+
+    #[cfg(feature = "cuda")]
+    fn dsv4_precision_matrix() -> Vec<Dsv4PrecisionCase> {
+        vec![
+            Dsv4PrecisionCase {
+                name: "scalar_bf16",
+                flashmla: false,
+                fused_wqkv: false,
+                contig_moe: false,
+                gate_trajectory: Some(1.0), // self-parity reference
+            },
+            Dsv4PrecisionCase {
+                name: "flashmla_fp8",
+                flashmla: true,
+                fused_wqkv: false,
+                contig_moe: false,
+                // The FP8-KV gate. ≥ 0.95 licenses the FlashMLA default flip.
+                gate_trajectory: Some(0.95),
+            },
+            // Compute fusions on top of FP8-KV — report-only (no new KV
+            // precision; the perf A/B + this trajectory monitor license them).
+            Dsv4PrecisionCase {
+                name: "flashmla_fp8_fused_wqkv",
+                flashmla: true,
+                fused_wqkv: true,
+                contig_moe: false,
+                gate_trajectory: None,
+            },
+            Dsv4PrecisionCase {
+                name: "flashmla_fp8_fused_wqkv_contig_moe",
+                flashmla: true,
+                fused_wqkv: true,
+                contig_moe: true,
+                gate_trajectory: None,
+            },
+        ]
+    }
+
+    /// Result of decoding the prompt set under one precision.
+    #[cfg(feature = "cuda")]
+    #[derive(Debug)]
+    struct Dsv4PrecisionResult {
+        name: &'static str,
+        /// Per-prompt generated token id sequences.
+        sequences: Vec<Vec<u32>>,
+    }
+
+    /// Trajectory diff of a candidate precision against the scalar reference.
+    #[cfg(feature = "cuda")]
+    #[derive(Debug)]
+    struct Dsv4DiffRow {
+        name: &'static str,
+        per_prompt_match: Vec<f32>,
+        mean_match: f32,
+        first_diverging_prompt: Option<usize>,
+        first_diverging_step: Option<usize>,
+        gate: Option<f32>,
+        gate_passed: Option<bool>,
+    }
+
+    /// Decode horizon: explicit `KV_PARITY_MAX_TOKENS`, else 64 (full) / 4
+    /// (smoke) via `KV_PARITY_PROFILE` — same semantics as the legacy gate's
+    /// `support/kv_parity_config.rs`.
+    #[cfg(feature = "cuda")]
+    fn dsv4_kv_parity_max_tokens() -> Result<usize> {
+        if let Ok(raw) = std::env::var("KV_PARITY_MAX_TOKENS") {
+            let parsed: usize = raw
+                .parse()
+                .map_err(|e| anyhow::anyhow!("parse KV_PARITY_MAX_TOKENS={raw:?}: {e}"))?;
+            anyhow::ensure!(parsed > 0, "KV_PARITY_MAX_TOKENS must be > 0");
+            return Ok(parsed);
+        }
+        Ok(match std::env::var("KV_PARITY_PROFILE").ok().as_deref() {
+            None | Some("") | Some("full") | Some("FULL") => 64,
+            Some("smoke") | Some("SMOKE") => 4,
+            Some(other) => {
+                anyhow::bail!("unsupported KV_PARITY_PROFILE={other:?}; expected 'full' or 'smoke'")
+            }
+        })
+    }
+
+    /// Default prompt set as DeepSeek token ids. Anchored on the ORACLE prompt
+    /// used by the resident A/B example so a base-model greedy continuation is
+    /// coherent (avoids the degenerate `!`-loop regime). Override with
+    /// `INFER_DSV4_PROMPT_IDS` (`;`-separated lists for multiple prompts).
+    #[cfg(feature = "cuda")]
+    fn dsv4_default_prompts() -> Vec<Vec<u32>> {
+        vec![
+            vec![671, 6102, 294, 8760, 344],
+            vec![603, 671, 6102, 294, 8760, 344, 11111],
+        ]
+    }
+
+    #[cfg(feature = "cuda")]
+    fn dsv4_parse_prompts(raw: &str) -> Result<Vec<Vec<u32>>> {
+        let mut prompts = Vec::new();
+        for chunk in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let ids: Vec<u32> = chunk
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| {
+                    t.parse::<u32>().map_err(|e| {
+                        anyhow::anyhow!("bad token id `{t}` in INFER_DSV4_PROMPT_IDS: {e}")
+                    })
+                })
+                .collect::<Result<_>>()?;
+            anyhow::ensure!(!ids.is_empty(), "empty prompt in INFER_DSV4_PROMPT_IDS");
+            prompts.push(ids);
+        }
+        anyhow::ensure!(!prompts.is_empty(), "INFER_DSV4_PROMPT_IDS resolved empty");
+        Ok(prompts)
+    }
+
+    /// Greedy sampling params (temperature 0 = argmax). Same contract as the
+    /// resident A/B example's `greedy()`.
+    #[cfg(feature = "cuda")]
+    fn dsv4_greedy() -> infer_plan::SamplingParams {
+        infer_plan::SamplingParams::default()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn dsv4_prefill_plan(tokens: &[u32]) -> ForwardPlan {
+        ForwardPlan {
+            mode: infer_plan::ForwardMode::Prefill,
+            decode_rows: Vec::new(),
+            prefill_rows: vec![infer_plan::PrefillRow {
+                slot: 0,
+                tokens: tokens.to_vec(),
+                start_pos: 0,
+                total_tokens: tokens.len(),
+                params: dsv4_greedy(),
+            }],
+            microbatch: None,
+            spec: None,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn dsv4_decode_plan(last_token: u32, kv_seq_len: usize) -> ForwardPlan {
+        ForwardPlan {
+            mode: infer_plan::ForwardMode::Decode,
+            decode_rows: vec![infer_plan::DecodeRow {
+                slot: 0,
+                last_token,
+                kv_seq_len,
+                params: dsv4_greedy(),
+            }],
+            prefill_rows: Vec::new(),
+            microbatch: None,
+            spec: None,
+        }
+    }
+
+    /// One forward step through the resident DSv4 executor (mirrors the
+    /// `forward_once` helper in `infer-cuda/examples/dsv4_resident_ab.rs`).
+    #[cfg(feature = "cuda")]
+    fn dsv4_forward_once(
+        exec: &mut infer_cuda::CudaExecutor,
+        kv: &mut infer_cuda::CudaKvPool,
+        plan: ForwardPlan,
+    ) -> Result<u32> {
+        let inflight = exec.submit(&plan, kv as &mut dyn KvPool)?;
+        match exec.poll(inflight)? {
+            PollResult::Ready(out) => out
+                .tokens
+                .first()
+                .map(|t| t.token)
+                .ok_or_else(|| anyhow::anyhow!("DSv4 step produced no token")),
+            PollResult::NotReady(_) => {
+                anyhow::bail!("DSv4 executor resolves synchronously; got NotReady")
+            }
+        }
+    }
+
+    /// Run the prompt set under one precision: select dispatch via the process-
+    /// local overrides + contig-MoE env, then greedy-decode each prompt to
+    /// `max_tokens`. A fresh `CudaKvPool` per prompt resets host bookkeeping
+    /// alongside the executor's prefill `start_pos=0`.
+    #[cfg(feature = "cuda")]
+    fn dsv4_run_precision(
+        exec: &mut infer_cuda::CudaExecutor,
+        case: Dsv4PrecisionCase,
+        prompts: &[Vec<u32>],
+        max_tokens: usize,
+    ) -> Result<Dsv4PrecisionResult> {
+        infer_cuda::set_dsv4_flashmla_decode_override(Some(case.flashmla));
+        infer_cuda::set_dsv4_fused_wqkv_decode_override(Some(case.fused_wqkv));
+        // SAFETY: the gate drives a single thread per precision and mutates env
+        // only between (not during) executor steps; the DSv4 decode path reads
+        // ARLE_DSV4_MOE_CONTIG_DECODE per step.
+        unsafe {
+            std::env::set_var(
+                "ARLE_DSV4_MOE_CONTIG_DECODE",
+                if case.contig_moe { "1" } else { "0" },
+            );
+        }
+
+        let mut sequences = Vec::with_capacity(prompts.len());
+        for (idx, prompt) in prompts.iter().enumerate() {
+            // One slot, page_size 16; DSv4 owns device KV internally, the host
+            // pool only paginates the logical token budget.
+            let mut kv = infer_cuda::CudaKvPool::new(1, 8192, 16);
+            let first = dsv4_forward_once(exec, &mut kv, dsv4_prefill_plan(prompt))?;
+            let mut tokens = vec![first];
+            for step in 1..max_tokens {
+                let kv_seq_len = prompt.len() + step - 1;
+                let last = *tokens.last().expect("tokens is non-empty");
+                let tok = dsv4_forward_once(exec, &mut kv, dsv4_decode_plan(last, kv_seq_len))?;
+                tokens.push(tok);
+            }
+            eprintln!(
+                "[kv-parity-dsv4] precision={} prompt[{}/{}] tokens={}",
+                case.name,
+                idx + 1,
+                prompts.len(),
+                tokens.len()
+            );
+            sequences.push(tokens);
+        }
+        Ok(Dsv4PrecisionResult {
+            name: case.name,
+            sequences,
+        })
+    }
+
+    /// Trajectory match = common-prefix-length / max(reference_len, 1), averaged
+    /// over prompts (the legacy `diff_against_reference` logic).
+    #[cfg(feature = "cuda")]
+    fn dsv4_diff_against_reference(
+        reference: &Dsv4PrecisionResult,
+        candidate: &Dsv4PrecisionResult,
+        gate: Option<f32>,
+    ) -> Dsv4DiffRow {
+        assert_eq!(
+            reference.sequences.len(),
+            candidate.sequences.len(),
+            "reference and candidate must share prompt count"
+        );
+        let mut per_prompt_match = Vec::with_capacity(reference.sequences.len());
+        let mut first_diverging_prompt = None;
+        let mut first_diverging_step = None;
+        for (idx, (ref_seq, cand_seq)) in reference
+            .sequences
+            .iter()
+            .zip(candidate.sequences.iter())
+            .enumerate()
+        {
+            let mut common = 0usize;
+            while common < ref_seq.len()
+                && common < cand_seq.len()
+                && ref_seq[common] == cand_seq[common]
+            {
+                common += 1;
+            }
+            let denom = ref_seq.len().max(1);
+            per_prompt_match.push(common as f32 / denom as f32);
+            if first_diverging_prompt.is_none()
+                && (common < ref_seq.len().min(cand_seq.len()) || ref_seq.len() != cand_seq.len())
+            {
+                first_diverging_prompt = Some(idx);
+                first_diverging_step = Some(common);
+            }
+        }
+        let mean_match = if per_prompt_match.is_empty() {
+            0.0
+        } else {
+            per_prompt_match.iter().sum::<f32>() / per_prompt_match.len() as f32
+        };
+        let gate_passed = gate.map(|g| mean_match >= g - 1e-6);
+        Dsv4DiffRow {
+            name: candidate.name,
+            per_prompt_match,
+            mean_match,
+            first_diverging_prompt,
+            first_diverging_step,
+            gate,
+            gate_passed,
+        }
+    }
+
+    /// Emit `target/kv-parity-dsv4-<unix>.json` (hand-rolled, no serde dep —
+    /// matches the bench crate's `metal_greedy_parity_gold` style).
+    #[cfg(feature = "cuda")]
+    fn dsv4_write_json_report(
+        max_tokens: usize,
+        num_prompts: usize,
+        degenerate: bool,
+        rows: &[Dsv4DiffRow],
+    ) -> Result<std::path::PathBuf> {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target");
+        std::fs::create_dir_all(&dir).ok();
+        let out = dir.join(format!("kv-parity-dsv4-{unix}.json"));
+
+        let mut buf = String::new();
+        buf.push_str("{\n");
+        buf.push_str("  \"model\": \"dsv4\",\n");
+        buf.push_str(&format!("  \"unix_ts\": {unix},\n"));
+        buf.push_str(&format!("  \"max_tokens\": {max_tokens},\n"));
+        buf.push_str(&format!("  \"num_prompts\": {num_prompts},\n"));
+        buf.push_str(&format!("  \"degenerate_baseline\": {degenerate},\n"));
+        buf.push_str("  \"precisions\": [\n");
+        for (i, row) in rows.iter().enumerate() {
+            let trailing = if i + 1 == rows.len() { "" } else { "," };
+            buf.push_str("    {\n");
+            buf.push_str(&format!("      \"name\": \"{}\",\n", row.name));
+            buf.push_str(&format!("      \"mean_match\": {:.6},\n", row.mean_match));
+            buf.push_str(&format!(
+                "      \"per_prompt_match\": [{}],\n",
+                row.per_prompt_match
+                    .iter()
+                    .map(|v| format!("{v:.4}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            match (row.first_diverging_prompt, row.first_diverging_step) {
+                (Some(p), Some(s)) => {
+                    buf.push_str(&format!("      \"first_diverging_prompt\": {p},\n"));
+                    buf.push_str(&format!("      \"first_diverging_step\": {s},\n"));
+                }
+                _ => {
+                    buf.push_str("      \"first_diverging_prompt\": null,\n");
+                    buf.push_str("      \"first_diverging_step\": null,\n");
+                }
+            }
+            match (row.gate, row.gate_passed) {
+                (Some(g), Some(p)) => {
+                    buf.push_str(&format!("      \"gate\": {g:.4},\n"));
+                    buf.push_str(&format!("      \"gate_passed\": {p}\n"));
+                }
+                _ => {
+                    buf.push_str("      \"gate\": null,\n");
+                    buf.push_str("      \"gate_passed\": null\n");
+                }
+            }
+            buf.push_str(&format!("    }}{trailing}\n"));
+        }
+        buf.push_str("  ]\n}\n");
+        std::fs::write(&out, buf).map_err(|e| anyhow::anyhow!("write kv-parity report: {e}"))?;
+        Ok(out)
+    }
+
+    /// DSv4 KV-precision-parity gate. Loads the executor ONCE, runs the same
+    /// prompt set through every precision, computes trajectory match vs the
+    /// scalar bf16 reference, and asserts the FP8 ≥ 95% gate that licenses the
+    /// FlashMLA default flip. Needs an 8×H20 pod + DSv4 weights — `#[ignore]`d
+    /// so CI stays green (mirrors `cuda_*_greedy_parity` / `metal_*_greedy_parity`).
+    ///
+    /// Run (pod):
+    ///   CUDARC_CUDA_VERSION=12090 INFER_DSV4_MODEL_PATH=/path/to/dsv4-fp8 \
+    ///     cargo test --release -p agent-bench --features cuda \
+    ///     dsv4_kv_precision_parity -- --ignored --nocapture --test-threads=1
+    /// (multi-rank TP=8: add `--features cuda,nccl` + INFER_NCCL_ID_FILE per the
+    /// resident A/B harness; this single-rank form is the default driving shape.)
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "DSv4 KV-precision-parity gate; needs --features cuda + 8xH20 pod + DSv4 FP8 weights"]
+    fn dsv4_kv_precision_parity() -> Result<()> {
+        let model_path = std::env::var("INFER_DSV4_MODEL_PATH").map_err(|_| {
+            anyhow::anyhow!(
+                "INFER_DSV4_MODEL_PATH must point at the DSv4 FP8 safetensors directory"
+            )
+        })?;
+
+        let max_tokens = dsv4_kv_parity_max_tokens()?;
+        let mut prompts = match std::env::var("INFER_DSV4_PROMPT_IDS") {
+            Ok(raw) => dsv4_parse_prompts(&raw)?,
+            Err(_) => dsv4_default_prompts(),
+        };
+        if let Some(cap) = std::env::var("KV_PARITY_PROMPTS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            prompts.truncate(cap.max(1));
+        }
+        let cases = dsv4_precision_matrix();
+
+        eprintln!(
+            "[kv-parity-dsv4] model={model_path} tokens/prompt={max_tokens} \
+             prompts={} precisions={}",
+            prompts.len(),
+            cases.len()
+        );
+
+        // The FlashMLA FP8 arena is a load-time capability gate independent of
+        // per-step dispatch; allocate it so the scalar-first ordering still lets
+        // the later FlashMLA precision pack KV (mirrors the resident A/B).
+        // SAFETY: process startup, before the executor builds CUDA/NCCL state.
+        unsafe {
+            std::env::set_var("ARLE_DSV4_FLASHMLA_DECODE_ALLOC", "1");
+            std::env::set_var("ARLE_DSV4_FUSED_WQKV_DECODE_ALLOC", "1");
+            // Decode graph capture can mask step-ordering bugs; keep it off for
+            // the audit (the resident A/B defaults the same way).
+            std::env::set_var("ARLE_DSV4_DECODE_GRAPH", "0");
+        }
+
+        let mut exec = infer_cuda::CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1)
+            .map_err(|e| anyhow::anyhow!("from_dsv4_fp8_safetensors failed: {e:#}"))?;
+
+        // Reference = scalar bf16.
+        let ref_case = cases
+            .iter()
+            .find(|c| c.name == "scalar_bf16")
+            .copied()
+            .expect("scalar_bf16 must be in the matrix");
+        let reference = dsv4_run_precision(&mut exec, ref_case, &prompts, max_tokens)?;
+
+        // Degenerate-baseline guard: a scalar reference that repeats a single
+        // token makes trajectory match a noise-fidelity metric, not quality.
+        let degenerate_baseline = reference
+            .sequences
+            .iter()
+            .any(|seq| seq.len() >= 8 && seq.iter().take(8).all(|&t| t == seq[0]));
+        if degenerate_baseline {
+            let dump: Vec<&[u32]> = reference
+                .sequences
+                .iter()
+                .map(|s| &s[..s.len().min(8)])
+                .collect();
+            eprintln!(
+                "[kv-parity-dsv4] WARNING degenerate scalar reference detected (one or more \
+                 prompts repeat a single token for the first 8 generated tokens). \
+                 FP8 quality conclusions from this run are INVALID — trajectory match is \
+                 measuring noise-fidelity, not quality. Reference first-8 per prompt: {dump:?}. \
+                 SKIPPING the gate assertion (see \
+                 errors/2026-05-26-fp8-kv-catastrophic-was-test-artifact.md)."
+            );
+        }
+
+        let mut rows = vec![dsv4_diff_against_reference(
+            &reference,
+            &reference,
+            ref_case.gate_trajectory,
+        )];
+        for case in cases.iter().filter(|c| c.name != "scalar_bf16") {
+            let result = dsv4_run_precision(&mut exec, *case, &prompts, max_tokens)?;
+            // Token-level divergence dump for prompt 0 — catastrophic-vs-noise.
+            if let (Some(ref_seq), Some(cand_seq)) =
+                (reference.sequences.first(), result.sequences.first())
+            {
+                let n = ref_seq.len().min(cand_seq.len()).min(8);
+                eprintln!(
+                    "[kv-parity-dsv4] {:<34} prompt0 first{} tokens: ref={:?} cand={:?}",
+                    result.name,
+                    n,
+                    &ref_seq[..n],
+                    &cand_seq[..n]
+                );
+            }
+            rows.push(dsv4_diff_against_reference(
+                &reference,
+                &result,
+                case.gate_trajectory,
+            ));
+        }
+
+        // Restore env-driven dispatch.
+        infer_cuda::set_dsv4_flashmla_decode_override(None);
+        infer_cuda::set_dsv4_fused_wqkv_decode_override(None);
+
+        let report = dsv4_write_json_report(max_tokens, prompts.len(), degenerate_baseline, &rows)?;
+        eprintln!("[kv-parity-dsv4] report: {}", report.display());
+        for row in &rows {
+            eprintln!(
+                "[kv-parity-dsv4] {:<34} mean_match={:.4} first_div={:?}/{:?} gate={:?} passed={:?}",
+                row.name,
+                row.mean_match,
+                row.first_diverging_prompt,
+                row.first_diverging_step,
+                row.gate,
+                row.gate_passed,
+            );
+        }
+
+        if degenerate_baseline {
+            // Audit invalid — do not assert (already warned loudly above).
+            return Ok(());
+        }
+
+        // Gather every gate failure and assert once so a single run surfaces all
+        // regressed precisions (the legacy multi-line panic strategy).
+        let failed: Vec<&Dsv4DiffRow> = rows
+            .iter()
+            .filter(|r| matches!(r.gate_passed, Some(false)))
+            .collect();
+        if !failed.is_empty() {
+            let mut msg = String::from("DSv4 KV precision parity gate failures:\n");
+            for row in &failed {
+                msg.push_str(&format!(
+                    "  - {}: mean_match={:.4} < gate={:.4} (first divergence prompt={:?} step={:?})\n",
+                    row.name,
+                    row.mean_match,
+                    row.gate.unwrap_or(0.0),
+                    row.first_diverging_prompt,
+                    row.first_diverging_step,
+                ));
+            }
+            msg.push_str(&format!("Full report: {}\n", report.display()));
+            panic!("{msg}");
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Metal greedy-parity regression harness.
     //
     // The legacy `infer/src/backend/metal` path was deleted, so Metal numeric
