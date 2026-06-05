@@ -6,8 +6,9 @@
 use anyhow::{Result, anyhow, bail, ensure};
 use cuda_kernels::attention as flash_kv;
 use cuda_kernels::ffi;
+use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
-use cuda_kernels::tensor::WeightFormat;
+use cuda_kernels::tensor::{WeightFormat, cache_ptr};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use std::sync::atomic::{AtomicI8, Ordering};
@@ -25,6 +26,7 @@ const DSV4_FLASHMLA_OVERRIDE_OFF: i8 = 0;
 const DSV4_FLASHMLA_OVERRIDE_ON: i8 = 1;
 
 static DSV4_FLASHMLA_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
+static DSV4_FUSED_WQKV_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
 
 pub(crate) fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
     let value = match enabled {
@@ -33,6 +35,15 @@ pub(crate) fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
         None => DSV4_FLASHMLA_OVERRIDE_ENV,
     };
     DSV4_FLASHMLA_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
+}
+
+pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
+    let value = match enabled {
+        Some(true) => DSV4_FLASHMLA_OVERRIDE_ON,
+        Some(false) => DSV4_FLASHMLA_OVERRIDE_OFF,
+        None => DSV4_FLASHMLA_OVERRIDE_ENV,
+    };
+    DSV4_FUSED_WQKV_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
 }
 
 pub(crate) struct Dsv4CompressorState {
@@ -247,11 +258,65 @@ impl Dsv4FlashMlaDecodeState {
     }
 }
 
+struct Dsv4FusedWqkvDecodeScratch {
+    input_fp8: CudaSlice<u8>,
+    input_scales: CudaSlice<f32>,
+    qkv_raw: HiddenStates,
+    active_experts: CudaSlice<i32>,
+    active_offsets: CudaSlice<i32>,
+    active_counts: CudaSlice<i32>,
+    max_m: usize,
+    scale_stride_m: usize,
+    hidden_dim: usize,
+    q_lora_rank: usize,
+    head_dim: usize,
+}
+
+impl Dsv4FusedWqkvDecodeScratch {
+    fn new(ctx: &DeviceContext, config: &DeepSeekV4Config) -> Result<Self> {
+        let max_m = 128;
+        let scale_stride_m = 128;
+        let hidden_dim = config.hidden_size;
+        let q_lora_rank = config.q_lora_rank;
+        let head_dim = config.head_dim;
+        let scale_cols = hidden_dim.div_ceil(128);
+        Ok(Self {
+            input_fp8: ctx
+                .stream
+                .alloc_zeros::<u8>(max_m * hidden_dim)
+                .map_err(|e| anyhow!("DSv4 fused wqkv input fp8 scratch alloc failed: {e}"))?,
+            input_scales: ctx
+                .stream
+                .alloc_zeros::<f32>(scale_stride_m * scale_cols)
+                .map_err(|e| anyhow!("DSv4 fused wqkv input scale scratch alloc failed: {e}"))?,
+            qkv_raw: unsafe { HiddenStates::uninit(ctx, q_lora_rank + head_dim, 1)? },
+            active_experts: ctx
+                .stream
+                .clone_htod(&[0_i32])
+                .map_err(|e| anyhow!("DSv4 fused wqkv active_experts H2D failed: {e}"))?,
+            active_offsets: ctx
+                .stream
+                .clone_htod(&[0_i32])
+                .map_err(|e| anyhow!("DSv4 fused wqkv active_offsets H2D failed: {e}"))?,
+            active_counts: ctx
+                .stream
+                .clone_htod(&[1_i32])
+                .map_err(|e| anyhow!("DSv4 fused wqkv active_counts H2D failed: {e}"))?,
+            max_m,
+            scale_stride_m,
+            hidden_dim,
+            q_lora_rank,
+            head_dim,
+        })
+    }
+}
+
 pub(crate) struct Dsv4LayerAttentionState {
     sw_window_cache: CudaSlice<half::bf16>,
     compressor: Option<Dsv4CompressorState>,
     indexer: Option<Dsv4CompressorState>,
     flashmla: Option<Dsv4FlashMlaDecodeState>,
+    fused_wqkv: Option<Dsv4FusedWqkvDecodeScratch>,
 }
 
 impl Dsv4LayerAttentionState {
@@ -313,11 +378,17 @@ impl Dsv4LayerAttentionState {
         } else {
             None
         };
+        let fused_wqkv = if dsv4_fused_wqkv_decode_alloc_enabled()? {
+            Some(Dsv4FusedWqkvDecodeScratch::new(ctx, config)?)
+        } else {
+            None
+        };
         Ok(Self {
             sw_window_cache,
             compressor,
             indexer,
             flashmla,
+            fused_wqkv,
         })
     }
 
@@ -993,6 +1064,22 @@ fn dsv4_flashmla_decode_alloc_enabled() -> Result<bool> {
     dsv4_flashmla_decode_enabled()
 }
 
+pub(crate) fn dsv4_fused_wqkv_decode_alloc_enabled() -> Result<bool> {
+    if env_flag("ARLE_DSV4_FUSED_WQKV_DECODE_ALLOC")? {
+        return Ok(true);
+    }
+    dsv4_fused_wqkv_decode_enabled()
+}
+
+fn dsv4_fused_wqkv_decode_enabled() -> Result<bool> {
+    match DSV4_FUSED_WQKV_DECODE_OVERRIDE.load(Ordering::Relaxed) {
+        DSV4_FLASHMLA_OVERRIDE_OFF => return Ok(false),
+        DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
+        _ => {}
+    }
+    env_flag("ARLE_DSV4_FUSED_WQKV_DECODE")
+}
+
 fn env_flag(name: &str) -> Result<bool> {
     match std::env::var(name) {
         Ok(value) => match value.as_str() {
@@ -1544,6 +1631,150 @@ fn mla_rms_norm(
     Ok(out)
 }
 
+fn mla_rms_norm_decode_slice(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    offset: usize,
+    width: usize,
+    weight: &DeviceVec,
+    eps: f32,
+) -> Result<HiddenStates> {
+    ensure!(
+        x.seq_len == 1,
+        "DSv4 fused wqkv slice RMSNorm is decode-only, got seq_len={}",
+        x.seq_len
+    );
+    ensure!(
+        offset + width <= x.hidden_dim,
+        "DSv4 fused wqkv slice out of range: offset={offset} width={width} hidden_dim={}",
+        x.hidden_dim
+    );
+    ensure!(
+        weight.len == width,
+        "DSv4 fused wqkv slice norm weight len {} != slice width {width}",
+        weight.len
+    );
+    let mut out = unsafe { HiddenStates::uninit(ctx, width, 1)? };
+    {
+        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+        let x_ptr = unsafe { (x_ptr as *const ffi::Half).add(offset) };
+        unsafe {
+            ffi::rms_norm_batched_cuda(
+                x_ptr,
+                w_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                width as i32,
+                1,
+                eps,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    Ok(out)
+}
+
+fn run_fused_wqkv_decode(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    hidden: &HiddenStates,
+    scratch: &mut Dsv4FusedWqkvDecodeScratch,
+) -> Result<(HiddenStates, HiddenStates, HiddenStates)> {
+    ensure!(
+        hidden.seq_len == 1,
+        "DSv4 fused wqkv decode path requires seq_len=1, got {}",
+        hidden.seq_len
+    );
+    ensure!(
+        hidden.hidden_dim == scratch.hidden_dim && hidden.hidden_dim == config.hidden_size,
+        "DSv4 fused wqkv hidden dim mismatch: hidden={} scratch={} config={}",
+        hidden.hidden_dim,
+        scratch.hidden_dim,
+        config.hidden_size
+    );
+    ensure!(
+        scratch.q_lora_rank == attention.wq_a.rows && scratch.head_dim == attention.wkv.rows,
+        "DSv4 fused wqkv scratch shape mismatch: scratch q={} kv={} weights q={} kv={}",
+        scratch.q_lora_rank,
+        scratch.head_dim,
+        attention.wq_a.rows,
+        attention.wkv.rows
+    );
+    let cache = attention.wqkv_a_deepgemm.as_ref().ok_or_else(|| {
+        anyhow!("DSv4 fused wqkv decode requested but fused cache was not loaded")
+    })?;
+    ensure!(
+        cache.rows == scratch.q_lora_rank + scratch.head_dim && cache.cols == scratch.hidden_dim,
+        "DSv4 fused wqkv cache shape {}x{} != expected {}x{}",
+        cache.rows,
+        cache.cols,
+        scratch.q_lora_rank + scratch.head_dim,
+        scratch.hidden_dim
+    );
+    let scale_cols = scratch.hidden_dim.div_ceil(128);
+    ensure!(
+        scratch.input_scales.len() >= scratch.scale_stride_m * scale_cols,
+        "DSv4 fused wqkv scale scratch too small"
+    );
+    let stream = ctx.stream.cu_stream();
+    unsafe {
+        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+            cache_ptr(&hidden.data, ctx),
+            cache_ptr(&scratch.input_fp8, ctx),
+            cache_ptr(&scratch.input_scales, ctx),
+            cache_ptr(&scratch.active_experts, ctx),
+            cache_ptr(&scratch.active_offsets, ctx),
+            cache_ptr(&scratch.active_counts, ctx),
+            1,
+            scratch.max_m,
+            scratch.hidden_dim,
+            scratch.scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 fused wqkv activation quantize failed: {e}"))?;
+        cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+            cache_ptr(&scratch.input_fp8, ctx),
+            cache_ptr(&scratch.input_scales, ctx),
+            cache_ptr(&cache.weight, ctx),
+            cache_ptr(&cache.scales, ctx),
+            cache_ptr(&scratch.qkv_raw.data, ctx),
+            1,
+            cache.rows,
+            cache.cols,
+            scratch.scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 fused wqkv DeepGEMM dense failed: {e}"))?;
+    }
+    let c_q_normed = mla_rms_norm_decode_slice(
+        ctx,
+        &scratch.qkv_raw,
+        0,
+        scratch.q_lora_rank,
+        &attention.q_norm,
+        config.rms_norm_eps,
+    )?;
+    let kv_normed = mla_rms_norm_decode_slice(
+        ctx,
+        &scratch.qkv_raw,
+        scratch.q_lora_rank,
+        scratch.head_dim,
+        &attention.kv_norm,
+        config.rms_norm_eps,
+    )?;
+
+    let mut q_raw = unsafe { HiddenStates::uninit(ctx, attention.wq_b.rows, 1)? };
+    let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
+    crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+        dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+    })?;
+    drop(nvtx_wq_b);
+    Ok((c_q_normed, q_raw, kv_normed))
+}
+
 /// One DSv4 MLA attention block (SlidingWindow / CompressedSparse /
 /// HybridCompressed, dispatched on `mode` / `compress_ratio`).
 ///
@@ -1646,24 +1877,59 @@ pub(crate) fn mla_attention(
     let start_pos_i32 = i32::try_from(start_pos)
         .map_err(|_| anyhow::anyhow!("DSv4 MLA start_pos {start_pos} overflows i32"))?;
 
-    // ── 1. Q-LoRA: wq_a (down) → q_norm RMSNorm → wq_b (up to per-head Q).
-    // SAFETY: dsv4_linear writes the full c_q buffer.
-    let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
-    dsv4_linear(ctx, &attention.wq_a, hidden, &mut c_q)?;
-    keepalive.keep_hidden(&c_q);
-    let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
-    keepalive.keep_hidden(&c_q_normed);
-    // SAFETY: dsv4_linear writes the full q_raw buffer.
-    let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
-    dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)?;
-    keepalive.keep_hidden(&q_raw);
+    // ── 1+2. Q/KV LoRA. SGLang fuses the first projections
+    // (`wq_a | wkv`) into one wqkv_a call. ARLE only enables that structure for
+    // B=1 decode: the fused output's two slices are contiguous, so the existing
+    // RMSNorm kernel can consume raw pointer offsets without adding a split
+    // kernel. Multi-token prefill stays on the scalar reference path until ARLE
+    // grows strided HiddenStates views or a fused split+norm kernel.
+    let fused_wqkv = token_count == 1 && dsv4_fused_wqkv_decode_enabled()?;
+    let (c_q_normed, q_raw, kv_normed) = if fused_wqkv {
+        let scratch = state.fused_wqkv.as_mut().ok_or_else(|| {
+            anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
+        })?;
+        let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused");
+        let out = crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused", || {
+            run_fused_wqkv_decode(ctx, config, attention, hidden, scratch)
+        })?;
+        drop(nvtx_wqkv);
+        out
+    } else {
+        // Q-LoRA: wq_a (down) → q_norm RMSNorm → wq_b (up to per-head Q).
+        // SAFETY: dsv4_linear writes the full c_q buffer.
+        let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
+        let nvtx_wq_a = crate::nvtx::range("dsv4/linear/wq_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wq_a", || {
+            dsv4_linear(ctx, &attention.wq_a, hidden, &mut c_q)
+        })?;
+        drop(nvtx_wq_a);
+        keepalive.keep_hidden(&c_q);
+        let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
+        keepalive.keep_hidden(&c_q_normed);
+        // SAFETY: dsv4_linear writes the full q_raw buffer.
+        let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
+        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+            dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+        })?;
+        drop(nvtx_wq_b);
+        keepalive.keep_hidden(&q_raw);
 
-    // ── 2. KV latent: wkv (down to the single compressed latent) → kv_norm.
-    // SAFETY: dsv4_linear writes the full kv_raw buffer.
-    let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
-    dsv4_linear(ctx, &attention.wkv, hidden, &mut kv_raw)?;
-    keepalive.keep_hidden(&kv_raw);
-    let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
+        // KV latent: wkv (down to the single compressed latent) → kv_norm.
+        // SAFETY: dsv4_linear writes the full kv_raw buffer.
+        let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
+        let nvtx_wkv = crate::nvtx::range("dsv4/linear/wkv");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wkv", || {
+            dsv4_linear(ctx, &attention.wkv, hidden, &mut kv_raw)
+        })?;
+        drop(nvtx_wkv);
+        keepalive.keep_hidden(&kv_raw);
+        let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
+        keepalive.keep_hidden(&kv_normed);
+        (c_q_normed, q_raw, kv_normed)
+    };
+    keepalive.keep_hidden(&c_q_normed);
+    keepalive.keep_hidden(&q_raw);
     keepalive.keep_hidden(&kv_normed);
 
     // ── 3. Partial RoPE on the trailing rope_dim cols of Q (per head) and K.
@@ -2050,9 +2316,17 @@ pub(crate) fn mla_attention(
     // back to hidden). Row-parallel: the all-reduce-sum is the model's concern.
     // SAFETY: dsv4_linear writes the full latent buffer.
     let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a.rows, token_count)? };
-    dsv4_linear(ctx, &attention.wo_a, &local_attn, &mut latent)?;
+    let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+    crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+        dsv4_linear(ctx, &attention.wo_a, &local_attn, &mut latent)
+    })?;
+    drop(nvtx_wo_a);
     keepalive.keep_hidden(&latent);
-    dsv4_linear(ctx, &attention.wo_b, &latent, out)?;
+    let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
+    crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+        dsv4_linear(ctx, &attention.wo_b, &latent, out)
+    })?;
+    drop(nvtx_wo_b);
     Ok(())
 }
 
@@ -2112,11 +2386,19 @@ fn compressor_forward(
 
     // SAFETY: dsv4_linear writes the full compressor kv buffer.
     let mut kv_raw = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
-    dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv_raw)?;
+    let nvtx_compressor_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv");
+    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv", || {
+        dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv_raw)
+    })?;
+    drop(nvtx_compressor_wkv);
     keepalive.keep_hidden(&kv_raw);
     // SAFETY: dsv4_linear writes the full compressor score buffer.
     let mut score_raw = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
-    dsv4_linear(ctx, &compressor.wgate, hidden, &mut score_raw)?;
+    let nvtx_compressor_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate");
+    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate", || {
+        dsv4_linear(ctx, &compressor.wgate, hidden, &mut score_raw)
+    })?;
+    drop(nvtx_compressor_wgate);
     keepalive.keep_hidden(&score_raw);
 
     let rope = &config.rope_parameters;
@@ -2223,12 +2505,20 @@ fn csa_select(
 ) -> Result<CudaSlice<i32>> {
     // SAFETY: dsv4_linear writes the full index-query buffer.
     let mut q_i = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, c_q_normed.seq_len)? };
-    dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)?;
+    let nvtx_indexer_wq_b = crate::nvtx::range("dsv4/linear/indexer_wq_b");
+    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
+        dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)
+    })?;
+    drop(nvtx_indexer_wq_b);
     keepalive.keep_hidden(&q_i);
     // SAFETY: dsv4_linear writes the full index-weight buffer.
     let mut weights =
         unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, hidden.seq_len)? };
-    dsv4_linear(ctx, &indexer.weights_proj, hidden, &mut weights)?;
+    let nvtx_indexer_weights = crate::nvtx::range("dsv4/linear/indexer_weights");
+    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights", || {
+        dsv4_linear(ctx, &indexer.weights_proj, hidden, &mut weights)
+    })?;
+    drop(nvtx_indexer_weights);
     keepalive.keep_hidden(&weights);
 
     ensure!(
