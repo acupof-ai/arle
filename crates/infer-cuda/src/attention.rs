@@ -450,6 +450,15 @@ impl Dsv4LayerAttentionState {
             indexer.compressed.seq_len = compressed_rows;
         }
     }
+
+    pub(crate) fn truncate_decode_len(
+        &mut self,
+        mode: DeepSeekV4AttentionMode,
+        ratio: usize,
+        total_len: usize,
+    ) {
+        self.advance_decode_len(mode, ratio, total_len);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
