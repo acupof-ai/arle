@@ -281,3 +281,301 @@ pub fn route(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result<Vec<R
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPS: f32 = 1.0e-6;
+
+    fn assert_close(actual: f32, expected: f32, label: &str) {
+        assert!(
+            (actual - expected).abs() <= EPS,
+            "{label}: actual={actual} expected={expected}"
+        );
+    }
+
+    fn noaux_cfg(
+        num_experts: usize,
+        top_k: usize,
+        scoring_func: ScoringFunc,
+        routed_scaling_factor: f32,
+        n_group: Option<usize>,
+        topk_group: Option<usize>,
+    ) -> MoeConfig {
+        MoeConfig {
+            num_experts,
+            num_shared_experts: 0,
+            top_k,
+            scoring_func,
+            topk_method: TopkMethod::NoAuxTc,
+            norm_topk_prob: false,
+            routed_scaling_factor,
+            n_group,
+            topk_group,
+            hidden_size: 16,
+        }
+    }
+
+    #[test]
+    fn group_scores_top2_sum_for_four_by_four_groups() {
+        let corrected = [
+            1.0, 4.0, 2.0, 3.0, // g0 top-2 = 4 + 3 = 7
+            -1.0, -2.0, -3.0, -4.0, // g1 top-2 = -1 + -2 = -3
+            0.5, 2.5, 2.0, 1.0, // g2 top-2 = 2.5 + 2 = 4.5
+            6.0, 6.0, 5.0, 0.0, // g3 top-2 = 6 + 6 = 12
+        ];
+        let got = group_scores(&corrected, 4);
+        assert_eq!(got.len(), 4);
+        for (i, (&actual, expected)) in got.iter().zip([7.0, -3.0, 4.5, 12.0]).enumerate() {
+            assert_close(actual, expected, &format!("group score {i}"));
+        }
+    }
+
+    #[test]
+    fn group_limited_route_excludes_global_top_outside_top_group() {
+        let logits = [0.0; 8];
+        // All sigmoid scores are 0.5. Bias makes expert 0 the global top key
+        // (10.5), but group 1 wins by top-2-sum: 6.5 + 6.5 > 10.5 + 0.5.
+        let bias = [10.0, 0.0, 0.0, 0.0, 6.0, 6.0, 0.0, 0.0];
+        let scores = scores_from_logits(&logits, ScoringFunc::Sigmoid).unwrap();
+        assert_eq!(
+            topk_indices_by_score(&scores, &bias, 2, None),
+            vec![0, 4],
+            "without group mask the globally best expert wins"
+        );
+
+        let cfg = noaux_cfg(8, 2, ScoringFunc::Sigmoid, 1.0, Some(2), Some(1));
+        let decision = route_token(&logits, &bias, &cfg).unwrap();
+        assert_eq!(
+            decision.expert_ids(),
+            vec![4, 5],
+            "topk_group mask keeps only the highest top-2-sum group"
+        );
+    }
+
+    #[test]
+    fn bias_corrected_selection_returns_unbiased_weight() {
+        let logits = [0.0, 0.0, -5.0, 0.0];
+        let bias = [0.0, 0.0, 10.0, 0.0];
+        let cfg = noaux_cfg(4, 2, ScoringFunc::Sigmoid, 1.0, None, None);
+        let scores = scores_from_logits(&logits, ScoringFunc::Sigmoid).unwrap();
+
+        let decision = route_token(&logits, &bias, &cfg).unwrap();
+        assert_eq!(
+            decision.expert_ids(),
+            vec![2, 0],
+            "bias changes selection order"
+        );
+
+        let denom = scores[2] + scores[0] + 1.0e-9;
+        assert_close(
+            decision.experts[0].weight,
+            scores[2] / denom,
+            "selected expert weight uses pre-bias score",
+        );
+        assert!(
+            decision.experts[0].weight < 0.02,
+            "large bias must not leak into emitted route weight"
+        );
+    }
+
+    #[test]
+    fn topk_ties_break_by_lower_index() {
+        let scores = [1.0, 2.0, 2.0, 2.0, 0.0];
+        assert_eq!(
+            topk_indices_by_score(&scores, &[], 3, None),
+            vec![1, 2, 3],
+            "equal raw scores prefer lower expert index"
+        );
+
+        let bias = [1.0, 0.0, 1.0];
+        let scores = [1.0, 2.0, 1.0];
+        assert_eq!(
+            topk_indices_by_score(&scores, &bias, 3, None),
+            vec![0, 1, 2],
+            "equal corrected keys prefer lower expert index"
+        );
+
+        let cfg = noaux_cfg(5, 3, ScoringFunc::Sigmoid, 1.0, None, None);
+        let decision = route_token(&[0.0; 5], &[0.0; 5], &cfg).unwrap();
+        assert_eq!(
+            decision.expert_ids(),
+            vec![0, 1, 2],
+            "route_token inherits lower-index tie break"
+        );
+    }
+
+    #[test]
+    fn denom_rules_and_scaling_for_softmax_and_sigmoid() {
+        let softmax_logits = [0.0, 1.0, 2.0, 3.0];
+        let softmax_scores = stable_softmax(&softmax_logits);
+        let softmax_cfg = noaux_cfg(4, 2, ScoringFunc::Softmax, 3.0, None, None);
+        let softmax = route_token(&softmax_logits, &[0.0; 4], &softmax_cfg).unwrap();
+        assert_eq!(softmax.expert_ids(), vec![3, 2]);
+        assert_close(
+            softmax.weights()[0],
+            softmax_scores[3] * 3.0,
+            "softmax denom is 1.0, then scaling applies",
+        );
+        assert_close(
+            softmax.weights()[1],
+            softmax_scores[2] * 3.0,
+            "softmax second selected weight",
+        );
+
+        let sigmoid_logits = [2.0, 1.0, 0.0, -1.0];
+        let sigmoid_scores = scores_from_logits(&sigmoid_logits, ScoringFunc::Sigmoid).unwrap();
+        let sigmoid_cfg = noaux_cfg(4, 2, ScoringFunc::Sigmoid, 1.5, None, None);
+        let sigmoid = route_token(&sigmoid_logits, &[0.0; 4], &sigmoid_cfg).unwrap();
+        assert_eq!(sigmoid.expert_ids(), vec![0, 1]);
+        let denom = sigmoid_scores[0] + sigmoid_scores[1] + 1.0e-9;
+        assert_close(
+            sigmoid.weights()[0],
+            sigmoid_scores[0] / denom * 1.5,
+            "sigmoid denom is selected_sum + 1e-9, then scaling applies",
+        );
+        assert_close(
+            sigmoid.weights()[1],
+            sigmoid_scores[1] / denom * 1.5,
+            "sigmoid second selected weight",
+        );
+    }
+
+    #[test]
+    fn group_degenerate_masks_are_all_true_when_all_groups_kept() {
+        let corrected = [0.2, 0.7, -1.0, 1.2];
+        assert_eq!(
+            group_scores(&corrected, 4),
+            corrected,
+            "singleton groups score as their single expert max"
+        );
+
+        assert_eq!(
+            group_limited_mask(&corrected, 1, 1),
+            vec![true; corrected.len()],
+            "n_group=1, topk_group=n_group keeps the only group"
+        );
+        assert_eq!(
+            group_limited_mask(&corrected, 4, 4),
+            vec![true; corrected.len()],
+            "topk_group==n_group keeps every group"
+        );
+
+        let logits = [0.1, 0.3, -0.2, 2.0, 1.0, 0.0, 0.7, 0.8];
+        let ungrouped = noaux_cfg(8, 3, ScoringFunc::Sigmoid, 1.0, None, None);
+        let all_groups = noaux_cfg(8, 3, ScoringFunc::Sigmoid, 1.0, Some(2), Some(2));
+        assert_eq!(
+            route_token(&logits, &[0.0; 8], &all_groups).unwrap(),
+            route_token(&logits, &[0.0; 8], &ungrouped).unwrap(),
+            "topk_group==n_group route matches ungrouped route"
+        );
+    }
+
+    #[test]
+    fn route_e2e_noaux_tc_group_limited_pipeline() {
+        let cfg = noaux_cfg(16, 3, ScoringFunc::Sigmoid, 2.0, Some(4), Some(2));
+        let logits = [0.0; 16];
+        // All scores are 0.5. Corrected top-2 group scores:
+        // g0: (7.5 + 6.5), g1: (1.5 + 1.5), g2: (3.5 + 2.5), g3: (5.5 + 5.0).
+        // The kept groups are g0 and g3. Expert 8 has a higher corrected key
+        // than expert 15, but it is in masked-out g2 and must not be selected.
+        let bias = [
+            7.0, 6.0, 0.0, 0.0, // g0
+            1.0, 1.0, 1.0, 1.0, // g1
+            3.0, 2.0, 0.0, 0.0, // g2
+            5.0, 4.5, 0.0, 0.0, // g3
+        ];
+
+        let decisions = route(&logits, &bias, &cfg).unwrap();
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0];
+        assert_eq!(
+            decision.expert_ids(),
+            vec![0, 1, 12],
+            "route() applies scoring, group top-2-sum mask, noaux_tc bias, and top-k order"
+        );
+
+        // Returned weights are still pre-bias sigmoid scores normalized over
+        // the selected experts, then scaled by routed_scaling_factor.
+        for (i, weight) in decision.weights().iter().enumerate() {
+            assert_close(*weight, 2.0 / 3.0, &format!("selected weight {i}"));
+        }
+    }
+
+    #[test]
+    fn route_e2e_bias_changes_selection_not_weight() {
+        let cfg = noaux_cfg(4, 2, ScoringFunc::Sigmoid, 1.0, None, None);
+        let logits = [0.0, 0.0, -5.0, 0.0];
+        let bias = [0.0, 0.0, 10.0, 0.0];
+        let decisions = route(&logits, &bias, &cfg).unwrap();
+        let decision = &decisions[0];
+
+        let scores = scores_from_logits(&logits, ScoringFunc::Sigmoid).unwrap();
+        let denom = scores[2] + scores[0] + 1.0e-9;
+        assert_eq!(decision.expert_ids(), vec![2, 0]);
+        assert_close(
+            decision.weights()[0],
+            scores[2] / denom,
+            "route() selected weight remains pre-bias",
+        );
+    }
+
+    #[test]
+    fn route_e2e_softmax_and_sigmoid_denoms_are_distinct() {
+        let softmax_logits = [0.0, 1.0, 2.0, 3.0];
+        let softmax_cfg = noaux_cfg(4, 2, ScoringFunc::Softmax, 3.0, None, None);
+        let softmax = route(&softmax_logits, &[0.0; 4], &softmax_cfg).unwrap();
+        let softmax_scores = stable_softmax(&softmax_logits);
+        assert_eq!(softmax[0].expert_ids(), vec![3, 2]);
+        assert_close(
+            softmax[0].weights()[0],
+            softmax_scores[3] * 3.0,
+            "route() softmax denom is 1.0",
+        );
+
+        let sigmoid_logits = [2.0, 1.0, 0.0, -1.0];
+        let sigmoid_cfg = noaux_cfg(4, 2, ScoringFunc::Sigmoid, 1.5, None, None);
+        let sigmoid = route(&sigmoid_logits, &[0.0; 4], &sigmoid_cfg).unwrap();
+        let sigmoid_scores = scores_from_logits(&sigmoid_logits, ScoringFunc::Sigmoid).unwrap();
+        let denom = sigmoid_scores[0] + sigmoid_scores[1] + 1.0e-9;
+        assert_eq!(sigmoid[0].expert_ids(), vec![0, 1]);
+        assert_close(
+            sigmoid[0].weights()[0],
+            sigmoid_scores[0] / denom * 1.5,
+            "route() sigmoid denom is selected_sum + 1e-9",
+        );
+    }
+
+    #[test]
+    fn route_e2e_ties_break_lower_index_across_batch() {
+        let cfg = noaux_cfg(5, 3, ScoringFunc::Sigmoid, 1.0, None, None);
+        let flat = [
+            0.0, 0.0, 0.0, 0.0, 0.0, // all tied
+            -1.0, 1.0, 1.0, 1.0, -1.0, // experts 1/2/3 tied for top
+        ];
+        let decisions = route(&flat, &[0.0; 5], &cfg).unwrap();
+        assert_eq!(decisions[0].expert_ids(), vec![0, 1, 2]);
+        assert_eq!(decisions[1].expert_ids(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn route_e2e_group_degenerate_matches_ungrouped() {
+        let logits = [0.1, 0.3, -0.2, 2.0, 1.0, 0.0, 0.7, 0.8];
+        let ungrouped = noaux_cfg(8, 3, ScoringFunc::Sigmoid, 1.0, None, None);
+        let one_group = noaux_cfg(8, 3, ScoringFunc::Sigmoid, 1.0, Some(1), Some(1));
+        let all_groups = noaux_cfg(8, 3, ScoringFunc::Sigmoid, 1.0, Some(4), Some(4));
+
+        let base = route(&logits, &[0.0; 8], &ungrouped).unwrap();
+        assert_eq!(
+            route(&logits, &[0.0; 8], &one_group).unwrap(),
+            base,
+            "n_group=1 keeps all experts and matches ungrouped route()"
+        );
+        assert_eq!(
+            route(&logits, &[0.0; 8], &all_groups).unwrap(),
+            base,
+            "topk_group==n_group keeps all experts and matches ungrouped route()"
+        );
+    }
+}
