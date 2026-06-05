@@ -431,8 +431,9 @@ mod dsv4_gpu {
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, HiddenStates};
     use cuda_kernels::tensor::{Dsv4Fp8DeepGemmWeightCache, RawDevicePtr, cache_ptr};
-    use cudarc::driver::{CudaSlice, DevicePtrMut};
+    use cudarc::driver::{CudaSlice, CudaStream, DevicePtrMut};
     use half::bf16;
+    use std::sync::Arc;
 
     use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
     use crate::moe_config::ExpertSplit;
@@ -1724,6 +1725,7 @@ mod dsv4_gpu {
 
     pub(crate) fn dsv4_shared_expert_forward(
         ctx: &DeviceContext,
+        stream: &Arc<CudaStream>,
         layer: &Dsv4MoeLayer,
         hidden: &HiddenStates,
         out: &mut HiddenStates,
@@ -1745,6 +1747,7 @@ mod dsv4_gpu {
             );
             return dsv4_shared_expert_pooled(
                 ctx,
+                stream,
                 layer,
                 hidden,
                 out,
@@ -1752,7 +1755,7 @@ mod dsv4_gpu {
                 &mut scratch.shared,
             );
         }
-        let shared = dsv4_shared_expert(ctx, layer, hidden, swiglu_limit, keepalive)?;
+        let shared = dsv4_shared_expert(ctx, stream, layer, hidden, swiglu_limit, keepalive)?;
         ensure!(
             shared.hidden_dim == out.hidden_dim && shared.seq_len >= out.seq_len,
             "DSv4 shared expert shape {}x{} != output {}x{}",
@@ -1763,7 +1766,7 @@ mod dsv4_gpu {
         );
         let elems = out.hidden_dim * out.seq_len;
         let src = shared.data.slice(0..elems);
-        ctx.stream
+        stream
             .memcpy_dtod(&src, &mut out.data)
             .map_err(|e| anyhow::anyhow!("DSv4 shared expert output D2D failed: {e}"))?;
         keepalive.keep_hidden(&shared);
@@ -2228,6 +2231,7 @@ mod dsv4_gpu {
     /// gate+up → clamped SwiGLU → w2 down, over every token. No routing/scatter.
     fn dsv4_shared_expert_pooled(
         ctx: &DeviceContext,
+        stream: &Arc<CudaStream>,
         layer: &Dsv4MoeLayer,
         hidden: &HiddenStates,
         out: &mut HiddenStates,
@@ -2262,7 +2266,7 @@ mod dsv4_gpu {
         let p_act_fp8 = cache_ptr(&scratch.act_fp8, ctx);
         let p_act_scales = cache_ptr(&scratch.act_scales, ctx);
         let p_out = cache_ptr(&scratch.out.data, ctx);
-        let stream = ctx.stream.cu_stream();
+        let cu_stream = stream.cu_stream();
 
         unsafe {
             moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
@@ -2276,7 +2280,7 @@ mod dsv4_gpu {
                 scratch.max_m,
                 hidden_dim,
                 scratch.scale_stride_m,
-                stream,
+                cu_stream,
             )?;
             moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
                 p_in_fp8,
@@ -2290,7 +2294,7 @@ mod dsv4_gpu {
                 2 * shared_inter,
                 hidden_dim,
                 scratch.scale_stride_m,
-                stream,
+                cu_stream,
             )?;
             moe::dsv4_deepgemm_swiglu_quantize_w13(
                 p_w13_out,
@@ -2303,7 +2307,7 @@ mod dsv4_gpu {
                 shared_inter,
                 scratch.scale_stride_m,
                 swiglu_limit,
-                stream,
+                cu_stream,
             )?;
             moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
                 p_act_fp8,
@@ -2317,13 +2321,13 @@ mod dsv4_gpu {
                 hidden_dim,
                 shared_inter,
                 scratch.scale_stride_m,
-                stream,
+                cu_stream,
             )?;
         }
 
         let elems = hidden_dim * num_tokens;
         let src = scratch.out.data.slice(0..elems);
-        ctx.stream
+        stream
             .memcpy_dtod(&src, &mut out.data)
             .map_err(|e| anyhow::anyhow!("DSv4 pooled shared output D2D failed: {e}"))?;
         Ok(())
@@ -2333,6 +2337,7 @@ mod dsv4_gpu {
     /// gate+up → clamped SwiGLU → w2 down, over every token. No routing/scatter.
     fn dsv4_shared_expert(
         ctx: &DeviceContext,
+        stream: &Arc<CudaStream>,
         layer: &Dsv4MoeLayer,
         hidden: &HiddenStates,
         swiglu_limit: f32,
@@ -2368,16 +2373,41 @@ mod dsv4_gpu {
         let scale_stride_m = max_m.div_ceil(4) * 4;
         let hidden_scale_cols = hidden_dim.div_ceil(128);
         let inter_scale_cols = shared_inter.div_ceil(128);
+        let use_ctx_stream = Arc::ptr_eq(stream, &ctx.stream);
 
-        let input_fp8 = alloc_u8(ctx, max_m * hidden_dim)?;
-        let input_scales = alloc_zeros_f32(ctx, scale_stride_m * hidden_scale_cols)?;
-        let w13_out = HiddenStates::zeros(ctx, 2 * shared_inter, max_m)?;
-        let act_fp8 = alloc_u8(ctx, max_m * shared_inter)?;
-        let act_scales = alloc_zeros_f32(ctx, scale_stride_m * inter_scale_cols)?;
+        let input_fp8 = if use_ctx_stream {
+            alloc_u8(ctx, max_m * hidden_dim)?
+        } else {
+            alloc_u8_on(stream, max_m * hidden_dim)?
+        };
+        let input_scales = if use_ctx_stream {
+            alloc_zeros_f32(ctx, scale_stride_m * hidden_scale_cols)?
+        } else {
+            alloc_zeros_f32_on(stream, scale_stride_m * hidden_scale_cols)?
+        };
+        let w13_out = if use_ctx_stream {
+            HiddenStates::zeros(ctx, 2 * shared_inter, max_m)?
+        } else {
+            hidden_zeros_on(stream, 2 * shared_inter, max_m)?
+        };
+        let act_fp8 = if use_ctx_stream {
+            alloc_u8(ctx, max_m * shared_inter)?
+        } else {
+            alloc_u8_on(stream, max_m * shared_inter)?
+        };
+        let act_scales = if use_ctx_stream {
+            alloc_zeros_f32(ctx, scale_stride_m * inter_scale_cols)?
+        } else {
+            alloc_zeros_f32_on(stream, scale_stride_m * inter_scale_cols)?
+        };
         // DeepGEMM's TMA D descriptor is built with `m = max_m`, so the output
         // allocation must cover the padded row capacity even though downstream
         // consumers only read the first `num_tokens` rows.
-        let out = HiddenStates::zeros(ctx, hidden_dim, max_m)?;
+        let out = if use_ctx_stream {
+            HiddenStates::zeros(ctx, hidden_dim, max_m)?
+        } else {
+            hidden_zeros_on(stream, hidden_dim, max_m)?
+        };
         keepalive.keep_u8(&input_fp8);
         keepalive.keep_f32(&input_scales);
         keepalive.keep_hidden(&w13_out);
@@ -2386,22 +2416,30 @@ mod dsv4_gpu {
         keepalive.keep_hidden(&out);
 
         // Single group spanning all tokens: identity expert 0, offset 0, count T.
-        let active_experts = ctx
-            .stream
-            .clone_htod(&[0i32])
-            .map_err(|e| anyhow::anyhow!("DSv4 shared active H2D failed: {e}"))?;
-        let active_offsets = ctx
-            .stream
-            .clone_htod(&[0i32])
-            .map_err(|e| anyhow::anyhow!("DSv4 shared offset H2D failed: {e}"))?;
-        let counts = ctx
-            .stream
-            .clone_htod(&[num_tokens as i32])
-            .map_err(|e| anyhow::anyhow!("DSv4 shared count H2D failed: {e}"))?;
-        let masked_m = ctx
-            .stream
-            .clone_htod(&[num_tokens as i32])
-            .map_err(|e| anyhow::anyhow!("DSv4 shared masked_m H2D failed: {e}"))?;
+        let active_experts = if use_ctx_stream {
+            ctx.stream.clone_htod(&[0i32])
+        } else {
+            stream.clone_htod(&[0i32])
+        }
+        .map_err(|e| anyhow::anyhow!("DSv4 shared active H2D failed: {e}"))?;
+        let active_offsets = if use_ctx_stream {
+            ctx.stream.clone_htod(&[0i32])
+        } else {
+            stream.clone_htod(&[0i32])
+        }
+        .map_err(|e| anyhow::anyhow!("DSv4 shared offset H2D failed: {e}"))?;
+        let counts = if use_ctx_stream {
+            ctx.stream.clone_htod(&[num_tokens as i32])
+        } else {
+            stream.clone_htod(&[num_tokens as i32])
+        }
+        .map_err(|e| anyhow::anyhow!("DSv4 shared count H2D failed: {e}"))?;
+        let masked_m = if use_ctx_stream {
+            ctx.stream.clone_htod(&[num_tokens as i32])
+        } else {
+            stream.clone_htod(&[num_tokens as i32])
+        }
+        .map_err(|e| anyhow::anyhow!("DSv4 shared masked_m H2D failed: {e}"))?;
         keepalive.keep_i32(&active_experts);
         keepalive.keep_i32(&active_offsets);
         keepalive.keep_i32(&counts);
@@ -2418,9 +2456,13 @@ mod dsv4_gpu {
         let p_act_fp8 = cache_ptr(&act_fp8, ctx);
         let p_act_scales = cache_ptr(&act_scales, ctx);
         let p_out = cache_ptr(&out.data, ctx);
-        let stream = ctx.stream.cu_stream();
+        let cu_stream = if use_ctx_stream {
+            ctx.stream.cu_stream()
+        } else {
+            stream.cu_stream()
+        };
 
-        // SAFETY: single-group buffers valid on ctx.stream; masked_m bounds rows.
+        // SAFETY: single-group buffers valid on the selected stream; masked_m bounds rows.
         unsafe {
             moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                 p_hidden,
@@ -2433,7 +2475,7 @@ mod dsv4_gpu {
                 max_m,
                 hidden_dim,
                 scale_stride_m,
-                stream,
+                cu_stream,
             )?;
             moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
                 p_in_fp8,
@@ -2447,7 +2489,7 @@ mod dsv4_gpu {
                 2 * shared_inter,
                 hidden_dim,
                 scale_stride_m,
-                stream,
+                cu_stream,
             )?;
             moe::dsv4_deepgemm_swiglu_quantize_w13(
                 p_w13_out,
@@ -2460,7 +2502,7 @@ mod dsv4_gpu {
                 shared_inter,
                 scale_stride_m,
                 swiglu_limit,
-                stream,
+                cu_stream,
             )?;
             moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
                 p_act_fp8,
@@ -2474,7 +2516,7 @@ mod dsv4_gpu {
                 hidden_dim,
                 shared_inter,
                 scale_stride_m,
-                stream,
+                cu_stream,
             )?;
         }
 
@@ -2567,10 +2609,41 @@ mod dsv4_gpu {
             .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM u8 scratch alloc failed: {e}"))
     }
 
+    fn alloc_u8_on(stream: &Arc<CudaStream>, len: usize) -> Result<cudarc::driver::CudaSlice<u8>> {
+        stream
+            .alloc_zeros::<u8>(len.max(1))
+            .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM u8 scratch alloc failed: {e}"))
+    }
+
     fn alloc_zeros_f32(ctx: &DeviceContext, len: usize) -> Result<cudarc::driver::CudaSlice<f32>> {
         ctx.stream
             .alloc_zeros::<f32>(len.max(1))
             .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM f32 scratch alloc failed: {e}"))
+    }
+
+    fn alloc_zeros_f32_on(
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> Result<cudarc::driver::CudaSlice<f32>> {
+        stream
+            .alloc_zeros::<f32>(len.max(1))
+            .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM f32 scratch alloc failed: {e}"))
+    }
+
+    fn hidden_zeros_on(
+        stream: &Arc<CudaStream>,
+        hidden_dim: usize,
+        seq_len: usize,
+    ) -> Result<HiddenStates> {
+        let len = hidden_dim * seq_len;
+        let data = stream
+            .alloc_zeros::<bf16>(len.max(1))
+            .map_err(|e| anyhow::anyhow!("DSv4 hidden scratch alloc failed: {e}"))?;
+        Ok(HiddenStates {
+            data,
+            hidden_dim,
+            seq_len,
+        })
     }
 }
 
@@ -2751,8 +2824,8 @@ mod tests {
     #[test]
     fn hash_route_rejects_token_beyond_table() {
         let cfg = hash_test_config();
-        let tid2eid: Vec<i64> = vec![0, 1]; // only token 0's two experts present
-        // token 1 needs entries [2,3] which the short table can't supply.
+        // Only token 0's two experts are present; token 1 needs entries [2,3].
+        let tid2eid: Vec<i64> = vec![0, 1];
         assert!(super::hash_route(&cfg, &tid2eid, &[0u32, 1u32], &[0.0; 8]).is_err());
     }
 }
