@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define DSV4_ROUTE_BLOCK 256
+#define DSV4_CONTIG_ROUTE_ALIGN 128
 #define DSV4_ROUTE_MAX_EXPERTS 512
 #define DSV4_ROUTE_MAX_TOPK 16
 
@@ -856,6 +857,75 @@ extern "C" CUresult dsv4_pack_local_experts_with_slots_cuda(
   dsv4_pack_local_experts_with_slots_kernel<<<total_routes, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
       hidden, indices, weights, offsets, cursors, packed_hidden, packed_route_slot,
       packed_weight, num_tokens, hidden_dim, topk, local_expert_start, experts_per_rank);
+  return (CUresult)cudaGetLastError();
+}
+
+__global__ void dsv4_pack_local_experts_with_slots_and_indices_kernel(
+    const uint16_t *__restrict__ hidden,
+    const int32_t *__restrict__ indices,
+    const float *__restrict__ weights,
+    const int32_t *__restrict__ offsets,
+    int32_t *__restrict__ cursors,
+    uint16_t *__restrict__ packed_hidden,
+    int32_t *__restrict__ packed_route_slot,
+    float *__restrict__ packed_weight,
+    int32_t *__restrict__ packed_m_indices,
+    int num_tokens,
+    int hidden_dim,
+    int topk,
+    int local_expert_start,
+    int experts_per_rank) {
+  int route = blockIdx.x;
+  int total_routes = num_tokens * topk;
+  if (route >= total_routes) return;
+
+  int token = route / topk;
+  int expert = indices[route];
+  int local = expert - local_expert_start;
+  if (local < 0 || local >= experts_per_rank) return;
+
+  (void)offsets;
+  (void)cursors;
+  int slot = route * DSV4_CONTIG_ROUTE_ALIGN;
+  if (threadIdx.x == 0) {
+    packed_route_slot[slot] = route;
+    packed_weight[slot] = weights[route];
+    packed_m_indices[slot] = local;
+  }
+
+  int src_base = token * hidden_dim;
+  int dst_base = slot * hidden_dim;
+  for (int col = threadIdx.x; col < hidden_dim; col += blockDim.x) {
+    packed_hidden[dst_base + col] = hidden[src_base + col];
+  }
+}
+
+extern "C" CUresult dsv4_pack_local_experts_with_slots_and_indices_cuda(
+    const uint16_t *hidden,
+    const int32_t *indices,
+    const float *weights,
+    const int32_t *offsets,
+    int32_t *cursors,
+    uint16_t *packed_hidden,
+    int32_t *packed_route_slot,
+    float *packed_weight,
+    int32_t *packed_m_indices,
+    int num_tokens,
+    int hidden_dim,
+    int topk,
+    int local_expert_start,
+    int experts_per_rank,
+    CUstream stream) {
+  if (num_tokens < 0 || hidden_dim <= 0 || topk <= 0 ||
+      local_expert_start < 0 || experts_per_rank <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total_routes = num_tokens * topk;
+  if (total_routes == 0) return CUDA_SUCCESS;
+  dsv4_pack_local_experts_with_slots_and_indices_kernel<<<total_routes, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      hidden, indices, weights, offsets, cursors, packed_hidden, packed_route_slot,
+      packed_weight, packed_m_indices, num_tokens, hidden_dim, topk, local_expert_start,
+      experts_per_rank);
   return (CUresult)cudaGetLastError();
 }
 

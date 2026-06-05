@@ -1072,6 +1072,74 @@ CUresult launch_sm90_grouped_masked(
   return CUDA_SUCCESS;
 }
 
+CUresult launch_sm90_grouped_contiguous(
+    const unsigned char* a,
+    const float* sfa,
+    const unsigned char* b,
+    const float* sfb,
+    unsigned short* d,
+    const int* m_indices,
+    int num_groups,
+    int m,
+    int n,
+    int k,
+    int sfa_aligned_m,
+    CUstream stream) {
+  cudaDeviceProp prop{};
+  CUresult prop_err = current_device_prop(&prop);
+  if (prop_err != CUDA_SUCCESS) return prop_err;
+  if (prop.major != 9) return CUDA_ERROR_NOT_SUPPORTED;
+
+  int num_sms = env_int("DG_NUM_SMS", prop.multiProcessorCount);
+  if (num_sms <= 0 || num_sms > prop.multiProcessorCount || (num_sms % 2) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  const GemmDesc desc{
+      m,
+      n,
+      k,
+      num_groups,
+      num_sms,
+      m,
+      n,
+      k,
+      1,
+  };
+  const auto config = get_best_config(desc);
+  const auto code = generate_kernel_code(desc, config, "MGroupedContiguous");
+  const auto runtime = get_or_build_runtime(
+      "sm90_fp8_m_grouped_gemm_contiguous_1d2d_native", code, prop.major, prop.minor);
+
+  const auto tensor_map_a = make_tma_a_desc(
+      a, m, k, config.storage.load_block_m, config.layout.block_k, k, 1,
+      config.storage.swizzle_a_mode);
+  const auto tensor_map_b = make_tma_b_desc(
+      b, n, k, config.storage.load_block_n, config.layout.block_k, k, num_groups,
+      config.storage.swizzle_b_mode);
+  const auto tensor_map_d = make_tma_d_desc(
+      d, m, n, config.storage.store_block_m, config.storage.store_block_n, n, 1,
+      config.storage.swizzle_cd_mode);
+  const auto tensor_map_sfa = make_tma_sfa_desc(
+      sfa, m, k, config.layout.block_m, config.layout.block_k, 1,
+      sfa_aligned_m);
+
+  dim3 grid(static_cast<unsigned>(config.launch.num_sms), 1, 1);
+  dim3 block(static_cast<unsigned>(config.launch.num_threads), 1, 1);
+  auto launch_config = construct_launch_config(
+      runtime->kernel, reinterpret_cast<cudaStream_t>(stream), config.pipeline.smem_size,
+      grid, block, config.layout.cluster_size(), false);
+
+  void* sfb_arg = const_cast<float*>(sfb);
+  void* m_indices_arg = const_cast<int*>(m_indices);
+  check_driver(
+      launch_kernel(
+          runtime->kernel, launch_config, sfb_arg, m_indices_arg, m, n, k,
+          tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa),
+      "DeepGEMM contiguous launch");
+  return CUDA_SUCCESS;
+}
+
 CUresult launch_sm90_dense_nt(
     const unsigned char* a,
     const float* sfa,
@@ -1180,6 +1248,38 @@ extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda(
         a, sfa, b, sfb, d, masked_m, num_groups, m, n, k, sfa_aligned_m, stream);
   } catch (const std::exception& err) {
     std::fprintf(stderr, "DeepGEMM native bridge failed: %s\n", err.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+}
+
+extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
+    const unsigned char* a,
+    const float* sfa,
+    const unsigned char* b,
+    const float* sfb,
+    unsigned short* d,
+    const int* m_indices,
+    int num_groups,
+    int m,
+    int n,
+    int k,
+    int sfa_aligned_m,
+    CUstream stream) {
+  if (a == nullptr || sfa == nullptr || b == nullptr || sfb == nullptr ||
+      d == nullptr || m_indices == nullptr || stream == nullptr || num_groups <= 0 ||
+      m <= 0 || n <= 0 || k <= 0 || sfa_aligned_m < m) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if ((k % kScaleGranK) != 0 || (n % 8) != 0 ||
+      sfa_aligned_m < get_tma_aligned_size(m, sizeof(float))) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  try {
+    return launch_sm90_grouped_contiguous(
+        a, sfa, b, sfb, d, m_indices, num_groups, m, n, k, sfa_aligned_m, stream);
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM native contiguous bridge failed: %s\n", err.what());
     return CUDA_ERROR_UNKNOWN;
   }
 }
