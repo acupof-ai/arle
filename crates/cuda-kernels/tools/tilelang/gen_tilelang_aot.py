@@ -565,15 +565,19 @@ def nvcc_compile_cubin(
         "-o",
         str(cubin_path),
     ]
-    nvcc_ccbin = None
-    try:
-        import os
+    import os
 
-        nvcc_ccbin = os.environ.get("NVCC_CCBIN")
-    except Exception:
-        nvcc_ccbin = None
+    nvcc_ccbin = os.environ.get("NVCC_CCBIN")
     if nvcc_ccbin:
         cmd.insert(1, f"--compiler-bindir={nvcc_ccbin}")
+    # Honor ARLE_NVCC_WRAPPER (e.g. sccache / ccache) so the TileLang AOT cubins
+    # share the same compile cache as the native .cu (build.rs threads the same
+    # env into its nvcc tool_command). Without this, sccache caches the 62 native
+    # .cu but misses the 124 TileLang cubins — the bigger half of a CUDA rebuild.
+    # No-op when the env is unset, so the default build path is unchanged.
+    nvcc_wrapper = os.environ.get("ARLE_NVCC_WRAPPER", "").strip()
+    if nvcc_wrapper:
+        cmd = nvcc_wrapper.split() + cmd
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(
