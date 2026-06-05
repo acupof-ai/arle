@@ -873,6 +873,7 @@ pub(crate) fn sample_cuda_token(
     params: &SamplingParams,
     position: u64,
 ) -> Result<u32> {
+    maybe_dump_sample_topk(ctx, logits, position)?;
     if params.is_greedy() {
         return argmax(ctx, logits);
     }
@@ -881,4 +882,63 @@ pub(crate) fn sample_cuda_token(
     // generated-token history threaded through the executor.
     let logits_host = logits.to_host(ctx)?;
     Ok(infer_plan::sample_token(&logits_host, params, position))
+}
+
+/// Positions (rank 0 only) at which to dump top-k logits, parsed once from
+/// `INFER_DSV4_DUMP_TOPK_POSITIONS`. Empty = disabled, the production default —
+/// so the per-token hot-path cost is one `OnceLock` load + a slice scan, never a
+/// per-token env-lock across all TP ranks. A diagnostic for FP8-vs-bf16 parity
+/// (e.g. the DIFF@122 margin investigation), not a serving path.
+fn dump_topk_positions() -> &'static [u64] {
+    static POSITIONS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    POSITIONS.get_or_init(|| {
+        if std::env::var("INFER_TP_RANK").ok().as_deref() != Some("0") {
+            return Vec::new();
+        }
+        let Ok(raw) = std::env::var("INFER_DSV4_DUMP_TOPK_POSITIONS") else {
+            return Vec::new();
+        };
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect()
+    })
+}
+
+fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64) -> Result<()> {
+    if !dump_topk_positions().contains(&position) {
+        return Ok(());
+    }
+
+    let top_k = std::env::var("INFER_DSV4_DUMP_TOPK")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8);
+    let variant =
+        std::env::var("INFER_DSV4_AB_CURRENT_VARIANT").unwrap_or_else(|_| "unknown".to_string());
+    let logits_host = logits.to_host(ctx)?;
+    let mut best: Vec<(u32, f32)> = Vec::with_capacity(top_k);
+    for (idx, &value) in logits_host.iter().enumerate() {
+        if best.len() < top_k {
+            best.push((idx as u32, value));
+            best.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            continue;
+        }
+        let Some(last) = best.last() else {
+            continue;
+        };
+        if value > last.1 || (value == last.1 && (idx as u32) < last.0) {
+            best.pop();
+            best.push((idx as u32, value));
+            best.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        }
+    }
+    let margin = match best.as_slice() {
+        [first, second, ..] => first.1 - second.1,
+        _ => 0.0,
+    };
+    println!("sample_topk variant={variant} position={position} top={best:?} margin={margin:.6}");
+    Ok(())
 }
