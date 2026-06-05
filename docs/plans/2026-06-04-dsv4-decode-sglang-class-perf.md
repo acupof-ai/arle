@@ -281,3 +281,31 @@ moves ARLE from 39.5 → toward ~16–20 ms on H20. Profile artifacts (pod):
 `sglang_h20_profile_v32_decode/`. Caveat: V3.2 vs DSv4 (same family, same HW) —
 directionally decisive, the per-DSv4-op target re-confirms once the DeepGEMM
 dense lands.
+
+**Full-opt re-profile (2026-06-05) — the gap decomposes into 2.5× kernel + 1.93×
+EAGLE.** The first SGLang run was a *basic* config; the production DSv4 config
+(provided by ckl) adds EAGLE speculative decode, DP-attention, DeepEP low-latency,
+the `dsv4` attention backend, and PD-disaggregation. Re-profiled the single-node
+per-token-latency subset on the same pod (the production V4-Flash-FP8 checkpoint
+isn't on the pod → V3.2 fallback; PD-disagg / router / mooncake are multi-node
+serving-throughput, not single-request latency, skipped):
+
+| SGLang config (V3.2, H20) | tok/s | ms/token | vs ARLE 39.5 |
+|---|---|---|---|
+| basic TP=8 (no-spec kernel ceiling) | 62.95 | 15.89 | 2.5× |
+| **+ EAGLE** (2 steps, topk1, 3 draft; 2.78 tok/verify) | **121.31** | **8.24** | **4.8×** |
+| + DP-attention | — | — | untestable (dp=8 OOMs each card on this pod) |
+
+So **5–6 ms needs the H100/H800 SKU *plus* the full opt stack; on H20 even SGLang
+is 15.89 ms no-spec / 8.24 ms with EAGLE.** ARLE's gap is two independent levers:
+1. **Kernels (~2.5×, → ~16 ms):** FP8 dense GEMM (ARLE scalar → DeepGEMM
+   `sm90_fp8_gemm_1d2d`, SGLang 4.94–5.94 ms) + hybrid MLA attention (ARLE
+   ~11.8 ms → FlashMLA `splitkv_mla`, SGLang 2.02–2.72 ms). **This is the "算子
+   优化" axis — in progress.**
+2. **EAGLE speculative decode (~1.93×, → ~8 ms):** an *algorithmic* lever (not a
+   kernel), ARLE doesn't have it (Medusa scaffold exists). A follow-on after the
+   kernels close the apples-to-apples no-spec gap.
+
+EAGLE per-decode-iter raw (÷2.78 acceptance for per-effective-token): MoE 7.24
+(2.60), FP8 dense 5.94 (2.14), MLA 2.72 (0.98), allreduce 2.35 (0.85). Artifacts:
+`sglang_h20_profile_v32_eagle_tp8_decode/`.
