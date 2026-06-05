@@ -621,8 +621,14 @@ mod dsv4_gpu {
                 .memset_zeros(&mut self.route_out.data)
                 .map_err(|e| anyhow::anyhow!("DSv4 decode route-out scratch reset failed: {e}"))?;
             memset_i32_minus_one(ctx, &mut self.packed_route_slot)?;
-            memset_i32_minus_one(ctx, &mut self.grouped_contig.packed_route_slot)?;
-            memset_i32_minus_one(ctx, &mut self.grouped_contig.m_indices)?;
+            // grouped_contig.{packed_route_slot,m_indices} are consumed ONLY on the
+            // contiguous decode path (the `use_contiguous` branch reads them); on the
+            // default masked path they are never read, so skip the per-layer memset
+            // there — pure waste (review #6, the measured 10.4% memset bucket).
+            if use_contiguous_decode_moe() {
+                memset_i32_minus_one(ctx, &mut self.grouped_contig.packed_route_slot)?;
+                memset_i32_minus_one(ctx, &mut self.grouped_contig.m_indices)?;
+            }
             Ok(())
         }
 
