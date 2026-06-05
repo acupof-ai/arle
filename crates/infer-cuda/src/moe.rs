@@ -816,7 +816,15 @@ mod dsv4_gpu {
     }
 
     fn use_gpu_router() -> bool {
-        std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some()
+        // Default ON: route fully on-device (no per-layer logits D2H + `ctx.sync()`).
+        // DSv4-Flash ships no group-limited routing (`MoeConfig::dsv4` hardcodes
+        // `n_group/topk_group = None`, config.rs:151), so the device kernel's plain
+        // bias-corrected top-k is algorithmically identical to the host
+        // `route_token`. The decode-graph path (`dsv4_moe_forward_decode_graph`)
+        // already calls this same kernel unconditionally and is token-verified, so
+        // the eager/deepep paths are just converging onto the proven path. Opt out
+        // with `ARLE_DSV4_GPU_ROUTER=0`.
+        !matches!(std::env::var("ARLE_DSV4_GPU_ROUTER").as_deref(), Ok("0"))
     }
 
     fn use_contiguous_decode_moe() -> bool {
