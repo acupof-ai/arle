@@ -736,23 +736,21 @@ fn waiting_request_precedes(
     queued: &RequestState,
     bias: WaitingInsertBias,
 ) -> bool {
-    match incoming.priority.cmp(&queued.priority) {
+    // Admission order is a single lexicographic key: higher priority first, then
+    // more reusable KV (session-affinity, then immediate, then total reuse). On a
+    // full tie the bias decides whether `incoming` sorts before an equal `queued`.
+    let key = |r: &RequestState| {
+        (
+            r.priority,
+            r.waiting_hint.session_affinity_tokens,
+            r.waiting_hint.immediate_reuse_tokens,
+            r.waiting_hint.total_reuse_tokens,
+        )
+    };
+    match key(incoming).cmp(&key(queued)) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => match (
-            incoming.waiting_hint.session_affinity_tokens,
-            incoming.waiting_hint.immediate_reuse_tokens,
-            incoming.waiting_hint.total_reuse_tokens,
-        )
-            .cmp(&(
-                queued.waiting_hint.session_affinity_tokens,
-                queued.waiting_hint.immediate_reuse_tokens,
-                queued.waiting_hint.total_reuse_tokens,
-            )) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => matches!(bias, WaitingInsertBias::BeforeEqual),
-        },
+        std::cmp::Ordering::Equal => matches!(bias, WaitingInsertBias::BeforeEqual),
     }
 }
 
@@ -1077,30 +1075,40 @@ mod testing {
         }
     }
 
+    /// Echo executor token rule shared by the mock executors: each prefill row
+    /// emits `last_prompt_token + 1` (or `1` when empty) and each decode row emits
+    /// `last_token + 1`. Real backends sample; the mocks just need a deterministic
+    /// monotonically-advancing token so the engine's slot bookkeeping is exercised.
+    fn echo_tokens(plan: &ForwardPlan) -> Vec<SlotToken> {
+        let mut tokens = Vec::new();
+        for row in &plan.prefill_rows {
+            let token = row.tokens.last().copied().map_or(1, |last| last + 1);
+            tokens.push(SlotToken {
+                slot: row.slot,
+                token,
+                logprob: None,
+                finish: None,
+            });
+        }
+        for row in &plan.decode_rows {
+            tokens.push(SlotToken {
+                slot: row.slot,
+                token: row.last_token + 1,
+                logprob: None,
+                finish: None,
+            });
+        }
+        tokens
+    }
+
     impl BackendExecutor for MockExecutor {
         type Inflight = MockInflight;
 
         fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
-            let mut tokens = Vec::new();
-            for row in &plan.prefill_rows {
-                let token = row.tokens.last().copied().map_or(1, |last| last + 1);
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token,
-                    logprob: None,
-                    finish: None,
-                });
-            }
-            for row in &plan.decode_rows {
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token: row.last_token + 1,
-                    logprob: None,
-                    finish: None,
-                });
-            }
             Ok(MockInflight {
-                output: StepOutput { tokens },
+                output: StepOutput {
+                    tokens: echo_tokens(plan),
+                },
                 return_not_ready_once: self.not_ready_once_per_submit,
             })
         }
@@ -1159,26 +1167,10 @@ mod testing {
         type Inflight = MockInflight;
 
         fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
-            let mut tokens = Vec::new();
-            for row in &plan.prefill_rows {
-                let token = row.tokens.last().copied().map_or(1, |last| last + 1);
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token,
-                    logprob: None,
-                    finish: None,
-                });
-            }
-            for row in &plan.decode_rows {
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token: row.last_token + 1,
-                    logprob: None,
-                    finish: None,
-                });
-            }
             Ok(MockInflight {
-                output: StepOutput { tokens },
+                output: StepOutput {
+                    tokens: echo_tokens(plan),
+                },
                 return_not_ready_once: false,
             })
         }

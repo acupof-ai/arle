@@ -225,6 +225,17 @@ DeepGEMM MoE + DeepEP). The DSv4 contract scaffold lives in
 `crates/deepseek-spec`. Multi-GPU sequencing is tracked in
 [`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md).
 
+DSv4 decode is under active kernel optimization on 8×H20 (adopt-best-first):
+gated, license-or-kill on a same-load resident A/B at the B=1 SLO shape, with
+KV-precision parity (`agent-bench::dsv4_kv_precision_parity`) as the
+precondition for any default flip. Landed gated: FlashMLA fused sparse decode,
+FP8 fused `wqkv_a`, contiguous active-row MoE layout. Lever sequencing +
+SGLang-reference adopt plan:
+[`plans/2026-06-05-dsv4-endgame-architecture-adopt-best-first.md`](plans/2026-06-05-dsv4-endgame-architecture-adopt-best-first.md)
+and [`plans/2026-06-05-sglang-dsv4-decode-overlap-adopt-plan.md`](plans/2026-06-05-sglang-dsv4-decode-overlap-adopt-plan.md).
+Prefill at production shapes is in repair (a MoE padded-layout i32 work-size
+overflow at >~1560 tokens).
+
 DeepSeek V4 is the #1 next-model priority and Qwen 3.6 is #2; the canonical
 ranking and rationale live in
 [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order),
@@ -240,6 +251,13 @@ full verifier machinery — `SpecConfig`, `DraftMode`, per-request draft state,
 greedy verifier accounting, bonus-token commit, the per-step `SpecPath`
 dispatch — was **not ported** below the executor seam and must be re-built on
 the new stack before spec-on results are valid.
+
+A concrete DSv4 port path now exists (adopt-best-first): the in-checkpoint
+**MTP draft head** (`mtp.0.*`, `num_nextn_predict_layers=1` — no training)
+consuming the wide hyper-connection stream, plus SGLang's MTP/EAGLE
+draft→tree→verify→extend loop reusing the Medusa substrate. Design:
+[`plans/2026-06-05-eagle-mtp-integration-design.md`](plans/2026-06-05-eagle-mtp-integration-design.md).
+Banked behind the DSv4 kernel arc (kernels first; spec is the ×1.93 multiplier).
 
 The historical caveats still bound any port:
 

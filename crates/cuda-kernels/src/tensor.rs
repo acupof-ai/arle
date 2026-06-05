@@ -1,6 +1,6 @@
 //! Device tensor types and CUDA context.
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr,
     DriverError, PinnedHostSlice, ValidAsZeroBits,
@@ -1063,6 +1063,15 @@ impl std::fmt::Display for WeightFormat {
 const DSV4_DEEPGEMM_FP8_SCALE_GRAN_M: usize = 128;
 const DSV4_DEEPGEMM_FP8_SCALE_GRAN_K: usize = 128;
 
+fn dsv4_deepgemm_linear_cache_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_FP8_LINEAR_DEEPGEMM")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "on" | "ON")
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Dsv4DeepGemmSourceFormat {
     Fp8 = 0,
@@ -1293,6 +1302,8 @@ pub struct DeviceMatrix {
     pub dsv4_scale_rows: usize,
     /// Number of columns in the DeepSeek V4 block-scale matrix.
     pub dsv4_scale_cols: usize,
+    /// Optional resident DeepGEMM FP8 cache for DSv4 block-scaled weights.
+    pub dsv4_deepgemm_cache: Option<Dsv4Fp8DeepGemmWeightCache>,
     /// Quantization group size (0 = not quantized).
     pub group_size: usize,
     /// Marlin-repacked INT4 weights for prefill GEMM (None if not W4 or repack failed).
@@ -1343,6 +1354,8 @@ pub struct HostMatrixSnapshot {
     qweight: OptHostBuf<i8>,
     qscales: OptHostBuf<bf16>,
     dsv4_scales: OptHostBuf<u8>,
+    dsv4_deepgemm_weight: OptHostBuf<u8>,
+    dsv4_deepgemm_scales: OptHostBuf<f32>,
     marlin_packed: OptHostBuf<u8>,
     marlin_scales: OptHostBuf<u16>,
     marlin_channel_scales: OptHostBuf<f32>,
@@ -1385,6 +1398,29 @@ fn snapshot_opt_slice<T: DeviceRepr + Clone>(
     }
 }
 
+fn snapshot_dsv4_deepgemm_cache(
+    ctx: &DeviceContext,
+    src: &Option<Dsv4Fp8DeepGemmWeightCache>,
+    freed: &mut usize,
+) -> Result<(OptHostBuf<u8>, OptHostBuf<f32>)> {
+    match src {
+        Some(cache) => {
+            let weight = ctx
+                .stream
+                .clone_dtoh(&cache.weight)
+                .map_err(|e| anyhow!("offload D2H copy (dsv4_deepgemm_weight) failed: {e}"))?;
+            let scales = ctx
+                .stream
+                .clone_dtoh(&cache.scales)
+                .map_err(|e| anyhow!("offload D2H copy (dsv4_deepgemm_scales) failed: {e}"))?;
+            *freed += weight.len() * std::mem::size_of::<u8>();
+            *freed += scales.len() * std::mem::size_of::<f32>();
+            Ok((Some(weight), Some(scales)))
+        }
+        None => Ok((None, None)),
+    }
+}
+
 /// Re-upload an optional host buffer to device.
 fn restore_opt_slice<T: DeviceRepr>(
     ctx: &DeviceContext,
@@ -1397,6 +1433,51 @@ fn restore_opt_slice<T: DeviceRepr>(
                 .map_err(|e| anyhow!("reload H2D copy failed: {e}"))?,
         )),
         None => Ok(None),
+    }
+}
+
+fn restore_dsv4_deepgemm_cache(
+    ctx: &DeviceContext,
+    snapshot: &HostMatrixSnapshot,
+    rows: usize,
+    cols: usize,
+) -> Result<Option<Dsv4Fp8DeepGemmWeightCache>> {
+    match (
+        &snapshot.dsv4_deepgemm_weight,
+        &snapshot.dsv4_deepgemm_scales,
+    ) {
+        (Some(weight), Some(scales)) => {
+            let scale_rows = rows.div_ceil(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M);
+            let scale_cols = cols.div_ceil(DSV4_DEEPGEMM_FP8_SCALE_GRAN_K);
+            ensure!(
+                weight.len() == rows * cols,
+                "reload DSv4 DeepGEMM cache weight len {} != {}",
+                weight.len(),
+                rows * cols
+            );
+            ensure!(
+                scales.len() == scale_rows * scale_cols,
+                "reload DSv4 DeepGEMM cache scale len {} != {}",
+                scales.len(),
+                scale_rows * scale_cols
+            );
+            Ok(Some(Dsv4Fp8DeepGemmWeightCache {
+                weight: ctx
+                    .stream
+                    .clone_htod(weight.as_slice())
+                    .map_err(|e| anyhow!("reload H2D copy (dsv4_deepgemm_weight) failed: {e}"))?,
+                scales: ctx
+                    .stream
+                    .clone_htod(scales.as_slice())
+                    .map_err(|e| anyhow!("reload H2D copy (dsv4_deepgemm_scales) failed: {e}"))?,
+                rows,
+                cols,
+                scale_rows,
+                scale_cols,
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => bail!("incomplete DSv4 DeepGEMM cache snapshot"),
     }
 }
 
@@ -1461,12 +1542,16 @@ impl DeviceMatrix {
             .clone_dtoh(&self.data)
             .map_err(|e| anyhow!("offload D2H copy (data) failed: {e}"))?;
         freed += data.len() * std::mem::size_of::<bf16>();
+        let (dsv4_deepgemm_weight, dsv4_deepgemm_scales) =
+            snapshot_dsv4_deepgemm_cache(ctx, &self.dsv4_deepgemm_cache, &mut freed)?;
 
         let snapshot = HostMatrixSnapshot {
             data,
             qweight: snapshot_opt_slice(ctx, &self.qweight, &mut freed)?,
             qscales: snapshot_opt_slice(ctx, &self.qscales, &mut freed)?,
             dsv4_scales: snapshot_opt_slice(ctx, &self.dsv4_scales, &mut freed)?,
+            dsv4_deepgemm_weight,
+            dsv4_deepgemm_scales,
             marlin_packed: snapshot_opt_slice(ctx, &self.marlin_packed, &mut freed)?,
             marlin_scales: snapshot_opt_slice(ctx, &self.marlin_scales, &mut freed)?,
             marlin_channel_scales: snapshot_opt_slice(
@@ -1504,6 +1589,7 @@ impl DeviceMatrix {
         self.qweight = None;
         self.qscales = None;
         self.dsv4_scales = None;
+        self.dsv4_deepgemm_cache = None;
         self.marlin_packed = None;
         self.marlin_scales = None;
         self.marlin_channel_scales = None;
@@ -1535,6 +1621,8 @@ impl DeviceMatrix {
         self.qweight = restore_opt_slice(ctx, &snapshot.qweight)?;
         self.qscales = restore_opt_slice(ctx, &snapshot.qscales)?;
         self.dsv4_scales = restore_opt_slice(ctx, &snapshot.dsv4_scales)?;
+        self.dsv4_deepgemm_cache =
+            restore_dsv4_deepgemm_cache(ctx, snapshot, self.rows, self.cols)?;
         self.marlin_packed = restore_opt_slice(ctx, &snapshot.marlin_packed)?;
         self.marlin_scales = restore_opt_slice(ctx, &snapshot.marlin_scales)?;
         self.marlin_channel_scales = restore_opt_slice(ctx, &snapshot.marlin_channel_scales)?;
@@ -1567,6 +1655,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
@@ -1620,6 +1709,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size,
             marlin_packed: None,
             marlin_scales: None,
@@ -1681,6 +1771,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size,
             marlin_packed: None,
             marlin_scales: None,
@@ -1740,7 +1831,7 @@ impl DeviceMatrix {
             .alloc_zeros::<bf16>(1)
             .map_err(|e| anyhow!("Alloc dummy: {e}"))?;
 
-        Ok(Self {
+        let mut matrix = Self {
             data: dummy,
             rows,
             cols,
@@ -1750,6 +1841,7 @@ impl DeviceMatrix {
             dsv4_scales: Some(scales),
             dsv4_scale_rows: scale_rows,
             dsv4_scale_cols: scale_cols,
+            dsv4_deepgemm_cache: None,
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
@@ -1763,7 +1855,12 @@ impl DeviceMatrix {
             tq_signs: None,
             tq_centroids: None,
             tq_bits: 0,
-        })
+        };
+        if dsv4_deepgemm_linear_cache_enabled() {
+            matrix.dsv4_deepgemm_cache =
+                Some(Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &matrix)?);
+        }
+        Ok(matrix)
     }
 
     /// Create from DeepSeek V4 packed FP4 E2M1 weights plus FP8 E8M0 block scales.
@@ -1819,6 +1916,7 @@ impl DeviceMatrix {
             dsv4_scales: Some(scales),
             dsv4_scale_rows: scale_rows,
             dsv4_scale_cols: scale_cols,
+            dsv4_deepgemm_cache: None,
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
@@ -1892,6 +1990,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size,
             marlin_packed: Some(packed),
             marlin_scales: Some(s_group),
@@ -2014,6 +2113,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size,
             marlin_packed: Some(w4a16_packed),
             marlin_scales: Some(w4a16_group),
@@ -2075,6 +2175,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
@@ -2136,6 +2237,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
@@ -2203,6 +2305,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
@@ -2264,6 +2367,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size: 256,
             marlin_packed: None,
             marlin_scales: None,
@@ -2324,6 +2428,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size,
             marlin_packed: None,
             marlin_scales: None,
@@ -2432,6 +2537,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size,
             marlin_packed: None,
             marlin_scales: None,
@@ -2588,6 +2694,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
@@ -2639,6 +2746,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,
@@ -2683,6 +2791,7 @@ impl DeviceMatrix {
                 dsv4_scales: None,
                 dsv4_scale_rows: 0,
                 dsv4_scale_cols: 0,
+                dsv4_deepgemm_cache: None,
                 group_size: 0,
                 marlin_packed: None,
                 marlin_scales: None,
@@ -2724,6 +2833,7 @@ impl DeviceMatrix {
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
             group_size: 0,
             marlin_packed: None,
             marlin_scales: None,

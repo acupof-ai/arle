@@ -881,7 +881,7 @@ fn collect_output(output: &std::process::Output) -> String {
     }
     if result.len() > 8000 {
         result.truncate(8000);
-        result.push_str("\n... (output truncated)");
+        result.push_str(TOOL_RESULT_TRUNCATION_MARKER);
     }
     result
 }

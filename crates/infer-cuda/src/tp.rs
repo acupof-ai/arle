@@ -216,6 +216,41 @@ impl TpRuntime {
         }
     }
 
+    /// Raw BF16 all-gather for TP-local attention slabs.
+    ///
+    /// FlashMLA's sparse decode kernel wants global heads (`h_q` 64/128), while
+    /// TP=8 ranks only hold their local head slab. This helper gathers one
+    /// local BF16 row from every rank into a rank-major receive buffer; the
+    /// caller repacks that buffer into FlashMLA's head-major layout.
+    #[cfg(feature = "cuda")]
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
+    pub unsafe fn all_gather_bf16_raw(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        sendbuf: *const std::ffi::c_void,
+        sendcount: usize,
+        recvbuf: *mut std::ffi::c_void,
+    ) -> anyhow::Result<()> {
+        match &self.comm {
+            TpComm::Single => anyhow::bail!("single-rank raw all_gather_bf16 is not needed"),
+            #[cfg(feature = "nccl")]
+            TpComm::Nccl(backend) => {
+                use cuda_kernels::collective::{CollectiveBackend, DType};
+
+                unsafe {
+                    backend.all_gather(
+                        sendbuf,
+                        recvbuf,
+                        sendcount,
+                        DType::BF16,
+                        ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Host-visible all-gather for small byte payloads such as CUDA IPC handles.
     ///
     /// Thin TP-level wrapper over the NCCL backend helper. DeepEP boot uses this

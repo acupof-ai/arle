@@ -88,7 +88,7 @@ More copy-paste: [`examples/`](examples/).
 | **OPD train (CUDA)** | Linux + NVIDIA | **Beta** | 2.49–2.91× faster than HF TRL `GKDTrainer`; LoRA fits 4 GB cards |
 | **CPU** | Portable | **Dev-only** | Smoke tests only |
 
-Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B) on CUDA + Metal. Next up: **DeepSeek V4** → **Qwen 3.6** ([ROADMAP](ROADMAP.md#next-model-priority-order)).
+Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B) on CUDA + Metal. **DeepSeek-V4-Flash** is in active multi-GPU bring-up (TP=8 / EP=8 FP8 MoE on 8×H20 — decode kernels landing gated, prefill in repair); **Qwen 3.6** is #2 ([ROADMAP](ROADMAP.md#next-model-priority-order)).
 
 Full numbers and tier policy: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
@@ -115,7 +115,7 @@ Benchmark data: [TTFT/TPOT steady sweep](docs/experience/wins/2026-06-02-metal-t
 [Metal SSD KV write-amplification cadence](docs/experience/wins/2026-06-02-metal-ssd-kv-wa-cadence.md).
 
 <p align="center">
-  <img src="docs/assets/metal-vs-mlxlm-ttft-tpot.png" alt="ARLE Metal vs mlx-lm TTFT and TPOT sweep" width="100%">
+  <img src="docs/assets/metal-vs-mlxlm-ttft-tpot.png" alt="ARLE Metal vs mlx-lm TTFT and TPOT sweep" width="62%">
 </p>
 
 ```mermaid
