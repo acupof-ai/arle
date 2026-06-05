@@ -3,15 +3,48 @@
 //! Prep kernels fuse Q/K RMSNorm + RoPE + KV-cache write; the TileLang kernels
 //! run the HD128/kv8 paged attention.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
+use cuda_kernels::attention as flash_kv;
 use cuda_kernels::ffi;
+use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
-use cuda_kernels::tensor::WeightFormat;
+use cuda_kernels::tensor::{WeightFormat, cache_ptr};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
+use std::sync::atomic::{AtomicI8, Ordering};
 
-use crate::dsv4::{Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer};
+use crate::dsv4::{
+    Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer, Dsv4MlaKvArena,
+};
 use crate::loader::PageMeta;
+use crate::tp::TpRuntime;
+
+const DSV4_FLASHMLA_MODEL1: i32 = 1;
+const DSV4_FLASHMLA_S_Q: usize = 1;
+const DSV4_FLASHMLA_OVERRIDE_ENV: i8 = -1;
+const DSV4_FLASHMLA_OVERRIDE_OFF: i8 = 0;
+const DSV4_FLASHMLA_OVERRIDE_ON: i8 = 1;
+
+static DSV4_FLASHMLA_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
+static DSV4_FUSED_WQKV_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
+
+pub(crate) fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
+    let value = match enabled {
+        Some(true) => DSV4_FLASHMLA_OVERRIDE_ON,
+        Some(false) => DSV4_FLASHMLA_OVERRIDE_OFF,
+        None => DSV4_FLASHMLA_OVERRIDE_ENV,
+    };
+    DSV4_FLASHMLA_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
+}
+
+pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
+    let value = match enabled {
+        Some(true) => DSV4_FLASHMLA_OVERRIDE_ON,
+        Some(false) => DSV4_FLASHMLA_OVERRIDE_OFF,
+        None => DSV4_FLASHMLA_OVERRIDE_ENV,
+    };
+    DSV4_FUSED_WQKV_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
+}
 
 pub(crate) struct Dsv4CompressorState {
     pending_kv: CudaSlice<half::bf16>,
@@ -73,10 +106,217 @@ impl Dsv4CompressorState {
     }
 }
 
+struct Dsv4FlashMlaDecodeState {
+    fp8_kv_pool: CudaSlice<u8>,
+    sw_blocks: usize,
+    comp_blocks: usize,
+    max_compressed_keys: usize,
+    topk_unified: usize,
+    fp8_kv_sw_bootstrapped: bool,
+    fp8_kv_comp_packed_rows: usize,
+    sw_bulk_block_ids: CudaSlice<i32>,
+    sw_bulk_rows: CudaSlice<i32>,
+    one_block_id: CudaSlice<i32>,
+    one_row: CudaSlice<i32>,
+    comp_block_ids: CudaSlice<i32>,
+    comp_rows: CudaSlice<i32>,
+    indices: CudaSlice<i32>,
+    topk_length: CudaSlice<i32>,
+    lse_out: CudaSlice<f32>,
+    lse_accum: CudaSlice<f32>,
+    o_accum: CudaSlice<f32>,
+    sched_meta: CudaSlice<i32>,
+    num_splits: CudaSlice<i32>,
+    tp_gathered_q: CudaSlice<half::bf16>,
+    tp_packed_q: CudaSlice<half::bf16>,
+    tp_full_out: CudaSlice<half::bf16>,
+    num_sm_parts: i32,
+    fixed_overhead_num_blocks: i32,
+    block_size_topk: i32,
+}
+
+impl Dsv4FlashMlaDecodeState {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        mode: DeepSeekV4AttentionMode,
+        compress_ratio: usize,
+        max_seq_len: usize,
+        kv_arena: &Dsv4MlaKvArena,
+        local_heads: usize,
+        tp_world: usize,
+    ) -> Result<Self> {
+        ensure!(
+            config.head_dim == 512 && kv_arena.bytes_per_token == 584,
+            "DSv4 FlashMLA decode only wires MODEL1 head_dim=512 bytes/token=584"
+        );
+        ensure!(
+            local_heads > 0 && tp_world > 0,
+            "DSv4 FlashMLA decode requires non-zero local_heads and tp_world"
+        );
+        let h_q = local_heads
+            .checked_mul(tp_world)
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA h_q overflow"))?;
+        ensure!(
+            matches!(h_q, 64 | 128),
+            "DSv4 FlashMLA decode requires global h_q 64 or 128, got {h_q}"
+        );
+        ensure!(
+            kv_arena.page_block_size == 64,
+            "DSv4 FlashMLA decode requires page_block_size=64"
+        );
+
+        let sw_blocks = config.sliding_window.div_ceil(kv_arena.page_block_size);
+        let compressed_rows = if mode == DeepSeekV4AttentionMode::SlidingWindow {
+            0
+        } else {
+            ensure!(
+                compress_ratio > 0,
+                "DSv4 FlashMLA compressed decode requires non-zero ratio"
+            );
+            max_seq_len.div_ceil(compress_ratio).max(1)
+        };
+        let comp_blocks = compressed_rows.div_ceil(kv_arena.page_block_size);
+        let max_compressed_keys = match mode {
+            DeepSeekV4AttentionMode::SlidingWindow => 0,
+            DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
+            DeepSeekV4AttentionMode::HybridCompressed => compressed_rows.div_ceil(128) * 128,
+        };
+        let topk_unified = config
+            .sliding_window
+            .checked_add(max_compressed_keys)
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA topk_unified overflow"))?;
+        ensure!(
+            topk_unified.is_multiple_of(128),
+            "DSv4 FlashMLA topk_unified {topk_unified} must be multiple of 128"
+        );
+        let total_blocks = sw_blocks
+            .checked_add(comp_blocks)
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA total block overflow"))?;
+
+        let mut num_sm_parts = 0_i32;
+        let mut fixed_overhead_num_blocks = 0_i32;
+        let mut block_size_topk = 0_i32;
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_get_meta(
+                h_q as i32,
+                DSV4_FLASHMLA_S_Q as i32,
+                DSV4_FLASHMLA_MODEL1,
+                &mut num_sm_parts,
+                &mut fixed_overhead_num_blocks,
+                &mut block_size_topk,
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA decode meta failed: {e}"))?;
+        }
+        let num_sm_parts_max = (num_sm_parts as usize).max(256);
+        let h_q_d = h_q
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA h_q*d overflow"))?;
+        let accum_rows = num_sm_parts_max + 1;
+        let sw_slots = config.sliding_window;
+        let comp_slots = compressed_rows.max(1);
+
+        Ok(Self {
+            fp8_kv_pool: kv_arena.alloc_fp8_arena(ctx, total_blocks)?,
+            sw_blocks,
+            comp_blocks,
+            max_compressed_keys,
+            topk_unified,
+            fp8_kv_sw_bootstrapped: false,
+            fp8_kv_comp_packed_rows: 0,
+            sw_bulk_block_ids: ctx.stream.alloc_zeros::<i32>(sw_slots)?,
+            sw_bulk_rows: ctx.stream.alloc_zeros::<i32>(sw_slots)?,
+            one_block_id: ctx.stream.alloc_zeros::<i32>(1)?,
+            one_row: ctx.stream.alloc_zeros::<i32>(1)?,
+            comp_block_ids: ctx.stream.alloc_zeros::<i32>(comp_slots)?,
+            comp_rows: ctx.stream.alloc_zeros::<i32>(comp_slots)?,
+            indices: ctx.stream.alloc_zeros::<i32>(topk_unified)?,
+            topk_length: ctx.stream.alloc_zeros::<i32>(1)?,
+            lse_out: ctx.stream.alloc_zeros::<f32>(h_q)?,
+            lse_accum: ctx.stream.alloc_zeros::<f32>(accum_rows * h_q)?,
+            o_accum: ctx.stream.alloc_zeros::<f32>(accum_rows * h_q_d)?,
+            sched_meta: ctx.stream.alloc_zeros::<i32>(num_sm_parts_max * 8)?,
+            num_splits: ctx.stream.alloc_zeros::<i32>(2)?,
+            tp_gathered_q: ctx.stream.alloc_zeros::<half::bf16>(h_q_d)?,
+            tp_packed_q: ctx.stream.alloc_zeros::<half::bf16>(h_q_d)?,
+            tp_full_out: ctx.stream.alloc_zeros::<half::bf16>(h_q_d)?,
+            num_sm_parts,
+            fixed_overhead_num_blocks,
+            block_size_topk,
+        })
+    }
+
+    fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+        self.fp8_kv_sw_bootstrapped = false;
+        self.fp8_kv_comp_packed_rows = 0;
+        ctx.stream
+            .memset_zeros(&mut self.fp8_kv_pool)
+            .map_err(|e| anyhow!("DSv4 FlashMLA FP8 KV reset failed: {e}"))?;
+        Ok(())
+    }
+}
+
+struct Dsv4FusedWqkvDecodeScratch {
+    input_fp8: CudaSlice<u8>,
+    input_scales: CudaSlice<f32>,
+    qkv_raw: HiddenStates,
+    active_experts: CudaSlice<i32>,
+    active_offsets: CudaSlice<i32>,
+    active_counts: CudaSlice<i32>,
+    max_m: usize,
+    scale_stride_m: usize,
+    hidden_dim: usize,
+    q_lora_rank: usize,
+    head_dim: usize,
+}
+
+impl Dsv4FusedWqkvDecodeScratch {
+    fn new(ctx: &DeviceContext, config: &DeepSeekV4Config) -> Result<Self> {
+        let max_m = 128;
+        let scale_stride_m = 128;
+        let hidden_dim = config.hidden_size;
+        let q_lora_rank = config.q_lora_rank;
+        let head_dim = config.head_dim;
+        let scale_cols = hidden_dim.div_ceil(128);
+        Ok(Self {
+            input_fp8: ctx
+                .stream
+                .alloc_zeros::<u8>(max_m * hidden_dim)
+                .map_err(|e| anyhow!("DSv4 fused wqkv input fp8 scratch alloc failed: {e}"))?,
+            input_scales: ctx
+                .stream
+                .alloc_zeros::<f32>(scale_stride_m * scale_cols)
+                .map_err(|e| anyhow!("DSv4 fused wqkv input scale scratch alloc failed: {e}"))?,
+            qkv_raw: unsafe { HiddenStates::uninit(ctx, q_lora_rank + head_dim, 1)? },
+            active_experts: ctx
+                .stream
+                .clone_htod(&[0_i32])
+                .map_err(|e| anyhow!("DSv4 fused wqkv active_experts H2D failed: {e}"))?,
+            active_offsets: ctx
+                .stream
+                .clone_htod(&[0_i32])
+                .map_err(|e| anyhow!("DSv4 fused wqkv active_offsets H2D failed: {e}"))?,
+            active_counts: ctx
+                .stream
+                .clone_htod(&[1_i32])
+                .map_err(|e| anyhow!("DSv4 fused wqkv active_counts H2D failed: {e}"))?,
+            max_m,
+            scale_stride_m,
+            hidden_dim,
+            q_lora_rank,
+            head_dim,
+        })
+    }
+}
+
 pub(crate) struct Dsv4LayerAttentionState {
     sw_window_cache: CudaSlice<half::bf16>,
     compressor: Option<Dsv4CompressorState>,
     indexer: Option<Dsv4CompressorState>,
+    flashmla: Option<Dsv4FlashMlaDecodeState>,
+    fused_wqkv: Option<Dsv4FusedWqkvDecodeScratch>,
 }
 
 impl Dsv4LayerAttentionState {
@@ -86,6 +326,9 @@ impl Dsv4LayerAttentionState {
         mode: DeepSeekV4AttentionMode,
         compress_ratio: usize,
         max_seq_len: usize,
+        kv_arena: &Dsv4MlaKvArena,
+        local_heads: usize,
+        tp_world: usize,
     ) -> Result<Self> {
         let sw_len = config.sliding_window * config.head_dim;
         ensure!(
@@ -121,10 +364,31 @@ impl Dsv4LayerAttentionState {
         } else {
             None
         };
+        let flashmla = if dsv4_flashmla_decode_alloc_enabled()? {
+            Some(Dsv4FlashMlaDecodeState::new(
+                ctx,
+                config,
+                mode,
+                compress_ratio,
+                max_seq_len,
+                kv_arena,
+                local_heads,
+                tp_world,
+            )?)
+        } else {
+            None
+        };
+        let fused_wqkv = if dsv4_fused_wqkv_decode_alloc_enabled()? {
+            Some(Dsv4FusedWqkvDecodeScratch::new(ctx, config)?)
+        } else {
+            None
+        };
         Ok(Self {
             sw_window_cache,
             compressor,
             indexer,
+            flashmla,
+            fused_wqkv,
         })
     }
 
@@ -138,7 +402,28 @@ impl Dsv4LayerAttentionState {
         if let Some(indexer) = &mut self.indexer {
             indexer.reset(ctx)?;
         }
+        if let Some(flashmla) = &mut self.flashmla {
+            flashmla.reset(ctx)?;
+        }
         Ok(())
+    }
+
+    pub(crate) fn advance_decode_len(
+        &mut self,
+        mode: DeepSeekV4AttentionMode,
+        ratio: usize,
+        total_len: usize,
+    ) {
+        if mode == DeepSeekV4AttentionMode::SlidingWindow {
+            return;
+        }
+        let compressed_rows = total_len / ratio;
+        if let Some(compressor) = &mut self.compressor {
+            compressor.compressed.seq_len = compressed_rows;
+        }
+        if let Some(indexer) = &mut self.indexer {
+            indexer.compressed.seq_len = compressed_rows;
+        }
     }
 }
 
@@ -676,6 +961,74 @@ pub(crate) fn mla_linear(
     Ok(())
 }
 
+pub(crate) fn mla_linear_vec(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &DeviceVec,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        weight.cols == x.len,
+        "mla_linear_vec input dim mismatch: weight cols {}, x len {}",
+        weight.cols,
+        x.len
+    );
+    ensure!(
+        weight.rows == out.hidden_dim && out.seq_len == 1,
+        "mla_linear_vec output shape mismatch: weight rows {}, out {}x{}",
+        weight.rows,
+        out.hidden_dim,
+        out.seq_len
+    );
+    let qw = weight
+        .qweight
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DSv4 MLA matrix missing raw quant bytes (qweight)"))?;
+    let scales = weight
+        .dsv4_scales
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DSv4 MLA matrix missing block scales (dsv4_scales)"))?;
+    let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let stream = ctx.stream.cu_stream();
+    // SAFETY: all buffers are valid on ctx.stream; shapes are checked above.
+    unsafe {
+        let res = match weight.weight_format {
+            WeightFormat::Dsv4Fp8BlockScaled => ffi::dsv4_fp8_gemv_batch_cuda(
+                qw_ptr as *const u8,
+                scales_ptr as *const u8,
+                x_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                1,
+                weight.rows as i32,
+                weight.cols as i32,
+                weight.dsv4_scale_rows as i32,
+                weight.dsv4_scale_cols as i32,
+                stream,
+            ),
+            WeightFormat::Dsv4Fp4BlockScaled => ffi::dsv4_fp4_gemv_batch_cuda(
+                qw_ptr as *const u8,
+                scales_ptr as *const u8,
+                x_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                1,
+                weight.rows as i32,
+                weight.cols as i32,
+                weight.dsv4_scale_rows as i32,
+                weight.dsv4_scale_cols as i32,
+                stream,
+            ),
+            other => {
+                bail!("mla_linear_vec: expected DSv4 FP8/FP4 block-scaled weight, got {other:?}")
+            }
+        };
+        res.result()?;
+    }
+    Ok(())
+}
+
 /// Run one DSv4 linear `out = W · x` dispatching on the weight's on-disk format:
 /// bf16 dense → [`crate::ops::gemm_batch`]; FP8/FP4 block-scaled → [`mla_linear`].
 /// DSv4 checkpoints ship the compressor / indexer / HC-mix matrices in either
@@ -695,6 +1048,558 @@ pub(crate) fn dsv4_linear(
     }
 }
 
+pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
+    match DSV4_FLASHMLA_DECODE_OVERRIDE.load(Ordering::Relaxed) {
+        DSV4_FLASHMLA_OVERRIDE_OFF => return Ok(false),
+        DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
+        _ => {}
+    }
+    env_flag("ARLE_DSV4_FLASHMLA_DECODE")
+}
+
+fn dsv4_flashmla_decode_alloc_enabled() -> Result<bool> {
+    if env_flag("ARLE_DSV4_FLASHMLA_DECODE_ALLOC")? {
+        return Ok(true);
+    }
+    dsv4_flashmla_decode_enabled()
+}
+
+pub(crate) fn dsv4_fused_wqkv_decode_alloc_enabled() -> Result<bool> {
+    if env_flag("ARLE_DSV4_FUSED_WQKV_DECODE_ALLOC")? {
+        return Ok(true);
+    }
+    dsv4_fused_wqkv_decode_enabled()
+}
+
+fn dsv4_fused_wqkv_decode_enabled() -> Result<bool> {
+    match DSV4_FUSED_WQKV_DECODE_OVERRIDE.load(Ordering::Relaxed) {
+        DSV4_FLASHMLA_OVERRIDE_OFF => return Ok(false),
+        DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
+        _ => {}
+    }
+    env_flag("ARLE_DSV4_FUSED_WQKV_DECODE")
+}
+
+fn env_flag(name: &str) -> Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => match value.as_str() {
+            "1" | "true" | "TRUE" | "yes" | "on" | "ON" => Ok(true),
+            "0" | "false" | "FALSE" | "no" | "off" | "OFF" | "" => Ok(false),
+            other => bail!("unsupported {name} `{other}` (expected 0/1, true/false, on/off)"),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => bail!("{name} invalid env: {e}"),
+    }
+}
+
+fn flashmla_mode_int(mode: DeepSeekV4AttentionMode) -> i32 {
+    match mode {
+        DeepSeekV4AttentionMode::CompressedSparse => 1,
+        DeepSeekV4AttentionMode::SlidingWindow | DeepSeekV4AttentionMode::HybridCompressed => 2,
+    }
+}
+
+fn flashmla_pack_sw_ring(
+    ctx: &DeviceContext,
+    flash: &mut Dsv4FlashMlaDecodeState,
+    window_cache: &CudaSlice<half::bf16>,
+    config: &DeepSeekV4Config,
+) -> Result<()> {
+    if flash.fp8_kv_sw_bootstrapped {
+        return Ok(());
+    }
+    let sliding_window = config.sliding_window;
+    let page_block_size = 64;
+    let mut block_ids = Vec::with_capacity(sliding_window);
+    let mut rows = Vec::with_capacity(sliding_window);
+    for slot in 0..sliding_window {
+        block_ids.push((slot / page_block_size) as i32);
+        rows.push((slot % page_block_size) as i32);
+    }
+    ctx.stream
+        .memcpy_htod(&block_ids, &mut flash.sw_bulk_block_ids)
+        .map_err(|e| anyhow!("DSv4 FlashMLA SW block_ids H2D failed: {e}"))?;
+    ctx.stream
+        .memcpy_htod(&rows, &mut flash.sw_bulk_rows)
+        .map_err(|e| anyhow!("DSv4 FlashMLA SW rows H2D failed: {e}"))?;
+    let (window_ptr, _wg) = window_cache.device_ptr(&ctx.stream);
+    let (pool_ptr, _pg) = flash.fp8_kv_pool.device_ptr_mut(&ctx.stream);
+    let nope_ptr = window_ptr as u64;
+    let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
+    flash_kv::dsv4_fp8_kv_pack_strided_raw(
+        ctx,
+        nope_ptr,
+        rope_ptr,
+        pool_ptr,
+        &flash.sw_bulk_block_ids,
+        &flash.sw_bulk_rows,
+        sliding_window,
+        page_block_size,
+        config.head_dim,
+        config.head_dim,
+    )?;
+    flash.fp8_kv_sw_bootstrapped = true;
+    Ok(())
+}
+
+fn flashmla_pack_one_sw_token(
+    ctx: &DeviceContext,
+    flash: &mut Dsv4FlashMlaDecodeState,
+    k_prepared: &HiddenStates,
+    start_pos_device: &CudaSlice<i32>,
+    config: &DeepSeekV4Config,
+) -> Result<()> {
+    let (bid_ptr, bid_guard) = flash.one_block_id.device_ptr_mut(&ctx.stream);
+    let (row_ptr, row_guard) = flash.one_row.device_ptr_mut(&ctx.stream);
+    let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
+    flash_kv::dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_raw(
+        ctx,
+        bid_ptr,
+        row_ptr,
+        start_ptr,
+        config.sliding_window,
+        64,
+    )?;
+    drop(bid_guard);
+    drop(row_guard);
+
+    let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
+    let (pool_ptr, _pg) = flash.fp8_kv_pool.device_ptr_mut(&ctx.stream);
+    let nope_ptr = k_ptr as u64;
+    let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
+    flash_kv::dsv4_fp8_kv_pack_strided_raw(
+        ctx,
+        nope_ptr,
+        rope_ptr,
+        pool_ptr,
+        &flash.one_block_id,
+        &flash.one_row,
+        1,
+        64,
+        config.head_dim,
+        config.head_dim,
+    )
+}
+
+fn flashmla_pack_compressed_delta(
+    ctx: &DeviceContext,
+    flash: &mut Dsv4FlashMlaDecodeState,
+    compressed: Option<&HiddenStates>,
+    config: &DeepSeekV4Config,
+) -> Result<()> {
+    let Some(compressed) = compressed else {
+        return Ok(());
+    };
+    let start_row = flash.fp8_kv_comp_packed_rows;
+    let end_row = compressed.seq_len;
+    if end_row <= start_row {
+        return Ok(());
+    }
+    let n = end_row - start_row;
+    let mut block_ids = Vec::with_capacity(n);
+    let mut rows = Vec::with_capacity(n);
+    for row in start_row..end_row {
+        block_ids.push((flash.sw_blocks + row / 64) as i32);
+        rows.push((row % 64) as i32);
+    }
+    ctx.stream
+        .memcpy_htod(&block_ids, &mut flash.comp_block_ids)
+        .map_err(|e| anyhow!("DSv4 FlashMLA compressed block_ids H2D failed: {e}"))?;
+    ctx.stream
+        .memcpy_htod(&rows, &mut flash.comp_rows)
+        .map_err(|e| anyhow!("DSv4 FlashMLA compressed rows H2D failed: {e}"))?;
+
+    let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
+    let (pool_ptr, _pg) = flash.fp8_kv_pool.device_ptr_mut(&ctx.stream);
+    let row_offset_bytes = start_row as u64 * config.head_dim as u64 * 2;
+    let nope_ptr = compressed_ptr as u64 + row_offset_bytes;
+    let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
+    flash_kv::dsv4_fp8_kv_pack_strided_raw(
+        ctx,
+        nope_ptr,
+        rope_ptr,
+        pool_ptr,
+        &flash.comp_block_ids,
+        &flash.comp_rows,
+        n,
+        64,
+        config.head_dim,
+        config.head_dim,
+    )?;
+    flash.fp8_kv_comp_packed_rows = end_row;
+    Ok(())
+}
+
+fn update_bf16_sw_window(
+    ctx: &DeviceContext,
+    sw_window_cache: &mut CudaSlice<half::bf16>,
+    k_prepared: &HiddenStates,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    config: &DeepSeekV4Config,
+) -> Result<()> {
+    let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
+    let (window_ptr, _wg) = sw_window_cache.device_ptr_mut(&ctx.stream);
+    unsafe {
+        if let Some(start_pos_device) = start_pos_device {
+            let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
+            ffi::dsv4_update_window_cache_start_pos_ptr_cuda(
+                k_ptr as *const ffi::Half,
+                window_ptr as *mut ffi::Half,
+                k_prepared.seq_len as i32,
+                start_ptr as *const i32,
+                config.sliding_window as i32,
+                config.head_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        } else {
+            ffi::dsv4_update_window_cache_cuda(
+                k_ptr as *const ffi::Half,
+                window_ptr as *mut ffi::Half,
+                k_prepared.seq_len as i32,
+                start_pos as i32,
+                config.sliding_window as i32,
+                config.head_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_flashmla_decode_attention(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    q_prepared: &HiddenStates,
+    k_prepared: &HiddenStates,
+    selected: Option<&CudaSlice<i32>>,
+    compressed: Option<&HiddenStates>,
+    sw_window_cache: &mut CudaSlice<half::bf16>,
+    flash: &mut Dsv4FlashMlaDecodeState,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    tp: &TpRuntime,
+    local_heads: usize,
+    local_attn: &mut HiddenStates,
+    sm_scale: f32,
+    rope_base: f32,
+    original_seq_len: i32,
+    rope_factor: f32,
+    rope_beta_fast: f32,
+    rope_beta_slow: f32,
+) -> Result<bool> {
+    if !dsv4_flashmla_decode_enabled()? {
+        return Ok(false);
+    }
+    if q_prepared.seq_len != 1 {
+        return Ok(false);
+    }
+    let start_pos_device = start_pos_device.ok_or_else(|| {
+        anyhow!("DSv4 FlashMLA decode requires device start_pos for token_count=1")
+    })?;
+    ensure!(
+        config.head_dim == 512 && config.qk_rope_head_dim == 64,
+        "DSv4 FlashMLA decode only supports MODEL1 head_dim=512 rope_dim=64"
+    );
+    ensure!(
+        local_attn.seq_len == 1,
+        "DSv4 FlashMLA decode writes exactly one token"
+    );
+
+    let tp_world = tp.config().world_size;
+    let tp_rank = tp.config().rank;
+    let global_heads = local_heads
+        .checked_mul(tp_world)
+        .ok_or_else(|| anyhow!("DSv4 FlashMLA global head overflow"))?;
+    ensure!(
+        matches!(global_heads, 64 | 128),
+        "DSv4 FlashMLA decode requires global heads 64/128, got {global_heads}"
+    );
+
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_sw_ring");
+        flashmla_pack_sw_ring(ctx, flash, sw_window_cache, config)?;
+    }
+
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_one");
+        flashmla_pack_one_sw_token(ctx, flash, k_prepared, start_pos_device, config)?;
+    }
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed");
+        flashmla_pack_compressed_delta(ctx, flash, compressed, config)?;
+    }
+
+    let mode_int = flashmla_mode_int(mode);
+    let selected_ptr_u64 = if mode == DeepSeekV4AttentionMode::CompressedSparse {
+        let selected =
+            selected.ok_or_else(|| anyhow!("DSv4 FlashMLA CSA missing selected topk"))?;
+        let (ptr, guard) = selected.device_ptr(&ctx.stream);
+        let ptr_u64 = ptr as u64;
+        drop(guard);
+        ptr_u64
+    } else {
+        0
+    };
+    let (indices_ptr, indices_guard) = flash.indices.device_ptr_mut(&ctx.stream);
+    let (start_ptr, start_guard) = start_pos_device.device_ptr(&ctx.stream);
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_build_indices");
+        flash_kv::dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
+            ctx,
+            indices_ptr,
+            selected_ptr_u64,
+            flash.sw_blocks,
+            config.sliding_window,
+            start_ptr,
+            flash.max_compressed_keys,
+            if mode == DeepSeekV4AttentionMode::SlidingWindow {
+                1
+            } else {
+                compress_ratio
+            },
+            mode_int,
+            64,
+        )?;
+    }
+    drop(indices_guard);
+    drop(start_guard);
+
+    let topk = i32::try_from(flash.topk_unified)
+        .map_err(|_| anyhow!("DSv4 FlashMLA topk {} overflows i32", flash.topk_unified))?;
+    ctx.stream
+        .memcpy_htod(&[topk], &mut flash.topk_length)
+        .map_err(|e| anyhow!("DSv4 FlashMLA topk_length H2D failed: {e}"))?;
+
+    let (topk_ptr, topk_guard) = flash.topk_length.device_ptr(&ctx.stream);
+    let (sched_ptr, sched_guard) = flash.sched_meta.device_ptr_mut(&ctx.stream);
+    let (splits_ptr, splits_guard) = flash.num_splits.device_ptr_mut(&ctx.stream);
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_sched_meta");
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
+                1,
+                1,
+                flash.block_size_topk,
+                flash.fixed_overhead_num_blocks,
+                topk,
+                0,
+                topk_ptr as *const i32,
+                std::ptr::null(),
+                sched_ptr as *mut i32,
+                splits_ptr as *mut i32,
+                flash.num_sm_parts,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA sched_meta failed: {e}"))?;
+        }
+    }
+    drop(topk_guard);
+    drop(sched_guard);
+    drop(splits_guard);
+
+    let (q_ptr, q_guard) = q_prepared.data.device_ptr(&ctx.stream);
+    let (pool_ptr, pool_guard) = flash.fp8_kv_pool.device_ptr(&ctx.stream);
+    let (out_ptr, out_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
+    let (lse_out_ptr, lse_guard) = flash.lse_out.device_ptr_mut(&ctx.stream);
+    let (lse_accum_ptr, lse_accum_guard) = flash.lse_accum.device_ptr_mut(&ctx.stream);
+    let (o_accum_ptr, o_accum_guard) = flash.o_accum.device_ptr_mut(&ctx.stream);
+    let (indices_ptr, indices_guard) = flash.indices.device_ptr(&ctx.stream);
+    let (topk_ptr, topk_guard) = flash.topk_length.device_ptr(&ctx.stream);
+    let (sched_ptr, sched_guard) = flash.sched_meta.device_ptr(&ctx.stream);
+    let (splits_ptr, splits_guard) = flash.num_splits.device_ptr(&ctx.stream);
+
+    let q_for_flashmla = if tp_world > 1 {
+        let (gather_ptr, gather_guard) = flash.tp_gathered_q.device_ptr_mut(&ctx.stream);
+        {
+            let _nvtx = crate::nvtx::range("dsv4/flashmla_q_allgather");
+            unsafe {
+                tp.all_gather_bf16_raw(
+                    ctx,
+                    q_ptr as *const std::ffi::c_void,
+                    local_heads * config.head_dim,
+                    gather_ptr as *mut std::ffi::c_void,
+                )?;
+            }
+        }
+        drop(gather_guard);
+        let (packed_ptr, packed_guard) = flash.tp_packed_q.device_ptr_mut(&ctx.stream);
+        {
+            let _nvtx = crate::nvtx::range("dsv4/flashmla_q_repack");
+            unsafe {
+                ffi::dsv4_tp_q_repack_cuda(
+                    gather_ptr as *const ffi::Half,
+                    packed_ptr as *mut ffi::Half,
+                    tp_world as i32,
+                    1,
+                    local_heads as i32,
+                    config.head_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA TP Q repack failed: {e}"))?;
+            }
+        }
+        drop(packed_guard);
+        packed_ptr as *const ffi::Half
+    } else {
+        q_ptr as *const ffi::Half
+    };
+
+    let (sink_base, sink_guard) = attention.attn_sink_f32.device_ptr(&ctx.stream);
+    ensure!(
+        if tp_world > 1 {
+            attention.attn_sink_f32.len() >= global_heads
+        } else {
+            attention.attn_sink_f32.len() >= tp_rank * local_heads + local_heads
+        },
+        "DSv4 FlashMLA attn_sink_f32 len {} cannot cover heads",
+        attention.attn_sink_f32.len()
+    );
+    let sink_ptr = if tp_world > 1 {
+        sink_base as *const f32
+    } else {
+        unsafe { (sink_base as *const f32).add(tp_rank * local_heads) }
+    };
+
+    let flash_out_ptr = if tp_world > 1 {
+        let (full_out_ptr, full_out_guard) = flash.tp_full_out.device_ptr_mut(&ctx.stream);
+        drop(full_out_guard);
+        full_out_ptr as *mut ffi::Half
+    } else {
+        out_ptr as *mut ffi::Half
+    };
+
+    let bytes_per_token = 584_i32;
+    let stride_kv_block_bytes = 64_i32 * bytes_per_token;
+    let stride_q = (global_heads * config.head_dim) as i32;
+    let stride_o = stride_q;
+    let stride_indices = flash.topk_unified as i32;
+    let stride_lse = global_heads as i32;
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_fwd");
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_fwd(
+                q_for_flashmla,
+                pool_ptr as *const ffi::Half,
+                indices_ptr as *const i32,
+                topk_ptr as *const i32,
+                sink_ptr,
+                flash_out_ptr,
+                lse_out_ptr as *mut f32,
+                lse_accum_ptr as *mut f32,
+                o_accum_ptr as *mut f32,
+                sched_ptr as *const i32,
+                splits_ptr as *const i32,
+                1,
+                1,
+                global_heads as i32,
+                1,
+                config.head_dim as i32,
+                config.head_dim as i32,
+                (flash.sw_blocks + flash.comp_blocks) as i32,
+                64,
+                stride_indices,
+                flash.num_sm_parts,
+                DSV4_FLASHMLA_MODEL1,
+                sm_scale,
+                stride_q,
+                stride_q,
+                config.head_dim as i32,
+                stride_kv_block_bytes,
+                bytes_per_token,
+                stride_indices,
+                stride_indices,
+                stride_lse,
+                1,
+                stride_o,
+                stride_o,
+                config.head_dim as i32,
+                global_heads as i32,
+                global_heads as i32,
+                stride_o,
+                stride_o,
+                config.head_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA sparse decode failed: {e}"))?;
+        }
+    }
+
+    if tp_world > 1 {
+        let (full_out_ptr, full_out_guard) = flash.tp_full_out.device_ptr(&ctx.stream);
+        {
+            let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice");
+            unsafe {
+                ffi::dsv4_tp_out_slice_cuda(
+                    full_out_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    1,
+                    (global_heads * config.head_dim) as i32,
+                    (local_heads * config.head_dim) as i32,
+                    (tp_rank * local_heads * config.head_dim) as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA TP out slice failed: {e}"))?;
+            }
+        }
+        drop(full_out_guard);
+    }
+
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_inverse_rope");
+        unsafe {
+            ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
+                out_ptr as *mut ffi::Half,
+                1,
+                local_heads as i32,
+                config.head_dim as i32,
+                config.qk_rope_head_dim as i32,
+                start_ptr as *const i32,
+                rope_base,
+                original_seq_len,
+                rope_factor,
+                rope_beta_fast,
+                rope_beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA output inverse-rope failed: {e}"))?;
+        }
+    }
+
+    drop(q_guard);
+    drop(pool_guard);
+    drop(out_guard);
+    drop(lse_guard);
+    drop(lse_accum_guard);
+    drop(o_accum_guard);
+    drop(indices_guard);
+    drop(topk_guard);
+    drop(sched_guard);
+    drop(splits_guard);
+    drop(sink_guard);
+
+    update_bf16_sw_window(
+        ctx,
+        sw_window_cache,
+        k_prepared,
+        start_pos,
+        Some(start_pos_device),
+        config,
+    )?;
+    Ok(true)
+}
+
 /// RMSNorm a `HiddenStates` in place into a fresh buffer (the MLA Q/KV LoRA
 /// norms `q_norm` / `kv_norm`). Thin wrapper over the shared batched RMSNorm.
 fn mla_rms_norm(
@@ -703,7 +1608,8 @@ fn mla_rms_norm(
     weight: &DeviceVec,
     eps: f32,
 ) -> Result<HiddenStates> {
-    let mut out = HiddenStates::zeros(ctx, x.hidden_dim, x.seq_len)?;
+    // SAFETY: rms_norm_batched_cuda writes the full output buffer.
+    let mut out = unsafe { HiddenStates::uninit(ctx, x.hidden_dim, x.seq_len)? };
     {
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
@@ -723,6 +1629,150 @@ fn mla_rms_norm(
         }
     }
     Ok(out)
+}
+
+fn mla_rms_norm_decode_slice(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    offset: usize,
+    width: usize,
+    weight: &DeviceVec,
+    eps: f32,
+) -> Result<HiddenStates> {
+    ensure!(
+        x.seq_len == 1,
+        "DSv4 fused wqkv slice RMSNorm is decode-only, got seq_len={}",
+        x.seq_len
+    );
+    ensure!(
+        offset + width <= x.hidden_dim,
+        "DSv4 fused wqkv slice out of range: offset={offset} width={width} hidden_dim={}",
+        x.hidden_dim
+    );
+    ensure!(
+        weight.len == width,
+        "DSv4 fused wqkv slice norm weight len {} != slice width {width}",
+        weight.len
+    );
+    let mut out = unsafe { HiddenStates::uninit(ctx, width, 1)? };
+    {
+        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+        let x_ptr = unsafe { (x_ptr as *const ffi::Half).add(offset) };
+        unsafe {
+            ffi::rms_norm_batched_cuda(
+                x_ptr,
+                w_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                width as i32,
+                1,
+                eps,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    Ok(out)
+}
+
+fn run_fused_wqkv_decode(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    hidden: &HiddenStates,
+    scratch: &mut Dsv4FusedWqkvDecodeScratch,
+) -> Result<(HiddenStates, HiddenStates, HiddenStates)> {
+    ensure!(
+        hidden.seq_len == 1,
+        "DSv4 fused wqkv decode path requires seq_len=1, got {}",
+        hidden.seq_len
+    );
+    ensure!(
+        hidden.hidden_dim == scratch.hidden_dim && hidden.hidden_dim == config.hidden_size,
+        "DSv4 fused wqkv hidden dim mismatch: hidden={} scratch={} config={}",
+        hidden.hidden_dim,
+        scratch.hidden_dim,
+        config.hidden_size
+    );
+    ensure!(
+        scratch.q_lora_rank == attention.wq_a.rows && scratch.head_dim == attention.wkv.rows,
+        "DSv4 fused wqkv scratch shape mismatch: scratch q={} kv={} weights q={} kv={}",
+        scratch.q_lora_rank,
+        scratch.head_dim,
+        attention.wq_a.rows,
+        attention.wkv.rows
+    );
+    let cache = attention.wqkv_a_deepgemm.as_ref().ok_or_else(|| {
+        anyhow!("DSv4 fused wqkv decode requested but fused cache was not loaded")
+    })?;
+    ensure!(
+        cache.rows == scratch.q_lora_rank + scratch.head_dim && cache.cols == scratch.hidden_dim,
+        "DSv4 fused wqkv cache shape {}x{} != expected {}x{}",
+        cache.rows,
+        cache.cols,
+        scratch.q_lora_rank + scratch.head_dim,
+        scratch.hidden_dim
+    );
+    let scale_cols = scratch.hidden_dim.div_ceil(128);
+    ensure!(
+        scratch.input_scales.len() >= scratch.scale_stride_m * scale_cols,
+        "DSv4 fused wqkv scale scratch too small"
+    );
+    let stream = ctx.stream.cu_stream();
+    unsafe {
+        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+            cache_ptr(&hidden.data, ctx),
+            cache_ptr(&scratch.input_fp8, ctx),
+            cache_ptr(&scratch.input_scales, ctx),
+            cache_ptr(&scratch.active_experts, ctx),
+            cache_ptr(&scratch.active_offsets, ctx),
+            cache_ptr(&scratch.active_counts, ctx),
+            1,
+            scratch.max_m,
+            scratch.hidden_dim,
+            scratch.scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 fused wqkv activation quantize failed: {e}"))?;
+        cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+            cache_ptr(&scratch.input_fp8, ctx),
+            cache_ptr(&scratch.input_scales, ctx),
+            cache_ptr(&cache.weight, ctx),
+            cache_ptr(&cache.scales, ctx),
+            cache_ptr(&scratch.qkv_raw.data, ctx),
+            1,
+            cache.rows,
+            cache.cols,
+            scratch.scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 fused wqkv DeepGEMM dense failed: {e}"))?;
+    }
+    let c_q_normed = mla_rms_norm_decode_slice(
+        ctx,
+        &scratch.qkv_raw,
+        0,
+        scratch.q_lora_rank,
+        &attention.q_norm,
+        config.rms_norm_eps,
+    )?;
+    let kv_normed = mla_rms_norm_decode_slice(
+        ctx,
+        &scratch.qkv_raw,
+        scratch.q_lora_rank,
+        scratch.head_dim,
+        &attention.kv_norm,
+        config.rms_norm_eps,
+    )?;
+
+    let mut q_raw = unsafe { HiddenStates::uninit(ctx, attention.wq_b.rows, 1)? };
+    let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
+    crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+        dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+    })?;
+    drop(nvtx_wq_b);
+    Ok((c_q_normed, q_raw, kv_normed))
 }
 
 /// One DSv4 MLA attention block (SlidingWindow / CompressedSparse /
@@ -751,7 +1801,8 @@ pub(crate) fn mla_attention(
     hidden: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
     start_pos: usize,
-    tp_rank: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    tp: &TpRuntime,
     out: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
@@ -771,6 +1822,7 @@ pub(crate) fn mla_attention(
     );
     let local_heads = local_width / head_dim;
     ensure!(local_heads > 0, "DSv4 MLA requires at least one local head");
+    let tp_rank = tp.config().rank;
     // This rank owns global heads [tp_rank*local_heads, +local_heads); the
     // whole-loaded attn_sink must be indexed from that offset (see fn docs).
     let sink_offset = tp_rank * local_heads;
@@ -825,26 +1877,65 @@ pub(crate) fn mla_attention(
     let start_pos_i32 = i32::try_from(start_pos)
         .map_err(|_| anyhow::anyhow!("DSv4 MLA start_pos {start_pos} overflows i32"))?;
 
-    // ── 1. Q-LoRA: wq_a (down) → q_norm RMSNorm → wq_b (up to per-head Q).
-    let mut c_q = HiddenStates::zeros(ctx, attention.wq_a.rows, token_count)?;
-    dsv4_linear(ctx, &attention.wq_a, hidden, &mut c_q)?;
-    keepalive.keep_hidden(&c_q);
-    let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
-    keepalive.keep_hidden(&c_q_normed);
-    let mut q_raw = HiddenStates::zeros(ctx, local_width, token_count)?;
-    dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)?;
-    keepalive.keep_hidden(&q_raw);
+    // ── 1+2. Q/KV LoRA. SGLang fuses the first projections
+    // (`wq_a | wkv`) into one wqkv_a call. ARLE only enables that structure for
+    // B=1 decode: the fused output's two slices are contiguous, so the existing
+    // RMSNorm kernel can consume raw pointer offsets without adding a split
+    // kernel. Multi-token prefill stays on the scalar reference path until ARLE
+    // grows strided HiddenStates views or a fused split+norm kernel.
+    let fused_wqkv = token_count == 1 && dsv4_fused_wqkv_decode_enabled()?;
+    let (c_q_normed, q_raw, kv_normed) = if fused_wqkv {
+        let scratch = state.fused_wqkv.as_mut().ok_or_else(|| {
+            anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
+        })?;
+        let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused");
+        let out = crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused", || {
+            run_fused_wqkv_decode(ctx, config, attention, hidden, scratch)
+        })?;
+        drop(nvtx_wqkv);
+        out
+    } else {
+        // Q-LoRA: wq_a (down) → q_norm RMSNorm → wq_b (up to per-head Q).
+        // SAFETY: dsv4_linear writes the full c_q buffer.
+        let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
+        let nvtx_wq_a = crate::nvtx::range("dsv4/linear/wq_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wq_a", || {
+            dsv4_linear(ctx, &attention.wq_a, hidden, &mut c_q)
+        })?;
+        drop(nvtx_wq_a);
+        keepalive.keep_hidden(&c_q);
+        let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
+        keepalive.keep_hidden(&c_q_normed);
+        // SAFETY: dsv4_linear writes the full q_raw buffer.
+        let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
+        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+            dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+        })?;
+        drop(nvtx_wq_b);
+        keepalive.keep_hidden(&q_raw);
 
-    // ── 2. KV latent: wkv (down to the single compressed latent) → kv_norm.
-    let mut kv_raw = HiddenStates::zeros(ctx, head_dim, token_count)?;
-    dsv4_linear(ctx, &attention.wkv, hidden, &mut kv_raw)?;
-    keepalive.keep_hidden(&kv_raw);
-    let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
+        // KV latent: wkv (down to the single compressed latent) → kv_norm.
+        // SAFETY: dsv4_linear writes the full kv_raw buffer.
+        let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
+        let nvtx_wkv = crate::nvtx::range("dsv4/linear/wkv");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wkv", || {
+            dsv4_linear(ctx, &attention.wkv, hidden, &mut kv_raw)
+        })?;
+        drop(nvtx_wkv);
+        keepalive.keep_hidden(&kv_raw);
+        let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
+        keepalive.keep_hidden(&kv_normed);
+        (c_q_normed, q_raw, kv_normed)
+    };
+    keepalive.keep_hidden(&c_q_normed);
+    keepalive.keep_hidden(&q_raw);
     keepalive.keep_hidden(&kv_normed);
 
     // ── 3. Partial RoPE on the trailing rope_dim cols of Q (per head) and K.
-    let mut q_prepared = HiddenStates::zeros(ctx, local_width, token_count)?;
-    let mut k_prepared = HiddenStates::zeros(ctx, head_dim, token_count)?;
+    // SAFETY: dsv4_prepare_qk_cuda writes both full output buffers.
+    let mut q_prepared = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
+    let mut k_prepared = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
     {
         let (q_raw_ptr, _qr) = q_raw.data.device_ptr(&ctx.stream);
         let (k_raw_ptr, _kr) = kv_normed.data.device_ptr(&ctx.stream);
@@ -852,69 +1943,153 @@ pub(crate) fn mla_attention(
         let (k_out_ptr, _ko) = k_prepared.data.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; head/dim args checked above.
         unsafe {
-            ffi::dsv4_prepare_qk_cuda(
-                q_raw_ptr as *const ffi::Half,
-                k_raw_ptr as *const ffi::Half,
-                q_out_ptr as *mut ffi::Half,
-                k_out_ptr as *mut ffi::Half,
-                token_count as i32,
-                local_heads as i32,
-                head_dim as i32,
-                config.qk_rope_head_dim as i32,
-                start_pos_i32,
-                config.rms_norm_eps,
-                rope_base,
-                original_seq_len,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            if let Some(start_pos_device) = start_pos_device {
+                let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
+                ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
+                    q_raw_ptr as *const ffi::Half,
+                    k_raw_ptr as *const ffi::Half,
+                    q_out_ptr as *mut ffi::Half,
+                    k_out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    start_ptr as *const i32,
+                    config.rms_norm_eps,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else {
+                ffi::dsv4_prepare_qk_cuda(
+                    q_raw_ptr as *const ffi::Half,
+                    k_raw_ptr as *const ffi::Half,
+                    q_out_ptr as *mut ffi::Half,
+                    k_out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    start_pos_i32,
+                    config.rms_norm_eps,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
     }
     keepalive.keep_hidden(&q_prepared);
     keepalive.keep_hidden(&k_prepared);
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
-    let mut local_attn = HiddenStates::zeros(ctx, local_width, token_count)?;
+    // SAFETY: the SW/hybrid attention kernel writes the full local_attn buffer.
+    let mut local_attn = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
 
     if mode == DeepSeekV4AttentionMode::SlidingWindow {
         // ── 4a. SW: windowed attention + per-head sink + output inverse-RoPE.
         // The kernel reads the pre-roped q/k, attends over the bf16 SW ring cache
         // (which it also updates), adds the sink, and un-rotates the rope tail of
         // the OUTPUT (sign = -1) before returning.
-        let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
-        let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-        let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-        let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
-        let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
-        // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
-        // skips to this rank's head block in the whole-loaded attn_sink vector.
-        unsafe {
-            ffi::dsv4_swa_attention_cuda(
-                q_ptr as *const ffi::Half,
-                k_ptr as *const ffi::Half,
-                window_ptr as *mut ffi::Half,
-                sink_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                token_count as i32,
-                local_heads as i32,
-                head_dim as i32,
-                config.sliding_window as i32,
-                start_pos_i32,
-                sink_offset as i32,
+        let flashmla_used = if dsv4_flashmla_decode_enabled()? {
+            let flash = state.flashmla.as_mut().ok_or_else(|| {
+                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+            })?;
+            try_flashmla_decode_attention(
+                ctx,
+                config,
+                attention,
+                mode,
+                compress_ratio,
+                &q_prepared,
+                &k_prepared,
+                None,
+                None,
+                &mut state.sw_window_cache,
+                flash,
+                start_pos,
+                start_pos_device,
+                tp,
+                local_heads,
+                &mut local_attn,
                 sm_scale,
-                config.qk_rope_head_dim as i32,
                 rope_base,
                 original_seq_len,
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
-                1,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?
+        } else {
+            false
+        };
+        if !flashmla_used {
+            let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
+            let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
+            let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
+            let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
+            let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
+            // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
+            // skips to this rank's head block in the whole-loaded attn_sink vector.
+            unsafe {
+                if let Some(start_pos_device) = start_pos_device {
+                    let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                    ffi::dsv4_swa_attention_start_pos_ptr_cuda(
+                        q_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        sink_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        config.sliding_window as i32,
+                        start_ptr as *const i32,
+                        sink_offset as i32,
+                        sm_scale,
+                        config.qk_rope_head_dim as i32,
+                        rope_base,
+                        original_seq_len,
+                        rope.factor,
+                        rope.beta_fast,
+                        rope.beta_slow,
+                        1,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                } else {
+                    ffi::dsv4_swa_attention_cuda(
+                        q_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        sink_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        config.sliding_window as i32,
+                        start_pos_i32,
+                        sink_offset as i32,
+                        sm_scale,
+                        config.qk_rope_head_dim as i32,
+                        rope_base,
+                        original_seq_len,
+                        rope.factor,
+                        rope.beta_fast,
+                        rope.beta_slow,
+                        1,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+            }
         }
     } else {
         // ── 4b. CSA / HCA: compressor → (CSA) indexer top-k select → hybrid
@@ -937,6 +2112,7 @@ pub(crate) fn mla_attention(
                 compress_ratio,
                 overlap,
                 start_pos,
+                start_pos_device,
                 true,
                 keepalive,
             )?;
@@ -966,6 +2142,7 @@ pub(crate) fn mla_attention(
                     compress_ratio,
                     true,
                     start_pos,
+                    start_pos_device,
                     false,
                     keepalive,
                 )?;
@@ -983,6 +2160,7 @@ pub(crate) fn mla_attention(
                 &c_q_normed,
                 index_keys,
                 start_pos,
+                start_pos_device,
                 compress_ratio,
                 keepalive,
             )?)
@@ -996,62 +2174,137 @@ pub(crate) fn mla_attention(
             .expect("compressor state checked above")
             .compressed;
         let compressed_count = compressed.seq_len;
+        let compressed_capacity = compressed.data.len() / head_dim;
+        let compressed_count_arg = if start_pos_device.is_some() {
+            // CUDA graph replay bakes scalar launch args. In decode, the causal
+            // bound is `abs_pos / compress_ratio`, so the kernel may safely see
+            // the fixed capacity instead of the current compressed seq_len.
+            compressed_capacity
+        } else {
+            compressed_count
+        };
         let mode_int = match mode {
             DeepSeekV4AttentionMode::CompressedSparse => 1,
             DeepSeekV4AttentionMode::HybridCompressed => 2,
             DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
         };
-        let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
-        let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-        let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-        let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
-        let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
-        let (comp_ptr, _cg, _cguard) = if compressed_count > 0 {
-            let (p, g) = compressed.data.device_ptr(&ctx.stream);
-            (p as *const ffi::Half, true, Some(g))
-        } else {
-            (std::ptr::null(), false, None)
-        };
-        let (sel_ptr, _sguard) = match selected.as_ref() {
-            Some(sel) => {
-                let (p, g) = sel.device_ptr(&ctx.stream);
-                (p as *const i32, Some(g))
-            }
-            None => (std::ptr::null(), None),
-        };
-        // SAFETY: all buffers valid on ctx.stream; compressed/selected may be null
-        // (the kernel branches on compressed_count / mode). write_window_cache=1
-        // updates the bf16 SW ring inline.
-        unsafe {
-            ffi::dsv4_hybrid_attention_cuda(
-                q_ptr as *const ffi::Half,
-                k_ptr as *const ffi::Half,
-                window_ptr as *mut ffi::Half,
-                comp_ptr,
-                sel_ptr,
-                sink_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                token_count as i32,
-                local_heads as i32,
-                head_dim as i32,
-                config.sliding_window as i32,
-                start_pos_i32,
-                sink_offset as i32,
+        let flashmla_used = if dsv4_flashmla_decode_enabled()? {
+            let flash = state.flashmla.as_mut().ok_or_else(|| {
+                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+            })?;
+            try_flashmla_decode_attention(
+                ctx,
+                config,
+                attention,
+                mode,
+                compress_ratio,
+                &q_prepared,
+                &k_prepared,
+                selected.as_ref(),
+                Some(compressed),
+                &mut state.sw_window_cache,
+                flash,
+                start_pos,
+                start_pos_device,
+                tp,
+                local_heads,
+                &mut local_attn,
                 sm_scale,
-                config.qk_rope_head_dim as i32,
                 rope_base,
                 original_seq_len,
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
-                mode_int,
-                compress_ratio as i32,
-                compressed_count as i32,
-                config.index_topk as i32,
-                1,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            )?
+        } else {
+            false
+        };
+        if !flashmla_used {
+            let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
+            let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
+            let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
+            let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
+            let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
+            let (comp_ptr, _cguard) = if compressed_count_arg > 0 {
+                let (p, g) = compressed.data.device_ptr(&ctx.stream);
+                (p as *const ffi::Half, Some(g))
+            } else {
+                (std::ptr::null(), None)
+            };
+            let (sel_ptr, _sguard) = match selected.as_ref() {
+                Some(sel) => {
+                    let (p, g) = sel.device_ptr(&ctx.stream);
+                    (p as *const i32, Some(g))
+                }
+                None => (std::ptr::null(), None),
+            };
+            // SAFETY: all buffers valid on ctx.stream; compressed/selected may be null
+            // (the kernel branches on compressed_count / mode). write_window_cache=1
+            // updates the bf16 SW ring inline.
+            unsafe {
+                if let Some(start_pos_device) = start_pos_device {
+                    let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                    ffi::dsv4_hybrid_attention_start_pos_ptr_cuda(
+                        q_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        comp_ptr,
+                        sel_ptr,
+                        sink_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        config.sliding_window as i32,
+                        start_ptr as *const i32,
+                        sink_offset as i32,
+                        sm_scale,
+                        config.qk_rope_head_dim as i32,
+                        rope_base,
+                        original_seq_len,
+                        rope.factor,
+                        rope.beta_fast,
+                        rope.beta_slow,
+                        mode_int,
+                        compress_ratio as i32,
+                        compressed_count_arg as i32,
+                        config.index_topk as i32,
+                        1,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                } else {
+                    ffi::dsv4_hybrid_attention_cuda(
+                        q_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        comp_ptr,
+                        sel_ptr,
+                        sink_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        config.sliding_window as i32,
+                        start_pos_i32,
+                        sink_offset as i32,
+                        sm_scale,
+                        config.qk_rope_head_dim as i32,
+                        rope_base,
+                        original_seq_len,
+                        rope.factor,
+                        rope.beta_fast,
+                        rope.beta_slow,
+                        mode_int,
+                        compress_ratio as i32,
+                        compressed_count_arg as i32,
+                        config.index_topk as i32,
+                        1,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+            }
         }
         if let Some(sel) = selected.as_ref() {
             keepalive.keep_i32(sel);
@@ -1061,10 +2314,19 @@ pub(crate) fn mla_attention(
 
     // ── 5. O-LoRA: wo_a (per o-group, down to the output latent) → wo_b (up
     // back to hidden). Row-parallel: the all-reduce-sum is the model's concern.
-    let mut latent = HiddenStates::zeros(ctx, attention.wo_a.rows, token_count)?;
-    dsv4_linear(ctx, &attention.wo_a, &local_attn, &mut latent)?;
+    // SAFETY: dsv4_linear writes the full latent buffer.
+    let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a.rows, token_count)? };
+    let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+    crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+        dsv4_linear(ctx, &attention.wo_a, &local_attn, &mut latent)
+    })?;
+    drop(nvtx_wo_a);
     keepalive.keep_hidden(&latent);
-    dsv4_linear(ctx, &attention.wo_b, &latent, out)?;
+    let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
+    crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+        dsv4_linear(ctx, &attention.wo_b, &latent, out)
+    })?;
+    drop(nvtx_wo_b);
     Ok(())
 }
 
@@ -1087,6 +2349,7 @@ fn compressor_forward(
     ratio: usize,
     overlap: bool,
     start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
     apply_rope: bool,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
@@ -1121,11 +2384,21 @@ fn compressor_forward(
         "DSv4 compressor compressed rows {compressed_rows} exceed state capacity {compressed_capacity}"
     );
 
-    let mut kv_raw = HiddenStates::zeros(ctx, width, token_count)?;
-    dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv_raw)?;
+    // SAFETY: dsv4_linear writes the full compressor kv buffer.
+    let mut kv_raw = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
+    let nvtx_compressor_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv");
+    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv", || {
+        dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv_raw)
+    })?;
+    drop(nvtx_compressor_wkv);
     keepalive.keep_hidden(&kv_raw);
-    let mut score_raw = HiddenStates::zeros(ctx, width, token_count)?;
-    dsv4_linear(ctx, &compressor.wgate, hidden, &mut score_raw)?;
+    // SAFETY: dsv4_linear writes the full compressor score buffer.
+    let mut score_raw = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
+    let nvtx_compressor_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate");
+    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate", || {
+        dsv4_linear(ctx, &compressor.wgate, hidden, &mut score_raw)
+    })?;
+    drop(nvtx_compressor_wgate);
     keepalive.keep_hidden(&score_raw);
 
     let rope = &config.rope_parameters;
@@ -1149,35 +2422,65 @@ fn compressor_forward(
         // SAFETY: all buffers valid on ctx.stream; state carries the pending and
         // overlap rows from previous contiguous appends.
         unsafe {
-            ffi::dsv4_compressor_update_cuda(
-                kv_ptr as *const ffi::Half,
-                score_ptr as *const ffi::Half,
-                ape_ptr as *const ffi::Half,
-                norm_ptr as *const ffi::Half,
-                pkv_ptr as *mut ffi::Half,
-                psc_ptr as *mut ffi::Half,
-                prkv_ptr as *mut ffi::Half,
-                prsc_ptr as *mut ffi::Half,
-                comp_ptr as *mut ffi::Half,
-                token_count as i32,
-                start_pos_i32,
-                pending_len_i32,
-                compressed_base_i32,
-                head_dim as i32,
-                ratio as i32,
-                width as i32,
-                i32::from(overlap),
-                has_prev_overlap,
-                config.rms_norm_eps,
-                rope_dim as i32,
-                rope_base,
-                0,
-                rope.factor,
-                rope.beta_fast,
-                rope.beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            if let Some(start_pos_device) = start_pos_device {
+                let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                ffi::dsv4_compressor_update_start_pos_ptr_cuda(
+                    kv_ptr as *const ffi::Half,
+                    score_ptr as *const ffi::Half,
+                    ape_ptr as *const ffi::Half,
+                    norm_ptr as *const ffi::Half,
+                    pkv_ptr as *mut ffi::Half,
+                    psc_ptr as *mut ffi::Half,
+                    prkv_ptr as *mut ffi::Half,
+                    prsc_ptr as *mut ffi::Half,
+                    comp_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    start_ptr as *const i32,
+                    head_dim as i32,
+                    ratio as i32,
+                    width as i32,
+                    i32::from(overlap),
+                    config.rms_norm_eps,
+                    rope_dim as i32,
+                    rope_base,
+                    0,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else {
+                ffi::dsv4_compressor_update_cuda(
+                    kv_ptr as *const ffi::Half,
+                    score_ptr as *const ffi::Half,
+                    ape_ptr as *const ffi::Half,
+                    norm_ptr as *const ffi::Half,
+                    pkv_ptr as *mut ffi::Half,
+                    psc_ptr as *mut ffi::Half,
+                    prkv_ptr as *mut ffi::Half,
+                    prsc_ptr as *mut ffi::Half,
+                    comp_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    start_pos_i32,
+                    pending_len_i32,
+                    compressed_base_i32,
+                    head_dim as i32,
+                    ratio as i32,
+                    width as i32,
+                    i32::from(overlap),
+                    has_prev_overlap,
+                    config.rms_norm_eps,
+                    rope_dim as i32,
+                    rope_base,
+                    0,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
     }
     state.compressed.seq_len = compressed_rows;
@@ -1196,14 +2499,26 @@ fn csa_select(
     c_q_normed: &HiddenStates,
     keys: &HiddenStates,
     start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
     ratio: usize,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<CudaSlice<i32>> {
-    let mut q_i = HiddenStates::zeros(ctx, indexer.wq_b.rows, c_q_normed.seq_len)?;
-    dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)?;
+    // SAFETY: dsv4_linear writes the full index-query buffer.
+    let mut q_i = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, c_q_normed.seq_len)? };
+    let nvtx_indexer_wq_b = crate::nvtx::range("dsv4/linear/indexer_wq_b");
+    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
+        dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)
+    })?;
+    drop(nvtx_indexer_wq_b);
     keepalive.keep_hidden(&q_i);
-    let mut weights = HiddenStates::zeros(ctx, indexer.weights_proj.rows, hidden.seq_len)?;
-    dsv4_linear(ctx, &indexer.weights_proj, hidden, &mut weights)?;
+    // SAFETY: dsv4_linear writes the full index-weight buffer.
+    let mut weights =
+        unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, hidden.seq_len)? };
+    let nvtx_indexer_weights = crate::nvtx::range("dsv4/linear/indexer_weights");
+    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights", || {
+        dsv4_linear(ctx, &indexer.weights_proj, hidden, &mut weights)
+    })?;
+    drop(nvtx_indexer_weights);
     keepalive.keep_hidden(&weights);
 
     ensure!(
@@ -1219,7 +2534,14 @@ fn csa_select(
         weights.hidden_dim
     );
 
-    let key_count = keys.seq_len;
+    let key_count = if start_pos_device.is_some() {
+        // Graph replay must not bake the current compressed-key seq_len. The
+        // selector computes `available = min(key_count, abs_pos / ratio)`, so
+        // capacity preserves the same causal set while staying replay-safe.
+        keys.data.len() / keys.hidden_dim
+    } else {
+        keys.seq_len
+    };
     let mut selected = ctx
         .stream
         .alloc_zeros::<i32>(hidden.seq_len * config.index_topk)
@@ -1233,23 +2555,44 @@ fn csa_select(
         let (sel_ptr, _sg) = selected.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; selected sized seq*index_topk.
         unsafe {
-            ffi::dsv4_csa_select_cuda(
-                q_ptr as *const ffi::Half,
-                w_ptr as *const ffi::Half,
-                keys_ptr as *const ffi::Half,
-                sel_ptr as *mut i32,
-                hidden.seq_len as i32,
-                q_i.hidden_dim as i32,
-                local_index_heads as i32,
-                config.index_head_dim as i32,
-                key_count as i32,
-                ratio as i32,
-                config.index_topk as i32,
-                score_scale,
-                start_pos as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+            if let Some(start_pos_device) = start_pos_device {
+                let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                ffi::dsv4_csa_select_start_pos_ptr_cuda(
+                    q_ptr as *const ffi::Half,
+                    w_ptr as *const ffi::Half,
+                    keys_ptr as *const ffi::Half,
+                    sel_ptr as *mut i32,
+                    hidden.seq_len as i32,
+                    q_i.hidden_dim as i32,
+                    local_index_heads as i32,
+                    config.index_head_dim as i32,
+                    key_count as i32,
+                    ratio as i32,
+                    config.index_topk as i32,
+                    score_scale,
+                    start_ptr as *const i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else {
+                ffi::dsv4_csa_select_cuda(
+                    q_ptr as *const ffi::Half,
+                    w_ptr as *const ffi::Half,
+                    keys_ptr as *const ffi::Half,
+                    sel_ptr as *mut i32,
+                    hidden.seq_len as i32,
+                    q_i.hidden_dim as i32,
+                    local_index_heads as i32,
+                    config.index_head_dim as i32,
+                    key_count as i32,
+                    ratio as i32,
+                    config.index_topk as i32,
+                    score_scale,
+                    start_pos as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
     }
     Ok(selected)

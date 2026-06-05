@@ -273,6 +273,93 @@ pub unsafe fn dsv4_count_local_experts(
     Ok(())
 }
 
+/// DSv4 on-device router: router logits `[num_tokens, n_experts]` to flat
+/// token-major `indices` / `weights` (`[num_tokens * topk]`). `routing_kind=0`
+/// is hash routing and requires `tid2eid` + `token_ids`; `routing_kind=1` is
+/// learned-bias noaux routing and requires `bias`.
+///
+/// # Safety
+/// All pointers must be valid on `stream` for the given shape. Optional
+/// pointers are only dereferenced by the matching routing-kind branch.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_route(
+    logits: RawDevicePtr<bf16>,
+    bias: Option<RawDevicePtr<bf16>>,
+    tid2eid: Option<RawDevicePtr<i64>>,
+    token_ids: Option<RawDevicePtr<u32>>,
+    indices: RawDevicePtr<i32>,
+    weights: RawDevicePtr<f32>,
+    num_tokens: usize,
+    n_experts: usize,
+    topk: usize,
+    routing_kind: i32,
+    scoring_kind: i32,
+    routed_scaling_factor: f32,
+    stream: CUstream,
+) -> Result<()> {
+    ensure!(
+        routing_kind == 0 || routing_kind == 1,
+        "DSv4 route routing_kind must be 0(hash) or 1(learned-bias), got {routing_kind}"
+    );
+    ensure!(
+        scoring_kind == 0 || scoring_kind == 1 || scoring_kind == 2,
+        "DSv4 route scoring_kind must be 0/1/2, got {scoring_kind}"
+    );
+    ensure!(n_experts > 0, "DSv4 route n_experts must be > 0");
+    ensure!(topk > 0, "DSv4 route topk must be > 0");
+    let bias_ptr = match (routing_kind, bias) {
+        (1, Some(ptr)) => ptr.as_ptr() as *const Half,
+        (1, None) => anyhow::bail!("DSv4 learned-bias route requires bias pointer"),
+        _ => std::ptr::null(),
+    };
+    let tid2eid_ptr = match (routing_kind, tid2eid) {
+        (0, Some(ptr)) => ptr.as_ptr(),
+        (0, None) => anyhow::bail!("DSv4 hash route requires tid2eid pointer"),
+        _ => std::ptr::null(),
+    };
+    let token_ids_ptr = match (routing_kind, token_ids) {
+        (0, Some(ptr)) => ptr.as_ptr(),
+        (0, None) => anyhow::bail!("DSv4 hash route requires token_ids pointer"),
+        _ => std::ptr::null(),
+    };
+    unsafe {
+        ffi::dsv4_route_cuda(
+            logits.as_ptr() as *const Half,
+            bias_ptr,
+            tid2eid_ptr,
+            token_ids_ptr,
+            indices.as_mut_ptr(),
+            weights.as_mut_ptr(),
+            i32::try_from(num_tokens)?,
+            i32::try_from(n_experts)?,
+            i32::try_from(topk)?,
+            routing_kind,
+            scoring_kind,
+            routed_scaling_factor,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Cast a flat `i32` device buffer to `i64` on-device.
+///
+/// # Safety
+/// `src` / `dst` must be valid on `stream` for `n` elements.
+pub unsafe fn dsv4_cast_i32_to_i64(
+    src: RawDevicePtr<i32>,
+    dst: RawDevicePtr<i64>,
+    n: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_cast_i32_to_i64_cuda(src.as_ptr(), dst.as_mut_ptr(), i32::try_from(n)?, stream)
+            .result()?;
+    }
+    Ok(())
+}
+
 /// Exclusive prefix-sum over per-expert counts → offsets (+ total).
 /// Wraps [`ffi::dsv4_exclusive_scan_i32_cuda`].
 ///
@@ -332,6 +419,80 @@ pub unsafe fn dsv4_pack_local_experts_with_slots(
             packed_hidden.as_mut_ptr() as *mut Half,
             packed_route_slot.as_mut_ptr(),
             packed_weight.as_mut_ptr(),
+            i32::try_from(num_tokens)?,
+            i32::try_from(hidden_dim)?,
+            i32::try_from(topk)?,
+            i32::try_from(local_expert_start)?,
+            i32::try_from(experts_per_rank)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Fill DeepGEMM contiguous `m_indices` from compact per-local-expert counts.
+///
+/// # Safety
+/// `counts`, `offsets`, and `m_indices` must be valid on `stream`;
+/// `m_indices` must have at least `row_capacity` rows.
+pub unsafe fn dsv4_fill_m_indices_from_counts(
+    counts: RawDevicePtr<i32>,
+    offsets: RawDevicePtr<i32>,
+    m_indices: RawDevicePtr<i32>,
+    experts_per_rank: usize,
+    row_capacity: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_fill_m_indices_from_counts_cuda(
+            counts.as_ptr(),
+            offsets.as_ptr(),
+            m_indices.as_mut_ptr(),
+            i32::try_from(experts_per_rank)?,
+            i32::try_from(row_capacity)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Pack routed tokens and emit the contiguous DeepGEMM `m_indices` row→local
+/// expert map alongside the compact route-slot metadata.
+///
+/// # Safety
+/// All pointers must be valid on `stream`; `packed_m_indices` has the same row
+/// capacity as `packed_hidden`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_pack_local_experts_with_slots_and_indices(
+    hidden: RawDevicePtr<bf16>,
+    indices: RawDevicePtr<i32>,
+    weights: RawDevicePtr<f32>,
+    offsets: RawDevicePtr<i32>,
+    cursors: RawDevicePtr<i32>,
+    packed_hidden: RawDevicePtr<bf16>,
+    packed_route_slot: RawDevicePtr<i32>,
+    packed_weight: RawDevicePtr<f32>,
+    packed_m_indices: RawDevicePtr<i32>,
+    num_tokens: usize,
+    hidden_dim: usize,
+    topk: usize,
+    local_expert_start: usize,
+    experts_per_rank: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_pack_local_experts_with_slots_and_indices_cuda(
+            hidden.as_ptr() as *const Half,
+            indices.as_ptr(),
+            weights.as_ptr(),
+            offsets.as_ptr(),
+            cursors.as_mut_ptr(),
+            packed_hidden.as_mut_ptr() as *mut Half,
+            packed_route_slot.as_mut_ptr(),
+            packed_weight.as_mut_ptr(),
+            packed_m_indices.as_mut_ptr(),
             i32::try_from(num_tokens)?,
             i32::try_from(hidden_dim)?,
             i32::try_from(topk)?,
@@ -547,6 +708,85 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
             d.as_mut_ptr() as *mut Half,
             masked_m.as_ptr(),
             i32::try_from(num_groups)?,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(sfa_aligned_m)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Contiguous m-grouped FP8 GEMM (`f8f8bf16`, NT): `d = a @ b^T` where each
+/// activation row's expert group is read from `m_indices`.
+///
+/// # Safety
+/// All pointers must be valid on `stream`; `m_indices` must contain one local
+/// expert id in `[0, num_groups)` per activation row.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+    a: RawDevicePtr<u8>,
+    sfa: RawDevicePtr<f32>,
+    b: RawDevicePtr<u8>,
+    sfb: RawDevicePtr<f32>,
+    d: RawDevicePtr<bf16>,
+    m_indices: RawDevicePtr<i32>,
+    num_groups: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    sfa_aligned_m: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
+            a.as_ptr(),
+            sfa.as_ptr(),
+            b.as_ptr(),
+            sfb.as_ptr(),
+            d.as_mut_ptr() as *mut Half,
+            m_indices.as_ptr(),
+            i32::try_from(num_groups)?,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(sfa_aligned_m)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Dense FP8 DeepGEMM (`f8f8bf16`, NT): `d = a @ b^T`, where `a` is a
+/// row-major FP8 activation matrix `[m, k]`, `b` is a row-major FP8 weight
+/// cache `[n, k]`, and `sfa` / `sfb` are FP32 128-block scales.
+///
+/// # Safety
+/// All pointers must be valid on `stream`; `sfa_aligned_m` is the TMA-aligned
+/// leading dimension of the activation scale matrix.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_fp8_gemm_nt(
+    a: RawDevicePtr<u8>,
+    sfa: RawDevicePtr<f32>,
+    b: RawDevicePtr<u8>,
+    sfb: RawDevicePtr<f32>,
+    d: RawDevicePtr<bf16>,
+    m: usize,
+    n: usize,
+    k: usize,
+    sfa_aligned_m: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_fp8_gemm_nt_cuda(
+            a.as_ptr(),
+            sfa.as_ptr(),
+            b.as_ptr(),
+            sfb.as_ptr(),
+            d.as_mut_ptr() as *mut Half,
             i32::try_from(m)?,
             i32::try_from(n)?,
             i32::try_from(k)?,

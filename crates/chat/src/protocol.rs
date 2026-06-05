@@ -69,11 +69,35 @@ const THINK_BLOCK: TaggedBlock = TaggedBlock {
     close: "</think>",
 };
 
+/// Open/close tags of every block the visible-text drain loops scan for. Shared
+/// by `VisibleTextStream::drain` and `StreamingToolCalls::drain` so the set lives
+/// in one place.
+const VISIBLE_TAGS: [&str; 6] = [
+    TOOL_CALL_BLOCK.open,
+    TOOL_CALL_BLOCK.close,
+    DSML_TOOL_CALLS_BLOCK.open,
+    DSML_TOOL_CALLS_BLOCK.close,
+    THINK_BLOCK.open,
+    THINK_BLOCK.close,
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HiddenBlock {
     ToolCall,
     DsmlToolCalls,
     Think,
+}
+
+/// Map a matched *open* tag to the [`HiddenBlock`] it starts. Close tags (and any
+/// other slice) map to `None`, matching the drain loops' fallthrough. Shared by
+/// both drain implementations.
+fn hidden_block_for_open_tag(tag: &str) -> Option<HiddenBlock> {
+    match tag {
+        tag if tag == TOOL_CALL_BLOCK.open => Some(HiddenBlock::ToolCall),
+        tag if tag == DSML_TOOL_CALLS_BLOCK.open => Some(HiddenBlock::DsmlToolCalls),
+        tag if tag == THINK_BLOCK.open => Some(HiddenBlock::Think),
+        _ => None,
+    }
 }
 
 /// Incremental text filter for streamed assistant output.
@@ -102,14 +126,6 @@ impl VisibleTextStream {
         loop {
             match self.hidden {
                 None => {
-                    const VISIBLE_TAGS: [&str; 6] = [
-                        TOOL_CALL_BLOCK.open,
-                        TOOL_CALL_BLOCK.close,
-                        DSML_TOOL_CALLS_BLOCK.open,
-                        DSML_TOOL_CALLS_BLOCK.close,
-                        THINK_BLOCK.open,
-                        THINK_BLOCK.close,
-                    ];
                     let Some((idx, tag)) = find_first_tag(&self.pending, &VISIBLE_TAGS) else {
                         if flush {
                             visible.push_str(&self.pending);
@@ -125,14 +141,7 @@ impl VisibleTextStream {
 
                     visible.push_str(&self.pending[..idx]);
                     self.pending.drain(..idx + tag.len());
-                    self.hidden = match tag {
-                        tag if tag == TOOL_CALL_BLOCK.open => Some(HiddenBlock::ToolCall),
-                        tag if tag == DSML_TOOL_CALLS_BLOCK.open => {
-                            Some(HiddenBlock::DsmlToolCalls)
-                        }
-                        tag if tag == THINK_BLOCK.open => Some(HiddenBlock::Think),
-                        _ => None,
-                    };
+                    self.hidden = hidden_block_for_open_tag(tag);
                 }
                 Some(HiddenBlock::ToolCall) => {
                     if let Some(idx) = self.pending.find(TOOL_CALL_BLOCK.close) {
@@ -225,14 +234,6 @@ impl StreamingToolCalls {
         loop {
             match self.hidden {
                 None => {
-                    const VISIBLE_TAGS: [&str; 6] = [
-                        TOOL_CALL_BLOCK.open,
-                        TOOL_CALL_BLOCK.close,
-                        DSML_TOOL_CALLS_BLOCK.open,
-                        DSML_TOOL_CALLS_BLOCK.close,
-                        THINK_BLOCK.open,
-                        THINK_BLOCK.close,
-                    ];
                     let Some((idx, tag)) = find_first_tag(&self.pending, &VISIBLE_TAGS) else {
                         if flush {
                             visible.push_str(&self.pending);
@@ -248,14 +249,7 @@ impl StreamingToolCalls {
 
                     visible.push_str(&self.pending[..idx]);
                     self.pending.drain(..idx + tag.len());
-                    self.hidden = match tag {
-                        tag if tag == TOOL_CALL_BLOCK.open => Some(HiddenBlock::ToolCall),
-                        tag if tag == DSML_TOOL_CALLS_BLOCK.open => {
-                            Some(HiddenBlock::DsmlToolCalls)
-                        }
-                        tag if tag == THINK_BLOCK.open => Some(HiddenBlock::Think),
-                        _ => None,
-                    };
+                    self.hidden = hidden_block_for_open_tag(tag);
                 }
                 Some(HiddenBlock::ToolCall) => {
                     if let Some(idx) = self.pending.find(TOOL_CALL_BLOCK.close) {
@@ -871,10 +865,7 @@ pub fn build_tool_block(tools: &[ToolDefinition]) -> String {
 /// answers as plain text). `Required` and `Function` append a directive that
 /// forces tool emission.
 pub fn build_tool_block_with_choice(tools: &[ToolDefinition], choice: &ToolChoiceMode) -> String {
-    if matches!(choice, ToolChoiceMode::None) {
-        return String::new();
-    }
-    if tools.is_empty() {
+    if matches!(choice, ToolChoiceMode::None) || tools.is_empty() {
         return String::new();
     }
 

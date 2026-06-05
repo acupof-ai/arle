@@ -142,19 +142,10 @@ ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuFuncSetAttribute);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLaunchKernelEx);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuTensorMapEncodeTiled);
 
-#if CUDA_VERSION >= 12040
-ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryLoadFromFile);
-ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryUnload);
-ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryGetKernelCount);
-ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryEnumerateKernels);
-ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuKernelGetFunction);
-using LibraryHandle = CUlibrary;
-#else
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleLoad);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleUnload);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleGetFunction);
 using LibraryHandle = CUmodule;
-#endif
 
 using KernelHandle = CUfunction;
 
@@ -450,36 +441,15 @@ KernelHandle load_kernel(
     LibraryHandle* library_out) {
   LibraryHandle library{};
   KernelHandle kernel{};
-#if CUDA_VERSION >= 12040
-  check_driver(
-      lazy_cuLibraryLoadFromFile(
-          &library, cubin_path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0),
-      "cuLibraryLoadFromFile");
-  unsigned int num_kernels = 0;
-  check_driver(lazy_cuLibraryGetKernelCount(&num_kernels, library),
-               "cuLibraryGetKernelCount");
-  if (num_kernels != 1) {
-    throw std::runtime_error("DeepGEMM CUBIN should contain exactly one kernel");
-  }
-  CUkernel cu_kernel{};
-  check_driver(lazy_cuLibraryEnumerateKernels(&cu_kernel, 1, library),
-               "cuLibraryEnumerateKernels");
-  check_driver(lazy_cuKernelGetFunction(&kernel, cu_kernel), "cuKernelGetFunction");
-#else
   check_driver(lazy_cuModuleLoad(&library, cubin_path.c_str()), "cuModuleLoad");
   check_driver(lazy_cuModuleGetFunction(&kernel, library, func_name.c_str()),
                "cuModuleGetFunction");
-#endif
   if (library_out != nullptr) *library_out = library;
   return kernel;
 }
 
 void unload_library(const LibraryHandle& library) {
-#if CUDA_VERSION >= 12040
-  const auto err = lazy_cuLibraryUnload(library);
-#else
   const auto err = lazy_cuModuleUnload(library);
-#endif
   if (err != CUDA_SUCCESS && err != CUDA_ERROR_DEINITIALIZED) {
     check_driver(err, "CUDA library unload");
   }
@@ -815,7 +785,8 @@ std::string bool_lit(bool value) { return value ? "true" : "false"; }
 
 std::string generate_kernel_code(
     const GemmDesc& desc,
-    const GemmConfig& config) {
+    const GemmConfig& config,
+    const char* gemm_type) {
   std::ostringstream code;
   code << R"(
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
@@ -839,7 +810,7 @@ static void __instantiate_kernel() {
        << config.launch.num_math_threads << R"(,
         )" << config.layout.cluster_size() << R"(, )"
        << bool_lit(config.layout.cluster_n > 1) << R"(,
-        )" << config.launch.num_sms << R"(, GemmType::MGroupedMasked,
+        )" << config.launch.num_sms << R"(, GemmType::)" << gemm_type << R"(,
         epilogue::transform::EpilogueIdentity
     >);
 }
@@ -929,7 +900,6 @@ void compile_with_nvcc(
   }
 }
 
-#ifndef DG_JIT_USE_LIBRARY_ENUM_KERNELS
 std::string parse_kernel_symbol(const std::filesystem::path& cubin_path) {
   const auto cuda_home = cuda_home_path();
   const auto cuobjdump = cuda_home / "bin" / "cuobjdump";
@@ -959,7 +929,6 @@ std::string parse_kernel_symbol(const std::filesystem::path& cubin_path) {
   }
   return symbols[0];
 }
-#endif
 
 std::shared_ptr<NativeRuntime> get_or_build_runtime(
     const std::string& name,
@@ -1024,11 +993,7 @@ std::shared_ptr<NativeRuntime> get_or_build_runtime(
 
   auto runtime = std::make_shared<NativeRuntime>();
   try {
-#ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
-    const std::string symbol;
-#else
     const std::string symbol = parse_kernel_symbol(cubin_path);
-#endif
     runtime->kernel = load_kernel(cubin_path, symbol, &runtime->library);
   } catch (const std::exception& err) {
     g_runtime_failures.emplace(digest, err.what());
@@ -1074,7 +1039,7 @@ CUresult launch_sm90_grouped_masked(
       num_groups,
   };
   const auto config = get_best_config(desc);
-  const auto code = generate_kernel_code(desc, config);
+  const auto code = generate_kernel_code(desc, config, "MGroupedMasked");
   const auto runtime = get_or_build_runtime(
       "sm90_fp8_m_grouped_gemm_masked_1d2d_native", code, prop.major, prop.minor);
 
@@ -1104,6 +1069,139 @@ CUresult launch_sm90_grouped_masked(
           runtime->kernel, launch_config, sfb_arg, masked_arg, m, n, k,
           tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa),
       "DeepGEMM launch");
+  return CUDA_SUCCESS;
+}
+
+CUresult launch_sm90_grouped_contiguous(
+    const unsigned char* a,
+    const float* sfa,
+    const unsigned char* b,
+    const float* sfb,
+    unsigned short* d,
+    const int* m_indices,
+    int num_groups,
+    int m,
+    int n,
+    int k,
+    int sfa_aligned_m,
+    CUstream stream) {
+  cudaDeviceProp prop{};
+  CUresult prop_err = current_device_prop(&prop);
+  if (prop_err != CUDA_SUCCESS) return prop_err;
+  if (prop.major != 9) return CUDA_ERROR_NOT_SUPPORTED;
+
+  int num_sms = env_int("DG_NUM_SMS", prop.multiProcessorCount);
+  if (num_sms <= 0 || num_sms > prop.multiProcessorCount || (num_sms % 2) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  const GemmDesc desc{
+      m,
+      n,
+      k,
+      num_groups,
+      num_sms,
+      m,
+      n,
+      k,
+      1,
+  };
+  const auto config = get_best_config(desc);
+  const auto code = generate_kernel_code(desc, config, "MGroupedContiguous");
+  const auto runtime = get_or_build_runtime(
+      "sm90_fp8_m_grouped_gemm_contiguous_1d2d_native", code, prop.major, prop.minor);
+
+  const auto tensor_map_a = make_tma_a_desc(
+      a, m, k, config.storage.load_block_m, config.layout.block_k, k, 1,
+      config.storage.swizzle_a_mode);
+  const auto tensor_map_b = make_tma_b_desc(
+      b, n, k, config.storage.load_block_n, config.layout.block_k, k, num_groups,
+      config.storage.swizzle_b_mode);
+  const auto tensor_map_d = make_tma_d_desc(
+      d, m, n, config.storage.store_block_m, config.storage.store_block_n, n, 1,
+      config.storage.swizzle_cd_mode);
+  const auto tensor_map_sfa = make_tma_sfa_desc(
+      sfa, m, k, config.layout.block_m, config.layout.block_k, 1,
+      sfa_aligned_m);
+
+  dim3 grid(static_cast<unsigned>(config.launch.num_sms), 1, 1);
+  dim3 block(static_cast<unsigned>(config.launch.num_threads), 1, 1);
+  auto launch_config = construct_launch_config(
+      runtime->kernel, reinterpret_cast<cudaStream_t>(stream), config.pipeline.smem_size,
+      grid, block, config.layout.cluster_size(), false);
+
+  void* sfb_arg = const_cast<float*>(sfb);
+  void* m_indices_arg = const_cast<int*>(m_indices);
+  check_driver(
+      launch_kernel(
+          runtime->kernel, launch_config, sfb_arg, m_indices_arg, m, n, k,
+          tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa),
+      "DeepGEMM contiguous launch");
+  return CUDA_SUCCESS;
+}
+
+CUresult launch_sm90_dense_nt(
+    const unsigned char* a,
+    const float* sfa,
+    const unsigned char* b,
+    const float* sfb,
+    unsigned short* d,
+    int m,
+    int n,
+    int k,
+    int sfa_aligned_m,
+    CUstream stream) {
+  cudaDeviceProp prop{};
+  CUresult prop_err = current_device_prop(&prop);
+  if (prop_err != CUDA_SUCCESS) return prop_err;
+  if (prop.major != 9) return CUDA_ERROR_NOT_SUPPORTED;
+
+  int num_sms = env_int("DG_NUM_SMS", prop.multiProcessorCount);
+  if (num_sms <= 0 || num_sms > prop.multiProcessorCount || (num_sms % 2) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  const GemmDesc desc{
+      m,
+      n,
+      k,
+      1,
+      num_sms,
+      m,
+      n,
+      k,
+      1,
+  };
+  const auto config = get_best_config(desc);
+  const auto code = generate_kernel_code(desc, config, "Normal");
+  const auto runtime = get_or_build_runtime(
+      "sm90_fp8_gemm_nt_1d2d_native", code, prop.major, prop.minor);
+
+  const auto tensor_map_a = make_tma_a_desc(
+      a, m, k, config.storage.load_block_m, config.layout.block_k, k, 1,
+      config.storage.swizzle_a_mode);
+  const auto tensor_map_b = make_tma_b_desc(
+      b, n, k, config.storage.load_block_n, config.layout.block_k, k, 1,
+      config.storage.swizzle_b_mode);
+  const auto tensor_map_d = make_tma_d_desc(
+      d, m, n, config.storage.store_block_m, config.storage.store_block_n, n, 1,
+      config.storage.swizzle_cd_mode);
+  const auto tensor_map_sfa = make_tma_sfa_desc(
+      sfa, m, k, config.layout.block_m, config.layout.block_k, 1, sfa_aligned_m);
+
+  dim3 grid(static_cast<unsigned>(config.launch.num_sms), 1, 1);
+  dim3 block(static_cast<unsigned>(config.launch.num_threads), 1, 1);
+  auto launch_config = construct_launch_config(
+      runtime->kernel, reinterpret_cast<cudaStream_t>(stream), config.pipeline.smem_size,
+      grid, block, config.layout.cluster_size(), false);
+
+  void* sfb_arg = const_cast<float*>(sfb);
+  int* grouped_arg = nullptr;
+  check_driver(
+      launch_kernel(
+          runtime->kernel, launch_config, sfb_arg, grouped_arg, m, n, k,
+          tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa),
+      "DeepGEMM dense launch");
   return CUDA_SUCCESS;
 }
 
@@ -1150,6 +1248,67 @@ extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda(
         a, sfa, b, sfb, d, masked_m, num_groups, m, n, k, sfa_aligned_m, stream);
   } catch (const std::exception& err) {
     std::fprintf(stderr, "DeepGEMM native bridge failed: %s\n", err.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+}
+
+extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
+    const unsigned char* a,
+    const float* sfa,
+    const unsigned char* b,
+    const float* sfb,
+    unsigned short* d,
+    const int* m_indices,
+    int num_groups,
+    int m,
+    int n,
+    int k,
+    int sfa_aligned_m,
+    CUstream stream) {
+  if (a == nullptr || sfa == nullptr || b == nullptr || sfb == nullptr ||
+      d == nullptr || m_indices == nullptr || stream == nullptr || num_groups <= 0 ||
+      m <= 0 || n <= 0 || k <= 0 || sfa_aligned_m < m) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if ((k % kScaleGranK) != 0 || (n % 8) != 0 ||
+      sfa_aligned_m < get_tma_aligned_size(m, sizeof(float))) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  try {
+    return launch_sm90_grouped_contiguous(
+        a, sfa, b, sfb, d, m_indices, num_groups, m, n, k, sfa_aligned_m, stream);
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM native contiguous bridge failed: %s\n", err.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+}
+
+extern "C" CUresult dsv4_deepgemm_fp8_gemm_nt_cuda(
+    const unsigned char* a,
+    const float* sfa,
+    const unsigned char* b,
+    const float* sfb,
+    unsigned short* d,
+    int m,
+    int n,
+    int k,
+    int sfa_aligned_m,
+    CUstream stream) {
+  if (a == nullptr || sfa == nullptr || b == nullptr || sfb == nullptr ||
+      d == nullptr || stream == nullptr || m <= 0 || n <= 0 || k <= 0 ||
+      sfa_aligned_m < m) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if ((k % kScaleGranK) != 0 || (n % 8) != 0 ||
+      sfa_aligned_m < get_tma_aligned_size(m, sizeof(float))) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  try {
+    return launch_sm90_dense_nt(a, sfa, b, sfb, d, m, n, k, sfa_aligned_m, stream);
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM native dense bridge failed: %s\n", err.what());
     return CUDA_ERROR_UNKNOWN;
   }
 }

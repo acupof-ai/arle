@@ -317,44 +317,13 @@ mod backend {
             enable_cuda_graph: bool,
             config: &EngineLoadConfig,
         ) -> Result<Self> {
-            use infer_server::OpenAiTokenizer;
-
-            // Single-GPU CUDA load: dispatch by checkpoint kind from config.json.
-            // Qwen3 dense + Qwen3.5/3.6 MoE run here; DSv4 is multi-GPU only and
-            // errors with a pointer to the launcher. Wire `enable_cuda_graph` (CLI
-            // `--cuda-graph`/`--no-cuda-graph`, default on) into the decode-graph
-            // default; `INFER_CUDA_DECODE_GRAPH` still overrides at runtime, and
-            // `warmup` gates the graph off under TP (NCCL) and MoE (host routing).
-            infer_cuda::set_decode_graph_default(enable_cuda_graph);
-            let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
-            let model_id = crate::serve_engine::model_id_from_path(model_path);
-            let kind = detect_cuda_model_kind(model_path)?;
-
-            let model_source = model_path.to_string();
-            let scheduler = config.scheduler_config();
-            let num_slots = config.num_slots;
-            let total_pages = config.total_pages;
-            let page_size = config.page_size;
-            let serve = ServeHandle::spawn_with_engine_builder(move || {
-                let executor = match kind {
-                    CudaModelKind::Qwen3Dense => CudaExecutor::from_qwen3_bf16_safetensors(
-                        &model_source,
-                        num_slots,
-                        total_pages,
-                    )?,
-                    CudaModelKind::Qwen3Moe => CudaExecutor::from_qwen35_moe_safetensors(
-                        &model_source,
-                        num_slots,
-                        total_pages,
-                    )?,
-                    CudaModelKind::Dsv4 => anyhow::bail!(
-                        "DSv4 is multi-GPU only (TP=8/EP=8); launch via \
-                         scripts/dsv4_multigpu_parity.sh, not the single-process loader"
-                    ),
-                };
-                let kv = CudaKvPool::new(num_slots, total_pages, page_size);
-                Ok(infer_core::Engine::with_config(executor, kv, scheduler))
-            })?;
+            // Single-GPU CUDA load: dispatch by checkpoint kind (Qwen3 dense +
+            // Qwen3.5/3.6 MoE; DSv4 is multi-GPU only and errors). `enable_cuda_graph`
+            // (CLI --cuda-graph, default on) sets the decode-graph default;
+            // `INFER_CUDA_DECODE_GRAPH` overrides, `warmup` gates it off under TP/MoE.
+            // Shares the engine builder with `router_cuda` via `cuda_serve_handle`.
+            let (serve, tokenizer, model_id) =
+                cuda_serve_handle(model_path, enable_cuda_graph, config)?;
             Ok(Self::Cuda(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
             )))
@@ -423,17 +392,24 @@ mod backend {
         Ok(super::classify_cuda_model(&v))
     }
 
-    /// Single-GPU CUDA serve router. Spawns the same `ServeHandle` as
-    /// [`LoadedInferenceEngine::load_cuda`] (dispatching by checkpoint kind;
-    /// DSv4 is multi-GPU only and errors), then wraps it in
-    /// [`infer_server::openai_router`].
+    /// Shared single-GPU CUDA engine builder for
+    /// [`LoadedInferenceEngine::load_cuda`] and [`router_cuda`]. Sets the
+    /// decode-graph default, resolves the tokenizer + model id, classifies the
+    /// checkpoint, and spawns the `ServeHandle` (dispatching by kind; DSv4 is
+    /// multi-GPU only and errors). Callers wrap the returned handle in either
+    /// [`ServeInferenceEngine`] (the agent/OPD adapter) or
+    /// [`infer_server::openai_router`] (the in-process serve loop).
     #[cfg(feature = "cuda")]
-    fn router_cuda(
+    fn cuda_serve_handle(
         model_path: &str,
         enable_cuda_graph: bool,
         config: &EngineLoadConfig,
-    ) -> Result<axum::Router> {
-        use infer_server::{OpenAiTokenizer, openai_router};
+    ) -> Result<(
+        ServeHandle<CudaExecutor, CudaKvPool>,
+        infer_server::OpenAiTokenizer,
+        String,
+    )> {
+        use infer_server::OpenAiTokenizer;
 
         infer_cuda::set_decode_graph_default(enable_cuda_graph);
         let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
@@ -465,7 +441,21 @@ mod backend {
             let kv = CudaKvPool::new(num_slots, total_pages, page_size);
             Ok(infer_core::Engine::with_config(executor, kv, scheduler))
         })?;
-        Ok(openai_router(serve, tokenizer, model_id))
+        Ok((serve, tokenizer, model_id))
+    }
+
+    /// Single-GPU CUDA serve router. Builds the same `ServeHandle` as
+    /// [`LoadedInferenceEngine::load_cuda`] via [`cuda_serve_handle`], then wraps
+    /// it in [`infer_server::openai_router`].
+    #[cfg(feature = "cuda")]
+    fn router_cuda(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        config: &EngineLoadConfig,
+    ) -> Result<axum::Router> {
+        let (serve, tokenizer, model_id) =
+            cuda_serve_handle(model_path, enable_cuda_graph, config)?;
+        Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
     /// Portable CPU serve router: the placeholder `MetalExecutor` over the real

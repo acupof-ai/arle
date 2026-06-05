@@ -1,0 +1,571 @@
+//! Resident DSv4-Flash A/B harness.
+//!
+//! Loads the TP=8/EP=8 DSv4 executor once, then runs multiple decode variants in
+//! the same process. This removes the 149GB model reload from every scalar vs
+//! FlashMLA comparison and makes kernel A/B loops seconds-scale after load.
+//!
+//! Env:
+//!   * `INFER_DSV4_MODEL_PATH`       required DSv4 FP8 safetensors dir.
+//!   * `INFER_DSV4_PROMPT_IDS`       comma-separated DeepSeek ids.
+//!   * `INFER_DSV4_AB_VARIANTS`      `scalar,flashmla` by default.
+//!   * `INFER_DSV4_AB_MAX_NEW`       generated-token count, default 128.
+//!   * `INFER_DSV4_AB_WARMUP_NEW`    decode steps excluded from steady timing,
+//!                                  default 16.
+//!   * `INFER_DSV4_AB_REPEAT`        repeat the variant list after one load,
+//!                                  default 1.
+//!   * `INFER_DSV4_AB_PROFILE_VARIANT` optional variant name; starts CUDA
+//!                                  profiler after warmup for ncu/nsys attach.
+
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
+fn main() -> anyhow::Result<()> {
+    real::run()
+}
+
+#[cfg(not(feature = "cuda"))]
+mod real {
+    pub(super) fn run() -> anyhow::Result<()> {
+        eprintln!(
+            "dsv4_resident_ab is a CUDA harness; rebuild with \
+             --features cuda (single-rank) or --features cuda,nccl (multi-rank \
+             NCCL file-rendezvous via INFER_NCCL_ID_FILE)."
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+mod real {
+    use anyhow::{Context, Result, bail};
+    use infer_cuda::{
+        CudaExecutor, CudaKvPool, print_dsv4_linear_profile, print_dsv4_stage_profile,
+        reset_dsv4_linear_profile, reset_dsv4_stage_profile, set_dsv4_flashmla_decode_override,
+        set_dsv4_fused_wqkv_decode_override, set_dsv4_stage_profile_active,
+    };
+    use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
+    use infer_seam::{BackendExecutor, KvPool, PollResult};
+    use std::time::Instant;
+
+    const DEFAULT_PROMPT_IDS: &str = "671,6102,294,8760,344";
+    const DEFAULT_MAX_NEW: usize = 128;
+    const DEFAULT_WARMUP_NEW: usize = 16;
+    const ORACLE_16: [u32; 16] = [
+        11111, 603, 671, 6102, 294, 8760, 344, 11111, 603, 671, 6102, 294, 8760, 344, 11111, 603,
+    ];
+
+    unsafe extern "C" {
+        fn cudaProfilerStart() -> i32;
+        fn cudaProfilerStop() -> i32;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Variant {
+        name: &'static str,
+        flashmla: bool,
+        fused_wqkv: bool,
+        contig_moe: bool,
+    }
+
+    #[derive(Debug)]
+    struct VariantResult {
+        name: &'static str,
+        flashmla: bool,
+        fused_wqkv: bool,
+        contig_moe: bool,
+        tokens: Vec<u32>,
+        prefill_ms: f64,
+        decode_ms: f64,
+        timed_decode_ms: f64,
+        decode_steps: usize,
+        timed_decode_steps: usize,
+        bail_at: Option<(usize, String)>,
+    }
+
+    pub(super) fn run() -> Result<()> {
+        resident_ab()
+    }
+
+    #[cfg(feature = "nccl")]
+    fn mint_nccl_id_hex() -> Result<String> {
+        use cuda_kernels::ffi::nccl;
+
+        let mut id = nccl::ncclUniqueId {
+            internal: [0i8; 128],
+        };
+        // SAFETY: `id` is a valid NCCL handle destination.
+        let res = unsafe { nccl::ncclGetUniqueId(&mut id) };
+        nccl::check(res).context("ncclGetUniqueId failed")?;
+
+        let mut hex = String::with_capacity(256);
+        for &b in &id.internal {
+            use std::fmt::Write;
+            write!(hex, "{:02x}", b as u8).expect("write to String is infallible");
+        }
+        Ok(hex)
+    }
+
+    #[cfg(feature = "nccl")]
+    fn export_nccl_id(hex: &str) {
+        // SAFETY: called at process startup before the executor creates threads
+        // or NCCL state.
+        unsafe { std::env::set_var("INFER_NCCL_UNIQUE_ID", hex) };
+    }
+
+    #[cfg(feature = "nccl")]
+    fn nccl_file_rendezvous(rank: usize, id_file: &std::path::Path) -> Result<()> {
+        use std::time::{Duration, Instant};
+
+        if rank == 0 {
+            let hex = mint_nccl_id_hex()?;
+            let tmp = id_file.with_extension("hex.tmp");
+            std::fs::write(&tmp, &hex).with_context(|| format!("write NCCL id to {tmp:?}"))?;
+            std::fs::rename(&tmp, id_file)
+                .with_context(|| format!("rename NCCL id -> {id_file:?}"))?;
+            export_nccl_id(&hex);
+            eprintln!("[dsv4-ab rank=0] minted NCCL id -> {id_file:?}");
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                if let Ok(s) = std::fs::read_to_string(id_file) {
+                    let s = s.trim();
+                    if s.len() == 256 {
+                        export_nccl_id(s);
+                        break;
+                    }
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "rank {rank} timed out waiting for NCCL id at {id_file:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "nccl"))]
+    fn nccl_file_rendezvous(_rank: usize, _id_file: &std::path::Path) -> Result<()> {
+        bail!("INFER_NCCL_ID_FILE needs the nccl feature; rebuild with --features cuda,nccl")
+    }
+
+    fn resident_ab() -> Result<()> {
+        let model_path = std::env::var("INFER_DSV4_MODEL_PATH")
+            .context("INFER_DSV4_MODEL_PATH must point at the DSv4 FP8 safetensors directory")?;
+        let prompt = parse_prompt_ids(
+            &std::env::var("INFER_DSV4_PROMPT_IDS")
+                .unwrap_or_else(|_| DEFAULT_PROMPT_IDS.to_string()),
+        )?;
+        anyhow::ensure!(!prompt.is_empty(), "INFER_DSV4_PROMPT_IDS resolved empty");
+
+        let max_new = parse_usize_env("INFER_DSV4_AB_MAX_NEW", DEFAULT_MAX_NEW)?;
+        let warmup_new = parse_usize_env("INFER_DSV4_AB_WARMUP_NEW", DEFAULT_WARMUP_NEW)?;
+        let repeat = parse_usize_env("INFER_DSV4_AB_REPEAT", 1)?;
+        anyhow::ensure!(max_new >= 1, "INFER_DSV4_AB_MAX_NEW must be >= 1");
+        anyhow::ensure!(repeat >= 1, "INFER_DSV4_AB_REPEAT must be >= 1");
+        let variants = parse_variants(
+            &std::env::var("INFER_DSV4_AB_VARIANTS")
+                .unwrap_or_else(|_| "scalar,flashmla".to_string()),
+        )?;
+        let rank = parse_usize_env("INFER_TP_RANK", 0)?;
+        let profile_variant = std::env::var("INFER_DSV4_AB_PROFILE_VARIANT").ok();
+
+        // Resident A/B needs the FlashMLA FP8 arena allocated even when the first
+        // variant is scalar. Dispatch is controlled by the process-local override
+        // below; allocation is a separate load-time capability gate.
+        set_env_var("ARLE_DSV4_FLASHMLA_DECODE_ALLOC", "1");
+        if variants.iter().any(|v| v.fused_wqkv) {
+            set_env_var("ARLE_DSV4_FUSED_WQKV_DECODE_ALLOC", "1");
+        }
+        if !env_flag("INFER_DSV4_AB_ALLOW_GRAPH") {
+            set_env_var("ARLE_DSV4_DECODE_GRAPH", "0");
+        }
+
+        if let Ok(id_file) = std::env::var("INFER_NCCL_ID_FILE") {
+            nccl_file_rendezvous(rank, std::path::Path::new(&id_file))?;
+        }
+
+        let prompt_head: Vec<u32> = prompt.iter().copied().take(16).collect();
+        eprintln!(
+            "[dsv4-ab rank={rank}] model={model_path} prompt_len={} \
+             prompt_head={prompt_head:?} max_new={max_new} warmup_new={warmup_new} \
+             repeat={repeat} variants={}",
+            prompt.len(),
+            variants
+                .iter()
+                .map(|v| v.name)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let load_t0 = Instant::now();
+        let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1)
+            .context("from_dsv4_fp8_safetensors failed")?;
+        let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
+
+        for rep in 0..repeat {
+            let mut results = Vec::with_capacity(variants.len());
+            for &variant in &variants {
+                results.push(run_variant(
+                    &mut exec,
+                    &prompt,
+                    variant,
+                    max_new,
+                    warmup_new,
+                    profile_variant.as_deref(),
+                )?);
+            }
+            let scalar_tokens = results
+                .iter()
+                .find(|result| result.name == "scalar")
+                .map(|result| result.tokens.as_slice());
+            if rank == 0 {
+                for result in &results {
+                    let oracle16 = compare_prefix(&result.tokens, &ORACLE_16);
+                    let scalar_ref = scalar_ref_text(scalar_tokens, result);
+                    print_rank0_result(rep, load_ms, warmup_new, result, oracle16, &scalar_ref);
+                }
+            }
+        }
+        set_dsv4_flashmla_decode_override(None);
+        set_dsv4_fused_wqkv_decode_override(None);
+        Ok(())
+    }
+
+    fn run_variant(
+        exec: &mut CudaExecutor,
+        prompt: &[u32],
+        variant: Variant,
+        max_new: usize,
+        warmup_new: usize,
+        profile_variant: Option<&str>,
+    ) -> Result<VariantResult> {
+        set_dsv4_flashmla_decode_override(Some(variant.flashmla));
+        set_dsv4_fused_wqkv_decode_override(Some(variant.fused_wqkv));
+        set_env_var(
+            "ARLE_DSV4_MOE_CONTIG_DECODE",
+            if variant.contig_moe { "1" } else { "0" },
+        );
+        set_env_var("INFER_DSV4_AB_CURRENT_VARIANT", variant.name);
+        reset_dsv4_linear_profile();
+        reset_dsv4_stage_profile();
+
+        // DSv4 does not use the host page pool, but the BackendExecutor seam
+        // still carries one. Recreate it per variant so host bookkeeping starts
+        // clean alongside the executor slot reset at prefill start_pos=0.
+        let mut kv = CudaKvPool::new(1, 1, 16);
+
+        let prefill_t0 = Instant::now();
+        let first = forward_once(exec, &mut kv, prefill_plan(prompt, 0))?;
+        let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
+        let mut tokens = vec![first];
+
+        let profile_this = profile_variant == Some(variant.name);
+        let stage_profile_this = std::env::var_os("ARLE_DSV4_STAGE_PROFILE").is_some()
+            && (profile_variant.is_none() || profile_this);
+        let warmup_decode_steps = warmup_new.min(max_new.saturating_sub(1));
+        let mut bail_at = None;
+        let mut profiler_on = false;
+        let decode_t0 = Instant::now();
+        let mut timed_t0: Option<Instant> = None;
+
+        for step in 1..max_new {
+            if timed_t0.is_none() && step > warmup_decode_steps {
+                if profile_this {
+                    cuda_profiler_start()
+                        .with_context(|| format!("cudaProfilerStart for {}", variant.name))?;
+                    profiler_on = true;
+                }
+                set_dsv4_stage_profile_active(stage_profile_this);
+                timed_t0 = Some(Instant::now());
+            }
+
+            let kv_seq_len = prompt.len() + step - 1;
+            let last = *tokens.last().expect("tokens is non-empty");
+            match forward_once(exec, &mut kv, decode_plan(last, kv_seq_len)) {
+                Ok(tok) => tokens.push(tok),
+                Err(e) => {
+                    bail_at = Some((step, format!("{e:#}")));
+                    break;
+                }
+            }
+        }
+
+        let decode_ms = decode_t0.elapsed().as_secs_f64() * 1000.0;
+        let timed_decode_ms = timed_t0
+            .map(|t0| t0.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        if profiler_on {
+            cuda_profiler_stop()
+                .with_context(|| format!("cudaProfilerStop for {}", variant.name))?;
+        }
+        set_dsv4_stage_profile_active(false);
+        print_dsv4_linear_profile(variant.name);
+        let decode_steps = tokens.len().saturating_sub(1);
+        let timed_decode_steps = decode_steps.saturating_sub(warmup_decode_steps);
+        print_dsv4_stage_profile(variant.name, timed_decode_steps, timed_decode_ms);
+
+        Ok(VariantResult {
+            name: variant.name,
+            flashmla: variant.flashmla,
+            fused_wqkv: variant.fused_wqkv,
+            contig_moe: variant.contig_moe,
+            tokens,
+            prefill_ms,
+            decode_ms,
+            timed_decode_ms,
+            decode_steps,
+            timed_decode_steps,
+            bail_at,
+        })
+    }
+
+    fn print_rank0_result(
+        rep: usize,
+        load_ms: f64,
+        warmup_new: usize,
+        result: &VariantResult,
+        oracle16: Option<usize>,
+        scalar_ref_text: &str,
+    ) {
+        let decode_tok_s = if result.decode_ms > 0.0 {
+            (result.decode_steps as f64) / (result.decode_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let steady_tok_s = if result.timed_decode_ms > 0.0 {
+            (result.timed_decode_steps as f64) / (result.timed_decode_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let oracle16_text = match oracle16 {
+            None => "PASS".to_string(),
+            Some(idx) => format!("FAIL@{idx}"),
+        };
+        println!(
+            "ab_variant={} rep={} flashmla={} fused_wqkv={} contig_moe={} tokens={:?} oracle16={} scalar_ref={} \
+             load_ms={:.3} prefill_ms={:.3} decode_steps={} decode_ms={:.3} \
+             decode_tok_s={:.3} warmup_decode_steps={} timed_decode_steps={} \
+             timed_decode_ms={:.3} steady_tok_s={:.3}",
+            result.name,
+            rep,
+            u8::from(result.flashmla),
+            u8::from(result.fused_wqkv),
+            u8::from(result.contig_moe),
+            result.tokens,
+            oracle16_text,
+            scalar_ref_text,
+            load_ms,
+            result.prefill_ms,
+            result.decode_steps,
+            result.decode_ms,
+            decode_tok_s,
+            warmup_new,
+            result.timed_decode_steps,
+            result.timed_decode_ms,
+            steady_tok_s,
+        );
+        if let Some((step, msg)) = &result.bail_at {
+            eprintln!(
+                "[dsv4-ab rank=0] variant={} bailed at decode step {step}: {msg}",
+                result.name
+            );
+        }
+    }
+
+    fn scalar_ref_text(reference: Option<&[u32]>, result: &VariantResult) -> String {
+        match reference {
+            Some(tokens) => match first_diff(tokens, &result.tokens) {
+                None => "MATCH".to_string(),
+                Some(idx) => format!("DIFF@{idx}"),
+            },
+            None if result.name == "scalar" => "SELF".to_string(),
+            None => "NOREF".to_string(),
+        }
+    }
+
+    fn env_flag(name: &str) -> bool {
+        matches!(
+            std::env::var(name).as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    }
+
+    fn set_env_var(name: &str, value: &str) {
+        // SAFETY: this harness mutates env only during process startup before it
+        // builds CUDA/NCCL state or spawns threads.
+        unsafe { std::env::set_var(name, value) };
+    }
+
+    fn cuda_profiler_start() -> Result<()> {
+        // SAFETY: CUDA profiler API has process-global side effects only.
+        let code = unsafe { cudaProfilerStart() };
+        anyhow::ensure!(
+            code == 0,
+            "cudaProfilerStart returned CUDA error code {code}"
+        );
+        Ok(())
+    }
+
+    fn cuda_profiler_stop() -> Result<()> {
+        // SAFETY: pairs with `cuda_profiler_start`.
+        let code = unsafe { cudaProfilerStop() };
+        anyhow::ensure!(
+            code == 0,
+            "cudaProfilerStop returned CUDA error code {code}"
+        );
+        Ok(())
+    }
+
+    fn prefill_plan(tokens: &[u32], start_pos: usize) -> ForwardPlan {
+        ForwardPlan {
+            mode: ForwardMode::Prefill,
+            decode_rows: Vec::new(),
+            prefill_rows: vec![PrefillRow {
+                slot: 0,
+                tokens: tokens.to_vec(),
+                start_pos,
+                total_tokens: start_pos + tokens.len(),
+                params: greedy(),
+            }],
+            microbatch: None,
+            spec: None,
+        }
+    }
+
+    fn decode_plan(last_token: u32, kv_seq_len: usize) -> ForwardPlan {
+        ForwardPlan {
+            mode: ForwardMode::Decode,
+            decode_rows: vec![infer_plan::DecodeRow {
+                slot: 0,
+                last_token,
+                kv_seq_len,
+                params: greedy(),
+            }],
+            prefill_rows: Vec::new(),
+            microbatch: None,
+            spec: None,
+        }
+    }
+
+    fn forward_once(
+        exec: &mut CudaExecutor,
+        kv: &mut CudaKvPool,
+        plan: ForwardPlan,
+    ) -> Result<u32> {
+        let inflight = exec.submit(&plan, kv as &mut dyn KvPool)?;
+        match exec.poll(inflight)? {
+            PollResult::Ready(out) => out
+                .tokens
+                .first()
+                .map(|t| t.token)
+                .context("DSv4 step produced no token"),
+            PollResult::NotReady(_) => bail!("DSv4 executor resolves synchronously; got NotReady"),
+        }
+    }
+
+    fn greedy() -> SamplingParams {
+        SamplingParams::default()
+    }
+
+    fn parse_prompt_ids(s: &str) -> Result<Vec<u32>> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                t.parse::<u32>()
+                    .with_context(|| format!("bad token id `{t}` in INFER_DSV4_PROMPT_IDS"))
+            })
+            .collect()
+    }
+
+    fn parse_usize_env(name: &str, default: usize) -> Result<usize> {
+        match std::env::var(name) {
+            Ok(raw) => raw
+                .parse::<usize>()
+                .with_context(|| format!("{name} must be usize, got `{raw}`")),
+            Err(std::env::VarError::NotPresent) => Ok(default),
+            Err(e) => bail!("{name} invalid env: {e}"),
+        }
+    }
+
+    fn parse_variants(raw: &str) -> Result<Vec<Variant>> {
+        let mut variants = Vec::new();
+        for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match item {
+                "scalar" | "bf16" | "baseline" => variants.push(Variant {
+                    name: "scalar",
+                    flashmla: false,
+                    fused_wqkv: false,
+                    contig_moe: false,
+                }),
+                "flashmla" | "flash" => variants.push(Variant {
+                    name: "flashmla",
+                    flashmla: true,
+                    fused_wqkv: false,
+                    contig_moe: false,
+                }),
+                "fused_wqkv" | "fused_linear" | "flashmla_fused" | "flashmla_fused_wqkv" => {
+                    variants.push(Variant {
+                        name: "flashmla_fused_wqkv",
+                        flashmla: true,
+                        fused_wqkv: true,
+                        contig_moe: false,
+                    })
+                }
+                "contig_moe" | "flashmla_fused_wqkv_contig" | "flashmla_fused_wqkv_contig_moe" => {
+                    variants.push(Variant {
+                        name: "flashmla_fused_wqkv_contig_moe",
+                        flashmla: true,
+                        fused_wqkv: true,
+                        contig_moe: true,
+                    })
+                }
+                "flashmla_contig_moe" => variants.push(Variant {
+                    name: "flashmla_contig_moe",
+                    flashmla: true,
+                    fused_wqkv: false,
+                    contig_moe: true,
+                }),
+                "scalar_fused_wqkv" => variants.push(Variant {
+                    name: "scalar_fused_wqkv",
+                    flashmla: false,
+                    fused_wqkv: true,
+                    contig_moe: false,
+                }),
+                other => bail!(
+                    "unsupported INFER_DSV4_AB_VARIANTS item `{other}` \
+                     (expected scalar, flashmla, flashmla_fused_wqkv, flashmla_fused_wqkv_contig_moe)"
+                ),
+            }
+        }
+        anyhow::ensure!(
+            !variants.is_empty(),
+            "INFER_DSV4_AB_VARIANTS resolved empty"
+        );
+        Ok(variants)
+    }
+
+    fn compare_prefix(got: &[u32], expected: &[u32]) -> Option<usize> {
+        let n = got.len().min(expected.len());
+        for i in 0..n {
+            if got[i] != expected[i] {
+                return Some(i);
+            }
+        }
+        if got.len() < expected.len() {
+            Some(got.len())
+        } else {
+            None
+        }
+    }
+
+    fn first_diff(a: &[u32], b: &[u32]) -> Option<usize> {
+        let n = a.len().min(b.len());
+        for i in 0..n {
+            if a[i] != b[i] {
+                return Some(i);
+            }
+        }
+        if a.len() == b.len() { None } else { Some(n) }
+    }
+}

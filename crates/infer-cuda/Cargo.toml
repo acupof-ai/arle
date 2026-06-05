@@ -56,5 +56,10 @@ name = "dsv4_parity"
 path = "examples/dsv4_parity.rs"
 required-features = ["cuda"]
 
+[[example]]
+name = "dsv4_resident_ab"
+path = "examples/dsv4_resident_ab.rs"
+required-features = ["cuda"]
+
 [lints]
 workspace = true
