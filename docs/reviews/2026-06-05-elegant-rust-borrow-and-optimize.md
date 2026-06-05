@@ -16,6 +16,44 @@ out of scope (Codex's live DSv4 tree).
 
 ---
 
+## 0. Applicability check (source-verified 2026-06-05) — READ FIRST
+
+The §2 borrow-list was rated for a *generic published library*. Verifying the
+top items against ARLE's actual source **revises most of them down** — ARLE is an
+**internal monorepo**, not a crates.io library, and several "smells" are
+defensible. Do **not** apply §2 top-down without this filter:
+
+- **Structured error enums (§2 #1) — speculative here, not high-ROI.** Verified:
+  the only code matching on `TopoError`/`MoeError` content is **test assertions**
+  (`.contains(...)`); **zero production callers branch** on these errors (they
+  just propagate / `Display`). Converting to enums adds a matchable surface
+  nothing uses → exactly [[feedback_no_speculative_interface_shaping]]. Skip
+  until a real caller needs to branch.
+- **`#[non_exhaustive]` (§2 #4) — counterproductive for an internal monorepo.**
+  Its value is *cross-published-crate* SemVer evolution. In a single workspace,
+  **exhaustive matching is a feature** — it forces every backend/site to handle
+  a new variant, which is what you *want*. `#[non_exhaustive]` would hide that.
+  Skip (the doc's own §3.5 caveat, sharpened: ARLE has no external consumers).
+- **Closed-set enums for `kind`/`role`/`dtype` (§2 #3) — wire boundaries, low
+  ROI.** Verified: `response.dtype` (teacher API), `record.kind` (JSONL), and
+  `message.role` (chat request) are all **external wire fields**. `dtype`
+  already errors correctly on unknown (not a silent bug); enum+serde would change
+  forward-compat (reject unknown future tags). The "parse at the boundary"
+  idiom applies only if we *want* to reject unknowns — usually we don't.
+- **What survives as clean, non-speculative wins:** the small *internal*
+  (non-wire) items — typed `FromStr::Err` in `train/cli_args.rs` (modulo
+  `FromStr` lacking flag-context for `ArgError`), a `StatusFlags` struct over the
+  `&[(&str,bool)]` bool-soup in `train/control.rs:183`, and `chunks_exact` in
+  `infer-moe/src/route.rs` (**bench-gated** — hot path). All marginal.
+
+**Bottom line:** ARLE's newer crates are already idiomatic; the real clarity
+wins were the dedup/dead-code pass already landed. This doc's best use is a
+**forward-looking guide for NEW code**, not a refactor backlog for the existing
+tree. Apply an item only after confirming a *real* (non-speculative, non-wire)
+caller benefits.
+
+---
+
 ## 1. Verdict
 
 For a perf-sensitive inference runtime, "elegant Rust" is not aesthetic polish — it is **converting runtime invariants into compile errors at zero hot-path cost**. Every top pattern (newtype IDs, sealed traits, typed enums, RAII guards) takes a bug class ARLE already fights in production — wrong-data-fed-to-path (`feedback_validate_comparison_inputs_before_bug.md`), slot/buffer reuse-after-free (`reference_disabled_event_tracking_premature_buffer_free.md`) — and makes it unrepresentable. The internal scan confirms ARLE's *newest* crates (`infer-core`, `infer-seam`, `infer-plan`, `infer-server`) are already strongly idiomatic: `RequestHandle(u64)` / `SessionId(Arc<str>)` newtypes, the `KvPool: KvQuery + KvAllocator + KvPrefixStore` sub-trait split with blanket impl, pervasive `#[must_use]`. The divergences are **maturity-of-contract issues concentrated in the older `train`/`chat`/`agent` crates plus two cross-cutting gaps** — not codebase-wide rot, and not beginner-grade problems. The single highest-leverage move is **propagating `infer-core`'s conventions backward** into the legacy crates, plus one near-zero-churn workspace-wide fix: `#[non_exhaustive]` is **absent from every in-scope crate** despite ~20 carrying `thiserror` enums and several public cross-crate seam enums.
