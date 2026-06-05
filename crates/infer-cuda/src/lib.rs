@@ -61,6 +61,14 @@ pub use qwen35::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 #[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
 
+/// Process-local override for DSv4 FlashMLA decode dispatch. `None` restores the
+/// `ARLE_DSV4_FLASHMLA_DECODE` env gate. Intended for resident A/B harnesses
+/// that need to compare scalar vs FlashMLA after one model load.
+#[cfg(feature = "cuda")]
+pub fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
+    attention::set_dsv4_flashmla_decode_override(enabled);
+}
+
 // Not cuda-gated: env→TpConfig resolution is CPU-testable; only the NCCL comm
 // variant is feature-gated.
 pub mod tp;
