@@ -1054,7 +1054,15 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
         DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
         _ => {}
     }
-    env_flag("ARLE_DSV4_FLASHMLA_DECODE")
+    // Default ON: FlashMLA SM90 sparse decode is the adopted decode attention — the
+    // same vendored kernel SGLang uses. Licensed 2026-06-06 on the TP=8/EP=8 pod:
+    // 64-tok resident same-load A/B token-exact vs scalar, 29.47 -> 36.59 tok/s
+    // (+24%). `dsv4_flashmla_decode_alloc_enabled` falls through to this, so the
+    // arena allocates under the default. Opt out with ARLE_DSV4_FLASHMLA_DECODE=0.
+    Ok(!matches!(
+        std::env::var("ARLE_DSV4_FLASHMLA_DECODE").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    ))
 }
 
 fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
