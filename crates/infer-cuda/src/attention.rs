@@ -3,12 +3,12 @@
 //! Prep kernels fuse Q/K RMSNorm + RoPE + KV-cache write; the TileLang kernels
 //! run the HD128/kv8 paged attention.
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{Result, anyhow, bail, ensure};
 use cuda_kernels::attention as flash_kv;
 use cuda_kernels::ffi;
 use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
-use cuda_kernels::tensor::{cache_ptr, WeightFormat};
+use cuda_kernels::tensor::{WeightFormat, cache_ptr};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use std::collections::HashSet;
@@ -1156,7 +1156,16 @@ fn dsv4_fused_wqkv_decode_enabled() -> Result<bool> {
         DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
         _ => {}
     }
-    env_flag("ARLE_DSV4_FUSED_WQKV_DECODE")
+    // Default ON: fuse wq_a|wkv_a into one FP8 DeepGEMM instead of the scalar
+    // `dsv4_fp8_gemv_batch_kernel` (which the clean decode profile pinned at 16.9% of
+    // decode GPU — the #1 real decode kernel). Licensed 2026-06-06 on the TP=8/EP=8
+    // pod, 64-tok same-binary env A/B: 31.774 -> 37.633 tok/s (+18.4%), token-exact.
+    // `dsv4_fused_wqkv_decode_alloc_enabled` falls through to this, so the fused
+    // scratch allocates under the default. Opt out with ARLE_DSV4_FUSED_WQKV_DECODE=0.
+    Ok(!matches!(
+        std::env::var("ARLE_DSV4_FUSED_WQKV_DECODE").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    ))
 }
 
 fn env_flag(name: &str) -> Result<bool> {
