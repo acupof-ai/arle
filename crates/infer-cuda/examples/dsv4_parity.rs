@@ -70,7 +70,10 @@ mod real {
 #[cfg(feature = "cuda")]
 mod real {
     use anyhow::{Context, Result};
-    use infer_cuda::{CudaExecutor, CudaKvPool};
+    use infer_cuda::{
+        CudaExecutor, CudaKvPool, print_dsv4_stage_profile, reset_dsv4_stage_profile,
+        set_dsv4_stage_profile_active,
+    };
     use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
     use infer_seam::{BackendExecutor, KvPool, PollResult};
     use std::time::Instant;
@@ -223,6 +226,9 @@ mod real {
         if profile_prefill {
             cuda_profiler_start().context("cudaProfilerStart before DSv4 prefill failed")?;
         }
+        let stage_profile_prefill = env_flag("ARLE_DSV4_STAGE_PROFILE");
+        reset_dsv4_stage_profile();
+        set_dsv4_stage_profile_active(stage_profile_prefill);
         let prefill_t0 = Instant::now();
         let first = if chunk1_prompt {
             let mut first = None;
@@ -234,6 +240,8 @@ mod real {
             forward_once(&mut exec, &mut kv, prefill_plan(&prompt, 0))?
         };
         let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
+        set_dsv4_stage_profile_active(false);
+        print_dsv4_stage_profile("prefill", prompt.len(), prefill_ms);
         if profile_prefill {
             cuda_profiler_stop().context("cudaProfilerStop after DSv4 prefill failed")?;
         }
