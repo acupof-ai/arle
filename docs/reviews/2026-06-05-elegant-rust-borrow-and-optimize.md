@@ -40,17 +40,26 @@ defensible. Do **not** apply §2 top-down without this filter:
   already errors correctly on unknown (not a silent bug); enum+serde would change
   forward-compat (reject unknown future tags). The "parse at the boundary"
   idiom applies only if we *want* to reject unknowns — usually we don't.
-- **What survives as clean, non-speculative wins:** the small *internal*
-  (non-wire) items — typed `FromStr::Err` in `train/cli_args.rs` (modulo
-  `FromStr` lacking flag-context for `ArgError`), a `StatusFlags` struct over the
-  `&[(&str,bool)]` bool-soup in `train/control.rs:183`, and `chunks_exact` in
-  `infer-moe/src/route.rs` (**bench-gated** — hot path). All marginal.
+- **Apply pass (4 parallel verify-or-kill agents, 2026-06-05): all four candidate
+  wins KILLed**, each with source evidence — (1) `FromStr::Err`→`ArgError`:
+  speculative, no production caller; (2) `StatusFlags`: not a bool-trap (labeled
+  pairs serialize to a JSONL `bools` map — wire) and would diverge from the
+  pervasive `&[(&str,bool)]` record convention; (3) shared `CliError`: the
+  `train/src/bin/*` it targeted **was deleted** in the OPD-only pivot — nothing to
+  dedup; (4) `sampling_params` dedup: **already done** (one `fn sampling_params`,
+  both methods delegate). The borrow-list reflected a generic library, not this
+  tree.
+- **The one real finding → acted on:** `crates/train/src/cli_args.rs` (argv helpers
+  for the deleted training binaries, superseded by `arle`'s clap args, **0 external
+  refs**) was confirmed dead and **deleted** — not patched. Genuine dead-code
+  removal, the only material change this study produced.
 
 **Bottom line:** ARLE's newer crates are already idiomatic; the real clarity
-wins were the dedup/dead-code pass already landed. This doc's best use is a
-**forward-looking guide for NEW code**, not a refactor backlog for the existing
-tree. Apply an item only after confirming a *real* (non-speculative, non-wire)
-caller benefits.
+wins were the dedup/dead-code pass already landed (+ this cli_args deletion).
+This doc's best use is a **forward-looking guide for NEW code**, not a refactor
+backlog for the existing tree — every borrow-list item that was checked against
+source either was already done, targeted deleted code, or was speculative. Apply
+an item only after confirming a *real* (non-speculative, non-wire) caller benefits.
 
 ---
 
