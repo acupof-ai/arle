@@ -138,6 +138,7 @@ pub(crate) struct Dsv4HyperConnection {
 /// the compressor on both CSA and HCA, the indexer on CSA only.
 pub(crate) struct Dsv4Attention {
     pub wq_a: DeviceMatrix,
+    pub wqkv_a_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub q_norm: DeviceVec,
     pub wq_b: DeviceMatrix,
     pub wkv: DeviceMatrix,
