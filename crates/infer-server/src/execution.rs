@@ -35,6 +35,7 @@ pub enum StreamItem {
 /// inside `engine.step()`) and the loop body. The engine loop is single-threaded,
 /// so `Rc<RefCell<_>>` is sound; every borrow is short and never spans a step.
 type Streamers = Rc<RefCell<HashMap<RequestHandle, Sender<StreamItem>>>>;
+type PendingCompletions = HashMap<RequestHandle, Sender<CompletedRequest>>;
 
 /// Live scheduler counters the engine loop publishes each tick for the frontend
 /// (`ServeHandle::counters`). Only counters the engine already tracks — no
@@ -98,8 +99,7 @@ pub(crate) fn engine_loop<E, K>(
 {
     // Per-request completion back-channels, keyed by the engine-assigned handle.
     // Entries are removed as their completion is delivered.
-    let mut pending: std::collections::HashMap<RequestHandle, Sender<CompletedRequest>> =
-        std::collections::HashMap::new();
+    let mut pending: PendingCompletions = std::collections::HashMap::new();
     // Per-request live token streams (streaming submissions only), shared with the
     // observer installed below; entries are removed when their `Done` is emitted.
     let streamers: Streamers = Rc::new(RefCell::new(HashMap::new()));
@@ -193,7 +193,7 @@ where
 /// Submit one request to the engine and register its back-channels.
 fn admit_submission<E, K>(
     engine: &mut Engine<E, K>,
-    pending: &mut std::collections::HashMap<RequestHandle, Sender<CompletedRequest>>,
+    pending: &mut PendingCompletions,
     streamers: &Streamers,
     submission: Submission,
 ) where
@@ -226,7 +226,7 @@ fn admit_submission<E, K>(
 /// Deliver any newly-completed requests to their waiting collectors.
 fn deliver_completions<E, K>(
     engine: &Engine<E, K>,
-    pending: &mut std::collections::HashMap<RequestHandle, Sender<CompletedRequest>>,
+    pending: &mut PendingCompletions,
     streamers: &Streamers,
 ) where
     E: BackendExecutor,
@@ -235,15 +235,13 @@ fn deliver_completions<E, K>(
     if pending.is_empty() {
         return;
     }
-    let ready: Vec<RequestHandle> = pending
+    let ready: Vec<(RequestHandle, CompletedRequest)> = pending
         .keys()
         .copied()
-        .filter(|handle| engine.completed(*handle).is_some())
+        .filter_map(|handle| engine.completed(handle).map(|c| (handle, c.clone())))
         .collect();
-    for handle in ready {
-        if let Some(completed) = engine.completed(handle) {
-            finish_handle(handle, completed.clone(), pending, streamers);
-        }
+    for (handle, completed) in ready {
+        finish_handle(handle, completed, pending, streamers);
     }
 }
 
@@ -253,7 +251,7 @@ fn deliver_completions<E, K>(
 fn finish_handle(
     handle: RequestHandle,
     completed: CompletedRequest,
-    pending: &mut std::collections::HashMap<RequestHandle, Sender<CompletedRequest>>,
+    pending: &mut PendingCompletions,
     streamers: &Streamers,
 ) {
     if let Some(stream_tx) = streamers.borrow_mut().remove(&handle) {
