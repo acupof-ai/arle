@@ -189,15 +189,7 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
             .get("norm_topk_prob")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
-        let mut mlp_only_layers = model
-            .get("mlp_only_layers")
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as usize))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let mut mlp_only_layers = parse_usize_array(model, "mlp_only_layers").unwrap_or_default();
 
         if let Some(nested) = nested_moe {
             let nested_num_experts = get_usize(nested, "num_experts", 0);
@@ -219,15 +211,8 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
             {
                 norm_topk_prob = false;
             }
-            if let Some(nested_layers) = nested
-                .get("mlp_only_layers")
-                .and_then(serde_json::Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64().map(|n| n as usize))
-                        .collect::<Vec<_>>()
-                })
-                .filter(|layers| !layers.is_empty())
+            if let Some(nested_layers) =
+                parse_usize_array(nested, "mlp_only_layers").filter(|layers| !layers.is_empty())
             {
                 mlp_only_layers = nested_layers;
             }
@@ -336,4 +321,19 @@ fn extend_unique(target: &mut Vec<u32>, src: Vec<u32>) {
             target.push(id);
         }
     }
+}
+
+/// Parse a JSON array field into `Vec<usize>`, dropping non-integer elements.
+/// Returns `None` when the key is absent or not an array.
+fn parse_usize_array(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<Vec<usize>> {
+    obj.get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect::<Vec<_>>()
+        })
 }
