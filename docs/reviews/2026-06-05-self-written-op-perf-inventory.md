@@ -59,12 +59,29 @@ These are **hypothesis — unmeasured**. None has an isolated ms/token or ncu nu
 
 ## 5. Genuine gaps (no vendored/best-practice alternative — custom op justified)
 
-- **Hyper-connection family** (`dsv4_mhc_*`, 4.92 ms/tok) — DSv4-specific; no upstream HC kernel exists. The fix is fusion/batching (collapse 61-layer params into one launch, or fold the per-layer mixers into the existing `ARLE_DSV4_DECODE_GRAPH` segment), not adoption. **This is the highest-value un-root-caused measured target in the inventory.**
+- ~~**Hyper-connection family** — DSv4-specific; no upstream HC kernel exists.~~
+  **CORRECTED 2026-06-05: this was WRONG — HC is NOT a gap, it's adopt-able.**
+  SGLang's DeepSeek-V4 fuses the entire `mhc_pre` (RMSNorm + Sinkhorn-Knopp +
+  residual-mix) into ONE TileLang kernel — `mhc_pre_big_fuse_tilelang`, PDL
+  enabled — so it has no launch storm. ARLE's **86 launches/token + single-CTA
+  thread0-Sinkhorn** (`dsv4_mhc_params_kernel<<<num_tokens,256>>>`) is the
+  ARLE-specific anti-pattern (meta-pattern (a)+(c)), not an inherent HC cost.
+  Root cause (nsys, 2026-06-05): `dsv4_mhc_params` 86 launch/tok = 3.05 ms +
+  `mix_fn` scalar GEMV ~2.16 ms; NOT f32-materialize. **Lever (in-progress):
+  adopt SGLang's fused `mhc_pre` TileLang structure** (ARLE already runs TileLang
+  AOT), Sinkhorn parallelized across warps/CTAs, optionally PDL. (mHC-lite,
+  [arXiv 2601.05732](https://arxiv.org/pdf/2601.05732), cuts Sinkhorn iters —
+  numeric change, parity-gated, deferred.)
 - **Compressor KV update** (`dsv4_compressor_update_cuda`, `<<<1,BLOCK>>>`) — SGLang's compressed-KV stream maintenance has no drop-in replacement; the `<<<1>>>` grid is the worst smell in the attention lane, but cost is unproven — measure before licensing a rewrite.
 - **FP8-KV pack + output inverse-RoPE + FlashMLA build-indices** — required by the FlashMLA FP8-only ABI; genuine glue gaps (~0.56 ms + smaller), removable only by changing the kernel ABI, not by adopting an upstream op.
 - **MHC params / Sinkhorn** — DSv4-specific normalization; no vendored equivalent.
 
-**Next measurement priority:** (1) ncu-isolate the HC `<<<1,256>>>` Sinkhorn to pick launch-fuse vs occupancy lever; (2) break out `moe_route`/`moe_pack`/`moe_combine_scatter` stage slices to confirm or dismiss the route-family tiny-grid hypotheses; (3) sync-before probe on `dsv4_compressor_update` (`<<<1>>>`) before any rewrite license.
+**Next measurement priority:** (1) ~~ncu-isolate the HC Sinkhorn~~ **DONE
+2026-06-05** — root-caused to 86 launch/tok + single-CTA (not f32); now adopting
+SGLang's fused `mhc_pre_big_fuse_tilelang` (in-progress); (2) break out
+`moe_route`/`moe_pack`/`moe_combine_scatter` stage slices to confirm or dismiss
+the route-family tiny-grid hypotheses; (3) sync-before probe on
+`dsv4_compressor_update` (`<<<1>>>`) before any rewrite license.
 
 ---
 
