@@ -229,8 +229,15 @@ mod tests {
         }
     }
 
+    fn skip_if_no_backend() -> bool {
+        !CompiledBackend::detect().supports_inference()
+    }
+
     #[test]
     fn serve_uses_subcommand_model_path() {
+        if skip_if_no_backend() {
+            return;
+        }
         let (args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -245,6 +252,9 @@ mod tests {
 
     #[test]
     fn serve_uses_top_level_model_path() {
+        if skip_if_no_backend() {
+            return;
+        }
         let (args, serve) = parse_serve(&[
             "arle",
             "--model-path",
@@ -259,6 +269,9 @@ mod tests {
 
     #[test]
     fn no_cuda_graph_flag_disables_decode_graph_default() {
+        if skip_if_no_backend() {
+            return;
+        }
         let (args, serve) = parse_serve(&[
             "arle",
             "--no-cuda-graph",
@@ -274,6 +287,9 @@ mod tests {
 
     #[test]
     fn default_enables_decode_graph_default() {
+        if skip_if_no_backend() {
+            return;
+        }
         let (args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -288,6 +304,9 @@ mod tests {
 
     #[test]
     fn port_and_bind_flow_into_options() {
+        if skip_if_no_backend() {
+            return;
+        }
         let (args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -321,6 +340,9 @@ mod tests {
 
     #[test]
     fn train_control_url_is_rejected() {
+        if skip_if_no_backend() {
+            return;
+        }
         let (args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -337,6 +359,9 @@ mod tests {
 
     #[test]
     fn pool_model_is_rejected() {
+        if skip_if_no_backend() {
+            return;
+        }
         let (args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -353,6 +378,9 @@ mod tests {
 
     #[test]
     fn extra_args_after_dashes_are_rejected() {
+        if skip_if_no_backend() {
+            return;
+        }
         let (args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -370,6 +398,9 @@ mod tests {
 
     #[test]
     fn non_metal_spec_type_errors_when_compiled_non_metal() {
+        if skip_if_no_backend() {
+            return;
+        }
         // Only meaningful when the compiled backend is not Metal; on a Metal
         // build `--spec-type mtp` is accepted, so skip there.
         if CompiledBackend::detect() == CompiledBackend::Metal {
