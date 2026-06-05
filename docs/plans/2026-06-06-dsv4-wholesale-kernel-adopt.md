@@ -47,10 +47,22 @@ accept if draft==argmax → 2 tokens/forward). Files: `dsv4.rs` (Dsv4MtpLayer + 
 in `submit`), `attention.rs` (KV rollback in `advance_decode_len`), scheduler seq_len
 accounting (+2-on-accept). Gate `ARLE_DSV4_SPEC_DECODE`, mutually exclusive with
 decode-graph/deepep for v1.
-- **Two design unknowns — control-experiment FIRST (§0):** (1) MLA KV rollback on
-  reject produces bit-identical state to a fresh forward; (2) host/device seq_len
-  lockstep when 2 tokens land/step. Both are cheap-experiment-verifiable; coding the
-  loop before they pass is a guess.
+- **Two design unknowns — GROUNDED 2026-06-06 (both tractable; control-experiment still gates landing):**
+  1. **KV rollback on reject** — `advance_decode_len` (attention.rs:411) is just
+     *logical counters* (`compressor/indexer.compressed.seq_len = total_len/ratio`).
+     So rollback is: SW ring **self-heals** (the next real token overwrites slot
+     `pos%W`); compressor/indexer counters **recompute** from the accepted `total_len`;
+     only the FlashMLA FP8-pool packed counters (`fp8_kv_comp_packed_rows`) need an
+     explicit decrement. Control experiment: spec-write pos p+1 → reject → next real
+     forward at p+1 is bit-identical to a no-spec forward.
+  2. **seq_len lockstep** — decode today does `kv.alloc_tokens(slot,1)` +
+     `position=kv_seq_len+1` + asserts `kv.seq_len(slot)==row.kv_seq_len`
+     (executor.rs:356-371), emits exactly 1 `SlotToken`. EAGLE: `alloc_tokens(slot,2)`
+     on the verify batch, emit 1-or-2 `SlotToken`s, on reject `free`/decrement the 2nd,
+     scheduler advances `row.kv_seq_len` by the emitted count; the existing
+     `kv.seq_len==row.kv_seq_len` assertion is the consistency gate. Control experiment:
+     drive accept(+2) then reject(+1) and assert materialized==logical each step.
+  Coding the verify loop before these two controls pass is still a guess (§0).
 - Acceptance gate: greedy-lossless parity (spec-on == spec-off greedy, non-negotiable)
   + measured α on the SLO shape + wall-clock tok/s Δ. ~1.9× is the α≈1 ceiling, not the claim.
 
