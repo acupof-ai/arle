@@ -85,25 +85,14 @@ where
             None => (raw_text, false),
         };
 
-        let finish_reason = if stop_truncated {
-            FinishReason::Stop
-        } else {
-            completed
-                .finish
-                .as_ref()
-                .map_or(FinishReason::Length, FinishReason::from_plan)
-        };
+        let finish_reason = finish_reason_from(stop_truncated, &completed);
 
         let prompt_tokens = completed.prompt_tokens.len();
         let completion_tokens = response_token_ids.len();
         Ok(CompletionOutput {
             text,
             finish_reason,
-            usage: TokenUsage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
-            },
+            usage: TokenUsage::new(prompt_tokens, completion_tokens),
             token_logprobs: Vec::new(), // not yet surfaced
             prompt_token_ids,
             response_token_ids,
@@ -253,24 +242,13 @@ where
                 error: None,
             });
         }
-        let finish_reason = if stop_truncated {
-            FinishReason::Stop
-        } else {
-            completed
-                .finish
-                .as_ref()
-                .map_or(FinishReason::Length, FinishReason::from_plan)
-        };
+        let finish_reason = finish_reason_from(stop_truncated, &completed);
         let prompt_tokens = completed.prompt_tokens.len();
         let completion_tokens = completed.generated_tokens.len();
         let _ = tx.send(CompletionStreamDelta {
             text_delta: String::new(),
             finish_reason: Some(finish_reason),
-            usage: Some(TokenUsage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
-            }),
+            usage: Some(TokenUsage::new(prompt_tokens, completion_tokens)),
             logprob: None,
             token_ids: Vec::new(),
             error: None,
@@ -317,6 +295,20 @@ fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
         }
     }
     earliest.map(|pos| text[..pos].to_string())
+}
+
+/// Map the host-side stop-truncation outcome + engine finish to the public
+/// [`FinishReason`]: an applied stop string wins (`Stop`), else the engine's
+/// finish (`Length` when none). Shared by `run` and `complete_stream`.
+fn finish_reason_from(stop_truncated: bool, completed: &CompletedRequest) -> FinishReason {
+    if stop_truncated {
+        FinishReason::Stop
+    } else {
+        completed
+            .finish
+            .as_ref()
+            .map_or(FinishReason::Length, FinishReason::from_plan)
+    }
 }
 
 /// Bytes to hold back from the live stream so a stop string spanning token

@@ -159,6 +159,18 @@ pub struct TokenUsage {
     pub total_tokens: usize,
 }
 
+impl TokenUsage {
+    /// Build usage with `total_tokens` set to `prompt_tokens + completion_tokens`.
+    #[must_use]
+    pub fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        }
+    }
+}
+
 /// One streamed delta (legacy `CompletionStreamDelta`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompletionStreamDelta {
