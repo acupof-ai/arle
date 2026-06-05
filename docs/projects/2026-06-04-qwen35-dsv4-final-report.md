@@ -177,3 +177,90 @@ deleted** (`956c774f` + `e81b98fb`).
    (build), primitive-count reduction (Metal encode) — each GPU-experiment-gated.
 4. **FP8-KV decode** (`alloc_fp8_arena` bail-gated); **V100/sm_70** TileLang
    LayoutInference (deferred legacy tier); **Qwen FP8/4-bit** quant paths.
+
+
+---
+
+# DSv4-Flash decode — full performance story (2026-06-05)
+
+**Verdict.** DSv4-Flash FP8 TP=8/EP=8 decode on 8×H20 went **4.365 → 25.5 tok/s (~6×, 236.8 → ~39.5 ms/token)** by eliminating *every* structural overhead — host-route sync, per-step alloc, D2D copies, zeroing, and launch overhead — each as its own license-or-kill commit. The decode path is now **GPU-kernel-bound**, not scheduling-bound. Same-pod ground-truth A/B against SGLang (V3.2 proxy, same MLA+FP8-MoE family) sets the honest H20 ceiling at **15.89 ms/token no-spec (2.5× over ARLE) and 8.24 ms +EAGLE (1.93× further)** — 5–6 ms is confirmed an H100/H800 number even for SGLang. The remaining gap is two clean levers: a kernel axis (2.5×) and an algorithmic axis (EAGLE, 1.93×). The kernel axis is de-risked: the fused FlashMLA sparse-decode kernel that closes the largest slice **is already vendored in-tree** — the work is runtime wire-up, not a port.
+
+### The 6× structural arc — per-stage 卡点 progression
+
+The host-route baseline nsys profile (236.8 ms/token, 16/16 correct) showed decode was **~76% host overhead**, not compute: `moe_route` 41.4% (`cuStreamSynchronize` — per-layer route D2H→CPU→H2D round-trip) + `deepgemm_grouped` 38.8% (`cuMemAllocAsync` — per-step grouped-GEMM scratch). The kernel floor was ~15–20%. Each lever below attacked one measured bucket and re-profiled:
+
+| Stage | Lever | Commit | Decode tok/s | ms/token |
+|---|---|---|---|---|
+| Static expert weights rebuilt every layer/step (~529 ms/token host rebuild) | Grouped-cache prebuilt once at load + wq_b TP-shard fix | `d5115de5` | (baseline) | — |
+| Host-route MoE routing (41.4%) + per-step alloc (38.8%) | On-device router (route-math 0-diff licensed) + persistent `Dsv4MoeDecodeScratch` (fixed device addresses) | `fa1b78f2` → `4d62062a` | 4.365 → **21.615 (~5×)** | 236.8 → ~46 |
+| D2D/zeroing/alloc residual (~19.3 ms/token, 38% wall) | Kill the keepalive `CudaSlice::clone` (a hidden D2D copy), `zeros`→`uninit`, view-not-copy in `shared_hc` | `7bdb3819` | 21.615 → **25.129 (+16%)** | 50.7 → 41.2 |
+| Launch API (`cudaLaunchKernel`+`cuLaunchKernelEx`, 13.36 ms/token, 32% of API table) | Breakable 43-layer decode CUDA graph (attn seg → eager all-reduce → MoE seg → eager all-reduce → tail) | `7104813e` (gated) | 25.129 → **25.517 (~flat)** | 41.2 → ~39.5 |
+
+The router lever was the structural unlock and carried the session's sharpest lesson: the GPU route kernel passed component parity (indices+weights 0-diff vs host oracle) yet its async sync-free path produced *accumulating* decode drift (correct token1, garbage by token 9). Bisection (`SYNC_AFTER_ROUTE` fail-at-9 / `SYNC_AFTER_MOE` pass; keepalive-all, same-stream-event all FAIL) localized it to a `cudaMallocAsync` **reuse-boundary race** — the allocator re-handed a freed address to the next step while an async consumer still read it. The persistent scratch pool was the **double-win**: fixed addresses killed both the alloc cost *and* the race, making the sync-free path correct with zero fences (`moe_route` 41.4→3.7%, `deepgemm_grouped` 38.8→4.3%, `cuMemAllocAsync` 87.4→2.81 ms/token).
+
+### Two framing traps, killed — why the arc stopped at the kernel floor, not earlier
+
+The §0 framing discipline caught two would-be 卡点 that the narrow-window metrics flagged but wall-clock disproved:
+
+- **Launch overhead was not critical-path.** The breakable graph removed **87% of launch API (13.36 → 1.68 ms/token)** but wall barely moved (+1.5%). The `cudaLaunchKernel` time was CPU-side launch *overlapped with GPU execution*; `cuStreamSynchronize` was always waiting on GPU backlog, not the launch queue. The graph lands **gated-off** — correct production architecture and a free-CPU win at concurrency, but not a single-stream B=1 wall win today.
+- **`lm_head_sample` was a phantom.** Its 9.4 ms/token NVTX range *included* the step-end `sample → ctx.sync()`, so it timed the whole step's GPU backlog. A `sync_before_lm_head` probe dropped it 9.42 → 0.565 ms with tok/s unchanged; the LM-head GEMV is ~0.4 ms. An NVTX range that ends in a sync absorbs the upstream backlog and reads as a fake bottleneck.
+
+The same discipline confirmed the prefill side: DSv4 prefill 512 dropped **14.66s → 1.204s (~12×)** once host-route was gone, and the 2048-prefill's apparent ~4.96s first-allreduce wait was **proven a warmup / rank-start-skew artifact** (per-rank layer0 MLA balanced 89.7–97.0 ms; layers 1–42 allreduce median 0.015 ms), removable with an init barrier — not an attention/allreduce-overlap project.
+
+### The honest SGLang H20 ceiling — gap decomposes into 2.5× kernel + 1.93× EAGLE
+
+Ground-truth A/B, not source survey: SGLang on the *same* 8×H20 pod (DeepSeek-V3.2 — the V4-Flash FP8 checkpoint isn't SGLang-loadable; same MLA + FP8-MoE family), TP=8, FP8 KV, FlashMLA backend (`flashmla_kv`):
+
+| SGLang config (V3.2, H20) | tok/s | ms/token | vs ARLE 39.5 |
+|---|---|---|---|
+| basic TP=8 (no-spec kernel ceiling) | 62.95 | **15.89** | **2.5×** |
+| + EAGLE (2 steps, topk1, 3 draft; 2.78 tok/verify) | 121.31 | **8.24** | **4.8×** |
+| + DP-attention | — | — | untestable (dp=8 OOMs each card on this pod) |
+
+So **5–6 ms requires the H100/H800 SKU *plus* the full opt stack**; on H20 even SGLang is 15.89 ms no-spec. ARLE's gap is two independent, non-compounding-into-one levers — kernels (~2.5×, the "算子优化" axis) and EAGLE speculative decode (~1.93×, an algorithmic lever ARLE lacks; Medusa/MTP scaffold exists). EAGLE must come **after** kernels: ×1.93 on a 16 ms kernel base ≈ 8 ms; on a 39.5 ms base ≈ 20 ms. SGLang's no-spec per-op breakdown (8-rank kernel-only) names the two ARLE kernel targets precisely:
+
+| Stage | SGLang ms/token | ARLE today | Lever |
+|---|---|---|---|
+| FP8 dense GEMM (`sm90_fp8_gemm_1d2d` WGMMA) | 4.94 | scalar `dsv4_fp8_gemv` (the #1 floor) | DeepGEMM dense, **fused call form** |
+| MoE route + MoE GEMM | 4.78 | already DeepGEMM (close) | — |
+| MLA attention (`flash_fwd_splitkv_mla_fp8_sparse`) | 2.02 | hybrid ~11.8 ms (~6× gap) | FlashMLA `splitkv_mla` |
+
+### Kernel reality — a per-call kill, then an in-tree breakthrough
+
+ncu on the #1 floor was the surprise: ARLE's attention-side FP8 block-scaled linear (`dsv4_fp8_gemv_batch`, the MLA wq/wkv/wo + compressor + HC projections) is a **hand-written scalar CUDA-core kernel** — tensor pipe **0.45% prefill / 0% decode**, DRAM ~10% of HBM BW, ALU/FMA-bound. So a large chunk of the "H20 floor" left tensor cores idle and ~90% of bandwidth unused: ~10× headroom, not a hardware wall.
+
+The obvious swap — DeepGEMM dense per projection (`d41bb189`, gated) — was **numerically correct but shipped ~0% wall (512 prefill 4.5% *slower*)** and was killed (`b6503064`). Root cause: **the call form, not the kernel.** One prefill issues ~344 DeepGEMM calls (5 projections × 43 layers + compressor/HC), each paying its own launch overhead *and* its own BF16→FP8 activation re-quant. SGLang's 4.94 ms is the *fused* form — qkv-fused, activation quantized once and reused, batched across the projection set. **A correct tensor-core kernel called 344×/forward erases its own win**; the upstream advantage is the batched call structure, which is an MLA-linear-forward restructure, deferred behind the higher-ROI attention lever.
+
+That higher-ROI lever is the breakthrough: a code-level read of SGLang's `dsv4` attention backend (`8c087967` build-opt session adjacent) found the fused sparse-decode kernel is **already vendored in ARLE's tree** (`e71758be`). ARLE's decode attention is 3 *separate scalar* bf16 kernels per layer (SW + compressed-sparse + hyper-compressed — the anti-pattern); SGLang launches **exactly one** fused `flash_mla_with_kvcache` → FlashMLA `run_flash_splitkv_mla_fp8_sparse_kernel` (`vendor/flashmla/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh`). It fixes the SM-1–3% occupancy via two structural mechanisms, not precision:
+
+1. **MQA-absorb** (`h_kv==1`): the 64–128 q-heads become the `BLOCK_M=64` rows of the QK WGMMA — one decode token fills a full tensor-core tile, latent KV read from HBM once.
+2. **Split-KV persistent grid** sized to the device: B=1 on H20 (132 SMs) → grid `(2,1,66) = 132 CTAs = one per SM` — a single decode token fills the whole GPU.
+
+Every CUDA piece is in-tree (the kernel, the `arle_flashmla_sm90_sparse_decode_fwd` shim+FFI, the 584-byte FP8-KV pack, the CSA/HCA index builders); **only the `attention.rs` decode dispatch is unwired** (still calls the scalar kernels, FlashMLA path bail-gated behind `Dsv4MlaKvArena::alloc_fp8_arena`). This corrects the earlier upstream scan's "SW/CSA/HCA is ARLE-original, FlashMLA gives only the dense base" — wrong for *decode*: the *sparse* kernel natively fuses SW (`indices`) + compressed (`extra_*`), and ARLE's SW/CSA/HCA map one-to-one onto its args. The "ours" framing is what produced the 3-scalar-kernel anti-pattern in the first place.
+
+### Endgame trajectory (adopt-best-first, `ad74b981`)
+
+Principle: `先用最好的再自己写`. Every lever leads with what to *adopt* (vendored / proven), writing custom only for the genuine gap. The recurring finding — the best-practice piece is often already vendored or config-scaffolded, just unwired (`arle_flashmla_*`, the `attn_dp_size` topo axis):
+
+| # | Lever | Adopt | Write (the gap) | Δ target | State |
+|---|---|---|---|---|---|
+| 1 | MLA attention | vendored FlashMLA fused sparse-decode kernel + shim + FP8-KV pack | un-gate `alloc_fp8_arena`, dispatch, delete 3 scalar kernels | SM 1–3% → full occupancy; ~10 → ~2 ms attn | **in progress** |
+| 2 | FP8 attention linear | SGLang's *fused* `fp8_gemm_nt` call form (qkv-fused, quant-once) | the fused call structure (per-projection swap already a kill) | the FP8-linear slice (~4.94 ms equiv) | after #1 |
+| 3 | EAGLE / spec decode | vendored MTP draft head (`mtp.0.*`, in the checkpoint, no training) + SGLang verify-loop | draft+tree-verify in `Engine<E,K>`, reuse Medusa substrate | ×1.93 (compounds on fast kernel base) | banked |
+| 4 | DP-attention | SGLang `--enable-dp-attention` (no attn all-reduce) | wire ARLE's existing-but-unwired `attn_dp_size` axis | `attn_allreduce` slice + scaling | config exists, unwired |
+| 5 | DeepEP low-latency | SGLang `--deepep-mode low_latency` (RDMA GPU dispatch/combine) | replace the #24 combine `ctx.sync` | MoE all-to-all decode cost | not present |
+
+**Hypothesis trajectory:** 39.5 ms → [#1 occupancy] → [#2 FP8 fused] → ~16 ms (kernel parity with SGLang no-spec) → [#3 EAGLE ×1.93] → **~8 ms**. #4/#5 trim the all-reduce + MoE-a2a slices on top. 5–6 ms remains H100-class. The structural-overhead arc is **closed and measured**; every lever below it is kernel + serving-architecture, each license-or-kill on a wall-clock A/B at the B=1 SLO shape, with a `strings | grep <symbol>` pod-build check before trusting parity. Kernels first ("kernel 是所有的一切的基础"), spec second.
+
+---
+
+Source docs (all absolute):
+- `/path/to/code/agent-infer/docs/plans/2026-06-04-dsv4-decode-sglang-class-perf.md` (§§5–10)
+- `/path/to/code/agent-infer/docs/plans/2026-06-05-dsv4-endgame-architecture-adopt-best-first.md`
+- `/path/to/code/agent-infer/docs/research/2026-06-05-flashmla-sparse-decode-already-vendored-wireup-spec.md`
+- `/path/to/code/agent-infer/docs/research/2026-06-05-dsv4-fp8-kernel-upstream-scan.md`
+- `/path/to/code/agent-infer/docs/research/2026-06-05-build-compile-speed-optimization.md`
+- `/path/to/code/agent-infer/docs/experience/wins/2026-06-05-dsv4-decode-scratch-pool-5x.md`, `-dsv4-decode-buffer-d2d-reduction.md`, `-dsv4-decode-breakable-graph-launch-overlapped.md`, `-dsv4-gpu-router-math-licensed-async-blocked.md`
+- `/path/to/code/agent-infer/docs/experience/errors/2026-06-05-fp8-linear-per-projection-deepgemm-no-win.md`
+
+Drop target: `/path/to/code/agent-infer/docs/projects/2026-06-04-qwen35-dsv4-final-report.md` (after §3 Performance / before §4 Architecture). Note: this was READ-ONLY — the section above is returned as output, not written to disk.
