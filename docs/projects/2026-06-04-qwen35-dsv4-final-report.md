@@ -264,3 +264,50 @@ Source docs (all absolute):
 - `/Users/bytedance/code/agent-infer/docs/experience/errors/2026-06-05-fp8-linear-per-projection-deepgemm-no-win.md`
 
 Drop target: `/Users/bytedance/code/agent-infer/docs/projects/2026-06-04-qwen35-dsv4-final-report.md` (after §3 Performance / before §4 Architecture). Note: this was READ-ONLY — the section above is returned as output, not written to disk.
+
+
+---
+
+## DSv4 decode + prefill — 2026-06-05 session update
+
+**Verdict.** DSv4-Flash FP8 TP=8/EP=8 decode on 8×H20 advanced **23.7 → 33.0 tok/s (+39%)** via three *landed-but-gated* kernel/layout levers, each a matched same-load A/B with `oracle16=PASS`. This continues the §3 "full performance story" arc, which closed the *structural* overhead (host-route / alloc / D2D / launch, → 25.5 tok/s) and localized the floor to two kernels — those kernels are now the work. The honest H20 ceiling is unchanged: **15.89 ms/token SGLang no-spec (~1.9× over ARLE's 33.0)**, **8.24 ms +EAGLE**. Everything below is gated-off; the default flip is blocked on the kv-precision-parity gate, not yet re-ported to `infer-cuda` DSv4. Prefill is **broken at production shapes** (MoE padded-layout i32 work-size overflow), in repair.
+
+### The decode arc — three gated levers, matched same-load A/B
+
+Iteration was unblocked by the resident A/B harness (`crates/infer-cuda/examples/dsv4_resident_ab.rs` + `scripts/dsv4_resident_ab.sh`): load the 149 GB TP=8/EP=8 executor once (~110 s), then flip each lever in-process via a process-local `AtomicI8` override, timing warmup-excluded steady-state decode per variant. This converted every prior cross-run smoke into a matched same-load A/B and made ncu/variance loops seconds-scale.
+
+| Stage | Lever | Gate | Decode tok/s | Δ vs prev | Slice evidence |
+|---|---|---|---|---|---|
+| scalar bf16 (3 separate SW/CSA/HCA kernels) | reference | — | 23.71 ± 0.05 | — | SM 1–3% grid (anti-pattern) |
+| **#1 FlashMLA fused sparse-decode** | wire the vendored `arle_flashmla_sm90_sparse_decode_fwd` (MQA-absorb + split-KV persistent grid) | `ARLE_DSV4_FLASHMLA_DECODE` | **27.99 ± 0.06** | **+18.03%** | 78 CTA/rank grid (vs scalar tiny-grid) |
+| **#2 FP8 fused `wqkv_a` linear** | concat `wq_a+wkv` → one DeepGEMM `fp8_gemm_nt`, quantize-once, sliced-output RMSNorm | `ARLE_DSV4_FUSED_WQKV_DECODE` | **29.44 ± 0.04** | **+5.07%** | the SGLang *fused call structure*, not the kernel |
+| **#3 contiguous active-row MoE** | DeepGEMM `MGroupedContiguous` + `ep_scatter → m_indices`, pack only `num_tokens×topk` active rows | `ARLE_DSV4_MOE_CONTIG_DECODE` | **32.98 ± 1.05** | **+12.78%** | `moe_deepgemm_grouped` 11.54 → 5.79 ms (**−49.8%**) |
+
+All three are `先用最好的再自己写`: each adopts an upstream SGLang structure already vendored or expressible in-tree, writing only the runtime wire-up.
+
+### §0 lever-order corrections from profiling
+
+The lever *order and target* were corrected by §0 stage-profiling before any kernel touch — twice the "obvious" kernel was not the cost:
+
+- **FP8 linear: the call form, not the kernel.** A per-projection DeepGEMM swap was numerically correct but shipped 0.8% / 4.5% *slower* (killed, `errors/2026-06-05-fp8-linear-per-projection-deepgemm-no-win`) — 344 DeepGEMM calls/forward ate the WGMMA win on per-call launch + per-projection re-quant. Reading SGLang's *actual* backend showed the real fusion is only `wq_a+wkv→wqkv_a` (the two down-projections), not the whole MLA stack. Adopting that *call structure* (quantize-once + one GEMM + sliced RMSNorm) won +5.07%.
+- **MoE: the padded layout, not the grouped GEMM.** The fresh profile flagged MoE (~14.6 ms/token) as the biggest non-attention slice; a detail probe split it into `dg_unpad 4.5 + dg_pack_quant 3.7 + dg_swiglu_quant 2.0 ≈ 10.2 ms` of pack/unpad of a `32 groups × 128 padded rows` masked layout, while the actual w13+w2 WGMMA GEMMs cost only **2.99 ms**. At B=1/topk=6 most of 32 experts have count=0, so the padded layout did ~10 ms of wasted materialization. Adopting SGLang's contiguous active-row layout halved the slice with **no kernel change**.
+
+Both confirm the op-inventory meta-pattern: when a "GEMM is slow" profile fires, break the slice into kernel vs layout/call-form *before* touching the kernel.
+
+### The SGLang ground-truth ceiling (unchanged, same-pod A/B)
+
+The honest H20 target stands from the §3 same-pod A/B (SGLang DeepSeek-V3.2 proxy — same MLA + FP8-MoE family, TP=8, FP8 KV, FlashMLA): **15.89 ms/token no-spec (62.95 tok/s)**, **8.24 ms/token +EAGLE (2-step, 2.78 tok/verify)**. 5–6 ms remains an H100/H800 number even for SGLang. At 33.0 tok/s (≈30.3 ms/token) ARLE is now **~1.9× off SGLang no-spec** (down from ~2.5× at the start of the session) — a real, non-diminishing gap, with the targets the SGLang per-op breakdown already named (FP8 dense GEMM, MLA attention).
+
+### What remains — the next levers (banked / in-progress, not landed)
+
+- **HC fuse — banked, root-caused.** ncu+nsys root-caused the HC/Sinkhorn cost (~4.9 ms/token) to **86 launches/token + a single-CTA thread0-serial Sinkhorn** (`dsv4_mhc_params_kernel<<<num_tokens,256>>>`), *not* f32 materialization (the `DSV4_MHC_BLOCK=512` hypothesis was killed). The adopt target is SGLang's fused `mhc_pre_big_fuse_tilelang` (RMSNorm + Sinkhorn-Knopp + residual-mix in one TileLang kernel + PDL). In progress.
+- **§5.1 multi-stream overlap — the next big lever** for the **~11.3 ms MLA-attention slice**, which dominates remaining decode latency. ARLE runs the attention-prepare serially (verified: no alt-stream/fork/record_event). Adopt SGLang's `_forward_prepare_multi_stream`: run the indexer (CSA select), KV compressor, FP8-KV pack/write, and q-projection prep on alt-streams hidden behind the big `wq_b` GEMM, joined with fine-grained capturable events — no kernel change, gated inside the decode-graph capture. (CUDA streams genuinely overlap — the MLX encode-on-caller caveat does not apply; cross-stream buffers need keepalive past the join per the disabled-event-tracking / private-stream-wait rules.)
+- **EAGLE / speculative decode — banked.** The vendored MTP draft head (`mtp.0.*`, already in the checkpoint, no training) + SGLang's verify-loop is the algorithmic ×1.93 lever. It must come **after** kernels: ×1.93 on a ~16 ms kernel base ≈ 8 ms; on today's ~30 ms base it only reaches ~16 ms. Kernels first.
+
+### The kv-precision-parity gate — the default-flip precondition
+
+None of the three landed levers is licensed to flip default-on. Correctness today is `oracle16=PASS` + an 80-token no-bail run, **not** the full KV-precision-parity audit, which is documented legacy-`infer/`-only and **not yet re-ported to `infer-cuda` DSv4**. The FlashMLA A/B's DIFF@122 (FP8-vs-bf16 drift at depth, both oracle16 PASS) is exactly the kind of margin the parity gate exists to bound. Re-porting that audit (the `agent-bench::dsv4_kv_precision_parity` precondition) is the gate every default flip waits on; gated-off landing on the current evidence is correct.
+
+### Prefill blocker — i32 work-size overflow (in repair, honest)
+
+DSv4 **prefill is broken at production shapes**: the MoE padded-layout work-size computation overflows i32 above ~1560 tokens (`32 × 49152 × 7168 = 11.27 B > INT_MAX = 2,147,483,647`), so prefill that worked at the small smoke shapes fails on real prompts. This is the same padded-layout cost the decode contiguous-MoE lever sidestepped, here surfacing as a correctness/overflow bug rather than a perf slice. A Codex peer is live-fixing it in `crates/infer-cuda` + `crates/cuda-kernels` (i64 work-size widening). The decode arc above is independent of this fix; the prefill perf characterization (and any prefill default) is blocked until the overflow repair lands and is verified at a production prompt length, not a smoke shape — per the recurring lesson that an SLO verdict must come from the SLO workload.
