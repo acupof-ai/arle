@@ -1830,93 +1830,96 @@ mod dsv4_gpu {
             w2.groups,
         );
 
-        // Upper-bound padded capacity per group = total routes (every route could
-        // land on one expert). scale_stride_m mirrors legacy TMA-aligned padding.
-        // Floor at 128: DeepGEMM's grouped GEMM small-m tile path diverges below
-        // 128 (m=1 decode flips tight-margin tokens); the >=128 floor matches the
-        // verified production path (H20 TP=8/EP=8 16/16). NOT a block-scale issue
-        // (scale_stride_m=128 alone did not fix it).
-        let max_m = packed_hidden.seq_len.max(128);
-        let scale_stride_m = max_m.div_ceil(4) * 4;
-        let rows = num_groups * max_m;
+        // Prefill can have tens of thousands of routes. The old masked layout
+        // materialized `num_groups * max_m` rows and overflowed the unpad kernel's
+        // work-size at ~1.5K prompt tokens (32 * T * topk * H > i32::MAX), long
+        // before the 8K/32K SLO shapes. Use DeepGEMM's contiguous grouped layout
+        // over the compact route rows instead: `m_indices[row]` names the local
+        // expert for each activation row, so no padded per-expert slab or unpad is
+        // needed.
+        let rows = packed_hidden.seq_len.max(1);
+        let scale_stride_m = rows.div_ceil(4) * 4;
         let hidden_scale_cols = hidden_dim.div_ceil(128);
         let inter_scale_cols = intermediate.div_ceil(128);
 
         let input_fp8 = alloc_u8(ctx, rows * hidden_dim)?;
-        let input_scales = alloc_zeros_f32(ctx, num_groups * scale_stride_m * hidden_scale_cols)?;
+        let input_scales = alloc_zeros_f32(ctx, scale_stride_m * hidden_scale_cols)?;
         let w13_out = HiddenStates::zeros(ctx, 2 * intermediate, rows)?;
         let act_fp8 = alloc_u8(ctx, rows * intermediate)?;
-        let act_scales = alloc_zeros_f32(ctx, num_groups * scale_stride_m * inter_scale_cols)?;
-        let out_padded = HiddenStates::zeros(ctx, hidden_dim, rows)?;
+        let act_scales = alloc_zeros_f32(ctx, scale_stride_m * inter_scale_cols)?;
         let mut out_compact = HiddenStates::zeros(ctx, hidden_dim, packed_hidden.seq_len.max(1))?;
+        let m_indices = ctx
+            .stream
+            .alloc_zeros::<i32>(rows)
+            .map_err(|e| anyhow::anyhow!("DSv4 contiguous m-index alloc failed: {e}"))?;
+        let active_experts = ctx.stream.clone_htod(&[0i32]).map_err(|e| {
+            anyhow::anyhow!("DSv4 DeepGEMM contiguous active-expert H2D failed: {e}")
+        })?;
+        let active_offsets = ctx
+            .stream
+            .clone_htod(&[0i32])
+            .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM contiguous offset H2D failed: {e}"))?;
+        let active_counts = ctx
+            .stream
+            .clone_htod(&[i32::try_from(rows)?])
+            .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM contiguous count H2D failed: {e}"))?;
         keepalive.keep_u8(&input_fp8);
         keepalive.keep_f32(&input_scales);
         keepalive.keep_hidden(&w13_out);
         keepalive.keep_u8(&act_fp8);
         keepalive.keep_f32(&act_scales);
-        keepalive.keep_hidden(&out_padded);
         keepalive.keep_hidden(&out_compact);
-
-        // masked_m = per-group valid row count = the local-expert counts (D2D).
-        let mut masked_m = ctx
-            .stream
-            .alloc_zeros::<i32>(num_groups)
-            .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM masked_m alloc failed: {e}"))?;
-        keepalive.keep_i32(&masked_m);
-        {
-            let src = counts.slice(0..num_groups);
-            let mut dst = masked_m.slice_mut(0..num_groups);
-            ctx.stream
-                .memcpy_dtod(&src, &mut dst)
-                .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM masked_m D2D failed: {e}"))?;
-        }
-
-        // Compact identity active-expert table 0..num_groups (dense local layout).
-        let active_experts = ctx
-            .stream
-            .clone_htod(&(0..num_groups as i32).collect::<Vec<i32>>())
-            .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM active-expert H2D failed: {e}"))?;
+        keepalive.keep_i32(&m_indices);
         keepalive.keep_i32(&active_experts);
+        keepalive.keep_i32(&active_offsets);
+        keepalive.keep_i32(&active_counts);
 
         let p_hidden = cache_ptr(&packed_hidden.data, ctx);
         let p_in_fp8 = cache_ptr(&input_fp8, ctx);
         let p_in_scales = cache_ptr(&input_scales, ctx);
         let p_active = cache_ptr(&active_experts, ctx);
-        let p_offsets = cache_ptr(offsets, ctx);
-        let p_counts = cache_ptr(counts, ctx);
-        let p_masked = cache_ptr(&masked_m, ctx);
+        let p_active_offsets = cache_ptr(&active_offsets, ctx);
+        let p_active_counts = cache_ptr(&active_counts, ctx);
+        let p_m_indices = cache_ptr(&m_indices, ctx);
         let p_w13_out = cache_ptr(&w13_out.data, ctx);
         let p_act_fp8 = cache_ptr(&act_fp8, ctx);
         let p_act_scales = cache_ptr(&act_scales, ctx);
-        let p_out_padded = cache_ptr(&out_padded.data, ctx);
         let p_out_compact = cache_ptr(&out_compact.data, ctx);
         let stream = ctx.stream.cu_stream();
 
         // SAFETY: every buffer/ptr above is valid on ctx.stream for the shapes
         // checked against the loaded caches; the kernels bound rows by masked_m.
         unsafe {
+            moe::dsv4_fill_m_indices_from_counts(
+                cache_ptr(counts, ctx),
+                cache_ptr(offsets, ctx),
+                p_m_indices,
+                num_groups,
+                rows,
+                stream,
+            )?;
             moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                 p_hidden,
                 p_in_fp8,
                 p_in_scales,
                 p_active,
-                p_offsets,
-                p_counts,
-                num_groups,
-                max_m,
+                p_active_offsets,
+                p_active_counts,
+                1,
+                rows,
                 hidden_dim,
                 scale_stride_m,
                 stream,
             )?;
-            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
                 p_in_fp8,
                 p_in_scales,
                 cache_ptr(&w13.weight, ctx),
                 cache_ptr(&w13.scales, ctx),
                 p_w13_out,
-                p_masked,
+                p_m_indices,
                 num_groups,
-                max_m,
+                rows,
                 2 * intermediate,
                 hidden_dim,
                 scale_stride_m,
@@ -1927,37 +1930,26 @@ mod dsv4_gpu {
                 p_act_fp8,
                 p_act_scales,
                 p_active,
-                p_counts,
-                num_groups,
-                max_m,
+                p_active_counts,
+                1,
+                rows,
                 intermediate,
                 scale_stride_m,
                 swiglu_limit,
                 stream,
             )?;
-            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
                 p_act_fp8,
                 p_act_scales,
                 cache_ptr(&w2.weight, ctx),
                 cache_ptr(&w2.scales, ctx),
-                p_out_padded,
-                p_masked,
+                p_out_compact,
+                p_m_indices,
                 num_groups,
-                max_m,
+                rows,
                 hidden_dim,
                 intermediate,
                 scale_stride_m,
-                stream,
-            )?;
-            moe::dsv4_deepgemm_unpad_grouped_bf16(
-                p_out_padded,
-                p_out_compact,
-                p_active,
-                p_offsets,
-                p_counts,
-                num_groups,
-                max_m,
-                hidden_dim,
                 stream,
             )?;
         }

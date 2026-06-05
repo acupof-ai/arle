@@ -860,6 +860,40 @@ extern "C" CUresult dsv4_pack_local_experts_with_slots_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_fill_m_indices_from_counts_kernel(
+    const int32_t *__restrict__ counts,
+    const int32_t *__restrict__ offsets,
+    int32_t *__restrict__ m_indices,
+    int experts_per_rank,
+    int row_capacity) {
+  int local = blockIdx.x;
+  if (local >= experts_per_rank) return;
+  int count = counts[local];
+  int offset = offsets[local];
+  for (int row = threadIdx.x; row < count; row += blockDim.x) {
+    int dst = offset + row;
+    if (dst < row_capacity) {
+      m_indices[dst] = local;
+    }
+  }
+}
+
+extern "C" CUresult dsv4_fill_m_indices_from_counts_cuda(
+    const int32_t *counts,
+    const int32_t *offsets,
+    int32_t *m_indices,
+    int experts_per_rank,
+    int row_capacity,
+    CUstream stream) {
+  if (counts == nullptr || offsets == nullptr || m_indices == nullptr ||
+      experts_per_rank <= 0 || row_capacity <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dsv4_fill_m_indices_from_counts_kernel<<<experts_per_rank, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      counts, offsets, m_indices, experts_per_rank, row_capacity);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_pack_local_experts_with_slots_and_indices_kernel(
     const uint16_t *__restrict__ hidden,
     const int32_t *__restrict__ indices,
