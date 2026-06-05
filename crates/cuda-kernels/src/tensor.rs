@@ -340,6 +340,36 @@ impl DeviceContext {
             ctx.disable_event_tracking();
         }
 
+        // Make the device `cuMemAllocAsync` pool a true caching allocator: raise the
+        // release threshold to MAX so freed blocks are CACHED for reuse instead of
+        // returned to the OS at the next stream/context sync. The cudarc default is a
+        // 0 threshold, which (with a per-step decode sync) re-allocates every per-step
+        // `HiddenStates::uninit`/`alloc_zeros` from the OS — the cuMemAllocAsync churn
+        // #29 only fixed for the MoE scratch. PyTorch's caching allocator + SGLang do
+        // exactly this. `trim_memory_pool()` still reclaims VRAM explicitly when needed
+        // (e.g. weight offload). Best-effort: a failure here is not fatal.
+        // Default on; opt out with `ARLE_CUDA_MEMPOOL_RETAIN=0` to restore the old
+        // release-at-sync behavior (for an A/B of the decode-alloc win, or if a
+        // memory-tight shape needs aggressive release).
+        let retain_pool = !matches!(
+            std::env::var("ARLE_CUDA_MEMPOOL_RETAIN").as_deref(),
+            Ok("0" | "false" | "off" | "OFF")
+        );
+        if retain_pool {
+            unsafe {
+                if let Ok(pool) = cudarc::driver::result::device::get_mem_pool(ctx.cu_device()) {
+                    let mut threshold: u64 = u64::MAX;
+                    if let Err(e) = cudarc::driver::result::mem_pool::set_attribute(
+                        pool,
+                        cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                        (&mut threshold as *mut u64).cast::<core::ffi::c_void>(),
+                    ) {
+                        log::warn!("set cuMemAllocAsync release threshold failed (non-fatal): {e}");
+                    }
+                }
+            }
+        }
+
         let stream = ctx
             .new_stream()
             .map_err(|e| anyhow!("Failed to create CUDA stream: {}", e))?;
