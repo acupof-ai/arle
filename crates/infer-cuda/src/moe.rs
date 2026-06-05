@@ -1003,45 +1003,47 @@ mod dsv4_gpu {
         // ── 1+2. Router gemm → logits[T, E] → route (host oracle or device). ───
         let total_routes = num_tokens * topk;
         let mut decode_scratch = decode_scratch;
-        let (route_indices, route_weights) = {
-            let _nvtx = crate::nvtx::range("dsv4/moe_route");
-            // SAFETY: router gemm writes the full logits buffer.
-            let mut logits = unsafe { HiddenStates::uninit(ctx, cfg.num_experts, num_tokens)? };
-            gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
-            if use_gpu_router() {
-                let routing = dsv4_route_device(
-                    model,
-                    layer,
-                    tokens,
-                    &logits,
-                    decode_scratch.as_deref_mut(),
-                    keepalive,
-                )?;
-                (routing.indices, routing.weights)
-            } else {
-                keepalive.keep_hidden(&logits);
-                ctx.sync()?;
-                let logits_bf16: Vec<bf16> = ctx
-                    .stream
-                    .clone_dtoh(&logits.data)
-                    .map_err(|e| anyhow::anyhow!("DSv4 router logits D2H failed: {e}"))?;
-                let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
-                let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
-                let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
+        let (route_indices, route_weights) =
+            crate::stage_profile::profile(ctx, "dsv4/stage/moe_route", || -> Result<_> {
+                let _nvtx = crate::nvtx::range("dsv4/moe_route");
+                // SAFETY: router gemm writes the full logits buffer.
+                let mut logits = unsafe { HiddenStates::uninit(ctx, cfg.num_experts, num_tokens)? };
+                gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
+                if use_gpu_router() {
+                    let routing = dsv4_route_device(
+                        model,
+                        layer,
+                        tokens,
+                        &logits,
+                        decode_scratch.as_deref_mut(),
+                        keepalive,
+                    )?;
+                    Ok((routing.indices, routing.weights))
+                } else {
+                    keepalive.keep_hidden(&logits);
+                    ctx.sync()?;
+                    let logits_bf16: Vec<bf16> = ctx
+                        .stream
+                        .clone_dtoh(&logits.data)
+                        .map_err(|e| anyhow::anyhow!("DSv4 router logits D2H failed: {e}"))?;
+                    let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+                    let decisions =
+                        dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
+                    let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
 
-                let route_indices = ctx
-                    .stream
-                    .clone_htod(&indices_host)
-                    .map_err(|e| anyhow::anyhow!("DSv4 route-index H2D failed: {e}"))?;
-                let route_weights = ctx
-                    .stream
-                    .clone_htod(&weights_host)
-                    .map_err(|e| anyhow::anyhow!("DSv4 route-weight H2D failed: {e}"))?;
-                keepalive.keep_i32(&route_indices);
-                keepalive.keep_f32(&route_weights);
-                (route_indices, route_weights)
-            }
-        };
+                    let route_indices = ctx
+                        .stream
+                        .clone_htod(&indices_host)
+                        .map_err(|e| anyhow::anyhow!("DSv4 route-index H2D failed: {e}"))?;
+                    let route_weights = ctx
+                        .stream
+                        .clone_htod(&weights_host)
+                        .map_err(|e| anyhow::anyhow!("DSv4 route-weight H2D failed: {e}"))?;
+                    keepalive.keep_i32(&route_indices);
+                    keepalive.keep_f32(&route_weights);
+                    Ok((route_indices, route_weights))
+                }
+            })?;
 
         if let Some(scratch) = decode_scratch.as_deref_mut() {
             let route_indices = cache_ptr(&route_indices, ctx);
@@ -1230,76 +1232,83 @@ mod dsv4_gpu {
             "DSv4 pooled decode MoE expected one token/topk routes, got tokens={num_tokens} routes={total_routes} scratch_topk={}",
             scratch.topk
         );
-        scratch.reset_routed(ctx)?;
-
-        unsafe {
-            moe::dsv4_count_local_experts(
-                route_indices,
-                cache_ptr(&scratch.counts, ctx),
-                num_tokens,
-                topk,
-                local_start,
-                split.experts_per_rank,
-                ctx.stream.cu_stream(),
-            )?;
-            moe::dsv4_exclusive_scan_i32(
-                cache_ptr(&scratch.counts, ctx),
-                cache_ptr(&scratch.offsets, ctx),
-                cache_ptr(&scratch.scan_total, ctx),
-                split.experts_per_rank,
-                ctx.stream.cu_stream(),
-            )?;
-            moe::dsv4_pack_local_experts_with_slots(
-                cache_ptr(&hidden.data, ctx),
-                route_indices,
-                route_weights,
-                cache_ptr(&scratch.offsets, ctx),
-                cache_ptr(&scratch.cursors, ctx),
-                cache_ptr(&scratch.packed_hidden.data, ctx),
-                cache_ptr(&scratch.packed_route_slot, ctx),
-                cache_ptr(&scratch.packed_weight, ctx),
-                num_tokens,
-                hidden_dim,
-                topk,
-                local_start,
-                split.experts_per_rank,
-                ctx.stream.cu_stream(),
-            )?;
-        }
+        crate::stage_profile::profile(ctx, "dsv4/stage/moe_pack", || -> Result<()> {
+            scratch.reset_routed(ctx)?;
+            unsafe {
+                moe::dsv4_count_local_experts(
+                    route_indices,
+                    cache_ptr(&scratch.counts, ctx),
+                    num_tokens,
+                    topk,
+                    local_start,
+                    split.experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+                moe::dsv4_exclusive_scan_i32(
+                    cache_ptr(&scratch.counts, ctx),
+                    cache_ptr(&scratch.offsets, ctx),
+                    cache_ptr(&scratch.scan_total, ctx),
+                    split.experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+                moe::dsv4_pack_local_experts_with_slots(
+                    cache_ptr(&hidden.data, ctx),
+                    route_indices,
+                    route_weights,
+                    cache_ptr(&scratch.offsets, ctx),
+                    cache_ptr(&scratch.cursors, ctx),
+                    cache_ptr(&scratch.packed_hidden.data, ctx),
+                    cache_ptr(&scratch.packed_route_slot, ctx),
+                    cache_ptr(&scratch.packed_weight, ctx),
+                    num_tokens,
+                    hidden_dim,
+                    topk,
+                    local_start,
+                    split.experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+            Ok(())
+        })?;
 
         let expert_out = {
             let _nvtx = crate::nvtx::range("dsv4/deepgemm_grouped");
-            deepgemm_grouped_experts_pooled(
-                ctx,
-                layer,
-                &scratch.packed_hidden,
-                &scratch.counts,
-                &scratch.offsets,
-                swiglu_limit,
-                &mut scratch.grouped,
-            )?
+            crate::stage_profile::profile(ctx, "dsv4/stage/moe_deepgemm_grouped", || {
+                deepgemm_grouped_experts_pooled(
+                    ctx,
+                    layer,
+                    &scratch.packed_hidden,
+                    &scratch.counts,
+                    &scratch.offsets,
+                    swiglu_limit,
+                    &mut scratch.grouped,
+                )
+            })?
         };
 
         let nvtx_combine = crate::nvtx::range("dsv4/combine_scatter");
-        unsafe {
-            moe::dsv4_scatter_all_route_slots(
-                cache_ptr(&expert_out.data, ctx),
-                cache_ptr(&scratch.route_out.data, ctx),
-                cache_ptr(&scratch.packed_route_slot, ctx),
-                cache_ptr(&scratch.packed_weight, ctx),
-                total_routes,
-                hidden_dim,
-                ctx.stream.cu_stream(),
-            )?;
-            moe::dsv4_combine_route_slot_outputs(
-                cache_ptr(&scratch.route_out.data, ctx),
-                cache_ptr(&out.data, ctx),
-                num_tokens,
-                topk,
-                hidden_dim,
-                ctx.stream.cu_stream(),
-            )?;
-        }
+        crate::stage_profile::profile(ctx, "dsv4/stage/moe_combine_scatter", || -> Result<()> {
+            unsafe {
+                moe::dsv4_scatter_all_route_slots(
+                    cache_ptr(&expert_out.data, ctx),
+                    cache_ptr(&scratch.route_out.data, ctx),
+                    cache_ptr(&scratch.packed_route_slot, ctx),
+                    cache_ptr(&scratch.packed_weight, ctx),
+                    total_routes,
+                    hidden_dim,
+                    ctx.stream.cu_stream(),
+                )?;
+                moe::dsv4_combine_route_slot_outputs(
+                    cache_ptr(&scratch.route_out.data, ctx),
+                    cache_ptr(&out.data, ctx),
+                    num_tokens,
+                    topk,
+                    hidden_dim,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+            Ok(())
+        })?;
         drop(nvtx_combine);
         Ok(())
     }
