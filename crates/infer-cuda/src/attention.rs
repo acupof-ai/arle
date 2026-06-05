@@ -1235,10 +1235,19 @@ fn try_flashmla_decode_attention(
         "DSv4 FlashMLA decode requires global heads 64/128, got {global_heads}"
     );
 
-    flashmla_pack_sw_ring(ctx, flash, sw_window_cache, config)?;
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_sw_ring");
+        flashmla_pack_sw_ring(ctx, flash, sw_window_cache, config)?;
+    }
 
-    flashmla_pack_one_sw_token(ctx, flash, k_prepared, start_pos_device, config)?;
-    flashmla_pack_compressed_delta(ctx, flash, compressed, config)?;
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_one");
+        flashmla_pack_one_sw_token(ctx, flash, k_prepared, start_pos_device, config)?;
+    }
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed");
+        flashmla_pack_compressed_delta(ctx, flash, compressed, config)?;
+    }
 
     let mode_int = flashmla_mode_int(mode);
     let selected_ptr_u64 = if mode == DeepSeekV4AttentionMode::CompressedSparse {
@@ -1253,22 +1262,25 @@ fn try_flashmla_decode_attention(
     };
     let (indices_ptr, indices_guard) = flash.indices.device_ptr_mut(&ctx.stream);
     let (start_ptr, start_guard) = start_pos_device.device_ptr(&ctx.stream);
-    flash_kv::dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
-        ctx,
-        indices_ptr,
-        selected_ptr_u64,
-        flash.sw_blocks,
-        config.sliding_window,
-        start_ptr,
-        flash.max_compressed_keys,
-        if mode == DeepSeekV4AttentionMode::SlidingWindow {
-            1
-        } else {
-            compress_ratio
-        },
-        mode_int,
-        64,
-    )?;
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_build_indices");
+        flash_kv::dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
+            ctx,
+            indices_ptr,
+            selected_ptr_u64,
+            flash.sw_blocks,
+            config.sliding_window,
+            start_ptr,
+            flash.max_compressed_keys,
+            if mode == DeepSeekV4AttentionMode::SlidingWindow {
+                1
+            } else {
+                compress_ratio
+            },
+            mode_int,
+            64,
+        )?;
+    }
     drop(indices_guard);
     drop(start_guard);
 
@@ -1281,23 +1293,26 @@ fn try_flashmla_decode_attention(
     let (topk_ptr, topk_guard) = flash.topk_length.device_ptr(&ctx.stream);
     let (sched_ptr, sched_guard) = flash.sched_meta.device_ptr_mut(&ctx.stream);
     let (splits_ptr, splits_guard) = flash.num_splits.device_ptr_mut(&ctx.stream);
-    unsafe {
-        ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
-            1,
-            1,
-            flash.block_size_topk,
-            flash.fixed_overhead_num_blocks,
-            topk,
-            0,
-            topk_ptr as *const i32,
-            std::ptr::null(),
-            sched_ptr as *mut i32,
-            splits_ptr as *mut i32,
-            flash.num_sm_parts,
-            ctx.stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| anyhow!("DSv4 FlashMLA sched_meta failed: {e}"))?;
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_sched_meta");
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
+                1,
+                1,
+                flash.block_size_topk,
+                flash.fixed_overhead_num_blocks,
+                topk,
+                0,
+                topk_ptr as *const i32,
+                std::ptr::null(),
+                sched_ptr as *mut i32,
+                splits_ptr as *mut i32,
+                flash.num_sm_parts,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA sched_meta failed: {e}"))?;
+        }
     }
     drop(topk_guard);
     drop(sched_guard);
@@ -1316,28 +1331,34 @@ fn try_flashmla_decode_attention(
 
     let q_for_flashmla = if tp_world > 1 {
         let (gather_ptr, gather_guard) = flash.tp_gathered_q.device_ptr_mut(&ctx.stream);
-        unsafe {
-            tp.all_gather_bf16_raw(
-                ctx,
-                q_ptr as *const std::ffi::c_void,
-                local_heads * config.head_dim,
-                gather_ptr as *mut std::ffi::c_void,
-            )?;
+        {
+            let _nvtx = crate::nvtx::range("dsv4/flashmla_q_allgather");
+            unsafe {
+                tp.all_gather_bf16_raw(
+                    ctx,
+                    q_ptr as *const std::ffi::c_void,
+                    local_heads * config.head_dim,
+                    gather_ptr as *mut std::ffi::c_void,
+                )?;
+            }
         }
         drop(gather_guard);
         let (packed_ptr, packed_guard) = flash.tp_packed_q.device_ptr_mut(&ctx.stream);
-        unsafe {
-            ffi::dsv4_tp_q_repack_cuda(
-                gather_ptr as *const ffi::Half,
-                packed_ptr as *mut ffi::Half,
-                tp_world as i32,
-                1,
-                local_heads as i32,
-                config.head_dim as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| anyhow!("DSv4 FlashMLA TP Q repack failed: {e}"))?;
+        {
+            let _nvtx = crate::nvtx::range("dsv4/flashmla_q_repack");
+            unsafe {
+                ffi::dsv4_tp_q_repack_cuda(
+                    gather_ptr as *const ffi::Half,
+                    packed_ptr as *mut ffi::Half,
+                    tp_world as i32,
+                    1,
+                    local_heads as i32,
+                    config.head_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA TP Q repack failed: {e}"))?;
+            }
         }
         drop(packed_guard);
         packed_ptr as *const ffi::Half
@@ -1375,89 +1396,98 @@ fn try_flashmla_decode_attention(
     let stride_o = stride_q;
     let stride_indices = flash.topk_unified as i32;
     let stride_lse = global_heads as i32;
-    unsafe {
-        ffi::arle_flashmla_sm90_sparse_decode_fwd(
-            q_for_flashmla,
-            pool_ptr as *const ffi::Half,
-            indices_ptr as *const i32,
-            topk_ptr as *const i32,
-            sink_ptr,
-            flash_out_ptr,
-            lse_out_ptr as *mut f32,
-            lse_accum_ptr as *mut f32,
-            o_accum_ptr as *mut f32,
-            sched_ptr as *const i32,
-            splits_ptr as *const i32,
-            1,
-            1,
-            global_heads as i32,
-            1,
-            config.head_dim as i32,
-            config.head_dim as i32,
-            (flash.sw_blocks + flash.comp_blocks) as i32,
-            64,
-            stride_indices,
-            flash.num_sm_parts,
-            DSV4_FLASHMLA_MODEL1,
-            sm_scale,
-            stride_q,
-            stride_q,
-            config.head_dim as i32,
-            stride_kv_block_bytes,
-            bytes_per_token,
-            stride_indices,
-            stride_indices,
-            stride_lse,
-            1,
-            stride_o,
-            stride_o,
-            config.head_dim as i32,
-            global_heads as i32,
-            global_heads as i32,
-            stride_o,
-            stride_o,
-            config.head_dim as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| anyhow!("DSv4 FlashMLA sparse decode failed: {e}"))?;
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_fwd");
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_fwd(
+                q_for_flashmla,
+                pool_ptr as *const ffi::Half,
+                indices_ptr as *const i32,
+                topk_ptr as *const i32,
+                sink_ptr,
+                flash_out_ptr,
+                lse_out_ptr as *mut f32,
+                lse_accum_ptr as *mut f32,
+                o_accum_ptr as *mut f32,
+                sched_ptr as *const i32,
+                splits_ptr as *const i32,
+                1,
+                1,
+                global_heads as i32,
+                1,
+                config.head_dim as i32,
+                config.head_dim as i32,
+                (flash.sw_blocks + flash.comp_blocks) as i32,
+                64,
+                stride_indices,
+                flash.num_sm_parts,
+                DSV4_FLASHMLA_MODEL1,
+                sm_scale,
+                stride_q,
+                stride_q,
+                config.head_dim as i32,
+                stride_kv_block_bytes,
+                bytes_per_token,
+                stride_indices,
+                stride_indices,
+                stride_lse,
+                1,
+                stride_o,
+                stride_o,
+                config.head_dim as i32,
+                global_heads as i32,
+                global_heads as i32,
+                stride_o,
+                stride_o,
+                config.head_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA sparse decode failed: {e}"))?;
+        }
     }
 
     if tp_world > 1 {
         let (full_out_ptr, full_out_guard) = flash.tp_full_out.device_ptr(&ctx.stream);
-        unsafe {
-            ffi::dsv4_tp_out_slice_cuda(
-                full_out_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                1,
-                (global_heads * config.head_dim) as i32,
-                (local_heads * config.head_dim) as i32,
-                (tp_rank * local_heads * config.head_dim) as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| anyhow!("DSv4 FlashMLA TP out slice failed: {e}"))?;
+        {
+            let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice");
+            unsafe {
+                ffi::dsv4_tp_out_slice_cuda(
+                    full_out_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    1,
+                    (global_heads * config.head_dim) as i32,
+                    (local_heads * config.head_dim) as i32,
+                    (tp_rank * local_heads * config.head_dim) as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA TP out slice failed: {e}"))?;
+            }
         }
         drop(full_out_guard);
     }
 
-    unsafe {
-        ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
-            out_ptr as *mut ffi::Half,
-            1,
-            local_heads as i32,
-            config.head_dim as i32,
-            config.qk_rope_head_dim as i32,
-            start_ptr as *const i32,
-            rope_base,
-            original_seq_len,
-            rope_factor,
-            rope_beta_fast,
-            rope_beta_slow,
-            ctx.stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| anyhow!("DSv4 FlashMLA output inverse-rope failed: {e}"))?;
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_inverse_rope");
+        unsafe {
+            ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
+                out_ptr as *mut ffi::Half,
+                1,
+                local_heads as i32,
+                config.head_dim as i32,
+                config.qk_rope_head_dim as i32,
+                start_ptr as *const i32,
+                rope_base,
+                original_seq_len,
+                rope_factor,
+                rope_beta_fast,
+                rope_beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA output inverse-rope failed: {e}"))?;
+        }
     }
 
     drop(q_guard);

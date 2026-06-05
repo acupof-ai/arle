@@ -59,6 +59,31 @@ default serving path is byte-identical.
   is the one SOLID datapoint (structurally larger than the scalar 1-3% grid); the
   occupancy SOL proof needs an explicit-metric rerun (`pending-remote`).
 
+## Closeout (matched A/B + wrapper breakdown + DIFF@122)
+
+Lever #1 closed out via the harness (no reload). **Default flip still NOT
+licensed** — occupancy unproven.
+
+- **Matched A/B is solid** — both orders (scalar-first *and* flashmla-first),
+  3 reps each, warmup-excluded: **scalar 23.713 ± 0.047** vs
+  **flashmla 27.988 ± 0.061 tok/s = +18.03%**. The +18% is order-robust and
+  low-variance, not a single-run artifact.
+- **Occupancy: precond-fail (again).** The explicit-metric ncu rerun
+  (`sm__throughput`, `sm__warps_active`, `gpu__time_duration`, `dram__throughput`)
+  hit the FlashMLA kernel but failed with `UnknownError`
+  (`dsv4_ab_ncu_flashmla_explicit.log`). The `.ncu-rep` still only proves launch
+  shape (78 CTA/rank). **No SM%/occupancy claim** → the kernel isn't licensed for
+  a default flip yet; needs a working ncu metric path (`pending-remote`).
+- **Wrapper ops measured (NVTX per-token)** — `dsv4_flashmla_wrapper_nvtx_stats`:
+  FlashMLA fwd ~0.64 ms, TP Q all-gather ~0.61 ms, Q repack ~0.23 ms, FP8 KV pack
+  total ~0.56 ms. Real costs (~1.4 ms/token of wrapper around a 0.64 ms kernel),
+  but **trim deferred** — it needs a new kernel ABI (local-head support) or
+  pack-into-kernel fusion; not enough ROI to start before the occupancy proof.
+- **DIFF@122 = precision margin, not a bug.** At position 127 scalar top1 `11111`
+  (margin 0.25 over `8760`); FlashMLA flips to top1 `8760`=28.0 with `11111`=27.875
+  (margin 0.125). FlashMLA (FP8) flips a tiny local margin vs scalar (bf16);
+  oracle16 still PASS. Consistent with FP8-vs-bf16 precision delta, not corruption.
+
 ## Rule
 
 A resident, load-once A/B harness is the right fix when a model reload
