@@ -10,6 +10,7 @@ use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates
 use cuda_kernels::tensor::WeightFormat;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
+use std::sync::atomic::{AtomicI8, Ordering};
 
 use crate::dsv4::{
     Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer, Dsv4MlaKvArena,
@@ -19,6 +20,20 @@ use crate::tp::TpRuntime;
 
 const DSV4_FLASHMLA_MODEL1: i32 = 1;
 const DSV4_FLASHMLA_S_Q: usize = 1;
+const DSV4_FLASHMLA_OVERRIDE_ENV: i8 = -1;
+const DSV4_FLASHMLA_OVERRIDE_OFF: i8 = 0;
+const DSV4_FLASHMLA_OVERRIDE_ON: i8 = 1;
+
+static DSV4_FLASHMLA_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
+
+pub(crate) fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
+    let value = match enabled {
+        Some(true) => DSV4_FLASHMLA_OVERRIDE_ON,
+        Some(false) => DSV4_FLASHMLA_OVERRIDE_OFF,
+        None => DSV4_FLASHMLA_OVERRIDE_ENV,
+    };
+    DSV4_FLASHMLA_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
+}
 
 pub(crate) struct Dsv4CompressorState {
     pending_kv: CudaSlice<half::bf16>,
@@ -284,7 +299,7 @@ impl Dsv4LayerAttentionState {
         } else {
             None
         };
-        let flashmla = if dsv4_flashmla_decode_enabled()? {
+        let flashmla = if dsv4_flashmla_decode_alloc_enabled()? {
             Some(Dsv4FlashMlaDecodeState::new(
                 ctx,
                 config,
@@ -963,16 +978,30 @@ pub(crate) fn dsv4_linear(
 }
 
 pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
-    match std::env::var("ARLE_DSV4_FLASHMLA_DECODE") {
+    match DSV4_FLASHMLA_DECODE_OVERRIDE.load(Ordering::Relaxed) {
+        DSV4_FLASHMLA_OVERRIDE_OFF => return Ok(false),
+        DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
+        _ => {}
+    }
+    env_flag("ARLE_DSV4_FLASHMLA_DECODE")
+}
+
+fn dsv4_flashmla_decode_alloc_enabled() -> Result<bool> {
+    if env_flag("ARLE_DSV4_FLASHMLA_DECODE_ALLOC")? {
+        return Ok(true);
+    }
+    dsv4_flashmla_decode_enabled()
+}
+
+fn env_flag(name: &str) -> Result<bool> {
+    match std::env::var(name) {
         Ok(value) => match value.as_str() {
             "1" | "true" | "TRUE" | "yes" | "on" | "ON" => Ok(true),
             "0" | "false" | "FALSE" | "no" | "off" | "OFF" | "" => Ok(false),
-            other => bail!(
-                "unsupported ARLE_DSV4_FLASHMLA_DECODE `{other}` (expected 0/1, true/false, on/off)"
-            ),
+            other => bail!("unsupported {name} `{other}` (expected 0/1, true/false, on/off)"),
         },
         Err(std::env::VarError::NotPresent) => Ok(false),
-        Err(e) => bail!("ARLE_DSV4_FLASHMLA_DECODE invalid env: {e}"),
+        Err(e) => bail!("{name} invalid env: {e}"),
     }
 }
 
