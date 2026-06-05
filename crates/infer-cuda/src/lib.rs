@@ -38,11 +38,17 @@ pub mod graph;
 #[cfg(feature = "cuda")]
 mod hc;
 #[cfg(feature = "cuda")]
+mod linear_profile;
+#[cfg(feature = "cuda")]
 mod loader;
 #[cfg(feature = "cuda")]
 mod model;
 #[cfg(feature = "cuda")]
+mod nvtx;
+#[cfg(feature = "cuda")]
 mod ops;
+#[cfg(feature = "cuda")]
+mod stage_profile;
 // Qwen3.5 / Qwen3.6 HYBRID model (gated-delta linear attention + periodic full
 // attention, BF16 MoE). cuda-gated: device weight matrices + recurrent state.
 #[cfg(feature = "cuda")]
@@ -58,6 +64,44 @@ pub use qwen35::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 // being discarded; the `INFER_CUDA_DECODE_GRAPH` env var still overrides.
 #[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
+
+/// Process-local override for DSv4 FlashMLA decode dispatch. `None` restores the
+/// `ARLE_DSV4_FLASHMLA_DECODE` env gate. Intended for resident A/B harnesses
+/// that need to compare scalar vs FlashMLA after one model load.
+#[cfg(feature = "cuda")]
+pub fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
+    attention::set_dsv4_flashmla_decode_override(enabled);
+}
+
+#[cfg(feature = "cuda")]
+pub fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
+    attention::set_dsv4_fused_wqkv_decode_override(enabled);
+}
+
+#[cfg(feature = "cuda")]
+pub fn reset_dsv4_linear_profile() {
+    linear_profile::reset();
+}
+
+#[cfg(feature = "cuda")]
+pub fn print_dsv4_linear_profile(tag: &str) {
+    linear_profile::print_rank0(tag);
+}
+
+#[cfg(feature = "cuda")]
+pub fn reset_dsv4_stage_profile() {
+    stage_profile::reset();
+}
+
+#[cfg(feature = "cuda")]
+pub fn set_dsv4_stage_profile_active(active: bool) {
+    stage_profile::set_active(active);
+}
+
+#[cfg(feature = "cuda")]
+pub fn print_dsv4_stage_profile(tag: &str, timed_tokens: usize, timed_wall_ms: f64) {
+    stage_profile::print_rank0(tag, timed_tokens, timed_wall_ms);
+}
 
 // Not cuda-gated: env→TpConfig resolution is CPU-testable; only the NCCL comm
 // variant is feature-gated.

@@ -430,11 +430,596 @@ mod dsv4_gpu {
     use anyhow::{Result, ensure};
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, HiddenStates};
-    use cuda_kernels::tensor::{Dsv4Fp8DeepGemmWeightCache, cache_ptr};
+    use cuda_kernels::tensor::{Dsv4Fp8DeepGemmWeightCache, RawDevicePtr, cache_ptr};
+    use cudarc::driver::{CudaSlice, DevicePtrMut};
     use half::bf16;
 
     use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
+    use crate::moe_config::ExpertSplit;
     use crate::ops::gemm_batch;
+
+    const CONTIG_ROUTE_ALIGN: usize = 128;
+
+    struct DeviceRouting {
+        indices: CudaSlice<i32>,
+        weights: CudaSlice<f32>,
+    }
+
+    pub(crate) struct Dsv4MoeDecodeScratch {
+        topk: usize,
+        num_groups: usize,
+        hidden_dim: usize,
+        intermediate: usize,
+        shared_intermediate: usize,
+        route_indices: CudaSlice<i32>,
+        route_weights: CudaSlice<f32>,
+        token_ids: CudaSlice<u32>,
+        router_logits: HiddenStates,
+        counts: CudaSlice<i32>,
+        offsets: CudaSlice<i32>,
+        scan_total: CudaSlice<i32>,
+        packed_hidden: HiddenStates,
+        packed_route_slot: CudaSlice<i32>,
+        packed_weight: CudaSlice<f32>,
+        cursors: CudaSlice<i32>,
+        route_out: HiddenStates,
+        grouped: Dsv4GroupedDecodeScratch,
+        grouped_contig: Dsv4GroupedContiguousDecodeScratch,
+        shared: Dsv4SharedDecodeScratch,
+    }
+
+    struct Dsv4GroupedDecodeScratch {
+        max_m: usize,
+        scale_stride_m: usize,
+        input_fp8: CudaSlice<u8>,
+        input_scales: CudaSlice<f32>,
+        w13_out: HiddenStates,
+        act_fp8: CudaSlice<u8>,
+        act_scales: CudaSlice<f32>,
+        out_padded: HiddenStates,
+        out_compact: HiddenStates,
+        masked_m: CudaSlice<i32>,
+        active_experts: CudaSlice<i32>,
+    }
+
+    struct Dsv4GroupedContiguousDecodeScratch {
+        rows: usize,
+        scale_stride_m: usize,
+        input_fp8: CudaSlice<u8>,
+        input_scales: CudaSlice<f32>,
+        w13_out: HiddenStates,
+        act_fp8: CudaSlice<u8>,
+        act_scales: CudaSlice<f32>,
+        out: HiddenStates,
+        packed_hidden: HiddenStates,
+        packed_route_slot: CudaSlice<i32>,
+        packed_weight: CudaSlice<f32>,
+        m_indices: CudaSlice<i32>,
+        active_experts: CudaSlice<i32>,
+        active_offsets: CudaSlice<i32>,
+        active_counts: CudaSlice<i32>,
+    }
+
+    struct Dsv4SharedDecodeScratch {
+        max_m: usize,
+        scale_stride_m: usize,
+        input_fp8: CudaSlice<u8>,
+        input_scales: CudaSlice<f32>,
+        w13_out: HiddenStates,
+        act_fp8: CudaSlice<u8>,
+        act_scales: CudaSlice<f32>,
+        out: HiddenStates,
+        active_experts: CudaSlice<i32>,
+        active_offsets: CudaSlice<i32>,
+        counts: CudaSlice<i32>,
+        masked_m: CudaSlice<i32>,
+    }
+
+    impl Dsv4MoeDecodeScratch {
+        pub(crate) fn new(
+            ctx: &DeviceContext,
+            cfg: &infer_moe::MoeConfig,
+            split: &ExpertSplit,
+            layer: &Dsv4MoeLayer,
+        ) -> Result<Self> {
+            let topk = cfg.top_k;
+            let num_groups = layer.num_groups;
+            let hidden_dim = layer.hidden_dim;
+            let intermediate = layer.intermediate;
+            let shared_intermediate = layer.shared_w2.cols;
+            ensure!(
+                topk > 0 && num_groups == split.experts_per_rank,
+                "DSv4 decode scratch shape mismatch: topk={topk} groups={num_groups} experts_per_rank={}",
+                split.experts_per_rank
+            );
+            ensure!(
+                hidden_dim.is_multiple_of(128)
+                    && intermediate.is_multiple_of(128)
+                    && shared_intermediate.is_multiple_of(128),
+                "DSv4 decode scratch needs 128-aligned dims: H={hidden_dim} I={intermediate} shared_I={shared_intermediate}"
+            );
+
+            let route_indices = ctx.stream.alloc_zeros::<i32>(topk).map_err(|e| {
+                anyhow::anyhow!("DSv4 decode route-index scratch alloc failed: {e}")
+            })?;
+            let route_weights = ctx.stream.alloc_zeros::<f32>(topk).map_err(|e| {
+                anyhow::anyhow!("DSv4 decode route-weight scratch alloc failed: {e}")
+            })?;
+            let token_ids = ctx
+                .stream
+                .alloc_zeros::<u32>(1)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode token-id scratch alloc failed: {e}"))?;
+            let router_logits = unsafe { HiddenStates::uninit(ctx, cfg.num_experts, 1)? };
+            let counts = ctx
+                .stream
+                .alloc_zeros::<i32>(num_groups)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode count scratch alloc failed: {e}"))?;
+            let offsets = ctx
+                .stream
+                .alloc_zeros::<i32>(num_groups)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode offset scratch alloc failed: {e}"))?;
+            let scan_total = ctx
+                .stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode scan-total scratch alloc failed: {e}"))?;
+            let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, topk)?;
+            let packed_route_slot = ctx
+                .stream
+                .alloc_zeros::<i32>(topk)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode route-slot scratch alloc failed: {e}"))?;
+            let packed_weight = ctx.stream.alloc_zeros::<f32>(topk).map_err(|e| {
+                anyhow::anyhow!("DSv4 decode packed-weight scratch alloc failed: {e}")
+            })?;
+            let cursors = ctx
+                .stream
+                .alloc_zeros::<i32>(num_groups)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode cursor scratch alloc failed: {e}"))?;
+            let route_out = HiddenStates::zeros(ctx, hidden_dim, topk)?;
+            let grouped =
+                Dsv4GroupedDecodeScratch::new(ctx, num_groups, hidden_dim, intermediate, topk)?;
+            let grouped_contig =
+                Dsv4GroupedContiguousDecodeScratch::new(ctx, hidden_dim, intermediate, topk)?;
+            let shared = Dsv4SharedDecodeScratch::new(ctx, hidden_dim, shared_intermediate)?;
+
+            Ok(Self {
+                topk,
+                num_groups,
+                hidden_dim,
+                intermediate,
+                shared_intermediate,
+                route_indices,
+                route_weights,
+                token_ids,
+                router_logits,
+                counts,
+                offsets,
+                scan_total,
+                packed_hidden,
+                packed_route_slot,
+                packed_weight,
+                cursors,
+                route_out,
+                grouped,
+                grouped_contig,
+                shared,
+            })
+        }
+
+        fn reset_routed(&mut self, ctx: &DeviceContext) -> Result<()> {
+            ctx.stream
+                .memset_zeros(&mut self.counts)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode count scratch reset failed: {e}"))?;
+            ctx.stream
+                .memset_zeros(&mut self.cursors)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode cursor scratch reset failed: {e}"))?;
+            ctx.stream
+                .memset_zeros(&mut self.packed_weight)
+                .map_err(|e| {
+                    anyhow::anyhow!("DSv4 decode packed-weight scratch reset failed: {e}")
+                })?;
+            ctx.stream
+                .memset_zeros(&mut self.route_out.data)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode route-out scratch reset failed: {e}"))?;
+            memset_i32_minus_one(ctx, &mut self.packed_route_slot)?;
+            memset_i32_minus_one(ctx, &mut self.grouped_contig.packed_route_slot)?;
+            memset_i32_minus_one(ctx, &mut self.grouped_contig.m_indices)?;
+            Ok(())
+        }
+
+        fn validate_routed(
+            &self,
+            hidden_dim: usize,
+            topk: usize,
+            layer: &Dsv4MoeLayer,
+        ) -> Result<()> {
+            ensure!(
+                self.topk == topk
+                    && self.num_groups == layer.num_groups
+                    && self.hidden_dim == hidden_dim
+                    && self.intermediate == layer.intermediate,
+                "DSv4 decode scratch mismatch: scratch topk={} groups={} H={} I={} vs topk={topk} groups={} H={hidden_dim} I={}",
+                self.topk,
+                self.num_groups,
+                self.hidden_dim,
+                self.intermediate,
+                layer.num_groups,
+                layer.intermediate
+            );
+            Ok(())
+        }
+    }
+
+    impl Dsv4GroupedDecodeScratch {
+        fn new(
+            ctx: &DeviceContext,
+            num_groups: usize,
+            hidden_dim: usize,
+            intermediate: usize,
+            route_capacity: usize,
+        ) -> Result<Self> {
+            let max_m = route_capacity.max(128);
+            let scale_stride_m = max_m.div_ceil(4) * 4;
+            let rows = num_groups * max_m;
+            let hidden_scale_cols = hidden_dim.div_ceil(128);
+            let inter_scale_cols = intermediate.div_ceil(128);
+            let input_fp8 = alloc_u8(ctx, rows * hidden_dim)?;
+            let input_scales =
+                alloc_zeros_f32(ctx, num_groups * scale_stride_m * hidden_scale_cols)?;
+            let w13_out = HiddenStates::zeros(ctx, 2 * intermediate, rows)?;
+            let act_fp8 = alloc_u8(ctx, rows * intermediate)?;
+            let act_scales = alloc_zeros_f32(ctx, num_groups * scale_stride_m * inter_scale_cols)?;
+            let out_padded = HiddenStates::zeros(ctx, hidden_dim, rows)?;
+            let out_compact = HiddenStates::zeros(ctx, hidden_dim, route_capacity.max(1))?;
+            let masked_m = ctx
+                .stream
+                .alloc_zeros::<i32>(num_groups)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode masked-m scratch alloc failed: {e}"))?;
+            let active_experts = ctx
+                .stream
+                .clone_htod(&(0..num_groups as i32).collect::<Vec<i32>>())
+                .map_err(|e| {
+                    anyhow::anyhow!("DSv4 decode active-expert scratch H2D failed: {e}")
+                })?;
+            Ok(Self {
+                max_m,
+                scale_stride_m,
+                input_fp8,
+                input_scales,
+                w13_out,
+                act_fp8,
+                act_scales,
+                out_padded,
+                out_compact,
+                masked_m,
+                active_experts,
+            })
+        }
+    }
+
+    impl Dsv4GroupedContiguousDecodeScratch {
+        fn new(
+            ctx: &DeviceContext,
+            hidden_dim: usize,
+            intermediate: usize,
+            route_capacity: usize,
+        ) -> Result<Self> {
+            // DeepGEMM's contiguous grouped layout expects each expert segment
+            // to be M-tile aligned, with invalid padding rows marked -1. Decode
+            // has at most `topk` active routes, so give each route one aligned
+            // tile instead of materialising every local expert group.
+            let rows = route_capacity.max(1) * CONTIG_ROUTE_ALIGN;
+            let scale_stride_m = rows.div_ceil(4) * 4;
+            let hidden_scale_cols = hidden_dim.div_ceil(128);
+            let inter_scale_cols = intermediate.div_ceil(128);
+            let input_fp8 = alloc_u8(ctx, rows * hidden_dim)?;
+            let input_scales = alloc_zeros_f32(ctx, scale_stride_m * hidden_scale_cols)?;
+            let w13_out = HiddenStates::zeros(ctx, 2 * intermediate, rows)?;
+            let act_fp8 = alloc_u8(ctx, rows * intermediate)?;
+            let act_scales = alloc_zeros_f32(ctx, scale_stride_m * inter_scale_cols)?;
+            let out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
+            let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, rows)?;
+            let packed_route_slot = ctx.stream.alloc_zeros::<i32>(rows).map_err(|e| {
+                anyhow::anyhow!("DSv4 contiguous route-slot scratch alloc failed: {e}")
+            })?;
+            let packed_weight = ctx.stream.alloc_zeros::<f32>(rows).map_err(|e| {
+                anyhow::anyhow!("DSv4 contiguous packed-weight scratch alloc failed: {e}")
+            })?;
+            let m_indices = ctx
+                .stream
+                .alloc_zeros::<i32>(rows)
+                .map_err(|e| anyhow::anyhow!("DSv4 decode contiguous m-index alloc failed: {e}"))?;
+            let active_experts = ctx
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| anyhow::anyhow!("DSv4 contiguous active scratch H2D failed: {e}"))?;
+            let active_offsets = ctx
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| anyhow::anyhow!("DSv4 contiguous offset scratch H2D failed: {e}"))?;
+            let active_counts = ctx
+                .stream
+                .clone_htod(&[i32::try_from(rows)?])
+                .map_err(|e| anyhow::anyhow!("DSv4 contiguous count scratch H2D failed: {e}"))?;
+            Ok(Self {
+                rows,
+                scale_stride_m,
+                input_fp8,
+                input_scales,
+                w13_out,
+                act_fp8,
+                act_scales,
+                out,
+                packed_hidden,
+                packed_route_slot,
+                packed_weight,
+                m_indices,
+                active_experts,
+                active_offsets,
+                active_counts,
+            })
+        }
+    }
+
+    impl Dsv4SharedDecodeScratch {
+        fn new(ctx: &DeviceContext, hidden_dim: usize, shared_inter: usize) -> Result<Self> {
+            let max_m = 128usize;
+            let scale_stride_m = max_m.div_ceil(4) * 4;
+            let hidden_scale_cols = hidden_dim.div_ceil(128);
+            let inter_scale_cols = shared_inter.div_ceil(128);
+            let input_fp8 = alloc_u8(ctx, max_m * hidden_dim)?;
+            let input_scales = alloc_zeros_f32(ctx, scale_stride_m * hidden_scale_cols)?;
+            let w13_out = HiddenStates::zeros(ctx, 2 * shared_inter, max_m)?;
+            let act_fp8 = alloc_u8(ctx, max_m * shared_inter)?;
+            let act_scales = alloc_zeros_f32(ctx, scale_stride_m * inter_scale_cols)?;
+            let out = HiddenStates::zeros(ctx, hidden_dim, max_m)?;
+            let active_experts = ctx
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| anyhow::anyhow!("DSv4 shared active scratch H2D failed: {e}"))?;
+            let active_offsets = ctx
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| anyhow::anyhow!("DSv4 shared offset scratch H2D failed: {e}"))?;
+            let counts = ctx
+                .stream
+                .clone_htod(&[1i32])
+                .map_err(|e| anyhow::anyhow!("DSv4 shared count scratch H2D failed: {e}"))?;
+            let masked_m = ctx
+                .stream
+                .clone_htod(&[1i32])
+                .map_err(|e| anyhow::anyhow!("DSv4 shared masked-m scratch H2D failed: {e}"))?;
+            Ok(Self {
+                max_m,
+                scale_stride_m,
+                input_fp8,
+                input_scales,
+                w13_out,
+                act_fp8,
+                act_scales,
+                out,
+                active_experts,
+                active_offsets,
+                counts,
+                masked_m,
+            })
+        }
+    }
+
+    fn memset_i32_minus_one(ctx: &DeviceContext, slice: &mut CudaSlice<i32>) -> Result<()> {
+        let bytes = slice.len() * std::mem::size_of::<i32>();
+        let (ptr, _record) = slice.device_ptr_mut(&ctx.stream);
+        unsafe {
+            cudarc::driver::result::memset_d8_async(ptr, 0xFF, bytes, ctx.stream.cu_stream())
+                .map_err(|e| anyhow::anyhow!("DSv4 decode i32 -1 memset failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn use_gpu_router() -> bool {
+        std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some()
+    }
+
+    fn use_contiguous_decode_moe() -> bool {
+        matches!(
+            std::env::var("ARLE_DSV4_MOE_CONTIG_DECODE").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    }
+
+    fn dsv4_route_device(
+        model: &Dsv4Model,
+        layer: &Dsv4MoeLayer,
+        tokens: &[u32],
+        logits: &HiddenStates,
+        decode_scratch: Option<&mut Dsv4MoeDecodeScratch>,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<DeviceRouting> {
+        use deepseek_spec::DeepSeekV4MoeRoutingKind;
+
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        let num_tokens = logits.seq_len;
+        let total_routes = num_tokens * cfg.top_k;
+        ensure!(
+            tokens.len() == num_tokens,
+            "DSv4 device route token count {} != logits seq_len {num_tokens}",
+            tokens.len()
+        );
+        ensure!(
+            logits.hidden_dim == cfg.num_experts,
+            "DSv4 device route logits hidden_dim {} != num_experts {}",
+            logits.hidden_dim,
+            cfg.num_experts
+        );
+
+        let mut decode_scratch = decode_scratch;
+        let (route_indices, route_weights, token_ids) = if let Some(scratch) =
+            decode_scratch.as_deref_mut()
+        {
+            ensure!(
+                num_tokens == 1 && total_routes == scratch.topk,
+                "DSv4 decode route scratch only supports one token: tokens={num_tokens} routes={total_routes} scratch_topk={}",
+                scratch.topk
+            );
+            let token_ids = if matches!(layer.routing_kind, DeepSeekV4MoeRoutingKind::Hash) {
+                ctx.stream
+                    .memcpy_htod(tokens, &mut scratch.token_ids)
+                    .map_err(|e| anyhow::anyhow!("DSv4 decode route token-id H2D failed: {e}"))?;
+                Some(scratch.token_ids.clone())
+            } else {
+                None
+            };
+            (
+                scratch.route_indices.clone(),
+                scratch.route_weights.clone(),
+                token_ids,
+            )
+        } else {
+            let route_indices = ctx
+                .stream
+                .alloc_zeros::<i32>(total_routes)
+                .map_err(|e| anyhow::anyhow!("DSv4 device route-index alloc failed: {e}"))?;
+            let route_weights = ctx
+                .stream
+                .alloc_zeros::<f32>(total_routes)
+                .map_err(|e| anyhow::anyhow!("DSv4 device route-weight alloc failed: {e}"))?;
+            let token_ids = if matches!(layer.routing_kind, DeepSeekV4MoeRoutingKind::Hash) {
+                let token_ids = ctx
+                    .stream
+                    .clone_htod(tokens)
+                    .map_err(|e| anyhow::anyhow!("DSv4 device route token-id H2D failed: {e}"))?;
+                keepalive.keep_route_u32(&token_ids);
+                Some(token_ids)
+            } else {
+                None
+            };
+            (route_indices, route_weights, token_ids)
+        };
+
+        let routing_kind = match layer.routing_kind {
+            DeepSeekV4MoeRoutingKind::Hash => 0,
+            DeepSeekV4MoeRoutingKind::LearnedBias => 1,
+        };
+        let bias = layer
+            .gate_bias
+            .as_ref()
+            .map(|bias| cache_ptr(&bias.data, ctx));
+        let tid2eid = layer
+            .hash_tid2eid_device
+            .as_ref()
+            .map(|table| cache_ptr(table, ctx));
+        let token_ids_ptr = token_ids.as_ref().map(|ids| cache_ptr(ids, ctx));
+
+        keepalive.keep_route_hidden(logits);
+        keepalive.keep_route_i32(&route_indices);
+        keepalive.keep_route_f32(&route_weights);
+        // SAFETY: buffers are allocated for `[num_tokens * topk]`; optional
+        // pointers are validated by the wrapper according to `routing_kind`.
+        unsafe {
+            moe::dsv4_route(
+                cache_ptr(&logits.data, ctx),
+                bias,
+                tid2eid,
+                token_ids_ptr,
+                cache_ptr(&route_indices, ctx),
+                cache_ptr(&route_weights, ctx),
+                num_tokens,
+                cfg.num_experts,
+                cfg.top_k,
+                routing_kind,
+                cfg.scoring_func.scoring_kind(),
+                cfg.routed_scaling_factor,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+        Ok(DeviceRouting {
+            indices: route_indices,
+            weights: route_weights,
+        })
+    }
+
+    /// Decode-graph MoE path: all mutable buffers are fixed scratch addresses,
+    /// and the token id is read from a caller-staged device buffer so graph
+    /// replay does not bake the capture step's host token value.
+    pub(crate) fn dsv4_moe_forward_decode_graph(
+        model: &Dsv4Model,
+        layer: &Dsv4MoeLayer,
+        token_ids: &CudaSlice<u32>,
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        scratch: &mut Dsv4MoeDecodeScratch,
+    ) -> Result<()> {
+        use deepseek_spec::DeepSeekV4MoeRoutingKind;
+
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        let split = &model.split;
+        let swiglu_limit = model.config.swiglu_limit;
+        let topk = cfg.top_k;
+        let hidden_dim = hidden.hidden_dim;
+        ensure!(
+            hidden.seq_len == 1 && token_ids.len() == 1,
+            "DSv4 decode-graph MoE requires B=1, got hidden seq={} token_ids={}",
+            hidden.seq_len,
+            token_ids.len()
+        );
+        scratch.validate_routed(hidden_dim, topk, layer)?;
+        scratch.reset_routed(ctx)?;
+        moe::dsv4_deepgemm_native_preflight()?;
+
+        gemm_batch(ctx, &layer.gate, hidden, &mut scratch.router_logits)?;
+
+        let routing_kind = match layer.routing_kind {
+            DeepSeekV4MoeRoutingKind::Hash => 0,
+            DeepSeekV4MoeRoutingKind::LearnedBias => 1,
+        };
+        let bias = layer
+            .gate_bias
+            .as_ref()
+            .map(|bias| cache_ptr(&bias.data, ctx));
+        let tid2eid = layer
+            .hash_tid2eid_device
+            .as_ref()
+            .map(|table| cache_ptr(table, ctx));
+        let token_ids_ptr = if matches!(layer.routing_kind, DeepSeekV4MoeRoutingKind::Hash) {
+            Some(cache_ptr(token_ids, ctx))
+        } else {
+            None
+        };
+        unsafe {
+            moe::dsv4_route(
+                cache_ptr(&scratch.router_logits.data, ctx),
+                bias,
+                tid2eid,
+                token_ids_ptr,
+                cache_ptr(&scratch.route_indices, ctx),
+                cache_ptr(&scratch.route_weights, ctx),
+                1,
+                cfg.num_experts,
+                cfg.top_k,
+                routing_kind,
+                cfg.scoring_func.scoring_kind(),
+                cfg.routed_scaling_factor,
+                ctx.stream.cu_stream(),
+            )?;
+        }
+
+        let route_indices = cache_ptr(&scratch.route_indices, ctx);
+        let route_weights = cache_ptr(&scratch.route_weights, ctx);
+        dsv4_moe_forward_decode_pooled(
+            ctx,
+            layer,
+            split,
+            route_indices,
+            route_weights,
+            hidden,
+            out,
+            topk,
+            split.local_expert_start,
+            swiglu_limit,
+            scratch,
+        )
+    }
 
     /// FP8 DeepGEMM MoE forward for one DSv4 routed-MoE layer (this EP rank's
     /// experts only). Mirrors the BF16 [`super::gpu::moe_forward`] route/pack/
@@ -456,6 +1041,7 @@ mod dsv4_gpu {
         tokens: &[u32],
         hidden: &HiddenStates,
         out: &mut HiddenStates,
+        decode_scratch: Option<&mut Dsv4MoeDecodeScratch>,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
         let ctx = &model.ctx;
@@ -500,34 +1086,79 @@ mod dsv4_gpu {
             "DSv4 expert hidden dim {} != runtime hidden dim {hidden_dim}",
             layer.hidden_dim
         );
+        if let Some(scratch) = decode_scratch.as_ref() {
+            scratch.validate_routed(hidden_dim, topk, layer)?;
+            ensure!(
+                num_tokens == 1,
+                "DSv4 decode MoE scratch is only valid for one-token decode, got {num_tokens}"
+            );
+        }
 
         // Fail loud if the native DeepGEMM bridge is a build-time stub.
         moe::dsv4_deepgemm_native_preflight()?;
 
-        // ── 1+2. Router gemm → logits[T, E] → HOST route (bias or hash). ────────
-        let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
-        gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
-        keepalive.keep_hidden(&logits);
-        ctx.sync()?;
-        let logits_bf16: Vec<bf16> = ctx
-            .stream
-            .clone_dtoh(&logits.data)
-            .map_err(|e| anyhow::anyhow!("DSv4 router logits D2H failed: {e}"))?;
-        let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
-        let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
-        let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
+        // ── 1+2. Router gemm → logits[T, E] → route (host oracle or device). ───
         let total_routes = num_tokens * topk;
+        let mut decode_scratch = decode_scratch;
+        let (route_indices, route_weights) =
+            crate::stage_profile::profile(ctx, "dsv4/stage/moe_route", || -> Result<_> {
+                let _nvtx = crate::nvtx::range("dsv4/moe_route");
+                // SAFETY: router gemm writes the full logits buffer.
+                let mut logits = unsafe { HiddenStates::uninit(ctx, cfg.num_experts, num_tokens)? };
+                gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
+                if use_gpu_router() {
+                    let routing = dsv4_route_device(
+                        model,
+                        layer,
+                        tokens,
+                        &logits,
+                        decode_scratch.as_deref_mut(),
+                        keepalive,
+                    )?;
+                    Ok((routing.indices, routing.weights))
+                } else {
+                    keepalive.keep_hidden(&logits);
+                    ctx.sync()?;
+                    let logits_bf16: Vec<bf16> = ctx
+                        .stream
+                        .clone_dtoh(&logits.data)
+                        .map_err(|e| anyhow::anyhow!("DSv4 router logits D2H failed: {e}"))?;
+                    let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+                    let decisions =
+                        dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
+                    let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
 
-        let route_indices = ctx
-            .stream
-            .clone_htod(&indices_host)
-            .map_err(|e| anyhow::anyhow!("DSv4 route-index H2D failed: {e}"))?;
-        let route_weights = ctx
-            .stream
-            .clone_htod(&weights_host)
-            .map_err(|e| anyhow::anyhow!("DSv4 route-weight H2D failed: {e}"))?;
-        keepalive.keep_i32(&route_indices);
-        keepalive.keep_f32(&route_weights);
+                    let route_indices = ctx
+                        .stream
+                        .clone_htod(&indices_host)
+                        .map_err(|e| anyhow::anyhow!("DSv4 route-index H2D failed: {e}"))?;
+                    let route_weights = ctx
+                        .stream
+                        .clone_htod(&weights_host)
+                        .map_err(|e| anyhow::anyhow!("DSv4 route-weight H2D failed: {e}"))?;
+                    keepalive.keep_i32(&route_indices);
+                    keepalive.keep_f32(&route_weights);
+                    Ok((route_indices, route_weights))
+                }
+            })?;
+
+        if let Some(scratch) = decode_scratch.as_deref_mut() {
+            let route_indices = cache_ptr(&route_indices, ctx);
+            let route_weights = cache_ptr(&route_weights, ctx);
+            return dsv4_moe_forward_decode_pooled(
+                ctx,
+                layer,
+                split,
+                route_indices,
+                route_weights,
+                hidden,
+                out,
+                topk,
+                local_start,
+                swiglu_limit,
+                scratch,
+            );
+        }
 
         // ── 3. Per-local-expert counts → group offsets (EP-aware start/range). ──
         let counts = ctx
@@ -630,18 +1261,22 @@ mod dsv4_gpu {
             intermediate
         );
 
-        let expert_out = deepgemm_grouped_experts(
-            ctx,
-            layer,
-            &packed_hidden,
-            &counts,
-            &offsets,
-            swiglu_limit,
-            keepalive,
-        )?;
+        let expert_out = {
+            let _nvtx = crate::nvtx::range("dsv4/deepgemm_grouped");
+            deepgemm_grouped_experts(
+                ctx,
+                layer,
+                &packed_hidden,
+                &counts,
+                &offsets,
+                swiglu_limit,
+                keepalive,
+            )?
+        };
         keepalive.keep_hidden(&expert_out);
 
         // ── 6. Scatter weighted expert outputs to route slots, combine topk. ────
+        let nvtx_combine = crate::nvtx::range("dsv4/combine_scatter");
         let route_out = HiddenStates::zeros(ctx, hidden_dim, total_routes.max(1))?;
         keepalive.keep_hidden(&route_out);
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
@@ -664,10 +1299,156 @@ mod dsv4_gpu {
                 ctx.stream.cu_stream(),
             )?;
         }
+        drop(nvtx_combine);
 
         // The shared expert is replicated on every rank. Callers must all-reduce
         // the routed local expert contribution first, then add the shared expert
         // exactly once per rank.
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dsv4_moe_forward_decode_pooled(
+        ctx: &DeviceContext,
+        layer: &Dsv4MoeLayer,
+        split: &ExpertSplit,
+        route_indices: RawDevicePtr<i32>,
+        route_weights: RawDevicePtr<f32>,
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        topk: usize,
+        local_start: usize,
+        swiglu_limit: f32,
+        scratch: &mut Dsv4MoeDecodeScratch,
+    ) -> Result<()> {
+        let num_tokens = hidden.seq_len;
+        let hidden_dim = hidden.hidden_dim;
+        let total_routes = num_tokens * topk;
+        ensure!(
+            num_tokens == 1 && total_routes == scratch.topk,
+            "DSv4 pooled decode MoE expected one token/topk routes, got tokens={num_tokens} routes={total_routes} scratch_topk={}",
+            scratch.topk
+        );
+        let use_contiguous = use_contiguous_decode_moe();
+        crate::stage_profile::profile(ctx, "dsv4/stage/moe_pack", || -> Result<()> {
+            scratch.reset_routed(ctx)?;
+            unsafe {
+                moe::dsv4_count_local_experts(
+                    route_indices,
+                    cache_ptr(&scratch.counts, ctx),
+                    num_tokens,
+                    topk,
+                    local_start,
+                    split.experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+                moe::dsv4_exclusive_scan_i32(
+                    cache_ptr(&scratch.counts, ctx),
+                    cache_ptr(&scratch.offsets, ctx),
+                    cache_ptr(&scratch.scan_total, ctx),
+                    split.experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+                if use_contiguous {
+                    moe::dsv4_pack_local_experts_with_slots_and_indices(
+                        cache_ptr(&hidden.data, ctx),
+                        route_indices,
+                        route_weights,
+                        cache_ptr(&scratch.offsets, ctx),
+                        cache_ptr(&scratch.cursors, ctx),
+                        cache_ptr(&scratch.grouped_contig.packed_hidden.data, ctx),
+                        cache_ptr(&scratch.grouped_contig.packed_route_slot, ctx),
+                        cache_ptr(&scratch.grouped_contig.packed_weight, ctx),
+                        cache_ptr(&scratch.grouped_contig.m_indices, ctx),
+                        num_tokens,
+                        hidden_dim,
+                        topk,
+                        local_start,
+                        split.experts_per_rank,
+                        ctx.stream.cu_stream(),
+                    )?;
+                } else {
+                    moe::dsv4_pack_local_experts_with_slots(
+                        cache_ptr(&hidden.data, ctx),
+                        route_indices,
+                        route_weights,
+                        cache_ptr(&scratch.offsets, ctx),
+                        cache_ptr(&scratch.cursors, ctx),
+                        cache_ptr(&scratch.packed_hidden.data, ctx),
+                        cache_ptr(&scratch.packed_route_slot, ctx),
+                        cache_ptr(&scratch.packed_weight, ctx),
+                        num_tokens,
+                        hidden_dim,
+                        topk,
+                        local_start,
+                        split.experts_per_rank,
+                        ctx.stream.cu_stream(),
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+
+        let expert_out = {
+            let _nvtx = crate::nvtx::range("dsv4/deepgemm_grouped");
+            crate::stage_profile::profile(ctx, "dsv4/stage/moe_deepgemm_grouped", || {
+                if use_contiguous {
+                    deepgemm_grouped_experts_contiguous_pooled(
+                        ctx,
+                        layer,
+                        swiglu_limit,
+                        &mut scratch.grouped_contig,
+                    )
+                } else {
+                    deepgemm_grouped_experts_pooled(
+                        ctx,
+                        layer,
+                        &scratch.packed_hidden,
+                        &scratch.counts,
+                        &scratch.offsets,
+                        swiglu_limit,
+                        &mut scratch.grouped,
+                    )
+                }
+            })?
+        };
+
+        let nvtx_combine = crate::nvtx::range("dsv4/combine_scatter");
+        crate::stage_profile::profile(ctx, "dsv4/stage/moe_combine_scatter", || -> Result<()> {
+            unsafe {
+                if use_contiguous {
+                    moe::dsv4_scatter_all_route_slots(
+                        cache_ptr(&expert_out.data, ctx),
+                        cache_ptr(&scratch.route_out.data, ctx),
+                        cache_ptr(&scratch.grouped_contig.packed_route_slot, ctx),
+                        cache_ptr(&scratch.grouped_contig.packed_weight, ctx),
+                        expert_out.seq_len,
+                        hidden_dim,
+                        ctx.stream.cu_stream(),
+                    )?;
+                } else {
+                    moe::dsv4_scatter_all_route_slots(
+                        cache_ptr(&expert_out.data, ctx),
+                        cache_ptr(&scratch.route_out.data, ctx),
+                        cache_ptr(&scratch.packed_route_slot, ctx),
+                        cache_ptr(&scratch.packed_weight, ctx),
+                        total_routes,
+                        hidden_dim,
+                        ctx.stream.cu_stream(),
+                    )?;
+                }
+                moe::dsv4_combine_route_slot_outputs(
+                    cache_ptr(&scratch.route_out.data, ctx),
+                    cache_ptr(&out.data, ctx),
+                    num_tokens,
+                    topk,
+                    hidden_dim,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+            Ok(())
+        })?;
+        drop(nvtx_combine);
         Ok(())
     }
 
@@ -723,27 +1504,46 @@ mod dsv4_gpu {
         // expert ids as i64 and remaps received ids to rank-local expert ids.
         let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
         gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
-        keepalive.keep_hidden(&logits);
-        ctx.sync()?;
-        let logits_bf16: Vec<bf16> = ctx
-            .stream
-            .clone_dtoh(&logits.data)
-            .map_err(|e| anyhow::anyhow!("DSv4 DeepEP router logits D2H failed: {e}"))?;
-        let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
-        let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
-        let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
         let total_routes = num_tokens * topk;
-        let indices_i64: Vec<i64> = indices_host.iter().map(|&v| i64::from(v)).collect();
-        let topk_idx_i64 = ctx
-            .stream
-            .clone_htod(&indices_i64)
-            .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 H2D failed: {e}"))?;
-        let route_weights = ctx
-            .stream
-            .clone_htod(&weights_host)
-            .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-weight H2D failed: {e}"))?;
-        keepalive.keep_i64(&topk_idx_i64);
-        keepalive.keep_f32(&route_weights);
+        let (topk_idx_i64, route_weights) = if use_gpu_router() {
+            let routing = dsv4_route_device(model, layer, tokens, &logits, None, keepalive)?;
+            let topk_idx_i64 = ctx
+                .stream
+                .alloc_zeros::<i64>(total_routes)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 alloc failed: {e}"))?;
+            keepalive.keep_route_i64(&topk_idx_i64);
+            unsafe {
+                moe::dsv4_cast_i32_to_i64(
+                    cache_ptr(&routing.indices, ctx),
+                    cache_ptr(&topk_idx_i64, ctx),
+                    total_routes,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+            (topk_idx_i64, routing.weights)
+        } else {
+            keepalive.keep_hidden(&logits);
+            ctx.sync()?;
+            let logits_bf16: Vec<bf16> = ctx
+                .stream
+                .clone_dtoh(&logits.data)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP router logits D2H failed: {e}"))?;
+            let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+            let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
+            let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
+            let indices_i64: Vec<i64> = indices_host.iter().map(|&v| i64::from(v)).collect();
+            let topk_idx_i64 = ctx
+                .stream
+                .clone_htod(&indices_i64)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 H2D failed: {e}"))?;
+            let route_weights = ctx
+                .stream
+                .clone_htod(&weights_host)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-weight H2D failed: {e}"))?;
+            keepalive.keep_i64(&topk_idx_i64);
+            keepalive.keep_f32(&route_weights);
+            (topk_idx_i64, route_weights)
+        };
 
         let num_sms = crate::deepep::DeepEpTransport::num_sms()?;
         let mut scratch =
@@ -912,10 +1712,48 @@ mod dsv4_gpu {
         ctx: &DeviceContext,
         layer: &Dsv4MoeLayer,
         hidden: &HiddenStates,
+        out: &mut HiddenStates,
         swiglu_limit: f32,
+        decode_scratch: Option<&mut Dsv4MoeDecodeScratch>,
         keepalive: &mut Dsv4ForwardKeepalive,
-    ) -> Result<HiddenStates> {
-        dsv4_shared_expert(ctx, layer, hidden, swiglu_limit, keepalive)
+    ) -> Result<()> {
+        if let Some(scratch) = decode_scratch {
+            ensure!(
+                hidden.seq_len == 1
+                    && scratch.hidden_dim == hidden.hidden_dim
+                    && scratch.shared_intermediate == layer.shared_w2.cols,
+                "DSv4 shared decode scratch mismatch: tokens={} scratch_H={} hidden_H={} scratch_I={} layer_I={}",
+                hidden.seq_len,
+                scratch.hidden_dim,
+                hidden.hidden_dim,
+                scratch.shared_intermediate,
+                layer.shared_w2.cols
+            );
+            return dsv4_shared_expert_pooled(
+                ctx,
+                layer,
+                hidden,
+                out,
+                swiglu_limit,
+                &mut scratch.shared,
+            );
+        }
+        let shared = dsv4_shared_expert(ctx, layer, hidden, swiglu_limit, keepalive)?;
+        ensure!(
+            shared.hidden_dim == out.hidden_dim && shared.seq_len >= out.seq_len,
+            "DSv4 shared expert shape {}x{} != output {}x{}",
+            shared.hidden_dim,
+            shared.seq_len,
+            out.hidden_dim,
+            out.seq_len
+        );
+        let elems = out.hidden_dim * out.seq_len;
+        let src = shared.data.slice(0..elems);
+        ctx.stream
+            .memcpy_dtod(&src, &mut out.data)
+            .map_err(|e| anyhow::anyhow!("DSv4 shared expert output D2D failed: {e}"))?;
+        keepalive.keep_hidden(&shared);
+        Ok(())
     }
 
     /// Dispatch DSv4 host routing for one layer: bias-routed → learned router +
@@ -992,93 +1830,96 @@ mod dsv4_gpu {
             w2.groups,
         );
 
-        // Upper-bound padded capacity per group = total routes (every route could
-        // land on one expert). scale_stride_m mirrors legacy TMA-aligned padding.
-        // Floor at 128: DeepGEMM's grouped GEMM small-m tile path diverges below
-        // 128 (m=1 decode flips tight-margin tokens); the >=128 floor matches the
-        // verified production path (H20 TP=8/EP=8 16/16). NOT a block-scale issue
-        // (scale_stride_m=128 alone did not fix it).
-        let max_m = packed_hidden.seq_len.max(128);
-        let scale_stride_m = max_m.div_ceil(4) * 4;
-        let rows = num_groups * max_m;
+        // Prefill can have tens of thousands of routes. The old masked layout
+        // materialized `num_groups * max_m` rows and overflowed the unpad kernel's
+        // work-size at ~1.5K prompt tokens (32 * T * topk * H > i32::MAX), long
+        // before the 8K/32K SLO shapes. Use DeepGEMM's contiguous grouped layout
+        // over the compact route rows instead: `m_indices[row]` names the local
+        // expert for each activation row, so no padded per-expert slab or unpad is
+        // needed.
+        let rows = packed_hidden.seq_len.max(1);
+        let scale_stride_m = rows.div_ceil(4) * 4;
         let hidden_scale_cols = hidden_dim.div_ceil(128);
         let inter_scale_cols = intermediate.div_ceil(128);
 
         let input_fp8 = alloc_u8(ctx, rows * hidden_dim)?;
-        let input_scales = alloc_zeros_f32(ctx, num_groups * scale_stride_m * hidden_scale_cols)?;
+        let input_scales = alloc_zeros_f32(ctx, scale_stride_m * hidden_scale_cols)?;
         let w13_out = HiddenStates::zeros(ctx, 2 * intermediate, rows)?;
         let act_fp8 = alloc_u8(ctx, rows * intermediate)?;
-        let act_scales = alloc_zeros_f32(ctx, num_groups * scale_stride_m * inter_scale_cols)?;
-        let out_padded = HiddenStates::zeros(ctx, hidden_dim, rows)?;
+        let act_scales = alloc_zeros_f32(ctx, scale_stride_m * inter_scale_cols)?;
         let mut out_compact = HiddenStates::zeros(ctx, hidden_dim, packed_hidden.seq_len.max(1))?;
+        let m_indices = ctx
+            .stream
+            .alloc_zeros::<i32>(rows)
+            .map_err(|e| anyhow::anyhow!("DSv4 contiguous m-index alloc failed: {e}"))?;
+        let active_experts = ctx.stream.clone_htod(&[0i32]).map_err(|e| {
+            anyhow::anyhow!("DSv4 DeepGEMM contiguous active-expert H2D failed: {e}")
+        })?;
+        let active_offsets = ctx
+            .stream
+            .clone_htod(&[0i32])
+            .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM contiguous offset H2D failed: {e}"))?;
+        let active_counts = ctx
+            .stream
+            .clone_htod(&[i32::try_from(rows)?])
+            .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM contiguous count H2D failed: {e}"))?;
         keepalive.keep_u8(&input_fp8);
         keepalive.keep_f32(&input_scales);
         keepalive.keep_hidden(&w13_out);
         keepalive.keep_u8(&act_fp8);
         keepalive.keep_f32(&act_scales);
-        keepalive.keep_hidden(&out_padded);
         keepalive.keep_hidden(&out_compact);
-
-        // masked_m = per-group valid row count = the local-expert counts (D2D).
-        let mut masked_m = ctx
-            .stream
-            .alloc_zeros::<i32>(num_groups)
-            .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM masked_m alloc failed: {e}"))?;
-        keepalive.keep_i32(&masked_m);
-        {
-            let src = counts.slice(0..num_groups);
-            let mut dst = masked_m.slice_mut(0..num_groups);
-            ctx.stream
-                .memcpy_dtod(&src, &mut dst)
-                .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM masked_m D2D failed: {e}"))?;
-        }
-
-        // Compact identity active-expert table 0..num_groups (dense local layout).
-        let active_experts = ctx
-            .stream
-            .clone_htod(&(0..num_groups as i32).collect::<Vec<i32>>())
-            .map_err(|e| anyhow::anyhow!("DSv4 DeepGEMM active-expert H2D failed: {e}"))?;
+        keepalive.keep_i32(&m_indices);
         keepalive.keep_i32(&active_experts);
+        keepalive.keep_i32(&active_offsets);
+        keepalive.keep_i32(&active_counts);
 
         let p_hidden = cache_ptr(&packed_hidden.data, ctx);
         let p_in_fp8 = cache_ptr(&input_fp8, ctx);
         let p_in_scales = cache_ptr(&input_scales, ctx);
         let p_active = cache_ptr(&active_experts, ctx);
-        let p_offsets = cache_ptr(offsets, ctx);
-        let p_counts = cache_ptr(counts, ctx);
-        let p_masked = cache_ptr(&masked_m, ctx);
+        let p_active_offsets = cache_ptr(&active_offsets, ctx);
+        let p_active_counts = cache_ptr(&active_counts, ctx);
+        let p_m_indices = cache_ptr(&m_indices, ctx);
         let p_w13_out = cache_ptr(&w13_out.data, ctx);
         let p_act_fp8 = cache_ptr(&act_fp8, ctx);
         let p_act_scales = cache_ptr(&act_scales, ctx);
-        let p_out_padded = cache_ptr(&out_padded.data, ctx);
         let p_out_compact = cache_ptr(&out_compact.data, ctx);
         let stream = ctx.stream.cu_stream();
 
         // SAFETY: every buffer/ptr above is valid on ctx.stream for the shapes
         // checked against the loaded caches; the kernels bound rows by masked_m.
         unsafe {
+            moe::dsv4_fill_m_indices_from_counts(
+                cache_ptr(counts, ctx),
+                cache_ptr(offsets, ctx),
+                p_m_indices,
+                num_groups,
+                rows,
+                stream,
+            )?;
             moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                 p_hidden,
                 p_in_fp8,
                 p_in_scales,
                 p_active,
-                p_offsets,
-                p_counts,
-                num_groups,
-                max_m,
+                p_active_offsets,
+                p_active_counts,
+                1,
+                rows,
                 hidden_dim,
                 scale_stride_m,
                 stream,
             )?;
-            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
                 p_in_fp8,
                 p_in_scales,
                 cache_ptr(&w13.weight, ctx),
                 cache_ptr(&w13.scales, ctx),
                 p_w13_out,
-                p_masked,
+                p_m_indices,
                 num_groups,
-                max_m,
+                rows,
                 2 * intermediate,
                 hidden_dim,
                 scale_stride_m,
@@ -1089,11 +1930,136 @@ mod dsv4_gpu {
                 p_act_fp8,
                 p_act_scales,
                 p_active,
-                p_counts,
-                num_groups,
-                max_m,
+                p_active_counts,
+                1,
+                rows,
                 intermediate,
                 scale_stride_m,
+                swiglu_limit,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                p_act_fp8,
+                p_act_scales,
+                cache_ptr(&w2.weight, ctx),
+                cache_ptr(&w2.scales, ctx),
+                p_out_compact,
+                p_m_indices,
+                num_groups,
+                rows,
+                hidden_dim,
+                intermediate,
+                scale_stride_m,
+                stream,
+            )?;
+        }
+
+        out_compact.seq_len = packed_hidden.seq_len;
+        Ok(out_compact)
+    }
+
+    fn deepgemm_grouped_experts_pooled(
+        ctx: &DeviceContext,
+        layer: &Dsv4MoeLayer,
+        packed_hidden: &HiddenStates,
+        counts: &CudaSlice<i32>,
+        offsets: &CudaSlice<i32>,
+        swiglu_limit: f32,
+        scratch: &mut Dsv4GroupedDecodeScratch,
+    ) -> Result<HiddenStates> {
+        let num_groups = layer.num_groups;
+        let hidden_dim = packed_hidden.hidden_dim;
+        let intermediate = layer.intermediate;
+        let w13 = &layer.w13_grouped;
+        let w2 = &layer.w2_grouped;
+        ensure!(
+            scratch.max_m >= packed_hidden.seq_len
+                && scratch.out_compact.seq_len >= packed_hidden.seq_len
+                && scratch.out_padded.hidden_dim == hidden_dim
+                && scratch.w13_out.hidden_dim == 2 * intermediate,
+            "DSv4 pooled grouped scratch mismatch: max_m={} out_cap={} packed={} H={} I={}",
+            scratch.max_m,
+            scratch.out_compact.seq_len,
+            packed_hidden.seq_len,
+            hidden_dim,
+            intermediate
+        );
+        ensure!(
+            w13.groups == num_groups
+                && w2.groups == num_groups
+                && w13.rows == 2 * intermediate
+                && w13.cols == hidden_dim
+                && w2.rows == hidden_dim
+                && w2.cols == intermediate,
+            "DSv4 grouped expert cache metadata mismatch: groups={} w13={}x{} g={} w2={}x{} g={} hidden={hidden_dim} inter={intermediate}",
+            num_groups,
+            w13.rows,
+            w13.cols,
+            w13.groups,
+            w2.rows,
+            w2.cols,
+            w2.groups,
+        );
+        {
+            let src = counts.slice(0..num_groups);
+            let mut dst = scratch.masked_m.slice_mut(0..num_groups);
+            ctx.stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow::anyhow!("DSv4 pooled DeepGEMM masked_m D2D failed: {e}"))?;
+        }
+
+        let p_hidden = cache_ptr(&packed_hidden.data, ctx);
+        let p_in_fp8 = cache_ptr(&scratch.input_fp8, ctx);
+        let p_in_scales = cache_ptr(&scratch.input_scales, ctx);
+        let p_active = cache_ptr(&scratch.active_experts, ctx);
+        let p_offsets = cache_ptr(offsets, ctx);
+        let p_counts = cache_ptr(counts, ctx);
+        let p_masked = cache_ptr(&scratch.masked_m, ctx);
+        let p_w13_out = cache_ptr(&scratch.w13_out.data, ctx);
+        let p_act_fp8 = cache_ptr(&scratch.act_fp8, ctx);
+        let p_act_scales = cache_ptr(&scratch.act_scales, ctx);
+        let p_out_padded = cache_ptr(&scratch.out_padded.data, ctx);
+        let p_out_compact = cache_ptr(&scratch.out_compact.data, ctx);
+        let stream = ctx.stream.cu_stream();
+
+        unsafe {
+            moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                p_hidden,
+                p_in_fp8,
+                p_in_scales,
+                p_active,
+                p_offsets,
+                p_counts,
+                num_groups,
+                scratch.max_m,
+                hidden_dim,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
+                p_in_fp8,
+                p_in_scales,
+                cache_ptr(&w13.weight, ctx),
+                cache_ptr(&w13.scales, ctx),
+                p_w13_out,
+                p_masked,
+                num_groups,
+                scratch.max_m,
+                2 * intermediate,
+                hidden_dim,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_swiglu_quantize_w13(
+                p_w13_out,
+                p_act_fp8,
+                p_act_scales,
+                p_active,
+                p_counts,
+                num_groups,
+                scratch.max_m,
+                intermediate,
+                scratch.scale_stride_m,
                 swiglu_limit,
                 stream,
             )?;
@@ -1105,10 +2071,10 @@ mod dsv4_gpu {
                 p_out_padded,
                 p_masked,
                 num_groups,
-                max_m,
+                scratch.max_m,
                 hidden_dim,
                 intermediate,
-                scale_stride_m,
+                scratch.scale_stride_m,
                 stream,
             )?;
             moe::dsv4_deepgemm_unpad_grouped_bf16(
@@ -1118,14 +2084,238 @@ mod dsv4_gpu {
                 p_offsets,
                 p_counts,
                 num_groups,
-                max_m,
+                scratch.max_m,
                 hidden_dim,
                 stream,
             )?;
         }
 
-        out_compact.seq_len = packed_hidden.seq_len;
-        Ok(out_compact)
+        Ok(HiddenStates {
+            data: scratch.out_compact.data.clone(),
+            hidden_dim,
+            seq_len: packed_hidden.seq_len,
+        })
+    }
+
+    fn deepgemm_grouped_experts_contiguous_pooled(
+        ctx: &DeviceContext,
+        layer: &Dsv4MoeLayer,
+        swiglu_limit: f32,
+        scratch: &mut Dsv4GroupedContiguousDecodeScratch,
+    ) -> Result<HiddenStates> {
+        let num_groups = layer.num_groups;
+        let packed_hidden = &scratch.packed_hidden;
+        let hidden_dim = packed_hidden.hidden_dim;
+        let intermediate = layer.intermediate;
+        let w13 = &layer.w13_grouped;
+        let w2 = &layer.w2_grouped;
+        ensure!(
+            scratch.rows >= packed_hidden.seq_len
+                && scratch.out.hidden_dim == hidden_dim
+                && scratch.w13_out.hidden_dim == 2 * intermediate,
+            "DSv4 contiguous grouped scratch mismatch: rows={} packed={} H={} I={}",
+            scratch.rows,
+            packed_hidden.seq_len,
+            hidden_dim,
+            intermediate
+        );
+        ensure!(
+            w13.groups == num_groups
+                && w2.groups == num_groups
+                && w13.rows == 2 * intermediate
+                && w13.cols == hidden_dim
+                && w2.rows == hidden_dim
+                && w2.cols == intermediate,
+            "DSv4 contiguous grouped cache metadata mismatch: groups={} w13={}x{} g={} w2={}x{} g={} hidden={hidden_dim} inter={intermediate}",
+            num_groups,
+            w13.rows,
+            w13.cols,
+            w13.groups,
+            w2.rows,
+            w2.cols,
+            w2.groups,
+        );
+
+        let p_hidden = cache_ptr(&packed_hidden.data, ctx);
+        let p_in_fp8 = cache_ptr(&scratch.input_fp8, ctx);
+        let p_in_scales = cache_ptr(&scratch.input_scales, ctx);
+        let p_active = cache_ptr(&scratch.active_experts, ctx);
+        let p_offsets = cache_ptr(&scratch.active_offsets, ctx);
+        let p_counts = cache_ptr(&scratch.active_counts, ctx);
+        let p_m_indices = cache_ptr(&scratch.m_indices, ctx);
+        let p_w13_out = cache_ptr(&scratch.w13_out.data, ctx);
+        let p_act_fp8 = cache_ptr(&scratch.act_fp8, ctx);
+        let p_act_scales = cache_ptr(&scratch.act_scales, ctx);
+        let p_out = cache_ptr(&scratch.out.data, ctx);
+        let stream = ctx.stream.cu_stream();
+
+        unsafe {
+            moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                p_hidden,
+                p_in_fp8,
+                p_in_scales,
+                p_active,
+                p_offsets,
+                p_counts,
+                1,
+                scratch.rows,
+                hidden_dim,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                p_in_fp8,
+                p_in_scales,
+                cache_ptr(&w13.weight, ctx),
+                cache_ptr(&w13.scales, ctx),
+                p_w13_out,
+                p_m_indices,
+                num_groups,
+                scratch.rows,
+                2 * intermediate,
+                hidden_dim,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_swiglu_quantize_w13(
+                p_w13_out,
+                p_act_fp8,
+                p_act_scales,
+                p_active,
+                p_counts,
+                1,
+                scratch.rows,
+                intermediate,
+                scratch.scale_stride_m,
+                swiglu_limit,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                p_act_fp8,
+                p_act_scales,
+                cache_ptr(&w2.weight, ctx),
+                cache_ptr(&w2.scales, ctx),
+                p_out,
+                p_m_indices,
+                num_groups,
+                scratch.rows,
+                hidden_dim,
+                intermediate,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+        }
+
+        Ok(HiddenStates {
+            data: scratch.out.data.clone(),
+            hidden_dim,
+            seq_len: packed_hidden.seq_len,
+        })
+    }
+
+    /// DSv4 dense shared expert via a single-group FP8 DeepGEMM pass: w13 fused
+    /// gate+up → clamped SwiGLU → w2 down, over every token. No routing/scatter.
+    fn dsv4_shared_expert_pooled(
+        ctx: &DeviceContext,
+        layer: &Dsv4MoeLayer,
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        swiglu_limit: f32,
+        scratch: &mut Dsv4SharedDecodeScratch,
+    ) -> Result<()> {
+        let hidden_dim = hidden.hidden_dim;
+        let num_tokens = hidden.seq_len;
+        let shared_inter = layer.shared_w2.cols;
+        ensure!(
+            num_tokens == 1
+                && scratch.out.hidden_dim == hidden_dim
+                && scratch.w13_out.hidden_dim == 2 * shared_inter,
+            "DSv4 pooled shared scratch mismatch: tokens={num_tokens} H={hidden_dim} I={shared_inter}"
+        );
+        ensure!(
+            out.hidden_dim == hidden_dim && out.seq_len == num_tokens,
+            "DSv4 pooled shared out shape {}x{} != hidden {}x{}",
+            out.hidden_dim,
+            out.seq_len,
+            hidden_dim,
+            num_tokens
+        );
+        let p_hidden = cache_ptr(&hidden.data, ctx);
+        let p_in_fp8 = cache_ptr(&scratch.input_fp8, ctx);
+        let p_in_scales = cache_ptr(&scratch.input_scales, ctx);
+        let p_active = cache_ptr(&scratch.active_experts, ctx);
+        let p_offsets = cache_ptr(&scratch.active_offsets, ctx);
+        let p_counts = cache_ptr(&scratch.counts, ctx);
+        let p_masked = cache_ptr(&scratch.masked_m, ctx);
+        let p_w13_out = cache_ptr(&scratch.w13_out.data, ctx);
+        let p_act_fp8 = cache_ptr(&scratch.act_fp8, ctx);
+        let p_act_scales = cache_ptr(&scratch.act_scales, ctx);
+        let p_out = cache_ptr(&scratch.out.data, ctx);
+        let stream = ctx.stream.cu_stream();
+
+        unsafe {
+            moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                p_hidden,
+                p_in_fp8,
+                p_in_scales,
+                p_active,
+                p_offsets,
+                p_counts,
+                1,
+                scratch.max_m,
+                hidden_dim,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
+                p_in_fp8,
+                p_in_scales,
+                cache_ptr(&layer.shared_w13.weight, ctx),
+                cache_ptr(&layer.shared_w13.scales, ctx),
+                p_w13_out,
+                p_masked,
+                1,
+                scratch.max_m,
+                2 * shared_inter,
+                hidden_dim,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_swiglu_quantize_w13(
+                p_w13_out,
+                p_act_fp8,
+                p_act_scales,
+                p_active,
+                p_counts,
+                1,
+                scratch.max_m,
+                shared_inter,
+                scratch.scale_stride_m,
+                swiglu_limit,
+                stream,
+            )?;
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
+                p_act_fp8,
+                p_act_scales,
+                cache_ptr(&layer.shared_w2.weight, ctx),
+                cache_ptr(&layer.shared_w2.scales, ctx),
+                p_out,
+                p_masked,
+                1,
+                scratch.max_m,
+                hidden_dim,
+                shared_inter,
+                scratch.scale_stride_m,
+                stream,
+            )?;
+        }
+
+        let elems = hidden_dim * num_tokens;
+        let src = scratch.out.data.slice(0..elems);
+        ctx.stream
+            .memcpy_dtod(&src, &mut out.data)
+            .map_err(|e| anyhow::anyhow!("DSv4 pooled shared output D2D failed: {e}"))?;
+        Ok(())
     }
 
     /// DSv4 dense shared expert via a single-group FP8 DeepGEMM pass: w13 fused
@@ -1173,7 +2363,10 @@ mod dsv4_gpu {
         let w13_out = HiddenStates::zeros(ctx, 2 * shared_inter, max_m)?;
         let act_fp8 = alloc_u8(ctx, max_m * shared_inter)?;
         let act_scales = alloc_zeros_f32(ctx, scale_stride_m * inter_scale_cols)?;
-        let out = HiddenStates::zeros(ctx, hidden_dim, num_tokens)?;
+        // DeepGEMM's TMA D descriptor is built with `m = max_m`, so the output
+        // allocation must cover the padded row capacity even though downstream
+        // consumers only read the first `num_tokens` rows.
+        let out = HiddenStates::zeros(ctx, hidden_dim, max_m)?;
         keepalive.keep_u8(&input_fp8);
         keepalive.keep_f32(&input_scales);
         keepalive.keep_hidden(&w13_out);
@@ -1274,7 +2467,11 @@ mod dsv4_gpu {
             )?;
         }
 
-        Ok(out)
+        Ok(HiddenStates {
+            data: out.data.clone(),
+            hidden_dim,
+            seq_len: num_tokens,
+        })
     }
 
     /// One contiguous group-major FP8 weight + scale buffer the masked GEMM
@@ -1371,7 +2568,8 @@ pub(crate) use dsv4_gpu::dsv4_moe_forward_deepep;
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
-    GroupedCache, build_grouped_cache, dsv4_moe_forward, dsv4_shared_expert_forward,
+    Dsv4MoeDecodeScratch, GroupedCache, build_grouped_cache, dsv4_moe_forward,
+    dsv4_moe_forward_decode_graph, dsv4_shared_expert_forward,
 };
 #[cfg(feature = "cuda")]
 pub(crate) use gpu::moe_forward;

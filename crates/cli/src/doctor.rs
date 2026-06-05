@@ -33,6 +33,23 @@ struct TtyState {
     stderr: bool,
 }
 
+/// Print the `Resolution` section for a resolved (or failed) model source.
+/// Shared by `run` and `list_models`.
+fn print_resolution(selected: &Result<SelectedModelSource>) {
+    println!("{}", style("Resolution").bold());
+    match selected {
+        Ok(source) => {
+            println!("{} {}", style("selected via").dim(), source.origin_label());
+            println!("{} {}", style("selected source").dim(), source.value());
+            match source.local_path() {
+                Some(path) => println!("{} {}", style("local path").dim(), path.display()),
+                None => println!("{} <not present locally>", style("local path").dim()),
+            }
+        }
+        Err(err) => println!("{} {err:#}", style("resolution error").red().bold()),
+    }
+}
+
 pub(crate) fn run(args: &Args) -> Result<()> {
     let snapshot = collect_snapshot(args);
     let report = doctor_report(&snapshot);
@@ -105,20 +122,7 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     );
     println!();
 
-    println!("{}", style("Resolution").bold());
-    match &snapshot.selected {
-        Ok(source) => {
-            println!("{} {}", style("selected via").dim(), source.origin_label());
-            println!("{} {}", style("selected source").dim(), source.value());
-            match source.local_path() {
-                Some(path) => println!("{} {}", style("local path").dim(), path.display()),
-                None => println!("{} <not present locally>", style("local path").dim()),
-            }
-        }
-        Err(err) => {
-            println!("{} {err:#}", style("resolution error").red().bold());
-        }
-    }
+    print_resolution(&snapshot.selected);
     println!();
 
     print_discovery_section(&snapshot);
@@ -163,20 +167,7 @@ pub(crate) fn list_models(args: &Args) -> Result<()> {
 
     println!("{}", style("ARLE models").bold().cyan());
     println!();
-    println!("{}", style("Resolution").bold());
-    match &snapshot.selected {
-        Ok(source) => {
-            println!("{} {}", style("selected via").dim(), source.origin_label());
-            println!("{} {}", style("selected source").dim(), source.value());
-            match source.local_path() {
-                Some(path) => println!("{} {}", style("local path").dim(), path.display()),
-                None => println!("{} <not present locally>", style("local path").dim()),
-            }
-        }
-        Err(err) => {
-            println!("{} {err:#}", style("resolution error").red().bold());
-        }
-    }
+    print_resolution(&snapshot.selected);
     println!();
 
     print_discovery_section(&snapshot);
