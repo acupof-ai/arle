@@ -81,6 +81,48 @@ the H20 Hopper path** (Codex profiling in flight).
 *Production H20 numbers* (DSv4/Qwen tok/s, TP=8 scaling, per-op nsys breakdown +
 compute/comm overlap) — the remaining input, Codex profiling on 8×H20 now.
 
+**Update 2026-06-05 — DSv4-Flash decode 6× + prefill 12× (the H20 production
+numbers above). DSv4-Flash FP8 TP=8/EP=8, 8×H20, parity harness (greedy,
+16/16 == oracle at every stage).** The decode-correctness fix (#23) cleared the
+incremental path; the perf arc then took decode from 236.8 → 39.5 ms/token by
+eliminating, in order, every layer of non-compute overhead:
+
+| Stage | tok/s | ms/token | what was eliminated | commit |
+|---|---|---|---|---|
+| baseline (host route, eager) | 4.365 | 236.8 | — | — |
+| #24 on-device GPU router (+ sync bridge) | 6.245 | 160 | per-layer host-route D2H+CPU+H2D (½) | `fa1b78f2` |
+| #29 persistent scratch pool | 21.615 | 46 | per-step alloc/free + the async reuse-boundary race | `4d62062a` |
+| buffer/D2D lever | 25.129 | 41.2 | D2D copies (a keepalive `clone()` = device copy), zeroing | `7bdb3819` |
+| #25 breakable decode graph (gated) | 25.517 | 39.5 | launch API −87% (overlapped → wall flat) | `7104813e` |
+
+Decode-step overhead profile before → after: `cuStreamSynchronize` 39.6% → ~0
+(host route gone), `cuMemAllocAsync` 36.9% → 2.8 ms/token, `cuMemcpyDtoH` route
+→ 0.018 ms/token. **Prefill rode the same fixes for free: 512-token TTFT
+14.66 s → 1.204 s (~12×), `moe_route` now 6–11 ms (was the 93%-GPU-idle cause).**
+
+**Now GPU-kernel-bound — and the floor is partly an unoptimized kernel.** The
+remaining ~39.5 ms/token is real GPU work, dominated by the *same* two kernels
+that floor prefill: the attention-side **FP8 block-scaled linear** (wq/wkv/wo +
+compressor + HC) and **hybrid MLA attention**. ncu shows the FP8 linear runs as a
+hand-written *scalar* CUDA-core kernel — tensor-core (WGMMA) <1%, HBM BW ~10% —
+so a large chunk of the "floor" is ~10× headroom, not silicon (lever: DeepGEMM
+dense FP8 GEMM for prefill M>1; a bandwidth-bound FP8 GEMV for decode M=1; in
+progress). **5–6 ms/token is an H100/H800 number** (SGLang's reference SKU);
+the H20 floor after the kernel pass is the open question, but the structural arc
+(scheduling / host / buffer / launch / routing) is closed and measured. Roadmap +
+per-stage evidence:
+[`docs/plans/2026-06-04-dsv4-decode-sglang-class-perf.md`](../plans/2026-06-04-dsv4-decode-sglang-class-perf.md)
+§§5–9; per-stage wins under `docs/experience/wins/2026-06-05-dsv4-*`.
+
+**Methodology note — three framing traps, each falsified before chasing.** The
+biggest line in a profile was repeatedly *not* the bottleneck: `lm_head_sample`
+9.4 ms (an NVTX range absorbing the step-end sync), `cudaLaunchKernel` 13.36 ms
+(CPU launch overlapped with GPU exec), the 2048-prefill 4.96 s attn-allreduce
+(a one-time NCCL/rank-start warmup, not steady-state). Each was proven artifact by
+a cheap control (sync-before probe / graph A/B / per-rank arrival timing) before
+any code changed. License-or-kill was always wall-clock per-token, never a narrow
+API/NVTX-window share.
+
 ## 4. Architecture (elegant / clean / extensible — substantiated)
 
 Device-neutral rewrite: `infer-plan` (IR) → `infer-seam` (host-only traits) →
@@ -114,9 +156,14 @@ deleted** (`956c774f` + `e81b98fb`).
 1. **GPU numeric verify of the OPD-teacher surface** (logits parity vs the pre-sample
    forward / offload correctness / lora-merge numerics) on the pod — fix-forward
    (typecheck-gated in-tree; the rewrite is committed truth, no `infer` fallback).
-2. **CUDA per-op perf profiling (#16)** — the perf half of this report. In flight
-   (early H20 nsys: NCCL all-reduce 27.5% GPU time **at 0% compute-overlap = serial
-   critical path**, DSv4 FP8 GEMV 26.4%, hybrid attn 21.7%; DSv4 weight load **111 s**).
+2. **CUDA per-op perf profiling (#16)** — the perf half of this report.
+   **Substantially delivered (§3 Update 2026-06-05):** DSv4 decode 6× / prefill
+   12×, structural overhead closed, the floor localized to FP8-GEMV + hybrid
+   attention (the early nsys's "DSv4 FP8 GEMV 26.4%, hybrid attn 21.7%" is exactly
+   today's kernel floor — confirmed scalar, ~10× headroom). Remaining: the kernel
+   pass (FP8 GEMV → tensor-core/bandwidth-bound, then hybrid attention) in
+   progress; DSv4 weight load **111 s** is still a separate load-time follow-up
+   (item 3).
 3. **Load + compile optimization** (research delivered,
    [`research/2026-06-04-load-and-compile-optimization.md`](../research/2026-06-04-load-and-compile-optimization.md)):
    top levers = pinned async H2D (load, ~111s target), content-addressed cubin cache
