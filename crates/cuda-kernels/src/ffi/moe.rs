@@ -192,6 +192,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_fill_m_indices_from_counts_cuda(
+        counts: *const i32,
+        offsets: *const i32,
+        m_indices: *mut i32,
+        experts_per_rank: i32,
+        row_capacity: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_pack_local_experts_with_slots_and_indices_cuda(
         hidden: *const Half,
         indices: *const i32,
