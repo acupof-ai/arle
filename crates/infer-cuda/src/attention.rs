@@ -1057,6 +1057,52 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
     env_flag("ARLE_DSV4_FLASHMLA_DECODE")
 }
 
+fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
+    env_flag("ARLE_DSV4_FLASHMLA_PREFILL")
+}
+
+/// Per-layer attention-output localizer (Track A FlashMLA-prefill diagnosis).
+///
+/// When `ARLE_DSV4_ATTN_DUMP=1`, every layer prints a stable FNV-1a hash of its
+/// full bf16 `local_attn` output plus the first 8 values of row 0, on rank 0
+/// only. Run the same prompt twice — once scalar (default), once with
+/// `ARLE_DSV4_FLASHMLA_PREFILL=1` — and diff the two logs: the *first* CSA/HCA
+/// layer whose hash differs is exactly where FlashMLA-prefill diverges from the
+/// scalar reference. SW layers run scalar in both passes and match by
+/// construction, so a mismatch localizes the bug to one layer in one build —
+/// replacing the end-to-end-token guess loop. Adds one `ctx.sync()` per layer,
+/// so it is strictly opt-in.
+fn dsv4_attn_dump_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_ATTN_DUMP").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    ) && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
+}
+
+fn dsv4_dump_attn_output(
+    ctx: &DeviceContext,
+    layer_idx: usize,
+    mode: DeepSeekV4AttentionMode,
+    out: &HiddenStates,
+) -> Result<()> {
+    ctx.sync()?;
+    let host: Vec<half::bf16> = ctx
+        .stream
+        .clone_dtoh(&out.data)
+        .map_err(|e| anyhow!("DSv4 attn-dump D2H failed: {e}"))?;
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for v in &host {
+        hash ^= u64::from(v.to_bits());
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let row0: Vec<f32> = host.iter().take(8).map(|v| v.to_f32()).collect();
+    eprintln!(
+        "[dsv4-attn-dump] layer={layer_idx} mode={mode:?} seq_len={} hidden={} hash={hash:016x} row0={row0:?}",
+        out.seq_len, out.hidden_dim
+    );
+    Ok(())
+}
+
 fn dsv4_flashmla_decode_alloc_enabled() -> Result<bool> {
     if env_flag("ARLE_DSV4_FLASHMLA_DECODE_ALLOC")? {
         return Ok(true);
@@ -1267,6 +1313,370 @@ fn update_bf16_sw_window(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_flashmla_prefill_attention(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    q_prepared: &HiddenStates,
+    k_prepared: &HiddenStates,
+    selected: Option<&CudaSlice<i32>>,
+    compressed: &HiddenStates,
+    sw_window_cache: &mut CudaSlice<half::bf16>,
+    start_pos: usize,
+    tp: &TpRuntime,
+    local_heads: usize,
+    local_attn: &mut HiddenStates,
+    sm_scale: f32,
+    rope_base: f32,
+    original_seq_len: i32,
+    rope_factor: f32,
+    rope_beta_fast: f32,
+    rope_beta_slow: f32,
+) -> Result<bool> {
+    if !dsv4_flashmla_prefill_enabled()? {
+        return Ok(false);
+    }
+    if q_prepared.seq_len <= 1 {
+        return Ok(false);
+    }
+    if mode == DeepSeekV4AttentionMode::SlidingWindow {
+        return Ok(false);
+    }
+    ensure!(
+        config.head_dim == 512 && config.qk_rope_head_dim == 64,
+        "DSv4 FlashMLA prefill only supports MODEL1 head_dim=512 rope_dim=64"
+    );
+    ensure!(
+        q_prepared.seq_len == k_prepared.seq_len && local_attn.seq_len == q_prepared.seq_len,
+        "DSv4 FlashMLA prefill shape mismatch: q={} k={} out={}",
+        q_prepared.seq_len,
+        k_prepared.seq_len,
+        local_attn.seq_len
+    );
+
+    let token_count = q_prepared.seq_len;
+    let tp_world = tp.config().world_size;
+    let tp_rank = tp.config().rank;
+    let global_heads = local_heads
+        .checked_mul(tp_world)
+        .ok_or_else(|| anyhow!("DSv4 FlashMLA prefill global head overflow"))?;
+    ensure!(
+        matches!(global_heads, 64 | 128),
+        "DSv4 FlashMLA prefill requires global heads 64/128, got {global_heads}"
+    );
+
+    let compressed_count = compressed.seq_len;
+    let max_compressed_keys = match mode {
+        DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
+        DeepSeekV4AttentionMode::HybridCompressed => compressed_count.div_ceil(128) * 128,
+        DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+    };
+    let topk_unified = config
+        .sliding_window
+        .checked_add(max_compressed_keys)
+        .ok_or_else(|| anyhow!("DSv4 FlashMLA prefill topk overflow"))?;
+    ensure!(
+        topk_unified.is_multiple_of(128),
+        "DSv4 FlashMLA prefill topk {topk_unified} must be multiple of 128"
+    );
+    let kv_rows = config
+        .sliding_window
+        .checked_add(token_count)
+        .and_then(|v| v.checked_add(compressed_count))
+        .ok_or_else(|| anyhow!("DSv4 FlashMLA prefill unified KV rows overflow"))?;
+    ensure!(kv_rows > 0, "DSv4 FlashMLA prefill needs non-empty KV pool");
+
+    // FlashMLA prefill consumes one unified bf16 pool:
+    // [rolling SW cache rebased | current chunk K | compressed pool].
+    let mut kv_unified = unsafe { HiddenStates::uninit(ctx, config.head_dim, kv_rows)? };
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_pack_kv");
+        let (kv_ptr, _kvg) = kv_unified.data.device_ptr_mut(&ctx.stream);
+        let (window_ptr, _wg) = sw_window_cache.device_ptr(&ctx.stream);
+        let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
+        let (comp_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::arle_flashmla_csa_pack_kv(
+                kv_ptr as *mut ffi::Half,
+                window_ptr as *const ffi::Half,
+                k_ptr as *const ffi::Half,
+                if compressed_count > 0 {
+                    comp_ptr as *const ffi::Half
+                } else {
+                    std::ptr::null()
+                },
+                start_pos as i32,
+                config.sliding_window as i32,
+                token_count as i32,
+                compressed_count as i32,
+                config.head_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA prefill KV pack failed: {e}"))?;
+        }
+    }
+
+    let mut indices = ctx
+        .stream
+        .alloc_zeros::<i32>(token_count * topk_unified)
+        .map_err(|e| anyhow!("DSv4 FlashMLA prefill indices alloc failed: {e}"))?;
+    let mut topk_length = ctx
+        .stream
+        .alloc_zeros::<i32>(token_count)
+        .map_err(|e| anyhow!("DSv4 FlashMLA prefill topk_length alloc failed: {e}"))?;
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_build_indices");
+        let (indices_ptr, _ig) = indices.device_ptr_mut(&ctx.stream);
+        let (topk_ptr, _tg) = topk_length.device_ptr_mut(&ctx.stream);
+        unsafe {
+            match mode {
+                DeepSeekV4AttentionMode::CompressedSparse => {
+                    let selected = selected.ok_or_else(|| {
+                        anyhow!("DSv4 FlashMLA CSA prefill missing selected topk")
+                    })?;
+                    let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
+                    ffi::arle_flashmla_csa_build_indices(
+                        indices_ptr as *mut i32,
+                        topk_ptr as *mut i32,
+                        selected_ptr as *const i32,
+                        token_count as i32,
+                        start_pos as i32,
+                        config.sliding_window as i32,
+                        config.index_topk as i32,
+                        compressed_count as i32,
+                        compress_ratio as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 FlashMLA CSA prefill indices failed: {e}"))?;
+                }
+                DeepSeekV4AttentionMode::HybridCompressed => {
+                    ffi::arle_flashmla_hca_build_indices(
+                        indices_ptr as *mut i32,
+                        topk_ptr as *mut i32,
+                        token_count as i32,
+                        start_pos as i32,
+                        config.sliding_window as i32,
+                        max_compressed_keys as i32,
+                        compressed_count as i32,
+                        compress_ratio as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}"))?;
+                }
+                DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+            }
+        }
+    }
+
+    let mut max_logits = ctx
+        .stream
+        .alloc_zeros::<f32>(token_count * global_heads)
+        .map_err(|e| anyhow!("DSv4 FlashMLA prefill max_logits alloc failed: {e}"))?;
+    let mut lse = ctx
+        .stream
+        .alloc_zeros::<f32>(token_count * global_heads)
+        .map_err(|e| anyhow!("DSv4 FlashMLA prefill lse alloc failed: {e}"))?;
+
+    let (q_ptr, q_guard) = q_prepared.data.device_ptr(&ctx.stream);
+    let (kv_ptr, kv_guard) = kv_unified.data.device_ptr(&ctx.stream);
+    let (indices_ptr, indices_guard) = indices.device_ptr(&ctx.stream);
+    let (topk_ptr, topk_guard) = topk_length.device_ptr(&ctx.stream);
+    let (out_ptr, out_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
+    let (max_ptr, max_guard) = max_logits.device_ptr_mut(&ctx.stream);
+    let (lse_ptr, lse_guard) = lse.device_ptr_mut(&ctx.stream);
+
+    let local_width = local_heads * config.head_dim;
+    let global_width = global_heads * config.head_dim;
+    let (q_for_flashmla, flash_out_ptr, mut tp_gathered_q, mut tp_packed_q, mut tp_full_out) =
+        if tp_world > 1 {
+            let mut gathered = ctx
+                .stream
+                .alloc_zeros::<half::bf16>(tp_world * token_count * local_width)
+                .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP Q gather alloc failed: {e}"))?;
+            let mut packed = ctx
+                .stream
+                .alloc_zeros::<half::bf16>(token_count * global_width)
+                .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP Q pack alloc failed: {e}"))?;
+            let full_out = ctx
+                .stream
+                .alloc_zeros::<half::bf16>(token_count * global_width)
+                .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP output alloc failed: {e}"))?;
+            let (gather_ptr, gather_guard) = gathered.device_ptr_mut(&ctx.stream);
+            {
+                let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_q_allgather");
+                unsafe {
+                    tp.all_gather_bf16_raw(
+                        ctx,
+                        q_ptr as *const std::ffi::c_void,
+                        token_count * local_width,
+                        gather_ptr as *mut std::ffi::c_void,
+                    )?;
+                }
+            }
+            drop(gather_guard);
+            let (packed_ptr, packed_guard) = packed.device_ptr_mut(&ctx.stream);
+            {
+                let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_q_repack");
+                unsafe {
+                    ffi::dsv4_tp_q_repack_cuda(
+                        gather_ptr as *const ffi::Half,
+                        packed_ptr as *mut ffi::Half,
+                        tp_world as i32,
+                        token_count as i32,
+                        local_heads as i32,
+                        config.head_dim as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP Q repack failed: {e}"))?;
+                }
+            }
+            drop(packed_guard);
+            let (full_out_ptr, full_out_guard) = full_out.device_ptr(&ctx.stream);
+            drop(full_out_guard);
+            (
+                packed_ptr as *const ffi::Half,
+                full_out_ptr as *mut ffi::Half,
+                Some(gathered),
+                Some(packed),
+                Some(full_out),
+            )
+        } else {
+            (
+                q_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                None,
+                None,
+                None,
+            )
+        };
+
+    let (sink_base, sink_guard) = attention.attn_sink_f32.device_ptr(&ctx.stream);
+    ensure!(
+        if tp_world > 1 {
+            attention.attn_sink_f32.len() >= global_heads
+        } else {
+            attention.attn_sink_f32.len() >= tp_rank * local_heads + local_heads
+        },
+        "DSv4 FlashMLA prefill attn_sink_f32 len {} cannot cover heads",
+        attention.attn_sink_f32.len()
+    );
+    let sink_ptr = if tp_world > 1 {
+        sink_base as *const f32
+    } else {
+        unsafe { (sink_base as *const f32).add(tp_rank * local_heads) }
+    };
+
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_fwd");
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_prefill_fwd(
+                q_for_flashmla,
+                kv_ptr as *const ffi::Half,
+                indices_ptr as *const i32,
+                sink_ptr,
+                topk_ptr as *const i32,
+                flash_out_ptr,
+                max_ptr as *mut f32,
+                lse_ptr as *mut f32,
+                token_count as i32,
+                kv_rows as i32,
+                global_heads as i32,
+                1,
+                config.head_dim as i32,
+                config.head_dim as i32,
+                topk_unified as i32,
+                sm_scale,
+                global_width as i32,
+                config.head_dim as i32,
+                config.head_dim as i32,
+                0,
+                topk_unified as i32,
+                0,
+                0,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA sparse prefill failed: {e}"))?;
+        }
+    }
+
+    if tp_world > 1 {
+        let full_out = tp_full_out
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA prefill missing TP full output"))?;
+        let (full_out_ptr, full_out_guard) = full_out.device_ptr(&ctx.stream);
+        {
+            let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_out_slice");
+            unsafe {
+                ffi::dsv4_tp_out_slice_cuda(
+                    full_out_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    global_width as i32,
+                    local_width as i32,
+                    (tp_rank * local_width) as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP out slice failed: {e}"))?;
+            }
+        }
+        drop(full_out_guard);
+    }
+
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_inverse_rope");
+        unsafe {
+            ffi::arle_dsv4_output_inverse_rope_cuda(
+                out_ptr as *mut ffi::Half,
+                token_count as i32,
+                local_heads as i32,
+                config.head_dim as i32,
+                config.qk_rope_head_dim as i32,
+                start_pos as i32,
+                rope_base,
+                original_seq_len,
+                rope_factor,
+                rope_beta_fast,
+                rope_beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {e}"))?;
+        }
+    }
+
+    update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
+
+    if env_flag("ARLE_DSV4_FLASHMLA_PREFILL_SYNC")? {
+        ctx.sync()?;
+    }
+
+    // Keep temporary buffers in scope until all launches that use their raw
+    // pointers have been enqueued. Optional sync above is available for
+    // diagnostics and for conservative lifetime validation on pod.
+    drop(tp_gathered_q.take());
+    drop(tp_packed_q.take());
+    drop(tp_full_out.take());
+    drop(q_guard);
+    drop(kv_guard);
+    drop(indices_guard);
+    drop(topk_guard);
+    drop(out_guard);
+    drop(max_guard);
+    drop(lse_guard);
+    drop(sink_guard);
+
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2188,7 +2598,30 @@ pub(crate) fn mla_attention(
             DeepSeekV4AttentionMode::HybridCompressed => 2,
             DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
         };
-        let flashmla_used = if dsv4_flashmla_decode_enabled()? {
+        let flashmla_used = if try_flashmla_prefill_attention(
+            ctx,
+            config,
+            attention,
+            mode,
+            compress_ratio,
+            &q_prepared,
+            &k_prepared,
+            selected.as_ref(),
+            compressed,
+            &mut state.sw_window_cache,
+            start_pos,
+            tp,
+            local_heads,
+            &mut local_attn,
+            sm_scale,
+            rope_base,
+            original_seq_len,
+            rope.factor,
+            rope.beta_fast,
+            rope.beta_slow,
+        )? {
+            true
+        } else if dsv4_flashmla_decode_enabled()? {
             let flash = state.flashmla.as_mut().ok_or_else(|| {
                 anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
             })?;
@@ -2311,6 +2744,10 @@ pub(crate) fn mla_attention(
         }
     }
     keepalive.keep_hidden(&local_attn);
+
+    if dsv4_attn_dump_enabled() {
+        dsv4_dump_attn_output(ctx, layer_idx, mode, &local_attn)?;
+    }
 
     // ── 5. O-LoRA: wo_a (per o-group, down to the output latent) → wo_b (up
     // back to hidden). Row-parallel: the all-reduce-sum is the model's concern.
