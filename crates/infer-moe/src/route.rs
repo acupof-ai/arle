@@ -282,6 +282,58 @@ pub fn route(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result<Vec<R
     Ok(out)
 }
 
+/// Route a flat batch and combine already-computed expert outputs.
+///
+/// This is the CPU end-to-end MoE reference for inference-side routed experts:
+/// `logits -> scores -> group mask -> top-k -> weights -> weighted sum`.
+/// `gate_logits` is `[num_tokens * num_experts]`; `expert_outputs` is
+/// `[num_tokens * num_experts * hidden_dim]`, token-major then expert-major.
+/// Shared experts are model-specific always-on paths and intentionally stay
+/// outside this routed-expert reference.
+pub fn route_and_combine(
+    gate_logits: &[f32],
+    bias: &[f32],
+    expert_outputs: &[f32],
+    hidden_dim: usize,
+    cfg: &MoeConfig,
+) -> Result<(Vec<RoutingDecision>, Vec<f32>)> {
+    if hidden_dim == 0 {
+        bail!("hidden_dim must be > 0");
+    }
+    let decisions = route(gate_logits, bias, cfg)?;
+    let num_tokens = decisions.len();
+    let expected = match num_tokens
+        .checked_mul(cfg.num_experts)
+        .and_then(|v| v.checked_mul(hidden_dim))
+    {
+        Some(value) => value,
+        None => bail!("expert_outputs shape overflow"),
+    };
+    if expert_outputs.len() != expected {
+        bail!(
+            "expert_outputs length {} does not match [tokens={}, experts={}, hidden_dim={}]",
+            expert_outputs.len(),
+            num_tokens,
+            cfg.num_experts,
+            hidden_dim
+        );
+    }
+
+    let mut out = vec![0.0_f32; num_tokens * hidden_dim];
+    for (token, decision) in decisions.iter().enumerate() {
+        let out_row = &mut out[token * hidden_dim..(token + 1) * hidden_dim];
+        for ExpertWeight { expert, weight } in &decision.experts {
+            let expert_offset = (token * cfg.num_experts + *expert) * hidden_dim;
+            let expert_row = &expert_outputs[expert_offset..expert_offset + hidden_dim];
+            for (dst, &value) in out_row.iter_mut().zip(expert_row) {
+                *dst += value * *weight;
+            }
+        }
+    }
+
+    Ok((decisions, out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +345,19 @@ mod tests {
             (actual - expected).abs() <= EPS,
             "{label}: actual={actual} expected={expected}"
         );
+    }
+
+    fn assert_slice_close(actual: &[f32], expected: &[f32], label: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{label}: length mismatch actual={} expected={}",
+            actual.len(),
+            expected.len()
+        );
+        for (i, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(actual, expected, &format!("{label}[{i}]"));
+        }
     }
 
     fn noaux_cfg(
@@ -315,6 +380,46 @@ mod tests {
             topk_group,
             hidden_size: 16,
         }
+    }
+
+    fn expert_outputs(num_tokens: usize, num_experts: usize, hidden_dim: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(num_tokens * num_experts * hidden_dim);
+        for token in 0..num_tokens {
+            for expert in 0..num_experts {
+                for dim in 0..hidden_dim {
+                    out.push((token as f32 + 1.0) * 1000.0 + expert as f32 * 10.0 + dim as f32);
+                }
+            }
+        }
+        out
+    }
+
+    fn expert_row(
+        expert_outputs: &[f32],
+        token: usize,
+        expert: usize,
+        num_experts: usize,
+        hidden_dim: usize,
+    ) -> &[f32] {
+        let offset = (token * num_experts + expert) * hidden_dim;
+        &expert_outputs[offset..offset + hidden_dim]
+    }
+
+    fn expected_weighted_sum(
+        expert_outputs: &[f32],
+        token: usize,
+        decision: &RoutingDecision,
+        num_experts: usize,
+        hidden_dim: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0_f32; hidden_dim];
+        for ExpertWeight { expert, weight } in &decision.experts {
+            let row = expert_row(expert_outputs, token, *expert, num_experts, hidden_dim);
+            for (dst, &value) in out.iter_mut().zip(row) {
+                *dst += value * *weight;
+            }
+        }
+        out
     }
 
     #[test]
@@ -576,6 +681,99 @@ mod tests {
             route(&logits, &[0.0; 8], &all_groups).unwrap(),
             base,
             "topk_group==n_group keeps all experts and matches ungrouped route()"
+        );
+    }
+
+    #[test]
+    fn route_and_combine_e2e_noaux_tc_group_limited_pipeline() {
+        let cfg = noaux_cfg(16, 3, ScoringFunc::Sigmoid, 2.0, Some(4), Some(2));
+        let logits = [0.0; 16];
+        let bias = [
+            7.0, 6.0, 0.0, 0.0, // g0
+            1.0, 1.0, 1.0, 1.0, // g1
+            3.0, 2.0, 0.0, 0.0, // g2
+            5.0, 4.5, 0.0, 0.0, // g3
+        ];
+        let hidden_dim = 4;
+        let expert_outputs = expert_outputs(1, 16, hidden_dim);
+
+        let (decisions, combined) =
+            route_and_combine(&logits, &bias, &expert_outputs, hidden_dim, &cfg).unwrap();
+
+        let decision = &decisions[0];
+        assert_eq!(
+            decision.expert_ids(),
+            vec![0, 1, 12],
+            "full reference applies group mask before routed weighted combine"
+        );
+        for (i, weight) in decision.weights().iter().enumerate() {
+            assert_close(*weight, 2.0 / 3.0, &format!("selected weight {i}"));
+        }
+        let expected = expected_weighted_sum(&expert_outputs, 0, decision, 16, hidden_dim);
+        assert_slice_close(&combined, &expected, "group-limited combined output");
+    }
+
+    #[test]
+    fn route_and_combine_e2e_bias_changes_selection_not_weight() {
+        let cfg = noaux_cfg(4, 2, ScoringFunc::Sigmoid, 1.0, None, None);
+        let logits = [0.0, 0.0, -5.0, 0.0];
+        let bias = [0.0, 0.0, 10.0, 0.0];
+        let hidden_dim = 3;
+        let expert_outputs = expert_outputs(1, 4, hidden_dim);
+
+        let (decisions, combined) =
+            route_and_combine(&logits, &bias, &expert_outputs, hidden_dim, &cfg).unwrap();
+
+        let scores = scores_from_logits(&logits, ScoringFunc::Sigmoid).unwrap();
+        let denom = scores[2] + scores[0] + 1.0e-9;
+        let decision = &decisions[0];
+        assert_eq!(decision.expert_ids(), vec![2, 0]);
+        assert_close(
+            decision.weights()[0],
+            scores[2] / denom,
+            "biased expert keeps pre-bias weight in full combine path",
+        );
+        let expected = expected_weighted_sum(&expert_outputs, 0, decision, 4, hidden_dim);
+        assert_slice_close(&combined, &expected, "bias-corrected combined output");
+    }
+
+    #[test]
+    fn route_and_combine_e2e_batched_tokens() {
+        let cfg = noaux_cfg(5, 2, ScoringFunc::Softmax, 1.25, None, None);
+        let logits = [
+            0.0, 1.0, 2.0, 3.0, 4.0, // token 0 -> experts 4, 3
+            5.0, 4.0, 3.0, 2.0, 1.0, // token 1 -> experts 0, 1
+        ];
+        let hidden_dim = 2;
+        let expert_outputs = expert_outputs(2, 5, hidden_dim);
+
+        let (decisions, combined) =
+            route_and_combine(&logits, &[0.0; 5], &expert_outputs, hidden_dim, &cfg).unwrap();
+
+        assert_eq!(decisions[0].expert_ids(), vec![4, 3]);
+        assert_eq!(decisions[1].expert_ids(), vec![0, 1]);
+        for token in 0..2 {
+            let expected =
+                expected_weighted_sum(&expert_outputs, token, &decisions[token], 5, hidden_dim);
+            assert_slice_close(
+                &combined[token * hidden_dim..(token + 1) * hidden_dim],
+                &expected,
+                &format!("batched token {token} combined output"),
+            );
+        }
+    }
+
+    #[test]
+    fn route_and_combine_rejects_bad_shapes() {
+        let cfg = noaux_cfg(4, 2, ScoringFunc::Sigmoid, 1.0, None, None);
+        let logits = [0.0, 0.0, 0.0, 0.0];
+        assert!(
+            route_and_combine(&logits, &[0.0; 4], &[0.0; 4], 0, &cfg).is_err(),
+            "hidden_dim=0 is invalid"
+        );
+        assert!(
+            route_and_combine(&logits, &[0.0; 4], &[0.0; 7], 2, &cfg).is_err(),
+            "expert output shape must match [tokens, experts, hidden_dim]"
         );
     }
 }
