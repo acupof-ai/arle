@@ -1075,30 +1075,40 @@ mod testing {
         }
     }
 
+    /// Echo executor token rule shared by the mock executors: each prefill row
+    /// emits `last_prompt_token + 1` (or `1` when empty) and each decode row emits
+    /// `last_token + 1`. Real backends sample; the mocks just need a deterministic
+    /// monotonically-advancing token so the engine's slot bookkeeping is exercised.
+    fn echo_tokens(plan: &ForwardPlan) -> Vec<SlotToken> {
+        let mut tokens = Vec::new();
+        for row in &plan.prefill_rows {
+            let token = row.tokens.last().copied().map_or(1, |last| last + 1);
+            tokens.push(SlotToken {
+                slot: row.slot,
+                token,
+                logprob: None,
+                finish: None,
+            });
+        }
+        for row in &plan.decode_rows {
+            tokens.push(SlotToken {
+                slot: row.slot,
+                token: row.last_token + 1,
+                logprob: None,
+                finish: None,
+            });
+        }
+        tokens
+    }
+
     impl BackendExecutor for MockExecutor {
         type Inflight = MockInflight;
 
         fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
-            let mut tokens = Vec::new();
-            for row in &plan.prefill_rows {
-                let token = row.tokens.last().copied().map_or(1, |last| last + 1);
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token,
-                    logprob: None,
-                    finish: None,
-                });
-            }
-            for row in &plan.decode_rows {
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token: row.last_token + 1,
-                    logprob: None,
-                    finish: None,
-                });
-            }
             Ok(MockInflight {
-                output: StepOutput { tokens },
+                output: StepOutput {
+                    tokens: echo_tokens(plan),
+                },
                 return_not_ready_once: self.not_ready_once_per_submit,
             })
         }
@@ -1157,26 +1167,10 @@ mod testing {
         type Inflight = MockInflight;
 
         fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
-            let mut tokens = Vec::new();
-            for row in &plan.prefill_rows {
-                let token = row.tokens.last().copied().map_or(1, |last| last + 1);
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token,
-                    logprob: None,
-                    finish: None,
-                });
-            }
-            for row in &plan.decode_rows {
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token: row.last_token + 1,
-                    logprob: None,
-                    finish: None,
-                });
-            }
             Ok(MockInflight {
-                output: StepOutput { tokens },
+                output: StepOutput {
+                    tokens: echo_tokens(plan),
+                },
                 return_not_ready_once: false,
             })
         }
