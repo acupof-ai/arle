@@ -15,6 +15,27 @@ arc (host-route / alloc / D2D / launch) is closed and measured; everything below
 kernel + serving architecture, and the recurring finding is **the best-practice
 piece is often already vendored or config-scaffolded, just unwired.**
 
+### Progress + measured lever-order correction (2026-06-05)
+
+Landed (gated, matched same-load A/B via the resident harness, both orders ×3):
+**#1 FlashMLA +18.03%** (23.67→27.99 tok/s; occupancy ncu precond-failed twice →
+correctness/perf-A/B only, **not default-flippable** yet) → **#2 FP8 fused
+`wqkv_a` +5.07%** (28.0→29.4 tok/s). Cumulative **scalar 23.7 → 29.4 tok/s**.
+
+A fresh full-decode stage profile (gated CUDA-event profiler, ranking-only) **re-
+orders the remaining levers off the original table**: now that attention is fast,
+the biggest slice is the **MoE expert path (DeepGEMM family ≈14.6 ms/token)**, with
+**#4 DP-attn (attn_allreduce 1.05 ms)** and **#5 DeepEP-LL (moe_allreduce 2.34 ms)**
+both *small* — so #4/#5 are deprioritized. A detail probe inside
+`moe_deepgemm_grouped` (11.68 ms) pins the cost on the **padded layout**, not the
+kernel: `dg_unpad 4.50 + dg_pack_quant 3.72 + dg_swiglu_quant 2.03 ≈ 10.2 ms` of
+pack/unpad/materialize vs **only 2.99 ms** for the w13+w2 masked GEMMs. Root cause:
+the decode scratch runs a `32 groups × 128 padded rows` masked layout even at
+B=1/topk=6 where most experts have count=0. **Next lever (in progress): align to
+SGLang's contiguous decode layout** (`ep_scatter → m_indices`, `use_masked_gemm=
+False`) — materialize only the `num_tokens×topk` active rows, killing the ~10 ms
+pack/unpad. The kernel is *not* the lever; the layout is.
+
 ## The adopt-best-first endgame (sequenced)
 
 | # | Lever | Adopt (best existing) | Write (the gap) | Δ target | State |
