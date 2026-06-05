@@ -645,6 +645,44 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
     Ok(())
 }
 
+/// Dense FP8 DeepGEMM (`f8f8bf16`, NT): `d = a @ b^T`, where `a` is a
+/// row-major FP8 activation matrix `[m, k]`, `b` is a row-major FP8 weight
+/// cache `[n, k]`, and `sfa` / `sfb` are FP32 128-block scales.
+///
+/// # Safety
+/// All pointers must be valid on `stream`; `sfa_aligned_m` is the TMA-aligned
+/// leading dimension of the activation scale matrix.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_fp8_gemm_nt(
+    a: RawDevicePtr<u8>,
+    sfa: RawDevicePtr<f32>,
+    b: RawDevicePtr<u8>,
+    sfb: RawDevicePtr<f32>,
+    d: RawDevicePtr<bf16>,
+    m: usize,
+    n: usize,
+    k: usize,
+    sfa_aligned_m: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_fp8_gemm_nt_cuda(
+            a.as_ptr(),
+            sfa.as_ptr(),
+            b.as_ptr(),
+            sfb.as_ptr(),
+            d.as_mut_ptr() as *mut Half,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(sfa_aligned_m)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Fused clamped-SwiGLU over the `[gate | up]` w13 GEMM output + per-128-block
 /// requantize to the FP8 activation the w2 GEMM reads. Wraps
 /// [`ffi::dsv4_deepgemm_swiglu_quantize_w13_cuda`]; `limit` is the SwiGLU clamp.

@@ -611,6 +611,19 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_deepgemm_fp8_gemm_nt_cuda(
+        a: *const u8,
+        sfa: *const f32,
+        b: *const u8,
+        sfb: *const f32,
+        d: *mut Half,
+        m: i32,
+        n: i32,
+        k: i32,
+        sfa_aligned_m: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn q6k_gemv_cuda(
         weight: *const u8,
         input: *const Half,
