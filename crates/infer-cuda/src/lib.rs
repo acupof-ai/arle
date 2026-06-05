@@ -38,6 +38,8 @@ pub mod graph;
 #[cfg(feature = "cuda")]
 mod hc;
 #[cfg(feature = "cuda")]
+mod linear_profile;
+#[cfg(feature = "cuda")]
 mod loader;
 #[cfg(feature = "cuda")]
 mod model;
@@ -67,6 +69,21 @@ pub use executor::set_decode_graph_default;
 #[cfg(feature = "cuda")]
 pub fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
     attention::set_dsv4_flashmla_decode_override(enabled);
+}
+
+#[cfg(feature = "cuda")]
+pub fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
+    attention::set_dsv4_fused_wqkv_decode_override(enabled);
+}
+
+#[cfg(feature = "cuda")]
+pub fn reset_dsv4_linear_profile() {
+    linear_profile::reset();
+}
+
+#[cfg(feature = "cuda")]
+pub fn print_dsv4_linear_profile(tag: &str) {
+    linear_profile::print_rank0(tag);
 }
 
 // Not cuda-gated: env→TpConfig resolution is CPU-testable; only the NCCL comm

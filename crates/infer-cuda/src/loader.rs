@@ -1103,8 +1103,20 @@ impl SafetensorLoader {
             drop(_dg);
             dst
         };
+        let wq_a = self.load_dsv4_block_scaled(ctx, &names.wq_a)?;
+        let wkv = self.load_dsv4_block_scaled(ctx, &names.wkv)?;
+        let wqkv_a_deepgemm = if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
+            Some(
+                cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_pair_rows(
+                    ctx, &wq_a, &wkv,
+                )?,
+            )
+        } else {
+            None
+        };
         Ok(crate::dsv4::Dsv4Attention {
-            wq_a: self.load_dsv4_block_scaled(ctx, &names.wq_a)?,
+            wq_a,
+            wqkv_a_deepgemm,
             q_norm: self.load_dsv4_vec(ctx, &names.q_norm)?,
             wq_b: self.load_dsv4_block_scaled_sharded(
                 ctx,
@@ -1114,7 +1126,7 @@ impl SafetensorLoader {
                     .unwrap_or(Shard::Replicated),
                 tp,
             )?,
-            wkv: self.load_dsv4_block_scaled(ctx, &names.wkv)?,
+            wkv,
             kv_norm: self.load_dsv4_vec(ctx, &names.kv_norm)?,
             wo_a: self.load_dsv4_block_scaled_sharded(
                 ctx,
