@@ -1239,9 +1239,8 @@ If no tool is needed, output exactly NO_TOOL.",
             prompt_token_ids: repair_output.prompt_token_ids,
         }));
     }
-    if repaired.content.trim() == "NO_TOOL" {
-        return Ok(None);
-    }
+    // No tool calls parsed (including an explicit "NO_TOOL" reply): nothing to
+    // repair into, so the turn yields no tool invocation.
     Ok(None)
 }
 
