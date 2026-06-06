@@ -639,6 +639,39 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_deepgemm_paged_mqa_logits_metadata_cuda(
+        context_lens: *const i32,
+        schedule_metadata: *mut i32,
+        batch_size: i32,
+        next_n: i32,
+        block_kv: i32,
+        num_sms: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
+        q: *const u8,
+        kv_cache: *const u8,
+        kv_cache_scales: *const f32,
+        weights: *const f32,
+        context_lens: *const i32,
+        block_table: *const i32,
+        schedule_meta: *const i32,
+        logits: *mut f32,
+        batch_size: i32,
+        next_n: i32,
+        num_heads: i32,
+        head_dim: i32,
+        num_kv_blocks: i32,
+        block_kv: i32,
+        max_context_len: i32,
+        logits_stride: i32,
+        block_table_stride: i32,
+        kv_cache_stride_bytes: i32,
+        num_sms: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn q6k_gemv_cuda(
         weight: *const u8,
         input: *const Half,

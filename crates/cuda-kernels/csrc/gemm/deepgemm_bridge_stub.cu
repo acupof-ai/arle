@@ -49,4 +49,39 @@ extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
     CUstream) {
   return CUDA_ERROR_NOT_SUPPORTED;
 }
+
+extern "C" CUresult dsv4_deepgemm_paged_mqa_logits_metadata_cuda(
+    const int*,
+    int*,
+    int,
+    int,
+    int,
+    int,
+    CUstream) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+extern "C" CUresult dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
+    const unsigned char*,
+    const unsigned char*,
+    const float*,
+    const float*,
+    const int*,
+    const int*,
+    const int*,
+    float*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    CUstream) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
 #endif
