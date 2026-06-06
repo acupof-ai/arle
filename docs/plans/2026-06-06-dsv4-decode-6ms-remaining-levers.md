@@ -13,6 +13,25 @@ decode-window profile** (8-tok prompt + 64 steps, prefill diluted; fused-wqkv ON
 | 3 | `dsv4_mhc_params` | 12.2% | mhc-fuse (parked f32-mma) |
 | — | FlashMLA fwd, KV pack | small | already optimal (vendored) |
 
+## Lever 1 decomposition (UPDATE 2026-06-06 — source-verified, §0 confounder)
+
+The "comm 32.4%" is **not one lever** — and it is profiled on the **allreduce MoE
+backend** (`dsv4_use_deepep_transport` defaults to `allreduce`, dsv4.rs:1898; the
+only debug-runnable lane). Breakdown of where the two NCCL kernels come from:
+
+| NCCL kernel | %decode | source | nature |
+|---|---|---|---|
+| `ncclAllReduce` | 16.4% | MoE all-reduce (`needs_moe_allreduce = !use_deepep`, dsv4.rs:1125) **+** TP attention all-reduce | the MoE half is a **backend artifact** — native-DeepEP replaces it with dispatch/combine (different cost). Re-profile on `ARLE_DSV4_MOE_TRANSPORT=deepep` before sizing this. |
+| `ncclAllGather` | 16.0% | **FlashMLA decode Q all-gather** (attention.rs:2572-2607, `dsv4/flashmla_q_allgather` + `dsv4_tp_q_repack`) | ARLE shards Q heads across TP but MLA's KV latent is replicated, so it all-gathers local Q → full Q for FlashMLA. **Open: does SGLang's MLA-TP / DP-attention avoid this?** Concrete, NVTX-marked, possibly-avoidable 16%. |
+
+**Consequence for prioritization:** do NOT license a generic "RING→one-shot
+all-reduce" lever off the 32.4% number. First (a) re-profile decode on native-DeepEP
+(`ARLE_DSV4_MOE_TRANSPORT=deepep`) to get the production comm cost — the MoE-AR half
+likely shrinks; then (b) the **FlashMLA Q all-gather (16%)** is the largest single
+*concrete* comm cost and is an operator-layout question vs SGLang (DP-attention?),
+investigate it on its own. The §5.1 multi-stream overlap below still applies to the
+attention-prepare chain regardless.
+
 ## Lever 1 — comm overlap (32.4%, the dominant lever) — DELICATE, focused effort
 
 **Why it's not a quick edit:** `dsv4_shared_expert_forward` (`moe.rs:1725`) is

@@ -51,6 +51,21 @@ DSv4 layers select similar compressed blocks → reuse the selection every N lay
 shrinks by ~the reuse factor. Higher-risk than #1 (correctness of the reuse) —
 do it second, validate the selection-reuse doesn't degrade the needle.
 
+**UPDATE 2026-06-06 (source-verified — reuse is LOSSY for DSv4, gate it empirically
+FIRST):** DSv4 indexers are **per-layer with distinct weights**
+(`layers.{N}.attn.indexer.compressor.*`, deepseek-spec/v4.rs:715,1163), and
+csa_select runs on **CSA layers only** (HCA has a compressor but no indexer,
+dsv4.rs:138). So each CSA layer computes its OWN top-512 from its OWN indexer query
++ keys — cross-layer reuse is NOT exact, it's an approximation whose validity is a
+per-model empirical property (how much do consecutive CSA layers' top-512 selections
+actually overlap?). **Before any implementation, run the cheap license-or-kill
+diagnostic:** dump layer-N and layer-(N+1) top-k index sets on a real prompt, compute
+Jaccard overlap across consecutive CSA layers. High overlap (≥~90%) → reuse-every-2
+is safe; low → KILL (reuse degrades retrieval). This is a read-only index dump, not a
+kernel change. Also verify the actual SGLang `skip_topk` condition (which layers it
+sets True for — all CSA, or only a shared-indexer subset?) before mirroring it; the
+plan-doc paraphrase is hypothesis-grade.
+
 ## Lever #3 (HARD, deferred) — hybrid_attention 31.3%
 
 The CSA/HCA attention math. FlashMLA-prefill was KILLED (+36% — the prepare-chain
