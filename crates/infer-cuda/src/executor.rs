@@ -696,7 +696,7 @@ impl Dsv4CudaExecutor {
             .ok_or_else(|| anyhow::anyhow!("DSv4 MTP decode missing previous hidden"))?
             .clone();
 
-        let draft_position = start_pos.saturating_add(1) as u64;
+        let draft_position = start_pos as u64;
         let draft = self.model.mtp_forward(&hidden, pending, draft_position)?;
         let (argmax, mut hiddens) = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],

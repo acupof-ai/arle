@@ -14,9 +14,10 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail, ensure};
+use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::{CudaPipelineStreamKind, Dsv4Fp8DeepGemmWeightCache};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config, DeepSeekV4MoeRoutingKind};
 use infer_moe::MoeConfig;
 use infer_plan::SamplingParams;
@@ -788,7 +789,8 @@ impl Dsv4Model {
         params: &SamplingParams,
         position: u64,
     ) -> Result<(u32, DeviceVec)> {
-        let mut last_hidden = DeviceVec::zeros(&self.ctx, self.config.hidden_size)?;
+        let mut last_hidden =
+            DeviceVec::zeros(&self.ctx, self.config.hidden_size * self.config.hc_mult)?;
         let token = self.forward_tokens_impl(
             slot,
             tokens,
@@ -823,12 +825,15 @@ impl Dsv4Model {
         }
 
         let (stream, mut keepalive) = self.forward_tokens_stream_impl(slot, tokens, start_pos)?;
+        if let Some(out) = last_hidden_out.as_deref_mut() {
+            self.capture_mtp_stream_hidden(&stream, seq_len - 1, out, &mut keepalive)?;
+        }
         let token = self.forward_stream_last_token(
             &stream,
             seq_len,
             params,
             position,
-            last_hidden_out.as_deref_mut(),
+            None,
             &mut keepalive,
         )?;
         std::hint::black_box(keepalive.len());
@@ -856,13 +861,15 @@ impl Dsv4Model {
             let row_position = position + row as u64;
             let (stream, mut keepalive) =
                 self.forward_tokens_stream_impl(slot, &[token_id], row_start)?;
-            let mut row_hidden = DeviceVec::zeros(&self.ctx, self.config.hidden_size)?;
+            let mut row_hidden =
+                DeviceVec::zeros(&self.ctx, self.config.hidden_size * self.config.hc_mult)?;
+            self.capture_mtp_stream_hidden(&stream, 0, &mut row_hidden, &mut keepalive)?;
             let token = self.forward_stream_last_token(
                 &stream,
                 1,
                 &params,
                 row_position,
-                Some(&mut row_hidden),
+                None,
                 &mut keepalive,
             )?;
             argmax_tokens.push(token);
@@ -880,6 +887,31 @@ impl Dsv4Model {
             }
         }
         Ok((argmax_tokens, hiddens))
+    }
+
+    fn capture_mtp_stream_hidden(
+        &self,
+        stream: &HiddenStates,
+        row: usize,
+        out: &mut DeviceVec,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<()> {
+        let stream_dim = self.config.hidden_size * self.config.hc_mult;
+        ensure!(
+            stream.hidden_dim == stream_dim,
+            "DSv4 MTP hidden source stream dim {} != hidden_size {} * hc_mult {}",
+            stream.hidden_dim,
+            self.config.hidden_size,
+            self.config.hc_mult
+        );
+        ensure!(
+            out.len == stream_dim,
+            "DSv4 MTP hidden capture len {} != stream_dim {stream_dim}",
+            out.len
+        );
+        crate::ops::copy_row_to_vec(&self.ctx, stream, row, out)?;
+        keepalive.keep_vec(out);
+        Ok(())
     }
 
     fn forward_stream_last_token(
@@ -1288,11 +1320,13 @@ impl Dsv4Model {
             .mtp
             .as_ref()
             .ok_or_else(|| anyhow!("ARLE_DSV4_SPEC_DECODE=1 but DSv4 MTP head is not loaded"))?;
+        let stream_dim = self.config.hidden_size * self.config.hc_mult;
         ensure!(
-            h_prev.len == self.config.hidden_size,
-            "DSv4 MTP h_prev len {} != hidden_size {}",
+            h_prev.len == stream_dim,
+            "DSv4 MTP h_prev len {} != hidden_size {} * hc_mult {}",
             h_prev.len,
-            self.config.hidden_size
+            self.config.hidden_size,
+            self.config.hc_mult
         );
 
         // The Phase-1 MTP probe must not write through the base FlashMLA decode
@@ -1323,27 +1357,39 @@ impl Dsv4Model {
         let mut e_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
         crate::attention::dsv4_linear(ctx, &mtp.e_proj, &emb_normed, &mut e_proj)?;
 
-        let mut h_prev_batch = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+        let mut h_prev_batch = unsafe { HiddenStates::uninit(ctx, hidden_size, hc_mult)? };
         ctx.stream
             .memcpy_dtod(&h_prev.data, &mut h_prev_batch.data)
             .map_err(|e| anyhow!("DSv4 MTP h_prev D2D batch copy failed: {e}"))?;
-        let mut h_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+        let mut h_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, hc_mult)? };
         crate::ops::rms_norm_batch(ctx, &h_prev_batch, &mtp.hnorm, eps, &mut h_normed)?;
-        let mut h_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+        let mut h_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, hc_mult)? };
         crate::attention::dsv4_linear(ctx, &mtp.h_proj, &h_normed, &mut h_proj)?;
 
-        let mut combined = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
-        crate::ops::add_batch(ctx, &e_proj, &h_proj, &mut combined)?;
+        let h_proj_stream = HiddenStates {
+            data: h_proj.data,
+            hidden_dim: hidden_size * hc_mult,
+            seq_len: 1,
+        };
         let mut stream = unsafe { HiddenStates::uninit(ctx, hidden_size * hc_mult, 1)? };
-        crate::hc::initial_stream_from_embeddings(
-            ctx,
-            &combined,
-            hidden_size,
-            hc_mult,
-            &mut stream,
-        )?;
+        {
+            let (e_ptr, _ge) = e_proj.data.device_ptr(&ctx.stream);
+            let (h_ptr, _gh) = h_proj_stream.data.device_ptr(&ctx.stream);
+            let (out_ptr, _go) = stream.data.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_mtp_add_eproj_hproj_cuda(
+                    e_ptr as *const ffi::Half,
+                    h_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    hidden_size as i32,
+                    hc_mult as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
 
-        let stream = self.run_mtp_transformer_layer(mtp, stream, next_token)?;
+        let stream = self.run_mtp_transformer_layer(mtp, stream, next_token, position as usize)?;
 
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
         crate::hc::head_hidden_from_stream(
@@ -1366,6 +1412,7 @@ impl Dsv4Model {
         mtp: &Dsv4MtpLayer,
         stream: HiddenStates,
         token: u32,
+        start_pos: usize,
     ) -> Result<HiddenStates> {
         let layer = &mtp.layer;
         let ctx = &self.ctx;
@@ -1374,10 +1421,9 @@ impl Dsv4Model {
         let stream_dim = hidden_size * hc_mult;
         let eps = self.config.rms_norm_eps;
         let seq_len = 1;
-        let start_pos = 0;
         let start_pos_device = ctx
             .stream
-            .clone_htod(&[0_i32])
+            .clone_htod(&[start_pos as i32])
             .map_err(|e| anyhow!("DSv4 MTP start_pos H2D failed: {e}"))?;
         let local_width = layer.attention.wq_b.rows;
         ensure!(
