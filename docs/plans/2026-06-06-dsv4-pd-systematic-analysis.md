@@ -102,14 +102,25 @@ the GPU) — massively under-parallelized. The exact-skip `if (available <= topk
 = 1024 > index_topk = 512`, so the full scoring+sort path runs. (index_topk=512; CSA-layer
 compress_ratio per the config — Codex confirming the real per-layer value.)
 
-**Lever ranking for csa_select:**
-1. **EXACT, SGLang-aligned (preferred):** split the kernel into (a) a parallelized scoring
-   GEMM `query · block-keys` spread across SMs (like SGLang `fp8_paged_mqa_logits`) + (b) a
-   separate top-k kernel. Removes the 1-SM bottleneck losslessly. The right "算子接入好用好"
-   alignment with SGLang's indexer.
-2. **Lossy fallback (E2):** cross-layer top-k reuse (SGLang `skip_topk`), gated on
-   consecutive-CSA-layer Jaccard overlap (Codex measuring). Only if (1) is too costly.
-3. Already done: the exact `available<=topk` skip (helps high-ratio / low-context).
+**Lever ranking for csa_select — LICENSED 2026-06-06 (Codex):**
+- **Cheap levers BOTH KILLED at 4096:** exact-skip (`available<=topk`) is already in the kernel
+  but only fires through abs_pos≤2051 (compress_ratio=4, index_topk=512 → pruning starts at
+  2052; at 4096 available=1024>512). Cross-layer reuse (E2) **killed** — adjacent CSA-layer
+  top-k Jaccard mean **0.53** (min 0.32 / max 0.79), far below ~90%; reuse degrades retrieval.
+- **ONLY licensed lever — optimize the kernel itself (EXACT, SGLang-aligned):** the decode
+  csa_select degenerates to **1 CUDA block = 1 SM at B=1** (`token=blockIdx.x`, num_tokens=1),
+  doing scoring (1024 blocks × 8 local-heads × 128 dim ≈ 1M dot-terms/layer) + bitonic sort on
+  one SM. Rewrite the **decode path** to parallelize over candidate-block tiles ACROSS CUDA
+  blocks/SMs (a scoring pass spread over SMs, like SGLang `fp8_paged_mqa_logits`, + a cross-block
+  top-k merge). Produces the identical top-512 (gate: needle + selected-index parity vs the
+  current kernel + decode-ms A/B). Prefill already parallelizes over tokens, so this is a
+  decode-specialized kernel. **ncu-profile first** to confirm the B=1 stall (occupancy / memory
+  latency / barriers) and target the rewrite (§0 — license a kernel rewrite with a profile).
+
+**Clean SLO-shape truth (no-osrt re-measure):** 4096 steady decode = **137.4 ms/token** (not
+26.6ms — that was short-context; csa_select scaling is the 5× gap). The 6ms goal at 4096 is 23×
+off; csa_select is the first wall. (DSv4 c=2 decode currently ERRORS — "graph-safe local routed
+output requires DeepGEMM device-count experts" — #38 confirmed broken.)
 
 ## 3.9 (superseded) Earlier open questions the trace answered
 
