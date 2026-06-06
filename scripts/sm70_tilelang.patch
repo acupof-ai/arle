@@ -1,5 +1,5 @@
 diff --git a/src/cuda/op/gemm.cc b/src/cuda/op/gemm.cc
-index d23fac73..c29c1348 100644
+index d23fac73..8e6bccac 100644
 --- a/src/cuda/op/gemm.cc
 +++ b/src/cuda/op/gemm.cc
 @@ -31,6 +31,7 @@ namespace cuda {
@@ -10,7 +10,7 @@ index d23fac73..c29c1348 100644
  constexpr const char *kCudaWGMMA = "cuda.wgmma";
  constexpr const char *kCudaTCGEN05 = "cuda.tcgen05";
  
-@@ -94,6 +95,23 @@ bool AllowWgmma(const GemmNode &op, int block_size, Target target) {
+@@ -94,6 +95,26 @@ bool AllowWgmma(const GemmNode &op, int block_size, Target target) {
           CheckWgmma(op);
  }
  
@@ -18,6 +18,9 @@ index d23fac73..c29c1348 100644
 +  bool scope_ok = (IsSharedBuffer(op.a_) || IsFragmentBuffer(op.a_)) &&
 +                  IsSharedBuffer(op.b_);
 +  if (!scope_ok) {
++    return false;
++  }
++  if (op.transA_) {
 +    return false;
 +  }
 +  if (op.a_->dtype != DataType::Float(16) ||
@@ -34,7 +37,7 @@ index d23fac73..c29c1348 100644
  void FatalWgmmaUnavailable(const GemmNode &op, Target target) {
    LOG(FATAL) << "T.wgmma_gemm() requires Hopper WGMMA lowering, but "
                  "constraints were not satisfied. Got target="
-@@ -283,6 +301,9 @@ struct Gemm {
+@@ -283,6 +304,9 @@ struct Gemm {
      if (AllowWgmma(op, block_size, target)) {
        return kCudaWGMMA;
      }
@@ -44,7 +47,7 @@ index d23fac73..c29c1348 100644
      return kCudaMMA;
    }
  
-@@ -298,6 +319,11 @@ struct Gemm {
+@@ -298,6 +322,11 @@ struct Gemm {
      if (gemm_inst == kCudaWGMMA) {
        return ComputeWgmmaWarpPartition(policy, M, N, num_warps);
      }
@@ -56,7 +59,7 @@ index d23fac73..c29c1348 100644
      int k_n_per_warp = TargetIsVolta(target) ? 16 : 8;
      return ComputeDefaultWarpPartition(policy, M, N, num_warps, k_n_per_warp);
    }
-@@ -316,6 +342,9 @@ struct Gemm {
+@@ -316,6 +345,9 @@ struct Gemm {
      if (gemm_inst == kCudaMMA) {
        return "mma";
      }
@@ -142,10 +145,10 @@ index 00000000..bef2f331
 +    tilelang.testing.torch_assert_close(c, ref, rtol=1e-2, atol=1e-2, max_mismatched_ratio=0.01)
 diff --git a/testing/python/kernel/test_tilelang_kernel_sm70_gemm_fma.py b/testing/python/kernel/test_tilelang_kernel_sm70_gemm_fma.py
 new file mode 100644
-index 00000000..18f83b60
+index 00000000..065672e2
 --- /dev/null
 +++ b/testing/python/kernel/test_tilelang_kernel_sm70_gemm_fma.py
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,125 @@
 +import torch
 +
 +import tilelang
@@ -202,6 +205,27 @@ index 00000000..18f83b60
 +    return main
 +
 +
++def _make_fp16_transposed_a_ss_gemm():
++    @T.prim_func
++    def main(
++        A: T.Tensor((16, 64), T.float16),
++        B: T.Tensor((16, 16), T.float16),
++        C: T.Tensor((64, 16), T.float32),
++    ):
++        with T.Kernel(1, threads=128):
++            A_shared = T.alloc_shared((16, 64), T.float16)
++            B_shared = T.alloc_shared((16, 16), T.float16)
++            C_local = T.alloc_fragment((64, 16), T.float32)
++
++            T.copy(A, A_shared)
++            T.copy(B, B_shared)
++            T.clear(C_local)
++            T.gemm(A_shared, B_shared, C_local, transpose_A=True, policy=T.GemmWarpPolicy.FullRow)
++            T.copy(C_local, C)
++
++    return main
++
++
 +@tilelang.testing.requires_cuda
 +@tilelang.testing.requires_cuda_compute_version_eq(7, 0)
 +def test_sm70_bf16_ss_gemm_uses_fma_fallback():
@@ -231,6 +255,21 @@ index 00000000..18f83b60
 +    ref = p.float() @ b.float()
 +
 +    tilelang.testing.torch_assert_close(c, ref, rtol=2e-2, atol=2e-2, max_mismatched_ratio=0.01)
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version_eq(7, 0)
++def test_sm70_fp16_transposed_a_uses_fma_fallback():
++    kernel = tilelang.compile(_make_fp16_transposed_a_ss_gemm(), target="cuda", out_idx=[2])
++    source = kernel.get_kernel_source()
++    assert "mma_sync_sm70" not in source
++
++    a = torch.randn((16, 64), device="cuda", dtype=torch.float16) * 0.25
++    b = torch.randn((16, 16), device="cuda", dtype=torch.float16) * 0.25
++    c = kernel(a, b)
++    ref = a.t().float() @ b.float()
++
++    tilelang.testing.torch_assert_close(c, ref, rtol=1e-2, atol=1e-2, max_mismatched_ratio=0.01)
 +
 +
 +if __name__ == "__main__":
