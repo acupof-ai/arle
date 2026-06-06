@@ -38,6 +38,37 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
 
 ---
 
+## §0.1 拆细到实现级 — 抽丝剥茧,事无巨细
+
+难/复杂的任务**不要被难度吓住**:抽丝剥茧拆成原子任务 → 画依赖 DAG(谁 block 谁)
+→ 算 critical path + 预算。粒度够细,方案自然就出来了。
+
+- **细到实现级,不是原则级。** "预分配、别拷大 buffer" 是原则不是 spec;要到精确的
+  buffer / 尺寸 / 调用点 / 前置条件。**Claude 出行级 spec,executor 照抄**——自由发挥
+  会漏字段(实证:DSv4 rollback snapshot 第一版漏了 `sw_window` + `fp8_kv_pool` 两个 buffer)。
+- **状态变更必枚举每个 mutated buffer,逐个证明。** rollback / cache / scratch / fusion /
+  quant 都算:列出操作写的**每一个** device buffer,对每个给出处置 + **精确前置条件**,
+  不靠"应该自愈":① 被现有路径回滚(指名);② 自愈(写出前置——如环形 buffer 的投机写
+  **仅** seq_len < ring_size 自愈,超过则别名活跃 slot);③ 必须 snapshot/restore。
+  完整枚举才能暴露 partial-fix 漏掉的 gap。
+- **速度内联进正确性。** 预分配一次复用(禁 per-step alloc —— churn + disabled-event-
+  tracking premature-free);最小粒度拷(环只动一个 slot → 只存那一个 slot,不是整环);
+  整段塞进 opt-in 路径,default baseline byte-for-byte 不变,A/B 实测 baseline tok/s 不退。
+- **正确推理 ≠ 基线一致。** spec-decode / quant / kernel-swap 的 gate 是**正确推理**
+  (needle 取回 + same-config-twice 非确定性地板 + 自洽:新 kernel 自回归输出才是参照),
+  **不是** token-exact-vs-baseline(被 MoE run-to-run 非确定性 confound)。退化(循环)
+  prompt 不是有效测例。
+- **在干净基线上 root-cause。** 下一个 fix 的详设不在被 confound 的基线上做;先落地 +
+  隔离前置(broken s_q=K 跑在带 rollback bug 的基线上,垃圾被 confound,在脏基线细化即自欺)。
+
+实证 anchor:
+- **DSv4 EAGLE rollback** (2026-06-06):`truncate_decode_len` 只还原 `compressed.seq_len`,
+  漏 `pending_kv`/`prev_overlap` → draft 撞压缩边界损坏;完整枚举才发现还漏 `sw_window` +
+  `fp8_kv_pool` 环 slot(自愈仅 seq_len < sliding_window)。曾拿 byte-identity 当 EAGLE gate
+  (违反自己的 MoE-非确定性 memory),把可能的非确定性误判成 bug。
+
+---
+
 ## Project shape
 
 `ARLE` is a Rust-native inference runtime with integrated local
