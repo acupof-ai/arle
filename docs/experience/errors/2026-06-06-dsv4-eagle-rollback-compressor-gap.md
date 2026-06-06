@@ -54,12 +54,16 @@ immediately.
 
 ## Fix
 
-- **Not yet fixed.** EAGLE-on-DSv4 is BLOCKED on correct rollback of the
-  compressed-attention state. The fix is snapshot/restore (or
-  defer-ingestion-until-accept) of the DSv4 compressor running-state across the
-  speculative verify — a Codex `snapshot/restore` attempt this session was
-  incomplete and reverted. Tranche-1 code stays committed (`625a4f06`) but
-  default-off and marked broken in its wins entry; nothing regresses.
+- **FIXED (2026-06-06, same day).** Complete snapshot/restore of the full mutated
+  state — see [`wins/2026-06-06-dsv4-eagle-rollback-fix-correct.md`](../wins/2026-06-06-dsv4-eagle-rollback-fix-correct.md).
+  The §0.1 mutated-buffer enumeration surfaced what the partial fix missed:
+  compressor + indexer running buffers (4 small fields each, NOT `compressed.data`)
+  + `sw_window_cache` one ring slot + FlashMLA `fp8_kv_pool` SW one ring slot
+  (split token-data/scale) + the `fp8_kv_comp_packed_rows` scalar. Pre-allocated,
+  spec-path-only, single-slot (`O(head_dim)`). Mechanism dump confirmed the bug was
+  real; correct-inference gate (needle short seq<W AND long seq≥W + same-twice
+  floor) PASSES. Spec decode is now CORRECT but still −32% (per-token verify);
+  **A2 (s_q=K) is the amortization.**
 - **Tranche 2** s_q=K glue needs the per-query index/mask build fixed against the
   decode KV coord space before it can be numerically valid (and only then is it a
   perf candidate).

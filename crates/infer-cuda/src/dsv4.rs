@@ -235,6 +235,7 @@ pub(crate) struct Dsv4Model {
 
 pub(crate) struct Dsv4SlotState {
     attention: Vec<crate::attention::Dsv4LayerAttentionState>,
+    spec_rollback: Option<Vec<crate::attention::Dsv4LayerAttentionSnapshot>>,
     moe_decode_scratch: Vec<crate::moe::Dsv4MoeDecodeScratch>,
     start_pos_device: CudaSlice<i32>,
     decode_graph: Option<Dsv4DecodeGraphScratch>,
@@ -493,6 +494,19 @@ impl Dsv4SlotState {
                 &layer.moe,
             )?);
         }
+        let spec_rollback = if dsv4_spec_decode_enabled() {
+            let mut snapshots = Vec::with_capacity(attention.len());
+            for state in &attention {
+                snapshots.push(state.rollback_snapshot(
+                    &model.ctx,
+                    &model.config,
+                    &model.kv_arena,
+                )?);
+            }
+            Some(snapshots)
+        } else {
+            None
+        };
         let start_pos_device = model
             .ctx
             .stream
@@ -500,6 +514,7 @@ impl Dsv4SlotState {
             .map_err(|e| anyhow!("DSv4 slot start_pos device scalar alloc failed: {e}"))?;
         Ok(Self {
             attention,
+            spec_rollback,
             moe_decode_scratch,
             start_pos_device,
             decode_graph: None,
@@ -519,6 +534,48 @@ impl Dsv4SlotState {
             .map_err(|e| anyhow!("DSv4 slot start_pos reset failed: {e}"))?;
         for layer in &mut self.attention {
             layer.reset(ctx)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capture_spec_rollback(
+        &mut self,
+        ctx: &DeviceContext,
+        draft_abs_pos: usize,
+    ) -> Result<()> {
+        let snapshots = self
+            .spec_rollback
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 spec rollback snapshot not allocated"))?;
+        ensure!(
+            self.attention.len() == snapshots.len(),
+            "DSv4 rollback snapshot layer count {} != attention states {}",
+            snapshots.len(),
+            self.attention.len()
+        );
+        for (state, snapshot) in self.attention.iter().zip(snapshots) {
+            state.capture_rollback_snapshot(ctx, snapshot, draft_abs_pos)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_spec_rollback(
+        &mut self,
+        ctx: &DeviceContext,
+        draft_abs_pos: usize,
+    ) -> Result<()> {
+        let snapshots = self
+            .spec_rollback
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 spec rollback snapshot not allocated"))?;
+        ensure!(
+            self.attention.len() == snapshots.len(),
+            "DSv4 rollback restore layer count {} != attention states {}",
+            snapshots.len(),
+            self.attention.len()
+        );
+        for (state, snapshot) in self.attention.iter_mut().zip(snapshots) {
+            state.restore_rollback_snapshot(ctx, snapshot, draft_abs_pos)?;
         }
         Ok(())
     }
@@ -687,6 +744,22 @@ impl Dsv4Model {
         slot.truncate(&self.layers, new_len)
     }
 
+    pub(crate) fn dump_mtp_rollback_state(
+        &self,
+        slot: &Dsv4SlotState,
+        label: &str,
+        abs_len: usize,
+    ) -> Result<()> {
+        let layer_idx = std::env::var("ARLE_DSV4_MTP_ROLLBACK_DUMP_LAYER")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        if layer_idx >= slot.attention.len() {
+            return Ok(());
+        }
+        slot.attention[layer_idx].dump_mtp_rollback_state(&self.ctx, layer_idx, label, abs_len)
+    }
+
     /// Forward one prefill/decode step over `tokens` starting at `start_pos`,
     /// returning the next greedy/sampled token.
     ///
@@ -796,6 +869,15 @@ impl Dsv4Model {
             hiddens.push(row_hidden);
             std::hint::black_box(keepalive.len());
             drop(keepalive);
+            if tokens.len() == 2 && row == 0 {
+                let draft_abs_pos = row_start + 1;
+                self.dump_mtp_rollback_state(
+                    slot,
+                    "spec_after_pending_before_draft",
+                    draft_abs_pos,
+                )?;
+                slot.capture_spec_rollback(&self.ctx, draft_abs_pos)?;
+            }
         }
         Ok((argmax_tokens, hiddens))
     }
