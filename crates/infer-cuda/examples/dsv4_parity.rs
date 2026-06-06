@@ -76,7 +76,7 @@ mod real {
     };
     use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
     use infer_seam::{BackendExecutor, KvPool, PollResult};
-    use std::time::Instant;
+    use std::{path::Path, time::Instant};
 
     /// Default prompt: "The capital of France is" in the **DeepSeek-V4** tokenizer
     /// (vocab 128000). These ids match the captured oracle, whose tokens 3-7 are
@@ -184,15 +184,18 @@ mod real {
     fn parity_forward() -> Result<()> {
         let model_path = std::env::var("INFER_DSV4_MODEL_PATH")
             .context("INFER_DSV4_MODEL_PATH must point at the DSv4 FP8 safetensors directory")?;
-        let prompt = parse_prompt_ids(
-            &std::env::var("INFER_DSV4_PROMPT_IDS")
-                .unwrap_or_else(|_| DEFAULT_PROMPT_IDS.to_string()),
-        )?;
+        let prompts = load_prompt_cases()?;
+        let prompt = prompts
+            .first()
+            .context("DSv4 parity prompt list resolved empty")?;
         let max_new: usize = std::env::var("INFER_DSV4_MAX_NEW")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MAX_NEW);
-        anyhow::ensure!(!prompt.is_empty(), "INFER_DSV4_PROMPT_IDS resolved empty");
+        anyhow::ensure!(
+            prompts.iter().all(|p| !p.is_empty()),
+            "DSv4 parity prompt list contains an empty prompt"
+        );
         anyhow::ensure!(max_new >= 1, "INFER_DSV4_MAX_NEW must be >= 1");
 
         let rank: usize = std::env::var("INFER_TP_RANK")
@@ -201,11 +204,13 @@ mod real {
             .unwrap_or(0);
         let prompt_head: Vec<u32> = prompt.iter().copied().take(16).collect();
         eprintln!(
-            "[dsv4-parity rank={rank}] model={model_path} prompt_len={} \
-             prompt_head={prompt_head:?} max_new={max_new}",
+            "[dsv4-parity rank={rank}] model={model_path} cases={} first_prompt_len={} \
+             first_prompt_head={prompt_head:?} max_new={max_new}",
+            prompts.len(),
             prompt.len()
         );
-        let slot_max_seq_len = configure_slot_max_seq_len(prompt.len(), max_new, rank)?;
+        let max_prompt_len = prompts.iter().map(Vec::len).max().unwrap_or(0);
+        let slot_max_seq_len = configure_slot_max_seq_len(max_prompt_len, max_new, rank)?;
 
         // Multi-rank NCCL bootstrap: file-rendezvous BEFORE building the executor
         // (the loader's TP runtime calls ncclCommInitRank during construction).
@@ -220,12 +225,46 @@ mod real {
         let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, DSV4_PARITY_NUM_SLOTS)
             .context("from_dsv4_fp8_safetensors failed (build/config?)")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
-        let mut kv = CudaKvPool::new(1, 1, 16);
         if env_flag("INFER_DSV4_MTP_STEP_A_SELFTEST") {
             exec.dsv4_verify_forward_selftest(&prompt)
                 .context("DSv4 MTP Step A verify-forward selftest failed")?;
         }
 
+        for (case_idx, prompt) in prompts.iter().enumerate() {
+            let mut kv = CudaKvPool::new(1, 1, 16);
+            run_prompt_case(
+                &mut exec,
+                &mut kv,
+                prompt,
+                max_new,
+                load_ms,
+                slot_max_seq_len,
+                rank,
+                case_idx,
+                prompts.len(),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_prompt_case(
+        mut exec: &mut CudaExecutor,
+        mut kv: &mut CudaKvPool,
+        prompt: &[u32],
+        max_new: usize,
+        load_ms: f64,
+        slot_max_seq_len: usize,
+        rank: usize,
+        case_idx: usize,
+        case_count: usize,
+    ) -> Result<()> {
+        let prompt_head: Vec<u32> = prompt.iter().copied().take(16).collect();
+        eprintln!(
+            "[dsv4-parity rank={rank}] case={case_idx}/{case_count} prompt_len={} \
+             prompt_head={prompt_head:?}",
+            prompt.len()
+        );
         // ── Step 1: full-prefix prefill at start_pos = 0 → the first token.
         let chunk1_prompt = matches!(
             std::env::var("INFER_DSV4_PROMPT_CHUNK1").as_deref(),
@@ -299,7 +338,13 @@ mod real {
             cuda_profiler_stop().context("cudaProfilerStop after DSv4 decode loop failed")?;
         }
 
-        println!("clean_tokens={clean_tokens:?}");
+        if case_count == 1 {
+            println!("clean_tokens={clean_tokens:?}");
+        }
+        println!(
+            "case_result index={case_idx} prompt_len={} clean_tokens={clean_tokens:?}",
+            prompt.len()
+        );
         let decode_steps = clean_tokens.len().saturating_sub(1);
         if rank == 0 {
             let decode_tok_s = if decode_ms > 0.0 {
@@ -308,9 +353,10 @@ mod real {
                 0.0
             };
             eprintln!(
-                "[dsv4-parity timing rank=0] prompt_tokens={} max_new={} load_ms={:.3} \
+                "[dsv4-parity timing rank=0] case={} prompt_tokens={} max_new={} load_ms={:.3} \
                  prefill_ms={:.3} decode_steps={} decode_ms={:.3} decode_tok_s={:.3} \
                  slot_max_seq_len={slot_max_seq_len}",
+                case_idx,
                 prompt.len(),
                 max_new,
                 load_ms,
@@ -447,6 +493,33 @@ mod real {
 
     fn greedy() -> SamplingParams {
         SamplingParams::default() // temperature 0.0 → greedy argmax
+    }
+
+    fn load_prompt_cases() -> Result<Vec<Vec<u32>>> {
+        if let Ok(path) = std::env::var("INFER_DSV4_PROMPT_IDS_LIST_FILE") {
+            let text = std::fs::read_to_string(Path::new(&path))
+                .with_context(|| format!("read INFER_DSV4_PROMPT_IDS_LIST_FILE={path}"))?;
+            let mut prompts = Vec::new();
+            for (line_idx, raw) in text.lines().enumerate() {
+                let line = raw.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                prompts.push(
+                    parse_prompt_ids(line)
+                        .with_context(|| format!("parse prompt ids at {path}:{}", line_idx + 1))?,
+                );
+            }
+            anyhow::ensure!(
+                !prompts.is_empty(),
+                "INFER_DSV4_PROMPT_IDS_LIST_FILE={path} contained no prompts"
+            );
+            return Ok(prompts);
+        }
+        Ok(vec![parse_prompt_ids(
+            &std::env::var("INFER_DSV4_PROMPT_IDS")
+                .unwrap_or_else(|_| DEFAULT_PROMPT_IDS.to_string()),
+        )?])
     }
 
     fn parse_prompt_ids(s: &str) -> Result<Vec<u32>> {
