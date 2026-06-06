@@ -25,6 +25,14 @@ a win** on any measurement so far.
    **MTP draft quality** (the `mtp.0` head forward, the depth-4 chain drafting,
    num_draft/topk tuning) needs investigation — fixing the verify kernel won't help
    if the draft is wrong.
+   - **UPDATE 2026-06-06 (env-gated draft-vs-actual dump, executor.rs):** the
+     **depth-1 head is GOOD — 96.875% (31/32)** on a deterministic 64-token greedy
+     loop (only mismatch step=3). So the `mtp.0` head forward + the basic
+     `mtp_forward` formula are NOT the blocker. The ~20-40% acceptance collapse is
+     in the **multi-draft chain feedback (num_draft=4)**, not depth-1 — if MTP perf
+     is ever un-parked, look at the chain drafting / KV-feedback path between draft
+     steps, not the head. (MTP is parked per the single-request-fundamentals reset;
+     this just closes the dangling "draft quality" question.)
 2. **Every test workload is degenerate under greedy.** The dsv4_parity harness feeds
    raw token IDs (no chat template); greedy decoding loops/degenerates on real
    prompts (Natalia GSM8K loops even spec-OFF), so the acceptance numbers are
