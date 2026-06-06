@@ -1,5 +1,17 @@
 # DSv4 EAGLE s_q=K verify KILLED — compressed attention makes the K-token verify both non-equivalent to autoregressive AND non-amortizing
 
+> **⚠️ CORRECTION 2026-06-06 (same day): this "fundamental" conclusion was WRONG.**
+> The divergence + slowdown were artifacts of MY implementation (I re-ran
+> `dsv4_compressor_update` DURING the verify → re-compressed mid-batch) and a
+> WRONG workload (synthetic 64-tok, not GSM8K/ShareGPT). SGLang does native MTP on
+> exactly this sparse attention (DSA, `dsa_mtp_fixture.py`, DeepSeek-V3.2,
+> accept_length≈2.7) via **frozen-KV**: the draft+verify READ the frozen target KV
+> and never re-run the compressor. With the compressor frozen, an off-boundary
+> K-draft span is EXACTLY autoregressive and the prepare-chain is paid ~once →
+> correct AND amortizes. See the redesign:
+> [`docs/plans/2026-06-06-dsv4-frozen-kv-mtp-redesign.md`](../../plans/2026-06-06-dsv4-frozen-kv-mtp-redesign.md).
+> Lesson below (axis 2) — I tested a smoke shape AND mutated frozen-should-be state.
+
 ## Context
 
 EAGLE/MTP Phase 2 on DSv4: A1 (the per-token greedy verify) landed CORRECT
