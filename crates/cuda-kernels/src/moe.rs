@@ -892,6 +892,61 @@ pub unsafe fn dsv4_deepgemm_fp8_paged_mqa_logits(
     Ok(())
 }
 
+/// Official DeepGEMM FP8 paged-MQA logits over SGLang's fused DSA cache layout:
+/// `[page][64][128 FP8 values | 64 FP32 scales]` as one byte buffer.
+///
+/// # Safety
+/// All pointers must be valid on `stream`. `kv_cache_with_scale` must point at
+/// a contiguous page buffer with `kv_cache_stride_bytes = 64 * (head_dim + 4)`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache(
+    q: RawDevicePtr<u8>,
+    kv_cache_with_scale: RawDevicePtr<u8>,
+    weights: RawDevicePtr<f32>,
+    context_lens: RawDevicePtr<i32>,
+    block_table: RawDevicePtr<i32>,
+    schedule_meta: RawDevicePtr<i32>,
+    logits: RawDevicePtr<f32>,
+    batch_size: usize,
+    next_n: usize,
+    num_heads: usize,
+    head_dim: usize,
+    num_kv_blocks: usize,
+    block_kv: usize,
+    max_context_len: usize,
+    logits_stride: usize,
+    block_table_stride: usize,
+    kv_cache_stride_bytes: usize,
+    num_sms: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
+            q.as_ptr(),
+            kv_cache_with_scale.as_ptr(),
+            weights.as_ptr(),
+            context_lens.as_ptr(),
+            block_table.as_ptr(),
+            schedule_meta.as_ptr(),
+            logits.as_mut_ptr(),
+            i32::try_from(batch_size)?,
+            i32::try_from(next_n)?,
+            i32::try_from(num_heads)?,
+            i32::try_from(head_dim)?,
+            i32::try_from(num_kv_blocks)?,
+            i32::try_from(block_kv)?,
+            i32::try_from(max_context_len)?,
+            i32::try_from(logits_stride)?,
+            i32::try_from(block_table_stride)?,
+            i32::try_from(kv_cache_stride_bytes)?,
+            i32::try_from(num_sms)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Fused clamped-SwiGLU over the `[gate | up]` w13 GEMM output + per-128-block
 /// requantize to the FP8 activation the w2 GEMM reads. Wraps
 /// [`ffi::dsv4_deepgemm_swiglu_quantize_w13_cuda`]; `limit` is the SwiGLU clamp.
