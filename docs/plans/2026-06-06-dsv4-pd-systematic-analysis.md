@@ -39,7 +39,64 @@ DeepGEMM) → `shared_hc` (shared expert + HC mix) → **`moe_allreduce`** (TP) 
 **→ 2 NCCL all-reduces per layer = 122 per forward step.** Prefill runs this once over N
 tokens (compute-bound, batched); decode runs it per token (B=1, latency-bound).
 
-## 3. What the end-to-end WALL-CLOCK trace must answer (发现真实问题)
+## 3. PD PROBLEM STATEMENTS — end-to-end wall-clock trace RESULT (2026-06-06)
+
+**Trace:** `dsv4_e2e_4096x64.nsys-rep`, working binary (FlashMLA decode ON, confirmed
+`flash_fwd_splitkv_mla_fp8_sparse_kernel` present), 4096 prompt + 64 decode, FP8_LINEAR_DEEPGEMM=1
++ GPU_ROUTER=1 + **allreduce** (native-DeepEP NOT runnable in parity: "not enough CUDA devices").
+Method: windowed (prefill / cold-first-decode / steady-decode), **exclusive interval coverage**
+(priority-ordered, overlapped kernels not double-counted → wall-clock truth, fixes the
+summed-kernel trap).
+
+### ⭐ HEADLINE: `dsv4_csa_select` (sparse top-k selection) is the #1 cost at the 4096 SLO shape — for BOTH P and D.
+
+This OVERTURNS the earlier "decode = comm 32.4%" picture, which was measured on an **8-token
+smoke shape** where csa_select is trivial. csa_select scales with context; at 4096 it dominates.
+(SLO-vs-smoke, [[../experience/errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill]].) The
+GEMV/comm levers chased earlier were smoke-shape artifacts.
+
+### PREFILL (4096, cold first request — 13.81s wall, exclusive):
+| bucket | wall | % |
+|---|---|---|
+| attention / sparse-prepare (csa_select + compressor + indexer + CSA/HCA math) | 6.13s | **44.4%** |
+| **host-gap / no GPU active** | 4.52s | **32.7%** |
+| dense MLA linear (the GEMV bucket) | 2.59s | 18.7% |
+| NCCL | 0.18s | 1.3% |
+| MoE | 0.17s | 1.2% |
+
+**Statement:** prefill is **sparse-attention-prepare-bound (44.4%) + host-gap-bound (32.7%)**,
+NOT MoE/NCCL. The 32.7% host-gap is **largely cold-start** (lazy weight-load / H2D /
+DeepGEMM-JIT — cuMemcpyHtoDAsync 62.5s summed across ranks, a 2.36s no-GPU gap in layer_00) →
+a warm prefill is faster; **separate cold vs warm** (re-measure a 2nd request). Levers, ranked:
+(1) **csa_select reduction** (reuse / skip-when-kv≤topk / faster kernel), (2) **pre-warm the
+cold-start H2D/JIT chain**, (3) dense linear (overlap-protected per #36 — low ROI).
+
+### DECODE (4096 steady, 62 steps — 137.6ms/token wall **osrt-INFLATED**, exclusive proportions valid; host_gap 0.3% ⇒ GPU-bound):
+| bucket | per-token | % |
+|---|---|---|
+| attention / sparse-prepare — **`dsv4_csa_select` dominant** | 103.0ms | **74.9%** |
+| MoE expert path | 12.4ms | 9.0% |
+| dense linear | 6.0ms | 4.4% |
+| NCCL | 5.5ms | 4.0% |
+| HC | 3.9ms | 2.9% |
+| FlashMLA math itself (`flash_fwd_splitkv_mla_fp8`) | ~5.5ms (small) | — |
+
+**Statement:** decode steady-state is **GPU-bound, csa-sparse-selection-bound (74.9%)** — NOT
+comm (4%), NOT FlashMLA math, NOT host. The critical path is **per-layer CSA selection / index
+prep**. Lever #1: **reduce/amortize csa_select** (cross-layer reuse = SGLang `skip_topk`;
+skip-when-kv≤index_topk; or a faster selection kernel). Cold first-decode step is 94% host-gap
+(one-time VMM/shareable-handle setup — `cuMemImportFromShareableHandle` etc.) → pre-warm or
+exclude. **CAVEAT:** absolute 137ms is osrt-inflated (real ≈ 26-50ms; re-measure clean
+`--trace=cuda,nvtx` at 4096); proportions hold (host_gap 0.3%).
+
+### Unified conclusion
+**csa_select is the single biggest single-request lever (P 44.4%-bucket + D 74.9%), and it
+scales with context.** Cross-layer reuse (E2) — previously down-ranked as lossy/risky — is now
+the top priority; the cheap read-only overlap diagnostic is licensed. Throughput ceiling (#38,
+single-row executor) is the separate big axis. Comm (4%), GEMV (#36, overlap-protected), and
+mhc are all secondary at the SLO shape.
+
+## 3.9 (superseded) Earlier open questions the trace answered
 
 Not kernel-sum %. The wall-clock critical path, with gaps/idle, **prefill and decode separately**:
 
