@@ -1,14 +1,15 @@
 # DSv4 EAGLE/MTP Phase 2 tranche 1 — verify loop + scheduler accounting landed; correctness INCOMPLETE (diverges on canonical prompt)
 
-> **⚠️ SUPERSEDED 2026-06-06 (same day): the "correct" claim below was FALSIFIED.**
-> Tranche 1 passed greedy-identity on ONE prompt ([11111]) but **DIVERGES on the
-> canonical [344] prompt** (pure HEAD `625a4f06`, clean tree). Root cause: the
-> reject rollback is incomplete for DSv4 compressed attention — see
-> [`errors/2026-06-06-dsv4-eagle-rollback-compressor-gap.md`](../errors/2026-06-06-dsv4-eagle-rollback-compressor-gap.md).
-> The committed code (`625a4f06`) is **default-off** so nothing regresses, but it
-> is **NOT correct** and must not be enabled until the rollback is fixed. The
-> scheduler multi-token accounting + state-machine *shape* are reusable; the
-> per-token verify + the rollback are the broken/incomplete parts.
+> **⚠️ SUPERSEDED 2026-06-06 (same day): the "correct" claim below was FALSIFIED,
+> then the underlying bug was FIXED later the same day.**
+> Tranche 1 passed greedy-identity on ONE prompt ([11111]) but DIVERGED on the
+> canonical [344] prompt — the reject rollback was incomplete for DSv4 compressed
+> attention. **Now FIXED** by the complete rollback — see
+> [`wins/2026-06-06-dsv4-eagle-rollback-fix-correct.md`](2026-06-06-dsv4-eagle-rollback-fix-correct.md)
+> and [`errors/2026-06-06-dsv4-eagle-rollback-compressor-gap.md`](../errors/2026-06-06-dsv4-eagle-rollback-compressor-gap.md).
+> The verify loop is correct (needle short+long); spec is still −32% (per-token
+> verify), A2 (s_q=K) is the speedup. This entry is kept as the record of the
+> single-prompt-gate miss; read the two linked entries for the resolved state.
 
 **Date:** 2026-06-06. **Backend:** CUDA, DSv4-Flash FP8 TP=8/EP=8, 8×H20.
 **Status:** **default-off, correctness INCOMPLETE.** Commit `625a4f06`.
