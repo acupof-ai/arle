@@ -91,10 +91,25 @@ exclude. **CAVEAT:** absolute 137ms is osrt-inflated (real ≈ 26-50ms; re-measu
 
 ### Unified conclusion
 **csa_select is the single biggest single-request lever (P 44.4%-bucket + D 74.9%), and it
-scales with context.** Cross-layer reuse (E2) — previously down-ranked as lossy/risky — is now
-the top priority; the cheap read-only overlap diagnostic is licensed. Throughput ceiling (#38,
-single-row executor) is the separate big axis. Comm (4%), GEMV (#36, overlap-protected), and
-mhc are all secondary at the SLO shape.
+scales with context.** Throughput ceiling (#38, single-row executor) is the separate big axis.
+Comm (4%), GEMV (#36, overlap-protected), and mhc are all secondary at the SLO shape.
+
+**csa_select kernel root cause (dsv4_attention.cu:1546 — source-confirmed):** `token =
+blockIdx.x` → **ONE CUDA block per token**, so at B=1 decode the entire scoring (`available`
+blocks × index_n_heads=64 × index_head_dim=128) + bitonic sort runs on **ONE SM** (1/132 of
+the GPU) — massively under-parallelized. The exact-skip `if (available <= topk) {skip}`
+(lines 1572-1580) is **already implemented** — but at 4096/ratio=4, `available = abs_pos/ratio
+= 1024 > index_topk = 512`, so the full scoring+sort path runs. (index_topk=512; CSA-layer
+compress_ratio per the config — Codex confirming the real per-layer value.)
+
+**Lever ranking for csa_select:**
+1. **EXACT, SGLang-aligned (preferred):** split the kernel into (a) a parallelized scoring
+   GEMM `query · block-keys` spread across SMs (like SGLang `fp8_paged_mqa_logits`) + (b) a
+   separate top-k kernel. Removes the 1-SM bottleneck losslessly. The right "算子接入好用好"
+   alignment with SGLang's indexer.
+2. **Lossy fallback (E2):** cross-layer top-k reuse (SGLang `skip_topk`), gated on
+   consecutive-CSA-layer Jaccard overlap (Codex measuring). Only if (1) is too costly.
+3. Already done: the exact `available<=topk` skip (helps high-ratio / low-context).
 
 ## 3.9 (superseded) Earlier open questions the trace answered
 
