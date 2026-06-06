@@ -3336,6 +3336,7 @@ pub(crate) fn mla_attention(
             Some(csa_select(
                 ctx,
                 config,
+                layer_idx,
                 indexer,
                 hidden,
                 &c_q_normed,
@@ -3703,6 +3704,7 @@ fn compressor_forward(
 fn csa_select(
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
+    layer_idx: usize,
     indexer: &Dsv4Indexer,
     hidden: &HiddenStates,
     c_q_normed: &HiddenStates,
@@ -3804,5 +3806,281 @@ fn csa_select(
             }
         }
     }
+    maybe_probe_deepgemm_dsa_logits(
+        ctx,
+        config,
+        layer_idx,
+        &q_i,
+        &weights,
+        keys,
+        hidden.seq_len,
+        local_index_heads,
+        key_count,
+        ratio,
+        start_pos,
+        start_pos_device,
+        score_scale,
+    )?;
+    if std::env::var("ARLE_DSV4_CSA_DUMP").as_deref() == Ok("1")
+        && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
+        && hidden.seq_len == 1
+    {
+        let available = std::cmp::min(key_count, start_pos / ratio);
+        match ctx.stream.clone_dtoh(&selected) {
+            Ok(host) => {
+                eprintln!(
+                    "[dsv4-csa-dump] layer={layer_idx} start_pos={start_pos} ratio={ratio} available={available} topk={} selected={host:?}",
+                    config.index_topk,
+                );
+            }
+            Err(e) => {
+                eprintln!("[dsv4-csa-dump] layer={layer_idx} start_pos={start_pos} dtoh_err={e}")
+            }
+        }
+    }
     Ok(selected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_probe_deepgemm_dsa_logits(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    layer_idx: usize,
+    q_i: &HiddenStates,
+    weights: &HiddenStates,
+    keys: &HiddenStates,
+    seq_len: usize,
+    local_index_heads: usize,
+    key_count: usize,
+    ratio: usize,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    score_scale: f32,
+) -> Result<()> {
+    if std::env::var("ARLE_DSV4_DSA_LOGITS_PROBE").as_deref() != Ok("1")
+        || std::env::var("INFER_TP_RANK").as_deref() != Ok("0")
+        || seq_len != 1
+    {
+        return Ok(());
+    }
+    static SEEN: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if !seen.lock().unwrap().insert(layer_idx) {
+        return Ok(());
+    }
+    let effective_start_pos = if let Some(start_pos_device) = start_pos_device {
+        let host = ctx
+            .stream
+            .clone_dtoh(start_pos_device)
+            .map_err(|e| anyhow!("DSv4 DSA logits probe start_pos D2H failed: {e}"))?;
+        usize::try_from(host.first().copied().unwrap_or_default())
+            .map_err(|_| anyhow!("DSv4 DSA logits probe negative start_pos"))?
+    } else {
+        start_pos
+    };
+    ensure!(
+        config.index_head_dim == 128,
+        "DeepGEMM paged-MQA logits probe expects index_head_dim=128, got {}",
+        config.index_head_dim
+    );
+    ensure!(
+        local_index_heads == 32 || local_index_heads == 64,
+        "DeepGEMM paged-MQA logits probe expects 32/64 heads, got {local_index_heads}"
+    );
+    let available = std::cmp::min(key_count, effective_start_pos / ratio);
+    if available == 0 {
+        eprintln!("[dsv4-dsa-logits-probe] layer={layer_idx} skipped reason=no_available_keys");
+        return Ok(());
+    }
+    let sample_limit = std::env::var("ARLE_DSV4_DSA_LOGITS_PROBE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16)
+        .min(available);
+    let num_sms = std::env::var("ARLE_DSV4_DSA_LOGITS_PROBE_SMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(78);
+    let block_kv = 64usize;
+    let padded_keys = available.div_ceil(block_kv) * block_kv;
+    let logits_stride = available.div_ceil(256) * 256;
+    let q_scale_stride_m = local_index_heads.div_ceil(4) * 4;
+    let key_scale_stride_m = padded_keys;
+    let scale_cols = config.index_head_dim.div_ceil(128);
+
+    let q_fp8 = ctx
+        .stream
+        .alloc_zeros::<u8>(local_index_heads * config.index_head_dim)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe q fp8 alloc failed: {e}"))?;
+    let q_scales = ctx
+        .stream
+        .alloc_zeros::<f32>(q_scale_stride_m * scale_cols)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe q scales alloc failed: {e}"))?;
+    let key_fp8 = ctx
+        .stream
+        .alloc_zeros::<u8>(padded_keys * config.index_head_dim)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe key fp8 alloc failed: {e}"))?;
+    let key_scales = ctx
+        .stream
+        .alloc_zeros::<f32>(padded_keys * scale_cols)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe key scales alloc failed: {e}"))?;
+    let active_experts = ctx
+        .stream
+        .clone_htod(&[0_i32])
+        .map_err(|e| anyhow!("DSv4 DSA logits probe active_experts H2D failed: {e}"))?;
+    let active_offsets = ctx
+        .stream
+        .clone_htod(&[0_i32])
+        .map_err(|e| anyhow!("DSv4 DSA logits probe active_offsets H2D failed: {e}"))?;
+    let mut active_counts = ctx
+        .stream
+        .clone_htod(&[local_index_heads as i32])
+        .map_err(|e| anyhow!("DSv4 DSA logits probe active_counts H2D failed: {e}"))?;
+    let stream = ctx.stream.cu_stream();
+    unsafe {
+        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+            cache_ptr(&q_i.data, ctx),
+            cache_ptr(&q_fp8, ctx),
+            cache_ptr(&q_scales, ctx),
+            cache_ptr(&active_experts, ctx),
+            cache_ptr(&active_offsets, ctx),
+            cache_ptr(&active_counts, ctx),
+            1,
+            local_index_heads,
+            config.index_head_dim,
+            q_scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 DSA logits probe q quantize failed: {e}"))?;
+    }
+    ctx.stream
+        .memcpy_htod(&[available as i32], &mut active_counts)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe key active_counts H2D failed: {e}"))?;
+    unsafe {
+        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+            cache_ptr(&keys.data, ctx),
+            cache_ptr(&key_fp8, ctx),
+            cache_ptr(&key_scales, ctx),
+            cache_ptr(&active_experts, ctx),
+            cache_ptr(&active_offsets, ctx),
+            cache_ptr(&active_counts, ctx),
+            1,
+            padded_keys,
+            config.index_head_dim,
+            key_scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 DSA logits probe key quantize failed: {e}"))?;
+    }
+
+    let q_scales_host = ctx
+        .stream
+        .clone_dtoh(&q_scales)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe q scales D2H failed: {e}"))?;
+    let weights_host = ctx
+        .stream
+        .clone_dtoh(&weights.data)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe weights D2H failed: {e}"))?;
+    let fused_weights_host: Vec<f32> = (0..local_index_heads)
+        .map(|head| weights_host[head].to_f32() * q_scales_host[head] * score_scale)
+        .collect();
+    let fused_weights = ctx
+        .stream
+        .clone_htod(&fused_weights_host)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe weights H2D failed: {e}"))?;
+    let context_lens = ctx
+        .stream
+        .clone_htod(&[available as i32])
+        .map_err(|e| anyhow!("DSv4 DSA logits probe context_lens H2D failed: {e}"))?;
+    let block_table_host: Vec<i32> = (0..padded_keys / block_kv).map(|v| v as i32).collect();
+    let block_table = ctx
+        .stream
+        .clone_htod(&block_table_host)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe block_table H2D failed: {e}"))?;
+    let sched_meta = ctx
+        .stream
+        .alloc_zeros::<i32>((num_sms + 1) * 2)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe sched_meta alloc failed: {e}"))?;
+    let logits = ctx
+        .stream
+        .alloc_zeros::<f32>(logits_stride)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe logits alloc failed: {e}"))?;
+    unsafe {
+        cuda_moe::dsv4_deepgemm_paged_mqa_logits_metadata(
+            cache_ptr(&context_lens, ctx),
+            cache_ptr(&sched_meta, ctx),
+            1,
+            1,
+            block_kv,
+            num_sms,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 DSA logits probe metadata failed: {e}"))?;
+        cuda_moe::dsv4_deepgemm_fp8_paged_mqa_logits(
+            cache_ptr(&q_fp8, ctx),
+            cache_ptr(&key_fp8, ctx),
+            cache_ptr(&key_scales, ctx),
+            cache_ptr(&fused_weights, ctx),
+            cache_ptr(&context_lens, ctx),
+            cache_ptr(&block_table, ctx),
+            cache_ptr(&sched_meta, ctx),
+            cache_ptr(&logits, ctx),
+            1,
+            1,
+            local_index_heads,
+            config.index_head_dim,
+            padded_keys / block_kv,
+            block_kv,
+            available,
+            logits_stride,
+            padded_keys / block_kv,
+            block_kv * (config.index_head_dim + std::mem::size_of::<f32>()),
+            num_sms,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 DSA logits probe paged logits failed: {e}"))?;
+    }
+    let logits_host = ctx
+        .stream
+        .clone_dtoh(&logits)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe logits D2H failed: {e}"))?;
+    let q_host = ctx
+        .stream
+        .clone_dtoh(&q_i.data)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe q D2H failed: {e}"))?;
+    let keys_host = ctx
+        .stream
+        .clone_dtoh(&keys.data)
+        .map_err(|e| anyhow!("DSv4 DSA logits probe keys D2H failed: {e}"))?;
+
+    let mut max_abs = 0.0f32;
+    let mut sum_sq = 0.0f32;
+    let mut first = Vec::with_capacity(sample_limit);
+    for block in 0..sample_limit {
+        let mut reference = 0.0f32;
+        for head in 0..local_index_heads {
+            let q_base = head * config.index_head_dim;
+            let key_base = block * config.index_head_dim;
+            let mut dot = 0.0f32;
+            for col in 0..config.index_head_dim {
+                dot += q_host[q_base + col].to_f32() * keys_host[key_base + col].to_f32();
+            }
+            reference += weights_host[head].to_f32() * score_scale * dot.max(0.0);
+        }
+        let official = logits_host[block];
+        let diff = (official - reference).abs();
+        max_abs = max_abs.max(diff);
+        sum_sq += diff * diff;
+        if block < 4 {
+            first.push(format!(
+                "{block}:dg={official:.5}:ref={reference:.5}:diff={diff:.5}"
+            ));
+        }
+    }
+    let rms = (sum_sq / sample_limit as f32).sqrt();
+    eprintln!(
+        "[dsv4-dsa-logits-probe] layer={layer_idx} available={available} sample={sample_limit} heads={local_index_heads} max_abs={max_abs:.6} rms={rms:.6} first={}",
+        first.join(",")
+    );
+    Ok(())
 }

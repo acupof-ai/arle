@@ -713,6 +713,46 @@ CUtensorMap make_tma_2d_desc_raw(
   return tensor_map;
 }
 
+CUtensorMap make_tma_3d_desc_raw(
+    const void* ptr,
+    CUtensorMapDataType dtype,
+    int elem_size,
+    int gmem_dim_0,
+    int gmem_dim_1,
+    int gmem_dim_2,
+    int smem_dim_0,
+    int smem_dim_1,
+    int smem_dim_2,
+    int gmem_stride_0,
+    int gmem_stride_1,
+    int swizzle_mode) {
+  if (swizzle_mode != 0) smem_dim_0 = swizzle_mode / elem_size;
+  CUtensorMap tensor_map{};
+  const cuuint64_t gmem_dims[3] = {
+      static_cast<cuuint64_t>(gmem_dim_0),
+      static_cast<cuuint64_t>(gmem_dim_1),
+      static_cast<cuuint64_t>(gmem_dim_2),
+  };
+  const cuuint32_t smem_dims[3] = {
+      static_cast<cuuint32_t>(smem_dim_0),
+      static_cast<cuuint32_t>(smem_dim_1),
+      static_cast<cuuint32_t>(smem_dim_2),
+  };
+  const cuuint64_t gmem_strides[2] = {
+      static_cast<cuuint64_t>(gmem_stride_0 * elem_size),
+      static_cast<cuuint64_t>(gmem_stride_1 * elem_size),
+  };
+  const cuuint32_t elem_strides[3] = {1, 1, 1};
+  check_driver(
+      lazy_cuTensorMapEncodeTiled(
+          &tensor_map, dtype, 3, const_cast<void*>(ptr), gmem_dims, gmem_strides,
+          smem_dims, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+          mode_into_tensor_map_swizzle(swizzle_mode),
+          CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+      "cuTensorMapEncodeTiled");
+  return tensor_map;
+}
+
 CUtensorMap make_tma_a_desc(
     const void* ptr,
     int shape_m,
@@ -782,6 +822,56 @@ CUtensorMap make_tma_sfa_desc(
 }
 
 std::string bool_lit(bool value) { return value ? "true" : "false"; }
+
+std::string generate_paged_mqa_metadata_code(
+    int aligned_batch_size,
+    int split_kv,
+    int num_sms) {
+  std::ostringstream code;
+  code << R"(
+#include <deep_gemm/scheduler/paged_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {
+    auto ptr = reinterpret_cast<void*>(&sched::smxx_paged_mqa_logits_metadata<
+        )" << aligned_batch_size << R"(, )" << split_kv << R"(, )" << num_sms << R"(, false
+    >);
+}
+)";
+  return code.str();
+}
+
+std::string generate_fp8_paged_mqa_logits_code(
+    int next_n,
+    int num_heads,
+    int head_dim,
+    int block_kv,
+    int num_q_stages,
+    int num_kv_stages,
+    int split_kv,
+    int num_tma_threads,
+    int num_math_threads) {
+  std::ostringstream code;
+  code << R"(
+#include <deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {
+    auto ptr = reinterpret_cast<void*>(&sm90_fp8_paged_mqa_logits<
+        )" << next_n << R"(, )" << num_heads << R"(,
+        )" << head_dim << R"(, )" << block_kv << R"(,
+        true, false,
+        )" << num_q_stages << R"(, )" << num_kv_stages << R"(,
+        )" << split_kv << R"(,
+        )" << num_tma_threads << R"(, )" << num_math_threads << R"(,
+        float
+    >);
+}
+)";
+  return code.str();
+}
 
 std::string generate_kernel_code(
     const GemmDesc& desc,
@@ -1205,6 +1295,153 @@ CUresult launch_sm90_dense_nt(
   return CUDA_SUCCESS;
 }
 
+CUresult launch_sm90_paged_mqa_logits_metadata(
+    const int* context_lens,
+    int* schedule_metadata,
+    int batch_size,
+    int next_n,
+    int block_kv,
+    int num_sms,
+    CUstream stream) {
+  cudaDeviceProp prop{};
+  CUresult prop_err = current_device_prop(&prop);
+  if (prop_err != CUDA_SUCCESS) return prop_err;
+  if (prop.major != 9) return CUDA_ERROR_NOT_SUPPORTED;
+  if (context_lens == nullptr || schedule_metadata == nullptr || stream == nullptr ||
+      batch_size <= 0 || next_n <= 0 || block_kv != 64 || num_sms <= 0 ||
+      num_sms > prop.multiProcessorCount) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  constexpr int split_kv = 256;
+  const int aligned_batch_size = align_to(batch_size, 32);
+  const int smem_size = (3 * aligned_batch_size + 1) * static_cast<int>(sizeof(int));
+  if (smem_size > kSm90SmemCapacity) return CUDA_ERROR_INVALID_VALUE;
+
+  const auto code =
+      generate_paged_mqa_metadata_code(aligned_batch_size, split_kv, num_sms);
+  const auto runtime = get_or_build_runtime(
+      "sm90_fp8_paged_mqa_logits_metadata_native", code, prop.major, prop.minor);
+
+  dim3 grid(1, 1, 1);
+  dim3 block(32, 1, 1);
+  auto launch_config = construct_launch_config(
+      runtime->kernel, reinterpret_cast<cudaStream_t>(stream), smem_size, grid, block, 1,
+      false);
+  const int* indices = nullptr;
+  check_driver(
+      launch_kernel(
+          runtime->kernel, launch_config, batch_size, next_n, true, context_lens,
+          indices, schedule_metadata),
+      "DeepGEMM paged MQA metadata launch");
+  return CUDA_SUCCESS;
+}
+
+CUresult launch_sm90_fp8_paged_mqa_logits(
+    const unsigned char* q,
+    const unsigned char* kv_cache,
+    const float* kv_cache_scales,
+    const float* weights,
+    const int* context_lens,
+    const int* block_table,
+    const int* schedule_meta,
+    float* logits,
+    int batch_size,
+    int next_n,
+    int num_heads,
+    int head_dim,
+    int num_kv_blocks,
+    int block_kv,
+    int max_context_len,
+    int logits_stride,
+    int block_table_stride,
+    int kv_cache_stride_bytes,
+    int num_sms,
+    CUstream stream) {
+  cudaDeviceProp prop{};
+  CUresult prop_err = current_device_prop(&prop);
+  if (prop_err != CUDA_SUCCESS) return prop_err;
+  if (prop.major != 9) return CUDA_ERROR_NOT_SUPPORTED;
+  if (q == nullptr || kv_cache == nullptr || kv_cache_scales == nullptr ||
+      weights == nullptr || context_lens == nullptr || block_table == nullptr ||
+      schedule_meta == nullptr || logits == nullptr || stream == nullptr ||
+      batch_size <= 0 || next_n <= 0 || (num_heads != 32 && num_heads != 64) ||
+      (head_dim != 32 && head_dim != 64 && head_dim != 128) || num_kv_blocks <= 0 ||
+      block_kv != 64 || max_context_len <= 0 || logits_stride < max_context_len ||
+      block_table_stride <= 0 || kv_cache_stride_bytes < block_kv * (head_dim + 4) ||
+      (kv_cache_stride_bytes % static_cast<int>(sizeof(float))) != 0 ||
+      num_sms <= 0 || num_sms > prop.multiProcessorCount) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  constexpr int split_kv = 256;
+  if ((logits_stride % split_kv) != 0) return CUDA_ERROR_INVALID_VALUE;
+  const int num_specialized_threads = 128;
+  const int mma_m = 64;
+  const int num_math_warp_groups = split_kv / mma_m;
+  const int num_math_threads = num_math_warp_groups * 128;
+  const int num_q_stages = 3;
+  const int num_kv_stages = 3;
+
+  const int swizzle_alignment = head_dim * 8;
+  const int smem_q_size_per_stage = next_n * num_heads * head_dim;
+  const int aligned_smem_weight_size_per_stage =
+      align_to(next_n * num_heads * static_cast<int>(sizeof(float)), swizzle_alignment);
+  const int smem_q_pipe_size =
+      num_q_stages *
+          (smem_q_size_per_stage + aligned_smem_weight_size_per_stage) +
+      align_to(num_q_stages * 8 * 2, swizzle_alignment);
+
+  const int smem_kv_size_per_stage = block_kv * head_dim;
+  const int aligned_smem_kv_scale_size_per_stage =
+      align_to(block_kv * static_cast<int>(sizeof(float)), swizzle_alignment);
+  const int smem_kv_pipe_size =
+      num_kv_stages *
+          (smem_kv_size_per_stage + aligned_smem_kv_scale_size_per_stage) +
+      align_to(num_kv_stages * 8 * 2, swizzle_alignment);
+
+  const int smem_umma_barriers = num_math_warp_groups * 2 * 8;
+  const int smem_tmem_ptr = 4;
+  const int smem_size = smem_q_pipe_size +
+                        num_math_warp_groups * smem_kv_pipe_size +
+                        smem_umma_barriers + smem_tmem_ptr;
+  if (smem_size > kSm90SmemCapacity) return CUDA_ERROR_INVALID_VALUE;
+
+  const auto code = generate_fp8_paged_mqa_logits_code(
+      next_n, num_heads, head_dim, block_kv, num_q_stages, num_kv_stages, split_kv,
+      num_specialized_threads, num_math_threads);
+  const auto runtime = get_or_build_runtime(
+      "sm90_fp8_paged_mqa_logits_native", code, prop.major, prop.minor);
+
+  const auto tensor_map_q = make_tma_2d_desc_raw(
+      q, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, head_dim, batch_size * next_n * num_heads,
+      head_dim, next_n * num_heads, head_dim, head_dim);
+  const auto tensor_map_kv = make_tma_3d_desc_raw(
+      kv_cache, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, head_dim, block_kv, num_kv_blocks,
+      head_dim, block_kv, 1, head_dim, kv_cache_stride_bytes, head_dim);
+  const auto tensor_map_kv_scales = make_tma_2d_desc_raw(
+      kv_cache_scales, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4, block_kv, num_kv_blocks,
+      block_kv, 1, kv_cache_stride_bytes / static_cast<int>(sizeof(float)), 0);
+  const auto tensor_map_weights = make_tma_2d_desc_raw(
+      weights, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4, next_n * num_heads, batch_size,
+      next_n * num_heads, 1, next_n * num_heads, 0);
+
+  dim3 grid(static_cast<unsigned>(num_sms), 1, 1);
+  dim3 block(static_cast<unsigned>(num_specialized_threads + num_math_threads), 1, 1);
+  auto launch_config = construct_launch_config(
+      runtime->kernel, reinterpret_cast<cudaStream_t>(stream), smem_size, grid, block, 1,
+      false);
+  const int* indices = nullptr;
+  check_driver(
+      launch_kernel(
+          runtime->kernel, launch_config, batch_size, static_cast<uint64_t>(logits_stride),
+          static_cast<uint64_t>(block_table_stride), context_lens, logits, block_table,
+          indices, schedule_meta, tensor_map_q, tensor_map_kv, tensor_map_kv_scales,
+          tensor_map_weights),
+      "DeepGEMM FP8 paged MQA logits launch");
+  return CUDA_SUCCESS;
+}
+
 }  // namespace
 
 extern "C" CUresult dsv4_deepgemm_native_preflight_cuda(
@@ -1309,6 +1546,56 @@ extern "C" CUresult dsv4_deepgemm_fp8_gemm_nt_cuda(
     return launch_sm90_dense_nt(a, sfa, b, sfb, d, m, n, k, sfa_aligned_m, stream);
   } catch (const std::exception& err) {
     std::fprintf(stderr, "DeepGEMM native dense bridge failed: %s\n", err.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+}
+
+extern "C" CUresult dsv4_deepgemm_paged_mqa_logits_metadata_cuda(
+    const int* context_lens,
+    int* schedule_metadata,
+    int batch_size,
+    int next_n,
+    int block_kv,
+    int num_sms,
+    CUstream stream) {
+  try {
+    return launch_sm90_paged_mqa_logits_metadata(
+        context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, stream);
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM paged MQA metadata bridge failed: %s\n", err.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+}
+
+extern "C" CUresult dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
+    const unsigned char* q,
+    const unsigned char* kv_cache,
+    const float* kv_cache_scales,
+    const float* weights,
+    const int* context_lens,
+    const int* block_table,
+    const int* schedule_meta,
+    float* logits,
+    int batch_size,
+    int next_n,
+    int num_heads,
+    int head_dim,
+    int num_kv_blocks,
+    int block_kv,
+    int max_context_len,
+    int logits_stride,
+    int block_table_stride,
+    int kv_cache_stride_bytes,
+    int num_sms,
+    CUstream stream) {
+  try {
+    return launch_sm90_fp8_paged_mqa_logits(
+        q, kv_cache, kv_cache_scales, weights, context_lens, block_table, schedule_meta,
+        logits, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv,
+        max_context_len, logits_stride, block_table_stride, kv_cache_stride_bytes, num_sms,
+        stream);
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM FP8 paged MQA logits bridge failed: %s\n", err.what());
     return CUDA_ERROR_UNKNOWN;
   }
 }
