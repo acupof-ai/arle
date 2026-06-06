@@ -1564,6 +1564,29 @@ fn validate_prebuilt_cuda_archive_symbols(archive: &Path) {
     }
 }
 
+fn validate_cuda_archive_has_symbol(archive: &Path, symbol: &str, context: &str) {
+    let output = Command::new("nm")
+        .arg("-g")
+        .arg(archive)
+        .output()
+        .unwrap_or_else(|err| panic!("Failed to run nm for {}: {err}", archive.display()));
+    if !output.status.success() {
+        panic!(
+            "Failed to inspect CUDA archive {} with nm: {}",
+            archive.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let symbols = String::from_utf8_lossy(&output.stdout);
+    if !symbols.contains(symbol) {
+        panic!(
+            "CUDA archive {} is missing required symbol {symbol} ({context}). \
+             This usually means a stale FlashMLA stub object was linked instead of the real shim.",
+            archive.display()
+        );
+    }
+}
+
 fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
     println!("cargo:rerun-if-changed=build.rs");
     let required = ["libkernels_cuda.a", "libtilelang_kernels_aot.a"];
@@ -1687,18 +1710,17 @@ fn main() {
     // 147f5673 — FlashMLA submodule pin). Refs sgl-kernel/cmake/flashmla.cmake.
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHMLA");
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_FLASHMLA");
-    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHMLA_DECODE");
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_FLASHMLA_DECODE");
     let flashmla_root = Path::new("vendor/flashmla");
     let flashmla_stub = Path::new("csrc/attention/arle_flashmla_decode_stubs.cu");
     let enable_flashmla = flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA");
-    // The sparse-FP8 decode instantiations require CUDA headers with
-    // __nv_fp8_e8m0 and the runtime gate is still default-OFF. Keep decode
-    // real-kernel compilation opt-in so CUDA 12.5 H20 builds can still produce
-    // DSv4-Flash artifacts with real sparse prefill and decode stubs.
-    let enable_flashmla_decode = enable_flashmla
-        && env_flag("ARLE_CUDA_ENABLE_FLASHMLA_DECODE")
-        && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA_DECODE");
+    if enable_flashmla && env_flag("ARLE_CUDA_DISABLE_FLASHMLA_DECODE") {
+        panic!(
+            "ARLE_CUDA_DISABLE_FLASHMLA_DECODE would create a FlashMLA half-state. \
+             Disable FlashMLA entirely with ARLE_CUDA_DISABLE_FLASHMLA=1, or build the real decode shim."
+        );
+    }
+    let enable_flashmla_decode = enable_flashmla;
     // `collect_cu_files` sees the fallback stub because it lives under csrc/.
     // Drop it first so FlashMLA builds link exactly one implementation of the
     // prefill/decode FFI symbols. Otherwise the archive order can satisfy
@@ -1721,15 +1743,11 @@ fn main() {
         // so this path is never actually called in practice.
         cu_files.push(flashmla_stub.to_path_buf());
     }
-    let flashmla_decode_stub_only = enable_flashmla && !enable_flashmla_decode;
-    if flashmla_decode_stub_only {
-        cu_files.retain(|p| {
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-            stem != "arle_flashmla_decode_shim"
-        });
-        cu_files.push(flashmla_stub.to_path_buf());
-    }
     if enable_flashmla {
+        assert!(
+            !cu_files.iter().any(|p| p == flashmla_stub),
+            "FlashMLA vendor tree is present, but the decode stub is still scheduled for nvcc"
+        );
         let sparse = flashmla_root.join("csrc/sm90/prefill/sparse");
         for entry in [
             "fwd.cu",
@@ -1839,9 +1857,6 @@ fn main() {
         if enable_deepgemm_native {
             nvcc_args.push("-DARLE_ENABLE_DEEPGEMM_NATIVE=1".to_string());
         }
-        if flashmla_decode_stub_only && cu_file == flashmla_stub {
-            nvcc_args.push("-DARLE_FLASHMLA_STUB_DECODE_ONLY=1".to_string());
-        }
         if let Some(split_compile) = nvcc_split_compile.as_deref() {
             nvcc_args.push(format!("--split-compile={split_compile}"));
         }
@@ -1932,6 +1947,17 @@ fn main() {
         obj_files.push(obj_file);
     }
 
+    if enable_flashmla {
+        let stub_obj = "arle_flashmla_decode_stubs_cuda.o";
+        assert!(
+            !obj_files.iter().any(|path| path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == stub_obj)),
+            "FlashMLA vendor tree is present, but {stub_obj} would be archived"
+        );
+    }
+
     let cuda_lib = out_dir.join("libkernels_cuda.a");
     match std::fs::remove_file(&cuda_lib) {
         Ok(()) => {}
@@ -1951,6 +1977,14 @@ fn main() {
         .expect("Failed to run ar");
 
     assert!(status.success(), "ar failed");
+
+    if enable_flashmla {
+        validate_cuda_archive_has_symbol(
+            &cuda_lib,
+            "arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda",
+            "real FlashMLA sparse decode shim",
+        );
+    }
 
     if kernel_set.tilelang_aot_enabled() {
         compile_tilelang_aot_kernels(&cuda_path, &out_dir, &sm_targets);
