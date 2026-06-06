@@ -122,6 +122,19 @@ compress_ratio per the config — Codex confirming the real per-layer value.)
 off; csa_select is the first wall. (DSv4 c=2 decode currently ERRORS — "graph-safe local routed
 output requires DeepGEMM device-count experts" — #38 confirmed broken.)
 
+**ncu LICENSE (2026-06-06) — the rewrite is evidence-backed, not a guess:** per-kernel decode
+breakdown (rank0, 4096, steady): `dsv4_csa_select_kernel` **101.44 ms/token** (21 calls ×
+4.83ms) — vs all `fp8_gemv` 3.61, FlashMLA fwd+combine 1.01, compressor 0.31, kv_pack 0.25. So
+the 74.9% bucket IS csa_select, not compressor/indexer, not launch (~5µs). ncu LaunchStats on a
+steady csa_select launch: **grid (1,1,1), active SMs 1/78 = 1.28%, achieved occupancy 12.5%,
+"estimated speedup from launch-geometry underutilization: 98.72%"**. The op-count paradox
+(scoring ~100µs but wall 101ms) is resolved: the selector runs on ONE SM. (DRAM/stall counters
+failed in-context on the TP=8 multi-process ncu — but launch geometry + the per-kernel nsys
+breakdown already kill every other hypothesis.) **#39 IN PROGRESS:** Codex implementing the
+2-kernel split (parallel scoring across SMs + reused bitonic top-k), exact gate (selected-index
+byte-parity vs fused kernel + needle + decode-ms A/B), flag-gated default-off. First real perf
+landing of this campaign.
+
 ## 3.9 (superseded) Earlier open questions the trace answered
 
 Not kernel-sum %. The wall-clock critical path, with gaps/idle, **prefill and decode separately**:
