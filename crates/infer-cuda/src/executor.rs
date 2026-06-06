@@ -697,7 +697,9 @@ impl Dsv4CudaExecutor {
             .clone();
 
         let draft_position = start_pos as u64;
-        let draft = self.model.mtp_forward(&hidden, pending, draft_position)?;
+        let draft =
+            self.model
+                .mtp_forward(&mut self.slots[slot_idx], &hidden, pending, draft_position)?;
         let (argmax, mut hiddens) = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
             &[pending, draft],
