@@ -663,13 +663,19 @@ impl Dsv4CudaExecutor {
         position: u64,
     ) -> Result<Vec<u32>> {
         if !crate::dsv4::dsv4_spec_decode_enabled() {
-            return Ok(vec![self.model.forward_tokens(
+            let token = self.model.forward_tokens(
                 &mut self.slots[slot_idx],
                 &[last_token],
                 start_pos,
                 params,
                 position,
-            )?]);
+            )?;
+            self.model.dump_mtp_rollback_state(
+                &self.slots[slot_idx],
+                "nonspec_after_forward",
+                start_pos + 1,
+            )?;
+            return Ok(vec![token]);
         }
 
         ensure!(
@@ -722,6 +728,17 @@ impl Dsv4CudaExecutor {
             let keep_len = start_pos + 1;
             self.model
                 .truncate_slot(&mut self.slots[slot_idx], keep_len)?;
+            self.model.dump_mtp_rollback_state(
+                &self.slots[slot_idx],
+                "spec_after_reject_truncate",
+                keep_len,
+            )?;
+            self.slots[slot_idx].restore_spec_rollback(&self.model.ctx, keep_len)?;
+            self.model.dump_mtp_rollback_state(
+                &self.slots[slot_idx],
+                "spec_after_reject_restore",
+                keep_len,
+            )?;
             let hidden_for_pending = hiddens.remove(0);
             spec.pending = Some(base_next);
             spec.hidden = Some(hidden_for_pending);
