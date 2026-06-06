@@ -67,12 +67,16 @@ Not kernel-sum %. The wall-clock critical path, with gaps/idle, **prefill and de
 the generic R6 path executor.rs:325, Qwen executor.rs:1036). Every forward processes ONE
 row — prefill OR decode.
 
-But the **planner builds MULTI-ROW plans** (`build_forward_plan` loops all eligible decode
-rows into one `ForwardPlan`, planner.rs:31; `retract_decode_to_fit` handles
-`decode_rows.len() > 1`) and the engine calls `submit(&plan)` **once** (lib.rs:430). So the
-scheduler is built for continuous batching, but the **executor cannot consume a multi-row
-forward** — concurrency either serializes per-row or errors. **No true batched decode exists
-in the rewrite.** (The pre-rewrite `infer/src/model/deepseek/` HAD an FFN-batched decode —
+But the **planner builds MULTI-ROW plans with NO cap** (`build_forward_plan` pushes a
+`DecodeRow` for EVERY active Decoding request, planner.rs:21-38, no limit;
+`retract_decode_to_fit` trims only for *memory*, not to 1) and the engine calls
+`submit(&plan)` **once** with no per-row split (lib.rs:404-432). So at c=N the plan has N
+decode rows → `submit` hits `ensure!(rows == 1)` → **DSv4 c>1 LIKELY ERRORS** (not merely
+serializes). **No true batched decode exists in the rewrite, and concurrent decode may be
+outright broken.** The prior throughput-sweep c=8 numbers
+([[../experience/wins/2026-06-06-dsv4-first-throughput-sweep-scaling-gap]]) may be
+stale/pre-cutover — **Codex must confirm empirically: does DSv4 c=2 decode error at the
+single-row bail?** (The pre-rewrite `infer/src/model/deepseek/` HAD an FFN-batched decode —
 [[../experience/wins/2026-05-29-dsv4-true-batched-decode]] — it was NOT ported; R6 was a
 clean single-row skeleton, batching deferred, #5.)
 
