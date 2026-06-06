@@ -28,7 +28,8 @@ near-tie 上和 s_q=1 不同**两者都对**。
 | A0 | (机制确认,非 gate)dump pending_kv reject 前后 + 是否撞 compression 边界 + same-twice 非确定性地板 | `attention.rs:728` dump 已建 | — | 低 | 确认机制/floor,不决定是否修 |
 | **A2** | **s_q=K FlashMLA verify**(真正的加速,depth-1 ~1.5×) | `attention.rs` `DSV4_FLASHMLA_S_Q`(25)、`Dsv4FlashMlaDecodeState`(134)、`dsv4_flashmla_decode_build_indices.cu` | needle + 自洽 | 高 | **26.6→~18ms** |
 | A2a | Q 排布 `[1,K,h_q,d_qk]` | `forward_tokens_verify`(dsv4.rs:766) | — | 中 | A2 子项 |
-| A2b | per-query top-k 索引(复用 prefill 多查询 builder `arle_flashmla_csa/hca_build_indices` 到 decode KV 坐标) | `dsv4_flashmla_decode_build_indices.cu` | — | **高(tranche2 在此挂)** | A2 子项 |
+| A2b | per-query top-k 索引 — **核心难点,tranche2 在此挂**:`dsv4_flashmla_decode_build_indices.cu` kernel 是为 `s_q=1` 写的,只填 row 0;s_q>1 要扩 kernel 给每个 query 位填各自 top-k(镜像 prefill 多查询 builder `arle_flashmla_csa/hca_build_indices`)。tranche2 做了 Rust glue(`query_start_pos`/`indices[max_s_q*topk]`)但 kernel 很可能没扩 → rows 1..s_q 是垃圾/回退 scalar → 结构性发散 + 3× 慢。**这是 .cu kernel 改,非纯 glue** | `dsv4_flashmla_decode_build_indices.cu` | — | **高** | A2 子项 |
+| — | **A2 详设前置**:必须在 A1 干净基线上做(broken s_q=K 跑在带 rollback bug 的基线 → 垃圾被 confound)。A1 落地后重跑 `/tmp/tranche2_sqk_broken.diff` 隔离纯 glue bug,再细化 A2 实现级方案 | — | — | — | 顺序约束 |
 | A2c | K 内因果 + cached-prefix mask | 同上 | — | 中 | A2 子项 |
 | A2d | `sched_meta` for s_q=K(`get_meta(h_q,s_q)` 已支持) | `sparse_decode.h:41/383` | — | 低 | A2 子项 |
 | A2e | s_q=K 回滚(若 A1 需要,snapshot 扩到 K) | `attention.rs` | — | 中 | A2 子项 |
