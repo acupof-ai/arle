@@ -154,6 +154,19 @@ C++ files staying separate from `mlx_bridge.cpp`. New Metal-only fused
 ops should land here, not in `infer`. See
 [`docs/projects/mlx-backend-roadmap.md`](../../docs/projects/mlx-backend-roadmap.md).
 
+## State-mutating change — enumerate every buffer (事无巨细)
+
+Root `AGENTS.md` §0.1 for the MLX/bridge side. Any change mutating MLX or
+bridge-cache state (DFlash draft KV, `BatchKVCache`, per-slot scratch, a rollback):
+**enumerate EVERY buffer it writes, prove each reverted / self-heals (with the
+exact precondition) / snapshotted** — never assume self-heal. Pre-allocate once
+and reuse (no per-step alloc on the encode path — `mx::async_eval` encodes on the
+caller thread, so a buffer's lifetime spans the async eval; a freed-too-early
+input corrupts silently). Save/restore at minimum granularity (a ring touched at
+one slot → that one slot). Keep it inside the opt-in path so the baseline step is
+byte-for-byte untouched, and gate correctness on **correct inference** (needle +
+same-config-twice floor), not byte-identity to a reference run.
+
 ## Distilled lessons (recurring ≥2 entries)
 
 - **mlx.metallib must be colocated with the binary on every macOS distribution path.** build.rs,
