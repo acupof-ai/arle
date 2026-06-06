@@ -1,5 +1,14 @@
 # DSv4 decode → 6ms — 抽丝剥茧 DAG（原子任务 + 依赖图 + 预算）
 
+> **⚠️ UPDATE 2026-06-06: EAGLE 主干 A2/A3 KILLED.** A1(per-token rollback)
+> 落地正确(`25a92e8a`,needle 过)但 −32%。A2(s_q=K)实测 **12.85 tok/s(3× 慢)
+> 且与 autoregressive 系统性不等价**(scalar control 也分叉 → 是 DSv4 stateful 压缩
+> 注意力,非 FlashMLA glue),见 `errors/2026-06-06-dsv4-eagle-sqk-no-amortize-kill.md`。
+> **EAGLE 的 K-token 摊销对 DSv4 不成立**:per-query prepare-chain(csa_select top-512
+> + compressor + indexer)昂贵且随 K 线性,K-token forward ≈ K× attention 不是 1×
+> (同 FlashMLA-prefill kill 的墙)。**新 critical path = prepare-chain 优化 + D kernel
+> levers**(下文 A 分支作废,prepare-chain 见 §新)。6ms-via-EAGLE 受阻。
+
 **Date:** 2026-06-06. **方法**:把"compressed-attention + EAGLE + 6ms"拆成原子任务,
 标出依赖,画 DAG,critical path 自现。**判据已纠正**(ckl 2026-06-06):gate 是
 **正确推理**(needle 取回 + 连贯 + 质量),**不是** byte-identity 复刻 s_q=1 基线。
