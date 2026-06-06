@@ -597,9 +597,14 @@ impl Dsv4DsaOfficialState {
             .map(|v| i64::try_from(v).expect("compressed capacity fits i64"))
             .collect();
         let freqs_cis_h = dsv4_dsa_freqs_cis_real(config, compress_ratio, max_seq_len)?;
-        let page_table_h: Vec<i32> = (0..num_pages)
-            .map(|v| i32::try_from(v).expect("page table fits i32"))
-            .collect();
+        let page_table_elems = max_tokens
+            .checked_mul(num_pages)
+            .ok_or_else(|| anyhow!("DSv4 official DSA page table size overflow"))?;
+        let mut page_table_h = Vec::with_capacity(page_table_elems);
+        for _ in 0..max_tokens {
+            page_table_h
+                .extend((0..num_pages).map(|v| i32::try_from(v).expect("page table fits i32")));
+        }
         let num_sms = std::env::var("ARLE_DSV4_DSA_INDEXER_SMS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -2006,7 +2011,15 @@ fn dsv4_fp8_linear_deepgemm_enabled() -> Result<bool> {
 }
 
 fn dsv4_dsa_official_enabled() -> Result<bool> {
-    env_flag("ARLE_DSV4_DSA_INDEXER")
+    // Default ON: official/vendored DSA indexer replaces the legacy scalar
+    // csa_select selector. Licensed by the variable-shape legacy-floor gate:
+    // official diverges no earlier than legacy diverges from itself across
+    // 64/256/512/1024/2048/4096 prompts, with the legacy selector retained as
+    // an explicit fallback via ARLE_DSV4_DSA_INDEXER=0.
+    Ok(!matches!(
+        std::env::var("ARLE_DSV4_DSA_INDEXER").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    ))
 }
 
 /// Per-layer attention-output localizer (Track A FlashMLA-prefill diagnosis).
@@ -4007,7 +4020,7 @@ fn csa_select(
     let score_scale =
         (config.index_head_dim as f32).powf(-0.5) * (config.index_n_heads as f32).powf(-0.5);
     if let Some(official) = official {
-        if let Some(selected) = csa_select_official_decode(
+        if let Some(selected) = csa_select_official(
             ctx,
             config,
             &q_i,
@@ -4019,6 +4032,7 @@ fn csa_select(
             key_count,
             start_pos,
             start_pos_device,
+            layer_idx,
             ratio,
             local_index_heads,
             score_scale,
@@ -4091,14 +4105,23 @@ fn csa_select(
     )?;
     if std::env::var("ARLE_DSV4_CSA_DUMP").as_deref() == Ok("1")
         && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
-        && hidden.seq_len == 1
     {
-        let available = std::cmp::min(key_count, start_pos / ratio);
+        let row_idx = hidden.seq_len.saturating_sub(1);
+        let available = std::cmp::min(key_count, (start_pos + row_idx) / ratio);
         match ctx.stream.clone_dtoh(&selected) {
             Ok(host) => {
+                let row_start = row_idx * config.index_topk;
+                let selected_head: Vec<i32> =
+                    host.iter().skip(row_start).copied().take(32).collect();
+                let invalid_selected = host
+                    .iter()
+                    .skip(row_start)
+                    .take(config.index_topk)
+                    .filter(|&&v| v < 0 || v >= available as i32)
+                    .count();
                 eprintln!(
-                    "[dsv4-csa-dump] layer={layer_idx} start_pos={start_pos} ratio={ratio} available={available} topk={} selected={host:?}",
-                    config.index_topk,
+                    "[dsv4-csa-dump] layer={layer_idx} start_pos={start_pos} seq_len={} row={row_idx} ratio={ratio} available={available} topk={} invalid_selected={invalid_selected} selected_head={selected_head:?}",
+                    hidden.seq_len, config.index_topk,
                 );
             }
             Err(e) => {
@@ -4110,7 +4133,7 @@ fn csa_select(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn csa_select_official_decode(
+fn csa_select_official(
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
     q_i: &HiddenStates,
@@ -4122,14 +4145,12 @@ fn csa_select_official_decode(
     key_count: usize,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
+    layer_idx: usize,
     ratio: usize,
     local_index_heads: usize,
     score_scale: f32,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Option<CudaSlice<i32>>> {
-    if q_i.seq_len != 1 {
-        return Ok(None);
-    }
     if start_pos_device.is_some()
         && matches!(
             std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
@@ -4163,8 +4184,10 @@ fn csa_select_official_decode(
         official.compressed_capacity
     );
     ensure!(
-        start_pos < official.max_tokens,
-        "DSv4 official DSA start_pos {start_pos} exceeds freqs_cis max {}",
+        start_pos + q_i.seq_len <= official.max_tokens,
+        "DSv4 official DSA positions {}..{} exceed freqs_cis max {}",
+        start_pos,
+        start_pos + q_i.seq_len,
         official.max_tokens
     );
 
@@ -4222,15 +4245,22 @@ fn csa_select_official_decode(
         keepalive.keep_u8(&official.key_cache);
     }
 
-    let available = std::cmp::min(key_count, start_pos / ratio);
-    let context_lens_h = [i32::try_from(available)?];
-    let positions_h = [i32::try_from(start_pos)?];
+    let token_count = q_i.seq_len;
+    let context_lens_h: Vec<i32> = (0..token_count)
+        .map(|token| {
+            let abs_pos = start_pos + token;
+            i32::try_from(std::cmp::min(key_count, abs_pos / ratio))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let positions_h: Vec<i32> = (0..token_count)
+        .map(|token| i32::try_from(start_pos + token))
+        .collect::<Result<Vec<_>, _>>()?;
     {
-        let mut context_lens = official.context_lens.slice_mut(0..1);
+        let mut context_lens = official.context_lens.slice_mut(0..token_count);
         ctx.stream
             .memcpy_htod(&context_lens_h, &mut context_lens)
             .map_err(|e| anyhow!("DSv4 official DSA context_lens H2D failed: {e}"))?;
-        let mut positions = official.positions.slice_mut(0..1);
+        let mut positions = official.positions.slice_mut(0..token_count);
         ctx.stream
             .memcpy_htod(&positions_h, &mut positions)
             .map_err(|e| anyhow!("DSv4 official DSA positions H2D failed: {e}"))?;
@@ -4238,7 +4268,7 @@ fn csa_select_official_decode(
 
     let mut selected = ctx
         .stream
-        .alloc_zeros::<i32>(config.index_topk)
+        .alloc_zeros::<i32>(token_count * config.index_topk)
         .map_err(|e| anyhow!("DSv4 official DSA selected alloc failed: {e}"))?;
     {
         let (q_ptr, _qg) = q_i.data.device_ptr(&ctx.stream);
@@ -4246,7 +4276,7 @@ fn csa_select_official_decode(
         let (w_ptr, _wg) = weights.data.device_ptr(&ctx.stream);
         let (weights_out_ptr, _wog) = official.weights.device_ptr_mut(&ctx.stream);
         let (freqs_ptr, _fg) = official.freqs_cis.device_ptr(&ctx.stream);
-        let positions = official.positions.slice(0..1);
+        let positions = official.positions.slice(0..token_count);
         let (positions_ptr, _pg) = positions.device_ptr(&ctx.stream);
         unsafe {
             ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
@@ -4257,7 +4287,7 @@ fn csa_select_official_decode(
                 score_scale,
                 freqs_ptr as *const f32,
                 positions_ptr as *const i32,
-                1,
+                i32::try_from(token_count)?,
                 i32::try_from(local_index_heads)?,
                 ctx.stream.cu_stream(),
             )
@@ -4267,12 +4297,12 @@ fn csa_select_official_decode(
     keepalive.keep_u8(&official.q_fp8);
     keepalive.keep_f32(&official.weights);
 
-    let context_lens = official.context_lens.slice(0..1);
+    let context_lens = official.context_lens.slice(0..token_count);
     unsafe {
         cuda_moe::dsv4_deepgemm_paged_mqa_logits_metadata(
             cache_ptr(&official.context_lens, ctx),
             cache_ptr(&official.sched_meta, ctx),
-            1,
+            token_count,
             1,
             64,
             official.num_sms,
@@ -4289,13 +4319,13 @@ fn csa_select_official_decode(
             cache_ptr(&official.page_table_identity, ctx),
             cache_ptr(&official.sched_meta, ctx),
             cache_ptr(&official.logits, ctx),
-            1,
+            token_count,
             1,
             local_index_heads,
             config.index_head_dim,
             official.num_pages,
             64,
-            key_count,
+            official.num_pages * 64,
             official.logits_stride,
             official.num_pages,
             64 * (config.index_head_dim + std::mem::size_of::<f32>()),
@@ -4309,7 +4339,9 @@ fn csa_select_official_decode(
         let (lens_ptr, _csg) = context_lens.device_ptr(&ctx.stream);
         let (page_ptr, _ptg) = official.page_table_identity.device_ptr(&ctx.stream);
         let (sel_ptr, _seg) = selected.device_ptr_mut(&ctx.stream);
-        let mut raw = official.raw_indices.slice_mut(0..config.index_topk);
+        let mut raw = official
+            .raw_indices
+            .slice_mut(0..token_count * config.index_topk);
         let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
         unsafe {
             ffi::dsv4_deepseek_v4_topk_transform_512_cuda(
@@ -4321,12 +4353,61 @@ fn csa_select_official_decode(
                 i64::try_from(official.logits_stride)?,
                 i64::try_from(official.num_pages)?,
                 i64::try_from(config.index_topk)?,
-                1,
+                i32::try_from(token_count)?,
                 i32::try_from(config.index_topk)?,
                 64,
                 ctx.stream.cu_stream(),
             )
             .result()?;
+        }
+    }
+    if std::env::var("ARLE_DSV4_CSA_DUMP").as_deref() == Ok("1")
+        && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
+    {
+        let row_idx = q_i.seq_len.saturating_sub(1);
+        let available = context_lens_h.get(row_idx).copied().unwrap_or_default();
+        let selected_host = ctx.stream.clone_dtoh(&selected);
+        let raw_host = ctx.stream.clone_dtoh(
+            &official
+                .raw_indices
+                .slice(0..q_i.seq_len * config.index_topk),
+        );
+        match (selected_host, raw_host) {
+            (Ok(selected_host), Ok(raw_host)) => {
+                let invalid_selected = selected_host
+                    .iter()
+                    .skip(row_idx * config.index_topk)
+                    .take(config.index_topk)
+                    .filter(|&&v| v < 0 || v >= available)
+                    .count();
+                let invalid_raw = raw_host
+                    .iter()
+                    .skip(row_idx * config.index_topk)
+                    .take(config.index_topk)
+                    .filter(|&&v| v < 0 || v >= available)
+                    .count();
+                let selected_head: Vec<i32> = selected_host
+                    .iter()
+                    .skip(row_idx * config.index_topk)
+                    .copied()
+                    .take(32)
+                    .collect();
+                let raw_head: Vec<i32> = raw_host
+                    .iter()
+                    .skip(row_idx * config.index_topk)
+                    .copied()
+                    .take(32)
+                    .collect();
+                eprintln!(
+                    "[dsv4-csa-dump-official] layer={layer_idx} start_pos={start_pos} seq_len={} row={row_idx} ratio={ratio} available={available} topk={} invalid_selected={invalid_selected} invalid_raw={invalid_raw} selected_head={selected_head:?} raw_head={raw_head:?}",
+                    q_i.seq_len, config.index_topk,
+                );
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!(
+                    "[dsv4-csa-dump-official] layer={layer_idx} start_pos={start_pos} dtoh_err={e}"
+                );
+            }
         }
     }
     Ok(Some(selected))

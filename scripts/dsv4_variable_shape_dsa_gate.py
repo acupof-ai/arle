@@ -4,13 +4,15 @@
 Runs a list of coherent, real-text prompts through one loaded `dsv4_parity`
 engine session per variant:
 
-  1. legacy csa_select twice (`ARLE_DSV4_DSA_INDEXER=0`) to establish the
-     same-config non-determinism floor;
+  1. legacy csa_select multiple times (`ARLE_DSV4_DSA_INDEXER=0`) to establish
+     the same-config non-determinism floor;
   2. official DSA once (`ARLE_DSV4_DSA_INDEXER=1`).
 
 The prompts vary in length and are processed sequentially in the same executor
-session, exercising slot reset / scratch reuse across request shapes. This is a
-correctness gate only; it deliberately does not report a performance A/B.
+session, exercising slot reset / scratch reuse across request shapes. The gate is
+relative correctness: official must diverge from legacy no earlier than legacy
+diverges from itself under the same config. Timing is reported as a sanity read,
+not as a formal A/B license.
 """
 
 from __future__ import annotations
@@ -49,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bin", default="target/release/examples/dsv4_parity")
     parser.add_argument("--max-new", type=int, default=8)
     parser.add_argument("--lengths", default=",".join(map(str, DEFAULT_LENGTHS)))
+    parser.add_argument(
+        "--legacy-runs",
+        type=int,
+        default=3,
+        help="same-config legacy repetitions used to estimate the non-determinism floor",
+    )
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -221,8 +229,42 @@ def coherent(text: str) -> bool:
     return not (len(head) >= 5 and len(set(head)) == 1)
 
 
+def first_divergence_index(left: list[int], right: list[int]) -> int | None:
+    for idx, (lhs, rhs) in enumerate(zip(left, right)):
+        if lhs != rhs:
+            return idx
+    if len(left) != len(right):
+        return min(len(left), len(right))
+    return None
+
+
+def floor_value(divergence: int | None, token_count: int) -> int:
+    return token_count if divergence is None else divergence
+
+
+def display_divergence(divergence: int | None) -> str:
+    return "none" if divergence is None else str(divergence)
+
+
+def legacy_floor_divergence(legacy_rows: list[dict], case_idx: int) -> int | None:
+    floor: int | None = None
+    for left_idx in range(len(legacy_rows)):
+        for right_idx in range(left_idx + 1, len(legacy_rows)):
+            div = first_divergence_index(
+                legacy_rows[left_idx][case_idx]["tokens"],
+                legacy_rows[right_idx][case_idx]["tokens"],
+            )
+            if div is None:
+                continue
+            if floor is None or div < floor:
+                floor = div
+    return floor
+
+
 def main() -> int:
     args = parse_args()
+    if args.legacy_runs < 2:
+        raise SystemExit("--legacy-runs must be >= 2")
     repo_root = Path(args.repo_root).resolve()
     model_path = Path(args.model_path)
     tokenizer = Tokenizer.from_file(str(model_path / "tokenizer.json"))
@@ -271,65 +313,84 @@ def main() -> int:
     }
 
     if args.parse_existing:
-        legacy1 = parse_variant_log("legacy1", output_dir / "legacy1.log")
-        legacy2 = parse_variant_log("legacy2", output_dir / "legacy2.log")
+        legacy_runs = [
+            parse_variant_log(f"legacy{idx}", output_dir / f"legacy{idx}.log")
+            for idx in range(1, args.legacy_runs + 1)
+        ]
         official = parse_variant_log("official", output_dir / "official.log")
     else:
-        legacy1 = run_variant(repo_root, env_base, "legacy1", False, output_dir / "legacy1.log")
-        legacy2 = run_variant(repo_root, env_base, "legacy2", False, output_dir / "legacy2.log")
+        legacy_runs = [
+            run_variant(
+                repo_root,
+                env_base,
+                f"legacy{idx}",
+                False,
+                output_dir / f"legacy{idx}.log",
+            )
+            for idx in range(1, args.legacy_runs + 1)
+        ]
         official = run_variant(repo_root, env_base, "official", True, output_dir / "official.log")
 
-    by_name = {"legacy1": legacy1, "legacy2": legacy2, "official": official}
+    by_name = {
+        **{f"legacy{idx}": rows for idx, rows in enumerate(legacy_runs, start=1)},
+        "official": official,
+    }
     report_rows = []
     all_pass = True
     for case in cases:
         idx = case["index"]
-        l1 = legacy1[idx]["tokens"]
-        l2 = legacy2[idx]["tokens"]
+        l1 = legacy_runs[0][idx]["tokens"]
         off = official[idx]["tokens"]
-        l1_text = decode(tokenizer, l1)
-        l2_text = decode(tokenizer, l2)
+        legacy_tokens = [run[idx]["tokens"] for run in legacy_runs]
+        legacy_texts = [decode(tokenizer, run[idx]["tokens"]) for run in legacy_runs]
         off_text = decode(tokenizer, off)
         answer = case["answer"].lower()
-        legacy_hit = answer in l1_text.lower() or answer in l2_text.lower()
+        legacy_hit = any(answer in text.lower() for text in legacy_texts)
         official_hit = answer in off_text.lower()
-        same_twice = l1 == l2
-        exact_to_legacy = off == l1 or off == l2
-        within_floor = exact_to_legacy or (not same_twice and legacy_hit and official_hit)
-        l1_ms = legacy1[idx].get("decode_ms_per_token")
+        legacy_divergence = legacy_floor_divergence(legacy_runs, idx)
+        official_divergence = first_divergence_index(off, l1)
+        same_twice = legacy_divergence is None
+        exact_to_legacy = any(off == tokens for tokens in legacy_tokens)
+        within_floor = floor_value(official_divergence, len(off)) >= floor_value(
+            legacy_divergence, len(l1)
+        )
+        l1_ms = legacy_runs[0][idx].get("decode_ms_per_token")
         off_ms = official[idx].get("decode_ms_per_token")
         decode_ms_delta = (
             None if l1_ms is None or off_ms is None else off_ms - l1_ms
         )
         prefill_ms_delta = (
             None
-            if legacy1[idx].get("prefill_ms") is None or official[idx].get("prefill_ms") is None
-            else official[idx]["prefill_ms"] - legacy1[idx]["prefill_ms"]
+            if legacy_runs[0][idx].get("prefill_ms") is None
+            or official[idx].get("prefill_ms") is None
+            else official[idx]["prefill_ms"] - legacy_runs[0][idx]["prefill_ms"]
         )
-        passed = legacy_hit and official_hit and coherent(off_text) and within_floor
+        passed = coherent(off_text) and within_floor
         all_pass = all_pass and passed
         report_rows.append(
             {
                 **case,
+                "legacy_floor_divergence_idx": legacy_divergence,
+                "official_divergence_idx": official_divergence,
+                "legacy_floor_divergence": display_divergence(legacy_divergence),
+                "official_divergence": display_divergence(official_divergence),
                 "legacy_same_twice": same_twice,
                 "legacy_hit": legacy_hit,
                 "official_hit": official_hit,
                 "official_exact_to_any_legacy": exact_to_legacy,
                 "within_floor": within_floor,
                 "pass": passed,
-                "legacy1_prefill_ms": legacy1[idx].get("prefill_ms"),
-                "legacy2_prefill_ms": legacy2[idx].get("prefill_ms"),
+                "legacy1_prefill_ms": legacy_runs[0][idx].get("prefill_ms"),
+                "legacy2_prefill_ms": legacy_runs[1][idx].get("prefill_ms"),
                 "official_prefill_ms": official[idx].get("prefill_ms"),
                 "prefill_ms_delta_official_minus_legacy1": prefill_ms_delta,
                 "legacy1_decode_ms_per_token": l1_ms,
-                "legacy2_decode_ms_per_token": legacy2[idx].get("decode_ms_per_token"),
+                "legacy2_decode_ms_per_token": legacy_runs[1][idx].get("decode_ms_per_token"),
                 "official_decode_ms_per_token": off_ms,
                 "decode_ms_per_token_delta_official_minus_legacy1": decode_ms_delta,
-                "legacy1_tokens": l1,
-                "legacy2_tokens": l2,
+                "legacy_tokens": legacy_tokens,
                 "official_tokens": off,
-                "legacy1_text": l1_text,
-                "legacy2_text": l2_text,
+                "legacy_texts": legacy_texts,
                 "official_text": off_text,
             }
         )
@@ -337,6 +398,7 @@ def main() -> int:
     payload = {
         "model_path": str(model_path),
         "max_new": args.max_new,
+        "legacy_runs": args.legacy_runs,
         "output_dir": str(output_dir),
         "variants": {name: len(rows) for name, rows in by_name.items()},
         "rows": report_rows,
@@ -346,21 +408,21 @@ def main() -> int:
 
     print(f"DSV4_VARIABLE_DSA_GATE output_dir={output_dir}")
     print(
-        "idx target prompt answer legacy_same legacy_hit official_hit within_floor "
+        "idx target prompt legacy_floor_idx official_div_idx within_floor "
         "legacy_prefill_ms official_prefill_ms legacy_decode_ms_tok official_decode_ms_tok "
         "delta_prefill_ms delta_decode_ms_tok pass"
     )
     for row in report_rows:
         print(
-            "{index} {target_len} {prompt_len} {answer} {legacy_same_twice} "
-            "{legacy_hit} {official_hit} {within_floor} "
+            "{index} {target_len} {prompt_len} {legacy_floor_divergence} "
+            "{official_divergence} {within_floor} "
             "{legacy1_prefill_ms} {official_prefill_ms} "
             "{legacy1_decode_ms_per_token} {official_decode_ms_per_token} "
             "{prefill_ms_delta_official_minus_legacy1} "
             "{decode_ms_per_token_delta_official_minus_legacy1} {pass}".format(**row)
         )
-        print(f"  legacy1 : {row['legacy1_text']!r}")
-        print(f"  legacy2 : {row['legacy2_text']!r}")
+        for legacy_idx, text in enumerate(row["legacy_texts"], start=1):
+            print(f"  legacy{legacy_idx}: {text!r}")
         print(f"  official: {row['official_text']!r}")
     return 0 if all_pass else 2
 
