@@ -569,6 +569,50 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    pub fn dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
+        q_input: *const super::Half,
+        q_fp8: *mut u8,
+        weight: *const super::Half,
+        weights_out: *mut f32,
+        weight_scale: f32,
+        freqs_cis: *const f32,
+        positions: *const i32,
+        batch_size: i32,
+        num_heads: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    pub fn dsv4_dsa_hadamard128_bf16_cuda(
+        input: *const super::Half,
+        output: *mut super::Half,
+        rows: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    pub fn dsv4_dsa_fused_store_index_k_cache_cuda(
+        key: *const super::Half,
+        index_k_with_scale: *mut u8,
+        out_cache_loc: *const i64,
+        num_tokens: i32,
+        page_size: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    pub fn dsv4_deepseek_v4_topk_transform_512_cuda(
+        scores: *const f32,
+        seq_lens: *const i32,
+        page_table: *const i32,
+        page_indices: *mut i32,
+        raw_indices: *mut i32,
+        score_stride: i64,
+        page_table_stride: i64,
+        output_stride: i64,
+        batch_size: i32,
+        topk: i32,
+        page_size: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     // ------------------------------------------------------------------
     // V2 FlashMLA support: bf16→f32 convert, TP repack/slice, CSA prep.
     // See:
