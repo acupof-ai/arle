@@ -130,10 +130,18 @@ steady csa_select launch: **grid (1,1,1), active SMs 1/78 = 1.28%, achieved occu
 "estimated speedup from launch-geometry underutilization: 98.72%"**. The op-count paradox
 (scoring ~100µs but wall 101ms) is resolved: the selector runs on ONE SM. (DRAM/stall counters
 failed in-context on the TP=8 multi-process ncu — but launch geometry + the per-kernel nsys
-breakdown already kill every other hypothesis.) **#39 IN PROGRESS:** Codex implementing the
-2-kernel split (parallel scoring across SMs + reused bitonic top-k), exact gate (selected-index
-byte-parity vs fused kernel + needle + decode-ms A/B), flag-gated default-off. First real perf
-landing of this campaign.
+breakdown already kill every other hypothesis.) **#39 — CORRECTED DIRECTION (ckl 2026-06-06: 别自己写算子,先抄业界最好的,删除所有自己写的算子):**
+do NOT hand-roll a parallel csa_select. The official DeepSeek DSA indexer is **already vendored
+& unwired** in `vendor/deepgemm/` — `fp8_paged_mqa_logits` (`sm90_fp8_paged_mqa_logits.cuh` +
+`csrc/apis/attention.hpp`) + `clean_logits`/top-k (`csrc/indexing/main.cu`) — the SAME kernel
+SGLang's DSA backend uses, properly multi-SM. This is the exact "present-but-unwired vendored
+kernel, hand-rolled duplicate" trap from [[../../memory/feedback_no_closed_door_solutions]] (the
+FlashMLA MLA kernel was the prior instance). The fix is a WIRE-UP (feed indexer-query +
+compressed index-keys in FP8 paged layout → logits → top-k → `selected`), then **DELETE
+dsv4_csa_select_kernel**. Gate: needle + same-twice floor + decode-ms A/B (FP8 logits differ on
+near-ties → not byte-identity). Constraints: kernel wants num_heads∈{32,64} (DSv4=64),
+head_dim=128 — confirm TP replicate-vs-shard of the indexer. **#40** broadens this to the whole
+hand-rolled `dsv4_attention.cu` kernel set (hybrid_attention→FlashMLA sparse_fwd, etc.).
 
 ## 3.9 (superseded) Earlier open questions the trace answered
 
