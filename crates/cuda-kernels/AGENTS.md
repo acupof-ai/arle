@@ -193,6 +193,35 @@ With `--features cuda,no-cuda`:
   §6.1.1 use smaller dims and need a different kernel (cute-DSL or hand-port);
   tracked as future work in that plan.
 
+## State-mutating change — enumerate every device buffer (事无巨细)
+
+Root `AGENTS.md` §0.1 in GPU terms. Any kernel / cache / scratch / rollback /
+quant change that mutates device state: **list EVERY buffer it writes, prove each
+is reverted / self-heals / snapshotted with the EXACT precondition** — no "should
+be fine". A partial fix that covers the obvious buffers and misses one is the
+default failure mode (DSv4 EAGLE rollback covered `compressor`+`indexer` running
+buffers but missed `sw_window_cache` + the FlashMLA `fp8_kv_pool` ring slot until
+the full enumeration forced it).
+
+- **Pre-allocate once, reuse.** Hold scratch/snapshot in the slot/state struct;
+  capture via D2D every step. NEVER `alloc_zeros` per decode step — churn + the
+  disabled-event-tracking premature-free hazard (`tensor.rs` event tracking off →
+  eager intermediates freed at Rust last-use, reused mid-async-kernel).
+- **Minimum granularity.** A ring buffer (`sw_window_cache`, the `fp8_kv_pool` SW
+  sub-pool) touched at ONE slot → save/restore that ONE slot `O(elem)`, not the
+  whole `O(ring)`. A ring self-heals a speculative write ONLY when
+  `seq_len < ring_size`; beyond that the slot aliases a still-live position.
+- **`compressed`-style grow buffers self-heal via their `seq_len`** (the stale row
+  beyond `seq_len` is overwritten by the next real write) — save the scalar, not
+  the data.
+- **Opt-in path only.** Gate the whole thing so the default decode is byte-for-byte
+  untouched; confirm baseline tok/s unchanged in a same-binary A/B. B=1 decode is
+  GPU/comm-bound — overhead-removal that overlaps GPU is wash; only less-compute /
+  comm-overlap / token-amortization move the wall.
+- **Correctness gate is correct-inference, not baseline byte-identity** (needle +
+  same-config-twice non-determinism floor) — MoE atomic-scatter is non-deterministic
+  run-to-run, so token-exact-vs-baseline is confounded.
+
 ## Distilled lessons (recurring ≥2 entries)
 
 - **Micro-kernel knobs (launch-shape sweep, vector-load, scale/row-pointer hoist, persistent
