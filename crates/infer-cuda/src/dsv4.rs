@@ -1304,6 +1304,7 @@ impl Dsv4Model {
 
     pub(crate) fn mtp_forward(
         &self,
+        slot: &mut Dsv4SlotState,
         h_prev: &DeviceVec,
         next_token: u32,
         position: u64,
@@ -1328,18 +1329,6 @@ impl Dsv4Model {
             self.config.hidden_size,
             self.config.hc_mult
         );
-
-        // The Phase-1 MTP probe must not write through the base FlashMLA decode
-        // KV arena. Run its one-token attention on the scalar SW path; Phase 2
-        // owns retained draft KV + rollback.
-        struct FlashMlaDecodeOverrideGuard;
-        impl Drop for FlashMlaDecodeOverrideGuard {
-            fn drop(&mut self) {
-                crate::attention::set_dsv4_flashmla_decode_override(None);
-            }
-        }
-        crate::attention::set_dsv4_flashmla_decode_override(Some(false));
-        let _flashmla_guard = FlashMlaDecodeOverrideGuard;
 
         let hidden_size = self.config.hidden_size;
         let hc_mult = self.config.hc_mult;
@@ -1389,7 +1378,22 @@ impl Dsv4Model {
             }
         }
 
-        let stream = self.run_mtp_transformer_layer(mtp, stream, next_token, position as usize)?;
+        let target_layer_idx = self.mtp_frozen_target_layer_idx(mtp)?;
+        let slot_attention_len = slot.attention.len();
+        let target_attention_state = slot.attention.get_mut(target_layer_idx).ok_or_else(|| {
+            anyhow!(
+                "DSv4 MTP frozen-KV target layer {target_layer_idx} outside slot attention len {}",
+                slot_attention_len
+            )
+        })?;
+        let stream = self.run_mtp_transformer_layer(
+            mtp,
+            stream,
+            next_token,
+            position as usize,
+            target_layer_idx,
+            target_attention_state,
+        )?;
 
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
         crate::hc::head_hidden_from_stream(
@@ -1407,12 +1411,48 @@ impl Dsv4Model {
         crate::executor::sample_cuda_token(ctx, &logits, &SamplingParams::default(), position)
     }
 
+    fn mtp_frozen_target_layer_idx(&self, mtp: &Dsv4MtpLayer) -> Result<usize> {
+        // SGLang's frozen-KV MTP harness maps assistant logical layer 0 to
+        // target physical layer 0. DSv4's shipped MTP layer is forced to
+        // compress_ratio=0 (SW-only), so the draft reads that committed target
+        // SW ring instead of a fresh one-token attention state.
+        let idx = if let Some(raw) = std::env::var_os("ARLE_DSV4_MTP_FROZEN_LAYER") {
+            raw.to_string_lossy().parse::<usize>().map_err(|err| {
+                anyhow!(
+                    "ARLE_DSV4_MTP_FROZEN_LAYER={} is not a usize: {err}",
+                    raw.to_string_lossy()
+                )
+            })?
+        } else {
+            0
+        };
+        let layer = self.layers.get(idx).ok_or_else(|| {
+            anyhow!(
+                "DSv4 MTP frozen-KV target layer {idx} outside base layer count {}",
+                self.layers.len()
+            )
+        })?;
+        ensure!(
+            mtp.layer.mode == DeepSeekV4AttentionMode::SlidingWindow,
+            "DSv4 MTP frozen-KV path expects the MTP layer to be SlidingWindow, got {:?}",
+            mtp.layer.mode
+        );
+        ensure!(
+            layer.mode == DeepSeekV4AttentionMode::SlidingWindow,
+            "DSv4 MTP frozen-KV target layer {idx} must be SlidingWindow for the current MTP layer, got {:?}",
+            layer.mode
+        );
+        Ok(idx)
+    }
+
     fn run_mtp_transformer_layer(
         &self,
         mtp: &Dsv4MtpLayer,
         stream: HiddenStates,
         token: u32,
         start_pos: usize,
+        target_layer_idx: usize,
+        target_attention_state: &mut crate::attention::Dsv4LayerAttentionState,
     ) -> Result<HiddenStates> {
         let layer = &mtp.layer;
         let ctx = &self.ctx;
@@ -1431,16 +1471,6 @@ impl Dsv4Model {
             "DSv4 MTP attention local width {local_width} is not a multiple of head_dim {}",
             self.config.head_dim
         );
-        let mut attention_state = crate::attention::Dsv4LayerAttentionState::new(
-            ctx,
-            &self.config,
-            layer.mode,
-            layer.compress_ratio,
-            1,
-            &self.kv_arena,
-            local_width / self.config.head_dim,
-            self.tp.config().world_size,
-        )?;
         let mut moe_scratch =
             crate::moe::Dsv4MoeDecodeScratch::new(ctx, &self.moe_config, &self.split, &layer.moe)?;
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
@@ -1465,9 +1495,9 @@ impl Dsv4Model {
             &layer.attention,
             layer.mode,
             layer.compress_ratio,
-            0,
+            target_layer_idx,
             &attn_normed,
-            &mut attention_state,
+            target_attention_state,
             start_pos,
             Some(&start_pos_device),
             &self.tp,
