@@ -798,6 +798,100 @@ pub unsafe fn dsv4_deepgemm_fp8_gemm_nt(
     Ok(())
 }
 
+/// DeepGEMM DSA indexer metadata for the official FP8 paged-MQA logits kernel.
+///
+/// `context_lens` is `[batch_size, next_n]` i32 and `schedule_metadata` is
+/// `[(num_sms + 1), 2]` i32. This is the raw native bridge over vendored
+/// DeepGEMM; it does not perform top-k.
+///
+/// # Safety
+/// All pointers must be valid on `stream`; `schedule_metadata` must have room
+/// for `(num_sms + 1) * 2` i32 values.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_paged_mqa_logits_metadata(
+    context_lens: RawDevicePtr<i32>,
+    schedule_metadata: RawDevicePtr<i32>,
+    batch_size: usize,
+    next_n: usize,
+    block_kv: usize,
+    num_sms: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_paged_mqa_logits_metadata_cuda(
+            context_lens.as_ptr(),
+            schedule_metadata.as_mut_ptr(),
+            i32::try_from(batch_size)?,
+            i32::try_from(next_n)?,
+            i32::try_from(block_kv)?,
+            i32::try_from(num_sms)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Official DeepGEMM FP8 paged-MQA logits for the DSv4 DSA indexer.
+///
+/// This computes logits only. Query/cache FP8 packing and top-k are separate
+/// official/OSS adoption pieces.
+///
+/// # Safety
+/// All pointers must be valid on `stream`. Layouts must match the DeepGEMM
+/// contract: `q=[B,next_n,H,D]` E4M3, `kv_cache=[blocks,64,1,D+4]` byte
+/// storage split into FP8 values and FP32 scales, `weights=[B*next_n,H]`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_fp8_paged_mqa_logits(
+    q: RawDevicePtr<u8>,
+    kv_cache: RawDevicePtr<u8>,
+    kv_cache_scales: RawDevicePtr<f32>,
+    weights: RawDevicePtr<f32>,
+    context_lens: RawDevicePtr<i32>,
+    block_table: RawDevicePtr<i32>,
+    schedule_meta: RawDevicePtr<i32>,
+    logits: RawDevicePtr<f32>,
+    batch_size: usize,
+    next_n: usize,
+    num_heads: usize,
+    head_dim: usize,
+    num_kv_blocks: usize,
+    block_kv: usize,
+    max_context_len: usize,
+    logits_stride: usize,
+    block_table_stride: usize,
+    kv_cache_stride_bytes: usize,
+    num_sms: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
+            q.as_ptr(),
+            kv_cache.as_ptr(),
+            kv_cache_scales.as_ptr(),
+            weights.as_ptr(),
+            context_lens.as_ptr(),
+            block_table.as_ptr(),
+            schedule_meta.as_ptr(),
+            logits.as_mut_ptr(),
+            i32::try_from(batch_size)?,
+            i32::try_from(next_n)?,
+            i32::try_from(num_heads)?,
+            i32::try_from(head_dim)?,
+            i32::try_from(num_kv_blocks)?,
+            i32::try_from(block_kv)?,
+            i32::try_from(max_context_len)?,
+            i32::try_from(logits_stride)?,
+            i32::try_from(block_table_stride)?,
+            i32::try_from(kv_cache_stride_bytes)?,
+            i32::try_from(num_sms)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Fused clamped-SwiGLU over the `[gate | up]` w13 GEMM output + per-128-block
 /// requantize to the FP8 activation the w2 GEMM reads. Wraps
 /// [`ffi::dsv4_deepgemm_swiglu_quantize_w13_cuda`]; `limit` is the SwiGLU clamp.

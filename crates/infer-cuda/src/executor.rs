@@ -712,6 +712,28 @@ impl Dsv4CudaExecutor {
         );
         let base_next = argmax[0];
         let bonus = argmax[1];
+        let matched = base_next == draft;
+        if std::env::var("ARLE_DSV4_MTP_DRAFT_DUMP").as_deref() == Ok("1")
+            && self.model.tp.config().rank == 0
+        {
+            let total_before = self.mtp_accepts + self.mtp_rejects;
+            let matches_before = self.mtp_accepts;
+            let total_after = total_before + 1;
+            let matches_after = matches_before + usize::from(matched);
+            let accuracy = (matches_after as f64) / (total_after as f64);
+            eprintln!(
+                "[dsv4-mtp-draft] step={} start_pos={} pending={} draft={} actual={} match={} depth1_match_total={} depth1_total={} depth1_accuracy={:.6}",
+                total_after,
+                start_pos,
+                pending,
+                draft,
+                base_next,
+                matched,
+                matches_after,
+                total_after,
+                accuracy
+            );
+        }
         if base_next == draft {
             let hidden_for_draft = hiddens.remove(1);
             spec.pending = Some(bonus);
