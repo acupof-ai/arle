@@ -469,12 +469,82 @@ impl Dsv4FusedWqkvDecodeScratch {
     }
 }
 
+struct Dsv4PrefillDeepGemmLinearScratch {
+    input_fp8: CudaSlice<u8>,
+    input_scales: CudaSlice<f32>,
+    qkv_raw: HiddenStates,
+    active_experts: CudaSlice<i32>,
+    active_offsets: CudaSlice<i32>,
+    active_counts: CudaSlice<i32>,
+    max_m: usize,
+    max_k: usize,
+    max_scale_stride_m: usize,
+    hidden_dim: usize,
+    q_lora_rank: usize,
+    head_dim: usize,
+}
+
+impl Dsv4PrefillDeepGemmLinearScratch {
+    fn new(ctx: &DeviceContext, config: &DeepSeekV4Config, max_seq_len: usize) -> Result<Self> {
+        let max_m = max_seq_len.max(1);
+        let max_k = config.hidden_size;
+        let q_lora_rank = config.q_lora_rank;
+        let head_dim = config.head_dim;
+        let max_scale_stride_m = max_m.div_ceil(4) * 4;
+        let scale_cols = max_k.div_ceil(128);
+        Ok(Self {
+            input_fp8: ctx
+                .stream
+                .alloc_zeros::<u8>(max_m.checked_mul(max_k).ok_or_else(|| {
+                    anyhow!(
+                        "DSv4 prefill DeepGEMM linear input scratch overflow: M={} K={}",
+                        max_m,
+                        max_k
+                    )
+                })?)
+                .map_err(|e| anyhow!("DSv4 prefill DeepGEMM linear input alloc failed: {e}"))?,
+            input_scales: ctx
+                .stream
+                .alloc_zeros::<f32>(max_scale_stride_m.checked_mul(scale_cols).ok_or_else(
+                    || {
+                        anyhow!(
+                            "DSv4 prefill DeepGEMM linear scale scratch overflow: M={} K={}",
+                            max_scale_stride_m,
+                            max_k
+                        )
+                    },
+                )?)
+                .map_err(|e| anyhow!("DSv4 prefill DeepGEMM linear scales alloc failed: {e}"))?,
+            qkv_raw: unsafe { HiddenStates::uninit(ctx, q_lora_rank + head_dim, max_m)? },
+            active_experts: ctx
+                .stream
+                .clone_htod(&[0_i32])
+                .map_err(|e| anyhow!("DSv4 prefill DeepGEMM active_experts H2D failed: {e}"))?,
+            active_offsets: ctx
+                .stream
+                .clone_htod(&[0_i32])
+                .map_err(|e| anyhow!("DSv4 prefill DeepGEMM active_offsets H2D failed: {e}"))?,
+            active_counts: ctx
+                .stream
+                .clone_htod(&[0_i32])
+                .map_err(|e| anyhow!("DSv4 prefill DeepGEMM active_counts H2D failed: {e}"))?,
+            max_m,
+            max_k,
+            max_scale_stride_m,
+            hidden_dim: config.hidden_size,
+            q_lora_rank,
+            head_dim,
+        })
+    }
+}
+
 pub(crate) struct Dsv4LayerAttentionState {
     sw_window_cache: CudaSlice<half::bf16>,
     compressor: Option<Dsv4CompressorState>,
     indexer: Option<Dsv4CompressorState>,
     flashmla: Option<Dsv4FlashMlaDecodeState>,
     fused_wqkv: Option<Dsv4FusedWqkvDecodeScratch>,
+    prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
 }
 
 pub(crate) struct Dsv4LayerAttentionSnapshot {
@@ -721,12 +791,22 @@ impl Dsv4LayerAttentionState {
         } else {
             None
         };
+        let prefill_linear = if dsv4_fp8_linear_deepgemm_enabled()? {
+            Some(Dsv4PrefillDeepGemmLinearScratch::new(
+                ctx,
+                config,
+                max_seq_len,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             sw_window_cache,
             compressor,
             indexer,
             flashmla,
             fused_wqkv,
+            prefill_linear,
         })
     }
 
@@ -1472,6 +1552,137 @@ pub(crate) fn mla_linear(
     Ok(())
 }
 
+fn run_fused_wqkv_prefill(
+    ctx: &DeviceContext,
+    attention: &Dsv4Attention,
+    hidden: &HiddenStates,
+    scratch: &mut Dsv4PrefillDeepGemmLinearScratch,
+    c_q: &mut HiddenStates,
+    kv_raw: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        hidden.seq_len > 1,
+        "DSv4 fused wqkv prefill path requires seq_len>1, got {}",
+        hidden.seq_len
+    );
+    ensure!(
+        hidden.hidden_dim == scratch.hidden_dim,
+        "DSv4 fused wqkv prefill hidden dim mismatch: hidden={} scratch={}",
+        hidden.hidden_dim,
+        scratch.hidden_dim
+    );
+    ensure!(
+        c_q.hidden_dim == scratch.q_lora_rank
+            && kv_raw.hidden_dim == scratch.head_dim
+            && c_q.seq_len == hidden.seq_len
+            && kv_raw.seq_len == hidden.seq_len,
+        "DSv4 fused wqkv prefill output shape mismatch: c_q={}x{} kv={}x{} scratch q={} kv={} tokens={}",
+        c_q.hidden_dim,
+        c_q.seq_len,
+        kv_raw.hidden_dim,
+        kv_raw.seq_len,
+        scratch.q_lora_rank,
+        scratch.head_dim,
+        hidden.seq_len
+    );
+    let cache = attention.wqkv_a_deepgemm.as_ref().ok_or_else(|| {
+        anyhow!("ARLE_DSV4_FP8_LINEAR_DEEPGEMM=1 but DSv4 fused wqkv cache was not loaded")
+    })?;
+    ensure!(
+        cache.rows == scratch.q_lora_rank + scratch.head_dim && cache.cols == scratch.hidden_dim,
+        "DSv4 fused wqkv prefill cache shape {}x{} != expected {}x{}",
+        cache.rows,
+        cache.cols,
+        scratch.q_lora_rank + scratch.head_dim,
+        scratch.hidden_dim
+    );
+    let m = hidden.seq_len;
+    let n = cache.rows;
+    let k = cache.cols;
+    ensure!(
+        m <= scratch.max_m && k <= scratch.max_k,
+        "DSv4 fused wqkv prefill scratch too small: need M={} K={}, have M={} K={}",
+        m,
+        k,
+        scratch.max_m,
+        scratch.max_k
+    );
+    let scale_stride_m = m.div_ceil(4) * 4;
+    let scale_cols = k.div_ceil(128);
+    ensure!(
+        scale_stride_m <= scratch.max_scale_stride_m
+            && scale_stride_m * scale_cols <= scratch.input_scales.len()
+            && m * k <= scratch.input_fp8.len(),
+        "DSv4 fused wqkv prefill scratch extent mismatch: M={} K={} scale_stride={} scales={} fp8={}",
+        m,
+        k,
+        scale_stride_m,
+        scratch.input_scales.len(),
+        scratch.input_fp8.len()
+    );
+    let active_count = i32::try_from(m)
+        .map_err(|_| anyhow!("DSv4 fused wqkv prefill token count {m} overflows i32"))?;
+    ctx.stream
+        .memcpy_htod(&[active_count], &mut scratch.active_counts)
+        .map_err(|e| anyhow!("DSv4 fused wqkv prefill active_counts H2D failed: {e}"))?;
+    let stream = ctx.stream.cu_stream();
+    unsafe {
+        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+            cache_ptr(&hidden.data, ctx),
+            cache_ptr(&scratch.input_fp8, ctx),
+            cache_ptr(&scratch.input_scales, ctx),
+            cache_ptr(&scratch.active_experts, ctx),
+            cache_ptr(&scratch.active_offsets, ctx),
+            cache_ptr(&scratch.active_counts, ctx),
+            1,
+            m,
+            k,
+            scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 fused wqkv prefill activation quantize failed: {e}"))?;
+        cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+            cache_ptr(&scratch.input_fp8, ctx),
+            cache_ptr(&scratch.input_scales, ctx),
+            cache_ptr(&cache.weight, ctx),
+            cache_ptr(&cache.scales, ctx),
+            cache_ptr(&scratch.qkv_raw.data, ctx),
+            m,
+            n,
+            k,
+            scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 fused wqkv prefill DeepGEMM dense failed: {e}"))?;
+        let (qkv_ptr, _qkv_guard) = scratch.qkv_raw.data.device_ptr(&ctx.stream);
+        let (cq_ptr, _cq_guard) = c_q.data.device_ptr_mut(&ctx.stream);
+        ffi::dsv4_tp_out_slice_cuda(
+            qkv_ptr as *const ffi::Half,
+            cq_ptr as *mut ffi::Half,
+            m as i32,
+            n as i32,
+            scratch.q_lora_rank as i32,
+            0,
+            stream,
+        )
+        .result()
+        .map_err(|e| anyhow!("DSv4 fused wqkv prefill c_q slice failed: {e}"))?;
+        let (kv_ptr, _kv_guard) = kv_raw.data.device_ptr_mut(&ctx.stream);
+        ffi::dsv4_tp_out_slice_cuda(
+            qkv_ptr as *const ffi::Half,
+            kv_ptr as *mut ffi::Half,
+            m as i32,
+            n as i32,
+            scratch.head_dim as i32,
+            scratch.q_lora_rank as i32,
+            stream,
+        )
+        .result()
+        .map_err(|e| anyhow!("DSv4 fused wqkv prefill kv slice failed: {e}"))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn mla_linear_vec(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -1578,6 +1789,10 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
 
 fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
     env_flag("ARLE_DSV4_FLASHMLA_PREFILL")
+}
+
+fn dsv4_fp8_linear_deepgemm_enabled() -> Result<bool> {
+    env_flag("ARLE_DSV4_FP8_LINEAR_DEEPGEMM")
 }
 
 /// Per-layer attention-output localizer (Track A FlashMLA-prefill diagnosis).
@@ -2815,12 +3030,10 @@ pub(crate) fn mla_attention(
     let start_pos_i32 = i32::try_from(start_pos)
         .map_err(|_| anyhow::anyhow!("DSv4 MLA start_pos {start_pos} overflows i32"))?;
 
-    // ── 1+2. Q/KV LoRA. SGLang fuses the first projections
-    // (`wq_a | wkv`) into one wqkv_a call. ARLE only enables that structure for
-    // B=1 decode: the fused output's two slices are contiguous, so the existing
-    // RMSNorm kernel can consume raw pointer offsets without adding a split
-    // kernel. Multi-token prefill stays on the scalar reference path until ARLE
-    // grows strided HiddenStates views or a fused split+norm kernel.
+    // ── 1+2. Q/KV LoRA. Decode uses the existing B=1 fused (`wq_a | wkv`)
+    // path. Prefill can opt into the same fused weight cache via
+    // ARLE_DSV4_FP8_LINEAR_DEEPGEMM; the default branch below preserves the
+    // scalar reference order exactly.
     let fused_wqkv = token_count == 1 && dsv4_fused_wqkv_decode_enabled()?;
     let (c_q_normed, q_raw, kv_normed) = if fused_wqkv {
         let scratch = state.fused_wqkv.as_mut().ok_or_else(|| {
@@ -2832,6 +3045,35 @@ pub(crate) fn mla_attention(
         })?;
         drop(nvtx_wqkv);
         out
+    } else if token_count > 1 && dsv4_fp8_linear_deepgemm_enabled()? {
+        let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
+        let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
+        let scratch = state.prefill_linear.as_mut().ok_or_else(|| {
+            anyhow!(
+                "ARLE_DSV4_FP8_LINEAR_DEEPGEMM=1 but prefill fused wqkv scratch was not allocated"
+            )
+        })?;
+        let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused_prefill");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused_prefill", || {
+            run_fused_wqkv_prefill(ctx, attention, hidden, scratch, &mut c_q, &mut kv_raw)
+        })?;
+        drop(nvtx_wqkv);
+        keepalive.keep_hidden(&c_q);
+        let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
+        keepalive.keep_hidden(&c_q_normed);
+        let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
+        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+            dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+        })?;
+        drop(nvtx_wq_b);
+        keepalive.keep_hidden(&q_raw);
+
+        // KV latent: wkv (down to the single compressed latent) → kv_norm.
+        keepalive.keep_hidden(&kv_raw);
+        let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
+        keepalive.keep_hidden(&kv_normed);
+        (c_q_normed, q_raw, kv_normed)
     } else {
         // Q-LoRA: wq_a (down) → q_norm RMSNorm → wq_b (up to per-head Q).
         // SAFETY: dsv4_linear writes the full c_q buffer.
