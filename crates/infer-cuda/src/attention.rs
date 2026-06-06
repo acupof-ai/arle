@@ -2003,11 +2003,26 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
 }
 
 fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
-    env_flag("ARLE_DSV4_FLASHMLA_PREFILL")
+    // Default ON: vendored FlashMLA sparse prefill replaces the scalar
+    // SW/CSA/HCA attention math. Licensed 2026-06-07 on the TP=8/EP=8 H20 pod:
+    // 4096-token warm prefill 7189 -> 4299 ms, and the 2048-token edge case is
+    // within the legacy same-config floor on both synthetic and real-prose prompts.
+    // Opt out with ARLE_DSV4_FLASHMLA_PREFILL=0.
+    Ok(!matches!(
+        std::env::var("ARLE_DSV4_FLASHMLA_PREFILL").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    ))
 }
 
 fn dsv4_fp8_linear_deepgemm_enabled() -> Result<bool> {
-    env_flag("ARLE_DSV4_FP8_LINEAR_DEEPGEMM")
+    // Default ON: prefill wq_a|wkv projection fusion routes the shared hidden
+    // activation through FP8 DeepGEMM instead of the scalar FP8 GEMV path. Licensed
+    // 2026-06-07 by the six-shape within-floor gate; keep the scalar fallback via
+    // ARLE_DSV4_FP8_LINEAR_DEEPGEMM=0.
+    Ok(!matches!(
+        std::env::var("ARLE_DSV4_FP8_LINEAR_DEEPGEMM").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    ))
 }
 
 fn dsv4_dsa_official_enabled() -> Result<bool> {
