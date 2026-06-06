@@ -1600,4 +1600,42 @@ extern "C" CUresult dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
   }
 }
 
+extern "C" CUresult dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
+    const unsigned char* q,
+    const unsigned char* kv_cache_with_scale,
+    const float* weights,
+    const int* context_lens,
+    const int* block_table,
+    const int* schedule_meta,
+    float* logits,
+    int batch_size,
+    int next_n,
+    int num_heads,
+    int head_dim,
+    int num_kv_blocks,
+    int block_kv,
+    int max_context_len,
+    int logits_stride,
+    int block_table_stride,
+    int kv_cache_stride_bytes,
+    int num_sms,
+    CUstream stream) {
+  if (kv_cache_with_scale == nullptr || block_kv != 64 || head_dim <= 0 ||
+      kv_cache_stride_bytes < block_kv * (head_dim + static_cast<int>(sizeof(float)))) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const auto* kv_cache_scales =
+      reinterpret_cast<const float*>(kv_cache_with_scale + block_kv * head_dim);
+  try {
+    return launch_sm90_fp8_paged_mqa_logits(
+        q, kv_cache_with_scale, kv_cache_scales, weights, context_lens, block_table,
+        schedule_meta, logits, batch_size, next_n, num_heads, head_dim, num_kv_blocks,
+        block_kv, max_context_len, logits_stride, block_table_stride,
+        kv_cache_stride_bytes, num_sms, stream);
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM FP8 paged MQA fused-cache bridge failed: %s\n", err.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+}
+
 #endif  // ARLE_ENABLE_DEEPGEMM_NATIVE

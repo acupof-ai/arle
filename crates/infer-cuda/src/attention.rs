@@ -538,6 +538,200 @@ impl Dsv4PrefillDeepGemmLinearScratch {
     }
 }
 
+struct Dsv4DsaOfficialState {
+    key_cache: CudaSlice<u8>,
+    rotated_keys: CudaSlice<half::bf16>,
+    cache_locs: CudaSlice<i64>,
+    q_fp8: CudaSlice<u8>,
+    weights: CudaSlice<f32>,
+    context_lens: CudaSlice<i32>,
+    positions: CudaSlice<i32>,
+    page_table_identity: CudaSlice<i32>,
+    freqs_cis: CudaSlice<f32>,
+    sched_meta: CudaSlice<i32>,
+    logits: CudaSlice<f32>,
+    raw_indices: CudaSlice<i32>,
+    packed_rows: usize,
+    max_tokens: usize,
+    compressed_capacity: usize,
+    num_pages: usize,
+    num_heads: usize,
+    head_dim: usize,
+    logits_stride: usize,
+    num_sms: usize,
+}
+
+impl Dsv4DsaOfficialState {
+    fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        compress_ratio: usize,
+        max_seq_len: usize,
+    ) -> Result<Self> {
+        ensure!(
+            config.index_head_dim == 128,
+            "Official DSv4 DSA indexer requires index_head_dim=128, got {}",
+            config.index_head_dim
+        );
+        ensure!(
+            config.index_n_heads == 32 || config.index_n_heads == 64,
+            "Official DSv4 DSA indexer requires 32/64 heads, got {}",
+            config.index_n_heads
+        );
+        let compressed_capacity = max_seq_len.div_ceil(compress_ratio).max(1);
+        let page_size = 64usize;
+        let num_pages = compressed_capacity.div_ceil(page_size).max(1);
+        let key_cache_bytes = num_pages
+            .checked_mul(page_size * (config.index_head_dim + std::mem::size_of::<f32>()))
+            .ok_or_else(|| anyhow!("DSv4 official DSA key cache size overflow"))?;
+        let max_tokens = max_seq_len.max(1);
+        let q_elems = max_tokens
+            .checked_mul(config.index_n_heads)
+            .and_then(|v| v.checked_mul(config.index_head_dim))
+            .ok_or_else(|| anyhow!("DSv4 official DSA q scratch size overflow"))?;
+        let logits_stride = compressed_capacity.div_ceil(256) * 256;
+        let logits_elems = max_tokens
+            .checked_mul(logits_stride)
+            .ok_or_else(|| anyhow!("DSv4 official DSA logits scratch size overflow"))?;
+        let cache_locs_h: Vec<i64> = (0..compressed_capacity)
+            .map(|v| i64::try_from(v).expect("compressed capacity fits i64"))
+            .collect();
+        let freqs_cis_h = dsv4_dsa_freqs_cis_real(config, compress_ratio, max_seq_len)?;
+        let page_table_h: Vec<i32> = (0..num_pages)
+            .map(|v| i32::try_from(v).expect("page table fits i32"))
+            .collect();
+        let num_sms = std::env::var("ARLE_DSV4_DSA_INDEXER_SMS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(78);
+        Ok(Self {
+            key_cache: ctx
+                .stream
+                .alloc_zeros::<u8>(key_cache_bytes)
+                .map_err(|e| anyhow!("DSv4 official DSA key cache alloc failed: {e}"))?,
+            rotated_keys: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(compressed_capacity * config.index_head_dim)
+                .map_err(|e| anyhow!("DSv4 official DSA rotated key alloc failed: {e}"))?,
+            cache_locs: ctx
+                .stream
+                .clone_htod(&cache_locs_h)
+                .map_err(|e| anyhow!("DSv4 official DSA cache loc upload failed: {e}"))?,
+            q_fp8: ctx
+                .stream
+                .alloc_zeros::<u8>(q_elems)
+                .map_err(|e| anyhow!("DSv4 official DSA q fp8 alloc failed: {e}"))?,
+            weights: ctx
+                .stream
+                .alloc_zeros::<f32>(max_tokens * config.index_n_heads)
+                .map_err(|e| anyhow!("DSv4 official DSA weights alloc failed: {e}"))?,
+            context_lens: ctx
+                .stream
+                .alloc_zeros::<i32>(max_tokens)
+                .map_err(|e| anyhow!("DSv4 official DSA context lens alloc failed: {e}"))?,
+            positions: ctx
+                .stream
+                .alloc_zeros::<i32>(max_tokens)
+                .map_err(|e| anyhow!("DSv4 official DSA positions alloc failed: {e}"))?,
+            page_table_identity: ctx
+                .stream
+                .clone_htod(&page_table_h)
+                .map_err(|e| anyhow!("DSv4 official DSA page table upload failed: {e}"))?,
+            freqs_cis: ctx
+                .stream
+                .clone_htod(&freqs_cis_h)
+                .map_err(|e| anyhow!("DSv4 official DSA freqs_cis upload failed: {e}"))?,
+            sched_meta: ctx
+                .stream
+                .alloc_zeros::<i32>((num_sms + 1) * 2)
+                .map_err(|e| anyhow!("DSv4 official DSA sched meta alloc failed: {e}"))?,
+            logits: ctx
+                .stream
+                .alloc_zeros::<f32>(logits_elems)
+                .map_err(|e| anyhow!("DSv4 official DSA logits alloc failed: {e}"))?,
+            raw_indices: ctx
+                .stream
+                .alloc_zeros::<i32>(max_tokens * config.index_topk)
+                .map_err(|e| anyhow!("DSv4 official DSA raw indices alloc failed: {e}"))?,
+            packed_rows: 0,
+            max_tokens,
+            compressed_capacity,
+            num_pages,
+            num_heads: config.index_n_heads,
+            head_dim: config.index_head_dim,
+            logits_stride,
+            num_sms,
+        })
+    }
+
+    fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+        self.packed_rows = 0;
+        ctx.stream
+            .memset_zeros(&mut self.key_cache)
+            .map_err(|e| anyhow!("DSv4 official DSA key cache reset failed: {e}"))?;
+        Ok(())
+    }
+}
+
+fn dsv4_dsa_freqs_cis_real(
+    config: &DeepSeekV4Config,
+    compress_ratio: usize,
+    max_seq_len: usize,
+) -> Result<Vec<f32>> {
+    ensure!(
+        config.qk_rope_head_dim.is_multiple_of(2),
+        "DSv4 official DSA RoPE dim {} must be even",
+        config.qk_rope_head_dim
+    );
+    let dim = config.qk_rope_head_dim;
+    let half = dim / 2;
+    let base = if compress_ratio > 0 {
+        config.compress_rope_theta
+    } else {
+        config.rope_theta
+    } as f64;
+    let original_seq_len = if compress_ratio > 0 {
+        config.rope_parameters.original_max_position_embeddings
+    } else {
+        0
+    };
+    let factor = config.rope_parameters.factor as f64;
+    let beta_fast = config.rope_parameters.beta_fast as f64;
+    let beta_slow = config.rope_parameters.beta_slow as f64;
+    let mut inv_freq = Vec::with_capacity(half);
+    for pair in 0..half {
+        let mut freq = 1.0f64 / base.powf((2 * pair) as f64 / dim as f64);
+        if original_seq_len > 0 {
+            let find_correction_dim = |num_rotations: f64| -> f64 {
+                dim as f64
+                    * ((original_seq_len as f64 / (num_rotations * 2.0 * std::f64::consts::PI))
+                        .ln())
+                    / (2.0 * base.ln())
+            };
+            let low = find_correction_dim(beta_fast).floor().max(0.0);
+            let high = find_correction_dim(beta_slow).ceil().min((dim - 1) as f64);
+            let mut high_adj = high;
+            if (low - high_adj).abs() < f64::EPSILON {
+                high_adj += 0.001;
+            }
+            let ramp = ((pair as f64 - low) / (high_adj - low)).clamp(0.0, 1.0);
+            let smooth = 1.0 - ramp;
+            freq = freq / factor * (1.0 - smooth) + freq * smooth;
+        }
+        inv_freq.push(freq);
+    }
+
+    let mut out = vec![0.0f32; max_seq_len * dim];
+    for pos in 0..max_seq_len {
+        for pair in 0..half {
+            let theta = pos as f64 * inv_freq[pair];
+            out[pos * dim + 2 * pair] = theta.cos() as f32;
+            out[pos * dim + 2 * pair + 1] = theta.sin() as f32;
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) struct Dsv4LayerAttentionState {
     sw_window_cache: CudaSlice<half::bf16>,
     compressor: Option<Dsv4CompressorState>,
@@ -545,6 +739,7 @@ pub(crate) struct Dsv4LayerAttentionState {
     flashmla: Option<Dsv4FlashMlaDecodeState>,
     fused_wqkv: Option<Dsv4FusedWqkvDecodeScratch>,
     prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
+    dsa_official: Option<Dsv4DsaOfficialState>,
 }
 
 pub(crate) struct Dsv4LayerAttentionSnapshot {
@@ -800,6 +995,17 @@ impl Dsv4LayerAttentionState {
         } else {
             None
         };
+        let dsa_official =
+            if mode == DeepSeekV4AttentionMode::CompressedSparse && dsv4_dsa_official_enabled()? {
+                Some(Dsv4DsaOfficialState::new(
+                    ctx,
+                    config,
+                    compress_ratio,
+                    max_seq_len,
+                )?)
+            } else {
+                None
+            };
         Ok(Self {
             sw_window_cache,
             compressor,
@@ -807,6 +1013,7 @@ impl Dsv4LayerAttentionState {
             flashmla,
             fused_wqkv,
             prefill_linear,
+            dsa_official,
         })
     }
 
@@ -822,6 +1029,9 @@ impl Dsv4LayerAttentionState {
         }
         if let Some(flashmla) = &mut self.flashmla {
             flashmla.reset(ctx)?;
+        }
+        if let Some(dsa) = &mut self.dsa_official {
+            dsa.reset(ctx)?;
         }
         Ok(())
     }
@@ -1793,6 +2003,10 @@ fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
 
 fn dsv4_fp8_linear_deepgemm_enabled() -> Result<bool> {
     env_flag("ARLE_DSV4_FP8_LINEAR_DEEPGEMM")
+}
+
+fn dsv4_dsa_official_enabled() -> Result<bool> {
+    env_flag("ARLE_DSV4_DSA_INDEXER")
 }
 
 /// Per-layer attention-output localizer (Track A FlashMLA-prefill diagnosis).
@@ -3295,6 +3509,7 @@ pub(crate) fn mla_attention(
                 start_pos,
                 start_pos_device,
                 true,
+                0,
                 keepalive,
             )?;
         }
@@ -3305,6 +3520,24 @@ pub(crate) fn mla_attention(
                     "DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights"
                 )
             })?;
+            let use_official_dsa = dsv4_dsa_official_enabled()?;
+            let indexer_rope_original_seq_len = if use_official_dsa {
+                i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
+                    |_| {
+                        anyhow!(
+                            "DSv4 official DSA original_max_position_embeddings {} overflows i32",
+                            config.rope_parameters.original_max_position_embeddings
+                        )
+                    },
+                )?
+            } else {
+                0
+            };
+            let indexer_rows_before = state
+                .indexer
+                .as_ref()
+                .map(|s| s.compressed.seq_len)
+                .unwrap_or(0);
             // Indexer keys: a second compressor over index_head_dim keys (no APE
             // gate on the keys — `apply_rope = true`, head_dim = index_head_dim).
             {
@@ -3324,15 +3557,22 @@ pub(crate) fn mla_attention(
                     true,
                     start_pos,
                     start_pos_device,
-                    false,
+                    use_official_dsa,
+                    indexer_rope_original_seq_len,
                     keepalive,
                 )?;
             }
+            let indexer_rows_after = state
+                .indexer
+                .as_ref()
+                .map(|s| s.compressed.seq_len)
+                .unwrap_or(0);
             let index_keys = &state
                 .indexer
                 .as_ref()
                 .expect("indexer state checked above")
                 .compressed;
+            let official = state.dsa_official.as_mut();
             Some(csa_select(
                 ctx,
                 config,
@@ -3341,6 +3581,9 @@ pub(crate) fn mla_attention(
                 hidden,
                 &c_q_normed,
                 index_keys,
+                official,
+                indexer_rows_before,
+                indexer_rows_after,
                 start_pos,
                 start_pos_device,
                 compress_ratio,
@@ -3561,6 +3804,7 @@ fn compressor_forward(
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     apply_rope: bool,
+    rope_original_seq_len: i32,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
     ensure!(ratio > 0, "DSv4 compressor ratio must be non-zero");
@@ -3653,7 +3897,7 @@ fn compressor_forward(
                     config.rms_norm_eps,
                     rope_dim as i32,
                     rope_base,
-                    0,
+                    rope_original_seq_len,
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
@@ -3683,7 +3927,7 @@ fn compressor_forward(
                     config.rms_norm_eps,
                     rope_dim as i32,
                     rope_base,
-                    0,
+                    rope_original_seq_len,
                     rope.factor,
                     rope.beta_fast,
                     rope.beta_slow,
@@ -3709,6 +3953,9 @@ fn csa_select(
     hidden: &HiddenStates,
     c_q_normed: &HiddenStates,
     keys: &HiddenStates,
+    official: Option<&mut Dsv4DsaOfficialState>,
+    indexer_rows_before: usize,
+    indexer_rows_after: usize,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     ratio: usize,
@@ -3759,6 +4006,27 @@ fn csa_select(
         .map_err(|e| anyhow::anyhow!("DSv4 CSA selected alloc failed: {e}"))?;
     let score_scale =
         (config.index_head_dim as f32).powf(-0.5) * (config.index_n_heads as f32).powf(-0.5);
+    if let Some(official) = official {
+        if let Some(selected) = csa_select_official_decode(
+            ctx,
+            config,
+            &q_i,
+            &weights,
+            keys,
+            official,
+            indexer_rows_before,
+            indexer_rows_after,
+            key_count,
+            start_pos,
+            start_pos_device,
+            ratio,
+            local_index_heads,
+            score_scale,
+            keepalive,
+        )? {
+            return Ok(selected);
+        }
+    }
     {
         let (q_ptr, _qg) = q_i.data.device_ptr(&ctx.stream);
         let (w_ptr, _wg) = weights.data.device_ptr(&ctx.stream);
@@ -3839,6 +4107,229 @@ fn csa_select(
         }
     }
     Ok(selected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn csa_select_official_decode(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    q_i: &HiddenStates,
+    weights: &HiddenStates,
+    keys: &HiddenStates,
+    official: &mut Dsv4DsaOfficialState,
+    indexer_rows_before: usize,
+    indexer_rows_after: usize,
+    key_count: usize,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    ratio: usize,
+    local_index_heads: usize,
+    score_scale: f32,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<Option<CudaSlice<i32>>> {
+    if q_i.seq_len != 1 {
+        return Ok(None);
+    }
+    if start_pos_device.is_some()
+        && matches!(
+            std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    {
+        return Ok(None);
+    }
+    ensure!(
+        local_index_heads == official.num_heads && config.index_head_dim == official.head_dim,
+        "DSv4 official DSA shape mismatch local_heads={} official_heads={} dim={} official_dim={}",
+        local_index_heads,
+        official.num_heads,
+        config.index_head_dim,
+        official.head_dim
+    );
+    ensure!(
+        q_i.seq_len <= official.max_tokens,
+        "DSv4 official DSA token_count {} exceeds scratch max {}",
+        q_i.seq_len,
+        official.max_tokens
+    );
+    ensure!(
+        key_count <= official.compressed_capacity
+            && indexer_rows_after <= official.compressed_capacity
+            && indexer_rows_before <= indexer_rows_after,
+        "DSv4 official DSA key rows before={} after={} key_count={} capacity={}",
+        indexer_rows_before,
+        indexer_rows_after,
+        key_count,
+        official.compressed_capacity
+    );
+    ensure!(
+        start_pos < official.max_tokens,
+        "DSv4 official DSA start_pos {start_pos} exceeds freqs_cis max {}",
+        official.max_tokens
+    );
+
+    let newly_packed = indexer_rows_after.saturating_sub(official.packed_rows);
+    if newly_packed > 0 {
+        ensure!(
+            official.packed_rows <= indexer_rows_before,
+            "DSv4 official DSA packed rows {} ahead of indexer rows before {}",
+            official.packed_rows,
+            indexer_rows_before
+        );
+        let src_offset = official.packed_rows * config.index_head_dim;
+        let src = keys
+            .data
+            .slice(src_offset..src_offset + newly_packed * config.index_head_dim);
+        {
+            let mut rotated = official
+                .rotated_keys
+                .slice_mut(src_offset..src_offset + newly_packed * config.index_head_dim);
+            let (src_ptr, _sg) = src.device_ptr(&ctx.stream);
+            let (rot_ptr, _rg) = rotated.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_dsa_hadamard128_bf16_cuda(
+                    src_ptr as *const ffi::Half,
+                    rot_ptr as *mut ffi::Half,
+                    i32::try_from(newly_packed)?,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        let locs = official
+            .cache_locs
+            .slice(official.packed_rows..official.packed_rows + newly_packed);
+        {
+            let rotated = official
+                .rotated_keys
+                .slice(src_offset..src_offset + newly_packed * config.index_head_dim);
+            let (rot_store_ptr, _rsg) = rotated.device_ptr(&ctx.stream);
+            let (cache_ptr_u8, _cg) = official.key_cache.device_ptr_mut(&ctx.stream);
+            let (locs_ptr, _lg) = locs.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_dsa_fused_store_index_k_cache_cuda(
+                    rot_store_ptr as *const ffi::Half,
+                    cache_ptr_u8 as *mut u8,
+                    locs_ptr as *const i64,
+                    i32::try_from(newly_packed)?,
+                    64,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        official.packed_rows = indexer_rows_after;
+        keepalive.keep_u8(&official.key_cache);
+    }
+
+    let available = std::cmp::min(key_count, start_pos / ratio);
+    let context_lens_h = [i32::try_from(available)?];
+    let positions_h = [i32::try_from(start_pos)?];
+    {
+        let mut context_lens = official.context_lens.slice_mut(0..1);
+        ctx.stream
+            .memcpy_htod(&context_lens_h, &mut context_lens)
+            .map_err(|e| anyhow!("DSv4 official DSA context_lens H2D failed: {e}"))?;
+        let mut positions = official.positions.slice_mut(0..1);
+        ctx.stream
+            .memcpy_htod(&positions_h, &mut positions)
+            .map_err(|e| anyhow!("DSv4 official DSA positions H2D failed: {e}"))?;
+    }
+
+    let mut selected = ctx
+        .stream
+        .alloc_zeros::<i32>(config.index_topk)
+        .map_err(|e| anyhow!("DSv4 official DSA selected alloc failed: {e}"))?;
+    {
+        let (q_ptr, _qg) = q_i.data.device_ptr(&ctx.stream);
+        let (q_fp8_ptr, _qfg) = official.q_fp8.device_ptr_mut(&ctx.stream);
+        let (w_ptr, _wg) = weights.data.device_ptr(&ctx.stream);
+        let (weights_out_ptr, _wog) = official.weights.device_ptr_mut(&ctx.stream);
+        let (freqs_ptr, _fg) = official.freqs_cis.device_ptr(&ctx.stream);
+        let positions = official.positions.slice(0..1);
+        let (positions_ptr, _pg) = positions.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
+                q_ptr as *const ffi::Half,
+                q_fp8_ptr as *mut u8,
+                w_ptr as *const ffi::Half,
+                weights_out_ptr as *mut f32,
+                score_scale,
+                freqs_ptr as *const f32,
+                positions_ptr as *const i32,
+                1,
+                i32::try_from(local_index_heads)?,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    keepalive.keep_u8(&official.q_fp8);
+    keepalive.keep_f32(&official.weights);
+
+    let context_lens = official.context_lens.slice(0..1);
+    unsafe {
+        cuda_moe::dsv4_deepgemm_paged_mqa_logits_metadata(
+            cache_ptr(&official.context_lens, ctx),
+            cache_ptr(&official.sched_meta, ctx),
+            1,
+            1,
+            64,
+            official.num_sms,
+            ctx.stream.cu_stream(),
+        )
+        .map_err(|e| anyhow!("DSv4 official DSA metadata failed: {e}"))?;
+    }
+    unsafe {
+        cuda_moe::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache(
+            cache_ptr(&official.q_fp8, ctx),
+            cache_ptr(&official.key_cache, ctx),
+            cache_ptr(&official.weights, ctx),
+            cache_ptr(&official.context_lens, ctx),
+            cache_ptr(&official.page_table_identity, ctx),
+            cache_ptr(&official.sched_meta, ctx),
+            cache_ptr(&official.logits, ctx),
+            1,
+            1,
+            local_index_heads,
+            config.index_head_dim,
+            official.num_pages,
+            64,
+            key_count,
+            official.logits_stride,
+            official.num_pages,
+            64 * (config.index_head_dim + std::mem::size_of::<f32>()),
+            official.num_sms,
+            ctx.stream.cu_stream(),
+        )
+        .map_err(|e| anyhow!("DSv4 official DSA paged logits failed: {e}"))?;
+    }
+    {
+        let (logits_ptr, _lg) = official.logits.device_ptr(&ctx.stream);
+        let (lens_ptr, _csg) = context_lens.device_ptr(&ctx.stream);
+        let (page_ptr, _ptg) = official.page_table_identity.device_ptr(&ctx.stream);
+        let (sel_ptr, _seg) = selected.device_ptr_mut(&ctx.stream);
+        let mut raw = official.raw_indices.slice_mut(0..config.index_topk);
+        let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_deepseek_v4_topk_transform_512_cuda(
+                logits_ptr as *const f32,
+                lens_ptr as *const i32,
+                page_ptr as *const i32,
+                sel_ptr as *mut i32,
+                raw_ptr as *mut i32,
+                i64::try_from(official.logits_stride)?,
+                i64::try_from(official.num_pages)?,
+                i64::try_from(config.index_topk)?,
+                1,
+                i32::try_from(config.index_topk)?,
+                64,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    Ok(Some(selected))
 }
 
 #[allow(clippy::too_many_arguments)]
