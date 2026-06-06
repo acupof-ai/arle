@@ -65,6 +65,13 @@ constexpr int V32_BYTES_PER_TOKEN = 656;    // 512 + 128 + 16
 
 extern "C" {
 
+// Real-shim marker used by the DSv4 fast-build prebuilt validator. The
+// fallback stubs intentionally do not export this symbol, so stale stub
+// archives cannot satisfy a FlashMLA-decode build.
+int32_t arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda() {
+    return 1;
+}
+
 // Reports the FP8 KV bytes/token packed layout for a (d_qk, model_type_int)
 // pair so ARLE-side allocation code can size buffers consistently with the
 // kernel's stride_kv_row hard-assert. Returns -1 for unsupported pairs.
