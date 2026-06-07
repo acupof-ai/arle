@@ -212,3 +212,20 @@ serving path serialize per-row?** Codex to confirm.
 
 **Method discipline:** wall-clock is ground truth (not kern-sum %, not NVTX-wall-ending-in-sync).
 One variable per A/B. License-or-kill on the SLO shape. Operators integrated before measured.
+
+## 5. Campaign chain (what this trace led to)
+
+This wall-clock trace is the root-cause anchor of the 2026-06-06/07 DSv4 campaign. It
+**overturned** the smoke-shape lever docs
+([`2026-06-06-dsv4-decode-6ms-remaining-levers.md`](2026-06-06-dsv4-decode-6ms-remaining-levers.md),
+[`2026-06-06-dsv4-decode-6ms-dag.md`](2026-06-06-dsv4-decode-6ms-dag.md),
+[`2026-06-06-dsv4-decode-residual-gemv-fusion.md`](2026-06-06-dsv4-decode-residual-gemv-fusion.md))
+and licensed the official-kernel adoption:
+
+- Principle retro: [`../experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md`](../experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md).
+- Hand-rolled→official kernel map: [`2026-06-06-dsv4-handrolled-kernel-audit.md`](2026-06-06-dsv4-handrolled-kernel-audit.md).
+- Re-anchored targets: [`2026-06-06-dsv4-h20-reference-baseline.md`](2026-06-06-dsv4-h20-reference-baseline.md).
+- Decode fix (official DSA flat 26ms): [`../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md`](../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md).
+- Prefill fix (official FlashMLA + DeepGEMM 7.2s→3.48s): [`../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md`](../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md).
+- The throughput axis → engine-generic batched decode: [`2026-06-07-unified-batched-kvpool-abstraction.md`](2026-06-07-unified-batched-kvpool-abstraction.md).
+- Session code cleanup audit: [`2026-06-07-dsv4-code-cleanup-audit.md`](2026-06-07-dsv4-code-cleanup-audit.md).

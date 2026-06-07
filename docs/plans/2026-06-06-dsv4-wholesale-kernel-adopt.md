@@ -1,5 +1,20 @@
 # DSv4 wholesale vendored-kernel adoption → SGLang-on-H20 (adopt, no rewrite)
 
+> **Status (2026-06-07): the adopt posture here is the CORRECT arc — most of it
+> SHIPPED.** Steps 0-1 (gpu-router, FlashMLA-decode, contiguous-MoE) landed; the
+> official DSA indexer + FlashMLA prefill + FP8-linear DeepGEMM are now **default-on**
+> ([`../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md`](../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md),
+> [`../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md`](../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md)).
+> **Step 3 (EAGLE/MTP) is overturned** — the "1 base forward → 2 tokens, ~1.9× now"
+> framing did not hold; MTP is parked at the draft-quality wall (39% accept vs SGLang
+> 68%), see
+> [`../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md`](../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md)
+> and the frozen-KV redesign
+> [`2026-06-06-dsv4-frozen-kv-mtp-redesign.md`](2026-06-06-dsv4-frozen-kv-mtp-redesign.md).
+> Re-anchor targets on the [H20 reference baseline](2026-06-06-dsv4-h20-reference-baseline.md);
+> the forward-looking program is the
+> [unified batched-decode/paged-KV abstraction](2026-06-07-unified-batched-kvpool-abstraction.md).
+
 **Date:** 2026-06-06. **Target:** SGLang-on-H20 parity (6 ms is an H100 number;
 H20 floor for this 671B-class FP8 MoE is ~25–40 ms/token, decode GPU-bound).
 **Principle:** every lever is wiring a *vendored* kernel — zero hand-rewrites.

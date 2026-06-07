@@ -57,3 +57,20 @@ variant; the pod is H20-96G — same 78-SM compute profile.)
 - **Honest:** 6ms single-token on H20 = base official kernels + spec decode; both are SGLang-standard, neither is hand-rolled.
 
 Sources: HF deepseek-ai/DeepSeek-V4-Flash · SGLang issue #23896 · DeepSeek API (Artificial Analysis) · LMSYS H20 serving blog.
+
+## Campaign chain (this is the re-anchor reference for the whole 2026-06-06/07 arc)
+
+- Root-cause trace (wall-clock @4096, the bottleneck = csa_select):
+  [`2026-06-06-dsv4-pd-systematic-analysis.md`](2026-06-06-dsv4-pd-systematic-analysis.md).
+- The "adopt official, don't hand-roll" principle retro:
+  [`../experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md`](../experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md).
+- Decode fix landed (official DSA, flat ~26ms):
+  [`../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md`](../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md).
+- Prefill fix landed (official FlashMLA `sparse_fwd` + FP8 DeepGEMM, 7.2s → 3.48s):
+  [`../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md`](../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md).
+- The 6ms-via-spec path (parked at the draft-quality wall):
+  [`../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md`](../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md).
+- The forward-looking program (engine-generic batched decode):
+  [`2026-06-07-unified-batched-kvpool-abstraction.md`](2026-06-07-unified-batched-kvpool-abstraction.md).
+- The session code-cleanup audit (flags → CLI, legacy fallbacks, dead paths):
+  [`2026-06-07-dsv4-code-cleanup-audit.md`](2026-06-07-dsv4-code-cleanup-audit.md).

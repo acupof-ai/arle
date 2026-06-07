@@ -73,6 +73,31 @@ and the path to SGLang-class decode — see
 and the DSv4 decode perf roadmap
 [`plans/2026-06-04-dsv4-decode-sglang-class-perf.md`](plans/2026-06-04-dsv4-decode-sglang-class-perf.md).
 
+**DSv4 perf campaign (2026-06-06/07) — adopt official kernels, not hand-roll.** The
+campaign's truth-order: (1) early narrow per-kernel / 8-token smoke profiling gave
+WRONG bottlenecks ("decode comm 32.4%", GEMV/mhc levers, 6ms-via-EAGLE-now) — those
+docs are marked *Superseded by later evidence*; (2) an end-to-end **wall-clock** trace
+at the 4096 SLO shape found the real bottleneck = `dsv4_csa_select` (the hand-rolled
+1/78-SM sparse selector), see
+[`plans/2026-06-06-dsv4-pd-systematic-analysis.md`](plans/2026-06-06-dsv4-pd-systematic-analysis.md);
+(3) the fix was to ADOPT the official DeepSeek/SGLang kernels (official DSA indexer →
+decode 124ms→26ms flat @4096, default-on
+[`experience/wins/2026-06-07-dsv4-official-dsa-default-on.md`](experience/wins/2026-06-07-dsv4-official-dsa-default-on.md);
+FlashMLA `sparse_fwd` + FP8 DeepGEMM → prefill 7.2s→3.48s, default-on
+[`experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md`](experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md)),
+the principle recorded in the retro
+[`experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md`](experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md);
+(4) targets re-anchored on the
+[`plans/2026-06-06-dsv4-h20-reference-baseline.md`](plans/2026-06-06-dsv4-h20-reference-baseline.md)
+(base decode ~20-35ms; 6ms needs MTP/EAGLE spec); (5) MTP/6ms parked at the
+draft-quality wall
+[`experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md`](experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md);
+(6) the forward-looking program is the engine-generic
+[`plans/2026-06-07-unified-batched-kvpool-abstraction.md`](plans/2026-06-07-unified-batched-kvpool-abstraction.md)
+(authoritative). The session code-cleanup task list (flags → CLI `--`, legacy
+fallbacks, dead hand-rolled paths) is
+[`plans/2026-06-07-dsv4-code-cleanup-audit.md`](plans/2026-06-07-dsv4-code-cleanup-audit.md).
+
 **Qwen3.5 Medusa is not pickup-ready** — recurrent-state accepted-length
 commit/rollback contract is the gate. Active plan:
 [`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md);
@@ -138,6 +163,12 @@ marked as the current source of truth, treat it as historical context.
 
 | Path | Status | Use this when |
 | --- | --- | --- |
+| [plans/2026-06-07-unified-batched-kvpool-abstraction.md](plans/2026-06-07-unified-batched-kvpool-abstraction.md) | Active — authoritative (DSv4 campaign forward plan) | The question is the engine-generic batched-decode / paged-KV abstraction: `KvBatchDescriptor` over the `KvPool` seam + per-model `ModelKvAdapter` (DSv4 first, then Qwen/Gemma), the 7-phase refactor-first map, and the Metal convergence end state. The throughput axis of the DSv4 perf campaign. |
+| [plans/2026-06-06-dsv4-pd-systematic-analysis.md](plans/2026-06-06-dsv4-pd-systematic-analysis.md) | Active — root-cause anchor | The question is the DSv4 P/D bottleneck at the 4096 SLO shape from a wall-clock end-to-end trace (csa_select #1), the operator-integration audit, and the single-row-executor throughput ceiling. The doc that overturned the smoke-shape lever plans. |
+| [plans/2026-06-06-dsv4-h20-reference-baseline.md](plans/2026-06-06-dsv4-h20-reference-baseline.md) | Active — reference baseline | The question is "how fast SHOULD DSv4-Flash be on H20" (base decode ~20-35ms, prefill ~1.5s warm @1024; 6ms requires MTP/EAGLE spec) — the should-be ground truth for any DSv4 perf license. |
+| [plans/2026-06-07-dsv4-code-cleanup-audit.md](plans/2026-06-07-dsv4-code-cleanup-audit.md) | Active — cleanup task list | The question is the DSv4 session code-cleanup queue: `ARLE_DSV4_*` env flags → CLI `--flags`, legacy fallbacks now default-off (csa_select, masked/pooled decode), dead hand-rolled paths from the official-kernel swaps, parked-MTP code, with safe-now vs wait-for-batched-decode per item. |
+| [plans/2026-06-06-dsv4-handrolled-kernel-audit.md](plans/2026-06-06-dsv4-handrolled-kernel-audit.md) | Active — kernel adoption map | The question is which hand-rolled CUDA kernels duplicate a vendored/official one (DELETE+ADOPT), which wrap already-adopted libs (KEEP), and which are irreducible ARLE glue (KEEP) — the per-operator license-or-kill map. |
+| [plans/2026-06-06-dsv4-frozen-kv-mtp-redesign.md](plans/2026-06-06-dsv4-frozen-kv-mtp-redesign.md) | Active design — MTP parked | The question is the SGLang frozen-KV MTP approach for DSv4 (freeze compressor + reuse selection during verify), which un-killed the s_q=K conclusion; MTP remains parked at the draft-quality wall pending a coherent-workload acceptance measurement. |
 | [plans/2026-06-04-dsv4-decode-sglang-class-perf.md](plans/2026-06-04-dsv4-decode-sglang-class-perf.md) | Active roadmap — gated on decode fix | The question is the DSv4-Flash TP=8/EP=8 decode path to SGLang-class 5–6 ms/token: on-device MoE routing (kill per-layer H2D/D2H), DeepEP low-latency decode mode, graph-capturable all-reduce, full decode-graph capture. Sequenced behind the incremental-decode correctness fix (#23). |
 | [plans/2026-05-27-flashinfer-paged-prefill-migration.md](plans/2026-05-27-flashinfer-paged-prefill-migration.md) | Active design | The question is whether/how to drop TileLang HD128 paged prefill for FlashInfer on sm_80. Driven by two TileLang 0.1.10 regressions in one week. |
 | [plans/2026-06-02-metal-mtp-sglang-alignment.md](plans/2026-06-02-metal-mtp-sglang-alignment.md) | Active control plan | The question is Metal Qwen3.6 MTP after the SGLang survey: frozen-KV invariants, parity-first gates, packed verify order, why MTP remains opt-in, or the bottom-level acceptance compute note at [research/2026-06-02-metal-mtp-acceptance-compute.md](research/2026-06-02-metal-mtp-acceptance-compute.md). |
@@ -204,6 +235,14 @@ brings them back.
 | [plans/M5-P0-modelforward-survey.md](plans/M5-P0-modelforward-survey.md) | Pre-plan survey behind the landed `m5-modelarch-trait.md`. |
 | [plans/M_medusa-phase1b-substrate-brief.md](plans/M_medusa-phase1b-substrate-brief.md) | PAUSED Qwen3/Qwen3.6 Medusa brief; superseded by `M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md` which links back to it. |
 | [plans/2026-05-10-dsv4-qwen36-substrate-audit.md](plans/2026-05-10-dsv4-qwen36-substrate-audit.md) | Phase 0 audit for DSv4 1B + Qwen3.6 CUDA substrate; predates current DSv4 readiness project. |
+| [plans/2026-06-06-dsv4-decode-6ms-remaining-levers.md](plans/2026-06-06-dsv4-decode-6ms-remaining-levers.md) | **Superseded** — smoke-shape decode lever ranking (comm 32.4% / GEMV / mhc); overturned by the wall-clock @4096 trace (csa_select #1) + official-kernel adoption. Marked at top; kept for the profiling-method record. |
+| [plans/2026-06-06-dsv4-decode-6ms-dag.md](plans/2026-06-06-dsv4-decode-6ms-dag.md) | **Superseded** — 6ms-via-EAGLE-now DAG on the smoke-shape ranking; overturned (csa_select root cause + H20 baseline re-anchor + MTP parked). Marked at top; kept for the §0.1 decomposition. |
+| [plans/2026-06-06-dsv4-decode-residual-gemv-fusion.md](plans/2026-06-06-dsv4-decode-residual-gemv-fusion.md) | **Superseded** — "GEMV is the #2 decode lever (14.4%)" is a smoke-shape artifact; the real fix was the official DSA indexer. Marked at top; the fused-wo design kept as a candidate. |
+| [plans/2026-06-06-dsv4-prefill-profile-levers.md](plans/2026-06-06-dsv4-prefill-profile-levers.md) | Partially superseded — profile valid (compute-bound), but lever #3 "FlashMLA-prefill killed" was wrong (official kernel default-on, faster) and #2 csa-reuse killed. Marked at top. |
+| [plans/2026-06-06-dsv4-prefill-fused-wqkv-extend.md](plans/2026-06-06-dsv4-prefill-fused-wqkv-extend.md) | Shipped — fused `wq_a\|wkv` → FP8 DeepGEMM, now default-on (`FP8_LINEAR_DEEPGEMM`); realized −5% (fused slice only). Status pointer at top. |
+| [plans/2026-06-06-dsv4-eagle-mtp-phase2-verify-loop.md](plans/2026-06-06-dsv4-eagle-mtp-phase2-verify-loop.md) | **Superseded** — verify loop landed correct (default-off) but the "1.9× lever" goal didn't hold; MTP parked at the draft-quality wall. Marked at top. |
+| [plans/2026-06-06-dsv4-a2-sqk-verify-detail.md](plans/2026-06-06-dsv4-a2-sqk-verify-detail.md) | **Superseded** — s_q=K verify killed then un-killed by frozen-KV; MTP parked regardless. Marked at top. |
+| [plans/2026-06-06-dsv4-wholesale-kernel-adopt.md](plans/2026-06-06-dsv4-wholesale-kernel-adopt.md) | Mostly shipped — the adopt-official sequencing arc (correct); the EAGLE step is overturned (MTP parked). Status pointer at top. |
 
 ### Projects (archived)
 
