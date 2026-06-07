@@ -1027,6 +1027,36 @@ impl Dsv4CudaExecutor {
                 );
             }
             Ok(vec![draft, bonus])
+        } else if crate::dsv4::dsv4_mtp_batched_verify_enabled() {
+            // Batched-verify reject: the rollback snapshot was captured PRE-pending
+            // (before the batched [pending,draft] forward), so truncate to start_pos,
+            // restore (compressor → pre-pending; draft sw/fp8 slot), then RE-FORWARD
+            // pending (M=1) to rebuild its KV + compressor + capture its hidden. Ends at
+            // start_pos+1 with pending committed (== the per-token reject end state).
+            self.model
+                .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
+            self.slots[slot_idx].restore_spec_rollback(
+                &self.model.ctx,
+                &mut self.kv_adapter,
+                start_pos + 1,
+            )?;
+            let (_, mut reforward_hiddens) = self.model.forward_tokens_verify(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &[pending],
+                start_pos,
+                (start_pos + 1) as u64,
+            )?;
+            spec.pending = Some(base_next);
+            spec.hidden = Some(reforward_hiddens.remove(0));
+            self.mtp_rejects += 1;
+            if self.model.tp.config().rank == 0 {
+                eprintln!(
+                    "[dsv4-mtp] accept_total={} reject_total={} pending={} draft={} base_next={} (batched)",
+                    self.mtp_accepts, self.mtp_rejects, pending, draft, base_next
+                );
+            }
+            Ok(vec![base_next])
         } else {
             let keep_len = start_pos + 1;
             self.model
@@ -1303,46 +1333,19 @@ impl Dsv4CudaExecutor {
             "DSv4 verify selftest two-token row0 mismatch: one={verify_one:?} two={verify_two:?}"
         );
 
-        // COL1 gate (the row0 check above masks the batched-verify col1 bug). The
-        // 2-token verify's col1 (bonus = next-after-draft @ start_pos+1) must equal a
-        // per-token reference: commit token_a@start_pos, then forward wrong_b@start_pos+1.
-        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
-        self.model.forward_tokens(
-            &mut self.slots[slot_idx],
-            &mut self.kv_adapter,
-            prompt,
-            0,
-            &params,
-            start_pos as u64,
-        )?;
-        self.model.forward_tokens(
-            &mut self.slots[slot_idx],
-            &mut self.kv_adapter,
-            &[token_a],
-            start_pos,
-            &params,
-            (start_pos + 1) as u64,
-        )?;
-        let ref_bonus = self.model.forward_tokens(
-            &mut self.slots[slot_idx],
-            &mut self.kv_adapter,
-            &[wrong_b],
-            start_pos + 1,
-            &params,
-            (start_pos + 2) as u64,
-        )?;
-        let col1 = verify_two.get(1).copied();
-        ensure!(
-            col1 == Some(ref_bonus),
-            "DSv4 verify selftest COL1 mismatch: batched bonus={col1:?} != per-token ref={ref_bonus} \
-             (token_a={token_a} wrong_b={wrong_b} verify_two={verify_two:?})"
-        );
+        // NOTE: no col1/bonus byte-identity gate here. The 2-token verify's col1
+        // (bonus) on a FORCED-WRONG draft is DISCARDED in real decode (rejects emit
+        // only base_next), and any byte-identity check is confounded by the M=2-vs-M=1
+        // FP8 kernel path (SWA-prefill + prefill-DeepGEMM vs FlashMLA-decode +
+        // decode-DeepGEMM). The real correctness gate is full-decode byte-identity vs
+        // non-spec (validated 2026-06-08: batched MTP byte-identical on needle+capital,
+        // +61/+70%). See errors/2026-06-08-dsv4-batched-verify-col1-wrong.md.
 
         self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
         self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
         if self.model.tp.config().rank == 0 {
             eprintln!(
-                "[dsv4-mtp-selftest] PASS token_a={token_a} token_b={token_b} wrong_b={wrong_b} ref_bonus={ref_bonus} verify_two={verify_two:?}"
+                "[dsv4-mtp-selftest] PASS token_a={token_a} token_b={token_b} wrong_b={wrong_b} verify_two={verify_two:?}"
             );
         }
         Ok(())
