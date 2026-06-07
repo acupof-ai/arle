@@ -845,6 +845,13 @@ fn validate_dsv4_prefill_kv_view(
     Ok(())
 }
 
+/// Opt-in flag for the layer-major batched DSv4 decode path (harness shim;
+/// promoted to a CLI `--flag` in the runtime-config cleanup). Default OFF keeps
+/// the per-row decode loop as the byte-identical correctness reference.
+fn dsv4_batched_decode_enabled() -> bool {
+    std::env::var_os("INFER_DSV4_BATCHED_DECODE").is_some()
+}
+
 impl std::fmt::Debug for Dsv4CudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dsv4CudaExecutor")
@@ -1086,6 +1093,42 @@ impl Dsv4CudaExecutor {
                 && batch.positions.len() == batch.rows.len(),
             "DSv4 decode batch surface length mismatch"
         );
+        // Opt-in true batched decode (Step A: layer-major driver, per-row
+        // looped attention). Default OFF → the per-row loop below stays the
+        // byte-identical reference. Only the multi-row, non-spec path batches.
+        if dsv4_batched_decode_enabled()
+            && batch.rows.len() > 1
+            && !crate::dsv4::dsv4_spec_decode_enabled()
+        {
+            let params: Vec<SamplingParams> = batch.rows.iter().map(|r| r.params.clone()).collect();
+            let out = self.model.forward_decode_batch(
+                &mut self.slots,
+                &mut self.kv_adapter,
+                &batch.slot_ids,
+                &batch.tokens,
+                &batch.start_positions,
+                &batch.positions,
+                &params,
+            )?;
+            ensure!(
+                out.len() == batch.rows.len(),
+                "DSv4 batched decode returned {} tokens for {} rows",
+                out.len(),
+                batch.rows.len()
+            );
+            return Ok(batch
+                .slot_ids
+                .iter()
+                .zip(out)
+                .map(|(&slot, token)| SlotToken {
+                    slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                })
+                .collect());
+        }
+
         let mut tokens = Vec::with_capacity(batch.rows.len());
         for (idx, row) in batch.rows.iter().enumerate() {
             debug_assert_eq!(batch.slot_ids[idx], row.slot);
