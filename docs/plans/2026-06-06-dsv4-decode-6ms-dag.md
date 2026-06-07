@@ -1,5 +1,34 @@
 # DSv4 decode → 6ms — 抽丝剥茧 DAG（原子任务 + 依赖图 + 预算）
 
+## Superseded by later evidence
+
+**The whole DAG below is built on the SMOKE-SHAPE lever ranking and the
+"6ms-via-EAGLE-now" critical path — both overturned the same day.** The decode-side
+critical path here (`G1 → A1 → A2 → A3` with D-branch comm/GEMV/mhc compressing the
+base) was anchored on the 8-token decode profile (comm 32.4%, GEMV 14.4%, mhc 12.2%)
+from [`2026-06-06-dsv4-decode-6ms-remaining-levers.md`](2026-06-06-dsv4-decode-6ms-remaining-levers.md),
+which is itself superseded. The end-to-end **wall-clock** trace at the 4096 SLO shape
+([`2026-06-06-dsv4-pd-systematic-analysis.md`](2026-06-06-dsv4-pd-systematic-analysis.md)
+§3) found the real bottleneck is `dsv4_csa_select` (the E2 entry in this doc's
+prefill branch was actually the #1 decode AND prefill cost), and the fix was to
+**adopt the official DeepSeek DSA indexer**, not hand-roll a parallel selector:
+[`../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md`](../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md).
+
+The 6ms target itself is re-anchored: base no-spec decode is ~20-35ms on H20 and 6ms
+**requires** MTP/EAGLE spec — see the
+[H20 reference baseline](2026-06-06-dsv4-h20-reference-baseline.md). The Branch-A
+EAGLE math here is also overturned: A1 (per-token rollback) landed correct but −32%;
+A2 (s_q=K) was killed then un-killed via the frozen-KV redesign
+([`2026-06-06-dsv4-frozen-kv-mtp-redesign.md`](2026-06-06-dsv4-frozen-kv-mtp-redesign.md));
+MTP is now parked at the **draft-quality wall** (39% accept vs SGLang 68%):
+[`../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md`](../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md).
+The forward-looking program is the
+[unified batched-decode/paged-KV abstraction](2026-06-07-unified-batched-kvpool-abstraction.md).
+Kept for history (the §0.1 atomic-task decomposition + correctness-model framing are
+valid process records).
+
+---
+
 > **⚠️ UPDATE 2026-06-06: EAGLE 主干 A2/A3 KILLED.** A1(per-token rollback)
 > 落地正确(`25a92e8a`,needle 过)但 −32%。A2(s_q=K)实测 **12.85 tok/s(3× 慢)
 > 且与 autoregressive 系统性不等价**(scalar control 也分叉 → 是 DSv4 stateful 压缩

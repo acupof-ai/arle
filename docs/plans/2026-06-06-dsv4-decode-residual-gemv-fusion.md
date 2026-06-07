@@ -1,5 +1,27 @@
 # DSv4 decode — residual GEMV → DeepGEMM fusion (#2 decode lever, 14.4%)
 
+## Superseded by later evidence
+
+**The "GEMV is the #2 decode lever (14.4%)" premise is a SMOKE-SHAPE artifact.** The
+14.4% comes from the 8-token decode window in
+[`2026-06-06-dsv4-decode-6ms-remaining-levers.md`](2026-06-06-dsv4-decode-6ms-remaining-levers.md)
+(superseded). At the 4096 SLO shape the residual GEMV is sub-5%; the real decode
+bottleneck is the sparse selector, fixed by adopting the official DeepSeek DSA
+indexer — see
+[`2026-06-06-dsv4-pd-systematic-analysis.md`](2026-06-06-dsv4-pd-systematic-analysis.md)
+§3 and
+[`../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md`](../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md).
+The "fuse the GEMV" lever survives only as the general posture "route FP8 GEMVs to
+DeepGEMM where a wall-clock A/B shows it wins" — and the prefill A/B already proved
+the **fused** form wins (−5%) while the 1:1 per-projection swap LOSES (+9%, overlap
+break), see
+[`../experience/wins/2026-06-06-dsv4-prefill-fused-wqkv-deepgemm.md`](../experience/wins/2026-06-06-dsv4-prefill-fused-wqkv-deepgemm.md).
+Kept for history (the fused-wo design detail is still a valid candidate if a future
+trace re-ranks it). Re-anchor on the
+[H20 reference baseline](2026-06-06-dsv4-h20-reference-baseline.md).
+
+---
+
 **Date:** 2026-06-06. **Status:** execution-ready design (parallel prep; touches
 `attention.rs` → IMPLEMENT after the EAGLE rollback merges). **Goal:** the second
 decode kernel bucket after fused-wqkv. The clean decode profile

@@ -1,5 +1,22 @@
 # DSv4 A2 — s_q=K FlashMLA verify, implementation-level spec (the decode speedup)
 
+## Superseded by later evidence
+
+**The s_q=K verify was KILLED, then the kill was un-killed by the frozen-KV
+redesign — but MTP is now parked regardless.** The naive s_q=K verify both diverges
+from autoregressive AND fails to amortize on DSv4's stateful compressed attention
+([`../experience/errors/2026-06-06-dsv4-eagle-sqk-no-amortize-kill.md`](../experience/errors/2026-06-06-dsv4-eagle-sqk-no-amortize-kill.md));
+SGLang's **frozen-KV** approach (freeze the compressor + reuse the selection during
+verify) makes an off-boundary K-span exactly autoregressive and amortizing — see
+[`2026-06-06-dsv4-frozen-kv-mtp-redesign.md`](2026-06-06-dsv4-frozen-kv-mtp-redesign.md).
+Even so, MTP is parked at the **draft-quality wall** (39% accept vs SGLang 68%):
+[`../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md`](../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md).
+Re-anchor the decode-speedup target on the
+[H20 reference baseline](2026-06-06-dsv4-h20-reference-baseline.md). Kept for history
+(the kernel-already-supports-s_q=K analysis is still accurate).
+
+---
+
 **Date:** 2026-06-06. **Status:** structural design from CLEAN reference code (the
 s_q=1 decode builder + the prefill multi-query builders); the runtime confirmation
 of tranche-2's exact break comes AFTER A1 lands (re-run `/tmp/tranche2_sqk_broken.diff`

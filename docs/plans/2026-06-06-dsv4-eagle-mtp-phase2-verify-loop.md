@@ -1,5 +1,24 @@
 # DSv4 EAGLE/MTP Phase 2 — greedy verify loop + KV rollback (the 1.9× decode lever)
 
+## Superseded by later evidence
+
+**The verify loop here LANDED CORRECT (A1, `25a92e8a`) but the "1.9× decode lever"
+goal did NOT hold, and the per-token verify is −32%.** The verify-loop + rollback
+state machine in this doc was implemented and made correct (full mutated-buffer
+rollback: [`../experience/wins/2026-06-06-dsv4-eagle-rollback-fix-correct.md`](../experience/wins/2026-06-06-dsv4-eagle-rollback-fix-correct.md)),
+but spec decode is parked at the **draft-quality wall** — 39% accept vs SGLang's 68%,
+so the amortization math never pays off:
+[`../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md`](../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md).
+The s_q=K amortization detail is in
+[`2026-06-06-dsv4-a2-sqk-verify-detail.md`](2026-06-06-dsv4-a2-sqk-verify-detail.md)
+(also superseded), and the corrected approach is the frozen-KV redesign
+[`2026-06-06-dsv4-frozen-kv-mtp-redesign.md`](2026-06-06-dsv4-frozen-kv-mtp-redesign.md).
+6ms-via-spec is re-anchored on the
+[H20 reference baseline](2026-06-06-dsv4-h20-reference-baseline.md). Kept for history
+(the depth-1 state machine is correct and shipped, default-off `ARLE_DSV4_SPEC_DECODE`).
+
+---
+
 **Date:** 2026-06-06. **Goal:** turn the loaded MTP draft head (Phase 1,
 `2e0cde16`) into a working speculative-decode loop: 1 base forward → up to 2
 committed tokens at acceptance α, ~(1+α)× decode throughput (target 1.5–1.9×,
