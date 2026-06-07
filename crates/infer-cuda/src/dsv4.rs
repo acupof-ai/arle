@@ -100,6 +100,10 @@ pub(crate) struct Dsv4Indexer {
     pub wq_b: DeviceMatrix,
     pub weights_proj: DeviceMatrix,
     pub compressor: Dsv4Compressor,
+    /// DeepGEMM repack of `wq_b` for the prefill index-query projection (the #1
+    /// remaining projection after wq_b/wo: 135ms / 67% of linear at M=1024). Built
+    /// when the prefill DeepGEMM scratch is enabled; `None` falls back to scalar.
+    pub wq_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
 }
 
 /// One hyper-connection mixing block (`hc_attn` / `hc_ffn` per layer, `hc_head`
