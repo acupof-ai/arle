@@ -10,7 +10,7 @@ use anyhow::{Result, ensure};
 use cuda_kernels::KVFormat;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 use infer_plan::{DecodeRow, ForwardPlan, SamplingParams, SlotToken, StepOutput};
-use infer_seam::KvPool;
+use infer_seam::{KvBatchDescriptor, KvBatchRowKind, KvPool};
 use log::{info, warn};
 
 use crate::decode_graph::DecodeGraphContext;
@@ -114,10 +114,11 @@ impl RealCudaExecutor {
         plan: &ForwardPlan,
         host_kv: &mut dyn KvPool,
     ) -> Result<StepOutput> {
+        let kv_batch = KvBatchDescriptor::from_plan(plan, host_kv)?;
         match self {
             Self::Qwen(q) => q.submit(plan, host_kv),
             Self::Qwen35(q) => q.submit(plan),
-            Self::Dsv4(d) => d.submit(plan),
+            Self::Dsv4(d) => d.submit(plan, &kv_batch),
         }
     }
 
@@ -660,6 +661,98 @@ impl Dsv4DecodeBatch {
     }
 }
 
+fn validate_dsv4_decode_kv_batch(rows: &[DecodeRow], kv_batch: &KvBatchDescriptor) -> Result<()> {
+    ensure!(
+        kv_batch.rows.len() == rows.len(),
+        "DSv4 decode KV batch row count {} != plan rows {}",
+        kv_batch.rows.len(),
+        rows.len()
+    );
+    for (idx, (plan_row, kv_row)) in rows.iter().zip(&kv_batch.rows).enumerate() {
+        ensure!(
+            kv_row.kind == KvBatchRowKind::Decode,
+            "DSv4 decode KV batch row {idx} has kind {:?}",
+            kv_row.kind
+        );
+        ensure!(
+            kv_row.slot == plan_row.slot,
+            "DSv4 decode KV batch row {idx} slot {} != plan slot {}",
+            kv_row.slot,
+            plan_row.slot
+        );
+        ensure!(
+            kv_row.seq_len == plan_row.kv_seq_len && kv_row.append_pos == plan_row.kv_seq_len,
+            "DSv4 decode KV batch row {idx} seq/append ({},{}) != plan kv_seq_len {}",
+            kv_row.seq_len,
+            kv_row.append_pos,
+            plan_row.kv_seq_len
+        );
+        ensure!(
+            kv_row.append_len == 1,
+            "DSv4 decode KV batch row {idx} append_len {} != 1",
+            kv_row.append_len
+        );
+        ensure!(
+            kv_row.page_range.start < kv_row.page_range.end,
+            "DSv4 decode KV batch row {idx} has empty page range"
+        );
+        let tokens = &kv_batch.flat_token_ids[kv_row.token_range.clone()];
+        ensure!(
+            tokens == [plan_row.last_token],
+            "DSv4 decode KV batch row {idx} tokens {:?} != plan token {}",
+            tokens,
+            plan_row.last_token
+        );
+    }
+    Ok(())
+}
+
+fn validate_dsv4_prefill_kv_batch(
+    row: &infer_plan::PrefillRow,
+    kv_batch: &KvBatchDescriptor,
+) -> Result<()> {
+    ensure!(
+        kv_batch.rows.len() == 1,
+        "DSv4 prefill KV batch row count {} != 1",
+        kv_batch.rows.len()
+    );
+    let kv_row = &kv_batch.rows[0];
+    ensure!(
+        kv_row.kind == KvBatchRowKind::Prefill,
+        "DSv4 prefill KV batch row has kind {:?}",
+        kv_row.kind
+    );
+    ensure!(
+        kv_row.slot == row.slot,
+        "DSv4 prefill KV batch slot {} != plan slot {}",
+        kv_row.slot,
+        row.slot
+    );
+    ensure!(
+        kv_row.seq_len == row.start_pos && kv_row.append_pos == row.start_pos,
+        "DSv4 prefill KV batch seq/append ({},{}) != plan start_pos {}",
+        kv_row.seq_len,
+        kv_row.append_pos,
+        row.start_pos
+    );
+    ensure!(
+        kv_row.append_len == row.tokens.len(),
+        "DSv4 prefill KV batch append_len {} != plan token count {}",
+        kv_row.append_len,
+        row.tokens.len()
+    );
+    ensure!(
+        kv_row.page_range.start < kv_row.page_range.end,
+        "DSv4 prefill KV batch has empty page range"
+    );
+    let tokens = &kv_batch.flat_token_ids[kv_row.token_range.clone()];
+    ensure!(
+        tokens == row.tokens.as_slice(),
+        "DSv4 prefill KV batch tokens do not match plan tokens"
+    );
+    Ok(())
+}
+
 impl std::fmt::Debug for Dsv4CudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dsv4CudaExecutor")
@@ -871,7 +964,12 @@ impl Dsv4CudaExecutor {
             .collect())
     }
 
-    fn forward_decode_batch(&mut self, rows: &[DecodeRow]) -> Result<Vec<SlotToken>> {
+    fn forward_decode_batch(
+        &mut self,
+        rows: &[DecodeRow],
+        kv_batch: &KvBatchDescriptor,
+    ) -> Result<Vec<SlotToken>> {
+        validate_dsv4_decode_kv_batch(rows, kv_batch)?;
         let batch = Dsv4DecodeBatch::from_rows(rows, &self.slots, self.num_slots)?;
         ensure!(
             batch.slot_ids.len() == batch.rows.len()
@@ -891,15 +989,19 @@ impl Dsv4CudaExecutor {
         Ok(tokens)
     }
 
-    fn submit(&mut self, plan: &ForwardPlan) -> Result<StepOutput> {
+    fn submit(&mut self, plan: &ForwardPlan, kv_batch: &KvBatchDescriptor) -> Result<StepOutput> {
         let rows = plan.decode_rows.len() + plan.prefill_rows.len();
         if rows == 0 {
+            ensure!(
+                kv_batch.rows.is_empty(),
+                "DSv4 empty plan got non-empty KV batch descriptor"
+            );
             return Ok(StepOutput { tokens: Vec::new() });
         }
 
         if plan.prefill_rows.is_empty() {
             return Ok(StepOutput {
-                tokens: self.forward_decode_batch(&plan.decode_rows)?,
+                tokens: self.forward_decode_batch(&plan.decode_rows, kv_batch)?,
             });
         }
 
@@ -914,6 +1016,7 @@ impl Dsv4CudaExecutor {
             .prefill_rows
             .first()
             .expect("prefill row present after empty-prefill branch");
+        validate_dsv4_prefill_kv_batch(row, kv_batch)?;
         ensure!(
             row.slot < self.num_slots,
             "prefill slot {} outside DSv4 executor slots {}",
