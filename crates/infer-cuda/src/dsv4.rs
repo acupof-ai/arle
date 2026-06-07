@@ -909,10 +909,47 @@ impl Dsv4Model {
             !tokens.is_empty(),
             "DSv4 verify forward requires at least one token"
         );
-        let mut argmax_tokens = Vec::with_capacity(tokens.len());
-        let mut hiddens = Vec::with_capacity(tokens.len());
         let _nvtx = crate::nvtx::range("dsv4/lm_head_verify");
         let params = SamplingParams::default();
+
+        // Batched verify (opt-in, default off; KNOWN col1 bug — see selftest probe).
+        // ONE 2-token forward amortizes the weight read (proven +63%). Capture the
+        // rollback only when the spec snapshot is allocated (skipped for the
+        // selftest probe, which doesn't reject).
+        if dsv4_mtp_batched_verify_enabled() && tokens.len() == 2 {
+            let stream_dim = self.config.hidden_size * self.config.hc_mult;
+            if dsv4_spec_decode_enabled() {
+                slot.capture_spec_rollback(&self.ctx, kv_adapter, start_pos + 1)?;
+            }
+            let (stream, mut keepalive) =
+                self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos)?;
+            let mut h0 = DeviceVec::zeros(&self.ctx, stream_dim)?;
+            let mut h1 = DeviceVec::zeros(&self.ctx, stream_dim)?;
+            self.capture_mtp_stream_hidden(&stream, 0, &mut h0, &mut keepalive)?;
+            self.capture_mtp_stream_hidden(&stream, 1, &mut h1, &mut keepalive)?;
+            let base_next = self.forward_stream_last_token(
+                &stream,
+                1,
+                &params,
+                position,
+                None,
+                &mut keepalive,
+            )?;
+            let bonus = self.forward_stream_last_token(
+                &stream,
+                2,
+                &params,
+                position + 1,
+                None,
+                &mut keepalive,
+            )?;
+            std::hint::black_box(keepalive.len());
+            drop(keepalive);
+            return Ok((vec![base_next, bonus], vec![h0, h1]));
+        }
+
+        let mut argmax_tokens = Vec::with_capacity(tokens.len());
+        let mut hiddens = Vec::with_capacity(tokens.len());
         for (row, &token_id) in tokens.iter().enumerate() {
             let row_start = start_pos + row;
             let row_position = position + row as u64;
@@ -2455,6 +2492,17 @@ fn dsv4_comm_overlap_enabled() -> bool {
 pub(crate) fn dsv4_spec_decode_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_SPEC_DECODE").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+/// Opt-in (default off): batch the MTP verify over [pending, draft] in one 2-token
+/// forward (amortizes the weight read, proven +63%). KNOWN col1 BUG — the 2-token
+/// forward's 2nd token diverges at start_pos>0; kept behind this flag for the
+/// `verify_forward_selftest` col1 probe + the eventual fix. Do NOT enable in prod.
+pub(crate) fn dsv4_mtp_batched_verify_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_MTP_BATCHED_VERIFY").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }
