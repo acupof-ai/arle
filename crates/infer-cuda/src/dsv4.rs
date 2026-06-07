@@ -133,6 +133,12 @@ pub(crate) struct Dsv4Attention {
     pub kv_norm: DeviceVec,
     pub wo_a: DeviceMatrix,
     pub wo_b: DeviceMatrix,
+    /// DeepGEMM-layout FP8 caches of the output projection (`wo_a`/`wo_b`) for the
+    /// decode path (lever #1b), companion to [`Self::wq_b_deepgemm`]. `local_width
+    /// == hidden_size` on DSv4-Flash, so the M=1 quantize reuses the fused-wqkv FP8
+    /// scratch. `None` unless the fused-wqkv decode alloc gate is on.
+    pub wo_a_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
+    pub wo_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub attn_sink: DeviceVec,
     pub attn_sink_f32: CudaSlice<f32>,
     pub compressor: Option<Dsv4Compressor>,

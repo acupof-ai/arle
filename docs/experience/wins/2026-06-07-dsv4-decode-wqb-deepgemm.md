@@ -35,6 +35,31 @@ DeepGEMM emit `[223, 30793, 929, 16, …]` — the answer retrieved **bit-identi
 (legitimate FP8 accumulation numerics, same signature as the batched all-reduce, NOT
 a bug). Gate on needle retrieval, not byte-parity.
 
+## Lever #1b: wo_a/wo_b → DeepGEMM (full lever = +6.3%)
+
+Extended the same path to the output projection. DSv4-Flash config: hidden_size=4096,
+num_heads=64 → local_width = (64/8)×512 = **4096 = hidden_size**, so wo_a's K and
+wo_b's K (≤ wo_a.rows) fit the fused FP8 scratch — **wo reuses it exactly like wq_b,
+no dedicated scratch.** Added `wo_a_deepgemm`/`wo_b_deepgemm` caches + a reusable
+`decode_proj_deepgemm` helper + the gated wo branch in `mla_attention` (under the same
+`ARLE_DSV4_DECODE_PROJ_DEEPGEMM`, default ON).
+
+**Full lever A/B (8×H20 TP=8, `flashmla_fused_wqkv`, same-run):**
+
+| `ARLE_DSV4_DECODE_PROJ_DEEPGEMM` | steady tok/s | Δ vs all-scalar |
+|---|---:|---:|
+| `0` (all scalar) | 37.43 | — |
+| `1` (wq_b + wo DeepGEMM) | 39.79 | **+6.3%** |
+
+wo roughly doubled the lever over wq_b-alone (+2.5% → +6.3%), consistent with wo being
+~2/3 of the 3.62ms residual GEMV.
+
+**Correctness:** needle (73914) — scalar and wq_b+wo DeepGEMM emit
+`[223,30793,929,16,19018,436,7681,16,455,9670]` **byte-identical** (all 10 tokens);
+capital-of-France prompt matches scalar 68/80 (tail-only divergence). The residual
+scalar `dsv4_fp8_gemv_batch` (3.62ms, #1 decode GPU kernel) is now fully replaced by
+tensor-core DeepGEMM at decode.
+
 ## Rule
 
 - Decode projection GEMV → DeepGEMM is a per-projection win, not just `fused_wqkv`:
