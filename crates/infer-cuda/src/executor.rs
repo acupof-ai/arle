@@ -588,6 +588,78 @@ struct Dsv4SpecSlotState {
     hidden: Option<DeviceVec>,
 }
 
+#[derive(Clone)]
+struct Dsv4DecodeBatchRow {
+    slot: usize,
+    last_token: u32,
+    start_pos: usize,
+    position: u64,
+    params: SamplingParams,
+}
+
+struct Dsv4DecodeBatch {
+    slot_ids: Vec<usize>,
+    tokens: Vec<u32>,
+    start_positions: Vec<usize>,
+    positions: Vec<u64>,
+    rows: Vec<Dsv4DecodeBatchRow>,
+}
+
+impl Dsv4DecodeBatch {
+    fn from_rows(
+        rows: &[DecodeRow],
+        slots: &[crate::dsv4::Dsv4SlotState],
+        num_slots: usize,
+    ) -> Result<Self> {
+        let mut seen = vec![false; num_slots];
+        let mut slot_ids = Vec::with_capacity(rows.len());
+        let mut tokens = Vec::with_capacity(rows.len());
+        let mut start_positions = Vec::with_capacity(rows.len());
+        let mut positions = Vec::with_capacity(rows.len());
+        let mut batch_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            ensure!(
+                row.slot < num_slots,
+                "decode slot {} outside DSv4 executor slots {}",
+                row.slot,
+                num_slots
+            );
+            ensure!(
+                !seen[row.slot],
+                "DSv4 decode batch contains duplicate slot {}",
+                row.slot
+            );
+            seen[row.slot] = true;
+            ensure!(
+                slots[row.slot].seq_len() == row.kv_seq_len,
+                "DSv4 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
+                slots[row.slot].seq_len(),
+                row.kv_seq_len,
+                row.slot
+            );
+            let position = row.kv_seq_len.saturating_add(1) as u64;
+            slot_ids.push(row.slot);
+            tokens.push(row.last_token);
+            start_positions.push(row.kv_seq_len);
+            positions.push(position);
+            batch_rows.push(Dsv4DecodeBatchRow {
+                slot: row.slot,
+                last_token: row.last_token,
+                start_pos: row.kv_seq_len,
+                position,
+                params: row.params.clone(),
+            });
+        }
+        Ok(Self {
+            slot_ids,
+            tokens,
+            start_positions,
+            positions,
+            rows: batch_rows,
+        })
+    }
+}
+
 impl std::fmt::Debug for Dsv4CudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dsv4CudaExecutor")
@@ -780,27 +852,13 @@ impl Dsv4CudaExecutor {
         }
     }
 
-    fn forward_decode_row(&mut self, row: &DecodeRow) -> Result<Vec<SlotToken>> {
-        ensure!(
-            row.slot < self.num_slots,
-            "decode slot {} outside DSv4 executor slots {}",
-            row.slot,
-            self.num_slots
-        );
-        ensure!(
-            self.slots[row.slot].seq_len() == row.kv_seq_len,
-            "DSv4 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
-            self.slots[row.slot].seq_len(),
-            row.kv_seq_len,
-            row.slot
-        );
-        let position = row.kv_seq_len.saturating_add(1) as u64;
+    fn forward_decode_row(&mut self, row: &Dsv4DecodeBatchRow) -> Result<Vec<SlotToken>> {
         let tokens = self.forward_decode_tokens(
             row.slot,
             row.last_token,
-            row.kv_seq_len,
+            row.start_pos,
             &row.params,
-            position,
+            row.position,
         )?;
         Ok(tokens
             .into_iter()
@@ -814,8 +872,20 @@ impl Dsv4CudaExecutor {
     }
 
     fn forward_decode_batch(&mut self, rows: &[DecodeRow]) -> Result<Vec<SlotToken>> {
-        let mut tokens = Vec::new();
-        for row in rows {
+        let batch = Dsv4DecodeBatch::from_rows(rows, &self.slots, self.num_slots)?;
+        ensure!(
+            batch.slot_ids.len() == batch.rows.len()
+                && batch.tokens.len() == batch.rows.len()
+                && batch.start_positions.len() == batch.rows.len()
+                && batch.positions.len() == batch.rows.len(),
+            "DSv4 decode batch surface length mismatch"
+        );
+        let mut tokens = Vec::with_capacity(batch.rows.len());
+        for (idx, row) in batch.rows.iter().enumerate() {
+            debug_assert_eq!(batch.slot_ids[idx], row.slot);
+            debug_assert_eq!(batch.tokens[idx], row.last_token);
+            debug_assert_eq!(batch.start_positions[idx], row.start_pos);
+            debug_assert_eq!(batch.positions[idx], row.position);
             tokens.extend(self.forward_decode_row(row)?);
         }
         Ok(tokens)
