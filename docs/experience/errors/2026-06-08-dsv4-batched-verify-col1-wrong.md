@@ -105,3 +105,33 @@ token-1's per-key logits / out_vec (pre-inverse-RoPE), or compare the batched se
 kernel launch against two seq=1 launches numerically with a minimal in-kernel probe.
 This is the deepest host-side localization possible; the remaining search is one CUDA
 kernel's multi-query path.
+
+## RESOLUTION (2026-06-08): col1 is legitimate FP8 KERNEL-PATH numerics, not a logic bug
+
+Elimination chain (all dumps committed): inputs bit-identical (q+k+attn_in+history);
+pre-all-reduce attn_out ALREADY diverges (not NCCL AR); FlashMLA-decode OFF still
+diverges. The remaining difference is the KERNEL PATH between the batched verify (M=2)
+and non-spec (M=1):
+- attention: batched=SWA-prefill kernel (seq>1); non-spec/per-token=FlashMLA-decode
+  (seq==1).
+- wo projection: batched=`prefill_proj_deepgemm` (M=2 DeepGEMM); non-spec=
+  `decode_proj_deepgemm` (M=1 DeepGEMM) — DIFFERENT DeepGEMM kernels.
+
+Different FP8 kernels round differently; over 43 layers this amplifies to the col1
+token flip (deterministic, 0.2% per-stage). This is NOT a logic bug — it's the same
+legitimate FP8-tensor-core numerics class as the projection-DeepGEMM work, and the
+byte-identity-vs-non-spec gate is CONFOUNDED by it (per
+`feedback_correct_inference_not_baseline_identity` / `reference_dsv4_moe_nondeterminism`).
+I nearly "fixed" a non-bug — the same trap the memory warns about.
+
+## Corrected rule
+
+- The MTP batched-verify gate is **determined-answer needle retrieval** (correct
+  inference), NOT byte-identity vs the per-token/non-spec path. A batched K+1 verify
+  inherently runs M>1 kernels (SWA-prefill, prefill-DeepGEMM) that differ in FP8
+  rounding from the M=1 non-spec kernels (FlashMLA-decode, decode-DeepGEMM); bit-
+  losslessness is unachievable and not required. Validate with a planted-answer
+  long-context needle (CSA-active) + a same-config-twice non-determinism floor.
+- Next: re-implement the executor batched-reject (capture-before + truncate + restore
+  + re-forward pending) and run the full MTP loop through a determined-answer needle;
+  if retrieval holds within the non-det floor, license MTP (+63%) and flip default-on.
