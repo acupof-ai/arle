@@ -38,12 +38,13 @@ mod real {
 mod real {
     use anyhow::{Context, Result, bail};
     use infer_cuda::{
-        CudaExecutor, CudaKvPool, print_dsv4_linear_profile, print_dsv4_stage_profile,
-        reset_dsv4_linear_profile, reset_dsv4_stage_profile, set_dsv4_flashmla_decode_override,
-        set_dsv4_fused_wqkv_decode_override, set_dsv4_stage_profile_active,
+        CudaExecutor, CudaKvPool, dsv4_max_seq_len, print_dsv4_linear_profile,
+        print_dsv4_stage_profile, reset_dsv4_linear_profile, reset_dsv4_stage_profile,
+        set_dsv4_flashmla_decode_override, set_dsv4_fused_wqkv_decode_override,
+        set_dsv4_stage_profile_active,
     };
     use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
-    use infer_seam::{BackendExecutor, KvPool, PollResult};
+    use infer_seam::{BackendExecutor, KvAllocator, KvPool, KvQuery, PollResult};
     use std::time::Instant;
 
     const DEFAULT_PROMPT_IDS: &str = "671,6102,294,8760,344";
@@ -198,7 +199,7 @@ mod real {
         );
 
         let load_t0 = Instant::now();
-        let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1)
+        let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1, dsv4_max_seq_len())
             .context("from_dsv4_fp8_safetensors failed")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -249,10 +250,14 @@ mod real {
         reset_dsv4_linear_profile();
         reset_dsv4_stage_profile();
 
-        // DSv4 does not use the host page pool, but the BackendExecutor seam
-        // still carries one. Recreate it per variant so host bookkeeping starts
-        // clean alongside the executor slot reset at prefill start_pos=0.
-        let mut kv = CudaKvPool::new(1, 1, 16);
+        // DSv4 does not use the host page pool for real KV, but the seam's
+        // KvBatchDescriptor check reads kv.seq_len(slot) (set by materialize_plan_kv
+        // below), so size the host pool to the executor's DESIGN max context
+        // (dsv4_max_seq_len) — length-agnostic, handles any prompt up to the max
+        // without per-test sizing. Recreated per variant for clean bookkeeping.
+        let page_size = 16usize;
+        let kv_pages = dsv4_max_seq_len().div_ceil(page_size) + 1;
+        let mut kv = CudaKvPool::new(1, kv_pages, page_size);
 
         let prefill_t0 = Instant::now();
         let first = forward_once(exec, &mut kv, prefill_plan(prompt, 0))?;
@@ -268,8 +273,14 @@ mod real {
         let decode_t0 = Instant::now();
         let mut timed_t0: Option<Instant> = None;
 
-        for step in 1..max_new {
-            if timed_t0.is_none() && step > warmup_decode_steps {
+        // Spec-aware: MTP emits 1-2 tokens/call (accepted base_next + bonus) and the
+        // executor self-manages slot KV, so loop on emitted TOKEN count (not calls)
+        // and feed the LAST emitted token (= executor `pending`) each step. For
+        // non-spec this degenerates to 1 token/call == the original loop.
+        let mut timed_token_start = 0usize;
+        let mut calls = 0usize;
+        while tokens.len() < max_new {
+            if timed_t0.is_none() && calls >= warmup_decode_steps {
                 if profile_this {
                     cuda_profiler_start()
                         .with_context(|| format!("cudaProfilerStart for {}", variant.name))?;
@@ -277,17 +288,26 @@ mod real {
                 }
                 set_dsv4_stage_profile_active(stage_profile_this);
                 timed_t0 = Some(Instant::now());
+                timed_token_start = tokens.len();
             }
 
-            let kv_seq_len = prompt.len() + step - 1;
+            let kv_seq_len = prompt.len() + tokens.len() - 1;
             let last = *tokens.last().expect("tokens is non-empty");
-            match forward_once(exec, &mut kv, decode_plan(last, kv_seq_len)) {
-                Ok(tok) => tokens.push(tok),
+            let new = match forward_multi(exec, &mut kv, decode_plan(last, kv_seq_len)) {
+                Ok(new) => new,
                 Err(e) => {
-                    bail_at = Some((step, format!("{e:#}")));
+                    bail_at = Some((calls + 1, format!("{e:#}")));
                     break;
                 }
+            };
+            // MTP emitted new.len() tokens but materialize_plan_kv alloc'd only 1
+            // (the decode row); advance the host pool by the rest so the next
+            // step's kv_seq_len matches the executor's actual KV.
+            for _ in 1..new.len() {
+                kv.alloc(0, 1).context("DSv4 MTP host-pool sync alloc")?;
             }
+            tokens.extend(new);
+            calls += 1;
         }
 
         let decode_ms = decode_t0.elapsed().as_secs_f64() * 1000.0;
@@ -300,8 +320,14 @@ mod real {
         }
         set_dsv4_stage_profile_active(false);
         print_dsv4_linear_profile(variant.name);
+        // decode_steps / timed_decode_steps are EMITTED TOKEN counts so tok/s is
+        // tokens/sec for both non-spec (1/call) and MTP (1-2/call).
         let decode_steps = tokens.len().saturating_sub(1);
-        let timed_decode_steps = decode_steps.saturating_sub(warmup_decode_steps);
+        let timed_decode_steps = if timed_t0.is_some() {
+            tokens.len().saturating_sub(timed_token_start)
+        } else {
+            0
+        };
         print_dsv4_stage_profile(variant.name, timed_decode_steps, timed_decode_ms);
 
         Ok(VariantResult {
@@ -447,11 +473,43 @@ mod real {
         }
     }
 
+    /// Materialize the host KV pool (set per-slot seq_len) for `plan` before
+    /// submit — the seam's KvBatchDescriptor check reads `kv.seq_len(slot)`.
+    /// Mirrors dsv4_parity. DSv4's real KV lives in the executor adapter; this is
+    /// the seam's logical bookkeeping only.
+    fn materialize_plan_kv(kv: &mut CudaKvPool, plan: &ForwardPlan) -> Result<()> {
+        for row in &plan.prefill_rows {
+            if row.start_pos == 0 {
+                kv.free_slot(row.slot);
+            }
+            anyhow::ensure!(
+                kv.seq_len(row.slot) == row.start_pos,
+                "host KV len {} != prefill start_pos {} for slot {}",
+                kv.seq_len(row.slot),
+                row.start_pos,
+                row.slot
+            );
+            kv.alloc(row.slot, row.tokens.len())?;
+        }
+        for row in &plan.decode_rows {
+            anyhow::ensure!(
+                kv.seq_len(row.slot) == row.kv_seq_len,
+                "host KV len {} != decode kv_seq_len {} for slot {}",
+                kv.seq_len(row.slot),
+                row.kv_seq_len,
+                row.slot
+            );
+            kv.alloc(row.slot, 1)?;
+        }
+        Ok(())
+    }
+
     fn forward_once(
         exec: &mut CudaExecutor,
         kv: &mut CudaKvPool,
         plan: ForwardPlan,
     ) -> Result<u32> {
+        materialize_plan_kv(kv, &plan)?;
         let inflight = exec.submit(&plan, kv as &mut dyn KvPool)?;
         match exec.poll(inflight)? {
             PollResult::Ready(out) => out
@@ -459,6 +517,27 @@ mod real {
                 .first()
                 .map(|t| t.token)
                 .context("DSv4 step produced no token"),
+            PollResult::NotReady(_) => bail!("DSv4 executor resolves synchronously; got NotReady"),
+        }
+    }
+
+    /// Like [`forward_once`] but returns ALL tokens the step emitted. MTP spec
+    /// decode emits 1 (reject) or 2 (accepted base_next + bonus) and sets the
+    /// executor's `pending` to the LAST emitted token, so the spec-aware decode
+    /// loop must push every returned token and feed the last as the next input.
+    fn forward_multi(
+        exec: &mut CudaExecutor,
+        kv: &mut CudaKvPool,
+        plan: ForwardPlan,
+    ) -> Result<Vec<u32>> {
+        materialize_plan_kv(kv, &plan)?;
+        let inflight = exec.submit(&plan, kv as &mut dyn KvPool)?;
+        match exec.poll(inflight)? {
+            PollResult::Ready(out) => {
+                let toks: Vec<u32> = out.tokens.iter().map(|t| t.token).collect();
+                anyhow::ensure!(!toks.is_empty(), "DSv4 step produced no token");
+                Ok(toks)
+            }
             PollResult::NotReady(_) => bail!("DSv4 executor resolves synchronously; got NotReady"),
         }
     }
