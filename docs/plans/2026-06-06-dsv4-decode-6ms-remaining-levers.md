@@ -1,5 +1,41 @@
 # DSv4 decode → 6ms: remaining levers (post +27%) — precise implementation plan
 
+## Superseded by later evidence
+
+**The lever ranking in this doc is a SMOKE-SHAPE artifact and was overturned the
+same day.** The "comm 32.4% (AllReduce 16.4% + AllGather 16.0%)" / "GEMV 14.4%" /
+"mhc 12.2%" ranking comes from an **8-token decode window** (short prompt + 64
+steps, prefill diluted), where the context-scaling sparse selector is trivial. The
+end-to-end **wall-clock** trace at the 4096 SLO shape found the real #1 bottleneck
+is `dsv4_csa_select` (74.9% of decode at 4096; flat-vs-scaling 124ms → 26ms after
+the fix) — comm is only ~4% at the SLO shape. See
+[`2026-06-06-dsv4-pd-systematic-analysis.md`](2026-06-06-dsv4-pd-systematic-analysis.md)
+§3 (the corrected wall-clock conclusion) and the retro
+[`../experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md`](../experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md).
+
+Correct conclusions that replaced the levers here:
+- **csa_select → official DeepSeek DSA indexer** (`fp8_paged_mqa_logits` +
+  `deepseek_v4_topk_transform_512`), not a hand-rolled parallel kernel. Default-on,
+  decode flat ~26ms @4096:
+  [`../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md`](../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md).
+- The **H20 reference baseline** (base decode ~20-35ms; 6ms needs spec):
+  [`2026-06-06-dsv4-h20-reference-baseline.md`](2026-06-06-dsv4-h20-reference-baseline.md).
+- The forward-looking program is the **unified batched-decode/paged-KV abstraction**,
+  not per-kernel B=1 levers:
+  [`2026-06-07-unified-batched-kvpool-abstraction.md`](2026-06-07-unified-batched-kvpool-abstraction.md).
+
+Lever 2 (residual `wo` GEMV) and lever 3 (mhc-fuse) below are subsumed by the
+"adopt the official kernel" posture (the fp8 GEMVs go to DeepGEMM where it wins;
+mhc-fuse was blocked on TileLang f32-mma — see
+[`../experience/errors/2026-06-06-dsv4-mhc-fuse-tilelang-f32-mma-blocked.md`](../experience/errors/2026-06-06-dsv4-mhc-fuse-tilelang-f32-mma-blocked.md)).
+Lever 4 (EAGLE/MTP via 6ms) is correct in principle but the "1.9× now" framing was
+overturned — MTP is parked at the draft-quality wall (39% accept vs SGLang 68%):
+[`../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md`](../experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md).
+Kept for history (the profiling method + the comm-overlap decomposition are valid
+process records).
+
+---
+
 **Date:** 2026-06-06. **State:** decode **29.5 → 37.6 tok/s (~26.6 ms/token)** this
 session via env-A/B-licensed flips (gpu-router on-device, FlashMLA-decode +24%,
 fused-wqkv +18.4%) + D2D/memset cleanups. The cheap env-A/B wins are **exhausted** —
