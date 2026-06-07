@@ -1212,10 +1212,17 @@ impl SafetensorLoader {
         ctx: &DeviceContext,
         names: &deepseek_spec::DeepSeekV4IndexerTensorNames,
     ) -> Result<crate::dsv4::Dsv4Indexer> {
+        let wq_b = self.load_dsv4_global_matrix(ctx, &names.wq_b)?;
+        let wq_b_deepgemm = if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
+            Some(cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &wq_b)?)
+        } else {
+            None
+        };
         Ok(crate::dsv4::Dsv4Indexer {
-            wq_b: self.load_dsv4_global_matrix(ctx, &names.wq_b)?,
+            wq_b,
             weights_proj: self.load_dsv4_global_matrix(ctx, &names.weights_proj)?,
             compressor: self.load_dsv4_compressor(ctx, &names.compressor)?,
+            wq_b_deepgemm,
         })
     }
 }

@@ -2563,6 +2563,21 @@ fn dsv4_prefill_proj_deepgemm_enabled() -> bool {
     )
 }
 
+/// Prefill DSA indexer query projection → DeepGEMM (134.9 → 6.05ms, −95.5% at M=1024,
+/// clean per-stage A/B). SEPARATE default-OFF flag from the residual wq_b/wo: the
+/// indexer feeds the top-k block SELECTOR, so an FP8 numeric flip could change
+/// selection — unlike the residual GEMMs it is NOT validated by a byte-identical
+/// needle (the 37-tok needle is < sliding_window so the indexer never runs, and an
+/// ad-hoc long-context needle has no planted answer). Gate ON only after a
+/// planted-answer long-context needle (dsv4_parity) confirms retrieval. Toggle:
+/// ARLE_DSV4_PREFILL_INDEXER_DEEPGEMM=1.
+fn dsv4_prefill_indexer_deepgemm_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_PREFILL_INDEXER_DEEPGEMM").as_deref(),
+        Ok("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+    )
+}
+
 fn dsv4_dsa_official_enabled() -> Result<bool> {
     // Default ON: official/vendored DSA indexer replaces the legacy scalar
     // csa_select selector. Licensed by the variable-shape legacy-floor gate:
@@ -4286,6 +4301,7 @@ pub(crate) fn mla_attention(
                 start_pos,
                 start_pos_device,
                 compress_ratio,
+                state.prefill_linear.as_mut(),
                 keepalive,
             )?)
         } else {
@@ -4736,14 +4752,34 @@ fn csa_select(
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     ratio: usize,
+    mut prefill_scratch: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<CudaSlice<i32>> {
     // SAFETY: dsv4_linear writes the full index-query buffer.
     let mut q_i = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, c_q_normed.seq_len)? };
     let nvtx_indexer_wq_b = crate::nvtx::range("dsv4/linear/indexer_wq_b");
-    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
-        dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)
-    })?;
+    // Prefill index-query (M=token_count) → DeepGEMM, off the scalar fp8_gemv (the #1
+    // remaining projection at M=1024). Decode (seq_len==1) / no-cache stays scalar.
+    let indexer_wq_b_dg = c_q_normed.seq_len > 1
+        && dsv4_prefill_indexer_deepgemm_enabled()
+        && indexer.wq_b_deepgemm.is_some()
+        && prefill_scratch.is_some();
+    if indexer_wq_b_dg {
+        let cache = indexer
+            .wq_b_deepgemm
+            .as_ref()
+            .expect("indexer wq_b dg gate checked");
+        let scratch = prefill_scratch
+            .as_deref_mut()
+            .expect("indexer wq_b dg gate checked");
+        crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
+            prefill_proj_deepgemm(ctx, scratch, cache, c_q_normed, &mut q_i)
+        })?;
+    } else {
+        crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
+            dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)
+        })?;
+    }
     drop(nvtx_indexer_wq_b);
     keepalive.keep_hidden(&q_i);
     // SAFETY: dsv4_linear writes the full index-weight buffer.
