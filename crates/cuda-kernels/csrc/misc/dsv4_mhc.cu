@@ -172,7 +172,24 @@ __global__ void dsv4_mhc_params_kernel(
 
   float sumsq = 0.0f;
   int row_start = token * residual_hidden_dim;
-  for (int idx = threadIdx.x; idx < residual_hidden_dim; idx += blockDim.x) {
+  // Vectorized read: 8 bf16 per uint4 (128-bit) load. At B=1 this kernel is ONE block
+  // (one SM, ~8 warps) reading residual_hidden_dim=hidden*hc_mult (~16384) bf16 for the
+  // rms scalar — latency-bound (one SM can't hide HBM latency at low occupancy). Packing
+  // 8 elems/load cuts memory round-trips 8x. (row_start*2B is 16B-aligned: hc_mult*hidden.)
+  int n8 = residual_hidden_dim / 8;
+  const uint4 *res4 = reinterpret_cast<const uint4 *>(residual + row_start);
+  for (int idx = threadIdx.x; idx < n8; idx += blockDim.x) {
+    uint4 packed = res4[idx];
+    const uint16_t *h = reinterpret_cast<const uint16_t *>(&packed);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      float value = bf16_to_f32(h[k]);
+      sumsq += value * value;
+    }
+  }
+  // Scalar tail when residual_hidden_dim is not a multiple of 8.
+  for (int idx = n8 * 8 + threadIdx.x; idx < residual_hidden_dim;
+       idx += blockDim.x) {
     float value = bf16_to_f32(residual[row_start + idx]);
     sumsq += value * value;
   }
