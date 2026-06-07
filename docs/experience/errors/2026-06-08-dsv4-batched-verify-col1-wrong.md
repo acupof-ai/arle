@@ -45,6 +45,14 @@ history at start_pos>0 (token 0 / col0 is correct; token 1 / col1 — which must
 to both the history AND token 0 — is wrong). The fix is in the chunked-prefill SW/CSA
 attention path, not the verify wiring. Re-validate with a planted-answer needle.
 
+## Suspects ruled out by source read (2026-06-08) — narrows the pod probe
+
+- **head_hidden_from_stream**: extracts `token_idx` correctly (`copy_row_to_hidden(stream, token_idx)`) — output extraction is fine.
+- **FlashMLA decode**: `try_flashmla_decode_attention` returns `Ok(false)` for `seq_len != 1` (attention.rs ~3291), so the 2-tok chunk correctly falls back to the legacy SWA kernel — NOT a FlashMLA s_q=1 mishandle.
+- **SWA kernel causal** (`dsv4_swa_attention_kernel`, dsv4_attention.cu:539): for token 1 (abs_pos=start_pos+1), `sw_start`/`key_count` (566-568) give key_pos 0..start_pos+1, and `dsv4_swa_key_value` routes key_pos≥base_start_pos → `k_new[key_pos-base_start_pos]` — so token1 DOES attend to token0 + history. Chunk math is correct.
+
+So col1 is wrong somewhere ELSE in the 2-token forward's token-1 path (HC mix `gen_mhc_params`/`hc_pre`/`hc_post` over seq_len=2, MoE token-1 routing, or a window_cache write-then-read ordering within the chunk). NOT crackable by reading — needs a pod probe that dumps token-1's per-stage hidden vs the per-token reference (the working `forward_tokens_stream_impl([draft], start_pos+1)`) to find the first diverging stage.
+
 ## Rule
 
 - A batched K+1 verify is the right MTP lever (speed proven +63%), but it requires the
