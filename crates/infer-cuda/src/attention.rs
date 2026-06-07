@@ -4504,6 +4504,45 @@ pub(crate) fn mla_attention(
             decode_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out, attention.wo_b.cols)
         })?;
         drop(nvtx_wo_b);
+    } else if token_count > 1
+        && dsv4_prefill_proj_deepgemm_enabled()
+        && attention.wo_a_deepgemm.is_some()
+        && attention.wo_b_deepgemm.is_some()
+        && state.prefill_linear.is_some()
+    {
+        // Prefill wo_a/wo_b (M=token_count) → DeepGEMM, off the scalar fp8_gemv
+        // (same lever as prefill wq_b; reuses the prefill FP8 scratch).
+        let wo_a_cache = attention
+            .wo_a_deepgemm
+            .as_ref()
+            .expect("wo prefill gate checked");
+        let wo_b_cache = attention
+            .wo_b_deepgemm
+            .as_ref()
+            .expect("wo prefill gate checked");
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        {
+            let scratch = state
+                .prefill_linear
+                .as_mut()
+                .expect("wo prefill gate checked");
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+                prefill_proj_deepgemm(ctx, scratch, wo_a_cache, &local_attn, &mut latent)
+            })?;
+        }
+        drop(nvtx_wo_a);
+        keepalive.keep_hidden(&latent);
+        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
+        {
+            let scratch = state
+                .prefill_linear
+                .as_mut()
+                .expect("wo prefill gate checked");
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+                prefill_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out)
+            })?;
+        }
+        drop(nvtx_wo_b);
     } else {
         let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
