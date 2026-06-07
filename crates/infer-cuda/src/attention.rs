@@ -2139,6 +2139,68 @@ pub(crate) fn mla_linear(
     Ok(())
 }
 
+/// Decode (M=1) FP8 projection through tensor-core DeepGEMM: quantize `input`
+/// (K columns) into the fused-wqkv FP8 scratch, then `dsv4_deepgemm_fp8_gemm_nt`
+/// with the pre-repacked weight `cache`. Used for the residual decode projections
+/// (wo_a/wo_b; lever #1b) when K ≤ the scratch hidden_dim. The scratch may have
+/// been consumed by an earlier projection this step — safe, all on `ctx.stream`.
+fn decode_proj_deepgemm(
+    ctx: &DeviceContext,
+    scratch: &Dsv4FusedWqkvDecodeScratch,
+    cache: &cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache,
+    input: &HiddenStates,
+    out: &mut HiddenStates,
+    k: usize,
+) -> Result<()> {
+    ensure!(
+        cache.cols == k
+            && cache.rows == out.hidden_dim
+            && input.hidden_dim == k
+            && input.seq_len == 1
+            && out.seq_len == 1,
+        "DSv4 decode_proj_deepgemm shape mismatch: cache {}x{} k={k} in {}x{} out {}x{}",
+        cache.rows,
+        cache.cols,
+        input.hidden_dim,
+        input.seq_len,
+        out.hidden_dim,
+        out.seq_len
+    );
+    let stream = ctx.stream.cu_stream();
+    // SAFETY: all buffers live on ctx.stream; K ≤ scratch hidden_dim so the fused
+    // FP8 + scale scratch covers the extents.
+    unsafe {
+        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+            cache_ptr(&input.data, ctx),
+            cache_ptr(&scratch.input_fp8, ctx),
+            cache_ptr(&scratch.input_scales, ctx),
+            cache_ptr(&scratch.active_experts, ctx),
+            cache_ptr(&scratch.active_offsets, ctx),
+            cache_ptr(&scratch.active_counts, ctx),
+            1,
+            scratch.max_m,
+            k,
+            scratch.scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 decode proj activation quantize failed: {e}"))?;
+        cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+            cache_ptr(&scratch.input_fp8, ctx),
+            cache_ptr(&scratch.input_scales, ctx),
+            cache_ptr(&cache.weight, ctx),
+            cache_ptr(&cache.scales, ctx),
+            cache_ptr(&out.data, ctx),
+            1,
+            cache.rows,
+            cache.cols,
+            scratch.scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 decode proj DeepGEMM dense failed: {e}"))?;
+    }
+    Ok(())
+}
+
 fn run_fused_wqkv_prefill(
     ctx: &DeviceContext,
     attention: &Dsv4Attention,
@@ -4301,17 +4363,54 @@ pub(crate) fn mla_attention(
     // back to hidden). Row-parallel: the all-reduce-sum is the model's concern.
     // SAFETY: dsv4_linear writes the full latent buffer.
     let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a.rows, token_count)? };
-    let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-    crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-        dsv4_linear(ctx, &attention.wo_a, &local_attn, &mut latent)
-    })?;
-    drop(nvtx_wo_a);
-    keepalive.keep_hidden(&latent);
-    let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
-    crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-        dsv4_linear(ctx, &attention.wo_b, &latent, out)
-    })?;
-    drop(nvtx_wo_b);
+    let wo_dg = token_count == 1
+        && dsv4_decode_proj_deepgemm_enabled()
+        && state.fused_wqkv.is_some()
+        && attention.wo_a_deepgemm.is_some()
+        && attention.wo_b_deepgemm.is_some();
+    if wo_dg {
+        // Lever #1b: wo_a/wo_b (M=1) through tensor-core DeepGEMM, reusing the
+        // fused-wqkv FP8 scratch (local_width == hidden_size on DSv4-Flash).
+        let scratch = state.fused_wqkv.as_ref().expect("wo_dg gate checked");
+        let wo_a_cache = attention
+            .wo_a_deepgemm
+            .as_ref()
+            .expect("wo_dg gate checked");
+        let wo_b_cache = attention
+            .wo_b_deepgemm
+            .as_ref()
+            .expect("wo_dg gate checked");
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+            decode_proj_deepgemm(
+                ctx,
+                scratch,
+                wo_a_cache,
+                &local_attn,
+                &mut latent,
+                attention.wo_a.cols,
+            )
+        })?;
+        drop(nvtx_wo_a);
+        keepalive.keep_hidden(&latent);
+        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+            decode_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out, attention.wo_b.cols)
+        })?;
+        drop(nvtx_wo_b);
+    } else {
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+            dsv4_linear(ctx, &attention.wo_a, &local_attn, &mut latent)
+        })?;
+        drop(nvtx_wo_a);
+        keepalive.keep_hidden(&latent);
+        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+            dsv4_linear(ctx, &attention.wo_b, &latent, out)
+        })?;
+        drop(nvtx_wo_b);
+    }
     Ok(())
 }
 

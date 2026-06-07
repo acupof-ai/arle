@@ -1131,6 +1131,40 @@ impl SafetensorLoader {
         } else {
             None
         };
+        let wo_a = self.load_dsv4_block_scaled_sharded(
+            ctx,
+            &names.wo_a,
+            names
+                .shard_for(config, &names.wo_a, tp.world_size)
+                .unwrap_or(Shard::Replicated),
+            tp,
+        )?;
+        let wo_b = self.load_dsv4_block_scaled_sharded(
+            ctx,
+            &names.wo_b,
+            names
+                .shard_for(config, &names.wo_b, tp.world_size)
+                .unwrap_or(Shard::Replicated),
+            tp,
+        )?;
+        // DeepGEMM caches for the decode output projection (lever #1b), same gate.
+        let (wo_a_deepgemm, wo_b_deepgemm) =
+            if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
+                (
+                    Some(
+                        cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
+                            ctx, &wo_a,
+                        )?,
+                    ),
+                    Some(
+                        cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
+                            ctx, &wo_b,
+                        )?,
+                    ),
+                )
+            } else {
+                (None, None)
+            };
         Ok(crate::dsv4::Dsv4Attention {
             wq_a,
             wqkv_a_deepgemm,
@@ -1139,22 +1173,10 @@ impl SafetensorLoader {
             wq_b_deepgemm,
             wkv,
             kv_norm: self.load_dsv4_vec(ctx, &names.kv_norm)?,
-            wo_a: self.load_dsv4_block_scaled_sharded(
-                ctx,
-                &names.wo_a,
-                names
-                    .shard_for(config, &names.wo_a, tp.world_size)
-                    .unwrap_or(Shard::Replicated),
-                tp,
-            )?,
-            wo_b: self.load_dsv4_block_scaled_sharded(
-                ctx,
-                &names.wo_b,
-                names
-                    .shard_for(config, &names.wo_b, tp.world_size)
-                    .unwrap_or(Shard::Replicated),
-                tp,
-            )?,
+            wo_a,
+            wo_b,
+            wo_a_deepgemm,
+            wo_b_deepgemm,
             attn_sink,
             attn_sink_f32,
             compressor: names
