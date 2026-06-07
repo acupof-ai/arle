@@ -39,6 +39,29 @@ differing from N=1 (see the numerics-derivation wins entry). `ref_self_parity=tr
 throughout (c=1 deterministic). The divergent c=2 tail stays coherent — it re-emits
 the passcode.
 
+## Phase 6b: remove the per-row attention `ctx.sync()`
+
+The attention half stays a per-row loop (N sequential `mla_attention`), but it had a
+`ctx.sync()` **per row** (43×N host syncs/step) added as debug isolation. Every op in
+the loop — the memcpy, `mla_attention`'s FlashMLA/compressor/indexer FFI (all invoked
+with `ctx.stream.cu_stream()`), the copy-out — runs on `ctx.stream`, so stream ordering
+already serializes row r's reads of the shared scratch before row r+1's writes. The sync
+is redundant; removed it.
+
+Same A/B (per-row baseline stable ~36.9 tok/s @ c=8 across both runs, so grouped numbers
+are directly comparable):
+
+| c | grouped w/ sync (6a) | grouped no-sync (6b) | Δ from sync removal |
+|---|---|---|---|
+| 4 | 43.50 | 45.47 | +4.5% |
+| 8 | 49.71 | 51.75 | +4.1% |
+
+Modest (+4%) because the attention COMPUTE is still N sequential FlashMLA over 43 layers
+— removing host syncs only recovers sync overhead + a little overlap, not the per-row
+compute serialization. gate_exit=0 (needle retrieved). The real attention lever is
+Phase 5 (batched FlashMLA b=N, one kernel over N rows); `dsv4_flashmla_decode_build_indices_batched_raw`
+already exists as partial b=N infra.
+
 ## Rule
 
 - Grouped-over-N is a drop-in for DSv4 decode MoE/shared: the prefill path already

@@ -1189,8 +1189,11 @@ impl Dsv4Model {
                     ctx.stream
                         .memcpy_dtod(&attn_out_row.data, &mut dst)
                         .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
-                    // ISOLATION (ordering-vs-logic): fully serialize per-row work.
-                    self.ctx.sync()?;
+                    // No per-row host sync: every op (memcpy, mla_attention's
+                    // FlashMLA/compressor/indexer FFI, copy-out) runs on ctx.stream,
+                    // so stream ordering already serializes row r's reads of the
+                    // shared {normed,attn_out}_row scratch before row r+1's writes
+                    // (WAR resolved by stream order). The sync was debug isolation.
                 }
             }
             keepalive.keep_hidden(&attn_out);
