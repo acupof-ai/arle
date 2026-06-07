@@ -2201,6 +2201,83 @@ fn decode_proj_deepgemm(
     Ok(())
 }
 
+/// Prefill (M=token_count) residual projection via DeepGEMM: quantize `input`
+/// [m, k] into the prefill FP8 scratch, then `dsv4_deepgemm_fp8_gemm_nt` with the
+/// pre-repacked weight `cache`. The M>1 analogue of [`decode_proj_deepgemm`] —
+/// moves the prefill wq_b / wo / indexer projections off the scalar
+/// `dsv4_fp8_gemv_batch` (62% of mla_attn prefill) onto tensor-core DeepGEMM.
+/// K ≤ scratch.max_k (the fused-wqkv scratch is sized for the largest K=hidden_dim).
+fn prefill_proj_deepgemm(
+    ctx: &DeviceContext,
+    scratch: &mut Dsv4PrefillDeepGemmLinearScratch,
+    cache: &cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache,
+    input: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    let m = input.seq_len;
+    let k = cache.cols;
+    let n = cache.rows;
+    ensure!(
+        input.hidden_dim == k && out.hidden_dim == n && out.seq_len == m,
+        "DSv4 prefill_proj_deepgemm shape mismatch: cache {n}x{k} in {}x{} out {}x{}",
+        input.hidden_dim,
+        input.seq_len,
+        out.hidden_dim,
+        out.seq_len
+    );
+    ensure!(
+        m <= scratch.max_m && k <= scratch.max_k,
+        "DSv4 prefill_proj_deepgemm scratch too small: need M={m} K={k}, have M={} K={}",
+        scratch.max_m,
+        scratch.max_k
+    );
+    let scale_stride_m = m.div_ceil(4) * 4;
+    let scale_cols = k.div_ceil(128);
+    ensure!(
+        scale_stride_m <= scratch.max_scale_stride_m
+            && scale_stride_m * scale_cols <= scratch.input_scales.len()
+            && m * k <= scratch.input_fp8.len(),
+        "DSv4 prefill_proj_deepgemm scratch extent mismatch: M={m} K={k} stride={scale_stride_m}"
+    );
+    let active_count = i32::try_from(m)
+        .map_err(|_| anyhow!("DSv4 prefill_proj_deepgemm token count {m} overflows i32"))?;
+    ctx.stream
+        .memcpy_htod(&[active_count], &mut scratch.active_counts)
+        .map_err(|e| anyhow!("DSv4 prefill_proj_deepgemm active_counts H2D failed: {e}"))?;
+    let stream = ctx.stream.cu_stream();
+    // SAFETY: all buffers on ctx.stream; M/K within scratch extents (checked above).
+    unsafe {
+        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+            cache_ptr(&input.data, ctx),
+            cache_ptr(&scratch.input_fp8, ctx),
+            cache_ptr(&scratch.input_scales, ctx),
+            cache_ptr(&scratch.active_experts, ctx),
+            cache_ptr(&scratch.active_offsets, ctx),
+            cache_ptr(&scratch.active_counts, ctx),
+            1,
+            m,
+            k,
+            scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 prefill_proj_deepgemm activation quantize failed: {e}"))?;
+        cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+            cache_ptr(&scratch.input_fp8, ctx),
+            cache_ptr(&scratch.input_scales, ctx),
+            cache_ptr(&cache.weight, ctx),
+            cache_ptr(&cache.scales, ctx),
+            cache_ptr(&out.data, ctx),
+            m,
+            n,
+            k,
+            scale_stride_m,
+            stream,
+        )
+        .map_err(|e| anyhow!("DSv4 prefill_proj_deepgemm DeepGEMM dense failed: {e}"))?;
+    }
+    Ok(())
+}
+
 fn run_fused_wqkv_prefill(
     ctx: &DeviceContext,
     attention: &Dsv4Attention,
@@ -2469,6 +2546,19 @@ fn dsv4_decode_proj_deepgemm_enabled() -> bool {
     // ARLE_DSV4_DECODE_PROJ_DEEPGEMM=0.
     !matches!(
         std::env::var("ARLE_DSV4_DECODE_PROJ_DEEPGEMM").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    )
+}
+
+/// Prefill residual projections (wq_b now; wo/indexer next) → tensor-core DeepGEMM
+/// instead of the scalar `dsv4_fp8_gemv_batch` (62% of mla_attn prefill per the P/D
+/// nsys breakdown). Default ON: licensed 2026-06-08 on the TP=8 pod — at M=1024 the
+/// prefill wq_b A/B cut total prefill_ms 14382 → 7628 (−47%) with the needle answer
+/// retrieved byte-identically (scalar fp8_gemv scales O(M); it's a decode GEMV).
+/// Opt out with ARLE_DSV4_PREFILL_PROJ_DEEPGEMM=0.
+fn dsv4_prefill_proj_deepgemm_enabled() -> bool {
+    !matches!(
+        std::env::var("ARLE_DSV4_PREFILL_PROJ_DEEPGEMM").as_deref(),
         Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
     )
 }
@@ -3868,9 +3958,25 @@ pub(crate) fn mla_attention(
         keepalive.keep_hidden(&c_q_normed);
         let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
         let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-            dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
-        })?;
+        // Prefill wq_b → DeepGEMM (off the scalar dsv4_fp8_gemv_batch, the 62% of
+        // mla_attn prefill). Reuses the prefill fused-wqkv FP8 scratch since
+        // K=q_lora_rank ≤ hidden_dim. Opt-in until the prefill A/B licenses it.
+        if let Some(cache) = attention
+            .wq_b_deepgemm
+            .as_ref()
+            .filter(|_| dsv4_prefill_proj_deepgemm_enabled())
+        {
+            let scratch = state.prefill_linear.as_mut().ok_or_else(|| {
+                anyhow!("DSv4 prefill wq_b DeepGEMM requested but prefill scratch not allocated")
+            })?;
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+                prefill_proj_deepgemm(ctx, scratch, cache, &c_q_normed, &mut q_raw)
+            })?;
+        } else {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+                dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+            })?;
+        }
         drop(nvtx_wq_b);
         keepalive.keep_hidden(&q_raw);
 
