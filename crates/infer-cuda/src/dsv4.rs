@@ -248,6 +248,7 @@ pub(crate) struct Dsv4DecodeGraphScratch {
     initial_stream: HiddenStates,
     layers: Vec<Dsv4DecodeLayerGraphScratch>,
     tail_graph: crate::graph::CudaGraphState,
+    whole_graph: crate::graph::CudaGraphState,
     last_hidden: DeviceVec,
     last_normed: DeviceVec,
     logits_batch: HiddenStates,
@@ -302,6 +303,7 @@ impl Dsv4DecodeGraphScratch {
             initial_stream,
             layers,
             tail_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
+            whole_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
             last_hidden,
             last_normed,
             logits_batch,
@@ -2171,268 +2173,315 @@ impl Dsv4Model {
         let eps = self.config.rms_norm_eps;
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
 
-        for layer_idx in 0..self.layers.len() {
-            let layer = &self.layers[layer_idx];
-            if layer_idx == 0 {
-                let current = &mut graph.layers[0];
+        let whole_step = dsv4_whole_step_graph_enabled();
+        if whole_step {
+            for s in graph.layers.iter_mut() {
+                s.attn_graph.set_bypass(true);
+                s.moe_graph.set_bypass(true);
+            }
+            graph.tail_graph.set_bypass(true);
+        }
+        // The whole per-token forward (loop + tail) as one closure: when whole_step,
+        // captured as ONE graph (graph.whole_graph); else run eagerly with the existing
+        // per-portion captures. advance_decode_len is host bookkeeping that must run
+        // every replay, so it is hoisted OUT of the closure (post-capture) for whole_step.
+        let mut body = || -> Result<()> {
+            for layer_idx in 0..self.layers.len() {
+                let layer = &self.layers[layer_idx];
+                if layer_idx == 0 {
+                    let current = &mut graph.layers[0];
+                    let Dsv4DecodeLayerGraphScratch {
+                        attn_graph,
+                        attn_mhc,
+                        attn_in,
+                        attn_normed,
+                        attn_out,
+                        ..
+                    } = current;
+                    let attn_state = &mut slot.attention[layer_idx];
+                    let attn_pool = kv_adapter.layer_mut(layer_idx)?;
+                    attn_graph.run_or_capture(|| {
+                        crate::ops::embedding_batch(
+                            &self.ctx,
+                            &self.embed_tokens,
+                            &graph.token_ids,
+                            &mut graph.embeddings,
+                        )?;
+                        crate::hc::initial_stream_from_embeddings(
+                            &self.ctx,
+                            &graph.embeddings,
+                            hidden_size,
+                            hc_mult,
+                            &mut graph.initial_stream,
+                        )?;
+                        let mhc = crate::hc::gen_mhc_params_into(
+                            &self.ctx,
+                            &self.config,
+                            &layer.hc_attn,
+                            &graph.initial_stream,
+                            attn_mhc,
+                        )?;
+                        crate::hc::hc_pre(
+                            &self.ctx,
+                            &graph.initial_stream,
+                            mhc.pre,
+                            hidden_size,
+                            hc_mult,
+                            attn_in,
+                        )?;
+                        crate::ops::rms_norm_batch(
+                            &self.ctx,
+                            attn_in,
+                            &layer.attn_norm,
+                            eps,
+                            attn_normed,
+                        )?;
+                        crate::attention::mla_attention(
+                            &self.ctx,
+                            &self.config,
+                            &layer.attention,
+                            layer.mode,
+                            layer.compress_ratio,
+                            layer_idx,
+                            attn_normed,
+                            attn_state,
+                            attn_pool,
+                            start_pos,
+                            Some(&slot.start_pos_device),
+                            &self.tp,
+                            attn_out,
+                            &mut keepalive,
+                        )
+                    })?;
+                } else {
+                    let (prev_layers, current_layers) = graph.layers.split_at_mut(layer_idx);
+                    let prev = &mut prev_layers[layer_idx - 1];
+                    let current = &mut current_layers[0];
+                    let Dsv4DecodeLayerGraphScratch {
+                        attn_graph,
+                        attn_mhc,
+                        attn_in,
+                        attn_normed,
+                        attn_out,
+                        ..
+                    } = current;
+                    let attn_state = &mut slot.attention[layer_idx];
+                    let attn_pool = kv_adapter.layer_mut(layer_idx)?;
+                    attn_graph.run_or_capture(|| {
+                        crate::ops::add_batch(
+                            &self.ctx,
+                            &prev.moe_out,
+                            &prev.shared,
+                            &mut prev.moe_with_shared,
+                        )?;
+                        crate::hc::hc_post(
+                            &self.ctx,
+                            &prev.moe_with_shared,
+                            &prev.attn_stream,
+                            &prev.ffn_mhc.post,
+                            &prev.ffn_mhc.comb,
+                            hidden_size,
+                            hc_mult,
+                            &mut prev.ffn_stream,
+                        )?;
+                        let mhc = crate::hc::gen_mhc_params_into(
+                            &self.ctx,
+                            &self.config,
+                            &layer.hc_attn,
+                            &prev.ffn_stream,
+                            attn_mhc,
+                        )?;
+                        crate::hc::hc_pre(
+                            &self.ctx,
+                            &prev.ffn_stream,
+                            mhc.pre,
+                            hidden_size,
+                            hc_mult,
+                            attn_in,
+                        )?;
+                        crate::ops::rms_norm_batch(
+                            &self.ctx,
+                            attn_in,
+                            &layer.attn_norm,
+                            eps,
+                            attn_normed,
+                        )?;
+                        crate::attention::mla_attention(
+                            &self.ctx,
+                            &self.config,
+                            &layer.attention,
+                            layer.mode,
+                            layer.compress_ratio,
+                            layer_idx,
+                            attn_normed,
+                            attn_state,
+                            attn_pool,
+                            start_pos,
+                            Some(&slot.start_pos_device),
+                            &self.tp,
+                            attn_out,
+                            &mut keepalive,
+                        )?;
+                        Ok(())
+                    })?;
+                }
+                if !whole_step {
+                    slot.attention[layer_idx].advance_decode_len(
+                        layer.mode,
+                        layer.compress_ratio,
+                        start_pos + 1,
+                    );
+                }
+                self.tp
+                    .all_reduce_sum(&self.ctx, &mut graph.layers[layer_idx].attn_out)?;
+
+                let (stream_in, layer_scratch) = if layer_idx == 0 {
+                    (&graph.initial_stream, &mut graph.layers[0])
+                } else {
+                    let (prev_layers, current_layers) = graph.layers.split_at_mut(layer_idx);
+                    (
+                        &prev_layers[layer_idx - 1].ffn_stream,
+                        &mut current_layers[0],
+                    )
+                };
                 let Dsv4DecodeLayerGraphScratch {
-                    attn_graph,
+                    moe_graph,
                     attn_mhc,
-                    attn_in,
-                    attn_normed,
+                    ffn_mhc,
                     attn_out,
+                    attn_stream,
+                    ffn_in,
+                    ffn_normed,
+                    moe_out,
+                    shared,
                     ..
-                } = current;
-                let attn_state = &mut slot.attention[layer_idx];
-                let attn_pool = kv_adapter.layer_mut(layer_idx)?;
-                attn_graph.run_or_capture(|| {
-                    crate::ops::embedding_batch(
+                } = layer_scratch;
+                let moe_scratch = &mut slot.moe_decode_scratch[layer_idx];
+                moe_graph.run_or_capture(|| {
+                    crate::hc::hc_post(
                         &self.ctx,
-                        &self.embed_tokens,
-                        &graph.token_ids,
-                        &mut graph.embeddings,
-                    )?;
-                    crate::hc::initial_stream_from_embeddings(
-                        &self.ctx,
-                        &graph.embeddings,
+                        attn_out,
+                        stream_in,
+                        &attn_mhc.post,
+                        &attn_mhc.comb,
                         hidden_size,
                         hc_mult,
-                        &mut graph.initial_stream,
+                        attn_stream,
                     )?;
                     let mhc = crate::hc::gen_mhc_params_into(
                         &self.ctx,
                         &self.config,
-                        &layer.hc_attn,
-                        &graph.initial_stream,
-                        attn_mhc,
+                        &layer.hc_ffn,
+                        attn_stream,
+                        ffn_mhc,
                     )?;
                     crate::hc::hc_pre(
                         &self.ctx,
-                        &graph.initial_stream,
+                        attn_stream,
                         mhc.pre,
                         hidden_size,
                         hc_mult,
-                        attn_in,
+                        ffn_in,
                     )?;
                     crate::ops::rms_norm_batch(
                         &self.ctx,
-                        attn_in,
-                        &layer.attn_norm,
+                        ffn_in,
+                        &layer.ffn_norm,
                         eps,
-                        attn_normed,
+                        ffn_normed,
                     )?;
-                    crate::attention::mla_attention(
+                    crate::moe::dsv4_moe_forward_decode_graph(
+                        self,
+                        &layer.moe,
+                        &graph.token_ids_u32,
+                        ffn_normed,
+                        moe_out,
+                        moe_scratch,
+                    )?;
+                    crate::moe::dsv4_shared_expert_forward(
                         &self.ctx,
-                        &self.config,
-                        &layer.attention,
-                        layer.mode,
-                        layer.compress_ratio,
-                        layer_idx,
-                        attn_normed,
-                        attn_state,
-                        attn_pool,
-                        start_pos,
-                        Some(&slot.start_pos_device),
-                        &self.tp,
-                        attn_out,
+                        &self.ctx.stream,
+                        &layer.moe,
+                        ffn_normed,
+                        shared,
+                        self.config.swiglu_limit,
+                        Some(moe_scratch),
                         &mut keepalive,
                     )
                 })?;
-            } else {
-                let (prev_layers, current_layers) = graph.layers.split_at_mut(layer_idx);
-                let prev = &mut prev_layers[layer_idx - 1];
-                let current = &mut current_layers[0];
-                let Dsv4DecodeLayerGraphScratch {
-                    attn_graph,
-                    attn_mhc,
-                    attn_in,
-                    attn_normed,
-                    attn_out,
-                    ..
-                } = current;
-                let attn_state = &mut slot.attention[layer_idx];
-                let attn_pool = kv_adapter.layer_mut(layer_idx)?;
-                attn_graph.run_or_capture(|| {
+                self.tp
+                    .all_reduce_sum(&self.ctx, &mut graph.layers[layer_idx].moe_out)?;
+            }
+
+            let final_idx = self.layers.len() - 1;
+            {
+                // Field-access (no destructure-move) so the outer `body` closure can borrow
+                // `graph` by disjoint fields. Nested tail capture (bypassed under whole_step).
+                let final_scratch = &mut graph.layers[final_idx];
+                let last_hidden_ref = &mut graph.last_hidden;
+                let last_normed_ref = &mut graph.last_normed;
+                let logits_batch_ref = &mut graph.logits_batch;
+                let logits_ref = &mut graph.logits;
+                graph.tail_graph.run_or_capture(|| {
                     crate::ops::add_batch(
                         &self.ctx,
-                        &prev.moe_out,
-                        &prev.shared,
-                        &mut prev.moe_with_shared,
+                        &final_scratch.moe_out,
+                        &final_scratch.shared,
+                        &mut final_scratch.moe_with_shared,
                     )?;
                     crate::hc::hc_post(
                         &self.ctx,
-                        &prev.moe_with_shared,
-                        &prev.attn_stream,
-                        &prev.ffn_mhc.post,
-                        &prev.ffn_mhc.comb,
+                        &final_scratch.moe_with_shared,
+                        &final_scratch.attn_stream,
+                        &final_scratch.ffn_mhc.post,
+                        &final_scratch.ffn_mhc.comb,
                         hidden_size,
                         hc_mult,
-                        &mut prev.ffn_stream,
+                        &mut final_scratch.ffn_stream,
                     )?;
-                    let mhc = crate::hc::gen_mhc_params_into(
+                    crate::hc::head_hidden_from_stream(
                         &self.ctx,
                         &self.config,
-                        &layer.hc_attn,
-                        &prev.ffn_stream,
-                        attn_mhc,
+                        &self.head_hc,
+                        &final_scratch.ffn_stream,
+                        0,
+                        last_hidden_ref,
                     )?;
-                    crate::hc::hc_pre(
+                    crate::ops::rms_norm_vec(
                         &self.ctx,
-                        &prev.ffn_stream,
-                        mhc.pre,
-                        hidden_size,
-                        hc_mult,
-                        attn_in,
-                    )?;
-                    crate::ops::rms_norm_batch(
-                        &self.ctx,
-                        attn_in,
-                        &layer.attn_norm,
+                        last_hidden_ref,
+                        &self.norm,
                         eps,
-                        attn_normed,
+                        last_normed_ref,
                     )?;
-                    crate::attention::mla_attention(
-                        &self.ctx,
-                        &self.config,
-                        &layer.attention,
-                        layer.mode,
-                        layer.compress_ratio,
-                        layer_idx,
-                        attn_normed,
-                        attn_state,
-                        attn_pool,
-                        start_pos,
-                        Some(&slot.start_pos_device),
-                        &self.tp,
-                        attn_out,
-                        &mut keepalive,
+                    self.lm_head_project_decode_graph(
+                        last_normed_ref,
+                        logits_batch_ref,
+                        logits_ref,
                     )?;
                     Ok(())
                 })?;
+                Ok(())
             }
-            slot.attention[layer_idx].advance_decode_len(
-                layer.mode,
-                layer.compress_ratio,
-                start_pos + 1,
-            );
-            self.tp
-                .all_reduce_sum(&self.ctx, &mut graph.layers[layer_idx].attn_out)?;
+        }; // end `body` closure
 
-            let (stream_in, layer_scratch) = if layer_idx == 0 {
-                (&graph.initial_stream, &mut graph.layers[0])
-            } else {
-                let (prev_layers, current_layers) = graph.layers.split_at_mut(layer_idx);
-                (
-                    &prev_layers[layer_idx - 1].ffn_stream,
-                    &mut current_layers[0],
-                )
-            };
-            let Dsv4DecodeLayerGraphScratch {
-                moe_graph,
-                attn_mhc,
-                ffn_mhc,
-                attn_out,
-                attn_stream,
-                ffn_in,
-                ffn_normed,
-                moe_out,
-                shared,
-                ..
-            } = layer_scratch;
-            let moe_scratch = &mut slot.moe_decode_scratch[layer_idx];
-            moe_graph.run_or_capture(|| {
-                crate::hc::hc_post(
-                    &self.ctx,
-                    attn_out,
-                    stream_in,
-                    &attn_mhc.post,
-                    &attn_mhc.comb,
-                    hidden_size,
-                    hc_mult,
-                    attn_stream,
-                )?;
-                let mhc = crate::hc::gen_mhc_params_into(
-                    &self.ctx,
-                    &self.config,
-                    &layer.hc_ffn,
-                    attn_stream,
-                    ffn_mhc,
-                )?;
-                crate::hc::hc_pre(
-                    &self.ctx,
-                    attn_stream,
-                    mhc.pre,
-                    hidden_size,
-                    hc_mult,
-                    ffn_in,
-                )?;
-                crate::ops::rms_norm_batch(&self.ctx, ffn_in, &layer.ffn_norm, eps, ffn_normed)?;
-                crate::moe::dsv4_moe_forward_decode_graph(
-                    self,
-                    &layer.moe,
-                    &graph.token_ids_u32,
-                    ffn_normed,
-                    moe_out,
-                    moe_scratch,
-                )?;
-                crate::moe::dsv4_shared_expert_forward(
-                    &self.ctx,
-                    &self.ctx.stream,
-                    &layer.moe,
-                    ffn_normed,
-                    shared,
-                    self.config.swiglu_limit,
-                    Some(moe_scratch),
-                    &mut keepalive,
-                )
-            })?;
-            self.tp
-                .all_reduce_sum(&self.ctx, &mut graph.layers[layer_idx].moe_out)?;
+        if whole_step {
+            graph.whole_graph.run_or_capture(body)?;
+            // advance_decode_len is host bookkeeping — run every step (replay skips body).
+            for layer_idx in 0..self.layers.len() {
+                let layer = &self.layers[layer_idx];
+                slot.attention[layer_idx].advance_decode_len(
+                    layer.mode,
+                    layer.compress_ratio,
+                    start_pos + 1,
+                );
+            }
+        } else {
+            body()?;
         }
 
-        let final_idx = self.layers.len() - 1;
-        let Dsv4DecodeGraphScratch {
-            layers,
-            tail_graph,
-            last_hidden,
-            last_normed,
-            logits_batch,
-            logits,
-            ..
-        } = graph;
-        let final_scratch = &mut layers[final_idx];
-        tail_graph.run_or_capture(|| {
-            crate::ops::add_batch(
-                &self.ctx,
-                &final_scratch.moe_out,
-                &final_scratch.shared,
-                &mut final_scratch.moe_with_shared,
-            )?;
-            crate::hc::hc_post(
-                &self.ctx,
-                &final_scratch.moe_with_shared,
-                &final_scratch.attn_stream,
-                &final_scratch.ffn_mhc.post,
-                &final_scratch.ffn_mhc.comb,
-                hidden_size,
-                hc_mult,
-                &mut final_scratch.ffn_stream,
-            )?;
-            crate::hc::head_hidden_from_stream(
-                &self.ctx,
-                &self.config,
-                &self.head_hc,
-                &final_scratch.ffn_stream,
-                0,
-                last_hidden,
-            )?;
-            crate::ops::rms_norm_vec(&self.ctx, last_hidden, &self.norm, eps, last_normed)?;
-            self.lm_head_project_decode_graph(last_normed, logits_batch, logits)?;
-            Ok(())
-        })?;
-
         slot.seq_len += 1;
-        crate::executor::sample_cuda_token(&self.ctx, logits, params, position)
+        crate::executor::sample_cuda_token(&self.ctx, &graph.logits, params, position)
     }
 
     /// Project the final hidden vector through the LM head into `logits`. The
@@ -2541,6 +2590,18 @@ fn dsv4_use_deepep_transport() -> Result<bool> {
 fn dsv4_decode_graph_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+/// Whole-step decode CUDA graph: capture the ENTIRE per-token forward (all layers
+/// + the 86 all-reduces + tail) as ONE graph, replayed with ~0 host orchestration.
+/// Collapses the ~100 per-sub-capture host gaps (~14ms/token) that make B=1 decode
+/// host-bound (nsys: ~94% GPU-idle). Requires ARLE_DSV4_DECODE_GRAPH=1 too (uses its
+/// pre-allocated scratch). Opt-in (capture of 86 NCCL ARs in one graph is unproven).
+fn dsv4_whole_step_graph_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_WHOLE_STEP_GRAPH").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }
