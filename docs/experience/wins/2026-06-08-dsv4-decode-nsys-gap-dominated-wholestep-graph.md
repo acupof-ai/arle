@@ -37,3 +37,23 @@ kernels.**
   graph (the substantial lever; the per-layer scaffold exists in forward_tokens_decode_graph
   but must be lifted to one capture for the full forward). DSv4-Flash B=1 decode stands at
   ~15ms (MTP); the whole-step graph is the gate to ~6ms.
+
+## CONFIRMED (sqlite query): decode is ~94% GPU-IDLE — HOST-bound, not GPU-bound
+
+nsys sqlite, post-load window: GPU busy 291ms / wall 4648ms = **6.3% busy, 93.7% IDLE**.
+Top decode kernels: sm90_fp8_gemm 59.5ms, mhc_params 49ms, ncclAllReduce 23ms,
+deepgemm_pack 13.7ms, flash_mla 10ms — all tiny vs the wall. (Caveat: the window includes
+harness inter-run setup, so the tight-loop idle is somewhat <94%; direction unambiguous.)
+
+**This CORRECTS [[feedback_b1_decode_gpu_bound_overhead_removal_wash]]: B=1 decode is
+HOST/GAP-bound, NOT GPU-bound.** The earlier "GPU-bound" was inferred from the per-layer
+graph wash — but that graph washed because it didn't kill the BETWEEN-layer host, not
+because the GPU was saturated. The GPU is ~94% idle; the host per-step orchestration is the
+wall. Every per-kernel lever washed because the kernels are ~6% of the wall; MTP works
+because it amortizes the host over ~1.85 tokens.
+
+**The 6ms lever is definitively the WHOLE-STEP CUDA graph** — capture the entire 43-layer
+decode forward as ONE graph (on-device routing, task #24, makes it capturable) → replay
+with ~0 host orchestration → the wall collapses toward the small GPU floor (~6ms or less).
+The per-layer scaffold (forward_tokens_decode_graph) must be lifted to a single
+whole-forward capture; that is the substantial, now-evidence-licensed next kernel effort.
