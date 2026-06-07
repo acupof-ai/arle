@@ -229,8 +229,9 @@ mod real {
             .unwrap_or(DSV4_PARITY_NUM_SLOTS)
             .max(DSV4_PARITY_NUM_SLOTS);
         let load_t0 = Instant::now();
-        let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, num_slots)
-            .context("from_dsv4_fp8_safetensors failed (build/config?)")?;
+        let mut exec =
+            CudaExecutor::from_dsv4_fp8_safetensors(&model_path, num_slots, slot_max_seq_len)
+                .context("from_dsv4_fp8_safetensors failed (build/config?)")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
         if env_flag("INFER_DSV4_MTP_STEP_A_SELFTEST") {
             exec.dsv4_verify_forward_selftest(&prompt)
@@ -613,10 +614,9 @@ mod real {
              ({kv_mib:.2} MiB/rank for {DSV4_PARITY_NUM_SLOTS} slot × \
              {DSV4_FLASH_BASE_LAYERS} layers × {DSV4_FLASH_KV_BYTES_PER_TOKEN} B/token)"
         );
-        // SAFETY: this harness is still single-threaded and has not constructed
-        // CUDA/NCCL/model state yet. The executor reads this env var while
-        // allocating DSv4 slot state below.
-        unsafe { std::env::set_var("INFER_DSV4_MAX_SEQ_LEN", slot_max_seq_len.to_string()) };
+        // slot_max_seq_len is threaded as the from_dsv4_fp8_safetensors max_seq_len
+        // PARAMETER (runtime config = explicit arg, not an env var the executor
+        // reads — per the runtime-config-as-CLI-flag rule).
         Ok(slot_max_seq_len)
     }
 

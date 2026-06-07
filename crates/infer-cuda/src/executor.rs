@@ -104,9 +104,10 @@ impl RealCudaExecutor {
     pub(crate) fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
+        max_seq_len: usize,
     ) -> Result<Self> {
         Ok(Self::Dsv4(Box::new(
-            Dsv4CudaExecutor::from_dsv4_fp8_safetensors(model_path, num_slots)?,
+            Dsv4CudaExecutor::from_dsv4_fp8_safetensors(model_path, num_slots, max_seq_len)?,
         )))
     }
 
@@ -865,10 +866,11 @@ impl Dsv4CudaExecutor {
     pub(crate) fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
+        max_seq_len: usize,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "Dsv4CudaExecutor requires at least one slot");
+        ensure!(max_seq_len > 0, "Dsv4CudaExecutor requires max_seq_len > 0");
         let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(model_path.as_ref())?;
-        let max_seq_len = dsv4_max_seq_len();
         let kv_adapter = model.new_kv_adapter(max_seq_len, num_slots)?;
         let mut slots = Vec::with_capacity(num_slots);
         for slot_idx in 0..num_slots {
@@ -1312,7 +1314,11 @@ impl Dsv4CudaExecutor {
     }
 }
 
-fn dsv4_max_seq_len() -> usize {
+/// The DSv4 executor's configured max KV sequence length (`INFER_DSV4_MAX_SEQ_LEN`,
+/// default [`DSV4_DEFAULT_MAX_SEQ_LEN`]). Exposed so harnesses size their host KV
+/// pool to the design max (length-agnostic — any prompt up to this works) instead
+/// of the specific test prompt length.
+pub fn dsv4_max_seq_len() -> usize {
     std::env::var("INFER_DSV4_MAX_SEQ_LEN")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
