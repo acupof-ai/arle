@@ -931,6 +931,419 @@ impl Dsv4Model {
         Ok((argmax_tokens, hiddens))
     }
 
+    /// Layer-major batched decode over N independent slots (one decode token each).
+    ///
+    /// Each row `r` decodes slot `slot_ids[r]` at `start_positions[r]`. The
+    /// point-wise pipeline (embed / HC wrap / rms_norm / MoE / shared expert /
+    /// all-reduce) runs over the whole `seq_len = N` batch exactly as the prefill
+    /// path does — those ops are token-independent, so stacking N rows is
+    /// math-identical to N separate single-row forwards. Attention is the only
+    /// per-row-dependent step (each row attends to its own slot's KV history);
+    /// Step A loops it per row (copy row r in/out of a `[hidden,1]` scratch and
+    /// call the existing single-row [`mla_attention`]) so this restructure changes
+    /// the *order* of work (row-major → layer-major) but not the math. Later
+    /// phases replace the per-row attention loop with batched DSA / FlashMLA and
+    /// the per-row MoE with grouped MoE. Returns one sampled token per row.
+    pub(crate) fn forward_decode_batch(
+        &self,
+        slots: &mut [Dsv4SlotState],
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        slot_ids: &[usize],
+        tokens: &[u32],
+        start_positions: &[usize],
+        positions: &[u64],
+        params: &[SamplingParams],
+    ) -> Result<Vec<u32>> {
+        let n = slot_ids.len();
+        ensure!(n > 0, "DSv4 batched decode requires at least one row");
+        ensure!(
+            tokens.len() == n
+                && start_positions.len() == n
+                && positions.len() == n
+                && params.len() == n,
+            "DSv4 batched decode surface length mismatch (slots {n}, tokens {}, starts {}, positions {}, params {})",
+            tokens.len(),
+            start_positions.len(),
+            positions.len(),
+            params.len()
+        );
+        let (stream, mut keepalive) = self.forward_decode_batch_stream_impl(
+            slots,
+            kv_adapter,
+            slot_ids,
+            tokens,
+            start_positions,
+        )?;
+        let _nvtx = crate::nvtx::range("dsv4/lm_head_sample_batched");
+        let mut out_tokens = Vec::with_capacity(n);
+        for r in 0..n {
+            // `forward_stream_last_token` folds stream row `seq_len - 1`; passing
+            // `seq_len = r + 1` samples row r of the batched stream.
+            let token = self.forward_stream_last_token(
+                &stream,
+                r + 1,
+                &params[r],
+                positions[r],
+                None,
+                &mut keepalive,
+            )?;
+            out_tokens.push(token);
+        }
+        std::hint::black_box(keepalive.len());
+        drop(keepalive);
+        Ok(out_tokens)
+    }
+
+    fn forward_decode_batch_stream_impl(
+        &self,
+        slots: &mut [Dsv4SlotState],
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        slot_ids: &[usize],
+        tokens: &[u32],
+        start_positions: &[usize],
+    ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
+        let n = slot_ids.len();
+        for r in 0..n {
+            let slot = &slots[slot_ids[r]];
+            ensure!(
+                slot.seq_len == start_positions[r],
+                "DSv4 batched decode slot {} seq_len {} != start_pos {}; decode requires contiguous appends",
+                slot_ids[r],
+                slot.seq_len,
+                start_positions[r]
+            );
+            ensure!(
+                start_positions[r] + 1 <= slot.max_seq_len,
+                "DSv4 batched decode slot {} sequence {} exceeds max_seq_len {}",
+                slot_ids[r],
+                start_positions[r] + 1,
+                slot.max_seq_len
+            );
+        }
+
+        let hidden_size = self.config.hidden_size;
+        let hc_mult = self.config.hc_mult;
+        let stream_dim = hidden_size * hc_mult;
+        let seq_len = n; // batch dimension: N independent decode rows
+        let eps = self.config.rms_norm_eps;
+        let use_deepep_transport = dsv4_use_deepep_transport()?;
+        ensure!(
+            !use_deepep_transport,
+            "DSv4 batched decode does not yet support the DeepEP MoE transport; use the all-reduce transport"
+        );
+        // N>1: mirror the prefill keepalive discipline (the per-token decode
+        // scratch / comm-overlap fast paths are seq_len==1 only).
+        let mut keepalive = Dsv4ForwardKeepalive::new(false);
+        let ctx = &self.ctx;
+
+        // Per-slot decode position scalars (each row's attention reads its own).
+        for r in 0..n {
+            let start_pos_i32 = i32::try_from(start_positions[r])
+                .map_err(|_| anyhow!("DSv4 start_pos {} overflows i32", start_positions[r]))?;
+            let slot = &mut slots[slot_ids[r]];
+            ctx.stream
+                .memcpy_htod(&[start_pos_i32], &mut slot.start_pos_device)
+                .map_err(|e| anyhow!("DSv4 batched start_pos H2D failed: {e}"))?;
+        }
+
+        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let nvtx_embed = crate::nvtx::range("dsv4/embed");
+        let token_ids = crate::ops::upload_i32(&self.ctx, &token_ids_host)?;
+        keepalive.keep_i32(&token_ids);
+        // SAFETY: embedding_batch writes the full [seq_len, hidden_size] buffer.
+        let mut embeddings = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+        crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)?;
+        keepalive.keep_hidden(&embeddings);
+        // SAFETY: initial_stream_from_embeddings writes the full stream buffer.
+        let mut stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+        crate::hc::initial_stream_from_embeddings(
+            &self.ctx,
+            &embeddings,
+            hidden_size,
+            hc_mult,
+            &mut stream,
+        )?;
+        keepalive.keep_hidden(&stream);
+        drop(nvtx_embed);
+
+        // Reusable [hidden,1] scratch for the per-row attention copy-in/out.
+        // Declared once (lives to function return → stream-ordered free, like the
+        // single-row intermediates); reuse across rows/layers is safe because all
+        // ops run on `ctx.stream` (WAR/RAW resolved by stream ordering).
+        // SAFETY: fully written by the copy-in / mla_attention each row before read.
+        let mut normed_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
+        let mut attn_out_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
+        keepalive.keep_hidden(&normed_row);
+        keepalive.keep_hidden(&attn_out_row);
+        // Step A keeps the routed MoE per-row (seq_len=1, byte-identical to the
+        // looped path) — only the layer structure and the point-wise/all-reduce
+        // ops batch over N. Phase 6 replaces this loop with grouped MoE over N.
+        // SAFETY: fully written by the copy-in / MoE each row before read.
+        let mut moe_normed_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
+        let mut moe_out_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
+        keepalive.keep_hidden(&moe_normed_row);
+        keepalive.keep_hidden(&moe_out_row);
+
+        // Localization probe: all rows have identical inputs, so every intermediate
+        // must be row-identical. Print the first (layer, half) where rows diverge.
+        let probe = std::env::var_os("INFER_DSV4_BATCH_PROBE").is_some()
+            && self.tp.config().rank == 0
+            && n >= 2;
+        let probe_rows = |label: &str, hs: &HiddenStates, layer_idx: usize| -> Result<()> {
+            if !probe {
+                return Ok(());
+            }
+            // FULL-VECTOR max-abs-diff of each row vs row0. All rows share an
+            // identical prompt, so at decode step 1 every element must be
+            // bit-identical. elem0-only is blind: hc_pre mixes hc_mult lanes and
+            // rms_norm reduces over the whole hidden vector, so a divergence at
+            // ANY element propagates. This finds the true first (layer, stage,
+            // element) of divergence.
+            let dim = hs.hidden_dim;
+            let host: Vec<half::bf16> = self
+                .ctx
+                .stream
+                .clone_dtoh(&hs.data)
+                .map_err(|e| anyhow!("DSv4 batch probe D2H failed: {e}"))?;
+            let mut global_max = 0.0f32;
+            let mut worst_r = 0usize;
+            let mut worst_i = 0usize;
+            let per_row: Vec<String> = (1..n)
+                .map(|r| {
+                    let mut m = 0.0f32;
+                    for i in 0..dim {
+                        let d = (host[r * dim + i].to_f32() - host[i].to_f32()).abs();
+                        if d > m {
+                            m = d;
+                        }
+                        if d > global_max {
+                            global_max = d;
+                            worst_r = r;
+                            worst_i = i;
+                        }
+                    }
+                    format!("{m:.6}")
+                })
+                .collect();
+            // Report the first 3 layers always (to confirm clean baseline), plus
+            // any later stage that diverges above bf16 round-trip noise.
+            if (layer_idx < 3 && start_positions[0] == 5) || global_max > 1e-4 {
+                eprintln!(
+                    "[batch-vdiff] start_pos={} L{layer_idx} {label}: maxdiff_vs_row0=[{}] worst(r={worst_r},i={worst_i})={global_max:.6}",
+                    start_positions[0],
+                    per_row.join(", "),
+                );
+            }
+            Ok(())
+        };
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
+            // ── Attention half: HC params + pre + norm over the whole [N] batch.
+            let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)?;
+            keepalive.keep_f32(&mhc.pre);
+            keepalive.keep_f32(&mhc.post);
+            keepalive.keep_f32(&mhc.comb);
+            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
+            let mut attn_in = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::hc::hc_pre(
+                &self.ctx,
+                &stream,
+                &mhc.pre,
+                hidden_size,
+                hc_mult,
+                &mut attn_in,
+            )?;
+            keepalive.keep_hidden(&attn_in);
+            // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::ops::rms_norm_batch(&self.ctx, &attn_in, &layer.attn_norm, eps, &mut normed)?;
+            keepalive.keep_hidden(&normed);
+            probe_rows("norm_in", &normed, layer_idx)?;
+
+            // ── Attention: per-row independent single-token MLA into row r.
+            // SAFETY: every [r*hidden, (r+1)*hidden) span of attn_out is written by
+            // the copy-out below before attn_out is read by hc_post.
+            let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            {
+                let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched");
+                for r in 0..n {
+                    let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
+                    ctx.stream
+                        .memcpy_dtod(&src, &mut normed_row.data)
+                        .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
+                    let layer_pool = kv_adapter.layer_mut(layer_idx)?;
+                    let slot = &mut slots[slot_ids[r]];
+                    crate::attention::mla_attention(
+                        &self.ctx,
+                        &self.config,
+                        &layer.attention,
+                        layer.mode,
+                        layer.compress_ratio,
+                        layer_idx,
+                        &normed_row,
+                        &mut slot.attention[layer_idx],
+                        layer_pool,
+                        start_positions[r],
+                        Some(&slot.start_pos_device),
+                        &self.tp,
+                        &mut attn_out_row,
+                        &mut keepalive,
+                    )?;
+                    let mut dst = attn_out
+                        .data
+                        .slice_mut(r * hidden_size..(r + 1) * hidden_size);
+                    ctx.stream
+                        .memcpy_dtod(&attn_out_row.data, &mut dst)
+                        .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
+                    // ISOLATION (ordering-vs-logic): fully serialize per-row work.
+                    self.ctx.sync()?;
+                }
+            }
+            keepalive.keep_hidden(&attn_out);
+            // Probe the RAW per-row attention output (pre all-reduce, pre hc_post):
+            // this is a per-row single-column kernel, so identical inputs MUST give
+            // bit-identical rows. Divergence here = real logic bug, not numerics.
+            probe_rows("attn_raw", &attn_out, layer_idx)?;
+            // Row-parallel O-LoRA: one all-reduce over [N, hidden]. NOT bit-identical
+            // to N per-row all-reduces: NCCL tiles a [hidden,N] message differently
+            // than N×[hidden,1], so identical-input rows pick up ~1 bf16 ULP of
+            // per-row drift here. This is the legitimate batched-numerics seed.
+            {
+                let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
+                self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
+            }
+            // Probe POST-all-reduce (pre hc_post): isolates the all-reduce as the
+            // divergence seed vs the per-token hc_post (which cannot cross rows).
+            probe_rows("attn_ar", &attn_out, layer_idx)?;
+            // SAFETY: hc_post writes the full stream buffer.
+            let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+            crate::hc::hc_post(
+                &self.ctx,
+                &attn_out,
+                &stream,
+                &mhc.post,
+                &mhc.comb,
+                hidden_size,
+                hc_mult,
+                &mut attn_stream,
+            )?;
+            keepalive.keep_hidden(&attn_stream);
+            stream = attn_stream;
+            probe_rows("attn", &stream, layer_idx)?;
+
+            // ── MoE half: HC-wrap the grouped FP8 DeepGEMM MoE over the [N] batch.
+            let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
+            keepalive.keep_f32(&mhc.pre);
+            keepalive.keep_f32(&mhc.post);
+            keepalive.keep_f32(&mhc.comb);
+            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
+            let mut ffn_in = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::hc::hc_pre(
+                &self.ctx,
+                &stream,
+                &mhc.pre,
+                hidden_size,
+                hc_mult,
+                &mut ffn_in,
+            )?;
+            keepalive.keep_hidden(&ffn_in);
+            // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)?;
+            keepalive.keep_hidden(&normed);
+            // Routed MoE per-row (Step A isolation): each row's token routes
+            // through the single-token MoE exactly as the looped reference path,
+            // written into row r of the batched moe_out.
+            let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            for r in 0..n {
+                let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
+                ctx.stream
+                    .memcpy_dtod(&src, &mut moe_normed_row.data)
+                    .map_err(|e| anyhow!("DSv4 batched MoE copy-in failed: {e}"))?;
+                crate::moe::dsv4_moe_forward(
+                    self,
+                    &layer.moe,
+                    &tokens[r..r + 1],
+                    &moe_normed_row,
+                    &mut moe_out_row,
+                    None,
+                    &mut keepalive,
+                )?;
+                let mut dst = moe_out
+                    .data
+                    .slice_mut(r * hidden_size..(r + 1) * hidden_size);
+                ctx.stream
+                    .memcpy_dtod(&moe_out_row.data, &mut dst)
+                    .map_err(|e| anyhow!("DSv4 batched MoE copy-out failed: {e}"))?;
+                self.ctx.sync()?;
+            }
+            keepalive.keep_hidden(&moe_out);
+            // Probe the RAW per-row MoE output (pre all-reduce): like attn_raw, the
+            // per-row single-token MoE must be bit-identical across identical rows.
+            probe_rows("moe_raw", &moe_out, layer_idx)?;
+            // Routed experts are EP-sharded → sum, then add the replicated shared
+            // expert once per rank. One all-reduce over [N, hidden].
+            {
+                let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
+                self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+            }
+            probe_rows("moe_ar", &moe_out, layer_idx)?;
+            // Shared expert per-row (Step A isolation): each row's token through
+            // the single-token shared expert, written into row r of shared.
+            let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            for r in 0..n {
+                let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
+                ctx.stream
+                    .memcpy_dtod(&src, &mut moe_normed_row.data)
+                    .map_err(|e| anyhow!("DSv4 batched shared copy-in failed: {e}"))?;
+                crate::moe::dsv4_shared_expert_forward(
+                    &self.ctx,
+                    &self.ctx.stream,
+                    &layer.moe,
+                    &moe_normed_row,
+                    &mut moe_out_row,
+                    self.config.swiglu_limit,
+                    None,
+                    &mut keepalive,
+                )?;
+                let mut dst = shared
+                    .data
+                    .slice_mut(r * hidden_size..(r + 1) * hidden_size);
+                ctx.stream
+                    .memcpy_dtod(&moe_out_row.data, &mut dst)
+                    .map_err(|e| anyhow!("DSv4 batched shared copy-out failed: {e}"))?;
+                self.ctx.sync()?;
+            }
+            keepalive.keep_hidden(&shared);
+            // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
+            let mut moe_with_shared =
+                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
+            keepalive.keep_hidden(&moe_with_shared);
+            // SAFETY: hc_post writes the full stream buffer.
+            let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+            crate::hc::hc_post(
+                &self.ctx,
+                &moe_with_shared,
+                &stream,
+                &mhc.post,
+                &mhc.comb,
+                hidden_size,
+                hc_mult,
+                &mut ffn_stream,
+            )?;
+            keepalive.keep_hidden(&ffn_stream);
+            stream = ffn_stream;
+            probe_rows("moe", &stream, layer_idx)?;
+        }
+
+        for r in 0..n {
+            slots[slot_ids[r]].seq_len += 1;
+        }
+        Ok((stream, keepalive))
+    }
+
     fn capture_mtp_stream_hidden(
         &self,
         stream: &HiddenStates,
