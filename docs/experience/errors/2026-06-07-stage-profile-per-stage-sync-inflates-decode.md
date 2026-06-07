@@ -45,7 +45,7 @@ For decode wall-clock + per-op attribution, use `nsys
 on a **`stage_profile`-OFF** run, with `INFER_DSV4_AB_PROFILE_VARIANT` firing
 `cudaProfilerStart` after warmup so only the steady window is captured. Read GPU
 time from `cuda_gpu_kern_sum` and idle from `window_wall − kern_sum`. See
-[`../wins/2026-06-07-dsv4-decode-nsys-real-breakdown.md`](../wins/2026-06-07-dsv4-decode-nsys-real-breakdown.md).
+[`../wins/2026-06-07-dsv4-pd-nsys-real-breakdown.md`](../wins/2026-06-07-dsv4-pd-nsys-real-breakdown.md).
 
 ## Rule
 

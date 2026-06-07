@@ -1,4 +1,4 @@
-# DSv4 decode real per-kernel breakdown (nsys, no stage-profile sync)
+# DSv4 prefill+decode real per-kernel breakdown (nsys, no stage-profile sync)
 
 ## Context
 
@@ -55,19 +55,53 @@ DeepGEMM (incl quant+glue) **~4.3** · dense BF16 GEMM **~1.9** · comm **1.84**
 FlashMLA attention math **~2.3** · norm/compressor/kv **~1.2**. Sum ≈ 19 ms/token
 GPU + ~10 ms/token launch gap = ~29 ms/token wall.
 
-**Prefill @4000 warm = 3508 ms** (stage-profile composite, sync negligible at
-ms-scale stages, matches the 2026-06-07 win 3.48s): `mla_attn` **82%**, routed-MoE
-**12%**, HC/shared/comm/norm **6%**. Per-kernel sub-split of prefill `mla_attn`
-not yet nsys-traced (decode-only nsys this pass).
+**Prefill @4000 warm — nsys per-kernel (the `mla_attn` 82% decomposed).**
+Captured the warm (rep1) prefill forward via a per-rep `cudaProfilerStart/Stop`
+gate (`INFER_DSV4_AB_PROFILE_PREFILL`, fires on the 2nd prefill). nsys cuda-trace
+inflates the Instant wall ~5× (17481ms traced vs ~3508ms real), but
+`cuda_gpu_kern_sum` measures true kernel GPU time: total ≈ **3340ms ≈ the real
+3508ms wall → ~95% GPU-busy (prefill is GPU-compute-bound, no launch gap, the
+opposite of decode's 34%).**
+
+| kernel | ms | % | note |
+|---|---:|---:|---|
+| `dsv4_fp8_gemv_batch_tiled` | **2077** | **62.2** | **attention/dense projection GEMV (self-written, CUDA-core not tensor-core) — the prefill bottleneck** |
+| `dsv4_compressor_update` | **552** | **16.5** | DSA KV-block compressor |
+| `deepgemm sm90_fp8_gemm` ×N | 236 | 7.1 | routed MoE + the one `wq_a\|wkv` projection that IS on DeepGEMM |
+| MoE `pack_quantize`+`swiglu_quantize` | 114 | 3.4 | FP8 companion |
+| mHC (`post`+`params`+`pre`) | 110 | 3.3 | hyper-connection |
+| **`sparse_attn_fwd`+`swa_attention`** | **110** | **3.3** | **the actual FlashMLA sparse-attention math — small, vendored, already efficient** |
+| comm (allgather+allreduce) | 52 | 1.6 | |
+| DSA select + glue (prepare_q/k, tp_q_repack, build_indices, paged_mqa, rope) | ~70 | 2.1 | |
+
+**Verdict: `mla_attn` 82% = projections (62%) + DSA compressor (16.5%), NOT the
+attention math (3.3%).** `FP8_LINEAR_DEEPGEMM` default-on routes only the
+`wq_a|wkv` fusion through DeepGEMM; the rest of the projections (wq_b, wo, indexer
+wq_b, …) still run the self-written `fp8_gemv_batch_tiled`, so the bulk of
+projection FLOPs stay on CUDA-core GEMV → 62%. Matches H20 being compute-starved:
+the inefficiency is running GEMM-shaped work (M=4000) as a tiled GEMV.
+
+**Cross-cutting:** `dsv4_fp8_gemv_batch[_tiled]` is the #1 self-written cost in
+BOTH prefill (62%) and decode (3.6ms, #1 GPU). The FlashMLA/DeepGEMM vendored
+kernels are already efficient in both. One lever — route ALL projections through
+DeepGEMM/tensor-core — hits both P and D.
 
 ## Rule
 
-For DSv4 **decode** wall-clock + per-op attribution, use `nsys
---capture-range=cudaProfilerApi` on a **`stage_profile`-OFF** run, not the
-in-tree per-stage CUDA-event profiler (its `stop.synchronize()` ×hundreds/token
-inflates the B=1 wall ~1.7×). The real decode is **GPU-bound ~66% / launch-gap
-~34%**; the dominant GPU kernels are the **scalar projection GEMV
-(`dsv4_fp8_gemv_batch`)** and the **mHC Sinkhorn (`dsv4_mhc_params`)**, NOT the
-FlashMLA attention math (only ~1.85ms). Optimization order: (1) projection
-GEMV → tensor-core/DeepGEMM, (2) mHC fuse (SGLang `mhc_pre` TileLang), (3) batched
-decode (摊薄 ~10ms launch gap), (4) comm-overlap (1.8ms, secondary).
+For DSv4 P/D wall-clock + per-op attribution, use `nsys
+--capture-range=cudaProfilerApi` on a **`stage_profile`-OFF** run (decode: profiler
+fires after warmup; prefill: per-rep gate on the warm forward), NOT the in-tree
+per-stage CUDA-event profiler — its `stop.synchronize()` inflates the B=1 decode
+wall ~1.7× and its `mla_attn` stage is a composite that hides the real split. Read
+GPU time from `cuda_gpu_kern_sum`.
+
+The real bottleneck in BOTH P and D is the **self-written projection GEMV
+`dsv4_fp8_gemv_batch[_tiled]`** (prefill 62%, decode #1 GPU 3.6ms), plus the
+**mHC Sinkhorn `dsv4_mhc_params`** (decode #2, 3.1ms) and the **DSA compressor**
+(prefill 16.5%). The vendored **FlashMLA attention math is NOT a bottleneck**
+(prefill 3.3%, decode ~1.85ms) — don't optimize it. Prefill is GPU-compute-bound
+(~95% busy, H20 compute-starved); decode is ~66% GPU / ~34% B=1 launch-gap.
+Optimization order: (1) **route ALL projections off `fp8_gemv` → DeepGEMM/tensor-core**
+(hits P and D; `FP8_LINEAR_DEEPGEMM` today only covers `wq_a|wkv`), (2) mHC fuse
+(SGLang `mhc_pre` TileLang — decode), (3) DSA compressor (prefill), (4) batched
+decode (摊薄 ~10ms decode launch gap), (5) comm-overlap (secondary).
