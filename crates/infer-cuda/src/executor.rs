@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 use cuda_kernels::KVFormat;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
-use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
+use infer_plan::{DecodeRow, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::KvPool;
 use log::{info, warn};
 
@@ -566,10 +566,13 @@ impl QwenCudaExecutor {
     }
 }
 
-/// DSv4-Flash executor: drives [`crate::dsv4::Dsv4Model::forward_tokens`] over a
-/// single scheduled row. DSv4 owns its MLA KV state inside the forward (bf16 SW
-/// rings + compressor pending/compressed pools), so it does NOT use a
-/// [`PagedKVPool`]. The decode graph is disabled (MLA host-routing per step).
+/// DSv4-Flash executor: drives [`crate::dsv4::Dsv4Model::forward_tokens`].
+/// Prefill/mixed still run one scheduled row; pure decode can accept multiple
+/// rows and currently loops over the existing single-row forward as the
+/// correctness foundation for later true batched kernels. DSv4 owns its MLA KV
+/// state inside the forward (bf16 SW rings + compressor pending/compressed
+/// pools), so it does NOT use a [`PagedKVPool`]. The decode graph is disabled
+/// (MLA host-routing per step).
 pub(crate) struct Dsv4CudaExecutor {
     model: crate::dsv4::Dsv4Model,
     slots: Vec<crate::dsv4::Dsv4SlotState>,
@@ -777,66 +780,92 @@ impl Dsv4CudaExecutor {
         }
     }
 
+    fn forward_decode_row(&mut self, row: &DecodeRow) -> Result<Vec<SlotToken>> {
+        ensure!(
+            row.slot < self.num_slots,
+            "decode slot {} outside DSv4 executor slots {}",
+            row.slot,
+            self.num_slots
+        );
+        ensure!(
+            self.slots[row.slot].seq_len() == row.kv_seq_len,
+            "DSv4 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
+            self.slots[row.slot].seq_len(),
+            row.kv_seq_len,
+            row.slot
+        );
+        let position = row.kv_seq_len.saturating_add(1) as u64;
+        let tokens = self.forward_decode_tokens(
+            row.slot,
+            row.last_token,
+            row.kv_seq_len,
+            &row.params,
+            position,
+        )?;
+        Ok(tokens
+            .into_iter()
+            .map(|token| SlotToken {
+                slot: row.slot,
+                token,
+                logprob: None,
+                finish: None,
+            })
+            .collect())
+    }
+
+    fn forward_decode_batch(&mut self, rows: &[DecodeRow]) -> Result<Vec<SlotToken>> {
+        let mut tokens = Vec::new();
+        for row in rows {
+            tokens.extend(self.forward_decode_row(row)?);
+        }
+        Ok(tokens)
+    }
+
     fn submit(&mut self, plan: &ForwardPlan) -> Result<StepOutput> {
         let rows = plan.decode_rows.len() + plan.prefill_rows.len();
         if rows == 0 {
             return Ok(StepOutput { tokens: Vec::new() });
         }
+
+        if plan.prefill_rows.is_empty() {
+            return Ok(StepOutput {
+                tokens: self.forward_decode_batch(&plan.decode_rows)?,
+            });
+        }
+
         ensure!(
-            rows == 1,
-            "DSv4 CUDA forward is single-row only, got {} prefill + {} decode rows",
+            plan.decode_rows.is_empty() && plan.prefill_rows.len() == 1,
+            "DSv4 CUDA prefill/mixed forward is single-row only, got {} prefill + {} decode rows",
             plan.prefill_rows.len(),
             plan.decode_rows.len()
         );
 
-        let (slot, token) = if let Some(row) = plan.prefill_rows.first() {
-            ensure!(
-                row.slot < self.num_slots,
-                "prefill slot {} outside DSv4 executor slots {}",
-                row.slot,
-                self.num_slots
-            );
-            ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
-            if row.start_pos == 0 {
-                self.slots[row.slot].reset(&self.model.ctx)?;
-                self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
-            }
-            let position = (row.start_pos + row.tokens.len()) as u64;
-            let final_prefill = row.start_pos + row.tokens.len() >= row.total_tokens;
-            let tokens = self.forward_prefill_tokens(
-                row.slot,
-                &row.tokens,
-                row.start_pos,
-                &row.params,
-                position,
-                final_prefill,
-            )?;
-            (row.slot, tokens)
-        } else {
-            let row = &plan.decode_rows[0];
-            ensure!(
-                row.slot < self.num_slots,
-                "decode slot {} outside DSv4 executor slots {}",
-                row.slot,
-                self.num_slots
-            );
-            ensure!(
-                self.slots[row.slot].seq_len() == row.kv_seq_len,
-                "DSv4 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
-                self.slots[row.slot].seq_len(),
-                row.kv_seq_len,
-                row.slot
-            );
-            let position = row.kv_seq_len.saturating_add(1) as u64;
-            let tokens = self.forward_decode_tokens(
-                row.slot,
-                row.last_token,
-                row.kv_seq_len,
-                &row.params,
-                position,
-            )?;
-            (row.slot, tokens)
-        };
+        let row = plan
+            .prefill_rows
+            .first()
+            .expect("prefill row present after empty-prefill branch");
+        ensure!(
+            row.slot < self.num_slots,
+            "prefill slot {} outside DSv4 executor slots {}",
+            row.slot,
+            self.num_slots
+        );
+        ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
+        if row.start_pos == 0 {
+            self.slots[row.slot].reset(&self.model.ctx)?;
+            self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
+        }
+        let position = (row.start_pos + row.tokens.len()) as u64;
+        let final_prefill = row.start_pos + row.tokens.len() >= row.total_tokens;
+        let token = self.forward_prefill_tokens(
+            row.slot,
+            &row.tokens,
+            row.start_pos,
+            &row.params,
+            position,
+            final_prefill,
+        )?;
+        let slot = row.slot;
 
         Ok(StepOutput {
             tokens: token
