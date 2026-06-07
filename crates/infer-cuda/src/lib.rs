@@ -62,6 +62,7 @@ pub use qwen35::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 // Load-time decode-graph default setter (CLI `--cuda-graph` → engine). Lets the
 // `enable_cuda_graph` load flag actually gate the B=1 decode graph instead of
 // being discarded; the `INFER_CUDA_DECODE_GRAPH` env var still overrides.
+pub use executor::dsv4_max_seq_len;
 #[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
 
@@ -417,14 +418,23 @@ impl CudaExecutor {
     /// DSv4 owns its MLA KV state inside the forward, so no `total_pages`/
     /// `CudaKvPool` page budget is needed (a host pool is still attached for slot
     /// bookkeeping).
+    /// `max_seq_len` is a runtime knob: the serve/run path threads it from
+    /// `--max-seq-len`; tests pass [`dsv4_max_seq_len`] (the env-overridable
+    /// default). The executor no longer reads the env internally (per the
+    /// runtime-config-as-CLI-flag rule).
     #[cfg(feature = "cuda")]
     pub fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
+        max_seq_len: usize,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
-                executor::RealCudaExecutor::from_dsv4_fp8_safetensors(model_path, num_slots)?,
+                executor::RealCudaExecutor::from_dsv4_fp8_safetensors(
+                    model_path,
+                    num_slots,
+                    max_seq_len,
+                )?,
             )),
         })
     }
