@@ -57,3 +57,31 @@ decode forward as ONE graph (on-device routing, task #24, makes it capturable) �
 with ~0 host orchestration → the wall collapses toward the small GPU floor (~6ms or less).
 The per-layer scaffold (forward_tokens_decode_graph) must be lifted to a single
 whole-forward capture; that is the substantial, now-evidence-licensed next kernel effort.
+
+## Whole-step graph ATTEMPTED — exact blocker scoped (borrow restructure of forward_tokens_decode_graph)
+
+Attempted the whole-step capture. Designed enabler: a `bypass: bool` on `CudaGraphState`
+(when set, `run_or_capture` runs kernels eagerly so they record into an OUTER capture) +
+a `whole_graph: CudaGraphState` on `Dsv4DecodeGraphScratch` wrapping the whole forward.
+Plan: set the per-portion attn/moe/tail states to bypass, wrap the entire layer loop +
+tail in one `whole_graph.run_or_capture`, capture the 86 per-layer all-reduces inside it
+(currently EAGER between the sub-captures — that's the gap), and move `advance_decode_len`
+OUT of the capture (it's next-step host bookkeeping; must run every replay, not once at
+capture). Enabler built + typechecks; reverted (no half-state) because the BRANCH needs:
+
+**Exact blocker — `forward_tokens_decode_graph` borrow restructure:** the function is NOT
+wrappable in one closure as-is. (1) The tail does `let Dsv4DecodeGraphScratch { layers,
+tail_graph, .. } = graph;` — a destructure-MOVE of `graph` — which conflicts with a closure
+that borrows `graph`. (2) The loop uses per-layer `graph.layers.split_at_mut(layer_idx)` +
+`slot.attention[i]` + `kv_adapter.layer_mut(i)` + `slot.moe_decode_scratch[i]`. To make ONE
+capture, the loop+tail must become a single closure with all-disjoint field borrows
+(no destructure-move; index `graph.layers`/`slot` by field), `whole_graph` taken out via
+`std::mem::take` first, `advance_decode_len` hoisted to a post-capture loop, and the 86
+NCCL all-reduces verified capture-safe inside one graph (task #25 made AR capturable, but
+here they're eager — must confirm one capture tolerates 86 of them + the DeepGEMM/FlashMLA
+with no hidden host malloc/sync). Then: needle byte-identical via replay + wall A/B +
+page-boundary recapture (num_pages changes every page_size tokens).
+
+This is a focused but genuine multi-pass refactor (the borrow restructure + capture
+debugging), now scoped to the line. It is THE remaining decode-6ms lever (collapses the
+~100 sub-capture host gaps → the ~12ms GPU floor).
