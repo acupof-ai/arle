@@ -31,6 +31,20 @@ compressor / sliding-window / head-HC sees the draft (token 2) without token 1's
 sequential update. This is the chunked-prefill-at-start_pos>0 path for compressed
 attention.
 
+## Root cause localized further (2026-06-08)
+
+`head_hidden_from_stream(stream, token_idx)` extracts the row correctly
+(`copy_row_to_hidden(stream, token_idx)`), so the output-extraction is NOT the bug —
+**the 2-token forward computes the draft's stream row (col1) wrong**. The smoking gun:
+`forward_tokens_stream_impl(seq_len=2, start_pos>0)` is a combination the normal flow
+**never exercises** — prefill is always a single chunk at start_pos=0; decode is
+seq_len=1 at start_pos>0. The batched verify is the FIRST caller of seq_len>1 AT
+start_pos>0 (a "decode-position chunk"), so it hits a latent bug in the
+sliding-window/compressed attention's handling of a multi-token chunk attending to KV
+history at start_pos>0 (token 0 / col0 is correct; token 1 / col1 — which must attend
+to both the history AND token 0 — is wrong). The fix is in the chunked-prefill SW/CSA
+attention path, not the verify wiring. Re-validate with a planted-answer needle.
+
 ## Rule
 
 - A batched K+1 verify is the right MTP lever (speed proven +63%), but it requires the
