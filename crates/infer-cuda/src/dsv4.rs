@@ -1620,6 +1620,9 @@ impl Dsv4Model {
                 })?;
             }
             keepalive.keep_hidden(&attn_out);
+            if layer_idx == 0 {
+                self.dump_tail_row("attn_out_pre_ar_L0", &attn_out, start_pos);
+            }
             // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
             {
                 let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
@@ -2545,14 +2548,18 @@ pub(crate) fn dsv4_spec_decode_enabled() -> bool {
     )
 }
 
-/// Opt-in (default off): batch the MTP verify over [pending, draft] in one 2-token
-/// forward (amortizes the weight read, proven +63%). KNOWN col1 BUG — the 2-token
-/// forward's 2nd token diverges at start_pos>0; kept behind this flag for the
-/// `verify_forward_selftest` col1 probe + the eventual fix. Do NOT enable in prod.
+/// Batch the MTP verify over [pending, draft] in one 2-token forward (amortizes the
+/// 149GB weight read). Default ON: validated 2026-06-08 on the TP=8 pod — with the
+/// executor batched-reject, the FULL spec decode is BYTE-IDENTICAL to non-spec on
+/// needle AND capital while running +61/+70% (needle 39.9→64.2, capital 38.2→65.0
+/// tok/s; decode ~27→~16ms). The earlier col1 "divergence" was a selftest artifact
+/// (the bonus on a forced-reject draft, which real decode discards) + the per-token
+/// reject mis-applied to the batched path; both resolved. Only matters when
+/// ARLE_DSV4_SPEC_DECODE is on. Opt out with ARLE_DSV4_MTP_BATCHED_VERIFY=0.
 pub(crate) fn dsv4_mtp_batched_verify_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ARLE_DSV4_MTP_BATCHED_VERIFY").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
     )
 }
 

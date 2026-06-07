@@ -4137,6 +4137,7 @@ pub(crate) fn mla_attention(
     keepalive.keep_hidden(&q_prepared);
     keepalive.keep_hidden(&k_prepared);
     dsv4_dump_kprep(ctx, layer_idx, "k_prepared", &k_prepared, start_pos);
+    dsv4_dump_kprep(ctx, layer_idx, "q_prepared", &q_prepared, start_pos);
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
     // SAFETY: the SW/hybrid attention kernel writes the full local_attn buffer.
