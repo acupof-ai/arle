@@ -75,7 +75,7 @@ mod real {
         set_dsv4_stage_profile_active,
     };
     use infer_plan::{DecodeRow, ForwardMode, ForwardPlan, PrefillRow, SamplingParams, SlotToken};
-    use infer_seam::{BackendExecutor, KvPool, PollResult};
+    use infer_seam::{BackendExecutor, KvAllocator, KvPool, KvQuery, PollResult};
     use std::{path::Path, time::Instant};
 
     /// Default prompt: "The capital of France is" in the **DeepSeek-V4** tokenizer
@@ -640,6 +640,7 @@ mod real {
         kv: &mut CudaKvPool,
         plan: ForwardPlan,
     ) -> Result<Vec<SlotToken>> {
+        materialize_plan_kv(kv, &plan)?;
         let inflight = exec.submit(&plan, kv as &mut dyn KvPool)?;
         match exec.poll(inflight)? {
             PollResult::Ready(out) => {
@@ -651,6 +652,33 @@ mod real {
                 anyhow::bail!("DSv4 executor resolves synchronously; got NotReady")
             }
         }
+    }
+
+    fn materialize_plan_kv(kv: &mut CudaKvPool, plan: &ForwardPlan) -> Result<()> {
+        for row in &plan.prefill_rows {
+            if row.start_pos == 0 {
+                kv.free_slot(row.slot);
+            }
+            anyhow::ensure!(
+                kv.seq_len(row.slot) == row.start_pos,
+                "DSv4 parity host KV len {} != prefill start_pos {} for slot {}",
+                kv.seq_len(row.slot),
+                row.start_pos,
+                row.slot
+            );
+            kv.alloc(row.slot, row.tokens.len())?;
+        }
+        for row in &plan.decode_rows {
+            anyhow::ensure!(
+                kv.seq_len(row.slot) == row.kv_seq_len,
+                "DSv4 parity host KV len {} != decode kv_seq_len {} for slot {}",
+                kv.seq_len(row.slot),
+                row.kv_seq_len,
+                row.slot
+            );
+            kv.alloc(row.slot, 1)?;
+        }
+        Ok(())
     }
 
     fn greedy() -> SamplingParams {
