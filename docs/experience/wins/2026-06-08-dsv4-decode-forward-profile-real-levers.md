@@ -55,3 +55,19 @@ kernel time. Linear-profile of it:
   the spec ceiling (depth-1 head) are the hard walls to literal 6ms.
 - Profile the forward per-stage before claiming "near the floor" — `mla_attn`=12ms was
   invisible until measured; it's projection-kernel overhead, not weight read.
+
+## UPDATE (2026-06-08): DSA-skip lever KILLED by A/B — the DSA is necessary, not wasted
+
+Implemented the "skip csa_select when 0 compressed blocks (seq <= window)" lever
+(`ARLE_DSV4_DSA_SKIP_EMPTY`) and A/B'd it (needle, B=1, SPEC off): output BYTE-IDENTICAL
+(correct) but **−3.7%** (38.1 vs 39.6 tok/s — the per-call env-var read, and the skip
+never fires). So `indexer_rows_after > 0` even for the 37-token needle: **DSv4's CSA
+compresses ALL tokens into blocks + selects top-k — it is NOT "window + beyond-window
+compressed"**. The compressor/indexer/csa_select are *necessary* CSA-attention compute,
+not waste. My "wasted for seq < window" hypothesis was WRONG; reverted.
+
+So the only real forward lever left is finishing projection→DeepGEMM (wqkv_a/wo, modest
+at M=1). The forward (26ms) is mostly NECESSARY compute (CSA compress+select, MoE,
+projections). Combined with the spec ceiling (depth-2-top1=33%), **6ms is bounded for
+DSv4-Flash B=1** — achievable ~13-15ms; literal 6ms needs model-level (multi-layer MTP)
+or library-level (SGLang MoE/CSA kernels) changes, proven now by A/B not assumption.
