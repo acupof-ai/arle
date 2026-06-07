@@ -2608,6 +2608,47 @@ fn dsv4_attn_dump_enabled() -> bool {
     ) && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
 }
 
+/// Debug (ARLE_DSV4_KNEW_DUMP, rank 0, layer 0): dump each row's L2 + first4 of the
+/// prepared key. Compares token_a's key in a batched [token_a,wrong_b] forward (sp=5
+/// seq=2, row 0) vs the per-token [token_a]@5 forward (sp=5 seq=1, row 0) to test
+/// whether the multi-token prepare mis-computes token_a (the col1-bug hypothesis).
+fn dsv4_dump_kprep(
+    ctx: &DeviceContext,
+    layer_idx: usize,
+    label: &str,
+    h: &HiddenStates,
+    start_pos: usize,
+) {
+    if layer_idx != 0
+        || std::env::var_os("ARLE_DSV4_KNEW_DUMP").is_none()
+        || std::env::var("INFER_TP_RANK").as_deref() != Ok("0")
+    {
+        return;
+    }
+    if ctx.sync().is_err() {
+        return;
+    }
+    let host: Vec<half::bf16> = match ctx.stream.clone_dtoh(&h.data) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let n = h.hidden_dim;
+    for row in 0..h.seq_len {
+        let base = row * n;
+        let mut l2 = 0.0f32;
+        for i in 0..n {
+            let x = host[base + i].to_f32();
+            l2 += x * x;
+        }
+        let first4: Vec<f32> = (0..4.min(n)).map(|i| host[base + i].to_f32()).collect();
+        eprintln!(
+            "[knew-dump] {label} sp={start_pos} seq={} row={row} dim={n} l2={:.5} first4={first4:?}",
+            h.seq_len,
+            l2.sqrt()
+        );
+    }
+}
+
 fn dsv4_dump_attn_output(
     ctx: &DeviceContext,
     layer_idx: usize,
@@ -4095,6 +4136,7 @@ pub(crate) fn mla_attention(
     }
     keepalive.keep_hidden(&q_prepared);
     keepalive.keep_hidden(&k_prepared);
+    dsv4_dump_kprep(ctx, layer_idx, "k_prepared", &k_prepared, start_pos);
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
     // SAFETY: the SW/hybrid attention kernel writes the full local_attn buffer.
