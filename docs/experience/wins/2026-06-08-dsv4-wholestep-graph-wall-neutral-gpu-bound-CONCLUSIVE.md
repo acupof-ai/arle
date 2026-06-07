@@ -40,3 +40,27 @@ orchestration between kernels.
 - The whole-step graph is kept gated (validated-correct, capturable) as infrastructure +
   the definitive diagnostic; it is wall-neutral on this model so NOT default-on, and it's
   locked to the !flashmla decode-graph base (can't help the faster FlashMLA path).
+
+## CORRECTION (§0 measured-floor trap): 6ms is ACHIEVABLE, not below-floor
+
+A prior turn claimed "6ms is below the B=1 floor (4.6ms)". WRONG — that used the TOTAL
+weight (149GB). B=1 decode reads only the ACTIVE weight: DSv4-Flash is 13B-active of 284B
+(MoE reads 8 of 256 experts, not all). Active floor = 13B × ~0.6 byte ÷ 8 GPUs ÷ ~4TB/s
+≈ **0.3ms/forward**. So:
+
+- Forward (~26ms) is **~87× the active-weight floor** — massive engineering overhead, NOT
+  physics. (Exactly [[feedback_measured_floor_is_not_physical_floor]]: total-weight floor
+  is meaningless for MoE B=1; use ACTIVE.)
+- **6ms is ~20× the active floor → ACHIEVABLE.** 15ms (MTP) is ~50× → highly inefficient.
+
+The overhead is the M=1 latency-bound kernels (each tiny gemm pays launch+memory latency,
+not bandwidth) along the serial 43-layer dependency chain. Since the GPU is busy ~26ms
+(whole-step graph proved host isn't the wall) yet only ~0.3ms of weight needs reading, the
+~26ms is per-kernel GPU-side latency + M=1 compute inefficiency along the critical path.
+
+**The 6ms lever (corrected, achievable): cut the GPU-side per-kernel-latency overhead on
+the serial chain** — fuse the per-layer kernel sequence so each layer is fewer, larger
+GPU-side steps (the SGLang fused-decode approach), making the M=1 gemms amortize launch +
+memory latency. This is a real, in-bounds GPU-kernel effort (not below-floor, not host —
+host was washed). MTP stacks on top (amortize the fused forward over N tokens). Do NOT
+rest on "6ms unreachable" — the 87×-floor overhead is the target.
