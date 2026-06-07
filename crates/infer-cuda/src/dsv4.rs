@@ -124,6 +124,11 @@ pub(crate) struct Dsv4Attention {
     pub wqkv_a_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub q_norm: DeviceVec,
     pub wq_b: DeviceMatrix,
+    /// DeepGEMM-layout FP8 cache of `wq_b` for the decode projection (M=1) — lets
+    /// the residual scalar `dsv4_fp8_gemv_batch` GEMV (nsys #1, 3.62ms) route
+    /// through tensor-core DeepGEMM like the fused wq_a|wkv path. `None` unless
+    /// the fused-wqkv decode alloc gate is on.
+    pub wq_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub wkv: DeviceMatrix,
     pub kv_norm: DeviceVec,
     pub wo_a: DeviceMatrix,

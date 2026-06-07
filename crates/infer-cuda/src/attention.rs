@@ -2397,6 +2397,20 @@ fn dsv4_fp8_linear_deepgemm_enabled() -> Result<bool> {
     ))
 }
 
+fn dsv4_decode_proj_deepgemm_enabled() -> bool {
+    // Lever #1 (nsys decode breakdown): route the residual decode projection GEMVs
+    // (wq_b now; wo_a/wo_b next) through tensor-core DeepGEMM instead of the scalar
+    // `dsv4_fp8_gemv_batch` (3.62ms, #1 decode GPU kernel). Default ON: licensed
+    // 2026-06-07 on the TP=8/EP=8 pod, same-load A/B 38.2 -> 39.2 tok/s (+2.5%,
+    // reproduced ×2) with the 37-tok needle retrieved bit-identically (divergence
+    // only in the free-continuation tail = legitimate FP8 numerics). Opt out with
+    // ARLE_DSV4_DECODE_PROJ_DEEPGEMM=0.
+    !matches!(
+        std::env::var("ARLE_DSV4_DECODE_PROJ_DEEPGEMM").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    )
+}
+
 fn dsv4_dsa_official_enabled() -> Result<bool> {
     // Default ON: official/vendored DSA indexer replaces the legacy scalar
     // csa_select selector. Licensed by the variable-shape legacy-floor gate:
@@ -3591,9 +3605,67 @@ fn run_fused_wqkv_decode(
 
     let mut q_raw = unsafe { HiddenStates::uninit(ctx, attention.wq_b.rows, 1)? };
     let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
-    crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-        dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
-    })?;
+    match (
+        dsv4_decode_proj_deepgemm_enabled(),
+        attention.wq_b_deepgemm.as_ref(),
+    ) {
+        (true, Some(cache)) => {
+            // Lever #1: wq_b (M=1) through tensor-core DeepGEMM instead of the
+            // scalar GEMV. Quantize c_q_normed (K=q_lora_rank) into the fused
+            // scratch FP8 buffer (already consumed by the wq_a|wkv GEMM above, so
+            // safe to reuse on this stream), then DeepGEMM dense GEMM.
+            let k = scratch.q_lora_rank;
+            ensure!(
+                cache.cols == k && cache.rows == attention.wq_b.rows,
+                "DSv4 wq_b DeepGEMM cache shape {}x{} != expected {}x{}",
+                cache.rows,
+                cache.cols,
+                attention.wq_b.rows,
+                k
+            );
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || -> Result<()> {
+                let stream = ctx.stream.cu_stream();
+                // SAFETY: all buffers live on ctx.stream; K=q_lora_rank ≤ hidden_dim
+                // so the fused scratch (sized for hidden_dim) covers the FP8 +
+                // scale extents.
+                unsafe {
+                    cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                        cache_ptr(&c_q_normed.data, ctx),
+                        cache_ptr(&scratch.input_fp8, ctx),
+                        cache_ptr(&scratch.input_scales, ctx),
+                        cache_ptr(&scratch.active_experts, ctx),
+                        cache_ptr(&scratch.active_offsets, ctx),
+                        cache_ptr(&scratch.active_counts, ctx),
+                        1,
+                        scratch.max_m,
+                        k,
+                        scratch.scale_stride_m,
+                        stream,
+                    )
+                    .map_err(|e| anyhow!("DSv4 wq_b activation quantize failed: {e}"))?;
+                    cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+                        cache_ptr(&scratch.input_fp8, ctx),
+                        cache_ptr(&scratch.input_scales, ctx),
+                        cache_ptr(&cache.weight, ctx),
+                        cache_ptr(&cache.scales, ctx),
+                        cache_ptr(&q_raw.data, ctx),
+                        1,
+                        cache.rows,
+                        cache.cols,
+                        scratch.scale_stride_m,
+                        stream,
+                    )
+                    .map_err(|e| anyhow!("DSv4 wq_b DeepGEMM dense failed: {e}"))?;
+                }
+                Ok(())
+            })?;
+        }
+        _ => {
+            crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+                dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+            })?;
+        }
+    }
     drop(nvtx_wq_b);
     Ok((c_q_normed, q_raw, kv_normed))
 }
