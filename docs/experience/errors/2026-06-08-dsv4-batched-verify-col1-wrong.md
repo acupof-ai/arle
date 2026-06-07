@@ -83,3 +83,25 @@ real spec-decode-contract bug (the verify must reproduce non-spec greedy, so a
 (batched token_a key) vs ring[5] (per-token token_a key) to confirm the prepare/store
 path. The ARLE_DSV4_TAIL_DUMP instrumentation (dsv4.rs dump_tail_row) is committed for
 this.
+
+## Inputs proven bit-identical → bug is INSIDE the SWA kernel (2026-06-08)
+
+k_prepared row dump (ARLE_DSV4_KNEW_DUMP), layer 0, batched [token_a,wrong_b]@5 vs
+the per-token references:
+- token_a key: batched row0 (sp5 seq2) == per-token [token_a]@5 row0 (sp5 seq1) —
+  l2=15.76101, first4=[-0.165,0.402,0.142,0.041] — **BIT-IDENTICAL**.
+- wrong_b key: batched row1 (sp5 seq2) == per-token [wrong_b]@6 row0 (sp6 seq1) —
+  l2=13.90704, first4=[0.836,-0.295,-0.270,0.080] — **BIT-IDENTICAL**.
+
+So q/k prepare is NOT the bug. Combined with attn_in_L0 bit-identical (earlier) and the
+history ring coming from the same deterministic prefill, EVERY input to token-1's
+attention is bit-identical, yet attn_out_L0(token-1) diverges deterministically
+(144.86 vs 145.18). Every host-visible index/path in `dsv4_swa_attention_kernel`
+(q_base=token*local_width+head*head_dim; k_new[(key_pos-base_start_pos)*head_dim+col];
+sw_start/key_count; sink_offset+head; output inverse-RoPE at abs_pos=base_start_pos+token;
+ring write head==0) is correct on read. So the bug is a seq=2-specific compute issue
+INSIDE the kernel for the 2nd query — not host-visible. Next: kernel-side printf of
+token-1's per-key logits / out_vec (pre-inverse-RoPE), or compare the batched seq=2
+kernel launch against two seq=1 launches numerically with a minimal in-kernel probe.
+This is the deepest host-side localization possible; the remaining search is one CUDA
+kernel's multi-query path.
