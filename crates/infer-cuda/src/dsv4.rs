@@ -1844,7 +1844,7 @@ impl Dsv4Model {
         h_prev: &DeviceVec,
         next_token: u32,
         position: u64,
-    ) -> Result<u32> {
+    ) -> Result<(u32, DeviceVec)> {
         ensure!(
             dsv4_spec_decode_enabled(),
             "DSv4 MTP forward called while ARLE_DSV4_SPEC_DECODE is disabled"
@@ -1946,7 +1946,18 @@ impl Dsv4Model {
         crate::ops::rms_norm_vec(ctx, &last_hidden, &mtp.norm, eps, &mut last_normed)?;
         let mut logits = DeviceVec::zeros(ctx, self.lm_head.rows)?;
         self.lm_head_project(&last_normed, &mut logits)?;
-        crate::executor::sample_cuda_token(ctx, &logits, &SamplingParams::default(), position)
+        let token =
+            crate::executor::sample_cuda_token(ctx, &logits, &SamplingParams::default(), position)?;
+        // Return the wide MTP stream (stream_dim) so a depth-2 draft can chain from it.
+        let stream_len = stream.hidden_dim * stream.seq_len;
+        Ok((
+            token,
+            DeviceVec {
+                data: stream.data,
+                len: stream_len,
+                label: "mtp_stream",
+            },
+        ))
     }
 
     fn mtp_frozen_target_layer_idx(&self, mtp: &Dsv4MtpLayer) -> Result<usize> {
