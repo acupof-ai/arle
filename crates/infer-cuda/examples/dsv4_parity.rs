@@ -74,7 +74,7 @@ mod real {
         CudaExecutor, CudaKvPool, print_dsv4_stage_profile, reset_dsv4_stage_profile,
         set_dsv4_stage_profile_active,
     };
-    use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
+    use infer_plan::{DecodeRow, ForwardMode, ForwardPlan, PrefillRow, SamplingParams, SlotToken};
     use infer_seam::{BackendExecutor, KvPool, PollResult};
     use std::{path::Path, time::Instant};
 
@@ -221,13 +221,32 @@ mod real {
         // DSv4 owns its MLA KV state inside the forward, so the host pool is only
         // present to satisfy the `submit(.., &mut dyn KvPool)` signature — the
         // DSv4 executor never touches it. A 1-slot/1-page pool is sufficient.
+        let batch_decode_validate = parse_batch_decode_validate()?;
+        let num_slots = batch_decode_validate
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(DSV4_PARITY_NUM_SLOTS)
+            .max(DSV4_PARITY_NUM_SLOTS);
         let load_t0 = Instant::now();
-        let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, DSV4_PARITY_NUM_SLOTS)
+        let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, num_slots)
             .context("from_dsv4_fp8_safetensors failed (build/config?)")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
         if env_flag("INFER_DSV4_MTP_STEP_A_SELFTEST") {
             exec.dsv4_verify_forward_selftest(&prompt)
                 .context("DSv4 MTP Step A verify-forward selftest failed")?;
+        }
+
+        if !batch_decode_validate.is_empty() {
+            run_batch_decode_validate(
+                &mut exec,
+                prompt,
+                max_new,
+                load_ms,
+                rank,
+                &batch_decode_validate,
+            )?;
+            return Ok(());
         }
 
         for (case_idx, prompt) in prompts.iter().enumerate() {
@@ -385,6 +404,127 @@ mod real {
         Ok(())
     }
 
+    fn parse_batch_decode_validate() -> Result<Vec<usize>> {
+        let Ok(raw) = std::env::var("INFER_DSV4_BATCH_DECODE_VALIDATE") else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let value = part
+                .parse::<usize>()
+                .with_context(|| format!("bad INFER_DSV4_BATCH_DECODE_VALIDATE entry `{part}`"))?;
+            anyhow::ensure!(value > 0, "batch size must be positive, got {value}");
+            out.push(value);
+        }
+        Ok(out)
+    }
+
+    fn run_batch_decode_validate(
+        exec: &mut CudaExecutor,
+        prompt: &[u32],
+        max_new: usize,
+        load_ms: f64,
+        rank: usize,
+        batch_sizes: &[usize],
+    ) -> Result<()> {
+        let validate_new = std::cmp::min(max_new, 16).max(2);
+        let max_batch = batch_sizes.iter().copied().max().unwrap_or(1);
+        let mut kv = CudaKvPool::new(max_batch, max_batch.max(1), 16);
+        let ref_tokens = run_slot_sequence(exec, &mut kv, 0, prompt, validate_new)
+            .context("DSv4 batch decode single-row reference failed")?;
+
+        if rank == 0 {
+            println!(
+                "batch_decode_reference batch=1 max_new={} clean_tokens={ref_tokens:?} load_ms={load_ms:.3}",
+                validate_new
+            );
+        }
+
+        for &batch in batch_sizes {
+            let rows = run_batch_sequence(exec, &mut kv, batch, prompt, validate_new)
+                .with_context(|| {
+                    format!("DSv4 batch decode validation failed for batch={batch}")
+                })?;
+            let parity = rows.iter().all(|tokens| tokens == &ref_tokens);
+            if rank == 0 {
+                println!("batch_decode_validate batch={batch} byte_parity={parity}");
+                for (idx, tokens) in rows.iter().enumerate() {
+                    println!("  row{idx}_clean_tokens={tokens:?}");
+                }
+            }
+            anyhow::ensure!(
+                parity,
+                "DSv4 batch decode byte parity failed for batch={batch}"
+            );
+        }
+        Ok(())
+    }
+
+    fn run_slot_sequence(
+        exec: &mut CudaExecutor,
+        kv: &mut CudaKvPool,
+        slot: usize,
+        prompt: &[u32],
+        max_new: usize,
+    ) -> Result<Vec<u32>> {
+        let first = forward_tokens(exec, kv, prefill_plan_for(slot, prompt, 0))?
+            .into_iter()
+            .find(|tok| tok.slot == slot)
+            .map(|tok| tok.token)
+            .context("DSv4 single-row prefill produced no token")?;
+        let mut clean_tokens = vec![first];
+        while clean_tokens.len() < max_new {
+            let last = *clean_tokens.last().expect("clean_tokens is non-empty");
+            let kv_seq_len = prompt.len() + clean_tokens.len() - 1;
+            let out = forward_tokens(exec, kv, decode_plan_for(&[(slot, last, kv_seq_len)]))?;
+            let token = out
+                .into_iter()
+                .find(|tok| tok.slot == slot)
+                .map(|tok| tok.token)
+                .context("DSv4 single-row decode produced no token")?;
+            clean_tokens.push(token);
+        }
+        Ok(clean_tokens)
+    }
+
+    fn run_batch_sequence(
+        exec: &mut CudaExecutor,
+        kv: &mut CudaKvPool,
+        batch: usize,
+        prompt: &[u32],
+        max_new: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        let mut clean_tokens = vec![Vec::new(); batch];
+        for (slot, slot_tokens) in clean_tokens.iter_mut().enumerate() {
+            let first = forward_tokens(exec, kv, prefill_plan_for(slot, prompt, 0))?
+                .into_iter()
+                .find(|tok| tok.slot == slot)
+                .map(|tok| tok.token)
+                .with_context(|| format!("DSv4 batch prefill produced no token for slot {slot}"))?;
+            slot_tokens.push(first);
+        }
+
+        while clean_tokens.iter().any(|tokens| tokens.len() < max_new) {
+            let mut rows = Vec::with_capacity(batch);
+            for (slot, slot_tokens) in clean_tokens.iter().enumerate() {
+                if slot_tokens.len() >= max_new {
+                    continue;
+                }
+                let last = *slot_tokens.last().expect("slot has prefill token");
+                let kv_seq_len = prompt.len() + slot_tokens.len() - 1;
+                rows.push((slot, last, kv_seq_len));
+            }
+            let out = forward_tokens(exec, kv, decode_plan_for(&rows))?;
+            for tok in out {
+                if tok.slot < clean_tokens.len() && clean_tokens[tok.slot].len() < max_new {
+                    clean_tokens[tok.slot].push(tok.token);
+                }
+            }
+        }
+
+        Ok(clean_tokens)
+    }
+
     fn configure_slot_max_seq_len(prompt_len: usize, max_new: usize, rank: usize) -> Result<usize> {
         let slot_max_seq_len = prompt_len
             .checked_add(max_new)
@@ -440,11 +580,15 @@ mod real {
 
     /// Build a one-row prefill `ForwardPlan` over the whole prompt at `start_pos`.
     fn prefill_plan(tokens: &[u32], start_pos: usize) -> ForwardPlan {
+        prefill_plan_for(0, tokens, start_pos)
+    }
+
+    fn prefill_plan_for(slot: usize, tokens: &[u32], start_pos: usize) -> ForwardPlan {
         ForwardPlan {
             mode: ForwardMode::Prefill,
             decode_rows: Vec::new(),
             prefill_rows: vec![PrefillRow {
-                slot: 0,
+                slot,
                 tokens: tokens.to_vec(),
                 start_pos,
                 total_tokens: start_pos + tokens.len(),
@@ -458,14 +602,21 @@ mod real {
     /// Build a one-row incremental-decode `ForwardPlan` for `last_token` at the
     /// given materialized KV length (the `start_pos > 0` path).
     fn decode_plan(last_token: u32, kv_seq_len: usize) -> ForwardPlan {
+        decode_plan_for(&[(0, last_token, kv_seq_len)])
+    }
+
+    fn decode_plan_for(rows: &[(usize, u32, usize)]) -> ForwardPlan {
         ForwardPlan {
             mode: ForwardMode::Decode,
-            decode_rows: vec![infer_plan::DecodeRow {
-                slot: 0,
-                last_token,
-                kv_seq_len,
-                params: greedy(),
-            }],
+            decode_rows: rows
+                .iter()
+                .map(|&(slot, last_token, kv_seq_len)| DecodeRow {
+                    slot,
+                    last_token,
+                    kv_seq_len,
+                    params: greedy(),
+                })
+                .collect(),
             prefill_rows: Vec::new(),
             microbatch: None,
             spec: None,
@@ -478,10 +629,21 @@ mod real {
         kv: &mut CudaKvPool,
         plan: ForwardPlan,
     ) -> Result<Vec<u32>> {
+        Ok(forward_tokens(exec, kv, plan)?
+            .into_iter()
+            .map(|t| t.token)
+            .collect())
+    }
+
+    fn forward_tokens(
+        exec: &mut CudaExecutor,
+        kv: &mut CudaKvPool,
+        plan: ForwardPlan,
+    ) -> Result<Vec<SlotToken>> {
         let inflight = exec.submit(&plan, kv as &mut dyn KvPool)?;
         match exec.poll(inflight)? {
             PollResult::Ready(out) => {
-                let tokens: Vec<u32> = out.tokens.into_iter().map(|t| t.token).collect();
+                let tokens = out.tokens;
                 anyhow::ensure!(!tokens.is_empty(), "DSv4 step produced no token");
                 Ok(tokens)
             }
