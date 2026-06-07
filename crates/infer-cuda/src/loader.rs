@@ -1114,18 +1114,29 @@ impl SafetensorLoader {
         } else {
             None
         };
+        let wq_b = self.load_dsv4_block_scaled_sharded(
+            ctx,
+            &names.wq_b,
+            names
+                .shard_for(config, &names.wq_b, tp.world_size)
+                .unwrap_or(Shard::Replicated),
+            tp,
+        )?;
+        // DeepGEMM-layout cache for the decode wq_b projection (lever #1: residual
+        // scalar GEMV → tensor-core). Built under the same gate as the fused
+        // wq_a|wkv cache so the runtime ARLE_DSV4_DECODE_PROJ_DEEPGEMM flag can A/B
+        // it without a rebuild.
+        let wq_b_deepgemm = if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
+            Some(cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &wq_b)?)
+        } else {
+            None
+        };
         Ok(crate::dsv4::Dsv4Attention {
             wq_a,
             wqkv_a_deepgemm,
             q_norm: self.load_dsv4_vec(ctx, &names.q_norm)?,
-            wq_b: self.load_dsv4_block_scaled_sharded(
-                ctx,
-                &names.wq_b,
-                names
-                    .shard_for(config, &names.wq_b, tp.world_size)
-                    .unwrap_or(Shard::Replicated),
-                tp,
-            )?,
+            wq_b,
+            wq_b_deepgemm,
             wkv,
             kv_norm: self.load_dsv4_vec(ctx, &names.kv_norm)?,
             wo_a: self.load_dsv4_block_scaled_sharded(
