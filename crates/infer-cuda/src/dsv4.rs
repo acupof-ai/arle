@@ -1075,14 +1075,7 @@ impl Dsv4Model {
         let mut attn_out_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
         keepalive.keep_hidden(&normed_row);
         keepalive.keep_hidden(&attn_out_row);
-        // Step A keeps the routed MoE per-row (seq_len=1, byte-identical to the
-        // looped path) — only the layer structure and the point-wise/all-reduce
-        // ops batch over N. Phase 6 replaces this loop with grouped MoE over N.
-        // SAFETY: fully written by the copy-in / MoE each row before read.
-        let mut moe_normed_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
-        let mut moe_out_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
-        keepalive.keep_hidden(&moe_normed_row);
-        keepalive.keep_hidden(&moe_out_row);
+        // MoE/shared are now grouped over [N] (Phase 6a) — no per-row MoE scratch.
 
         // Localization probe: all rows have identical inputs, so every intermediate
         // must be row-identical. Print the first (layer, half) where rows diverge.
@@ -1252,32 +1245,21 @@ impl Dsv4Model {
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)?;
             keepalive.keep_hidden(&normed);
-            // Routed MoE per-row (Step A isolation): each row's token routes
-            // through the single-token MoE exactly as the looped reference path,
-            // written into row r of the batched moe_out.
+            // Phase 6a: grouped routed MoE over the whole [N] batch — one router
+            // gemm + one DeepGEMM grouped expert GEMM over N×topk routes (the
+            // prefill path, decode_scratch=None), replacing N per-row calls + N
+            // host syncs. Bit-identity vs per-row is NOT expected (grouped GEMM
+            // tiles over N differently); gated on needle retrieval, not byte-parity.
             let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            for r in 0..n {
-                let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
-                ctx.stream
-                    .memcpy_dtod(&src, &mut moe_normed_row.data)
-                    .map_err(|e| anyhow!("DSv4 batched MoE copy-in failed: {e}"))?;
-                crate::moe::dsv4_moe_forward(
-                    self,
-                    &layer.moe,
-                    &tokens[r..r + 1],
-                    &moe_normed_row,
-                    &mut moe_out_row,
-                    None,
-                    &mut keepalive,
-                )?;
-                let mut dst = moe_out
-                    .data
-                    .slice_mut(r * hidden_size..(r + 1) * hidden_size);
-                ctx.stream
-                    .memcpy_dtod(&moe_out_row.data, &mut dst)
-                    .map_err(|e| anyhow!("DSv4 batched MoE copy-out failed: {e}"))?;
-                self.ctx.sync()?;
-            }
+            crate::moe::dsv4_moe_forward(
+                self,
+                &layer.moe,
+                tokens,
+                &normed,
+                &mut moe_out,
+                None,
+                &mut keepalive,
+            )?;
             keepalive.keep_hidden(&moe_out);
             // Probe the RAW per-row MoE output (pre all-reduce): like attn_raw, the
             // per-row single-token MoE must be bit-identical across identical rows.
@@ -1289,32 +1271,20 @@ impl Dsv4Model {
                 self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
             }
             probe_rows("moe_ar", &moe_out, layer_idx)?;
-            // Shared expert per-row (Step A isolation): each row's token through
-            // the single-token shared expert, written into row r of shared.
+            // Phase 6a: grouped shared expert over [N] (dense FFN, prefill path,
+            // decode_scratch=None) — one batched SwiGLU GEMM pair, replacing the
+            // per-row loop + N host syncs.
             let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            for r in 0..n {
-                let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
-                ctx.stream
-                    .memcpy_dtod(&src, &mut moe_normed_row.data)
-                    .map_err(|e| anyhow!("DSv4 batched shared copy-in failed: {e}"))?;
-                crate::moe::dsv4_shared_expert_forward(
-                    &self.ctx,
-                    &self.ctx.stream,
-                    &layer.moe,
-                    &moe_normed_row,
-                    &mut moe_out_row,
-                    self.config.swiglu_limit,
-                    None,
-                    &mut keepalive,
-                )?;
-                let mut dst = shared
-                    .data
-                    .slice_mut(r * hidden_size..(r + 1) * hidden_size);
-                ctx.stream
-                    .memcpy_dtod(&moe_out_row.data, &mut dst)
-                    .map_err(|e| anyhow!("DSv4 batched shared copy-out failed: {e}"))?;
-                self.ctx.sync()?;
-            }
+            crate::moe::dsv4_shared_expert_forward(
+                &self.ctx,
+                &self.ctx.stream,
+                &layer.moe,
+                &normed,
+                &mut shared,
+                self.config.swiglu_limit,
+                None,
+                &mut keepalive,
+            )?;
             keepalive.keep_hidden(&shared);
             // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
             let mut moe_with_shared =

@@ -471,13 +471,28 @@ mod real {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         for &batch in batch_sizes {
-            let rows = run_batch_sequence(exec, &mut kv, batch, prompt, validate_new)
+            let (rows, decode_ms) = run_batch_sequence(exec, &mut kv, batch, prompt, validate_new)
                 .with_context(|| {
                     format!("DSv4 batch decode validation failed for batch={batch}")
                 })?;
             let parity = rows.iter().all(|tokens| tokens == &ref_tokens);
+            let decode_steps = validate_new.saturating_sub(1);
+            let total_tokens = decode_steps * batch;
+            let tok_s = if decode_ms > 0.0 {
+                (total_tokens as f64) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            };
+            let ms_per_step = if decode_steps > 0 {
+                decode_ms / decode_steps as f64
+            } else {
+                0.0
+            };
             if rank == 0 {
                 println!("batch_decode_validate batch={batch} byte_parity={parity}");
+                println!(
+                    "  batch_decode_perf batch={batch} decode_steps={decode_steps} decode_ms={decode_ms:.3} ms_per_step={ms_per_step:.3} tok_s={tok_s:.3}"
+                );
                 for (idx, tokens) in rows.iter().enumerate() {
                     let div = first_div(&ref_tokens, tokens);
                     println!("  row{idx}_first_div_vs_ref={div:?} clean_tokens={tokens:?}");
@@ -537,13 +552,16 @@ mod real {
         Ok(clean_tokens)
     }
 
+    /// Returns (per-slot tokens, decode-loop wall ms). The decode timer excludes
+    /// the per-slot prefills so the batched STEP cost is isolated — this is the
+    /// throughput signal (compare BATCHED=1 grouped vs BATCHED=0 per-row executor).
     fn run_batch_sequence(
         exec: &mut CudaExecutor,
         kv: &mut CudaKvPool,
         batch: usize,
         prompt: &[u32],
         max_new: usize,
-    ) -> Result<Vec<Vec<u32>>> {
+    ) -> Result<(Vec<Vec<u32>>, f64)> {
         let mut clean_tokens = vec![Vec::new(); batch];
         for (slot, slot_tokens) in clean_tokens.iter_mut().enumerate() {
             let first = forward_tokens(exec, kv, prefill_plan_for(slot, prompt, 0))?
@@ -554,6 +572,7 @@ mod real {
             slot_tokens.push(first);
         }
 
+        let decode_t0 = Instant::now();
         while clean_tokens.iter().any(|tokens| tokens.len() < max_new) {
             let mut rows = Vec::with_capacity(batch);
             for (slot, slot_tokens) in clean_tokens.iter().enumerate() {
@@ -571,8 +590,9 @@ mod real {
                 }
             }
         }
+        let decode_ms = decode_t0.elapsed().as_secs_f64() * 1000.0;
 
-        Ok(clean_tokens)
+        Ok((clean_tokens, decode_ms))
     }
 
     fn configure_slot_max_seq_len(prompt_len: usize, max_new: usize, rank: usize) -> Result<usize> {
