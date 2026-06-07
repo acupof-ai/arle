@@ -1,5 +1,34 @@
 # DSv4 prefill 调研 — clean §0 profile + lever ranking (implementation-level)
 
+## Superseded by later evidence (lever #3 + the "FlashMLA-prefill killed" call)
+
+The profile here is valid (prefill is compute-bound → kernel-% ≈ wall), but the
+**lever ranking was overturned** when the official-kernel posture replaced the
+hand-rolled framing:
+- **Lever #3 "hybrid_attention (31.3%) — HARD, FlashMLA-prefill KILLED (+36%)" is
+  WRONG.** That +36% was the hand-roll framing; re-judged on the **official vendored
+  FlashMLA `sparse_fwd`** the prefill attention is now **DEFAULT-ON** and FASTER
+  (7.19s → 4.30s @4096). See
+  [`../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md`](../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md).
+- **Lever #1 (MLA-LoRA → DeepGEMM, 30.2%) only partly bankable.** The full bucket
+  does NOT collapse — only the FUSED `wq_a|wkv` slice wins (−5%); the 1:1
+  per-projection swap LOSES (+9%, overlap break). Now default-on as
+  `FP8_LINEAR_DEEPGEMM`. See
+  [`../experience/wins/2026-06-06-dsv4-prefill-fused-wqkv-deepgemm.md`](../experience/wins/2026-06-06-dsv4-prefill-fused-wqkv-deepgemm.md)
+  + the prefill default-on win above.
+- **Lever #2 (csa_select cross-layer reuse) KILLED** — Jaccard 0.53 across CSA
+  layers, reuse degrades retrieval; the real fix is the **official DSA indexer**
+  (decode 124ms → 26ms @4096), not reuse. See
+  [`2026-06-06-dsv4-pd-systematic-analysis.md`](2026-06-06-dsv4-pd-systematic-analysis.md)
+  §3 and
+  [`../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md`](../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md).
+
+Re-anchor on the [H20 reference baseline](2026-06-06-dsv4-h20-reference-baseline.md)
+and the [unified plan](2026-06-07-unified-batched-kvpool-abstraction.md). Kept for
+history (the profile numbers + the cross-layer-reuse diagnostic are valid records).
+
+---
+
 **Date:** 2026-06-06. **Evidence:** `nsys cuda_gpu_kern_sum` on the 4096-tok prefill
 (`dsv4_prefill4096_default_nsys`), TP=8/EP=8, 8×H20. Prefill is GPU-compute-bound
 (4096 tokens), so kernel-time % ≈ wall-clock % (unlike decode — §0 framing holds).

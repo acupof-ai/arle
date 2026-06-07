@@ -1,5 +1,14 @@
 # DSv4 prefill perf — extend fused-wqkv (DeepGEMM) to multi-token (#1 prefill lever, 22.8%)
 
+> **Status update: SHIPPED + default-on (`ARLE_DSV4_FP8_LINEAR_DEEPGEMM`).** This
+> design landed; the realized win is the **fused `wq_a|wkv` slice (−5%)** not the
+> full 22.8% bucket (the 1:1 per-projection swap LOSES +9% to overlap break). See
+> [`../experience/wins/2026-06-06-dsv4-prefill-fused-wqkv-deepgemm.md`](../experience/wins/2026-06-06-dsv4-prefill-fused-wqkv-deepgemm.md)
+> and the prefill default-on win
+> [`../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md`](../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md).
+> Superseding context (the 22.8% smoke-shape ranking) is in
+> [`2026-06-06-dsv4-prefill-profile-levers.md`](2026-06-06-dsv4-prefill-profile-levers.md).
+
 **Date:** 2026-06-06. **Status:** execution-ready design (parallel prep while the
 decode EAGLE rollback lands; this touches `attention.rs` so IMPLEMENT after the
 rollback merges to avoid conflict). **Goal:** lift the proven decode fused-wqkv
