@@ -22,6 +22,9 @@ pub struct CudaGraphState {
     /// needs `&Arc<CudaStream>`, so the `Arc` is held here).
     stream: Arc<CudaStream>,
     graph: Option<CudaGraph>,
+    /// Whole-step mode: when true, `run_or_capture` runs kernels eagerly so they
+    /// record into an OUTER capture instead of nesting their own.
+    bypass: bool,
 }
 
 // SAFETY: the wrapped `CudaGraph` holds `!Send` handles (a CUDA graph must be
@@ -38,7 +41,13 @@ impl CudaGraphState {
         Self {
             stream,
             graph: None,
+            bypass: false,
         }
+    }
+
+    /// Set whole-step bypass (per-portion states record into the outer capture).
+    pub fn set_bypass(&mut self, bypass: bool) {
+        self.bypass = bypass;
     }
 
     /// Whether the graph for this shape has been captured yet.
@@ -58,6 +67,9 @@ impl CudaGraphState {
     where
         F: FnOnce() -> Result<()>,
     {
+        if self.bypass {
+            return kernels();
+        }
         if let Some(graph) = &self.graph {
             graph
                 .launch()
