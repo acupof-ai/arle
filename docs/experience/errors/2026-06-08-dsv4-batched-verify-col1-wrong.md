@@ -64,3 +64,22 @@ So col1 is wrong somewhere ELSE in the 2-token forward's token-1 path (HC mix `g
 - Reverted the code (default-off but incorrect = a half-state); re-implement after the
   chunked-prefill col-N correctness is established. Design is in
   `reference_dsv4_decode_6ms_path_state`.
+
+## PINPOINTED to the attention (2026-06-08, ARLE_DSV4_TAIL_DUMP probe)
+
+Per-layer-0 tail-row (token-1) dump, batched (sp=5 seq=2) vs per-token ref (sp=6 seq=1):
+- `init_stream`: l2=2.86334, first4=[0.0270,…] — **BIT-IDENTICAL** (embed fine)
+- `attn_in_L0` (post HC-pre): l2=5.72668, first4=[0.1079,…] — **BIT-IDENTICAL** (HC fine)
+- `attn_out_L0` (post attention): batched l2=144.86 first4=[-1.10, 2.125, -2.125, 3.469];
+  ref l2=145.18 first4=[-1.20, 1.953, -2.0, 3.375] — **DIVERGE**, concentrated in the
+  first/RoPE elements.
+
+So the col1 bug is the **SWA attention for the chunk's 2nd token** (not embed/HC/MoE/
+output-extraction). The kernel's output inverse-RoPE uses `abs_pos=base_start_pos+token`
+correctly, and the inputs (token_a via k_new[0] vs ring[5], history ring[0-4], query,
+sink) all appear to match on read — so it is a subtle multi-query SWA effect. It's a
+real spec-decode-contract bug (the verify must reproduce non-spec greedy, so a
+"legitimate numerical" path difference still breaks losslessness). Next dump: k_new[0]
+(batched token_a key) vs ring[5] (per-token token_a key) to confirm the prepare/store
+path. The ARLE_DSV4_TAIL_DUMP instrumentation (dsv4.rs dump_tail_row) is committed for
+this.

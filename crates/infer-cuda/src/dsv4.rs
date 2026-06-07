@@ -1451,6 +1451,48 @@ impl Dsv4Model {
         })
     }
 
+    // col1-bug pinpoint (2026-06-08, ARLE_DSV4_TAIL_DUMP): for the capital selftest
+    // (start_pos=5), the batched verify token-1 (sp=5 seq=2) vs the per-token reference
+    // (sp=6 seq=1) are BIT-IDENTICAL at init_stream + attn_in_L0, then DIVERGE at
+    // attn_out_L0 (L2 144.86 vs 145.18, concentrated in the first/RoPE dims). So the
+    // chunked-verify col1 bug is in the SWA attention for the chunk's 2nd token — NOT
+    // embed/HC/MoE. Inputs (token_a key k_new[0] vs ring[5], history, query, sink, the
+    // abs_pos inverse-RoPE) all appear to match on read; next dump is k_new[0] vs
+    // ring[5] for token_a to confirm whether the prepare/store path differs.
+    /// Debug: dump the TAIL row (seq_len-1) of `h` — L2 + first4 — gated by
+    /// ARLE_DSV4_TAIL_DUMP, rank 0 only. The tail row is the LAST token, so it is
+    /// directly comparable between a batched [a,b] forward (row 1) and a per-token
+    /// [b]@start_pos+1 reference (row 0) — used to localize the batched-verify col1
+    /// bug to the first diverging stage. Syncs (debug only; not on the hot path).
+    fn dump_tail_row(&self, label: &str, h: &HiddenStates, start_pos: usize) {
+        if self.tp.config().rank != 0 || std::env::var_os("ARLE_DSV4_TAIL_DUMP").is_none() {
+            return;
+        }
+        if self.ctx.sync().is_err() {
+            return;
+        }
+        let host: Vec<half::bf16> = match self.ctx.stream.clone_dtoh(&h.data) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let row = h.seq_len.saturating_sub(1);
+        let base = row * h.hidden_dim;
+        let mut l2 = 0.0f32;
+        for i in 0..h.hidden_dim {
+            let x = host[base + i].to_f32();
+            l2 += x * x;
+        }
+        let first4: Vec<f32> = (0..4.min(h.hidden_dim))
+            .map(|i| host[base + i].to_f32())
+            .collect();
+        eprintln!(
+            "[tail-dump] {label} sp={start_pos} seq={} dim={} tailrow={row} l2={:.5} first4={first4:?}",
+            h.seq_len,
+            h.hidden_dim,
+            l2.sqrt()
+        );
+    }
+
     fn forward_tokens_stream_impl(
         &self,
         slot: &mut Dsv4SlotState,
@@ -1521,6 +1563,7 @@ impl Dsv4Model {
         })?;
         keepalive.keep_hidden(&stream);
         drop(nvtx_embed);
+        self.dump_tail_row("init_stream", &stream, start_pos);
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC-wrap MLA attention.
@@ -1543,6 +1586,9 @@ impl Dsv4Model {
                 )
             })?;
             keepalive.keep_hidden(&attn_in);
+            if layer_idx == 0 {
+                self.dump_tail_row("attn_in_L0", &attn_in, start_pos);
+            }
             // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             crate::stage_profile::profile(ctx, "dsv4/stage/attn_norm", || {
@@ -1580,6 +1626,9 @@ impl Dsv4Model {
                 crate::stage_profile::profile(ctx, "dsv4/stage/attn_allreduce", || {
                     self.tp.all_reduce_sum(&self.ctx, &mut attn_out)
                 })?;
+            }
+            if layer_idx == 0 {
+                self.dump_tail_row("attn_out_L0", &attn_out, start_pos);
             }
             // SAFETY: hc_post writes the full stream buffer.
             let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
