@@ -80,24 +80,6 @@ impl Dsv4MlaKvArena {
             num_layers: config.num_hidden_layers,
         })
     }
-
-    /// Allocate the flat device FP8 KV arena the FlashMLA sparse-FP8 decode reads.
-    pub(crate) fn alloc_fp8_arena(
-        &self,
-        ctx: &DeviceContext,
-        num_blocks: usize,
-    ) -> Result<CudaSlice<u8>> {
-        ensure!(num_blocks > 0, "DSv4 FP8 KV arena needs at least one block");
-        let rows = num_blocks
-            .checked_mul(self.page_block_size)
-            .ok_or_else(|| anyhow!("DSv4 FP8 KV arena row count overflow"))?;
-        let bytes = rows
-            .checked_mul(self.bytes_per_token)
-            .ok_or_else(|| anyhow!("DSv4 FP8 KV arena byte size overflow"))?;
-        ctx.stream
-            .alloc_zeros::<u8>(bytes)
-            .map_err(|e| anyhow!("DSv4 FP8 KV arena alloc failed ({bytes} bytes): {e}"))
-    }
 }
 
 /// Compressor sub-block for CSA/HCA layers (`compress_ratio > 0`): projects the
@@ -467,17 +449,23 @@ impl Dsv4ForwardKeepalive {
 }
 
 impl Dsv4SlotState {
-    fn new(model: &Dsv4Model, max_seq_len: usize) -> Result<Self> {
+    fn new(
+        model: &Dsv4Model,
+        max_seq_len: usize,
+        slot_idx: usize,
+        kv_adapter: &crate::attention::Dsv4KvAdapter,
+    ) -> Result<Self> {
         ensure!(max_seq_len > 0, "DSv4 slot max_seq_len must be positive");
         let mut attention = Vec::with_capacity(model.layers.len());
         let mut moe_decode_scratch = Vec::with_capacity(model.layers.len());
-        for layer in &model.layers {
+        for (layer_idx, layer) in model.layers.iter().enumerate() {
             let local_width = layer.attention.wq_b.rows;
             ensure!(
                 local_width.is_multiple_of(model.config.head_dim),
                 "DSv4 slot attention local width {local_width} is not a multiple of head_dim {}",
                 model.config.head_dim
             );
+            let pool = kv_adapter.layer(layer_idx)?;
             attention.push(crate::attention::Dsv4LayerAttentionState::new(
                 &model.ctx,
                 &model.config,
@@ -487,6 +475,8 @@ impl Dsv4SlotState {
                 &model.kv_arena,
                 local_width / model.config.head_dim,
                 model.tp.config().world_size,
+                slot_idx,
+                pool,
             )?);
             moe_decode_scratch.push(crate::moe::Dsv4MoeDecodeScratch::new(
                 &model.ctx,
@@ -528,13 +518,18 @@ impl Dsv4SlotState {
         self.seq_len
     }
 
-    pub(crate) fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+    pub(crate) fn reset(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+    ) -> Result<()> {
         self.seq_len = 0;
         ctx.stream
             .memset_zeros(&mut self.start_pos_device)
             .map_err(|e| anyhow!("DSv4 slot start_pos reset failed: {e}"))?;
-        for layer in &mut self.attention {
-            layer.reset(ctx)?;
+        for (layer_idx, layer) in self.attention.iter_mut().enumerate() {
+            let pool = kv_adapter.layer_mut(layer_idx)?;
+            layer.reset(ctx, pool)?;
         }
         Ok(())
     }
@@ -542,6 +537,7 @@ impl Dsv4SlotState {
     pub(crate) fn capture_spec_rollback(
         &mut self,
         ctx: &DeviceContext,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         draft_abs_pos: usize,
     ) -> Result<()> {
         let snapshots = self
@@ -554,8 +550,9 @@ impl Dsv4SlotState {
             snapshots.len(),
             self.attention.len()
         );
-        for (state, snapshot) in self.attention.iter().zip(snapshots) {
-            state.capture_rollback_snapshot(ctx, snapshot, draft_abs_pos)?;
+        for (layer_idx, (state, snapshot)) in self.attention.iter().zip(snapshots).enumerate() {
+            let pool = kv_adapter.layer_mut(layer_idx)?;
+            state.capture_rollback_snapshot(ctx, pool, snapshot, draft_abs_pos)?;
         }
         Ok(())
     }
@@ -563,6 +560,7 @@ impl Dsv4SlotState {
     pub(crate) fn restore_spec_rollback(
         &mut self,
         ctx: &DeviceContext,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         draft_abs_pos: usize,
     ) -> Result<()> {
         let snapshots = self
@@ -575,8 +573,9 @@ impl Dsv4SlotState {
             snapshots.len(),
             self.attention.len()
         );
-        for (state, snapshot) in self.attention.iter_mut().zip(snapshots) {
-            state.restore_rollback_snapshot(ctx, snapshot, draft_abs_pos)?;
+        for (layer_idx, (state, snapshot)) in self.attention.iter_mut().zip(snapshots).enumerate() {
+            let pool = kv_adapter.layer_mut(layer_idx)?;
+            state.restore_rollback_snapshot(ctx, pool, snapshot, draft_abs_pos)?;
         }
         Ok(())
     }
@@ -737,8 +736,43 @@ impl Dsv4Model {
         })
     }
 
-    pub(crate) fn new_slot_state(&self, max_seq_len: usize) -> Result<Dsv4SlotState> {
-        Dsv4SlotState::new(self, max_seq_len)
+    pub(crate) fn new_kv_adapter(
+        &self,
+        max_seq_len: usize,
+        num_slots: usize,
+    ) -> Result<crate::attention::Dsv4KvAdapter> {
+        let mut specs = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let local_width = layer.attention.wq_b.rows;
+            ensure!(
+                local_width.is_multiple_of(self.config.head_dim),
+                "DSv4 attention pool local width {local_width} is not a multiple of head_dim {}",
+                self.config.head_dim
+            );
+            specs.push((
+                layer.mode,
+                layer.compress_ratio,
+                local_width / self.config.head_dim,
+            ));
+        }
+        crate::attention::Dsv4KvAdapter::new(
+            &self.ctx,
+            &self.config,
+            &specs,
+            max_seq_len,
+            &self.kv_arena,
+            self.tp.config().world_size,
+            num_slots,
+        )
+    }
+
+    pub(crate) fn new_slot_state(
+        &self,
+        max_seq_len: usize,
+        slot_idx: usize,
+        kv_adapter: &crate::attention::Dsv4KvAdapter,
+    ) -> Result<Dsv4SlotState> {
+        Dsv4SlotState::new(self, max_seq_len, slot_idx, kv_adapter)
     }
 
     pub(crate) fn truncate_slot(&self, slot: &mut Dsv4SlotState, new_len: usize) -> Result<()> {
@@ -773,17 +807,19 @@ impl Dsv4Model {
     pub(crate) fn forward_tokens(
         &self,
         slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         tokens: &[u32],
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
     ) -> Result<u32> {
-        self.forward_tokens_impl(slot, tokens, start_pos, params, position, None)
+        self.forward_tokens_impl(slot, kv_adapter, tokens, start_pos, params, position, None)
     }
 
     pub(crate) fn forward_tokens_with_hidden(
         &self,
         slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         tokens: &[u32],
         start_pos: usize,
         params: &SamplingParams,
@@ -793,6 +829,7 @@ impl Dsv4Model {
             DeviceVec::zeros(&self.ctx, self.config.hidden_size * self.config.hc_mult)?;
         let token = self.forward_tokens_impl(
             slot,
+            kv_adapter,
             tokens,
             start_pos,
             params,
@@ -805,6 +842,7 @@ impl Dsv4Model {
     fn forward_tokens_impl(
         &self,
         slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         tokens: &[u32],
         start_pos: usize,
         params: &SamplingParams,
@@ -821,10 +859,13 @@ impl Dsv4Model {
             && use_gpu_router
             && !use_deepep_transport
         {
-            return self.forward_tokens_decode_graph(slot, tokens[0], start_pos, params, position);
+            return self.forward_tokens_decode_graph(
+                slot, kv_adapter, tokens[0], start_pos, params, position,
+            );
         }
 
-        let (stream, mut keepalive) = self.forward_tokens_stream_impl(slot, tokens, start_pos)?;
+        let (stream, mut keepalive) =
+            self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos)?;
         if let Some(out) = last_hidden_out.as_deref_mut() {
             self.capture_mtp_stream_hidden(&stream, seq_len - 1, out, &mut keepalive)?;
         }
@@ -844,6 +885,7 @@ impl Dsv4Model {
     pub(crate) fn forward_tokens_verify(
         &self,
         slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         tokens: &[u32],
         start_pos: usize,
         position: u64,
@@ -860,7 +902,7 @@ impl Dsv4Model {
             let row_start = start_pos + row;
             let row_position = position + row as u64;
             let (stream, mut keepalive) =
-                self.forward_tokens_stream_impl(slot, &[token_id], row_start)?;
+                self.forward_tokens_stream_impl(slot, kv_adapter, &[token_id], row_start)?;
             let mut row_hidden =
                 DeviceVec::zeros(&self.ctx, self.config.hidden_size * self.config.hc_mult)?;
             self.capture_mtp_stream_hidden(&stream, 0, &mut row_hidden, &mut keepalive)?;
@@ -883,7 +925,7 @@ impl Dsv4Model {
                     "spec_after_pending_before_draft",
                     draft_abs_pos,
                 )?;
-                slot.capture_spec_rollback(&self.ctx, draft_abs_pos)?;
+                slot.capture_spec_rollback(&self.ctx, kv_adapter, draft_abs_pos)?;
             }
         }
         Ok((argmax_tokens, hiddens))
@@ -974,6 +1016,7 @@ impl Dsv4Model {
     fn forward_tokens_stream_impl(
         &self,
         slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
@@ -1073,6 +1116,7 @@ impl Dsv4Model {
             {
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn");
                 crate::stage_profile::profile(ctx, "dsv4/stage/mla_attn", || {
+                    let layer_pool = kv_adapter.layer_mut(layer_idx)?;
                     crate::attention::mla_attention(
                         &self.ctx,
                         &self.config,
@@ -1082,6 +1126,7 @@ impl Dsv4Model {
                         layer_idx,
                         &normed,
                         &mut slot.attention[layer_idx],
+                        layer_pool,
                         start_pos,
                         start_pos_device,
                         &self.tp,
@@ -1305,6 +1350,7 @@ impl Dsv4Model {
     pub(crate) fn mtp_forward(
         &self,
         slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         h_prev: &DeviceVec,
         next_token: u32,
         position: u64,
@@ -1386,6 +1432,7 @@ impl Dsv4Model {
                 slot_attention_len
             )
         })?;
+        let target_attention_pool = kv_adapter.layer_mut(target_layer_idx)?;
         let stream = self.run_mtp_transformer_layer(
             mtp,
             stream,
@@ -1393,6 +1440,7 @@ impl Dsv4Model {
             position as usize,
             target_layer_idx,
             target_attention_state,
+            target_attention_pool,
         )?;
 
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
@@ -1453,6 +1501,7 @@ impl Dsv4Model {
         start_pos: usize,
         target_layer_idx: usize,
         target_attention_state: &mut crate::attention::Dsv4LayerAttentionState,
+        target_attention_pool: &mut crate::attention::Dsv4LayerKvLayout,
     ) -> Result<HiddenStates> {
         let layer = &mtp.layer;
         let ctx = &self.ctx;
@@ -1498,6 +1547,7 @@ impl Dsv4Model {
             target_layer_idx,
             &attn_normed,
             target_attention_state,
+            target_attention_pool,
             start_pos,
             Some(&start_pos_device),
             &self.tp,
@@ -1571,6 +1621,7 @@ impl Dsv4Model {
     fn forward_tokens_decode_graph(
         &self,
         slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         token: u32,
         start_pos: usize,
         params: &SamplingParams,
@@ -1632,6 +1683,7 @@ impl Dsv4Model {
                     ..
                 } = current;
                 let attn_state = &mut slot.attention[layer_idx];
+                let attn_pool = kv_adapter.layer_mut(layer_idx)?;
                 attn_graph.run_or_capture(|| {
                     crate::ops::embedding_batch(
                         &self.ctx,
@@ -1677,6 +1729,7 @@ impl Dsv4Model {
                         layer_idx,
                         attn_normed,
                         attn_state,
+                        attn_pool,
                         start_pos,
                         Some(&slot.start_pos_device),
                         &self.tp,
@@ -1697,6 +1750,7 @@ impl Dsv4Model {
                     ..
                 } = current;
                 let attn_state = &mut slot.attention[layer_idx];
+                let attn_pool = kv_adapter.layer_mut(layer_idx)?;
                 attn_graph.run_or_capture(|| {
                     crate::ops::add_batch(
                         &self.ctx,
@@ -1745,6 +1799,7 @@ impl Dsv4Model {
                         layer_idx,
                         attn_normed,
                         attn_state,
+                        attn_pool,
                         start_pos,
                         Some(&slot.start_pos_device),
                         &self.tp,
