@@ -1740,8 +1740,12 @@ mod tests {
             std::env::set_var("ARLE_DSV4_DECODE_GRAPH", "0");
         }
 
-        let mut exec = infer_cuda::CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1)
-            .map_err(|e| anyhow::anyhow!("from_dsv4_fp8_safetensors failed: {e:#}"))?;
+        let mut exec = infer_cuda::CudaExecutor::from_dsv4_fp8_safetensors(
+            &model_path,
+            1,
+            infer_cuda::dsv4_max_seq_len(),
+        )
+        .map_err(|e| anyhow::anyhow!("from_dsv4_fp8_safetensors failed: {e:#}"))?;
 
         // Reference = scalar bf16.
         let ref_case = cases
