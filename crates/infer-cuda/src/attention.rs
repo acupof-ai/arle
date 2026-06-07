@@ -11,6 +11,7 @@ use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates
 use cuda_kernels::tensor::{WeightFormat, cache_ptr};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
+use infer_seam::{KvBatchDescriptor, KvBatchRowKind};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicI8, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -264,8 +265,363 @@ fn dsv4_checksum_hidden(
     dsv4_checksum_bf16_slice(ctx, &hidden.data)
 }
 
+pub(crate) struct Dsv4KvAdapter {
+    layers: Vec<Dsv4LayerKvLayout>,
+    num_slots: usize,
+    slot_epochs: Vec<Option<u64>>,
+}
+
+pub(crate) struct Dsv4LayerKvLayout {
+    flashmla_fp8_kv_pool: Option<CudaSlice<u8>>,
+    dsa_key_cache: Option<CudaSlice<u8>>,
+    flashmla_slot_bytes: usize,
+    dsa_slot_bytes: usize,
+    num_slots: usize,
+}
+
+pub(crate) trait ModelKvAdapter {
+    type BatchView;
+
+    fn prepare_kv_batch(&mut self, desc: &KvBatchDescriptor) -> Result<Self::BatchView>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Dsv4KvBatchView {
+    pub(crate) rows: Vec<Dsv4KvBatchRowView>,
+    pub(crate) flat_page_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Dsv4KvBatchRowView {
+    pub(crate) slot: usize,
+    pub(crate) kind: KvBatchRowKind,
+    pub(crate) seq_len: usize,
+    pub(crate) append_pos: usize,
+    pub(crate) append_len: usize,
+    #[allow(dead_code)]
+    pub(crate) slot_epoch: u64,
+    pub(crate) page_range: std::ops::Range<usize>,
+}
+
+impl Dsv4KvAdapter {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        layer_specs: &[(DeepSeekV4AttentionMode, usize, usize)],
+        max_seq_len: usize,
+        kv_arena: &Dsv4MlaKvArena,
+        tp_world: usize,
+        num_slots: usize,
+    ) -> Result<Self> {
+        ensure!(num_slots > 0, "DSv4 attention pool needs at least one slot");
+        let mut layers = Vec::with_capacity(layer_specs.len());
+        for &(mode, compress_ratio, local_heads) in layer_specs {
+            layers.push(Dsv4LayerKvLayout::new(
+                ctx,
+                config,
+                mode,
+                compress_ratio,
+                max_seq_len,
+                kv_arena,
+                local_heads,
+                tp_world,
+                num_slots,
+            )?);
+        }
+        Ok(Self {
+            layers,
+            num_slots,
+            slot_epochs: vec![None; num_slots],
+        })
+    }
+
+    pub(crate) fn layer_mut(&mut self, layer_idx: usize) -> Result<&mut Dsv4LayerKvLayout> {
+        let len = self.layers.len();
+        self.layers
+            .get_mut(layer_idx)
+            .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))
+    }
+
+    pub(crate) fn layer(&self, layer_idx: usize) -> Result<&Dsv4LayerKvLayout> {
+        let len = self.layers.len();
+        self.layers
+            .get(layer_idx)
+            .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))
+    }
+}
+
+impl ModelKvAdapter for Dsv4KvAdapter {
+    type BatchView = Dsv4KvBatchView;
+
+    fn prepare_kv_batch(&mut self, desc: &KvBatchDescriptor) -> Result<Self::BatchView> {
+        let mut rows = Vec::with_capacity(desc.rows.len());
+        for (idx, row) in desc.rows.iter().enumerate() {
+            ensure!(
+                row.slot < self.num_slots,
+                "DSv4 KV batch row {idx} slot {} outside adapter slots {}",
+                row.slot,
+                self.num_slots
+            );
+            ensure!(
+                row.page_range.end <= desc.flat_page_ids.len(),
+                "DSv4 KV batch row {idx} page range {:?} outside flat page len {}",
+                row.page_range,
+                desc.flat_page_ids.len()
+            );
+            ensure!(
+                row.token_range.end <= desc.flat_token_ids.len(),
+                "DSv4 KV batch row {idx} token range {:?} outside flat token len {}",
+                row.token_range,
+                desc.flat_token_ids.len()
+            );
+            ensure!(
+                row.page_range.start < row.page_range.end,
+                "DSv4 KV batch row {idx} has empty page range"
+            );
+            self.slot_epochs[row.slot] = Some(row.slot_epoch);
+            rows.push(Dsv4KvBatchRowView {
+                slot: row.slot,
+                kind: row.kind,
+                seq_len: row.seq_len,
+                append_pos: row.append_pos,
+                append_len: row.append_len,
+                slot_epoch: row.slot_epoch,
+                page_range: row.page_range.clone(),
+            });
+        }
+
+        Ok(Dsv4KvBatchView {
+            rows,
+            flat_page_ids: desc.flat_page_ids.clone(),
+        })
+    }
+}
+
+impl Dsv4LayerKvLayout {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        mode: DeepSeekV4AttentionMode,
+        compress_ratio: usize,
+        max_seq_len: usize,
+        kv_arena: &Dsv4MlaKvArena,
+        local_heads: usize,
+        tp_world: usize,
+        num_slots: usize,
+    ) -> Result<Self> {
+        let flashmla_slot_bytes = if dsv4_flashmla_decode_alloc_enabled()? {
+            let shape = Dsv4FlashMlaDecodeShape::new(
+                config,
+                mode,
+                compress_ratio,
+                max_seq_len,
+                kv_arena,
+                local_heads,
+                tp_world,
+            )?;
+            shape
+                .total_blocks
+                .checked_mul(kv_arena.page_block_size)
+                .and_then(|rows| rows.checked_mul(kv_arena.bytes_per_token))
+                .ok_or_else(|| anyhow!("DSv4 shared FlashMLA pool byte size overflow"))?
+        } else {
+            0
+        };
+        let flashmla_fp8_kv_pool = if flashmla_slot_bytes > 0 {
+            Some(
+                ctx.stream
+                    .alloc_zeros::<u8>(
+                        flashmla_slot_bytes
+                            .checked_mul(num_slots)
+                            .ok_or_else(|| anyhow!("DSv4 shared FlashMLA pool total overflow"))?,
+                    )
+                    .map_err(|e| anyhow!("DSv4 shared FlashMLA pool alloc failed: {e}"))?,
+            )
+        } else {
+            None
+        };
+
+        let dsa_slot_bytes =
+            if mode == DeepSeekV4AttentionMode::CompressedSparse && dsv4_dsa_official_enabled()? {
+                dsv4_dsa_key_cache_bytes(config, compress_ratio, max_seq_len)?
+            } else {
+                0
+            };
+        let dsa_key_cache = if dsa_slot_bytes > 0 {
+            Some(
+                ctx.stream
+                    .alloc_zeros::<u8>(
+                        dsa_slot_bytes
+                            .checked_mul(num_slots)
+                            .ok_or_else(|| anyhow!("DSv4 shared DSA key-cache total overflow"))?,
+                    )
+                    .map_err(|e| anyhow!("DSv4 shared DSA key-cache alloc failed: {e}"))?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            flashmla_fp8_kv_pool,
+            dsa_key_cache,
+            flashmla_slot_bytes,
+            dsa_slot_bytes,
+            num_slots,
+        })
+    }
+
+    fn slot_range(
+        slot_idx: usize,
+        slot_bytes: usize,
+        num_slots: usize,
+    ) -> Result<std::ops::Range<usize>> {
+        ensure!(
+            slot_idx < num_slots,
+            "DSv4 attention pool slot {slot_idx} outside num_slots {num_slots}"
+        );
+        let start = slot_idx
+            .checked_mul(slot_bytes)
+            .ok_or_else(|| anyhow!("DSv4 attention pool slot offset overflow"))?;
+        let end = start
+            .checked_add(slot_bytes)
+            .ok_or_else(|| anyhow!("DSv4 attention pool slot end overflow"))?;
+        Ok(start..end)
+    }
+
+    fn flashmla_slot_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
+        Self::slot_range(slot_idx, self.flashmla_slot_bytes, self.num_slots)
+    }
+
+    fn dsa_slot_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
+        Self::slot_range(slot_idx, self.dsa_slot_bytes, self.num_slots)
+    }
+
+    fn reset_flashmla_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        flash: &Dsv4FlashMlaDecodeState,
+    ) -> Result<()> {
+        let range = self.flashmla_slot_range(flash.slot_idx)?;
+        let pool = self
+            .flashmla_fp8_kv_pool
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+        ensure!(
+            range.end <= pool.len() && range.len() == flash.fp8_kv_pool_len,
+            "DSv4 FlashMLA shared pool range {:?} invalid for pool_len={} slot_len={}",
+            range,
+            pool.len(),
+            flash.fp8_kv_pool_len
+        );
+        let mut view = pool.slice_mut(range);
+        ctx.stream
+            .memset_zeros(&mut view)
+            .map_err(|e| anyhow!("DSv4 shared FlashMLA slot reset failed: {e}"))?;
+        Ok(())
+    }
+
+    fn reset_dsa_slot(&mut self, ctx: &DeviceContext, dsa: &Dsv4DsaOfficialState) -> Result<()> {
+        let range = self.dsa_slot_range(dsa.slot_idx)?;
+        let pool = self
+            .dsa_key_cache
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 DSA shared key-cache missing"))?;
+        ensure!(
+            range.end <= pool.len() && range.len() == dsa.key_cache_len,
+            "DSv4 DSA shared key-cache range {:?} invalid for pool_len={} slot_len={}",
+            range,
+            pool.len(),
+            dsa.key_cache_len
+        );
+        let mut view = pool.slice_mut(range);
+        ctx.stream
+            .memset_zeros(&mut view)
+            .map_err(|e| anyhow!("DSv4 shared DSA key-cache reset failed: {e}"))?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Dsv4FlashMlaDecodeShape {
+    sw_blocks: usize,
+    comp_blocks: usize,
+    max_compressed_keys: usize,
+    topk_unified: usize,
+    total_blocks: usize,
+    h_q: usize,
+}
+
+impl Dsv4FlashMlaDecodeShape {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        config: &DeepSeekV4Config,
+        mode: DeepSeekV4AttentionMode,
+        compress_ratio: usize,
+        max_seq_len: usize,
+        kv_arena: &Dsv4MlaKvArena,
+        local_heads: usize,
+        tp_world: usize,
+    ) -> Result<Self> {
+        ensure!(
+            config.head_dim == 512 && kv_arena.bytes_per_token == 584,
+            "DSv4 FlashMLA decode only wires MODEL1 head_dim=512 bytes/token=584"
+        );
+        ensure!(
+            local_heads > 0 && tp_world > 0,
+            "DSv4 FlashMLA decode requires non-zero local_heads and tp_world"
+        );
+        let h_q = local_heads
+            .checked_mul(tp_world)
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA h_q overflow"))?;
+        ensure!(
+            matches!(h_q, 64 | 128),
+            "DSv4 FlashMLA decode requires global h_q 64 or 128, got {h_q}"
+        );
+        ensure!(
+            kv_arena.page_block_size == 64,
+            "DSv4 FlashMLA decode requires page_block_size=64"
+        );
+        let sw_blocks = config.sliding_window.div_ceil(kv_arena.page_block_size);
+        let compressed_rows = if mode == DeepSeekV4AttentionMode::SlidingWindow {
+            0
+        } else {
+            ensure!(
+                compress_ratio > 0,
+                "DSv4 FlashMLA compressed decode requires non-zero ratio"
+            );
+            max_seq_len.div_ceil(compress_ratio).max(1)
+        };
+        let comp_blocks = compressed_rows.div_ceil(kv_arena.page_block_size);
+        let max_compressed_keys = match mode {
+            DeepSeekV4AttentionMode::SlidingWindow => 0,
+            DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
+            DeepSeekV4AttentionMode::HybridCompressed => compressed_rows.div_ceil(128) * 128,
+        };
+        let topk_unified = config
+            .sliding_window
+            .checked_add(max_compressed_keys)
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA topk_unified overflow"))?;
+        ensure!(
+            topk_unified.is_multiple_of(128),
+            "DSv4 FlashMLA topk_unified {topk_unified} must be multiple of 128"
+        );
+        let total_blocks = sw_blocks
+            .checked_add(comp_blocks)
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA total block overflow"))?;
+        Ok(Self {
+            sw_blocks,
+            comp_blocks,
+            max_compressed_keys,
+            topk_unified,
+            total_blocks,
+            h_q,
+        })
+    }
+}
+
 struct Dsv4FlashMlaDecodeState {
-    fp8_kv_pool: CudaSlice<u8>,
+    slot_idx: usize,
+    fp8_kv_pool_len: usize,
     sw_blocks: usize,
     comp_blocks: usize,
     max_compressed_keys: usize,
@@ -304,61 +660,32 @@ impl Dsv4FlashMlaDecodeState {
         kv_arena: &Dsv4MlaKvArena,
         local_heads: usize,
         tp_world: usize,
+        slot_idx: usize,
+        pool: &Dsv4LayerKvLayout,
     ) -> Result<Self> {
+        let shape = Dsv4FlashMlaDecodeShape::new(
+            config,
+            mode,
+            compress_ratio,
+            max_seq_len,
+            kv_arena,
+            local_heads,
+            tp_world,
+        )?;
+        let range = pool.flashmla_slot_range(slot_idx)?;
         ensure!(
-            config.head_dim == 512 && kv_arena.bytes_per_token == 584,
-            "DSv4 FlashMLA decode only wires MODEL1 head_dim=512 bytes/token=584"
+            pool.flashmla_fp8_kv_pool.is_some()
+                && range.len() == pool.flashmla_slot_bytes
+                && range.len() > 0,
+            "DSv4 FlashMLA shared slot band missing/invalid for slot {slot_idx}"
         );
-        ensure!(
-            local_heads > 0 && tp_world > 0,
-            "DSv4 FlashMLA decode requires non-zero local_heads and tp_world"
-        );
-        let h_q = local_heads
-            .checked_mul(tp_world)
-            .ok_or_else(|| anyhow!("DSv4 FlashMLA h_q overflow"))?;
-        ensure!(
-            matches!(h_q, 64 | 128),
-            "DSv4 FlashMLA decode requires global h_q 64 or 128, got {h_q}"
-        );
-        ensure!(
-            kv_arena.page_block_size == 64,
-            "DSv4 FlashMLA decode requires page_block_size=64"
-        );
-
-        let sw_blocks = config.sliding_window.div_ceil(kv_arena.page_block_size);
-        let compressed_rows = if mode == DeepSeekV4AttentionMode::SlidingWindow {
-            0
-        } else {
-            ensure!(
-                compress_ratio > 0,
-                "DSv4 FlashMLA compressed decode requires non-zero ratio"
-            );
-            max_seq_len.div_ceil(compress_ratio).max(1)
-        };
-        let comp_blocks = compressed_rows.div_ceil(kv_arena.page_block_size);
-        let max_compressed_keys = match mode {
-            DeepSeekV4AttentionMode::SlidingWindow => 0,
-            DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
-            DeepSeekV4AttentionMode::HybridCompressed => compressed_rows.div_ceil(128) * 128,
-        };
-        let topk_unified = config
-            .sliding_window
-            .checked_add(max_compressed_keys)
-            .ok_or_else(|| anyhow!("DSv4 FlashMLA topk_unified overflow"))?;
-        ensure!(
-            topk_unified.is_multiple_of(128),
-            "DSv4 FlashMLA topk_unified {topk_unified} must be multiple of 128"
-        );
-        let total_blocks = sw_blocks
-            .checked_add(comp_blocks)
-            .ok_or_else(|| anyhow!("DSv4 FlashMLA total block overflow"))?;
 
         let mut num_sm_parts = 0_i32;
         let mut fixed_overhead_num_blocks = 0_i32;
         let mut block_size_topk = 0_i32;
         unsafe {
             ffi::arle_flashmla_sm90_sparse_decode_get_meta(
-                h_q as i32,
+                shape.h_q as i32,
                 DSV4_FLASHMLA_S_Q as i32,
                 DSV4_FLASHMLA_MODEL1,
                 &mut num_sm_parts,
@@ -369,19 +696,25 @@ impl Dsv4FlashMlaDecodeState {
             .map_err(|e| anyhow!("DSv4 FlashMLA decode meta failed: {e}"))?;
         }
         let num_sm_parts_max = (num_sm_parts as usize).max(256);
-        let h_q_d = h_q
+        let h_q_d = shape
+            .h_q
             .checked_mul(config.head_dim)
             .ok_or_else(|| anyhow!("DSv4 FlashMLA h_q*d overflow"))?;
         let accum_rows = num_sm_parts_max + 1;
         let sw_slots = config.sliding_window;
-        let comp_slots = compressed_rows.max(1);
+        let comp_slots = if mode == DeepSeekV4AttentionMode::SlidingWindow {
+            1
+        } else {
+            max_seq_len.div_ceil(compress_ratio).max(1)
+        };
 
         Ok(Self {
-            fp8_kv_pool: kv_arena.alloc_fp8_arena(ctx, total_blocks)?,
-            sw_blocks,
-            comp_blocks,
-            max_compressed_keys,
-            topk_unified,
+            slot_idx,
+            fp8_kv_pool_len: range.len(),
+            sw_blocks: shape.sw_blocks,
+            comp_blocks: shape.comp_blocks,
+            max_compressed_keys: shape.max_compressed_keys,
+            topk_unified: shape.topk_unified,
             fp8_kv_sw_bootstrapped: false,
             fp8_kv_comp_packed_rows: 0,
             sw_bulk_block_ids: ctx.stream.alloc_zeros::<i32>(sw_slots)?,
@@ -390,10 +723,10 @@ impl Dsv4FlashMlaDecodeState {
             one_row: ctx.stream.alloc_zeros::<i32>(1)?,
             comp_block_ids: ctx.stream.alloc_zeros::<i32>(comp_slots)?,
             comp_rows: ctx.stream.alloc_zeros::<i32>(comp_slots)?,
-            indices: ctx.stream.alloc_zeros::<i32>(topk_unified)?,
+            indices: ctx.stream.alloc_zeros::<i32>(shape.topk_unified)?,
             topk_length: ctx.stream.alloc_zeros::<i32>(1)?,
-            lse_out: ctx.stream.alloc_zeros::<f32>(h_q)?,
-            lse_accum: ctx.stream.alloc_zeros::<f32>(accum_rows * h_q)?,
+            lse_out: ctx.stream.alloc_zeros::<f32>(shape.h_q)?,
+            lse_accum: ctx.stream.alloc_zeros::<f32>(accum_rows * shape.h_q)?,
             o_accum: ctx.stream.alloc_zeros::<f32>(accum_rows * h_q_d)?,
             sched_meta: ctx.stream.alloc_zeros::<i32>(num_sm_parts_max * 8)?,
             num_splits: ctx.stream.alloc_zeros::<i32>(2)?,
@@ -406,12 +739,10 @@ impl Dsv4FlashMlaDecodeState {
         })
     }
 
-    fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+    fn reset(&mut self, ctx: &DeviceContext, pool: &mut Dsv4LayerKvLayout) -> Result<()> {
         self.fp8_kv_sw_bootstrapped = false;
         self.fp8_kv_comp_packed_rows = 0;
-        ctx.stream
-            .memset_zeros(&mut self.fp8_kv_pool)
-            .map_err(|e| anyhow!("DSv4 FlashMLA FP8 KV reset failed: {e}"))?;
+        pool.reset_flashmla_slot(ctx, self)?;
         Ok(())
     }
 }
@@ -539,7 +870,8 @@ impl Dsv4PrefillDeepGemmLinearScratch {
 }
 
 struct Dsv4DsaOfficialState {
-    key_cache: CudaSlice<u8>,
+    slot_idx: usize,
+    key_cache_len: usize,
     rotated_keys: CudaSlice<half::bf16>,
     cache_locs: CudaSlice<i64>,
     q_fp8: CudaSlice<u8>,
@@ -567,6 +899,8 @@ impl Dsv4DsaOfficialState {
         config: &DeepSeekV4Config,
         compress_ratio: usize,
         max_seq_len: usize,
+        slot_idx: usize,
+        pool: &Dsv4LayerKvLayout,
     ) -> Result<Self> {
         ensure!(
             config.index_head_dim == 128,
@@ -581,9 +915,15 @@ impl Dsv4DsaOfficialState {
         let compressed_capacity = max_seq_len.div_ceil(compress_ratio).max(1);
         let page_size = 64usize;
         let num_pages = compressed_capacity.div_ceil(page_size).max(1);
-        let key_cache_bytes = num_pages
-            .checked_mul(page_size * (config.index_head_dim + std::mem::size_of::<f32>()))
-            .ok_or_else(|| anyhow!("DSv4 official DSA key cache size overflow"))?;
+        let key_cache_bytes = dsv4_dsa_key_cache_bytes(config, compress_ratio, max_seq_len)?;
+        let range = pool.dsa_slot_range(slot_idx)?;
+        ensure!(
+            pool.dsa_key_cache.is_some()
+                && range.len() == key_cache_bytes
+                && range.len() == pool.dsa_slot_bytes
+                && range.len() > 0,
+            "DSv4 official DSA shared slot band missing/invalid for slot {slot_idx}"
+        );
         let max_tokens = max_seq_len.max(1);
         let q_elems = max_tokens
             .checked_mul(config.index_n_heads)
@@ -610,10 +950,8 @@ impl Dsv4DsaOfficialState {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(78);
         Ok(Self {
-            key_cache: ctx
-                .stream
-                .alloc_zeros::<u8>(key_cache_bytes)
-                .map_err(|e| anyhow!("DSv4 official DSA key cache alloc failed: {e}"))?,
+            slot_idx,
+            key_cache_len: key_cache_bytes,
             rotated_keys: ctx
                 .stream
                 .alloc_zeros::<half::bf16>(compressed_capacity * config.index_head_dim)
@@ -669,13 +1007,24 @@ impl Dsv4DsaOfficialState {
         })
     }
 
-    fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+    fn reset(&mut self, ctx: &DeviceContext, pool: &mut Dsv4LayerKvLayout) -> Result<()> {
         self.packed_rows = 0;
-        ctx.stream
-            .memset_zeros(&mut self.key_cache)
-            .map_err(|e| anyhow!("DSv4 official DSA key cache reset failed: {e}"))?;
+        pool.reset_dsa_slot(ctx, self)?;
         Ok(())
     }
+}
+
+fn dsv4_dsa_key_cache_bytes(
+    config: &DeepSeekV4Config,
+    compress_ratio: usize,
+    max_seq_len: usize,
+) -> Result<usize> {
+    let compressed_capacity = max_seq_len.div_ceil(compress_ratio).max(1);
+    let page_size = 64usize;
+    let num_pages = compressed_capacity.div_ceil(page_size).max(1);
+    num_pages
+        .checked_mul(page_size * (config.index_head_dim + std::mem::size_of::<f32>()))
+        .ok_or_else(|| anyhow!("DSv4 official DSA key cache size overflow"))
 }
 
 fn dsv4_dsa_freqs_cis_real(
@@ -839,6 +1188,7 @@ impl Dsv4LayerAttentionSnapshot {
     fn capture_fp8_sw(
         &mut self,
         ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
         flash: &Dsv4FlashMlaDecodeState,
         draft_abs_pos: usize,
     ) -> Result<()> {
@@ -849,26 +1199,30 @@ impl Dsv4LayerAttentionSnapshot {
         let Some(slot) = &mut self.fp8_sw_slot else {
             return Ok(());
         };
+        let range = pool.flashmla_slot_range(flash.slot_idx)?;
+        let pool_buf = pool
+            .flashmla_fp8_kv_pool
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 rollback FP8 shared pool missing"))?;
         ensure!(
-            data_offset + self.fp8_token_data_bytes <= flash.fp8_kv_pool.len()
-                && scale_offset + self.fp8_scale_bytes <= flash.fp8_kv_pool.len()
+            data_offset + self.fp8_token_data_bytes <= range.len()
+                && scale_offset + self.fp8_scale_bytes <= range.len()
                 && slot.len() == self.fp8_bytes_per_token,
             "DSv4 rollback FP8 SW slot out of range data={} scale={} pool_len={} slot_len={}",
             data_offset,
             scale_offset,
-            flash.fp8_kv_pool.len(),
+            range.len(),
             slot.len()
         );
-        let src_data = flash
-            .fp8_kv_pool
-            .slice(data_offset..data_offset + self.fp8_token_data_bytes);
+        let src_data = pool_buf.slice(
+            range.start + data_offset..range.start + data_offset + self.fp8_token_data_bytes,
+        );
         let mut dst_data = slot.slice_mut(0..self.fp8_token_data_bytes);
         ctx.stream
             .memcpy_dtod(&src_data, &mut dst_data)
             .map_err(|e| anyhow!("DSv4 rollback FP8 SW data snapshot failed: {e}"))?;
-        let src_scale = flash
-            .fp8_kv_pool
-            .slice(scale_offset..scale_offset + self.fp8_scale_bytes);
+        let src_scale = pool_buf
+            .slice(range.start + scale_offset..range.start + scale_offset + self.fp8_scale_bytes);
         let mut dst_scale = slot.slice_mut(self.fp8_token_data_bytes..self.fp8_bytes_per_token);
         ctx.stream
             .memcpy_dtod(&src_scale, &mut dst_scale)
@@ -880,6 +1234,7 @@ impl Dsv4LayerAttentionSnapshot {
     fn restore_fp8_sw(
         &self,
         ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
         flash: &mut Dsv4FlashMlaDecodeState,
         draft_abs_pos: usize,
     ) -> Result<()> {
@@ -896,27 +1251,32 @@ impl Dsv4LayerAttentionSnapshot {
             self.draft_abs_pos,
             draft_abs_pos
         );
+        let range = pool.flashmla_slot_range(flash.slot_idx)?;
+        let pool_buf = pool
+            .flashmla_fp8_kv_pool
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 rollback FP8 shared pool missing"))?;
         ensure!(
-            data_offset + self.fp8_token_data_bytes <= flash.fp8_kv_pool.len()
-                && scale_offset + self.fp8_scale_bytes <= flash.fp8_kv_pool.len()
+            data_offset + self.fp8_token_data_bytes <= range.len()
+                && scale_offset + self.fp8_scale_bytes <= range.len()
                 && slot.len() == self.fp8_bytes_per_token,
             "DSv4 rollback FP8 SW restore out of range data={} scale={} pool_len={} slot_len={}",
             data_offset,
             scale_offset,
-            flash.fp8_kv_pool.len(),
+            range.len(),
             slot.len()
         );
         let src_data = slot.slice(0..self.fp8_token_data_bytes);
-        let mut dst_data = flash
-            .fp8_kv_pool
-            .slice_mut(data_offset..data_offset + self.fp8_token_data_bytes);
+        let mut dst_data = pool_buf.slice_mut(
+            range.start + data_offset..range.start + data_offset + self.fp8_token_data_bytes,
+        );
         ctx.stream
             .memcpy_dtod(&src_data, &mut dst_data)
             .map_err(|e| anyhow!("DSv4 rollback FP8 SW data restore failed: {e}"))?;
         let src_scale = slot.slice(self.fp8_token_data_bytes..self.fp8_bytes_per_token);
-        let mut dst_scale = flash
-            .fp8_kv_pool
-            .slice_mut(scale_offset..scale_offset + self.fp8_scale_bytes);
+        let mut dst_scale = pool_buf.slice_mut(
+            range.start + scale_offset..range.start + scale_offset + self.fp8_scale_bytes,
+        );
         ctx.stream
             .memcpy_dtod(&src_scale, &mut dst_scale)
             .map_err(|e| anyhow!("DSv4 rollback FP8 SW scale restore failed: {e}"))?;
@@ -937,6 +1297,8 @@ impl Dsv4LayerAttentionState {
         kv_arena: &Dsv4MlaKvArena,
         local_heads: usize,
         tp_world: usize,
+        slot_idx: usize,
+        pool: &Dsv4LayerKvLayout,
     ) -> Result<Self> {
         let sw_len = config.sliding_window * config.head_dim;
         ensure!(
@@ -982,6 +1344,8 @@ impl Dsv4LayerAttentionState {
                 kv_arena,
                 local_heads,
                 tp_world,
+                slot_idx,
+                pool,
             )?)
         } else {
             None
@@ -1007,6 +1371,8 @@ impl Dsv4LayerAttentionState {
                     config,
                     compress_ratio,
                     max_seq_len,
+                    slot_idx,
+                    pool,
                 )?)
             } else {
                 None
@@ -1022,7 +1388,11 @@ impl Dsv4LayerAttentionState {
         })
     }
 
-    pub(crate) fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+    pub(crate) fn reset(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+    ) -> Result<()> {
         ctx.stream
             .memset_zeros(&mut self.sw_window_cache)
             .map_err(|e| anyhow::anyhow!("DSv4 SW window cache reset failed: {e}"))?;
@@ -1033,10 +1403,10 @@ impl Dsv4LayerAttentionState {
             indexer.reset(ctx)?;
         }
         if let Some(flashmla) = &mut self.flashmla {
-            flashmla.reset(ctx)?;
+            flashmla.reset(ctx, pool)?;
         }
         if let Some(dsa) = &mut self.dsa_official {
-            dsa.reset(ctx)?;
+            dsa.reset(ctx, pool)?;
         }
         Ok(())
     }
@@ -1099,12 +1469,13 @@ impl Dsv4LayerAttentionState {
     pub(crate) fn capture_rollback_snapshot(
         &self,
         ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
         snapshot: &mut Dsv4LayerAttentionSnapshot,
         draft_abs_pos: usize,
     ) -> Result<()> {
         snapshot.capture_sw(ctx, &self.sw_window_cache, draft_abs_pos)?;
         if let Some(flash) = &self.flashmla {
-            snapshot.capture_fp8_sw(ctx, flash, draft_abs_pos)?;
+            snapshot.capture_fp8_sw(ctx, pool, flash, draft_abs_pos)?;
         }
         match (&self.compressor, &mut snapshot.compressor) {
             (Some(state), Some(snapshot)) => snapshot.capture_from(ctx, state)?,
@@ -1122,12 +1493,13 @@ impl Dsv4LayerAttentionState {
     pub(crate) fn restore_rollback_snapshot(
         &mut self,
         ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
         snapshot: &Dsv4LayerAttentionSnapshot,
         draft_abs_pos: usize,
     ) -> Result<()> {
         snapshot.restore_sw(ctx, &mut self.sw_window_cache, draft_abs_pos)?;
         if let Some(flash) = &mut self.flashmla {
-            snapshot.restore_fp8_sw(ctx, flash, draft_abs_pos)?;
+            snapshot.restore_fp8_sw(ctx, pool, flash, draft_abs_pos)?;
         }
         match (&mut self.compressor, &snapshot.compressor) {
             (Some(state), Some(snapshot)) => snapshot.restore_to(ctx, state)?,
@@ -1678,7 +2050,7 @@ fn run_tilelang_paged(
 // projection (`wo_a → wo_b`).
 //
 // All three modes run through the bf16 correctness core (the perf-optimized
-// FlashMLA sparse path stays gated — `Dsv4MlaKvArena::alloc_fp8_arena`):
+// FlashMLA sparse path stays gated and uses the shared per-layer FP8 KV pool:
 //   - SlidingWindow (`compress_ratio == 0`): Q/K prep RoPE + `dsv4_swa_attention`
 //     over the bf16 SW ring cache, with the output inverse-RoPE fused.
 //   - CompressedSparse (`0 < ratio < 16`): a compressor produces compressed keys,
@@ -2133,6 +2505,7 @@ fn flashmla_mode_int(mode: DeepSeekV4AttentionMode) -> i32 {
 fn flashmla_pack_sw_ring(
     ctx: &DeviceContext,
     flash: &mut Dsv4FlashMlaDecodeState,
+    pool: &mut Dsv4LayerKvLayout,
     window_cache: &CudaSlice<half::bf16>,
     config: &DeepSeekV4Config,
 ) -> Result<()> {
@@ -2154,7 +2527,20 @@ fn flashmla_pack_sw_ring(
         .memcpy_htod(&rows, &mut flash.sw_bulk_rows)
         .map_err(|e| anyhow!("DSv4 FlashMLA SW rows H2D failed: {e}"))?;
     let (window_ptr, _wg) = window_cache.device_ptr(&ctx.stream);
-    let (pool_ptr, _pg) = flash.fp8_kv_pool.device_ptr_mut(&ctx.stream);
+    let range = pool.flashmla_slot_range(flash.slot_idx)?;
+    let pool_buf = pool
+        .flashmla_fp8_kv_pool
+        .as_mut()
+        .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+    ensure!(
+        range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
+        "DSv4 FlashMLA shared SW slot range {:?} invalid pool_len={} slot_len={}",
+        range,
+        pool_buf.len(),
+        flash.fp8_kv_pool_len
+    );
+    let mut pool_view = pool_buf.slice_mut(range);
+    let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
     let nope_ptr = window_ptr as u64;
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
     flash_kv::dsv4_fp8_kv_pack_strided_raw(
@@ -2176,6 +2562,7 @@ fn flashmla_pack_sw_ring(
 fn flashmla_pack_one_sw_token(
     ctx: &DeviceContext,
     flash: &mut Dsv4FlashMlaDecodeState,
+    pool: &mut Dsv4LayerKvLayout,
     k_prepared: &HiddenStates,
     start_pos_device: &CudaSlice<i32>,
     config: &DeepSeekV4Config,
@@ -2195,7 +2582,20 @@ fn flashmla_pack_one_sw_token(
     drop(row_guard);
 
     let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-    let (pool_ptr, _pg) = flash.fp8_kv_pool.device_ptr_mut(&ctx.stream);
+    let range = pool.flashmla_slot_range(flash.slot_idx)?;
+    let pool_buf = pool
+        .flashmla_fp8_kv_pool
+        .as_mut()
+        .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+    ensure!(
+        range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
+        "DSv4 FlashMLA shared one-token slot range {:?} invalid pool_len={} slot_len={}",
+        range,
+        pool_buf.len(),
+        flash.fp8_kv_pool_len
+    );
+    let mut pool_view = pool_buf.slice_mut(range);
+    let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
     let nope_ptr = k_ptr as u64;
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
     flash_kv::dsv4_fp8_kv_pack_strided_raw(
@@ -2215,6 +2615,7 @@ fn flashmla_pack_one_sw_token(
 fn flashmla_pack_compressed_delta(
     ctx: &DeviceContext,
     flash: &mut Dsv4FlashMlaDecodeState,
+    pool: &mut Dsv4LayerKvLayout,
     compressed: Option<&HiddenStates>,
     config: &DeepSeekV4Config,
 ) -> Result<()> {
@@ -2241,7 +2642,20 @@ fn flashmla_pack_compressed_delta(
         .map_err(|e| anyhow!("DSv4 FlashMLA compressed rows H2D failed: {e}"))?;
 
     let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
-    let (pool_ptr, _pg) = flash.fp8_kv_pool.device_ptr_mut(&ctx.stream);
+    let range = pool.flashmla_slot_range(flash.slot_idx)?;
+    let pool_buf = pool
+        .flashmla_fp8_kv_pool
+        .as_mut()
+        .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+    ensure!(
+        range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
+        "DSv4 FlashMLA shared compressed slot range {:?} invalid pool_len={} slot_len={}",
+        range,
+        pool_buf.len(),
+        flash.fp8_kv_pool_len
+    );
+    let mut pool_view = pool_buf.slice_mut(range);
+    let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
     let row_offset_bytes = start_row as u64 * config.head_dim as u64 * 2;
     let nope_ptr = compressed_ptr as u64 + row_offset_bytes;
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
@@ -2677,6 +3091,7 @@ fn try_flashmla_decode_attention(
     compressed: Option<&HiddenStates>,
     sw_window_cache: &mut CudaSlice<half::bf16>,
     flash: &mut Dsv4FlashMlaDecodeState,
+    pool: &mut Dsv4LayerKvLayout,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     tp: &TpRuntime,
@@ -2719,16 +3134,16 @@ fn try_flashmla_decode_attention(
 
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_sw_ring");
-        flashmla_pack_sw_ring(ctx, flash, sw_window_cache, config)?;
+        flashmla_pack_sw_ring(ctx, flash, pool, sw_window_cache, config)?;
     }
 
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_one");
-        flashmla_pack_one_sw_token(ctx, flash, k_prepared, start_pos_device, config)?;
+        flashmla_pack_one_sw_token(ctx, flash, pool, k_prepared, start_pos_device, config)?;
     }
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed");
-        flashmla_pack_compressed_delta(ctx, flash, compressed, config)?;
+        flashmla_pack_compressed_delta(ctx, flash, pool, compressed, config)?;
     }
 
     let mode_int = flashmla_mode_int(mode);
@@ -2801,7 +3216,20 @@ fn try_flashmla_decode_attention(
     drop(splits_guard);
 
     let (q_ptr, q_guard) = q_prepared.data.device_ptr(&ctx.stream);
-    let (pool_ptr, pool_guard) = flash.fp8_kv_pool.device_ptr(&ctx.stream);
+    let pool_range = pool.flashmla_slot_range(flash.slot_idx)?;
+    let pool_buf = pool
+        .flashmla_fp8_kv_pool
+        .as_ref()
+        .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+    ensure!(
+        pool_range.end <= pool_buf.len() && pool_range.len() == flash.fp8_kv_pool_len,
+        "DSv4 FlashMLA shared fwd slot range {:?} invalid pool_len={} slot_len={}",
+        pool_range,
+        pool_buf.len(),
+        flash.fp8_kv_pool_len
+    );
+    let pool_view = pool_buf.slice(pool_range);
+    let (pool_ptr, pool_guard) = pool_view.device_ptr(&ctx.stream);
     let (out_ptr, out_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
     let (lse_out_ptr, lse_guard) = flash.lse_out.device_ptr_mut(&ctx.stream);
     let (lse_accum_ptr, lse_accum_guard) = flash.lse_accum.device_ptr_mut(&ctx.stream);
@@ -3195,6 +3623,7 @@ pub(crate) fn mla_attention(
     layer_idx: usize,
     hidden: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
+    pool: &mut Dsv4LayerKvLayout,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     tp: &TpRuntime,
@@ -3437,6 +3866,7 @@ pub(crate) fn mla_attention(
                 None,
                 &mut state.sw_window_cache,
                 flash,
+                pool,
                 start_pos,
                 start_pos_device,
                 tp,
@@ -3610,6 +4040,7 @@ pub(crate) fn mla_attention(
                 &c_q_normed,
                 index_keys,
                 official,
+                pool,
                 indexer_rows_before,
                 indexer_rows_after,
                 start_pos,
@@ -3680,6 +4111,7 @@ pub(crate) fn mla_attention(
                 Some(compressed),
                 &mut state.sw_window_cache,
                 flash,
+                pool,
                 start_pos,
                 start_pos_device,
                 tp,
@@ -3982,6 +4414,7 @@ fn csa_select(
     c_q_normed: &HiddenStates,
     keys: &HiddenStates,
     official: Option<&mut Dsv4DsaOfficialState>,
+    pool: &mut Dsv4LayerKvLayout,
     indexer_rows_before: usize,
     indexer_rows_after: usize,
     start_pos: usize,
@@ -4042,6 +4475,7 @@ fn csa_select(
             &weights,
             keys,
             official,
+            pool,
             indexer_rows_before,
             indexer_rows_after,
             key_count,
@@ -4155,6 +4589,7 @@ fn csa_select_official(
     weights: &HiddenStates,
     keys: &HiddenStates,
     official: &mut Dsv4DsaOfficialState,
+    pool: &mut Dsv4LayerKvLayout,
     indexer_rows_before: usize,
     indexer_rows_after: usize,
     key_count: usize,
@@ -4242,7 +4677,20 @@ fn csa_select_official(
                 .rotated_keys
                 .slice(src_offset..src_offset + newly_packed * config.index_head_dim);
             let (rot_store_ptr, _rsg) = rotated.device_ptr(&ctx.stream);
-            let (cache_ptr_u8, _cg) = official.key_cache.device_ptr_mut(&ctx.stream);
+            let cache_range = pool.dsa_slot_range(official.slot_idx)?;
+            let cache_pool = pool
+                .dsa_key_cache
+                .as_mut()
+                .ok_or_else(|| anyhow!("DSv4 official DSA shared key-cache missing"))?;
+            ensure!(
+                cache_range.end <= cache_pool.len() && cache_range.len() == official.key_cache_len,
+                "DSv4 official DSA shared key-cache range {:?} invalid pool_len={} slot_len={}",
+                cache_range,
+                cache_pool.len(),
+                official.key_cache_len
+            );
+            let mut cache_view = cache_pool.slice_mut(cache_range);
+            let (cache_ptr_u8, _cg) = cache_view.device_ptr_mut(&ctx.stream);
             let (locs_ptr, _lg) = locs.device_ptr(&ctx.stream);
             unsafe {
                 ffi::dsv4_dsa_fused_store_index_k_cache_cuda(
@@ -4257,7 +4705,6 @@ fn csa_select_official(
             }
         }
         official.packed_rows = indexer_rows_after;
-        keepalive.keep_u8(&official.key_cache);
     }
 
     let token_count = q_i.seq_len;
@@ -4325,29 +4772,52 @@ fn csa_select_official(
         )
         .map_err(|e| anyhow!("DSv4 official DSA metadata failed: {e}"))?;
     }
-    unsafe {
-        cuda_moe::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache(
-            cache_ptr(&official.q_fp8, ctx),
-            cache_ptr(&official.key_cache, ctx),
-            cache_ptr(&official.weights, ctx),
-            cache_ptr(&official.context_lens, ctx),
-            cache_ptr(&official.page_table_identity, ctx),
-            cache_ptr(&official.sched_meta, ctx),
-            cache_ptr(&official.logits, ctx),
-            token_count,
-            1,
-            local_index_heads,
-            config.index_head_dim,
-            official.num_pages,
-            64,
-            official.num_pages * 64,
-            official.logits_stride,
-            official.num_pages,
-            64 * (config.index_head_dim + std::mem::size_of::<f32>()),
-            official.num_sms,
-            ctx.stream.cu_stream(),
-        )
-        .map_err(|e| anyhow!("DSv4 official DSA paged logits failed: {e}"))?;
+    {
+        let cache_range = pool.dsa_slot_range(official.slot_idx)?;
+        let cache_pool = pool
+            .dsa_key_cache
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 official DSA shared key-cache missing"))?;
+        ensure!(
+            cache_range.end <= cache_pool.len() && cache_range.len() == official.key_cache_len,
+            "DSv4 official DSA shared key-cache range {:?} invalid pool_len={} slot_len={}",
+            cache_range,
+            cache_pool.len(),
+            official.key_cache_len
+        );
+        let cache_view = cache_pool.slice(cache_range);
+        let (q_ptr, _qg) = official.q_fp8.device_ptr(&ctx.stream);
+        let (cache_ptr_u8, _kg) = cache_view.device_ptr(&ctx.stream);
+        let (weights_ptr, _wg) = official.weights.device_ptr(&ctx.stream);
+        let (lens_ptr, _lg) = official.context_lens.device_ptr(&ctx.stream);
+        let (page_ptr, _pg) = official.page_table_identity.device_ptr(&ctx.stream);
+        let (sched_ptr, _sg) = official.sched_meta.device_ptr(&ctx.stream);
+        let (logits_ptr, _og) = official.logits.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
+                q_ptr as *const u8,
+                cache_ptr_u8 as *const u8,
+                weights_ptr as *const f32,
+                lens_ptr as *const i32,
+                page_ptr as *const i32,
+                sched_ptr as *const i32,
+                logits_ptr as *mut f32,
+                i32::try_from(token_count)?,
+                1,
+                i32::try_from(local_index_heads)?,
+                i32::try_from(config.index_head_dim)?,
+                i32::try_from(official.num_pages)?,
+                64,
+                i32::try_from(official.num_pages * 64)?,
+                i32::try_from(official.logits_stride)?,
+                i32::try_from(official.num_pages)?,
+                i32::try_from(64 * (config.index_head_dim + std::mem::size_of::<f32>()))?,
+                i32::try_from(official.num_sms)?,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 official DSA paged logits failed: {e}"))?;
+        }
     }
     {
         let (logits_ptr, _lg) = official.logits.device_ptr(&ctx.stream);

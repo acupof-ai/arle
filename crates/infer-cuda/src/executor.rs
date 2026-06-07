@@ -13,6 +13,7 @@ use infer_plan::{DecodeRow, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{KvBatchDescriptor, KvBatchRowKind, KvPool};
 use log::{info, warn};
 
+use crate::attention::ModelKvAdapter;
 use crate::decode_graph::DecodeGraphContext;
 use crate::decode_graph_key::{DECODE_GRAPH_BATCH, DecodeGraphKey};
 use crate::graph::GraphBucket;
@@ -577,6 +578,7 @@ impl QwenCudaExecutor {
 pub(crate) struct Dsv4CudaExecutor {
     model: crate::dsv4::Dsv4Model,
     slots: Vec<crate::dsv4::Dsv4SlotState>,
+    kv_adapter: crate::attention::Dsv4KvAdapter,
     spec_slots: Vec<Dsv4SpecSlotState>,
     num_slots: usize,
     mtp_accepts: usize,
@@ -753,6 +755,96 @@ fn validate_dsv4_prefill_kv_batch(
     Ok(())
 }
 
+fn validate_dsv4_decode_kv_view(
+    rows: &[DecodeRow],
+    view: &crate::attention::Dsv4KvBatchView,
+) -> Result<()> {
+    ensure!(
+        view.rows.len() == rows.len(),
+        "DSv4 decode KV adapter view row count {} != plan rows {}",
+        view.rows.len(),
+        rows.len()
+    );
+    for (idx, (plan_row, view_row)) in rows.iter().zip(&view.rows).enumerate() {
+        ensure!(
+            view_row.kind == KvBatchRowKind::Decode,
+            "DSv4 decode KV adapter row {idx} has kind {:?}",
+            view_row.kind
+        );
+        ensure!(
+            view_row.slot == plan_row.slot,
+            "DSv4 decode KV adapter row {idx} slot {} != plan slot {}",
+            view_row.slot,
+            plan_row.slot
+        );
+        ensure!(
+            view_row.seq_len == plan_row.kv_seq_len
+                && view_row.append_pos == plan_row.kv_seq_len
+                && view_row.append_len == 1,
+            "DSv4 decode KV adapter row {idx} seq/append ({},{},{}) != plan kv_seq_len {}",
+            view_row.seq_len,
+            view_row.append_pos,
+            view_row.append_len,
+            plan_row.kv_seq_len
+        );
+        ensure!(
+            view_row.page_range.end <= view.flat_page_ids.len(),
+            "DSv4 decode KV adapter row {idx} page range {:?} outside flat page len {}",
+            view_row.page_range,
+            view.flat_page_ids.len()
+        );
+        let pages = &view.flat_page_ids[view_row.page_range.clone()];
+        ensure!(
+            !pages.is_empty(),
+            "DSv4 decode KV adapter row {idx} has no page ids"
+        );
+    }
+    Ok(())
+}
+
+fn validate_dsv4_prefill_kv_view(
+    row: &infer_plan::PrefillRow,
+    view: &crate::attention::Dsv4KvBatchView,
+) -> Result<()> {
+    ensure!(
+        view.rows.len() == 1,
+        "DSv4 prefill KV adapter view row count {} != 1",
+        view.rows.len()
+    );
+    let view_row = &view.rows[0];
+    ensure!(
+        view_row.kind == KvBatchRowKind::Prefill,
+        "DSv4 prefill KV adapter row has kind {:?}",
+        view_row.kind
+    );
+    ensure!(
+        view_row.slot == row.slot
+            && view_row.seq_len == row.start_pos
+            && view_row.append_pos == row.start_pos
+            && view_row.append_len == row.tokens.len(),
+        "DSv4 prefill KV adapter row slot/seq/append ({},{},{},{}) != plan ({},{},{})",
+        view_row.slot,
+        view_row.seq_len,
+        view_row.append_pos,
+        view_row.append_len,
+        row.slot,
+        row.start_pos,
+        row.tokens.len()
+    );
+    ensure!(
+        view_row.page_range.end <= view.flat_page_ids.len(),
+        "DSv4 prefill KV adapter row page range {:?} outside flat page len {}",
+        view_row.page_range,
+        view.flat_page_ids.len()
+    );
+    let pages = &view.flat_page_ids[view_row.page_range.clone()];
+    ensure!(
+        !pages.is_empty(),
+        "DSv4 prefill KV adapter row has no page ids"
+    );
+    Ok(())
+}
+
 impl std::fmt::Debug for Dsv4CudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dsv4CudaExecutor")
@@ -770,9 +862,10 @@ impl Dsv4CudaExecutor {
         ensure!(num_slots > 0, "Dsv4CudaExecutor requires at least one slot");
         let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(model_path.as_ref())?;
         let max_seq_len = dsv4_max_seq_len();
+        let kv_adapter = model.new_kv_adapter(max_seq_len, num_slots)?;
         let mut slots = Vec::with_capacity(num_slots);
-        for _ in 0..num_slots {
-            slots.push(model.new_slot_state(max_seq_len)?);
+        for slot_idx in 0..num_slots {
+            slots.push(model.new_slot_state(max_seq_len, slot_idx, &kv_adapter)?);
         }
         let spec_slots = (0..num_slots)
             .map(|_| Dsv4SpecSlotState::default())
@@ -780,6 +873,7 @@ impl Dsv4CudaExecutor {
         Ok(Self {
             model,
             slots,
+            kv_adapter,
             spec_slots,
             num_slots,
             mtp_accepts: 0,
@@ -799,6 +893,7 @@ impl Dsv4CudaExecutor {
         if crate::dsv4::dsv4_spec_decode_enabled() {
             let (token, hidden) = self.model.forward_tokens_with_hidden(
                 &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
                 tokens,
                 start_pos,
                 params,
@@ -814,6 +909,7 @@ impl Dsv4CudaExecutor {
         } else {
             Ok(vec![self.model.forward_tokens(
                 &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
                 tokens,
                 start_pos,
                 params,
@@ -833,6 +929,7 @@ impl Dsv4CudaExecutor {
         if !crate::dsv4::dsv4_spec_decode_enabled() {
             let token = self.model.forward_tokens(
                 &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
                 &[last_token],
                 start_pos,
                 params,
@@ -865,11 +962,16 @@ impl Dsv4CudaExecutor {
             .clone();
 
         let draft_position = start_pos as u64;
-        let draft =
-            self.model
-                .mtp_forward(&mut self.slots[slot_idx], &hidden, pending, draft_position)?;
+        let draft = self.model.mtp_forward(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            &hidden,
+            pending,
+            draft_position,
+        )?;
         let (argmax, mut hiddens) = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
             &[pending, draft],
             start_pos,
             position,
@@ -925,7 +1027,11 @@ impl Dsv4CudaExecutor {
                 "spec_after_reject_truncate",
                 keep_len,
             )?;
-            self.slots[slot_idx].restore_spec_rollback(&self.model.ctx, keep_len)?;
+            self.slots[slot_idx].restore_spec_rollback(
+                &self.model.ctx,
+                &mut self.kv_adapter,
+                keep_len,
+            )?;
             self.model.dump_mtp_rollback_state(
                 &self.slots[slot_idx],
                 "spec_after_reject_restore",
@@ -970,6 +1076,8 @@ impl Dsv4CudaExecutor {
         kv_batch: &KvBatchDescriptor,
     ) -> Result<Vec<SlotToken>> {
         validate_dsv4_decode_kv_batch(rows, kv_batch)?;
+        let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
+        validate_dsv4_decode_kv_view(rows, &kv_view)?;
         let batch = Dsv4DecodeBatch::from_rows(rows, &self.slots, self.num_slots)?;
         ensure!(
             batch.slot_ids.len() == batch.rows.len()
@@ -1017,6 +1125,8 @@ impl Dsv4CudaExecutor {
             .first()
             .expect("prefill row present after empty-prefill branch");
         validate_dsv4_prefill_kv_batch(row, kv_batch)?;
+        let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
+        validate_dsv4_prefill_kv_view(row, &kv_view)?;
         ensure!(
             row.slot < self.num_slots,
             "prefill slot {} outside DSv4 executor slots {}",
@@ -1025,7 +1135,7 @@ impl Dsv4CudaExecutor {
         );
         ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
         if row.start_pos == 0 {
-            self.slots[row.slot].reset(&self.model.ctx)?;
+            self.slots[row.slot].reset(&self.model.ctx, &mut self.kv_adapter)?;
             self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
         }
         let position = (row.start_pos + row.tokens.len()) as u64;
@@ -1062,9 +1172,10 @@ impl Dsv4CudaExecutor {
         let params = SamplingParams::default();
         let start_pos = prompt.len();
 
-        self.slots[slot_idx].reset(&self.model.ctx)?;
+        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
         let token_a = self.model.forward_tokens(
             &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
             prompt,
             0,
             &params,
@@ -1072,14 +1183,16 @@ impl Dsv4CudaExecutor {
         )?;
         let (verify_one, _) = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
             &[token_a],
             start_pos,
             (start_pos + 1) as u64,
         )?;
 
-        self.slots[slot_idx].reset(&self.model.ctx)?;
+        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
         let token_a_again = self.model.forward_tokens(
             &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
             prompt,
             0,
             &params,
@@ -1091,6 +1204,7 @@ impl Dsv4CudaExecutor {
         );
         let normal_one = self.model.forward_tokens(
             &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
             &[token_a],
             start_pos,
             &params,
@@ -1101,9 +1215,10 @@ impl Dsv4CudaExecutor {
             "DSv4 verify selftest one-token mismatch: verify={verify_one:?} normal={normal_one}"
         );
 
-        self.slots[slot_idx].reset(&self.model.ctx)?;
+        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
         let token_a = self.model.forward_tokens(
             &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
             prompt,
             0,
             &params,
@@ -1111,6 +1226,7 @@ impl Dsv4CudaExecutor {
         )?;
         let (verify_one, _) = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
             &[token_a],
             start_pos,
             (start_pos + 1) as u64,
@@ -1121,9 +1237,10 @@ impl Dsv4CudaExecutor {
             wrong_b = token_b.wrapping_add(3);
         }
 
-        self.slots[slot_idx].reset(&self.model.ctx)?;
+        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
         let token_a = self.model.forward_tokens(
             &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
             prompt,
             0,
             &params,
@@ -1131,6 +1248,7 @@ impl Dsv4CudaExecutor {
         )?;
         let (verify_two, _) = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
             &[token_a, wrong_b],
             start_pos,
             (start_pos + 1) as u64,
@@ -1140,7 +1258,7 @@ impl Dsv4CudaExecutor {
             "DSv4 verify selftest two-token row0 mismatch: one={verify_one:?} two={verify_two:?}"
         );
 
-        self.slots[slot_idx].reset(&self.model.ctx)?;
+        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
         self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
         if self.model.tp.config().rank == 0 {
             eprintln!(
