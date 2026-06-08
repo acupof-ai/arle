@@ -661,8 +661,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 break;
             };
             let prefix_match = if self.config.enable_prefix_cache {
-                self.radix
-                    .peek_longest_prefix_match(&candidate.prompt_tokens)
+                let matched = self
+                    .radix
+                    .peek_longest_prefix_match(&candidate.prompt_tokens);
+                self.clamp_prefix_to_backend(matched)
             } else {
                 PrefixMatch::empty()
             };
@@ -1190,6 +1192,42 @@ mod testing {
         }
     }
 
+    /// Mock executor that can only reuse a bounded number of leading prefix
+    /// pages, mirroring a backend (Metal GDR / linear attention) whose
+    /// prefix-wide recurrent state is snapshotted at only some page boundaries.
+    /// The engine must clamp the radix-offered prefix down to this count before
+    /// attaching, or it would ask the executor for a boundary it cannot serve.
+    #[derive(Debug, Clone)]
+    pub(super) struct LimitedPrefixExecutor {
+        inner: MockExecutor,
+        max_reuse_pages: usize,
+    }
+
+    impl LimitedPrefixExecutor {
+        pub(super) fn with_max_reuse_pages(max_reuse_pages: usize) -> Self {
+            Self {
+                inner: MockExecutor::ready(),
+                max_reuse_pages,
+            }
+        }
+    }
+
+    impl BackendExecutor for LimitedPrefixExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
+            block_ids.len().min(self.max_reuse_pages)
+        }
+    }
+
     /// Mock executor that records how many times `warmup` was called, so a test
     /// can assert the engine warms the backend exactly once.
     #[derive(Debug, Clone, Default)]
@@ -1483,8 +1521,8 @@ mod tests {
     use infer_seam::{KvAllocator, KvQuery};
 
     use super::testing::{
-        DeviceMirrorExecutor, HoldGovernor, MockExecutor, MockKvPool, SamplingExecutor,
-        SpecMirrorExecutor, StopTokenExecutor, WarmupCountingExecutor,
+        DeviceMirrorExecutor, HoldGovernor, LimitedPrefixExecutor, MockExecutor, MockKvPool,
+        SamplingExecutor, SpecMirrorExecutor, StopTokenExecutor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -2134,6 +2172,50 @@ mod tests {
         assert_eq!(request.reused_prefix_pages, vec![cached_page]);
         assert_eq!(engine.kv.page_indices(slot)[0], cached_page);
         assert_eq!(engine.kv_free_pages(), free_after_publish - 1);
+
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_match_clamped_to_backend_reusable_pages() -> Result<()> {
+        // Regression for the Metal GDR prefix-attach crash: the host radix
+        // caches every page boundary, but a recurrent-state backend only
+        // snapshots some of them. The engine must clamp the offered prefix to
+        // what the backend reports it can attach, or `materialize_slot_from_prefix`
+        // errors and the engine thread dies. page_size 4: turn 1 caches two full
+        // blocks ([1,2,3,4] and [5,6,7,8]); the executor here can attach only one.
+        let mut engine = Engine::with_config(
+            LimitedPrefixExecutor::with_max_reuse_pages(1),
+            MockKvPool::with_capacity(1, 4, 16),
+            test_config(1),
+        );
+        let first = engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8, 99], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+
+        // The radix offers the full two-block (8-token) prefix.
+        let hit = engine
+            .radix
+            .peek_longest_prefix_match(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(hit.matched_len, 8);
+        assert_eq!(hit.block_ids.len(), 2);
+
+        // But the backend caps reuse at one page, so the engine clamps the
+        // attached prefix to 4 tokens / 1 page and re-prefills the rest.
+        let second = engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8, 100, 101], 1);
+        engine.step()?;
+        let request = engine
+            .active
+            .values()
+            .find(|request| request.handle == second)
+            .expect("second admitted");
+        assert_eq!(
+            request.prefill_start_pos, 4,
+            "prefix attach must clamp to the backend's 1 reusable page"
+        );
+        assert_eq!(request.reused_prefix_pages.len(), 1);
 
         engine.run_to_idle()?;
         assert_finished(engine.completed(second).expect("second completed"));
