@@ -16,6 +16,8 @@ mod modelscope;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod repl;
 mod serve;
+#[cfg(all(unix, feature = "cuda"))]
+mod serve_multiproc;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod startup;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -37,6 +39,17 @@ use clap::Parser;
 use infer_api::{InferenceEngine, LoadedInferenceEngine};
 
 pub fn run() -> ExitCode {
+    // DSv4 multiproc-serve worker entry. When ARLE_WORKER_RANK>0 is set (by the
+    // serve coordinator before spawning this process), this process is a worker
+    // rank: short-circuit BEFORE clap parsing — it joins the NCCL group as its
+    // rank and runs the relay-receiver loop instead of the normal CLI. Mirrors
+    // the deleted `infer/src/main.rs` fn main worker-entry. No-op on non-CUDA /
+    // non-Unix builds (the module isn't compiled there).
+    #[cfg(all(unix, feature = "cuda"))]
+    if let Some(code) = serve_multiproc::worker_entry() {
+        return code;
+    }
+
     let mut args = Args::parse();
     let command = args.command.take();
 

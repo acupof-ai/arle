@@ -817,7 +817,15 @@ struct Dsv4PrefillDeepGemmLinearScratch {
 
 impl Dsv4PrefillDeepGemmLinearScratch {
     fn new(ctx: &DeviceContext, config: &DeepSeekV4Config, max_seq_len: usize) -> Result<Self> {
-        let max_m = max_seq_len.max(1);
+        // M (query/token) dimension is chunk-bounded: under chunked prefill the
+        // layer forward processes at most `chunked_prefill_size` (<= chunk) query
+        // tokens per call, so the M×K `input_fp8` / `input_scales` / `qkv_raw`
+        // activation scratch is sized by `query_chunk`, not the slot's full
+        // `max_seq_len` context (which would OOM at 900K). K = hidden_size stays
+        // full. A debug assert at each forward call site (`prefill_proj_deepgemm`,
+        // `run_fused_wqkv_prefill`) guards `seq_len <= max_m`.
+        let query_chunk = DSV4_PREFILL_QUERY_CHUNK.min(max_seq_len.max(1));
+        let max_m = query_chunk;
         let max_k = config.hidden_size;
         let q_lora_rank = config.q_lora_rank;
         let head_dim = config.head_dim;
@@ -873,7 +881,28 @@ impl Dsv4PrefillDeepGemmLinearScratch {
 /// is `TILE × compressed_capacity` (f32); tiling the query axis keeps it bounded
 /// (e.g. compress_ratio=4 @ 900K ctx: 4096 × 225024 × 4B ≈ 3.7 GB instead of ~810 GB).
 /// This is the only path — long prompts loop in tiles, never materialize full-N logits.
-const DSV4_DSA_PREFILL_QUERY_TILE: usize = 4096;
+///
+/// Per-layer (each CSA layer owns its own `Dsv4DsaOfficialState` and thus its own
+/// `logits` scratch — no cross-layer sharing, which is unsafe under this codebase's
+/// disabled event-tracking + forward-level keepalive). The tile is 1024 (not 4096) so
+/// all ~43 per-layer `logits` buffers fit at 900K: cr=4 → 1024 × ~225024 × 4B ≈ 0.92 GB
+/// per cr=4 layer × ~20 such layers ≈ 18.4 GB, within the ~31 GB free budget. The 4096
+/// tile OOMs (4096 × ~225024 × 4B ≈ 3.7 GB/layer × ~20 ≈ 74 GB).
+/// `csa_select_official` loops sub-chunks when a forward passes more than `query_tile`
+/// query tokens, so correctness is unchanged — just more sub-iterations.
+const DSV4_DSA_PREFILL_QUERY_TILE: usize = 1024;
+
+/// Query/token (M) dimension bound for DSv4 per-layer prefill scratch buffers
+/// (e.g. [`Dsv4PrefillDeepGemmLinearScratch`]). Under chunked prefill the layer
+/// forward only ever processes `chunked_prefill_size` query tokens per call
+/// (scheduler default 2048), so M-dimension scratch must be sized by this chunk
+/// bound — NOT by the slot's full `max_seq_len` context — or long-context prompts
+/// (e.g. 900K) OOM allocating M×K activation buffers they never fill. Context/KV
+/// dimensions (K=hidden_dim, compressed capacity, per-slot KV) keep `max_seq_len`
+/// sizing. `chunked_prefill_size <= DSV4_PREFILL_QUERY_CHUNK` is asserted at each
+/// scratch-writing call site; the one-shot `dsv4_parity` example at long context
+/// is not the chunked-prefill path and is expected to trip that assert.
+const DSV4_PREFILL_QUERY_CHUNK: usize = 4096;
 
 struct Dsv4DsaOfficialState {
     slot_idx: usize,
@@ -892,6 +921,7 @@ struct Dsv4DsaOfficialState {
     packed_rows: usize,
     max_tokens: usize,
     query_tile: usize,
+    query_chunk: usize,
     compressed_capacity: usize,
     num_pages: usize,
     num_heads: usize,
@@ -936,8 +966,16 @@ impl Dsv4DsaOfficialState {
         // many query tokens a single call passes. When token_count <= query_tile the
         // compute loop runs a single iteration (offset 0), behavior-identical to the
         // pre-tiling code. Key-dimension / full-N buffers (rotated_keys, cache_locs,
-        // freqs_cis, raw_indices) stay sized by max_tokens/compressed_capacity.
+        // freqs_cis) stay sized by max_tokens/compressed_capacity; `raw_indices` (the
+        // per-forward topk output) is chunk-sized — see below.
         let query_tile = DSV4_DSA_PREFILL_QUERY_TILE.min(max_tokens);
+        // `raw_indices` is the topk OUTPUT: written per forward over the forward's
+        // query tokens and read only by the gated `ARLE_DSV4_CSA_DUMP` block for those
+        // same ≤ chunk queries — never the full max_tokens context. Size it by the
+        // chunked-prefill query bound (`DSV4_PREFILL_QUERY_CHUNK`), not `max_tokens`,
+        // which at 900K × topk would be ~1.9 GB/layer. `csa_select_official` asserts
+        // `q_i.seq_len <= query_chunk` before the tile loop.
+        let query_chunk = DSV4_PREFILL_QUERY_CHUNK.min(max_tokens);
         let q_elems = query_tile
             .checked_mul(config.index_n_heads)
             .and_then(|v| v.checked_mul(config.index_head_dim))
@@ -1007,11 +1045,12 @@ impl Dsv4DsaOfficialState {
                 .map_err(|e| anyhow!("DSv4 official DSA logits alloc failed: {e}"))?,
             raw_indices: ctx
                 .stream
-                .alloc_zeros::<i32>(max_tokens * config.index_topk)
+                .alloc_zeros::<i32>(query_chunk * config.index_topk)
                 .map_err(|e| anyhow!("DSv4 official DSA raw indices alloc failed: {e}"))?,
             packed_rows: 0,
             max_tokens,
             query_tile,
+            query_chunk,
             compressed_capacity,
             num_pages,
             num_heads: config.index_n_heads,
@@ -2239,9 +2278,15 @@ fn prefill_proj_deepgemm(
         out.hidden_dim,
         out.seq_len
     );
+    // M (query/token) dim is chunk-bounded: scratch.max_m = DSV4_PREFILL_QUERY_CHUNK
+    // (>= chunked_prefill_size). Chunked prefill guarantees seq_len <=
+    // chunked_prefill_size <= DSV4_PREFILL_QUERY_CHUNK, so this assert only trips on
+    // a misconfigured chunk size or the one-shot dsv4_parity long-context example —
+    // fail loud rather than write past the chunk-sized M×K scratch.
     ensure!(
         m <= scratch.max_m && k <= scratch.max_k,
-        "DSv4 prefill_proj_deepgemm scratch too small: need M={m} K={k}, have M={} K={}",
+        "DSv4 prefill_proj_deepgemm M={m} > query chunk {} (or K={k} > {}): chunked \
+         prefill must keep seq_len <= chunked_prefill_size <= DSV4_PREFILL_QUERY_CHUNK",
         scratch.max_m,
         scratch.max_k
     );
@@ -2339,12 +2384,18 @@ fn run_fused_wqkv_prefill(
     let m = hidden.seq_len;
     let n = cache.rows;
     let k = cache.cols;
+    // M (query/token) dim is chunk-bounded: scratch.max_m = DSV4_PREFILL_QUERY_CHUNK
+    // (>= chunked_prefill_size). Chunked prefill guarantees seq_len <=
+    // chunked_prefill_size <= DSV4_PREFILL_QUERY_CHUNK, so this assert only trips on
+    // a misconfigured chunk size or the one-shot dsv4_parity long-context example —
+    // fail loud rather than write past the chunk-sized M×K activation scratch.
     ensure!(
         m <= scratch.max_m && k <= scratch.max_k,
-        "DSv4 fused wqkv prefill scratch too small: need M={} K={}, have M={} K={}",
+        "DSv4 fused wqkv prefill M={} > query chunk {} (or K={} > {}): chunked prefill \
+         must keep seq_len <= chunked_prefill_size <= DSV4_PREFILL_QUERY_CHUNK",
         m,
-        k,
         scratch.max_m,
+        k,
         scratch.max_k
     );
     let scale_stride_m = m.div_ceil(4) * 4;
@@ -5145,6 +5196,21 @@ fn csa_select_official(
     }
 
     let token_count = q_i.seq_len;
+    // `raw_indices` (topk output) is sized by `query_chunk`, not `max_tokens`. The
+    // scheduler guarantees a single forward never passes more than
+    // `chunked_prefill_size <= DSV4_PREFILL_QUERY_CHUNK == query_chunk` query tokens,
+    // so the per-tile `raw_indices[t0..t0+tlen]` writes and the DUMP read
+    // `raw_indices[0..seq_len*topk]` both stay within the chunk-sized buffer. Fail loud
+    // rather than write past it (e.g. the one-shot long-context `dsv4_parity` example,
+    // which is not the chunked-prefill path).
+    ensure!(
+        token_count <= official.query_chunk,
+        "DSv4 official DSA token_count {} exceeds prefill query chunk {} (raw_indices \
+         scratch is chunk-sized; chunked prefill must keep seq_len <= \
+         chunked_prefill_size <= DSV4_PREFILL_QUERY_CHUNK)",
+        token_count,
+        official.query_chunk
+    );
     // Full-length host context_lens (cheap i32 vec); the DUMP block below reads the
     // global last row from it, and each tile slices its sub-range for H2D.
     let context_lens_h: Vec<i32> = (0..token_count)

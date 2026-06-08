@@ -256,6 +256,35 @@ mod backend {
             }
         }
 
+        /// Submit a pre-tokenized prompt to the engine and discard its output —
+        /// the multiproc worker (rank 1..N-1) lockstep path. CUDA-only: DSv4
+        /// multi-rank serve is CUDA, and only the worker ranks (whose output is
+        /// never returned over HTTP) use this. Each relayed
+        /// [`infer_server::WireRequest`] is submitted here so the worker's engine
+        /// loop drives the executor's NCCL collective `forward` in lockstep with
+        /// rank 0. Metal/CPU bail (single-process, no relay).
+        #[cfg(feature = "cuda")]
+        pub fn submit_replicated(
+            &self,
+            prompt_tokens: Vec<u32>,
+            max_tokens: usize,
+            sampling: infer_plan::SamplingParams,
+        ) -> Result<()> {
+            match self {
+                Self::Cuda(engine) => engine.submit_replicated(prompt_tokens, max_tokens, sampling),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {
+                    let _ = (prompt_tokens, max_tokens, sampling);
+                    anyhow::bail!("submit_replicated is CUDA-only (multiproc worker lockstep path)")
+                }
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => {
+                    let _ = (prompt_tokens, max_tokens, sampling);
+                    anyhow::bail!("submit_replicated is CUDA-only (multiproc worker lockstep path)")
+                }
+            }
+        }
+
         /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6 q/v
         /// projection weights (OPD per-step re-merge). CUDA-only: the Metal /
         /// CPU arms reject it.
@@ -433,10 +462,33 @@ mod backend {
                     num_slots,
                     total_pages,
                 )?,
-                CudaModelKind::Dsv4 => anyhow::bail!(
-                    "DSv4 is multi-GPU only (TP=8/EP=8); launch via \
-                     scripts/dsv4_multigpu_parity.sh, not the single-process loader"
-                ),
+                // DSv4 multi-rank serve. The DSv4 executor resolves its TP
+                // rank/world-size + EP expert split + NCCL communicator from the
+                // environment during construction (`INFER_TP_RANK` /
+                // `INFER_TP_SIZE` / `INFER_CUDA_DEVICES`, plus
+                // `INFER_NCCL_UNIQUE_ID` / `INFER_NCCL_ID_FILE` rendezvous) — set
+                // by the multiproc coordinator/launcher before this runs. On a
+                // single GPU (world_size==1) it loads as one rank. DSv4 owns its
+                // MLA KV state inside the forward, so the host `CudaKvPool` is
+                // only present to satisfy the `submit(.., &mut dyn KvPool)`
+                // signature; `max_seq_len` threads from `dsv4_max_seq_len()`
+                // (`INFER_DSV4_MAX_SEQ_LEN`).
+                //
+                // This builds the rank-0 executor + Engine. The multi-rank
+                // LOCKSTEP FORWARD is now wired: the rank-0 engine thread's
+                // admission path broadcasts each request to ranks 1..N-1
+                // (`infer_server::broadcast_admission`, installed by
+                // `cli::serve_multiproc`), and each worker submits the relayed
+                // request into its own rank-R Engine so the NCCL collective
+                // `forward` runs in lockstep.
+                //
+                // `// STAGE 3:` chunked-prefill scratch chunk-bounding and the
+                // long-decode path (beyond a single short prompt) are later stages.
+                CudaModelKind::Dsv4 => CudaExecutor::from_dsv4_fp8_safetensors(
+                    &model_source,
+                    num_slots,
+                    infer_cuda::dsv4_max_seq_len(),
+                )?,
             };
             let kv = CudaKvPool::new(num_slots, total_pages, page_size);
             Ok(infer_core::Engine::with_config(executor, kv, scheduler))

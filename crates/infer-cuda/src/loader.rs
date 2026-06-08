@@ -223,6 +223,30 @@ pub(crate) fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclU
     Ok(cuda_kernels::ffi::nccl::ncclUniqueId { internal })
 }
 
+/// Mint a fresh NCCL `unique_id` (rank-0 launcher / multiproc coordinator) and
+/// return it as 256 hex chars, ready to publish via `INFER_NCCL_UNIQUE_ID` so
+/// every spawned worker rank inherits the SAME rendezvous handle (which the DSv4
+/// executor decodes via [`nccl_unique_id_from_env`] during construction).
+/// `ncclGetUniqueId` is a host call — no CUDA context / GPU is required to mint.
+#[cfg(feature = "nccl")]
+pub fn mint_nccl_unique_id_hex() -> Result<String> {
+    use cuda_kernels::ffi::nccl;
+    let mut id = nccl::ncclUniqueId {
+        internal: [0i8; 128],
+    };
+    // SAFETY: `id` is a valid, fully-initialized 128-byte ncclUniqueId; NCCL
+    // writes the rendezvous handle into it. Single-threaded, no aliasing.
+    let res = unsafe { nccl::ncclGetUniqueId(&mut id) };
+    nccl::check(res).context("ncclGetUniqueId failed")?;
+    let mut hex = String::with_capacity(256);
+    for &b in &id.internal {
+        use std::fmt::Write;
+        write!(hex, "{:02x}", b as u8).expect("write to String is infallible");
+    }
+    debug_assert_eq!(hex.len(), 256);
+    Ok(hex)
+}
+
 pub(crate) fn validate_clean_bf16_config(config: &Qwen3Config) -> Result<()> {
     // Qwen3 decouples head_dim from hidden_size/num_heads (e.g. Qwen3-0.6B:
     // hidden 1024, heads 16, head_dim 128), so `hidden_size == heads*head_dim`

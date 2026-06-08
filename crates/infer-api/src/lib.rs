@@ -39,9 +39,20 @@ pub use loaded::EngineLoadConfig;
 pub use loaded::LoadedInferenceEngine;
 pub use serve::{ServeHttpOptions, serve_http};
 pub use serve_engine::ServeInferenceEngine;
+// DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so
+// the `cli` coordinator/worker scaffold (`cli::serve_multiproc`) reaches it at
+// the `infer-api` surface without depending on `infer-server` directly (mirrors
+// the `infer-cuda` re-export pattern above).
+pub use infer_server::{
+    PendingRelayCoordinator, RelayCompletionDelta, RelayCoordinator, RelayEnvelope, RelayWorker,
+    WireRequest, broadcast_admission, set_admission_broadcaster,
+};
 // Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
 // so consumers see them at the `infer-api` surface (mirrors the legacy
 // `infer::server_engine::StudentLora*` path the `train` crate couples to).
+/// Rank-0 NCCL `unique_id` mint for the multiproc-serve coordinator.
+#[cfg(feature = "nccl")]
+pub use infer_cuda::mint_nccl_unique_id_hex;
 #[cfg(feature = "cuda")]
 pub use infer_cuda::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 #[cfg(feature = "cuda")]

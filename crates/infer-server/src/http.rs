@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 #[cfg(feature = "metal")]
 use anyhow::{Context, anyhow};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use infer_core::CompletedRequest;
@@ -54,6 +54,10 @@ where
         .route("/v1/completions", post(completions::<E, K>))
         .route("/v1/chat/completions", post(chat_completions::<E, K>))
         .route("/v1/models", get(list_models::<E, K>))
+        // Long-context prompts (e.g. a ~900K-token needle) serialize to several MB,
+        // far over axum's 2 MiB default. Allow up to 256 MiB (a 1M-token prompt is
+        // only a handful of MB; the cap stays well under any real DoS concern here).
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
 

@@ -372,6 +372,7 @@ dependencies = [
  "indicatif",
  "infer-api",
  "infer-util",
+ "libc",
  "log",
  "nucleo-matcher",
  "qwen3-spec",
