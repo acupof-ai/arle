@@ -25,12 +25,30 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         tokens.div_ceil(page_size)
     }
 
+    /// Clamp a radix prefix match to the leading pages the backend can actually
+    /// attach. The host radix caches a block at every page boundary, but a
+    /// backend whose layers carry prefix-wide recurrent state (Metal GDR /
+    /// linear attention) only snapshots that state at the boundaries a forward
+    /// pass landed on. Chunked prefill skips interior boundaries, so the radix
+    /// can offer a prefix the executor cannot serve; attaching it errors in the
+    /// executor and kills the engine thread. Trim the match to the reusable
+    /// page count and re-prefill the unsnapshotted tail.
+    pub(crate) fn clamp_prefix_to_backend(&self, mut prefix_match: PrefixMatch) -> PrefixMatch {
+        let serveable = self.executor.reusable_prefix_pages(&prefix_match.block_ids);
+        if serveable < prefix_match.block_ids.len() {
+            prefix_match.block_ids.truncate(serveable);
+            prefix_match.matched_len = serveable.saturating_mul(self.radix.block_size());
+        }
+        prefix_match
+    }
+
     pub(crate) fn attach_prefix_to_request(
         &mut self,
         slot: usize,
         request: &mut RequestState,
         prefix_match: PrefixMatch,
     ) -> Result<()> {
+        let prefix_match = self.clamp_prefix_to_backend(prefix_match);
         if prefix_match.is_empty() {
             request.prefill_start_pos = 0;
             request.phase = RequestPhase::Prefilling { progress: 0 };

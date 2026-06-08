@@ -62,6 +62,22 @@ pub trait BackendExecutor {
         Vec::new()
     }
 
+    /// How many leading prefix-cache pages of `block_ids` (in prompt order) the
+    /// executor can actually reuse when attaching this prefix to a slot.
+    ///
+    /// The host radix caches a block at every page boundary, but a backend
+    /// whose layers carry prefix-wide recurrent/conv state (e.g. Metal
+    /// linear-attention "GDR" layers) can only attach at boundaries where it
+    /// snapshotted that state during a forward pass — chunked prefill skips the
+    /// interior boundaries. Returning fewer pages than `block_ids.len()` tells
+    /// engine-core to re-prefill the unsnapshotted tail instead of asking the
+    /// executor for a boundary it cannot serve (which would error on attach).
+    /// The default reuses everything the radix offers, which is correct for
+    /// fully page-sliceable KV (paged attention).
+    fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
+        block_ids.len()
+    }
+
     /// Move the model's device weights to host RAM and free the VRAM (OPD teacher
     /// time-share), returning the device bytes freed. The default is a no-op
     /// (returns 0) so backends that do not support weight offload are unaffected.
