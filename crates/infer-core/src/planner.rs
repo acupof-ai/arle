@@ -52,9 +52,27 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
             let start_pos = request.prefill_start_pos.min(request.prompt_tokens.len());
             let remaining = request.prompt_tokens.len() - start_pos;
-            let chunk = remaining.min(chunk_cap).min(budget);
+            let mut chunk = remaining.min(chunk_cap).min(budget);
             if chunk == 0 {
                 continue;
+            }
+            // Stop a prefill chunk on a page boundary when it would otherwise
+            // cross one mid-chunk. A hybrid backend (Metal GDR / linear
+            // attention) snapshots its prefix-wide recurrent state only at the
+            // page boundary a forward pass ends on, but the radix later caches a
+            // reusable block at *every* page boundary — a chunk that ends inside
+            // a page leaves that boundary without a snapshot, so a future prefix
+            // hit there must re-prefill (handled by `clamp_prefix_to_backend`)
+            // instead of reusing. Aligning chunk ends keeps the deepest cached
+            // boundary reusable. The final sub-page tail (no full boundary left,
+            // i.e. `aligned_end <= start_pos`) is emitted as-is. Page-sliceable
+            // backends (paged attention) are unaffected — the split is just an
+            // extra tiny tick at most.
+            let page_size = self.kv.page_size().max(1);
+            let chunk_end = start_pos + chunk;
+            let aligned_end = chunk_end - (chunk_end % page_size);
+            if aligned_end > start_pos {
+                chunk = aligned_end - start_pos;
             }
             prefill_rows.push(PrefillRow {
                 slot,
