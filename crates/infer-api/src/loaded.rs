@@ -462,15 +462,25 @@ mod backend {
         if matches!(kind, CudaModelKind::Dsv4 | CudaModelKind::Qwen3Moe) {
             scheduler.enable_prefix_cache = false;
         }
-        // DSv4 additionally has no multi-rank chunked-prefill path yet (the NCCL
-        // lockstep desyncs across chunk boundaries), so pin to single-chunk
-        // prefill until that lands. Both the rank-0 coordinator and the worker
-        // ranks build through this same helper with the same `kind`, so the two
-        // stay in lockstep.
+        // DSv4 prefill activation scratch is bounded by the query-chunk size
+        // (`DSV4_PREFILL_QUERY_CHUNK` = 4096): the chunked-prefill forward asserts
+        // each call passes <= that many query tokens, so long prompts MUST chunk
+        // (single-chunk max_seq_len both trips that assert at >4096 and OOMs the
+        // M×K scratch at 900K). Contiguous chunks are recurrent-KV-safe now that
+        // cross-request prefix reuse is disabled above (each request still resets
+        // at start_pos==0; chunks advance start_pos contiguously). Cap at 4096;
+        // all ranks build through this same helper with the same `kind`, so the
+        // rank-0 coordinator and workers stay in lockstep across chunk boundaries.
         if matches!(kind, CudaModelKind::Dsv4) {
-            scheduler.chunked_prefill_size = scheduler
-                .chunked_prefill_size
-                .max(infer_cuda::dsv4_max_seq_len());
+            scheduler.chunked_prefill_size = 4096;
+            // Long-context: lift the prompt/total token caps to the model's
+            // configured max_seq_len so a 900K-token needle isn't rejected with an
+            // empty completion. The 32768/65536 defaults are a short-context DoS
+            // guard, not a model limit; DSv4's KV budget (dsv4.rs) separately
+            // clamps slot count to what HBM affords at this length.
+            let max_seq = infer_cuda::dsv4_max_seq_len();
+            scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.max(max_seq);
+            scheduler.max_total_tokens = scheduler.max_total_tokens.max(max_seq + 4096);
         }
         let num_slots = config.num_slots;
         let total_pages = config.total_pages;
