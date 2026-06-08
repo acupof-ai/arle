@@ -61,6 +61,12 @@ pub struct SchedulerConfig {
     /// Per-request prefill chunk size. A prompt longer than this is prefilled
     /// across multiple ticks so decode rows can interleave (chunked prefill).
     pub chunked_prefill_size: usize,
+    /// Whether cross-request prompt-prefix reuse via the host radix cache is
+    /// enabled. Models whose per-slot KV is recurrent / not page-addressable
+    /// (DSv4's sliding-window ring + compressor/indexer running state) cannot
+    /// honor a partial-prefix start_pos, so they disable this and every request
+    /// resets at `start_pos == 0`.
+    pub enable_prefix_cache: bool,
 }
 
 impl SchedulerConfig {
@@ -97,6 +103,7 @@ impl Default for SchedulerConfig {
             max_total_tokens: 32_768,
             prefix_cache_low_water_pages: 0,
             chunked_prefill_size: 2_048,
+            enable_prefix_cache: true,
         }
     }
 }
@@ -653,9 +660,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             let Some(candidate) = self.waiting.front() else {
                 break;
             };
-            let prefix_match = self
-                .radix
-                .peek_longest_prefix_match(&candidate.prompt_tokens);
+            let prefix_match = if self.config.enable_prefix_cache {
+                self.radix
+                    .peek_longest_prefix_match(&candidate.prompt_tokens)
+            } else {
+                PrefixMatch::empty()
+            };
             let prefill_tokens = candidate
                 .prompt_len()
                 .saturating_sub(prefix_match.matched_len);
@@ -684,7 +694,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .waiting
                 .pop_front()
                 .expect("waiting.front() was Some above");
-            let prefix_match = self.radix.longest_prefix_match(&request.prompt_tokens);
+            let prefix_match = if self.config.enable_prefix_cache {
+                self.radix.longest_prefix_match(&request.prompt_tokens)
+            } else {
+                PrefixMatch::empty()
+            };
             self.attach_prefix_to_request(slot, &mut request, prefix_match)?;
 
             remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(

@@ -446,7 +446,32 @@ mod backend {
         let kind = detect_cuda_model_kind(model_path)?;
 
         let model_source = model_path.to_string();
-        let scheduler = config.scheduler_config();
+        let mut scheduler = config.scheduler_config();
+        // Cross-request prompt-prefix reuse (the host radix cache) is only sound
+        // when a cached prefix's KV can be re-attached to a new slot and read
+        // back unchanged — i.e. a page-addressable full-attention pool. The
+        // hybrid / recurrent-KV models advance per-slot state in place and assert
+        // contiguous appends from a reset (`seq_len == start_pos`):
+        //   - DSv4: sliding-window ring + compressor/indexer running state,
+        //   - Qwen3.5/3.6 MoE: gated-delta linear-attention recurrent state +
+        //     conv ring (the majority of its layers).
+        // Neither can honor a prefix-cache `start_pos > 0`, so prefix reuse is
+        // disabled for them and every request resets at `start_pos == 0`. Only
+        // pure full-attention Qwen3-dense keeps it. (Default stays on — see
+        // `SchedulerConfig::enable_prefix_cache`.)
+        if matches!(kind, CudaModelKind::Dsv4 | CudaModelKind::Qwen3Moe) {
+            scheduler.enable_prefix_cache = false;
+        }
+        // DSv4 additionally has no multi-rank chunked-prefill path yet (the NCCL
+        // lockstep desyncs across chunk boundaries), so pin to single-chunk
+        // prefill until that lands. Both the rank-0 coordinator and the worker
+        // ranks build through this same helper with the same `kind`, so the two
+        // stay in lockstep.
+        if matches!(kind, CudaModelKind::Dsv4) {
+            scheduler.chunked_prefill_size = scheduler
+                .chunked_prefill_size
+                .max(infer_cuda::dsv4_max_seq_len());
+        }
         let num_slots = config.num_slots;
         let total_pages = config.total_pages;
         let page_size = config.page_size;
