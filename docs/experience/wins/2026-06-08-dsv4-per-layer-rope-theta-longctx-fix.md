@@ -37,10 +37,10 @@ their mis-rotated logits dominate and drown the correct SW contribution.
 - `softmax_scale = head_dim**-0.5`, **no mscale** (line 251) — YaRN only touches the
   freq ramp, no attention-scale coupling.
 
-The prior "always rope_theta, no YaRN" matched the old-tree `reference.rs` and
-`errors/2026-05-29-dsv4-longctx-rope-conflation` (which asserted the model
-"intentionally" dots Q@10000 against compressed-K@160000) — that was wrong;
-reference.rs encoded the same bug. Docs are not truth.
+The prior "always rope_theta, no YaRN" matched the old-tree `reference.rs` (and a
+2026-05-29 fix that "validated" the inverted direction — see the useful-error
+trail in [`../errors/2026-06-08-dsv4-longctx-prefill-corruption-not-attention-kernel.md`]).
+That direction was wrong; `reference.rs` encoded the same bug. SGLang > reference.rs.
 
 ## What Worked
 
@@ -76,12 +76,41 @@ neutral-to-slightly-better vs the ~27 ms-tok baseline
 (`reference_dsv4_decode_6ms_path_state`). No regression (B=1 decode is GPU-bound;
 a theta constant swap adds no compute).
 
-## Residual (next)
+## Long-context follow-on (`6e2e572e` — reconcile + caps)
 
-seq ≥ 241 recalls the needle *region* (`738…`) but loses trailing digits
-(`291`). No longer catastrophic — a separate, smaller mechanism (compression
-fidelity at cr=4/128 for early-position fine detail, or a long-position rope/YaRN
-detail). Investigate independently; do NOT conflate with the collapse above.
+Reaching past 32K needed two more unrelated fixes (committed `6e2e572e`), found
+by sweeping the needle up the length axis:
+
+- **`chunked_prefill_size = 4096`** (was `max(.., dsv4_max_seq_len())`). The
+  prefix-cache fix (`702454fe`) pinned single-chunk prefill to dodge a
+  *hypothesized* multi-rank NCCL chunk-boundary desync, but origin/main's
+  `query_chunk` memory-bounding asserts each prefill call passes ≤
+  `DSV4_PREFILL_QUERY_CHUNK`(4096) query tokens → >4096 prompts hit
+  `M=6400 > query chunk 4096` and crash the engine. **The desync hypothesis was
+  FALSE** (verified: a *single* 64K request = 13 contiguous chunks, multi-rank,
+  completes in 29.5s, no hang — the "hang" seen first was two concurrent requests
+  on a KV-budget-clamped 1-slot serve).
+- **Lift `max_prompt_tokens`/`max_total_tokens` to `dsv4_max_seq_len()`** for
+  DSv4 (`loaded.rs`). The 32768/65536 defaults silently returned an **empty**
+  completion (0.1s, `out=''`) for any prompt >32K — the real 900K blocker, masked
+  as "model can't go long."
+
+Extended needle ladder (depth-0, default config): **32K (25,567 tok) → `738291`
+exact ✓**; 64K (51,107) processes in 29.5s (recalls `738…`, digits noisy).
+
+## Residual (next, separate)
+
+1. **Borderline exact-digit retrieval >~2K.** Reliably finds the needle *region*
+   (`738…`) but the trailing digits (`291`) are noisy/non-deterministic (8K = 1/2
+   exact, 32K flips run-to-run). Compression fidelity (cr=4/128 blur of
+   early-position detail) + MoE non-determinism. Not catastrophic; investigate
+   apart from the collapse above.
+2. **900K prefill is host-bound.** At 900K the `infer-engine` thread runs at 90%
+   CPU while all 8 GPUs sit at 0% util / 120 W idle — per-chunk host-side prep
+   (CSA selection / metadata over ~225K compressed blocks × ~220 chunks) starves
+   the GPU, so prefill crawls (>10 min, no GPU progress; 32K/64K are fine). A
+   perf wall at extreme length, **not** correctness. Profile + move per-chunk prep
+   off the engine critical path.
 
 ## Rule
 
