@@ -25,6 +25,9 @@ ctrlc = "3"
 dialoguer = "0.11"
 hf-hub = { version = "0.5", features = ["tokio"] }
 indicatif = "0.18"
+# DSv4 multiproc-serve: coordinator -> worker death-detect pipe (Unix `pipe(2)`).
+# Used only by `serve_multiproc` (cfg(all(unix, feature = "cuda"))).
+libc = "0.2"
 agent = { path = "../agent" }
 autograd = { path = "../autograd", default-features = false }
 chat = { path = "../chat" }

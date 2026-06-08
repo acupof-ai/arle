@@ -39,6 +39,7 @@ use infer_seam::{BackendExecutor, KvPool, PollResult};
 
 mod execution;
 mod http;
+pub mod multiproc_relay;
 mod schema;
 mod tokenizer;
 
@@ -46,6 +47,10 @@ use execution::{ControlMessage, Submission, engine_loop};
 pub use execution::{CounterSnapshot, StreamItem};
 
 pub use http::openai_router;
+pub use multiproc_relay::{
+    PendingRelayCoordinator, RelayCompletionDelta, RelayCoordinator, RelayEnvelope, RelayWorker,
+    WireRequest, broadcast_admission, set_admission_broadcaster,
+};
 pub use schema::{
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
 };
