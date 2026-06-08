@@ -20,10 +20,11 @@ ignore = [
     # `paste` proc-macro is unmaintained. Pulled in transitively by several
     # crates; no actively-exploited security implication, low priority swap.
     "RUSTSEC-2024-0436",
-    # `rand::rng()` unsound with a custom logger. We do not install a
-    # custom global logger that would trigger the unsound path; track the
-    # `rand` 0.10 fix when it ships.
-    "RUSTSEC-2026-0097",
+    # `proc-macro-error2` is unmaintained (a fork of the also-unmaintained
+    # `proc-macro-error`). Build-time only, pulled in transitively via
+    # fastrace-macro -> fastrace -> infer-api; no runtime/security surface.
+    # Revisit when fastrace drops the dep or migrates its macro error path.
+    "RUSTSEC-2026-0173",
     # Three `rustls`/`webpki`/CRL-related vulnerabilities. Pulled in via
     # reqwest's TLS path. Bumping the TLS stack is queued as a deliberate
     # PR; ignoring here so dep-bumps unrelated to TLS don't get blocked.
