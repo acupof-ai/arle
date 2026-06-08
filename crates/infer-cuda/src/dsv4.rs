@@ -2596,9 +2596,16 @@ fn dsv4_decode_graph_enabled() -> bool {
 
 /// Whole-step decode CUDA graph: capture the ENTIRE per-token forward (all layers
 /// + the 86 all-reduces + tail) as ONE graph, replayed with ~0 host orchestration.
-/// Collapses the ~100 per-sub-capture host gaps (~14ms/token) that make B=1 decode
-/// host-bound (nsys: ~94% GPU-idle). Requires ARLE_DSV4_DECODE_GRAPH=1 too (uses its
-/// pre-allocated scratch). Opt-in (capture of 86 NCCL ARs in one graph is unproven).
+/// Requires ARLE_DSV4_DECODE_GRAPH=1 (reuses its pre-allocated scratch).
+///
+/// STATUS (2026-06-08): VALIDATED-CORRECT but WALL-NEUTRAL — kept as gated infra, not
+/// default. The 86-NCCL-all-reduces-in-one-graph capture WORKS and is byte-identical,
+/// but the A/B is wall-neutral (eager 30.38 / per-portion 30.13 / whole-step 30.32 tok/s):
+/// removing ALL host orchestration moves the wall 0%, which is the DEFINITIVE proof that
+/// B=1 decode is GPU/critical-path-bound, NOT host-bound (the earlier "94% GPU-idle" was a
+/// harness-window artifact). Retained as the re-runnable host-vs-GPU diagnostic and the only
+/// concrete capturable-whole-decode reference for future tree-EAGLE/chain-fusion work.
+/// See docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md.
 fn dsv4_whole_step_graph_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_WHOLE_STEP_GRAPH").as_deref(),
