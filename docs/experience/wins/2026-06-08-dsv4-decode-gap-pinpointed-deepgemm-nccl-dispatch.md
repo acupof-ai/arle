@@ -1,3 +1,7 @@
+> **SUPERSEDED (2026-06-08).** The host-DISPATCH-gap framing here was harness-confounded
+> (the 396µs were inter-run idle). Decode is GPU/critical-path-bound (proven by the
+> wall-neutral whole-step graph). Final word: `2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md`.
+
 # DSv4 decode gap PINPOINTED: DeepGEMM + NCCL host-DISPATCH (~396µs / ~1.36ms per call)
 
 ## Context
