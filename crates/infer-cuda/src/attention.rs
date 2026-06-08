@@ -4527,6 +4527,34 @@ pub(crate) fn mla_attention(
     // ── 5. O-LoRA: wo_a (per o-group, down to the output latent) → wo_b (up
     // back to hidden). Row-parallel: the all-reduce-sum is the model's concern.
     // SAFETY: dsv4_linear writes the full latent buffer.
+    mla_oproj(
+        ctx,
+        attention,
+        state,
+        &local_attn,
+        token_count,
+        keepalive,
+        out,
+    )
+}
+
+/// O-LoRA output projection, extracted from `mla_attention` so the batched-decode
+/// path can call it ONCE over [N] rows (Phase 4): `wo_a` (down to the output latent)
+/// → `wo_b` (up to hidden) into `out`. Row-parallel — the all-reduce-sum is the
+/// caller's concern. Decode (token_count==1) and prefill (token_count>1) DeepGEMM
+/// paths + the scalar fallback are preserved byte-for-byte; batched decode passes
+/// token_count=N to hit the prefill DeepGEMM branch (M=N amortizes the wo weight read).
+#[allow(clippy::too_many_arguments)]
+fn mla_oproj(
+    ctx: &DeviceContext,
+    attention: &Dsv4Attention,
+    state: &mut Dsv4LayerAttentionState,
+    local_attn: &HiddenStates,
+    token_count: usize,
+    keepalive: &mut Dsv4ForwardKeepalive,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    // SAFETY: dsv4_linear writes the full latent buffer.
     let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a.rows, token_count)? };
     let wo_dg = token_count == 1
         && dsv4_decode_proj_deepgemm_enabled()
@@ -4551,7 +4579,7 @@ pub(crate) fn mla_attention(
                 ctx,
                 scratch,
                 wo_a_cache,
-                &local_attn,
+                local_attn,
                 &mut latent,
                 attention.wo_a.cols,
             )
@@ -4586,7 +4614,7 @@ pub(crate) fn mla_attention(
                 .as_mut()
                 .expect("wo prefill gate checked");
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-                prefill_proj_deepgemm(ctx, scratch, wo_a_cache, &local_attn, &mut latent)
+                prefill_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, &mut latent)
             })?;
         }
         drop(nvtx_wo_a);
@@ -4605,7 +4633,7 @@ pub(crate) fn mla_attention(
     } else {
         let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            dsv4_linear(ctx, &attention.wo_a, &local_attn, &mut latent)
+            dsv4_linear(ctx, &attention.wo_a, local_attn, &mut latent)
         })?;
         drop(nvtx_wo_a);
         keepalive.keep_hidden(&latent);
