@@ -871,6 +871,9 @@ impl Dsv4CudaExecutor {
         ensure!(num_slots > 0, "Dsv4CudaExecutor requires at least one slot");
         ensure!(max_seq_len > 0, "Dsv4CudaExecutor requires max_seq_len > 0");
         let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(model_path.as_ref())?;
+        // Dynamic KV mem budget: clamp num_slots to what GPU free mem affords (was: fixed
+        // num_slots → c=32 OOM crash at long max_seq_len). Deterministic ⇒ TP-consistent.
+        let num_slots = model.kv_budget_num_slots(num_slots, max_seq_len);
         let kv_adapter = model.new_kv_adapter(max_seq_len, num_slots)?;
         let mut slots = Vec::with_capacity(num_slots);
         for slot_idx in 0..num_slots {
