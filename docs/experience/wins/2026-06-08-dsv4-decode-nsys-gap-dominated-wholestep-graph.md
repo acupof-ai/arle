@@ -1,3 +1,8 @@
+> **SUPERSEDED (2026-06-08).** The "host-bound / GPU-idle / whole-step graph is the lever"
+> conclusion here was DISPROVEN: the whole-step graph was built + tested → wall-neutral →
+> decode is GPU/critical-path-bound, not host-bound (the GPU-idle % was a harness-window
+> artifact). Final word: `2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md`.
+
 # DSv4 decode nsys: GAP-dominated (~60% GPU-idle) — the 6ms lever is a WHOLE-STEP graph
 
 ## Context

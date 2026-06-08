@@ -1341,61 +1341,10 @@ impl Dsv4CudaExecutor {
         // non-spec (validated 2026-06-08: batched MTP byte-identical on needle+capital,
         // +61/+70%). See errors/2026-06-08-dsv4-batched-verify-col1-wrong.md.
 
-        // === DEPTH-2 MTP ACCEPT-RATE PROBE (isolated; selftest resets, no rollback) ===
-        // License-or-kill the multi-token MTP direction (the decode-6ms lever): does the
-        // depth-1 head chain to a usable 2nd draft? d1 drafts L+1, d2 chains from d1's
-        // stream to draft L+2; verify the [pending,d1,d2] chain and report whether each
-        // matches the real token (d1 vs real@L+1, d2 vs real@L+2). Opt-in (adds 2 MTP
-        // forwards + a verify); measured 2026-06-08: depth-1 3/3, depth-2-top1 1/3
-        // (~33%) → depth-2 sequential is only ~+15%, not the 6ms path (needs tree top-K).
-        if std::env::var_os("ARLE_DSV4_MTP_DEPTH2_PROBE").is_some() {
-            self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
-            let (pending, prefill_hidden) = self.model.forward_tokens_with_hidden(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                prompt,
-                0,
-                &params,
-                start_pos as u64,
-            )?;
-            let (d1, d1_stream) = self.model.mtp_forward(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                &prefill_hidden,
-                pending,
-                start_pos as u64,
-            )?;
-            let (d2, _d2_stream) = self.model.mtp_forward(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                &d1_stream,
-                d1,
-                (start_pos + 1) as u64,
-            )?;
-            self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
-            self.model.forward_tokens(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                prompt,
-                0,
-                &params,
-                start_pos as u64,
-            )?;
-            let (verify3, _) = self.model.forward_tokens_verify(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                &[pending, d1, d2],
-                start_pos,
-                (start_pos + 1) as u64,
-            )?;
-            let d1_accept = verify3.first().copied() == Some(d1);
-            let d2_accept = verify3.get(1).copied() == Some(d2);
-            if self.model.tp.config().rank == 0 {
-                eprintln!(
-                    "[dsv4-mtp-depth2-probe] pending={pending} d1={d1} d2={d2} verify3={verify3:?} d1_accept={d1_accept} d2_accept={d2_accept}"
-                );
-            }
-        }
+        // Depth-2 sequential MTP probe REMOVED 2026-06-08 (killed): measured depth-1 3/3,
+        // depth-2-top1 1/3 (~33% accept) → sequential chain is only ~+15%, not the 6ms
+        // path. The single MTP head caps multi-step drafts; tree-EAGLE (top-K) is the
+        // amortization lever beyond depth-1. See the consolidated decode-6ms report.
 
         self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
         self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
