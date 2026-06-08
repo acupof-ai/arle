@@ -76,10 +76,32 @@ attached cleanly and most of the prompt was a cache hit (only the tail
 recomputed). Pre-fix this turn returned `engine thread closed before request 1
 completed`.
 
+**Correctness gate — reuse is bit-exact, not just non-crashing.** The open
+question (and the reason `702454fe` disabled recurrent-KV reuse on CUDA) was
+whether a slot resumed at `start_pos > 0` reconstructs the gated-delta recurrent
++ conv-ring state correctly, or silently decodes wrong. `agent-bench::tests::
+metal_prefix_reuse_parity_qwen36` (canonical Qwen3.6 MoE) drives prompt `P` cold
+(caches it) then drives `P` again — the second request reconstructs the slot at
+the deepest cached page boundary (192/200), re-prefills only the `[192,200)`
+tail, and decodes. Metal greedy is deterministic, so the floor is exact match:
+
+```
+cold  (ticks=28 fp=0x56076e604b0bf0e6)
+reuse (ticks=25 fp=0x56076e604b0bf0e6)   ← identical fingerprint
+```
+
+Bit-for-bit identical greedy continuation ⇒ `materialize_slot_from_prefix`
+reconstructs the recurrent/GDR state correctly; `ticks 25 < 28` ⇒ reuse engaged
+(skipped prefill). This is the difference from CUDA: the CUDA executor advances
+KV in place and asserts contiguous appends (`seq_len == start_pos`), so it cannot
+honor `start_pos > 0` and `702454fe` rightly disables it there; the Metal
+executor reconstructs a fresh contiguous slot, so reuse is sound. The two fixes
+are complementary, not contradictory.
+
 Regression test (CPU, no GPU): `infer-core::tests::
 prefix_match_clamped_to_backend_reusable_pages` — a `LimitedPrefixExecutor` that
 can attach only 1 page while the radix offers 2; asserts `prefill_start_pos` is
-clamped 8→4. `cargo test -p infer-core` 32 passed; `clippy -D warnings` clean on
+clamped 8→4. `cargo test -p infer-core` 33 passed; `clippy -D warnings` clean on
 `infer-core`/`infer-seam`/`infer-metal`.
 
 Why not a guidellm sweep: guidellm fires **independent** requests and never
