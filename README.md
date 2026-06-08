@@ -88,7 +88,7 @@ More copy-paste: [`examples/`](examples/).
 | **OPD train (CUDA)** | Linux + NVIDIA | **Beta** | 2.49–2.91× faster than HF TRL `GKDTrainer`; LoRA fits 4 GB cards |
 | **CPU** | Portable | **Dev-only** | Smoke tests only |
 
-Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B) on CUDA + Metal. **DeepSeek-V4-Flash** is in active multi-GPU bring-up (TP=8 / EP=8 FP8 MoE on 8×H20 — decode kernels landing gated, prefill in repair); **Qwen 3.6** is #2 ([ROADMAP](ROADMAP.md#next-model-priority-order)).
+Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B) on CUDA + Metal. **DeepSeek-V4-Flash** is in active multi-GPU bring-up (TP=8 / EP=8 FP8 MoE on 8×H20 — official DSA + DeepGEMM prefill default-on at ~23 ms, B=1 decode down to 15 ms/token via MTP batched verify); **Qwen 3.6** is #2 ([ROADMAP](ROADMAP.md#next-model-priority-order)).
 
 Full numbers and tier policy: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
@@ -172,6 +172,12 @@ Operators wanting only serving can run `arle serve` — the same HTTP contract, 
 ## Latest Updates
 
 <!-- Breakthrough-only headlines (shipped capability / perf wins). Research notes + retractions live in docs/. -->
+
+**2026-06-08 — DeepSeek-V4-Flash B=1 latency: prefill 23 ms, decode 27 → 15 ms** (8×H20, TP=8 / EP=8, FP8 MoE). The official DSA indexer flattened decode across context (legacy `csa_select` 124 ms → ~26 ms @4k, 4.8×); the MLA / output projections moved from scalar GEMV to tensor-core DeepGEMM (−94% per stage → prefill ~23 ms); and MTP depth-1 batched verify amortized the serial critical path for **+71% decode tok/s** (39.9 → 64.2), byte-identical. Eight per-kernel levers (whole-step CUDA graph, mhc_params uint4, M=1 GEMV, comm-overlap, …) all **washed** — B=1 decode is GPU-bound on the critical path, so 15 ms is the sound single-request ceiling; 6 ms needs tree-EAGLE + mega-kernel fusion or batching (M=N). [FINAL report](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md).
+
+<p align="center">
+  <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 latency optimization journey: decode context-scaling fix, prefill DeepGEMM projections, and the MTP-amortized decode wall" width="100%">
+</p>
 
 **2026-06-02 — Metal Qwen3.6 A/B refreshed.** ARLE and mlx-lm are in the same steady TPOT band from 128 to 12k input tokens; the README chart now shows TTFT + steady TPOT only. [Wins entry](docs/experience/wins/2026-06-02-metal-ttft-tpot-steady.md).
 
