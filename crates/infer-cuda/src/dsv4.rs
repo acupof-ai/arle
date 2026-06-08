@@ -792,6 +792,45 @@ impl Dsv4Model {
         Dsv4SlotState::new(self, max_seq_len, slot_idx, kv_adapter)
     }
 
+    /// Clamp `requested` decode slots to what the per-rank KV budget affords, from
+    /// `cudaMemGetInfo() × MEM_FRACTION ÷ per-slot KV bytes`. This is the dynamic-mem-budget
+    /// fix for the c=32 OOM CRASH (root cause: a fixed `num_slots` whose arena alloc OOMs at
+    /// high concurrency × long `max_seq_len`). Deterministic formula ⇒ TP-consistent (all
+    /// ranks compute the same clamp from ~balanced post-weights free mem — a per-rank
+    /// measure-and-retry would diverge across ranks and corrupt the KV). The EXACT FP8 arena
+    /// term (`max_seq_len × bytes_per_token × num_layers`) is scaled ×2 to cover the
+    /// compressor/SW/indexer per-slot buffers + forward activations on top.
+    pub(crate) fn kv_budget_num_slots(&self, requested: usize, max_seq_len: usize) -> usize {
+        const MEM_FRACTION: f64 = 0.9;
+        const PER_SLOT_OVERHEAD_X: usize = 2;
+        let arena_per_slot = max_seq_len
+            .saturating_mul(self.kv_arena.bytes_per_token)
+            .saturating_mul(self.kv_arena.num_layers);
+        let per_slot = arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X);
+        if per_slot == 0 {
+            return requested.max(1);
+        }
+        let free = match cudarc::driver::result::mem_get_info() {
+            Ok((free, _total)) => free,
+            // Can't query (no active context / driver error) → don't clamp, let alloc decide.
+            Err(_) => return requested,
+        };
+        let budget = (free as f64 * MEM_FRACTION) as usize;
+        let affordable = (budget / per_slot).max(1);
+        if requested > affordable {
+            log::warn!(
+                "DSv4 KV budget: requested {requested} slots × ~{}MB/slot = ~{}MB, but only \
+                 ~{}MB affordable ({MEM_FRACTION}×{}MB free post-weights); clamping num_slots \
+                 to {affordable}. Lower --max-seq-len ({max_seq_len}) to raise concurrency.",
+                per_slot >> 20,
+                requested.saturating_mul(per_slot) >> 20,
+                budget >> 20,
+                free >> 20,
+            );
+        }
+        requested.min(affordable)
+    }
+
     pub(crate) fn truncate_slot(&self, slot: &mut Dsv4SlotState, new_len: usize) -> Result<()> {
         slot.truncate(&self.layers, new_len)
     }
