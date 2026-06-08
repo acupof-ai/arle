@@ -2396,6 +2396,40 @@ mod tests {
     }
 
     #[test]
+    fn prefill_chunk_stops_on_page_boundary() -> Result<()> {
+        // page_size 4, 10-token prompt, ample budget: the first chunk must stop
+        // at the last page boundary (8) instead of crossing it to the prompt end
+        // (10), so a hybrid backend snapshots recurrent state at every page
+        // boundary the radix later caches. The 2-token sub-page tail follows next
+        // tick. Pairs with `prefix_match_clamped_to_backend_reusable_pages`: the
+        // clamp is the safety floor, this alignment is the reuse-coverage win.
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 4, 16),
+            test_config(1),
+        );
+        engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 1);
+
+        let mut prefilling_positions = Vec::new();
+        for _ in 0..6 {
+            engine.step()?;
+            if let Some(request) = engine.active.values().next() {
+                if matches!(request.phase, RequestPhase::Prefilling { .. }) {
+                    prefilling_positions.push(request.prefill_start_pos);
+                }
+            }
+        }
+        // The chunk landed on page boundary 8 (a Prefilling progress value).
+        // Without alignment the single chunk [0,10) would jump straight to
+        // Decoding and 8 would never appear.
+        assert!(
+            prefilling_positions.contains(&8),
+            "prefill chunk must stop on page boundary 8, got {prefilling_positions:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn r1d_chunked_prefill_advances_progress_across_ticks() -> Result<()> {
         let mut config = test_config(1);
         config.chunked_prefill_size = 2;

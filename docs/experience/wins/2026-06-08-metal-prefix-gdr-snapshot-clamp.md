@@ -88,14 +88,35 @@ lives on. The two-turn agent repro is the discriminating instrument. The hot
 decode loop is untouched; the change only adds a bounded prefix-key scan on the
 admission/attach path (zero cost on the CUDA default).
 
+## Follow-up landed: planner page-aligns prefill chunk ends (perf layer)
+
+The clamp alone leaves a per-turn tail re-prefill: the radix's deepest cached
+boundary (`floor(prompt_len/16)*16`) lands inside the final prefill chunk, which
+has no GDR snapshot, so the clamp drops it back to the previous boundary and
+re-prefills the gap (~6ms/turn). Fix (`infer-core/src/planner.rs`,
+`build_forward_plan`): stop a prefill chunk on a page boundary when it would
+otherwise cross one mid-chunk (`aligned_end = chunk_end - chunk_end % page_size`;
+shrink to it when `aligned_end > start_pos`). A chunk can no longer skip a page
+boundary without landing on it, so Metal snapshots GDR at every boundary the
+radix later offers as its deepest match. The sub-page tail (no boundary left)
+is emitted as-is — one extra tiny tick at most. Page-sliceable backends (CUDA
+paged attention) are unaffected functionally; the only change is chunk
+boundaries shift to page multiples.
+
+This is the perf layer **on top of** the clamp, not a replacement: chunks are
+larger than a page (64 in the repro), so page boundaries *inside* a chunk
+(16/32/48/80…) are still radix-offerable but unsnapshotted — a prefix hit there
+still relies on the clamp for safety. Alignment only guarantees the *deepest*
+boundary (the common agent-REPL case where the shared prefix = the full system
+prompt) is reusable. Regression test: `prefill_chunk_stops_on_page_boundary`.
+
+CUDA bench: `pending-remote` — this planner change touches the shared CPU
+scheduler so it affects the CUDA path's chunk boundaries; cannot run CUDA on
+this Mac. Expected delta ≈ 0 (one extra ≤page-size prefill tick per request at
+most). Verify on the 8×H20 pod before relying on it for CUDA.
+
 ## Honest read / deferred (not silent)
 
-- **Perpetual tail re-prefill.** Each turn the radix's deepest cached boundary
-  (`floor(prompt_len/16)*16`) lands inside the final prefill chunk, so ≤1 chunk
-  is re-prefilled every turn. Inherent to chunked-prefill × GDR; the clamp makes
-  it *correct* but doesn't eliminate it. Full fix = split the final prefill chunk
-  at the last page boundary so Metal snapshots there too — a planner change
-  affecting all backends, deferred to its own evaluation.
 - **Snapshot staleness under eviction (latent, separate bug).** `MetalPageStore.
   pages/prefixes` are not pruned when the host radix LRU-evicts a page; if a page
   id is recycled, a stale snapshot could be read. The 2-turn repro has no
