@@ -88,7 +88,7 @@ arle --doctor --json              # CI 友好自检
 | **OPD 训练(CUDA)** | Linux + NVIDIA | **Beta** | **对比 HuggingFace TRL `GKDTrainer` 同配置快 2.04×**(Qwen3-0.6B)。**LoRA 模式 0.140 s/step + 仅 3.9 GB 峰值** —— 4 GB 消费级显卡可跑。跨 runtime 大 teacher 路径已端到端验证(Qwen3.5-4B → 0.8B LoRA)。详见 [最新动态](#最新动态)。 |
 | **CPU** | 通用 | **仅开发用** | 冒烟测试,不作为性能目标。 |
 
-模型:**Qwen3.5 全家族**(0.8B / 4B / 30B-A3B / 35B)在 CUDA + Metal 上支持。后续模型队列:**DeepSeek V4 (#1)** → **Qwen 3.6 (#2)** —— 见 [ROADMAP.md](ROADMAP.md#next-model-priority-order)。
+模型:**Qwen3.5 全家族**(0.8B / 4B / 30B-A3B / 35B)在 CUDA + Metal 上支持。**DeepSeek-V4-Flash** 多卡 bring-up 进行中(8×H20 上 TP=8 / EP=8 FP8 MoE —— 官方 DSA + DeepGEMM prefill 默认开启 ~23 ms,B=1 decode 经 MTP batched verify 降到 15 ms/token);**Qwen 3.6** 为 #2 —— 见 [ROADMAP.md](ROADMAP.md#next-model-priority-order)。
 
 权威支持矩阵:[docs/support-matrix.md](docs/support-matrix.md) · [docs/stability-policy.md](docs/stability-policy.md)。
 
@@ -132,6 +132,12 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 ## 最新动态
 
 <!-- 最近 1-2 条,更早历史见 CHANGELOG.md。 -->
+
+**2026-06-08 — DeepSeek-V4-Flash B=1 延迟:prefill 23 ms,decode 27 → 15 ms**(8×H20,TP=8 / EP=8,FP8 MoE)。官方 DSA indexer 让 decode 不再随上下文增长(legacy `csa_select` 124 ms → ~26 ms @4k,4.8×);MLA / output 投影从 scalar GEMV 换成 tensor-core DeepGEMM(每段 −94% → prefill ~23 ms);MTP depth-1 batched verify 摊薄串行关键路径,**decode tok/s +71%**(39.9 → 64.2),逐字节一致。八个 per-kernel 杠杆(whole-step CUDA graph、mhc_params uint4、M=1 GEMV、comm-overlap …)全部 **wash** —— B=1 decode 卡在关键路径上、GPU-bound,所以 15 ms 是单请求的合理地板;6 ms 需要 tree-EAGLE + mega-kernel 融合或 batching(M=N)。[最终报告](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md)。
+
+<p align="center">
+  <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 延迟优化历程:decode 不再随上下文增长、prefill DeepGEMM 投影、MTP 摊薄的 decode wall" width="100%">
+</p>
 
 **2026-05-21 — ARLE OPD CUDA:更快 + 更省显存,对比 HuggingFace TRL。**
 同 Qwen3-0.6B teacher/student、32 prompts、`rollout_len=8`、`lr=1e-7`、500 步、AdamW、RTX 4070 Ti SUPER。
