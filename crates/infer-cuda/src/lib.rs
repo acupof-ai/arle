@@ -65,6 +65,9 @@ pub use qwen35::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 pub use executor::dsv4_max_seq_len;
 #[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
+/// Rank-0 NCCL `unique_id` mint for multiproc launchers (see [`loader::mint_nccl_unique_id_hex`]).
+#[cfg(feature = "nccl")]
+pub use loader::mint_nccl_unique_id_hex;
 
 /// Process-local override for DSv4 FlashMLA decode dispatch. `None` restores the
 /// `ARLE_DSV4_FLASHMLA_DECODE` env gate. Intended for resident A/B harnesses

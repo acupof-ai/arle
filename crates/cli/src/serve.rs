@@ -57,6 +57,36 @@ fn run_config(config: ServeConfig) -> ExitCode {
     if let Some(warning) = config.bind_warning.as_deref() {
         eprintln!("[ARLE serve] warning: {warning}");
     }
+
+    // DSv4 + CUDA: become the multiproc-serve COORDINATOR (rank 0). Bind the
+    // relay, spawn N-1 worker processes (one per GPU via INFER_CUDA_DEVICES /
+    // INFER_TP_SIZE), accept their relay connects, boot-ping, install the
+    // admission broadcaster — THEN fall through to the normal in-process serve
+    // below (rank 0 owns HTTP). The broadcaster fans out each request the rank-0
+    // engine admits to the workers so they step their executors' NCCL `forward`
+    // in lockstep. The guard holds the relay + worker pipes for the serve loop's
+    // lifetime; dropping it on return EOFs the workers so they exit. On a single
+    // GPU it is a no-op and serve proceeds single-process. Non-DSv4 models skip
+    // this entirely.
+    //
+    // `// STAGE 3:` chunked-prefill scratch chunk-bounding + the decode path
+    // beyond a single short prompt are later stages (see Stage-2 markers in
+    // `serve_multiproc.rs` / `multiproc_relay.rs` / `execution.rs`).
+    #[cfg(all(unix, feature = "cuda"))]
+    let _coordinator_guard = if config.backend == ServeBackend::Cuda
+        && crate::serve_multiproc::is_dsv4_model(&config.options.model_path)
+    {
+        match crate::serve_multiproc::bind_relay_and_spawn_workers(&config.options.model_path) {
+            Ok(guard) => guard,
+            Err(err) => {
+                eprintln!("[ARLE serve] multiproc coordinator setup failed: {err:#}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
     eprintln!(
         "[ARLE serve] starting {} backend in-process on {}:{}",
         config.backend.label(),

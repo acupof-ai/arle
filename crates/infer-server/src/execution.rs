@@ -200,6 +200,19 @@ fn admit_submission<E, K>(
     E: BackendExecutor,
     K: KvPool,
 {
+    // Multiproc lockstep (Stage 2): broadcast this request to worker ranks 1..N-1
+    // BEFORE submitting it to the local rank-0 Engine, mirroring the old
+    // `DistributedSchedulerGroup::submit` ordering (`e81b98fb^:infer/src/
+    // request_handle.rs:909` broadcast `Request2 { wire }` ahead of `permit.submit`).
+    // This site is the single deterministic admission point on the engine thread,
+    // so every rank admits the same requests in the same FIFO order and their
+    // deterministic planners build identical per-step batches. On single-process
+    // serves no broadcaster is installed, so this is a cheap no-op load.
+    crate::broadcast_admission(
+        &submission.prompt,
+        submission.max_tokens,
+        &submission.sampling,
+    );
     let handle = engine.submit_request_with_options(
         submission.prompt,
         submission.max_tokens,
