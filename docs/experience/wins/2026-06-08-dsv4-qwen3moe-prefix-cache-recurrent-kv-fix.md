@@ -35,9 +35,17 @@ prefix reuse) gates the radix `longest_prefix_match` / `peek_longest_prefix_matc
 (empty match ⇒ every request resets at `start_pos == 0`). `cuda_serve_handle`
 flips it **off** for `Dsv4 | Qwen3Moe`. Both the rank-0 coordinator and worker
 ranks build through that same helper with the same `kind`, so the disable stays
-in lockstep across the NCCL group. DSv4 additionally pins single-chunk prefill
-(`chunked_prefill_size = max(.., dsv4_max_seq_len())`) since the multi-rank
-chunked-prefill lockstep is not wired yet.
+in lockstep across the NCCL group.
+
+> **Correction (`6e2e572e`).** This commit also pinned `chunked_prefill_size =
+> max(.., dsv4_max_seq_len())` (single-chunk) on a *hypothesized* multi-rank NCCL
+> chunk-boundary desync. That hypothesis was **FALSE** and single-chunk conflicts
+> with origin/main's `query_chunk` memory bound (asserts ≤4096 query tok/call) —
+> >4096 prompts crashed the engine and 900K OOMs. Reverted to
+> `chunked_prefill_size = 4096`; multi-rank chunked prefill works (single 64K = 13
+> contiguous chunks, 29.5s, no hang). Same commit lifts the 32768 `max_prompt_tokens`
+> cap (it silently returned empty for >32K prompts). See
+> [`2026-06-08-dsv4-per-layer-rope-theta-longctx-fix.md`].
 
 **Verified:** a back-to-back needle sweep (50 / 130 / 300 / 596 + a repeat —
 prompts sharing the `<｜User｜>…` prefix) ran to completion with **0**
