@@ -257,6 +257,14 @@ impl BackendExecutor for MetalExecutor {
         Vec::new()
     }
 
+    fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_ref() {
+            return real.page_store.reusable_prefix_pages(block_ids);
+        }
+        block_ids.len()
+    }
+
     fn warmup(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_mut() {
@@ -655,6 +663,19 @@ struct MetalPrefixSnapshot {
 
 #[cfg(feature = "metal")]
 impl MetalPageStore {
+    /// Largest leading page count of `block_ids` (in prompt order) for which a
+    /// GDR prefix snapshot exists. The host radix caches every page boundary,
+    /// but linear-attention (GDR) recurrent/conv state is only snapshotted at
+    /// the page boundaries a forward pass landed on; attaching at any other
+    /// boundary fails in `materialize_slot_from_prefix`. Engine-core clamps the
+    /// offered prefix to this so it never asks for a boundary we can't serve.
+    fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
+        (1..=block_ids.len())
+            .rev()
+            .find(|&k| self.prefixes.contains_key(&block_ids[..k]))
+            .unwrap_or(0)
+    }
+
     fn publish_slot(&mut self, slot: &MetalSlotState, kv: &dyn KvPool) -> anyhow::Result<()> {
         let page_size = kv.page_size().max(1);
         let full_pages = slot.cache_len / page_size;
