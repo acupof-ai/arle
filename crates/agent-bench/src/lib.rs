@@ -1190,6 +1190,70 @@ mod tests {
         Ok(())
     }
 
+    /// REAL Metal prefix-reuse CORRECTNESS gate on the canonical Qwen3.6 MoE
+    /// (gated-delta linear-attention recurrent state + conv ring — the model
+    /// whose cross-request reuse `702454fe` disabled on CUDA as unsound).
+    ///
+    /// Decisive question: does `materialize_slot_from_prefix` reconstruct the
+    /// recurrent/GDR state so a slot resumed at `start_pos > 0` decodes
+    /// identically to a fresh cold prefill? Metal greedy is deterministic (see
+    /// `metal_c1_greedy_fingerprint_qwen35_08b`), so the floor is exact match.
+    ///
+    /// One model load: drive prompt `P` cold (caches `P`), then drive `P` again
+    /// — the radix now serves a partial prefix, so the second request
+    /// reconstructs the slot at the deepest cached page boundary, prefills only
+    /// the sub-page tail, and decodes. `G_reuse == G_cold` bit-for-bit ⇒ reuse
+    /// is sound (keep the clamp + page-align fix); a mismatch ⇒ recurrent reuse
+    /// corrupts state (revert and disable it on Metal too, mirroring 702454fe).
+    /// `ticks_reuse < ticks_cold` proves reuse actually engaged (skipped prefill).
+    ///   CUDARC_CUDA_VERSION=12060 cargo test --release -p agent-bench \
+    ///     --no-default-features --features metal,no-cuda \
+    ///     metal_prefix_reuse_parity_qwen36 -- --ignored --nocapture
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "real Metal prefix-reuse parity; needs --features metal + cached Qwen3.6-35B-A3B-4bit"]
+    fn metal_prefix_reuse_parity_qwen36() -> Result<()> {
+        let model = "mlx-community/Qwen3.6-35B-A3B-4bit";
+        // 200 raw ids (avoid 0 = engine STOP). 200 tokens = 12 full pages + an
+        // 8-token tail at page_size 16, so the second request reuses 192 tokens
+        // and re-prefills only [192,200): the real partial-reuse path.
+        let prompt: Vec<u32> = (10u32..210).collect();
+        let n_gen = 24usize;
+
+        let (mut engine, _ttft) = metal_engine_from_model_path(model)?;
+        let cold = drive_concurrent(&mut engine, &[(prompt.clone(), n_gen)]);
+        let reuse = drive_concurrent(&mut engine, &[(prompt.clone(), n_gen)]);
+        eprintln!(
+            "[metal prefix-reuse parity Qwen3.6] cold(err={:?} ticks={} fp={:#018x}) \
+             reuse(err={:?} ticks={} fp={:#018x})",
+            cold.step_error,
+            cold.ticks,
+            cold.fingerprint(),
+            reuse.step_error,
+            reuse.ticks,
+            reuse.fingerprint(),
+        );
+
+        assert!(cold.step_error.is_none(), "cold run errored: {cold:?}");
+        assert!(reuse.step_error.is_none(), "reuse run errored: {reuse:?}");
+        let g_cold = cold.generated.first().cloned().unwrap_or_default();
+        let g_reuse = reuse.generated.first().cloned().unwrap_or_default();
+        assert_eq!(g_cold.len(), n_gen, "cold run must decode {n_gen} tokens");
+        assert_eq!(g_reuse.len(), n_gen, "reuse run must decode {n_gen} tokens");
+        assert!(
+            reuse.ticks < cold.ticks,
+            "reuse must skip prefill (engaged): cold ticks {} vs reuse ticks {}",
+            cold.ticks,
+            reuse.ticks
+        );
+        assert_eq!(
+            g_reuse, g_cold,
+            "prefix-reuse greedy continuation must match cold prefill bit-for-bit \
+             — a mismatch means recurrent/GDR state reconstruction is unsound"
+        );
+        Ok(())
+    }
+
     /// H20 greedy-parity harness for the clean CUDA BF16 Qwen3 forward.
     ///
     /// Raw token ids (no tokenizer): greedy decode is deterministic given the ids,
