@@ -4037,12 +4037,28 @@ pub(crate) fn mla_attention(
     );
 
     let rope = &config.rope_parameters;
-    // Q / SW-K / output RoPE is ALWAYS the main rope_theta with NO YaRN, for
-    // every layer regardless of compress_ratio (only the COMPRESSED keys use
-    // compress_rope_theta — applied inside `compressor_forward`). This matches
-    // the validated long-context fix (errors/2026-05-29-dsv4-longctx-rope...).
-    let rope_base = config.rope_theta;
-    let original_seq_len = 0i32;
+    // RoPE base/YaRN is PER-LAYER, matching the canonical SGLang impl
+    // (deepseek_v4.py:271 `rope_base = compress_rope_theta if compress_ratio else
+    // rope_theta`, and fused_qk_norm_rope_swa_store which ropes Q + SW-K with ONE
+    // per-layer cos/sin cache): compressed layers (CSA cr=4 / HCA cr=128) rope Q,
+    // SW-K, the output inverse-rope AND the compressor with compress_rope_theta +
+    // YaRN(original_max_position_embeddings); pure-SW layers (cr=0) use rope_theta
+    // with no YaRN. Q MUST share the compressed-key theta or Q·compressed-K phase
+    // mismatches and long context (>~80 tok) collapses to garbage. (The prior
+    // "always rope_theta, no YaRN" matched the old-tree reference.rs /
+    // errors/2026-05-29-dsv4-longctx-rope-conflation, not the canonical model —
+    // SGLang ropes everything on a compressed layer at compress_rope_theta.)
+    let (rope_base, original_seq_len) = if compress_ratio > 0 {
+        let osl = i32::try_from(rope.original_max_position_embeddings).map_err(|_| {
+            anyhow!(
+                "DSv4 original_max_position_embeddings {} overflows i32",
+                rope.original_max_position_embeddings
+            )
+        })?;
+        (config.compress_rope_theta, osl)
+    } else {
+        (config.rope_theta, 0i32)
+    };
     let start_pos_i32 = i32::try_from(start_pos)
         .map_err(|_| anyhow::anyhow!("DSv4 MLA start_pos {start_pos} overflows i32"))?;
 
@@ -4330,7 +4346,9 @@ pub(crate) fn mla_attention(
                 start_pos,
                 start_pos_device,
                 true,
-                0,
+                // YaRN on for compressed layers (matches Q/SW-K + SGLang
+                // compressor freqs_cis); original_seq_len = orig_max_pos here.
+                original_seq_len,
                 keepalive,
             )?;
         }
