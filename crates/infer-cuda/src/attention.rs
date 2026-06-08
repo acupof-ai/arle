@@ -869,6 +869,12 @@ impl Dsv4PrefillDeepGemmLinearScratch {
     }
 }
 
+/// Query-dimension tile for the official DSA indexer prefill. The logits scratch
+/// is `TILE × compressed_capacity` (f32); tiling the query axis keeps it bounded
+/// (e.g. compress_ratio=4 @ 900K ctx: 4096 × 225024 × 4B ≈ 3.7 GB instead of ~810 GB).
+/// This is the only path — long prompts loop in tiles, never materialize full-N logits.
+const DSV4_DSA_PREFILL_QUERY_TILE: usize = 4096;
+
 struct Dsv4DsaOfficialState {
     slot_idx: usize,
     key_cache_len: usize,
@@ -885,6 +891,7 @@ struct Dsv4DsaOfficialState {
     raw_indices: CudaSlice<i32>,
     packed_rows: usize,
     max_tokens: usize,
+    query_tile: usize,
     compressed_capacity: usize,
     num_pages: usize,
     num_heads: usize,
@@ -925,23 +932,29 @@ impl Dsv4DsaOfficialState {
             "DSv4 official DSA shared slot band missing/invalid for slot {slot_idx}"
         );
         let max_tokens = max_seq_len.max(1);
-        let q_elems = max_tokens
+        // Query-dimension scratch is tiled: bounded by `query_tile` regardless of how
+        // many query tokens a single call passes. When token_count <= query_tile the
+        // compute loop runs a single iteration (offset 0), behavior-identical to the
+        // pre-tiling code. Key-dimension / full-N buffers (rotated_keys, cache_locs,
+        // freqs_cis, raw_indices) stay sized by max_tokens/compressed_capacity.
+        let query_tile = DSV4_DSA_PREFILL_QUERY_TILE.min(max_tokens);
+        let q_elems = query_tile
             .checked_mul(config.index_n_heads)
             .and_then(|v| v.checked_mul(config.index_head_dim))
             .ok_or_else(|| anyhow!("DSv4 official DSA q scratch size overflow"))?;
         let logits_stride = compressed_capacity.div_ceil(256) * 256;
-        let logits_elems = max_tokens
+        let logits_elems = query_tile
             .checked_mul(logits_stride)
             .ok_or_else(|| anyhow!("DSv4 official DSA logits scratch size overflow"))?;
         let cache_locs_h: Vec<i64> = (0..compressed_capacity)
             .map(|v| i64::try_from(v).expect("compressed capacity fits i64"))
             .collect();
         let freqs_cis_h = dsv4_dsa_freqs_cis_real(config, compress_ratio, max_seq_len)?;
-        let page_table_elems = max_tokens
+        let page_table_elems = query_tile
             .checked_mul(num_pages)
             .ok_or_else(|| anyhow!("DSv4 official DSA page table size overflow"))?;
         let mut page_table_h = Vec::with_capacity(page_table_elems);
-        for _ in 0..max_tokens {
+        for _ in 0..query_tile {
             page_table_h
                 .extend((0..num_pages).map(|v| i32::try_from(v).expect("page table fits i32")));
         }
@@ -966,15 +979,15 @@ impl Dsv4DsaOfficialState {
                 .map_err(|e| anyhow!("DSv4 official DSA q fp8 alloc failed: {e}"))?,
             weights: ctx
                 .stream
-                .alloc_zeros::<f32>(max_tokens * config.index_n_heads)
+                .alloc_zeros::<f32>(query_tile * config.index_n_heads)
                 .map_err(|e| anyhow!("DSv4 official DSA weights alloc failed: {e}"))?,
             context_lens: ctx
                 .stream
-                .alloc_zeros::<i32>(max_tokens)
+                .alloc_zeros::<i32>(query_tile)
                 .map_err(|e| anyhow!("DSv4 official DSA context lens alloc failed: {e}"))?,
             positions: ctx
                 .stream
-                .alloc_zeros::<i32>(max_tokens)
+                .alloc_zeros::<i32>(query_tile)
                 .map_err(|e| anyhow!("DSv4 official DSA positions alloc failed: {e}"))?,
             page_table_identity: ctx
                 .stream
@@ -998,6 +1011,7 @@ impl Dsv4DsaOfficialState {
                 .map_err(|e| anyhow!("DSv4 official DSA raw indices alloc failed: {e}"))?,
             packed_rows: 0,
             max_tokens,
+            query_tile,
             compressed_capacity,
             num_pages,
             num_heads: config.index_n_heads,
@@ -5131,144 +5145,207 @@ fn csa_select_official(
     }
 
     let token_count = q_i.seq_len;
+    // Full-length host context_lens (cheap i32 vec); the DUMP block below reads the
+    // global last row from it, and each tile slices its sub-range for H2D.
     let context_lens_h: Vec<i32> = (0..token_count)
         .map(|token| {
             let abs_pos = start_pos + token;
             i32::try_from(std::cmp::min(key_count, abs_pos / ratio))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let positions_h: Vec<i32> = (0..token_count)
-        .map(|token| i32::try_from(start_pos + token))
-        .collect::<Result<Vec<_>, _>>()?;
-    {
-        let mut context_lens = official.context_lens.slice_mut(0..token_count);
-        ctx.stream
-            .memcpy_htod(&context_lens_h, &mut context_lens)
-            .map_err(|e| anyhow!("DSv4 official DSA context_lens H2D failed: {e}"))?;
-        let mut positions = official.positions.slice_mut(0..token_count);
-        ctx.stream
-            .memcpy_htod(&positions_h, &mut positions)
-            .map_err(|e| anyhow!("DSv4 official DSA positions H2D failed: {e}"))?;
-    }
 
+    // Full-N output, allocated once. Each tile writes its disjoint [t0..t0+tlen) slice.
     let mut selected = ctx
         .stream
         .alloc_zeros::<i32>(token_count * config.index_topk)
         .map_err(|e| anyhow!("DSv4 official DSA selected alloc failed: {e}"))?;
-    {
-        let (q_ptr, _qg) = q_i.data.device_ptr(&ctx.stream);
-        let (q_fp8_ptr, _qfg) = official.q_fp8.device_ptr_mut(&ctx.stream);
-        let (w_ptr, _wg) = weights.data.device_ptr(&ctx.stream);
-        let (weights_out_ptr, _wog) = official.weights.device_ptr_mut(&ctx.stream);
-        let (freqs_ptr, _fg) = official.freqs_cis.device_ptr(&ctx.stream);
-        let positions = official.positions.slice(0..token_count);
-        let (positions_ptr, _pg) = positions.device_ptr(&ctx.stream);
+
+    // Query-axis tiling — the ONLY compute path. The logits scratch is bounded by
+    // `tile × logits_stride`; long prompts loop in tiles and never materialize full-N
+    // logits. When token_count <= tile this loop runs a single iteration with t0=0
+    // (tlen=token_count), behavior-IDENTICAL to the pre-tiling code.
+    //
+    // Mutated-buffer enumeration (per-tile correctness):
+    //   official.logits [tile × stride]: overwritten each sub-chunk before topk reads it — safe.
+    //   official.q_fp8/weights/context_lens/positions [tile-sized]: overwritten each
+    //     sub-chunk before use — safe.
+    //   official.page_table_identity [tile × num_pages]: identity, read-only, same for
+    //     every sub-chunk — safe.
+    //   selected / official.raw_indices [full N × topk]: each sub-chunk writes its
+    //     disjoint [t0..t0+tlen) slice — full output assembled, no overlap.
+    //   key-packing buffers (rotated_keys, key cache, cache_locs, packed_rows):
+    //     untouched by this change (handled in the query-independent block above).
+    let tile = official.query_tile;
+    // q_i.data / weights.data are flat [seq_len * per_token_width]; derive per-token
+    // strides so each tile slices the right sub-range of the (untiled) inputs.
+    let q_stride = q_i.data.len() / token_count;
+    ensure!(
+        q_stride * token_count == q_i.data.len(),
+        "DSv4 official DSA q input len {} not divisible by token_count {}",
+        q_i.data.len(),
+        token_count
+    );
+    let w_stride = weights.data.len() / token_count;
+    ensure!(
+        w_stride * token_count == weights.data.len(),
+        "DSv4 official DSA weights input len {} not divisible by token_count {}",
+        weights.data.len(),
+        token_count
+    );
+
+    let mut t0 = 0usize;
+    while t0 < token_count {
+        let tlen = (token_count - t0).min(tile);
+
+        // (a) per-tile context_lens / positions, H2D into the tile-sized scratch.
+        let context_lens_tile: Vec<i32> = (0..tlen)
+            .map(|i| {
+                let abs_pos = start_pos + t0 + i;
+                i32::try_from(std::cmp::min(key_count, abs_pos / ratio))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let positions_tile: Vec<i32> = (0..tlen)
+            .map(|i| i32::try_from(start_pos + t0 + i))
+            .collect::<Result<Vec<_>, _>>()?;
+        {
+            let mut context_lens = official.context_lens.slice_mut(0..tlen);
+            ctx.stream
+                .memcpy_htod(&context_lens_tile, &mut context_lens)
+                .map_err(|e| anyhow!("DSv4 official DSA context_lens H2D failed: {e}"))?;
+            let mut positions = official.positions.slice_mut(0..tlen);
+            ctx.stream
+                .memcpy_htod(&positions_tile, &mut positions)
+                .map_err(|e| anyhow!("DSv4 official DSA positions H2D failed: {e}"))?;
+        }
+
+        // (c) fused Q indexer rope+hadamard+quant over the tile's input sub-range.
+        {
+            let q_in = q_i.data.slice(t0 * q_stride..(t0 + tlen) * q_stride);
+            let (q_ptr, _qg) = q_in.device_ptr(&ctx.stream);
+            let (q_fp8_ptr, _qfg) = official.q_fp8.device_ptr_mut(&ctx.stream);
+            let w_in = weights.data.slice(t0 * w_stride..(t0 + tlen) * w_stride);
+            let (w_ptr, _wg) = w_in.device_ptr(&ctx.stream);
+            let (weights_out_ptr, _wog) = official.weights.device_ptr_mut(&ctx.stream);
+            let (freqs_ptr, _fg) = official.freqs_cis.device_ptr(&ctx.stream);
+            let positions = official.positions.slice(0..tlen);
+            let (positions_ptr, _pg) = positions.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
+                    q_ptr as *const ffi::Half,
+                    q_fp8_ptr as *mut u8,
+                    w_ptr as *const ffi::Half,
+                    weights_out_ptr as *mut f32,
+                    score_scale,
+                    freqs_ptr as *const f32,
+                    positions_ptr as *const i32,
+                    i32::try_from(tlen)?,
+                    i32::try_from(local_index_heads)?,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        // (d) paged MQA logits scheduling metadata for the tile.
         unsafe {
-            ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
-                q_ptr as *const ffi::Half,
-                q_fp8_ptr as *mut u8,
-                w_ptr as *const ffi::Half,
-                weights_out_ptr as *mut f32,
-                score_scale,
-                freqs_ptr as *const f32,
-                positions_ptr as *const i32,
-                i32::try_from(token_count)?,
-                i32::try_from(local_index_heads)?,
+            cuda_moe::dsv4_deepgemm_paged_mqa_logits_metadata(
+                cache_ptr(&official.context_lens, ctx),
+                cache_ptr(&official.sched_meta, ctx),
+                tlen,
+                1,
+                64,
+                official.num_sms,
                 ctx.stream.cu_stream(),
             )
-            .result()?;
+            .map_err(|e| anyhow!("DSv4 official DSA metadata failed: {e}"))?;
         }
+
+        // (e) fused paged FP8 MQA logits → official.logits (tlen rows).
+        {
+            let cache_range = pool.dsa_slot_range(official.slot_idx)?;
+            let cache_pool = pool
+                .dsa_key_cache
+                .as_ref()
+                .ok_or_else(|| anyhow!("DSv4 official DSA shared key-cache missing"))?;
+            ensure!(
+                cache_range.end <= cache_pool.len() && cache_range.len() == official.key_cache_len,
+                "DSv4 official DSA shared key-cache range {:?} invalid pool_len={} slot_len={}",
+                cache_range,
+                cache_pool.len(),
+                official.key_cache_len
+            );
+            let cache_view = cache_pool.slice(cache_range);
+            let (q_ptr, _qg) = official.q_fp8.device_ptr(&ctx.stream);
+            let (cache_ptr_u8, _kg) = cache_view.device_ptr(&ctx.stream);
+            let (weights_ptr, _wg) = official.weights.device_ptr(&ctx.stream);
+            let (lens_ptr, _lg) = official.context_lens.device_ptr(&ctx.stream);
+            let (page_ptr, _pg) = official.page_table_identity.device_ptr(&ctx.stream);
+            let (sched_ptr, _sg) = official.sched_meta.device_ptr(&ctx.stream);
+            let (logits_ptr, _og) = official.logits.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
+                    q_ptr as *const u8,
+                    cache_ptr_u8 as *const u8,
+                    weights_ptr as *const f32,
+                    lens_ptr as *const i32,
+                    page_ptr as *const i32,
+                    sched_ptr as *const i32,
+                    logits_ptr as *mut f32,
+                    i32::try_from(tlen)?,
+                    1,
+                    i32::try_from(local_index_heads)?,
+                    i32::try_from(config.index_head_dim)?,
+                    i32::try_from(official.num_pages)?,
+                    64,
+                    i32::try_from(official.num_pages * 64)?,
+                    i32::try_from(official.logits_stride)?,
+                    i32::try_from(official.num_pages)?,
+                    i32::try_from(64 * (config.index_head_dim + std::mem::size_of::<f32>()))?,
+                    i32::try_from(official.num_sms)?,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 official DSA paged logits failed: {e}"))?;
+            }
+        }
+
+        // (f) topk transform: read official.logits (base), write the tile's disjoint
+        //     output slices of `selected` and `official.raw_indices`.
+        {
+            let context_lens = official.context_lens.slice(0..tlen);
+            let (logits_ptr, _lg) = official.logits.device_ptr(&ctx.stream);
+            let (lens_ptr, _csg) = context_lens.device_ptr(&ctx.stream);
+            let (page_ptr, _ptg) = official.page_table_identity.device_ptr(&ctx.stream);
+            let mut sel =
+                selected.slice_mut(t0 * config.index_topk..(t0 + tlen) * config.index_topk);
+            let (sel_ptr, _seg) = sel.device_ptr_mut(&ctx.stream);
+            let mut raw = official
+                .raw_indices
+                .slice_mut(t0 * config.index_topk..(t0 + tlen) * config.index_topk);
+            let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_deepseek_v4_topk_transform_512_cuda(
+                    logits_ptr as *const f32,
+                    lens_ptr as *const i32,
+                    page_ptr as *const i32,
+                    sel_ptr as *mut i32,
+                    raw_ptr as *mut i32,
+                    i64::try_from(official.logits_stride)?,
+                    i64::try_from(official.num_pages)?,
+                    i64::try_from(config.index_topk)?,
+                    i32::try_from(tlen)?,
+                    i32::try_from(config.index_topk)?,
+                    64,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        t0 += tlen;
     }
     keepalive.keep_u8(&official.q_fp8);
     keepalive.keep_f32(&official.weights);
-
-    let context_lens = official.context_lens.slice(0..token_count);
-    unsafe {
-        cuda_moe::dsv4_deepgemm_paged_mqa_logits_metadata(
-            cache_ptr(&official.context_lens, ctx),
-            cache_ptr(&official.sched_meta, ctx),
-            token_count,
-            1,
-            64,
-            official.num_sms,
-            ctx.stream.cu_stream(),
-        )
-        .map_err(|e| anyhow!("DSv4 official DSA metadata failed: {e}"))?;
-    }
-    {
-        let cache_range = pool.dsa_slot_range(official.slot_idx)?;
-        let cache_pool = pool
-            .dsa_key_cache
-            .as_ref()
-            .ok_or_else(|| anyhow!("DSv4 official DSA shared key-cache missing"))?;
-        ensure!(
-            cache_range.end <= cache_pool.len() && cache_range.len() == official.key_cache_len,
-            "DSv4 official DSA shared key-cache range {:?} invalid pool_len={} slot_len={}",
-            cache_range,
-            cache_pool.len(),
-            official.key_cache_len
-        );
-        let cache_view = cache_pool.slice(cache_range);
-        let (q_ptr, _qg) = official.q_fp8.device_ptr(&ctx.stream);
-        let (cache_ptr_u8, _kg) = cache_view.device_ptr(&ctx.stream);
-        let (weights_ptr, _wg) = official.weights.device_ptr(&ctx.stream);
-        let (lens_ptr, _lg) = official.context_lens.device_ptr(&ctx.stream);
-        let (page_ptr, _pg) = official.page_table_identity.device_ptr(&ctx.stream);
-        let (sched_ptr, _sg) = official.sched_meta.device_ptr(&ctx.stream);
-        let (logits_ptr, _og) = official.logits.device_ptr_mut(&ctx.stream);
-        unsafe {
-            ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
-                q_ptr as *const u8,
-                cache_ptr_u8 as *const u8,
-                weights_ptr as *const f32,
-                lens_ptr as *const i32,
-                page_ptr as *const i32,
-                sched_ptr as *const i32,
-                logits_ptr as *mut f32,
-                i32::try_from(token_count)?,
-                1,
-                i32::try_from(local_index_heads)?,
-                i32::try_from(config.index_head_dim)?,
-                i32::try_from(official.num_pages)?,
-                64,
-                i32::try_from(official.num_pages * 64)?,
-                i32::try_from(official.logits_stride)?,
-                i32::try_from(official.num_pages)?,
-                i32::try_from(64 * (config.index_head_dim + std::mem::size_of::<f32>()))?,
-                i32::try_from(official.num_sms)?,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| anyhow!("DSv4 official DSA paged logits failed: {e}"))?;
-        }
-    }
-    {
-        let (logits_ptr, _lg) = official.logits.device_ptr(&ctx.stream);
-        let (lens_ptr, _csg) = context_lens.device_ptr(&ctx.stream);
-        let (page_ptr, _ptg) = official.page_table_identity.device_ptr(&ctx.stream);
-        let (sel_ptr, _seg) = selected.device_ptr_mut(&ctx.stream);
-        let mut raw = official
-            .raw_indices
-            .slice_mut(0..token_count * config.index_topk);
-        let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
-        unsafe {
-            ffi::dsv4_deepseek_v4_topk_transform_512_cuda(
-                logits_ptr as *const f32,
-                lens_ptr as *const i32,
-                page_ptr as *const i32,
-                sel_ptr as *mut i32,
-                raw_ptr as *mut i32,
-                i64::try_from(official.logits_stride)?,
-                i64::try_from(official.num_pages)?,
-                i64::try_from(config.index_topk)?,
-                i32::try_from(token_count)?,
-                i32::try_from(config.index_topk)?,
-                64,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-    }
     if std::env::var("ARLE_DSV4_CSA_DUMP").as_deref() == Ok("1")
         && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
     {
