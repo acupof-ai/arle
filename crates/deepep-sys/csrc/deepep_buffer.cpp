@@ -22,11 +22,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-// Header layout differs between the old flat DeepEP tree and the new
-// "csrc/kernels/legacy/" refactor. build.rs defines ARLE_DEEPEP_LEGACY_
-// LAYOUT=1 when api.cuh sits under legacy/ — pick the right include +
-// shim the renamed constants (NUM_MAX_NVL_PEERS → LEGACY_NUM_MAX_NVL_PEERS).
-#ifdef ARLE_DEEPEP_LEGACY_LAYOUT
+// DeepEP intranode/layout kernels (upstream csrc/kernels/legacy tree,
+// pinned d4f41e4). The constant aliases hide upstream's NUM_MAX_*
+// constant names behind the clean names our code uses.
 #include "kernels/legacy/api.cuh"
 #include "kernels/legacy/compiled.cuh"
 #ifndef NUM_MAX_NVL_PEERS
@@ -38,15 +36,8 @@
 #ifndef NUM_WORKSPACE_BYTES
 #define NUM_WORKSPACE_BYTES LEGACY_NUM_WORKSPACE_BYTES
 #endif
-// Legacy refactor put intranode/layout under deep_ep::legacy::*.
 namespace deep_ep_intranode_ns = deep_ep::legacy::intranode;
 namespace deep_ep_layout_ns = deep_ep::legacy::layout;
-#else
-#include "kernels/api.cuh"
-#include "kernels/configs.cuh"
-namespace deep_ep_intranode_ns = deep_ep::intranode;
-namespace deep_ep_layout_ns = deep_ep::layout;
-#endif
 
 namespace {
 
@@ -506,3 +497,47 @@ extern "C" void arle_deepep_buffer_destroy(ArleDeepEpBuffer *self) {
 }
 
 extern "C" const char *arle_deepep_last_error(void) { return g_last_error; }
+
+// --- NVSHMEM low-latency force-link probe (T4-LL de-risk 2026-06-09) ---
+//
+// build.rs defines ARLE_DEEPEP_HAVE_NVSHMEM=1 when the internode_ll.cu +
+// backend/nvshmem.cu objects are compiled into libarle_deepep.a. We must
+// FORCE the final link to pull the NVSHMEM device + host libraries even
+// though no ARLE caller invokes the LL path yet — otherwise the linker's
+// default --as-needed drops libnvshmem_host and the archive's NVSHMEM
+// members are never selected (a trivial "link OK" that proves nothing).
+//
+// Mechanism: a file-scope volatile function pointer initialised to the
+// address of deep_ep::nvshmem::get_unique_id (a real host entry point in
+// backend/nvshmem.cu). A static initialiser carrying a symbol relocation
+// CANNOT be folded away by the optimiser, so:
+//   probe .o  --references-->  deep_ep::nvshmem::get_unique_id
+//   backend_nvshmem.o  --references-->  nvshmem_my_pe / nvshmemx_get_uniqueid
+//                                       (undefined host syms)
+//   => libnvshmem_host.so.3 must resolve them at final link.
+// The pointer is read but NEVER called (no nvshmem_init runtime bootstrap
+// in this unit). Returns 1 when NVSHMEM is compiled+linked in, else 0.
+#if defined(ARLE_DEEPEP_HAVE_NVSHMEM)
+namespace deep_ep {
+namespace nvshmem {
+// Forward declaration of the real host entry point (defined in
+// csrc/kernels/backend/nvshmem.cu). Declared here rather than including
+// backend/api.cuh to avoid dragging <nccl.h>/<nccl_device.h> into this TU.
+std::vector<unsigned char> get_unique_id();
+}  // namespace nvshmem
+}  // namespace deep_ep
+
+namespace {
+// Static initialiser → symbol relocation that survives -O2. `volatile`
+// forces the load in the probe to actually happen.
+using ArleNvshmemAnchorFn = std::vector<unsigned char> (*)();
+volatile ArleNvshmemAnchorFn g_arle_nvshmem_anchor =
+    &deep_ep::nvshmem::get_unique_id;
+}  // namespace
+
+extern "C" int arle_deepep_nvshmem_built(void) {
+    return g_arle_nvshmem_anchor != nullptr ? 1 : 0;
+}
+#else
+extern "C" int arle_deepep_nvshmem_built(void) { return 0; }
+#endif
