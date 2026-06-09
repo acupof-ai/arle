@@ -193,12 +193,14 @@ route on-device (reuse dsv4_route_device, topk_idx i64 already on device — NO 
 ```
 **Delete** moe.rs:1594-1647 (recv_topk_idx D2H + i64→i32 loop + per-call allocs).
 
-**T4.4 masked DeepGEMM bridge** — VERIFY/ADD: ARLE has contiguous-pooled grouped GEMM;
-the **masked** variant (`fp8_m_grouped_gemm_nt_masked`, takes `masked_m` device + `expected_m`)
-must exist in `csrc/gemm/deepgemm_native.cu`. If absent, add the bridge (vendored deepgemm
-supports it). `silu_and_mul_masked_post_quant` masked variant likewise (current
-`dsv4_deepgemm_swiglu_quantize_w13` is dense, not masked — needs `masked_m` arg + the
-`[E, tok, hidden]` 3-D layout).
+**T4.4 masked DeepGEMM bridge** — masked GEMM **ALREADY EXISTS**:
+`dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda` (deepgemm_native.cu:1460) →
+`launch_sm90_grouped_masked` (`sm90_fp8_m_grouped_gemm_masked_1d2d_native`, :1097),
+takes `masked_m` device + `expected_m` — exactly `grouped_gemm_nt_f8f8bf16_masked`.
+**Only gap = masked `silu_mul_post_quant`:** current `dsv4_deepgemm_swiglu_quantize_w13`
+is dense; add a masked variant taking `masked_m` + the `[E, max_tok*world, hidden]` 3-D
+layout (SGLang `silu_and_mul_masked_post_quant` ep_moe/kernels.py:366-431,
+grid `(cdiv(n,128), BLOCK_NUM_PER_EXPERT, E)`).
 
 **Buffers mutated (enumerate):** all of `DeepEpLlScratch` (pre-alloc per slot at boot,
 overwritten each decode step — masked_m/recv_count written by dispatch, gemm1_out/act/
