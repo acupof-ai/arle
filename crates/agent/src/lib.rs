@@ -102,7 +102,7 @@ Use tools silently when needed.
 Never expose raw role markers, XML protocol tags, or internal tool protocol in user-facing answers.
 If the user asks for an exact format, output exactly that.
 Do not expose chain-of-thought.";
-const TOOL_PLANNING_MAX_TOKENS: usize = 256;
+const TOOL_PLANNING_MAX_TOKENS: usize = 49_984; // ~50k, 64-aligned (781 * 64)
 const STREAM_POLL_INTERVAL: Duration = Duration::from_micros(200);
 
 #[derive(Clone, Copy, Debug)]
@@ -1945,7 +1945,9 @@ mod tests {
                 &tool_policy(),
                 AgentSettings {
                     max_turns: 4,
-                    max_tokens: 4096,
+                    // Above the planning cap so `min` resolves to the cap and
+                    // the assertion exercises the clamp (not the setting).
+                    max_tokens: 262_144,
                     temperature: 0.0,
                 },
             )
