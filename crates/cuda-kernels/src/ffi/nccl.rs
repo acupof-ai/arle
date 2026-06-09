@@ -75,6 +75,18 @@ unsafe extern "C" {
         rank: i32,
     ) -> ncclResult_t;
     pub fn ncclCommDestroy(comm: ncclComm_t) -> ncclResult_t;
+    /// Split the parent comm into sub-comms. COLLECTIVE over `comm`: every
+    /// parent rank must call it together. Ranks sharing a `color` join the same
+    /// `newcomm`, ordered by `key`. `config` is passed as null (`*mut c_void`)
+    /// so the sub-comm inherits the parent's config — avoids binding the
+    /// `ncclConfig_t` struct / `NCCL_CONFIG_INITIALIZER` magic.
+    pub fn ncclCommSplit(
+        comm: ncclComm_t,
+        color: i32,
+        key: i32,
+        newcomm: *mut ncclComm_t,
+        config: *mut std::os::raw::c_void,
+    ) -> ncclResult_t;
     pub fn ncclAllReduce(
         sendbuff: *const std::ffi::c_void,
         recvbuff: *mut std::ffi::c_void,
