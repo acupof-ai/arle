@@ -44,6 +44,14 @@ This is the *same class* as the prefix-cache recurrent-KV bug: the generic sched
 **Verified:** 256K (204,338 tok) admits → forwards (GPU 100%) → completes in **55.4s**,
 retrieves `738291` exact (was: infinite spin, never completed).
 
+**900K milestone (the original blocker):** with this fix + the prefill perf wins
+(parallel compressor + indexer-DeepGEMM), the 900K needle now **runs end-to-end** —
+`prompt_tokens=718,295`, **wall 270.3s (~4.5 min), all 8 GPUs at ~385W (≈95% TDP,
+high MFU)** — where it previously spun forever at GPU 0%. The top-k selection finds
+the needle region even at 718K tokens (`out=' 7387413…'`). Exact-digit retrieval
+still drifts (`738741` vs `738291`) — the compression-fidelity + MoE residual
+(separate task), not a selection or admission failure.
+
 ## Rule / follow-up
 
 - A request stuck in `waiting` keeps `is_idle()` false → the engine **busy-spins**
