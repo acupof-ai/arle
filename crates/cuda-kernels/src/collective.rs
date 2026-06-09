@@ -172,6 +172,42 @@ mod nccl_backend {
             })
         }
 
+        /// Split this comm into a sub-comm via `ncclCommSplit`. COLLECTIVE over
+        /// the parent comm: every parent rank must call `split` together, in the
+        /// same order. Ranks sharing `color` join the same sub-comm, ordered by
+        /// `key`. Returns a fresh `NcclBackend` owning the sub-comm: its `Drop`
+        /// independently calls `ncclCommDestroy` on the sub-comm, so there is no
+        /// aliasing with — and no double-free of — the parent's comm.
+        ///
+        /// `world_size`/`rank` of the returned backend are the sub-comm's local
+        /// membership: the number of ranks sharing `color` and this rank's `key`
+        /// within that color (the caller knows both from the partition).
+        ///
+        /// `// T2.3 will consume this` — DSv4 attn_tp / moe_ep sub-collectives.
+        ///
+        /// # Errors
+        /// Propagates the NCCL `ncclCommSplit` error.
+        #[allow(dead_code)] // T2.3 will consume this
+        pub fn split(
+            &self,
+            color: i32,
+            key: i32,
+            sub_world: usize,
+            sub_rank: usize,
+        ) -> Result<Self> {
+            let mut newcomm: nccl::ncclComm_t = std::ptr::null_mut();
+            // `config = null` ⇒ the sub-comm inherits the parent's config.
+            let res = unsafe {
+                nccl::ncclCommSplit(self.comm, color, key, &mut newcomm, std::ptr::null_mut())
+            };
+            nccl::check(res)?;
+            Ok(Self {
+                comm: newcomm,
+                world_size: sub_world,
+                rank: sub_rank,
+            })
+        }
+
         /// Host-visible all-gather for small byte payloads such as CUDA IPC
         /// handles. The payload is staged through an `i32` device buffer so this
         /// reuses NCCL all-gather without adding a host-side rendezvous path.

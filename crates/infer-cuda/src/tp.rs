@@ -85,6 +85,16 @@ impl TpComm {
 pub struct TpRuntime {
     config: TpConfig,
     comm: TpComm,
+    /// Attention tensor-parallel sub-communicator (DSv4 DP-attention).
+    /// Under the default TP8/EP8 route this aliases [`TpComm::Single`] because
+    /// the attn_tp groups equal the global comm (attn_dp=1).
+    // T2.3 will consume this (DP-attention token-owned EP sub-collectives).
+    attn_tp: TpComm,
+    /// MoE expert-parallel sub-communicator (DSv4 token-owned EP).
+    /// Under the default TP8/EP8 route this aliases [`TpComm::Single`] because
+    /// `ep_size == tp_size` ⇒ the moe_ep groups equal the global comm.
+    // T2.3 will consume this (DP-attention token-owned EP sub-collectives).
+    moe_ep: TpComm,
 }
 
 impl TpRuntime {
@@ -94,6 +104,8 @@ impl TpRuntime {
         Self {
             config: TpConfig::single(),
             comm: TpComm::single(),
+            attn_tp: TpComm::single(),
+            moe_ep: TpComm::single(),
         }
     }
 
@@ -105,13 +117,22 @@ impl TpRuntime {
         Self {
             config,
             comm: TpComm::single(),
+            attn_tp: TpComm::single(),
+            moe_ep: TpComm::single(),
         }
     }
 
-    /// Build a runtime from a config and an explicit communicator.
+    /// Build a runtime from a config and an explicit communicator. The sub-comms
+    /// default to the no-op [`TpComm::single`]; [`Self::from_env_with_nccl`] is
+    /// the path that builds real attn_tp / moe_ep sub-comms.
     #[must_use]
     pub fn with_comm(config: TpConfig, comm: TpComm) -> Self {
-        Self { config, comm }
+        Self {
+            config,
+            comm,
+            attn_tp: TpComm::single(),
+            moe_ep: TpComm::single(),
+        }
     }
 
     /// Resolve the runtime from env with the no-op communicator.
@@ -134,16 +155,72 @@ impl TpRuntime {
     pub fn from_env_with_nccl(
         unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
     ) -> anyhow::Result<Self> {
+        use infer_topo::{MultiAxisConfig, build_attn_tp_groups, build_moe_ep_groups};
+
         let config = resolve_tp_config_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
         if config.is_single() {
             return Ok(Self::new(config));
         }
-        let backend = cuda_kernels::collective::NcclBackend::init_rank(
-            unique_id,
-            config.world_size,
-            config.rank,
-        )?;
-        Ok(Self::with_comm(config, TpComm::Nccl(Box::new(backend))))
+        let world_size = config.world_size;
+        let rank = config.rank;
+        let backend =
+            cuda_kernels::collective::NcclBackend::init_rank(unique_id, world_size, rank)?;
+
+        // Env-driven axis config. Under the default TP8/EP8 this yields attn_dp=1
+        // ⇒ attn_tp groups == the global group, and ep_size == tp_size ⇒ moe_ep
+        // groups == the global group, so both splits below alias the global comm.
+        // `cfg` is identical on every rank, so the skip-if-single-group decision
+        // (and thus the sequence of `split` collectives) is identical across all
+        // ranks — required for `ncclCommSplit` collective-ordering correctness.
+        let cfg = MultiAxisConfig::current_route_from_env_with_defaults(world_size, world_size)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // IMPORTANT: do attn_tp then moe_ep, unconditionally-in-the-same-order on
+        // every rank. `split_sub_comm` skips the split only when the partition is
+        // a single global group (identical decision on all ranks).
+        let attn_tp = Self::split_sub_comm(&backend, &build_attn_tp_groups(cfg), rank)?;
+        let moe_ep = Self::split_sub_comm(&backend, &build_moe_ep_groups(cfg), rank)?;
+
+        Ok(Self {
+            config,
+            comm: TpComm::Nccl(Box::new(backend)),
+            attn_tp,
+            moe_ep,
+        })
+    }
+
+    /// Build a sub-communicator for `rank` from a rank-partition `groups`
+    /// (each inner Vec = the ranks in one group). If `groups.len() == 1` the
+    /// partition is a single global group (sub-size == tp_size, the builder
+    /// returned the global group), so we skip the redundant `ncclCommSplit`
+    /// (all ranks share one color ⇒ a wasteful global-comm clone + extra
+    /// collective) and return the no-op [`TpComm::single`]. Otherwise we locate
+    /// this rank's `color`/`key` and split the parent comm.
+    ///
+    /// Collective-ordering: callers MUST invoke this in the same order on every
+    /// rank with the same (identical-per-rank) `groups`, so the skip-or-split
+    /// decision and the resulting `split` collective sequence match across ranks.
+    #[cfg(feature = "nccl")]
+    fn split_sub_comm(
+        backend: &cuda_kernels::collective::NcclBackend,
+        groups: &[Vec<usize>],
+        rank: usize,
+    ) -> anyhow::Result<TpComm> {
+        // Single global group ⇒ sub-comm aliases the global comm. Skip the split.
+        if groups.len() == 1 {
+            return Ok(TpComm::single());
+        }
+        let color = groups
+            .iter()
+            .position(|g| g.contains(&rank))
+            .ok_or_else(|| anyhow::anyhow!("rank {rank} not present in any sub-group partition"))?;
+        let key = groups[color]
+            .iter()
+            .position(|&r| r == rank)
+            .ok_or_else(|| anyhow::anyhow!("rank {rank} not present in its own sub-group"))?;
+        let sub_world = groups[color].len();
+        let sub = backend.split(color as i32, key as i32, sub_world, key)?;
+        Ok(TpComm::Nccl(Box::new(sub)))
     }
 
     /// The resolved tensor-parallel placement.
@@ -156,6 +233,22 @@ impl TpRuntime {
     #[must_use]
     pub fn comm(&self) -> &TpComm {
         &self.comm
+    }
+
+    /// The attention tensor-parallel sub-communicator (DSv4 DP-attention).
+    /// Aliases [`TpComm::Single`] under the default TP8/EP8 route.
+    #[must_use]
+    #[allow(dead_code)] // T2.3 will consume this
+    pub fn attn_tp(&self) -> &TpComm {
+        &self.attn_tp
+    }
+
+    /// The MoE expert-parallel sub-communicator (DSv4 token-owned EP).
+    /// Aliases [`TpComm::Single`] under the default TP8/EP8 route.
+    #[must_use]
+    #[allow(dead_code)] // T2.3 will consume this
+    pub fn moe_ep(&self) -> &TpComm {
+        &self.moe_ep
     }
 
     /// Whether this runtime is single-GPU (no all-reduce needed).
@@ -181,15 +274,34 @@ impl TpRuntime {
     /// # Errors
     /// Propagates the NCCL all-reduce error on multi-rank builds.
     #[cfg(feature = "cuda")]
-    // Without `nccl` the only arm is `Single => Ok(())`, so the args are unused;
-    // that is the intended single-GPU no-op, not a bug.
-    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub fn all_reduce_sum(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: &mut cuda_kernels::prelude::HiddenStates,
     ) -> anyhow::Result<()> {
-        match &self.comm {
+        self.all_reduce_sum_over(&self.comm, ctx, buf)
+    }
+
+    /// All-reduce (sum) in place over an explicit communicator (the global TP
+    /// comm, or one of the [`Self::attn_tp`] / [`Self::moe_ep`] sub-comms).
+    /// Same body as [`Self::all_reduce_sum`] but on the passed `comm`.
+    /// `// T2.3 will consume this` — DSv4 DP-attention token-owned EP reductions.
+    ///
+    /// # Errors
+    /// Propagates the NCCL all-reduce error on multi-rank builds.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    // T2.3 will consume this
+    // Without `nccl` the only arm is `Single => Ok(())`, so the args are unused;
+    // that is the intended single-GPU no-op, not a bug.
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
+    pub fn all_reduce_sum_over(
+        &self,
+        comm: &TpComm,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        buf: &mut cuda_kernels::prelude::HiddenStates,
+    ) -> anyhow::Result<()> {
+        match comm {
             TpComm::Single => Ok(()),
             #[cfg(feature = "nccl")]
             TpComm::Nccl(backend) => {
