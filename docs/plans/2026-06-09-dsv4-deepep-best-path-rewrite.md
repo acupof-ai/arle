@@ -56,10 +56,27 @@ buffer still carries replicated rows → over-transport. "Just swap to LL" fails
 
 ---
 
-## T1 — fail-fast + startup observability  (land first, ~2 files)
+## Deletion-style mandate (ckl 2026-06-09)
 
-**Goal:** the DSv4 path declares its effective contract and refuses to *claim* the
-SGLang lane when components are missing. No perf claim; default route byte-unchanged.
+DeepEP is currently unusable (not default, not validated) → **delete the old
+replicated-token normal-mode path now**, don't gate it. No parallel old+new
+(`feedback_no_half_states`). The LL contract is the only deepep we build toward; the
+old `dsv4_moe_forward_deepep` glue + its dead deepep.rs helpers are deleted in Unit 1.
+`=deepep` bails ("reimplementing to LL") until T4 lands. The default allreduce
+low-latency lane (38.24 B=1) stays untouched throughout.
+
+## T1 — delete old deepep + fail-fast/observability  (land first, Unit 1)
+
+**Goal:** declare the effective contract, fail-fast on a false SGLang-lane claim, and
+**delete the old normal-mode deepep MoE path** (the D2H/per-call-alloc glue). No perf
+claim; default allreduce route byte-unchanged.
+
+**Delete:** `dsv4_moe_forward_deepep` (moe.rs:1471-1724) + its `pub(crate) use`
+re-export (moe.rs:2651); route the `if use_deepep_transport` branch (dsv4.rs:1734-1753)
+to `bail!("deepep reimplementing to LL; use allreduce")`. Grep then delete the
+now-orphaned deepep.rs normal `dispatch`/`combine`/`alloc_scratch`/`DeepEpDispatchScratch`
+(only callers were the deleted fn). Keep `DeepEpTransport` boot+struct (hosts the LL
+methods next). Keep deepep-sys (gets LL FFI in T4).
 
 **Files:** `crates/infer-cuda/src/dsv4.rs` (engine build), `crates/infer-api/src/loaded.rs` (serve log).
 
