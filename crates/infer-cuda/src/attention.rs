@@ -2628,18 +2628,21 @@ fn dsv4_prefill_proj_deepgemm_enabled() -> bool {
     )
 }
 
-/// Prefill DSA indexer query projection → DeepGEMM (134.9 → 6.05ms, −95.5% at M=1024,
-/// clean per-stage A/B). SEPARATE default-OFF flag from the residual wq_b/wo: the
-/// indexer feeds the top-k block SELECTOR, so an FP8 numeric flip could change
-/// selection — unlike the residual GEMMs it is NOT validated by a byte-identical
-/// needle (the 37-tok needle is < sliding_window so the indexer never runs, and an
-/// ad-hoc long-context needle has no planted answer). Gate ON only after a
-/// planted-answer long-context needle (dsv4_parity) confirms retrieval. Toggle:
-/// ARLE_DSV4_PREFILL_INDEXER_DEEPGEMM=1.
+/// Prefill DSA indexer query projection → DeepGEMM (134.9 → 6.05ms, −95.5% at M=1024).
+/// **Default ON (licensed 2026-06-09).** This was the #1 prefill GPU kernel — the
+/// nsys 64K breakdown pinned `dsv4_fp8_gemv_batch_tiled` (this indexer query proj)
+/// at **38.4% of all GPU time** (25ms/call, scalar token-looped GEMV). It feeds the
+/// top-k block SELECTOR, so it was gated OFF pending a planted-answer long-context
+/// needle (an FP8 flip could shift selection). That gate is now MET: with it ON, the
+/// planted needle (738291) **retrieves** — 64K hit `738291` exact, 128K hit `738291`
+/// exact, and every run finds the needle region (selection intact). Same-binary A/B:
+/// 64K prefill 17.6s → 11.0s (−37%), 128K 42.7s → 23.0s (−46%). The exact-digit
+/// borderline at ≥2K is the pre-existing compression-fidelity residual (tracked
+/// separately), NOT a selection break. Opt out with ARLE_DSV4_PREFILL_INDEXER_DEEPGEMM=0.
 fn dsv4_prefill_indexer_deepgemm_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ARLE_DSV4_PREFILL_INDEXER_DEEPGEMM").as_deref(),
-        Ok("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
     )
 }
 
