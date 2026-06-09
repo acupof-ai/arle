@@ -311,11 +311,27 @@ T5 graph + spec
 Unit-1 deleted the *messy* normal path; T4n rebuilds it **clean + token-owned** (slice +
 all-gather, no replicated dispatch, no D2H glue) — not a revert.
 
+## NVSHMEM de-risk — ALL RESOLVED (2026-06-09, proven on 8×H20)
+
+1. **Build+link:** `internode_ll.cu`+`nvshmem.cu` compile (`-rdc=true`+dlink) and the `arle`
+   binary links (`readelf NEEDED libnvshmem_host.so.3`).
+2. **Legacy-clean build:** collapsed single-path deepep-sys (`c0e6983f`) still builds+links
+   NVSHMEM on pod (`ec=0`).
+3. **Runtime init:** standalone 8-rank smoke — `nvshmemx_init_attr(WITH_UNIQUEID)` boots all
+   8 PEs in ~7s, `my_pe`=0..7, `barrier_all` OK, no timeout. The May "same-process timeout"
+   was the same-process model; **multi-process UID bootstrap works**.
+
+**Proven bootstrap recipe (→ ARLE deepep-sys):** rank0 `nvshmemx_get_uniqueid(&uid)` →
+broadcast 128B uid → all ranks `nvshmemx_set_attr_uniqueid_args(rank,world,&uid,&attr)` →
+`nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID,&attr)`. Env (single-node NVLink):
+`NVSHMEM_REMOTE_TRANSPORT=none NVSHMEM_DISABLE_MNNVL=1 NVSHMEM_BOOTSTRAP=UID`,
+`LD_LIBRARY_PATH` has the nvshmem lib (pulls `nvshmem_bootstrap_uid.so.3`). NVSHMEM 3.3,
+CUDA 12.9. Smoke refs at pod `/data01/build/nvshmem_smoke.*`. (Production internode RDMA
+adds `NVSHMEM_IB_ENABLE_IBGDA=1` — DeepEP legacy.py:108.)
+
 ## Risks / kill-criteria
 - **B=1 masquerade:** measure only batched; B=1 "loss" is by construction.
-- **NVSHMEM boot (T4-LL only):** standalone 8-rank `nvshmem_init` smoke BEFORE the LL FFI;
-  if it times out, LL is deferred and token-owned NORMAL deepep ships as best path (still
-  kills the fanout tax).
+- ~~NVSHMEM boot~~ **RESOLVED above** — deepep_ll unblocked.
 - **Masked DeepGEMM exists** (`dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda`); only masked
   silu_mul_quant to add (T4.4), and only on the LL track.
 - **T2 forward surgery is the bulk:** 86 all-reduces × 4 variants (T2.5); land per-variant,
