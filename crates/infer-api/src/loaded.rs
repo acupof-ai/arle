@@ -483,8 +483,23 @@ mod backend {
             scheduler.max_total_tokens = scheduler.max_total_tokens.max(max_seq + 4096);
         }
         let num_slots = config.num_slots;
-        let total_pages = config.total_pages;
         let page_size = config.page_size;
+        let mut total_pages = config.total_pages;
+        if matches!(kind, CudaModelKind::Dsv4) {
+            // The host CudaKvPool is a DUMMY for DSv4 (the real KV is recurrent —
+            // SW ring + compressed — owned by the executor). But the scheduler
+            // still gates ADMISSION on its page count: `request_pages_needed =
+            // (prompt_len + max_tokens) / page_size` (a full-attention estimate).
+            // The 8192-page default caps admission at `8192 * page_size` tokens
+            // (= 128K @ page_size 16), so a >128K prompt's pages_needed exceeds the
+            // pool → `admit_waiting` rejects it → it sits in `waiting` → `is_idle()`
+            // is never true → the engine spins `while !is_idle()` forever (100% CPU,
+            // no forward, GPU 0%). Size the dummy pool to the model's max context so
+            // long prompts admit. `CudaKvPool::new` allocates NO HBM (just a
+            // `Vec<u32>` of page ids), so this is free.
+            let need = (infer_cuda::dsv4_max_seq_len() + 4096).div_ceil(page_size.max(1));
+            total_pages = total_pages.max(need);
+        }
         let serve = ServeHandle::spawn_with_engine_builder(move || {
             let executor = match kind {
                 CudaModelKind::Qwen3Dense => CudaExecutor::from_qwen3_bf16_safetensors(
