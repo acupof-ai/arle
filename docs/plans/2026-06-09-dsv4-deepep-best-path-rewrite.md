@@ -274,8 +274,41 @@ skips 10-20m DeepGEMM warmup) + `--features cuda,nccl,deepep` (reuses cached
 `libarle_deepep.a`; verified `deepep-sys` seconds-recompile). Prebuilt-archive symbol
 gate already in `cuda-kernels/build.rs:1502-1594`. Feature-forward landed `ae889cce`.
 
+## Re-sequencing (2026-06-09 de-risk) — NVSHMEM-LL goes LAST
+
+Big win = killing the 4.46× replicated-token fanout = **token ownership (T2)**, NOT LL
+mode. LL is a decode refinement on top, the **only** piece needing NVSHMEM
+(`internode_ll`). Probe: `internode_ll.cu` + `libnvshmem_host.so.3` + `nvshmem.h` present
+on the pod, but ARLE deepep-sys builds **intranode/IPC only** (never compiled
+`internode_ll`/`nvshmem.cu`); NVSHMEM runtime init under our launcher unverified. Order:
+
+**Token ownership for the MoE win does NOT need full DP-attention.** In TP8 every rank
+already holds the replicated post-attention hidden; rank r **slices** its `[r·n/8 :
+(r+1)·n/8]` token shard, deepep-dispatches only those (total dispatched = n, not 8n →
+fanout fixed), combines its shard, then **all-gather** reconstructs full `[n,h]` for the
+next layer's TP8 attention. This banks the fanout-fix win without the attention-resharding
+surgery. Full DP-attention (sharding attention compute/KV too) is a later perf layer.
+
+```
+T2.2 comm infra ........... ✓ 81cac74e (moe_ep comm; TP8/EP8 aliases global)
+T4n: token-owned deepep NORMAL MoE on TP8  ← NEXT, THE WIN, no NVSHMEM
+     slice replicated hidden [r·n/8:(r+1)·n/8] → deepep dispatch (intranode IPC,
+     deepep-sys C++ exists) → grouped DeepGEMM experts → deepep combine → all-gather.
+     Replaces moe all-reduce. Clean rebuild of the Unit-1-deleted path, token-owned.
+T4-LL: NVSHMEM 8-rank nvshmem_init smoke → IF boots → internode_ll FFI + masked silu,
+       decode LL refinement (packed FP8, no glue). NVSHMEM unknown isolated here.
+T2-DP: full DP-attention (shard attention compute) — perf layer, deferred
+T5 graph + spec
+```
+Unit-1 deleted the *messy* normal path; T4n rebuilds it **clean + token-owned** (slice +
+all-gather, no replicated dispatch, no D2H glue) — not a revert.
+
 ## Risks / kill-criteria
 - **B=1 masquerade:** measure only batched; B=1 "loss" is by construction.
-- **NVSHMEM boot (T4):** verify LL `internode_ll` inits under multiproc before code (wholesale-adopt §4 same-process-timeout).
-- **Masked DeepGEMM/act-quant may be absent (T4.4):** verify bridges before T4.3, else add first.
-- **T2 is weeks:** if post-T1 batched DeepEP-normal already shows over-transport dominating, that quantifies T2 ROI before committing.
+- **NVSHMEM boot (T4-LL only):** standalone 8-rank `nvshmem_init` smoke BEFORE the LL FFI;
+  if it times out, LL is deferred and token-owned NORMAL deepep ships as best path (still
+  kills the fanout tax).
+- **Masked DeepGEMM exists** (`dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda`); only masked
+  silu_mul_quant to add (T4.4), and only on the LL track.
+- **T2 forward surgery is the bulk:** 86 all-reduces × 4 variants (T2.5); land per-variant,
+  gate each on ≥2-prompt needle + c=8 correctness.
