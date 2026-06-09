@@ -1,5 +1,6 @@
 #include <cuda.h>
 #include <cuda_fp8.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <limits.h>
 #include <stdint.h>
@@ -174,6 +175,80 @@ __global__ void dsv4_deepgemm_swiglu_quantize_w13_kernel(
   }
 }
 
+
+// Masked 3-D variant of the dense swiglu+quantize kernel above. Operates
+// directly on the deepep_ll grouped layout (input `[E, tok_padded, 2*hidden]`
+// bf16, output `[E, tok_padded, hidden]` fp8) and skips invalid tokens per
+// expert using `masked_m[expert]` (only the first `masked_m[e]` tokens of
+// expert `e` carry valid GEMM1 output). Mirrors SGLang
+// `silu_and_mul_masked_post_quant` math (clamped DSv4 SwiGLU + per-128-group
+// FP8 e4m3 quant) but emits ARLE's column-major SFA scale layout
+// (`dg_scale_offset`, stride `scale_stride_m`) so the masked grouped
+// DeepGEMM (`make_tma_sfa_desc`) consumes it unchanged.
+//
+// `hidden_dim` is the gate||up width (= 2 * intermediate). Output width and
+// quant axis is `intermediate = hidden_dim / 2`.
+__global__ void dsv4_deepgemm_silu_mul_masked_quant_kernel(
+    const uint16_t* __restrict__ input,
+    uint8_t* __restrict__ output,
+    float* __restrict__ output_scale,
+    const int32_t* __restrict__ masked_m,
+    int expert_num,
+    int token_num_padded,
+    int intermediate_dim,
+    int scale_stride_m,
+    int scale_k_blocks,
+    float limit) {
+  int64_t linear = blockIdx.x;
+  const int k_block = static_cast<int>(linear % scale_k_blocks);
+  linear /= scale_k_blocks;
+  const int row = static_cast<int>(linear % token_num_padded);
+  const int expert = static_cast<int>(linear / token_num_padded);
+  if (expert >= expert_num) return;
+  const int count = masked_m[expert];
+  if (row >= count) return;
+  const int col_start = k_block * DSV4_DEEPGEMM_GRAN_K;
+  const int col_end = min(col_start + DSV4_DEEPGEMM_GRAN_K, intermediate_dim);
+  const int in_cols = intermediate_dim * 2;
+  const uint16_t* in_row =
+      input + (static_cast<int64_t>(expert) * token_num_padded + row) * in_cols;
+
+  float local_max = 0.0f;
+  for (int col = col_start + threadIdx.x; col < col_end; col += blockDim.x) {
+    local_max = fmaxf(
+        local_max,
+        fabsf(dg_swiglu(in_row[col], in_row[intermediate_dim + col], limit)));
+  }
+  local_max = dg_warp_reduce_max(local_max);
+  __shared__ float warp_max[DSV4_DEEPGEMM_BLOCK / 32];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) warp_max[warp] = local_max;
+  __syncthreads();
+
+  float block_max = 0.0f;
+  if (warp == 0) {
+    block_max = lane < (blockDim.x + 31) / 32 ? warp_max[lane] : 0.0f;
+    block_max = dg_warp_reduce_max(block_max);
+  }
+  __shared__ float scale_shared;
+  if (threadIdx.x == 0) {
+    scale_shared = block_max > 0.0f ? block_max / DSV4_FP8_E4M3_MAX : 1.0f;
+    output_scale[dg_scale_offset(
+        expert, row, k_block, scale_stride_m, scale_k_blocks)] = scale_shared;
+  }
+  __syncthreads();
+
+  const float scale = scale_shared;
+  uint8_t* out_row =
+      output +
+      (static_cast<int64_t>(expert) * token_num_padded + row) * intermediate_dim;
+  for (int col = col_start + threadIdx.x; col < col_end; col += blockDim.x) {
+    float value = dg_swiglu(in_row[col], in_row[intermediate_dim + col], limit);
+    out_row[col] = dg_f32_to_fp8(scale > 0.0f ? value / scale : 0.0f);
+  }
+}
+
 __global__ void dsv4_deepgemm_unpad_grouped_bf16_kernel(
     const uint16_t* __restrict__ grouped,
     uint16_t* __restrict__ compact,
@@ -286,5 +361,44 @@ extern "C" CUresult dsv4_deepgemm_unpad_grouped_bf16_cuda(
   dsv4_deepgemm_unpad_grouped_bf16_kernel<<<static_cast<int>(grid), DSV4_DEEPGEMM_BLOCK, 0, (cudaStream_t)stream>>>(
       grouped, compact, active_experts, active_offsets, active_counts,
       active_count, max_m, hidden_dim);
+  return (CUresult)cudaGetLastError();
+}
+
+
+extern "C" CUresult dsv4_deepgemm_silu_mul_masked_quant_cuda(
+    const __nv_bfloat16* input,
+    uint8_t* out_fp8,
+    float* out_scale,
+    const int* masked_m,
+    int expert_num,
+    int token_num_padded,
+    int hidden_dim,
+    float swiglu_limit,
+    CUstream stream) {
+  // `hidden_dim` is the gate||up width; the quant axis is intermediate = hidden_dim/2.
+  if (expert_num < 0 || token_num_padded <= 0 || hidden_dim <= 0 ||
+      (hidden_dim & 1) != 0 || !(swiglu_limit > 0.0f)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const int intermediate_dim = hidden_dim / 2;
+  if ((intermediate_dim % DSV4_DEEPGEMM_GRAN_K) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (expert_num == 0) return CUDA_SUCCESS;
+  if (input == nullptr || out_fp8 == nullptr || out_scale == nullptr ||
+      masked_m == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  // Column-major SFA stride the masked grouped DeepGEMM expects: TMA-aligned to
+  // a multiple of 4 over the padded token dim (`get_tma_aligned_size(m, 4)`).
+  const int scale_stride_m = ((token_num_padded + 3) / 4) * 4;
+  const int scale_k_blocks =
+      (intermediate_dim + DSV4_DEEPGEMM_GRAN_K - 1) / DSV4_DEEPGEMM_GRAN_K;
+  int64_t grid = static_cast<int64_t>(scale_k_blocks) * token_num_padded * expert_num;
+  if (grid > INT_MAX) return CUDA_ERROR_INVALID_VALUE;
+  dsv4_deepgemm_silu_mul_masked_quant_kernel<<<static_cast<int>(grid), DSV4_DEEPGEMM_BLOCK, 0, (cudaStream_t)stream>>>(
+      reinterpret_cast<const uint16_t*>(input), out_fp8, out_scale, masked_m,
+      expert_num, token_num_padded, intermediate_dim, scale_stride_m,
+      scale_k_blocks, swiglu_limit);
   return (CUresult)cudaGetLastError();
 }
