@@ -100,19 +100,22 @@ execution is global-TP/EP only (topology.rs:35).
 
 **Files:** `crates/infer-topo/src/topology.rs` (subgroup comm builders), `crates/infer-cuda/src/tp.rs` + collective layer (per-axis NCCL comms), `crates/infer-cuda/src/dsv4.rs` (attention on owned shard + gather/scatter), scheduler (batch partition by dp rank).
 
-**T2.1 rank math** — port `compute_dp_attention_world_info` (dp_attention.py:240-271):
-```
-attn_tp_size = tp_size / attn_dp_size / attn_cp_size
-attn_tp_rank = tp_rank % attn_tp_size
-attn_dp_rank = tp_rank / (attn_tp_size * attn_cp_size)   // layout (dp,cp,tp), tp fastest
-```
-Add `MultiAxisConfig::attn_world_info(tp_rank) -> {attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size}`.
+**T2.1 rank math — ALREADY DONE** (verified 2026-06-09, infer-topo/src/topology.rs, 930
+lines + SGLang-docstring tests): `MultiAxisConfig`, `attn_tp_size()`, the world-info
+`{attn_tp_rank, attn_dp_rank, moe_ep_rank}` (topology.rs:281-319), and ALL group-list
+builders `build_attn_dp_groups`/`build_attn_owner_groups`/`build_moe_dp_groups`/
+`build_moe_ep_groups`/`build_attn_tp_groups` (topology.rs:360-490). **Gap is NOT the
+math.** The runtime never consumes it — infer-cuda uses infer-topo only for weight
+sharding (`TpConfig`/`row_shard`/`column_shard`); zero refs to `build_*_groups` in
+infer-cuda/scheduler.
 
-**T2.2 subgroup NCCL comms** — port group construction order (parallel_state.py:1862-2030):
-`_ATTN_TP` (ranks sharing an attn_dp_rank), `_MOE_EP` (`range(start, end, moe_tp_size)`).
-When a sub-size == tp_size the comm **aliases the global TP comm** (parallel_state.py:1970).
-New: `infer_topo::build_axis_comms(world, cfg) -> AxisComms{attn_tp: Comm, moe_ep: Comm}`
-backed by `ncclCommSplit` of the global comm (collective.rs).
+**T2.2 subgroup NCCL comms — MISSING (the first real T2 code).** No `ncclCommSplit`
+anywhere (collective.rs/tp.rs run one global TP comm). Add `Comm::split(color, key)`
+wrapping `ncclCommSplit` (collective.rs), then at DSv4 boot build `attn_tp_comm` +
+`moe_ep_comm` from `build_attn_tp_groups(cfg)` / `build_moe_ep_groups(cfg)` (color =
+the group index this rank belongs to). When a sub-size == tp_size the comm aliases the
+global TP comm (the builders already return `build_tp_groups` in that case —
+topology.rs:474). **Pod-verify-gated** (NCCL comm split needs 8×H20; not Mac-checkable).
 
 **T2.3 batch partition** — port `get_dp_local_info` (dp_attention.py:385-419):
 scheduler computes `global_num_tokens_gpu [attn_dp_size]`, `cumsum`, each rank takes
