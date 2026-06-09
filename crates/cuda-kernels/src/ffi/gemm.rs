@@ -579,6 +579,18 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_deepgemm_silu_mul_masked_quant_cuda(
+        input: *const Half,
+        out_fp8: *mut u8,
+        out_scale: *mut f32,
+        masked_m: *const i32,
+        expert_num: i32,
+        token_num_padded: i32,
+        hidden_dim: i32,
+        swiglu_limit: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_deepgemm_unpad_grouped_bf16_cuda(
         grouped: *const Half,
         compact: *mut Half,
