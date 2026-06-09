@@ -83,6 +83,22 @@ pub fn is_native() -> bool {
     !cfg!(deepep_stub)
 }
 
+/// Whether the DeepEP NVSHMEM low-latency (internode_ll) path is
+/// compiled + linked into this binary. `true` proves libarle_deepep.a
+/// pulled the internode_ll + NVSHMEM device objects at final link
+/// (build+link de-risk only — no `nvshmem_init` runtime bootstrap yet).
+#[cfg(not(deepep_stub))]
+pub fn nvshmem_built() -> bool {
+    // SAFETY: trivial extern "C" probe, no args, returns int.
+    unsafe { native::arle_deepep_nvshmem_built() != 0 }
+}
+
+/// Stub build: NVSHMEM LL is never compiled in.
+#[cfg(deepep_stub)]
+pub fn nvshmem_built() -> bool {
+    false
+}
+
 #[cfg(deepep_stub)]
 pub struct Buffer {
     _rank: u32,
@@ -192,6 +208,9 @@ mod native {
         ) -> c_int;
         pub(super) fn arle_deepep_buffer_destroy(handle: *mut ArleDeepEpBuffer);
         pub(super) fn arle_deepep_last_error() -> *const c_char;
+        /// Force-link probe: returns 1 when the internode_ll + NVSHMEM
+        /// objects are compiled into libarle_deepep.a (T4-LL de-risk).
+        pub(super) fn arle_deepep_nvshmem_built() -> c_int;
     }
 
     pub(super) fn last_error() -> String {
