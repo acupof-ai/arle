@@ -50,9 +50,12 @@ retrieves `738291` exact (was: infinite spin, never completed).
   (100% CPU, GPU 0%). "Host-bound, GPU idle, pre-kernel-issue" on a long prompt is
   an **admission rejection spin** first — check `pages_needed` vs pool `total_pages`
   before profiling the forward.
-- **The real fix is uniform, not per-model** (next): `request_pages_needed` assumes
-  full-attention (`tokens/page_size`) for ALL backends, and `total_pages` is a
-  hardcoded short-context default. Recurrent-KV backends (DSv4, Qwen3.5/3.6 MoE)
-  need a model-declared KV capacity, not a `matches!(kind, Dsv4)` override. Rewrite:
-  derive the page-pool capacity from the model's KV model uniformly; supersede this
-  band-aid and the `matches!` page-accounting special-cases.
+- **Uniform rewrite — LANDED (follow-up commit).** The DSv4-only `if matches!` bump
+  was replaced by `cuda_admission_total_pages(kind, config, page_size)`: one call
+  site for every model, each backend declaring its KV token-capacity (full-attention
+  / Qwen3.5-3.6-MoE keep the configured budget; DSv4 = `max_seq_len`, dummy pool).
+  Behavior-identical to the band-aid for DSv4. Deeper still (not yet done): the
+  engine should **reject a permanently-unfittable request** (`pages_needed > total
+  capacity`) instead of spinning `while !is_idle()` — a model-agnostic anti-spin
+  guard in `admit_waiting`, so any over-large prompt errors gracefully rather than
+  hanging the engine.
