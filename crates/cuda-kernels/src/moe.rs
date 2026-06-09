@@ -987,6 +987,52 @@ pub unsafe fn dsv4_deepgemm_swiglu_quantize_w13(
     Ok(())
 }
 
+
+/// Masked 3-D variant of [`dsv4_deepgemm_swiglu_quantize_w13`] for the
+/// `deepep_ll` MoE path: fused clamped-SwiGLU over the `[E, tok_padded,
+/// 2*intermediate]` BF16 GEMM1 output + per-128-block FP8 requantize into the
+/// `[E, tok_padded, intermediate]` activation the masked w2 GEMM reads. Skips
+/// invalid tokens per expert via `masked_m[expert]` (no `active_*` compaction)
+/// and emits the column-major SFA scale layout the masked grouped DeepGEMM
+/// consumes. Wraps [`ffi::dsv4_deepgemm_silu_mul_masked_quant_cuda`].
+///
+/// `hidden_dim` is the gate||up width (= `2 * intermediate`); `out_fp8` /
+/// `out_scale` are sized `[E, tok_padded, intermediate]` and
+/// `[E, scale_stride_m, intermediate/128]` respectively (`scale_stride_m` =
+/// `tok_padded` rounded up to a multiple of 4).
+///
+/// # Safety
+/// All pointers must be valid on `stream` for the given shape; `input` is the
+/// padded BF16 w13 output, `out_fp8` / `out_scale` the FP8 + scale scratch.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_deepgemm_silu_mul_masked_quant(
+    input: RawDevicePtr<bf16>,
+    out_fp8: RawDevicePtr<u8>,
+    out_scale: RawDevicePtr<f32>,
+    masked_m: RawDevicePtr<i32>,
+    expert_num: usize,
+    token_num_padded: usize,
+    hidden_dim: usize,
+    swiglu_limit: f32,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_deepgemm_silu_mul_masked_quant_cuda(
+            input.as_ptr() as *const Half,
+            out_fp8.as_mut_ptr(),
+            out_scale.as_mut_ptr(),
+            masked_m.as_ptr(),
+            i32::try_from(expert_num)?,
+            i32::try_from(token_num_padded)?,
+            i32::try_from(hidden_dim)?,
+            swiglu_limit,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Unpad the padded `[num_groups * max_m, hidden]` grouped GEMM output back to
 /// the compact `[total_routes, hidden]` row layout (per-group `active_offsets`).
 /// Wraps [`ffi::dsv4_deepgemm_unpad_grouped_bf16_cuda`].
