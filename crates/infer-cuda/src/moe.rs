@@ -1467,6 +1467,262 @@ mod dsv4_gpu {
         Ok(())
     }
 
+    #[cfg(feature = "deepep")]
+    pub(crate) fn dsv4_moe_forward_deepep(
+        model: &Dsv4Model,
+        transport: &crate::deepep::DeepEpTransport,
+        layer: &Dsv4MoeLayer,
+        tokens: &[u32],
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<()> {
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        let split = &model.split;
+        let swiglu_limit = model.config.swiglu_limit;
+
+        let num_tokens = hidden.seq_len;
+        let hidden_dim = hidden.hidden_dim;
+        let topk = cfg.top_k;
+        let experts_per_rank = split.experts_per_rank;
+
+        ensure!(
+            tokens.len() == num_tokens,
+            "DSv4 DeepEP token count {} != hidden seq_len {num_tokens}",
+            tokens.len()
+        );
+        ensure!(
+            out.hidden_dim == hidden_dim && out.seq_len == num_tokens,
+            "DSv4 DeepEP out shape {}x{} != hidden {}x{}",
+            out.hidden_dim,
+            out.seq_len,
+            hidden_dim,
+            num_tokens
+        );
+        ensure!(
+            layer.num_groups == experts_per_rank,
+            "DSv4 DeepEP expert group count {} != experts_per_rank {experts_per_rank}",
+            layer.num_groups
+        );
+        ensure!(
+            layer.hidden_dim == hidden_dim,
+            "DSv4 DeepEP expert hidden dim {} != runtime hidden dim {hidden_dim}",
+            layer.hidden_dim
+        );
+        // Local DSv4 MoE is DeepGEMM-only (no scalar/native expert fallback exists
+        // in this tree), so the production path is always the DeepGEMM backend. The
+        // preflight below is the real guard against a build-time stub.
+        moe::dsv4_deepgemm_native_preflight()?;
+
+        // Route exactly like the allreduce path. DeepEP dispatch consumes global
+        // expert ids as i64 and remaps received ids to rank-local expert ids.
+        let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, num_tokens)?;
+        gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
+        let total_routes = num_tokens * topk;
+        let (topk_idx_i64, route_weights) = if use_gpu_router() {
+            let routing = dsv4_route_device(model, layer, tokens, &logits, None, keepalive)?;
+            let topk_idx_i64 = ctx
+                .stream
+                .alloc_zeros::<i64>(total_routes)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 alloc failed: {e}"))?;
+            keepalive.keep_route_i64(&topk_idx_i64);
+            unsafe {
+                moe::dsv4_cast_i32_to_i64(
+                    cache_ptr(&routing.indices, ctx),
+                    cache_ptr(&topk_idx_i64, ctx),
+                    total_routes,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+            (topk_idx_i64, routing.weights)
+        } else {
+            keepalive.keep_hidden(&logits);
+            ctx.sync()?;
+            let logits_bf16: Vec<bf16> = ctx
+                .stream
+                .clone_dtoh(&logits.data)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP router logits D2H failed: {e}"))?;
+            let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+            let decisions = dsv4_route(ctx, &model.config, cfg, layer, tokens, &logits_host)?;
+            let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
+            let indices_i64: Vec<i64> = indices_host.iter().map(|&v| i64::from(v)).collect();
+            let topk_idx_i64 = ctx
+                .stream
+                .clone_htod(&indices_i64)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-index i64 H2D failed: {e}"))?;
+            let route_weights = ctx
+                .stream
+                .clone_htod(&weights_host)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP route-weight H2D failed: {e}"))?;
+            keepalive.keep_i64(&topk_idx_i64);
+            keepalive.keep_f32(&route_weights);
+            (topk_idx_i64, route_weights)
+        };
+
+        let num_sms = crate::deepep::DeepEpTransport::num_sms()?;
+        let mut scratch =
+            transport.alloc_scratch(ctx, hidden_dim, num_tokens, topk, cfg.num_experts, num_sms)?;
+        keepalive.keep_hidden(&scratch.recv_x);
+        keepalive.keep_i32(&scratch.recv_src_idx);
+        keepalive.keep_i64(&scratch.recv_topk_idx);
+        keepalive.keep_f32(&scratch.recv_topk_weights);
+        keepalive.keep_i32(&scratch.rank_prefix);
+        keepalive.keep_i32(&scratch.recv_channel_prefix);
+        keepalive.keep_i32(&scratch.send_head);
+        keepalive.keep_i32(&scratch.num_tokens_per_rank);
+        keepalive.keep_i32(&scratch.num_tokens_per_expert);
+        keepalive.keep_u8(&scratch.is_token_in_rank);
+        keepalive.keep_i32(&scratch.channel_prefix_matrix);
+        keepalive.keep_f32(&scratch.combined_topk_weights);
+        let num_recv = transport.dispatch(
+            ctx,
+            &mut scratch,
+            hidden,
+            &topk_idx_i64,
+            &route_weights,
+            cfg.num_experts,
+            topk,
+            num_sms,
+        )?;
+
+        let recv_slots = num_recv.saturating_mul(topk);
+        let local_routed = HiddenStates::zeros(ctx, hidden_dim, scratch.capacity_recv)?;
+        if recv_slots > 0 {
+            // DeepEP gives rank-local expert ids as i64. Convert the valid prefix
+            // to i32 for the existing local count/pack kernels.
+            let recv_i64 = ctx
+                .stream
+                .clone_dtoh(&scratch.recv_topk_idx)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP recv_topk_idx D2H failed: {e}"))?;
+            let mut recv_i32 = vec![0i32; scratch.capacity_recv.saturating_mul(topk)];
+            for (dst, &src) in recv_i32.iter_mut().zip(recv_i64.iter()).take(recv_slots) {
+                *dst = i32::try_from(src).map_err(|_| {
+                    anyhow::anyhow!("DSv4 DeepEP recv expert id {src} overflows i32")
+                })?;
+            }
+            let recv_topk_i32 = ctx
+                .stream
+                .clone_htod(&recv_i32)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP recv_topk_i32 H2D failed: {e}"))?;
+            let counts = ctx
+                .stream
+                .alloc_zeros::<i32>(experts_per_rank)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP local count alloc failed: {e}"))?;
+            let offsets = ctx
+                .stream
+                .alloc_zeros::<i32>(experts_per_rank)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP local offset alloc failed: {e}"))?;
+            let scan_total = ctx
+                .stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP scan-total alloc failed: {e}"))?;
+            keepalive.keep_i32(&recv_topk_i32);
+            keepalive.keep_i32(&counts);
+            keepalive.keep_i32(&offsets);
+            keepalive.keep_i32(&scan_total);
+            unsafe {
+                moe::dsv4_count_local_experts(
+                    cache_ptr(&recv_topk_i32, ctx),
+                    cache_ptr(&counts, ctx),
+                    num_recv,
+                    topk,
+                    0,
+                    experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+                moe::dsv4_exclusive_scan_i32(
+                    cache_ptr(&counts, ctx),
+                    cache_ptr(&offsets, ctx),
+                    cache_ptr(&scan_total, ctx),
+                    experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+
+            let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, recv_slots.max(1))?;
+            let packed_route_slot = ctx
+                .stream
+                .clone_htod(&vec![-1i32; recv_slots.max(1)])
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP packed_route_slot H2D failed: {e}"))?;
+            let packed_weight = ctx
+                .stream
+                .alloc_zeros::<f32>(recv_slots.max(1))
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP packed_weight alloc failed: {e}"))?;
+            let cursors = ctx
+                .stream
+                .alloc_zeros::<i32>(experts_per_rank)
+                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP cursors alloc failed: {e}"))?;
+            keepalive.keep_hidden(&packed_hidden);
+            keepalive.keep_i32(&packed_route_slot);
+            keepalive.keep_f32(&packed_weight);
+            keepalive.keep_i32(&cursors);
+            unsafe {
+                moe::dsv4_pack_local_experts_with_slots(
+                    cache_ptr(&scratch.recv_x.data, ctx),
+                    cache_ptr(&recv_topk_i32, ctx),
+                    cache_ptr(&scratch.recv_topk_weights, ctx),
+                    cache_ptr(&offsets, ctx),
+                    cache_ptr(&cursors, ctx),
+                    cache_ptr(&packed_hidden.data, ctx),
+                    cache_ptr(&packed_route_slot, ctx),
+                    cache_ptr(&packed_weight, ctx),
+                    num_recv,
+                    hidden_dim,
+                    topk,
+                    0,
+                    experts_per_rank,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+
+            let expert_out = deepgemm_grouped_experts(
+                ctx,
+                layer,
+                &packed_hidden,
+                &counts,
+                &offsets,
+                swiglu_limit,
+                keepalive,
+            )?;
+            keepalive.keep_hidden(&expert_out);
+            let route_out = HiddenStates::zeros(ctx, hidden_dim, recv_slots.max(1))?;
+            keepalive.keep_hidden(&route_out);
+            unsafe {
+                moe::dsv4_scatter_all_route_slots(
+                    cache_ptr(&expert_out.data, ctx),
+                    cache_ptr(&route_out.data, ctx),
+                    cache_ptr(&packed_route_slot, ctx),
+                    cache_ptr(&packed_weight, ctx),
+                    recv_slots,
+                    hidden_dim,
+                    ctx.stream.cu_stream(),
+                )?;
+                moe::dsv4_combine_route_slot_outputs(
+                    cache_ptr(&route_out.data, ctx),
+                    cache_ptr(&local_routed.data, ctx),
+                    num_recv,
+                    topk,
+                    hidden_dim,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+        }
+
+        transport.combine(
+            ctx,
+            &mut scratch,
+            &local_routed,
+            out,
+            num_recv,
+            num_tokens,
+            topk,
+            num_sms,
+        )?;
+        let _ = total_routes;
+        Ok(())
+    }
+
     pub(crate) fn dsv4_shared_expert_forward(
         ctx: &DeviceContext,
         stream: &Arc<CudaStream>,
@@ -2389,8 +2645,203 @@ mod dsv4_gpu {
             seq_len,
         })
     }
+
+    /// NVSHMEM low-latency (token-owned) DSv4 MoE forward for THIS rank's owned
+    /// token slice. Implements the EP pipeline over the owned `[hidden, owned_n]`
+    /// activations: route → LL dispatch (FP8 pack) → masked grouped GEMM w13 →
+    /// masked SwiGLU+requant → masked grouped GEMM w2 → LL combine → add shared
+    /// expert. The caller (dsv4.rs) owns the token slicing + the final all-gather.
+    ///
+    /// `out` is this rank's owned routed+shared output `[hidden, owned_n]`. The
+    /// LL packed recv / GEMM-output scratch is pre-allocated once in `scratch`;
+    /// this path only overwrites it (no per-step alloc beyond the small route +
+    /// topk-id buffers + the routed/shared temporaries).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dsv4_moe_forward_deepep_ll(
+        model: &Dsv4Model,
+        transport: &crate::deepep::DeepEpTransport,
+        scratch: &mut crate::deepep::DeepEpLlScratch,
+        layer: &Dsv4MoeLayer,
+        tokens: &[u32],
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<()> {
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        let swiglu_limit = model.config.swiglu_limit;
+
+        let owned_n = hidden.seq_len;
+        let hidden_dim = hidden.hidden_dim;
+        let topk = cfg.top_k;
+        let intermediate = layer.intermediate;
+        let num_local_experts = transport.ll_num_local_experts()?;
+
+        ensure!(
+            tokens.len() == owned_n,
+            "deepep_ll token count {} != owned hidden seq_len {owned_n}",
+            tokens.len()
+        );
+        ensure!(
+            out.hidden_dim == hidden_dim && out.seq_len == owned_n,
+            "deepep_ll out shape {}x{} != owned {hidden_dim}x{owned_n}",
+            out.hidden_dim,
+            out.seq_len,
+        );
+        ensure!(
+            layer.num_groups == num_local_experts,
+            "deepep_ll expert group count {} != num_local_experts {num_local_experts}",
+            layer.num_groups
+        );
+        ensure!(
+            layer.hidden_dim == hidden_dim,
+            "deepep_ll expert hidden dim {} != runtime hidden dim {hidden_dim}",
+            layer.hidden_dim
+        );
+        moe::dsv4_deepgemm_native_preflight()?;
+
+        // ── Step 2: route the OWNED tokens on device → topk_idx (i64, global
+        // expert ids, kept on device — no host i32→i64 glue) + topk weights.
+        // owned_n may be 0 (seq_len < world): this rank still participates in the
+        // dispatch/combine COLLECTIVE with num_tokens=0 (sends nothing, receives
+        // tokens routed to its local experts), so allocate 1-slot dummies for the
+        // route buffers and skip the actual route compute.
+        let total_routes = owned_n * topk;
+        let topk_idx_i64 = ctx
+            .stream
+            .alloc_zeros::<i64>(total_routes.max(1))
+            .map_err(|e| anyhow::anyhow!("deepep_ll route-index i64 alloc failed: {e}"))?;
+        keepalive.keep_route_i64(&topk_idx_i64);
+        let route_weights = if owned_n > 0 {
+            let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, owned_n)?;
+            gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
+            keepalive.keep_hidden(&logits);
+            let routing = dsv4_route_device(model, layer, tokens, &logits, None, keepalive)?;
+            keepalive.keep_route_f32(&routing.weights);
+            // SAFETY: both buffers hold `total_routes` elements on `ctx.stream`.
+            unsafe {
+                moe::dsv4_cast_i32_to_i64(
+                    cache_ptr(&routing.indices, ctx),
+                    cache_ptr(&topk_idx_i64, ctx),
+                    total_routes,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+            routing.weights
+        } else {
+            let w = ctx
+                .stream
+                .alloc_zeros::<f32>(1)
+                .map_err(|e| anyhow::anyhow!("deepep_ll empty route-weight alloc failed: {e}"))?;
+            keepalive.keep_route_f32(&w);
+            w
+        };
+
+        // ── Step 3: LL dispatch the owned tokens → packed FP8 recv into scratch.
+        // `scratch` is model-owned (outlives the forward), so it does not need
+        // the forward-keepalive guard the transient buffers below get.
+        let _expected_m = transport.ll_dispatch(ctx, scratch, hidden, &topk_idx_i64, topk)?;
+
+        let m = scratch.m_padded;
+        let sfa_aligned_m = scratch.sfa_aligned_m;
+        let w13 = &layer.w13_grouped;
+        let w2 = &layer.w2_grouped;
+        ensure!(
+            w13.groups == num_local_experts
+                && w2.groups == num_local_experts
+                && w13.rows == 2 * intermediate
+                && w13.cols == hidden_dim
+                && w2.rows == hidden_dim
+                && w2.cols == intermediate,
+            "deepep_ll grouped weight metadata mismatch: groups={} w13={}x{}g{} w2={}x{}g{} H={hidden_dim} I={intermediate}",
+            num_local_experts,
+            w13.rows,
+            w13.cols,
+            w13.groups,
+            w2.rows,
+            w2.cols,
+            w2.groups,
+        );
+
+        let p_recv_x = cache_ptr(&scratch.recv_x_fp8, ctx);
+        let p_recv_sc = cache_ptr(&scratch.recv_x_scales, ctx);
+        let p_masked = cache_ptr(&scratch.recv_count, ctx);
+        let p_w13_out = cache_ptr(&scratch.w13_out, ctx);
+        let p_act_fp8 = cache_ptr(&scratch.act_fp8, ctx);
+        let p_act_sc = cache_ptr(&scratch.act_scales, ctx);
+        let p_expert_out = cache_ptr(&scratch.expert_out, ctx);
+        let stream = ctx.stream.cu_stream();
+
+        // ── Step 4: masked grouped GEMM w13 (fused gate+up): recv FP8 → bf16
+        //    [E_local, m, 2*intermediate]. masked_m = recv_count (per expert).
+        // SAFETY: all buffers are scratch sized for `[E_local, m, *]`; masked_m
+        // bounds rows; sfa_aligned_m == m (TMA-aligned, asserted at scratch alloc).
+        unsafe {
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
+                p_recv_x,
+                p_recv_sc,
+                cache_ptr(&w13.weight, ctx),
+                cache_ptr(&w13.scales, ctx),
+                p_w13_out,
+                p_masked,
+                num_local_experts,
+                m,
+                2 * intermediate,
+                hidden_dim,
+                sfa_aligned_m,
+                stream,
+            )?;
+            // ── Step 5: masked SwiGLU(clamp) + per-128-block FP8 requant →
+            //    [E_local, m, intermediate] FP8 + column-major scales.
+            moe::dsv4_deepgemm_silu_mul_masked_quant(
+                p_w13_out,
+                p_act_fp8,
+                p_act_sc,
+                p_masked,
+                num_local_experts,
+                m,
+                2 * intermediate,
+                swiglu_limit,
+                stream,
+            )?;
+            // ── Step 6: masked grouped GEMM w2 (down): act FP8 → bf16
+            //    [E_local, m, hidden]. This IS the LL-combine input layout.
+            moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
+                p_act_fp8,
+                p_act_sc,
+                cache_ptr(&w2.weight, ctx),
+                cache_ptr(&w2.scales, ctx),
+                p_expert_out,
+                p_masked,
+                num_local_experts,
+                m,
+                hidden_dim,
+                intermediate,
+                sfa_aligned_m,
+                stream,
+            )?;
+        }
+
+        // ── Step 7: LL combine → this rank's owned routed output [hidden, owned_n].
+        // The shared expert is NOT added here: the dsv4.rs forward adds the
+        // replicated shared expert on the FULL gathered `moe_out` afterward
+        // (identical to the intranode `dsv4_moe_forward_deepep` contract), so
+        // adding it here would double-count. `out` holds routed-only.
+        transport.ll_combine(
+            ctx,
+            scratch,
+            out,
+            &topk_idx_i64,
+            &route_weights,
+            owned_n,
+            topk,
+        )?;
+        Ok(())
+    }
 }
 
+#[cfg(feature = "deepep")]
+pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
