@@ -72,6 +72,7 @@ cpu = ["dep:infer-metal"]
 # to infer-cuda's `nccl` feature (declared optionally so it only engages when
 # the CUDA backend is pulled in).
 nccl = ["cuda", "infer-cuda?/nccl"]
+deepep = ["nccl", "infer-cuda?/deepep"]
 
 [dev-dependencies]
 infer-core = { path = "../infer-core" }

@@ -16,6 +16,7 @@ no-cuda = ["infer-api/no-cuda", "train/no-cuda", "autograd/no-cuda"]
 cpu = ["infer-api/cpu"]
 metal = ["infer-api/metal", "train/metal", "autograd/metal"]
 nccl = ["cuda", "infer-api/nccl"]
+deepep = ["nccl", "infer-api/deepep"]
 
 [dependencies]
 anyhow = "1.0"
