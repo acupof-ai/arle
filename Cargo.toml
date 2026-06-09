@@ -95,6 +95,9 @@ metal = ["cli/metal"]
 # NCCL FFI for multi-GPU collectives. Implies `cuda`.
 # Forwards through `cli` → `infer-api` → `infer-cuda` → `cuda-kernels`.
 nccl = ["cuda", "cli/nccl"]
+# DSv4 expert-parallel DeepEP dispatch/combine. Implies `nccl`; forwards through
+# `cli` → `infer-api` → `infer-cuda` → `deepep-sys`.
+deepep = ["nccl", "cli/deepep"]
 
 [dependencies]
 anyhow = "1.0"
