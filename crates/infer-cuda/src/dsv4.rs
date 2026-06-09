@@ -227,7 +227,10 @@ pub(crate) struct Dsv4Model {
     pub head_hc: Dsv4HyperConnection,
     pub mtp: Option<Dsv4MtpLayer>,
     pub tp: crate::tp::TpRuntime,
+    // Booted by `maybe_boot` and held for the upcoming SGLang low-latency DeepEP
+    // path; the old normal-mode forward that read it was deleted.
     #[cfg(feature = "deepep")]
+    #[allow(dead_code)]
     pub deepep: Option<crate::deepep::DeepEpTransport>,
 }
 
@@ -402,14 +405,6 @@ impl Dsv4ForwardKeepalive {
         self.i32.push(value.clone());
     }
 
-    #[cfg(feature = "deepep")]
-    pub(crate) fn keep_i64(&mut self, value: &CudaSlice<i64>) {
-        if !self.active {
-            return;
-        }
-        self.i64.push(value.clone());
-    }
-
     pub(crate) fn keep_u8(&mut self, value: &CudaSlice<u8>) {
         if !self.active {
             return;
@@ -439,14 +434,6 @@ impl Dsv4ForwardKeepalive {
             return;
         }
         self.i32.push(value.clone());
-    }
-
-    #[cfg(feature = "deepep")]
-    pub(crate) fn keep_route_i64(&mut self, value: &CudaSlice<i64>) {
-        if !self.active {
-            return;
-        }
-        self.i64.push(value.clone());
     }
 
     pub(crate) fn keep_route_u32(&mut self, value: &CudaSlice<u32>) {
@@ -1732,25 +1719,10 @@ impl Dsv4Model {
             // non-deepep path needs the explicit TP all-reduce below.
             let needs_moe_allreduce = !use_deepep_transport;
             if use_deepep_transport {
-                #[cfg(feature = "deepep")]
-                {
-                    let transport = self.deepep.as_ref().ok_or_else(|| {
-                        anyhow!("ARLE_DSV4_MOE_TRANSPORT=deepep but DeepEP transport is not booted")
-                    })?;
-                    crate::moe::dsv4_moe_forward_deepep(
-                        self,
-                        transport,
-                        &layer.moe,
-                        tokens,
-                        &normed,
-                        &mut moe_out,
-                        &mut keepalive,
-                    )?;
-                }
-                #[cfg(not(feature = "deepep"))]
-                {
-                    bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
-                }
+                bail!(
+                    "DSv4 DeepEP transport is being reimplemented to the SGLang low-latency \
+                     contract (deepep_ll); not available yet — set ARLE_DSV4_MOE_BACKEND=allreduce"
+                );
             } else {
                 let decode_scratch = if use_moe_decode_scratch {
                     Some(&mut slot.moe_decode_scratch[layer_idx])
