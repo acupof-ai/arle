@@ -227,10 +227,7 @@ pub(crate) struct Dsv4Model {
     pub head_hc: Dsv4HyperConnection,
     pub mtp: Option<Dsv4MtpLayer>,
     pub tp: crate::tp::TpRuntime,
-    // Booted by `maybe_boot` and held for the upcoming SGLang low-latency DeepEP
-    // path; the old normal-mode forward that read it was deleted.
     #[cfg(feature = "deepep")]
-    #[allow(dead_code)]
     pub deepep: Option<crate::deepep::DeepEpTransport>,
 }
 
@@ -240,6 +237,12 @@ pub(crate) struct Dsv4SlotState {
     moe_decode_scratch: Vec<crate::moe::Dsv4MoeDecodeScratch>,
     start_pos_device: CudaSlice<i32>,
     decode_graph: Option<Dsv4DecodeGraphScratch>,
+    /// Pre-allocated NVSHMEM low-latency MoE scratch, reused across all layers +
+    /// decode steps (overwritten in place each `dsv4_moe_forward_deepep_ll`
+    /// call). `Some` only when the `deepep_ll` transport is booted. Held once per
+    /// slot — layers run sequentially so a single scratch suffices.
+    #[cfg(feature = "deepep")]
+    deepep_ll_scratch: Option<crate::deepep::DeepEpLlScratch>,
     seq_len: usize,
     max_seq_len: usize,
 }
@@ -405,6 +408,14 @@ impl Dsv4ForwardKeepalive {
         self.i32.push(value.clone());
     }
 
+    #[cfg(feature = "deepep")]
+    pub(crate) fn keep_i64(&mut self, value: &CudaSlice<i64>) {
+        if !self.active {
+            return;
+        }
+        self.i64.push(value.clone());
+    }
+
     pub(crate) fn keep_u8(&mut self, value: &CudaSlice<u8>) {
         if !self.active {
             return;
@@ -434,6 +445,14 @@ impl Dsv4ForwardKeepalive {
             return;
         }
         self.i32.push(value.clone());
+    }
+
+    #[cfg(feature = "deepep")]
+    pub(crate) fn keep_route_i64(&mut self, value: &CudaSlice<i64>) {
+        if !self.active {
+            return;
+        }
+        self.i64.push(value.clone());
     }
 
     pub(crate) fn keep_route_u32(&mut self, value: &CudaSlice<u32>) {
@@ -507,12 +526,29 @@ impl Dsv4SlotState {
             .stream
             .alloc_zeros::<i32>(1)
             .map_err(|e| anyhow!("DSv4 slot start_pos device scalar alloc failed: {e}"))?;
+        // Pre-allocate the LL MoE scratch ONCE when the deepep_ll transport is
+        // booted. `intermediate` is uniform across layers (all share the MoE
+        // config), so layer 0's value sizes the SwiGLU/w2 stages.
+        #[cfg(feature = "deepep")]
+        let deepep_ll_scratch = match model.deepep.as_ref() {
+            Some(transport) if transport.is_low_latency() => {
+                let intermediate = model
+                    .layers
+                    .first()
+                    .map(|layer| layer.moe.intermediate)
+                    .ok_or_else(|| anyhow!("DSv4 deepep_ll: model has no layers"))?;
+                Some(transport.alloc_ll_scratch(&model.ctx, intermediate)?)
+            }
+            _ => None,
+        };
         Ok(Self {
             attention,
             spec_rollback,
             moe_decode_scratch,
             start_pos_device,
             decode_graph: None,
+            #[cfg(feature = "deepep")]
+            deepep_ll_scratch,
             seq_len: 0,
             max_seq_len,
         })
@@ -651,7 +687,12 @@ impl Dsv4Model {
 
         let ctx = DeviceContext::new()?;
         #[cfg(feature = "deepep")]
-        let deepep = crate::deepep::DeepEpTransport::maybe_boot(&ctx, &tp)?;
+        let deepep = crate::deepep::DeepEpTransport::maybe_boot(
+            &ctx,
+            &tp,
+            config.hidden_size,
+            config.n_routed_experts,
+        )?;
         let loader = SafetensorLoader::new(model_path)?;
         let names = config.tensor_names();
 
@@ -1719,10 +1760,109 @@ impl Dsv4Model {
             // non-deepep path needs the explicit TP all-reduce below.
             let needs_moe_allreduce = !use_deepep_transport;
             if use_deepep_transport {
-                bail!(
-                    "DSv4 DeepEP transport is being reimplemented to the SGLang low-latency \
-                     contract (deepep_ll); not available yet — set ARLE_DSV4_MOE_BACKEND=allreduce"
-                );
+                #[cfg(feature = "deepep")]
+                {
+                    let transport = self.deepep.as_ref().ok_or_else(|| {
+                        anyhow!("ARLE_DSV4_MOE_TRANSPORT=deepep but DeepEP transport is not booted")
+                    })?;
+                    if transport.is_low_latency() {
+                        // ── deepep_ll token-owned path ──────────────────────
+                        // TP8 replicates `normed` [hidden, n]; HiddenStates is
+                        // token-major (token i at i*hidden), so this rank's owned
+                        // shard cols [start..end] is a CONTIGUOUS byte range.
+                        let world = self.tp.config().world_size;
+                        let rank = self.tp.config().rank;
+                        let per = seq_len.div_ceil(world);
+                        let start = (rank * per).min(seq_len);
+                        let end = ((rank + 1) * per).min(seq_len);
+                        let owned_n = end - start;
+                        // Zero the full output; every rank scatters its owned cols
+                        // then an all-reduce gathers them (replaces the moe AR).
+                        self.ctx
+                            .stream
+                            .memset_zeros(&mut moe_out.data)
+                            .map_err(|e| anyhow!("deepep_ll moe_out zero failed: {e}"))?;
+                        // The LL dispatch + combine are COLLECTIVES: EVERY rank must
+                        // participate every step or the symmetric protocol deadlocks
+                        // (DeepEP "timeout for dispatch receive"). A rank that owns 0
+                        // tokens (when seq_len < world) still dispatches 0 tokens and
+                        // runs the masked GEMMs over the tokens routed to ITS local
+                        // experts. So always call the LL forward — it internally
+                        // handles owned_n == 0 — and only scatter when owned_n > 0.
+                        let scratch = slot.deepep_ll_scratch.as_mut().ok_or_else(|| {
+                            anyhow!("deepep_ll selected but slot LL scratch not allocated")
+                        })?;
+                        // Copy this rank's owned contiguous columns of `normed`
+                        // into a compact `[hidden, owned_n]` buffer (the LL dispatch
+                        // needs a standalone `[owned_n, hidden]` input; `.slice()`
+                        // yields a borrowed CudaView, not an owned CudaSlice, so we
+                        // materialize it — same one-copy pattern as the per-row
+                        // attention slab path above). owned_n may be 0.
+                        let mut owned_in =
+                            HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
+                        owned_in.seq_len = owned_n;
+                        keepalive.keep_hidden(&owned_in);
+                        if owned_n > 0 {
+                            self.ctx
+                                .stream
+                                .memcpy_dtod(
+                                    &normed.data.slice(
+                                        start * hidden_size..end * hidden_size,
+                                    ),
+                                    &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
+                                )
+                                .map_err(|e| {
+                                    anyhow!("deepep_ll owned-slice copy failed: {e}")
+                                })?;
+                        }
+                        let mut owned_out =
+                            HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
+                        owned_out.seq_len = owned_n;
+                        keepalive.keep_hidden(&owned_out);
+                        crate::moe::dsv4_moe_forward_deepep_ll(
+                            self,
+                            transport,
+                            scratch,
+                            &layer.moe,
+                            &tokens[start..end],
+                            &owned_in,
+                            &mut owned_out,
+                            &mut keepalive,
+                        )?;
+                        if owned_n > 0 {
+                            // Scatter owned_out into moe_out's owned cols (contiguous).
+                            self.ctx
+                                .stream
+                                .memcpy_dtod(
+                                    &owned_out.data.slice(0..owned_n * hidden_size),
+                                    &mut moe_out.data.slice_mut(
+                                        start * hidden_size..end * hidden_size,
+                                    ),
+                                )
+                                .map_err(|e| {
+                                    anyhow!("deepep_ll owned scatter into moe_out failed: {e}")
+                                })?;
+                        }
+                        // All-gather via all-reduce: each rank contributed only its
+                        // owned cols (rest zero), so the sum is the full gather.
+                        // This REPLACES the moe all-reduce (needs_moe_allreduce=false).
+                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                    } else {
+                        crate::moe::dsv4_moe_forward_deepep(
+                            self,
+                            transport,
+                            &layer.moe,
+                            tokens,
+                            &normed,
+                            &mut moe_out,
+                            &mut keepalive,
+                        )?;
+                    }
+                }
+                #[cfg(not(feature = "deepep"))]
+                {
+                    bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
+                }
             } else {
                 let decode_scratch = if use_moe_decode_scratch {
                     Some(&mut slot.moe_decode_scratch[layer_idx])
@@ -2590,10 +2730,11 @@ fn dsv4_use_deepep_transport() -> Result<bool> {
         .unwrap_or_else(|_| "allreduce".to_string());
     match value.as_str() {
         "allreduce" | "all_reduce" | "native" | "scalar" | "static" | "deepgemm" | "" => Ok(false),
-        "deepep" | "native-deepep" | "native_deepep" => Ok(true),
+        "deepep" | "native-deepep" | "native_deepep" | "deepep_ll" | "deepep-ll"
+        | "deepep_low_latency" | "native_deepep_ll" => Ok(true),
         other => bail!(
             "unsupported ARLE_DSV4_MOE_TRANSPORT/ARLE_DSV4_MOE_BACKEND `{other}` \
-             (expected allreduce or deepep)"
+             (expected allreduce, deepep, or deepep_ll)"
         ),
     }
 }
