@@ -992,6 +992,219 @@ __global__ void dsv4_compressor_update_kernel(
   }
 }
 
+// Parallel prefill compressor: one CUDA block per compressed-output block (grid =
+// `completed`), so the whole SM array fills instead of a single block looping
+// serially. Block b>0 reads its overlap "previous-block" tokens DIRECTLY from
+// kv_raw/score_raw (first-half projection, col) — the serial `prev_overlap` carry
+// was only a re-read optimization, the source tokens are addressable. Block 0's
+// cross-chunk overlap still reads the (frozen, prior-chunk) prev_overlap input.
+// prev_overlap/pending WRITES are deferred to dsv4_compressor_finalize_kernel so
+// there is no in-flight read/write race on those buffers.
+__global__ void dsv4_compressor_block_kernel(
+    const uint16_t *__restrict__ kv_raw,
+    const uint16_t *__restrict__ score_raw,
+    const uint16_t *__restrict__ ape,
+    const uint16_t *__restrict__ norm,
+    const uint16_t *__restrict__ pending_kv,
+    const uint16_t *__restrict__ pending_score,
+    const uint16_t *__restrict__ prev_overlap_kv,
+    const uint16_t *__restrict__ prev_overlap_score,
+    uint16_t *__restrict__ compressed,
+    int start_pos,
+    int pending_len,
+    int compressed_base,
+    int head_dim,
+    int ratio,
+    int width,
+    int overlap,
+    int has_prev_overlap,
+    float eps,
+    int rope_dim,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow) {
+  int block = blockIdx.x;
+  int block_start0 = start_pos - pending_len;
+  int block_start = block_start0 + block * ratio;
+  int block_end = block_start + ratio - 1;
+  int prev_block_start = block_start - ratio;
+  __shared__ float row[DSV4_ATTN_MAX_HEAD_DIM];
+  int count = overlap ? 2 * ratio : ratio;
+
+  for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
+    float max_logit = -INFINITY;
+    for (int pos = 0; pos < count; ++pos) {
+      float logit;
+      if (overlap && pos < ratio) {
+        if (block == 0) {
+          logit = has_prev_overlap
+                      ? dsv4_attn_bf16_to_f32(prev_overlap_score[pos * head_dim + col])
+                      : -INFINITY;
+        } else {
+          int abs_pos = prev_block_start + pos;
+          logit = dsv4_compressor_score_value(
+              score_raw, pending_score, ape, abs_pos, start_pos, prev_block_start,
+              ratio, width, col);
+        }
+      } else {
+        int local_pos = overlap ? (pos - ratio) : pos;
+        int abs_pos = block_start + local_pos;
+        int score_col = overlap ? (head_dim + col) : col;
+        logit = dsv4_compressor_score_value(
+            score_raw, pending_score, ape, abs_pos, start_pos, block_start,
+            ratio, width, score_col);
+      }
+      max_logit = fmaxf(max_logit, logit);
+    }
+    float denom = 0.0f;
+    float acc = 0.0f;
+    if (isfinite(max_logit)) {
+      for (int pos = 0; pos < count; ++pos) {
+        float logit;
+        float raw_value;
+        if (overlap && pos < ratio) {
+          if (block == 0) {
+            if (has_prev_overlap) {
+              logit = dsv4_attn_bf16_to_f32(prev_overlap_score[pos * head_dim + col]);
+              raw_value = dsv4_attn_bf16_to_f32(prev_overlap_kv[pos * head_dim + col]);
+            } else {
+              logit = -INFINITY;
+              raw_value = 0.0f;
+            }
+          } else {
+            int abs_pos = prev_block_start + pos;
+            logit = dsv4_compressor_score_value(
+                score_raw, pending_score, ape, abs_pos, start_pos, prev_block_start,
+                ratio, width, col);
+            raw_value = dsv4_compressor_raw_value(
+                kv_raw, pending_kv, abs_pos, start_pos, prev_block_start, width, col);
+          }
+        } else {
+          int local_pos = overlap ? (pos - ratio) : pos;
+          int abs_pos = block_start + local_pos;
+          int score_col = overlap ? (head_dim + col) : col;
+          int kv_col = overlap ? (head_dim + col) : col;
+          logit = dsv4_compressor_score_value(
+              score_raw, pending_score, ape, abs_pos, start_pos, block_start,
+              ratio, width, score_col);
+          raw_value = dsv4_compressor_raw_value(
+              kv_raw, pending_kv, abs_pos, start_pos, block_start, width, kv_col);
+        }
+        float weight = expf(logit - max_logit);
+        denom += weight;
+        acc += weight * raw_value;
+      }
+      if (denom > 0.0f) {
+        acc /= denom;
+      }
+    }
+    row[col] = acc;
+  }
+  __syncthreads();
+
+  float sumsq = 0.0f;
+  for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
+    sumsq += row[col] * row[col];
+  }
+  sumsq = dsv4_attn_block_sum(sumsq);
+  __shared__ float norm_scale;
+  if (threadIdx.x == 0) {
+    norm_scale = rsqrtf(sumsq / fmaxf((float)head_dim, 1.0f) + eps);
+  }
+  __syncthreads();
+
+  for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
+    float value = row[col] * norm_scale * dsv4_attn_bf16_to_f32(norm[col]);
+    if (rope_dim > 0 && col >= head_dim - rope_dim) {
+      int local = col - (head_dim - rope_dim);
+      int pair = local / 2;
+      int pair_col = head_dim - rope_dim + pair * 2;
+      float a = row[pair_col] * norm_scale * dsv4_attn_bf16_to_f32(norm[pair_col]);
+      float b = row[pair_col + 1] * norm_scale * dsv4_attn_bf16_to_f32(norm[pair_col + 1]);
+      float out_a;
+      float out_b;
+      dsv4_apply_rope_pair(
+          a, b, pair, block_end, rope_dim, rope_base, original_seq_len,
+          factor, beta_fast, beta_slow, 1.0f, &out_a, &out_b);
+      value = (local & 1) == 0 ? out_a : out_b;
+    }
+    compressed[(compressed_base + block) * head_dim + col] =
+        dsv4_attn_f32_to_bf16_bits(value);
+  }
+}
+
+// Finalize the prefill compressor: write the cross-chunk `prev_overlap` (the LAST
+// produced block's first-half tokens) and the trailing `pending` partial block.
+// Single block (both writes are O(ratio·head_dim), tiny). The __syncthreads
+// separates the prev_overlap reads of the OLD pending from the pending writes.
+__global__ void dsv4_compressor_finalize_kernel(
+    const uint16_t *__restrict__ kv_raw,
+    const uint16_t *__restrict__ score_raw,
+    const uint16_t *__restrict__ ape,
+    uint16_t *__restrict__ pending_kv,
+    uint16_t *__restrict__ pending_score,
+    uint16_t *__restrict__ prev_overlap_kv,
+    uint16_t *__restrict__ prev_overlap_score,
+    int num_tokens,
+    int start_pos,
+    int pending_len,
+    int completed,
+    int head_dim,
+    int ratio,
+    int width,
+    int overlap) {
+  int block_start0 = start_pos - pending_len;
+  int total = pending_len + num_tokens;
+
+  if (overlap && completed > 0) {
+    int last_block_start = block_start0 + (completed - 1) * ratio;
+    for (int idx = threadIdx.x; idx < ratio * head_dim; idx += blockDim.x) {
+      int pos = idx / head_dim;
+      int col = idx - pos * head_dim;
+      int abs_pos = last_block_start + pos;
+      float kv = dsv4_compressor_raw_value(
+          kv_raw, pending_kv, abs_pos, start_pos, last_block_start, width, col);
+      float score = dsv4_compressor_score_value(
+          score_raw, pending_score, ape, abs_pos, start_pos, last_block_start,
+          ratio, width, col);
+      prev_overlap_kv[pos * head_dim + col] = dsv4_attn_f32_to_bf16_bits(kv);
+      prev_overlap_score[pos * head_dim + col] = dsv4_attn_f32_to_bf16_bits(score);
+    }
+  }
+  __syncthreads();
+
+  if (completed == 0) {
+    for (int idx = threadIdx.x; idx < num_tokens * width; idx += blockDim.x) {
+      int pos = idx / width;
+      int col = idx - pos * width;
+      int abs_pos = start_pos + pos;
+      int dst = (pending_len + pos) * width + col;
+      float kv = dsv4_attn_bf16_to_f32(kv_raw[idx]);
+      float score = dsv4_attn_bf16_to_f32(score_raw[idx]) +
+                    dsv4_attn_bf16_to_f32(ape[(abs_pos % ratio) * width + col]);
+      pending_kv[dst] = dsv4_attn_f32_to_bf16_bits(kv);
+      pending_score[dst] = dsv4_attn_f32_to_bf16_bits(score);
+    }
+  } else {
+    int new_pending = total - completed * ratio;
+    int tail_start = start_pos + num_tokens - new_pending;
+    for (int idx = threadIdx.x; idx < new_pending * width; idx += blockDim.x) {
+      int pos = idx / width;
+      int col = idx - pos * width;
+      int abs_pos = tail_start + pos;
+      float kv = dsv4_compressor_raw_value(
+          kv_raw, pending_kv, abs_pos, start_pos, block_start0, width, col);
+      float score = dsv4_compressor_score_value(
+          score_raw, pending_score, ape, abs_pos, start_pos, block_start0,
+          ratio, width, col);
+      pending_kv[idx] = dsv4_attn_f32_to_bf16_bits(kv);
+      pending_score[idx] = dsv4_attn_f32_to_bf16_bits(score);
+    }
+  }
+}
+
 extern "C" CUresult dsv4_compressor_update_cuda(
     const uint16_t *kv_raw,
     const uint16_t *score_raw,
@@ -1024,11 +1237,22 @@ extern "C" CUresult dsv4_compressor_update_cuda(
       ratio > 256 || width < head_dim || rope_dim < 0 || rope_dim > head_dim) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  dsv4_compressor_update_kernel<<<1, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
-      kv_raw, score_raw, ape, norm, pending_kv, pending_score, prev_overlap_kv,
-      prev_overlap_score, compressed, num_tokens, start_pos, nullptr, pending_len,
-      compressed_base, head_dim, ratio, width, overlap, has_prev_overlap, eps,
-      rope_dim, rope_base, original_seq_len, factor, beta_fast, beta_slow);
+  // Parallel prefill: grid = number of compressed blocks (fills the SMs), then a
+  // tiny single-block finalize for prev_overlap + pending. (Decode keeps the
+  // single-block dsv4_compressor_update_kernel via the start_pos_ptr launcher
+  // below — there completed<=1, so a grid is pointless.)
+  int completed = (pending_len + num_tokens) / ratio;
+  if (completed > 0) {
+    dsv4_compressor_block_kernel<<<completed, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
+        kv_raw, score_raw, ape, norm, pending_kv, pending_score, prev_overlap_kv,
+        prev_overlap_score, compressed, start_pos, pending_len, compressed_base,
+        head_dim, ratio, width, overlap, has_prev_overlap, eps, rope_dim, rope_base,
+        original_seq_len, factor, beta_fast, beta_slow);
+  }
+  dsv4_compressor_finalize_kernel<<<1, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
+      kv_raw, score_raw, ape, pending_kv, pending_score, prev_overlap_kv,
+      prev_overlap_score, num_tokens, start_pos, pending_len, completed, head_dim,
+      ratio, width, overlap);
   return (CUresult)cudaGetLastError();
 }
 
