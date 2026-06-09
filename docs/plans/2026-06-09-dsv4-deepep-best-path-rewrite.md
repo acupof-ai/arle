@@ -7,6 +7,14 @@ Reference contract: SGLang `/workspace/sglang@0d51db3`, extracted verbatim
 [`docs/research/2026-06-01-dsv4-sglang-path-research.md`](../research/2026-06-01-dsv4-sglang-path-research.md).
 This is an executor-copies-verbatim spec, not a principle list.
 
+**Method (ckl 2026-06-09): copy-and-adapt the real source, don't hand-write.** DeepEP
+`internode_ll.cu` + `nvshmem.cu` (pod `/data01/build/DeepEP/csrc`) and SGLang's
+`silu_and_mul_masked_post_quant` are the source of truth — vendor/copy them into ARLE's
+deepep-sys + cuda-kernels and adapt the FFI/build, rather than re-deriving from the
+contract (`feedback_no_closed_door_solutions`). First copy-and-adapt unit = vendor
+`internode_ll`+`nvshmem` into deepep-sys (drop `-DDISABLE_NVSHMEM`, add NVSHMEM link) —
+which simultaneously DE-RISKS NVSHMEM by actually building+linking it on the pod.
+
 ---
 
 ## 0. Goal + success metric (read before any "win")
