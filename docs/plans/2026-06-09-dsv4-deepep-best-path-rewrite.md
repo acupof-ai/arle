@@ -128,6 +128,18 @@ Attention forward consumes only `hidden[:, local_start..local_start+local_num]`.
 
 **Buffers mutated (enumerate + disposition):** `global_hidden` (new slot scratch, pre-alloc `[hidden, max_total_tokens]`, zeroed each step before gather — required, not self-healing); `local_hidden` (existing attn out, sliced); `global_num_tokens_gpu` (new `[attn_dp_size] i32`, scheduler-written per step); the two axis comms (created once at boot, immutable).
 
+**T2.5 collective rewire sites** (verified 2026-06-09) — the forward today does **86
+global all-reduces/token** = 2/layer (`dsv4/attn_allreduce` + `dsv4/moe_allreduce`) via
+`self.tp.all_reduce_sum(&self.ctx, &mut X)` over ONE global NCCL comm
+(collective.rs:268, single `self.comm`). Rewire across **4 forward variants** (same 2
+sites each): eager dsv4.rs:1290/1354, main 1657/1789, prefill 2071/2106, decode-graph
+2347/2424.
+- **attn all-reduce** → `all_reduce_sum` over the **attn_tp** subgroup comm (smaller than
+  global when attn_dp>1). Add `TpRuntime::all_reduce_sum_over(comm, …)`.
+- **moe all-reduce** → **deleted**, replaced by `dp_gather(attn_tp)` before EP dispatch +
+  token-owned deepep combine + `dp_scatter` after (T2.4). No post-FFN all-reduce on the
+  token-owned path.
+
 **Gate:** c=8 emits correct text; per-rank dispatch `num_recv` shows owned (≈ tokens/dp) not replicated rows; DeepEP fanout 4.46×→~1×; allreduce default lane unchanged.
 
 ---
