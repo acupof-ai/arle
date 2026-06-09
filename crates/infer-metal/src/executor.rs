@@ -391,6 +391,9 @@ impl RealMetalExecutor {
             row.start_pos,
             slot.cache_len
         );
+        // Reservation normally covers the whole prompt; guard against a chunk that
+        // would write past it so prefill shares the decode growth invariant.
+        slot.ensure_kv_capacity(model, row.tokens.len())?;
         slot.ensure_session_active(model)?;
         self.active_session_slot = Some(row.slot);
         let token_values: Vec<i32> = row.tokens.iter().map(|&token| token as i32).collect();
@@ -479,6 +482,10 @@ impl RealMetalExecutor {
             slot.committed_len,
             slot.cache_len
         );
+        // Grow the flat K/V before this step would write past the reservation —
+        // the host pool already grew its pages for this length; the executor
+        // must keep pace or `slice_update` silently drops the write.
+        slot.ensure_kv_capacity(model, 1)?;
         slot.ensure_session_active(model)?;
         self.active_session_slot = Some(row.slot);
         let token_arr = mlx::MlxArray::from_slice_i32(&[row.last_token as i32], &[1]);
@@ -913,6 +920,72 @@ impl MetalSlotState {
         self.session_active = false;
         Ok(())
     }
+
+    /// Guarantee the flat K/V cache can hold `cache_len + needed` tokens, growing
+    /// the seq axis with zeros when the prefill reservation is exhausted.
+    ///
+    /// The C++ session writes each step's K/V with `slice_update`, which returns a
+    /// *same-shape* array — so the session's capacity is frozen at `begin_session`
+    /// and never grows on its own. The host KV pool already grows page-by-page for
+    /// arbitrarily long generations; without this the executor's `kv_flat` lags
+    /// behind, `slice_update` silently drops out-of-range writes (corrupt output),
+    /// and `publish_slot` eventually hard-errors at a page boundary
+    /// (`K/V slice token range [..] exceeds shape=[..]`). The GDR recurrent/conv
+    /// state is sequence-independent (see `MetalSlotState::new`) and is left
+    /// untouched, exactly as `materialize_slot_from_prefix` treats it. Growing
+    /// mutates `kv_flat`, which an open session owns, so the session is drained
+    /// first; the caller re-activates it via `ensure_session_active`.
+    fn ensure_kv_capacity(
+        &mut self,
+        model: &qwen35::CppQwen35Model,
+        needed: usize,
+    ) -> anyhow::Result<()> {
+        let capacity = self
+            .kv_flat
+            .first()
+            .map(|array| array.shape().get(2).copied().unwrap_or(0) as usize)
+            .unwrap_or(0);
+        let required = self.cache_len.saturating_add(needed);
+        if capacity == 0 || required <= capacity {
+            return Ok(());
+        }
+        // The open session holds these arrays; drain before reallocating so the
+        // grown buffers are the ones the next `begin_session` binds.
+        self.drain_session(model)?;
+        let new_capacity = round_up_capacity(required.max(capacity.saturating_mul(2))) as usize;
+        let mut grown = Vec::with_capacity(self.kv_flat.len());
+        for array in &self.kv_flat {
+            grown.push(grow_kv_seq_axis(array, new_capacity)?);
+        }
+        // Materialize before re-binding so the concatenation is not replayed
+        // lazily on every subsequent step's forward graph.
+        let refs: Vec<&mlx::MlxArray> = grown.iter().collect();
+        mlx::eval(&refs);
+        self.kv_flat = grown;
+        Ok(())
+    }
+}
+
+/// Extend a rank-4 `[B, n_kv, seq, head_dim]` K/V cache array along the seq axis
+/// (index 2) to `new_capacity`, padding the new tail with zeros. The leading
+/// tokens are preserved bit-for-bit; the C++ session then writes future tokens
+/// into the zero tail via `slice_update`. A no-op (cheap clone) when the array
+/// already meets the capacity.
+#[cfg(feature = "metal")]
+fn grow_kv_seq_axis(array: &mlx::MlxArray, new_capacity: usize) -> anyhow::Result<mlx::MlxArray> {
+    let shape = array.shape().to_vec();
+    anyhow::ensure!(
+        shape.len() == 4,
+        "expected rank-4 K/V array to grow, got shape={shape:?}"
+    );
+    let current = shape[2] as usize;
+    if new_capacity <= current {
+        return Ok(array.clone());
+    }
+    let mut tail_shape = shape;
+    tail_shape[2] = usize_to_i32(new_capacity - current)?;
+    let zeros = mlx::zeros(&tail_shape, array.dtype());
+    Ok(mlx::concatenate_axis(&[array.clone(), zeros], 2))
 }
 
 #[cfg(feature = "metal")]
@@ -962,6 +1035,37 @@ mod tests {
     use super::*;
     use crate::kv_pool::MetalKvPool;
     use infer_plan::{DecodeRow, ForwardMode, PrefillRow};
+
+    // Regression guard for the "K/V slice token range [..] exceeds shape=[..]"
+    // crash: a long generation outgrows the prefill reservation, so `kv_flat`
+    // must grow along the seq axis while preserving every prior token. Mirrors
+    // the exact operation `ensure_kv_capacity` performs on each cache array.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn grow_kv_seq_axis_preserves_tokens_and_zero_pads_tail() {
+        let _guard = mlx_sys::mlx_guard();
+        // [B=1, n_kv=1, seq=2, head_dim=2] with distinct, known values.
+        let src = mlx::MlxArray::from_slice_i32(&[10, 11, 20, 21], &[1, 1, 2, 2]);
+        let src = mlx::as_dtype(&src, mlx::Dtype::Float32);
+        let grown = grow_kv_seq_axis(&src, 4).unwrap();
+        mlx::eval(&[&grown]);
+        assert_eq!(grown.shape(), &[1, 1, 4, 2], "seq axis must extend to 4");
+        let vals = grown.as_slice_f32();
+        // Tokens 0,1 preserved bit-for-bit.
+        assert_eq!(&vals[0..4], &[10.0, 11.0, 20.0, 21.0]);
+        // Tokens 2,3 (the grown tail) are zero — the slice_update write target.
+        assert_eq!(&vals[4..8], &[0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn grow_kv_seq_axis_is_noop_when_capacity_met() {
+        let _guard = mlx_sys::mlx_guard();
+        let src = mlx::MlxArray::from_slice_i32(&[1, 2, 3, 4], &[1, 1, 2, 2]);
+        let src = mlx::as_dtype(&src, mlx::Dtype::Float32);
+        let same = grow_kv_seq_axis(&src, 2).unwrap();
+        assert_eq!(same.shape(), &[1, 1, 2, 2]);
+    }
 
     #[test]
     fn executor_decode_plumbing_returns_one_token_per_row() {
