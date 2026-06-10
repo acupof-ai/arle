@@ -168,6 +168,51 @@ pub fn shard_head_blocks_column_parallel(
     })
 }
 
+/// Borrow expert `expert_idx`'s `[out_rows, cols]` row-major sub-block out of
+/// a stacked `[num_experts, stacked_rows, cols]` expert tensor.
+///
+/// Row-major layout means each expert's matrix — and any whole-row range
+/// inside it — is one contiguous byte block, so the returned slice borrows
+/// the source with no copy. `row_offset`/`out_rows` select rows inside the
+/// expert block: the fused Qwen3.6 `experts.gate_up_proj`
+/// `[E, 2*moe_inter, hidden]` stores gate at rows `[0, moe_inter)` and up at
+/// `[moe_inter, 2*moe_inter)`; a plain stacked tensor (e.g.
+/// `experts.down_proj` `[E, hidden, moe_inter]`) is the whole block
+/// (`row_offset == 0`, `out_rows == stacked_rows`).
+///
+/// # Errors
+/// Errors if `expert_idx >= num_experts`, the row range exceeds
+/// `stacked_rows`, or the buffer length is inconsistent with
+/// `num_experts * stacked_rows * cols * elem_size`.
+pub fn slice_stacked_expert(
+    bytes: &[u8],
+    num_experts: usize,
+    stacked_rows: usize,
+    cols: usize,
+    elem_size: usize,
+    expert_idx: usize,
+    row_offset: usize,
+    out_rows: usize,
+) -> Result<&[u8]> {
+    let total_rows = num_experts
+        .checked_mul(stacked_rows)
+        .ok_or_else(|| anyhow::anyhow!("num_experts*stacked_rows overflows"))?;
+    ensure_buffer(bytes, total_rows, cols, elem_size)?;
+    ensure!(
+        expert_idx < num_experts,
+        "stacked expert index {expert_idx} out of range (num_experts={num_experts})"
+    );
+    ensure!(
+        row_offset + out_rows <= stacked_rows,
+        "stacked expert row range [{row_offset}, {}) exceeds stacked rows {stacked_rows}",
+        row_offset + out_rows
+    );
+    let row_stride = cols * elem_size;
+    let start = (expert_idx * stacked_rows + row_offset) * row_stride;
+    let end = start + out_rows * row_stride;
+    Ok(&bytes[start..end])
+}
+
 fn ensure_buffer(bytes: &[u8], rows: usize, cols: usize, elem_size: usize) -> Result<()> {
     ensure!(elem_size > 0, "elem_size must be > 0");
     let expected = rows
@@ -501,6 +546,107 @@ mod tests {
             head_rows: 2,
         }];
         assert!(shard_head_blocks_column_parallel(&w, 4, 2, &bad_blocks, &single).is_err());
+    }
+
+    // Build a fake stacked [num_experts, stacked_rows, cols] u16 (bf16-sized)
+    // expert tensor where element (e, r, c) is encoded as
+    // `e * stacked_rows * cols + r * cols + c` — a per-expert slice's bytes
+    // are then trivially checkable.
+    fn fake_stacked(num_experts: usize, stacked_rows: usize, cols: usize) -> Vec<u8> {
+        fake_weight(num_experts * stacked_rows, cols)
+    }
+
+    #[test]
+    fn stacked_expert_full_block_slices_tile_the_tensor() {
+        // down_proj-shaped analogue: [E=4, hidden=3, mi=2], whole-block slices.
+        let (e, rows, cols) = (4usize, 3usize, 2usize);
+        let w = fake_stacked(e, rows, cols);
+        let mut joined = Vec::new();
+        for i in 0..e {
+            let s = slice_stacked_expert(&w, e, rows, cols, 2, i, 0, rows).unwrap();
+            // Expert i's block holds the values [i*rows*cols, (i+1)*rows*cols).
+            let want: Vec<u16> = (i * rows * cols..(i + 1) * rows * cols)
+                .map(|v| v as u16)
+                .collect();
+            assert_eq!(decode(s), want, "expert {i}");
+            joined.extend_from_slice(s);
+        }
+        // Concatenating every expert's slice reconstructs the stacked tensor.
+        assert_eq!(joined, w);
+    }
+
+    #[test]
+    fn stacked_fused_gate_up_split_keeps_gate_first_row_order() {
+        // gate_up_proj-shaped analogue: [E=3, 2*mi, hidden] with mi=2,
+        // hidden=4. Gate = rows [0, mi) of the expert block, up = rows
+        // [mi, 2*mi) — the production Qwen3.6 fused row order.
+        let (e, mi, hidden) = (3usize, 2usize, 4usize);
+        let stacked_rows = 2 * mi;
+        let w = fake_stacked(e, stacked_rows, hidden);
+        for i in 0..e {
+            let gate = slice_stacked_expert(&w, e, stacked_rows, hidden, 2, i, 0, mi).unwrap();
+            let up = slice_stacked_expert(&w, e, stacked_rows, hidden, 2, i, mi, mi).unwrap();
+            let block_base = i * stacked_rows * hidden;
+            let want_gate: Vec<u16> = (block_base..block_base + mi * hidden)
+                .map(|v| v as u16)
+                .collect();
+            let want_up: Vec<u16> = (block_base + mi * hidden..block_base + 2 * mi * hidden)
+                .map(|v| v as u16)
+                .collect();
+            assert_eq!(decode(gate), want_gate, "expert {i} gate rows [0, mi)");
+            assert_eq!(decode(up), want_up, "expert {i} up rows [mi, 2*mi)");
+            // gate ‖ up reassembles the expert's full fused block.
+            let mut rejoined = gate.to_vec();
+            rejoined.extend_from_slice(up);
+            assert_eq!(
+                rejoined,
+                w[block_base * 2..(block_base + stacked_rows * hidden) * 2],
+                "expert {i} gate+up == fused block"
+            );
+        }
+    }
+
+    #[test]
+    fn stacked_expert_ep_subrange_loads_only_local_experts() {
+        // EP analogue of the Qwen3.6 TP=2 split: E=8 over ep_size=4 → rank 2
+        // owns experts [4, 6). The loader slices exactly that subrange.
+        let split = crate::moe_config::ExpertSplit::new(8, 4, 2).unwrap();
+        assert_eq!((split.local_expert_start, split.local_expert_end()), (4, 6));
+        let (mi, hidden) = (2usize, 3usize);
+        let stacked_rows = 2 * mi;
+        let w = fake_stacked(split.num_experts, stacked_rows, hidden);
+        let mut local_gates = Vec::new();
+        for i in split.local_expert_start..split.local_expert_end() {
+            let gate =
+                slice_stacked_expert(&w, split.num_experts, stacked_rows, hidden, 2, i, 0, mi)
+                    .unwrap();
+            let block_base = i * stacked_rows * hidden;
+            let want: Vec<u16> = (block_base..block_base + mi * hidden)
+                .map(|v| v as u16)
+                .collect();
+            assert_eq!(decode(gate), want, "global expert {i} on ep_rank 2");
+            local_gates.push(gate.to_vec());
+        }
+        assert_eq!(local_gates.len(), split.experts_per_rank);
+        // Foreign experts' values never appear in the local slices.
+        let local_lo = (split.local_expert_start * stacked_rows * hidden) as u16;
+        let local_hi = (split.local_expert_end() * stacked_rows * hidden) as u16;
+        for bytes in &local_gates {
+            for v in decode(bytes) {
+                assert!((local_lo..local_hi).contains(&v), "foreign value {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn stacked_expert_out_of_range_and_bad_buffer_rejected() {
+        let w = fake_stacked(2, 4, 3);
+        // expert_idx >= num_experts.
+        assert!(slice_stacked_expert(&w, 2, 4, 3, 2, 2, 0, 4).is_err());
+        // Row range exceeds the expert block.
+        assert!(slice_stacked_expert(&w, 2, 4, 3, 2, 0, 2, 3).is_err());
+        // Buffer length inconsistent with the claimed shape.
+        assert!(slice_stacked_expert(&w, 2, 4, 4, 2, 0, 0, 4).is_err());
     }
 
     #[test]

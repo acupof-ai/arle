@@ -99,7 +99,92 @@ pub struct Qwen35LayerTensorNames {
     pub attention: Qwen35AttentionTensorNames,
 }
 
+/// MoE block tensor names for one sparse layer (Qwen3.6 / Qwen3_5_Moe).
+///
+/// Router + shared expert are common to both routed-expert layouts:
+///   router : `{mlp}.gate.weight`                               `[E, hidden]`
+///   shared : `{mlp}.shared_expert.{gate,up,down}_proj.weight`
+///   s-gate : `{mlp}.shared_expert_gate.weight`                 `[1, hidden]`
+///
+/// Routed experts ship in one of two layouts:
+///   • per-expert: `{mlp}.experts.{i}.{gate,up,down}_proj.weight` — one 2D
+///     matrix per projection per expert (tiny-random smokes / some HF
+///     exports). Names via [`Self::expert_gate_proj`] and siblings.
+///   • stacked+fused: `{mlp}.experts.gate_up_proj`
+///     `[E, 2*moe_inter, hidden]` (gate ‖ up fused on the output axis: gate =
+///     rows `[0, moe_inter)`, up = rows `[moe_inter, 2*moe_inter)`) +
+///     `{mlp}.experts.down_proj` `[E, hidden, moe_inter]`. Both are HF
+///     `nn.Parameter`s, stored WITHOUT a `.weight` suffix — verified against
+///     the production Qwen3.6-35B-A3B safetensors index (BF16, E=256,
+///     moe_inter=512, hidden=2048; gate-first row order proven e2e in
+///     `wins/2026-05-30-qwen36-moe-cuda-e2e-h20-real-model.md`).
+///
+/// The legacy mlx-lm `switch_mlp.*` stacked convention is NOT part of this
+/// contract (loaders reject it loudly).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen35MoeTensorNames {
+    pub mlp_prefix: String,
+    pub router_gate: String,
+    pub shared_expert_gate_proj: String,
+    pub shared_expert_up_proj: String,
+    pub shared_expert_down_proj: String,
+    pub shared_expert_gate: String,
+    pub experts_stacked_gate_up_proj: String,
+    pub experts_stacked_down_proj: String,
+}
+
+impl Qwen35MoeTensorNames {
+    /// Per-expert layout: routed expert `i`'s gate projection.
+    pub fn expert_gate_proj(&self, expert_idx: usize) -> String {
+        format!("{}.experts.{expert_idx}.gate_proj.weight", self.mlp_prefix)
+    }
+
+    /// Per-expert layout: routed expert `i`'s up projection.
+    pub fn expert_up_proj(&self, expert_idx: usize) -> String {
+        format!("{}.experts.{expert_idx}.up_proj.weight", self.mlp_prefix)
+    }
+
+    /// Per-expert layout: routed expert `i`'s down projection.
+    pub fn expert_down_proj(&self, expert_idx: usize) -> String {
+        format!("{}.experts.{expert_idx}.down_proj.weight", self.mlp_prefix)
+    }
+
+    /// TP shard contract for the MoE block. The router gate and the shared
+    /// expert's sigmoid gate stay replicated (routing must be computed
+    /// identically on every rank); the shared expert is column/row-sharded
+    /// like a dense MLP. Routed experts return `None`: EP assigns whole
+    /// experts by index (the executor's `ExpertSplit`), it never TP-slices
+    /// an expert matrix.
+    pub fn shard_for(&self, name: &str) -> Option<Shard> {
+        if name == self.router_gate || name == self.shared_expert_gate {
+            return Some(Shard::Replicated);
+        }
+        if name == self.shared_expert_gate_proj || name == self.shared_expert_up_proj {
+            return Some(Shard::Column { dim: 0 });
+        }
+        if name == self.shared_expert_down_proj {
+            return Some(Shard::Row { dim: 1 });
+        }
+        None
+    }
+}
+
 impl Qwen35CommonLayerTensorNames {
+    /// MoE block tensor names rooted at this layer's `mlp_prefix`.
+    pub fn moe_tensor_names(&self) -> Qwen35MoeTensorNames {
+        let mlp = &self.mlp_prefix;
+        Qwen35MoeTensorNames {
+            mlp_prefix: mlp.clone(),
+            router_gate: format!("{mlp}.gate.weight"),
+            shared_expert_gate_proj: format!("{mlp}.shared_expert.gate_proj.weight"),
+            shared_expert_up_proj: format!("{mlp}.shared_expert.up_proj.weight"),
+            shared_expert_down_proj: format!("{mlp}.shared_expert.down_proj.weight"),
+            shared_expert_gate: format!("{mlp}.shared_expert_gate.weight"),
+            experts_stacked_gate_up_proj: format!("{mlp}.experts.gate_up_proj"),
+            experts_stacked_down_proj: format!("{mlp}.experts.down_proj"),
+        }
+    }
+
     pub fn shard_for(&self, name: &str) -> Option<Shard> {
         if name == self.mlp_gate_proj || name == self.mlp_up_proj {
             return Some(Shard::Column { dim: 0 });
@@ -1265,6 +1350,82 @@ mod tests {
         assert!(config.is_moe_layer(1));
         assert!(!config.is_moe_layer(2));
         assert!(config.is_moe_layer(3));
+    }
+
+    #[test]
+    fn moe_tensor_names_match_production_qwen36_checkpoint() {
+        // Name strings verified against the real Qwen3.6-35B-A3B safetensors
+        // index: stacked expert tensors are `nn.Parameter`s WITHOUT a
+        // `.weight` suffix; router/shared-expert names carry `.weight`.
+        let config = Qwen35Config::from_json_str(QWEN36_MOE_FLAT_JSON).unwrap();
+        let names = config.layer_tensor_names(0).common.moe_tensor_names();
+        let mlp = "model.language_model.layers.0.mlp";
+        assert_eq!(names.mlp_prefix, mlp);
+        assert_eq!(names.router_gate, format!("{mlp}.gate.weight"));
+        assert_eq!(
+            names.shared_expert_gate_proj,
+            format!("{mlp}.shared_expert.gate_proj.weight")
+        );
+        assert_eq!(
+            names.shared_expert_up_proj,
+            format!("{mlp}.shared_expert.up_proj.weight")
+        );
+        assert_eq!(
+            names.shared_expert_down_proj,
+            format!("{mlp}.shared_expert.down_proj.weight")
+        );
+        assert_eq!(
+            names.shared_expert_gate,
+            format!("{mlp}.shared_expert_gate.weight")
+        );
+        assert_eq!(
+            names.experts_stacked_gate_up_proj,
+            format!("{mlp}.experts.gate_up_proj")
+        );
+        assert_eq!(
+            names.experts_stacked_down_proj,
+            format!("{mlp}.experts.down_proj")
+        );
+        // Per-expert layout (tiny-random smokes / some HF exports).
+        assert_eq!(
+            names.expert_gate_proj(0),
+            format!("{mlp}.experts.0.gate_proj.weight")
+        );
+        assert_eq!(
+            names.expert_up_proj(7),
+            format!("{mlp}.experts.7.up_proj.weight")
+        );
+        assert_eq!(
+            names.expert_down_proj(255),
+            format!("{mlp}.experts.255.down_proj.weight")
+        );
+    }
+
+    #[test]
+    fn moe_shard_contract_replicates_gates_and_shards_shared_expert() {
+        let config = Qwen35Config::from_json_str(QWEN36_MOE_FLAT_JSON).unwrap();
+        let names = config.layer_tensor_names(0).common.moe_tensor_names();
+        assert_eq!(names.shard_for(&names.router_gate), Some(Shard::Replicated));
+        assert_eq!(
+            names.shard_for(&names.shared_expert_gate),
+            Some(Shard::Replicated)
+        );
+        assert_eq!(
+            names.shard_for(&names.shared_expert_gate_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&names.shared_expert_up_proj),
+            Some(Shard::Column { dim: 0 })
+        );
+        assert_eq!(
+            names.shard_for(&names.shared_expert_down_proj),
+            Some(Shard::Row { dim: 1 })
+        );
+        // Routed experts are EP-split by whole expert index, never TP-sliced.
+        assert_eq!(names.shard_for(&names.experts_stacked_gate_up_proj), None);
+        assert_eq!(names.shard_for(&names.experts_stacked_down_proj), None);
+        assert_eq!(names.shard_for(&names.expert_gate_proj(0)), None);
     }
 
     #[test]

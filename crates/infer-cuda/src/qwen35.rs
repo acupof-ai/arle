@@ -644,9 +644,11 @@ impl Qwen35Model {
             let (mlp, moe) = if m.is_moe_layer(layer_idx) {
                 let moe = loader.load_moe_layer_experts(
                     &ctx,
-                    &names.common.layer_prefix,
+                    &names.common.moe_tensor_names(),
                     &split,
                     &tp_cfg,
+                    m.moe_intermediate_size,
+                    m.hidden_size,
                 )?;
                 (None, Some(moe))
             } else if tp_cfg.is_single() {
