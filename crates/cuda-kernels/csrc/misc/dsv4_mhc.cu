@@ -320,6 +320,91 @@ extern "C" CUresult dsv4_mhc_params_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+// Fused hc_pre + rms_norm for the decode/prefill critical path: mixes the
+// hc stream into one lane (x[col] = sum_lane pre[lane]*stream[lane*H+col]),
+// rounds to bf16 (matching the unfused chain's intermediate buffer), then
+// rms-normalizes and scales in the same block — one kernel boundary and one
+// 2*H-byte round trip instead of two kernels + an intermediate tensor.
+// Grid: one block per token, DSV4_MHC_BLOCK threads; the bf16 mixed row is
+// staged in shared memory (H bf16 <= 16KB at H=7168).
+__global__ void dsv4_mhc_pre_rms_norm_kernel(
+    const uint16_t *__restrict__ residual,
+    const float *__restrict__ pre,
+    const uint16_t *__restrict__ weight,
+    uint16_t *__restrict__ out,
+    int num_tokens,
+    int hidden_size,
+    int hc_mult,
+    float eps) {
+  extern __shared__ uint16_t x_row[];
+  const int token = blockIdx.x;
+  if (token >= num_tokens) return;
+
+  float pre_lane[DSV4_MHC_MAX];
+#pragma unroll
+  for (int lane = 0; lane < DSV4_MHC_MAX; ++lane) {
+    pre_lane[lane] = (lane < hc_mult) ? pre[token * hc_mult + lane] : 0.0f;
+  }
+
+  const int residual_base = token * hidden_size * hc_mult;
+  float local_sum = 0.0f;
+  for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
+    float value = 0.0f;
+    for (int lane = 0; lane < hc_mult; ++lane) {
+      value += pre_lane[lane] *
+               bf16_to_f32(residual[residual_base + lane * hidden_size + col]);
+    }
+    const uint16_t bits = f32_to_bf16_bits(value);
+    x_row[col] = bits;
+    const float rounded = bf16_to_f32(bits);
+    local_sum += rounded * rounded;
+  }
+  const float total = block_sum(local_sum);
+
+  __shared__ float s_inv_rms;
+  if (threadIdx.x == 0) {
+    s_inv_rms = 1.0f / sqrtf(total / (float)hidden_size + eps);
+  }
+  __syncthreads();
+  const float inv_rms = s_inv_rms;
+
+  uint16_t *out_row = out + token * hidden_size;
+  for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
+    const float value = bf16_to_f32(x_row[col]) * inv_rms *
+                        bf16_to_f32(weight[col]);
+    out_row[col] = f32_to_bf16_bits(value);
+  }
+}
+
+extern "C" CUresult dsv4_mhc_pre_rms_norm_cuda(
+    const uint16_t *residual,
+    const float *pre,
+    const uint16_t *weight,
+    uint16_t *out,
+    int num_tokens,
+    int hidden_size,
+    int hc_mult,
+    float eps,
+    CUstream stream) {
+  if (num_tokens < 0 || hidden_size <= 0 || hc_mult <= 0 ||
+      hc_mult > DSV4_MHC_MAX) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (num_tokens == 0) return CUDA_SUCCESS;
+  const size_t shmem = (size_t)hidden_size * sizeof(uint16_t);
+  if (shmem > 192 * 1024) return CUDA_ERROR_INVALID_VALUE;
+  if (shmem > 48 * 1024) {
+    cudaError_t attr = cudaFuncSetAttribute(
+        dsv4_mhc_pre_rms_norm_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+    if (attr != cudaSuccess) return (CUresult)attr;
+  }
+  dsv4_mhc_pre_rms_norm_kernel<<<num_tokens, DSV4_MHC_BLOCK, shmem,
+                                 (cudaStream_t)stream>>>(
+      residual, pre, weight, out, num_tokens, hidden_size, hc_mult, eps);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_mhc_pre_kernel(
     const uint16_t *__restrict__ residual,
     const float *__restrict__ pre,

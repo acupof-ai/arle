@@ -1367,20 +1367,18 @@ impl Dsv4Model {
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
-            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
-            let mut attn_in = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::hc::hc_pre(
+            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::hc::mhc_pre_rms_norm(
                 &self.ctx,
                 &stream,
                 &mhc.pre,
+                &layer.attn_norm,
+                eps,
                 hidden_size,
                 hc_mult,
-                &mut attn_in,
+                &mut normed,
             )?;
-            keepalive.keep_hidden(&attn_in);
-            // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
-            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::ops::rms_norm_batch(&self.ctx, &attn_in, &layer.attn_norm, eps, &mut normed)?;
             keepalive.keep_hidden(&normed);
             probe_rows("norm_in", &normed, layer_idx)?;
 
@@ -1465,20 +1463,18 @@ impl Dsv4Model {
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
-            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
-            let mut ffn_in = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::hc::hc_pre(
+            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::hc::mhc_pre_rms_norm(
                 &self.ctx,
                 &stream,
                 &mhc.pre,
+                &layer.ffn_norm,
+                eps,
                 hidden_size,
                 hc_mult,
-                &mut ffn_in,
+                &mut normed,
             )?;
-            keepalive.keep_hidden(&ffn_in);
-            // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
-            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)?;
             keepalive.keep_hidden(&normed);
             // Routed MoE over the whole [N] batch. allreduce transport: Phase 6a
             // grouped path (one router gemm + one DeepGEMM grouped expert GEMM
@@ -1855,25 +1851,20 @@ impl Dsv4Model {
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
             // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
-            let mut attn_in = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre", || {
-                crate::hc::hc_pre(
+            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size]
+            // buffer. (The old attn_in_L0 tail dump went with the intermediate.)
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
+                crate::hc::mhc_pre_rms_norm(
                     &self.ctx,
                     &stream,
                     &mhc.pre,
+                    &layer.attn_norm,
+                    eps,
                     hidden_size,
                     hc_mult,
-                    &mut attn_in,
+                    &mut normed,
                 )
-            })?;
-            keepalive.keep_hidden(&attn_in);
-            if layer_idx == 0 {
-                self.dump_tail_row("attn_in_L0", &attn_in, start_pos);
-            }
-            // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
-            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/attn_norm", || {
-                crate::ops::rms_norm_batch(&self.ctx, &attn_in, &layer.attn_norm, eps, &mut normed)
             })?;
             keepalive.keep_hidden(&normed);
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
@@ -1941,22 +1932,19 @@ impl Dsv4Model {
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
             // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
-            let mut ffn_in = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre", || {
-                crate::hc::hc_pre(
+            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
+                crate::hc::mhc_pre_rms_norm(
                     &self.ctx,
                     &stream,
                     &mhc.pre,
+                    &layer.ffn_norm,
+                    eps,
                     hidden_size,
                     hc_mult,
-                    &mut ffn_in,
+                    &mut normed,
                 )
-            })?;
-            keepalive.keep_hidden(&ffn_in);
-            // SAFETY: rms_norm_batch writes the full [seq_len, hidden_size] buffer.
-            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/ffn_norm", || {
-                crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)
             })?;
             keepalive.keep_hidden(&normed);
             let use_comm_overlap =
@@ -2394,17 +2382,17 @@ impl Dsv4Model {
         let tokens = [token];
 
         let attn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, &stream)?;
-        let mut attn_in = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
-        crate::hc::hc_pre(
+        let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
+        crate::hc::mhc_pre_rms_norm(
             ctx,
             &stream,
             &attn_mhc.pre,
+            &layer.attn_norm,
+            eps,
             hidden_size,
             hc_mult,
-            &mut attn_in,
+            &mut attn_normed,
         )?;
-        let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
-        crate::ops::rms_norm_batch(ctx, &attn_in, &layer.attn_norm, eps, &mut attn_normed)?;
         let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
         crate::attention::mla_attention(
             ctx,
@@ -2437,17 +2425,17 @@ impl Dsv4Model {
         )?;
 
         let ffn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, &attn_stream)?;
-        let mut ffn_in = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
-        crate::hc::hc_pre(
+        let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
+        crate::hc::mhc_pre_rms_norm(
             ctx,
             &attn_stream,
             &ffn_mhc.pre,
+            &layer.ffn_norm,
+            eps,
             hidden_size,
             hc_mult,
-            &mut ffn_in,
+            &mut ffn_normed,
         )?;
-        let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
-        crate::ops::rms_norm_batch(ctx, &ffn_in, &layer.ffn_norm, eps, &mut ffn_normed)?;
         let mut moe_out = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
         crate::moe::dsv4_moe_forward(
             self,
@@ -2587,19 +2575,14 @@ impl Dsv4Model {
                             &graph.initial_stream,
                             attn_mhc,
                         )?;
-                        crate::hc::hc_pre(
+                        crate::hc::mhc_pre_rms_norm(
                             &self.ctx,
                             &graph.initial_stream,
                             mhc.pre,
-                            hidden_size,
-                            hc_mult,
-                            attn_in,
-                        )?;
-                        crate::ops::rms_norm_batch(
-                            &self.ctx,
-                            attn_in,
                             &layer.attn_norm,
                             eps,
+                            hidden_size,
+                            hc_mult,
                             attn_normed,
                         )?;
                         crate::attention::mla_attention(
@@ -2658,19 +2641,14 @@ impl Dsv4Model {
                             &prev.ffn_stream,
                             attn_mhc,
                         )?;
-                        crate::hc::hc_pre(
+                        crate::hc::mhc_pre_rms_norm(
                             &self.ctx,
                             &prev.ffn_stream,
                             mhc.pre,
-                            hidden_size,
-                            hc_mult,
-                            attn_in,
-                        )?;
-                        crate::ops::rms_norm_batch(
-                            &self.ctx,
-                            attn_in,
                             &layer.attn_norm,
                             eps,
+                            hidden_size,
+                            hc_mult,
                             attn_normed,
                         )?;
                         crate::attention::mla_attention(
@@ -2743,19 +2721,14 @@ impl Dsv4Model {
                         attn_stream,
                         ffn_mhc,
                     )?;
-                    crate::hc::hc_pre(
+                    crate::hc::mhc_pre_rms_norm(
                         &self.ctx,
                         attn_stream,
                         mhc.pre,
-                        hidden_size,
-                        hc_mult,
-                        ffn_in,
-                    )?;
-                    crate::ops::rms_norm_batch(
-                        &self.ctx,
-                        ffn_in,
                         &layer.ffn_norm,
                         eps,
+                        hidden_size,
+                        hc_mult,
                         ffn_normed,
                     )?;
                     crate::moe::dsv4_moe_forward_decode_graph(
