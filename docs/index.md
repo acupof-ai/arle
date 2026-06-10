@@ -7,62 +7,31 @@
 > [docs/http-api.md](http-api.md) instead. This file is for ARLE maintainers
 > tracking canonical truth surfaces, active plans, and experience logs.
 
-**Current status (2026-05-28):** OPD mainline execution is active.
-The 2026-05-27 "51.03% MMLU first cross-base" wins claim was retracted
-under multi-seed paired verification — see
+**Current status (2026-06-10):** the strategic single truth is
+[`projects/2026-06-10-arle-master-strategy-v2.md`](projects/2026-06-10-arle-master-strategy-v2.md)
+(supersedes the 2026-05-07 master strategy; v2 §1 lists every overturned
+claim). Evolution path = Phase 0 debt (long-ctx correctness closeout,
+KV-precision-parity re-port to `infer-cuda`, truth-surface resync) →
+Phase 1 batched serving lane
+([`plans/2026-06-07-unified-batched-kvpool-abstraction.md`](plans/2026-06-07-unified-batched-kvpool-abstraction.md);
+`cd421794` made c≥2 exist as a sequential plan-split, bench
+pending-remote) → Phase 2 frozen-KV MTP default-good → Phase 3 product
+re-aim (W3/W4 baseline, OPD GPU resume, Qwen3.6 adapter). DSv4 perf
+coordinates: decode ~26–27 ms/token vs same-pod SGLang 15.89 no-spec /
+8.24 +EAGLE; 5–6 ms is an H100 number, not an H20 target. deepep_ll is
+correct but gated (B=1 −55%, its batched lane pending Phase 1 —
+[`experience/errors/2026-06-10-dsv4-deepep-ll-b1-regression-no-batch-lane.md`](experience/errors/2026-06-10-dsv4-deepep-ll-b1-regression-no-batch-lane.md)).
+Progress tracking: GitHub umbrella issue + per-Phase sub-issues.
+
+OPD remains the only training surface
+([`projects/2026-05-18-opd-only-pivot.md`](projects/2026-05-18-opd-only-pivot.md));
+its GPU experiments are queued behind Phase 1–2 (D4 serial rule). The
+"multi-seed before wins" capability-eval rule from
 [`experience/errors/2026-05-28-mmlu-cross-base-was-noise.md`](experience/errors/2026-05-28-mmlu-cross-base-was-noise.md)
-for the post-mortem + "multi-seed before wins" rule.
-
-Open research threads (not shipped, not wins):
-[rollout-perf O(n²) characterization](research/2026-05-28-opd-rollout-perf-208s-bottleneck.md),
-[codex task queue](projects/2026-05-28-codex-queue-when-it-returns.md).
-The OPD-only product boundary remains
-[`projects/2026-05-18-opd-only-pivot.md`](projects/2026-05-18-opd-only-pivot.md).
-The 2026-05-24 backlog
-[`projects/2026-05-24-opd-mainline-task-backlog.md`](projects/2026-05-24-opd-mainline-task-backlog.md)
-predates the methodology shift and is stale.
-
-**DSv4 status snapshot (2026-06-03):** DSv4 serving is correct enough to output
-tokens on the current debug/default path, but the current path is not
-SGLang-path aligned. The active target is DSv4-Flash TP8 + EAGLE on one 8-GPU
-node, 256K/1500, hot GPU-cache hit: TTFT ~0.44 s, TPOT ~4.85 ms, E2E ~7.7 s,
-and output throughput ~196 tok/s. The SGLang-gap campaign now uses
-[`plans/2026-06-01-dsv4-sglang-path-alignment.md`](plans/2026-06-01-dsv4-sglang-path-alignment.md)
-as the controlling plan. A result does not pass until that workload clears
-TTFT, TPOT, E2E, and output throughput together. For the mechanism-by-mechanism
-SGLang↔ARLE code-level cross-reference (what V4 does, where ARLE already does it,
-and the borrowable deltas), see
-[`research/2026-06-04-dsv4-sglang-codelevel-study.md`](research/2026-06-04-dsv4-sglang-codelevel-study.md).
-
-Default MoE transport is local routed experts plus EP all-reduce; native DeepEP
-is explicitly blocked on the replicated-token TP/EP route because it
-over-transports token rows by about 4.4x. The latest fail-closed startup
-contract also logs `model_row_ownership=replicated-token`; request routing can
-print `request_ownership=token-owned-dp-ep`, but that is not evidence that the
-DeepSeek model forward consumes distinct token-owned hidden rows. Debug
-all-reduce, DeepEP-style replicated-token dispatch, cold-cache runs, or raw
-target-model TPOT without EAGLE/effective-token accounting cannot license a
-win. The operator roofline queue is subordinate to this path contract and
-cannot license a SGLang-comparable win until request ownership, model row
-ownership, multi-axis TP/DP/EP layout, batched FlashMLA paged-KV attention, and
-native DeepEP/MegaMoE-style MoE transport are aligned. A later user-supplied
-vLLM/SGLang trace makes the post-contract P0 MoE/EP first: fused SwiGLU+quant,
-DeepGEMM expert GEMM, DeepEP dispatch/combine, and scratch/materialization
-elimination. Historical evidence:
-[`experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md),
-[`experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-route-grouped-kill.md),
-[`experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md`](experience/errors/2026-05-26-dsv4-a3-phase2-deepgemm-kill.md),
-[`experience/errors/2026-05-26-dsv4-native-deepep-ll-sameprocess-timeout.md`](experience/errors/2026-05-26-dsv4-native-deepep-ll-sameprocess-timeout.md),
-[`experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md`](experience/errors/2026-05-26-dsv4-native-deepep-process-model-gate.md),
-[`plans/2026-05-26-dsv4-deepep-process-per-rank.md`](plans/2026-05-26-dsv4-deepep-process-per-rank.md) (next step — sidecar transport),
-[`experience/wins/2026-05-26-dsv4-deepep-child-process-spike.md`](experience/wins/2026-05-26-dsv4-deepep-child-process-spike.md) (phase 0 PASS — child-process buffer reuse),
-[`experience/wins/2026-05-26-dsv4-deepep-ipc-roundtrip-measurement.md`](experience/wins/2026-05-26-dsv4-deepep-ipc-roundtrip-measurement.md) (phase 1 budget reframed to 250 us / layer; C++ sidecar locked),
-[`experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md`](experience/wins/2026-05-26-dsv4-default-deepep-deepgemm.md),
-[`experience/wins/2026-05-26-dsv4-a20-fused-attn-window-update.md`](experience/wins/2026-05-26-dsv4-a20-fused-attn-window-update.md),
-[`experience/wins/2026-05-26-dsv4-a21-fused-qk-prep.md`](experience/wins/2026-05-26-dsv4-a21-fused-qk-prep.md),
-[`experience/wins/2026-05-26-dsv4-deepgemm-device-prop-cache.md`](experience/wins/2026-05-26-dsv4-deepgemm-device-prop-cache.md),
-[`experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md`](experience/wins/2026-05-26-dsv4-deepgemm-device-counts.md),
-`trace-artifacts/2026-05-15-dsv4-deepep/`.
+stands. Open thread:
+[rollout-perf O(n²) characterization](research/2026-05-28-opd-rollout-perf-208s-bottleneck.md).
+The 2026-05-24 OPD backlog and the 2026-06-01 SGLang-path-alignment plan
+are historical (superseded by the v2 phase sequence).
 
 **Rewrite + DSv4/Qwen final verdict (2026-06-04):** the device-neutral `infer-*`
 rewrite is the serving truth (monolithic `infer` deleted); for the consolidated
@@ -112,7 +81,7 @@ live in this file.
 | Concern | Canonical source | Notes |
 | --- | --- | --- |
 | **New contributor onboarding (30 min)** | [onboarding.md](onboarding.md) | Current truth, paths, feature flags, verify checklist. |
-| Strategic master (positioning, axes, kill criteria) | [projects/2026-05-07-arle-master-strategy.md](projects/2026-05-07-arle-master-strategy.md) | Cited by [`ROADMAP.md`](../ROADMAP.md) as strategic master. |
+| Strategic master (positioning, evolution path, kill criteria) | [projects/2026-06-10-arle-master-strategy-v2.md](projects/2026-06-10-arle-master-strategy-v2.md) | Cited by [`ROADMAP.md`](../ROADMAP.md) as strategic master. v1 (2026-05-07) is SUPERSEDED, kept as history. |
 | Support status of backends / APIs / model families | [support-matrix.md](support-matrix.md) | README and roadmap summarize only. |
 | Quantization deep map (KV + weights, kernels, status, tests) | [quantization.md](quantization.md) | Canonical for every quant path; support-matrix §4 mirrors a one-glance view. |
 | Stability levels and compatibility posture | [stability-policy.md](stability-policy.md) | Do not redefine tiers elsewhere. |
@@ -120,7 +89,7 @@ live in this file.
 | Architecture ownership and boundaries | [architecture.md](architecture.md) | The `infer-*` rewrite crates (`infer-core`/`-seam`/`-cuda`/`-metal`/`-server`/`-api`) own runtime truth. |
 | Benchmark and trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) | `guidellm` is the canonical e2e benchmark path. |
 | Canonical e2e bench tool + parameter set | [plans/guidellm-integration.md](plans/guidellm-integration.md) | Wrapper script `scripts/bench_guidellm.sh` uses these params verbatim. |
-| OPD mainline execution queue | [projects/2026-05-24-opd-mainline-task-backlog.md](projects/2026-05-24-opd-mainline-task-backlog.md) | Live CPU/GPU task order, deferred gates, and fdb021c→HEAD artifact ledger. |
+| OPD mainline execution queue | [projects/2026-05-24-opd-mainline-task-backlog.md](projects/2026-05-24-opd-mainline-task-backlog.md) | Historical artifact ledger; superseded by master strategy v2 Phase 3 (OPD GPU work queued behind Phase 1–2). |
 | Contributor operating contract | [../AGENTS.md](../AGENTS.md) | Use with the canonical docs above. |
 
 ## Current Positioning
@@ -146,11 +115,11 @@ marked as the current source of truth, treat it as historical context.
 | Path | Status | Use this when |
 | --- | --- | --- |
 | [projects/2026-06-04-qwen35-dsv4-final-report.md](projects/2026-06-04-qwen35-dsv4-final-report.md) | Active — rewrite verification + perf | The question is the post-rewrite (`infer-*` crates, branch `arch/ideal-inference-engine`) verification & performance verdict across Metal + CUDA, TP/EP, FP8 DeepGEMM MoE, DeepEP — including the honest DSv4 incremental-decode-broken correction and the SGLang-class perf push. Companion detail: [projects/2026-06-04-rewrite-completion-verification-report.md](projects/2026-06-04-rewrite-completion-verification-report.md). |
-| [projects/2026-05-24-opd-mainline-task-backlog.md](projects/2026-05-24-opd-mainline-task-backlog.md) | Active — live queue | The question is the current OPD mainline task order, CPU-only shipped work, GPU-deferred gates, or session artifact ledger. |
+| [projects/2026-05-24-opd-mainline-task-backlog.md](projects/2026-05-24-opd-mainline-task-backlog.md) | Historical — superseded by strategy v2 | The question is the past OPD mainline task order or session artifact ledger; current OPD sequencing is master strategy v2 Phase 3. |
 | [projects/2026-05-18-opd-only-pivot.md](projects/2026-05-18-opd-only-pivot.md) | Active — product boundary | The question is why training scope is OPD-only and why scratch pretrain/SFT/GRPO/multi-turn surfaces stay deleted. |
 | [projects/2026-05-01-deepseek-v4-readiness.md](projects/2026-05-01-deepseek-v4-readiness.md) | Active — #1 next-model | The question is DeepSeek V4 readiness, the DS0–DS8 gap matrix, and current 8xH20 DeepEP decode hot path. |
-| [projects/2026-04-30-longctx-32k-128k-leadership.md](projects/2026-04-30-longctx-32k-128k-leadership.md) | Active — P0 mission | The question is the 32k–128k longctx world-#1 mission (4 phase plan, baseline panel, hardware tiers, current Phase 1 SGLang-row close + Phase 2 plumbing/regression status). |
-| [projects/2026-05-02-agent-load-mission-expansion.md](projects/2026-05-02-agent-load-mission-expansion.md) | Active — mission expansion | The question is the agent-load world-#1 expansion: W3 short-prompt multi-turn, W4 tool-call resume, session affinity, prefix-cache reuse, four-engine baseline gates. |
+| [projects/2026-04-30-longctx-32k-128k-leadership.md](projects/2026-04-30-longctx-32k-128k-leadership.md) | Paused — restarts at strategy v2 Phase 3 | The question is the 32k–128k longctx world-#1 mission (4 phase plan, baseline panel, hardware tiers, Phase 1 SGLang-row close + the Phase 2 spec-decode regression that the frozen-KV redesign now addresses). |
+| [projects/2026-05-02-agent-load-mission-expansion.md](projects/2026-05-02-agent-load-mission-expansion.md) | Paused — restarts at strategy v2 Phase 3 | The question is the agent-load world-#1 expansion: W3 short-prompt multi-turn, W4 tool-call resume, session affinity, prefix-cache reuse, four-engine baseline gates (cross-engine baseline still never run). |
 | [projects/2026-05-01-multi-gpu-f0-readiness.md](projects/2026-05-01-multi-gpu-f0-readiness.md) | Active | The question is single-node multi-GPU F0 readiness, TP/PP/EP axes, NCCL smoke, the gap matrix to real multi-rank serving. |
 | [projects/2026-05-01-spec-decode-integration-design.md](projects/2026-05-01-spec-decode-integration-design.md) | Active | The question is how Phase 2 spec decode plumbing integrates with the CUDA scheduler, verifier, and external draft state. |
 | [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | Active | The question is current KV-tier scope, milestones, or operator-facing status. |
