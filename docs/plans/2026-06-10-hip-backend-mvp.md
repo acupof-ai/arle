@@ -116,6 +116,40 @@ The Vulkan column is self-contained shaders (no CUDA→HIP source porting, no RO
 install, runs on AMD/Intel/NVIDIA + Windows); the HIP column is closer to our
 existing CUDA kernel idioms and gets GEMM from a vendor library instead of shaders.
 
+### §2.2 Op-prep audit (2026-06-10, off-box)
+
+**WIP-graph anatomy (nisparks `pr/01-deepseek-v4-arch` @ `9cb6ae64`):** the DSv4
+graph adds **zero new GGML ops and zero new kernels** — compressor/indexer/CSA are
+compositions of standard primitives (`concat/cont/mul_mat/rope_ext(+back)/soft_max/
+sigmoid/top_k/set_rows/sum_rows/softplus/fill/swiglu_split/clamp/…`), attention is
+manual `mul_mat+soft_max` (no `flash_attn_ext` — matches "FA disabled"). That is
+both why it boots anywhere and why it crawls at 1–2 t/s: zero fusion. **Vulkan
+coverage check: every op in that list is implemented in mainline `ggml-vulkan`**
+(`ggml_cast` lowers to CPY) — the tinycomputers base runs on either backend; lane
+choice stays a perf call, not a coverage call.
+
+**Our csrc DSv4 fallback kernels — hipcc portability scan** (SM90-construct grep:
+`wgmma|cp.async|mbarrier|tma|__grid_constant__|cluster|asm volatile`):
+
+| File | Exports | Verdict |
+| --- | --- | --- |
+| `misc/dsv4_attention.cu` (1963 L) | `hybrid_attention`, `swa_attention`, `csa_select`, `compressor_update`, `prepare_qk(+fused)`, `update_window_cache`, `output_inverse_rope` | **0 blockers, 0 warp intrinsics — shim-portable as-is.** This file IS the fused DSv4 core the WIP branch lacks |
+| `gemm/dsv4_grouped_gemm.cu`, `gemm/moe_grouped_gemm.cu` | grouped/MoE GEMM | 0 blockers, 1 `__shfl` each — portable after wave32/64 width audit (RDNA3.5 native wave32) |
+| `attention/decode_prep_paged.cu`, `misc/elementwise_basic.cu` | prep, `swiglu_clamped`, `mtp_add_eproj_hproj` | clean |
+| `misc/dsv4_mhc.cu` | `mhc_pre/post/expand/params/head_pre` | 4 loose-pattern hits — classify next pass (strict SM90 scan does NOT flag it) |
+| `misc/dsv4_dsa_official.cu` | official-DSA adapter | 1 strict blocker + warp intrinsics — **excluded**; fallback = `csa_select` path above |
+| FlashMLA / DeepGEMM / DeepEP | — | excluded, datacenter-only |
+
+**Op-prep checklist (remaining, all off-box-doable):**
+- [ ] Classify `dsv4_mhc.cu`'s 4 hits; wave32/64 audit of the two `__shfl` uses
+- [ ] Shim header for our csrc subset (extend vendored `vendors/hip.h`; map
+  `__nv_bfloat16`→HIP bf16, verify launch/macro coverage by dry hipcc parse on-box)
+- [ ] Re-wrap vendored iq2/q2_K `mmvq`+`dequantize` into raw-pointer ARLE-callable
+  kernels (strip ggml tensor plumbing)
+- [ ] Offline quantizer: FP8 safetensors → asymmetric IQ2_XXS/Q2_K recipe
+  (`ggml-quants.c` codecs; CPU-only, unit-testable off-box)
+- [ ] Wire the above into `cuda-kernels`-style build for hipcc (`--offload-arch=gfx1151`)
+
 ## §3 Kept / killed kernel-source candidates
 
 | Candidate | Verdict | Why |
