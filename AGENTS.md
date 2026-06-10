@@ -415,11 +415,16 @@ cargo test -p cli --release --no-default-features --features metal,no-cuda   # M
 cargo test -p kv-native-sys --release
 ```
 
-**KV precision parity audit — NOT yet re-ported to `infer-cuda`.** The
-legacy-`infer` parity harness (BF16 reference vs INT8/FP8/TQ4 trajectory
-match) died with the monolith; re-porting it is a Phase 0 item in the
-master strategy v2 and **the gate every KV/quant default flip waits on**
-(FlashMLA decode / fused-wqkv / contig-MoE land gated-off until then).
+**KV precision parity gate — re-ported 2026-06-10 (#58).** The monolith's
+trajectory-match audit is superseded by the correct-inference gate
+(`scripts/dsv4_needle_gate.py` + `scripts/dsv4_lever_gate.sh`): needle ladder
+x3 same-config repeats vs the baseline envelope, NOT byte-identity (MoE
+non-determinism). DSv4 lever verdicts
+([wins entry](docs/experience/wins/2026-06-10-dsv4-lever-gate-license-or-kill.md)):
+FlashMLA decode + fused-wqkv correctness LICENSED — default flips still need
+a wall-clock perf license per the bench spec; pooled/contig-MoE flip KILLED
+(-24%). Qwen3.5's BF16/INT8/FP8/TQ4 matrix stays BLOCKED until the quant-KV
+dispatch is re-ported to the rewrite's paged-KV path.
 
 Env vars: `TORCH_CUDA_ARCH_LIST` (SM override, PyTorch convention; alt `CMAKE_CUDA_ARCHITECTURES`),
 `INFER_TILELANG_PYTHON` (TileLang AOT Python), `INFER_TEST_MODEL_PATH`
