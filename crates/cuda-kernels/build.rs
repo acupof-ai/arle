@@ -1640,6 +1640,64 @@ fn tool_command(tool: &str, wrapper: Option<&str>) -> Command {
     }
 }
 
+/// One queued nvcc invocation: the source (for error messages) plus the full
+/// pre-built argv. The output path is already baked into `args`.
+struct NvccJob {
+    cu_file: PathBuf,
+    args: Vec<String>,
+}
+
+fn run_nvcc_job(nvcc: &str, wrapper: Option<&str>, job: &NvccJob) {
+    let status = tool_command(nvcc, wrapper)
+        .args(&job.args)
+        .status()
+        .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", job.cu_file.display()));
+    assert!(
+        status.success(),
+        "nvcc compilation failed for {}",
+        job.cu_file.display()
+    );
+}
+
+/// Bounded worker count for the nvcc pool. Capped at 8 because a single
+/// multi-arch nvcc invocation can take 1-2 GB of RAM; `ARLE_NVCC_PARALLEL=1`
+/// restores the previous serial behavior.
+fn nvcc_parallelism(jobs: usize) -> usize {
+    println!("cargo:rerun-if-env-changed=ARLE_NVCC_PARALLEL");
+    let configured = env_nonempty("ARLE_NVCC_PARALLEL").and_then(|v| v.parse::<usize>().ok());
+    let default = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8);
+    configured.unwrap_or(default).clamp(1, jobs.max(1))
+}
+
+/// Run all queued nvcc jobs through a bounded pool. Archive order is decided
+/// by the caller's `obj_files` (queue order), not completion order, so the
+/// `ar` symbol-resolution order is identical to the old serial loop. A panic
+/// in any worker is re-raised when the scope joins, failing the build.
+fn run_nvcc_jobs(nvcc: &str, wrapper: Option<&str>, jobs: &[NvccJob]) {
+    let workers = nvcc_parallelism(jobs.len());
+    if workers <= 1 {
+        for job in jobs {
+            run_nvcc_job(nvcc, wrapper, job);
+        }
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(job) = jobs.get(idx) else { break };
+                    run_nvcc_job(nvcc, wrapper, job);
+                }
+            });
+        }
+    });
+}
+
 fn main() {
     if std::env::var("CARGO_FEATURE_METAL").is_ok() {
         println!("cargo:warning=metal feature active: relying on mlx-sys bridge only.");
@@ -1837,6 +1895,7 @@ fn main() {
         );
 
     let mut obj_files = Vec::new();
+    let mut nvcc_jobs = Vec::new();
     for cu_file in &cu_files {
         let stem = cu_file.file_stem().unwrap().to_str().unwrap();
         let obj_file = out_dir.join(format!("{}_cuda.o", stem));
@@ -1933,19 +1992,14 @@ fn main() {
             ]);
         }
 
-        let status = tool_command(&nvcc, nvcc_wrapper.as_deref())
-            .args(&nvcc_args)
-            .status()
-            .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
-
-        assert!(
-            status.success(),
-            "nvcc compilation failed for {}",
-            cu_file.display()
-        );
-
+        nvcc_jobs.push(NvccJob {
+            cu_file: cu_file.clone(),
+            args: nvcc_args,
+        });
         obj_files.push(obj_file);
     }
+
+    run_nvcc_jobs(&nvcc, nvcc_wrapper.as_deref(), &nvcc_jobs);
 
     if enable_flashmla {
         let stub_obj = "arle_flashmla_decode_stubs_cuda.o";
