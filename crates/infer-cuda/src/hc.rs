@@ -309,6 +309,122 @@ pub(crate) fn hc_pre(
     Ok(())
 }
 
+/// Full "enter the hc sandwich" in one kernel after the mix gemv:
+/// mhc_params (rms factor + sigmoid/Sinkhorn) AND the pre-mix + rms_norm,
+/// with the stream row staged in shared memory once. Returns the params
+/// (post/comb feed the later [`hc_post`]) and writes `normed_out`.
+/// hc_mult==4 fast path (production); other shapes fall back to the
+/// two-kernel pair.
+pub(crate) fn hc_enter(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    hc: &Dsv4HyperConnection,
+    stream: &HiddenStates,
+    norm_weight: &cuda_kernels::prelude::DeviceVec,
+    norm_eps: f32,
+    normed_out: &mut HiddenStates,
+) -> Result<MhcParams> {
+    let hc_mult = config.hc_mult;
+    if hc_mult != 4 {
+        let params = gen_mhc_params(ctx, config, hc, stream)?;
+        let hidden_size = stream.hidden_dim / hc_mult;
+        mhc_pre_rms_norm(
+            ctx,
+            stream,
+            &params.pre,
+            norm_weight,
+            norm_eps,
+            hidden_size,
+            hc_mult,
+            normed_out,
+        )?;
+        return Ok(params);
+    }
+    let mix_dim = (2 + hc_mult) * hc_mult;
+    let hidden_size = stream.hidden_dim / hc_mult;
+    ensure!(
+        stream.hidden_dim == hidden_size * hc_mult,
+        "DSv4 hc_enter stream dim {} not divisible by hc_mult {hc_mult}",
+        stream.hidden_dim
+    );
+    ensure!(
+        hc.mix_fn.cols == stream.hidden_dim && hc.mix_fn.rows >= mix_dim,
+        "DSv4 hc_enter mix shape {}x{} cannot produce {mix_dim} from stream dim {}",
+        hc.mix_fn.rows,
+        hc.mix_fn.cols,
+        stream.hidden_dim
+    );
+    ensure!(
+        hc.base.len >= mix_dim && hc.scale.len >= 3 && norm_weight.len == hidden_size,
+        "DSv4 hc_enter base/scale/weight too short: base={} scale={} weight={}",
+        hc.base.len,
+        hc.scale.len,
+        norm_weight.len
+    );
+    ensure!(
+        normed_out.hidden_dim == hidden_size && normed_out.seq_len == stream.seq_len,
+        "DSv4 hc_enter out shape {}x{} != {hidden_size}x{}",
+        normed_out.hidden_dim,
+        normed_out.seq_len,
+        stream.seq_len
+    );
+
+    // SAFETY: dsv4_linear writes the full mix buffer.
+    let mut mixes = unsafe { HiddenStates::uninit(ctx, hc.mix_fn.rows, stream.seq_len)? };
+    crate::attention::dsv4_linear(ctx, &hc.mix_fn, stream, &mut mixes)?;
+
+    let mut pre = unsafe {
+        ctx.stream
+            .alloc::<f32>(stream.seq_len * hc_mult)
+            .map_err(|e| anyhow!("DSv4 hc_enter pre alloc failed: {e}"))?
+    };
+    let mut post = unsafe {
+        ctx.stream
+            .alloc::<f32>(stream.seq_len * hc_mult)
+            .map_err(|e| anyhow!("DSv4 hc_enter post alloc failed: {e}"))?
+    };
+    let mut comb = unsafe {
+        ctx.stream
+            .alloc::<f32>(stream.seq_len * hc_mult * hc_mult)
+            .map_err(|e| anyhow!("DSv4 hc_enter comb alloc failed: {e}"))?
+    };
+    {
+        let (stream_ptr, _gs) = stream.data.device_ptr(&ctx.stream);
+        let (mixes_ptr, _gm) = mixes.data.device_ptr(&ctx.stream);
+        let (base_ptr, _gb) = hc.base.data.device_ptr(&ctx.stream);
+        let (scale_ptr, _gsc) = hc.scale.data.device_ptr(&ctx.stream);
+        let (w_ptr, _gw) = norm_weight.data.device_ptr(&ctx.stream);
+        let (pre_ptr, _gp) = pre.device_ptr_mut(&ctx.stream);
+        let (post_ptr, _gpo) = post.device_ptr_mut(&ctx.stream);
+        let (comb_ptr, _gc) = comb.device_ptr_mut(&ctx.stream);
+        let (out_ptr, _go) = normed_out.data.device_ptr_mut(&ctx.stream);
+        // SAFETY: buffers valid on ctx.stream; shapes checked above.
+        unsafe {
+            ffi::dsv4_mhc_enter_launch_cuda(
+                stream_ptr as *const ffi::Half,
+                mixes_ptr as *const ffi::Half,
+                base_ptr as *const ffi::Half,
+                scale_ptr as *const ffi::Half,
+                w_ptr as *const ffi::Half,
+                pre_ptr as *mut f32,
+                post_ptr as *mut f32,
+                comb_ptr as *mut f32,
+                out_ptr as *mut ffi::Half,
+                stream.seq_len as i32,
+                hidden_size as i32,
+                mixes.hidden_dim as i32,
+                hc_mult as i32,
+                config.hc_eps,
+                norm_eps,
+                config.hc_sinkhorn_iters as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    Ok(MhcParams { pre, post, comb })
+}
+
 /// Fused [`hc_pre`] + rms-norm: mix the stream into one lane and normalize in
 /// a single kernel (one boundary, no intermediate tensor). Drop-in for the
 /// `hc_pre(...) ; rms_norm_batch(...)` pair on every layer's attn/ffn prologue.

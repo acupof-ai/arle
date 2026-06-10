@@ -441,6 +441,179 @@ extern "C" CUresult dsv4_mhc_params_bench_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+// hc_enter: the full "enter the hc sandwich" sequence in ONE kernel —
+// mhc_params (stream rms factor + sigmoid/Sinkhorn over the mix gemv output)
+// followed by the fused pre-mix + rms_norm. The stream row is read from
+// global memory ONCE into shared memory (32KB at H=4096, hc_mult=4) and
+// reused by both phases; `pre` lanes flow through shared memory instead of a
+// global round trip. hc_mult==4 only (production); callers fall back to the
+// two-kernel path otherwise. One block per token, 1024 threads
+// (microbench-licensed for the single-block bandwidth shape).
+__global__ void dsv4_mhc_enter_kernel(
+    const uint16_t *__restrict__ residual,
+    const uint16_t *__restrict__ mixes,
+    const uint16_t *__restrict__ base,
+    const uint16_t *__restrict__ scale,
+    const uint16_t *__restrict__ weight,
+    float *__restrict__ pre,
+    float *__restrict__ post,
+    float *__restrict__ comb,
+    uint16_t *__restrict__ out,
+    int num_tokens,
+    int hidden_size,
+    int mix_dim,
+    float eps,
+    float norm_eps,
+    int sinkhorn_iters) {
+  constexpr int HC = 4;
+  extern __shared__ uint16_t smem[];
+  // Layout: stream row [hidden*HC bf16] | mixed row [hidden bf16].
+  uint16_t *stream_row = smem;
+  uint16_t *mixed_row = smem + (size_t)hidden_size * HC;
+
+  const int token = blockIdx.x;
+  if (token >= num_tokens) return;
+  const int stream_dim = hidden_size * HC;
+
+  // ── Phase 1a: stage the stream row + sumsq for the params rms factor. ──
+  const int row_start = token * stream_dim;
+  float sumsq = 0.0f;
+  for (int idx = threadIdx.x; idx < stream_dim; idx += blockDim.x) {
+    const uint16_t bits = residual[row_start + idx];
+    stream_row[idx] = bits;
+    const float value = bf16_to_f32(bits);
+    sumsq += value * value;
+  }
+  sumsq = block_sum(sumsq);
+
+  __shared__ float rsqrt_shared;
+  __shared__ float mixes_shared[HC * (2 + HC)];
+  __shared__ float pre_shared[HC];
+  if (threadIdx.x == 0) {
+    rsqrt_shared = rsqrtf(sumsq / fmaxf((float)stream_dim, 1.0f) + eps);
+  }
+  __syncthreads();
+
+  const int need_mix = HC * (2 + HC);
+  for (int idx = threadIdx.x; idx < need_mix; idx += blockDim.x) {
+    mixes_shared[idx] = bf16_to_f32(mixes[token * mix_dim + idx]) * rsqrt_shared;
+  }
+  __syncthreads();
+
+  // ── Phase 1b: warp tail — sigmoids + Sinkhorn (lanes 0-15). ──
+  if (threadIdx.x < WARP_SIZE) {
+    const int lane = threadIdx.x;
+    const float scale0 = bf16_to_f32(scale[0]);
+    const float scale1 = bf16_to_f32(scale[1]);
+    const float scale2 = bf16_to_f32(scale[2]);
+    const int token_hc = token * HC;
+    if (lane < HC) {
+      const float p =
+          dsv4_sigmoid(scale0 * mixes_shared[lane] + bf16_to_f32(base[lane])) + eps;
+      pre[token_hc + lane] = p;
+      pre_shared[lane] = p;
+    } else if (lane < 2 * HC) {
+      const int l = lane - HC;
+      post[token_hc + l] = 2.0f * dsv4_sigmoid(scale1 * mixes_shared[HC + l] +
+                                               bf16_to_f32(base[HC + l]));
+    }
+    if (lane < 16) {
+      const unsigned mask = 0xFFFFu;
+      float v = scale2 * mixes_shared[2 * HC + lane] + bf16_to_f32(base[2 * HC + lane]);
+      float m = v;
+      m = fmaxf(m, __shfl_xor_sync(mask, m, 1));
+      m = fmaxf(m, __shfl_xor_sync(mask, m, 2));
+      v = expf(v - m);
+      float rs = v;
+      rs += __shfl_xor_sync(mask, rs, 1);
+      rs += __shfl_xor_sync(mask, rs, 2);
+      v = v / rs + eps;
+      float cs = v;
+      cs += __shfl_xor_sync(mask, cs, 4);
+      cs += __shfl_xor_sync(mask, cs, 8);
+      v /= (eps + cs);
+      for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+        float rsum = v;
+        rsum += __shfl_xor_sync(mask, rsum, 1);
+        rsum += __shfl_xor_sync(mask, rsum, 2);
+        v /= (eps + rsum);
+        float csum = v;
+        csum += __shfl_xor_sync(mask, csum, 4);
+        csum += __shfl_xor_sync(mask, csum, 8);
+        v /= (eps + csum);
+      }
+      comb[token * HC * HC + lane] = v;
+    }
+  }
+  __syncthreads();
+
+  // ── Phase 2: pre-mix from shared stream + rms_norm (bf16-rounded mix to
+  //    match the unfused intermediate semantics). ──
+  float local_sum = 0.0f;
+  for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
+    float value = 0.0f;
+#pragma unroll
+    for (int lane = 0; lane < HC; ++lane) {
+      value += pre_shared[lane] * bf16_to_f32(stream_row[lane * hidden_size + col]);
+    }
+    const uint16_t bits = f32_to_bf16_bits(value);
+    mixed_row[col] = bits;
+    const float rounded = bf16_to_f32(bits);
+    local_sum += rounded * rounded;
+  }
+  const float total = block_sum(local_sum);
+
+  __shared__ float s_inv_rms;
+  if (threadIdx.x == 0) {
+    s_inv_rms = 1.0f / sqrtf(total / (float)hidden_size + norm_eps);
+  }
+  __syncthreads();
+  const float inv_rms = s_inv_rms;
+
+  uint16_t *out_row = out + (size_t)token * hidden_size;
+  for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
+    out_row[col] = f32_to_bf16_bits(bf16_to_f32(mixed_row[col]) * inv_rms *
+                                    bf16_to_f32(weight[col]));
+  }
+}
+
+extern "C" CUresult dsv4_mhc_enter_launch_cuda(
+    const uint16_t *residual,
+    const uint16_t *mixes,
+    const uint16_t *base,
+    const uint16_t *scale,
+    const uint16_t *weight,
+    float *pre,
+    float *post,
+    float *comb,
+    uint16_t *out,
+    int num_tokens,
+    int hidden_size,
+    int mix_dim,
+    int hc_mult,
+    float eps,
+    float norm_eps,
+    int sinkhorn_iters,
+    CUstream stream) {
+  if (num_tokens < 0 || hidden_size <= 0 || hc_mult != 4 ||
+      mix_dim < 4 * (2 + 4) || sinkhorn_iters <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (num_tokens == 0) return CUDA_SUCCESS;
+  const size_t shmem = (size_t)hidden_size * 5 * sizeof(uint16_t);
+  if (shmem > 200 * 1024) return CUDA_ERROR_INVALID_VALUE;
+  if (shmem > 48 * 1024) {
+    cudaError_t attr = cudaFuncSetAttribute(
+        dsv4_mhc_enter_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)shmem);
+    if (attr != cudaSuccess) return (CUresult)attr;
+  }
+  dsv4_mhc_enter_kernel<<<num_tokens, 1024, shmem, (cudaStream_t)stream>>>(
+      residual, mixes, base, scale, weight, pre, post, comb, out, num_tokens,
+      hidden_size, mix_dim, eps, norm_eps, sinkhorn_iters);
+  return (CUresult)cudaGetLastError();
+}
+
 // Bench-only entry for the fused prologue with an explicit block size
 // (examples/dsv4_microbench.rs). Not a serving path.
 extern "C" CUresult dsv4_mhc_pre_rms_norm_bench_cuda(

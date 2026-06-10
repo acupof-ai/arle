@@ -1363,22 +1363,20 @@ impl Dsv4Model {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC params + pre + norm over the whole [N] batch.
-            let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)?;
+            // SAFETY: hc_enter writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            let mhc = crate::hc::hc_enter(
+                &self.ctx,
+                &self.config,
+                &layer.hc_attn,
+                &stream,
+                &layer.attn_norm,
+                eps,
+                &mut normed,
+            )?;
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
-            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
-            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::hc::mhc_pre_rms_norm(
-                &self.ctx,
-                &stream,
-                &mhc.pre,
-                &layer.attn_norm,
-                eps,
-                hidden_size,
-                hc_mult,
-                &mut normed,
-            )?;
             keepalive.keep_hidden(&normed);
             probe_rows("norm_in", &normed, layer_idx)?;
 
@@ -1459,22 +1457,20 @@ impl Dsv4Model {
             probe_rows("attn", &stream, layer_idx)?;
 
             // ── MoE half: HC-wrap the grouped FP8 DeepGEMM MoE over the [N] batch.
-            let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
+            // SAFETY: hc_enter writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            let mhc = crate::hc::hc_enter(
+                &self.ctx,
+                &self.config,
+                &layer.hc_ffn,
+                &stream,
+                &layer.ffn_norm,
+                eps,
+                &mut normed,
+            )?;
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
-            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
-            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::hc::mhc_pre_rms_norm(
-                &self.ctx,
-                &stream,
-                &mhc.pre,
-                &layer.ffn_norm,
-                eps,
-                hidden_size,
-                hc_mult,
-                &mut normed,
-            )?;
             keepalive.keep_hidden(&normed);
             // Routed MoE over the whole [N] batch. allreduce transport: Phase 6a
             // grouped path (one router gemm + one DeepGEMM grouped expert GEMM
@@ -1844,28 +1840,22 @@ impl Dsv4Model {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC-wrap MLA attention.
-            let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_params", || {
-                crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)
+            // SAFETY: hc_enter writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_enter", || {
+                crate::hc::hc_enter(
+                    &self.ctx,
+                    &self.config,
+                    &layer.hc_attn,
+                    &stream,
+                    &layer.attn_norm,
+                    eps,
+                    &mut normed,
+                )
             })?;
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
-            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
-            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size]
-            // buffer. (The old attn_in_L0 tail dump went with the intermediate.)
-            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
-                crate::hc::mhc_pre_rms_norm(
-                    &self.ctx,
-                    &stream,
-                    &mhc.pre,
-                    &layer.attn_norm,
-                    eps,
-                    hidden_size,
-                    hc_mult,
-                    &mut normed,
-                )
-            })?;
             keepalive.keep_hidden(&normed);
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
@@ -1925,27 +1915,22 @@ impl Dsv4Model {
             stream = attn_stream;
 
             // ── MoE half: HC-wrap the FP8 DeepGEMM MoE block.
-            let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_params", || {
-                crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)
+            // SAFETY: hc_enter writes the full [seq_len, hidden_size] buffer.
+            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_enter", || {
+                crate::hc::hc_enter(
+                    &self.ctx,
+                    &self.config,
+                    &layer.hc_ffn,
+                    &stream,
+                    &layer.ffn_norm,
+                    eps,
+                    &mut normed,
+                )
             })?;
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
             keepalive.keep_f32(&mhc.comb);
-            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
-            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
-            let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
-                crate::hc::mhc_pre_rms_norm(
-                    &self.ctx,
-                    &stream,
-                    &mhc.pre,
-                    &layer.ffn_norm,
-                    eps,
-                    hidden_size,
-                    hc_mult,
-                    &mut normed,
-                )
-            })?;
             keepalive.keep_hidden(&normed);
             let use_comm_overlap =
                 dsv4_comm_overlap_enabled() && seq_len == 1 && !use_deepep_transport;
@@ -2381,16 +2366,14 @@ impl Dsv4Model {
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
         let tokens = [token];
 
-        let attn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, &stream)?;
         let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
-        crate::hc::mhc_pre_rms_norm(
+        let attn_mhc = crate::hc::hc_enter(
             ctx,
+            &self.config,
+            &layer.hc_attn,
             &stream,
-            &attn_mhc.pre,
             &layer.attn_norm,
             eps,
-            hidden_size,
-            hc_mult,
             &mut attn_normed,
         )?;
         let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
@@ -2424,16 +2407,14 @@ impl Dsv4Model {
             &mut attn_stream,
         )?;
 
-        let ffn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, &attn_stream)?;
         let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
-        crate::hc::mhc_pre_rms_norm(
+        let ffn_mhc = crate::hc::hc_enter(
             ctx,
+            &self.config,
+            &layer.hc_ffn,
             &attn_stream,
-            &ffn_mhc.pre,
             &layer.ffn_norm,
             eps,
-            hidden_size,
-            hc_mult,
             &mut ffn_normed,
         )?;
         let mut moe_out = unsafe { HiddenStates::uninit(ctx, hidden_size, seq_len)? };
