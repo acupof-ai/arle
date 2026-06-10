@@ -1,5 +1,13 @@
 # ARLE 战略主文档 — 唯一信息源(coding/agent runtime + DSV4 training)
 
+> ⚠️ **SUPERSEDED by [`docs/projects/2026-06-10-arle-master-strategy-v2.md`](2026-06-10-arle-master-strategy-v2.md)
+> (2026-06-10)。** 本文不再是战略真理。已被推翻的关键结论(完整清单见 v2 §1):
+> 训练侧 from-scratch DSV4 repro(2026-05-18 OPD-only pivot 删除)、"不做分布式
+> 72B+"(DSv4-Flash TP8/EP8 已是主战场)、单体 `infer/` crate(已删除,serving truth
+> = `infer-*` 重写栈)、"Rust+TileLang 5 项组合 moat"(TileLang 项撤销)。
+> 仅 §7.4 classical-spec KILL evidence 与 §2 workload 形态分析仍被 v2 引用。
+> 以下正文保留作历史推理记录,**不要据此决策**。
+
 > 2026-05-07 用户 directive:全力分析 + 顶尖大师姿态 + 至少 3 遍 review + SOLID
 > 无不确定性 + **唯一的文档**。本文是 ARLE 项目的唯一战略主文档,**任何与本
 > 文冲突的旧 doc 以本文为准**。
