@@ -172,6 +172,8 @@ Operators wanting only serving can run `arle serve` — the same HTTP contract, 
 
 <!-- Breakthrough-only headlines (shipped capability / perf wins). Research notes + retractions live in docs/. -->
 
+**2026-06-10 — Phase 0 debt cleared:** DSv4 256K boots + needle-exact @230K, admission on real KV budgets, KV-parity gate re-ported (FlashMLA decode licensed) — Phase 1 batched serving lane is next ([#55](https://github.com/cklxx/arle/issues/55)).
+
 **2026-06-08 — DeepSeek-V4-Flash B=1 latency: prefill 23 ms, decode 27 → 15 ms** (8×H20, TP=8 / EP=8, FP8 MoE). The official DSA indexer flattened decode across context (legacy `csa_select` 124 ms → ~26 ms @4k, 4.8×); the MLA / output projections moved from scalar GEMV to tensor-core DeepGEMM (−94% per stage → prefill ~23 ms); and MTP depth-1 batched verify amortized the serial critical path for **+71% decode tok/s** (39.9 → 64.2), byte-identical. Eight per-kernel levers (whole-step CUDA graph, mhc_params uint4, M=1 GEMV, comm-overlap, …) all **washed** — B=1 decode is GPU-bound on the critical path, so 15 ms is the sound single-request ceiling; 6 ms needs tree-EAGLE + mega-kernel fusion or batching (M=N). [FINAL report](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md).
 
 <p align="center">
