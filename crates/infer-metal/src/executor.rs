@@ -407,6 +407,12 @@ impl RealMetalExecutor {
         let position = slot.cache_len as u64;
         slot.drain_session(model)?;
         self.active_session_slot = None;
+        // Publish is prefill-only by design: engine-core's radix cache only ever
+        // offers PROMPT pages for attach (`infer-core` prefix.rs:
+        // `publishable_tokens = request.prompt_len().min(self.kv.seq_len(slot))`),
+        // so pages/snapshots covering generated tokens are unreachable. The old
+        // decode-time publishes were a per-token O(full_pages) re-slice plus an
+        // unbounded GDR-snapshot leak (`prefixes` is never evicted).
         self.page_store.publish_slot(slot, kv)?;
         // A new prefill restarts this slot's token stream; any decode prequeue
         // from a prior turn is stale.
@@ -422,8 +428,8 @@ impl RealMetalExecutor {
     ) -> anyhow::Result<MetalInflight> {
         // Pipeline fast path: this step's `step_session` was already issued
         // (async) inside the previous submit, with the session left open one step
-        // ahead. Drain + publish that now-committed step (valid page ids, correct
-        // gdr), prequeue the next one, and return the already-sampled token —
+        // ahead. Drain that now-committed step, prequeue the next one, and
+        // return the already-sampled token —
         // no forward on the engine's critical poll path. Greedy + single-slot
         // only. The guard validates the pending against the LIVE slot before
         // reuse: the slot must still be the SAME live state we prequeued from
@@ -496,7 +502,6 @@ impl RealMetalExecutor {
         let position = slot.cache_len as u64;
         slot.drain_session(model)?;
         self.active_session_slot = None;
-        self.page_store.publish_slot(slot, kv)?;
 
         let inflight = sample_inflight(row.slot, &logits, &row.params, position);
 
@@ -540,8 +545,8 @@ impl RealMetalExecutor {
 
     /// Pipeline fast path: the slot's session is open one step ahead (the step
     /// whose token we are about to return). Drain it to extract the committed
-    /// K/V + gdr, publish the committed prefix while the host page ids are still
-    /// valid, then prequeue the following step (leaving the session open again).
+    /// K/V + gdr, then prequeue the following step (leaving the session open
+    /// again).
     fn commit_pending_then_prequeue(
         &mut self,
         row: &infer_plan::DecodeRow,
@@ -563,7 +568,6 @@ impl RealMetalExecutor {
             slot.committed_len = slot.cache_len;
             slot.drain_session(model)?;
             self.active_session_slot = None;
-            self.page_store.publish_slot(slot, kv)?;
         }
         self.prequeue_decode(row.slot, kv)
     }
@@ -702,7 +706,24 @@ impl MetalPageStore {
             // Host page ids may be reused after the seam frees a slot. Overwrite
             // with the current slot's contents; retained/shared pages cannot be
             // reallocated by the host pool, so this does not corrupt live reuse.
-            self.pages.insert(*page_id, MetalPageBlock { kv_flat });
+            if self
+                .pages
+                .insert(*page_id, MetalPageBlock { kv_flat })
+                .is_some()
+            {
+                // Alias hazard: overwriting a page block means this page id was
+                // recycled to a new occupant (or republished). Any surviving
+                // prefix key containing it would pair the NEW page contents with
+                // a STALE GDR snapshot in `materialize_slot_from_prefix` —
+                // silently corrupt linear-attention state. Prune every such key
+                // except exact prefixes of the live occupant's own page list,
+                // which the boundary insert below keeps coherent.
+                let overwritten = *page_id;
+                self.prefixes.retain(|key, _| {
+                    !key.contains(&overwritten)
+                        || (key.len() <= page_ids.len() && page_ids[..key.len()] == key[..])
+                });
+            }
         }
 
         // GDR state is prefix-wide, not page-local. Only publish a hot-prefix
@@ -1065,6 +1086,144 @@ mod tests {
         let src = mlx::as_dtype(&src, mlx::Dtype::Float32);
         let same = grow_kv_seq_axis(&src, 2).unwrap();
         assert_eq!(same.shape(), &[1, 1, 2, 2]);
+    }
+
+    /// Rank-4 `[1, 1, seq, 2]` f32 K/V array filled with `fill` — the minimal
+    /// shape `slice_kv_tokens` accepts, no model load needed.
+    #[cfg(feature = "metal")]
+    fn kv_array(seq: usize, fill: i32) -> mlx::MlxArray {
+        let vals = vec![fill; seq * 2];
+        let arr = mlx::MlxArray::from_slice_i32(&vals, &[1, 1, seq as i32, 2]);
+        mlx::as_dtype(&arr, mlx::Dtype::Float32)
+    }
+
+    /// Tiny stand-in GDR state array carrying a distinguishable `fill` value so a
+    /// test can tell WHICH occupant's snapshot survives in `prefixes`.
+    #[cfg(feature = "metal")]
+    fn gdr_array(fill: i32) -> mlx::MlxArray {
+        let arr = mlx::MlxArray::from_slice_i32(&[fill], &[1]);
+        mlx::as_dtype(&arr, mlx::Dtype::Float32)
+    }
+
+    // Defect-2 regression guard (stale prefix snapshot aliasing): host page ids
+    // are recycled LIFO after radix eviction, but `prefixes` keys used to live
+    // forever. A later radix match colliding with a stale key would serve the
+    // NEW occupant's K/V pages with the OLD occupant's GDR snapshot. Publishing
+    // a second occupant under the same recycled page ids must prune the first
+    // occupant's prefix key.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn page_reuse_prunes_stale_prefix_snapshot() {
+        use infer_seam::{KvAllocator, KvQuery};
+        let _guard = mlx_sys::mlx_guard();
+        let mut store = MetalPageStore::default();
+        let mut pool = MetalKvPool::new(2, 8, 4);
+
+        // First occupant: slot 0, 8 tokens = 2 full pages, exact page boundary
+        // -> publishes both page blocks and a GDR prefix snapshot.
+        pool.alloc(0, 8).unwrap();
+        let first_pages: Vec<u32> = pool.page_indices(0).to_vec();
+        let state_a = MetalSlotState::from_arrays(
+            0,
+            pool.slot_epoch(0),
+            8,
+            vec![kv_array(8, 10)],
+            vec![gdr_array(1)],
+        );
+        store.publish_slot(&state_a, &pool).unwrap();
+        assert_eq!(store.reusable_prefix_pages(&first_pages), 2);
+
+        // Free slot 0 and allocate slot 1: the LIFO free list recycles the SAME
+        // physical page ids (in reversed order) to the new occupant.
+        pool.free_slot(0);
+        pool.alloc(1, 8).unwrap();
+        let second_pages: Vec<u32> = pool.page_indices(1).to_vec();
+        let sorted = |mut v: Vec<u32>| {
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            sorted(first_pages.clone()),
+            sorted(second_pages.clone()),
+            "test premise: the pool must recycle the freed page ids"
+        );
+        assert_ne!(
+            first_pages, second_pages,
+            "test premise: the recycled order must differ so the stale key is not \
+             the new occupant's own prefix"
+        );
+
+        let state_b = MetalSlotState::from_arrays(
+            1,
+            pool.slot_epoch(1),
+            8,
+            vec![kv_array(8, 20)],
+            vec![gdr_array(2)],
+        );
+        store.publish_slot(&state_b, &pool).unwrap();
+
+        // The first occupant's prefix key is pruned: it contains overwritten
+        // page ids and is not a prefix of the new occupant's page list.
+        assert!(
+            !store.prefixes.contains_key(&first_pages),
+            "stale prefix key {first_pages:?} must be pruned on page reuse"
+        );
+        assert_eq!(store.reusable_prefix_pages(&first_pages), 0);
+
+        // The new occupant's own boundary snapshot survives and carries ITS GDR
+        // state, not the first occupant's.
+        assert_eq!(store.reusable_prefix_pages(&second_pages), 2);
+        let snap = store
+            .prefixes
+            .get(&second_pages)
+            .expect("new occupant's boundary snapshot must survive");
+        assert_eq!(snap.cache_len, 8);
+        mlx::eval(&[&snap.gdr_flat[0]]);
+        assert_eq!(snap.gdr_flat[0].as_slice_f32(), &[2.0]);
+    }
+
+    // A slot republishing its own pages (e.g. the next prefill chunk) overwrites
+    // its earlier page blocks, but its earlier boundary snapshots are exact
+    // prefixes of the live page list and must NOT be pruned.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn republish_same_slot_keeps_own_prefix_snapshots() {
+        use infer_seam::{KvAllocator, KvQuery};
+        let _guard = mlx_sys::mlx_guard();
+        let mut store = MetalPageStore::default();
+        let mut pool = MetalKvPool::new(1, 8, 4);
+
+        // First chunk: 4 tokens = 1 full page -> snapshot at [p0].
+        pool.alloc(0, 4).unwrap();
+        let one_page: Vec<u32> = pool.page_indices(0).to_vec();
+        let state = MetalSlotState::from_arrays(
+            0,
+            pool.slot_epoch(0),
+            4,
+            vec![kv_array(4, 10)],
+            vec![gdr_array(1)],
+        );
+        store.publish_slot(&state, &pool).unwrap();
+        assert_eq!(store.reusable_prefix_pages(&one_page), 1);
+
+        // Second chunk: 8 tokens = 2 pages. Page p0's block is overwritten
+        // (insert returns Some) but [p0] is an exact prefix of the live
+        // occupant's page list, so its snapshot survives.
+        pool.alloc(0, 4).unwrap();
+        let two_pages: Vec<u32> = pool.page_indices(0).to_vec();
+        let state = MetalSlotState::from_arrays(
+            0,
+            pool.slot_epoch(0),
+            8,
+            vec![kv_array(8, 10)],
+            vec![gdr_array(1)],
+        );
+        store.publish_slot(&state, &pool).unwrap();
+
+        assert!(store.prefixes.contains_key(&one_page));
+        assert!(store.prefixes.contains_key(&two_pages));
+        assert_eq!(store.reusable_prefix_pages(&one_page), 1);
+        assert_eq!(store.reusable_prefix_pages(&two_pages), 2);
     }
 
     #[test]
