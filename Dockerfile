@@ -35,11 +35,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 FROM base AS python-deps
 
+# Build deps (tilelang pin) come from requirements-build.txt — single source
+# shared with release.yml and setup.sh. The rest are dev-image extras.
+COPY requirements-build.txt /tmp/requirements-build.txt
+
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && python3 -m pip install --no-cache-dir -r /tmp/requirements-build.txt \
     && python3 -m pip install --no-cache-dir \
       torch \
       flashinfer-python==0.6.9 \
-      tilelang \
       "guidellm[recommended]==0.6.0" \
       huggingface_hub==0.36.2
 
