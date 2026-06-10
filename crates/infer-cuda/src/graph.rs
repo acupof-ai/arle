@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use cudarc::driver::safe::{CudaGraph, CudaStream};
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
@@ -113,10 +113,38 @@ impl CudaGraphState {
 
         kernels()?;
 
+        // Walk the still-capturing graph's nodes BEFORE instantiation: a
+        // memcpy node whose src/dst is HOST memory re-reads that host address
+        // on every replay — when the source was a stack/heap temporary this
+        // is a use-after-free that corrupts silently (frozen topk → IMA;
+        // frozen active_counts → MoE no-op at fake +24%, 2026-06-10). Audit
+        // failure is intentionally fatal: the alternative is silent garbage.
+        let audit = audit_capturing_graph(&self.stream);
+
         let graph = self
             .stream
             .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
             .map_err(|e| anyhow::anyhow!("end_capture failed: {e}"))?;
+        match audit {
+            Ok(a) => {
+                ensure!(
+                    a.host_memcpy_nodes == 0 && a.host_fn_nodes == 0,
+                    "captured graph is host-coupled: {} host-side memcpy node(s), {} host-callback node(s)                      of {} total — per-step values must be device-derived or pre-replay updates into                      persistent buffers (graph discarded; see errors/2026-06-10 graph rekill entry)",
+                    a.host_memcpy_nodes,
+                    a.host_fn_nodes,
+                    a.total_nodes,
+                );
+                if a.mem_alloc_nodes > 0 {
+                    log::warn!(
+                        "captured graph allocates: {} alloc / {} free node(s) of {} — legal                          (AUTO_FREE_ON_LAUNCH) but fragile; prefer persistent scratch",
+                        a.mem_alloc_nodes,
+                        a.mem_free_nodes,
+                        a.total_nodes,
+                    );
+                }
+            }
+            Err(e) => debug!("capture audit unavailable: {e}"),
+        }
         self.graph = graph;
         debug!("CUDA Graph captured successfully");
 
@@ -166,6 +194,84 @@ impl CapturedDecodeGraph {
 
 /// Per-batch-size pool of captured graphs (one per batch size, reused across
 /// steps). Holds the compute stream so new buckets can be created on demand.
+
+/// Node census of a captured graph, taken via `cuStreamGetCaptureInfo_v2`
+/// while capture is still active (the safe `CudaGraph` wrapper does not
+/// expose its raw handle).
+struct CaptureAudit {
+    total_nodes: usize,
+    /// Memcpy nodes touching HOST memory on either side — these re-read the
+    /// recorded host ADDRESS every replay (use-after-free when the source was
+    /// a temporary). Zero legitimate uses in this codebase.
+    host_memcpy_nodes: usize,
+    /// CU_GRAPH_NODE_TYPE_HOST callback nodes — host fn pointers in a replay.
+    host_fn_nodes: usize,
+    mem_alloc_nodes: usize,
+    mem_free_nodes: usize,
+}
+
+fn audit_capturing_graph(stream: &CudaStream) -> Result<CaptureAudit> {
+    use cudarc::driver::sys as cu;
+    let mut status = cu::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+    let mut id: u64 = 0;
+    let mut graph: cu::CUgraph = std::ptr::null_mut();
+    let mut deps: *const cu::CUgraphNode = std::ptr::null();
+    let mut ndeps: usize = 0;
+    // SAFETY: out-params are valid locals; the stream handle is live.
+    unsafe {
+        cu::cuStreamGetCaptureInfo_v2(
+            stream.cu_stream(),
+            &mut status,
+            &mut id,
+            &mut graph,
+            &mut deps,
+            &mut ndeps,
+        )
+        .result()?;
+    }
+    ensure!(
+        status == cu::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE && !graph.is_null(),
+        "stream not in active capture"
+    );
+    let mut n: usize = 0;
+    // SAFETY: null nodes-out queries the count.
+    unsafe { cu::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut n).result()? };
+    let mut nodes: Vec<cu::CUgraphNode> = vec![std::ptr::null_mut(); n];
+    // SAFETY: nodes has capacity n as reported by the count query.
+    unsafe { cu::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut n).result()? };
+    let mut audit = CaptureAudit {
+        total_nodes: n,
+        host_memcpy_nodes: 0,
+        host_fn_nodes: 0,
+        mem_alloc_nodes: 0,
+        mem_free_nodes: 0,
+    };
+    for &node in &nodes[..n] {
+        let mut ty = cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL;
+        // SAFETY: node handles come from cuGraphGetNodes on a live graph.
+        unsafe { cu::cuGraphNodeGetType(node, &mut ty).result()? };
+        match ty {
+            cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMCPY => {
+                let mut p: cu::CUDA_MEMCPY3D = unsafe { std::mem::zeroed() };
+                // SAFETY: p is a valid out-param for a memcpy node.
+                if unsafe { cu::cuGraphMemcpyNodeGetParams(node, &mut p) }
+                    .result()
+                    .is_ok()
+                    && (matches!(p.srcMemoryType, cu::CUmemorytype::CU_MEMORYTYPE_HOST)
+                        || matches!(p.dstMemoryType, cu::CUmemorytype::CU_MEMORYTYPE_HOST))
+                {
+                    audit.host_memcpy_nodes += 1;
+                }
+            }
+            cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_HOST => audit.host_fn_nodes += 1,
+            cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC => audit.mem_alloc_nodes += 1,
+            cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE => audit.mem_free_nodes += 1,
+            _ => {}
+        }
+    }
+    Ok(audit)
+}
+
 pub struct GraphBucket {
     stream: Arc<CudaStream>,
     graphs: HashMap<usize, CapturedDecodeGraph>,
