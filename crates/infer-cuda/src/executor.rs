@@ -858,9 +858,11 @@ fn validate_dsv4_prefill_kv_view(
     Ok(())
 }
 
-/// Opt-in flag for the layer-major batched DSv4 decode path (harness shim;
-/// promoted to a CLI `--flag` in the runtime-config cleanup). Default OFF keeps
-/// the per-row decode loop as the byte-identical correctness reference.
+/// Opt-in for the layer-major batched DSv4 decode path. CLI-fronted as
+/// `arle serve --dsv4-batched-decode` (serve.rs exports the env pre-spawn so
+/// multiproc workers inherit it); setting the env var directly remains a
+/// harness shim. Default OFF keeps the per-row decode loop as the
+/// byte-identical correctness reference.
 fn dsv4_batched_decode_enabled() -> bool {
     std::env::var_os("INFER_DSV4_BATCHED_DECODE").is_some()
 }
