@@ -669,7 +669,7 @@ impl Dsv4Model {
 
     pub(crate) fn from_dsv4_fp8_safetensors_with_tp(
         model_path: &Path,
-        tp: crate::tp::TpRuntime,
+        #[cfg_attr(not(feature = "nccl"), allow(unused_mut))] mut tp: crate::tp::TpRuntime,
     ) -> Result<Self> {
         let config = DeepSeekV4Config::from_json_file(model_path.join("config.json"))
             .map_err(|e| anyhow!("load DSv4 config from {}: {e}", model_path.display()))?;
@@ -686,6 +686,11 @@ impl Dsv4Model {
         let kv_arena = Dsv4MlaKvArena::from_config(&config)?;
 
         let ctx = DeviceContext::new()?;
+        // One-shot small-message collectives (default-on, loud auto-degrade).
+        // COLLECTIVE boot — identical construction point on every rank, BEFORE
+        // the DeepEP boot so the collective sequences line up across ranks.
+        #[cfg(feature = "nccl")]
+        tp.init_oneshot_comm(&ctx);
         #[cfg(feature = "deepep")]
         let deepep = crate::deepep::DeepEpTransport::maybe_boot(
             &ctx,

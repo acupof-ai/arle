@@ -95,6 +95,12 @@ pub struct TpRuntime {
     /// `ep_size == tp_size` ⇒ the moe_ep groups equal the global comm.
     // T2.3 will consume this (DP-attention token-owned EP sub-collectives).
     moe_ep: TpComm,
+    /// One-shot small-message collective path (vendored sgl-kernel/vLLM custom
+    /// allreduce + ARLE one-shot all-gather) for the decode critical chain.
+    /// `None` = NCCL everywhere (single rank, `ARLE_COMM_BACKEND=nccl`, or any
+    /// boot probe/self-test failure — every degrade logs WARN, never silent).
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    oneshot: Option<oneshot::OneShotComm>,
 }
 
 impl TpRuntime {
@@ -106,6 +112,8 @@ impl TpRuntime {
             comm: TpComm::single(),
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
+            #[cfg(all(feature = "cuda", feature = "nccl"))]
+            oneshot: None,
         }
     }
 
@@ -119,6 +127,8 @@ impl TpRuntime {
             comm: TpComm::single(),
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
+            #[cfg(all(feature = "cuda", feature = "nccl"))]
+            oneshot: None,
         }
     }
 
@@ -132,6 +142,8 @@ impl TpRuntime {
             comm,
             attn_tp: TpComm::single(),
             moe_ep: TpComm::single(),
+            #[cfg(all(feature = "cuda", feature = "nccl"))]
+            oneshot: None,
         }
     }
 
@@ -186,6 +198,8 @@ impl TpRuntime {
             comm: TpComm::Nccl(Box::new(backend)),
             attn_tp,
             moe_ep,
+            #[cfg(all(feature = "cuda", feature = "nccl"))]
+            oneshot: None,
         })
     }
 
@@ -273,12 +287,69 @@ impl TpRuntime {
     ///
     /// # Errors
     /// Propagates the NCCL all-reduce error on multi-rank builds.
+    /// Bring up the one-shot small-message collective path (default-on with
+    /// automatic loud degrade). COLLECTIVE: every rank must call at the same
+    /// construction point. `ARLE_COMM_BACKEND=nccl` (CLI `--comm-backend nccl`)
+    /// skips it entirely; any probe/boot/self-test failure on ANY rank degrades
+    /// EVERY rank to NCCL via the built-in ok-votes (never a silent fallback,
+    /// never a desynced boot).
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub fn init_oneshot_comm(&mut self, ctx: &cuda_kernels::prelude::DeviceContext) {
+        let mode = std::env::var("ARLE_COMM_BACKEND").unwrap_or_else(|_| "auto".to_string());
+        match mode.as_str() {
+            "nccl" => {
+                log::info!("[comm-oneshot] disabled via ARLE_COMM_BACKEND=nccl");
+                return;
+            }
+            "auto" | "oneshot" => {}
+            other => {
+                log::warn!("[comm-oneshot] unknown ARLE_COMM_BACKEND={other}; treating as auto");
+            }
+        }
+        let TpComm::Nccl(backend) = &self.comm else {
+            return; // single rank — nothing to accelerate
+        };
+        let world = self.config.world_size;
+        let rank = self.config.rank;
+        if !matches!(world, 2 | 4 | 6 | 8) {
+            log::warn!(
+                "[comm-oneshot] world_size={world} unsupported (need 2/4/6/8); staying on NCCL"
+            );
+            return;
+        }
+        match oneshot::OneShotComm::build(ctx, backend, world, rank) {
+            Ok(Some(comm)) => {
+                log::info!(
+                    "[comm-oneshot] rank {rank}: one-shot AR/AG active                      (scratch {} KB, self-test passed, larger messages stay NCCL)",
+                    comm.scratch_bytes() / 1024
+                );
+                self.oneshot = Some(comm);
+            }
+            Ok(None) => {
+                log::warn!(
+                    "[comm-oneshot] rank {rank}: degraded to NCCL (a rank failed boot/self-test;                      see its WARN above)"
+                );
+            }
+            Err(err) => {
+                log::warn!("[comm-oneshot] rank {rank}: boot collective failed: {err:#}");
+            }
+        }
+    }
+
     #[cfg(feature = "cuda")]
     pub fn all_reduce_sum(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
         buf: &mut cuda_kernels::prelude::HiddenStates,
     ) -> anyhow::Result<()> {
+        // One-shot path: decode-sized bf16 messages over the GLOBAL comm only
+        // (sub-comms keep NCCL). Oversized (prefill) buffers fall through.
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        if let Some(os) = &self.oneshot {
+            if buf.data.len() * 2 <= os.scratch_bytes() {
+                return os.all_reduce_sum_inplace(ctx, buf);
+            }
+        }
         self.all_reduce_sum_over(&self.comm, ctx, buf)
     }
 
@@ -402,6 +473,14 @@ impl TpRuntime {
         sendcount: usize,
         recvbuf: *mut std::ffi::c_void,
     ) -> anyhow::Result<()> {
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        if let Some(os) = &self.oneshot {
+            if sendcount * 2 <= os.scratch_bytes() {
+                // SAFETY: same contract as the NCCL arm below; the one-shot
+                // path stages `sendbuf` through its registered scratch.
+                return unsafe { os.all_gather_bf16(ctx, sendbuf, sendcount, recvbuf) };
+            }
+        }
         match &self.comm {
             TpComm::Single => anyhow::bail!("single-rank raw all_gather_bf16 is not needed"),
             #[cfg(feature = "nccl")]
@@ -654,6 +733,339 @@ mod tests {
         }
         for (got, want) in gathered.iter().zip(&full) {
             assert!((got - want).abs() < 1e-3, "gathered {got} != full {want}");
+        }
+    }
+}
+
+/// One-shot small-message collective path: vendored sgl-kernel/vLLM custom
+/// allreduce + ARLE one-shot all-gather over IPC-shared buffers
+/// (`csrc/comm/custom_all_reduce.cu`), staged through one persistent registered
+/// scratch per rank. Decode-chain messages (2×AR 14 KB + Q-AG 18 KB per layer)
+/// measured 2.6–3.6× faster than NCCL on 8×H20
+/// (`wins/2026-06-10-dsv4-comm-bench-oneshot-licensed.md`).
+///
+/// Boot is COLLECTIVE-SAFE by construction: every local step is followed by an
+/// all-ranks ok-vote (1-byte allgather), so one rank failing alloc/IPC/create
+/// degrades EVERY rank to NCCL instead of desyncing the boot collectives.
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+mod oneshot {
+    use anyhow::{Result, anyhow, ensure};
+    use cuda_kernels::collective::NcclBackend;
+    use cuda_kernels::ffi::comm as car;
+    use cuda_kernels::prelude::DeviceContext;
+
+    /// Persistent registered scratch per rank. Covers every decode shape
+    /// (B=1..32 AR ≤ 448 KB, Q-AG ≤ 18 KB/rank); prefill-sized buffers fall
+    /// through to NCCL at the call sites.
+    const SCRATCH_BYTES: usize = 512 * 1024;
+    /// Signal region = sgl `Signal` struct (≈3.5 KB) + two-shot staging tmp;
+    /// 8 KB margin keeps us independent of upstream Signal layout drift.
+    const SIGNAL_BYTES: usize = 8192 + SCRATCH_BYTES;
+
+    pub(super) struct OneShotComm {
+        handle: *mut std::os::raw::c_void,
+        scratch_ptr: u64,
+    }
+
+    // SAFETY: the handle wraps host-side state plus device pointers; all calls
+    // are issued from the engine thread that owns the executor (the same
+    // single-threaded discipline as every other forward-path FFI handle).
+    unsafe impl Send for OneShotComm {}
+    unsafe impl Sync for OneShotComm {}
+
+    impl Drop for OneShotComm {
+        fn drop(&mut self) {
+            // Frees own regions + rank data, IPC-closes peer mappings.
+            unsafe { car::arle_car_destroy_prod(self.handle) };
+        }
+    }
+
+    fn check(res: cudarc::driver::sys::CUresult, what: &str) -> Result<()> {
+        ensure!(
+            res == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "{what} failed: {res:?}"
+        );
+        Ok(())
+    }
+
+    /// 1-byte all-ranks ok-vote. Returns whether EVERY rank reported ok —
+    /// the same verdict on every rank, so degrade decisions stay collective.
+    fn vote(ctx: &DeviceContext, backend: &NcclBackend, ok: bool) -> Result<bool> {
+        let gathered = backend.all_gather_bytes(ctx, &[u8::from(ok)], 1)?;
+        Ok(gathered.iter().all(|&b| b == 1))
+    }
+
+    impl OneShotComm {
+        pub(super) fn scratch_bytes(&self) -> usize {
+            SCRATCH_BYTES
+        }
+
+        /// Collective constructor: every rank must call at the same point.
+        /// Returns `Ok(None)` when any rank voted a local failure (all ranks
+        /// then degrade together); `Err` only on collective-infrastructure
+        /// failures (which already imply a broken NCCL comm).
+        pub(super) fn build(
+            ctx: &DeviceContext,
+            backend: &NcclBackend,
+            world: usize,
+            rank: usize,
+        ) -> Result<Option<Self>> {
+            // Stage 1: own allocations (local) + vote.
+            let mut sig_ptr = 0u64;
+            let mut sig_handle = [0u8; 64];
+            let mut in_ptr = 0u64;
+            let mut in_handle = [0u8; 64];
+            let alloc_ok = unsafe {
+                check(
+                    car::arle_car_alloc_shared(SIGNAL_BYTES, &mut sig_ptr, sig_handle.as_mut_ptr()),
+                    "one-shot signal-region alloc",
+                )
+                .and_then(|()| {
+                    check(
+                        car::arle_car_alloc_shared(
+                            SCRATCH_BYTES,
+                            &mut in_ptr,
+                            in_handle.as_mut_ptr(),
+                        ),
+                        "one-shot scratch alloc",
+                    )
+                })
+            };
+            if let Err(err) = &alloc_ok {
+                log::warn!("[comm-oneshot] rank {rank}: {err:#}");
+            }
+            if !vote(ctx, backend, alloc_ok.is_ok())? {
+                return Ok(None);
+            }
+
+            // Stage 2: handle exchange (collective; all ranks reach it).
+            let mut payload = [0u8; 128];
+            payload[..64].copy_from_slice(&sig_handle);
+            payload[64..].copy_from_slice(&in_handle);
+            let all = backend.all_gather_bytes(ctx, &payload, 128)?;
+            ensure!(all.len() == world * 128, "one-shot handle exchange size");
+
+            // Stage 3: open peers + create (local) + vote.
+            let built = (|| -> Result<*mut std::os::raw::c_void> {
+                let mut sigs = [0u64; 8];
+                let mut ins = [0u64; 8];
+                for r in 0..world {
+                    if r == rank {
+                        sigs[r] = sig_ptr;
+                        ins[r] = in_ptr;
+                        continue;
+                    }
+                    let rec = &all[r * 128..(r + 1) * 128];
+                    unsafe {
+                        check(
+                            car::arle_car_open_peer(rec.as_ptr(), &mut sigs[r]),
+                            "one-shot peer signal open (no-P2P probe)",
+                        )?;
+                        check(
+                            car::arle_car_open_peer(rec[64..].as_ptr(), &mut ins[r]),
+                            "one-shot peer scratch open",
+                        )?;
+                    }
+                }
+                let handle = unsafe {
+                    car::arle_car_create(rank as i32, world as i32, sigs.as_ptr(), ins.as_ptr())
+                };
+                ensure!(!handle.is_null(), "one-shot CustomAllreduce create");
+                Ok(handle)
+            })();
+            if let Err(err) = &built {
+                log::warn!(
+                    "[comm-oneshot] rank {rank}: {err:#} (boot scratch leaked ~1 MB; degrading)"
+                );
+            }
+            if !vote(ctx, backend, built.is_ok())? {
+                return Ok(None);
+            }
+            let comm = Self {
+                handle: built.expect("voted ok"),
+                scratch_ptr: in_ptr,
+            };
+
+            // Stage 4: self-test (one-shot vs NCCL on identical inputs +
+            // cross-rank digest) + final vote. Catches memory-ordering issues
+            // on this driver/HW combo before any production traffic.
+            let tested = comm.self_test(ctx, backend, rank);
+            if let Err(err) = &tested {
+                log::warn!("[comm-oneshot] rank {rank} self-test failed: {err:#}");
+            }
+            if !vote(ctx, backend, tested.is_ok())? {
+                return Ok(None);
+            }
+            Ok(Some(comm))
+        }
+
+        fn self_test(&self, ctx: &DeviceContext, backend: &NcclBackend, rank: usize) -> Result<()> {
+            use cuda_kernels::collective::{CollectiveBackend, DType, ReduceOp};
+            use cudarc::driver::DevicePtrMut;
+
+            const ELEMS: usize = 7168;
+            let stream = &ctx.stream;
+            // One-shot arm: fill the registered scratch, reduce into `got`.
+            check(
+                unsafe {
+                    car::arle_car_fill_bf16(
+                        stream.cu_stream(),
+                        self.scratch_ptr,
+                        ELEMS as i32,
+                        rank as i32,
+                    )
+                },
+                "self-test fill",
+            )?;
+            let mut got = stream
+                .alloc_zeros::<u16>(ELEMS)
+                .map_err(|e| anyhow!("self-test out alloc: {e}"))?;
+            {
+                let (got_ptr, _g) = got.device_ptr_mut(stream);
+                check(
+                    unsafe {
+                        car::arle_car_allreduce_bf16_into(
+                            self.handle,
+                            stream.cu_stream(),
+                            got_ptr,
+                            ELEMS as i32,
+                            1,
+                        )
+                    },
+                    "self-test one-shot AR",
+                )?;
+            }
+            // NCCL reference: identical fill (same seed), in-place AR.
+            let mut reference = stream
+                .alloc_zeros::<u16>(ELEMS)
+                .map_err(|e| anyhow!("self-test ref alloc: {e}"))?;
+            {
+                let (ref_ptr, _g) = reference.device_ptr_mut(stream);
+                check(
+                    unsafe {
+                        car::arle_car_fill_bf16(
+                            stream.cu_stream(),
+                            ref_ptr,
+                            ELEMS as i32,
+                            rank as i32,
+                        )
+                    },
+                    "self-test ref fill",
+                )?;
+                unsafe {
+                    backend.all_reduce(
+                        ref_ptr as *mut std::ffi::c_void,
+                        ELEMS,
+                        DType::BF16,
+                        ReduceOp::Sum,
+                        stream.cu_stream().cast::<std::ffi::c_void>(),
+                    )?;
+                }
+            }
+            let got_host = stream
+                .memcpy_dtov(&got)
+                .map_err(|e| anyhow!("self-test dtoh: {e}"))?;
+            let ref_host = stream
+                .memcpy_dtov(&reference)
+                .map_err(|e| anyhow!("self-test ref dtoh: {e}"))?;
+            let to_f32 = |bits: u16| f32::from_bits(u32::from(bits) << 16);
+            let max_delta = got_host
+                .iter()
+                .zip(&ref_host)
+                .map(|(&a, &b)| (to_f32(a) - to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            ensure!(
+                max_delta <= 0.05,
+                "one-shot vs NCCL max delta {max_delta} exceeds tolerance"
+            );
+            // Cross-rank identity (lockstep hard requirement): FNV digest of
+            // the one-shot output must be byte-identical on every rank.
+            let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+            for v in &got_host {
+                for b in v.to_le_bytes() {
+                    digest ^= u64::from(b);
+                    digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            let digests = backend.all_gather_bytes(ctx, &digest.to_le_bytes(), 8)?;
+            ensure!(
+                digests.chunks(8).all(|c| c == digest.to_le_bytes()),
+                "one-shot output differs across ranks"
+            );
+            Ok(())
+        }
+
+        /// In-place bf16 sum allreduce: stage `buf` into the registered
+        /// scratch, one-shot/two-shot kernel writes the reduced result back
+        /// into `buf`. Caller guarantees `len*2 <= scratch_bytes()`.
+        pub(super) fn all_reduce_sum_inplace(
+            &self,
+            ctx: &DeviceContext,
+            buf: &mut cuda_kernels::prelude::HiddenStates,
+        ) -> Result<()> {
+            use cudarc::driver::DevicePtrMut;
+
+            let elems = buf.data.len();
+            let (ptr, _guard) = buf.data.device_ptr_mut(&ctx.stream);
+            // SAFETY: `ptr` is a live device allocation of `elems` bf16 on this
+            // device; scratch is this rank's registered region of >= elems*2
+            // bytes; both ops are stream-ordered on `ctx.stream`.
+            unsafe {
+                cudarc::driver::result::memcpy_dtod_async(
+                    self.scratch_ptr,
+                    ptr,
+                    elems * 2,
+                    ctx.stream.cu_stream(),
+                )
+                .map_err(|e| anyhow!("one-shot AR stage copy: {e}"))?;
+                check(
+                    car::arle_car_allreduce_bf16_into(
+                        self.handle,
+                        ctx.stream.cu_stream(),
+                        ptr,
+                        elems as i32,
+                        0,
+                    ),
+                    "one-shot AR",
+                )?;
+            }
+            Ok(())
+        }
+
+        /// Raw bf16 all-gather: stage the local chunk into the registered
+        /// scratch, the one-shot kernel writes `[world × sendcount]` rank-major
+        /// into `recvbuf` (ncclAllGather layout). Caller guarantees
+        /// `sendcount*2 <= scratch_bytes()` and `recvbuf` capacity.
+        ///
+        /// # Safety
+        /// Same contract as the NCCL `all_gather` arm: both pointers are live
+        /// device allocations on this rank's device, sized as documented.
+        pub(super) unsafe fn all_gather_bf16(
+            &self,
+            ctx: &DeviceContext,
+            sendbuf: *const std::ffi::c_void,
+            sendcount: usize,
+            recvbuf: *mut std::ffi::c_void,
+        ) -> Result<()> {
+            unsafe {
+                cudarc::driver::result::memcpy_dtod_async(
+                    self.scratch_ptr,
+                    sendbuf as u64,
+                    sendcount * 2,
+                    ctx.stream.cu_stream(),
+                )
+                .map_err(|e| anyhow!("one-shot AG stage copy: {e}"))?;
+                check(
+                    car::arle_car_allgather_bf16_into(
+                        self.handle,
+                        ctx.stream.cu_stream(),
+                        recvbuf as u64,
+                        sendcount as i32,
+                    ),
+                    "one-shot AG",
+                )?;
+            }
+            Ok(())
         }
     }
 }

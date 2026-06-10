@@ -44,6 +44,19 @@ struct ServeConfig {
 }
 
 pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
+    // CLI-fronted comm-backend knob, exported via env BEFORE the multiproc
+    // coordinator spawns workers (children inherit it) and before any engine
+    // build reads it (`TpRuntime::init_oneshot_comm`).
+    // SAFETY: single CLI thread, pre-spawn, pre-tokio.
+    unsafe {
+        std::env::set_var(
+            "ARLE_COMM_BACKEND",
+            match serve_args.comm_backend {
+                crate::args::ServeCommBackendArg::Auto => "auto",
+                crate::args::ServeCommBackendArg::Nccl => "nccl",
+            },
+        );
+    }
     match resolve_config(args, &serve_args) {
         Ok(config) => run_config(config),
         Err(err) => {
