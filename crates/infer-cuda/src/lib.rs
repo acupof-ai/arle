@@ -443,6 +443,21 @@ impl CudaExecutor {
         })
     }
 
+    /// Effective slot count after any model-side KV-budget clamp, or `None` on
+    /// the no-GPU placeholder. The DSv4 constructor may clamp below the
+    /// requested `num_slots` (dynamic KV mem budget, cross-rank min-reduced);
+    /// the engine's scheduler and admission pool MUST be sized from this value,
+    /// not the requested one, or admission targets slots the executor has no
+    /// arena for.
+    #[must_use]
+    pub fn effective_num_slots(&self) -> Option<usize> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => None,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => Some(real.effective_num_slots()),
+        }
+    }
+
     /// OPD teacher raw-logits forward (Qwen3.5/3.6 hybrid only).
     ///
     /// Runs the full hybrid forward over `(input_ids, positions)` and returns the

@@ -820,43 +820,57 @@ impl Dsv4Model {
         Dsv4SlotState::new(self, max_seq_len, slot_idx, kv_adapter)
     }
 
-    /// Clamp `requested` decode slots to what the per-rank KV budget affords, from
+    /// Clamp `requested` decode slots to what the KV budget affords, from
     /// `cudaMemGetInfo() × MEM_FRACTION ÷ per-slot KV bytes`. This is the dynamic-mem-budget
     /// fix for the c=32 OOM CRASH (root cause: a fixed `num_slots` whose arena alloc OOMs at
-    /// high concurrency × long `max_seq_len`). Deterministic formula ⇒ TP-consistent (all
-    /// ranks compute the same clamp from ~balanced post-weights free mem — a per-rank
-    /// measure-and-retry would diverge across ranks and corrupt the KV). The EXACT FP8 arena
+    /// high concurrency × long `max_seq_len`). The EXACT FP8 arena
     /// term (`max_seq_len × bytes_per_token × num_layers`) is scaled ×2 to cover the
     /// compressor/SW/indexer per-slot buffers + forward activations on top.
-    pub(crate) fn kv_budget_num_slots(&self, requested: usize, max_seq_len: usize) -> usize {
+    ///
+    /// Cross-rank consistency: per-rank `mem_get_info` is NOT guaranteed identical
+    /// (allocator state differs per rank), and the clamped count feeds the
+    /// scheduler's slot gate — any per-rank divergence in scheduler-visible
+    /// capacity diverges the deterministic planner and deadlocks NCCL. The local
+    /// affordable count is therefore NCCL min-reduced; every rank calls this at
+    /// the same construction point (collective). A rank that cannot query its
+    /// memory contributes `i32::MAX` (does not bind) instead of skipping the
+    /// collective.
+    pub(crate) fn kv_budget_num_slots(
+        &self,
+        requested: usize,
+        max_seq_len: usize,
+    ) -> Result<usize> {
         const MEM_FRACTION: f64 = 0.9;
         const PER_SLOT_OVERHEAD_X: usize = 2;
         let arena_per_slot = max_seq_len
             .saturating_mul(self.kv_arena.bytes_per_token)
             .saturating_mul(self.kv_arena.num_layers);
         let per_slot = arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X);
-        if per_slot == 0 {
-            return requested.max(1);
-        }
-        let free = match cudarc::driver::result::mem_get_info() {
-            Ok((free, _total)) => free,
-            // Can't query (no active context / driver error) → don't clamp, let alloc decide.
-            Err(_) => return requested,
+        let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
+            Ok((free, _total)) => {
+                let budget = (free as f64 * MEM_FRACTION) as usize;
+                budget
+                    .checked_div(per_slot)
+                    .map_or(i32::MAX, |n| i32::try_from(n.max(1)).unwrap_or(i32::MAX))
+            }
+            // Can't query (no active context / driver error) → don't bind
+            // the min; the other ranks' budgets still apply.
+            Err(_) => i32::MAX,
         };
-        let budget = (free as f64 * MEM_FRACTION) as usize;
-        let affordable = (budget / per_slot).max(1);
+        let affordable =
+            self.tp
+                .all_reduce_min_scalar_i32(&self.ctx, affordable_local)? as usize;
         if requested > affordable {
             log::warn!(
-                "DSv4 KV budget: requested {requested} slots × ~{}MB/slot = ~{}MB, but only \
-                 ~{}MB affordable ({MEM_FRACTION}×{}MB free post-weights); clamping num_slots \
-                 to {affordable}. Lower --max-seq-len ({max_seq_len}) to raise concurrency.",
+                "DSv4 KV budget: requested {requested} slots × ~{}MB/slot = ~{}MB exceeds the \
+                 cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
+                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}. \
+                 Lower --max-seq-len ({max_seq_len}) to raise concurrency.",
                 per_slot >> 20,
                 requested.saturating_mul(per_slot) >> 20,
-                budget >> 20,
-                free >> 20,
             );
         }
-        requested.min(affordable)
+        Ok(requested.min(affordable))
     }
 
     pub(crate) fn truncate_slot(&self, slot: &mut Dsv4SlotState, new_len: usize) -> Result<()> {

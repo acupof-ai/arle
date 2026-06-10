@@ -142,6 +142,18 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Effective slot count after any model-side KV-budget clamp. The DSv4
+    /// constructor may clamp below the requested `num_slots` (dynamic KV mem
+    /// budget); the scheduler MUST admit against this count, not the requested
+    /// one, or it admits requests to slots the executor has no arena for.
+    pub(crate) fn effective_num_slots(&self) -> usize {
+        match self {
+            Self::Qwen(q) => q.num_slots,
+            Self::Qwen35(q) => q.num_slots,
+            Self::Dsv4(d) => d.num_slots,
+        }
+    }
+
     /// OPD teacher raw-logits forward (Qwen3.5/3.6 hybrid only). Returns the full
     /// `[seq_len, vocab]` logits without sampling. Dense Qwen3 / DSv4 are not OPD
     /// teacher targets on this surface and bail.
@@ -873,7 +885,7 @@ impl Dsv4CudaExecutor {
         let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(model_path.as_ref())?;
         // Dynamic KV mem budget: clamp num_slots to what GPU free mem affords (was: fixed
         // num_slots → c=32 OOM crash at long max_seq_len). Deterministic ⇒ TP-consistent.
-        let num_slots = model.kv_budget_num_slots(num_slots, max_seq_len);
+        let num_slots = model.kv_budget_num_slots(num_slots, max_seq_len)?;
         let kv_adapter = model.new_kv_adapter(max_seq_len, num_slots)?;
         let mut slots = Vec::with_capacity(num_slots);
         for slot_idx in 0..num_slots {

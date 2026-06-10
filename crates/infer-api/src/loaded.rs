@@ -406,21 +406,32 @@ mod backend {
     /// (100% CPU, GPU 0%). Per backend:
     ///   - Qwen3-Dense / Qwen3.5-3.6-MoE: `total_pages` IS (or bounds) the real GPU
     ///     KV budget the executor allocates — keep the configured value.
-    ///   - DSv4: recurrent KV (SW ring + compressed) lives in the executor; the host
-    ///     pool is admission-only bookkeeping, so size it to the model's max context.
-    ///     `CudaKvPool::new` allocates NO HBM (just a `Vec<u32>` of page ids).
+    ///   - DSv4: recurrent KV (SW ring + compressed) lives in the executor as one
+    ///     pre-sized arena PER SLOT (each covering max context), so the true
+    ///     capacity is `num_slots × per-slot tokens` — sizing for a single
+    ///     max-context request under-admits at c>1 (a second long request waits
+    ///     for fictional pages while a real slot arena sits free). With the
+    ///     per-slot sizing the page gate can never bind before the slot gate,
+    ///     which is the truthful encoding for slot-arena models. `CudaKvPool::new`
+    ///     allocates NO HBM (just a `Vec<u32>` of page ids).
+    ///
+    /// `num_slots` must be the EFFECTIVE slot count (post KV-budget clamp), not
+    /// the requested one.
     #[cfg(feature = "cuda")]
     fn cuda_admission_total_pages(
         kind: CudaModelKind,
         config: &EngineLoadConfig,
         page_size: usize,
+        num_slots: usize,
     ) -> usize {
         let ps = page_size.max(1);
         let capacity_tokens = match kind {
             CudaModelKind::Qwen3Dense | CudaModelKind::Qwen3Moe => {
                 config.total_pages.saturating_mul(ps)
             }
-            CudaModelKind::Dsv4 => infer_cuda::dsv4_max_seq_len().saturating_add(4096),
+            CudaModelKind::Dsv4 => infer_cuda::dsv4_max_seq_len()
+                .saturating_add(4096)
+                .saturating_mul(num_slots.max(1)),
         };
         capacity_tokens.div_ceil(ps).max(config.total_pages)
     }
@@ -505,7 +516,10 @@ mod backend {
         }
         let num_slots = config.num_slots;
         let page_size = config.page_size;
-        let total_pages = cuda_admission_total_pages(kind, config, page_size);
+        // Qwen executors size their device pool from total_pages, so compute the
+        // requested-slot capacity first; the DSv4 arm re-derives below from the
+        // executor's EFFECTIVE slot count (post KV-budget clamp).
+        let total_pages = cuda_admission_total_pages(kind, config, page_size, num_slots);
         let executor = match kind {
             CudaModelKind::Qwen3Dense => {
                 CudaExecutor::from_qwen3_bf16_safetensors(model_path, num_slots, total_pages)?
@@ -530,6 +544,21 @@ mod backend {
                 infer_cuda::dsv4_max_seq_len(),
             )?,
         };
+        // The DSv4 constructor may clamp slots below the request (dynamic KV
+        // mem budget, NCCL min-reduced ⇒ identical on every rank). Scheduler +
+        // admission pool MUST follow the effective count: admitting to a slot
+        // the executor has no arena for fails at submit, and (lockstep) a
+        // scheduler-visible capacity that diverged from the executor's would
+        // diverge the deterministic planner.
+        let num_slots = executor.effective_num_slots().unwrap_or(num_slots);
+        let total_pages = cuda_admission_total_pages(kind, config, page_size, num_slots);
+        if num_slots != scheduler.num_slots {
+            log::warn!(
+                "CUDA engine: executor clamped slots {} -> {num_slots}; scheduler follows",
+                scheduler.num_slots
+            );
+            scheduler.num_slots = num_slots;
+        }
         let kv = CudaKvPool::new(num_slots, total_pages, page_size);
         Ok(infer_core::Engine::with_config(executor, kv, scheduler))
     }
