@@ -76,7 +76,10 @@ fn run_config(config: ServeConfig) -> ExitCode {
     let _coordinator_guard = if config.backend == ServeBackend::Cuda
         && crate::serve_multiproc::is_dsv4_model(&config.options.model_path)
     {
-        match crate::serve_multiproc::bind_relay_and_spawn_workers(&config.options.model_path) {
+        match crate::serve_multiproc::bind_relay_and_spawn_workers(
+            &config.options.model_path,
+            &config.options.engine_config,
+        ) {
             Ok(guard) => guard,
             Err(err) => {
                 eprintln!("[ARLE serve] multiproc coordinator setup failed: {err:#}");
