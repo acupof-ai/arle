@@ -23,13 +23,15 @@ __device__ __forceinline__ float dsv4_sigmoid(float value) {
 }
 
 __device__ float block_sum(float value) {
-  __shared__ float warp_sums[DSV4_MHC_BLOCK / WARP_SIZE];
+  // Sized for the max block (1024 = 32 warps) so launch block size is a free
+  // parameter; smaller blocks use a prefix of the scratch — identical math.
+  __shared__ float warp_sums[32];
   value = warp_reduce_sum(value);
   if ((threadIdx.x & (WARP_SIZE - 1)) == 0) {
     warp_sums[threadIdx.x / WARP_SIZE] = value;
   }
   __syncthreads();
-  value = threadIdx.x < (DSV4_MHC_BLOCK / WARP_SIZE) ? warp_sums[threadIdx.x] : 0.0f;
+  value = threadIdx.x < (blockDim.x / WARP_SIZE) ? warp_sums[threadIdx.x] : 0.0f;
   if (threadIdx.x < WARP_SIZE) {
     value = warp_reduce_sum(value);
   }
@@ -400,6 +402,59 @@ extern "C" CUresult dsv4_mhc_pre_rms_norm_cuda(
     if (attr != cudaSuccess) return (CUresult)attr;
   }
   dsv4_mhc_pre_rms_norm_kernel<<<num_tokens, DSV4_MHC_BLOCK, shmem,
+                                 (cudaStream_t)stream>>>(
+      residual, pre, weight, out, num_tokens, hidden_size, hc_mult, eps);
+  return (CUresult)cudaGetLastError();
+}
+
+// Bench-only entry: identical to dsv4_mhc_params_cuda but with an explicit
+// block size, for the isolated single-block-bandwidth microbench
+// (examples/dsv4_microbench.rs). Not a serving path.
+extern "C" CUresult dsv4_mhc_params_bench_cuda(
+    const uint16_t *residual,
+    const uint16_t *mixes,
+    const uint16_t *base,
+    const uint16_t *scale,
+    float *pre,
+    float *post,
+    float *comb,
+    int num_tokens,
+    int residual_hidden_dim,
+    int mix_dim,
+    int hc_mult,
+    float eps,
+    int sinkhorn_iters,
+    int block_dim,
+    CUstream stream) {
+  if (num_tokens <= 0 || block_dim < 64 || block_dim > 1024 ||
+      (block_dim & 31) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dsv4_mhc_params_kernel<<<num_tokens, block_dim, 0, (cudaStream_t)stream>>>(
+      residual, mixes, base, scale, pre, post, comb, num_tokens,
+      residual_hidden_dim, mix_dim, hc_mult, eps, sinkhorn_iters);
+  return (CUresult)cudaGetLastError();
+}
+
+// Bench-only entry for the fused prologue with an explicit block size
+// (examples/dsv4_microbench.rs). Not a serving path.
+extern "C" CUresult dsv4_mhc_pre_rms_norm_bench_cuda(
+    const uint16_t *residual,
+    const float *pre,
+    const uint16_t *weight,
+    uint16_t *out,
+    int num_tokens,
+    int hidden_size,
+    int hc_mult,
+    float eps,
+    int block_dim,
+    CUstream stream) {
+  if (num_tokens <= 0 || block_dim < 64 || block_dim > 1024 ||
+      (block_dim & 31) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const size_t shmem = (size_t)hidden_size * sizeof(uint16_t);
+  dsv4_mhc_pre_rms_norm_kernel<<<num_tokens, block_dim, shmem,
                                  (cudaStream_t)stream>>>(
       residual, pre, weight, out, num_tokens, hidden_size, hc_mult, eps);
   return (CUresult)cudaGetLastError();
