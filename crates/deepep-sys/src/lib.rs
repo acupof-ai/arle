@@ -95,7 +95,7 @@ pub struct LowLatencyDispatchParams {
     pub round_scale: bool,
     pub use_ue8m0: bool,
     /// Inputs (caller-owned).
-    pub d_x: usize,        // __nv_bfloat16[num_tokens, hidden]
+    pub d_x: usize, // __nv_bfloat16[num_tokens, hidden]
     pub d_topk_idx: usize, // int64_t[num_tokens, num_topk]
     /// Outputs (caller-allocated; see header for exact shapes).
     pub d_recv_x: usize,
@@ -118,7 +118,7 @@ pub struct LowLatencyCombineParams {
     pub use_logfmt: bool,
     pub zero_copy: bool,
     /// Inputs (caller-owned).
-    pub d_x: usize,            // bf16[num_local_experts, world*max_tok, hidden]
+    pub d_x: usize, // bf16[num_local_experts, world*max_tok, hidden]
     pub d_topk_idx: usize,     // int64_t[num_combined_tokens, num_topk]
     pub d_topk_weights: usize, // float[num_combined_tokens, num_topk]
     pub d_src_info: usize,     // dispatch out: int[num_local_experts, world*max_tok]
@@ -365,9 +365,7 @@ mod native {
             handle: *mut ArleDeepEpBuffer,
             params: *const ArleDeepEpLowLatencyCombineParams,
         ) -> c_int;
-        pub(super) fn arle_deepep_buffer_is_low_latency(
-            handle: *const ArleDeepEpBuffer,
-        ) -> c_int;
+        pub(super) fn arle_deepep_buffer_is_low_latency(handle: *const ArleDeepEpBuffer) -> c_int;
     }
 
     pub(super) fn last_error() -> String {
@@ -596,8 +594,7 @@ impl Buffer {
             compute_stream: p.compute_stream,
             out_expected_m: &mut out_expected_m,
         };
-        let status =
-            unsafe { native::arle_deepep_buffer_low_latency_dispatch(self.handle, &c) };
+        let status = unsafe { native::arle_deepep_buffer_low_latency_dispatch(self.handle, &c) };
         if status != 0 {
             bail!(DeepEpError::Status {
                 code: status,
@@ -626,8 +623,7 @@ impl Buffer {
             d_combined_x: p.d_combined_x,
             compute_stream: p.compute_stream,
         };
-        let status =
-            unsafe { native::arle_deepep_buffer_low_latency_combine(self.handle, &c) };
+        let status = unsafe { native::arle_deepep_buffer_low_latency_combine(self.handle, &c) };
         if status != 0 {
             bail!(DeepEpError::Status {
                 code: status,
