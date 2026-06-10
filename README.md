@@ -1,9 +1,8 @@
 <p align="center">
-  <img src="docs/assets/logo.svg" alt="ARLE logo" width="88">
+  <img src="docs/assets/caret-counter-lockup.svg" height="56" alt="arle">
 </p>
 
 <p align="center">
-  <strong>ARLE</strong><br>
   <em>Pure-Rust runtime for serving, local agents, On-Policy Distillation, and evaluation. <code>arle serve</code> is the OpenAI-compatible serving path; <code>arle</code> is the unified front door.</em>
 </p>
 

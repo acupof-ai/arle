@@ -1,9 +1,8 @@
 <p align="center">
-  <img src="docs/assets/logo.svg" alt="ARLE logo" width="88">
+  <img src="docs/assets/caret-counter-lockup.svg" height="56" alt="arle">
 </p>
 
 <p align="center">
-  <strong>ARLE</strong><br>
   <em>Pure-Rust 运行时,统一服务、本地 agent、On-Policy Distillation 训练与评测。<code>arle serve</code> 是 OpenAI 兼容的服务入口;<code>arle</code> 是统一的用户入口。</em>
 </p>
 
