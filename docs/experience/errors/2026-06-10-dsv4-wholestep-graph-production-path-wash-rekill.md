@@ -71,8 +71,17 @@ and env-gated for future stacks where the host becomes the wall.
 
 1. **MTP** (÷~1.85) — the only proven B=1 multiplier; serve integration is
    THE next tranche.
-2. GPU-work reduction on the serial chain (fusion: 65 kernels/layer; mHC,
-   AR+rmsnorm) — license each by component A/B.
+2. GPU-work reduction on the serial chain — fusion, with the census from the
+   nsys capture (dev0, per token, steady decode) naming the targets:
+   `dsv4_mhc_params_kernel` 61/tok × **35.5 µs = 2.2 ms/token** (the single
+   biggest non-GEMM kernel — the known mHC-fuse lever, now quantified);
+   the tiny-kernel epilogue class `splitKreduce` 196/tok + `pack_quantize`
+   184/tok + `rms_norm` 123/tok + `mhc_pre/post` 123/tok ≈ 600 kernels/token
+   ≈ 1.5 ms busy + ~1 ms inherent gaps (quant-into-GEMM-epilogue, norm+mhc
+   fusion, splitK shape tuning). License each by component A/B.
+   Post-capture audit census: whole step = 4627 graph nodes, 533 alloc/free
+   PAIRED in-graph (self-contained pairs are why alloc-bearing graphs replay
+   correctly; the corrupt arm's un-paired htod constants were the killer).
 3. Lockstep start-offset (~2-4 ms skew) — real on the GPU timeline, but with
    a GPU-bound chain its recoverable share needs a direct experiment
    (rotate/parallelize TickAdmissions sends), not inference from gaps.
