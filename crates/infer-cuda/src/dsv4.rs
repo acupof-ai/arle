@@ -869,28 +869,61 @@ impl Dsv4Model {
             }
             _ => 0,
         };
-        let dsa_rotated_per_slot: usize = if official_on {
-            self.layers
-                .iter()
-                .filter(|layer| matches!(layer.mode, DeepSeekV4AttentionMode::CompressedSparse))
-                .map(|layer| {
-                    crate::attention::dsv4_dsa_rotated_keys_bytes(
-                        &self.config,
-                        layer.compress_ratio,
-                        max_seq_len,
-                    )
-                })
-                .fold(0usize, usize::saturating_add)
-        } else {
-            0
-        };
+        // Per-slot stateful selector/compressor caches, itemized per layer:
+        // rotated_keys + DSA key-cache band (CSA only), compressor compressed
+        // cache (every cr>0 layer, head_dim wide) + indexer compressed cache
+        // (CSA, index_head_dim wide). All scale with max_seq/cr.
+        let mut dsa_rotated_per_slot: usize = 0;
+        let mut state_caches_per_slot: usize = 0;
+        for layer in &self.layers {
+            if layer.compress_ratio == 0 {
+                continue;
+            }
+            let cc = max_seq_len.div_ceil(layer.compress_ratio).max(1);
+            state_caches_per_slot = state_caches_per_slot
+                .saturating_add(cc.saturating_mul(self.config.head_dim).saturating_mul(2));
+            if matches!(layer.mode, DeepSeekV4AttentionMode::CompressedSparse) {
+                state_caches_per_slot = state_caches_per_slot.saturating_add(
+                    cc.saturating_mul(self.config.index_head_dim)
+                        .saturating_mul(2),
+                );
+                if official_on {
+                    dsa_rotated_per_slot = dsa_rotated_per_slot.saturating_add(
+                        crate::attention::dsv4_dsa_rotated_keys_bytes(
+                            &self.config,
+                            layer.compress_ratio,
+                            max_seq_len,
+                        ),
+                    );
+                    state_caches_per_slot = state_caches_per_slot.saturating_add(
+                        crate::attention::dsv4_dsa_key_cache_bytes(
+                            &self.config,
+                            layer.compress_ratio,
+                            max_seq_len,
+                        )
+                        .unwrap_or(0),
+                    );
+                }
+            }
+        }
         let per_slot = arena_per_slot
             .saturating_mul(PER_SLOT_OVERHEAD_X)
-            .saturating_add(dsa_rotated_per_slot);
+            .saturating_add(dsa_rotated_per_slot)
+            .saturating_add(state_caches_per_slot);
         let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
             Ok((free, _total)) => {
                 let budget =
                     ((free as f64 * MEM_FRACTION) as usize).saturating_sub(dsa_shared_bytes);
+                log::info!(
+                    "DSv4 KV budget: free {}MB, per_slot {}MB (arena×2 {}MB + rotated {}MB + \
+                     state caches {}MB), shared DSA {}MB",
+                    free >> 20,
+                    per_slot >> 20,
+                    arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X) >> 20,
+                    dsa_rotated_per_slot >> 20,
+                    state_caches_per_slot >> 20,
+                    dsa_shared_bytes >> 20,
+                );
                 budget
                     .checked_div(per_slot)
                     .map_or(i32::MAX, |n| i32::try_from(n.max(1)).unwrap_or(i32::MAX))
@@ -905,13 +938,13 @@ impl Dsv4Model {
         if requested > affordable {
             log::warn!(
                 "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (arena×2 ~{}MB + \
-                 DSA rotated-keys ~{}MB) + shared DSA scratch ~{}MB exceeds the \
+                 per-slot selector/compressor caches ~{}MB) + shared DSA scratch ~{}MB exceeds the \
                  cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
                  {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}. \
                  Lower --max-seq-len ({max_seq_len}) to raise concurrency.",
                 per_slot >> 20,
                 arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X) >> 20,
-                dsa_rotated_per_slot >> 20,
+                dsa_rotated_per_slot.saturating_add(state_caches_per_slot) >> 20,
                 dsa_shared_bytes >> 20,
             );
         }
