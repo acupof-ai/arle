@@ -638,11 +638,62 @@ impl TokenKVPool {
         Ok(new_pages)
     }
 
+    /// Mirror a slot's page table and logical length from a host-authoritative
+    /// pool view.
+    ///
+    /// The rewrite's Qwen-dense executor does not run this pool's allocator at
+    /// all: the engine's host `CudaKvPool` is the single page allocator, and the
+    /// executor lowers each scheduled row's `KvBatchDescriptor` page list into
+    /// this device pool via `mirror_slot` before the forward. Host page ids
+    /// index this pool's storage rows 1:1 (both pools are sized to the same
+    /// `total_pages`), which is what makes radix prefix attach work: pages a
+    /// finished request published keep their KV rows until the host pool
+    /// recycles the ids, so a fresh slot mirroring those ids reads the prefix
+    /// KV directly.
+    ///
+    /// Mirrored slots bypass `free_pages`/`page_attach_count`; do not mix
+    /// `mirror_slot` with [`Self::alloc_tokens`]/[`Self::free_slot`] on the
+    /// same pool.
+    pub fn mirror_slot(&mut self, slot: usize, pages: &[u32], seq_len: usize) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "TokenKVPool::mirror_slot slot {slot} out of range {}",
+            self.num_slots
+        );
+        ensure!(
+            pages.len() == seq_len.div_ceil(self.page_size),
+            "TokenKVPool::mirror_slot pages {} do not exactly cover seq_len {} at page_size {}",
+            pages.len(),
+            seq_len,
+            self.page_size
+        );
+        for &page in pages {
+            ensure!(
+                (page as usize) < self.max_total_pages,
+                "TokenKVPool::mirror_slot page {page} out of range {} \
+                 (host pool total_pages exceeds device pool budget?)",
+                self.max_total_pages
+            );
+        }
+        let dst = &mut self.page_indices[slot];
+        // Steady decode extends the same table by one page every 16 tokens;
+        // avoid re-copying the whole prefix when the host view is a superset.
+        if pages.len() >= dst.len() && pages[..dst.len()] == dst[..] {
+            dst.extend_from_slice(&pages[dst.len()..]);
+        } else {
+            dst.clear();
+            dst.extend_from_slice(pages);
+        }
+        self.seq_lens[slot] = seq_len;
+        Ok(())
+    }
+
     /// Attach already-live pages to an empty slot.
     ///
-    /// Used by the CUDA scheduler's GPU-prefix admission path: the radix owns
-    /// the retained pages, and a fresh slot borrows them as its prefix KV
-    /// table before suffix prefill / decode appends new tokens.
+    /// Monolith-era allocator-mode prefix attach (the deleted scheduler drove
+    /// this directly). The rewrite path instead mirrors the host pool's page
+    /// table via [`Self::mirror_slot`]; this method and the retain/COW
+    /// machinery below stay for allocator-mode users and tests.
     ///
     /// Borrowed full pages are sealed shared prefix blocks. If `token_count`
     /// leaves the final page partial, that borrowed frontier is a read-only hot

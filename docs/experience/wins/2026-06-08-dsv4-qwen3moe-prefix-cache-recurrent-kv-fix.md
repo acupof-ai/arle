@@ -55,6 +55,18 @@ thread and every subsequent request returned HTTP 400 "engine thread closed".
 cargo check (cuda,no-cuda) PASS; `cargo test -p infer-core` 31/31 PASS (prefix
 tests unchanged — default stays on).
 
+> **Correction (2026-06-10).** The claim "only pure full-attention `Qwen3Dense`
+> has a page-addressable KV pool that **can honor prefix reuse**" was false as
+> shipped: the engine's attach wrote only the host `CudaKvPool`, while the
+> device `TokenKVPool` ran its own allocator and asserted
+> `materialized == start_pos` — a Qwen3Dense prefix hit killed the engine
+> thread the same way the DSv4 crash above did, just unexercised (this entry
+> verified DSv4/Qwen3Moe on H20, never a Qwen3Dense prefix hit). Fixed by
+> making the host pool the single allocator and mirroring its page table into
+> the device pool per row — see
+> [`2026-06-10-cuda-qwen3-dense-prefix-attach-host-mirror.md`](2026-06-10-cuda-qwen3-dense-prefix-attach-host-mirror.md)
+> (pending V100 verification).
+
 ## Rule
 
 - Cross-request prefix reuse is **only** sound for page-addressable
