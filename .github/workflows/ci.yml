@@ -43,81 +43,44 @@ jobs:
       - name: Run repo hygiene checks
         run: python3 scripts/check_repo_hygiene.py
 
-  # ── macOS arm64: Metal feature surface ──────────────────────────────────────
-  check-macos:
-    name: Check (macOS Metal)
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v6
+  # macOS Metal coverage lives in metal-ci.yml (superset: checks + tests +
+  # artifact packaging on macos-14). A second macOS job here was a duplicate.
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: macos-arm64-cargo-
-
-      - name: cargo check (Metal infer lib)
-        run: cargo check -p infer-api --no-default-features --features metal,no-cuda --lib
-
-      - name: cargo check (Metal CLI surface)
-        run: cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
-
-      - name: cargo check (Metal train/autograd libs)
-        run: |
-          cargo check -p autograd --release --features metal --lib
-          cargo check -p train --release --features metal --lib
-
-      - name: cargo test (kv-native-sys POSIX substrate)
-        # kv-native-sys is the pure-Rust persistence substrate (file/block I/O,
-        # WAL, mmap, POSIX shm, host arena). Linux coverage lives in the `test`
-        # job; this step is the canonical macOS POSIX gate.
-        run: cargo test -p kv-native-sys --release
-
-      - name: cargo test (Metal CLI unit tests)
-        run: cargo test -p cli --release --no-default-features --features metal,no-cuda
-
-      - name: cargo test (Metal ARLE smoke path)
-        run: cargo test -p agent-infer --release --no-default-features --features metal,no-cuda,cli --test cli_smoke
-
-  # ── Linux: CPU-only (no CUDA, no Metal) ─────────────────────────────────────
-  check:
-    name: Check
+  # ── Linux: lint (clippy subsumes cargo check) + CUDA-Rust typecheck ─────────
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          components: clippy
 
-      # Keep Rust CI focused on the infer library's CPU-only surface.
-      - name: cargo check (CPU-only)
-        run: cargo check -p infer-api --no-default-features --features cpu,no-cuda --lib
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
 
-      - name: cargo check (ARLE CPU smoke path)
-        run: cargo check -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle
-
-      - name: cargo check (workspace support crates)
+      - name: cargo clippy (CPU-only surfaces)
         run: |
-          cargo check -p autograd --release --features no-cuda --lib
-          cargo check -p train --release --features no-cuda --lib
+          cargo clippy -p infer-api --no-default-features --features cpu,no-cuda --lib -- -D warnings
+          cargo clippy -p cli --no-default-features --features no-cuda -- -D warnings
+          cargo clippy -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
+          cargo clippy -p autograd --features no-cuda --lib -- -D warnings
+          cargo clippy -p train --features no-cuda --lib -- -D warnings
+          cargo clippy -p kv-native-sys --all-targets -- -D warnings
+
+      # The only automated gate for the CUDA-Rust surface: cuda-ci.yml needs a
+      # self-hosted GPU runner (none registered), so without this step a CUDA
+      # type break lands on main silently and only surfaces at pod build time.
+      # `no-cuda` makes cuda-kernels' build.rs skip nvcc/TileLang compilation;
+      # CUDARC_CUDA_VERSION pins cudarc's probe so no toolkit is needed.
+      - name: cargo check (cuda + no-cuda typecheck, no GPU toolchain)
+        env:
+          CUDARC_CUDA_VERSION: "12080"
+        run: |
+          cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
+          cargo check -p agent-infer --release --no-default-features --features cuda,no-cuda,cli --bin arle
 
   test:
     name: Test
@@ -128,25 +91,22 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
 
-      - name: cargo test (CPU-only)
-        run: cargo test -p infer-api --no-default-features --features cpu,no-cuda --lib
+      - name: cargo test (CPU-only infer surface)
+        run: |
+          cargo test -p infer-api --release --no-default-features --features cpu,no-cuda --lib
+          cargo test -p cli --release --no-default-features --features no-cuda
+          cargo test -p agent-infer --release --no-default-features --features cpu,no-cuda,cli
 
-      - name: cargo test (CLI crate)
-        run: cargo test -p cli --release --no-default-features --features no-cuda
-
-      - name: cargo test (ARLE CPU smoke path)
-        run: cargo test -p agent-infer --release --no-default-features --features cpu,no-cuda,cli
+      - name: cargo test (rewrite-stack core crates)
+        # Device-neutral crates above the backend seam. infer-core is the
+        # scheduler/RadixCache — the most actively changed runtime code.
+        run: >
+          cargo test --release
+          -p infer-core -p infer-server -p infer-plan -p infer-seam
+          -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
 
       - name: cargo test (workspace support crates)
         run: |
@@ -154,48 +114,15 @@ jobs:
           cargo test -p autograd --release --features no-cuda --lib
           cargo test -p train --release --features no-cuda --lib
 
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: cargo clippy (CPU-only)
-        run: cargo clippy -p infer-api --no-default-features --features cpu,no-cuda --lib -- -D warnings
-
-      - name: cargo clippy (CLI crate)
-        run: cargo clippy -p cli --release --no-default-features --features no-cuda -- -D warnings
-
-      - name: cargo clippy (ARLE CPU smoke path)
-        run: cargo clippy -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
-
-      - name: cargo clippy (workspace support crates)
-        run: |
-          cargo clippy -p autograd --release --features no-cuda --lib -- -D warnings
-          cargo clippy -p train --release --features no-cuda --lib -- -D warnings
-          cargo clippy -p kv-native-sys --release --all-targets -- -D warnings
-
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The scoped fmt check diffs against the pre-push SHA; depth 1 has
+          # no parent commit and used to make the check a silent no-op.
+          fetch-depth: 2
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -203,12 +130,14 @@ jobs:
           components: rustfmt
 
       - name: cargo fmt check (scoped to changed .rs files)
-        # Workspace-wide `cargo fmt --all -- --check` trips on any
-        # un-formatted file the WORKTREE happens to contain — including
-        # files left dirty by parallel-track work that this commit
-        # didn't touch. Scope to the actual delta instead so CI failure
-        # tracks the commit, not the worktree. Drift is caught by the
-        # periodic nightly full-workspace fmt sweep (see fmt-nightly).
+        # Workspace-wide `cargo fmt --all -- --check` trips on unformatted
+        # files committed by parallel tracks that this push didn't touch.
+        # Scope to the actual delta so CI failure tracks the push, not the
+        # tree. Drift is caught by the nightly full-workspace sweep
+        # (fmt-nightly.yml). The script falls back to the full check rather
+        # than skipping when no diff base can be resolved.
+        env:
+          BASE_SHA: ${{ github.event.before }}
         run: bash scripts/ci-fmt-check-changed.sh
 
   python-test:
