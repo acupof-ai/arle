@@ -1,6 +1,11 @@
 # DSv4 decode 链上小消息集合通信 — one-shot AR/AG isolated bench(copy-first)
 
-> Status: PLAN — awaiting ck review. Commissioned 2026-06-10
+> Status: **T1 DONE — LICENSED** (`3aaa19b9`; results:
+> [`wins/2026-06-10-dsv4-comm-bench-oneshot-licensed.md`](../experience/wins/2026-06-10-dsv4-comm-bench-oneshot-licensed.md)).
+> Verdict: car_1stage 3.05× @14KB / nccl_sym 2.17× @448KB vs NCCL, all arms
+> cross-rank byte-identical. T2 = TpComm integration, car_1stage ≤128KB +
+> nccl_sym ≥224KB behind one opt-in flag (C4 short-circuit re-judged with
+> staging asymmetry — see wins entry). Commissioned 2026-06-10
 > ("写 one-shot AR kernel 的 isolated bench…先copy现成实现…看看 sglang 的是不是更好…给我判断依据")。
 
 ## 1. 问题与公式预测(hypothesis,本 bench 负责 license-or-kill)
