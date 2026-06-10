@@ -149,11 +149,14 @@ Use the lightest meaningful validation first, then broaden based on risk.
   correctness checks and include benchmark evidence when claiming a performance
   improvement.
 
-The CLI now has one canonical tiny-fixture path for real backend validation:
-`arle train test --out-dir <tmp>` leaves a checkpoint at `<tmp>/sft/latest`,
-and the Metal/CUDA CI lanes reuse that artifact for `arle run --json` coverage.
-GitHub-hosted macOS runners cover Metal; CUDA CI lives in the dedicated
-`.github/workflows/cuda-ci.yml` self-hosted GPU lane.
+CI coverage by surface: GitHub-hosted macOS runners cover Metal
+(`.github/workflows/metal-ci.yml` — checks, tests, and the release-shaped
+artifact). The CUDA-Rust surface is type-checked on every push without a GPU
+toolchain (the `ci.yml` Lint job builds `cuda,no-cuda` feature combos); the
+full-GPU `.github/workflows/cuda-ci.yml` lane is `workflow_dispatch`-only
+until a self-hosted GPU runner is registered, so real-GPU validation runs on
+a developer GPU box and lands as benchmark evidence (see
+`docs/bench-and-trace-spec.md`).
 
 See [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
 for the detailed matrix.
