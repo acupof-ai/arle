@@ -1571,6 +1571,7 @@ dependencies = [
  "hf-hub",
  "log",
  "logforth",
+ "tempfile",
 ]
 
 [[package]]
