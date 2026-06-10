@@ -841,6 +841,29 @@ mod dsv4_gpu {
         )
     }
 
+
+    /// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF).
+    ///
+    /// A `clone_htod(&vec![-1; n])` here would record a CUDA-graph memcpy node
+    /// whose HOST source dies with this call — replay reads freed memory (the
+    /// same hazard class as the topk_length IMA, 2026-06-10). Device memset is
+    /// capture-safe and cheaper.
+    fn alloc_neg1_i32(ctx: &DeviceContext, len: usize) -> Result<CudaSlice<i32>> {
+        let mut buf = ctx
+            .stream
+            .alloc_zeros::<i32>(len)
+            .map_err(|e| anyhow::anyhow!("DSv4 -1 sentinel alloc failed: {e}"))?;
+        let n_bytes = len * std::mem::size_of::<i32>();
+        let (ptr, _guard) = buf.device_ptr_mut(&ctx.stream);
+        // SAFETY: `ptr` is a live device allocation of `n_bytes` on this stream.
+        unsafe {
+            cudarc::driver::result::memset_d8_async(ptr, 0xFF, n_bytes, ctx.stream.cu_stream())
+                .map_err(|e| anyhow::anyhow!("DSv4 -1 sentinel memset failed: {e}"))?;
+        }
+        drop(_guard);
+        Ok(buf)
+    }
+
     fn dsv4_route_device(
         model: &Dsv4Model,
         layer: &Dsv4MoeLayer,
@@ -963,13 +986,12 @@ mod dsv4_gpu {
         hidden: &HiddenStates,
         out: &mut HiddenStates,
         scratch: &mut Dsv4MoeDecodeScratch,
+        keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
         use deepseek_spec::DeepSeekV4MoeRoutingKind;
 
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
-        let split = &model.split;
-        let swiglu_limit = model.config.swiglu_limit;
         let topk = cfg.top_k;
         let hidden_dim = hidden.hidden_dim;
         ensure!(
@@ -1019,20 +1041,18 @@ mod dsv4_gpu {
             )?;
         }
 
-        let route_indices = cache_ptr(&scratch.route_indices, ctx);
-        let route_weights = cache_ptr(&scratch.route_weights, ctx);
-        dsv4_moe_forward_decode_pooled(
-            ctx,
+        // Masked tail (the eager-default MoE path): the pooled tail carried a
+        // ~20% B=1 tax (padded grouped GEMM), which capped graph arms below
+        // the eager bar. Routing above stays in fixed scratch addresses; the
+        // tail's intermediates are capture-legal stream-ordered allocs.
+        dsv4_moe_forward_masked_tail(
+            model,
             layer,
-            split,
-            route_indices,
-            route_weights,
+            &scratch.route_indices,
+            &scratch.route_weights,
             hidden,
             out,
-            topk,
-            split.local_expert_start,
-            swiglu_limit,
-            scratch,
+            keepalive,
         )
     }
 
@@ -1113,7 +1133,6 @@ mod dsv4_gpu {
         moe::dsv4_deepgemm_native_preflight()?;
 
         // ── 1+2. Router gemm → logits[T, E] → route (host oracle or device). ───
-        let total_routes = num_tokens * topk;
         let mut decode_scratch = decode_scratch;
         let (route_indices, route_weights) =
             crate::stage_profile::profile(ctx, "dsv4/stage/moe_route", || -> Result<_> {
@@ -1175,6 +1194,42 @@ mod dsv4_gpu {
             );
         }
 
+        dsv4_moe_forward_masked_tail(
+            model,
+            layer,
+            &route_indices,
+            &route_weights,
+            hidden,
+            out,
+            keepalive,
+        )
+    }
+
+    /// Masked-path MoE tail (count → scan → pack → DeepGEMM grouped → scatter/
+    /// combine), shared by the eager forward and the decode graph. Fully
+    /// device-driven: routing buffers are read by kernels, intermediates are
+    /// stream-ordered allocs (legal inside graph capture, freed via
+    /// AUTO_FREE_ON_LAUNCH), and the -1 route-slot sentinel is a device memset.
+    #[allow(clippy::too_many_arguments)]
+    fn dsv4_moe_forward_masked_tail(
+        model: &Dsv4Model,
+        layer: &Dsv4MoeLayer,
+        route_indices: &CudaSlice<i32>,
+        route_weights: &CudaSlice<f32>,
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<()> {
+        let ctx = &model.ctx;
+        let cfg = &model.moe_config;
+        let split = &model.split;
+        let swiglu_limit = model.config.swiglu_limit;
+        let num_tokens = hidden.seq_len;
+        let hidden_dim = hidden.hidden_dim;
+        let topk = cfg.top_k;
+        let experts_per_rank = split.experts_per_rank;
+        let local_start = split.local_expert_start;
+        let total_routes = num_tokens * topk;
         // ── 3. Per-local-expert counts → group offsets (EP-aware start/range). ──
         let counts = ctx
             .stream
@@ -1194,7 +1249,7 @@ mod dsv4_gpu {
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
         unsafe {
             moe::dsv4_count_local_experts(
-                cache_ptr(&route_indices, ctx),
+                cache_ptr(route_indices, ctx),
                 cache_ptr(&counts, ctx),
                 num_tokens,
                 topk,
@@ -1218,10 +1273,7 @@ mod dsv4_gpu {
         // treats only route_slot < 0 as invalid; zero-init left unfilled compact
         // rows looking like valid slot-0 rows, which in m=1 decode overwrote
         // route slot 0 with zero output (DeepGEMM-path divergence, fixed H20).
-        let packed_route_slot = ctx
-            .stream
-            .clone_htod(&vec![-1i32; total_routes.max(1)])
-            .map_err(|e| anyhow::anyhow!("DSv4 packed_route_slot H2D failed: {e}"))?;
+        let packed_route_slot = alloc_neg1_i32(ctx, total_routes.max(1))?;
         let packed_weight = ctx
             .stream
             .alloc_zeros::<f32>(total_routes.max(1))
@@ -1237,8 +1289,8 @@ mod dsv4_gpu {
         unsafe {
             moe::dsv4_pack_local_experts_with_slots(
                 cache_ptr(&hidden.data, ctx),
-                cache_ptr(&route_indices, ctx),
-                cache_ptr(&route_weights, ctx),
+                cache_ptr(route_indices, ctx),
+                cache_ptr(route_weights, ctx),
                 cache_ptr(&offsets, ctx),
                 cache_ptr(&cursors, ctx),
                 cache_ptr(&packed_hidden.data, ctx),
@@ -1641,10 +1693,7 @@ mod dsv4_gpu {
             }
 
             let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, recv_slots.max(1))?;
-            let packed_route_slot = ctx
-                .stream
-                .clone_htod(&vec![-1i32; recv_slots.max(1)])
-                .map_err(|e| anyhow::anyhow!("DSv4 DeepEP packed_route_slot H2D failed: {e}"))?;
+            let packed_route_slot = alloc_neg1_i32(ctx, recv_slots.max(1))?;
             let packed_weight = ctx
                 .stream
                 .alloc_zeros::<f32>(recv_slots.max(1))
