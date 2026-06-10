@@ -1,0 +1,16 @@
+[package]
+name = "hip-sys"
+version = "0.1.5"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+# Link the ROCm HIP runtime (`amdhip64`). Off by default so the workspace
+# typechecks on machines without ROCm — mirror of the Mac `cuda,no-cuda`
+# trick. Without the feature every entry point returns `HIP_NOT_COMPILED`.
+hip = []
+
+[lints]
+workspace = true
