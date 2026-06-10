@@ -2840,14 +2840,14 @@ mod dsv4_gpu {
     }
 }
 
-#[cfg(feature = "deepep")]
-pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
     Dsv4MoeDecodeScratch, GroupedCache, build_grouped_cache, dsv4_moe_forward,
     dsv4_moe_forward_decode_graph, dsv4_shared_expert_forward,
 };
+#[cfg(feature = "deepep")]
+pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};
 #[cfg(feature = "cuda")]
 pub(crate) use gpu::moe_forward;
 

@@ -1806,14 +1806,10 @@ impl Dsv4Model {
                             self.ctx
                                 .stream
                                 .memcpy_dtod(
-                                    &normed.data.slice(
-                                        start * hidden_size..end * hidden_size,
-                                    ),
+                                    &normed.data.slice(start * hidden_size..end * hidden_size),
                                     &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
                                 )
-                                .map_err(|e| {
-                                    anyhow!("deepep_ll owned-slice copy failed: {e}")
-                                })?;
+                                .map_err(|e| anyhow!("deepep_ll owned-slice copy failed: {e}"))?;
                         }
                         let mut owned_out =
                             HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
@@ -1835,9 +1831,9 @@ impl Dsv4Model {
                                 .stream
                                 .memcpy_dtod(
                                     &owned_out.data.slice(0..owned_n * hidden_size),
-                                    &mut moe_out.data.slice_mut(
-                                        start * hidden_size..end * hidden_size,
-                                    ),
+                                    &mut moe_out
+                                        .data
+                                        .slice_mut(start * hidden_size..end * hidden_size),
                                 )
                                 .map_err(|e| {
                                     anyhow!("deepep_ll owned scatter into moe_out failed: {e}")
