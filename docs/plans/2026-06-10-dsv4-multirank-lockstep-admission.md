@@ -1,8 +1,22 @@
 # DSv4 multi-rank lockstep admission — kill the c≥2 plan-divergence deadlock
 
-> Status: **DESIGN — awaiting ck ack** (architectural, >3 files). Layer 1
-> (executor mixed-plan split, `cd421794`) is landed; this is Layer 2.
-> Commissioned by the 2026-06-10 deepep_ll batched-lane investigation.
+> Status: **LANDED `23b69249`** (ck ack 2026-06-10 "你review再然后开工吧";
+> review upgraded the design — see §Design revision). Verified on 8×H20:
+> c=2/4/8 burst+stagger all complete, 1150/1150 ticks rank-uniform incl. 140
+> Mixed ticks, B=1 −0.3% (noise), batched-decode arm +57% agg @ c=8. Results:
+> [`wins/2026-06-10-dsv4-lockstep-admission-c-sweep-lane-exists.md`](../experience/wins/2026-06-10-dsv4-lockstep-admission-c-sweep-lane-exists.md).
+>
+> **Design revision (review, pre-implementation):** the sketch below
+> ("rank 0 sends one TickAdmissions per *forward-executing* tick"; an earlier
+> variant stamped admit-ticks with a margin K) had two holes — empty plans run
+> no collectives so any forward/tick counter drifts across ranks, and an
+> idle-system stamp can never be reached (self-deadlock). What landed is
+> **message-per-step**: rank 0 sends exactly one `TickAdmissions{seq,requests}`
+> before EVERY `Engine::step` (empty list allowed); workers own their Engine
+> directly (`CudaWorkerEngine`, no background loop) and step exactly once per
+> envelope. Sound because the CUDA executor's `submit` is synchronous with
+> `poll` always `Ready` (one forward per step), sampling is
+> `(seed,position)`-deterministic, and plan-building is pure in engine state.
 
 ## Problem — two layers behind "c≥2 crashes"
 
