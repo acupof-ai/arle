@@ -586,6 +586,7 @@ unsafe extern "C" {
         masked_m: *const i32,
         expert_num: i32,
         token_num_padded: i32,
+        expected_m: i32,
         hidden_dim: i32,
         swiglu_limit: f32,
         stream: CUstream,

@@ -1003,6 +1003,11 @@ pub unsafe fn dsv4_deepgemm_swiglu_quantize_w13(
 /// # Safety
 /// All pointers must be valid on `stream` for the given shape; `input` is the
 /// padded BF16 w13 output, `out_fp8` / `out_scale` the FP8 + scale scratch.
+/// `expected_m` is the host-known upper bound on any expert's valid rows
+/// (per-expert recv count ≤ the step's global token count); the launch grid
+/// covers only `min(expected_m, token_num_padded)` rows per expert. The padded
+/// band still backs all memory strides, and the kernel traps loudly if a
+/// `masked_m` count ever exceeds the bound.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn dsv4_deepgemm_silu_mul_masked_quant(
     input: RawDevicePtr<bf16>,
@@ -1011,6 +1016,7 @@ pub unsafe fn dsv4_deepgemm_silu_mul_masked_quant(
     masked_m: RawDevicePtr<i32>,
     expert_num: usize,
     token_num_padded: usize,
+    expected_m: usize,
     hidden_dim: usize,
     swiglu_limit: f32,
     stream: CUstream,
@@ -1023,6 +1029,7 @@ pub unsafe fn dsv4_deepgemm_silu_mul_masked_quant(
             masked_m.as_ptr(),
             i32::try_from(expert_num)?,
             i32::try_from(token_num_padded)?,
+            i32::try_from(expected_m)?,
             i32::try_from(hidden_dim)?,
             swiglu_limit,
             stream,

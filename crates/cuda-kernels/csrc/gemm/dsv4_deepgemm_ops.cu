@@ -194,18 +194,26 @@ __global__ void dsv4_deepgemm_silu_mul_masked_quant_kernel(
     float* __restrict__ output_scale,
     const int32_t* __restrict__ masked_m,
     int expert_num,
+    int token_num_grid,
     int token_num_padded,
     int intermediate_dim,
     int scale_stride_m,
     int scale_k_blocks,
     float limit) {
+  // Grid decomposes over `token_num_grid` rows (host-known per-expert valid-row
+  // upper bound, e.g. the step's global token count) while all memory strides
+  // keep the full `token_num_padded` band. DeepEP LL packs received rows from
+  // row 0, so rows >= token_num_grid are guaranteed invalid when the bound
+  // holds; the trap below makes a violated bound loud instead of silently
+  // skipping valid rows.
   int64_t linear = blockIdx.x;
   const int k_block = static_cast<int>(linear % scale_k_blocks);
   linear /= scale_k_blocks;
-  const int row = static_cast<int>(linear % token_num_padded);
-  const int expert = static_cast<int>(linear / token_num_padded);
+  const int row = static_cast<int>(linear % token_num_grid);
+  const int expert = static_cast<int>(linear / token_num_grid);
   if (expert >= expert_num) return;
   const int count = masked_m[expert];
+  if (row == 0 && threadIdx.x == 0 && count > token_num_grid) __trap();
   if (row >= count) return;
   const int col_start = k_block * DSV4_DEEPGEMM_GRAN_K;
   const int col_end = min(col_start + DSV4_DEEPGEMM_GRAN_K, intermediate_dim);
@@ -372,12 +380,19 @@ extern "C" CUresult dsv4_deepgemm_silu_mul_masked_quant_cuda(
     const int* masked_m,
     int expert_num,
     int token_num_padded,
+    int expected_m,
     int hidden_dim,
     float swiglu_limit,
     CUstream stream) {
   // `hidden_dim` is the gate||up width; the quant axis is intermediate = hidden_dim/2.
-  if (expert_num < 0 || token_num_padded <= 0 || hidden_dim <= 0 ||
-      (hidden_dim & 1) != 0 || !(swiglu_limit > 0.0f)) {
+  // `expected_m` is the host-known upper bound on any expert's valid rows
+  // (per-expert recv count <= the step's global token count); the launch grid
+  // covers only `min(expected_m, token_num_padded)` rows per expert instead of
+  // the full padded band — at decode B=1 this collapses the grid by ~2048x
+  // (the empty-block drain over [E, m_padded, k_blocks] measured 631 us/call,
+  // 52.9% of deepep_ll GPU time on 8xH20).
+  if (expert_num < 0 || token_num_padded <= 0 || expected_m <= 0 ||
+      hidden_dim <= 0 || (hidden_dim & 1) != 0 || !(swiglu_limit > 0.0f)) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   const int intermediate_dim = hidden_dim / 2;
@@ -389,16 +404,18 @@ extern "C" CUresult dsv4_deepgemm_silu_mul_masked_quant_cuda(
       masked_m == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
+  const int token_num_grid =
+      expected_m < token_num_padded ? expected_m : token_num_padded;
   // Column-major SFA stride the masked grouped DeepGEMM expects: TMA-aligned to
   // a multiple of 4 over the padded token dim (`get_tma_aligned_size(m, 4)`).
   const int scale_stride_m = ((token_num_padded + 3) / 4) * 4;
   const int scale_k_blocks =
       (intermediate_dim + DSV4_DEEPGEMM_GRAN_K - 1) / DSV4_DEEPGEMM_GRAN_K;
-  int64_t grid = static_cast<int64_t>(scale_k_blocks) * token_num_padded * expert_num;
+  int64_t grid = static_cast<int64_t>(scale_k_blocks) * token_num_grid * expert_num;
   if (grid > INT_MAX) return CUDA_ERROR_INVALID_VALUE;
   dsv4_deepgemm_silu_mul_masked_quant_kernel<<<static_cast<int>(grid), DSV4_DEEPGEMM_BLOCK, 0, (cudaStream_t)stream>>>(
       reinterpret_cast<const uint16_t*>(input), out_fp8, out_scale, masked_m,
-      expert_num, token_num_padded, intermediate_dim, scale_stride_m,
-      scale_k_blocks, swiglu_limit);
+      expert_num, token_num_grid, token_num_padded, intermediate_dim,
+      scale_stride_m, scale_k_blocks, swiglu_limit);
   return (CUresult)cudaGetLastError();
 }
