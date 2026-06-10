@@ -49,7 +49,7 @@ pub use execution::{CounterSnapshot, StreamItem};
 pub use http::openai_router;
 pub use multiproc_relay::{
     PendingRelayCoordinator, RelayCompletionDelta, RelayCoordinator, RelayEnvelope, RelayWorker,
-    WireRequest, broadcast_admission, set_admission_broadcaster,
+    WireRequest, broadcast_tick, set_tick_broadcaster, tick_broadcaster_installed,
 };
 pub use schema::{
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,

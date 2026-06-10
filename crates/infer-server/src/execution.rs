@@ -120,6 +120,18 @@ pub(crate) fn engine_loop<E, K>(
         }));
     }
 
+    // Multiproc lockstep state (rank-0 coordinator only; resolved once — the
+    // coordinator installs the broadcaster at boot, before this engine spawns).
+    // `tick_seq` pairs exactly one `TickAdmissions` with every engine step so
+    // worker ranks admit the same requests at the same step index; see
+    // `multiproc_relay::set_tick_broadcaster` for the desync proof this closes.
+    let lockstep = crate::multiproc_relay::tick_broadcaster_installed();
+    let mut tick_seq: u64 = 0;
+    let mut next_request_id: u64 = 1;
+    // Submission picked up by the idle park below, admitted on the next pass so
+    // it flows through the same per-tick broadcast as the drained batch.
+    let mut carry: Vec<Submission> = Vec::new();
+
     loop {
         // 0. Run any queued out-of-band control closures against the executor
         //    (OPD raw-logits forward, weight offload/reload, LoRA re-merge). These
@@ -127,13 +139,12 @@ pub(crate) fn engine_loop<E, K>(
         //    exclusive. A disconnected control channel is benign (frontend gone).
         drain_control(&mut engine, &control_rx);
 
-        // 1. Drain every queued submission without blocking. Each one is handed
-        //    to the engine and registered for completion delivery.
+        // 1. Drain every queued submission without blocking (plus any idle-park
+        //    carry). Admission happens AFTER the lockstep broadcast below.
+        let mut drained = std::mem::take(&mut carry);
         loop {
             match submit_rx.try_recv() {
-                Ok(submission) => {
-                    admit_submission(&mut engine, &mut pending, &streamers, submission)
-                }
+                Ok(submission) => drained.push(submission),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     submit_open = false;
@@ -141,9 +152,36 @@ pub(crate) fn engine_loop<E, K>(
                 }
             }
         }
+
+        // 2. Lockstep tick barrier: exactly one `TickAdmissions` precedes every
+        //    engine step (and every admission batch). Empty-request envelopes on
+        //    pure-decode ticks cost one localhost TCP write per worker (~µs)
+        //    against a ≥25 ms step. `engine.is_idle()` here is the pre-admission
+        //    state; if it is idle AND nothing was drained, no step follows and
+        //    no envelope is sent (workers park on recv symmetrically).
+        if lockstep && (!drained.is_empty() || !engine.is_idle()) {
+            let requests = drained
+                .iter()
+                .map(|submission| crate::multiproc_relay::WireRequest {
+                    request_id: {
+                        let id = next_request_id;
+                        next_request_id += 1;
+                        id
+                    },
+                    prompt_tokens: submission.prompt.clone(),
+                    max_tokens: submission.max_tokens,
+                    sampling: submission.sampling.clone(),
+                })
+                .collect();
+            crate::multiproc_relay::broadcast_tick(tick_seq, requests);
+            tick_seq += 1;
+        }
+        for submission in drained {
+            admit_submission(&mut engine, &mut pending, &streamers, submission);
+        }
         publish_counters(&engine, &counters);
 
-        // 2. If there is engine work, run one tick and deliver any completions.
+        // 3. If there is engine work, run one tick and deliver any completions.
         //    Looping here (rather than one tick per outer pass) keeps latency low
         //    without re-checking the submit channel between every micro-step.
         if !engine.is_idle() {
@@ -159,17 +197,18 @@ pub(crate) fn engine_loop<E, K>(
             continue;
         }
 
-        // 3. Fully idle. If the frontend is gone and nothing remains, exit.
+        // 4. Fully idle. If the frontend is gone and nothing remains, exit.
         if !submit_open {
             // Flush any straggler completions before leaving.
             deliver_completions(&engine, &mut pending, &streamers);
             return;
         }
 
-        // 4. Idle but still serving: park on the submit channel instead of
-        //    busy-spinning, so the engine thread is an OS good citizen.
+        // 5. Idle but still serving: park on the submit channel instead of
+        //    busy-spinning. The submission is carried to the next pass so it
+        //    rides the same tick broadcast as try_recv'd ones.
         match submit_rx.recv_timeout(IDLE_PARK) {
-            Ok(submission) => admit_submission(&mut engine, &mut pending, &streamers, submission),
+            Ok(submission) => carry.push(submission),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => submit_open = false,
         }
@@ -200,19 +239,9 @@ fn admit_submission<E, K>(
     E: BackendExecutor,
     K: KvPool,
 {
-    // Multiproc lockstep (Stage 2): broadcast this request to worker ranks 1..N-1
-    // BEFORE submitting it to the local rank-0 Engine, mirroring the old
-    // `DistributedSchedulerGroup::submit` ordering (`e81b98fb^:infer/src/
-    // request_handle.rs:909` broadcast `Request2 { wire }` ahead of `permit.submit`).
-    // This site is the single deterministic admission point on the engine thread,
-    // so every rank admits the same requests in the same FIFO order and their
-    // deterministic planners build identical per-step batches. On single-process
-    // serves no broadcaster is installed, so this is a cheap no-op load.
-    crate::broadcast_admission(
-        &submission.prompt,
-        submission.max_tokens,
-        &submission.sampling,
-    );
+    // Multiproc lockstep: the per-tick `TickAdmissions` broadcast already
+    // happened in the engine loop (step 2) before this admission batch, so
+    // worker ranks admit these same requests at the same step index.
     let handle = engine.submit_request_with_options(
         submission.prompt,
         submission.max_tokens,

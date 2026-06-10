@@ -6,7 +6,12 @@
 //! available; the enum + impls require a backend feature.
 
 /// Slot / page configuration for [`LoadedInferenceEngine::load_with_config`].
-#[derive(Debug, Clone, Copy)]
+///
+/// Serde: the multiproc coordinator serializes its resolved config into
+/// `ARLE_WORKER_ENGINE_CONFIG` so worker ranks build their engines from the
+/// SAME values — any divergence (slots, budgets, chunk size) diverges the
+/// deterministic planner across ranks and deadlocks the NCCL lockstep.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct EngineLoadConfig {
     /// Logical request slots.
     pub num_slots: usize,
@@ -256,35 +261,6 @@ mod backend {
             }
         }
 
-        /// Submit a pre-tokenized prompt to the engine and discard its output —
-        /// the multiproc worker (rank 1..N-1) lockstep path. CUDA-only: DSv4
-        /// multi-rank serve is CUDA, and only the worker ranks (whose output is
-        /// never returned over HTTP) use this. Each relayed
-        /// [`infer_server::WireRequest`] is submitted here so the worker's engine
-        /// loop drives the executor's NCCL collective `forward` in lockstep with
-        /// rank 0. Metal/CPU bail (single-process, no relay).
-        #[cfg(feature = "cuda")]
-        pub fn submit_replicated(
-            &self,
-            prompt_tokens: Vec<u32>,
-            max_tokens: usize,
-            sampling: infer_plan::SamplingParams,
-        ) -> Result<()> {
-            match self {
-                Self::Cuda(engine) => engine.submit_replicated(prompt_tokens, max_tokens, sampling),
-                #[cfg(feature = "metal")]
-                Self::Metal(_) => {
-                    let _ = (prompt_tokens, max_tokens, sampling);
-                    anyhow::bail!("submit_replicated is CUDA-only (multiproc worker lockstep path)")
-                }
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(_) => {
-                    let _ = (prompt_tokens, max_tokens, sampling);
-                    anyhow::bail!("submit_replicated is CUDA-only (multiproc worker lockstep path)")
-                }
-            }
-        }
-
         /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6 q/v
         /// projection weights (OPD per-step re-merge). CUDA-only: the Metal /
         /// CPU arms reject it.
@@ -471,9 +447,28 @@ mod backend {
         infer_cuda::set_decode_graph_default(enable_cuda_graph);
         let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
         let model_id = crate::serve_engine::model_id_from_path(model_path);
-        let kind = detect_cuda_model_kind(model_path)?;
 
         let model_source = model_path.to_string();
+        let engine_config = *config;
+        let serve = ServeHandle::spawn_with_engine_builder(move || {
+            build_cuda_engine(&model_source, &engine_config)
+        })?;
+        Ok((serve, tokenizer, model_id))
+    }
+
+    /// Build the CUDA `Engine` (executor + admission KV pool + scheduler) for
+    /// `model_path` — the ONE engine constructor every rank uses. rank 0 runs it
+    /// inside [`ServeHandle::spawn_with_engine_builder`]; multiproc worker ranks
+    /// run it directly on their driver thread ([`super::CudaWorkerEngine`]). All
+    /// ranks building through this same helper with the same
+    /// [`EngineLoadConfig`] is a lockstep invariant: any per-rank divergence in
+    /// scheduler knobs diverges the deterministic planner and deadlocks NCCL.
+    #[cfg(feature = "cuda")]
+    pub(super) fn build_cuda_engine(
+        model_path: &str,
+        config: &EngineLoadConfig,
+    ) -> Result<infer_core::Engine<CudaExecutor, CudaKvPool>> {
+        let kind = detect_cuda_model_kind(model_path)?;
         let mut scheduler = config.scheduler_config();
         // Cross-request prompt-prefix reuse (the host radix cache) is only sound
         // when a cached prefix's KV can be re-attached to a new slot and read
@@ -496,9 +491,7 @@ mod backend {
         // (single-chunk max_seq_len both trips that assert at >4096 and OOMs the
         // M×K scratch at 900K). Contiguous chunks are recurrent-KV-safe now that
         // cross-request prefix reuse is disabled above (each request still resets
-        // at start_pos==0; chunks advance start_pos contiguously). Cap at 4096;
-        // all ranks build through this same helper with the same `kind`, so the
-        // rank-0 coordinator and workers stay in lockstep across chunk boundaries.
+        // at start_pos==0; chunks advance start_pos contiguously). Cap at 4096.
         if matches!(kind, CudaModelKind::Dsv4) {
             scheduler.chunked_prefill_size = 4096;
             // Long-context: lift the prompt/total token caps to the model's
@@ -513,50 +506,87 @@ mod backend {
         let num_slots = config.num_slots;
         let page_size = config.page_size;
         let total_pages = cuda_admission_total_pages(kind, config, page_size);
-        let serve = ServeHandle::spawn_with_engine_builder(move || {
-            let executor = match kind {
-                CudaModelKind::Qwen3Dense => CudaExecutor::from_qwen3_bf16_safetensors(
-                    &model_source,
-                    num_slots,
-                    total_pages,
-                )?,
-                CudaModelKind::Qwen3Moe => CudaExecutor::from_qwen35_moe_safetensors(
-                    &model_source,
-                    num_slots,
-                    total_pages,
-                )?,
-                // DSv4 multi-rank serve. The DSv4 executor resolves its TP
-                // rank/world-size + EP expert split + NCCL communicator from the
-                // environment during construction (`INFER_TP_RANK` /
-                // `INFER_TP_SIZE` / `INFER_CUDA_DEVICES`, plus
-                // `INFER_NCCL_UNIQUE_ID` / `INFER_NCCL_ID_FILE` rendezvous) — set
-                // by the multiproc coordinator/launcher before this runs. On a
-                // single GPU (world_size==1) it loads as one rank. DSv4 owns its
-                // MLA KV state inside the forward, so the host `CudaKvPool` is
-                // only present to satisfy the `submit(.., &mut dyn KvPool)`
-                // signature; `max_seq_len` threads from `dsv4_max_seq_len()`
-                // (`INFER_DSV4_MAX_SEQ_LEN`).
-                //
-                // This builds the rank-0 executor + Engine. The multi-rank
-                // LOCKSTEP FORWARD is now wired: the rank-0 engine thread's
-                // admission path broadcasts each request to ranks 1..N-1
-                // (`infer_server::broadcast_admission`, installed by
-                // `cli::serve_multiproc`), and each worker submits the relayed
-                // request into its own rank-R Engine so the NCCL collective
-                // `forward` runs in lockstep.
-                //
-                // `// STAGE 3:` chunked-prefill scratch chunk-bounding and the
-                // long-decode path (beyond a single short prompt) are later stages.
-                CudaModelKind::Dsv4 => CudaExecutor::from_dsv4_fp8_safetensors(
-                    &model_source,
-                    num_slots,
-                    infer_cuda::dsv4_max_seq_len(),
-                )?,
-            };
-            let kv = CudaKvPool::new(num_slots, total_pages, page_size);
-            Ok(infer_core::Engine::with_config(executor, kv, scheduler))
-        })?;
-        Ok((serve, tokenizer, model_id))
+        let executor = match kind {
+            CudaModelKind::Qwen3Dense => {
+                CudaExecutor::from_qwen3_bf16_safetensors(model_path, num_slots, total_pages)?
+            }
+            CudaModelKind::Qwen3Moe => {
+                CudaExecutor::from_qwen35_moe_safetensors(model_path, num_slots, total_pages)?
+            }
+            // DSv4 multi-rank serve. The DSv4 executor resolves its TP
+            // rank/world-size + EP expert split + NCCL communicator from the
+            // environment during construction (`INFER_TP_RANK` /
+            // `INFER_TP_SIZE` / `INFER_CUDA_DEVICES`, plus
+            // `INFER_NCCL_UNIQUE_ID` / `INFER_NCCL_ID_FILE` rendezvous) — set
+            // by the multiproc coordinator/launcher before this runs. On a
+            // single GPU (world_size==1) it loads as one rank. DSv4 owns its
+            // MLA KV state inside the forward, so the host `CudaKvPool` is
+            // only present to satisfy the `submit(.., &mut dyn KvPool)`
+            // signature; `max_seq_len` threads from `dsv4_max_seq_len()`
+            // (`INFER_DSV4_MAX_SEQ_LEN`).
+            CudaModelKind::Dsv4 => CudaExecutor::from_dsv4_fp8_safetensors(
+                model_path,
+                num_slots,
+                infer_cuda::dsv4_max_seq_len(),
+            )?,
+        };
+        let kv = CudaKvPool::new(num_slots, total_pages, page_size);
+        Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+    }
+
+    /// Multiproc worker rank's directly-driven engine (rank 1..N-1).
+    ///
+    /// Unlike rank 0 (whose engine lives on a free-running [`ServeHandle`]
+    /// thread), a worker steps its engine SYNCHRONOUSLY — exactly once per
+    /// relayed `TickAdmissions` envelope — so admission lands at the same step
+    /// index on every rank (the lockstep contract; see
+    /// `infer_server::set_tick_broadcaster`). Built and driven on one thread.
+    ///
+    /// Known growth, mirroring rank 0: the engine's completed-request map is
+    /// never drained (no collector on workers), one entry per finished request.
+    #[cfg(feature = "cuda")]
+    pub struct CudaWorkerEngine(infer_core::Engine<CudaExecutor, CudaKvPool>);
+
+    #[cfg(feature = "cuda")]
+    impl CudaWorkerEngine {
+        /// Build the rank-R engine from the SAME config rank 0 resolved
+        /// (`ARLE_WORKER_ENGINE_CONFIG`); NCCL rank/world come from env during
+        /// executor construction.
+        pub fn load(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
+            Ok(Self(build_cuda_engine(model_path, config)?))
+        }
+
+        /// Inject one relayed request, mirroring rank 0's admission options
+        /// (`RequestOptions { sampling, ..default() }` — `admit_submission`).
+        pub fn inject(
+            &mut self,
+            prompt_tokens: Vec<u32>,
+            max_tokens: usize,
+            sampling: infer_plan::SamplingParams,
+        ) {
+            let _handle = self.0.submit_request_with_options(
+                prompt_tokens,
+                max_tokens,
+                infer_core::RequestOptions {
+                    sampling,
+                    ..infer_core::RequestOptions::default()
+                },
+            );
+        }
+
+        /// Whether the engine has no queued, active, or in-flight work —
+        /// evaluated on the same state rank 0 evaluates, so both sides step (or
+        /// skip) symmetrically per tick.
+        #[must_use]
+        pub fn is_idle(&self) -> bool {
+            self.0.is_idle()
+        }
+
+        /// Run exactly one scheduler tick (apply previous output → admit
+        /// waiting → build plan → submit forward).
+        pub fn step(&mut self) -> Result<()> {
+            self.0.step()
+        }
     }
 
     /// Single-GPU CUDA serve router. Builds the same `ServeHandle` as
@@ -651,6 +681,8 @@ mod backend {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub use backend::CudaWorkerEngine;
 #[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
 pub use backend::LoadedInferenceEngine;
 #[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]

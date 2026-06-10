@@ -20,18 +20,24 @@
 //!     bootstraps NCCL as rank R from env during construction), then run a
 //!     relay-receiver loop.
 //!
-//! Stage 2 (this change) wires the FUNCTIONAL lockstep forward: the coordinator
-//! installs an admission broadcaster (`infer_api::set_admission_broadcaster`) so
-//! every request the rank-0 engine admits is fanned out as a `RelayEnvelope::
-//! Request` to ranks 1..N-1; each worker's relay-receiver loop submits the
-//! reconstructed request into its own rank-R engine
-//! (`LoadedInferenceEngine::submit_replicated`), whose background loop drives the
-//! executor's NCCL collective `forward` in lockstep with rank 0. Worker output is
-//! discarded — only rank 0 returns over HTTP.
+//! Lockstep admission (this change): the coordinator installs a per-tick
+//! broadcaster (`infer_api::set_tick_broadcaster`); the rank-0 engine loop sends
+//! exactly one `RelayEnvelope::TickAdmissions { seq, requests }` before every
+//! engine step (empty `requests` on pure-decode ticks). Each worker drives its
+//! own rank-R engine SYNCHRONOUSLY — one `inject + step` per envelope
+//! ([`infer_api::CudaWorkerEngine`]) — so every rank admits the same requests at
+//! the same step index and the per-step NCCL collective sequences stay aligned.
+//! Free-running per-request relays desync (admission-vs-tick race, measured
+//! 2026-06-10: `errors/2026-06-10-dsv4-c2-layer2-lockstep-admission-deadlock.md`).
+//! Worker output is discarded — only rank 0 returns over HTTP.
+//!
+//! Config parity: the coordinator serializes its resolved
+//! [`EngineLoadConfig`] into `ARLE_WORKER_ENGINE_CONFIG` before spawning, so
+//! worker planners run the SAME scheduler knobs (a divergent knob = divergent
+//! plans = NCCL deadlock).
 //!
 //! `// STAGE 3:` owner-routed visible output (`RelayEnvelope::Completion` back to
-//! a non-rank-0 owner), chunked-prefill scratch chunk-bounding, and the
-//! long-decode path beyond a single short prompt remain later stages.
+//! a non-rank-0 owner) remains a later stage.
 
 #![cfg(all(unix, feature = "cuda"))]
 
@@ -39,11 +45,8 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use infer_api::{
-    EngineLoadConfig, LoadedInferenceEngine, RelayCoordinator, RelayEnvelope, RelayWorker,
-    WireRequest,
-};
+use anyhow::{Context, Result, ensure};
+use infer_api::{CudaWorkerEngine, EngineLoadConfig, RelayCoordinator, RelayEnvelope, RelayWorker};
 
 /// Relay accept / worker-connect timeout. Generous: a cold DSv4 rank-0 build can
 /// take tens of seconds before it reaches the accept point.
@@ -136,13 +139,27 @@ pub(crate) struct CoordinatorGuard {
 /// engine thread invokes that closure (`infer_server::broadcast_admission`) at the
 /// single deterministic admission point, broadcasting a [`WireRequest`] to every
 /// worker before submitting the request locally.
-pub(crate) fn bind_relay_and_spawn_workers(model_path: &str) -> Result<Option<CoordinatorGuard>> {
+pub(crate) fn bind_relay_and_spawn_workers(
+    model_path: &str,
+    engine_config: &EngineLoadConfig,
+) -> Result<Option<CoordinatorGuard>> {
     let world_size = world_size_from_env();
     if world_size <= 1 {
         log::info!(
             "[multiproc-coord] world_size={world_size}; serving DSv4 single-process (no workers)"
         );
         return Ok(None);
+    }
+
+    // Config parity: workers must build their engines from the SAME resolved
+    // config as rank 0 (any scheduler-knob divergence diverges the
+    // deterministic planner across ranks → NCCL deadlock). Published via env
+    // BEFORE spawn so children inherit it.
+    let config_json =
+        serde_json::to_string(engine_config).context("serialize ARLE_WORKER_ENGINE_CONFIG")?;
+    // SAFETY: env write happens before child spawn, on the single CLI thread.
+    unsafe {
+        std::env::set_var("ARLE_WORKER_ENGINE_CONFIG", &config_json);
     }
 
     // 0. Mint the NCCL rendezvous id ONCE (rank 0) and publish it via env so every
@@ -197,34 +214,26 @@ pub(crate) fn bind_relay_and_spawn_workers(model_path: &str) -> Result<Option<Co
         .broadcast(&RelayEnvelope::BootPing { request_id: 0 })
         .context("multiproc relay boot-ping")?;
 
-    // 5. Install the admission broadcaster. Share the relay (`Arc<Mutex<_>>`)
-    //    between this guard and the broadcast closure the rank-0 engine thread
-    //    invokes per request. The closure assigns each request a monotonic id and
-    //    broadcasts a `WireRequest` to every worker, matching the old
-    //    `DistributedSchedulerGroup::submit` fanout. Broadcast failure here is
-    //    logged (not fatal) — a dead worker is surfaced by the relay EOF path; the
-    //    request still runs on rank 0, which is the only rank returning HTTP output.
+    // 5. Install the per-tick admission broadcaster. Share the relay
+    //    (`Arc<Mutex<_>>`) between this guard and the closure the rank-0 engine
+    //    loop invokes exactly once before every engine step. A broadcast failure
+    //    is a BROKEN LOCKSTEP (a worker missing one tick deadlocks the NCCL
+    //    group), so it is logged at error level — the hang that follows is then
+    //    attributable in the log instead of silent.
     let relay = Arc::new(Mutex::new(relay));
     let broadcast_relay = Arc::clone(&relay);
-    let next_request_id = std::sync::atomic::AtomicU64::new(1);
-    infer_api::set_admission_broadcaster(Box::new(move |prompt, max_tokens, sampling| {
-        let request_id = next_request_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let wire = WireRequest {
-            request_id,
-            prompt_tokens: prompt.to_vec(),
-            max_tokens,
-            sampling: sampling.clone(),
-        };
+    infer_api::set_tick_broadcaster(Box::new(move |seq, requests| {
         let mut coord = broadcast_relay
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(err) = coord.broadcast(&RelayEnvelope::Request { wire }) {
-            log::warn!(
-                "[multiproc-coord] admission broadcast for req#{request_id} failed: {err:#}"
+        if let Err(err) = coord.broadcast(&RelayEnvelope::TickAdmissions { seq, requests }) {
+            log::error!(
+                "[multiproc-coord] tick #{seq} admission broadcast failed — lockstep is broken, \
+                 expect an NCCL stall: {err:#}"
             );
         }
     }))
-    .context("install multiproc admission broadcaster")?;
+    .context("install multiproc tick broadcaster")?;
 
     Ok(Some(CoordinatorGuard {
         _relay: relay,
@@ -296,26 +305,32 @@ fn run_worker_mode(rank: usize) -> Result<()> {
         None
     };
 
-    // 2. Build the rank-R DSv4 engine. `LoadedInferenceEngine::load` dispatches
-    //    (CUDA build) to the DSv4 executor builder, which resolves TP rank R /
-    //    world-size + EP split + NCCL communicator from the env that the
-    //    coordinator set (`INFER_TP_RANK`, `INFER_TP_SIZE` / `INFER_CUDA_DEVICES`,
-    //    `INFER_NCCL_UNIQUE_ID` / `INFER_NCCL_ID_FILE`).
-    //
-    //    The engine is built so the NCCL group forms AND so the relay-receiver
-    //    loop below can submit each relayed request into it: the engine's own
-    //    background loop then drives the executor's `forward` (the NCCL collective)
-    //    in lockstep with rank 0.
-    log::info!("[arle-worker rank={rank}] building rank-{rank} DSv4 engine");
-    let engine: LoadedInferenceEngine =
-        LoadedInferenceEngine::load_with_config(&model_path, false, EngineLoadConfig::default())
-            .with_context(|| format!("worker rank {rank} engine build"))?;
-    log::info!("[arle-worker rank={rank}] engine built; entering relay-receiver loop");
+    // 2. Build the rank-R DSv4 engine from the coordinator's resolved config
+    //    (`ARLE_WORKER_ENGINE_CONFIG` — config parity is a lockstep invariant).
+    //    The executor resolves TP rank R / world-size + EP split + NCCL
+    //    communicator from the env the coordinator set (`INFER_TP_RANK`,
+    //    `INFER_TP_SIZE` / `INFER_CUDA_DEVICES`, `INFER_NCCL_UNIQUE_ID` /
+    //    `INFER_NCCL_ID_FILE`). Built directly on THIS thread (no background
+    //    engine loop): the lockstep driver below steps it exactly once per
+    //    relayed tick.
+    let engine_config: EngineLoadConfig = match std::env::var("ARLE_WORKER_ENGINE_CONFIG") {
+        Ok(json) => serde_json::from_str(&json)
+            .with_context(|| format!("worker rank {rank} ARLE_WORKER_ENGINE_CONFIG parse"))?,
+        Err(_) => {
+            anyhow::bail!(
+                "worker rank {rank} missing ARLE_WORKER_ENGINE_CONFIG (set by coordinator); \
+                 refusing to guess a config — divergent scheduler knobs deadlock the lockstep"
+            )
+        }
+    };
+    log::info!("[arle-worker rank={rank}] building rank-{rank} DSv4 engine ({engine_config:?})");
+    let engine = CudaWorkerEngine::load(&model_path, &engine_config)
+        .with_context(|| format!("worker rank {rank} engine build"))?;
+    log::info!("[arle-worker rank={rank}] engine built; entering lockstep driver");
 
-    // 3. Relay-receiver loop: submit each received request into the local engine
-    //    so its loop steps the executor in lockstep with rank 0.
+    // 3. Lockstep driver: one engine step per relayed `TickAdmissions`.
     if let Some(relay) = relay.as_mut() {
-        run_relay_receiver(rank, relay, &engine)?;
+        run_lockstep_driver(rank, relay, engine)?;
     }
 
     // 4. Block on the parent pipe — the coordinator closes the write end on
@@ -324,49 +339,47 @@ fn run_worker_mode(rank: usize) -> Result<()> {
     Ok(())
 }
 
-/// Drain the relay until EOF / shutdown, submitting each received request into
-/// the worker's local engine so its loop steps the executor in lockstep with
-/// rank 0.
+/// Drive the worker engine in lockstep: exactly one engine step per relayed
+/// `TickAdmissions`, after injecting that tick's admissions.
 ///
-/// Ported from the old worker relay-receiver thread
-/// (`e81b98fb^:infer/src/main.rs:486-540`): on each `RelayEnvelope::Request`, the
-/// worker reconstructed the `IncomingRequest` from the wire and called
-/// `permit.submit(req)` into its local scheduler, discarding the deltas (worker
-/// output never reaches the user). Here, the rewrite engine's `ServeHandle`
-/// background loop already owns the step/poll cycle, so the worker only needs to
-/// submit the reconstructed request and drop the ticket; the NCCL collective
-/// inside each `forward` is the implicit per-step barrier that keeps the worker's
-/// step cadence aligned with rank 0's.
+/// This mirrors the rank-0 engine loop's pairing (one `TickAdmissions` is sent
+/// before every rank-0 step), so every rank admits the same requests at the
+/// same step index and the planner — a pure function of engine state — builds
+/// identical plans, keeping the per-step NCCL collective sequences aligned.
+/// Both sides evaluate the same post-injection `is_idle()` (e.g. a request
+/// completed at ingress steps NOBODY). A `seq` gap means the relay dropped a
+/// tick — fatal: a worker missing one tick deadlocks the NCCL group, so dying
+/// loudly (the coordinator's pipe then reaps the rank) beats spinning.
 ///
-/// `// STAGE 2 (GPU-verify):` lockstep alignment — this assumes the worker's
-/// engine admits the same requests in the same order as rank 0 (guaranteed by the
-/// FIFO relay + rank-0's single ordered admission broadcast) so its deterministic
-/// planner builds the same per-step batches, and that the NCCL collective barriers
-/// any rank that races ahead. Confirm on hardware that no rank deadlocks or drifts.
-fn run_relay_receiver(
+/// Worker output is discarded — only rank 0 returns over HTTP.
+fn run_lockstep_driver(
     rank: usize,
     relay: &mut RelayWorker,
-    engine: &LoadedInferenceEngine,
+    mut engine: CudaWorkerEngine,
 ) -> Result<()> {
-    let mut count: usize = 0;
+    let mut next_seq: u64 = 0;
     loop {
         match relay.recv()? {
-            Some(RelayEnvelope::Request { wire }) => {
-                count += 1;
-                let request_id = wire.request_id;
-                let prompt_len = wire.prompt_tokens.len();
-                let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
-                // Submit into the local engine; its background loop drives the
-                // executor's NCCL `forward` in lockstep with rank 0. Worker output
-                // is discarded — only rank 0 returns over HTTP.
-                if let Err(err) = engine.submit_replicated(prompt_tokens, max_tokens, sampling) {
-                    log::warn!(
-                        "[arle-worker rank={rank}] submit for req#{request_id} failed: {err:#}"
-                    );
-                } else {
+            Some(RelayEnvelope::TickAdmissions { seq, requests }) => {
+                ensure!(
+                    seq == next_seq,
+                    "worker rank {rank} lockstep tick gap: got seq {seq}, expected {next_seq}"
+                );
+                next_seq += 1;
+                for wire in requests {
                     log::debug!(
-                        "[arle-worker rank={rank}] submitted req#{request_id} (prompt_tokens={prompt_len}, max_tokens={max_tokens})"
+                        "[arle-worker rank={rank}] tick #{seq} inject req#{} (prompt_tokens={}, max_tokens={})",
+                        wire.request_id,
+                        wire.prompt_tokens.len(),
+                        wire.max_tokens
                     );
+                    let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
+                    engine.inject(prompt_tokens, max_tokens, sampling);
+                }
+                if !engine.is_idle() {
+                    engine
+                        .step()
+                        .with_context(|| format!("worker rank {rank} step (tick #{seq})"))?;
                 }
             }
             Some(RelayEnvelope::BootPing { request_id }) => {
@@ -385,7 +398,7 @@ fn run_relay_receiver(
                 return Ok(());
             }
             None => {
-                log::info!("[arle-worker rank={rank}] relay EOF after {count} envelopes");
+                log::info!("[arle-worker rank={rank}] relay EOF after {next_seq} lockstep ticks");
                 return Ok(());
             }
         }

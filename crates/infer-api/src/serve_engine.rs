@@ -37,28 +37,6 @@ where
         }
     }
 
-    /// Submit a pre-tokenized prompt to the engine and discard its output.
-    ///
-    /// The multiproc worker (rank 1..N-1) path: a worker reconstructs each
-    /// relayed [`infer_server::WireRequest`] and submits it here so its local
-    /// engine loop drives the executor's `forward` (the NCCL collective) in
-    /// lockstep with rank 0. Only rank 0 returns HTTP output, so the worker
-    /// discards the completion. The submit is non-blocking (returns once the
-    /// engine assigns a handle); the dropped [`infer_server::RequestTicket`] lets
-    /// the engine free the slot on completion without anyone collecting.
-    pub fn submit_replicated(
-        &self,
-        prompt_tokens: Vec<u32>,
-        max_tokens: usize,
-        sampling: infer_plan::SamplingParams,
-    ) -> Result<()> {
-        let _ticket = self
-            .serve
-            .submit(prompt_tokens, max_tokens, sampling)
-            .map_err(|err| anyhow!("replicated worker submit failed: {err}"))?;
-        Ok(())
-    }
-
     /// Offload the engine's device weights to host RAM (OPD teacher weight
     /// time-share), returning the device bytes freed. Threads down to the backend
     /// executor on the engine thread via the [`ServeHandle`] control channel.

@@ -42,49 +42,56 @@ use anyhow::{Context, Result, bail};
 use infer_plan::SamplingParams;
 use serde::{Deserialize, Serialize};
 
-/// Process-global admission broadcaster: the rank-0 multiproc coordinator installs
-/// a closure here that ships a [`WireRequest`] to every worker rank. The engine
-/// loop's admission path ([`crate::execution`]) calls [`broadcast_admission`] at
-/// the single deterministic point each request enters the rank-0 [`infer_core::Engine`].
+/// Process-global per-tick admission broadcaster: the rank-0 multiproc
+/// coordinator installs a closure here that ships a
+/// [`RelayEnvelope::TickAdmissions`] to every worker rank. The rank-0 engine
+/// loop ([`crate::execution`]) calls [`broadcast_tick`] exactly once before
+/// every engine step (with the submissions drained for that tick — possibly
+/// none), so admission is PART of the lockstep instead of racing it.
 ///
-/// This is the Stage-2 successor to the old
-/// `DistributedSchedulerGroup::submit` broadcast (`e81b98fb^:infer/src/request_handle.rs:909`),
-/// which broadcast `RelayEnvelope::Request2 { wire }` to workers BEFORE the local
-/// `permit.submit(rank0_req)` under a `submission_lock`. In the rewrite stack the
-/// rank-0 `ServeHandle` is consumed by the axum router (it is not reachable from
-/// the CLI coordinator that owns the relay), so the broadcast hook crosses the
-/// crate boundary through this global instead of a direct handle reference.
-///
-/// `// STAGE 2 (GPU-verify):` admission ordering — `admit_submission` drains the
-/// MPSC submit channel in FIFO order and broadcasts each request from that single
-/// engine-thread site, so every rank's `Engine` admits the same requests in the
-/// same order and its deterministic planner builds identical per-step batches.
-/// This replicates the old `submission_lock`-serialized single-call-site ordering
-/// invariant; confirm on hardware that NCCL forwards stay aligned across ranks.
+/// Why per-tick and not per-request: with a free-running async relay, a request
+/// lands in rank 0's queue at T and in a worker's at T+δ; whichever rank's
+/// tick-top drain straddles T plans it one forward earlier than the others →
+/// divergent NCCL collective sequences → deadlock (measured 2026-06-10: tick-9
+/// fingerprints, `errors/2026-06-10-dsv4-c2-layer2-lockstep-admission-deadlock.md`).
+/// Per-tick broadcast is the SGLang `recv_requests` + `broadcast_pyobj` shape:
+/// every rank admits the same requests at the same step index by construction.
+/// Soundness preconditions (all hold on the CUDA path): executor `submit` is
+/// synchronous and `poll` always `Ready` (one forward per `Engine::step`),
+/// sampling is `(seed, position)`-deterministic, and plan-building is a pure
+/// function of engine state.
 ///
 /// Single-process serving (`world_size == 1`) never installs a broadcaster, so
-/// [`broadcast_admission`] is a cheap `None` load and the default serve path is
+/// [`tick_broadcaster_installed`] is false and the default serve path is
 /// byte-identical to before.
-type AdmissionBroadcaster = Box<dyn Fn(&[u32], usize, &SamplingParams) + Send + Sync>;
+type TickBroadcaster = Box<dyn Fn(u64, Vec<WireRequest>) + Send + Sync>;
 
-static ADMISSION_BROADCASTER: OnceLock<AdmissionBroadcaster> = OnceLock::new();
+static TICK_BROADCASTER: OnceLock<TickBroadcaster> = OnceLock::new();
 
-/// Install the process-global admission broadcaster (rank-0 coordinator only).
+/// Install the process-global per-tick admission broadcaster (rank-0
+/// coordinator only). Must happen at boot, before `serve_http` builds the
+/// rank-0 engine, so the engine loop observes it from its first tick.
 ///
-/// Returns an error if a broadcaster is already installed — a coordinator installs
-/// exactly once at boot before `serve_http` builds the rank-0 engine.
-pub fn set_admission_broadcaster(broadcaster: AdmissionBroadcaster) -> Result<()> {
-    ADMISSION_BROADCASTER
+/// Returns an error if a broadcaster is already installed.
+pub fn set_tick_broadcaster(broadcaster: TickBroadcaster) -> Result<()> {
+    TICK_BROADCASTER
         .set(broadcaster)
-        .map_err(|_| anyhow::anyhow!("admission broadcaster already installed"))
+        .map_err(|_| anyhow::anyhow!("tick broadcaster already installed"))
 }
 
-/// Invoke the installed admission broadcaster, if any. Called by the engine loop
-/// at the single ordered point a request enters the rank-0 [`infer_core::Engine`].
-/// A no-op (cheap `OnceLock` load returning `None`) on single-process serves.
-pub fn broadcast_admission(prompt: &[u32], max_tokens: usize, sampling: &SamplingParams) {
-    if let Some(broadcaster) = ADMISSION_BROADCASTER.get() {
-        broadcaster(prompt, max_tokens, sampling);
+/// Whether a tick broadcaster is installed (multiproc rank-0 coordinator).
+#[must_use]
+pub fn tick_broadcaster_installed() -> bool {
+    TICK_BROADCASTER.get().is_some()
+}
+
+/// Invoke the installed tick broadcaster. Called by the rank-0 engine loop
+/// exactly once per engine step, BEFORE the drained submissions are admitted
+/// locally. `seq` is the loop's monotonic tick counter; workers verify
+/// contiguity and treat a gap as a fatal protocol violation.
+pub fn broadcast_tick(seq: u64, requests: Vec<WireRequest>) {
+    if let Some(broadcaster) = TICK_BROADCASTER.get() {
+        broadcaster(seq, requests);
     }
 }
 
@@ -145,10 +152,15 @@ pub enum RelayEnvelope {
     /// Lightweight boot-ping / liveness envelope used at coordinator boot to
     /// validate every worker opened its relay end.
     BootPing { request_id: u64 },
-    /// Full per-request fanout payload — the coordinator's HTTP submission path
-    /// serializes one of these per incoming completion; every worker
-    /// reconstructs the `submit` args from it on receive.
-    Request { wire: WireRequest },
+    /// One engine tick's admissions, sent by rank 0 exactly once before every
+    /// engine step (empty `requests` for pure-decode ticks). Workers inject the
+    /// requests into their local engine and run exactly one step per envelope,
+    /// keeping admission-at-step-index identical on every rank. `seq` is
+    /// contiguous from 0; a gap on the worker side is a fatal protocol bug.
+    TickAdmissions {
+        seq: u64,
+        requests: Vec<WireRequest>,
+    },
     /// Worker-to-coordinator output for a remote visible-output owner rank.
     /// `// STAGE 2:` the visible-output owner routing is not wired yet; today
     /// every worker is a replicated-token follower with no visible output.
@@ -579,23 +591,26 @@ mod tests {
 
     #[test]
     fn envelope_round_trip() {
-        let env = RelayEnvelope::Request {
-            wire: WireRequest {
+        let env = RelayEnvelope::TickAdmissions {
+            seq: 5,
+            requests: vec![WireRequest {
                 request_id: 42,
                 prompt_tokens: vec![1, 2, 3, 4],
                 max_tokens: 16,
                 sampling: SamplingParams::default(),
-            },
+            }],
         };
         let bytes = serde_json::to_vec(&env).unwrap();
         let decoded: RelayEnvelope = serde_json::from_slice(&bytes).unwrap();
         match decoded {
-            RelayEnvelope::Request { wire } => {
-                assert_eq!(wire.request_id, 42);
-                assert_eq!(wire.prompt_tokens, vec![1, 2, 3, 4]);
-                assert_eq!(wire.max_tokens, 16);
+            RelayEnvelope::TickAdmissions { seq, requests } => {
+                assert_eq!(seq, 5);
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].request_id, 42);
+                assert_eq!(requests[0].prompt_tokens, vec![1, 2, 3, 4]);
+                assert_eq!(requests[0].max_tokens, 16);
             }
-            other => panic!("expected Request, got {other:?}"),
+            other => panic!("expected TickAdmissions, got {other:?}"),
         }
     }
 
@@ -612,11 +627,12 @@ mod tests {
             // Receive one envelope, then EOF on shutdown.
             let env = worker.recv().unwrap().expect("envelope");
             match env {
-                RelayEnvelope::Request { wire } => {
-                    assert_eq!(wire.request_id, 7);
-                    assert_eq!(wire.prompt_tokens, vec![100, 200]);
+                RelayEnvelope::TickAdmissions { seq, requests } => {
+                    assert_eq!(seq, 0);
+                    assert_eq!(requests[0].request_id, 7);
+                    assert_eq!(requests[0].prompt_tokens, vec![100, 200]);
                 }
-                _ => panic!("expected Request"),
+                _ => panic!("expected TickAdmissions"),
             }
             let next = worker.recv().unwrap();
             assert!(next.is_none(), "expected EOF after coordinator drop");
@@ -627,13 +643,14 @@ mod tests {
             .expect("worker connected within 5s");
         assert_eq!(coord.worker_ranks(), vec![1]);
         coord
-            .broadcast(&RelayEnvelope::Request {
-                wire: WireRequest {
+            .broadcast(&RelayEnvelope::TickAdmissions {
+                seq: 0,
+                requests: vec![WireRequest {
                     request_id: 7,
                     prompt_tokens: vec![100, 200],
                     max_tokens: 1,
                     sampling: SamplingParams::default(),
-                },
+                }],
             })
             .unwrap();
         drop(coord);
@@ -661,11 +678,12 @@ mod tests {
                     .unwrap();
             let env = worker.recv().unwrap().expect("targeted envelope");
             match env {
-                RelayEnvelope::Request { wire } => {
-                    assert_eq!(wire.request_id, 9);
-                    assert_eq!(wire.prompt_tokens, vec![9]);
+                RelayEnvelope::TickAdmissions { seq, requests } => {
+                    assert_eq!(seq, 3);
+                    assert_eq!(requests[0].request_id, 9);
+                    assert_eq!(requests[0].prompt_tokens, vec![9]);
                 }
-                other => panic!("expected Request, got {other:?}"),
+                other => panic!("expected TickAdmissions, got {other:?}"),
             }
             assert!(worker.recv().unwrap().is_none());
         });
@@ -677,13 +695,14 @@ mod tests {
         coord
             .send_to_ranks(
                 &[2],
-                &RelayEnvelope::Request {
-                    wire: WireRequest {
+                &RelayEnvelope::TickAdmissions {
+                    seq: 3,
+                    requests: vec![WireRequest {
                         request_id: 9,
                         prompt_tokens: vec![9],
                         max_tokens: 1,
                         sampling: SamplingParams::default(),
-                    },
+                    }],
                 },
             )
             .unwrap();
@@ -704,7 +723,9 @@ mod tests {
                 RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, world_size)
                     .unwrap();
             match worker.recv().unwrap().expect("request signal") {
-                RelayEnvelope::Request { wire } => assert_eq!(wire.request_id, 11),
+                RelayEnvelope::TickAdmissions { requests, .. } => {
+                    assert_eq!(requests[0].request_id, 11);
+                }
                 other => panic!("expected request signal, got {other:?}"),
             }
             worker
@@ -732,13 +753,14 @@ mod tests {
         coord
             .send_to_ranks(
                 &[1],
-                &RelayEnvelope::Request {
-                    wire: WireRequest {
+                &RelayEnvelope::TickAdmissions {
+                    seq: 0,
+                    requests: vec![WireRequest {
                         request_id: 11,
                         prompt_tokens: vec![11],
                         max_tokens: 1,
                         sampling: SamplingParams::default(),
-                    },
+                    }],
                 },
             )
             .unwrap();
