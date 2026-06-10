@@ -1,55 +1,53 @@
 # ARLE Roadmap
 
-Updated 2026-05-25. Derived planning surface. On any conflict the canonical
+Updated 2026-06-10. Derived planning surface. On any conflict the canonical
 doc wins:
 
-- Strategic master: [`docs/projects/2026-05-07-arle-master-strategy.md`](docs/projects/2026-05-07-arle-master-strategy.md)
+- Strategic master: [`docs/projects/2026-06-10-arle-master-strategy-v2.md`](docs/projects/2026-06-10-arle-master-strategy-v2.md)
 - Support status: [`docs/support-matrix.md`](docs/support-matrix.md)
 - Workspace topology: [`docs/codebase-map.md`](docs/codebase-map.md)
 - Architecture boundaries: [`docs/architecture.md`](docs/architecture.md)
 - Benchmark process: [`docs/bench-and-trace-spec.md`](docs/bench-and-trace-spec.md)
-- OPD mainline queue:
-  [`docs/projects/2026-05-24-opd-mainline-task-backlog.md`](docs/projects/2026-05-24-opd-mainline-task-backlog.md)
 - Contributor contract: [`AGENTS.md`](AGENTS.md)
 
 ## Positioning
 
-ARLE is a Rust-native inference runtime with integrated local agent and
-**On-Policy Distillation (OPD)** workflows. Runtime stays primary: `infer`
-owns serving truth; `arle` is the unified front door; OPD train
-strengthens the runtime loop (teacher in `infer`, student LoRA on the same
-backend), it does not fork a second product identity. Scratch pretrain,
-SFT, GRPO, and multi-turn RL surfaces were retired 2026-05-18 — see
-[`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md).
+ARLE is a Rust-native, device-neutral inference runtime with integrated
+local agent and **On-Policy Distillation (OPD)** workflows. The serving
+truth is the `infer-*` rewrite stack (`infer-plan` → `infer-seam` →
+`infer-core` → `infer-cuda`/`infer-metal` → `infer-server`/`infer-api`);
+the monolithic `infer` crate was deleted 2026-06-04. `arle` is the unified
+front door. Product mainline = coding-agent runtime (local Metal
+single-user + self-hosted CUDA multi-tenant). DSv4-Flash on 8×H20 is the
+technical wedge and engine forge, not a separate product line. Training
+is OPD-only (2026-05-18 pivot — see
+[`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md)).
 
-## Active Priorities
+## Active Priorities (strict serial — master strategy v2 §3)
 
-| # | Goal | Anchor |
-| --- | --- | --- |
-| **P0** | **DeepSeek V4 8xH20 readiness** — DSv4 DeepEP decode is the active hot path. Default B=1 padded BF16 reduce-scatter combine + fused local-expert prepare + broad scratch reuse landed; `decode64` 12.05 post-first tok/s, isolated single-token wave 87.7 ms. Remaining: NCCL SendRecv/AllReduce, FP8/FP4 expert GEMV (awaits true grouped GEMM / DeepGEMM), launch churn. | [`docs/projects/2026-05-01-deepseek-v4-readiness.md`](docs/projects/2026-05-01-deepseek-v4-readiness.md), [`docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md) |
-| **P0'** | **32k–128k long-context world-#1 mission** — Phase 1 SGLang-row closed (`1.609x` mean at W1/c4); Phase 2 spec-decode plumbing landed but first end-to-end bench regressed (9.73 tok/s, -62.8% vs Phase 1), blocked on packed K+1 verifier / MagicDec sparse-KV self-spec / Qwen3.5 recurrent-state rollback. vLLM / TRT-LLM / Mooncake baseline panel still required for full world-#1 claim. | [`docs/projects/2026-04-30-longctx-32k-128k-leadership.md`](docs/projects/2026-04-30-longctx-32k-128k-leadership.md), [`docs/plans/2026-05-01-longctx-spec-decode-phase2.md`](docs/plans/2026-05-01-longctx-spec-decode-phase2.md) |
-| **P0''** | **Single-node multi-GPU F0–F4 scaffold** — F0 NCCL group-coordinator smoke + 2-thread `all_reduce` proven; F1 shard-aware BF16 `TpLoadContext` landed; F2 Qwen3.5 TP forward sharding wired through `LayerCommunicator` (TP=1 no-op, TP>1 fails fast until production NCCL forward collectives land); F3/F4 PP + EP scaffolds present. Gated on F2 collective wire-up + TP=2 H20 throughput bench. | [`docs/projects/2026-05-01-multi-gpu-f0-readiness.md`](docs/projects/2026-05-01-multi-gpu-f0-readiness.md) |
-| **P1** | Finish the `infer`-side observability spine: throughput, TTFT, ITL, queue shape, `ncu`, `nsys`, sampled traces on one operator surface. | [`docs/plans/infer-observability-v1.md`](docs/plans/infer-observability-v1.md) |
-| **P2** | Push tiered KV from a strong local CUDA path toward validated staged readmission + remote/shared backends. | [`docs/projects/tiered-kv-cache.md`](docs/projects/tiered-kv-cache.md), [`docs/plans/tiered-kv-hicache-readmission.md`](docs/plans/tiered-kv-hicache-readmission.md) |
-| **P3** | Finish serving-grade Metal batching and long-context closure without forking runtime truth away from CUDA. | [`docs/projects/mlx-backend-roadmap.md`](docs/projects/mlx-backend-roadmap.md) |
-| **P4** | OPD-only training substrate. Teacher in `infer`, student LoRA on the same backend. Pretrain / SFT / GRPO / multi-turn surfaces deleted 2026-05-18. Current execution runs through the 2026-05-24 mainline backlog: `arle train opd --student-model <dir>` is wired end-to-end, P5 pure-OPD 5k capability eval is preflighted, chunked-KL and KV-tier observability are code-landed, and GPU benches/evals remain deferred until P5 releases the GPU. | [`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md), [`docs/projects/2026-05-24-opd-mainline-task-backlog.md`](docs/projects/2026-05-24-opd-mainline-task-backlog.md), [`docs/experience/wins/2026-05-25-capability-eval-preflight.md`](docs/experience/wins/2026-05-25-capability-eval-preflight.md) |
+| Phase | Goal | Exit condition | Anchor |
+| --- | --- | --- | --- |
+| **0 — Debt** | Long-ctx correctness closeout (seq≥241 residual, same-config-twice control), 256K admission band-aid → real fix, KV-precision-parity audit re-port to `infer-cuda`, truth-surface resync (this doc series). | All four items closed; parity harness unlocks the gated FlashMLA/fused-wqkv/contig-MoE default flips. | v2 §3 Phase 0 |
+| **1 — Batched serving lane (keystone)** | True batched lowering per [`unified-batched-kvpool-abstraction`](docs/plans/2026-06-07-unified-batched-kvpool-abstraction.md) (`KvBatchDescriptor` + `ModelKvAdapter`, DSv4 first). `cd421794` (sequential plan-split, c≥2 no longer crashes) is the starting point, not the goal. | c-sweep clears TTFT+ITL+tok/s per bench spec; then deepep_ll-vs-allreduce A/B at its real lane, license-or-kill. | v2 §3 Phase 1 |
+| **2 — Spec decode default-good** | Frozen-KV MTP on DSv4 (checkpoint-native draft head, no training). First step: cheap acceptance measurement on coherent workloads (GSM8K/ShareGPT) — the biggest unverified hypothesis. | Spec-on as default; wall-clock net win at B=1 + long-ctx; H20 target ~8–10 ms/token. | [frozen-KV design](docs/plans/2026-06-06-dsv4-frozen-kv-mtp-redesign.md), v2 §3 Phase 2 |
+| **3 — Product re-aim** | W3/W4 cross-engine baseline (owed since 2026-05-02), long-ctx mission restart on the new substrate, OPD GPU experiments resume, Qwen3.6 CUDA via the second `ModelKvAdapter`. | Per-item; mission threshold ≥1.30 stands. | v2 §3 Phase 3 |
+
+Killed/deferred work (B=1 per-kernel levers, deepep_ll default-on,
+classical spec, 5–6 ms-on-H20 framing, FlashInfer migration, ROCm, …) is
+enumerated in master strategy v2 §5 — re-doing a KILLED item requires
+overturning its evidence first.
 
 ## Next-Model Priority Order
 
-Currently shipped: Qwen3.5-family. Going forward the model-coverage
-queue is ranked, not parallel:
+Currently shipped: Qwen3.5-family (CUDA + Metal), DSv4-Flash (CUDA 8×H20).
+The model-coverage queue is ranked, not parallel:
 
-1. **DeepSeek V4 (DS4)** — highest priority. V4-only spec, registry, train
-   bootstrap, and CPU reference HTTP smoke have landed against
-   `infer/models/dsv4-mini-1B-init`; CUDA V4 hybrid attention + MoE + MTP
-   kernels are the active substrate (see P0).
-2. **Qwen 3.6** — second priority, planned. Metal already loads
-   `mlx-community/Qwen3.6-35B-A3B-4bit` for diagnostic use; CUDA serving and
-   DFlash long-context evidence land after DS4's runtime substrate is
-   producing benches.
+1. **DeepSeek V4 (DSv4-Flash)** — active substrate (Phase 0–2 above).
+2. **Qwen 3.6** — second priority. Metal canonical model today; CUDA
+   serving lands as the second `ModelKvAdapter` (Phase 3).
 
-Other families in the support matrix (Llama 3 / 4, DeepSeek V3/R1, Mistral /
-Mixtral / Gemma / Phi) sit behind these two and are not actively scheduled.
+Other families in the support matrix sit behind these two and are not
+actively scheduled.
 
 ## History
 
