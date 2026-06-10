@@ -316,7 +316,10 @@ extern "C" CUresult dsv4_mhc_params_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (num_tokens == 0) return CUDA_SUCCESS;
-  dsv4_mhc_params_kernel<<<num_tokens, DSV4_MHC_BLOCK, 0, (cudaStream_t)stream>>>(
+  // One block reads the whole hc-stream row (32KB at H=4096, hc_mult=4) for
+  // the rms factor alone: 1024 threads. Microbench (idle-GPU CUDA timing,
+  // examples/dsv4_microbench): 16.22us @256 -> 8.51us @1024 (-48%).
+  dsv4_mhc_params_kernel<<<num_tokens, 1024, 0, (cudaStream_t)stream>>>(
       residual, mixes, base, scale, pre, post, comb, num_tokens,
       residual_hidden_dim, mix_dim, hc_mult, eps, sinkhorn_iters);
   return (CUresult)cudaGetLastError();
@@ -401,7 +404,9 @@ extern "C" CUresult dsv4_mhc_pre_rms_norm_cuda(
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
     if (attr != cudaSuccess) return (CUresult)attr;
   }
-  dsv4_mhc_pre_rms_norm_kernel<<<num_tokens, DSV4_MHC_BLOCK, shmem,
+  // Same single-block-bandwidth shape: 9.70us @256 -> 4.80us @1024 (-51%),
+  // examples/dsv4_microbench.
+  dsv4_mhc_pre_rms_norm_kernel<<<num_tokens, 1024, shmem,
                                  (cudaStream_t)stream>>>(
       residual, pre, weight, out, num_tokens, hidden_size, hc_mult, eps);
   return (CUresult)cudaGetLastError();
