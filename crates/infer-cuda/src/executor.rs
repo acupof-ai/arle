@@ -1191,17 +1191,52 @@ impl Dsv4CudaExecutor {
             });
         }
 
+        // Mixed / multi-prefill plans split into per-prefill single-row
+        // sub-steps plus one decode sub-batch. Plan rows always address
+        // disjoint slots (a request is either Prefilling or Decoding), so the
+        // sequential sub-steps are math-identical to consecutive single-mode
+        // ticks. Descriptor commit order is prefill rows first, then decode
+        // rows (`KvBatchDescriptor::from_plan`), mapping plan rows onto
+        // descriptor rows by index.
         ensure!(
-            plan.decode_rows.is_empty() && plan.prefill_rows.len() == 1,
-            "DSv4 CUDA prefill/mixed forward is single-row only, got {} prefill + {} decode rows",
-            plan.prefill_rows.len(),
-            plan.decode_rows.len()
+            kv_batch.rows.len() == rows,
+            "DSv4 KV batch descriptor has {} rows for a {rows}-row plan",
+            kv_batch.rows.len()
         );
-
-        let row = plan
+        let mut seen_slots = std::collections::BTreeSet::new();
+        for slot in plan
             .prefill_rows
-            .first()
-            .expect("prefill row present after empty-prefill branch");
+            .iter()
+            .map(|row| row.slot)
+            .chain(plan.decode_rows.iter().map(|row| row.slot))
+        {
+            ensure!(
+                seen_slots.insert(slot),
+                "DSv4 plan schedules slot {slot} more than once per tick"
+            );
+        }
+
+        let n_prefill = plan.prefill_rows.len();
+        let mut tokens = Vec::with_capacity(rows);
+        for (idx, row) in plan.prefill_rows.iter().enumerate() {
+            let sub_batch = kv_batch.subset(idx..idx + 1)?;
+            tokens.extend(self.submit_prefill_row(row, &sub_batch)?);
+        }
+        if !plan.decode_rows.is_empty() {
+            let sub_batch = kv_batch.subset(n_prefill..kv_batch.rows.len())?;
+            tokens.extend(self.forward_decode_batch(&plan.decode_rows, &sub_batch)?);
+        }
+        Ok(StepOutput { tokens })
+    }
+
+    /// One prefill row as its own single-row sub-step. `kv_batch` must be the
+    /// row's single-row (sub-)descriptor — indistinguishable from what a
+    /// prefill-only tick delivers.
+    fn submit_prefill_row(
+        &mut self,
+        row: &infer_plan::PrefillRow,
+        kv_batch: &KvBatchDescriptor,
+    ) -> Result<Vec<SlotToken>> {
         validate_dsv4_prefill_kv_batch(row, kv_batch)?;
         let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
         validate_dsv4_prefill_kv_view(row, &kv_view)?;
@@ -1218,7 +1253,7 @@ impl Dsv4CudaExecutor {
         }
         let position = (row.start_pos + row.tokens.len()) as u64;
         let final_prefill = row.start_pos + row.tokens.len() >= row.total_tokens;
-        let token = self.forward_prefill_tokens(
+        let tokens = self.forward_prefill_tokens(
             row.slot,
             &row.tokens,
             row.start_pos,
@@ -1227,18 +1262,15 @@ impl Dsv4CudaExecutor {
             final_prefill,
         )?;
         let slot = row.slot;
-
-        Ok(StepOutput {
-            tokens: token
-                .into_iter()
-                .map(|token| SlotToken {
-                    slot,
-                    token,
-                    logprob: None,
-                    finish: None,
-                })
-                .collect(),
-        })
+        Ok(tokens
+            .into_iter()
+            .map(|token| SlotToken {
+                slot,
+                token,
+                logprob: None,
+                finish: None,
+            })
+            .collect())
     }
 
     pub(crate) fn verify_forward_selftest(&mut self, prompt: &[u32]) -> Result<()> {
