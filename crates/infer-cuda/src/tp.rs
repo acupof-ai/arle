@@ -380,7 +380,7 @@ impl TpRuntime {
                 }
                 let host = ctx
                     .stream
-                    .memcpy_dtov(&buf)
+                    .clone_dtoh(&buf)
                     .map_err(|e| anyhow::anyhow!("scalar all-reduce dtoh failed: {e}"))?;
                 Ok(host[0])
             }
