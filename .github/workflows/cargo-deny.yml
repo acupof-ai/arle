@@ -1,10 +1,32 @@
 name: Cargo Deny
 
+# Dependency-graph gates only fire when the dependency graph can change.
+# The weekly cron catches newly-published advisories against an unchanged
+# Cargo.lock — pushes alone would never re-check those.
+
 on:
   push:
     branches: [main, master]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/*/Cargo.toml'
+      - 'deny.toml'
+      - '.github/workflows/cargo-deny.yml'
   pull_request:
     branches: [main, master]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/*/Cargo.toml'
+      - 'deny.toml'
+      - '.github/workflows/cargo-deny.yml'
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   cargo-deny:
@@ -13,11 +35,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
-
+      # Prebuilt binary — the old `cargo install cargo-deny` compiled it
+      # from source on every push (~2-3 min of pure waste).
       - name: Run cargo deny
-        run: cargo deny check advisories bans licenses sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
