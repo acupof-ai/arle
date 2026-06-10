@@ -66,8 +66,33 @@ pub enum ncclRedOp_t {
     Avg = 4,
 }
 
+/// Opaque NCCL window handle (`ncclWindow_t`, NCCL >= 2.27).
+#[allow(non_camel_case_types)]
+pub type ncclWindow_t = *mut std::os::raw::c_void;
+
+/// `ncclCommWindowRegister` flag requesting symmetric-collective eligibility
+/// (NCCL >= 2.27 low-latency symmetric kernels; `NCCL_WIN_COLL_SYMMETRIC`).
+pub const NCCL_WIN_COLL_SYMMETRIC: i32 = 1;
+
 unsafe extern "C" {
     pub fn ncclGetUniqueId(unique_id: *mut ncclUniqueId) -> ncclResult_t;
+    /// NCCL >= 2.27: allocate device memory eligible for window registration
+    /// (symmetric low-latency kernels require `ncclMemAlloc`'d or VMM-aligned
+    /// buffers, not plain `cudaMalloc`).
+    pub fn ncclMemAlloc(ptr: *mut *mut std::os::raw::c_void, size: usize) -> ncclResult_t;
+    pub fn ncclMemFree(ptr: *mut std::os::raw::c_void) -> ncclResult_t;
+    /// NCCL >= 2.27: register `buff` as a window over `comm`. With
+    /// [`NCCL_WIN_COLL_SYMMETRIC`], collectives whose operands are all
+    /// symmetric windows take the low-latency symmetric kernels.
+    /// COLLECTIVE over `comm`: every rank must call it together.
+    pub fn ncclCommWindowRegister(
+        comm: ncclComm_t,
+        buff: *mut std::os::raw::c_void,
+        size: usize,
+        win: *mut ncclWindow_t,
+        win_flags: i32,
+    ) -> ncclResult_t;
+    pub fn ncclCommWindowDeregister(comm: ncclComm_t, win: ncclWindow_t) -> ncclResult_t;
     pub fn ncclCommInitRank(
         comm: *mut ncclComm_t,
         world_size: i32,

@@ -5,6 +5,8 @@ pub type Half = u16;
 
 #[path = "ffi/attention.rs"]
 pub mod attention;
+#[path = "ffi/comm.rs"]
+pub mod comm;
 #[path = "ffi/elementwise.rs"]
 pub mod elementwise;
 #[path = "ffi/embedding.rs"]
