@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="ARLE logo">
+  <line x1="14" y1="48" x2="82" y2="48" stroke="#D97757" stroke-width="2"/>
+  <rect x="6" y="40" width="16" height="16" fill="#D97757"/>
+  <circle cx="48" cy="48" r="10" fill="none" stroke="#D97757" stroke-width="2"/>
+  <circle cx="48" cy="48" r="3" fill="#D97757"/>
+  <rect x="74" y="40" width="16" height="16" fill="none" stroke="#D97757" stroke-width="2"/>
+</svg>
