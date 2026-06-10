@@ -56,11 +56,21 @@ ensures; TP=1 byte-identical by construction (all sharding behind
   `cargo test -p infer-cuda` 43/43 (4 new shard tests: fused-qkv block shard
   TP∈{2,4}, gated q/gate row pairing, single-GPU identity, indivisible-heads
   rejection); `infer-core` 33/33; clippy zero new warnings.
-- **pending-remote (2×H20):** TP=2 boot of Qwen3.6-35B-A3B, correct-inference
-  gate (same-config-twice floor + needle + self-consistency, NOT byte-vs-TP1 —
-  MoE non-determinism), c=2 long-prompt admission A/B (the original E3), and
-  tok/s vs TP=1-on-paper. Blocked until the resident DSv4 serve vacates ≥2
-  GPUs.
+- **Pod TP=2 run (2026-06-11, GPUs 0,1, built at `bddf174c` + stacked-expert
+  loader `b729f8e2`): mechanics LICENSED, numerics BLOCKED.**
+  - LICENSED: 67 GB stacked-expert load with per-rank EP ranges (~85 s),
+    multiproc spawn via the lifted gate, NCCL init, rank-1 lockstep driver,
+    greedy outputs byte-identical across ranks and across same-config ×3,
+    decode 49.9 tok/s (TP=2) vs 36.4 (TP=1) on the same shape (+37%, single
+    run, contention-free box).
+  - BLOCKED: output is degenerate — but **TP=1 with the same binary +
+    checkpoint is equally degenerate**, so the defect is in the base rewrite
+    Qwen35 forward / stacked loader, NOT the TP sharding (which takes zero
+    branches at TP=1). Tracked in
+    [`errors/2026-06-11-qwen35-cuda-rewrite-35b-degenerate-output.md`](../errors/2026-06-11-qwen35-cuda-rewrite-35b-degenerate-output.md).
+  - The c=2 admission A/B (original E3) additionally needs the single-row
+    executor limit lifted (a 2-row decode plan kills the engine thread by
+    design today).
 
 ## Rule
 
