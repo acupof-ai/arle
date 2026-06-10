@@ -334,10 +334,12 @@ pub(crate) struct ServeArgs {
     pub(crate) spec_type: ServeSpecTypeArg,
 
     /// Multi-GPU collective backend for small decode-path messages (CUDA
-    /// multi-rank only). `auto` (default) boots the one-shot custom AR/AG with
-    /// a self-test and degrades to NCCL loudly on any probe failure; `nccl`
-    /// forces plain NCCL everywhere (escape hatch).
-    #[arg(long, value_enum, default_value_t = ServeCommBackendArg::Auto)]
+    /// multi-rank only). `nccl` (default): plain NCCL — the 2026-06-10 matched
+    /// A/B measured the one-shot path wall-neutral on single-node H20 (the
+    /// decode wall is rank-skew-bound, not protocol-bound). `auto` boots the
+    /// one-shot custom AR/AG with a self-test and loud degrade — kept for
+    /// multi-node and the fused-AR+norm follow-up.
+    #[arg(long, value_enum, default_value_t = ServeCommBackendArg::Nccl)]
     pub(crate) comm_backend: ServeCommBackendArg,
 
     /// External split MTP drafter model path or HuggingFace repo for Metal.
