@@ -51,6 +51,10 @@ check-cuda:
 # ── Platform-agnostic ─────────────────────────────────────────────────────────
 test:
 	cargo test -p agent-infer --release --no-default-features --features cpu,no-cuda,cli
+	cargo test --release \
+		-p infer-core -p infer-server -p infer-plan -p infer-seam \
+		-p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
+	cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys --release
 
 test-py:
 	pytest tests/python/ -x
