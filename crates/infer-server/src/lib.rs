@@ -535,7 +535,18 @@ mod tests {
 
         // After ticks ran, the snapshot reflects the (now idle) engine: requests
         // drained and the KV pool restored to its non-zero free-page count.
-        let snap = serve.counters();
+        // The completion reaches the collector BEFORE the engine's next tick
+        // publishes the post-drain snapshot, so poll briefly instead of racing
+        // the engine thread (one-shot read flaked on slow CI runners).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let snap = loop {
+            let snap = serve.counters();
+            let drained = snap.active_requests == 0 && snap.queue_depth == 0;
+            if drained || std::time::Instant::now() >= deadline {
+                break snap;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert_eq!(snap.active_requests, 0, "request drained");
         assert_eq!(snap.queue_depth, 0, "queue drained");
         assert!(
