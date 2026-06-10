@@ -552,7 +552,15 @@ impl QwenCudaExecutor {
         ensure!(self.num_slots > 0, "warmup needs at least one slot");
         let dummy_slot = 0usize;
         self.kv.mirror_slot(dummy_slot, &[0], 1)?;
-        let capture_result = self.capture_decode_for_current_state(dummy_slot, 0, 0);
+        // Two passes: `CudaGraphState` warms one eager run before its first
+        // capture (universal JIT-in-capture guard), so a single call here
+        // would only warm and silently push the capture onto the first real
+        // request. First call = eager warm (also flushes lazy module loads
+        // outside capture), second = the boot-time capture this warmup
+        // promises.
+        let capture_result = self
+            .capture_decode_for_current_state(dummy_slot, 0, 0)
+            .and_then(|()| self.capture_decode_for_current_state(dummy_slot, 0, 0));
         self.kv.mirror_slot(dummy_slot, &[], 0)?;
         capture_result?;
         self.model.ctx.sync()?;
