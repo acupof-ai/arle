@@ -142,6 +142,11 @@ guard)、Qwen/Gemma 的 engine-generic 复用。wall-clock @4096 实测 c=8 仅 
 3. **OPD 拿回 GPU 时间**:rollout O(n²) 线程重启;capability 评估按 multi-seed gate。
 4. **Qwen3.6 CUDA serving**(Next-Model #2):`ModelKvAdapter` 第二个实现,验证抽象的
    engine-generic 承诺。
+5. **AIPC 路线**(ckl directive 2026-06-10,#71):Metal 单用户收敛(继承 Phase 1 批量
+   抽象,c=1 SLO gate)+ HIP/ROCm 第三后端 —— `infer-hip` 只实现两个 host-only trait,
+   zero `infer-core` 改动是验收线(moat 主张变成可测命题)。本地统一内存硬件
+   (M-series / Ryzen AI Max 级),不与 8×H20 pod 抢占;§5 的 ROCm DEFER 仅指
+   Phase 0-2,在此入队。
 
 ---
 
@@ -166,7 +171,7 @@ guard)、Qwen/Gemma 的 engine-generic 复用。wall-clock @4096 实测 c=8 仅 
 | DSA-skip lever | **KILLED**(−3.7%,压缩是必要计算)| `5b10d6b5` |
 | 5-6 ms/token 当 H20 目标 | **KILLED**(H100 数字;H20 真目标 ~16ms no-spec / ~8ms +MTP)| 同 pod SGLang A/B |
 | hand-rolled kernel 先行(vs adopt-official)| **纪律性 KILL** | adopt-official retro |
-| FlashInfer 迁移 / tiered-KV readmission / ROCm 第三后端 / Qwen3.5 Medusa | **DEFER**,不进 Phase 0-2 | 各自 plan 在案 |
+| FlashInfer 迁移 / tiered-KV readmission / ROCm 第三后端 / Qwen3.5 Medusa | **DEFER**,不进 Phase 0-2(ROCm 自 Phase 3 起以 AIPC 路线入队,#71)| 各自 plan 在案 |
 
 ## §6 不确定性(显式,license-or-kill 解除)
 
