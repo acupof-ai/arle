@@ -18,7 +18,10 @@ release/
 models/
 .DS_Store
 .context/
-/vendor/
+# Build-time-fetched official kernels stay untracked; the llama.cpp
+# reference-kernel copy (pinned, see its README) is committed.
+/vendor/*
+!/vendor/llama.cpp/
 bench-output/
 opd-output/
 runs/
