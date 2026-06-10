@@ -102,6 +102,50 @@ impl KvBatchDescriptor {
         )
     }
 
+    /// Re-rooted sub-descriptor over `rows[range]`, with token/page ranges
+    /// rebased so the result is indistinguishable from a descriptor built for
+    /// just those rows. Backends that split a mixed plan into per-mode
+    /// sub-steps use this to keep single-mode validation invariants (e.g.
+    /// "a prefill descriptor has exactly one row") intact.
+    pub fn subset(&self, range: Range<usize>) -> Result<Self> {
+        ensure!(
+            range.start < range.end && range.end <= self.rows.len(),
+            "KV batch subset {range:?} outside {} rows",
+            self.rows.len()
+        );
+        let mut desc = Self {
+            mode: ForwardMode::Idle,
+            rows: Vec::with_capacity(range.len()),
+            flat_token_ids: Vec::new(),
+            flat_page_ids: Vec::new(),
+        };
+        let mut has_prefill = false;
+        let mut has_decode = false;
+        for row in &self.rows[range] {
+            match row.kind {
+                KvBatchRowKind::Prefill => has_prefill = true,
+                KvBatchRowKind::Decode => has_decode = true,
+            }
+            let token_start = desc.flat_token_ids.len();
+            desc.flat_token_ids
+                .extend_from_slice(&self.flat_token_ids[row.token_range.clone()]);
+            let page_start = desc.flat_page_ids.len();
+            desc.flat_page_ids
+                .extend_from_slice(&self.flat_page_ids[row.page_range.clone()]);
+            desc.rows.push(KvBatchRow {
+                token_range: token_start..desc.flat_token_ids.len(),
+                page_range: page_start..desc.flat_page_ids.len(),
+                ..row.clone()
+            });
+        }
+        desc.mode = match (has_prefill, has_decode) {
+            (true, false) => ForwardMode::Prefill,
+            (false, true) => ForwardMode::Decode,
+            _ => ForwardMode::Mixed,
+        };
+        Ok(desc)
+    }
+
     fn push_row(
         &mut self,
         slot: usize,
@@ -364,6 +408,86 @@ mod tests {
         assert_eq!(row.slot_epoch, 3);
         assert_eq!(row.token_range, 0..3);
         assert_eq!(row.page_range, 0..2);
+    }
+
+    #[test]
+    fn subset_rebases_mixed_descriptor_into_single_mode_descriptors() {
+        let kv = MockKvPool::new(
+            4,
+            vec![
+                MockSlot {
+                    seq_len: 7,
+                    epoch: 3,
+                    pages: vec![30, 31],
+                },
+                MockSlot {
+                    seq_len: 5,
+                    epoch: 7,
+                    pages: vec![10, 11],
+                },
+                MockSlot {
+                    seq_len: 9,
+                    epoch: 8,
+                    pages: vec![20, 21, 22],
+                },
+            ],
+        );
+        let plan = ForwardPlan {
+            mode: ForwardMode::Mixed,
+            decode_rows: vec![
+                DecodeRow {
+                    slot: 1,
+                    last_token: 101,
+                    kv_seq_len: 4,
+                    params: params(),
+                },
+                DecodeRow {
+                    slot: 2,
+                    last_token: 202,
+                    kv_seq_len: 8,
+                    params: params(),
+                },
+            ],
+            prefill_rows: vec![PrefillRow {
+                slot: 0,
+                tokens: vec![11, 12, 13],
+                start_pos: 4,
+                total_tokens: 7,
+                params: params(),
+            }],
+            microbatch: None,
+            spec: None,
+        };
+        let desc = KvBatchDescriptor::from_plan(&plan, &kv).unwrap();
+        assert_eq!(desc.rows.len(), 3);
+
+        // Prefill sub-descriptor: identical to a prefill-only tick's descriptor.
+        let prefill = desc.subset(0..1).unwrap();
+        assert!(matches!(prefill.mode, ForwardMode::Prefill));
+        assert_eq!(prefill.flat_token_ids, vec![11, 12, 13]);
+        assert_eq!(prefill.flat_page_ids, vec![30, 31]);
+        assert_eq!(prefill.rows.len(), 1);
+        assert_eq!(prefill.rows[0].kind, KvBatchRowKind::Prefill);
+        assert_eq!(prefill.rows[0].slot, 0);
+        assert_eq!(prefill.rows[0].token_range, 0..3);
+        assert_eq!(prefill.rows[0].page_range, 0..2);
+
+        // Decode sub-descriptor: ranges rebased to its own flat buffers.
+        let decode = desc.subset(1..3).unwrap();
+        assert!(matches!(decode.mode, ForwardMode::Decode));
+        assert_eq!(decode.flat_token_ids, vec![101, 202]);
+        assert_eq!(decode.flat_page_ids, vec![10, 11, 20, 21, 22]);
+        assert_eq!(decode.rows.len(), 2);
+        assert_eq!(decode.rows[0].kind, KvBatchRowKind::Decode);
+        assert_eq!(decode.rows[0].slot, 1);
+        assert_eq!(decode.rows[0].token_range, 0..1);
+        assert_eq!(decode.rows[0].page_range, 0..2);
+        assert_eq!(decode.rows[1].slot, 2);
+        assert_eq!(decode.rows[1].token_range, 1..2);
+        assert_eq!(decode.rows[1].page_range, 2..5);
+
+        assert!(desc.subset(0..0).is_err());
+        assert!(desc.subset(2..4).is_err());
     }
 
     #[test]
