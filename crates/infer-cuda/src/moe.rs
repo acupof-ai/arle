@@ -841,7 +841,6 @@ mod dsv4_gpu {
         )
     }
 
-
     /// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF).
     ///
     /// A `clone_htod(&vec![-1; n])` here would record a CUDA-graph memcpy node
@@ -986,7 +985,6 @@ mod dsv4_gpu {
         hidden: &HiddenStates,
         out: &mut HiddenStates,
         scratch: &mut Dsv4MoeDecodeScratch,
-        keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
         use deepseek_spec::DeepSeekV4MoeRoutingKind;
 
@@ -1041,18 +1039,29 @@ mod dsv4_gpu {
             )?;
         }
 
-        // Masked tail (the eager-default MoE path): the pooled tail carried a
-        // ~20% B=1 tax (padded grouped GEMM), which capped graph arms below
-        // the eager bar. Routing above stays in fixed scratch addresses; the
-        // tail's intermediates are capture-legal stream-ordered allocs.
-        dsv4_moe_forward_masked_tail(
-            model,
+        // Pooled tail: EVERY buffer is a persistent scratch address. The
+        // masked per-call-alloc tail was tried here and produced degenerate
+        // output at +24% "speed" — its stream-ordered allocs (and the
+        // clone_htod'd active_counts constants) become graph nodes whose
+        // Rust-side frees land after capture, so replays write/read aliased
+        // VAs and the MoE partially no-ops. Captured bodies must allocate
+        // NOTHING. The pooled padded-GEMM tax is avoided by the contiguous
+        // variant (ARLE_DSV4_MOE_CONTIG_DECODE=1): same persistent buffers,
+        // compact 8-row GEMM shape.
+        let route_indices = cache_ptr(&scratch.route_indices, ctx);
+        let route_weights = cache_ptr(&scratch.route_weights, ctx);
+        dsv4_moe_forward_decode_pooled(
+            ctx,
             layer,
-            &scratch.route_indices,
-            &scratch.route_weights,
+            &model.split,
+            route_indices,
+            route_weights,
             hidden,
             out,
-            keepalive,
+            topk,
+            model.split.local_expert_start,
+            model.config.swiglu_limit,
+            scratch,
         )
     }
 
