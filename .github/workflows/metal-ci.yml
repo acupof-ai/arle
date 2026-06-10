@@ -1,52 +1,29 @@
 name: Metal CI
 
+# Sole macOS gate: checks + tests + release-shaped artifact packaging.
+# (ci.yml used to run a second overlapping macos-14 job; deleted 2026-06-10.)
+
 on:
   push:
     branches: [ main, master ]
     paths:
       - 'crates/**'
-      - 'crates/cli/**'
-      - 'crates/train/**'
-      - 'crates/kv-native-sys/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/**'
       - 'tests/**'
-      - 'scripts/start_agent.sh'
-      - 'setup.sh'
-      - 'Makefile'
-      - 'README.md'
-      - 'CONTRIBUTING.md'
-      - 'CHANGELOG.md'
-      - 'docs/release-checklist.md'
-      - 'docs/stability-policy.md'
-      - 'docs/support-matrix.md'
       - 'scripts/package_macos_metal_artifact.sh'
-      - '.github/workflows/release.yml'
       - 'benchmarks/metal_baseline.json'
       - '.github/workflows/metal-ci.yml'
   pull_request:
     branches: [ main, master ]
     paths:
       - 'crates/**'
-      - 'crates/cli/**'
-      - 'crates/train/**'
-      - 'crates/kv-native-sys/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/**'
       - 'tests/**'
-      - 'scripts/start_agent.sh'
-      - 'setup.sh'
-      - 'Makefile'
-      - 'README.md'
-      - 'CONTRIBUTING.md'
-      - 'CHANGELOG.md'
-      - 'docs/release-checklist.md'
-      - 'docs/stability-policy.md'
-      - 'docs/support-matrix.md'
       - 'scripts/package_macos_metal_artifact.sh'
-      - '.github/workflows/release.yml'
       - 'benchmarks/metal_baseline.json'
       - '.github/workflows/metal-ci.yml'
 
@@ -69,6 +46,9 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      # Raw target/ caching on purpose (NOT Swatinem/rust-cache): rust-cache
+      # prunes workspace-crate artifacts, which would drop mlx-sys' OUT_DIR
+      # cmake build of MLX — the single most expensive thing this job makes.
       - name: Cache cargo registry + build artifacts
         uses: actions/cache@v5
         with:
@@ -106,12 +86,14 @@ jobs:
           --lib --release
           -- --test-threads 1
 
-      - name: cargo test (metal + no-cuda CLI unit tests)
+      - name: cargo test (metal + no-cuda CLI crate unit tests)
+        run: cargo test -p cli --release --no-default-features --features metal,no-cuda
+
+      - name: cargo test (metal + no-cuda ARLE CLI tests)
         run: cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer --release
 
-      # `metal_serve`/`metal_bench` were `infer`-crate bins; the rewrite deleted
-      # them — serving is now `arle serve` (cli/src/serve.rs). The `arle` build
-      # below is the Metal serve/bench surface.
+      # Serving is `arle serve` (cli/src/serve.rs); this build is the Metal
+      # serve/bench surface and the release-shaped artifact.
       - name: cargo build ARLE CLI
         run: >
           cargo build
