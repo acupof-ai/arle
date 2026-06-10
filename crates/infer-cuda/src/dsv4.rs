@@ -828,9 +828,13 @@ impl Dsv4Model {
     /// Clamp `requested` decode slots to what the KV budget affords, from
     /// `cudaMemGetInfo() × MEM_FRACTION ÷ per-slot KV bytes`. This is the dynamic-mem-budget
     /// fix for the c=32 OOM CRASH (root cause: a fixed `num_slots` whose arena alloc OOMs at
-    /// high concurrency × long `max_seq_len`). The EXACT FP8 arena
-    /// term (`max_seq_len × bytes_per_token × num_layers`) is scaled ×2 to cover the
-    /// compressor/SW/indexer per-slot buffers + forward activations on top.
+    /// high concurrency × long `max_seq_len`). The per-slot cost is an itemized
+    /// ledger: the EXACT FP8 arena term (`max_seq_len × bytes_per_token ×
+    /// num_layers`) scaled ×2 to cover compressor/SW per-slot buffers + forward
+    /// activations, PLUS the official-DSA indexer scratch (one
+    /// `Dsv4DsaOfficialState` per CSA layer per slot — its `logits` tile scales
+    /// with `max_seq/cr` and dwarfs the arena at long context; un-budgeted it
+    /// OOMs engine build at 256K, issue #67).
     ///
     /// Cross-rank consistency: per-rank `mem_get_info` is NOT guaranteed identical
     /// (allocator state differs per rank), and the clamped count feeds the
@@ -850,7 +854,25 @@ impl Dsv4Model {
         let arena_per_slot = max_seq_len
             .saturating_mul(self.kv_arena.bytes_per_token)
             .saturating_mul(self.kv_arena.num_layers);
-        let per_slot = arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X);
+        let dsa_scratch_per_slot: usize =
+            if crate::attention::dsv4_dsa_official_enabled().unwrap_or(true) {
+                self.layers
+                    .iter()
+                    .filter(|layer| matches!(layer.mode, DeepSeekV4AttentionMode::CompressedSparse))
+                    .map(|layer| {
+                        crate::attention::dsv4_dsa_official_scratch_bytes(
+                            &self.config,
+                            layer.compress_ratio,
+                            max_seq_len,
+                        )
+                    })
+                    .fold(0usize, usize::saturating_add)
+            } else {
+                0
+            };
+        let per_slot = arena_per_slot
+            .saturating_mul(PER_SLOT_OVERHEAD_X)
+            .saturating_add(dsa_scratch_per_slot);
         let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
             Ok((free, _total)) => {
                 let budget = (free as f64 * MEM_FRACTION) as usize;
@@ -867,11 +889,14 @@ impl Dsv4Model {
                 .all_reduce_min_scalar_i32(&self.ctx, affordable_local)? as usize;
         if requested > affordable {
             log::warn!(
-                "DSv4 KV budget: requested {requested} slots × ~{}MB/slot = ~{}MB exceeds the \
-                 cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
-                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}. \
-                 Lower --max-seq-len ({max_seq_len}) to raise concurrency.",
+                "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (arena×2 ~{}MB + \
+                 DSA scratch ~{}MB) = ~{}MB exceeds the cross-rank-min affordable {affordable} \
+                 (local affordable {affordable_local}, {MEM_FRACTION} of post-weights free); \
+                 clamping num_slots to {affordable}. Lower --max-seq-len ({max_seq_len}) to \
+                 raise concurrency.",
                 per_slot >> 20,
+                arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X) >> 20,
+                dsa_scratch_per_slot >> 20,
                 requested.saturating_mul(per_slot) >> 20,
             );
         }

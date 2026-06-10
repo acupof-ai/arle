@@ -1067,6 +1067,52 @@ impl Dsv4DsaOfficialState {
     }
 }
 
+/// Device bytes ONE [`Dsv4DsaOfficialState`] allocates — i.e. per CSA layer,
+/// per slot. MUST mirror the allocations in [`Dsv4DsaOfficialState::new`]
+/// above (dominant term: the `logits` tile, `query_tile × ~(max_seq/cr) × 4`).
+///
+/// This feeds the dynamic KV memory budget (`Dsv4Model::kv_budget_num_slots`):
+/// the scratch is per-slot AND per-CSA-layer, so at long `max_seq` it dwarfs
+/// the MLA arena the budget's ×2 overhead factor was tuned for — un-budgeted,
+/// it OOMs engine build at 256K with the default slot count (issue #67; the
+/// design comment at `DSV4_DSA_PREFILL_QUERY_TILE` sized the 900K ledger for a
+/// single slot).
+pub(crate) fn dsv4_dsa_official_scratch_bytes(
+    config: &DeepSeekV4Config,
+    compress_ratio: usize,
+    max_seq_len: usize,
+) -> usize {
+    let cc = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
+    let num_pages = cc.div_ceil(64).max(1);
+    let query_tile = DSV4_DSA_PREFILL_QUERY_TILE.min(max_seq_len.max(1));
+    let query_chunk = DSV4_PREFILL_QUERY_CHUNK.min(max_seq_len.max(1));
+    let logits_stride = cc.div_ceil(256) * 256;
+    let logits = query_tile.saturating_mul(logits_stride).saturating_mul(4);
+    let rotated_keys = cc.saturating_mul(config.index_head_dim).saturating_mul(2);
+    let cache_locs = cc.saturating_mul(8);
+    let q_fp8 = query_tile
+        .saturating_mul(config.index_n_heads)
+        .saturating_mul(config.index_head_dim);
+    let weights = query_tile
+        .saturating_mul(config.index_n_heads)
+        .saturating_mul(4);
+    let lens_positions = query_tile.saturating_mul(8);
+    let page_table = query_tile.saturating_mul(num_pages).saturating_mul(4);
+    let freqs_cis = cc.saturating_mul(config.qk_rope_head_dim).saturating_mul(4);
+    let raw_indices = query_chunk
+        .saturating_mul(config.index_topk)
+        .saturating_mul(4);
+    logits
+        .saturating_add(rotated_keys)
+        .saturating_add(cache_locs)
+        .saturating_add(q_fp8)
+        .saturating_add(weights)
+        .saturating_add(lens_positions)
+        .saturating_add(page_table)
+        .saturating_add(freqs_cis)
+        .saturating_add(raw_indices)
+}
+
 fn dsv4_dsa_key_cache_bytes(
     config: &DeepSeekV4Config,
     compress_ratio: usize,
@@ -2646,7 +2692,7 @@ fn dsv4_prefill_indexer_deepgemm_enabled() -> bool {
     )
 }
 
-fn dsv4_dsa_official_enabled() -> Result<bool> {
+pub(crate) fn dsv4_dsa_official_enabled() -> Result<bool> {
     // Default ON: official/vendored DSA indexer replaces the legacy scalar
     // csa_select selector. Licensed by the variable-shape legacy-floor gate:
     // official diverges no earlier than legacy diverges from itself across
