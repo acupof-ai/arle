@@ -51,10 +51,25 @@ called from three sites; code review established two defects:
   `cargo clippy -p infer-metal --release --no-default-features --features
   metal --tests -- -D warnings` clean.
 
-**Bench pending.** The mandatory matched A/B on the canonical Metal model has
-NOT run yet. The lead session runs `./scripts/bench_guidellm.sh
-metal-pagestore-prompt-only --model mlx-community/Qwen3.6-35B-A3B-4bit` vs
-the latest Metal baseline after integration; this entry gets the Δ% row then.
+**Bench (2026-06-10, M-series local, Qwen3.6-35B-A3B-4bit).** Canonical
+`bench_guidellm.sh` is BLOCKED against the rewrite Metal server: its streaming
+probe gets HTTP 400 `stream=true is deferred in R5 tranche 2` — environmental,
+pre-existing, unrelated to this diff. Fallback: direct same-shape timing
+(4096-token prompt, 1200-token greedy completion, c=1), same shell, two
+interleaved before/after pairs (before = parent-commit binary `0f80fdd6`):
+
+| run | before tok/s | after tok/s |
+|-----|-------------|------------|
+| pair 1 (cold) | 31.97 | 51.70 |
+| pair 2 (warm) | 56.28 | 56.46 |
+
+Verdict: **perf wash**. Pair 1's +62% is cold-load/thermal confounding (the
+same before binary jumps 32→56 between runs); the warm matched pair is ±0.3%.
+The licensed claims are correctness (stale-alias prune, unit-tested) and
+bounded growth (decode-time publishes deleted by construction — the snapshot
+map can no longer grow during decode), NOT throughput. `ps` RSS could not
+isolate the GDR-snapshot footprint (dominated by 19 GB model page-touching;
+±0 between before/after) — the memory delta stays code-derived, not measured.
 
 ## Rule
 
