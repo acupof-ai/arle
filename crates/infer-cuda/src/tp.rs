@@ -328,6 +328,65 @@ impl TpRuntime {
         }
     }
 
+    /// All-reduce MIN of one host `i32` across ranks (1-element device round
+    /// trip). [`TpComm::Single`] is the identity.
+    ///
+    /// Use this for capacity decisions that feed the scheduler (e.g. the DSv4
+    /// KV-budget slot clamp): each rank's `mem_get_info` can differ, and any
+    /// per-rank divergence in scheduler-visible capacity diverges the
+    /// deterministic planner and deadlocks NCCL — min-reducing makes the
+    /// decision identical on every rank by construction. Collective: every
+    /// rank MUST call this at the same construction point.
+    ///
+    /// # Errors
+    /// Propagates device alloc/copy and NCCL errors on multi-rank builds.
+    #[cfg(feature = "cuda")]
+    // Without `nccl` the only arm is `Single => Ok(value)`, so `ctx` is unused;
+    // that is the intended single-GPU identity, not a bug.
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
+    pub fn all_reduce_min_scalar_i32(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        value: i32,
+    ) -> anyhow::Result<i32> {
+        match &self.comm {
+            TpComm::Single => Ok(value),
+            #[cfg(feature = "nccl")]
+            TpComm::Nccl(backend) => {
+                use cuda_kernels::collective::{CollectiveBackend, DType, ReduceOp};
+                use cudarc::driver::DevicePtrMut;
+
+                let mut buf = ctx
+                    .stream
+                    .alloc_zeros::<i32>(1)
+                    .map_err(|e| anyhow::anyhow!("scalar all-reduce scratch alloc failed: {e}"))?;
+                ctx.stream
+                    .memcpy_htod(&[value], &mut buf)
+                    .map_err(|e| anyhow::anyhow!("scalar all-reduce htod failed: {e}"))?;
+                {
+                    let (ptr, _guard) = buf.device_ptr_mut(&ctx.stream);
+                    // SAFETY: `ptr` is a valid 1-element i32 device allocation on
+                    // this context's device; `ctx.stream` is a stream on the same
+                    // device. `_guard` keeps the buffer borrowed for the FFI call.
+                    unsafe {
+                        backend.all_reduce(
+                            ptr as *mut std::ffi::c_void,
+                            1,
+                            DType::I32,
+                            ReduceOp::Min,
+                            ctx.stream.cu_stream().cast::<std::ffi::c_void>(),
+                        )?;
+                    }
+                }
+                let host = ctx
+                    .stream
+                    .memcpy_dtov(&buf)
+                    .map_err(|e| anyhow::anyhow!("scalar all-reduce dtoh failed: {e}"))?;
+                Ok(host[0])
+            }
+        }
+    }
+
     /// Raw BF16 all-gather for TP-local attention slabs.
     ///
     /// FlashMLA's sparse decode kernel wants global heads (`h_q` 64/128), while
