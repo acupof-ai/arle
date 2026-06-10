@@ -81,6 +81,7 @@ jobs:
         run: |
           cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
           cargo check -p agent-infer --release --no-default-features --features cuda,no-cuda,cli --bin arle
+          cargo check -p cli --release --no-default-features --features cuda,no-cuda,nccl
 
   test:
     name: Test
