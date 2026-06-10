@@ -309,6 +309,64 @@ pub(crate) fn hc_pre(
     Ok(())
 }
 
+/// Fused [`hc_pre`] + rms-norm: mix the stream into one lane and normalize in
+/// a single kernel (one boundary, no intermediate tensor). Drop-in for the
+/// `hc_pre(...) ; rms_norm_batch(...)` pair on every layer's attn/ffn prologue.
+pub(crate) fn mhc_pre_rms_norm(
+    ctx: &DeviceContext,
+    stream: &HiddenStates,
+    pre: &CudaSlice<f32>,
+    norm_weight: &cuda_kernels::prelude::DeviceVec,
+    eps: f32,
+    hidden_size: usize,
+    hc_mult: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        stream.hidden_dim == hidden_size * hc_mult,
+        "DSv4 HC pre+norm stream dim {} != hidden_size {hidden_size} * hc_mult {hc_mult}",
+        stream.hidden_dim
+    );
+    ensure!(
+        pre.len() >= stream.seq_len * hc_mult,
+        "DSv4 HC pre+norm pre len {} < seq {} * hc_mult {hc_mult}",
+        pre.len(),
+        stream.seq_len
+    );
+    ensure!(
+        norm_weight.len == hidden_size,
+        "DSv4 HC pre+norm weight len {} != hidden {hidden_size}",
+        norm_weight.len
+    );
+    ensure!(
+        out.hidden_dim == hidden_size && out.seq_len == stream.seq_len,
+        "DSv4 HC pre+norm out shape {}x{} != {hidden_size}x{}",
+        out.hidden_dim,
+        out.seq_len,
+        stream.seq_len
+    );
+    let (stream_ptr, _gs) = stream.data.device_ptr(&ctx.stream);
+    let (pre_ptr, _gp) = pre.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = norm_weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: buffers valid on ctx.stream; shapes checked above.
+    unsafe {
+        ffi::dsv4_mhc_pre_rms_norm_cuda(
+            stream_ptr as *const ffi::Half,
+            pre_ptr as *const f32,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            stream.seq_len as i32,
+            hidden_size as i32,
+            hc_mult as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Scatter the sub-block output back across the lanes and re-mix the residual
 /// stream (output of the sub-block).
 #[allow(clippy::too_many_arguments)]
