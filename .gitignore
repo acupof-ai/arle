@@ -41,3 +41,4 @@ traces/
 /_gap_a_micro_workdir/
 _gap_a_micro_workdir/
 scripts/_pod_*
+.kami-lark/*
