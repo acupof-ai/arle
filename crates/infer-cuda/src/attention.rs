@@ -1203,7 +1203,7 @@ pub(crate) fn dsv4_dsa_rotated_keys_bytes(
     cc.saturating_mul(config.index_head_dim).saturating_mul(2)
 }
 
-fn dsv4_dsa_key_cache_bytes(
+pub(crate) fn dsv4_dsa_key_cache_bytes(
     config: &DeepSeekV4Config,
     compress_ratio: usize,
     max_seq_len: usize,
