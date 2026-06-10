@@ -1,0 +1,117 @@
+"""#56 long-ctx closeout matrix: needle ladder x same-config-repeat control.
+
+Usage: python3 _pod_needle_matrix.py [lengths_csv] [runs] [depth]
+  lengths_csv  approx prompt-token targets (default spans the 241 boundary)
+  runs         same-config repeats per length (default 3)
+  depth        needle depth 0.0=start .. 1.0=end (default 0.0)
+
+Env: PORT (default 18189), MODEL (default "x"), CHAT=1 to route through
+/v1/chat/completions (proper chat template) instead of raw /v1/completions.
+
+Prints one line per run with the raw decoded completion, then a per-length
+summary line: exact/partial/miss counts + deterministic? (all runs identical).
+"""
+import os, sys, json, urllib.request, time
+
+BASE = "http://127.0.0.1:" + os.environ.get("PORT", "18189")
+NEEDLE = "738291"
+PRE = "Important: the secret access code is " + NEEDLE + ". Keep it in mind.\n\n"
+TOPICS = [
+    "The river flowed gently past the old stone bridge.",
+    "Mountains rose sharply against the pale morning sky.",
+    "She opened the wooden door and stepped into the hall.",
+    "The market was full of fruit, spices, and fresh bread.",
+    "A long train crossed the wide green valley at dawn.",
+    "Children played near the fountain in the city square.",
+    "The library held thousands of dusty leather books.",
+    "Rain fell softly on the roof throughout the night.",
+]
+CUE = "\n\nRecall the secret access code stated earlier. The secret access code is"
+
+lengths = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else
+           "115,180,241,300,446,1000,2000,4000,8000").split(",")]
+runs = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+depth = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+
+
+def build_prompt(target, depth):
+    # Unique per-sentence prefix kills exact-repetition degeneracy (a looping
+    # filler is itself a degenerate prompt and confounds retrieval verdicts).
+    n = max(1, target // 16)
+    sents = ["Note %d: %s" % (i + 1, TOPICS[i % len(TOPICS)]) for i in range(n)]
+    k = int(len(sents) * depth)
+    filler_a = " ".join(sents[:k])
+    filler_b = " ".join(sents[k:])
+    mid = (filler_a + ("\n\n" if filler_a else "")) + PRE + filler_b
+    return mid + CUE
+
+
+def wrap_template(prompt):
+    # Official DSv4 chat shape (model encoding/encoding_dsv4.py): system +
+    # User + Assistant + `</think>` (non-thinking "chat" mode), fullwidth bars.
+    if os.environ.get("TEMPLATE") == "dsv4":
+        return ("<｜begin▁of▁sentence｜>You are a helpful assistant."
+                "<｜User｜>" + prompt + "<｜Assistant｜></think>")
+    return prompt
+
+
+def one_completion(prompt):
+    body = {"model": os.environ.get("MODEL", "x"), "prompt": wrap_template(prompt),
+            "max_tokens": 16, "temperature": 0}
+    req = urllib.request.Request(BASE + "/v1/completions",
+                                 data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    t0 = time.time()
+    d = json.loads(urllib.request.urlopen(req, timeout=1800).read())
+    dt = time.time() - t0
+    out = d["choices"][0]["text"]
+    pt = d.get("usage", {}).get("prompt_tokens")
+    return out, pt, dt
+
+
+def one_chat(prompt):
+    body = {"model": os.environ.get("MODEL", "x"),
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 16, "temperature": 0}
+    req = urllib.request.Request(BASE + "/v1/chat/completions",
+                                 data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    t0 = time.time()
+    d = json.loads(urllib.request.urlopen(req, timeout=1800).read())
+    dt = time.time() - t0
+    out = d["choices"][0]["message"]["content"]
+    pt = d.get("usage", {}).get("prompt_tokens")
+    return out, pt, dt
+
+
+one = one_chat if os.environ.get("CHAT") == "1" else one_completion
+
+
+def classify(out):
+    if NEEDLE in out:
+        return "exact"
+    if "738" in out:
+        return "partial"
+    return "miss"
+
+
+for target in lengths:
+    prompt = build_prompt(target, depth)
+    outs = []
+    for r in range(runs):
+        try:
+            out, pt, dt = one(prompt)
+        except Exception as e:  # noqa: BLE001 - surface and continue the matrix
+            print("len=%d depth=%.2f run=%d ERROR %r" % (target, depth, r, e))
+            outs.append(None)
+            continue
+        outs.append(out)
+        print("len=%d depth=%.2f run=%d pt=%s cls=%s wall=%.1fs out=%r"
+              % (target, depth, r, pt, classify(out), dt, out))
+    ok = [o for o in outs if o is not None]
+    cls = [classify(o) for o in ok]
+    det = "DET" if len(set(ok)) <= 1 and len(ok) == runs else "NONDET"
+    print("SUMMARY len=%d depth=%.2f exact=%d partial=%d miss=%d %s"
+          % (target, depth, cls.count("exact"), cls.count("partial"),
+             cls.count("miss"), det))
+    sys.stdout.flush()
