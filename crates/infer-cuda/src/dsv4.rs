@@ -854,28 +854,43 @@ impl Dsv4Model {
         let arena_per_slot = max_seq_len
             .saturating_mul(self.kv_arena.bytes_per_token)
             .saturating_mul(self.kv_arena.num_layers);
-        let dsa_scratch_per_slot: usize =
-            if crate::attention::dsv4_dsa_official_enabled().unwrap_or(true) {
-                self.layers
-                    .iter()
-                    .filter(|layer| matches!(layer.mode, DeepSeekV4AttentionMode::CompressedSparse))
-                    .map(|layer| {
-                        crate::attention::dsv4_dsa_official_scratch_bytes(
-                            &self.config,
-                            layer.compress_ratio,
-                            max_seq_len,
-                        )
-                    })
-                    .fold(0usize, usize::saturating_add)
-            } else {
-                0
-            };
+        // Official-DSA selector memory splits into the ONE model-wide shared
+        // scratch (a fixed subtraction from the budget) and the per-(slot,
+        // CSA-layer) stateful rotated_keys mirrors (a per-slot term). #67.
+        let official_on = crate::attention::dsv4_dsa_official_enabled().unwrap_or(true);
+        let csa_cr = self
+            .layers
+            .iter()
+            .find(|layer| matches!(layer.mode, DeepSeekV4AttentionMode::CompressedSparse))
+            .map(|layer| layer.compress_ratio);
+        let dsa_shared_bytes: usize = match (official_on, csa_cr) {
+            (true, Some(cr)) => {
+                crate::attention::dsv4_dsa_shared_scratch_bytes(&self.config, cr, max_seq_len)
+            }
+            _ => 0,
+        };
+        let dsa_rotated_per_slot: usize = if official_on {
+            self.layers
+                .iter()
+                .filter(|layer| matches!(layer.mode, DeepSeekV4AttentionMode::CompressedSparse))
+                .map(|layer| {
+                    crate::attention::dsv4_dsa_rotated_keys_bytes(
+                        &self.config,
+                        layer.compress_ratio,
+                        max_seq_len,
+                    )
+                })
+                .fold(0usize, usize::saturating_add)
+        } else {
+            0
+        };
         let per_slot = arena_per_slot
             .saturating_mul(PER_SLOT_OVERHEAD_X)
-            .saturating_add(dsa_scratch_per_slot);
+            .saturating_add(dsa_rotated_per_slot);
         let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
             Ok((free, _total)) => {
-                let budget = (free as f64 * MEM_FRACTION) as usize;
+                let budget =
+                    ((free as f64 * MEM_FRACTION) as usize).saturating_sub(dsa_shared_bytes);
                 budget
                     .checked_div(per_slot)
                     .map_or(i32::MAX, |n| i32::try_from(n.max(1)).unwrap_or(i32::MAX))
@@ -890,14 +905,14 @@ impl Dsv4Model {
         if requested > affordable {
             log::warn!(
                 "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (arena×2 ~{}MB + \
-                 DSA scratch ~{}MB) = ~{}MB exceeds the cross-rank-min affordable {affordable} \
-                 (local affordable {affordable_local}, {MEM_FRACTION} of post-weights free); \
-                 clamping num_slots to {affordable}. Lower --max-seq-len ({max_seq_len}) to \
-                 raise concurrency.",
+                 DSA rotated-keys ~{}MB) + shared DSA scratch ~{}MB exceeds the \
+                 cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
+                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}. \
+                 Lower --max-seq-len ({max_seq_len}) to raise concurrency.",
                 per_slot >> 20,
                 arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X) >> 20,
-                dsa_scratch_per_slot >> 20,
-                requested.saturating_mul(per_slot) >> 20,
+                dsa_rotated_per_slot >> 20,
+                dsa_shared_bytes >> 20,
             );
         }
         Ok(requested.min(affordable))
@@ -1326,7 +1341,8 @@ impl Dsv4Model {
                     ctx.stream
                         .memcpy_dtod(&src, &mut normed_row.data)
                         .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
-                    let layer_pool = kv_adapter.layer_mut(layer_idx)?;
+                    let (layer_pool, dsa_shared) =
+                        kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     let slot = &mut slots[slot_ids[r]];
                     crate::attention::mla_attention(
                         &self.ctx,
@@ -1338,6 +1354,7 @@ impl Dsv4Model {
                         &normed_row,
                         &mut slot.attention[layer_idx],
                         layer_pool,
+                        dsa_shared,
                         start_positions[r],
                         Some(&slot.start_pos_device),
                         &self.tp,
@@ -1810,7 +1827,8 @@ impl Dsv4Model {
             {
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn");
                 crate::stage_profile::profile(ctx, "dsv4/stage/mla_attn", || {
-                    let layer_pool = kv_adapter.layer_mut(layer_idx)?;
+                    let (layer_pool, dsa_shared) =
+                        kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     crate::attention::mla_attention(
                         &self.ctx,
                         &self.config,
@@ -1821,6 +1839,7 @@ impl Dsv4Model {
                         &normed,
                         &mut slot.attention[layer_idx],
                         layer_pool,
+                        dsa_shared,
                         start_pos,
                         start_pos_device,
                         &self.tp,
@@ -2213,7 +2232,8 @@ impl Dsv4Model {
                 slot_attention_len
             )
         })?;
-        let target_attention_pool = kv_adapter.layer_mut(target_layer_idx)?;
+        let (target_attention_pool, target_dsa_shared) =
+            kv_adapter.layer_and_dsa_shared_mut(target_layer_idx)?;
         let stream = self.run_mtp_transformer_layer(
             mtp,
             stream,
@@ -2222,6 +2242,7 @@ impl Dsv4Model {
             target_layer_idx,
             target_attention_state,
             target_attention_pool,
+            target_dsa_shared,
         )?;
 
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
@@ -2294,6 +2315,7 @@ impl Dsv4Model {
         target_layer_idx: usize,
         target_attention_state: &mut crate::attention::Dsv4LayerAttentionState,
         target_attention_pool: &mut crate::attention::Dsv4LayerKvLayout,
+        target_dsa_shared: Option<&mut crate::attention::Dsv4DsaSharedScratch>,
     ) -> Result<HiddenStates> {
         let layer = &mtp.layer;
         let ctx = &self.ctx;
@@ -2340,6 +2362,7 @@ impl Dsv4Model {
             &attn_normed,
             target_attention_state,
             target_attention_pool,
+            target_dsa_shared,
             start_pos,
             Some(&start_pos_device),
             &self.tp,
@@ -2535,6 +2558,7 @@ impl Dsv4Model {
                             attn_normed,
                             attn_state,
                             attn_pool,
+                            None,
                             start_pos,
                             Some(&slot.start_pos_device),
                             &self.tp,
@@ -2605,6 +2629,7 @@ impl Dsv4Model {
                             attn_normed,
                             attn_state,
                             attn_pool,
+                            None,
                             start_pos,
                             Some(&slot.start_pos_device),
                             &self.tp,
