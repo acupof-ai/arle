@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="docs/assets/logo.svg" alt="ARLE logo" width="88">
+</p>
+
+<p align="center">
   <strong>ARLE</strong><br>
   <em>Pure-Rust runtime for serving, local agents, On-Policy Distillation, and evaluation. <code>arle serve</code> is the OpenAI-compatible serving path; <code>arle</code> is the unified front door.</em>
 </p>
@@ -119,33 +123,34 @@ Benchmark data: [TTFT/TPOT steady sweep](docs/experience/wins/2026-06-02-metal-t
 
 ```mermaid
 flowchart TB
-  subgraph Surface["Entry surfaces"]
-    Serve["arle serve<br/>OpenAI HTTP"]
+  subgraph Surfaces["One arle binary"]
+    Serve["arle serve<br/>OpenAI v1 HTTP"]
     Agent["arle<br/>local agent / REPL"]
-    Train["arle train opd<br/>teacher rollouts + distillation"]
+    Train["arle train opd<br/>OPD — teacher <i>is</i> the production server"]
   end
 
-  subgraph Runtime["Shared Rust runtime"]
-    Router["OpenAI router<br/>continuous scheduler"]
-    Model["Qwen model authority<br/>weights / tokenizer / decode"]
-    KV["KV memory plane<br/>prefix radix + paged KV + residency tiers"]
+  subgraph Serving["Serving layer"]
+    Server["infer-server<br/>HTTP · streaming · ServeHandle"]
+    API["infer-api<br/>LoadedInferenceEngine — programmatic front door"]
   end
 
-  subgraph Backend["Execution backends"]
-    Metal["Metal<br/>MLX bridge + packed varlen decode"]
-    CUDA["CUDA<br/>TileLang AOT + custom kernels"]
+  Core["<b>infer-core — device-neutral Engine&lt;E,K&gt;</b><br/>continuous scheduler · RadixCache prefix reuse<br/>chunked prefill · paged-KV admission · sampling"]
+
+  Seam["<b>infer-plan IR · infer-seam</b><br/>the narrow waist: two host-only traits — BackendExecutor · KvPool"]
+
+  subgraph Exec["Executors — a new backend = implement the two traits"]
+    CUDA["infer-cuda<br/>official FlashMLA · DeepGEMM · DeepEP + TileLang AOT<br/>TP=8 / EP=8 · Qwen3.5 · DeepSeek-V4-Flash"]
+    Metal["infer-metal<br/>MLX bridge · packed varlen decode · wired weights<br/>Qwen3.5 · Qwen3.6"]
   end
 
-  Serve --> Router
-  Agent --> Router
-  Train --> Router
-  Router --> Model
-  Model <--> KV
-  Model --> Metal
-  Model --> CUDA
-  KV --> Metal
-  KV --> CUDA
-  Model -. teacher samples .-> Train
+  Serve --> Server
+  Agent --> API
+  Train --> API
+  Server --> Core
+  API --> Core
+  Core --> Seam
+  Seam --> CUDA
+  Seam --> Metal
 ```
 
 Deep dive: [onboarding](docs/onboarding.md) (30 min) · [architecture](docs/architecture.md) · [codebase-map](docs/codebase-map.md).
