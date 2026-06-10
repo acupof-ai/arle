@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="${PROFILE:-release-fast}"
 FEATURES="${FEATURES:-cuda,nccl}"
-BIN="${BIN:-infer}"
+BIN="${BIN:-arle}"
 PREBUILT_DIR="${ARLE_CUDA_KERNELS_PREBUILT_DIR:-$ROOT/target/dsv4-cuda-kernels-prebuilt}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 MANIFEST_NAME="arle-cuda-kernels.manifest"
@@ -315,7 +315,7 @@ echo "ARLE_DEEPGEMM_LIBRARY_ROOT=${ARLE_DEEPGEMM_LIBRARY_ROOT:-}"
 echo "ARLE_DEEPGEMM_CUTLASS_INCLUDE=${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}"
 echo "ARLE_DEEPEP_DIR=${ARLE_DEEPEP_DIR:-}"
 
-time cargo build --profile "$PROFILE" -p infer --features "$FEATURES" --bin "$BIN"
+time cargo build --profile "$PROFILE" --features "$FEATURES" --bin "$BIN"
 if [[ "$USED_PREBUILT" == "1" ]]; then
     echo "prebuilt fast path used; not harvesting older OUT_DIR artifacts"
 else

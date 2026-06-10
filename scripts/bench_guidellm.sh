@@ -104,7 +104,7 @@ SECONDARY_C1_SECONDS=""
 # OpenAI v1 HTTP API, so `openai_http` is the correct backend to use.
 BACKEND="openai_http"
 # guidellm's default backend validation probes GET /health, which
-# metal_serve / cuda-infer do not expose. Point it at /v1/models instead
+# `arle serve` does not expose. Point it at /v1/models instead
 # (we already rely on that route being present in preflight below).
 #
 # Also pin the benchmark path to /v1/completions. The chat endpoint starts

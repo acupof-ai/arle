@@ -26,8 +26,8 @@ need uname
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "${OS}-${ARCH}" in
-  Darwin-arm64)        PLATFORM="macos-arm64"; BINARIES="arle metal_serve" ;;
-  Linux-x86_64|Linux-amd64) PLATFORM="linux-x86_64"; BINARIES="arle infer bench_serving" ;;
+  Darwin-arm64)        PLATFORM="macos-arm64"; BINARIES="arle" ;;
+  Linux-x86_64|Linux-amd64) PLATFORM="linux-x86_64"; BINARIES="arle" ;;
   *) err "unsupported platform: ${OS}-${ARCH} (supported: Darwin-arm64, Linux-x86_64)" ;;
 esac
 
@@ -80,7 +80,7 @@ done
 
 # Stage MLX kernels next to the macOS binaries. MLX searches for
 # `mlx.metallib` colocated with the running binary; without this copy
-# `metal_serve` fails with "Failed to load the default metallib".
+# `arle serve --backend metal` fails with "Failed to load the default metallib".
 if [ "$PLATFORM" = "macos-arm64" ] && [ -f "${TMPDIR}/mlx.metallib" ]; then
   install -m 0644 "${TMPDIR}/mlx.metallib" "${INSTALL_DIR}/mlx.metallib"
   info "Installed ${INSTALL_DIR}/mlx.metallib"

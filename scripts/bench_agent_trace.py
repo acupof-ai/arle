@@ -185,7 +185,8 @@ class TurnResult:
 class ServerStats:
     """Parsed snapshot of the server's `/v1/stats` plain-text response.
 
-    The infer server (see `infer/src/http_server.rs:393-409`) emits a
+    The monolith-era infer server emitted a (rewrite `infer-server`
+    has NOT re-ported `/v1/stats` yet — this probe degrades to absent)
     single-line key=value blob like::
 
         requests=0 active=0 waiting=0 tokens_out=0 kv_util=0.0% \
@@ -273,8 +274,8 @@ async def fetch_server_stats(
     Until those land, cross-session prefix hit rate is NOT directly
     observable from this probe; we report the delta of `tokens_out`
     and the final `kv_util` / `ttft_*` gauges as the best proxy. The
-    add-the-counters change is ~30–50 LOC in `infer/src/metrics.rs`
-    plus a hook in the scheduler's prefix-cache lookup site. See the
+    add-the-counters change belongs in the rewrite `infer-server` /
+    `infer-core` scheduler once `/v1/stats` is re-ported. See the
     I1 research report in
     `docs/plans/tiered-kv-cache-tasks.md` §N.Addendum (or scroll to
     the bottom of the file for the consolidated remote-validation
