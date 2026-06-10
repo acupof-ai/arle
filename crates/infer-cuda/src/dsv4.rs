@@ -1148,10 +1148,6 @@ impl Dsv4Model {
         let seq_len = n; // batch dimension: N independent decode rows
         let eps = self.config.rms_norm_eps;
         let use_deepep_transport = dsv4_use_deepep_transport()?;
-        ensure!(
-            !use_deepep_transport,
-            "DSv4 batched decode does not yet support the DeepEP MoE transport; use the all-reduce transport"
-        );
         // N>1: mirror the prefill keepalive discipline (the per-token decode
         // scratch / comm-overlap fast paths are seq_len==1 only).
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
@@ -1369,31 +1365,132 @@ impl Dsv4Model {
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             crate::ops::rms_norm_batch(&self.ctx, &ffn_in, &layer.ffn_norm, eps, &mut normed)?;
             keepalive.keep_hidden(&normed);
-            // Phase 6a: grouped routed MoE over the whole [N] batch — one router
-            // gemm + one DeepGEMM grouped expert GEMM over N×topk routes (the
-            // prefill path, decode_scratch=None), replacing N per-row calls + N
-            // host syncs. Bit-identity vs per-row is NOT expected (grouped GEMM
-            // tiles over N differently); gated on needle retrieval, not byte-parity.
+            // Routed MoE over the whole [N] batch. allreduce transport: Phase 6a
+            // grouped path (one router gemm + one DeepGEMM grouped expert GEMM
+            // over N×topk routes, decode_scratch=None) + one EP all-reduce.
+            // deepep transport: the token-owned LL / intranode pipelines, which
+            // are natively [N]-batched — same owned-slice structure as the
+            // single-row forward (see its collective-participation invariants).
+            // Bit-identity vs per-row is NOT expected (grouped GEMM / LL combine
+            // tile over N differently); gated on needle retrieval, not byte-parity.
             let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::moe::dsv4_moe_forward(
-                self,
-                &layer.moe,
-                tokens,
-                &normed,
-                &mut moe_out,
-                None,
-                &mut keepalive,
-            )?;
-            keepalive.keep_hidden(&moe_out);
-            // Probe the RAW per-row MoE output (pre all-reduce): like attn_raw, the
-            // per-row single-token MoE must be bit-identical across identical rows.
-            probe_rows("moe_raw", &moe_out, layer_idx)?;
-            // Routed experts are EP-sharded → sum, then add the replicated shared
-            // expert once per rank. One all-reduce over [N, hidden].
-            {
+            if use_deepep_transport {
+                #[cfg(feature = "deepep")]
+                {
+                    let transport = self.deepep.as_ref().ok_or_else(|| {
+                        anyhow!("ARLE_DSV4_MOE_TRANSPORT=deepep but DeepEP transport is not booted")
+                    })?;
+                    if transport.is_low_latency() {
+                        // Token-owned LL path: this rank owns the contiguous
+                        // token cols [start..end) of the replicated `normed`.
+                        // Every rank participates in the dispatch/combine
+                        // COLLECTIVES even with owned_n == 0 (seq_len < world).
+                        let world = self.tp.config().world_size;
+                        let rank = self.tp.config().rank;
+                        let per = seq_len.div_ceil(world);
+                        let start = (rank * per).min(seq_len);
+                        let end = ((rank + 1) * per).min(seq_len);
+                        let owned_n = end - start;
+                        // Zero the full output; each rank scatters its owned
+                        // cols, then an all-reduce gathers them (replacing the
+                        // moe all-reduce — DeepEP combine already EP-reduced).
+                        self.ctx
+                            .stream
+                            .memset_zeros(&mut moe_out.data)
+                            .map_err(|e| anyhow!("deepep_ll batched moe_out zero failed: {e}"))?;
+                        let mut owned_in =
+                            HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
+                        owned_in.seq_len = owned_n;
+                        keepalive.keep_hidden(&owned_in);
+                        if owned_n > 0 {
+                            self.ctx
+                                .stream
+                                .memcpy_dtod(
+                                    &normed.data.slice(start * hidden_size..end * hidden_size),
+                                    &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
+                                )
+                                .map_err(|e| {
+                                    anyhow!("deepep_ll batched owned-slice copy failed: {e}")
+                                })?;
+                        }
+                        let mut owned_out =
+                            HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
+                        owned_out.seq_len = owned_n;
+                        keepalive.keep_hidden(&owned_out);
+                        // The LL scratch is whole-forward scratch (fully
+                        // overwritten per call); it is parked per-slot for the
+                        // single-row path, so the batch borrows row 0's.
+                        let scratch =
+                            slots[slot_ids[0]]
+                                .deepep_ll_scratch
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    anyhow!("deepep_ll selected but slot LL scratch not allocated")
+                                })?;
+                        crate::moe::dsv4_moe_forward_deepep_ll(
+                            self,
+                            transport,
+                            scratch,
+                            &layer.moe,
+                            &tokens[start..end],
+                            tokens.len(),
+                            &owned_in,
+                            &mut owned_out,
+                            &mut keepalive,
+                        )?;
+                        if owned_n > 0 {
+                            self.ctx
+                                .stream
+                                .memcpy_dtod(
+                                    &owned_out.data.slice(0..owned_n * hidden_size),
+                                    &mut moe_out
+                                        .data
+                                        .slice_mut(start * hidden_size..end * hidden_size),
+                                )
+                                .map_err(|e| {
+                                    anyhow!("deepep_ll batched owned scatter failed: {e}")
+                                })?;
+                        }
+                        // All-gather via all-reduce: only owned cols are nonzero.
+                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                    } else {
+                        // Intranode normal-mode DeepEP: already [N]-shaped; its
+                        // combine reduces across EP, no moe all-reduce needed.
+                        crate::moe::dsv4_moe_forward_deepep(
+                            self,
+                            transport,
+                            &layer.moe,
+                            tokens,
+                            &normed,
+                            &mut moe_out,
+                            &mut keepalive,
+                        )?;
+                    }
+                }
+                #[cfg(not(feature = "deepep"))]
+                bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
+            } else {
+                crate::moe::dsv4_moe_forward(
+                    self,
+                    &layer.moe,
+                    tokens,
+                    &normed,
+                    &mut moe_out,
+                    None,
+                    &mut keepalive,
+                )?;
+                keepalive.keep_hidden(&moe_out);
+                // Probe the RAW per-row MoE output (pre all-reduce): like attn_raw,
+                // the per-row single-token MoE must be bit-identical across
+                // identical rows. (allreduce arm only — the deepep arm's pre-gather
+                // buffer is owned-cols-sparse by construction.)
+                probe_rows("moe_raw", &moe_out, layer_idx)?;
+                // Routed experts are EP-sharded → sum, then add the replicated
+                // shared expert once per rank. One all-reduce over [N, hidden].
                 let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
                 self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
             }
+            keepalive.keep_hidden(&moe_out);
             probe_rows("moe_ar", &moe_out, layer_idx)?;
             // Phase 6a: grouped shared expert over [N] (dense FFN, prefill path,
             // decode_scratch=None) — one batched SwiGLU GEMM pair, replacing the
