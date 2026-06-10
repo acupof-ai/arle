@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+  # Build-only validation without cutting a tag. The tag-only trigger is why
+  # the broken builder stage (deleted `infer` crate) sat undetected for weeks.
+  workflow_dispatch:
 
 concurrency:
   group: docker-${{ github.ref }}
@@ -47,7 +50,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: true
+          # Publish only from tag pushes; dispatch runs are build-only checks.
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
