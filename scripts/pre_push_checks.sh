@@ -4,11 +4,24 @@
 #
 # Usage:
 #   scripts/pre_push_checks.sh
+#
+# Speed: HEAD is exported into a STABLE snapshot dir and refreshed with
+# rsync --checksum, so unchanged files keep their mtimes and cargo's
+# incremental cache (target/pre-push-quick) stays warm across runs. The
+# previous mktemp-per-run snapshot changed every source path on every
+# push, invalidating all workspace-crate fingerprints — a full cold
+# rebuild (~5-8 min) per push, which is why the .githooks/pre-push hook
+# got disabled. Warm runs are now sub-minute.
+#
+# The snapshot lives OUTSIDE the repo on purpose: inside the repo tree,
+# git commands run by the hygiene check would discover the parent repo
+# and operate on it instead of the snapshot.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SNAPSHOT_ROOT=""
+SNAPSHOT_ROOT="${TMPDIR:-/tmp}/arle-pre-push-snapshot"
+STAGE_ROOT=""
 
 info() { echo "[pre-push] $*"; }
 
@@ -18,27 +31,37 @@ run() {
 }
 
 cleanup() {
-    if [[ -n "${SNAPSHOT_ROOT}" && -d "${SNAPSHOT_ROOT}" ]]; then
-        rm -rf "${SNAPSHOT_ROOT}"
+    if [[ -n "${STAGE_ROOT}" && -d "${STAGE_ROOT}" ]]; then
+        rm -rf "${STAGE_ROOT}"
     fi
 }
 
 trap cleanup EXIT
 
-SNAPSHOT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arle-pre-push.XXXXXX")"
-info "exporting HEAD snapshot to ${SNAPSHOT_ROOT}"
-git -C "${REPO_ROOT}" archive HEAD | tar -x -C "${SNAPSHOT_ROOT}"
+STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arle-pre-push-stage.XXXXXX")"
+info "refreshing HEAD snapshot at ${SNAPSHOT_ROOT}"
+git -C "${REPO_ROOT}" archive HEAD | tar -x -C "${STAGE_ROOT}"
+mkdir -p "${SNAPSHOT_ROOT}"
+# --checksum keeps mtimes of content-identical files untouched (cargo sees
+# them as unchanged); --delete drops files removed from HEAD.
+rsync -a --delete --checksum "${STAGE_ROOT}/" "${SNAPSHOT_ROOT}/"
 cd "${SNAPSHOT_ROOT}"
 
 export CARGO_TERM_COLOR=always
 export RUSTFLAGS="-D warnings"
 export CARGO_TARGET_DIR="${REPO_ROOT}/target/pre-push-quick"
+# cudarc probes the CUDA version at build time; pin it so the cuda,no-cuda
+# typecheck works on hosts without nvcc.
+export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-12080}"
 
 run python3 scripts/check_repo_hygiene.py
 run cargo fmt --all -- --check
 run cargo check -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle
 run cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
 run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys --release
+run cargo test --release \
+    -p infer-core -p infer-server -p infer-plan -p infer-seam \
+    -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
 run cargo clippy -p kv-native-sys --release --all-targets -- -D warnings
 
 METAL_CHECKS="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
