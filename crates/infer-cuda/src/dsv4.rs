@@ -1028,9 +1028,12 @@ impl Dsv4Model {
         let seq_len = tokens.len();
         let use_gpu_router = std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some();
         let use_deepep_transport = dsv4_use_deepep_transport()?;
+        // FlashMLA-decode captures cleanly (proven per-portion 2026-06-08,
+        // byte-identical) — the old !flashmla conjunct predated that evidence.
+        // The graph body still runs the pooled MoE (device-side routing is the
+        // capturable form), hence the gpu_router requirement.
         if dsv4_decode_graph_enabled()
             && last_hidden_out.is_none()
-            && !crate::attention::dsv4_flashmla_decode_enabled()?
             && seq_len == 1
             && use_gpu_router
             && !use_deepep_transport
