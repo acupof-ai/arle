@@ -1177,6 +1177,26 @@ impl Dsv4CudaExecutor {
 
     fn submit(&mut self, plan: &ForwardPlan, kv_batch: &KvBatchDescriptor) -> Result<StepOutput> {
         let rows = plan.decode_rows.len() + plan.prefill_rows.len();
+        // Cross-rank lockstep debug surface: every rank logs a per-forward plan
+        // fingerprint. Divergence at tick K (different rows on different ranks)
+        // is the NCCL-deadlock root cause for multi-rank serve; diff the per-rank
+        // streams with RUST_LOG=infer_cuda=debug.
+        if rows > 0 && log::log_enabled!(log::Level::Debug) {
+            static PLAN_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tick = PLAN_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::debug!(
+                "[dsv4-plan] rank={} tick={tick} prefill={:?} decode={:?}",
+                self.model.tp.config().rank,
+                plan.prefill_rows
+                    .iter()
+                    .map(|r| (r.slot, r.start_pos, r.tokens.len()))
+                    .collect::<Vec<_>>(),
+                plan.decode_rows
+                    .iter()
+                    .map(|r| (r.slot, r.kv_seq_len))
+                    .collect::<Vec<_>>(),
+            );
+        }
         if rows == 0 {
             ensure!(
                 kv_batch.rows.is_empty(),
