@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use cudarc::driver::safe::{CudaGraph, CudaStream};
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
@@ -252,15 +252,21 @@ fn audit_capturing_graph(stream: &CudaStream) -> Result<CaptureAudit> {
         unsafe { cu::cuGraphNodeGetType(node, &mut ty).result()? };
         match ty {
             cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMCPY => {
-                let mut p: cu::CUDA_MEMCPY3D = unsafe { std::mem::zeroed() };
-                // SAFETY: p is a valid out-param for a memcpy node.
-                if unsafe { cu::cuGraphMemcpyNodeGetParams(node, &mut p) }
+                // CUDA_MEMCPY3D contains enums with no 0 variant — mem::zeroed
+                // aborts (validity check). MaybeUninit + driver-filled out-param.
+                let mut p = std::mem::MaybeUninit::<cu::CUDA_MEMCPY3D>::uninit();
+                // SAFETY: the driver fully writes the params on success.
+                if unsafe { cu::cuGraphMemcpyNodeGetParams(node, p.as_mut_ptr()) }
                     .result()
                     .is_ok()
-                    && (matches!(p.srcMemoryType, cu::CUmemorytype::CU_MEMORYTYPE_HOST)
-                        || matches!(p.dstMemoryType, cu::CUmemorytype::CU_MEMORYTYPE_HOST))
                 {
-                    audit.host_memcpy_nodes += 1;
+                    // SAFETY: success above guarantees initialization.
+                    let p = unsafe { p.assume_init() };
+                    if matches!(p.srcMemoryType, cu::CUmemorytype::CU_MEMORYTYPE_HOST)
+                        || matches!(p.dstMemoryType, cu::CUmemorytype::CU_MEMORYTYPE_HOST)
+                    {
+                        audit.host_memcpy_nodes += 1;
+                    }
                 }
             }
             cu::CUgraphNodeType::CU_GRAPH_NODE_TYPE_HOST => audit.host_fn_nodes += 1,
