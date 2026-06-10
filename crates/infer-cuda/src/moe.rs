@@ -2656,6 +2656,7 @@ mod dsv4_gpu {
     /// LL packed recv / GEMM-output scratch is pre-allocated once in `scratch`;
     /// this path only overwrites it (no per-step alloc beyond the small route +
     /// topk-id buffers + the routed/shared temporaries).
+    #[cfg(feature = "deepep")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dsv4_moe_forward_deepep_ll(
         model: &Dsv4Model,
