@@ -19,6 +19,8 @@ serde_json = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokenizers = { workspace = true }
 uuid = { workspace = true }
+minijinja = { version = "2.20.0", features = ["loop_controls"] }
+minijinja-contrib = { version = "2.20.0", features = ["pycompat"] }
 
 [features]
 default = []
