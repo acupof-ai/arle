@@ -573,11 +573,22 @@ impl SafetensorLoader {
             .with_context(|| format!("upload head-sharded tensor {name}"))
     }
 
-    /// Load this EP rank's per-expert MoE weights for one layer (gate/up/down +
+    /// Load this EP rank's MoE weights for one layer (routed gate/up/down +
     /// router gate + shared expert) and build the per-expert weight-pointer
-    /// tables. Naming follows the mlx-lm `qwen3_5_moe` HF convention. Only the
-    /// experts in `split.local_expert_start..local_expert_end()` are loaded
-    /// (single-GPU loads all).
+    /// tables. Only the experts in
+    /// `split.local_expert_start..local_expert_end()` are loaded (single-GPU
+    /// loads all).
+    ///
+    /// Routed experts ship in one of two layouts (see
+    /// [`qwen35_spec::Qwen35MoeTensorNames`]), auto-detected per layer:
+    ///   • per-expert `experts.{i}.{gate,up,down}_proj.weight` — loaded as
+    ///     separate matrices (byte-identical to the pre-stacked-support path);
+    ///   • stacked+fused `experts.gate_up_proj` `[E, 2*moe_inter, hidden]`
+    ///     (gate rows `[0, moe_inter)`, up rows `[moe_inter, 2*moe_inter)`)
+    ///     + `experts.down_proj` `[E, hidden, moe_inter]` (production
+    ///     Qwen3.6-35B-A3B) — each local expert's contiguous 2D block is
+    ///     sliced out by byte range and uploaded into the same
+    ///     `Vec<DeviceMatrix>` the per-expert path builds.
     ///
     /// Under TP the router gate (and the shared-expert sigmoid gate) stay
     /// replicated — routing must be computed identically on every rank — while
@@ -586,53 +597,181 @@ impl SafetensorLoader {
     pub(crate) fn load_moe_layer_experts(
         &self,
         ctx: &DeviceContext,
-        layer_prefix: &str,
+        names: &qwen35_spec::Qwen35MoeTensorNames,
         split: &crate::moe_config::ExpertSplit,
         tp: &TpConfig,
+        moe_intermediate_size: usize,
+        hidden_size: usize,
     ) -> Result<MoeLayerWeights> {
+        const BF16_ELEM_SIZE: usize = 2;
         let mut gate = Vec::with_capacity(split.experts_per_rank);
         let mut up = Vec::with_capacity(split.experts_per_rank);
         let mut down = Vec::with_capacity(split.experts_per_rank);
-        for e in split.local_expert_start..split.local_expert_end() {
-            let base = format!("{layer_prefix}.mlp.experts.{e}");
-            gate.push(self.load_matrix(ctx, &format!("{base}.gate_proj.weight"))?);
-            up.push(self.load_matrix(ctx, &format!("{base}.up_proj.weight"))?);
-            down.push(self.load_matrix(ctx, &format!("{base}.down_proj.weight"))?);
+        let per_expert_probe = names.expert_gate_proj(split.local_expert_start);
+        // The stacked tensors are HF `nn.Parameter`s — no `.weight` suffix on
+        // the real Qwen3.6-35B-A3B checkpoint — but accept a `.weight`-suffixed
+        // export too.
+        let resolve_stacked = |base: &str| -> Option<String> {
+            [base.to_string(), format!("{base}.weight")]
+                .into_iter()
+                .find(|name| self.has_tensor(name))
+        };
+        if self.has_tensor(&per_expert_probe) {
+            for e in split.local_expert_start..split.local_expert_end() {
+                gate.push(self.load_matrix(ctx, &names.expert_gate_proj(e))?);
+                up.push(self.load_matrix(ctx, &names.expert_up_proj(e))?);
+                down.push(self.load_matrix(ctx, &names.expert_down_proj(e))?);
+            }
+        } else if let Some(gate_up_name) = resolve_stacked(&names.experts_stacked_gate_up_proj) {
+            let down_name = resolve_stacked(&names.experts_stacked_down_proj).ok_or_else(|| {
+                anyhow!(
+                    "MoE layer `{}`: found stacked `{gate_up_name}` but no `{}` \
+                     (expected [{}, {hidden_size}, {moe_intermediate_size}])",
+                    names.mlp_prefix,
+                    names.experts_stacked_down_proj,
+                    split.num_experts
+                )
+            })?;
+            ensure!(
+                moe_intermediate_size > 0 && hidden_size > 0,
+                "MoE layer `{}`: stacked expert load needs non-zero config dims \
+                 (moe_intermediate_size={moe_intermediate_size}, hidden_size={hidden_size})",
+                names.mlp_prefix
+            );
+            let stacked_rows = 2 * moe_intermediate_size;
+            // Load each stacked tensor ONCE and slice every local expert out
+            // of its bytes — a per-expert load would copy the full [E, …]
+            // tensor `experts_per_rank` times.
+            let gate_up_t = self.load_tensor(&gate_up_name)?;
+            ensure!(
+                gate_up_t.shape == [split.num_experts, stacked_rows, hidden_size],
+                "{gate_up_name}: expected stacked fused gate‖up tensor \
+                 [{}, {stacked_rows}, {hidden_size}] \
+                 ([num_experts, 2*moe_intermediate_size, hidden_size]), got {:?}",
+                split.num_experts,
+                gate_up_t.shape
+            );
+            let down_t = self.load_tensor(&down_name)?;
+            ensure!(
+                down_t.shape == [split.num_experts, hidden_size, moe_intermediate_size],
+                "{down_name}: expected stacked down tensor \
+                 [{}, {hidden_size}, {moe_intermediate_size}] \
+                 ([num_experts, hidden_size, moe_intermediate_size]), got {:?}",
+                split.num_experts,
+                down_t.shape
+            );
+            for e in split.local_expert_start..split.local_expert_end() {
+                // gate_up_proj [E, 2*mi, hidden]: gate = rows [0, mi),
+                // up = rows [mi, 2*mi) of expert e's contiguous block.
+                let gate_bytes = crate::shard_slice::slice_stacked_expert(
+                    &gate_up_t.bytes,
+                    split.num_experts,
+                    stacked_rows,
+                    hidden_size,
+                    BF16_ELEM_SIZE,
+                    e,
+                    0,
+                    moe_intermediate_size,
+                )?;
+                gate.push(
+                    DeviceMatrix::from_safetensors(
+                        ctx,
+                        gate_bytes,
+                        moe_intermediate_size,
+                        hidden_size,
+                    )
+                    .with_context(|| format!("upload expert {e} gate slice of {gate_up_name}"))?,
+                );
+                let up_bytes = crate::shard_slice::slice_stacked_expert(
+                    &gate_up_t.bytes,
+                    split.num_experts,
+                    stacked_rows,
+                    hidden_size,
+                    BF16_ELEM_SIZE,
+                    e,
+                    moe_intermediate_size,
+                    moe_intermediate_size,
+                )?;
+                up.push(
+                    DeviceMatrix::from_safetensors(
+                        ctx,
+                        up_bytes,
+                        moe_intermediate_size,
+                        hidden_size,
+                    )
+                    .with_context(|| format!("upload expert {e} up slice of {gate_up_name}"))?,
+                );
+                // down_proj [E, hidden, mi]: the whole expert block.
+                let down_bytes = crate::shard_slice::slice_stacked_expert(
+                    &down_t.bytes,
+                    split.num_experts,
+                    hidden_size,
+                    moe_intermediate_size,
+                    BF16_ELEM_SIZE,
+                    e,
+                    0,
+                    hidden_size,
+                )?;
+                down.push(
+                    DeviceMatrix::from_safetensors(
+                        ctx,
+                        down_bytes,
+                        hidden_size,
+                        moe_intermediate_size,
+                    )
+                    .with_context(|| format!("upload expert {e} down slice of {down_name}"))?,
+                );
+            }
+        } else {
+            let legacy_switch_mlp =
+                resolve_stacked(&format!("{}.switch_mlp.gate_proj", names.mlp_prefix)).is_some();
+            bail!(
+                "MoE layer `{}`: no recognized routed-expert layout — need per-expert \
+                 `{per_expert_probe}` (+ up/down siblings) or stacked+fused \
+                 `{}` [{}, {}, {hidden_size}] + `{}` [{}, {hidden_size}, {moe_intermediate_size}]{}",
+                names.mlp_prefix,
+                names.experts_stacked_gate_up_proj,
+                split.num_experts,
+                2 * moe_intermediate_size,
+                names.experts_stacked_down_proj,
+                split.num_experts,
+                if legacy_switch_mlp {
+                    " (found unsupported legacy `switch_mlp.*`)"
+                } else {
+                    ""
+                }
+            );
         }
-        let router_gate = self.load_matrix(ctx, &format!("{layer_prefix}.mlp.gate.weight"))?;
-        let shared_prefix = format!("{layer_prefix}.mlp.shared_expert");
+        let router_gate = self.load_matrix(ctx, &names.router_gate)?;
         let (shared_gate, shared_up, shared_down) = if tp.is_single() {
             (
-                self.load_matrix(ctx, &format!("{shared_prefix}.gate_proj.weight"))?,
-                self.load_matrix(ctx, &format!("{shared_prefix}.up_proj.weight"))?,
-                self.load_matrix(ctx, &format!("{shared_prefix}.down_proj.weight"))?,
+                self.load_matrix(ctx, &names.shared_expert_gate_proj)?,
+                self.load_matrix(ctx, &names.shared_expert_up_proj)?,
+                self.load_matrix(ctx, &names.shared_expert_down_proj)?,
             )
         } else {
             (
                 self.load_matrix_sharded(
                     ctx,
-                    &format!("{shared_prefix}.gate_proj.weight"),
+                    &names.shared_expert_gate_proj,
                     infer_topo::ParallelLinearKind::Column,
                     tp,
                 )?,
                 self.load_matrix_sharded(
                     ctx,
-                    &format!("{shared_prefix}.up_proj.weight"),
+                    &names.shared_expert_up_proj,
                     infer_topo::ParallelLinearKind::Column,
                     tp,
                 )?,
                 self.load_matrix_sharded(
                     ctx,
-                    &format!("{shared_prefix}.down_proj.weight"),
+                    &names.shared_expert_down_proj,
                     infer_topo::ParallelLinearKind::Row,
                     tp,
                 )?,
             )
         };
-        let shared_gate_router = self.load_matrix(
-            ctx,
-            &format!("{layer_prefix}.mlp.shared_expert_gate.weight"),
-        )?;
+        let shared_gate_router = self.load_matrix(ctx, &names.shared_expert_gate)?;
 
         // Per-expert weight-pointer tables (one device pointer per owned expert).
         let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
@@ -670,6 +809,35 @@ impl SafetensorLoader {
             "tensor {name} not found in safetensors under {}",
             self.base.display()
         ))
+    }
+
+    /// Whether `name` exists in the checkpoint: weight-map lookup when an
+    /// index is present, otherwise each shard header is parsed (from the
+    /// read-once byte cache). Used to probe which routed-expert layout a MoE
+    /// checkpoint ships before committing to a load path.
+    pub(crate) fn has_tensor(&self, name: &str) -> bool {
+        if !self.weight_map.is_empty() {
+            return self.weight_map.contains_key(name);
+        }
+        (0..self.shards.len()).any(|idx| self.shard_has_tensor(idx, name).unwrap_or(false))
+    }
+
+    /// Header-only existence check against one shard — no tensor bytes are
+    /// copied (unlike `load_tensor_from_shard`).
+    fn shard_has_tensor(&self, idx: usize, name: &str) -> Result<bool> {
+        let path = self
+            .shards
+            .get(idx)
+            .ok_or_else(|| anyhow!("shard index {idx} out of range"))?;
+        if !self.shard_cache.borrow().contains_key(&idx) {
+            let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            self.shard_cache.borrow_mut().insert(idx, bytes);
+        }
+        let cache = self.shard_cache.borrow();
+        let bytes = cache.get(&idx).expect("shard bytes just cached");
+        let tensors = SafeTensors::deserialize(bytes)
+            .with_context(|| format!("deserialize {}", path.display()))?;
+        Ok(tensors.tensor(name).is_ok())
     }
 
     fn load_tensor_from_shard(&self, idx: usize, name: &str) -> Result<OwnedTensor> {
