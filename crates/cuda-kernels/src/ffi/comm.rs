@@ -51,4 +51,43 @@ unsafe extern "C" {
     pub fn arle_car_chain_touch(stream: CUstream, output: u64, input: u64) -> CUresult;
 
     pub fn arle_car_destroy(handle: *mut std::os::raw::c_void);
+
+    // ── Production ABI (serve path): handle exchange rides the already-up
+    // NCCL comm, not rendezvous files. `arle_car_create` takes OWNERSHIP of
+    // every pointer; `arle_car_destroy_prod` frees own regions and IPC-closes
+    // peer mappings.
+
+    /// cudaMalloc + zero a region and emit its 64-byte `cudaIpcMemHandle_t`.
+    pub fn arle_car_alloc_shared(bytes: usize, out_ptr: *mut u64, out_handle: *mut u8) -> CUresult;
+    /// Open a peer's 64-byte IPC handle (enables P2P lazily; failure here IS
+    /// the no-P2P probe).
+    pub fn arle_car_open_peer(handle: *const u8, out_ptr: *mut u64) -> CUresult;
+    /// Build the CustomAllreduce over `world` signal/input pointers (index =
+    /// rank; this rank's entries are its own allocations, others are opened
+    /// peer mappings). Registers the input set. Null on failure.
+    pub fn arle_car_create(
+        rank: i32,
+        world: i32,
+        signal_ptrs: *const u64,
+        input_ptrs: *const u64,
+    ) -> *mut std::os::raw::c_void;
+    /// bf16 sum allreduce: this rank's registered input scratch → `out_ptr`
+    /// (any local buffer). `force_algo`: 0 auto (one-shot < 256 KB @ world 8),
+    /// 1 one-shot, 2 two-shot.
+    pub fn arle_car_allreduce_bf16_into(
+        handle: *mut std::os::raw::c_void,
+        stream: CUstream,
+        out_ptr: u64,
+        elems: i32,
+        force_algo: i32,
+    ) -> CUresult;
+    /// bf16 one-shot all-gather of every rank's registered scratch chunk into
+    /// rank-major `out_ptr` (`[world × per_rank_elems]`, ncclAllGather layout).
+    pub fn arle_car_allgather_bf16_into(
+        handle: *mut std::os::raw::c_void,
+        stream: CUstream,
+        out_ptr: u64,
+        per_rank_elems: i32,
+    ) -> CUresult;
+    pub fn arle_car_destroy_prod(handle: *mut std::os::raw::c_void);
 }
