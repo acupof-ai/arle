@@ -71,13 +71,20 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
 
 ## Project shape
 
-`ARLE` is a Rust-native inference runtime with integrated local
-agent and **On-Policy Distillation (OPD)** workflows. The runtime
+`ARLE` is a Rust-native, device-neutral inference runtime with integrated
+local agent and **On-Policy Distillation (OPD)** workflows. The runtime
 remains primary:
 
-- `infer` owns serving/runtime truth.
+- The **`infer-*` rewrite stack owns serving/runtime truth**: `infer-plan`
+  (IR) → `infer-seam` (host-only traits) → `infer-core`
+  (Engine/scheduler/RadixCache) → `infer-cuda`/`infer-metal` (executors) →
+  `infer-server`/`infer-api`, with `infer-topo`/`infer-moe`/`infer-util` as
+  shared leaves. The monolithic `infer/` crate was **deleted 2026-06-04**
+  (`e81b98fb`, ~167k LOC) — any doc/command referencing `infer/` or
+  `-p infer` is stale.
 - `arle` is the runtime-led CLI front door for local agent, OPD train,
-  and eval workflows.
+  and eval workflows. `infer-api` (`LoadedInferenceEngine`) is the single
+  programmatic front door.
 - `train` extends the same runtime/model authority via **OPD only**;
   it is not a second equal product line with its own independent
   truth surface. Scratch pretrain, SFT, GRPO, and multi-turn RL
@@ -88,19 +95,19 @@ remains primary:
   axolotl). OPD is the one training axis where ARLE's runtime
   authority is structurally differentiating: it needs a strong
   inference path for the teacher and tight latency to score student
-  rollouts — both already in `infer`.
+  rollouts — both already in the `infer-*` runtime (teacher surface on
+  `infer-api`).
 
-No PyTorch and no Python on the hot path. Two backends plug into one contract
-(`server_engine::InferenceEngine`): the CUDA continuous-batching scheduler
-(Linux/NVIDIA, `cudarc` + TileLang AOT + native CUDA C) and the Metal scheduler
-runtime (Apple Silicon, `crates/mlx-sys` C++ bridge — continuous batching with
-variable-length packed decode via mlx-lm `BatchKVCache` pattern: left-padding +
-additive mask + per-row RoPE offsets, see
-[`infer/src/backend/metal/AGENTS.md`](infer/src/backend/metal/AGENTS.md) §7).
-Models: Qwen3.5-family. TileLang drives CUDA paged prefill/decode
-for BF16 attention; custom CUDA C handles quantized decode and supporting ops.
-Tests compare against JSON baselines in
-`infer/test_data/` — regenerate after any change affecting numerical output.
+No PyTorch and no Python on the hot path. Two backends plug into one seam
+(`infer_seam::{BackendExecutor, KvPool}` — two host-only traits): the CUDA
+continuous-batching executor (Linux/NVIDIA, `cudarc` + vendored official
+kernels FlashMLA/DeepGEMM/DeepEP + TileLang AOT + native CUDA C) and the
+Metal executor (Apple Silicon, `crates/mlx-sys` C++ bridge — continuous
+batching with variable-length packed decode via mlx-lm `BatchKVCache`
+pattern). The same `infer_core::Engine<E, K>` drives both; adding a backend
+means implementing the two seam traits, not touching scheduler/cache/server.
+Models: Qwen3.5-family (CUDA + Metal), Qwen3.6 (Metal), DSv4-Flash
+(CUDA 8×H20 TP=8/EP=8).
 
 **Metal canonical model — globally unified (2026-05-07).** All Metal
 backend development, benchmarking, and testing uses
@@ -112,7 +119,8 @@ backend development, benchmarking, and testing uses
   [`ROADMAP.md`](ROADMAP.md) Next-Model priority queue. Benching against
   the production shape catches MoE-specific perf and correctness
   regressions that Qwen3.5-0.8B (dense) cannot surface.
-- **Scope**: every Metal `metal_serve` invocation, `scripts/bench_*.sh`
+- **Scope**: every Metal serve invocation (`arle serve --backend metal`;
+  the legacy `metal_serve` bin is deleted), `scripts/bench_*.sh`
   default, smoke test, and `docs/experience/wins`/`errors` entry on the
   Metal track must use Qwen3.6. CUDA-side benches keep their existing
   defaults.
@@ -121,12 +129,12 @@ backend development, benchmarking, and testing uses
   set `INFER_TEST_MODEL_PATH=models/Qwen3.5-0.8B-MLX-4bit` and document
   the reason in the test/wins entry.
 - **Bench-script invocation**: `./scripts/bench_*.sh <label> --model
-  mlx-community/Qwen3.6-35B-A3B-4bit` (HF id; `metal_serve` resolves to
-  the cached snapshot). For `metal_serve` directly: `--model-path
+  mlx-community/Qwen3.6-35B-A3B-4bit` (HF id; the serve path resolves to
+  the cached snapshot). Direct: `arle serve --backend metal --model-path
   mlx-community/Qwen3.6-35B-A3B-4bit`.
 - **Auto-wired-limit** (default since
   [`2026-05-07-bench-qwen36-mle-perf.md`](docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md)):
-  `metal_serve` auto-pins model weights via `mlx::set_wired_limit`
+  Metal serve auto-pins model weights via `mlx::set_wired_limit`
   when `--wired-limit-bytes` isn't passed. Computes
   (model dir size + 1 GiB headroom) and follows HF cache symlinks.
   Drops c=1 p99 from 86 ms → 15 ms on Qwen3.6 (−82%). Opt-out via
@@ -138,28 +146,35 @@ backend development, benchmarking, and testing uses
   Refs: [baseline](docs/experience/wins/2026-05-07-bench-qwen36-baseline.md),
   [encode-bottleneck](docs/experience/wins/2026-05-07-bench-qwen36-encode-bottleneck.md).
 
-**Workspace (current):**
+**Workspace (current, post-rewrite 2026-06-04):**
 
 ```
 ARLE/
-├── src/                       ← thin `arle` binary
-├── infer/                     ← primary runtime crate (scheduler/model/ops/backends/HTTP/distributed)
+├── src/                       ← thin `arle` binary (root package `agent-infer`)
 ├── crates/
-│   ├── agent/chat/cli/tools   ← runtime-facing control-plane crates
-│   ├── autograd/              ← from-scratch autograd + optimizer + lr-schedule + AdamW codec
-│   ├── cuda-kernels/          ← csrc/{attention,gemm,kv,quant,misc}/, tools/tilelang/, ffi/, collective.rs (NCCL)
-│   ├── deepseek-spec/         ← DeepSeek V4 readiness scaffold (DS0 config + tensor names + Shard)
+│   ├── infer-plan/            ← backend-independent forward IR (ForwardPlan)
+│   ├── infer-seam/            ← host-only traits: BackendExecutor, KvPool, KvBatchDescriptor
+│   ├── infer-core/            ← Engine<E,K>: scheduler, RadixCache, chunked prefill, sampling
+│   ├── infer-cuda/            ← CUDA executor (Qwen + DSv4, TP/EP, FlashMLA/DeepGEMM/DeepEP)
+│   ├── infer-metal/           ← Metal/MLX executor (packed varlen decode)
+│   ├── infer-server/          ← HTTP serving (OpenAI v1 compat)
+│   ├── infer-api/             ← single front door: LoadedInferenceEngine + OPD-teacher surface
+│   ├── infer-topo/ infer-moe/ infer-util/  ← shared leaves (TP/EP topology, MoE, hf_hub/logging)
+│   ├── agent/ agent-bench/ chat/ cli/ tools/  ← control-plane crates (`cli` hosts serve/REPL)
+│   ├── autograd/              ← from-scratch autograd + optimizer (OPD substrate)
+│   ├── cuda-kernels/          ← csrc/{attention,gemm,kv,quant,misc}/, tools/tilelang/, ffi/, NCCL
+│   ├── deepep-sys/            ← DeepEP/NVSHMEM FFI (internode_ll dispatch/combine)
+│   ├── deepseek-spec/ qwen3-spec/ qwen35-spec/  ← model config + tensor-name + Shard contracts
 │   ├── kv-native-sys/         ← local persistence substrate for KV tier transports
-│   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc), Qwen3.5 step / MoE / DFlash draft / Metal capture hook
-│   ├── qwen3-spec/            ← Qwen3 config + tensor-parallel Shard enum (TP layout authority)
-│   ├── qwen35-spec/           ← shared Qwen3.5 config + tensor-name contract
-│   ├── train/                 ← train-side control plane + runtime-integrated RL stack
-│   └── xgrammar-sys/          ← Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode)
+│   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc)
+│   ├── train/                 ← OPD-only training (teacher via infer-api)
+│   └── xgrammar-sys/          ← grammar-constrained decode FFI
+├── vendor/                    ← vendored official kernels (FlashMLA, DeepGEMM, DeepEP, …)
 └── docs/                      ← projects/ plans/ experience/ reviews/ resources/
 ```
 
-CUDA kernels live at `crates/cuda-kernels/csrc/`, **not** `infer/csrc/`
-(common mistake — extracted 2026-04-15).
+CUDA kernels live at `crates/cuda-kernels/csrc/` + `vendor/`
+(adopt-official-first; hand-rolled only for the genuine gap).
 
 Workspace topology source of truth: [`docs/codebase-map.md`](docs/codebase-map.md).
 
@@ -173,7 +188,7 @@ Workspace topology source of truth: [`docs/codebase-map.md`](docs/codebase-map.m
 |-------|----------------|
 | **Explore** (trace callers, grep prior art, list trait implementors) | You can name every file you will touch. |
 | **Plan** (ask "how would this fail?" first; >5 files or irreversible → stop + flag) | Written approach the user accepted. |
-| **Implement** (check prior art in `infer/src/` + `docs/`; outside plan → update plan) | Diff compiles under the relevant feature set. |
+| **Implement** (check prior art in `crates/infer-*/src/` + `docs/`; outside plan → update plan) | Diff compiles under the relevant feature set. |
 | **Verify** (`cargo test --workspace`; justify every new `unwrap()`/alloc/async path; **bench entry per §Benchmarks** if diff is in-scope) | Tests green, `cargo clippy -- -D warnings` clean, **wins/ entry committed (or stub with `pending-remote`)**. |
 | **Reflect** (bug >1 attempt → `docs/experience/errors/`; correction → feedback memory) | Experience entry committed. |
 
@@ -195,11 +210,12 @@ Skip rules: trivial → Implement + Verify; exploration questions → Explore on
 ### Backend isolation (CRITICAL)
 
 - `#[cfg(feature = "cuda")]` / `#[cfg(feature = "metal")]` gating; **never
-  `cfg`-leak backend types into cross-backend modules** — route through
-  `backend.rs` / `server_engine.rs`.
+  `cfg`-leak backend types into cross-backend modules** — everything above
+  the seam (`infer-core`/`-server`/`-api`) stays device-neutral; backend
+  types live only in `infer-cuda` / `infer-metal`.
 - CUDA stubs on non-CUDA targets: `todo!("GPU required: ...")`.
 - Pre-push type check on Mac without nvcc:
-  `cargo check -p infer --no-default-features --features cuda,no-cuda`.
+  `cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib`.
 
 ### Delegation (general-purpose subagents execute, Codex reviews, parallel by default)
 
@@ -260,7 +276,7 @@ changes.
 - **MANDATORY — every runtime change produces a bench entry.** A diff isn't
   "done" until a dated entry lands under `docs/experience/wins/` (or
   `errors/` on regression). Verify-phase exit condition. No entry → not shipped.
-  - **In scope:** `infer/src/`, `crates/cuda-kernels/csrc/`,
+  - **In scope:** `crates/infer-*/src/`, `crates/cuda-kernels/csrc/`,
     `crates/mlx-sys/src/`, `src/`, `scripts/bench_*.{sh,py}` param changes,
     feature-flag default flips, hot-path dep bumps.
   - **Exempt:** docs / `AGENTS.md` / `CLAUDE.md` / memory / dev-only tooling
@@ -349,8 +365,8 @@ Xcode Metal capture / MLX instruments (Metal).
   "best ckpt across save-every-10" is a positively-biased estimator
   (`errors/2026-05-28-mmlu-cross-base-was-noise.md`).
 - **Pod-side probe trust is conditional on git+symbol checks.** Before flipping a default based on
-  pod output, verify the pod tree is a git repo at HEAD and `strings target/release/infer | grep <symbol>`
-  shows the change actually landed — `target/release/infer` proves *some* tree was current
+  pod output, verify the pod tree is a git repo at HEAD and `strings target/release/arle | grep <symbol>`
+  shows the change actually landed — the binary proves *some* tree was current
   *whenever it was last built*, not that the current source built it
   (`errors/2026-05-28-dsv4-flashmla-decode-parity-precond-fail.md`).
 - **Decode greedy-token decode the actual generation when a metric looks catastrophic.** Three weeks
@@ -384,25 +400,25 @@ wins/YYYY-MM-DD-slug.md  : # Title  ## Context  ## What Worked  ## Rule
 Always `--release` — debug GPU builds are unusably slow.
 
 ```bash
-CUDA_HOME=/usr/local/cuda cargo build --release                              # CUDA
-cargo build --release --no-default-features --features metal                 # Metal
-cargo build --release --no-default-features --features no-cuda               # no-GPU
-cargo check -p infer --no-default-features --features cuda,no-cuda           # Mac CUDA-Rust typecheck
+CUDA_HOME=/usr/local/cuda cargo build --release --features cuda              # CUDA (Linux+NVIDIA)
+cargo build --release --no-default-features --features metal,no-cuda         # Metal (Apple Silicon)
+cargo build --release --no-default-features --features cpu,no-cuda           # portable / CI smoke
+# Multi-GPU features stack: nccl (implies cuda) → deepep (implies nccl)
 
-cargo test --release                                   # ~9s, CPU-only
-cargo test --release --test e2e                        # GPU + weights
-cargo test --release --test e2e_qwen35
-cargo test --release --no-default-features --features metal
+# Mac CUDA-Rust typecheck without nvcc (CI-mirrored):
+cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
 
-# KV precision parity audit (CUDA only) — BF16 reference vs INT8/FP8/TQ4
-# trajectory match. Required after any change touching KV quant kernels,
-# `infer/src/model/qwen3/{prefill,batch_decode}.rs`, the paged-pool gating,
-# or `auto`-default selection.
-cargo test --release -p infer --features cuda \
-  --test kv_precision_parity -- --nocapture --test-threads=1
-# Knobs: KV_PARITY_PROMPTS / KV_PARITY_MAX_TOKENS / KV_PARITY_MAX_SEQ_LEN /
-# KV_PARITY_INCLUDE_TQ23=1. Report lands at target/kv-parity-<model>-<unix>.json.
+# Tests (CI-mirrored; see .github/workflows/*.yml for the full matrix):
+cargo test -p agent-infer --release --no-default-features --features cpu,no-cuda,cli
+cargo test -p cli --release --no-default-features --features metal,no-cuda   # Metal
+cargo test -p kv-native-sys --release
 ```
+
+**KV precision parity audit — NOT yet re-ported to `infer-cuda`.** The
+legacy-`infer` parity harness (BF16 reference vs INT8/FP8/TQ4 trajectory
+match) died with the monolith; re-porting it is a Phase 0 item in the
+master strategy v2 and **the gate every KV/quant default flip waits on**
+(FlashMLA decode / fused-wqkv / contig-MoE land gated-off until then).
 
 Env vars: `TORCH_CUDA_ARCH_LIST` (SM override, PyTorch convention; alt `CMAKE_CUDA_ARCHITECTURES`),
 `INFER_TILELANG_PYTHON` (TileLang AOT Python), `INFER_TEST_MODEL_PATH`
@@ -417,17 +433,14 @@ older than 30 days. Dev profile already keeps deps DWARF-free (see root
 
 ## Module Guides
 
-Load the relevant `AGENTS.md` **before** editing inside a module.
+Load the relevant `AGENTS.md` **before** editing inside a module. The
+per-module guides under the old `infer/src/**` were deleted with the
+monolith; for the `infer-*` rewrite crates the module truth is
+[`docs/architecture.md`](docs/architecture.md) +
+[`docs/codebase-map.md`](docs/codebase-map.md).
 
 | Path | Guide |
 |------|-------|
-| `infer/src/backend/` | [AGENTS.md](infer/src/backend/AGENTS.md) — backend trait, dispatch, cfg discipline |
-| `infer/src/backend/metal/` | [AGENTS.md](infer/src/backend/metal/AGENTS.md) — MLX bridge, unified memory, scheduler runtime + varlen scaffolding |
-| `infer/src/scheduler/` | [AGENTS.md](infer/src/scheduler/AGENTS.md) — continuous batching, prefix cache, slot lifecycle |
-| `infer/src/model/` | [AGENTS.md](infer/src/model/AGENTS.md) — ModelForward, state/weights split, hybrid models |
-| `infer/src/ops/` | [AGENTS.md](infer/src/ops/AGENTS.md) — visibility policy, `_into` variants, batched conventions |
-| `infer/src/kv_tier/` | [AGENTS.md](infer/src/kv_tier/AGENTS.md) — tier model, RadixCache invariant, MR stability |
-| `infer/src/http_server/` | [AGENTS.md](infer/src/http_server/AGENTS.md) — OpenAI v1 compat, `session_id`, streaming |
 | `crates/autograd/` | [AGENTS.md](crates/autograd/AGENTS.md) — training-tape engine, CPU + Metal backends, host-authoritative `Vec<f32>` |
 | `crates/cuda-kernels/` | [AGENTS.md](crates/cuda-kernels/AGENTS.md) — prelude discipline, csrc layout, TileLang AOT |
 | `crates/mlx-sys/` | [AGENTS.md](crates/mlx-sys/AGENTS.md) — single Metal bridge, cmake+cc build, no repo `.metal` |
