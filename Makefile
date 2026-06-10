@@ -41,8 +41,18 @@ bench-metal:
 	./scripts/bench_guidellm.sh make-bench-metal --model $(METAL_MODEL)
 
 # ── CUDA (Linux / NVIDIA GPU) ─────────────────────────────────────────────────
+# sccache (when installed) wraps both rustc and nvcc — including the TileLang
+# AOT cubins — so kernel rebuilds after a csrc/.cuh touch are cache hits.
 build-cuda:
-	CUDA_HOME=$${CUDA_HOME:-/usr/local/cuda} cargo build --release --features cuda
+	@if command -v sccache >/dev/null 2>&1; then \
+		echo "[build-cuda] sccache detected: wrapping rustc + nvcc"; \
+		CUDA_HOME=$${CUDA_HOME:-/usr/local/cuda} \
+		RUSTC_WRAPPER=$${RUSTC_WRAPPER:-sccache} \
+		ARLE_NVCC_WRAPPER=$${ARLE_NVCC_WRAPPER:-sccache} \
+		cargo build --release --features cuda; \
+	else \
+		CUDA_HOME=$${CUDA_HOME:-/usr/local/cuda} cargo build --release --features cuda; \
+	fi
 
 # Mac-safe CUDA-Rust typecheck (CI-mirrored; no nvcc required)
 check-cuda:
