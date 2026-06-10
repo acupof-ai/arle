@@ -2,10 +2,14 @@
 //!
 //! [`CudaKvPool`] is the host-side page manager implementing the host-only
 //! [`KvPool`] seam (alloc/grow/truncate + prefix retain/release), structurally
-//! identical to [`infer_metal::MetalKvPool`]. [`CudaExecutor`] implements
-//! [`BackendExecutor`]: a CPU-testable placeholder without `cuda`, the real
-//! cuda-kernels path with it. Scope: dense BF16 Qwen3, safetensors, single
-//! scheduled row, device argmax greedy / host temperature sampling.
+//! identical to [`infer_metal::MetalKvPool`]. It is the SINGLE page allocator
+//! for the Qwen-dense paged path: the executor lowers each scheduled row's
+//! host page table into the device pool (`TokenKVPool::mirror_slot`), which is
+//! what makes radix prefix attach serve real device KV. [`CudaExecutor`]
+//! implements [`BackendExecutor`] (CPU-testable placeholder without `cuda`)
+//! and dispatches three model arms: dense BF16 Qwen3 (paged, host-mirrored),
+//! Qwen3.5/3.6 hybrid MoE (per-slot arena, recurrent state), and DSv4-Flash
+//! FP8 (per-slot MLA arena, multi-GPU TP/EP).
 //!
 //! Depends only on `infer-plan` + `infer-seam`, never engine-core.
 

@@ -116,11 +116,20 @@ impl RealCudaExecutor {
         plan: &ForwardPlan,
         host_kv: &mut dyn KvPool,
     ) -> Result<StepOutput> {
-        let kv_batch = KvBatchDescriptor::from_plan(plan, host_kv)?;
+        // The descriptor is built per arm: Qwen-dense lowers it into its device
+        // page pool (host-authoritative mirror), DSv4 validates + adapts it.
+        // Qwen3.5 hybrid owns per-slot KV state and consumes neither, so it
+        // skips the per-step page-id flattening entirely.
         match self {
-            Self::Qwen(q) => q.submit(plan, host_kv),
+            Self::Qwen(q) => {
+                let kv_batch = KvBatchDescriptor::from_plan(plan, host_kv)?;
+                q.submit(plan, host_kv, &kv_batch)
+            }
             Self::Qwen35(q) => q.submit(plan),
-            Self::Dsv4(d) => d.submit(plan, &kv_batch),
+            Self::Dsv4(d) => {
+                let kv_batch = KvBatchDescriptor::from_plan(plan, host_kv)?;
+                d.submit(plan, &kv_batch)
+            }
         }
     }
 
@@ -249,6 +258,17 @@ pub(crate) struct QwenCudaExecutor {
     model: CudaModel,
     kv: PagedKVPool,
     num_slots: usize,
+    /// Per-slot (occupant epoch, materialized token count) continuity guard.
+    ///
+    /// The host `CudaKvPool` is the single page allocator; this executor only
+    /// mirrors the host page table into the device pool per scheduled row
+    /// (`TokenKVPool::mirror_slot`), so the device pool no longer proves that
+    /// the KV rows behind a resumed position were actually written. This
+    /// watermark restores that loud-error contract: within one occupant epoch,
+    /// rows must append contiguously; a NEW epoch may start at `append_pos > 0`
+    /// only because the engine attached a radix prefix whose retained pages
+    /// still hold the publishing request's KV rows.
+    slot_progress: Vec<SlotProgress>,
     /// Fixed device buffers for the B=1 captured decode path. Built lazily at
     /// warmup; `None` until then / on capture failure (capture is never
     /// load-bearing for correctness — eager is the floor).
@@ -257,6 +277,28 @@ pub(crate) struct QwenCudaExecutor {
     /// fixed at [`DECODE_GRAPH_BATCH`], so `num_pages` is the only varying capture
     /// scalar. A new page count recaptures.
     graphs: Option<GraphBucket>,
+}
+
+/// One slot's executor-side materialization watermark (see
+/// [`QwenCudaExecutor::slot_progress`]).
+#[derive(Clone, Copy)]
+struct SlotProgress {
+    /// Host-pool occupant epoch the watermark belongs to.
+    epoch: u64,
+    /// Tokens materialized (KV rows written or prefix-attached) for that epoch.
+    len: usize,
+}
+
+impl Default for SlotProgress {
+    fn default() -> Self {
+        // u64::MAX never collides with a real host epoch (epochs start at 0 and
+        // bump by 1-2 per occupancy), so the first real row always takes the
+        // fresh-occupant branch.
+        Self {
+            epoch: u64::MAX,
+            len: 0,
+        }
+    }
 }
 
 impl std::fmt::Debug for QwenCudaExecutor {
@@ -311,10 +353,12 @@ impl QwenCudaExecutor {
             kv.page_size
         );
 
+        let slot_progress = vec![SlotProgress::default(); num_slots];
         Ok(Self {
             model,
             kv,
             num_slots,
+            slot_progress,
             decode_ctx: None,
             graphs: None,
         })
@@ -324,6 +368,7 @@ impl QwenCudaExecutor {
         &mut self,
         plan: &ForwardPlan,
         host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor,
     ) -> Result<StepOutput> {
         ensure!(
             host_kv.page_size() == SUPPORTED_PAGE_SIZE,
@@ -341,6 +386,15 @@ impl QwenCudaExecutor {
             plan.prefill_rows.len(),
             plan.decode_rows.len()
         );
+        ensure!(
+            kv_batch.rows.len() == 1,
+            "KV batch descriptor carries {} rows for a single-row plan",
+            kv_batch.rows.len()
+        );
+        let kv_row = &kv_batch.rows[0];
+        // Host page table covering [0, append_end) for this row — the engine
+        // already allocated the append span in the host pool.
+        let pages = &kv_batch.flat_page_ids[kv_row.page_range.clone()];
 
         let token = if let Some(row) = plan.prefill_rows.first() {
             ensure!(
@@ -352,14 +406,19 @@ impl QwenCudaExecutor {
             ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
             let expected_len = row.start_pos + row.tokens.len();
             ensure!(
-                host_kv.seq_len(row.slot) >= expected_len,
-                "host KV length {} is behind prefill materialization end {} for slot {}",
-                host_kv.seq_len(row.slot),
-                expected_len,
-                row.slot
+                kv_row.slot == row.slot
+                    && kv_row.append_pos == row.start_pos
+                    && kv_row.append_len == row.tokens.len(),
+                "KV batch row (slot {}, append {}+{}) does not match prefill row (slot {}, {}+{})",
+                kv_row.slot,
+                kv_row.append_pos,
+                kv_row.append_len,
+                row.slot,
+                row.start_pos,
+                row.tokens.len()
             );
-            self.ensure_slot_ready_for_prefill(row.slot, row.start_pos)?;
-            self.kv.alloc_tokens(row.slot, row.tokens.len())?;
+            self.advance_slot_progress(row.slot, kv_row.slot_epoch, row.start_pos, expected_len)?;
+            self.kv.mirror_slot(row.slot, pages, expected_len)?;
             let position = expected_len as u64;
             self.model.forward_tokens(
                 row.slot,
@@ -378,20 +437,23 @@ impl QwenCudaExecutor {
                 self.num_slots
             );
             ensure!(
-                self.kv.seq_len(row.slot) == row.kv_seq_len,
-                "CUDA materialized cache_len {} != DecodeRow.kv_seq_len {} for slot {}",
-                self.kv.seq_len(row.slot),
+                kv_row.slot == row.slot
+                    && kv_row.append_pos == row.kv_seq_len
+                    && kv_row.append_len == 1,
+                "KV batch row (slot {}, append {}+{}) does not match decode row (slot {}, kv_seq_len {})",
+                kv_row.slot,
+                kv_row.append_pos,
+                kv_row.append_len,
+                row.slot,
+                row.kv_seq_len
+            );
+            self.advance_slot_progress(
+                row.slot,
+                kv_row.slot_epoch,
                 row.kv_seq_len,
-                row.slot
-            );
-            ensure!(
-                host_kv.seq_len(row.slot) > row.kv_seq_len,
-                "host KV length {} is behind decode materialization end {} for slot {}",
-                host_kv.seq_len(row.slot),
                 row.kv_seq_len + 1,
-                row.slot
-            );
-            self.kv.alloc_tokens(row.slot, 1)?;
+            )?;
+            self.kv.mirror_slot(row.slot, pages, row.kv_seq_len + 1)?;
             let position = row.kv_seq_len.saturating_add(1) as u64;
             // Try the captured graph; on any miss fall back to the eager path.
             match self.try_captured_decode(row.slot, row.last_token, row.kv_seq_len)? {
@@ -481,14 +543,17 @@ impl QwenCudaExecutor {
         self.decode_ctx = Some(ctx);
         self.graphs = Some(GraphBucket::new(self.model.ctx.stream.clone()));
 
-        // Reserve dummy slot 0 with a single token so the page table is valid for
-        // num_pages = 1, capture, then release it so serving starts clean.
+        // Mirror dummy slot 0 onto page 0 for a single token so the page table
+        // is valid for num_pages = 1, capture, then clear the view so serving
+        // starts clean. The capture writes throwaway KV into page 0's rows; the
+        // first real occupant of that page overwrites them. The device
+        // allocator is never used — the host pool is the single allocator and
+        // serving rows arrive via `mirror_slot`.
         ensure!(self.num_slots > 0, "warmup needs at least one slot");
         let dummy_slot = 0usize;
-        self.kv.free_slot(dummy_slot);
-        self.kv.alloc_tokens(dummy_slot, 1)?;
+        self.kv.mirror_slot(dummy_slot, &[0], 1)?;
         let capture_result = self.capture_decode_for_current_state(dummy_slot, 0, 0);
-        self.kv.free_slot(dummy_slot);
+        self.kv.mirror_slot(dummy_slot, &[], 0)?;
         capture_result?;
         self.model.ctx.sync()?;
         Ok(())
@@ -565,18 +630,32 @@ impl QwenCudaExecutor {
         sample_cuda_token(&self.model.ctx, &decode_ctx.logits, params, position)
     }
 
-    fn ensure_slot_ready_for_prefill(&mut self, slot: usize, start_pos: usize) -> Result<()> {
-        let materialized = self.kv.seq_len(slot);
-        if start_pos == 0 {
-            if materialized != 0 {
-                self.kv.free_slot(slot);
-            }
-            return Ok(());
+    /// Loud-error continuity guard replacing the old device-allocator
+    /// materialized checks (see [`QwenCudaExecutor::slot_progress`]).
+    ///
+    /// Same occupant epoch ⇒ this executor must already have materialized
+    /// exactly `append_pos` tokens (chunked prefill and decode append
+    /// contiguously). A new epoch is a fresh occupant: `append_pos == 0` is a
+    /// normal fresh prefill; `append_pos > 0` means the engine attached a radix
+    /// prefix whose retained pages still hold the publishing request's KV rows
+    /// (the host pool never recycled them), so the occupant starts materialized
+    /// at that length.
+    fn advance_slot_progress(
+        &mut self,
+        slot: usize,
+        epoch: u64,
+        append_pos: usize,
+        end: usize,
+    ) -> Result<()> {
+        let progress = &mut self.slot_progress[slot];
+        if progress.epoch == epoch {
+            ensure!(
+                progress.len == append_pos,
+                "CUDA slot {slot} epoch {epoch} materialized {} tokens but the plan resumes at {append_pos} (non-contiguous append)",
+                progress.len
+            );
         }
-        ensure!(
-            materialized == start_pos,
-            "chunked prefill requires materialized CUDA cache_len == start_pos; got cache_len={materialized}, start_pos={start_pos}"
-        );
+        *progress = SlotProgress { epoch, len: end };
         Ok(())
     }
 }
