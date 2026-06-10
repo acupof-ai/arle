@@ -82,24 +82,22 @@ EOF
 
 if [[ $DO_TARBALL -eq 1 ]]; then
   echo "== Building binary tarball =="
-  if [[ ! -x target/release/infer ]]; then
-    echo "[fatal] target/release/infer not present — build first with:"
-    echo "  ARLE_CUDA_DISABLE_MARLIN_W4_FP8=1 CUDA_HOME=/path/to/cuda-${CUDA_VER} \\"
-    echo "    cargo build --release --features cuda,nccl -p infer --bin infer"
+  if [[ ! -x target/release/arle ]]; then
+    echo "[fatal] target/release/arle not present — build first with:"
+    echo "  CUDA_HOME=/path/to/cuda-${CUDA_VER} \\"
+    echo "    cargo build --release --features cuda,nccl --bin arle"
     exit 2
   fi
   TBOX="${DIST_DIR}/arle-infer-${TAG}"
   rm -rf "$TBOX"
   mkdir -p "$TBOX"
-  cp target/release/infer "$TBOX/"
-  [[ -x target/release/arle ]] && cp target/release/arle "$TBOX/"
+  cp target/release/arle "$TBOX/"
   # Ship the LICENSE + a tag-keyed README so the package is self-documenting.
   cp LICENSE "$TBOX/" 2>/dev/null || true
   cat >"${TBOX}/README.md" <<EOF
 # arle-infer — release package ${TAG}
 
-- Binary: \`infer\` (CUDA inference server)
-- CLI: \`arle\` (if present)
+- Binary: \`arle\` (CLI front door + CUDA inference server)
 - Built against CUDA ${CUDA_VER} on ${OS_TAG} / ${ARCH}
 - Commit: ${COMMIT}
 - Build date: ${DATE_UTC}
@@ -113,7 +111,7 @@ if [[ $DO_TARBALL -eq 1 ]]; then
 ## Quick start
 
 \`\`\`bash
-./infer serve --port 8000
+./arle serve --backend cuda --model-path <model-dir> --port 8000
 \`\`\`
 EOF
   tar -czf "${TBOX}.tar.gz" -C "$DIST_DIR" "arle-infer-${TAG}"
