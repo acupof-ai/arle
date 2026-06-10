@@ -71,22 +71,6 @@ export ARLE_MODEL=models/Qwen3.5-4B
 ./target/release/arle --max-turns 10
 ```
 
-### `AGENT_INFER_API_KEY`
-
-Default Bearer token for HTTP serving entry points that opt into API auth.
-
-Current use:
-
-- The Metal serving path (`arle serve --backend metal`) uses this when
-  `--api-key` is omitted.
-
-Example:
-
-```bash
-export AGENT_INFER_API_KEY=dev-secret
-./target/release/arle serve --backend metal --model-path mlx-community/Qwen3.5-4B-bf16
-```
-
 ### Apple Silicon one-command bring-up
 
 The canonical Metal serving entrypoint is `arle serve --backend metal`. The rewrite
@@ -100,43 +84,13 @@ arle serve --backend metal --model-path mlx-community/Qwen3.5-4B-bf16 --port 801
 
 Run `arle serve --help` for the full flag surface.
 
-### `AGENT_INFER_TEST_MODEL_PATH`
-
-Override model path for selected CLI-side tests.
-
-### `AGENT_INFER_METAL_KV_POOL`
-
-Legacy compatibility fallback for the experimental Metal KV pool path.
-
-Current use:
-
-- The Metal serving path (`arle serve --backend metal`) and Metal bench
-  harnesses under `scripts/`.
-
-Behavior:
-
-- If neither `--kv-pool` nor `--no-kv-pool` is passed, these entry points use
-  `AGENT_INFER_METAL_KV_POOL` as a fallback.
-- Prefer the explicit CLI flags over this environment variable.
-
-Status: experimental, fallback-only.
-
 ### Metal runtime memory limits
 
-The MLX allocator limits for Metal are currently exposed as CLI flags, not
-environment variables:
-
-- `--memory-limit-bytes`
-- `--cache-limit-bytes`
-- `--wired-limit-bytes`
-
-Current use:
-
-- The Metal serving path (`arle serve --backend metal`) and Metal bench
-  harnesses under `scripts/`.
-
-These are applied before model load and affect the whole process-local MLX
-allocator state.
+The rewrite Metal executor auto-pins model weights via `mlx::set_wired_limit`
+at construction (model dir size + 1 GiB headroom —
+`crates/infer-metal/src/wired_limit.rs`). The monolith-era
+`--memory-limit-bytes` / `--cache-limit-bytes` / `--wired-limit-bytes` flags
+no longer exist; there is currently no CLI or env override.
 
 ### `INFER_MOE_TOP_K`
 
@@ -301,7 +255,7 @@ as diagnostics and validation gates, not stable tuning API.
 
 | Variable | Values | Default | Current behavior |
 |---|---|---|---|
-| `ARLE_DSV4_MOE_BACKEND` | `allreduce`, `native-deepep`, `native_deepep`, legacy `deepep`, unset | unset = current all-reduce default | Selects the DSv4 MoE runtime. The current default is local routed experts plus EP all-reduce because native DeepEP is not correct on replicated token rows. `native-deepep` is reserved for the future token-owned DP/EP path and currently fails during startup on the replicated-token executable route; legacy `deepep` names the older DeepEP-style diagnosis path, not a default-worthy SGLang path. |
+| `ARLE_DSV4_MOE_BACKEND` (alias `ARLE_DSV4_MOE_TRANSPORT`) | `allreduce` (default), `deepep`, `deepep_ll` | `allreduce` | Selects the DSv4 MoE transport (`infer-cuda/src/dsv4.rs::dsv4_use_deepep_transport`). `allreduce` = local routed experts + EP all-reduce (the licensed default). `deepep` / `deepep_ll` = NVSHMEM token-owned DeepEP paths; B=1 deepep_ll is fixed (`b5f00399`) but the batched lane license is open (#61) — not default-worthy yet. |
 | `ARLE_DSV4_INCREMENTAL_KV` | `1` / unset | unset | Enables the incremental DSv4 KV state path used by the 8-rank HTTP bring-up. |
 | `ARLE_DSV4_TRACE_LAYER` | `1` / unset | unset | Emits CUDA-synchronizing per-layer phase traces and request-level DSv4 operator aggregates. Use for diagnosis only; it changes latency. |
 | `ARLE_DSV4_OPERATOR_TRACE` | `1` / unset | unset | Enables the same CUDA-synchronizing DSv4 operator aggregate in `request_trace` JSON without emitting every per-layer event log line. The field is `dsv4_operator_trace_process_delta` and is valid for single-inflight profiling only. |
@@ -450,30 +404,6 @@ INFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release --test e2e
   --port 8765 -- --max-running-requests 16
 ```
 
-### `INFER_E2E_MODEL_PATH`
-
-Override model path for selected E2E regeneration flows
-(`infer/tests/regen_test_data.rs`).
-
-### `INFER_Q35_PATH`
-
-Override model path for the Qwen3.5 GGUF smoke test
-(`infer/tests/smoke_qwen35_gguf.rs`).
-
-### `INFER_QWEN35_4B_GGUF_PATH`
-
-Override model path for the Qwen3.5 4B GGUF ground-truth Q4_K test
-(`infer/tests/ground_truth_q4k.rs`).
-
-### `INFER_CARNICE_PATH`
-
-Override model path for Carnice 27B Q4_K / real-tensor-dequant /
-dtype-audit tests
-(`infer/tests/smoke_carnice_27b_q4k.rs`,
-`infer/tests/carnice_real_tensor_dequant.rs`,
-`infer/tests/carnice_dtype_audit.rs`,
-`infer/tests/carnice_tensor_probe.rs`).
-
 ### `INFER_URL`
 
 Base URL for integration-style Python API tests.
@@ -481,11 +411,6 @@ Base URL for integration-style Python API tests.
 ### `INFER_MODEL`
 
 Model name expected by integration-style Python API tests.
-
-### `AGENT_INFER_TEST_MODEL_PATH`
-
-CLI-side live-agent integration test model path override
-(`tests/cli_agent_live.rs`).
 
 ### `HF_TOKEN`
 
@@ -552,25 +477,10 @@ export INFER_MODEL=Qwen3.5-4B
 These exist in the repository, but should be treated as less stable unless the
 docs promote them more clearly:
 
-- `AGENT_INFER_METAL_KV_POOL`
 - `AGENT_INFER_GDR_METAL_KERNEL`
-- `INFER_E2E_MODEL_PATH`
-- `INFER_ROPE_CACHE_LEN` — override RoPE cache allocation length in `weight_loader.rs`
-- `INFER_FORCE_BF16_QUANT` — skip all packed-quant fast paths in
-  `weight_loader.rs` and force BF16 tensor load (debug aid for quant-format issues)
-- `INFER_DEBUG_DUMP` — enable tensor debug-dump capture in
-  `infer/src/model/common.rs` (default off; set to any value to enable)
-- `INFER_PREFILL_WARMUP` — controls the CUDA scheduler's startup prefill
-  warmup pass (`infer/src/scheduler/cuda/core/warmup.rs`). Default is enabled.
-  Set to `0`, `false`, `off`, or `no` to skip the pass for cold-start A/B
-  measurements; this is a diagnostic escape hatch, not a runtime tuning knob.
 - `AGENT_INFER_QWEN35_CPP_SEPARATE` — toggle the Rust→C++ separate-proj
   path in `crates/infer-metal/src/qwen35.rs`. Default on; set to `0`
   to force the fused route for A/B comparison
-- `METAL_NO_CPP` — disable the Metal Qwen3.5 C++ route entirely
-  (`crates/infer-metal/src/qwen35.rs`). Default unset (C++
-  route enabled). Set to any value to fall back to the Rust reference
-  path for debugging
 - `AGENT_INFER_QWEN35_CPP_KEEP_PREFILL_INTERMEDIATES` — keep prefill
   intermediate tensors in the Qwen3.5 C++ step model (`mlx_qwen35_model.cpp`)
   for debugging; default off

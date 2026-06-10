@@ -1,62 +1,56 @@
 # ARLE — local development shortcuts
 #
+# Targets mirror the CI matrix (.github/workflows/{ci,metal-ci,cuda-ci}.yml).
+#
 # Usage:
 #   make hygiene                  # public docs/templates/link guardrails
-#   make build-metal               # macOS / Apple Silicon
-#   make build-agent-metal         # macOS / Apple Silicon CLI
-#   make check-metal               # verify infer + arle Metal surfaces
-#   make test-metal                # run Metal lib tests serially
-#   make bench-metal METAL_MODEL=models/Qwen3-0.6B-4bit
-#   make build-cuda                # Linux / NVIDIA GPU
-#   make bench-cuda
-#   make test                      # any platform (CPU-only)
+#   make build-metal              # macOS / Apple Silicon → target/release/arle
+#   make check-metal              # CI-mirrored Metal checks (infer-api lib + CLI surface)
+#   make test-metal               # CI-mirrored Metal tests (cli crate + smoke)
+#   make bench-metal              # canonical guidellm bench (Qwen3.6 default)
+#   make build-cuda               # Linux / NVIDIA GPU → target/release/arle
+#   make check-cuda               # Mac-safe CUDA-Rust typecheck (no nvcc needed)
+#   make test                     # any platform (CPU-only, CI-mirrored)
 #   make test-py
-#   make web-install               # bun install for the web/ landing
-#   make web-dev                   # dev server with HMR (Astro+Vite)
-#   make web-build                 # production build to web/dist/
-#   make web-check                 # type-check the web/ frontend
-#   make web-clean                 # remove web/dist + web/.astro + web/node_modules
+#   make web-install              # bun install for the web/ landing
+#   make web-dev                  # dev server with HMR (Astro+Vite)
+#   make web-build                # production build to web/dist/
+#   make web-check                # type-check the web/ frontend
+#   make web-clean                # remove web/dist + web/.astro + web/node_modules
 
-METAL_MODEL ?= models/Qwen3-0.6B-4bit
-CUDA_MODEL ?= models/Qwen3-4B
+METAL_MODEL ?= mlx-community/Qwen3.6-35B-A3B-4bit
 
-.PHONY: hygiene build-metal build-agent-metal check-metal test-metal bench-metal bench-metal-compare build-cuda bench-cuda test test-py pre-push install-hooks web-install web-dev web-build web-check web-clean
+.PHONY: hygiene build-metal check-metal test-metal bench-metal build-cuda check-cuda test test-py pre-push install-hooks web-install web-dev web-build web-check web-clean
 
 hygiene:
 	python3 scripts/check_repo_hygiene.py
 
 # ── Metal (macOS / Apple Silicon) ────────────────────────────────────────────
 build-metal:
-	cargo build --release --no-default-features --features metal,no-cuda -p infer
-
-build-agent-metal:
 	cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
 
 check-metal:
-	cargo check --no-default-features --features metal,no-cuda -p infer --lib
+	cargo check -p infer-api --no-default-features --features metal,no-cuda --lib
 	cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
 
 test-metal:
-	cargo test --no-default-features --features metal,no-cuda -p infer --lib -- --test-threads 1
+	cargo test -p cli --release --no-default-features --features metal,no-cuda
+	cargo test -p agent-infer --release --no-default-features --features metal,no-cuda,cli --test cli_smoke
 
 bench-metal:
-	cargo run --release -p infer --no-default-features --features metal,no-cuda \
-		--bin metal_bench -- --model $(METAL_MODEL)
-
-bench-metal-compare:
-	cargo run --release -p infer --no-default-features --features metal,no-cuda \
-		--bin metal_bench -- --model $(METAL_MODEL) --compare-baseline benchmarks/metal_baseline.json
+	./scripts/bench_guidellm.sh make-bench-metal --model $(METAL_MODEL)
 
 # ── CUDA (Linux / NVIDIA GPU) ─────────────────────────────────────────────────
 build-cuda:
-	cargo build --release --features cuda -p infer
+	CUDA_HOME=$${CUDA_HOME:-/usr/local/cuda} cargo build --release --features cuda
 
-bench-cuda:
-	cargo run --release --features cuda --bin bench_serving
+# Mac-safe CUDA-Rust typecheck (CI-mirrored; no nvcc required)
+check-cuda:
+	cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
 
 # ── Platform-agnostic ─────────────────────────────────────────────────────────
 test:
-	cargo test --no-default-features --features no-cuda -p infer --lib
+	cargo test -p agent-infer --release --no-default-features --features cpu,no-cuda,cli
 
 test-py:
 	pytest tests/python/ -x

@@ -132,13 +132,14 @@ backend development, benchmarking, and testing uses
   mlx-community/Qwen3.6-35B-A3B-4bit` (HF id; the serve path resolves to
   the cached snapshot). Direct: `arle serve --backend metal --model-path
   mlx-community/Qwen3.6-35B-A3B-4bit`.
-- **Auto-wired-limit** (default since
+- **Auto-wired-limit** (always-on since
   [`2026-05-07-bench-qwen36-mle-perf.md`](docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md)):
-  Metal serve auto-pins model weights via `mlx::set_wired_limit`
-  when `--wired-limit-bytes` isn't passed. Computes
+  the rewrite Metal executor auto-pins model weights via
+  `mlx::set_wired_limit` at construction
+  (`infer-metal/src/wired_limit.rs`). Computes
   (model dir size + 1 GiB headroom) and follows HF cache symlinks.
-  Drops c=1 p99 from 86 ms → 15 ms on Qwen3.6 (−82%). Opt-out via
-  `--wired-limit-bytes 0`.
+  Drops c=1 p99 from 86 ms → 15 ms on Qwen3.6 (−82%). The monolith-era
+  `--wired-limit-bytes` flag (and its `0` opt-out) no longer exists.
 - **MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER — not a default.**
   Qwen3.5-dense-only tune; on Qwen3.6 MoE benched wash-or-loss because 95% of
   step is `mx::async_eval` encoding ~600-1000 primitives — buffer cap doesn't

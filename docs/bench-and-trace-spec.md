@@ -80,6 +80,11 @@ delta attributable.
 
 ### 3.1 `/v1/stats` service trace
 
+> **Rewrite gap (2026-06-10):** the rewrite `infer-server` has not re-ported
+> `/v1/stats` — the route does not exist; probes degrade to absent. Until the
+> observability re-port lands, report §3.1 counters as `n/a (rewrite gap)`
+> instead of hunting for the endpoint.
+
 Captured automatically by `bench_guidellm.sh` as
 `service_stats_before.txt`, `service_stats_trace.jsonl`,
 `service_stats_after.txt`, plus a summary. Headline counters:
@@ -99,7 +104,12 @@ not §6.
 
 ### 3.2 Scheduling envelope log
 
-`infer/src/backend/cuda/bootstrap.rs` emits a
+> **Rewrite gap (2026-06-10):** the envelope log lived in the deleted
+> monolith's `bootstrap.rs` and has not been re-ported to the rewrite stack.
+> Until it lands, record the resolved scheduling params by hand (flags + env)
+> in the wins entry.
+
+The monolith emitted a
 `Scheduling envelope (resolved | SGLang-equiv)` line at server boot. **Paste
 it verbatim** into the wins entry whenever the run is compared against an
 external reference (SGLang, vLLM, prior commit). Silent param drift
@@ -167,7 +177,7 @@ clean falsification is a successful run — don't grind for false precision.
 
 **Triggers outside a single task:**
 
-- Optimization commit touching `infer/src/ops/`, `crates/cuda-kernels/csrc/`, `crates/mlx-sys/src/` → regression run vs latest baseline. No exceptions.
+- Optimization commit touching `crates/infer-*/src/`, `crates/cuda-kernels/csrc/`, `crates/mlx-sys/src/` → regression run vs latest baseline. No exceptions.
 - Diagnosis entry without a follow-up fix entry within 14 days = debt → open in `docs/plans/`.
 
 ---
@@ -183,7 +193,8 @@ Tok/s is meaningless if the model emits garbage. The TileLang `clear=False`
 regression (`47bad713`) shipped headline numbers while 4-token prompts
 returned `"!!!!!"`. **Gate** every wins entry with one of:
 
-- a passing `cargo test --release -p infer --test e2e --features cuda`, or
+- a passing rewrite-stack integration test on the target backend (e.g.
+  `cargo test -p infer-api --release --features cuda` on the pod), or
 - a curl smoke: 4-token prompt → non-empty, first 5 chars not all identical.
 
 K6 (§3.4) catches "200 + empty"; the e2e test catches "200 + degenerate

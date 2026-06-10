@@ -10,7 +10,7 @@ SUBCOMMAND="${1:-}"
 [[ -n "$SUBCOMMAND" ]] && shift || true
 
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-$ROOT/docs/trace-artifacts/dsv4-toolchain-local}"
-SERVER_BIN="${SERVER_BIN:-$ROOT/target/release/infer}"
+SERVER_BIN="${SERVER_BIN:-$ROOT/target/release/arle}"
 PORT="${PORT:-18188}"
 HOST="${HOST:-127.0.0.1}"
 TARGET="${TARGET:-http://${HOST}:${PORT}}"
@@ -20,9 +20,7 @@ MAX_TOKENS="${MAX_TOKENS:-32}"
 PROMPT="${PROMPT:-Compute 137 + 269. Answer with the number only.}"
 WAIT_SECONDS="${WAIT_SECONDS:-600}"
 DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-NUM_SLOTS="${NUM_SLOTS:-1}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.10}"
 MOE_BACKEND="${ARLE_DSV4_MOE_BACKEND:-allreduce}"
 EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
 DEEPGEMM_ROOT="${ARLE_DEEPGEMM_ROOT:-$ROOT/crates/cuda-kernels/vendor/deepgemm}"
@@ -41,7 +39,7 @@ Options:
   --model-path DIR   DSv4 model path; overrides ARLE_DSV4_MODEL_PATH
   --artifact-root DIR
                     artifact directory (default: $ARTIFACT_ROOT)
-  --server-bin PATH  infer binary for smoke/nsys (default: $SERVER_BIN)
+  --server-bin PATH  arle binary for smoke/nsys (default: $SERVER_BIN)
   --port PORT        HTTP port (default: $PORT)
   --max-tokens N     smoke/nsys max_tokens; default 32, must be >=32
   --devices LIST     CUDA device list (default: $DEVICES)
@@ -282,7 +280,7 @@ build_infer() {
     cd "$ROOT"
     export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
     ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1 \
-        cargo build --release -p infer --features cuda,nccl --bin infer
+        cargo build --release --features cuda,nccl --bin arle
 }
 
 wait_ready() {
@@ -309,7 +307,7 @@ smoke() {
     export_runtime_env
     need_cmd curl
     need_cmd python3
-    [[ -x "$SERVER_BIN" ]] || die "infer binary missing or not executable: $SERVER_BIN; run build first"
+    [[ -x "$SERVER_BIN" ]] || die "arle binary missing or not executable: $SERVER_BIN; run build first"
     mkdir -p "$ARTIFACT_ROOT"
     if curl -sS -f "$TARGET/v1/models" >/dev/null 2>&1; then
         die "server already responding at $TARGET; set PORT or stop it first"
@@ -324,16 +322,16 @@ smoke() {
     # reports land in this server.log). Unset by default → zero change to
     # production runs. Intentionally unquoted so the multi-word command
     # word-splits into argv.
+    # Rewrite-stack serve: runtime knobs ride env vars (INFER_DSV4_MAX_SEQ_LEN,
+    # ARLE_DSV4_*); FP8 KV + dynamic KV memory budget are the DSv4 defaults, so
+    # the old --num-slots/--mem-fraction-static/--kv-cache-dtype flags are gone.
     (
         cd "$ROOT"
-        exec ${ARLE_SERVER_WRAP:-} "$SERVER_BIN" \
+        export INFER_DSV4_MAX_SEQ_LEN="$MAX_SEQ_LEN"
+        exec ${ARLE_SERVER_WRAP:-} "$SERVER_BIN" serve \
+            --backend cuda \
             --model-path "$MODEL_PATH" \
-            --port "$PORT" \
-            --num-slots "$NUM_SLOTS" \
-            --max-seq-len "$MAX_SEQ_LEN" \
-            --mem-fraction-static "$MEM_FRACTION_STATIC" \
-            --kv-cache-dtype fp8 \
-            --deepseek-distributed-layers 43
+            --port "$PORT"
     ) >"$server_log" 2>&1 &
     server_pid=$!
 

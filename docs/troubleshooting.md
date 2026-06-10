@@ -91,19 +91,13 @@ Another process is bound to port 8000 (often a previous `arle serve` that did
 not exit cleanly). `lsof -i :8000` will show it; `kill <pid>` or pick a new
 port: `arle serve --port 8010 ...`.
 
-### Apple Silicon `arle serve` runs but bind warning says "metal-only flag"
+### `arle serve` says the requested backend is unavailable
 
-`--bind 0.0.0.0` (or any value other than `127.0.0.1`) is currently only
-supported on the Metal serving binary. CUDA / CPU dispatch silently falls back
-to the backend's default bind. This is a documented Beta gap; use
-`127.0.0.1` for those backends or run behind a reverse proxy.
-
-### `metal_serve` / `cpu_serve` / `infer` not found by `arle serve`
-
-`arle serve` is a thin front door that spawns a matching native backend
-binary by name (`infer` for CUDA, `metal_serve` for Metal, `cpu_serve` for
-CPU), looking next to the `arle` executable first, then on `PATH`. Build
-`arle` with the matching backend feature:
+Serving is **in-process** — the workspace ships a single `arle` binary and
+`arle serve` loads the model in the same process (`crates/cli/src/serve.rs`).
+There are no standalone `infer` / `metal_serve` / `cpu_serve` binaries to
+find on `PATH`; if the requested `--backend` is not compiled into the binary
+you are running, rebuild with the matching feature:
 
 ```bash
 # Apple Silicon
@@ -113,14 +107,12 @@ cargo build --release --no-default-features --features metal,no-cuda,cli --bin a
 cargo build --release --features cuda --bin arle
 ```
 
+`arle --doctor` reports which backend the current binary was compiled with.
 The release tarballs at
 [GitHub Releases](https://github.com/cklxx/arle/releases) ship the `arle`
-binary built for the platform's backend.
-
-> Note: the workspace no longer produces standalone `infer` / `metal_serve` /
-> `cpu_serve` binary targets after the rewrite (the only `[[bin]]` is `arle`).
-> If `arle serve` reports a missing backend binary, that is a known gap in the
-> serve front door, not a missing build step on your side.
+binary built for the platform's backend. `--bind` is honored in-process by
+every backend (the old "Metal-only `--bind`" limitation died with the
+monolith's spawn-a-binary front door).
 
 ---
 

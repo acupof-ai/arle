@@ -23,19 +23,18 @@
 # bench-output/<date>-<label-a>/ and bench-output/<date>-<label-b>/. No
 # wins entries are seeded (exploration mode).
 #
-# Example — DFlash vs no-DFlash on Qwen3.5-4B Metal, 2-minute /quick run:
+# Example — MTP vs no-MTP on Qwen3.6 Metal, 2-minute /quick run:
 #
-#   MODEL=mlx-community/Qwen3.5-4B-MLX-4bit
-#   BIN=target/release/metal_serve
+#   MODEL=mlx-community/Qwen3.6-35B-A3B-4bit
+#   BIN="target/release/arle serve --backend metal"
 #   scripts/bench_ab.sh \
-#       qwen35-baseline \
-#       qwen35-dflash \
+#       qwen36-baseline \
+#       qwen36-mtp \
 #       --quick \
 #       --model "$MODEL" \
-#       --cmd-a "$BIN --model-path $MODEL --port 8000 --warmup 1 \
+#       --cmd-a "$BIN --model-path $MODEL --port 8000 \
 #                > /tmp/ab-a.log 2>&1 &" \
-#       --cmd-b "$BIN --model-path $MODEL --port 8000 --warmup 1 \
-#                --dflash-draft-model z-lab/Qwen3.5-4B-DFlash \
+#       --cmd-b "$BIN --model-path $MODEL --port 8000 --spec-type mtp \
 #                > /tmp/ab-b.log 2>&1 &"
 
 set -uo pipefail
@@ -128,7 +127,7 @@ cleanup() {
     if [[ -n "${CURRENT_CMD:-}" ]]; then
         pkill -f "$(echo "$CURRENT_CMD" | awk '{print $1}')" 2>/dev/null || true
     fi
-    pkill -f "metal_serve|cuda_serve|infer_serve" 2>/dev/null || true
+    pkill -f "target/release/arle" 2>/dev/null || true
     sleep 1
 }
 trap cleanup EXIT INT TERM
@@ -150,7 +149,7 @@ run_side() {
     echo
     echo "=== $label ==="
     # Ensure the port is free before launching.
-    pkill -f "metal_serve|cuda_serve|infer_serve" 2>/dev/null || true
+    pkill -f "target/release/arle" 2>/dev/null || true
     sleep 2
     echo "launch: $cmd"
     eval "$cmd" || die "failed to launch: $cmd"
@@ -159,7 +158,7 @@ run_side() {
     "$REPO_ROOT/scripts/bench_guidellm.sh" "$label" --target "$TARGET" "${PASSTHROUGH[@]}" \
         || die "bench run failed for $label"
 
-    pkill -f "metal_serve|cuda_serve|infer_serve" 2>/dev/null || true
+    pkill -f "target/release/arle" 2>/dev/null || true
     sleep 2
     CURRENT_CMD=""
 }
