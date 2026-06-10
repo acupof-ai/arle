@@ -333,6 +333,13 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_enum, default_value_t = ServeSpecTypeArg::None)]
     pub(crate) spec_type: ServeSpecTypeArg,
 
+    /// Multi-GPU collective backend for small decode-path messages (CUDA
+    /// multi-rank only). `auto` (default) boots the one-shot custom AR/AG with
+    /// a self-test and degrades to NCCL loudly on any probe failure; `nccl`
+    /// forces plain NCCL everywhere (escape hatch).
+    #[arg(long, value_enum, default_value_t = ServeCommBackendArg::Auto)]
+    pub(crate) comm_backend: ServeCommBackendArg,
+
     /// External split MTP drafter model path or HuggingFace repo for Metal.
     /// Implies the Metal MTP speculative route.
     #[arg(long, value_name = "PATH_OR_REPO")]
@@ -353,6 +360,14 @@ pub(crate) struct ServeArgs {
     /// Forward additional backend-specific flags after `--`.
     #[arg(last = true, allow_hyphen_values = true)]
     pub(crate) extra_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ServeCommBackendArg {
+    /// One-shot custom collectives with automatic loud degrade to NCCL.
+    Auto,
+    /// Plain NCCL everywhere.
+    Nccl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

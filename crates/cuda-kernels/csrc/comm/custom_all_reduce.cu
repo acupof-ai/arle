@@ -264,6 +264,154 @@ CUresult arle_car_chain_touch(CUstream stream, uint64_t output, uint64_t input) 
   return (CUresult)cudaGetLastError();
 }
 
+// ───────────────────────────── production ABI ─────────────────────────────
+// The serve path exchanges IPC handles over the ALREADY-UP NCCL comm
+// (collective.rs `all_gather_bytes`), not rendezvous files: Rust calls
+// `alloc_shared` (own regions) → NCCL-allgathers the 2×64B handles →
+// `open_peer` per peer → `create`. `create` takes OWNERSHIP of every pointer
+// (own allocations freed, peer mappings IPC-closed, on `destroy_prod`).
+
+struct ArleCarProd {
+  sglang::CustomAllreduce* car = nullptr;
+  int rank = 0;
+  int world = 0;
+  void* rank_data = nullptr;
+  void* signal_ptrs[kMaxWorld] = {nullptr};
+  void* input_ptrs[kMaxWorld] = {nullptr};
+};
+
+extern "C" CUresult arle_car_alloc_shared(size_t bytes, uint64_t* out_ptr, uint8_t* out_handle) {
+  void* p = nullptr;
+  cudaError_t e = cudaMalloc(&p, bytes);
+  if (e != cudaSuccess) return (CUresult)e;
+  e = cudaMemset(p, 0, bytes);
+  if (e != cudaSuccess) return (CUresult)e;
+  static_assert(sizeof(cudaIpcMemHandle_t) == 64, "IPC handle is 64 bytes");
+  e = cudaIpcGetMemHandle(reinterpret_cast<cudaIpcMemHandle_t*>(out_handle), p);
+  if (e != cudaSuccess) return (CUresult)e;
+  *out_ptr = reinterpret_cast<uint64_t>(p);
+  return CUDA_SUCCESS;
+}
+
+extern "C" CUresult arle_car_open_peer(const uint8_t* handle, uint64_t* out_ptr) {
+  void* p = nullptr;
+  cudaError_t e = cudaIpcOpenMemHandle(
+      &p, *reinterpret_cast<const cudaIpcMemHandle_t*>(handle), cudaIpcMemLazyEnablePeerAccess);
+  if (e != cudaSuccess) return (CUresult)e;
+  *out_ptr = reinterpret_cast<uint64_t>(p);
+  return CUDA_SUCCESS;
+}
+
+extern "C" void* arle_car_create(
+    int rank, int world, const uint64_t* signal_ptrs, const uint64_t* input_ptrs) {
+  if (world < 2 || world > kMaxWorld || rank < 0 || rank >= world) return nullptr;
+  auto* p = new ArleCarProd();
+  p->rank = rank;
+  p->world = world;
+  sglang::Signal* signals[kMaxWorld] = {nullptr};
+  void* inputs[kMaxWorld] = {nullptr};
+  for (int r = 0; r < world; r++) {
+    p->signal_ptrs[r] = reinterpret_cast<void*>(signal_ptrs[r]);
+    p->input_ptrs[r] = reinterpret_cast<void*>(input_ptrs[r]);
+    signals[r] = reinterpret_cast<sglang::Signal*>(p->signal_ptrs[r]);
+    inputs[r] = p->input_ptrs[r];
+  }
+  cudaError_t e = cudaMalloc(&p->rank_data, 8 * sizeof(sglang::RankData));
+  if (e != cudaSuccess) {
+    delete p;
+    return nullptr;
+  }
+  try {
+    p->car = new sglang::CustomAllreduce(
+        signals, p->rank_data, 8 * sizeof(sglang::RankData), rank, world, /*full_nvlink=*/true);
+    p->car->register_buffer(inputs);
+  } catch (const std::exception& ex) {
+    fprintf(stderr, "[arle_car] create failed: %s\n", ex.what());
+    cudaFree(p->rank_data);
+    delete p;
+    return nullptr;
+  }
+  return p;
+}
+
+// Sum-allreduce: registered own-input scratch → `out_ptr` (any local buffer).
+// force_algo: 0 upstream auto threshold (one-shot <256KB at world 8), 1/2 force.
+extern "C" CUresult arle_car_allreduce_bf16_into(
+    void* h, CUstream stream, uint64_t out_ptr, int elems, int force_algo) {
+  auto* p = static_cast<ArleCarProd*>(h);
+  if (force_algo == 1) {
+    setenv("SGLANG_CUSTOM_ALLREDUCE_ALGO", "1stage", 1);
+  } else if (force_algo == 2) {
+    setenv("SGLANG_CUSTOM_ALLREDUCE_ALGO", "2stage", 1);
+  } else {
+    unsetenv("SGLANG_CUSTOM_ALLREDUCE_ALGO");
+  }
+  try {
+    p->car->allreduce<nv_bfloat16>(
+        reinterpret_cast<cudaStream_t>(stream),
+        reinterpret_cast<nv_bfloat16*>(p->input_ptrs[p->rank]),
+        reinterpret_cast<nv_bfloat16*>(out_ptr),
+        elems);
+  } catch (const std::exception& ex) {
+    fprintf(stderr, "[arle_car] allreduce_into failed: %s\n", ex.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+  return (CUresult)cudaGetLastError();
+}
+
+// One-shot all-gather: every rank's registered scratch chunk → rank-major
+// `out_ptr` ([world × per_rank_elems], ncclAllGather layout).
+extern "C" CUresult arle_car_allgather_bf16_into(
+    void* h, CUstream stream, uint64_t out_ptr, int per_rank_elems) {
+  auto* p = static_cast<ArleCarProd*>(h);
+  using P = sglang::packed_t<nv_bfloat16>::P;
+  constexpr int pack = P::size;
+  if (per_rank_elems % pack != 0) return CUDA_ERROR_INVALID_VALUE;
+  const int per_rank = per_rank_elems / pack;
+  auto it = p->car->buffers_.find(p->input_ptrs[p->rank]);
+  if (it == p->car->buffers_.end()) return CUDA_ERROR_INVALID_VALUE;
+  sglang::RankData* ptrs = it->second;
+  const int total = per_rank * p->world;
+  const int threads = 512;
+  int blocks = std::min(36, (total + threads - 1) / threads);
+  blocks = std::max(blocks, 1);
+
+#define ARLE_AG_PROD_CASE(ngpus)                                                          \
+  case ngpus:                                                                             \
+    cross_device_allgather_1stage<nv_bfloat16, ngpus>                                     \
+        <<<blocks, threads, 0, (cudaStream_t)stream>>>(                                   \
+            ptrs, p->car->sg_, p->car->self_sg_, reinterpret_cast<nv_bfloat16*>(out_ptr), \
+            p->rank, per_rank);                                                           \
+    break;
+  switch (p->world) {
+    ARLE_AG_PROD_CASE(2)
+    ARLE_AG_PROD_CASE(4)
+    ARLE_AG_PROD_CASE(6)
+    ARLE_AG_PROD_CASE(8)
+    default:
+      return CUDA_ERROR_INVALID_VALUE;
+  }
+#undef ARLE_AG_PROD_CASE
+  return (CUresult)cudaGetLastError();
+}
+
+extern "C" void arle_car_destroy_prod(void* h) {
+  auto* p = static_cast<ArleCarProd*>(h);
+  if (!p) return;
+  delete p->car;
+  for (int r = 0; r < p->world; r++) {
+    if (r == p->rank) {
+      cudaFree(p->signal_ptrs[r]);
+      cudaFree(p->input_ptrs[r]);
+    } else {
+      if (p->signal_ptrs[r]) cudaIpcCloseMemHandle(p->signal_ptrs[r]);
+      if (p->input_ptrs[r]) cudaIpcCloseMemHandle(p->input_ptrs[r]);
+    }
+  }
+  cudaFree(p->rank_data);
+  delete p;
+}
+
 void arle_car_destroy(void* h) {
   auto* ctx = static_cast<ArleCarCtx*>(h);
   if (!ctx) return;
