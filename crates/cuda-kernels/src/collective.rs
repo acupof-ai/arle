@@ -208,6 +208,87 @@ mod nccl_backend {
             })
         }
 
+        /// Out-of-place all-reduce (the trait method is in-place; the comm
+        /// bench needs distinct send/recv buffers so every arm runs the same
+        /// input→output dataflow).
+        ///
+        /// # Safety
+        /// `sendbuf`/`recvbuf` must be valid device allocations of `count`
+        /// elements on this rank's device; `stream` must belong to it.
+        pub unsafe fn all_reduce_out_of_place(
+            &self,
+            sendbuf: *const std::ffi::c_void,
+            recvbuf: *mut std::ffi::c_void,
+            count: usize,
+            dtype: DType,
+            op: ReduceOp,
+            stream: *mut std::ffi::c_void,
+        ) -> Result<()> {
+            let res = unsafe {
+                nccl::ncclAllReduce(
+                    sendbuf,
+                    recvbuf,
+                    count,
+                    Self::map_dtype(dtype),
+                    Self::map_op(op),
+                    self.comm,
+                    stream,
+                )
+            };
+            nccl::check(res)
+        }
+
+        /// NCCL ≥ 2.27 symmetric-memory pair: `ncclMemAlloc` a buffer and
+        /// register it as a `NCCL_WIN_COLL_SYMMETRIC` window over this comm.
+        /// COLLECTIVE: every rank must call together with the same `bytes`.
+        /// Collectives whose operands are all symmetric windows take NCCL's
+        /// low-latency symmetric kernels (the C4 arm of the comm bench).
+        /// Returns the raw device pointer + window handle; the caller owns
+        /// both (deregister + `ncclMemFree` on teardown).
+        ///
+        /// # Safety
+        /// The returned pointer is a raw device allocation; the caller must
+        /// not use it after `ncclMemFree`, and must deregister before freeing.
+        pub unsafe fn mem_alloc_symmetric_window(
+            &self,
+            bytes: usize,
+        ) -> Result<(*mut std::ffi::c_void, nccl::ncclWindow_t)> {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            nccl::check(unsafe { nccl::ncclMemAlloc(&mut ptr, bytes) })?;
+            let mut win: nccl::ncclWindow_t = std::ptr::null_mut();
+            let res = unsafe {
+                nccl::ncclCommWindowRegister(
+                    self.comm,
+                    ptr,
+                    bytes,
+                    &mut win,
+                    nccl::NCCL_WIN_COLL_SYMMETRIC,
+                )
+            };
+            if let Err(err) = nccl::check(res) {
+                // Roll back the allocation so a failed registration (e.g. NCCL
+                // < 2.27 at runtime) doesn't leak device memory.
+                let _ = unsafe { nccl::ncclMemFree(ptr) };
+                return Err(err);
+            }
+            Ok((ptr, win))
+        }
+
+        /// Tear down a [`Self::mem_alloc_symmetric_window`] pair.
+        ///
+        /// # Safety
+        /// `ptr`/`win` must come from `mem_alloc_symmetric_window` on this comm
+        /// and must not be used afterwards.
+        pub unsafe fn free_symmetric_window(
+            &self,
+            ptr: *mut std::ffi::c_void,
+            win: nccl::ncclWindow_t,
+        ) -> Result<()> {
+            nccl::check(unsafe { nccl::ncclCommWindowDeregister(self.comm, win) })?;
+            nccl::check(unsafe { nccl::ncclMemFree(ptr) })?;
+            Ok(())
+        }
+
         /// Host-visible all-gather for small byte payloads such as CUDA IPC
         /// handles. The payload is staged through an `i32` device buffer so this
         /// reuses NCCL all-gather without adding a host-side rendezvous path.
