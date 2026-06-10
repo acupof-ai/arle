@@ -223,6 +223,21 @@ const INSTALL_CARDS_ZH: InstallCard[] = [
 
 const BENCH_ROWS_EN: BenchRow[] = [
   {
+    date: "2026-06-10",
+    stability: "beta",
+    stabilityLabel: "beta · gate-licensed",
+    caption:
+      '<b>cuda</b> · 8×H20 TP=8 / EP=8 · <code>DeepSeek-V4-Flash FP8</code> · B=1, official FlashMLA / DSA / DeepGEMM + MTP · 256K boots, needle-exact @230K',
+    cells: [
+      { key: "prefill", value: "23", unit: "ms" },
+      { key: "decode", value: "15", unit: "ms/tok" },
+      { key: "decode +MTP", value: "64.2", unit: "tok/s" },
+      { key: "needle-exact", value: "230K", unit: "ctx" },
+    ],
+    cmd: "scripts/dsv4_lever_gate.sh",
+    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md",
+  },
+  {
     date: "2026-05-21",
     stability: "beta",
     stabilityLabel: "beta · cycle-wrap",
@@ -281,6 +296,21 @@ const BENCH_ROWS_EN: BenchRow[] = [
 ];
 
 const BENCH_ROWS_ZH: BenchRow[] = [
+  {
+    date: "2026-06-10",
+    stability: "beta",
+    stabilityLabel: "beta · 闸门已 license",
+    caption:
+      '<b>cuda</b> · 8×H20 TP=8 / EP=8 · <code>DeepSeek-V4-Flash FP8</code> · B=1,官方 FlashMLA / DSA / DeepGEMM + MTP · 256K 可启动、needle 230K 精确命中',
+    cells: [
+      { key: "prefill", value: "23", unit: "ms" },
+      { key: "解码", value: "15", unit: "ms/tok" },
+      { key: "解码 +MTP", value: "64.2", unit: "tok/s" },
+      { key: "needle 精确", value: "230K", unit: "ctx" },
+    ],
+    cmd: "scripts/dsv4_lever_gate.sh",
+    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md",
+  },
   {
     date: "2026-05-21",
     stability: "beta",
@@ -427,7 +457,7 @@ export const EN: Locale = {
   meta: {
     title: "arle(1) — runtime-first rust workspace",
     description:
-      "ARLE is a runtime-first Rust workspace for serving Qwen3/Qwen3.5 on CUDA, Metal, and CPU. arle serve is the OpenAI-compatible serving path; arle is the unified front door for run, serve, train, and data flows.",
+      "ARLE is a runtime-first Rust workspace for serving Qwen3.5 / Qwen3.6 and DeepSeek-V4-Flash on CUDA, Metal, and CPU. arle serve is the OpenAI-compatible serving path; arle is the unified front door for run, serve, train, and data flows.",
     ogTitle: "arle — runtime-first Rust workspace",
     ogDescription:
       "arle serve is the OpenAI-compatible serving path on CUDA, Metal, and CPU. arle is the unified front door for run, serve, train, and data.",
@@ -495,7 +525,7 @@ export const ZH: Locale = {
   meta: {
     title: "arle(1) — 以 runtime 为主干的 rust workspace",
     description:
-      "ARLE 是以 runtime 为主干的 Rust workspace，覆盖 CUDA、Metal、CPU 上 Qwen3 / Qwen3.5 的 serving。arle serve 是 OpenAI 兼容的 serving 路径；arle 是 run / serve / train / data 的统一前门。",
+      "ARLE 是以 runtime 为主干的 Rust workspace，覆盖 CUDA、Metal、CPU 上 Qwen3.5 / Qwen3.6 与 DeepSeek-V4-Flash 的 serving。arle serve 是 OpenAI 兼容的 serving 路径；arle 是 run / serve / train / data 的统一前门。",
     ogTitle: "arle — runtime-first Rust workspace",
     ogDescription:
       "arle serve 在 CUDA、Metal、CPU 上提供 OpenAI 兼容 serving；arle 是 run / serve / train / data 的统一前门。",

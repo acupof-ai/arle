@@ -132,6 +132,8 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 
 <!-- 最近 1-2 条,更早历史见 CHANGELOG.md。 -->
 
+**2026-06-10 — Phase 0 还债收口:** DSv4 256K 可启动、needle 230K 精确命中、admission 按真实 KV 预算、KV-parity gate 移植完成(FlashMLA decode 已 license),下一步 Phase 1 批量化 serving lane([#55](https://github.com/cklxx/arle/issues/55))。
+
 **2026-06-08 — DeepSeek-V4-Flash B=1 延迟:prefill 23 ms,decode 27 → 15 ms**(8×H20,TP=8 / EP=8,FP8 MoE)。官方 DSA indexer 让 decode 不再随上下文增长(legacy `csa_select` 124 ms → ~26 ms @4k,4.8×);MLA / output 投影从 scalar GEMV 换成 tensor-core DeepGEMM(每段 −94% → prefill ~23 ms);MTP depth-1 batched verify 摊薄串行关键路径,**decode tok/s +71%**(39.9 → 64.2),逐字节一致。八个 per-kernel 杠杆(whole-step CUDA graph、mhc_params uint4、M=1 GEMV、comm-overlap …)全部 **wash** —— B=1 decode 卡在关键路径上、GPU-bound,所以 15 ms 是单请求的合理地板;6 ms 需要 tree-EAGLE + mega-kernel 融合或 batching(M=N)。[最终报告](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md)。
 
 <p align="center">
