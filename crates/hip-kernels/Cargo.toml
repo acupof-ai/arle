@@ -1,0 +1,18 @@
+[package]
+name = "hip-kernels"
+version = "0.1.5"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+# Compile the HIP kernel objects with hipcc (ROCm box only). Off by default
+# so the workspace typechecks on machines without ROCm — mirror of the Mac
+# `cuda,no-cuda` trick. Without the feature every wrapper returns a
+# NOT_COMPILED error. With the feature but no hipcc on PATH, build.rs warns
+# and skips kernel compilation (typecheck-only lane).
+hip = []
+
+[lints]
+workspace = true
