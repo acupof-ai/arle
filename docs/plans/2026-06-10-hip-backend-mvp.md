@@ -13,31 +13,52 @@ marked *hypothesis* needs on-box confirmation during H2/H3.
 | OS | Linux first (ROCm APU support is Preview and scoped to Linux; Windows out of MVP) |
 | ROCm | 7.x known-good stack per [llama.cpp discussion #20856](https://github.com/ggml-org/llama.cpp/discussions/20856); TheRock nightlies ship native gfx1151 binaries — pin the exact version from the box once provisioned (pin-from-proven-env rule) |
 | Memory | UMA/GTT: BIOS UMA minimum + GTT sizing via kernel params so the iGPU can map most of the 128 GB; ~212 GB/s measured GPU bandwidth ([llm-tracker](https://llm-tracker.info/_TOORG/Strix-Halo)) |
-| MVP model | Qwen3 dense (`Qwen3ForCausalLM`): 0.6B bring-up → 4B target. GQA hd128, QK-norm, RoPE, SwiGLU — exactly `infer-cuda/src/model.rs`'s op set |
-| Reference engine | llama.cpp HIP build on the same box (`-DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DGGML_HIP_ROCWMMA_FATTN=ON`, `ROCBLAS_USE_HIPBLASLT=1`, `GGML_HIP_NO_VMM=ON`) |
+| Mission model | **DSv4-Flash at 2-bit weights** (ckl directive 2026-06-10) — the model only ARLE can serve, on a consumer 128 GB box. Weight format: IQ2-class i-quants (llama.cpp 2.06–2.5 bpw family, kernels vendored). Bring-up smoke: Qwen3-0.6B BF16 (in `models/`, proves the substrate before the big model) |
+| Reference engine | llama.cpp HIP build on the same box (`-DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DGGML_HIP_ROCWMMA_FATTN=ON`, `ROCBLAS_USE_HIPBLASLT=1`, `GGML_HIP_NO_VMM=ON`) — bar set with an IQ2-class MoE it can run (it cannot load DSv4-Flash; nearest-proxy protocol per the 2026-06-04 SGLang A/B precedent) |
 
-**Why not Qwen3.5 first:** Qwen3.5 is NOT plain dense — `models/Qwen3.5-0.8B/config.json`
-`text_config` shows 24 layers at 3:1 `linear_attention` (gated delta net, conv4,
-16 K/V linear heads) : `full_attention` (GQA hd256, gated). That op set adds a
-recurrent delta kernel + depthwise conv + hd256 attention. Tier 2, not MVP.
-(#77's "Qwen3.5 dense" wording is corrected to "Qwen3 dense" — amended in the issue.)
+**Model-shape notes:** DSv4-Flash FP8 checkpoint is 149 GB (#69) ≈ ~149B params →
+~39–47 GB at 2.06–2.5 bpw: fits the 128 GB UMA with room for compressed-attention KV
+(DSA/CSA KV is small by construction — the long-ctx story survives quantization of
+weights). Qwen3.5 is hybrid (3:1 gated-delta : hd256 full attn), NOT the dense
+stepping stone — Qwen3-0.6B (plain GQA hd128) is. Per-tensor quant mix follows
+llama.cpp dynamic-quant practice: attention/dense/shared-expert tensors stay at
+higher bits, routed-expert FFNs take the 2-bit floor — exact recipe is an on-box
+needle-gated experiment, not a guess.
 
 ## §1 Decode floor (formula before measurement)
 
-B=1 decode is weight-bandwidth-bound: `bytes(weights touched) / 212 GB/s`.
+B=1 decode is weight-bandwidth-bound: `bytes(weights touched per token) / 212 GB/s`.
+For the MoE mission model the bytes are the ACTIVE subset, not total weights.
 
-| Model | Weights | Floor | Note |
+| Model | Bytes/token | Floor | Note |
 | --- | --- | --- | --- |
-| Qwen3-4B BF16 | ~8.0 GB | ~38 ms/tok ≈ 26 tok/s | MVP correctness arm |
-| Qwen3-4B INT4-class | ~2.3 GB | ~11 ms/tok ≈ 90 tok/s | H4 quant arm; llama.cpp Q4 is the bar |
-| Qwen3-0.6B BF16 | ~1.4 GB | ~6.6 ms/tok | bring-up only |
+| **DSv4-Flash IQ2-class** | active params × ~2.1–2.5 bpw + higher-bit attn/shared tensors — *pin active-param count from the checkpoint `config.json` on first session (hypothesis range: ~5–10 GB/tok → ~25–45 ms/tok ≈ 22–40 tok/s)* | TBD on-box | the mission number; compressed-attention KV adds little |
+| Qwen3-0.6B BF16 | ~1.4 GB | ~6.6 ms/tok | substrate smoke only |
 
-Gap-to-floor on the box = engineering overhead, not physics (measured-floor rule).
+Total-weight residency: ~39–47 GB at 2-bit → GTT must map ≥64 GB (kernel-param
+checklist item). Gap-to-floor on the box = engineering overhead, not physics
+(measured-floor rule).
 
-## §2 Op→kernel table (Qwen3 dense prefill+decode)
+## §2 Op→kernel tables
+
+llama.cpp refs at commit `d2462f8f7ac6` — **vendored into
+[`vendor/llama.cpp/`](../../vendor/llama.cpp/README.md)** (MIT, pinned, op map in
+its README).
+
+### §2.0 Mission op set — DSv4-Flash 2-bit
+
+| Op family | Source | Evidence / note |
+| --- | --- | --- |
+| 2-bit weight matmul (dense projections + lm_head) | vendored `vecdotq.cuh`+`mmvq/mmq` (HIP) / `mul_mat_vec_iq2_*`+`mul_mmq` (Vulkan) | llama.cpp's IQ2 kernels are the production 2-bit corpus; MMQ MFMA is CDNA-only but the dp4a/WMMA paths cover RDNA3.5 |
+| MoE routed experts (per-expert matmul + top-k router) | vendored `mmid.*` + `topk-moe.*` / `mul_mm_id_funcs.glsl` | indirect matmul over expert ids = llama.cpp's MoE shape; our scheduler keeps ARLE routing semantics |
+| DSA/CSA compressed attention, indexer, compressor, SW window | **our `crates/cuda-kernels/csrc/` DSv4 kernels, ported via the `vendors/hip.h` shim** (plain CUDA C, no SM90 asm on the fallback path) | the non-FlashMLA path (`dsv4_hybrid_attention`, `dsv4_csa_select`, compressor/indexer) predates official-kernel adoption and is shim-portable; FlashMLA/DeepGEMM/DeepEP = SM90/datacenter, excluded |
+| Offline quantizer (FP8 safetensors → IQ2-class) | new tool, reference = vendored `ggml-quants.c` block codecs | per-tensor mix: attn/dense/shared-expert higher-bit, routed FFN 2-bit; needle-gate per recipe |
+| Norm / rope / softmax / elementwise / sampling | same as §2 table below | shared with the substrate smoke |
+
+### Substrate smoke op set — Qwen3 dense (proves the lane before the big model)
 
 ARLE op names from `infer-cuda/src/{model,ops,attention}.rs` (the dense Qwen3 CUDA
-forward). llama.cpp refs at commit `d2462f8f7ac6` (sparse checkout in `/tmp/arle-hip-scan`).
+forward).
 
 | ARLE op | Role | HIP MVP source | llama.cpp reference / evidence |
 | --- | --- | --- | --- |
