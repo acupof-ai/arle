@@ -197,6 +197,8 @@ do_check() {
     local pkg_errors=0
     while IFS= read -r line; do
         [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        # tilelang needs the CUDA toolchain; hosts without nvcc never install it.
+        [[ "$line" == tilelang* && "$HAS_CUDA" != "1" ]] && continue
         local pkg ver
         pkg="${line%%==*}"; ver="${line##*==}"
         local actual
@@ -501,34 +503,21 @@ do_deps() {
     python -m pip install --upgrade pip -q
 
     # --- Build deps ---
-    # TileLang is the only Python AOT dependency for CUDA kernels; the rest is
-    # platform-neutral utility support. Skip TileLang on hosts without nvcc
-    # (macOS, Linux+no-CUDA, dev CI) since it requires the CUDA toolchain.
+    # TileLang (pinned in requirements-build.txt) is the only Python build
+    # dependency — AOT codegen for CUDA cubins. It requires the CUDA
+    # toolchain, so skip it on hosts without nvcc (macOS, Linux+no-CUDA).
     step "Python build dependencies (from requirements-build.txt)"
     if [ "$HAS_CUDA" = "1" ]; then
         grep -E '^[a-zA-Z]' requirements-build.txt | pip install -r /dev/stdin -q
         ok "CUDA build deps installed"
     else
-        grep -E '^[a-zA-Z]' requirements-build.txt | grep -Ev '^tilelang($|[<=>])' | \
-            pip install -r /dev/stdin -q
-        ok "Platform-neutral build deps installed (TileLang skipped, no CUDA toolchain)"
+        ok "No build deps for this host (TileLang skipped, no CUDA toolchain)"
     fi
 
     # --- Bench/test deps ---
     step "Bench & test dependencies (from requirements-bench.txt)"
     pip install -r requirements-bench.txt -q
     ok "Bench deps installed"
-
-    # --- TileLang (CUDA-toolchain hosts only — AOT codegen for CUDA cubins) ---
-    if [ "$HAS_CUDA" = "1" ]; then
-        step "TileLang (AOT codegen for --features cuda)"
-        if python -c "import tilelang" 2>/dev/null; then
-            ok "tilelang already installed: $(python -c 'import tilelang; print(tilelang.__version__)')"
-        else
-            pip install tilelang -q
-            ok "tilelang installed: $(python -c 'import tilelang; print(tilelang.__version__)')"
-        fi
-    fi
 
     # --- Project install ---
     if [ -f pyproject.toml ]; then
@@ -542,10 +531,11 @@ do_deps() {
     local ok_count=0
     while IFS= read -r line; do
         [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        # tilelang needs the CUDA toolchain; hosts without nvcc never install it.
+        [[ "$line" == tilelang* && "$HAS_CUDA" != "1" ]] && continue
         local pkg ver
         pkg="${line%%==*}"
         ver="${line##*==}"
-        local pkg_name="${pkg//-/_}"
         local actual
         actual=$(pip show "$pkg" 2>/dev/null | grep "^Version:" | awk '{print $2}')
         actual="${actual:-MISSING}"
