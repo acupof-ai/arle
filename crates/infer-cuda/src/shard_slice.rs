@@ -100,6 +100,74 @@ pub fn shard_row_parallel(
     })
 }
 
+/// One sub-block of a fused column-parallel projection: `heads` whole heads of
+/// `head_rows` rows each. The Qwen3.5/3.6 gated-delta `in_proj_qkv` stacks
+/// `[q(Kh×Kd); k(Kh×Kd); v(Vh×Vd)]` along dim 0, and its depthwise `conv1d`
+/// channels mirror the same row order — a flat [`shard_column_parallel`] over
+/// the fused output dim would cut across the block boundaries, so each block
+/// is sharded independently on whole-head boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadBlock {
+    /// Number of whole heads in this block (must divide the TP world size).
+    pub heads: usize,
+    /// Rows contributed by each head (e.g. `key_head_dim`, or `2*head_dim` for
+    /// a gated `[query; gate]` per-head layout).
+    pub head_rows: usize,
+}
+
+impl HeadBlock {
+    fn rows(&self) -> usize {
+        self.heads * self.head_rows
+    }
+}
+
+/// Slice a fused multi-block column-parallel weight (`[Σ block rows, cols]`
+/// row-major) for one TP rank: every block is head-sharded independently and
+/// this rank's per-block slices are re-stacked in block order.
+///
+/// Rank `r` takes heads `[r·heads/world, (r+1)·heads/world)` of EVERY block,
+/// preserving each block's head grouping (e.g. gated-delta k↔v head pairing).
+/// Single-GPU (`world_size == 1`) is the identity slice.
+///
+/// # Errors
+/// Errors if any block's `heads` is not divisible by the world size, the block
+/// rows don't sum to the buffer's row count, or the buffer length is
+/// inconsistent with `rows * cols * elem_size`.
+pub fn shard_head_blocks_column_parallel(
+    bytes: &[u8],
+    cols: usize,
+    elem_size: usize,
+    blocks: &[HeadBlock],
+    tp: &infer_topo::TpConfig,
+) -> Result<ShardedBytes> {
+    let total_rows: usize = blocks.iter().map(HeadBlock::rows).sum();
+    ensure_buffer(bytes, total_rows, cols, elem_size)?;
+    let world = tp.world_size;
+    let row_stride = cols * elem_size;
+    let mut out = Vec::new();
+    let mut local_rows = 0usize;
+    let mut block_start = 0usize;
+    for (i, block) in blocks.iter().enumerate() {
+        ensure!(
+            block.heads.is_multiple_of(world),
+            "fused block {i}: {} heads not divisible by world_size {world}",
+            block.heads
+        );
+        let local_heads = block.heads / world;
+        let shard_rows = local_heads * block.head_rows;
+        let start = (block_start + tp.rank * shard_rows) * row_stride;
+        let end = start + shard_rows * row_stride;
+        out.extend_from_slice(&bytes[start..end]);
+        local_rows += shard_rows;
+        block_start += block.rows();
+    }
+    Ok(ShardedBytes {
+        bytes: out,
+        rows: local_rows,
+        cols,
+    })
+}
+
 fn ensure_buffer(bytes: &[u8], rows: usize, cols: usize, elem_size: usize) -> Result<()> {
     ensure!(elem_size > 0, "elem_size must be > 0");
     let expected = rows
@@ -294,6 +362,145 @@ mod tests {
         }
         assert_eq!(total_rows, rows);
         assert_eq!(joined, w);
+    }
+
+    #[test]
+    fn fused_qkv_head_blocks_shard_each_block_and_reassemble() {
+        // Gated-delta in_proj_qkv shape: [q(Kh×Kd); k(Kh×Kd); v(Vh×Vd)] blocks.
+        // Small analogue: Kh=4, Kd=3, Vh=8, Vd=2 → rows = 12 + 12 + 16 = 40.
+        let (kh, kd, vh, vd) = (4usize, 3usize, 8usize, 2usize);
+        let cols = 5usize;
+        let rows = 2 * kh * kd + vh * vd;
+        let w = fake_weight(rows, cols);
+        let blocks = [
+            HeadBlock {
+                heads: kh,
+                head_rows: kd,
+            },
+            HeadBlock {
+                heads: kh,
+                head_rows: kd,
+            },
+            HeadBlock {
+                heads: vh,
+                head_rows: vd,
+            },
+        ];
+
+        for world in [2usize, 4] {
+            let mut per_rank = Vec::new();
+            for rank in 0..world {
+                let tp = TpConfig::new(world, rank).unwrap();
+                let r = shard_head_blocks_column_parallel(&w, cols, 2, &blocks, &tp).unwrap();
+                assert_eq!(r.cols, cols);
+                assert_eq!(r.rows, rows / world, "uniform per-rank row count");
+
+                // Hand-build the expectation: rank's q rows, then k rows, then
+                // v rows — each sliced inside its own block, never across the
+                // block boundary.
+                let q_block = 0..kh * kd;
+                let k_block = kh * kd..2 * kh * kd;
+                let v_block = 2 * kh * kd..rows;
+                let local_k_rows = kh / world * kd;
+                let local_v_rows = vh / world * vd;
+                let mut want_rows = Vec::new();
+                want_rows.extend(q_block.skip(rank * local_k_rows).take(local_k_rows));
+                want_rows.extend(k_block.skip(rank * local_k_rows).take(local_k_rows));
+                want_rows.extend(v_block.skip(rank * local_v_rows).take(local_v_rows));
+                let want: Vec<u16> = want_rows
+                    .iter()
+                    .flat_map(|&r| (0..cols).map(move |c| (r * cols + c) as u16))
+                    .collect();
+                assert_eq!(decode(&r.bytes), want, "world={world} rank={rank}");
+                per_rank.push(r.bytes);
+            }
+            // Per-block reassembly: concatenating every rank's q slices, then k
+            // slices, then v slices reconstructs the original (no gap/overlap).
+            let local_k_bytes = (kh / world) * kd * cols * 2;
+            let local_v_bytes = (vh / world) * vd * cols * 2;
+            let mut joined = Vec::new();
+            for (block_idx, block_bytes) in [local_k_bytes, local_k_bytes, local_v_bytes]
+                .into_iter()
+                .enumerate()
+            {
+                for bytes in &per_rank {
+                    let start: usize = [local_k_bytes, local_k_bytes, local_v_bytes][..block_idx]
+                        .iter()
+                        .sum();
+                    joined.extend_from_slice(&bytes[start..start + block_bytes]);
+                }
+            }
+            assert_eq!(joined, w, "world={world} blockwise concat reconstructs");
+        }
+    }
+
+    #[test]
+    fn gated_q_proj_head_block_shard_keeps_query_and_gate_rows_paired() {
+        // The gated q_proj interleaves [query(HD); gate(HD)] PER HEAD
+        // (prefill_attention_hd256.cu reads q at head*2*HD + d and the gate at
+        // head*2*HD + HD + d), so the per-head row block is 2*HD. Each rank must
+        // get its heads' query rows AND the matching gate rows — never a
+        // contiguous slice across the q/gate boundary of a foreign head.
+        let heads = 4usize;
+        let hd = 3usize; // small stand-in for head_dim=256
+        let cols = 2usize;
+        let rows = heads * 2 * hd;
+        let w = fake_weight(rows, cols);
+        let blocks = [HeadBlock {
+            heads,
+            head_rows: 2 * hd,
+        }];
+
+        let world = 2usize;
+        for rank in 0..world {
+            let tp = TpConfig::new(world, rank).unwrap();
+            let r = shard_head_blocks_column_parallel(&w, cols, 2, &blocks, &tp).unwrap();
+            assert_eq!(r.rows, rows / world);
+            let local_heads = heads / world;
+            for lh in 0..local_heads {
+                let global_head = rank * local_heads + lh;
+                for d in 0..hd {
+                    // Query row d of local head lh == global head's query row.
+                    let got_q = decode(&r.bytes)[(lh * 2 * hd + d) * cols];
+                    let want_q = ((global_head * 2 * hd + d) * cols) as u16;
+                    assert_eq!(got_q, want_q, "rank={rank} head={lh} q row {d}");
+                    // Gate row d of local head lh == global head's gate row.
+                    let got_g = decode(&r.bytes)[(lh * 2 * hd + hd + d) * cols];
+                    let want_g = ((global_head * 2 * hd + hd + d) * cols) as u16;
+                    assert_eq!(got_g, want_g, "rank={rank} head={lh} gate row {d}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_block_shard_single_gpu_is_identity_and_indivisible_rejected() {
+        let blocks = [
+            HeadBlock {
+                heads: 3,
+                head_rows: 2,
+            },
+            HeadBlock {
+                heads: 6,
+                head_rows: 1,
+            },
+        ];
+        let w = fake_weight(12, 4);
+        let single = TpConfig::single();
+        let r = shard_head_blocks_column_parallel(&w, 4, 2, &blocks, &single).unwrap();
+        assert_eq!(r.bytes, w);
+        assert_eq!((r.rows, r.cols), (12, 4));
+
+        // heads=3 not divisible by world=2 → loud error, not a silent split head.
+        let tp = TpConfig::new(2, 0).unwrap();
+        assert!(shard_head_blocks_column_parallel(&w, 4, 2, &blocks, &tp).is_err());
+
+        // Wrong row total (blocks don't cover the buffer) → rejected.
+        let bad_blocks = [HeadBlock {
+            heads: 2,
+            head_rows: 2,
+        }];
+        assert!(shard_head_blocks_column_parallel(&w, 4, 2, &bad_blocks, &single).is_err());
     }
 
     #[test]

@@ -1588,12 +1588,28 @@ impl Qwen35CudaExecutor {
     /// returning the device bytes freed. Per-slot KV / recurrent state is left
     /// resident — only the shared model weights move.
     fn offload_engine_weights(&mut self) -> Result<usize> {
+        self.ensure_not_collective("offload_engine_weights")?;
         self.model.offload_engine_weights()
     }
 
     /// Reload the model's device weights from the host snapshot.
     fn reload_engine_weights(&mut self) -> Result<()> {
+        self.ensure_not_collective("reload_engine_weights")?;
         self.model.reload_engine_weights()
+    }
+
+    /// OPD surfaces are rank-0 control-seam calls: under multi-rank TP they
+    /// would run on one rank only, desyncing the per-step NCCL collective
+    /// sequence (and, for LoRA/offload, diverging the resident weights across
+    /// ranks). Bail loudly instead of silently corrupting the lockstep.
+    fn ensure_not_collective(&self, what: &str) -> Result<()> {
+        ensure!(
+            !self.model.tp.is_collective(),
+            "{what} is single-GPU only: the Qwen3.5/3.6 OPD surfaces are not \
+             wired for multi-rank tensor parallelism (world_size={})",
+            self.model.tp.config().world_size
+        );
+        Ok(())
     }
 
     fn submit(&mut self, plan: &ForwardPlan) -> Result<StepOutput> {
@@ -1681,6 +1697,7 @@ impl Qwen35CudaExecutor {
         input_ids: &[u32],
         positions: &[u32],
     ) -> Result<(DeviceVec, [usize; 2])> {
+        self.ensure_not_collective("forward_token_logits")?;
         ensure!(
             !input_ids.is_empty(),
             "forward_token_logits requires a non-empty token sequence"
@@ -1716,6 +1733,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         update: crate::qwen35::StudentLoraUpdate,
     ) -> Result<()> {
+        self.ensure_not_collective("remerge_student_lora")?;
         self.model.remerge_student_lora(update)
     }
 }

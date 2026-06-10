@@ -185,12 +185,19 @@ impl CudaModel {
 
 /// Build the tensor-parallel runtime for model load. Multi-rank `nccl` builds
 /// take the NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID`; otherwise the no-op
-/// single runtime.
-fn build_tp_runtime() -> Result<crate::tp::TpRuntime> {
+/// single runtime. Shared by the dense Qwen3 and Qwen3.5/3.6 hybrid loaders.
+pub(crate) fn build_tp_runtime() -> Result<crate::tp::TpRuntime> {
     #[cfg(feature = "nccl")]
     {
         let cfg = crate::tp::resolve_tp_config_from_env().map_err(|e| anyhow!("{e}"))?;
         if !cfg.is_single() {
+            // Bind this rank's CUDA device BEFORE ncclCommInitRank — NCCL pins
+            // the communicator to the current device at init, so without this
+            // every rank would init on device 0 (mirrors the proven
+            // `dsv4::build_dsv4_tp_runtime` flow).
+            let ordinal = cuda_kernels::tensor::parse_device_ordinal_from_env()?;
+            cudarc::runtime::result::device::set(ordinal as i32)
+                .map_err(|e| anyhow!("cudaSetDevice({ordinal}) before NCCL init failed: {e}"))?;
             let unique_id = nccl_unique_id_from_env()?;
             return crate::tp::TpRuntime::from_env_with_nccl(unique_id);
         }
@@ -472,7 +479,7 @@ impl SafetensorLoader {
     /// Load a 2D BF16 weight, slice it to this TP rank via [`crate::shard_slice`],
     /// and upload the shard. Column kind (`q/k/v/gate/up`) slices rows; row kind
     /// (`o/down`) slices cols. Single-GPU is the identity slice.
-    fn load_matrix_sharded(
+    pub(crate) fn load_matrix_sharded(
         &self,
         ctx: &DeviceContext,
         name: &str,
@@ -520,7 +527,11 @@ impl SafetensorLoader {
     /// dim would split a head on the last rank. `local_heads` (from `head_shard`,
     /// which requires global heads divide world size) gives a contiguous shard at
     /// offset `rank * local_heads * head_dim`.
-    fn load_qkv_head_sharded(
+    ///
+    /// `head_dim` is the PER-HEAD ROW COUNT, not necessarily the attention
+    /// head_dim: the gated Qwen3.5/3.6 q_proj interleaves `[query; gate]` per
+    /// head, so its per-head row block is `2 * head_dim`.
+    pub(crate) fn load_qkv_head_sharded(
         &self,
         ctx: &DeviceContext,
         name: &str,
@@ -567,11 +578,17 @@ impl SafetensorLoader {
     /// tables. Naming follows the mlx-lm `qwen3_5_moe` HF convention. Only the
     /// experts in `split.local_expert_start..local_expert_end()` are loaded
     /// (single-GPU loads all).
+    ///
+    /// Under TP the router gate (and the shared-expert sigmoid gate) stay
+    /// replicated — routing must be computed identically on every rank — while
+    /// the shared expert is column/row-sharded like a dense MLP so its partial
+    /// lands in the same post-MoE all-reduce as the routed partial.
     pub(crate) fn load_moe_layer_experts(
         &self,
         ctx: &DeviceContext,
         layer_prefix: &str,
         split: &crate::moe_config::ExpertSplit,
+        tp: &TpConfig,
     ) -> Result<MoeLayerWeights> {
         let mut gate = Vec::with_capacity(split.experts_per_rank);
         let mut up = Vec::with_capacity(split.experts_per_rank);
@@ -584,9 +601,34 @@ impl SafetensorLoader {
         }
         let router_gate = self.load_matrix(ctx, &format!("{layer_prefix}.mlp.gate.weight"))?;
         let shared_prefix = format!("{layer_prefix}.mlp.shared_expert");
-        let shared_gate = self.load_matrix(ctx, &format!("{shared_prefix}.gate_proj.weight"))?;
-        let shared_up = self.load_matrix(ctx, &format!("{shared_prefix}.up_proj.weight"))?;
-        let shared_down = self.load_matrix(ctx, &format!("{shared_prefix}.down_proj.weight"))?;
+        let (shared_gate, shared_up, shared_down) = if tp.is_single() {
+            (
+                self.load_matrix(ctx, &format!("{shared_prefix}.gate_proj.weight"))?,
+                self.load_matrix(ctx, &format!("{shared_prefix}.up_proj.weight"))?,
+                self.load_matrix(ctx, &format!("{shared_prefix}.down_proj.weight"))?,
+            )
+        } else {
+            (
+                self.load_matrix_sharded(
+                    ctx,
+                    &format!("{shared_prefix}.gate_proj.weight"),
+                    infer_topo::ParallelLinearKind::Column,
+                    tp,
+                )?,
+                self.load_matrix_sharded(
+                    ctx,
+                    &format!("{shared_prefix}.up_proj.weight"),
+                    infer_topo::ParallelLinearKind::Column,
+                    tp,
+                )?,
+                self.load_matrix_sharded(
+                    ctx,
+                    &format!("{shared_prefix}.down_proj.weight"),
+                    infer_topo::ParallelLinearKind::Row,
+                    tp,
+                )?,
+            )
+        };
         let shared_gate_router = self.load_matrix(
             ctx,
             &format!("{layer_prefix}.mlp.shared_expert_gate.weight"),
@@ -671,7 +713,10 @@ impl SafetensorLoader {
 // with the Piece 2/3 forward (see `feedback_necessity_not_callers`).
 #[allow(dead_code)]
 impl SafetensorLoader {
-    fn load_raw_tensor(&self, name: &str) -> Result<OwnedTensor> {
+    /// Dtype-agnostic full-tensor read (shape + raw bytes + dtype). The Qwen3.5
+    /// hybrid TP loader slices fused-block tensors (`in_proj_qkv`, `conv1d`,
+    /// per-v-head vectors) from these bytes before upload.
+    pub(crate) fn load_raw_tensor(&self, name: &str) -> Result<OwnedTensor> {
         if let Some(&idx) = self.weight_map.get(name) {
             return self.load_raw_from_shard(idx, name);
         }
@@ -686,9 +731,12 @@ impl SafetensorLoader {
         ))
     }
 
-    /// Normalize a DSv4 small 1D/2D tensor to BF16 bytes — these ship as BF16
-    /// (norms) or F32 (attn_sink, router gate) depending on the checkpoint.
-    fn dsv4_bytes_to_bf16<'a>(
+    /// Normalize a small 1D/2D tensor to BF16 bytes — these ship as BF16
+    /// (norms) or F32 (attn_sink, router gate, Qwen3.5 `dt_bias`) depending on
+    /// the checkpoint. Shared by the DSv4 vec loaders and the Qwen3.5 hybrid
+    /// TP slicers (which must match `load_vec_any`'s conversion exactly so the
+    /// sharded load is byte-identical to slicing the single-GPU upload).
+    pub(crate) fn dsv4_bytes_to_bf16<'a>(
         name: &str,
         tensor: &'a OwnedTensor,
     ) -> Result<std::borrow::Cow<'a, [u8]>> {
@@ -1256,10 +1304,10 @@ struct SafetensorIndex {
     weight_map: HashMap<String, String>,
 }
 
-struct OwnedTensor {
-    shape: Vec<usize>,
-    bytes: Vec<u8>,
-    dtype: Dtype,
+pub(crate) struct OwnedTensor {
+    pub(crate) shape: Vec<usize>,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) dtype: Dtype,
 }
 
 /// This EP rank's loaded MoE weights for one sparse layer: per-expert

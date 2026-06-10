@@ -397,6 +397,22 @@ mod backend {
         Ok(super::classify_cuda_model(&v))
     }
 
+    /// Whether `model_path`'s checkpoint takes the multiproc TP serve path when
+    /// the env world size > 1: DSv4 (multi-GPU by design) and the Qwen3.5/3.6
+    /// MoE hybrid (a `TpRuntime` consumer since the TP port; its executor
+    /// resolves rank/world + the NCCL communicator from env at load, exactly
+    /// like DSv4). Dense Qwen3 stays single-process. `false` on any
+    /// config-read/parse failure (the single-process path then errors with its
+    /// normal message).
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn cuda_model_takes_multiproc_serve(model_path: &str) -> bool {
+        matches!(
+            detect_cuda_model_kind(model_path),
+            Ok(CudaModelKind::Dsv4 | CudaModelKind::Qwen3Moe)
+        )
+    }
+
     /// Admission page-pool capacity, derived uniformly for every model — one rule,
     /// each backend declares its KV token-capacity. The scheduler gates admission on
     /// `pages_needed = (prompt_len + max_tokens) / page_size` (a full-attention
@@ -727,5 +743,7 @@ mod backend {
 pub use backend::CudaWorkerEngine;
 #[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
 pub use backend::LoadedInferenceEngine;
+#[cfg(feature = "cuda")]
+pub use backend::cuda_model_takes_multiproc_serve;
 #[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
 pub(crate) use backend::router_for_backend;
