@@ -44,6 +44,19 @@ stack with a strictly stronger experiment.
   whole-step graph BEFORE building per-path capture-safety.
 - nsys gap decompositions must subtract inherent dispatch + observer tax
   before claiming recoverable host time — A/B the graph, don't trust the gap.
+- **Sampling/RNG never enters a capture with by-value state** (audited vs the
+  SGLang Omni frozen-(seed,offset) catastrophe, flashinfer sampling baked a
+  by-value RNG handle into the graph → frozen u → AR self-conditioning locks
+  into repetition attractors, cross-boot drift makes it look flaky). ARLE is
+  structurally immune today: BOTH decode graphs (DSv4 `tail_graph`, Qwen
+  `GraphBucket`) end at the logits buffer with sampling outside the capture,
+  and the RNG is stateless counter-based `splitmix64(seed, position)` — the
+  philox-contract design; there is no mutable offset to freeze. If sampling
+  is ever moved in-graph for the lm_head-tail ~0.6 ms, position must live in
+  a device buffer advanced by a captured kernel (by-reference, the PyTorch
+  graphsafe pattern) — and note our greedy (temperature=0) graph gates are
+  BLIND to this bug class; a same-seed cross-boot 8/8 token-id probe is the
+  matching gate.
 
 ## What the campaign keeps (durable instrumentation/infra wins)
 
