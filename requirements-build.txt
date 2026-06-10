@@ -1,6 +1,6 @@
-# Build-time Python dependencies for agent-infer
-# TileLang: AOT attention/GDR kernels enabled by the CUDA feature set.
-tilelang
-
-# HuggingFace Hub: model weight download.
-huggingface_hub==1.17.0
+# Build-time Python dependencies for agent-infer.
+# TileLang: AOT attention/GDR kernel codegen for the CUDA feature set.
+# Pinned to the version on the 8xH20 pod (verified 2026-06-10), which is
+# what every current DSv4 AOT kernel build/bench runs against. Bump
+# deliberately, backed by a pod build + bench entry.
+tilelang==0.1.11
