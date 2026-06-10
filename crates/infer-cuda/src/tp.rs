@@ -963,10 +963,10 @@ mod oneshot {
                 }
             }
             let got_host = stream
-                .memcpy_dtov(&got)
+                .clone_dtoh(&got)
                 .map_err(|e| anyhow!("self-test dtoh: {e}"))?;
             let ref_host = stream
-                .memcpy_dtov(&reference)
+                .clone_dtoh(&reference)
                 .map_err(|e| anyhow!("self-test ref dtoh: {e}"))?;
             let to_f32 = |bits: u16| f32::from_bits(u32::from(bits) << 16);
             let max_delta = got_host
