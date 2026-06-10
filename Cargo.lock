@@ -1172,6 +1172,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hip-kernels"
+version = "0.1.5"
+
+[[package]]
+name = "hip-sys"
+version = "0.1.5"
+
+[[package]]
 name = "home"
 version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

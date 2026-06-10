@@ -1,0 +1,466 @@
+//! HIP kernel build + FFI layer for the AIPC DSv4-Flash 2-bit lane
+//! (#76/#77, [`docs/plans/2026-06-10-hip-backend-mvp.md`] §2/§4).
+//!
+//! Kernel objects only exist when built on a ROCm box (`--features hip`
+//! with hipcc installed — pending-remote); everywhere else the crate is
+//! the always-compiled layout layer (row-bytes helpers below) plus stubs
+//! that return [`NOT_COMPILED`]. With `--features hip` but no hipcc,
+//! build.rs warns and skips so `cargo check --features hip` stays green
+//! on the Mac (mirror of the `cuda,no-cuda` lane).
+//!
+//! Kernel corpus: `csrc/iq2_mmvq.cu` (IQ2_XXS / Q2_K mat-vec + q8_1
+//! activation quantization, adapted from llama.cpp @ d2462f8f) and the six
+//! shim-portable DSv4 sources from `crates/cuda-kernels/csrc/`, compiled
+//! by hipcc with `csrc/arle_hip_shim.h` force-included.
+//!
+//! [`docs/plans/2026-06-10-hip-backend-mvp.md`]: https://github.com/cklxx/ARLE/blob/main/docs/plans/2026-06-10-hip-backend-mvp.md
+
+/// Per-block byte sizes, pinned against the vendored
+/// `vendor/llama.cpp/ggml-common.h` struct definitions and mirrored by the
+/// `static_assert`s in `csrc/iq2_mmvq.cu`:
+/// - `block_iq2_xxs` (ggml-common.h:368-375): half d + (QK_K/8)*u16 qs = 66
+/// - `block_q2_K` (ggml-common.h:286-299): (QK_K/16) scales + (QK_K/4) qs + 2*half = 84
+/// - `block_q8_1` (ggml-common.h:249-259): half2 ds + QK8_1 i8 qs = 36
+pub const BLOCK_IQ2_XXS_BYTES: usize = 66;
+pub const BLOCK_Q2_K_BYTES: usize = 84;
+pub const BLOCK_Q8_1_BYTES: usize = 36;
+
+/// Weights per super-block for the two 2-bit formats (ggml-common.h:89).
+pub const QK_K: usize = 256;
+/// Values per q8_1 activation block (ggml-common.h:248).
+pub const QK8_1: usize = 32;
+
+/// Bytes of one IQ2_XXS weight row. `None` unless `ncols % QK_K == 0`
+/// (Option over assert: callers size buffers from untrusted model dims).
+pub const fn iq2_xxs_row_bytes(ncols: usize) -> Option<usize> {
+    if ncols == 0 || !ncols.is_multiple_of(QK_K) {
+        return None;
+    }
+    Some(ncols / QK_K * BLOCK_IQ2_XXS_BYTES)
+}
+
+/// Bytes of one Q2_K weight row. `None` unless `ncols % QK_K == 0`.
+pub const fn q2_k_row_bytes(ncols: usize) -> Option<usize> {
+    if ncols == 0 || !ncols.is_multiple_of(QK_K) {
+        return None;
+    }
+    Some(ncols / QK_K * BLOCK_Q2_K_BYTES)
+}
+
+/// Bytes of one q8_1 activation row. `None` unless `ncols % QK8_1 == 0`.
+pub const fn q8_1_row_bytes(ncols: usize) -> Option<usize> {
+    if ncols == 0 || !ncols.is_multiple_of(QK8_1) {
+        return None;
+    }
+    Some(ncols / QK8_1 * BLOCK_Q8_1_BYTES)
+}
+
+/// Raw HIP error code from a kernel launcher. `0` is `hipSuccess`;
+/// [`NOT_COMPILED`] is our stub-build sentinel, never produced by the
+/// runtime. Local on purpose — no dependency on `hip-sys`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelError(pub i32);
+
+/// Sentinel returned by every stub entry point when built without `hip`.
+pub const NOT_COMPILED: KernelError = KernelError(-1);
+
+pub type Result<T> = std::result::Result<T, KernelError>;
+
+impl std::fmt::Display for KernelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if *self == NOT_COMPILED {
+            return write!(
+                f,
+                "HIP kernels not compiled (build with --features hip on a ROCm box)"
+            );
+        }
+        write!(f, "HIP kernel error {}", self.0)
+    }
+}
+
+impl std::error::Error for KernelError {}
+
+/// Raw C-ABI launcher declarations (status = `hipError_t` as `i32`, stream
+/// last as `*mut c_void`). Public so the future `infer-hip` executor can
+/// call the DSv4 launchers directly — wrappers trail callers.
+#[cfg(feature = "hip")]
+pub mod ffi {
+    use std::ffi::c_void;
+
+    // csrc/iq2_mmvq.cu launchers (status = hipError_t, stream last).
+    unsafe extern "C" {
+        pub fn arle_quantize_row_q8_1_cuda(
+            x: *const f32,
+            y_q8_1: *mut c_void,
+            ncols: i64,
+            nrows: i64,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn arle_mmvq_iq2_xxs_cuda(
+            w_blocks: *const c_void,
+            x_q8_1: *const c_void,
+            y: *mut f32,
+            ncols: i32,
+            nrows: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn arle_mmvq_q2_k_cuda(
+            w_blocks: *const c_void,
+            x_q8_1: *const c_void,
+            y: *mut f32,
+            ncols: i32,
+            nrows: i32,
+            stream: *mut c_void,
+        ) -> i32;
+    }
+
+    // DSv4 graph-safe (`*_start_pos_ptr_cuda`) launchers exported by the
+    // shim-compiled cuda-kernels sources — signatures mirrored 1:1 from
+    // crates/cuda-kernels/csrc/misc/dsv4_attention.cu. Extern decls only;
+    // wrappers land with the infer-hip executor (interfaces trail callers).
+    unsafe extern "C" {
+        pub fn dsv4_prepare_qk_start_pos_ptr_cuda(
+            q_raw: *const u16,
+            k_raw: *const u16,
+            q_out: *mut u16,
+            k_out: *mut u16,
+            num_tokens: i32,
+            local_heads: i32,
+            head_dim: i32,
+            rope_dim: i32,
+            start_pos_ptr: *const i32,
+            rms_eps: f32,
+            rope_base: f32,
+            original_seq_len: i32,
+            factor: f32,
+            beta_fast: f32,
+            beta_slow: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn dsv4_prepare_qk_fused_start_pos_ptr_cuda(
+            q_raw: *const u16,
+            k_raw: *const u16,
+            q_out: *mut u16,
+            k_out: *mut u16,
+            num_tokens: i32,
+            local_heads: i32,
+            head_dim: i32,
+            rope_dim: i32,
+            start_pos_ptr: *const i32,
+            rms_eps: f32,
+            rope_base: f32,
+            original_seq_len: i32,
+            factor: f32,
+            beta_fast: f32,
+            beta_slow: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn dsv4_swa_attention_start_pos_ptr_cuda(
+            q: *const u16,
+            k_new: *const u16,
+            window_cache: *mut u16,
+            attn_sink: *const u16,
+            out: *mut u16,
+            num_tokens: i32,
+            local_heads: i32,
+            head_dim: i32,
+            sliding_window: i32,
+            start_pos_ptr: *const i32,
+            sink_offset: i32,
+            scale_value: f32,
+            rope_dim: i32,
+            rope_base: f32,
+            original_seq_len: i32,
+            factor: f32,
+            beta_fast: f32,
+            beta_slow: f32,
+            write_window_cache: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn dsv4_update_window_cache_start_pos_ptr_cuda(
+            k_new: *const u16,
+            window_cache: *mut u16,
+            num_tokens: i32,
+            start_pos_ptr: *const i32,
+            sliding_window: i32,
+            head_dim: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn dsv4_compressor_update_start_pos_ptr_cuda(
+            kv_raw: *const u16,
+            score_raw: *const u16,
+            ape: *const u16,
+            norm: *const u16,
+            pending_kv: *mut u16,
+            pending_score: *mut u16,
+            prev_overlap_kv: *mut u16,
+            prev_overlap_score: *mut u16,
+            compressed: *mut u16,
+            num_tokens: i32,
+            start_pos: *const i32,
+            head_dim: i32,
+            ratio: i32,
+            width: i32,
+            overlap: i32,
+            eps: f32,
+            rope_dim: i32,
+            rope_base: f32,
+            original_seq_len: i32,
+            factor: f32,
+            beta_fast: f32,
+            beta_slow: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn dsv4_hybrid_attention_start_pos_ptr_cuda(
+            q: *const u16,
+            k_new: *const u16,
+            window_cache: *mut u16,
+            compressed: *const u16,
+            selected: *const i32,
+            attn_sink: *const u16,
+            out: *mut u16,
+            num_tokens: i32,
+            local_heads: i32,
+            head_dim: i32,
+            sliding_window: i32,
+            start_pos_ptr: *const i32,
+            sink_offset: i32,
+            scale_value: f32,
+            rope_dim: i32,
+            rope_base: f32,
+            original_seq_len: i32,
+            factor: f32,
+            beta_fast: f32,
+            beta_slow: f32,
+            mode: i32,
+            compress_ratio: i32,
+            compressed_count: i32,
+            selected_topk: i32,
+            write_window_cache: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
+            out: *mut u16,
+            token_count: i32,
+            local_heads: i32,
+            head_dim: i32,
+            rope_dim: i32,
+            start_pos_ptr: *const i32,
+            rope_base: f32,
+            original_seq_len: i32,
+            factor: f32,
+            beta_fast: f32,
+            beta_slow: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn dsv4_csa_select_start_pos_ptr_cuda(
+            q: *const u16,
+            weights: *const u16,
+            keys: *const u16,
+            selected: *mut i32,
+            num_tokens: i32,
+            q_width: i32,
+            local_heads: i32,
+            index_dim: i32,
+            key_count: i32,
+            ratio: i32,
+            topk: i32,
+            score_scale: f32,
+            start_pos: *const i32,
+            stream: *mut c_void,
+        ) -> i32;
+    }
+}
+
+#[cfg(feature = "hip")]
+mod real {
+    use super::{KernelError, Result, ffi};
+    use std::ffi::c_void;
+
+    fn check(code: i32) -> Result<()> {
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(KernelError(code))
+        }
+    }
+
+    /// Quantize `nrows` contiguous rows of `ncols` f32 activations into
+    /// q8_1 blocks at `y_q8_1`. `ncols` must be a multiple of [`super::QK8_1`].
+    ///
+    /// # Safety
+    /// `x` must point to `nrows * ncols` device f32; `y_q8_1` to at least
+    /// `nrows * q8_1_row_bytes(ncols)` device bytes; `stream` must be a
+    /// valid HIP stream (or null for the default stream).
+    pub unsafe fn quantize_row_q8_1(
+        x: *const f32,
+        y_q8_1: *mut c_void,
+        ncols: i64,
+        nrows: i64,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        check(unsafe { ffi::arle_quantize_row_q8_1_cuda(x, y_q8_1, ncols, nrows, stream) })
+    }
+
+    /// y = W·x for a row-major IQ2_XXS weight matrix `[nrows, ncols]`
+    /// against one q8_1-quantized activation vector (B=1 decode shape).
+    ///
+    /// # Safety
+    /// `w_blocks` must hold `nrows * iq2_xxs_row_bytes(ncols)` device
+    /// bytes; `x_q8_1` one q8_1 row of `ncols` values; `y` `nrows` device
+    /// f32; `stream` a valid HIP stream (or null).
+    pub unsafe fn mmvq_iq2_xxs(
+        w_blocks: *const c_void,
+        x_q8_1: *const c_void,
+        y: *mut f32,
+        ncols: i32,
+        nrows: i32,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        check(unsafe { ffi::arle_mmvq_iq2_xxs_cuda(w_blocks, x_q8_1, y, ncols, nrows, stream) })
+    }
+
+    /// y = W·x for a row-major Q2_K weight matrix — same shape contract as
+    /// [`mmvq_iq2_xxs`].
+    ///
+    /// # Safety
+    /// As [`mmvq_iq2_xxs`], with `q2_k_row_bytes(ncols)` weight rows.
+    pub unsafe fn mmvq_q2_k(
+        w_blocks: *const c_void,
+        x_q8_1: *const c_void,
+        y: *mut f32,
+        ncols: i32,
+        nrows: i32,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        check(unsafe { ffi::arle_mmvq_q2_k_cuda(w_blocks, x_q8_1, y, ncols, nrows, stream) })
+    }
+}
+
+#[cfg(feature = "hip")]
+pub use real::{mmvq_iq2_xxs, mmvq_q2_k, quantize_row_q8_1};
+
+#[cfg(not(feature = "hip"))]
+mod stub {
+    use super::{NOT_COMPILED, Result};
+    use std::ffi::c_void;
+
+    /// Stub — see the `hip` build for the real contract.
+    ///
+    /// # Safety
+    /// No-op; never dereferences its arguments.
+    pub unsafe fn quantize_row_q8_1(
+        _x: *const f32,
+        _y_q8_1: *mut c_void,
+        _ncols: i64,
+        _nrows: i64,
+        _stream: *mut c_void,
+    ) -> Result<()> {
+        Err(NOT_COMPILED)
+    }
+
+    /// Stub — see the `hip` build for the real contract.
+    ///
+    /// # Safety
+    /// No-op; never dereferences its arguments.
+    pub unsafe fn mmvq_iq2_xxs(
+        _w_blocks: *const c_void,
+        _x_q8_1: *const c_void,
+        _y: *mut f32,
+        _ncols: i32,
+        _nrows: i32,
+        _stream: *mut c_void,
+    ) -> Result<()> {
+        Err(NOT_COMPILED)
+    }
+
+    /// Stub — see the `hip` build for the real contract.
+    ///
+    /// # Safety
+    /// No-op; never dereferences its arguments.
+    pub unsafe fn mmvq_q2_k(
+        _w_blocks: *const c_void,
+        _x_q8_1: *const c_void,
+        _y: *mut f32,
+        _ncols: i32,
+        _nrows: i32,
+        _stream: *mut c_void,
+    ) -> Result<()> {
+        Err(NOT_COMPILED)
+    }
+}
+
+#[cfg(not(feature = "hip"))]
+pub use stub::{mmvq_iq2_xxs, mmvq_q2_k, quantize_row_q8_1};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Per-block sizes pinned against vendor/llama.cpp/ggml-common.h:
+    // block_iq2_xxs l.368-375, block_q2_K l.286-299, block_q8_1 l.249-259
+    // (same numbers as the static_asserts in csrc/iq2_mmvq.cu).
+    #[test]
+    fn per_block_bytes_match_ggml_common() {
+        assert_eq!(iq2_xxs_row_bytes(QK_K), Some(66));
+        assert_eq!(q2_k_row_bytes(QK_K), Some(84));
+        assert_eq!(q8_1_row_bytes(QK8_1), Some(36));
+    }
+
+    #[test]
+    fn row_bytes_dsv4_hidden_dim() {
+        // DSv4-Flash hidden dim 7168 = 28 super-blocks = 224 q8_1 blocks.
+        assert_eq!(iq2_xxs_row_bytes(7168), Some(28 * 66));
+        assert_eq!(q2_k_row_bytes(7168), Some(28 * 84));
+        assert_eq!(q8_1_row_bytes(7168), Some(224 * 36));
+    }
+
+    #[test]
+    fn row_bytes_reject_unaligned() {
+        assert_eq!(iq2_xxs_row_bytes(0), None);
+        assert_eq!(iq2_xxs_row_bytes(255), None);
+        assert_eq!(q2_k_row_bytes(QK_K + 1), None);
+        assert_eq!(q8_1_row_bytes(33), None);
+    }
+
+    #[cfg(not(feature = "hip"))]
+    #[test]
+    fn stubs_report_not_compiled() {
+        let err = unsafe {
+            quantize_row_q8_1(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                32,
+                1,
+                std::ptr::null_mut(),
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, NOT_COMPILED);
+        let err = unsafe {
+            mmvq_iq2_xxs(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                256,
+                1,
+                std::ptr::null_mut(),
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, NOT_COMPILED);
+        let err = unsafe {
+            mmvq_q2_k(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                256,
+                1,
+                std::ptr::null_mut(),
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, NOT_COMPILED);
+        assert!(NOT_COMPILED.to_string().contains("not compiled"));
+    }
+}
