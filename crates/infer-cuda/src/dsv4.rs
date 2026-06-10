@@ -261,6 +261,20 @@ pub(crate) struct Dsv4DecodeGraphScratch {
     logits: DeviceVec,
 }
 
+impl Dsv4DecodeGraphScratch {
+    /// Request-boundary hook: re-arm one eager warm run on every graph state
+    /// (whole-step + per-portion + tail) without dropping the captures. See
+    /// [`crate::graph::CudaGraphState::rearm_warm`].
+    fn rearm_for_new_request(&mut self) {
+        self.whole_graph.rearm_warm(1);
+        self.tail_graph.rearm_warm(1);
+        for layer in &mut self.layers {
+            layer.attn_graph.rearm_warm(1);
+            layer.moe_graph.rearm_warm(1);
+        }
+    }
+}
+
 struct Dsv4DecodeLayerGraphScratch {
     attn_graph: crate::graph::CudaGraphState,
     moe_graph: crate::graph::CudaGraphState,
@@ -570,6 +584,13 @@ impl Dsv4SlotState {
         for (layer_idx, layer) in self.attention.iter_mut().enumerate() {
             let pool = kv_adapter.layer_mut(layer_idx)?;
             layer.reset(ctx, pool)?;
+        }
+        // Re-arm one eager warm step on every captured decode graph: the new
+        // request's first decode runs the host-side per-request work (SW ring
+        // bootstrap, compressed bulk pack) eagerly, then replay resumes with
+        // the SAME captured graph (capture cost paid once per slot lifetime).
+        if let Some(graph) = self.decode_graph.as_mut() {
+            graph.rearm_for_new_request();
         }
         Ok(())
     }

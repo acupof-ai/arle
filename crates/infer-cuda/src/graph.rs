@@ -62,6 +62,15 @@ impl CudaGraphState {
         self.bypass = bypass;
     }
 
+    /// Re-arm `n` eager warm runs without dropping the captured graph. Called
+    /// at request boundaries (slot reset): the next step runs eagerly so
+    /// host-side per-request work (ring bootstrap, compressed bulk pack) can
+    /// execute, then replay resumes — capture cost is paid once per slot, not
+    /// once per request.
+    pub fn rearm_warm(&mut self, n: u32) {
+        self.warm_remaining = self.warm_remaining.max(n);
+    }
+
     /// Whether the graph for this shape has been captured yet.
     #[must_use]
     pub fn is_captured(&self) -> bool {
@@ -82,16 +91,19 @@ impl CudaGraphState {
         if self.bypass {
             return kernels();
         }
+        // Warm runs take precedence over replay: a captured graph can be
+        // re-armed (`rearm_warm`) so the next call(s) run eagerly — the
+        // per-request boundary hook (slot reset) uses this to run bootstrap /
+        // bulk host work once per request while KEEPING the captured graph.
+        if self.warm_remaining > 0 {
+            self.warm_remaining -= 1;
+            return kernels();
+        }
         if let Some(graph) = &self.graph {
             graph
                 .launch()
                 .map_err(|e| anyhow::anyhow!("CUDA Graph launch failed: {e}"))?;
             return Ok(());
-        }
-        if self.warm_remaining > 0 {
-            // Eager warm run: flush lazy JIT/module/alloc init outside capture.
-            self.warm_remaining -= 1;
-            return kernels();
         }
 
         debug!("Capturing CUDA Graph for decode path...");

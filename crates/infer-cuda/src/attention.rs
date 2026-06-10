@@ -749,7 +749,7 @@ impl Dsv4FlashMlaDecodeState {
             max_seq_len.div_ceil(compress_ratio).max(1)
         };
 
-        Ok(Self {
+        let mut state = Self {
             slot_idx,
             fp8_kv_pool_len: range.len(),
             sw_blocks: shape.sw_blocks,
@@ -777,7 +777,46 @@ impl Dsv4FlashMlaDecodeState {
             num_sm_parts,
             fixed_overhead_num_blocks,
             block_size_topk,
-        })
+        };
+        state.init_constant_sched_meta(ctx)?;
+        Ok(state)
+    }
+
+    /// Fill `topk_length` and the FlashMLA scheduler metadata ONCE: both
+    /// depend only on slot constants (`topk_unified`, sm-part shape), so
+    /// computing them per decode step was (a) wasted work (43 calls/token)
+    /// and (b) a CUDA-graph capture hazard — the per-step
+    /// `memcpy_htod(&[topk], ..)` recorded a memcpy node whose HOST source
+    /// was a dead stack temporary, so replay read a dangling pointer
+    /// (garbage topk → insane splits → the 2026-06-10 IMA).
+    fn init_constant_sched_meta(&mut self, ctx: &DeviceContext) -> Result<()> {
+        let topk = i32::try_from(self.topk_unified)
+            .map_err(|_| anyhow!("DSv4 FlashMLA topk {} overflows i32", self.topk_unified))?;
+        ctx.stream
+            .memcpy_htod(&[topk], &mut self.topk_length)
+            .map_err(|e| anyhow!("DSv4 FlashMLA topk_length H2D failed: {e}"))?;
+        let (topk_ptr, _tg) = self.topk_length.device_ptr(&ctx.stream);
+        let (sched_ptr, _sg) = self.sched_meta.device_ptr_mut(&ctx.stream);
+        let (splits_ptr, _pg) = self.num_splits.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
+                1,
+                1,
+                self.block_size_topk,
+                self.fixed_overhead_num_blocks,
+                topk,
+                0,
+                topk_ptr as *const i32,
+                std::ptr::null(),
+                sched_ptr as *mut i32,
+                splits_ptr as *mut i32,
+                self.num_sm_parts,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA sched_meta failed: {e}"))?;
+        }
+        Ok(())
     }
 
     fn reset(&mut self, ctx: &DeviceContext, pool: &mut Dsv4LayerKvLayout) -> Result<()> {
@@ -3043,14 +3082,53 @@ fn flashmla_pack_compressed_delta(
     flash: &mut Dsv4FlashMlaDecodeState,
     pool: &mut Dsv4LayerKvLayout,
     compressed: Option<&HiddenStates>,
+    start_pos_device: &CudaSlice<i32>,
+    compress_ratio: usize,
     config: &DeepSeekV4Config,
 ) -> Result<()> {
     let Some(compressed) = compressed else {
         return Ok(());
     };
+    // Steady-state decode adds AT MOST one compressed row per step
+    // ((pos+1) % ratio == 0). That row is packed by the DEVICE kernel below —
+    // fully derived from `start_pos_device`, so it records into CUDA-graph
+    // captures and stays correct on replay (the old host Vec + H2D path is
+    // skipped on replay entirely, which stalled the pool → garbage/IMA).
+    // The host bulk path remains ONLY for multi-row gaps (first decode after
+    // prefill / request boundaries), which always execute eagerly (the graph
+    // warm pass — see `CudaGraphState::rearm_warm`).
+    {
+        let range = pool.flashmla_slot_range(flash.slot_idx)?;
+        let pool_buf = pool
+            .flashmla_fp8_kv_pool
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+        let mut pool_view = pool_buf.slice_mut(range);
+        let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
+        let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
+        let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
+        flash_kv::dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw(
+            ctx,
+            compressed_ptr,
+            pool_ptr,
+            start_ptr,
+            compress_ratio,
+            flash.sw_blocks,
+            64,
+            config.head_dim,
+        )?;
+    }
     let start_row = flash.fp8_kv_comp_packed_rows;
     let end_row = compressed.seq_len;
     if end_row <= start_row {
+        return Ok(());
+    }
+    // Host bookkeeping below runs in eager contexts only (warm pass / no
+    // graph); the device kernel above already covered the single-row case, so
+    // bulk-pack only multi-row gaps. The boundary row may be packed by both
+    // paths — idempotent overwrite of identical data.
+    flash.fp8_kv_comp_packed_rows = end_row;
+    if end_row == start_row + 1 {
         return Ok(());
     }
     let n = end_row - start_row;
@@ -3569,7 +3647,15 @@ fn try_flashmla_decode_attention(
     }
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed");
-        flashmla_pack_compressed_delta(ctx, flash, pool, compressed, config)?;
+        flashmla_pack_compressed_delta(
+            ctx,
+            flash,
+            pool,
+            compressed,
+            start_pos_device,
+            compress_ratio,
+            config,
+        )?;
     }
 
     let mode_int = flashmla_mode_int(mode);
@@ -3607,39 +3693,9 @@ fn try_flashmla_decode_attention(
     drop(indices_guard);
     drop(start_guard);
 
-    let topk = i32::try_from(flash.topk_unified)
-        .map_err(|_| anyhow!("DSv4 FlashMLA topk {} overflows i32", flash.topk_unified))?;
-    ctx.stream
-        .memcpy_htod(&[topk], &mut flash.topk_length)
-        .map_err(|e| anyhow!("DSv4 FlashMLA topk_length H2D failed: {e}"))?;
-
-    let (topk_ptr, topk_guard) = flash.topk_length.device_ptr(&ctx.stream);
-    let (sched_ptr, sched_guard) = flash.sched_meta.device_ptr_mut(&ctx.stream);
-    let (splits_ptr, splits_guard) = flash.num_splits.device_ptr_mut(&ctx.stream);
-    {
-        let _nvtx = crate::nvtx::range("dsv4/flashmla_sched_meta");
-        unsafe {
-            ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
-                1,
-                1,
-                flash.block_size_topk,
-                flash.fixed_overhead_num_blocks,
-                topk,
-                0,
-                topk_ptr as *const i32,
-                std::ptr::null(),
-                sched_ptr as *mut i32,
-                splits_ptr as *mut i32,
-                flash.num_sm_parts,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| anyhow!("DSv4 FlashMLA sched_meta failed: {e}"))?;
-        }
-    }
-    drop(topk_guard);
-    drop(sched_guard);
-    drop(splits_guard);
+    // topk_length + scheduler metadata are slot constants, computed once at
+    // state init (`init_constant_sched_meta`) — see the capture-hazard note
+    // there. Saves 43 sched-meta calls/token as a side effect.
 
     let (q_ptr, q_guard) = q_prepared.data.device_ptr(&ctx.stream);
     let pool_range = pool.flashmla_slot_range(flash.slot_idx)?;
