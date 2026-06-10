@@ -1821,6 +1821,7 @@ impl Dsv4Model {
                             scratch,
                             &layer.moe,
                             &tokens[start..end],
+                            tokens.len(),
                             &owned_in,
                             &mut owned_out,
                             &mut keepalive,
