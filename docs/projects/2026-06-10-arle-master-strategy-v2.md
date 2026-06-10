@@ -3,7 +3,9 @@
 > **本文 supersede [`2026-05-07-arle-master-strategy.md`](2026-05-07-arle-master-strategy.md)(v1)的全部战略结论。**
 > 任何与本文冲突的旧 doc 以本文为准。v1 保留作历史推理记录,header 已打 SUPERSEDED 横幅。
 > 进展跟踪:[umbrella #55](https://github.com/cklxx/arle/issues/55) ——
-> Phase 0 = #56–#59,Phase 1 = #60–#61,Phase 2 = #62,Phase 3 = #63–#65。
+> Phase 0 = #56–#59(✅ 全关 2026-06-10;残留 #68 model-generic KV-quant gate,不再 block
+> Phase 1),Phase 1 = #60–#61(ACTIVE),Phase 2 = #70(kernel-base 收敛,先行)+ #62,
+> Phase 3 = #63–#65;off-path infra = #69(cold-boot)。
 >
 > 写作纪律:结论先行 + evidence 引用;hypothesis 显式标注(§6);不复述 per-date
 > wins/errors 的细节,只 link。
@@ -157,7 +159,7 @@ guard)、Qwen/Gemma 的 engine-generic 复用。wall-clock @4096 实测 c=8 仅 
 
 | 项 | 裁定 | 依据 |
 |---|---|---|
-| B=1 decode 的 per-kernel / launch / alloc / host-overhead lever | **KILLED**(8 wash)| `2026-06-08-dsv4-decode-6ms-FINAL` |
+| B=1 decode 的 per-kernel / launch / alloc / host-overhead **micro**-lever | **KILLED**(8 wash)。例外:whole-step graph + lockstep step-start 两项已于 2026-06-10 依本节翻案规则 RE-LICENSED([skew anatomy](../experience/wins/2026-06-10-dsv4-nsys-skew-anatomy-rewrites-lever-board.md) 实测 launch-gap 29% + start-offset 18% of wall),跟踪 #70 | `2026-06-08-dsv4-decode-6ms-FINAL`;翻案 evidence 见 skew anatomy |
 | deepep_ll default-on | **BLOCKED**:B=1 −55%;翻案唯一条件 = Phase 1 后批量 lane A/B 赢 | errors 2026-06-10 |
 | classical spec decode(Leviathan 自/外 draft)| **KILLED**(α≤0.25 三连)| v1 §7.4 evidence,继续有效 |
 | pooled/contiguous decode 当 B=1 默认 | **KILLED**(28.4 vs 37.6 tok/s)| memory + A/B |
