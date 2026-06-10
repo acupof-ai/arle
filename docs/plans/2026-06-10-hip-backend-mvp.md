@@ -16,14 +16,36 @@ marked *hypothesis* needs on-box confirmation during H2/H3.
 | Mission model | **DSv4-Flash at 2-bit weights** (ckl directive 2026-06-10) — the model only ARLE can serve, on a consumer 128 GB box. Weight format: IQ2-class i-quants (llama.cpp 2.06–2.5 bpw family, kernels vendored). Bring-up smoke: Qwen3-0.6B BF16 (in `models/`, proves the substrate before the big model) |
 | Reference engine | llama.cpp HIP build on the same box (`-DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DGGML_HIP_ROCWMMA_FATTN=ON`, `ROCBLAS_USE_HIPBLASLT=1`, `GGML_HIP_NO_VMM=ON`) — bar set with an IQ2-class MoE it can run (it cannot load DSv4-Flash; nearest-proxy protocol per the 2026-06-04 SGLang A/B precedent) |
 
-**Model-shape notes:** DSv4-Flash FP8 checkpoint is 149 GB (#69) ≈ ~149B params →
-~39–47 GB at 2.06–2.5 bpw: fits the 128 GB UMA with room for compressed-attention KV
-(DSA/CSA KV is small by construction — the long-ctx story survives quantization of
-weights). Qwen3.5 is hybrid (3:1 gated-delta : hd256 full attn), NOT the dense
-stepping stone — Qwen3-0.6B (plain GQA hd128) is. Per-tensor quant mix follows
-llama.cpp dynamic-quant practice: attention/dense/shared-expert tensors stay at
-higher bits, routed-expert FFNs take the 2-bit floor — exact recipe is an on-box
-needle-gated experiment, not a guess.
+**Model-shape facts (2026-06-10 OSS survey):** DSv4-Flash = **284B total / 13B
+active**, 1M-token context, checkpoint natively FP4(experts)/FP8 — matches our pod's
+149 GB dir (#69). At the community 2-bit recipe the model lands ~58–75 GB on disk:
+fits 128 GB UMA with room for compressed-attention KV (DSA/CSA KV small by
+construction). Qwen3.5 is hybrid (3:1 gated-delta : hd256 full attn), NOT the dense
+stepping stone — Qwen3-0.6B (plain GQA hd128) is.
+
+**Quant recipe — adopt the converged community one, don't invent:** asymmetric,
+routed-MoE-experts-only — up/gate `IQ2_XXS`, down `Q2_K`, **everything else (attn,
+shared experts, projections, router) untouched**, imatrix-calibrated
+([antirez/ds4](https://github.com/antirez/ds4) ships exactly this as `q2-imatrix`,
+plus `q2-q4` last-6-layers-Q4 and `q4` for 256GB+ boxes). Quality upgrade candidate:
+ik_llama.cpp `IQ2_KT` integer-trellis (2.125 bpw, lower ppl than IQ2-class,
+QTIP/EXL3-family) — evaluate after the proven recipe passes the needle gate.
+
+### §0.5 Prior art (who runs DSv4-Flash today, and how fast)
+
+| Project | Backend / box | Quant | Numbers | Takeaway |
+| --- | --- | --- | --- | --- |
+| [antirez/ds4 "DwarfStar"](https://github.com/antirez/ds4) (MIT, C/CUDA/Metal/ROCm, DSv4-specific engine) | Metal M5 Max 128GB | q2-imatrix | **87 pp / 34 tg t/s** @32K ctx | the bar: a dedicated engine hits the bandwidth floor; expert in-RAM cache + SSD streaming; KV is a first-class disk citizen; ROCm/Strix Halo listed as supported |
+| same | DGX Spark GB10 128GB | q2 | 344 pp / 13.75 tg | prefill scales with compute, decode with bandwidth |
+| [llama.cpp WIP](https://github.com/ggml-org/llama.cpp/discussions/22376) `wip/deepseek-v4-support` (draft PR #22378) | RTX 6000-class + CPU-MoE | Q2–Q3 mixed / FP4-FP8 GGUF | 15–18 tg | mainline pending; FA disabled; graph WIP; community GGUFs on HF (nsparks, batiai, unsloth safetensors mirror) |
+| [tinycomputers Strix Halo run](https://tinycomputers.io/posts/running-deepseek-v4-flash-on-amd-strix-halo.html) (nisparks fork `pr/01-deepseek-v4-arch`) | **ROCm 7.2 gfx1151 — our exact box** | IQ1_S-XL, 58 GB | **1–2 tg** (theory ~46) | it boots on the 395 TODAY but runs 20–40× below floor — that gap is ARLE's opportunity. Needed: GTT 96 GB, `GGML_HIP_NO_VMM=OFF` (VMM **on** for the GTT pool — contradicts the dense-model known-good `NO_VMM=ON`; treat both as on-box hypotheses), `--no-warmup`, a dequant-before-binbcast fix |
+
+TQ/ternary verdict (ckl asked): `TQ1_0`/`TQ2_0` (llama.cpp, 1.69/2.06 bpw MAD),
+[bitnet.cpp](https://arxiv.org/abs/2502.11880) (1.67-bit packing), T-MAC (LUT) are
+all for **natively ternary-TRAINED models** (BitNet b1.58 / TriLM) — ternary PTQ of
+an FP8 checkpoint collapses without QAT. **Not applicable to DSv4-Flash**; our TQ4
+stays a KV-cache format. The 2-bit PTQ menu is IQ2-class (proven, kernels vendored)
+vs `IQ2_KT` trellis (quality candidate).
 
 ## §1 Decode floor (formula before measurement)
 
@@ -32,7 +54,7 @@ For the MoE mission model the bytes are the ACTIVE subset, not total weights.
 
 | Model | Bytes/token | Floor | Note |
 | --- | --- | --- | --- |
-| **DSv4-Flash IQ2-class** | active params × ~2.1–2.5 bpw + higher-bit attn/shared tensors — *pin active-param count from the checkpoint `config.json` on first session (hypothesis range: ~5–10 GB/tok → ~25–45 ms/tok ≈ 22–40 tok/s)* | TBD on-box | the mission number; compressed-attention KV adds little |
+| **DSv4-Flash IQ2-class** | 13B active × ~2.1–2.6 bpw mixed + higher-bit attn/shared ≈ **~4.5–6 GB/tok** | ~21–28 ms/tok ≈ **35–47 tok/s** | the mission number; cross-checked: ds4 measures 34 tg on M5 Max (~same bandwidth class) — floor math and prior art agree |
 | Qwen3-0.6B BF16 | ~1.4 GB | ~6.6 ms/tok | substrate smoke only |
 
 Total-weight residency: ~39–47 GB at 2-bit → GTT must map ≥64 GB (kernel-param
