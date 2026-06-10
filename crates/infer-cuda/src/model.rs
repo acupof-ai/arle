@@ -195,7 +195,9 @@ impl CudaModel {
                 let cfg = self.moe_config.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("MoE layer present but model has no moe_config")
                 })?;
-                let moe_out = moe_forward(&self.ctx, moe, &normed, cfg)?;
+                // Dense-path MoE has no EP split (single-rank expert ownership).
+                let split = crate::moe_config::ExpertSplit::single(cfg.num_experts);
+                let moe_out = moe_forward(&self.ctx, moe, &normed, cfg, &split)?;
                 self.ctx
                     .stream
                     .memcpy_dtod(&moe_out.data, &mut o_buf.data)

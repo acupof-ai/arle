@@ -125,6 +125,36 @@ pub(crate) fn flatten_routing(
     Ok((indices, weights))
 }
 
+/// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF).
+///
+/// A `clone_htod(&vec![-1; n])` here would record a CUDA-graph memcpy node
+/// whose HOST source dies with this call — replay reads freed memory (the
+/// same hazard class as the topk_length IMA, 2026-06-10). Device memset is
+/// capture-safe and cheaper. Shared by the BF16 (`gpu`) and DSv4 FP8
+/// (`dsv4_gpu`) forwards — both use `-1` as the "route slot not packed on this
+/// rank" sentinel.
+#[cfg(feature = "cuda")]
+fn alloc_neg1_i32(
+    ctx: &cuda_kernels::prelude::DeviceContext,
+    len: usize,
+) -> anyhow::Result<cudarc::driver::CudaSlice<i32>> {
+    use cudarc::driver::DevicePtrMut;
+
+    let mut buf = ctx
+        .stream
+        .alloc_zeros::<i32>(len)
+        .map_err(|e| anyhow::anyhow!("MoE -1 sentinel alloc failed: {e}"))?;
+    let n_bytes = len * std::mem::size_of::<i32>();
+    let (ptr, _guard) = buf.device_ptr_mut(&ctx.stream);
+    // SAFETY: `ptr` is a live device allocation of `n_bytes` on this stream.
+    unsafe {
+        cudarc::driver::result::memset_d8_async(ptr, 0xFF, n_bytes, ctx.stream.cu_stream())
+            .map_err(|e| anyhow::anyhow!("MoE -1 sentinel memset failed: {e}"))?;
+    }
+    drop(_guard);
+    Ok(buf)
+}
+
 #[cfg(feature = "cuda")]
 mod gpu {
     use anyhow::{Result, ensure};
@@ -134,22 +164,40 @@ mod gpu {
     use half::bf16;
     use infer_moe::MoeConfig;
 
+    use super::alloc_neg1_i32;
     use crate::loader::MoeLayerWeights;
+    use crate::moe_config::ExpertSplit;
     use crate::ops::{gemm_batch, silu_mul};
 
-    /// Single-GPU BF16 MoE forward for one sparse layer (all experts local).
-    /// `normed` is the post-LN hidden `[num_tokens, hidden]`; returns the block
-    /// output (routed + sigmoid-gated shared expert) as a fresh `HiddenStates`.
+    /// BF16 MoE forward for one sparse layer. `normed` is the post-LN hidden
+    /// `[num_tokens, hidden]`; returns the block output (routed + sigmoid-gated
+    /// shared expert) as a fresh `HiddenStates`.
+    ///
+    /// `split` is this rank's EP expert ownership. Routing runs over ALL
+    /// `cfg.num_experts` (router gate replicated; activations identical across
+    /// ranks because every row-parallel output was all-reduced upstream), but
+    /// only routes landing on `split`'s local experts contribute — so under
+    /// `ep_size > 1` the returned buffer is a PARTIAL sum (routed locals +
+    /// column/row-sharded shared expert) and the caller must `all_reduce_sum`
+    /// it once before the residual add. `ExpertSplit::single` is the unchanged
+    /// single-GPU path (every expert local, nothing to reduce).
     pub(crate) fn moe_forward(
         ctx: &DeviceContext,
         weights: &MoeLayerWeights,
         normed: &HiddenStates,
         cfg: &MoeConfig,
+        split: &ExpertSplit,
     ) -> Result<HiddenStates> {
         let num_tokens = normed.seq_len;
         let hidden_dim = normed.hidden_dim;
         let num_experts = cfg.num_experts;
         let topk = cfg.top_k;
+        ensure!(
+            split.num_experts == num_experts,
+            "MoE expert split covers {} experts but the router has {num_experts}",
+            split.num_experts
+        );
+        let local_experts = split.experts_per_rank;
         ensure!(
             weights.router_gate.cols == hidden_dim && weights.router_gate.rows == num_experts,
             "MoE router shape mismatch: gate={}x{} hidden_dim={} num_experts={}",
@@ -159,14 +207,16 @@ mod gpu {
             num_experts
         );
         ensure!(
-            weights.gate.len() == num_experts
-                && weights.up.len() == num_experts
-                && weights.down.len() == num_experts,
-            "MoE expert count mismatch: gate={} up={} down={} num_experts={}",
+            weights.gate.len() == local_experts
+                && weights.up.len() == local_experts
+                && weights.down.len() == local_experts,
+            "MoE expert count mismatch: gate={} up={} down={} local_experts={local_experts} \
+             (ep_size={} ep_rank={})",
             weights.gate.len(),
             weights.up.len(),
             weights.down.len(),
-            num_experts
+            split.ep_size,
+            split.ep_rank
         );
 
         // ── 1. Router gemm → logits[T, E] (token-major). ────────────────────
@@ -199,15 +249,15 @@ mod gpu {
             .clone_htod(&weights_host)
             .map_err(|e| anyhow::anyhow!("MoE route-weight H2D failed: {e}"))?;
 
-        // ── 3. Per-expert route counts → group offsets. ─────────────────────
+        // ── 3. Per-expert route counts → group offsets (LOCAL experts only). ─
         // Kernels write these through raw device pointers, so no Rust `mut`.
         let counts = ctx
             .stream
-            .alloc_zeros::<i32>(num_experts)
+            .alloc_zeros::<i32>(local_experts)
             .map_err(|e| anyhow::anyhow!("MoE count alloc failed: {e}"))?;
         let offsets = ctx
             .stream
-            .alloc_zeros::<i32>(num_experts)
+            .alloc_zeros::<i32>(local_experts)
             .map_err(|e| anyhow::anyhow!("MoE offset alloc failed: {e}"))?;
         let scan_total = ctx
             .stream
@@ -220,32 +270,41 @@ mod gpu {
                 cache_ptr(&counts, ctx),
                 num_tokens,
                 topk,
-                0,
-                num_experts,
+                split.local_expert_start,
+                local_experts,
                 ctx.stream.cu_stream(),
             )?;
             moe::dsv4_exclusive_scan_i32(
                 cache_ptr(&counts, ctx),
                 cache_ptr(&offsets, ctx),
                 cache_ptr(&scan_total, ctx),
-                num_experts,
+                local_experts,
                 ctx.stream.cu_stream(),
             )?;
         }
 
         // ── 4. Pack routed tokens grouped-by-expert (with route slots). ─────
         let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, total_routes)?;
-        let packed_route_slot = ctx
-            .stream
-            .alloc_zeros::<i32>(total_routes.max(1))
-            .map_err(|e| anyhow::anyhow!("MoE packed_route_slot alloc failed: {e}"))?;
+        // Under EP only routes hitting LOCAL experts get packed, so the tail of
+        // `packed_route_slot` past this rank's route count stays at its init
+        // value. The scatter kernel skips `route_slot < 0` — a zero-init tail
+        // would alias route slot 0 and race its legitimate write — so EP needs
+        // the -1 sentinel fill. Single-GPU packs every slot exactly once and
+        // keeps today's zero-init path untouched.
+        let packed_route_slot = if split.ep_size == 1 {
+            ctx.stream
+                .alloc_zeros::<i32>(total_routes.max(1))
+                .map_err(|e| anyhow::anyhow!("MoE packed_route_slot alloc failed: {e}"))?
+        } else {
+            alloc_neg1_i32(ctx, total_routes.max(1))?
+        };
         let packed_weight = ctx
             .stream
             .alloc_zeros::<f32>(total_routes.max(1))
             .map_err(|e| anyhow::anyhow!("MoE packed_weight alloc failed: {e}"))?;
         let cursors = ctx
             .stream
-            .alloc_zeros::<i32>(num_experts)
+            .alloc_zeros::<i32>(local_experts)
             .map_err(|e| anyhow::anyhow!("MoE cursors alloc failed: {e}"))?;
         // SAFETY: buffers valid on ctx.stream; shapes checked by the kernel.
         unsafe {
@@ -261,16 +320,16 @@ mod gpu {
                 num_tokens,
                 hidden_dim,
                 topk,
-                0,
-                num_experts,
+                split.local_expert_start,
+                local_experts,
                 ctx.stream.cu_stream(),
             )?;
         }
 
-        // Identity compact→global remap: single GPU runs every expert, so the
-        // 0..E table is the identity walk (explicit table keeps the RawDevicePtr
-        // contract — no null hack).
-        let expert_index_table: Vec<i32> = (0..num_experts as i32).collect();
+        // Identity compact→local remap: the weight-pointer tables hold ONLY this
+        // rank's experts (loader walks `split`'s range), so group g indexes table
+        // entry g (explicit table keeps the RawDevicePtr contract — no null hack).
+        let expert_index_table: Vec<i32> = (0..local_experts as i32).collect();
         let expert_indices = ctx
             .stream
             .clone_htod(&expert_index_table)
@@ -294,7 +353,7 @@ mod gpu {
                 cache_ptr(&offsets, ctx),
                 cache_ptr(&counts, ctx),
                 cache_ptr(&expert_indices, ctx),
-                num_experts,
+                local_experts,
                 max_count,
                 moe_inter,
                 hidden_dim,
@@ -326,7 +385,7 @@ mod gpu {
                 cache_ptr(&offsets, ctx),
                 cache_ptr(&counts, ctx),
                 cache_ptr(&expert_indices, ctx),
-                num_experts,
+                local_experts,
                 max_count,
                 hidden_dim,
                 moe_inter,
@@ -435,6 +494,7 @@ mod dsv4_gpu {
     use half::bf16;
     use std::sync::Arc;
 
+    use super::alloc_neg1_i32;
     use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
     use crate::moe_config::ExpertSplit;
     use crate::ops::gemm_batch;
@@ -839,28 +899,6 @@ mod dsv4_gpu {
             std::env::var("ARLE_DSV4_MOE_CONTIG_DECODE").as_deref(),
             Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
         )
-    }
-
-    /// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF).
-    ///
-    /// A `clone_htod(&vec![-1; n])` here would record a CUDA-graph memcpy node
-    /// whose HOST source dies with this call — replay reads freed memory (the
-    /// same hazard class as the topk_length IMA, 2026-06-10). Device memset is
-    /// capture-safe and cheaper.
-    fn alloc_neg1_i32(ctx: &DeviceContext, len: usize) -> Result<CudaSlice<i32>> {
-        let mut buf = ctx
-            .stream
-            .alloc_zeros::<i32>(len)
-            .map_err(|e| anyhow::anyhow!("DSv4 -1 sentinel alloc failed: {e}"))?;
-        let n_bytes = len * std::mem::size_of::<i32>();
-        let (ptr, _guard) = buf.device_ptr_mut(&ctx.stream);
-        // SAFETY: `ptr` is a live device allocation of `n_bytes` on this stream.
-        unsafe {
-            cudarc::driver::result::memset_d8_async(ptr, 0xFF, n_bytes, ctx.stream.cu_stream())
-                .map_err(|e| anyhow::anyhow!("DSv4 -1 sentinel memset failed: {e}"))?;
-        }
-        drop(_guard);
-        Ok(buf)
     }
 
     fn dsv4_route_device(

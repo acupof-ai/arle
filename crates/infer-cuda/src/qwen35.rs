@@ -35,11 +35,14 @@ use cuda_kernels::tensor::{HostMatrixSnapshot, offload_raw_slice, reload_raw_sli
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 use infer_plan::SamplingParams;
+use infer_topo::TpConfig;
 use qwen35_spec::{LayerType, Qwen35AttentionTensorNames, Qwen35Config};
+use safetensors::tensor::Dtype;
 
 use crate::executor::sample_cuda_token;
 use crate::loader::SafetensorLoader;
 use crate::moe::moe_forward;
+use crate::moe_config::ExpertSplit;
 use crate::ops::{
     add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul, upload_i32,
 };
@@ -85,11 +88,15 @@ pub struct StudentLoraUpdate {
 /// Per-slot full-attention K/V cache (one contiguous bf16 cache per full-attn
 /// layer) + per-slot gated-delta recurrent state (state + conv ring per
 /// linear-attn layer). Carried across prefill/decode for one request.
+///
+/// All dims are this rank's LOCAL shard sizes (= the global config dims on a
+/// single GPU): each TP rank caches only its own kv heads, v-head recurrent
+/// slabs, and qkv conv channels.
 pub(crate) struct Qwen35SlotState {
     /// `[num_full_layers]` contiguous K caches, each `max_seq_len*kv_dim` bf16.
     k_caches: Vec<DeviceVec>,
     v_caches: Vec<DeviceVec>,
-    /// `[num_linear_layers]` gated-delta recurrent states (`V*K*Vh` f32).
+    /// `[num_linear_layers]` gated-delta recurrent states (`Vh*Kd*Vd` f32).
     gdr_states: Vec<CudaSlice<f32>>,
     /// `[num_linear_layers]` conv1d rings (`qkv_dim*(kernel-1)` bf16).
     conv_states: Vec<DeviceVec>,
@@ -100,17 +107,13 @@ pub(crate) struct Qwen35SlotState {
 impl Qwen35SlotState {
     pub(crate) fn new(
         ctx: &DeviceContext,
-        config: &Qwen35Config,
+        num_full: usize,
+        num_linear: usize,
         max_seq_len: usize,
+        kv_dim: usize,
+        gdr_state_len: usize,
+        conv_len: usize,
     ) -> Result<Self> {
-        let num_full = config.num_full_attention_layers();
-        let num_linear = config.num_hidden_layers - num_full;
-        let kv_dim = config.full_attn_kv_dim();
-        let gdr_state_len = config.linear_num_value_heads
-            * config.linear_key_head_dim
-            * config.linear_value_head_dim;
-        let conv_len = config.linear_attn_qkv_dim() * (config.linear_conv_kernel_dim - 1);
-
         let mut k_caches = Vec::with_capacity(num_full);
         let mut v_caches = Vec::with_capacity(num_full);
         for _ in 0..num_full {
@@ -186,9 +189,10 @@ pub(crate) struct LinearAttn {
     /// Depthwise conv1d weight `[qkv_dim*kernel]` bf16.
     conv1d_weight: DeviceVec,
     dt_bias: DeviceVec,
-    /// `A_log` `[num_value_heads]` f32.
+    /// `A_log` `[num_value_heads]` f32 (this rank's v-head shard under TP).
     a_log: CudaSlice<f32>,
-    /// Gated output RMSNorm scale `[V*Vh]` f32.
+    /// Gated output RMSNorm scale `[value_head_dim]` f32, broadcast across
+    /// heads by rms_norm_gated (norm.cu `weight[tid]`) — replicated under TP.
     norm_weight: CudaSlice<f32>,
     out_proj: DeviceMatrix,
 }
@@ -218,6 +222,19 @@ pub(crate) struct Qwen35Model {
     cos_cache: DeviceVec,
     sin_cache: DeviceVec,
     moe_config: Option<infer_moe::MoeConfig>,
+    /// Tensor-parallel runtime. `world_size == 1` uses the no-op communicator,
+    /// so every `all_reduce_sum` returns immediately (mirrors the dense
+    /// [`crate::model::CudaModel`]).
+    pub(crate) tp: crate::tp::TpRuntime,
+    /// This rank's per-shard head counts (= global config on a single GPU).
+    /// The forward sizes its buffers, slot state, and kernel launches from
+    /// these, not the config.
+    local_q_heads: usize,
+    local_kv_heads: usize,
+    local_linear_k_heads: usize,
+    local_linear_v_heads: usize,
+    /// This rank's EP expert ownership (every expert local on a single GPU).
+    expert_split: ExpertSplit,
     /// Per-slot cache capacity (full-attn contiguous cache rows).
     max_seq_len: usize,
     /// Host-resident weight snapshot while the engine is offloaded for the OPD
@@ -319,16 +336,68 @@ impl Qwen35Model {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 
-    pub(crate) fn new_slot_state(&self) -> Result<Qwen35SlotState> {
-        Qwen35SlotState::new(&self.ctx, &self.config, self.max_seq_len)
+    /// This rank's full-attention query width (`local_q_heads * head_dim`).
+    fn local_full_attn_q_dim(&self) -> usize {
+        self.local_q_heads * self.config.head_dim
     }
 
-    /// Load a single-GPU BF16 Qwen3.5/3.6 HYBRID MoE checkpoint.
+    /// This rank's GATED q_proj output width: the projection interleaves
+    /// `[query; gate]` per head, so each local head contributes `2*head_dim` rows.
+    fn local_full_attn_q_proj_dim(&self) -> usize {
+        self.local_q_heads * self.config.head_dim * 2
+    }
+
+    /// This rank's full-attention K/V width (`local_kv_heads * head_dim`).
+    fn local_full_attn_kv_dim(&self) -> usize {
+        self.local_kv_heads * self.config.head_dim
+    }
+
+    /// This rank's fused gated-delta `[q | k | v]` width.
+    fn local_linear_qkv_dim(&self) -> usize {
+        let qk = 2 * self.local_linear_k_heads * self.config.linear_key_head_dim;
+        qk + self.local_linear_v_heads * self.config.linear_value_head_dim
+    }
+
+    /// This rank's gated-delta output / z-gate width.
+    fn local_linear_z_dim(&self) -> usize {
+        self.local_linear_v_heads * self.config.linear_value_head_dim
+    }
+
+    pub(crate) fn new_slot_state(&self) -> Result<Qwen35SlotState> {
+        let c = &self.config;
+        let num_full = c.num_full_attention_layers();
+        let num_linear = c.num_hidden_layers - num_full;
+        // Slot state is sized from this rank's LOCAL shard widths: each rank
+        // caches only its own kv heads / v-head recurrent slabs / qkv channels.
+        Qwen35SlotState::new(
+            &self.ctx,
+            num_full,
+            num_linear,
+            self.max_seq_len,
+            self.local_full_attn_kv_dim(),
+            self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim,
+            self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1),
+        )
+    }
+
+    /// Load a BF16 Qwen3.5/3.6 HYBRID MoE checkpoint, resolving the TP runtime
+    /// from the environment (single-GPU when no TP env is set).
     ///
     /// `max_seq_len` sizes the per-slot full-attn contiguous K/V cache.
     pub(crate) fn from_qwen35_moe_safetensors(
         model_path: &Path,
         max_seq_len: usize,
+    ) -> Result<Self> {
+        let tp = crate::loader::build_tp_runtime()?;
+        Self::from_qwen35_moe_safetensors_with_tp(model_path, max_seq_len, tp)
+    }
+
+    /// Load with an explicit [`crate::tp::TpRuntime`] (tests inject a single-GPU
+    /// runtime — mirrors the dense loader's `from_safetensors_with_tp`).
+    pub(crate) fn from_qwen35_moe_safetensors_with_tp(
+        model_path: &Path,
+        max_seq_len: usize,
+        tp: crate::tp::TpRuntime,
     ) -> Result<Self> {
         let m = Qwen35Config::from_model_dir(model_path)
             .map_err(|e| anyhow!("load Qwen3.5 config from {}: {e}", model_path.display()))?;
@@ -363,8 +432,60 @@ impl Qwen35Model {
             "Qwen3.5 hybrid model requires a non-zero KV cache budget"
         );
 
+        let tp_cfg = *tp.config();
+        let world = tp_cfg.world_size;
+        // Per-rank GQA head counts. `head_shard` requires both counts divide the
+        // world size (kv_heads=2 caps Qwen3.6-35B at TP∈{1,2}), keeping every
+        // rank's attention shape uniform — the HD256 kernels and the all-reduce
+        // both rely on it.
+        let (local_q_heads, local_kv_heads) = if tp_cfg.is_single() {
+            (m.num_attention_heads, m.num_key_value_heads)
+        } else {
+            infer_topo::head_shard(m.num_attention_heads, m.num_key_value_heads, &tp_cfg)
+                .map_err(|e| anyhow!("Qwen3.5 TP full-attention head shard failed: {e}"))?
+        };
+        // Gated-delta head counts. Both must divide the world size so a
+        // contiguous head-major block shard preserves the v-per-k grouping
+        // (gated_delta_rule.cu maps k_head = v_head * Kh / Vh): each rank's
+        // v-head range then reads exactly its own k-head range.
+        ensure!(
+            m.linear_num_key_heads.is_multiple_of(world),
+            "Qwen3.5 TP: linear_num_key_heads ({}) not divisible by world_size ({world})",
+            m.linear_num_key_heads
+        );
+        ensure!(
+            m.linear_num_value_heads.is_multiple_of(world),
+            "Qwen3.5 TP: linear_num_value_heads ({}) not divisible by world_size ({world})",
+            m.linear_num_value_heads
+        );
+        let local_linear_k_heads = m.linear_num_key_heads / world;
+        let local_linear_v_heads = m.linear_num_value_heads / world;
+        // Shared expert is column/row-sharded like a dense MLP (its partial
+        // joins the routed partial in one post-MoE all-reduce).
+        ensure!(
+            m.shared_expert_intermediate_size.is_multiple_of(world),
+            "Qwen3.5 TP: shared_expert_intermediate_size ({}) not divisible by world_size ({world})",
+            m.shared_expert_intermediate_size
+        );
+        // Dense-MLP layers (mlp_only_layers / sparse-step gaps) shard their
+        // intermediate dim; only constrain it when such a layer exists.
+        if (0..m.num_hidden_layers).any(|i| !m.is_moe_layer(i)) {
+            ensure!(
+                m.intermediate_size.is_multiple_of(world),
+                "Qwen3.5 TP: dense intermediate_size ({}) not divisible by world_size ({world})",
+                m.intermediate_size
+            );
+        }
+
         let moe_config = crate::moe_config::moe_config_from_qwen35(&m)?;
-        let split = crate::moe_config::ExpertSplit::single(m.num_experts);
+        // EP mirrors TP: each rank owns `num_experts / world` whole experts
+        // (`ExpertSplit::new` rejects an indivisible expert count loudly).
+        let split = if tp_cfg.is_single() {
+            ExpertSplit::single(m.num_experts)
+        } else {
+            ExpertSplit::new(m.num_experts, world, tp_cfg.rank)
+                .map_err(|e| anyhow!("Qwen3.5 TP expert split: {e}"))?
+        };
 
         let ctx = DeviceContext::new()?;
         let loader = SafetensorLoader::new(model_path)?;
@@ -380,15 +501,58 @@ impl Qwen35Model {
         for layer_idx in 0..m.num_hidden_layers {
             let names = m.layer_tensor_names(layer_idx);
             let attn = match &names.attention {
+                // Single GPU: full tensors, byte-identical to the pre-TP path.
+                Qwen35AttentionTensorNames::Full(full) if tp_cfg.is_single() => {
+                    Qwen35Attn::Full(Box::new(FullAttn {
+                        q_proj: loader.load_matrix(&ctx, &full.q_proj)?,
+                        k_proj: loader.load_matrix(&ctx, &full.k_proj)?,
+                        v_proj: loader.load_matrix(&ctx, &full.v_proj)?,
+                        o_proj: loader.load_matrix(&ctx, &full.o_proj)?,
+                        q_norm: loader.load_vec(&ctx, &full.q_norm)?,
+                        k_norm: loader.load_vec(&ctx, &full.k_norm)?,
+                    }))
+                }
                 Qwen35AttentionTensorNames::Full(full) => Qwen35Attn::Full(Box::new(FullAttn {
-                    q_proj: loader.load_matrix(&ctx, &full.q_proj)?,
-                    k_proj: loader.load_matrix(&ctx, &full.k_proj)?,
-                    v_proj: loader.load_matrix(&ctx, &full.v_proj)?,
-                    o_proj: loader.load_matrix(&ctx, &full.o_proj)?,
+                    // The GATED q_proj interleaves [query(HD); gate(HD)] PER
+                    // HEAD (prefill_attention_hd256.cu reads q at
+                    // `head*2*HD + d`, the gate kernel at `head*2*HD + HD + d`),
+                    // so a whole-head slice with per-head row block 2*head_dim
+                    // carries each head's query rows AND its matching gate rows.
+                    q_proj: loader.load_qkv_head_sharded(
+                        &ctx,
+                        &full.q_proj,
+                        local_q_heads,
+                        m.head_dim * 2,
+                        &tp_cfg,
+                    )?,
+                    k_proj: loader.load_qkv_head_sharded(
+                        &ctx,
+                        &full.k_proj,
+                        local_kv_heads,
+                        m.head_dim,
+                        &tp_cfg,
+                    )?,
+                    v_proj: loader.load_qkv_head_sharded(
+                        &ctx,
+                        &full.v_proj,
+                        local_kv_heads,
+                        m.head_dim,
+                        &tp_cfg,
+                    )?,
+                    // Row-parallel: each rank holds the o_proj input columns of
+                    // its own heads; the forward all-reduces the partial sums.
+                    o_proj: loader.load_matrix_sharded(
+                        &ctx,
+                        &full.o_proj,
+                        infer_topo::ParallelLinearKind::Row,
+                        &tp_cfg,
+                    )?,
+                    // q/k_norm are `[head_dim]`, broadcast across heads by the
+                    // HD256 prep kernel — replicated.
                     q_norm: loader.load_vec(&ctx, &full.q_norm)?,
                     k_norm: loader.load_vec(&ctx, &full.k_norm)?,
                 })),
-                Qwen35AttentionTensorNames::Linear(lin) => {
+                Qwen35AttentionTensorNames::Linear(lin) if tp_cfg.is_single() => {
                     Qwen35Attn::Linear(Box::new(LinearAttn {
                         in_proj_qkv: loader.load_matrix(&ctx, &lin.in_proj_qkv)?,
                         in_proj_z: loader.load_matrix(&ctx, &lin.in_proj_z)?,
@@ -401,18 +565,120 @@ impl Qwen35Model {
                         out_proj: loader.load_matrix(&ctx, &lin.out_proj)?,
                     }))
                 }
+                Qwen35AttentionTensorNames::Linear(lin) => {
+                    Qwen35Attn::Linear(Box::new(LinearAttn {
+                        // Fused [q | k | v] blocks: shard EACH block on whole-head
+                        // boundaries and re-stack this rank's three slices (a flat
+                        // column shard would cut across the block boundaries).
+                        in_proj_qkv: load_linear_qkv_sharded(
+                            &loader,
+                            &ctx,
+                            &lin.in_proj_qkv,
+                            &m,
+                            &tp_cfg,
+                        )?,
+                        // z gate is v-head-major `[Vh*Vd]` (rms_norm_gated reads
+                        // the gate at `head*Vd + d`).
+                        in_proj_z: loader.load_qkv_head_sharded(
+                            &ctx,
+                            &lin.in_proj_z,
+                            local_linear_v_heads,
+                            m.linear_value_head_dim,
+                            &tp_cfg,
+                        )?,
+                        // b/a are ONE SCALAR PER V HEAD (gated_delta_rule.cu reads
+                        // `b_proj[token*Vh + v_head]`) → per-head row count 1.
+                        in_proj_b: loader.load_qkv_head_sharded(
+                            &ctx,
+                            &lin.in_proj_b,
+                            local_linear_v_heads,
+                            1,
+                            &tp_cfg,
+                        )?,
+                        in_proj_a: loader.load_qkv_head_sharded(
+                            &ctx,
+                            &lin.in_proj_a,
+                            local_linear_v_heads,
+                            1,
+                            &tp_cfg,
+                        )?,
+                        // Depthwise conv: channel rows mirror the qkv block shard.
+                        conv1d_weight: load_conv1d_sharded(
+                            &loader,
+                            &ctx,
+                            &lin.conv1d_weight,
+                            &m,
+                            &tp_cfg,
+                        )?,
+                        // Per-v-head vectors `[Vh]`.
+                        dt_bias: load_v_head_vec_sharded(
+                            &loader,
+                            &ctx,
+                            &lin.dt_bias,
+                            m.linear_num_value_heads,
+                            &tp_cfg,
+                        )?,
+                        a_log: load_v_head_f32_sharded(
+                            &loader,
+                            &ctx,
+                            &lin.a_log,
+                            m.linear_num_value_heads,
+                            &tp_cfg,
+                        )?,
+                        // Gated-norm scale is `[Vd]`, broadcast across heads by
+                        // rms_norm_gated (norm.cu `weight[tid]`) — replicated,
+                        // matching the qwen35-spec Shard contract.
+                        norm_weight: loader.load_f32_vec(&ctx, &lin.norm)?,
+                        // Row-parallel: input columns follow this rank's v heads;
+                        // the forward all-reduces the partial sums.
+                        out_proj: loader.load_matrix_sharded(
+                            &ctx,
+                            &lin.out_proj,
+                            infer_topo::ParallelLinearKind::Row,
+                            &tp_cfg,
+                        )?,
+                    }))
+                }
             };
 
             let (mlp, moe) = if m.is_moe_layer(layer_idx) {
-                let moe =
-                    loader.load_moe_layer_experts(&ctx, &names.common.layer_prefix, &split)?;
+                let moe = loader.load_moe_layer_experts(
+                    &ctx,
+                    &names.common.layer_prefix,
+                    &split,
+                    &tp_cfg,
+                )?;
                 (None, Some(moe))
-            } else {
+            } else if tp_cfg.is_single() {
                 (
                     Some(DenseMlp {
                         gate_proj: loader.load_matrix(&ctx, &names.common.mlp_gate_proj)?,
                         up_proj: loader.load_matrix(&ctx, &names.common.mlp_up_proj)?,
                         down_proj: loader.load_matrix(&ctx, &names.common.mlp_down_proj)?,
+                    }),
+                    None,
+                )
+            } else {
+                (
+                    Some(DenseMlp {
+                        gate_proj: loader.load_matrix_sharded(
+                            &ctx,
+                            &names.common.mlp_gate_proj,
+                            infer_topo::ParallelLinearKind::Column,
+                            &tp_cfg,
+                        )?,
+                        up_proj: loader.load_matrix_sharded(
+                            &ctx,
+                            &names.common.mlp_up_proj,
+                            infer_topo::ParallelLinearKind::Column,
+                            &tp_cfg,
+                        )?,
+                        down_proj: loader.load_matrix_sharded(
+                            &ctx,
+                            &names.common.mlp_down_proj,
+                            infer_topo::ParallelLinearKind::Row,
+                            &tp_cfg,
+                        )?,
                     }),
                     None,
                 )
@@ -447,6 +713,12 @@ impl Qwen35Model {
             cos_cache,
             sin_cache,
             moe_config: Some(moe_config),
+            tp,
+            local_q_heads,
+            local_kv_heads,
+            local_linear_k_heads,
+            local_linear_v_heads,
+            expert_split: split,
             max_seq_len,
             offloaded: None,
             lora_base: HashMap::new(),
@@ -770,12 +1042,12 @@ impl Qwen35Model {
                 eps,
                 &mut normed,
             )?;
-            let mlp_out = if let Some(moe) = &layer.moe {
+            let mut mlp_out = if let Some(moe) = &layer.moe {
                 let cfg = self
                     .moe_config
                     .as_ref()
                     .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
-                moe_forward(&self.ctx, moe, &normed, cfg)?
+                moe_forward(&self.ctx, moe, &normed, cfg, &self.expert_split)?
             } else {
                 let mlp = layer
                     .mlp
@@ -783,6 +1055,11 @@ impl Qwen35Model {
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
                 self.dense_mlp(mlp, &normed)?
             };
+            // ONE all-reduce covers the whole FFN partial: the MoE buffer already
+            // sums this rank's routed experts (non-local routes contribute zero)
+            // + the column/row-sharded shared expert; the dense branch is a
+            // row-parallel down_proj partial. No-op on a single GPU.
+            self.tp.all_reduce_sum(&self.ctx, &mut mlp_out)?;
 
             let mut hidden_next = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
             add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut hidden_next)?;
@@ -792,6 +1069,11 @@ impl Qwen35Model {
         slot.seq_len += seq_len;
 
         // Final norm (offset) + LM head on the last token only.
+        //
+        // TP invariant: embed/lm_head are replicated and `hidden` is
+        // post-all-reduce (every row-parallel output above was summed), so the
+        // logits — and therefore the sampled token — are identical on every
+        // rank. No rank ever needs to broadcast its sample.
         let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
         copy_row_to_vec(&self.ctx, &hidden, seq_len - 1, &mut last_hidden)?;
         let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
@@ -878,12 +1160,12 @@ impl Qwen35Model {
                 eps,
                 &mut normed,
             )?;
-            let mlp_out = if let Some(moe) = &layer.moe {
+            let mut mlp_out = if let Some(moe) = &layer.moe {
                 let cfg = self
                     .moe_config
                     .as_ref()
                     .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
-                moe_forward(&self.ctx, moe, &normed, cfg)?
+                moe_forward(&self.ctx, moe, &normed, cfg, &self.expert_split)?
             } else {
                 let mlp = layer
                     .mlp
@@ -891,6 +1173,11 @@ impl Qwen35Model {
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
                 self.dense_mlp(mlp, &normed)?
             };
+            // ONE all-reduce covers the whole FFN partial: the MoE buffer already
+            // sums this rank's routed experts (non-local routes contribute zero)
+            // + the column/row-sharded shared expert; the dense branch is a
+            // row-parallel down_proj partial. No-op on a single GPU.
+            self.tp.all_reduce_sum(&self.ctx, &mut mlp_out)?;
 
             let mut hidden_next = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
             add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut hidden_next)?;
@@ -901,6 +1188,8 @@ impl Qwen35Model {
 
         // Final norm (offset) over the WHOLE batch, then the batched lm-head GEMM
         // produces every row's logits — no last-row slice, no sampling.
+        // (TP invariant as in `forward_tokens`: replicated lm_head over
+        // post-all-reduce hidden ⇒ identical logits on every rank.)
         let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
         rms_norm_offset(&self.ctx, &hidden, &self.norm, eps, &mut normed)?;
         let vocab = self.output_projection().rows;
@@ -1124,9 +1413,12 @@ impl Qwen35Model {
     ) -> Result<HiddenStates> {
         let c = &self.config;
         let seq_len = normed.seq_len;
-        let q_dim = c.full_attn_q_dim();
-        let kv_dim = c.full_attn_kv_dim();
-        let q_proj_dim = c.full_attn_q_proj_dim();
+        // LOCAL per-rank widths (= global config on a single GPU): the sharded
+        // q/k/v GEMM outputs, the per-slot caches, and the kernel launches must
+        // all agree on this rank's head shard.
+        let q_dim = self.local_full_attn_q_dim();
+        let kv_dim = self.local_full_attn_kv_dim();
+        let q_proj_dim = self.local_full_attn_q_proj_dim();
 
         let mut q_full = HiddenStates::zeros(&self.ctx, q_proj_dim, seq_len)?;
         let mut k_batch = HiddenStates::zeros(&self.ctx, kv_dim, seq_len)?;
@@ -1171,8 +1463,8 @@ impl Qwen35Model {
                     qp_ptr as *mut ffi::Half,
                     kc_ptr as *mut ffi::Half,
                     vc_ptr as *mut ffi::Half,
-                    c.num_attention_heads as i32,
-                    c.num_key_value_heads as i32,
+                    self.local_q_heads as i32,
+                    self.local_kv_heads as i32,
                     seq_len as i32,
                     sp_ptr as *const i32,
                     c.rotary_dim as i32,
@@ -1197,8 +1489,8 @@ impl Qwen35Model {
                     kc_ptr as *const ffi::Half,
                     vc_ptr as *const ffi::Half,
                     o_ptr as *mut ffi::Half,
-                    c.num_attention_heads as i32,
-                    c.num_key_value_heads as i32,
+                    self.local_q_heads as i32,
+                    self.local_kv_heads as i32,
                     c.head_dim as i32,
                     seq_len as i32,
                     kv_len as i32,
@@ -1219,7 +1511,7 @@ impl Qwen35Model {
                 ffi::attention_gate_batch_hd256_cuda(
                     qf_ptr as *const ffi::Half,
                     o_ptr as *mut ffi::Half,
-                    c.num_attention_heads as i32,
+                    self.local_q_heads as i32,
                     seq_len as i32,
                     self.ctx.stream.cu_stream(),
                 )
@@ -1229,6 +1521,8 @@ impl Qwen35Model {
 
         let mut out = HiddenStates::zeros(&self.ctx, c.hidden_size, seq_len)?;
         gemm_batch(&self.ctx, &attn.o_proj, &attn_out, &mut out)?;
+        // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
+        self.tp.all_reduce_sum(&self.ctx, &mut out)?;
         Ok(out)
     }
 
@@ -1244,8 +1538,12 @@ impl Qwen35Model {
     ) -> Result<HiddenStates> {
         let c = &self.config;
         let seq_len = normed.seq_len;
-        let qkv_dim = c.linear_attn_qkv_dim();
-        let z_dim = c.linear_attn_z_dim();
+        // LOCAL per-rank widths (= global config on a single GPU): the fused
+        // [q|k|v] shard, conv channels, recurrent state, and kernel launches all
+        // follow this rank's linear k/v head shard. b/a widths come off the
+        // sharded projection rows directly (`[local_Vh, hidden]`).
+        let qkv_dim = self.local_linear_qkv_dim();
+        let z_dim = self.local_linear_z_dim();
         let b_dim = attn.in_proj_b.rows;
         let a_dim = attn.in_proj_a.rows;
 
@@ -1312,8 +1610,8 @@ impl Qwen35Model {
                         alog_ptr as *const f32,
                         s_ptr as *mut f32,
                         o_ptr as *mut ffi::Half,
-                        c.linear_num_key_heads as i32,
-                        c.linear_num_value_heads as i32,
+                        self.local_linear_k_heads as i32,
+                        self.local_linear_v_heads as i32,
                         c.linear_key_head_dim as i32,
                         c.linear_value_head_dim as i32,
                         self.ctx.stream.cu_stream(),
@@ -1328,8 +1626,8 @@ impl Qwen35Model {
                         alog_ptr as *const f32,
                         s_ptr as *mut f32,
                         o_ptr as *mut ffi::Half,
-                        c.linear_num_key_heads as i32,
-                        c.linear_num_value_heads as i32,
+                        self.local_linear_k_heads as i32,
+                        self.local_linear_v_heads as i32,
                         c.linear_key_head_dim as i32,
                         c.linear_value_head_dim as i32,
                         seq_len as i32,
@@ -1354,7 +1652,7 @@ impl Qwen35Model {
                     w_ptr as *const f32,
                     gate_ptr as *const ffi::Half,
                     o_ptr as *mut ffi::Half,
-                    c.linear_num_value_heads as i32,
+                    self.local_linear_v_heads as i32,
                     c.linear_value_head_dim as i32,
                     c.rms_norm_eps,
                     self.ctx.stream.cu_stream(),
@@ -1365,8 +1663,173 @@ impl Qwen35Model {
 
         let mut out = HiddenStates::zeros(&self.ctx, c.hidden_size, seq_len)?;
         gemm_batch(&self.ctx, &attn.out_proj, &normed_out, &mut out)?;
+        // Row-parallel out_proj: sum the per-rank partials (no-op single-GPU).
+        self.tp.all_reduce_sum(&self.ctx, &mut out)?;
         Ok(out)
     }
+}
+
+/// The gated-delta fused `in_proj_qkv` row blocks `[q(Kh×Kd); k(Kh×Kd); v(Vh×Vd)]`
+/// (gated_delta_rule.cu reads q at `k_head*Kd + d`, k at `q_dim + k_head*Kd + d`,
+/// v at `q_dim + k_dim + v_head*Vd + d`). Shared by the qkv weight slice and the
+/// depthwise conv1d slice — conv channel `c` filters in_proj_qkv output row `c`,
+/// so both must shard the SAME row ranges.
+fn linear_qkv_head_blocks(m: &Qwen35Config) -> [crate::shard_slice::HeadBlock; 3] {
+    let k_block = crate::shard_slice::HeadBlock {
+        heads: m.linear_num_key_heads,
+        head_rows: m.linear_key_head_dim,
+    };
+    let v_block = crate::shard_slice::HeadBlock {
+        heads: m.linear_num_value_heads,
+        head_rows: m.linear_value_head_dim,
+    };
+    [k_block, k_block, v_block]
+}
+
+/// Load the fused gated-delta `in_proj_qkv` (`[2*Kh*Kd + Vh*Vd, hidden]` BF16)
+/// sharded for this TP rank: each of the `[q; k; v]` blocks is head-sharded
+/// independently and re-stacked, preserving the k↔v head grouping (a flat
+/// column shard would cut across the block boundaries).
+fn load_linear_qkv_sharded(
+    loader: &SafetensorLoader,
+    ctx: &DeviceContext,
+    name: &str,
+    m: &Qwen35Config,
+    tp: &TpConfig,
+) -> Result<DeviceMatrix> {
+    let tensor = loader.load_raw_tensor(name)?;
+    ensure!(
+        tensor.dtype == Dtype::BF16,
+        "{name}: expected BF16 fused qkv projection, got {:?}",
+        tensor.dtype
+    );
+    ensure!(
+        tensor.shape.len() == 2 && tensor.shape[0] == m.linear_attn_qkv_dim(),
+        "{name}: expected [{}, hidden] fused qkv projection, got shape {:?}",
+        m.linear_attn_qkv_dim(),
+        tensor.shape
+    );
+    let sharded = crate::shard_slice::shard_head_blocks_column_parallel(
+        &tensor.bytes,
+        tensor.shape[1],
+        2,
+        &linear_qkv_head_blocks(m),
+        tp,
+    )?;
+    DeviceMatrix::from_safetensors(ctx, &sharded.bytes, sharded.rows, sharded.cols)
+        .map_err(|e| anyhow!("upload sharded fused qkv {name}: {e}"))
+}
+
+/// Load the depthwise conv1d weight (`[qkv_dim, 1, kernel]` BF16) sharded for
+/// this TP rank as a flat `[local_qkv_dim*kernel]` [`DeviceVec`]: the channel
+/// rows mirror [`load_linear_qkv_sharded`]'s `[q; k; v]` block shard exactly
+/// (conv1d.cu reads `conv_weight[c*kernel + k]` for channel `c`).
+fn load_conv1d_sharded(
+    loader: &SafetensorLoader,
+    ctx: &DeviceContext,
+    name: &str,
+    m: &Qwen35Config,
+    tp: &TpConfig,
+) -> Result<DeviceVec> {
+    let tensor = loader.load_raw_tensor(name)?;
+    ensure!(
+        tensor.dtype == Dtype::BF16,
+        "{name}: expected BF16 conv1d weight, got {:?}",
+        tensor.dtype
+    );
+    let channels = tensor.shape.first().copied().unwrap_or(0);
+    ensure!(
+        channels == m.linear_attn_qkv_dim(),
+        "{name}: conv1d channels {channels} != qkv_dim {} (shape {:?})",
+        m.linear_attn_qkv_dim(),
+        tensor.shape
+    );
+    // `[channels, 1, kernel]` (HF) or `[channels, kernel]`: the singleton middle
+    // dim is squeezed by treating each channel's row as `kernel` elements.
+    let kernel: usize = tensor.shape[1..].iter().product();
+    ensure!(
+        kernel == m.linear_conv_kernel_dim,
+        "{name}: conv1d kernel {kernel} != linear_conv_kernel_dim {} (shape {:?})",
+        m.linear_conv_kernel_dim,
+        tensor.shape
+    );
+    let sharded = crate::shard_slice::shard_head_blocks_column_parallel(
+        &tensor.bytes,
+        kernel,
+        2,
+        &linear_qkv_head_blocks(m),
+        tp,
+    )?;
+    DeviceVec::from_safetensors(ctx, &sharded.bytes)
+        .map_err(|e| anyhow!("upload sharded conv1d {name}: {e}"))
+}
+
+/// Load a per-v-head 1D vector (`[Vh]`, BF16 or F32 normalized to BF16 exactly
+/// like the single-GPU `load_vec_any`) sliced to this rank's contiguous v-head
+/// range (gated_delta_rule.cu indexes `dt_bias[v_head]`).
+fn load_v_head_vec_sharded(
+    loader: &SafetensorLoader,
+    ctx: &DeviceContext,
+    name: &str,
+    total_v_heads: usize,
+    tp: &TpConfig,
+) -> Result<DeviceVec> {
+    let tensor = loader.load_raw_tensor(name)?;
+    ensure!(
+        tensor.shape.len() == 1 && tensor.shape[0] == total_v_heads,
+        "{name}: expected 1D [{total_v_heads}] per-v-head vector, got shape {:?}",
+        tensor.shape
+    );
+    let bf16_bytes = SafetensorLoader::dsv4_bytes_to_bf16(name, &tensor)?;
+    let (start, len) = v_head_shard_range(name, total_v_heads, tp)?;
+    DeviceVec::from_safetensors(ctx, &bf16_bytes[start * 2..(start + len) * 2])
+        .map_err(|e| anyhow!("upload sharded per-v-head vec {name}: {e}"))
+}
+
+/// Load a per-v-head 1D F32 tensor (`A_log`; F32 passthrough or BF16 widened,
+/// matching the single-GPU `load_f32_vec`) sliced to this rank's v-head range,
+/// uploaded as a device `f32` slice.
+fn load_v_head_f32_sharded(
+    loader: &SafetensorLoader,
+    ctx: &DeviceContext,
+    name: &str,
+    total_v_heads: usize,
+    tp: &TpConfig,
+) -> Result<CudaSlice<f32>> {
+    let tensor = loader.load_raw_tensor(name)?;
+    ensure!(
+        tensor.shape.len() == 1 && tensor.shape[0] == total_v_heads,
+        "{name}: expected 1D [{total_v_heads}] per-v-head tensor, got shape {:?}",
+        tensor.shape
+    );
+    let host: Vec<f32> = match tensor.dtype {
+        Dtype::F32 => tensor
+            .bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        Dtype::BF16 => tensor
+            .bytes
+            .chunks_exact(2)
+            .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        other => anyhow::bail!("{name}: expected F32/BF16 1D tensor, got {other:?}"),
+    };
+    let (start, len) = v_head_shard_range(name, total_v_heads, tp)?;
+    ctx.stream
+        .clone_htod(&host[start..start + len])
+        .map_err(|e| anyhow!("upload sharded per-v-head f32 {name}: {e}"))
+}
+
+/// This rank's contiguous v-head range `(start, len)` within `[0, total_v_heads)`.
+fn v_head_shard_range(name: &str, total_v_heads: usize, tp: &TpConfig) -> Result<(usize, usize)> {
+    ensure!(
+        total_v_heads.is_multiple_of(tp.world_size),
+        "{name}: {total_v_heads} v heads not divisible by world_size {}",
+        tp.world_size
+    );
+    let local = total_v_heads / tp.world_size;
+    Ok((tp.rank * local, local))
 }
 
 /// Copy a dense BF16 `DeviceMatrix`'s `data` buffer to a row-major host `Vec`.

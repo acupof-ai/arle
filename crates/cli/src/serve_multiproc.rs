@@ -1,11 +1,13 @@
-//! DSv4 multiproc-serve coordinator + worker scaffold (Stage 1 re-wire).
+//! Multi-rank TP multiproc-serve coordinator + worker scaffold (DSv4 +
+//! Qwen3.5/3.6 MoE; Stage 1 re-wire).
 //!
 //! Ported from `git show e81b98fb^:infer/src/main.rs` (fn `main` worker-entry,
 //! `run_worker_mode`, `spawn_cuda_worker_processes`, and the coordinator-side
 //! relay bind/spawn/accept in `async_main`), adapted to the rewrite crate stack.
 //!
 //! Control flow this reproduces:
-//!   - `arle serve` on a DSv4 + CUDA model becomes the COORDINATOR (rank 0):
+//!   - `arle serve` on a multi-rank TP CUDA model (DSv4, Qwen3.5/3.6 MoE)
+//!     becomes the COORDINATOR (rank 0):
 //!     [`bind_relay_and_spawn_workers`] binds the relay listener
 //!     ([`RelayCoordinator::bind`]), publishes the port via
 //!     `ARLE_COORDINATOR_RELAY_PORT`, spawns N-1 worker processes via
@@ -16,7 +18,7 @@
 //!     relay + worker pipes; dropping it EOFs the workers so they exit.
 //!   - On process start, BEFORE clap parsing, [`worker_entry`] detects
 //!     `ARLE_WORKER_RANK>0` and runs worker mode: pre-connect the relay
-//!     ([`RelayWorker::connect_with_rank`]), build the rank-R DSv4 engine (which
+//!     ([`RelayWorker::connect_with_rank`]), build the rank-R engine (which
 //!     bootstraps NCCL as rank R from env during construction), then run a
 //!     relay-receiver loop.
 //!
@@ -48,34 +50,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use infer_api::{CudaWorkerEngine, EngineLoadConfig, RelayCoordinator, RelayEnvelope, RelayWorker};
 
-/// Relay accept / worker-connect timeout. Generous: a cold DSv4 rank-0 build can
+/// Relay accept / worker-connect timeout. Generous: a cold rank-0 build can
 /// take tens of seconds before it reaches the accept point.
 const RELAY_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Whether the checkpoint at `model_path` is a DSv4-Flash model (so serve should
-/// take the multiproc path). Reads `architectures` / `model_type` from
-/// `config.json`; returns `false` on any read/parse failure (the single-process
-/// path then errors with its normal message).
-#[must_use]
-pub(crate) fn is_dsv4_model(model_path: &str) -> bool {
-    let Ok(raw) = std::fs::read_to_string(std::path::Path::new(model_path).join("config.json"))
-    else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    let model_type = v.get("model_type").and_then(|x| x.as_str()).unwrap_or("");
-    if model_type == "deepseek_v4" {
-        return true;
-    }
-    v.get("architectures")
-        .and_then(|a| a.as_array())
-        .is_some_and(|a| {
-            a.iter()
-                .any(|s| s.as_str().is_some_and(|s| s.contains("DeepseekV4")))
-        })
-}
+// (Model-kind gating lives in `infer_api::cuda_model_takes_multiproc_serve` —
+// one classifier shared with `build_cuda_engine`, covering DSv4 AND the
+// Qwen3.5/3.6 MoE TpRuntime consumer.)
 
 /// Resolve the multiproc world size from the environment. `INFER_TP_SIZE` wins,
 /// else the comma-separated `INFER_CUDA_DEVICES` count, else 1 (single GPU — no
@@ -146,7 +127,7 @@ pub(crate) fn bind_relay_and_spawn_workers(
     let world_size = world_size_from_env();
     if world_size <= 1 {
         log::info!(
-            "[multiproc-coord] world_size={world_size}; serving DSv4 single-process (no workers)"
+            "[multiproc-coord] world_size={world_size}; serving single-process (no workers)"
         );
         return Ok(None);
     }
@@ -163,7 +144,7 @@ pub(crate) fn bind_relay_and_spawn_workers(
     }
 
     // 0. Mint the NCCL rendezvous id ONCE (rank 0) and publish it via env so every
-    //    spawned worker inherits the SAME handle. The DSv4 executor reads
+    //    spawned worker inherits the SAME handle. The TP executors read
     //    `INFER_NCCL_UNIQUE_ID` during construction (loader::nccl_unique_id_from_env);
     //    minting here is the multiproc analogue of the parity launcher's
     //    file-rendezvous. Must happen BEFORE spawn_workers so children inherit it.
@@ -182,7 +163,7 @@ pub(crate) fn bind_relay_and_spawn_workers(
     // unreachable and trips -D warnings on the cuda,no-cuda typecheck lane.
     if !cfg!(feature = "nccl") {
         anyhow::bail!(
-            "DSv4 multi-rank serve (world_size={world_size}) requires the `nccl` feature; \
+            "Multi-rank TP serve (world_size={world_size}) requires the `nccl` feature; \
              rebuild with --features cuda,nccl"
         );
     }
@@ -267,7 +248,7 @@ pub(crate) fn worker_entry() -> Option<ExitCode> {
     }
 }
 
-/// Worker-mode body (rank R > 0). Pre-connects the relay, builds the rank-R DSv4
+/// Worker-mode body (rank R > 0). Pre-connects the relay, builds the rank-R
 /// engine (NCCL bootstrap as rank R happens inside construction from env), runs
 /// the relay-receiver loop, then blocks on the parent pipe until the coordinator
 /// dies.
@@ -309,7 +290,7 @@ fn run_worker_mode(rank: usize) -> Result<()> {
         None
     };
 
-    // 2. Build the rank-R DSv4 engine from the coordinator's resolved config
+    // 2. Build the rank-R engine from the coordinator's resolved config
     //    (`ARLE_WORKER_ENGINE_CONFIG` — config parity is a lockstep invariant).
     //    The executor resolves TP rank R / world-size + EP split + NCCL
     //    communicator from the env the coordinator set (`INFER_TP_RANK`,
@@ -327,7 +308,7 @@ fn run_worker_mode(rank: usize) -> Result<()> {
             )
         }
     };
-    log::info!("[arle-worker rank={rank}] building rank-{rank} DSv4 engine ({engine_config:?})");
+    log::info!("[arle-worker rank={rank}] building rank-{rank} engine ({engine_config:?})");
     let engine = CudaWorkerEngine::load(&model_path, &engine_config)
         .with_context(|| format!("worker rank {rank} engine build"))?;
     log::info!("[arle-worker rank={rank}] engine built; entering lockstep driver");
@@ -533,7 +514,7 @@ fn spawn_workers(model_path: &str, world_size: usize) -> Result<WorkerChildren> 
         cmd.env("ARLE_WORKER_MODEL_PATH", model_path);
         cmd.env("WORLD_SIZE", world_size.to_string());
         cmd.env("INFER_CUDA_DEVICE", cuda_ordinal.to_string());
-        // The DSv4 executor reads its TP rank from INFER_TP_RANK; bind it to this
+        // The TP executors read their TP rank from INFER_TP_RANK; bind it to this
         // worker's rank so the per-rank EP split + NCCL rank match.
         cmd.env("INFER_TP_RANK", rank.to_string());
         cmd.env("INFER_TP_SIZE", world_size.to_string());
