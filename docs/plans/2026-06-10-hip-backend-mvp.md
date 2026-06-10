@@ -140,15 +140,29 @@ choice stays a perf call, not a coverage call.
 | `misc/dsv4_dsa_official.cu` | official-DSA adapter | 1 strict blocker + warp intrinsics — **excluded**; fallback = `csa_select` path above |
 | FlashMLA / DeepGEMM / DeepEP | — | excluded, datacenter-only |
 
-**Op-prep checklist (remaining, all off-box-doable):**
-- [ ] Classify `dsv4_mhc.cu`'s 4 hits; wave32/64 audit of the two `__shfl` uses
-- [ ] Shim header for our csrc subset (extend vendored `vendors/hip.h`; map
-  `__nv_bfloat16`→HIP bf16, verify launch/macro coverage by dry hipcc parse on-box)
-- [ ] Re-wrap vendored iq2/q2_K `mmvq`+`dequantize` into raw-pointer ARLE-callable
-  kernels (strip ggml tensor plumbing)
-- [ ] Offline quantizer: FP8 safetensors → asymmetric IQ2_XXS/Q2_K recipe
-  (`ggml-quants.c` codecs; CPU-only, unit-testable off-box)
-- [ ] Wire the above into `cuda-kernels`-style build for hipcc (`--offload-arch=gfx1151`)
+**Op-prep checklist (off-box portion DONE 2026-06-10, `crates/hip-kernels`):**
+- [x] `dsv4_mhc.cu`'s 4 hits = false positives (`softmax` matches the `tma`
+  substring) — file is clean; the two `__shfl_xor_sync(0xffffffff,…)` reductions map
+  to `__shfl_xor` in the shim (wave32 pinned on RDNA3.5)
+- [x] Shim header `csrc/arle_hip_shim.h` (inventory-scoped: bf16/fp8 types,
+  `_rn`-suffix mapping, shfl macros, `cuda_compat/` stand-in headers for literal
+  `<cuda*.h>` includes). PENDING-REMOTE: dry hipcc parse of bf16 `__hadd/__hadd2` +
+  fp8 cast overloads against the box's ROCm headers
+- [x] iq2/q2_K re-wrap: `csrc/iq2_mmvq.cu` — raw-pointer `arle_mmvq_iq2_xxs_cuda`,
+  `arle_mmvq_q2_k_cuda`, `arle_quantize_row_q8_1_cuda` (single-source nvcc+hipcc;
+  block sizes 66/84/36 static-asserted + clang-fsyntax-verified + Rust-test-pinned)
+- [x] hipcc build wiring: `hip-kernels/build.rs` compiles the six csrc files + the
+  mmvq source (`-x hip --offload-arch=gfx1151`, AMDGPU_TARGETS override); hipcc-missing
+  → warn-and-skip typecheck lane; eight DSv4 launcher externs mirrored in `src/lib.rs`
+- [x] ~~Offline quantizer~~ **OBVIATED**: 2-bit artifacts already exist (ds4
+  `q2-imatrix` GGUFs + community HF GGUFs) — ARLE consumes IQ2_XXS/Q2_K blocks via a
+  GGUF loader in H3 instead of building a quantizer; revisit only if we need a custom
+  recipe the ecosystem doesn't ship
+
+**Remaining (the honest gap to "только verification"):** H3 `infer-hip` executor
+(KvPool impl + DSv4 forward orchestration over the eight launchers + GGUF 2-bit
+weight loader + `BackendExecutor`), then on-box: hipcc compile of the kernel set,
+ROCm-vs-Vulkan lane A/B, needle gate, perf license (#78).
 
 ## §3 Kept / killed kernel-source candidates
 
