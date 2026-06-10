@@ -25,6 +25,17 @@ pub struct CudaGraphState {
     /// Whole-step mode: when true, `run_or_capture` runs kernels eagerly so they
     /// record into an OUTER capture instead of nesting their own.
     bypass: bool,
+    /// Eager warm runs remaining before the first capture (default 1).
+    ///
+    /// Lazy first-use initialization inside the kernel closure — DeepGEMM's
+    /// JIT `cuModuleLoad` on a new shape, cuBLAS workspace setup, allocator
+    /// pool growth — is ILLEGAL during stream capture (CUDA error 900,
+    /// `STREAM_CAPTURE_UNSUPPORTED`). Running the closure eagerly first lets
+    /// every lazy init land outside capture. This lives HERE so every graph
+    /// user (per-portion attn/moe, tail, whole-step, Qwen dense decode, any
+    /// future model) is capture-safe by construction instead of each call
+    /// site rediscovering error 900.
+    warm_remaining: u32,
 }
 
 // SAFETY: the wrapped `CudaGraph` holds `!Send` handles (a CUDA graph must be
@@ -42,6 +53,7 @@ impl CudaGraphState {
             stream,
             graph: None,
             bypass: false,
+            warm_remaining: 1,
         }
     }
 
@@ -75,6 +87,11 @@ impl CudaGraphState {
                 .launch()
                 .map_err(|e| anyhow::anyhow!("CUDA Graph launch failed: {e}"))?;
             return Ok(());
+        }
+        if self.warm_remaining > 0 {
+            // Eager warm run: flush lazy JIT/module/alloc init outside capture.
+            self.warm_remaining -= 1;
+            return kernels();
         }
 
         debug!("Capturing CUDA Graph for decode path...");
