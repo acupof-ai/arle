@@ -176,21 +176,7 @@ __global__ void dsv4_mhc_params_kernel(
     float value = bf16_to_f32(residual[row_start + idx]);
     sumsq += value * value;
   }
-  // blockDim may exceed DSV4_MHC_BLOCK (block_sum's scratch size): reduce
-  // with a 32-warp local scratch.
-  {
-    __shared__ float warp_sums_wide[32];
-    float v = warp_reduce_sum(sumsq);
-    if ((threadIdx.x & (WARP_SIZE - 1)) == 0) {
-      warp_sums_wide[threadIdx.x / WARP_SIZE] = v;
-    }
-    __syncthreads();
-    v = threadIdx.x < (blockDim.x / WARP_SIZE) ? warp_sums_wide[threadIdx.x] : 0.0f;
-    if (threadIdx.x < WARP_SIZE) {
-      v = warp_reduce_sum(v);
-    }
-    sumsq = v;
-  }
+  sumsq = block_sum(sumsq);
 
   __shared__ float rsqrt_shared;
   __shared__ float mixes_shared[DSV4_MHC_MAX * (2 + DSV4_MHC_MAX)];
@@ -328,9 +314,7 @@ extern "C" CUresult dsv4_mhc_params_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (num_tokens == 0) return CUDA_SUCCESS;
-  // One block reads the whole hc stream row (57KB at H=7168, hc_mult=4) for
-  // the rms factor: 1024 threads to maximize in-flight loads on that SM.
-  dsv4_mhc_params_kernel<<<num_tokens, 1024, 0, (cudaStream_t)stream>>>(
+  dsv4_mhc_params_kernel<<<num_tokens, DSV4_MHC_BLOCK, 0, (cudaStream_t)stream>>>(
       residual, mixes, base, scale, pre, post, comb, num_tokens,
       residual_hidden_dim, mix_dim, hc_mult, eps, sinkhorn_iters);
   return (CUresult)cudaGetLastError();
@@ -375,25 +359,7 @@ __global__ void dsv4_mhc_pre_rms_norm_kernel(
     const float rounded = bf16_to_f32(bits);
     local_sum += rounded * rounded;
   }
-  // blockDim=1024 here; block_sum() is sized for DSV4_MHC_BLOCK (256), so
-  // reduce with a local 32-warp scratch instead.
-  float total;
-  {
-    __shared__ float warp_sums_1k[32];
-    float v = warp_reduce_sum(local_sum);
-    if ((threadIdx.x & (WARP_SIZE - 1)) == 0) {
-      warp_sums_1k[threadIdx.x / WARP_SIZE] = v;
-    }
-    __syncthreads();
-    v = threadIdx.x < (blockDim.x / WARP_SIZE) ? warp_sums_1k[threadIdx.x] : 0.0f;
-    if (threadIdx.x < WARP_SIZE) {
-      v = warp_reduce_sum(v);
-    }
-    __shared__ float s_total;
-    if (threadIdx.x == 0) s_total = v;
-    __syncthreads();
-    total = s_total;
-  }
+  const float total = block_sum(local_sum);
 
   __shared__ float s_inv_rms;
   if (threadIdx.x == 0) {
@@ -433,9 +399,7 @@ extern "C" CUresult dsv4_mhc_pre_rms_norm_cuda(
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
     if (attr != cudaSuccess) return (CUresult)attr;
   }
-  // One block must pull hc_mult*H bf16 alone (57KB at H=7168, hc_mult=4):
-  // 1024 threads to maximize in-flight loads on the single SM.
-  dsv4_mhc_pre_rms_norm_kernel<<<num_tokens, 1024, shmem,
+  dsv4_mhc_pre_rms_norm_kernel<<<num_tokens, DSV4_MHC_BLOCK, shmem,
                                  (cudaStream_t)stream>>>(
       residual, pre, weight, out, num_tokens, hidden_size, hc_mult, eps);
   return (CUresult)cudaGetLastError();
