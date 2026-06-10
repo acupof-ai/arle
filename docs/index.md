@@ -21,7 +21,8 @@ coordinates: decode ~26–27 ms/token vs same-pod SGLang 15.89 no-spec /
 8.24 +EAGLE; 5–6 ms is an H100 number, not an H20 target. deepep_ll is
 correct but gated (B=1 −55%, its batched lane pending Phase 1 —
 [`experience/errors/2026-06-10-dsv4-deepep-ll-b1-regression-no-batch-lane.md`](experience/errors/2026-06-10-dsv4-deepep-ll-b1-regression-no-batch-lane.md)).
-Progress tracking: GitHub umbrella issue + per-Phase sub-issues.
+Progress tracking: [umbrella #55](https://github.com/cklxx/arle/issues/55)
+(Phase 0 #56–#59 · Phase 1 #60–#61 · Phase 2 #62 · Phase 3 #63–#65).
 
 OPD remains the only training surface
 ([`projects/2026-05-18-opd-only-pivot.md`](projects/2026-05-18-opd-only-pivot.md));
