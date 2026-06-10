@@ -44,21 +44,10 @@ curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh | s
 docker run --rm --gpus all -p 8000:8000 -v /path/to/Qwen3.5-4B:/model:ro \
   ghcr.io/cklxx/arle:latest serve --backend cuda --model-path /model
 
-# From source (any backend)
-cargo build --release --features cuda --bin arle     # Linux + NVIDIA
-cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle  # Apple Silicon
-```
-
-Full install matrix + uninstall: [docs/install.md](docs/install.md).
-
-**Serve:**
-
-```bash
+# Serve
 arle serve --backend cuda  --model-path /path/to/Qwen3.5-4B --port 8000
 arle serve --backend metal --model-path mlx-community/Qwen3.5-0.8B-MLX-4bit --port 8000
 ```
-
-**Talk to it (OpenAI-compatible):**
 
 ```python
 from openai import OpenAI
@@ -69,15 +58,17 @@ print(client.chat.completions.create(
 ).choices[0].message.content)
 ```
 
-**Local agent / self-check:**
+Build from source, full install matrix, uninstall: [docs/install.md](docs/install.md) · more copy-paste: [`examples/`](examples/).
 
-```bash
-arle                              # interactive REPL with python/shell tools
-arle run --prompt "Summarize this repo" --model-path /path/to/Qwen3.5-4B
-arle --doctor --json              # CI-friendly self-check
-```
+`arle` is one binary:
 
-More copy-paste: [`examples/`](examples/).
+| Command | What it does |
+|---|---|
+| `arle` (no args) | Interactive agent REPL with `python` and `shell` tools. |
+| `arle run --prompt "…"` | One-shot agent prompt. `--no-tools` to disable tools. |
+| `arle serve --backend …` | OpenAI-compatible HTTP server. |
+| `arle train opd` | **On-Policy Distillation** — teacher on the serving runtime, student in `train`. [Manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). |
+| `arle --doctor [--json]` | Backend / hardware / model-resolution self-check. |
 
 ---
 
@@ -91,9 +82,7 @@ More copy-paste: [`examples/`](examples/).
 | **OPD train (CUDA)** | Linux + NVIDIA | **Beta** | 2.49–2.91× faster than HF TRL `GKDTrainer`; LoRA fits 4 GB cards |
 | **CPU** | Portable | **Dev-only** | Smoke tests only |
 
-Models: **Qwen3.5 family** (0.8B / 4B / 30B-A3B / 35B) on CUDA + Metal. **DeepSeek-V4-Flash** is in active multi-GPU bring-up (TP=8 / EP=8 FP8 MoE on 8×H20 — official DSA + DeepGEMM prefill default-on at ~23 ms, B=1 decode down to 15 ms/token via MTP batched verify); **Qwen 3.6** is #2 ([ROADMAP](ROADMAP.md#next-model-priority-order)).
-
-Full numbers and tier policy: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
+Models: **Qwen3.5 family** (CUDA + Metal) · **Qwen3.6** (Metal) · **DeepSeek-V4-Flash** (CUDA 8×H20, TP=8 / EP=8 FP8 — prefill 23 ms, B=1 decode 15 ms/token). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
 ---
 
@@ -101,25 +90,10 @@ Full numbers and tier policy: [support-matrix](docs/support-matrix.md) · [stabi
 
 Agent and RL workloads waste compute re-processing the same prompt + history + tool output every turn. ARLE fixes this once and shares the fix across serving and training:
 
-- **KV stays hot across turns.** Prior-turn KV is kept on GPU; spills to host / disk / cluster only when memory pressures it.
-- **Shared prefixes are cheap.** Pages are reused across requests with the same prefix — no duplicate compute, no duplicate memory.
-- **In-memory KV is bounded.** Metal auto-sizes the live prefix snapshot tier from available memory, live KV shape, and whether weights are wired; `--kv-memory-max-bytes 0` disables it.
-- **Local disk KV is bounded.** Metal keeps SSD prefix snapshots under `~/.cache/arle/metal_kv` with a 20 GiB budget and LRU watermark eviction; use `--no-kv-disk` to disable or `--kv-disk-max-bytes` to override.
-- **Disk KV is segment-backed.** Metal commits small manifests plus sequential segment files; 64 KiB CRC32C-checked chunks dedupe prefix extensions without creating thousands of tiny files. Small session tails stay in memory and hit SSD only at a 64-token checkpoint cadence to avoid recurrent-state write amplification.
-- **One runtime, three surfaces.** Serving, the local agent, and OPD training all run on the same Rust + model code. The OPD teacher *is* the production server.
-
-Quantized KV is available on CUDA (`--kv-cache-dtype int8|fp8|tq4`). Metal uses
-the model-native KV dtype today; MLX-side quantized KV is a separate follow-up.
-
-Benchmark data: [TTFT/TPOT steady sweep](docs/experience/wins/2026-06-02-metal-ttft-tpot-steady.md) ·
-[Metal memory accounting note](docs/experience/wins/2026-06-01-metal-low-rss-analysis.md) ·
-[Metal KV memory budget](docs/experience/wins/2026-06-01-metal-memory-kv-cache-auto-budget.md) ·
-[Metal segmented SSD KV](docs/experience/wins/2026-06-02-metal-segmented-ssd-kv.md) ·
-[Metal SSD KV write-amplification cadence](docs/experience/wins/2026-06-02-metal-ssd-kv-wa-cadence.md).
-
-<p align="center">
-  <img src="docs/assets/metal-vs-mlxlm-ttft-tpot.png" alt="ARLE Metal vs mlx-lm TTFT and TPOT sweep" width="62%">
-</p>
+- **KV stays hot across turns.** Prior-turn KV lives on GPU and spills to host / disk only under memory pressure; prefix pages are shared across requests — no duplicate compute or memory.
+- **KV tiers are bounded.** Metal auto-sizes the in-memory prefix tier and keeps SSD snapshots under a 20 GiB LRU budget (CRC32C-checked 64 KiB segments); `--kv-memory-max-bytes 0` / `--no-kv-disk` opt out.
+- **Quantized KV on CUDA.** `--kv-cache-dtype int8|fp8|tq4`.
+- **One runtime, three surfaces.** Serving, the local agent, and OPD training run the same Rust + model code — the OPD teacher *is* the production server.
 
 ```mermaid
 flowchart TB
@@ -157,54 +131,25 @@ Deep dive: [onboarding](docs/onboarding.md) (30 min) · [architecture](docs/arch
 
 ---
 
-## Entry surfaces
-
-`arle` is the single binary:
-
-| Command | What it does |
-|---|---|
-| `arle` (no args) | Interactive agent REPL with `python` and `shell` tools. |
-| `arle run --prompt "…"` | One-shot agent prompt. `--no-tools` to disable tools. |
-| `arle serve --backend …` | OpenAI-compatible HTTP server. |
-| `arle train opd` | **On-Policy Distillation** — teacher on the serving runtime (`infer-api`), student in `train`. CUDA path. [Usage manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). |
-| `arle --doctor [--json]` | Backend / hardware / model-resolution self-check. |
-
-Operators wanting only serving can run `arle serve` — the same HTTP contract, without touching the agent / train surfaces.
-
----
-
 ## Latest Updates
 
 <!-- Breakthrough-only headlines (shipped capability / perf wins). Research notes + retractions live in docs/. -->
 
 **2026-06-10 — Phase 0 debt cleared:** DSv4 256K boots + needle-exact @230K, admission on real KV budgets, KV-parity gate re-ported (FlashMLA decode licensed) — Phase 1 batched serving lane is next ([#55](https://github.com/cklxx/arle/issues/55)).
 
-**2026-06-08 — DeepSeek-V4-Flash B=1 latency: prefill 23 ms, decode 27 → 15 ms** (8×H20, TP=8 / EP=8, FP8 MoE). The official DSA indexer flattened decode across context (legacy `csa_select` 124 ms → ~26 ms @4k, 4.8×); the MLA / output projections moved from scalar GEMV to tensor-core DeepGEMM (−94% per stage → prefill ~23 ms); and MTP depth-1 batched verify amortized the serial critical path for **+71% decode tok/s** (39.9 → 64.2), byte-identical. Eight per-kernel levers (whole-step CUDA graph, mhc_params uint4, M=1 GEMV, comm-overlap, …) all **washed** — B=1 decode is GPU-bound on the critical path, so 15 ms is the sound single-request ceiling; 6 ms needs tree-EAGLE + mega-kernel fusion or batching (M=N). [FINAL report](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md).
+**2026-06-08 — DeepSeek-V4-Flash B=1: prefill 23 ms, decode 27 → 15 ms/token** (8×H20, TP=8 / EP=8, FP8 MoE). Official DSA indexer flattens decode across context (4.8× @4k), tensor-core DeepGEMM projections (−94% per stage), MTP batched verify **+71% decode tok/s** — byte-identical. [FINAL report](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md).
 
 <p align="center">
   <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 latency optimization journey: decode context-scaling fix, prefill DeepGEMM projections, and the MTP-amortized decode wall" width="100%">
 </p>
 
-**2026-06-02 — Metal Qwen3.6 A/B refreshed.** ARLE and mlx-lm are in the same steady TPOT band from 128 to 12k input tokens; the README chart now shows TTFT + steady TPOT only. [Wins entry](docs/experience/wins/2026-06-02-metal-ttft-tpot-steady.md).
-
-**2026-06-02 — Metal SSD KV is segment-backed.** Prefix snapshots now use CRC32C-checked 64 KiB chunks in sequential segment files; short generated tails stay in memory until the 64-token SSD checkpoint cadence. [Segmented KV](docs/experience/wins/2026-06-02-metal-segmented-ssd-kv.md) · [WA cadence](docs/experience/wins/2026-06-02-metal-ssd-kv-wa-cadence.md).
-
 Older history: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
-## Documentation map
+## Documentation
 
-- [docs/http-api.md](docs/http-api.md) · HTTP contract & streaming
-- [docs/support-matrix.md](docs/support-matrix.md) · backend / model / quant tiers
-- [docs/architecture.md](docs/architecture.md) · package boundaries
-- [docs/codebase-map.md](docs/codebase-map.md) · workspace layout & execution paths
-- [docs/environment.md](docs/environment.md) · env vars & runtime knobs
-- [docs/troubleshooting.md](docs/troubleshooting.md) · common build/runtime errors
-- [docs/comparison.md](docs/comparison.md) · vs vLLM / SGLang / mistral.rs / llama.cpp
-- [CONTRIBUTING.md](CONTRIBUTING.md) · contributor setup & validation
-- [examples/](examples/) · copy-paste smoke paths
-- [docs/index.md](docs/index.md) · maintainer-facing PARA index
+[http-api](docs/http-api.md) · [support-matrix](docs/support-matrix.md) · [architecture](docs/architecture.md) · [codebase-map](docs/codebase-map.md) · [environment](docs/environment.md) · [troubleshooting](docs/troubleshooting.md) · [comparison vs vLLM / SGLang / mistral.rs / llama.cpp](docs/comparison.md) · [CONTRIBUTING](CONTRIBUTING.md) · [docs/index.md](docs/index.md)
 
 ---
 

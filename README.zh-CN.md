@@ -44,21 +44,10 @@ curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh | s
 docker run --rm --gpus all -p 8000:8000 -v /path/to/Qwen3.5-4B:/model:ro \
   ghcr.io/cklxx/arle:latest serve --backend cuda --model-path /model
 
-# 源码构建(任意后端)
-cargo build --release --features cuda --bin arle     # Linux + NVIDIA
-cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle  # Apple Silicon
-```
-
-完整安装矩阵与卸载:[docs/install.md](docs/install.md)。
-
-**启动服务:**
-
-```bash
+# 启动服务
 arle serve --backend cuda  --model-path /path/to/Qwen3.5-4B --port 8000
 arle serve --backend metal --model-path mlx-community/Qwen3.5-0.8B-MLX-4bit --port 8000
 ```
-
-**调用(OpenAI 兼容):**
 
 ```python
 from openai import OpenAI
@@ -69,15 +58,17 @@ print(client.chat.completions.create(
 ).choices[0].message.content)
 ```
 
-**本地 agent / 自检:**
+源码构建、完整安装矩阵与卸载:[docs/install.md](docs/install.md) · 更多即用样例:[`examples/`](examples/)。
 
-```bash
-arle                              # 交互式 REPL,内置 python/shell 工具
-arle run --prompt "总结这个仓库" --model-path /path/to/Qwen3.5-4B
-arle --doctor --json              # CI 友好自检
-```
+`arle` 是唯一的二进制:
 
-更多即用样例:[`examples/`](examples/)。
+| 命令 | 含义 |
+|---|---|
+| `arle`(无参) | 交互式 agent REPL,内置 `python` 与 `shell` 工具。 |
+| `arle run --prompt "…"` | 一次性 prompt。`--no-tools` 关闭工具。 |
+| `arle serve --backend …` | OpenAI 兼容 HTTP 服务。 |
+| `arle train opd` | **On-Policy Distillation** —— teacher 跑在服务运行时,student 跑 `train`。[使用手册](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md)。 |
+| `arle --doctor [--json]` | 后端 / 硬件 / 模型解析自检。 |
 
 ---
 
@@ -85,50 +76,58 @@ arle --doctor --json              # CI 友好自检
 
 | 后端 | 平台 | 状态 | 关键数字 |
 |---|---|:---:|---|
-| **CUDA** | Linux + NVIDIA | **Stable** | 持续批处理、paged KV、radix 复用、TileLang BF16 attention、CUDA Graph decode。L4 / Qwen3.5-4B BF16 + FP8 KV:**c=16 / 4k-in 197 tok/s**。 |
-| **Metal** | Apple Silicon | **Beta** | 调度器驱动服务、chunked prefill、replay prefix 复用。Qwen3.6 35B-A3B 4-bit MLX:**M4 Pro 48GB 85.6 tok/s 解码 / TTFT 385 ms**。 |
-| **Metal DFlash** | Apple Silicon | **Beta — 默认开启** | Qwen3.5 推测解码。Qwen3.5-4B-4bit 比特一致,c=1..8。 |
-| **OPD 训练(CUDA)** | Linux + NVIDIA | **Beta** | **对比 HuggingFace TRL `GKDTrainer` 同配置快 2.04×**(Qwen3-0.6B)。**LoRA 模式 0.140 s/step + 仅 3.9 GB 峰值** —— 4 GB 消费级显卡可跑。跨 runtime 大 teacher 路径已端到端验证(Qwen3.5-4B → 0.8B LoRA)。详见 [最新动态](#最新动态)。 |
-| **CPU** | 通用 | **仅开发用** | 冒烟测试,不作为性能目标。 |
+| **CUDA** | Linux + NVIDIA | **Stable** | L4 上 197 tok/s(Qwen3.5-4B BF16,c=16) |
+| **Metal** | Apple Silicon | **Beta** | M4 Pro 上 85.6 tok/s(Qwen3.6 35B-A3B 4-bit) |
+| **Metal DFlash** | Apple Silicon | **Beta** | Qwen3.5 推测解码,比特一致 |
+| **OPD 训练(CUDA)** | Linux + NVIDIA | **Beta** | 比 HF TRL `GKDTrainer` 快 2.49–2.91×;LoRA 4 GB 显卡可跑 |
+| **CPU** | 通用 | **仅开发用** | 冒烟测试 |
 
-模型:**Qwen3.5 全家族**(0.8B / 4B / 30B-A3B / 35B)在 CUDA + Metal 上支持。**DeepSeek-V4-Flash** 多卡 bring-up 进行中(8×H20 上 TP=8 / EP=8 FP8 MoE —— 官方 DSA + DeepGEMM prefill 默认开启 ~23 ms,B=1 decode 经 MTP batched verify 降到 15 ms/token);**Qwen 3.6** 为 #2 —— 见 [ROADMAP.md](ROADMAP.md#next-model-priority-order)。
-
-权威支持矩阵:[docs/support-matrix.md](docs/support-matrix.md) · [docs/stability-policy.md](docs/stability-policy.md)。
+模型:**Qwen3.5 全家族**(CUDA + Metal)· **Qwen3.6**(Metal)· **DeepSeek-V4-Flash**(CUDA 8×H20,TP=8 / EP=8 FP8 —— prefill 23 ms,B=1 decode 15 ms/token)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
 
 ---
 
 ## 为什么是 ARLE
 
-agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 + 工具结果重复处理。ARLE 把这件事当成 serving 与训练的共同核心问题:
+agent 与 RL 工作负载每轮都在重复处理同样的 prompt + 历史 + 工具输出。ARLE 把这件事解决一次,serving 与训练共享:
 
-- **跨轮 KV 复用。** Slot-sticky 复用 + radix 支撑的分层 KV(`T0 GPU → T1 host → T2 盘 → T3 集群`)保持上一轮 KV 热。
-- **Paged KV 池。** `page_size=16`,直接 GPU 页面挂载 + 共享前缀的尾页 CoW —— 计费可预期、共享前缀更便宜。
-- **统一的运行时权威。** `arle serve`、`arle`、OPD 训练共用同一套 Rust 运行时与模型契约 —— OPD teacher 就是生产服务用的同一个 runtime,不再分两套栈。
+- **跨轮 KV 常驻。** 上一轮 KV 留在 GPU,内存压力下才下沉 host / 盘;共享前缀按页复用 —— 不重复计算、不重复占内存。
+- **KV 分层有预算。** Metal 自动确定内存前缀层大小,SSD 快照 20 GiB LRU 预算(CRC32C 校验的 64 KiB 段);`--kv-memory-max-bytes 0` / `--no-kv-disk` 可关。
+- **CUDA 量化 KV。** `--kv-cache-dtype int8|fp8|tq4`。
+- **一套运行时、三个表面。** serving、本地 agent、OPD 训练共用同一套 Rust + 模型代码 —— OPD teacher 就是生产 server。
 
-<p align="center">
-  <img src="docs/assets/metal-vs-mlxlm-essay-avg.png" alt="ARLE Metal vs mlx-lm TTFT、TPOT、RSS 作文压测对比" width="62%">
-</p>
-<p align="center">
-  <sub><a href="docs/experience/wins/2026-06-01-readme-metal-vs-mlxlm-ttft-rss.md">Benchmark 数据</a> · <a href="docs/experience/wins/2026-06-01-metal-low-rss-analysis.md">RSS 分析</a></sub>
-</p>
+```mermaid
+flowchart TB
+  subgraph Surfaces["One arle binary"]
+    Serve["arle serve<br/>OpenAI v1 HTTP"]
+    Agent["arle<br/>local agent / REPL"]
+    Train["arle train opd<br/>OPD — teacher <i>is</i> the production server"]
+  end
 
-架构详解:[docs/onboarding.md](docs/onboarding.md)（新人 30 分钟）· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
+  subgraph Serving["Serving layer"]
+    Server["infer-server<br/>HTTP · streaming · ServeHandle"]
+    API["infer-api<br/>LoadedInferenceEngine — programmatic front door"]
+  end
 
----
+  Core["<b>infer-core — device-neutral Engine&lt;E,K&gt;</b><br/>continuous scheduler · RadixCache prefix reuse<br/>chunked prefill · paged-KV admission · sampling"]
 
-## 入口面
+  Seam["<b>infer-plan IR · infer-seam</b><br/>the narrow waist: two host-only traits — BackendExecutor · KvPool"]
 
-`arle` 是用户面对的唯一二进制:
+  subgraph Exec["Executors — a new backend = implement the two traits"]
+    CUDA["infer-cuda<br/>official FlashMLA · DeepGEMM · DeepEP + TileLang AOT<br/>TP=8 / EP=8 · Qwen3.5 · DeepSeek-V4-Flash"]
+    Metal["infer-metal<br/>MLX bridge · packed varlen decode · wired weights<br/>Qwen3.5 · Qwen3.6"]
+  end
 
-| 命令 | 含义 |
-|---|---|
-| `arle`(无参) | 交互式 agent REPL,内置 `python` 与 `shell` 工具。 |
-| `arle run --prompt "…"` | 脚本友好的一次性 prompt。`--no-tools` 关闭工具。 |
-| `arle serve --backend …` | OpenAI 兼容 HTTP 服务。 |
-| `arle train opd` | **On-Policy Distillation** —— teacher 跑在服务运行时(`infer-api`),student 跑 `train`,共享 runtime。[使用手册](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md)。 |
-| `arle --doctor [--json]` | 后端 / 硬件 / 模型解析自检。 |
+  Serve --> Server
+  Agent --> API
+  Train --> API
+  Server --> Core
+  API --> Core
+  Core --> Seam
+  Seam --> CUDA
+  Seam --> Metal
+```
 
-只需要服务的运维同学可直接用 `arle serve`(`cargo build --release --features cuda --bin arle`)—— 同一份 HTTP 契约,不带 agent / train 表面。
+架构详解:[docs/onboarding.md](docs/onboarding.md)(新人 30 分钟)· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
 
 ---
 
@@ -138,45 +137,19 @@ agent 与 RL 工作负载每轮都要付 **prefill 税**:system prompt + 历史 
 
 **2026-06-10 — Phase 0 还债收口:** DSv4 256K 可启动、needle 230K 精确命中、admission 按真实 KV 预算、KV-parity gate 移植完成(FlashMLA decode 已 license),下一步 Phase 1 批量化 serving lane([#55](https://github.com/cklxx/arle/issues/55))。
 
-**2026-06-08 — DeepSeek-V4-Flash B=1 延迟:prefill 23 ms,decode 27 → 15 ms**(8×H20,TP=8 / EP=8,FP8 MoE)。官方 DSA indexer 让 decode 不再随上下文增长(legacy `csa_select` 124 ms → ~26 ms @4k,4.8×);MLA / output 投影从 scalar GEMV 换成 tensor-core DeepGEMM(每段 −94% → prefill ~23 ms);MTP depth-1 batched verify 摊薄串行关键路径,**decode tok/s +71%**(39.9 → 64.2),逐字节一致。八个 per-kernel 杠杆(whole-step CUDA graph、mhc_params uint4、M=1 GEMV、comm-overlap …)全部 **wash** —— B=1 decode 卡在关键路径上、GPU-bound,所以 15 ms 是单请求的合理地板;6 ms 需要 tree-EAGLE + mega-kernel 融合或 batching(M=N)。[最终报告](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md)。
+**2026-06-08 — DeepSeek-V4-Flash B=1:prefill 23 ms,decode 27 → 15 ms/token**(8×H20,TP=8 / EP=8,FP8 MoE)。官方 DSA indexer 让 decode 不再随上下文增长(4.8× @4k),tensor-core DeepGEMM 投影(每段 −94%),MTP batched verify **decode tok/s +71%** —— 逐字节一致。[最终报告](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md)。
 
 <p align="center">
   <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 延迟优化历程:decode 不再随上下文增长、prefill DeepGEMM 投影、MTP 摊薄的 decode wall" width="100%">
 </p>
 
-**2026-05-21 — ARLE OPD CUDA:更快 + 更省显存,对比 HuggingFace TRL。**
-同 Qwen3-0.6B teacher/student、32 prompts、`rollout_len=8`、`lr=1e-7`、500 步、AdamW、RTX 4070 Ti SUPER。
-
-![ARLE OPD CUDA vs HuggingFace TRL — 速度、显存、held-out KL](docs/projects/img/2026-05-21-arle-vs-pytorch-opd-comparison.png)
-
-| | TRL `GKDTrainer` | **ARLE 全量微调** | **ARLE LoRA r=16** |
-|---|---:|---:|---:|
-| step 时间 (s) | 0.408 | **0.164** (2.49×) | **0.140** (2.91×) |
-| 显存峰值 (GB) | 12.6 | 15.4 | **3.93**(4 GB 显卡可跑) |
-| held-out KL(500 步) | -5.5 % | **-18.5 %** | **-36.4 %** |
-
-**跨 runtime 大 teacher 路径已端到端验证。** Qwen3.5-4B BF16 teacher 跑在服务运行时(`infer-api`),Qwen3.5-0.8B-Base LoRA r=16 student 在 `train`,通过 `InferTeacher` device-logits bridge 对接。200 步真实文本 run:**5.66 s/step**、**14.8 GiB 峰值**、KL 单调下降(held-out -2.05%)。跨 runtime 开销实测仅 **占 step 时间 1.5%** —— 生产级 teacher 集成成本可忽略。
-
-端到端收敛:lr=1e-7、5000 步,held-out exact-overlap **50% → 82.8%**。
-
-证据:[`docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`](docs/projects/2026-05-21-opd-cuda-cycle-wrap.md) · [使用手册](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md) · [TRL 对照](docs/experience/wins/2026-05-21-arle-vs-trl-gkd-head-to-head.md) · [4B→0.8B 跨 runtime bench](docs/experience/wins/2026-05-21-qwen35-4b-08b-opd-infer-teacher.md)。
-
 完整历史:[CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
-## 文档地图
+## 文档
 
-- [docs/http-api.md](docs/http-api.md) · HTTP 契约与流式行为
-- [docs/support-matrix.md](docs/support-matrix.md) · 后端 / 模型 / 量化等级
-- [docs/architecture.md](docs/architecture.md) · 包边界与依赖方向
-- [docs/codebase-map.md](docs/codebase-map.md) · workspace 布局与执行路径
-- [docs/environment.md](docs/environment.md) · 环境变量与运行时旋钮
-- [docs/troubleshooting.md](docs/troubleshooting.md) · 常见构建 / 运行错误
-- [docs/comparison.md](docs/comparison.md) · vs vLLM / SGLang / mistral.rs / llama.cpp
-- [CONTRIBUTING.md](CONTRIBUTING.md) · 贡献者环境与验证
-- [examples/](examples/) · 即用样例
-- [docs/index.md](docs/index.md) · 维护者 PARA 索引
+[http-api](docs/http-api.md) · [support-matrix](docs/support-matrix.md) · [architecture](docs/architecture.md) · [codebase-map](docs/codebase-map.md) · [environment](docs/environment.md) · [troubleshooting](docs/troubleshooting.md) · [对比 vLLM / SGLang / mistral.rs / llama.cpp](docs/comparison.md) · [CONTRIBUTING](CONTRIBUTING.md) · [docs/index.md](docs/index.md)
 
 ---
 
