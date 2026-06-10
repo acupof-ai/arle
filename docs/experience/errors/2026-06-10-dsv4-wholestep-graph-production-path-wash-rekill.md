@@ -77,6 +77,21 @@ and env-gated for future stacks where the host becomes the wall.
    a GPU-bound chain its recoverable share needs a direct experiment
    (rotate/parallelize TickAdmissions sends), not inference from gaps.
 
+## Follow-up audit (the SGLang Omni article prompted a second sweep)
+
+The Qwen dense decode graph turned out to be **DEFAULT-ON in production**
+(`--cuda-graph` default, single-GPU dense; TP/MoE hard-gated in warmup) —
+the one graph path that never got the DSv4-style enumeration. Verdict:
+`forward_decode_captured` is clean (zero alloc/htod/sync in the captured
+body; `stage1_write` refreshes persistent device buffers per step outside
+the graph — the canonical by-reference design), sampling outside, RNG
+stateless. One real regression found and fixed (`5ee8bf82`): the universal
+warm guard had silently demoted Qwen's boot-time warmup capture to a warm
+run — warmup now double-passes (warm, then capture). Lesson: **a universal
+change to shared graph infra must be re-audited against EVERY graph user,
+especially the default-on ones** — I audited the gated DSv4 path I was
+working on and missed the live Qwen path for a day.
+
 ## Refs
 
 - Ladder + capture fixes: [`wins/2026-06-10-dsv4-flashmla-graph-ima-fixed-ladder.md`](../wins/2026-06-10-dsv4-flashmla-graph-ima-fixed-ladder.md)
