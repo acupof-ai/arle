@@ -269,6 +269,10 @@ pub(crate) struct Dsv4KvAdapter {
     layers: Vec<Dsv4LayerKvLayout>,
     num_slots: usize,
     slot_epochs: Vec<Option<u64>>,
+    /// One shared official-DSA selector scratch for ALL CSA layers and slots
+    /// (issue #67). `None` when the model has no CSA layer or the official
+    /// indexer is disabled (`ARLE_DSV4_DSA_INDEXER=0`).
+    dsa_shared: Option<Dsv4DsaSharedScratch>,
 }
 
 pub(crate) struct Dsv4LayerKvLayout {
@@ -328,11 +332,48 @@ impl Dsv4KvAdapter {
                 num_slots,
             )?);
         }
+        // Build the ONE shared official-DSA scratch when any CSA layer exists.
+        // All CSA layers must agree on compress_ratio: the scratch's
+        // compressed-capacity sizing is shared (uniform cr=4 on DSv4-Flash).
+        let mut csa_ratios = layer_specs
+            .iter()
+            .filter(|(mode, _, _)| *mode == DeepSeekV4AttentionMode::CompressedSparse)
+            .map(|&(_, compress_ratio, _)| compress_ratio);
+        let dsa_shared = match csa_ratios.next() {
+            Some(first_cr) if dsv4_dsa_official_enabled()? => {
+                ensure!(
+                    csa_ratios.all(|cr| cr == first_cr),
+                    "DSv4 shared DSA scratch requires a uniform CSA compress_ratio"
+                );
+                Some(Dsv4DsaSharedScratch::new(
+                    ctx,
+                    config,
+                    first_cr,
+                    max_seq_len,
+                )?)
+            }
+            _ => None,
+        };
         Ok(Self {
             layers,
             num_slots,
             slot_epochs: vec![None; num_slots],
+            dsa_shared,
         })
+    }
+
+    /// Split-borrow accessor: one layer's KV layout plus the model-wide shared
+    /// DSA scratch (disjoint fields, so both can be `&mut` at once).
+    pub(crate) fn layer_and_dsa_shared_mut(
+        &mut self,
+        layer_idx: usize,
+    ) -> Result<(&mut Dsv4LayerKvLayout, Option<&mut Dsv4DsaSharedScratch>)> {
+        let len = self.layers.len();
+        let layer = self
+            .layers
+            .get_mut(layer_idx)
+            .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))?;
+        Ok((layer, self.dsa_shared.as_mut()))
     }
 
     pub(crate) fn layer_mut(&mut self, layer_idx: usize) -> Result<&mut Dsv4LayerKvLayout> {
@@ -904,30 +945,19 @@ const DSV4_DSA_PREFILL_QUERY_TILE: usize = 1024;
 /// is not the chunked-prefill path and is expected to trip that assert.
 const DSV4_PREFILL_QUERY_CHUNK: usize = 4096;
 
+/// Per-(slot, CSA-layer) STATEFUL half of the official DSA selector.
+///
+/// Only the pieces that carry cross-call state live here: the `rotated_keys`
+/// mirror (incrementally written as compressed keys arrive), the
+/// `packed_rows` progress counter, and the slot's key-cache band binding.
+/// Every per-forward scratch buffer and every constant table is shared across
+/// slots AND layers in [`Dsv4DsaSharedScratch`] (issue #67 — the per-slot ×
+/// per-layer copies of the `logits` tile alone made 256K boot impossible).
 struct Dsv4DsaOfficialState {
     slot_idx: usize,
     key_cache_len: usize,
     rotated_keys: CudaSlice<half::bf16>,
-    cache_locs: CudaSlice<i64>,
-    q_fp8: CudaSlice<u8>,
-    weights: CudaSlice<f32>,
-    context_lens: CudaSlice<i32>,
-    positions: CudaSlice<i32>,
-    page_table_identity: CudaSlice<i32>,
-    freqs_cis: CudaSlice<f32>,
-    sched_meta: CudaSlice<i32>,
-    logits: CudaSlice<f32>,
-    raw_indices: CudaSlice<i32>,
     packed_rows: usize,
-    max_tokens: usize,
-    query_tile: usize,
-    query_chunk: usize,
-    compressed_capacity: usize,
-    num_pages: usize,
-    num_heads: usize,
-    head_dim: usize,
-    logits_stride: usize,
-    num_sms: usize,
 }
 
 impl Dsv4DsaOfficialState {
@@ -939,6 +969,81 @@ impl Dsv4DsaOfficialState {
         slot_idx: usize,
         pool: &Dsv4LayerKvLayout,
     ) -> Result<Self> {
+        let compressed_capacity = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
+        let key_cache_bytes = dsv4_dsa_key_cache_bytes(config, compress_ratio, max_seq_len)?;
+        let range = pool.dsa_slot_range(slot_idx)?;
+        ensure!(
+            pool.dsa_key_cache.is_some()
+                && range.len() == key_cache_bytes
+                && range.len() == pool.dsa_slot_bytes
+                && !range.is_empty(),
+            "DSv4 official DSA shared slot band missing/invalid for slot {slot_idx}"
+        );
+        Ok(Self {
+            slot_idx,
+            key_cache_len: key_cache_bytes,
+            rotated_keys: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(compressed_capacity * config.index_head_dim)
+                .map_err(|e| anyhow!("DSv4 official DSA rotated key alloc failed: {e}"))?,
+            packed_rows: 0,
+        })
+    }
+
+    fn reset(&mut self, ctx: &DeviceContext, pool: &mut Dsv4LayerKvLayout) -> Result<()> {
+        self.packed_rows = 0;
+        pool.reset_dsa_slot(ctx, self)?;
+        Ok(())
+    }
+}
+
+/// Per-MODEL shared half of the official DSA selector — ONE instance per
+/// executor, shared across every CSA layer and every slot (issue #67).
+///
+/// Sharing safety: every kernel that touches these buffers is enqueued on the
+/// single `ctx.stream`, so a later (slot, layer) call's writes are
+/// stream-ordered after the earlier call's reads — the overwrite-before-read
+/// discipline that already held per-tile within one call holds across calls
+/// for free. The disabled-event-tracking hazard is about FREEING device memory
+/// while async kernels may still touch it; this scratch lives as long as the
+/// KV adapter and is never dropped mid-forward, so no premature-reuse window
+/// exists. Contents carry NO cross-call state:
+///
+/// - per-forward scratch, overwritten before every read: `logits`, `q_fp8`,
+///   `weights`, `context_lens`, `positions`, `sched_meta`, `raw_indices`;
+/// - constants of (config, compress_ratio, max_seq): `cache_locs`,
+///   `page_table_identity`, `freqs_cis`.
+///
+/// The stateful per-(slot, layer) pieces stay in [`Dsv4DsaOfficialState`].
+pub(crate) struct Dsv4DsaSharedScratch {
+    cache_locs: CudaSlice<i64>,
+    q_fp8: CudaSlice<u8>,
+    weights: CudaSlice<f32>,
+    context_lens: CudaSlice<i32>,
+    positions: CudaSlice<i32>,
+    page_table_identity: CudaSlice<i32>,
+    freqs_cis: CudaSlice<f32>,
+    sched_meta: CudaSlice<i32>,
+    logits: CudaSlice<f32>,
+    raw_indices: CudaSlice<i32>,
+    max_tokens: usize,
+    query_tile: usize,
+    query_chunk: usize,
+    compressed_capacity: usize,
+    num_pages: usize,
+    num_heads: usize,
+    head_dim: usize,
+    logits_stride: usize,
+    num_sms: usize,
+}
+
+impl Dsv4DsaSharedScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        compress_ratio: usize,
+        max_seq_len: usize,
+    ) -> Result<Self> {
         ensure!(
             config.index_head_dim == 128,
             "Official DSv4 DSA indexer requires index_head_dim=128, got {}",
@@ -949,31 +1054,22 @@ impl Dsv4DsaOfficialState {
             "Official DSv4 DSA indexer requires 32/64 heads, got {}",
             config.index_n_heads
         );
-        let compressed_capacity = max_seq_len.div_ceil(compress_ratio).max(1);
+        let compressed_capacity = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
         let page_size = 64usize;
         let num_pages = compressed_capacity.div_ceil(page_size).max(1);
-        let key_cache_bytes = dsv4_dsa_key_cache_bytes(config, compress_ratio, max_seq_len)?;
-        let range = pool.dsa_slot_range(slot_idx)?;
-        ensure!(
-            pool.dsa_key_cache.is_some()
-                && range.len() == key_cache_bytes
-                && range.len() == pool.dsa_slot_bytes
-                && range.len() > 0,
-            "DSv4 official DSA shared slot band missing/invalid for slot {slot_idx}"
-        );
         let max_tokens = max_seq_len.max(1);
         // Query-dimension scratch is tiled: bounded by `query_tile` regardless of how
         // many query tokens a single call passes. When token_count <= query_tile the
         // compute loop runs a single iteration (offset 0), behavior-identical to the
-        // pre-tiling code. Key-dimension / full-N buffers (rotated_keys, cache_locs,
-        // freqs_cis) stay sized by max_tokens/compressed_capacity; `raw_indices` (the
+        // pre-tiling code. Key-dimension / full-N buffers (cache_locs, freqs_cis)
+        // stay sized by max_tokens/compressed_capacity; `raw_indices` (the
         // per-forward topk output) is chunk-sized — see below.
         let query_tile = DSV4_DSA_PREFILL_QUERY_TILE.min(max_tokens);
         // `raw_indices` is the topk OUTPUT: written per forward over the forward's
         // query tokens and read only by the gated `ARLE_DSV4_CSA_DUMP` block for those
-        // same ≤ chunk queries — never the full max_tokens context. Size it by the
+        // same <= chunk queries — never the full max_tokens context. Size it by the
         // chunked-prefill query bound (`DSV4_PREFILL_QUERY_CHUNK`), not `max_tokens`,
-        // which at 900K × topk would be ~1.9 GB/layer. `csa_select_official` asserts
+        // which at 900K x topk would be ~1.9 GB/layer. `csa_select_official` asserts
         // `q_i.seq_len <= query_chunk` before the tile loop.
         let query_chunk = DSV4_PREFILL_QUERY_CHUNK.min(max_tokens);
         let q_elems = query_tile
@@ -1001,12 +1097,6 @@ impl Dsv4DsaOfficialState {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(78);
         Ok(Self {
-            slot_idx,
-            key_cache_len: key_cache_bytes,
-            rotated_keys: ctx
-                .stream
-                .alloc_zeros::<half::bf16>(compressed_capacity * config.index_head_dim)
-                .map_err(|e| anyhow!("DSv4 official DSA rotated key alloc failed: {e}"))?,
             cache_locs: ctx
                 .stream
                 .clone_htod(&cache_locs_h)
@@ -1047,7 +1137,6 @@ impl Dsv4DsaOfficialState {
                 .stream
                 .alloc_zeros::<i32>(query_chunk * config.index_topk)
                 .map_err(|e| anyhow!("DSv4 official DSA raw indices alloc failed: {e}"))?,
-            packed_rows: 0,
             max_tokens,
             query_tile,
             query_chunk,
@@ -1059,25 +1148,13 @@ impl Dsv4DsaOfficialState {
             num_sms,
         })
     }
-
-    fn reset(&mut self, ctx: &DeviceContext, pool: &mut Dsv4LayerKvLayout) -> Result<()> {
-        self.packed_rows = 0;
-        pool.reset_dsa_slot(ctx, self)?;
-        Ok(())
-    }
 }
 
-/// Device bytes ONE [`Dsv4DsaOfficialState`] allocates — i.e. per CSA layer,
-/// per slot. MUST mirror the allocations in [`Dsv4DsaOfficialState::new`]
-/// above (dominant term: the `logits` tile, `query_tile × ~(max_seq/cr) × 4`).
-///
-/// This feeds the dynamic KV memory budget (`Dsv4Model::kv_budget_num_slots`):
-/// the scratch is per-slot AND per-CSA-layer, so at long `max_seq` it dwarfs
-/// the MLA arena the budget's ×2 overhead factor was tuned for — un-budgeted,
-/// it OOMs engine build at 256K with the default slot count (issue #67; the
-/// design comment at `DSV4_DSA_PREFILL_QUERY_TILE` sized the 900K ledger for a
-/// single slot).
-pub(crate) fn dsv4_dsa_official_scratch_bytes(
+/// Device bytes of the ONE [`Dsv4DsaSharedScratch`] (per model, NOT per slot).
+/// MUST mirror [`Dsv4DsaSharedScratch::new`]'s allocations (kept adjacent so
+/// drift is visible). Feeds `Dsv4Model::kv_budget_num_slots` as a one-off
+/// subtraction from the budget.
+pub(crate) fn dsv4_dsa_shared_scratch_bytes(
     config: &DeepSeekV4Config,
     compress_ratio: usize,
     max_seq_len: usize,
@@ -1088,7 +1165,6 @@ pub(crate) fn dsv4_dsa_official_scratch_bytes(
     let query_chunk = DSV4_PREFILL_QUERY_CHUNK.min(max_seq_len.max(1));
     let logits_stride = cc.div_ceil(256) * 256;
     let logits = query_tile.saturating_mul(logits_stride).saturating_mul(4);
-    let rotated_keys = cc.saturating_mul(config.index_head_dim).saturating_mul(2);
     let cache_locs = cc.saturating_mul(8);
     let q_fp8 = query_tile
         .saturating_mul(config.index_n_heads)
@@ -1098,12 +1174,14 @@ pub(crate) fn dsv4_dsa_official_scratch_bytes(
         .saturating_mul(4);
     let lens_positions = query_tile.saturating_mul(8);
     let page_table = query_tile.saturating_mul(num_pages).saturating_mul(4);
-    let freqs_cis = cc.saturating_mul(config.qk_rope_head_dim).saturating_mul(4);
+    // freqs_cis covers max_tokens positions x rope dim (f32).
+    let freqs_cis = max_seq_len
+        .saturating_mul(config.qk_rope_head_dim)
+        .saturating_mul(4);
     let raw_indices = query_chunk
         .saturating_mul(config.index_topk)
         .saturating_mul(4);
     logits
-        .saturating_add(rotated_keys)
         .saturating_add(cache_locs)
         .saturating_add(q_fp8)
         .saturating_add(weights)
@@ -1111,6 +1189,18 @@ pub(crate) fn dsv4_dsa_official_scratch_bytes(
         .saturating_add(page_table)
         .saturating_add(freqs_cis)
         .saturating_add(raw_indices)
+}
+
+/// Device bytes of ONE per-(slot, CSA-layer) [`Dsv4DsaOfficialState`] — the
+/// stateful `rotated_keys` mirror. Feeds the per-slot term of
+/// `Dsv4Model::kv_budget_num_slots`.
+pub(crate) fn dsv4_dsa_rotated_keys_bytes(
+    config: &DeepSeekV4Config,
+    compress_ratio: usize,
+    max_seq_len: usize,
+) -> usize {
+    let cc = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
+    cc.saturating_mul(config.index_head_dim).saturating_mul(2)
 }
 
 fn dsv4_dsa_key_cache_bytes(
@@ -4018,6 +4108,7 @@ pub(crate) fn mla_attention(
     hidden: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
+    dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     tp: &TpRuntime,
@@ -4470,6 +4561,7 @@ pub(crate) fn mla_attention(
                 &c_q_normed,
                 index_keys,
                 official,
+                dsa_shared,
                 pool,
                 indexer_rows_before,
                 indexer_rows_after,
@@ -4949,6 +5041,7 @@ fn csa_select(
     c_q_normed: &HiddenStates,
     keys: &HiddenStates,
     official: Option<&mut Dsv4DsaOfficialState>,
+    dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
     pool: &mut Dsv4LayerKvLayout,
     indexer_rows_before: usize,
     indexer_rows_after: usize,
@@ -5023,26 +5116,44 @@ fn csa_select(
     let score_scale =
         (config.index_head_dim as f32).powf(-0.5) * (config.index_n_heads as f32).powf(-0.5);
     if let Some(official) = official {
-        if let Some(selected) = csa_select_official(
-            ctx,
-            config,
-            &q_i,
-            &weights,
-            keys,
-            official,
-            pool,
-            indexer_rows_before,
-            indexer_rows_after,
-            key_count,
-            start_pos,
-            start_pos_device,
-            layer_idx,
-            ratio,
-            local_index_heads,
-            score_scale,
-            keepalive,
-        )? {
-            return Ok(selected);
+        let graph_replay = start_pos_device.is_some()
+            && matches!(
+                std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
+                Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+            );
+        let shared = match (dsa_shared, graph_replay) {
+            (Some(shared), _) => Some(shared),
+            // Decode-graph replay: csa_select_official would early-return
+            // before touching any scratch, so a missing shared handle (the
+            // graph capture closures don't carry the adapter) is legal.
+            (None, true) => None,
+            (None, false) => anyhow::bail!(
+                "DSv4 official DSA per-slot state present but shared scratch missing                  outside decode-graph replay"
+            ),
+        };
+        if let Some(shared) = shared {
+            if let Some(selected) = csa_select_official(
+                ctx,
+                config,
+                &q_i,
+                &weights,
+                keys,
+                official,
+                shared,
+                pool,
+                indexer_rows_before,
+                indexer_rows_after,
+                key_count,
+                start_pos,
+                start_pos_device,
+                layer_idx,
+                ratio,
+                local_index_heads,
+                score_scale,
+                keepalive,
+            )? {
+                return Ok(selected);
+            }
         }
     }
     {
@@ -5144,6 +5255,7 @@ fn csa_select_official(
     weights: &HiddenStates,
     keys: &HiddenStates,
     official: &mut Dsv4DsaOfficialState,
+    shared: &mut Dsv4DsaSharedScratch,
     pool: &mut Dsv4LayerKvLayout,
     indexer_rows_before: usize,
     indexer_rows_after: usize,
@@ -5165,35 +5277,43 @@ fn csa_select_official(
         return Ok(None);
     }
     ensure!(
-        local_index_heads == official.num_heads && config.index_head_dim == official.head_dim,
+        local_index_heads == shared.num_heads && config.index_head_dim == shared.head_dim,
         "DSv4 official DSA shape mismatch local_heads={} official_heads={} dim={} official_dim={}",
         local_index_heads,
-        official.num_heads,
+        shared.num_heads,
         config.index_head_dim,
-        official.head_dim
+        shared.head_dim
     );
     ensure!(
-        q_i.seq_len <= official.max_tokens,
+        q_i.seq_len <= shared.max_tokens,
         "DSv4 official DSA token_count {} exceeds scratch max {}",
         q_i.seq_len,
-        official.max_tokens
+        shared.max_tokens
     );
     ensure!(
-        key_count <= official.compressed_capacity
-            && indexer_rows_after <= official.compressed_capacity
+        key_count <= shared.compressed_capacity
+            && indexer_rows_after <= shared.compressed_capacity
             && indexer_rows_before <= indexer_rows_after,
         "DSv4 official DSA key rows before={} after={} key_count={} capacity={}",
         indexer_rows_before,
         indexer_rows_after,
         key_count,
-        official.compressed_capacity
+        shared.compressed_capacity
     );
     ensure!(
-        start_pos + q_i.seq_len <= official.max_tokens,
+        start_pos + q_i.seq_len <= shared.max_tokens,
         "DSv4 official DSA positions {}..{} exceed freqs_cis max {}",
         start_pos,
         start_pos + q_i.seq_len,
-        official.max_tokens
+        shared.max_tokens
+    );
+
+    ensure!(
+        official.rotated_keys.len() == shared.compressed_capacity * shared.head_dim,
+        "DSv4 official DSA rotated_keys len {} mismatches shared scratch capacity {}x{}",
+        official.rotated_keys.len(),
+        shared.compressed_capacity,
+        shared.head_dim
     );
 
     let newly_packed = indexer_rows_after.saturating_sub(official.packed_rows);
@@ -5224,7 +5344,7 @@ fn csa_select_official(
                 .result()?;
             }
         }
-        let locs = official
+        let locs = shared
             .cache_locs
             .slice(official.packed_rows..official.packed_rows + newly_packed);
         {
@@ -5271,12 +5391,12 @@ fn csa_select_official(
     // rather than write past it (e.g. the one-shot long-context `dsv4_parity` example,
     // which is not the chunked-prefill path).
     ensure!(
-        token_count <= official.query_chunk,
+        token_count <= shared.query_chunk,
         "DSv4 official DSA token_count {} exceeds prefill query chunk {} (raw_indices \
          scratch is chunk-sized; chunked prefill must keep seq_len <= \
          chunked_prefill_size <= DSV4_PREFILL_QUERY_CHUNK)",
         token_count,
-        official.query_chunk
+        shared.query_chunk
     );
     // Full-length host context_lens (cheap i32 vec); the DUMP block below reads the
     // global last row from it, and each tile slices its sub-range for H2D.
@@ -5299,16 +5419,16 @@ fn csa_select_official(
     // (tlen=token_count), behavior-IDENTICAL to the pre-tiling code.
     //
     // Mutated-buffer enumeration (per-tile correctness):
-    //   official.logits [tile × stride]: overwritten each sub-chunk before topk reads it — safe.
-    //   official.q_fp8/weights/context_lens/positions [tile-sized]: overwritten each
+    //   shared.logits [tile × stride]: overwritten each sub-chunk before topk reads it — safe.
+    //   shared.q_fp8/weights/context_lens/positions [tile-sized]: overwritten each
     //     sub-chunk before use — safe.
-    //   official.page_table_identity [tile × num_pages]: identity, read-only, same for
+    //   shared.page_table_identity [tile × num_pages]: identity, read-only, same for
     //     every sub-chunk — safe.
-    //   selected / official.raw_indices [full N × topk]: each sub-chunk writes its
+    //   selected / shared.raw_indices [full N × topk]: each sub-chunk writes its
     //     disjoint [t0..t0+tlen) slice — full output assembled, no overlap.
     //   key-packing buffers (rotated_keys, key cache, cache_locs, packed_rows):
     //     untouched by this change (handled in the query-independent block above).
-    let tile = official.query_tile;
+    let tile = shared.query_tile;
     // q_i.data / weights.data are flat [seq_len * per_token_width]; derive per-token
     // strides so each tile slices the right sub-range of the (untiled) inputs.
     let q_stride = q_i.data.len() / token_count;
@@ -5341,11 +5461,11 @@ fn csa_select_official(
             .map(|i| i32::try_from(start_pos + t0 + i))
             .collect::<Result<Vec<_>, _>>()?;
         {
-            let mut context_lens = official.context_lens.slice_mut(0..tlen);
+            let mut context_lens = shared.context_lens.slice_mut(0..tlen);
             ctx.stream
                 .memcpy_htod(&context_lens_tile, &mut context_lens)
                 .map_err(|e| anyhow!("DSv4 official DSA context_lens H2D failed: {e}"))?;
-            let mut positions = official.positions.slice_mut(0..tlen);
+            let mut positions = shared.positions.slice_mut(0..tlen);
             ctx.stream
                 .memcpy_htod(&positions_tile, &mut positions)
                 .map_err(|e| anyhow!("DSv4 official DSA positions H2D failed: {e}"))?;
@@ -5355,12 +5475,12 @@ fn csa_select_official(
         {
             let q_in = q_i.data.slice(t0 * q_stride..(t0 + tlen) * q_stride);
             let (q_ptr, _qg) = q_in.device_ptr(&ctx.stream);
-            let (q_fp8_ptr, _qfg) = official.q_fp8.device_ptr_mut(&ctx.stream);
+            let (q_fp8_ptr, _qfg) = shared.q_fp8.device_ptr_mut(&ctx.stream);
             let w_in = weights.data.slice(t0 * w_stride..(t0 + tlen) * w_stride);
             let (w_ptr, _wg) = w_in.device_ptr(&ctx.stream);
-            let (weights_out_ptr, _wog) = official.weights.device_ptr_mut(&ctx.stream);
-            let (freqs_ptr, _fg) = official.freqs_cis.device_ptr(&ctx.stream);
-            let positions = official.positions.slice(0..tlen);
+            let (weights_out_ptr, _wog) = shared.weights.device_ptr_mut(&ctx.stream);
+            let (freqs_ptr, _fg) = shared.freqs_cis.device_ptr(&ctx.stream);
+            let positions = shared.positions.slice(0..tlen);
             let (positions_ptr, _pg) = positions.device_ptr(&ctx.stream);
             unsafe {
                 ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
@@ -5382,18 +5502,18 @@ fn csa_select_official(
         // (d) paged MQA logits scheduling metadata for the tile.
         unsafe {
             cuda_moe::dsv4_deepgemm_paged_mqa_logits_metadata(
-                cache_ptr(&official.context_lens, ctx),
-                cache_ptr(&official.sched_meta, ctx),
+                cache_ptr(&shared.context_lens, ctx),
+                cache_ptr(&shared.sched_meta, ctx),
                 tlen,
                 1,
                 64,
-                official.num_sms,
+                shared.num_sms,
                 ctx.stream.cu_stream(),
             )
             .map_err(|e| anyhow!("DSv4 official DSA metadata failed: {e}"))?;
         }
 
-        // (e) fused paged FP8 MQA logits → official.logits (tlen rows).
+        // (e) fused paged FP8 MQA logits → shared.logits (tlen rows).
         {
             let cache_range = pool.dsa_slot_range(official.slot_idx)?;
             let cache_pool = pool
@@ -5408,13 +5528,13 @@ fn csa_select_official(
                 official.key_cache_len
             );
             let cache_view = cache_pool.slice(cache_range);
-            let (q_ptr, _qg) = official.q_fp8.device_ptr(&ctx.stream);
+            let (q_ptr, _qg) = shared.q_fp8.device_ptr(&ctx.stream);
             let (cache_ptr_u8, _kg) = cache_view.device_ptr(&ctx.stream);
-            let (weights_ptr, _wg) = official.weights.device_ptr(&ctx.stream);
-            let (lens_ptr, _lg) = official.context_lens.device_ptr(&ctx.stream);
-            let (page_ptr, _pg) = official.page_table_identity.device_ptr(&ctx.stream);
-            let (sched_ptr, _sg) = official.sched_meta.device_ptr(&ctx.stream);
-            let (logits_ptr, _og) = official.logits.device_ptr_mut(&ctx.stream);
+            let (weights_ptr, _wg) = shared.weights.device_ptr(&ctx.stream);
+            let (lens_ptr, _lg) = shared.context_lens.device_ptr(&ctx.stream);
+            let (page_ptr, _pg) = shared.page_table_identity.device_ptr(&ctx.stream);
+            let (sched_ptr, _sg) = shared.sched_meta.device_ptr(&ctx.stream);
+            let (logits_ptr, _og) = shared.logits.device_ptr_mut(&ctx.stream);
             unsafe {
                 ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
                     q_ptr as *const u8,
@@ -5428,13 +5548,13 @@ fn csa_select_official(
                     1,
                     i32::try_from(local_index_heads)?,
                     i32::try_from(config.index_head_dim)?,
-                    i32::try_from(official.num_pages)?,
+                    i32::try_from(shared.num_pages)?,
                     64,
-                    i32::try_from(official.num_pages * 64)?,
-                    i32::try_from(official.logits_stride)?,
-                    i32::try_from(official.num_pages)?,
+                    i32::try_from(shared.num_pages * 64)?,
+                    i32::try_from(shared.logits_stride)?,
+                    i32::try_from(shared.num_pages)?,
                     i32::try_from(64 * (config.index_head_dim + std::mem::size_of::<f32>()))?,
-                    i32::try_from(official.num_sms)?,
+                    i32::try_from(shared.num_sms)?,
                     ctx.stream.cu_stream(),
                 )
                 .result()
@@ -5442,17 +5562,17 @@ fn csa_select_official(
             }
         }
 
-        // (f) topk transform: read official.logits (base), write the tile's disjoint
-        //     output slices of `selected` and `official.raw_indices`.
+        // (f) topk transform: read shared.logits (base), write the tile's disjoint
+        //     output slices of `selected` and `shared.raw_indices`.
         {
-            let context_lens = official.context_lens.slice(0..tlen);
-            let (logits_ptr, _lg) = official.logits.device_ptr(&ctx.stream);
+            let context_lens = shared.context_lens.slice(0..tlen);
+            let (logits_ptr, _lg) = shared.logits.device_ptr(&ctx.stream);
             let (lens_ptr, _csg) = context_lens.device_ptr(&ctx.stream);
-            let (page_ptr, _ptg) = official.page_table_identity.device_ptr(&ctx.stream);
+            let (page_ptr, _ptg) = shared.page_table_identity.device_ptr(&ctx.stream);
             let mut sel =
                 selected.slice_mut(t0 * config.index_topk..(t0 + tlen) * config.index_topk);
             let (sel_ptr, _seg) = sel.device_ptr_mut(&ctx.stream);
-            let mut raw = official
+            let mut raw = shared
                 .raw_indices
                 .slice_mut(t0 * config.index_topk..(t0 + tlen) * config.index_topk);
             let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
@@ -5463,8 +5583,8 @@ fn csa_select_official(
                     page_ptr as *const i32,
                     sel_ptr as *mut i32,
                     raw_ptr as *mut i32,
-                    i64::try_from(official.logits_stride)?,
-                    i64::try_from(official.num_pages)?,
+                    i64::try_from(shared.logits_stride)?,
+                    i64::try_from(shared.num_pages)?,
                     i64::try_from(config.index_topk)?,
                     i32::try_from(tlen)?,
                     i32::try_from(config.index_topk)?,
@@ -5477,19 +5597,17 @@ fn csa_select_official(
 
         t0 += tlen;
     }
-    keepalive.keep_u8(&official.q_fp8);
-    keepalive.keep_f32(&official.weights);
+    keepalive.keep_u8(&shared.q_fp8);
+    keepalive.keep_f32(&shared.weights);
     if std::env::var("ARLE_DSV4_CSA_DUMP").as_deref() == Ok("1")
         && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
     {
         let row_idx = q_i.seq_len.saturating_sub(1);
         let available = context_lens_h.get(row_idx).copied().unwrap_or_default();
         let selected_host = ctx.stream.clone_dtoh(&selected);
-        let raw_host = ctx.stream.clone_dtoh(
-            &official
-                .raw_indices
-                .slice(0..q_i.seq_len * config.index_topk),
-        );
+        let raw_host = ctx
+            .stream
+            .clone_dtoh(&shared.raw_indices.slice(0..q_i.seq_len * config.index_topk));
         match (selected_host, raw_host) {
             (Ok(selected_host), Ok(raw_host)) => {
                 let invalid_selected = selected_host
