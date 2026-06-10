@@ -1,6 +1,14 @@
 # DSv4 decode 链上小消息集合通信 — one-shot AR/AG isolated bench(copy-first)
 
-> Status: **T1 DONE — LICENSED** (`3aaa19b9`; results:
+> Status: **CLOSED — T2 ran, wall-neutral, default back to NCCL** (the 9th
+> wall-neutral decode lever; complete causal account in
+> [`errors/2026-06-10-dsv4-oneshot-comm-wall-neutral-skew-bound.md`](../experience/errors/2026-06-10-dsv4-oneshot-comm-wall-neutral-skew-bound.md):
+> per-op 2-4× real and path-verified on-chain, but the decode wall is
+> rank-SKEW-bound, not protocol-bound). One-shot stack stays as opt-in
+> `--comm-backend auto` — foundation for multi-node EP and T3 fused AR+norm.
+> Verdict: B=1 decode's remaining lever is MTP.
+>
+> T1 record: **LICENSED** (`3aaa19b9`; results:
 > [`wins/2026-06-10-dsv4-comm-bench-oneshot-licensed.md`](../experience/wins/2026-06-10-dsv4-comm-bench-oneshot-licensed.md)).
 > Verdict: car_1stage 3.05× @14KB / nccl_sym 2.17× @448KB vs NCCL, all arms
 > cross-rank byte-identical. T2 = TpComm integration, car_1stage ≤128KB +
