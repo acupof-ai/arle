@@ -177,11 +177,15 @@ pub(crate) fn bind_relay_and_spawn_workers(
         }
         log::info!("[multiproc-coord] minted NCCL unique id (published via INFER_NCCL_UNIQUE_ID)");
     }
-    #[cfg(not(feature = "nccl"))]
-    anyhow::bail!(
-        "DSv4 multi-rank serve (world_size={world_size}) requires the `nccl` feature; \
-         rebuild with --features cuda,nccl"
-    );
+    // cfg!() (not #[cfg]) so the relay/spawn code below stays reachable in
+    // non-nccl builds — an attribute-cfg bail makes the rest of the function
+    // unreachable and trips -D warnings on the cuda,no-cuda typecheck lane.
+    if !cfg!(feature = "nccl") {
+        anyhow::bail!(
+            "DSv4 multi-rank serve (world_size={world_size}) requires the `nccl` feature; \
+             rebuild with --features cuda,nccl"
+        );
+    }
 
     // 1. Bind relay BEFORE spawning workers so the port can be exported via env.
     let pending = RelayCoordinator::bind().context("multiproc relay bind")?;
