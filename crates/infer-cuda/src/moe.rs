@@ -2664,6 +2664,7 @@ mod dsv4_gpu {
         scratch: &mut crate::deepep::DeepEpLlScratch,
         layer: &Dsv4MoeLayer,
         tokens: &[u32],
+        global_tokens: usize,
         hidden: &HiddenStates,
         out: &mut HiddenStates,
         keepalive: &mut Dsv4ForwardKeepalive,
@@ -2793,7 +2794,11 @@ mod dsv4_gpu {
                 stream,
             )?;
             // ── Step 5: masked SwiGLU(clamp) + per-128-block FP8 requant →
-            //    [E_local, m, intermediate] FP8 + column-major scales.
+            //    [E_local, m, intermediate] FP8 + column-major scales. The grid
+            //    covers only `expected_m = min(global_tokens, m)` rows per
+            //    expert (per-expert recv count ≤ the step's global token count;
+            //    a full-band grid measured 631 µs/layer of empty-block drain at
+            //    B=1 — 52.9% of deepep_ll GPU time).
             moe::dsv4_deepgemm_silu_mul_masked_quant(
                 p_w13_out,
                 p_act_fp8,
@@ -2801,6 +2806,7 @@ mod dsv4_gpu {
                 p_masked,
                 num_local_experts,
                 m,
+                global_tokens.max(1).min(m),
                 2 * intermediate,
                 swiglu_limit,
                 stream,
