@@ -24,6 +24,9 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      # Same key prefix as metal-ci.yml so tag builds restore the warm cache
+      # written by main-branch Metal CI runs (tag refs can read default-branch
+      # caches; the old macos-arm64-cargo prefix had no writer left).
       - name: Cache cargo registry
         uses: actions/cache@v5
         with:
@@ -31,8 +34,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: macos-arm64-cargo-
+          key: ${{ runner.os }}-metal-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-metal-
 
       # `metal_serve` was an `infer`-crate bin removed in the rewrite; serving is
       # now `arle serve`. The ARLE CLI build below is the Metal release artifact.
