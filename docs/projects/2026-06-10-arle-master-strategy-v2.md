@@ -2,7 +2,8 @@
 
 > **本文 supersede [`2026-05-07-arle-master-strategy.md`](2026-05-07-arle-master-strategy.md)(v1)的全部战略结论。**
 > 任何与本文冲突的旧 doc 以本文为准。v1 保留作历史推理记录,header 已打 SUPERSEDED 横幅。
-> 进展跟踪:GitHub umbrella issue(见 §3 各 Phase 的 issue 链接;落地后回填)。
+> 进展跟踪:[umbrella #55](https://github.com/cklxx/arle/issues/55) ——
+> Phase 0 = #56–#59,Phase 1 = #60–#61,Phase 2 = #62,Phase 3 = #63–#65。
 >
 > 写作纪律:结论先行 + evidence 引用;hypothesis 显式标注(§6);不复述 per-date
 > wins/errors 的细节,只 link。
