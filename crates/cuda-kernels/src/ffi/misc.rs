@@ -51,6 +51,37 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    pub fn dsv4_mhc_params_bench_cuda(
+        residual: *const super::Half,
+        mixes: *const super::Half,
+        base: *const super::Half,
+        scale: *const super::Half,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        num_tokens: i32,
+        residual_hidden_dim: i32,
+        mix_dim: i32,
+        hc_mult: i32,
+        eps: f32,
+        sinkhorn_iters: i32,
+        block_dim: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    pub fn dsv4_mhc_pre_rms_norm_bench_cuda(
+        residual: *const super::Half,
+        pre: *const f32,
+        weight: *const super::Half,
+        out: *mut super::Half,
+        num_tokens: i32,
+        hidden_size: i32,
+        hc_mult: i32,
+        eps: f32,
+        block_dim: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_mhc_post_cuda(
         new_x: *const super::Half,
         residual: *const super::Half,
