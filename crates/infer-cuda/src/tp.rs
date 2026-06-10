@@ -788,11 +788,14 @@ mod oneshot {
         Ok(())
     }
 
-    /// 1-byte all-ranks ok-vote. Returns whether EVERY rank reported ok —
-    /// the same verdict on every rank, so degrade decisions stay collective.
+    /// All-ranks ok-vote (4-byte payload — `all_gather_bytes` stages through
+    /// an i32 device buffer and requires 4-byte alignment). Returns whether
+    /// EVERY rank reported ok — the same verdict on every rank, so degrade
+    /// decisions stay collective.
     fn vote(ctx: &DeviceContext, backend: &NcclBackend, ok: bool) -> Result<bool> {
-        let gathered = backend.all_gather_bytes(ctx, &[u8::from(ok)], 1)?;
-        Ok(gathered.iter().all(|&b| b == 1))
+        let payload = [u8::from(ok), 0, 0, 0];
+        let gathered = backend.all_gather_bytes(ctx, &payload, 4)?;
+        Ok(gathered.chunks(4).all(|c| c[0] == 1))
     }
 
     impl OneShotComm {
