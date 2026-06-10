@@ -6,7 +6,7 @@ It states what the repository currently supports, what is still limited, and
 what validation exists for each area. If something is not listed as supported
 here, do not assume it is supported just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-06-04.
+State reflected here is based on repository evidence as of 2026-06-10.
 **The device-neutral rewrite (`crates/infer-*`) IS the product** — PR #53 merged
 to `main` 2026-06-04, and the legacy monolithic `infer/` crate is **deleted**.
 Sections 1–7 below were written against the legacy runtime; those capabilities
@@ -32,7 +32,7 @@ a dated `wins/` entry says so. Project framing:
 | Backend | New-stack status | What is verified | Open |
 | --- | --- | --- | --- |
 | Metal (`infer-metal`) | **Verified** | Real MLX Qwen3.5/3.6 forward, **bit-identical greedy parity** vs legacy across 4 configs (Qwen3.5-0.8B single-token / full 16-tok / chunked prefill, and canonical Qwen3.6-35B-A3B-4bit MoE). Cross-step decode pipeline recovered the perf regression. | c≥2 multi-slot Metal decode (single-row guard); FP8/4-bit Metal MoE quant swap points. |
-| CUDA (`infer-cuda`) | **Verified (prefill) — decode in progress** | Qwen3 dense **16/16** vs HF gold; DSv4-Flash **TP=8/EP=8** (MLA+CSA/HCA+HC+hash+FP8 DeepGEMM MoE) **prefill** matches the bf16 oracle on 8×H20; **DeepGEMM** 16/16; **DeepEP** transport verified; CUDA-graph capture/replay parity. | DSv4 **incremental decode (`start_pos>0`) is broken** (#23); decode-perf + the SGLang-class roadmap (#24/#25) gate on it. |
+| CUDA (`infer-cuda`) | **Verified (serve: prefill + decode)** | Qwen3 dense **16/16** vs HF gold; DSv4-Flash **TP=8/EP=8** (MLA+CSA/HCA+FP8 DeepGEMM MoE, FlashMLA, DeepEP) serves in-process multi-rank (`63d814a4`); per-layer RoPE theta fix (`fa355315`) → needle exact at 32K; decode ~39 tok/s c=1. | Long-ctx ≥241 trailing-digit residual (#56); 256K admission band-aid (#57); KV-precision-parity gate re-port (#58); batched lane license (#60/#61); spec-decode default (#62). |
 
 **New-stack model coverage:** Qwen3.5 / Qwen3.6 on Metal (verified); Qwen3 dense +
 DeepSeek-V4-Flash (TP=8/EP=8) on CUDA (prefill verified, decode in progress);
@@ -56,7 +56,7 @@ in §1–§7 below predates the rewrite; verify against §0 + dated `wins/` entr
 | --- | --- | --- |
 | CUDA | Supported | Primary serving path. Main runtime, scheduler, and benchmark focus. |
 | Metal | Beta | Usable for local validation and live scheduler-backed serving. Qwen3.5 ships live prefix reuse via replayed compiled-path snapshots; `arle serve --backend metal` is the canonical Apple bring-up path (in-process serve). Qwen3.5-0.8B MLX 4bit single-request step-driver is measured at 305.5 tok/s on M4 Pro 20c for `1024/256`. The matched GGUF Q4_K_M exact default is 202.1 tok/s direct; the opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s step-driver and remains a separate exact packed-K-quant kernel/format gap. Metal is still missing full batched-decode parity with CUDA, especially on variable-length Qwen3.5 decode. |
-| Metal DFlash | Beta | Apple Silicon speculative decode path. Default-on for Qwen3.5; benchmark before production use. |
+| Metal DFlash | **Substrate only (serving not re-ported)** | The DFlash draft-model FFI lives in `crates/mlx-sys` and hub discovery rejects draft-only checkpoints, but the rewrite Metal serve has **no DFlash route** — its speculative path is MTP (`arle serve --spec-type mtp` / `--mtp-draft-model`). The monolith-era default-on DFlash serving died with the rewrite. |
 | no-cuda / CPU-only | Development-oriented CPU backend | Build, test, and smoke-validation path for non-GPU logic. Not a production inference target. |
 
 ---
@@ -101,8 +101,8 @@ Notes:
 | Model family | Status | Notes |
 | --- | --- | --- |
 | Qwen3.5 | Supported | Primary supported family. Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B has two measured Metal single-request paths: MLX SafeTensors 4bit step-driver reaches 305.5 tok/s for `1024/256`, while GGUF Q4_K_M exact default is 202.1 tok/s direct and its opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s step-driver on the same `1024/256` profile. RoPE scaling (YARN / Linear / NtkAware) wired through `Qwen35Config::rope_scaling` for long-ctx extend (Phase 1+2 closed; Phase 3 bench pending). Metal DFlash is Beta; see §4a for the current validation note. |
-| Qwen3.6 / Qwen3.5-MoE | Beta (Metal), CUDA stub | Metal loads and runs `mlx-community/Qwen3.6-35B-A3B-4bit` locally. A 2026-04-27 M4 Pro short diagnostic confirmed load/execute behavior, but DFlash performance decisions for this family should use long-context / ultra-long-sequence workloads only. CUDA intentionally returns a GPU-required stub for Qwen3.6 MoE. Full Qwen 3.6 serving coverage is the **#2 next-model priority** — see roadmap note below. |
-| DeepSeek V4 | In progress — V4-only substrate + CPU reference smoke | `crates/deepseek-spec` is V4-only for the local `models/dsv4-mini-1B-init` checkpoint. The CPU serving path (`arle serve --backend cpu`) has a slow Rust reference path that mmaps the 2.0 GB safetensors and runs a 1-token HTTP completion smoke. CUDA optimized V4 attention/MoE/MTP kernels remain pending, so this is not a serving-performance target yet. The `arle train pretrain-dsv4` command was retired in the 2026-05-18 OPD-only pivot; DSv4 scratch pretrain is not a supported ARLE workflow. **#1 next-model priority for inference.** |
+| Qwen3.6 / Qwen3.5-MoE | Supported (Metal canonical), CUDA pending (#65) | `mlx-community/Qwen3.6-35B-A3B-4bit` is the **canonical Metal production model** (globally unified 2026-05-07) — every Metal serve/bench/test defaults to it. CUDA classifies Qwen3 MoE checkpoints (`infer-api` `classify_cuda_model`), but Qwen3.6 CUDA serving needs the second `ModelKvAdapter` (#65, Phase 3). |
+| DeepSeek V4 | Serving (CUDA 8×H20 TP=8/EP=8) | DSv4-Flash serves via `arle serve --backend cuda` in-process multi-rank: FlashMLA + DSA/CSA/HCA hybrid attention, FP8 KV, DeepGEMM FP8 MoE, DeepEP/allreduce transports. Needle-exact to 32K after the per-layer RoPE theta fix (`fa355315`); decode ~39 tok/s c=1. Open debt tracked in #55 (Phase 0: #56–#58; batched lane #60/#61; MTP default #62). `crates/deepseek-spec` remains V4-only; DSv4 scratch pretrain stays retired (2026-05-18 OPD-only pivot). |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Not carried | Deleted from the current registry/spec/train surface; reintroduction would require a new explicit project, not a compatibility branch inside DSv4. |
 | Mistral / Mixtral / Gemma / Phi | Planned | Not yet supported. |
@@ -182,12 +182,12 @@ Code lives in `crates/infer-core/src/{prefix,radix}.rs` (radix tree) and the
 | `/v1/models` | Stable | Loaded-model discovery endpoint. |
 | `/v1/responses` | Beta | Non-streaming and SSE forms shipped. Streaming emits `response.created`, `response.output_text.delta`, and terminal `response.completed`; structured outputs are still missing. |
 | SSE streaming | Stable at high level | Intended to remain OpenAI-style; edge behavior may improve. |
-| `/metrics` | Stable | Prometheus endpoint; Metal now reports live queue / latency / MLX memory gauges. |
-| `/v1/stats` | Stable | Human-readable stats endpoint; Metal now reports live queue / latency / MLX memory gauges. |
+| `/metrics` | **Not re-ported (rewrite gap)** | Route does not exist in `infer-server` (`http.rs` serves only `/v1/completions`, `/v1/chat/completions`, `/v1/models`). The monolith's Prometheus endpoint died with the rewrite; re-port pending. |
+| `/v1/stats` | **Not re-ported (rewrite gap)** | Same — see [`bench-and-trace-spec.md`](bench-and-trace-spec.md) §3.1 note; bench reports record these counters as `n/a (rewrite gap)`. |
 | Train-side `/v1/train/status|events|stop|save` | Substrate landed; OPD-CLI wiring pending | Control-plane truth lives in `crates/train/src/server.rs` and survives the 2026-05-18 OPD-only pivot. The per-binary `pretrain --serve` / `train_sft --serve` / `train_grpo --serve` / `train_multi_turn --serve` wiring was retired alongside those binaries. OPD CLI (`arle train opd <dir>`) shipped 2026-05-24 (`14c3be9`) as a one-shot runner without `--serve`; reusing the control plane via `arle train opd --serve` is a separate task not yet licensed. The CUDA serving path can still expose the surface as an optional proxy via `--train-control-url`. |
-| Metal runtime memory knobs | Beta | The Metal serving path (`arle serve --backend metal`) exposes `--memory-limit-bytes`, `--cache-limit-bytes`, and `--wired-limit-bytes` for MLX allocator control. |
+| Metal runtime memory knobs | Auto (no flags) | The rewrite Metal executor auto-pins model weights via `mlx::set_wired_limit` (model size + 1 GiB headroom, `infer-metal/src/wired_limit.rs`) at construction. The old `--memory-limit-bytes` / `--cache-limit-bytes` / `--wired-limit-bytes` flags died with the monolith; no CLI override currently exists. |
 | CLI agent slash commands | Beta | Usable and documented, but not yet treated like the HTTP API for compatibility. |
-| `arle serve` front door | Beta | Launches the matching serving binary (`infer`, `metal_serve`, or `cpu_serve`) from the release artifact or PATH. This is a packaging/DX front door over existing server binaries, not a second HTTP implementation. |
+| `arle serve` front door | Stable | **In-process** serving (`crates/cli/src/serve.rs`): the single `arle` binary loads the model and serves OpenAI v1 directly — no standalone backend binaries are spawned or searched. `--bind` is honored by every backend. |
 | CLI built-in shell/python tools | Beta | Enabled by default for local trusted agent use. `--no-tools` disables them, and `arle --doctor` reports the detected sandbox backend (`nsjail`, `sandbox-exec`, or `bare`). Do not expose tool-enabled local agent prompts to untrusted users. |
 | Structured-output grammar (xgrammar FFI) | Scaffold (Phase 1) | `crates/xgrammar-sys` Rust safe wrapper over upstream `mlc-ai/xgrammar` v0.1.34 (codex's #26 WIP, FFI substrate landed; default build = stub, `--features real` builds C++ shim via `cc` + pinned upstream checkout). No HTTP, scheduler, sampler, or GPU sampling integration yet. Tracked under [`docs/plans/M_xgrammar-ffi-scaffold.md`](plans/M_xgrammar-ffi-scaffold.md). |
 

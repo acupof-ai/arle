@@ -129,8 +129,8 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
                         Some(path) => path,
                         None => {
                             eprintln!(
-                                "No model selected. Pass --model-path or try \
-                                 ./scripts/run_dflash.sh serve."
+                                "No model selected. Pass --model-path <dir-or-hf-id> \
+                                 or rerun to use the model picker."
                             );
                             return Err(err);
                         }
