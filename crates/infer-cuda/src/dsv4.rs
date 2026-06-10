@@ -2765,7 +2765,6 @@ impl Dsv4Model {
                         ffn_normed,
                         moe_out,
                         moe_scratch,
-                        &mut keepalive,
                     )?;
                     crate::moe::dsv4_shared_expert_forward(
                         &self.ctx,
