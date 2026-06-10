@@ -1047,16 +1047,13 @@ impl Dsv4Model {
         mut last_hidden_out: Option<&mut DeviceVec>,
     ) -> Result<u32> {
         let seq_len = tokens.len();
-        let use_gpu_router = std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some();
         let use_deepep_transport = dsv4_use_deepep_transport()?;
-        // FlashMLA-decode captures cleanly (proven per-portion 2026-06-08,
-        // byte-identical) — the old !flashmla conjunct predated that evidence.
-        // The graph body still runs the pooled MoE (device-side routing is the
-        // capturable form), hence the gpu_router requirement.
+        // FlashMLA-decode captures cleanly (capture-safety fixes e95e11b6).
+        // The graph routes on-device into fixed scratch and runs the masked
+        // MoE tail — no gpu_router/pooled dependency.
         if dsv4_decode_graph_enabled()
             && last_hidden_out.is_none()
             && seq_len == 1
-            && use_gpu_router
             && !use_deepep_transport
         {
             return self.forward_tokens_decode_graph(
@@ -2768,6 +2765,7 @@ impl Dsv4Model {
                         ffn_normed,
                         moe_out,
                         moe_scratch,
+                        &mut keepalive,
                     )?;
                     crate::moe::dsv4_shared_expert_forward(
                         &self.ctx,
