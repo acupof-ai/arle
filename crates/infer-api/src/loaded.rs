@@ -403,17 +403,22 @@ mod backend {
     /// estimate, infer-core `prefix.rs`), so the host `CudaKvPool` must cover the
     /// backend's actual KV capacity or a long prompt is falsely rejected → it sits
     /// in `waiting` → `is_idle()` is never true → the engine spins `while !is_idle()`
-    /// (100% CPU, GPU 0%). Per backend:
-    ///   - Qwen3-Dense / Qwen3.5-3.6-MoE: `total_pages` IS (or bounds) the real GPU
-    ///     KV budget the executor allocates — keep the configured value.
-    ///   - DSv4: recurrent KV (SW ring + compressed) lives in the executor as one
-    ///     pre-sized arena PER SLOT (each covering max context), so the true
-    ///     capacity is `num_slots × per-slot tokens` — sizing for a single
+    /// (100% CPU, GPU 0%). Three regimes:
+    ///   - Qwen3-Dense: SHARED paged pool — the executor allocates one device pool
+    ///     of `total_pages` and host page ids mirror it 1:1, so admission MUST be
+    ///     exactly `config.total_pages` (host total == device total is load-bearing:
+    ///     the device pool consumes host page ids directly).
+    ///   - Qwen3.5/3.6-MoE: SLOT ARENA — `Qwen35SlotState::new` eagerly allocates a
+    ///     contiguous full-attn K/V cache of `total_pages × page_size` tokens per
+    ///     layer PER SLOT at load (true VRAM = num_slots ×), so admission is
+    ///     `num_slots × per-slot tokens` — the page gate never binds before the
+    ///     slot gate.
+    ///   - DSv4: SLOT ARENA (SW ring + compressed, each slot covers max context)
+    ///     with its own dynamic mem-budget slot clamp; admission is
+    ///     `num_slots × per-slot tokens`. Sizing a slot-arena model for a single
     ///     max-context request under-admits at c>1 (a second long request waits
-    ///     for fictional pages while a real slot arena sits free). With the
-    ///     per-slot sizing the page gate can never bind before the slot gate,
-    ///     which is the truthful encoding for slot-arena models. `CudaKvPool::new`
-    ///     allocates NO HBM (just a `Vec<u32>` of page ids).
+    ///     for fictional pages while a real slot arena sits free).
+    /// `CudaKvPool::new` allocates NO HBM (just a `Vec<u32>` of page ids).
     ///
     /// `num_slots` must be the EFFECTIVE slot count (post KV-budget clamp), not
     /// the requested one.
@@ -426,9 +431,11 @@ mod backend {
     ) -> usize {
         let ps = page_size.max(1);
         let capacity_tokens = match kind {
-            CudaModelKind::Qwen3Dense | CudaModelKind::Qwen3Moe => {
-                config.total_pages.saturating_mul(ps)
-            }
+            CudaModelKind::Qwen3Dense => config.total_pages.saturating_mul(ps),
+            CudaModelKind::Qwen3Moe => config
+                .total_pages
+                .saturating_mul(ps)
+                .saturating_mul(num_slots.max(1)),
             CudaModelKind::Dsv4 => infer_cuda::dsv4_max_seq_len()
                 .saturating_add(4096)
                 .saturating_mul(num_slots.max(1)),
@@ -516,17 +523,23 @@ mod backend {
         }
         let num_slots = config.num_slots;
         let page_size = config.page_size;
-        // Qwen executors size their device pool from total_pages, so compute the
-        // requested-slot capacity first; the DSv4 arm re-derives below from the
-        // executor's EFFECTIVE slot count (post KV-budget clamp).
-        let total_pages = cuda_admission_total_pages(kind, config, page_size, num_slots);
+        // Executors receive the CONFIGURED `total_pages` (Dense: shared device
+        // pool size; Qwen3.5/3.6: per-slot token budget / page_size). The host
+        // admission pool capacity is derived separately below — after the
+        // executor reports its EFFECTIVE slot count (post KV-budget clamp).
         let executor = match kind {
-            CudaModelKind::Qwen3Dense => {
-                CudaExecutor::from_qwen3_bf16_safetensors(model_path, num_slots, total_pages)?
-            }
-            CudaModelKind::Qwen3Moe => {
-                CudaExecutor::from_qwen35_moe_safetensors(model_path, num_slots, total_pages)?
-            }
+            CudaModelKind::Qwen3Dense => CudaExecutor::from_qwen3_bf16_safetensors(
+                model_path,
+                num_slots,
+                config.total_pages,
+            )?,
+            // NOTE: Qwen3Moe has no DSv4-style `kv_budget_num_slots` mem clamp yet
+            // (load OOM risk if total_pages × num_slots exceeds free HBM) — deferred.
+            CudaModelKind::Qwen3Moe => CudaExecutor::from_qwen35_moe_safetensors(
+                model_path,
+                num_slots,
+                config.total_pages,
+            )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP
             // rank/world-size + EP expert split + NCCL communicator from the
             // environment during construction (`INFER_TP_RANK` /
