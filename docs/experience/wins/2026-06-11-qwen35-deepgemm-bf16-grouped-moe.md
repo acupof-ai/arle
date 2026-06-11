@@ -70,3 +70,19 @@ by this entry. The default is byte-identical: `ARLE_QWEN35_DEEPGEMM` is OFF.
 ## Learnings
 
 - Filled after the pod run.
+
+
+## Pod verdicts (2026-06-11, appended)
+
+- Round 1 (pre-hybrid, `b1d77285` build): masked-at-decode REGRESSED −8.0%
+  (37.5 vs 40.8 tok/s) while contiguous prefill won — drove the hybrid
+  dispatch (`878c5ff2`, R≥1024) + the grouped-mode down-probe fix
+  (`d24987f0`, dg_on boot panic at moe.rs:728).
+- Round 2 (hybrid, warm `~/.deep_gemm`): decode 40.86 vs hand 40.46
+  (neutral, n=3); **needle 3k wall 9.10 → 2.32 s (−74.5%)**; smoke ×3
+  consistent + needle PASS both arms. Round-1's 6.10 s needle carried
+  ~3.7 s of first-run JIT compiles — warm-cache is the steady state
+  (skill anti-pattern #15: cold/warm both reported).
+- Default flipped ON with a load-time preflight guard: stub builds
+  (no ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1) degrade to hand kernels with a
+  warn instead of erroring at the first MoE forward.

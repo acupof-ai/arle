@@ -786,7 +786,22 @@ impl SafetensorLoader {
         // both would double the routed-expert VRAM (~2x model weights on
         // Qwen3.6-35B). The hand kernels keep working through the rebuilt
         // tables (same [n, k] row-major slabs, new addresses).
-        let (gate_grouped, up_grouped, down_grouped) = if crate::moe::qwen35_deepgemm_enabled() {
+        // Default-ON safety: a build-time stub bridge (no
+        // ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1) must degrade to the hand-kernel
+        // path instead of erroring at the first MoE forward — probe once here
+        // and skip the grouped caches so `use_deepgemm` self-disables.
+        let deepgemm_ready = crate::moe::qwen35_deepgemm_enabled()
+            && match cuda_kernels::moe::dsv4_deepgemm_native_preflight() {
+                Ok(_) => true,
+                Err(err) => {
+                    log::warn!(
+                        "Qwen3.5 DeepGEMM MoE disabled: native bridge unavailable ({err}); \
+                         falling back to the hand grouped kernels"
+                    );
+                    false
+                }
+            };
+        let (gate_grouped, up_grouped, down_grouped) = if deepgemm_ready {
             let gate_g = MoeExpertGroup::concat(ctx, &gate)?;
             let up_g = MoeExpertGroup::concat(ctx, &up)?;
             let down_g = MoeExpertGroup::concat(ctx, &down)?;
