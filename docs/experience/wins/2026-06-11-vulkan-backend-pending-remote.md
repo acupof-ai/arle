@@ -14,6 +14,9 @@ against the CUDA implementation.
 P3 adds the DSv4 fallback-forward contract: non-FlashMLA operator order,
 per-layer RoPE theta switch, `enable_prefix_cache=false`, and the exact
 mutated slot-buffer enumeration.
+P4 adds the Qwen3.5 hybrid contract: 3:1 linear/full attention structure,
+gated-delta recurrent state, conv4 ring state, hd256 full attention, and MLP
+order.
 
 The backend is not reachable from `arle serve` yet. CLI and model wiring are
 scheduled for P7, so there is no production hot path or benchmarkable endpoint
@@ -67,6 +70,10 @@ P3 numeric DSv4 execution is blocked independently: CSA/compressor/hybrid
 attention have no vendored standalone Vulkan GLSL equivalent. They need either
 new `.comp` ports from `dsv4_attention.cu` semantics or a measured composition
 from primitives before DSv4 can run on Vulkan.
+
+P4 numeric Qwen3.5 execution is blocked independently: conv4 and recurrent
+gated-delta kernels do not exist in the vendored Vulkan corpus and need Vulkan
+ports before hybrid layers can execute.
 
 ## Learnings
 
