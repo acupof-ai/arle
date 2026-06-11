@@ -252,6 +252,7 @@ pub(crate) struct Dsv4SlotState {
     attention: Vec<crate::attention::Dsv4LayerAttentionState>,
     spec_rollback: Option<Vec<crate::attention::Dsv4LayerAttentionSnapshot>>,
     moe_decode_scratch: Vec<crate::moe::Dsv4MoeDecodeScratch>,
+    shared_decode_out: Vec<HiddenStates>,
     start_pos_device: CudaSlice<i32>,
     decode_graph: Option<Dsv4DecodeGraphScratch>,
     /// Pre-allocated NVSHMEM low-latency MoE scratch, reused across all layers +
@@ -516,6 +517,7 @@ impl Dsv4SlotState {
         ensure!(max_seq_len > 0, "DSv4 slot max_seq_len must be positive");
         let mut attention = Vec::with_capacity(model.layers.len());
         let mut moe_decode_scratch = Vec::with_capacity(model.layers.len());
+        let mut shared_decode_out = Vec::with_capacity(model.layers.len());
         for (layer_idx, layer) in model.layers.iter().enumerate() {
             let local_width = layer.attention.wq_b.rows;
             ensure!(
@@ -542,6 +544,8 @@ impl Dsv4SlotState {
                 &model.split,
                 &layer.moe,
             )?);
+            shared_decode_out
+                .push(unsafe { HiddenStates::uninit(&model.ctx, model.config.hidden_size, 1)? });
         }
         let spec_rollback = if model.spec_decode_on {
             let mut snapshots = Vec::with_capacity(attention.len());
@@ -580,6 +584,7 @@ impl Dsv4SlotState {
             attention,
             spec_rollback,
             moe_decode_scratch,
+            shared_decode_out,
             start_pos_device,
             decode_graph: None,
             #[cfg(feature = "deepep")]
@@ -679,6 +684,9 @@ impl Dsv4SlotState {
     ///   sentinel-memset or fully overwritten before read; the per-buffer init
     ///   table lives on `moe.rs`'s `Dsv4MoeDecodeScratch` (counts/cursors
     ///   zeroed every call, GEMM staging written within offsets/counts).
+    /// - `shared_decode_out`: SCRATCH — B=1 shared-expert output, fully
+    ///   overwritten before every read; layers execute sequentially, and the
+    ///   comm-overlap path fences before `add_batch` consumes it.
     /// - `start_pos_device`: SCRATCH — every decode-step entry (eager
     ///   `forward_tokens`, graph step, and batched decode) H2Ds the plan's
     ///   `start_pos` into it before any read; prefill passes `None`.
@@ -2285,20 +2293,16 @@ impl Dsv4Model {
             }
             keepalive.keep_hidden(&moe_out);
             let nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
-            let mut shared_opt = None;
             let shared_ready = if use_comm_overlap {
-                let len = hidden_size * seq_len;
-                let data = unsafe {
-                    self.ctx
-                        .comm_stream
-                        .alloc::<half::bf16>(len)
-                        .map_err(|e| anyhow!("DSv4 shared expert comm-stream alloc failed: {e}"))?
-                };
-                let mut shared = HiddenStates {
-                    data,
-                    hidden_dim: hidden_size,
-                    seq_len,
-                };
+                let shared = &mut slot.shared_decode_out[layer_idx];
+                ensure!(
+                    shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
+                    "DSv4 shared decode scratch shape {}x{} != {}x{}",
+                    shared.hidden_dim,
+                    shared.seq_len,
+                    hidden_size,
+                    seq_len
+                );
                 let _normed_ready = normed_ready
                     .as_ref()
                     .expect("comm-overlap path records normed fence");
@@ -2308,7 +2312,7 @@ impl Dsv4Model {
                         &self.ctx.comm_stream,
                         &layer.moe,
                         &normed,
-                        &mut shared,
+                        shared,
                         self.config.swiglu_limit,
                         if use_moe_decode_scratch {
                             Some(&mut slot.moe_decode_scratch[layer_idx])
@@ -2318,7 +2322,6 @@ impl Dsv4Model {
                         &mut keepalive,
                     )
                 })?;
-                shared_opt = Some(shared);
                 Some(ctx.record_pipeline_fence(CudaPipelineStreamKind::Comm)?)
             } else {
                 None
@@ -2333,8 +2336,35 @@ impl Dsv4Model {
                     self.tp.all_reduce_sum(&self.ctx, &mut moe_out)
                 })?;
             }
-            let shared = if let Some(shared) = shared_opt {
-                shared
+            let mut shared_owned = None;
+            if use_comm_overlap {
+                // Already launched on the comm stream above.
+            } else if seq_len == 1 {
+                let shared = &mut slot.shared_decode_out[layer_idx];
+                ensure!(
+                    shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
+                    "DSv4 shared decode scratch shape {}x{} != {}x{}",
+                    shared.hidden_dim,
+                    shared.seq_len,
+                    hidden_size,
+                    seq_len
+                );
+                crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
+                    crate::moe::dsv4_shared_expert_forward(
+                        &self.ctx,
+                        &self.ctx.stream,
+                        &layer.moe,
+                        &normed,
+                        shared,
+                        self.config.swiglu_limit,
+                        if use_moe_decode_scratch {
+                            Some(&mut slot.moe_decode_scratch[layer_idx])
+                        } else {
+                            None
+                        },
+                        &mut keepalive,
+                    )
+                })?;
             } else {
                 // Keep the default masked path order byte-for-byte with main:
                 // routed MoE → all-reduce → allocate/run shared expert. Moving
@@ -2358,9 +2388,16 @@ impl Dsv4Model {
                         &mut keepalive,
                     )
                 })?;
-                shared
+                shared_owned = Some(shared);
             };
-            keepalive.keep_hidden(&shared);
+            let shared = if seq_len == 1 {
+                &slot.shared_decode_out[layer_idx]
+            } else {
+                shared_owned
+                    .as_ref()
+                    .expect("multi-token shared expert allocates owned output")
+            };
+            keepalive.keep_hidden(shared);
             if let Some(fence) = shared_ready.as_ref() {
                 ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
             }
@@ -2368,7 +2405,7 @@ impl Dsv4Model {
             let mut moe_with_shared =
                 unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             crate::stage_profile::profile(ctx, "dsv4/stage/shared_add", || {
-                crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)
+                crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)
             })?;
             keepalive.keep_hidden(&moe_with_shared);
             // SAFETY: hc_post writes the full stream buffer.

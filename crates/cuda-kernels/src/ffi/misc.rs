@@ -641,6 +641,17 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    pub fn dsv4_dsa_fill_context_lens_positions_start_pos_cuda(
+        context_lens: *mut i32,
+        positions: *mut i32,
+        start_pos: *const i32,
+        token_offset: i32,
+        batch_size: i32,
+        key_count: i32,
+        ratio: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_deepseek_v4_topk_transform_512_cuda(
         scores: *const f32,
         seq_lens: *const i32,

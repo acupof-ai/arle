@@ -5554,10 +5554,6 @@ fn csa_select(
     } else {
         keys.seq_len
     };
-    let mut selected = ctx
-        .stream
-        .alloc_zeros::<i32>(hidden.seq_len * config.index_topk)
-        .map_err(|e| anyhow::anyhow!("DSv4 CSA selected alloc failed: {e}"))?;
     let score_scale =
         (config.index_head_dim as f32).powf(-0.5) * (config.index_n_heads as f32).powf(-0.5);
     if let Some(official) = official {
@@ -5601,6 +5597,10 @@ fn csa_select(
             }
         }
     }
+    let mut selected = ctx
+        .stream
+        .alloc_zeros::<i32>(hidden.seq_len * config.index_topk)
+        .map_err(|e| anyhow::anyhow!("DSv4 CSA selected alloc failed: {e}"))?;
     {
         let (q_ptr, _qg) = q_i.data.device_ptr(&ctx.stream);
         let (w_ptr, _wg) = weights.data.device_ptr(&ctx.stream);
@@ -5843,14 +5843,20 @@ fn csa_select_official(
         token_count,
         shared.query_chunk
     );
-    // Full-length host context_lens (cheap i32 vec); the DUMP block below reads the
-    // global last row from it, and each tile slices its sub-range for H2D.
-    let context_lens_h: Vec<i32> = (0..token_count)
-        .map(|token| {
-            let abs_pos = start_pos + token;
-            i32::try_from(std::cmp::min(key_count, abs_pos / ratio))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let dump_csa = std::env::var("ARLE_DSV4_CSA_DUMP").as_deref() == Ok("1")
+        && std::env::var("INFER_TP_RANK").as_deref() == Ok("0");
+    let context_lens_h = if dump_csa {
+        Some(
+            (0..token_count)
+                .map(|token| {
+                    let abs_pos = start_pos + token;
+                    i32::try_from(std::cmp::min(key_count, abs_pos / ratio))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    } else {
+        None
+    };
 
     // Full-N output, allocated once. Each tile writes its disjoint [t0..t0+tlen) slice.
     let mut selected = ctx
@@ -5895,25 +5901,47 @@ fn csa_select_official(
     while t0 < token_count {
         let tlen = (token_count - t0).min(tile);
 
-        // (a) per-tile context_lens / positions, H2D into the tile-sized scratch.
-        let context_lens_tile: Vec<i32> = (0..tlen)
-            .map(|i| {
-                let abs_pos = start_pos + t0 + i;
-                i32::try_from(std::cmp::min(key_count, abs_pos / ratio))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let positions_tile: Vec<i32> = (0..tlen)
-            .map(|i| i32::try_from(start_pos + t0 + i))
-            .collect::<Result<Vec<_>, _>>()?;
+        // (a) per-tile context_lens / positions. Decode graph/eager decode carry
+        // `start_pos` on device; fill tile metadata on GPU to avoid two tiny
+        // H2D copies per CSA layer.
         {
             let mut context_lens = shared.context_lens.slice_mut(0..tlen);
-            ctx.stream
-                .memcpy_htod(&context_lens_tile, &mut context_lens)
-                .map_err(|e| anyhow!("DSv4 official DSA context_lens H2D failed: {e}"))?;
             let mut positions = shared.positions.slice_mut(0..tlen);
-            ctx.stream
-                .memcpy_htod(&positions_tile, &mut positions)
-                .map_err(|e| anyhow!("DSv4 official DSA positions H2D failed: {e}"))?;
+            if let Some(start_pos_device) = start_pos_device {
+                let (lens_ptr, _lg) = context_lens.device_ptr_mut(&ctx.stream);
+                let (positions_ptr, _pg) = positions.device_ptr_mut(&ctx.stream);
+                let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
+                unsafe {
+                    ffi::dsv4_dsa_fill_context_lens_positions_start_pos_cuda(
+                        lens_ptr as *mut i32,
+                        positions_ptr as *mut i32,
+                        start_ptr as *const i32,
+                        i32::try_from(t0)?,
+                        i32::try_from(tlen)?,
+                        i32::try_from(key_count)?,
+                        i32::try_from(ratio)?,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 official DSA GPU metadata fill failed: {e}"))?;
+                }
+            } else {
+                let context_lens_tile: Vec<i32> = (0..tlen)
+                    .map(|i| {
+                        let abs_pos = start_pos + t0 + i;
+                        i32::try_from(std::cmp::min(key_count, abs_pos / ratio))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let positions_tile: Vec<i32> = (0..tlen)
+                    .map(|i| i32::try_from(start_pos + t0 + i))
+                    .collect::<Result<Vec<_>, _>>()?;
+                ctx.stream
+                    .memcpy_htod(&context_lens_tile, &mut context_lens)
+                    .map_err(|e| anyhow!("DSv4 official DSA context_lens H2D failed: {e}"))?;
+                ctx.stream
+                    .memcpy_htod(&positions_tile, &mut positions)
+                    .map_err(|e| anyhow!("DSv4 official DSA positions H2D failed: {e}"))?;
+            }
         }
 
         // (c) fused Q indexer rope+hadamard+quant over the tile's input sub-range.
@@ -6044,11 +6072,12 @@ fn csa_select_official(
     }
     keepalive.keep_u8(&shared.q_fp8);
     keepalive.keep_f32(&shared.weights);
-    if std::env::var("ARLE_DSV4_CSA_DUMP").as_deref() == Ok("1")
-        && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
-    {
+    if dump_csa {
         let row_idx = q_i.seq_len.saturating_sub(1);
-        let available = context_lens_h.get(row_idx).copied().unwrap_or_default();
+        let available = context_lens_h
+            .as_ref()
+            .and_then(|lens| lens.get(row_idx).copied())
+            .unwrap_or_default();
         let selected_host = ctx.stream.clone_dtoh(&selected);
         let raw_host = ctx
             .stream

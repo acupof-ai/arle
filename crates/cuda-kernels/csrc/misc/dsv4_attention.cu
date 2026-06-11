@@ -1961,3 +1961,44 @@ extern "C" CUresult dsv4_csa_select_start_pos_ptr_cuda(
       key_count, ratio, topk, score_scale, 0, start_pos);
   return (CUresult)cudaGetLastError();
 }
+
+__global__ void dsv4_dsa_fill_context_lens_positions_start_pos_kernel(
+    int32_t *context_lens,
+    int32_t *positions,
+    const int32_t *start_pos,
+    int token_offset,
+    int batch_size,
+    int key_count,
+    int ratio) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= batch_size) return;
+  int abs_pos = *start_pos + token_offset + row;
+  int context_len = 0;
+  if (abs_pos > 0 && ratio > 0) {
+    context_len = abs_pos / ratio;
+    if (context_len > key_count) context_len = key_count;
+  }
+  context_lens[row] = context_len;
+  positions[row] = abs_pos;
+}
+
+extern "C" CUresult dsv4_dsa_fill_context_lens_positions_start_pos_cuda(
+    int32_t *context_lens,
+    int32_t *positions,
+    const int32_t *start_pos,
+    int token_offset,
+    int batch_size,
+    int key_count,
+    int ratio,
+    CUstream stream) {
+  if (context_lens == nullptr || positions == nullptr || start_pos == nullptr ||
+      token_offset < 0 || batch_size < 0 || key_count < 0 || ratio <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (batch_size == 0) return CUDA_SUCCESS;
+  constexpr int kBlock = 128;
+  int grid = (batch_size + kBlock - 1) / kBlock;
+  dsv4_dsa_fill_context_lens_positions_start_pos_kernel<<<grid, kBlock, 0, (cudaStream_t)stream>>>(
+      context_lens, positions, start_pos, token_offset, batch_size, key_count, ratio);
+  return (CUresult)cudaGetLastError();
+}
