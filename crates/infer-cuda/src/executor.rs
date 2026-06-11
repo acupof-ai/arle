@@ -1657,8 +1657,8 @@ pub(crate) struct Qwen35CudaExecutor {
     /// and re-`None`d whenever baked addresses go stale: OPD weight
     /// offload/reload, student-LoRA re-merge).
     decode_graph: Option<Qwen35DecodeGraph>,
-    /// Lazily-built batched rows>1 decode state (dedicated `[*, B]` workspace
-    /// + per-layer recurrent-state pointer tables; see
+    /// Lazily-built batched rows>1 decode state: a dedicated `[*, B]`
+    /// workspace plus per-layer recurrent-state pointer tables (see
     /// [`crate::qwen35::Qwen35BatchDecodeState`]). `None` until the first
     /// batched decode.
     batch_decode: Option<crate::qwen35::Qwen35BatchDecodeState>,
