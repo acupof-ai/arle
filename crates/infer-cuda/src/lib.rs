@@ -57,6 +57,10 @@ mod stage_profile;
 // attention, BF16 MoE). cuda-gated: device weight matrices + recurrent state.
 #[cfg(feature = "cuda")]
 mod qwen35;
+// Persistent forward-workspace buffer slots (exact-shape reuse cache). cuda-
+// gated: owns device buffers.
+#[cfg(feature = "cuda")]
+mod workspace;
 
 // Per-step student LoRA re-merge contract (OPD P2). The host-side data types
 // the train crate pushes into the student engine; re-exported from `infer-api`.

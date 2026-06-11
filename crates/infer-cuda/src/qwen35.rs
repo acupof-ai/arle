@@ -41,11 +41,10 @@ use safetensors::tensor::Dtype;
 
 use crate::executor::sample_cuda_token;
 use crate::loader::SafetensorLoader;
-use crate::moe::moe_forward;
+use crate::moe::{MoeForwardScratch, moe_forward_into};
 use crate::moe_config::ExpertSplit;
-use crate::ops::{
-    add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul, upload_i32,
-};
+use crate::ops::{add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul};
+use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 
@@ -159,6 +158,158 @@ impl Qwen35SlotState {
                 .map_err(|e| anyhow!("memset conv state failed: {e}"))?;
         }
         Ok(())
+    }
+}
+
+/// Persistent device workspace for the Qwen3.5/3.6 hybrid forward.
+///
+/// The forward used to perform ~425 fresh device allocations PER CALL
+/// (3 `HiddenStates::zeros` per layer in the residual stream, ~6 per
+/// attention block, ~10 per MoE layer, plus the sampling tail) — all fully
+/// overwritten before any read, per decode token. This workspace gives every
+/// such buffer a persistent exact-shape slot (see [`crate::workspace`] for the
+/// reuse/zeroing/free-safety contract and why the cache is exact-shape rather
+/// than capacity-sized: `all_reduce_sum` derives the TP collective message
+/// length — and the one-shot-vs-NCCL choice — from `data.len()`, so oversized
+/// buffers would change the reduction on TP>=2).
+///
+/// One workspace per executor (forwards are strictly serial); passed `&mut`
+/// from the executor like the DSv4 decode scratch pools. Numerics are
+/// byte-identical to the per-call path: same buffer sizes, same kernel
+/// arguments, same launch order — only the allocation lifetime changes.
+///
+/// Write-before-read proof per slot (kernels verified in
+/// `csrc/misc/elementwise_basic.cu`, `csrc/misc/norm.cu`,
+/// `csrc/misc/conv1d.cu`, `csrc/misc/gated_delta_rule.cu`,
+/// `csrc/attention/prefill_attention_hd256.cu`,
+/// `csrc/attention/nonpaged_prefill_attention.cu`, `csrc/gemm/gemv.cu`;
+/// MoE slots carry their own table on [`MoeForwardScratch`]):
+///
+/// | slot          | shape           | proof of full overwrite before read |
+/// |---------------|-----------------|--------------------------------------|
+/// | `token_ids`   | `[S]` i32       | H2D upload overwrites every call |
+/// | `start_pos`   | `[1]` i32       | H2D upload overwrites every call |
+/// | `hidden`      | `[H, S]`        | `embedding_batched` writes all `H*S`; per layer, the residual `add_cuda` rewrites all `H*S` before the next read |
+/// | `normed`      | `[H, S]`        | `rms_norm_batched_offset` writes all rows (grid = S blocks × full row) |
+/// | `hidden_mid`  | `[H, S]`        | `add_cuda` writes all `H*S` |
+/// | `attn_out`    | `[H, S]`        | o/out-proj `gemm_cuda` is beta=0 (writes all `M*N`) |
+/// | `mlp_out`     | `[H, S]`        | dense: down `gemm_cuda` beta=0; MoE: combine kernel writes all, then gated-add RMWs |
+/// | `full.q_full` | `[2*Hq*D, S]`   | `gemm_cuda` beta=0 |
+/// | `full.k_batch`/`v_batch` | `[Hkv*D, S]` | `gemm_cuda` beta=0 |
+/// | `full.q_prepped` | `[Hq*D, S]`  | HD256 prep writes every (token, head, d): RoPE pair covers `[0, rotary)`, the `d >= rotary` branch covers the rest |
+/// | `full.attn_heads`| `[Hq*D, S]`  | nonpaged attention writes every (token, head, d) from register accumulators; the gate kernel then RMWs in place |
+/// | `linear.qkv`/`z`/`b_proj`/`a_proj` | `[*, S]` | `gemm_cuda` beta=0 |
+/// | `linear.qkv_conv` | `[QKV, S]`  | conv1d prefill writes every (channel, t) |
+/// | `linear.gdr_out`  | `[Vh*Vd, S]`| gated-delta kernels write every (token, v_head, d) (one block per v_head, j_slice 0 writes the reduced output) |
+/// | `linear.normed_out`| `[Vh*Vd, S]`| `rms_norm_gated` writes every (head, d) over `Vh*S` blocks |
+/// | `dense.gate`/`up` | `[I, S]`    | `gemm_cuda` beta=0 |
+/// | `dense.act`   | `[I, S]`        | `silu_mul` writes all `I*S` |
+/// | `last_hidden` | `[H]`           | `memcpy_dtod` overwrites the full vec |
+/// | `last_normed` | `[H]`           | `rms_norm_offset` writes all `H` |
+/// | `logits`      | `[V]`           | `gemv` writes every output row |
+///
+/// The full-logits OPD tail (`[V, S]`) is RETURNED to the caller and stays a
+/// per-call allocation by design.
+#[derive(Default)]
+pub(crate) struct Qwen35Workspace {
+    token_ids: SliceSlot<i32>,
+    /// GPU-resident `start_pos` for the HD256 prep kernel — uploaded once per
+    /// forward (the value is identical for every full-attn layer in the call;
+    /// the old path uploaded one identical buffer per layer).
+    start_pos: SliceSlot<i32>,
+    hidden: HiddenSlot,
+    normed: HiddenSlot,
+    hidden_mid: HiddenSlot,
+    attn_out: HiddenSlot,
+    mlp_out: HiddenSlot,
+    full: FullAttnScratch,
+    linear: LinearAttnScratch,
+    dense: DenseMlpScratch,
+    moe: MoeForwardScratch,
+    last_hidden: VecSlot,
+    last_normed: VecSlot,
+    logits: VecSlot,
+}
+
+#[derive(Default)]
+pub(crate) struct FullAttnScratch {
+    q_full: HiddenSlot,
+    k_batch: HiddenSlot,
+    v_batch: HiddenSlot,
+    q_prepped: HiddenSlot,
+    attn_heads: HiddenSlot,
+}
+
+#[derive(Default)]
+pub(crate) struct LinearAttnScratch {
+    qkv: HiddenSlot,
+    z: HiddenSlot,
+    b_proj: HiddenSlot,
+    a_proj: HiddenSlot,
+    qkv_conv: HiddenSlot,
+    gdr_out: HiddenSlot,
+    normed_out: HiddenSlot,
+}
+
+#[derive(Default)]
+pub(crate) struct DenseMlpScratch {
+    gate: HiddenSlot,
+    up: HiddenSlot,
+    act: HiddenSlot,
+}
+
+impl Qwen35Workspace {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop every cached buffer (frees the VRAM). Called by the executor after
+    /// the OPD weight offload so the workspace does not hold prefill-shaped
+    /// scratch while the student backward needs the headroom. The caller must
+    /// have quiesced the device first (`offload_engine_weights` syncs).
+    pub(crate) fn release(&mut self) {
+        let Self {
+            token_ids,
+            start_pos,
+            hidden,
+            normed,
+            hidden_mid,
+            attn_out,
+            mlp_out,
+            full,
+            linear,
+            dense,
+            moe,
+            last_hidden,
+            last_normed,
+            logits,
+        } = self;
+        token_ids.release();
+        start_pos.release();
+        hidden.release();
+        normed.release();
+        hidden_mid.release();
+        attn_out.release();
+        mlp_out.release();
+        full.q_full.release();
+        full.k_batch.release();
+        full.v_batch.release();
+        full.q_prepped.release();
+        full.attn_heads.release();
+        linear.qkv.release();
+        linear.z.release();
+        linear.b_proj.release();
+        linear.a_proj.release();
+        linear.qkv_conv.release();
+        linear.gdr_out.release();
+        linear.normed_out.release();
+        dense.gate.release();
+        dense.up.release();
+        dense.act.release();
+        moe.release();
+        last_hidden.release();
+        last_normed.release();
+        logits.release();
     }
 }
 
@@ -987,21 +1138,21 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Run prefill or decode for one row. `start_pos` is the absolute position of
-    /// the first token; `tokens` are the new tokens (whole prompt on prefill, one
-    /// token on decode). Advances `slot.seq_len` and the recurrent state. Returns
-    /// the next sampled token.
-    pub(crate) fn forward_tokens(
+    /// Shared layer stack for [`Self::forward_tokens`] /
+    /// [`Self::forward_token_logits_full`]: embeds `tokens`, runs every layer
+    /// over the workspace buffers, advances `slot.seq_len` and the recurrent
+    /// state, and leaves the final hidden states in `ws.hidden`
+    /// (`[hidden, seq_len]`).
+    fn forward_hidden(
         &self,
         slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
         tokens: &[u32],
         start_pos: usize,
-        params: &SamplingParams,
-        position: u64,
-    ) -> Result<u32> {
+    ) -> Result<()> {
         ensure!(
             !tokens.is_empty(),
-            "forward_tokens requires at least one token"
+            "Qwen3.5 hybrid forward requires at least one token"
         );
         ensure!(
             slot.seq_len == start_pos,
@@ -1020,65 +1171,125 @@ impl Qwen35Model {
         let eps = c.rms_norm_eps;
         let hidden_size = c.hidden_size;
 
-        let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let token_ids = upload_i32(&self.ctx, &token_ids)?;
-        let mut hidden = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)?;
+        // Destructure once: each binding borrows its own workspace field, so
+        // the residual-stream buffers, the per-block scratch, and the MoE
+        // scratch stay simultaneously borrowable across the layer loop.
+        let Qwen35Workspace {
+            token_ids,
+            start_pos: start_pos_slot,
+            hidden,
+            normed,
+            hidden_mid,
+            attn_out,
+            mlp_out,
+            full,
+            linear,
+            dense,
+            moe,
+            ..
+        } = ws;
+
+        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let token_ids = token_ids.upload(&self.ctx, &token_ids_host)?;
+        let start_pos_dev = start_pos_slot.upload(&self.ctx, &[start_pos as i32])?;
+
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)?;
+        let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
+        let hidden_mid = hidden_mid.get(&self.ctx, hidden_size, seq_len)?;
+        let attn_out = attn_out.get(&self.ctx, hidden_size, seq_len)?;
+        let mlp_out = mlp_out.get(&self.ctx, hidden_size, seq_len)?;
 
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
         for layer in &self.layers {
-            let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            rms_norm_offset(&self.ctx, &hidden, &layer.input_layernorm, eps, &mut normed)?;
+            rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed)?;
 
-            let attn_out = match &layer.attn {
-                Qwen35Attn::Full(full) => {
-                    let out = self.full_attention(full, &normed, slot, full_idx, start_pos)?;
+            match &layer.attn {
+                Qwen35Attn::Full(full_attn) => {
+                    self.full_attention(
+                        full_attn,
+                        normed,
+                        slot,
+                        full_idx,
+                        start_pos,
+                        start_pos_dev,
+                        full,
+                        attn_out,
+                    )?;
                     full_idx += 1;
-                    out
                 }
                 Qwen35Attn::Linear(lin) => {
-                    let out = self.linear_attention(lin, &normed, slot, linear_idx)?;
+                    self.linear_attention(lin, normed, slot, linear_idx, linear, attn_out)?;
                     linear_idx += 1;
-                    out
                 }
-            };
+            }
 
-            let mut hidden_mid = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            add_batch(&self.ctx, &hidden, &attn_out, &mut hidden_mid)?;
+            add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
 
             rms_norm_offset(
                 &self.ctx,
-                &hidden_mid,
+                hidden_mid,
                 &layer.post_attention_layernorm,
                 eps,
-                &mut normed,
+                normed,
             )?;
-            let mut mlp_out = if let Some(moe) = &layer.moe {
+            if let Some(moe_weights) = &layer.moe {
                 let cfg = self
                     .moe_config
                     .as_ref()
                     .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
-                moe_forward(&self.ctx, moe, &normed, cfg, &self.expert_split)?
+                moe_forward_into(
+                    &self.ctx,
+                    moe_weights,
+                    normed,
+                    cfg,
+                    &self.expert_split,
+                    moe,
+                    mlp_out,
+                )?;
             } else {
                 let mlp = layer
                     .mlp
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
-                self.dense_mlp(mlp, &normed)?
-            };
+                self.dense_mlp(mlp, normed, dense, mlp_out)?;
+            }
             // ONE all-reduce covers the whole FFN partial: the MoE buffer already
             // sums this rank's routed experts (non-local routes contribute zero)
             // + the column/row-sharded shared expert; the dense branch is a
             // row-parallel down_proj partial. No-op on a single GPU.
-            self.tp.all_reduce_sum(&self.ctx, &mut mlp_out)?;
+            self.tp.all_reduce_sum(&self.ctx, mlp_out)?;
 
-            let mut hidden_next = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut hidden_next)?;
-            hidden = hidden_next;
+            // Residual add straight into `hidden` (the old per-layer
+            // `hidden_next` alloc + move): add_cuda reads hidden_mid/mlp_out
+            // and writes hidden, whose previous value is dead here — same
+            // kernel, same bytes, one fewer buffer.
+            add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
         }
 
         slot.seq_len += seq_len;
+        Ok(())
+    }
+
+    /// Run prefill or decode for one row. `start_pos` is the absolute position of
+    /// the first token; `tokens` are the new tokens (whole prompt on prefill, one
+    /// token on decode). Advances `slot.seq_len` and the recurrent state. Returns
+    /// the next sampled token. `ws` is the executor's persistent forward
+    /// workspace (serial forwards share one).
+    pub(crate) fn forward_tokens(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<u32> {
+        self.forward_hidden(slot, ws, tokens, start_pos)?;
+        let seq_len = tokens.len();
+        let eps = self.config.rms_norm_eps;
+        let hidden_size = self.config.hidden_size;
 
         // Final norm (offset) + LM head on the last token only.
         //
@@ -1086,18 +1297,22 @@ impl Qwen35Model {
         // post-all-reduce (every row-parallel output above was summed), so the
         // logits — and therefore the sampled token — are identical on every
         // rank. No rank ever needs to broadcast its sample.
-        let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        copy_row_to_vec(&self.ctx, &hidden, seq_len - 1, &mut last_hidden)?;
-        let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        rms_norm_offset_vec(&self.ctx, &last_hidden, &self.norm, eps, &mut last_normed)?;
-        let mut logits = DeviceVec::zeros(&self.ctx, self.output_projection().rows)?;
-        gemv(
-            &self.ctx,
-            self.output_projection(),
-            &last_normed,
-            &mut logits,
-        )?;
-        sample_cuda_token(&self.ctx, &logits, params, position)
+        let Qwen35Workspace {
+            hidden,
+            last_hidden,
+            last_normed,
+            logits,
+            ..
+        } = ws;
+        // Shape-matched re-get returns the SAME buffer forward_hidden filled.
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        let last_hidden = last_hidden.get(&self.ctx, hidden_size)?;
+        copy_row_to_vec(&self.ctx, hidden, seq_len - 1, last_hidden)?;
+        let last_normed = last_normed.get(&self.ctx, hidden_size)?;
+        rms_norm_offset_vec(&self.ctx, last_hidden, &self.norm, eps, last_normed)?;
+        let logits = logits.get(&self.ctx, self.output_projection().rows)?;
+        gemv(&self.ctx, self.output_projection(), last_normed, logits)?;
+        sample_cuda_token(&self.ctx, logits, params, position)
     }
 
     /// Run the full forward over `tokens` and return the FULL `[seq_len, vocab]`
@@ -1114,99 +1329,30 @@ impl Qwen35Model {
     pub(crate) fn forward_token_logits_full(
         &self,
         slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<(DeviceVec, [usize; 2])> {
-        ensure!(
-            !tokens.is_empty(),
-            "forward_token_logits_full requires at least one token"
-        );
-        ensure!(
-            slot.seq_len == start_pos,
-            "Qwen3.5 hybrid slot seq_len {} != start_pos {start_pos} (uncached full-prefix \
-             path requires contiguous appends)",
-            slot.seq_len
-        );
+        self.forward_hidden(slot, ws, tokens, start_pos)?;
         let seq_len = tokens.len();
-        ensure!(
-            start_pos + seq_len <= self.max_seq_len,
-            "Qwen3.5 hybrid sequence {} exceeds KV cache budget {}",
-            start_pos + seq_len,
-            self.max_seq_len
-        );
-        let c = &self.config;
-        let eps = c.rms_norm_eps;
-        let hidden_size = c.hidden_size;
-
-        let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let token_ids = upload_i32(&self.ctx, &token_ids)?;
-        let mut hidden = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut hidden)?;
-
-        let mut full_idx = 0usize;
-        let mut linear_idx = 0usize;
-        for layer in &self.layers {
-            let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            rms_norm_offset(&self.ctx, &hidden, &layer.input_layernorm, eps, &mut normed)?;
-
-            let attn_out = match &layer.attn {
-                Qwen35Attn::Full(full) => {
-                    let out = self.full_attention(full, &normed, slot, full_idx, start_pos)?;
-                    full_idx += 1;
-                    out
-                }
-                Qwen35Attn::Linear(lin) => {
-                    let out = self.linear_attention(lin, &normed, slot, linear_idx)?;
-                    linear_idx += 1;
-                    out
-                }
-            };
-
-            let mut hidden_mid = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            add_batch(&self.ctx, &hidden, &attn_out, &mut hidden_mid)?;
-
-            rms_norm_offset(
-                &self.ctx,
-                &hidden_mid,
-                &layer.post_attention_layernorm,
-                eps,
-                &mut normed,
-            )?;
-            let mut mlp_out = if let Some(moe) = &layer.moe {
-                let cfg = self
-                    .moe_config
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
-                moe_forward(&self.ctx, moe, &normed, cfg, &self.expert_split)?
-            } else {
-                let mlp = layer
-                    .mlp
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
-                self.dense_mlp(mlp, &normed)?
-            };
-            // ONE all-reduce covers the whole FFN partial: the MoE buffer already
-            // sums this rank's routed experts (non-local routes contribute zero)
-            // + the column/row-sharded shared expert; the dense branch is a
-            // row-parallel down_proj partial. No-op on a single GPU.
-            self.tp.all_reduce_sum(&self.ctx, &mut mlp_out)?;
-
-            let mut hidden_next = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-            add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut hidden_next)?;
-            hidden = hidden_next;
-        }
-
-        slot.seq_len += seq_len;
+        let eps = self.config.rms_norm_eps;
+        let hidden_size = self.config.hidden_size;
 
         // Final norm (offset) over the WHOLE batch, then the batched lm-head GEMM
         // produces every row's logits — no last-row slice, no sampling.
         // (TP invariant as in `forward_tokens`: replicated lm_head over
         // post-all-reduce hidden ⇒ identical logits on every rank.)
-        let mut normed = HiddenStates::zeros(&self.ctx, hidden_size, seq_len)?;
-        rms_norm_offset(&self.ctx, &hidden, &self.norm, eps, &mut normed)?;
+        let Qwen35Workspace { hidden, normed, .. } = ws;
+        // Shape-matched re-gets return the SAME buffers forward_hidden used;
+        // rms_norm fully overwrites `normed` before the lm-head GEMM reads it.
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
+        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
         let vocab = self.output_projection().rows;
+        // The logits buffer is RETURNED to the OPD caller (ownership leaves the
+        // forward), so it stays a per-call allocation — not a workspace slot.
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
-        gemm_batch(&self.ctx, self.output_projection(), &normed, &mut logits)?;
+        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
         self.ctx.sync()?;
 
         // `HiddenStates` is a `[vocab, seq_len]` column-batch over a flat device
@@ -1397,24 +1543,34 @@ impl Qwen35Model {
         Ok(())
     }
 
-    fn dense_mlp(&self, mlp: &DenseMlp, normed: &HiddenStates) -> Result<HiddenStates> {
+    /// Dense SwiGLU MLP into `out` (`[hidden, seq]`). Every stage fully
+    /// overwrites its scratch buffer (beta=0 GEMMs + full-range silu_mul).
+    fn dense_mlp(
+        &self,
+        mlp: &DenseMlp,
+        normed: &HiddenStates,
+        dw: &mut DenseMlpScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         let inter = mlp.gate_proj.rows;
         let seq_len = normed.seq_len;
-        let mut gate = HiddenStates::zeros(&self.ctx, inter, seq_len)?;
-        let mut up = HiddenStates::zeros(&self.ctx, inter, seq_len)?;
-        gemm_batch(&self.ctx, &mlp.gate_proj, normed, &mut gate)?;
-        gemm_batch(&self.ctx, &mlp.up_proj, normed, &mut up)?;
-        let mut act = HiddenStates::zeros(&self.ctx, inter, seq_len)?;
-        silu_mul(&self.ctx, &gate, &up, &mut act)?;
-        let mut out = HiddenStates::zeros(&self.ctx, self.config.hidden_size, seq_len)?;
-        gemm_batch(&self.ctx, &mlp.down_proj, &act, &mut out)?;
-        Ok(out)
+        let gate = dw.gate.get(&self.ctx, inter, seq_len)?;
+        let up = dw.up.get(&self.ctx, inter, seq_len)?;
+        gemm_batch(&self.ctx, &mlp.gate_proj, normed, gate)?;
+        gemm_batch(&self.ctx, &mlp.up_proj, normed, up)?;
+        let act = dw.act.get(&self.ctx, inter, seq_len)?;
+        silu_mul(&self.ctx, gate, up, act)?;
+        gemm_batch(&self.ctx, &mlp.down_proj, act, out)?;
+        Ok(())
     }
 
     /// Gated full attention over the contiguous per-slot K/V cache (uncached
-    /// recompute over `[0, start_pos+seq_len)` each call). HD256 prep fuses
-    /// q/k RMSNorm + RoPE + cache write; the gate kernel applies the per-head
-    /// sigmoid gate carried in `q_full`.
+    /// recompute over `[0, start_pos+seq_len)` each call) into `out`
+    /// (`[hidden, seq]`, beta=0 o_proj GEMM). HD256 prep fuses q/k RMSNorm +
+    /// RoPE + cache write; the gate kernel applies the per-head sigmoid gate
+    /// carried in `q_full`. `start_pos_dev` is the forward-level GPU-resident
+    /// `start_pos` (identical for every layer of one call).
+    #[allow(clippy::too_many_arguments)]
     fn full_attention(
         &self,
         attn: &FullAttn,
@@ -1422,7 +1578,10 @@ impl Qwen35Model {
         slot: &mut Qwen35SlotState,
         full_idx: usize,
         start_pos: usize,
-    ) -> Result<HiddenStates> {
+        start_pos_dev: &CudaSlice<i32>,
+        fw: &mut FullAttnScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         let c = &self.config;
         let seq_len = normed.seq_len;
         // LOCAL per-rank widths (= global config on a single GPU): the sharded
@@ -1432,19 +1591,25 @@ impl Qwen35Model {
         let kv_dim = self.local_full_attn_kv_dim();
         let q_proj_dim = self.local_full_attn_q_proj_dim();
 
-        let mut q_full = HiddenStates::zeros(&self.ctx, q_proj_dim, seq_len)?;
-        let mut k_batch = HiddenStates::zeros(&self.ctx, kv_dim, seq_len)?;
-        let mut v_batch = HiddenStates::zeros(&self.ctx, kv_dim, seq_len)?;
-        gemm_batch(&self.ctx, &attn.q_proj, normed, &mut q_full)?;
-        gemm_batch(&self.ctx, &attn.k_proj, normed, &mut k_batch)?;
-        gemm_batch(&self.ctx, &attn.v_proj, normed, &mut v_batch)?;
+        let FullAttnScratch {
+            q_full,
+            k_batch,
+            v_batch,
+            q_prepped,
+            attn_heads,
+        } = fw;
+        let q_full = q_full.get(&self.ctx, q_proj_dim, seq_len)?;
+        let k_batch = k_batch.get(&self.ctx, kv_dim, seq_len)?;
+        let v_batch = v_batch.get(&self.ctx, kv_dim, seq_len)?;
+        gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
+        gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
+        gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
 
-        let mut q_prepped = HiddenStates::zeros(&self.ctx, q_dim, seq_len)?;
-        let mut attn_out = HiddenStates::zeros(&self.ctx, q_dim, seq_len)?;
+        let q_prepped = q_prepped.get(&self.ctx, q_dim, seq_len)?;
+        let attn_out = attn_heads.get(&self.ctx, q_dim, seq_len)?;
         let k_cache = &mut slot.k_caches[full_idx];
         let v_cache = &mut slot.v_caches[full_idx];
 
-        let start_pos_buf = upload_i32(&self.ctx, &[start_pos as i32])?;
         let max_seq_len = k_cache.len / kv_dim;
         let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
         let kv_len = start_pos + seq_len;
@@ -1461,7 +1626,7 @@ impl Qwen35Model {
             let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
             let (kc_ptr, _g8) = k_cache.data.device_ptr_mut(&self.ctx.stream);
             let (vc_ptr, _g9) = v_cache.data.device_ptr_mut(&self.ctx.stream);
-            let (sp_ptr, _g10) = start_pos_buf.device_ptr(&self.ctx.stream);
+            let (sp_ptr, _g10) = start_pos_dev.device_ptr(&self.ctx.stream);
             // SAFETY: all buffers valid on ctx.stream; cache sized max_seq_len*kv_dim.
             unsafe {
                 ffi::prefill_attention_hd256_prep_cuda(
@@ -1531,23 +1696,25 @@ impl Qwen35Model {
             }
         }
 
-        let mut out = HiddenStates::zeros(&self.ctx, c.hidden_size, seq_len)?;
-        gemm_batch(&self.ctx, &attn.o_proj, &attn_out, &mut out)?;
+        gemm_batch(&self.ctx, &attn.o_proj, attn_out, out)?;
         // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
-        self.tp.all_reduce_sum(&self.ctx, &mut out)?;
-        Ok(out)
+        self.tp.all_reduce_sum(&self.ctx, out)?;
+        Ok(())
     }
 
-    /// Gated-delta-rule linear attention: in-proj → depthwise conv1d → RECURRENT
-    /// gated-delta (advances the per-slot state in place) → gated output RMSNorm
-    /// → out-proj. The conv ring + recurrent state carry across prefill/decode.
+    /// Gated-delta-rule linear attention into `out` (`[hidden, seq]`, beta=0
+    /// out-proj GEMM): in-proj → depthwise conv1d → RECURRENT gated-delta
+    /// (advances the per-slot state in place) → gated output RMSNorm →
+    /// out-proj. The conv ring + recurrent state carry across prefill/decode.
     fn linear_attention(
         &self,
         attn: &LinearAttn,
         normed: &HiddenStates,
         slot: &mut Qwen35SlotState,
         linear_idx: usize,
-    ) -> Result<HiddenStates> {
+        lw: &mut LinearAttnScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         let c = &self.config;
         let seq_len = normed.seq_len;
         // LOCAL per-rank widths (= global config on a single GPU): the fused
@@ -1559,17 +1726,26 @@ impl Qwen35Model {
         let b_dim = attn.in_proj_b.rows;
         let a_dim = attn.in_proj_a.rows;
 
-        let mut qkv = HiddenStates::zeros(&self.ctx, qkv_dim, seq_len)?;
-        let mut z = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-        let mut b_proj = HiddenStates::zeros(&self.ctx, b_dim, seq_len)?;
-        let mut a_proj = HiddenStates::zeros(&self.ctx, a_dim, seq_len)?;
-        gemm_batch(&self.ctx, &attn.in_proj_qkv, normed, &mut qkv)?;
-        gemm_batch(&self.ctx, &attn.in_proj_z, normed, &mut z)?;
-        gemm_batch(&self.ctx, &attn.in_proj_b, normed, &mut b_proj)?;
-        gemm_batch(&self.ctx, &attn.in_proj_a, normed, &mut a_proj)?;
+        let LinearAttnScratch {
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            qkv_conv,
+            gdr_out,
+            normed_out,
+        } = lw;
+        let qkv = qkv.get(&self.ctx, qkv_dim, seq_len)?;
+        let z = z.get(&self.ctx, z_dim, seq_len)?;
+        let b_proj = b_proj.get(&self.ctx, b_dim, seq_len)?;
+        let a_proj = a_proj.get(&self.ctx, a_dim, seq_len)?;
+        gemm_batch(&self.ctx, &attn.in_proj_qkv, normed, qkv)?;
+        gemm_batch(&self.ctx, &attn.in_proj_z, normed, z)?;
+        gemm_batch(&self.ctx, &attn.in_proj_b, normed, b_proj)?;
+        gemm_batch(&self.ctx, &attn.in_proj_a, normed, a_proj)?;
 
         // ── conv1d (advances the per-slot conv ring). ──
-        let mut qkv_conv = HiddenStates::zeros(&self.ctx, qkv_dim, seq_len)?;
+        let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, seq_len)?;
         let conv_state = &mut slot.conv_states[linear_idx];
         ensure!(
             conv_state.len == qkv_dim * (c.linear_conv_kernel_dim - 1),
@@ -1601,7 +1777,7 @@ impl Qwen35Model {
 
         // ── gated-delta RECURRENT (never chunkwise: WGMMA short-seq path hangs
         //    on sm_90; the recurrent kernel handles seq_len==1 decode too). ──
-        let mut gdr_out = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+        let gdr_out = gdr_out.get(&self.ctx, z_dim, seq_len)?;
         let gdr_state = &mut slot.gdr_states[linear_idx];
         {
             let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
@@ -1651,7 +1827,7 @@ impl Qwen35Model {
         }
 
         // ── gated output RMSNorm (per value head; gate = z). ──
-        let mut normed_out = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+        let normed_out = normed_out.get(&self.ctx, z_dim, seq_len)?;
         {
             let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
             let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
@@ -1680,11 +1856,10 @@ impl Qwen35Model {
             }
         }
 
-        let mut out = HiddenStates::zeros(&self.ctx, c.hidden_size, seq_len)?;
-        gemm_batch(&self.ctx, &attn.out_proj, &normed_out, &mut out)?;
+        gemm_batch(&self.ctx, &attn.out_proj, normed_out, out)?;
         // Row-parallel out_proj: sum the per-rank partials (no-op single-GPU).
-        self.tp.all_reduce_sum(&self.ctx, &mut out)?;
-        Ok(out)
+        self.tp.all_reduce_sum(&self.ctx, out)?;
+        Ok(())
     }
 }
 
