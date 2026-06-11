@@ -89,16 +89,5 @@ unsafe extern "C" {
         out_ptr: u64,
         per_rank_elems: i32,
     ) -> CUresult;
-    pub fn arle_car_fused_ar_hc_post(
-        handle: *mut std::os::raw::c_void,
-        stream: CUstream,
-        shared_or_0: u64,
-        residual_ptr: u64,
-        post_ptr: u64,
-        comb_ptr: u64,
-        out_ptr: u64,
-        hidden: i32,
-        hc_mult: i32,
-    ) -> CUresult;
     pub fn arle_car_destroy_prod(handle: *mut std::os::raw::c_void);
 }
