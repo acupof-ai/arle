@@ -169,11 +169,13 @@ RoPE theta switch; mutated-slot-buffer enumeration encoded as a test), seam
 `BackendExecutor` + `load_dsv4_gguf`. 53 unit tests green on Mac; hip-kernels
 compiles 10 csrc files + mhc/basic-op extern surface.
 
-**Remaining = on-box only (the true "only verification" set):** hipcc compile of
-the kernel set against real ROCm headers (shim bf16/fp8 overload check), dequant
-golden vs llama.cpp, ROCm-vs-Vulkan lane A/B, needle gate, first tok/s entry +
-perf license (#78). One non-box item deferred: batched-prefill mmq (sequential
-per-token prefill is the licensed MVP).
+**Remaining = on-box only — ordered checklist with pass criteria:
+[`2026-06-11-hip-onbox-runbook.md`](2026-06-11-hip-onbox-runbook.md)**
+(box prep/GTT → compile lane → hardware-gated smoke + dequant golden →
+llama.cpp ROCm/Vulkan lane A/B → DSv4 bring-up + needle gate → perf license
+#78). CLI wiring landed `98674323` (`arle serve --backend hip`). One non-box
+item deferred: batched-prefill mmq (sequential per-token prefill is the
+licensed MVP).
 
 ## §3 Kept / killed kernel-source candidates
 
