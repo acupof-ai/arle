@@ -1,62 +1,73 @@
 #version 450
-// Adapted from ggml-org/llama.cpp @ d2462f8f
-// ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv.comp (MIT).
+// ARLE Vulkan shader ported from crates/cuda-kernels/csrc/misc/conv1d.cu.
+// Qwen3.5 depthwise conv1d includes SiLU and advances the per-slot ring.
 
-#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
-#include "types.glsl"
+layout(push_constant) uniform Params {
+    uint num_channels;
+    uint seq_len;
+    uint kernel_size;
+} p;
 
-layout(constant_id = 0) const uint BLOCK_SIZE = 32;
-layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
-layout(constant_id = 2) const bool APPLY_BIAS = false;
-layout(constant_id = 3) const bool APPLY_SILU = false;
-
-layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
-
-layout(binding = 0) readonly buffer Src0 { float src0[]; };
-layout(binding = 1) readonly buffer Src1 { float src1[]; };
-layout(binding = 2) readonly buffer Bias { float bias[]; };
-layout(binding = 3) buffer Dst { float dst[]; };
-
-layout(push_constant) uniform PushConstants {
-    uint nb01; uint nb02;
-    uint nb11;
-    uint dst_nb0; uint dst_nb1; uint dst_nb2;
-    uint nc; uint ncs; uint nr; uint n_t; uint n_s;
+layout(binding = 0) readonly buffer XSeq {
+    float x_seq[];
+};
+layout(binding = 1) readonly buffer ConvWeight {
+    float conv_weight[];
+};
+layout(binding = 2) buffer ConvState {
+    float conv_state[];
+};
+layout(binding = 3) buffer OutSeq {
+    float out_seq[];
 };
 
-void main() {
-    const uint i1 = gl_GlobalInvocationID.x;
-    const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
-    const uint i3 = gl_WorkGroupID.z;
+float silu(float x) {
+    return x / (1.0 + exp(-x));
+}
 
-    if (i1 >= nr || i2 >= n_t || i3 >= n_s) {
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= p.num_channels || p.kernel_size == 0) {
         return;
     }
 
-    const uint src0_base = i3 * (nb02 / 4) + i2 + i1 * (nb01 / 4);
-    const uint src1_base = i1 * (nb11 / 4);
+    const uint state_width = p.kernel_size - 1;
+    float old_state[8];
+    for (uint i = 0; i < 8; ++i) {
+        old_state[i] = 0.0;
+    }
+    for (uint i = 0; i < min(state_width, 8u); ++i) {
+        old_state[i] = conv_state[c * state_width + i];
+    }
 
-    float sum = 0.0;
+    for (uint t = 0; t < p.seq_len; ++t) {
+        float sum = 0.0;
+        for (uint k = 0; k < p.kernel_size; ++k) {
+            const int src_t = int(t) - int(state_width) + int(k);
+            float value = 0.0;
+            if (src_t < 0) {
+                const int state_idx = int(state_width) + src_t;
+                if (state_idx >= 0 && state_idx < 8) {
+                    value = old_state[state_idx];
+                }
+            } else {
+                value = x_seq[uint(src_t) * p.num_channels + c];
+            }
+            sum += value * conv_weight[c * p.kernel_size + k];
+        }
+        out_seq[t * p.num_channels + c] = silu(sum);
+    }
 
-    if (nc == 4) {
-        sum = dot(
-            vec4(src0[src0_base], src0[src0_base + 1], src0[src0_base + 2], src0[src0_base + 3]),
-            vec4(src1[src1_base], src1[src1_base + 1], src1[src1_base + 2], src1[src1_base + 3])
-        );
-    } else {
-        [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
-            sum += src0[src0_base + i0] * src1[src1_base + i0];
+    for (uint i = 0; i < state_width; ++i) {
+        const int src_t = int(p.seq_len) - int(state_width) + int(i);
+        if (src_t >= 0) {
+            conv_state[c * state_width + i] = x_seq[uint(src_t) * p.num_channels + c];
+        } else {
+            const int state_idx = int(state_width) + src_t;
+            conv_state[c * state_width + i] =
+                state_idx >= 0 && state_idx < 8 ? old_state[state_idx] : 0.0;
         }
     }
-
-    if (APPLY_BIAS) {
-        sum += bias[i1];
-    }
-    if (APPLY_SILU) {
-        sum = sum / (1.0f + exp(-sum));
-    }
-
-    const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
-    dst[dst_idx] = sum;
 }
