@@ -6,9 +6,11 @@ layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
     uint local_heads;
+    uint num_tokens;
     uint head_dim;
     uint sliding_window;
     uint start_pos;
+    uint sink_offset;
     float sm_scale;
     uint rope_dim;
     float rope_base;
@@ -50,8 +52,8 @@ float rope_inv_freq(uint pair_idx) {
     return inv / p.factor * (1.0 - smooth_weight) + inv * smooth_weight;
 }
 
-void apply_rope_pair(inout float a, inout float b, uint pair_idx, float sign) {
-    const float angle = float(p.start_pos) * rope_inv_freq(pair_idx);
+void apply_rope_pair(inout float a, inout float b, uint pair_idx, uint abs_pos, float sign) {
+    const float angle = float(abs_pos) * rope_inv_freq(pair_idx);
     const float c = cos(angle);
     const float s = sign * sin(angle);
     const float old_a = a;
@@ -67,16 +69,24 @@ float key_value(uint key_pos, uint col) {
 }
 
 void main() {
-    const uint head = gl_GlobalInvocationID.x;
-    if (head >= p.local_heads || p.head_dim == 0 || p.sliding_window == 0) {
+    const uint row = gl_GlobalInvocationID.x;
+    if (p.local_heads == 0 || p.head_dim == 0 || p.sliding_window == 0) {
+        return;
+    }
+    const uint token = row / p.local_heads;
+    const uint head = row - token * p.local_heads;
+    if (token >= p.num_tokens || head >= p.local_heads) {
         return;
     }
 
-    const uint n_ctx = min(p.start_pos + 1, p.sliding_window);
-    const uint base = head * p.head_dim;
-    float max_logit = sink[head];
+    const uint abs_pos = p.start_pos + token;
+    const uint n_ctx = min(abs_pos + 1, p.sliding_window);
+    const uint local_width = p.local_heads * p.head_dim;
+    const uint base = token * local_width + head * p.head_dim;
+    const float sink_value = sink[p.sink_offset + head];
+    float max_logit = sink_value;
     for (uint t = 0; t < n_ctx; ++t) {
-        const uint abs_t = p.start_pos + 1 - n_ctx + t;
+        const uint abs_t = abs_pos + 1 - n_ctx + t;
         float dotv = 0.0;
         for (uint d = 0; d < p.head_dim; ++d) {
             dotv += q[base + d] * key_value(abs_t, d);
@@ -84,12 +94,12 @@ void main() {
         max_logit = max(max_logit, dotv * p.sm_scale);
     }
 
-    float denom = exp(sink[head] - max_logit);
+    float denom = exp(sink_value - max_logit);
     for (uint d = 0; d < p.head_dim; ++d) {
         out_data[base + d] = 0.0;
     }
     for (uint t = 0; t < n_ctx; ++t) {
-        const uint abs_t = p.start_pos + 1 - n_ctx + t;
+        const uint abs_t = abs_pos + 1 - n_ctx + t;
         float dotv = 0.0;
         for (uint d = 0; d < p.head_dim; ++d) {
             dotv += q[base + d] * key_value(abs_t, d);
@@ -109,7 +119,7 @@ void main() {
     for (uint d = 0; d + 1 < rope; d += 2) {
         float a = out_data[base + rope_start + d] * inv_denom;
         float b = out_data[base + rope_start + d + 1] * inv_denom;
-        apply_rope_pair(a, b, d / 2, -1.0);
+        apply_rope_pair(a, b, d / 2, abs_pos, -1.0);
         out_data[base + rope_start + d] = a;
         out_data[base + rope_start + d + 1] = b;
     }
@@ -117,9 +127,9 @@ void main() {
         out_data[base + p.head_dim - 1] *= inv_denom;
     }
     if (p.write_window_cache != 0 && head == 0) {
-        const uint row = p.start_pos % p.sliding_window;
+        const uint cache_row = abs_pos % p.sliding_window;
         for (uint d = 0; d < p.head_dim; ++d) {
-            window_cache[row * p.head_dim + d] = k_new[d];
+            window_cache[cache_row * p.head_dim + d] = k_new[token * p.head_dim + d];
         }
     }
 }
