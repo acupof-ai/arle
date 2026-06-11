@@ -34,7 +34,32 @@ RankData/Signal/barrier framework, `buffers_.find(input_ptrs[rank])`).
 - scratch_ptr == input_ptrs[rank] (the unfused AR, which reads
   input_ptrs[rank] internally, produces correct output on the same serve). ✓
 
-## Prime suspect (next diagnostic)
+## UPDATE — device-printf diagnostic ran: kernel is correct at layer 0, bug is deeper
+
+Ran the prescribed diagnostic (guarded `printf` in both the fused kernel and
+the unfused `dsv4_mhc_post_kernel`, `NVCC_PREPEND_FLAGS=-DARLE_FUSED_AR_DEBUG`,
+same prompt). Layer-0 token-0 column-0:
+
+| | out[0] | new_x | post0 | comb0 | res0 |
+|---|---|---|---|---|---|
+| unfused (correct " Paris…") | 0.024204 | 1.726562 | 0.025342 | 0.888959 | -0.020630 |
+| fused (empty/garbage e2e) | 0.024216 | 1.727051 | 0.025342 | 0.888959 | -0.020630 |
+
+The 8 per-rank partials summed correctly to new_x (e.g. -1.469+0.594+…=1.727),
+and the fused `out[0]` matches the unfused to **bf16 precision**. So BOTH the
+cross-rank reduction AND the hc_post mix are correct — the visibility-fence
+hypothesis is REFUTED (the reduction reads valid peer data). Yet e2e still
+generates empty/garbage. The bug is therefore NOT in the kernel's layer-0
+value; it is a deeper-layer, sync, or buffer-lifetime interaction the
+layer-0-col-0 probe cannot see. Candidates for the next session:
+deeper-layer residual aliasing (does the fused branch leave `attn_out`
+unreduced where a later consumer needs it?), the end-barrier vs the
+subsequent moe AR staging into the same scratch, or a per-layer
+buffer-recycle race. Next diagnostic: print out[0] at the LAST layer + dump
+the full attn_stream row hash fused-vs-unfused per layer to find the
+divergence layer.
+
+## Prime suspect (original — now partly refuted)
 
 The repeating-token degeneracy = attention contributing ~constant/garbage,
 i.e. `new_x` (the in-kernel reduction) is wrong. The unfused AR writes the
