@@ -43,6 +43,7 @@ dependencies = [
  "anyhow",
  "cli",
  "infer-util",
+ "infer-vulkan",
  "serde_json",
  "vulkan-kernels",
  "vulkan-sys",
@@ -1607,6 +1608,19 @@ dependencies = [
  "log",
  "logforth",
  "tempfile",
+]
+
+[[package]]
+name = "infer-vulkan"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "infer-hip",
+ "infer-plan",
+ "infer-seam",
+ "qwen3-spec",
+ "vulkan-kernels",
+ "vulkan-sys",
 ]
 
 [[package]]

@@ -22,6 +22,7 @@ members = [
     "crates/infer-server",
     "crates/infer-topo",
     "crates/infer-util",
+    "crates/infer-vulkan",
     "crates/kv-native-sys",
     "crates/mlx-sys",
     "crates/qwen3-spec",
@@ -103,6 +104,8 @@ hip = ["cli/hip"]
 vulkan = [
     "dep:vulkan-sys",
     "vulkan-sys/vulkan",
+    "dep:infer-vulkan",
+    "infer-vulkan/vulkan",
     "dep:vulkan-kernels",
     "vulkan-kernels/vulkan",
 ]
@@ -116,6 +119,7 @@ deepep = ["nccl", "cli/deepep"]
 [dependencies]
 anyhow = "1.0"
 cli = { path = "crates/cli", default-features = false, optional = true }
+infer-vulkan = { path = "crates/infer-vulkan", default-features = false, optional = true }
 vulkan-kernels = { path = "crates/vulkan-kernels", default-features = false, optional = true }
 vulkan-sys = { path = "crates/vulkan-sys", default-features = false, optional = true }
 

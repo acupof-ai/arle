@@ -1,0 +1,27 @@
+[package]
+name = "infer-vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+infer-hip = { path = "../infer-hip", default-features = false }
+infer-plan = { path = "../infer-plan" }
+infer-seam = { path = "../infer-seam" }
+qwen3-spec = { path = "../qwen3-spec" }
+vulkan-kernels = { path = "../vulkan-kernels", default-features = false, optional = true }
+vulkan-sys = { path = "../vulkan-sys", default-features = false, optional = true }
+
+[features]
+default = []
+vulkan = [
+    "dep:vulkan-sys",
+    "dep:vulkan-kernels",
+    "vulkan-sys/vulkan",
+    "vulkan-kernels/vulkan",
+]
+
+[lints]
+workspace = true
