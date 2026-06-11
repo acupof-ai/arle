@@ -11,7 +11,7 @@ systematic gap: **budget logic was fragmented and partly absent**.
 | Surface | Before | Risk |
 |---------|--------|------|
 | DSv4 CUDA | bottom-up clamp `free×0.9 − shared`, NCCL min-reduce (dsv4.rs) | ok; missing reject-below-fixed guard (**fixed C4**) |
-| Qwen3.5/3.6 CUDA | **NO clamp** — requested num_slots admitted as-is | **OOM at large max_seq_len (the #60 failure class)** |
+| Qwen3.5/3.6 CUDA | **NO clamp** — requested num_slots admitted as-is | ~~OOM at large max_seq_len (the #60 failure class)~~ **fixed C2 + C4, Qwen-pod-validated** |
 | Metal | top-down `plan_resource_budget` (its own planner) | ok, but not shared |
 | Host RAM (T1) / SSD (T2) | hardcoded 4 GiB / 20 GiB constants | not machine-derived (**fixed C3**) |
 
@@ -50,6 +50,9 @@ guards).
     crash at slot alloc, new = clamp + serve. Dense Qwen3 is out of scope: it
     uses a `PagedKVPool` sized by `total_pages` (global pool), not
     num_slots×max_seq_len, so it has no slot-multiplied OOM.
+  - **Pod-VALIDATED** (Qwen3.6-35B-A3B, TP=2): `--num-slots 1024` clamped to 42
+    across both ranks, engine boots, decodes correctly (see GPU-validation
+    section). C4 reject also confirmed on this path (TP=1 + VRAM filler).
 - **Phase C3** (`5353f17f`): **host RAM (T1) / SSD (T2) tiers machine-derived**
   instead of hardcoded. `kv_tier.rs` gains two probes — `/proc/meminfo`
   `MemAvailable` (dep-free) for RAM, POSIX `statvfs` (libc, unix) for free disk
@@ -136,13 +139,48 @@ Qwen3.5 ×1 — and retains DeepGEMM-native, 399 symbols).
   path (admit 1 slot → device OOM at arena alloc). Pod left clean (all 8 GPUs
   back to 0 MiB).
 
-**Still inferred (not pod-exercised).** C2 + C4 on the **Qwen3.5/3.6 CUDA** path
-share the now-validated kernel + NCCL-min-reduce + bail shape with DSv4, but the
-DSv4 lane cannot exercise a Qwen serve; their per-slot mirroring of
-`new_slot_state` is by inspection. C3 host RAM/SSD derivation is unit-tested and
-resolves to the caps on the ample pod (byte-identical). A Qwen3.5 CUDA serve at
-an over-large shape is the one remaining round-trip — risk is bounded by the
-shared validated kernel.
+**GPU validation — Qwen3.5/3.6 MoE lane DONE on the H20 pod (Qwen3.6-35B-A3B,
+`qwen3_5_moe`, 256 experts / 40 layers / 67 GB BF16, same HEAD release-fast
+binary).** The Qwen MoE serve routes through `classify_cuda_model →
+CudaModelKind::Qwen3Moe → from_qwen35_moe_safetensors →
+Qwen35Model::kv_budget_num_slots` — the **exact** C2 clamp + C4 reject code, a
+different file (`qwen35.rs:810-861`) than the DSv4 path the run above exercised.
+Two hardware constraints shaped the runs (both real findings): Qwen3.6 has
+`num_kv_heads = 2`, so the full-attn head shard needs `world_size | 2` — **TP=8
+fails the divisibility check before the budget code runs**, valid TP ≤ 2 (the
+support-matrix "Qwen3.6 = Metal" is really this head-count limit, not a CUDA
+gap); and the RoPE cache caps `max_seq_len` at 262144, bounding per-slot KV to
+~5 GB — far below a 96 GB H20's free VRAM, so the affordable-0 reject is a
+tight-VRAM guard **unreachable by context length alone** on this hardware.
+
+- **C2 clamp — CONFIRMED (TP=2, GPUs 0–1).** Oversized `--num-slots 1024` at the
+  128K default (`total_pages 8192`): `Qwen3.5 KV budget: free 61759MB, per_slot
+  1310MB (K+V 1280MB + gdr 30MB + conv 0MB)` → `requested 1024 slots ×
+  ~1310MB/slot exceeds the cross-rank-min affordable 42 (local affordable 42);
+  clamping num_slots to 42`. `local == cross-rank-min` proves the NCCL
+  all_reduce_min returned symmetrically on both ranks; `[arle-worker rank=1]
+  engine built; entering lockstep driver` + `executor clamped slots 1024 -> 42;
+  scheduler follows` confirm both ranks built and the clamp propagated to the
+  scheduler. Both GPUs at 90451 MiB (weights ~33.5 GB + 42 × 1310 MB), zero OOM,
+  and the clamped serve **decodes correctly** (`The capital of France is` →
+  `" Paris, a city renowned for its rich"`). C2 thus clears the same bar as
+  DSv4 C1 (clamp + boot + correct decode).
+- **C4 reject — CONFIRMED (TP=1, GPU 0 + a 25 GiB VRAM filler,
+  `scripts/_conv_gpu_filler.py`).** With free VRAM constrained so post-weights
+  free couldn't hold one slot at the RoPE-cap 262144 context: `Qwen3.5 KV budget
+  rejected startup: post-weights free VRAM affords 0 slots at max_seq_len 262144
+  (per_slot ~5181MB exceeds 0.9 of free). Lower --max-seq-len or free VRAM.`
+  `per_slot ~5181MB` matches the measured K+V scaling exactly (0.15625
+  MB/head/page × 2 heads × 16384 pages + gdr). No clamp, **zero OOM / CUDA error
+  / panic** — the same fail-closed improvement validated on DSv4, now directly
+  observed on the Qwen branch (not by shared-mechanism inference). Pod left clean
+  (all GPUs 0 MiB).
+
+**Convergence fully pod-validated.** DSv4 (C1 byte-identity + C4 reject across 8
+ranks) and Qwen3.5/3.6 (C2 clamp + correct decode + C4 reject) both exercise the
+shared infer-seam budget kernel on real H20 hardware. The only residual is C3's
+host RAM/SSD derivation, which stays unit-tested and resolves to the caps on the
+ample pod (byte-identical serving footprint).
 
 ## Rule
 
