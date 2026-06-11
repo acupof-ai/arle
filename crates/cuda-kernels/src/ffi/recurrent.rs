@@ -195,3 +195,69 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 }
+
+// ============================================================================
+// FlashQLA chunked GDR fwd (board #3) — TileLang AOT, Hopper-only, fixed
+// Qwen3.6 shard H=32/Hg=16/DK=DV=128/chunk=64. Non-sm90 builds link
+// CUDA_ERROR_NOT_SUPPORTED stubs; `gdr_fq_prep_cuda` is native CUDA C
+// (csrc/misc/gated_delta_rule.cu) and links everywhere.
+//
+// Pipeline per prefill chunk (batch=1, token-major dense tensors):
+//   prep:   qkv_conv [S, qkv_dim] -> q/k [S,16,128] l2norm'd bf16,
+//           v [S,32,128] bf16, g/beta [S,32] f32
+//   cumsum: g -> g_cumsum (chunk-local, 64)
+//   kkt:    (k, beta) -> a_inv [S,32,64] bf16
+//   fwd:    (q,k,v,a_inv,g_cumsum,beta,h0) -> o [S,32,128] bf16, ht
+//           h0/ht may BOTH point at the slot state [32,128,128] f32
+//           (each CTA reads its h0 slice fully before writing ht).
+// ============================================================================
+#[allow(dead_code)]
+unsafe extern "C" {
+    pub fn gdr_fq_prep_cuda(
+        qkv: *const Half,
+        b_proj: *const Half,
+        a_proj: *const Half,
+        dt_bias: *const Half,
+        A_log: *const f32,
+        q_out: *mut Half,
+        k_out: *mut Half,
+        v_out: *mut Half,
+        g_out: *mut f32,
+        beta_out: *mut f32,
+        num_key_heads: i32,
+        num_value_heads: i32,
+        key_dim: i32,
+        val_dim: i32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_cumsum_cuda(
+        g_in: *const f32,
+        g_out: *mut f32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_kkt_cuda(
+        k: *const Half,
+        beta: *const f32,
+        a_inv: *mut Half,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_fwd_cuda(
+        q: *const Half,
+        k: *const Half,
+        v: *const Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        h0: *const f32,
+        o: *mut Half,
+        ht: *mut f32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+}
