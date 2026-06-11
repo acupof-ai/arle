@@ -793,9 +793,11 @@ mod backend {
                 .root
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("--kv-ssd-max-bytes requires --kv-ssd-path"))?;
+            // Machine-derived T2 budget when `--kv-ssd-max-bytes` is unset:
+            // probe free disk at the spill root (borrow ends before the move).
             let budget = kv_ssd
                 .max_bytes
-                .unwrap_or(infer_cuda::DEFAULT_KV_SSD_BUDGET_BYTES);
+                .unwrap_or_else(|| infer_cuda::default_t2_budget_bytes(&root));
             let consumed = serve.run_on_executor(move |e| e.set_kv_tier_disk(root, budget))?;
             anyhow::ensure!(
                 consumed,
@@ -876,8 +878,9 @@ mod backend {
                 num_slots,
                 config.total_pages,
             )?,
-            // NOTE: Qwen3Moe has no DSv4-style `kv_budget_num_slots` mem clamp yet
-            // (load OOM risk if total_pages × num_slots exceeds free HBM) — deferred.
+            // Qwen3Moe clamps `num_slots` to free HBM inside the constructor
+            // (`Qwen35Model::kv_budget_num_slots`, unified with DSv4 via the
+            // infer-seam budget kernel) — no longer the #60 OOM risk.
             CudaModelKind::Qwen3Moe => CudaExecutor::from_qwen35_moe_safetensors(
                 model_path,
                 num_slots,
