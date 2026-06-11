@@ -2096,6 +2096,62 @@ mod tests {
     }
 
     #[test]
+    fn preemption_with_tier_swaps_prompt_and_promotes_on_readmission() -> Result<()> {
+        let mut engine = Engine::with_config(
+            TierMockExecutor::with_capacity(8),
+            MockKvPool::with_capacity(2, 4, 16),
+            test_config(2),
+        );
+        let handle = engine.submit_request((1..=8).collect(), 4);
+        engine.step()?;
+        engine.step()?;
+        let (&slot, request) = engine.active.iter().next().expect("request active");
+        assert!(matches!(request.phase, RequestPhase::Decoding));
+
+        engine.requeue_preempted_decode(slot);
+        assert!(engine.active.is_empty(), "victim re-queued");
+        let tier = engine.kv_tier_stats();
+        assert_eq!(
+            tier.demoted_pages, 2,
+            "both sealed prompt blocks swapped to the host tier: {tier:?}"
+        );
+
+        // Re-admission promotes the prompt back instead of re-prefilling.
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(handle).expect("completed"));
+        let tier = engine.kv_tier_stats();
+        assert!(tier.promoted_pages >= 2, "prompt promoted back: {tier:?}");
+        assert!(engine.prefix_cache_stats().hits >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn preemption_without_tier_is_unchanged() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(2, 4, 16),
+            test_config(2),
+        );
+        let free_before = engine.kv_free_pages();
+        let handle = engine.submit_request((1..=8).collect(), 4);
+        engine.step()?;
+        engine.step()?;
+        let (&slot, _) = engine.active.iter().next().expect("request active");
+
+        engine.requeue_preempted_decode(slot);
+        assert_eq!(
+            engine.radix.cached_page_count(),
+            0,
+            "no publish on the plain recompute path"
+        );
+        assert_eq!(engine.kv_free_pages(), free_before, "all pages freed");
+
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(handle).expect("completed"));
+        Ok(())
+    }
+
+    #[test]
     fn tier_full_rotates_out_the_coldest_entry() -> Result<()> {
         let mut engine = Engine::with_config(
             TierMockExecutor::with_capacity(1),
