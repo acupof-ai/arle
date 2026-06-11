@@ -16,6 +16,8 @@ use infer_plan::{FinishReason, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::execution::CounterSnapshot;
+
 /// Minimal `/v1/completions` request body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionRequest {
@@ -227,6 +229,76 @@ impl ModelsResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct StatsResponse {
+    pub scheduler: SchedulerStats,
+    pub prefix_cache: PrefixCacheStatsResponse,
+    pub ssd_recall: SsdRecallStats,
+}
+
+impl StatsResponse {
+    pub(crate) fn from_counters(counters: CounterSnapshot) -> Self {
+        Self {
+            scheduler: SchedulerStats {
+                active_requests: counters.active_requests,
+                queue_depth: counters.queue_depth,
+                kv_free_pages: counters.kv_free_pages,
+            },
+            prefix_cache: PrefixCacheStatsResponse {
+                lookups: counters.prefix_cache.lookups,
+                hits: counters.prefix_cache.hits,
+                hit_rate: ratio(counters.prefix_cache.hits, counters.prefix_cache.lookups),
+                hit_tokens: counters.prefix_cache.hit_tokens,
+                hit_pages: counters.prefix_cache.hit_pages,
+                published_pages: counters.prefix_cache.published_pages,
+                cached_pages: counters.prefix_cache.cached_pages,
+            },
+            ssd_recall: SsdRecallStats {
+                available: false,
+                lookups: 0,
+                hits: 0,
+                recall_rate: None,
+                not_available_reason: "ssd kv recall is not implemented in the rewrite serve path",
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SchedulerStats {
+    pub active_requests: usize,
+    pub queue_depth: usize,
+    pub kv_free_pages: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrefixCacheStatsResponse {
+    pub lookups: u64,
+    pub hits: u64,
+    pub hit_rate: Option<f64>,
+    pub hit_tokens: u64,
+    pub hit_pages: u64,
+    pub published_pages: u64,
+    pub cached_pages: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SsdRecallStats {
+    pub available: bool,
+    pub lookups: u64,
+    pub hits: u64,
+    pub recall_rate: Option<f64>,
+    pub not_available_reason: &'static str,
+}
+
+fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
+    if denominator == 0 {
+        None
+    } else {
+        Some(numerator as f64 / denominator as f64)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CompletionChoice {
     pub text: String,
     pub index: usize,
@@ -378,5 +450,29 @@ mod tests {
         assert_eq!(v["data"][0]["object"], "model");
         assert_eq!(v["data"][0]["owned_by"], "arle");
         assert!(v["data"][0]["created"].is_u64());
+    }
+
+    #[test]
+    fn stats_response_reports_prefix_rate_and_ssd_unavailable() {
+        let resp = StatsResponse::from_counters(CounterSnapshot {
+            active_requests: 0,
+            queue_depth: 0,
+            kv_free_pages: 7,
+            prefix_cache: infer_core::PrefixCacheStats {
+                lookups: 4,
+                hits: 3,
+                hit_tokens: 96,
+                hit_pages: 6,
+                published_pages: 8,
+                cached_pages: 8,
+            },
+        });
+
+        let v = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(v["scheduler"]["kv_free_pages"], 7);
+        assert_eq!(v["prefix_cache"]["hit_rate"], 0.75);
+        assert_eq!(v["prefix_cache"]["hit_tokens"], 96);
+        assert_eq!(v["ssd_recall"]["available"], false);
+        assert!(v["ssd_recall"]["recall_rate"].is_null());
     }
 }

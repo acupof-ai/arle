@@ -18,7 +18,7 @@ use infer_seam::{BackendExecutor, KvPool};
 use crate::ServeHandle;
 use crate::schema::{
     ApiError, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
-    ModelsResponse,
+    ModelsResponse, StatsResponse,
 };
 use crate::tokenizer::OpenAiTokenizer;
 
@@ -47,6 +47,7 @@ where
         .route("/v1/completions", post(completions::<E, K>))
         .route("/v1/chat/completions", post(chat_completions::<E, K>))
         .route("/v1/models", get(list_models::<E, K>))
+        .route("/v1/stats", get(stats::<E, K>))
         // Long-context prompts (e.g. a ~900K-token needle) serialize to several MB,
         // far over axum's 2 MiB default. Allow up to 256 MiB (a 1M-token prompt is
         // only a handful of MB; the cap stays well under any real DoS concern here).
@@ -62,6 +63,22 @@ where
     K: KvPool + 'static,
 {
     Json(ModelsResponse::single(state.model.clone()))
+}
+
+/// `GET /v1/stats` — compact runtime counters for bench and smoke probes.
+async fn stats<E, K>(
+    State(state): State<Arc<HttpState<E, K>>>,
+) -> Result<Json<StatsResponse>, ApiError>
+where
+    E: BackendExecutor + 'static,
+    K: KvPool + 'static,
+{
+    let counters = state
+        .serve
+        .lock()
+        .map_err(|_| ApiError::internal("serve lock poisoned"))?
+        .counters();
+    Ok(Json(StatsResponse::from_counters(counters)))
 }
 
 async fn completions<E, K>(
