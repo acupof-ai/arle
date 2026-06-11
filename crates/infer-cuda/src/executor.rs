@@ -1097,10 +1097,25 @@ impl Dsv4CudaExecutor {
 
         // ── Depth-K MTP: chain K drafts off the MTP head, verify
         // [pending, d0..d_{K-1}] in ONE batched forward, accept the longest correct
-        // prefix, commit accepted+bonus, roll back the rejected tail. K from the
-        // CLI/env config; K=1 reduces to the original depth-1 path. Greedy-equivalent:
-        // every committed token is the target's argmax.
-        let depth = self.spec_draft_tokens.unwrap_or(1).max(1);
+        // prefix, commit accepted+bonus, roll back the rejected tail. K=1 reduces to
+        // the validated depth-1 batched-verify path. Greedy-equivalent: every committed
+        // token is the target's argmax.
+        //
+        // Depth-K (K>1) is PARKED on the draft-quality wall: the checkpoint's 1-layer
+        // mtp.0 nextn head loops when chained (drafts=[223,4489,223,4489]), accept
+        // collapses to 1/4 @ K=4 (measured 2026-06-11) so there is no amortization
+        // benefit, plus a residual K>1 verify correctness bug. The --mtp-draft-tokens
+        // flag stays wired for a future EAGLE-tree draft head; until one lands we clamp
+        // to depth-1 so an explicit `--mtp-draft-tokens N` can never run the broken path.
+        // See errors/2026-06-11-dsv4-mtp-depth-k-draft-quality-wall.md.
+        let requested = self.spec_draft_tokens.unwrap_or(1).max(1);
+        if requested > 1 {
+            log::warn!(
+                "[dsv4-mtp] --mtp-draft-tokens={requested} requested but depth-K is parked \
+                 (draft-quality wall: 1-layer nextn head loops, accept 1/4 @ K=4); clamping to depth-1"
+            );
+        }
+        let depth = 1usize;
 
         // Draft chain: d_i = mtp_forward(prev_stream, prev_token) at start_pos+i, each
         // chaining from the previous draft's wide MTP stream so d_{i+1} conditions on d_i.
