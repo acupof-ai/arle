@@ -1,4 +1,4 @@
-# DSv4 MTP depth-K KILLED — draft-quality wall, not a depth bug
+# DSv4 MTP linear depth-K KILLED — LINEAR-chain wall (first thought draft-quality; corrected: EAGLE-tree off the SAME head reaches 2.44 tokens)
 
 ## Context
 
@@ -46,16 +46,38 @@ Clamp the effective depth to 1 (`executor.rs:1103`, commit `37986aeb`); keep
 a future EAGLE-tree draft head without re-exposing the broken path. Default
 (no flag) is unchanged: validated depth-1 batched verify.
 
+## CORRECTION (2026-06-11, same day) — this was MIS-ATTRIBUTED
+
+Research into DeepSeek's own MTP (`docs/research/2026-06-11-dsv4-mtp-eagle-and-decode-operators.md`)
+overturns the "head too weak" root cause. **DeepSeek-V4-Flash ships exactly one
+NextN module (`num_nextn_predict_layers=1`) — the same head we have — and SGLang
+chains it 4 steps via EAGLE to a measured 2.44 accepted tokens / step** (2.18 at
+3-token; 1.8× decode at bs=1, LMSYS). The single head provably CAN draft ~2.44
+tokens. Our 1/4 is **3.4× worse than the identical-architecture head**, so the
+collapse is our **linear chain**, not the head:
+
+- We draft topk=1 **linearly**; SGLang drafts a **tree** (eagle-topk>1) and
+  verifies all paths — a linear chain forfeits the whole tail on the first wrong
+  draft (the 1/4 plateau).
+- We feed the single MTP layer's own stream back as `h_prev` (off-distribution);
+  the tree hedges this for SGLang.
+- Our chain attends the **shared** frozen target KV; the draft needs its **own**
+  scratch KV so draft *i* sees draft *i−1* without corrupting the target (the
+  2-cycle `[223,4489]` smells like draft *i* blind to the chain — confirm by
+  logging draft attention length per step).
+
+The depth-1 **clamp stays correct** (linear depth-K IS worse than depth-1), but
+the wall is the **linear chain**, not draft-head quality. The licensed path to
+~1.8× is EAGLE-tree drafting + a dedicated draft KV cache + frozen-KV verify.
+
 ## Rule
 
-**Speculative-decode depth is gated on draft-head quality, not driver
-correctness.** A single-layer checkpoint nextn head is a depth-1 instrument —
-chaining it past its training signal produces a context-free token cycle whose
-acceptance pins at 1/K, so depth-K is strictly worse than depth-1 regardless of
-how correct the rollback logic is. Measure per-position acceptance (`matches=`)
-BEFORE crediting any depth-K speedup; the win only exists if drafts 1..K-1 land.
-The path from 16 ms → 6 ms is a stronger multi-token draft (EAGLE-style trained
-head), not a deeper chain off the depth-1 head — and per the B=1 decode washes
-(`a222ab64`: per-kernel GPU-time optimization DEAD, mHC overlapped → wall-neutral;
-`daccf20a`: decode-graph wash −5%) amortization is the *only* lever that moves
-the wall.
+**Before declaring a spec-decode depth wall, compare acceptance against the
+reference impl on the SAME architecture.** Our single NextN head is identical to
+DeepSeek's; SGLang gets 2.44 tokens from it, we got 1 — that 3.4× gap is the
+evidence that the *driver* (linear chain, shared KV, off-dist feedback), not the
+*head*, is the limit. Measuring per-position acceptance (`matches=`) was right; the
+error was concluding "head too weak" without the reference-impl cross-check. A
+linear chain off a single head plateaus at ~1 accepted; an EAGLE tree off the
+SAME head reaches ~2.44. "Depth-K is dead" → "linear depth-K is dead; tree depth-K
+is the open lever."
