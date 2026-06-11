@@ -358,7 +358,7 @@ impl RealCudaExecutor {
     }
 }
 
-use crate::kv_tier::{CudaKvTierStore, DEFAULT_KV_TIER_BUDGET_BYTES};
+use crate::kv_tier::{CudaKvTierStore, default_t1_budget_bytes};
 
 pub(crate) struct QwenCudaExecutor {
     model: CudaModel,
@@ -462,7 +462,7 @@ impl QwenCudaExecutor {
 
         let slot_progress = vec![SlotProgress::default(); num_slots];
         let tier =
-            CudaKvTierStore::with_budget(DEFAULT_KV_TIER_BUDGET_BYTES, kv.storage_bytes_per_page());
+            CudaKvTierStore::with_budget(default_t1_budget_bytes(), kv.storage_bytes_per_page());
         Ok(Self {
             model,
             kv,

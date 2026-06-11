@@ -81,9 +81,9 @@ pub use qwen35::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 pub use executor::dsv4_max_seq_len;
 #[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
-/// Default T2 disk budget when `--kv-ssd-path` is given without
-/// `--kv-ssd-max-bytes`.
-pub use kv_tier::DEFAULT_KV_SSD_BUDGET_BYTES;
+/// Machine-derived T2 disk budget when `--kv-ssd-path` is given without
+/// `--kv-ssd-max-bytes` (probes free disk; capped at the proven 20 GiB).
+pub use kv_tier::default_t2_budget_bytes;
 /// Rank-0 NCCL `unique_id` mint for multiproc launchers (see [`loader::mint_nccl_unique_id_hex`]).
 #[cfg(feature = "nccl")]
 pub use loader::mint_nccl_unique_id_hex;
