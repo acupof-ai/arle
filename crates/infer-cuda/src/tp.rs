@@ -478,6 +478,15 @@ impl TpRuntime {
     /// TP=8 ranks only hold their local head slab. This helper gathers one
     /// local BF16 row from every rank into a rank-major receive buffer; the
     /// caller repacks that buffer into FlashMLA's head-major layout.
+    ///
+    /// # Safety
+    ///
+    /// `sendbuf` must point to at least `sendcount` contiguous BF16 elements on
+    /// this rank's current CUDA device. `recvbuf` must point to writable device
+    /// memory large enough for `sendcount * world_size` BF16 elements. Both
+    /// buffers must remain valid until the collective enqueued on `ctx.stream`
+    /// completes, and every rank in the TP group must call this method with the
+    /// same `sendcount`.
     #[cfg(feature = "cuda")]
     #[cfg_attr(not(feature = "nccl"), allow(unused_variables))]
     pub unsafe fn all_gather_bf16_raw(

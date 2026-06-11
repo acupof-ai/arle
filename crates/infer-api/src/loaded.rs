@@ -728,6 +728,7 @@ mod backend {
     ///     `num_slots × per-slot tokens`. Sizing a slot-arena model for a single
     ///     max-context request under-admits at c>1 (a second long request waits
     ///     for fictional pages while a real slot arena sits free).
+    ///
     /// `CudaKvPool::new` allocates NO HBM (just a `Vec<u32>` of page ids).
     ///
     /// `num_slots` must be the EFFECTIVE slot count (post KV-budget clamp), not
