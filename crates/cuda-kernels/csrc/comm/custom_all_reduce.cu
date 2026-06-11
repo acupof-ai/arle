@@ -112,6 +112,51 @@ __global__ void chain_touch(__nv_bfloat16* output, __nv_bfloat16* input) {
   input[0] = output[0];
 }
 
+// ── Fused all-reduce + DSv4 hc_post: replaces [1stage AR kernel] + [hc_post
+// kernel] + the AR-output intermediate with one kernel. Each thread reduces
+// one hidden column across all ranks (fixed rank order → bitwise-identical
+// like the bare 1stage), then runs the hc_post mix (post·new_x +
+// Σ comb·residual) directly from registers into `out` (hidden×hc_mult).
+// `shared_add` (optional, moe site) is summed into new_x before hc_post so
+// the shared-expert add folds in too. Grid-strided over `hidden` columns;
+// inputs are fully staged before launch (same precondition as 1stage), so
+// the per-block start/end barriers suffice. bf16 scalar reduce (B=1 hidden
+// is tiny; correctness-first).
+template <int ngpus>
+__global__ void __launch_bounds__(sglang::kMaxThreadsPerBlock, 1)
+    dsv4_fused_ar_hc_post_kernel(
+        sglang::RankData* _dp, sglang::RankSignals sg, sglang::Signal* self_sg,
+        const __nv_bfloat16* __restrict__ shared_add,  // or nullptr
+        const __nv_bfloat16* __restrict__ residual,    // [hidden*hc_mult]
+        const float* __restrict__ post,                // [hc_mult]
+        const float* __restrict__ comb,                // [hc_mult*hc_mult]
+        __nv_bfloat16* __restrict__ out,               // [hidden*hc_mult]
+        int rank, int hidden, int hc_mult) {
+  auto dp = *_dp;
+  sglang::multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+  for (int col = blockIdx.x * blockDim.x + threadIdx.x; col < hidden;
+       col += gridDim.x * blockDim.x) {
+    // All-reduce this column in fixed rank order (deterministic).
+    float acc = 0.0f;
+#pragma unroll
+    for (int r = 0; r < ngpus; ++r) {
+      acc += __bfloat162float(((const __nv_bfloat16*)dp.ptrs[r])[col]);
+    }
+    if (shared_add != nullptr) acc += __bfloat162float(shared_add[col]);
+    const float new_x = acc;
+    // hc_post: out[dst_lane, col] = post[dst]*new_x + Σ_src comb[dst,src]*res[src,col]
+    for (int dst = 0; dst < hc_mult; ++dst) {
+      float value = post[dst] * new_x;
+      for (int src = 0; src < hc_mult; ++src) {
+        value += comb[dst * hc_mult + src] *
+                 __bfloat162float(residual[src * hidden + col]);
+      }
+      out[dst * hidden + col] = __float2bfloat16(value);
+    }
+  }
+  sglang::multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
+}
+
 }  // namespace
 
 extern "C" {
@@ -392,6 +437,45 @@ extern "C" CUresult arle_car_allgather_bf16_into(
       return CUDA_ERROR_INVALID_VALUE;
   }
 #undef ARLE_AG_PROD_CASE
+  return (CUresult)cudaGetLastError();
+}
+
+
+// Fused AR + hc_post production entry. `new_x` is this rank's attention output,
+// already staged into the registered scratch (input_ptrs[rank]); peers' copies
+// are visible via RankData. `shared_or_0`=0 skips the shared-expert add.
+extern "C" CUresult arle_car_fused_ar_hc_post(
+    void* h, CUstream stream, uint64_t shared_or_0, uint64_t residual_ptr,
+    uint64_t post_ptr, uint64_t comb_ptr, uint64_t out_ptr, int hidden,
+    int hc_mult) {
+  auto* p = static_cast<ArleCarProd*>(h);
+  if (hidden <= 0 || hc_mult <= 0) return CUDA_ERROR_INVALID_VALUE;
+  auto it = p->car->buffers_.find(p->input_ptrs[p->rank]);
+  if (it == p->car->buffers_.end()) return CUDA_ERROR_INVALID_VALUE;
+  sglang::RankData* ptrs = it->second;
+  const int threads = 256;
+  int blocks = std::min(sglang::kMaxBlocks, (hidden + threads - 1) / threads);
+  blocks = std::max(blocks, 1);
+  const auto* shared = reinterpret_cast<const __nv_bfloat16*>(shared_or_0);
+  const auto* residual = reinterpret_cast<const __nv_bfloat16*>(residual_ptr);
+  const auto* post = reinterpret_cast<const float*>(post_ptr);
+  const auto* comb = reinterpret_cast<const float*>(comb_ptr);
+  auto* out = reinterpret_cast<__nv_bfloat16*>(out_ptr);
+
+#define ARLE_FUSED_CASE(ngpus)                                                            \
+  case ngpus:                                                                             \
+    dsv4_fused_ar_hc_post_kernel<ngpus><<<blocks, threads, 0, (cudaStream_t)stream>>>(    \
+        ptrs, p->car->sg_, p->car->self_sg_, shared, residual, post, comb, out,           \
+        p->rank, hidden, hc_mult);                                                        \
+    break;
+  switch (p->world) {
+    ARLE_FUSED_CASE(2)
+    ARLE_FUSED_CASE(4)
+    ARLE_FUSED_CASE(8)
+    default:
+      return CUDA_ERROR_INVALID_VALUE;
+  }
+#undef ARLE_FUSED_CASE
   return (CUresult)cudaGetLastError();
 }
 
