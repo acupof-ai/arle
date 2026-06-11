@@ -4,7 +4,7 @@
 //! synchronous completion, and host sampling once numeric logits exist. Until
 //! a model is loaded, every non-idle plan errors loud.
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
 
@@ -34,11 +34,11 @@ pub fn classify_vulkan_architecture(
     if arch.contains("gemma4") || name.contains("gemma-4") || name.contains("gemma4") {
         return VulkanModelKind::Gemma4;
     }
-    if arch.contains("qwen3moe") || arch.contains("qwen3_moe") || expert_count > 0 {
-        return VulkanModelKind::Qwen36Moe;
-    }
     if name.contains("qwen3.5") || name.contains("qwen35") {
         return VulkanModelKind::Qwen35Hybrid;
+    }
+    if arch.contains("qwen3moe") || arch.contains("qwen3_moe") || expert_count > 0 {
+        return VulkanModelKind::Qwen36Moe;
     }
     VulkanModelKind::Qwen3Dense
 }
@@ -288,6 +288,10 @@ mod tests {
         );
         assert_eq!(
             classify_vulkan_architecture("qwen3", Some("Qwen3.5-4B"), 0),
+            VulkanModelKind::Qwen35Hybrid
+        );
+        assert_eq!(
+            classify_vulkan_architecture("qwen3moe", Some("Qwen3.5-MoE-A2B"), 64),
             VulkanModelKind::Qwen35Hybrid
         );
         assert_eq!(
