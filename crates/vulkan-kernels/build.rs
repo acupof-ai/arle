@@ -198,6 +198,20 @@ const LOCAL: &[ShaderSpec] = &[
         source: "crates/vulkan-kernels/shaders/swiglu_clamped.comp",
         defines: &[],
     },
+    ShaderSpec {
+        name: "qwen35_ssm_conv",
+        source: "crates/vulkan-kernels/shaders/qwen35_ssm_conv.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "qwen35_gated_delta_net",
+        source: "crates/vulkan-kernels/shaders/qwen35_gated_delta_net.comp",
+        defines: &[
+            "FLOAT_TYPE=float",
+            "USE_SUBGROUP_CLUSTERED=0",
+            "USE_SUBGROUP_ADD=0",
+        ],
+    },
 ];
 
 fn main() {
@@ -261,6 +275,7 @@ fn main() {
         let dst = out_dir.join(format!("{}.spv", spec.name));
         let mut cmd = Command::new(&glslc);
         cmd.arg("-O")
+            .arg("--target-env=vulkan1.1")
             .arg("-I")
             .arg(&shader_dir)
             .arg("-o")
