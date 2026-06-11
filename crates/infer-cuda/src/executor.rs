@@ -1401,6 +1401,21 @@ impl Dsv4CudaExecutor {
         let trunk_hidden = hidden;
         let mut prev_stream: Option<DeviceVec> = None;
         let mut chain_token = pending;
+        // Frozen-KV MTP P1-2: snapshot the K+1 ring slots [start_pos ..= start_pos+depth]
+        // (SW + FP8 + the fp8 packed_rows counter) BEFORE ANY speculative write. The
+        // draft loop below (mtp_forward -> run_mtp_transformer_layer -> mla_attention)
+        // ALSO writes the frozen target layer's SW/FP8 ring at start_pos+i, so the
+        // snapshot MUST precede it — capturing after the draft loop would snapshot
+        // draft-polluted slots for the target layer. On a partial-accept reject with
+        // start_pos >= sliding_window the rejected drafts' ring writes alias still-active
+        // window slots; restore_spec_ring_tail puts the committed content back. No-op
+        // when spec_rings is unallocated (spec decode off).
+        self.model.capture_spec_rings(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            start_pos,
+            depth,
+        )?;
         for i in 0..depth {
             let h_prev: &DeviceVec = match (chain_fresh, prev_stream.as_ref()) {
                 (false, Some(prev)) => prev,
@@ -1477,6 +1492,18 @@ impl Dsv4CudaExecutor {
         let _ = &hiddens;
         self.model
             .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
+        // Frozen-KV MTP P1-2: restore the REJECTED ring tail (slots accepted_n+1
+        // ..= depth) the verify wrote over still-active window slots. The accepted
+        // slots [0 ..= n] are left to the re-forward below, which overwrites them.
+        // No-op when spec decode is off. MUST run after truncate (which only
+        // resets lengths) and before the re-forward.
+        self.model.restore_spec_ring_tail(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            start_pos,
+            n,
+            depth,
+        )?;
         let mut prefix: Vec<u32> = Vec::with_capacity(n + 1);
         prefix.push(pending);
         prefix.extend_from_slice(&drafts[..n]);
