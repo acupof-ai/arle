@@ -7,8 +7,6 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_shader_atomic_float : require
-
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
@@ -28,8 +26,8 @@ layout(binding = 1) writeonly buffer D {
     block_q8_1 data_d[];
 };
 
-shared float absmax;
-shared float sum;
+shared float abs_values[32];
+shared float sums[32];
 
 void main() {
     const uint block = gl_WorkGroupID.x;
@@ -39,20 +37,23 @@ void main() {
     }
 
     const float x = data_x[block * 32 + lane];
-    if (lane == 0) {
-        absmax = 0.0;
-        sum = 0.0;
+    abs_values[lane] = abs(x);
+    sums[lane] = x;
+    barrier();
+
+    for (uint stride = 16; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            abs_values[lane] = max(abs_values[lane], abs_values[lane + stride]);
+            sums[lane] += sums[lane + stride];
+        }
+        barrier();
     }
-    barrier();
 
-    atomicAdd(absmax, abs(x));
-    atomicAdd(sum, x);
-    barrier();
-
+    const float absmax = abs_values[0];
     const float d = absmax == 0.0 ? 0.0 : absmax / 127.0;
     const int q = d == 0.0 ? 0 : int(round(clamp(x / d, -127.0, 127.0)));
     data_d[block].qs[lane] = int8_t(q);
     if (lane == 0) {
-        data_d[block].ds = f16vec2(float16_t(d), float16_t(sum));
+        data_d[block].ds = f16vec2(float16_t(d), float16_t(sums[0]));
     }
 }
