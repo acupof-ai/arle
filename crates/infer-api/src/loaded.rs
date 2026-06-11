@@ -519,6 +519,17 @@ mod backend {
         if matches!(kind, CudaModelKind::Dsv4 | CudaModelKind::Qwen3Moe) {
             scheduler.enable_prefix_cache = false;
         }
+        // The 64-token `chunked_prefill_size` default is a Metal-interactivity
+        // tune (small ticks keep the single-threaded MLX encode loop responsive
+        // between decode steps); on CUDA the per-chunk cost is an entire engine
+        // tick plus a full launch round (GDR/conv/MoE kernels per layer), so a
+        // 2048-token prompt at 64-token ticks pays ~32x the tick/launch overhead
+        // for the same KV-read volume (KV bytes read are chunk-invariant).
+        // Floor the CUDA Qwen kinds at 2048, mirroring the DSv4 override below;
+        // an explicitly larger configured chunk is preserved. (audit QW-KV-07)
+        if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen3Moe) {
+            scheduler.chunked_prefill_size = scheduler.chunked_prefill_size.max(2048);
+        }
         // DSv4 prefill activation scratch is bounded by the query-chunk size
         // (`DSV4_PREFILL_QUERY_CHUNK` = 4096): the chunked-prefill forward asserts
         // each call passes <= that many query tokens, so long prompts MUST chunk
