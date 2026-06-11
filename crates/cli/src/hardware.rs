@@ -49,19 +49,30 @@ impl CompiledBackend {
         {
             return Self::Cuda;
         }
-        #[cfg(feature = "metal")]
+        #[cfg(all(not(feature = "cuda"), feature = "metal"))]
         {
             return Self::Metal;
         }
-        #[cfg(feature = "hip")]
+        #[cfg(all(not(feature = "cuda"), not(feature = "metal"), feature = "hip"))]
         {
             return Self::Hip;
         }
-        #[cfg(feature = "vulkan")]
+        #[cfg(all(
+            not(feature = "cuda"),
+            not(feature = "metal"),
+            not(feature = "hip"),
+            feature = "vulkan"
+        ))]
         {
             return Self::Vulkan;
         }
-        #[cfg(feature = "cpu")]
+        #[cfg(all(
+            not(feature = "cuda"),
+            not(feature = "metal"),
+            not(feature = "hip"),
+            not(feature = "vulkan"),
+            feature = "cpu"
+        ))]
         {
             return Self::Cpu;
         }
