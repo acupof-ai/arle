@@ -371,3 +371,135 @@ cudaError_t gated_delta_rule_prefill_recurrent_cuda(
 }
 
 } // extern "C"
+
+// ============================================================================
+// FlashQLA chunked-prefill prep — unpack the fused [q|k|v] projection row
+// into the FlashQLA tensor layouts and derive g/beta.
+//
+// Mirrors the recurrent kernels' math LINE-FOR-LINE (same l2norm eps 1e-12,
+// same softplus/sigmoid forms) so the chunked path inherits the licensed
+// semantics; the ONLY deliberate difference is that q is NOT pre-scaled by
+// rsqrt(key_dim) — FlashQLA bakes scale=K^-0.5 into its fused kernel (applied
+// to P and O, mathematically the same place).
+//
+// Outputs (token-major, dense — TileLang AOT tensors assume contiguous):
+//   q_out  [S, Hg, 128] bf16  l2-normalized
+//   k_out  [S, Hg, 128] bf16  l2-normalized
+//   v_out  [S, H, 128]  bf16  copy (qkv rows are strided by qkv_dim)
+//   g_out  [S, H]       f32   -exp(A_log)*softplus(a+dt_bias)  (pre-cumsum)
+//   beta_out [S, H]     f32   sigmoid(b)
+//
+// Grid (S, H): block y handles v-head y (v copy + g/beta); blocks y < Hg
+// additionally l2norm key-head y's q/k. 128 threads = one element per
+// thread; block reduce via 4-warp partials.
+// ============================================================================
+
+__global__ void gdr_fq_prep_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ b_proj,
+    const __nv_bfloat16* __restrict__ a_proj,
+    const __nv_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__ A_log,
+    __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ k_out,
+    __nv_bfloat16* __restrict__ v_out,
+    float* __restrict__ g_out,
+    float* __restrict__ beta_out,
+    int num_key_heads,
+    int num_value_heads,
+    int seq_len
+) {
+    const int token = blockIdx.x;
+    const int head = blockIdx.y;  // v-head index; also key-head when < Hg
+    const int d = threadIdx.x;    // 0..127
+    const int warp_id = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 0x1F;
+
+    const int q_dim_total = num_key_heads * GDR_KEY_DIM;
+    const int qkv_stride = 2 * q_dim_total + num_value_heads * GDR_VAL_DIM;
+    const __nv_bfloat16* token_qkv = qkv + (size_t)token * qkv_stride;
+
+    // ── v copy + g/beta (every block: head is a v-head). ──
+    const float v_val =
+        __bfloat162float(token_qkv[2 * q_dim_total + head * GDR_VAL_DIM + d]);
+    v_out[((size_t)token * num_value_heads + head) * GDR_VAL_DIM + d] =
+        __float2bfloat16(v_val);
+
+    if (threadIdx.x == 0) {
+        const float a_val =
+            __bfloat162float(a_proj[(size_t)token * num_value_heads + head]);
+        const float b_val =
+            __bfloat162float(b_proj[(size_t)token * num_value_heads + head]);
+        const float bias = __bfloat162float(dt_bias[head]);
+        const float a_log = A_log[head];
+        const float x = a_val + bias;
+        const float softplus_x = (x > 20.0f) ? x : logf(1.0f + expf(x));
+        g_out[(size_t)token * num_value_heads + head] = -expf(a_log) * softplus_x;
+        beta_out[(size_t)token * num_value_heads + head] =
+            1.0f / (1.0f + expf(-b_val));
+    }
+
+    // ── q/k l2norm (key-head blocks only). ──
+    if (head >= num_key_heads) return;
+
+    __shared__ float warp_partials[2][GDR_VAL_DIM / WARP_SIZE];  // [q|k][4]
+    __shared__ float norms[2];
+
+    const float q_val = __bfloat162float(token_qkv[head * GDR_KEY_DIM + d]);
+    const float k_val =
+        __bfloat162float(token_qkv[q_dim_total + head * GDR_KEY_DIM + d]);
+
+    float q_sq = warp_reduce_sum(q_val * q_val);
+    float k_sq = warp_reduce_sum(k_val * k_val);
+    if (lane_id == 0) {
+        warp_partials[0][warp_id] = q_sq;
+        warp_partials[1][warp_id] = k_sq;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        norms[0] = rsqrtf(warp_partials[0][0] + warp_partials[0][1] +
+                          warp_partials[0][2] + warp_partials[0][3] + 1e-12f);
+        norms[1] = rsqrtf(warp_partials[1][0] + warp_partials[1][1] +
+                          warp_partials[1][2] + warp_partials[1][3] + 1e-12f);
+    }
+    __syncthreads();
+
+    const size_t qk_base = ((size_t)token * num_key_heads + head) * GDR_KEY_DIM + d;
+    q_out[qk_base] = __float2bfloat16(q_val * norms[0]);
+    k_out[qk_base] = __float2bfloat16(k_val * norms[1]);
+}
+
+extern "C" {
+
+cudaError_t gdr_fq_prep_cuda(
+    const __nv_bfloat16* qkv,
+    const __nv_bfloat16* b_proj,
+    const __nv_bfloat16* a_proj,
+    const __nv_bfloat16* dt_bias,
+    const float* A_log,
+    __nv_bfloat16* q_out,
+    __nv_bfloat16* k_out,
+    __nv_bfloat16* v_out,
+    float* g_out,
+    float* beta_out,
+    int num_key_heads,
+    int num_value_heads,
+    int key_dim,
+    int val_dim,
+    int seq_len,
+    cudaStream_t stream
+) {
+    if (key_dim != GDR_KEY_DIM || val_dim != GDR_VAL_DIM || seq_len <= 0 ||
+        num_key_heads <= 0 || num_value_heads < num_key_heads) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(seq_len, num_value_heads);
+    gdr_fq_prep_kernel<<<grid, GDR_VAL_DIM, 0, stream>>>(
+        qkv, b_proj, a_proj, dt_bias, A_log,
+        q_out, k_out, v_out, g_out, beta_out,
+        num_key_heads, num_value_heads, seq_len
+    );
+    return cudaGetLastError();
+}
+
+} // extern "C"

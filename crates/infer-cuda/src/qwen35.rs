@@ -81,6 +81,25 @@ fn qwen35_fa3_enabled() -> bool {
     })
 }
 
+/// `ARLE_QWEN35_GDR_CHUNKED=1`: route GDN prefill chunks (`seq_len > 1`)
+/// through the FlashQLA chunked kernels (TileLang AOT, sm_90a) instead of
+/// the serial `gated_delta_rule_prefill_recurrent` kernel (28.0% of prefill
+/// GPU time pre-FA3 —
+/// `docs/reviews/2026-06-11-qwen35-post-license-reprofile-rerank.md`).
+/// Default OFF (candidate arm). Only valid on the baked Qwen3.6 single-GPU
+/// shard (H=32/Hg=16/128/128 — the call site additionally shape-guards);
+/// builds without an sm_90 target link NOT_SUPPORTED stubs, so keep the gate
+/// off there. Decode (`seq_len == 1`) always stays on the recurrent kernel.
+fn qwen35_gdr_chunked_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ARLE_QWEN35_GDR_CHUNKED").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    })
+}
+
 /// Raw (un-scaled) LoRA A/B matrices for one full-attention q/v projection,
 /// pushed from the train crate's OPD student loop for the per-step re-merge.
 ///
@@ -311,6 +330,16 @@ pub(crate) struct LinearAttnScratch {
     qkv_conv: HiddenSlot,
     gdr_out: HiddenSlot,
     normed_out: HiddenSlot,
+    /// FlashQLA chunked-prefill scratch (`ARLE_QWEN35_GDR_CHUNKED`), all
+    /// token-major dense: q/k `[S, Hg, 128]` bf16 l2norm'd, v `[S, H, 128]`
+    /// bf16, a_inv `[S, H, 64]` bf16, g/g_cumsum/beta `[S, H]` f32.
+    fq_q: HiddenSlot,
+    fq_k: HiddenSlot,
+    fq_v: HiddenSlot,
+    fq_a: HiddenSlot,
+    fq_g: SliceSlot<f32>,
+    fq_g_cumsum: SliceSlot<f32>,
+    fq_beta: SliceSlot<f32>,
 }
 
 #[derive(Default)]
@@ -2186,6 +2215,13 @@ impl Qwen35Model {
             qkv_conv,
             gdr_out,
             normed_out,
+            fq_q,
+            fq_k,
+            fq_v,
+            fq_a,
+            fq_g,
+            fq_g_cumsum,
+            fq_beta,
         } = lw;
         let qkv = qkv.get(&self.ctx, qkv_dim, seq_len)?;
         let z = z.get(&self.ctx, z_dim, seq_len)?;
@@ -2227,11 +2263,102 @@ impl Qwen35Model {
             }
         }
 
-        // ── gated-delta RECURRENT (never chunkwise: WGMMA short-seq path hangs
-        //    on sm_90; the recurrent kernel handles seq_len==1 decode too). ──
+        // ── gated-delta rule. Decode (seq_len==1) is always the recurrent
+        //    kernel. Prefill chunks default to the recurrent kernel; the
+        //    FlashQLA chunked path (ARLE_QWEN35_GDR_CHUNKED) replaces the
+        //    serial token scan with chunk-parallel TileLang kernels on the
+        //    baked Qwen3.6 single-GPU shard. The legacy in-tree chunkwise
+        //    TileLang path stays dead (sm_90 hang was in ITS kernels). ──
         let gdr_out = gdr_out.get(&self.ctx, z_dim, seq_len)?;
-        let gdr_state = &mut slot.gdr_states[linear_idx];
-        {
+        let use_fq_chunked = seq_len > 1
+            && qwen35_gdr_chunked_enabled()
+            && self.local_linear_k_heads == 16
+            && self.local_linear_v_heads == 32
+            && c.linear_key_head_dim == 128
+            && c.linear_value_head_dim == 128;
+        if use_fq_chunked {
+            let hg_dim = self.local_linear_k_heads * c.linear_key_head_dim;
+            let fq_q = fq_q.get(&self.ctx, hg_dim, seq_len)?;
+            let fq_k = fq_k.get(&self.ctx, hg_dim, seq_len)?;
+            let fq_v = fq_v.get(&self.ctx, z_dim, seq_len)?;
+            let fq_a = fq_a.get(&self.ctx, self.local_linear_v_heads * 64, seq_len)?;
+            let g_len = self.local_linear_v_heads * seq_len;
+            let fq_g = fq_g.get(&self.ctx, g_len)?;
+            let fq_g_cumsum = fq_g_cumsum.get(&self.ctx, g_len)?;
+            let fq_beta = fq_beta.get(&self.ctx, g_len)?;
+            let gdr_state = &mut slot.gdr_states[linear_idx];
+
+            let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
+            let (b_ptr, _g1) = b_proj.data.device_ptr(&self.ctx.stream);
+            let (a_ptr, _g2) = a_proj.data.device_ptr(&self.ctx.stream);
+            let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
+            let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
+            let (q_ptr, _g5) = fq_q.data.device_ptr_mut(&self.ctx.stream);
+            let (k_ptr, _g6) = fq_k.data.device_ptr_mut(&self.ctx.stream);
+            let (v_ptr, _g7) = fq_v.data.device_ptr_mut(&self.ctx.stream);
+            let (a_inv_ptr, _g8) = fq_a.data.device_ptr_mut(&self.ctx.stream);
+            let (g_ptr, _g9) = fq_g.device_ptr_mut(&self.ctx.stream);
+            let (gc_ptr, _g10) = fq_g_cumsum.device_ptr_mut(&self.ctx.stream);
+            let (beta_ptr, _g11) = fq_beta.device_ptr_mut(&self.ctx.stream);
+            let (s_ptr, _g12) = gdr_state.device_ptr_mut(&self.ctx.stream);
+            let (o_ptr, _g13) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: all buffers valid on ctx.stream, shapes per the slot
+            // `.get` calls above. The slot state pointer is passed as BOTH
+            // h0 and ht (in-place chunk chaining): each fwd CTA reads its h0
+            // slice fully before writing the same ht slice.
+            unsafe {
+                ffi::gdr_fq_prep_cuda(
+                    qkv_ptr as *const ffi::Half,
+                    b_ptr as *const ffi::Half,
+                    a_ptr as *const ffi::Half,
+                    dt_ptr as *const ffi::Half,
+                    alog_ptr as *const f32,
+                    q_ptr as *mut ffi::Half,
+                    k_ptr as *mut ffi::Half,
+                    v_ptr as *mut ffi::Half,
+                    g_ptr as *mut f32,
+                    beta_ptr as *mut f32,
+                    self.local_linear_k_heads as i32,
+                    self.local_linear_v_heads as i32,
+                    c.linear_key_head_dim as i32,
+                    c.linear_value_head_dim as i32,
+                    seq_len as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+                ffi::gdr_fq_cumsum_cuda(
+                    g_ptr as *const f32,
+                    gc_ptr as *mut f32,
+                    seq_len as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+                ffi::gdr_fq_kkt_cuda(
+                    k_ptr as *const ffi::Half,
+                    beta_ptr as *const f32,
+                    a_inv_ptr as *mut ffi::Half,
+                    seq_len as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+                ffi::gdr_fq_fwd_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    v_ptr as *const ffi::Half,
+                    a_inv_ptr as *const ffi::Half,
+                    gc_ptr as *const f32,
+                    beta_ptr as *const f32,
+                    s_ptr as *const f32,
+                    o_ptr as *mut ffi::Half,
+                    s_ptr as *mut f32,
+                    seq_len as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        if !use_fq_chunked {
+            let gdr_state = &mut slot.gdr_states[linear_idx];
             let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
             let (b_ptr, _g1) = b_proj.data.device_ptr(&self.ctx.stream);
             let (a_ptr, _g2) = a_proj.data.device_ptr(&self.ctx.stream);
@@ -2750,6 +2877,14 @@ impl Qwen35Model {
             qkv_conv,
             gdr_out,
             normed_out,
+            // Batched decode is per-token recurrent; FlashQLA scratch unused.
+            fq_q: _,
+            fq_k: _,
+            fq_v: _,
+            fq_a: _,
+            fq_g: _,
+            fq_g_cumsum: _,
+            fq_beta: _,
         } = lw;
         let qkv = qkv.get(&self.ctx, qkv_dim, b)?;
         let z = z.get(&self.ctx, z_dim, b)?;
