@@ -9,7 +9,7 @@
 
 use std::{env, process::ExitCode};
 
-use infer_api::{EngineLoadConfig, ServeHttpOptions, serve_http};
+use infer_api::{EngineLoadConfig, ServeHttpOptions, ServeSpecOptions, ServeSpecType, serve_http};
 
 use crate::{
     args::{Args, ServeArgs, ServeBackendArg, ServeSpecTypeArg},
@@ -160,7 +160,8 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
 
     // Speculative / MTP routing is Metal-only on the rewrite serve stack today.
     // The CLI rejects it elsewhere so the error surface matches the old front
-    // door; the router itself does not yet thread these through (follow-up).
+    // door. Metal carries it through to infer-api, whose serve path fail-closes
+    // until the executor consumes the options.
     if serve_args.spec_type != ServeSpecTypeArg::None && backend != ServeBackend::Metal {
         return Err("--spec-type is currently only supported by the Metal backend".to_string());
     }
@@ -195,6 +196,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
     }
 
     let engine_config = resolve_engine_config(serve_args)?;
+    let spec = resolve_spec_options(backend, serve_args);
 
     let options = ServeHttpOptions {
         model_path,
@@ -204,6 +206,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         // the CUDA backend only (Metal/CPU ignore it).
         enable_cuda_graph: !args.no_cuda_graph,
         engine_config,
+        spec,
     };
 
     Ok(ServeConfig {
@@ -211,6 +214,27 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         options,
         bind_warning,
     })
+}
+
+fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeSpecOptions {
+    if backend != ServeBackend::Metal {
+        return ServeSpecOptions::default();
+    }
+    let mut spec_type = match serve_args.spec_type {
+        ServeSpecTypeArg::None => ServeSpecType::None,
+        ServeSpecTypeArg::Auto => ServeSpecType::Auto,
+        ServeSpecTypeArg::Mtp => ServeSpecType::Mtp,
+    };
+    if spec_type == ServeSpecType::None
+        && (serve_args.mtp_draft_model.is_some() || serve_args.mtp_draft_tokens.is_some())
+    {
+        spec_type = ServeSpecType::Mtp;
+    }
+    ServeSpecOptions {
+        spec_type,
+        mtp_draft_model: serve_args.mtp_draft_model.clone(),
+        mtp_draft_tokens: serve_args.mtp_draft_tokens,
+    }
 }
 
 fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
@@ -654,6 +678,34 @@ mod tests {
         ]);
         let config = resolve_config(&args, &serve).expect("metal accepts spec type");
         assert_eq!(config.backend, ServeBackend::Metal);
+        assert_eq!(config.options.spec.spec_type, ServeSpecType::Mtp);
+    }
+
+    #[test]
+    fn metal_mtp_draft_model_implies_mtp_spec() {
+        if CompiledBackend::detect() != CompiledBackend::Metal {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            "metal",
+            "--model-path",
+            "model",
+            "--mtp-draft-model",
+            "draft-model",
+            "--mtp-draft-tokens",
+            "2",
+        ]);
+        let config = resolve_config(&args, &serve).expect("metal accepts mtp draft options");
+        assert_eq!(config.backend, ServeBackend::Metal);
+        assert_eq!(config.options.spec.spec_type, ServeSpecType::Mtp);
+        assert_eq!(
+            config.options.spec.mtp_draft_model.as_deref(),
+            Some("draft-model")
+        );
+        assert_eq!(config.options.spec.mtp_draft_tokens, Some(2));
     }
 
     #[test]
