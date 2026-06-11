@@ -9,6 +9,7 @@ use cuda_kernels::ffi;
 use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
 use cuda_kernels::tensor::{WeightFormat, cache_ptr};
+use cuda_kernels::{KVFormat, TokenKVPool};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use infer_seam::{KvBatchDescriptor, KvBatchRowKind};
@@ -19,6 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::dsv4::{
     Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer, Dsv4MlaKvArena,
 };
+use crate::dsv4_page_table::{contiguous_page_table_byte_range, physical_page};
 use crate::loader::PageMeta;
 use crate::tp::TpRuntime;
 
@@ -276,9 +278,22 @@ pub(crate) struct Dsv4KvAdapter {
 }
 
 pub(crate) struct Dsv4LayerKvLayout {
-    flashmla_fp8_kv_pool: Option<CudaSlice<u8>>,
+    /// Shared FP8 MLA latent pool for this layer (#85 P2 Stage A): a
+    /// `TokenKVPool` of opaque packed records (`KVFormat::PackedBytes`,
+    /// 584 B/token), page = FlashMLA block = 64 tokens, single plane (records
+    /// in the K plane, no V/scale buffers). Every slot's band is addressed
+    /// ONLY through its block table ([`Self::flashmla_page_table`] /
+    /// [`Self::flashmla_pages_byte_range`]) — never by `slot_idx × slot_bytes`
+    /// arithmetic. Stage A allocates each slot's pages up-front in slot
+    /// order, so tables are contiguous identity runs and the physical layout
+    /// is byte-identical to the pre-paging band arena.
+    flashmla_kv_pool: Option<TokenKVPool>,
     dsa_key_cache: Option<CudaSlice<u8>>,
-    flashmla_slot_bytes: usize,
+    /// Slot-logical FlashMLA blocks per slot (`sw_blocks + comp_blocks` for
+    /// this layer's shape) — every slot's block-table length.
+    flashmla_slot_pages: usize,
+    /// Bytes of one pool page (`page_block_size × packed record bytes`).
+    flashmla_page_bytes: usize,
     dsa_slot_bytes: usize,
     num_slots: usize,
 }
@@ -451,7 +466,7 @@ impl Dsv4LayerKvLayout {
         tp_world: usize,
         num_slots: usize,
     ) -> Result<Self> {
-        let flashmla_slot_bytes = if dsv4_flashmla_decode_alloc_enabled()? {
+        let flashmla_slot_pages = if dsv4_flashmla_decode_alloc_enabled()? {
             let shape = Dsv4FlashMlaDecodeShape::new(
                 config,
                 mode,
@@ -461,24 +476,83 @@ impl Dsv4LayerKvLayout {
                 local_heads,
                 tp_world,
             )?;
-            shape
-                .total_blocks
-                .checked_mul(kv_arena.page_block_size)
-                .and_then(|rows| rows.checked_mul(kv_arena.bytes_per_token))
-                .ok_or_else(|| anyhow!("DSv4 shared FlashMLA pool byte size overflow"))?
+            shape.total_blocks
         } else {
             0
         };
-        let flashmla_fp8_kv_pool = if flashmla_slot_bytes > 0 {
-            Some(
-                ctx.stream
-                    .alloc_zeros::<u8>(
-                        flashmla_slot_bytes
-                            .checked_mul(num_slots)
-                            .ok_or_else(|| anyhow!("DSv4 shared FlashMLA pool total overflow"))?,
-                    )
-                    .map_err(|e| anyhow!("DSv4 shared FlashMLA pool alloc failed: {e}"))?,
+        let flashmla_page_bytes = kv_arena
+            .page_block_size
+            .checked_mul(kv_arena.bytes_per_token)
+            .ok_or_else(|| anyhow!("DSv4 shared FlashMLA page byte size overflow"))?;
+        let flashmla_kv_pool = if flashmla_slot_pages > 0 {
+            // #85 P2 Stage A: the raw band arena is replaced by a shared
+            // `TokenKVPool` of packed MLA latent records, sized to the SAME
+            // total token budget (`total_blocks × 64 × num_slots` records).
+            let format = KVFormat::PackedBytes {
+                bytes_per_token: kv_arena.bytes_per_token,
+            };
+            ensure!(
+                format.default_page_size() == kv_arena.page_block_size,
+                "DSv4 FlashMLA pool page size {} != arena block size {}",
+                format.default_page_size(),
+                kv_arena.page_block_size
+            );
+            let tokens_per_slot = flashmla_slot_pages
+                .checked_mul(kv_arena.page_block_size)
+                .ok_or_else(|| anyhow!("DSv4 shared FlashMLA slot token overflow"))?;
+            let total_tokens = tokens_per_slot
+                .checked_mul(num_slots)
+                .ok_or_else(|| anyhow!("DSv4 shared FlashMLA pool total overflow"))?;
+            let budget_bytes = TokenKVPool::budget_bytes_for_tokens(
+                1, // single "layer": one pool per Dsv4LayerKvLayout
+                1, // MLA latent is head-less (kv_heads = 1)
+                config.head_dim,
+                total_tokens,
+                format,
+            );
+            let mut pool = TokenKVPool::with_format(
+                ctx,
+                1,
+                1,
+                config.head_dim,
+                num_slots,
+                budget_bytes,
+                format,
             )
+            .map_err(|e| anyhow!("DSv4 shared FlashMLA pool alloc failed: {e}"))?;
+            ensure!(
+                pool.page_size == kv_arena.page_block_size
+                    && pool.max_total_pages == flashmla_slot_pages * num_slots,
+                "DSv4 FlashMLA pool sizing mismatch: page_size={} pages={} expected page_size={} pages={}",
+                pool.page_size,
+                pool.max_total_pages,
+                kv_arena.page_block_size,
+                flashmla_slot_pages * num_slots
+            );
+            // Stage A identity tables: every slot's pages are allocated
+            // up-front in slot order, so slot `i` owns the contiguous run
+            // `[i × total_blocks, (i+1) × total_blocks)` — byte-identical to
+            // the pre-paging band arena. TP lockstep invariant: the tables
+            // derive only from construction constants (num_slots + the
+            // plan-pinned decode shape), so they are identical on every rank;
+            // the NCCL min-reduced slot budget (`kv_budget_num_slots`) stays
+            // the cross-rank capacity gate. Stage B replaces this loop with
+            // host-pool mirroring (Qwen `mirror_slot` pattern).
+            for slot in 0..num_slots {
+                let pages = pool
+                    .alloc_tokens(slot, tokens_per_slot)
+                    .map_err(|e| anyhow!("DSv4 FlashMLA slot {slot} page alloc failed: {e}"))?;
+                let first = (slot * flashmla_slot_pages) as u32;
+                ensure!(
+                    pages.len() == flashmla_slot_pages
+                        && pages
+                            .iter()
+                            .enumerate()
+                            .all(|(i, &p)| p == first + i as u32),
+                    "DSv4 FlashMLA Stage A identity layout violated for slot {slot}"
+                );
+            }
+            Some(pool)
         } else {
             None
         };
@@ -503,9 +577,10 @@ impl Dsv4LayerKvLayout {
             None
         };
         Ok(Self {
-            flashmla_fp8_kv_pool,
+            flashmla_kv_pool,
             dsa_key_cache,
-            flashmla_slot_bytes,
+            flashmla_slot_pages,
+            flashmla_page_bytes,
             dsa_slot_bytes,
             num_slots,
         })
@@ -529,8 +604,64 @@ impl Dsv4LayerKvLayout {
         Ok(start..end)
     }
 
-    fn flashmla_slot_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
-        Self::slot_range(slot_idx, self.flashmla_slot_bytes, self.num_slots)
+    /// The layer's shared FlashMLA latent pool (present iff the decode-alloc
+    /// gate is on and this layer has a non-empty FlashMLA shape).
+    fn flashmla_pool(&self) -> Result<&TokenKVPool> {
+        self.flashmla_kv_pool
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))
+    }
+
+    fn flashmla_pool_mut(&mut self) -> Result<&mut TokenKVPool> {
+        self.flashmla_kv_pool
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))
+    }
+
+    /// Whole-pool data plane (packed records live in the K plane only).
+    fn flashmla_pool_data(&self) -> Result<&CudaSlice<u8>> {
+        Ok(self.flashmla_pool()?.k_data_slice(0))
+    }
+
+    fn flashmla_pool_data_mut(&mut self) -> Result<&mut CudaSlice<u8>> {
+        Ok(self.flashmla_pool_mut()?.k_data_slice_mut(0))
+    }
+
+    /// One slot's page table: slot-logical page → physical pool page
+    /// (FlashMLA's FFI calls our 64-token page a "block"). The ONLY source of band addresses (#85 P2) — token counts and
+    /// block counts come from the pool's table, never re-derived from
+    /// `slot_idx` arithmetic.
+    fn flashmla_page_table(&self, slot_idx: usize) -> Result<&[u32]> {
+        ensure!(
+            slot_idx < self.num_slots,
+            "DSv4 attention pool slot {slot_idx} outside num_slots {}",
+            self.num_slots
+        );
+        Ok(self.flashmla_pool()?.page_indices(slot_idx))
+    }
+
+    /// Table-routed byte range of one slot's FlashMLA band.
+    ///
+    /// Invariant (#85 P2 Stage A): the range derives from the slot's PAGE
+    /// TABLE, and the helper errors unless the table is a contiguous identity
+    /// run — that contiguity is what licenses the band-base addressing the
+    /// device-side pack/index kernels still use. Stage B must hand those
+    /// kernels a device-resident table before tables may fragment.
+    fn flashmla_pages_byte_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
+        let table = self.flashmla_page_table(slot_idx)?;
+        let range = contiguous_page_table_byte_range(
+            table,
+            self.flashmla_slot_pages,
+            self.flashmla_page_bytes,
+        )?;
+        let pool_bytes = self.flashmla_pool_data()?.len();
+        ensure!(
+            range.end <= pool_bytes,
+            "DSv4 FlashMLA table range {:?} outside pool bytes {}",
+            range,
+            pool_bytes
+        );
+        Ok(range)
     }
 
     fn dsa_slot_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
@@ -542,19 +673,19 @@ impl Dsv4LayerKvLayout {
         ctx: &DeviceContext,
         flash: &Dsv4FlashMlaDecodeState,
     ) -> Result<()> {
-        let range = self.flashmla_slot_range(flash.slot_idx)?;
-        let pool = self
-            .flashmla_fp8_kv_pool
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+        // Table-routed (#85 P2): the zeroed range derives from the slot's
+        // page table. Stage A contiguity makes it one span (a single memset,
+        // same launch count as the pre-paging band reset); Stage B zeroes —
+        // or frees — per page once tables may fragment.
+        let range = self.flashmla_pages_byte_range(flash.slot_idx)?;
         ensure!(
-            range.end <= pool.len() && range.len() == flash.fp8_kv_pool_len,
-            "DSv4 FlashMLA shared pool range {:?} invalid for pool_len={} slot_len={}",
+            range.len() == flash.fp8_kv_pool_len,
+            "DSv4 FlashMLA shared pool range {:?} invalid for slot_len={}",
             range,
-            pool.len(),
             flash.fp8_kv_pool_len
         );
-        let mut view = pool.slice_mut(range);
+        let pool_buf = self.flashmla_pool_data_mut()?;
+        let mut view = pool_buf.slice_mut(range);
         ctx.stream
             .memset_zeros(&mut view)
             .map_err(|e| anyhow!("DSv4 shared FlashMLA slot reset failed: {e}"))?;
@@ -713,12 +844,16 @@ impl Dsv4FlashMlaDecodeState {
             local_heads,
             tp_world,
         )?;
-        let range = pool.flashmla_slot_range(slot_idx)?;
+        // Table-routed (#85 P2): the slot band length comes from the slot's
+        // block table; the decode shape must agree with the layout's table
+        // length (both derive from the same plan-pinned construction params).
+        let range = pool.flashmla_pages_byte_range(slot_idx)?;
         ensure!(
-            pool.flashmla_fp8_kv_pool.is_some()
-                && range.len() == pool.flashmla_slot_bytes
-                && range.len() > 0,
-            "DSv4 FlashMLA shared slot band missing/invalid for slot {slot_idx}"
+            shape.total_blocks == pool.flashmla_slot_pages && !range.is_empty(),
+            "DSv4 FlashMLA shared slot band missing/invalid for slot {slot_idx} \
+             (shape blocks {} vs table blocks {})",
+            shape.total_blocks,
+            pool.flashmla_slot_pages
         );
 
         let mut num_sm_parts = 0_i32;
@@ -1340,18 +1475,19 @@ pub(crate) struct Dsv4LayerAttentionSnapshot {
 }
 
 impl Dsv4LayerAttentionSnapshot {
-    fn fp8_sw_offsets(&self, draft_abs_pos: usize) -> Option<Result<(usize, usize)>> {
+    /// `(logical ring block, data offset in block, scale offset in block)` for
+    /// one draft token's FP8 SW ring slot. The block id is slot-LOGICAL — the
+    /// caller translates it to a physical pool page through the slot's block
+    /// table (#85 P2), so this math never bakes in band contiguity.
+    fn fp8_sw_offsets(&self, draft_abs_pos: usize) -> Option<(usize, usize, usize)> {
         self.fp8_sw_slot.as_ref()?;
         let ring_idx = draft_abs_pos % self.sliding_window;
         let block_id = ring_idx / self.fp8_page_block_size;
         let row = ring_idx % self.fp8_page_block_size;
-        let block_stride = self.fp8_page_block_size * self.fp8_bytes_per_token;
-        let block_base = block_id * block_stride;
-        let data_offset = block_base + row * self.fp8_token_data_bytes;
-        let scale_offset = block_base
-            + self.fp8_page_block_size * self.fp8_token_data_bytes
-            + row * self.fp8_scale_bytes;
-        Some(Ok((data_offset, scale_offset)))
+        let data_in_block = row * self.fp8_token_data_bytes;
+        let scale_in_block =
+            self.fp8_page_block_size * self.fp8_token_data_bytes + row * self.fp8_scale_bytes;
+        Some((block_id, data_in_block, scale_in_block))
     }
 
     fn capture_sw(
@@ -1420,37 +1556,38 @@ impl Dsv4LayerAttentionSnapshot {
         flash: &Dsv4FlashMlaDecodeState,
         draft_abs_pos: usize,
     ) -> Result<()> {
-        let Some((data_offset, scale_offset)) = self.fp8_sw_offsets(draft_abs_pos).transpose()?
+        let Some((logical_page, data_in_block, scale_in_block)) =
+            self.fp8_sw_offsets(draft_abs_pos)
         else {
             return Ok(());
         };
         let Some(slot) = &mut self.fp8_sw_slot else {
             return Ok(());
         };
-        let range = pool.flashmla_slot_range(flash.slot_idx)?;
-        let pool_buf = pool
-            .flashmla_fp8_kv_pool
-            .as_ref()
-            .ok_or_else(|| anyhow!("DSv4 rollback FP8 shared pool missing"))?;
+        // Table-routed (#85 P2): the ring block's byte base is its PHYSICAL
+        // pool page (block-table lookup), so this path stays valid when
+        // Stage B fragments the table.
+        let page = physical_page(pool.flashmla_page_table(flash.slot_idx)?, logical_page)?;
+        let block_base = page as usize * (self.fp8_page_block_size * self.fp8_bytes_per_token);
+        let data_offset = block_base + data_in_block;
+        let scale_offset = block_base + scale_in_block;
+        let pool_buf = pool.flashmla_pool_data()?;
         ensure!(
-            data_offset + self.fp8_token_data_bytes <= range.len()
-                && scale_offset + self.fp8_scale_bytes <= range.len()
+            data_offset + self.fp8_token_data_bytes <= pool_buf.len()
+                && scale_offset + self.fp8_scale_bytes <= pool_buf.len()
                 && slot.len() == self.fp8_bytes_per_token,
             "DSv4 rollback FP8 SW slot out of range data={} scale={} pool_len={} slot_len={}",
             data_offset,
             scale_offset,
-            range.len(),
+            pool_buf.len(),
             slot.len()
         );
-        let src_data = pool_buf.slice(
-            range.start + data_offset..range.start + data_offset + self.fp8_token_data_bytes,
-        );
+        let src_data = pool_buf.slice(data_offset..data_offset + self.fp8_token_data_bytes);
         let mut dst_data = slot.slice_mut(0..self.fp8_token_data_bytes);
         ctx.stream
             .memcpy_dtod(&src_data, &mut dst_data)
             .map_err(|e| anyhow!("DSv4 rollback FP8 SW data snapshot failed: {e}"))?;
-        let src_scale = pool_buf
-            .slice(range.start + scale_offset..range.start + scale_offset + self.fp8_scale_bytes);
+        let src_scale = pool_buf.slice(scale_offset..scale_offset + self.fp8_scale_bytes);
         let mut dst_scale = slot.slice_mut(self.fp8_token_data_bytes..self.fp8_bytes_per_token);
         ctx.stream
             .memcpy_dtod(&src_scale, &mut dst_scale)
@@ -1466,7 +1603,8 @@ impl Dsv4LayerAttentionSnapshot {
         flash: &mut Dsv4FlashMlaDecodeState,
         draft_abs_pos: usize,
     ) -> Result<()> {
-        let Some((data_offset, scale_offset)) = self.fp8_sw_offsets(draft_abs_pos).transpose()?
+        let Some((logical_page, data_in_block, scale_in_block)) =
+            self.fp8_sw_offsets(draft_abs_pos)
         else {
             return Ok(());
         };
@@ -1479,32 +1617,29 @@ impl Dsv4LayerAttentionSnapshot {
             self.draft_abs_pos,
             draft_abs_pos
         );
-        let range = pool.flashmla_slot_range(flash.slot_idx)?;
-        let pool_buf = pool
-            .flashmla_fp8_kv_pool
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 rollback FP8 shared pool missing"))?;
+        // Table-routed (#85 P2): same physical-page translation as capture.
+        let page = physical_page(pool.flashmla_page_table(flash.slot_idx)?, logical_page)?;
+        let block_base = page as usize * (self.fp8_page_block_size * self.fp8_bytes_per_token);
+        let data_offset = block_base + data_in_block;
+        let scale_offset = block_base + scale_in_block;
+        let pool_buf = pool.flashmla_pool_data_mut()?;
         ensure!(
-            data_offset + self.fp8_token_data_bytes <= range.len()
-                && scale_offset + self.fp8_scale_bytes <= range.len()
+            data_offset + self.fp8_token_data_bytes <= pool_buf.len()
+                && scale_offset + self.fp8_scale_bytes <= pool_buf.len()
                 && slot.len() == self.fp8_bytes_per_token,
             "DSv4 rollback FP8 SW restore out of range data={} scale={} pool_len={} slot_len={}",
             data_offset,
             scale_offset,
-            range.len(),
+            pool_buf.len(),
             slot.len()
         );
         let src_data = slot.slice(0..self.fp8_token_data_bytes);
-        let mut dst_data = pool_buf.slice_mut(
-            range.start + data_offset..range.start + data_offset + self.fp8_token_data_bytes,
-        );
+        let mut dst_data = pool_buf.slice_mut(data_offset..data_offset + self.fp8_token_data_bytes);
         ctx.stream
             .memcpy_dtod(&src_data, &mut dst_data)
             .map_err(|e| anyhow!("DSv4 rollback FP8 SW data restore failed: {e}"))?;
         let src_scale = slot.slice(self.fp8_token_data_bytes..self.fp8_bytes_per_token);
-        let mut dst_scale = pool_buf.slice_mut(
-            range.start + scale_offset..range.start + scale_offset + self.fp8_scale_bytes,
-        );
+        let mut dst_scale = pool_buf.slice_mut(scale_offset..scale_offset + self.fp8_scale_bytes);
         ctx.stream
             .memcpy_dtod(&src_scale, &mut dst_scale)
             .map_err(|e| anyhow!("DSv4 rollback FP8 SW scale restore failed: {e}"))?;
@@ -1601,13 +1736,16 @@ impl Dsv4CompressorImage {
 }
 
 /// Whole-slot host image of one [`Dsv4FlashMlaDecodeState`]: the two mutable
-/// host scalars plus the slot's exclusive band of the shared FP8 KV pool.
+/// host scalars plus the slot's pages of the shared FP8 KV pool.
 struct Dsv4FlashMlaImage {
     fp8_kv_sw_bootstrapped: bool,
     fp8_kv_comp_packed_rows: usize,
-    /// Full `flashmla_slot_range` band. Perf TODO: only `seq_len`-derived rows
-    /// are written; v1 copies the whole band (extent-proof by construction).
-    fp8_kv_pool_slot: Vec<u8>,
+    /// Whole-band payload in slot-logical block order — the per-page host
+    /// images `TokenKVPool::copy_pages_to_host` produces. Slot-agnostic:
+    /// restore re-resolves the TARGET slot's block table. Perf TODO
+    /// unchanged: only `seq_len`-derived rows are written; v1 copies every
+    /// page (extent-proof by construction).
+    fp8_kv_pool_pages: Vec<u8>,
 }
 
 impl Dsv4FlashMlaImage {
@@ -1616,25 +1754,25 @@ impl Dsv4FlashMlaImage {
         pool: &Dsv4LayerKvLayout,
         flash: &Dsv4FlashMlaDecodeState,
     ) -> Result<Self> {
-        let range = pool.flashmla_slot_range(flash.slot_idx)?;
-        let pool_buf = pool
-            .flashmla_fp8_kv_pool
-            .as_ref()
-            .ok_or_else(|| anyhow!("DSv4 swap FlashMLA shared pool missing"))?;
+        // Table-routed (#85 P2): the image is the slot's PAGES (page-table lookup),
+        // moved by the pool's own per-page transport — the same
+        // `copy_pages_to_host` the page tier (#82/#83) consumes — so this
+        // path stays valid when Stage B fragments the table.
+        let table = pool.flashmla_page_table(flash.slot_idx)?.to_vec();
+        let payload = pool
+            .flashmla_pool()?
+            .copy_pages_to_host(ctx, &table)
+            .map_err(|e| anyhow!("DSv4 swap FlashMLA pool page D2H failed: {e}"))?;
         ensure!(
-            range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
-            "DSv4 swap FlashMLA pool range {:?} invalid for pool_len={} slot_len={}",
-            range,
-            pool_buf.len(),
+            payload.len() == flash.fp8_kv_pool_len,
+            "DSv4 swap FlashMLA page payload {} != slot band bytes {}",
+            payload.len(),
             flash.fp8_kv_pool_len
         );
         Ok(Self {
             fp8_kv_sw_bootstrapped: flash.fp8_kv_sw_bootstrapped,
             fp8_kv_comp_packed_rows: flash.fp8_kv_comp_packed_rows,
-            fp8_kv_pool_slot: ctx
-                .stream
-                .clone_dtoh(&pool_buf.slice(range))
-                .map_err(|e| anyhow!("DSv4 swap FlashMLA pool band D2H failed: {e}"))?,
+            fp8_kv_pool_pages: payload,
         })
     }
 
@@ -1644,24 +1782,19 @@ impl Dsv4FlashMlaImage {
         pool: &mut Dsv4LayerKvLayout,
         flash: &mut Dsv4FlashMlaDecodeState,
     ) -> Result<()> {
-        let range = pool.flashmla_slot_range(flash.slot_idx)?;
-        let pool_buf = pool
-            .flashmla_fp8_kv_pool
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 swap FlashMLA shared pool missing"))?;
+        // Table-routed (#85 P2): restore lands on the TARGET slot's pages
+        // (page-table lookup), mirroring capture; `copy_pages_from_host`
+        // re-validates payload length against the page count.
+        let table = pool.flashmla_page_table(flash.slot_idx)?.to_vec();
         ensure!(
-            range.end <= pool_buf.len()
-                && range.len() == flash.fp8_kv_pool_len
-                && range.len() == self.fp8_kv_pool_slot.len(),
-            "DSv4 swap FlashMLA restore range {:?} invalid for pool_len={} image_len={}",
-            range,
-            pool_buf.len(),
-            self.fp8_kv_pool_slot.len()
+            self.fp8_kv_pool_pages.len() == flash.fp8_kv_pool_len,
+            "DSv4 swap FlashMLA restore payload {} != slot band bytes {}",
+            self.fp8_kv_pool_pages.len(),
+            flash.fp8_kv_pool_len
         );
-        let mut view = pool_buf.slice_mut(range);
-        ctx.stream
-            .memcpy_htod(&self.fp8_kv_pool_slot, &mut view)
-            .map_err(|e| anyhow!("DSv4 swap FlashMLA pool band H2D failed: {e}"))?;
+        pool.flashmla_pool_mut()?
+            .copy_pages_from_host(ctx, &table, &self.fp8_kv_pool_pages)
+            .map_err(|e| anyhow!("DSv4 swap FlashMLA pool page H2D failed: {e}"))?;
         flash.fp8_kv_sw_bootstrapped = self.fp8_kv_sw_bootstrapped;
         flash.fp8_kv_comp_packed_rows = self.fp8_kv_comp_packed_rows;
         Ok(())
@@ -2000,9 +2133,9 @@ impl Dsv4LayerAttentionState {
     ///     only host scalars written after init (`flashmla_pack_sw_ring`,
     ///     `flashmla_pack_compressed_delta`; everything else is set once in
     ///     `new`/`init_constant_sched_meta`).
-    ///   - shared FP8 pool band (`flashmla_slot_range(slot_idx)` into
-    ///     `flashmla_fp8_kv_pool`): SNAPSHOT (full band; perf TODO: written
-    ///     extent is `seq_len`-derived).
+    ///   - shared FP8 pool pages (the slot's `flashmla_page_table` into the
+    ///     packed `TokenKVPool`): SNAPSHOT via `copy_pages_to_host` (every
+    ///     page; perf TODO: written extent is `seq_len`-derived).
     ///   - `sw_bulk_block_ids`/`sw_bulk_rows`: SCRATCH — written only in
     ///     `flashmla_pack_sw_ring` (ring-identity constants) immediately before
     ///     their single read in the same call; never read elsewhere.
@@ -3370,9 +3503,20 @@ fn flashmla_pack_sw_ring(
     let page_block_size = 64;
     let mut block_ids = Vec::with_capacity(sliding_window);
     let mut rows = Vec::with_capacity(sliding_window);
-    for slot in 0..sliding_window {
-        block_ids.push((slot / page_block_size) as i32);
-        rows.push((slot % page_block_size) as i32);
+    {
+        // Table-routed (#85 P2): this host-built bulk pack hands the kernel
+        // PHYSICAL pool pages (page-table lookup) and the pool BASE pointer,
+        // so it stays valid when Stage B fragments the table. Token/block
+        // counts come from the slot's table, never re-derived.
+        let table = pool.flashmla_page_table(flash.slot_idx)?;
+        for slot in 0..sliding_window {
+            let page = physical_page(table, slot / page_block_size)?;
+            block_ids.push(
+                i32::try_from(page)
+                    .map_err(|_| anyhow!("DSv4 FlashMLA SW page {page} overflows i32"))?,
+            );
+            rows.push((slot % page_block_size) as i32);
+        }
     }
     ctx.stream
         .memcpy_htod(&block_ids, &mut flash.sw_bulk_block_ids)
@@ -3381,21 +3525,9 @@ fn flashmla_pack_sw_ring(
         .memcpy_htod(&rows, &mut flash.sw_bulk_rows)
         .map_err(|e| anyhow!("DSv4 FlashMLA SW rows H2D failed: {e}"))?;
     let (window_ptr, _wg) = window_cache.device_ptr(&ctx.stream);
-    let range = pool.flashmla_slot_range(flash.slot_idx)?;
-    let pool_buf = pool
-        .flashmla_fp8_kv_pool
-        .as_mut()
-        .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
-    ensure!(
-        range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
-        "DSv4 FlashMLA shared SW slot range {:?} invalid pool_len={} slot_len={}",
-        range,
-        pool_buf.len(),
-        flash.fp8_kv_pool_len
-    );
-    let mut pool_view = pool_buf.slice_mut(range);
-    let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
-    let nope_ptr = window_ptr as u64;
+    let pool_buf = pool.flashmla_pool_data_mut()?;
+    let (pool_ptr, _pg) = pool_buf.device_ptr_mut(&ctx.stream);
+    let nope_ptr = window_ptr;
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
     flash_kv::dsv4_fp8_kv_pack_strided_raw(
         ctx,
@@ -3436,21 +3568,18 @@ fn flashmla_pack_one_sw_token(
     drop(row_guard);
 
     let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-    let range = pool.flashmla_slot_range(flash.slot_idx)?;
-    let pool_buf = pool
-        .flashmla_fp8_kv_pool
-        .as_mut()
-        .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+    let range = pool.flashmla_pages_byte_range(flash.slot_idx)?;
+    let pool_buf = pool.flashmla_pool_data_mut()?;
     ensure!(
         range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
-        "DSv4 FlashMLA shared one-token slot range {:?} invalid pool_len={} slot_len={}",
+        "DSv4 FlashMLA shared one-token table range {:?} invalid pool_len={} slot_len={}",
         range,
         pool_buf.len(),
         flash.fp8_kv_pool_len
     );
     let mut pool_view = pool_buf.slice_mut(range);
     let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
-    let nope_ptr = k_ptr as u64;
+    let nope_ptr = k_ptr;
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
     flash_kv::dsv4_fp8_kv_pack_strided_raw(
         ctx,
@@ -3487,11 +3616,15 @@ fn flashmla_pack_compressed_delta(
     // prefill / request boundaries), which always execute eagerly (the graph
     // warm pass — see `CudaGraphState::rearm_warm`).
     {
-        let range = pool.flashmla_slot_range(flash.slot_idx)?;
-        let pool_buf = pool
-            .flashmla_fp8_kv_pool
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+        let range = pool.flashmla_pages_byte_range(flash.slot_idx)?;
+        let pool_buf = pool.flashmla_pool_data_mut()?;
+        ensure!(
+            range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
+            "DSv4 FlashMLA shared compressed-delta table range {:?} invalid pool_len={} slot_len={}",
+            range,
+            pool_buf.len(),
+            flash.fp8_kv_pool_len
+        );
         let mut pool_view = pool_buf.slice_mut(range);
         let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
         let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
@@ -3535,14 +3668,11 @@ fn flashmla_pack_compressed_delta(
         .map_err(|e| anyhow!("DSv4 FlashMLA compressed rows H2D failed: {e}"))?;
 
     let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
-    let range = pool.flashmla_slot_range(flash.slot_idx)?;
-    let pool_buf = pool
-        .flashmla_fp8_kv_pool
-        .as_mut()
-        .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+    let range = pool.flashmla_pages_byte_range(flash.slot_idx)?;
+    let pool_buf = pool.flashmla_pool_data_mut()?;
     ensure!(
         range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
-        "DSv4 FlashMLA shared compressed slot range {:?} invalid pool_len={} slot_len={}",
+        "DSv4 FlashMLA shared compressed table range {:?} invalid pool_len={} slot_len={}",
         range,
         pool_buf.len(),
         flash.fp8_kv_pool_len
@@ -3550,7 +3680,7 @@ fn flashmla_pack_compressed_delta(
     let mut pool_view = pool_buf.slice_mut(range);
     let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
     let row_offset_bytes = start_row as u64 * config.head_dim as u64 * 2;
-    let nope_ptr = compressed_ptr as u64 + row_offset_bytes;
+    let nope_ptr = compressed_ptr + row_offset_bytes;
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
     flash_kv::dsv4_fp8_kv_pack_strided_raw(
         ctx,
@@ -4087,14 +4217,11 @@ fn try_flashmla_decode_attention(
     // there. Saves 43 sched-meta calls/token as a side effect.
 
     let (q_ptr, q_guard) = q_prepared.data.device_ptr(&ctx.stream);
-    let pool_range = pool.flashmla_slot_range(flash.slot_idx)?;
-    let pool_buf = pool
-        .flashmla_fp8_kv_pool
-        .as_ref()
-        .ok_or_else(|| anyhow!("DSv4 FlashMLA shared pool missing"))?;
+    let pool_range = pool.flashmla_pages_byte_range(flash.slot_idx)?;
+    let pool_buf = pool.flashmla_pool_data()?;
     ensure!(
         pool_range.end <= pool_buf.len() && pool_range.len() == flash.fp8_kv_pool_len,
-        "DSv4 FlashMLA shared fwd slot range {:?} invalid pool_len={} slot_len={}",
+        "DSv4 FlashMLA shared fwd table range {:?} invalid pool_len={} slot_len={}",
         pool_range,
         pool_buf.len(),
         flash.fp8_kv_pool_len
