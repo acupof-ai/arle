@@ -1540,6 +1540,10 @@ pub(crate) struct Qwen35CudaExecutor {
     model: crate::qwen35::Qwen35Model,
     /// Per-slot KV + recurrent state (one [`crate::qwen35::Qwen35SlotState`] per slot).
     slots: Vec<crate::qwen35::Qwen35SlotState>,
+    /// Persistent forward workspace (exact-shape buffer reuse): forwards are
+    /// strictly serial on this executor, so ONE workspace serves every slot.
+    /// Mirrors the DSv4 persistent decode scratch (passed `&mut` per forward).
+    workspace: crate::qwen35::Qwen35Workspace,
     num_slots: usize,
 }
 
@@ -1580,16 +1584,22 @@ impl Qwen35CudaExecutor {
         Ok(Self {
             model,
             slots,
+            workspace: crate::qwen35::Qwen35Workspace::new(),
             num_slots,
         })
     }
 
     /// Offload the model's device weights to host RAM (OPD teacher time-share),
     /// returning the device bytes freed. Per-slot KV / recurrent state is left
-    /// resident — only the shared model weights move.
+    /// resident — only the shared model weights move. The forward workspace is
+    /// released too (AFTER the offload's full device sync, so no in-flight
+    /// kernel can still reference the dropped buffers) — it may hold
+    /// prefill-shaped scratch the student backward wants as headroom.
     fn offload_engine_weights(&mut self) -> Result<usize> {
         self.ensure_not_collective("offload_engine_weights")?;
-        self.model.offload_engine_weights()
+        let freed = self.model.offload_engine_weights()?;
+        self.workspace.release();
+        Ok(freed)
     }
 
     /// Reload the model's device weights from the host snapshot.
@@ -1640,6 +1650,7 @@ impl Qwen35CudaExecutor {
             let position = (row.start_pos + row.tokens.len()) as u64;
             let token = self.model.forward_tokens(
                 &mut self.slots[row.slot],
+                &mut self.workspace,
                 &row.tokens,
                 row.start_pos,
                 &row.params,
@@ -1664,6 +1675,7 @@ impl Qwen35CudaExecutor {
             let position = row.kv_seq_len.saturating_add(1) as u64;
             let token = self.model.forward_tokens(
                 &mut self.slots[row.slot],
+                &mut self.workspace,
                 &[row.last_token],
                 row.kv_seq_len,
                 &row.params,
@@ -1718,9 +1730,11 @@ impl Qwen35CudaExecutor {
         }
         // Private transient slot: the teacher scores the whole sequence in one
         // forward, so it never shares the serving slots' KV/recurrent state.
+        // The shared workspace IS reused (serial forwards; its buffers reshape
+        // to the teacher's seq_len and back on the next serving call).
         let mut slot = self.model.new_slot_state()?;
         self.model
-            .forward_token_logits_full(&mut slot, input_ids, start_pos)
+            .forward_token_logits_full(&mut slot, &mut self.workspace, input_ids, start_pos)
     }
 
     pub(crate) fn device(&self) -> &DeviceContext {

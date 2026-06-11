@@ -164,23 +164,129 @@ mod gpu {
     use half::bf16;
     use infer_moe::MoeConfig;
 
-    use super::alloc_neg1_i32;
     use crate::loader::MoeLayerWeights;
     use crate::moe_config::ExpertSplit;
     use crate::ops::{gemm_batch, silu_mul};
+    use crate::workspace::{HiddenSlot, SliceSlot};
 
-    /// BF16 MoE forward for one sparse layer. `normed` is the post-LN hidden
-    /// `[num_tokens, hidden]`; returns the block output (routed + sigmoid-gated
-    /// shared expert) as a fresh `HiddenStates`.
+    /// Persistent device scratch for [`moe_forward_into`] — one slot per
+    /// per-call buffer the old path allocated fresh (~10 device allocations per
+    /// MoE layer per step). Exact-shape reuse: decode (`R = topk`) hits the
+    /// cache every step; prefill re-allocates only when the chunk shape
+    /// changes. (audit MOE-P3-1)
     ///
-    /// `split` is this rank's EP expert ownership. Routing runs over ALL
-    /// `cfg.num_experts` (router gate replicated; activations identical across
-    /// ranks because every row-parallel output was all-reduced upstream), but
-    /// only routes landing on `split`'s local experts contribute — so under
-    /// `ep_size > 1` the returned buffer is a PARTIAL sum (routed locals +
-    /// column/row-sharded shared expert) and the caller must `all_reduce_sum`
-    /// it once before the residual add. `ExpertSplit::single` is the unchanged
-    /// single-GPU path (every expert local, nothing to reduce).
+    /// Write-before-read proof per slot (kernels verified in
+    /// `csrc/moe/dsv4_route.cu`, `csrc/gemm/moe_grouped_gemm.cu`,
+    /// `csrc/gemm/gemv.cu`, `csrc/misc/elementwise_basic.cu`):
+    ///
+    /// | slot              | shape       | init on reuse | proof |
+    /// |-------------------|-------------|---------------|-------|
+    /// | `logits`          | `[E, T]`    | none          | router `gemm_cuda` is beta=0, writes all `E*T` |
+    /// | `route_indices`   | `[R]` i32   | H2D overwrite | uploaded from host every call |
+    /// | `route_weights`   | `[R]` f32   | H2D overwrite | uploaded from host every call |
+    /// | `counts`          | `[E_l]` i32 | memset 0      | REQUIRED: count kernel `atomicAdd`s |
+    /// | `offsets`         | `[E_l]` i32 | none          | exclusive scan writes all `tid < n` |
+    /// | `scan_total`      | `[1]` i32   | none          | scan writes it before any read |
+    /// | `packed_hidden`   | `[H, R]`    | none          | single-GPU: pack writes every slot row (offsets+cursors partition `[0,R)`); EP: tail rows unwritten but only read by the grouped GEMMs WITHIN `offsets/counts` |
+    /// | `packed_route_slot`| `[R]` i32  | memset -1 (EP only) | single-GPU: pack writes all `R` slots; EP: sentinel REQUIRED (scatter skips `< 0`; stale/zero tail would alias slot 0) |
+    /// | `packed_weight`   | `[R]` f32   | none          | scatter reads `packed_weight[r]` only where `packed_route_slot[r] >= 0`, which pack wrote |
+    /// | `cursors`         | `[E_l]` i32 | memset 0      | REQUIRED: pack kernel `atomicAdd`s slot cursors |
+    /// | `expert_indices`  | `[E_l]` i32 | none          | identity table, pure function of length (`upload_const`) |
+    /// | `gate_out`/`up_out`| `[I, R]`   | none          | grouped GEMM writes rows within `counts`; `silu_mul` READS the (EP) tail but its outputs there land in the `act` tail, which nothing reads (down-GEMM reads `act` within `counts` only) — final bytes unchanged |
+    /// | `act`             | `[I, R]`    | none          | `silu_mul` writes all `I*R` |
+    /// | `expert_out`      | `[H, R]`    | none          | down grouped GEMM writes within `counts`; scatter reads only packed slots |
+    /// | `route_out`       | `[H, R]`    | memset 0 (EP only) | single-GPU: scatter writes ALL `R` slots (route↔slot bijection) then combine reads all; EP: zero-init LOAD-BEARING (combine sums non-local slots as 0 into the partial) |
+    /// | `shared_gate`/`shared_up`| `[S_i, T]` | none    | dense `gemm_cuda` beta=0 |
+    /// | `shared_act`      | `[S_i, T]`  | none          | `silu_mul` writes all |
+    /// | `shared_out`      | `[H, T]`    | none          | dense `gemm_cuda` beta=0 |
+    /// | `gate_logit`      | `[1, T]`    | none          | dense `gemm_cuda` beta=0 |
+    ///
+    /// The caller-provided `out` (`[H, T]`) needs no init: the combine kernel
+    /// writes every element before `qwen36_add_shared_expert_gated` RMWs it.
+    #[derive(Default)]
+    pub(crate) struct MoeForwardScratch {
+        logits: HiddenSlot,
+        route_indices: SliceSlot<i32>,
+        route_weights: SliceSlot<f32>,
+        counts: SliceSlot<i32>,
+        offsets: SliceSlot<i32>,
+        scan_total: SliceSlot<i32>,
+        packed_hidden: HiddenSlot,
+        packed_route_slot: SliceSlot<i32>,
+        packed_weight: SliceSlot<f32>,
+        cursors: SliceSlot<i32>,
+        expert_indices: SliceSlot<i32>,
+        gate_out: HiddenSlot,
+        up_out: HiddenSlot,
+        act: HiddenSlot,
+        expert_out: HiddenSlot,
+        route_out: HiddenSlot,
+        shared_gate: HiddenSlot,
+        shared_up: HiddenSlot,
+        shared_act: HiddenSlot,
+        shared_out: HiddenSlot,
+        gate_logit: HiddenSlot,
+    }
+
+    impl MoeForwardScratch {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        /// Drop every cached buffer (frees the VRAM; OPD weight time-share).
+        pub(crate) fn release(&mut self) {
+            let Self {
+                logits,
+                route_indices,
+                route_weights,
+                counts,
+                offsets,
+                scan_total,
+                packed_hidden,
+                packed_route_slot,
+                packed_weight,
+                cursors,
+                expert_indices,
+                gate_out,
+                up_out,
+                act,
+                expert_out,
+                route_out,
+                shared_gate,
+                shared_up,
+                shared_act,
+                shared_out,
+                gate_logit,
+            } = self;
+            logits.release();
+            route_indices.release();
+            route_weights.release();
+            counts.release();
+            offsets.release();
+            scan_total.release();
+            packed_hidden.release();
+            packed_route_slot.release();
+            packed_weight.release();
+            cursors.release();
+            expert_indices.release();
+            gate_out.release();
+            up_out.release();
+            act.release();
+            expert_out.release();
+            route_out.release();
+            shared_gate.release();
+            shared_up.release();
+            shared_act.release();
+            shared_out.release();
+            gate_logit.release();
+        }
+    }
+
+    /// BF16 MoE forward for one sparse layer (allocate-per-call compatibility
+    /// wrapper): builds a transient [`MoeForwardScratch`] + output buffer and
+    /// delegates to [`moe_forward_into`]. Same allocation behavior as the
+    /// pre-scratch path; the Qwen3.5/3.6 hot loop passes a persistent scratch
+    /// through [`moe_forward_into`] instead.
     pub(crate) fn moe_forward(
         ctx: &DeviceContext,
         weights: &MoeLayerWeights,
@@ -188,6 +294,33 @@ mod gpu {
         cfg: &MoeConfig,
         split: &ExpertSplit,
     ) -> Result<HiddenStates> {
+        let mut scratch = MoeForwardScratch::new();
+        let mut out = HiddenStates::zeros(ctx, normed.hidden_dim, normed.seq_len)?;
+        moe_forward_into(ctx, weights, normed, cfg, split, &mut scratch, &mut out)?;
+        Ok(out)
+    }
+
+    /// BF16 MoE forward for one sparse layer. `normed` is the post-LN hidden
+    /// `[num_tokens, hidden]`; writes the block output (routed + sigmoid-gated
+    /// shared expert) into `out` (`[hidden, num_tokens]`, fully overwritten).
+    ///
+    /// `split` is this rank's EP expert ownership. Routing runs over ALL
+    /// `cfg.num_experts` (router gate replicated; activations identical across
+    /// ranks because every row-parallel output was all-reduced upstream), but
+    /// only routes landing on `split`'s local experts contribute — so under
+    /// `ep_size > 1` the output buffer is a PARTIAL sum (routed locals +
+    /// column/row-sharded shared expert) and the caller must `all_reduce_sum`
+    /// it once before the residual add. `ExpertSplit::single` is the unchanged
+    /// single-GPU path (every expert local, nothing to reduce).
+    pub(crate) fn moe_forward_into(
+        ctx: &DeviceContext,
+        weights: &MoeLayerWeights,
+        normed: &HiddenStates,
+        cfg: &MoeConfig,
+        split: &ExpertSplit,
+        scratch: &mut MoeForwardScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         let num_tokens = normed.seq_len;
         let hidden_dim = normed.hidden_dim;
         let num_experts = cfg.num_experts;
@@ -218,10 +351,16 @@ mod gpu {
             split.ep_size,
             split.ep_rank
         );
+        ensure!(
+            out.hidden_dim == hidden_dim && out.seq_len == num_tokens,
+            "MoE output shape mismatch: out={}x{} expected {hidden_dim}x{num_tokens}",
+            out.hidden_dim,
+            out.seq_len
+        );
 
         // ── 1. Router gemm → logits[T, E] (token-major). ────────────────────
-        let mut logits = HiddenStates::zeros(ctx, num_experts, num_tokens)?;
-        gemm_batch(ctx, &weights.router_gate, normed, &mut logits)?;
+        let logits = scratch.logits.get(ctx, num_experts, num_tokens)?;
+        gemm_batch(ctx, &weights.router_gate, normed, logits)?;
 
         // ── 2. HOST route (verified infer_moe reference). ───────────────────
         // Sync so the gemm has landed before the D2H read.
@@ -240,34 +379,21 @@ mod gpu {
             "flattened routing length mismatch"
         );
 
-        let route_indices = ctx
-            .stream
-            .clone_htod(&indices_host)
-            .map_err(|e| anyhow::anyhow!("MoE route-index H2D failed: {e}"))?;
-        let route_weights = ctx
-            .stream
-            .clone_htod(&weights_host)
-            .map_err(|e| anyhow::anyhow!("MoE route-weight H2D failed: {e}"))?;
+        let route_indices = scratch.route_indices.upload(ctx, &indices_host)?;
+        let route_weights = scratch.route_weights.upload(ctx, &weights_host)?;
 
         // ── 3. Per-expert route counts → group offsets (LOCAL experts only). ─
         // Kernels write these through raw device pointers, so no Rust `mut`.
-        let counts = ctx
-            .stream
-            .alloc_zeros::<i32>(local_experts)
-            .map_err(|e| anyhow::anyhow!("MoE count alloc failed: {e}"))?;
-        let offsets = ctx
-            .stream
-            .alloc_zeros::<i32>(local_experts)
-            .map_err(|e| anyhow::anyhow!("MoE offset alloc failed: {e}"))?;
-        let scan_total = ctx
-            .stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow::anyhow!("MoE scan total alloc failed: {e}"))?;
+        // counts MUST be zeroed every call (atomicAdd accumulator); offsets and
+        // scan_total are fully written by the scan before any read.
+        let counts = scratch.counts.get_zeroed(ctx, local_experts)?;
+        let offsets = scratch.offsets.get(ctx, local_experts)?;
+        let scan_total = scratch.scan_total.get(ctx, 1)?;
         // SAFETY: all buffers are valid on ctx.stream for the given shapes.
         unsafe {
             moe::dsv4_count_local_experts(
-                cache_ptr(&route_indices, ctx),
-                cache_ptr(&counts, ctx),
+                cache_ptr(route_indices, ctx),
+                cache_ptr(counts, ctx),
                 num_tokens,
                 topk,
                 split.local_expert_start,
@@ -275,48 +401,45 @@ mod gpu {
                 ctx.stream.cu_stream(),
             )?;
             moe::dsv4_exclusive_scan_i32(
-                cache_ptr(&counts, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&scan_total, ctx),
+                cache_ptr(counts, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(scan_total, ctx),
                 local_experts,
                 ctx.stream.cu_stream(),
             )?;
         }
 
         // ── 4. Pack routed tokens grouped-by-expert (with route slots). ─────
-        let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, total_routes)?;
-        // Under EP only routes hitting LOCAL experts get packed, so the tail of
-        // `packed_route_slot` past this rank's route count stays at its init
-        // value. The scatter kernel skips `route_slot < 0` — a zero-init tail
-        // would alias route slot 0 and race its legitimate write — so EP needs
-        // the -1 sentinel fill. Single-GPU packs every slot exactly once and
-        // keeps today's zero-init path untouched.
+        // Single-GPU packs every one of the `total_routes` slots exactly once
+        // (offsets + cursors partition `[0, R)`), so the reused buffers need no
+        // re-init. Under EP only routes hitting LOCAL experts get packed, so
+        // the tail of `packed_route_slot` past this rank's route count would
+        // keep a STALE slot id on reuse. The scatter kernel skips
+        // `route_slot < 0` — a stale/zero tail would alias a live route slot
+        // and race its legitimate write — so EP re-fills the -1 sentinel every
+        // call (same memset the old per-call `alloc_neg1_i32` did).
+        // cursors MUST be zeroed every call (atomicAdd slot allocator).
+        let packed_hidden = scratch.packed_hidden.get(ctx, hidden_dim, total_routes)?;
         let packed_route_slot = if split.ep_size == 1 {
-            ctx.stream
-                .alloc_zeros::<i32>(total_routes.max(1))
-                .map_err(|e| anyhow::anyhow!("MoE packed_route_slot alloc failed: {e}"))?
+            scratch.packed_route_slot.get(ctx, total_routes.max(1))?
         } else {
-            alloc_neg1_i32(ctx, total_routes.max(1))?
+            scratch
+                .packed_route_slot
+                .neg1_filled(ctx, total_routes.max(1))?
         };
-        let packed_weight = ctx
-            .stream
-            .alloc_zeros::<f32>(total_routes.max(1))
-            .map_err(|e| anyhow::anyhow!("MoE packed_weight alloc failed: {e}"))?;
-        let cursors = ctx
-            .stream
-            .alloc_zeros::<i32>(local_experts)
-            .map_err(|e| anyhow::anyhow!("MoE cursors alloc failed: {e}"))?;
+        let packed_weight = scratch.packed_weight.get(ctx, total_routes.max(1))?;
+        let cursors = scratch.cursors.get_zeroed(ctx, local_experts)?;
         // SAFETY: buffers valid on ctx.stream; shapes checked by the kernel.
         unsafe {
             moe::dsv4_pack_local_experts_with_slots(
                 cache_ptr(&normed.data, ctx),
-                cache_ptr(&route_indices, ctx),
-                cache_ptr(&route_weights, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&cursors, ctx),
+                cache_ptr(route_indices, ctx),
+                cache_ptr(route_weights, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(cursors, ctx),
                 cache_ptr(&packed_hidden.data, ctx),
-                cache_ptr(&packed_route_slot, ctx),
-                cache_ptr(&packed_weight, ctx),
+                cache_ptr(packed_route_slot, ctx),
+                cache_ptr(packed_weight, ctx),
                 num_tokens,
                 hidden_dim,
                 topk,
@@ -329,17 +452,18 @@ mod gpu {
         // Identity compact→local remap: the weight-pointer tables hold ONLY this
         // rank's experts (loader walks `split`'s range), so group g indexes table
         // entry g (explicit table keeps the RawDevicePtr contract — no null hack).
+        // The table is a pure function of `local_experts`, so a length-matched
+        // reuse skips the per-call H2D copy entirely.
         let expert_index_table: Vec<i32> = (0..local_experts as i32).collect();
-        let expert_indices = ctx
-            .stream
-            .clone_htod(&expert_index_table)
-            .map_err(|e| anyhow::anyhow!("MoE expert-index table H2D failed: {e}"))?;
+        let expert_indices = scratch
+            .expert_indices
+            .upload_const(ctx, &expert_index_table)?;
 
         // ── 5. Grouped expert GEMM (gate + up paired). ──────────────────────
         let moe_inter = weights.gate[0].rows;
         expert_shape_ok(&weights.gate[0], &weights.up[0], hidden_dim, moe_inter)?;
-        let gate_out = HiddenStates::zeros(ctx, moe_inter, total_routes)?;
-        let up_out = HiddenStates::zeros(ctx, moe_inter, total_routes)?;
+        let gate_out = scratch.gate_out.get(ctx, moe_inter, total_routes)?;
+        let up_out = scratch.up_out.get(ctx, moe_inter, total_routes)?;
         // `max_count` only sizes grid Y; total_routes is a safe upper bound.
         let max_count = total_routes.max(1);
         // SAFETY: weight-ptr tables + packed buffers valid on ctx.stream.
@@ -350,9 +474,9 @@ mod gpu {
                 cache_ptr(&packed_hidden.data, ctx),
                 cache_ptr(&gate_out.data, ctx),
                 cache_ptr(&up_out.data, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&counts, ctx),
-                cache_ptr(&expert_indices, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(counts, ctx),
+                cache_ptr(expert_indices, ctx),
                 local_experts,
                 max_count,
                 moe_inter,
@@ -363,8 +487,12 @@ mod gpu {
         }
 
         // ── 6. SwiGLU (UNCLAMPED — Qwen3.6 MoE has no swiglu clamp). ────────
-        let mut act = HiddenStates::zeros(ctx, moe_inter, total_routes)?;
-        silu_mul(ctx, &gate_out, &up_out, &mut act)?;
+        // silu_mul covers all `moe_inter * total_routes` elements; under EP the
+        // gate/up tails past the local route count are stale (not zero), but
+        // their products land only in the matching `act` tail, which nothing
+        // reads (the down-GEMM consumes `act` strictly within offsets/counts).
+        let act = scratch.act.get(ctx, moe_inter, total_routes)?;
+        silu_mul(ctx, gate_out, up_out, act)?;
 
         // ── 7. Grouped down GEMM → expert_out[R, H]. ────────────────────────
         ensure!(
@@ -375,16 +503,16 @@ mod gpu {
             hidden_dim,
             moe_inter
         );
-        let expert_out = HiddenStates::zeros(ctx, hidden_dim, total_routes)?;
+        let expert_out = scratch.expert_out.get(ctx, hidden_dim, total_routes)?;
         // SAFETY: down weight table + act/expert_out valid on ctx.stream.
         unsafe {
             moe::moe_bf16_grouped_gemm_batch(
                 &weights.down_ptrs,
                 cache_ptr(&act.data, ctx),
                 cache_ptr(&expert_out.data, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&counts, ctx),
-                cache_ptr(&expert_indices, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(counts, ctx),
+                cache_ptr(expert_indices, ctx),
                 local_experts,
                 max_count,
                 hidden_dim,
@@ -395,24 +523,33 @@ mod gpu {
         }
 
         // ── 8. Scatter weighted expert outputs to route slots, combine topk. ─
-        // route_out[slot] = weight · expert_out[slot] (zero-init covers unwritten
-        // slots); combine sums over topk.
-        let route_out = HiddenStates::zeros(ctx, hidden_dim, total_routes)?;
-        let routed = HiddenStates::zeros(ctx, hidden_dim, num_tokens)?;
+        // route_out[slot] = weight · expert_out[slot]; combine sums over topk.
+        // Single-GPU the scatter writes ALL `total_routes` slots (route↔slot
+        // bijection), so reuse needs no re-init; under EP the unwritten
+        // non-local slots MUST read zero in the combine (the partial-sum
+        // contract), so EP re-zeros every call — exactly the zero-init the old
+        // per-call alloc provided.
+        let route_out = if split.ep_size == 1 {
+            scratch.route_out.get(ctx, hidden_dim, total_routes)?
+        } else {
+            scratch
+                .route_out
+                .get_zeroed(ctx, hidden_dim, total_routes)?
+        };
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
         unsafe {
             moe::dsv4_scatter_all_route_slots(
                 cache_ptr(&expert_out.data, ctx),
                 cache_ptr(&route_out.data, ctx),
-                cache_ptr(&packed_route_slot, ctx),
-                cache_ptr(&packed_weight, ctx),
+                cache_ptr(packed_route_slot, ctx),
+                cache_ptr(packed_weight, ctx),
                 total_routes,
                 hidden_dim,
                 ctx.stream.cu_stream(),
             )?;
             moe::dsv4_combine_route_slot_outputs(
                 cache_ptr(&route_out.data, ctx),
-                cache_ptr(&routed.data, ctx),
+                cache_ptr(&out.data, ctx),
                 num_tokens,
                 topk,
                 hidden_dim,
@@ -421,13 +558,21 @@ mod gpu {
         }
 
         // ── 9. Shared expert: dense SwiGLU · sigmoid(x @ shared_gate_router).
-        let shared = shared_expert_forward(ctx, weights, normed)?;
-        let mut gate_logit = HiddenStates::zeros(ctx, 1, num_tokens)?;
-        gemm_batch(ctx, &weights.shared_gate_router, normed, &mut gate_logit)?;
-        // SAFETY: routed/shared/gate_logit valid on ctx.stream.
+        let shared = shared_expert_forward(
+            ctx,
+            weights,
+            normed,
+            &mut scratch.shared_gate,
+            &mut scratch.shared_up,
+            &mut scratch.shared_act,
+            &mut scratch.shared_out,
+        )?;
+        let gate_logit = scratch.gate_logit.get(ctx, 1, num_tokens)?;
+        gemm_batch(ctx, &weights.shared_gate_router, normed, gate_logit)?;
+        // SAFETY: out/shared/gate_logit valid on ctx.stream.
         unsafe {
             moe::qwen36_add_shared_expert_gated(
-                cache_ptr(&routed.data, ctx),
+                cache_ptr(&out.data, ctx),
                 cache_ptr(&shared.data, ctx),
                 cache_ptr(&gate_logit.data, ctx),
                 num_tokens,
@@ -436,25 +581,33 @@ mod gpu {
             )?;
         }
 
-        Ok(routed)
+        Ok(())
     }
 
-    /// Dense shared-expert SwiGLU: `down(silu(gate(x)) * up(x))`.
-    fn shared_expert_forward(
+    /// Dense shared-expert SwiGLU: `down(silu(gate(x)) * up(x))` into the
+    /// `out_slot` buffer (every stage fully overwrites its buffer: beta=0
+    /// GEMMs + full-range silu_mul). Takes the four slots individually so the
+    /// caller's other scratch fields stay borrowable while the returned
+    /// reference (tied to `out_slot` only) is alive.
+    fn shared_expert_forward<'a>(
         ctx: &DeviceContext,
         weights: &MoeLayerWeights,
         normed: &HiddenStates,
-    ) -> Result<HiddenStates> {
+        gate_slot: &mut HiddenSlot,
+        up_slot: &mut HiddenSlot,
+        act_slot: &mut HiddenSlot,
+        out_slot: &'a mut HiddenSlot,
+    ) -> Result<&'a HiddenStates> {
         let shared_inter = weights.shared_gate.rows;
         let hidden_dim = normed.hidden_dim;
-        let mut gate = HiddenStates::zeros(ctx, shared_inter, normed.seq_len)?;
-        let mut up = HiddenStates::zeros(ctx, shared_inter, normed.seq_len)?;
-        gemm_batch(ctx, &weights.shared_gate, normed, &mut gate)?;
-        gemm_batch(ctx, &weights.shared_up, normed, &mut up)?;
-        let mut act = HiddenStates::zeros(ctx, shared_inter, normed.seq_len)?;
-        silu_mul(ctx, &gate, &up, &mut act)?;
-        let mut out = HiddenStates::zeros(ctx, hidden_dim, normed.seq_len)?;
-        gemm_batch(ctx, &weights.shared_down, &act, &mut out)?;
+        let gate = gate_slot.get(ctx, shared_inter, normed.seq_len)?;
+        let up = up_slot.get(ctx, shared_inter, normed.seq_len)?;
+        gemm_batch(ctx, &weights.shared_gate, normed, gate)?;
+        gemm_batch(ctx, &weights.shared_up, normed, up)?;
+        let act = act_slot.get(ctx, shared_inter, normed.seq_len)?;
+        silu_mul(ctx, gate, up, act)?;
+        let out = out_slot.get(ctx, hidden_dim, normed.seq_len)?;
+        gemm_batch(ctx, &weights.shared_down, act, out)?;
         Ok(out)
     }
 
@@ -2952,7 +3105,7 @@ pub(crate) use dsv4_gpu::{
 #[cfg(feature = "deepep")]
 pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};
 #[cfg(feature = "cuda")]
-pub(crate) use gpu::moe_forward;
+pub(crate) use gpu::{MoeForwardScratch, moe_forward, moe_forward_into};
 
 #[cfg(test)]
 mod tests {

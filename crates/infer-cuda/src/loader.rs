@@ -335,8 +335,14 @@ pub(crate) struct SafetensorLoader {
     shards: Vec<PathBuf>,
     weight_map: HashMap<String, usize>,
     /// Read-once cache of shard bytes: without it, loading N tensors re-reads the
-    /// whole shard N times (O(N × file_size) I/O).
-    shard_cache: std::cell::RefCell<HashMap<usize, Vec<u8>>>,
+    /// whole shard N times (O(N × file_size) I/O). `Rc` so [`SharedTensor`] can
+    /// expose a tensor's byte range zero-copy (no `to_vec` of the multi-GiB
+    /// stacked expert tensors) without holding a `RefCell` guard across further
+    /// loads (which would panic on the next shard-cache fill).
+    /// `Rc<Vec<u8>>` over clippy's `Rc<[u8]>`: the conversion would copy the
+    /// multi-GiB shard once more — the exact copy this cache exists to avoid.
+    #[allow(clippy::rc_buffer)]
+    shard_cache: std::cell::RefCell<HashMap<usize, std::rc::Rc<Vec<u8>>>>,
 }
 
 impl SafetensorLoader {
@@ -639,10 +645,11 @@ impl SafetensorLoader {
                 names.mlp_prefix
             );
             let stacked_rows = 2 * moe_intermediate_size;
-            // Load each stacked tensor ONCE and slice every local expert out
-            // of its bytes — a per-expert load would copy the full [E, …]
-            // tensor `experts_per_rank` times.
-            let gate_up_t = self.load_tensor(&gate_up_name)?;
+            // Borrow each stacked tensor ONCE from the read-once shard cache and
+            // slice every local expert directly out of the cached bytes — the
+            // previous owned load (`view.data().to_vec()`) added ~1 GiB + 512 MiB
+            // of host memcpy per MoE layer on top of the cache. Uploads unchanged.
+            let gate_up_t = self.borrow_bf16_tensor(&gate_up_name)?;
             ensure!(
                 gate_up_t.shape == [split.num_experts, stacked_rows, hidden_size],
                 "{gate_up_name}: expected stacked fused gate‖up tensor \
@@ -651,7 +658,7 @@ impl SafetensorLoader {
                 split.num_experts,
                 gate_up_t.shape
             );
-            let down_t = self.load_tensor(&down_name)?;
+            let down_t = self.borrow_bf16_tensor(&down_name)?;
             ensure!(
                 down_t.shape == [split.num_experts, hidden_size, moe_intermediate_size],
                 "{down_name}: expected stacked down tensor \
@@ -664,7 +671,7 @@ impl SafetensorLoader {
                 // gate_up_proj [E, 2*mi, hidden]: gate = rows [0, mi),
                 // up = rows [mi, 2*mi) of expert e's contiguous block.
                 let gate_bytes = crate::shard_slice::slice_stacked_expert(
-                    &gate_up_t.bytes,
+                    gate_up_t.bytes(),
                     split.num_experts,
                     stacked_rows,
                     hidden_size,
@@ -683,7 +690,7 @@ impl SafetensorLoader {
                     .with_context(|| format!("upload expert {e} gate slice of {gate_up_name}"))?,
                 );
                 let up_bytes = crate::shard_slice::slice_stacked_expert(
-                    &gate_up_t.bytes,
+                    gate_up_t.bytes(),
                     split.num_experts,
                     stacked_rows,
                     hidden_size,
@@ -703,7 +710,7 @@ impl SafetensorLoader {
                 );
                 // down_proj [E, hidden, mi]: the whole expert block.
                 let down_bytes = crate::shard_slice::slice_stacked_expert(
-                    &down_t.bytes,
+                    down_t.bytes(),
                     split.num_experts,
                     hidden_size,
                     moe_intermediate_size,
@@ -822,21 +829,32 @@ impl SafetensorLoader {
         (0..self.shards.len()).any(|idx| self.shard_has_tensor(idx, name).unwrap_or(false))
     }
 
-    /// Header-only existence check against one shard — no tensor bytes are
-    /// copied (unlike `load_tensor_from_shard`).
-    fn shard_has_tensor(&self, idx: usize, name: &str) -> Result<bool> {
+    /// Read-once shard bytes: fill the cache on first touch, then hand out a
+    /// cheap `Rc` clone (no `RefCell` guard escapes, so nested loads that fill
+    /// OTHER shards never hit a `BorrowMutError`).
+    #[allow(clippy::rc_buffer)] // Rc<[u8]> conversion would re-copy the shard
+    fn shard_bytes(&self, idx: usize) -> Result<std::rc::Rc<Vec<u8>>> {
         let path = self
             .shards
             .get(idx)
             .ok_or_else(|| anyhow!("shard index {idx} out of range"))?;
-        if !self.shard_cache.borrow().contains_key(&idx) {
-            let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-            self.shard_cache.borrow_mut().insert(idx, bytes);
+        if let Some(bytes) = self.shard_cache.borrow().get(&idx) {
+            return Ok(std::rc::Rc::clone(bytes));
         }
-        let cache = self.shard_cache.borrow();
-        let bytes = cache.get(&idx).expect("shard bytes just cached");
-        let tensors = SafeTensors::deserialize(bytes)
-            .with_context(|| format!("deserialize {}", path.display()))?;
+        let bytes =
+            std::rc::Rc::new(fs::read(path).with_context(|| format!("read {}", path.display()))?);
+        self.shard_cache
+            .borrow_mut()
+            .insert(idx, std::rc::Rc::clone(&bytes));
+        Ok(bytes)
+    }
+
+    /// Header-only existence check against one shard — no tensor bytes are
+    /// copied (unlike `load_tensor_from_shard`).
+    fn shard_has_tensor(&self, idx: usize, name: &str) -> Result<bool> {
+        let bytes = self.shard_bytes(idx)?;
+        let tensors = SafeTensors::deserialize(&bytes)
+            .with_context(|| format!("deserialize {}", self.shards[idx].display()))?;
         Ok(tensors.tensor(name).is_ok())
     }
 
@@ -853,26 +871,94 @@ impl SafetensorLoader {
     /// Dtype-agnostic shard read (DSv4 FP8/FP4/E8M0). Same read-once cache as the
     /// BF16 path; the typed gate lives in the callers.
     fn load_raw_from_shard(&self, idx: usize, name: &str) -> Result<OwnedTensor> {
-        let path = self
-            .shards
-            .get(idx)
-            .ok_or_else(|| anyhow!("shard index {idx} out of range"))?;
-        if !self.shard_cache.borrow().contains_key(&idx) {
-            let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-            self.shard_cache.borrow_mut().insert(idx, bytes);
-        }
-        let cache = self.shard_cache.borrow();
-        let bytes = cache.get(&idx).expect("shard bytes just cached");
-        let tensors = SafeTensors::deserialize(bytes)
+        let tensor = self.borrow_raw_from_shard(idx, name)?;
+        Ok(OwnedTensor {
+            shape: tensor.shape.clone(),
+            bytes: tensor.bytes().to_vec(),
+            dtype: tensor.dtype,
+        })
+    }
+
+    /// Zero-copy shard read: the returned [`SharedTensor`] aliases the tensor's
+    /// byte range inside the read-once shard cache (an `Rc` clone, no host
+    /// memcpy). The stacked-expert loader slices ~1.5 GiB per MoE layer out of
+    /// these bytes; the owned path (`load_raw_from_shard`) copied that whole
+    /// range per tensor on top of the cache. (audit MOE-P2-1)
+    fn borrow_raw_from_shard(&self, idx: usize, name: &str) -> Result<SharedTensor> {
+        let shard = self.shard_bytes(idx)?;
+        let path = &self.shards[idx];
+        let tensors = SafeTensors::deserialize(&shard)
             .with_context(|| format!("deserialize {}", path.display()))?;
         let view = tensors
             .tensor(name)
             .with_context(|| format!("find tensor {name} in {}", path.display()))?;
-        Ok(OwnedTensor {
-            shape: view.shape().to_vec(),
-            bytes: view.data().to_vec(),
-            dtype: view.dtype(),
+        let shape = view.shape().to_vec();
+        let dtype = view.dtype();
+        let data = view.data();
+        // `view.data()` borrows from `shard`'s allocation; record its range so
+        // the `Rc`-owning SharedTensor can re-slice it without the borrow.
+        let base = shard.as_ptr() as usize;
+        let offset = data.as_ptr() as usize - base;
+        let len = data.len();
+        ensure!(
+            offset + len <= shard.len(),
+            "{name}: tensor byte range [{offset}, {}) exceeds shard size {}",
+            offset + len,
+            shard.len()
+        );
+        Ok(SharedTensor {
+            shape,
+            dtype,
+            shard,
+            offset,
+            len,
         })
+    }
+
+    /// Zero-copy tensor lookup across shards (the borrow-path twin of
+    /// [`Self::load_raw_tensor`]).
+    fn borrow_raw_tensor(&self, name: &str) -> Result<SharedTensor> {
+        if let Some(&idx) = self.weight_map.get(name) {
+            return self.borrow_raw_from_shard(idx, name);
+        }
+        for idx in 0..self.shards.len() {
+            if let Ok(tensor) = self.borrow_raw_from_shard(idx, name) {
+                return Ok(tensor);
+            }
+        }
+        Err(anyhow!(
+            "tensor {name} not found in safetensors under {}",
+            self.base.display()
+        ))
+    }
+
+    /// Zero-copy BF16 tensor borrow (the borrow-path twin of `load_tensor`'s
+    /// dtype gate).
+    fn borrow_bf16_tensor(&self, name: &str) -> Result<SharedTensor> {
+        let tensor = self.borrow_raw_tensor(name)?;
+        ensure!(
+            tensor.dtype == Dtype::BF16,
+            "{name}: R6 clean CUDA path accepts BF16 only, got {:?}",
+            tensor.dtype
+        );
+        Ok(tensor)
+    }
+}
+
+/// A tensor whose bytes alias the loader's read-once shard cache (`Rc` share,
+/// zero host copies). [`Self::bytes`] yields the tensor's exact byte range.
+pub(crate) struct SharedTensor {
+    pub(crate) shape: Vec<usize>,
+    pub(crate) dtype: Dtype,
+    #[allow(clippy::rc_buffer)] // shares the shard cache's Rc — see shard_cache
+    shard: std::rc::Rc<Vec<u8>>,
+    offset: usize,
+    len: usize,
+}
+
+impl SharedTensor {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.shard[self.offset..self.offset + self.len]
     }
 }
 
