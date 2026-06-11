@@ -83,21 +83,19 @@ def _fq_cumsum_kernel():
         with T.Kernel(num_chunks, threads=128) as (bc,):
             bb = bc % data_batch_size
             chunk_idx = bc // data_batch_size
-            seq_start_idx = 0
-            seq_end_idx = num_tokens
 
-            left = seq_start_idx + chunk_idx * block_S
+            left = chunk_idx * block_S
             right = left + block_S
 
             g_fragment = T.alloc_fragment((H, block_S), dtype=accum_dtype)
             gT_fragment = T.alloc_fragment((block_S, H), dtype=g_dtype)
             gT_shared = T.alloc_shared((block_S, H + 1), dtype=g_dtype)
 
-            if right <= seq_end_idx:
+            if right <= num_tokens:
                 T.copy(g_raw[bb, left:right, 0:H], gT_fragment)
             else:
                 for j, i in T.Parallel(block_S, H):
-                    if left + j < seq_end_idx:
+                    if left + j < num_tokens:
                         gT_fragment[j, i] = g_raw[bb, left + j, i]
                     else:
                         gT_fragment[j, i] = 0
@@ -112,11 +110,11 @@ def _fq_cumsum_kernel():
                 gT_shared[j, i] = g_fragment[i, j]
 
             T.copy(gT_shared[:, :H], gT_fragment)
-            if right <= seq_end_idx:
+            if right <= num_tokens:
                 T.copy(gT_fragment, g_cumsum[bb, left:right, 0:H])
             else:
                 for j, i in T.Parallel(block_S, H):
-                    if left + j < seq_end_idx:
+                    if left + j < num_tokens:
                         g_cumsum[bb, left + j, i] = gT_fragment[j, i]
 
     return fq_cumsum_kernel
@@ -157,10 +155,8 @@ def _fq_kkt_kernel():
 
             bb = bc % data_batch_size
             chunk_idx = bc // data_batch_size
-            seq_start_idx = 0
-            seq_end_idx = num_tokens
 
-            left = seq_start_idx + chunk_idx * block_S
+            left = chunk_idx * block_S
             right = left + block_S
 
             k_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
@@ -201,12 +197,12 @@ def _fq_kkt_kernel():
                 T.set_max_nreg(CONSUMER_NREG, 1)
 
                 # Load b
-                if right <= seq_end_idx:
+                if right <= num_tokens:
                     for j_s in T.Parallel(block_S):
                         b_shared[j_s] = b[bb, left + j_s, bh]
                 else:
                     for j_s in T.Parallel(block_S):
-                        if left + j_s < seq_end_idx:
+                        if left + j_s < num_tokens:
                             b_shared[j_s] = b[bb, left + j_s, bh]
                         else:
                             b_shared[j_s] = 0
@@ -322,16 +318,16 @@ def _fq_kkt_kernel():
                     T.barrier_wait(a_is_ready, 0)
 
                     # Save A (unmasked)
-                    if right <= seq_end_idx:
+                    if right <= num_tokens:
                         T.copy(a64_shared, a[bb, left:right, bh, 0:block_S])
 
                 else:
                     T.barrier_wait(a_is_ready, 0)
 
                     # Save A (masked)
-                    if right > seq_end_idx:
+                    if right > num_tokens:
                         for j_s, j_t in T.Parallel(block_S, block_S):
-                            if left + j_s < seq_end_idx:
+                            if left + j_s < num_tokens:
                                 a[bb, left + j_s, bh, j_t] = a64_shared[j_s, j_t]
 
     return fq_kkt_kernel
@@ -395,15 +391,13 @@ def _fq_fwd_kernel():
             bb, bh = bbh // H, bbh % H
 
             batch_idx = bb
-            seq_start_idx = 0
-            seq_end_idx = num_tokens
 
             raw_batch_idx = bb
 
             num_iters = T.alloc_var("int32")
             num_unmasked_iters = T.alloc_var("int32")
-            num_iters = T.ceildiv(seq_end_idx - seq_start_idx, block_S)
-            num_unmasked_iters = (seq_end_idx - seq_start_idx) // block_S
+            num_iters = T.ceildiv(num_tokens, block_S)
+            num_unmasked_iters = num_tokens // block_S
 
             q_shared = T.alloc_shared((2, block_S, DK), dtype=qkva_dtype)
             k_shared = T.alloc_shared((2, block_S, DK), dtype=qkva_dtype)
@@ -515,7 +509,7 @@ def _fq_fwd_kernel():
                         g_exp_shared[j_s] = T.exp2(g_shared[i_s % 2, j_s] * 1.442695)
                     for j_s in T.Parallel(block_S):
                         g_rev_exp_shared[j_s] = T.if_then_else(
-                            seq_start_idx + i_s * block_S + j_s < seq_end_idx,
+                            i_s * block_S + j_s < num_tokens,
                             T.exp2(
                                 (
                                     g_shared[i_s % 2, block_S - 1]
@@ -651,7 +645,7 @@ def _fq_fwd_kernel():
                 if tx < 384 + 32:
                     for i_s in T.serial(num_iters):
                         T.barrier_wait(data_is_free[i_s % 2], (i_s // 2 + 1) % 2)
-                        left = seq_start_idx + i_s * block_S
+                        left = i_s * block_S
                         right = left + block_S
 
                         # Load Q
@@ -670,7 +664,7 @@ def _fq_fwd_kernel():
                 elif tx < 384 + 64:
                     for i_s in T.serial(num_iters):
                         T.barrier_wait(data_is_free[i_s % 2], (i_s // 2 + 1) % 2)
-                        left = seq_start_idx + i_s * block_S
+                        left = i_s * block_S
                         right = left + block_S
 
                         # Load V
@@ -684,12 +678,12 @@ def _fq_fwd_kernel():
                             v_shared[i_s % 2, :, :],
                         )
                         # Load beta
-                        if right <= seq_end_idx:
+                        if right <= num_tokens:
                             for j_s in T.Parallel(block_S):
                                 b_shared[i_s % 2, j_s] = b[batch_idx, left + j_s, bh]
                         else:
                             for j_s in T.Parallel(block_S):
-                                if left + j_s < seq_end_idx:
+                                if left + j_s < num_tokens:
                                     b_shared[i_s % 2, j_s] = b[
                                         batch_idx, left + j_s, bh
                                     ]
@@ -701,7 +695,7 @@ def _fq_fwd_kernel():
                 elif tx < 384 + 96:
                     for i_s in T.serial(num_iters):
                         T.barrier_wait(data_is_free[i_s % 2], (i_s // 2 + 1) % 2)
-                        left = seq_start_idx + i_s * block_S
+                        left = i_s * block_S
                         right = left + block_S
 
                         # Load A
@@ -710,25 +704,25 @@ def _fq_fwd_kernel():
                             a_shared[i_s % 2, :, :],
                         )
                         # Load gamma
-                        if right <= seq_end_idx:
+                        if right <= num_tokens:
                             for j_s in T.Parallel(block_S):
                                 g_shared[i_s % 2, j_s] = g[batch_idx, left + j_s, bh]
                         else:
                             for j_s in T.Parallel(block_S):
-                                if left + j_s < seq_end_idx:
+                                if left + j_s < num_tokens:
                                     g_shared[i_s % 2, j_s] = g[
                                         batch_idx, left + j_s, bh
                                     ]
                                 else:
                                     g_shared[i_s % 2, j_s] = g[
-                                        batch_idx, seq_end_idx - 1, bh
+                                        batch_idx, num_tokens - 1, bh
                                     ]
 
                         T.barrier_arrive(data_is_ready[i_s % 2])
 
                 else:
                     for i_s in T.serial(num_unmasked_iters):
-                        right = seq_start_idx + i_s * block_S
+                        right = i_s * block_S
                         left = right - block_S
 
                         T.barrier_arrive(bar_0)
@@ -750,7 +744,7 @@ def _fq_fwd_kernel():
                         T.barrier_wait(bar_1, i_s % 2)
 
                     if num_unmasked_iters < num_iters:
-                        seq_split_idx = seq_start_idx + num_unmasked_iters * block_S
+                        seq_split_idx = num_unmasked_iters * block_S
 
                         T.barrier_arrive(bar_0)
 
@@ -770,12 +764,12 @@ def _fq_fwd_kernel():
 
                         T.barrier_wait(bar_1, num_unmasked_iters % 2)
 
-                    seq_split_idx = seq_start_idx + (num_iters - 1) * block_S
+                    seq_split_idx = (num_iters - 1) * block_S
 
                     # Store O
                     T.barrier_wait(bar_o, 0)
                     for j_s, j_v in T.Parallel(block_S, block_DV):
-                        with T.If(seq_split_idx + j_s < seq_end_idx):
+                        with T.If(seq_split_idx + j_s < num_tokens):
                             with T.Then():
                                 o[
                                     batch_idx,
