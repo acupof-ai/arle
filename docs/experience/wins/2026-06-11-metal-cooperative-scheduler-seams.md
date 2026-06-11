@@ -19,9 +19,10 @@ avoid default per-token D2H stalls without adding Metal types above the seam.
 
 - Backend: Metal/MLX executor.
 - Scheduler: shared `infer_core::Engine`.
-- Low-impact config: `num_slots=1`, `total_pages<=1024`,
-  `max_prompt_tokens<=8192`, `max_total_tokens<=8192`,
-  `chunked_prefill_size<=32`, plus cooperative `StepBudget`.
+- Low-impact config: `num_slots=1`, `chunked_prefill_size<=32`, plus
+  cooperative `StepBudget`. It does not cap `total_pages`,
+  `max_prompt_tokens`, or `max_total_tokens`; those stay at the normal
+  defaults unless the operator sets them explicitly.
 - Metal serve policy: single-flight only; a second live request returns busy
   instead of queueing behind the first request.
 - Spec decode: CUDA checkpoint-native MTP only; Metal speculative routes fail

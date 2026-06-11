@@ -15,7 +15,9 @@
 //! `ServeHandle` the `load_*` constructors spawn. On a build with no backend
 //! compiled in, [`serve_http`] returns a clear error (mirrors `--doctor`).
 
-use anyhow::Result;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
 
 use crate::loaded::EngineLoadConfig;
 
@@ -40,6 +42,10 @@ pub struct ServeHttpOptions {
     /// Speculative-decode request surface. The rewrite server keeps this
     /// fail-closed until a backend actually consumes it.
     pub spec: ServeSpecOptions,
+    /// Optional SSD-backed KV tier request. The option is backend-neutral at the
+    /// service boundary; current rewrite backends fail closed until they expose a
+    /// real recall path below the executor seam.
+    pub kv_ssd: ServeKvSsdOptions,
 }
 
 impl ServeHttpOptions {
@@ -53,7 +59,27 @@ impl ServeHttpOptions {
             enable_cuda_graph: true,
             engine_config: EngineLoadConfig::default(),
             spec: ServeSpecOptions::default(),
+            kv_ssd: ServeKvSsdOptions::default(),
         }
+    }
+}
+
+/// SSD-backed KV tier request carried at the serve boundary.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct ServeKvSsdOptions {
+    /// Root directory for local SSD/NVMe KV blocks.
+    pub root: Option<PathBuf>,
+    /// Optional capacity guard for this serve process.
+    pub max_bytes: Option<usize>,
+    /// The only intended SSD serving mode in the rewrite stack: synchronous,
+    /// high-throughput promotion without background preemption.
+    pub high_performance_non_preemptive: bool,
+}
+
+impl ServeKvSsdOptions {
+    #[must_use]
+    pub fn requested(&self) -> bool {
+        self.root.is_some() || self.max_bytes.is_some() || self.high_performance_non_preemptive
     }
 }
 
@@ -110,7 +136,7 @@ impl ServeSpecOptions {
     feature = "cpu"
 ))]
 pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
-    use anyhow::Context;
+    validate_kv_ssd_options(&opts.kv_ssd)?;
 
     // Lower the requested spec surface into the engine config. The blanket
     // fail-close is now narrowed: an external draft model and `auto` are still
@@ -158,6 +184,46 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
     })
 }
 
+fn validate_kv_ssd_options(opts: &ServeKvSsdOptions) -> Result<()> {
+    if !opts.requested() {
+        return Ok(());
+    }
+
+    let root = opts.root.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("--kv-ssd-max-bytes requires --kv-ssd-path so the KV tier has a root")
+    })?;
+    anyhow::ensure!(
+        !root.as_os_str().is_empty(),
+        "--kv-ssd-path must not be empty"
+    );
+    anyhow::ensure!(
+        root.is_absolute(),
+        "--kv-ssd-path must be absolute for serving; got {}",
+        root.display()
+    );
+    let meta = std::fs::metadata(root)
+        .with_context(|| format!("inspect --kv-ssd-path {}", root.display()))?;
+    anyhow::ensure!(
+        meta.is_dir(),
+        "--kv-ssd-path must be an existing directory; got {}",
+        root.display()
+    );
+    anyhow::ensure!(
+        opts.max_bytes.is_none_or(|value| value > 0),
+        "--kv-ssd-max-bytes must be positive"
+    );
+    anyhow::ensure!(
+        opts.high_performance_non_preemptive,
+        "--kv-ssd-path currently only supports the high-performance non-preemptive mode"
+    );
+
+    anyhow::bail!(
+        "SSD KV tier requested at {}, but the rewrite serve path has no active SSD recall implementation yet; \
+         kv-native-sys is only the persistence substrate. Refusing to start instead of reporting fake SSD hits.",
+        root.display()
+    );
+}
+
 /// Backend-absent build: report the same way `--doctor` does and return an error.
 #[cfg(not(any(
     feature = "metal",
@@ -166,10 +232,55 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
     feature = "vulkan",
     feature = "cpu"
 )))]
-pub fn serve_http(_opts: ServeHttpOptions) -> Result<()> {
+pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
+    validate_kv_ssd_options(&opts.kv_ssd)?;
     anyhow::bail!(
         "serve requires a backend build; rebuild with cuda, metal/no-cuda, vulkan/no-cuda, or cpu/no-cuda"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServeKvSsdOptions, validate_kv_ssd_options};
+
+    #[test]
+    fn kv_ssd_rejects_capacity_without_root() {
+        let err = validate_kv_ssd_options(&ServeKvSsdOptions {
+            root: None,
+            max_bytes: Some(1),
+            high_performance_non_preemptive: true,
+        })
+        .expect_err("capacity without root should fail");
+
+        assert!(err.to_string().contains("--kv-ssd-path"));
+    }
+
+    #[test]
+    fn kv_ssd_rejects_relative_root() {
+        let err = validate_kv_ssd_options(&ServeKvSsdOptions {
+            root: Some("relative/kv".into()),
+            max_bytes: None,
+            high_performance_non_preemptive: true,
+        })
+        .expect_err("relative root should fail");
+
+        assert!(err.to_string().contains("must be absolute"));
+    }
+
+    #[test]
+    fn kv_ssd_valid_root_still_fails_closed_until_recall_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = validate_kv_ssd_options(&ServeKvSsdOptions {
+            root: Some(dir.path().to_path_buf()),
+            max_bytes: Some(1 << 30),
+            high_performance_non_preemptive: true,
+        })
+        .expect_err("current rewrite serve path should fail closed");
+
+        let msg = err.to_string();
+        assert!(msg.contains("no active SSD recall implementation"));
+        assert!(msg.contains("fake SSD hits"));
+    }
 }
 
 #[cfg(any(
