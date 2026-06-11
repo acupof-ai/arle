@@ -1767,6 +1767,22 @@ impl Dsv4LayerAttentionState {
         total_len: usize,
     ) {
         self.advance_decode_len(mode, ratio, total_len);
+        // SGLang frozen-KV discipline: the official DSA key cache is a
+        // deterministic function of committed `seq_len`. `capture/restore_
+        // rollback_snapshot` cover sw/fp8/compressor/indexer but NOT
+        // `dsa_official` — its `packed_rows` progress counter advances when a
+        // speculative draft crosses a compression boundary (csa_select_official,
+        // `packed_rows = indexer_rows_after`) and was never rolled back on draft
+        // rejection. The stale draft key then stays in `dsa_key_cache` and the
+        // next pack is skipped (`newly_packed == 0`), corrupting top-k selection
+        // and accumulating into degenerate output. Clamp `packed_rows` DOWN to
+        // the rolled-back compressed-row count so the next real decode re-packs
+        // (overwrites) the row from the restored indexer KV — self-heal, no
+        // snapshot (mirrors SGLang's seq_len-as-single-source-of-truth design).
+        if let Some(dsa) = &mut self.dsa_official {
+            let compressed_rows = total_len / ratio.max(1);
+            dsa.packed_rows = dsa.packed_rows.min(compressed_rows);
+        }
     }
 
     pub(crate) fn dump_mtp_rollback_state(
