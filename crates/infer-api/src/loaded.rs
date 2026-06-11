@@ -427,8 +427,12 @@ mod backend {
             // (CLI --cuda-graph, default on) sets the decode-graph default;
             // `INFER_CUDA_DECODE_GRAPH` overrides, `warmup` gates it off under TP/MoE.
             // Shares the engine builder with `router_cuda` via `cuda_serve_handle`.
-            let (serve, tokenizer, model_id) =
-                cuda_serve_handle(model_path, enable_cuda_graph, config)?;
+            let (serve, tokenizer, model_id) = cuda_serve_handle(
+                model_path,
+                enable_cuda_graph,
+                config,
+                &crate::serve::ServeKvSsdOptions::default(),
+            )?;
             Ok(Self::Cuda(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
             )))
@@ -497,7 +501,17 @@ mod backend {
         model_path: &str,
         enable_cuda_graph: bool,
         config: EngineLoadConfig,
+        kv_ssd: &crate::serve::ServeKvSsdOptions,
     ) -> Result<axum::Router> {
+        // The T2 disk tier is consumed by the CUDA arm only; every other
+        // backend fails closed on an explicit request instead of silently
+        // serving without it.
+        #[cfg(not(all(not(feature = "metal"), feature = "cuda")))]
+        anyhow::ensure!(
+            !kv_ssd.requested(),
+            "--kv-ssd-path: the T2 KV tier is CUDA-only today (Metal pending #74/#83)"
+        );
+
         #[cfg(feature = "metal")]
         {
             let _ = enable_cuda_graph;
@@ -506,7 +520,7 @@ mod backend {
 
         #[cfg(all(not(feature = "metal"), feature = "cuda"))]
         {
-            return router_cuda(model_path, enable_cuda_graph, &config);
+            return router_cuda(model_path, enable_cuda_graph, &config, kv_ssd);
         }
 
         #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "hip"))]
@@ -687,6 +701,7 @@ mod backend {
         model_path: &str,
         enable_cuda_graph: bool,
         config: &EngineLoadConfig,
+        kv_ssd: &crate::serve::ServeKvSsdOptions,
     ) -> Result<(
         ServeHandle<CudaExecutor, CudaKvPool>,
         infer_server::OpenAiTokenizer,
@@ -703,6 +718,24 @@ mod backend {
         let serve = ServeHandle::spawn_with_engine_builder(move || {
             build_cuda_engine(&model_source, &engine_config)
         })?;
+        // Opt-in T2 disk spill (`--kv-ssd-path`): attach pre-traffic via the
+        // engine-thread control seam; fail closed instead of silently
+        // serving without the requested tier.
+        if kv_ssd.requested() {
+            let root = kv_ssd
+                .root
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--kv-ssd-max-bytes requires --kv-ssd-path"))?;
+            let budget = kv_ssd
+                .max_bytes
+                .unwrap_or(infer_cuda::DEFAULT_KV_SSD_BUDGET_BYTES);
+            let consumed = serve.run_on_executor(move |e| e.set_kv_tier_disk(root, budget))?;
+            anyhow::ensure!(
+                consumed,
+                "--kv-ssd-path: the loaded model has no page-addressable KV tier store \
+                 (Qwen3-dense only today; DSv4/hybrid pending #85)"
+            );
+        }
         Ok((serve, tokenizer, model_id))
     }
 
@@ -889,9 +922,10 @@ mod backend {
         model_path: &str,
         enable_cuda_graph: bool,
         config: &EngineLoadConfig,
+        kv_ssd: &crate::serve::ServeKvSsdOptions,
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) =
-            cuda_serve_handle(model_path, enable_cuda_graph, config)?;
+            cuda_serve_handle(model_path, enable_cuda_graph, config, kv_ssd)?;
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
