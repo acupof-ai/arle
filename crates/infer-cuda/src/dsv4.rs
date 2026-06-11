@@ -250,7 +250,6 @@ pub(crate) struct Dsv4SlotImage {
 
 pub(crate) struct Dsv4SlotState {
     attention: Vec<crate::attention::Dsv4LayerAttentionState>,
-    spec_rollback: Option<Vec<crate::attention::Dsv4LayerAttentionSnapshot>>,
     moe_decode_scratch: Vec<crate::moe::Dsv4MoeDecodeScratch>,
     shared_decode_out: Vec<HiddenStates>,
     start_pos_device: CudaSlice<i32>,
@@ -547,19 +546,6 @@ impl Dsv4SlotState {
             shared_decode_out
                 .push(unsafe { HiddenStates::uninit(&model.ctx, model.config.hidden_size, 1)? });
         }
-        let spec_rollback = if model.spec_decode_on {
-            let mut snapshots = Vec::with_capacity(attention.len());
-            for state in &attention {
-                snapshots.push(state.rollback_snapshot(
-                    &model.ctx,
-                    &model.config,
-                    &model.kv_arena,
-                )?);
-            }
-            Some(snapshots)
-        } else {
-            None
-        };
         let start_pos_device = model
             .ctx
             .stream
@@ -582,7 +568,6 @@ impl Dsv4SlotState {
         };
         Ok(Self {
             attention,
-            spec_rollback,
             moe_decode_scratch,
             shared_decode_out,
             start_pos_device,
@@ -621,52 +606,6 @@ impl Dsv4SlotState {
         Ok(())
     }
 
-    pub(crate) fn capture_spec_rollback(
-        &mut self,
-        ctx: &DeviceContext,
-        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
-        draft_abs_pos: usize,
-    ) -> Result<()> {
-        let snapshots = self
-            .spec_rollback
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 spec rollback snapshot not allocated"))?;
-        ensure!(
-            self.attention.len() == snapshots.len(),
-            "DSv4 rollback snapshot layer count {} != attention states {}",
-            snapshots.len(),
-            self.attention.len()
-        );
-        for (layer_idx, (state, snapshot)) in self.attention.iter().zip(snapshots).enumerate() {
-            let pool = kv_adapter.layer_mut(layer_idx)?;
-            state.capture_rollback_snapshot(ctx, pool, snapshot, draft_abs_pos)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn restore_spec_rollback(
-        &mut self,
-        ctx: &DeviceContext,
-        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
-        draft_abs_pos: usize,
-    ) -> Result<()> {
-        let snapshots = self
-            .spec_rollback
-            .as_ref()
-            .ok_or_else(|| anyhow!("DSv4 spec rollback snapshot not allocated"))?;
-        ensure!(
-            self.attention.len() == snapshots.len(),
-            "DSv4 rollback restore layer count {} != attention states {}",
-            snapshots.len(),
-            self.attention.len()
-        );
-        for (layer_idx, (state, snapshot)) in self.attention.iter_mut().zip(snapshots).enumerate() {
-            let pool = kv_adapter.layer_mut(layer_idx)?;
-            state.restore_rollback_snapshot(ctx, pool, snapshot, draft_abs_pos)?;
-        }
-        Ok(())
-    }
-
     /// Serialize this slot's COMPLETE device state into a host image (whole-
     /// slot KV swap, #84/#85 Route B). The engine frees the slot right after
     /// `demote_slot` returns, so the trailing `ctx.sync()` is load-bearing:
@@ -676,10 +615,6 @@ impl Dsv4SlotState {
     /// - `attention`: SNAPSHOT per layer — see
     ///   [`crate::attention::Dsv4LayerAttentionState::swap_out_image`] for the
     ///   per-buffer enumeration.
-    /// - `spec_rollback`: SCRATCH — captured fresh (`capture_spec_rollback`)
-    ///   at the start of every spec verify step before any
-    ///   `restore_spec_rollback` reads it; never read across step or request
-    ///   boundaries.
     /// - `moe_decode_scratch`: SCRATCH — every buffer is per-call zeroed /
     ///   sentinel-memset or fully overwritten before read; the per-buffer init
     ///   table lives on `moe.rs`'s `Dsv4MoeDecodeScratch` (counts/cursors
@@ -1224,17 +1159,9 @@ impl Dsv4Model {
         let params = SamplingParams::default();
 
         // Batched verify (opt-in, default off; KNOWN col1 bug — see selftest probe).
-        // ONE 2-token forward amortizes the weight read (proven +63%). Capture the
-        // rollback only when the spec snapshot is allocated (skipped for the
-        // selftest probe, which doesn't reject).
+        // ONE 2-token forward amortizes the weight read (proven +63%).
         if dsv4_mtp_batched_verify_enabled() && tokens.len() >= 2 {
             let stream_dim = self.config.hidden_size * self.config.hc_mult;
-            // Capture iff the per-slot rollback snapshot was actually allocated
-            // (gated on `spec_decode_on` at slot construction): config-driven
-            // `--spec-type mtp` OR the env fallback.
-            if self.spec_decode_on {
-                slot.capture_spec_rollback(&self.ctx, kv_adapter, start_pos + 1)?;
-            }
             // Depth-K verify: ONE forward over `[pending, d0..d_{K-1}]` amortizes the
             // weight read across K+1 tokens. `hiddens[j]` = position j's MTP stream;
             // `argmax[j]` = the target's argmax AFTER `tokens[j]` (so `argmax[i]` is
@@ -1295,7 +1222,6 @@ impl Dsv4Model {
                     "spec_after_pending_before_draft",
                     draft_abs_pos,
                 )?;
-                slot.capture_spec_rollback(&self.ctx, kv_adapter, draft_abs_pos)?;
             }
         }
         Ok((argmax_tokens, hiddens))
