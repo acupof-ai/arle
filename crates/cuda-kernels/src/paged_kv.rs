@@ -1561,6 +1561,14 @@ impl TokenKVPool {
         &self.k_data[layer]
     }
 
+    /// Mutable K data CudaSlice ref for a layer. Packed-record pools
+    /// (`KVFormat::PackedBytes`) are single-plane - the whole record lives
+    /// here - and their adapters (DSv4 #85 P2) need `slice_mut` views for
+    /// memset / D2D restore paths that the raw-pointer accessors can't serve.
+    pub fn k_data_slice_mut(&mut self, layer: usize) -> &mut CudaSlice<u8> {
+        &mut self.k_data[layer]
+    }
+
     /// V data CudaSlice ref for a layer.
     pub fn v_data_slice(&self, layer: usize) -> &CudaSlice<u8> {
         &self.v_data[layer]
