@@ -46,6 +46,11 @@ pub struct EngineLoadConfig {
     /// builder so the service/scheduler layers stay device-neutral.
     #[serde(default)]
     pub kv_cache_dtype: KvCacheDtype,
+    /// Host-RAM budget for the T1 prefix-KV tier in bytes. `None` keeps the
+    /// backend default (CUDA dense: 4 GiB, default-on); `Some(0)` disables
+    /// the tier. Backends without a tier store ignore it.
+    #[serde(default)]
+    pub kv_t1_budget_bytes: Option<usize>,
     /// Low-impact local serving mode: keep work chunks cooperative for desktop
     /// responsiveness. Backend builders may install a resource governor when
     /// this is set; server-style defaults leave it off.
@@ -65,6 +70,7 @@ impl Default for EngineLoadConfig {
             chunked_prefill_size: 64,
             mtp_draft_tokens: None,
             kv_cache_dtype: KvCacheDtype::Auto,
+            kv_t1_budget_bytes: None,
             low_impact: false,
         }
     }
@@ -795,6 +801,12 @@ mod backend {
                 config.mtp_draft_tokens,
             )?,
         };
+        let mut executor = executor;
+        if let Some(bytes) = config.kv_t1_budget_bytes {
+            // Pre-serve re-budget of the T1 prefix tier (0 disables); None
+            // keeps the executor's default-on budget.
+            executor.set_kv_tier_budget_bytes(bytes);
+        }
         // The DSv4 constructor may clamp slots below the request (dynamic KV
         // mem budget, NCCL min-reduced ⇒ identical on every rank). Scheduler +
         // admission pool MUST follow the effective count: admitting to a slot

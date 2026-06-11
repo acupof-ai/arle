@@ -367,6 +367,9 @@ fn resolve_engine_config(
     if let Some(value) = serve_args.chunked_prefill_size {
         config.chunked_prefill_size = value;
     }
+    if serve_args.kv_t1_budget_bytes.is_some() {
+        config.kv_t1_budget_bytes = serve_args.kv_t1_budget_bytes;
+    }
 
     if config.max_prompt_tokens > config.max_total_tokens {
         return Err(format!(

@@ -343,6 +343,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_positive_usize, requires = "kv_ssd_path")]
     pub(crate) kv_ssd_max_bytes: Option<usize>,
 
+    /// Host-RAM budget in bytes for the T1 prefix-KV tier (default-on:
+    /// CUDA dense keeps 4 GiB when unset). `0` disables the tier.
+    #[arg(long, value_name = "BYTES")]
+    pub(crate) kv_t1_budget_bytes: Option<usize>,
+
     /// Logical request slots for the unified scheduler.
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) num_slots: Option<usize>,
