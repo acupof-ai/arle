@@ -73,13 +73,16 @@ Backend-specific (stays put — genuinely not shared):
 - **Phase C1 ✅ (`a23336eb`):** DSv4 `kv_budget_num_slots` routes through the
   kernel. **Byte-identical** (`from_free` reproduces `floor(free×0.9)−Σfixed`;
   the two saturating_subs fold, proven in a unit test). NCCL min-reduce stays
-  CUDA-side. Budget log unchanged. Pod re-confirm = pending-remote.
+  CUDA-side. Budget log unchanged. **Pod-VALIDATED** (8×H20, DSv4-Flash,
+  HEAD binary): budget log byte-identical to the pre-convergence reference
+  (`per_slot 924MB …`), 8-slot boot clean, correct decode (Paris).
 - **Phase C2 ✅ (`c7fe1aea`):** Qwen3.5/3.6 CUDA gains the clamp it lacked — the
   real bug fix — via `Qwen35Model::kv_budget_num_slots` (per-slot bytes mirror
   `new_slot_state`) + the same kernel + NCCL min-reduce, wired in the executor
   constructor. Strictly safer (no-op when `requested ≤ affordable`). Dense
   Qwen3 out of scope (global `PagedKVPool`, no slot-multiplied OOM). GPU
-  boot-at-previously-OOMing-shape gate = pending-remote.
+  boot-at-previously-OOMing-shape gate = pending-remote (Qwen lane; shares the
+  pod-validated DSv4 kernel + NCCL-reduce path).
 - **Phase C3 ✅ (`5353f17f`):** `kv_tier.rs` derives T1/T2 from system RAM
   (`/proc/meminfo`, dep-free) + free disk (`statvfs`, libc/unix) via
   `split_host_tiers`; CLI opt-out preserved. Caps == old constants, so an ample
@@ -94,8 +97,11 @@ Backend-specific (stays put — genuinely not shared):
   **Byte-identical in every working config** (`max(1)` was a no-op once the real
   affordable ≥ 1 on all ranks); behavior changes ONLY in the previously-OOMing
   regime — now a clear `affords 0 slots at max_seq_len N` error instead of a
-  device OOM at arena/slot allocation. Pod boot-rejects-vs-OOM gate =
-  pending-remote (dormant on the pod: `free×0.9 ≫ per_slot`).
+  device OOM at arena/slot allocation. **Pod-VALIDATED (DSv4 lane)**: forced with
+  `max_seq_len 2000000` (per_slot 112802MB ≫ budget 48839MB → affordable 0),
+  **all 8 TP ranks** logged the identical `affords 0 slots` fail-closed message,
+  **zero OOM/panic**, pod left clean. Qwen3.5 path shares this exact shape
+  (pending a Qwen CUDA serve).
 
 **Convergence complete:** VRAM (DSv4 C1 + Qwen3.5/3.6 C2 + reject-parity C4),
 host RAM/SSD (C3), and Metal (B′) all flow through the one neutral infer-seam

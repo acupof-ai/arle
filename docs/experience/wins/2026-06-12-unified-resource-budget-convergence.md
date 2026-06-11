@@ -105,18 +105,44 @@ policy.** No backend hand-rolls the budget/clamp/reject policy.
 - C4 guard arithmetic: covered by the existing `infer-seam`
   `fits_fixed` unit test (`affordable == 0` ⇒ reject); the CUDA edit only drops
   a proven-no-op `max(1)` and adds the post-reduce `ensure!`.
-- DSv4 C1 byte-identity: the #60 pod 8-slot run already exercises this exact
-  path (`shared MoE decode 114MB` came through `kv_budget_num_slots`); the
-  refactor preserves the log line and arithmetic.
+- DSv4 C1 byte-identity: directly pod-validated against a HEAD-built binary —
+  the new budget log reproduces the pre-convergence reference exactly (see the
+  GPU-validation section). Not the old-binary #60 run; a fresh rebuild from this
+  HEAD on the 8×H20 DSv4 lane.
 
-**GPU integration gate — pending-remote.** Two regimes need a CUDA GPU (H20 pod
-is the DSv4 lane, local is Mac): (1) Qwen3.5/3.6 CUDA clamp triggering at an
-over-large `--num-slots × --max-seq-len` (boots clamped instead of OOM); (2) C4
-reject-below-fixed bailing with the `affords 0 slots` error instead of a device
-OOM. Both are dormant on the pod's real configs (`free×0.9 ≫ per_slot`). Tracked
-under the unified-resource-budget plan; local evidence (kernel unit tests +
-fitting-regime byte-identity + `new_slot_state` mirroring by inspection) bounds
-the risk.
+**GPU validation — DSv4 lane DONE on the H20 pod (8×H20, TP=8, DeepSeek-V4-Flash,
+release-fast binary built from this HEAD).** Deployed the 11 convergence files to
+the pod build tree (`tn push` over the hostPath volume; all five critical files
+hash byte-identical to HEAD; new binary carries the C4 reject strings — DSv4 ×2,
+Qwen3.5 ×1 — and retains DeepGEMM-native, 399 symbols).
+
+- **C1 byte-identity — CONFIRMED.** New binary's budget log is identical to the
+  pre-convergence reference: `DSv4 KV budget: free 57035MB, per_slot 924MB
+  (arena×2 784MB + rotated 21MB + state caches 118MB), shared DSA 36MB, shared
+  MoE decode 0MB` (only the source line moved `1123→1129`, since C4 added the
+  guard above — log *content* identical). 8-slot boot clean, no OOM; completion
+  probe returned correct, coherent output (`" Paris.\nThe capital of France is
+  Paris."`), so the kernel refactor did not perturb decode.
+- **C4 reject — CONFIRMED (the one genuine behavior change).** Forced the
+  previously-dormant regime with `INFER_DSV4_MAX_SEQ_LEN=2000000`: per_slot
+  computed to 112802MB ≫ budget 48839MB → affordable 0. **All 8 TP ranks logged
+  the identical fail-closed message** (`grep -c "affords 0 slots" = 8`) — the
+  lockstep-safe uniform bail working exactly as designed (every rank branches on
+  the same post-NCCL-min-reduce scalar; no half-OOM, no deadlock). Message:
+  `DSv4 KV budget rejected startup: post-weights free VRAM affords 0 slots at
+  max_seq_len 2000000 (per_slot ~112802MB + shared DSA 2492MB + shared MoE decode
+  0MB exceed 0.9 of free). Lower --max-seq-len or free VRAM.` **Zero OOM / CUDA
+  error / panic / core-dump** — the precise improvement over the old `max(1)`
+  path (admit 1 slot → device OOM at arena alloc). Pod left clean (all 8 GPUs
+  back to 0 MiB).
+
+**Still inferred (not pod-exercised).** C2 + C4 on the **Qwen3.5/3.6 CUDA** path
+share the now-validated kernel + NCCL-min-reduce + bail shape with DSv4, but the
+DSv4 lane cannot exercise a Qwen serve; their per-slot mirroring of
+`new_slot_state` is by inspection. C3 host RAM/SSD derivation is unit-tested and
+resolves to the caps on the ample pod (byte-identical). A Qwen3.5 CUDA serve at
+an over-large shape is the one remaining round-trip — risk is bounded by the
+shared validated kernel.
 
 ## Rule
 
