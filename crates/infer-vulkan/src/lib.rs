@@ -12,6 +12,7 @@ pub mod kv_pool;
 pub mod model_dsv4;
 pub mod model_qwen3;
 pub mod model_qwen35;
+pub mod model_qwen36;
 
 pub use executor::{VulkanExecutor, VulkanInflight, load_qwen3_gguf};
 pub use kv_pool::VulkanKvPool;

@@ -17,6 +17,9 @@ mutated slot-buffer enumeration.
 P4 adds the Qwen3.5 hybrid contract: 3:1 linear/full attention structure,
 gated-delta recurrent state, conv4 ring state, hd256 full attention, and MLP
 order.
+P5 adds the Qwen3.6 MoE contract on top of Qwen3.5 hybrid attention: router
+GEMV, top-k, routed expert gate/up/down, shared expert, and weighted expert
+mix.
 
 The backend is not reachable from `arle serve` yet. CLI and model wiring are
 scheduled for P7, so there is no production hot path or benchmarkable endpoint
@@ -74,6 +77,9 @@ from primitives before DSv4 can run on Vulkan.
 P4 numeric Qwen3.5 execution is blocked independently: conv4 and recurrent
 gated-delta kernels do not exist in the vendored Vulkan corpus and need Vulkan
 ports before hybrid layers can execute.
+
+P5 numeric Qwen3.6 execution is blocked independently: MoE router/top-k and
+expert-mix launch integration is not implemented for Vulkan yet.
 
 ## Learnings
 
