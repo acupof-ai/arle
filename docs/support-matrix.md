@@ -158,7 +158,7 @@ Code lives in `crates/infer-core/src/{prefix,radix}.rs` (radix tree) and the
 | Slot-sticky multi-turn KV reuse | Supported (CUDA), Beta (Metal) | Prior-turn KV stays in slot for the next turn so only new user tokens prefill. CUDA is the primary path; Metal Qwen3.5 ships live prefix reuse via replayed compiled-path snapshots (see §1). |
 | Radix-backed prefix cache (T0 GPU) | Supported (CUDA) | Direct GPU-page attach + tail-page CoW on shared prefixes; `RadixNode` carries `hit_count`, `tier_location`, `session_id`, `fingerprint`, `soft_pin_until`, `byte_len`. |
 | T1 host-pinned spillover | Beta (CUDA) | Cold blocks demote from GPU to host pinned memory via `HostPinnedPool` (`kv-native-sys` arena); promote-on-use through `ReadmissionPlan`. |
-| T2 NVMe local-disk transport | Beta (CUDA) | Node-local persistence on top of `crates/kv-native-sys` (file/block ABI, mmap, WAL). The disk transport was legacy `infer/`-only; re-porting below the executor seam is sequenced in the multi-GPU port roadmap (see §0). |
+| T2 NVMe local-disk transport | Beta (CUDA), rewrite serve not active | Node-local persistence on top of `crates/kv-native-sys` (file/block ABI, mmap, WAL). The disk transport was legacy `infer/`-only; re-porting below the executor seam is sequenced in the multi-GPU port roadmap (see §0). `arle serve --kv-ssd-path ...` validates the request and fails closed until a backend exposes real SSD recall. |
 | T3 cluster-shared backend | Experimental | A minimal shared-FS reference backend shipped in the legacy tree; **NIXL transport remains stub-only** (`nixl-sys` activates the stub feature, no real link). Treat T3 as scaffolding, not a production tier today; not yet re-ported into the rewrite stack (see §0). |
 
 ---

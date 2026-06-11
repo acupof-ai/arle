@@ -326,7 +326,7 @@ These crates sit around the runtime graph:
 - `crates/cuda-kernels`: CUDA kernel layer (extracted from the legacy `infer` crate in commit `a4e12f5`, 2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/tilelang/`, Rust FFI, `paged_kv`, `tilelang`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend, including vendored MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/deepep-sys`: DeepEP all-to-all transport bindings used by `infer-cuda`'s DSv4 MoE path
-- `crates/kv-native-sys`: local persistence substrate (POSIX file + content-addressed block object ops, WAL append/replay, mmap + shared-memory descriptors) used by the KV-tier transports
+- `crates/kv-native-sys`: local persistence substrate (POSIX file + content-addressed block object ops, WAL append/replay, mmap + shared-memory descriptors) reserved for the KV-tier transports — currently **zero dependents**; the tier re-port is tracked in #82/#83
 - `crates/xgrammar-sys`: Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode)
 - `crates/qwen3-spec`: Qwen3 config + tensor-parallel `Shard` enum (TP layout authority)
 - `crates/qwen35-spec`: shared train↔infer Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the sharded loader path
