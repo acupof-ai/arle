@@ -76,6 +76,15 @@ pub trait BackendExecutor {
         usize::MAX
     }
 
+    /// Maximum number of live frontend requests this backend wants the serve
+    /// layer to allow at once. Batched/server backends keep the unbounded
+    /// default. Desktop scalar backends can return `1` so the frontend rejects a
+    /// second request instead of queueing it and pretending concurrency is
+    /// supported.
+    fn max_live_requests(&self) -> usize {
+        usize::MAX
+    }
+
     /// How many leading prefix-cache pages of `block_ids` (in prompt order) the
     /// executor can actually reuse when attaching this prefix to a slot.
     ///
