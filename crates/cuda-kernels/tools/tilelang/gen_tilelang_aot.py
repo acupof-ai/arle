@@ -396,6 +396,80 @@ GDR_SPECS = {
 }
 
 
+# FlashQLA chunked GDR fwd (tools/tilelang/flashqla_gdr.py — Hopper-only,
+# fixed Qwen3.6 H=32/Hg=16/DK=DV=128/chunk=64/block_DV=64). All dynamic shape
+# vars resolve from the single `seq_len` public scalar; batch is always 1.
+FLASHQLA_SCALAR_INPUTS = {
+    "batch_size": ("int32_t", "1"),
+    "data_batch_size": ("int32_t", "1"),
+    "raw_batch_size": ("int32_t", "1"),
+    "real_batch_size": ("int32_t", "1"),
+    "num_tokens": ("int32_t", "seq_len"),
+    "num_chunks": ("int32_t", "ceildiv_i32(seq_len, 64)"),
+    "seq_len": ("int32_t", "seq_len"),
+}
+
+FLASHQLA_SPECS = {
+    "fq_cumsum": WrapperSpec(
+        public_params="""    const float *g_in,
+    float *g_out,
+    int32_t seq_len,
+    CUstream stream""",
+        tensor_inputs={"g_raw": "g_in", "g_cumsum": "g_out"},
+        scalar_inputs=FLASHQLA_SCALAR_INPUTS,
+        prelude="",
+        grid="""    int grid_x = ceildiv_i32(seq_len, 64);
+    int grid_y = 1;
+    int grid_z = 1;""",
+        block="128, 1, 1",
+    ),
+    "fq_kkt": WrapperSpec(
+        public_params="""    const uint16_t *k,
+    const float *beta,
+    uint16_t *a_inv,
+    int32_t seq_len,
+    CUstream stream""",
+        tensor_inputs={"k": "k", "b": "beta", "a": "a_inv"},
+        scalar_inputs=FLASHQLA_SCALAR_INPUTS,
+        prelude="",
+        grid="""    int grid_x = ceildiv_i32(seq_len, 64) * 32;
+    int grid_y = 1;
+    int grid_z = 1;""",
+        block="256, 1, 1",
+    ),
+    "fq_fwd": WrapperSpec(
+        public_params="""    const uint16_t *q,
+    const uint16_t *k,
+    const uint16_t *v,
+    const uint16_t *a_inv,
+    const float *g_cumsum,
+    const float *beta,
+    const float *h0,
+    uint16_t *o,
+    float *ht,
+    int32_t seq_len,
+    CUstream stream""",
+        tensor_inputs={
+            "q": "q",
+            "k": "k",
+            "v": "v",
+            "a": "a_inv",
+            "g": "g_cumsum",
+            "b": "beta",
+            "h0": "h0",
+            "o": "o",
+            "ht": "ht",
+        },
+        scalar_inputs=FLASHQLA_SCALAR_INPUTS,
+        prelude="",
+        grid="""    int grid_x = 64;  /* ceildiv(DV=128, block_DV=64) * batch(1) * H(32) */
+    int grid_y = 1;
+    int grid_z = 1;""",
+        block="512, 1, 1",
+    ),
+}
+
+
 def load_module(kernel_path: str):
     spec = importlib.util.spec_from_file_location("tilelang_kernel_module", kernel_path)
     if spec is None or spec.loader is None:
@@ -448,7 +522,7 @@ def parse_target(target: str):
     return tilelang.tvm.target.Target(parsed)
 
 
-def compile_kernel(prim_func, target):
+def compile_kernel(prim_func, target, pass_configs=None):
     try:
         import tilelang
     except ImportError as exc:
@@ -458,7 +532,10 @@ def compile_kernel(prim_func, target):
             "INFER_TILELANG_PYTHON to an interpreter that has tilelang."
         ) from exc
 
-    compiled = tilelang.compile(prim_func, target=target)
+    if pass_configs:
+        compiled = tilelang.compile(prim_func, target=target, pass_configs=pass_configs)
+    else:
+        compiled = tilelang.compile(prim_func, target=target)
     adapter = getattr(compiled, "adapter", None)
     if adapter is not None and hasattr(adapter, "get_device_source"):
         device_source = adapter.get_device_source()
@@ -725,6 +802,7 @@ def main() -> int:
             "attention_bf16_split_merge",
             "attention_fp8",
             "gdr",
+            "flashqla",
         ],
         default="attention",
     )
@@ -778,6 +856,16 @@ def main() -> int:
             raise RuntimeError("attention_fp8 kernels require --num-q-heads and --num-kv-heads")
         prim_func = load_attention_kernel(args.kernel_path, args.num_q_heads, args.num_kv_heads)
         wrapper_spec = ATTENTION_FP8_SPEC
+    elif args.kernel_family == "flashqla":
+        if not args.kernel_key:
+            raise RuntimeError("flashqla kernels require --kernel-key")
+        if args.kernel_key not in FLASHQLA_SPECS:
+            raise RuntimeError(
+                f"unknown flashqla kernel key {args.kernel_key!r}; "
+                f"valid keys: {sorted(FLASHQLA_SPECS)}"
+            )
+        prim_func = load_gdr_kernel(args.kernel_path, args.kernel_key)
+        wrapper_spec = FLASHQLA_SPECS[args.kernel_key]
     else:
         if not args.kernel_key:
             raise RuntimeError("gdr kernels require --kernel-key")
@@ -789,7 +877,17 @@ def main() -> int:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    device_source, kernel_func_name, parsed_args, dyn_shmem_bytes = compile_kernel(prim_func, target)
+    # Optional per-key pass configs (e.g. FlashQLA's TL_ENABLE_FAST_MATH).
+    pass_configs = None
+    if args.kernel_key:
+        module = load_module(args.kernel_path)
+        get_pc = getattr(module, "get_pass_configs", None)
+        if get_pc is not None:
+            pass_configs = get_pc(args.kernel_key)
+
+    device_source, kernel_func_name, parsed_args, dyn_shmem_bytes = compile_kernel(
+        prim_func, target, pass_configs=pass_configs
+    )
     device_cu_staged = out_dir / f"{args.out_name}_device_kernel.cu"
     device_cu_staged.write_text(device_source)
     cubin_path = out_dir / f"{args.out_name}.cubin"
