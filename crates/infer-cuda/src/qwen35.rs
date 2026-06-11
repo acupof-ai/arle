@@ -347,6 +347,147 @@ impl Qwen35Workspace {
     }
 }
 
+/// Persistent device state for the rows>1 BATCHED DECODE path (stage 1:
+/// contiguous per-slot KV kept, no paged migration). Re-port of the deleted
+/// monolith's proven design (`e81b98fb~1` `infer/src/model/qwen35/batch_decode.rs`,
+/// `BatchDecodeBuffers35` + per-layer pointer tables, lines 87-89/780-815)
+/// onto the rewrite's workspace slots, using DSv4's batched-decode executor
+/// shape (`dsv4.rs` Step-A per-row attention) as the template.
+///
+/// Owns a DEDICATED forward workspace: it only ever sees `[*, B]` decode
+/// shapes, so the main (prefill-reshaping) workspace never thrashes, and —
+/// critically — every buffer that feeds `TpRuntime::all_reduce_sum` is an
+/// EXACT-shape `[dim, B]` allocation. `all_reduce_sum` derives the collective
+/// message length (and the one-shot-vs-NCCL choice) from `data.len()`
+/// (see `workspace.rs`), so exact-shape buffers make the reduced message
+/// exactly B valid columns BY CONSTRUCTION — no capacity tail of stale
+/// columns can ever enter a reduction. (Deviation from the monolith's
+/// capacity-sized `set_batch_size` buffers, deliberate: the monolith had a
+/// length-honest collective API; the rewrite's does not.)
+///
+/// Pointer tables are capacity-sized (`[num_slots]` u64 per linear layer per
+/// kind) and uploaded with B valid entries; the batch kernels read entries
+/// `[0, gridDim.y)` = `[0, B)` only, so the dead tail is never dereferenced.
+/// Tables are a pure function of `(slot_indices, layer)`: the per-slot conv
+/// ring / GDR state `CudaSlice`s are allocated once at executor construction
+/// and never re-allocated (`Qwen35SlotState::reset` memsets in place; the OPD
+/// weight offload leaves slot state untouched), so restaging is needed only
+/// when the row→slot mapping changes (monolith `TileLangDecodeMetadata.update`
+/// pattern).
+pub(crate) struct Qwen35BatchDecodeState {
+    /// Dedicated `[*, B]`-shaped forward workspace (see struct docs).
+    ws: Qwen35Workspace,
+    /// Per-row absolute start positions (`[B]` i32), staged once per step;
+    /// the per-row full-attention kernel launches read `positions + r`.
+    positions: SliceSlot<i32>,
+    /// Per-LINEAR-layer `[num_slots]` u64 device tables of conv-ring pointers
+    /// (`Half** [B] -> [C, K-1]` as `conv1d_decode_batch_cuda` consumes them).
+    conv_state_ptrs: Vec<CudaSlice<u64>>,
+    /// Per-LINEAR-layer `[num_slots]` u64 device tables of GDR-state pointers
+    /// (`float** [B] -> [Vh, Kd, Vd]` as `gdr_decode_batch_cuda` consumes them).
+    gdr_state_ptrs: Vec<CudaSlice<u64>>,
+    /// Host staging vecs for the table uploads (monolith pattern: one
+    /// `memcpy_htod` per layer per table, no per-row H2D).
+    conv_host: Vec<u64>,
+    gdr_host: Vec<u64>,
+    /// Row→slot mapping the tables were last staged for (empty = never).
+    staged_slot_indices: Vec<usize>,
+    /// Batched logits `[vocab, B]` (final norm + lm_head GEMM over all rows).
+    logits_batch: HiddenSlot,
+    /// Batched greedy argmax outputs `[B]` i32.
+    argmax: SliceSlot<i32>,
+}
+
+impl Qwen35BatchDecodeState {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        num_linear_layers: usize,
+        max_batch: usize,
+    ) -> Result<Self> {
+        ensure!(
+            max_batch > 0,
+            "Qwen3.5 batched decode requires max_batch > 0"
+        );
+        let mut conv_state_ptrs = Vec::with_capacity(num_linear_layers);
+        let mut gdr_state_ptrs = Vec::with_capacity(num_linear_layers);
+        for layer_idx in 0..num_linear_layers {
+            conv_state_ptrs.push(ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
+                anyhow!("alloc qwen35 batch conv_state_ptrs layer {layer_idx}: {e}")
+            })?);
+            gdr_state_ptrs.push(ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
+                anyhow!("alloc qwen35 batch gdr_state_ptrs layer {layer_idx}: {e}")
+            })?);
+        }
+        Ok(Self {
+            ws: Qwen35Workspace::new(),
+            positions: SliceSlot::default(),
+            conv_state_ptrs,
+            gdr_state_ptrs,
+            conv_host: vec![0u64; max_batch],
+            gdr_host: vec![0u64; max_batch],
+            staged_slot_indices: Vec::new(),
+            logits_batch: HiddenSlot::default(),
+            argmax: SliceSlot::default(),
+        })
+    }
+
+    /// Re-upload the per-layer state pointer tables iff the row→slot mapping
+    /// changed (tables are a pure function of `(slot_indices, layer)`; see
+    /// struct docs for why the slot-state addresses themselves are stable).
+    fn stage_pointer_tables(
+        &mut self,
+        ctx: &DeviceContext,
+        slots: &mut [Qwen35SlotState],
+        slot_indices: &[usize],
+    ) -> Result<()> {
+        if self.staged_slot_indices == slot_indices {
+            return Ok(());
+        }
+        let b = slot_indices.len();
+        ensure!(
+            b <= self.conv_host.len(),
+            "Qwen3.5 batched decode batch {} exceeds table capacity {}",
+            b,
+            self.conv_host.len()
+        );
+        for layer_idx in 0..self.conv_state_ptrs.len() {
+            for (r, &si) in slot_indices.iter().enumerate() {
+                let slot = &mut slots[si];
+                ensure!(
+                    layer_idx < slot.conv_states.len() && layer_idx < slot.gdr_states.len(),
+                    "Qwen3.5 batched decode linear layer {layer_idx} outside slot state \
+                     (conv={}, gdr={})",
+                    slot.conv_states.len(),
+                    slot.gdr_states.len()
+                );
+                let (conv_ptr, _gc) = slot.conv_states[layer_idx].data.device_ptr_mut(&ctx.stream);
+                let (gdr_ptr, _gg) = slot.gdr_states[layer_idx].device_ptr_mut(&ctx.stream);
+                self.conv_host[r] = conv_ptr;
+                self.gdr_host[r] = gdr_ptr;
+            }
+            ctx.stream
+                .memcpy_htod(&self.conv_host[..b], &mut self.conv_state_ptrs[layer_idx])
+                .map_err(|e| anyhow!("H2D qwen35 conv_state_ptrs layer {layer_idx}: {e}"))?;
+            ctx.stream
+                .memcpy_htod(&self.gdr_host[..b], &mut self.gdr_state_ptrs[layer_idx])
+                .map_err(|e| anyhow!("H2D qwen35 gdr_state_ptrs layer {layer_idx}: {e}"))?;
+        }
+        self.staged_slot_indices = slot_indices.to_vec();
+        Ok(())
+    }
+
+    /// Drop the workspace VRAM (OPD weight time-share hook). The pointer
+    /// TABLES and the staged mapping stay: the per-slot state addresses they
+    /// hold are executor-owned and untouched by the weight offload, so they
+    /// remain valid across an offload/reload cycle (and they are ~KB-scale).
+    pub(crate) fn release(&mut self) {
+        self.ws.release();
+        self.positions.release();
+        self.logits_batch.release();
+        self.argmax.release();
+    }
+}
+
 pub(crate) enum Qwen35Attn {
     // Boxed: `FullAttn`/`LinearAttn` are large (multiple DeviceMatrix) and
     // size-skewed; boxing keeps the enum small (clippy::large_enum_variant).
@@ -2086,6 +2227,541 @@ impl Qwen35Model {
 
         gemm_batch(&self.ctx, &attn.out_proj, normed_out, out)?;
         // Row-parallel out_proj: sum the per-rank partials (no-op single-GPU).
+        self.tp.all_reduce_sum(&self.ctx, out)?;
+        Ok(())
+    }
+
+    /// BATCHED DECODE (stage 1, contiguous KV): execute a whole multi-row
+    /// pure-decode plan in ONE forward — B rows packed as `seq_len == B`.
+    ///
+    /// Token-parallel ops run batched exactly like a B-token prefill chunk
+    /// (they already support `seq_len > 1`): embedding, every GEMM (q/k/v/o,
+    /// qkv/z/b/a/out, router, experts, lm_head), `rms_norm_batched_offset`,
+    /// residual adds, MoE (`moe_forward_into` with `num_tokens = B` → `R = 8B`
+    /// routes — stays on the hand grouped kernels below
+    /// `QWEN35_DEEPGEMM_MIN_ROUTES = 1024`), final norm + batched argmax.
+    /// Per-row handling ONLY where state is per-slot:
+    ///   - full attention (per-row loop over the existing single-row kernels
+    ///     against each row's contiguous cache — DSv4 Step-A pattern, but with
+    ///     column-offset pointers instead of copy-in/out:
+    ///     [`Self::full_attention_batch_rows`]);
+    ///   - conv1d + GDR (one batched kernel each via per-layer device pointer
+    ///     tables: [`Self::linear_attention_batch`]);
+    ///   - sampling (batched greedy argmax; non-greedy rows host-sample).
+    ///
+    /// FORMULA (the c=4 prediction this path is licensed against): at B=4 the
+    /// token-parallel ops amortize ~4x (GEMM/MoE/norm launch count AND time
+    /// per generated token /4), while per-row ops (full attention on 10
+    /// layers x 3 kernels, sampling) stay linear in B → predicted aggregate
+    /// ~2.3-3.2x single-stream tok/s at B=4 (vs ~1.0x today, because a
+    /// rows>1 plan previously hard-errored the executor). License: pod
+    /// c-sweep 1/2/4, aggregate tok/s + per-stream ITL + needle PASS at c=2.
+    ///
+    /// TP: safe under TP=2 by the same lockstep argument as single-row decode
+    /// — every rank executes the identical plan (slot order fixed by the
+    /// deterministic scheduler), the layer loop and the per-row attention
+    /// loop have a fixed order, and every collective is an `all_reduce_sum`
+    /// over an exact-shape `[hidden, B]` buffer (identical message length and
+    /// call sequence on every rank; the per-row loop itself contains NO
+    /// collectives). Complete all-reduce enumeration for one batched step:
+    ///   1. full-attn o_proj partial   — `attn_out` `[hidden, B]` x num_full
+    ///   2. linear-attn out_proj partial — `attn_out` `[hidden, B]` x num_linear
+    ///   3. FFN (MoE routed+shared / dense down_proj) partial — `mlp_out`
+    ///      `[hidden, B]` x num_layers
+    ///
+    /// All three are exact-shape `HiddenSlot` buffers at `seq_len == B`, so
+    /// `all_reduce_sum`'s `data.len()`-derived message is exactly B columns.
+    ///
+    /// Advances every row's slot state (KV rows, conv ring, GDR state,
+    /// `seq_len`) by one token, exactly like B sequential single-row decodes.
+    /// Returns the B sampled tokens in row order.
+    pub(crate) fn forward_decode_batch(
+        &self,
+        slots: &mut [Qwen35SlotState],
+        bd: &mut Qwen35BatchDecodeState,
+        slot_indices: &[usize],
+        tokens: &[u32],
+        params: &[SamplingParams],
+        sample_positions: &[u64],
+    ) -> Result<Vec<u32>> {
+        let b = tokens.len();
+        ensure!(b >= 1, "Qwen3.5 batched decode requires at least one row");
+        ensure!(
+            slot_indices.len() == b && params.len() == b && sample_positions.len() == b,
+            "Qwen3.5 batched decode surface length mismatch: slots={} tokens={} params={} positions={}",
+            slot_indices.len(),
+            b,
+            params.len(),
+            sample_positions.len()
+        );
+        // Pre-mutation validation: every row in bounds and in budget BEFORE
+        // any device state is touched.
+        for &si in slot_indices {
+            ensure!(
+                si < slots.len(),
+                "Qwen3.5 batched decode slot {si} outside executor slots {}",
+                slots.len()
+            );
+            ensure!(
+                slots[si].seq_len() < self.max_seq_len,
+                "Qwen3.5 batched decode sequence {} exceeds KV cache budget {}",
+                slots[si].seq_len() + 1,
+                self.max_seq_len
+            );
+        }
+
+        let c = &self.config;
+        let eps = c.rms_norm_eps;
+        let hidden_size = c.hidden_size;
+        let vocab = self.output_projection().rows;
+
+        // ── Stage pointer tables (no-op when the row→slot mapping is unchanged). ──
+        bd.stage_pointer_tables(&self.ctx, slots, slot_indices)?;
+
+        // ── Stage per-step inputs: token ids + per-row absolute positions. ──
+        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let positions_host: Vec<i32> = slot_indices
+            .iter()
+            .map(|&si| slots[si].seq_len() as i32)
+            .collect();
+
+        let Qwen35BatchDecodeState {
+            ws,
+            positions,
+            conv_state_ptrs,
+            gdr_state_ptrs,
+            logits_batch,
+            argmax,
+            ..
+        } = bd;
+        let Qwen35Workspace {
+            token_ids,
+            hidden,
+            normed,
+            hidden_mid,
+            attn_out,
+            mlp_out,
+            full,
+            linear,
+            dense,
+            moe,
+            logits: row_logits,
+            ..
+        } = ws;
+        let token_ids = token_ids.upload(&self.ctx, &token_ids_host)?;
+        let positions_dev = positions.upload(&self.ctx, &positions_host)?;
+
+        // ── Forward body: identical layer stack to `forward_hidden_staged`
+        //    at seq_len == B, with the two per-slot dispatch differences. ──
+        let hidden = hidden.get(&self.ctx, hidden_size, b)?;
+        embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)?;
+        let normed = normed.get(&self.ctx, hidden_size, b)?;
+        let hidden_mid = hidden_mid.get(&self.ctx, hidden_size, b)?;
+        let attn_out = attn_out.get(&self.ctx, hidden_size, b)?;
+        let mlp_out = mlp_out.get(&self.ctx, hidden_size, b)?;
+
+        let mut full_idx = 0usize;
+        let mut linear_idx = 0usize;
+        for layer in &self.layers {
+            rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed)?;
+
+            match &layer.attn {
+                Qwen35Attn::Full(full_attn) => {
+                    self.full_attention_batch_rows(
+                        full_attn,
+                        normed,
+                        slots,
+                        slot_indices,
+                        full_idx,
+                        positions_dev,
+                        full,
+                        attn_out,
+                    )?;
+                    full_idx += 1;
+                }
+                Qwen35Attn::Linear(lin) => {
+                    ensure!(
+                        linear_idx < conv_state_ptrs.len(),
+                        "Qwen3.5 batched decode linear layer {linear_idx} outside pointer tables {}",
+                        conv_state_ptrs.len()
+                    );
+                    self.linear_attention_batch(
+                        lin,
+                        normed,
+                        &conv_state_ptrs[linear_idx],
+                        &gdr_state_ptrs[linear_idx],
+                        linear,
+                        attn_out,
+                    )?;
+                    linear_idx += 1;
+                }
+            }
+
+            add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
+
+            rms_norm_offset(
+                &self.ctx,
+                hidden_mid,
+                &layer.post_attention_layernorm,
+                eps,
+                normed,
+            )?;
+            if let Some(moe_weights) = &layer.moe {
+                let cfg = self
+                    .moe_config
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
+                moe_forward_into(
+                    &self.ctx,
+                    moe_weights,
+                    normed,
+                    cfg,
+                    &self.expert_split,
+                    moe,
+                    mlp_out,
+                )?;
+            } else {
+                let mlp = layer
+                    .mlp
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
+                self.dense_mlp(mlp, normed, dense, mlp_out)?;
+            }
+            // ONE all-reduce covers the whole FFN partial (see the per-layer
+            // enumeration in the method docs); exact `[hidden, B]` message.
+            self.tp.all_reduce_sum(&self.ctx, mlp_out)?;
+
+            add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
+        }
+
+        // ── Final norm over ALL rows + batched lm_head GEMM. ──
+        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        let logits_buf = logits_batch.get(&self.ctx, vocab, b)?;
+        gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)?;
+
+        // Host seq_len advance: the device state (KV rows, conv rings, GDR
+        // states) advanced in-stream above, so the host counters advance here
+        // regardless of how sampling below fares — host and device stay
+        // consistent (mirrors `forward_hidden`).
+        for &si in slot_indices {
+            slots[si].advance_seq_len(1);
+        }
+
+        // ── Sampling: ONE batched argmax over `[B, vocab]` (greedy fast
+        //    path); any non-greedy row falls back to per-row host sampling. ──
+        let argmax_buf = argmax.get(&self.ctx, b)?;
+        {
+            let (l_ptr, _gl) = logits_buf.data.device_ptr(&self.ctx.stream);
+            let (a_ptr, _ga) = argmax_buf.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: logits is a live `[B, vocab]` bf16 buffer and argmax a
+            // live `[B]` i32 buffer on ctx.stream.
+            unsafe {
+                ffi::argmax_batch_cuda(
+                    l_ptr as *const ffi::Half,
+                    a_ptr as *mut i32,
+                    b as i32,
+                    vocab as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        self.ctx.sync()?;
+        let greedy_ids = self
+            .ctx
+            .stream
+            .clone_dtoh(argmax_buf)
+            .map_err(|e| anyhow!("D2H qwen35 batched argmax failed: {e}"))?;
+        let mut out = Vec::with_capacity(b);
+        for (r, p) in params.iter().enumerate() {
+            if p.is_greedy() {
+                out.push(greedy_ids[r] as u32);
+            } else {
+                let row_vec = row_logits.get(&self.ctx, vocab)?;
+                copy_row_to_vec(&self.ctx, logits_buf, r, row_vec)?;
+                let host = row_vec.to_host(&self.ctx)?;
+                out.push(infer_plan::sample_token(&host, p, sample_positions[r]));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batched-decode full attention: batched q/k/v projections over all B
+    /// rows (the GEMM amortizes), then a PER-ROW loop over the existing
+    /// single-row prep + devpos-attention + gate kernels against each row's
+    /// contiguous per-slot cache (DSv4 `dsv4.rs` Step-A pattern). Unlike
+    /// DSv4's copy-in/copy-out, the HD256 kernels index strictly
+    /// `token * dim + ...` from their base pointers with the position read
+    /// from a device scalar, so at `seq_len == 1` a column-offset pointer
+    /// (`base + r*dim`) and a per-row position pointer (`positions + r`)
+    /// address row r exactly — zero extra copies. Stream-ordered (all
+    /// launches on `ctx.stream`; rows touch disjoint caches and disjoint
+    /// scratch columns), NO host sync between rows.
+    #[allow(clippy::too_many_arguments)]
+    fn full_attention_batch_rows(
+        &self,
+        attn: &FullAttn,
+        normed: &HiddenStates,
+        slots: &mut [Qwen35SlotState],
+        slot_indices: &[usize],
+        full_idx: usize,
+        positions_dev: &CudaSlice<i32>,
+        fw: &mut FullAttnScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        let c = &self.config;
+        let b = normed.seq_len;
+        let q_dim = self.local_full_attn_q_dim();
+        let kv_dim = self.local_full_attn_kv_dim();
+        let q_proj_dim = self.local_full_attn_q_proj_dim();
+        let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
+
+        let FullAttnScratch {
+            q_full,
+            k_batch,
+            v_batch,
+            q_prepped,
+            attn_heads,
+        } = fw;
+        let q_full = q_full.get(&self.ctx, q_proj_dim, b)?;
+        let k_batch = k_batch.get(&self.ctx, kv_dim, b)?;
+        let v_batch = v_batch.get(&self.ctx, kv_dim, b)?;
+        gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
+        gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
+        gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
+
+        let q_prepped = q_prepped.get(&self.ctx, q_dim, b)?;
+        let attn_heads = attn_heads.get(&self.ctx, q_dim, b)?;
+
+        {
+            let (qf_base, _g0) = q_full.data.device_ptr(&self.ctx.stream);
+            let (k_base, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
+            let (v_base, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
+            let (qn_ptr, _g3) = attn.q_norm.data.device_ptr(&self.ctx.stream);
+            let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
+            let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
+            let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
+            let (qp_base, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+            let (ao_base, _g8) = attn_heads.data.device_ptr_mut(&self.ctx.stream);
+            let (pos_base, _g9) = positions_dev.device_ptr(&self.ctx.stream);
+
+            for (r, &si) in slot_indices.iter().enumerate() {
+                let slot = &mut slots[si];
+                let k_cache = &mut slot.k_caches[full_idx];
+                let v_cache = &mut slot.v_caches[full_idx];
+                let max_seq_len = k_cache.len / kv_dim;
+                let (kc_ptr, _gk) = k_cache.data.device_ptr_mut(&self.ctx.stream);
+                let (vc_ptr, _gv) = v_cache.data.device_ptr_mut(&self.ctx.stream);
+                // Column-offset device addresses: token-major storage makes
+                // row r's block contiguous at element offset r*dim (bf16 = 2
+                // bytes; i32 = 4 bytes).
+                let qf_r = qf_base + (r * q_proj_dim * 2) as u64;
+                let k_r = k_base + (r * kv_dim * 2) as u64;
+                let v_r = v_base + (r * kv_dim * 2) as u64;
+                let qp_r = qp_base + (r * q_dim * 2) as u64;
+                let ao_r = ao_base + (r * q_dim * 2) as u64;
+                let pos_r = pos_base + (r * 4) as u64;
+                // SAFETY: every pointer is a live device allocation on
+                // ctx.stream; the offsets stay inside the `[*, B]` buffers for
+                // r < B; each kernel runs at seq_len == 1 so it touches only
+                // row r's block + slot r's caches; `pos_r` points at this
+                // row's staged i32 position.
+                unsafe {
+                    ffi::prefill_attention_hd256_prep_cuda(
+                        qf_r as *const ffi::Half,
+                        k_r as *const ffi::Half,
+                        v_r as *const ffi::Half,
+                        qn_ptr as *const ffi::Half,
+                        kn_ptr as *const ffi::Half,
+                        cos_ptr as *const ffi::Half,
+                        sin_ptr as *const ffi::Half,
+                        qp_r as *mut ffi::Half,
+                        kc_ptr as *mut ffi::Half,
+                        vc_ptr as *mut ffi::Half,
+                        self.local_q_heads as i32,
+                        self.local_kv_heads as i32,
+                        1, // seq_len: one new token per row
+                        pos_r as *const i32,
+                        c.rotary_dim as i32,
+                        c.rms_norm_eps,
+                        max_seq_len as i32,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                    ffi::nonpaged_prefill_attention_devpos_cuda(
+                        qp_r as *const ffi::Half,
+                        kc_ptr as *const ffi::Half,
+                        vc_ptr as *const ffi::Half,
+                        ao_r as *mut ffi::Half,
+                        self.local_q_heads as i32,
+                        self.local_kv_heads as i32,
+                        c.head_dim as i32,
+                        1, // seq_len
+                        pos_r as *const i32,
+                        max_seq_len as i32,
+                        sm_scale,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                    ffi::attention_gate_batch_hd256_cuda(
+                        qf_r as *const ffi::Half,
+                        ao_r as *mut ffi::Half,
+                        self.local_q_heads as i32,
+                        1, // seq_len
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+            }
+        }
+
+        gemm_batch(&self.ctx, &attn.o_proj, attn_heads, out)?;
+        // Row-parallel o_proj: ONE all-reduce over the exact `[hidden, B]`
+        // buffer — message length is B valid columns by construction (no-op
+        // single-GPU).
+        self.tp.all_reduce_sum(&self.ctx, out)?;
+        Ok(())
+    }
+
+    /// Batched-decode gated-delta linear attention: batched in-projections
+    /// over all B rows, then the BATCHED conv1d + GDR kernels
+    /// (`conv1d_decode_batch_cuda` / `gdr_decode_batch_cuda`) advancing every
+    /// row's per-slot conv ring + recurrent state through the pre-staged
+    /// per-layer device pointer tables — one launch each for all B rows
+    /// (monolith `decode_batch_linear_attn_layer_graphable` re-port). Layout
+    /// contracts verified against the single-row kernels:
+    ///   - `x_batch [B, C]`: the in_proj GEMM output is token-major, so row
+    ///     r's channels are contiguous at r*C — exactly the batch kernel's
+    ///     `x_batch[b * num_channels + c]`;
+    ///   - conv state `[C, K-1]` per slot: identical layout in `conv1d.cu`
+    ///     (`conv_state[c * state_width + i]`) and the batch kernel
+    ///     (`conv_state_ptrs[b] + c * sw`);
+    ///   - GDR state `[Vh, Kd, Vd]` f32 per slot: identical in both kernels;
+    ///   - `rms_norm_gated` over `[B, Vh*Vd]` row-major gdr_out/z: pass
+    ///     `num_heads = Vh*B`, the same per-(token, head) grid extension the
+    ///     single-row path already uses for `seq_len > 1`.
+    fn linear_attention_batch(
+        &self,
+        attn: &LinearAttn,
+        normed: &HiddenStates,
+        conv_table: &CudaSlice<u64>,
+        gdr_table: &CudaSlice<u64>,
+        lw: &mut LinearAttnScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        let c = &self.config;
+        let b = normed.seq_len;
+        let qkv_dim = self.local_linear_qkv_dim();
+        let z_dim = self.local_linear_z_dim();
+        let b_dim = attn.in_proj_b.rows;
+        let a_dim = attn.in_proj_a.rows;
+
+        let LinearAttnScratch {
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            qkv_conv,
+            gdr_out,
+            normed_out,
+        } = lw;
+        let qkv = qkv.get(&self.ctx, qkv_dim, b)?;
+        let z = z.get(&self.ctx, z_dim, b)?;
+        let b_proj = b_proj.get(&self.ctx, b_dim, b)?;
+        let a_proj = a_proj.get(&self.ctx, a_dim, b)?;
+        gemm_batch(&self.ctx, &attn.in_proj_qkv, normed, qkv)?;
+        gemm_batch(&self.ctx, &attn.in_proj_z, normed, z)?;
+        gemm_batch(&self.ctx, &attn.in_proj_b, normed, b_proj)?;
+        gemm_batch(&self.ctx, &attn.in_proj_a, normed, a_proj)?;
+
+        // ── Batched conv1d (advances every row's conv ring in place). ──
+        let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, b)?;
+        {
+            let (x_ptr, _g0) = qkv.data.device_ptr(&self.ctx.stream);
+            let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
+            let (tbl_ptr, _g2) = conv_table.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g3) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: x/weight/out are live `[B, C]`/`[C*K]` buffers on
+            // ctx.stream; `tbl_ptr` is the staged `[>=B]` u64 table whose
+            // first B entries point at live `[C, K-1]` conv rings.
+            unsafe {
+                ffi::conv1d_decode_batch_cuda(
+                    x_ptr as *const ffi::Half,
+                    w_ptr as *const ffi::Half,
+                    tbl_ptr as *mut *mut ffi::Half,
+                    o_ptr as *mut ffi::Half,
+                    qkv_dim as i32,
+                    c.linear_conv_kernel_dim as i32,
+                    b as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        // ── Batched gated-delta recurrent (advances every row's state). ──
+        let gdr_out = gdr_out.get(&self.ctx, z_dim, b)?;
+        {
+            let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
+            let (b_ptr, _g1) = b_proj.data.device_ptr(&self.ctx.stream);
+            let (a_ptr, _g2) = a_proj.data.device_ptr(&self.ctx.stream);
+            let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
+            let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
+            let (tbl_ptr, _g5) = gdr_table.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g6) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: all buffers live on ctx.stream; `tbl_ptr` is the staged
+            // `[>=B]` u64 table whose first B entries point at live
+            // `[Vh, Kd, Vd]` f32 states; head dims from this rank's shard.
+            unsafe {
+                ffi::gdr_decode_batch_cuda(
+                    qkv_ptr as *const ffi::Half,
+                    b_ptr as *const ffi::Half,
+                    a_ptr as *const ffi::Half,
+                    dt_ptr as *const ffi::Half,
+                    alog_ptr as *const f32,
+                    tbl_ptr as *mut *mut f32,
+                    o_ptr as *mut ffi::Half,
+                    self.local_linear_k_heads as i32,
+                    self.local_linear_v_heads as i32,
+                    c.linear_key_head_dim as i32,
+                    c.linear_value_head_dim as i32,
+                    b as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        // ── Gated output RMSNorm over all (token, head) slices. ──
+        let normed_out = normed_out.get(&self.ctx, z_dim, b)?;
+        {
+            let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
+            let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
+            let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g3) = normed_out.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: same per-(token, head) grid extension as the single-row
+            // path's `seq_len > 1` case — `num_heads = Vh*B` covers all B*Vh
+            // `[Vd]` slices of the row-major `[B, Vh*Vd]` buffers; `weight`
+            // is a per-`[Vd]` broadcast with no blockIdx dependence.
+            unsafe {
+                ffi::rms_norm_gated_cuda(
+                    x_ptr as *const ffi::Half,
+                    w_ptr as *const f32,
+                    gate_ptr as *const ffi::Half,
+                    o_ptr as *mut ffi::Half,
+                    (self.local_linear_v_heads * b) as i32,
+                    c.linear_value_head_dim as i32,
+                    c.rms_norm_eps,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        gemm_batch(&self.ctx, &attn.out_proj, normed_out, out)?;
+        // Row-parallel out_proj: ONE all-reduce over the exact `[hidden, B]`
+        // buffer — message length is B valid columns by construction (no-op
+        // single-GPU).
         self.tp.all_reduce_sum(&self.ctx, out)?;
         Ok(())
     }
