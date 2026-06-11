@@ -33,41 +33,43 @@ identical-architecture head.** The earlier KILL ("the 1-layer head can't draft a
 chain, depth-K fundamentally dead") is therefore **mis-attributed** — the head
 provably *can* draft 2.44 tokens. Our chain is broken.
 
-### Why our linear chain collapses (root-cause hypotheses, ranked)
+### Industry-leading DeepSeek MTP is a LINEAR chain (topk=1) — so our 1/4 is a BUG
 
-Our driver (`executor.rs` depth-K, `dsv4.rs::mtp_forward` +
-`run_mtp_transformer_layer`) differs from EAGLE in three ways, each a candidate:
+**SGLang's default DeepSeek config: `--speculative-num-steps 3 --speculative-
+eagle-topk 1 --speculative-num-draft-tokens 4`.** `eagle-topk 1` is a **linear
+chain** (single branch/step) — *not* a tree. That linear 3-step chain reaches
+2.18–2.44 accepted tokens. Tree (topk>1) is an *optional* further gain, and our
+kernels can't do it anyway (FlashMLA decode is `s_q=1` scalar-only, no mask;
+verify positions are contiguous-only — Explore confirmed). **So the target shape
+is exactly our depth-K linear chain, and reaching it needs NO kernel build — just
+fixing the chain bug that pins us at 1/4 vs SGLang's ~2.2.**
 
-1. **Linear chain (topk=1), not a tree.** We draft one token per step and chain
-   it; SGLang drafts a **tree** (eagle-topk>1) and verifies all paths, accepting
-   the best. A linear chain commits to one wrong draft at step *i* and forfeits
-   every later token — exactly the 1/4 plateau. This alone is most of the gap.
-   *Strongest hypothesis.*
-2. **Off-distribution hidden feedback.** We feed the single MTP layer's *own*
-   output stream (`d_stream`) back as `h_prev` for the next draft. The module was
-   trained as one of D *sequential* modules each consuming the prior's hidden, not
-   one module consuming itself D times. SGLang hits the same off-distribution but
-   the tree hedges it.
-3. **Shared-KV chaining (needs code-trace confirm).** `run_mtp_transformer_layer`
-   attends the *shared* frozen target KV pool at `start_pos+i`. Draft *i* writing
-   its KV at `start_pos+i` into the target pool both (a) may not be visible to
-   draft *i+1* depending on the read-window/position math, and (b) transiently
-   corrupts the target KV the verify step reads (the DSA packed_rows self-heal,
-   `dc068bc5`, addresses one facet of this). A rigid 2-cycle smells like draft
-   *i* **not** seeing draft *i−1* — i.e. each draft re-derives "after 223 comes
-   4489" from the *fixed* committed prefix, blind to the chain. Confirm by logging
-   whether the draft attention length advances per chain step.
+**Code facts (Explore):** the draft chain is *not* KV-blind — each `mtp_forward`
+at `start_pos+i` writes its K into the shared pool and the next draft reads it
+(SW ring / FP8 pool, same `target_attention_pool`). So the earlier "shared-KV
+blindness" hypothesis is **falsified**. The rigid `[223,4489]` 2-cycle is a chain
+bug, candidates (need a pod probe to isolate — one variable at a time per §0):
+1. **Off-distribution hidden feedback** — we feed the single MTP layer's *own*
+   wide stream (`d_stream`) back as `h_prev`. SGLang's linear chain feeds the
+   draft's hidden too and works, so either our `d_stream` is the wrong tensor/
+   slice, or it needs the same norm SGLang applies. *Prime suspect.*
+2. **Position / RoPE on the chained draft** — draft *i* at `start_pos+i`; if the
+   RoPE position or the device `start_pos` is mis-fed on chain steps >0, the draft
+   attends with wrong positional encoding → degenerate fixed point.
+3. **Draft KV corrupting the committed pool** — drafts write "future" slots
+   `start_pos..start_pos+depth` in the shared pool; on the chain this is the
+   intended self-attention, but verify/rollback must overwrite/restore them
+   cleanly (the DSA packed_rows self-heal `dc068bc5` covers one facet).
 
 ### Verdict revision
 
-Depth-K is **not** dead. The licensed path to ~1.8× (from our current ~1.4×) is
-**EAGLE-tree drafting + a dedicated draft KV cache**: (a) give the NextN draft
-its **own** scratch KV (separate from the frozen target pool) so draft *i* attends
-`[frozen target 0..start_pos] ++ [draft KV start_pos..i)` without corrupting the
-target; (b) draft a **tree** (topk 2-4) and verify it with tree attention; (c)
-keep the frozen-KV verify (no compressor re-run). The depth-1 clamp (`37986aeb`)
-stays correct — *linear* depth-K is genuinely worse than depth-1 — but the wall
-is the linear chain, not the head.
+Depth-K is **not** dead and does **not** need a tree kernel. The path to SGLang-
+class (2.18–2.44 tok, ~1.8×) is to **debug our linear chain** to parity with
+SGLang's linear `topk=1` chain. The depth-1 clamp (`37986aeb`) stays correct as a
+safety until the chain is fixed; once per-position accept clears ≥2 tokens at
+depth-3, unclamp. Diagnose first (§0: isolate the 2-cycle's single cause on the
+pod), then fix — do **not** charge into the tree (topk>1) build, which is a later,
+kernel-deep, optional gain.
 
 ## 2. Decode operators (算子): inventory vs SGLang, ranked levers
 
@@ -86,22 +88,30 @@ MLA attention ~11.8 ms = 30% of wall**, then FP8 GEMV, DeepGEMM pack/unpad, MHC.
 licensed), comm-overlap (`dsv4_comm_overlap_enabled`, seq_len==1 non-deepep — a
 Single-Batch-Overlap analog), DeepGEMM decode projections (default ON).
 
-### The #1 operator lever: MLA weight absorption = the gated FlashMLA decode path
+### CORRECTION (Explore, 2026-06-11): the big operator levers are ALREADY landed
 
-SGLang's headline MLA decode trick is **weight absorption** — fold `wkv_b`
-(latent→K/V up-projection) into `wq_b`/`wo`, so decode attends **directly in the
-~512-dim compressed latent** instead of decompressing to full per-head K/V. That
-collapses the dominant attention bucket.
+My first draft said "our default MLA decode does NOT absorb (FlashMLA gated-off)"
+— that read a **stale comment** (`attention.rs:2296`). The actual gate
+`dsv4_flashmla_decode_enabled()` (`attention.rs:2755`) is **default-ON**:
+> "Default ON: FlashMLA SM90 sparse decode is the adopted decode attention — the
+> same vendored kernel SGLang uses. Licensed 2026-06-06: 29.47 → 36.59 tok/s
+> (+24%). Opt out with `ARLE_DSV4_FLASHMLA_DECODE=0`."
 
-**Our default MLA decode does NOT absorb** — `attention.rs:2296` "all three modes
-run through the bf16 correctness core … the perf-optimized FlashMLA sparse path
-stays **gated**." So the 11.8 ms bucket is the **non-absorbed bf16 core**, and the
-absorbed path (official FlashMLA decode, which operates on the latent ckv+k_pe) is
-**gated-off**. Crucially, FlashMLA decode + fused-wqkv are **already correctness-
-licensed** (`wins/2026-06-10-dsv4-lever-gate-license-or-kill.md`) — the default
-flip is blocked only on a **wall-clock perf license**, not correctness. This is
-the highest-leverage, lowest-risk operator move: A/B the gated FlashMLA decode
-path against the bf16 core on the SLO shape and license-or-kill the 11.8 ms.
+So the **MLA weight-absorption lever is already shipped and default-on (+24%)**,
+alongside **fused-WQKV decode** (`attention.rs:2949`, default-on, +18.4%,
+2026-06-06) and **DeepGEMM decode projections** (default-on, +6.3%). The 11.8 ms
+MLA bucket from the 2026-06-05 entry **predates** the 2026-06-06 FlashMLA-default
+flip — the current decode already runs the absorbed FlashMLA path. **"算子做好"
+is largely DONE.**
+
+Remaining operator headroom is incremental, gated on a fresh nsys roofline
+showing the current FlashMLA decode is *above* the H20 floor:
+1. **nsys roofline%** on the current FlashMLA decode kernel — is it at the H20
+   bandwidth floor, or is there headroom? (Decides whether anything below is worth it.)
+2. **DeepGEMM pack/unpad fusion** — FP8 quant/layout overhead around the MoE/proj GEMMs.
+3. **Single Batch Overlap for the deepep_ll lane** — we have comm-overlap for the
+   *allreduce* transport (`dsv4_comm_overlap_enabled`, seq_len==1, non-deepep) but
+   not the deepep_ll path; SGLang overlaps DeepEP dispatch/combine with DeepGEMM.
 
 ### Ranked operator levers (license-or-kill each on wall-clock)
 
@@ -124,19 +134,19 @@ number, not commit-message verdicts, decides absorbed-FlashMLA's ceiling.
 
 ## 3. Synthesis: two multiplicative axes to the H20 floor
 
-The 6 ms target is H100/H800; the H20 realistic floor is ~25–40 ms no-rewrite,
-lower with the levers below. Two **independent, multiplicative** axes:
+The 6 ms target is H100/H800; the H20 realistic floor is ~25–40 ms no-rewrite.
+Two **independent** axes, and after the Explore both are clearer:
 
-- **Amortization** — EAGLE-tree MTP: 1.4× (our depth-1) → ~1.8× (SGLang's 2.44
-  tokens). Needs the dedicated draft KV + tree verify (§1).
-- **Operator rewrite** — absorbed FlashMLA decode on the 11.8 ms MLA bucket
-  (§2.1), then DeepGEMM fusion + SBO. Needs the nsys roofline license (§2 gate).
+- **Amortization (the open work)** — fix our **linear** depth-K chain to SGLang's
+  linear `topk=1` parity: 1.4× (depth-1) → ~1.8× (2.18–2.44 tok). No kernel build;
+  it's a chain bug (§1). This is where "industry-leading MTP" actually lives.
+- **Operator (largely landed)** — the absorbed FlashMLA decode (+24%), fused-WQKV
+  (+18.4%), DeepGEMM projections (+6.3%) are **already default-on**. Remaining is
+  incremental (DeepGEMM pack/unpad fusion, SBO for deepep_ll), gated on an nsys
+  roofline showing the current FlashMLA decode is above the H20 floor (§2).
 
-Earlier framing ("MTP is the only lever; kernels are dead") was wrong on both
-counts — it conflated *compute-shaving of overlapped kernels* (genuinely dead)
-with *operator rewrites that shorten the chain / absorb the attention* (wide
-open), and it under-rated MTP by measuring a broken linear chain instead of the
-EAGLE tree DeepSeek actually ships.
+Net: the headline lever is the **MTP linear-chain fix** (toward 2.2 tok); the
+operator side is mostly done and its remainder is gated on a roofline measurement.
 
 ## Sources
 
