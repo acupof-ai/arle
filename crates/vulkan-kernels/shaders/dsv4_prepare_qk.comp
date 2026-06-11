@@ -33,11 +33,26 @@ layout(binding = 3) writeonly buffer KOut {
     float k_out[];
 };
 
+float rope_inv_freq(uint pair_idx) {
+    const float inv = pow(p.rope_base, -(2.0 * float(pair_idx)) / float(p.rope_dim));
+    if (p.orig_seq_len == 0) {
+        return inv;
+    }
+    const float low_f = floor(float(p.rope_dim) * log(float(p.orig_seq_len) / (p.beta_fast * 6.283185307179586)) / (2.0 * log(p.rope_base)));
+    const float high_f = ceil(float(p.rope_dim) * log(float(p.orig_seq_len) / (p.beta_slow * 6.283185307179586)) / (2.0 * log(p.rope_base)));
+    const int low = max(0, int(low_f));
+    const int high = min(max(0, int(p.rope_dim) - 1), int(high_f));
+    const float denom = low == high ? 0.001 : float(high - low);
+    const float ramp = clamp((float(pair_idx) - float(low)) / denom, 0.0, 1.0);
+    const float smooth_weight = 1.0 - ramp;
+    return inv / p.factor * (1.0 - smooth_weight) + inv * smooth_weight;
+}
+
 void apply_rope(inout float a, inout float b, uint pair_idx) {
     if (p.rope_dim == 0) {
         return;
     }
-    const float theta = pow(p.rope_base, -2.0 * float(pair_idx) / float(p.rope_dim));
+    const float theta = rope_inv_freq(pair_idx);
     const float angle = float(p.start_pos) * theta;
     const float c = cos(angle);
     const float s = sin(angle);

@@ -31,52 +31,95 @@ layout(binding = 2) buffer Window {
 layout(binding = 3) readonly buffer Sink {
     float sink[];
 };
-layout(binding = 4) writeonly buffer Out {
+layout(binding = 4) buffer Out {
     float out_data[];
 };
+
+float rope_inv_freq(uint pair_idx) {
+    const float inv = pow(p.rope_base, -(2.0 * float(pair_idx)) / float(p.rope_dim));
+    if (p.orig_seq_len == 0) {
+        return inv;
+    }
+    const float low_f = floor(float(p.rope_dim) * log(float(p.orig_seq_len) / (p.beta_fast * 6.283185307179586)) / (2.0 * log(p.rope_base)));
+    const float high_f = ceil(float(p.rope_dim) * log(float(p.orig_seq_len) / (p.beta_slow * 6.283185307179586)) / (2.0 * log(p.rope_base)));
+    const int low = max(0, int(low_f));
+    const int high = min(max(0, int(p.rope_dim) - 1), int(high_f));
+    const float denom = low == high ? 0.001 : float(high - low);
+    const float ramp = clamp((float(pair_idx) - float(low)) / denom, 0.0, 1.0);
+    const float smooth_weight = 1.0 - ramp;
+    return inv / p.factor * (1.0 - smooth_weight) + inv * smooth_weight;
+}
+
+void apply_rope_pair(inout float a, inout float b, uint pair_idx, float sign) {
+    const float angle = float(p.start_pos) * rope_inv_freq(pair_idx);
+    const float c = cos(angle);
+    const float s = sign * sin(angle);
+    const float old_a = a;
+    a = old_a * c - b * s;
+    b = b * c + old_a * s;
+}
+
+float key_value(uint key_pos, uint col) {
+    if (key_pos >= p.start_pos) {
+        return k_new[(key_pos - p.start_pos) * p.head_dim + col];
+    }
+    return window_cache[(key_pos % p.sliding_window) * p.head_dim + col];
+}
 
 void main() {
     const uint head = gl_GlobalInvocationID.x;
     if (head >= p.local_heads || p.head_dim == 0 || p.sliding_window == 0) {
         return;
     }
-    const uint row = p.start_pos % p.sliding_window;
-    if (p.write_window_cache != 0 && head == 0) {
-        for (uint d = 0; d < p.head_dim; ++d) {
-            window_cache[row * p.head_dim + d] = k_new[d];
-        }
-    }
 
     const uint n_ctx = min(p.start_pos + 1, p.sliding_window);
+    const uint base = head * p.head_dim;
     float max_logit = sink[head];
     for (uint t = 0; t < n_ctx; ++t) {
         const uint abs_t = p.start_pos + 1 - n_ctx + t;
-        const uint cache_row = abs_t % p.sliding_window;
         float dotv = 0.0;
         for (uint d = 0; d < p.head_dim; ++d) {
-            dotv += q[head * p.head_dim + d] * window_cache[cache_row * p.head_dim + d];
+            dotv += q[base + d] * key_value(abs_t, d);
         }
         max_logit = max(max_logit, dotv * p.sm_scale);
     }
 
     float denom = exp(sink[head] - max_logit);
     for (uint d = 0; d < p.head_dim; ++d) {
-        out_data[head * p.head_dim + d] = 0.0;
+        out_data[base + d] = 0.0;
     }
     for (uint t = 0; t < n_ctx; ++t) {
         const uint abs_t = p.start_pos + 1 - n_ctx + t;
-        const uint cache_row = abs_t % p.sliding_window;
         float dotv = 0.0;
         for (uint d = 0; d < p.head_dim; ++d) {
-            dotv += q[head * p.head_dim + d] * window_cache[cache_row * p.head_dim + d];
+            dotv += q[base + d] * key_value(abs_t, d);
         }
         const float w = exp(dotv * p.sm_scale - max_logit);
         denom += w;
         for (uint d = 0; d < p.head_dim; ++d) {
-            out_data[head * p.head_dim + d] += w * window_cache[cache_row * p.head_dim + d];
+            out_data[base + d] += w * key_value(abs_t, d);
         }
     }
-    for (uint d = 0; d < p.head_dim; ++d) {
-        out_data[head * p.head_dim + d] /= max(denom, 1.0e-20);
+    const float inv_denom = 1.0 / max(denom, 1.0e-20);
+    const uint rope = min(p.rope_dim, p.head_dim);
+    const uint rope_start = p.head_dim - rope;
+    for (uint d = 0; d < rope_start; ++d) {
+        out_data[base + d] *= inv_denom;
+    }
+    for (uint d = 0; d + 1 < rope; d += 2) {
+        float a = out_data[base + rope_start + d] * inv_denom;
+        float b = out_data[base + rope_start + d + 1] * inv_denom;
+        apply_rope_pair(a, b, d / 2, -1.0);
+        out_data[base + rope_start + d] = a;
+        out_data[base + rope_start + d + 1] = b;
+    }
+    if ((rope & 1u) != 0u) {
+        out_data[base + p.head_dim - 1] *= inv_denom;
+    }
+    if (p.write_window_cache != 0 && head == 0) {
+        const uint row = p.start_pos % p.sliding_window;
+        for (uint d = 0; d < p.head_dim; ++d) {
+            window_cache[row * p.head_dim + d] = k_new[d];
+        }
     }
 }
