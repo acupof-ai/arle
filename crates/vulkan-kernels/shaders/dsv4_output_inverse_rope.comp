@@ -23,6 +23,30 @@ layout(binding = 1) writeonly buffer Out {
     float out_data[];
 };
 
+float rope_inv_freq(uint pair_idx) {
+    const float inv = pow(p.rope_base, -(2.0 * float(pair_idx)) / float(p.rope_dim));
+    if (p.orig_seq_len == 0) {
+        return inv;
+    }
+    const float low_f = floor(float(p.rope_dim) * log(float(p.orig_seq_len) / (p.beta_fast * 6.283185307179586)) / (2.0 * log(p.rope_base)));
+    const float high_f = ceil(float(p.rope_dim) * log(float(p.orig_seq_len) / (p.beta_slow * 6.283185307179586)) / (2.0 * log(p.rope_base)));
+    const int low = max(0, int(low_f));
+    const int high = min(max(0, int(p.rope_dim) - 1), int(high_f));
+    const float denom = low == high ? 0.001 : float(high - low);
+    const float ramp = clamp((float(pair_idx) - float(low)) / denom, 0.0, 1.0);
+    const float smooth_weight = 1.0 - ramp;
+    return inv / p.factor * (1.0 - smooth_weight) + inv * smooth_weight;
+}
+
+void apply_rope_pair(inout float a, inout float b, uint pair_idx, float sign) {
+    const float angle = float(p.start_pos) * rope_inv_freq(pair_idx);
+    const float c = cos(angle);
+    const float s = sign * sin(angle);
+    const float old_a = a;
+    a = old_a * c - b * s;
+    b = b * c + old_a * s;
+}
+
 void main() {
     const uint head = gl_GlobalInvocationID.x;
     if (head >= p.local_heads) {
@@ -34,13 +58,10 @@ void main() {
     }
     const uint rope_start = p.head_dim - min(p.rope_dim, p.head_dim);
     for (uint d = 0; d + 1 < p.rope_dim && rope_start + d + 1 < p.head_dim; d += 2) {
-        const float theta = pow(p.rope_base, -2.0 * float(d / 2) / float(p.rope_dim));
-        const float angle = -float(p.start_pos) * theta;
-        const float c = cos(angle);
-        const float s = sin(angle);
-        const float a = in_data[base + rope_start + d];
-        const float b = in_data[base + rope_start + d + 1];
-        out_data[base + rope_start + d] = a * c - b * s;
-        out_data[base + rope_start + d + 1] = a * s + b * c;
+        float a = in_data[base + rope_start + d];
+        float b = in_data[base + rope_start + d + 1];
+        apply_rope_pair(a, b, d / 2, -1.0);
+        out_data[base + rope_start + d] = a;
+        out_data[base + rope_start + d + 1] = b;
     }
 }
