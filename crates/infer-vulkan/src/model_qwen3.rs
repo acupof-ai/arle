@@ -1,0 +1,135 @@
+//! Dense Qwen3 Vulkan forward order.
+//!
+//! Authoritative source: `crates/infer-cuda/src/model.rs` eager
+//! `forward_tokens`. P2 encodes the exact operator order and buffer families;
+//! numeric execution waits for the Vulkan shader ABI and Qwen3 GGUF/safetensor
+//! residency loader.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen3Op {
+    Embedding,
+    InputRmsNorm,
+    QProj,
+    KProj,
+    VProj,
+    QNorm,
+    KNorm,
+    Rope,
+    Attention,
+    OProj,
+    AttentionResidual,
+    PostAttentionRmsNorm,
+    GateProj,
+    UpProj,
+    SwiGlu,
+    DownProj,
+    MlpResidual,
+    FinalRmsNorm,
+    LmHead,
+}
+
+pub const DENSE_QWEN3_LAYER_OPS: &[Qwen3Op] = &[
+    Qwen3Op::InputRmsNorm,
+    Qwen3Op::QProj,
+    Qwen3Op::KProj,
+    Qwen3Op::VProj,
+    Qwen3Op::QNorm,
+    Qwen3Op::KNorm,
+    Qwen3Op::Rope,
+    Qwen3Op::Attention,
+    Qwen3Op::OProj,
+    Qwen3Op::AttentionResidual,
+    Qwen3Op::PostAttentionRmsNorm,
+    Qwen3Op::GateProj,
+    Qwen3Op::UpProj,
+    Qwen3Op::SwiGlu,
+    Qwen3Op::DownProj,
+    Qwen3Op::MlpResidual,
+];
+
+pub fn dense_qwen3_forward_ops(num_layers: usize) -> Vec<Qwen3Op> {
+    let mut ops = Vec::with_capacity(2 + num_layers * DENSE_QWEN3_LAYER_OPS.len() + 2);
+    ops.push(Qwen3Op::Embedding);
+    for _ in 0..num_layers {
+        ops.extend_from_slice(DENSE_QWEN3_LAYER_OPS);
+    }
+    ops.push(Qwen3Op::FinalRmsNorm);
+    ops.push(Qwen3Op::LmHead);
+    ops
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen3ResidencyPlan {
+    pub num_layers: usize,
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub head_dim: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+}
+
+impl Qwen3ResidencyPlan {
+    pub fn from_config(config: &qwen3_spec::Qwen3Config) -> Self {
+        Self {
+            num_layers: config.num_hidden_layers,
+            vocab_size: config.vocab_size,
+            hidden_size: config.hidden_size,
+            intermediate_size: config.intermediate_size,
+            head_dim: config.head_dim,
+            num_attention_heads: config.num_attention_heads,
+            num_key_value_heads: config.num_key_value_heads,
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+pub struct VulkanQwen3Model {
+    pub config: qwen3_spec::Qwen3Config,
+    _ctx: vulkan_sys::VulkanContext,
+}
+
+#[cfg(feature = "vulkan")]
+impl VulkanQwen3Model {
+    pub fn new(config: qwen3_spec::Qwen3Config) -> anyhow::Result<Self> {
+        let ctx = vulkan_sys::VulkanContext::create()
+            .map_err(|e| anyhow::anyhow!("create Vulkan context: {e}"))?;
+        Ok(Self { config, _ctx: ctx })
+    }
+
+    pub fn forward_token(
+        &mut self,
+        _slot: usize,
+        _epoch: u64,
+        _token: u32,
+        _start_pos: usize,
+    ) -> anyhow::Result<Vec<f32>> {
+        anyhow::bail!(
+            "Vulkan Qwen3 numeric forward is pending shader specialization and residency upload"
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_qwen3_ops_match_cuda_order() {
+        let ops = dense_qwen3_forward_ops(1);
+        assert_eq!(ops.first(), Some(&Qwen3Op::Embedding));
+        assert_eq!(ops.last(), Some(&Qwen3Op::LmHead));
+        assert_eq!(
+            &ops[1..1 + DENSE_QWEN3_LAYER_OPS.len()],
+            DENSE_QWEN3_LAYER_OPS
+        );
+        assert_eq!(ops[1], Qwen3Op::InputRmsNorm);
+        assert_eq!(ops[2], Qwen3Op::QProj);
+        assert_eq!(ops[3], Qwen3Op::KProj);
+        assert_eq!(ops[4], Qwen3Op::VProj);
+        assert!(ops.contains(&Qwen3Op::QNorm));
+        assert!(ops.contains(&Qwen3Op::KNorm));
+        assert!(ops.contains(&Qwen3Op::SwiGlu));
+        assert_eq!(ops.len(), 19);
+    }
+}
