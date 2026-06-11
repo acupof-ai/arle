@@ -8,6 +8,9 @@ by default so Mac/off-box builds do not require a Vulkan SDK or loader.
 P1 adds `crates/vulkan-kernels`, a `glslc` build wrapper around the vendored
 llama.cpp Vulkan shader corpus plus raw-buffer launch wrappers for the generic
 operator set.
+P2 adds `crates/infer-vulkan`, a seam-correct backend skeleton that reuses
+`infer_hip::{gguf,dequant,config}` and pins the dense Qwen3 forward sequence
+against the CUDA implementation.
 
 The backend is not reachable from `arle serve` yet. CLI and model wiring are
 scheduled for P7, so there is no production hot path or benchmarkable endpoint
@@ -31,6 +34,11 @@ cargo check -p vulkan-kernels --features vulkan
 cargo test -p vulkan-kernels
 cargo test -p vulkan-kernels --features vulkan
 cargo clippy -p vulkan-kernels --all-features -- -D warnings
+cargo check -p infer-vulkan
+cargo check -p infer-vulkan --features vulkan
+cargo test -p infer-vulkan
+cargo test -p infer-vulkan --features vulkan
+cargo clippy -p infer-vulkan --all-features -- -D warnings
 ```
 
 All passed on 2026-06-11. `cargo check --features vulkan` also passed after
