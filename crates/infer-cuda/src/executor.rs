@@ -196,6 +196,23 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Attach the opt-in T2 disk spill level (pre-serve only). Returns whether
+    /// any arm consumed it, so callers can fail closed instead of silently
+    /// dropping an explicit `--kv-ssd-path` request.
+    pub(crate) fn set_kv_tier_disk(
+        &mut self,
+        root: std::path::PathBuf,
+        budget_bytes: usize,
+    ) -> bool {
+        match self {
+            Self::Qwen(q) => {
+                q.set_kv_tier_disk(root, budget_bytes);
+                true
+            }
+            Self::Qwen35(_) | Self::Dsv4(_) => false,
+        }
+    }
+
     pub(crate) fn dsv4_verify_forward_selftest(&mut self, prompt: &[u32]) -> Result<()> {
         match self {
             Self::Dsv4(d) => d.verify_forward_selftest(prompt),
@@ -308,43 +325,7 @@ impl RealCudaExecutor {
     }
 }
 
-/// Default host-RAM budget for the T1 prefix tier. Default-on (ckl
-/// 2026-06-11): evicted prefix pages demote into host RAM and promote back on
-/// the next prefix hit instead of re-prefilling. The engine never demotes
-/// more than this budget; CLI opt-out wiring (`--kv-t1-budget-bytes 0`) is
-/// tracked in #82.
-const DEFAULT_KV_TIER_BUDGET_BYTES: usize = 4 << 30;
-
-/// Capacity-capped host store of demoted KV page payloads, keyed by
-/// engine-assigned tier keys. Each payload is a full [`PagedKVPool`] page
-/// image (`storage_bytes_per_page`: all layers, K+V, scales/norms) produced
-/// by `copy_pages_to_host` and consumed by `copy_pages_from_host`.
-pub(crate) struct CudaKvTierStore {
-    capacity_pages: usize,
-    entries: std::collections::BTreeMap<u64, Vec<u8>>,
-}
-
-impl CudaKvTierStore {
-    fn with_budget(budget_bytes: usize, bytes_per_page: usize) -> Self {
-        let capacity_pages = if bytes_per_page == 0 {
-            0
-        } else {
-            budget_bytes / bytes_per_page
-        };
-        Self {
-            capacity_pages,
-            entries: std::collections::BTreeMap::new(),
-        }
-    }
-
-    fn capacity_pages(&self) -> usize {
-        self.capacity_pages
-    }
-
-    fn is_full(&self) -> bool {
-        self.entries.len() >= self.capacity_pages
-    }
-}
+use crate::kv_tier::{CudaKvTierStore, DEFAULT_KV_TIER_BUDGET_BYTES};
 
 pub(crate) struct QwenCudaExecutor {
     model: CudaModel,
@@ -471,6 +452,12 @@ impl QwenCudaExecutor {
         self.tier = CudaKvTierStore::with_budget(bytes, self.kv.storage_bytes_per_page());
     }
 
+    /// Attach the opt-in T2 disk spill level (`--kv-ssd-path`). Pre-serve only.
+    pub(crate) fn set_kv_tier_disk(&mut self, root: std::path::PathBuf, budget_bytes: usize) {
+        self.tier
+            .set_disk(root, budget_bytes, self.kv.storage_bytes_per_page());
+    }
+
     /// Copy device pages into the host tier store (synchronous: the copy is
     /// complete when this returns, so the engine may free the pages). Stops at
     /// capacity and reports the accepted prefix length.
@@ -481,7 +468,9 @@ impl QwenCudaExecutor {
                 break;
             }
             let payload = self.kv.copy_pages_to_host(&self.model.ctx, &[page])?;
-            self.tier.entries.insert(key, payload);
+            if !self.tier.insert(key, payload) {
+                break;
+            }
             accepted += 1;
         }
         Ok(accepted)
@@ -491,22 +480,21 @@ impl QwenCudaExecutor {
     /// engine attaches the pages right after, so sync before returning.
     pub(crate) fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
         for &(key, page) in entries {
+            // Disjoint-field borrows: payload borrows self.tier; the copy
+            // borrows self.kv + self.model.
             let payload = self
                 .tier
-                .entries
-                .get(&key)
-                .ok_or_else(|| anyhow::anyhow!("KV tier promote: unknown key {key}"))?;
+                .read(key)
+                .map_err(|err| anyhow::anyhow!("KV tier promote: {err}"))?;
             self.kv
-                .copy_pages_from_host(&self.model.ctx, &[page], payload)?;
+                .copy_pages_from_host(&self.model.ctx, &[page], &payload)?;
         }
         self.model.ctx.sync()?;
         Ok(())
     }
 
     pub(crate) fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
-        for key in keys {
-            self.tier.entries.remove(key);
-        }
+        self.tier.remove(keys);
     }
 
     pub(crate) fn submit(
