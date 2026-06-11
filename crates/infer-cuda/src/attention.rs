@@ -1443,6 +1443,13 @@ pub(crate) struct Dsv4SpecRingSnapshot {
     fp8_slots: Option<CudaSlice<u8>>,
     /// `flash.fp8_kv_comp_packed_rows` captured once pre-verify; restored on reject.
     fp8_packed_rows_before: Option<usize>,
+    /// `flash.fp8_kv_sw_bootstrapped` captured once pre-verify; restored on reject
+    /// (P1-B). On the first spec decode after a long prefill the flag is still
+    /// false, so the FP8 ring is unbootstrapped (stale) when captured. Restoring
+    /// the flag means a wrap-reject re-bootstraps the whole window on the next
+    /// decode (overwriting the stale FP8 bytes restore put back) instead of
+    /// skipping the repack and reading corruption.
+    fp8_bootstrapped_before: Option<bool>,
     /// Layout metadata `fp8_sw_offsets` needs — copied verbatim from the deleted
     /// single-slot snapshot struct's fields.
     head_dim: usize,
@@ -2123,6 +2130,7 @@ impl Dsv4LayerAttentionState {
                 })
                 .transpose()?,
             fp8_packed_rows_before: None,
+            fp8_bootstrapped_before: None,
             head_dim: config.head_dim,
             sliding_window: config.sliding_window,
             fp8_page_block_size: kv_arena.page_block_size,
@@ -2161,6 +2169,7 @@ impl Dsv4LayerAttentionState {
             snap.head_dim
         );
         snap.fp8_packed_rows_before = self.flashmla.as_ref().map(|f| f.fp8_kv_comp_packed_rows);
+        snap.fp8_bootstrapped_before = self.flashmla.as_ref().map(|f| f.fp8_kv_sw_bootstrapped);
         for i in 0..=depth {
             let draft_abs_pos = start_pos + i;
             snap.capture_sw_slot(ctx, &self.sw_window_cache, i, draft_abs_pos)?;
@@ -2212,8 +2221,17 @@ impl Dsv4LayerAttentionState {
                 snap.restore_fp8_slot(ctx, pool, slot_idx, i, draft_abs_pos)?;
             }
         }
-        if let (Some(flash), Some(rows)) = (&mut self.flashmla, snap.fp8_packed_rows_before) {
-            flash.fp8_kv_comp_packed_rows = rows;
+        if let Some(flash) = &mut self.flashmla {
+            if let Some(rows) = snap.fp8_packed_rows_before {
+                flash.fp8_kv_comp_packed_rows = rows;
+            }
+            // P1-B: restore the bootstrap flag too. If it was false pre-verify the
+            // captured FP8 slots are stale, so leaving the flag true would skip the
+            // next decode's repack; restoring false forces a full re-bootstrap that
+            // overwrites the stale bytes restore_sw/fp8 put back.
+            if let Some(bootstrapped) = snap.fp8_bootstrapped_before {
+                flash.fp8_kv_sw_bootstrapped = bootstrapped;
+            }
         }
         Ok(())
     }
@@ -5733,10 +5751,22 @@ fn csa_select(
     );
 
     let key_count = if start_pos_device.is_some() {
-        // Graph replay must not bake the current compressed-key seq_len. The
-        // selector computes `available = min(key_count, abs_pos / ratio)`, so
-        // capacity preserves the same causal set while staying replay-safe.
-        keys.data.len() / keys.hidden_dim
+        if dsv4_verify_frozen() {
+            // Frozen-KV (P1-A): the selector computes `available = min(key_count,
+            // abs_pos / ratio)`. A frozen verify's `abs_pos` can cross a compression
+            // boundary, so capacity-or-`abs_pos/ratio` would expose a compressed row
+            // the frozen compressor never produced. Pin to the committed indexer row
+            // count — `keys.seq_len` is frozen to that by P1-1, and abs_pos/ratio >=
+            // it, so `available` stays at the committed set. (Frozen verify is the
+            // spec path, never graph-replayed, so the replay-safety capacity rule
+            // below does not apply here.)
+            keys.seq_len
+        } else {
+            // Graph replay must not bake the current compressed-key seq_len. The
+            // selector computes `available = min(key_count, abs_pos / ratio)`, so
+            // capacity preserves the same causal set while staying replay-safe.
+            keys.data.len() / keys.hidden_dim
+        }
     } else {
         keys.seq_len
     };
