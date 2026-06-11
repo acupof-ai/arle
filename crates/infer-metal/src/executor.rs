@@ -19,6 +19,25 @@ use crate::{config, mlx, model_source, qwen35, wired_limit};
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
 
+/// Metal KV-cache storage dtype. The host `MetalKvPool` remains a logical page
+/// allocator; this controls the MLX arrays inside each Metal slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MetalKvCacheDtype {
+    Bf16,
+    #[default]
+    Int8,
+}
+
+impl MetalKvCacheDtype {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Int8 => "int8",
+        }
+    }
+}
+
 /// Cross-step decode pipelining (env-gated, default ON since
 /// `wins/2026-06-04-metal-decode-pipeline-c2-safe-default-on.md`).
 ///
@@ -187,6 +206,15 @@ impl MetalExecutor {
     /// path or HuggingFace id.
     #[cfg(feature = "metal")]
     pub fn from_model_path(model_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::from_model_path_with_kv_cache_dtype(model_path, MetalKvCacheDtype::default())
+    }
+
+    /// Build a real MLX Qwen3.5/Qwen3.6 executor with an explicit Metal KV dtype.
+    #[cfg(feature = "metal")]
+    pub fn from_model_path_with_kv_cache_dtype(
+        model_path: impl AsRef<Path>,
+        kv_cache_dtype: MetalKvCacheDtype,
+    ) -> anyhow::Result<Self> {
         let model_source = model_path.as_ref().to_string_lossy();
         let resolved = model_source::resolve_model_path(&model_source)?;
         let _guard = mlx_sys::mlx_guard();
@@ -199,10 +227,15 @@ impl MetalExecutor {
             );
         }
         let config = config::load_metal_config(&resolved)?;
+        if kv_cache_dtype == MetalKvCacheDtype::Int8 {
+            validate_int8_kv_config(&config)?;
+        }
+        eprintln!("[infer-metal] kv cache dtype = {}", kv_cache_dtype.label());
         let weights = qwen35::load_qwen35_metal_weights(&resolved, &config)?;
         Ok(Self {
             real: Some(RealMetalExecutor {
                 config,
+                kv_cache_dtype,
                 weights,
                 slots: HashMap::new(),
                 page_store: MetalPageStore::default(),
@@ -328,6 +361,7 @@ struct PendingStep {
 #[cfg(feature = "metal")]
 struct RealMetalExecutor {
     config: config::MetalModelConfig,
+    kv_cache_dtype: MetalKvCacheDtype,
     weights: qwen35::Qwen35MetalWeights,
     slots: HashMap<usize, MetalSlotState>,
     page_store: MetalPageStore,
@@ -358,7 +392,7 @@ impl RealMetalExecutor {
         // Throwaway warmup state: a reserved slot id, tiny cache, never inserted
         // into `self.slots` or published to the kv pool. Token id 0 is a valid
         // vocab index; the output is discarded — only the graph JIT matters.
-        let mut state = MetalSlotState::new(usize::MAX, 0, &self.config, 8);
+        let mut state = MetalSlotState::new(usize::MAX, 0, &self.config, self.kv_cache_dtype, 8);
         state.ensure_session_active(model)?;
         // Tiny prefill → JIT the prefill graph + first MoE encode.
         let prefill = mlx::MlxArray::from_slice_i32(&[0, 0], &[2]);
@@ -410,7 +444,13 @@ impl RealMetalExecutor {
                 .max(row.total_tokens.saturating_add(512))
                 .max(row.tokens.len().saturating_add(1));
             let state = if row.start_pos == 0 {
-                MetalSlotState::new(row.slot, kv.slot_epoch(row.slot), &self.config, reservation)
+                MetalSlotState::new(
+                    row.slot,
+                    kv.slot_epoch(row.slot),
+                    &self.config,
+                    self.kv_cache_dtype,
+                    reservation,
+                )
             } else {
                 self.page_store.materialize_slot_from_prefix(
                     row.slot,
@@ -907,20 +947,11 @@ impl MetalSlotState {
         slot: usize,
         slot_epoch: u64,
         config: &config::MetalModelConfig,
+        kv_cache_dtype: MetalKvCacheDtype,
         capacity_tokens: usize,
     ) -> Self {
         let capacity = round_up_capacity(capacity_tokens);
-        let cache_shape = [
-            1,
-            config.num_key_value_heads as i32,
-            capacity,
-            config.head_dim as i32,
-        ];
-        let mut kv_flat = Vec::with_capacity(config.arch.num_full_attention_layers() * 2);
-        for _ in 0..config.arch.num_full_attention_layers() {
-            kv_flat.push(mlx::zeros(&cache_shape, mlx::Dtype::Bfloat16));
-            kv_flat.push(mlx::zeros(&cache_shape, mlx::Dtype::Bfloat16));
-        }
+        let kv_flat = allocate_kv_flat(config, kv_cache_dtype, capacity);
 
         let mut gdr_flat = Vec::with_capacity(config.arch.num_linear_attention_layers() * 2);
         for _ in 0..config.arch.num_linear_attention_layers() {
@@ -1103,6 +1134,71 @@ fn round_up_capacity(tokens: usize) -> i32 {
     ((tokens + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK) * KV_CACHE_CHUNK
 }
 
+#[cfg(feature = "metal")]
+fn validate_int8_kv_config(config: &config::MetalModelConfig) -> anyhow::Result<()> {
+    let group_size = int8_kv_group_size(config.head_dim)?;
+    anyhow::ensure!(
+        config.head_dim.is_multiple_of(group_size),
+        "Metal int8 KV requires head_dim divisible by group_size: head_dim={}, group_size={group_size}",
+        config.head_dim
+    );
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn int8_kv_group_size(head_dim: usize) -> anyhow::Result<usize> {
+    if head_dim.is_multiple_of(128) {
+        Ok(128)
+    } else if head_dim.is_multiple_of(64) {
+        Ok(64)
+    } else if head_dim.is_multiple_of(32) {
+        Ok(32)
+    } else {
+        anyhow::bail!("Metal int8 KV requires head_dim divisible by 32/64/128, got {head_dim}")
+    }
+}
+
+#[cfg(feature = "metal")]
+fn allocate_kv_flat(
+    config: &config::MetalModelConfig,
+    kv_cache_dtype: MetalKvCacheDtype,
+    capacity: i32,
+) -> Vec<mlx::MlxArray> {
+    let full_layers = config.arch.num_full_attention_layers();
+    let nkv = config.num_key_value_heads as i32;
+    let hd = config.head_dim as i32;
+    match kv_cache_dtype {
+        MetalKvCacheDtype::Bf16 => {
+            let cache_shape = [1, nkv, capacity, hd];
+            let mut kv_flat = Vec::with_capacity(full_layers * 2);
+            for _ in 0..full_layers {
+                kv_flat.push(mlx::zeros(&cache_shape, mlx::Dtype::Bfloat16));
+                kv_flat.push(mlx::zeros(&cache_shape, mlx::Dtype::Bfloat16));
+            }
+            kv_flat
+        }
+        MetalKvCacheDtype::Int8 => {
+            let group_size = int8_kv_group_size(config.head_dim)
+                .expect("validated before slot allocation") as i32;
+            let packed_shape = [1, nkv, capacity, hd / 4];
+            let scale_shape = [1, nkv, capacity, hd / group_size];
+            let mut kv_flat = Vec::with_capacity(full_layers * 6);
+            for _ in 0..full_layers {
+                // K: packed uint32 data + bf16 scale/bias, then V with the same
+                // layout. C++ session code interprets n_kv=6*full_layers as
+                // quantized KV.
+                kv_flat.push(mlx::zeros(&packed_shape, mlx::Dtype::Uint32));
+                kv_flat.push(mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16));
+                kv_flat.push(mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16));
+                kv_flat.push(mlx::zeros(&packed_shape, mlx::Dtype::Uint32));
+                kv_flat.push(mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16));
+                kv_flat.push(mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16));
+            }
+            kv_flat
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,6 +1234,53 @@ mod tests {
         let src = mlx::as_dtype(&src, mlx::Dtype::Float32);
         let same = grow_kv_seq_axis(&src, 2).unwrap();
         assert_eq!(same.shape(), &[1, 1, 2, 2]);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn int8_kv_layout_allocates_packed_triples_per_kv_axis() {
+        let _guard = mlx_sys::mlx_guard();
+        let config = config::MetalModelConfig {
+            hidden_size: 16,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            num_hidden_layers: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            head_dim: 128,
+            stop_token_ids: vec![0],
+            quantization: None,
+            arch: config::MetalQwen35ArchConfig {
+                layer_types: vec![config::MetalQwen35LayerType::FullAttention],
+                rotary_dim: 128,
+                linear: config::MetalGdrConfig {
+                    num_key_heads: 0,
+                    key_dim: 0,
+                    num_value_heads: 0,
+                    value_dim: 0,
+                    conv_kernel: 4,
+                    rms_norm_eps: 1e-6,
+                },
+                moe: None,
+            },
+        };
+        let arrays = allocate_kv_flat(&config, MetalKvCacheDtype::Int8, 256);
+        assert_eq!(arrays.len(), 6);
+        assert_eq!(arrays[0].shape(), &[1, 1, 256, 32]);
+        assert_eq!(arrays[0].dtype(), mlx::Dtype::Uint32);
+        assert_eq!(arrays[1].shape(), &[1, 1, 256, 1]);
+        assert_eq!(arrays[1].dtype(), mlx::Dtype::Bfloat16);
+        assert_eq!(arrays[2].shape(), &[1, 1, 256, 1]);
+        assert_eq!(arrays[3].shape(), &[1, 1, 256, 32]);
+        assert_eq!(arrays[3].dtype(), mlx::Dtype::Uint32);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn int8_kv_group_size_prefers_largest_supported_divisor() {
+        assert_eq!(int8_kv_group_size(256).unwrap(), 128);
+        assert_eq!(int8_kv_group_size(96).unwrap(), 32);
+        assert!(int8_kv_group_size(80).is_err());
     }
 
     /// Rank-4 `[1, 1, seq, 2]` f32 K/V array filled with `fill` — the minimal

@@ -121,8 +121,12 @@ embedding / 转换中间态；同 profile 下 RSS 约 1679 MB，而 MLX SafeTens
 
 Metal 这条线现在要把“量化 KV 是否需要做”说清楚，不再和 CUDA 能力混写：
 
-- 当前 Metal / MLX serving **不支持** `fp8` / `int8` / `tq2-4` 这类量化 KV cache。
-- 今天的 Metal KV 仍然是模型原生 dtype，通常是 `bf16` / `f16`。
+- 当前 Metal / MLX serving 支持 `int8` KV，并且 `--kv-cache-dtype auto`
+  默认解析为 int8；`--kv-cache-dtype bf16` 是显式回退。
+- Metal int8 KV 使用 MLX affine 8-bit group quant，不是 CUDA KIVI。FP8 /
+  TQ2-4 仍不支持。
+- 今天的 Metal 只量化 full-attention K/V；GDR recurrent / conv state 仍保持
+  原生 `float32` / `bf16`。
 - 现阶段这不是 P0，也不是 P1。Metal 的主瓶颈仍然是 batched decode、live prefix
   reuse、serving observability，以及产品级 API / DX。
 
@@ -136,8 +140,8 @@ Metal 这条线现在要把“量化 KV 是否需要做”说清楚，不再和 
 
 - `FP8 KV` 在 MLX / Apple Silicon 上不是优先路线。当前 MLX 没有一等 FP8 tensor
   dtype，Apple GPU 也没有 CUDA 那种 FP8 decode kernel 生态。
-- 如果未来真的做，第一候选更像是 `INT8` 或 `TurboQuant / PolarQuant` 风格的
-  压缩 KV，而不是照搬 CUDA 的 FP8 方案。
+- `INT8` 已落到默认路径；下一步如果继续压缩，应走实测 license 的
+  `TurboQuant / PolarQuant` 风格，而不是照搬 CUDA 的 FP8 方案。
 
 ## Model Scope
 
