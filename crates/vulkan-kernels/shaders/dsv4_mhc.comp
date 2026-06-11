@@ -1,0 +1,89 @@
+#version 450
+// ARLE Vulkan shader ported from crates/cuda-kernels/csrc/misc/dsv4_mhc.cu
+// mhc_expand/params/pre/post/head_pre entry semantics. No llama.cpp equivalent exists (MIT).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint op;
+    uint hidden;
+    uint hc_mult;
+    uint mix_rows;
+    float eps;
+    uint sinkhorn_iters;
+} p;
+
+layout(binding = 0) readonly buffer A {
+    float a[];
+};
+layout(binding = 1) readonly buffer B {
+    float b[];
+};
+layout(binding = 2) readonly buffer Base {
+    float base[];
+};
+layout(binding = 3) readonly buffer Scale {
+    float scale[];
+};
+layout(binding = 4) buffer Pre {
+    float pre[];
+};
+layout(binding = 5) buffer Post {
+    float post[];
+};
+layout(binding = 6) buffer Comb {
+    float comb[];
+};
+layout(binding = 7) buffer Out {
+    float out_data[];
+};
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint stream_dim = p.hidden * p.hc_mult;
+    if (p.op == 0) {
+        if (idx < stream_dim) {
+            out_data[idx] = a[idx % p.hidden];
+        }
+        return;
+    }
+    if (p.op == 1) {
+        if (idx < p.hc_mult) {
+            pre[idx] = base[idx] + scale[idx];
+            post[idx] = base[idx] - scale[idx];
+        }
+        if (idx < p.hc_mult * p.hc_mult) {
+            const uint row = idx / p.hc_mult;
+            const uint col = idx % p.hc_mult;
+            comb[idx] = row == col ? 1.0 : 0.0;
+        }
+        return;
+    }
+    if (p.op == 2) {
+        if (idx < p.hidden) {
+            float acc = 0.0;
+            for (uint m = 0; m < p.hc_mult; ++m) {
+                acc += a[m * p.hidden + idx] * pre[m];
+            }
+            out_data[idx] = acc / max(float(p.hc_mult), 1.0);
+        }
+        return;
+    }
+    if (p.op == 3) {
+        if (idx < stream_dim) {
+            const uint m = idx / p.hidden;
+            const uint h = idx % p.hidden;
+            out_data[idx] = b[idx] + a[h] * post[m];
+        }
+        return;
+    }
+    if (p.op == 4) {
+        if (idx < p.hidden) {
+            float acc = 0.0;
+            for (uint m = 0; m < p.hc_mult; ++m) {
+                acc += a[m * p.hidden + idx];
+            }
+            out_data[idx] = acc / max(float(p.hc_mult), 1.0);
+        }
+    }
+}

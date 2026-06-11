@@ -1,0 +1,46 @@
+#version 450
+// ARLE Vulkan shader ported from crates/cuda-kernels/csrc/misc/dsv4_attention.cu
+// dsv4_output_inverse_rope_kernel. No standalone llama.cpp equivalent exists (MIT).
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint local_heads;
+    uint head_dim;
+    uint rope_dim;
+    uint start_pos;
+    float rope_base;
+    uint orig_seq_len;
+    float factor;
+    float beta_fast;
+    float beta_slow;
+} p;
+
+layout(binding = 0) readonly buffer In {
+    float in_data[];
+};
+layout(binding = 1) writeonly buffer Out {
+    float out_data[];
+};
+
+void main() {
+    const uint head = gl_GlobalInvocationID.x;
+    if (head >= p.local_heads) {
+        return;
+    }
+    const uint base = head * p.head_dim;
+    for (uint d = 0; d < p.head_dim; ++d) {
+        out_data[base + d] = in_data[base + d];
+    }
+    const uint rope_start = p.head_dim - min(p.rope_dim, p.head_dim);
+    for (uint d = 0; d + 1 < p.rope_dim && rope_start + d + 1 < p.head_dim; d += 2) {
+        const float theta = pow(p.rope_base, -2.0 * float(d / 2) / float(p.rope_dim));
+        const float angle = -float(p.start_pos) * theta;
+        const float c = cos(angle);
+        const float s = sin(angle);
+        const float a = in_data[base + rope_start + d];
+        const float b = in_data[base + rope_start + d + 1];
+        out_data[base + rope_start + d] = a * c - b * s;
+        out_data[base + rope_start + d + 1] = a * s + b * c;
+    }
+}

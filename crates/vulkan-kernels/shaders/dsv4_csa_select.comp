@@ -1,0 +1,65 @@
+#version 450
+// ARLE Vulkan shader ported from crates/cuda-kernels/csrc/misc/dsv4_attention.cu
+// dsv4_csa_select_kernel. No standalone llama.cpp equivalent exists (MIT).
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint query_width;
+    uint index_heads;
+    uint index_dim;
+    uint key_count;
+    uint ratio;
+    uint topk;
+    uint start_pos;
+    float score_scale;
+} p;
+
+layout(binding = 0) readonly buffer Query {
+    float query[];
+};
+layout(binding = 1) readonly buffer Weights {
+    float weights[];
+};
+layout(binding = 2) readonly buffer Keys {
+    float keys[];
+};
+layout(binding = 3) buffer Selected {
+    int selected[];
+};
+
+float score_key(uint key) {
+    float sum = 0.0;
+    for (uint d = 0; d < p.query_width; ++d) {
+        sum += query[d] * keys[key * p.query_width + d];
+    }
+    for (uint h = 0; h < p.index_heads; ++h) {
+        sum += weights[h];
+    }
+    return sum * p.score_scale;
+}
+
+void main() {
+    for (uint k = 0; k < p.topk; ++k) {
+        selected[k] = -1;
+    }
+    for (uint rank = 0; rank < p.topk; ++rank) {
+        float best = -3.402823e38;
+        int best_idx = -1;
+        for (uint key = 0; key < p.key_count; ++key) {
+            bool used = false;
+            for (uint prev = 0; prev < rank; ++prev) {
+                used = used || selected[prev] == int(key);
+            }
+            if (used) {
+                continue;
+            }
+            const float s = score_key(key);
+            if (s > best) {
+                best = s;
+                best_idx = int(key);
+            }
+        }
+        selected[rank] = best_idx;
+    }
+}

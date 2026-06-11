@@ -45,6 +45,22 @@ pub enum Dsv4Op {
 
 pub const DSV4_PREFIX_CACHE_ENABLED: bool = false;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dsv4LauncherKind {
+    TokenEmbedding,
+    QuantizedGemv,
+    RmsNorm,
+    Dsv4PrepareQk,
+    Dsv4SwaAttention,
+    Dsv4CompressorUpdate,
+    Dsv4CsaSelect,
+    Dsv4HybridAttention,
+    Dsv4Mhc,
+    SwigluClamped,
+    Add,
+    HostRouting,
+}
+
 pub const DSV4_FALLBACK_LAYER_OPS: &[Dsv4Op] = &[
     Dsv4Op::HcAttnFn,
     Dsv4Op::MhcParams,
@@ -89,6 +105,77 @@ pub fn dsv4_fallback_forward_ops(num_layers: usize) -> Vec<Dsv4Op> {
     ops.push(Dsv4Op::FinalRmsNorm);
     ops.push(Dsv4Op::LmHead);
     ops
+}
+
+pub fn dsv4_launcher_kind(op: Dsv4Op) -> Dsv4LauncherKind {
+    match op {
+        Dsv4Op::TokenEmbedding => Dsv4LauncherKind::TokenEmbedding,
+        Dsv4Op::HcAttnFn
+        | Dsv4Op::WqA
+        | Dsv4Op::WqB
+        | Dsv4Op::WKv
+        | Dsv4Op::IndexerQB
+        | Dsv4Op::IndexerProj
+        | Dsv4Op::WoA
+        | Dsv4Op::WoB
+        | Dsv4Op::HcFfnFn
+        | Dsv4Op::RouterGemv
+        | Dsv4Op::RoutedExpertGateUp
+        | Dsv4Op::RoutedExpertDown
+        | Dsv4Op::SharedExpert
+        | Dsv4Op::LmHead => Dsv4LauncherKind::QuantizedGemv,
+        Dsv4Op::QNorm | Dsv4Op::KvNorm | Dsv4Op::FinalRmsNorm => Dsv4LauncherKind::RmsNorm,
+        Dsv4Op::PrepareQk => Dsv4LauncherKind::Dsv4PrepareQk,
+        Dsv4Op::SlidingWindowAttention => Dsv4LauncherKind::Dsv4SwaAttention,
+        Dsv4Op::CompressorUpdate | Dsv4Op::IndexerCompressorUpdate => {
+            Dsv4LauncherKind::Dsv4CompressorUpdate
+        }
+        Dsv4Op::CsaSelect => Dsv4LauncherKind::Dsv4CsaSelect,
+        Dsv4Op::HybridAttention => Dsv4LauncherKind::Dsv4HybridAttention,
+        Dsv4Op::MhcExpand
+        | Dsv4Op::MhcParams
+        | Dsv4Op::MhcPreRmsNormAttn
+        | Dsv4Op::MhcPostAttention
+        | Dsv4Op::MhcPreRmsNormFfn
+        | Dsv4Op::MhcPostFfn
+        | Dsv4Op::MhcHeadPre => Dsv4LauncherKind::Dsv4Mhc,
+        Dsv4Op::SwigluClamped => Dsv4LauncherKind::SwigluClamped,
+        Dsv4Op::ExpertMixResidual => Dsv4LauncherKind::Add,
+        Dsv4Op::HostSqrtSoftplusRouting => Dsv4LauncherKind::HostRouting,
+    }
+}
+
+pub fn dsv4_launcher_sequence(num_layers: usize) -> Vec<Dsv4LauncherKind> {
+    dsv4_fallback_forward_ops(num_layers)
+        .into_iter()
+        .map(dsv4_launcher_kind)
+        .collect()
+}
+
+#[cfg(feature = "vulkan")]
+pub fn dsv4_kernel_for_launcher(kind: Dsv4LauncherKind) -> Option<vulkan_kernels::Kernel> {
+    Some(match kind {
+        Dsv4LauncherKind::TokenEmbedding => vulkan_kernels::Kernel::GetRows,
+        Dsv4LauncherKind::QuantizedGemv => vulkan_kernels::Kernel::GemvQ4K,
+        Dsv4LauncherKind::RmsNorm => vulkan_kernels::Kernel::RmsNorm,
+        Dsv4LauncherKind::Dsv4PrepareQk => vulkan_kernels::Kernel::Dsv4PrepareQk,
+        Dsv4LauncherKind::Dsv4SwaAttention => vulkan_kernels::Kernel::Dsv4SwaAttention,
+        Dsv4LauncherKind::Dsv4CompressorUpdate => vulkan_kernels::Kernel::Dsv4CompressorUpdate,
+        Dsv4LauncherKind::Dsv4CsaSelect => vulkan_kernels::Kernel::Dsv4CsaSelect,
+        Dsv4LauncherKind::Dsv4HybridAttention => vulkan_kernels::Kernel::Dsv4HybridAttention,
+        Dsv4LauncherKind::Dsv4Mhc => vulkan_kernels::Kernel::Dsv4Mhc,
+        Dsv4LauncherKind::SwigluClamped => vulkan_kernels::Kernel::SwigluClamped,
+        Dsv4LauncherKind::Add => vulkan_kernels::Kernel::Add,
+        Dsv4LauncherKind::HostRouting => return None,
+    })
+}
+
+#[cfg(feature = "vulkan")]
+pub fn dsv4_forward_kernel_sequence(num_layers: usize) -> Vec<Option<vulkan_kernels::Kernel>> {
+    dsv4_launcher_sequence(num_layers)
+        .into_iter()
+        .map(dsv4_kernel_for_launcher)
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -193,9 +280,9 @@ impl VulkanDsv4Model {
         _token: u32,
         _start_pos: usize,
     ) -> anyhow::Result<Vec<f32>> {
+        let _ = dsv4_forward_kernel_sequence(self.config.num_hidden_layers);
         anyhow::bail!(
-            "Vulkan DSv4 numeric forward is blocked: CSA/compressor/hybrid-attention shaders \
-             are not ported yet"
+            "Vulkan DSv4 numeric forward requires GGUF residency binding for the launcher sequence"
         )
     }
 }
@@ -235,6 +322,54 @@ mod tests {
         let mut expected = DSV4_MUTATED_SLOT_BUFFERS.to_vec();
         expected.sort_unstable();
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn every_dsv4_op_has_a_launcher_class() {
+        let kinds = dsv4_launcher_sequence(1);
+        assert_eq!(kinds.first(), Some(&Dsv4LauncherKind::TokenEmbedding));
+        assert!(kinds.contains(&Dsv4LauncherKind::Dsv4PrepareQk));
+        assert!(kinds.contains(&Dsv4LauncherKind::Dsv4CompressorUpdate));
+        assert!(kinds.contains(&Dsv4LauncherKind::Dsv4CsaSelect));
+        assert!(kinds.contains(&Dsv4LauncherKind::Dsv4HybridAttention));
+        assert!(kinds.contains(&Dsv4LauncherKind::Dsv4SwaAttention));
+        assert!(kinds.contains(&Dsv4LauncherKind::Dsv4Mhc));
+        assert!(kinds.contains(&Dsv4LauncherKind::SwigluClamped));
+        assert!(kinds.contains(&Dsv4LauncherKind::HostRouting));
+        assert_eq!(kinds.len(), dsv4_fallback_forward_ops(1).len());
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn dsv4_fused_launcher_classes_map_to_kernels() {
+        assert_eq!(
+            dsv4_kernel_for_launcher(Dsv4LauncherKind::Dsv4PrepareQk),
+            Some(vulkan_kernels::Kernel::Dsv4PrepareQk)
+        );
+        assert_eq!(
+            dsv4_kernel_for_launcher(Dsv4LauncherKind::Dsv4CompressorUpdate),
+            Some(vulkan_kernels::Kernel::Dsv4CompressorUpdate)
+        );
+        assert_eq!(
+            dsv4_kernel_for_launcher(Dsv4LauncherKind::Dsv4CsaSelect),
+            Some(vulkan_kernels::Kernel::Dsv4CsaSelect)
+        );
+        assert_eq!(
+            dsv4_kernel_for_launcher(Dsv4LauncherKind::Dsv4HybridAttention),
+            Some(vulkan_kernels::Kernel::Dsv4HybridAttention)
+        );
+        assert_eq!(
+            dsv4_kernel_for_launcher(Dsv4LauncherKind::Dsv4SwaAttention),
+            Some(vulkan_kernels::Kernel::Dsv4SwaAttention)
+        );
+        assert_eq!(
+            dsv4_kernel_for_launcher(Dsv4LauncherKind::SwigluClamped),
+            Some(vulkan_kernels::Kernel::SwigluClamped)
+        );
+        assert_eq!(
+            dsv4_kernel_for_launcher(Dsv4LauncherKind::HostRouting),
+            None
+        );
     }
 
     #[test]

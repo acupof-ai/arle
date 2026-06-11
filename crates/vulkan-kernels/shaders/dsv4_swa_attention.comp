@@ -1,0 +1,82 @@
+#version 450
+// ARLE Vulkan shader ported from crates/cuda-kernels/csrc/misc/dsv4_attention.cu
+// dsv4_swa_attention_kernel. No standalone llama.cpp equivalent exists (MIT).
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint local_heads;
+    uint head_dim;
+    uint sliding_window;
+    uint start_pos;
+    float sm_scale;
+    uint rope_dim;
+    float rope_base;
+    uint orig_seq_len;
+    float factor;
+    float beta_fast;
+    float beta_slow;
+    uint write_window_cache;
+} p;
+
+layout(binding = 0) readonly buffer Q {
+    float q[];
+};
+layout(binding = 1) readonly buffer KNew {
+    float k_new[];
+};
+layout(binding = 2) buffer Window {
+    float window_cache[];
+};
+layout(binding = 3) readonly buffer Sink {
+    float sink[];
+};
+layout(binding = 4) writeonly buffer Out {
+    float out_data[];
+};
+
+void main() {
+    const uint head = gl_GlobalInvocationID.x;
+    if (head >= p.local_heads || p.head_dim == 0 || p.sliding_window == 0) {
+        return;
+    }
+    const uint row = p.start_pos % p.sliding_window;
+    if (p.write_window_cache != 0 && head == 0) {
+        for (uint d = 0; d < p.head_dim; ++d) {
+            window_cache[row * p.head_dim + d] = k_new[d];
+        }
+    }
+
+    const uint n_ctx = min(p.start_pos + 1, p.sliding_window);
+    float max_logit = sink[head];
+    for (uint t = 0; t < n_ctx; ++t) {
+        const uint abs_t = p.start_pos + 1 - n_ctx + t;
+        const uint cache_row = abs_t % p.sliding_window;
+        float dotv = 0.0;
+        for (uint d = 0; d < p.head_dim; ++d) {
+            dotv += q[head * p.head_dim + d] * window_cache[cache_row * p.head_dim + d];
+        }
+        max_logit = max(max_logit, dotv * p.sm_scale);
+    }
+
+    float denom = exp(sink[head] - max_logit);
+    for (uint d = 0; d < p.head_dim; ++d) {
+        out_data[head * p.head_dim + d] = 0.0;
+    }
+    for (uint t = 0; t < n_ctx; ++t) {
+        const uint abs_t = p.start_pos + 1 - n_ctx + t;
+        const uint cache_row = abs_t % p.sliding_window;
+        float dotv = 0.0;
+        for (uint d = 0; d < p.head_dim; ++d) {
+            dotv += q[head * p.head_dim + d] * window_cache[cache_row * p.head_dim + d];
+        }
+        const float w = exp(dotv * p.sm_scale - max_logit);
+        denom += w;
+        for (uint d = 0; d < p.head_dim; ++d) {
+            out_data[head * p.head_dim + d] += w * window_cache[cache_row * p.head_dim + d];
+        }
+    }
+    for (uint d = 0; d < p.head_dim; ++d) {
+        out_data[head * p.head_dim + d] /= max(denom, 1.0e-20);
+    }
+}

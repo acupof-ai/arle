@@ -1,0 +1,74 @@
+#version 450
+// ARLE Vulkan shader ported from crates/cuda-kernels/csrc/misc/dsv4_attention.cu
+// dsv4_compressor_update_kernel. No standalone llama.cpp equivalent exists (MIT).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint dim;
+    uint ratio;
+    uint width;
+    uint overlap;
+    uint start_pos;
+    float eps;
+    uint rope_dim;
+    float rope_base;
+    uint orig_seq_len;
+    float factor;
+    float beta_fast;
+    float beta_slow;
+} p;
+
+layout(binding = 0) readonly buffer CompKv {
+    float comp_kv[];
+};
+layout(binding = 1) readonly buffer CompScore {
+    float comp_score[];
+};
+layout(binding = 2) readonly buffer Ape {
+    float ape[];
+};
+layout(binding = 3) readonly buffer Norm {
+    float norm_weight[];
+};
+layout(binding = 4) buffer PendingKv {
+    float pending_kv[];
+};
+layout(binding = 5) buffer PendingScore {
+    float pending_score[];
+};
+layout(binding = 6) buffer PrevOverlapKv {
+    float prev_overlap_kv[];
+};
+layout(binding = 7) buffer PrevOverlapScore {
+    float prev_overlap_score[];
+};
+layout(binding = 8) buffer Compressed {
+    float compressed[];
+};
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (p.ratio == 0 || idx >= p.width) {
+        return;
+    }
+    const uint rslot = p.start_pos % p.ratio;
+    const uint pending_off = rslot * p.width + idx;
+    pending_kv[pending_off] = comp_kv[idx] + ape[pending_off];
+    pending_score[pending_off] = comp_score[idx];
+
+    if (((p.start_pos + 1) % p.ratio) != 0 || idx >= p.dim) {
+        return;
+    }
+
+    float v = 0.0;
+    for (uint r = 0; r < p.ratio; ++r) {
+        v += pending_kv[r * p.width + idx];
+    }
+    v /= float(p.ratio);
+    const float w = norm_weight[idx];
+    const uint row = p.start_pos / p.ratio;
+    compressed[row * p.dim + idx] = v * w;
+    prev_overlap_kv[idx] = pending_kv[rslot * p.width + idx];
+    prev_overlap_score[idx] = pending_score[rslot * p.width + idx];
+}
