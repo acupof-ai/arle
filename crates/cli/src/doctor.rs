@@ -393,6 +393,7 @@ fn gpu_report(gpu: &GpuInfo) -> GpuReport {
         GpuInfo::Metal {
             chip,
             unified_memory_gb,
+            ..
         } => GpuReport {
             kind: "metal",
             name: Some(chip.clone()),
@@ -736,7 +737,16 @@ fn gpu_summary(gpu: &GpuInfo) -> String {
         GpuInfo::Metal {
             chip,
             unified_memory_gb,
-        } => format!("{chip} · {unified_memory_gb:.0} GB unified memory"),
+            recommended_working_set_gb,
+        } => {
+            if let Some(working_set) = recommended_working_set_gb {
+                format!(
+                    "{chip} · {unified_memory_gb:.0} GB unified memory · {working_set:.1} GB working set"
+                )
+            } else {
+                format!("{chip} · {unified_memory_gb:.0} GB unified memory")
+            }
+        }
         GpuInfo::None => "none detected".to_string(),
     }
 }
