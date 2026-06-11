@@ -1507,6 +1507,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-hip"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "deepseek-spec",
+ "hip-kernels",
+ "hip-sys",
+ "infer-plan",
+ "infer-seam",
+ "memmap2",
+]
+
+[[package]]
 name = "infer-metal"
 version = "0.1.5"
 dependencies = [
