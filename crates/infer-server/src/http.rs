@@ -9,6 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, State};
+use axum::http::header;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use infer_core::CompletedRequest;
@@ -48,6 +49,7 @@ where
         .route("/v1/chat/completions", post(chat_completions::<E, K>))
         .route("/v1/models", get(list_models::<E, K>))
         .route("/v1/stats", get(stats::<E, K>))
+        .route("/metrics", get(metrics::<E, K>))
         // Long-context prompts (e.g. a ~900K-token needle) serialize to several MB,
         // far over axum's 2 MiB default. Allow up to 256 MiB (a 1M-token prompt is
         // only a handful of MB; the cap stays well under any real DoS concern here).
@@ -79,6 +81,29 @@ where
         .map_err(|_| ApiError::internal("serve lock poisoned"))?
         .counters();
     Ok(Json(StatsResponse::from_counters(counters)))
+}
+
+/// `GET /metrics` — Prometheus text exposition of the same counters `/v1/stats`
+/// serves as JSON (scrape surface for bench/monitoring tooling).
+async fn metrics<E, K>(
+    State(state): State<Arc<HttpState<E, K>>>,
+) -> Result<([(header::HeaderName, &'static str); 1], String), ApiError>
+where
+    E: BackendExecutor + 'static,
+    K: KvPool + 'static,
+{
+    let counters = state
+        .serve
+        .lock()
+        .map_err(|_| ApiError::internal("serve lock poisoned"))?
+        .counters();
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            crate::metrics::PROMETHEUS_CONTENT_TYPE,
+        )],
+        crate::metrics::render_prometheus(&counters, &state.model),
+    ))
 }
 
 async fn completions<E, K>(
