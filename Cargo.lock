@@ -1620,6 +1620,7 @@ dependencies = [
  "infer-plan",
  "infer-seam",
  "qwen3-spec",
+ "qwen35-spec",
  "vulkan-kernels",
  "vulkan-sys",
 ]
