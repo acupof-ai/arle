@@ -40,6 +40,7 @@ use infer_seam::{BackendExecutor, KvPool, PollResult};
 
 mod execution;
 mod http;
+mod metrics;
 pub mod multiproc_relay;
 mod schema;
 mod tokenizer;
