@@ -225,6 +225,13 @@ struct RequestState {
     /// (preempted on a backend with [`infer_seam::BackendExecutor::kv_slot_tier_enabled`]).
     /// Re-admission promotes and resumes decode; `generated_tokens` are kept.
     swap_key: Option<u64>,
+    /// Host KV length captured at demote time, restored verbatim on promote.
+    /// Captured (not derived from `prompt + generated`) because the last
+    /// committed token's KV is not materialized yet — it is the next decode
+    /// step's input — so the materialized length is one short of the token
+    /// count and deriving it would desync host accounting from the restored
+    /// device state.
+    swap_seq_len: usize,
     finish: Option<FinishReason>,
     waiting_hint: WaitingRequestHint,
 }
@@ -248,6 +255,7 @@ impl RequestState {
             prefill_start_pos: 0,
             reused_prefix_pages: Vec::new(),
             swap_key: None,
+            swap_seq_len: 0,
             finish: None,
             waiting_hint: WaitingRequestHint::default(),
         }
@@ -267,6 +275,7 @@ impl RequestState {
         // Store-entry lifetime is the caller's job (drop before reset); the
         // key is cleared so a recomputed request can never promote stale state.
         self.swap_key = None;
+        self.swap_seq_len = 0;
         self.finish = None;
         self.waiting_hint = WaitingRequestHint::default();
         self
@@ -2238,11 +2247,28 @@ mod tests {
         let (&slot, request) = engine.active.iter().next().expect("request active");
         assert!(matches!(request.phase, RequestPhase::Decoding));
         assert_eq!(request.generated_tokens, vec![9]);
+        // Between steps the engine invariant is host seq_len == device
+        // seq_len == the next plan's kv_seq_len; capture it for the
+        // restore-exactness assertion below.
+        let demoted_seq_len = engine.kv.seq_len(slot);
+        assert_eq!(demoted_seq_len, 9, "prompt 8 + the committed token's row");
 
         engine.requeue_preempted_decode(slot);
         let tier = engine.kv_tier_stats();
         assert_eq!(tier.demoted_slots, 1, "whole slot swapped out: {tier:?}");
         assert_eq!(engine.executor.store.len(), 1);
+
+        // One tick: re-admission promotes (restoring EXACTLY the demoted
+        // length) and the resumed decode step appends its one token — host
+        // accounting must line up with the restored device image, not run
+        // one ahead (codex P2 on 6ec31f53).
+        engine.step()?;
+        let (&new_slot, _) = engine.active.iter().next().expect("resumed");
+        assert_eq!(
+            engine.kv.seq_len(new_slot),
+            demoted_seq_len + 1,
+            "restored materialized length + the resumed step's single append"
+        );
 
         engine.run_to_idle()?;
         let done = engine.completed(handle).expect("completed");
