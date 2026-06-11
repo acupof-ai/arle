@@ -407,6 +407,12 @@ FLASHQLA_SCALAR_INPUTS = {
     "num_tokens": ("int32_t", "seq_len"),
     "num_chunks": ("int32_t", "ceildiv_i32(seq_len, 64)"),
     "seq_len": ("int32_t", "seq_len"),
+    # The TileLang DSL parser materializes python alias bindings of dynamic
+    # vars as standalone TIR let-vars that surface as kernel scalar params
+    # (seen: seq_end_idx on 0.1.11). The kernels inline these now; keep the
+    # mappings as a safety net against pass-pipeline re-hoisting.
+    "seq_start_idx": ("int32_t", "0"),
+    "seq_end_idx": ("int32_t", "seq_len"),
 }
 
 FLASHQLA_SPECS = {
