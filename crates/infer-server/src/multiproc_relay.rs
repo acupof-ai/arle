@@ -64,7 +64,7 @@ use serde::{Deserialize, Serialize};
 /// Single-process serving (`world_size == 1`) never installs a broadcaster, so
 /// [`tick_broadcaster_installed`] is false and the default serve path is
 /// byte-identical to before.
-type TickBroadcaster = Box<dyn Fn(u64, Vec<WireRequest>) + Send + Sync>;
+type TickBroadcaster = Box<dyn Fn(u64, Vec<WireRequest>) -> Result<()> + Send + Sync>;
 
 static TICK_BROADCASTER: OnceLock<TickBroadcaster> = OnceLock::new();
 
@@ -89,10 +89,11 @@ pub fn tick_broadcaster_installed() -> bool {
 /// exactly once per engine step, BEFORE the drained submissions are admitted
 /// locally. `seq` is the loop's monotonic tick counter; workers verify
 /// contiguity and treat a gap as a fatal protocol violation.
-pub fn broadcast_tick(seq: u64, requests: Vec<WireRequest>) {
+pub fn broadcast_tick(seq: u64, requests: Vec<WireRequest>) -> Result<()> {
     if let Some(broadcaster) = TICK_BROADCASTER.get() {
-        broadcaster(seq, requests);
+        broadcaster(seq, requests)?;
     }
+    Ok(())
 }
 
 /// Free-port picker. Binds 127.0.0.1:0, reads the assigned port, drops the
