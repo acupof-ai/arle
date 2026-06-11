@@ -159,10 +159,21 @@ choice stays a perf call, not a coverage call.
   GGUF loader in H3 instead of building a quantizer; revisit only if we need a custom
   recipe the ecosystem doesn't ship
 
-**Remaining (the honest gap to "только verification"):** H3 `infer-hip` executor
-(KvPool impl + DSv4 forward orchestration over the eight launchers + GGUF 2-bit
-weight loader + `BackendExecutor`), then on-box: hipcc compile of the kernel set,
-ROCm-vs-Vulkan lane A/B, needle gate, perf license (#78).
+**H3 code WRITTEN 2026-06-11 (`f3f665ad` stage A + `f9e88c7e` stage B):**
+`crates/infer-hip` — GGUF v2/v3 parser (real-file tested), CPU dequant ports
+(F16/BF16/Q8_0/Q2K/Q4K/Q5K/Q6K), GGUF→`DeepSeekV4Config` mapping with the real
+deepseek4 keys + 36 per-layer tensor names, residency planner (matmul roles must
+land on a residency with a HIP gemv — fail-loud), `Dsv4SlotShape`+`HipKvPool`,
+`HipDsv4Model` forward mirroring dsv4.rs's fallback call order (incl. per-layer
+RoPE theta switch; mutated-slot-buffer enumeration encoded as a test), seam
+`BackendExecutor` + `load_dsv4_gguf`. 53 unit tests green on Mac; hip-kernels
+compiles 10 csrc files + mhc/basic-op extern surface.
+
+**Remaining = on-box only (the true "only verification" set):** hipcc compile of
+the kernel set against real ROCm headers (shim bf16/fp8 overload check), dequant
+golden vs llama.cpp, ROCm-vs-Vulkan lane A/B, needle gate, first tok/s entry +
+perf license (#78). One non-box item deferred: batched-prefill mmq (sequential
+per-token prefill is the licensed MVP).
 
 ## §3 Kept / killed kernel-source candidates
 
