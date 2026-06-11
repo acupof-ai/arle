@@ -701,8 +701,18 @@ impl Qwen35Model {
             .rope_cache_len_hint()
             .unwrap_or(DEFAULT_ROPE_CACHE_LEN)
             .max(DEFAULT_ROPE_CACHE_LEN);
+        ensure!(
+            max_seq_len <= rope_len,
+            "Qwen3.5 max_seq_len ({max_seq_len}) exceeds the RoPE cache length ({rope_len}); \
+             positions beyond the table would read out of bounds"
+        );
+        // PARTIAL RoPE: the table must be built over `rotary_dim` (= head_dim ×
+        // partial_rotary_factor, 64 on Qwen3.6), not head_dim — the HD256 prep
+        // kernel indexes `cos_cache[pos * rotary_dim + d]` and expects inv_freq
+        // computed over rotary_dim dims (`precompute_rope` is generic over its
+        // dim arg and emits the half-duplicated stride-dim layout it reads).
         let (cos_cache, sin_cache) =
-            crate::ops::precompute_rope(&ctx, m.head_dim, rope_len, m.rope_theta, None)?;
+            crate::ops::precompute_rope(&ctx, m.rotary_dim, rope_len, m.rope_theta, None)?;
         ctx.sync()?;
 
         Ok(Self {
@@ -1648,13 +1658,20 @@ impl Qwen35Model {
             let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g3) = normed_out.data.device_ptr_mut(&self.ctx.stream);
             // SAFETY: gdr_out/norm/z/out valid on ctx.stream; per-head layout from config.
+            // The kernel launches exactly `num_heads` blocks, each normalizing one
+            // flat `[val_dim]` slice at `blockIdx.x * val_dim` — gdr_out/z are
+            // `[seq_len, Vh*Vd]` row-major, so the grid must cover all
+            // seq_len*Vh (token, head) slices, not just token 0. `weight[tid]`
+            // is a per-[Vd] broadcast (no blockIdx dependence), so the
+            // extension is exact (the monolith's `rms_norm_gated_batch_into`
+            // passed `seq_len * num_heads` identically).
             unsafe {
                 ffi::rms_norm_gated_cuda(
                     x_ptr as *const ffi::Half,
                     w_ptr as *const f32,
                     gate_ptr as *const ffi::Half,
                     o_ptr as *mut ffi::Half,
-                    self.local_linear_v_heads as i32,
+                    (self.local_linear_v_heads * seq_len) as i32,
                     c.linear_value_head_dim as i32,
                     c.rms_norm_eps,
                     self.ctx.stream.cu_stream(),

@@ -58,22 +58,45 @@ __global__ void conv1d_prefill_kernel(
     float silu_out = sum_bf16 / (1.0f + expf(-sum_bf16));
     out_seq[t * num_channels + c] = __float2bfloat16(silu_out);
 
-    // Last (state_width) tokens update conv_state
-    // Only the last thread for each channel updates state
-    if (t == seq_len - 1) {
-        float old_state[4];
-        for (int i = 0; i < state_width; i++) {
-            old_state[i] = __bfloat162float(conv_state[c * state_width + i]);
-        }
-        for (int i = 0; i < state_width; i++) {
-            int src_t = seq_len - state_width + i;
-            if (src_t >= 0) {
-                conv_state[c * state_width + i] = x_seq[src_t * num_channels + c];
-            } else {
-                int state_idx = state_width + src_t;  // maps [-state_width, -1] → [0, state_width-1]
-                conv_state[c * state_width + i] =
-                    state_idx >= 0 ? __float2bfloat16(old_state[state_idx]) : __float2bfloat16(0.0f);
-            }
+    // NOTE: the conv ring update lives in conv1d_state_update_kernel, launched
+    // AFTER this kernel on the same stream. Updating it here raced: threads at
+    // t < kernel_size-1 READ conv_state (the previous chunk's tail) while the
+    // t == seq_len-1 thread WROTE the new ring, with no grid-level ordering —
+    // under chunked prefill early tokens could convolve against the CURRENT
+    // chunk's tail instead of the previous chunk's.
+}
+
+// ============================================================================
+// State-update kernel: rebuild the conv ring from the chunk tail. One thread
+// per channel; reproduces the exact ring semantics of the writer branch that
+// previously lived in conv1d_prefill_kernel (including seq_len < kernel-1,
+// where the new ring = shifted old state ++ all of x_seq — old state is staged
+// through registers before the in-place overwrite).
+// ============================================================================
+__global__ void conv1d_state_update_kernel(
+    const __nv_bfloat16* __restrict__ x_seq,
+    __nv_bfloat16* __restrict__ conv_state,
+    int num_channels,
+    int seq_len,
+    int kernel_size
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= num_channels) return;
+
+    int state_width = kernel_size - 1;
+
+    float old_state[4];
+    for (int i = 0; i < state_width; i++) {
+        old_state[i] = __bfloat162float(conv_state[c * state_width + i]);
+    }
+    for (int i = 0; i < state_width; i++) {
+        int src_t = seq_len - state_width + i;
+        if (src_t >= 0) {
+            conv_state[c * state_width + i] = x_seq[src_t * num_channels + c];
+        } else {
+            int state_idx = state_width + src_t;  // maps [-state_width, -1] → [0, state_width-1]
+            conv_state[c * state_width + i] =
+                state_idx >= 0 ? __float2bfloat16(old_state[state_idx]) : __float2bfloat16(0.0f);
         }
     }
 }
@@ -94,6 +117,19 @@ cudaError_t conv1d_prefill_cuda(
     int blocks = (total + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
     conv1d_prefill_kernel<<<blocks, CONV1D_BLOCK, 0, stream>>>(
         x_seq, conv_weight, conv_state, out_seq, num_channels, seq_len, kernel_size
+    );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        return err;
+    }
+    // Ring update only after every (channel, position) thread has consumed the
+    // previous state (same-stream ordering). Launched here, inside the
+    // launcher, so every consumer — including the per-request delegation in
+    // conv1d_prefill_packed_batch_cuda — keeps the original FFI contract
+    // "state is advanced when the call's stream work completes".
+    int state_blocks = (num_channels + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
+    conv1d_state_update_kernel<<<state_blocks, CONV1D_BLOCK, 0, stream>>>(
+        x_seq, conv_state, num_channels, seq_len, kernel_size
     );
     return cudaGetLastError();
 }

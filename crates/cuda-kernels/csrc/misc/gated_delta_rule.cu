@@ -80,6 +80,10 @@ __global__ void gated_delta_rule_decode_kernel(
         float total = warp_norms[0] + warp_norms[1] + warp_norms[2] + warp_norms[3];
         smem_norm[0] = rsqrtf(total + 1e-12f);
     }
+    // Thread 0 above reads warp_norms[0..3] (q partials) while warps 1-3,
+    // already past the previous barrier, would otherwise overwrite them with
+    // k partials below — order the consumption before the overwrite.
+    __syncthreads();
 
     float k_sq = (j_slice == 0) ? k_val * k_val : 0.0f;
     k_sq = warp_reduce_sum(k_sq);
@@ -188,6 +192,11 @@ cudaError_t gated_delta_rule_decode_cuda(
     int val_dim,
     cudaStream_t stream
 ) {
+    // Fixed-size shared/thread tiling assumes the GDR_* dims (same guard as
+    // gated_delta_rule_prefill_recurrent_cuda).
+    if (key_dim != GDR_KEY_DIM || val_dim != GDR_VAL_DIM) {
+        return cudaErrorInvalidValue;
+    }
     // One block per value head, 512 threads (128 val_dim × 4 j_slices)
     gated_delta_rule_decode_kernel<<<num_value_heads, GDR_BLOCK_DIM, 0, stream>>>(
         qkv, b_proj, a_proj, dt_bias, A_log,
@@ -258,6 +267,10 @@ __global__ void gated_delta_rule_prefill_recurrent_kernel(
             float total = warp_norms[0] + warp_norms[1] + warp_norms[2] + warp_norms[3];
             smem_norm[0] = rsqrtf(total + 1e-12f);
         }
+        // Same q-vs-k warp_norms ordering hazard as the decode kernel: the
+        // q-partial read by thread 0 must complete before warps 1-3 overwrite
+        // warp_norms with k partials.
+        __syncthreads();
 
         float k_sq = (j_slice == 0) ? k_val * k_val : 0.0f;
         k_sq = warp_reduce_sum(k_sq);

@@ -267,6 +267,65 @@ impl Qwen35LayerTensorNames {
 struct RopeParameters {
     rope_theta: f32,
     partial_rotary_factor: f32,
+    /// HF `rope_parameters.rope_type` (newer exports; older ones omit it).
+    /// `None` / `"default"` ⇒ vanilla RoPE. Scaled types populate
+    /// [`Qwen35Config::rope_scaling`] so downstream guards
+    /// (e.g. infer-cuda's `ensure!(rope_scaling.is_none())`) stay live.
+    #[serde(default)]
+    rope_type: Option<String>,
+    #[serde(default)]
+    factor: Option<f32>,
+    #[serde(default)]
+    original_max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    beta_fast: Option<f32>,
+    #[serde(default)]
+    beta_slow: Option<f32>,
+    #[serde(default)]
+    attention_factor: Option<f32>,
+    #[serde(default)]
+    mscale: Option<f32>,
+}
+
+impl RopeParameters {
+    /// Resolve the long-context scaling config from the flat HF
+    /// `rope_parameters` fields. `rope_type` absent or `"default"` ⇒ `None`
+    /// (behavior unchanged for vanilla checkpoints); unsupported types are a
+    /// loud error rather than a silent drop.
+    fn rope_scaling(&self) -> Result<Option<RopeScalingConfig>> {
+        match self.rope_type.as_deref() {
+            None | Some("default") => Ok(None),
+            Some("yarn") => {
+                let factor = self.factor.ok_or(Qwen35ConfigError::InvalidConfig(
+                    "rope_parameters.rope_type=yarn requires `factor`",
+                ))?;
+                let original_max_position_embeddings = self
+                    .original_max_position_embeddings
+                    .ok_or(Qwen35ConfigError::InvalidConfig(
+                        "rope_parameters.rope_type=yarn requires \
+                         `original_max_position_embeddings`",
+                    ))?;
+                Ok(Some(RopeScalingConfig::Yarn {
+                    factor,
+                    original_max_position_embeddings,
+                    beta_fast: self.beta_fast.unwrap_or_else(default_yarn_beta_fast),
+                    beta_slow: self.beta_slow.unwrap_or_else(default_yarn_beta_slow),
+                    attention_factor: self.attention_factor,
+                    mscale: self.mscale.unwrap_or_else(default_yarn_mscale),
+                }))
+            }
+            Some("linear") => {
+                let factor = self.factor.ok_or(Qwen35ConfigError::InvalidConfig(
+                    "rope_parameters.rope_type=linear requires `factor`",
+                ))?;
+                Ok(Some(RopeScalingConfig::Linear { factor }))
+            }
+            Some(_) => Err(Qwen35ConfigError::InvalidConfig(
+                "unsupported rope_parameters.rope_type (expected \
+                 default / yarn / linear)",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -637,7 +696,14 @@ impl Qwen35Config {
     }
 
     pub fn lm_head_tensor_name(&self) -> &'static str {
-        self.embed_tokens_tensor_name()
+        if self.tie_word_embeddings {
+            self.embed_tokens_tensor_name()
+        } else {
+            // Untied checkpoints (Qwen3.6-35B-A3B et al.) store the head as a
+            // TOP-LEVEL `lm_head.weight` — no `model.language_model` prefix
+            // (`shard_for_global_tensor` already matches this literal).
+            "lm_head.weight"
+        }
     }
 
     /// Sharding for non-layer ("global") tensors. Returns `None` for any
@@ -690,6 +756,7 @@ impl Qwen35Config {
     fn from_text_config(text: TextConfig, stop_token_ids: Vec<u32>) -> Result<Self> {
         let rotary_dim =
             (text.head_dim as f32 * text.rope_parameters.partial_rotary_factor) as usize;
+        let rope_scaling = text.rope_parameters.rope_scaling()?;
 
         // Merge nested `moe_config` sub-block (if present) on top of the flat
         // text_config MoE fields. Nested fields override flat ones only when
@@ -769,10 +836,7 @@ impl Qwen35Config {
             linear_value_head_dim,
             linear_conv_kernel_dim,
             rope_theta: rope_parameters.rope_theta,
-            // Phase 1a: rope_scaling not yet read from JSON; the RawConfig
-            // → from_text_config path will be wired in Phase 1b. Default
-            // to None preserves existing behavior.
-            rope_scaling: None,
+            rope_scaling,
             partial_rotary_factor: rope_parameters.partial_rotary_factor,
             rotary_dim,
             rope_cache_len_hint: max_position_embeddings.or(context_length).or(seq_length),
@@ -1102,6 +1166,84 @@ mod tests {
         let json = json.replace("\"tie_word_embeddings\": true,", "");
         let config = Qwen35Config::from_json_str(&json).unwrap();
         assert!(!config.tie_word_embeddings);
+    }
+
+    #[test]
+    fn lm_head_tensor_name_follows_tie_word_embeddings() {
+        // Tied (classic Qwen3.5): head shares the embedding tensor.
+        let tied = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        assert!(tied.tie_word_embeddings);
+        assert_eq!(
+            tied.lm_head_tensor_name(),
+            "model.language_model.embed_tokens.weight"
+        );
+
+        // Untied (Qwen3.6-35B-A3B production checkpoint): TOP-LEVEL
+        // `lm_head.weight`, no `model.language_model` prefix.
+        let untied = Qwen35Config::from_json_str(QWEN36_MOE_FLAT_JSON).unwrap();
+        assert!(!untied.tie_word_embeddings);
+        assert_eq!(untied.lm_head_tensor_name(), "lm_head.weight");
+        // The sharding contract must recognise the same literal.
+        assert_eq!(
+            untied.shard_for_global_tensor(untied.lm_head_tensor_name()),
+            Some(Shard::VocabParallel { dim: 0 })
+        );
+    }
+
+    #[test]
+    fn rope_type_default_or_absent_keeps_rope_scaling_none() {
+        // Absent rope_type (all existing fixtures).
+        let absent = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        assert_eq!(absent.rope_scaling, None);
+
+        // Explicit "default".
+        let json = NESTED_CONFIG_JSON.replace(
+            "\"rope_theta\": 1000000.0,",
+            "\"rope_theta\": 1000000.0,\n                \"rope_type\": \"default\",",
+        );
+        let explicit = Qwen35Config::from_json_str(&json).unwrap();
+        assert_eq!(explicit.rope_scaling, None);
+    }
+
+    #[test]
+    fn rope_type_yarn_populates_rope_scaling() {
+        let json = NESTED_CONFIG_JSON.replace(
+            "\"rope_theta\": 1000000.0,",
+            "\"rope_theta\": 1000000.0,\n                \
+             \"rope_type\": \"yarn\",\n                \
+             \"factor\": 4.0,\n                \
+             \"original_max_position_embeddings\": 32768,",
+        );
+        let config = Qwen35Config::from_json_str(&json).unwrap();
+        assert_eq!(
+            config.rope_scaling,
+            Some(RopeScalingConfig::Yarn {
+                factor: 4.0,
+                original_max_position_embeddings: 32768,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                attention_factor: None,
+                mscale: 1.0,
+            })
+        );
+    }
+
+    #[test]
+    fn rope_type_yarn_missing_factor_is_rejected() {
+        let json = NESTED_CONFIG_JSON.replace(
+            "\"rope_theta\": 1000000.0,",
+            "\"rope_theta\": 1000000.0,\n                \"rope_type\": \"yarn\",",
+        );
+        assert!(Qwen35Config::from_json_str(&json).is_err());
+    }
+
+    #[test]
+    fn rope_type_unsupported_is_rejected() {
+        let json = NESTED_CONFIG_JSON.replace(
+            "\"rope_theta\": 1000000.0,",
+            "\"rope_theta\": 1000000.0,\n                \"rope_type\": \"longrope\",",
+        );
+        assert!(Qwen35Config::from_json_str(&json).is_err());
     }
 
     #[test]
