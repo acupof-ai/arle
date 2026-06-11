@@ -49,7 +49,7 @@ pub use loaded::LoadedInferenceEngine;
 /// world (DSv4 + Qwen3.5/3.6 MoE). Consumed by `cli::serve_multiproc`.
 #[cfg(feature = "cuda")]
 pub use loaded::cuda_model_takes_multiproc_serve;
-pub use serve::{ServeHttpOptions, ServeSpecOptions, ServeSpecType, serve_http};
+pub use serve::{ServeHttpOptions, ServeKvSsdOptions, ServeSpecOptions, ServeSpecType, serve_http};
 pub use serve_engine::ServeInferenceEngine;
 // DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so
 // the `cli` coordinator/worker scaffold (`cli::serve_multiproc`) reaches it at
