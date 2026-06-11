@@ -167,18 +167,23 @@ pub(crate) fn deepgemm_contig_rows_cap(total_routes: usize, local_experts: usize
 /// bridge; requires a binary built with `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`,
 /// preflight fails loud otherwise).
 ///
-/// Default OFF for now: the hand-kernel path stays the production default
-/// until the pod A/B licenses the flip — correct-inference gate (smoke x3
-/// same-config consistency + needle retrieval; NOT byte-identity, MoE
-/// atomic-scatter is non-deterministic) plus a wall-clock perf license per
-/// the bench spec. Read at LOAD time as well: the loader builds the
-/// contiguous grouped-B weight caches (and drops the per-expert copies) only
-/// when set, so flipping requires a process restart.
+/// Default ON (licensed 2026-06-11 pod A/B, warm JIT cache, n=3 each):
+/// hybrid dispatch keeps decode on the hand kernels (40.86 vs 40.46 tok/s,
+/// neutral) and puts prefill on DeepGEMM tensor cores — needle 3k wall
+/// 9.10 -> 2.32 s (-74.5%); smoke x3 consistent + needle PASS both arms.
+/// First-ever run on a box pays the DeepGEMM JIT compile into
+/// `~/.deep_gemm` (~3.7 s across needle shapes, once per cache lifetime).
+/// `ARLE_QWEN35_DEEPGEMM=0` restores the hand-kernel-only path. Read at
+/// LOAD time as well: the loader builds the contiguous grouped-B weight
+/// caches (and drops the per-expert copies) only when enabled, so flipping
+/// requires a process restart. Requires a binary built with
+/// `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`; without it the preflight fails
+/// loud and `=0` is the operator's escape hatch.
 #[cfg(feature = "cuda")]
 pub(crate) fn qwen35_deepgemm_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ARLE_QWEN35_DEEPGEMM").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
     )
 }
 

@@ -1,8 +1,13 @@
 # Qwen3.5/3.6 whole-decode-step CUDA graph (env-gated OFF)
 
 **Date:** 2026-06-11. **Backend:** CUDA, Qwen3.6-35B-A3B, H20, TP=1 only.
-**Status: pending-remote** — same-binary `ARLE_QWEN35_DECODE_GRAPH=0/1` flip
-on the pod; license ≥ +10% tok/s + needle gate + replay-counter evidence.
+**Status: measured BELOW BAR — default stays OFF.** Pod A/B (warm, n=3):
+43.11 vs 40.86 tok/s = **+5.5%** (σ≈0.07), needle 2.24 s PASS. Second
+consecutive launch-formula over-prediction (predicted +30–75%): with host
+issue removed, ~23 ms/token is GPU-timeline — ~600 N=1 GEMMs' per-kernel
+GPU-side fixed cost dominates. The structural lever is BATCHED decode
+(more rows per GEMM), which also reshapes the graph's value — revisit the
+default after batching lands.
 
 ## Context
 
