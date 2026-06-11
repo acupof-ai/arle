@@ -113,7 +113,7 @@ mod classify_tests {
     }
 }
 
-#[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
+#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
 mod backend {
     use anyhow::Result;
     use infer_core::SchedulerConfig;
@@ -131,6 +131,8 @@ mod backend {
 
     #[cfg(feature = "cuda")]
     use infer_cuda::{CudaExecutor, CudaKvPool};
+    #[cfg(feature = "hip")]
+    use infer_hip::{HipDsv4Executor, HipKvPool};
     #[cfg(feature = "metal")]
     use infer_metal::{MetalExecutor, MetalKvPool};
     // The CPU path reuses infer-metal's feature-free placeholder executor + pool.
@@ -156,6 +158,10 @@ mod backend {
         /// real forward is lead-owned and not yet runnable.
         #[cfg(feature = "cuda")]
         Cuda(ServeInferenceEngine<CudaExecutor, CudaKvPool>),
+        /// HIP backend (AMD ROCm, DSv4 GGUF). Host-side wiring typechecks
+        /// everywhere; the device forward runs on a ROCm box (pending-remote).
+        #[cfg(feature = "hip")]
+        Hip(ServeInferenceEngine<HipDsv4Executor, HipKvPool>),
         /// Portable CPU backend: the placeholder `MetalExecutor` over the real
         /// host `MetalKvPool` (no MLX, no CUDA). Smoke / CI.
         #[cfg(all(feature = "cpu", not(feature = "metal")))]
@@ -189,7 +195,18 @@ mod backend {
                 return Self::load_cuda(model_path, enable_cuda_graph, &config);
             }
 
-            #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "cpu"))]
+            #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "hip"))]
+            {
+                let _ = enable_cuda_graph;
+                return Self::load_hip(model_path, &config);
+            }
+
+            #[cfg(all(
+                not(feature = "metal"),
+                not(feature = "cuda"),
+                not(feature = "hip"),
+                feature = "cpu"
+            ))]
             {
                 let _ = enable_cuda_graph;
                 return Self::load_cpu(model_path, &config);
@@ -204,6 +221,8 @@ mod backend {
                 Self::Metal(_) => "metal",
                 #[cfg(feature = "cuda")]
                 Self::Cuda(_) => "cuda",
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => "hip",
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => "cpu",
             }
@@ -225,6 +244,10 @@ mod backend {
                 Self::Metal(_) => {
                     anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
                 }
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => {
+                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
+                }
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => {
                     anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
@@ -243,6 +266,8 @@ mod backend {
                 Self::Cuda(engine) => engine.offload_engine_weights(),
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
             }
@@ -256,6 +281,8 @@ mod backend {
                 Self::Cuda(engine) => engine.reload_engine_weights(),
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
             }
@@ -284,6 +311,11 @@ mod backend {
                 Self::Metal(_) => {
                     let _ = update;
                     anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is Metal")
+                }
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => {
+                    let _ = update;
+                    anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is HIP")
                 }
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => {
@@ -334,6 +366,18 @@ mod backend {
             )))
         }
 
+        #[cfg(feature = "hip")]
+        fn load_hip(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
+            // HIP DSv4 GGUF load. Shares the engine builder with `router_hip`
+            // via `hip_serve_handle`, mirroring the CUDA `cuda_serve_handle`
+            // split (Metal instead reuses an infer-server facade; infer-server
+            // has no HIP code, so the handle is built here).
+            let (serve, tokenizer, model_id) = hip_serve_handle(model_path, config)?;
+            Ok(Self::Hip(ServeInferenceEngine::new(
+                model_id, tokenizer, serve,
+            )))
+        }
+
         #[cfg(all(feature = "cpu", not(feature = "metal")))]
         fn load_cpu(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
             use infer_server::OpenAiTokenizer;
@@ -379,7 +423,18 @@ mod backend {
             return router_cuda(model_path, enable_cuda_graph, &config);
         }
 
-        #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "cpu"))]
+        #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "hip"))]
+        {
+            let _ = enable_cuda_graph;
+            return router_hip(model_path, &config);
+        }
+
+        #[cfg(all(
+            not(feature = "metal"),
+            not(feature = "cuda"),
+            not(feature = "hip"),
+            feature = "cpu"
+        ))]
         {
             let _ = enable_cuda_graph;
             return router_cpu(model_path, &config);
@@ -672,6 +727,98 @@ mod backend {
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
+    /// Resolve `model_path` to the DSv4 `.gguf` checkpoint the HIP backend
+    /// loads: either the file itself or a directory containing exactly one
+    /// `*.gguf`. No HF-repo resolution (that is the Metal facade's surface);
+    /// a plain file-path check with a clear error is the MVP contract.
+    #[cfg(feature = "hip")]
+    fn resolve_hip_gguf_path(model_path: &str) -> Result<std::path::PathBuf> {
+        use anyhow::{Context, bail, ensure};
+
+        let path = std::path::Path::new(model_path);
+        if path.is_file() {
+            ensure!(
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf")),
+                "HIP backend serves GGUF checkpoints only; {model_path} is not a .gguf file"
+            );
+            return Ok(path.to_path_buf());
+        }
+        if path.is_dir() {
+            let mut ggufs: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+                .with_context(|| format!("read model dir {model_path}"))?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+                })
+                .collect();
+            return match ggufs.len() {
+                1 => Ok(ggufs.remove(0)),
+                0 => bail!(
+                    "no .gguf file in {model_path}; the HIP backend serves GGUF checkpoints only"
+                ),
+                n => bail!("{n} .gguf files in {model_path}; pass the .gguf file path explicitly"),
+            };
+        }
+        bail!(
+            "HIP model path {model_path} not found \
+             (expected a .gguf file or a directory containing exactly one)"
+        )
+    }
+
+    /// Shared HIP engine builder for [`LoadedInferenceEngine::load_hip`] and
+    /// [`router_hip`], mirroring [`cuda_serve_handle`]. Resolves the `.gguf`
+    /// checkpoint + sibling `tokenizer.json` (the GGUF's directory), then
+    /// spawns the `ServeHandle` over [`infer_hip::load_dsv4_gguf`], which
+    /// returns the matched executor + host KV pool pair. DSv4 is a slot-arena
+    /// model: per-slot depth is the per-request `max_total_tokens` budget.
+    #[cfg(feature = "hip")]
+    fn hip_serve_handle(
+        model_path: &str,
+        config: &EngineLoadConfig,
+    ) -> Result<(
+        ServeHandle<HipDsv4Executor, HipKvPool>,
+        infer_server::OpenAiTokenizer,
+        String,
+    )> {
+        use infer_server::OpenAiTokenizer;
+
+        let gguf_path = resolve_hip_gguf_path(model_path)?;
+        let tokenizer_dir = gguf_path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map_or_else(
+                || std::path::PathBuf::from("."),
+                std::path::Path::to_path_buf,
+            );
+        let tokenizer = OpenAiTokenizer::from_model_dir(&tokenizer_dir)?;
+        let model_id = crate::serve_engine::model_id_from_path(model_path);
+
+        let mut scheduler = config.scheduler_config();
+        // HIP serves DSv4 only: sliding-window ring + compressor running state
+        // cannot honor a prefix-cache `start_pos > 0`, exactly like the CUDA
+        // DSv4 arm (`build_cuda_engine`) — disable cross-request prefix reuse.
+        scheduler.enable_prefix_cache = false;
+        let num_slots = config.num_slots;
+        let max_seq_len = config.max_total_tokens;
+        let serve = ServeHandle::spawn_with_engine_builder(move || {
+            let (executor, kv) = infer_hip::load_dsv4_gguf(&gguf_path, num_slots, max_seq_len)?;
+            Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+        })?;
+        Ok((serve, tokenizer, model_id))
+    }
+
+    /// HIP serve router. Builds the same `ServeHandle` as
+    /// [`LoadedInferenceEngine::load_hip`] via [`hip_serve_handle`], then wraps
+    /// it in [`infer_server::openai_router`]. Mirrors [`router_cuda`].
+    #[cfg(feature = "hip")]
+    fn router_hip(model_path: &str, config: &EngineLoadConfig) -> Result<axum::Router> {
+        let (serve, tokenizer, model_id) = hip_serve_handle(model_path, config)?;
+        Ok(infer_server::openai_router(serve, tokenizer, model_id))
+    }
+
     /// Portable CPU serve router: the placeholder `MetalExecutor` over the real
     /// host `MetalKvPool` (no MLX, no CUDA), wrapped in
     /// [`infer_server::openai_router`]. Mirrors
@@ -695,6 +842,8 @@ mod backend {
                 Self::Metal(engine) => engine.model_id(),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.model_id(),
+                #[cfg(feature = "hip")]
+                Self::Hip(engine) => engine.model_id(),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.model_id(),
             }
@@ -706,6 +855,8 @@ mod backend {
                 Self::Metal(engine) => engine.complete(req),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.complete(req),
+                #[cfg(feature = "hip")]
+                Self::Hip(engine) => engine.complete(req),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.complete(req),
             }
@@ -721,6 +872,8 @@ mod backend {
                 Self::Metal(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.complete_stream(req, tx),
+                #[cfg(feature = "hip")]
+                Self::Hip(engine) => engine.complete_stream(req, tx),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.complete_stream(req, tx),
             }
@@ -732,6 +885,8 @@ mod backend {
                 Self::Metal(engine) => engine.tokenize(text),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.tokenize(text),
+                #[cfg(feature = "hip")]
+                Self::Hip(engine) => engine.tokenize(text),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.tokenize(text),
             }
@@ -743,6 +898,8 @@ mod backend {
                 Self::Metal(engine) => engine.telemetry(),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.telemetry(),
+                #[cfg(feature = "hip")]
+                Self::Hip(engine) => engine.telemetry(),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.telemetry(),
             }
@@ -752,9 +909,9 @@ mod backend {
 
 #[cfg(feature = "cuda")]
 pub use backend::CudaWorkerEngine;
-#[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
+#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
 pub use backend::LoadedInferenceEngine;
 #[cfg(feature = "cuda")]
 pub use backend::cuda_model_takes_multiproc_serve;
-#[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
+#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
 pub(crate) use backend::router_for_backend;

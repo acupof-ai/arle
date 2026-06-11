@@ -15,6 +15,9 @@ cuda = ["infer-api/cuda", "train/cuda", "autograd/cuda"]
 no-cuda = ["infer-api/no-cuda", "train/no-cuda", "autograd/no-cuda"]
 cpu = ["infer-api/cpu"]
 metal = ["infer-api/metal", "train/metal", "autograd/metal"]
+# HIP backend (AMD ROCm, DSv4 GGUF). Pair with `no-cuda` off-box; train/autograd
+# have no HIP code, so only infer-api forwards.
+hip = ["infer-api/hip"]
 nccl = ["cuda", "infer-api/nccl"]
 deepep = ["nccl", "infer-api/deepep"]
 

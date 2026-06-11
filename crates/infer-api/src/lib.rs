@@ -37,7 +37,7 @@ mod types;
 #[cfg(feature = "cuda")]
 pub use loaded::CudaWorkerEngine;
 pub use loaded::EngineLoadConfig;
-#[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
+#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
 pub use loaded::LoadedInferenceEngine;
 /// Multiproc-serve spawn gate: which CUDA checkpoints join the env-driven TP
 /// world (DSv4 + Qwen3.5/3.6 MoE). Consumed by `cli::serve_multiproc`.

@@ -95,6 +95,8 @@ no-cuda = ["cli/no-cuda"]
 cpu = ["cli/cpu"]
 # Metal backend via mlx-sys (Apple Silicon). Pair with `no-cuda`.
 metal = ["cli/metal"]
+# HIP backend via infer-hip (AMD ROCm, DSv4 GGUF). Pair with `no-cuda` off-box.
+hip = ["cli/hip"]
 # NCCL FFI for multi-GPU collectives. Implies `cuda`.
 # Forwards through `cli` → `infer-api` → `infer-cuda` → `cuda-kernels`.
 nccl = ["cuda", "cli/nccl"]
