@@ -169,6 +169,13 @@ pub fn qwen35_kernel_for_launcher(kind: Qwen35LauncherKind) -> vulkan_kernels::K
 }
 
 #[cfg(feature = "vulkan")]
+pub fn qwen35_full_attention_spec(
+    config: &qwen35_spec::Qwen35Config,
+) -> vulkan_kernels::FlashAttentionSpec {
+    vulkan_kernels::FlashAttentionSpec::f32_f16(config.head_dim as u32)
+}
+
+#[cfg(feature = "vulkan")]
 pub fn qwen35_forward_kernel_sequence(
     layer_types: &[qwen35_spec::LayerType],
 ) -> Vec<vulkan_kernels::Kernel> {
@@ -245,6 +252,43 @@ mod tests {
     use super::*;
     use qwen35_spec::LayerType;
 
+    fn qwen35_config() -> qwen35_spec::Qwen35Config {
+        qwen35_spec::Qwen35Config::from_json_str(
+            r#"{
+                "text_config": {
+                    "hidden_size": 512,
+                    "intermediate_size": 1024,
+                    "num_hidden_layers": 4,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 2,
+                    "head_dim": 256,
+                    "vocab_size": 1000,
+                    "rms_norm_eps": 1e-6,
+                    "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+                    "linear_conv_kernel_dim": 4,
+                    "linear_key_head_dim": 128,
+                    "linear_num_key_heads": 16,
+                    "linear_num_value_heads": 32,
+                    "linear_value_head_dim": 128,
+                    "rope_parameters": {
+                        "rope_theta": 1000000.0,
+                        "partial_rotary_factor": 1.0
+                    },
+                    "eos_token_id": 248044,
+                    "bos_token_id": 248000,
+                    "tie_word_embeddings": false,
+                    "max_position_embeddings": 32768,
+                    "num_experts": 8,
+                    "num_experts_per_tok": 2,
+                    "moe_intermediate_size": 256,
+                    "shared_expert_intermediate_size": 512,
+                    "decoder_sparse_step": 1
+                }
+            }"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn qwen35_three_linear_one_full_pattern_is_pinned() {
         let layers = [
@@ -301,37 +345,7 @@ mod tests {
 
     #[test]
     fn qwen35_linear_state_shape_uses_conv_kernel_minus_one() {
-        let cfg = qwen35_spec::Qwen35Config::from_json_str(
-            r#"{
-                "architectures": ["Qwen3MoeForCausalLM"],
-                "model_type": "qwen3_moe",
-                "vocab_size": 1000,
-                "hidden_size": 512,
-                "intermediate_size": 1024,
-                "num_hidden_layers": 4,
-                "num_attention_heads": 16,
-                "num_key_value_heads": 2,
-                "head_dim": 256,
-                "hidden_act": "silu",
-                "rms_norm_eps": 1e-6,
-                "max_position_embeddings": 32768,
-                "rope_theta": 1000000.0,
-                "tie_word_embeddings": false,
-                "num_experts": 8,
-                "num_experts_per_tok": 2,
-                "moe_intermediate_size": 256,
-                "shared_expert_intermediate_size": 512,
-                "decoder_sparse_step": 1,
-                "first_k_dense_replace": 0,
-                "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
-                "linear_num_key_heads": 16,
-                "linear_num_value_heads": 32,
-                "linear_key_head_dim": 128,
-                "linear_value_head_dim": 128,
-                "linear_conv_kernel_dim": 4
-            }"#,
-        )
-        .unwrap();
+        let cfg = qwen35_config();
         let shape = linear_state_shape(&cfg);
         assert_eq!(shape.recurrent_f32, 32 * 128 * 128);
         assert_eq!(shape.conv_bf16, (2 * 16 * 128 + 32 * 128) * 3);
@@ -352,5 +366,17 @@ mod tests {
             qwen35_kernel_for_launcher(Qwen35LauncherKind::FullAttentionHd256),
             vulkan_kernels::Kernel::FlashAttn
         );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn qwen35_full_attention_spec_uses_config_head_dim() {
+        let cfg = qwen35_config();
+        let spec = qwen35_full_attention_spec(&cfg);
+        assert_eq!(spec.specialization_u32().len(), 16);
+        assert_eq!(spec.specialization_u32()[3], (3, 256));
+        assert_eq!(spec.specialization_u32()[4], (4, 256));
+        assert_eq!(spec.specialization_u32()[12], (12, 1));
+        assert_eq!(spec.specialization_u32()[14], (14, 2));
     }
 }

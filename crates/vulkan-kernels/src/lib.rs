@@ -91,7 +91,24 @@ pub enum Kernel {
 }
 
 const SPEC_WORKGROUP_32: &[(u32, u32)] = &[(0, 32)];
-const SPEC_FLASH_ATTN_WORKGROUP: &[(u32, u32)] = &[(0, 128)];
+const SPEC_FLASH_ATTN_F32_F16_HD256: &[(u32, u32)] = &[
+    (0, 128),
+    (1, 1),
+    (2, 64),
+    (3, 256),
+    (4, 256),
+    (5, 0),
+    (6, 8),
+    (7, 1),
+    (8, 32),
+    (9, 0),
+    (10, 0),
+    (11, 0),
+    (12, 1),
+    (13, 1),
+    (14, 2),
+    (15, 2),
+];
 const SPEC_MMVQ_IQ2_XXS: &[(u32, u32)] = &[(0, 32), (1, 4), (2, 1)];
 const SPEC_MMVQ_Q2_K: &[(u32, u32)] = &[(0, 32), (1, 2), (2, 1)];
 const SPEC_GEMV_K_Q8_1: &[(u32, u32)] = &[(0, 32), (1, 1), (2, 1)];
@@ -170,7 +187,7 @@ impl Kernel {
             Kernel::QuantizeQ8_1 => SPEC_WORKGROUP_32,
             Kernel::RmsNorm => SPEC_RMS_NORM_MUL,
             Kernel::SoftMax | Kernel::ArgMax => SPEC_WORKGROUP_32,
-            Kernel::FlashAttn => SPEC_FLASH_ATTN_WORKGROUP,
+            Kernel::FlashAttn => SPEC_FLASH_ATTN_F32_F16_HD256,
             Kernel::RopeNeox
             | Kernel::RopeNorm
             | Kernel::Silu
@@ -190,6 +207,44 @@ impl Kernel {
             | Kernel::Qwen35SsmConv
             | Kernel::Qwen35GatedDeltaNet => &[],
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashAttentionSpec {
+    specialization_u32: [(u32, u32); 16],
+}
+
+impl FlashAttentionSpec {
+    pub const fn f32_f16(head_dim: u32) -> Self {
+        Self::f32_f16_dims(head_dim, head_dim)
+    }
+
+    pub const fn f32_f16_dims(hsk: u32, hsv: u32) -> Self {
+        Self {
+            specialization_u32: [
+                (0, 128),
+                (1, 1),
+                (2, 64),
+                (3, hsk),
+                (4, hsv),
+                (5, 0),
+                (6, 8),
+                (7, 1),
+                (8, 32),
+                (9, 0),
+                (10, 0),
+                (11, 0),
+                (12, 1),
+                (13, 1),
+                (14, 2),
+                (15, 2),
+            ],
+        }
+    }
+
+    pub const fn specialization_u32(&self) -> &[(u32, u32)] {
+        &self.specialization_u32
     }
 }
 
@@ -536,7 +591,7 @@ macro_rules! fused_launcher_fns {
 
 #[cfg(feature = "vulkan")]
 mod real {
-    use super::{Dispatch, Kernel, KernelError, Result};
+    use super::{Dispatch, FlashAttentionSpec, Kernel, KernelError, Result};
     use ash::vk;
     use std::path::PathBuf;
 
@@ -562,6 +617,24 @@ mod real {
         dispatch: Dispatch,
         params: &super::KernelParams,
     ) -> Result<()> {
+        launch_with_params_and_specialization(
+            kernel,
+            ctx,
+            buffers,
+            dispatch,
+            params,
+            kernel.specialization_u32(),
+        )
+    }
+
+    pub fn launch_with_params_and_specialization(
+        kernel: Kernel,
+        ctx: &vulkan_sys::VulkanContext,
+        buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        dispatch: Dispatch,
+        params: &super::KernelParams,
+        specialization_u32: &[(u32, u32)],
+    ) -> Result<()> {
         if dispatch.x == 0 || dispatch.y == 0 || dispatch.z == 0 {
             return Err(KernelError::InvalidDispatch);
         }
@@ -585,7 +658,7 @@ mod real {
             &shader,
             &[&layout],
             push_bytes.len() as u32,
-            kernel.specialization_u32(),
+            specialization_u32,
         )
         .map_err(|e| KernelError::Runtime(e.to_string()))?;
         let commands = vulkan_sys::CommandPool::create(ctx)
@@ -624,6 +697,23 @@ mod real {
         let path = PathBuf::from(dir).join(format!("{}.spv", kernel.shader_name()));
         path.exists().then_some(path)
     }
+
+    pub fn flash_attn_with_params_and_spec(
+        ctx: &vulkan_sys::VulkanContext,
+        buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        dispatch: Dispatch,
+        params: &super::KernelParams,
+        spec: &FlashAttentionSpec,
+    ) -> Result<()> {
+        launch_with_params_and_specialization(
+            Kernel::FlashAttn,
+            ctx,
+            buffers,
+            dispatch,
+            params,
+            spec.specialization_u32(),
+        )
+    }
 }
 
 #[cfg(feature = "vulkan")]
@@ -633,7 +723,7 @@ fused_launcher_fns!(real::launch_with_params);
 
 #[cfg(not(feature = "vulkan"))]
 mod stub {
-    use super::{Kernel, KernelError, Result};
+    use super::{FlashAttentionSpec, Kernel, KernelError, Result};
 
     pub fn launch(
         _kernel: Kernel,
@@ -653,12 +743,27 @@ mod stub {
     ) -> Result<()> {
         Err(KernelError::NotCompiled)
     }
+
+    pub fn flash_attn_with_params_and_spec(
+        _ctx: &vulkan_sys::VulkanContext,
+        _buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        _dispatch: super::Dispatch,
+        _params: &super::KernelParams,
+        _spec: &FlashAttentionSpec,
+    ) -> Result<()> {
+        Err(KernelError::NotCompiled)
+    }
 }
 
 #[cfg(not(feature = "vulkan"))]
 launcher_fns!(stub::launch);
 #[cfg(not(feature = "vulkan"))]
 fused_launcher_fns!(stub::launch_with_params);
+
+#[cfg(feature = "vulkan")]
+pub use real::flash_attn_with_params_and_spec;
+#[cfg(not(feature = "vulkan"))]
+pub use stub::flash_attn_with_params_and_spec;
 
 #[cfg(test)]
 mod tests {
@@ -727,7 +832,17 @@ mod tests {
         assert_eq!(Kernel::SoftMax.specialization_u32(), &[(0, 32)]);
         assert_eq!(Kernel::ArgMax.specialization_u32(), &[(0, 32)]);
         assert_eq!(Kernel::QuantizeQ8_1.specialization_u32(), &[(0, 32)]);
-        assert_eq!(Kernel::FlashAttn.specialization_u32(), &[(0, 128)]);
+        assert_eq!(
+            Kernel::FlashAttn.specialization_u32(),
+            FlashAttentionSpec::f32_f16(256).specialization_u32()
+        );
+        assert_eq!(Kernel::FlashAttn.specialization_u32().len(), 16);
+        assert_eq!(Kernel::FlashAttn.specialization_u32()[3], (3, 256));
+        assert_eq!(Kernel::FlashAttn.specialization_u32()[4], (4, 256));
+        assert_eq!(Kernel::FlashAttn.specialization_u32()[12], (12, 1));
+        assert_eq!(Kernel::FlashAttn.specialization_u32()[13], (13, 1));
+        assert_eq!(Kernel::FlashAttn.specialization_u32()[14], (14, 2));
+        assert_eq!(Kernel::FlashAttn.specialization_u32()[15], (15, 2));
         assert_eq!(Kernel::RmsNorm.specialization_u32(), &[(1, 1)]);
     }
 
