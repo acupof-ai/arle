@@ -1158,7 +1158,7 @@ impl Dsv4Model {
             affordable > 0,
             "DSv4 KV budget rejected startup: post-weights free VRAM affords 0 slots at \
              max_seq_len {max_seq_len} (per_slot ~{}MB + shared DSA {}MB + shared MoE decode {}MB \
-             exceed {MEM_FRACTION} of free). Lower --max-seq-len or free VRAM.",
+             exceed {MEM_FRACTION} of free). Lower INFER_DSV4_MAX_SEQ_LEN or free VRAM.",
             per_slot >> 20,
             dsa_shared_bytes >> 20,
             moe_decode_shared_bytes >> 20,
@@ -1172,7 +1172,7 @@ impl Dsv4Model {
                  per-slot selector/compressor caches ~{}MB) + shared DSA scratch ~{}MB exceeds the \
                  cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
                  {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}. \
-                 Lower --max-seq-len ({max_seq_len}) to raise concurrency.",
+                 Lower INFER_DSV4_MAX_SEQ_LEN ({max_seq_len}) to raise concurrency.",
                 per_slot >> 20,
                 arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X) >> 20,
                 dsa_rotated_per_slot.saturating_add(state_caches_per_slot) >> 20,
