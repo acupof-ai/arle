@@ -785,9 +785,28 @@ impl TokenKVPool {
         Ok(())
     }
 
+    /// Reject any page id outside the pool before byte-offset math runs.
+    /// Codex review (9d63682d): the tier (#82/#83) and whole-slot swap
+    /// transports feed these copies caller-built page lists; a corrupt list
+    /// must fail loudly, not slice out of bounds.
+    fn validate_page_ids(&self, pages: &[u32], what: &str) -> Result<()> {
+        for &page in pages {
+            anyhow::ensure!(
+                (page as usize) < self.max_total_pages,
+                "paged_kv {what}: page id {page} outside pool ({} pages)",
+                self.max_total_pages
+            );
+        }
+        Ok(())
+    }
+
     pub fn copy_pages_to_host(&self, ctx: &DeviceContext, pages: &[u32]) -> Result<Vec<u8>> {
         #[cfg(feature = "cuda")]
         {
+            // Tier/swap transports hand this caller-built page lists; validate
+            // every id before any byte math so a corrupt table fails loudly
+            // here instead of slicing out of bounds below.
+            self.validate_page_ids(pages, "copy_pages_to_host")?;
             let token_bytes = self.data_plane_bytes_per_page();
             let single_plane = self.is_single_plane();
             let scale_len = self.page_size * self.num_kv_heads;
@@ -873,6 +892,8 @@ impl TokenKVPool {
     ) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
+            // See copy_pages_to_host: validate ids before any byte math.
+            self.validate_page_ids(pages, "copy_pages_from_host")?;
             let token_bytes = self.data_plane_bytes_per_page();
             let single_plane = self.is_single_plane();
             let scale_len = self.page_size * self.num_kv_heads;
