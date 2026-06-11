@@ -88,46 +88,59 @@ impl CudaKvTierStore {
         t1_full && disk_full
     }
 
-    /// Store a page payload. Spills the coldest T1 entry to disk when T1 is
-    /// full and a disk level exists. Returns `false` (payload dropped) only
-    /// when both levels are full or the spill write failed.
+    /// Store a page payload. T1 takes it when it has room; a full (or
+    /// disabled, `--kv-t1-budget-bytes 0`) T1 spills its coldest entry to
+    /// disk — or, with no T1 at all, the payload writes straight to disk.
+    /// Returns `false` (payload dropped) only when no level has room or the
+    /// disk write failed.
     pub(crate) fn insert(&mut self, key: u64, payload: Vec<u8>) -> bool {
-        if self.t1.len() >= self.t1_capacity_pages {
-            if self.t1_capacity_pages == 0 || !self.spill_coldest_to_disk() {
-                return false;
-            }
+        if self.t1.len() < self.t1_capacity_pages {
+            self.clock += 1;
+            self.t1.insert(key, (self.clock, payload));
+            return true;
         }
-        self.clock += 1;
-        self.t1.insert(key, (self.clock, payload));
-        true
+        if self.t1_capacity_pages > 0 && self.spill_coldest_to_disk() {
+            self.clock += 1;
+            self.t1.insert(key, (self.clock, payload));
+            return true;
+        }
+        // Disk-only configuration (or the spill failed): write directly.
+        self.write_to_disk(key, &payload)
     }
 
-    fn spill_coldest_to_disk(&mut self) -> bool {
+    fn write_to_disk(&mut self, key: u64, payload: &[u8]) -> bool {
         let Some(disk) = &mut self.disk else {
             return false;
         };
         if disk.keys.len() >= disk.capacity_pages {
             return false;
         }
-        let Some((&key, _)) = self.t1.iter().min_by_key(|(_, (stamp, _))| *stamp) else {
-            return false;
-        };
-        let (_, payload) = self.t1.remove(&key).expect("key just observed");
-        match kv_native_sys::write_block_atomic(&disk.root, fingerprint(key), &payload) {
+        match kv_native_sys::write_block_atomic(&disk.root, fingerprint(key), payload) {
             Ok(()) => {
                 disk.keys.insert(key);
                 true
             }
             Err(err) => {
                 log::warn!(
-                    "KV T2 spill failed for key {key} under {}: {err}",
+                    "KV T2 write failed for key {key} under {}: {err}",
                     disk.root.display()
                 );
-                // Keep the entry in RAM rather than lose it; report no room.
-                self.clock += 1;
-                self.t1.insert(key, (self.clock, payload));
                 false
             }
+        }
+    }
+
+    fn spill_coldest_to_disk(&mut self) -> bool {
+        let Some((&key, _)) = self.t1.iter().min_by_key(|(_, (stamp, _))| *stamp) else {
+            return false;
+        };
+        let (stamp, payload) = self.t1.remove(&key).expect("key just observed");
+        if self.write_to_disk(key, &payload) {
+            true
+        } else {
+            // Keep the entry in RAM rather than lose it; report no room.
+            self.t1.insert(key, (stamp, payload));
+            false
         }
     }
 
@@ -226,6 +239,25 @@ mod tests {
         store.remove(&[2]);
         assert_eq!(store.disk_len(), 0);
         assert!(store.read(2).is_err());
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn disk_only_config_writes_straight_to_disk() {
+        // --kv-t1-budget-bytes 0 --kv-ssd-path ...: T1 disabled, disk active.
+        let root = temp_root("disk_only");
+        let mut store = CudaKvTierStore::with_budget(0, 8);
+        store.set_disk(root.clone(), 16, 8);
+        assert_eq!(store.capacity_pages(), 2);
+
+        assert!(store.insert(1, vec![1; 8]), "insert lands on disk");
+        assert_eq!(store.t1_len(), 0);
+        assert_eq!(store.disk_len(), 1);
+        assert_eq!(store.read(1).expect("disk read").as_ref(), &[1u8; 8]);
+        assert!(store.insert(2, vec![2; 8]));
+        assert!(store.is_full());
+        assert!(!store.insert(3, vec![3; 8]), "disk full rejects");
 
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
