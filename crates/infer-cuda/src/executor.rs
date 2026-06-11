@@ -1423,13 +1423,18 @@ impl Dsv4CudaExecutor {
         let mut verify_tokens: Vec<u32> = Vec::with_capacity(depth + 1);
         verify_tokens.push(pending);
         verify_tokens.extend_from_slice(&drafts);
-        let (argmax, mut hiddens) = self.model.forward_tokens_verify(
+        // Frozen-KV: speculative verify runs with the compressor FROZEN (mutates
+        // nothing compressed). Clear the flag even on error.
+        crate::attention::set_dsv4_verify_frozen(true);
+        let verify_res = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
             &verify_tokens,
             start_pos,
             position,
-        )?;
+        );
+        crate::attention::set_dsv4_verify_frozen(false);
+        let (argmax, hiddens) = verify_res?;
         ensure!(
             argmax.len() == depth + 1 && hiddens.len() == depth + 1,
             "DSv4 MTP depth-{depth} verify expected {} rows, got argmax={} hidden={}",
@@ -1463,47 +1468,31 @@ impl Dsv4CudaExecutor {
             );
         }
 
-        if n == depth {
-            // Full accept: every draft matched — the verify already wrote their KV,
-            // keep it. committed = drafts + [bonus]; next pending = bonus, hidden =
-            // the position-`depth` stream (the last draft's).
-            spec.pending = Some(bonus);
-            spec.hidden = Some(hiddens.remove(depth));
-            let mut out = drafts;
-            out.push(bonus);
-            Ok(out)
-        } else {
-            // Partial accept (incl. n==0): the verify wrote KV for pending + K drafts;
-            // roll the whole step back to pre-verify (truncate to start_pos + restore the
-            // full-buffer compressor/indexer; SW ring + DSA packed_rows self-heal on the
-            // next overwrite), then RE-FORWARD the accepted prefix [pending, d0..d_{n-1}]
-            // (n+1 tokens) to rebuild its KV/compressor and capture the hidden for the
-            // next draft. bonus (argmax[n]) is the next pending. n==0 → re-forward
-            // [pending] = the original depth-1 reject.
-            self.model
-                .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
-            self.slots[slot_idx].restore_spec_rollback(
-                &self.model.ctx,
-                &mut self.kv_adapter,
-                start_pos + 1,
-            )?;
-            let mut prefix: Vec<u32> = Vec::with_capacity(n + 1);
-            prefix.push(pending);
-            prefix.extend_from_slice(&drafts[..n]);
-            let (_, mut re_hiddens) = self.model.forward_tokens_verify(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                &prefix,
-                start_pos,
-                position,
-            )?;
-            spec.pending = Some(bonus);
-            spec.hidden = Some(re_hiddens.remove(n));
-            let mut out: Vec<u32> = Vec::with_capacity(n + 1);
-            out.extend_from_slice(&drafts[..n]);
-            out.push(bonus);
-            Ok(out)
-        }
+        // Frozen-KV commit (Option A): the speculative verify mutated nothing
+        // compressed, so there is no rollback snapshot and no full/partial split.
+        // Truncate to the pre-step length, then re-forward the accepted prefix
+        // [pending, d0..d_{n-1}] NON-frozen — committing the compressor for exactly
+        // the accepted tokens. Always re-forwards (even on full accept); a
+        // compressor-only commit (no re-forward) is the perf follow-up.
+        let _ = &hiddens;
+        self.model
+            .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
+        let mut prefix: Vec<u32> = Vec::with_capacity(n + 1);
+        prefix.push(pending);
+        prefix.extend_from_slice(&drafts[..n]);
+        let (_, mut re_hiddens) = self.model.forward_tokens_verify(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            &prefix,
+            start_pos,
+            position,
+        )?;
+        spec.pending = Some(bonus);
+        spec.hidden = Some(re_hiddens.remove(n));
+        let mut out: Vec<u32> = Vec::with_capacity(n + 1);
+        out.extend_from_slice(&drafts[..n]);
+        out.push(bonus);
+        Ok(out)
     }
 
     fn forward_decode_row(&mut self, row: &Dsv4DecodeBatchRow) -> Result<Vec<SlotToken>> {
