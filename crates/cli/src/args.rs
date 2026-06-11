@@ -43,10 +43,9 @@ pub(crate) enum TracePromptsMode {
     Off,
 }
 
-// `keep_prompts` is only consumed by the trajectory writer, which is
-// itself gated on a backend feature being active. Mirror that gate
-// here so `cargo clippy -p cli -- -D warnings` on the no-backend
-// build doesn't trip on `method never used`. (codex Phase-1 P1)
+// `keep_prompts` is only consumed by the trajectory writer, which is currently
+// compiled for the interactive CUDA/Metal/CPU front door. Mirror that gate here
+// so `cargo clippy -p cli -- -D warnings` on serve-only builds stays clean.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl TracePromptsMode {
     pub(crate) fn keep_prompts(self) -> bool {
@@ -68,6 +67,7 @@ pub(crate) enum BackendArg {
     Cpu,
     Metal,
     Cuda,
+    Vulkan,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -78,6 +78,7 @@ pub(crate) enum ServeBackendArg {
     Metal,
     Cuda,
     Hip,
+    Vulkan,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -306,7 +307,7 @@ pub(crate) struct RunArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 #[command(
-    after_help = "This is a thin front door over the ARLE-native backend serving binaries shipped in release artifacts.\nIt looks for `infer`, `metal_serve`, or `cpu_serve` next to the current `arle` binary first, then on PATH. Flags after `--` are forwarded to that native backend binary.\n\nExamples:\n  arle serve --model-path /path/to/Qwen3-4B\n  arle serve --backend arle --model-path /models/Qwen3-4B --port 8000\n  arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit --port 8010\n  arle serve --backend cuda --model-path /models/Qwen3-4B -- --num-slots 8"
+    after_help = "This is a thin front door over the in-process ARLE-native backend compiled into this binary.\n\nExamples:\n  arle serve --model-path /path/to/Qwen3-4B\n  arle serve --backend arle --model-path /models/Qwen3-4B --port 8000\n  arle serve --backend metal --model-path mlx-community/Qwen3-0.6B-4bit --port 8010\n  arle serve --backend vulkan --model-path /models/qwen3.gguf --port 8020\n  arle serve --backend cuda --model-path /models/Qwen3-4B"
 )]
 pub(crate) struct ServeArgs {
     /// Model directory or HuggingFace model ID. Defaults to the top-level --model-path.
