@@ -572,6 +572,24 @@ const GDR_O_EXTERN_DECL: &str = GDR_O_PUBLIC_DECL;
 const GDR_O_CALL_ARGS: &str =
     "q, k, v_new, chunk_state, g_cumsum, output, seq_len, num_value_heads, scale, stream";
 
+// FlashQLA chunked GDR fwd (tools/tilelang/flashqla_gdr.py) — Hopper-only
+// (sm_90a warp-spec + barriers), fixed Qwen3.6 shard H=32/Hg=16/DK=DV=128.
+// Non-sm90 targets get CUDA_ERROR_NOT_SUPPORTED stubs; the runtime gate in
+// infer-cuda keeps those builds on the recurrent kernel.
+const FQ_CUMSUM_PUBLIC_DECL: &str =
+    "const float* g_in, float* g_out, int32_t seq_len, CUstream stream";
+const FQ_CUMSUM_EXTERN_DECL: &str = FQ_CUMSUM_PUBLIC_DECL;
+const FQ_CUMSUM_CALL_ARGS: &str = "g_in, g_out, seq_len, stream";
+
+const FQ_KKT_PUBLIC_DECL: &str =
+    "const uint16_t* k, const float* beta, uint16_t* a_inv, int32_t seq_len, CUstream stream";
+const FQ_KKT_EXTERN_DECL: &str = FQ_KKT_PUBLIC_DECL;
+const FQ_KKT_CALL_ARGS: &str = "k, beta, a_inv, seq_len, stream";
+
+const FQ_FWD_PUBLIC_DECL: &str = "const uint16_t* q, const uint16_t* k, const uint16_t* v, const uint16_t* a_inv, const float* g_cumsum, const float* beta, const float* h0, uint16_t* o, float* ht, int32_t seq_len, CUstream stream";
+const FQ_FWD_EXTERN_DECL: &str = FQ_FWD_PUBLIC_DECL;
+const FQ_FWD_CALL_ARGS: &str = "q, k, v, a_inv, g_cumsum, beta, h0, o, ht, seq_len, stream";
+
 /// Locate the directories the TileLang AOT generator needs for nvcc to
 /// compile `device_kernel.cu`: TileLang's `src/` (for `tl_templates/`),
 /// the cutlass headers it bundles, and the active CUDA toolkit include.
@@ -970,6 +988,24 @@ fn compile_tilelang_stub_kernels(cuda_path: &str, out_dir: &Path) {
             "gated_delta_rule_prefill_chunk_o",
             GDR_O_PUBLIC_DECL,
         ),
+        (
+            "flashqla_gdr_cumsum",
+            "tilelang_flashqla_gdr_cumsum",
+            "gdr_fq_cumsum",
+            FQ_CUMSUM_PUBLIC_DECL,
+        ),
+        (
+            "flashqla_gdr_kkt",
+            "tilelang_flashqla_gdr_kkt",
+            "gdr_fq_kkt",
+            FQ_KKT_PUBLIC_DECL,
+        ),
+        (
+            "flashqla_gdr_fwd",
+            "tilelang_flashqla_gdr_fwd",
+            "gdr_fq_fwd",
+            FQ_FWD_PUBLIC_DECL,
+        ),
     ] {
         write_tilelang_unsupported_stub(
             out_dir,
@@ -1352,6 +1388,83 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             spec,
             &mut generated_sources,
         );
+    }
+
+    // FlashQLA chunked GDR fwd — sm_90 ONLY (TileLang lowering uses Hopper
+    // barriers/warp-spec/gemm_v1 that fail on every other SM). Build the real
+    // cubins only for sm_90 targets; every other build flavor links the
+    // NOT_SUPPORTED stubs so the FFI surface stays complete.
+    let flashqla_specs = [
+        TileLangKernelSpec {
+            artifact_dir: "flashqla_gdr_cumsum".to_string(),
+            kernel_path: "tools/tilelang/flashqla_gdr.py",
+            kernel_name: "gdr_fq_cumsum".to_string(),
+            out_name: "tilelang_flashqla_gdr_cumsum".to_string(),
+            kernel_family: "flashqla",
+            kernel_key: Some("fq_cumsum"),
+            num_q_heads: None,
+            num_kv_heads: None,
+            public_decl: FQ_CUMSUM_PUBLIC_DECL,
+            extern_decl: FQ_CUMSUM_EXTERN_DECL,
+            call_args: FQ_CUMSUM_CALL_ARGS,
+            allow_sm70: false,
+        },
+        TileLangKernelSpec {
+            artifact_dir: "flashqla_gdr_kkt".to_string(),
+            kernel_path: "tools/tilelang/flashqla_gdr.py",
+            kernel_name: "gdr_fq_kkt".to_string(),
+            out_name: "tilelang_flashqla_gdr_kkt".to_string(),
+            kernel_family: "flashqla",
+            kernel_key: Some("fq_kkt"),
+            num_q_heads: None,
+            num_kv_heads: None,
+            public_decl: FQ_KKT_PUBLIC_DECL,
+            extern_decl: FQ_KKT_EXTERN_DECL,
+            call_args: FQ_KKT_CALL_ARGS,
+            allow_sm70: false,
+        },
+        TileLangKernelSpec {
+            artifact_dir: "flashqla_gdr_fwd".to_string(),
+            kernel_path: "tools/tilelang/flashqla_gdr.py",
+            kernel_name: "gdr_fq_fwd".to_string(),
+            out_name: "tilelang_flashqla_gdr_fwd".to_string(),
+            kernel_family: "flashqla",
+            kernel_key: Some("fq_fwd"),
+            num_q_heads: None,
+            num_kv_heads: None,
+            public_decl: FQ_FWD_PUBLIC_DECL,
+            extern_decl: FQ_FWD_EXTERN_DECL,
+            call_args: FQ_FWD_CALL_ARGS,
+            allow_sm70: false,
+        },
+    ];
+    let sm90_targets: Vec<SmSpec> = sm_targets
+        .iter()
+        .filter(|sm| sm.sm == "90")
+        .cloned()
+        .collect();
+    for spec in &flashqla_specs {
+        if sm90_targets.is_empty() {
+            write_tilelang_unsupported_stub(
+                out_dir,
+                &spec.artifact_dir,
+                &spec.out_name,
+                &spec.kernel_name,
+                spec.public_decl,
+                &mut generated_sources,
+            );
+        } else {
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                &sm90_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                spec,
+                &mut generated_sources,
+            );
+        }
     }
 
     let mut build = cc::Build::new();
