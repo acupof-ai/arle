@@ -32,10 +32,10 @@ authority rather than defining a second equal architecture.
 | `tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |
 | `chat` | Shared protocol formatting/parsing, OpenAI chat surface types | Runtime scheduling and backend logic |
 | `infer-plan` | Backend-neutral data IR: `ForwardPlan`, `ForwardMode`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device. | Any device or backend type |
-| `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll) + `KvPool` (`KvQuery`/`KvAllocator`/`KvPrefixStore`). No device types. | Concrete kernels, scheduler, model code |
+| `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll) + `KvPool` (`KvQuery`/`KvAllocator`/`KvPrefixStore`) + the backend-neutral `HostPagedKvPool`. No device types. | Concrete kernels, scheduler, model code |
 | `infer-core` | The one device-neutral `Engine<E,K>`: admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry. No backend dependency. | Device kernels, HTTP, CLI |
 | `infer-cuda` | CUDA `BackendExecutor` + KV pool: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, over `cuda-kernels` | Scheduler logic, HTTP, terminal UX |
-| `infer-metal` | Metal MLX `BackendExecutor` (packed varlen decode) + the feature-free host/CPU KV pool used for cpu smoke, over `mlx-sys` | Scheduler logic, HTTP, terminal UX |
+| `infer-metal` | Metal MLX `BackendExecutor` (packed varlen decode) over `mlx-sys`; `MetalKvPool` is only a compatibility alias to `infer-seam::HostPagedKvPool` | Scheduler logic, HTTP, terminal UX |
 | `infer-topo` | TP/EP sharding: `head_shard`, column/row shard | Kernels, scheduler, HTTP |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig` | Backend kernels, scheduler |
 | `infer-server` | OpenAI v1 HTTP frontend + tokenizer; `ServeHandle<E,K>` engine thread | Terminal UX, agent-session orchestration |
@@ -69,7 +69,7 @@ infer-core        -> infer-plan, infer-seam            (the one Engine<E,K>; no 
 infer-cuda        -> infer-plan, infer-seam, infer-topo, infer-moe, cuda-kernels, [deepep-sys, deepseek-spec, qwen3-spec], qwen35-spec
 infer-metal       -> infer-plan, infer-seam, [mlx-sys]
 
-infer-server      -> infer-core, infer-seam, infer-plan, infer-metal
+infer-server      -> infer-core, infer-seam, infer-plan
 infer-api         -> infer-core, infer-seam, infer-plan, infer-server, [infer-metal, infer-cuda, cuda-kernels]
 
 workspace root package (agent-infer)
@@ -124,9 +124,9 @@ infer-api       single front-door lib (LoadedInferenceEngine, EngineLoadConfig,
 | Crate | Owns |
 | --- | --- |
 | `infer-plan` | The data contract: `ForwardPlan`, `ForwardMode{Prefill,Decode,Mixed,Idle,Verify,Draft}`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device — the sole engine↔executor bridge. |
-| `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll) + the `KvPool` split (`KvQuery`/`KvAllocator`/`KvPrefixStore`). No device types. |
+| `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll) + the `KvPool` split (`KvQuery`/`KvAllocator`/`KvPrefixStore`) + `HostPagedKvPool`, the shared production host page allocator. No device types. |
 | `infer-core` | The one device-neutral scheduler: admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry, `Engine<E,K>`. No backend dependency. |
-| `infer-metal` | Metal MLX Qwen3.5/3.6 forward (packed varlen decode) as a thin `BackendExecutor` + KV pool; also hosts the feature-free host/CPU KV pool used for cpu smoke. |
+| `infer-metal` | Metal MLX Qwen3.5/3.6 forward (packed varlen decode) as a thin `BackendExecutor`; `MetalKvPool` names the shared host allocator for compatibility. |
 | `infer-cuda` | CUDA executor as a thin seam impl over `cuda-kernels`: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, dense Qwen3 + Qwen3.5 MoE. |
 | `infer-topo` | TP/EP sharding helpers: `head_shard`, column/row shard. |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig`. |
@@ -329,9 +329,9 @@ forces them.
   plus the `infer-api` front door; a further trait crate would be redundant.
 - **No `*-sys` / Rust-types split for the kernel crate.** One crate holds
   both layers; splitting them creates a `*-sys` boundary with one consumer.
-- **No CPU backend extraction.** The feature-free host/CPU KV pool lives in
-  `infer-metal` and exists only for smoke tests; extracting it would create a
-  one-consumer crate with zero independence benefit.
+- **No separate CPU backend crate.** The smoke executor still reuses the
+  feature-free placeholder `MetalExecutor`, but the host paged KV allocator is
+  now the shared `infer-seam::HostPagedKvPool`, not a Metal-owned pool.
 
 The original kernel-crate trip wires (T1 NCCL, T2 FA-3, T3 MLA/FP8 GEMM,
 T4 spec decoding, T5 second external consumer) are arguments for the

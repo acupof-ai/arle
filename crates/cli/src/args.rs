@@ -326,6 +326,34 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub(crate) bind: String,
 
+    /// Use conservative local-machine engine budgets for smoother foreground UX.
+    #[arg(long, default_value_t = false)]
+    pub(crate) low_impact: bool,
+
+    /// Logical request slots for the unified scheduler.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) num_slots: Option<usize>,
+
+    /// Physical host KV pages for the unified scheduler.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) total_pages: Option<usize>,
+
+    /// Tokens per host KV page.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) page_size: Option<usize>,
+
+    /// Max prompt tokens accepted at ingress.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) max_prompt_tokens: Option<usize>,
+
+    /// Max prompt plus generated tokens for one request.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) max_total_tokens: Option<usize>,
+
+    /// Per-request prefill chunk size.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) chunked_prefill_size: Option<usize>,
+
     /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
     #[arg(long)]
     pub(crate) train_control_url: Option<String>,
