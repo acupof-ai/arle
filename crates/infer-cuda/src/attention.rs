@@ -22,6 +22,7 @@ use crate::dsv4::{
 };
 use crate::dsv4_page_table::{contiguous_page_table_byte_range, physical_page};
 use crate::loader::PageMeta;
+use crate::moe_config::ExpertSplit;
 use crate::tp::TpRuntime;
 
 const DSV4_FLASHMLA_MODEL1: i32 = 1;
@@ -224,6 +225,12 @@ pub(crate) struct Dsv4KvAdapter {
     /// (issue #67). `None` when the model has no CSA layer or the official
     /// indexer is disabled (`ARLE_DSV4_DSA_INDEXER=0`).
     dsa_shared: Option<Dsv4DsaSharedScratch>,
+    /// One shared MoE decode scratch for ALL layers and slots (issue #60).
+    /// `None` when the GPU router decode scratch path is disabled.
+    moe_decode_shared: Option<crate::moe::Dsv4MoeDecodeScratch>,
+    /// One shared-expert decode output for ALL layers and slots (issue #60).
+    /// `None` when the GPU router decode scratch path is disabled.
+    shared_expert_out: Option<HiddenStates>,
 }
 
 pub(crate) struct Dsv4LayerKvLayout {
@@ -280,6 +287,12 @@ impl Dsv4KvAdapter {
         kv_arena: &Dsv4MlaKvArena,
         tp_world: usize,
         num_slots: usize,
+        moe_decode: Option<(
+            &infer_moe::MoeConfig,
+            &ExpertSplit,
+            &crate::dsv4::Dsv4MoeLayer,
+        )>,
+        hidden_size: usize,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "DSv4 attention pool needs at least one slot");
         let mut layers = Vec::with_capacity(layer_specs.len());
@@ -318,11 +331,26 @@ impl Dsv4KvAdapter {
             }
             _ => None,
         };
+        let moe_decode_shared = moe_decode
+            .map(|(cfg, split, layer)| {
+                crate::moe::Dsv4MoeDecodeScratch::new(ctx, cfg, split, layer)
+            })
+            .transpose()?;
+        // ALWAYS allocate the model-wide B=1 shared-expert decode output: the
+        // shared expert runs on every decode step (`use_comm_overlap || seq_len
+        // == 1`) regardless of the GPU-router scratch path, so this must not be
+        // gated on `moe_decode_shared`. One tiny instance (hidden_size×1 BF16 ≈
+        // 14 KiB) replaces the old per-slot×per-layer `shared_decode_out` (#60),
+        // and keeping it pre-allocated avoids a per-step `uninit` on the default
+        // decode path.
+        let shared_expert_out = Some(unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? });
         Ok(Self {
             layers,
             num_slots,
             slot_epochs: vec![None; num_slots],
             dsa_shared,
+            moe_decode_shared,
+            shared_expert_out,
         })
     }
 
@@ -338,6 +366,20 @@ impl Dsv4KvAdapter {
             .get_mut(layer_idx)
             .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))?;
         Ok((layer, self.dsa_shared.as_mut()))
+    }
+
+    /// Split-borrow accessor: model-wide shared MoE decode scratch plus the
+    /// shared-expert output buffer (disjoint fields, so both can be `&mut`).
+    pub(crate) fn moe_decode_shared_mut(
+        &mut self,
+    ) -> (
+        Option<&mut crate::moe::Dsv4MoeDecodeScratch>,
+        Option<&mut HiddenStates>,
+    ) {
+        (
+            self.moe_decode_shared.as_mut(),
+            self.shared_expert_out.as_mut(),
+        )
     }
 
     pub(crate) fn layer_mut(&mut self, layer_idx: usize) -> Result<&mut Dsv4LayerKvLayout> {
