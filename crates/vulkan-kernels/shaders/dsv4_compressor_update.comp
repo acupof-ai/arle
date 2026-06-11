@@ -47,6 +47,87 @@ layout(binding = 8) buffer Compressed {
     float compressed[];
 };
 
+float rope_inv_freq(uint pair_idx) {
+    const float inv = pow(p.rope_base, -(2.0 * float(pair_idx)) / float(p.rope_dim));
+    if (p.orig_seq_len == 0) {
+        return inv;
+    }
+    const float low_f = floor(float(p.rope_dim) * log(float(p.orig_seq_len) / (p.beta_fast * 6.283185307179586)) / (2.0 * log(p.rope_base)));
+    const float high_f = ceil(float(p.rope_dim) * log(float(p.orig_seq_len) / (p.beta_slow * 6.283185307179586)) / (2.0 * log(p.rope_base)));
+    const int low = max(0, int(low_f));
+    const int high = min(max(0, int(p.rope_dim) - 1), int(high_f));
+    const float denom = low == high ? 0.001 : float(high - low);
+    const float ramp = clamp((float(pair_idx) - float(low)) / denom, 0.0, 1.0);
+    const float smooth_weight = 1.0 - ramp;
+    return inv / p.factor * (1.0 - smooth_weight) + inv * smooth_weight;
+}
+
+void apply_rope_pair(inout float a, inout float b, uint pair_idx) {
+    const float angle = float(p.start_pos) * rope_inv_freq(pair_idx);
+    const float c = cos(angle);
+    const float s = sin(angle);
+    const float old_a = a;
+    a = old_a * c - b * s;
+    b = b * c + old_a * s;
+}
+
+float raw_value(uint abs_pos, uint block_start, uint col) {
+    if (abs_pos < p.start_pos) {
+        return pending_kv[(abs_pos - block_start) * p.width + col];
+    }
+    return comp_kv[(abs_pos - p.start_pos) * p.width + col];
+}
+
+float score_value(uint abs_pos, uint block_start, uint col) {
+    if (abs_pos < p.start_pos) {
+        return pending_score[(abs_pos - block_start) * p.width + col];
+    }
+    return comp_score[(abs_pos - p.start_pos) * p.width + col] + ape[(abs_pos % p.ratio) * p.width + col];
+}
+
+float compressed_row_value(uint col, uint block_start, bool has_prev_overlap) {
+    const uint count = p.overlap != 0 ? 2 * p.ratio : p.ratio;
+    float max_logit = -3.4028234663852886e38;
+    for (uint pos = 0; pos < count; ++pos) {
+        float logit = -3.4028234663852886e38;
+        if (p.overlap != 0 && pos < p.ratio) {
+            if (has_prev_overlap) {
+                logit = prev_overlap_score[pos * p.dim + col];
+            }
+        } else {
+            const uint local_pos = p.overlap != 0 ? pos - p.ratio : pos;
+            const uint abs_pos = block_start + local_pos;
+            const uint score_col = p.overlap != 0 ? p.dim + col : col;
+            logit = score_value(abs_pos, block_start, score_col);
+        }
+        max_logit = max(max_logit, logit);
+    }
+
+    float denom = 0.0;
+    float acc = 0.0;
+    for (uint pos = 0; pos < count; ++pos) {
+        float logit = -3.4028234663852886e38;
+        float raw = 0.0;
+        if (p.overlap != 0 && pos < p.ratio) {
+            if (has_prev_overlap) {
+                logit = prev_overlap_score[pos * p.dim + col];
+                raw = prev_overlap_kv[pos * p.dim + col];
+            }
+        } else {
+            const uint local_pos = p.overlap != 0 ? pos - p.ratio : pos;
+            const uint abs_pos = block_start + local_pos;
+            const uint score_col = p.overlap != 0 ? p.dim + col : col;
+            const uint kv_col = p.overlap != 0 ? p.dim + col : col;
+            logit = score_value(abs_pos, block_start, score_col);
+            raw = raw_value(abs_pos, block_start, kv_col);
+        }
+        const float weight = exp(logit - max_logit);
+        denom += weight;
+        acc += weight * raw;
+    }
+    return denom > 0.0 ? acc / denom : 0.0;
+}
+
 void main() {
     const uint idx = gl_GlobalInvocationID.x;
     if (p.ratio == 0 || idx >= p.width) {
@@ -54,21 +135,44 @@ void main() {
     }
     const uint rslot = p.start_pos % p.ratio;
     const uint pending_off = rslot * p.width + idx;
-    pending_kv[pending_off] = comp_kv[idx] + ape[pending_off];
-    pending_score[pending_off] = comp_score[idx];
+    pending_kv[pending_off] = comp_kv[idx];
+    pending_score[pending_off] = comp_score[idx] + ape[pending_off];
 
     if (((p.start_pos + 1) % p.ratio) != 0 || idx >= p.dim) {
         return;
     }
 
-    float v = 0.0;
-    for (uint r = 0; r < p.ratio; ++r) {
-        v += pending_kv[r * p.width + idx];
+    const uint block_start = p.start_pos - rslot;
+    const bool has_prev_overlap = (p.start_pos / p.ratio) > 0;
+    const float row_value = compressed_row_value(idx, block_start, has_prev_overlap);
+    float sumsq = 0.0;
+    for (uint col = 0; col < p.dim; ++col) {
+        const float v = compressed_row_value(col, block_start, has_prev_overlap);
+        sumsq += v * v;
     }
-    v /= float(p.ratio);
-    const float w = norm_weight[idx];
+    const float norm_scale = inversesqrt(sumsq / max(float(p.dim), 1.0) + p.eps);
+    float out_value = row_value * norm_scale * norm_weight[idx];
+    const uint rope = min(p.rope_dim, p.dim);
+    const uint rope_start = p.dim - rope;
+    if (rope != 0 && idx >= rope_start) {
+        const uint local = idx - rope_start;
+        const uint pair = local / 2;
+        const uint pair_col = rope_start + pair * 2;
+        if (pair_col + 1 < p.dim) {
+            float a = compressed_row_value(pair_col, block_start, has_prev_overlap) * norm_scale * norm_weight[pair_col];
+            float b = compressed_row_value(pair_col + 1, block_start, has_prev_overlap) * norm_scale * norm_weight[pair_col + 1];
+            apply_rope_pair(a, b, pair);
+            out_value = (local & 1u) == 0u ? a : b;
+        }
+    }
     const uint row = p.start_pos / p.ratio;
-    compressed[row * p.dim + idx] = v * w;
-    prev_overlap_kv[idx] = pending_kv[rslot * p.width + idx];
-    prev_overlap_score[idx] = pending_score[rslot * p.width + idx];
+    compressed[row * p.dim + idx] = out_value;
+
+    if (p.overlap != 0) {
+        for (uint pos = 0; pos < p.ratio; ++pos) {
+            const uint abs_pos = block_start + pos;
+            prev_overlap_kv[pos * p.dim + idx] = raw_value(abs_pos, block_start, idx);
+            prev_overlap_score[pos * p.dim + idx] = score_value(abs_pos, block_start, idx);
+        }
+    }
 }
