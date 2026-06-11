@@ -227,8 +227,10 @@ pub fn plan_resource_budget(
         .and_then(|v| v.checked_add(static_state_bytes))
         .ok_or_else(|| anyhow::anyhow!("Metal fixed memory estimate overflowed"))?;
 
+    // Shared budget kernel (infer-seam), same policy as the CUDA executors:
+    // the reject-below-fixed guard is `memory_limit > fixed`.
     anyhow::ensure!(
-        memory_limit_bytes > fixed_bytes,
+        infer_seam::SlotBudget::fits_fixed(memory_limit_bytes, fixed_bytes),
         "Metal resource guard rejected startup: {system_status_line}; memory budget {} GiB is below fixed requirement {} GiB \
          (weights {} GiB + runtime headroom {} GiB + static state {} MiB). \
          Close other memory-heavy apps, use a smaller model, or pass --memory-budget-bytes after verifying headroom.",
@@ -247,7 +249,6 @@ pub fn plan_resource_budget(
         WIRED_HEADROOM_BYTES / GIB,
     );
 
-    let kv_budget_bytes = memory_limit_bytes - fixed_bytes;
     let kv_bytes_per_token_all_slots =
         kv_bytes_per_token_per_slot(&model_config, request.kv_cache_dtype)?
             .checked_mul(request.num_slots.max(1))
@@ -256,11 +257,19 @@ pub fn plan_resource_budget(
         kv_bytes_per_token_all_slots > 0,
         "Metal KV byte estimate was zero"
     );
+    // Shared budget kernel: kv_budget = limit − fixed (saturating == plain here,
+    // guarded by the fits_fixed ensure above); max tokens = budget / per-token.
+    let token_budget = infer_seam::SlotBudget::from_limit(
+        memory_limit_bytes,
+        fixed_bytes,
+        kv_bytes_per_token_all_slots,
+    );
+    let kv_budget_bytes = token_budget.budget_bytes;
+    let max_capacity_tokens = token_budget.affordable().unwrap_or(0);
     let requested_total_pages = request.total_pages.max(1);
     let requested_capacity_tokens = requested_total_pages
         .checked_mul(request.page_size.max(1))
         .ok_or_else(|| anyhow::anyhow!("Metal requested KV capacity overflowed"))?;
-    let max_capacity_tokens = kv_budget_bytes / kv_bytes_per_token_all_slots;
     let max_total_pages = max_capacity_tokens / request.page_size.max(1);
     anyhow::ensure!(
         max_total_pages > 0,
@@ -272,7 +281,10 @@ pub fn plan_resource_budget(
         request.num_slots.max(1),
     );
 
-    let planned_total_pages = requested_total_pages.min(max_total_pages).max(1);
+    // Shared clamp: planned = min(requested, max_total_pages); both ≥1 here, so
+    // the legacy `.max(1)` was a no-op. `clamped` flags a reduced request.
+    let (planned_total_pages, clamped) =
+        infer_seam::clamp_to_affordable(requested_total_pages, max_total_pages);
     let capacity_tokens = planned_total_pages
         .checked_mul(request.page_size.max(1))
         .ok_or_else(|| anyhow::anyhow!("Metal planned KV capacity overflowed"))?;
@@ -297,7 +309,7 @@ pub fn plan_resource_budget(
         requested_total_pages,
         planned_total_pages,
         capacity_tokens: capacity_tokens.min(requested_capacity_tokens),
-        clamped: planned_total_pages < requested_total_pages,
+        clamped,
     })
 }
 
@@ -729,6 +741,37 @@ mod tests {
             sample_millis: 1_000,
         };
         assert!(swapout_hot.is_active_pressure());
+    }
+
+    #[test]
+    fn kv_budget_clamp_matches_legacy_inline_arithmetic() {
+        // Lock the B′ re-route: the infer-seam kernel must reproduce Metal's
+        // former inline `limit − fixed`, `budget/per_token/page`, and
+        // `min().max(1)` byte-for-byte across fitting and clamped regimes.
+        let page_size = 256usize;
+        for &(limit, fixed, per_token, requested_pages) in &[
+            (80 * GIB, 30 * GIB, 4096usize, 64usize), // fits
+            (40 * GIB, 30 * GIB, 8192, 4096),         // clamps
+            (32 * GIB, 30 * GIB, 4096, 8),            // tight but ≥1 page
+        ] {
+            // Legacy inline path.
+            let kv_budget_legacy = limit - fixed;
+            let max_tokens_legacy = kv_budget_legacy / per_token;
+            let max_pages_legacy = max_tokens_legacy / page_size;
+            let planned_legacy = requested_pages.min(max_pages_legacy).max(1);
+            let clamped_legacy = planned_legacy < requested_pages;
+
+            // Kernel-routed path.
+            let tb = infer_seam::SlotBudget::from_limit(limit, fixed, per_token);
+            let max_pages_kernel = tb.affordable().unwrap_or(0) / page_size;
+            let (planned_kernel, clamped_kernel) =
+                infer_seam::clamp_to_affordable(requested_pages, max_pages_kernel);
+
+            assert_eq!(tb.budget_bytes, kv_budget_legacy);
+            assert_eq!(max_pages_kernel, max_pages_legacy);
+            assert_eq!(planned_kernel, planned_legacy);
+            assert_eq!(clamped_kernel, clamped_legacy);
+        }
     }
 
     #[test]
