@@ -1,8 +1,20 @@
 # DSv4 MTP frozen-KV — long-context P1 correctness fix
 
-`pending-remote` — short-context validated on 8×H20; the long-context +
-SW-wrap spec-decode needle gate that *exercises* these P1s is owed (pod GPUs
-held by a concurrent serve at write time).
+**VALIDATED on 8×H20** (`e945a3f2`, `scripts/dsv4_needle_gate.py`, 2026-06-12).
+Long-context needle with MTP spec-decode active — `sliding_window=128`, so 3k/6k
+fully wraps the SW ring and crosses many compression boundaries:
+
+| length | depth-1 | depth-4 (accept 0/4–1/4, reject-heavy) |
+|--------|---------|------------------------------------------|
+| 3000 (depth 0.5) | **exact ×3** | **exact ×3** |
+| 6000 (depth 0.5) | **exact ×3** | **exact ×3** |
+
+depth-4 rejects on nearly every step (`reject_total=132` vs `accept_total=52`),
+so `restore_spec_ring_tail` fires constantly into a wrapped ring — and the secret
+code retrieves exactly every run. "NONDET" classifier label = MoE continuation
+variance, not corruption (the code is exact ×12). **codex's P1-C (HCA decode
+count) does NOT manifest** at these lengths; per §0, the gate supersedes the
+source-analysis hypothesis — not chased.
 
 ## Context
 
