@@ -176,6 +176,26 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Device-position variant of [`nonpaged_prefill_attention_cuda`]:
+    /// `start_pos_dev` is one device-resident i32 (kv_len = *start_pos_dev +
+    /// token + 1 inside the kernel), making the launch CUDA-graph
+    /// capture-safe — the Qwen3.5/3.6 decode graph stages the position
+    /// pre-replay instead of baking a host scalar.
+    pub fn nonpaged_prefill_attention_devpos_cuda(
+        q: *const Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        out: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        start_pos_dev: *const i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn decode_prep_paged_cuda(
         q_batch: *mut Half,
         k_batch: *const Half,
