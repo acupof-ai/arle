@@ -48,21 +48,23 @@ use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 
-/// `ARLE_QWEN35_FA3=1`: route full-attention prefill chunks (`seq_len > 1`)
-/// through the vendored FA3 hopper fwd shim instead of the in-tree
-/// `nonpaged_prefill_attention` kernel (42.1% of prefill GPU time at 3k —
+/// Route full-attention prefill chunks (`seq_len > 1`) through the vendored
+/// FA3 hopper fwd shim instead of the in-tree `nonpaged_prefill_attention`
+/// kernel (42.1% of prefill GPU time at 3k —
 /// `docs/reviews/2026-06-11-qwen35-post-license-reprofile-rerank.md`).
-/// Default OFF (step-1 candidate arm). Requires a binary built with
-/// `ARLE_CUDA_ENABLE_FA3=1`; on stub builds the link marker is 0 and the
-/// gate permanently falls back with a warning instead of failing at the
-/// first chunk (flashmla stale-stub lesson). Read once — prefill is never
-/// graph-captured, so a process-lifetime latch is safe.
+/// Default ON (licensed 2026-06-11: 3k prefill −36%, multi-shape verified —
+/// see `wins/2026-06-11-qwen35-fa3-prefill-licensed.md`);
+/// `ARLE_QWEN35_FA3=0` is the same-binary fallback arm. On stub builds
+/// (no `ARLE_CUDA_ENABLE_FA3`) the link marker is 0 and the gate silently
+/// keeps the in-tree kernel, so the default is safe across build flavors.
+/// Read once — prefill is never graph-captured, so a process-lifetime latch
+/// is safe.
 fn qwen35_fa3_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let on = matches!(
+        let on = !matches!(
             std::env::var("ARLE_QWEN35_FA3").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+            Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
         );
         if !on {
             return false;
@@ -70,10 +72,9 @@ fn qwen35_fa3_enabled() -> bool {
         // SAFETY: pure host query exported by both the real shim and the stub.
         let real = unsafe { ffi::arle_fa3_real_kernel_marker_cuda() } == 1;
         if !real {
-            log::warn!(
-                "ARLE_QWEN35_FA3=1 but this binary linked the FA3 stub \
-                 (build without ARLE_CUDA_ENABLE_FA3) — using the in-tree \
-                 attention kernel"
+            log::info!(
+                "FA3 stub build (no ARLE_CUDA_ENABLE_FA3) — full-attention \
+                 prefill stays on the in-tree kernel"
             );
         }
         real
