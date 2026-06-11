@@ -27,6 +27,11 @@ pub struct EngineLoadConfig {
     pub chunked_prefill_size: usize,
     /// `Some(n)` = MTP spec decode on with draft depth `n`; `None` = off.
     pub mtp_draft_tokens: Option<usize>,
+    /// Low-impact local serving mode: keep work chunks cooperative for desktop
+    /// responsiveness. Backend builders may install a resource governor when
+    /// this is set; server-style defaults leave it off.
+    #[serde(default)]
+    pub low_impact: bool,
 }
 
 impl Default for EngineLoadConfig {
@@ -40,6 +45,7 @@ impl Default for EngineLoadConfig {
             max_total_tokens: 65_536,
             chunked_prefill_size: 64,
             mtp_draft_tokens: None,
+            low_impact: false,
         }
     }
 }
@@ -531,10 +537,25 @@ mod backend {
         let num_slots = config.num_slots;
         let total_pages = config.total_pages;
         let page_size = config.page_size;
+        let low_impact = config.low_impact;
         let serve = ServeHandle::spawn_with_engine_builder(move || {
             let executor = MetalExecutor::from_model_path(&model_source)?;
             let kv = MetalKvPool::new(num_slots, total_pages, page_size);
-            Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+            if low_impact {
+                let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
+                    max_tokens: scheduler.chunked_prefill_size.max(1),
+                    max_micros: 20_000,
+                })
+                .with_yield_every_ticks(8);
+                Ok(infer_core::Engine::with_config_and_governor(
+                    executor,
+                    kv,
+                    scheduler,
+                    Box::new(governor),
+                ))
+            } else {
+                Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+            }
         })?;
         Ok((serve, tokenizer, model_id))
     }

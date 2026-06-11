@@ -103,9 +103,11 @@ impl std::fmt::Debug for MetalInflight {
 
 /// Turn a logits array into an in-flight result under `params`.
 ///
-/// Greedy keeps the device `argmax` + async path; `temperature > 0` materializes
-/// host f32 logits and draws via the shared `infer_plan::sample_token` (one D2H
-/// per token, no GPU sampling kernel).
+/// Greedy keeps the device `argmax` + async path. Non-greedy Metal sampling
+/// used to materialize host f32 logits and sample on CPU every token, which
+/// creates synchronous D2H stalls on the local desktop path. Default behavior is
+/// therefore constrained to device greedy; opt back into the old host sampler
+/// with `INFER_METAL_HOST_SAMPLING=1` for debugging.
 #[cfg(feature = "metal")]
 fn sample_inflight(
     slot: usize,
@@ -113,7 +115,10 @@ fn sample_inflight(
     params: &infer_plan::SamplingParams,
     position: u64,
 ) -> MetalInflight {
-    if params.is_greedy() {
+    if params.is_greedy() || !host_sampling_enabled() {
+        if !params.is_greedy() {
+            warn_host_sampling_downgrade();
+        }
         let sampled = mlx::argmax(logits);
         mlx::async_eval(&[&sampled]);
         return MetalInflight::Sampled { slot, sampled };
@@ -129,6 +134,30 @@ fn sample_inflight(
             finish: None,
         }],
     })
+}
+
+#[cfg(feature = "metal")]
+fn host_sampling_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INFER_METAL_HOST_SAMPLING")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(feature = "metal")]
+fn warn_host_sampling_downgrade() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "Metal non-greedy sampling requested, but host logits sampling is disabled; \
+             using device greedy argmax. Set INFER_METAL_HOST_SAMPLING=1 to opt into \
+             the blocking D2H sampler."
+        );
+    }
 }
 
 /// Metal backend executor.
@@ -257,12 +286,23 @@ impl BackendExecutor for MetalExecutor {
         Vec::new()
     }
 
+    fn max_rows_per_step(&self) -> usize {
+        1
+    }
+
     fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_ref() {
             return real.page_store.reusable_prefix_pages(block_ids);
         }
         block_ids.len()
+    }
+
+    fn release_prefix_pages(&mut self, _pages: &[u32]) {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_mut() {
+            real.page_store.release_pages(_pages);
+        }
     }
 
     fn warmup(&mut self) -> anyhow::Result<()> {
@@ -685,6 +725,17 @@ impl MetalPageStore {
             .rev()
             .find(|&k| self.prefixes.contains_key(&block_ids[..k]))
             .unwrap_or(0)
+    }
+
+    fn release_pages(&mut self, pages: &[u32]) {
+        if pages.is_empty() {
+            return;
+        }
+        for page in pages {
+            self.pages.remove(page);
+        }
+        self.prefixes
+            .retain(|key, _| !pages.iter().any(|page| key.contains(page)));
     }
 
     fn publish_slot(&mut self, slot: &MetalSlotState, kv: &dyn KvPool) -> anyhow::Result<()> {
@@ -1224,6 +1275,40 @@ mod tests {
         assert!(store.prefixes.contains_key(&two_pages));
         assert_eq!(store.reusable_prefix_pages(&one_page), 1);
         assert_eq!(store.reusable_prefix_pages(&two_pages), 2);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn release_pages_drops_mirrors_and_prefix_snapshots() {
+        use infer_seam::{KvAllocator, KvQuery};
+        let _guard = mlx_sys::mlx_guard();
+        let mut store = MetalPageStore::default();
+        let mut pool = MetalKvPool::new(1, 8, 4);
+
+        pool.alloc(0, 8).unwrap();
+        let pages: Vec<u32> = pool.page_indices(0).to_vec();
+        let state = MetalSlotState::from_arrays(
+            0,
+            pool.slot_epoch(0),
+            8,
+            vec![kv_array(8, 10)],
+            vec![gdr_array(1)],
+        );
+        store.publish_slot(&state, &pool).unwrap();
+        assert_eq!(store.pages.len(), 2);
+        assert_eq!(store.reusable_prefix_pages(&pages), 2);
+
+        store.release_pages(&[pages[0]]);
+
+        assert!(
+            !store.pages.contains_key(&pages[0]),
+            "evicted page mirror must be dropped"
+        );
+        assert!(
+            !store.prefixes.contains_key(&pages),
+            "prefix snapshot containing the evicted page must be pruned"
+        );
+        assert_eq!(store.reusable_prefix_pages(&pages), 0);
     }
 
     #[test]

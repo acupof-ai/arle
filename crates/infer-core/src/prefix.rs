@@ -171,6 +171,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let reclaimed = pages.len();
         if reclaimed > 0 {
             self.kv.release_pages(&pages);
+            self.executor.release_prefix_pages(&pages);
         }
         reclaimed
     }
