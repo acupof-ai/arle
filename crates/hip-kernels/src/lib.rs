@@ -253,6 +253,41 @@ macro_rules! basic_op_launchers {
             weight: *const u8, token_id: *const i32, out: *mut u16,
             hidden_dim: i32, stream: *mut c_void,
         ));
+
+        // crates/cuda-kernels/csrc/misc/dsv4_mhc.cu (compiled into the archive
+        // since stage A; externs land with their first caller, the infer-hip
+        // DSv4 forward). pre/post/comb are f32 sinkhorn weights; everything
+        // else is bf16.
+        $decl!(dsv4_mhc_expand_cuda(
+            embeddings: *const u16, out: *mut u16, num_tokens: i32,
+            hidden_size: i32, hc_mult: i32, stream: *mut c_void,
+        ));
+        $decl!(dsv4_mhc_params_cuda(
+            residual: *const u16, mixes: *const u16, base: *const u16,
+            scale: *const u16, pre: *mut f32, post: *mut f32, comb: *mut f32,
+            num_tokens: i32, residual_hidden_dim: i32, mix_dim: i32,
+            hc_mult: i32, eps: f32, sinkhorn_iters: i32, stream: *mut c_void,
+        ));
+        $decl!(dsv4_mhc_pre_cuda(
+            residual: *const u16, pre: *const f32, out: *mut u16,
+            num_tokens: i32, hidden_size: i32, hc_mult: i32,
+            stream: *mut c_void,
+        ));
+        $decl!(dsv4_mhc_pre_rms_norm_cuda(
+            residual: *const u16, pre: *const f32, weight: *const u16,
+            out: *mut u16, num_tokens: i32, hidden_size: i32, hc_mult: i32,
+            eps: f32, stream: *mut c_void,
+        ));
+        $decl!(dsv4_mhc_post_cuda(
+            new_x: *const u16, residual: *const u16, post: *const f32,
+            comb: *const f32, out: *mut u16, num_tokens: i32,
+            hidden_size: i32, hc_mult: i32, stream: *mut c_void,
+        ));
+        $decl!(dsv4_mhc_head_pre_cuda(
+            residual_row: *const u16, mixes: *const u16, base: *const u16,
+            scale: *const u16, out: *mut u16, residual_hidden_dim: i32,
+            hidden_size: i32, hc_mult: i32, eps: f32, stream: *mut c_void,
+        ));
     };
 }
 

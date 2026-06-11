@@ -344,14 +344,13 @@ impl KvPrefixStore for HipKvPool {
     }
 }
 
+/// Shared synthetic DSv4 config for unit tests across this crate's modules
+/// (3 layers, ratios [0, 4, 32], 16 experts top-2, hash layer 0). Lifted
+/// unchanged from the original kv_pool test helper.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use infer_seam::KvPool;
-
-    fn small_config() -> DeepSeekV4Config {
-        DeepSeekV4Config::from_json_str(
-            r#"{
+pub(crate) fn test_config() -> DeepSeekV4Config {
+    DeepSeekV4Config::from_json_str(
+        r#"{
             "architectures": ["DeepseekV4ForCausalLM"],
             "model_type": "deepseek_v4",
             "dtype": "bfloat16",
@@ -403,8 +402,17 @@ mod tests {
             "bos_token_id": 0,
             "eos_token_id": 1
         }"#,
-        )
-        .unwrap()
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use infer_seam::KvPool;
+
+    fn small_config() -> DeepSeekV4Config {
+        test_config()
     }
 
     #[test]
