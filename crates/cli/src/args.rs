@@ -348,6 +348,19 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "BYTES")]
     pub(crate) kv_t1_budget_bytes: Option<usize>,
 
+    /// Whole-process memory budget in bytes for unified-memory backends.
+    /// Metal applies this before loading weights and clamps KV capacity to fit.
+    #[arg(long, value_parser = parse_positive_usize, value_name = "BYTES")]
+    pub(crate) memory_budget_bytes: Option<usize>,
+
+    /// Physical memory bytes to reserve for macOS and foreground apps.
+    #[arg(long, value_parser = parse_positive_usize, value_name = "BYTES")]
+    pub(crate) system_reserve_bytes: Option<usize>,
+
+    /// Allow Metal startup even when macOS swap is already materially active.
+    #[arg(long, default_value_t = false)]
+    pub(crate) allow_swap: bool,
+
     /// Logical request slots for the unified scheduler.
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) num_slots: Option<usize>,
