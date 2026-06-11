@@ -15,7 +15,7 @@
 //! `ServeHandle` the `load_*` constructors spawn. On a build with no backend
 //! compiled in, [`serve_http`] returns a clear error (mirrors `--doctor`).
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::loaded::EngineLoadConfig;
 
@@ -37,6 +37,9 @@ pub struct ServeHttpOptions {
     pub enable_cuda_graph: bool,
     /// Engine slot / page / token-budget configuration.
     pub engine_config: EngineLoadConfig,
+    /// Speculative-decode request surface. The rewrite server keeps this
+    /// fail-closed until a backend actually consumes it.
+    pub spec: ServeSpecOptions,
 }
 
 impl ServeHttpOptions {
@@ -49,7 +52,48 @@ impl ServeHttpOptions {
             port,
             enable_cuda_graph: true,
             engine_config: EngineLoadConfig::default(),
+            spec: ServeSpecOptions::default(),
         }
+    }
+}
+
+/// Speculative decode mode requested at the serve boundary.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum ServeSpecType {
+    /// Standard target-only decode.
+    #[default]
+    None,
+    /// Backend chooses the available speculative route.
+    Auto,
+    /// Multi-token prediction / MTP route.
+    Mtp,
+}
+
+impl ServeSpecType {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Auto => "auto",
+            Self::Mtp => "mtp",
+        }
+    }
+}
+
+/// Speculative decode options carried by [`ServeHttpOptions`].
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct ServeSpecOptions {
+    pub spec_type: ServeSpecType,
+    pub mtp_draft_model: Option<String>,
+    pub mtp_draft_tokens: Option<usize>,
+}
+
+impl ServeSpecOptions {
+    #[must_use]
+    pub fn requested(&self) -> bool {
+        self.spec_type != ServeSpecType::None
+            || self.mtp_draft_model.is_some()
+            || self.mtp_draft_tokens.is_some()
     }
 }
 
@@ -67,6 +111,19 @@ impl ServeHttpOptions {
 ))]
 pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
     use anyhow::Context;
+
+    if opts.spec.requested() {
+        bail!(
+            "speculative decode is not wired into the rewrite serve path yet: \
+             requested spec_type={}, mtp_draft_model={}, mtp_draft_tokens={}; \
+             refusing to silently run standard decode",
+            opts.spec.spec_type.label(),
+            opts.spec.mtp_draft_model.as_deref().unwrap_or("none"),
+            opts.spec
+                .mtp_draft_tokens
+                .map_or_else(|| "none".to_string(), |value| value.to_string())
+        );
+    }
 
     let router = crate::loaded::router_for_backend(
         &opts.model_path,
