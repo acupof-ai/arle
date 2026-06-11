@@ -130,6 +130,52 @@ pub(crate) fn flatten_routing(
     Ok((indices, weights))
 }
 
+/// DeepGEMM m-grouped-contiguous row alignment on SM90 (the upstream
+/// `get_mk_alignment_for_contiguous_layout()`): the kernel resolves the B-side
+/// expert group ONCE per BLOCK_M output tile from `m_indices[tile_start]`
+/// (vendor `deep_gemm/scheduler/gemm.cuh::get_global_idx`), and BLOCK_M for
+/// the contiguous layout is pinned to 128 — so every expert group's row
+/// segment must start at a multiple of 128, with `-1` on every pad row.
+pub(crate) const DEEPGEMM_CONTIG_ALIGN: usize = 128;
+
+/// Host upper bound on the 128-aligned packed row count for the DeepGEMM
+/// contiguous grouped layout. The true total `Σ_g align(count_g, 128)` is
+/// device-resident (counts come from the on-device router), and the GEMM's
+/// `m` / the TMA descriptors are host values — so the launch uses this cap
+/// instead of a per-layer D2H sync:
+///
+/// `Σ_g align(c_g, 128) ≤ R + 127·G_active ≤ align(R, 128) + 128·min(R, G)`
+///
+/// (G_active ≤ min(R, G) since every active group has ≥ 1 route). Tiles past
+/// the true aligned total carry `m_indices = -1` and compute excluded garbage.
+/// Always a multiple of 128 (the native bridge rejects unaligned `m`).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn deepgemm_contig_rows_cap(total_routes: usize, local_experts: usize) -> usize {
+    let a = DEEPGEMM_CONTIG_ALIGN;
+    total_routes.div_ceil(a) * a + a * local_experts.min(total_routes)
+}
+
+/// `ARLE_QWEN35_DEEPGEMM=1`: swap the Qwen3.5/3.6 hand CUDA-core grouped
+/// expert GEMMs (~3.9 TFLOP/s class) for DeepGEMM SM90 BF16 m-grouped GEMMs
+/// (vendored official kernels, JIT-compiled through the torch-free native
+/// bridge; requires a binary built with `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`,
+/// preflight fails loud otherwise).
+///
+/// Default OFF for now: the hand-kernel path stays the production default
+/// until the pod A/B licenses the flip — correct-inference gate (smoke x3
+/// same-config consistency + needle retrieval; NOT byte-identity, MoE
+/// atomic-scatter is non-deterministic) plus a wall-clock perf license per
+/// the bench spec. Read at LOAD time as well: the loader builds the
+/// contiguous grouped-B weight caches (and drops the per-expert copies) only
+/// when set, so flipping requires a process restart.
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen35_deepgemm_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_QWEN35_DEEPGEMM").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
 /// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF).
 ///
 /// A `clone_htod(&vec![-1; n])` here would record a CUDA-graph memcpy node
@@ -164,15 +210,23 @@ fn alloc_neg1_i32(
 mod gpu {
     use anyhow::{Result, ensure};
     use cuda_kernels::moe;
-    use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, HiddenStates};
+    use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, HiddenStates, RawDevicePtr};
     use cuda_kernels::tensor::cache_ptr;
     use half::bf16;
     use infer_moe::{MoeConfig, ScoringFunc, TopkMethod};
 
+    use super::{DEEPGEMM_CONTIG_ALIGN, deepgemm_contig_rows_cap, qwen35_deepgemm_enabled};
     use crate::loader::MoeLayerWeights;
     use crate::moe_config::ExpertSplit;
     use crate::ops::{gemm_batch, silu_mul};
     use crate::workspace::{HiddenSlot, SliceSlot};
+
+    /// DeepGEMM masked per-group band capacity (rows). Must be a multiple of
+    /// 128: the masked GEMM's TMA store writes full BLOCK_M (64/128) output
+    /// tiles, so a smaller band would let a tile cross into the next group's
+    /// band. The masked layout is host-shape-fixed (`[G, 128, K]` regardless
+    /// of routing), which also makes it the CUDA-graph-safe variant.
+    const DEEPGEMM_MASKED_BAND: usize = 128;
 
     /// Persistent device scratch for [`moe_forward_into`] — one slot per
     /// per-call buffer the old path allocated fresh (~10 device allocations per
@@ -209,6 +263,21 @@ mod gpu {
     ///
     /// The caller-provided `out` (`[H, T]`) needs no init: the combine kernel
     /// writes every element before `qwen36_add_shared_expert_gated` RMWs it.
+    ///
+    /// DeepGEMM path (`ARLE_QWEN35_DEEPGEMM=1`) — extra slots + reused slots
+    /// at PADDED shapes (`rows_p` = `G·128` masked band / `contig_rows_cap`):
+    ///
+    /// | slot                 | shape        | init on reuse | proof |
+    /// |----------------------|--------------|---------------|-------|
+    /// | `dg_band_offsets`    | `[E_l]` i32  | `upload_const`| pure function of length (`g * 128` band bases) |
+    /// | `dg_aligned_offsets` | `[E_l]` i32  | none          | aligned scan writes all `tid < n` |
+    /// | `dg_m_indices`       | `[rows_p]`   | memset -1     | REQUIRED: fill kernel writes only `count_g` rows per group; every pad row must read -1 (contiguous-GEMM group resolution + garbage marker) |
+    /// | `packed_route_slot`  | `[rows_p]`   | memset -1     | REQUIRED even single-GPU (unlike the hand path): pack writes only the `R` real rows; pad rows must read -1 so the scatter skips them |
+    /// | `packed_hidden`      | `[H, rows_p]`| none          | pack writes the `R` real rows; PAD rows: zero from the slot's `alloc_zeros`, or stale rows from a previous call — both safe by induction: a pad A-row only feeds the matching pad D-row (GEMM rows are independent), every pad D-row has `packed_route_slot = -1` so the scatter never reads it, and every stale value traces back to a finite prior GEMM output or the zero init (never uninitialized memory) |
+    /// | `packed_weight`      | `[rows_p]`   | none          | scatter reads it only where `packed_route_slot >= 0`, which pack wrote |
+    /// | `gate_out`/`up_out`  | `[I, rows_p]`| none          | masked/contiguous GEMM writes rows within its tile coverage; rows outside coverage are read only by `silu_mul`, whose outputs land in the matching `act` pad rows (down-GEMM tile coverage is identical, scatter skips pads) |
+    /// | `act`                | `[I, rows_p]`| none          | `silu_mul` writes all elements |
+    /// | `expert_out`         | `[H, rows_p]`| none          | GEMM writes within tile coverage; scatter reads only `packed_route_slot >= 0` rows, all within coverage |
     #[derive(Default)]
     pub(crate) struct MoeForwardScratch {
         logits: HiddenSlot,
@@ -223,6 +292,9 @@ mod gpu {
         packed_weight: SliceSlot<f32>,
         cursors: SliceSlot<i32>,
         expert_indices: SliceSlot<i32>,
+        dg_band_offsets: SliceSlot<i32>,
+        dg_aligned_offsets: SliceSlot<i32>,
+        dg_m_indices: SliceSlot<i32>,
         gate_out: HiddenSlot,
         up_out: HiddenSlot,
         act: HiddenSlot,
@@ -255,6 +327,9 @@ mod gpu {
                 packed_weight,
                 cursors,
                 expert_indices,
+                dg_band_offsets,
+                dg_aligned_offsets,
+                dg_m_indices,
                 gate_out,
                 up_out,
                 act,
@@ -278,6 +353,9 @@ mod gpu {
             packed_weight.release();
             cursors.release();
             expert_indices.release();
+            dg_band_offsets.release();
+            dg_aligned_offsets.release();
+            dg_m_indices.release();
             gate_out.release();
             up_out.release();
             act.release();
@@ -360,18 +438,24 @@ mod gpu {
             hidden_dim,
             num_experts
         );
-        ensure!(
-            weights.gate.len() == local_experts
-                && weights.up.len() == local_experts
-                && weights.down.len() == local_experts,
-            "MoE expert count mismatch: gate={} up={} down={} local_experts={local_experts} \
-             (ep_size={} ep_rank={})",
-            weights.gate.len(),
-            weights.up.len(),
-            weights.down.len(),
-            split.ep_size,
-            split.ep_rank
-        );
+        // DeepGEMM expert path: grouped-B caches present (built at load when
+        // `ARLE_QWEN35_DEEPGEMM=1`) and the env gate still set. Default OFF —
+        // the hand grouped-GEMM path stays byte-for-byte untouched.
+        let use_deepgemm = qwen35_deepgemm_enabled() && weights.gate_grouped.is_some();
+        if !use_deepgemm {
+            ensure!(
+                weights.gate.len() == local_experts
+                    && weights.up.len() == local_experts
+                    && weights.down.len() == local_experts,
+                "MoE expert count mismatch: gate={} up={} down={} local_experts={local_experts} \
+                 (ep_size={} ep_rank={})",
+                weights.gate.len(),
+                weights.up.len(),
+                weights.down.len(),
+                split.ep_size,
+                split.ep_rank
+            );
+        }
         ensure!(
             out.hidden_dim == hidden_dim && out.seq_len == num_tokens,
             "MoE output shape mismatch: out={}x{} expected {hidden_dim}x{num_tokens}",
@@ -468,26 +552,53 @@ mod gpu {
             (route_indices, route_weights)
         };
 
-        // ── 3. Per-expert route counts → group offsets (LOCAL experts only). ─
+        // ── 3. Per-expert route counts (LOCAL experts only). ────────────────
         // Kernels write these through raw device pointers, so no Rust `mut`.
-        // counts MUST be zeroed every call (atomicAdd accumulator); offsets and
-        // scan_total are fully written by the scan before any read.
-        let counts = scratch.counts.get_zeroed(ctx, local_experts)?;
-        let offsets = scratch.offsets.get(ctx, local_experts)?;
-        let scan_total = scratch.scan_total.get(ctx, 1)?;
+        // counts MUST be zeroed every call (atomicAdd accumulator). Raw-ptr
+        // conversions end the scratch field borrows so the DeepGEMM tail can
+        // take `&mut scratch` (the buffers themselves persist in the scratch).
+        let route_indices_ptr = cache_ptr(route_indices, ctx);
+        let route_weights_ptr = cache_ptr(route_weights, ctx);
+        let counts_ptr = cache_ptr(scratch.counts.get_zeroed(ctx, local_experts)?, ctx);
         // SAFETY: all buffers are valid on ctx.stream for the given shapes.
         unsafe {
             moe::dsv4_count_local_experts(
-                cache_ptr(route_indices, ctx),
-                cache_ptr(counts, ctx),
+                route_indices_ptr,
+                counts_ptr,
                 num_tokens,
                 topk,
                 split.local_expert_start,
                 local_experts,
                 ctx.stream.cu_stream(),
             )?;
+        }
+
+        if use_deepgemm {
+            // ── 4-8 (DeepGEMM): aligned/banded pack → SM90 BF16 m-grouped
+            // GEMMs → scatter/combine. Fills `out` exactly like step 8.
+            deepgemm_routed_tail(
+                ctx,
+                weights,
+                normed,
+                split,
+                scratch,
+                route_indices_ptr,
+                route_weights_ptr,
+                counts_ptr,
+                out,
+                topk,
+            )?;
+            return add_shared_expert_gated(ctx, weights, normed, scratch, out);
+        }
+
+        // ── 3b. Group offsets for the hand path (compact exclusive scan).
+        // offsets and scan_total are fully written by the scan before any read.
+        let offsets = scratch.offsets.get(ctx, local_experts)?;
+        let scan_total = scratch.scan_total.get(ctx, 1)?;
+        // SAFETY: counts/offsets/scan_total valid on ctx.stream.
+        unsafe {
             moe::dsv4_exclusive_scan_i32(
-                cache_ptr(counts, ctx),
+                counts_ptr,
                 cache_ptr(offsets, ctx),
                 cache_ptr(scan_total, ctx),
                 local_experts,
@@ -519,8 +630,8 @@ mod gpu {
         unsafe {
             moe::dsv4_pack_local_experts_with_slots(
                 cache_ptr(&normed.data, ctx),
-                cache_ptr(route_indices, ctx),
-                cache_ptr(route_weights, ctx),
+                route_indices_ptr,
+                route_weights_ptr,
                 cache_ptr(offsets, ctx),
                 cache_ptr(cursors, ctx),
                 cache_ptr(&packed_hidden.data, ctx),
@@ -561,7 +672,7 @@ mod gpu {
                 cache_ptr(&gate_out.data, ctx),
                 cache_ptr(&up_out.data, ctx),
                 cache_ptr(offsets, ctx),
-                cache_ptr(counts, ctx),
+                counts_ptr,
                 cache_ptr(expert_indices, ctx),
                 local_experts,
                 max_count,
@@ -597,7 +708,7 @@ mod gpu {
                 cache_ptr(&act.data, ctx),
                 cache_ptr(&expert_out.data, ctx),
                 cache_ptr(offsets, ctx),
-                cache_ptr(counts, ctx),
+                counts_ptr,
                 cache_ptr(expert_indices, ctx),
                 local_experts,
                 max_count,
@@ -644,6 +755,21 @@ mod gpu {
         }
 
         // ── 9. Shared expert: dense SwiGLU · sigmoid(x @ shared_gate_router).
+        add_shared_expert_gated(ctx, weights, normed, scratch, out)
+    }
+
+    /// Step 9 of the MoE block, shared by the hand and DeepGEMM expert paths:
+    /// dense shared-expert SwiGLU, sigmoid-gated and accumulated into the
+    /// routed output (`out` is RMW'd; the combine fully wrote it in step 8).
+    fn add_shared_expert_gated(
+        ctx: &DeviceContext,
+        weights: &MoeLayerWeights,
+        normed: &HiddenStates,
+        scratch: &mut MoeForwardScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        let num_tokens = normed.seq_len;
+        let hidden_dim = normed.hidden_dim;
         let shared = shared_expert_forward(
             ctx,
             weights,
@@ -667,6 +793,302 @@ mod gpu {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Steps 4-8 of the MoE block on the DeepGEMM SM90 BF16 m-grouped GEMMs
+    /// (`ARLE_QWEN35_DEEPGEMM=1`): pack → gate GEMM + up GEMM → silu_mul →
+    /// down GEMM → scatter/combine into `out`. `counts` was already filled by
+    /// step 3's count kernel.
+    ///
+    /// Per-call dispatch (masked vs contiguous):
+    ///
+    /// * **Masked** (`R = total_routes <= 128`, i.e. decode): A/D are fixed
+    ///   per-group bands `[G, 128, *]` and `masked_m = counts` bounds each
+    ///   group on-device. The band capacity is a HOST constant while the
+    ///   per-group counts are device-resident, so the only host-provable
+    ///   capacity bound is `max_g count_g <= Σ_g count_g = R <= 128` — which
+    ///   is exactly the dispatch threshold. Wasted compute is
+    ///   `Σ_g (align(count_g, BLOCK_M ∈ {64,128}) − count_g) <= 64·G_active`
+    ///   rows per GEMM; shapes are routing-independent (CUDA-graph-safe).
+    /// * **Contiguous** (`R > 128`, i.e. prefill): compact-ish `[m_cap, K]` A
+    ///   with 128-aligned per-group segments and `m_indices` row→group ids
+    ///   (-1 pads). Masked CANNOT serve this regime — a single hot expert can
+    ///   receive up to R rows, so the band capacity would have to be R per
+    ///   group (`G·R` rows of scratch). Contiguous pays
+    ///   `m_cap − Σ_g count_g <= align(R,128) + 128·min(R,G) − R` padding
+    ///   rows of garbage compute (pad tiles resolve to group 0 and are
+    ///   excluded from the scatter via the route-slot -1 sentinel).
+    ///
+    /// Gate and up run as TWO grouped GEMMs over the same A (fusing them into
+    /// one `[G, 2I, K]` grouped B — the checkpoint's native stacked layout —
+    /// is a follow-up: it halves A traffic and launch count but needs the
+    /// loader to keep the fused `gate_up` tensor un-split plus a strided
+    /// silu_mul over `[gate | up]` halves; deferred to keep this diff at the
+    /// licensed two-GEMM numerics of the hand path).
+    #[allow(clippy::too_many_arguments)]
+    fn deepgemm_routed_tail(
+        ctx: &DeviceContext,
+        weights: &MoeLayerWeights,
+        normed: &HiddenStates,
+        split: &ExpertSplit,
+        scratch: &mut MoeForwardScratch,
+        route_indices: RawDevicePtr<i32>,
+        route_weights: RawDevicePtr<f32>,
+        counts: RawDevicePtr<i32>,
+        out: &mut HiddenStates,
+        topk: usize,
+    ) -> Result<()> {
+        let num_tokens = normed.seq_len;
+        let hidden_dim = normed.hidden_dim;
+        let total_routes = num_tokens * topk;
+        let local_experts = split.experts_per_rank;
+        let stream = ctx.stream.cu_stream();
+
+        let (gate_g, up_g, down_g) = match (
+            &weights.gate_grouped,
+            &weights.up_grouped,
+            &weights.down_grouped,
+        ) {
+            (Some(g), Some(u), Some(d)) => (g, u, d),
+            _ => anyhow::bail!(
+                "DeepGEMM MoE path requires the grouped expert caches (load with ARLE_QWEN35_DEEPGEMM=1)"
+            ),
+        };
+        let moe_inter = gate_g.rows;
+        ensure!(
+            gate_g.groups == local_experts
+                && up_g.groups == local_experts
+                && down_g.groups == local_experts,
+            "DeepGEMM MoE group count mismatch: gate={} up={} down={} local_experts={local_experts}",
+            gate_g.groups,
+            up_g.groups,
+            down_g.groups
+        );
+        ensure!(
+            gate_g.cols == hidden_dim
+                && up_g.rows == moe_inter
+                && up_g.cols == hidden_dim
+                && down_g.rows == hidden_dim
+                && down_g.cols == moe_inter,
+            "DeepGEMM MoE grouped cache shape mismatch: gate={}x{} up={}x{} down={}x{} H={hidden_dim} I={moe_inter}",
+            gate_g.rows,
+            gate_g.cols,
+            up_g.rows,
+            up_g.cols,
+            down_g.rows,
+            down_g.cols
+        );
+        // BF16 kernel constraints: K % 64 (BLOCK_K) and N % 8, in both GEMM
+        // directions (gate/up: n=I k=H; down: n=H k=I) → both dims % 64.
+        ensure!(
+            hidden_dim.is_multiple_of(64) && moe_inter.is_multiple_of(64),
+            "DeepGEMM BF16 MoE needs H and I aligned to 64, got H={hidden_dim} I={moe_inter}"
+        );
+        // Fail loud if the native DeepGEMM bridge is a build-time stub.
+        moe::dsv4_deepgemm_native_preflight()?;
+
+        let use_masked = total_routes <= DEEPGEMM_MASKED_BAND;
+        let rows = if use_masked {
+            local_experts * DEEPGEMM_MASKED_BAND
+        } else {
+            deepgemm_contig_rows_cap(total_routes, local_experts)
+        };
+        ensure!(
+            rows.checked_mul(hidden_dim.max(moe_inter))
+                .is_some_and(|v| i32::try_from(v).is_ok()),
+            "DeepGEMM MoE padded rows {rows} x max(H={hidden_dim}, I={moe_inter}) exceeds the i32 kernel ABI"
+        );
+
+        // ── 4 (DG). Pack routed tokens + pad-row sentinels. ─────────────────
+        // packed_route_slot MUST be -1-refilled every call even single-GPU:
+        // the pack writes only the R real rows, and every PAD row has to read
+        // -1 so the scatter skips it (pad GEMM outputs are garbage — masked
+        // rows beyond count_g, contiguous tiles resolved against group 0).
+        // packed_hidden pad rows are zero-from-alloc or stale-from-prior-call;
+        // safe by the slot-table induction (GEMM rows are independent, pads
+        // never reach `out`).
+        let offsets_ptr = if use_masked {
+            // Fixed band bases `g * 128` — a pure function of the length.
+            let band_table: Vec<i32> = (0..local_experts as i32)
+                .map(|g| g * DEEPGEMM_MASKED_BAND as i32)
+                .collect();
+            cache_ptr(scratch.dg_band_offsets.upload_const(ctx, &band_table)?, ctx)
+        } else {
+            // 128-aligned per-group segment starts (device-side scan of the
+            // device-resident counts; the total is not read back — `rows` is
+            // the host cap).
+            let aligned_offsets =
+                cache_ptr(scratch.dg_aligned_offsets.get(ctx, local_experts)?, ctx);
+            let scan_total = cache_ptr(scratch.scan_total.get(ctx, 1)?, ctx);
+            // SAFETY: counts/offsets/total valid on ctx.stream for E_l groups.
+            unsafe {
+                moe::moe_exclusive_scan_aligned_i32(
+                    counts,
+                    aligned_offsets,
+                    scan_total,
+                    local_experts,
+                    DEEPGEMM_CONTIG_ALIGN,
+                    stream,
+                )?;
+            }
+            aligned_offsets
+        };
+        let cursors = cache_ptr(scratch.cursors.get_zeroed(ctx, local_experts)?, ctx);
+        let packed_route_slot = cache_ptr(scratch.packed_route_slot.neg1_filled(ctx, rows)?, ctx);
+        let packed_weight = cache_ptr(scratch.packed_weight.get(ctx, rows)?, ctx);
+        let packed_hidden = cache_ptr(&scratch.packed_hidden.get(ctx, hidden_dim, rows)?.data, ctx);
+        // SAFETY: buffers valid on ctx.stream; the pack writes every route's
+        // row at offsets[local] + cursor < rows (masked: count_g <= R <= 128
+        // = band capacity by the dispatch threshold; contiguous: aligned
+        // offsets + counts <= the rows cap by construction).
+        unsafe {
+            moe::dsv4_pack_local_experts_with_slots(
+                cache_ptr(&normed.data, ctx),
+                route_indices,
+                route_weights,
+                offsets_ptr,
+                cursors,
+                packed_hidden,
+                packed_route_slot,
+                packed_weight,
+                num_tokens,
+                hidden_dim,
+                topk,
+                split.local_expert_start,
+                local_experts,
+                stream,
+            )?;
+        }
+
+        // Contiguous only: row → local-expert map (-1 pads, refilled every
+        // call for the same sentinel reason as packed_route_slot).
+        let m_indices = if use_masked {
+            None
+        } else {
+            let m_indices = cache_ptr(scratch.dg_m_indices.neg1_filled(ctx, rows)?, ctx);
+            // SAFETY: counts/offsets are per-group; m_indices has `rows` slots.
+            unsafe {
+                moe::dsv4_fill_m_indices_from_counts(
+                    counts,
+                    offsets_ptr,
+                    m_indices,
+                    local_experts,
+                    rows,
+                    stream,
+                )?;
+            }
+            Some(m_indices)
+        };
+
+        // ── 5+6+7 (DG). gate GEMM + up GEMM → silu_mul → down GEMM. ─────────
+        // Heuristics-only hint: expected valid rows per group.
+        let expected_m = total_routes.div_ceil(local_experts).max(1);
+        let gate_out = scratch.gate_out.get(ctx, moe_inter, rows)?;
+        let up_out = scratch.up_out.get(ctx, moe_inter, rows)?;
+        // SAFETY: A `[rows, H]`, B `[G, I, H]`, D `[rows, I]` row-major BF16
+        // on ctx.stream; masked_m = counts (read-only); m_indices contract
+        // holds by the aligned scan (group segments start 128-aligned).
+        unsafe {
+            for (grouped_b, d) in [(gate_g, &*gate_out), (up_g, &*up_out)] {
+                if use_masked {
+                    moe::deepgemm_m_grouped_bf16_gemm_nt_masked(
+                        packed_hidden,
+                        cache_ptr(&grouped_b.data, ctx),
+                        cache_ptr(&d.data, ctx),
+                        counts,
+                        local_experts,
+                        DEEPGEMM_MASKED_BAND,
+                        moe_inter,
+                        hidden_dim,
+                        expected_m,
+                        stream,
+                    )?;
+                } else {
+                    moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
+                        packed_hidden,
+                        cache_ptr(&grouped_b.data, ctx),
+                        cache_ptr(&d.data, ctx),
+                        m_indices.expect("contiguous path fills m_indices"),
+                        local_experts,
+                        rows,
+                        moe_inter,
+                        hidden_dim,
+                        stream,
+                    )?;
+                }
+            }
+        }
+        // SwiGLU over the full padded buffers (UNCLAMPED — Qwen3.6 has no
+        // clamp); pad-row products land in `act` pad rows, which the down
+        // GEMM tiles cover only as further pad rows the scatter skips.
+        let act = scratch.act.get(ctx, moe_inter, rows)?;
+        silu_mul(ctx, gate_out, up_out, act)?;
+        let expert_out = scratch.expert_out.get(ctx, hidden_dim, rows)?;
+        // SAFETY: A `[rows, I]`, B `[G, H, I]`, D `[rows, H]`; same contracts
+        // as the gate/up GEMMs above.
+        unsafe {
+            if use_masked {
+                moe::deepgemm_m_grouped_bf16_gemm_nt_masked(
+                    cache_ptr(&act.data, ctx),
+                    cache_ptr(&down_g.data, ctx),
+                    cache_ptr(&expert_out.data, ctx),
+                    counts,
+                    local_experts,
+                    DEEPGEMM_MASKED_BAND,
+                    hidden_dim,
+                    moe_inter,
+                    expected_m,
+                    stream,
+                )?;
+            } else {
+                moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
+                    cache_ptr(&act.data, ctx),
+                    cache_ptr(&down_g.data, ctx),
+                    cache_ptr(&expert_out.data, ctx),
+                    m_indices.expect("contiguous path fills m_indices"),
+                    local_experts,
+                    rows,
+                    hidden_dim,
+                    moe_inter,
+                    stream,
+                )?;
+            }
+        }
+
+        // ── 8 (DG). Scatter weighted expert rows to route slots, combine. ───
+        // The scatter walks ALL `rows` padded rows and skips route_slot < 0,
+        // so exactly the R real rows land in route_out. Single-GPU that is a
+        // route↔slot bijection (all experts local → all R slots written);
+        // under EP the unwritten non-local slots MUST read zero in the
+        // combine (partial-sum contract) → zero-refill, same as the hand path.
+        let route_out = if split.ep_size == 1 {
+            scratch.route_out.get(ctx, hidden_dim, total_routes)?
+        } else {
+            scratch
+                .route_out
+                .get_zeroed(ctx, hidden_dim, total_routes)?
+        };
+        // SAFETY: all buffers valid on ctx.stream for the given shapes.
+        unsafe {
+            moe::dsv4_scatter_all_route_slots(
+                cache_ptr(&expert_out.data, ctx),
+                cache_ptr(&route_out.data, ctx),
+                packed_route_slot,
+                packed_weight,
+                rows,
+                hidden_dim,
+                stream,
+            )?;
+            moe::dsv4_combine_route_slot_outputs(
+                cache_ptr(&route_out.data, ctx),
+                cache_ptr(&out.data, ctx),
+                num_tokens,
+                topk,
+                hidden_dim,
+                stream,
+            )?;
+        }
         Ok(())
     }
 
@@ -3362,5 +3784,193 @@ mod tests {
         // Only token 0's two experts are present; token 1 needs entries [2,3].
         let tid2eid: Vec<i64> = vec![0, 1];
         assert!(super::hash_route(&cfg, &tid2eid, &[0u32, 1u32], &[0.0; 8]).is_err());
+    }
+
+    // ── DeepGEMM m-grouped layout math (kernel-foundation #2). ──────────────
+    // Host references mirror the device kernels (`moe_exclusive_scan_aligned_
+    // i32`, `dsv4_fill_m_indices_from_counts` over a -1-prefilled buffer, the
+    // `dsv4_pack_local_experts_with_slots` slot arithmetic) and the DeepGEMM
+    // scheduler contract (vendor `deep_gemm/scheduler/gemm.cuh`,
+    // `get_global_idx` for `GemmType::MGroupedContiguous`): the kernel
+    // resolves the B-side expert group ONCE per BLOCK_M output tile from
+    // `m_indices[m_block_idx * BLOCK_M]`, so a tile must never mix groups.
+
+    const ALIGN: usize = super::DEEPGEMM_CONTIG_ALIGN;
+
+    /// Mirror of `moe_exclusive_scan_aligned_i32_cuda`: exclusive prefix sum
+    /// of per-group counts, each group's span padded up to `alignment`.
+    fn aligned_scan_ref(counts: &[i32], alignment: i32) -> (Vec<i32>, i32) {
+        let mut offsets = Vec::with_capacity(counts.len());
+        let mut acc = 0i32;
+        for &c in counts {
+            offsets.push(acc);
+            // (signed `div_ceil` is unstable; counts are non-negative)
+            acc += (c + alignment - 1) / alignment * alignment;
+        }
+        (offsets, acc)
+    }
+
+    /// Mirror of -1-memset + `dsv4_fill_m_indices_from_counts_cuda`.
+    fn fill_m_indices_ref(counts: &[i32], offsets: &[i32], cap: usize) -> Vec<i32> {
+        let mut m = vec![-1i32; cap];
+        for (g, (&c, &o)) in counts.iter().zip(offsets).enumerate() {
+            for r in 0..c {
+                let dst = (o + r) as usize;
+                if dst < cap {
+                    m[dst] = g as i32;
+                }
+            }
+        }
+        m
+    }
+
+    /// The MGroupedContiguous scheduler contract: within every BLOCK_M tile,
+    /// every VALID row's group must equal the group read at the tile's first
+    /// row (pad rows are -1 and excluded downstream).
+    fn tile_contract_holds(m_indices: &[i32], block_m: usize) -> bool {
+        m_indices.chunks(block_m).all(|tile| {
+            let head = tile[0];
+            tile.iter().all(|&g| g < 0 || g == head)
+        })
+    }
+
+    #[test]
+    fn aligned_scan_offsets_are_aligned_and_within_cap() {
+        // Mixed counts incl. zero and exact-multiple groups.
+        let counts = vec![3i32, 0, 130, 128, 1];
+        let total_routes: i32 = counts.iter().sum();
+        let (offsets, total) = aligned_scan_ref(&counts, ALIGN as i32);
+        assert_eq!(offsets, vec![0, 128, 128, 384, 512]);
+        assert_eq!(total, 640);
+        for (g, &o) in offsets.iter().enumerate() {
+            assert_eq!(o as usize % ALIGN, 0, "group {g} offset {o} unaligned");
+            // Segments never overlap: offset + count <= next offset.
+            let end = o + counts[g];
+            let next = offsets.get(g + 1).copied().unwrap_or(total);
+            assert!(
+                end <= next,
+                "group {g} segment [{o}, {end}) overlaps {next}"
+            );
+        }
+        // The host launch cap bounds the device-side aligned total.
+        let cap = super::deepgemm_contig_rows_cap(total_routes as usize, counts.len());
+        assert!(
+            total as usize <= cap,
+            "aligned total {total} > host cap {cap}"
+        );
+        assert_eq!(cap % ALIGN, 0, "cap must stay 128-aligned for the bridge");
+    }
+
+    #[test]
+    fn contig_rows_cap_bounds_worst_case_skew() {
+        // Worst cases: all routes on one expert; one route per expert; empty.
+        for (counts, experts) in [
+            (vec![16384i32], 256usize),
+            (vec![1i32; 256], 256),
+            (vec![64i32; 256], 256),
+            (vec![0i32; 256], 256),
+        ] {
+            let mut padded = vec![0i32; experts];
+            padded[..counts.len()].copy_from_slice(&counts);
+            let routes: i32 = padded.iter().sum();
+            let (_, total) = aligned_scan_ref(&padded, ALIGN as i32);
+            let cap = super::deepgemm_contig_rows_cap(routes.max(1) as usize, experts);
+            assert!(
+                total as usize <= cap,
+                "aligned total {total} > cap {cap} for counts {padded:?}"
+            );
+        }
+    }
+
+    /// Item-6 contract test, POSITIVE: the 128-aligned layout keeps every
+    /// BLOCK_M=128 tile single-group, so `m_indices[tile_start]` (what the
+    /// kernel reads) is correct for every valid row of the tile.
+    #[test]
+    fn aligned_layout_satisfies_per_tile_group_contract() {
+        let counts = vec![100i32, 100, 3, 0, 257];
+        let (offsets, total) = aligned_scan_ref(&counts, ALIGN as i32);
+        let cap = total as usize + ALIGN; // trailing all-pad tile stays -1
+        let m = fill_m_indices_ref(&counts, &offsets, cap);
+        assert!(tile_contract_holds(&m, ALIGN));
+        // Pure-pad tiles (e.g. the trailing cap slack) read -1 at the head.
+        assert_eq!(m[total as usize], -1);
+    }
+
+    /// Item-6 contract test, NEGATIVE: the COMPACT (unaligned) layout — what
+    /// the DSv4 prefill contiguous path builds via the plain exclusive scan —
+    /// puts a group boundary inside a 128-row tile, so the kernel computes
+    /// the tail rows of the tile against the WRONG expert's weights. This is
+    /// the latent correctness bug this entry documents; the BF16 path uses
+    /// the aligned scan instead.
+    #[test]
+    fn compact_layout_violates_per_tile_group_contract() {
+        let counts = vec![100i32, 100];
+        // Plain (compact) exclusive scan: offsets [0, 100].
+        let offsets = vec![0i32, 100];
+        let m = fill_m_indices_ref(&counts, &offsets, 200);
+        assert!(
+            !tile_contract_holds(&m, ALIGN),
+            "compact layout must violate the per-tile contract (rows 100..128 \
+             are group 1 inside a tile whose head row is group 0)"
+        );
+    }
+
+    /// Pad rows are excluded from the combine: the pack writes a route slot
+    /// for the R real rows only, every pad row keeps the -1 sentinel the
+    /// scatter skips, and each route lands in exactly one packed row.
+    #[test]
+    fn pad_rows_keep_sentinel_and_every_route_packs_once() {
+        let counts = vec![2i32, 0, 3];
+        let (offsets, total) = aligned_scan_ref(&counts, ALIGN as i32);
+        let cap = total as usize;
+        // Mirror the pack: slot = offsets[g] + cursor[g]++ per route.
+        let mut route_slot = vec![-1i32; cap];
+        let mut cursors = vec![0i32; counts.len()];
+        let routes: Vec<usize> = vec![0, 2, 2, 2, 0]; // route -> expert
+        for (route, &g) in routes.iter().enumerate() {
+            let slot = (offsets[g] + cursors[g]) as usize;
+            cursors[g] += 1;
+            route_slot[slot] = route as i32;
+        }
+        // Scatter-skip semantics: only slot >= 0 rows reach route_out.
+        let written: Vec<i32> = route_slot.iter().copied().filter(|&s| s >= 0).collect();
+        assert_eq!(
+            written.len(),
+            routes.len(),
+            "every route packs exactly once"
+        );
+        let mut sorted = written.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3, 4]);
+        // Every pad row (outside [offset, offset+count)) keeps the sentinel.
+        for (row, &slot) in route_slot.iter().enumerate() {
+            let in_segment = counts
+                .iter()
+                .zip(&offsets)
+                .any(|(&c, &o)| row >= o as usize && row < (o + c) as usize);
+            assert_eq!(
+                slot >= 0,
+                in_segment,
+                "row {row}: packed rows and segment rows must coincide"
+            );
+        }
+    }
+
+    /// Masked-band dispatch threshold: R <= 128 is the only host-provable
+    /// bound on any single group's count (counts are device-resident), and it
+    /// keeps every pack slot inside its group's 128-row band.
+    #[test]
+    fn masked_band_threshold_bounds_per_group_counts() {
+        const BAND: i32 = 128;
+        // Worst skew at the threshold: all R = 128 routes on one expert.
+        let counts = vec![128i32, 0, 0];
+        let total: i32 = counts.iter().sum();
+        assert!(total <= BAND);
+        for (g, &c) in counts.iter().enumerate() {
+            assert!(c <= BAND, "group {g} count {c} exceeds the band");
+            // Band pack slot arithmetic: g * BAND + cursor < (g + 1) * BAND.
+            let last_slot = g as i32 * BAND + (c - 1).max(0);
+            assert!(last_slot < (g as i32 + 1) * BAND);
+        }
     }
 }

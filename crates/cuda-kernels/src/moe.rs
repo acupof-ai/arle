@@ -360,6 +360,37 @@ pub unsafe fn dsv4_cast_i32_to_i64(
     Ok(())
 }
 
+/// Exclusive prefix-sum over per-expert counts with each group's span padded
+/// up to `alignment` rows — the DeepGEMM m-grouped-contiguous layout builder
+/// (group segments must start BLOCK_M=128-aligned because the kernel resolves
+/// the per-tile B group from `m_indices[tile_start]`). Wraps
+/// [`ffi::moe_exclusive_scan_aligned_i32_cuda`].
+///
+/// # Safety
+/// `counts` / `offsets` / `total` must be valid on `stream`; `offsets` holds
+/// `n` entries and `total` one entry.
+pub unsafe fn moe_exclusive_scan_aligned_i32(
+    counts: RawDevicePtr<i32>,
+    offsets: RawDevicePtr<i32>,
+    total: RawDevicePtr<i32>,
+    n: usize,
+    alignment: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::moe_exclusive_scan_aligned_i32_cuda(
+            counts.as_ptr(),
+            offsets.as_mut_ptr(),
+            total.as_mut_ptr(),
+            i32::try_from(n)?,
+            i32::try_from(alignment)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Exclusive prefix-sum over per-expert counts → offsets (+ total).
 /// Wraps [`ffi::dsv4_exclusive_scan_i32_cuda`].
 ///
@@ -779,6 +810,92 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
             i32::try_from(n)?,
             i32::try_from(k)?,
             i32::try_from(sfa_aligned_m)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// SM90 BF16 m-grouped masked GEMM (NT): per group `g`,
+/// `d[g, 0..masked_m[g], :] = a[g, 0..masked_m[g], :] @ b[g]^T`. `a` is the
+/// per-group padded band `[num_groups, m, k]`, `b` the grouped weights
+/// `[num_groups, n, k]`, `d` `[num_groups, m, n]`, all row-major BF16.
+/// `expected_m` is a heuristics-only block-size hint (per-group expected
+/// valid rows). The native bridge rejects `m % 128 != 0` — the output TMA
+/// store writes full BLOCK_M (64/128) tiles, so a smaller band capacity would
+/// let a tile cross into the next group's band.
+///
+/// # Safety
+/// All pointers must be valid on `stream` for the shapes above; `masked_m`
+/// holds `num_groups` entries, each `<= m`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn deepgemm_m_grouped_bf16_gemm_nt_masked(
+    a: RawDevicePtr<bf16>,
+    b: RawDevicePtr<bf16>,
+    d: RawDevicePtr<bf16>,
+    masked_m: RawDevicePtr<i32>,
+    num_groups: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    expected_m: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::deepgemm_m_grouped_bf16_gemm_nt_masked_cuda(
+            a.as_ptr() as *const Half,
+            b.as_ptr() as *const Half,
+            d.as_mut_ptr() as *mut Half,
+            masked_m.as_ptr(),
+            i32::try_from(num_groups)?,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(expected_m)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// SM90 BF16 m-grouped contiguous GEMM (NT): `d = a @ b[g]^T` where each
+/// activation row's group is `m_indices[row]` (`-1` = padding). `a` is
+/// `[m, k]`, `b` `[num_groups, n, k]`, `d` `[m, n]`, all row-major BF16.
+///
+/// CONTRACT (DeepGEMM scheduler): the kernel reads the B group ONCE per
+/// BLOCK_M=128 output tile from `m_indices[tile_start]`, so every group's row
+/// segment must start 128-aligned (build the layout with
+/// [`moe_exclusive_scan_aligned_i32`]) and pad rows must carry `-1`. Pad-row
+/// outputs are computed against group 0 and are garbage — the caller excludes
+/// them via the packed route-slot `-1` sentinel (the scatter skips them).
+///
+/// # Safety
+/// All pointers must be valid on `stream` for the shapes above; `m_indices`
+/// holds `m` entries in `[-1, num_groups)`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn deepgemm_m_grouped_bf16_gemm_nt_contiguous(
+    a: RawDevicePtr<bf16>,
+    b: RawDevicePtr<bf16>,
+    d: RawDevicePtr<bf16>,
+    m_indices: RawDevicePtr<i32>,
+    num_groups: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::deepgemm_m_grouped_bf16_gemm_nt_contiguous_cuda(
+            a.as_ptr() as *const Half,
+            b.as_ptr() as *const Half,
+            d.as_mut_ptr() as *mut Half,
+            m_indices.as_ptr(),
+            i32::try_from(num_groups)?,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
             stream,
         )
         .result()?;

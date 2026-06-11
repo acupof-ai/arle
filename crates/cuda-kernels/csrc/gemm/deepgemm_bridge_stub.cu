@@ -50,6 +50,33 @@ extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
   return CUDA_ERROR_NOT_SUPPORTED;
 }
 
+extern "C" CUresult deepgemm_m_grouped_bf16_gemm_nt_masked_cuda(
+    const unsigned short*,
+    const unsigned short*,
+    unsigned short*,
+    const int*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    CUstream) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+extern "C" CUresult deepgemm_m_grouped_bf16_gemm_nt_contiguous_cuda(
+    const unsigned short*,
+    const unsigned short*,
+    unsigned short*,
+    const int*,
+    int,
+    int,
+    int,
+    int,
+    CUstream) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
 extern "C" CUresult dsv4_deepgemm_paged_mqa_logits_metadata_cuda(
     const int*,
     int*,

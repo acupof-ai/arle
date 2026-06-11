@@ -823,6 +823,271 @@ CUtensorMap make_tma_sfa_desc(
 
 std::string bool_lit(bool value) { return value ? "true" : "false"; }
 
+// ── SM90 BF16 m-grouped GEMM (KernelNoSF) ──────────────────────────────────
+// Heuristics ported from vendor/deepgemm csrc/jit_kernels/heuristics/sm90.hpp
+// for the BF16 (KernelNoSF) kernel family. Differences vs the FP8 1D2D port
+// above, per the upstream decision table:
+//   * block_k = 128 / elem_size(bf16) = 64 (FP8 uses 128);
+//   * no SFA/SFB shared memory and no extra-SFB smem term in the pipeline;
+//   * block_n enumerates 16..256 step 16 (KernelNoSF; 1D2D caps at 192) with
+//     no 1D2D `block_n > block_k` unroll constraint, but block_m and block_n
+//     may not BOTH exceed 128 (register budget);
+//   * MGroupedContiguous pins block_m to the contiguous-layout MK alignment
+//     (128 on SM90, heuristics/runtime.hpp); MGroupedMasked enumerates
+//     {64, 128};
+//   * masked multicast legality: ceil_div(n, block_n) divisible by the
+//     cluster size (contiguous validates peers at runtime in the scheduler);
+//   * cycle model bytes scale by elem_size(bf16) = 2 on the A/B side.
+
+constexpr int kBf16BlockK = 64;
+constexpr int kBf16ElemSize = 2;
+// SM90 contiguous-layout MK alignment (heuristics/runtime.hpp
+// kLegacyMKAlignmentForContiguousLayout). The contiguous scheduler resolves
+// the per-tile B group from `m_indices[m_block_idx * BLOCK_M]`
+// (scheduler/gemm.cuh `get_global_idx`), so every per-group row segment MUST
+// start at a multiple of this; BLOCK_M for MGroupedContiguous is pinned to it.
+constexpr int kBf16ContiguousAlignment = 128;
+
+PipelineConfig get_bf16_pipeline_config(const Layout& layout) {
+  const int smem_cd =
+      align_to(layout.block_m * layout.block_n * kBf16ElemSize, 1024);
+  const int smem_barriers = kMaxStages * 8 * 2;
+  const int smem_a_per_stage = layout.block_m * layout.block_k * kBf16ElemSize;
+  const int smem_b_per_stage = layout.block_n * layout.block_k * kBf16ElemSize;
+  const int smem_extra = smem_cd + smem_barriers;
+  const int smem_per_stage = smem_a_per_stage + smem_b_per_stage;
+  const int num_stages =
+      std::min((kSm90SmemCapacity - smem_extra) / smem_per_stage, kMaxStages);
+  return {smem_extra + num_stages * smem_per_stage, num_stages};
+}
+
+LayoutInfo get_bf16_layout_info(const GemmDesc& desc, const Layout& layout) {
+  const int64_t num_blocks =
+      static_cast<int64_t>(ceil_div(desc.expected_m, layout.block_m)) *
+      ceil_div(desc.expected_n, layout.block_n) * desc.expected_num_groups;
+  const int64_t num_waves = ceil_div(num_blocks, static_cast<int64_t>(desc.num_sms));
+  const double l2_bandwidth_per_cycle =
+      std::min(64.0 * static_cast<double>(desc.num_sms), 8e6 / 1.3e3);
+  const double l1_bandwidth_per_cycle = 128.0 * static_cast<double>(desc.num_sms);
+  const int64_t num_bytes_l2_ab =
+      static_cast<int64_t>(desc.expected_k) * kBf16ElemSize *
+      (layout.block_m / layout.cluster_n + layout.block_n / layout.cluster_m);
+  const int64_t num_bytes_l1_ab = static_cast<int64_t>(desc.expected_k) *
+                                  kBf16ElemSize *
+                                  (layout.block_m + layout.block_n);
+  const int64_t num_bytes_l1_tc =
+      static_cast<int64_t>(desc.expected_k) * kBf16ElemSize *
+          (std::max(64, layout.block_m) + layout.block_n) +
+      static_cast<int64_t>(layout.block_m) * layout.block_n * kBf16ElemSize;
+  const int64_t num_bytes_l1_l2_cd =
+      static_cast<int64_t>(layout.block_m) * layout.block_n * kBf16ElemSize;
+  const double num_l2_cycles =
+      static_cast<double>(num_bytes_l2_ab + num_bytes_l1_l2_cd) *
+      static_cast<double>(num_blocks) / l2_bandwidth_per_cycle;
+  const double num_l1_cycles =
+      static_cast<double>(num_bytes_l1_ab + num_bytes_l1_tc + num_bytes_l1_l2_cd) *
+      static_cast<double>(num_blocks) / l1_bandwidth_per_cycle;
+  const double wave_efficiency =
+      static_cast<double>(num_blocks) /
+      static_cast<double>(num_waves * desc.num_sms);
+  int64_t cycles =
+      static_cast<int64_t>(std::max(num_l1_cycles, num_l2_cycles) / wave_efficiency);
+  if (layout.cluster_size() > 1 && num_waves <= 1) {
+    cycles = std::numeric_limits<int64_t>::max();
+  }
+  return {cycles, layout};
+}
+
+std::vector<Layout> get_bf16_layout_candidates(const GemmDesc& desc, bool masked) {
+  std::vector<Layout> candidates;
+  const int block_k = kBf16BlockK;
+  std::vector<int> block_m_candidates =
+      masked ? std::vector<int>{64, 128}
+             : std::vector<int>{kBf16ContiguousAlignment};
+  for (int cluster_m = 1; cluster_m <= 2; ++cluster_m) {
+    for (int cluster_n = 1; cluster_n <= 2; ++cluster_n) {
+      if (cluster_m * cluster_n > 2) continue;
+      if (desc.num_sms % (cluster_m * cluster_n) != 0) continue;
+      for (int block_m : block_m_candidates) {
+        for (int block_n = 16; block_n <= 256; block_n += 16) {
+          // Masked multicast legality (upstream sm90.hpp): the N tiling must
+          // divide evenly into clusters.
+          if (masked &&
+              ceil_div(desc.n, block_n) % (cluster_m * cluster_n) != 0) {
+            continue;
+          }
+          // Register budget: at least one block dim must be <= 128.
+          if (block_m > 128 && block_n > 128) continue;
+          const Layout layout{block_m, block_n, block_k, cluster_m, cluster_n};
+          const int swizzle_ab = get_swizzle_mode(block_k, kBf16ElemSize);
+          if (swizzle_ab % 64 != 0) continue;
+          // STSM epilogue requires a swizzled D store.
+          if (get_swizzle_mode(block_n, kBf16ElemSize) == 16) continue;
+          const int stages = get_bf16_pipeline_config(layout).num_stages;
+          if (stages < 3 || (block_m * block_n < 128 * 192 && stages < 4)) {
+            continue;
+          }
+          candidates.push_back(layout);
+        }
+      }
+    }
+  }
+  return candidates;
+}
+
+GemmConfig get_best_bf16_config(const GemmDesc& desc, bool masked) {
+  const auto candidates = get_bf16_layout_candidates(desc, masked);
+  if (candidates.empty()) {
+    throw std::runtime_error("no DeepGEMM BF16 layout candidates");
+  }
+  LayoutInfo best = get_bf16_layout_info(desc, candidates[0]);
+  for (size_t i = 1; i < candidates.size(); ++i) {
+    const auto candidate = get_bf16_layout_info(desc, candidates[i]);
+    if (candidate.num_cycles < best.num_cycles) best = candidate;
+  }
+  const int swizzle_ab = get_swizzle_mode(kBf16BlockK, kBf16ElemSize);
+  const StorageConfig storage{
+      best.layout.block_m,
+      best.layout.block_n,
+      best.layout.block_m,
+      best.layout.block_n,
+      swizzle_ab,
+      swizzle_ab,
+      get_swizzle_mode(best.layout.block_n, kBf16ElemSize),
+  };
+  const auto pipeline = get_bf16_pipeline_config(best.layout);
+  const int num_math_threads = best.layout.block_m <= 64 ? 128 : 256;
+  return {
+      best.layout,
+      storage,
+      pipeline,
+      {desc.num_sms, 128 + num_math_threads, 128, num_math_threads},
+  };
+}
+
+std::string generate_bf16_kernel_code(
+    const GemmDesc& desc,
+    const GemmConfig& config,
+    const char* gemm_type) {
+  std::ostringstream code;
+  code << R"(
+#include <deep_gemm/impls/sm90_bf16_gemm.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {
+    auto ptr = reinterpret_cast<void*>(&sm90_bf16_gemm_impl<
+        cute::UMMA::Major::K, cute::UMMA::Major::K,
+        0, )" << desc.n << R"(, )" << desc.k << R"(,
+        )" << desc.num_groups << R"(,
+        )" << config.layout.block_m << R"(, )" << config.layout.block_n << R"(, )"
+       << config.layout.block_k << R"(,
+        )" << config.storage.swizzle_a_mode << R"(, )"
+       << config.storage.swizzle_b_mode << R"(, )"
+       << config.storage.swizzle_cd_mode << R"(,
+        )" << config.pipeline.num_stages << R"(,
+        )" << config.launch.num_tma_threads << R"(, )"
+       << config.launch.num_math_threads << R"(,
+        )" << config.layout.cluster_size() << R"(, )"
+       << bool_lit(config.layout.cluster_n > 1) << R"(,
+        )" << config.launch.num_sms << R"(, GemmType::)" << gemm_type << R"(,
+        false,
+        cutlass::bfloat16_t
+    >);
+}
+)";
+  return code.str();
+}
+
+// K-major BF16 A/B operand descriptor: gmem `[shape_mn * num_groups, shape_k]`
+// row-major, smem box `[block_mn, block_k]` (swizzle overrides the inner dim).
+CUtensorMap make_tma_ab_desc_bf16(
+    const void* ptr,
+    int shape_mn,
+    int shape_k,
+    int block_mn,
+    int block_k,
+    int outer_stride,
+    int num_groups,
+    int swizzle_mode) {
+  return make_tma_2d_desc_raw(
+      ptr, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, kBf16ElemSize, shape_k,
+      shape_mn * num_groups, block_k, block_mn, outer_stride, swizzle_mode);
+}
+
+CUresult launch_sm90_bf16_grouped(
+    const unsigned short* a,
+    const unsigned short* b,
+    unsigned short* d,
+    const int* grouped_layout,
+    int num_groups,
+    int m,
+    int n,
+    int k,
+    int expected_m,
+    bool masked,
+    CUstream stream) {
+  cudaDeviceProp prop{};
+  CUresult prop_err = current_device_prop(&prop);
+  if (prop_err != CUDA_SUCCESS) return prop_err;
+  if (prop.major != 9) return CUDA_ERROR_NOT_SUPPORTED;
+
+  int num_sms = env_int("DG_NUM_SMS", prop.multiProcessorCount);
+  if (num_sms <= 0 || num_sms > prop.multiProcessorCount || (num_sms % 2) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  // expected_m is a heuristics-only hint (upstream masked API): the per-group
+  // expected valid-row count used by the cycle model to pick block sizes. The
+  // contiguous variant expects one flat M; the masked variant weights the
+  // model by `num_groups`.
+  const GemmDesc desc{
+      m,
+      n,
+      k,
+      num_groups,
+      num_sms,
+      std::min(std::max(expected_m, 1), m),
+      n,
+      k,
+      masked ? num_groups : 1,
+  };
+  const auto config = get_best_bf16_config(desc, masked);
+  const auto code = generate_bf16_kernel_code(
+      desc, config, masked ? "MGroupedMasked" : "MGroupedContiguous");
+  const auto runtime = get_or_build_runtime(
+      masked ? "sm90_bf16_m_grouped_gemm_masked_native"
+             : "sm90_bf16_m_grouped_gemm_contiguous_native",
+      code, prop.major, prop.minor);
+
+  // Masked: A and D are per-group bands `[num_groups, m, *]`; contiguous: one
+  // flat `[m, *]` (the scheduler offsets B/D by the per-tile m_indices group).
+  const int ad_groups = masked ? num_groups : 1;
+  const auto tensor_map_a = make_tma_ab_desc_bf16(
+      a, m, k, config.storage.load_block_m, config.layout.block_k, k, ad_groups,
+      config.storage.swizzle_a_mode);
+  const auto tensor_map_b = make_tma_ab_desc_bf16(
+      b, n, k, config.storage.load_block_n, config.layout.block_k, k, num_groups,
+      config.storage.swizzle_b_mode);
+  const auto tensor_map_d = make_tma_d_desc(
+      d, m, n, config.storage.store_block_m, config.storage.store_block_n, n,
+      ad_groups, config.storage.swizzle_cd_mode);
+
+  dim3 grid(static_cast<unsigned>(config.launch.num_sms), 1, 1);
+  dim3 block(static_cast<unsigned>(config.launch.num_threads), 1, 1);
+  auto launch_config = construct_launch_config(
+      runtime->kernel, reinterpret_cast<cudaStream_t>(stream), config.pipeline.smem_size,
+      grid, block, config.layout.cluster_size(), false);
+
+  void* grouped_arg = const_cast<int*>(grouped_layout);
+  check_driver(
+      launch_kernel(
+          runtime->kernel, launch_config, grouped_arg, m, n, k, tensor_map_a,
+          tensor_map_b, tensor_map_d),
+      "DeepGEMM BF16 grouped launch");
+  return CUDA_SUCCESS;
+}
+
 std::string generate_paged_mqa_metadata_code(
     int aligned_batch_size,
     int split_kv,
@@ -1517,6 +1782,77 @@ extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
         a, sfa, b, sfb, d, m_indices, num_groups, m, n, k, sfa_aligned_m, stream);
   } catch (const std::exception& err) {
     std::fprintf(stderr, "DeepGEMM native contiguous bridge failed: %s\n", err.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+}
+
+// SM90 BF16 m-grouped masked GEMM (KernelNoSF, NT): per group g,
+// `d[g, 0..masked_m[g], :] = a[g, 0..masked_m[g], :] @ b[g]^T`.
+// `a` is `[num_groups, m, k]`, `b` `[num_groups, n, k]`, `d` `[num_groups, m, n]`,
+// all row-major BF16. `m` is the per-group band capacity: it MUST be a
+// multiple of 128 so a BLOCK_M (64 or 128) output tile can never cross into
+// the next group's band (the TMA store writes the full tile). `expected_m` is
+// a heuristics-only hint (per-group expected valid rows).
+extern "C" CUresult deepgemm_m_grouped_bf16_gemm_nt_masked_cuda(
+    const unsigned short* a,
+    const unsigned short* b,
+    unsigned short* d,
+    const int* masked_m,
+    int num_groups,
+    int m,
+    int n,
+    int k,
+    int expected_m,
+    CUstream stream) {
+  if (a == nullptr || b == nullptr || d == nullptr || masked_m == nullptr ||
+      stream == nullptr || num_groups <= 0 || m <= 0 || n <= 0 || k <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if ((k % kBf16BlockK) != 0 || (n % 8) != 0 || (m % 128) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  try {
+    return launch_sm90_bf16_grouped(
+        a, b, d, masked_m, num_groups, m, n, k, expected_m, true, stream);
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM native BF16 masked bridge failed: %s\n", err.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+}
+
+// SM90 BF16 m-grouped contiguous GEMM (KernelNoSF, NT): `d = a @ b[g]^T` where
+// each activation row's group is `m_indices[row]` (-1 = padding row). `a` is
+// `[m, k]`, `b` `[num_groups, n, k]`, `d` `[m, n]`, all row-major BF16.
+// CONTRACT (scheduler/gemm.cuh): the kernel resolves the B group ONCE per
+// BLOCK_M=128 output tile from `m_indices[tile_start]`, so every group's row
+// segment must start 128-aligned and pad rows must carry -1; pad-row outputs
+// are computed against `max(0, -1)` = group 0 and are garbage — callers must
+// exclude them (route-slot sentinel). `m` must be a multiple of 128.
+extern "C" CUresult deepgemm_m_grouped_bf16_gemm_nt_contiguous_cuda(
+    const unsigned short* a,
+    const unsigned short* b,
+    unsigned short* d,
+    const int* m_indices,
+    int num_groups,
+    int m,
+    int n,
+    int k,
+    CUstream stream) {
+  if (a == nullptr || b == nullptr || d == nullptr || m_indices == nullptr ||
+      stream == nullptr || num_groups <= 0 || m <= 0 || n <= 0 || k <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if ((k % kBf16BlockK) != 0 || (n % 8) != 0 ||
+      (m % kBf16ContiguousAlignment) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  try {
+    return launch_sm90_bf16_grouped(
+        a, b, d, m_indices, num_groups, m, n, k, m, false, stream);
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM native BF16 contiguous bridge failed: %s\n", err.what());
     return CUDA_ERROR_UNKNOWN;
   }
 }

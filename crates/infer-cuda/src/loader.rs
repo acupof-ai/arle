@@ -780,13 +780,46 @@ impl SafetensorLoader {
         };
         let shared_gate_router = self.load_matrix(ctx, &names.shared_expert_gate)?;
 
-        // Per-expert weight-pointer tables (one device pointer per owned expert).
-        let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
-        let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
-        let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
-        let gate_ptrs = cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &gate_refs)?;
-        let up_ptrs = cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &up_refs)?;
-        let down_ptrs = cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &down_refs)?;
+        // DeepGEMM grouped-B caches (opt-in): concat the per-expert matrices
+        // into one contiguous [G, n, k] buffer per projection, repoint the
+        // pointer tables into it, and DROP the per-expert copies — keeping
+        // both would double the routed-expert VRAM (~2x model weights on
+        // Qwen3.6-35B). The hand kernels keep working through the rebuilt
+        // tables (same [n, k] row-major slabs, new addresses).
+        let (gate_grouped, up_grouped, down_grouped) = if crate::moe::qwen35_deepgemm_enabled() {
+            let gate_g = MoeExpertGroup::concat(ctx, &gate)?;
+            let up_g = MoeExpertGroup::concat(ctx, &up)?;
+            let down_g = MoeExpertGroup::concat(ctx, &down)?;
+            // Event tracking is disabled: dropping the per-expert sources
+            // frees device memory at Rust last-use, so the async D2D concats
+            // MUST have completed first.
+            ctx.sync()?;
+            gate.clear();
+            up.clear();
+            down.clear();
+            (Some(gate_g), Some(up_g), Some(down_g))
+        } else {
+            (None, None, None)
+        };
+
+        // Per-expert weight-pointer tables (one device pointer per owned
+        // expert) — built from the per-expert matrices on the default path,
+        // or from the grouped buffer offsets on the DeepGEMM path.
+        let (gate_ptrs, up_ptrs, down_ptrs) = match (&gate_grouped, &up_grouped, &down_grouped) {
+            (Some(g), Some(u), Some(d)) => {
+                (g.ptr_table(ctx)?, u.ptr_table(ctx)?, d.ptr_table(ctx)?)
+            }
+            _ => {
+                let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
+                let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
+                let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
+                (
+                    cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &gate_refs)?,
+                    cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &up_refs)?,
+                    cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &down_refs)?,
+                )
+            }
+        };
 
         Ok(MoeLayerWeights {
             gate,
@@ -795,6 +828,9 @@ impl SafetensorLoader {
             gate_ptrs,
             up_ptrs,
             down_ptrs,
+            gate_grouped,
+            up_grouped,
+            down_grouped,
             router_gate,
             shared_gate,
             shared_up,
@@ -1569,15 +1605,91 @@ pub(crate) struct OwnedTensor {
 /// shared expert. Built by [`SafetensorLoader::load_moe_layer_experts`],
 /// consumed by [`crate::moe::moe_forward`].
 pub(crate) struct MoeLayerWeights {
+    /// Per-expert weight matrices (hand grouped-GEMM path). EMPTY when the
+    /// DeepGEMM grouped caches below are built (`ARLE_QWEN35_DEEPGEMM=1` at
+    /// load) — the grouped buffer then owns the only copy of the bytes and
+    /// the `*_ptrs` tables point into it, so the hand kernels stay runnable.
     pub(crate) gate: Vec<DeviceMatrix>,
     pub(crate) up: Vec<DeviceMatrix>,
     pub(crate) down: Vec<DeviceMatrix>,
     pub(crate) gate_ptrs: CudaSlice<u64>,
     pub(crate) up_ptrs: CudaSlice<u64>,
     pub(crate) down_ptrs: CudaSlice<u64>,
+    /// DeepGEMM grouped-B caches (`[groups, n, k]` contiguous row-major BF16,
+    /// this rank's EP experts only). `Some` iff `ARLE_QWEN35_DEEPGEMM=1` at
+    /// load; the default load path is byte-identical (fields stay `None`).
+    pub(crate) gate_grouped: Option<MoeExpertGroup>,
+    pub(crate) up_grouped: Option<MoeExpertGroup>,
+    pub(crate) down_grouped: Option<MoeExpertGroup>,
     pub(crate) router_gate: DeviceMatrix,
     pub(crate) shared_gate: DeviceMatrix,
     pub(crate) shared_up: DeviceMatrix,
     pub(crate) shared_down: DeviceMatrix,
     pub(crate) shared_gate_router: DeviceMatrix,
+}
+
+/// One contiguous `[groups, rows, cols]` row-major BF16 expert-weight buffer —
+/// DeepGEMM's grouped-B layout (group `g` starts at `g * rows * cols`).
+pub(crate) struct MoeExpertGroup {
+    pub(crate) data: CudaSlice<half::bf16>,
+    pub(crate) groups: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+}
+
+impl MoeExpertGroup {
+    /// Concatenate per-expert `[rows, cols]` matrices into one contiguous
+    /// group-major buffer (D2D). Weights are static after load; the source
+    /// matrices may be dropped afterwards **only after a stream sync** (event
+    /// tracking is disabled, so a Rust drop frees device memory immediately —
+    /// before the async copies may have run).
+    fn concat(ctx: &DeviceContext, experts: &[DeviceMatrix]) -> Result<Self> {
+        let first = experts
+            .first()
+            .ok_or_else(|| anyhow!("MoE expert group concat: no local experts"))?;
+        let (rows, cols) = (first.rows, first.cols);
+        let stride = rows * cols;
+        let groups = experts.len();
+        let mut data = ctx
+            .stream
+            .alloc_zeros::<half::bf16>(groups * stride)
+            .map_err(|e| anyhow!("MoE expert group alloc failed: {e}"))?;
+        for (g, expert) in experts.iter().enumerate() {
+            ensure!(
+                expert.rows == rows && expert.cols == cols && expert.data.len() == stride,
+                "MoE expert group {g} non-uniform: {}x{} (data len {}) != {rows}x{cols}",
+                expert.rows,
+                expert.cols,
+                expert.data.len()
+            );
+            ensure!(
+                expert.qweight.is_none() && expert.group_size == 0,
+                "MoE expert group {g} is quantized — DeepGEMM BF16 grouped cache needs dense BF16"
+            );
+            let mut dst = data.slice_mut(g * stride..(g + 1) * stride);
+            ctx.stream
+                .memcpy_dtod(&expert.data, &mut dst)
+                .map_err(|e| anyhow!("MoE expert group {g} D2D failed: {e}"))?;
+        }
+        Ok(Self {
+            data,
+            groups,
+            rows,
+            cols,
+        })
+    }
+
+    /// Device table of per-group base pointers (`data + g * rows * cols`) in
+    /// the same `*const u64` format as [`cuda_kernels::moe::build_expert_weight_ptr_table`],
+    /// so the hand grouped-GEMM kernels run unchanged on the grouped memory.
+    fn ptr_table(&self, ctx: &DeviceContext) -> Result<CudaSlice<u64>> {
+        let (base, _guard) = self.data.device_ptr(&ctx.stream);
+        let stride_bytes = (self.rows * self.cols * std::mem::size_of::<half::bf16>()) as u64;
+        let host: Vec<u64> = (0..self.groups as u64)
+            .map(|g| base + g * stride_bytes)
+            .collect();
+        ctx.stream
+            .clone_htod(&host)
+            .map_err(|e| anyhow!("MoE expert group ptr table H2D failed: {e}"))
+    }
 }
