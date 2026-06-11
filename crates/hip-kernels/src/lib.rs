@@ -80,12 +80,197 @@ impl std::fmt::Display for KernelError {
 
 impl std::error::Error for KernelError {}
 
+/// Basic-op launcher declarations shared by the real and stub `ffi` modules
+/// (signatures mirrored 1:1 from the cuda-kernels sources named per block;
+/// `__nv_bfloat16*` crosses as `*const/mut u16`, `cudaStream_t`/`CUstream`
+/// as `*mut c_void`, `cudaError_t`/`CUresult` as `i32`).
+macro_rules! basic_op_launchers {
+    ($decl:ident) => {
+        // crates/cuda-kernels/csrc/misc/elementwise_basic.cu
+        $decl!(silu_mul_cuda(
+            gate: *const u16, up: *const u16, out: *mut u16, n: i32,
+            stream: *mut c_void,
+        ));
+        $decl!(dsv4_swiglu_clamped_cuda(
+            gate: *const u16, up: *const u16, out: *mut u16, n: i32,
+            limit: f32, stream: *mut c_void,
+        ));
+        $decl!(add_scaled_row_cuda(
+            row: *const u16, out: *mut u16, hidden_dim: i32, token_idx: i32,
+            scale: f32, stream: *mut c_void,
+        ));
+        $decl!(add_scaled_row_segment_cuda(
+            row: *const u16, out: *mut u16, row_len: i32, out_hidden_dim: i32,
+            token_idx: i32, segment_offset: i32, scale: f32, stream: *mut c_void,
+        ));
+        $decl!(add_cuda(
+            a: *const u16, b: *const u16, out: *mut u16, n: i32,
+            stream: *mut c_void,
+        ));
+        $decl!(add_assign_cuda(
+            a: *mut u16, b: *const u16, n: i32, stream: *mut c_void,
+        ));
+        $decl!(embedding_decode_cuda(
+            table: *const u16, token_id: *const i32, out: *mut u16,
+            hidden_dim: i32, stream: *mut c_void,
+        ));
+        $decl!(embedding_batched_cuda(
+            table: *const u16, token_ids: *const i32, out: *mut u16,
+            hidden_dim: i32, batch_size: i32, stream: *mut c_void,
+        ));
+
+        // crates/cuda-kernels/csrc/misc/norm.cu
+        $decl!(rms_norm_cuda(
+            x: *const u16, weight: *const u16, out: *mut u16, n: i32,
+            eps: f32, stream: *mut c_void,
+        ));
+        $decl!(fused_add_rms_norm_cuda(
+            hidden: *mut u16, residual: *const u16, weight: *const u16,
+            out: *mut u16, n: i32, eps: f32, stream: *mut c_void,
+        ));
+        $decl!(fused_add_rms_norm_batched_cuda(
+            hidden: *mut u16, residual: *const u16, weight: *const u16,
+            out: *mut u16, hidden_dim: i32, seq_len: i32, eps: f32,
+            stream: *mut c_void,
+        ));
+        $decl!(rms_norm_batched_cuda(
+            x: *const u16, weight: *const u16, out: *mut u16,
+            hidden_dim: i32, seq_len: i32, eps: f32, stream: *mut c_void,
+        ));
+        $decl!(rms_norm_batched_f32_in_cuda(
+            x: *const f32, weight: *const u16, out: *mut u16,
+            hidden_dim: i32, seq_len: i32, eps: f32, stream: *mut c_void,
+        ));
+        $decl!(add_bf16_into_f32_cuda(
+            out: *mut f32, input: *const u16, n: i32, stream: *mut c_void,
+        ));
+        $decl!(cast_bf16_to_f32_cuda(
+            input: *const u16, out: *mut f32, n: i32, stream: *mut c_void,
+        ));
+        $decl!(cast_f32_to_bf16_cuda(
+            input: *const f32, out: *mut u16, n: i32, stream: *mut c_void,
+        ));
+        $decl!(rms_norm_offset_cuda(
+            x: *const u16, weight: *const u16, out: *mut u16, n: i32,
+            eps: f32, stream: *mut c_void,
+        ));
+        $decl!(fused_add_rms_norm_offset_cuda(
+            hidden: *mut u16, residual: *const u16, weight: *const u16,
+            out: *mut u16, n: i32, eps: f32, stream: *mut c_void,
+        ));
+        $decl!(rms_norm_batched_offset_cuda(
+            x: *const u16, weight: *const u16, out: *mut u16,
+            hidden_dim: i32, seq_len: i32, eps: f32, stream: *mut c_void,
+        ));
+        $decl!(rms_norm_gated_cuda(
+            x: *const u16, weight: *const f32, gate: *const u16, out: *mut u16,
+            num_heads: i32, head_dim: i32, eps: f32, stream: *mut c_void,
+        ));
+
+        // crates/cuda-kernels/csrc/misc/sampling.cu
+        $decl!(argmax_logprob_cuda(
+            x: *const u16, out_idx: *mut i32, out_logprob: *mut f32, n: i32,
+            stream: *mut c_void,
+        ));
+        $decl!(argmax_cuda(
+            x: *const u16, out: *mut i32, n: i32, stream: *mut c_void,
+        ));
+        $decl!(argmax_batch_logprob_cuda(
+            logits: *const u16, token_ids: *mut i32, logprobs: *mut f32,
+            batch_size: i32, vocab_size: i32, stream: *mut c_void,
+        ));
+        $decl!(argmax_batch_cuda(
+            logits: *const u16, token_ids: *mut i32, batch_size: i32,
+            vocab_size: i32, stream: *mut c_void,
+        ));
+        $decl!(gpu_sample_cuda(
+            logits: *const u16, probs_scratch: *mut f32, output: *mut i32,
+            vocab_size: i32, inv_temperature: f32, top_k: i32, top_p: f32,
+            random_val: f32, stream: *mut c_void,
+        ));
+
+        // crates/cuda-kernels/csrc/gemm/quantized_gemv.cu — the GGUF
+        // Q4_K/Q5_K/Q6_K subset infer-hip serves; the fp8/fp4 + w{2,4,8}a16
+        // launchers also compile into the archive but get Rust decls with
+        // their first caller (interfaces trail callers).
+        $decl!(q4k_gemv_cuda(
+            weight: *const u8, input: *const u16, output: *mut u16,
+            n: i32, k: i32, stream: *mut c_void,
+        ));
+        $decl!(q4k_gemv_batch_cuda(
+            weight: *const u8, input: *const u16, output: *mut u16,
+            b: i32, n: i32, k: i32, stream: *mut c_void,
+        ));
+        $decl!(q4k_dequant_chunk_cuda(
+            weight: *const u8, out: *mut u16, n: i32, k: i32,
+            k_start: i32, k_len: i32, stream: *mut c_void,
+        ));
+        $decl!(q5k_gemv_cuda(
+            weight: *const u8, input: *const u16, output: *mut u16,
+            n: i32, k: i32, stream: *mut c_void,
+        ));
+        $decl!(q5k_gemv_batch_cuda(
+            weight: *const u8, input: *const u16, output: *mut u16,
+            b: i32, n: i32, k: i32, stream: *mut c_void,
+        ));
+        $decl!(q5k_dequant_chunk_cuda(
+            weight: *const u8, out: *mut u16, n: i32, k: i32,
+            k_start: i32, k_len: i32, stream: *mut c_void,
+        ));
+        $decl!(q6k_gemv_cuda(
+            weight: *const u8, input: *const u16, output: *mut u16,
+            n: i32, k: i32, stream: *mut c_void,
+        ));
+        $decl!(q6k_gemv_batch_cuda(
+            weight: *const u8, input: *const u16, output: *mut u16,
+            b: i32, n: i32, k: i32, stream: *mut c_void,
+        ));
+        $decl!(q6k_dequant_chunk_cuda(
+            weight: *const u8, out: *mut u16, n: i32, k: i32,
+            k_start: i32, k_len: i32, stream: *mut c_void,
+        ));
+        $decl!(q4k_embedding_batched_cuda(
+            weight: *const u8, token_ids: *const i32, out: *mut u16,
+            hidden_dim: i32, batch_size: i32, stream: *mut c_void,
+        ));
+        $decl!(q5k_embedding_batched_cuda(
+            weight: *const u8, token_ids: *const i32, out: *mut u16,
+            hidden_dim: i32, batch_size: i32, stream: *mut c_void,
+        ));
+        $decl!(q6k_embedding_batched_cuda(
+            weight: *const u8, token_ids: *const i32, out: *mut u16,
+            hidden_dim: i32, batch_size: i32, stream: *mut c_void,
+        ));
+        $decl!(q4k_embedding_decode_cuda(
+            weight: *const u8, token_id: *const i32, out: *mut u16,
+            hidden_dim: i32, stream: *mut c_void,
+        ));
+        $decl!(q5k_embedding_decode_cuda(
+            weight: *const u8, token_id: *const i32, out: *mut u16,
+            hidden_dim: i32, stream: *mut c_void,
+        ));
+        $decl!(q6k_embedding_decode_cuda(
+            weight: *const u8, token_id: *const i32, out: *mut u16,
+            hidden_dim: i32, stream: *mut c_void,
+        ));
+    };
+}
+
 /// Raw C-ABI launcher declarations (status = `hipError_t` as `i32`, stream
 /// last as `*mut c_void`). Public so the future `infer-hip` executor can
 /// call the DSv4 launchers directly — wrappers trail callers.
 #[cfg(feature = "hip")]
 pub mod ffi {
     use std::ffi::c_void;
+
+    macro_rules! declare_launcher {
+        ($name:ident($($arg:ident: $ty:ty,)*)) => {
+            unsafe extern "C" {
+                pub fn $name($($arg: $ty),*) -> i32;
+            }
+        };
+    }
+    basic_op_launchers!(declare_launcher);
 
     // csrc/iq2_mmvq.cu launchers (status = hipError_t, stream last).
     unsafe extern "C" {
@@ -340,6 +525,28 @@ mod real {
 #[cfg(feature = "hip")]
 pub use real::{mmvq_iq2_xxs, mmvq_q2_k, quantize_row_q8_1};
 
+/// Stub `ffi` with the same basic-op launcher names/signatures as the real
+/// module — `infer-hip` compiles against `hip_kernels::ffi::*` on any machine
+/// and every call answers [`NOT_COMPILED`].
+#[cfg(not(feature = "hip"))]
+pub mod ffi {
+    use std::ffi::c_void;
+
+    macro_rules! declare_launcher {
+        ($name:ident($($arg:ident: $ty:ty,)*)) => {
+            /// Stub — see the `hip` build for the real contract.
+            ///
+            /// # Safety
+            /// No-op; never dereferences its arguments.
+            pub unsafe fn $name($($arg: $ty),*) -> i32 {
+                $(let _ = $arg;)*
+                super::NOT_COMPILED.0
+            }
+        };
+    }
+    basic_op_launchers!(declare_launcher);
+}
+
 #[cfg(not(feature = "hip"))]
 mod stub {
     use super::{NOT_COMPILED, Result};
@@ -462,5 +669,32 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, NOT_COMPILED);
         assert!(NOT_COMPILED.to_string().contains("not compiled"));
+    }
+
+    #[cfg(not(feature = "hip"))]
+    #[test]
+    fn basic_op_ffi_stubs_report_not_compiled() {
+        let code = unsafe {
+            ffi::rms_norm_cuda(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+                1e-6,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, NOT_COMPILED.0);
+        let code = unsafe {
+            ffi::q4k_gemv_cuda(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, NOT_COMPILED.0);
     }
 }

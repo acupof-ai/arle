@@ -1,0 +1,22 @@
+[package]
+name = "infer-hip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+deepseek-spec = { path = "../deepseek-spec" }
+hip-kernels = { path = "../hip-kernels", optional = true }
+hip-sys = { path = "../hip-sys", optional = true }
+infer-plan = { path = "../infer-plan" }
+infer-seam = { path = "../infer-seam" }
+memmap2 = { workspace = true }
+
+[features]
+default = []
+hip = ["dep:hip-sys", "dep:hip-kernels", "hip-sys/hip", "hip-kernels/hip"]
+
+[lints]
+workspace = true
