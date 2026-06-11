@@ -36,7 +36,6 @@ mod types;
 
 #[cfg(feature = "cuda")]
 pub use loaded::CudaWorkerEngine;
-pub use loaded::EngineLoadConfig;
 #[cfg(any(
     feature = "metal",
     feature = "cuda",
@@ -49,6 +48,7 @@ pub use loaded::LoadedInferenceEngine;
 /// world (DSv4 + Qwen3.5/3.6 MoE). Consumed by `cli::serve_multiproc`.
 #[cfg(feature = "cuda")]
 pub use loaded::cuda_model_takes_multiproc_serve;
+pub use loaded::{EngineLoadConfig, KvCacheDtype};
 pub use serve::{ServeHttpOptions, ServeKvSsdOptions, ServeSpecOptions, ServeSpecType, serve_http};
 pub use serve_engine::ServeInferenceEngine;
 // DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so

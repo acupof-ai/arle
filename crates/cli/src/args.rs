@@ -335,6 +335,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     pub(crate) kv_ssd_path: Option<PathBuf>,
 
+    /// KV cache storage dtype. `auto` lets the backend choose its default.
+    #[arg(long, value_enum, default_value_t = ServeKvCacheDtypeArg::Auto)]
+    pub(crate) kv_cache_dtype: ServeKvCacheDtypeArg,
+
     /// Maximum bytes this serve process may use under --kv-ssd-path.
     #[arg(long, value_parser = parse_positive_usize, requires = "kv_ssd_path")]
     pub(crate) kv_ssd_max_bytes: Option<usize>,
@@ -424,6 +428,13 @@ pub(crate) enum ServeSpecTypeArg {
     None,
     Auto,
     Mtp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ServeKvCacheDtypeArg {
+    Auto,
+    Bf16,
+    Int8,
 }
 
 #[derive(Debug, Clone, clap::Args)]
