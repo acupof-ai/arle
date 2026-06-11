@@ -78,6 +78,14 @@ pub enum Kernel {
     SoftMax,
     ArgMax,
     FlashAttn,
+    Dsv4PrepareQk,
+    Dsv4CompressorUpdate,
+    Dsv4CsaSelect,
+    Dsv4HybridAttention,
+    Dsv4SwaAttention,
+    Dsv4Mhc,
+    Dsv4OutputInverseRope,
+    SwigluClamped,
 }
 
 impl Kernel {
@@ -101,6 +109,14 @@ impl Kernel {
             Kernel::SoftMax => "soft_max",
             Kernel::ArgMax => "argmax",
             Kernel::FlashAttn => "flash_attn",
+            Kernel::Dsv4PrepareQk => "dsv4_prepare_qk",
+            Kernel::Dsv4CompressorUpdate => "dsv4_compressor_update",
+            Kernel::Dsv4CsaSelect => "dsv4_csa_select",
+            Kernel::Dsv4HybridAttention => "dsv4_hybrid_attention",
+            Kernel::Dsv4SwaAttention => "dsv4_swa_attention",
+            Kernel::Dsv4Mhc => "dsv4_mhc",
+            Kernel::Dsv4OutputInverseRope => "dsv4_output_inverse_rope",
+            Kernel::SwigluClamped => "swiglu_clamped",
         }
     }
 }
@@ -123,6 +139,7 @@ pub enum KernelError {
     NotCompiled,
     ShaderMissing(&'static str),
     InvalidDispatch,
+    InvalidPushConstants,
     Runtime(String),
 }
 
@@ -143,12 +160,59 @@ impl std::fmt::Display for KernelError {
             KernelError::InvalidDispatch => {
                 write!(f, "Vulkan dispatch dimensions must be non-zero")
             }
+            KernelError::InvalidPushConstants => {
+                write!(f, "Vulkan push constants must be 4-byte aligned")
+            }
             KernelError::Runtime(msg) => write!(f, "{msg}"),
         }
     }
 }
 
 impl std::error::Error for KernelError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelParams {
+    words: Vec<u32>,
+}
+
+impl KernelParams {
+    pub fn empty() -> Self {
+        Self { words: Vec::new() }
+    }
+
+    pub fn from_words(words: impl Into<Vec<u32>>) -> Self {
+        Self {
+            words: words.into(),
+        }
+    }
+
+    pub fn push_u32(&mut self, value: u32) {
+        self.words.push(value);
+    }
+
+    pub fn push_i32(&mut self, value: i32) {
+        self.words.push(value as u32);
+    }
+
+    pub fn push_f32(&mut self, value: f32) {
+        self.words.push(value.to_bits());
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        self.words.len() * std::mem::size_of::<u32>()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    pub fn to_le_bytes(&self) -> Vec<u8> {
+        self.words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect()
+    }
+}
 
 macro_rules! launcher_fns {
     ($call:path) => {
@@ -298,6 +362,88 @@ macro_rules! launcher_fns {
     };
 }
 
+macro_rules! fused_launcher_fns {
+    ($call:path) => {
+        pub fn dsv4_prepare_qk(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call(Kernel::Dsv4PrepareQk, ctx, buffers, dispatch, params)
+        }
+
+        pub fn dsv4_compressor_update(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call(Kernel::Dsv4CompressorUpdate, ctx, buffers, dispatch, params)
+        }
+
+        pub fn dsv4_csa_select(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call(Kernel::Dsv4CsaSelect, ctx, buffers, dispatch, params)
+        }
+
+        pub fn dsv4_hybrid_attention(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call(Kernel::Dsv4HybridAttention, ctx, buffers, dispatch, params)
+        }
+
+        pub fn dsv4_swa_attention(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call(Kernel::Dsv4SwaAttention, ctx, buffers, dispatch, params)
+        }
+
+        pub fn dsv4_mhc(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call(Kernel::Dsv4Mhc, ctx, buffers, dispatch, params)
+        }
+
+        pub fn dsv4_output_inverse_rope(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call(
+                Kernel::Dsv4OutputInverseRope,
+                ctx,
+                buffers,
+                dispatch,
+                params,
+            )
+        }
+
+        pub fn swiglu_clamped(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call(Kernel::SwigluClamped, ctx, buffers, dispatch, params)
+        }
+    };
+}
+
 #[cfg(feature = "vulkan")]
 mod real {
     use super::{Dispatch, Kernel, KernelError, Result};
@@ -310,8 +456,28 @@ mod real {
         buffers: &[&vulkan_sys::DeviceBuffer<'_>],
         dispatch: Dispatch,
     ) -> Result<()> {
+        launch_with_params(
+            kernel,
+            ctx,
+            buffers,
+            dispatch,
+            &super::KernelParams::empty(),
+        )
+    }
+
+    pub fn launch_with_params(
+        kernel: Kernel,
+        ctx: &vulkan_sys::VulkanContext,
+        buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        dispatch: Dispatch,
+        params: &super::KernelParams,
+    ) -> Result<()> {
         if dispatch.x == 0 || dispatch.y == 0 || dispatch.z == 0 {
             return Err(KernelError::InvalidDispatch);
+        }
+        let push_bytes = params.to_le_bytes();
+        if !push_bytes.len().is_multiple_of(4) {
+            return Err(KernelError::InvalidPushConstants);
         }
         let Some(path) = shader_path(kernel) else {
             return Err(KernelError::ShaderMissing(kernel.shader_name()));
@@ -324,8 +490,13 @@ mod real {
             .map_err(|e| KernelError::Runtime(e.to_string()))?;
         let set = vulkan_sys::DescriptorSet::storage_buffers(ctx, &layout, buffers)
             .map_err(|e| KernelError::Runtime(e.to_string()))?;
-        let pipeline = vulkan_sys::ComputePipeline::create(ctx, &shader, &[&layout])
-            .map_err(|e| KernelError::Runtime(e.to_string()))?;
+        let pipeline = vulkan_sys::ComputePipeline::create_with_push_constants(
+            ctx,
+            &shader,
+            &[&layout],
+            push_bytes.len() as u32,
+        )
+        .map_err(|e| KernelError::Runtime(e.to_string()))?;
         let commands = vulkan_sys::CommandPool::create(ctx)
             .map_err(|e| KernelError::Runtime(e.to_string()))?;
         commands
@@ -341,6 +512,15 @@ mod real {
                         &[set.raw()],
                         &[],
                     );
+                    if !push_bytes.is_empty() {
+                        device.cmd_push_constants(
+                            cmd,
+                            pipeline.layout(),
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            &push_bytes,
+                        );
+                    }
                     device.cmd_dispatch(cmd, dispatch.x, dispatch.y, dispatch.z);
                 }
                 Ok(())
@@ -357,6 +537,8 @@ mod real {
 
 #[cfg(feature = "vulkan")]
 launcher_fns!(real::launch);
+#[cfg(feature = "vulkan")]
+fused_launcher_fns!(real::launch_with_params);
 
 #[cfg(not(feature = "vulkan"))]
 mod stub {
@@ -370,10 +552,22 @@ mod stub {
     ) -> Result<()> {
         Err(KernelError::NotCompiled)
     }
+
+    pub fn launch_with_params(
+        _kernel: Kernel,
+        _ctx: &vulkan_sys::VulkanContext,
+        _buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+        _dispatch: super::Dispatch,
+        _params: &super::KernelParams,
+    ) -> Result<()> {
+        Err(KernelError::NotCompiled)
+    }
 }
 
 #[cfg(not(feature = "vulkan"))]
 launcher_fns!(stub::launch);
+#[cfg(not(feature = "vulkan"))]
+fused_launcher_fns!(stub::launch_with_params);
 
 #[cfg(test)]
 mod tests {
@@ -415,6 +609,35 @@ mod tests {
         ];
         assert_eq!(names.len(), 18);
         assert!(names.iter().all(|name| !name.is_empty()));
+    }
+
+    #[test]
+    fn shader_names_cover_dsv4_fused_op_set() {
+        let names = [
+            Kernel::Dsv4PrepareQk.shader_name(),
+            Kernel::Dsv4CompressorUpdate.shader_name(),
+            Kernel::Dsv4CsaSelect.shader_name(),
+            Kernel::Dsv4HybridAttention.shader_name(),
+            Kernel::Dsv4SwaAttention.shader_name(),
+            Kernel::Dsv4Mhc.shader_name(),
+            Kernel::Dsv4OutputInverseRope.shader_name(),
+            Kernel::SwigluClamped.shader_name(),
+        ];
+        assert_eq!(names.len(), 8);
+        assert!(names.iter().all(|name| !name.is_empty()));
+    }
+
+    #[test]
+    fn kernel_params_are_le_words() {
+        let mut params = KernelParams::empty();
+        params.push_u32(0x1122_3344);
+        params.push_i32(-1);
+        params.push_f32(1.0);
+        assert_eq!(params.len_bytes(), 12);
+        assert_eq!(
+            params.to_le_bytes(),
+            [0x44, 0x33, 0x22, 0x11, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x80, 0x3f]
+        );
     }
 
     #[cfg(not(feature = "vulkan"))]

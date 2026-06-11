@@ -1,0 +1,32 @@
+#version 450
+// ARLE Vulkan shader adapted from crates/cuda-kernels/csrc/misc/elementwise_basic.cu
+// dsv4_swiglu_clamped_kernel and ggml-org/llama.cpp @ d2462f8f GLU plumbing (MIT).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint n;
+    float limit;
+} p;
+
+layout(binding = 0) readonly buffer Gate {
+    float gate[];
+};
+
+layout(binding = 1) readonly buffer Up {
+    float up[];
+};
+
+layout(binding = 2) writeonly buffer Out {
+    float out_data[];
+};
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n || !(p.limit > 0.0)) {
+        return;
+    }
+    const float g = min(gate[idx], p.limit);
+    const float u = clamp(up[idx], -p.limit, p.limit);
+    out_data[idx] = (g / (1.0 + exp(-g))) * u;
+}

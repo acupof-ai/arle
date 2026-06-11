@@ -158,6 +158,46 @@ const LOCAL: &[ShaderSpec] = &[
         source: "crates/vulkan-kernels/shaders/geglu.comp",
         defines: &[],
     },
+    ShaderSpec {
+        name: "dsv4_prepare_qk",
+        source: "crates/vulkan-kernels/shaders/dsv4_prepare_qk.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "dsv4_compressor_update",
+        source: "crates/vulkan-kernels/shaders/dsv4_compressor_update.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "dsv4_csa_select",
+        source: "crates/vulkan-kernels/shaders/dsv4_csa_select.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "dsv4_hybrid_attention",
+        source: "crates/vulkan-kernels/shaders/dsv4_hybrid_attention.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "dsv4_swa_attention",
+        source: "crates/vulkan-kernels/shaders/dsv4_swa_attention.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "dsv4_mhc",
+        source: "crates/vulkan-kernels/shaders/dsv4_mhc.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "dsv4_output_inverse_rope",
+        source: "crates/vulkan-kernels/shaders/dsv4_output_inverse_rope.comp",
+        defines: &[],
+    },
+    ShaderSpec {
+        name: "swiglu_clamped",
+        source: "crates/vulkan-kernels/shaders/swiglu_clamped.comp",
+        defines: &[],
+    },
 ];
 
 fn main() {
