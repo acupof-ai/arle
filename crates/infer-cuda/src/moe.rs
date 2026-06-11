@@ -136,6 +136,7 @@ pub(crate) fn flatten_routing(
 /// (vendor `deep_gemm/scheduler/gemm.cuh::get_global_idx`), and BLOCK_M for
 /// the contiguous layout is pinned to 128 — so every expert group's row
 /// segment must start at a multiple of 128, with `-1` on every pad row.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const DEEPGEMM_CONTIG_ALIGN: usize = 128;
 
 /// Host upper bound on the 128-aligned packed row count for the DeepGEMM
@@ -150,16 +151,17 @@ pub(crate) const DEEPGEMM_CONTIG_ALIGN: usize = 128;
 /// the true aligned total carry `m_indices = -1` and compute excluded garbage.
 /// Always a multiple of 128 (the native bridge rejects unaligned `m`).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn deepgemm_contig_rows_cap(total_routes: usize, local_experts: usize) -> usize {
+    let a = DEEPGEMM_CONTIG_ALIGN;
+    total_routes.div_ceil(a) * a + a * local_experts.min(total_routes)
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 /// Routed-row floor below which the DeepGEMM grouped path loses to the hand
 /// CUDA-core kernels (pod A/B 2026-06-11: decode R=8 hand wins +8%, prefill
 /// R=16384 DeepGEMM wins -33% needle wall; 1024 = 128-token chunk x top-8
 /// keeps both measured regimes on their winning side).
 pub(crate) const QWEN35_DEEPGEMM_MIN_ROUTES: usize = 1024;
-
-pub(crate) fn deepgemm_contig_rows_cap(total_routes: usize, local_experts: usize) -> usize {
-    let a = DEEPGEMM_CONTIG_ALIGN;
-    total_routes.div_ceil(a) * a + a * local_experts.min(total_routes)
-}
 
 /// `ARLE_QWEN35_DEEPGEMM=1`: swap the Qwen3.5/3.6 hand CUDA-core grouped
 /// expert GEMMs (~3.9 TFLOP/s class) for DeepGEMM SM90 BF16 m-grouped GEMMs
