@@ -125,3 +125,20 @@ Validation (8×H20, both fixes, **default batched** `ARLE_DSV4_SPEC_DECODE=1`):
 non-batched pass the needle gate's miss/garbage criteria; batched gives the
 speedup). Still opt-in. Default flip awaits: (a) the multi-seed long-context
 recall check, (b) productionizing the env gate to a `--spec-type mtp` CLI flag (#16).
+
+## UPDATE — #16 CLI flag landed (`9c979dd1`), pod-e2e pending-remote
+
+`--spec-type mtp` + `--mtp-draft-tokens N` now drive CUDA DSv4 MTP (consuming
+ckl's `ServeSpecOptions` serve-spec infra from `c1655675`). Plumb:
+`serve_http` lowers `--spec-type mtp` → `EngineLoadConfig.mtp_draft_tokens` →
+`Dsv4CudaExecutor.spec_draft_tokens` → gate `is_some() || ARLE_DSV4_SPEC_DECODE`
+(env kept as fallback). `EngineLoadConfig` serializes into
+`ARLE_WORKER_ENGINE_CONFIG` so the flag reaches all TP/EP ranks. Mac
+`cuda,no-cuda` typecheck clean (`-p infer-api`, `-p cli`).
+
+**pending-remote**: pod e2e — serve `--spec-type mtp --mtp-draft-tokens 1` (no
+`ARLE_DSV4_SPEC_DECODE`), confirm the `[dsv4-mtp]` accept/reject markers appear
+(flag engages MTP) + the depth-1 A/B holds. Needs the pod synced to recent main
+(currently at `1e0f05e1` + the git-applied MTP patches; #16 builds on ckl's
+`c1655675` infra which post-dates that tree). Default flip still gated on the
+multi-seed recall (#20) + depth decision.
