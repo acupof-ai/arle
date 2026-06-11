@@ -1139,7 +1139,7 @@ impl Dsv4Model {
                 );
                 budget
                     .affordable()
-                    .map_or(i32::MAX, |n| i32::try_from(n.max(1)).unwrap_or(i32::MAX))
+                    .map_or(i32::MAX, |n| i32::try_from(n).unwrap_or(i32::MAX))
             }
             // Can't query (no active context / driver error) → don't bind
             // the min; the other ranks' budgets still apply.
@@ -1148,6 +1148,21 @@ impl Dsv4Model {
         let affordable =
             self.tp
                 .all_reduce_min_scalar_i32(&self.ctx, affordable_local)? as usize;
+        // Reject-below-fixed guard (parity with Metal's fits_fixed): a
+        // cross-rank-min affordable of 0 means post-weights free VRAM cannot
+        // hold even one slot's KV arena + selector/compressor state at this
+        // max_seq_len. Fail closed uniformly — every rank branches on the same
+        // reduced scalar, so this is lockstep-safe — instead of admitting one
+        // slot (the former `max(1)`) and OOMing at arena allocation.
+        anyhow::ensure!(
+            affordable > 0,
+            "DSv4 KV budget rejected startup: post-weights free VRAM affords 0 slots at \
+             max_seq_len {max_seq_len} (per_slot ~{}MB + shared DSA {}MB + shared MoE decode {}MB \
+             exceed {MEM_FRACTION} of free). Lower --max-seq-len or free VRAM.",
+            per_slot >> 20,
+            dsa_shared_bytes >> 20,
+            moe_decode_shared_bytes >> 20,
+        );
         // Neutral clamp (infer-seam): planned = min(requested, affordable);
         // clamped == requested > affordable. NCCL min-reduce stays CUDA-side.
         let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
