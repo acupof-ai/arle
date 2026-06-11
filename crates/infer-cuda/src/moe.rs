@@ -1760,8 +1760,9 @@ mod dsv4_gpu {
 
         let mut decode_scratch = decode_scratch;
         let (route_indices, route_weights, token_ids) = if let Some(scratch) =
-            decode_scratch.as_deref_mut()
+            decode_scratch.as_mut()
         {
+            let scratch = &mut **scratch;
             ensure!(
                 num_tokens == 1 && total_routes == scratch.topk,
                 "DSv4 decode route scratch only supports one token: tokens={num_tokens} routes={total_routes} scratch_topk={}",
@@ -2054,7 +2055,8 @@ mod dsv4_gpu {
                 }
             })?;
 
-        if let Some(scratch) = decode_scratch.as_deref_mut() {
+        if let Some(scratch) = decode_scratch.as_mut() {
+            let scratch = &mut **scratch;
             let route_indices = cache_ptr(&route_indices, ctx);
             let route_weights = cache_ptr(&route_weights, ctx);
             return dsv4_moe_forward_decode_pooled(

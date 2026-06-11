@@ -4182,7 +4182,7 @@ fn try_flashmla_decode_attention(
         let selected =
             selected.ok_or_else(|| anyhow!("DSv4 FlashMLA CSA missing selected topk"))?;
         let (ptr, guard) = selected.device_ptr(&ctx.stream);
-        let ptr_u64 = ptr as u64;
+        let ptr_u64 = ptr;
         drop(guard);
         ptr_u64
     } else {
@@ -5620,7 +5620,7 @@ fn csa_select(
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     ratio: usize,
-    mut prefill_scratch: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
+    prefill_scratch: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<CudaSlice<i32>> {
     // SAFETY: dsv4_linear writes the full index-query buffer.
@@ -5637,9 +5637,7 @@ fn csa_select(
             .wq_b_deepgemm
             .as_ref()
             .expect("indexer wq_b dg gate checked");
-        let scratch = prefill_scratch
-            .as_deref_mut()
-            .expect("indexer wq_b dg gate checked");
+        let scratch = prefill_scratch.expect("indexer wq_b dg gate checked");
         crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
             prefill_proj_deepgemm(ctx, scratch, cache, c_q_normed, &mut q_i)
         })?;
@@ -6465,18 +6463,17 @@ fn maybe_probe_deepgemm_dsa_logits(
     let mut max_abs = 0.0f32;
     let mut sum_sq = 0.0f32;
     let mut first = Vec::with_capacity(sample_limit);
-    for block in 0..sample_limit {
+    for (block, &official) in logits_host.iter().enumerate().take(sample_limit) {
         let mut reference = 0.0f32;
-        for head in 0..local_index_heads {
+        for (head, weight) in weights_host.iter().enumerate().take(local_index_heads) {
             let q_base = head * config.index_head_dim;
             let key_base = block * config.index_head_dim;
             let mut dot = 0.0f32;
             for col in 0..config.index_head_dim {
                 dot += q_host[q_base + col].to_f32() * keys_host[key_base + col].to_f32();
             }
-            reference += weights_host[head].to_f32() * score_scale * dot.max(0.0);
+            reference += weight.to_f32() * score_scale * dot.max(0.0);
         }
-        let official = logits_host[block];
         let diff = (official - reference).abs();
         max_abs = max_abs.max(diff);
         sum_sq += diff * diff;
