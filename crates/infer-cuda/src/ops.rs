@@ -295,6 +295,24 @@ pub(crate) fn argmax(ctx: &DeviceContext, logits: &DeviceVec) -> Result<u32> {
         .stream
         .alloc_zeros::<i32>(1)
         .map_err(|e| anyhow!("argmax output alloc failed: {e}"))?;
+    argmax_into(ctx, logits, &mut out)
+}
+
+/// [`argmax`] into a caller-provided persistent 1-element device scratch —
+/// the steady-state decode sampler (Qwen3.5/3.6 workspace `argmax_out` slot)
+/// uses this so greedy decode performs ZERO device allocations per token.
+/// Syncs the stream (the token must reach the host), so it must stay OUTSIDE
+/// any CUDA-graph capture.
+pub(crate) fn argmax_into(
+    ctx: &DeviceContext,
+    logits: &DeviceVec,
+    out: &mut CudaSlice<i32>,
+) -> Result<u32> {
+    ensure!(
+        out.len() == 1,
+        "argmax scratch must be one i32, got {}",
+        out.len()
+    );
     {
         let (logits_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
         let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
@@ -311,7 +329,7 @@ pub(crate) fn argmax(ctx: &DeviceContext, logits: &DeviceVec) -> Result<u32> {
     ctx.sync()?;
     let token = ctx
         .stream
-        .clone_dtoh(&out)
+        .clone_dtoh(out)
         .map_err(|e| anyhow!("D2H argmax token failed: {e}"))?;
     Ok(token[0] as u32)
 }

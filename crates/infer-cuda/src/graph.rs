@@ -77,6 +77,14 @@ impl CudaGraphState {
         self.graph.is_some()
     }
 
+    /// Whether the next [`Self::run_or_capture`] call will run eagerly (a warm
+    /// run is still armed) rather than replay/capture. Lets callers count
+    /// replays precisely for the reuse-evidence probe.
+    #[must_use]
+    pub fn is_armed_warm(&self) -> bool {
+        self.warm_remaining > 0
+    }
+
     /// Launch the captured graph, or capture it from `kernels` on the first call.
     ///
     /// `kernels` must be a pure GPU kernel sequence — no host/device sync, no
@@ -111,7 +119,17 @@ impl CudaGraphState {
             .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|e| anyhow::anyhow!("begin_capture failed: {e}"))?;
 
-        kernels()?;
+        // A mid-closure error MUST still terminate the capture: leaving the
+        // stream in capture mode would record all subsequent (eager-fallback)
+        // work into an orphaned capture and poison the stream. Captured work
+        // is recorded, not executed, so aborting here leaves device state
+        // untouched and the eager fallback re-runs the step cleanly.
+        if let Err(e) = kernels() {
+            let _ = self
+                .stream
+                .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
+            return Err(e);
+        }
 
         // Walk the still-capturing graph's nodes BEFORE instantiation: a
         // memcpy node whose src/dst is HOST memory re-reads that host address
@@ -191,9 +209,6 @@ impl CapturedDecodeGraph {
         }
     }
 }
-
-/// Per-batch-size pool of captured graphs (one per batch size, reused across
-/// steps). Holds the compute stream so new buckets can be created on demand.
 
 /// Node census of a captured graph, taken via `cuStreamGetCaptureInfo_v2`
 /// while capture is still active (the safe `CudaGraph` wrapper does not
@@ -278,6 +293,8 @@ fn audit_capturing_graph(stream: &CudaStream) -> Result<CaptureAudit> {
     Ok(audit)
 }
 
+/// Per-batch-size pool of captured graphs (one per batch size, reused across
+/// steps). Holds the compute stream so new buckets can be created on demand.
 pub struct GraphBucket {
     stream: Arc<CudaStream>,
     graphs: HashMap<usize, CapturedDecodeGraph>,

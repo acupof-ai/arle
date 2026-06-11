@@ -39,7 +39,7 @@ use infer_topo::TpConfig;
 use qwen35_spec::{LayerType, Qwen35AttentionTensorNames, Qwen35Config};
 use safetensors::tensor::Dtype;
 
-use crate::executor::sample_cuda_token;
+use crate::executor::sample_cuda_token_scratched;
 use crate::loader::SafetensorLoader;
 use crate::moe::{MoeForwardScratch, moe_forward_into};
 use crate::moe_config::ExpertSplit;
@@ -142,6 +142,16 @@ impl Qwen35SlotState {
         self.seq_len
     }
 
+    /// Advance the materialized length by `n` tokens. The captured decode
+    /// graph's caller uses this: the graph body
+    /// ([`Qwen35Model::forward_decode_step_captured`]) is host-state-free —
+    /// replay re-launches only GPU work — so the host-side length advance
+    /// happens exactly once per step at the call site, never inside the
+    /// captured closure.
+    pub(crate) fn advance_seq_len(&mut self, n: usize) {
+        self.seq_len += n;
+    }
+
     /// Reset for a fresh generation in this slot (zeros recurrent + conv state,
     /// rewinds the full-attn cache cursor; stale cache rows are overwritten on
     /// the next prefill).
@@ -207,6 +217,7 @@ impl Qwen35SlotState {
 /// | `last_hidden` | `[H]`           | `memcpy_dtod` overwrites the full vec |
 /// | `last_normed` | `[H]`           | `rms_norm_offset` writes all `H` |
 /// | `logits`      | `[V]`           | `gemv` writes every output row |
+/// | `argmax_out`  | `[1]` i32       | argmax kernel writes it before the D2H read (sampling tail, never captured) |
 ///
 /// The full-logits OPD tail (`[V, S]`) is RETURNED to the caller and stays a
 /// per-call allocation by design.
@@ -215,7 +226,9 @@ pub(crate) struct Qwen35Workspace {
     token_ids: SliceSlot<i32>,
     /// GPU-resident `start_pos` for the HD256 prep kernel — uploaded once per
     /// forward (the value is identical for every full-attn layer in the call;
-    /// the old path uploaded one identical buffer per layer).
+    /// the old path uploaded one identical buffer per layer). The decode graph
+    /// also reads it from the devpos attention kernel, so it is the single
+    /// per-step position scalar staged pre-replay.
     start_pos: SliceSlot<i32>,
     hidden: HiddenSlot,
     normed: HiddenSlot,
@@ -229,6 +242,16 @@ pub(crate) struct Qwen35Workspace {
     last_hidden: VecSlot,
     last_normed: VecSlot,
     logits: VecSlot,
+    /// Persistent argmax output (one i32) for the greedy sampling tail —
+    /// removes the last steady-state per-token device allocation
+    /// (`ops::argmax`'s `alloc_zeros(1)`).
+    argmax_out: SliceSlot<i32>,
+    /// Buffer-address generation. Bumped whenever cached buffers are dropped
+    /// wholesale ([`Self::release`]) — i.e. whenever previously-cached device
+    /// ADDRESSES may change on the next `get`. The captured decode graph bakes
+    /// buffer addresses, so it records this at capture and recaptures on
+    /// mismatch instead of replaying against freed memory.
+    epoch: u64,
 }
 
 #[derive(Default)]
@@ -263,11 +286,19 @@ impl Qwen35Workspace {
         Self::default()
     }
 
+    /// Buffer-address generation (see the `epoch` field).
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Drop every cached buffer (frees the VRAM). Called by the executor after
     /// the OPD weight offload so the workspace does not hold prefill-shaped
     /// scratch while the student backward needs the headroom. The caller must
     /// have quiesced the device first (`offload_engine_weights` syncs).
+    /// Bumps the address epoch: any captured decode graph over these buffers
+    /// is stale after this.
     pub(crate) fn release(&mut self) {
+        self.epoch += 1;
         let Self {
             token_ids,
             start_pos,
@@ -283,6 +314,8 @@ impl Qwen35Workspace {
             last_hidden,
             last_normed,
             logits,
+            argmax_out,
+            epoch: _,
         } = self;
         token_ids.release();
         start_pos.release();
@@ -310,6 +343,7 @@ impl Qwen35Workspace {
         last_hidden.release();
         last_normed.release();
         logits.release();
+        argmax_out.release();
     }
 }
 
@@ -1139,9 +1173,9 @@ impl Qwen35Model {
     }
 
     /// Shared layer stack for [`Self::forward_tokens`] /
-    /// [`Self::forward_token_logits_full`]: embeds `tokens`, runs every layer
-    /// over the workspace buffers, advances `slot.seq_len` and the recurrent
-    /// state, and leaves the final hidden states in `ws.hidden`
+    /// [`Self::forward_token_logits_full`]: stages the per-step host inputs
+    /// (token ids + start_pos), runs [`Self::forward_hidden_staged`], and
+    /// advances `slot.seq_len`. Leaves the final hidden states in `ws.hidden`
     /// (`[hidden, seq_len]`).
     fn forward_hidden(
         &self,
@@ -1167,6 +1201,51 @@ impl Qwen35Model {
             start_pos + seq_len,
             self.max_seq_len
         );
+        self.stage_step_inputs(ws, tokens, start_pos)?;
+        self.forward_hidden_staged(slot, ws, seq_len, start_pos)?;
+        slot.seq_len += seq_len;
+        Ok(())
+    }
+
+    /// Stage the per-step HOST inputs (token ids, start_pos) into their
+    /// persistent device slots. This is the ONLY H2D traffic of a decode step;
+    /// the captured decode graph runs it OUTSIDE the capture/replay (the dense
+    /// `stage1_write` pattern), so the graph body below is a pure GPU kernel
+    /// sequence. Returns the `(token_ids, start_pos)` device addresses for the
+    /// graph-bake fingerprint (length-matched slot reuse keeps them stable; a
+    /// change means the captured graph reads stale memory and must recapture).
+    pub(crate) fn stage_step_inputs(
+        &self,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(u64, u64)> {
+        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let token_ids = ws.token_ids.upload(&self.ctx, &token_ids_host)?;
+        let (token_ids_ptr, _g0) = token_ids.device_ptr(&self.ctx.stream);
+        let start_pos_dev = ws.start_pos.upload(&self.ctx, &[start_pos as i32])?;
+        let (start_pos_ptr, _g1) = start_pos_dev.device_ptr(&self.ctx.stream);
+        Ok((token_ids_ptr, start_pos_ptr))
+    }
+
+    /// The pure-GPU layer stack over already-staged inputs: embeds the staged
+    /// token ids, runs every layer over the workspace buffers, and advances
+    /// the recurrent/conv/KV device state in place. Does NOT advance
+    /// `slot.seq_len` and performs NO H2D/D2H/sync — at `seq_len == 1` this is
+    /// the CUDA-graph-capturable decode body (every per-step scalar is read
+    /// from the staged device buffers; see
+    /// [`Self::forward_decode_step_captured`] for the capture-safety table).
+    ///
+    /// `start_pos` (host) is consumed only by the `seq_len > 1` prefill
+    /// attention launch; the `seq_len == 1` path reads the position from the
+    /// staged device buffer.
+    fn forward_hidden_staged(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        seq_len: usize,
+        start_pos: usize,
+    ) -> Result<()> {
         let c = &self.config;
         let eps = c.rms_norm_eps;
         let hidden_size = c.hidden_size;
@@ -1189,9 +1268,11 @@ impl Qwen35Model {
             ..
         } = ws;
 
-        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let token_ids = token_ids.upload(&self.ctx, &token_ids_host)?;
-        let start_pos_dev = start_pos_slot.upload(&self.ctx, &[start_pos as i32])?;
+        // Shape-matched re-gets return the SAME buffers `stage_step_inputs`
+        // just wrote (no H2D here — a mismatch would mean staging was skipped,
+        // which the two call paths above make impossible).
+        let token_ids = &*token_ids.get(&self.ctx, seq_len)?;
+        let start_pos_dev = &*start_pos_slot.get(&self.ctx, 1)?;
 
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
         embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)?;
@@ -1268,7 +1349,6 @@ impl Qwen35Model {
             add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
         }
 
-        slot.seq_len += seq_len;
         Ok(())
     }
 
@@ -1287,16 +1367,21 @@ impl Qwen35Model {
         position: u64,
     ) -> Result<u32> {
         self.forward_hidden(slot, ws, tokens, start_pos)?;
-        let seq_len = tokens.len();
+        self.lm_head_logits(ws, tokens.len())?;
+        self.sample_workspace_logits(ws, params, position)
+    }
+
+    /// Final norm (offset) + LM head on the last token only, into `ws.logits`.
+    /// Last stage of the captured decode graph (the capture ends at the logits
+    /// buffer, dense-style); sampling stays outside.
+    ///
+    /// TP invariant: embed/lm_head are replicated and `hidden` is
+    /// post-all-reduce (every row-parallel output above was summed), so the
+    /// logits — and therefore the sampled token — are identical on every
+    /// rank. No rank ever needs to broadcast its sample.
+    fn lm_head_logits(&self, ws: &mut Qwen35Workspace, seq_len: usize) -> Result<()> {
         let eps = self.config.rms_norm_eps;
         let hidden_size = self.config.hidden_size;
-
-        // Final norm (offset) + LM head on the last token only.
-        //
-        // TP invariant: embed/lm_head are replicated and `hidden` is
-        // post-all-reduce (every row-parallel output above was summed), so the
-        // logits — and therefore the sampled token — are identical on every
-        // rank. No rank ever needs to broadcast its sample.
         let Qwen35Workspace {
             hidden,
             last_hidden,
@@ -1312,7 +1397,122 @@ impl Qwen35Model {
         rms_norm_offset_vec(&self.ctx, last_hidden, &self.norm, eps, last_normed)?;
         let logits = logits.get(&self.ctx, self.output_projection().rows)?;
         gemv(&self.ctx, self.output_projection(), last_normed, logits)?;
-        sample_cuda_token(&self.ctx, logits, params, position)
+        Ok(())
+    }
+
+    /// Sample the next token from `ws.logits` (written by
+    /// [`Self::lm_head_logits`] — eagerly or by a decode-graph replay). Greedy
+    /// uses the persistent `argmax_out` slot (zero per-token allocations);
+    /// non-greedy reads the logits to host. Always OUTSIDE any capture (syncs).
+    pub(crate) fn sample_workspace_logits(
+        &self,
+        ws: &mut Qwen35Workspace,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<u32> {
+        let Qwen35Workspace {
+            logits, argmax_out, ..
+        } = ws;
+        let logits = logits.get(&self.ctx, self.output_projection().rows)?;
+        let argmax_out = argmax_out.get(&self.ctx, 1)?;
+        sample_cuda_token_scratched(&self.ctx, logits, params, position, argmax_out)
+    }
+
+    /// Device address of the workspace logits buffer (allocating it at vocab
+    /// size if absent) — the decode-graph bake fingerprint's output anchor.
+    pub(crate) fn workspace_logits_ptr(&self, ws: &mut Qwen35Workspace) -> Result<u64> {
+        let logits = ws.logits.get(&self.ctx, self.output_projection().rows)?;
+        let (ptr, _g) = logits.data.device_ptr(&self.ctx.stream);
+        Ok(ptr)
+    }
+
+    /// Per-slot KV-cache capacity (tokens).
+    pub(crate) fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    /// Whole-step captured decode body: embedding → every layer (norms,
+    /// full/linear attention, dense/MoE FFN) → final norm → lm_head GEMV,
+    /// ending at `ws.logits`. One `seq_len == 1` pass over already-staged
+    /// inputs; sampling stays outside (dense pattern). The host-side
+    /// `slot.seq_len` advance is the CALLER's job (replay never re-runs host
+    /// code), and the per-step scalars (token id, position) live in the staged
+    /// device buffers, so ONE capture replays across positions.
+    ///
+    /// Why this is the big lever (formula, vs the DSv4 whole-step WASH):
+    /// Qwen3.5/3.6 B=1 decode measured 24.5 ms/token (40.8 tok/s) against a
+    /// ~1.7 ms HBM active-weight floor — ~94% orchestration: ~1,074 kernel
+    /// launches per token, each paying serialized host issue (~3-8 us) plus
+    /// inter-launch gaps. predicted = 24.5 ms − (host issue + gap reclaim by
+    /// graph scheduling) → ~14-19 ms/token (+30-75% tok/s) at TP=1. DSv4's
+    /// whole-step graph was wall-neutral because ITS decode is GPU-bound;
+    /// this one is host-bound, the opposite regime. License threshold:
+    /// ≥ +10% tok/s with needle-gate pass AND replay-reuse evidence (the
+    /// capture/replay counters in the executor), per the bench spec.
+    ///
+    /// Captured-kernel enumeration (capture-safety proof per kernel; the
+    /// captured-bodies-allocate-nothing rule). All workspace slots are at
+    /// steady decode shapes (allocated by the warm eager run `CudaGraphState`
+    /// forces before first capture), so every `get`/`upload_const` inside is a
+    /// pure cache hit; the only stream ops recorded are kernels, D2D memcpys,
+    /// and device memsets — no H2D, no host callback, no alloc (the
+    /// `audit_capturing_graph` host-memcpy census enforces this at capture).
+    ///
+    /// | # | kernel (per occurrence) | capture-safety justification |
+    /// |---|-------------------------|------------------------------|
+    /// | 1 | `embedding_batched_cuda` | reads staged `token_ids` device buffer; writes ws.hidden |
+    /// | 2 | `rms_norm_batched_offset_cuda` ×2/layer | stateless; fixed ws buffers |
+    /// | 3 | `gemm_cuda` (q/k/v/o, qkv/z/b/a/out, gate/up/down, router, shared ×4) | cuBLASLt with load-time workspace + algo cache warmed by the eager warm run (heuristic query happens outside capture; autotune self-suppresses during capture) |
+    /// | 4 | `prefill_attention_hd256_prep_cuda` | position read from staged `start_pos` DEVICE buffer (already a device-pointer arg); writes K/V cache rows + q_prepped in place |
+    /// | 5 | `nonpaged_prefill_attention_devpos_cuda` | NEW devpos entry: kv walk bounded by `*start_pos_dev` read on device; grid `(heads, 1)` shape-constant |
+    /// | 6 | `attention_gate_batch_hd256_cuda` | stateless gate RMW on ws buffers |
+    /// | 7 | `conv1d_prefill_cuda` (+ its internal `conv1d_state_update_kernel`) | depthwise conv + ring shift are content-based in-place device writes; each replay advances the ring by one token exactly like eager |
+    /// | 8 | `gated_delta_rule_decode_cuda` | recurrent-state advance is a content-based in-place device write; no position arg |
+    /// | 9 | `rms_norm_gated_cuda` | stateless; fixed ws buffers |
+    /// | 10 | `dsv4_route` + `qwen36_renorm_topk_weights` | device router (gate requires `qwen35_decode_moe_graph_capturable`): all-zero bias table is `upload_const` (warm, no H2D node); writes route indices/weights slots unconditionally |
+    /// | 11 | memset(counts), memset(cursors) | `get_zeroed` device memsets — legal graph memset nodes, re-executed per replay (atomicAdd accumulators NEED the per-replay re-zero) |
+    /// | 12 | `dsv4_count_local_experts`, `dsv4_exclusive_scan_i32`, `dsv4_pack_local_experts_with_slots` | device counts/offsets/pack; grids sized by `total_routes = top_k` (shape constant, 8); counts live on device |
+    /// | 13 | `moe_bf16_grouped_gemm_pair_batch` + `moe_bf16_grouped_gemm_batch` | HAND grouped kernels (hybrid dispatch: R=8 < `QWEN35_DEEPGEMM_MIN_ROUTES`, DeepGEMM JIT never runs at decode); weight-ptr tables are load-time device buffers |
+    /// | 14 | `silu_mul_cuda` ×2 (routed + shared) | stateless |
+    /// | 15 | `dsv4_scatter_all_route_slots` + `dsv4_combine_route_slot_outputs` | single-GPU (graph gated `tp.is_single()`): scatter writes ALL `top_k` slots (no EP sentinel/zeroed-tail path taken) |
+    /// | 16 | `qwen36_add_shared_expert_gated` | stateless RMW over fully-written `mlp_out` |
+    /// | 17 | `add_cuda` ×2/layer | stateless residual adds |
+    /// | 18 | `memcpy_dtod` (last row), `rms_norm_offset_cuda`, `gemv_cuda` (lm_head) | D2D memcpy node + stateless kernels; capture ends at `ws.logits` |
+    ///
+    /// NOT in the captured region (stays eager): `SliceSlot::upload` staging
+    /// H2D (pre-replay), argmax + D2H + `ctx.sync` sampling tail, the MoE
+    /// host-route fallback (gated off), NCCL all-reduce (`tp.is_single()`
+    /// only — `TpComm::Single` is a literal `Ok(())`).
+    pub(crate) fn forward_decode_step_captured(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        start_pos: usize,
+    ) -> Result<()> {
+        self.forward_hidden_staged(slot, ws, 1, start_pos)?;
+        self.lm_head_logits(ws, 1)
+    }
+
+    /// Whether every layer of this model can run the captured decode body —
+    /// i.e. each MoE layer's decode step is a pure device-kernel sequence.
+    /// Dense-MLP layers are always capturable; MoE layers need the device
+    /// router + hand grouped kernels
+    /// ([`crate::moe::qwen35_decode_moe_graph_capturable`]).
+    pub(crate) fn decode_graph_unsupported_reason(&self) -> Option<&'static str> {
+        let has_moe = self.layers.iter().any(|l| l.moe.is_some());
+        if !has_moe {
+            return None;
+        }
+        let Some(cfg) = self.moe_config.as_ref() else {
+            return Some("MoE layers present but no moe_config");
+        };
+        if !crate::moe::qwen35_decode_moe_graph_capturable(cfg) {
+            return Some(
+                "MoE decode is not device-routable (host router fallback active — \
+                 ARLE_QWEN35_GPU_ROUTER=0 or non-greedy/grouped routing)",
+            );
+        }
+        None
     }
 
     /// Run the full forward over `tokens` and return the FULL `[seq_len, vocab]`
@@ -1654,28 +1854,56 @@ impl Qwen35Model {
         }
 
         // ── 2. Attention over the contiguous cache (causal; decode = qlen 1). ──
+        // Decode (`seq_len == 1`) takes the devpos entry: the kv length is read
+        // from the staged `start_pos` DEVICE buffer inside the kernel (same
+        // math — kv_len = start_pos + token + 1 either way), so the launch is
+        // CUDA-graph capture-safe and ONE captured graph replays across
+        // positions. Eager decode uses the same entry, keeping the graph lane
+        // kernel-for-kernel identical to its eager warm runs. Prefill keeps
+        // the host-scalar entry (multi-token, never captured).
         {
             let (q_ptr, _g0) = q_prepped.data.device_ptr(&self.ctx.stream);
             let (kc_ptr, _g1) = k_cache.data.device_ptr(&self.ctx.stream);
             let (vc_ptr, _g2) = v_cache.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g3) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: q_prepped/caches/out valid on ctx.stream for the shapes above.
+            // SAFETY: q_prepped/caches/out valid on ctx.stream for the shapes
+            // above; `start_pos_dev` is the forward-level staged position (one
+            // i32, value == start_pos).
             unsafe {
-                ffi::nonpaged_prefill_attention_cuda(
-                    q_ptr as *const ffi::Half,
-                    kc_ptr as *const ffi::Half,
-                    vc_ptr as *const ffi::Half,
-                    o_ptr as *mut ffi::Half,
-                    self.local_q_heads as i32,
-                    self.local_kv_heads as i32,
-                    c.head_dim as i32,
-                    seq_len as i32,
-                    kv_len as i32,
-                    max_seq_len as i32,
-                    sm_scale,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
+                if seq_len == 1 {
+                    let (sp_ptr, _g4) = start_pos_dev.device_ptr(&self.ctx.stream);
+                    ffi::nonpaged_prefill_attention_devpos_cuda(
+                        q_ptr as *const ffi::Half,
+                        kc_ptr as *const ffi::Half,
+                        vc_ptr as *const ffi::Half,
+                        o_ptr as *mut ffi::Half,
+                        self.local_q_heads as i32,
+                        self.local_kv_heads as i32,
+                        c.head_dim as i32,
+                        seq_len as i32,
+                        sp_ptr as *const i32,
+                        max_seq_len as i32,
+                        sm_scale,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                } else {
+                    ffi::nonpaged_prefill_attention_cuda(
+                        q_ptr as *const ffi::Half,
+                        kc_ptr as *const ffi::Half,
+                        vc_ptr as *const ffi::Half,
+                        o_ptr as *mut ffi::Half,
+                        self.local_q_heads as i32,
+                        self.local_kv_heads as i32,
+                        c.head_dim as i32,
+                        seq_len as i32,
+                        kv_len as i32,
+                        max_seq_len as i32,
+                        sm_scale,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
             }
         }
 
