@@ -31,6 +31,11 @@ mod deepep;
 // device weight matrices + the shared DSv4 FP8 DeepGEMM caches.
 #[cfg(feature = "cuda")]
 mod dsv4;
+// DSv4 page-table host math (#85 P2): page table -> byte-offset translation
+// for the packed MLA latent pool (FlashMLA's FFI calls a page a "block"). Not cuda-gated: pure host
+// math, CPU-testable without nvcc.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+mod dsv4_page_table;
 #[cfg(feature = "cuda")]
 mod executor;
 #[cfg(feature = "cuda")]
