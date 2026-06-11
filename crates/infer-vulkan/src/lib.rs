@@ -9,6 +9,7 @@ pub use infer_hip::{config, dequant, gguf};
 
 pub mod executor;
 pub mod kv_pool;
+pub mod model_dsv4;
 pub mod model_qwen3;
 
 pub use executor::{VulkanExecutor, VulkanInflight, load_qwen3_gguf};
