@@ -46,6 +46,12 @@ float sigmoid(float value) {
     return expv / (1.0 + expv);
 }
 
+float round_to_bf16(float x) {
+    const uint bits = floatBitsToUint(x);
+    const uint lsb = (bits >> 16) & 1u;
+    return uintBitsToFloat((bits + 0x7fffu + lsb) & 0xffff0000u);
+}
+
 float stream_rsqrt() {
     const uint stream_dim = p.hidden * p.hc_mult;
     float sumsq = 0.0;
@@ -146,14 +152,14 @@ void main() {
     }
     if (p.op == 2) {
         if (idx < p.hidden) {
-            const float mixed = pre_mixed(idx);
+            const float mixed = round_to_bf16(pre_mixed(idx));
             float sumsq = 0.0;
             for (uint col = 0; col < p.hidden; ++col) {
-                const float value = pre_mixed(col);
+                const float value = round_to_bf16(pre_mixed(col));
                 sumsq += value * value;
             }
             const float inv_rms = inversesqrt(sumsq / max(float(p.hidden), 1.0) + p.eps);
-            out_data[idx] = mixed * inv_rms * b[idx];
+            out_data[idx] = round_to_bf16(mixed * inv_rms * round_to_bf16(b[idx]));
         }
         return;
     }
