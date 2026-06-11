@@ -19,6 +19,8 @@ MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash}"
 MAX_TOKENS="${MAX_TOKENS:-32}"
 PROMPT="${PROMPT:-Compute 137 + 269. Answer with the number only.}"
 WAIT_SECONDS="${WAIT_SECONDS:-600}"
+NSYS_DELAY_SECONDS="${NSYS_DELAY_SECONDS:-5}"
+NSYS_DURATION_SECONDS="${NSYS_DURATION_SECONDS:-10}"
 DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 MOE_BACKEND="${ARLE_DSV4_MOE_BACKEND:-allreduce}"
@@ -41,7 +43,7 @@ Options:
                     artifact directory (default: $ARTIFACT_ROOT)
   --server-bin PATH  arle binary for smoke/nsys (default: $SERVER_BIN)
   --port PORT        HTTP port (default: $PORT)
-  --max-tokens N     smoke/nsys max_tokens; default 32, must be >=32
+  --max-tokens N     smoke max_tokens; default 32, must be >=32
   --devices LIST     CUDA device list (default: $DEVICES)
   --moe-backend NAME DSv4 MoE backend (default: $MOE_BACKEND).
                     Accepts: deepep | native-deepep | allreduce.
@@ -53,7 +55,11 @@ Options:
                     pod paths. Supports both csrc/kernels/api.cuh and
                     csrc/kernels/legacy/api.cuh layouts. Overrides
                     ARLE_DEEPEP_DIR.
-  --prompt TEXT      prompt for smoke/nsys
+  --prompt TEXT      prompt for smoke
+  --nsys-delay-seconds N
+                    delay before nsys capture (default: $NSYS_DELAY_SECONDS)
+  --nsys-duration-seconds N
+                    nsys capture duration (default: $NSYS_DURATION_SECONDS)
   -h, --help         show this help
 
 Environment:
@@ -61,6 +67,7 @@ Environment:
   ARLE_DEEPGEMM_CUTLASS_INCLUDE,
   ARLE_DSV4_MODEL_PATH, ARLE_DSV4_MOE_BACKEND, ARLE_DSV4_EXPERT_BACKEND,
   ARLE_DEEPEP_DIR, ARTIFACT_ROOT, PORT, SERVER_BIN, MAX_TOKENS, PROMPT.
+  NSYS_DELAY_SECONDS, NSYS_DURATION_SECONDS.
 EOF
 }
 
@@ -99,6 +106,8 @@ parse_args() {
             --expert-backend) need_value "$@"; EXPERT_BACKEND="$2"; shift 2 ;;
             --deepep-dir) need_value "$@"; DEEPEP_DIR="$(abs_path "$2")"; shift 2 ;;
             --prompt) need_value "$@"; PROMPT="$2"; shift 2 ;;
+            --nsys-delay-seconds) need_value "$@"; NSYS_DELAY_SECONDS="$2"; shift 2 ;;
+            --nsys-duration-seconds) need_value "$@"; NSYS_DURATION_SECONDS="$2"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown argument: $1" ;;
         esac
@@ -384,22 +393,51 @@ PY
 }
 
 nsys_profile() {
-    require_max_tokens_decode
     preflight
     export_runtime_env
     need_cmd nsys
-    [[ -x "$ROOT/scripts/profile_dsv4_single_decode_nsys.sh" ]] ||
-        die "missing nsys wrapper: $ROOT/scripts/profile_dsv4_single_decode_nsys.sh"
+    need_cmd curl
+    [[ -x "$SERVER_BIN" ]] || die "arle binary missing or not executable: $SERVER_BIN; run build first"
+    [[ -x "$ROOT/scripts/profile_nsys_guidellm.sh" ]] ||
+        die "missing nsys wrapper: $ROOT/scripts/profile_nsys_guidellm.sh"
+
+    mkdir -p "$ARTIFACT_ROOT"
+    if curl -sS -f "$TARGET/v1/models" >/dev/null 2>&1; then
+        die "server already responding at $TARGET; set PORT or stop it first"
+    fi
+
+    local server_log="$ARTIFACT_ROOT/nsys-server.log"
+    (
+        cd "$ROOT"
+        export INFER_DSV4_MAX_SEQ_LEN="$MAX_SEQ_LEN"
+        exec ${ARLE_SERVER_WRAP:-} "$SERVER_BIN" serve \
+            --backend cuda \
+            --model-path "$MODEL_PATH" \
+            --port "$PORT"
+    ) >"$server_log" 2>&1 &
+    server_pid=$!
+
+    cleanup() {
+        set +e
+        if kill -0 "$server_pid" >/dev/null 2>&1; then
+            kill "$server_pid" >/dev/null 2>&1 || true
+            wait "$server_pid" >/dev/null 2>&1 || true
+        fi
+    }
+    trap cleanup EXIT INT TERM
+
+    wait_ready "$server_log"
     ARLE_DSV4_MOE_BACKEND="$ARLE_DSV4_MOE_BACKEND" \
     ARLE_DSV4_EXPERT_BACKEND="$ARLE_DSV4_EXPERT_BACKEND" \
     ARLE_DEEPGEMM_LIBRARY_ROOT="$ARLE_DEEPGEMM_LIBRARY_ROOT" \
-        "$ROOT/scripts/profile_dsv4_single_decode_nsys.sh" \
-        --out "$ARTIFACT_ROOT/nsys" \
-        --port "$PORT" \
-        --model-path "$MODEL_PATH" \
-        --server-bin "$SERVER_BIN" \
-        --prompt "$PROMPT" \
-        --max-tokens "$MAX_TOKENS"
+        "$ROOT/scripts/profile_nsys_guidellm.sh" \
+        dsv4-toolchain \
+        --target "$TARGET" \
+        --model "$MODEL_NAME" \
+        --server-pid "$server_pid" \
+        --fast \
+        --delay-seconds "$NSYS_DELAY_SECONDS" \
+        --duration-seconds "$NSYS_DURATION_SECONDS"
 }
 
 case "$SUBCOMMAND" in

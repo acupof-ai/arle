@@ -1325,7 +1325,7 @@ mod dsv4_gpu {
     use half::bf16;
     use std::sync::Arc;
 
-    use super::alloc_neg1_i32;
+    use super::{DEEPGEMM_CONTIG_ALIGN, alloc_neg1_i32, deepgemm_contig_rows_cap};
     use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
     use crate::moe_config::ExpertSplit;
     use crate::ops::gemm_batch;
@@ -2135,26 +2135,29 @@ mod dsv4_gpu {
                 experts_per_rank,
                 ctx.stream.cu_stream(),
             )?;
-            moe::dsv4_exclusive_scan_i32(
+            moe::moe_exclusive_scan_aligned_i32(
                 cache_ptr(&counts, ctx),
                 cache_ptr(&offsets, ctx),
                 cache_ptr(&scan_total, ctx),
                 experts_per_rank,
+                DEEPGEMM_CONTIG_ALIGN,
                 ctx.stream.cu_stream(),
             )?;
         }
 
-        // ── 4. Pack routed tokens grouped-by-local-expert (compact rows). ───────
-        let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, total_routes.max(1))?;
+        // ── 4. Pack routed tokens grouped-by-local-expert (128-aligned rows). ──
+        let packed_rows = deepgemm_contig_rows_cap(total_routes.max(1), experts_per_rank);
+        let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, packed_rows)?;
         keepalive.keep_hidden(&packed_hidden);
         // Initialize to -1 (the invalid sentinel), NOT 0. The scatter kernel
         // treats only route_slot < 0 as invalid; zero-init left unfilled compact
         // rows looking like valid slot-0 rows, which in m=1 decode overwrote
-        // route slot 0 with zero output (DeepGEMM-path divergence, fixed H20).
-        let packed_route_slot = alloc_neg1_i32(ctx, total_routes.max(1))?;
+        // route slot 0 with zero output. Pad rows from the aligned layout must
+        // also stay -1 so the scatter skips their garbage GEMM output.
+        let packed_route_slot = alloc_neg1_i32(ctx, packed_rows)?;
         let packed_weight = ctx
             .stream
-            .alloc_zeros::<f32>(total_routes.max(1))
+            .alloc_zeros::<f32>(packed_rows)
             .map_err(|e| anyhow::anyhow!("DSv4 packed_weight alloc failed: {e}"))?;
         let cursors = ctx
             .stream
@@ -2183,7 +2186,7 @@ mod dsv4_gpu {
             )?;
         }
 
-        // ── 5. FP8 DeepGEMM 5-call grouped expert pipeline → compact rows. ──────
+        // ── 5. FP8 DeepGEMM 5-call grouped expert pipeline → aligned rows. ─────
         let intermediate = layer.intermediate;
         ensure!(
             hidden_dim.is_multiple_of(128) && intermediate.is_multiple_of(128),
@@ -2231,7 +2234,7 @@ mod dsv4_gpu {
                 cache_ptr(&route_out.data, ctx),
                 cache_ptr(&packed_route_slot, ctx),
                 cache_ptr(&packed_weight, ctx),
-                total_routes,
+                expert_out.seq_len,
                 hidden_dim,
                 ctx.stream.cu_stream(),
             )?;
@@ -2737,7 +2740,8 @@ mod dsv4_gpu {
     }
 
     /// Run the FP8 DeepGEMM 5-call grouped expert pipeline over this rank's local
-    /// experts; returns the compact `[total_routes, hidden]` expert output.
+    /// experts; returns the padded/aligned expert output. The caller's
+    /// `packed_route_slot = -1` pad rows decide which rows reach route slots.
     fn deepgemm_grouped_experts(
         ctx: &DeviceContext,
         layer: &Dsv4MoeLayer,
@@ -2778,9 +2782,8 @@ mod dsv4_gpu {
         // materialized `num_groups * max_m` rows and overflowed the unpad kernel's
         // work-size at ~1.5K prompt tokens (32 * T * topk * H > i32::MAX), long
         // before the 8K/32K SLO shapes. Use DeepGEMM's contiguous grouped layout
-        // over the compact route rows instead: `m_indices[row]` names the local
-        // expert for each activation row, so no padded per-expert slab or unpad is
-        // needed.
+        // over 128-aligned route rows instead: `m_indices[row]` names the local
+        // expert for each activation row, and every pad row stays -1.
         let rows = packed_hidden.seq_len.max(1);
         let scale_stride_m = rows.div_ceil(4) * 4;
         let hidden_scale_cols = hidden_dim.div_ceil(128);
@@ -2792,10 +2795,7 @@ mod dsv4_gpu {
         let act_fp8 = alloc_u8(ctx, rows * intermediate)?;
         let act_scales = alloc_zeros_f32(ctx, scale_stride_m * inter_scale_cols)?;
         let mut out_compact = HiddenStates::zeros(ctx, hidden_dim, packed_hidden.seq_len.max(1))?;
-        let m_indices = ctx
-            .stream
-            .alloc_zeros::<i32>(rows)
-            .map_err(|e| anyhow::anyhow!("DSv4 contiguous m-index alloc failed: {e}"))?;
+        let m_indices = alloc_neg1_i32(ctx, rows)?;
         let active_experts = ctx.stream.clone_htod(&[0i32]).map_err(|e| {
             anyhow::anyhow!("DSv4 DeepGEMM contiguous active-expert H2D failed: {e}")
         })?;
@@ -4068,12 +4068,10 @@ mod tests {
         assert_eq!(m[total as usize], -1);
     }
 
-    /// Item-6 contract test, NEGATIVE: the COMPACT (unaligned) layout — what
-    /// the DSv4 prefill contiguous path builds via the plain exclusive scan —
-    /// puts a group boundary inside a 128-row tile, so the kernel computes
-    /// the tail rows of the tile against the WRONG expert's weights. This is
-    /// the latent correctness bug this entry documents; the BF16 path uses
-    /// the aligned scan instead.
+    /// Item-6 contract test, NEGATIVE: the COMPACT (unaligned) layout puts a
+    /// group boundary inside a 128-row tile, so the kernel computes the tail
+    /// rows of the tile against the WRONG expert's weights. This is the
+    /// regression the DSv4 FP8 prefill path must not reintroduce.
     #[test]
     fn compact_layout_violates_per_tile_group_contract() {
         let counts = vec![100i32, 100];
@@ -4084,6 +4082,27 @@ mod tests {
             !tile_contract_holds(&m, ALIGN),
             "compact layout must violate the per-tile contract (rows 100..128 \
              are group 1 inside a tile whose head row is group 0)"
+        );
+    }
+
+    #[test]
+    fn dsv4_fp8_prefill_rows_cap_keeps_pad_rows_invalid() {
+        let counts = vec![100i32, 100];
+        let total_routes: i32 = counts.iter().sum();
+        let (offsets, aligned_total) = aligned_scan_ref(&counts, ALIGN as i32);
+        let rows_cap = super::deepgemm_contig_rows_cap(total_routes as usize, counts.len());
+        let m = fill_m_indices_ref(&counts, &offsets, rows_cap);
+
+        assert_eq!(offsets, vec![0, 128]);
+        assert!(aligned_total as usize <= rows_cap);
+        assert!(tile_contract_holds(&m, ALIGN));
+        assert!(
+            m[100..128].iter().all(|&g| g == -1),
+            "rows between expert 0 and expert 1 must be invalid pads"
+        );
+        assert!(
+            m[228..rows_cap].iter().all(|&g| g == -1),
+            "rows after the aligned total must be invalid pads"
         );
     }
 

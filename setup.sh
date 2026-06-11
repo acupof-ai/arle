@@ -139,7 +139,6 @@ do_clean() {
     step "Cleaning build artifacts and venv"
     rm -rf "$VENV_DIR" && ok "Removed .venv/"
     rm -rf target/ && ok "Removed target/"
-    rm -rf infer/target/ && ok "Removed infer/target/"
     info "Run ./setup.sh to rebuild from scratch"
 }
 
@@ -246,16 +245,6 @@ do_check() {
         fail "ARLE binary not found — run ./setup.sh --build-only"
         errors=$((errors + 1))
     fi
-    local expected_server
-    if [ "$PLATFORM" = "linux" ]; then expected_server="target/release/infer"
-    else expected_server="target/release/metal_serve"; fi
-    if [ -x "$expected_server" ]; then
-        ok "$expected_server built"
-    else
-        fail "server binary not found at $expected_server — run ./setup.sh --build-only"
-        errors=$((errors + 1))
-    fi
-
     # Model
     if [ -f "$MODEL_DIR/config.json" ]; then
         ok "Model: $MODEL_DIR"
@@ -503,15 +492,16 @@ do_deps() {
     python -m pip install --upgrade pip -q
 
     # --- Build deps ---
-    # TileLang (pinned in requirements-build.txt) is the only Python build
-    # dependency — AOT codegen for CUDA cubins. It requires the CUDA
-    # toolchain, so skip it on hosts without nvcc (macOS, Linux+no-CUDA).
+    # TileLang requires the CUDA toolchain, so skip only that package on
+    # hosts without nvcc. Model-download helpers such as huggingface_hub are
+    # still needed on every backend.
     step "Python build dependencies (from requirements-build.txt)"
     if [ "$HAS_CUDA" = "1" ]; then
         grep -E '^[a-zA-Z]' requirements-build.txt | pip install -r /dev/stdin -q
         ok "CUDA build deps installed"
     else
-        ok "No build deps for this host (TileLang skipped, no CUDA toolchain)"
+        grep -E '^[a-zA-Z]' requirements-build.txt | grep -v '^tilelang' | pip install -r /dev/stdin -q
+        ok "Non-CUDA build deps installed (TileLang skipped, no CUDA toolchain)"
     fi
 
     # --- Bench/test deps ---
@@ -561,7 +551,7 @@ do_deps() {
 # BUILD — compile Rust + CUDA kernels
 # ============================================================================
 do_build() {
-    local arle_features infer_features build_label
+    local arle_features build_label
     if [ "$PLATFORM" = "linux" ] && [ "$HAS_CUDA" = "1" ]; then
         build_label="CUDA"
     elif [ "$PLATFORM" = "linux" ]; then
@@ -569,7 +559,7 @@ do_build() {
     else
         build_label="Metal"
     fi
-    step "Building ARLE CLI + infer server (release, $build_label)"
+    step "Building ARLE CLI/server (release, $build_label)"
     activate_venv
 
     # Ensure cargo is on PATH
@@ -600,16 +590,13 @@ do_build() {
             fi
         fi
         arle_features="cuda,cli"
-        infer_features="cuda"
     elif [ "$PLATFORM" = "linux" ]; then
         info "Linux without CUDA toolchain: building with cpu,no-cuda,cli"
         info "  GPU ops will panic at runtime; install CUDA to enable the cuda path"
         arle_features="cpu,no-cuda,cli"
-        infer_features="cpu,no-cuda"
     else
         info "Apple Silicon: building with metal,no-cuda"
         arle_features="metal,no-cuda"
-        infer_features="metal,no-cuda"
     fi
 
     local start
@@ -622,33 +609,11 @@ do_build() {
         esac
     done
 
-    local server_bin
-    if [ "$PLATFORM" = "linux" ]; then
-        cargo build --release --no-default-features --features "$infer_features" -p infer --bin infer 2>&1 | while IFS= read -r line; do
-            case "$line" in
-                *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
-                    echo "  $line" ;;
-            esac
-        done
-        server_bin="target/release/infer"
-    else
-        cargo build --release --no-default-features --features "$infer_features" -p infer --bin metal_serve 2>&1 | while IFS= read -r line; do
-            case "$line" in
-                *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
-                    echo "  $line" ;;
-            esac
-        done
-        server_bin="target/release/metal_serve"
-    fi
-
     local elapsed=$(( $(date +%s) - start ))
     ok "Build complete in ${elapsed}s"
 
     if [ -x target/release/arle ]; then
         info "Binary: target/release/arle ($(du -h target/release/arle | awk '{print $1}'))"
-    fi
-    if [ -x "$server_bin" ]; then
-        info "Binary: $server_bin ($(du -h "$server_bin" | awk '{print $1}'))"
     fi
 }
 
@@ -758,13 +723,13 @@ do_full() {
     echo ""
     if [ "$PLATFORM" = "linux" ] && [ "$HAS_CUDA" = "1" ]; then
         echo "  # Run HTTP server (CUDA)"
-        echo "  ./target/release/infer --model-path $MODEL_DIR --port 8000"
+        echo "  ./target/release/arle serve --backend cuda --model-path $MODEL_DIR --port 8000"
     elif [ "$PLATFORM" = "linux" ]; then
         echo "  # Run HTTP server (CPU — install CUDA + rebuild for GPU)"
-        echo "  ./target/release/infer --model-path $MODEL_DIR --port 8000"
+        echo "  ./target/release/arle serve --backend cpu --model-path $MODEL_DIR --port 8000"
     else
         echo "  # Run HTTP server (Metal)"
-        echo "  ./target/release/metal_serve --model-path $MODEL_DIR --port 8000"
+        echo "  ./target/release/arle serve --backend metal --model-path $MODEL_DIR --port 8000"
     fi
     echo ""
     echo "  # 5. Run benchmarks"

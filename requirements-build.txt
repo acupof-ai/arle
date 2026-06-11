@@ -4,3 +4,6 @@
 # what every current DSv4 AOT kernel build/bench runs against. Bump
 # deliberately, backed by a pod build + bench entry.
 tilelang==0.1.11
+
+# Model downloads in setup.sh use huggingface_hub.snapshot_download.
+huggingface_hub==1.9.1

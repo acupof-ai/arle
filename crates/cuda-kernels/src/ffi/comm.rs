@@ -59,9 +59,15 @@ unsafe extern "C" {
 
     /// cudaMalloc + zero a region and emit its 64-byte `cudaIpcMemHandle_t`.
     pub fn arle_car_alloc_shared(bytes: usize, out_ptr: *mut u64, out_handle: *mut u8) -> CUresult;
+    /// Free a local region allocated by `arle_car_alloc_shared` before it is
+    /// transferred to `arle_car_create`.
+    pub fn arle_car_free_shared(ptr: u64) -> CUresult;
     /// Open a peer's 64-byte IPC handle (enables P2P lazily; failure here IS
     /// the no-P2P probe).
     pub fn arle_car_open_peer(handle: *const u8, out_ptr: *mut u64) -> CUresult;
+    /// Close a peer mapping opened by `arle_car_open_peer` before it is
+    /// transferred to `arle_car_create`.
+    pub fn arle_car_close_peer(ptr: u64) -> CUresult;
     /// Build the CustomAllreduce over `world` signal/input pointers (index =
     /// rank; this rank's entries are its own allocations, others are opened
     /// peer mappings). Registers the input set. Null on failure.

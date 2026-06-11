@@ -43,6 +43,7 @@
 
 #![cfg(all(unix, feature = "cuda"))]
 
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -211,12 +212,9 @@ pub(crate) fn bind_relay_and_spawn_workers(
         let mut coord = broadcast_relay
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(err) = coord.broadcast(&RelayEnvelope::TickAdmissions { seq, requests }) {
-            log::error!(
-                "[multiproc-coord] tick #{seq} admission broadcast failed — lockstep is broken, \
-                 expect an NCCL stall: {err:#}"
-            );
-        }
+        coord
+            .broadcast(&RelayEnvelope::TickAdmissions { seq, requests })
+            .with_context(|| format!("[multiproc-coord] tick #{seq} admission broadcast failed"))
     }))
     .context("install multiproc tick broadcaster")?;
 
@@ -474,29 +472,15 @@ fn dummy_file() -> std::fs::File {
 }
 
 fn spawn_workers(model_path: &str, world_size: usize) -> Result<WorkerChildren> {
-    use std::os::fd::AsRawFd;
-
     let exe = std::env::current_exe().context("current_exe")?;
     let ordinals = cuda_ordinals(world_size);
     let mut children = Vec::with_capacity(world_size - 1);
 
     for rank in 1..world_size {
-        // Parent -> child pipe. Child holds the read end, parent the write end.
-        // When parent drops the write end (or dies), child's read() returns EOF
-        // and the worker exits.
-        let mut fds = [0i32; 2];
-        // SAFETY: pipe(2) writes two valid owned fds into `fds`.
-        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        if ret != 0 {
-            anyhow::bail!(
-                "pipe(2) for worker rank {rank} failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        // SAFETY: pipe(2) returned two valid owned fds.
-        use std::os::fd::FromRawFd;
-        let child_read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
-        let parent_write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        // Parent -> child pipe. Only the read end is inherited by the exec'd
+        // worker; the parent write end stays close-on-exec so the worker cannot
+        // keep its own writer alive and mask EOF after coordinator death.
+        let (child_read_end, parent_write_end) = worker_parent_pipe(rank)?;
         let child_read_raw = child_read_end.as_raw_fd();
 
         let cuda_ordinal = ordinals.get(rank).copied().unwrap_or(rank);
@@ -525,8 +509,8 @@ fn spawn_workers(model_path: &str, world_size: usize) -> Result<WorkerChildren> 
             .spawn()
             .with_context(|| format!("spawn worker rank {rank}"))?;
 
-        // After spawn the parent doesn't need the child-side read fd; the child
-        // inherited it. Closing it here would EOF the child immediately.
+        // After spawn the parent doesn't need its copy of the child-side read fd;
+        // the worker inherited the same fd number across exec.
         drop(child_read_end);
         let pid = child.id();
         children.push((rank, child, parent_write_end));
@@ -534,4 +518,83 @@ fn spawn_workers(model_path: &str, world_size: usize) -> Result<WorkerChildren> 
     }
 
     Ok(WorkerChildren { children })
+}
+
+fn worker_parent_pipe(rank: usize) -> Result<(std::fs::File, std::fs::File)> {
+    let mut fds = [0i32; 2];
+    make_cloexec_pipe(&mut fds)
+        .with_context(|| format!("create parent pipe for worker rank {rank}"))?;
+    // Child must inherit exactly this fd across exec; the write end remains
+    // FD_CLOEXEC and is held only by the coordinator process.
+    if let Err(err) = set_fd_cloexec(fds[0], false)
+        .with_context(|| format!("clear CLOEXEC on worker rank {rank} read pipe"))
+    {
+        // SAFETY: make_cloexec_pipe succeeded, so both fds are owned here.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(err);
+    }
+    // SAFETY: make_cloexec_pipe initialized both fds and ownership moves into
+    // File. On error before this point, the process exits setup with no child.
+    let child_read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let parent_write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    Ok((child_read_end, parent_write_end))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn make_cloexec_pipe(fds: &mut [i32; 2]) -> Result<()> {
+    // SAFETY: pipe2(2) writes two owned fds into `fds` on success.
+    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if ret != 0 {
+        anyhow::bail!(
+            "pipe2(O_CLOEXEC) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn make_cloexec_pipe(fds: &mut [i32; 2]) -> Result<()> {
+    // SAFETY: pipe(2) writes two owned fds into `fds` on success.
+    let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if ret != 0 {
+        anyhow::bail!("pipe(2) failed: {}", std::io::Error::last_os_error());
+    }
+    if let Err(err) = set_fd_cloexec(fds[0], true).and_then(|_| set_fd_cloexec(fds[1], true)) {
+        // SAFETY: pipe(2) succeeded, so both fds are owned and must be closed on
+        // setup failure to avoid leaking them in the coordinator.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn set_fd_cloexec(fd: RawFd, cloexec: bool) -> Result<()> {
+    // SAFETY: fcntl(F_GETFD/F_SETFD) does not take ownership of `fd`.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        anyhow::bail!(
+            "fcntl(F_GETFD) failed for fd {fd}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let next = if cloexec {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, next) };
+    if ret != 0 {
+        anyhow::bail!(
+            "fcntl(F_SETFD) failed for fd {fd}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
 }

@@ -281,25 +281,45 @@ struct ArleCarProd {
 };
 
 extern "C" CUresult arle_car_alloc_shared(size_t bytes, uint64_t* out_ptr, uint8_t* out_handle) {
+  if (!out_ptr || !out_handle) return CUDA_ERROR_INVALID_VALUE;
+  *out_ptr = 0;
   void* p = nullptr;
   cudaError_t e = cudaMalloc(&p, bytes);
   if (e != cudaSuccess) return (CUresult)e;
   e = cudaMemset(p, 0, bytes);
-  if (e != cudaSuccess) return (CUresult)e;
+  if (e != cudaSuccess) {
+    cudaFree(p);
+    return (CUresult)e;
+  }
   static_assert(sizeof(cudaIpcMemHandle_t) == 64, "IPC handle is 64 bytes");
   e = cudaIpcGetMemHandle(reinterpret_cast<cudaIpcMemHandle_t*>(out_handle), p);
-  if (e != cudaSuccess) return (CUresult)e;
+  if (e != cudaSuccess) {
+    cudaFree(p);
+    return (CUresult)e;
+  }
   *out_ptr = reinterpret_cast<uint64_t>(p);
   return CUDA_SUCCESS;
 }
 
+extern "C" CUresult arle_car_free_shared(uint64_t ptr) {
+  if (ptr == 0) return CUDA_SUCCESS;
+  return (CUresult)cudaFree(reinterpret_cast<void*>(ptr));
+}
+
 extern "C" CUresult arle_car_open_peer(const uint8_t* handle, uint64_t* out_ptr) {
+  if (!handle || !out_ptr) return CUDA_ERROR_INVALID_VALUE;
+  *out_ptr = 0;
   void* p = nullptr;
   cudaError_t e = cudaIpcOpenMemHandle(
       &p, *reinterpret_cast<const cudaIpcMemHandle_t*>(handle), cudaIpcMemLazyEnablePeerAccess);
   if (e != cudaSuccess) return (CUresult)e;
   *out_ptr = reinterpret_cast<uint64_t>(p);
   return CUDA_SUCCESS;
+}
+
+extern "C" CUresult arle_car_close_peer(uint64_t ptr) {
+  if (ptr == 0) return CUDA_SUCCESS;
+  return (CUresult)cudaIpcCloseMemHandle(reinterpret_cast<void*>(ptr));
 }
 
 extern "C" void* arle_car_create(
@@ -327,6 +347,7 @@ extern "C" void* arle_car_create(
     p->car->register_buffer(inputs);
   } catch (const std::exception& ex) {
     fprintf(stderr, "[arle_car] create failed: %s\n", ex.what());
+    delete p->car;
     cudaFree(p->rank_data);
     delete p;
     return nullptr;

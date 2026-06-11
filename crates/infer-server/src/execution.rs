@@ -22,6 +22,9 @@ use infer_seam::{BackendExecutor, KvPool};
 
 use crate::ServeShutdown;
 
+type TickBroadcast<'a> =
+    Option<&'a dyn Fn(u64, Vec<crate::multiproc_relay::WireRequest>) -> anyhow::Result<()>>;
+
 /// How long the engine thread parks on the submit channel when fully idle.
 ///
 /// Short enough that a freshly-submitted request is picked up promptly, long
@@ -100,11 +103,39 @@ pub(crate) struct Submission {
 
 /// The engine thread body: own the engine, drain submits, step, deliver.
 pub(crate) fn engine_loop<E, K>(
+    engine: Engine<E, K>,
+    submit_rx: Receiver<Submission>,
+    control_rx: Receiver<ControlMessage<E>>,
+    counters: CounterHandle,
+    shutdown: ServeShutdown,
+) where
+    E: BackendExecutor,
+    K: KvPool,
+{
+    let broadcast_tick = |seq, requests| crate::multiproc_relay::broadcast_tick(seq, requests);
+    let tick_broadcast: TickBroadcast<'_> = if crate::multiproc_relay::tick_broadcaster_installed()
+    {
+        Some(&broadcast_tick)
+    } else {
+        None
+    };
+    engine_loop_with_tick_broadcaster(
+        engine,
+        submit_rx,
+        control_rx,
+        counters,
+        shutdown,
+        tick_broadcast,
+    );
+}
+
+fn engine_loop_with_tick_broadcaster<E, K>(
     mut engine: Engine<E, K>,
     submit_rx: Receiver<Submission>,
     control_rx: Receiver<ControlMessage<E>>,
     counters: CounterHandle,
     shutdown: ServeShutdown,
+    tick_broadcast: TickBroadcast<'_>,
 ) where
     E: BackendExecutor,
     K: KvPool,
@@ -137,7 +168,7 @@ pub(crate) fn engine_loop<E, K>(
     // `tick_seq` pairs exactly one `TickAdmissions` with every engine step so
     // worker ranks admit the same requests at the same step index; see
     // `multiproc_relay::set_tick_broadcaster` for the desync proof this closes.
-    let lockstep = crate::multiproc_relay::tick_broadcaster_installed();
+    let lockstep = tick_broadcast.is_some();
     let mut tick_seq: u64 = 0;
     let mut next_request_id: u64 = 1;
     // Submission picked up by the idle park below, admitted on the next pass so
@@ -191,7 +222,17 @@ pub(crate) fn engine_loop<E, K>(
                     sampling: submission.sampling.clone(),
                 })
                 .collect();
-            crate::multiproc_relay::broadcast_tick(tick_seq, requests);
+            if let Some(broadcast_tick) = tick_broadcast
+                && let Err(err) = broadcast_tick(tick_seq, requests)
+            {
+                log::error!(
+                    "infer-server multiproc tick #{tick_seq} broadcast failed; \
+                     stopping rank-0 engine before local admission/step: {err:#}"
+                );
+                abort_pending(&mut pending, &streamers);
+                publish_counters(&engine, &counters);
+                return;
+            }
             tick_seq += 1;
         }
         for submission in drained {
@@ -324,5 +365,100 @@ fn finish_handle(
     }
     if let Some(tx) = pending.remove(&handle) {
         let _ = tx.send(completed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    use anyhow::bail;
+    use infer_core::SchedulerConfig;
+    use infer_plan::{ForwardPlan, SamplingParams, StepOutput};
+    use infer_seam::{HostPagedKvPool, KvPool, PollResult};
+
+    use super::*;
+
+    struct CountingExecutor {
+        submits: Arc<AtomicUsize>,
+    }
+
+    impl BackendExecutor for CountingExecutor {
+        type Inflight = StepOutput;
+
+        fn submit(
+            &mut self,
+            plan: &ForwardPlan,
+            kv: &mut dyn KvPool,
+        ) -> anyhow::Result<Self::Inflight> {
+            self.submits.fetch_add(1, Ordering::SeqCst);
+            let mut inner = crate::EchoExecutor;
+            inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>> {
+            let mut inner = crate::EchoExecutor;
+            inner.poll(inflight)
+        }
+    }
+
+    #[test]
+    fn broadcast_failure_stops_before_local_admit_or_step() -> anyhow::Result<()> {
+        let submits = Arc::new(AtomicUsize::new(0));
+        let executor = CountingExecutor {
+            submits: Arc::clone(&submits),
+        };
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_prompt_tokens: 128,
+            max_total_tokens: 256,
+            ..SchedulerConfig::default()
+        };
+        let engine = Engine::with_config(executor, HostPagedKvPool::new(1, 16, 16), config);
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let (_control_tx, control_rx) = mpsc::channel();
+        let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
+        let shutdown = ServeShutdown::new();
+
+        let (handle_tx, handle_rx) = mpsc::channel();
+        let (completion_tx, _completion_rx) = mpsc::channel();
+        submit_tx.send(Submission {
+            prompt: vec![10, 11],
+            max_tokens: 1,
+            sampling: SamplingParams::default(),
+            handle_tx,
+            completion_tx,
+            stream_tx: None,
+        })?;
+        drop(submit_tx);
+
+        let failing_broadcast = |seq: u64, requests: Vec<crate::multiproc_relay::WireRequest>| {
+            assert_eq!(seq, 0);
+            assert_eq!(requests.len(), 1);
+            bail!("injected broadcast failure")
+        };
+        engine_loop_with_tick_broadcaster(
+            engine,
+            submit_rx,
+            control_rx,
+            counters,
+            shutdown,
+            Some(&failing_broadcast),
+        );
+
+        assert!(
+            handle_rx.recv_timeout(Duration::from_secs(1)).is_err(),
+            "rank-0 must not locally admit after a failed tick broadcast"
+        );
+        assert_eq!(
+            submits.load(Ordering::SeqCst),
+            0,
+            "rank-0 must not step locally after a failed tick broadcast"
+        );
+        Ok(())
     }
 }

@@ -7,9 +7,9 @@
 //! real consumers (interfaces trail callers).
 //!
 //! Feature contract (mirror of `cuda,no-cuda`):
-//! - `--features hip`: links `amdhip64` (see `build.rs`); calls are real.
-//! - default: every entry point returns [`HIP_NOT_COMPILED`]; compiles and
-//!   tests on any machine.
+//! - `--features hip` on a ROCm box with `libamdhip64`: calls are real.
+//! - default, or `--features hip` off-box without `libamdhip64`: every entry
+//!   point returns [`HIP_NOT_COMPILED`]; compiles and tests on any machine.
 //!
 //! On-box TODOs (need ROCm headers / real hardware, see
 //! `docs/plans/2026-06-10-hip-backend-mvp.md` §4): gfx arch-name probe
@@ -30,9 +30,12 @@ pub type Result<T> = std::result::Result<T, HipError>;
 impl std::fmt::Display for HipError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if *self == HIP_NOT_COMPILED {
-            return write!(f, "HIP support not compiled (build with --features hip)");
+            return write!(
+                f,
+                "HIP runtime unavailable (build with --features hip on a ROCm box with libamdhip64)"
+            );
         }
-        #[cfg(feature = "hip")]
+        #[cfg(hip_runtime_available)]
         {
             let msg = unsafe { ffi::hipGetErrorString(self.0) };
             if !msg.is_null() {
@@ -51,7 +54,7 @@ pub const MEMCPY_HOST_TO_DEVICE: i32 = 1;
 pub const MEMCPY_DEVICE_TO_HOST: i32 = 2;
 pub const MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
-#[cfg(feature = "hip")]
+#[cfg(hip_runtime_available)]
 mod ffi {
     use std::ffi::{c_char, c_void};
 
@@ -72,7 +75,7 @@ mod ffi {
     }
 }
 
-#[cfg(feature = "hip")]
+#[cfg(hip_runtime_available)]
 mod real {
     use super::{HipError, Result, ffi};
     use std::ffi::c_void;
@@ -200,13 +203,13 @@ mod real {
     }
 }
 
-#[cfg(feature = "hip")]
+#[cfg(hip_runtime_available)]
 pub use real::{
     DeviceBuffer, Stream, device_count, device_name, device_synchronize, device_total_mem, init,
     set_device,
 };
 
-#[cfg(not(feature = "hip"))]
+#[cfg(not(hip_runtime_available))]
 mod stub {
     use super::{HIP_NOT_COMPILED, Result};
     use std::ffi::c_void;
@@ -284,7 +287,7 @@ mod stub {
     }
 }
 
-#[cfg(not(feature = "hip"))]
+#[cfg(not(hip_runtime_available))]
 pub use stub::{
     DeviceBuffer, Stream, device_count, device_name, device_synchronize, device_total_mem, init,
     set_device,
@@ -294,20 +297,20 @@ pub use stub::{
 mod tests {
     use super::*;
 
-    #[cfg(not(feature = "hip"))]
+    #[cfg(not(hip_runtime_available))]
     #[test]
     fn stub_reports_not_compiled() {
         assert_eq!(init().unwrap_err(), HIP_NOT_COMPILED);
         assert_eq!(device_count().unwrap_err(), HIP_NOT_COMPILED);
         assert!(DeviceBuffer::alloc(16).is_err());
         let msg = HIP_NOT_COMPILED.to_string();
-        assert!(msg.contains("not compiled"), "{msg}");
+        assert!(msg.contains("unavailable"), "{msg}");
     }
 
     /// Real-hardware smoke: probe + H2D/D2H roundtrip. Skips (does not
     /// fail) when no AMD GPU is present so `--features hip` can run in
     /// link-only CI environments.
-    #[cfg(feature = "hip")]
+    #[cfg(hip_runtime_available)]
     #[test]
     fn probe_and_roundtrip_or_skip() {
         if init().is_err() {
