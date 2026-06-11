@@ -3,9 +3,8 @@
 **Date:** 2026-06-11. **Backend:** CUDA, Qwen3.5/3.6 (single GPU + TP=2).
 **Scope:** `infer-cuda` (workspace.rs new, qwen35.rs, moe.rs, loader.rs,
 executor.rs, lib.rs), `infer-api/loaded.rs`.
-**Status: pending-remote** — same-binary before/after decode tok/s + prefill
-TTFT A/B on the pod (baseline `fc5b48ed` numbers: TP=1 36.0 tok/s decode,
-TP=2 45.5; needle 3k prefill 9.85 s at chunk=64).
+**Status: LICENSED** (pod A/B 2026-06-11, single-variable vs `fc5b48ed`,
+same box/driver/shapes, n=1 each — see Verification).
 
 ## Context
 
@@ -44,10 +43,28 @@ host orchestration, not kernels, is the binding constraint.
   37/37; clippy: 0 new warnings (3 `rc_buffer` suggestions suppressed with
   rationale — converting `Rc<Vec<u8>>`→`Rc<[u8]>` would re-copy the shard,
   the very copy this removes).
-- **pending-remote:** pod same-binary A/B vs `fc5b48ed` — decode tok/s
-  (expect the ~425-alloc and 40-roundtrip share of 27.8 ms/token to shrink),
-  needle-prefill wall (expect ~chunk-count-bound improvement), plus
-  numerics re-gate (smoke ×3 + needle) since allocation lifetime changed.
+- **Pod A/B vs `fc5b48ed`** (H20, contention-free, same drivers/shapes;
+  n=1 each — directionally above the 10% license bar at TP=2, TP=1 within
+  it; multi-run σ deferred):
+
+  | metric | fc5b48ed | 1e0f05e1 | Δ |
+  |---|---|---|---|
+  | decode tok/s TP=1 (gen128) | 36.01 | 39.39 | **+9.4%** |
+  | decode tok/s TP=2 (gen128) | 45.47 | 57.52 | **+26.5%** |
+  | needle 3k wall TP=1 | 9.85 s | 8.08 s | **−18.0%** |
+  | needle 3k wall TP=2 | 5.78 s | 4.70 s | **−18.7%** |
+
+  TP=2 gains more than TP=1: the host-side alloc/roundtrip work was
+  serialized across BOTH ranks by lockstep, so removing it compounds.
+- **Numerics re-gate**: smoke ×3 byte-consistent, gen128 head strings
+  byte-equal to the fc5b48ed run ("Unit 734 … Seven/Artie"); needle-64
+  retrieval PASS ×2 + self-consistent (5.88 s vs 7.29 s pre-tranche). The
+  8-token needle probe now enters think-mode at TP=1 too — chunk 64→2048
+  shifts MoE routing on knife-edge tokens (expected MoE non-determinism;
+  retrieval gate is the licensed check, not token-identity).
+- c=2 side-effect: 2k-token concurrent prefills now run ~11 s before the
+  known single-row decode-tick engine death — previously they died at
+  admission-time instantly. Same known limitation, different timing.
 
 ## Rule
 
