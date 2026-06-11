@@ -145,6 +145,33 @@ pub trait BackendExecutor {
     /// device residency. The default is a no-op for backends without a tier.
     fn drop_kv_tier_entries(&mut self, _keys: &[u64]) {}
 
+    /// Whether the backend can demote/promote a whole slot's device state as
+    /// one image — the tier route for models whose KV is NOT page-addressable
+    /// (recurrent / ring / compressed-arena state, e.g. DSv4). Default: no.
+    fn kv_slot_tier_enabled(&self) -> bool {
+        false
+    }
+
+    /// Snapshot the entire device state of `slot` (KV at its exact positions
+    /// plus every recurrent/ring/compressor sidecar) into the backend host
+    /// store under `key`. The copy MUST be complete before returning — the
+    /// engine frees the slot immediately after. Returns `false` when the
+    /// store has no room (the engine falls back to plain recompute).
+    fn demote_slot(&mut self, _slot: usize, _key: u64) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Restore a whole-slot image into `slot`. The engine resumes decode at
+    /// the exact demoted position right after, so the copy MUST be complete
+    /// before returning. Only called when
+    /// [`BackendExecutor::kv_slot_tier_enabled`] is `true`.
+    fn promote_slot(&mut self, _key: u64, _slot: usize) -> anyhow::Result<()> {
+        anyhow::bail!("backend has no whole-slot KV tier store")
+    }
+
+    /// Drop whole-slot store entries (promoted, cancelled, or abandoned).
+    fn drop_kv_slot_entries(&mut self, _keys: &[u64]) {}
+
     /// Move the model's device weights to host RAM and free the VRAM (OPD teacher
     /// time-share), returning the device bytes freed. The default is a no-op
     /// (returns 0) so backends that do not support weight offload are unaffected.

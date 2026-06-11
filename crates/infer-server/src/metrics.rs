@@ -137,6 +137,24 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         "Tier promotions that failed (tail re-prefilled instead).",
         counters.kv_tier.promote_failures,
     );
+    push(
+        "kv_tier_demoted_slots_total",
+        "counter",
+        "Whole-slot images demoted on preemption (page-less model route).",
+        counters.kv_tier.demoted_slots,
+    );
+    push(
+        "kv_tier_promoted_slots_total",
+        "counter",
+        "Whole-slot images promoted back on re-admission (decode resumed).",
+        counters.kv_tier.promoted_slots,
+    );
+    push(
+        "kv_tier_slot_promote_failures_total",
+        "counter",
+        "Whole-slot promotions that failed (request recomputed).",
+        counters.kv_tier.slot_promote_failures,
+    );
     out
 }
 
@@ -160,7 +178,7 @@ mod tests {
 
     use super::*;
 
-    const METRIC_COUNT: usize = 17;
+    const METRIC_COUNT: usize = 20;
 
     #[test]
     fn renders_help_type_and_labelled_samples() {
@@ -187,6 +205,9 @@ mod tests {
                 promoted_pages: 4,
                 promote_failures: 1,
                 resident_blocks: 2,
+                demoted_slots: 3,
+                promoted_slots: 2,
+                slot_promote_failures: 1,
             },
         };
         let body = render_prometheus(&counters, "qwen3-dense");
@@ -212,6 +233,13 @@ mod tests {
         assert!(body.contains("arle_kv_tier_promoted_pages_total{model_name=\"qwen3-dense\"} 4\n"));
         assert!(
             body.contains("arle_kv_tier_promote_failures_total{model_name=\"qwen3-dense\"} 1\n")
+        );
+        assert!(body.contains("arle_kv_tier_demoted_slots_total{model_name=\"qwen3-dense\"} 3\n"));
+        assert!(body.contains("arle_kv_tier_promoted_slots_total{model_name=\"qwen3-dense\"} 2\n"));
+        assert!(
+            body.contains(
+                "arle_kv_tier_slot_promote_failures_total{model_name=\"qwen3-dense\"} 1\n"
+            )
         );
 
         // Every sample line carries the HELP/TYPE pair exactly once.

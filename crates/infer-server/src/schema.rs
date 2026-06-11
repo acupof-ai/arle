@@ -253,11 +253,15 @@ impl StatsResponse {
             },
             kv_tier: KvTierStatsResponse {
                 available: counters.kv_tier.demoted_pages > 0
-                    || counters.kv_tier.resident_blocks > 0,
+                    || counters.kv_tier.resident_blocks > 0
+                    || counters.kv_tier.demoted_slots > 0,
                 demoted_pages: counters.kv_tier.demoted_pages,
                 promoted_pages: counters.kv_tier.promoted_pages,
                 promote_failures: counters.kv_tier.promote_failures,
                 resident_blocks: counters.kv_tier.resident_blocks,
+                demoted_slots: counters.kv_tier.demoted_slots,
+                promoted_slots: counters.kv_tier.promoted_slots,
+                slot_promote_failures: counters.kv_tier.slot_promote_failures,
             },
             prefix_cache: PrefixCacheStatsResponse {
                 lookups: counters.prefix_cache.lookups,
@@ -306,6 +310,9 @@ pub struct KvTierStatsResponse {
     pub promoted_pages: u64,
     pub promote_failures: u64,
     pub resident_blocks: usize,
+    pub demoted_slots: u64,
+    pub promoted_slots: u64,
+    pub slot_promote_failures: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

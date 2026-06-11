@@ -153,7 +153,8 @@ pub struct ThroughputStats {
 
 /// KV host-tier (T1 DRAM) counters maintained by the backend-neutral
 /// scheduler. All zero unless the executor reports a nonzero
-/// [`infer_seam::BackendExecutor::kv_tier_capacity_pages`].
+/// [`infer_seam::BackendExecutor::kv_tier_capacity_pages`] (page route) or
+/// [`infer_seam::BackendExecutor::kv_slot_tier_enabled`] (whole-slot route).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KvTierStats {
     /// Prefix pages demoted to the backend host tier instead of dropped.
@@ -164,6 +165,12 @@ pub struct KvTierStats {
     pub promote_failures: u64,
     /// Blocks currently resident in the host tier.
     pub resident_blocks: usize,
+    /// Whole-slot images demoted on preemption (page-less model route).
+    pub demoted_slots: u64,
+    /// Whole-slot images promoted back on re-admission (decode resumed).
+    pub promoted_slots: u64,
+    /// Whole-slot promotions that failed (request fell back to recompute).
+    pub slot_promote_failures: u64,
 }
 
 /// Prefix-cache counters maintained by the backend-neutral scheduler.
@@ -214,6 +221,10 @@ struct RequestState {
     phase: RequestPhase,
     prefill_start_pos: usize,
     reused_prefix_pages: Vec<BlockId>,
+    /// Whole-slot tier key while this request's device state is swapped out
+    /// (preempted on a backend with [`infer_seam::BackendExecutor::kv_slot_tier_enabled`]).
+    /// Re-admission promotes and resumes decode; `generated_tokens` are kept.
+    swap_key: Option<u64>,
     finish: Option<FinishReason>,
     waiting_hint: WaitingRequestHint,
 }
@@ -236,6 +247,7 @@ impl RequestState {
             phase: RequestPhase::Prefilling { progress: 0 },
             prefill_start_pos: 0,
             reused_prefix_pages: Vec::new(),
+            swap_key: None,
             finish: None,
             waiting_hint: WaitingRequestHint::default(),
         }
@@ -252,6 +264,9 @@ impl RequestState {
         self.phase = RequestPhase::Prefilling { progress: 0 };
         self.prefill_start_pos = 0;
         self.reused_prefix_pages.clear();
+        // Store-entry lifetime is the caller's job (drop before reset); the
+        // key is cleared so a recomputed request can never promote stale state.
+        self.swap_key = None;
         self.finish = None;
         self.waiting_hint = WaitingRequestHint::default();
         self
@@ -850,14 +865,21 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .waiting
                 .pop_front()
                 .expect("waiting.front() was Some above");
-            let prefix_match = if self.config.enable_prefix_cache {
-                // Tier-aware: demoted blocks in the match are promoted back
-                // into fresh pages here, so attach sees a resident-only match.
-                self.lookup_prefix_for_attach(&request.prompt_tokens)
+            if let Some(key) = request.swap_key.take() {
+                // Whole-slot re-admission: restore the swapped device image
+                // and resume decode (falls back to recompute internally).
+                self.restore_swapped_slot(slot, &mut request, key)?;
             } else {
-                PrefixMatch::empty()
-            };
-            self.attach_prefix_to_request(slot, &mut request, prefix_match)?;
+                let prefix_match = if self.config.enable_prefix_cache {
+                    // Tier-aware: demoted blocks in the match are promoted
+                    // back into fresh pages here, so attach sees a
+                    // resident-only match.
+                    self.lookup_prefix_for_attach(&request.prompt_tokens)
+                } else {
+                    PrefixMatch::empty()
+                };
+                self.attach_prefix_to_request(slot, &mut request, prefix_match)?;
+            }
 
             remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(
                 request
@@ -1810,6 +1832,84 @@ mod testing {
             }
         }
     }
+
+    /// Whole-slot tier mock (page-less model route): records demoted slot
+    /// images by key; forwards delegate to [`MockExecutor`].
+    #[derive(Debug, Clone)]
+    pub(super) struct SlotTierMockExecutor {
+        inner: MockExecutor,
+        pub(super) store: BTreeMap<u64, usize>,
+        pub(super) dropped: Vec<u64>,
+        reject_demotes: bool,
+        fail_promotes: bool,
+    }
+
+    impl SlotTierMockExecutor {
+        pub(super) fn enabled() -> Self {
+            Self {
+                inner: MockExecutor::ready(),
+                store: BTreeMap::new(),
+                dropped: Vec::new(),
+                reject_demotes: false,
+                fail_promotes: false,
+            }
+        }
+
+        pub(super) fn rejecting_demotes() -> Self {
+            Self {
+                reject_demotes: true,
+                ..Self::enabled()
+            }
+        }
+
+        pub(super) fn failing_promotes() -> Self {
+            Self {
+                fail_promotes: true,
+                ..Self::enabled()
+            }
+        }
+    }
+
+    impl BackendExecutor for SlotTierMockExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        fn kv_slot_tier_enabled(&self) -> bool {
+            true
+        }
+
+        fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
+            if self.reject_demotes {
+                return Ok(false);
+            }
+            self.store.insert(key, slot);
+            Ok(true)
+        }
+
+        fn promote_slot(&mut self, key: u64, _slot: usize) -> Result<()> {
+            if self.fail_promotes {
+                bail!("mock slot promote failure");
+            }
+            if !self.store.contains_key(&key) {
+                bail!("promote of unknown slot key {key}");
+            }
+            Ok(())
+        }
+
+        fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
+            for key in keys {
+                self.store.remove(key);
+                self.dropped.push(*key);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1819,8 +1919,8 @@ mod tests {
 
     use super::testing::{
         DeviceMirrorExecutor, HoldGovernor, LimitedPrefixExecutor, MockExecutor, MockKvPool,
-        SamplingExecutor, SingleRowExecutor, SpecMirrorExecutor, StopTokenExecutor,
-        TierMockExecutor, TokenBudgetGovernor, WarmupCountingExecutor,
+        SamplingExecutor, SingleRowExecutor, SlotTierMockExecutor, SpecMirrorExecutor,
+        StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -2122,6 +2222,95 @@ mod tests {
         let tier = engine.kv_tier_stats();
         assert!(tier.promoted_pages >= 2, "prompt promoted back: {tier:?}");
         assert!(engine.prefix_cache_stats().hits >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn slot_swap_resumes_decode_with_generation_intact() -> Result<()> {
+        let mut engine = Engine::with_config(
+            SlotTierMockExecutor::enabled(),
+            MockKvPool::with_capacity(2, 4, 32),
+            test_config(2),
+        );
+        let handle = engine.submit_request((1..=8).collect(), 4);
+        engine.step()?;
+        engine.step()?;
+        let (&slot, request) = engine.active.iter().next().expect("request active");
+        assert!(matches!(request.phase, RequestPhase::Decoding));
+        assert_eq!(request.generated_tokens, vec![9]);
+
+        engine.requeue_preempted_decode(slot);
+        let tier = engine.kv_tier_stats();
+        assert_eq!(tier.demoted_slots, 1, "whole slot swapped out: {tier:?}");
+        assert_eq!(engine.executor.store.len(), 1);
+
+        engine.run_to_idle()?;
+        let done = engine.completed(handle).expect("completed");
+        assert_finished(done);
+        assert_eq!(done.generated_tokens, vec![9, 10, 11, 12]);
+        let tier = engine.kv_tier_stats();
+        assert_eq!(tier.promoted_slots, 1, "decode resumed via promote");
+        assert_eq!(tier.slot_promote_failures, 0);
+        assert_eq!(engine.executor.dropped.len(), 1, "store entry dropped");
+        // The discriminator: the prompt prefilled exactly once — a recompute
+        // fallback would have prefilled it twice.
+        assert_eq!(engine.throughput_stats().prefill_tokens, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn slot_promote_failure_falls_back_to_recompute() -> Result<()> {
+        let mut engine = Engine::with_config(
+            SlotTierMockExecutor::failing_promotes(),
+            MockKvPool::with_capacity(2, 4, 32),
+            test_config(2),
+        );
+        let handle = engine.submit_request((1..=8).collect(), 4);
+        engine.step()?;
+        engine.step()?;
+        let (&slot, _) = engine.active.iter().next().expect("request active");
+
+        engine.requeue_preempted_decode(slot);
+        engine.run_to_idle()?;
+        let done = engine.completed(handle).expect("completed");
+        assert_finished(done);
+        assert_eq!(done.generated_tokens, vec![9, 10, 11, 12]);
+        let tier = engine.kv_tier_stats();
+        assert_eq!(tier.slot_promote_failures, 1, "{tier:?}");
+        assert_eq!(tier.promoted_slots, 0);
+        assert_eq!(engine.executor.dropped.len(), 1, "failed entry dropped");
+        assert_eq!(
+            engine.throughput_stats().prefill_tokens,
+            16,
+            "fallback re-prefilled the prompt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn slot_store_rejection_recomputes_without_counters() -> Result<()> {
+        let mut engine = Engine::with_config(
+            SlotTierMockExecutor::rejecting_demotes(),
+            MockKvPool::with_capacity(2, 4, 32),
+            test_config(2),
+        );
+        let handle = engine.submit_request((1..=8).collect(), 4);
+        engine.step()?;
+        engine.step()?;
+        let (&slot, _) = engine.active.iter().next().expect("request active");
+
+        engine.requeue_preempted_decode(slot);
+        engine.run_to_idle()?;
+        let done = engine.completed(handle).expect("completed");
+        assert_finished(done);
+        assert_eq!(done.generated_tokens, vec![9, 10, 11, 12]);
+        let tier = engine.kv_tier_stats();
+        assert_eq!(tier.demoted_slots, 0);
+        assert_eq!(
+            engine.throughput_stats().prefill_tokens,
+            16,
+            "plain recompute path"
+        );
         Ok(())
     }
 

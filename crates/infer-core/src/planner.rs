@@ -6,10 +6,11 @@
 
 use std::cmp::Reverse;
 
+use anyhow::Result;
 use infer_plan::{DecodeRow, ForwardMode, ForwardPlan, PrefillRow};
 use infer_seam::{BackendExecutor, KvPool};
 
-use crate::{Engine, RequestPhase, WaitingInsertBias};
+use crate::{Engine, RequestPhase, RequestState, WaitingInsertBias};
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     pub(crate) fn build_forward_plan(&self) -> ForwardPlan {
@@ -126,28 +127,100 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     }
 
     pub(crate) fn requeue_preempted_decode(&mut self, slot: usize) {
-        let Some(request) = self.active.remove(&slot) else {
+        let Some(mut request) = self.active.remove(&slot) else {
             return;
         };
-        // Swap-style preemption (#84): with a host tier, seal the victim's
+        // Swap-style preemption (#84): with a page tier, seal the victim's
         // prompt blocks into the radix and demote exactly those pages, so
         // re-admission promotes the prefill back instead of recomputing it.
-        // The same device pages end up free as the plain path; without a
-        // tier store the behavior is byte-for-byte unchanged.
-        let published = if self.kv_tier_capacity() > 0 {
-            self.publish_prefix_blocks(slot, &request)
-        } else {
-            Vec::new()
-        };
+        // On a page-less backend with a whole-slot tier (DSv4 route), demote
+        // the entire slot image instead — re-admission resumes decode with
+        // `generated_tokens` intact. Without any tier store the behavior is
+        // byte-for-byte unchanged.
+        let mut published = Vec::new();
+        let mut slot_swap_key = None;
+        if self.kv_tier_capacity() > 0 {
+            published = self.publish_prefix_blocks(slot, &request);
+        } else if self.executor.kv_slot_tier_enabled()
+            && matches!(request.phase, RequestPhase::Decoding)
+        {
+            let key = self.next_tier_key;
+            self.next_tier_key = self.next_tier_key.wrapping_add(1);
+            match self.executor.demote_slot(slot, key) {
+                Ok(true) => {
+                    slot_swap_key = Some(key);
+                    self.kv_tier_stats.demoted_slots =
+                        self.kv_tier_stats.demoted_slots.saturating_add(1);
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    log::warn!("whole-slot KV demote failed for slot {slot}: {err:#}");
+                }
+            }
+        }
         self.release_reused_prefix(&request.reused_prefix_pages);
         self.kv.free_slot(slot);
         if !published.is_empty() {
             self.demote_published_pages(&published);
         }
-        self.enqueue_waiting_request(
-            request.reset_for_recompute(),
-            WaitingInsertBias::BeforeEqual,
-        );
+        let request = if let Some(key) = slot_swap_key {
+            // Keep the generation: decode resumes at the demoted position
+            // after promote. Only slot-coupled bookkeeping resets.
+            request.swap_key = Some(key);
+            request.reused_prefix_pages.clear();
+            request.prefill_start_pos = 0;
+            request.phase = RequestPhase::Prefilling { progress: 0 };
+            request.waiting_hint = crate::WaitingRequestHint::default();
+            request
+        } else {
+            request.reset_for_recompute()
+        };
+        self.enqueue_waiting_request(request, WaitingInsertBias::BeforeEqual);
+    }
+
+    /// Inverse of the whole-slot demote: rebuild host KV accounting for the
+    /// full sequence, restore the device image, and resume decode. On any
+    /// failure the request falls back to plain recompute on the same slot.
+    pub(crate) fn restore_swapped_slot(
+        &mut self,
+        slot: usize,
+        request: &mut RequestState,
+        key: u64,
+    ) -> Result<()> {
+        let seq_len = request
+            .prompt_len()
+            .saturating_add(request.generated_tokens.len());
+        let restored = self
+            .alloc_with_prefix_reclaim(slot, seq_len)
+            .and_then(|()| self.executor.promote_slot(key, slot));
+        match restored {
+            Ok(()) => {
+                self.executor.drop_kv_slot_entries(&[key]);
+                request.phase = RequestPhase::Decoding;
+                request.prefill_start_pos = request.prompt_len();
+                self.kv_tier_stats.promoted_slots =
+                    self.kv_tier_stats.promoted_slots.saturating_add(1);
+                Ok(())
+            }
+            Err(err) => {
+                log::warn!(
+                    "whole-slot KV promote failed for request {}: {err:#}; recomputing",
+                    request.handle.id()
+                );
+                self.executor.drop_kv_slot_entries(&[key]);
+                self.kv.free_slot(slot);
+                self.kv_tier_stats.slot_promote_failures =
+                    self.kv_tier_stats.slot_promote_failures.saturating_add(1);
+                let fresh = request.clone().reset_for_recompute();
+                *request = fresh;
+                let prefix_match = if self.config.enable_prefix_cache {
+                    self.lookup_prefix_for_attach(&request.prompt_tokens)
+                } else {
+                    crate::PrefixMatch::empty()
+                };
+                self.attach_prefix_to_request(slot, request, prefix_match)
+            }
+        }
     }
 
     pub(crate) fn plan_new_pages_needed(&self, plan: &ForwardPlan) -> usize {
