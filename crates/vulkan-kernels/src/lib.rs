@@ -341,8 +341,18 @@ impl KernelParams {
     }
 }
 
+pub const Q8_1_X4_VALUES_PER_GROUP: u32 = 128;
+
+pub fn q8_1_quantize_params(ne: u32) -> KernelParams {
+    KernelParams::from_words(vec![ne, ne.div_ceil(Q8_1_X4_VALUES_PER_GROUP)])
+}
+
+pub fn q8_1_quantize_dispatch(ne: u32) -> Dispatch {
+    Dispatch::x(ne.div_ceil(Q8_1_X4_VALUES_PER_GROUP).max(1))
+}
+
 macro_rules! launcher_fns {
-    ($call:path) => {
+    ($call:path, $call_params:path) => {
         pub fn mmvq_iq2_xxs(
             ctx: &vulkan_sys::VulkanContext,
             buffers: &[&vulkan_sys::DeviceBuffer<'_>],
@@ -387,8 +397,9 @@ macro_rules! launcher_fns {
             ctx: &vulkan_sys::VulkanContext,
             buffers: &[&vulkan_sys::DeviceBuffer<'_>],
             dispatch: Dispatch,
+            params: &KernelParams,
         ) -> Result<()> {
-            $call(Kernel::QuantizeQ8_1, ctx, buffers, dispatch)
+            $call_params(Kernel::QuantizeQ8_1, ctx, buffers, dispatch, params)
         }
 
         pub fn rms_norm(
@@ -717,7 +728,7 @@ mod real {
 }
 
 #[cfg(feature = "vulkan")]
-launcher_fns!(real::launch);
+launcher_fns!(real::launch, real::launch_with_params);
 #[cfg(feature = "vulkan")]
 fused_launcher_fns!(real::launch_with_params);
 
@@ -756,7 +767,7 @@ mod stub {
 }
 
 #[cfg(not(feature = "vulkan"))]
-launcher_fns!(stub::launch);
+launcher_fns!(stub::launch, stub::launch_with_params);
 #[cfg(not(feature = "vulkan"))]
 fused_launcher_fns!(stub::launch_with_params);
 
@@ -917,6 +928,17 @@ mod tests {
                 0x44, 0x33, 0x22, 0x11, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x80, 0x3f
             ]
         );
+    }
+
+    #[test]
+    fn q8_1_quantize_params_match_x4_shader_contract() {
+        let params = q8_1_quantize_params(257);
+        assert_eq!(params.len_bytes(), 8);
+        assert_eq!(params.to_le_bytes(), [1, 1, 0, 0, 3, 0, 0, 0]);
+        assert_eq!(q8_1_quantize_dispatch(0), Dispatch::x(1));
+        assert_eq!(q8_1_quantize_dispatch(128), Dispatch::x(1));
+        assert_eq!(q8_1_quantize_dispatch(129), Dispatch::x(2));
+        assert_eq!(q8_1_quantize_dispatch(257), Dispatch::x(3));
     }
 
     #[cfg(not(feature = "vulkan"))]
