@@ -1095,69 +1095,93 @@ impl Dsv4CudaExecutor {
             .ok_or_else(|| anyhow::anyhow!("DSv4 MTP decode missing previous hidden"))?
             .clone();
 
-        let draft_position = start_pos as u64;
-        let (draft, _draft_stream) = self.model.mtp_forward(
-            &mut self.slots[slot_idx],
-            &mut self.kv_adapter,
-            &hidden,
-            pending,
-            draft_position,
-        )?;
+        // ── Depth-K MTP: chain K drafts off the MTP head, verify
+        // [pending, d0..d_{K-1}] in ONE batched forward, accept the longest correct
+        // prefix, commit accepted+bonus, roll back the rejected tail. K from the
+        // CLI/env config; K=1 reduces to the original depth-1 path. Greedy-equivalent:
+        // every committed token is the target's argmax.
+        let depth = self.spec_draft_tokens.unwrap_or(1).max(1);
+
+        // Draft chain: d_i = mtp_forward(prev_stream, prev_token) at start_pos+i, each
+        // chaining from the previous draft's wide MTP stream so d_{i+1} conditions on d_i.
+        let mut drafts: Vec<u32> = Vec::with_capacity(depth);
+        let mut chain_hidden = hidden;
+        let mut chain_token = pending;
+        for i in 0..depth {
+            let (d, d_stream) = self.model.mtp_forward(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &chain_hidden,
+                chain_token,
+                (start_pos + i) as u64,
+            )?;
+            drafts.push(d);
+            chain_hidden = d_stream;
+            chain_token = d;
+        }
+
+        // Verify K+1 tokens: argmax[j] = target argmax AFTER verify_tokens[j], so
+        // argmax[i] is exactly what draft i must equal; hiddens[j] = that MTP stream.
+        let mut verify_tokens: Vec<u32> = Vec::with_capacity(depth + 1);
+        verify_tokens.push(pending);
+        verify_tokens.extend_from_slice(&drafts);
         let (argmax, mut hiddens) = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
-            &[pending, draft],
+            &verify_tokens,
             start_pos,
             position,
         )?;
         ensure!(
-            argmax.len() == 2 && hiddens.len() == 2,
-            "DSv4 MTP depth-1 verify expected 2 rows, got argmax={} hidden={}",
+            argmax.len() == depth + 1 && hiddens.len() == depth + 1,
+            "DSv4 MTP depth-{depth} verify expected {} rows, got argmax={} hidden={}",
+            depth + 1,
             argmax.len(),
             hiddens.len()
         );
-        let base_next = argmax[0];
-        let bonus = argmax[1];
-        let matched = base_next == draft;
+
+        // Longest accepted prefix: draft i accepted iff it equals argmax[i]; stop
+        // at the first mismatch.
+        let mut n = 0usize;
+        while n < depth && drafts[n] == argmax[n] {
+            n += 1;
+        }
+        let bonus = argmax[n]; // target's correction (n<depth) or continuation (n==depth)
+        self.mtp_accepts += n;
+        self.mtp_rejects += depth - n;
         if std::env::var("ARLE_DSV4_MTP_DRAFT_DUMP").as_deref() == Ok("1")
             && self.model.tp.config().rank == 0
         {
-            let total_before = self.mtp_accepts + self.mtp_rejects;
-            let matches_before = self.mtp_accepts;
-            let total_after = total_before + 1;
-            let matches_after = matches_before + usize::from(matched);
-            let accuracy = (matches_after as f64) / (total_after as f64);
+            let matches: Vec<bool> = (0..depth).map(|i| drafts[i] == argmax[i]).collect();
             eprintln!(
-                "[dsv4-mtp-draft] step={} start_pos={} pending={} draft={} actual={} match={} depth1_match_total={} depth1_total={} depth1_accuracy={:.6}",
-                total_after,
-                start_pos,
-                pending,
-                draft,
-                base_next,
-                matched,
-                matches_after,
-                total_after,
-                accuracy
+                "[dsv4-mtp-draft] depth={depth} start_pos={start_pos} accepted={n} drafts={drafts:?} targets={:?} matches={matches:?}",
+                &argmax[..depth]
             );
         }
-        if base_next == draft {
-            let hidden_for_draft = hiddens.remove(1);
+        if self.model.tp.config().rank == 0 {
+            eprintln!(
+                "[dsv4-mtp] depth={depth} accepted={n}/{depth} accept_total={} reject_total={} pending={pending} bonus={bonus}",
+                self.mtp_accepts, self.mtp_rejects
+            );
+        }
+
+        if n == depth {
+            // Full accept: every draft matched — the verify already wrote their KV,
+            // keep it. committed = drafts + [bonus]; next pending = bonus, hidden =
+            // the position-`depth` stream (the last draft's).
             spec.pending = Some(bonus);
-            spec.hidden = Some(hidden_for_draft);
-            self.mtp_accepts += 1;
-            if self.model.tp.config().rank == 0 {
-                eprintln!(
-                    "[dsv4-mtp] accept_total={} reject_total={} pending={} draft={} bonus={}",
-                    self.mtp_accepts, self.mtp_rejects, pending, draft, bonus
-                );
-            }
-            Ok(vec![draft, bonus])
-        } else if crate::dsv4::dsv4_mtp_batched_verify_enabled() {
-            // Batched-verify reject: the rollback snapshot was captured PRE-pending
-            // (before the batched [pending,draft] forward), so truncate to start_pos,
-            // restore (compressor → pre-pending; draft sw/fp8 slot), then RE-FORWARD
-            // pending (M=1) to rebuild its KV + compressor + capture its hidden. Ends at
-            // start_pos+1 with pending committed (== the per-token reject end state).
+            spec.hidden = Some(hiddens.remove(depth));
+            let mut out = drafts;
+            out.push(bonus);
+            Ok(out)
+        } else {
+            // Partial accept (incl. n==0): the verify wrote KV for pending + K drafts;
+            // roll the whole step back to pre-verify (truncate to start_pos + restore the
+            // full-buffer compressor/indexer; SW ring + DSA packed_rows self-heal on the
+            // next overwrite), then RE-FORWARD the accepted prefix [pending, d0..d_{n-1}]
+            // (n+1 tokens) to rebuild its KV/compressor and capture the hidden for the
+            // next draft. bonus (argmax[n]) is the next pending. n==0 → re-forward
+            // [pending] = the original depth-1 reject.
             self.model
                 .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
             self.slots[slot_idx].restore_spec_rollback(
@@ -1165,53 +1189,22 @@ impl Dsv4CudaExecutor {
                 &mut self.kv_adapter,
                 start_pos + 1,
             )?;
-            let (_, mut reforward_hiddens) = self.model.forward_tokens_verify(
+            let mut prefix: Vec<u32> = Vec::with_capacity(n + 1);
+            prefix.push(pending);
+            prefix.extend_from_slice(&drafts[..n]);
+            let (_, mut re_hiddens) = self.model.forward_tokens_verify(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
-                &[pending],
+                &prefix,
                 start_pos,
-                (start_pos + 1) as u64,
+                position,
             )?;
-            spec.pending = Some(base_next);
-            spec.hidden = Some(reforward_hiddens.remove(0));
-            self.mtp_rejects += 1;
-            if self.model.tp.config().rank == 0 {
-                eprintln!(
-                    "[dsv4-mtp] accept_total={} reject_total={} pending={} draft={} base_next={} (batched)",
-                    self.mtp_accepts, self.mtp_rejects, pending, draft, base_next
-                );
-            }
-            Ok(vec![base_next])
-        } else {
-            let keep_len = start_pos + 1;
-            self.model
-                .truncate_slot(&mut self.slots[slot_idx], keep_len)?;
-            self.model.dump_mtp_rollback_state(
-                &self.slots[slot_idx],
-                "spec_after_reject_truncate",
-                keep_len,
-            )?;
-            self.slots[slot_idx].restore_spec_rollback(
-                &self.model.ctx,
-                &mut self.kv_adapter,
-                keep_len,
-            )?;
-            self.model.dump_mtp_rollback_state(
-                &self.slots[slot_idx],
-                "spec_after_reject_restore",
-                keep_len,
-            )?;
-            let hidden_for_pending = hiddens.remove(0);
-            spec.pending = Some(base_next);
-            spec.hidden = Some(hidden_for_pending);
-            self.mtp_rejects += 1;
-            if self.model.tp.config().rank == 0 {
-                eprintln!(
-                    "[dsv4-mtp] accept_total={} reject_total={} pending={} draft={} base_next={}",
-                    self.mtp_accepts, self.mtp_rejects, pending, draft, base_next
-                );
-            }
-            Ok(vec![base_next])
+            spec.pending = Some(bonus);
+            spec.hidden = Some(re_hiddens.remove(n));
+            let mut out: Vec<u32> = Vec::with_capacity(n + 1);
+            out.extend_from_slice(&drafts[..n]);
+            out.push(bonus);
+            Ok(out)
         }
     }
 
