@@ -188,6 +188,14 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Re-budget the T1 tier store (`0` disables; pre-serve only). No-op on
+    /// arms without a tier store.
+    pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
+        if let Self::Qwen(q) = self {
+            q.set_kv_tier_budget_bytes(bytes);
+        }
+    }
+
     pub(crate) fn dsv4_verify_forward_selftest(&mut self, prompt: &[u32]) -> Result<()> {
         match self {
             Self::Dsv4(d) => d.verify_forward_selftest(prompt),
@@ -454,6 +462,13 @@ impl QwenCudaExecutor {
 
     pub(crate) fn kv_tier_capacity_pages(&self) -> usize {
         self.tier.capacity_pages()
+    }
+
+    /// Re-budget the T1 tier store (`0` disables). Pre-serve only: any
+    /// existing entries are dropped, so callers configure this right after
+    /// construction, before the engine demotes anything.
+    pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
+        self.tier = CudaKvTierStore::with_budget(bytes, self.kv.storage_bytes_per_page());
     }
 
     /// Copy device pages into the host tier store (synchronous: the copy is

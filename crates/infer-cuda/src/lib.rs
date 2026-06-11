@@ -180,6 +180,18 @@ impl CudaExecutor {
         }
     }
 
+    /// Re-budget the T1 host KV tier (`0` disables). Pre-serve only — must be
+    /// called before the engine starts demoting; existing entries are dropped.
+    pub fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = bytes;
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.set_kv_tier_budget_bytes(bytes),
+        }
+    }
+
     /// Build the real CUDA executor for dense BF16 Qwen3 safetensors.
     ///
     /// `total_pages` must match the host [`CudaKvPool`] so device page
