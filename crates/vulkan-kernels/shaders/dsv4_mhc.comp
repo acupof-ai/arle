@@ -38,9 +38,80 @@ layout(binding = 7) buffer Out {
     float out_data[];
 };
 
+float sigmoid(float value) {
+    if (value >= 0.0) {
+        return 1.0 / (1.0 + exp(-value));
+    }
+    const float expv = exp(value);
+    return expv / (1.0 + expv);
+}
+
+float stream_rsqrt() {
+    const uint stream_dim = p.hidden * p.hc_mult;
+    float sumsq = 0.0;
+    for (uint i = 0; i < stream_dim; ++i) {
+        sumsq += a[i] * a[i];
+    }
+    return inversesqrt(sumsq / max(float(stream_dim), 1.0) + p.eps);
+}
+
+void row_softmax_plus_eps(inout float raw[64]) {
+    for (uint row = 0; row < p.hc_mult; ++row) {
+        float max_value = -3.4028234663852886e38;
+        for (uint col = 0; col < p.hc_mult; ++col) {
+            max_value = max(max_value, raw[row * p.hc_mult + col]);
+        }
+        float denom = 0.0;
+        for (uint col = 0; col < p.hc_mult; ++col) {
+            const uint idx = row * p.hc_mult + col;
+            raw[idx] = exp(raw[idx] - max_value);
+            denom += raw[idx];
+        }
+        for (uint col = 0; col < p.hc_mult; ++col) {
+            const uint idx = row * p.hc_mult + col;
+            raw[idx] = raw[idx] / denom + p.eps;
+        }
+    }
+}
+
+void row_normalize(inout float raw[64]) {
+    for (uint row = 0; row < p.hc_mult; ++row) {
+        float sum = p.eps;
+        for (uint col = 0; col < p.hc_mult; ++col) {
+            sum += raw[row * p.hc_mult + col];
+        }
+        for (uint col = 0; col < p.hc_mult; ++col) {
+            raw[row * p.hc_mult + col] /= sum;
+        }
+    }
+}
+
+void column_normalize(inout float raw[64]) {
+    for (uint col = 0; col < p.hc_mult; ++col) {
+        float sum = p.eps;
+        for (uint row = 0; row < p.hc_mult; ++row) {
+            sum += raw[row * p.hc_mult + col];
+        }
+        for (uint row = 0; row < p.hc_mult; ++row) {
+            raw[row * p.hc_mult + col] /= sum;
+        }
+    }
+}
+
+float pre_mixed(uint col) {
+    float value = 0.0;
+    for (uint lane = 0; lane < p.hc_mult; ++lane) {
+        value += pre[lane] * a[lane * p.hidden + col];
+    }
+    return value;
+}
+
 void main() {
     const uint idx = gl_GlobalInvocationID.x;
     const uint stream_dim = p.hidden * p.hc_mult;
+    if (p.hc_mult == 0 || p.hc_mult > 8 || p.hidden == 0) {
+        return;
+    }
     if (p.op == 0) {
         if (idx < stream_dim) {
             out_data[idx] = a[idx % p.hidden];
@@ -48,24 +119,41 @@ void main() {
         return;
     }
     if (p.op == 1) {
+        const float inv_rms = stream_rsqrt();
+        const uint need_mix = p.hc_mult * (2 + p.hc_mult);
         if (idx < p.hc_mult) {
-            pre[idx] = base[idx] + scale[idx];
-            post[idx] = base[idx] - scale[idx];
+            pre[idx] = sigmoid(scale[0] * b[idx] * inv_rms + base[idx]) + p.eps;
+            post[idx] = 2.0 * sigmoid(scale[1] * b[p.hc_mult + idx] * inv_rms + base[p.hc_mult + idx]);
         }
         if (idx < p.hc_mult * p.hc_mult) {
-            const uint row = idx / p.hc_mult;
-            const uint col = idx % p.hc_mult;
-            comb[idx] = row == col ? 1.0 : 0.0;
+            float raw[64];
+            for (uint i = 0; i < 64; ++i) {
+                raw[i] = 0.0;
+            }
+            for (uint i = 0; i < p.hc_mult * p.hc_mult; ++i) {
+                const uint mix_idx = 2 * p.hc_mult + i;
+                raw[i] = mix_idx < need_mix ? scale[2] * b[mix_idx] * inv_rms + base[mix_idx] : 0.0;
+            }
+            row_softmax_plus_eps(raw);
+            column_normalize(raw);
+            for (uint iter = 1; iter < p.sinkhorn_iters; ++iter) {
+                row_normalize(raw);
+                column_normalize(raw);
+            }
+            comb[idx] = raw[idx];
         }
         return;
     }
     if (p.op == 2) {
         if (idx < p.hidden) {
-            float acc = 0.0;
-            for (uint m = 0; m < p.hc_mult; ++m) {
-                acc += a[m * p.hidden + idx] * pre[m];
+            const float mixed = pre_mixed(idx);
+            float sumsq = 0.0;
+            for (uint col = 0; col < p.hidden; ++col) {
+                const float value = pre_mixed(col);
+                sumsq += value * value;
             }
-            out_data[idx] = acc / max(float(p.hc_mult), 1.0);
+            const float inv_rms = inversesqrt(sumsq / max(float(p.hidden), 1.0) + p.eps);
+            out_data[idx] = mixed * inv_rms * b[idx];
         }
         return;
     }
@@ -73,17 +161,23 @@ void main() {
         if (idx < stream_dim) {
             const uint m = idx / p.hidden;
             const uint h = idx % p.hidden;
-            out_data[idx] = b[idx] + a[h] * post[m];
+            float value = post[m] * a[h];
+            for (uint src = 0; src < p.hc_mult; ++src) {
+                value += comb[m * p.hc_mult + src] * b[src * p.hidden + h];
+            }
+            out_data[idx] = value;
         }
         return;
     }
     if (p.op == 4) {
         if (idx < p.hidden) {
-            float acc = 0.0;
-            for (uint m = 0; m < p.hc_mult; ++m) {
-                acc += a[m * p.hidden + idx];
+            const float inv_rms = stream_rsqrt();
+            float value = 0.0;
+            for (uint lane = 0; lane < p.hc_mult; ++lane) {
+                const float lane_pre = sigmoid(scale[0] * b[lane] * inv_rms + base[lane]) + p.eps;
+                value += lane_pre * a[lane * p.hidden + idx];
             }
-            out_data[idx] = acc / max(float(p.hc_mult), 1.0);
+            out_data[idx] = value;
         }
     }
 }
