@@ -2,8 +2,10 @@
 //!
 //! ```text
 //!  router gemm  → logits[T, E]
-//!    → infer_moe::route (HOST)         → per-token (expert, weight)
-//!    → flatten_routing (HOST)          → route_indices[T*topk], route_weights[T*topk]
+//!    → dsv4_route (DEVICE, zero bias)  → route_indices[T*topk], route_weights[T*topk]
+//!    → qwen36_renorm_topk_weights      → norm_topk_prob renorm (in-place)
+//!      [ARLE_QWEN35_GPU_ROUTER=0 fallback: infer_moe::route (HOST) + flatten_routing
+//!       + ctx.sync + logits D2H + indices/weights H2D]
 //!    → dsv4_count_local_experts        → counts[E]
 //!    → dsv4_exclusive_scan_i32         → offsets[E]
 //!    → dsv4_pack_local_experts_with_slots
@@ -17,8 +19,11 @@
 //!    → shared expert dense SwiGLU + qwen36_add_shared_expert_gated
 //! ```
 //!
-//! Routing runs on the host (the small `[T, E]` logits are cheap to round-trip
-//! through the verified `infer_moe::route`); a device router is a perf follow-up.
+//! Routing runs on DEVICE by default (`dsv4_route` with a zero selection bias is
+//! exactly greedy top-k; audit lane MOE-OK-3 established host/device semantic
+//! identity for Qwen3.6). The host `infer_moe::route` path stays as the
+//! `ARLE_QWEN35_GPU_ROUTER=0` fallback for the pod A/B license — it costs a
+//! full-stream `ctx.sync` + logits D2H + 2×H2D per layer per step.
 //! W4/4-bit is a separate follow-up: the two `moe_bf16_grouped_gemm_*` call sites
 //! are the swap points; everything else is dtype-agnostic on BF16 activations.
 
@@ -162,7 +167,7 @@ mod gpu {
     use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, HiddenStates};
     use cuda_kernels::tensor::cache_ptr;
     use half::bf16;
-    use infer_moe::MoeConfig;
+    use infer_moe::{MoeConfig, ScoringFunc, TopkMethod};
 
     use crate::loader::MoeLayerWeights;
     use crate::moe_config::ExpertSplit;
@@ -182,8 +187,9 @@ mod gpu {
     /// | slot              | shape       | init on reuse | proof |
     /// |-------------------|-------------|---------------|-------|
     /// | `logits`          | `[E, T]`    | none          | router `gemm_cuda` is beta=0, writes all `E*T` |
-    /// | `route_indices`   | `[R]` i32   | H2D overwrite | uploaded from host every call |
-    /// | `route_weights`   | `[R]` f32   | H2D overwrite | uploaded from host every call |
+    /// | `route_indices`   | `[R]` i32   | none / H2D    | device route: `dsv4_route` phase 3 writes all `topk` slots per token unconditionally; host fallback: H2D overwrite every call |
+    /// | `route_weights`   | `[R]` f32   | none / H2D    | same as `route_indices` (renorm kernel is in-place over freshly written slots) |
+    /// | `router_bias_zero`| `[E]` bf16  | `upload_const`| pure function of length (all-zero greedy selection bias), uploaded once |
     /// | `counts`          | `[E_l]` i32 | memset 0      | REQUIRED: count kernel `atomicAdd`s |
     /// | `offsets`         | `[E_l]` i32 | none          | exclusive scan writes all `tid < n` |
     /// | `scan_total`      | `[1]` i32   | none          | scan writes it before any read |
@@ -208,6 +214,7 @@ mod gpu {
         logits: HiddenSlot,
         route_indices: SliceSlot<i32>,
         route_weights: SliceSlot<f32>,
+        router_bias_zero: SliceSlot<bf16>,
         counts: SliceSlot<i32>,
         offsets: SliceSlot<i32>,
         scan_total: SliceSlot<i32>,
@@ -239,6 +246,7 @@ mod gpu {
                 logits,
                 route_indices,
                 route_weights,
+                router_bias_zero,
                 counts,
                 offsets,
                 scan_total,
@@ -261,6 +269,7 @@ mod gpu {
             logits.release();
             route_indices.release();
             route_weights.release();
+            router_bias_zero.release();
             counts.release();
             offsets.release();
             scan_total.release();
@@ -280,6 +289,18 @@ mod gpu {
             shared_out.release();
             gate_logit.release();
         }
+    }
+
+    /// Default ON: route fully on-device (no per-layer logits D2H +
+    /// `ctx.sync()` full-stream drain). Opt out with
+    /// `ARLE_QWEN35_GPU_ROUTER=0` (or `false`) to run the verified
+    /// `infer_moe::route` host reference — the pod A/B license lever. Mirrors
+    /// the DSv4 `ARLE_DSV4_GPU_ROUTER` gate (`dsv4_gpu::use_gpu_router`).
+    fn use_gpu_router() -> bool {
+        !matches!(
+            std::env::var("ARLE_QWEN35_GPU_ROUTER").as_deref(),
+            Ok("0" | "false")
+        )
     }
 
     /// BF16 MoE forward for one sparse layer (allocate-per-call compatibility
@@ -362,25 +383,90 @@ mod gpu {
         let logits = scratch.logits.get(ctx, num_experts, num_tokens)?;
         gemm_batch(ctx, &weights.router_gate, normed, logits)?;
 
-        // ── 2. HOST route (verified infer_moe reference). ───────────────────
-        // Sync so the gemm has landed before the D2H read.
-        ctx.sync()?;
-        let logits_bf16: Vec<bf16> = ctx
-            .stream
-            .clone_dtoh(&logits.data)
-            .map_err(|e| anyhow::anyhow!("MoE router logits D2H failed: {e}"))?;
-        let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
-        let decisions = infer_moe::route(&logits_host, &[], cfg)
-            .map_err(|e| anyhow::anyhow!("MoE host route failed: {e}"))?;
-        let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
+        // ── 2. Route: DEVICE kernel (default) or host reference fallback. ───
         let total_routes = num_tokens * topk;
-        ensure!(
-            indices_host.len() == total_routes && weights_host.len() == total_routes,
-            "flattened routing length mismatch"
-        );
+        // The device kernel implements greedy top-k (zero selection bias) with
+        // no group-limited masking; any other routing config falls back to the
+        // host reference rather than silently mis-routing.
+        let device_route_eligible = cfg.topk_method == TopkMethod::Greedy
+            && cfg.n_group.is_none()
+            && cfg.topk_group.is_none();
+        let (route_indices, route_weights) = if use_gpu_router() && device_route_eligible {
+            // `dsv4_route` with routing_kind=1 (learned-bias selection key) and
+            // an all-zero bias IS greedy top-k: key = scores + 0.0 exactly
+            // (softmax scores are >= +0.0, so `x + 0.0f == x` bitwise).
+            // scoring_kind=0 (softmax) pins the weight denom at 1.0 — raw
+            // softmax probs — and the Qwen3.6 `norm_topk_prob` renorm is the
+            // separate `qwen36_renorm_topk_weights` launch, mirroring
+            // `infer_moe::route`'s separate step 5 (same 1e-20 zero guard,
+            // same serial sum order). Audit lane MOE-OK-3 (2026-06-11)
+            // established host/device semantic identity for Qwen3.6: stable
+            // softmax over all experts, greedy top-k ties-to-lower-index,
+            // renorm to sum 1, scaling 1.0. The bias table is a pure function
+            // of its length (all zeros), so `upload_const` uploads once.
+            let bias_zero_host = vec![bf16::ZERO; num_experts];
+            let bias_zero = scratch
+                .router_bias_zero
+                .upload_const(ctx, &bias_zero_host)?;
+            let bias_zero_ptr = cache_ptr(bias_zero, ctx);
+            let route_indices = scratch.route_indices.get(ctx, total_routes)?;
+            let route_weights = scratch.route_weights.get(ctx, total_routes)?;
+            // SAFETY: logits `[E, T]`, indices/weights `[T*topk]`, bias `[E]`
+            // are live scratch buffers on ctx.stream. Phase 3 of the route
+            // kernel writes EVERY indices/weights slot unconditionally, so
+            // length-matched slot reuse needs no re-init; the renorm kernel
+            // rewrites the same freshly written slots in place.
+            unsafe {
+                moe::dsv4_route(
+                    cache_ptr(&logits.data, ctx),
+                    Some(bias_zero_ptr),
+                    None,
+                    None,
+                    cache_ptr(route_indices, ctx),
+                    cache_ptr(route_weights, ctx),
+                    num_tokens,
+                    num_experts,
+                    topk,
+                    1, // learned-bias selection key; zero bias ⇒ greedy
+                    cfg.scoring_func.scoring_kind(),
+                    cfg.routed_scaling_factor,
+                    ctx.stream.cu_stream(),
+                )?;
+                // Host-route gate equivalent: norm_topk_prob ∧ Greedy ∧
+                // softmax (non-softmax scoring already normalizes inside the
+                // route kernel; Greedy is guaranteed by the eligibility gate).
+                if cfg.norm_topk_prob && cfg.scoring_func == ScoringFunc::Softmax {
+                    moe::qwen36_renorm_topk_weights(
+                        cache_ptr(route_weights, ctx),
+                        num_tokens,
+                        topk,
+                        ctx.stream.cu_stream(),
+                    )?;
+                }
+            }
+            (&*route_indices, &*route_weights)
+        } else {
+            // HOST route (verified infer_moe reference,
+            // `ARLE_QWEN35_GPU_ROUTER=0` or a non-greedy/grouped config).
+            // Sync so the gemm has landed before the D2H read.
+            ctx.sync()?;
+            let logits_bf16: Vec<bf16> = ctx
+                .stream
+                .clone_dtoh(&logits.data)
+                .map_err(|e| anyhow::anyhow!("MoE router logits D2H failed: {e}"))?;
+            let logits_host: Vec<f32> = logits_bf16.iter().map(|&v| v.to_f32()).collect();
+            let decisions = infer_moe::route(&logits_host, &[], cfg)
+                .map_err(|e| anyhow::anyhow!("MoE host route failed: {e}"))?;
+            let (indices_host, weights_host) = super::flatten_routing(&decisions, topk)?;
+            ensure!(
+                indices_host.len() == total_routes && weights_host.len() == total_routes,
+                "flattened routing length mismatch"
+            );
 
-        let route_indices = scratch.route_indices.upload(ctx, &indices_host)?;
-        let route_weights = scratch.route_weights.upload(ctx, &weights_host)?;
+            let route_indices = scratch.route_indices.upload(ctx, &indices_host)?;
+            let route_weights = scratch.route_weights.upload(ctx, &weights_host)?;
+            (route_indices, route_weights)
+        };
 
         // ── 3. Per-expert route counts → group offsets (LOCAL experts only). ─
         // Kernels write these through raw device pointers, so no Rust `mut`.
