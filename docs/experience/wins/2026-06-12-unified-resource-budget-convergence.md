@@ -182,6 +182,18 @@ shared infer-seam budget kernel on real H20 hardware. The only residual is C3's
 host RAM/SSD derivation, which stays unit-tested and resolves to the caps on the
 ample pod (byte-identical serving footprint).
 
+**Post-validation message fix (log-string only, behavior-identical).** The
+validated binary printed `Lower --max-seq-len …` in all four budget messages
+(quoted verbatim above), but no `--max-seq-len` CLI flag exists — Qwen's knob is
+`--total-pages`, DSv4's is the `INFER_DSV4_MAX_SEQ_LEN` env var (confirmed:
+`grep max.seq.len crates/cli/src/args.rs` is empty). The four messages were
+corrected to name the real knob (`--total-pages` / `INFER_DSV4_MAX_SEQ_LEN`)
+**after** the pod runs. This is a pure operator-guidance string change — the
+reject/clamp arithmetic, control flow, and decode path are byte-for-byte
+unchanged — so it is **not re-validated** on the pod; the log excerpts above are
+the historical record of the validated binary's exact wording. Bench-exempt:
+log-string only, no runtime behavior change.
+
 ## Rule
 
 When two backends solve the same resource problem (how many KV slots fit in
