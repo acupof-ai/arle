@@ -150,6 +150,12 @@ pub(crate) const DEEPGEMM_CONTIG_ALIGN: usize = 128;
 /// the true aligned total carry `m_indices = -1` and compute excluded garbage.
 /// Always a multiple of 128 (the native bridge rejects unaligned `m`).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Routed-row floor below which the DeepGEMM grouped path loses to the hand
+/// CUDA-core kernels (pod A/B 2026-06-11: decode R=8 hand wins +8%, prefill
+/// R=16384 DeepGEMM wins -33% needle wall; 1024 = 128-token chunk x top-8
+/// keeps both measured regimes on their winning side).
+pub(crate) const QWEN35_DEEPGEMM_MIN_ROUTES: usize = 1024;
+
 pub(crate) fn deepgemm_contig_rows_cap(total_routes: usize, local_experts: usize) -> usize {
     let a = DEEPGEMM_CONTIG_ALIGN;
     total_routes.div_ceil(a) * a + a * local_experts.min(total_routes)
@@ -215,7 +221,10 @@ mod gpu {
     use half::bf16;
     use infer_moe::{MoeConfig, ScoringFunc, TopkMethod};
 
-    use super::{DEEPGEMM_CONTIG_ALIGN, deepgemm_contig_rows_cap, qwen35_deepgemm_enabled};
+    use super::{
+        DEEPGEMM_CONTIG_ALIGN, QWEN35_DEEPGEMM_MIN_ROUTES, deepgemm_contig_rows_cap,
+        qwen35_deepgemm_enabled,
+    };
     use crate::loader::MoeLayerWeights;
     use crate::moe_config::ExpertSplit;
     use crate::ops::{gemm_batch, silu_mul};
@@ -439,14 +448,27 @@ mod gpu {
             num_experts
         );
         // DeepGEMM expert path: grouped-B caches present (built at load when
-        // `ARLE_QWEN35_DEEPGEMM=1`) and the env gate still set. Default OFF —
-        // the hand grouped-GEMM path stays byte-for-byte untouched.
-        let use_deepgemm = qwen35_deepgemm_enabled() && weights.gate_grouped.is_some();
+        // `ARLE_QWEN35_DEEPGEMM=1`) and the env gate still set. HYBRID
+        // dispatch by routed-row count (pod A/B 2026-06-11, same binary,
+        // n=3): at decode R=8 the masked grouped path loses to the hand
+        // CUDA-core kernels (37.5 vs 40.8 tok/s, JIT/TMA fixed overhead on
+        // tiny bands), while at prefill R=16384 the contiguous tensor-core
+        // path wins big (needle 3k wall 9.07 -> 6.10 s). The crossover
+        // between the measured endpoints is uncharacterized; 1024 routed
+        // rows (= 128-token chunk x top-8) keeps every measured regime on
+        // its winning side and only remainder chunks land in between.
+        let use_deepgemm = qwen35_deepgemm_enabled()
+            && weights.gate_grouped.is_some()
+            && num_tokens * topk >= QWEN35_DEEPGEMM_MIN_ROUTES;
         if !use_deepgemm {
+            // Grouped-mode loads cleared the per-expert Vecs (the hand
+            // kernels run through the rebuilt ptr tables into the grouped
+            // buffer), so accept either weight form here.
             ensure!(
-                weights.gate.len() == local_experts
-                    && weights.up.len() == local_experts
-                    && weights.down.len() == local_experts,
+                weights.gate_grouped.is_some()
+                    || (weights.gate.len() == local_experts
+                        && weights.up.len() == local_experts
+                        && weights.down.len() == local_experts),
                 "MoE expert count mismatch: gate={} up={} down={} local_experts={local_experts} \
                  (ep_size={} ep_rank={})",
                 weights.gate.len(),
@@ -657,8 +679,18 @@ mod gpu {
             .upload_const(ctx, &expert_index_table)?;
 
         // ── 5. Grouped expert GEMM (gate + up paired). ──────────────────────
-        let moe_inter = weights.gate[0].rows;
-        expert_shape_ok(&weights.gate[0], &weights.up[0], hidden_dim, moe_inter)?;
+        // Grouped-mode loads carry shapes on the group (per-expert Vecs are
+        // cleared); concat already enforced uniformity + the same [n, k]
+        // slab layout the ptr tables expose.
+        let moe_inter = match (&weights.gate_grouped, weights.gate.first()) {
+            (Some(g), _) => g.rows,
+            (None, Some(first)) => {
+                let mi = first.rows;
+                expert_shape_ok(first, &weights.up[0], hidden_dim, mi)?;
+                mi
+            }
+            (None, None) => anyhow::bail!("MoE weights carry neither grouped nor per-expert experts"),
+        };
         let gate_out = scratch.gate_out.get(ctx, moe_inter, total_routes)?;
         let up_out = scratch.up_out.get(ctx, moe_inter, total_routes)?;
         // `max_count` only sizes grid Y; total_routes is a safe upper bound.
