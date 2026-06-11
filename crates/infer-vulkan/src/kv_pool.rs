@@ -136,6 +136,10 @@ impl KvAllocator for VulkanKvPool {
             .collect())
     }
 
+    fn free_detached_pages(&mut self, pages: &[u32]) {
+        self.free.extend_from_slice(pages);
+    }
+
     fn free_slot(&mut self, slot: usize) {
         let Some(pages) = self.slot_pages.get_mut(slot) else {
             return;

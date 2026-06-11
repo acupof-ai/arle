@@ -13,7 +13,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use infer_core::{CompletedRequest, Engine, PrefixCacheStats, RequestHandle, RequestOptions};
+use infer_core::{
+    CompletedRequest, Engine, PrefixCacheStats, RequestHandle, RequestOptions, ThroughputStats,
+};
 use infer_plan::SamplingParams;
 use infer_seam::{BackendExecutor, KvPool};
 
@@ -46,6 +48,7 @@ pub struct CounterSnapshot {
     pub queue_depth: usize,
     pub kv_free_pages: usize,
     pub prefix_cache: PrefixCacheStats,
+    pub throughput: ThroughputStats,
 }
 
 /// Cross-thread handle to the latest [`CounterSnapshot`]: the engine loop writes
@@ -62,6 +65,7 @@ fn publish_counters<E: BackendExecutor, K: KvPool>(
         snap.queue_depth = engine.waiting_count();
         snap.kv_free_pages = engine.kv_free_pages();
         snap.prefix_cache = engine.prefix_cache_stats();
+        snap.throughput = engine.throughput_stats();
     }
 }
 

@@ -89,6 +89,30 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         "Prompt pages newly retained by the radix cache.",
         prefix.published_pages,
     );
+    push(
+        "engine_steps_total",
+        "counter",
+        "Executor steps whose output was applied.",
+        counters.throughput.steps,
+    );
+    push(
+        "prefill_tokens_total",
+        "counter",
+        "Prompt tokens advanced through chunked prefill.",
+        counters.throughput.prefill_tokens,
+    );
+    push(
+        "generated_tokens_total",
+        "counter",
+        "Tokens committed to requests (final prefill chunk + decode).",
+        counters.throughput.generated_tokens,
+    );
+    push(
+        "requests_completed_total",
+        "counter",
+        "Requests finished after holding a scheduler slot.",
+        counters.throughput.requests_completed,
+    );
     out
 }
 
@@ -108,9 +132,11 @@ fn escape_label_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use infer_core::PrefixCacheStats;
+    use infer_core::{PrefixCacheStats, ThroughputStats};
 
     use super::*;
+
+    const METRIC_COUNT: usize = 13;
 
     #[test]
     fn renders_help_type_and_labelled_samples() {
@@ -126,6 +152,12 @@ mod tests {
                 published_pages: 31,
                 cached_pages: 19,
             },
+            throughput: ThroughputStats {
+                steps: 90,
+                prefill_tokens: 1200,
+                generated_tokens: 256,
+                requests_completed: 5,
+            },
         };
         let body = render_prometheus(&counters, "qwen3-dense");
 
@@ -140,17 +172,23 @@ mod tests {
         );
         assert!(body.contains("arle_prefix_cache_cached_pages{model_name=\"qwen3-dense\"} 19\n"));
         assert!(body.contains("arle_kv_free_pages{model_name=\"qwen3-dense\"} 240\n"));
+        assert!(body.contains("# TYPE arle_engine_steps_total counter\n"));
+        assert!(body.contains("arle_engine_steps_total{model_name=\"qwen3-dense\"} 90\n"));
+        assert!(body.contains("arle_prefill_tokens_total{model_name=\"qwen3-dense\"} 1200\n"));
+        assert!(body.contains("arle_generated_tokens_total{model_name=\"qwen3-dense\"} 256\n"));
+        assert!(body.contains("arle_requests_completed_total{model_name=\"qwen3-dense\"} 5\n"));
 
         // Every sample line carries the HELP/TYPE pair exactly once.
-        assert_eq!(body.matches("# HELP ").count(), 9);
-        assert_eq!(body.matches("# TYPE ").count(), 9);
+        assert_eq!(body.matches("# HELP ").count(), METRIC_COUNT);
+        assert_eq!(body.matches("# TYPE ").count(), METRIC_COUNT);
     }
 
     #[test]
     fn zero_snapshot_renders_all_metrics() {
         let body = render_prometheus(&CounterSnapshot::default(), "m");
-        assert_eq!(body.matches("# TYPE ").count(), 9);
+        assert_eq!(body.matches("# TYPE ").count(), METRIC_COUNT);
         assert!(body.contains("arle_queue_depth{model_name=\"m\"} 0\n"));
+        assert!(body.contains("arle_generated_tokens_total{model_name=\"m\"} 0\n"));
     }
 
     #[test]

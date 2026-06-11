@@ -14,6 +14,11 @@ pub trait KvAllocator {
     /// Allocate physical pages that are not yet attached to a slot.
     fn alloc_detached_pages(&mut self, pages: usize) -> anyhow::Result<Vec<u32>>;
 
+    /// Return detached pages (from [`KvAllocator::alloc_detached_pages`]) to
+    /// the free pool. Must only be called with pages that were never attached
+    /// to a slot or retained by the prefix store.
+    fn free_detached_pages(&mut self, pages: &[u32]);
+
     /// Free all pages currently attached to `slot`.
     fn free_slot(&mut self, slot: usize);
 
