@@ -29,8 +29,16 @@ pub(crate) enum CompiledBackend {
     Metal,
     #[cfg(feature = "hip")]
     Hip,
+    #[cfg(feature = "vulkan")]
+    Vulkan,
     Cpu,
-    #[cfg(not(any(feature = "cuda", feature = "metal", feature = "hip", feature = "cpu")))]
+    #[cfg(not(any(
+        feature = "cuda",
+        feature = "metal",
+        feature = "hip",
+        feature = "vulkan",
+        feature = "cpu"
+    )))]
     None,
 }
 
@@ -49,11 +57,21 @@ impl CompiledBackend {
         {
             return Self::Hip;
         }
+        #[cfg(feature = "vulkan")]
+        {
+            return Self::Vulkan;
+        }
         #[cfg(feature = "cpu")]
         {
             return Self::Cpu;
         }
-        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "hip", feature = "cpu")))]
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "hip",
+            feature = "vulkan",
+            feature = "cpu"
+        )))]
         {
             Self::None
         }
@@ -65,11 +83,14 @@ impl CompiledBackend {
             Self::Metal => "metal",
             #[cfg(feature = "hip")]
             Self::Hip => "hip",
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan => "vulkan",
             Self::Cpu => "cpu",
             #[cfg(not(any(
                 feature = "cuda",
                 feature = "metal",
                 feature = "hip",
+                feature = "vulkan",
                 feature = "cpu"
             )))]
             Self::None => "none",
@@ -78,11 +99,23 @@ impl CompiledBackend {
 
     pub(crate) fn supports_inference(self) -> bool {
         let _ = self;
-        #[cfg(any(feature = "cuda", feature = "metal", feature = "hip", feature = "cpu"))]
+        #[cfg(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "hip",
+            feature = "vulkan",
+            feature = "cpu"
+        ))]
         {
             true
         }
-        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "hip", feature = "cpu")))]
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "hip",
+            feature = "vulkan",
+            feature = "cpu"
+        )))]
         {
             false
         }
@@ -120,6 +153,11 @@ impl SystemInfo {
             // report 0 rather than a fictional VRAM figure.
             #[cfg(feature = "hip")]
             CompiledBackend::Hip => 0.0,
+            // No generic Vulkan VRAM probe yet; report 0 rather than a
+            // fictional figure. On-box validation will add a loader-backed
+            // memory query when model selection needs it.
+            #[cfg(feature = "vulkan")]
+            CompiledBackend::Vulkan => 0.0,
             CompiledBackend::Cpu => {
                 if self.available_ram_gb > 0.0 {
                     self.available_ram_gb
@@ -131,6 +169,7 @@ impl SystemInfo {
                 feature = "cuda",
                 feature = "metal",
                 feature = "hip",
+                feature = "vulkan",
                 feature = "cpu"
             )))]
             CompiledBackend::None => 0.0,
@@ -253,10 +292,16 @@ mod tests {
             CompiledBackend::Hip => {
                 assert_eq!(info.effective_memory_gb(), 0.0);
             }
+            // No generic Vulkan VRAM probe yet — effective memory reports 0.
+            #[cfg(feature = "vulkan")]
+            CompiledBackend::Vulkan => {
+                assert_eq!(info.effective_memory_gb(), 0.0);
+            }
             #[cfg(not(any(
                 feature = "cuda",
                 feature = "metal",
                 feature = "hip",
+                feature = "vulkan",
                 feature = "cpu"
             )))]
             CompiledBackend::None => {
