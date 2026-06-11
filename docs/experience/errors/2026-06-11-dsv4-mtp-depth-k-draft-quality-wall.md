@@ -66,9 +66,16 @@ collapse is our **linear chain**, not the head:
   2-cycle `[223,4489]` smells like draft *i* blind to the chain — confirm by
   logging draft attention length per step).
 
-The depth-1 **clamp stays correct** (linear depth-K IS worse than depth-1), but
-the wall is the **linear chain**, not draft-head quality. The licensed path to
-~1.8× is EAGLE-tree drafting + a dedicated draft KV cache + frozen-KV verify.
+The depth-1 **clamp stays correct as a safety** (our *broken* linear depth-K IS
+worse than depth-1), but the wall is a **chain bug**, not draft-head quality and
+not a missing tree. SGLang's *default* DeepSeek config is a **linear** chain
+(`--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-
+tokens 4`) reaching 2.18–2.44 tok — `topk=1` = linear, no tree. So the fix is to
+**debug our linear chain to SGLang parity** (no kernel build); the chain already
+writes+reads its own KV (Explore confirmed — "shared-KV blindness" falsified), so
+the 2-cycle is off-distribution feedback / position-RoPE / feeding the wrong
+hidden, to be isolated on the pod one variable at a time. Tree (topk>1) is a
+later optional gain and our kernels can't do it yet (FlashMLA `s_q=1`, no mask).
 
 ## Rule
 
