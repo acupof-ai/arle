@@ -84,3 +84,44 @@ is SW-only. SGLang mutates-then-self-heals, doesn't freeze the verify.)
   in the SAME change (`feedback_design_to_implementation_detail`). And gate spec
   correctness on the **needle ladder + same-config-twice**, never an eyeballed
   greedy sample (MoE non-determinism).
+
+## UPDATE — Bug 1 FIXED: per-token verify attention (the +61% path restored)
+
+Root cause (exact): `forward_tokens_stream_impl` gates the **device-side
+start_pos** AND the FlashMLA/fused-wqkv decode paths on `seq_len == 1`
+(dsv4.rs ~1806, attention.rs 3630/4008). The batched 2-token verify
+(`seq_len == 2`) therefore got `start_pos_device = None` and fell to the
+**host-start_pos prefill-style compressed/DSA path**, which is incorrect for a
+2-token chunk at a fully-populated mid-sequence position — garbling even
+**accepted** col0 tokens (问答 86% accept fully garbage). Non-batched
+(`ARLE_DSV4_MTP_BATCHED_VERIFY=0`) dodged it because each token went through
+the correct seq_len==1 decode path.
+
+Fix (dsv4.rs, `per_token_attn` flag on `forward_tokens_stream_impl`, true only
+for the batched verify): run **attention per token on the seq_len==1 decode
+path** (own device `start_pos` buffer — the fn-level binding already borrows
+`slot.start_pos_device`), in order so token r+1 attends to r's just-written KV;
+point-wise/MoE stay batched for the weight-read amortization. Mirrors the
+proven `forward_decode_batch` Step-A loop. (Build also needed a forward-decl of
+`get_or_build_runtime` — a latent use-before-def in the pod tree that ckl
+fixed in parallel as `d7a45894`; nvcc-order bug the no-nvcc Mac lane can't see.)
+
+Validation (8×H20, both fixes, **default batched** `ARLE_DSV4_SPEC_DECODE=1`):
+- **Garbage → coherent.** The catastrophic `或或或` / `response response` is gone.
+- **Perf restored** (4-domain, vs ~44 baseline): 问答 **63.3 (+39%)**, 客服
+  **63.5 (+47%)** (accept 86%/93%), 代码 46.9 (+12%), 创作 47.3 (+2%) — accept-rate-gated.
+- **Needle ladder ×2 (115/446/2000): zero miss, zero garbage** — clears the gate's
+  KILL criteria. Caveat: 446/2000 showed `partial=2` (e.g. `738321` — right region,
+  wrong last digits) where this baseline run got `exact=2`. Partials are in the
+  baseline non-determinism floor too; n=2 can't separate a real 1-digit recall
+  skew from MoE noise (`errors/2026-05-28-mmlu-cross-base-was-noise.md` —
+  <5pp/small-n needs multi-seed). **Follow-up: multi-seed needle to confirm the
+  per-token verify is recall-neutral at long context.**
+- The 客服 "loop" that looked like a residual bug was the **degenerate-prompt /
+  MoE-non-determinism confound** — spec-OFF 客服 ×3 ALSO loops (`;);)`,
+  `…解决方案。…解决方案。`). `退化(循环) prompt 不是有效测例`.
+
+**State**: MTP recovered from totally-broken → **correct + fast** (both batched &
+non-batched pass the needle gate's miss/garbage criteria; batched gives the
+speedup). Still opt-in. Default flip awaits: (a) the multi-seed long-context
+recall check, (b) productionizing the env gate to a `--spec-type mtp` CLI flag (#16).
