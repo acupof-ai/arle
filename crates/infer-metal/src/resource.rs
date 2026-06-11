@@ -36,6 +36,32 @@ pub struct MetalResourceRequest {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct MetalSystemStatus {
+    pub total_memory_bytes: Option<usize>,
+    pub available_memory_bytes: Option<usize>,
+    pub swap_used_bytes: Option<usize>,
+}
+
+impl MetalSystemStatus {
+    pub fn current() -> Self {
+        Self {
+            total_memory_bytes: physical_memory_bytes(),
+            available_memory_bytes: available_memory_bytes(),
+            swap_used_bytes: swap_used_bytes(),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "system total={} available={} swap_used={}",
+            format_gib(self.total_memory_bytes),
+            format_gib(self.available_memory_bytes),
+            format_mib(self.swap_used_bytes),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct MetalResourcePlan {
     pub total_memory_bytes: Option<usize>,
     pub available_memory_bytes: Option<usize>,
@@ -57,7 +83,13 @@ pub struct MetalResourcePlan {
 impl MetalResourcePlan {
     pub fn describe(&self) -> String {
         format!(
-            "memory_limit={}GiB wired={}GiB cache={}MiB weights={}GiB runtime_headroom={}GiB static_state={}MiB kv_budget={}GiB kv_capacity_tokens={} pages={}{}",
+            "{} memory_limit={}GiB wired={}GiB cache={}MiB weights={}GiB runtime_headroom={}GiB static_state={}MiB kv_budget={}GiB kv_capacity_tokens={} pages={}{}",
+            MetalSystemStatus {
+                total_memory_bytes: self.total_memory_bytes,
+                available_memory_bytes: self.available_memory_bytes,
+                swap_used_bytes: self.swap_used_bytes,
+            }
+            .describe(),
             self.memory_limit_bytes / GIB,
             self.wired_limit_bytes / GIB,
             self.cache_limit_bytes / MIB,
@@ -79,20 +111,23 @@ pub fn plan_resource_budget(
     let model_config = config::load_metal_config(model_dir)?;
     let weight_bytes = wired_limit::model_weight_bytes(model_dir).ok_or_else(|| {
         anyhow::anyhow!(
-            "Metal resource guard could not estimate model weight bytes for {}; \
+            "Metal resource guard could not estimate model weight bytes for {}; system={}. \
              pass a local safetensors/bin/gguf/npz model directory or set an explicit budget after verifying memory headroom",
-            model_dir.display()
+            model_dir.display(),
+            MetalSystemStatus::current().describe(),
         )
     })?;
 
-    let total_memory_bytes = physical_memory_bytes();
-    let available_memory_bytes = available_memory_bytes();
-    let swap_used_bytes = swap_used_bytes();
+    let system_status = MetalSystemStatus::current();
+    let system_status_line = system_status.describe();
+    let total_memory_bytes = system_status.total_memory_bytes;
+    let available_memory_bytes = system_status.available_memory_bytes;
+    let swap_used_bytes = system_status.swap_used_bytes;
     if !request.allow_swap {
         if let Some(used) = swap_used_bytes {
             anyhow::ensure!(
                 used <= SWAP_USED_GUARD_BYTES,
-                "Metal resource guard rejected startup because macOS swap is already active: used={} MiB. \
+                "Metal resource guard rejected startup: {system_status_line}; macOS swap is already active above the guardrail (used={} MiB). \
                  This path can spill unified memory to SSD and stall the system. Close memory-heavy apps, reboot to clear swap if needed, or pass --allow-swap after accepting the risk.",
                 used / MIB,
             );
@@ -114,6 +149,7 @@ pub fn plan_resource_budget(
         request.low_impact,
         total_memory_bytes,
         available_memory_bytes,
+        &system_status_line,
     )?;
 
     let wired_limit_bytes = weight_bytes
@@ -129,7 +165,7 @@ pub fn plan_resource_budget(
 
     anyhow::ensure!(
         memory_limit_bytes > fixed_bytes,
-        "Metal resource guard rejected startup: memory budget {} GiB is below fixed requirement {} GiB \
+        "Metal resource guard rejected startup: {system_status_line}; memory budget {} GiB is below fixed requirement {} GiB \
          (weights {} GiB + runtime headroom {} GiB + static state {} MiB). \
          Close other memory-heavy apps, use a smaller model, or pass --memory-budget-bytes after verifying headroom.",
         memory_limit_bytes / GIB,
@@ -140,7 +176,7 @@ pub fn plan_resource_budget(
     );
     anyhow::ensure!(
         memory_limit_bytes > wired_limit_bytes,
-        "Metal resource guard rejected startup: memory budget {} GiB is below wired requirement {} GiB \
+        "Metal resource guard rejected startup: {system_status_line}; memory budget {} GiB is below wired requirement {} GiB \
          (weights + {} GiB).",
         memory_limit_bytes / GIB,
         wired_limit_bytes / GIB,
@@ -164,7 +200,7 @@ pub fn plan_resource_budget(
     let max_total_pages = max_capacity_tokens / request.page_size.max(1);
     anyhow::ensure!(
         max_total_pages > 0,
-        "Metal resource guard rejected startup: remaining KV budget {} MiB cannot hold one {}-token page \
+        "Metal resource guard rejected startup: {system_status_line}; remaining KV budget {} MiB cannot hold one {}-token page \
          ({} bytes/token across {} slot(s)).",
         kv_budget_bytes / MIB,
         request.page_size.max(1),
@@ -202,6 +238,7 @@ fn resolve_memory_limit(
     low_impact: bool,
     total_memory_bytes: Option<usize>,
     available_memory_bytes: Option<usize>,
+    system_status_line: &str,
 ) -> anyhow::Result<usize> {
     if let Some(budget) = explicit_budget {
         anyhow::ensure!(
@@ -213,13 +250,13 @@ fn resolve_memory_limit(
                 explicit_reserve.unwrap_or_else(|| default_system_reserve_bytes(total, low_impact));
             anyhow::ensure!(
                 reserve < total,
-                "Metal system reserve {} GiB is >= total memory {} GiB",
+                "Metal system reserve {} GiB is >= total memory {} GiB; {system_status_line}",
                 reserve / GIB,
                 total / GIB,
             );
             anyhow::ensure!(
                 budget <= total - reserve,
-                "--memory-budget-bytes {} GiB exceeds physical budget after system reserve {} GiB",
+                "--memory-budget-bytes {} GiB exceeds physical budget after system reserve {} GiB; {system_status_line}",
                 budget / GIB,
                 (total - reserve) / GIB,
             );
@@ -232,7 +269,7 @@ fn resolve_memory_limit(
             };
             anyhow::ensure!(
                 available > reserve,
-                "Metal resource guard rejected startup: available memory {} GiB is <= anti-swap reserve {} GiB. \
+                "Metal resource guard rejected startup: {system_status_line}; available memory {} GiB is <= anti-swap reserve {} GiB. \
                  macOS would likely compress/swap to SSD under model load; close memory-heavy apps or use a smaller model.",
                 available / GIB,
                 reserve / GIB,
@@ -240,7 +277,7 @@ fn resolve_memory_limit(
             anyhow::ensure!(
                 budget <= available - reserve,
                 "--memory-budget-bytes {} GiB exceeds current anti-swap budget {} GiB \
-                 (available memory minus reserve).",
+                 (available memory minus reserve); {system_status_line}.",
                 budget / GIB,
                 (available - reserve) / GIB,
             );
@@ -254,7 +291,7 @@ fn resolve_memory_limit(
             explicit_reserve.unwrap_or_else(|| default_system_reserve_bytes(total, low_impact));
         anyhow::ensure!(
             reserve < total,
-            "Metal system reserve {} GiB is >= total memory {} GiB",
+            "Metal system reserve {} GiB is >= total memory {} GiB; {system_status_line}",
             reserve / GIB,
             total / GIB,
         );
@@ -268,17 +305,32 @@ fn resolve_memory_limit(
         };
         anyhow::ensure!(
             available > reserve,
-            "Metal resource guard rejected startup: available memory {} GiB is <= anti-swap reserve {} GiB. \
+            "Metal resource guard rejected startup: {system_status_line}; available memory {} GiB is <= anti-swap reserve {} GiB. \
              macOS would likely compress/swap to SSD under model load; close memory-heavy apps or use a smaller model.",
             available / GIB,
             reserve / GIB,
         );
         candidates.push(available - reserve);
     }
-    candidates
-        .into_iter()
-        .min()
-        .ok_or_else(|| anyhow::anyhow!("Metal resource guard could not determine a memory budget"))
+    candidates.into_iter().min().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Metal resource guard could not determine a memory budget; {system_status_line}"
+        )
+    })
+}
+
+fn format_gib(bytes: Option<usize>) -> String {
+    bytes.map_or_else(
+        || "unknown".to_string(),
+        |bytes| format!("{:.1}GiB", bytes as f64 / GIB as f64),
+    )
+}
+
+fn format_mib(bytes: Option<usize>) -> String {
+    bytes.map_or_else(
+        || "unknown".to_string(),
+        |bytes| format!("{}MiB", bytes / MIB),
+    )
 }
 
 fn default_system_reserve_bytes(total_memory_bytes: usize, low_impact: bool) -> usize {
@@ -483,17 +535,44 @@ mod tests {
 
     #[test]
     fn explicit_memory_budget_wins() {
-        let budget =
-            resolve_memory_limit(Some(22 * GIB), None, false, Some(48 * GIB), Some(40 * GIB))
-                .unwrap();
+        let budget = resolve_memory_limit(
+            Some(22 * GIB),
+            None,
+            false,
+            Some(48 * GIB),
+            Some(40 * GIB),
+            "system unit-test",
+        )
+        .unwrap();
         assert_eq!(budget, 22 * GIB);
     }
 
     #[test]
     fn available_memory_below_reserve_is_rejected() {
-        let err = resolve_memory_limit(None, None, false, Some(48 * GIB), Some(4 * GIB))
-            .expect_err("low available memory must fail closed");
+        let err = resolve_memory_limit(
+            None,
+            None,
+            false,
+            Some(48 * GIB),
+            Some(4 * GIB),
+            "system unit-test",
+        )
+        .expect_err("low available memory must fail closed");
         assert!(err.to_string().contains("anti-swap reserve"));
+        assert!(err.to_string().contains("system unit-test"));
+    }
+
+    #[test]
+    fn system_status_describe_reports_unknowns_and_values() {
+        let status = MetalSystemStatus {
+            total_memory_bytes: Some(48 * GIB),
+            available_memory_bytes: Some(24 * GIB + 512 * MIB),
+            swap_used_bytes: Some(817 * MIB),
+        };
+        assert_eq!(
+            status.describe(),
+            "system total=48.0GiB available=24.5GiB swap_used=817MiB"
+        );
     }
 
     #[test]
