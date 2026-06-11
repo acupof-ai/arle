@@ -85,10 +85,10 @@ bool compressed_valid(int chosen, uint abs_pos) {
     return uint(chosen) * p.ratio + (p.ratio - 1) <= abs_pos;
 }
 
-float dot_key(uint head, uint key_base) {
+float dot_key(uint q_base, uint key_base) {
     float dotv = 0.0;
     for (uint d = 0; d < p.head_dim; ++d) {
-        dotv += q[head * p.head_dim + d] * compressed[key_base * p.head_dim + d];
+        dotv += q[q_base + d] * compressed[key_base * p.head_dim + d];
     }
     return dotv * p.sm_scale;
 }
@@ -124,7 +124,7 @@ void main() {
     for (uint i = 0; i < c_count; ++i) {
         const int chosen = p.mode == 1 ? selected[token * p.index_topk + i] : int(i);
         if (compressed_valid(chosen, abs_pos)) {
-            max_logit = max(max_logit, dot_key(head, uint(chosen)));
+            max_logit = max(max_logit, dot_key(base, uint(chosen)));
         }
     }
 
@@ -149,7 +149,7 @@ void main() {
         if (!compressed_valid(chosen, abs_pos)) {
             continue;
         }
-        const float w = exp(dot_key(head, uint(chosen)) - max_logit);
+        const float w = exp(dot_key(base, uint(chosen)) - max_logit);
         denom += w;
         for (uint d = 0; d < p.head_dim; ++d) {
             out_data[base + d] += w * compressed[uint(chosen) * p.head_dim + d];
