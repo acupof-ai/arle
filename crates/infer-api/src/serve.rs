@@ -15,7 +15,7 @@
 //! `ServeHandle` the `load_*` constructors spawn. On a build with no backend
 //! compiled in, [`serve_http`] returns a clear error (mirrors `--doctor`).
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::loaded::EngineLoadConfig;
 
@@ -113,7 +113,7 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
     use anyhow::Context;
 
     if opts.spec.requested() {
-        bail!(
+        anyhow::bail!(
             "speculative decode is not wired into the rewrite serve path yet: \
              requested spec_type={}, mtp_draft_model={}, mtp_draft_tokens={}; \
              refusing to silently run standard decode",
