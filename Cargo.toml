@@ -28,6 +28,7 @@ members = [
     "crates/qwen35-spec",
     "crates/tools",
     "crates/train",
+    "crates/vulkan-sys",
     "crates/xgrammar-sys",
 ]
 
@@ -97,6 +98,8 @@ cpu = ["cli/cpu"]
 metal = ["cli/metal"]
 # HIP backend via infer-hip (AMD ROCm, DSv4 GGUF). Pair with `no-cuda` off-box.
 hip = ["cli/hip"]
+# Vulkan runtime substrate. Full CLI/backend forwarding lands in P7.
+vulkan = ["dep:vulkan-sys", "vulkan-sys/vulkan"]
 # NCCL FFI for multi-GPU collectives. Implies `cuda`.
 # Forwards through `cli` → `infer-api` → `infer-cuda` → `cuda-kernels`.
 nccl = ["cuda", "cli/nccl"]
@@ -107,6 +110,7 @@ deepep = ["nccl", "cli/deepep"]
 [dependencies]
 anyhow = "1.0"
 cli = { path = "crates/cli", default-features = false, optional = true }
+vulkan-sys = { path = "crates/vulkan-sys", default-features = false, optional = true }
 
 [dev-dependencies]
 infer-util = { path = "crates/infer-util" }
