@@ -282,6 +282,209 @@ __global__ void moe_bf16_grouped_gemm_pair_batch_kernel(
     }
 }
 
+// ── Decode-band (small-R) weight-read-bound grouped GEMM ───────────────────
+//
+// At decode R = num_routes is tiny (R = topk = 8 at B=1; R = 8B on the
+// stage-1 batched path) and per-expert counts are 1..B, so the batch kernels
+// above run their tile_M<=4 fast path with zero M reuse: 64-thread row
+// groups issue SCALAR 2-byte weight loads (<= 64B per warp request, ~2
+// outstanding loads per thread -> latency-bound), the down grid launches
+// N/4 x E blocks of which ~94% early-exit on counts==0, and a separate
+// silu_mul pass re-reads gate/up. Measured (nsys 2026-06-11, B=1 decode,
+// Qwen3.6-35B-A3B, H20): 250 us/layer pair + 237 us/layer down = 76.6% of
+// decode GPU time at ~3% of HBM bandwidth.
+//
+// These decode kernels are weight-read-bound by construction: the grid
+// covers (weight-row tiles x activation chunks x experts) so every weight
+// row of every TOUCHED expert is read exactly once per <=8-row activation
+// chunk, coalesced. One WARP owns one weight row [row, 0..K) and streams it
+// with 16-byte (8 x bf16) vector loads, dotting against the <=
+// MOE_DECODE_ACT_TILE activation rows routed to the expert (read from the
+// packed activations + per-expert offsets/counts the pack path already
+// produces; activation rows are L1/L2-hot, R*K*2B total). Experts with
+// count 0 exit after a single counts read. count_e > ACT_TILE (B > 8 batched
+// decode) pays ceil(count_e/8) weight passes — still >= 8-way activation
+// reuse per pass.
+//
+// Ideal bytes (Qwen3.6-35B shapes I=512, H=2048, E_active experts):
+//   gate[512,2048] + up[512,2048] + down[2048,512] = 3*512*2048*2B
+//   = 6.29 MB/expert -> E_active=8: 50.3 MB -> 12.6 us at 4 TB/s;
+//   realistic 25-60 us/layer target vs the measured 487 us/layer.
+//
+// Numerics contract: fp32 accumulate, bf16 in/out. Accumulation order per
+// output element: lane l sums its k-segments {k : (k/8) % 32 == l} in
+// ascending k (8 sequential fp32 FMAs per 16B vector), then a 5-step
+// shfl_xor butterfly (offsets 16,8,4,2,1) combines lanes. This REORDERS the
+// reduction vs the batch kernels' stride-64 lanes + smem two-stage sum —
+// ulp-level only, covered by the correct-inference gate (needle +
+// same-config-twice floor), NOT byte-identity.
+//
+// Requires K % 8 == 0 (16-byte row alignment: weight slab bases are
+// >=256B-aligned allocations and row offsets are row*K*2B; same for the
+// packed activation rows). The Rust dispatch guards and falls back to the
+// batch kernels otherwise.
+
+#define MOE_DECODE_WARPS 8    // weight rows per block (one warp per row)
+#define MOE_DECODE_THREADS (MOE_DECODE_WARPS * MOE_GROUPED_WARP_SIZE)
+#define MOE_DECODE_ACT_TILE 8 // activation rows per chunk (grid.y)
+#define MOE_DECODE_VEC 8      // bf16 elements per 16-byte vector load
+
+struct alignas(16) moe_bf16x8 {
+    __nv_bfloat162 h[4];
+};
+
+static __device__ __forceinline__ moe_bf16x8
+moe_load_bf16x8(const __nv_bfloat16* __restrict__ p) {
+    moe_bf16x8 v;
+    *reinterpret_cast<uint4*>(&v) = *reinterpret_cast<const uint4*>(p);
+    return v;
+}
+
+// 8 sequential fp32 FMAs in ascending k — the per-lane accumulation order.
+static __device__ __forceinline__ float moe_decode_dot8(float acc,
+                                                        const moe_bf16x8& w,
+                                                        const moe_bf16x8& x) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 wf = __bfloat1622float2(w.h[i]);
+        const float2 xf = __bfloat1622float2(x.h[i]);
+        acc += wf.x * xf.x;
+        acc += wf.y * xf.y;
+    }
+    return acc;
+}
+
+// Matches silu_mul_one (csrc/misc/elementwise_basic.cu): fp32 sigmoid form.
+static __device__ __forceinline__ float moe_decode_silu(float g) {
+    return g / (1.0f + expf(-g));
+}
+
+// Single-output decode grouped GEMM (down projection).
+__global__ void moe_bf16_grouped_gemm_decode_kernel(
+    const uint64_t* __restrict__ weight_ptrs,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const int* __restrict__ offsets,
+    const int* __restrict__ counts,
+    const int* __restrict__ expert_indices,
+    int N,
+    int K)
+{
+    const int compact_expert_idx = blockIdx.z;
+    const int expert_M = counts[compact_expert_idx];
+    const int chunk_base = blockIdx.y * MOE_DECODE_ACT_TILE;
+    if (chunk_base >= expert_M) return;
+    const int warp = threadIdx.x / MOE_GROUPED_WARP_SIZE;
+    const int lane = threadIdx.x % MOE_GROUPED_WARP_SIZE;
+    const int row = blockIdx.x * MOE_DECODE_WARPS + warp;
+    if (row >= N) return;
+    const int tile_raw = expert_M - chunk_base;
+    const int tile = tile_raw < MOE_DECODE_ACT_TILE ? tile_raw : MOE_DECODE_ACT_TILE;
+    const int expert_idx = expert_indices ? expert_indices[compact_expert_idx] : compact_expert_idx;
+    const int route_base = offsets[compact_expert_idx] + chunk_base;
+
+    const auto* weight = reinterpret_cast<const __nv_bfloat16*>(weight_ptrs[expert_idx]);
+    const __nv_bfloat16* weight_row = weight + (int64_t)row * K;
+
+    float acc[MOE_DECODE_ACT_TILE];
+#pragma unroll
+    for (int b = 0; b < MOE_DECODE_ACT_TILE; ++b) acc[b] = 0.0f;
+
+    const int kv = K / MOE_DECODE_VEC; // launcher enforces K % 8 == 0
+    for (int v = lane; v < kv; v += MOE_GROUPED_WARP_SIZE) {
+        const moe_bf16x8 w = moe_load_bf16x8(weight_row + v * MOE_DECODE_VEC);
+#pragma unroll
+        for (int b = 0; b < MOE_DECODE_ACT_TILE; ++b) {
+            if (b < tile) {
+                const moe_bf16x8 x = moe_load_bf16x8(
+                    input + (int64_t)(route_base + b) * K + v * MOE_DECODE_VEC);
+                acc[b] = moe_decode_dot8(acc[b], w, x);
+            }
+        }
+    }
+
+    // tile is warp-uniform, so the predicated reduce keeps all lanes converged.
+#pragma unroll
+    for (int b = 0; b < MOE_DECODE_ACT_TILE; ++b) {
+        if (b < tile) acc[b] = moe_grouped_warp_reduce_sum(acc[b]);
+    }
+    if (lane == 0) {
+        for (int b = 0; b < tile; ++b) {
+            output[(int64_t)(route_base + b) * N + row] = __float2bfloat16(acc[b]);
+        }
+    }
+}
+
+// Fused gate+up+SwiGLU decode grouped GEMM: reads each expert's gate and up
+// matrices once and writes act = silu(gate_dot) * up_dot directly — the
+// separate silu_mul pass (read 2x + write 1x over [num_routes, N]) folds into
+// the epilogue. silu applies to the fp32 accumulators BEFORE the single bf16
+// round; the batch path rounds gate/up to bf16 first — a rounding-class
+// deviation in the same ulp class as the reduction reorder (gate-covered).
+__global__ void moe_bf16_grouped_gemm_swiglu_decode_kernel(
+    const uint64_t* __restrict__ weight_gate_ptrs,
+    const uint64_t* __restrict__ weight_up_ptrs,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ act,
+    const int* __restrict__ offsets,
+    const int* __restrict__ counts,
+    const int* __restrict__ expert_indices,
+    int N,
+    int K)
+{
+    const int compact_expert_idx = blockIdx.z;
+    const int expert_M = counts[compact_expert_idx];
+    const int chunk_base = blockIdx.y * MOE_DECODE_ACT_TILE;
+    if (chunk_base >= expert_M) return;
+    const int warp = threadIdx.x / MOE_GROUPED_WARP_SIZE;
+    const int lane = threadIdx.x % MOE_GROUPED_WARP_SIZE;
+    const int row = blockIdx.x * MOE_DECODE_WARPS + warp;
+    if (row >= N) return;
+    const int tile_raw = expert_M - chunk_base;
+    const int tile = tile_raw < MOE_DECODE_ACT_TILE ? tile_raw : MOE_DECODE_ACT_TILE;
+    const int expert_idx = expert_indices ? expert_indices[compact_expert_idx] : compact_expert_idx;
+    const int route_base = offsets[compact_expert_idx] + chunk_base;
+
+    const auto* weight_gate = reinterpret_cast<const __nv_bfloat16*>(weight_gate_ptrs[expert_idx]);
+    const auto* weight_up = reinterpret_cast<const __nv_bfloat16*>(weight_up_ptrs[expert_idx]);
+    const __nv_bfloat16* gate_row = weight_gate + (int64_t)row * K;
+    const __nv_bfloat16* up_row = weight_up + (int64_t)row * K;
+
+    float acc_g[MOE_DECODE_ACT_TILE];
+    float acc_u[MOE_DECODE_ACT_TILE];
+#pragma unroll
+    for (int b = 0; b < MOE_DECODE_ACT_TILE; ++b) { acc_g[b] = 0.0f; acc_u[b] = 0.0f; }
+
+    const int kv = K / MOE_DECODE_VEC; // launcher enforces K % 8 == 0
+    for (int v = lane; v < kv; v += MOE_GROUPED_WARP_SIZE) {
+        const moe_bf16x8 wg = moe_load_bf16x8(gate_row + v * MOE_DECODE_VEC);
+        const moe_bf16x8 wu = moe_load_bf16x8(up_row + v * MOE_DECODE_VEC);
+#pragma unroll
+        for (int b = 0; b < MOE_DECODE_ACT_TILE; ++b) {
+            if (b < tile) {
+                const moe_bf16x8 x = moe_load_bf16x8(
+                    input + (int64_t)(route_base + b) * K + v * MOE_DECODE_VEC);
+                acc_g[b] = moe_decode_dot8(acc_g[b], wg, x);
+                acc_u[b] = moe_decode_dot8(acc_u[b], wu, x);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int b = 0; b < MOE_DECODE_ACT_TILE; ++b) {
+        if (b < tile) {
+            acc_g[b] = moe_grouped_warp_reduce_sum(acc_g[b]);
+            acc_u[b] = moe_grouped_warp_reduce_sum(acc_u[b]);
+        }
+    }
+    if (lane == 0) {
+        for (int b = 0; b < tile; ++b) {
+            act[(int64_t)(route_base + b) * N + row] =
+                __float2bfloat16(moe_decode_silu(acc_g[b]) * acc_u[b]);
+        }
+    }
+}
+
 extern "C" {
 
 cudaError_t moe_bf16_grouped_gemm_batch_cuda(
@@ -327,6 +530,54 @@ cudaError_t moe_bf16_grouped_gemm_pair_batch_cuda(
               num_experts);
     moe_bf16_grouped_gemm_pair_batch_kernel<<<grid, block, 0, stream>>>(
         weight_a_ptrs, weight_b_ptrs, input, output_a, output_b, offsets, counts,
+        expert_indices, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t moe_bf16_grouped_gemm_decode_cuda(
+    const uint64_t* weight_ptrs,
+    const __nv_bfloat16* input,
+    __nv_bfloat16* output,
+    const int* offsets,
+    const int* counts,
+    const int* expert_indices,
+    int num_experts,
+    int max_count,
+    int N,
+    int K,
+    cudaStream_t stream) {
+    if (num_experts <= 0 || max_count <= 0 || N <= 0 || K <= 0) return cudaSuccess;
+    if (K % MOE_DECODE_VEC != 0) return cudaErrorInvalidValue;
+    dim3 block(MOE_DECODE_THREADS);
+    dim3 grid((N + MOE_DECODE_WARPS - 1) / MOE_DECODE_WARPS,
+              (max_count + MOE_DECODE_ACT_TILE - 1) / MOE_DECODE_ACT_TILE,
+              num_experts);
+    moe_bf16_grouped_gemm_decode_kernel<<<grid, block, 0, stream>>>(
+        weight_ptrs, input, output, offsets, counts, expert_indices, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t moe_bf16_grouped_gemm_swiglu_decode_cuda(
+    const uint64_t* weight_gate_ptrs,
+    const uint64_t* weight_up_ptrs,
+    const __nv_bfloat16* input,
+    __nv_bfloat16* act,
+    const int* offsets,
+    const int* counts,
+    const int* expert_indices,
+    int num_experts,
+    int max_count,
+    int N,
+    int K,
+    cudaStream_t stream) {
+    if (num_experts <= 0 || max_count <= 0 || N <= 0 || K <= 0) return cudaSuccess;
+    if (K % MOE_DECODE_VEC != 0) return cudaErrorInvalidValue;
+    dim3 block(MOE_DECODE_THREADS);
+    dim3 grid((N + MOE_DECODE_WARPS - 1) / MOE_DECODE_WARPS,
+              (max_count + MOE_DECODE_ACT_TILE - 1) / MOE_DECODE_ACT_TILE,
+              num_experts);
+    moe_bf16_grouped_gemm_swiglu_decode_kernel<<<grid, block, 0, stream>>>(
+        weight_gate_ptrs, weight_up_ptrs, input, act, offsets, counts,
         expert_indices, N, K);
     return cudaGetLastError();
 }

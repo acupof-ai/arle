@@ -11,9 +11,12 @@
 //!    → dsv4_pack_local_experts_with_slots
 //!                                      → packed_hidden[R,H], packed_route_slot[R],
 //!                                        packed_weight[R]   (R = T*topk)
-//!    → moe_bf16_grouped_gemm_pair_batch (gate+up)
-//!    → silu_mul (unclamped SwiGLU — Qwen3.6 has no clamp)
-//!    → moe_bf16_grouped_gemm_batch (down)
+//!    → R ≤ 256: moe_bf16_grouped_gemm_swiglu_decode (fused gate+up+SwiGLU,
+//!               weight-read-bound decode kernels; ARLE_QWEN35_MOE_DECODE_KERNEL=0
+//!               opts out) → moe_bf16_grouped_gemm_decode (down)
+//!      R > 256: moe_bf16_grouped_gemm_pair_batch (gate+up)
+//!               → silu_mul (unclamped SwiGLU — Qwen3.6 has no clamp)
+//!               → moe_bf16_grouped_gemm_batch (down)
 //!    → dsv4_scatter_all_route_slots    → route_out[R,H]   (weight·expert_out, by slot)
 //!    → dsv4_combine_route_slot_outputs → routed[T,H]      (sum over topk)
 //!    → shared expert dense SwiGLU + qwen36_add_shared_expert_gated
@@ -163,6 +166,33 @@ pub(crate) fn deepgemm_contig_rows_cap(total_routes: usize, local_experts: usize
 /// keeps both measured regimes on their winning side).
 pub(crate) const QWEN35_DEEPGEMM_MIN_ROUTES: usize = 1024;
 
+/// Routed-row ceiling for the decode-specialized weight-read-bound grouped
+/// kernels (`moe_bf16_grouped_gemm_{swiglu_,}decode`).
+///
+/// Formula: `256 = top_k(8) × B_max(32)` — the batched-decode envelope. The
+/// decode band is exactly `R = top_k · B` (stage-1 batched decode steps;
+/// B=1 single decode is R=8), where each expert receives ≤ B rows (one route
+/// per token per expert), so:
+/// * `B ≤ ACT_TILE(8)`: every touched weight row is read EXACTLY once
+///   (nsys 2026-06-11 root cause: the batch kernels burn 487 µs/layer at R=8
+///   on scalar 2B loads + zero M-reuse ≈ 3% of HBM bandwidth; ideal bytes
+///   `E_active × (gate[512,2048] + up[512,2048] + down[2048,512]) × 2B =
+///   E_active × 6.29 MB` → 50.3 MB at E_active=8 → 12.6 µs at 4 TB/s,
+///   realistic 25-60 µs/layer target).
+/// * `8 < B ≤ 32`: ≤ `ceil(32/8) = 4` weight passes with ≥8-way activation
+///   reuse per pass — still weight-traffic-dominated.
+/// * `R > 256`: only prefill remainder chunks land here (full 128-token
+///   chunks go DeepGEMM at `R ≥ 1024`). The batch kernels' 32-row M-tile
+///   reads weights `ceil(c/32)` times vs the decode kernels' `ceil(c/8)` —
+///   up to 4× less traffic — and the regime is unmeasured, so the batch
+///   kernels keep it (status quo; folding the mid-band is a follow-up pod
+///   A/B, not a default flip).
+///
+/// Must stay `< QWEN35_DEEPGEMM_MIN_ROUTES` so the decode band never
+/// shadows the licensed DeepGEMM prefill dispatch.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const QWEN35_MOE_DECODE_MAX_ROUTES: usize = 256;
+
 /// `ARLE_QWEN35_DEEPGEMM=1`: swap the Qwen3.5/3.6 hand CUDA-core grouped
 /// expert GEMMs (~3.9 TFLOP/s class) for DeepGEMM SM90 BF16 m-grouped GEMMs
 /// (vendored official kernels, JIT-compiled through the torch-free native
@@ -185,6 +215,20 @@ pub(crate) const QWEN35_DEEPGEMM_MIN_ROUTES: usize = 1024;
 pub(crate) fn qwen35_deepgemm_enabled() -> bool {
     !matches!(
         std::env::var("ARLE_QWEN35_DEEPGEMM").as_deref(),
+        Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
+    )
+}
+
+/// `ARLE_QWEN35_MOE_DECODE_KERNEL=0`: run the original hand batch grouped
+/// kernels at every routed-row count below the DeepGEMM floor — the
+/// same-binary A/B arm for the pod license of the decode-band
+/// weight-read-bound kernels. Default ON. Read per call (per layer per
+/// step), mirroring [`qwen35_deepgemm_enabled`]; inside a captured decode
+/// graph the value read at capture time is what replays.
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen35_moe_decode_kernel_enabled() -> bool {
+    !matches!(
+        std::env::var("ARLE_QWEN35_MOE_DECODE_KERNEL").as_deref(),
         Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
     )
 }
@@ -229,8 +273,8 @@ mod gpu {
     use infer_moe::{MoeConfig, ScoringFunc, TopkMethod};
 
     use super::{
-        DEEPGEMM_CONTIG_ALIGN, QWEN35_DEEPGEMM_MIN_ROUTES, deepgemm_contig_rows_cap,
-        qwen35_deepgemm_enabled,
+        DEEPGEMM_CONTIG_ALIGN, QWEN35_DEEPGEMM_MIN_ROUTES, QWEN35_MOE_DECODE_MAX_ROUTES,
+        deepgemm_contig_rows_cap, qwen35_deepgemm_enabled, qwen35_moe_decode_kernel_enabled,
     };
     use crate::loader::MoeLayerWeights;
     use crate::moe_config::ExpertSplit;
@@ -268,9 +312,9 @@ mod gpu {
     /// | `packed_weight`   | `[R]` f32   | none          | scatter reads `packed_weight[r]` only where `packed_route_slot[r] >= 0`, which pack wrote |
     /// | `cursors`         | `[E_l]` i32 | memset 0      | REQUIRED: pack kernel `atomicAdd`s slot cursors |
     /// | `expert_indices`  | `[E_l]` i32 | none          | identity table, pure function of length (`upload_const`) |
-    /// | `gate_out`/`up_out`| `[I, R]`   | none          | grouped GEMM writes rows within `counts`; `silu_mul` READS the (EP) tail but its outputs there land in the `act` tail, which nothing reads (down-GEMM reads `act` within `counts` only) — final bytes unchanged |
-    /// | `act`             | `[I, R]`    | none          | `silu_mul` writes all `I*R` |
-    /// | `expert_out`      | `[H, R]`    | none          | down grouped GEMM writes within `counts`; scatter reads only packed slots |
+    /// | `gate_out`/`up_out`| `[I, R]`   | none          | batch path only (`R > QWEN35_MOE_DECODE_MAX_ROUTES` or decode kernels opted out): grouped GEMM writes rows within `counts`; `silu_mul` READS the (EP) tail but its outputs there land in the `act` tail, which nothing reads (down-GEMM reads `act` within `counts` only) — final bytes unchanged. Decode-kernel path never allocates/touches these slots |
+    /// | `act`             | `[I, R]`    | none          | batch path: `silu_mul` writes all `I*R`. Decode path: the fused swiglu kernel writes rows within `offsets/counts` only; the (EP) tail keeps stale rows, read by nothing (the down decode GEMM also reads strictly within `offsets/counts`) |
+    /// | `expert_out`      | `[H, R]`    | none          | down grouped GEMM (batch or decode) writes within `counts`; scatter reads only packed slots |
     /// | `route_out`       | `[H, R]`    | memset 0 (EP only) | single-GPU: scatter writes ALL `R` slots (route↔slot bijection) then combine reads all; EP: zero-init LOAD-BEARING (combine sums non-local slots as 0 into the partial) |
     /// | `shared_gate`/`shared_up`| `[S_i, T]` | none    | dense `gemm_cuda` beta=0 |
     /// | `shared_act`      | `[S_i, T]`  | none          | `silu_mul` writes all |
@@ -701,10 +745,9 @@ mod gpu {
             .expert_indices
             .upload_const(ctx, &expert_index_table)?;
 
-        // ── 5. Grouped expert GEMM (gate + up paired). ──────────────────────
-        // Grouped-mode loads carry shapes on the group (per-expert Vecs are
-        // cleared); concat already enforced uniformity + the same [n, k]
-        // slab layout the ptr tables expose.
+        // ── 5-7 shape resolution. Grouped-mode loads carry shapes on the
+        // group (per-expert Vecs are cleared); concat already enforced
+        // uniformity + the same [n, k] slab layout the ptr tables expose.
         let moe_inter = match (&weights.gate_grouped, weights.gate.first()) {
             (Some(g), _) => g.rows,
             (None, Some(first)) => {
@@ -716,41 +759,11 @@ mod gpu {
                 anyhow::bail!("MoE weights carry neither grouped nor per-expert experts")
             }
         };
-        let gate_out = scratch.gate_out.get(ctx, moe_inter, total_routes)?;
-        let up_out = scratch.up_out.get(ctx, moe_inter, total_routes)?;
         // `max_count` only sizes grid Y; total_routes is a safe upper bound.
         let max_count = total_routes.max(1);
-        // SAFETY: weight-ptr tables + packed buffers valid on ctx.stream.
-        unsafe {
-            moe::moe_bf16_grouped_gemm_pair_batch(
-                &weights.gate_ptrs,
-                &weights.up_ptrs,
-                cache_ptr(&packed_hidden.data, ctx),
-                cache_ptr(&gate_out.data, ctx),
-                cache_ptr(&up_out.data, ctx),
-                cache_ptr(offsets, ctx),
-                counts_ptr,
-                cache_ptr(expert_indices, ctx),
-                local_experts,
-                max_count,
-                moe_inter,
-                hidden_dim,
-                ctx,
-                ctx.stream.cu_stream(),
-            )?;
-        }
-
-        // ── 6. SwiGLU (UNCLAMPED — Qwen3.6 MoE has no swiglu clamp). ────────
-        // silu_mul covers all `moe_inter * total_routes` elements; under EP the
-        // gate/up tails past the local route count are stale (not zero), but
-        // their products land only in the matching `act` tail, which nothing
-        // reads (the down-GEMM consumes `act` strictly within offsets/counts).
-        let act = scratch.act.get(ctx, moe_inter, total_routes)?;
-        silu_mul(ctx, gate_out, up_out, act)?;
-
-        // ── 7. Grouped down GEMM → expert_out[R, H]. ────────────────────────
-        // Grouped-mode loads cleared the per-expert Vec; the group carries
-        // the (uniform, concat-ensured) dims instead.
+        // Down dims up front (shared by both expert-GEMM paths). Grouped-mode
+        // loads cleared the per-expert Vec; the group carries the (uniform,
+        // concat-ensured) dims instead.
         let (down_rows, down_cols) = match (&weights.down_grouped, weights.down.first()) {
             (Some(g), _) => (g.rows, g.cols),
             (None, Some(first)) => (first.rows, first.cols),
@@ -764,23 +777,116 @@ mod gpu {
             hidden_dim,
             moe_inter
         );
+
+        // Decode-band dispatch: at `R <= QWEN35_MOE_DECODE_MAX_ROUTES` the
+        // weight-read-bound decode kernels replace pair-GEMM + silu_mul +
+        // down-GEMM (3 launches -> 2; one warp per weight row, 16B-vector
+        // loads, weights of touched experts read once per <=8-row activation
+        // chunk — see the formula on the const). Both contraction dims must
+        // be 16B-vector rows (gate/up k = H, down k = I); otherwise the batch
+        // kernels keep the shape. `ARLE_QWEN35_MOE_DECODE_KERNEL=0` is the
+        // same-binary A/B arm. Shape-constant pure kernel launches — decode
+        // CUDA-graph capture-safe, same as the batch kernels.
+        let use_decode_kernels = total_routes <= QWEN35_MOE_DECODE_MAX_ROUTES
+            && hidden_dim.is_multiple_of(8)
+            && moe_inter.is_multiple_of(8)
+            && qwen35_moe_decode_kernel_enabled();
+
+        // ── 5+6. Gate+up GEMM + SwiGLU (UNCLAMPED — Qwen3.6 has no clamp). ──
+        // act rows are written within `offsets/counts` (decode path) or fully
+        // (batch path's silu_mul); under EP the act tail past the local route
+        // count is stale either way, and nothing reads it (both down GEMMs
+        // consume `act` strictly within offsets/counts).
+        let act = scratch.act.get(ctx, moe_inter, total_routes)?;
+        if use_decode_kernels {
+            // Fused: act = silu(gate·x) * (up·x), no gate_out/up_out slots.
+            // SAFETY: weight-ptr tables + packed buffers valid on ctx.stream;
+            // k = hidden_dim % 8 == 0 checked by the dispatch above.
+            unsafe {
+                moe::moe_bf16_grouped_gemm_swiglu_decode(
+                    &weights.gate_ptrs,
+                    &weights.up_ptrs,
+                    cache_ptr(&packed_hidden.data, ctx),
+                    cache_ptr(&act.data, ctx),
+                    cache_ptr(offsets, ctx),
+                    counts_ptr,
+                    cache_ptr(expert_indices, ctx),
+                    local_experts,
+                    max_count,
+                    moe_inter,
+                    hidden_dim,
+                    ctx,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+        } else {
+            let gate_out = scratch.gate_out.get(ctx, moe_inter, total_routes)?;
+            let up_out = scratch.up_out.get(ctx, moe_inter, total_routes)?;
+            // SAFETY: weight-ptr tables + packed buffers valid on ctx.stream.
+            unsafe {
+                moe::moe_bf16_grouped_gemm_pair_batch(
+                    &weights.gate_ptrs,
+                    &weights.up_ptrs,
+                    cache_ptr(&packed_hidden.data, ctx),
+                    cache_ptr(&gate_out.data, ctx),
+                    cache_ptr(&up_out.data, ctx),
+                    cache_ptr(offsets, ctx),
+                    counts_ptr,
+                    cache_ptr(expert_indices, ctx),
+                    local_experts,
+                    max_count,
+                    moe_inter,
+                    hidden_dim,
+                    ctx,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+            // silu_mul covers all `moe_inter * total_routes` elements; under
+            // EP the gate/up tails past the local route count are stale (not
+            // zero), but their products land only in the matching `act` tail,
+            // which nothing reads.
+            silu_mul(ctx, gate_out, up_out, act)?;
+        }
+
+        // ── 7. Grouped down GEMM → expert_out[R, H]. ────────────────────────
         let expert_out = scratch.expert_out.get(ctx, hidden_dim, total_routes)?;
-        // SAFETY: down weight table + act/expert_out valid on ctx.stream.
-        unsafe {
-            moe::moe_bf16_grouped_gemm_batch(
-                &weights.down_ptrs,
-                cache_ptr(&act.data, ctx),
-                cache_ptr(&expert_out.data, ctx),
-                cache_ptr(offsets, ctx),
-                counts_ptr,
-                cache_ptr(expert_indices, ctx),
-                local_experts,
-                max_count,
-                hidden_dim,
-                moe_inter,
-                ctx,
-                ctx.stream.cu_stream(),
-            )?;
+        if use_decode_kernels {
+            // SAFETY: down weight table + act/expert_out valid on ctx.stream;
+            // k = moe_inter % 8 == 0 checked by the dispatch above.
+            unsafe {
+                moe::moe_bf16_grouped_gemm_decode(
+                    &weights.down_ptrs,
+                    cache_ptr(&act.data, ctx),
+                    cache_ptr(&expert_out.data, ctx),
+                    cache_ptr(offsets, ctx),
+                    counts_ptr,
+                    cache_ptr(expert_indices, ctx),
+                    local_experts,
+                    max_count,
+                    hidden_dim,
+                    moe_inter,
+                    ctx,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+        } else {
+            // SAFETY: down weight table + act/expert_out valid on ctx.stream.
+            unsafe {
+                moe::moe_bf16_grouped_gemm_batch(
+                    &weights.down_ptrs,
+                    cache_ptr(&act.data, ctx),
+                    cache_ptr(&expert_out.data, ctx),
+                    cache_ptr(offsets, ctx),
+                    counts_ptr,
+                    cache_ptr(expert_indices, ctx),
+                    local_experts,
+                    max_count,
+                    hidden_dim,
+                    moe_inter,
+                    ctx,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
         }
 
         // ── 8. Scatter weighted expert outputs to route slots, combine topk. ─
@@ -4019,6 +4125,64 @@ mod tests {
                 in_segment,
                 "row {row}: packed rows and segment rows must coincide"
             );
+        }
+    }
+
+    // ── Decode-band weight-read-bound kernel dispatch + grid mirrors. ───────
+
+    /// The decode band must never shadow the licensed DeepGEMM prefill
+    /// dispatch, and must cover the whole batched-decode envelope
+    /// (`R = top_k(8) × B` for B ≤ 32) on 16B-vector-aligned chunks.
+    #[test]
+    fn decode_band_sits_below_deepgemm_floor_and_covers_batched_decode() {
+        const MAX: usize = super::QWEN35_MOE_DECODE_MAX_ROUTES;
+        assert!(
+            MAX < super::QWEN35_DEEPGEMM_MIN_ROUTES,
+            "decode band {MAX} must stay below the DeepGEMM floor {}",
+            super::QWEN35_DEEPGEMM_MIN_ROUTES
+        );
+        // Batched decode R = 8B; the band covers B up to 32 slots.
+        assert_eq!(MAX, 8 * 32, "decode band is the batched-decode envelope");
+        // grid.y chunking is ACT_TILE=8-row; the band is whole chunks.
+        assert_eq!(MAX % 8, 0, "decode band must be whole 8-row chunks");
+    }
+
+    /// Host mirror of the `moe_bf16_grouped_gemm_{swiglu_,}decode` launch
+    /// grid: `grid.y = ceil(max_count / ACT_TILE)` chunks over per-expert
+    /// `offsets/counts`. Every routed row must be covered by exactly one
+    /// (expert, chunk) block — chunks beyond an expert's count early-exit,
+    /// counts above ACT_TILE span multiple chunks (the extra weight passes),
+    /// and zero-count experts contribute nothing.
+    #[test]
+    fn decode_kernel_chunk_grid_covers_every_route_exactly_once() {
+        const ACT_TILE: usize = 8;
+        // Mixed per-expert counts: zero, sub-tile, exact-tile, multi-chunk
+        // (count 32 = B_max under the R<=256 band), odd remainder.
+        let counts = [1usize, 0, 8, 3, 32, 0, 9];
+        let total: usize = counts.iter().sum();
+        let mut offsets = vec![0usize; counts.len()];
+        let mut acc = 0usize;
+        for (g, &c) in counts.iter().enumerate() {
+            offsets[g] = acc;
+            acc += c;
+        }
+        // Launcher: max_count = total_routes upper bound.
+        let chunks = total.max(1).div_ceil(ACT_TILE);
+        let mut touched = vec![0u32; total];
+        for (e, &c) in counts.iter().enumerate() {
+            for chunk in 0..chunks {
+                let chunk_base = chunk * ACT_TILE;
+                if chunk_base >= c {
+                    continue; // kernel early-exit: chunk_base >= counts[e]
+                }
+                let tile = (c - chunk_base).min(ACT_TILE);
+                for b in 0..tile {
+                    touched[offsets[e] + chunk_base + b] += 1;
+                }
+            }
+        }
+        for (row, &t) in touched.iter().enumerate() {
+            assert_eq!(t, 1, "packed row {row} covered {t} times (want exactly 1)");
         }
     }
 
