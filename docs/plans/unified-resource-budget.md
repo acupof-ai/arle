@@ -1,8 +1,9 @@
 # Unified resource budget — VRAM / RAM / SSD convergence
 
-Status: in-progress (2026-06-12). Owner: ckl. Tracks the systematic follow-up
-to #60: budget logic must be globally managed and converged, not per-backend
-ad-hoc.
+Status: complete + pod-validated (2026-06-12). Owner: ckl. Tracks the systematic
+follow-up to #60: budget logic must be globally managed and converged, not
+per-backend ad-hoc. Both CUDA lanes (DSv4 + Qwen3.5/3.6 MoE) pod-validated on the
+8×H20 pod; C3 host tiers unit-tested (resolve to caps on the ample pod).
 
 ## Audit (evidence, file:line)
 
@@ -80,9 +81,12 @@ Backend-specific (stays put — genuinely not shared):
   real bug fix — via `Qwen35Model::kv_budget_num_slots` (per-slot bytes mirror
   `new_slot_state`) + the same kernel + NCCL min-reduce, wired in the executor
   constructor. Strictly safer (no-op when `requested ≤ affordable`). Dense
-  Qwen3 out of scope (global `PagedKVPool`, no slot-multiplied OOM). GPU
-  boot-at-previously-OOMing-shape gate = pending-remote (Qwen lane; shares the
-  pod-validated DSv4 kernel + NCCL-reduce path).
+  Qwen3 out of scope (global `PagedKVPool`, no slot-multiplied OOM).
+  **Pod-VALIDATED** (Qwen3.6-35B-A3B, `qwen3_5_moe`, TP=2): `--num-slots 1024 →
+  per_slot 1310MB → clamped to affordable 42` across both ranks (`local ==
+  cross-rank-min`), engine boots, decodes correctly (`Paris`). Findings:
+  Qwen3.6 `num_kv_heads=2` ⇒ TP must divide 2 (TP=8 fails head-shard before the
+  budget code); RoPE cache caps `max_seq_len` at 262144.
 - **Phase C3 ✅ (`5353f17f`):** `kv_tier.rs` derives T1/T2 from system RAM
   (`/proc/meminfo`, dep-free) + free disk (`statvfs`, libc/unix) via
   `split_host_tiers`; CLI opt-out preserved. Caps == old constants, so an ample
@@ -100,13 +104,21 @@ Backend-specific (stays put — genuinely not shared):
   device OOM at arena/slot allocation. **Pod-VALIDATED (DSv4 lane)**: forced with
   `max_seq_len 2000000` (per_slot 112802MB ≫ budget 48839MB → affordable 0),
   **all 8 TP ranks** logged the identical `affords 0 slots` fail-closed message,
-  **zero OOM/panic**, pod left clean. Qwen3.5 path shares this exact shape
-  (pending a Qwen CUDA serve).
+  **zero OOM/panic**, pod left clean. **Qwen lane also Pod-VALIDATED**
+  (Qwen3.6-35B-A3B, TP=1 + a 25 GiB VRAM filler — the RoPE cap bounds per_slot
+  to ~5 GB so the affordable-0 regime is unreachable by context alone on a 96 GB
+  H20): `rejected startup: ... affords 0 slots at max_seq_len 262144 (per_slot
+  ~5181MB)`, no clamp, zero OOM, clean exit.
 
-**Convergence complete:** VRAM (DSv4 C1 + Qwen3.5/3.6 C2 + reject-parity C4),
-host RAM/SSD (C3), and Metal (B′) all flow through the one neutral infer-seam
-kernel — for both the **budget arithmetic** and the **reject policy**. No
-fragmented budget surface remains.
+**Convergence complete + pod-validated:** VRAM (DSv4 C1 + Qwen3.5/3.6 C2 +
+reject-parity C4), host RAM/SSD (C3), and Metal (B′) all flow through the one
+neutral infer-seam kernel — for both the **budget arithmetic** and the **reject
+policy**. No fragmented budget surface remains. Both CUDA lanes exercise the
+shared kernel on real H20 hardware: DSv4 (C1 byte-identity + C4 reject ×8 ranks)
+and Qwen3.5/3.6 (C2 clamp 1024→42 + correct decode + C4 reject). Hardware
+findings on the Qwen lane: `num_kv_heads=2` ⇒ TP ≤ 2; the RoPE cache caps
+`max_seq_len` at 262144, so the affordable-0 reject is a tight-VRAM guard
+(validated under a controlled VRAM filler).
 
 Each phase: `cargo test --workspace` + clippy clean + wins/ entry (or
 `pending-remote` for pod-only). No default-flip without a wall-clock license
