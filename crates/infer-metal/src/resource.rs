@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use crate::{config, wired_limit};
 
@@ -21,7 +22,10 @@ const DEFAULT_AVAILABLE_RESERVE_BYTES: usize = 6 * GIB;
 const LOW_IMPACT_AVAILABLE_RESERVE_BYTES: usize = 8 * GIB;
 const DEFAULT_CACHE_LIMIT_BYTES: usize = GIB;
 const LOW_IMPACT_CACHE_LIMIT_BYTES: usize = 512 * MIB;
-const SWAP_USED_GUARD_BYTES: usize = 512 * MIB;
+const SWAP_USED_WARN_BYTES: usize = 512 * MIB;
+const PAGING_SAMPLE_MILLIS: u64 = 1_000;
+const ACTIVE_PAGEOUT_GUARD_BYTES: usize = 64 * MIB;
+const ACTIVE_SWAPOUT_GUARD_BYTES: usize = 16 * MIB;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MetalResourceRequest {
@@ -40,6 +44,9 @@ pub struct MetalSystemStatus {
     pub total_memory_bytes: Option<usize>,
     pub available_memory_bytes: Option<usize>,
     pub swap_used_bytes: Option<usize>,
+    pub pageouts_delta_bytes: Option<usize>,
+    pub swapouts_delta_bytes: Option<usize>,
+    pub paging_sample_millis: u64,
 }
 
 impl MetalSystemStatus {
@@ -48,12 +55,25 @@ impl MetalSystemStatus {
             total_memory_bytes: physical_memory_bytes(),
             available_memory_bytes: available_memory_bytes(),
             swap_used_bytes: swap_used_bytes(),
+            pageouts_delta_bytes: None,
+            swapouts_delta_bytes: None,
+            paging_sample_millis: 0,
         }
     }
 
     pub fn describe(&self) -> String {
+        let paging = if self.paging_sample_millis == 0 {
+            "paging_delta=not_sampled".to_string()
+        } else {
+            format!(
+                "pageouts_delta={} swapouts_delta={} sample={}ms",
+                format_mib(self.pageouts_delta_bytes),
+                format_mib(self.swapouts_delta_bytes),
+                self.paging_sample_millis,
+            )
+        };
         format!(
-            "system total={} available={} swap_used={}",
+            "system total={} available={} swap_used={} {paging}",
             format_gib(self.total_memory_bytes),
             format_gib(self.available_memory_bytes),
             format_mib(self.swap_used_bytes),
@@ -62,10 +82,31 @@ impl MetalSystemStatus {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct PagingActivity {
+    pageouts_delta_bytes: Option<usize>,
+    swapouts_delta_bytes: Option<usize>,
+    sample_millis: u64,
+}
+
+impl PagingActivity {
+    fn is_active_pressure(self) -> bool {
+        self.pageouts_delta_bytes
+            .is_some_and(|bytes| bytes >= ACTIVE_PAGEOUT_GUARD_BYTES)
+            || self
+                .swapouts_delta_bytes
+                .is_some_and(|bytes| bytes >= ACTIVE_SWAPOUT_GUARD_BYTES)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct MetalResourcePlan {
     pub total_memory_bytes: Option<usize>,
     pub available_memory_bytes: Option<usize>,
     pub swap_used_bytes: Option<usize>,
+    pub pageouts_delta_bytes: Option<usize>,
+    pub swapouts_delta_bytes: Option<usize>,
+    pub paging_sample_millis: u64,
+    pub residual_swap_warning: bool,
     pub memory_limit_bytes: usize,
     pub cache_limit_bytes: usize,
     pub wired_limit_bytes: usize,
@@ -88,6 +129,9 @@ impl MetalResourcePlan {
                 total_memory_bytes: self.total_memory_bytes,
                 available_memory_bytes: self.available_memory_bytes,
                 swap_used_bytes: self.swap_used_bytes,
+                pageouts_delta_bytes: self.pageouts_delta_bytes,
+                swapouts_delta_bytes: self.swapouts_delta_bytes,
+                paging_sample_millis: self.paging_sample_millis,
             }
             .describe(),
             self.memory_limit_bytes / GIB,
@@ -119,19 +163,32 @@ pub fn plan_resource_budget(
     })?;
 
     let system_status = MetalSystemStatus::current();
-    let system_status_line = system_status.describe();
     let total_memory_bytes = system_status.total_memory_bytes;
     let available_memory_bytes = system_status.available_memory_bytes;
     let swap_used_bytes = system_status.swap_used_bytes;
-    if !request.allow_swap {
-        if let Some(used) = swap_used_bytes {
-            anyhow::ensure!(
-                used <= SWAP_USED_GUARD_BYTES,
-                "Metal resource guard rejected startup: {system_status_line}; macOS swap is already active above the guardrail (used={} MiB). \
-                 This path can spill unified memory to SSD and stall the system. Close memory-heavy apps, reboot to clear swap if needed, or pass --allow-swap after accepting the risk.",
-                used / MIB,
-            );
-        }
+    let paging = sample_paging_activity();
+    let system_status = MetalSystemStatus {
+        pageouts_delta_bytes: paging.and_then(|p| p.pageouts_delta_bytes),
+        swapouts_delta_bytes: paging.and_then(|p| p.swapouts_delta_bytes),
+        paging_sample_millis: paging.map_or(0, |p| p.sample_millis),
+        ..system_status
+    };
+    let system_status_line = system_status.describe();
+    let residual_swap_warning = swap_used_bytes.is_some_and(|used| used >= SWAP_USED_WARN_BYTES);
+    if residual_swap_warning {
+        log::warn!(
+            "Metal resource guard: residual macOS swap is present but not a hard failure: {}",
+            system_status_line
+        );
+    }
+    if !request.allow_swap && paging.is_some_and(PagingActivity::is_active_pressure) {
+        anyhow::bail!(
+            "Metal resource guard rejected startup: {system_status_line}; active pageout/swapout activity is above the guardrail \
+             (pageout >= {} MiB/s or swapout >= {} MiB/s). This path can spill unified memory to SSD and stall the system. \
+             Close memory-heavy apps and retry, or pass --allow-swap after accepting the risk.",
+            ACTIVE_PAGEOUT_GUARD_BYTES / MIB,
+            ACTIVE_SWAPOUT_GUARD_BYTES / MIB,
+        );
     }
     let runtime_headroom_bytes = if request.low_impact {
         LOW_IMPACT_RUNTIME_HEADROOM_BYTES
@@ -217,6 +274,10 @@ pub fn plan_resource_budget(
         total_memory_bytes,
         available_memory_bytes,
         swap_used_bytes,
+        pageouts_delta_bytes: system_status.pageouts_delta_bytes,
+        swapouts_delta_bytes: system_status.swapouts_delta_bytes,
+        paging_sample_millis: system_status.paging_sample_millis,
+        residual_swap_warning,
         memory_limit_bytes,
         cache_limit_bytes,
         wired_limit_bytes,
@@ -424,16 +485,54 @@ fn page_size_bytes() -> Option<usize> {
 
 fn available_memory_bytes() -> Option<usize> {
     let page_size = page_size_bytes().unwrap_or(4096);
-    let output = Command::new("vm_stat").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
+    let text = vm_stat_text()?;
     let pages = ["Pages free", "Pages inactive", "Pages speculative"]
         .into_iter()
         .filter_map(|key| parse_vm_stat_pages(&text, key))
         .sum::<usize>();
     (pages > 0).then_some(pages.saturating_mul(page_size))
+}
+
+fn sample_paging_activity() -> Option<PagingActivity> {
+    let page_size = page_size_bytes().unwrap_or(4096);
+    let before = VmStatCounters::current()?;
+    std::thread::sleep(Duration::from_millis(PAGING_SAMPLE_MILLIS));
+    let after = VmStatCounters::current()?;
+    Some(PagingActivity {
+        pageouts_delta_bytes: after
+            .pageouts
+            .checked_sub(before.pageouts)
+            .map(|pages| pages.saturating_mul(page_size)),
+        swapouts_delta_bytes: after
+            .swapouts
+            .checked_sub(before.swapouts)
+            .map(|pages| pages.saturating_mul(page_size)),
+        sample_millis: PAGING_SAMPLE_MILLIS,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VmStatCounters {
+    pageouts: usize,
+    swapouts: usize,
+}
+
+impl VmStatCounters {
+    fn current() -> Option<Self> {
+        let text = vm_stat_text()?;
+        Some(Self {
+            pageouts: parse_vm_stat_pages(&text, "Pageouts")?,
+            swapouts: parse_vm_stat_pages(&text, "Swapouts")?,
+        })
+    }
+}
+
+fn vm_stat_text() -> Option<String> {
+    let output = Command::new("vm_stat").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
 }
 
 fn swap_used_bytes() -> Option<usize> {
@@ -568,19 +667,48 @@ mod tests {
             total_memory_bytes: Some(48 * GIB),
             available_memory_bytes: Some(24 * GIB + 512 * MIB),
             swap_used_bytes: Some(817 * MIB),
+            pageouts_delta_bytes: Some(0),
+            swapouts_delta_bytes: Some(0),
+            paging_sample_millis: 1_000,
         };
         assert_eq!(
             status.describe(),
-            "system total=48.0GiB available=24.5GiB swap_used=817MiB"
+            "system total=48.0GiB available=24.5GiB swap_used=817MiB pageouts_delta=0MiB swapouts_delta=0MiB sample=1000ms"
         );
     }
 
     #[test]
+    fn active_paging_thresholds_trip_only_on_delta() {
+        let quiet = PagingActivity {
+            pageouts_delta_bytes: Some(8 * MIB),
+            swapouts_delta_bytes: Some(0),
+            sample_millis: 1_000,
+        };
+        assert!(!quiet.is_active_pressure());
+
+        let pageout_hot = PagingActivity {
+            pageouts_delta_bytes: Some(ACTIVE_PAGEOUT_GUARD_BYTES),
+            swapouts_delta_bytes: Some(0),
+            sample_millis: 1_000,
+        };
+        assert!(pageout_hot.is_active_pressure());
+
+        let swapout_hot = PagingActivity {
+            pageouts_delta_bytes: Some(0),
+            swapouts_delta_bytes: Some(ACTIVE_SWAPOUT_GUARD_BYTES),
+            sample_millis: 1_000,
+        };
+        assert!(swapout_hot.is_active_pressure());
+    }
+
+    #[test]
     fn vm_stat_parser_accepts_macos_format() {
-        let text = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               12,345.\nPages inactive:                           20.\nPages speculative:                        7.\n";
+        let text = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               12,345.\nPages inactive:                           20.\nPages speculative:                        7.\nPageouts:                                 1,024.\nSwapouts:                                 2.\n";
         assert_eq!(parse_vm_stat_pages(text, "Pages free"), Some(12345));
         assert_eq!(parse_vm_stat_pages(text, "Pages inactive"), Some(20));
         assert_eq!(parse_vm_stat_pages(text, "Pages speculative"), Some(7));
+        assert_eq!(parse_vm_stat_pages(text, "Pageouts"), Some(1024));
+        assert_eq!(parse_vm_stat_pages(text, "Swapouts"), Some(2));
     }
 
     #[test]
