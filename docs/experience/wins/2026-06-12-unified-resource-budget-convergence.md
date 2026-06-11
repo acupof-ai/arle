@@ -26,6 +26,14 @@ guards).
 
 - **Phase B** (`15ec44cd`): the kernel + tests. Behavior-neutral (no consumers
   wired), no bench delta possible.
+- **Phase B′** (`e5ad704f`): **Metal `plan_resource_budget` routed through the
+  kernel** — `fits_fixed` guard, `from_limit` + `affordable()`,
+  `clamp_to_affordable`. Byte-identical (`saturating_sub` == `-` after the
+  guard; nested-floor identity for the token→page division; the legacy
+  `.max(1)` a proven no-op after the `max_total_pages > 0` ensure);
+  `MetalResourcePlan` fields and `describe()` output unchanged. Locked by a new
+  unit test across fitting/clamped/tight regimes. Metal's probing
+  (sysctl/vm_stat), dual reserve regimes, and paging guards stay Metal-side.
 - **Phase C1** (`a23336eb`): DSv4 `kv_budget_num_slots` routed through the
   kernel. **Byte-identical** — `from_free` reproduces `floor(free×0.9)−Σfixed`
   exactly (the two saturating_subs fold into one, proven by
@@ -58,8 +66,9 @@ guards).
     over-shrinks. CLI overrides (`--kv-t1-budget-bytes` / `--kv-ssd-max-bytes`)
     are untouched — they short-circuit the probe.
 
-With C3 the audit's last fragmented surface converges: **VRAM (DSv4 + Qwen3.5/3.6)
-and host RAM/SSD now all flow through the one neutral infer-seam kernel.**
+With C3 + B′ the audit's last fragmented surfaces converge: **VRAM (DSv4 +
+Qwen3.5/3.6), host RAM/SSD, and the Metal planner now all flow through the one
+neutral infer-seam kernel.** No backend hand-rolls the budget/clamp policy.
 
 ## Evidence
 
@@ -68,8 +77,13 @@ and host RAM/SSD now all flow through the one neutral infer-seam kernel.**
 - `infer-cuda` `kv_tier` tests: **7/7 pass**, including C3's new probe tests
   (`statvfs` on a real dir reports Some + nonexistent path → None; T1 budget in
   `[1 GiB, 4 GiB]`; T2 budget ≤ 20 GiB cap).
+- `infer-metal` `resource` tests: **10/10 pass**, including B′'s new
+  `kv_budget_clamp_matches_legacy_inline_arithmetic` (kernel route reproduces
+  the former inline `limit−fixed` / `budget/per_token/page` / `min().max(1)`
+  byte-for-byte across fits/clamps/tight).
 - Mac CUDA-Rust typecheck (`cuda,no-cuda`) + `clippy -D warnings`: **clean** for
-  C1, C2, and C3 (both `cuda,no-cuda` and `no-cuda` paths).
+  C1, C2, and C3 (both `cuda,no-cuda` and `no-cuda` paths); `clippy -D warnings`
+  clean for B′ (`metal`).
 - DSv4 C1 byte-identity: the #60 pod 8-slot run already exercises this exact
   path (`shared MoE decode 114MB` came through `kv_budget_num_slots`); the
   refactor preserves the log line and arithmetic.
