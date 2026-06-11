@@ -91,6 +91,37 @@ pub enum Kernel {
 }
 
 impl Kernel {
+    pub const ALL: &'static [Self] = &[
+        Self::MmvqIq2Xxs,
+        Self::MmvqQ2K,
+        Self::GemvQ4K,
+        Self::GemvQ5K,
+        Self::GemvQ6K,
+        Self::QuantizeQ8_1,
+        Self::RmsNorm,
+        Self::RopeNeox,
+        Self::RopeNorm,
+        Self::Silu,
+        Self::Gelu,
+        Self::GeGlu,
+        Self::SwiGlu,
+        Self::Add,
+        Self::GetRows,
+        Self::SoftMax,
+        Self::ArgMax,
+        Self::FlashAttn,
+        Self::Dsv4PrepareQk,
+        Self::Dsv4CompressorUpdate,
+        Self::Dsv4CsaSelect,
+        Self::Dsv4HybridAttention,
+        Self::Dsv4SwaAttention,
+        Self::Dsv4Mhc,
+        Self::Dsv4OutputInverseRope,
+        Self::SwigluClamped,
+        Self::Qwen35SsmConv,
+        Self::Qwen35GatedDeltaNet,
+    ];
+
     pub const fn shader_name(self) -> &'static str {
         match self {
             Kernel::MmvqIq2Xxs => "mul_mat_vec_iq2_xxs",
@@ -631,6 +662,19 @@ mod tests {
         ];
         assert_eq!(names.len(), 18);
         assert!(names.iter().all(|name| !name.is_empty()));
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_feature_build_produces_every_registered_spv() {
+        let dir = option_env!("ARLE_VULKAN_SPV_DIR").expect("build.rs sets ARLE_VULKAN_SPV_DIR");
+        for kernel in Kernel::ALL {
+            let path = std::path::Path::new(dir).join(format!("{}.spv", kernel.shader_name()));
+            let len = std::fs::metadata(&path)
+                .unwrap_or_else(|_| panic!("missing SPIR-V for {}", kernel.shader_name()))
+                .len();
+            assert!(len > 0, "empty SPIR-V for {}", kernel.shader_name());
+        }
     }
 
     #[test]
