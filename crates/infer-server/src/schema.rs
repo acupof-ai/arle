@@ -233,6 +233,7 @@ pub struct StatsResponse {
     pub scheduler: SchedulerStats,
     pub throughput: ThroughputStatsResponse,
     pub prefix_cache: PrefixCacheStatsResponse,
+    pub kv_tier: KvTierStatsResponse,
     pub ssd_recall: SsdRecallStats,
 }
 
@@ -249,6 +250,14 @@ impl StatsResponse {
                 prefill_tokens: counters.throughput.prefill_tokens,
                 generated_tokens: counters.throughput.generated_tokens,
                 requests_completed: counters.throughput.requests_completed,
+            },
+            kv_tier: KvTierStatsResponse {
+                available: counters.kv_tier.demoted_pages > 0
+                    || counters.kv_tier.resident_blocks > 0,
+                demoted_pages: counters.kv_tier.demoted_pages,
+                promoted_pages: counters.kv_tier.promoted_pages,
+                promote_failures: counters.kv_tier.promote_failures,
+                resident_blocks: counters.kv_tier.resident_blocks,
             },
             prefix_cache: PrefixCacheStatsResponse {
                 lookups: counters.prefix_cache.lookups,
@@ -285,6 +294,17 @@ pub struct ThroughputStatsResponse {
     pub prefill_tokens: u64,
     pub generated_tokens: u64,
     pub requests_completed: u64,
+}
+
+/// KV host-tier (T1 DRAM) counters. All zero until a backend with a tier
+/// store is configured (`available` keys off observed tier activity).
+#[derive(Debug, Clone, Serialize)]
+pub struct KvTierStatsResponse {
+    pub available: bool,
+    pub demoted_pages: u64,
+    pub promoted_pages: u64,
+    pub promote_failures: u64,
+    pub resident_blocks: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -500,6 +520,7 @@ mod tests {
                 generated_tokens: 48,
                 requests_completed: 3,
             },
+            kv_tier: infer_core::KvTierStats::default(),
         });
 
         let v = serde_json::to_value(&resp).expect("serialize");
@@ -508,6 +529,8 @@ mod tests {
         assert_eq!(v["prefix_cache"]["hit_tokens"], 96);
         assert_eq!(v["throughput"]["generated_tokens"], 48);
         assert_eq!(v["throughput"]["requests_completed"], 3);
+        assert_eq!(v["kv_tier"]["available"], false);
+        assert_eq!(v["kv_tier"]["demoted_pages"], 0);
         assert_eq!(v["ssd_recall"]["available"], false);
         assert!(v["ssd_recall"]["recall_rate"].is_null());
     }

@@ -35,12 +35,37 @@ impl PrefixMatch {
     }
 }
 
+/// One block of a tier-aware prefix match, in prompt order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierBlock {
+    /// Block is device-resident under this host page id.
+    Resident(BlockId),
+    /// Block was demoted to the backend's host tier store under this key.
+    Demoted(u64),
+}
+
+/// Longest cached prefix including demoted (host-tier) blocks.
+///
+/// Used only by the tier-enabled engine path; the resident-only
+/// [`PrefixMatch`] surface is unchanged for backends without a tier store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TieredPrefixMatch {
+    /// Matched blocks in prompt order (resident and demoted interleaved).
+    pub blocks: Vec<TierBlock>,
+}
+
 /// Fixed-block radix cache for prompt KV reuse.
 #[derive(Debug, Clone)]
 pub struct RadixCache {
     block_size: usize,
     nodes: Vec<Node>,
     page_to_node: BTreeMap<BlockId, usize>,
+    /// Demoted blocks: backend tier key -> node index.
+    tier_to_node: BTreeMap<u64, usize>,
+    /// Tier keys invalidated by sever/revive since the last drain. The engine
+    /// drains these after every cache mutation batch and forwards them to
+    /// `BackendExecutor::drop_kv_tier_entries`, so no path can leak a key.
+    dropped_tier_keys: Vec<u64>,
     clock: u64,
 }
 
@@ -48,6 +73,9 @@ pub struct RadixCache {
 struct Node {
     block: Vec<u32>,
     page_id: Option<BlockId>,
+    /// Backend tier-store key while this block's contents live in the host
+    /// tier instead of a device page. Mutually exclusive with `page_id`.
+    tier_key: Option<u64>,
     ref_count: usize,
     last_access: u64,
     parent: Option<usize>,
@@ -60,6 +88,7 @@ impl Node {
         Self {
             block: Vec::new(),
             page_id: None,
+            tier_key: None,
             ref_count: 0,
             last_access: 0,
             parent: None,
@@ -72,6 +101,7 @@ impl Node {
         Self {
             block,
             page_id: Some(page_id),
+            tier_key: None,
             ref_count: 0,
             last_access,
             parent: Some(parent),
@@ -80,8 +110,8 @@ impl Node {
         }
     }
 
-    fn is_evictable_leaf(&self) -> bool {
-        !self.evicted && self.page_id.is_some() && self.ref_count == 0 && self.children.is_empty()
+    fn is_demoted(&self) -> bool {
+        !self.evicted && self.page_id.is_none() && self.tier_key.is_some()
     }
 }
 
@@ -93,6 +123,8 @@ impl RadixCache {
             block_size: block_size.max(1),
             nodes: vec![Node::root()],
             page_to_node: BTreeMap::new(),
+            tier_to_node: BTreeMap::new(),
+            dropped_tier_keys: Vec::new(),
             clock: 0,
         }
     }
@@ -107,6 +139,18 @@ impl RadixCache {
     #[must_use]
     pub fn cached_page_count(&self) -> usize {
         self.page_to_node.len()
+    }
+
+    /// Return the number of blocks currently demoted to the host tier.
+    #[must_use]
+    pub fn demoted_block_count(&self) -> usize {
+        self.tier_to_node.len()
+    }
+
+    /// Drain the tier keys invalidated since the last call (severed or revived
+    /// demoted nodes). The caller forwards them to the backend tier store.
+    pub fn take_dropped_tier_keys(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.dropped_tier_keys)
     }
 
     /// Find the longest cached full-block prefix and bump recency.
@@ -153,6 +197,157 @@ impl RadixCache {
         }
     }
 
+    /// Find the longest cached prefix including demoted blocks, bumping recency.
+    ///
+    /// Unlike [`RadixCache::longest_prefix_match`], the walk continues through
+    /// demoted nodes (contents in the backend host tier) so the engine can
+    /// promote them into fresh pages instead of re-prefilling. Only used by
+    /// the tier-enabled engine path.
+    pub fn tiered_longest_prefix_match(&mut self, tokens: &[u32]) -> TieredPrefixMatch {
+        let mut node_idx = 0usize;
+        let mut blocks = Vec::new();
+        for block in tokens.chunks_exact(self.block_size) {
+            let Some(&child_idx) = self.nodes[node_idx].children.get(block) else {
+                break;
+            };
+            let child = &self.nodes[child_idx];
+            let entry = if let Some(page_id) = child.page_id {
+                TierBlock::Resident(page_id)
+            } else if let Some(tier_key) = child.tier_key {
+                TierBlock::Demoted(tier_key)
+            } else {
+                break;
+            };
+            blocks.push(entry);
+            let last_access = self.tick();
+            self.nodes[child_idx].last_access = last_access;
+            node_idx = child_idx;
+        }
+        TieredPrefixMatch { blocks }
+    }
+
+    /// Demote a cached resident block: drop its device page id and remember the
+    /// backend tier key its contents now live under. The node stays linked and
+    /// matchable. Returns `false` (no state change) if `page` is not an
+    /// idle cached block.
+    pub fn demote_block(&mut self, page: BlockId, tier_key: u64) -> bool {
+        let Some(&node_idx) = self.page_to_node.get(&page) else {
+            return false;
+        };
+        // Only idle leaves (no resident descendants) demote, preserving the
+        // invariant that demoted subtrees are entirely non-resident.
+        if !self.is_evictable_leaf(node_idx) {
+            return false;
+        }
+        self.page_to_node.remove(&page);
+        let node = &mut self.nodes[node_idx];
+        node.page_id = None;
+        node.tier_key = Some(tier_key);
+        self.tier_to_node.insert(tier_key, node_idx);
+        true
+    }
+
+    /// Restore a demoted block to device residency under a freshly promoted
+    /// page. The tier key is consumed (the caller drops the store entry via
+    /// the dropped-keys drain). Returns `false` if the key is unknown.
+    pub fn promote_block(&mut self, tier_key: u64, page: BlockId) -> bool {
+        let Some(&node_idx) = self.tier_to_node.get(&tier_key) else {
+            return false;
+        };
+        self.tier_to_node.remove(&tier_key);
+        self.dropped_tier_keys.push(tier_key);
+        let node = &mut self.nodes[node_idx];
+        node.tier_key = None;
+        node.page_id = Some(page);
+        self.page_to_node.insert(page, node_idx);
+        let last_access = self.tick();
+        self.nodes[node_idx].last_access = last_access;
+        true
+    }
+
+    /// Peek the page id of the least-recently-used evictable resident block.
+    #[must_use]
+    pub fn lru_evictable_page(&self) -> Option<BlockId> {
+        self.least_recent_evictable_leaf()
+            .and_then(|idx| self.nodes[idx].page_id)
+    }
+
+    /// Peek the tier key of the least-recently-used demoted block whose
+    /// subtree holds no resident pages (safe to sever for tier-store room).
+    #[must_use]
+    pub fn lru_demoted_key(&self) -> Option<u64> {
+        self.tier_to_node
+            .iter()
+            .map(|(&key, &idx)| (key, idx))
+            .filter(|&(_, idx)| !self.subtree_has_resident(idx))
+            .min_by_key(|&(_, idx)| self.nodes[idx].last_access)
+            .map(|(key, _)| key)
+    }
+
+    /// Sever a demoted block (and its demoted-only subtree) from the cache,
+    /// pushing all invalidated tier keys to the dropped-keys drain. Returns
+    /// `false` if the key is unknown or the subtree still holds resident pages.
+    pub fn drop_demoted(&mut self, tier_key: u64) -> bool {
+        let Some(&node_idx) = self.tier_to_node.get(&tier_key) else {
+            return false;
+        };
+        if self.subtree_has_resident(node_idx) {
+            return false;
+        }
+        self.sever_subtree(node_idx);
+        true
+    }
+
+    /// Sever an idle resident block selected by page id, exactly like one
+    /// `evict_lru` step. Demoted descendants are dropped via the tier-key
+    /// drain. Returns `false` if `page` is not an idle cached block.
+    pub fn evict_page(&mut self, page: BlockId) -> bool {
+        let Some(&node_idx) = self.page_to_node.get(&page) else {
+            return false;
+        };
+        if !self.is_evictable_leaf(node_idx) {
+            return false;
+        }
+        self.page_to_node.remove(&page);
+        self.sever_subtree(node_idx);
+        true
+    }
+
+    /// Whether any node in `idx`'s subtree (inclusive) holds a device page.
+    fn subtree_has_resident(&self, idx: usize) -> bool {
+        if self.nodes[idx].page_id.is_some() {
+            return true;
+        }
+        self.nodes[idx]
+            .children
+            .values()
+            .any(|&child| self.subtree_has_resident(child))
+    }
+
+    /// Detach `idx` from its parent and mark its subtree evicted, draining
+    /// every tier key found into `dropped_tier_keys`. Callers must have
+    /// removed any `page_to_node` entries for resident nodes in the subtree
+    /// (the engine paths only sever subtrees whose only contents are the
+    /// severed node's own page plus demoted descendants).
+    fn sever_subtree(&mut self, idx: usize) {
+        if let Some(parent_idx) = self.nodes[idx].parent {
+            let block = self.nodes[idx].block.clone();
+            self.nodes[parent_idx].children.remove(&block);
+        }
+        let mut stack = vec![idx];
+        while let Some(current) = stack.pop() {
+            let node = &mut self.nodes[current];
+            node.evicted = true;
+            node.page_id = None;
+            if let Some(key) = node.tier_key.take() {
+                self.tier_to_node.remove(&key);
+                self.dropped_tier_keys.push(key);
+            }
+            let children = std::mem::take(&mut self.nodes[current].children);
+            stack.extend(children.into_values());
+        }
+    }
+
     /// Publish full token blocks with their host page ids.
     ///
     /// Returns page ids that became newly owned by the cache. Existing matching
@@ -188,6 +383,12 @@ impl RadixCache {
             };
 
             if self.nodes[child_idx].page_id.is_none() {
+                // Reviving a page-less node: if it was demoted, the re-prefilled
+                // page supersedes the tier copy — drop the stale tier entry.
+                if let Some(key) = self.nodes[child_idx].tier_key.take() {
+                    self.tier_to_node.remove(&key);
+                    self.dropped_tier_keys.push(key);
+                }
                 self.nodes[child_idx].page_id = Some(page_id);
                 if self.page_to_node.insert(page_id, child_idx).is_none() {
                     newly_cached.push(page_id);
@@ -225,40 +426,181 @@ impl RadixCache {
 
     /// Evict up to `n_pages_needed` least-recently-used inactive leaf blocks.
     ///
-    /// Blocks with a nonzero active ref are never returned.
+    /// Blocks with a nonzero active ref are never returned. Demoted-only
+    /// subtrees under an evicted block are severed with it (their tier keys
+    /// land in the dropped-keys drain).
     pub fn evict_lru(&mut self, n_pages_needed: usize) -> Vec<BlockId> {
         let mut evicted = Vec::new();
         while evicted.len() < n_pages_needed {
             let Some(node_idx) = self.least_recent_evictable_leaf() else {
                 break;
             };
-            let Some(page_id) = self.nodes[node_idx].page_id.take() else {
-                self.nodes[node_idx].evicted = true;
-                continue;
+            let Some(page_id) = self.nodes[node_idx].page_id else {
+                break;
             };
-            if let Some(parent_idx) = self.nodes[node_idx].parent {
-                let block = self.nodes[node_idx].block.clone();
-                self.nodes[parent_idx].children.remove(&block);
-            }
-            self.nodes[node_idx].evicted = true;
             self.page_to_node.remove(&page_id);
+            self.sever_subtree(node_idx);
             evicted.push(page_id);
         }
         evicted
     }
 
+    /// A resident block is evictable when it is idle and holds no resident
+    /// descendants. Demoted children do not pin their parent (otherwise a
+    /// demoted leaf would freeze its whole ancestor chain on the device);
+    /// demoted nodes never have resident descendants — inserting through a
+    /// demoted node revives it first (see `insert`) — so one level suffices.
+    fn is_evictable_leaf(&self, idx: usize) -> bool {
+        let node = &self.nodes[idx];
+        !node.evicted
+            && node.page_id.is_some()
+            && node.ref_count == 0
+            && node
+                .children
+                .values()
+                .all(|&child| self.nodes[child].is_demoted())
+    }
+
     fn least_recent_evictable_leaf(&self) -> Option<usize> {
-        self.nodes
-            .iter()
-            .enumerate()
-            .skip(1)
-            .filter(|(_, node)| node.is_evictable_leaf())
-            .min_by_key(|(_, node)| node.last_access)
-            .map(|(idx, _)| idx)
+        (1..self.nodes.len())
+            .filter(|&idx| self.is_evictable_leaf(idx))
+            .min_by_key(|&idx| self.nodes[idx].last_access)
     }
 
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.saturating_add(1);
         self.clock
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two-block cache: [1,2] -> page 10, [1,2,3,4] -> pages 10,11.
+    fn two_block_cache() -> RadixCache {
+        let mut cache = RadixCache::new(2);
+        let newly = cache.insert(&[1, 2, 3, 4], &[10, 11]);
+        assert_eq!(newly, vec![10, 11]);
+        cache
+    }
+
+    #[test]
+    fn demote_then_tiered_match_then_promote_roundtrip() {
+        let mut cache = two_block_cache();
+
+        // Deepest leaf (page 11) demotes first; page 10 still pins residency.
+        assert!(cache.demote_block(11, 7));
+        assert_eq!(cache.demoted_block_count(), 1);
+        assert_eq!(cache.cached_page_count(), 1);
+
+        // Resident-only match stops at the demoted block.
+        let resident = cache.peek_longest_prefix_match(&[1, 2, 3, 4]);
+        assert_eq!(resident.matched_len, 2);
+        assert_eq!(resident.block_ids, vec![10]);
+
+        // Tiered match walks through it.
+        let tiered = cache.tiered_longest_prefix_match(&[1, 2, 3, 4]);
+        assert_eq!(
+            tiered.blocks,
+            vec![TierBlock::Resident(10), TierBlock::Demoted(7)]
+        );
+
+        // Promote restores residency under the new page and drops the key.
+        assert!(cache.promote_block(7, 42));
+        assert_eq!(cache.take_dropped_tier_keys(), vec![7]);
+        assert_eq!(cache.demoted_block_count(), 0);
+        let restored = cache.peek_longest_prefix_match(&[1, 2, 3, 4]);
+        assert_eq!(restored.block_ids, vec![10, 42]);
+    }
+
+    #[test]
+    fn demote_rejects_interior_refed_and_unknown_blocks() {
+        let mut cache = two_block_cache();
+
+        // Interior block (has a resident child) must not demote.
+        assert!(!cache.demote_block(10, 1));
+        // Active-ref'd leaf must not demote.
+        cache.retain_blocks(&[11]);
+        assert!(!cache.demote_block(11, 2));
+        cache.release_blocks(&[11]);
+        // Unknown page id.
+        assert!(!cache.demote_block(99, 3));
+        assert_eq!(cache.demoted_block_count(), 0);
+    }
+
+    #[test]
+    fn parent_demotes_after_child_and_subtree_severs_as_one() {
+        let mut cache = two_block_cache();
+
+        assert!(cache.demote_block(11, 1));
+        // With its only child demoted, the parent becomes the LRU evictable
+        // leaf (relaxed rule) and can demote too.
+        assert_eq!(cache.lru_evictable_page(), Some(10));
+        assert!(cache.demote_block(10, 2));
+        assert_eq!(cache.demoted_block_count(), 2);
+        assert_eq!(cache.cached_page_count(), 0);
+
+        // The demoted chain still matches end-to-end.
+        let tiered = cache.tiered_longest_prefix_match(&[1, 2, 3, 4]);
+        assert_eq!(
+            tiered.blocks,
+            vec![TierBlock::Demoted(2), TierBlock::Demoted(1)]
+        );
+
+        // Severing the parent cascades over the demoted child.
+        assert!(cache.drop_demoted(2));
+        let mut dropped = cache.take_dropped_tier_keys();
+        dropped.sort_unstable();
+        assert_eq!(dropped, vec![1, 2]);
+        assert_eq!(cache.demoted_block_count(), 0);
+        assert!(
+            cache
+                .tiered_longest_prefix_match(&[1, 2, 3, 4])
+                .blocks
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn evict_lru_severs_demoted_descendants() {
+        let mut cache = two_block_cache();
+        assert!(cache.demote_block(11, 9));
+
+        // Plain eviction of the parent must cascade the demoted child's key.
+        let evicted = cache.evict_lru(1);
+        assert_eq!(evicted, vec![10]);
+        assert_eq!(cache.take_dropped_tier_keys(), vec![9]);
+        assert_eq!(cache.demoted_block_count(), 0);
+        assert_eq!(cache.cached_page_count(), 0);
+    }
+
+    #[test]
+    fn insert_over_demoted_node_revives_and_drops_tier_entry() {
+        let mut cache = two_block_cache();
+        assert!(cache.demote_block(11, 5));
+
+        // Re-publishing the same prompt with a fresh page for block 2 revives
+        // the node; the stale tier copy must surface on the drain.
+        let newly = cache.insert(&[1, 2, 3, 4], &[10, 21]);
+        assert_eq!(newly, vec![21]);
+        assert_eq!(cache.take_dropped_tier_keys(), vec![5]);
+        assert_eq!(cache.demoted_block_count(), 0);
+        let m = cache.peek_longest_prefix_match(&[1, 2, 3, 4]);
+        assert_eq!(m.block_ids, vec![10, 21]);
+    }
+
+    #[test]
+    fn lru_demoted_key_returns_coldest() {
+        let mut cache = RadixCache::new(2);
+        cache.insert(&[1, 2], &[10]);
+        cache.insert(&[5, 6], &[20]);
+        assert!(cache.demote_block(10, 100));
+        assert!(cache.demote_block(20, 200));
+        // Key 100 was demoted (last touched) first -> coldest.
+        assert_eq!(cache.lru_demoted_key(), Some(100));
+        // Touching it via a tiered match flips the order.
+        cache.tiered_longest_prefix_match(&[1, 2]);
+        assert_eq!(cache.lru_demoted_key(), Some(200));
     }
 }
