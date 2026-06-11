@@ -324,10 +324,17 @@ __global__ void moe_bf16_grouped_gemm_pair_batch_kernel(
 // packed activation rows). The Rust dispatch guards and falls back to the
 // batch kernels otherwise.
 
-#define MOE_DECODE_WARPS 8    // weight rows per block (one warp per row)
+#define MOE_DECODE_WARPS 8    // warps per block
 #define MOE_DECODE_THREADS (MOE_DECODE_WARPS * MOE_GROUPED_WARP_SIZE)
 #define MOE_DECODE_ACT_TILE 8 // activation rows per chunk (grid.y)
 #define MOE_DECODE_VEC 8      // bf16 elements per 16-byte vector load
+// Down-projection K is short (Qwen3.6: K=I=512 -> 2 v-iterations/lane), so a
+// warp owning ONE row keeps only ~2 weight loads in flight and runs
+// latency-bound at 6% of HBM peak (nsys 2026-06-11: 69 us/layer vs the
+// swiglu kernel's 25% at K=2048). A warp therefore owns MOE_DECODE_ROW_TILE
+// consecutive rows: 4x the loads in flight per lane, and the activation
+// vector is loaded once per v-iteration and reused across the row tile.
+#define MOE_DECODE_ROW_TILE 4 // weight rows per warp (down kernel only)
 
 struct alignas(16) moe_bf16x8 {
     __nv_bfloat162 h[4];
@@ -376,41 +383,65 @@ __global__ void moe_bf16_grouped_gemm_decode_kernel(
     if (chunk_base >= expert_M) return;
     const int warp = threadIdx.x / MOE_GROUPED_WARP_SIZE;
     const int lane = threadIdx.x % MOE_GROUPED_WARP_SIZE;
-    const int row = blockIdx.x * MOE_DECODE_WARPS + warp;
-    if (row >= N) return;
+    const int row_base =
+        (blockIdx.x * MOE_DECODE_WARPS + warp) * MOE_DECODE_ROW_TILE;
+    if (row_base >= N) return;
     const int tile_raw = expert_M - chunk_base;
     const int tile = tile_raw < MOE_DECODE_ACT_TILE ? tile_raw : MOE_DECODE_ACT_TILE;
     const int expert_idx = expert_indices ? expert_indices[compact_expert_idx] : compact_expert_idx;
     const int route_base = offsets[compact_expert_idx] + chunk_base;
 
     const auto* weight = reinterpret_cast<const __nv_bfloat16*>(weight_ptrs[expert_idx]);
-    const __nv_bfloat16* weight_row = weight + (int64_t)row * K;
+    const int rows = N - row_base < MOE_DECODE_ROW_TILE ? N - row_base
+                                                        : MOE_DECODE_ROW_TILE;
 
-    float acc[MOE_DECODE_ACT_TILE];
+    float acc[MOE_DECODE_ACT_TILE][MOE_DECODE_ROW_TILE];
 #pragma unroll
-    for (int b = 0; b < MOE_DECODE_ACT_TILE; ++b) acc[b] = 0.0f;
+    for (int b = 0; b < MOE_DECODE_ACT_TILE; ++b)
+#pragma unroll
+        for (int r = 0; r < MOE_DECODE_ROW_TILE; ++r) acc[b][r] = 0.0f;
 
     const int kv = K / MOE_DECODE_VEC; // launcher enforces K % 8 == 0
     for (int v = lane; v < kv; v += MOE_GROUPED_WARP_SIZE) {
-        const moe_bf16x8 w = moe_load_bf16x8(weight_row + v * MOE_DECODE_VEC);
+        moe_bf16x8 w[MOE_DECODE_ROW_TILE];
+#pragma unroll
+        for (int r = 0; r < MOE_DECODE_ROW_TILE; ++r) {
+            if (r < rows) {
+                w[r] = moe_load_bf16x8(weight + (int64_t)(row_base + r) * K +
+                                       v * MOE_DECODE_VEC);
+            }
+        }
 #pragma unroll
         for (int b = 0; b < MOE_DECODE_ACT_TILE; ++b) {
             if (b < tile) {
                 const moe_bf16x8 x = moe_load_bf16x8(
                     input + (int64_t)(route_base + b) * K + v * MOE_DECODE_VEC);
-                acc[b] = moe_decode_dot8(acc[b], w, x);
+#pragma unroll
+                for (int r = 0; r < MOE_DECODE_ROW_TILE; ++r) {
+                    if (r < rows) acc[b][r] = moe_decode_dot8(acc[b][r], w[r], x);
+                }
             }
         }
     }
 
-    // tile is warp-uniform, so the predicated reduce keeps all lanes converged.
+    // tile/rows are warp-uniform, so the predicated reduce keeps all lanes
+    // converged. Per-element reduction order is unchanged from the one-row
+    // form: same lane->k-segment mapping, same butterfly.
 #pragma unroll
     for (int b = 0; b < MOE_DECODE_ACT_TILE; ++b) {
-        if (b < tile) acc[b] = moe_grouped_warp_reduce_sum(acc[b]);
+        if (b < tile) {
+#pragma unroll
+            for (int r = 0; r < MOE_DECODE_ROW_TILE; ++r) {
+                if (r < rows) acc[b][r] = moe_grouped_warp_reduce_sum(acc[b][r]);
+            }
+        }
     }
     if (lane == 0) {
         for (int b = 0; b < tile; ++b) {
-            output[(int64_t)(route_base + b) * N + row] = __float2bfloat16(acc[b]);
+            for (int r = 0; r < rows; ++r) {
+                output[(int64_t)(route_base + b) * N + row_base + r] =
+                    __float2bfloat16(acc[b][r]);
+            }
         }
     }
 }
@@ -549,7 +580,8 @@ cudaError_t moe_bf16_grouped_gemm_decode_cuda(
     if (num_experts <= 0 || max_count <= 0 || N <= 0 || K <= 0) return cudaSuccess;
     if (K % MOE_DECODE_VEC != 0) return cudaErrorInvalidValue;
     dim3 block(MOE_DECODE_THREADS);
-    dim3 grid((N + MOE_DECODE_WARPS - 1) / MOE_DECODE_WARPS,
+    const int rows_per_block = MOE_DECODE_WARPS * MOE_DECODE_ROW_TILE;
+    dim3 grid((N + rows_per_block - 1) / rows_per_block,
               (max_count + MOE_DECODE_ACT_TILE - 1) / MOE_DECODE_ACT_TILE,
               num_experts);
     moe_bf16_grouped_gemm_decode_kernel<<<grid, block, 0, stream>>>(
