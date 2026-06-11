@@ -277,6 +277,20 @@ impl TpRuntime {
         self.comm.is_collective()
     }
 
+    /// Whether the decode small-message path is currently using ARLE's
+    /// one-shot CustomAllreduce instead of plain NCCL.
+    #[must_use]
+    pub fn oneshot_comm_active(&self) -> bool {
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        {
+            self.oneshot.is_some()
+        }
+        #[cfg(not(all(feature = "cuda", feature = "nccl")))]
+        {
+            false
+        }
+    }
+
     /// All-reduce (sum) a row-parallel GEMM output across the TP group, in place.
     ///
     /// Row-parallel linears (`o_proj`/`down_proj`) produce a partial per rank;
@@ -753,6 +767,7 @@ mod oneshot {
     use cuda_kernels::collective::NcclBackend;
     use cuda_kernels::ffi::comm as car;
     use cuda_kernels::prelude::DeviceContext;
+    use std::ffi::c_void;
 
     /// Persistent registered scratch per rank. Covers every decode shape
     /// (B=1..32 AR ≤ 448 KB, Q-AG ≤ 18 KB/rank); prefill-sized buffers fall
@@ -788,6 +803,114 @@ mod oneshot {
         Ok(())
     }
 
+    struct SharedRegion {
+        ptr: u64,
+        label: &'static str,
+    }
+
+    impl SharedRegion {
+        fn alloc(bytes: usize, handle: &mut [u8; 64], label: &'static str) -> Result<Self> {
+            let mut ptr = 0u64;
+            check(
+                unsafe { car::arle_car_alloc_shared(bytes, &mut ptr, handle.as_mut_ptr()) },
+                label,
+            )?;
+            Ok(Self { ptr, label })
+        }
+
+        fn ptr(&self) -> u64 {
+            self.ptr
+        }
+
+        fn disarm(&mut self) {
+            self.ptr = 0;
+        }
+    }
+
+    impl Drop for SharedRegion {
+        fn drop(&mut self) {
+            if self.ptr == 0 {
+                return;
+            }
+            let res = unsafe { car::arle_car_free_shared(self.ptr) };
+            if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                log::warn!(
+                    "[comm-oneshot] cleanup {} ptr=0x{:x} failed: {res:?}",
+                    self.label,
+                    self.ptr
+                );
+            }
+        }
+    }
+
+    struct PeerMapping {
+        ptr: u64,
+        label: &'static str,
+    }
+
+    impl PeerMapping {
+        fn open(handle: &[u8], label: &'static str) -> Result<Self> {
+            let mut ptr = 0u64;
+            check(
+                unsafe { car::arle_car_open_peer(handle.as_ptr(), &mut ptr) },
+                label,
+            )?;
+            Ok(Self { ptr, label })
+        }
+
+        fn ptr(&self) -> u64 {
+            self.ptr
+        }
+
+        fn disarm(&mut self) {
+            self.ptr = 0;
+        }
+    }
+
+    impl Drop for PeerMapping {
+        fn drop(&mut self) {
+            if self.ptr == 0 {
+                return;
+            }
+            let res = unsafe { car::arle_car_close_peer(self.ptr) };
+            if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                log::warn!(
+                    "[comm-oneshot] cleanup {} ptr=0x{:x} failed: {res:?}",
+                    self.label,
+                    self.ptr
+                );
+            }
+        }
+    }
+
+    struct BootHandle {
+        handle: *mut c_void,
+        scratch_ptr: u64,
+    }
+
+    impl BootHandle {
+        fn self_test(&self, ctx: &DeviceContext, backend: &NcclBackend, rank: usize) -> Result<()> {
+            OneShotComm::self_test_handle(self.handle, self.scratch_ptr, ctx, backend, rank)
+        }
+
+        fn into_comm(mut self) -> OneShotComm {
+            let comm = OneShotComm {
+                handle: self.handle,
+                scratch_ptr: self.scratch_ptr,
+            };
+            self.handle = std::ptr::null_mut();
+            comm
+        }
+    }
+
+    impl Drop for BootHandle {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                unsafe { car::arle_car_destroy_prod(self.handle) };
+            }
+        }
+    }
+
     /// All-ranks ok-vote (4-byte payload — `all_gather_bytes` stages through
     /// an i32 device buffer and requires 4-byte alignment). Returns whether
     /// EVERY rank reported ok — the same verdict on every rank, so degrade
@@ -814,32 +937,27 @@ mod oneshot {
             rank: usize,
         ) -> Result<Option<Self>> {
             // Stage 1: own allocations (local) + vote.
-            let mut sig_ptr = 0u64;
-            let mut sig_handle = [0u8; 64];
-            let mut in_ptr = 0u64;
-            let mut in_handle = [0u8; 64];
-            let alloc_ok = unsafe {
-                check(
-                    car::arle_car_alloc_shared(SIGNAL_BYTES, &mut sig_ptr, sig_handle.as_mut_ptr()),
+            let alloc_ok = (|| -> Result<(SharedRegion, SharedRegion, [u8; 64], [u8; 64])> {
+                let mut sig_handle = [0u8; 64];
+                let mut in_handle = [0u8; 64];
+                let sig_region = SharedRegion::alloc(
+                    SIGNAL_BYTES,
+                    &mut sig_handle,
                     "one-shot signal-region alloc",
-                )
-                .and_then(|()| {
-                    check(
-                        car::arle_car_alloc_shared(
-                            SCRATCH_BYTES,
-                            &mut in_ptr,
-                            in_handle.as_mut_ptr(),
-                        ),
-                        "one-shot scratch alloc",
-                    )
-                })
-            };
+                )?;
+                let in_region =
+                    SharedRegion::alloc(SCRATCH_BYTES, &mut in_handle, "one-shot scratch alloc")?;
+                Ok((sig_region, in_region, sig_handle, in_handle))
+            })();
             if let Err(err) = &alloc_ok {
                 log::warn!("[comm-oneshot] rank {rank}: {err:#}");
             }
             if !vote(ctx, backend, alloc_ok.is_ok())? {
                 return Ok(None);
             }
+            let Ok((mut sig_region, mut in_region, sig_handle, in_handle)) = alloc_ok else {
+                return Ok(None);
+            };
 
             // Stage 2: handle exchange (collective; all ranks reach it).
             let mut payload = [0u8; 128];
@@ -849,60 +967,74 @@ mod oneshot {
             ensure!(all.len() == world * 128, "one-shot handle exchange size");
 
             // Stage 3: open peers + create (local) + vote.
-            let built = (|| -> Result<*mut std::os::raw::c_void> {
+            let scratch_ptr = in_region.ptr();
+            let built = (|| -> Result<BootHandle> {
                 let mut sigs = [0u64; 8];
                 let mut ins = [0u64; 8];
+                let mut peer_sigs = Vec::with_capacity(world.saturating_sub(1));
+                let mut peer_ins = Vec::with_capacity(world.saturating_sub(1));
                 for r in 0..world {
                     if r == rank {
-                        sigs[r] = sig_ptr;
-                        ins[r] = in_ptr;
+                        sigs[r] = sig_region.ptr();
+                        ins[r] = in_region.ptr();
                         continue;
                     }
                     let rec = &all[r * 128..(r + 1) * 128];
-                    unsafe {
-                        check(
-                            car::arle_car_open_peer(rec.as_ptr(), &mut sigs[r]),
-                            "one-shot peer signal open (no-P2P probe)",
-                        )?;
-                        check(
-                            car::arle_car_open_peer(rec[64..].as_ptr(), &mut ins[r]),
-                            "one-shot peer scratch open",
-                        )?;
-                    }
+                    let sig =
+                        PeerMapping::open(&rec[..64], "one-shot peer signal open (no-P2P probe)")?;
+                    sigs[r] = sig.ptr();
+                    peer_sigs.push(sig);
+                    let input = PeerMapping::open(&rec[64..], "one-shot peer scratch open")?;
+                    ins[r] = input.ptr();
+                    peer_ins.push(input);
                 }
                 let handle = unsafe {
                     car::arle_car_create(rank as i32, world as i32, sigs.as_ptr(), ins.as_ptr())
                 };
                 ensure!(!handle.is_null(), "one-shot CustomAllreduce create");
-                Ok(handle)
+                sig_region.disarm();
+                in_region.disarm();
+                for peer in &mut peer_sigs {
+                    peer.disarm();
+                }
+                for peer in &mut peer_ins {
+                    peer.disarm();
+                }
+                Ok(BootHandle {
+                    handle,
+                    scratch_ptr,
+                })
             })();
             if let Err(err) = &built {
-                log::warn!(
-                    "[comm-oneshot] rank {rank}: {err:#} (boot scratch leaked ~1 MB; degrading)"
-                );
+                log::warn!("[comm-oneshot] rank {rank}: {err:#} (degrading)");
             }
             if !vote(ctx, backend, built.is_ok())? {
                 return Ok(None);
             }
-            let comm = Self {
-                handle: built.expect("voted ok"),
-                scratch_ptr: in_ptr,
+            let Ok(boot) = built else {
+                return Ok(None);
             };
 
             // Stage 4: self-test (one-shot vs NCCL on identical inputs +
             // cross-rank digest) + final vote. Catches memory-ordering issues
             // on this driver/HW combo before any production traffic.
-            let tested = comm.self_test(ctx, backend, rank);
+            let tested = boot.self_test(ctx, backend, rank);
             if let Err(err) = &tested {
                 log::warn!("[comm-oneshot] rank {rank} self-test failed: {err:#}");
             }
             if !vote(ctx, backend, tested.is_ok())? {
                 return Ok(None);
             }
-            Ok(Some(comm))
+            Ok(Some(boot.into_comm()))
         }
 
-        fn self_test(&self, ctx: &DeviceContext, backend: &NcclBackend, rank: usize) -> Result<()> {
+        fn self_test_handle(
+            handle: *mut c_void,
+            scratch_ptr: u64,
+            ctx: &DeviceContext,
+            backend: &NcclBackend,
+            rank: usize,
+        ) -> Result<()> {
             use cuda_kernels::collective::{CollectiveBackend, DType, ReduceOp};
             use cudarc::driver::DevicePtrMut;
 
@@ -913,7 +1045,7 @@ mod oneshot {
                 unsafe {
                     car::arle_car_fill_bf16(
                         stream.cu_stream(),
-                        self.scratch_ptr,
+                        scratch_ptr,
                         ELEMS as i32,
                         rank as i32,
                     )
@@ -928,7 +1060,7 @@ mod oneshot {
                 check(
                     unsafe {
                         car::arle_car_allreduce_bf16_into(
-                            self.handle,
+                            handle,
                             stream.cu_stream(),
                             got_ptr,
                             ELEMS as i32,

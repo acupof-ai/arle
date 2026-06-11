@@ -1,8 +1,8 @@
 # GPU Profiling Guide
 
-> **TL;DR:** For benchmarking, use `bench_serving --help`. For profiling, capture a trace with `nsys` and analyze with `nsys stats`. This document covers pitfalls and diagnostic paths, not CLI reference.
+> **TL;DR:** For benchmarking, use `scripts/bench_guidellm.sh --help`. For profiling, start `arle serve` and capture with `scripts/profile_nsys_guidellm.sh`. This document covers pitfalls and diagnostic paths, not CLI reference.
 >
-> **Status:** Active.
+> **Status:** Current for the rewrite stack (`arle serve`). Historical examples that used the deleted legacy benchmark binary were removed.
 
 ## Prerequisites
 
@@ -11,16 +11,22 @@
 
 ## Capturing a Trace
 
-One command:
+Start the server, then attach a profiling load:
 
 ```bash
-# Example: capture a trace for 1024 prompt + 256 decode, export sqlite directly
-nsys profile --force-overwrite=true --cuda-graph-trace=node \
-  --export=sqlite -o target/profiling/trace \
-  cargo run -r --bin bench_serving -- request --prompt-len 1024 --output-len 256
+# Terminal 1
+./target/release/arle serve --backend cuda --model-path /path/to/model --port 8000
+
+# Terminal 2
+scripts/profile_nsys_guidellm.sh cuda-local \
+  --target http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-4B \
+  --fast \
+  --delay-seconds 8 \
+  --duration-seconds 12
 ```
 
-Produces `target/profiling/trace.nsys-rep` + `target/profiling/trace.sqlite`. The sqlite file can be analyzed directly with `nsys stats` — no secondary conversion needed.
+Produces `bench-output/<date>-cuda-local-profile-nsys/trace.nsys-rep` + `trace.sqlite`. The sqlite file can be analyzed directly with `nsys stats` — no secondary conversion needed.
 
 ### Key Flags
 
@@ -82,26 +88,34 @@ Normal pattern: `cuMemcpyHtoDAsync` is dominated by model loading (one-time). Du
 Two profiles isolate prefill and decode paths for per-model optimization.
 
 ```bash
-# Prefill-heavy: TTFT dominates, decode negligible
-cargo run -r --bin bench_serving -- request --prompt-len 2048 --output-len 1
+# Canonical latency / throughput sweep against a running arle server
+scripts/bench_guidellm.sh cuda-local --target http://127.0.0.1:8000
 
-# Decode-heavy: TPOT dominates, prefill negligible
-cargo run -r --bin bench_serving -- request --prompt-len 1 --output-len 128
+# Fast profiling anchor: 4096 input tokens + 256 output tokens at c=16
+scripts/bench_guidellm.sh cuda-local --target http://127.0.0.1:8000 --fast
+
+# Quick concurrency curve: c=1,2,4,8 with 512 input + 128 output tokens
+scripts/bench_guidellm.sh cuda-local --target http://127.0.0.1:8000 --quick
 ```
 
 ## Diagnosing Decode Degradation With Sequence Length
 
-If `bench_serving curve` shows TPOT degrading significantly as context grows, use comparative traces to pinpoint the offending kernel:
+If GuideLLM or service stats show TPOT degrading significantly as context grows, use comparative traces to pinpoint the offending kernel:
 
 ```bash
-# Fix output tokens, vary only prompt length
-nsys profile --force-overwrite=true --cuda-graph-trace=node \
-  --export=sqlite -o target/profiling/ctx_short \
-  cargo run -r --bin bench_serving -- request --prompt-len 1 --output-len 128 --warmup 1 --iters 1
+# Short-context trace
+scripts/profile_nsys_guidellm.sh cuda-ctx-short \
+  --target http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-4B \
+  --quick \
+  --delay-seconds 8 \
+  --duration-seconds 12
 
-nsys profile --force-overwrite=true --cuda-graph-trace=node \
-  --export=sqlite -o target/profiling/ctx_long \
-  cargo run -r --bin bench_serving -- request --prompt-len 2048 --output-len 128 --warmup 1 --iters 1
+# Long-context trace
+scripts/profile_nsys_guidellm.sh cuda-ctx-long \
+  --target http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-4B \
+  --bench bench-output/<existing-longctx-bench>
 ```
 
 Compare the two `cuda_gpu_kern_sum` reports — the kernel with the largest avg time increase is the culprit.
