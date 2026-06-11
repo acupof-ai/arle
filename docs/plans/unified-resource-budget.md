@@ -62,18 +62,31 @@ Backend-specific (stays put — genuinely not shared):
 
 ## Phased landing (small committed tranches, bench/wins each)
 
-- **Phase B (this tranche):** add `infer-seam/src/resource.rs` (pure kernel +
-  unit tests). Refactor Metal `plan_resource_budget` to route its `−fixed` and
-  `clamp` through the kernel. Gate = **byte-identical plan numbers** (A/B same
-  `describe()` output). Smallest, safest, has a clean gate.
-- **Phase C1:** DSv4 `kv_budget_num_slots` routes through the kernel; add the
-  reject-below-fixed guard; NCCL min-reduce stays CUDA-side. Gate = same
-  affordable count on the pod (budget log unchanged).
-- **Phase C2:** Qwen3.5 (+ Qwen3 dense) CUDA gains the clamp via the kernel —
-  the real bug fix. Gate = boots at a max_seq_len that previously OOM'd.
-- **Phase C3:** kv_tier.rs derives T1/T2 from system RAM + free disk via
-  `split_host_tiers`; CLI opt-out preserved. Gate = default budget on a known
-  machine matches/improves the old constants, documented.
+- **Phase B ✅ (`15ec44cd`):** added `infer-seam/src/resource.rs` (pure kernel +
+  10 unit tests). Shipped behavior-neutral (no consumers wired yet). The Metal
+  `plan_resource_budget` re-route is split out as **B′ (optional, deferred)** —
+  Metal is already top-down-correct; routing it through the kernel is pure
+  convergence with a byte-identical gate, not a fix, so it follows the bug-fix
+  tranches.
+- **Phase C1 ✅ (`a23336eb`):** DSv4 `kv_budget_num_slots` routes through the
+  kernel. **Byte-identical** (`from_free` reproduces `floor(free×0.9)−Σfixed`;
+  the two saturating_subs fold, proven in a unit test). NCCL min-reduce stays
+  CUDA-side. Budget log unchanged. Pod re-confirm = pending-remote.
+- **Phase C2 ✅ (`c7fe1aea`):** Qwen3.5/3.6 CUDA gains the clamp it lacked — the
+  real bug fix — via `Qwen35Model::kv_budget_num_slots` (per-slot bytes mirror
+  `new_slot_state`) + the same kernel + NCCL min-reduce, wired in the executor
+  constructor. Strictly safer (no-op when `requested ≤ affordable`). Dense
+  Qwen3 out of scope (global `PagedKVPool`, no slot-multiplied OOM). GPU
+  boot-at-previously-OOMing-shape gate = pending-remote.
+- **Phase C3 ✅ (`5353f17f`):** `kv_tier.rs` derives T1/T2 from system RAM
+  (`/proc/meminfo`, dep-free) + free disk (`statvfs`, libc/unix) via
+  `split_host_tiers`; CLI opt-out preserved. Caps == old constants, so an ample
+  host (the pod) is byte-identical and a constrained one scales down; probe miss
+  → cap. 7/7 kv_tier tests (incl. new probe tests).
+
+**Convergence reached:** VRAM (C1+C2) and host RAM/SSD (C3) all flow through the
+one neutral infer-seam kernel. Only B′ (Metal re-route) remains, and it is
+optional polish, not a correctness gap.
 
 Each phase: `cargo test --workspace` + clippy clean + wins/ entry (or
 `pending-remote` for pod-only). No default-flip without a wall-clock license
