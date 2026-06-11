@@ -21,6 +21,17 @@ pub enum KVFormat {
         key_bits: u8,
         val_bits: u8,
     },
+    /// Opaque packed single-plane record format (MLA-style latent KV): one
+    /// `bytes_per_token` record per token, stored in the K plane only — no V
+    /// plane and no separate scale/norm buffers (everything is embedded in
+    /// the record). Canonical DSv4 use: 584 B = 448 B FP8 NoPE + 64×2 B BF16
+    /// RoPE + 8 B e8m0 scale. `num_kv_heads` must be 1 (the latent record is
+    /// head-less) and sizing routes through `bytes_per_token`, never
+    /// `bytes_per_element`. Per-head attention/quant kernels do not consume
+    /// it; its consumers (FlashMLA block-table paths) arrive in P2.
+    PackedBytes {
+        bytes_per_token: usize,
+    },
 }
 
 impl KVFormat {
@@ -53,6 +64,14 @@ impl KVFormat {
                 val_bits: 4,
             } => 12,
             Self::TurboQuant { .. } => return None,
+            // Canonical DSv4 MLA latent record (448 B FP8 NoPE + 64×2 B BF16
+            // RoPE + 8 B e8m0 scale). Other record widths get their own tag
+            // when a production shape ships — same policy as TurboQuant
+            // bit-pairs above.
+            Self::PackedBytes {
+                bytes_per_token: 584,
+            } => 13,
+            Self::PackedBytes { .. } => return None,
         };
         Some(tag)
     }
@@ -62,6 +81,8 @@ impl KVFormat {
             Self::BF16 => 16,
             Self::FP8E4M3 | Self::INT8 | Self::INT4 => 16,
             Self::TurboQuant { .. } => 1,
+            // FlashMLA block size — block-table entries are 64-token pages.
+            Self::PackedBytes { .. } => 64,
         }
     }
 
@@ -77,6 +98,22 @@ impl KVFormat {
                 let effective = if key_bits == 3 { 4 } else { key_bits as usize };
                 effective.div_ceil(8)
             }
+            // Per-(kv_dim)-element sizing is meaningless for an opaque packed
+            // record; every sizing path must route through
+            // `packed_record_bytes_per_token` instead.
+            Self::PackedBytes { .. } => {
+                panic!("KVFormat::PackedBytes sizes via bytes_per_token, not bytes_per_element")
+            }
+        }
+    }
+
+    /// `Some(record bytes)` for the packed single-plane record format,
+    /// `None` for every per-head format. Sizing paths use this to bypass
+    /// `kv_dim`-based math for packed records.
+    pub fn packed_record_bytes_per_token(self) -> Option<usize> {
+        match self {
+            Self::PackedBytes { bytes_per_token } => Some(bytes_per_token),
+            _ => None,
         }
     }
 
@@ -89,7 +126,10 @@ impl KVFormat {
     }
 
     pub fn needs_work_buffer(self) -> bool {
-        !matches!(self, Self::BF16)
+        // PackedBytes records are written directly by their producer — no
+        // bf16 staging buffer (the P2 FlashMLA pack path writes the packed
+        // record in one shot).
+        !matches!(self, Self::BF16 | Self::PackedBytes { .. })
     }
 
     pub fn is_turboquant(self) -> bool {
@@ -110,6 +150,11 @@ impl KVFormat {
                 let packed = crate::turboquant_state::packed_bytes_per_head(head_dim, key_bits);
                 packed + 2
             }
+            // PackedBytes is the MLA latent record format; per-kv-head pool
+            // sizing does not apply to it (P2 brings the FlashMLA consumer).
+            Self::PackedBytes { .. } => panic!(
+                "KVFormat::PackedBytes sizes via bytes_per_token, not pool_bytes_per_kv_head"
+            ),
         }
     }
 }
@@ -147,6 +192,52 @@ mod tests {
             .stable_tag(),
             Some(12),
         );
+    }
+
+    #[test]
+    fn packed_bytes_is_a_single_plane_record_format() {
+        let fmt = KVFormat::PackedBytes {
+            bytes_per_token: 584,
+        };
+        // FlashMLA block size.
+        assert_eq!(fmt.default_page_size(), 64);
+        // Scales / norms / RoPE halves are embedded in the record.
+        assert!(!fmt.has_scales());
+        assert!(!fmt.has_norms());
+        assert!(!fmt.needs_work_buffer());
+        assert!(!fmt.is_turboquant());
+        assert_eq!(fmt.packed_record_bytes_per_token(), Some(584));
+        assert_eq!(KVFormat::BF16.packed_record_bytes_per_token(), None);
+    }
+
+    #[test]
+    fn packed_bytes_stable_tag_is_fixed_for_the_canonical_dsv4_record() {
+        assert_eq!(
+            KVFormat::PackedBytes {
+                bytes_per_token: 584,
+            }
+            .stable_tag(),
+            Some(13),
+        );
+        // Non-canonical record widths fail fast instead of stamping a
+        // collision-prone tag onto disk — same policy as TurboQuant
+        // bit-pairs.
+        assert_eq!(
+            KVFormat::PackedBytes {
+                bytes_per_token: 600,
+            }
+            .stable_tag(),
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bytes_per_token, not bytes_per_element")]
+    fn packed_bytes_has_no_per_element_size() {
+        let _ = KVFormat::PackedBytes {
+            bytes_per_token: 584,
+        }
+        .bytes_per_element();
     }
 
     #[test]

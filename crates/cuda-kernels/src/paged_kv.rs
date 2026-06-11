@@ -8,7 +8,9 @@
 //!
 //! BF16 / INT8 / FP8 E4M3 now all use `page_size = 16`. TurboQuant remains
 //! token-granular (`page_size = 1`) until its decode and migration kernels are
-//! rewritten around paged layout.
+//! rewritten around paged layout. `PackedBytes` (MLA latent records) uses
+//! `page_size = 64` — the FlashMLA block size — and stores one opaque
+//! `bytes_per_token` record per token in the K plane only.
 
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr};
@@ -27,6 +29,8 @@ use crate::turboquant_state::TurboQuantLayerState;
 /// - `BF16`: `k_data`/`v_data` are `CudaSlice<u8>` holding bf16 (2 bytes/elem)
 /// - `FP8E4M3`: `k_data`/`v_data` hold FP8 E4M3 (1 byte/elem), + `k_scales`/`v_scales`
 /// - `INT8`: `k_data`/`v_data` hold int8 (1 byte/elem), + `k_scales`/`v_scales`
+/// - `PackedBytes`: `k_data` holds one opaque `bytes_per_token` record per
+///   token (MLA latent); `v_data` and all scale/norm buffers stay empty
 ///
 /// For FP8/INT8, a shared bf16 working buffer (1 layer) is used as the write
 /// target for `decode_prep_paged`, which outputs bf16. After the prep kernel,
@@ -150,7 +154,6 @@ fn compute_budget_breakdown(
     format: KVFormat,
 ) -> BudgetBreakdown {
     let kv_dim = num_kv_heads * head_dim;
-    let bpe = format.bytes_per_element();
     let scale_bytes_per_token = if format.has_scales() {
         num_kv_heads * 4 * 2 // f32 per-head, K+V
     } else {
@@ -161,7 +164,11 @@ fn compute_budget_breakdown(
     } else {
         0
     };
-    let data_bytes_per_token = kv_dim * bpe * 2; // K+V
+    let data_bytes_per_token = match format.packed_record_bytes_per_token() {
+        // Single packed plane (K only) — the MLA latent record has no V plane.
+        Some(record_bytes) => record_bytes,
+        None => kv_dim * format.bytes_per_element() * 2, // K+V
+    };
     let storage_bytes_per_token =
         (data_bytes_per_token + scale_bytes_per_token + norm_bytes_per_token) * num_layers;
     let work_bytes_per_token = if format.needs_work_buffer() {
@@ -182,6 +189,23 @@ fn compute_budget_breakdown(
     }
 }
 
+/// Host-side shape validation shared by pool construction (kept free-standing
+/// so the no-GPU unit tests can exercise it without a `DeviceContext`).
+fn validate_format_shape(format: KVFormat, num_kv_heads: usize) -> Result<()> {
+    if let KVFormat::PackedBytes { bytes_per_token } = format {
+        ensure!(
+            num_kv_heads == 1,
+            "KVFormat::PackedBytes requires num_kv_heads == 1 (the MLA latent record is \
+             head-less), got {num_kv_heads}"
+        );
+        ensure!(
+            bytes_per_token > 0,
+            "KVFormat::PackedBytes requires bytes_per_token > 0"
+        );
+    }
+    Ok(())
+}
+
 impl TokenKVPool {
     /// Return the budget bytes needed to allocate at least `token_count` logical
     /// tokens for this pool shape and format.
@@ -198,7 +222,11 @@ impl TokenKVPool {
     }
 
     fn storage_bytes_per_token(&self) -> usize {
-        let data_bytes = self.kv_dim * self.format.bytes_per_element() * 2;
+        let data_bytes = match self.format.packed_record_bytes_per_token() {
+            // Single packed plane (K only) — no V plane for packed records.
+            Some(record_bytes) => record_bytes,
+            None => self.kv_dim * self.format.bytes_per_element() * 2,
+        };
         let scale_bytes = if self.format.has_scales() {
             self.num_kv_heads * std::mem::size_of::<f32>() * 2
         } else {
@@ -220,6 +248,21 @@ impl TokenKVPool {
     /// payload unit `copy_pages_to_host`/`copy_pages_from_host` move.
     pub fn storage_bytes_per_page(&self) -> usize {
         self.storage_bytes_for_tokens(self.page_size)
+    }
+
+    /// Whether this pool stores one packed record per token in the K plane
+    /// only (`v_data` and all scale/norm buffers are empty).
+    fn is_single_plane(&self) -> bool {
+        self.format.packed_record_bytes_per_token().is_some()
+    }
+
+    /// Bytes of one page in a single data plane (K or V; packed-record
+    /// formats store everything in the K plane).
+    fn data_plane_bytes_per_page(&self) -> usize {
+        match self.format.packed_record_bytes_per_token() {
+            Some(record_bytes) => self.page_size * record_bytes,
+            None => self.page_size * self.kv_dim * self.format.bytes_per_element(),
+        }
     }
 
     fn slot_hot_tail_len(&self, slot: usize) -> usize {
@@ -335,8 +378,8 @@ impl TokenKVPool {
         budget_bytes: usize,
         format: KVFormat,
     ) -> Result<Self> {
+        validate_format_shape(format, num_kv_heads)?;
         let kv_dim = num_kv_heads * head_dim;
-        let bpe = format.bytes_per_element();
         let page_size = format.default_page_size();
         let budget = compute_budget_breakdown(
             num_layers,
@@ -364,12 +407,14 @@ impl TokenKVPool {
         );
 
         // INT4 packs 2 nibbles per byte → kv_dim/2 actual bytes per token.
-        // Other formats: kv_dim * bpe bytes per token.
-        let pool_bytes_per_layer = if matches!(format, KVFormat::INT4) {
-            max_total_tokens * kv_dim.div_ceil(2)
-        } else {
-            max_total_tokens * kv_dim * bpe
+        // PackedBytes stores one opaque record per token (K plane only).
+        // Other formats: kv_dim * bytes_per_element bytes per token.
+        let pool_bytes_per_layer = match format {
+            KVFormat::INT4 => max_total_tokens * kv_dim.div_ceil(2),
+            KVFormat::PackedBytes { bytes_per_token } => max_total_tokens * bytes_per_token,
+            _ => max_total_tokens * kv_dim * format.bytes_per_element(),
         };
+        let single_plane = format.packed_record_bytes_per_token().is_some();
         let scale_elements = max_total_tokens * num_kv_heads;
 
         let mut k_data = Vec::new();
@@ -382,18 +427,21 @@ impl TokenKVPool {
         let mut v_work = None;
 
         if pool_bytes_per_layer > 0 {
-            // Data buffers (all formats)
+            // Data buffers. Packed-record formats are single-plane: the
+            // whole record lives in `k_data`, `v_data` stays empty.
             for _ in 0..num_layers {
                 k_data.push(
                     ctx.stream
                         .alloc_zeros::<u8>(pool_bytes_per_layer)
                         .map_err(|e| anyhow!("TokenKVPool K data alloc failed: {e}"))?,
                 );
-                v_data.push(
-                    ctx.stream
-                        .alloc_zeros::<u8>(pool_bytes_per_layer)
-                        .map_err(|e| anyhow!("TokenKVPool V data alloc failed: {e}"))?,
-                );
+                if !single_plane {
+                    v_data.push(
+                        ctx.stream
+                            .alloc_zeros::<u8>(pool_bytes_per_layer)
+                            .map_err(|e| anyhow!("TokenKVPool V data alloc failed: {e}"))?,
+                    );
+                }
             }
 
             // Scale buffers (FP8/INT8)
@@ -445,7 +493,7 @@ impl TokenKVPool {
 
             info!(
                 "TokenKVPool {format:?}: data={:.1}MB/layer scales={:.1}MB/layer working={:.1}MB",
-                (pool_bytes_per_layer * 2) as f64 / 1e6,
+                (pool_bytes_per_layer * if single_plane { 1 } else { 2 }) as f64 / 1e6,
                 if format.has_scales() {
                     (scale_elements * 4 * 2) as f64 / 1e6
                 } else {
@@ -530,9 +578,11 @@ impl TokenKVPool {
 
         // Legacy dtype mapping. INT4 falls back to BF16 contig (PoC has no
         // contig INT4 storage; prefill stages K/V in bf16 work buffer then
-        // packs to INT4 in the pool).
+        // packs to INT4 in the pool). PackedBytes carries no per-head quant
+        // dispatch — BF16 is the inert legacy mapping (P2's FlashMLA
+        // consumer reads the packed record directly, never this field).
         let dtype = match format {
-            KVFormat::BF16 | KVFormat::INT4 => KVCacheDtype::BF16,
+            KVFormat::BF16 | KVFormat::INT4 | KVFormat::PackedBytes { .. } => KVCacheDtype::BF16,
             KVFormat::FP8E4M3 | KVFormat::INT8 | KVFormat::TurboQuant { .. } => KVCacheDtype::INT8,
         };
 
@@ -738,7 +788,8 @@ impl TokenKVPool {
     pub fn copy_pages_to_host(&self, ctx: &DeviceContext, pages: &[u32]) -> Result<Vec<u8>> {
         #[cfg(feature = "cuda")]
         {
-            let token_bytes = self.page_size * self.kv_dim * self.format.bytes_per_element();
+            let token_bytes = self.data_plane_bytes_per_page();
+            let single_plane = self.is_single_plane();
             let scale_len = self.page_size * self.num_kv_heads;
             let mut out = Vec::with_capacity(pages.len() * self.storage_bytes_per_page());
 
@@ -755,11 +806,15 @@ impl TokenKVPool {
                             .clone_dtoh(&self.k_data[layer].slice(data_start..data_end))
                             .map_err(|e| anyhow!("paged_kv copy K page dtoh failed: {e}"))?,
                     );
-                    out.extend_from_slice(
-                        &ctx.stream
-                            .clone_dtoh(&self.v_data[layer].slice(data_start..data_end))
-                            .map_err(|e| anyhow!("paged_kv copy V page dtoh failed: {e}"))?,
-                    );
+                    // Packed records have no V plane (scale/norm branches
+                    // below skip themselves via has_scales/has_norms).
+                    if !single_plane {
+                        out.extend_from_slice(
+                            &ctx.stream
+                                .clone_dtoh(&self.v_data[layer].slice(data_start..data_end))
+                                .map_err(|e| anyhow!("paged_kv copy V page dtoh failed: {e}"))?,
+                        );
+                    }
 
                     if self.format.has_scales() {
                         for value in ctx
@@ -818,7 +873,8 @@ impl TokenKVPool {
     ) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
-            let token_bytes = self.page_size * self.kv_dim * self.format.bytes_per_element();
+            let token_bytes = self.data_plane_bytes_per_page();
+            let single_plane = self.is_single_plane();
             let scale_len = self.page_size * self.num_kv_heads;
             let expected_len = pages.len() * self.storage_bytes_per_page();
             if payload.len() != expected_len {
@@ -844,11 +900,15 @@ impl TokenKVPool {
                         .map_err(|e| anyhow!("paged_kv copy K page htod failed: {e}"))?;
                     cursor += token_bytes;
 
-                    let mut v_view = self.v_data[layer].slice_mut(data_start..data_end);
-                    ctx.stream
-                        .memcpy_htod(&payload[cursor..cursor + token_bytes], &mut v_view)
-                        .map_err(|e| anyhow!("paged_kv copy V page htod failed: {e}"))?;
-                    cursor += token_bytes;
+                    // Packed records have no V plane (scale/norm branches
+                    // below skip themselves via has_scales/has_norms).
+                    if !single_plane {
+                        let mut v_view = self.v_data[layer].slice_mut(data_start..data_end);
+                        ctx.stream
+                            .memcpy_htod(&payload[cursor..cursor + token_bytes], &mut v_view)
+                            .map_err(|e| anyhow!("paged_kv copy V page htod failed: {e}"))?;
+                        cursor += token_bytes;
+                    }
 
                     if self.format.has_scales() {
                         let mut k_scales = Vec::with_capacity(scale_len);
@@ -1061,15 +1121,17 @@ impl TokenKVPool {
 
         let src_pages_gpu = self.upload_page_indices(ctx, src_pages)?;
         let dst_pages_gpu = self.upload_page_indices(ctx, dst_pages)?;
-        let token_bytes = self.page_size * self.kv_dim * self.format.bytes_per_element();
+        let token_bytes = self.data_plane_bytes_per_page();
         let scale_len = self.page_size * self.num_kv_heads;
 
+        // Packed records have no V plane — transfer the K plane only.
+        let v_layers = (!self.is_single_plane()).then_some(self.v_data.as_slice());
         self.transfer_layer_table_pair(
             ctx,
             &self.k_data,
             &self.k_data,
-            Some(&self.v_data),
-            Some(&self.v_data),
+            v_layers,
+            v_layers,
             &src_pages_gpu,
             &dst_pages_gpu,
             src_pages.len(),
@@ -1685,6 +1747,13 @@ impl TokenKVPool {
         k_dst_ptr: impl Fn(usize) -> u64,
         v_dst_ptr: impl Fn(usize) -> u64,
     ) -> Result<()> {
+        // PackedBytes is the MLA latent record format; per-head KV migration
+        // kernels do not consume it (P2 brings the FlashMLA pack path).
+        ensure!(
+            !self.is_single_plane(),
+            "paged_kv bf16 migration does not support packed-record formats ({:?})",
+            self.format
+        );
         if token_count == 0 || self.k_data.is_empty() {
             return Ok(());
         }
@@ -1779,6 +1848,13 @@ impl TokenKVPool {
         start_pos: usize,
         new_token_indices: &[u32],
     ) -> Result<()> {
+        // PackedBytes is the MLA latent record format; per-head KV migration
+        // kernels do not consume it (P2 brings the FlashMLA pack path).
+        ensure!(
+            !self.is_single_plane(),
+            "paged_kv int8 migration does not support packed-record formats ({:?})",
+            self.format
+        );
         let token_count = new_token_indices.len();
         if token_count == 0 || self.k_data.is_empty() {
             return Ok(());
@@ -1859,6 +1935,13 @@ impl TokenKVPool {
         start_pos: usize,
         new_token_indices: &[u32],
     ) -> Result<()> {
+        // PackedBytes is the MLA latent record format; per-head KV migration
+        // kernels do not consume it (P2 brings the FlashMLA pack path).
+        ensure!(
+            !self.is_single_plane(),
+            "paged_kv fp8 migration does not support packed-record formats ({:?})",
+            self.format
+        );
         let token_count = new_token_indices.len();
         if token_count == 0 || self.k_data.is_empty() {
             return Ok(());
@@ -1925,6 +2008,13 @@ impl TokenKVPool {
         start_pos: usize,
         new_token_indices: &[u32],
     ) -> Result<()> {
+        // PackedBytes is the MLA latent record format; per-head KV migration
+        // kernels do not consume it (P2 brings the FlashMLA pack path).
+        ensure!(
+            !self.is_single_plane(),
+            "paged_kv turboquant migration does not support packed-record formats ({:?})",
+            self.format
+        );
         let token_count = new_token_indices.len();
         if token_count == 0 || self.k_data.is_empty() {
             return Ok(());
@@ -2004,7 +2094,7 @@ pub const DEFAULT_PAGE_SIZE: usize = 16;
 
 #[cfg(test)]
 mod tests {
-    use super::{BudgetBreakdown, TokenKVPool, compute_budget_breakdown};
+    use super::{BudgetBreakdown, TokenKVPool, compute_budget_breakdown, validate_format_shape};
     use crate::KVFormat;
 
     #[test]
@@ -2043,6 +2133,76 @@ mod tests {
         let budget = compute_budget_breakdown(43, 1, 512, 1, required, KVFormat::FP8E4M3);
         assert!(budget.max_total_tokens >= tokens);
         assert_eq!(required, tokens * budget.total_bytes_per_token);
+    }
+
+    /// Canonical DSv4 MLA latent record: 584 B = 448 B FP8 NoPE + 64×2 B
+    /// BF16 RoPE + 8 B e8m0 scale.
+    const DSV4_RECORD_BYTES: usize = 584;
+
+    fn dsv4_packed_format() -> KVFormat {
+        KVFormat::PackedBytes {
+            bytes_per_token: DSV4_RECORD_BYTES,
+        }
+    }
+
+    #[test]
+    fn packed_bytes_budget_is_layers_times_record_bytes() {
+        // Single packed plane: no V term, no scale/norm term, no work
+        // buffer, and no kv_dim/head_dim factor — head_dim is deliberately
+        // a nonsense value to prove it does not leak into sizing.
+        let num_layers = 61;
+        let budget =
+            compute_budget_breakdown(num_layers, 1, 12345, 4, 16_384, dsv4_packed_format());
+        assert_eq!(
+            budget.storage_bytes_per_token,
+            num_layers * DSV4_RECORD_BYTES
+        );
+        assert_eq!(budget.work_bytes_per_token, 0);
+        assert_eq!(budget.total_bytes_per_token, num_layers * DSV4_RECORD_BYTES);
+    }
+
+    #[test]
+    fn packed_bytes_explicit_token_budget_matches_pool_accounting() {
+        let tokens = 256;
+        let num_layers = 61;
+        let required =
+            TokenKVPool::budget_bytes_for_tokens(num_layers, 1, 576, tokens, dsv4_packed_format());
+        assert_eq!(required, tokens * num_layers * DSV4_RECORD_BYTES);
+        let budget =
+            compute_budget_breakdown(num_layers, 1, 576, 1, required, dsv4_packed_format());
+        assert!(budget.max_total_tokens >= tokens);
+    }
+
+    #[test]
+    fn packed_bytes_page_image_is_page64_times_record_bytes() {
+        // The per-page host image (the unit copy_pages_to_host/from_host
+        // move) is page_size × bytes_per_token × layers — K plane only.
+        let num_layers = 2;
+        let budget = compute_budget_breakdown(num_layers, 1, 576, 1, 1 << 20, dsv4_packed_format());
+        let page_size = dsv4_packed_format().default_page_size();
+        assert_eq!(page_size, 64);
+        assert_eq!(
+            budget.storage_bytes_per_token * page_size,
+            num_layers * 64 * DSV4_RECORD_BYTES
+        );
+    }
+
+    #[test]
+    fn packed_bytes_requires_single_kv_head() {
+        assert!(validate_format_shape(dsv4_packed_format(), 1).is_ok());
+        let err = validate_format_shape(dsv4_packed_format(), 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("num_kv_heads == 1"), "unexpected error: {err}");
+        let err = validate_format_shape(KVFormat::PackedBytes { bytes_per_token: 0 }, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("bytes_per_token > 0"),
+            "unexpected error: {err}"
+        );
+        // Per-head formats keep arbitrary head counts.
+        assert!(validate_format_shape(KVFormat::BF16, 8).is_ok());
     }
 
     #[cfg(feature = "cuda")]
@@ -2225,6 +2385,21 @@ mod tests {
             }
             self.page_indices[slot].extend_from_slice(pages);
             self.seq_lens[slot] = token_count;
+        }
+
+        /// Mirrors `TokenKVPool::mirror_slot` (host-authoritative page table
+        /// lowering): exact page coverage, superset fast path, divergent
+        /// table replacement. Mirror mode bypasses attach counts.
+        fn mirror_slot(&mut self, slot: usize, pages: &[u32], seq_len: usize) {
+            assert_eq!(pages.len(), seq_len.div_ceil(self.page_size));
+            let dst = &mut self.page_indices[slot];
+            if pages.len() >= dst.len() && pages[..dst.len()] == dst[..] {
+                dst.extend_from_slice(&pages[dst.len()..]);
+            } else {
+                dst.clear();
+                dst.extend_from_slice(pages);
+            }
+            self.seq_lens[slot] = seq_len;
         }
 
         fn retain(&mut self, pages: &[u32]) {
@@ -2670,5 +2845,128 @@ mod tests {
         let next_hot_tail = pool.alloc_tokens(0, 1);
         assert_eq!(next_hot_tail.len(), 1);
         assert_eq!(pool.page_indices[0], vec![private_tail, next_hot_tail[0]]);
+    }
+
+    // ------------------------------------------------------------------
+    // PackedBytes (P1) — bookkeeping at the FlashMLA block size (64) is
+    // byte-for-byte the BF16 bookkeeping; only the storage sizing and the
+    // missing V plane differ. These tests pin the page-64 arithmetic the
+    // P2 DSv4 wiring will lean on.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn packed_page64_alloc_reuses_tail_before_grabbing_a_new_page() {
+        let page_size = dsv4_packed_format().default_page_size();
+        let mut pool = MockPool::new(4, 1, page_size);
+        let first = pool.alloc_tokens(0, 32);
+        let second = pool.alloc_tokens(0, 16);
+        let third = pool.alloc_tokens(0, 20);
+
+        assert_eq!(first, vec![0]);
+        assert!(
+            second.is_empty(),
+            "tail room should satisfy the second alloc"
+        );
+        assert_eq!(third, vec![1], "68 tokens spill into a second page");
+        assert_eq!(pool.page_indices[0], vec![0, 1]);
+        assert_eq!(pool.seq_lens[0], 68);
+        assert_eq!(pool.slot_last_page_len(0), 4);
+        assert_eq!(pool.token_rows_for_range(0, 62, 4), vec![62, 63, 64, 65]);
+    }
+
+    #[test]
+    fn packed_page64_retain_release_attach_cycle_matches_bf16_behavior() {
+        let mut pool = MockPool::new(4, 2, 64);
+        let pages = pool.alloc_tokens(0, 128); // 2 full pages
+        assert_eq!(pages.len(), 2);
+
+        pool.retain(&pages);
+        pool.free_slot(0);
+        assert_eq!(pool.slot_epochs[0], 1);
+        assert_eq!(pool.free_pages.len(), 2, "both pages pinned in limbo");
+
+        pool.attach_pages(1, &pages, 128);
+        assert_eq!(pool.page_indices[1], pages);
+        assert!(!pool.cow_tail_page_for_append(1), "full pages stay sealed");
+
+        pool.free_slot(1);
+        let freed = pool.release(&pages);
+        assert_eq!(freed.len(), 2);
+        assert_eq!(pool.free_pages.len(), 4, "every page back in the free pool");
+        assert_eq!(pool.retained_count(), 0);
+    }
+
+    #[test]
+    fn packed_page64_mirror_slot_extends_superset_and_replaces_divergent_tables() {
+        let mut pool = MockPool::new(8, 1, 64);
+
+        pool.mirror_slot(0, &[3, 1], 100);
+        assert_eq!(pool.page_indices[0], vec![3, 1]);
+        assert_eq!(pool.seq_lens[0], 100);
+        assert_eq!(pool.slot_last_page_len(0), 36);
+
+        // Superset fast path: steady decode extends the same table.
+        pool.mirror_slot(0, &[3, 1, 7], 130);
+        assert_eq!(pool.page_indices[0], vec![3, 1, 7]);
+        assert_eq!(pool.slot_last_page_len(0), 2);
+
+        // Divergent host view replaces the table wholesale.
+        pool.mirror_slot(0, &[2], 64);
+        assert_eq!(pool.page_indices[0], vec![2]);
+        assert_eq!(pool.seq_lens[0], 64);
+        assert_eq!(pool.slot_last_page_len(0), 64);
+    }
+
+    /// Device-only: PackedBytes pool construction + single-plane page copy
+    /// round trip (typecheck-only on Mac; runs on the pod).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_transfer_copies_packed_record_page_payload() {
+        use super::TokenKVPool;
+        use crate::tensor::DeviceContext;
+
+        let ctx = DeviceContext::new().expect("CUDA context");
+        let num_layers = 2;
+        let format = dsv4_packed_format();
+        let page_size = format.default_page_size();
+        let plane_bytes = page_size * DSV4_RECORD_BYTES;
+        let storage_bytes_per_page = num_layers * plane_bytes;
+        let mut pool = TokenKVPool::with_format(
+            &ctx,
+            num_layers,
+            1,
+            576,
+            1,
+            storage_bytes_per_page * 4,
+            format,
+        )
+        .expect("pool");
+
+        assert_eq!(pool.page_size, 64);
+        assert_eq!(pool.storage_bytes_per_page(), storage_bytes_per_page);
+        assert!(pool.v_data.is_empty(), "PackedBytes is single-plane");
+        assert!(pool.k_scales.is_empty() && pool.v_scales.is_empty());
+        assert!(pool.k_norms.is_empty() && pool.v_norms.is_empty());
+        assert!(pool.k_work.is_none() && pool.v_work.is_none());
+
+        // kv_heads != 1 must be rejected at construction.
+        assert!(
+            TokenKVPool::with_format(&ctx, num_layers, 2, 576, 1, storage_bytes_per_page, format)
+                .is_err()
+        );
+
+        let payload: Vec<u8> = (0..storage_bytes_per_page)
+            .map(|byte| (byte % 251) as u8)
+            .collect();
+        pool.copy_pages_from_host(&ctx, &[0], &payload)
+            .expect("seed source page");
+        pool.copy_page_device_to_device(&ctx, 0, 1)
+            .expect("copy page on device");
+        ctx.sync().expect("sync");
+
+        let copied = pool
+            .copy_pages_to_host(&ctx, &[1])
+            .expect("read copied page");
+        assert_eq!(copied, payload);
     }
 }
