@@ -139,10 +139,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // byte-for-byte unchanged.
         let mut published = Vec::new();
         let mut slot_swap_key = None;
+        let demoted_seq_len = self.kv.seq_len(slot);
         if self.kv_tier_capacity() > 0 {
             published = self.publish_prefix_blocks(slot, &request);
         } else if self.executor.kv_slot_tier_enabled()
             && matches!(request.phase, RequestPhase::Decoding)
+            && demoted_seq_len > 0
         {
             let key = self.next_tier_key;
             self.next_tier_key = self.next_tier_key.wrapping_add(1);
@@ -165,8 +167,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
         let request = if let Some(key) = slot_swap_key {
             // Keep the generation: decode resumes at the demoted position
-            // after promote. Only slot-coupled bookkeeping resets.
+            // after promote. Only slot-coupled bookkeeping resets. The
+            // MATERIALIZED host KV length is captured verbatim (it is one
+            // short of prompt+generated: the newest token's KV is the next
+            // step's write, not yet materialized) so restore re-allocates
+            // exactly what the device image holds.
             request.swap_key = Some(key);
+            request.swap_seq_len = demoted_seq_len;
             request.reused_prefix_pages.clear();
             request.prefill_start_pos = 0;
             request.phase = RequestPhase::Prefilling { progress: 0 };
@@ -187,9 +194,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         request: &mut RequestState,
         key: u64,
     ) -> Result<()> {
-        let seq_len = request
-            .prompt_len()
-            .saturating_add(request.generated_tokens.len());
+        // Re-allocate exactly the materialized length captured at demote —
+        // NOT prompt+generated, which runs one ahead of the device image
+        // (the newest token's KV is the next decode step's write).
+        let seq_len = std::mem::take(&mut request.swap_seq_len);
         let restored = self
             .alloc_with_prefix_reclaim(slot, seq_len)
             .and_then(|()| self.executor.promote_slot(key, slot));
