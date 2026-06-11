@@ -116,6 +116,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn moe_exclusive_scan_aligned_i32_cuda(
+        counts: *const i32,
+        offsets: *mut i32,
+        total: *mut i32,
+        n: i32,
+        alignment: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_cast_i32_to_i64_cuda(
         src: *const i32,
         dst: *mut i64,
