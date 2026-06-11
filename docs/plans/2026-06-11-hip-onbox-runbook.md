@@ -12,7 +12,7 @@ record evidence inline and pin every version (pin-from-proven-env rule).
 | 0.1 | Ubuntu 24.04+ (Linux only — ROCm APU support is Linux Preview). Record `uname -a`. | — |
 | 0.2 | BIOS: UMA/dedicated VRAM to **minimum** (512M–4G); GPU memory comes from GTT. | — |
 | 0.3 | Kernel params for ≥96 GB GTT: `ttm.pages_limit` + `amdttm.pages_limit` (page count = bytes/4096; 110 GB ≈ 28835840), reboot. Reference: tinycomputers ran 96 GB GTT. | `cat /sys/module/*ttm*/parameters/pages_limit` shows the value |
-| 0.4 | ROCm 7.x known-good stack per [llama.cpp #20856](https://github.com/ggml-org/llama.cpp/discussions/20856) (or TheRock nightly with native gfx1151). **Pin exact versions in the wins entry.** | `rocminfo \| grep gfx1151`; `hipcc --version`; `rocm-smi` shows the 8060S |
+| 0.4 | ROCm install — **version is itself an A/B variable, do not blind-pin**: a 2026 community report measured ROCm 7.0.1 at 325 t/s vs **6.4.4 at 1132 t/s** on the same Qwen3-8B BF16 (BLAS-path regression); tinycomputers ran the DSv4 GGUF on 7.2. Install 6.4.4 AND a 7.x/TheRock-nightly side-by-side if disk allows; ARLE's own lane uses no rocBLAS (only our kernels), so the regression may not bite us — measure, don't assume. **Pin whatever wins in the wins entry.** | `rocminfo \| grep gfx1151`; `hipcc --version`; `rocm-smi` shows the 8060S |
 | 0.5 | `export ROCM_PATH=/opt/rocm` (build.rs detection order: ROCM_PATH → HIP_PATH → /opt/rocm). | — |
 | 0.6 | Artifacts: a DSv4-Flash 2-bit GGUF ([ds4 q2-imatrix](https://github.com/antirez/ds4) preferred; else [nsparks](https://huggingface.co/nsparks/DeepSeek-V4-Flash-FP4-FP8-GGUF)/batiai community quants) **+ `tokenizer.json`** from the [unsloth safetensors mirror](https://huggingface.co/unsloth/DeepSeek-V4-Flash) placed in the SAME directory as the .gguf (loader uses `OpenAiTokenizer::from_model_dir`). | ~58–75 GB on disk; sha256 recorded |
 
@@ -81,6 +81,16 @@ cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 | 5.1 | B=1 decode tok/s: ≥3 runs × ≥256 tok, greedy, 4K ctx | p50 vs the three anchors: floor 35–47 (plan §1), ds4-on-this-box (3.4), nisparks 1–2 (3.3). Gap-to-floor = engineering list, not physics |
 | 5.2 | `scripts/bench_guidellm.sh hip-gfx1151-dsv4-q2 --model <gguf>` (canonical params) | raw table into the wins entry |
 | 5.3 | Wins entry `docs/experience/wins/2026-MM-DD-hip-gfx1151-dsv4-q2-bringup.md`: env pins (ROCm version, kernel params, GGUF sha, ARLE commit), every table above, license-or-kill verdict | ships before any default/README claim; #77 closes on 4.4, #78 closes on 5.x |
+
+## 6. Windows (out of MVP scope — the lane decision decides the cost)
+
+Verdict: **Windows ships via the Vulkan lane, not HIP.** Three paths, ranked:
+
+| Path | Status | Cost to ARLE |
+| --- | --- | --- |
+| **Vulkan executor on native Windows** | Adrenalin ships Vulkan with KHR coopmat; llama.cpp Vulkan is the proven Windows engine on this chip (LM Studio default); zero ROCm dependency | if the §3.2 lane A/B flips us to Vulkan anyway, Windows ≈ free: `ash` + SPIR-V are cross-platform; remaining work = build/packaging + **AMD Variable Graphics Memory** (Adrenalin, up to ~75% of RAM) replacing the GTT kernel-param step |
+| **WSL2 + the Linux runbook** | community-documented on this exact chip ([rosagallina 2026-02](https://gianni.rosagallina.com/en/posts/2026/02/24/rocm-wsl2-ryzen-ai-max-395.html)) — stages 0–5 run nearly unchanged inside WSL2 | *hypothesis*: GPU-PV memory visibility for a 58–75 GB model unverified; try only after native Linux passes |
+| **HIP SDK for Windows** | exists ([7.1.1 docs](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/reference/system-requirements.html)) but gfx1151 Windows support is still an open ask ([ROCm#6294](https://github.com/ROCm/ROCm/issues/6294)); preview-grade | **DEFER**: our build.rs is Linux-shaped (hipcc invocation, `ar`, lib paths) — porting it buys the weakest-evidence stack; revisit at TheRock ROCm 8.0 (mid-2026, first-class gfx1151) |
 
 ## Known failure playbook (from the OSS survey)
 
