@@ -147,19 +147,24 @@ Backend reach:
 
 ## 4b. Multi-turn KV Reuse / Tiered KV Matrix
 
-The KV-reuse architecture that the README calls out (slot-sticky multi-turn
-reuse + radix-backed `T0 GPU → T1 host pinned → T2 NVMe → T3 cluster-shared`).
-Code lives in `crates/infer-core/src/{prefix,radix}.rs` (radix tree) and the
-`crates/kv-native-sys` persistence substrate (tiered-KV plumbing); see
-[`docs/codebase-map.md`](codebase-map.md) for the per-file map.
+Rewrite-stack truth as of the 2026-06-11 KV-system audit (#80). The rewrite
+keeps **all KV in device memory (T0)**: the host radix cache
+(`crates/infer-core/src/{prefix,radix}.rs`) shares page-aligned prompt
+prefixes between slots and LRU-evicts to free pages — eviction frees, it does
+not demote. The monolith's tiered KV (T1 host-pinned / T2 NVMe / T3
+cluster-shared) died with the rewrite; `crates/kv-native-sys` (file/block ABI,
+WAL, mmap, shm, host arena) survives as an **orphaned substrate with zero
+dependents**. `/v1/stats` reports `ssd_recall.available=false` accordingly
+(`crates/infer-server/src/schema.rs`).
 
 | Capability | Status | Notes |
 | --- | --- | --- |
 | Slot-sticky multi-turn KV reuse | Supported (CUDA), Beta (Metal) | Prior-turn KV stays in slot for the next turn so only new user tokens prefill. CUDA is the primary path; Metal Qwen3.5 ships live prefix reuse via replayed compiled-path snapshots (see §1). |
-| Radix-backed prefix cache (T0 GPU) | Supported (CUDA) | Direct GPU-page attach + tail-page CoW on shared prefixes; `RadixNode` carries `hit_count`, `tier_location`, `session_id`, `fingerprint`, `soft_pin_until`, `byte_len`. |
-| T1 host-pinned spillover | Beta (CUDA) | Cold blocks demote from GPU to host pinned memory via `HostPinnedPool` (`kv-native-sys` arena); promote-on-use through `ReadmissionPlan`. |
-| T2 NVMe local-disk transport | Beta (CUDA), rewrite serve not active | Node-local persistence on top of `crates/kv-native-sys` (file/block ABI, mmap, WAL). The disk transport was legacy `infer/`-only; re-porting below the executor seam is sequenced in the multi-GPU port roadmap (see §0). `arle serve --kv-ssd-path ...` validates the request and fails closed until a backend exposes real SSD recall. |
-| T3 cluster-shared backend | Experimental | A minimal shared-FS reference backend shipped in the legacy tree; **NIXL transport remains stub-only** (`nixl-sys` activates the stub feature, no real link). Treat T3 as scaffolding, not a production tier today; not yet re-ported into the rewrite stack (see §0). |
+| Radix-backed prefix cache (T0 GPU) | Supported (CUDA, **Qwen3-dense only**), Beta (Metal, GDR-clamped) | Page-aligned full-block radix (`RadixCache`) with retain/release refcounts and LRU evict. **Disabled for DSv4 and Qwen3.5/3.6 hybrid** — their recurrent/ring sidecar state cannot attach at `start_pos>0` (`crates/infer-api/src/loaded.rs` carve-out); re-enable tracked in #85. No tail-page CoW (no n>1 consumer, #86); no tier/fingerprint/soft-pin metadata on nodes. |
+| T1 host-pinned spillover | **Not re-ported** (substrate orphaned) | No demote/promote path exists in the rewrite; page pressure frees + recomputes (`crates/infer-core/src/planner.rs`). Re-port tracked in #82. |
+| T2 NVMe local-disk transport | **Not re-ported** (substrate orphaned) | `kv-native-sys` persistence primitives (file/block ABI, mmap, WAL) are in-tree but unconsumed. `arle serve --kv-ssd-path ...` validates the request and fails closed until a backend exposes real SSD recall. Re-port (incl. restart-surviving prefix cache) tracked in #83. |
+| T3 cluster-shared backend | Stub only | **NIXL transport remains stub-only** (`nixl-sys` activates the stub feature, no real link); the rewrite has no KV export/import surface. P/D-disagg backlog in #87. |
+| Swap-style preemption | Missing (recompute only) | `retract_decode_to_fit` picks a victim, frees its whole KV, and requeues it for full recompute. Swap alternative tracked in #84 (depends on #82). |
 
 ---
 
