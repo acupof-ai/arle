@@ -216,7 +216,9 @@ impl TokenKVPool {
         self.storage_bytes_per_token() * token_count
     }
 
-    fn storage_bytes_per_page(&self) -> usize {
+    /// Full per-page host-image size (all layers, K+V, scales/norms) — the
+    /// payload unit `copy_pages_to_host`/`copy_pages_from_host` move.
+    pub fn storage_bytes_per_page(&self) -> usize {
         self.storage_bytes_for_tokens(self.page_size)
     }
 

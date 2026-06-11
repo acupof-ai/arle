@@ -154,6 +154,40 @@ impl RealCudaExecutor {
         }
     }
 
+    /// T1 host-tier hooks. Only dense Qwen3 has a page-addressable device
+    /// pool with cross-request prefix reuse, so it is the only arm with a
+    /// tier store; the hybrid/DSv4 arms (prefix cache disabled — recurrent /
+    /// ring sidecar state, see infer-api's carve-out) report capacity 0 and
+    /// the engine never calls the other hooks.
+    pub(crate) fn kv_tier_capacity_pages(&self) -> usize {
+        match self {
+            Self::Qwen(q) => q.kv_tier_capacity_pages(),
+            Self::Qwen35(_) | Self::Dsv4(_) => 0,
+        }
+    }
+
+    pub(crate) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
+        match self {
+            Self::Qwen(q) => q.demote_prefix_pages(entries),
+            Self::Qwen35(_) | Self::Dsv4(_) => Ok(0),
+        }
+    }
+
+    pub(crate) fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
+        match self {
+            Self::Qwen(q) => q.promote_prefix_pages(entries),
+            Self::Qwen35(_) | Self::Dsv4(_) => {
+                anyhow::bail!("KV tier store is only wired for the dense Qwen3 arm")
+            }
+        }
+    }
+
+    pub(crate) fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
+        if let Self::Qwen(q) = self {
+            q.drop_kv_tier_entries(keys);
+        }
+    }
+
     pub(crate) fn dsv4_verify_forward_selftest(&mut self, prompt: &[u32]) -> Result<()> {
         match self {
             Self::Dsv4(d) => d.verify_forward_selftest(prompt),
@@ -266,9 +300,48 @@ impl RealCudaExecutor {
     }
 }
 
+/// Default host-RAM budget for the T1 prefix tier. Default-on (ckl
+/// 2026-06-11): evicted prefix pages demote into host RAM and promote back on
+/// the next prefix hit instead of re-prefilling. The engine never demotes
+/// more than this budget; CLI opt-out wiring (`--kv-t1-budget-bytes 0`) is
+/// tracked in #82.
+const DEFAULT_KV_TIER_BUDGET_BYTES: usize = 4 << 30;
+
+/// Capacity-capped host store of demoted KV page payloads, keyed by
+/// engine-assigned tier keys. Each payload is a full [`PagedKVPool`] page
+/// image (`storage_bytes_per_page`: all layers, K+V, scales/norms) produced
+/// by `copy_pages_to_host` and consumed by `copy_pages_from_host`.
+pub(crate) struct CudaKvTierStore {
+    capacity_pages: usize,
+    entries: std::collections::BTreeMap<u64, Vec<u8>>,
+}
+
+impl CudaKvTierStore {
+    fn with_budget(budget_bytes: usize, bytes_per_page: usize) -> Self {
+        let capacity_pages = if bytes_per_page == 0 {
+            0
+        } else {
+            budget_bytes / bytes_per_page
+        };
+        Self {
+            capacity_pages,
+            entries: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn capacity_pages(&self) -> usize {
+        self.capacity_pages
+    }
+
+    fn is_full(&self) -> bool {
+        self.entries.len() >= self.capacity_pages
+    }
+}
+
 pub(crate) struct QwenCudaExecutor {
     model: CudaModel,
     kv: PagedKVPool,
+    tier: CudaKvTierStore,
     num_slots: usize,
     /// Per-slot (occupant epoch, materialized token count) continuity guard.
     ///
@@ -366,14 +439,59 @@ impl QwenCudaExecutor {
         );
 
         let slot_progress = vec![SlotProgress::default(); num_slots];
+        let tier =
+            CudaKvTierStore::with_budget(DEFAULT_KV_TIER_BUDGET_BYTES, kv.storage_bytes_per_page());
         Ok(Self {
             model,
             kv,
+            tier,
             num_slots,
             slot_progress,
             decode_ctx: None,
             graphs: None,
         })
+    }
+
+    pub(crate) fn kv_tier_capacity_pages(&self) -> usize {
+        self.tier.capacity_pages()
+    }
+
+    /// Copy device pages into the host tier store (synchronous: the copy is
+    /// complete when this returns, so the engine may free the pages). Stops at
+    /// capacity and reports the accepted prefix length.
+    pub(crate) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
+        let mut accepted = 0usize;
+        for &(page, key) in entries {
+            if self.tier.is_full() {
+                break;
+            }
+            let payload = self.kv.copy_pages_to_host(&self.model.ctx, &[page])?;
+            self.tier.entries.insert(key, payload);
+            accepted += 1;
+        }
+        Ok(accepted)
+    }
+
+    /// Copy host tier entries back into freshly allocated device pages. The
+    /// engine attaches the pages right after, so sync before returning.
+    pub(crate) fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
+        for &(key, page) in entries {
+            let payload = self
+                .tier
+                .entries
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("KV tier promote: unknown key {key}"))?;
+            self.kv
+                .copy_pages_from_host(&self.model.ctx, &[page], payload)?;
+        }
+        self.model.ctx.sync()?;
+        Ok(())
+    }
+
+    pub(crate) fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
+        for key in keys {
+            self.tier.entries.remove(key);
+        }
     }
 
     pub(crate) fn submit(
