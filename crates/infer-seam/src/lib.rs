@@ -21,6 +21,8 @@ mod kv_batch;
 mod kv_query;
 #[path = "prefix_store.rs"]
 mod prefix_store;
+#[path = "resource.rs"]
+mod resource;
 
 pub use allocator::KvAllocator;
 pub use host_paged_kv_pool::HostPagedKvPool;
@@ -28,6 +30,9 @@ pub use kv::KvPool;
 pub use kv_batch::{KvBatchDescriptor, KvBatchRow, KvBatchRowKind};
 pub use kv_query::KvQuery;
 pub use prefix_store::KvPrefixStore;
+pub use resource::{
+    HostTierBudget, HostTierPolicy, SlotBudget, clamp_to_affordable, split_host_tiers,
+};
 
 /// Result of polling a submitted executor step.
 #[derive(Debug, Clone)]
