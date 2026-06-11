@@ -172,6 +172,22 @@ pub fn gemma4_kernel_for_launcher(kind: Gemma4LauncherKind) -> vulkan_kernels::K
 }
 
 #[cfg(feature = "vulkan")]
+pub fn gemma4_attention_spec(
+    config: &gemma_spec::Gemma4TextConfig,
+    kind: Gemma4LauncherKind,
+) -> Option<vulkan_kernels::FlashAttentionSpec> {
+    match kind {
+        Gemma4LauncherKind::SlidingWindowAttention => Some(
+            vulkan_kernels::FlashAttentionSpec::f32_f16(config.head_dim as u32),
+        ),
+        Gemma4LauncherKind::GlobalAttention => Some(vulkan_kernels::FlashAttentionSpec::f32_f16(
+            config.global_attention_head_dim() as u32,
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "vulkan")]
 pub fn gemma4_forward_kernel_sequence(
     config: &gemma_spec::Gemma4TextConfig,
 ) -> Vec<vulkan_kernels::Kernel> {
@@ -326,5 +342,21 @@ mod tests {
             gemma4_kernel_for_launcher(Gemma4LauncherKind::GemmaRmsNorm),
             vulkan_kernels::Kernel::RmsNorm
         );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn gemma4_attention_spec_separates_local_and_global_head_dims() {
+        let cfg = config();
+        let sliding =
+            gemma4_attention_spec(&cfg, Gemma4LauncherKind::SlidingWindowAttention).unwrap();
+        let global = gemma4_attention_spec(&cfg, Gemma4LauncherKind::GlobalAttention).unwrap();
+        assert_eq!(sliding.specialization_u32()[3], (3, 256));
+        assert_eq!(sliding.specialization_u32()[4], (4, 256));
+        assert_eq!(global.specialization_u32()[3], (3, 512));
+        assert_eq!(global.specialization_u32()[4], (4, 512));
+        assert_eq!(global.specialization_u32()[12], (12, 1));
+        assert_eq!(global.specialization_u32()[14], (14, 2));
+        assert!(gemma4_attention_spec(&cfg, Gemma4LauncherKind::GeGlu).is_none());
     }
 }
