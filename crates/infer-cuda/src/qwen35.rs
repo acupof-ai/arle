@@ -774,6 +774,79 @@ impl Qwen35Model {
         )
     }
 
+    /// Per-slot device-memory cost (bytes) at this rank's local shard widths:
+    /// K+V contiguous full-attn caches + gated-delta recurrent state + conv
+    /// rings. Mirrors exactly what [`Self::new_slot_state`] allocates per slot.
+    fn per_slot_kv_bytes(&self) -> (usize, usize, usize, usize) {
+        let c = &self.config;
+        let num_full = c.num_full_attention_layers();
+        let num_linear = c.num_hidden_layers - num_full;
+        let bf16 = std::mem::size_of::<half::bf16>();
+        let f32sz = std::mem::size_of::<f32>();
+        // K and V contiguous caches: num_full × (max_seq_len × kv_dim) bf16, ×2.
+        let kv_bytes = num_full
+            .saturating_mul(self.max_seq_len)
+            .saturating_mul(self.local_full_attn_kv_dim())
+            .saturating_mul(2)
+            .saturating_mul(bf16);
+        // Gated-delta recurrent state: num_linear × (Vh × Kd × Vd) f32.
+        let gdr_len = self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
+        let gdr_bytes = num_linear.saturating_mul(gdr_len).saturating_mul(f32sz);
+        // Conv1d rings: num_linear × (qkv_dim × (kernel-1)) bf16.
+        let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
+        let conv_bytes = num_linear.saturating_mul(conv_len).saturating_mul(bf16);
+        let per_slot = kv_bytes
+            .saturating_add(gdr_bytes)
+            .saturating_add(conv_bytes);
+        (per_slot, kv_bytes, gdr_bytes, conv_bytes)
+    }
+
+    /// Clamp `requested` slots to what post-weights free VRAM affords — the
+    /// dynamic KV-memory budget Qwen3.5/3.6 previously lacked (requested slots
+    /// were admitted as-is → OOM at large max_seq_len, the #60 failure class).
+    /// Unified with DSv4 through the infer-seam budget kernel; the affordable
+    /// count is NCCL min-reduced for TP-consistent slot counts. Call AFTER
+    /// weights load so `mem_get_info().free` already excludes them.
+    pub(crate) fn kv_budget_num_slots(&self, requested: usize) -> Result<usize> {
+        const MEM_FRACTION: f64 = 0.9;
+        let (per_slot, kv_bytes, gdr_bytes, conv_bytes) = self.per_slot_kv_bytes();
+        let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
+            Ok((free, _total)) => {
+                // Same neutral kernel as DSv4: floor(free × fraction) / per_slot.
+                let budget = infer_seam::SlotBudget::from_free(free, MEM_FRACTION, 0, per_slot);
+                log::info!(
+                    "Qwen3.5 KV budget: free {}MB, per_slot {}MB (K+V {}MB + gdr {}MB + conv {}MB)",
+                    free >> 20,
+                    per_slot >> 20,
+                    kv_bytes >> 20,
+                    gdr_bytes >> 20,
+                    conv_bytes >> 20,
+                );
+                budget
+                    .affordable()
+                    .map_or(i32::MAX, |n| i32::try_from(n.max(1)).unwrap_or(i32::MAX))
+            }
+            // Can't query (no active context / driver error) → don't bind the
+            // min; the other ranks' budgets still apply.
+            Err(_) => i32::MAX,
+        };
+        let affordable =
+            self.tp
+                .all_reduce_min_scalar_i32(&self.ctx, affordable_local)? as usize;
+        let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
+        if clamped {
+            log::warn!(
+                "Qwen3.5 KV budget: requested {requested} slots × ~{}MB/slot exceeds the \
+                 cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
+                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}. \
+                 Lower --max-seq-len ({}) to raise concurrency.",
+                per_slot >> 20,
+                self.max_seq_len,
+            );
+        }
+        Ok(planned)
+    }
+
     /// Load a BF16 Qwen3.5/3.6 HYBRID MoE checkpoint, resolving the TP runtime
     /// from the environment (single-GPU when no TP env is set).
     ///
