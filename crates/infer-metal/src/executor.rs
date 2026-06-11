@@ -19,8 +19,8 @@ use crate::{config, mlx, model_source, qwen35, wired_limit};
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
 
-/// Cross-step decode pipelining (env-gated, default ON since the c>=2 fall-safe
-/// validation — `wins/2026-06-04-metal-decode-pipeline-c2-safe-default-on.md`).
+/// Cross-step decode pipelining (env-gated, default ON since
+/// `wins/2026-06-04-metal-decode-pipeline-c2-safe-default-on.md`).
 ///
 /// HEAD decode is strictly submit(N) → poll(N) blocks on `eval` → apply(N) →
 /// submit(N+1): the GPU idles for the host gap between poll(N)'s eval finishing
@@ -33,12 +33,11 @@ const KV_CACHE_CHUNK: i32 = 256;
 /// a non-greedy or recycled-slot single-row decode drains and takes the cold
 /// (HEAD) path via the `pending_matches_live_slot` guard.
 ///
-/// c>=2 safety: the rewrite Metal executor accepts exactly one row per plan
-/// (`submit` guard), so a concurrent (multi-row) plan errors loud at that guard
-/// BEFORE any pipeline logic — identical error + bit-identical (empty) output
-/// with the pipeline on or off, and the fast path provably never fires
-/// concurrently. The default-on flip therefore changes only the c=1 greedy path.
-/// Opt OUT with `INFER_METAL_PIPELINE=0`.
+/// Serve safety: Metal reports one live request and one plan row to the shared
+/// layers. The HTTP frontend rejects a second live request, while the executor's
+/// single-row submit guard remains an internal fail-closed fence before any
+/// pipeline logic. The default-on flip therefore changes only the c=1 greedy
+/// path. Opt OUT with `INFER_METAL_PIPELINE=0`.
 #[cfg(feature = "metal")]
 fn pipeline_decode_enabled() -> bool {
     use std::sync::OnceLock;
@@ -63,10 +62,8 @@ fn probe_pipeline_fast_path() {
 }
 
 /// Monotonic count of pipeline fast-path firings (process-wide). A test or bench
-/// reads this to prove which decode path each step took — at c>=2 it must stay
-/// pinned at whatever it was before the concurrent phase, since the planner's
-/// multi-row plans never reach the single-row pipeline path. Harmless in
-/// production: a single relaxed counter on an already-rare event.
+/// reads this to prove which decode path each step took. Harmless in production:
+/// a single relaxed counter on an already-rare event.
 #[cfg(feature = "metal")]
 pub(crate) static PIPELINE_FAST_PATH_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -287,6 +284,10 @@ impl BackendExecutor for MetalExecutor {
     }
 
     fn max_rows_per_step(&self) -> usize {
+        1
+    }
+
+    fn max_live_requests(&self) -> usize {
         1
     }
 

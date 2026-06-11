@@ -408,13 +408,24 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub(crate) fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(value: anyhow::Error) -> Self {
+        let message = value.to_string();
+        if message.starts_with("server is busy:") {
+            return Self::too_many_requests(message);
+        }
         Self {
             status: StatusCode::BAD_REQUEST,
-            message: value.to_string(),
+            message,
         }
     }
 }

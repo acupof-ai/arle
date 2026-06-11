@@ -345,6 +345,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         &mut self.executor
     }
 
+    /// Frontend live-request capacity requested by the backend executor.
+    #[must_use]
+    pub fn max_live_requests(&self) -> usize {
+        self.executor.max_live_requests().max(1)
+    }
+
     /// Run backend warmup exactly once.
     ///
     /// Delegates to [`BackendExecutor::warmup`] (default no-op for Metal/mock).
