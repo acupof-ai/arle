@@ -695,7 +695,13 @@ mod real {
             shader: &ShaderModule<'_>,
             descriptor_layouts: &[&DescriptorSetLayout<'_>],
         ) -> Result<Self> {
-            Self::create_with_push_constants(ctx, shader, descriptor_layouts, 0)
+            Self::create_with_push_constants_and_specialization(
+                ctx,
+                shader,
+                descriptor_layouts,
+                0,
+                &[],
+            )
         }
 
         pub fn create_with_push_constants(
@@ -703,6 +709,22 @@ mod real {
             shader: &ShaderModule<'_>,
             descriptor_layouts: &[&DescriptorSetLayout<'_>],
             push_constant_bytes: u32,
+        ) -> Result<Self> {
+            Self::create_with_push_constants_and_specialization(
+                ctx,
+                shader,
+                descriptor_layouts,
+                push_constant_bytes,
+                &[],
+            )
+        }
+
+        pub fn create_with_push_constants_and_specialization(
+            ctx: &'a VulkanContext,
+            shader: &ShaderModule<'_>,
+            descriptor_layouts: &[&DescriptorSetLayout<'_>],
+            push_constant_bytes: u32,
+            specialization_u32: &[(u32, u32)],
         ) -> Result<Self> {
             let set_layouts: Vec<_> = descriptor_layouts
                 .iter()
@@ -725,10 +747,30 @@ mod real {
                 .map_err(|e| vk_error("creating Vulkan pipeline layout", e))?;
             let entry =
                 CString::new("main").map_err(|e| runtime_error("building shader entry", e))?;
-            let stage = vk::PipelineShaderStageCreateInfo::default()
+
+            let mut specialization_data = Vec::with_capacity(specialization_u32.len() * 4);
+            let mut specialization_entries = Vec::with_capacity(specialization_u32.len());
+            for (idx, (constant_id, value)) in specialization_u32.iter().copied().enumerate() {
+                let offset = u32::try_from(idx * std::mem::size_of::<u32>())
+                    .map_err(|e| runtime_error("converting specialization offset", e))?;
+                specialization_entries.push(vk::SpecializationMapEntry {
+                    constant_id,
+                    offset,
+                    size: std::mem::size_of::<u32>(),
+                });
+                specialization_data.extend_from_slice(&value.to_ne_bytes());
+            }
+            let specialization_info = vk::SpecializationInfo::default()
+                .map_entries(&specialization_entries)
+                .data(&specialization_data);
+
+            let mut stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(shader.raw())
                 .name(&entry);
+            if !specialization_u32.is_empty() {
+                stage = stage.specialization_info(&specialization_info);
+            }
             let create = [vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(layout)];
@@ -908,6 +950,16 @@ mod stub {
             _shader: &ShaderModule<'_>,
             _descriptor_layouts: &[&DescriptorSetLayout<'_>],
             _push_constant_bytes: u32,
+        ) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn create_with_push_constants_and_specialization(
+            _ctx: &'a VulkanContext,
+            _shader: &ShaderModule<'_>,
+            _descriptor_layouts: &[&DescriptorSetLayout<'_>],
+            _push_constant_bytes: u32,
+            _specialization_u32: &[(u32, u32)],
         ) -> Result<Self> {
             Err(VULKAN_NOT_COMPILED)
         }
