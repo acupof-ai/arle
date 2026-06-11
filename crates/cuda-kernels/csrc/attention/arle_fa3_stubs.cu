@@ -24,6 +24,10 @@ typedef struct {
     long long k_row_stride;
     long long v_row_stride;
     long long o_row_stride;
+    long long q_head_stride;
+    long long k_head_stride;
+    long long v_head_stride;
+    long long o_head_stride;
     float softmax_scale;
     int is_causal;
 } ArleFa3FwdHd256Args;

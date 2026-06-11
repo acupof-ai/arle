@@ -48,6 +48,38 @@ use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 
+/// `ARLE_QWEN35_FA3=1`: route full-attention prefill chunks (`seq_len > 1`)
+/// through the vendored FA3 hopper fwd shim instead of the in-tree
+/// `nonpaged_prefill_attention` kernel (42.1% of prefill GPU time at 3k —
+/// `docs/reviews/2026-06-11-qwen35-post-license-reprofile-rerank.md`).
+/// Default OFF (step-1 candidate arm). Requires a binary built with
+/// `ARLE_CUDA_ENABLE_FA3=1`; on stub builds the link marker is 0 and the
+/// gate permanently falls back with a warning instead of failing at the
+/// first chunk (flashmla stale-stub lesson). Read once — prefill is never
+/// graph-captured, so a process-lifetime latch is safe.
+fn qwen35_fa3_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = matches!(
+            std::env::var("ARLE_QWEN35_FA3").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        );
+        if !on {
+            return false;
+        }
+        // SAFETY: pure host query exported by both the real shim and the stub.
+        let real = unsafe { ffi::arle_fa3_real_kernel_marker_cuda() } == 1;
+        if !real {
+            log::warn!(
+                "ARLE_QWEN35_FA3=1 but this binary linked the FA3 stub \
+                 (build without ARLE_CUDA_ENABLE_FA3) — using the in-tree \
+                 attention kernel"
+            );
+        }
+        real
+    })
+}
+
 /// Raw (un-scaled) LoRA A/B matrices for one full-attention q/v projection,
 /// pushed from the train crate's OPD student loop for the per-step re-merge.
 ///
@@ -261,6 +293,12 @@ pub(crate) struct FullAttnScratch {
     v_batch: HiddenSlot,
     q_prepped: HiddenSlot,
     attn_heads: HiddenSlot,
+    /// FA3 prefill scratch (`ARLE_QWEN35_FA3`): fp32 softmax LSE
+    /// `[local_q_heads * seq_len]` (write-only output of the fwd kernel) and
+    /// the persistent-scheduler semaphore (1 i32, zeroed by the shim per
+    /// launch).
+    fa3_lse: SliceSlot<f32>,
+    fa3_semaphore: SliceSlot<i32>,
 }
 
 #[derive(Default)]
@@ -1911,6 +1949,10 @@ impl Qwen35Model {
     /// RoPE + cache write; the gate kernel applies the per-head sigmoid gate
     /// carried in `q_full`. `start_pos_dev` is the forward-level GPU-resident
     /// `start_pos` (identical for every layer of one call).
+    ///
+    /// Prefill chunks (`seq_len > 1`) route through the vendored FA3 hopper
+    /// fwd when [`qwen35_fa3_enabled`]; decode keeps the devpos kernel
+    /// (graph-captured) untouched.
     #[allow(clippy::too_many_arguments)]
     fn full_attention(
         &self,
@@ -1938,6 +1980,8 @@ impl Qwen35Model {
             v_batch,
             q_prepped,
             attn_heads,
+            fa3_lse,
+            fa3_semaphore,
         } = fw;
         let q_full = q_full.get(&self.ctx, q_proj_dim, seq_len)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, seq_len)?;
@@ -2028,6 +2072,44 @@ impl Qwen35Model {
                         self.ctx.stream.cu_stream(),
                     )
                     .result()?;
+                } else if qwen35_fa3_enabled() {
+                    // FA3 fwd over the SAME buffers the in-tree kernel uses:
+                    // q/out token-major [S, h, 256] (HD256 prep layout),
+                    // cache head-major [h_k, max_seq, 256]. Passing the
+                    // exact `kv_len` as seqlen_k keeps the shim on the
+                    // non-varlen path; causal is bottom-right aligned =
+                    // chunked-prefill semantics. Gate + o_proj follow
+                    // unchanged.
+                    let lse = fa3_lse.get(&self.ctx, self.local_q_heads * seq_len)?;
+                    let sem = fa3_semaphore.get(&self.ctx, 1)?;
+                    let (lse_ptr, _g4) = lse.device_ptr_mut(&self.ctx.stream);
+                    let (sem_ptr, _g5) = sem.device_ptr_mut(&self.ctx.stream);
+                    let head_dim = c.head_dim as i64;
+                    let args = ffi::ArleFa3FwdHd256Args {
+                        q: q_ptr as *const ffi::Half,
+                        k: kc_ptr as *const ffi::Half,
+                        v: vc_ptr as *const ffi::Half,
+                        o: o_ptr as *mut ffi::Half,
+                        softmax_lse: lse_ptr as *mut f32,
+                        tile_count_semaphore: sem_ptr as *mut i32,
+                        seqlen_q: seq_len as i32,
+                        seqlen_k: kv_len as i32,
+                        num_heads: self.local_q_heads as i32,
+                        num_heads_k: self.local_kv_heads as i32,
+                        head_dim: c.head_dim as i32,
+                        q_row_stride: q_dim as i64,
+                        k_row_stride: head_dim,
+                        v_row_stride: head_dim,
+                        o_row_stride: q_dim as i64,
+                        q_head_stride: head_dim,
+                        k_head_stride: max_seq_len as i64 * head_dim,
+                        v_head_stride: max_seq_len as i64 * head_dim,
+                        o_head_stride: head_dim,
+                        softmax_scale: sm_scale,
+                        is_causal: 1,
+                    };
+                    ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
+                        .result()?;
                 } else {
                     ffi::nonpaged_prefill_attention_cuda(
                         q_ptr as *const ffi::Half,
@@ -2522,6 +2604,9 @@ impl Qwen35Model {
             v_batch,
             q_prepped,
             attn_heads,
+            // Batched decode stays on the devpos kernel; FA3 scratch unused.
+            fa3_lse: _,
+            fa3_semaphore: _,
         } = fw;
         let q_full = q_full.get(&self.ctx, q_proj_dim, b)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, b)?;

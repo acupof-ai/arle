@@ -39,15 +39,16 @@ inline int device_num_sm() {
 
 extern "C" {
 
-// All strides in ELEMENTS. Heads are packed within a token row
-// (head_stride == head_dim); rows may be strided (k/v live in the slot cache
-// at k_row_stride == h_k * d for the current layout, but the field keeps the
-// cache layout free to change).
+// All strides in ELEMENTS; the last dim (head_dim) must be contiguous. The
+// separate row/head strides express both token-major q/o ([S, h, d]:
+// row=h*d, head=d) and the qwen35 head-major slot caches ([h_k, max_seq, d]:
+// row=d, head=max_seq*d) without any relayout — they feed FA3's TMA
+// descriptors directly (16-byte alignment required, satisfied for d=256).
 typedef struct {
-    const void* q;              // bf16 [seqlen_q, h, d]
-    const void* k;              // bf16 [seqlen_k(+), h_k, d] slot cache rows
-    const void* v;              // bf16 [seqlen_k(+), h_k, d]
-    void* o;                    // bf16 [seqlen_q, h, d]
+    const void* q;              // bf16, seqlen_q x h x d view
+    const void* k;              // bf16, seqlen_k x h_k x d view of the cache
+    const void* v;
+    void* o;                    // bf16, seqlen_q x h x d view
     float* softmax_lse;         // fp32 [h * seqlen_q] scratch
     int* tile_count_semaphore;  // device i32 scratch (>= 1 element)
     int seqlen_q;
@@ -59,6 +60,10 @@ typedef struct {
     long long k_row_stride;
     long long v_row_stride;
     long long o_row_stride;
+    long long q_head_stride;
+    long long k_head_stride;
+    long long v_head_stride;
+    long long o_head_stride;
     float softmax_scale;
     int is_causal;
 } ArleFa3FwdHd256Args;
@@ -82,17 +87,30 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     params.k_row_stride = a->k_row_stride;
     params.v_row_stride = a->v_row_stride;
     params.o_row_stride = a->o_row_stride;
-    params.q_head_stride = a->head_dim;
-    params.k_head_stride = a->head_dim;
-    params.v_head_stride = a->head_dim;
+    params.q_head_stride = a->q_head_stride;
+    params.k_head_stride = a->k_head_stride;
+    params.v_head_stride = a->v_head_stride;
+    params.o_head_stride = a->o_head_stride;
     params.v_dim_stride = 1;
     // b=1: batch strides are never walked past index 0, but mirror the
     // non-varlen fill (flash_api.cpp:101-108) so the TMA descriptors see
-    // self-consistent extents.
-    params.q_batch_stride = (int64_t)a->seqlen_q * a->q_row_stride;
-    params.k_batch_stride = (int64_t)a->seqlen_k * a->k_row_stride;
-    params.v_batch_stride = (int64_t)a->seqlen_k * a->v_row_stride;
-    params.o_batch_stride = (int64_t)a->seqlen_q * a->o_row_stride;
+    // self-consistent extents. Take the larger of the row/head walks so both
+    // token-major ([S, h, d]) and head-major cache ([h_k, max_seq, d]) views
+    // yield a plausible batch extent.
+    auto batch_extent = [](int64_t rows, int64_t row_stride, int64_t heads,
+                           int64_t head_stride) {
+        int64_t by_row = rows * row_stride;
+        int64_t by_head = heads * head_stride;
+        return by_row > by_head ? by_row : by_head;
+    };
+    params.q_batch_stride =
+        batch_extent(a->seqlen_q, a->q_row_stride, a->num_heads, a->q_head_stride);
+    params.k_batch_stride =
+        batch_extent(a->seqlen_k, a->k_row_stride, a->num_heads_k, a->k_head_stride);
+    params.v_batch_stride =
+        batch_extent(a->seqlen_k, a->v_row_stride, a->num_heads_k, a->v_head_stride);
+    params.o_batch_stride =
+        batch_extent(a->seqlen_q, a->o_row_stride, a->num_heads, a->o_head_stride);
 
     params.softmax_lse_ptr = a->softmax_lse;
 

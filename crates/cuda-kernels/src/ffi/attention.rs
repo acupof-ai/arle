@@ -972,9 +972,12 @@ unsafe extern "C" {
 // ============================================================================
 
 /// Mirror of `ArleFa3FwdHd256Args` in `csrc/attention/arle_fa3_shim.cu`.
-/// All strides in elements; heads packed within a token row
-/// (head_stride == head_dim). Step-1 contract: b=1, contiguous slot KV viewed
-/// at exact `seqlen_k`, `num_splits=1`, causal bottom-right alignment.
+/// All strides in elements; the last dim (head_dim) must be contiguous. The
+/// separate row/head strides express both token-major q/o (`[S, h, d]`:
+/// row = h*d, head = d) and the qwen35 head-major slot caches
+/// (`[h_k, max_seq, d]`: row = d, head = max_seq*d) without relayout.
+/// Step-1 contract: b=1, slot KV viewed at exact `seqlen_k`, `num_splits=1`,
+/// causal bottom-right alignment.
 #[repr(C)]
 pub struct ArleFa3FwdHd256Args {
     pub q: *const Half,
@@ -995,6 +998,10 @@ pub struct ArleFa3FwdHd256Args {
     pub k_row_stride: i64,
     pub v_row_stride: i64,
     pub o_row_stride: i64,
+    pub q_head_stride: i64,
+    pub k_head_stride: i64,
+    pub v_head_stride: i64,
+    pub o_head_stride: i64,
     pub softmax_scale: f32,
     pub is_causal: i32,
 }
