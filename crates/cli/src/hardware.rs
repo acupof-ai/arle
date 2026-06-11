@@ -324,9 +324,33 @@ mod tests {
     }
 
     #[test]
-    fn effective_memory_positive() {
+    fn detected_effective_memory_is_non_negative() {
         let info = detect_system();
-        match CompiledBackend::detect() {
+        assert!(info.effective_memory_gb() >= 0.0);
+    }
+
+    #[test]
+    fn effective_memory_positive_when_backend_has_budget() {
+        let info = SystemInfo {
+            cpu_name: "test".to_string(),
+            cpu_cores: 8,
+            total_ram_gb: 48.0,
+            available_ram_gb: 22.0,
+            gpu: match CompiledBackend::detect() {
+                CompiledBackend::Cuda => GpuInfo::Cuda {
+                    name: "test".to_string(),
+                    vram_gb: 24.0,
+                },
+                CompiledBackend::Metal => GpuInfo::Metal {
+                    chip: "Apple M4 Pro".to_string(),
+                    unified_memory_gb: 48.0,
+                    recommended_working_set_gb: Some(37.0),
+                },
+                _ => GpuInfo::None,
+            },
+            compiled_backend: CompiledBackend::detect(),
+        };
+        match info.compiled_backend {
             CompiledBackend::Cuda | CompiledBackend::Metal | CompiledBackend::Cpu => {
                 assert!(info.effective_memory_gb() > 0.0);
             }
@@ -374,5 +398,22 @@ mod tests {
             compiled_backend: CompiledBackend::Metal,
         };
         assert!((info.effective_memory_gb() - 14.8).abs() < 0.1);
+    }
+
+    #[test]
+    fn metal_effective_memory_can_be_zero_under_available_reserve() {
+        let info = SystemInfo {
+            cpu_name: "test".to_string(),
+            cpu_cores: 8,
+            total_ram_gb: 48.0,
+            available_ram_gb: 7.5,
+            gpu: GpuInfo::Metal {
+                chip: "Apple M4 Pro".to_string(),
+                unified_memory_gb: 48.0,
+                recommended_working_set_gb: Some(37.4),
+            },
+            compiled_backend: CompiledBackend::Metal,
+        };
+        assert_eq!(info.effective_memory_gb(), 0.0);
     }
 }
