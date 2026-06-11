@@ -27,6 +27,12 @@ float silu(float x) {
     return x / (1.0 + exp(-x));
 }
 
+float round_to_bf16(float x) {
+    const uint bits = floatBitsToUint(x);
+    const uint lsb = (bits >> 16) & 1u;
+    return uintBitsToFloat((bits + 0x7fffu + lsb) & 0xffff0000u);
+}
+
 void main() {
     const uint c = gl_GlobalInvocationID.x;
     if (c >= p.num_channels || p.kernel_size == 0) {
@@ -57,7 +63,7 @@ void main() {
             }
             sum += value * conv_weight[c * p.kernel_size + k];
         }
-        out_seq[t * p.num_channels + c] = silu(sum);
+        out_seq[t * p.num_channels + c] = silu(round_to_bf16(sum));
     }
 
     for (uint i = 0; i < state_width; ++i) {
