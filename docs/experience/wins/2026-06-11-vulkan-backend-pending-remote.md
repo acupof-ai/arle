@@ -20,6 +20,10 @@ order.
 P5 adds the Qwen3.6 MoE contract on top of Qwen3.5 hybrid attention: router
 GEMV, top-k, routed expert gate/up/down, shared expert, and weighted expert
 mix.
+P6 adds `crates/gemma-spec` and the Gemma4 Vulkan text contract: nested
+`text_config` parsing, sliding/global layer typing with final-global
+validation, PLE fields, global KV/p-RoPE fields, QK-norm, GeGLU, and the
+Gemma RMSNorm(+1) convention.
 
 The backend is not reachable from `arle serve` yet. CLI and model wiring are
 scheduled for P7, so there is no production hot path or benchmarkable endpoint
@@ -80,6 +84,9 @@ ports before hybrid layers can execute.
 
 P5 numeric Qwen3.6 execution is blocked independently: MoE router/top-k and
 expert-mix launch integration is not implemented for Vulkan yet.
+
+P6 numeric Gemma4 execution is blocked independently: p-RoPE/global-KV sharing
+and Gemma RMSNorm(+1) kernels are not validated on Vulkan yet.
 
 ## Learnings
 

@@ -10,6 +10,7 @@ pub use infer_hip::{config, dequant, gguf};
 pub mod executor;
 pub mod kv_pool;
 pub mod model_dsv4;
+pub mod model_gemma4;
 pub mod model_qwen3;
 pub mod model_qwen35;
 pub mod model_qwen36;
