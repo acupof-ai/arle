@@ -147,24 +147,23 @@ Backend reach:
 
 ## 4b. Multi-turn KV Reuse / Tiered KV Matrix
 
-Rewrite-stack truth as of the 2026-06-11 KV-system audit (#80). The rewrite
-keeps **all KV in device memory (T0)**: the host radix cache
-(`crates/infer-core/src/{prefix,radix}.rs`) shares page-aligned prompt
-prefixes between slots and LRU-evicts to free pages — eviction frees, it does
-not demote. The monolith's tiered KV (T1 host-pinned / T2 NVMe / T3
-cluster-shared) died with the rewrite; `crates/kv-native-sys` (file/block ABI,
-WAL, mmap, shm, host arena) survives as an **orphaned substrate with zero
-dependents**. `/v1/stats` reports `ssd_recall.available=false` accordingly
-(`crates/infer-server/src/schema.rs`).
+Rewrite-stack truth as of 2026-06-11 (#80 audit; tier re-port landed the same
+day: #82 `4409491c`+`e2cc27ba`, #83 `b7458707`, #84 `9cadad3f`). The host
+radix cache (`crates/infer-core/src/{prefix,radix}.rs`) shares page-aligned
+prompt prefixes between slots; under page pressure, evicted blocks **demote
+into the executor's host tier store** (when one exists) and **promote back**
+on the next prefix match instead of re-prefilling. Engine-side correctness is
+mock-tested; **CUDA-traffic verification (needle gate + multi-turn TTFT A/B)
+is pending pod time** — see the dated `wins/` entries per row.
 
 | Capability | Status | Notes |
 | --- | --- | --- |
 | Slot-sticky multi-turn KV reuse | Supported (CUDA), Beta (Metal) | Prior-turn KV stays in slot for the next turn so only new user tokens prefill. CUDA is the primary path; Metal Qwen3.5 ships live prefix reuse via replayed compiled-path snapshots (see §1). |
-| Radix-backed prefix cache (T0 GPU) | Supported (CUDA, **Qwen3-dense only**), Beta (Metal, GDR-clamped) | Page-aligned full-block radix (`RadixCache`) with retain/release refcounts and LRU evict. **Disabled for DSv4 and Qwen3.5/3.6 hybrid** — their recurrent/ring sidecar state cannot attach at `start_pos>0` (`crates/infer-api/src/loaded.rs` carve-out); re-enable tracked in #85. No tail-page CoW (no n>1 consumer, #86); no tier/fingerprint/soft-pin metadata on nodes. |
-| T1 host-pinned spillover | **Not re-ported** (substrate orphaned) | No demote/promote path exists in the rewrite; page pressure frees + recomputes (`crates/infer-core/src/planner.rs`). Re-port tracked in #82. |
-| T2 NVMe local-disk transport | **Not re-ported** (substrate orphaned) | `kv-native-sys` persistence primitives (file/block ABI, mmap, WAL) are in-tree but unconsumed. `arle serve --kv-ssd-path ...` validates the request and fails closed until a backend exposes real SSD recall. Re-port (incl. restart-surviving prefix cache) tracked in #83. |
+| Radix-backed prefix cache (T0 GPU) | Supported (CUDA, **Qwen3-dense only**), Beta (Metal, GDR-clamped) | Page-aligned full-block radix (`RadixCache`) with retain/release refcounts and LRU evict. **Disabled for DSv4 and Qwen3.5/3.6 hybrid** — their recurrent/ring sidecar state cannot attach at `start_pos>0` (`crates/infer-api/src/loaded.rs` carve-out); re-enable tracked in #85 (hard requirement, ckl 2026-06-11). No tail-page CoW (no n>1 consumer, #86). |
+| T1 DRAM tier (host store) | **Default-on (CUDA Qwen3-dense), pod gate pending** | 4 GiB host budget by default; `--kv-t1-budget-bytes 0` opts out. Demote-on-evict / promote-on-match via `BackendExecutor` tier hooks; LRU rotation when full. Engine semantics mock-tested ([host tranche](experience/wins/2026-06-11-kv-t1-tier-host-tranche.md)); CUDA store [pending-remote](experience/wins/2026-06-11-kv-t1-tier-cuda-store.md). |
+| T2 NVMe disk spill | **Opt-in, shipped (store host-verified; CUDA traffic pending-remote)** | `--kv-ssd-path` (+ `--kv-ssd-max-bytes`, default 20 GiB) attaches a disk level on `kv-native-sys` block files; coldest T1 entry spills when RAM fills; capacity reported to the engine is T1+T2. Non-consuming backends fail closed. [wins](experience/wins/2026-06-11-kv-t2-disk-spill.md). Restart-surviving prefix cache remains open scope on #83. |
 | T3 cluster-shared backend | Stub only | **NIXL transport remains stub-only** (`nixl-sys` activates the stub feature, no real link); the rewrite has no KV export/import surface. P/D-disagg backlog in #87. |
-| Swap-style preemption | Missing (recompute only) | `retract_decode_to_fit` picks a victim, frees its whole KV, and requeues it for full recompute. Swap alternative tracked in #84 (depends on #82). |
+| Swap-style preemption | **Shipped with the tier (tier-gated)** | `retract_decode_to_fit`'s victim seals its prompt blocks into the radix and demotes exactly those pages; re-admission promotes instead of re-prefilling (decode is still recomputed). Without a tier store the recompute path is byte-for-byte unchanged. DSv4 whole-slot variant tracked under #84/#85 Route B. |
 
 ---
 
