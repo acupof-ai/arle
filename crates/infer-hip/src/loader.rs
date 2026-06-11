@@ -6,9 +6,12 @@
 //! / `arle_mmvq_q2_k_cuda` (csrc/iq2_mmvq.cu) and the q4k/q5k/q6k
 //! gemv/dequant/embedding launchers (csrc/gemm/quantized_gemv.cu — q3k
 //! also compiles but has no Rust decl, so Q3_K dequantizes). Everything
-//! else lands BF16 (the basic-op weight dtype), except f32-fidelity small
-//! tensors (`rms_norm_gated_cuda` takes f32 weights; router/HC math is
-//! host f32) and the integer hash table which stays host-only.
+//! else lands BF16 — every device consumer of the non-matmul tensors
+//! (`dsv4_compressor_update` ape/norm, `dsv4_{swa,hybrid}_attention`
+//! attn_sink, `dsv4_mhc_params`/`_head_pre` base/scale) takes bf16 per the
+//! dsv4_attention.cu/dsv4_mhc.cu signatures. Host-consumed routing data
+//! (`exp_probs_b` bias, integer `tid2eid` hash table) stays host-only;
+//! the model reads it straight from the GGUF at load.
 
 use anyhow::{Result, bail};
 
@@ -44,7 +47,12 @@ pub fn f32_to_bf16_rne(x: f32) -> u16 {
 }
 
 pub fn plan_residency(kind: Dsv4TensorKind, ty: GgmlType) -> Residency {
-    if kind == Dsv4TensorKind::RouterHashTable {
+    // Host-routed data: the executor routes on the CPU, so the bias and
+    // hash table never need device bytes.
+    if matches!(
+        kind,
+        Dsv4TensorKind::RouterHashTable | Dsv4TensorKind::RouterBias
+    ) {
         return Residency::HostOnly;
     }
     match ty {
@@ -53,18 +61,9 @@ pub fn plan_residency(kind: Dsv4TensorKind, ty: GgmlType) -> Residency {
         GgmlType::Q4K => Residency::KeepKQuant(KQuant::Q4K),
         GgmlType::Q5K => Residency::KeepKQuant(KQuant::Q5K),
         GgmlType::Q6K => Residency::KeepKQuant(KQuant::Q6K),
-        _ => match kind {
-            // Host-f32 consumers: router bias/sinkhorn HC params, attn sinks,
-            // APE tables added in f32, gated-norm weight (f32 per
-            // rms_norm_gated_cuda signature).
-            Dsv4TensorKind::RouterBias
-            | Dsv4TensorKind::HyperConnection
-            | Dsv4TensorKind::HeadHyperConnection
-            | Dsv4TensorKind::AttnSink
-            | Dsv4TensorKind::CompressorApe
-            | Dsv4TensorKind::IndexerCompressApe => Residency::DequantF32,
-            _ => Residency::DequantBf16,
-        },
+        // Everything else is bf16: norms, sinks, APE tables, HC base/scale
+        // all enter the dsv4_attention.cu / dsv4_mhc.cu launchers as bf16.
+        _ => Residency::DequantBf16,
     }
 }
 
@@ -258,12 +257,15 @@ mod tests {
             (OutputNorm, F32, Residency::DequantBf16),
             (AttnKvLatent, F16, Residency::DequantBf16),
             (RouterGate, F32, Residency::DequantBf16),
-            (RouterBias, F32, Residency::DequantF32),
-            (AttnSink, F32, Residency::DequantF32),
-            (HyperConnection, F32, Residency::DequantF32),
-            (HeadHyperConnection, F32, Residency::DequantF32),
-            (CompressorApe, F32, Residency::DequantF32),
+            // Device consumers take these as bf16 (dsv4_attention.cu sink/ape,
+            // dsv4_mhc.cu base/scale).
+            (AttnSink, F32, Residency::DequantBf16),
+            (HyperConnection, F32, Residency::DequantBf16),
+            (HeadHyperConnection, F32, Residency::DequantBf16),
+            (CompressorApe, F32, Residency::DequantBf16),
             (CompressorNorm, F32, Residency::DequantBf16),
+            // Host routing data — never uploaded.
+            (RouterBias, F32, Residency::HostOnly),
             (RouterHashTable, I64, Residency::HostOnly),
         ];
         for (kind, ty, expect) in cases {
@@ -320,9 +322,9 @@ mod tests {
         //   up/gate IQ2_XXS: 512/256=2 blocks x66 = 132 B/row x 256x16 rows = 540672 each
         //   down Q2_K: 1 block x84 = 84 B/row x 512x16 = 688128
         //   q_a / shexp Q4_K: 2x144 = 288 B/row x 256 = 73728 each
-        //   norm 512 f32 -> bf16 = 1024; sinks 8 -> f32 = 32; tid2eid = 0
+        //   norm 512 f32 -> bf16 = 1024; sinks 8 -> bf16 = 16; tid2eid = 0
         //   embd Q4_K: 288 x 1000 = 288000 (global)
-        let layer0 = 540_672u64 * 2 + 688_128 + 73_728 * 2 + 1_024 + 32;
+        let layer0 = 540_672u64 * 2 + 688_128 + 73_728 * 2 + 1_024 + 16;
         assert_eq!(plan.layer_bytes, vec![layer0]);
         assert_eq!(plan.global_bytes, 288_000);
         assert_eq!(plan.total_bytes, layer0 + 288_000);
@@ -344,7 +346,10 @@ mod tests {
             by_name("blk.0.attn_norm.weight").residency,
             Residency::DequantBf16
         );
-        assert_eq!(by_name("blk.0.attn_sinks").residency, Residency::DequantF32);
+        assert_eq!(
+            by_name("blk.0.attn_sinks").residency,
+            Residency::DequantBf16
+        );
         assert_eq!(by_name("blk.0.ffn_gate_tid2eid").bytes, 0);
         std::fs::remove_file(path).ok();
     }
