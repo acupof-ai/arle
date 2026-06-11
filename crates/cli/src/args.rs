@@ -330,6 +330,15 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) low_impact: bool,
 
+    /// Opt into the SSD/NVMe KV tier root. The rewrite stack validates this
+    /// request and fails closed until a backend exposes real SSD recall.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) kv_ssd_path: Option<PathBuf>,
+
+    /// Maximum bytes this serve process may use under --kv-ssd-path.
+    #[arg(long, value_parser = parse_positive_usize, requires = "kv_ssd_path")]
+    pub(crate) kv_ssd_max_bytes: Option<usize>,
+
     /// Logical request slots for the unified scheduler.
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) num_slots: Option<usize>,

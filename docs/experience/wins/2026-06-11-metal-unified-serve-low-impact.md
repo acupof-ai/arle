@@ -5,8 +5,8 @@
 Make the Metal serving path use the same service layer and scheduler layer as
 the other backends, with only backend construction differing below `infer-api`.
 Also add a conservative CLI mode for local Apple Silicon serving so the user can
-start with bounded slots/pages/tokens instead of the previous hardcoded Metal
-router defaults.
+start with bounded slots and smaller prefill chunks instead of the previous
+hardcoded Metal router defaults.
 
 ## Hypothesis
 
@@ -24,9 +24,10 @@ backend-neutral.
   (small-model opt-out to avoid stressing the local Mac while validating CLI
   wiring; Qwen3.6/guidellm pending).
 - CLI: `arle serve --backend metal --model-path mlx-community/Qwen3.5-0.8B-MLX-4bit --port 8127 --low-impact`
-- `--low-impact` engine config: `num_slots=1`, `total_pages=1024`,
-  `page_size=16`, `max_prompt_tokens=8192`, `max_total_tokens=8192`,
-  `chunked_prefill_size=32`.
+- `--low-impact` engine config: `num_slots=1`, `page_size=16`,
+  `chunked_prefill_size=32`. `total_pages`, `max_prompt_tokens`, and
+  `max_total_tokens` remain at the normal engine defaults unless explicitly
+  set (supersedes the first low-impact cap sketch from this entry).
 - Env: `INFER_METAL_WARMUP=1`, `INFER_METAL_PIPELINE` default ON.
 
 ## Env
