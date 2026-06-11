@@ -48,6 +48,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         request: &mut RequestState,
         prefix_match: PrefixMatch,
     ) -> Result<()> {
+        if self.config.enable_prefix_cache {
+            self.prefix_cache_stats.lookups = self.prefix_cache_stats.lookups.saturating_add(1);
+        }
+
         let prefix_match = self.clamp_prefix_to_backend(prefix_match);
         if prefix_match.is_empty() {
             request.prefill_start_pos = 0;
@@ -67,6 +71,16 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.kv.release_pages(&prefix_match.block_ids);
             return Err(err);
         }
+
+        self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
+        self.prefix_cache_stats.hit_tokens = self
+            .prefix_cache_stats
+            .hit_tokens
+            .saturating_add(prefix_match.matched_len as u64);
+        self.prefix_cache_stats.hit_pages = self
+            .prefix_cache_stats
+            .hit_pages
+            .saturating_add(prefix_match.block_ids.len() as u64);
 
         request.prefill_start_pos = prefix_match.matched_len.min(request.prompt_len());
         request.reused_prefix_pages = prefix_match.block_ids;
@@ -133,6 +147,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             &pages[..publish_blocks],
         );
         if !newly_cached.is_empty() {
+            self.prefix_cache_stats.published_pages = self
+                .prefix_cache_stats
+                .published_pages
+                .saturating_add(newly_cached.len() as u64);
             self.kv.retain_pages(&newly_cached);
         }
     }
