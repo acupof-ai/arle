@@ -285,10 +285,14 @@ struct Dsv4DecodeLayerGraphScratch {
     moe_graph: crate::graph::CudaGraphState,
     attn_mhc: crate::hc::MhcDecodeScratch,
     ffn_mhc: crate::hc::MhcDecodeScratch,
+    // Kept for the unfused HC-pre path; current decode graph uses fused MHC pre RMS.
+    #[allow(dead_code)]
     attn_in: HiddenStates,
     attn_normed: HiddenStates,
     attn_out: HiddenStates,
     attn_stream: HiddenStates,
+    // Kept for the unfused HC-pre path; current decode graph uses fused MHC pre RMS.
+    #[allow(dead_code)]
     ffn_in: HiddenStates,
     ffn_normed: HiddenStates,
     moe_out: HiddenStates,
@@ -2642,7 +2646,7 @@ impl Dsv4Model {
                     let Dsv4DecodeLayerGraphScratch {
                         attn_graph,
                         attn_mhc,
-                        attn_in,
+                        attn_in: _,
                         attn_normed,
                         attn_out,
                         ..
@@ -2705,7 +2709,7 @@ impl Dsv4Model {
                     let Dsv4DecodeLayerGraphScratch {
                         attn_graph,
                         attn_mhc,
-                        attn_in,
+                        attn_in: _,
                         attn_normed,
                         attn_out,
                         ..
@@ -2791,7 +2795,7 @@ impl Dsv4Model {
                     ffn_mhc,
                     attn_out,
                     attn_stream,
-                    ffn_in,
+                    ffn_in: _,
                     ffn_normed,
                     moe_out,
                     shared,

@@ -264,6 +264,8 @@ pub(crate) fn gen_mhc_params_into<'a>(
 
 /// Collapse the wide stream to one `hidden_size` row per token using the pre-mix
 /// lane weights (input to the sub-block).
+// Kept as the unfused primitive; current DSv4 decode uses `mhc_pre_rms_norm`.
+#[allow(dead_code)]
 pub(crate) fn hc_pre(
     ctx: &DeviceContext,
     stream: &HiddenStates,
