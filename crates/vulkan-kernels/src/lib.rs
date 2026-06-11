@@ -86,6 +86,8 @@ pub enum Kernel {
     Dsv4Mhc,
     Dsv4OutputInverseRope,
     SwigluClamped,
+    Qwen35SsmConv,
+    Qwen35GatedDeltaNet,
 }
 
 impl Kernel {
@@ -117,6 +119,8 @@ impl Kernel {
             Kernel::Dsv4Mhc => "dsv4_mhc",
             Kernel::Dsv4OutputInverseRope => "dsv4_output_inverse_rope",
             Kernel::SwigluClamped => "swiglu_clamped",
+            Kernel::Qwen35SsmConv => "qwen35_ssm_conv",
+            Kernel::Qwen35GatedDeltaNet => "qwen35_gated_delta_net",
         }
     }
 }
@@ -441,6 +445,24 @@ macro_rules! fused_launcher_fns {
         ) -> Result<()> {
             $call(Kernel::SwigluClamped, ctx, buffers, dispatch, params)
         }
+
+        pub fn qwen35_ssm_conv(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call(Kernel::Qwen35SsmConv, ctx, buffers, dispatch, params)
+        }
+
+        pub fn qwen35_gated_delta_net(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call(Kernel::Qwen35GatedDeltaNet, ctx, buffers, dispatch, params)
+        }
     };
 }
 
@@ -624,6 +646,17 @@ mod tests {
             Kernel::SwigluClamped.shader_name(),
         ];
         assert_eq!(names.len(), 8);
+        assert!(names.iter().all(|name| !name.is_empty()));
+    }
+
+    #[test]
+    fn shader_names_cover_qwen35_hybrid_fused_op_set() {
+        let names = [
+            Kernel::Qwen35SsmConv.shader_name(),
+            Kernel::Qwen35GatedDeltaNet.shader_name(),
+            Kernel::FlashAttn.shader_name(),
+        ];
+        assert_eq!(names.len(), 3);
         assert!(names.iter().all(|name| !name.is_empty()));
     }
 
