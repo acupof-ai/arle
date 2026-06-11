@@ -27,6 +27,7 @@
 //! - [`tokenizer`] — the tokenizer / chat-template adapter (COLD).
 //! - [`schema`] — the OpenAI wire types and `ApiError` (COLD).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -73,6 +74,10 @@ pub struct ServeHandle<E: BackendExecutor, K: KvPool> {
     join: Option<JoinHandle<()>>,
     /// Latest scheduler counters, republished by the engine loop each tick.
     counters: Arc<Mutex<CounterSnapshot>>,
+    /// Backend-requested frontend live-request cap.
+    max_live_requests: usize,
+    /// Request tickets currently handed out and not yet dropped.
+    live_requests: Arc<AtomicUsize>,
     _backend: std::marker::PhantomData<fn() -> (E, K)>,
 }
 
@@ -84,6 +89,7 @@ pub struct ServeHandle<E: BackendExecutor, K: KvPool> {
 pub struct RequestTicket {
     handle: RequestHandle,
     completion_rx: Receiver<CompletedRequest>,
+    live_requests: Arc<AtomicUsize>,
 }
 
 impl RequestTicket {
@@ -121,6 +127,12 @@ impl RequestTicket {
     }
 }
 
+impl Drop for RequestTicket {
+    fn drop(&mut self) {
+        self.live_requests.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Outcome of a [`RequestTicket::collect_timeout`] that did not deliver a result.
 pub enum CollectTimeout {
     /// The request is still running; the ticket is returned to retry.
@@ -144,6 +156,7 @@ where
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E>>();
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
+        let max_live_requests = executor.max_live_requests().max(1);
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
             .spawn(move || {
@@ -160,6 +173,8 @@ where
             control_tx: Some(control_tx),
             join: Some(join),
             counters,
+            max_live_requests,
+            live_requests: Arc::new(AtomicUsize::new(0)),
             _backend: std::marker::PhantomData,
         }
     }
@@ -182,7 +197,7 @@ where
     {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E>>();
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<usize, String>>(1);
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
         let join = thread::Builder::new()
@@ -193,7 +208,8 @@ where
                         let _ = ready_tx.send(Err(err.to_string()));
                         return;
                     }
-                    let _ = ready_tx.send(Ok(()));
+                    let max_live_requests = engine.max_live_requests();
+                    let _ = ready_tx.send(Ok(max_live_requests));
                     engine_loop(engine, submit_rx, control_rx, loop_counters);
                 }
                 Err(err) => {
@@ -206,11 +222,13 @@ where
             .recv()
             .map_err(|_| anyhow!("engine thread exited before signalling readiness"))?
         {
-            Ok(()) => Ok(Self {
+            Ok(max_live_requests) => Ok(Self {
                 submit_tx: Some(submit_tx),
                 control_tx: Some(control_tx),
                 join: Some(join),
                 counters,
+                max_live_requests: max_live_requests.max(1),
+                live_requests: Arc::new(AtomicUsize::new(0)),
                 _backend: std::marker::PhantomData,
             }),
             Err(err) => {
@@ -231,13 +249,14 @@ where
         max_tokens: usize,
         sampling: SamplingParams,
     ) -> Result<RequestTicket> {
-        let submit_tx = self
-            .submit_tx
-            .as_ref()
-            .ok_or_else(|| anyhow!("ServeHandle already shut down"))?;
+        self.acquire_live_request()?;
+        let submit_tx = self.submit_tx.as_ref().ok_or_else(|| {
+            self.release_live_request();
+            anyhow!("ServeHandle already shut down")
+        })?;
         let (handle_tx, handle_rx) = mpsc::channel::<RequestHandle>();
         let (completion_tx, completion_rx) = mpsc::channel::<CompletedRequest>();
-        submit_tx
+        if submit_tx
             .send(Submission {
                 prompt,
                 max_tokens,
@@ -246,13 +265,24 @@ where
                 completion_tx,
                 stream_tx: None,
             })
-            .map_err(|_| anyhow!("engine thread closed; cannot submit"))?;
-        let handle = handle_rx
-            .recv()
-            .map_err(|_| anyhow!("engine thread closed before assigning a request handle"))?;
+            .is_err()
+        {
+            self.release_live_request();
+            return Err(anyhow!("engine thread closed; cannot submit"));
+        }
+        let handle = match handle_rx.recv() {
+            Ok(handle) => handle,
+            Err(_) => {
+                self.release_live_request();
+                return Err(anyhow!(
+                    "engine thread closed before assigning a request handle"
+                ));
+            }
+        };
         Ok(RequestTicket {
             handle,
             completion_rx,
+            live_requests: Arc::clone(&self.live_requests),
         })
     }
 
@@ -268,14 +298,15 @@ where
         max_tokens: usize,
         sampling: SamplingParams,
     ) -> Result<(RequestTicket, Receiver<StreamItem>)> {
-        let submit_tx = self
-            .submit_tx
-            .as_ref()
-            .ok_or_else(|| anyhow!("ServeHandle already shut down"))?;
+        self.acquire_live_request()?;
+        let submit_tx = self.submit_tx.as_ref().ok_or_else(|| {
+            self.release_live_request();
+            anyhow!("ServeHandle already shut down")
+        })?;
         let (handle_tx, handle_rx) = mpsc::channel::<RequestHandle>();
         let (completion_tx, completion_rx) = mpsc::channel::<CompletedRequest>();
         let (stream_tx, stream_rx) = mpsc::channel::<StreamItem>();
-        submit_tx
+        if submit_tx
             .send(Submission {
                 prompt,
                 max_tokens,
@@ -284,14 +315,25 @@ where
                 completion_tx,
                 stream_tx: Some(stream_tx),
             })
-            .map_err(|_| anyhow!("engine thread closed; cannot submit"))?;
-        let handle = handle_rx
-            .recv()
-            .map_err(|_| anyhow!("engine thread closed before assigning a request handle"))?;
+            .is_err()
+        {
+            self.release_live_request();
+            return Err(anyhow!("engine thread closed; cannot submit"));
+        }
+        let handle = match handle_rx.recv() {
+            Ok(handle) => handle,
+            Err(_) => {
+                self.release_live_request();
+                return Err(anyhow!(
+                    "engine thread closed before assigning a request handle"
+                ));
+            }
+        };
         Ok((
             RequestTicket {
                 handle,
                 completion_rx,
+                live_requests: Arc::clone(&self.live_requests),
             },
             stream_rx,
         ))
@@ -310,6 +352,29 @@ where
     #[must_use]
     pub fn counters(&self) -> CounterSnapshot {
         self.counters.lock().map(|c| *c).unwrap_or_default()
+    }
+
+    fn acquire_live_request(&self) -> Result<()> {
+        loop {
+            let current = self.live_requests.load(Ordering::Acquire);
+            if current >= self.max_live_requests {
+                return Err(anyhow!(
+                    "server is busy: backend allows at most {} live request(s)",
+                    self.max_live_requests
+                ));
+            }
+            if self
+                .live_requests
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn release_live_request(&self) {
+        self.live_requests.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Run `f` against the engine-thread-owned executor and return its result.
@@ -430,6 +495,27 @@ mod tests {
     use super::*;
     use infer_seam::HostPagedKvPool;
 
+    #[derive(Debug, Clone, Copy, Default)]
+    struct SingleFlightEchoExecutor;
+
+    impl BackendExecutor for SingleFlightEchoExecutor {
+        type Inflight = StepOutput;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            let mut inner = EchoExecutor;
+            inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            let mut inner = EchoExecutor;
+            inner.poll(inflight)
+        }
+
+        fn max_live_requests(&self) -> usize {
+            1
+        }
+    }
+
     /// End-to-end frontend-||-engine smoke test with no GPU/MLX dependency.
     ///
     /// Spawns the engine thread on an `EchoExecutor` + real host paged KV pool,
@@ -470,6 +556,35 @@ mod tests {
         // Echo rule: final prefill chunk commits last_prompt + 1, then +1/decode.
         assert_eq!(first_done.generated_tokens, vec![13, 14, 15, 16, 17]);
         assert_eq!(second_done.generated_tokens, vec![102, 103, 104]);
+
+        serve.shutdown().expect("engine thread joins cleanly");
+        Ok(())
+    }
+
+    #[test]
+    fn single_flight_backend_rejects_second_live_request() -> Result<()> {
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_prompt_tokens: 4096,
+            max_total_tokens: 8192,
+            ..SchedulerConfig::default()
+        };
+        let kv = HostPagedKvPool::new(1, 256, 16);
+        let serve = ServeHandle::spawn(SingleFlightEchoExecutor, kv, config);
+
+        let first = serve.submit(vec![10, 11, 12], 5, SamplingParams::default())?;
+        let err = match serve.submit(vec![100, 101], 3, SamplingParams::default()) {
+            Ok(_) => panic!("single-flight backend must reject a second live request"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("server is busy"),
+            "unexpected error: {err:#}"
+        );
+
+        assert_eq!(first.collect()?.generated_tokens, vec![13, 14, 15, 16, 17]);
+        let second = serve.submit(vec![100, 101], 3, SamplingParams::default())?;
+        assert_eq!(second.collect()?.generated_tokens, vec![102, 103, 104]);
 
         serve.shutdown().expect("engine thread joins cleanly");
         Ok(())
