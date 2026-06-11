@@ -427,7 +427,8 @@ mod backend {
 
         #[cfg(feature = "metal")]
         fn load_metal(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
-            let (serve, tokenizer, model_id) = metal_serve_handle(model_path, config)?;
+            let (serve, tokenizer, model_id) =
+                metal_serve_handle(model_path, config, infer_server::ServeShutdown::new())?;
             Ok(Self::Metal(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
             )))
@@ -449,6 +450,7 @@ mod backend {
                 enable_cuda_graph,
                 config,
                 &crate::serve::ServeKvSsdOptions::default(),
+                infer_server::ServeShutdown::new(),
             )?;
             Ok(Self::Cuda(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
@@ -461,7 +463,8 @@ mod backend {
             // via `hip_serve_handle`, mirroring the CUDA `cuda_serve_handle`
             // split (Metal instead reuses an infer-server facade; infer-server
             // has no HIP code, so the handle is built here).
-            let (serve, tokenizer, model_id) = hip_serve_handle(model_path, config)?;
+            let (serve, tokenizer, model_id) =
+                hip_serve_handle(model_path, config, infer_server::ServeShutdown::new())?;
             Ok(Self::Hip(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
             )))
@@ -472,7 +475,8 @@ mod backend {
             // Vulkan GGUF load. Shares the engine builder with `router_vulkan`
             // via `vulkan_serve_handle`, mirroring the HIP path while keeping
             // all Vulkan types below the seam.
-            let (serve, tokenizer, model_id) = vulkan_serve_handle(model_path, config)?;
+            let (serve, tokenizer, model_id) =
+                vulkan_serve_handle(model_path, config, infer_server::ServeShutdown::new())?;
             Ok(Self::Vulkan(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
             )))
@@ -519,6 +523,7 @@ mod backend {
         enable_cuda_graph: bool,
         config: EngineLoadConfig,
         kv_ssd: &crate::serve::ServeKvSsdOptions,
+        shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
         // The T2 disk tier is consumed by the CUDA arm only; every other
         // backend fails closed on an explicit request instead of silently
@@ -532,18 +537,18 @@ mod backend {
         #[cfg(feature = "metal")]
         {
             let _ = enable_cuda_graph;
-            return router_metal(model_path, &config);
+            return router_metal(model_path, &config, shutdown);
         }
 
         #[cfg(all(not(feature = "metal"), feature = "cuda"))]
         {
-            return router_cuda(model_path, enable_cuda_graph, &config, kv_ssd);
+            return router_cuda(model_path, enable_cuda_graph, &config, kv_ssd, shutdown);
         }
 
         #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "hip"))]
         {
             let _ = enable_cuda_graph;
-            return router_hip(model_path, &config);
+            return router_hip(model_path, &config, shutdown);
         }
 
         #[cfg(all(
@@ -554,7 +559,7 @@ mod backend {
         ))]
         {
             let _ = enable_cuda_graph;
-            return router_vulkan(model_path, &config);
+            return router_vulkan(model_path, &config, shutdown);
         }
 
         #[cfg(all(
@@ -566,7 +571,7 @@ mod backend {
         ))]
         {
             let _ = enable_cuda_graph;
-            return router_cpu(model_path, &config);
+            return router_cpu(model_path, &config, shutdown);
         }
     }
 
@@ -577,6 +582,7 @@ mod backend {
     fn metal_serve_handle(
         model_path: &str,
         config: &EngineLoadConfig,
+        shutdown: infer_server::ServeShutdown,
     ) -> Result<(
         ServeHandle<MetalExecutor, MetalKvPool>,
         infer_server::OpenAiTokenizer,
@@ -631,29 +637,33 @@ mod backend {
             );
             scheduler.max_prompt_tokens = scheduler.max_total_tokens;
         }
-        let serve = ServeHandle::spawn_with_engine_builder(move || {
-            let executor = MetalExecutor::from_model_path_with_kv_cache_dtype_and_resource_plan(
-                &model_source,
-                metal_kv_dtype,
-                resource_plan,
-            )?;
-            let kv = MetalKvPool::new(num_slots, total_pages, page_size);
-            if low_impact {
-                let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
-                    max_tokens: scheduler.chunked_prefill_size.max(1),
-                    max_micros: 20_000,
-                })
-                .with_yield_every_ticks(8);
-                Ok(infer_core::Engine::with_config_and_governor(
-                    executor,
-                    kv,
-                    scheduler,
-                    Box::new(governor),
-                ))
-            } else {
-                Ok(infer_core::Engine::with_config(executor, kv, scheduler))
-            }
-        })?;
+        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
+            move || {
+                let executor =
+                    MetalExecutor::from_model_path_with_kv_cache_dtype_and_resource_plan(
+                        &model_source,
+                        metal_kv_dtype,
+                        resource_plan,
+                    )?;
+                let kv = MetalKvPool::new(num_slots, total_pages, page_size);
+                if low_impact {
+                    let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
+                        max_tokens: scheduler.chunked_prefill_size.max(1),
+                        max_micros: 20_000,
+                    })
+                    .with_yield_every_ticks(8);
+                    Ok(infer_core::Engine::with_config_and_governor(
+                        executor,
+                        kv,
+                        scheduler,
+                        Box::new(governor),
+                    ))
+                } else {
+                    Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+                }
+            },
+            shutdown,
+        )?;
         Ok((serve, tokenizer, model_id))
     }
 
@@ -661,8 +671,12 @@ mod backend {
     /// [`LoadedInferenceEngine::load_metal`] and wraps it in the unified OpenAI
     /// facade.
     #[cfg(feature = "metal")]
-    fn router_metal(model_path: &str, config: &EngineLoadConfig) -> Result<axum::Router> {
-        let (serve, tokenizer, model_id) = metal_serve_handle(model_path, config)?;
+    fn router_metal(
+        model_path: &str,
+        config: &EngineLoadConfig,
+        shutdown: infer_server::ServeShutdown,
+    ) -> Result<axum::Router> {
+        let (serve, tokenizer, model_id) = metal_serve_handle(model_path, config, shutdown)?;
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
@@ -752,6 +766,7 @@ mod backend {
         enable_cuda_graph: bool,
         config: &EngineLoadConfig,
         kv_ssd: &crate::serve::ServeKvSsdOptions,
+        shutdown: infer_server::ServeShutdown,
     ) -> Result<(
         ServeHandle<CudaExecutor, CudaKvPool>,
         infer_server::OpenAiTokenizer,
@@ -765,9 +780,10 @@ mod backend {
 
         let model_source = model_path.to_string();
         let engine_config = *config;
-        let serve = ServeHandle::spawn_with_engine_builder(move || {
-            build_cuda_engine(&model_source, &engine_config)
-        })?;
+        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
+            move || build_cuda_engine(&model_source, &engine_config),
+            shutdown,
+        )?;
         // Opt-in T2 disk spill (`--kv-ssd-path`): attach pre-traffic via the
         // engine-thread control seam; fail closed instead of silently
         // serving without the requested tier.
@@ -973,9 +989,10 @@ mod backend {
         enable_cuda_graph: bool,
         config: &EngineLoadConfig,
         kv_ssd: &crate::serve::ServeKvSsdOptions,
+        shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) =
-            cuda_serve_handle(model_path, enable_cuda_graph, config, kv_ssd)?;
+            cuda_serve_handle(model_path, enable_cuda_graph, config, kv_ssd, shutdown)?;
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
@@ -1030,6 +1047,7 @@ mod backend {
     fn hip_serve_handle(
         model_path: &str,
         config: &EngineLoadConfig,
+        shutdown: infer_server::ServeShutdown,
     ) -> Result<(
         ServeHandle<HipDsv4Executor, HipKvPool>,
         infer_server::OpenAiTokenizer,
@@ -1058,10 +1076,13 @@ mod backend {
         scheduler.enable_prefix_cache = false;
         let num_slots = config.num_slots;
         let max_seq_len = config.max_total_tokens;
-        let serve = ServeHandle::spawn_with_engine_builder(move || {
-            let (executor, kv) = infer_hip::load_dsv4_gguf(&gguf_path, num_slots, max_seq_len)?;
-            Ok(infer_core::Engine::with_config(executor, kv, scheduler))
-        })?;
+        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
+            move || {
+                let (executor, kv) = infer_hip::load_dsv4_gguf(&gguf_path, num_slots, max_seq_len)?;
+                Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+            },
+            shutdown,
+        )?;
         Ok((serve, tokenizer, model_id))
     }
 
@@ -1075,6 +1096,7 @@ mod backend {
     fn vulkan_serve_handle(
         model_path: &str,
         config: &EngineLoadConfig,
+        shutdown: infer_server::ServeShutdown,
     ) -> Result<(
         ServeHandle<VulkanExecutor, VulkanKvPool>,
         infer_server::OpenAiTokenizer,
@@ -1099,10 +1121,14 @@ mod backend {
         let scheduler = config.scheduler_config();
         let num_slots = config.num_slots;
         let max_seq_len = config.max_total_tokens;
-        let serve = ServeHandle::spawn_with_engine_builder(move || {
-            let (executor, kv) = infer_vulkan::load_qwen3_gguf(&gguf_path, num_slots, max_seq_len)?;
-            Ok(infer_core::Engine::with_config(executor, kv, scheduler))
-        })?;
+        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
+            move || {
+                let (executor, kv) =
+                    infer_vulkan::load_qwen3_gguf(&gguf_path, num_slots, max_seq_len)?;
+                Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+            },
+            shutdown,
+        )?;
         Ok((serve, tokenizer, model_id))
     }
 
@@ -1110,8 +1136,12 @@ mod backend {
     /// [`LoadedInferenceEngine::load_hip`] via [`hip_serve_handle`], then wraps
     /// it in [`infer_server::openai_router`]. Mirrors [`router_cuda`].
     #[cfg(feature = "hip")]
-    fn router_hip(model_path: &str, config: &EngineLoadConfig) -> Result<axum::Router> {
-        let (serve, tokenizer, model_id) = hip_serve_handle(model_path, config)?;
+    fn router_hip(
+        model_path: &str,
+        config: &EngineLoadConfig,
+        shutdown: infer_server::ServeShutdown,
+    ) -> Result<axum::Router> {
+        let (serve, tokenizer, model_id) = hip_serve_handle(model_path, config, shutdown)?;
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
@@ -1119,8 +1149,12 @@ mod backend {
     /// [`LoadedInferenceEngine::load_vulkan`] via [`vulkan_serve_handle`], then
     /// wraps it in [`infer_server::openai_router`]. Mirrors [`router_hip`].
     #[cfg(feature = "vulkan")]
-    fn router_vulkan(model_path: &str, config: &EngineLoadConfig) -> Result<axum::Router> {
-        let (serve, tokenizer, model_id) = vulkan_serve_handle(model_path, config)?;
+    fn router_vulkan(
+        model_path: &str,
+        config: &EngineLoadConfig,
+        shutdown: infer_server::ServeShutdown,
+    ) -> Result<axum::Router> {
+        let (serve, tokenizer, model_id) = vulkan_serve_handle(model_path, config, shutdown)?;
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
@@ -1135,7 +1169,11 @@ mod backend {
         not(feature = "hip"),
         not(feature = "vulkan")
     ))]
-    fn router_cpu(model_path: &str, config: &EngineLoadConfig) -> Result<axum::Router> {
+    fn router_cpu(
+        model_path: &str,
+        config: &EngineLoadConfig,
+        shutdown: infer_server::ServeShutdown,
+    ) -> Result<axum::Router> {
         use infer_server::{OpenAiTokenizer, openai_router};
 
         if config.mtp_draft_tokens.is_some() {
@@ -1145,7 +1183,8 @@ mod backend {
         let model_id = crate::serve_engine::model_id_from_path(model_path);
         let executor = MetalExecutor::new();
         let kv = HostPagedKvPool::new(config.num_slots, config.total_pages, config.page_size);
-        let serve = ServeHandle::spawn(executor, kv, config.scheduler_config());
+        let serve =
+            ServeHandle::spawn_with_shutdown(executor, kv, config.scheduler_config(), shutdown);
         Ok(openai_router(serve, tokenizer, model_id))
     }
 
