@@ -5,19 +5,25 @@ interface Props {
 }
 const { head, rows } = Astro.props;
 ---
-<table class="matrix">
-  <thead>
-    <tr>{head.map((h) => <th>{h}</th>)}</tr>
-  </thead>
-  <tbody>
-    {rows.map((row) => (
-      <tr>
-        {row.map((cell) => <td set:html={cell} />)}
-      </tr>
-    ))}
-  </tbody>
-</table>
+<div class="matrix-wrap">
+  <table class="matrix">
+    <thead>
+      <tr>{head.map((h) => <th>{h}</th>)}</tr>
+    </thead>
+    <tbody>
+      {rows.map((row) => (
+        <tr>
+          {row.map((cell) => <td set:html={cell} />)}
+        </tr>
+      ))}
+    </tbody>
+  </table>
+</div>
 <style>
+  /* The 6-column table can't fit narrow viewports; scroll locally since
+     the root clips horizontal overflow for the full-bleed bands. */
+  .matrix-wrap { overflow-x: auto; }
+
   .matrix {
     width: 100%;
     border-collapse: collapse;

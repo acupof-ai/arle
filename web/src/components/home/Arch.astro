@@ -7,7 +7,7 @@ interface Props {
 }
 const { rows, foot } = Astro.props;
 ---
-<div class="arch" role="img" aria-label="arle runtime crate graph, layered top to bottom">
+<div class="arch">
   {rows.map((r) => (
     <div class="row">
       <div class="layer">{r.layer}</div>
