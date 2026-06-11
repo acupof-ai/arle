@@ -1840,6 +1840,36 @@ fn main() {
         }
     }
 
+    // FA3 hopper fwd (hdim256/bf16/sm90) — vendored at `vendor/flash-attention/`
+    // (Dao-AILab/flash-attention @ fc8cbad6, cutlass pin 71275920). Explicit
+    // opt-in (ARLE_CUDA_ENABLE_FA3=1): the 5 fwd instantiation units are
+    // nvcc-heavy and build.rs recompiles every .cu on any csrc change, so the
+    // cost is only paid on FA3-target builds. Consumer plan:
+    // docs/plans/2026-06-11-qwen35-fa3-hd256-adoption.md.
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FA3");
+    let fa3_root = Path::new("vendor/flash-attention");
+    let fa3_stub = Path::new("csrc/attention/arle_fa3_stubs.cu");
+    let fa3_shim = Path::new("csrc/attention/arle_fa3_shim.cu");
+    let enable_fa3 = env_flag("ARLE_CUDA_ENABLE_FA3") && fa3_root.join("hopper").is_dir();
+    // Exactly one implementation of the FA3 FFI symbols may reach the archive
+    // (same single-definition rule as the FlashMLA stub handling above).
+    cu_files.retain(|p| p != fa3_stub);
+    if !enable_fa3 {
+        cu_files.retain(|p| p != fa3_shim);
+        cu_files.push(fa3_stub.to_path_buf());
+    } else {
+        for entry in [
+            "instantiations/flash_fwd_hdim256_bf16_sm90.cu",
+            "instantiations/flash_fwd_hdim256_bf16_split_sm90.cu",
+            "instantiations/flash_fwd_hdim256_bf16_packgqa_sm90.cu",
+            "instantiations/flash_fwd_hdim256_bf16_paged_sm90.cu",
+            "instantiations/flash_fwd_hdim256_bf16_paged_split_sm90.cu",
+            "flash_fwd_combine.cu",
+        ] {
+            cu_files.push(fa3_root.join("hopper").join(entry));
+        }
+    }
+
     // Keep a stable compile order independent of filesystem iteration order.
     cu_files.sort();
 
@@ -1992,6 +2022,34 @@ fn main() {
             ]);
         }
 
+        // FA3 hopper units + ARLE shim. Flag set mirrors hopper/setup.py:
+        // NDEBUG is upstream-marked "otherwise performance is severely
+        // impacted"; EXTENDED_MMA_SHAPES is required for FA3's WGMMA tiles.
+        // DISABLE_{BACKWARD,LOCAL,APPENDKV} prune template combinations ARLE
+        // never dispatches (causal/full only, KV written by ARLE's own prep).
+        let is_fa3_kernel = cu_file
+            .components()
+            .any(|c| c.as_os_str() == "flash-attention");
+        if is_fa3_kernel || stem == "arle_fa3_shim" {
+            nvcc_args.extend([
+                "-std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "--use_fast_math".to_string(),
+                "-DNDEBUG".to_string(),
+                "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED".to_string(),
+                "-DCUTLASS_ENABLE_GDC_FOR_SM90".to_string(),
+                "-DCUTLASS_DEBUG_TRACE_LEVEL=0".to_string(),
+                "-DFLASHATTENTION_DISABLE_BACKWARD".to_string(),
+                "-DFLASHATTENTION_DISABLE_LOCAL".to_string(),
+                "-DFLASHATTENTION_DISABLE_APPENDKV".to_string(),
+                "-Xcudafe=--diag_suppress=177".to_string(),
+                "-gencode=arch=compute_90a,code=sm_90a".to_string(),
+                format!("-I{}", fa3_root.join("hopper").display()),
+                format!("-I{}", fa3_root.join("csrc/cutlass/include").display()),
+            ]);
+        }
+
         nvcc_jobs.push(NvccJob {
             cu_file: cu_file.clone(),
             args: nvcc_args,
@@ -2037,6 +2095,14 @@ fn main() {
             &cuda_lib,
             "arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda",
             "real FlashMLA sparse decode shim",
+        );
+    }
+
+    if enable_fa3 {
+        validate_cuda_archive_has_symbol(
+            &cuda_lib,
+            "arle_fa3_real_kernel_marker_cuda",
+            "real FA3 hd256 fwd shim (ARLE_CUDA_ENABLE_FA3 build)",
         );
     }
 

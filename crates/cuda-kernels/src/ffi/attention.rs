@@ -960,3 +960,51 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 }
+
+// ============================================================================
+// FA3 hopper fwd shim (hdim256/bf16/sm_90a) — vendored Dao-AILab
+// flash-attention @ fc8cbad6, torch-free C ABI in
+// `csrc/attention/arle_fa3_shim.cu`. Build opt-in via ARLE_CUDA_ENABLE_FA3;
+// without it the stub returns `cudaErrorNotSupported` and the marker returns
+// 0 (assert it returns 1 before enabling the runtime path — flashmla stub
+// lesson). Consumer plan:
+// `docs/plans/2026-06-11-qwen35-fa3-hd256-adoption.md`.
+// ============================================================================
+
+/// Mirror of `ArleFa3FwdHd256Args` in `csrc/attention/arle_fa3_shim.cu`.
+/// All strides in elements; heads packed within a token row
+/// (head_stride == head_dim). Step-1 contract: b=1, contiguous slot KV viewed
+/// at exact `seqlen_k`, `num_splits=1`, causal bottom-right alignment.
+#[repr(C)]
+pub struct ArleFa3FwdHd256Args {
+    pub q: *const Half,
+    pub k: *const Half,
+    pub v: *const Half,
+    pub o: *mut Half,
+    /// fp32 scratch, `num_heads * seqlen_q` elements.
+    pub softmax_lse: *mut f32,
+    /// device i32 scratch (>= 1 element); the shim zeroes it per launch.
+    pub tile_count_semaphore: *mut i32,
+    pub seqlen_q: i32,
+    pub seqlen_k: i32,
+    pub num_heads: i32,
+    pub num_heads_k: i32,
+    /// Must be 256.
+    pub head_dim: i32,
+    pub q_row_stride: i64,
+    pub k_row_stride: i64,
+    pub v_row_stride: i64,
+    pub o_row_stride: i64,
+    pub softmax_scale: f32,
+    pub is_causal: i32,
+}
+
+unsafe extern "C" {
+    pub fn arle_fa3_fwd_hd256_bf16_cuda(
+        args: *const ArleFa3FwdHd256Args,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// 1 = real FA3 shim linked; 0 = stub build.
+    pub fn arle_fa3_real_kernel_marker_cuda() -> i32;
+}
