@@ -45,11 +45,7 @@ fn fingerprint(key: u64) -> [u8; 16] {
 
 impl CudaKvTierStore {
     pub(crate) fn with_budget(budget_bytes: usize, bytes_per_page: usize) -> Self {
-        let t1_capacity_pages = if bytes_per_page == 0 {
-            0
-        } else {
-            budget_bytes / bytes_per_page
-        };
+        let t1_capacity_pages = budget_bytes.checked_div(bytes_per_page).unwrap_or(0);
         Self {
             t1_capacity_pages,
             t1: BTreeMap::new(),
@@ -60,11 +56,7 @@ impl CudaKvTierStore {
 
     /// Attach the T2 disk level (opt-in). Pre-serve only.
     pub(crate) fn set_disk(&mut self, root: PathBuf, budget_bytes: usize, bytes_per_page: usize) {
-        let capacity_pages = if bytes_per_page == 0 {
-            0
-        } else {
-            budget_bytes / bytes_per_page
-        };
+        let capacity_pages = budget_bytes.checked_div(bytes_per_page).unwrap_or(0);
         self.disk = Some(DiskTier {
             root,
             capacity_pages,
