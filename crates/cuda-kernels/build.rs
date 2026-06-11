@@ -1865,6 +1865,10 @@ fn main() {
             "instantiations/flash_fwd_hdim256_bf16_paged_sm90.cu",
             "instantiations/flash_fwd_hdim256_bf16_paged_split_sm90.cu",
             "flash_fwd_combine.cu",
+            // Defines prepare_varlen_num_blocks — referenced by the launch
+            // template's runtime VARLEN_SWITCH even on the non-varlen path,
+            // so it must link whenever any fwd instantiation does.
+            "flash_prepare_scheduler.cu",
         ] {
             cu_files.push(fa3_root.join("hopper").join(entry));
         }
