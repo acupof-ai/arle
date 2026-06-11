@@ -627,6 +627,32 @@ pub unsafe fn qwen36_add_shared_expert_gated(
     Ok(())
 }
 
+/// Qwen3.6 `norm_topk_prob` in-place renorm over `dsv4_route` weights:
+/// `weights[t*topk + k] /= Σ_k weights[t*topk + k]` (sum zero-guarded at
+/// `1e-20`, matching `infer_moe::route`'s step-5 renorm). Skip the launch
+/// entirely when `norm_topk_prob` is false (raw softmax probs are the gate
+/// weights). Wraps [`ffi::qwen36_renorm_topk_weights_cuda`].
+///
+/// # Safety
+/// `weights` must be valid on `stream` for `num_tokens * topk` f32 elements.
+pub unsafe fn qwen36_renorm_topk_weights(
+    weights: RawDevicePtr<f32>,
+    num_tokens: usize,
+    topk: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::qwen36_renorm_topk_weights_cuda(
+            weights.as_mut_ptr(),
+            i32::try_from(num_tokens)?,
+            i32::try_from(topk)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 // ── DSv4 FP8 DeepGEMM MoE pipeline (f8f8bf16, 128-block scale) ─────────────
 // The 5-call native DeepGEMM expert path: pack/quantize the packed grouped
 // hidden to FP8 → masked grouped GEMM (w13 fused gate+up) → SwiGLU+requant →
