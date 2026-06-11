@@ -380,6 +380,46 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn kv_tier_capacity_pages(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => 0,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_capacity_pages(),
+        }
+    }
+
+    fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = entries;
+                Ok(0)
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.demote_prefix_pages(entries),
+        }
+    }
+
+    fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = entries;
+                anyhow::bail!("placeholder CUDA executor has no KV tier store")
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.promote_prefix_pages(entries),
+        }
+    }
+
+    fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = keys;
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.drop_kv_tier_entries(keys),
+        }
+    }
+
     fn offload_weights(&mut self) -> anyhow::Result<usize> {
         match &mut self.inner {
             // No real device weights to offload without the cuda backend.
