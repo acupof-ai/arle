@@ -21,6 +21,7 @@ enum ServeBackend {
     Cuda,
     Metal,
     Hip,
+    Vulkan,
     Cpu,
 }
 
@@ -30,6 +31,7 @@ impl ServeBackend {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
             Self::Hip => "hip",
+            Self::Vulkan => "vulkan",
             Self::Cpu => "cpu",
         }
     }
@@ -214,6 +216,7 @@ fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
         ServeBackendArg::Cuda => Some(ServeBackend::Cuda),
         ServeBackendArg::Metal => Some(ServeBackend::Metal),
         ServeBackendArg::Hip => Some(ServeBackend::Hip),
+        ServeBackendArg::Vulkan => Some(ServeBackend::Vulkan),
         ServeBackendArg::Cpu => Some(ServeBackend::Cpu),
         ServeBackendArg::Auto => None,
     };
@@ -223,14 +226,22 @@ fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
         CompiledBackend::Metal => Some(ServeBackend::Metal),
         #[cfg(feature = "hip")]
         CompiledBackend::Hip => Some(ServeBackend::Hip),
+        #[cfg(feature = "vulkan")]
+        CompiledBackend::Vulkan => Some(ServeBackend::Vulkan),
         CompiledBackend::Cpu => Some(ServeBackend::Cpu),
-        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "hip", feature = "cpu")))]
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "hip",
+            feature = "vulkan",
+            feature = "cpu"
+        )))]
         CompiledBackend::None => None,
     };
 
     let Some(compiled) = compiled else {
         return Err(
-            "serve requires a backend build; rebuild with cuda, metal/no-cuda, or cpu/no-cuda"
+            "serve requires a backend build; rebuild with cuda, metal/no-cuda, vulkan/no-cuda, or cpu/no-cuda"
                 .to_string(),
         );
     };
@@ -282,11 +293,14 @@ mod tests {
             CompiledBackend::Metal => "metal",
             #[cfg(feature = "hip")]
             CompiledBackend::Hip => "hip",
+            #[cfg(feature = "vulkan")]
+            CompiledBackend::Vulkan => "vulkan",
             CompiledBackend::Cpu => "cpu",
             #[cfg(not(any(
                 feature = "cuda",
                 feature = "metal",
                 feature = "hip",
+                feature = "vulkan",
                 feature = "cpu"
             )))]
             CompiledBackend::None => "auto",
@@ -394,11 +408,14 @@ mod tests {
             CompiledBackend::Metal => "cuda",
             #[cfg(feature = "hip")]
             CompiledBackend::Hip => "metal",
+            #[cfg(feature = "vulkan")]
+            CompiledBackend::Vulkan => "metal",
             CompiledBackend::Cuda | CompiledBackend::Cpu => "metal",
             #[cfg(not(any(
                 feature = "cuda",
                 feature = "metal",
                 feature = "hip",
+                feature = "vulkan",
                 feature = "cpu"
             )))]
             CompiledBackend::None => return,

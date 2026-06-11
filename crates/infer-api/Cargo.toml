@@ -36,6 +36,7 @@ tokio = { version = "1", features = [
 infer-metal = { path = "../infer-metal", default-features = false, optional = true }
 infer-cuda = { path = "../infer-cuda", default-features = false, optional = true }
 infer-hip = { path = "../infer-hip", default-features = false, optional = true }
+infer-vulkan = { path = "../infer-vulkan", default-features = false, optional = true }
 # CUDA-only: `RawLogits` carries a `cuda_kernels` device buffer/context and reads
 # its raw device pointer via the `cudarc` `DevicePtr` trait for the OPD-teacher
 # raw-logits surface. Both engage only under `--features cuda`.
@@ -68,6 +69,9 @@ metal = ["dep:infer-metal", "infer-metal/metal", "infer-server/metal"]
 # HIP backend via infer-hip (AMD ROCm, DSv4 GGUF). infer-server has no
 # hip-specific code, so no infer-server feature is forwarded (unlike metal).
 hip = ["dep:infer-hip", "infer-hip/hip"]
+# Vulkan backend via infer-vulkan (cross-vendor, Windows lane). infer-server
+# stays backend-neutral; device code is gated below infer-vulkan.
+vulkan = ["dep:infer-vulkan", "infer-vulkan/vulkan"]
 # Portable CPU backend: drives the engine over infer-metal's feature-free
 # host KV pool + the placeholder MetalExecutor (no MLX, no CUDA). Used for
 # smoke / CI and the adapter integration test.

@@ -10,7 +10,7 @@
 //! The CLI is synchronous, so this owns its tokio multi-thread runtime rather
 //! than relying on `#[tokio::main]` (which is what the deleted bins used).
 //!
-//! Backend is selected at compile time (`metal`/`cuda`/`cpu`) and the router is
+//! Backend is selected at compile time (`metal`/`cuda`/`hip`/`vulkan`/`cpu`) and the router is
 //! built by [`LoadedInferenceEngine::router_for_backend`], which spawns the same
 //! `ServeHandle` the `load_*` constructors spawn. On a build with no backend
 //! compiled in, [`serve_http`] returns a clear error (mirrors `--doctor`).
@@ -58,7 +58,13 @@ impl ServeHttpOptions {
 ///
 /// Errors before binding if no backend was compiled in, if the model / tokenizer
 /// fails to load, or if the address is already in use.
-#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
     use anyhow::Context;
 
@@ -90,14 +96,26 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
 }
 
 /// Backend-absent build: report the same way `--doctor` does and return an error.
-#[cfg(not(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu")))]
+#[cfg(not(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+)))]
 pub fn serve_http(_opts: ServeHttpOptions) -> Result<()> {
     anyhow::bail!(
-        "serve requires a backend build; rebuild with cuda, metal/no-cuda, or cpu/no-cuda"
+        "serve requires a backend build; rebuild with cuda, metal/no-cuda, vulkan/no-cuda, or cpu/no-cuda"
     )
 }
 
-#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 async fn shutdown_signal() {
     if tokio::signal::ctrl_c().await.is_ok() {
         log::info!("shutdown signal received");

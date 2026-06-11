@@ -43,10 +43,7 @@ dependencies = [
  "anyhow",
  "cli",
  "infer-util",
- "infer-vulkan",
  "serde_json",
- "vulkan-kernels",
- "vulkan-sys",
 ]
 
 [[package]]
@@ -1488,6 +1485,7 @@ dependencies = [
  "infer-plan",
  "infer-seam",
  "infer-server",
+ "infer-vulkan",
  "log",
  "serde",
  "serde_json",

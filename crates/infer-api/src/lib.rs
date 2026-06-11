@@ -4,7 +4,7 @@
 //! [`InferenceEngine`] trait, [`LoadedInferenceEngine`] enum, request/output/
 //! stream/telemetry types) over the rewrite stack, so consumers can later swap
 //! `infer` -> `infer-api` with zero code changes. Backend selection is by
-//! compiled feature (`metal`/`cuda`/`cpu`). Every request flows
+//! compiled feature (`metal`/`cuda`/`hip`/`vulkan`/`cpu`). Every request flows
 //! `tokenize -> ServeHandle::submit -> collect -> detokenize` via
 //! [`ServeInferenceEngine`].
 //!
@@ -37,7 +37,13 @@ mod types;
 #[cfg(feature = "cuda")]
 pub use loaded::CudaWorkerEngine;
 pub use loaded::EngineLoadConfig;
-#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 pub use loaded::LoadedInferenceEngine;
 /// Multiproc-serve spawn gate: which CUDA checkpoints join the env-driven TP
 /// world (DSv4 + Qwen3.5/3.6 MoE). Consumed by `cli::serve_multiproc`.

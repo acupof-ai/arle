@@ -24,10 +24,15 @@ P6 adds `crates/gemma-spec` and the Gemma4 Vulkan text contract: nested
 `text_config` parsing, sliding/global layer typing with final-global
 validation, PLE fields, global KV/p-RoPE fields, QK-norm, GeGLU, and the
 Gemma RMSNorm(+1) convention.
+P7 wires the compiled Vulkan backend through `infer-api` and `cli`: root
+`--features vulkan` now forwards through `cli/vulkan`, `arle serve --backend
+vulkan` resolves to the Vulkan build, and the in-process router uses the
+GGUF-only Vulkan load path.
 
-The backend is not reachable from `arle serve` yet. CLI and model wiring are
-scheduled for P7, so there is no production hot path or benchmarkable endpoint
-on this Mac.
+The backend is reachable from `arle serve --backend vulkan` only as an
+off-box/typecheck endpoint today. Numeric forward still fails loud after host
+GGUF/tokenizer resolution, so there is no production hot path or benchmarkable
+endpoint on this Mac.
 
 ## Results
 
@@ -52,20 +57,32 @@ cargo check -p infer-vulkan --features vulkan
 cargo test -p infer-vulkan
 cargo test -p infer-vulkan --features vulkan
 cargo clippy -p infer-vulkan --all-features -- -D warnings
+cargo fmt --check
+cargo check --no-default-features --features vulkan,no-cuda
+cargo check -p infer-api --no-default-features --features vulkan
+cargo test -p infer-api --no-default-features --features vulkan
+cargo test -p cli --no-default-features --features vulkan,no-cuda
+cargo test --no-default-features --features vulkan,no-cuda
+cargo clippy --no-default-features --features vulkan,no-cuda -- -D warnings
+cargo check
+cargo test
+cargo check --features vulkan
 ```
 
 All passed on 2026-06-11. `cargo check --features vulkan` also passed after
-P1.
+P1 and again after P7 root feature forwarding.
 
 On-box validation is pending: SPIR-V compile path, Vulkan loader/device
 enumeration on the AIPC target, numeric correctness, and throughput.
 
 ## Problems
 
-The exact root `cargo clippy --all-features -- -D warnings` gate is blocked
-before P0 completion because all-features enables unrelated pre-existing CUDA
-and autograd code paths on this Mac. The visible blockers include protected
-dirty `crates/infer-cuda/src/moe.rs` errors and an `autograd` CUDA match gap.
+The exact root `cargo clippy --all-features -- -D warnings` gate is blocked on
+this Mac because all-features enables CUDA without a local CUDA toolkit. The
+current first blocker is `cudarc`'s build script failing `nvcc --version`
+(`nvcc` not found). Earlier all-feature attempts also exposed unrelated CUDA /
+autograd paths. These are outside the Vulkan phase and the protected CUDA files
+were not touched.
 
 P1 has a second pending item: this Mac has `glslc`, and several vendored
 llama.cpp shader variants warn-and-skip because ARLE has not yet replicated
