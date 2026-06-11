@@ -1117,9 +1117,15 @@ impl Dsv4Model {
             .saturating_add(state_caches_per_slot);
         let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
             Ok((free, _total)) => {
-                let budget = ((free as f64 * MEM_FRACTION) as usize)
-                    .saturating_sub(dsa_shared_bytes)
-                    .saturating_sub(moe_decode_shared_bytes);
+                // Neutral budget kernel (infer-seam): floor(free × fraction) −
+                // Σfixed, then / per_slot. The two saturating_subs fold into one
+                // fixed term (byte-identical, proven by the kernel unit test).
+                let budget = infer_seam::SlotBudget::from_free(
+                    free,
+                    MEM_FRACTION,
+                    dsa_shared_bytes.saturating_add(moe_decode_shared_bytes),
+                    per_slot,
+                );
                 log::info!(
                     "DSv4 KV budget: free {}MB, per_slot {}MB (arena×2 {}MB + rotated {}MB + \
                      state caches {}MB), shared DSA {}MB, shared MoE decode {}MB",
@@ -1132,7 +1138,7 @@ impl Dsv4Model {
                     moe_decode_shared_bytes >> 20,
                 );
                 budget
-                    .checked_div(per_slot)
+                    .affordable()
                     .map_or(i32::MAX, |n| i32::try_from(n.max(1)).unwrap_or(i32::MAX))
             }
             // Can't query (no active context / driver error) → don't bind
@@ -1142,7 +1148,10 @@ impl Dsv4Model {
         let affordable =
             self.tp
                 .all_reduce_min_scalar_i32(&self.ctx, affordable_local)? as usize;
-        if requested > affordable {
+        // Neutral clamp (infer-seam): planned = min(requested, affordable);
+        // clamped == requested > affordable. NCCL min-reduce stays CUDA-side.
+        let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
+        if clamped {
             log::warn!(
                 "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (arena×2 ~{}MB + \
                  per-slot selector/compressor caches ~{}MB) + shared DSA scratch ~{}MB exceeds the \
@@ -1155,7 +1164,7 @@ impl Dsv4Model {
                 dsa_shared_bytes >> 20,
             );
         }
-        Ok(requested.min(affordable))
+        Ok(planned)
     }
 
     pub(crate) fn truncate_slot(&self, slot: &mut Dsv4SlotState, new_len: usize) -> Result<()> {
