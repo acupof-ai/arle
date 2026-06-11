@@ -667,13 +667,30 @@ mod tests {
     #[cfg(feature = "vulkan")]
     #[test]
     fn vulkan_feature_build_produces_every_registered_spv() {
+        if option_env!("ARLE_VULKAN_GLSLC_PRESENT") != Some("1") {
+            eprintln!("vulkan-kernels: glslc unavailable, skipping SPIR-V existence check");
+            return;
+        }
         let dir = option_env!("ARLE_VULKAN_SPV_DIR").expect("build.rs sets ARLE_VULKAN_SPV_DIR");
-        for kernel in Kernel::ALL {
-            let path = std::path::Path::new(dir).join(format!("{}.spv", kernel.shader_name()));
+        let manifest_path = std::path::Path::new(dir).join("registered-shaders.txt");
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .unwrap_or_else(|_| panic!("missing shader manifest {}", manifest_path.display()));
+        let registered: std::collections::BTreeSet<_> =
+            manifest.lines().filter(|name| !name.is_empty()).collect();
+        let exposed: std::collections::BTreeSet<_> = Kernel::ALL
+            .iter()
+            .map(|kernel| kernel.shader_name())
+            .collect();
+        assert_eq!(
+            registered, exposed,
+            "build.rs registry and Kernel::ALL drifted"
+        );
+        for name in registered {
+            let path = std::path::Path::new(dir).join(format!("{name}.spv"));
             let len = std::fs::metadata(&path)
-                .unwrap_or_else(|_| panic!("missing SPIR-V for {}", kernel.shader_name()))
+                .unwrap_or_else(|_| panic!("missing SPIR-V for {name}"))
                 .len();
-            assert!(len > 0, "empty SPIR-V for {}", kernel.shader_name());
+            assert!(len > 0, "empty SPIR-V for {name}");
         }
     }
 

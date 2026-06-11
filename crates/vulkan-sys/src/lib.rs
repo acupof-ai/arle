@@ -54,6 +54,8 @@ mod real {
     use ash::{Entry, vk};
     use std::ffi::{CStr, CString};
 
+    const REQUIRED_API_VERSION: u32 = vk::API_VERSION_1_2;
+
     fn runtime_error(context: &str, err: impl std::fmt::Display) -> VulkanError {
         VulkanError::Runtime(format!("{context}: {err}"))
     }
@@ -72,7 +74,7 @@ mod real {
             .application_version(1)
             .engine_name(&engine_name)
             .engine_version(1)
-            .api_version(vk::API_VERSION_1_1);
+            .api_version(REQUIRED_API_VERSION);
         let create = vk::InstanceCreateInfo::default().application_info(&app);
         unsafe { entry.create_instance(&create, None) }
             .map_err(|e| vk_error("creating Vulkan instance", e))
@@ -88,11 +90,14 @@ mod real {
         let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| vk_error("enumerating Vulkan physical devices", e))?;
         for physical_device in devices {
+            let props = unsafe { instance.get_physical_device_properties(physical_device) };
+            if props.api_version < REQUIRED_API_VERSION {
+                continue;
+            }
             let families =
                 unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
             for (idx, family) in families.iter().enumerate() {
                 if family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::COMPUTE) {
-                    let props = unsafe { instance.get_physical_device_properties(physical_device) };
                     let queue_family_index = u32::try_from(idx)
                         .map_err(|e| runtime_error("converting Vulkan queue family index", e))?;
                     return Ok((physical_device, queue_family_index, props));

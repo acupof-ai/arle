@@ -257,6 +257,11 @@ fn main() {
     std::fs::create_dir_all(&out_dir).expect("create vulkan-spv out dir");
     println!("cargo:rustc-env=ARLE_VULKAN_SPV_DIR={}", out_dir.display());
 
+    let shader_names: Vec<_> = VENDORED.iter().chain(LOCAL).map(|spec| spec.name).collect();
+    let manifest = format!("{}\n", shader_names.join("\n"));
+    std::fs::write(out_dir.join("registered-shaders.txt"), manifest)
+        .expect("write registered shader manifest");
+
     for spec in VENDORED.iter().chain(LOCAL) {
         println!(
             "cargo:rerun-if-changed={}",
@@ -269,6 +274,7 @@ fn main() {
         "generic_binary_head.glsl",
         "generic_unary_head.glsl",
         "utils.glsl",
+        "rope_params.glsl",
         "mul_mat_vec_base.glsl",
         "mul_mat_vec_iface.glsl",
         "mul_mat_vecq_funcs.glsl",
@@ -276,6 +282,8 @@ fn main() {
         "dot_product_funcs.glsl",
         "flash_attn_base.glsl",
         "flash_attn_dequant.glsl",
+        "flash_attn_mmq_funcs.glsl",
+        "mul_mmq_shmem_types.glsl",
         "rope_head.glsl",
         "rope_funcs.glsl",
         "glu_head.glsl",
@@ -292,8 +300,10 @@ fn main() {
             "cargo:warning=vulkan-kernels: glslc not found (ARLE_VULKAN_GLSLC/VULKAN_SDK/PATH); \
              skipping SPIR-V compilation — typecheck-only lane, compile on the Vulkan box"
         );
+        println!("cargo:rustc-env=ARLE_VULKAN_GLSLC_PRESENT=0");
         return;
     };
+    println!("cargo:rustc-env=ARLE_VULKAN_GLSLC_PRESENT=1");
 
     for spec in VENDORED.iter().chain(LOCAL) {
         let src = workspace_root.join(spec.source);
