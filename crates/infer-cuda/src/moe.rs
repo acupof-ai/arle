@@ -390,6 +390,25 @@ mod gpu {
         )
     }
 
+    /// Whether this routing config can run on the DEVICE route kernel (greedy
+    /// top-k, no group-limited masking). Shared by the per-layer dispatch in
+    /// [`moe_forward_into`] and the decode-graph gate below.
+    fn device_route_eligible(cfg: &MoeConfig) -> bool {
+        cfg.topk_method == TopkMethod::Greedy && cfg.n_group.is_none() && cfg.topk_group.is_none()
+    }
+
+    /// Decode-graph gate: TRUE iff a `seq_len == 1` MoE step through
+    /// [`moe_forward_into`] is a pure device-kernel sequence (CUDA-graph
+    /// capturable) for `cfg` — i.e. it takes the device router (no per-layer
+    /// `ctx.sync` + logits D2H + indices/weights H2D of the host fallback) AND
+    /// the decode routed-row count stays under the DeepGEMM hybrid-dispatch
+    /// floor so the shape-constant hand grouped kernels run (DeepGEMM JIT is
+    /// not capture-safe and never fires at decode: `R = top_k <
+    /// QWEN35_DEEPGEMM_MIN_ROUTES`).
+    pub(crate) fn qwen35_decode_moe_graph_capturable(cfg: &MoeConfig) -> bool {
+        use_gpu_router() && device_route_eligible(cfg) && cfg.top_k < QWEN35_DEEPGEMM_MIN_ROUTES
+    }
+
     /// BF16 MoE forward for one sparse layer (allocate-per-call compatibility
     /// wrapper): builds a transient [`MoeForwardScratch`] + output buffer and
     /// delegates to [`moe_forward_into`]. Same allocation behavior as the
@@ -494,10 +513,7 @@ mod gpu {
         // The device kernel implements greedy top-k (zero selection bias) with
         // no group-limited masking; any other routing config falls back to the
         // host reference rather than silently mis-routing.
-        let device_route_eligible = cfg.topk_method == TopkMethod::Greedy
-            && cfg.n_group.is_none()
-            && cfg.topk_group.is_none();
-        let (route_indices, route_weights) = if use_gpu_router() && device_route_eligible {
+        let (route_indices, route_weights) = if use_gpu_router() && device_route_eligible(cfg) {
             // `dsv4_route` with routing_kind=1 (learned-bias selection key) and
             // an all-zero bias IS greedy top-k: key = scores + 0.0 exactly
             // (softmax scores are >= +0.0, so `x + 0.0f == x` bitwise).
@@ -689,7 +705,9 @@ mod gpu {
                 expert_shape_ok(first, &weights.up[0], hidden_dim, mi)?;
                 mi
             }
-            (None, None) => anyhow::bail!("MoE weights carry neither grouped nor per-expert experts"),
+            (None, None) => {
+                anyhow::bail!("MoE weights carry neither grouped nor per-expert experts")
+            }
         };
         let gate_out = scratch.gate_out.get(ctx, moe_inter, total_routes)?;
         let up_out = scratch.up_out.get(ctx, moe_inter, total_routes)?;
@@ -724,11 +742,18 @@ mod gpu {
         silu_mul(ctx, gate_out, up_out, act)?;
 
         // ── 7. Grouped down GEMM → expert_out[R, H]. ────────────────────────
+        // Grouped-mode loads cleared the per-expert Vec; the group carries
+        // the (uniform, concat-ensured) dims instead.
+        let (down_rows, down_cols) = match (&weights.down_grouped, weights.down.first()) {
+            (Some(g), _) => (g.rows, g.cols),
+            (None, Some(first)) => (first.rows, first.cols),
+            (None, None) => anyhow::bail!("MoE weights carry neither grouped nor per-expert down"),
+        };
         ensure!(
-            weights.down[0].cols == moe_inter && weights.down[0].rows == hidden_dim,
+            down_cols == moe_inter && down_rows == hidden_dim,
             "MoE expert down shape {}x{} != hidden_dim {} / moe_inter {}",
-            weights.down[0].rows,
-            weights.down[0].cols,
+            down_rows,
+            down_cols,
             hidden_dim,
             moe_inter
         );
@@ -3645,7 +3670,9 @@ pub(crate) use dsv4_gpu::{
 #[cfg(feature = "deepep")]
 pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};
 #[cfg(feature = "cuda")]
-pub(crate) use gpu::{MoeForwardScratch, moe_forward, moe_forward_into};
+pub(crate) use gpu::{
+    MoeForwardScratch, moe_forward, moe_forward_into, qwen35_decode_moe_graph_capturable,
+};
 
 #[cfg(test)]
 mod tests {
