@@ -205,8 +205,17 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         ));
     }
 
-    let engine_config = resolve_engine_config(serve_args)?;
+    let mut engine_config = resolve_engine_config(serve_args)?;
     let spec = resolve_spec_options(backend, serve_args);
+    // Lower MTP spec into the engine config at the CLI level so BOTH paths carry the
+    // draft depth: the multiproc coordinator serializes `config.options.engine_config`
+    // into `ARLE_WORKER_ENGINE_CONFIG` before spawning workers and NEVER runs
+    // `serve_http`'s lowering — without this every rank builds with
+    // `mtp_draft_tokens=None` and skips the MTP-head load. (serve_http re-applies the
+    // same lowering idempotently for the single-proc path.)
+    if spec.spec_type == ServeSpecType::Mtp {
+        engine_config.mtp_draft_tokens = Some(spec.mtp_draft_tokens.unwrap_or(1));
+    }
 
     let options = ServeHttpOptions {
         model_path,
