@@ -230,7 +230,7 @@ mod real {
             .max(DSV4_PARITY_NUM_SLOTS);
         let load_t0 = Instant::now();
         let mut exec =
-            CudaExecutor::from_dsv4_fp8_safetensors(&model_path, num_slots, slot_max_seq_len)
+            CudaExecutor::from_dsv4_fp8_safetensors(&model_path, num_slots, slot_max_seq_len, None)
                 .context("from_dsv4_fp8_safetensors failed (build/config?)")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
         if env_flag("INFER_DSV4_MTP_STEP_A_SELFTEST") {

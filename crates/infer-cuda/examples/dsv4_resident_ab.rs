@@ -199,8 +199,9 @@ mod real {
         );
 
         let load_t0 = Instant::now();
-        let mut exec = CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1, dsv4_max_seq_len())
-            .context("from_dsv4_fp8_safetensors failed")?;
+        let mut exec =
+            CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1, dsv4_max_seq_len(), None)
+                .context("from_dsv4_fp8_safetensors failed")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
 
         for rep in 0..repeat {
