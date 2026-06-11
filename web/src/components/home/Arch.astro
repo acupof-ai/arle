@@ -1,0 +1,101 @@
+---
+import type { ArchRow } from "../../data/content.ts";
+
+interface Props {
+  rows: ArchRow[];
+  foot: string[];
+}
+const { rows, foot } = Astro.props;
+---
+<div class="arch" role="img" aria-label="arle runtime crate graph, layered top to bottom">
+  {rows.map((r) => (
+    <div class="row">
+      <div class="layer">{r.layer}</div>
+      <div class="crates">
+        {r.chips.map((c) => (
+          <span class:list={["chip", c.kind]}>{c.label}</span>
+        ))}
+        <span class="note" set:html={r.note} />
+      </div>
+    </div>
+  ))}
+</div>
+<div class="arch-foot">
+  {foot.map((f) => <span set:html={f} />)}
+</div>
+<style>
+  .arch {
+    border: 1px solid var(--ink);
+    background: var(--paper);
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 110px 1fr;
+    border-bottom: 1px solid var(--line);
+  }
+  .row:last-child { border-bottom: none; }
+  .layer {
+    padding: 16px 14px;
+    border-right: 1px solid var(--line);
+    font-size: 9px;
+    letter-spacing: 0.20em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    display: flex;
+    align-items: center;
+  }
+  .crates {
+    padding: 13px 16px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 10px;
+    min-width: 0;
+  }
+  .chip {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink);
+    border: 1px solid var(--line);
+    background: var(--paper-dim);
+    padding: 4px 10px;
+    white-space: nowrap;
+  }
+  .chip.bin {
+    background: var(--ink);
+    color: var(--paper);
+    border-color: var(--ink);
+  }
+  .chip.door { border-color: var(--ink); background: var(--paper); }
+  .chip.feat { color: var(--ink-soft); border-style: dashed; background: var(--paper); }
+  .note {
+    font-size: 11px;
+    color: var(--ink-soft);
+    margin-left: auto;
+    white-space: nowrap;
+  }
+  .note :global(code) { color: var(--ink); font-weight: 600; }
+  .arch-foot {
+    border: 1px solid var(--line);
+    border-top: none;
+    background: var(--paper-dim);
+    padding: 12px 16px;
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--ink-soft);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 24px;
+  }
+  .arch-foot :global(b) { color: var(--ink); font-weight: 600; }
+
+  @media (max-width: 760px) {
+    .row { grid-template-columns: 1fr; }
+    .layer {
+      border-right: none;
+      border-bottom: 1px solid var(--line-soft);
+      padding-bottom: 8px;
+    }
+    .note { margin-left: 0; white-space: normal; }
+  }
+</style>

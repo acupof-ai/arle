@@ -9,6 +9,9 @@ html {
   scroll-behavior: smooth;
   background: var(--paper);
   color: var(--ink);
+  /* Full-bleed ink bands escape the centered column with 50vw margins;
+     vw includes the scrollbar gutter, so clip the sub-pixel overshoot here. */
+  overflow-x: clip;
 }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
