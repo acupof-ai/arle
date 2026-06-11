@@ -51,7 +51,7 @@ impl std::error::Error for VulkanError {}
 #[cfg(feature = "vulkan")]
 mod real {
     use super::{Result, VulkanError};
-    use ash::{vk, Entry};
+    use ash::{Entry, vk};
     use std::ffi::{CStr, CString};
 
     fn runtime_error(context: &str, err: impl std::fmt::Display) -> VulkanError {
@@ -640,10 +640,12 @@ mod real {
             let push_ranges = if push_constant_bytes == 0 {
                 Vec::new()
             } else {
-                vec![vk::PushConstantRange::default()
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                    .offset(0)
-                    .size(push_constant_bytes)]
+                vec![
+                    vk::PushConstantRange::default()
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                        .offset(0)
+                        .size(push_constant_bytes),
+                ]
             };
             let layout_create = vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&set_layouts)
@@ -708,8 +710,8 @@ mod real {
 
 #[cfg(feature = "vulkan")]
 pub use real::{
-    device_count, device_name, init, CommandPool, ComputePipeline, DescriptorSet,
-    DescriptorSetLayout, DeviceBuffer, ShaderModule, VulkanContext,
+    CommandPool, ComputePipeline, DescriptorSet, DescriptorSetLayout, DeviceBuffer, ShaderModule,
+    VulkanContext, device_count, device_name, init,
 };
 
 #[cfg(not(feature = "vulkan"))]
@@ -843,8 +845,8 @@ mod stub {
 
 #[cfg(not(feature = "vulkan"))]
 pub use stub::{
-    device_count, device_name, init, CommandPool, ComputePipeline, DescriptorSet,
-    DescriptorSetLayout, DeviceBuffer, ShaderModule, VulkanContext,
+    CommandPool, ComputePipeline, DescriptorSet, DescriptorSetLayout, DeviceBuffer, ShaderModule,
+    VulkanContext, device_count, device_name, init,
 };
 
 #[cfg(test)]
