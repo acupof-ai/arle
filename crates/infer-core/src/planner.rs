@@ -125,12 +125,25 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .map(|(pos, _)| pos)
     }
 
-    fn requeue_preempted_decode(&mut self, slot: usize) {
+    pub(crate) fn requeue_preempted_decode(&mut self, slot: usize) {
         let Some(request) = self.active.remove(&slot) else {
             return;
         };
+        // Swap-style preemption (#84): with a host tier, seal the victim's
+        // prompt blocks into the radix and demote exactly those pages, so
+        // re-admission promotes the prefill back instead of recomputing it.
+        // The same device pages end up free as the plain path; without a
+        // tier store the behavior is byte-for-byte unchanged.
+        let published = if self.kv_tier_capacity() > 0 {
+            self.publish_prefix_blocks(slot, &request)
+        } else {
+            Vec::new()
+        };
         self.release_reused_prefix(&request.reused_prefix_pages);
         self.kv.free_slot(slot);
+        if !published.is_empty() {
+            self.demote_published_pages(&published);
+        }
         self.enqueue_waiting_request(
             request.reset_for_recompute(),
             WaitingInsertBias::BeforeEqual,

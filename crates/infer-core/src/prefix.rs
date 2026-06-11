@@ -120,16 +120,22 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
     }
 
-    pub(crate) fn publish_prefix_blocks(&mut self, slot: usize, request: &RequestState) {
+    /// Seal the request's full prompt blocks into the radix. Returns the
+    /// newly cached pages (already cache-retained), in prompt order.
+    pub(crate) fn publish_prefix_blocks(
+        &mut self,
+        slot: usize,
+        request: &RequestState,
+    ) -> Vec<BlockId> {
         if !self.kv.is_active() {
-            return;
+            return Vec::new();
         }
 
         let block_size = self.radix.block_size().max(1);
         let publishable_tokens = request.prompt_len().min(self.kv.seq_len(slot));
         let sealed_blocks = publishable_tokens / block_size;
         if sealed_blocks == 0 {
-            return;
+            return Vec::new();
         }
 
         let sealed_tokens = sealed_blocks * block_size;
@@ -139,7 +145,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .to_vec();
         let publish_blocks = sealed_blocks.min(pages.len());
         if publish_blocks == 0 {
-            return;
+            return Vec::new();
         }
 
         let token_len = publish_blocks * block_size;
@@ -156,6 +162,26 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
         // Publishing over a demoted node revives it with the re-prefilled
         // page; the superseded tier entries surface on the drain.
+        self.drain_dropped_tier_keys();
+        newly_cached
+    }
+
+    /// Swap-style preemption support: demote exactly these just-published
+    /// victim pages into the host tier (deepest block first so each parent
+    /// becomes an evictable leaf in turn), severing on store refusal. Either
+    /// way every page ends up free, so retraction releases the same device
+    /// pages as a plain `free_slot` — only the contents' fate differs.
+    pub(crate) fn demote_published_pages(&mut self, pages: &[BlockId]) {
+        for &page in pages.iter().rev() {
+            if !self.try_demote_page(page) && !self.radix.evict_page(page) {
+                // Defensive: a just-published page must be an idle leaf by
+                // construction; if not, leave it cache-resident rather than
+                // corrupt accounting.
+                continue;
+            }
+            self.kv.release_pages(&[page]);
+            self.executor.release_prefix_pages(&[page]);
+        }
         self.drain_dropped_tier_keys();
     }
 
@@ -204,7 +230,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// Host-tier capacity in pages; `0` disables every tier path. Tier use is
     /// gated on the prefix cache because demoted blocks are only reachable
     /// through radix prefix matches.
-    fn kv_tier_capacity(&self) -> usize {
+    pub(crate) fn kv_tier_capacity(&self) -> usize {
         if self.config.enable_prefix_cache {
             self.executor.kv_tier_capacity_pages()
         } else {
