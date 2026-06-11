@@ -346,7 +346,7 @@ fn deliverable_delta(full: &str, emitted: &str, holdback: usize) -> Option<Strin
 /// Used by the backend variants; unused on a no-backend lib build.
 #[must_use]
 #[cfg_attr(
-    not(any(feature = "metal", feature = "cuda", feature = "cpu")),
+    not(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu")),
     allow(dead_code)
 )]
 pub(crate) fn model_id_from_path(model_path: &str) -> String {

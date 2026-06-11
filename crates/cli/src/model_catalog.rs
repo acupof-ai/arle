@@ -174,8 +174,15 @@ mod tests {
                 name: "L4".to_string(),
                 vram_gb: memory_gb,
             },
+            #[cfg(feature = "hip")]
+            CompiledBackend::Hip => GpuInfo::None,
             CompiledBackend::Cpu => GpuInfo::None,
-            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            #[cfg(not(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "hip",
+                feature = "cpu"
+            )))]
             CompiledBackend::None => GpuInfo::None,
         };
         SystemInfo {

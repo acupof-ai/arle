@@ -20,6 +20,7 @@ use crate::{
 enum ServeBackend {
     Cuda,
     Metal,
+    Hip,
     Cpu,
 }
 
@@ -28,6 +29,7 @@ impl ServeBackend {
         match self {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
+            Self::Hip => "hip",
             Self::Cpu => "cpu",
         }
     }
@@ -211,6 +213,7 @@ fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
     let requested = match arg {
         ServeBackendArg::Cuda => Some(ServeBackend::Cuda),
         ServeBackendArg::Metal => Some(ServeBackend::Metal),
+        ServeBackendArg::Hip => Some(ServeBackend::Hip),
         ServeBackendArg::Cpu => Some(ServeBackend::Cpu),
         ServeBackendArg::Auto => None,
     };
@@ -218,8 +221,10 @@ fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
     let compiled = match CompiledBackend::detect() {
         CompiledBackend::Cuda => Some(ServeBackend::Cuda),
         CompiledBackend::Metal => Some(ServeBackend::Metal),
+        #[cfg(feature = "hip")]
+        CompiledBackend::Hip => Some(ServeBackend::Hip),
         CompiledBackend::Cpu => Some(ServeBackend::Cpu),
-        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "hip", feature = "cpu")))]
         CompiledBackend::None => None,
     };
 
@@ -275,8 +280,15 @@ mod tests {
         match CompiledBackend::detect() {
             CompiledBackend::Cuda => "cuda",
             CompiledBackend::Metal => "metal",
+            #[cfg(feature = "hip")]
+            CompiledBackend::Hip => "hip",
             CompiledBackend::Cpu => "cpu",
-            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            #[cfg(not(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "hip",
+                feature = "cpu"
+            )))]
             CompiledBackend::None => "auto",
         }
     }
@@ -380,8 +392,15 @@ mod tests {
         // compiled in, where every explicit backend is rejected anyway).
         let other = match CompiledBackend::detect() {
             CompiledBackend::Metal => "cuda",
+            #[cfg(feature = "hip")]
+            CompiledBackend::Hip => "metal",
             CompiledBackend::Cuda | CompiledBackend::Cpu => "metal",
-            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            #[cfg(not(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "hip",
+                feature = "cpu"
+            )))]
             CompiledBackend::None => return,
         };
         let (args, serve) =
