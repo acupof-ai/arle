@@ -158,21 +158,31 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         None
     };
 
-    // Speculative / MTP routing is Metal-only on the rewrite serve stack today.
-    // The CLI rejects it elsewhere so the error surface matches the old front
-    // door. Metal carries it through to infer-api, whose serve path fail-closes
-    // until the executor consumes the options.
-    if serve_args.spec_type != ServeSpecTypeArg::None && backend != ServeBackend::Metal {
-        return Err("--spec-type is currently only supported by the Metal backend".to_string());
+    // Speculative / MTP routing is supported by Metal and CUDA on the rewrite
+    // serve stack. The CLI rejects it for other backends so the error surface
+    // is clear; the chosen backend carries it through to infer-api, whose serve
+    // path lowers `--spec-type mtp` into the engine config (CUDA DSv4 consumes
+    // it) and fail-closes the unimplemented variants. `--mtp-draft-model` (an
+    // external draft model) stays Metal-only: CUDA uses the checkpoint-native
+    // MTP head.
+    if serve_args.spec_type != ServeSpecTypeArg::None
+        && !matches!(backend, ServeBackend::Metal | ServeBackend::Cuda)
+    {
+        return Err(
+            "--spec-type is currently only supported by the Metal and CUDA backends".to_string(),
+        );
     }
     if serve_args.mtp_draft_model.is_some() && backend != ServeBackend::Metal {
         return Err(
             "--mtp-draft-model is currently only supported by the Metal backend".to_string(),
         );
     }
-    if serve_args.mtp_draft_tokens.is_some() && backend != ServeBackend::Metal {
+    if serve_args.mtp_draft_tokens.is_some()
+        && !matches!(backend, ServeBackend::Metal | ServeBackend::Cuda)
+    {
         return Err(
-            "--mtp-draft-tokens is currently only supported by the Metal backend".to_string(),
+            "--mtp-draft-tokens is currently only supported by the Metal and CUDA backends"
+                .to_string(),
         );
     }
 
@@ -217,7 +227,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
 }
 
 fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeSpecOptions {
-    if backend != ServeBackend::Metal {
+    if !matches!(backend, ServeBackend::Metal | ServeBackend::Cuda) {
         return ServeSpecOptions::default();
     }
     let mut spec_type = match serve_args.spec_type {

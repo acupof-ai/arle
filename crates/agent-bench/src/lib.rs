@@ -1808,6 +1808,7 @@ mod tests {
             &model_path,
             1,
             infer_cuda::dsv4_max_seq_len(),
+            None,
         )
         .map_err(|e| anyhow::anyhow!("from_dsv4_fp8_safetensors failed: {e:#}"))?;
 

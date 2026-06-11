@@ -232,11 +232,16 @@ impl CudaExecutor {
     /// `--max-seq-len`; tests pass [`dsv4_max_seq_len`] (the env-overridable
     /// default). The executor no longer reads the env internally (per the
     /// runtime-config-as-CLI-flag rule).
+    /// `mtp_draft_tokens`: `Some(n)` turns on the checkpoint-native MTP
+    /// speculative-decode head with draft depth `n` (config-driven, the serve
+    /// path's `--spec-type mtp` / `--mtp-draft-tokens`); `None` falls back to
+    /// the `ARLE_DSV4_SPEC_DECODE` env gate for backward compat.
     #[cfg(feature = "cuda")]
     pub fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
         max_seq_len: usize,
+        mtp_draft_tokens: Option<usize>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -244,6 +249,7 @@ impl CudaExecutor {
                     model_path,
                     num_slots,
                     max_seq_len,
+                    mtp_draft_tokens,
                 )?,
             )),
         })
