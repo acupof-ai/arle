@@ -1,9 +1,13 @@
 # Qwen3.5/3.6 batched decode stage 1 — the SGLang-comparison structural fix
 
 **Date:** 2026-06-11. **Backend:** CUDA, Qwen3.6-35B-A3B, H20.
-**Status: pending-remote** — pod c-sweep 1/2/4 (aggregate tok/s + per-stream
-ITL + needle PASS at c=2). Today c≥2 KILLS the engine (single-row ensure),
-so the baseline for the c>1 cells is "engine death", not a number.
+**Status: LICENSED.** Pod c-sweep (b2077c65 build): batched 40.5/65.6/65.5
+tok/s aggregate at c=1/2/4 vs sequential-fallback 40.6/40.4/40.5 — +62% at
+c=2, needle@c2 PASS 2.75 s; old behavior at c≥2 was engine death. The c=4
+plateau was the decode MoE grouped kernel (nsys: 76.6% of GPU time,
+R-proportional at 3% BW) — lifted by the decode-band kernel rework (see
+2026-06-11-qwen35-decode-moe-kernel-licensed.md): with it, the sweep scales
+92/142/185 tok/s at c=1/2/4.
 
 ## Context
 
