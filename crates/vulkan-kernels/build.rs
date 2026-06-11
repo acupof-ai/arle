@@ -244,6 +244,7 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
     println!("cargo:rerun-if-env-changed=ARLE_VULKAN_GLSLC");
+    println!("cargo:rerun-if-env-changed=PATH");
 
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir
