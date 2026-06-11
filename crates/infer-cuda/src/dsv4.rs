@@ -1117,7 +1117,7 @@ impl Dsv4Model {
         // ONE 2-token forward amortizes the weight read (proven +63%). Capture the
         // rollback only when the spec snapshot is allocated (skipped for the
         // selftest probe, which doesn't reject).
-        if dsv4_mtp_batched_verify_enabled() && tokens.len() == 2 {
+        if dsv4_mtp_batched_verify_enabled() && tokens.len() >= 2 {
             let stream_dim = self.config.hidden_size * self.config.hc_mult;
             // Capture iff the per-slot rollback snapshot was actually allocated
             // (gated on `spec_decode_on` at slot construction): config-driven
@@ -1125,31 +1125,35 @@ impl Dsv4Model {
             if self.spec_decode_on {
                 slot.capture_spec_rollback(&self.ctx, kv_adapter, start_pos + 1)?;
             }
+            // Depth-K verify: ONE forward over `[pending, d0..d_{K-1}]` amortizes the
+            // weight read across K+1 tokens. `hiddens[j]` = position j's MTP stream;
+            // `argmax[j]` = the target's argmax AFTER `tokens[j]` (so `argmax[i]` is
+            // exactly what draft i must equal to be accepted). Per-token attention
+            // (`per_token_attn=true`) keeps the mid-sequence compressed/DSA path correct.
             let (stream, mut keepalive) =
                 self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, true)?;
-            let mut h0 = DeviceVec::zeros(&self.ctx, stream_dim)?;
-            let mut h1 = DeviceVec::zeros(&self.ctx, stream_dim)?;
-            self.capture_mtp_stream_hidden(&stream, 0, &mut h0, &mut keepalive)?;
-            self.capture_mtp_stream_hidden(&stream, 1, &mut h1, &mut keepalive)?;
-            let base_next = self.forward_stream_last_token(
-                &stream,
-                1,
-                &params,
-                position,
-                None,
-                &mut keepalive,
-            )?;
-            let bonus = self.forward_stream_last_token(
-                &stream,
-                2,
-                &params,
-                position + 1,
-                None,
-                &mut keepalive,
-            )?;
+            let n = tokens.len();
+            let mut hiddens = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
+                self.capture_mtp_stream_hidden(&stream, i, &mut h, &mut keepalive)?;
+                hiddens.push(h);
+            }
+            let mut argmax = Vec::with_capacity(n);
+            for i in 1..=n {
+                let tok = self.forward_stream_last_token(
+                    &stream,
+                    i,
+                    &params,
+                    position + (i as u64 - 1),
+                    None,
+                    &mut keepalive,
+                )?;
+                argmax.push(tok);
+            }
             std::hint::black_box(keepalive.len());
             drop(keepalive);
-            return Ok((vec![base_next, bonus], vec![h0, h1]));
+            return Ok((argmax, hiddens));
         }
 
         let mut argmax_tokens = Vec::with_capacity(tokens.len());
