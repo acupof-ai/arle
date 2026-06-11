@@ -176,11 +176,14 @@ mod tests {
             },
             #[cfg(feature = "hip")]
             CompiledBackend::Hip => GpuInfo::None,
+            #[cfg(feature = "vulkan")]
+            CompiledBackend::Vulkan => GpuInfo::None,
             CompiledBackend::Cpu => GpuInfo::None,
             #[cfg(not(any(
                 feature = "cuda",
                 feature = "metal",
                 feature = "hip",
+                feature = "vulkan",
                 feature = "cpu"
             )))]
             CompiledBackend::None => GpuInfo::None,

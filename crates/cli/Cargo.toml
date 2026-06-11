@@ -18,6 +18,9 @@ metal = ["infer-api/metal", "train/metal", "autograd/metal"]
 # HIP backend (AMD ROCm, DSv4 GGUF). Pair with `no-cuda` off-box; train/autograd
 # have no HIP code, so only infer-api forwards.
 hip = ["infer-api/hip"]
+# Vulkan backend (cross-vendor / Windows lane). Pair with `no-cuda` off-box;
+# train/autograd have no Vulkan code, so only infer-api forwards.
+vulkan = ["infer-api/vulkan"]
 nccl = ["cuda", "infer-api/nccl"]
 deepep = ["nccl", "infer-api/deepep"]
 

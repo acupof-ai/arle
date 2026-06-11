@@ -1,6 +1,6 @@
 //! `LoadedInferenceEngine` — the backend-dispatching public engine.
 //!
-//! A feature-gated enum over the available backends (`metal`/`cuda`/`cpu`,
+//! A feature-gated enum over the available backends (`metal`/`cuda`/`hip`/`vulkan`/`cpu`,
 //! selected at compile time) with a `load(model_path, enable_cuda_graph)`
 //! constructor dispatching to the active variant. [`EngineLoadConfig`] is always
 //! available; the enum + impls require a backend feature.
@@ -113,7 +113,13 @@ mod classify_tests {
     }
 }
 
-#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 mod backend {
     use anyhow::Result;
     use infer_core::SchedulerConfig;
@@ -135,6 +141,8 @@ mod backend {
     use infer_hip::{HipDsv4Executor, HipKvPool};
     #[cfg(feature = "metal")]
     use infer_metal::{MetalExecutor, MetalKvPool};
+    #[cfg(feature = "vulkan")]
+    use infer_vulkan::{VulkanExecutor, VulkanKvPool};
     // The CPU path reuses infer-metal's feature-free placeholder executor + pool.
     #[cfg(all(feature = "cpu", not(feature = "metal")))]
     use infer_metal::{MetalExecutor, MetalKvPool};
@@ -162,6 +170,10 @@ mod backend {
         /// everywhere; the device forward runs on a ROCm box (pending-remote).
         #[cfg(feature = "hip")]
         Hip(ServeInferenceEngine<HipDsv4Executor, HipKvPool>),
+        /// Vulkan backend (cross-vendor, GGUF). Host-side wiring typechecks
+        /// everywhere; numeric device forward is pending AIPC on-box bring-up.
+        #[cfg(feature = "vulkan")]
+        Vulkan(ServeInferenceEngine<VulkanExecutor, VulkanKvPool>),
         /// Portable CPU backend: the placeholder `MetalExecutor` over the real
         /// host `MetalKvPool` (no MLX, no CUDA). Smoke / CI.
         #[cfg(all(feature = "cpu", not(feature = "metal")))]
@@ -205,6 +217,18 @@ mod backend {
                 not(feature = "metal"),
                 not(feature = "cuda"),
                 not(feature = "hip"),
+                feature = "vulkan"
+            ))]
+            {
+                let _ = enable_cuda_graph;
+                return Self::load_vulkan(model_path, &config);
+            }
+
+            #[cfg(all(
+                not(feature = "metal"),
+                not(feature = "cuda"),
+                not(feature = "hip"),
+                not(feature = "vulkan"),
                 feature = "cpu"
             ))]
             {
@@ -223,6 +247,8 @@ mod backend {
                 Self::Cuda(_) => "cuda",
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => "hip",
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => "vulkan",
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => "cpu",
             }
@@ -248,6 +274,10 @@ mod backend {
                 Self::Hip(_) => {
                     anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
                 }
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {
+                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
+                }
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => {
                     anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
@@ -268,6 +298,10 @@ mod backend {
                 Self::Metal(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {
+                    anyhow::bail!("offload_engine_weights is only available on CUDA")
+                }
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
             }
@@ -283,6 +317,10 @@ mod backend {
                 Self::Metal(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {
+                    anyhow::bail!("reload_engine_weights is only available on CUDA")
+                }
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
             }
@@ -316,6 +354,11 @@ mod backend {
                 Self::Hip(_) => {
                     let _ = update;
                     anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is HIP")
+                }
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {
+                    let _ = update;
+                    anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is Vulkan")
                 }
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(_) => {
@@ -378,6 +421,17 @@ mod backend {
             )))
         }
 
+        #[cfg(feature = "vulkan")]
+        fn load_vulkan(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
+            // Vulkan GGUF load. Shares the engine builder with `router_vulkan`
+            // via `vulkan_serve_handle`, mirroring the HIP path while keeping
+            // all Vulkan types below the seam.
+            let (serve, tokenizer, model_id) = vulkan_serve_handle(model_path, config)?;
+            Ok(Self::Vulkan(ServeInferenceEngine::new(
+                model_id, tokenizer, serve,
+            )))
+        }
+
         #[cfg(all(feature = "cpu", not(feature = "metal")))]
         fn load_cpu(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
             use infer_server::OpenAiTokenizer;
@@ -433,6 +487,18 @@ mod backend {
             not(feature = "metal"),
             not(feature = "cuda"),
             not(feature = "hip"),
+            feature = "vulkan"
+        ))]
+        {
+            let _ = enable_cuda_graph;
+            return router_vulkan(model_path, &config);
+        }
+
+        #[cfg(all(
+            not(feature = "metal"),
+            not(feature = "cuda"),
+            not(feature = "hip"),
+            not(feature = "vulkan"),
             feature = "cpu"
         ))]
         {
@@ -727,12 +793,12 @@ mod backend {
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
-    /// Resolve `model_path` to the DSv4 `.gguf` checkpoint the HIP backend
-    /// loads: either the file itself or a directory containing exactly one
-    /// `*.gguf`. No HF-repo resolution (that is the Metal facade's surface);
-    /// a plain file-path check with a clear error is the MVP contract.
-    #[cfg(feature = "hip")]
-    fn resolve_hip_gguf_path(model_path: &str) -> Result<std::path::PathBuf> {
+    /// Resolve `model_path` to a `.gguf` checkpoint: either the file itself or a
+    /// directory containing exactly one `*.gguf`. No HF-repo resolution (that
+    /// is the Metal facade's surface); a plain file-path check with a clear
+    /// error is the MVP contract for GGUF-only backends.
+    #[cfg(any(feature = "hip", feature = "vulkan"))]
+    fn resolve_gguf_path(model_path: &str, backend_label: &str) -> Result<std::path::PathBuf> {
         use anyhow::{Context, bail, ensure};
 
         let path = std::path::Path::new(model_path);
@@ -740,7 +806,7 @@ mod backend {
             ensure!(
                 path.extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf")),
-                "HIP backend serves GGUF checkpoints only; {model_path} is not a .gguf file"
+                "{backend_label} backend serves GGUF checkpoints only; {model_path} is not a .gguf file"
             );
             return Ok(path.to_path_buf());
         }
@@ -757,13 +823,13 @@ mod backend {
             return match ggufs.len() {
                 1 => Ok(ggufs.remove(0)),
                 0 => bail!(
-                    "no .gguf file in {model_path}; the HIP backend serves GGUF checkpoints only"
+                    "no .gguf file in {model_path}; the {backend_label} backend serves GGUF checkpoints only"
                 ),
                 n => bail!("{n} .gguf files in {model_path}; pass the .gguf file path explicitly"),
             };
         }
         bail!(
-            "HIP model path {model_path} not found \
+            "{backend_label} model path {model_path} not found \
              (expected a .gguf file or a directory containing exactly one)"
         )
     }
@@ -785,7 +851,7 @@ mod backend {
     )> {
         use infer_server::OpenAiTokenizer;
 
-        let gguf_path = resolve_hip_gguf_path(model_path)?;
+        let gguf_path = resolve_gguf_path(model_path, "HIP")?;
         let tokenizer_dir = gguf_path
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())
@@ -810,12 +876,59 @@ mod backend {
         Ok((serve, tokenizer, model_id))
     }
 
+    /// Shared Vulkan engine builder for [`LoadedInferenceEngine::load_vulkan`]
+    /// and [`router_vulkan`]. Resolves the `.gguf` checkpoint + sibling
+    /// `tokenizer.json`, then spawns the `ServeHandle` over
+    /// [`infer_vulkan::load_qwen3_gguf`]. P7 wires the CLI endpoint; the
+    /// numeric Vulkan forward remains pending AIPC/on-box validation and fails
+    /// loud inside the backend.
+    #[cfg(feature = "vulkan")]
+    fn vulkan_serve_handle(
+        model_path: &str,
+        config: &EngineLoadConfig,
+    ) -> Result<(
+        ServeHandle<VulkanExecutor, VulkanKvPool>,
+        infer_server::OpenAiTokenizer,
+        String,
+    )> {
+        use infer_server::OpenAiTokenizer;
+
+        let gguf_path = resolve_gguf_path(model_path, "Vulkan")?;
+        let tokenizer_dir = gguf_path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map_or_else(
+                || std::path::PathBuf::from("."),
+                std::path::Path::to_path_buf,
+            );
+        let tokenizer = OpenAiTokenizer::from_model_dir(&tokenizer_dir)?;
+        let model_id = crate::serve_engine::model_id_from_path(model_path);
+
+        let scheduler = config.scheduler_config();
+        let num_slots = config.num_slots;
+        let max_seq_len = config.max_total_tokens;
+        let serve = ServeHandle::spawn_with_engine_builder(move || {
+            let (executor, kv) = infer_vulkan::load_qwen3_gguf(&gguf_path, num_slots, max_seq_len)?;
+            Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+        })?;
+        Ok((serve, tokenizer, model_id))
+    }
+
     /// HIP serve router. Builds the same `ServeHandle` as
     /// [`LoadedInferenceEngine::load_hip`] via [`hip_serve_handle`], then wraps
     /// it in [`infer_server::openai_router`]. Mirrors [`router_cuda`].
     #[cfg(feature = "hip")]
     fn router_hip(model_path: &str, config: &EngineLoadConfig) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) = hip_serve_handle(model_path, config)?;
+        Ok(infer_server::openai_router(serve, tokenizer, model_id))
+    }
+
+    /// Vulkan serve router. Builds the same `ServeHandle` as
+    /// [`LoadedInferenceEngine::load_vulkan`] via [`vulkan_serve_handle`], then
+    /// wraps it in [`infer_server::openai_router`]. Mirrors [`router_hip`].
+    #[cfg(feature = "vulkan")]
+    fn router_vulkan(model_path: &str, config: &EngineLoadConfig) -> Result<axum::Router> {
+        let (serve, tokenizer, model_id) = vulkan_serve_handle(model_path, config)?;
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
@@ -844,6 +957,8 @@ mod backend {
                 Self::Cuda(engine) => engine.model_id(),
                 #[cfg(feature = "hip")]
                 Self::Hip(engine) => engine.model_id(),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(engine) => engine.model_id(),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.model_id(),
             }
@@ -857,6 +972,8 @@ mod backend {
                 Self::Cuda(engine) => engine.complete(req),
                 #[cfg(feature = "hip")]
                 Self::Hip(engine) => engine.complete(req),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(engine) => engine.complete(req),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.complete(req),
             }
@@ -874,6 +991,8 @@ mod backend {
                 Self::Cuda(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "hip")]
                 Self::Hip(engine) => engine.complete_stream(req, tx),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(engine) => engine.complete_stream(req, tx),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.complete_stream(req, tx),
             }
@@ -887,6 +1006,8 @@ mod backend {
                 Self::Cuda(engine) => engine.tokenize(text),
                 #[cfg(feature = "hip")]
                 Self::Hip(engine) => engine.tokenize(text),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(engine) => engine.tokenize(text),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.tokenize(text),
             }
@@ -900,6 +1021,8 @@ mod backend {
                 Self::Cuda(engine) => engine.telemetry(),
                 #[cfg(feature = "hip")]
                 Self::Hip(engine) => engine.telemetry(),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(engine) => engine.telemetry(),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.telemetry(),
             }
@@ -909,9 +1032,21 @@ mod backend {
 
 #[cfg(feature = "cuda")]
 pub use backend::CudaWorkerEngine;
-#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 pub use backend::LoadedInferenceEngine;
 #[cfg(feature = "cuda")]
 pub use backend::cuda_model_takes_multiproc_serve;
-#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 pub(crate) use backend::router_for_backend;
