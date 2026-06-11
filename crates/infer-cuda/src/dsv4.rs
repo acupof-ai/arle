@@ -1173,7 +1173,7 @@ impl Dsv4Model {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
-        mut last_hidden_out: Option<&mut DeviceVec>,
+        last_hidden_out: Option<&mut DeviceVec>,
     ) -> Result<u32> {
         let seq_len = tokens.len();
         let use_deepep_transport = dsv4_use_deepep_transport()?;
@@ -1192,7 +1192,7 @@ impl Dsv4Model {
 
         let (stream, mut keepalive) =
             self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, false)?;
-        if let Some(out) = last_hidden_out.as_deref_mut() {
+        if let Some(out) = last_hidden_out {
             self.capture_mtp_stream_hidden(&stream, seq_len - 1, out, &mut keepalive)?;
         }
         let token = self.forward_stream_last_token(
@@ -1382,11 +1382,14 @@ impl Dsv4Model {
                 slot.seq_len,
                 start_positions[r]
             );
+            let next_len = start_positions[r]
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("DSv4 batched decode start_pos overflow"))?;
             ensure!(
-                start_positions[r] + 1 <= slot.max_seq_len,
+                start_positions[r] < slot.max_seq_len,
                 "DSv4 batched decode slot {} sequence {} exceeds max_seq_len {}",
                 slot_ids[r],
-                start_positions[r] + 1,
+                next_len,
                 slot.max_seq_len
             );
         }
@@ -2732,10 +2735,13 @@ impl Dsv4Model {
             "DSv4 graph decode slot seq_len {} != start_pos {start_pos}",
             slot.seq_len
         );
+        let next_len = start_pos
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("DSv4 graph decode start_pos overflow"))?;
         ensure!(
-            start_pos + 1 <= slot.max_seq_len,
+            start_pos < slot.max_seq_len,
             "DSv4 graph decode sequence {} exceeds slot max_seq_len {}",
-            start_pos + 1,
+            next_len,
             slot.max_seq_len
         );
         ensure!(
@@ -3185,7 +3191,8 @@ fn dsv4_decode_graph_enabled() -> bool {
 }
 
 /// Whole-step decode CUDA graph: capture the ENTIRE per-token forward (all layers
-/// + the 86 all-reduces + tail) as ONE graph, replayed with ~0 host orchestration.
+/// and the 86 all-reduces + tail) as ONE graph, replayed with ~0 host orchestration.
+///
 /// Requires ARLE_DSV4_DECODE_GRAPH=1 (reuses its pre-allocated scratch).
 ///
 /// STATUS (2026-06-08): VALIDATED-CORRECT but WALL-NEUTRAL — kept as gated infra, not
