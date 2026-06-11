@@ -160,9 +160,13 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
         }
     }
 
-    let router =
-        crate::loaded::router_for_backend(&opts.model_path, opts.enable_cuda_graph, engine_config)
-            .with_context(|| format!("failed to build serve router for {}", opts.model_path))?;
+    let router = crate::loaded::router_for_backend(
+        &opts.model_path,
+        opts.enable_cuda_graph,
+        engine_config,
+        &opts.kv_ssd,
+    )
+    .with_context(|| format!("failed to build serve router for {}", opts.model_path))?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -217,11 +221,11 @@ fn validate_kv_ssd_options(opts: &ServeKvSsdOptions) -> Result<()> {
         "--kv-ssd-path currently only supports the high-performance non-preemptive mode"
     );
 
-    anyhow::bail!(
-        "SSD KV tier requested at {}, but the rewrite serve path has no active SSD recall implementation yet; \
-         kv-native-sys is only the persistence substrate. Refusing to start instead of reporting fake SSD hits.",
-        root.display()
-    );
+    // Structural validation only — whether the loaded backend/model can
+    // actually consume the T2 tier is decided at engine build
+    // (`router_for_backend` / `cuda_serve_handle`), which fails closed for
+    // arms without a page-addressable tier store.
+    Ok(())
 }
 
 /// Backend-absent build: report the same way `--doctor` does and return an error.
@@ -268,18 +272,16 @@ mod tests {
     }
 
     #[test]
-    fn kv_ssd_valid_root_still_fails_closed_until_recall_exists() {
+    fn kv_ssd_valid_root_passes_structural_validation() {
+        // Backend consumption is gated at engine build (CUDA-only today,
+        // fails closed there); structural validation accepts a valid root.
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = validate_kv_ssd_options(&ServeKvSsdOptions {
+        validate_kv_ssd_options(&ServeKvSsdOptions {
             root: Some(dir.path().to_path_buf()),
             max_bytes: Some(1 << 30),
             high_performance_non_preemptive: true,
         })
-        .expect_err("current rewrite serve path should fail closed");
-
-        let msg = err.to_string();
-        assert!(msg.contains("no active SSD recall implementation"));
-        assert!(msg.contains("fake SSD hits"));
+        .expect("valid absolute root should pass structural validation");
     }
 }
 

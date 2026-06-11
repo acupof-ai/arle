@@ -35,6 +35,10 @@ mod dsv4;
 mod executor;
 #[cfg(feature = "cuda")]
 pub mod graph;
+// Not cuda-gated: pure host two-level (RAM + kv-native-sys disk) store for
+// demoted prefix-KV pages, CPU-testable without nvcc.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+mod kv_tier;
 // DSv4 hyper-connections (`hc_mult > 1`): the wide residual stream wrap. cuda-
 // gated (device kernels + DSv4 weight matrices).
 #[cfg(feature = "cuda")]
@@ -72,6 +76,9 @@ pub use qwen35::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
 pub use executor::dsv4_max_seq_len;
 #[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
+/// Default T2 disk budget when `--kv-ssd-path` is given without
+/// `--kv-ssd-max-bytes`.
+pub use kv_tier::DEFAULT_KV_SSD_BUDGET_BYTES;
 /// Rank-0 NCCL `unique_id` mint for multiproc launchers (see [`loader::mint_nccl_unique_id_hex`]).
 #[cfg(feature = "nccl")]
 pub use loader::mint_nccl_unique_id_hex;
@@ -189,6 +196,21 @@ impl CudaExecutor {
             }
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.set_kv_tier_budget_bytes(bytes),
+        }
+    }
+
+    /// Attach the opt-in T2 disk spill level under `root` (pre-serve only).
+    /// Returns whether the loaded model's arm consumed it; callers fail
+    /// closed on `false` so an explicit `--kv-ssd-path` is never a silent
+    /// no-op.
+    pub fn set_kv_tier_disk(&mut self, root: std::path::PathBuf, budget_bytes: usize) -> bool {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (root, budget_bytes);
+                false
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.set_kv_tier_disk(root, budget_bytes),
         }
     }
 

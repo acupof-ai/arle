@@ -273,7 +273,8 @@ impl StatsResponse {
                 lookups: 0,
                 hits: 0,
                 recall_rate: None,
-                not_available_reason: "ssd kv recall is not implemented in the rewrite serve path",
+                not_available_reason: "per-level ssd recall counters are not split out yet; \
+                                       T2 disk spill activity is included in the kv_tier block",
             },
         }
     }
