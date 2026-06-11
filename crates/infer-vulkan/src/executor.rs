@@ -4,13 +4,89 @@
 //! synchronous completion, and host sampling once numeric logits exist. Until
 //! a model is loaded, every non-idle plan errors loud.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{bail, ensure, Result};
 use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
 
 use crate::kv_pool::VulkanKvPool;
 
 pub const DEFAULT_PAGE_SIZE: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VulkanModelKind {
+    Qwen3Dense,
+    Dsv4,
+    Qwen35Hybrid,
+    Qwen36Moe,
+    Gemma4,
+}
+
+pub fn classify_vulkan_architecture(
+    architecture: &str,
+    model_name: Option<&str>,
+    expert_count: usize,
+) -> VulkanModelKind {
+    let arch = architecture.to_ascii_lowercase();
+    let name = model_name.unwrap_or_default().to_ascii_lowercase();
+    if arch.contains("deepseek4") || arch.contains("deepseek_v4") {
+        return VulkanModelKind::Dsv4;
+    }
+    if arch.contains("gemma4") || name.contains("gemma-4") || name.contains("gemma4") {
+        return VulkanModelKind::Gemma4;
+    }
+    if arch.contains("qwen3moe") || arch.contains("qwen3_moe") || expert_count > 0 {
+        return VulkanModelKind::Qwen36Moe;
+    }
+    if name.contains("qwen3.5") || name.contains("qwen35") {
+        return VulkanModelKind::Qwen35Hybrid;
+    }
+    VulkanModelKind::Qwen3Dense
+}
+
+pub fn classify_vulkan_gguf(gguf: &infer_hip::gguf::GgufFile) -> Result<VulkanModelKind> {
+    let architecture = gguf
+        .get_str("general.architecture")
+        .unwrap_or("qwen3")
+        .to_string();
+    let model_name = gguf.get_str("general.name");
+    let expert_count = gguf
+        .get_usize(&format!("{architecture}.expert_count"))
+        .or_else(|| gguf.get_usize(&format!("{architecture}.num_experts")))
+        .unwrap_or(0);
+    Ok(classify_vulkan_architecture(
+        &architecture,
+        model_name,
+        expert_count,
+    ))
+}
+
+#[cfg(feature = "vulkan")]
+pub enum VulkanLoadedModel {
+    Qwen3(Box<crate::model_qwen3::VulkanQwen3Model>),
+    Dsv4(Box<crate::model_dsv4::VulkanDsv4Model>),
+    Qwen35(Box<crate::model_qwen35::VulkanQwen35Model>),
+    Qwen36(Box<crate::model_qwen36::VulkanQwen36Model>),
+    Gemma4(Box<crate::model_gemma4::VulkanGemma4Model>),
+}
+
+#[cfg(feature = "vulkan")]
+impl VulkanLoadedModel {
+    fn forward_token(
+        &mut self,
+        slot: usize,
+        epoch: u64,
+        token: u32,
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        match self {
+            Self::Qwen3(model) => model.forward_token(slot, epoch, token, start_pos),
+            Self::Dsv4(model) => model.forward_token(slot, epoch, token, start_pos),
+            Self::Qwen35(model) => model.forward_token(slot, epoch, token, start_pos),
+            Self::Qwen36(model) => model.forward_token(slot, epoch, token, start_pos),
+            Self::Gemma4(model) => model.forward_token(slot, epoch, token, start_pos),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum VulkanInflight {
@@ -20,7 +96,7 @@ pub enum VulkanInflight {
 #[derive(Default)]
 pub struct VulkanExecutor {
     #[cfg(feature = "vulkan")]
-    model: Option<crate::model_qwen3::VulkanQwen3Model>,
+    model: Option<VulkanLoadedModel>,
     stop_tokens: Vec<u32>,
 }
 
@@ -139,18 +215,18 @@ pub fn load_qwen3_gguf(
     ensure!(num_slots > 0, "Vulkan load requires at least one slot");
     ensure!(max_seq_len > 0, "Vulkan load requires max_seq_len > 0");
     let gguf = infer_hip::gguf::GgufFile::open(&path)?;
-    let _ = gguf.metadata();
+    let kind = classify_vulkan_gguf(&gguf)?;
     #[cfg(feature = "vulkan")]
     {
         let _ = gguf;
         bail!(
-            "Vulkan Qwen3 GGUF load is pending Qwen3 config mapping and residency upload; \
-             host GGUF parse succeeded"
+            "Vulkan {kind:?} GGUF load is pending per-model config mapping and residency upload; \
+             host GGUF parse and architecture classification succeeded"
         )
     }
     #[cfg(not(feature = "vulkan"))]
     {
-        let _ = (num_slots, max_seq_len);
+        let _ = (num_slots, max_seq_len, kind);
         Err(anyhow::anyhow!(
             "Vulkan backend not compiled: rebuild with --features vulkan \
              (host stage validated: GGUF parsed)"
@@ -198,6 +274,30 @@ mod tests {
 
     fn pool() -> VulkanKvPool {
         VulkanKvPool::new(2, 8, DEFAULT_PAGE_SIZE, 256)
+    }
+
+    #[test]
+    fn classifies_vulkan_model_families_from_architecture() {
+        assert_eq!(
+            classify_vulkan_architecture("deepseek4", None, 0),
+            VulkanModelKind::Dsv4
+        );
+        assert_eq!(
+            classify_vulkan_architecture("qwen3moe", None, 64),
+            VulkanModelKind::Qwen36Moe
+        );
+        assert_eq!(
+            classify_vulkan_architecture("qwen3", Some("Qwen3.5-4B"), 0),
+            VulkanModelKind::Qwen35Hybrid
+        );
+        assert_eq!(
+            classify_vulkan_architecture("gemma4", None, 0),
+            VulkanModelKind::Gemma4
+        );
+        assert_eq!(
+            classify_vulkan_architecture("qwen3", None, 0),
+            VulkanModelKind::Qwen3Dense
+        );
     }
 
     #[test]
