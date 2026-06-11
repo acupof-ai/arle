@@ -243,6 +243,113 @@ pub unsafe fn moe_bf16_grouped_gemm_pair_batch(
     Ok(())
 }
 
+/// Decode-band single grouped expert GEMM (down projection): weight-read-bound
+/// — one warp per weight row, 16B-vector loads, each touched expert's `[n, k]`
+/// weight read exactly once per ≤8-row activation chunk regardless of the
+/// routed-row count. Wraps [`ffi::moe_bf16_grouped_gemm_decode_cuda`].
+///
+/// # Errors
+/// Errors unless `k % 8 == 0` (16-byte vector rows) — callers dispatch to
+/// [`moe_bf16_grouped_gemm_batch`] for unaligned shapes.
+///
+/// # Safety
+/// See [`moe_bf16_grouped_gemm_batch`]: all buffers must be valid on `stream`
+/// for the shape (input `[num_routes, k]`, output `[num_routes, n]`,
+/// offsets/counts/expert_indices `[num_experts]`).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn moe_bf16_grouped_gemm_decode(
+    weight_ptrs: &CudaSlice<u64>,
+    input: RawDevicePtr<bf16>,
+    output: RawDevicePtr<bf16>,
+    offsets: RawDevicePtr<i32>,
+    counts: RawDevicePtr<i32>,
+    expert_indices: RawDevicePtr<i32>,
+    num_experts: usize,
+    max_count: usize,
+    n: usize,
+    k: usize,
+    ctx: &DeviceContext,
+    stream: CUstream,
+) -> Result<()> {
+    ensure!(
+        k.is_multiple_of(8),
+        "decode grouped GEMM needs k % 8 == 0 for 16B vector loads, got n={n} k={k}"
+    );
+    let (wp, _g) = weight_ptrs.device_ptr(&ctx.stream);
+    unsafe {
+        ffi::moe_bf16_grouped_gemm_decode_cuda(
+            wp as *const u64,
+            input.as_ptr() as *const Half,
+            output.as_mut_ptr() as *mut Half,
+            offsets.as_ptr(),
+            counts.as_ptr(),
+            expert_indices.as_ptr(),
+            i32::try_from(num_experts)?,
+            i32::try_from(max_count)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Decode-band fused gate+up+SwiGLU grouped expert GEMM: reads each touched
+/// expert's gate and up `[n, k]` matrices exactly once per ≤8-row activation
+/// chunk and writes `act = silu(gate·x) * (up·x)` directly (the separate
+/// `silu_mul` pass folds into the epilogue; silu applies to the fp32
+/// accumulators before the single bf16 round). Wraps
+/// [`ffi::moe_bf16_grouped_gemm_swiglu_decode_cuda`].
+///
+/// # Errors
+/// Errors unless `k % 8 == 0` — see [`moe_bf16_grouped_gemm_decode`].
+///
+/// # Safety
+/// See [`moe_bf16_grouped_gemm_decode`]; both weight tables and the single
+/// `act` output `[num_routes, n]` must be valid on `stream` for the shape.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn moe_bf16_grouped_gemm_swiglu_decode(
+    weight_gate_ptrs: &CudaSlice<u64>,
+    weight_up_ptrs: &CudaSlice<u64>,
+    input: RawDevicePtr<bf16>,
+    act: RawDevicePtr<bf16>,
+    offsets: RawDevicePtr<i32>,
+    counts: RawDevicePtr<i32>,
+    expert_indices: RawDevicePtr<i32>,
+    num_experts: usize,
+    max_count: usize,
+    n: usize,
+    k: usize,
+    ctx: &DeviceContext,
+    stream: CUstream,
+) -> Result<()> {
+    ensure!(
+        k.is_multiple_of(8),
+        "decode swiglu grouped GEMM needs k % 8 == 0 for 16B vector loads, got n={n} k={k}"
+    );
+    let (wg, _gg) = weight_gate_ptrs.device_ptr(&ctx.stream);
+    let (wu, _gu) = weight_up_ptrs.device_ptr(&ctx.stream);
+    unsafe {
+        ffi::moe_bf16_grouped_gemm_swiglu_decode_cuda(
+            wg as *const u64,
+            wu as *const u64,
+            input.as_ptr() as *const Half,
+            act.as_mut_ptr() as *mut Half,
+            offsets.as_ptr(),
+            counts.as_ptr(),
+            expert_indices.as_ptr(),
+            i32::try_from(num_experts)?,
+            i32::try_from(max_count)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Count how many routed tokens fall on each local expert.
 /// Wraps [`ffi::dsv4_count_local_experts_cuda`].
 ///

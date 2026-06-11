@@ -465,6 +465,43 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // Decode-band (small routed-row count) weight-read-bound variants: one
+    // warp per weight row with 16B-vector coalesced loads, every touched
+    // expert's weight rows read exactly once per <=8-row activation chunk
+    // regardless of R. The swiglu variant fuses the gate+up pair AND the
+    // SwiGLU epilogue (act = silu(gate)*up, single output buffer — no
+    // separate silu_mul pass). Requires k % 8 == 0 (launcher rejects with
+    // cudaErrorInvalidValue; the Rust dispatch routes to the batch kernels
+    // instead).
+    pub fn moe_bf16_grouped_gemm_decode_cuda(
+        weight_ptrs: *const u64,
+        input: *const Half,
+        output: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn moe_bf16_grouped_gemm_swiglu_decode_cuda(
+        weight_gate_ptrs: *const u64,
+        weight_up_ptrs: *const u64,
+        input: *const Half,
+        act: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_fp8_route_gemv_batch_cuda(
         weight_ptrs: *const u64,
         scale_ptrs: *const u64,
