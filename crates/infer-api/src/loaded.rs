@@ -432,7 +432,13 @@ mod backend {
             )))
         }
 
-        #[cfg(all(feature = "cpu", not(feature = "metal")))]
+        #[cfg(all(
+            feature = "cpu",
+            not(feature = "metal"),
+            not(feature = "cuda"),
+            not(feature = "hip"),
+            not(feature = "vulkan")
+        ))]
         fn load_cpu(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
             use infer_server::OpenAiTokenizer;
 
@@ -936,7 +942,13 @@ mod backend {
     /// host `MetalKvPool` (no MLX, no CUDA), wrapped in
     /// [`infer_server::openai_router`]. Mirrors
     /// [`LoadedInferenceEngine::load_cpu`].
-    #[cfg(all(feature = "cpu", not(feature = "metal")))]
+    #[cfg(all(
+        feature = "cpu",
+        not(feature = "metal"),
+        not(feature = "cuda"),
+        not(feature = "hip"),
+        not(feature = "vulkan")
+    ))]
     fn router_cpu(model_path: &str, config: &EngineLoadConfig) -> Result<axum::Router> {
         use infer_server::{OpenAiTokenizer, openai_router};
 

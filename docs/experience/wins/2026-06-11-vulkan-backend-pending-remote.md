@@ -64,6 +64,7 @@ cargo test -p infer-api --no-default-features --features vulkan
 cargo test -p cli --no-default-features --features vulkan,no-cuda
 cargo test --no-default-features --features vulkan,no-cuda
 cargo clippy --no-default-features --features vulkan,no-cuda -- -D warnings
+cargo check --no-default-features --features vulkan,cpu,no-cuda
 cargo check
 cargo test
 cargo check --features vulkan
