@@ -97,7 +97,7 @@ const SPEC_FLASH_ATTN_F32_F16_HD256: &[(u32, u32)] = &[
     (2, 64),
     (3, 256),
     (4, 256),
-    (5, 0),
+    (5, 1),
     (6, 8),
     (7, 1),
     (8, 32),
@@ -228,7 +228,7 @@ impl FlashAttentionSpec {
                 (2, 64),
                 (3, hsk),
                 (4, hsv),
-                (5, 0),
+                (5, 1),
                 (6, 8),
                 (7, 1),
                 (8, 32),
@@ -839,6 +839,7 @@ mod tests {
         assert_eq!(Kernel::FlashAttn.specialization_u32().len(), 16);
         assert_eq!(Kernel::FlashAttn.specialization_u32()[3], (3, 256));
         assert_eq!(Kernel::FlashAttn.specialization_u32()[4], (4, 256));
+        assert_eq!(Kernel::FlashAttn.specialization_u32()[5], (5, 1));
         assert_eq!(Kernel::FlashAttn.specialization_u32()[12], (12, 1));
         assert_eq!(Kernel::FlashAttn.specialization_u32()[13], (13, 1));
         assert_eq!(Kernel::FlashAttn.specialization_u32()[14], (14, 2));
