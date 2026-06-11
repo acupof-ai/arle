@@ -101,13 +101,21 @@ impl RealCudaExecutor {
     }
 
     /// Build the DSv4-Flash executor (MLA + HC + FP8 MoE, multi-GPU TP/EP).
+    /// `mtp_draft_tokens`: `Some(n)` = config-driven MTP spec decode on (draft
+    /// depth `n`); `None` falls back to the `ARLE_DSV4_SPEC_DECODE` env gate.
     pub(crate) fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
         max_seq_len: usize,
+        mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
         Ok(Self::Dsv4(Box::new(
-            Dsv4CudaExecutor::from_dsv4_fp8_safetensors(model_path, num_slots, max_seq_len)?,
+            Dsv4CudaExecutor::from_dsv4_fp8_safetensors(
+                model_path,
+                num_slots,
+                max_seq_len,
+                mtp_draft_tokens,
+            )?,
         )))
     }
 
@@ -684,6 +692,10 @@ pub(crate) struct Dsv4CudaExecutor {
     slots: Vec<crate::dsv4::Dsv4SlotState>,
     kv_adapter: crate::attention::Dsv4KvAdapter,
     spec_slots: Vec<Dsv4SpecSlotState>,
+    /// `Some(n)` = config-driven MTP spec decode on (draft depth `n`, from the
+    /// serve path's `--spec-type mtp`); `None` falls back to the
+    /// `ARLE_DSV4_SPEC_DECODE` env gate at each spec branch.
+    spec_draft_tokens: Option<usize>,
     num_slots: usize,
     mtp_accepts: usize,
     mtp_rejects: usize,
@@ -972,10 +984,14 @@ impl Dsv4CudaExecutor {
         model_path: impl AsRef<Path>,
         num_slots: usize,
         max_seq_len: usize,
+        mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "Dsv4CudaExecutor requires at least one slot");
         ensure!(max_seq_len > 0, "Dsv4CudaExecutor requires max_seq_len > 0");
-        let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(model_path.as_ref())?;
+        let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(
+            model_path.as_ref(),
+            mtp_draft_tokens,
+        )?;
         // Dynamic KV mem budget: clamp num_slots to what GPU free mem affords (was: fixed
         // num_slots → c=32 OOM crash at long max_seq_len). Deterministic ⇒ TP-consistent.
         let num_slots = model.kv_budget_num_slots(num_slots, max_seq_len)?;
@@ -992,6 +1008,7 @@ impl Dsv4CudaExecutor {
             slots,
             kv_adapter,
             spec_slots,
+            spec_draft_tokens: mtp_draft_tokens,
             num_slots,
             mtp_accepts: 0,
             mtp_rejects: 0,
@@ -1007,7 +1024,7 @@ impl Dsv4CudaExecutor {
         position: u64,
         final_prefill: bool,
     ) -> Result<Vec<u32>> {
-        if crate::dsv4::dsv4_spec_decode_enabled() {
+        if self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled() {
             let (token, hidden) = self.model.forward_tokens_with_hidden(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
@@ -1043,7 +1060,7 @@ impl Dsv4CudaExecutor {
         params: &SamplingParams,
         position: u64,
     ) -> Result<Vec<u32>> {
-        if !crate::dsv4::dsv4_spec_decode_enabled() {
+        if !(self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled()) {
             let token = self.model.forward_tokens(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
@@ -1238,7 +1255,7 @@ impl Dsv4CudaExecutor {
         // byte-identical reference. Only the multi-row, non-spec path batches.
         if dsv4_batched_decode_enabled()
             && batch.rows.len() > 1
-            && !crate::dsv4::dsv4_spec_decode_enabled()
+            && !(self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled())
         {
             let params: Vec<SamplingParams> = batch.rows.iter().map(|r| r.params.clone()).collect();
             let out = self.model.forward_decode_batch(
@@ -1541,6 +1558,23 @@ fn qwen35_decode_graph_enabled() -> bool {
     )
 }
 
+/// Batched rows>1 decode for Qwen3.5/3.6 (stage 1, contiguous KV) — re-port
+/// of the deleted monolith's `decode_batch` design
+/// ([`crate::qwen35::Qwen35BatchDecodeState`]). DEFAULT ON: before this path
+/// existed, a rows>1 plan was a hard executor error (`rows == 1` ensure →
+/// engine death), so even a conservative batched path strictly dominates the
+/// status quo. `ARLE_QWEN35_BATCHED_DECODE=0` is the escape hatch AND the
+/// honest same-binary A/B arm: it processes rows>1 decode plans as sequential
+/// per-row single-row forwards instead (a NEW loop — the old behavior was
+/// death, not a fallback). rows==1 plans never consult this gate (the
+/// single-row path is byte-identical either way).
+fn qwen35_batched_decode_enabled() -> bool {
+    !matches!(
+        std::env::var("ARLE_QWEN35_BATCHED_DECODE").as_deref(),
+        Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
+    )
+}
+
 /// Decode-graph replay/capture probes — static so the pod bench can PROVE
 /// replay reuse from server logs (license requires reuse evidence, not
 /// capture-exists). Expected steady state: captures == live slots (≤
@@ -1591,17 +1625,21 @@ impl Qwen35DecodeGraph {
 }
 
 /// Qwen3.5 / Qwen3.6 HYBRID executor: drives
-/// [`crate::qwen35::Qwen35Model::forward_tokens`] over a single scheduled row.
-/// Owns per-slot KV state inside the model (full-attn contiguous caches +
-/// gated-delta recurrent state), so it does NOT use a [`PagedKVPool`]; it relies
-/// on the host [`KvPool`] only for the slot's logical `seq_len` to derive
-/// `start_pos`. The whole-step decode graph is opt-in
-/// (`ARLE_QWEN35_DECODE_GRAPH=1`, single-GPU + device-routed MoE only).
+/// [`crate::qwen35::Qwen35Model::forward_tokens`] per single-row sub-step and
+/// [`crate::qwen35::Qwen35Model::forward_decode_batch`] for rows>1 pure-decode
+/// sub-batches (stage-1 batched decode, contiguous KV). Owns per-slot KV state
+/// inside the model (full-attn contiguous caches + gated-delta recurrent
+/// state), so it does NOT use a [`PagedKVPool`]; it relies on the host
+/// [`KvPool`] only for the slot's logical `seq_len` to derive `start_pos`.
+/// The whole-step decode graph is opt-in (`ARLE_QWEN35_DECODE_GRAPH=1`,
+/// single-GPU + device-routed MoE only, rows==1 plans only).
 ///
-/// First-runnable scope: single-row prefill/decode, uncached full-prefix (each
-/// full-attn layer recomputes over its contiguous cache; each linear-attn layer
-/// advances the recurrent state in place). A continuous-batching paged +
-/// packed-batch path is the perf follow-up (legacy `infer/src/model/qwen35`).
+/// Scope: prefill stays single-row (mixed plans run per-prefill sub-steps,
+/// then one decode sub-batch — the DSv4 executor pattern), uncached
+/// full-prefix (each full-attn layer recomputes over its contiguous cache;
+/// each linear-attn layer advances the recurrent state in place). A
+/// continuous-batching paged + packed-batch path is the stage-2 follow-up
+/// (legacy `infer/src/model/qwen35`).
 pub(crate) struct Qwen35CudaExecutor {
     model: crate::qwen35::Qwen35Model,
     /// Per-slot KV + recurrent state (one [`crate::qwen35::Qwen35SlotState`] per slot).
@@ -1619,6 +1657,11 @@ pub(crate) struct Qwen35CudaExecutor {
     /// and re-`None`d whenever baked addresses go stale: OPD weight
     /// offload/reload, student-LoRA re-merge).
     decode_graph: Option<Qwen35DecodeGraph>,
+    /// Lazily-built batched rows>1 decode state (dedicated `[*, B]` workspace
+    /// + per-layer recurrent-state pointer tables; see
+    /// [`crate::qwen35::Qwen35BatchDecodeState`]). `None` until the first
+    /// batched decode.
+    batch_decode: Option<crate::qwen35::Qwen35BatchDecodeState>,
 }
 
 impl std::fmt::Debug for Qwen35CudaExecutor {
@@ -1676,6 +1719,7 @@ impl Qwen35CudaExecutor {
             num_slots,
             decode_graph_armed,
             decode_graph: None,
+            batch_decode: None,
         })
     }
 
@@ -1852,6 +1896,13 @@ impl Qwen35CudaExecutor {
         self.ensure_not_collective("offload_engine_weights")?;
         let freed = self.model.offload_engine_weights()?;
         self.workspace.release();
+        // The batched-decode workspace holds `[*, B]` scratch (incl. MoE) —
+        // release it for the same headroom reason. Its pointer TABLES survive:
+        // they address per-slot state, which the weight offload leaves
+        // resident (see `Qwen35BatchDecodeState::release`).
+        if let Some(bd) = self.batch_decode.as_mut() {
+            bd.release();
+        }
         // Captured decode graphs bake the (now freed/placeholder) weight
         // addresses — drop them wholesale. Re-built + re-captured lazily after
         // reload (the gate flag stays armed).
@@ -1884,47 +1935,172 @@ impl Qwen35CudaExecutor {
         if rows == 0 {
             return Ok(StepOutput { tokens: Vec::new() });
         }
-        ensure!(
-            rows == 1,
-            "Qwen3.5 hybrid CUDA forward is single-row only, got {} prefill + {} decode rows",
-            plan.prefill_rows.len(),
-            plan.decode_rows.len()
-        );
 
-        let (slot, token) = if let Some(row) = plan.prefill_rows.first() {
+        // rows == 1 keeps the existing single-row path byte-identical
+        // (including the whole-step B=1 decode-graph lane, which is gated to
+        // rows==1 PLANS — batched/mixed steps never capture or replay).
+        if rows == 1 {
+            let (slot, token) = if let Some(row) = plan.prefill_rows.first() {
+                (row.slot, self.submit_prefill_row(row)?)
+            } else {
+                let row = &plan.decode_rows[0];
+                (
+                    row.slot,
+                    self.submit_decode_row(row, /* allow_graph = */ true)?,
+                )
+            };
+            return Ok(StepOutput {
+                tokens: vec![SlotToken {
+                    slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                }],
+            });
+        }
+
+        // Multi-row plans (DSv4 executor pattern): per-prefill single-row
+        // sub-steps, then ONE decode sub-batch. Plan rows always address
+        // disjoint slots (a request is either Prefilling or Decoding), so the
+        // sequential sub-steps are math-identical to consecutive single-mode
+        // ticks.
+        let mut seen_slots = std::collections::BTreeSet::new();
+        for slot in plan
+            .prefill_rows
+            .iter()
+            .map(|row| row.slot)
+            .chain(plan.decode_rows.iter().map(|row| row.slot))
+        {
             ensure!(
-                row.slot < self.num_slots,
-                "prefill slot {} outside Qwen3.5 executor slots {}",
-                row.slot,
-                self.num_slots
+                seen_slots.insert(slot),
+                "Qwen3.5 plan schedules slot {slot} more than once per tick"
             );
-            ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
-            // A fresh prefill (start_pos == 0) rewinds this slot's recurrent +
-            // conv state and cache cursor before appending. Request-boundary
-            // rearm discipline (the e95e11b6 lesson): the slot's captured
-            // decode graph stays valid (state buffers are memset, not
-            // re-allocated), but its FIRST decode of the new occupant runs one
-            // eager warm step so any per-request host work executes without
-            // dropping the capture — capture cost stays once per slot, not
-            // once per request.
-            if row.start_pos == 0 {
-                self.slots[row.slot].reset(&self.model.ctx)?;
-                if let Some(dg) = self.decode_graph.as_mut() {
-                    dg.graphs[row.slot].rearm_warm(1);
-                }
+        }
+
+        let mut tokens = Vec::with_capacity(rows);
+        for row in &plan.prefill_rows {
+            let token = self.submit_prefill_row(row)?;
+            tokens.push(SlotToken {
+                slot: row.slot,
+                token,
+                logprob: None,
+                finish: None,
+            });
+        }
+        match plan.decode_rows.len() {
+            0 => {}
+            1 => {
+                // Mixed tick with a single decode row: eager (the B=1 graph
+                // lane stays gated to rows==1 plans in stage 1).
+                let row = &plan.decode_rows[0];
+                let token = self.submit_decode_row(row, /* allow_graph = */ false)?;
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                });
             }
-            let position = (row.start_pos + row.tokens.len()) as u64;
-            let token = self.model.forward_tokens(
+            _ => tokens.extend(self.submit_decode_batch(&plan.decode_rows)?),
+        }
+        Ok(StepOutput { tokens })
+    }
+
+    /// One prefill row as its own single-row sub-step (the pre-batching
+    /// single-row prefill arm, factored).
+    fn submit_prefill_row(&mut self, row: &infer_plan::PrefillRow) -> Result<u32> {
+        ensure!(
+            row.slot < self.num_slots,
+            "prefill slot {} outside Qwen3.5 executor slots {}",
+            row.slot,
+            self.num_slots
+        );
+        ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
+        // A fresh prefill (start_pos == 0) rewinds this slot's recurrent +
+        // conv state and cache cursor before appending. Request-boundary
+        // rearm discipline (the e95e11b6 lesson): the slot's captured
+        // decode graph stays valid (state buffers are memset, not
+        // re-allocated), but its FIRST decode of the new occupant runs one
+        // eager warm step so any per-request host work executes without
+        // dropping the capture — capture cost stays once per slot, not
+        // once per request.
+        if row.start_pos == 0 {
+            self.slots[row.slot].reset(&self.model.ctx)?;
+            if let Some(dg) = self.decode_graph.as_mut() {
+                dg.graphs[row.slot].rearm_warm(1);
+            }
+        }
+        let position = (row.start_pos + row.tokens.len()) as u64;
+        self.model.forward_tokens(
+            &mut self.slots[row.slot],
+            &mut self.workspace,
+            &row.tokens,
+            row.start_pos,
+            &row.params,
+            position,
+        )
+    }
+
+    /// One decode row as a single-row forward (the pre-batching single-row
+    /// decode arm, factored). `allow_graph` admits the whole-step B=1
+    /// decode-graph lane — true only for rows==1 plans.
+    fn submit_decode_row(&mut self, row: &DecodeRow, allow_graph: bool) -> Result<u32> {
+        ensure!(
+            row.slot < self.num_slots,
+            "decode slot {} outside Qwen3.5 executor slots {}",
+            row.slot,
+            self.num_slots
+        );
+        ensure!(
+            self.slots[row.slot].seq_len() == row.kv_seq_len,
+            "Qwen3.5 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
+            self.slots[row.slot].seq_len(),
+            row.kv_seq_len,
+            row.slot
+        );
+        let position = row.kv_seq_len.saturating_add(1) as u64;
+        // Whole-step graph lane first (opt-in); eager forward is the
+        // correctness floor and the fallback on any graph miss/failure.
+        let graph_token = if allow_graph {
+            self.try_graph_decode(row, position)?
+        } else {
+            None
+        };
+        match graph_token {
+            Some(token) => Ok(token),
+            None => self.model.forward_tokens(
                 &mut self.slots[row.slot],
                 &mut self.workspace,
-                &row.tokens,
-                row.start_pos,
+                &[row.last_token],
+                row.kv_seq_len,
                 &row.params,
                 position,
-            )?;
-            (row.slot, token)
-        } else {
-            let row = &plan.decode_rows[0];
+            ),
+        }
+    }
+
+    /// A rows>1 pure-decode sub-batch: ONE batched forward over all rows
+    /// ([`crate::qwen35::Qwen35Model::forward_decode_batch`] — stage 1
+    /// re-port of the monolith batched decode; the c=4 amortization formula
+    /// and the TP/all-reduce proof live on that method). With
+    /// `ARLE_QWEN35_BATCHED_DECODE=0`, runs the rows sequentially as
+    /// single-row forwards instead (the honest A/B arm; the pre-batching
+    /// behavior was a hard error, not a fallback).
+    ///
+    /// Decode-graph interaction (stage 1): batched steps NEVER capture or
+    /// replay, and they cannot invalidate existing B=1 captures — the
+    /// captured graphs bake (a) per-slot state addresses, which the batched
+    /// path mutates strictly IN PLACE through pointer tables over the same
+    /// allocations, and (b) the dedicated decode-graph workspace's buffer
+    /// addresses, which the batched path never touches (it owns a third,
+    /// batch-only workspace). The per-step position is read from a staged
+    /// device scalar at replay, so a slot's seq_len advancing via a batched
+    /// step replays correctly on its next single-row graphed step.
+    fn submit_decode_batch(&mut self, rows: &[DecodeRow]) -> Result<Vec<SlotToken>> {
+        debug_assert!(rows.len() > 1);
+        // Per-row watermark/validation BEFORE any device mutation (dup-slot
+        // ensure ran at plan level in `submit`).
+        for row in rows {
             ensure!(
                 row.slot < self.num_slots,
                 "decode slot {} outside Qwen3.5 executor slots {}",
@@ -1938,31 +2114,68 @@ impl Qwen35CudaExecutor {
                 row.kv_seq_len,
                 row.slot
             );
-            let position = row.kv_seq_len.saturating_add(1) as u64;
-            // Whole-step graph lane first (opt-in); eager forward is the
-            // correctness floor and the fallback on any graph miss/failure.
-            let token = match self.try_graph_decode(row, position)? {
-                Some(token) => token,
-                None => self.model.forward_tokens(
-                    &mut self.slots[row.slot],
-                    &mut self.workspace,
-                    &[row.last_token],
-                    row.kv_seq_len,
-                    &row.params,
-                    position,
-                )?,
-            };
-            (row.slot, token)
-        };
+        }
 
-        Ok(StepOutput {
-            tokens: vec![SlotToken {
+        if !qwen35_batched_decode_enabled() {
+            // Sequential per-row fallback (A/B arm / escape hatch).
+            let mut tokens = Vec::with_capacity(rows.len());
+            for row in rows {
+                let token = self.submit_decode_row(row, /* allow_graph = */ false)?;
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                });
+            }
+            return Ok(tokens);
+        }
+
+        if self.batch_decode.is_none() {
+            let num_full = self.model.config.num_full_attention_layers();
+            let num_linear = self.model.config.num_hidden_layers - num_full;
+            self.batch_decode = Some(crate::qwen35::Qwen35BatchDecodeState::new(
+                &self.model.ctx,
+                num_linear,
+                self.num_slots,
+            )?);
+        }
+        let bd = self
+            .batch_decode
+            .as_mut()
+            .expect("batch_decode built above");
+
+        let slot_indices: Vec<usize> = rows.iter().map(|r| r.slot).collect();
+        let tokens_in: Vec<u32> = rows.iter().map(|r| r.last_token).collect();
+        let params: Vec<SamplingParams> = rows.iter().map(|r| r.params.clone()).collect();
+        let positions: Vec<u64> = rows
+            .iter()
+            .map(|r| r.kv_seq_len.saturating_add(1) as u64)
+            .collect();
+        let sampled = self.model.forward_decode_batch(
+            &mut self.slots,
+            bd,
+            &slot_indices,
+            &tokens_in,
+            &params,
+            &positions,
+        )?;
+        ensure!(
+            sampled.len() == rows.len(),
+            "Qwen3.5 batched decode returned {} tokens for {} rows",
+            sampled.len(),
+            rows.len()
+        );
+        Ok(slot_indices
+            .into_iter()
+            .zip(sampled)
+            .map(|(slot, token)| SlotToken {
                 slot,
                 token,
                 logprob: None,
                 finish: None,
-            }],
-        })
+            })
+            .collect())
     }
 
     /// OPD teacher raw-logits forward: run the full hybrid forward over

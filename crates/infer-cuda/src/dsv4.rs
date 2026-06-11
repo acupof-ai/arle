@@ -226,6 +226,11 @@ pub(crate) struct Dsv4Model {
     /// row before the final RMSNorm + lm_head projection.
     pub head_hc: Dsv4HyperConnection,
     pub mtp: Option<Dsv4MtpLayer>,
+    /// Resolved at construction: spec decode is on when the serve config
+    /// requested `--spec-type mtp` OR the `ARLE_DSV4_SPEC_DECODE` env gate is
+    /// set. Per-slot construction (`Dsv4SlotState::new`) reads this so the
+    /// MTP-head load and the per-slot rollback snapshots agree on one decision.
+    pub spec_decode_on: bool,
     pub tp: crate::tp::TpRuntime,
     #[cfg(feature = "deepep")]
     pub deepep: Option<crate::deepep::DeepEpTransport>,
@@ -522,7 +527,7 @@ impl Dsv4SlotState {
                 &layer.moe,
             )?);
         }
-        let spec_rollback = if dsv4_spec_decode_enabled() {
+        let spec_rollback = if model.spec_decode_on {
             let mut snapshots = Vec::with_capacity(attention.len());
             for state in &attention {
                 snapshots.push(state.rollback_snapshot(
@@ -683,15 +688,24 @@ impl Dsv4Model {
     /// keeps all experts local (dev/typecheck). Weight FP8/FP4 + E8M0 scales load
     /// through the shared `cuda-kernels` DSv4 tensors; per-expert DeepGEMM caches
     /// are built at load. The forward (MLA, FP8 MoE) is Pieces 2/3.
-    pub(crate) fn from_dsv4_fp8_safetensors(model_path: &Path) -> Result<Self> {
+    pub(crate) fn from_dsv4_fp8_safetensors(
+        model_path: &Path,
+        mtp_draft_tokens: Option<usize>,
+    ) -> Result<Self> {
         let tp = build_dsv4_tp_runtime()?;
-        Self::from_dsv4_fp8_safetensors_with_tp(model_path, tp)
+        Self::from_dsv4_fp8_safetensors_with_tp(model_path, tp, mtp_draft_tokens)
     }
 
     pub(crate) fn from_dsv4_fp8_safetensors_with_tp(
         model_path: &Path,
         #[cfg_attr(not(feature = "nccl"), allow(unused_mut))] mut tp: crate::tp::TpRuntime,
+        mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
+        // Spec decode is on when the serve config requests it (`Some(n)` from
+        // `--spec-type mtp`) OR the `ARLE_DSV4_SPEC_DECODE` env gate is set
+        // (backward-compat fallback). Resolved once and stored on the model so
+        // per-slot construction reads the same decision.
+        let spec_decode_on = mtp_draft_tokens.is_some() || dsv4_spec_decode_enabled();
         let config = DeepSeekV4Config::from_json_file(model_path.join("config.json"))
             .map_err(|e| anyhow!("load DSv4 config from {}: {e}", model_path.display()))?;
         ensure_loadable(&config)?;
@@ -751,7 +765,7 @@ impl Dsv4Model {
         }
         let norm = loader.load_dsv4_vec(&ctx, names.norm())?;
         let head_hc = loader.load_dsv4_hyper_connection(&ctx, &names.head_hc())?;
-        let mtp = if dsv4_spec_decode_enabled() && config.num_nextn_predict_layers > 0 {
+        let mtp = if spec_decode_on && config.num_nextn_predict_layers > 0 {
             ensure!(
                 config.num_nextn_predict_layers == 1,
                 "DSv4 Phase-1 MTP loader supports exactly one nextn layer, got {}",
@@ -801,6 +815,7 @@ impl Dsv4Model {
             norm,
             head_hc,
             mtp,
+            spec_decode_on,
             tp,
             #[cfg(feature = "deepep")]
             deepep,
@@ -1100,7 +1115,10 @@ impl Dsv4Model {
         // selftest probe, which doesn't reject).
         if dsv4_mtp_batched_verify_enabled() && tokens.len() == 2 {
             let stream_dim = self.config.hidden_size * self.config.hc_mult;
-            if dsv4_spec_decode_enabled() {
+            // Capture iff the per-slot rollback snapshot was actually allocated
+            // (gated on `spec_decode_on` at slot construction): config-driven
+            // `--spec-type mtp` OR the env fallback.
+            if self.spec_decode_on {
                 slot.capture_spec_rollback(&self.ctx, kv_adapter, start_pos + 1)?;
             }
             let (stream, mut keepalive) =
