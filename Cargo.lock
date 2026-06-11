@@ -1518,6 +1518,7 @@ dependencies = [
  "infer-plan",
  "infer-seam",
  "infer-topo",
+ "kv-native-sys",
  "log",
  "qwen3-spec",
  "qwen35-spec",
