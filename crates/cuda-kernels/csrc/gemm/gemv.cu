@@ -17,9 +17,16 @@
 // Warp shuffle reduction + shared memory for inter-warp reduce.
 // BF16 inputs, FP32 accumulators, BF16 output.
 // Graph-capture safe (no cuBLAS workspace allocation).
+//
+// ROWS_PER_BLOCK is the loads-in-flight knob: at K=2048 each thread issues
+// exactly ONE 16B load per row (K/8/256 = 1), so 4 rows/block ran
+// latency-bound at 32% of HBM peak on the H20 lm_head (nsys 2026-06-11:
+// 491 us for 0.62 GB). 16 rows/block keeps every caller (lm_head-class
+// M >= 100k => grid >= 6k blocks, far above SM capacity — unlike the MoE
+// down-kernel grid-shrink trap) while 4x-ing per-thread loads in flight.
 // ============================================================================
 #define GEMV_BLOCK 256
-#define GEMV_ROWS_PER_BLOCK 4
+#define GEMV_ROWS_PER_BLOCK 16
 #define GEMV_NUM_WARPS (GEMV_BLOCK / WARP_SIZE)
 
 __device__ __forceinline__ float bf16x4_dot(uint2 a_val, uint2 x_val) {
