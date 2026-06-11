@@ -30,6 +30,7 @@ PROFILE="${3:-release}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+source "${REPO_ROOT}/scripts/cuda_prebuilt_manifest.sh"
 
 # Newest cuda-kernels OUT_DIR that actually contains both archives (several
 # fingerprint hashes can coexist after feature/env flips).
@@ -80,6 +81,9 @@ cat > "${DEST}/manifest.json" <<EOF
 }
 EOF
 
+cuda_prebuilt_manifest > "${DEST}/arle-cuda-kernels.manifest"
+
 echo "[export] ${SRC_OUT} -> ${DEST}"
 echo "[export] archives: libkernels_cuda.a libtilelang_kernels_aot.a ${SIDECAR}"
+echo "[export] manifest: arle-cuda-kernels.manifest (consumer key), manifest.json (provenance)"
 echo "[export] consume with: export ARLE_CUDA_KERNELS_PREBUILT_DIR=$(cd "${DEST}" && pwd)"

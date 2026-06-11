@@ -2771,6 +2771,11 @@ impl Dsv4Model {
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
 
         let whole_step = dsv4_whole_step_graph_enabled();
+        ensure!(
+            !(whole_step && self.tp.oneshot_comm_active()),
+            "DSv4 whole-step CUDA graph cannot capture ARLE one-shot CustomAllreduce; \
+             set ARLE_COMM_BACKEND=nccl or disable ARLE_DSV4_WHOLE_STEP_GRAPH"
+        );
         if whole_step {
             for s in graph.layers.iter_mut() {
                 s.attn_graph.set_bypass(true);
