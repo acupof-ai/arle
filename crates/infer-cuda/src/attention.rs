@@ -51,6 +51,21 @@ pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
     DSV4_FUSED_WQKV_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
 }
 
+static DSV4_VERIFY_FROZEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Frozen-KV MTP verify: while set, `mla_attention` SKIPS `dsv4_compressor_update`
+/// so the speculative K-token verify forms no new compressed blocks / DSA packs and
+/// mutates nothing compressed. The executor sets it around the speculative verify and
+/// clears it for the accepted-prefix commit re-forward.
+pub(crate) fn set_dsv4_verify_frozen(frozen: bool) {
+    DSV4_VERIFY_FROZEN.store(frozen, Ordering::Relaxed);
+}
+
+pub(crate) fn dsv4_verify_frozen() -> bool {
+    DSV4_VERIFY_FROZEN.load(Ordering::Relaxed)
+}
+
 fn maybe_probe_flashmla_decode_path(
     layer_idx: usize,
     mode: DeepSeekV4AttentionMode,
@@ -130,72 +145,6 @@ impl Dsv4CompressorState {
             .memset_zeros(&mut self.compressed.data)
             .map_err(|e| anyhow::anyhow!("DSv4 compressor compressed reset failed: {e}"))?;
         self.compressed.seq_len = 0;
-        Ok(())
-    }
-}
-
-pub(crate) struct Dsv4CompressorStateSnapshot {
-    pending_kv: CudaSlice<half::bf16>,
-    pending_score: CudaSlice<half::bf16>,
-    prev_overlap_kv: CudaSlice<half::bf16>,
-    prev_overlap_score: CudaSlice<half::bf16>,
-    compressed_seq_len: usize,
-}
-
-impl Dsv4CompressorStateSnapshot {
-    fn new(ctx: &DeviceContext, state: &Dsv4CompressorState) -> Result<Self> {
-        Ok(Self {
-            pending_kv: ctx
-                .stream
-                .alloc_zeros::<half::bf16>(state.pending_kv.len())
-                .map_err(|e| anyhow!("DSv4 compressor snapshot pending kv alloc failed: {e}"))?,
-            pending_score: ctx
-                .stream
-                .alloc_zeros::<half::bf16>(state.pending_score.len())
-                .map_err(|e| anyhow!("DSv4 compressor snapshot pending score alloc failed: {e}"))?,
-            prev_overlap_kv: ctx
-                .stream
-                .alloc_zeros::<half::bf16>(state.prev_overlap_kv.len())
-                .map_err(|e| anyhow!("DSv4 compressor snapshot prev kv alloc failed: {e}"))?,
-            prev_overlap_score: ctx
-                .stream
-                .alloc_zeros::<half::bf16>(state.prev_overlap_score.len())
-                .map_err(|e| anyhow!("DSv4 compressor snapshot prev score alloc failed: {e}"))?,
-            compressed_seq_len: 0,
-        })
-    }
-
-    fn capture_from(&mut self, ctx: &DeviceContext, state: &Dsv4CompressorState) -> Result<()> {
-        ctx.stream
-            .memcpy_dtod(&state.pending_kv, &mut self.pending_kv)
-            .map_err(|e| anyhow!("DSv4 compressor snapshot pending kv D2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_dtod(&state.pending_score, &mut self.pending_score)
-            .map_err(|e| anyhow!("DSv4 compressor snapshot pending score D2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_dtod(&state.prev_overlap_kv, &mut self.prev_overlap_kv)
-            .map_err(|e| anyhow!("DSv4 compressor snapshot prev kv D2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_dtod(&state.prev_overlap_score, &mut self.prev_overlap_score)
-            .map_err(|e| anyhow!("DSv4 compressor snapshot prev score D2D failed: {e}"))?;
-        self.compressed_seq_len = state.compressed.seq_len;
-        Ok(())
-    }
-
-    fn restore_to(&self, ctx: &DeviceContext, state: &mut Dsv4CompressorState) -> Result<()> {
-        ctx.stream
-            .memcpy_dtod(&self.pending_kv, &mut state.pending_kv)
-            .map_err(|e| anyhow!("DSv4 compressor restore pending kv D2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_dtod(&self.pending_score, &mut state.pending_score)
-            .map_err(|e| anyhow!("DSv4 compressor restore pending score D2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_dtod(&self.prev_overlap_kv, &mut state.prev_overlap_kv)
-            .map_err(|e| anyhow!("DSv4 compressor restore prev kv D2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_dtod(&self.prev_overlap_score, &mut state.prev_overlap_score)
-            .map_err(|e| anyhow!("DSv4 compressor restore prev score D2D failed: {e}"))?;
-        state.compressed.seq_len = self.compressed_seq_len;
         Ok(())
     }
 }
@@ -1459,197 +1408,6 @@ pub(crate) struct Dsv4LayerAttentionState {
     dsa_official: Option<Dsv4DsaOfficialState>,
 }
 
-pub(crate) struct Dsv4LayerAttentionSnapshot {
-    compressor: Option<Dsv4CompressorStateSnapshot>,
-    indexer: Option<Dsv4CompressorStateSnapshot>,
-    sw_slot: CudaSlice<half::bf16>,
-    fp8_sw_slot: Option<CudaSlice<u8>>,
-    fp8_comp_packed_rows: Option<usize>,
-    draft_abs_pos: usize,
-    head_dim: usize,
-    sliding_window: usize,
-    fp8_page_block_size: usize,
-    fp8_bytes_per_token: usize,
-    fp8_token_data_bytes: usize,
-    fp8_scale_bytes: usize,
-}
-
-impl Dsv4LayerAttentionSnapshot {
-    /// `(logical ring block, data offset in block, scale offset in block)` for
-    /// one draft token's FP8 SW ring slot. The block id is slot-LOGICAL — the
-    /// caller translates it to a physical pool page through the slot's block
-    /// table (#85 P2), so this math never bakes in band contiguity.
-    fn fp8_sw_offsets(&self, draft_abs_pos: usize) -> Option<(usize, usize, usize)> {
-        self.fp8_sw_slot.as_ref()?;
-        let ring_idx = draft_abs_pos % self.sliding_window;
-        let block_id = ring_idx / self.fp8_page_block_size;
-        let row = ring_idx % self.fp8_page_block_size;
-        let data_in_block = row * self.fp8_token_data_bytes;
-        let scale_in_block =
-            self.fp8_page_block_size * self.fp8_token_data_bytes + row * self.fp8_scale_bytes;
-        Some((block_id, data_in_block, scale_in_block))
-    }
-
-    fn capture_sw(
-        &mut self,
-        ctx: &DeviceContext,
-        sw_window_cache: &CudaSlice<half::bf16>,
-        draft_abs_pos: usize,
-    ) -> Result<()> {
-        ensure!(
-            self.sliding_window > 0 && self.head_dim > 0,
-            "DSv4 rollback SW snapshot has invalid shape sliding_window={} head_dim={}",
-            self.sliding_window,
-            self.head_dim
-        );
-        self.draft_abs_pos = draft_abs_pos;
-        let ring_idx = draft_abs_pos % self.sliding_window;
-        let offset = ring_idx * self.head_dim;
-        ensure!(
-            offset + self.head_dim <= sw_window_cache.len() && self.sw_slot.len() == self.head_dim,
-            "DSv4 rollback SW slot out of range offset={} len={} cache_len={} snapshot_len={}",
-            offset,
-            self.head_dim,
-            sw_window_cache.len(),
-            self.sw_slot.len()
-        );
-        let src = sw_window_cache.slice(offset..offset + self.head_dim);
-        ctx.stream
-            .memcpy_dtod(&src, &mut self.sw_slot)
-            .map_err(|e| anyhow!("DSv4 rollback SW slot D2D snapshot failed: {e}"))?;
-        Ok(())
-    }
-
-    fn restore_sw(
-        &self,
-        ctx: &DeviceContext,
-        sw_window_cache: &mut CudaSlice<half::bf16>,
-        draft_abs_pos: usize,
-    ) -> Result<()> {
-        ensure!(
-            self.draft_abs_pos == draft_abs_pos,
-            "DSv4 rollback SW restore draft_pos mismatch snapshot={} restore={}",
-            self.draft_abs_pos,
-            draft_abs_pos
-        );
-        let ring_idx = draft_abs_pos % self.sliding_window;
-        let offset = ring_idx * self.head_dim;
-        ensure!(
-            offset + self.head_dim <= sw_window_cache.len() && self.sw_slot.len() == self.head_dim,
-            "DSv4 rollback SW restore out of range offset={} len={} cache_len={} snapshot_len={}",
-            offset,
-            self.head_dim,
-            sw_window_cache.len(),
-            self.sw_slot.len()
-        );
-        let mut dst = sw_window_cache.slice_mut(offset..offset + self.head_dim);
-        ctx.stream
-            .memcpy_dtod(&self.sw_slot, &mut dst)
-            .map_err(|e| anyhow!("DSv4 rollback SW slot D2D restore failed: {e}"))?;
-        Ok(())
-    }
-
-    fn capture_fp8_sw(
-        &mut self,
-        ctx: &DeviceContext,
-        pool: &mut Dsv4LayerKvLayout,
-        flash: &Dsv4FlashMlaDecodeState,
-        draft_abs_pos: usize,
-    ) -> Result<()> {
-        let Some((logical_page, data_in_block, scale_in_block)) =
-            self.fp8_sw_offsets(draft_abs_pos)
-        else {
-            return Ok(());
-        };
-        let Some(slot) = &mut self.fp8_sw_slot else {
-            return Ok(());
-        };
-        // Table-routed (#85 P2): the ring block's byte base is its PHYSICAL
-        // pool page (block-table lookup), so this path stays valid when
-        // Stage B fragments the table.
-        let page = physical_page(pool.flashmla_page_table(flash.slot_idx)?, logical_page)?;
-        let block_base = page as usize * (self.fp8_page_block_size * self.fp8_bytes_per_token);
-        let data_offset = block_base + data_in_block;
-        let scale_offset = block_base + scale_in_block;
-        let pool_buf = pool.flashmla_pool_data()?;
-        ensure!(
-            data_offset + self.fp8_token_data_bytes <= pool_buf.len()
-                && scale_offset + self.fp8_scale_bytes <= pool_buf.len()
-                && slot.len() == self.fp8_bytes_per_token,
-            "DSv4 rollback FP8 SW slot out of range data={} scale={} pool_len={} slot_len={}",
-            data_offset,
-            scale_offset,
-            pool_buf.len(),
-            slot.len()
-        );
-        let src_data = pool_buf.slice(data_offset..data_offset + self.fp8_token_data_bytes);
-        let mut dst_data = slot.slice_mut(0..self.fp8_token_data_bytes);
-        ctx.stream
-            .memcpy_dtod(&src_data, &mut dst_data)
-            .map_err(|e| anyhow!("DSv4 rollback FP8 SW data snapshot failed: {e}"))?;
-        let src_scale = pool_buf.slice(scale_offset..scale_offset + self.fp8_scale_bytes);
-        let mut dst_scale = slot.slice_mut(self.fp8_token_data_bytes..self.fp8_bytes_per_token);
-        ctx.stream
-            .memcpy_dtod(&src_scale, &mut dst_scale)
-            .map_err(|e| anyhow!("DSv4 rollback FP8 SW scale snapshot failed: {e}"))?;
-        self.fp8_comp_packed_rows = Some(flash.fp8_kv_comp_packed_rows);
-        Ok(())
-    }
-
-    fn restore_fp8_sw(
-        &self,
-        ctx: &DeviceContext,
-        pool: &mut Dsv4LayerKvLayout,
-        flash: &mut Dsv4FlashMlaDecodeState,
-        draft_abs_pos: usize,
-    ) -> Result<()> {
-        let Some((logical_page, data_in_block, scale_in_block)) =
-            self.fp8_sw_offsets(draft_abs_pos)
-        else {
-            return Ok(());
-        };
-        let Some(slot) = &self.fp8_sw_slot else {
-            return Ok(());
-        };
-        ensure!(
-            self.draft_abs_pos == draft_abs_pos,
-            "DSv4 rollback FP8 restore draft_pos mismatch snapshot={} restore={}",
-            self.draft_abs_pos,
-            draft_abs_pos
-        );
-        // Table-routed (#85 P2): same physical-page translation as capture.
-        let page = physical_page(pool.flashmla_page_table(flash.slot_idx)?, logical_page)?;
-        let block_base = page as usize * (self.fp8_page_block_size * self.fp8_bytes_per_token);
-        let data_offset = block_base + data_in_block;
-        let scale_offset = block_base + scale_in_block;
-        let pool_buf = pool.flashmla_pool_data_mut()?;
-        ensure!(
-            data_offset + self.fp8_token_data_bytes <= pool_buf.len()
-                && scale_offset + self.fp8_scale_bytes <= pool_buf.len()
-                && slot.len() == self.fp8_bytes_per_token,
-            "DSv4 rollback FP8 SW restore out of range data={} scale={} pool_len={} slot_len={}",
-            data_offset,
-            scale_offset,
-            pool_buf.len(),
-            slot.len()
-        );
-        let src_data = slot.slice(0..self.fp8_token_data_bytes);
-        let mut dst_data = pool_buf.slice_mut(data_offset..data_offset + self.fp8_token_data_bytes);
-        ctx.stream
-            .memcpy_dtod(&src_data, &mut dst_data)
-            .map_err(|e| anyhow!("DSv4 rollback FP8 SW data restore failed: {e}"))?;
-        let src_scale = slot.slice(self.fp8_token_data_bytes..self.fp8_bytes_per_token);
-        let mut dst_scale = pool_buf.slice_mut(scale_offset..scale_offset + self.fp8_scale_bytes);
-        ctx.stream
-            .memcpy_dtod(&src_scale, &mut dst_scale)
-            .map_err(|e| anyhow!("DSv4 rollback FP8 SW scale restore failed: {e}"))?;
-        if let Some(rows) = self.fp8_comp_packed_rows {
-            flash.fp8_kv_comp_packed_rows = rows;
-        }
-        Ok(())
-    }
-}
-
 /// Host-side image of one slot's per-layer device state for the whole-slot KV
 /// tier (#84/#85 Route B, `docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md`).
 /// Executor-internal, NOT byte-packed: plain host vectors per buffer.
@@ -1665,11 +1423,11 @@ pub(crate) struct Dsv4LayerImage {
 
 /// Whole-slot host image of one [`Dsv4CompressorState`].
 ///
-/// Unlike [`Dsv4CompressorStateSnapshot`] (spec-decode rollback), this MUST
-/// carry `compressed.data`: rollback only ever SHRINKS a live slot (the
-/// rolled-back rows are overwritten by the next real decode), but a swapped-out
-/// slot is freed and reused by another request, so every committed compressed
-/// row has to survive in the image.
+/// Unlike spec-decode rollback (truncate + re-forward, which only ever SHRINKS
+/// a live slot so the rolled-back rows are overwritten by the next real
+/// decode), this MUST carry `compressed.data`: a swapped-out slot is freed and
+/// reused by another request, so every committed compressed row has to survive
+/// in the image.
 struct Dsv4CompressorImage {
     pending_kv: Vec<half::bf16>,
     pending_score: Vec<half::bf16>,
@@ -2010,109 +1768,6 @@ impl Dsv4LayerAttentionState {
         Ok(())
     }
 
-    pub(crate) fn rollback_snapshot(
-        &self,
-        ctx: &DeviceContext,
-        config: &DeepSeekV4Config,
-        kv_arena: &Dsv4MlaKvArena,
-    ) -> Result<Dsv4LayerAttentionSnapshot> {
-        let fp8_token_data_bytes = kv_arena
-            .nope_dim
-            .checked_add(kv_arena.rope_dim * std::mem::size_of::<half::bf16>())
-            .ok_or_else(|| anyhow!("DSv4 rollback FP8 token data byte overflow"))?;
-        ensure!(
-            kv_arena.bytes_per_token >= fp8_token_data_bytes,
-            "DSv4 rollback FP8 bytes/token {} smaller than token data bytes {}",
-            kv_arena.bytes_per_token,
-            fp8_token_data_bytes
-        );
-        let fp8_scale_bytes = kv_arena.bytes_per_token - fp8_token_data_bytes;
-        Ok(Dsv4LayerAttentionSnapshot {
-            compressor: self
-                .compressor
-                .as_ref()
-                .map(|state| Dsv4CompressorStateSnapshot::new(ctx, state))
-                .transpose()?,
-            indexer: self
-                .indexer
-                .as_ref()
-                .map(|state| Dsv4CompressorStateSnapshot::new(ctx, state))
-                .transpose()?,
-            sw_slot: ctx
-                .stream
-                .alloc_zeros::<half::bf16>(config.head_dim)
-                .map_err(|e| anyhow!("DSv4 rollback SW slot alloc failed: {e}"))?,
-            fp8_sw_slot: self
-                .flashmla
-                .as_ref()
-                .map(|_| {
-                    ctx.stream
-                        .alloc_zeros::<u8>(kv_arena.bytes_per_token)
-                        .map_err(|e| anyhow!("DSv4 rollback FP8 SW slot alloc failed: {e}"))
-                })
-                .transpose()?,
-            fp8_comp_packed_rows: self
-                .flashmla
-                .as_ref()
-                .map(|flash| flash.fp8_kv_comp_packed_rows),
-            draft_abs_pos: 0,
-            head_dim: config.head_dim,
-            sliding_window: config.sliding_window,
-            fp8_page_block_size: kv_arena.page_block_size,
-            fp8_bytes_per_token: kv_arena.bytes_per_token,
-            fp8_token_data_bytes,
-            fp8_scale_bytes,
-        })
-    }
-
-    pub(crate) fn capture_rollback_snapshot(
-        &self,
-        ctx: &DeviceContext,
-        pool: &mut Dsv4LayerKvLayout,
-        snapshot: &mut Dsv4LayerAttentionSnapshot,
-        draft_abs_pos: usize,
-    ) -> Result<()> {
-        snapshot.capture_sw(ctx, &self.sw_window_cache, draft_abs_pos)?;
-        if let Some(flash) = &self.flashmla {
-            snapshot.capture_fp8_sw(ctx, pool, flash, draft_abs_pos)?;
-        }
-        match (&self.compressor, &mut snapshot.compressor) {
-            (Some(state), Some(snapshot)) => snapshot.capture_from(ctx, state)?,
-            (None, None) => {}
-            _ => bail!("DSv4 compressor rollback snapshot shape mismatch"),
-        }
-        match (&self.indexer, &mut snapshot.indexer) {
-            (Some(state), Some(snapshot)) => snapshot.capture_from(ctx, state)?,
-            (None, None) => {}
-            _ => bail!("DSv4 indexer rollback snapshot shape mismatch"),
-        }
-        Ok(())
-    }
-
-    pub(crate) fn restore_rollback_snapshot(
-        &mut self,
-        ctx: &DeviceContext,
-        pool: &mut Dsv4LayerKvLayout,
-        snapshot: &Dsv4LayerAttentionSnapshot,
-        draft_abs_pos: usize,
-    ) -> Result<()> {
-        snapshot.restore_sw(ctx, &mut self.sw_window_cache, draft_abs_pos)?;
-        if let Some(flash) = &mut self.flashmla {
-            snapshot.restore_fp8_sw(ctx, pool, flash, draft_abs_pos)?;
-        }
-        match (&mut self.compressor, &snapshot.compressor) {
-            (Some(state), Some(snapshot)) => snapshot.restore_to(ctx, state)?,
-            (None, None) => {}
-            _ => bail!("DSv4 compressor rollback restore shape mismatch"),
-        }
-        match (&mut self.indexer, &snapshot.indexer) {
-            (Some(state), Some(snapshot)) => snapshot.restore_to(ctx, state)?,
-            (None, None) => {}
-            _ => bail!("DSv4 indexer rollback restore shape mismatch"),
-        }
-        Ok(())
-    }
-
     /// Serialize this layer's COMPLETE per-slot device state into a host image
     /// (whole-slot KV swap, #84/#85 Route B). The caller (slot-level entry in
     /// `dsv4.rs`) syncs the stream once after all layers, so the D2H copies are
@@ -2274,9 +1929,9 @@ impl Dsv4LayerAttentionState {
     ) {
         self.advance_decode_len(mode, ratio, total_len);
         // SGLang frozen-KV discipline: the official DSA key cache is a
-        // deterministic function of committed `seq_len`. `capture/restore_
-        // rollback_snapshot` cover sw/fp8/compressor/indexer but NOT
-        // `dsa_official` — its `packed_rows` progress counter advances when a
+        // deterministic function of committed `seq_len`. Truncating
+        // sw/fp8/compressor/indexer back to `total_len` is enough for them, but
+        // NOT for `dsa_official` — its `packed_rows` progress counter advances when a
         // speculative draft crosses a compression boundary (csa_select_official,
         // `packed_rows = indexer_rows_after`) and was never rolled back on draft
         // rejection. The stale draft key then stays in `dsa_key_cache` and the
@@ -5534,65 +5189,67 @@ fn compressor_forward(
         let has_prev_overlap = i32::from(compressed_base > 0);
         // SAFETY: all buffers valid on ctx.stream; state carries the pending and
         // overlap rows from previous contiguous appends.
-        unsafe {
-            if let Some(start_pos_device) = start_pos_device {
-                let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
-                ffi::dsv4_compressor_update_start_pos_ptr_cuda(
-                    kv_ptr as *const ffi::Half,
-                    score_ptr as *const ffi::Half,
-                    ape_ptr as *const ffi::Half,
-                    norm_ptr as *const ffi::Half,
-                    pkv_ptr as *mut ffi::Half,
-                    psc_ptr as *mut ffi::Half,
-                    prkv_ptr as *mut ffi::Half,
-                    prsc_ptr as *mut ffi::Half,
-                    comp_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    start_ptr as *const i32,
-                    head_dim as i32,
-                    ratio as i32,
-                    width as i32,
-                    i32::from(overlap),
-                    config.rms_norm_eps,
-                    rope_dim as i32,
-                    rope_base,
-                    rope_original_seq_len,
-                    rope.factor,
-                    rope.beta_fast,
-                    rope.beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            } else {
-                ffi::dsv4_compressor_update_cuda(
-                    kv_ptr as *const ffi::Half,
-                    score_ptr as *const ffi::Half,
-                    ape_ptr as *const ffi::Half,
-                    norm_ptr as *const ffi::Half,
-                    pkv_ptr as *mut ffi::Half,
-                    psc_ptr as *mut ffi::Half,
-                    prkv_ptr as *mut ffi::Half,
-                    prsc_ptr as *mut ffi::Half,
-                    comp_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    start_pos_i32,
-                    pending_len_i32,
-                    compressed_base_i32,
-                    head_dim as i32,
-                    ratio as i32,
-                    width as i32,
-                    i32::from(overlap),
-                    has_prev_overlap,
-                    config.rms_norm_eps,
-                    rope_dim as i32,
-                    rope_base,
-                    rope_original_seq_len,
-                    rope.factor,
-                    rope.beta_fast,
-                    rope.beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+        if !dsv4_verify_frozen() {
+            unsafe {
+                if let Some(start_pos_device) = start_pos_device {
+                    let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                    ffi::dsv4_compressor_update_start_pos_ptr_cuda(
+                        kv_ptr as *const ffi::Half,
+                        score_ptr as *const ffi::Half,
+                        ape_ptr as *const ffi::Half,
+                        norm_ptr as *const ffi::Half,
+                        pkv_ptr as *mut ffi::Half,
+                        psc_ptr as *mut ffi::Half,
+                        prkv_ptr as *mut ffi::Half,
+                        prsc_ptr as *mut ffi::Half,
+                        comp_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        start_ptr as *const i32,
+                        head_dim as i32,
+                        ratio as i32,
+                        width as i32,
+                        i32::from(overlap),
+                        config.rms_norm_eps,
+                        rope_dim as i32,
+                        rope_base,
+                        rope_original_seq_len,
+                        rope.factor,
+                        rope.beta_fast,
+                        rope.beta_slow,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                } else {
+                    ffi::dsv4_compressor_update_cuda(
+                        kv_ptr as *const ffi::Half,
+                        score_ptr as *const ffi::Half,
+                        ape_ptr as *const ffi::Half,
+                        norm_ptr as *const ffi::Half,
+                        pkv_ptr as *mut ffi::Half,
+                        psc_ptr as *mut ffi::Half,
+                        prkv_ptr as *mut ffi::Half,
+                        prsc_ptr as *mut ffi::Half,
+                        comp_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        start_pos_i32,
+                        pending_len_i32,
+                        compressed_base_i32,
+                        head_dim as i32,
+                        ratio as i32,
+                        width as i32,
+                        i32::from(overlap),
+                        has_prev_overlap,
+                        config.rms_norm_eps,
+                        rope_dim as i32,
+                        rope_base,
+                        rope_original_seq_len,
+                        rope.factor,
+                        rope.beta_fast,
+                        rope.beta_slow,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
             }
         }
     }
