@@ -337,6 +337,37 @@ impl TpRuntime {
     }
 
     #[cfg(feature = "cuda")]
+    /// Fused all-reduce + DSv4 hc_post (one kernel). Returns `Ok(false)` when
+    /// the one-shot comm is absent or the message exceeds the registered
+    /// scratch — the caller then runs the unfused all-reduce + hc_post pair.
+    /// `attn_out` is reduced across ranks, `shared` (optional) folded in, then
+    /// the hc_post mix (`post`/`comb`, mixing `residual`) written to `out`.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(all(feature = "cuda", feature = "nccl")), allow(unused_variables))]
+    pub fn try_fused_ar_hc_post(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        attn_out: &cuda_kernels::prelude::HiddenStates,
+        shared: Option<&cuda_kernels::prelude::HiddenStates>,
+        residual: &cuda_kernels::prelude::HiddenStates,
+        post: &cudarc::driver::CudaSlice<f32>,
+        comb: &cudarc::driver::CudaSlice<f32>,
+        out: &mut cuda_kernels::prelude::HiddenStates,
+        hidden: usize,
+        hc_mult: usize,
+    ) -> anyhow::Result<bool> {
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        if let Some(os) = &self.oneshot {
+            if attn_out.data.len() * 2 <= os.scratch_bytes() {
+                os.fused_ar_hc_post(
+                    ctx, attn_out, shared, residual, post, comb, out, hidden, hc_mult,
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn all_reduce_sum(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
@@ -1030,6 +1061,68 @@ mod oneshot {
                         0,
                     ),
                     "one-shot AR",
+                )?;
+            }
+            Ok(())
+        }
+
+        /// Fused all-reduce + DSv4 hc_post: stage `attn_out` (this rank's
+        /// attention/MoE output) into the registered scratch, then ONE kernel
+        /// reduces across ranks and applies the hc_post mix into `out`. With
+        /// `shared`, the shared-expert output is summed into the reduced value
+        /// before the mix (the moe site). Caller guarantees
+        /// `attn_out.len()*2 <= scratch_bytes()`.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn fused_ar_hc_post(
+            &self,
+            ctx: &DeviceContext,
+            attn_out: &cuda_kernels::prelude::HiddenStates,
+            shared: Option<&cuda_kernels::prelude::HiddenStates>,
+            residual: &cuda_kernels::prelude::HiddenStates,
+            post: &cudarc::driver::CudaSlice<f32>,
+            comb: &cudarc::driver::CudaSlice<f32>,
+            out: &mut cuda_kernels::prelude::HiddenStates,
+            hidden: usize,
+            hc_mult: usize,
+        ) -> Result<()> {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+            let elems = attn_out.data.len();
+            let (in_ptr, _gi) = attn_out.data.device_ptr(&ctx.stream);
+            let shared_or_0 = match shared {
+                Some(h) => {
+                    let (p, _g) = h.data.device_ptr(&ctx.stream);
+                    p
+                }
+                None => 0,
+            };
+            let (res_ptr, _gr) = residual.data.device_ptr(&ctx.stream);
+            let (post_ptr, _gp) = post.device_ptr(&ctx.stream);
+            let (comb_ptr, _gc) = comb.device_ptr(&ctx.stream);
+            let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+            // SAFETY: in_ptr is `elems` live bf16; scratch is this rank's
+            // registered region of >= elems*2 bytes; all stream-ordered.
+            unsafe {
+                cudarc::driver::result::memcpy_dtod_async(
+                    self.scratch_ptr,
+                    in_ptr,
+                    elems * 2,
+                    ctx.stream.cu_stream(),
+                )
+                .map_err(|e| anyhow!("fused AR stage copy: {e}"))?;
+                check(
+                    car::arle_car_fused_ar_hc_post(
+                        self.handle,
+                        ctx.stream.cu_stream(),
+                        shared_or_0,
+                        res_ptr,
+                        post_ptr,
+                        comb_ptr,
+                        out_ptr,
+                        hidden as i32,
+                        hc_mult as i32,
+                    ),
+                    "fused AR+hc_post",
                 )?;
             }
             Ok(())
