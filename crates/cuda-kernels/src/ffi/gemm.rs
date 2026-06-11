@@ -639,6 +639,31 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepgemm_m_grouped_bf16_gemm_nt_masked_cuda(
+        a: *const Half,
+        b: *const Half,
+        d: *mut Half,
+        masked_m: *const i32,
+        num_groups: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        expected_m: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepgemm_m_grouped_bf16_gemm_nt_contiguous_cuda(
+        a: *const Half,
+        b: *const Half,
+        d: *mut Half,
+        m_indices: *const i32,
+        num_groups: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_deepgemm_fp8_gemm_nt_cuda(
         a: *const u8,
         sfa: *const f32,

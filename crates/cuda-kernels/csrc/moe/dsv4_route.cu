@@ -577,6 +577,59 @@ extern "C" CUresult dsv4_exclusive_scan_i32_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+// Exclusive prefix-sum over per-expert counts with each group's span padded
+// up to `alignment` rows: `offsets[g] = sum_{g' < g} align(counts[g'])`.
+// This is the DeepGEMM m-grouped-contiguous layout builder: BLOCK_M = 128
+// output tiles resolve their B group from `m_indices[tile_start]`, so every
+// group's row segment must start 128-aligned (alignment = 128). Empty groups
+// contribute zero rows. `total` (optional) receives the aligned row total.
+__global__ void moe_exclusive_scan_aligned_i32_kernel(
+    const int32_t *__restrict__ counts,
+    int32_t *__restrict__ offsets,
+    int32_t *__restrict__ total,
+    int n,
+    int alignment) {
+  __shared__ int32_t values[DSV4_ROUTE_BLOCK];
+  int tid = threadIdx.x;
+  int value = 0;
+  if (tid < n) {
+    int count = counts[tid];
+    value = ((count + alignment - 1) / alignment) * alignment;
+  }
+  values[tid] = value;
+  __syncthreads();
+
+  for (int stride = 1; stride < DSV4_ROUTE_BLOCK; stride <<= 1) {
+    int add = (tid >= stride) ? values[tid - stride] : 0;
+    __syncthreads();
+    values[tid] += add;
+    __syncthreads();
+  }
+
+  if (tid < n) {
+    offsets[tid] = values[tid] - value;
+  }
+  if (tid == 0 && total != nullptr) {
+    total[0] = (n > 0) ? values[n - 1] : 0;
+  }
+}
+
+extern "C" CUresult moe_exclusive_scan_aligned_i32_cuda(
+    const int32_t *counts,
+    int32_t *offsets,
+    int32_t *total,
+    int n,
+    int alignment,
+    CUstream stream) {
+  if (n < 0 || n > DSV4_ROUTE_BLOCK || alignment <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (n == 0) return CUDA_SUCCESS;
+  moe_exclusive_scan_aligned_i32_kernel<<<1, DSV4_ROUTE_BLOCK, 0, (cudaStream_t)stream>>>(
+      counts, offsets, total, n, alignment);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_count_expert_ranks_kernel(
     const int32_t *__restrict__ indices,
     int32_t *__restrict__ counts,
