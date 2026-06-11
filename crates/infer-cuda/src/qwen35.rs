@@ -841,7 +841,7 @@ impl Qwen35Model {
         anyhow::ensure!(
             affordable > 0,
             "Qwen3.5 KV budget rejected startup: post-weights free VRAM affords 0 slots at \
-             max_seq_len {} (per_slot ~{}MB exceeds {MEM_FRACTION} of free). Lower --max-seq-len \
+             max_seq_len {} (per_slot ~{}MB exceeds {MEM_FRACTION} of free). Lower --total-pages \
              or free VRAM.",
             self.max_seq_len,
             per_slot >> 20,
@@ -852,7 +852,7 @@ impl Qwen35Model {
                 "Qwen3.5 KV budget: requested {requested} slots × ~{}MB/slot exceeds the \
                  cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
                  {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}. \
-                 Lower --max-seq-len ({}) to raise concurrency.",
+                 Lower --total-pages (max_seq_len {}) to raise concurrency.",
                 per_slot >> 20,
                 self.max_seq_len,
             );
