@@ -10,7 +10,7 @@ systematic gap: **budget logic was fragmented and partly absent**.
 
 | Surface | Before | Risk |
 |---------|--------|------|
-| DSv4 CUDA | bottom-up clamp `free×0.9 − shared`, NCCL min-reduce (dsv4.rs) | ok |
+| DSv4 CUDA | bottom-up clamp `free×0.9 − shared`, NCCL min-reduce (dsv4.rs) | ok; missing reject-below-fixed guard (**fixed C4**) |
 | Qwen3.5/3.6 CUDA | **NO clamp** — requested num_slots admitted as-is | **OOM at large max_seq_len (the #60 failure class)** |
 | Metal | top-down `plan_resource_budget` (its own planner) | ok, but not shared |
 | Host RAM (T1) / SSD (T2) | hardcoded 4 GiB / 20 GiB constants | not machine-derived (**fixed C3**) |
@@ -65,10 +65,28 @@ guards).
     probe miss (Mac: no `/proc`) falls back to the cap, so it never
     over-shrinks. CLI overrides (`--kv-t1-budget-bytes` / `--kv-ssd-max-bytes`)
     are untouched — they short-circuit the probe.
+- **Phase C4** (`75530149`): **reject-below-fixed parity** — the last audit gap.
+  Both CUDA `from_free` paths (DSv4 + Qwen3.5/3.6) dropped the per-rank
+  `affordable().max(1)`, NCCL-min-reduce the **real** affordable count, then bail
+  uniformly (`anyhow::ensure!(affordable > 0, …)`) when the reduced count is 0 —
+  matching Metal's `fits_fixed` two-stage guard. Before C4 the CUDA paths
+  admitted one slot when post-weights free VRAM couldn't hold even one, then
+  OOM'd at arena/slot allocation; now they fail closed with a clear
+  `affords 0 slots at max_seq_len N` message.
+  - **Lockstep-safe:** every rank branches on the same *reduced* scalar, so the
+    TP group rejects or admits as one — no half-OOM where one rank had room and
+    another did not (the rule from `feedback_spec_decode_gate` / lockstep-state:
+    a fail-closed bail must branch on the post-reduce uniform value).
+  - **Byte-identical in every working config:** once the real affordable is ≥ 1
+    on all ranks the former `max(1)` was a no-op, so the reduced count and clamp
+    are unchanged. Behavior changes ONLY in the regime that previously OOM'd —
+    a strict improvement (clean error vs device OOM), no regression in the
+    fitting regime.
 
-With C3 + B′ the audit's last fragmented surfaces converge: **VRAM (DSv4 +
+With C3 + B′ + C4 the audit's last fragmented surfaces converge: **VRAM (DSv4 +
 Qwen3.5/3.6), host RAM/SSD, and the Metal planner now all flow through the one
-neutral infer-seam kernel.** No backend hand-rolls the budget/clamp policy.
+neutral infer-seam kernel — for both the budget arithmetic *and* the reject
+policy.** No backend hand-rolls the budget/clamp/reject policy.
 
 ## Evidence
 
@@ -82,23 +100,33 @@ neutral infer-seam kernel.** No backend hand-rolls the budget/clamp policy.
   the former inline `limit−fixed` / `budget/per_token/page` / `min().max(1)`
   byte-for-byte across fits/clamps/tight).
 - Mac CUDA-Rust typecheck (`cuda,no-cuda`) + `clippy -D warnings`: **clean** for
-  C1, C2, and C3 (both `cuda,no-cuda` and `no-cuda` paths); `clippy -D warnings`
-  clean for B′ (`metal`).
+  C1, C2, C3, and C4 (both `cuda,no-cuda` and `no-cuda` paths); `clippy -D
+  warnings` clean for B′ (`metal`).
+- C4 guard arithmetic: covered by the existing `infer-seam`
+  `fits_fixed` unit test (`affordable == 0` ⇒ reject); the CUDA edit only drops
+  a proven-no-op `max(1)` and adds the post-reduce `ensure!`.
 - DSv4 C1 byte-identity: the #60 pod 8-slot run already exercises this exact
   path (`shared MoE decode 114MB` came through `kv_budget_num_slots`); the
   refactor preserves the log line and arithmetic.
 
-**GPU integration gate — pending-remote.** Qwen3.5/3.6 CUDA clamp triggering at
-an over-large `--num-slots × --max-seq-len` (boots clamped instead of OOM) needs
-a CUDA GPU; the H20 pod is the DSv4 lane and local is Mac. Tracked under the
-unified-resource-budget plan; the local evidence (kernel unit tests + fitting-
-regime byte-identity + new_slot_state mirroring by inspection) bounds the risk.
+**GPU integration gate — pending-remote.** Two regimes need a CUDA GPU (H20 pod
+is the DSv4 lane, local is Mac): (1) Qwen3.5/3.6 CUDA clamp triggering at an
+over-large `--num-slots × --max-seq-len` (boots clamped instead of OOM); (2) C4
+reject-below-fixed bailing with the `affords 0 slots` error instead of a device
+OOM. Both are dormant on the pod's real configs (`free×0.9 ≫ per_slot`). Tracked
+under the unified-resource-budget plan; local evidence (kernel unit tests +
+fitting-regime byte-identity + `new_slot_state` mirroring by inspection) bounds
+the risk.
 
 ## Rule
 
 When two backends solve the same resource problem (how many KV slots fit in
-device memory), the *policy* — `budget = mem×fraction − fixed; affordable =
-budget/per_unit; planned = min(requested, affordable)` — is identical and
-belongs in one neutral, unit-tested kernel; only probing, cross-rank reduce, and
-byte sizing are backend-specific. A backend with NO clamp (Qwen3.5/3.6) is not
-"simpler" — it is the #60 OOM waiting at a larger shape.
+device memory), the *policy* — `reject if mem < fixed; budget = mem×fraction −
+fixed; affordable = budget/per_unit; planned = min(requested, affordable)` — is
+identical and belongs in one neutral, unit-tested kernel; only probing,
+cross-rank reduce, and byte sizing are backend-specific. The **reject** half of
+that policy is as much a part of it as the clamp half: a backend that clamps but
+admits one slot it can't fit (the CUDA `max(1)`, fixed C4) still OOMs — just one
+shape later. A backend with NO clamp (Qwen3.5/3.6) is not "simpler" — it is the
+#60 OOM waiting at a larger shape. For TP, the reject must branch on the
+post-reduce uniform scalar, or the group half-OOMs.
