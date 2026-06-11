@@ -27,7 +27,7 @@
 //! - [`tokenizer`] — the tokenizer / chat-template adapter (COLD).
 //! - [`schema`] — the OpenAI wire types and `ApiError` (COLD).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -62,9 +62,10 @@ pub use tokenizer::OpenAiTokenizer;
 ///
 /// Owns the engine thread's `JoinHandle` and the submit channel. Dropping the
 /// handle closes the submit channel; the engine thread then drains any
-/// in-flight work, exits its loop, and joins. The generic parameters mirror
-/// [`Engine`]; both must be `Send + 'static` because the engine lives on a
-/// separate thread.
+/// in-flight work, exits its loop, and joins. A [`ServeShutdown`] token can
+/// request a process-level abort instead, used by HTTP Ctrl-C shutdown. The
+/// generic parameters mirror [`Engine`]; both must be `Send + 'static` because
+/// the engine lives on a separate thread.
 pub struct ServeHandle<E: BackendExecutor, K: KvPool> {
     submit_tx: Option<Sender<Submission>>,
     /// Out-of-band control channel: runs a `FnOnce(&mut E)` on the engine thread
@@ -80,6 +81,37 @@ pub struct ServeHandle<E: BackendExecutor, K: KvPool> {
     /// Request tickets currently handed out and not yet dropped.
     live_requests: Arc<AtomicUsize>,
     _backend: std::marker::PhantomData<fn() -> (E, K)>,
+}
+
+/// Shared server shutdown token observed by the HTTP signal handler and the
+/// engine thread.
+#[derive(Clone, Debug)]
+pub struct ServeShutdown {
+    requested: Arc<AtomicBool>,
+}
+
+impl ServeShutdown {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+impl Default for ServeShutdown {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Receipt for a submitted request.
@@ -153,6 +185,17 @@ where
     /// with [`ServeHandle::submit`] and collect results with
     /// [`ServeHandle::collect`].
     pub fn spawn(executor: E, kv: K, config: SchedulerConfig) -> Self {
+        Self::spawn_with_shutdown(executor, kv, config, ServeShutdown::new())
+    }
+
+    /// Spawn an engine thread that also observes `shutdown` for process-level
+    /// aborts.
+    pub fn spawn_with_shutdown(
+        executor: E,
+        kv: K,
+        config: SchedulerConfig,
+        shutdown: ServeShutdown,
+    ) -> Self {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E>>();
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
@@ -166,6 +209,7 @@ where
                     submit_rx,
                     control_rx,
                     loop_counters,
+                    shutdown,
                 )
             })
             .expect("spawn infer-engine thread");
@@ -196,6 +240,18 @@ where
     where
         B: FnOnce() -> Result<Engine<E, K>> + Send + 'static,
     {
+        Self::spawn_with_engine_builder_and_shutdown(builder, ServeShutdown::new())
+    }
+
+    /// Spawn an engine thread, build the engine inside that thread, and observe
+    /// `shutdown` for process-level aborts.
+    pub fn spawn_with_engine_builder_and_shutdown<B>(
+        builder: B,
+        shutdown: ServeShutdown,
+    ) -> Result<Self>
+    where
+        B: FnOnce() -> Result<Engine<E, K>> + Send + 'static,
+    {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E>>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<usize, String>>(1);
@@ -211,7 +267,7 @@ where
                     }
                     let max_live_requests = engine.max_live_requests();
                     let _ = ready_tx.send(Ok(max_live_requests));
-                    engine_loop(engine, submit_rx, control_rx, loop_counters);
+                    engine_loop(engine, submit_rx, control_rx, loop_counters, shutdown);
                 }
                 Err(err) => {
                     let _ = ready_tx.send(Err(err.to_string()));
@@ -517,6 +573,22 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy, Default)]
+    struct NeverReadyEchoExecutor;
+
+    impl BackendExecutor for NeverReadyEchoExecutor {
+        type Inflight = StepOutput;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            let mut inner = EchoExecutor;
+            inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            Ok(PollResult::NotReady(inflight))
+        }
+    }
+
     /// End-to-end frontend-||-engine smoke test with no GPU/MLX dependency.
     ///
     /// Spawns the engine thread on an `EchoExecutor` + real host paged KV pool,
@@ -694,6 +766,33 @@ mod tests {
             .map_err(|_| anyhow!("rejected request did not complete in time"))?;
         assert!(done.generated_tokens.is_empty());
         assert!(done.finish.is_some());
+
+        serve.shutdown().expect("engine thread joins cleanly");
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_token_aborts_inflight_without_drain() -> Result<()> {
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_prompt_tokens: 4096,
+            max_total_tokens: 8192,
+            ..SchedulerConfig::default()
+        };
+        let shutdown = ServeShutdown::new();
+        let kv = HostPagedKvPool::new(1, 256, 16);
+        let serve =
+            ServeHandle::spawn_with_shutdown(NeverReadyEchoExecutor, kv, config, shutdown.clone());
+
+        let ticket = serve.submit(vec![10, 11, 12], 5, SamplingParams::default())?;
+        let handle = ticket.handle();
+        shutdown.request();
+
+        match ticket.collect_timeout(Duration::from_secs(2)) {
+            Err(CollectTimeout::Closed(closed)) => assert_eq!(closed, handle),
+            Err(CollectTimeout::Pending(_)) => panic!("shutdown did not close in-flight request"),
+            Ok(done) => panic!("never-ready request unexpectedly completed: {done:?}"),
+        }
 
         serve.shutdown().expect("engine thread joins cleanly");
         Ok(())

@@ -20,6 +20,8 @@ use infer_core::{
 use infer_plan::SamplingParams;
 use infer_seam::{BackendExecutor, KvPool};
 
+use crate::ServeShutdown;
+
 /// How long the engine thread parks on the submit channel when fully idle.
 ///
 /// Short enough that a freshly-submitted request is picked up promptly, long
@@ -102,6 +104,7 @@ pub(crate) fn engine_loop<E, K>(
     submit_rx: Receiver<Submission>,
     control_rx: Receiver<ControlMessage<E>>,
     counters: CounterHandle,
+    shutdown: ServeShutdown,
 ) where
     E: BackendExecutor,
     K: KvPool,
@@ -142,6 +145,12 @@ pub(crate) fn engine_loop<E, K>(
     let mut carry: Vec<Submission> = Vec::new();
 
     loop {
+        if shutdown.is_requested() {
+            abort_pending(&mut pending, &streamers);
+            publish_counters(&engine, &counters);
+            return;
+        }
+
         // 0. Run any queued out-of-band control closures against the executor
         //    (OPD raw-logits forward, weight offload/reload, LoRA re-merge). These
         //    run between steps with no request in flight, so `&mut E` access is
@@ -236,6 +245,11 @@ where
     while let Ok(closure) = control_rx.try_recv() {
         closure(engine.executor_mut());
     }
+}
+
+fn abort_pending(pending: &mut PendingCompletions, streamers: &Streamers) {
+    pending.clear();
+    streamers.borrow_mut().clear();
 }
 
 /// Submit one request to the engine and register its back-channels.
