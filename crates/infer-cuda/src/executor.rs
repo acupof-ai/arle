@@ -136,9 +136,13 @@ impl RealCudaExecutor {
     pub(crate) fn warmup(&mut self) -> Result<()> {
         match self {
             Self::Qwen(q) => q.warmup(),
-            // Qwen3.5 hybrid / DSv4 have no captured decode graph (MoE host-routing
-            // + recurrent/recompute state are not graph-capturable).
-            Self::Qwen35(_) | Self::Dsv4(_) => Ok(()),
+            // Qwen3.5/3.6 hybrid: whole-step decode graph (opt-in,
+            // ARLE_QWEN35_DECODE_GRAPH=1) — warmup logs the gate verdict;
+            // capture itself is lazy per slot.
+            Self::Qwen35(q) => q.warmup(),
+            // DSv4 drives its own per-portion/whole-step graph gates inside
+            // the model (ARLE_DSV4_* envs).
+            Self::Dsv4(_) => Ok(()),
         }
     }
 
@@ -1525,12 +1529,74 @@ pub fn dsv4_max_seq_len() -> usize {
         .unwrap_or(DSV4_DEFAULT_MAX_SEQ_LEN)
 }
 
+/// Whole-step Qwen3.5/3.6 decode graph enabled? `ARLE_QWEN35_DECODE_GRAPH=1`
+/// opt-in, default OFF until the pod license (≥ +10% tok/s + needle gate +
+/// replay-reuse evidence per the bench spec). The eager path stays the
+/// correctness floor; `Qwen35CudaExecutor::warmup` additionally gates TP and
+/// host-routed MoE off regardless of this.
+fn qwen35_decode_graph_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_QWEN35_DECODE_GRAPH").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+/// Decode-graph replay/capture probes — static so the pod bench can PROVE
+/// replay reuse from server logs (license requires reuse evidence, not
+/// capture-exists). Expected steady state: captures == live slots (≤
+/// num_slots keys; B=1/R=8/seq=1 are shape constants and kv enters via the
+/// staged device scalar, so there is exactly ONE graph per slot), replays ≈
+/// decoded tokens.
+static QWEN35_GRAPH_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QWEN35_GRAPH_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Device addresses a slot's captured decode graph was baked against. The
+/// graph replays kernel launches against FIXED pointers, so if any anchor
+/// moved (workspace `release()` → re-alloc, a length-flip on the staging
+/// slots) the capture is stale and must be dropped — replaying it would read
+/// freed memory (the 2026-06-10 IMA class). `ws_epoch` covers wholesale
+/// releases; the three pointer anchors cover the staged-input and output
+/// buffers directly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Qwen35GraphBake {
+    token_ids_ptr: u64,
+    start_pos_ptr: u64,
+    logits_ptr: u64,
+    ws_epoch: u64,
+}
+
+/// Per-executor whole-step decode-graph state: a DEDICATED decode workspace
+/// (only ever sees `seq_len == 1` shapes, so its buffer addresses are stable
+/// across prefill interleaves — the main workspace re-shapes on every
+/// prefill chunk and would invalidate captures every request) plus one
+/// [`CudaGraphState`] per slot (captured buffers bake the slot's k/v cache +
+/// GDR/conv state addresses, which live for the executor's lifetime and are
+/// only memset by `reset`).
+struct Qwen35DecodeGraph {
+    ws: crate::qwen35::Qwen35Workspace,
+    graphs: Vec<crate::graph::CudaGraphState>,
+    baked: Vec<Option<Qwen35GraphBake>>,
+}
+
+impl Qwen35DecodeGraph {
+    fn new(num_slots: usize, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Self {
+        Self {
+            ws: crate::qwen35::Qwen35Workspace::new(),
+            graphs: (0..num_slots)
+                .map(|_| crate::graph::CudaGraphState::new(stream.clone()))
+                .collect(),
+            baked: vec![None; num_slots],
+        }
+    }
+}
+
 /// Qwen3.5 / Qwen3.6 HYBRID executor: drives
 /// [`crate::qwen35::Qwen35Model::forward_tokens`] over a single scheduled row.
 /// Owns per-slot KV state inside the model (full-attn contiguous caches +
 /// gated-delta recurrent state), so it does NOT use a [`PagedKVPool`]; it relies
 /// on the host [`KvPool`] only for the slot's logical `seq_len` to derive
-/// `start_pos`. Decode graph disabled (MoE host-routing + recurrent state).
+/// `start_pos`. The whole-step decode graph is opt-in
+/// (`ARLE_QWEN35_DECODE_GRAPH=1`, single-GPU + device-routed MoE only).
 ///
 /// First-runnable scope: single-row prefill/decode, uncached full-prefix (each
 /// full-attn layer recomputes over its contiguous cache; each linear-attn layer
@@ -1545,6 +1611,14 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Mirrors the DSv4 persistent decode scratch (passed `&mut` per forward).
     workspace: crate::qwen35::Qwen35Workspace,
     num_slots: usize,
+    /// Whole-step decode graph armed (env gate + TP-single + device-routed
+    /// MoE, resolved at construction; `warmup` logs the verdict). ANY capture
+    /// failure clears this — eager is the permanent fallback, never fatal.
+    decode_graph_armed: bool,
+    /// Lazily-built per-slot graph state (`None` until the first gated decode,
+    /// and re-`None`d whenever baked addresses go stale: OPD weight
+    /// offload/reload, student-LoRA re-merge).
+    decode_graph: Option<Qwen35DecodeGraph>,
 }
 
 impl std::fmt::Debug for Qwen35CudaExecutor {
@@ -1552,6 +1626,14 @@ impl std::fmt::Debug for Qwen35CudaExecutor {
         f.debug_struct("Qwen35CudaExecutor")
             .field("model", &self.model)
             .field("num_slots", &self.num_slots)
+            .field("decode_graph_armed", &self.decode_graph_armed)
+            .field(
+                "captured_decode_slots",
+                &self
+                    .decode_graph
+                    .as_ref()
+                    .map_or(0, |dg| dg.graphs.iter().filter(|g| g.is_captured()).count()),
+            )
             .finish()
     }
 }
@@ -1581,12 +1663,183 @@ impl Qwen35CudaExecutor {
         for _ in 0..num_slots {
             slots.push(model.new_slot_state()?);
         }
+        // Whole-step decode graph: env opt-in ∧ single-GPU (NCCL all-reduce is
+        // not graph-capturable on this stack — TP≥2 stays eager, same as
+        // dense) ∧ every layer's decode step is a pure device-kernel sequence.
+        let decode_graph_armed = qwen35_decode_graph_enabled()
+            && model.tp.is_single()
+            && model.decode_graph_unsupported_reason().is_none();
         Ok(Self {
             model,
             slots,
             workspace: crate::qwen35::Qwen35Workspace::new(),
             num_slots,
+            decode_graph_armed,
+            decode_graph: None,
         })
+    }
+
+    /// Boot-time decode-graph verdict log (mirrors the dense `warmup` info
+    /// messages). Capture itself is lazy — one whole-step capture per slot on
+    /// its first gated decode (after `CudaGraphState`'s universal eager warm
+    /// run), so unused slots never pay capture/instantiation memory.
+    pub(crate) fn warmup(&mut self) -> Result<()> {
+        if !qwen35_decode_graph_enabled() {
+            info!(
+                "Qwen3.5 whole-step decode graph disabled \
+                 (set ARLE_QWEN35_DECODE_GRAPH=1 to enable)"
+            );
+            return Ok(());
+        }
+        if !self.model.tp.is_single() {
+            info!(
+                "Qwen3.5 whole-step decode graph disabled under tensor parallelism \
+                 (world_size>1, NCCL collectives are not graph-capturable); \
+                 using eager forward"
+            );
+            return Ok(());
+        }
+        if let Some(reason) = self.model.decode_graph_unsupported_reason() {
+            info!("Qwen3.5 whole-step decode graph disabled: {reason}; using eager forward");
+            return Ok(());
+        }
+        debug_assert!(self.decode_graph_armed);
+        info!(
+            "Qwen3.5 whole-step decode graph ARMED ({} slots; lazy capture per slot, \
+             one eager warm run before each first capture; eager fallback on any failure)",
+            self.num_slots
+        );
+        Ok(())
+    }
+
+    /// Run one decode step through the captured whole-step graph. Returns
+    /// `Ok(None)` for eager fallback (gate off, out-of-budget position, or a
+    /// capture/replay failure — which permanently downgrades to eager with a
+    /// warn, never fatal). On `Some`, the sampled token is final and the
+    /// slot's seq_len has been advanced.
+    ///
+    /// See [`crate::qwen35::Qwen35Model::forward_decode_step_captured`] for
+    /// the captured-kernel capture-safety table and the perf formula.
+    fn try_graph_decode(&mut self, row: &DecodeRow, position: u64) -> Result<Option<u32>> {
+        if !self.decode_graph_armed {
+            return Ok(None);
+        }
+        // Replay-time invariant: host `ensure!`s inside the captured closure
+        // run only on warm/capture steps, so the budget check must live here,
+        // on EVERY step. Out-of-budget falls back to eager for the canonical
+        // error message.
+        if row.kv_seq_len + 1 > self.model.max_seq_len() {
+            return Ok(None);
+        }
+        if self.decode_graph.is_none() {
+            self.decode_graph = Some(Qwen35DecodeGraph::new(
+                self.num_slots,
+                &self.model.ctx.stream,
+            ));
+        }
+        // Split borrows: the capture closure needs &model + &mut slot state +
+        // &mut decode workspace while the graph entry itself is borrowed.
+        let Self {
+            model,
+            slots,
+            decode_graph,
+            ..
+        } = self;
+        let dg = decode_graph
+            .as_mut()
+            .expect("decode_graph built above when armed");
+        let Qwen35DecodeGraph { ws, graphs, baked } = dg;
+        let slot_idx = row.slot;
+
+        // Stage the per-step device scalars OUTSIDE the graph (dense
+        // stage1_write pattern): token id + position into fixed device
+        // buffers the captured kernels read.
+        let (token_ids_ptr, start_pos_ptr) =
+            model.stage_step_inputs(ws, &[row.last_token], row.kv_seq_len)?;
+        let logits_ptr = model.workspace_logits_ptr(ws)?;
+        let bake = Qwen35GraphBake {
+            token_ids_ptr,
+            start_pos_ptr,
+            logits_ptr,
+            ws_epoch: ws.epoch(),
+        };
+        match baked[slot_idx] {
+            Some(prev) if prev != bake => {
+                // Decode-workspace addresses drifted since capture (release →
+                // re-alloc). Replaying would launch against freed memory —
+                // drop the capture and re-capture against the new addresses.
+                info!(
+                    "[qwen35-decode-graph] slot {slot_idx}: workspace addresses changed; \
+                     dropping stale capture and recapturing"
+                );
+                graphs[slot_idx] = crate::graph::CudaGraphState::new(model.ctx.stream.clone());
+                baked[slot_idx] = Some(bake);
+            }
+            None => baked[slot_idx] = Some(bake),
+            _ => {}
+        }
+
+        let state = &mut graphs[slot_idx];
+        let was_captured = state.is_captured();
+        let will_replay = was_captured && !state.is_armed_warm();
+        let slot_state = &mut slots[slot_idx];
+        let run = state
+            .run_or_capture(|| model.forward_decode_step_captured(slot_state, ws, row.kv_seq_len));
+        if let Err(e) = run {
+            // Any capture/replay failure downgrades to eager permanently —
+            // never fatal (dense pattern). A mid-CAPTURE error recorded (not
+            // executed) its kernels, so device state is untouched and the
+            // eager re-run of this step is clean.
+            warn!(
+                "Qwen3.5 whole-step decode graph failed (slot {slot_idx}), \
+                 downgrading to eager forward: {e}"
+            );
+            self.decode_graph_armed = false;
+            self.decode_graph = None;
+            return Ok(None);
+        }
+        // Host-side state advance happens exactly once per step HERE — the
+        // captured closure is host-state-free (replay skips host code).
+        slots[slot_idx].advance_seq_len(1);
+
+        // Reuse-evidence probes (license needs replay counts, not
+        // capture-exists). Key cardinality must stay ≤ num_slots.
+        let state = &self.decode_graph.as_ref().expect("still present").graphs[slot_idx];
+        if !was_captured && state.is_captured() {
+            let captures =
+                QWEN35_GRAPH_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let keys = self
+                .decode_graph
+                .as_ref()
+                .expect("still present")
+                .graphs
+                .iter()
+                .filter(|g| g.is_captured())
+                .count();
+            info!(
+                "[qwen35-decode-graph] captured slot {slot_idx} \
+                 (captures_total={captures}, live_keys={keys}, max_keys={})",
+                self.num_slots
+            );
+        }
+        if will_replay {
+            let replays =
+                QWEN35_GRAPH_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if replays.is_multiple_of(100) {
+                info!(
+                    "[qwen35-decode-graph] replay_total={replays} captures_total={}",
+                    QWEN35_GRAPH_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        }
+
+        // Sampling stays OUTSIDE the graph (argmax + D2H + sync), reading the
+        // logits the replay (or warm run) just wrote.
+        let dg = self.decode_graph.as_mut().expect("still present");
+        let token = self
+            .model
+            .sample_workspace_logits(&mut dg.ws, &row.params, position)?;
+        Ok(Some(token))
     }
 
     /// Offload the model's device weights to host RAM (OPD teacher time-share),
@@ -1599,6 +1852,10 @@ impl Qwen35CudaExecutor {
         self.ensure_not_collective("offload_engine_weights")?;
         let freed = self.model.offload_engine_weights()?;
         self.workspace.release();
+        // Captured decode graphs bake the (now freed/placeholder) weight
+        // addresses — drop them wholesale. Re-built + re-captured lazily after
+        // reload (the gate flag stays armed).
+        self.decode_graph = None;
         Ok(freed)
     }
 
@@ -1643,9 +1900,18 @@ impl Qwen35CudaExecutor {
             );
             ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
             // A fresh prefill (start_pos == 0) rewinds this slot's recurrent +
-            // conv state and cache cursor before appending.
+            // conv state and cache cursor before appending. Request-boundary
+            // rearm discipline (the e95e11b6 lesson): the slot's captured
+            // decode graph stays valid (state buffers are memset, not
+            // re-allocated), but its FIRST decode of the new occupant runs one
+            // eager warm step so any per-request host work executes without
+            // dropping the capture — capture cost stays once per slot, not
+            // once per request.
             if row.start_pos == 0 {
                 self.slots[row.slot].reset(&self.model.ctx)?;
+                if let Some(dg) = self.decode_graph.as_mut() {
+                    dg.graphs[row.slot].rearm_warm(1);
+                }
             }
             let position = (row.start_pos + row.tokens.len()) as u64;
             let token = self.model.forward_tokens(
@@ -1673,14 +1939,19 @@ impl Qwen35CudaExecutor {
                 row.slot
             );
             let position = row.kv_seq_len.saturating_add(1) as u64;
-            let token = self.model.forward_tokens(
-                &mut self.slots[row.slot],
-                &mut self.workspace,
-                &[row.last_token],
-                row.kv_seq_len,
-                &row.params,
-                position,
-            )?;
+            // Whole-step graph lane first (opt-in); eager forward is the
+            // correctness floor and the fallback on any graph miss/failure.
+            let token = match self.try_graph_decode(row, position)? {
+                Some(token) => token,
+                None => self.model.forward_tokens(
+                    &mut self.slots[row.slot],
+                    &mut self.workspace,
+                    &[row.last_token],
+                    row.kv_seq_len,
+                    &row.params,
+                    position,
+                )?,
+            };
             (row.slot, token)
         };
 
@@ -1748,6 +2019,10 @@ impl Qwen35CudaExecutor {
         update: crate::qwen35::StudentLoraUpdate,
     ) -> Result<()> {
         self.ensure_not_collective("remerge_student_lora")?;
+        // The merge REPLACES q/v `DeviceMatrix` buffers (new device
+        // addresses); captured decode graphs bake the old ones — drop and
+        // recapture lazily.
+        self.decode_graph = None;
         self.model.remerge_student_lora(update)
     }
 }
@@ -1765,6 +2040,26 @@ pub(crate) fn sample_cuda_token(
 
     // TODO: repetition/frequency/presence penalties need the per-request
     // generated-token history threaded through the executor.
+    let logits_host = logits.to_host(ctx)?;
+    Ok(infer_plan::sample_token(&logits_host, params, position))
+}
+
+/// [`sample_cuda_token`] with a caller-provided persistent argmax scratch (one
+/// device i32): the Qwen3.5/3.6 steady-state decode sampler — greedy decode
+/// performs ZERO device allocations per token (the last per-token
+/// `alloc_zeros(1)` moved into the workspace `argmax_out` slot). Always runs
+/// OUTSIDE any CUDA-graph capture (argmax syncs + reads D2H).
+pub(crate) fn sample_cuda_token_scratched(
+    ctx: &DeviceContext,
+    logits: &DeviceVec,
+    params: &SamplingParams,
+    position: u64,
+    argmax_out: &mut cudarc::driver::CudaSlice<i32>,
+) -> Result<u32> {
+    maybe_dump_sample_topk(ctx, logits, position)?;
+    if params.is_greedy() {
+        return crate::ops::argmax_into(ctx, logits, argmax_out);
+    }
     let logits_host = logits.to_host(ctx)?;
     Ok(infer_plan::sample_token(&logits_host, params, position))
 }
