@@ -1408,6 +1408,76 @@ pub(crate) struct Dsv4LayerAttentionState {
     dsa_official: Option<Dsv4DsaOfficialState>,
 }
 
+/// Per-layer K+1-slot snapshot of the speculative-verify ring writes (frozen-KV
+/// MTP P1-2). The depth-K verify forward over `[pending, d0..d_{depth-1}]` at
+/// absolute positions `[start_pos .. start_pos+depth]` writes the BF16 SW ring
+/// (`sw_window_cache`) and the FP8 ring (FlashMLA pool, block-table routed) for
+/// each of the K+1 tokens — the draft chain needs its own KV. On a partial-accept
+/// reject where `start_pos >= sliding_window`, the rejected drafts' ring writes
+/// alias still-active window slots; truncate alone only resets lengths, so the
+/// next decode would read corrupted slots. We snapshot ALL K+1 verify slots
+/// pre-verify and, after the commit truncate, restore the rejected tail
+/// `(accepted_n+1 ..= depth)`. The accepted slots `[0 ..= accepted_n]` are left
+/// to the commit re-forward (which overwrites them).
+///
+/// §0.1 buffer enumeration — every verify-mutated, NON-frozen device buffer this
+/// snapshot covers:
+/// - `sw_window_cache` (BF16 SW ring): `sw_slots` holds K+1 head-dim slots.
+/// - FP8 ring (FlashMLA pool data+scale bytes): `fp8_slots` holds K+1
+///   `fp8_bytes_per_token` slots (`None` when this layer has no FlashMLA/FP8).
+/// - `flash.fp8_kv_comp_packed_rows` (counter): `fp8_packed_rows_before` saves
+///   the pre-verify value so the re-forward re-advances from the correct base.
+///
+/// Buffers pre-allocated ONCE at slot construction (no per-step `CudaSlice`
+/// alloc — alloc churn + the disabled-event-tracking premature-free hazard). The
+/// per-slot D2D copy math is recovered verbatim from the deleted single-slot
+/// rollback snapshot (`Dsv4LayerAttentionSnapshot`, git 7f305a1e): SW slot =
+/// `(draft_abs_pos % sliding_window) * head_dim`; FP8 via `fp8_sw_offsets` →
+/// `physical_page(table, logical_page)` → block_base → data/scale byte D2D. The
+/// only change here: loop over the K+1 positions and store K+1 slots.
+pub(crate) struct Dsv4SpecRingSnapshot {
+    /// `(max_depth+1) * head_dim` BF16 SW ring slots, slot `i` at `[i*head_dim..]`.
+    sw_slots: CudaSlice<half::bf16>,
+    /// `(max_depth+1) * fp8_bytes_per_token` FP8 ring slots (data+scale per slot);
+    /// `None` when this layer has no FlashMLA/FP8 ring.
+    fp8_slots: Option<CudaSlice<u8>>,
+    /// `flash.fp8_kv_comp_packed_rows` captured once pre-verify; restored on reject.
+    fp8_packed_rows_before: Option<usize>,
+    /// Layout metadata `fp8_sw_offsets` needs — copied verbatim from the deleted
+    /// single-slot snapshot struct's fields.
+    head_dim: usize,
+    sliding_window: usize,
+    fp8_page_block_size: usize,
+    fp8_token_data_bytes: usize,
+    fp8_scale_bytes: usize,
+    fp8_bytes_per_token: usize,
+    /// Max draft depth this snapshot was sized for (K); valid slot count is K+1.
+    max_depth: usize,
+    /// Capture-time `start_pos`/`depth`, asserted in restore so a stale snapshot
+    /// can never be replayed against a different verify window.
+    captured_start_pos: usize,
+    captured_depth: usize,
+}
+
+impl Dsv4SpecRingSnapshot {
+    /// `(logical ring block, data offset in block, scale offset in block)` for
+    /// one draft token's FP8 SW ring slot. Recovered verbatim from the deleted
+    /// `Dsv4LayerAttentionSnapshot::fp8_sw_offsets` (git 7f305a1e). The block id
+    /// is slot-LOGICAL — the caller translates it to a physical pool page through
+    /// the slot's block table (#85 P2), so this math never bakes in band
+    /// contiguity. Returns `None` when this layer has no FP8 ring.
+    fn fp8_sw_offsets(&self, draft_abs_pos: usize) -> Option<(usize, usize, usize)> {
+        self.fp8_slots.as_ref()?;
+        let ring_idx = draft_abs_pos % self.sliding_window;
+        let block_id = ring_idx / self.fp8_page_block_size;
+        let row = ring_idx % self.fp8_page_block_size;
+        let data_in_block = row * self.fp8_token_data_bytes;
+        let scale_in_block =
+            self.fp8_page_block_size * self.fp8_token_data_bytes + row * self.fp8_scale_bytes;
+        Some((block_id, data_in_block, scale_in_block))
+    }
+}
+
 /// Host-side image of one slot's per-layer device state for the whole-slot KV
 /// tier (#84/#85 Route B, `docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md`).
 /// Executor-internal, NOT byte-packed: plain host vectors per buffer.
@@ -2006,6 +2076,331 @@ impl Dsv4LayerAttentionState {
             indexer_prev.map_or_else(|| "none".to_string(), |v| v.to_string()),
             indexer_compressed.map_or_else(|| "none".to_string(), |v| v.to_string()),
         );
+        Ok(())
+    }
+
+    /// Allocate this layer's K+1-slot spec-ring snapshot ONCE at slot
+    /// construction (no per-step alloc). Sizes mirror the deleted single-slot
+    /// `rollback_snapshot` (git 7f305a1e) ×(max_depth+1): the SW slot
+    /// (`config.head_dim` BF16) and — when this layer has a FlashMLA decode
+    /// state — the FP8 ring slot (`kv_arena.bytes_per_token` bytes, data+scale).
+    pub(crate) fn alloc_spec_ring_snapshot(
+        &self,
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        kv_arena: &Dsv4MlaKvArena,
+        max_depth: usize,
+    ) -> Result<Dsv4SpecRingSnapshot> {
+        let slots = max_depth
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("DSv4 spec-ring max_depth {max_depth} overflow"))?;
+        // FP8 token data bytes = NoPE FP8 (1 B/dim) + RoPE bf16 (2 B/dim);
+        // scale bytes = bytes_per_token - data bytes. Verbatim from the deleted
+        // `rollback_snapshot` (git 7f305a1e).
+        let fp8_token_data_bytes = kv_arena
+            .nope_dim
+            .checked_add(kv_arena.rope_dim * std::mem::size_of::<half::bf16>())
+            .ok_or_else(|| anyhow!("DSv4 spec-ring FP8 token data byte overflow"))?;
+        ensure!(
+            kv_arena.bytes_per_token >= fp8_token_data_bytes,
+            "DSv4 spec-ring FP8 bytes/token {} smaller than token data bytes {}",
+            kv_arena.bytes_per_token,
+            fp8_token_data_bytes
+        );
+        let fp8_scale_bytes = kv_arena.bytes_per_token - fp8_token_data_bytes;
+        Ok(Dsv4SpecRingSnapshot {
+            sw_slots: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(slots * config.head_dim)
+                .map_err(|e| anyhow!("DSv4 spec-ring SW slots alloc failed: {e}"))?,
+            fp8_slots: self
+                .flashmla
+                .as_ref()
+                .map(|_| {
+                    ctx.stream
+                        .alloc_zeros::<u8>(slots * kv_arena.bytes_per_token)
+                        .map_err(|e| anyhow!("DSv4 spec-ring FP8 slots alloc failed: {e}"))
+                })
+                .transpose()?,
+            fp8_packed_rows_before: None,
+            head_dim: config.head_dim,
+            sliding_window: config.sliding_window,
+            fp8_page_block_size: kv_arena.page_block_size,
+            fp8_token_data_bytes,
+            fp8_scale_bytes,
+            fp8_bytes_per_token: kv_arena.bytes_per_token,
+            max_depth,
+            captured_start_pos: 0,
+            captured_depth: 0,
+        })
+    }
+
+    /// Snapshot the K+1 verify ring slots BEFORE the frozen depth-K verify
+    /// forward. For `i in 0..=depth`: D2D the SW slot for `draft_abs_pos =
+    /// start_pos+i` into `snap.sw_slots[i*head_dim..]`, and — when this layer has
+    /// an FP8 ring — D2D the FP8 data+scale for that position into
+    /// `snap.fp8_slots[i*bytes_per_token..]`. Saves `flash.fp8_kv_comp_packed_rows`
+    /// once. Borrows match the deleted code: `pool: &mut`, `flash: &`.
+    pub(crate) fn capture_spec_rings(
+        &self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+        snap: &mut Dsv4SpecRingSnapshot,
+        start_pos: usize,
+        depth: usize,
+    ) -> Result<()> {
+        ensure!(
+            depth <= snap.max_depth,
+            "DSv4 spec-ring capture depth {depth} exceeds snapshot max_depth {}",
+            snap.max_depth
+        );
+        ensure!(
+            snap.sliding_window > 0 && snap.head_dim > 0,
+            "DSv4 spec-ring capture invalid shape sliding_window={} head_dim={}",
+            snap.sliding_window,
+            snap.head_dim
+        );
+        snap.fp8_packed_rows_before = self.flashmla.as_ref().map(|f| f.fp8_kv_comp_packed_rows);
+        for i in 0..=depth {
+            let draft_abs_pos = start_pos + i;
+            snap.capture_sw_slot(ctx, &self.sw_window_cache, i, draft_abs_pos)?;
+            if let Some(flash) = &self.flashmla {
+                snap.capture_fp8_slot(ctx, pool, flash, i, draft_abs_pos)?;
+            }
+        }
+        snap.captured_start_pos = start_pos;
+        snap.captured_depth = depth;
+        Ok(())
+    }
+
+    /// Restore the REJECTED tail ring slots `(accepted_n+1 ..= depth)` AFTER the
+    /// commit truncate and BEFORE the accepted-prefix re-forward. The accepted
+    /// slots `[0 ..= accepted_n]` are left to the re-forward (which overwrites
+    /// them). Restores `flash.fp8_kv_comp_packed_rows` to the pre-verify base.
+    /// `pool: &mut`; the FP8 `slot_idx` is read from `self.flashmla` up front so
+    /// the per-slot restore re-resolves the page table without a live `&flash`
+    /// borrow across the `&mut sw_window_cache` restore.
+    pub(crate) fn restore_spec_ring_tail(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+        snap: &Dsv4SpecRingSnapshot,
+        start_pos: usize,
+        accepted_n: usize,
+        depth: usize,
+    ) -> Result<()> {
+        ensure!(
+            snap.captured_start_pos == start_pos && snap.captured_depth == depth,
+            "DSv4 spec-ring restore window mismatch captured=({},{}) restore=({start_pos},{depth})",
+            snap.captured_start_pos,
+            snap.captured_depth
+        );
+        ensure!(
+            accepted_n <= depth,
+            "DSv4 spec-ring restore accepted_n {accepted_n} exceeds depth {depth}"
+        );
+        // The FP8 ring is slot-pinned; its page table is keyed by the layer's
+        // `flash.slot_idx`. Read it once up front so the per-slot restore can
+        // re-resolve the physical page WITHOUT holding a `&self.flashmla` borrow
+        // across the `&mut self.sw_window_cache` restore (mirrors the deleted
+        // `restore_fp8_sw`, which re-read the table from `flash.slot_idx`).
+        let fp8_slot_idx = self.flashmla.as_ref().map(|f| f.slot_idx);
+        for i in (accepted_n + 1)..=depth {
+            let draft_abs_pos = start_pos + i;
+            snap.restore_sw_slot(ctx, &mut self.sw_window_cache, i, draft_abs_pos)?;
+            if let Some(slot_idx) = fp8_slot_idx {
+                snap.restore_fp8_slot(ctx, pool, slot_idx, i, draft_abs_pos)?;
+            }
+        }
+        if let (Some(flash), Some(rows)) = (&mut self.flashmla, snap.fp8_packed_rows_before) {
+            flash.fp8_kv_comp_packed_rows = rows;
+        }
+        Ok(())
+    }
+}
+
+impl Dsv4SpecRingSnapshot {
+    /// D2D the SW ring slot for `draft_abs_pos` into snapshot slot `i`. Ring
+    /// offset = `(draft_abs_pos % sliding_window) * head_dim` — verbatim from the
+    /// deleted `Dsv4LayerAttentionSnapshot::capture_sw` (git 7f305a1e).
+    fn capture_sw_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        sw_window_cache: &CudaSlice<half::bf16>,
+        i: usize,
+        draft_abs_pos: usize,
+    ) -> Result<()> {
+        ensure!(
+            self.sliding_window > 0 && self.head_dim > 0,
+            "DSv4 spec-ring SW snapshot has invalid shape sliding_window={} head_dim={}",
+            self.sliding_window,
+            self.head_dim
+        );
+        let ring_idx = draft_abs_pos % self.sliding_window;
+        let src_offset = ring_idx * self.head_dim;
+        let dst_offset = i * self.head_dim;
+        ensure!(
+            src_offset + self.head_dim <= sw_window_cache.len()
+                && dst_offset + self.head_dim <= self.sw_slots.len(),
+            "DSv4 spec-ring SW slot out of range src={} dst={} head_dim={} cache_len={} slots_len={}",
+            src_offset,
+            dst_offset,
+            self.head_dim,
+            sw_window_cache.len(),
+            self.sw_slots.len()
+        );
+        let src = sw_window_cache.slice(src_offset..src_offset + self.head_dim);
+        let mut dst = self
+            .sw_slots
+            .slice_mut(dst_offset..dst_offset + self.head_dim);
+        ctx.stream
+            .memcpy_dtod(&src, &mut dst)
+            .map_err(|e| anyhow!("DSv4 spec-ring SW slot D2D snapshot failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Restore the SW ring slot for `draft_abs_pos` from snapshot slot `i`.
+    /// Verbatim ring math from the deleted `restore_sw`.
+    fn restore_sw_slot(
+        &self,
+        ctx: &DeviceContext,
+        sw_window_cache: &mut CudaSlice<half::bf16>,
+        i: usize,
+        draft_abs_pos: usize,
+    ) -> Result<()> {
+        let ring_idx = draft_abs_pos % self.sliding_window;
+        let dst_offset = ring_idx * self.head_dim;
+        let src_offset = i * self.head_dim;
+        ensure!(
+            dst_offset + self.head_dim <= sw_window_cache.len()
+                && src_offset + self.head_dim <= self.sw_slots.len(),
+            "DSv4 spec-ring SW restore out of range src={} dst={} head_dim={} cache_len={} slots_len={}",
+            src_offset,
+            dst_offset,
+            self.head_dim,
+            sw_window_cache.len(),
+            self.sw_slots.len()
+        );
+        let src = self.sw_slots.slice(src_offset..src_offset + self.head_dim);
+        let mut dst = sw_window_cache.slice_mut(dst_offset..dst_offset + self.head_dim);
+        ctx.stream
+            .memcpy_dtod(&src, &mut dst)
+            .map_err(|e| anyhow!("DSv4 spec-ring SW slot D2D restore failed: {e}"))?;
+        Ok(())
+    }
+
+    /// D2D the FP8 ring data+scale bytes for `draft_abs_pos` into snapshot slot
+    /// `i`. Table-routed physical-page math verbatim from the deleted
+    /// `capture_fp8_sw` (git 7f305a1e); early-returns when this layer has no FP8
+    /// ring (`fp8_sw_offsets`/`fp8_slots` is `None`).
+    fn capture_fp8_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+        flash: &Dsv4FlashMlaDecodeState,
+        i: usize,
+        draft_abs_pos: usize,
+    ) -> Result<()> {
+        // `fp8_sw_offsets` returns `None` exactly when `fp8_slots` is `None`
+        // (SW-only / non-FlashMLA layer), so this early-return also guards the
+        // `as_mut().ok_or_else` below — verbatim shape from the deleted
+        // `capture_fp8_sw`.
+        let Some((logical_page, data_in_block, scale_in_block)) =
+            self.fp8_sw_offsets(draft_abs_pos)
+        else {
+            return Ok(());
+        };
+        // Table-routed (#85 P2): the ring block's byte base is its PHYSICAL pool
+        // page (block-table lookup), so this path stays valid when Stage B
+        // fragments the table.
+        let page = physical_page(pool.flashmla_page_table(flash.slot_idx)?, logical_page)?;
+        let block_base = page as usize * (self.fp8_page_block_size * self.fp8_bytes_per_token);
+        let data_offset = block_base + data_in_block;
+        let scale_offset = block_base + scale_in_block;
+        let pool_buf = pool.flashmla_pool_data()?;
+        let slot_base = i * self.fp8_bytes_per_token;
+        let slots = self
+            .fp8_slots
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 spec-ring FP8 slots missing during capture"))?;
+        ensure!(
+            data_offset + self.fp8_token_data_bytes <= pool_buf.len()
+                && scale_offset + self.fp8_scale_bytes <= pool_buf.len()
+                && slot_base + self.fp8_bytes_per_token <= slots.len(),
+            "DSv4 spec-ring FP8 slot out of range data={} scale={} pool_len={} slot_base={} slots_len={}",
+            data_offset,
+            scale_offset,
+            pool_buf.len(),
+            slot_base,
+            slots.len()
+        );
+        let src_data = pool_buf.slice(data_offset..data_offset + self.fp8_token_data_bytes);
+        let mut dst_data = slots.slice_mut(slot_base..slot_base + self.fp8_token_data_bytes);
+        ctx.stream
+            .memcpy_dtod(&src_data, &mut dst_data)
+            .map_err(|e| anyhow!("DSv4 spec-ring FP8 data snapshot failed: {e}"))?;
+        let src_scale = pool_buf.slice(scale_offset..scale_offset + self.fp8_scale_bytes);
+        let mut dst_scale = slots
+            .slice_mut(slot_base + self.fp8_token_data_bytes..slot_base + self.fp8_bytes_per_token);
+        ctx.stream
+            .memcpy_dtod(&src_scale, &mut dst_scale)
+            .map_err(|e| anyhow!("DSv4 spec-ring FP8 scale snapshot failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Restore the FP8 ring data+scale bytes for `draft_abs_pos` from snapshot
+    /// slot `i`. Table-routed physical-page math verbatim from the deleted
+    /// `restore_fp8_sw`; early-returns when this layer has no FP8 ring. (The
+    /// `flash` slot index is re-resolved through the table by the page lookup;
+    /// the caller restores `fp8_kv_comp_packed_rows` separately.)
+    fn restore_fp8_slot(
+        &self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+        slot_idx: usize,
+        i: usize,
+        draft_abs_pos: usize,
+    ) -> Result<()> {
+        let Some((logical_page, data_in_block, scale_in_block)) =
+            self.fp8_sw_offsets(draft_abs_pos)
+        else {
+            return Ok(());
+        };
+        let Some(slots) = &self.fp8_slots else {
+            return Ok(());
+        };
+        // Table-routed (#85 P2): same physical-page translation as capture. The
+        // table is re-resolved from the layer's `slot_idx` (read by the caller
+        // before the `&mut sw_window_cache` borrow) — verbatim translation from
+        // the deleted `restore_fp8_sw`.
+        let page = physical_page(pool.flashmla_page_table(slot_idx)?, logical_page)?;
+        let block_base = page as usize * (self.fp8_page_block_size * self.fp8_bytes_per_token);
+        let data_offset = block_base + data_in_block;
+        let scale_offset = block_base + scale_in_block;
+        let pool_buf = pool.flashmla_pool_data_mut()?;
+        let slot_base = i * self.fp8_bytes_per_token;
+        ensure!(
+            data_offset + self.fp8_token_data_bytes <= pool_buf.len()
+                && scale_offset + self.fp8_scale_bytes <= pool_buf.len()
+                && slot_base + self.fp8_bytes_per_token <= slots.len(),
+            "DSv4 spec-ring FP8 restore out of range data={} scale={} pool_len={} slot_base={} slots_len={}",
+            data_offset,
+            scale_offset,
+            pool_buf.len(),
+            slot_base,
+            slots.len()
+        );
+        let src_data = slots.slice(slot_base..slot_base + self.fp8_token_data_bytes);
+        let mut dst_data = pool_buf.slice_mut(data_offset..data_offset + self.fp8_token_data_bytes);
+        ctx.stream
+            .memcpy_dtod(&src_data, &mut dst_data)
+            .map_err(|e| anyhow!("DSv4 spec-ring FP8 data restore failed: {e}"))?;
+        let src_scale = slots
+            .slice(slot_base + self.fp8_token_data_bytes..slot_base + self.fp8_bytes_per_token);
+        let mut dst_scale = pool_buf.slice_mut(scale_offset..scale_offset + self.fp8_scale_bytes);
+        ctx.stream
+            .memcpy_dtod(&src_scale, &mut dst_scale)
+            .map_err(|e| anyhow!("DSv4 spec-ring FP8 scale restore failed: {e}"))?;
         Ok(())
     }
 }
@@ -5253,7 +5648,16 @@ fn compressor_forward(
             }
         }
     }
-    state.compressed.seq_len = compressed_rows;
+    // Frozen-KV (P1-1): a frozen verify SKIPS the compressor/indexer CUDA update
+    // above, so it must NOT advance `compressed.seq_len` either — otherwise CSA /
+    // FlashMLA in the same verify would attend to a compressed/indexer row whose
+    // data was never produced, and `csa_select` would advance DSA `packed_rows`
+    // off `indexer_rows_after`. Freezing the length keeps `indexer_rows_after ==
+    // indexer_rows_before` so the whole compressed+sparse path stays frozen; the
+    // accepted-prefix commit re-forward (non-frozen) advances it for real.
+    if !dsv4_verify_frozen() {
+        state.compressed.seq_len = compressed_rows;
+    }
     Ok(())
 }
 

@@ -248,10 +248,27 @@ pub(crate) struct Dsv4SlotImage {
     layers: Vec<crate::attention::Dsv4LayerImage>,
 }
 
+/// Max MTP draft depth (K) the per-slot frozen-KV spec-ring snapshot is sized
+/// for; valid verify-slot count is K+1. The model does NOT retain the requested
+/// `--mtp-draft-tokens` count (only the `spec_decode_on` bool), and under
+/// `ARLE_DSV4_MTP_UNCLAMP=1` the runtime depth follows the requested value, so
+/// the snapshot is sized to a fixed safe ceiling rather than the request. The
+/// executor verify path asserts `depth <= max_depth` (via
+/// `capture_spec_rings`), turning an over-large request into a clean error
+/// instead of silent ring corruption. 8 covers every shipped MTP head config
+/// (the 1-layer nextn checkpoint runs depth-1 by default; deeper EAGLE-tree
+/// drafts are the future axis this ceiling anticipates).
+const MAX_SPEC_DRAFT_DEPTH: usize = 8;
+
 pub(crate) struct Dsv4SlotState {
     attention: Vec<crate::attention::Dsv4LayerAttentionState>,
     moe_decode_scratch: Vec<crate::moe::Dsv4MoeDecodeScratch>,
     shared_decode_out: Vec<HiddenStates>,
+    /// Per-attention-layer K+1-slot snapshot of the speculative-verify SW + FP8
+    /// ring writes (frozen-KV MTP P1-2). `Some` only when `model.spec_decode_on`;
+    /// pre-allocated ONCE here (no per-step alloc). One entry per attention layer,
+    /// index-aligned with `attention`.
+    spec_rings: Option<Vec<crate::attention::Dsv4SpecRingSnapshot>>,
     start_pos_device: CudaSlice<i32>,
     decode_graph: Option<Dsv4DecodeGraphScratch>,
     /// Pre-allocated NVSHMEM low-latency MoE scratch, reused across all layers +
@@ -546,6 +563,25 @@ impl Dsv4SlotState {
             shared_decode_out
                 .push(unsafe { HiddenStates::uninit(&model.ctx, model.config.hidden_size, 1)? });
         }
+        // Pre-allocate the per-layer frozen-KV spec-ring snapshot ONCE when spec
+        // decode is on (mirror `spec_rollback`, git 476da9d7). Each layer's
+        // snapshot is sized for K+1 = MAX_SPEC_DRAFT_DEPTH+1 verify slots from
+        // that layer's shapes (SW head_dim BF16 + optional FP8 bytes_per_token).
+        // No per-step alloc — the executor only captures/restores into these.
+        let spec_rings = if model.spec_decode_on {
+            let mut rings = Vec::with_capacity(attention.len());
+            for state in &attention {
+                rings.push(state.alloc_spec_ring_snapshot(
+                    &model.ctx,
+                    &model.config,
+                    &model.kv_arena,
+                    MAX_SPEC_DRAFT_DEPTH,
+                )?);
+            }
+            Some(rings)
+        } else {
+            None
+        };
         let start_pos_device = model
             .ctx
             .stream
@@ -570,6 +606,7 @@ impl Dsv4SlotState {
             attention,
             moe_decode_scratch,
             shared_decode_out,
+            spec_rings,
             start_pos_device,
             decode_graph: None,
             #[cfg(feature = "deepep")]
@@ -577,6 +614,62 @@ impl Dsv4SlotState {
             seq_len: 0,
             max_seq_len,
         })
+    }
+
+    /// Snapshot the K+1 speculative-verify ring slots across all attention layers
+    /// BEFORE the frozen depth-K verify forward. No-op when spec decode is off
+    /// (`spec_rings` is `None`), so the executor can call unconditionally. Mirrors
+    /// the deleted `capture_spec_rollback` (git 476da9d7): `&mut self` so the
+    /// per-layer snapshot dst (`&mut`) and the attention state src (`&`) split
+    /// cleanly across the `attention` / `spec_rings` fields.
+    pub(crate) fn capture_spec_rings(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        start_pos: usize,
+        depth: usize,
+    ) -> Result<()> {
+        let Some(rings) = self.spec_rings.as_mut() else {
+            return Ok(());
+        };
+        ensure!(
+            self.attention.len() == rings.len(),
+            "DSv4 spec-ring layer count {} != attention states {}",
+            rings.len(),
+            self.attention.len()
+        );
+        for (layer_idx, (state, snap)) in self.attention.iter().zip(rings).enumerate() {
+            let pool = kv_adapter.layer_mut(layer_idx)?;
+            state.capture_spec_rings(ctx, pool, snap, start_pos, depth)?;
+        }
+        Ok(())
+    }
+
+    /// Restore the REJECTED ring tail across all attention layers AFTER the commit
+    /// truncate and BEFORE the accepted-prefix re-forward. No-op when spec decode
+    /// is off.
+    pub(crate) fn restore_spec_ring_tail(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        start_pos: usize,
+        accepted_n: usize,
+        depth: usize,
+    ) -> Result<()> {
+        let Some(rings) = self.spec_rings.as_ref() else {
+            return Ok(());
+        };
+        ensure!(
+            self.attention.len() == rings.len(),
+            "DSv4 spec-ring restore layer count {} != attention states {}",
+            rings.len(),
+            self.attention.len()
+        );
+        for (layer_idx, (state, snap)) in self.attention.iter_mut().zip(rings).enumerate() {
+            let pool = kv_adapter.layer_mut(layer_idx)?;
+            state.restore_spec_ring_tail(ctx, pool, snap, start_pos, accepted_n, depth)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn seq_len(&self) -> usize {
@@ -1038,6 +1131,33 @@ impl Dsv4Model {
 
     pub(crate) fn truncate_slot(&self, slot: &mut Dsv4SlotState, new_len: usize) -> Result<()> {
         slot.truncate(&self.layers, new_len)
+    }
+
+    /// Frozen-KV MTP P1-2 passthrough: snapshot the K+1 speculative-verify ring
+    /// slots BEFORE the frozen depth-K verify forward. No-op when spec decode is
+    /// off, so the executor calls it unconditionally on the spec verify path.
+    pub(crate) fn capture_spec_rings(
+        &self,
+        slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        start_pos: usize,
+        depth: usize,
+    ) -> Result<()> {
+        slot.capture_spec_rings(&self.ctx, kv_adapter, start_pos, depth)
+    }
+
+    /// Frozen-KV MTP P1-2 passthrough: restore the REJECTED ring tail AFTER the
+    /// commit truncate and BEFORE the accepted-prefix re-forward. No-op when spec
+    /// decode is off.
+    pub(crate) fn restore_spec_ring_tail(
+        &self,
+        slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        start_pos: usize,
+        accepted_n: usize,
+        depth: usize,
+    ) -> Result<()> {
+        slot.restore_spec_ring_tail(&self.ctx, kv_adapter, start_pos, accepted_n, depth)
     }
 
     pub(crate) fn dump_mtp_rollback_state(
