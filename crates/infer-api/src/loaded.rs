@@ -51,6 +51,20 @@ pub struct EngineLoadConfig {
     /// the tier. Backends without a tier store ignore it.
     #[serde(default)]
     pub kv_t1_budget_bytes: Option<usize>,
+    /// Whole-process memory budget for unified-memory backends. Metal maps this
+    /// to MLX memory/cache/wired limits before loading weights and clamps KV
+    /// capacity to fit. `None` lets the backend derive a budget from physical
+    /// and currently available memory.
+    #[serde(default)]
+    pub memory_budget_bytes: Option<usize>,
+    /// Physical memory to leave for macOS and foreground apps on unified-memory
+    /// backends. `None` uses the backend's anti-swap default.
+    #[serde(default)]
+    pub system_reserve_bytes: Option<usize>,
+    /// Allow startup when macOS swap is already materially active. Default is
+    /// fail-closed because swap uses SSD and can stall the whole system.
+    #[serde(default)]
+    pub allow_swap: bool,
     /// Low-impact local serving mode: keep work chunks cooperative for desktop
     /// responsiveness. Backend builders may install a resource governor when
     /// this is set; server-style defaults leave it off.
@@ -71,6 +85,9 @@ impl Default for EngineLoadConfig {
             mtp_draft_tokens: None,
             kv_cache_dtype: KvCacheDtype::Auto,
             kv_t1_budget_bytes: None,
+            memory_budget_bytes: None,
+            system_reserve_bytes: None,
+            allow_swap: false,
             low_impact: false,
         }
     }
@@ -579,14 +596,47 @@ mod backend {
         let model_id = crate::serve_engine::model_id_from_path(model_path);
 
         let model_source = resolved.to_string_lossy().to_string();
-        let scheduler = config.scheduler_config();
+        let mut scheduler = config.scheduler_config();
         let num_slots = config.num_slots;
-        let total_pages = config.total_pages;
         let page_size = config.page_size;
         let low_impact = config.low_impact;
+        let resource_plan = infer_metal::plan_resource_budget(
+            &resolved,
+            infer_metal::MetalResourceRequest {
+                kv_cache_dtype: metal_kv_dtype,
+                num_slots,
+                total_pages: config.total_pages,
+                page_size,
+                low_impact,
+                memory_budget_bytes: config.memory_budget_bytes,
+                system_reserve_bytes: config.system_reserve_bytes,
+                allow_swap: config.allow_swap,
+            },
+        )?;
+        let total_pages = resource_plan.planned_total_pages;
+        let planned_capacity_tokens = resource_plan.capacity_tokens;
+        if planned_capacity_tokens < scheduler.max_total_tokens {
+            log::warn!(
+                "Metal resource guard clamps max_total_tokens {} -> {}",
+                scheduler.max_total_tokens,
+                planned_capacity_tokens
+            );
+            scheduler.max_total_tokens = planned_capacity_tokens.max(1);
+        }
+        if scheduler.max_prompt_tokens > scheduler.max_total_tokens {
+            log::warn!(
+                "Metal resource guard clamps max_prompt_tokens {} -> {}",
+                scheduler.max_prompt_tokens,
+                scheduler.max_total_tokens
+            );
+            scheduler.max_prompt_tokens = scheduler.max_total_tokens;
+        }
         let serve = ServeHandle::spawn_with_engine_builder(move || {
-            let executor =
-                MetalExecutor::from_model_path_with_kv_cache_dtype(&model_source, metal_kv_dtype)?;
+            let executor = MetalExecutor::from_model_path_with_kv_cache_dtype_and_resource_plan(
+                &model_source,
+                metal_kv_dtype,
+                resource_plan,
+            )?;
             let kv = MetalKvPool::new(num_slots, total_pages, page_size);
             if low_impact {
                 let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {

@@ -370,6 +370,13 @@ fn resolve_engine_config(
     if serve_args.kv_t1_budget_bytes.is_some() {
         config.kv_t1_budget_bytes = serve_args.kv_t1_budget_bytes;
     }
+    if serve_args.memory_budget_bytes.is_some() {
+        config.memory_budget_bytes = serve_args.memory_budget_bytes;
+    }
+    if serve_args.system_reserve_bytes.is_some() {
+        config.system_reserve_bytes = serve_args.system_reserve_bytes;
+    }
+    config.allow_swap = serve_args.allow_swap;
 
     if config.max_prompt_tokens > config.max_total_tokens {
         return Err(format!(
@@ -621,6 +628,36 @@ mod tests {
         ]);
         let err = resolve_config(&args, &serve).expect_err("non-metal int8 rejected");
         assert!(err.contains("--kv-cache-dtype int8"), "got: {err}");
+    }
+
+    #[test]
+    fn memory_budget_flags_flow_to_engine_config() {
+        if skip_if_no_backend() {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--memory-budget-bytes",
+            "25769803776",
+            "--system-reserve-bytes",
+            "17179869184",
+            "--allow-swap",
+        ]);
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert_eq!(
+            config.options.engine_config.memory_budget_bytes,
+            Some(25_769_803_776)
+        );
+        assert_eq!(
+            config.options.engine_config.system_reserve_bytes,
+            Some(17_179_869_184)
+        );
+        assert!(config.options.engine_config.allow_swap);
     }
 
     #[test]

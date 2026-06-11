@@ -16,6 +16,10 @@ pub(crate) fn auto_wired_limit_bytes(model_dir: &Path) -> Option<usize> {
     Some(limit)
 }
 
+pub(crate) fn model_weight_bytes(model_dir: &Path) -> Option<usize> {
+    model_weight_size_for_path(model_dir).and_then(|estimate| usize::try_from(estimate.bytes).ok())
+}
+
 #[derive(Debug, Clone)]
 struct ModelWeightSize {
     bytes: u64,
