@@ -1,0 +1,18 @@
+[package]
+name = "vulkan-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ash = { version = "0.38.0", default-features = false, features = ["loaded"], optional = true }
+
+[features]
+default = []
+# Dynamically load Vulkan through ash. Off by default so the workspace
+# typechecks on machines without a Vulkan SDK or loader installed.
+vulkan = ["dep:ash"]
+
+[lints]
+workspace = true
