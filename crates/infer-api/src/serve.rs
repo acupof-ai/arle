@@ -112,25 +112,31 @@ impl ServeSpecOptions {
 pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
     use anyhow::Context;
 
-    if opts.spec.requested() {
+    // Lower the requested spec surface into the engine config. The blanket
+    // fail-close is now narrowed: an external draft model and `auto` are still
+    // unimplemented and error, but `--spec-type mtp` drives the CUDA DSv4
+    // checkpoint-native MTP head via `mtp_draft_tokens`. The per-backend
+    // fail-close (MTP is CUDA-only) lives in `router_for_backend`'s `load_*`.
+    let mut engine_config = opts.engine_config;
+    if opts.spec.mtp_draft_model.is_some() {
         anyhow::bail!(
-            "speculative decode is not wired into the rewrite serve path yet: \
-             requested spec_type={}, mtp_draft_model={}, mtp_draft_tokens={}; \
-             refusing to silently run standard decode",
-            opts.spec.spec_type.label(),
-            opts.spec.mtp_draft_model.as_deref().unwrap_or("none"),
-            opts.spec
-                .mtp_draft_tokens
-                .map_or_else(|| "none".to_string(), |value| value.to_string())
+            "--mtp-draft-model (external draft model) is not supported on this serve path; \
+             CUDA DSv4 uses the checkpoint-native MTP head"
         );
     }
+    match opts.spec.spec_type {
+        ServeSpecType::None => {}
+        ServeSpecType::Auto => {
+            anyhow::bail!("--spec-type auto is not implemented; use mtp");
+        }
+        ServeSpecType::Mtp => {
+            engine_config.mtp_draft_tokens = Some(opts.spec.mtp_draft_tokens.unwrap_or(1));
+        }
+    }
 
-    let router = crate::loaded::router_for_backend(
-        &opts.model_path,
-        opts.enable_cuda_graph,
-        opts.engine_config,
-    )
-    .with_context(|| format!("failed to build serve router for {}", opts.model_path))?;
+    let router =
+        crate::loaded::router_for_backend(&opts.model_path, opts.enable_cuda_graph, engine_config)
+            .with_context(|| format!("failed to build serve router for {}", opts.model_path))?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
