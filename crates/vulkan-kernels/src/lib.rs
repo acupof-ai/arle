@@ -167,11 +167,11 @@ impl Kernel {
             Kernel::MmvqIq2Xxs => SPEC_MMVQ_IQ2_XXS,
             Kernel::MmvqQ2K => SPEC_MMVQ_Q2_K,
             Kernel::GemvQ4K | Kernel::GemvQ5K | Kernel::GemvQ6K => SPEC_GEMV_K_Q8_1,
+            Kernel::QuantizeQ8_1 => SPEC_WORKGROUP_32,
             Kernel::RmsNorm => SPEC_RMS_NORM_MUL,
             Kernel::SoftMax | Kernel::ArgMax => SPEC_WORKGROUP_32,
             Kernel::FlashAttn => SPEC_FLASH_ATTN_WORKGROUP,
-            Kernel::QuantizeQ8_1
-            | Kernel::RopeNeox
+            Kernel::RopeNeox
             | Kernel::RopeNorm
             | Kernel::Silu
             | Kernel::Gelu
@@ -726,6 +726,7 @@ mod tests {
         );
         assert_eq!(Kernel::SoftMax.specialization_u32(), &[(0, 32)]);
         assert_eq!(Kernel::ArgMax.specialization_u32(), &[(0, 32)]);
+        assert_eq!(Kernel::QuantizeQ8_1.specialization_u32(), &[(0, 32)]);
         assert_eq!(Kernel::FlashAttn.specialization_u32(), &[(0, 128)]);
         assert_eq!(Kernel::RmsNorm.specialization_u32(), &[(1, 1)]);
     }
