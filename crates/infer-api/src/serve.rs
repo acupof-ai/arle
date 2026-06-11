@@ -160,11 +160,13 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
         }
     }
 
+    let shutdown = infer_server::ServeShutdown::new();
     let router = crate::loaded::router_for_backend(
         &opts.model_path,
         opts.enable_cuda_graph,
         engine_config,
         &opts.kv_ssd,
+        shutdown.clone(),
     )
     .with_context(|| format!("failed to build serve router for {}", opts.model_path))?;
 
@@ -182,7 +184,7 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
             .context("failed to read listener local address")?;
         log::info!("serving OpenAI v1 on http://{} ({})", addr, opts.model_path);
         axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown_signal(shutdown))
             .await
             .context("serve loop error")
     })
@@ -292,8 +294,9 @@ mod tests {
     feature = "vulkan",
     feature = "cpu"
 ))]
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown: infer_server::ServeShutdown) {
     if tokio::signal::ctrl_c().await.is_ok() {
+        shutdown.request();
         log::info!("shutdown signal received");
     }
 }
