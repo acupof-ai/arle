@@ -194,6 +194,8 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         ));
     }
 
+    let engine_config = resolve_engine_config(serve_args)?;
+
     let options = ServeHttpOptions {
         model_path,
         bind: serve_args.bind.clone(),
@@ -201,7 +203,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         // `--no-cuda-graph` flips the CUDA decode-graph default off; honored by
         // the CUDA backend only (Metal/CPU ignore it).
         enable_cuda_graph: !args.no_cuda_graph,
-        engine_config: EngineLoadConfig::default(),
+        engine_config,
     };
 
     Ok(ServeConfig {
@@ -267,6 +269,57 @@ fn model_from_env() -> Option<String> {
         .or_else(|| env::var("AGENT_INFER_MODEL").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn resolve_engine_config(serve_args: &ServeArgs) -> Result<EngineLoadConfig, String> {
+    let mut config = EngineLoadConfig::default();
+
+    if serve_args.low_impact {
+        config.num_slots = 1;
+        config.total_pages = config.total_pages.min(1024);
+        config.max_prompt_tokens = config.max_prompt_tokens.min(8192);
+        config.max_total_tokens = config.max_total_tokens.min(8192);
+        config.chunked_prefill_size = config.chunked_prefill_size.min(32);
+    }
+
+    if let Some(value) = serve_args.num_slots {
+        config.num_slots = value;
+    }
+    if let Some(value) = serve_args.total_pages {
+        config.total_pages = value;
+    }
+    if let Some(value) = serve_args.page_size {
+        config.page_size = value;
+    }
+    if let Some(value) = serve_args.max_prompt_tokens {
+        config.max_prompt_tokens = value;
+    }
+    if let Some(value) = serve_args.max_total_tokens {
+        config.max_total_tokens = value;
+    }
+    if let Some(value) = serve_args.chunked_prefill_size {
+        config.chunked_prefill_size = value;
+    }
+
+    if config.max_prompt_tokens > config.max_total_tokens {
+        return Err(format!(
+            "--max-prompt-tokens ({}) must be <= --max-total-tokens ({})",
+            config.max_prompt_tokens, config.max_total_tokens
+        ));
+    }
+
+    let capacity_tokens = config
+        .total_pages
+        .checked_mul(config.page_size)
+        .ok_or_else(|| "--total-pages * --page-size overflows usize".to_string())?;
+    if capacity_tokens < config.max_total_tokens {
+        return Err(format!(
+            "KV capacity is too small for one max-length request: total_pages({}) * page_size({}) = {} tokens, max_total_tokens={}",
+            config.total_pages, config.page_size, capacity_tokens, config.max_total_tokens
+        ));
+    }
+
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -398,6 +451,79 @@ mod tests {
         let config = resolve_config(&args, &serve).expect("resolve");
         assert_eq!(config.options.port, 8123);
         assert_eq!(config.options.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn low_impact_sets_conservative_engine_budget() {
+        if skip_if_no_backend() {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--low-impact",
+        ]);
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert_eq!(config.options.engine_config.num_slots, 1);
+        assert_eq!(config.options.engine_config.total_pages, 1024);
+        assert_eq!(config.options.engine_config.max_prompt_tokens, 8192);
+        assert_eq!(config.options.engine_config.max_total_tokens, 8192);
+        assert_eq!(config.options.engine_config.chunked_prefill_size, 32);
+    }
+
+    #[test]
+    fn explicit_engine_budget_overrides_low_impact() {
+        if skip_if_no_backend() {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--low-impact",
+            "--num-slots",
+            "2",
+            "--total-pages",
+            "2048",
+            "--max-total-tokens",
+            "16384",
+        ]);
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert_eq!(config.options.engine_config.num_slots, 2);
+        assert_eq!(config.options.engine_config.total_pages, 2048);
+        assert_eq!(config.options.engine_config.max_total_tokens, 16_384);
+    }
+
+    #[test]
+    fn engine_budget_rejects_capacity_below_max_total() {
+        if skip_if_no_backend() {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--total-pages",
+            "1",
+            "--page-size",
+            "16",
+            "--max-prompt-tokens",
+            "16",
+            "--max-total-tokens",
+            "32",
+        ]);
+        let err = resolve_config(&args, &serve).expect_err("capacity rejected");
+        assert!(err.contains("KV capacity is too small"), "got: {err}");
     }
 
     #[test]

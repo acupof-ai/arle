@@ -29,7 +29,7 @@ pub struct EngineLoadConfig {
 
 impl Default for EngineLoadConfig {
     fn default() -> Self {
-        // Matches `metal_openai_router_from_model_path` defaults.
+        // Conservative local-serving defaults shared by every backend builder.
         Self {
             num_slots: 4,
             total_pages: 8192,
@@ -143,9 +143,12 @@ mod backend {
     use infer_metal::{MetalExecutor, MetalKvPool};
     #[cfg(feature = "vulkan")]
     use infer_vulkan::{VulkanExecutor, VulkanKvPool};
-    // The CPU path reuses infer-metal's feature-free placeholder executor + pool.
+    // The CPU path reuses infer-metal's feature-free placeholder executor over
+    // the backend-neutral host paged KV pool.
     #[cfg(all(feature = "cpu", not(feature = "metal")))]
-    use infer_metal::{MetalExecutor, MetalKvPool};
+    use infer_metal::MetalExecutor;
+    #[cfg(all(feature = "cpu", not(feature = "metal")))]
+    use infer_seam::HostPagedKvPool;
 
     impl EngineLoadConfig {
         pub(super) fn scheduler_config(&self) -> SchedulerConfig {
@@ -174,10 +177,10 @@ mod backend {
         /// everywhere; numeric device forward is pending AIPC on-box bring-up.
         #[cfg(feature = "vulkan")]
         Vulkan(ServeInferenceEngine<VulkanExecutor, VulkanKvPool>),
-        /// Portable CPU backend: the placeholder `MetalExecutor` over the real
-        /// host `MetalKvPool` (no MLX, no CUDA). Smoke / CI.
+        /// Portable CPU backend: the placeholder `MetalExecutor` over the
+        /// backend-neutral host paged KV pool (no MLX, no CUDA). Smoke / CI.
         #[cfg(all(feature = "cpu", not(feature = "metal")))]
-        Cpu(ServeInferenceEngine<MetalExecutor, MetalKvPool>),
+        Cpu(ServeInferenceEngine<MetalExecutor, HostPagedKvPool>),
     }
 
     impl LoadedInferenceEngine {
@@ -370,22 +373,7 @@ mod backend {
 
         #[cfg(feature = "metal")]
         fn load_metal(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
-            use infer_server::OpenAiTokenizer;
-
-            let resolved = infer_metal::resolve_model_path(model_path)?;
-            let tokenizer = OpenAiTokenizer::from_model_dir(&resolved)?;
-            let model_id = crate::serve_engine::model_id_from_path(model_path);
-
-            let model_source = resolved.to_string_lossy().to_string();
-            let scheduler = config.scheduler_config();
-            let num_slots = config.num_slots;
-            let total_pages = config.total_pages;
-            let page_size = config.page_size;
-            let serve = ServeHandle::spawn_with_engine_builder(move || {
-                let executor = MetalExecutor::from_model_path(&model_source)?;
-                let kv = MetalKvPool::new(num_slots, total_pages, page_size);
-                Ok(infer_core::Engine::with_config(executor, kv, scheduler))
-            })?;
+            let (serve, tokenizer, model_id) = metal_serve_handle(model_path, config)?;
             Ok(Self::Metal(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
             )))
@@ -447,7 +435,7 @@ mod backend {
             let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
             let model_id = crate::serve_engine::model_id_from_path(model_path);
             let executor = MetalExecutor::new();
-            let kv = MetalKvPool::new(config.num_slots, config.total_pages, config.page_size);
+            let kv = HostPagedKvPool::new(config.num_slots, config.total_pages, config.page_size);
             let serve = ServeHandle::spawn(executor, kv, config.scheduler_config());
             Ok(Self::Cpu(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
@@ -461,9 +449,7 @@ mod backend {
     /// [`axum::Router`] the in-process [`crate::serve_http`] loop binds, rather
     /// than the [`InferenceEngine`] adapter the agent/OPD callers use. Each arm
     /// spawns the same [`ServeHandle`] the matching `load_*` method spawns, then
-    /// hands it to [`infer_server::openai_router`] (the Metal arm reuses the
-    /// existing [`infer_server::metal_openai_router_from_model_path`] facade, which
-    /// also resolves the tokenizer via the HF cache).
+    /// hands it to the backend-neutral [`infer_server::openai_router`].
     // Each arm is a feature-gated `return` (the tail arm varies by feature set),
     // so a bare expression would not compile in single-backend builds.
     #[allow(clippy::needless_return)]
@@ -474,8 +460,8 @@ mod backend {
     ) -> Result<axum::Router> {
         #[cfg(feature = "metal")]
         {
-            let _ = (enable_cuda_graph, &config);
-            return infer_server::metal_openai_router_from_model_path(model_path);
+            let _ = enable_cuda_graph;
+            return router_metal(model_path, &config);
         }
 
         #[cfg(all(not(feature = "metal"), feature = "cuda"))]
@@ -511,6 +497,46 @@ mod backend {
             let _ = enable_cuda_graph;
             return router_cpu(model_path, &config);
         }
+    }
+
+    /// Shared Metal engine builder for [`LoadedInferenceEngine::load_metal`] and
+    /// [`router_metal`]. The service layer stays backend-neutral: Metal-specific
+    /// model resolution, executor construction, and KV-pool sizing happen here.
+    #[cfg(feature = "metal")]
+    fn metal_serve_handle(
+        model_path: &str,
+        config: &EngineLoadConfig,
+    ) -> Result<(
+        ServeHandle<MetalExecutor, MetalKvPool>,
+        infer_server::OpenAiTokenizer,
+        String,
+    )> {
+        use infer_server::OpenAiTokenizer;
+
+        let resolved = infer_metal::resolve_model_path(model_path)?;
+        let tokenizer = OpenAiTokenizer::from_model_dir(&resolved)?;
+        let model_id = crate::serve_engine::model_id_from_path(model_path);
+
+        let model_source = resolved.to_string_lossy().to_string();
+        let scheduler = config.scheduler_config();
+        let num_slots = config.num_slots;
+        let total_pages = config.total_pages;
+        let page_size = config.page_size;
+        let serve = ServeHandle::spawn_with_engine_builder(move || {
+            let executor = MetalExecutor::from_model_path(&model_source)?;
+            let kv = MetalKvPool::new(num_slots, total_pages, page_size);
+            Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+        })?;
+        Ok((serve, tokenizer, model_id))
+    }
+
+    /// Metal serve router. Builds the same `ServeHandle` as
+    /// [`LoadedInferenceEngine::load_metal`] and wraps it in the unified OpenAI
+    /// facade.
+    #[cfg(feature = "metal")]
+    fn router_metal(model_path: &str, config: &EngineLoadConfig) -> Result<axum::Router> {
+        let (serve, tokenizer, model_id) = metal_serve_handle(model_path, config)?;
+        Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
     /// Read a CUDA checkpoint's `config.json` and classify it for `load_cuda`.
@@ -939,7 +965,7 @@ mod backend {
     }
 
     /// Portable CPU serve router: the placeholder `MetalExecutor` over the real
-    /// host `MetalKvPool` (no MLX, no CUDA), wrapped in
+    /// backend-neutral host paged KV pool (no MLX, no CUDA), wrapped in
     /// [`infer_server::openai_router`]. Mirrors
     /// [`LoadedInferenceEngine::load_cpu`].
     #[cfg(all(
@@ -955,7 +981,7 @@ mod backend {
         let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
         let model_id = crate::serve_engine::model_id_from_path(model_path);
         let executor = MetalExecutor::new();
-        let kv = MetalKvPool::new(config.num_slots, config.total_pages, config.page_size);
+        let kv = HostPagedKvPool::new(config.num_slots, config.total_pages, config.page_size);
         let serve = ServeHandle::spawn(executor, kv, config.scheduler_config());
         Ok(openai_router(serve, tokenizer, model_id))
     }

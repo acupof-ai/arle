@@ -3,13 +3,11 @@
 //! Proves the `tokenize -> submit -> collect -> detokenize` plumbing in
 //! [`infer_api::ServeInferenceEngine`] without loading a real model. The mock
 //! backend is `infer_server::EchoExecutor` (echoes `last_token + 1`) over the
-//! real host `infer_metal::MetalKvPool` — the same GPU-free mock pair the
-//! `infer-server` crate uses for its own engine smoke tests. No MLX, no CUDA.
+//! real backend-neutral host paged KV pool. No MLX, no CUDA.
 //!
-//! Follow-up (not run here): a real Metal e2e exists at
-//! `infer-server`'s `metal_openai_chat_completions_returns_real_text` (ignored,
-//! loads MLX weights). Wiring the same against `LoadedInferenceEngine::Metal`
-//! would load the 19 GB Qwen3.6 model and is left as a follow-up.
+//! Follow-up (not run here): a real Metal e2e against
+//! `LoadedInferenceEngine::Metal` would load the 19 GB Qwen3.6 model and is
+//! left as a local-heavy follow-up.
 
 use std::path::Path;
 
@@ -18,7 +16,7 @@ use infer_api::{
     CompletionRequest, FinishReason, InferenceEngine, SamplingParams, ServeInferenceEngine,
 };
 use infer_core::SchedulerConfig;
-use infer_metal::MetalKvPool;
+use infer_seam::HostPagedKvPool;
 use infer_server::{EchoExecutor, OpenAiTokenizer, ServeHandle};
 use tokenizers::{
     Tokenizer as HfTokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
@@ -57,7 +55,7 @@ fn write_tiny_tokenizer(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_engine() -> Result<ServeInferenceEngine<EchoExecutor, MetalKvPool>> {
+fn build_engine() -> Result<ServeInferenceEngine<EchoExecutor, HostPagedKvPool>> {
     let dir = tempfile::tempdir()?;
     write_tiny_tokenizer(dir.path())?;
     let tokenizer = OpenAiTokenizer::from_model_dir(dir.path())?;
@@ -70,7 +68,7 @@ fn build_engine() -> Result<ServeInferenceEngine<EchoExecutor, MetalKvPool>> {
     };
     // Feature-free placeholder executor + real host KV pool. EchoExecutor gives
     // a deterministic `+1` token rule so token plumbing is exactly assertable.
-    let kv = MetalKvPool::new(2, 256, 16);
+    let kv = HostPagedKvPool::new(2, 256, 16);
     let serve = ServeHandle::spawn(EchoExecutor, kv, config);
 
     // Keep the tempdir alive for the lifetime of the engine: the tokenizer is

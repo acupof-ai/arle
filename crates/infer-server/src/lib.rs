@@ -56,9 +56,6 @@ pub use schema::{
 };
 pub use tokenizer::OpenAiTokenizer;
 
-#[cfg(feature = "metal")]
-pub use http::metal_openai_router_from_model_path;
-
 /// Handle to a running engine thread.
 ///
 /// Owns the engine thread's `JoinHandle` and the submit channel. Dropping the
@@ -191,7 +188,11 @@ where
         let join = thread::Builder::new()
             .name("infer-engine".to_string())
             .spawn(move || match builder() {
-                Ok(engine) => {
+                Ok(mut engine) => {
+                    if let Err(err) = engine.warmup() {
+                        let _ = ready_tx.send(Err(err.to_string()));
+                        return;
+                    }
                     let _ = ready_tx.send(Ok(()));
                     engine_loop(engine, submit_rx, control_rx, loop_counters);
                 }
@@ -427,11 +428,11 @@ impl BackendExecutor for EchoExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infer_metal::MetalKvPool;
+    use infer_seam::HostPagedKvPool;
 
     /// End-to-end frontend-||-engine smoke test with no GPU/MLX dependency.
     ///
-    /// Spawns the engine thread on an `EchoExecutor` + real `MetalKvPool`,
+    /// Spawns the engine thread on an `EchoExecutor` + real host paged KV pool,
     /// submits two requests, collects both off their private back-channels, and
     /// asserts the generated token counts match each request's `max_tokens`
     /// (the echo executor never emits a stop token, so finish is length-bound).
@@ -444,7 +445,7 @@ mod tests {
             ..SchedulerConfig::default()
         };
         // Real host-side pool: 2 slots, ample pages, page_size 16.
-        let kv = MetalKvPool::new(2, 256, 16);
+        let kv = HostPagedKvPool::new(2, 256, 16);
         let serve = ServeHandle::spawn(EchoExecutor, kv, config);
 
         let first = serve.submit(vec![10, 11, 12], 5, SamplingParams::default())?;
@@ -484,7 +485,7 @@ mod tests {
             max_total_tokens: 8192,
             ..SchedulerConfig::default()
         };
-        let kv = MetalKvPool::new(1, 256, 16);
+        let kv = HostPagedKvPool::new(1, 256, 16);
         let serve = ServeHandle::spawn(EchoExecutor, kv, config);
 
         let (ticket, stream_rx) =
@@ -526,7 +527,7 @@ mod tests {
             max_total_tokens: 8192,
             ..SchedulerConfig::default()
         };
-        let kv = MetalKvPool::new(1, 256, 16);
+        let kv = HostPagedKvPool::new(1, 256, 16);
         let serve = ServeHandle::spawn(EchoExecutor, kv, config);
 
         serve
@@ -568,7 +569,7 @@ mod tests {
             max_total_tokens: 16,
             ..SchedulerConfig::default()
         };
-        let kv = MetalKvPool::new(1, 64, 16);
+        let kv = HostPagedKvPool::new(1, 64, 16);
         let serve = ServeHandle::spawn(EchoExecutor, kv, config);
 
         let ticket = serve.submit(vec![1, 2, 3], 4, SamplingParams::default())?;

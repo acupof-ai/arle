@@ -136,11 +136,11 @@ Key files:
 - `crates/infer-metal/src/executor.rs`: Metal `BackendExecutor` impl
   (shipped, parity-verified)
 
-> `infer-server` depends on `infer-core` + `infer-metal` + `infer-plan` +
-> `infer-seam`; it does **not** depend on `infer-cuda`. The CUDA backend is
-> wired in one layer up at `infer-api` (its `cuda` feature pulls `infer-cuda`).
-> The `cpu` smoke path reuses `infer-metal`'s feature-free host/CPU KV pool, so
-> a CPU build still depends on `infer-metal` (without the `metal` feature).
+> `infer-server` depends on `infer-core` + `infer-plan` + `infer-seam`; it does
+> **not** depend on any backend crate. CUDA/Metal/HIP/Vulkan are wired one layer
+> up at `infer-api`. The `cpu` smoke path still depends on `infer-metal` for the
+> feature-free placeholder executor, but its KV pool is the shared
+> `infer-seam::HostPagedKvPool`.
 
 ### Current OPD train path (post-OPD-pivot, 2026-05-24)
 
@@ -247,15 +247,14 @@ host-only seam with zero device coupling.
 `infer-topo` + `infer-moe` + `qwen35-spec` (and optionally `qwen3-spec` /
 `deepseek-spec` by feature); never `infer-core`.
 
-### 3.5 `infer-metal` — Metal MLX executor (+ feature-free host KV pool)
+### 3.5 `infer-metal` — Metal MLX executor
 
 > Old home: `infer/src/backend/metal/**`.
 
 - `crates/infer-metal/src/executor.rs`: the `BackendExecutor` impl (shipped,
   parity-verified) — the cleanest example of a thin seam impl.
-- `crates/infer-metal/src/kv_pool.rs`: `MetalKvPool` implementing the host-only
-  `KvPool` seam; also serves as the feature-free host/CPU KV pool used by the
-  `cpu` smoke path.
+- `crates/infer-metal/src/kv_pool.rs`: `MetalKvPool` compatibility alias to
+  `infer-seam::HostPagedKvPool`; device-side MLX KV stays in the executor.
 - `crates/infer-metal/src/qwen35.rs`: the stable C++ MLX bridge for the
   Qwen3.5/3.6 forward (split deferred until FFI churn justifies it).
 - `crates/infer-metal/src/{mlx,loader,weights,config,model_source,wired_limit}.rs`:
@@ -353,10 +352,10 @@ infer-api
   -> infer-server
   -> infer-plan, infer-seam
   -> infer-cuda  (feature = "cuda")
-  -> infer-metal (feature = "metal"; also pulled feature-free for cpu KV pool)
+  -> infer-metal (feature = "metal"; also pulled feature-free for cpu executor)
 
 infer-server
-  -> infer-core, infer-metal, infer-plan, infer-seam   (NOT infer-cuda)
+  -> infer-core, infer-plan, infer-seam   (no backend crates)
 
 infer-core
   -> infer-plan, infer-seam   (no backend dependency — device-neutral)
