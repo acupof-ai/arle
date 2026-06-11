@@ -64,6 +64,10 @@ mod real {
         VulkanError::Runtime(format!("{context}: {err:?}"))
     }
 
+    fn vk_bool(value: vk::Bool32) -> bool {
+        value != 0
+    }
+
     fn create_instance(entry: &Entry) -> Result<ash::Instance> {
         let app_name = CString::new("arle-vulkan")
             .map_err(|e| runtime_error("building Vulkan app name", e))?;
@@ -80,6 +84,40 @@ mod real {
             .map_err(|e| vk_error("creating Vulkan instance", e))
     }
 
+    fn has_device_extension(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        name: &CStr,
+    ) -> Result<bool> {
+        let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+            .map_err(|e| vk_error("enumerating Vulkan device extensions", e))?;
+        Ok(extensions.iter().any(|extension| {
+            let extension_name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
+            extension_name == name
+        }))
+    }
+
+    fn supports_required_shader_features(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> bool {
+        let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default();
+        let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut integer_dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut integer_dot)
+            .push_next(&mut vulkan12)
+            .push_next(&mut storage16);
+        unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+
+        vk_bool(features2.features.shader_int16)
+            && vk_bool(storage16.storage_buffer16_bit_access)
+            && vk_bool(vulkan12.storage_buffer8_bit_access)
+            && vk_bool(vulkan12.shader_float16)
+            && vk_bool(vulkan12.shader_int8)
+            && vk_bool(integer_dot.shader_integer_dot_product)
+    }
+
     fn load_entry() -> Result<Entry> {
         unsafe { Entry::load() }.map_err(|e| runtime_error("loading Vulkan loader", e))
     }
@@ -92,6 +130,16 @@ mod real {
         for physical_device in devices {
             let props = unsafe { instance.get_physical_device_properties(physical_device) };
             if props.api_version < REQUIRED_API_VERSION {
+                continue;
+            }
+            if !has_device_extension(
+                instance,
+                physical_device,
+                vk::KHR_SHADER_INTEGER_DOT_PRODUCT_NAME,
+            )? {
+                continue;
+            }
+            if !supports_required_shader_features(instance, physical_device) {
                 continue;
             }
             let families =
@@ -139,7 +187,25 @@ mod real {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family_index)
                 .queue_priorities(&priorities)];
-            let create = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
+            let extensions = [vk::KHR_SHADER_INTEGER_DOT_PRODUCT_NAME.as_ptr()];
+            let base_features = vk::PhysicalDeviceFeatures::default().shader_int16(true);
+            let mut storage16 =
+                vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
+            let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
+                .storage_buffer8_bit_access(true)
+                .shader_float16(true)
+                .shader_int8(true);
+            let mut integer_dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
+                .shader_integer_dot_product(true);
+            let mut features2 = vk::PhysicalDeviceFeatures2::default()
+                .features(base_features)
+                .push_next(&mut integer_dot)
+                .push_next(&mut vulkan12)
+                .push_next(&mut storage16);
+            let create = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queue_info)
+                .enabled_extension_names(&extensions)
+                .push_next(&mut features2);
             let device = match unsafe { instance.create_device(physical_device, &create, None) } {
                 Ok(device) => device,
                 Err(e) => {
