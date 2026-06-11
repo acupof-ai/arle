@@ -1379,30 +1379,46 @@ impl Dsv4CudaExecutor {
         // to depth-1 so an explicit `--mtp-draft-tokens N` can never run the broken path.
         // See errors/2026-06-11-dsv4-mtp-depth-k-draft-quality-wall.md.
         let requested = self.spec_draft_tokens.unwrap_or(1).max(1);
-        if requested > 1 {
+        // Depth-K is clamped to 1 by default (the parked linear-chain bug). For the
+        // linear-chain diagnostic/fix work, ARLE_DSV4_MTP_UNCLAMP=1 honors the requested
+        // depth so the chain can be measured + fixed; default users stay safe at depth-1.
+        let unclamp = std::env::var("ARLE_DSV4_MTP_UNCLAMP").as_deref() == Ok("1");
+        if requested > 1 && !unclamp {
             log::warn!(
                 "[dsv4-mtp] --mtp-draft-tokens={requested} requested but depth-K is parked \
                  (draft-quality wall: 1-layer nextn head loops, accept 1/4 @ K=4); clamping to depth-1"
             );
         }
-        let depth = 1usize;
+        let depth = if unclamp { requested } else { 1usize };
 
         // Draft chain: d_i = mtp_forward(prev_stream, prev_token) at start_pos+i, each
         // chaining from the previous draft's wide MTP stream so d_{i+1} conditions on d_i.
+        // DIAGNOSTIC control ARLE_DSV4_MTP_CHAIN_FRESH=1: feed the trunk (draft-0) hidden
+        // to EVERY draft instead of the chained d_stream — isolates whether the chain's
+        // 2-cycle is the off-distribution 1-layer-MTP-stream feedback vs position/KV.
+        let chain_fresh = std::env::var("ARLE_DSV4_MTP_CHAIN_FRESH").as_deref() == Ok("1");
         let mut drafts: Vec<u32> = Vec::with_capacity(depth);
-        let mut chain_hidden = hidden;
+        let trunk_hidden = hidden;
+        let mut prev_stream: Option<DeviceVec> = None;
         let mut chain_token = pending;
         for i in 0..depth {
+            let h_prev: &DeviceVec = if chain_fresh || prev_stream.is_none() {
+                &trunk_hidden
+            } else {
+                prev_stream
+                    .as_ref()
+                    .expect("prev_stream set for chained draft")
+            };
             let (d, d_stream) = self.model.mtp_forward(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
-                &chain_hidden,
+                h_prev,
                 chain_token,
                 (start_pos + i) as u64,
             )?;
             drafts.push(d);
-            chain_hidden = d_stream;
             chain_token = d;
+            prev_stream = Some(d_stream);
         }
 
         // Verify K+1 tokens: argmax[j] = target argmax AFTER verify_tokens[j], so
