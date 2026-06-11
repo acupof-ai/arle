@@ -32,10 +32,15 @@ pub(crate) fn physical_page(table: &[u32], logical_page: usize) -> Result<u32> {
     })
 }
 
-/// Byte range of the contiguous physical run covered by one slot's block
-/// table (#85 P2 Stage A identity layout).
+/// Byte range of the contiguous physical run covered by one slot's page
+/// table.
 ///
-/// Errors when the table length differs from the slot's expected block count
+/// Semantic honesty (codex review on 9d63682d): this proves CONTIGUITY —
+/// which is what licenses band-base addressing — not identity placement.
+/// The Stage A byte-identical-to-band claim is proven separately at pool
+/// construction (`first page == slot × slot_pages`, ensure!d per slot).
+///
+/// Errors when the table length differs from the slot's expected page count
 /// or the run has a gap: a gapped table is valid paging (Stage B), but it
 /// means a caller still using contiguous band-base addressing (the device-side
 /// pack/index kernels) can no longer do so - fail loudly instead of aliasing
@@ -73,7 +78,7 @@ pub(crate) fn contiguous_page_table_byte_range(
 mod tests {
     use super::{contiguous_page_table_byte_range, physical_page};
 
-    /// Synthetic Stage A config: 3 slots x 5 blocks of 64 x 584 B pages.
+    /// Synthetic Stage A config: 3 slots x 5 pages of 64 x 584 B each.
     const PAGE_BYTES: usize = 64 * 584;
     const SLOT_PAGES: usize = 5;
     const NUM_SLOTS: usize = 3;
@@ -96,10 +101,10 @@ mod tests {
         }
     }
 
-    /// Stage A identity property for per-block translation: the physical page
-    /// is the band-relative block plus the slot's first page.
+    /// Stage A identity property for per-page translation: the physical page
+    /// is the slot-logical page plus the slot's first page.
     #[test]
-    fn identity_physical_block_matches_band_arithmetic() {
+    fn identity_physical_page_matches_band_arithmetic() {
         for slot in 0..NUM_SLOTS {
             let table = identity_table(slot);
             for logical in 0..SLOT_PAGES {
@@ -112,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_block_rejects_out_of_range_logical_block() {
+    fn physical_page_rejects_out_of_range_logical_page() {
         let table = identity_table(1);
         let err = physical_page(&table, SLOT_PAGES).unwrap_err().to_string();
         assert!(err.contains("outside slot page table"), "got: {err}");
