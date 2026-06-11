@@ -6,11 +6,19 @@
 // ggml/src/ggml-cuda/vendors/hip.h @ d2462f8f (MIT, vendored at
 // vendor/llama.cpp/ggml-cuda/vendors/hip.h), scoped down to the exact
 // CUDA-API inventory of the sources this crate compiles:
-//   crates/cuda-kernels/csrc/misc/{dsv4_attention,dsv4_mhc,elementwise_basic}.cu
+//   crates/cuda-kernels/csrc/misc/{dsv4_attention,dsv4_mhc,elementwise_basic,
+//                                  norm,sampling}.cu
 //   crates/cuda-kernels/csrc/attention/decode_prep_paged.cu
-//   crates/cuda-kernels/csrc/gemm/{dsv4_grouped_gemm,moe_grouped_gemm}.cu
+//   crates/cuda-kernels/csrc/gemm/{dsv4_grouped_gemm,moe_grouped_gemm,
+//                                  quantized_gemv}.cu
 //   crates/cuda-kernels/csrc/common.cuh
-//   crates/hip-kernels/csrc/iq2_mmvq.cu
+//   crates/hip-kernels/csrc/{iq2_mmvq,quantized_gemv_mma_stub}.cu
+//
+// Basic-op additions (norm/sampling/quantized_gemv, 2026-06-10) introduce NO
+// new CUDA APIs beyond this inventory: bf16 conversions, __ldg, full-mask
+// __shfl_{down,xor}_sync, cudaError_t/cudaStream_t/cudaGetLastError/
+// cudaSuccess/cudaErrorInvalidValue, and the fp8 e4m3 cast — all mapped or
+// HIP-native below.
 //
 // Inventory items needing NO mapping (provided by HIP as-is, verified
 // against the ROCm HIP headers / llama.cpp HIP build at the pinned commit):
