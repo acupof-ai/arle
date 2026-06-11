@@ -59,6 +59,15 @@ const { left, links, lang } = Astro.props;
   .right a.lang:hover { border-color: var(--ink); color: var(--ink); }
 
   @media (max-width: 760px) {
-    .right { flex-wrap: wrap; white-space: normal; gap: 10px 16px; justify-content: flex-end; }
+    /* flex:none keeps the nav at max-content even with wrap enabled —
+       let it shrink so the links actually wrap on narrow viewports. */
+    .right {
+      flex: 1 1 auto;
+      min-width: 0;
+      flex-wrap: wrap;
+      white-space: normal;
+      gap: 10px 16px;
+      justify-content: flex-end;
+    }
   }
 </style>
