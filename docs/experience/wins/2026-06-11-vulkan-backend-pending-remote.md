@@ -11,6 +11,9 @@ operator set.
 P2 adds `crates/infer-vulkan`, a seam-correct backend skeleton that reuses
 `infer_hip::{gguf,dequant,config}` and pins the dense Qwen3 forward sequence
 against the CUDA implementation.
+P3 adds the DSv4 fallback-forward contract: non-FlashMLA operator order,
+per-layer RoPE theta switch, `enable_prefix_cache=false`, and the exact
+mutated slot-buffer enumeration.
 
 The backend is not reachable from `arle serve` yet. CLI and model wiring are
 scheduled for P7, so there is no production hot path or benchmarkable endpoint
@@ -59,6 +62,11 @@ llama.cpp shader variants warn-and-skip because ARLE has not yet replicated
 llama.cpp's full specialization matrix for compile-time defines and push
 constant layouts. The Rust launchers fail loud with `ShaderMissing` for those
 variants until the AIPC/on-box compile matrix is fixed.
+
+P3 numeric DSv4 execution is blocked independently: CSA/compressor/hybrid
+attention have no vendored standalone Vulkan GLSL equivalent. They need either
+new `.comp` ports from `dsv4_attention.cu` semantics or a measured composition
+from primitives before DSv4 can run on Vulkan.
 
 ## Learnings
 
