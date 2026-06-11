@@ -8,6 +8,7 @@
 use anyhow::{Result, anyhow};
 use infer_seam::{BackendExecutor, KvPool};
 
+use crate::radix::TierBlock;
 use crate::{BlockId, Engine, PrefixMatch, RequestPhase, RequestState};
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
@@ -153,6 +154,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .saturating_add(newly_cached.len() as u64);
             self.kv.retain_pages(&newly_cached);
         }
+        // Publishing over a demoted node revives it with the re-prefilled
+        // page; the superseded tier entries surface on the drain.
+        self.drain_dropped_tier_keys();
     }
 
     pub(crate) fn release_reused_prefix(&mut self, pages: &[BlockId]) {
@@ -167,12 +171,148 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if pages_needed == 0 {
             return 0;
         }
-        let pages = self.radix.evict_lru(pages_needed);
-        let reclaimed = pages.len();
-        if reclaimed > 0 {
-            self.kv.release_pages(&pages);
-            self.executor.release_prefix_pages(&pages);
+        if self.kv_tier_capacity() == 0 {
+            let pages = self.radix.evict_lru(pages_needed);
+            let reclaimed = pages.len();
+            if reclaimed > 0 {
+                self.kv.release_pages(&pages);
+                self.executor.release_prefix_pages(&pages);
+            }
+            self.drain_dropped_tier_keys();
+            return reclaimed;
         }
+
+        // Tier path: demote each LRU page into the backend host store instead
+        // of dropping it; fall back to plain eviction when the store refuses.
+        let mut reclaimed = 0usize;
+        while reclaimed < pages_needed {
+            let Some(page) = self.radix.lru_evictable_page() else {
+                break;
+            };
+            if !self.try_demote_page(page) && !self.radix.evict_page(page) {
+                // Neither demotable nor severable — stop instead of spinning.
+                break;
+            }
+            self.kv.release_pages(&[page]);
+            self.executor.release_prefix_pages(&[page]);
+            reclaimed += 1;
+        }
+        self.drain_dropped_tier_keys();
         reclaimed
+    }
+
+    /// Host-tier capacity in pages; `0` disables every tier path. Tier use is
+    /// gated on the prefix cache because demoted blocks are only reachable
+    /// through radix prefix matches.
+    fn kv_tier_capacity(&self) -> usize {
+        if self.config.enable_prefix_cache {
+            self.executor.kv_tier_capacity_pages()
+        } else {
+            0
+        }
+    }
+
+    /// Copy `page` into the backend host tier and mark its radix node demoted.
+    /// Makes room by severing the coldest demoted block when the tier is full.
+    fn try_demote_page(&mut self, page: BlockId) -> bool {
+        let capacity = self.executor.kv_tier_capacity_pages();
+        if self.radix.demoted_block_count() >= capacity {
+            match self.radix.lru_demoted_key() {
+                Some(coldest) => {
+                    self.radix.drop_demoted(coldest);
+                    // Drain immediately so the store slot is reusable for the
+                    // demote below, not only after the eviction batch.
+                    self.drain_dropped_tier_keys();
+                }
+                None => return false,
+            }
+        }
+        let key = self.next_tier_key;
+        self.next_tier_key = self.next_tier_key.wrapping_add(1);
+        match self.executor.demote_prefix_pages(&[(page, key)]) {
+            Ok(accepted) if accepted >= 1 => {
+                if self.radix.demote_block(page, key) {
+                    self.kv_tier_stats.demoted_pages =
+                        self.kv_tier_stats.demoted_pages.saturating_add(1);
+                    true
+                } else {
+                    // The radix refused (page is not an idle cached leaf);
+                    // the store copy is unreachable — drop it.
+                    self.executor.drop_kv_tier_entries(&[key]);
+                    false
+                }
+            }
+            Ok(_) => false,
+            Err(err) => {
+                log::warn!("KV tier demote failed for page {page}: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// Prefix lookup used at slot attach. With a host tier, demoted blocks in
+    /// the matched prefix are promoted back into freshly allocated pages so
+    /// the existing resident-only attach path applies unchanged; a promote
+    /// failure truncates the match there and the tail re-prefills.
+    pub(crate) fn lookup_prefix_for_attach(&mut self, tokens: &[u32]) -> PrefixMatch {
+        if self.kv_tier_capacity() == 0 {
+            return self.radix.longest_prefix_match(tokens);
+        }
+        let tiered = self.radix.tiered_longest_prefix_match(tokens);
+        let mut block_ids = Vec::with_capacity(tiered.blocks.len());
+        for block in tiered.blocks {
+            let page = match block {
+                TierBlock::Resident(page) => Some(page),
+                TierBlock::Demoted(key) => self.promote_demoted_block(key),
+            };
+            let Some(page) = page else { break };
+            block_ids.push(page);
+        }
+        self.drain_dropped_tier_keys();
+        PrefixMatch {
+            matched_len: block_ids.len() * self.radix.block_size(),
+            block_ids,
+        }
+    }
+
+    /// Promote one demoted block into a fresh device page and restore its
+    /// radix node to residency (cache-owned, like a published page).
+    fn promote_demoted_block(&mut self, key: u64) -> Option<BlockId> {
+        let page = match self.kv.alloc_detached_pages(1) {
+            Ok(mut pages) => pages.pop()?,
+            Err(_) => return None,
+        };
+        match self.executor.promote_prefix_pages(&[(key, page)]) {
+            Ok(()) if self.radix.promote_block(key, page) => {
+                self.kv.retain_pages(&[page]);
+                self.kv_tier_stats.promoted_pages =
+                    self.kv_tier_stats.promoted_pages.saturating_add(1);
+                Some(page)
+            }
+            Ok(()) => {
+                // Unknown key (should not happen for a key the match returned).
+                self.kv.free_detached_pages(&[page]);
+                self.executor.drop_kv_tier_entries(&[key]);
+                None
+            }
+            Err(err) => {
+                log::warn!("KV tier promote failed for key {key}: {err:#}");
+                self.kv.free_detached_pages(&[page]);
+                self.radix.drop_demoted(key);
+                self.kv_tier_stats.promote_failures =
+                    self.kv_tier_stats.promote_failures.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    /// Forward tier keys invalidated by radix mutations (sever, revive,
+    /// promote) to the backend store. Called after every mutation batch so no
+    /// path can leak a store entry.
+    pub(crate) fn drain_dropped_tier_keys(&mut self) {
+        let keys = self.radix.take_dropped_tier_keys();
+        if !keys.is_empty() {
+            self.executor.drop_kv_tier_entries(&keys);
+        }
     }
 }
