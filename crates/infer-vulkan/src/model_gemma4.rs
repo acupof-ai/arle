@@ -188,12 +188,34 @@ pub fn gemma4_attention_spec(
 }
 
 #[cfg(feature = "vulkan")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gemma4KernelLaunch {
+    pub kind: Gemma4LauncherKind,
+    pub kernel: vulkan_kernels::Kernel,
+    pub flash_attention_spec: Option<vulkan_kernels::FlashAttentionSpec>,
+}
+
+#[cfg(feature = "vulkan")]
+pub fn gemma4_forward_launch_sequence(
+    config: &gemma_spec::Gemma4TextConfig,
+) -> Vec<Gemma4KernelLaunch> {
+    gemma4_launcher_sequence(config)
+        .into_iter()
+        .map(|kind| Gemma4KernelLaunch {
+            kind,
+            kernel: gemma4_kernel_for_launcher(kind),
+            flash_attention_spec: gemma4_attention_spec(config, kind),
+        })
+        .collect()
+}
+
+#[cfg(feature = "vulkan")]
 pub fn gemma4_forward_kernel_sequence(
     config: &gemma_spec::Gemma4TextConfig,
 ) -> Vec<vulkan_kernels::Kernel> {
-    gemma4_launcher_sequence(config)
+    gemma4_forward_launch_sequence(config)
         .into_iter()
-        .map(gemma4_kernel_for_launcher)
+        .map(|launch| launch.kernel)
         .collect()
 }
 
@@ -234,7 +256,7 @@ impl VulkanGemma4Model {
         _token: u32,
         _start_pos: usize,
     ) -> anyhow::Result<Vec<f32>> {
-        let _ = gemma4_forward_kernel_sequence(&self.config);
+        let _ = gemma4_forward_launch_sequence(&self.config);
         anyhow::bail!(
             "Vulkan Gemma4 numeric forward requires weight/KV residency binding for the launcher sequence"
         )
@@ -358,5 +380,38 @@ mod tests {
         assert_eq!(global.specialization_u32()[12], (12, 1));
         assert_eq!(global.specialization_u32()[14], (14, 2));
         assert!(gemma4_attention_spec(&cfg, Gemma4LauncherKind::GeGlu).is_none());
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn gemma4_forward_launch_sequence_preserves_attention_specs() {
+        let cfg = config();
+        let launches = gemma4_forward_launch_sequence(&cfg);
+        assert_eq!(launches.len(), gemma4_forward_ops(&cfg).len());
+
+        let sliding = launches
+            .iter()
+            .find(|launch| launch.kind == Gemma4LauncherKind::SlidingWindowAttention)
+            .unwrap();
+        assert_eq!(sliding.kernel, vulkan_kernels::Kernel::FlashAttn);
+        let sliding_spec = sliding.flash_attention_spec.unwrap();
+        assert_eq!(sliding_spec.specialization_u32()[3], (3, 256));
+        assert_eq!(sliding_spec.specialization_u32()[4], (4, 256));
+
+        let global = launches
+            .iter()
+            .find(|launch| launch.kind == Gemma4LauncherKind::GlobalAttention)
+            .unwrap();
+        assert_eq!(global.kernel, vulkan_kernels::Kernel::FlashAttn);
+        let global_spec = global.flash_attention_spec.unwrap();
+        assert_eq!(global_spec.specialization_u32()[3], (3, 512));
+        assert_eq!(global_spec.specialization_u32()[4], (4, 512));
+
+        let geglu = launches
+            .iter()
+            .find(|launch| launch.kind == Gemma4LauncherKind::GeGlu)
+            .unwrap();
+        assert_eq!(geglu.kernel, vulkan_kernels::Kernel::GeGlu);
+        assert!(geglu.flash_attention_spec.is_none());
     }
 }
