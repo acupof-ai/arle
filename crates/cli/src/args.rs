@@ -358,8 +358,8 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub(crate) train_control_url: Option<String>,
 
-    /// Speculative decode route. Currently only `metal` accepts `auto`/`mtp`;
-    /// non-Metal backends should use backend-specific flags after `--`.
+    /// Speculative decode route. Currently only CUDA accepts checkpoint-native
+    /// `mtp`; external draft-model routes are not re-ported in the rewrite.
     #[arg(long, value_enum, default_value_t = ServeSpecTypeArg::None)]
     pub(crate) spec_type: ServeSpecTypeArg,
 
@@ -379,12 +379,13 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub(crate) dsv4_batched_decode: bool,
 
-    /// External split MTP drafter model path or HuggingFace repo for Metal.
-    /// Implies the Metal MTP speculative route.
+    /// External split MTP drafter model path or HuggingFace repo.
+    /// Parsed for compatibility, but rejected by the rewrite serve path until
+    /// external draft-model speculative decode is re-ported.
     #[arg(long, value_name = "PATH_OR_REPO")]
     pub(crate) mtp_draft_model: Option<String>,
 
-    /// Number of MTP draft tokens to propose per verify block on Metal.
+    /// Number of MTP draft tokens to propose per verify block on CUDA.
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,
 
