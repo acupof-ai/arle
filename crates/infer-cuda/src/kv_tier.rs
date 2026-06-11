@@ -8,19 +8,80 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use infer_seam::{HostTierPolicy, split_host_tiers};
 
-/// Default host-RAM budget for the T1 prefix tier. Default-on (ckl
-/// 2026-06-11): evicted prefix pages demote into host RAM and promote back on
-/// the next prefix hit instead of re-prefilling; `--kv-t1-budget-bytes 0`
-/// opts out.
-pub(crate) const DEFAULT_KV_TIER_BUDGET_BYTES: usize = 4 << 30;
+/// Bytes of *available* system RAM (Linux `/proc/meminfo` `MemAvailable`).
+///
+/// `None` off Linux or when the field is unreadable — [`split_host_tiers`]
+/// then falls back to the proven cap, so a probe miss never over-shrinks the
+/// tier (a Mac CUDA-typecheck build, having no `/proc`, lands on the cap).
+fn available_ram_bytes() -> Option<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        // "MemAvailable:   12345678 kB"
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
 
-/// Default T2 disk budget when `--kv-ssd-path` is set without
-/// `--kv-ssd-max-bytes` (the monolith-era 20 GiB LRU budget).
-pub const DEFAULT_KV_SSD_BUDGET_BYTES: usize = 20 << 30;
+/// Bytes free on the filesystem holding `path` (POSIX `statvfs`,
+/// unprivileged-available blocks). `None` on non-unix or probe failure →
+/// [`split_host_tiers`] falls back to the proven cap.
+#[cfg(unix)]
+fn free_disk_bytes(path: &Path) -> Option<usize> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated path; `statvfs` writes into
+    // the zeroed buffer and returns 0 on success (non-zero ⇒ bail to `None`).
+    let stat = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        stat
+    };
+    // f_bavail = blocks available to unprivileged users; f_frsize = fragment size.
+    let bytes = u128::from(stat.f_frsize).saturating_mul(u128::from(stat.f_bavail));
+    usize::try_from(bytes).ok()
+}
+
+#[cfg(not(unix))]
+fn free_disk_bytes(_path: &Path) -> Option<usize> {
+    None
+}
+
+/// Machine-derived T1 (host-RAM) budget for the prefix tier — replaces the
+/// hardcoded 4 GiB constant. Default-on (ckl 2026-06-11): evicted prefix pages
+/// demote into host RAM and promote back on the next prefix hit instead of
+/// re-prefilling (`--kv-t1-budget-bytes 0` opts out). Probes `MemAvailable`;
+/// the neutral [`split_host_tiers`] policy caps it at the proven 4 GiB (so an
+/// ample host is byte-identical to the old default) and scales it down on a
+/// constrained one, with a 1 GiB floor.
+pub(crate) fn default_t1_budget_bytes() -> usize {
+    split_host_tiers(
+        available_ram_bytes(),
+        None,
+        false,
+        HostTierPolicy::default(),
+    )
+    .ram_bytes
+}
+
+/// Machine-derived T2 (SSD spill) budget for the disk tier rooted at `root` —
+/// replaces the hardcoded 20 GiB constant. Applies when `--kv-ssd-path` is set
+/// without `--kv-ssd-max-bytes`. Probes free disk at the spill path; the
+/// neutral [`split_host_tiers`] policy caps it at the proven 20 GiB and scales
+/// it down when free disk is scarce.
+pub fn default_t2_budget_bytes(root: &Path) -> usize {
+    split_host_tiers(None, free_disk_bytes(root), true, HostTierPolicy::default()).ssd_bytes
+}
 
 pub(crate) struct CudaKvTierStore {
     t1_capacity_pages: usize,
@@ -265,6 +326,42 @@ mod tests {
         assert!(store.is_full());
         assert!(!store.insert(3, vec![3; 8]));
 
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    const GIB: usize = 1 << 30;
+
+    #[test]
+    fn t1_default_budget_within_policy_envelope() {
+        // Probe miss (Mac) → 4 GiB cap; Linux MemAvailable → clamp(avail×0.25,
+        // 1 GiB floor, 4 GiB cap). Either way: floored at 1 GiB, capped at 4 GiB.
+        let b = default_t1_budget_bytes();
+        assert!(
+            (GIB..=4 * GIB).contains(&b),
+            "T1 budget {b} outside [1 GiB, 4 GiB]"
+        );
+    }
+
+    #[test]
+    fn t2_default_budget_capped_at_proven_constant() {
+        // statvfs on a real temp dir (or probe-miss fallback) → never exceeds
+        // the proven 20 GiB cap.
+        let root = temp_root("t2_probe");
+        let b = default_t2_budget_bytes(&root);
+        assert!(b <= 20 * GIB, "T2 budget {b} exceeds 20 GiB cap");
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn free_disk_probe_reports_some_on_real_dir() {
+        let root = temp_root("statvfs");
+        assert!(
+            free_disk_bytes(&root).is_some(),
+            "statvfs on an existing dir should report free bytes"
+        );
+        // A nonexistent path fails the syscall → None (caller falls back to cap).
+        assert!(free_disk_bytes(&root.join("does-not-exist/x")).is_none());
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

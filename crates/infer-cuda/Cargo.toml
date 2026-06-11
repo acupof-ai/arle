@@ -21,6 +21,7 @@ infer-plan = { path = "../infer-plan" }
 infer-seam = { path = "../infer-seam" }
 infer-topo = { path = "../infer-topo" }
 kv-native-sys = { path = "../kv-native-sys" }
+libc = "0.2"
 log = "0.4"
 qwen3-spec = { path = "../qwen3-spec", optional = true }
 qwen35-spec = { path = "../qwen35-spec" }

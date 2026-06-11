@@ -1519,6 +1519,7 @@ dependencies = [
  "infer-seam",
  "infer-topo",
  "kv-native-sys",
+ "libc",
  "log",
  "qwen3-spec",
  "qwen35-spec",
