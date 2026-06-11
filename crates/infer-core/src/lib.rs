@@ -151,6 +151,21 @@ pub struct ThroughputStats {
     pub requests_completed: u64,
 }
 
+/// KV host-tier (T1 DRAM) counters maintained by the backend-neutral
+/// scheduler. All zero unless the executor reports a nonzero
+/// [`infer_seam::BackendExecutor::kv_tier_capacity_pages`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvTierStats {
+    /// Prefix pages demoted to the backend host tier instead of dropped.
+    pub demoted_pages: u64,
+    /// Demoted pages promoted back into device pages on a prefix hit.
+    pub promoted_pages: u64,
+    /// Promotions that failed (entry severed, tail re-prefilled instead).
+    pub promote_failures: u64,
+    /// Blocks currently resident in the host tier.
+    pub resident_blocks: usize,
+}
+
 /// Prefix-cache counters maintained by the backend-neutral scheduler.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrefixCacheStats {
@@ -285,6 +300,9 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     /// Prefix-cache accounting exposed to serving telemetry.
     prefix_cache_stats: PrefixCacheStats,
     throughput_stats: ThroughputStats,
+    kv_tier_stats: KvTierStats,
+    /// Next backend tier-store key; monotonically burned (failures included).
+    next_tier_key: u64,
     /// Optional per-token observer invoked as each token is committed to a
     /// request, so a serving layer can stream tokens live. `None` by default —
     /// when unset, token commit behavior is byte-identical to before.
@@ -343,6 +361,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             model_stop_token_ids,
             prefix_cache_stats: PrefixCacheStats::default(),
             throughput_stats: ThroughputStats::default(),
+            kv_tier_stats: KvTierStats::default(),
+            next_tier_key: 0,
             on_token: None,
         }
     }
@@ -591,6 +611,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.throughput_stats
     }
 
+    /// Return KV host-tier counters plus the current tier-resident size.
+    #[must_use]
+    pub fn kv_tier_stats(&self) -> KvTierStats {
+        let mut stats = self.kv_tier_stats;
+        stats.resident_blocks = self.radix.demoted_block_count();
+        stats
+    }
+
     /// Return a completed request by handle.
     #[must_use]
     pub fn completed(&self, handle: RequestHandle) -> Option<&CompletedRequest> {
@@ -823,7 +851,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .pop_front()
                 .expect("waiting.front() was Some above");
             let prefix_match = if self.config.enable_prefix_cache {
-                self.radix.longest_prefix_match(&request.prompt_tokens)
+                // Tier-aware: demoted blocks in the match are promoted back
+                // into fresh pages here, so attach sees a resident-only match.
+                self.lookup_prefix_for_attach(&request.prompt_tokens)
             } else {
                 PrefixMatch::empty()
             };
@@ -1703,6 +1733,83 @@ mod testing {
             false
         }
     }
+
+    /// Tier-store mock: forwards delegate to [`MockExecutor`]; demoted page
+    /// payloads live in a host map with a capacity cap, drops are recorded.
+    #[derive(Debug, Clone)]
+    pub(super) struct TierMockExecutor {
+        inner: MockExecutor,
+        capacity: usize,
+        pub(super) store: BTreeMap<u64, u32>,
+        pub(super) dropped: Vec<u64>,
+        fail_promotes: bool,
+    }
+
+    impl TierMockExecutor {
+        pub(super) fn with_capacity(capacity: usize) -> Self {
+            Self {
+                inner: MockExecutor::ready(),
+                capacity,
+                store: BTreeMap::new(),
+                dropped: Vec::new(),
+                fail_promotes: false,
+            }
+        }
+
+        pub(super) fn failing_promotes(capacity: usize) -> Self {
+            Self {
+                fail_promotes: true,
+                ..Self::with_capacity(capacity)
+            }
+        }
+    }
+
+    impl BackendExecutor for TierMockExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        fn kv_tier_capacity_pages(&self) -> usize {
+            self.capacity
+        }
+
+        fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
+            let mut accepted = 0;
+            for &(page, key) in entries {
+                if self.store.len() >= self.capacity {
+                    break;
+                }
+                self.store.insert(key, page);
+                accepted += 1;
+            }
+            Ok(accepted)
+        }
+
+        fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
+            if self.fail_promotes {
+                bail!("mock promote failure");
+            }
+            for (key, _page) in entries {
+                if !self.store.contains_key(key) {
+                    bail!("promote of unknown tier key {key}");
+                }
+            }
+            Ok(())
+        }
+
+        fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
+            for key in keys {
+                self.store.remove(key);
+                self.dropped.push(*key);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1713,7 +1820,7 @@ mod tests {
     use super::testing::{
         DeviceMirrorExecutor, HoldGovernor, LimitedPrefixExecutor, MockExecutor, MockKvPool,
         SamplingExecutor, SingleRowExecutor, SpecMirrorExecutor, StopTokenExecutor,
-        TokenBudgetGovernor, WarmupCountingExecutor,
+        TierMockExecutor, TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -1903,6 +2010,117 @@ mod tests {
             assert_eq!(params.top_p, sampling.top_p);
             assert_eq!(params.seed, sampling.seed);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn tier_demotes_on_eviction_and_promotes_on_prefix_hit() -> Result<()> {
+        // 4 pages of 4 tokens; each 8-token prompt + 1 generated token needs 3.
+        let mut engine = Engine::with_config(
+            TierMockExecutor::with_capacity(8),
+            MockKvPool::with_capacity(1, 4, 4),
+            test_config(1),
+        );
+
+        let first = engine.submit_request((1..=8).collect(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+        assert_eq!(engine.prefix_cache_stats().published_pages, 2);
+
+        // A disjoint prompt cannot fit without evicting; with a tier store the
+        // evicted block demotes instead of dropping.
+        let second = engine.submit_request((50..=57).collect(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        let tier = engine.kv_tier_stats();
+        assert!(
+            tier.demoted_pages >= 1,
+            "eviction demoted into the store: {tier:?}"
+        );
+        assert!(!engine.executor.store.is_empty());
+
+        // Re-running the first prompt promotes the demoted block back instead
+        // of re-prefilling it.
+        let third = engine.submit_request((1..=8).collect(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(third).expect("third completed"));
+        let tier = engine.kv_tier_stats();
+        assert!(
+            tier.promoted_pages >= 1,
+            "prefix hit promoted from the store: {tier:?}"
+        );
+        assert_eq!(tier.promote_failures, 0);
+        assert!(
+            engine.prefix_cache_stats().hits >= 1,
+            "tiered match counts as a prefix hit"
+        );
+        // Promoted entries were dropped from the store by the key drain.
+        assert!(
+            engine.executor.dropped.len() as u64 >= tier.promoted_pages,
+            "store entries dropped after promote: {:?}",
+            engine.executor.dropped
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tier_promote_failure_truncates_match_and_reprefills() -> Result<()> {
+        let mut engine = Engine::with_config(
+            TierMockExecutor::failing_promotes(8),
+            MockKvPool::with_capacity(1, 4, 4),
+            test_config(1),
+        );
+
+        let first = engine.submit_request((1..=8).collect(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+
+        let second = engine.submit_request((50..=57).collect(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        assert!(engine.kv_tier_stats().demoted_pages >= 1);
+
+        // Promotion fails -> demoted entry is severed, the tail re-prefills,
+        // and the request still completes.
+        let third = engine.submit_request((1..=8).collect(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(third).expect("third completed"));
+        let tier = engine.kv_tier_stats();
+        assert!(tier.promote_failures >= 1, "failure counted: {tier:?}");
+        assert_eq!(tier.promoted_pages, 0);
+        assert!(
+            engine.executor.store.is_empty(),
+            "failed entries dropped from the store"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tier_full_rotates_out_the_coldest_entry() -> Result<()> {
+        let mut engine = Engine::with_config(
+            TierMockExecutor::with_capacity(1),
+            MockKvPool::with_capacity(1, 4, 8),
+            test_config(1),
+        );
+
+        let first = engine.submit_request((1..=8).collect(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+        assert_eq!(engine.prefix_cache_stats().published_pages, 2);
+
+        // Force-demote both published blocks through a capacity-1 store: the
+        // second demotion must rotate the first entry out (LRU), not fail.
+        let reclaimed = engine.evict_prefix_cache_for_pages(2);
+        assert_eq!(reclaimed, 2);
+        let tier = engine.kv_tier_stats();
+        assert_eq!(tier.demoted_pages, 2);
+        assert_eq!(tier.resident_blocks, 1, "capacity-1 store holds one block");
+        assert_eq!(engine.executor.store.len(), 1);
+        assert_eq!(
+            engine.executor.dropped.len(),
+            1,
+            "coldest entry rotated out"
+        );
         Ok(())
     }
 

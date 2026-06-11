@@ -113,6 +113,30 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         "Requests finished after holding a scheduler slot.",
         counters.throughput.requests_completed,
     );
+    push(
+        "kv_tier_resident_blocks",
+        "gauge",
+        "Prefix blocks currently resident in the host KV tier.",
+        counters.kv_tier.resident_blocks as u64,
+    );
+    push(
+        "kv_tier_demoted_pages_total",
+        "counter",
+        "Prefix pages demoted to the host KV tier instead of dropped.",
+        counters.kv_tier.demoted_pages,
+    );
+    push(
+        "kv_tier_promoted_pages_total",
+        "counter",
+        "Demoted pages promoted back to device pages on a prefix hit.",
+        counters.kv_tier.promoted_pages,
+    );
+    push(
+        "kv_tier_promote_failures_total",
+        "counter",
+        "Tier promotions that failed (tail re-prefilled instead).",
+        counters.kv_tier.promote_failures,
+    );
     out
 }
 
@@ -132,11 +156,11 @@ fn escape_label_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use infer_core::{PrefixCacheStats, ThroughputStats};
+    use infer_core::{KvTierStats, PrefixCacheStats, ThroughputStats};
 
     use super::*;
 
-    const METRIC_COUNT: usize = 13;
+    const METRIC_COUNT: usize = 17;
 
     #[test]
     fn renders_help_type_and_labelled_samples() {
@@ -158,6 +182,12 @@ mod tests {
                 generated_tokens: 256,
                 requests_completed: 5,
             },
+            kv_tier: KvTierStats {
+                demoted_pages: 6,
+                promoted_pages: 4,
+                promote_failures: 1,
+                resident_blocks: 2,
+            },
         };
         let body = render_prometheus(&counters, "qwen3-dense");
 
@@ -177,6 +207,12 @@ mod tests {
         assert!(body.contains("arle_prefill_tokens_total{model_name=\"qwen3-dense\"} 1200\n"));
         assert!(body.contains("arle_generated_tokens_total{model_name=\"qwen3-dense\"} 256\n"));
         assert!(body.contains("arle_requests_completed_total{model_name=\"qwen3-dense\"} 5\n"));
+        assert!(body.contains("arle_kv_tier_resident_blocks{model_name=\"qwen3-dense\"} 2\n"));
+        assert!(body.contains("arle_kv_tier_demoted_pages_total{model_name=\"qwen3-dense\"} 6\n"));
+        assert!(body.contains("arle_kv_tier_promoted_pages_total{model_name=\"qwen3-dense\"} 4\n"));
+        assert!(
+            body.contains("arle_kv_tier_promote_failures_total{model_name=\"qwen3-dense\"} 1\n")
+        );
 
         // Every sample line carries the HELP/TYPE pair exactly once.
         assert_eq!(body.matches("# HELP ").count(), METRIC_COUNT);
