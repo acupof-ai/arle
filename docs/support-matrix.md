@@ -31,7 +31,7 @@ a dated `wins/` entry says so. Project framing:
 
 | Backend | New-stack status | What is verified | Open |
 | --- | --- | --- | --- |
-| Metal (`infer-metal`) | **Verified** | Real MLX Qwen3.5/3.6 forward, **bit-identical greedy parity** vs legacy across 4 configs (Qwen3.5-0.8B single-token / full 16-tok / chunked prefill, and canonical Qwen3.6-35B-A3B-4bit MoE). Cross-step decode pipeline recovered the perf regression. The executor reports a one-row capability, so the shared scheduler serializes c≥2 requests instead of submitting unsupported multi-row plans. | Full packed batched-decode parity with CUDA; FP8/4-bit Metal MoE quant swap points. |
+| Metal (`infer-metal`) | **Verified** | Real MLX Qwen3.5/3.6 forward, **bit-identical greedy parity** vs legacy across 4 configs (Qwen3.5-0.8B single-token / full 16-tok / chunked prefill, and canonical Qwen3.6-35B-A3B-4bit MoE). Cross-step decode pipeline recovered the c=1 perf regression. Metal serve is intentionally single-flight on macOS: the executor reports one live request and one plan row, so a second live HTTP request is rejected instead of queued. | Full packed batched-decode parity with CUDA; FP8/4-bit Metal MoE quant swap points. |
 | CUDA (`infer-cuda`) | **Verified (serve: prefill + decode)** | Qwen3 dense **16/16** vs HF gold; DSv4-Flash **TP=8/EP=8** (MLA+CSA/HCA+FP8 DeepGEMM MoE, FlashMLA, DeepEP) serves in-process multi-rank (`63d814a4`); per-layer RoPE theta fix (`fa355315`) → needle exact at 32K; decode ~39 tok/s c=1. | Long-ctx ≥241 trailing-digit residual (#56); 256K admission band-aid (#57); KV-precision-parity gate re-port (#58); batched lane license (#60/#61); spec-decode default (#62). |
 
 **New-stack model coverage:** Qwen3.5 / Qwen3.6 on Metal (verified); Qwen3 dense +
