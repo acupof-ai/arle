@@ -88,8 +88,48 @@ before peers read.
   a fused-comm A/B — else try_fused silently falls back and you bench the
   pair twice.
 
+## FINAL — exhaustive static audit closes correctness; perf premise is the real kill
+
+Rather than burn more pod cycles chasing the e2e race, did a full free static
+audit of the reverted kernel (`git show 2d60fb1d`) against the live unfused
+path. Ruled out, line by line:
+
+- **Striding** — hidden=4096, threads=256, blocks=min(36,16)=16 → exactly 4096
+  threads, one col/thread, no stride iteration; each writes 4 dst lanes.
+  `out[0]` correct ⇒ all cols correct (per-column independent, identical code).
+- **comb/post/residual indexing** — byte-identical to `dsv4_mhc_post_kernel`
+  (`comb[dst*hc_mult+src]`, `residual[src*hidden+col]`, `post[dst]`, out lane
+  `dst*hidden+col`). NOT transposed; dst lanes 1-3 correct too.
+- **Second consumer of `attn_out`** — NONE. At both fused sites
+  (`forward_tokens_stream_impl` ~1897, `forward_decode_batch_stream_impl` ~1440)
+  `attn_out` is consumed only by hc_post, then `stream = attn_stream`; `attn_out`
+  drops out of scope. The "unreduced second consumer" hypothesis is refuted.
+- **Staging / visibility** — the fused entry stages via `memcpy_dtod_async →
+  scratch_ptr` then `multi_gpu_barrier<8,true>`, **identical** to the working
+  one-shot `all_reduce_sum_inplace` (tp.rs:1004) + `cross_device_reduce_1stage`.
+  Same fence mechanism; if it raced, the licensed AR would too.
+- **Premature free** — mhc.post/comb (dsv4.rs:1850-1852), attn_out (1896),
+  stream (1841), attn_stream all keepalive'd. Not freed before the async kernel.
+- **Barrier desync** — `self_counter[block][peer]+=1` with `val%2` ping-pong is
+  self-consistent under lockstep regardless of block-count mismatch vs the moe AR.
+
+The kernel is mathematically **byte-identical** to the licensed AR+hc_post for
+all cols and all lanes. The residual e2e race (printf-on correct, printf-off
+garbage = Heisenbug) is real but **not worth chasing**, because:
+
+**The perf premise is dead.** Fusing [AR + hc_post] removes one launch boundary
+(~5µs) + an 8 KB intermediate round-trip (~5ns) per attn site × 60 layers ≈
+300µs/token ≈ **~1%** at 44 tok/s — below the ±6% drift floor. B=1 decode is
+GPU-bound (`feedback_b1_decode_gpu_bound_overhead_removal_wash`); this is pure
+overhead-removal → wash even when correct. And the real headroom is elsewhere:
+the same-day nsys (`nsys_b1_allreduce`) shows the AR+AG **collectives are 34%**
+of GPU-busy time — fuse/overlap THOSE, not the hc_post boundary. See
+[`2026-06-11-dsv4-rung2-kill-comm-is-the-real-b1-lever.md`].
+
 ## State
 
-Rung 3 = KILLED pending the visibility-fence debug (cheap, bounded). Rung 2
-(multi-block hc_enter segment) is independent and unaffected. Rung-1 stands
-(+9.3% matched, campaign 39.51→~44).
+Rung 3 = **KILLED, terminal.** Kernel proven math-correct by static audit; perf
+premise dead (≤1% overhead-removal on a GPU-bound path). Not reopening the race
+debug — even a fixed Rung 3 is wash. Rung 2 = KILLED before build (same
+comm-is-the-real-lever evidence). Rung-1 stands (+9.3% matched, campaign
+39.51→~44). Ladder exhausted; next lever is TP/EP comm (34%).
