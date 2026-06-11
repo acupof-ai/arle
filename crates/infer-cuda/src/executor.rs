@@ -1402,12 +1402,9 @@ impl Dsv4CudaExecutor {
         let mut prev_stream: Option<DeviceVec> = None;
         let mut chain_token = pending;
         for i in 0..depth {
-            let h_prev: &DeviceVec = if chain_fresh || prev_stream.is_none() {
-                &trunk_hidden
-            } else {
-                prev_stream
-                    .as_ref()
-                    .expect("prev_stream set for chained draft")
+            let h_prev: &DeviceVec = match (chain_fresh, prev_stream.as_ref()) {
+                (false, Some(prev)) => prev,
+                _ => &trunk_hidden,
             };
             let (d, d_stream) = self.model.mtp_forward(
                 &mut self.slots[slot_idx],
