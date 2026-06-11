@@ -28,7 +28,9 @@ mod wired_limit;
 
 #[cfg(feature = "metal")]
 pub use executor::pipeline_fast_path_hits;
-pub use executor::{MetalExecutor, MetalInflight};
+pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
 pub use kv_pool::MetalKvPool;
+#[cfg(feature = "metal")]
+pub use mlx::{AllocatorMemory, allocator_memory, clear_metal_cache};
 #[cfg(feature = "metal")]
 pub use model_source::resolve_model_path;

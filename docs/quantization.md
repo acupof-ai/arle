@@ -22,8 +22,8 @@ with concrete evidence.
 
 | Axis | Format | Status | Enable | Notes |
 |---|---|---|---|---|
-| **KV cache** | BF16 | production | `--kv-cache-dtype bf16` *(default via `auto`)* | Reference. CUDA-paged + Metal. |
-| KV cache | INT8 | production (CUDA) | `--kv-cache-dtype int8` | **KIVI per-channel K** (`[num_kv_heads, head_dim]` static table, /127) + per-(row, head) V (/127). V100 Qwen3.5-4B audit `mean_match=1.0000` bit-identical with BF16 (2026-05-27 wins entry). 1.57× max tokens per GB vs BF16. |
+| **KV cache** | BF16 | production | `--kv-cache-dtype bf16` | Reference fallback. CUDA-paged + Metal. |
+| KV cache | INT8 | production (Metal default + CUDA) | `--kv-cache-dtype int8`; Metal `auto` resolves to int8 | Metal stores full-attention K/V as MLX affine 8-bit packed triples (`uint32 data + bf16 scale/bias`, group 128/64/32 by head_dim). CUDA uses **KIVI per-channel K** (`[num_kv_heads, head_dim]` static table, /127) + per-(row, head) V (/127). |
 | KV cache | FP8 E4M3 | production (CUDA) | `--kv-cache-dtype fp8` | **KIVI per-channel K** (/448) + per-(row, head) V (/448). Same code shape as INT8 modulo quant range. V100 audit `mean_match=1.0000`. |
 | KV cache | TurboQuant TQ2/3/4 | experimental (CUDA) | `--kv-cache-dtype tq{2,3,4}` | FWHT-rotated packed indices + FP16 group norms. Page-size-1 path bypasses the HD128 batched prefill kernel. **Decode requires sm_80+**; sm_70 V100 build returns `CUDA_ERROR_NOT_SUPPORTED`. sm_80 audit pending. |
 | KV cache | INT4 (PoC) | experimental (CUDA) | `KVFormat::INT4` (no CLI flag yet) | KIVI per-channel K (/7) + per-(row, head) V (/7), 4-bit symmetric packed (2 nibbles/byte). ~25% of BF16 bytes. V100 audit `mean_match=0.094`: produces coherent text but greedy trajectory diverges from BF16 at step 1 — the empirical floor of 4-bit symmetric per-channel scaling. TQ4's Hadamard rotation is the structurally right answer for 4-bit; INT4-KIVI is a documented control. See [`docs/experience/wins/2026-05-27-int4-kv-kivi-poc.md`](experience/wins/2026-05-27-int4-kv-kivi-poc.md). |
@@ -37,9 +37,10 @@ with concrete evidence.
 | Weights | DSv4 FP8 E4M3 block-scaled | in progress (CUDA) | DSv4 checkpoints | `Dsv4Fp8BlockScaled` format; CUDA V4 attention/MoE/MTP kernels are the runtime blocker. |
 | Weights | DSv4 FP4 E2M1 block-scaled | in progress (CUDA) | DSv4 checkpoints | `Dsv4Fp4BlockScaled`; same DSv4 dependency chain. |
 
-> **Default policy** (`--kv-cache-dtype auto`): BF16 paged pool. FP8 was
-> historically the auto default but the 2026-05-25 audit reproduced
-> first-token divergence — auto is now correctness-safe BF16.
+> **Default policy** (`--kv-cache-dtype auto`): Metal resolves `auto` to INT8
+> full-attention KV after the 2026-06-11 long-context gate. CUDA keeps its
+> backend-specific default policy; BF16 remains the explicit correctness
+> fallback via `--kv-cache-dtype bf16`.
 
 ---
 
@@ -208,15 +209,35 @@ kernel. Opt-in lossy conversion to MLX-native q4 group64 via
 
 ---
 
+### 1.5 Metal INT8 (MLX affine groups)
+
+- **Storage**: one packed affine triple per full-attention K or V cache:
+  `uint32` packed 8-bit data with last dim `head_dim / 4`, plus BF16
+  `scale` and `bias` arrays with last dim `head_dim / group_size`.
+- **Group size**: largest supported divisor among 128, 64, 32. Qwen3.6
+  (`head_dim=256`) uses group 128.
+- **Write path**: C++ session quantizes only the newly written K/V chunk, then
+  `slice_update`s the packed data/scale/bias cache at `cache_pos`. It does not
+  re-quantize the whole cache every token.
+- **Read path**: the active prefix is dequantized to BF16 before MLX SDPA.
+  This keeps correctness close to the existing BF16 attention path while making
+  the persistent session KV about half-size.
+- **Scope**: full-attention KV only. Qwen3.5/3.6 linear-attention recurrent and
+  convolution state keep their existing FP32/BF16 dtypes.
+- **Evidence**: Qwen3.6 16K serial probe on local Apple Silicon:
+  BF16 after-clear active 24.203 GB vs INT8 23.691 GB, a 512 MB reduction;
+  8K probe reduced 244 MB. See
+  [`experience/wins/2026-06-11-metal-int8-kv-default.md`](experience/wins/2026-06-11-metal-int8-kv-default.md).
+
 ## 3. CLI quick reference
 
 ```bash
-# KV cache (CUDA only — Metal does not ship quantized KV today)
---kv-cache-dtype <auto|bf16|fp8|int8|tq2|tq3|tq4>
-  # auto → bf16 paged pool (correctness-safe default since 2026-05-25)
-  # fp8  → KVCacheDtype::BF16 + KVFormat::FP8E4M3 + KIVI per-channel K
-  # int8 → KVCacheDtype::INT8 + KVFormat::INT8
-  # tq{2,3,4} → KVCacheDtype::BF16 + KVFormat::TurboQuant { key_bits, val_bits }
+# KV cache
+--kv-cache-dtype <auto|bf16|int8>
+  # Metal: auto → int8, bf16 → reference fallback, int8 → explicit default path.
+  # CUDA rewrite: dtype plumbing is backend-owned; unsupported flags fail closed.
+  # Legacy CUDA kernel formats fp8/tq{2,3,4} remain documented above but are not
+  # exposed by the rewrite CLI in this Metal tranche.
 
 # Weight quantization
 # Format is autodetected from safetensors metadata. No CLI flag needed.
@@ -224,10 +245,9 @@ kernel. Opt-in lossy conversion to MLX-native q4 group64 via
 INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1
 ```
 
-Source: the `--kv-cache-dtype` CLI parser. In the rewrite this moves to the
-serving front door under `crates/cli` / `crates/infer-server`; the legacy
-`infer/` `parse_kv_cache_mode` / `kv_mode_candidates` / `Args.kv_cache_dtype`
-plumbing is being re-ported per [`support-matrix.md`](support-matrix.md) §0.
+Source: the `--kv-cache-dtype` CLI parser in `crates/cli`, carried through
+`infer_api::EngineLoadConfig`. Metal resolves the neutral enum below
+`infer-api` and the service/scheduler layers remain backend-neutral.
 
 ---
 

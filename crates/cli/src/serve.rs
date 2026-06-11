@@ -10,12 +10,12 @@
 use std::{env, process::ExitCode};
 
 use infer_api::{
-    EngineLoadConfig, ServeHttpOptions, ServeKvSsdOptions, ServeSpecOptions, ServeSpecType,
-    serve_http,
+    EngineLoadConfig, KvCacheDtype, ServeHttpOptions, ServeKvSsdOptions, ServeSpecOptions,
+    ServeSpecType, serve_http,
 };
 
 use crate::{
-    args::{Args, ServeArgs, ServeBackendArg, ServeSpecTypeArg},
+    args::{Args, ServeArgs, ServeBackendArg, ServeKvCacheDtypeArg, ServeSpecTypeArg},
     hardware::CompiledBackend,
 };
 
@@ -199,7 +199,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         ));
     }
 
-    let mut engine_config = resolve_engine_config(serve_args)?;
+    let mut engine_config = resolve_engine_config(backend, serve_args)?;
     let spec = resolve_spec_options(backend, serve_args);
     let kv_ssd = resolve_kv_ssd_options(serve_args)?;
     // Lower MTP spec into the engine config at the CLI level so BOTH paths carry the
@@ -322,8 +322,26 @@ fn model_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn resolve_engine_config(serve_args: &ServeArgs) -> Result<EngineLoadConfig, String> {
-    let mut config = EngineLoadConfig::default();
+fn resolve_engine_config(
+    backend: ServeBackend,
+    serve_args: &ServeArgs,
+) -> Result<EngineLoadConfig, String> {
+    let kv_cache_dtype = match serve_args.kv_cache_dtype {
+        ServeKvCacheDtypeArg::Auto => KvCacheDtype::Auto,
+        ServeKvCacheDtypeArg::Bf16 => KvCacheDtype::Bf16,
+        ServeKvCacheDtypeArg::Int8 => KvCacheDtype::Int8,
+    };
+    let mut config = EngineLoadConfig {
+        kv_cache_dtype,
+        ..EngineLoadConfig::default()
+    };
+
+    if config.kv_cache_dtype == KvCacheDtype::Int8 && backend != ServeBackend::Metal {
+        return Err(format!(
+            "--kv-cache-dtype int8 is currently implemented for the Metal backend; active backend is {}",
+            backend.label()
+        ));
+    }
 
     if serve_args.low_impact {
         config.low_impact = true;
@@ -559,6 +577,47 @@ mod tests {
         );
         assert_eq!(config.options.kv_ssd.max_bytes, Some(1_073_741_824));
         assert!(config.options.kv_ssd.high_performance_non_preemptive);
+    }
+
+    #[test]
+    fn kv_cache_dtype_int8_flows_to_metal_engine_config() {
+        if skip_if_no_backend() || compiled_backend_flag() != "metal" {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            "metal",
+            "--model-path",
+            "model",
+            "--kv-cache-dtype",
+            "int8",
+        ]);
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert_eq!(
+            config.options.engine_config.kv_cache_dtype,
+            KvCacheDtype::Int8
+        );
+    }
+
+    #[test]
+    fn kv_cache_dtype_int8_rejects_non_metal_backend() {
+        if skip_if_no_backend() || compiled_backend_flag() == "metal" {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--kv-cache-dtype",
+            "int8",
+        ]);
+        let err = resolve_config(&args, &serve).expect_err("non-metal int8 rejected");
+        assert!(err.contains("--kv-cache-dtype int8"), "got: {err}");
     }
 
     #[test]

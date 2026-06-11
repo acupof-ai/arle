@@ -606,6 +606,7 @@ struct Qwen35CompiledModel {
         array attn_mask = array(0);
         bool has_cache_pos_arr = false;
         const int32_t* cache_pos_arr = nullptr;
+        bool kv_cache_int8 = false;
         bool has_rope_offsets = false;
         array rope_offsets = array(0);
         bool keep_intermediates = false;
@@ -665,6 +666,7 @@ struct Qwen35CompiledModel {
     // context and uses it only when the batched verify entrypoint requests it.
     mutable const int32_t* current_cache_pos_arr = nullptr;
     mutable bool current_has_cache_pos_arr = false;
+    mutable bool current_kv_cache_int8 = false;
     // Per-row RoPE offsets (int32 array of length batch_size).
     //
     // Workaround for MLX 0.31.1: `fast::rope(..., int offset)` on a
@@ -680,7 +682,9 @@ struct Qwen35CompiledModel {
     // the next GC cycle, allowing MLX to reuse GPU buffers efficiently.
     std::vector<array> prev_outputs;
     // Session state for FFI-cost-amortized single-request decode.
-    std::vector<array> session_kv_caches;   // [k0, v0, k1, v1, ...]
+    // BF16 session: [k0, v0, k1, v1, ...].
+    // INT8 session: [k_q0, k_s0, k_b0, v_q0, v_s0, v_b0, ...].
+    std::vector<array> session_kv_caches;
     std::vector<array> session_gdr_states;  // [gdr0, conv0, gdr1, conv1, ...]
     bool session_active = false;
     // Collect ALL intermediate arrays during forward() to keep them alive.
@@ -930,6 +934,133 @@ struct Qwen35CompiledModel {
             auto& intermediates = artifacts->intermediates;
             intermediates.push_back(q);
             intermediates.push_back(k);
+            intermediates.push_back(attn_out);
+            intermediates.push_back(result);
+        }
+        return result;
+    }
+
+    int kv_int8_group_size() const {
+        if (head_dim % 128 == 0) return 128;
+        if (head_dim % 64 == 0) return 64;
+        if (head_dim % 32 == 0) return 32;
+        throw std::runtime_error("Metal int8 KV requires head_dim divisible by 32/64/128");
+    }
+
+    array full_attn_step_int8(
+        const array& x, const FullAttnLayerWeights& lw,
+        const array& k_q_cache, const array& k_s_cache, const array& k_b_cache,
+        const array& v_q_cache, const array& v_s_cache, const array& v_b_cache,
+        int cache_pos,
+        const ForwardContext& ctx,
+        ForwardArtifacts* artifacts,
+        array& new_k_q_cache, array& new_k_s_cache, array& new_k_b_cache,
+        array& new_v_q_cache, array& new_v_s_cache, array& new_v_b_cache
+    ) const {
+        if (ctx.has_cache_pos_arr) {
+            throw std::runtime_error("Metal int8 KV session does not support cache_pos_arr");
+        }
+        int B = ctx.batch_size;
+        int nh = n_heads, nkv = n_kv_heads, hd = head_dim;
+        int S = ctx.seq_len;
+        int group_size = kv_int8_group_size();
+        float attn_scale = 1.0f / std::sqrt((float)hd);
+        bool keep_intermediates = ctx.keep_intermediates && artifacts;
+        bool prefer_verify_m16 = should_prefer_verify_m16(ctx);
+
+        auto q_proj_out = lw.q_proj.apply(x, prefer_verify_m16);
+        auto k_raw = lw.k_proj.apply(x, prefer_verify_m16);
+        auto v_raw = lw.v_proj.apply(x, prefer_verify_m16);
+
+        array q(0), gate_val(0);
+        if (lw.has_qk_gate) {
+            auto q_full = reshape(q_proj_out, {B, S, nh, hd * 2});
+            auto q_gate = split(q_full, Shape{hd}, -1);
+            q = fast::rms_norm(q_gate[0], lw.q_norm_w, rms_eps);
+            gate_val = q_gate[1];
+        } else {
+            q = fast::rms_norm(reshape(q_proj_out, {B, S, nh, hd}), lw.q_norm_w, rms_eps);
+        }
+        q = transpose(q, {0, 2, 1, 3});
+
+        auto k = reshape(k_raw, {B, S, nkv, hd});
+        k = fast::rms_norm(k, lw.k_norm_w, rms_eps);
+        k = transpose(k, {0, 2, 1, 3});
+
+        if (ctx.has_rope_offsets) {
+            q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, ctx.rope_offsets);
+            k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, ctx.rope_offsets);
+        } else {
+            q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
+            k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
+        }
+
+        auto v = reshape(v_raw, {B, S, nkv, hd});
+        v = transpose(v, {0, 2, 1, 3});
+
+        auto kq = quantize(k, group_size, 8);
+        auto vq = quantize(v, group_size, 8);
+        if (kq.size() != 3 || vq.size() != 3) {
+            throw std::runtime_error("Metal int8 KV quantize expected data/scale/bias triples");
+        }
+
+        int end = cache_pos + S;
+        int packed_hd = hd / 4;
+        int scale_hd = hd / group_size;
+        new_k_q_cache = slice_update(k_q_cache, kq[0], {0,0,cache_pos,0}, {B,nkv,end,packed_hd});
+        new_k_s_cache = slice_update(k_s_cache, kq[1], {0,0,cache_pos,0}, {B,nkv,end,scale_hd});
+        new_k_b_cache = slice_update(k_b_cache, kq[2], {0,0,cache_pos,0}, {B,nkv,end,scale_hd});
+        new_v_q_cache = slice_update(v_q_cache, vq[0], {0,0,cache_pos,0}, {B,nkv,end,packed_hd});
+        new_v_s_cache = slice_update(v_s_cache, vq[1], {0,0,cache_pos,0}, {B,nkv,end,scale_hd});
+        new_v_b_cache = slice_update(v_b_cache, vq[2], {0,0,cache_pos,0}, {B,nkv,end,scale_hd});
+
+        auto k_q_full = slice(new_k_q_cache, {0,0,0,0}, {B,nkv,end,packed_hd});
+        auto k_s_full = slice(new_k_s_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
+        auto k_b_full = slice(new_k_b_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
+        auto v_q_full = slice(new_v_q_cache, {0,0,0,0}, {B,nkv,end,packed_hd});
+        auto v_s_full = slice(new_v_s_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
+        auto v_b_full = slice(new_v_b_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
+        auto k_full = dequantize(k_q_full, k_s_full, k_b_full, group_size, 8);
+        auto v_full = dequantize(v_q_full, v_s_full, v_b_full, group_size, 8);
+
+        array attn_out(0);
+        if (can_use_verify_sdpa_2pass(ctx, q, k_full, v_full, nh, nkv, hd)) {
+            attn_out = batched_sdpa_2pass_cpp(q, k_full, v_full, attn_scale, nh / nkv);
+        } else if (ctx.has_attn_mask) {
+            attn_out = fast::scaled_dot_product_attention(
+                q,
+                k_full,
+                v_full,
+                attn_scale,
+                "",
+                ctx.attn_mask);
+        } else {
+            std::string mask_mode = (S > 1) ? "causal" : "";
+            attn_out = fast::scaled_dot_product_attention(
+                q,
+                k_full,
+                v_full,
+                attn_scale,
+                mask_mode);
+        }
+        attn_out = reshape(transpose(attn_out, {0,2,1,3}), {B, S, nh*hd});
+
+        array result(0);
+        if (lw.has_qk_gate) {
+            auto gate = reshape(gate_val, {B, S, nh*hd});
+            result = lw
+                .o_proj
+                .apply(compiled_precise_sigmoid_mul()({gate, attn_out})[0], prefer_verify_m16);
+        } else {
+            result = lw.o_proj.apply(attn_out, prefer_verify_m16);
+        }
+
+        if (keep_intermediates) {
+            auto& intermediates = artifacts->intermediates;
+            intermediates.push_back(q);
+            intermediates.push_back(k);
+            intermediates.push_back(kq[0]);
+            intermediates.push_back(vq[0]);
             intermediates.push_back(attn_out);
             intermediates.push_back(result);
         }
@@ -1244,12 +1375,15 @@ struct Qwen35CompiledModel {
     // ── Full forward pass ──────────────────────────────────────────────
     // inputs layout:
     //   [0]        : token ids / token batch
-    //   [1..1+2*F) : k_cache_i, v_cache_i for F full-attn layers
-    //   [1+2*F .. 1+2*F+2*G) : gdr_state_i, conv_state_i for G GDR layers
+    //   BF16:
+    //     [1..1+2*F) : k_cache_i, v_cache_i for F full-attn layers
+    //     [1+2*F .. 1+2*F+2*G) : gdr_state_i, conv_state_i for G GDR layers
+    //   INT8:
+    //     [1..1+6*F) : k_q,k_s,k_b,v_q,v_s,v_b per full-attn layer
+    //     [1+6*F .. 1+6*F+2*G) : gdr_state_i, conv_state_i for G GDR layers
     // outputs layout:
     //   [0]        : logits
-    //   [1..1+2*F) : new k/v caches
-    //   [1+2*F .. 1+2*F+2*G) : new gdr/conv states
+    //   followed by the same KV/GDR layout as the inputs.
 
     std::vector<array> forward_impl(
         const std::vector<array>& inputs,
@@ -1262,6 +1396,8 @@ struct Qwen35CompiledModel {
         int S = ctx.seq_len;  // 1 for decode, >1 for batch prefill
 
         int F = n_full_attn, G = n_gdr;
+        int kv_per_full = ctx.kv_cache_int8 ? 6 : 2;
+        int full_kv_count = kv_per_full * F;
         auto x = use_packed_embed
             ? gguf_embedding_cpp(token_id, embed_packed.w, embed_packed.gguf_format, embed_packed.rows, embed_packed.cols)
             : take(embed_tokens, flatten(token_id), 0);
@@ -1270,7 +1406,7 @@ struct Qwen35CompiledModel {
         bool prefer_verify_m16 = should_prefer_verify_m16(ctx);
         auto gdr_t_arr = array(S);
 
-        std::vector<array> new_kv_caches(2 * F, array(0));
+        std::vector<array> new_kv_caches(full_kv_count, array(0));
         std::vector<array> new_gdr_states(G, array(0));
         std::vector<array> new_conv_states(G, array(0));
         std::vector<array> captured_hidden;
@@ -1292,7 +1428,7 @@ struct Qwen35CompiledModel {
             // Attention
             array attn_out(0);
             if (layer.is_gdr) {
-                int si = 1 + 2*F + 2*gdr_idx;
+                int si = 1 + full_kv_count + 2*gdr_idx;
                 attn_out = gdr_step(xn, layer.gdr,
                     inputs[si], inputs[si+1],
                     ctx,
@@ -1300,13 +1436,25 @@ struct Qwen35CompiledModel {
                     new_gdr_states[gdr_idx], new_conv_states[gdr_idx], gdr_t_arr);
                 gdr_idx++;
             } else {
-                int si = 1 + 2*full_idx;
-                attn_out = full_attn_step(xn, layer.full,
-                    inputs[si], inputs[si+1],
-                    cache_pos,
-                    ctx,
-                    artifacts,
-                    new_kv_caches[2*full_idx], new_kv_caches[2*full_idx+1]);
+                int si = 1 + kv_per_full*full_idx;
+                int oi = kv_per_full*full_idx;
+                if (ctx.kv_cache_int8) {
+                    attn_out = full_attn_step_int8(xn, layer.full,
+                        inputs[si], inputs[si+1], inputs[si+2],
+                        inputs[si+3], inputs[si+4], inputs[si+5],
+                        cache_pos,
+                        ctx,
+                        artifacts,
+                        new_kv_caches[oi], new_kv_caches[oi+1], new_kv_caches[oi+2],
+                        new_kv_caches[oi+3], new_kv_caches[oi+4], new_kv_caches[oi+5]);
+                } else {
+                    attn_out = full_attn_step(xn, layer.full,
+                        inputs[si], inputs[si+1],
+                        cache_pos,
+                        ctx,
+                        artifacts,
+                        new_kv_caches[oi], new_kv_caches[oi+1]);
+                }
                 full_idx++;
             }
 
@@ -1367,7 +1515,7 @@ struct Qwen35CompiledModel {
 
         // Build output: [logits, kv_caches..., gdr_states..., captured_hidden...]
         std::vector<array> outputs;
-        outputs.reserve(1 + 2*F + 2*G + captured_hidden.size());
+        outputs.reserve(1 + full_kv_count + 2*G + captured_hidden.size());
         outputs.push_back(std::move(logits));
         for (auto& kv : new_kv_caches) outputs.push_back(std::move(kv));
         for (int j = 0; j < G; ++j) {
@@ -1389,6 +1537,7 @@ struct Qwen35CompiledModel {
         ctx.attn_mask = current_attn_mask;
         ctx.has_cache_pos_arr = current_has_cache_pos_arr;
         ctx.cache_pos_arr = current_cache_pos_arr;
+        ctx.kv_cache_int8 = current_kv_cache_int8;
         ctx.has_rope_offsets = current_has_rope_offsets;
         ctx.rope_offsets = current_rope_offsets;
         ctx.keep_intermediates = keep_step_intermediates(current_seq_len);
@@ -2006,6 +2155,20 @@ int32_t qwen35_session_begin(
     }
 
     try {
+        bool kv_int8 = false;
+        if (m->n_full_attn == 0) {
+            if (n_kv != 0) {
+                throw std::runtime_error("qwen35_session_begin expected zero KV caches");
+            }
+        } else if (n_kv == 2 * m->n_full_attn) {
+            kv_int8 = false;
+        } else if (n_kv == 6 * m->n_full_attn) {
+            kv_int8 = true;
+        } else {
+            throw std::runtime_error(
+                "qwen35_session_begin KV cache count must be 2*full_layers (bf16) "
+                "or 6*full_layers (int8)");
+        }
         std::vector<array> session_kv_caches;
         std::vector<array> session_gdr_states;
         session_kv_caches.reserve(n_kv);
@@ -2019,6 +2182,7 @@ int32_t qwen35_session_begin(
 
         m->session_kv_caches = std::move(session_kv_caches);
         m->session_gdr_states = std::move(session_gdr_states);
+        m->current_kv_cache_int8 = kv_int8;
         m->session_active = true;
         return 0;
     } catch (const std::exception& e) {
@@ -2059,6 +2223,7 @@ int32_t qwen35_session_end(
 
         m->session_kv_caches.clear();
         m->session_gdr_states.clear();
+        m->current_kv_cache_int8 = false;
         m->session_active = false;
         return 0;
     } catch (const std::exception& e) {
@@ -2095,6 +2260,10 @@ int32_t qwen35_compiled_session_kv_clone(
                 "qwen35_compiled_session_kv_clone: kv_axis must be 0 (K) or 1 (V)");
         }
         const int32_t n_kv = static_cast<int32_t>(m->session_kv_caches.size());
+        if (m->n_full_attn > 0 && n_kv == 6 * m->n_full_attn) {
+            throw std::runtime_error(
+                "qwen35_compiled_session_kv_clone does not expose int8 KV triples");
+        }
         const int32_t flat_idx = 2 * layer_idx + kv_axis;
         if (layer_idx < 0 || flat_idx >= n_kv) {
             throw std::runtime_error(
@@ -2149,6 +2318,7 @@ int32_t qwen35_compiled_step_session_paged(
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
         m->clear_optional_batch_inputs();
+        m->current_kv_cache_int8 = (n_kv == 6 * m->n_full_attn && m->n_full_attn > 0);
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -2214,6 +2384,7 @@ int32_t qwen35_compiled_step_session(
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
         m->clear_optional_batch_inputs();
+        m->current_kv_cache_int8 = (n_kv == 6 * m->n_full_attn && m->n_full_attn > 0);
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -2286,6 +2457,7 @@ int32_t qwen35_compiled_prefill_session(
         m->current_seq_len = prompt_len;
         m->current_last_logits_only = use_qwen35_cpp_prefill_last_logits_only();
         m->clear_optional_batch_inputs();
+        m->current_kv_cache_int8 = (n_kv == 6 * m->n_full_attn && m->n_full_attn > 0);
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);

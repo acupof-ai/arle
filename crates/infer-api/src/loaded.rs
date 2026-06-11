@@ -11,6 +11,21 @@
 /// `ARLE_WORKER_ENGINE_CONFIG` so worker ranks build their engines from the
 /// SAME values — any divergence (slots, budgets, chunk size) diverges the
 /// deterministic planner across ranks and deadlocks the NCCL lockstep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvCacheDtype {
+    /// Backend default. Metal resolves this to INT8 after the Metal int8 gate;
+    /// other backends keep their established default.
+    #[default]
+    Auto,
+    /// Native BF16 / model-dtype KV cache.
+    Bf16,
+    /// INT8 KV cache. Metal uses MLX affine 8-bit groups; CUDA support is a
+    /// separate backend implementation detail and must not be silently assumed.
+    Int8,
+}
+
+/// Slot / page configuration for [`LoadedInferenceEngine::load_with_config`].
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct EngineLoadConfig {
     /// Logical request slots.
@@ -27,6 +42,10 @@ pub struct EngineLoadConfig {
     pub chunked_prefill_size: usize,
     /// `Some(n)` = MTP spec decode on with draft depth `n`; `None` = off.
     pub mtp_draft_tokens: Option<usize>,
+    /// Requested KV-cache dtype. Backends resolve `Auto` inside their own
+    /// builder so the service/scheduler layers stay device-neutral.
+    #[serde(default)]
+    pub kv_cache_dtype: KvCacheDtype,
     /// Low-impact local serving mode: keep work chunks cooperative for desktop
     /// responsiveness. Backend builders may install a resource governor when
     /// this is set; server-style defaults leave it off.
@@ -45,6 +64,7 @@ impl Default for EngineLoadConfig {
             max_total_tokens: 65_536,
             chunked_prefill_size: 64,
             mtp_draft_tokens: None,
+            kv_cache_dtype: KvCacheDtype::Auto,
             low_impact: false,
         }
     }
@@ -138,6 +158,8 @@ mod backend {
     #[cfg(feature = "cuda")]
     use super::CudaModelKind;
     use super::EngineLoadConfig;
+    #[cfg(feature = "metal")]
+    use super::KvCacheDtype;
     use crate::serve_engine::ServeInferenceEngine;
     use crate::types::{
         CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry,
@@ -528,6 +550,10 @@ mod backend {
         if config.mtp_draft_tokens.is_some() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
+        let metal_kv_dtype = match config.kv_cache_dtype {
+            KvCacheDtype::Auto | KvCacheDtype::Int8 => infer_metal::MetalKvCacheDtype::Int8,
+            KvCacheDtype::Bf16 => infer_metal::MetalKvCacheDtype::Bf16,
+        };
         let resolved = infer_metal::resolve_model_path(model_path)?;
         let tokenizer = OpenAiTokenizer::from_model_dir(&resolved)?;
         let model_id = crate::serve_engine::model_id_from_path(model_path);
@@ -539,7 +565,8 @@ mod backend {
         let page_size = config.page_size;
         let low_impact = config.low_impact;
         let serve = ServeHandle::spawn_with_engine_builder(move || {
-            let executor = MetalExecutor::from_model_path(&model_source)?;
+            let executor =
+                MetalExecutor::from_model_path_with_kv_cache_dtype(&model_source, metal_kv_dtype)?;
             let kv = MetalKvPool::new(num_slots, total_pages, page_size);
             if low_impact {
                 let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {

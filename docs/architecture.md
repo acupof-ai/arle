@@ -168,7 +168,7 @@ parity in another.
 | Continuous batching scheduler | Yes (one `Engine<E,K>` in `infer-core`) | Yes (same `Engine<E,K>`; packed varlen batched decode) | No |
 | Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes (`BatchKVCache` pattern via `mlx-sys`) | No |
 | Chunked prefill + decode-priority | Yes | Partial | No |
-| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8/TQ*) | No (native model dtype) | No |
+| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8/TQ*) | Yes (INT8 default via MLX affine groups; BF16 fallback) | No |
 | Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots) | No |
 | Speculative decode | Not shipped (plumbing only) | Beta (DFlash for Qwen3.5) | No |
 | Multi-GPU TP/PP/EP | TP=8 / EP=8 live (DSv4: DeepGEMM + DeepEP); PP not wired | No | No |
