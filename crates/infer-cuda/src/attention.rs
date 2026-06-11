@@ -1515,6 +1515,244 @@ impl Dsv4LayerAttentionSnapshot {
     }
 }
 
+/// Host-side image of one slot's per-layer device state for the whole-slot KV
+/// tier (#84/#85 Route B, `docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md`).
+/// Executor-internal, NOT byte-packed: plain host vectors per buffer.
+/// Full-allocation copies by construction — extent-proof for v1; computing
+/// written extents (e.g. `seq_len * 584B` of the FP8 band) is a perf TODO.
+pub(crate) struct Dsv4LayerImage {
+    sw_window_cache: Vec<half::bf16>,
+    compressor: Option<Dsv4CompressorImage>,
+    indexer: Option<Dsv4CompressorImage>,
+    flashmla: Option<Dsv4FlashMlaImage>,
+    dsa_official: Option<Dsv4DsaOfficialImage>,
+}
+
+/// Whole-slot host image of one [`Dsv4CompressorState`].
+///
+/// Unlike [`Dsv4CompressorStateSnapshot`] (spec-decode rollback), this MUST
+/// carry `compressed.data`: rollback only ever SHRINKS a live slot (the
+/// rolled-back rows are overwritten by the next real decode), but a swapped-out
+/// slot is freed and reused by another request, so every committed compressed
+/// row has to survive in the image.
+struct Dsv4CompressorImage {
+    pending_kv: Vec<half::bf16>,
+    pending_score: Vec<half::bf16>,
+    prev_overlap_kv: Vec<half::bf16>,
+    prev_overlap_score: Vec<half::bf16>,
+    compressed_data: Vec<half::bf16>,
+    compressed_seq_len: usize,
+}
+
+impl Dsv4CompressorImage {
+    fn capture(ctx: &DeviceContext, state: &Dsv4CompressorState) -> Result<Self> {
+        Ok(Self {
+            pending_kv: ctx
+                .stream
+                .clone_dtoh(&state.pending_kv)
+                .map_err(|e| anyhow!("DSv4 swap compressor pending kv D2H failed: {e}"))?,
+            pending_score: ctx
+                .stream
+                .clone_dtoh(&state.pending_score)
+                .map_err(|e| anyhow!("DSv4 swap compressor pending score D2H failed: {e}"))?,
+            prev_overlap_kv: ctx
+                .stream
+                .clone_dtoh(&state.prev_overlap_kv)
+                .map_err(|e| anyhow!("DSv4 swap compressor prev kv D2H failed: {e}"))?,
+            prev_overlap_score: ctx
+                .stream
+                .clone_dtoh(&state.prev_overlap_score)
+                .map_err(|e| anyhow!("DSv4 swap compressor prev score D2H failed: {e}"))?,
+            compressed_data: ctx
+                .stream
+                .clone_dtoh(&state.compressed.data)
+                .map_err(|e| anyhow!("DSv4 swap compressor compressed D2H failed: {e}"))?,
+            compressed_seq_len: state.compressed.seq_len,
+        })
+    }
+
+    fn restore_to(&self, ctx: &DeviceContext, state: &mut Dsv4CompressorState) -> Result<()> {
+        ensure!(
+            self.pending_kv.len() == state.pending_kv.len()
+                && self.pending_score.len() == state.pending_score.len()
+                && self.prev_overlap_kv.len() == state.prev_overlap_kv.len()
+                && self.prev_overlap_score.len() == state.prev_overlap_score.len()
+                && self.compressed_data.len() == state.compressed.data.len(),
+            "DSv4 swap compressor image shape mismatch"
+        );
+        ctx.stream
+            .memcpy_htod(&self.pending_kv, &mut state.pending_kv)
+            .map_err(|e| anyhow!("DSv4 swap compressor pending kv H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&self.pending_score, &mut state.pending_score)
+            .map_err(|e| anyhow!("DSv4 swap compressor pending score H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&self.prev_overlap_kv, &mut state.prev_overlap_kv)
+            .map_err(|e| anyhow!("DSv4 swap compressor prev kv H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&self.prev_overlap_score, &mut state.prev_overlap_score)
+            .map_err(|e| anyhow!("DSv4 swap compressor prev score H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&self.compressed_data, &mut state.compressed.data)
+            .map_err(|e| anyhow!("DSv4 swap compressor compressed H2D failed: {e}"))?;
+        state.compressed.seq_len = self.compressed_seq_len;
+        Ok(())
+    }
+}
+
+/// Whole-slot host image of one [`Dsv4FlashMlaDecodeState`]: the two mutable
+/// host scalars plus the slot's exclusive band of the shared FP8 KV pool.
+struct Dsv4FlashMlaImage {
+    fp8_kv_sw_bootstrapped: bool,
+    fp8_kv_comp_packed_rows: usize,
+    /// Full `flashmla_slot_range` band. Perf TODO: only `seq_len`-derived rows
+    /// are written; v1 copies the whole band (extent-proof by construction).
+    fp8_kv_pool_slot: Vec<u8>,
+}
+
+impl Dsv4FlashMlaImage {
+    fn capture(
+        ctx: &DeviceContext,
+        pool: &Dsv4LayerKvLayout,
+        flash: &Dsv4FlashMlaDecodeState,
+    ) -> Result<Self> {
+        let range = pool.flashmla_slot_range(flash.slot_idx)?;
+        let pool_buf = pool
+            .flashmla_fp8_kv_pool
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 swap FlashMLA shared pool missing"))?;
+        ensure!(
+            range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
+            "DSv4 swap FlashMLA pool range {:?} invalid for pool_len={} slot_len={}",
+            range,
+            pool_buf.len(),
+            flash.fp8_kv_pool_len
+        );
+        Ok(Self {
+            fp8_kv_sw_bootstrapped: flash.fp8_kv_sw_bootstrapped,
+            fp8_kv_comp_packed_rows: flash.fp8_kv_comp_packed_rows,
+            fp8_kv_pool_slot: ctx
+                .stream
+                .clone_dtoh(&pool_buf.slice(range))
+                .map_err(|e| anyhow!("DSv4 swap FlashMLA pool band D2H failed: {e}"))?,
+        })
+    }
+
+    fn restore_to(
+        &self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+        flash: &mut Dsv4FlashMlaDecodeState,
+    ) -> Result<()> {
+        let range = pool.flashmla_slot_range(flash.slot_idx)?;
+        let pool_buf = pool
+            .flashmla_fp8_kv_pool
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 swap FlashMLA shared pool missing"))?;
+        ensure!(
+            range.end <= pool_buf.len()
+                && range.len() == flash.fp8_kv_pool_len
+                && range.len() == self.fp8_kv_pool_slot.len(),
+            "DSv4 swap FlashMLA restore range {:?} invalid for pool_len={} image_len={}",
+            range,
+            pool_buf.len(),
+            self.fp8_kv_pool_slot.len()
+        );
+        let mut view = pool_buf.slice_mut(range);
+        ctx.stream
+            .memcpy_htod(&self.fp8_kv_pool_slot, &mut view)
+            .map_err(|e| anyhow!("DSv4 swap FlashMLA pool band H2D failed: {e}"))?;
+        flash.fp8_kv_sw_bootstrapped = self.fp8_kv_sw_bootstrapped;
+        flash.fp8_kv_comp_packed_rows = self.fp8_kv_comp_packed_rows;
+        Ok(())
+    }
+}
+
+/// Whole-slot host image of one [`Dsv4DsaOfficialState`]: the `packed_rows`
+/// progress counter, the `rotated_keys` mirror, and the slot's exclusive band
+/// of the shared official-DSA key cache.
+struct Dsv4DsaOfficialImage {
+    packed_rows: usize,
+    /// Incrementally-written rotated-key mirror. Already-packed rows are not
+    /// provably re-read (only the newly-packed slice feeds the cache store in
+    /// `csa_select_official`), so this MIGHT be reconstructible — uncertain
+    /// from source, so snapshot the full buffer (always safe).
+    rotated_keys: Vec<half::bf16>,
+    /// Full `dsa_slot_range` band: the FP8 indexer key cache the paged-MQA
+    /// logits kernel reads in full every step. Perf TODO: written extent is
+    /// `packed_rows`-derived; v1 copies the whole band.
+    key_cache_slot: Vec<u8>,
+}
+
+impl Dsv4DsaOfficialImage {
+    fn capture(
+        ctx: &DeviceContext,
+        pool: &Dsv4LayerKvLayout,
+        official: &Dsv4DsaOfficialState,
+    ) -> Result<Self> {
+        let range = pool.dsa_slot_range(official.slot_idx)?;
+        let pool_buf = pool
+            .dsa_key_cache
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 swap DSA shared key-cache missing"))?;
+        ensure!(
+            range.end <= pool_buf.len() && range.len() == official.key_cache_len,
+            "DSv4 swap DSA key-cache range {:?} invalid for pool_len={} slot_len={}",
+            range,
+            pool_buf.len(),
+            official.key_cache_len
+        );
+        Ok(Self {
+            packed_rows: official.packed_rows,
+            rotated_keys: ctx
+                .stream
+                .clone_dtoh(&official.rotated_keys)
+                .map_err(|e| anyhow!("DSv4 swap DSA rotated keys D2H failed: {e}"))?,
+            key_cache_slot: ctx
+                .stream
+                .clone_dtoh(&pool_buf.slice(range))
+                .map_err(|e| anyhow!("DSv4 swap DSA key-cache band D2H failed: {e}"))?,
+        })
+    }
+
+    fn restore_to(
+        &self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+        official: &mut Dsv4DsaOfficialState,
+    ) -> Result<()> {
+        ensure!(
+            self.rotated_keys.len() == official.rotated_keys.len(),
+            "DSv4 swap DSA rotated keys image len {} != state len {}",
+            self.rotated_keys.len(),
+            official.rotated_keys.len()
+        );
+        let range = pool.dsa_slot_range(official.slot_idx)?;
+        let pool_buf = pool
+            .dsa_key_cache
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 swap DSA shared key-cache missing"))?;
+        ensure!(
+            range.end <= pool_buf.len()
+                && range.len() == official.key_cache_len
+                && range.len() == self.key_cache_slot.len(),
+            "DSv4 swap DSA restore range {:?} invalid for pool_len={} image_len={}",
+            range,
+            pool_buf.len(),
+            self.key_cache_slot.len()
+        );
+        ctx.stream
+            .memcpy_htod(&self.rotated_keys, &mut official.rotated_keys)
+            .map_err(|e| anyhow!("DSv4 swap DSA rotated keys H2D failed: {e}"))?;
+        let mut view = pool_buf.slice_mut(range);
+        ctx.stream
+            .memcpy_htod(&self.key_cache_slot, &mut view)
+            .map_err(|e| anyhow!("DSv4 swap DSA key-cache band H2D failed: {e}"))?;
+        official.packed_rows = self.packed_rows;
+        Ok(())
+    }
+}
+
 impl Dsv4LayerAttentionState {
     pub(crate) fn new(
         ctx: &DeviceContext,
@@ -1738,6 +1976,141 @@ impl Dsv4LayerAttentionState {
             (Some(state), Some(snapshot)) => snapshot.restore_to(ctx, state)?,
             (None, None) => {}
             _ => bail!("DSv4 indexer rollback restore shape mismatch"),
+        }
+        Ok(())
+    }
+
+    /// Serialize this layer's COMPLETE per-slot device state into a host image
+    /// (whole-slot KV swap, #84/#85 Route B). The caller (slot-level entry in
+    /// `dsv4.rs`) syncs the stream once after all layers, so the D2H copies are
+    /// complete before the engine frees the slot.
+    ///
+    /// §0.1 per-buffer verdict — every `Dsv4LayerAttentionState` field:
+    /// - `sw_window_cache`: SNAPSHOT (full allocation). The live BF16 SW ring;
+    ///   whole-buffer copy is extent-proof by construction (the EAGLE lesson:
+    ///   ring self-heal only holds below `sliding_window`, so never infer a
+    ///   written extent).
+    /// - `compressor` / `indexer` ([`Dsv4CompressorState`]): SNAPSHOT (full) —
+    ///   `pending_kv`/`pending_score`/`prev_overlap_kv`/`prev_overlap_score`
+    ///   partial-row accumulators, plus `compressed.data` + `compressed.seq_len`
+    ///   (see [`Dsv4CompressorImage`] for why the rollback snapshot's data-skip
+    ///   does NOT apply to swap).
+    /// - `flashmla` ([`Dsv4FlashMlaDecodeState`]), field by field:
+    ///   - `fp8_kv_sw_bootstrapped` / `fp8_kv_comp_packed_rows`: SNAPSHOT — the
+    ///     only host scalars written after init (`flashmla_pack_sw_ring`,
+    ///     `flashmla_pack_compressed_delta`; everything else is set once in
+    ///     `new`/`init_constant_sched_meta`).
+    ///   - shared FP8 pool band (`flashmla_slot_range(slot_idx)` into
+    ///     `flashmla_fp8_kv_pool`): SNAPSHOT (full band; perf TODO: written
+    ///     extent is `seq_len`-derived).
+    ///   - `sw_bulk_block_ids`/`sw_bulk_rows`: SCRATCH — written only in
+    ///     `flashmla_pack_sw_ring` (ring-identity constants) immediately before
+    ///     their single read in the same call; never read elsewhere.
+    ///   - `one_block_id`/`one_row`: SCRATCH — device-written from
+    ///     `start_pos_device` at the top of every `flashmla_pack_one_sw_token`
+    ///     before their single read in the same call.
+    ///   - `comp_block_ids`/`comp_rows`: SCRATCH — H2D-written immediately
+    ///     before their single read inside `flashmla_pack_compressed_delta`.
+    ///   - `indices`: SCRATCH — the unified top-k select writes it each decode
+    ///     step before the sparse-decode kernel reads it in the same step.
+    ///   - `topk_length`/`sched_meta`/`num_splits`: CONSTANT-after-init
+    ///     (`init_constant_sched_meta` — slot-shape constants, written once).
+    ///   - `lse_out`/`lse_accum`/`o_accum`: SCRATCH — decode-kernel split
+    ///     accumulators/outputs, fully overwritten per launch before read.
+    ///   - `tp_gathered_q`/`tp_packed_q`/`tp_full_out`: SCRATCH — per-step Q
+    ///     gather/output staging, written each decode step before read.
+    ///   - `slot_idx`/`fp8_kv_pool_len`/`sw_blocks`/`comp_blocks`/
+    ///     `max_compressed_keys`/`topk_unified`/`num_sm_parts`/
+    ///     `fixed_overhead_num_blocks`/`block_size_topk`: CONSTANT-after-init.
+    /// - `fused_wqkv` ([`Dsv4FusedWqkvDecodeScratch`]): SCRATCH — `input_fp8`/
+    ///   `input_scales`/`qkv_raw` are quantize→GEMM staging overwritten from
+    ///   the step's activations before every read; `active_experts`/
+    ///   `active_offsets`/`active_counts` are `[0]`/`[0]`/`[1]` constants.
+    /// - `prefill_linear` ([`Dsv4PrefillDeepGemmLinearScratch`]): SCRATCH —
+    ///   same quantize→GEMM staging pattern, M-chunk-bounded, fully written
+    ///   from the chunk's activations before read each call.
+    /// - `dsa_official` ([`Dsv4DsaOfficialState`]): SNAPSHOT — `packed_rows`
+    ///   (host progress counter), `rotated_keys` (incremental mirror; old rows
+    ///   not provably re-read → uncertain → snapshot full, always safe), and
+    ///   the shared `dsa_key_cache` band (`dsa_slot_range(slot_idx)`), which
+    ///   the paged-MQA logits kernel reads in full every step.
+    /// - [`Dsv4DsaSharedScratch`] (adapter-level, NOT per-slot): NO SNAPSHOT —
+    ///   its doc proves "contents carry NO cross-call state" (per-forward
+    ///   scratch overwritten before read + config constants), shared across
+    ///   every slot and layer.
+    pub(crate) fn swap_out_image(
+        &self,
+        ctx: &DeviceContext,
+        pool: &Dsv4LayerKvLayout,
+    ) -> Result<Dsv4LayerImage> {
+        Ok(Dsv4LayerImage {
+            sw_window_cache: ctx
+                .stream
+                .clone_dtoh(&self.sw_window_cache)
+                .map_err(|e| anyhow!("DSv4 swap SW window D2H failed: {e}"))?,
+            compressor: self
+                .compressor
+                .as_ref()
+                .map(|state| Dsv4CompressorImage::capture(ctx, state))
+                .transpose()?,
+            indexer: self
+                .indexer
+                .as_ref()
+                .map(|state| Dsv4CompressorImage::capture(ctx, state))
+                .transpose()?,
+            flashmla: self
+                .flashmla
+                .as_ref()
+                .map(|flash| Dsv4FlashMlaImage::capture(ctx, pool, flash))
+                .transpose()?,
+            dsa_official: self
+                .dsa_official
+                .as_ref()
+                .map(|official| Dsv4DsaOfficialImage::capture(ctx, pool, official))
+                .transpose()?,
+        })
+    }
+
+    /// Exact inverse of [`Self::swap_out_image`] into (possibly another) slot's
+    /// state at the same per-buffer granularity. Every stateful buffer is fully
+    /// rewritten from the image, so leftover state from a previous occupant of
+    /// the target slot cannot leak; scratch buffers stay untouched (overwritten
+    /// before read per the verdicts above). The slot-level caller syncs once
+    /// after all layers, before the engine resumes decode / drops the image.
+    pub(crate) fn swap_in_image(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+        image: &Dsv4LayerImage,
+    ) -> Result<()> {
+        ensure!(
+            image.sw_window_cache.len() == self.sw_window_cache.len(),
+            "DSv4 swap SW window image len {} != state len {}",
+            image.sw_window_cache.len(),
+            self.sw_window_cache.len()
+        );
+        ctx.stream
+            .memcpy_htod(&image.sw_window_cache, &mut self.sw_window_cache)
+            .map_err(|e| anyhow!("DSv4 swap SW window H2D failed: {e}"))?;
+        match (&mut self.compressor, &image.compressor) {
+            (Some(state), Some(image)) => image.restore_to(ctx, state)?,
+            (None, None) => {}
+            _ => bail!("DSv4 swap compressor image presence mismatch"),
+        }
+        match (&mut self.indexer, &image.indexer) {
+            (Some(state), Some(image)) => image.restore_to(ctx, state)?,
+            (None, None) => {}
+            _ => bail!("DSv4 swap indexer image presence mismatch"),
+        }
+        match (&mut self.flashmla, &image.flashmla) {
+            (Some(flash), Some(image)) => image.restore_to(ctx, pool, flash)?,
+            (None, None) => {}
+            _ => bail!("DSv4 swap FlashMLA image presence mismatch"),
+        }
+        match (&mut self.dsa_official, &image.dsa_official) {
+            (Some(official), Some(image)) => image.restore_to(ctx, pool, official)?,
+            (None, None) => {}
+            _ => bail!("DSv4 swap DSA image presence mismatch"),
         }
         Ok(())
     }

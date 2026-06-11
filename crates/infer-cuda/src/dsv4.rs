@@ -236,6 +236,18 @@ pub(crate) struct Dsv4Model {
     pub deepep: Option<crate::deepep::DeepEpTransport>,
 }
 
+/// Host-side image of one slot's COMPLETE device state for the whole-slot KV
+/// tier (#84/#85 Route B): the per-layer attention images plus the slot-level
+/// scalars. Executor-internal, NOT byte-packed. Built by
+/// [`Dsv4SlotState::swap_out_image`], consumed by
+/// [`Dsv4SlotState::swap_in_image`]; slot-agnostic (per-slot pool bands are
+/// re-resolved from the TARGET slot on swap-in), so an image can be promoted
+/// into a different slot index than it was demoted from.
+pub(crate) struct Dsv4SlotImage {
+    seq_len: usize,
+    layers: Vec<crate::attention::Dsv4LayerImage>,
+}
+
 pub(crate) struct Dsv4SlotState {
     attention: Vec<crate::attention::Dsv4LayerAttentionState>,
     spec_rollback: Option<Vec<crate::attention::Dsv4LayerAttentionSnapshot>>,
@@ -647,6 +659,96 @@ impl Dsv4SlotState {
             let pool = kv_adapter.layer_mut(layer_idx)?;
             state.restore_rollback_snapshot(ctx, pool, snapshot, draft_abs_pos)?;
         }
+        Ok(())
+    }
+
+    /// Serialize this slot's COMPLETE device state into a host image (whole-
+    /// slot KV swap, #84/#85 Route B). The engine frees the slot right after
+    /// `demote_slot` returns, so the trailing `ctx.sync()` is load-bearing:
+    /// every D2H copy must have landed in host memory first.
+    ///
+    /// §0.1 per-field verdict — every `Dsv4SlotState` field:
+    /// - `attention`: SNAPSHOT per layer — see
+    ///   [`crate::attention::Dsv4LayerAttentionState::swap_out_image`] for the
+    ///   per-buffer enumeration.
+    /// - `spec_rollback`: SCRATCH — captured fresh (`capture_spec_rollback`)
+    ///   at the start of every spec verify step before any
+    ///   `restore_spec_rollback` reads it; never read across step or request
+    ///   boundaries.
+    /// - `moe_decode_scratch`: SCRATCH — every buffer is per-call zeroed /
+    ///   sentinel-memset or fully overwritten before read; the per-buffer init
+    ///   table lives on `moe.rs`'s `Dsv4MoeDecodeScratch` (counts/cursors
+    ///   zeroed every call, GEMM staging written within offsets/counts).
+    /// - `start_pos_device`: SCRATCH — every decode-step entry (eager
+    ///   `forward_tokens`, graph step, and batched decode) H2Ds the plan's
+    ///   `start_pos` into it before any read; prefill passes `None`.
+    /// - `decode_graph`: NO SNAPSHOT — captured kernel topology + per-step
+    ///   scratch, not data; replay reads the restored slot bands. Re-armed for
+    ///   one eager warm pass on swap-in (same as `reset`).
+    /// - `deepep_ll_scratch`: SCRATCH — "overwritten in place each
+    ///   `dsv4_moe_forward_deepep_ll` call" (field doc above).
+    /// - `seq_len`: SNAPSHOT (scalar) — the decode resume position; batch
+    ///   validation requires it to equal the plan's `kv_seq_len`.
+    /// - `max_seq_len`: construction constant (validated on swap-in).
+    /// - (`Dsv4KvAdapter::slot_epochs`, adapter-level: debug bookkeeping
+    ///   re-recorded from every batch descriptor — no snapshot.)
+    pub(crate) fn swap_out_image(
+        &self,
+        ctx: &DeviceContext,
+        kv_adapter: &crate::attention::Dsv4KvAdapter,
+    ) -> Result<Dsv4SlotImage> {
+        let mut layers = Vec::with_capacity(self.attention.len());
+        for (layer_idx, state) in self.attention.iter().enumerate() {
+            let pool = kv_adapter.layer(layer_idx)?;
+            layers.push(state.swap_out_image(ctx, pool)?);
+        }
+        // The clone_dtoh copies above are stream-ordered; the image's host
+        // vectors are only valid once the stream drains.
+        ctx.sync()?;
+        Ok(Dsv4SlotImage {
+            seq_len: self.seq_len,
+            layers,
+        })
+    }
+
+    /// Exact inverse of [`Self::swap_out_image`]: restore the image into this
+    /// slot at the demoted `seq_len`, so the next decode step continues as if
+    /// never swapped. The engine resumes decode right after `promote_slot`
+    /// returns (and drops the host image via `drop_kv_slot_entries`), so the
+    /// trailing `ctx.sync()` is load-bearing for both.
+    pub(crate) fn swap_in_image(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        image: &Dsv4SlotImage,
+    ) -> Result<()> {
+        ensure!(
+            image.seq_len <= self.max_seq_len,
+            "DSv4 swap image seq_len {} exceeds slot max_seq_len {}",
+            image.seq_len,
+            self.max_seq_len
+        );
+        ensure!(
+            image.layers.len() == self.attention.len(),
+            "DSv4 swap image layer count {} != attention states {}",
+            image.layers.len(),
+            self.attention.len()
+        );
+        for (layer_idx, (state, layer_image)) in
+            self.attention.iter_mut().zip(&image.layers).enumerate()
+        {
+            let pool = kv_adapter.layer_mut(layer_idx)?;
+            state.swap_in_image(ctx, pool, layer_image)?;
+        }
+        self.seq_len = image.seq_len;
+        // Same request-boundary discipline as `reset`: re-arm one eager warm
+        // step on every captured decode graph so per-request host work (SW
+        // ring bootstrap, compressed bulk pack) reruns against the restored
+        // bands before replay resumes.
+        if let Some(graph) = self.decode_graph.as_mut() {
+            graph.rearm_for_new_request();
+        }
+        ctx.sync()?;
         Ok(())
     }
 

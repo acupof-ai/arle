@@ -188,6 +188,39 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Whole-slot KV tier hooks (#84/#85 Route B). Only the DSv4 arm owns
+    /// page-less per-slot state it can demote/promote as one image; the Qwen
+    /// arms keep the page-granular tier above and report no slot tier, so the
+    /// engine never routes their preemptions here.
+    pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
+        match self {
+            Self::Dsv4(d) => d.kv_slot_tier_enabled(),
+            Self::Qwen(_) | Self::Qwen35(_) => false,
+        }
+    }
+
+    pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
+        match self {
+            Self::Dsv4(d) => d.demote_slot(slot, key),
+            Self::Qwen(_) | Self::Qwen35(_) => Ok(false),
+        }
+    }
+
+    pub(crate) fn promote_slot(&mut self, key: u64, slot: usize) -> Result<()> {
+        match self {
+            Self::Dsv4(d) => d.promote_slot(key, slot),
+            Self::Qwen(_) | Self::Qwen35(_) => {
+                anyhow::bail!("whole-slot KV tier store is only wired for the DSv4 arm")
+            }
+        }
+    }
+
+    pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
+        if let Self::Dsv4(d) = self {
+            d.drop_kv_slot_entries(keys);
+        }
+    }
+
     /// Re-budget the T1 tier store (`0` disables; pre-serve only). No-op on
     /// arms without a tier store.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
@@ -820,6 +853,26 @@ pub(crate) struct Dsv4CudaExecutor {
     num_slots: usize,
     mtp_accepts: usize,
     mtp_rejects: usize,
+    /// Whole-slot KV tier store (#84/#85 Route B): host images of demoted
+    /// slots, keyed by the engine-minted swap key. Capacity is a v1 COUNT cap
+    /// of `2 * num_slots` images (each image ≈ one slot's device KV footprint,
+    /// so host RAM is bounded at ~2× the device arena; preemption churn beyond
+    /// that signals thrash where plain recompute is the better fallback). A
+    /// byte-budget cap (CudaKvTierStore reuse) is the follow-up tracked in
+    /// docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md.
+    slot_swap_store: std::collections::BTreeMap<u64, Dsv4SlotSwapEntry>,
+}
+
+/// One demoted slot: the device-state image plus the executor-level MTP spec
+/// chain. `spec_pending`/`spec_hidden` MUST ride along (not reset): under
+/// `--spec-type mtp` the resumed decode hard-requires the pending token and
+/// the previous MTP stream (`forward_decode_tokens` errors on a missing
+/// pending), and the slot's spec state is overwritten by whichever request
+/// occupies the slot while this one is demoted.
+struct Dsv4SlotSwapEntry {
+    image: crate::dsv4::Dsv4SlotImage,
+    spec_pending: Option<u32>,
+    spec_hidden: Option<Vec<half::bf16>>,
 }
 
 #[derive(Default)]
@@ -1133,7 +1186,103 @@ impl Dsv4CudaExecutor {
             num_slots,
             mtp_accepts: 0,
             mtp_rejects: 0,
+            slot_swap_store: std::collections::BTreeMap::new(),
         })
+    }
+
+    /// Whole-slot KV tier gate (#84/#85 Route B): single-rank only for v1.
+    pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
+        let world_size = self.model.tp.config().world_size;
+        if world_size > 1 {
+            // Multi-rank demote/promote must execute on EVERY rank in lockstep
+            // (the seam hooks fire on the coordinator only), or the
+            // deterministic planner diverges and NCCL deadlocks. The
+            // multiproc-relay SwapOut/SwapIn envelopes are the tracked
+            // follow-up in docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md.
+            static MULTI_RANK_LOGGED: std::sync::Once = std::sync::Once::new();
+            MULTI_RANK_LOGGED.call_once(|| {
+                info!(
+                    "DSv4 whole-slot KV tier disabled at world_size={world_size}: \
+                     multi-rank lockstep swap envelopes are the tracked follow-up \
+                     (docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md)"
+                );
+            });
+            return false;
+        }
+        true
+    }
+
+    /// Demote `slot`'s entire device state into the host store under `key`.
+    /// Contract (see `infer_seam::BackendExecutor::demote_slot`): the copy is
+    /// complete before returning — `swap_out_image` ends in `ctx.sync()` — so
+    /// the engine may free the slot immediately. Returns `Ok(false)` when the
+    /// store is at its v1 count cap (engine falls back to plain recompute).
+    pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 demote slot {slot} outside executor slots {}",
+            self.num_slots
+        );
+        if !self.slot_swap_store.contains_key(&key)
+            && self.slot_swap_store.len() >= self.num_slots.saturating_mul(2)
+        {
+            return Ok(false);
+        }
+        // Spec chain D2H first: the copies are stream-ordered, so the trailing
+        // sync inside `swap_out_image` covers them too.
+        let spec_pending = self.spec_slots[slot].pending;
+        let spec_hidden = match self.spec_slots[slot].hidden.as_ref() {
+            Some(hidden) => Some(
+                self.model
+                    .ctx
+                    .stream
+                    .clone_dtoh(&hidden.data)
+                    .map_err(|e| anyhow::anyhow!("DSv4 swap spec hidden D2H failed: {e}"))?,
+            ),
+            None => None,
+        };
+        let image = self.slots[slot].swap_out_image(&self.model.ctx, &self.kv_adapter)?;
+        self.slot_swap_store.insert(
+            key,
+            Dsv4SlotSwapEntry {
+                image,
+                spec_pending,
+                spec_hidden,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Restore the whole-slot image stored under `key` into `slot`. The engine
+    /// resumes decode at the demoted position right after this returns, and
+    /// drops the entry via [`Self::drop_kv_slot_entries`] — the entry
+    /// intentionally stays in the store here. `swap_in_image` ends in
+    /// `ctx.sync()`, so both the device restore and the spec-hidden H2D (same
+    /// stream, ordered before it) are complete before the host image can be
+    /// dropped.
+    pub(crate) fn promote_slot(&mut self, key: u64, slot: usize) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 promote slot {slot} outside executor slots {}",
+            self.num_slots
+        );
+        let entry = self.slot_swap_store.get(&key).ok_or_else(|| {
+            anyhow::anyhow!("DSv4 whole-slot KV store has no image for key {key}")
+        })?;
+        self.spec_slots[slot] = Dsv4SpecSlotState {
+            pending: entry.spec_pending,
+            hidden: match entry.spec_hidden.as_ref() {
+                Some(host) => Some(DeviceVec::from_host(&self.model.ctx, host)?),
+                None => None,
+            },
+        };
+        self.slots[slot].swap_in_image(&self.model.ctx, &mut self.kv_adapter, &entry.image)
+    }
+
+    pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
+        for key in keys {
+            self.slot_swap_store.remove(key);
+        }
     }
 
     fn forward_prefill_tokens(

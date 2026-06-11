@@ -454,6 +454,46 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn kv_slot_tier_enabled(&self) -> bool {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => false,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_slot_tier_enabled(),
+        }
+    }
+
+    fn demote_slot(&mut self, slot: usize, key: u64) -> anyhow::Result<bool> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (slot, key);
+                Ok(false)
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.demote_slot(slot, key),
+        }
+    }
+
+    fn promote_slot(&mut self, key: u64, slot: usize) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (key, slot);
+                anyhow::bail!("placeholder CUDA executor has no whole-slot KV tier store")
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.promote_slot(key, slot),
+        }
+    }
+
+    fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = keys;
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.drop_kv_slot_entries(keys),
+        }
+    }
+
     fn offload_weights(&mut self) -> anyhow::Result<usize> {
         match &mut self.inner {
             // No real device weights to offload without the cuda backend.
