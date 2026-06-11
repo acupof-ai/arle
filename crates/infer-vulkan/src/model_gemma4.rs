@@ -35,6 +35,23 @@ pub enum Gemma4Op {
     LmHead,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma4LauncherKind {
+    TokenEmbedding,
+    PerLayerEmbedding,
+    GemmaRmsNorm,
+    QuantizedGemv,
+    QkNorm,
+    RopeStandard,
+    RopeProportional,
+    SlidingWindowAttention,
+    GlobalAttention,
+    GeGlu,
+    Add,
+    MoeRouter,
+    MoeExperts,
+}
+
 pub const GEMMA4_RMS_NORM_ADDS_ONE: bool = true;
 
 pub fn gemma4_forward_ops(config: &gemma_spec::Gemma4TextConfig) -> Vec<Gemma4Op> {
@@ -89,6 +106,81 @@ pub fn gemma4_forward_ops(config: &gemma_spec::Gemma4TextConfig) -> Vec<Gemma4Op
     ops
 }
 
+pub fn gemma4_launcher_kind(op: Gemma4Op) -> Gemma4LauncherKind {
+    match op {
+        Gemma4Op::TokenEmbedding => Gemma4LauncherKind::TokenEmbedding,
+        Gemma4Op::PerLayerEmbedding => Gemma4LauncherKind::PerLayerEmbedding,
+        Gemma4Op::PreAttentionRmsNorm | Gemma4Op::PreMlpRmsNorm | Gemma4Op::FinalRmsNorm => {
+            Gemma4LauncherKind::GemmaRmsNorm
+        }
+        Gemma4Op::QProj
+        | Gemma4Op::KProj
+        | Gemma4Op::VProj
+        | Gemma4Op::OProj
+        | Gemma4Op::GateProj
+        | Gemma4Op::UpProj
+        | Gemma4Op::DownProj
+        | Gemma4Op::LmHead => Gemma4LauncherKind::QuantizedGemv,
+        Gemma4Op::QNorm | Gemma4Op::KNorm => Gemma4LauncherKind::QkNorm,
+        Gemma4Op::StandardRope => Gemma4LauncherKind::RopeStandard,
+        Gemma4Op::ProportionalRope => Gemma4LauncherKind::RopeProportional,
+        Gemma4Op::SlidingWindowAttention => Gemma4LauncherKind::SlidingWindowAttention,
+        Gemma4Op::GlobalAttention => Gemma4LauncherKind::GlobalAttention,
+        Gemma4Op::GeGlu => Gemma4LauncherKind::GeGlu,
+        Gemma4Op::AttentionResidual | Gemma4Op::MlpResidual => Gemma4LauncherKind::Add,
+        Gemma4Op::Router => Gemma4LauncherKind::MoeRouter,
+        Gemma4Op::RoutedExperts | Gemma4Op::SharedExpert => Gemma4LauncherKind::MoeExperts,
+    }
+}
+
+pub fn gemma4_launcher_sequence(config: &gemma_spec::Gemma4TextConfig) -> Vec<Gemma4LauncherKind> {
+    gemma4_forward_ops(config)
+        .into_iter()
+        .map(gemma4_launcher_kind)
+        .collect()
+}
+
+pub fn gemma4_effective_norm_weight(raw_weight: f32) -> f32 {
+    if GEMMA4_RMS_NORM_ADDS_ONE {
+        raw_weight + 1.0
+    } else {
+        raw_weight
+    }
+}
+
+#[cfg(feature = "vulkan")]
+pub fn gemma4_kernel_for_launcher(kind: Gemma4LauncherKind) -> vulkan_kernels::Kernel {
+    match kind {
+        Gemma4LauncherKind::TokenEmbedding | Gemma4LauncherKind::PerLayerEmbedding => {
+            vulkan_kernels::Kernel::GetRows
+        }
+        Gemma4LauncherKind::GemmaRmsNorm | Gemma4LauncherKind::QkNorm => {
+            vulkan_kernels::Kernel::RmsNorm
+        }
+        Gemma4LauncherKind::QuantizedGemv
+        | Gemma4LauncherKind::MoeRouter
+        | Gemma4LauncherKind::MoeExperts => vulkan_kernels::Kernel::GemvQ4K,
+        Gemma4LauncherKind::RopeStandard | Gemma4LauncherKind::RopeProportional => {
+            vulkan_kernels::Kernel::RopeNeox
+        }
+        Gemma4LauncherKind::SlidingWindowAttention | Gemma4LauncherKind::GlobalAttention => {
+            vulkan_kernels::Kernel::FlashAttn
+        }
+        Gemma4LauncherKind::GeGlu => vulkan_kernels::Kernel::GeGlu,
+        Gemma4LauncherKind::Add => vulkan_kernels::Kernel::Add,
+    }
+}
+
+#[cfg(feature = "vulkan")]
+pub fn gemma4_forward_kernel_sequence(
+    config: &gemma_spec::Gemma4TextConfig,
+) -> Vec<vulkan_kernels::Kernel> {
+    gemma4_launcher_sequence(config)
+        .into_iter()
+        .map(gemma4_kernel_for_launcher)
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gemma4KvShape {
     pub local_window: usize,
@@ -126,9 +218,9 @@ impl VulkanGemma4Model {
         _token: u32,
         _start_pos: usize,
     ) -> anyhow::Result<Vec<f32>> {
+        let _ = gemma4_forward_kernel_sequence(&self.config);
         anyhow::bail!(
-            "Vulkan Gemma4 numeric forward is blocked: p-RoPE/global-KV sharing and Gemma \
-             RMSNorm(+1) kernels are not validated yet"
+            "Vulkan Gemma4 numeric forward requires weight/KV residency binding for the launcher sequence"
         )
     }
 }
@@ -195,5 +287,44 @@ mod tests {
         assert_eq!(shape.local_head_dim, 256);
         assert_eq!(shape.global_head_dim, 512);
         assert_eq!(shape.shared_global_layers, 3);
+    }
+
+    #[test]
+    fn gemma4_launcher_sequence_tracks_attention_and_norm_variants() {
+        let cfg = config();
+        let kinds = gemma4_launcher_sequence(&cfg);
+        assert_eq!(kinds.first(), Some(&Gemma4LauncherKind::TokenEmbedding));
+        assert!(kinds.contains(&Gemma4LauncherKind::PerLayerEmbedding));
+        assert!(kinds.contains(&Gemma4LauncherKind::GemmaRmsNorm));
+        assert!(kinds.contains(&Gemma4LauncherKind::QkNorm));
+        assert!(kinds.contains(&Gemma4LauncherKind::SlidingWindowAttention));
+        assert!(kinds.contains(&Gemma4LauncherKind::GlobalAttention));
+        assert!(kinds.contains(&Gemma4LauncherKind::RopeProportional));
+        assert!(kinds.contains(&Gemma4LauncherKind::GeGlu));
+        assert_eq!(kinds.len(), gemma4_forward_ops(&cfg).len());
+    }
+
+    #[test]
+    fn gemma4_norm_weight_adds_one_is_pinned() {
+        assert_eq!(gemma4_effective_norm_weight(0.0), 1.0);
+        assert_eq!(gemma4_effective_norm_weight(-0.25), 0.75);
+        assert!(GEMMA4_RMS_NORM_ADDS_ONE);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn gemma4_launcher_classes_map_to_kernels() {
+        assert_eq!(
+            gemma4_kernel_for_launcher(Gemma4LauncherKind::GeGlu),
+            vulkan_kernels::Kernel::GeGlu
+        );
+        assert_eq!(
+            gemma4_kernel_for_launcher(Gemma4LauncherKind::SlidingWindowAttention),
+            vulkan_kernels::Kernel::FlashAttn
+        );
+        assert_eq!(
+            gemma4_kernel_for_launcher(Gemma4LauncherKind::GemmaRmsNorm),
+            vulkan_kernels::Kernel::RmsNorm
+        );
     }
 }
