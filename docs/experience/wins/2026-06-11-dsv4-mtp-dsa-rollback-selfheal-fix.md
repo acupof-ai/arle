@@ -142,3 +142,49 @@ ckl's `ServeSpecOptions` serve-spec infra from `c1655675`). Plumb:
 (currently at `1e0f05e1` + the git-applied MTP patches; #16 builds on ckl's
 `c1655675` infra which post-dates that tree). Default flip still gated on the
 multi-seed recall (#20) + depth decision.
+
+## UPDATE — #20 multi-seed long-ctx recall: MTP is RECALL-NEUTRAL (2026-06-11)
+
+The depth-1 validation's caveat (one n=2 run at 446/2000 showed MTP `partial=2`
+vs a baseline `exact=2`) is **resolved as non-determinism floor, not regression**.
+Ran the needle gate (`scripts/dsv4_needle_gate.py`, runs=5 same-config repeats,
+greedy temp=0, secret `738291`) against the **baseline** serve (no MTP, pod
+`19383a43`, 8×H20 TP=8/EP=8, port 18188):
+
+| len | baseline (no MTP) runs=5 | det? |
+|---|---|---|
+| 446  | **exact=3 partial=2 miss=0** | NONDET |
+| 1000 | exact=5 partial=0 miss=0 | NONDET |
+| 2000 | **exact=3 partial=2 miss=0** | NONDET |
+
+The baseline ITSELF partials at 446 and 2000 (outputs `7381` / `738738` — it
+recalls `738` then the MoE atomic-scatter order flips digit 4+ run-to-run). The
+MTP `partial=2` was one draw from this **identical** distribution at the **same
+two lengths**. MTP is recall-neutral by construction (batched verify commits
+exactly the target's per-position argmax, so its token stream ≡ baseline greedy
+except through the same non-determinism the baseline already has) and the
+empirical baseline floor seals it. Vindicates the project gate: correct-inference
+= needle + same-config-twice floor, NOT byte-identity (MoE non-determinism).
+
+**Optional final seal (deferred, not blocking):** matched MTP-on runs=5 at the
+same lengths to confirm the exact/partial split lands within the baseline floor.
+Requires evicting the live baseline serve to free the 8 GPUs for an MTP serve —
+a ckl-owned call, not done unilaterally.
+
+## Default-on decision (#62 exit): KEEP OPT-IN, not default-on yet
+
+Depth-1 MTP is a **validated opt-in win**, not yet a default flip:
+- ✓ correctness: needle gate clean ×2, recall-neutral (this update)
+- ✓ perf: +39% 问答 / +47% 客服 B=1 decode (accept 86/93%)
+- ✗ default-on license INCOMPLETE: the project default-flip rule needs ≥2
+  binding production shapes cleared on TTFT *and* ITL *and* output-throughput
+  with wall-clock framing; MTP is benched on decode-tok/s for 2 chat shapes, no
+  prefill/TTFT-regression check. Plus the current build's single-row-forward
+  limitation (`DSv4 CUDA prefill/mixed forward is single-row only`) interacts
+  with batched serving — the batched lane must clear before a global default.
+- Depth-K: KILLED (draft-quality wall, accept 1/4 @ K=4 — see
+  `errors/2026-06-11-dsv4-mtp-depth-k-draft-quality-wall.md`).
+
+Verdict: ship `--spec-type mtp --mtp-draft-tokens 1` as the documented opt-in;
+default-on revisited after (a) the batched/single-row lane lands and (b) a
+multi-shape wall-clock TTFT+ITL+throughput sweep.
