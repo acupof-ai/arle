@@ -58,7 +58,7 @@ impl ServeHttpOptions {
 ///
 /// Errors before binding if no backend was compiled in, if the model / tokenizer
 /// fails to load, or if the address is already in use.
-#[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
+#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
 pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
     use anyhow::Context;
 
@@ -90,14 +90,14 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
 }
 
 /// Backend-absent build: report the same way `--doctor` does and return an error.
-#[cfg(not(any(feature = "metal", feature = "cuda", feature = "cpu")))]
+#[cfg(not(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu")))]
 pub fn serve_http(_opts: ServeHttpOptions) -> Result<()> {
     anyhow::bail!(
         "serve requires a backend build; rebuild with cuda, metal/no-cuda, or cpu/no-cuda"
     )
 }
 
-#[cfg(any(feature = "metal", feature = "cuda", feature = "cpu"))]
+#[cfg(any(feature = "metal", feature = "cuda", feature = "hip", feature = "cpu"))]
 async fn shutdown_signal() {
     if tokio::signal::ctrl_c().await.is_ok() {
         log::info!("shutdown signal received");

@@ -27,8 +27,10 @@ pub(crate) enum GpuInfo {
 pub(crate) enum CompiledBackend {
     Cuda,
     Metal,
+    #[cfg(feature = "hip")]
+    Hip,
     Cpu,
-    #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+    #[cfg(not(any(feature = "cuda", feature = "metal", feature = "hip", feature = "cpu")))]
     None,
 }
 
@@ -43,11 +45,15 @@ impl CompiledBackend {
         {
             return Self::Metal;
         }
+        #[cfg(feature = "hip")]
+        {
+            return Self::Hip;
+        }
         #[cfg(feature = "cpu")]
         {
             return Self::Cpu;
         }
-        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "hip", feature = "cpu")))]
         {
             Self::None
         }
@@ -57,19 +63,26 @@ impl CompiledBackend {
         match self {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
+            #[cfg(feature = "hip")]
+            Self::Hip => "hip",
             Self::Cpu => "cpu",
-            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            #[cfg(not(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "hip",
+                feature = "cpu"
+            )))]
             Self::None => "none",
         }
     }
 
     pub(crate) fn supports_inference(self) -> bool {
         let _ = self;
-        #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "hip", feature = "cpu"))]
         {
             true
         }
-        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "hip", feature = "cpu")))]
         {
             false
         }
@@ -103,6 +116,10 @@ impl SystemInfo {
                 } => *unified_memory_gb * 0.75, // leave headroom for OS
                 _ => 0.0,
             },
+            // No host AMD-GPU probe yet (the catalog has no HIP entries either);
+            // report 0 rather than a fictional VRAM figure.
+            #[cfg(feature = "hip")]
+            CompiledBackend::Hip => 0.0,
             CompiledBackend::Cpu => {
                 if self.available_ram_gb > 0.0 {
                     self.available_ram_gb
@@ -110,7 +127,12 @@ impl SystemInfo {
                     self.total_ram_gb * 0.75
                 }
             }
-            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            #[cfg(not(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "hip",
+                feature = "cpu"
+            )))]
             CompiledBackend::None => 0.0,
         }
     }
@@ -226,7 +248,17 @@ mod tests {
             CompiledBackend::Cuda | CompiledBackend::Metal | CompiledBackend::Cpu => {
                 assert!(info.effective_memory_gb() > 0.0);
             }
-            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            // No host AMD-GPU probe yet — effective memory reports 0.
+            #[cfg(feature = "hip")]
+            CompiledBackend::Hip => {
+                assert_eq!(info.effective_memory_gb(), 0.0);
+            }
+            #[cfg(not(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "hip",
+                feature = "cpu"
+            )))]
             CompiledBackend::None => {
                 assert_eq!(info.effective_memory_gb(), 0.0);
             }

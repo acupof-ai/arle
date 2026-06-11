@@ -77,6 +77,7 @@ pub(crate) enum ServeBackendArg {
     Cpu,
     Metal,
     Cuda,
+    Hip,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
