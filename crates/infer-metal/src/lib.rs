@@ -22,6 +22,8 @@ mod model_source;
 #[cfg(feature = "metal")]
 mod qwen35;
 #[cfg(feature = "metal")]
+mod resource;
+#[cfg(feature = "metal")]
 mod weights;
 #[cfg(feature = "metal")]
 mod wired_limit;
@@ -34,3 +36,5 @@ pub use kv_pool::MetalKvPool;
 pub use mlx::{AllocatorMemory, allocator_memory, clear_metal_cache};
 #[cfg(feature = "metal")]
 pub use model_source::resolve_model_path;
+#[cfg(feature = "metal")]
+pub use resource::{MetalResourcePlan, MetalResourceRequest, plan_resource_budget};

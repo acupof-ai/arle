@@ -217,8 +217,55 @@ impl MetalExecutor {
     ) -> anyhow::Result<Self> {
         let model_source = model_path.as_ref().to_string_lossy();
         let resolved = model_source::resolve_model_path(&model_source)?;
+        let resource_plan = crate::resource::plan_resource_budget(
+            &resolved,
+            crate::resource::MetalResourceRequest {
+                kv_cache_dtype,
+                num_slots: 1,
+                total_pages: 8192,
+                page_size: 16,
+                low_impact: true,
+                memory_budget_bytes: None,
+                system_reserve_bytes: None,
+                allow_swap: false,
+            },
+        )?;
+        Self::from_resolved_model_path_with_plan(&resolved, kv_cache_dtype, Some(resource_plan))
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn from_model_path_with_kv_cache_dtype_and_resource_plan(
+        model_path: impl AsRef<Path>,
+        kv_cache_dtype: MetalKvCacheDtype,
+        resource_plan: crate::resource::MetalResourcePlan,
+    ) -> anyhow::Result<Self> {
+        let model_source = model_path.as_ref().to_string_lossy();
+        let resolved = model_source::resolve_model_path(&model_source)?;
+        Self::from_resolved_model_path_with_plan(&resolved, kv_cache_dtype, Some(resource_plan))
+    }
+
+    #[cfg(feature = "metal")]
+    fn from_resolved_model_path_with_plan(
+        resolved: &Path,
+        kv_cache_dtype: MetalKvCacheDtype,
+        resource_plan: Option<crate::resource::MetalResourcePlan>,
+    ) -> anyhow::Result<Self> {
         let _guard = mlx_sys::mlx_guard();
-        if let Some(limit) = wired_limit::auto_wired_limit_bytes(&resolved) {
+        if let Some(plan) = resource_plan {
+            let previous_memory = mlx::set_memory_limit_bytes(plan.memory_limit_bytes as u64);
+            let previous_cache = mlx::set_cache_limit_bytes(plan.cache_limit_bytes as u64);
+            let previous_wired = mlx::set_wired_limit_bytes(plan.wired_limit_bytes as u64);
+            eprintln!("[infer-metal] resource guard: {}", plan.describe());
+            log::info!(
+                "Metal resource guard set MLX limits: memory={} (previous {}), cache={} (previous {}), wired={} (previous {})",
+                plan.memory_limit_bytes,
+                previous_memory,
+                plan.cache_limit_bytes,
+                previous_cache,
+                plan.wired_limit_bytes,
+                previous_wired
+            );
+        } else if let Some(limit) = wired_limit::auto_wired_limit_bytes(resolved) {
             let previous = mlx::set_wired_limit_bytes(limit as u64);
             log::info!(
                 "Metal executor wired limit set to {} bytes (previous {})",
@@ -226,12 +273,12 @@ impl MetalExecutor {
                 previous
             );
         }
-        let config = config::load_metal_config(&resolved)?;
+        let config = config::load_metal_config(resolved)?;
         if kv_cache_dtype == MetalKvCacheDtype::Int8 {
             validate_int8_kv_config(&config)?;
         }
         eprintln!("[infer-metal] kv cache dtype = {}", kv_cache_dtype.label());
-        let weights = qwen35::load_qwen35_metal_weights(&resolved, &config)?;
+        let weights = qwen35::load_qwen35_metal_weights(resolved, &config)?;
         Ok(Self {
             real: Some(RealMetalExecutor {
                 config,
@@ -1146,7 +1193,7 @@ fn validate_int8_kv_config(config: &config::MetalModelConfig) -> anyhow::Result<
 }
 
 #[cfg(feature = "metal")]
-fn int8_kv_group_size(head_dim: usize) -> anyhow::Result<usize> {
+pub(crate) fn int8_kv_group_size(head_dim: usize) -> anyhow::Result<usize> {
     if head_dim.is_multiple_of(128) {
         Ok(128)
     } else if head_dim.is_multiple_of(64) {
