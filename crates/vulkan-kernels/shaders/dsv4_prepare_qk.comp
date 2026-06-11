@@ -1,0 +1,83 @@
+#version 450
+// ARLE Vulkan shader ported from crates/cuda-kernels/csrc/misc/dsv4_attention.cu
+// dsv4_prepare_qk_fused_kernel. No standalone llama.cpp equivalent exists (MIT).
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint local_heads;
+    uint head_dim;
+    uint rope_dim;
+    uint start_pos;
+    float eps;
+    float rope_base;
+    uint orig_seq_len;
+    float factor;
+    float beta_fast;
+    float beta_slow;
+} p;
+
+layout(binding = 0) readonly buffer QRaw {
+    float q_raw[];
+};
+
+layout(binding = 1) readonly buffer KRaw {
+    float k_raw[];
+};
+
+layout(binding = 2) writeonly buffer QOut {
+    float q_out[];
+};
+
+layout(binding = 3) writeonly buffer KOut {
+    float k_out[];
+};
+
+void apply_rope(inout float a, inout float b, uint pair_idx) {
+    if (p.rope_dim == 0) {
+        return;
+    }
+    const float theta = pow(p.rope_base, -2.0 * float(pair_idx) / float(p.rope_dim));
+    const float angle = float(p.start_pos) * theta;
+    const float c = cos(angle);
+    const float s = sin(angle);
+    const float old_a = a;
+    a = old_a * c - b * s;
+    b = old_a * s + b * c;
+}
+
+void main() {
+    const uint row = gl_GlobalInvocationID.x;
+    if (row < p.local_heads) {
+        float ss = 0.0;
+        const uint base = row * p.head_dim;
+        for (uint d = 0; d < p.head_dim; ++d) {
+            const float v = q_raw[base + d];
+            ss += v * v;
+        }
+        const float scale = inversesqrt(ss / max(float(p.head_dim), 1.0) + p.eps);
+        for (uint d = 0; d < p.head_dim; ++d) {
+            q_out[base + d] = q_raw[base + d] * scale;
+        }
+        const uint rope_start = p.head_dim - min(p.rope_dim, p.head_dim);
+        for (uint d = 0; d + 1 < p.rope_dim && rope_start + d + 1 < p.head_dim; d += 2) {
+            float a = q_raw[base + rope_start + d] * scale;
+            float b = q_raw[base + rope_start + d + 1] * scale;
+            apply_rope(a, b, d / 2);
+            q_out[base + rope_start + d] = a;
+            q_out[base + rope_start + d + 1] = b;
+        }
+    } else if (row == p.local_heads) {
+        for (uint d = 0; d < p.head_dim; ++d) {
+            k_out[d] = k_raw[d];
+        }
+        const uint rope_start = p.head_dim - min(p.rope_dim, p.head_dim);
+        for (uint d = 0; d + 1 < p.rope_dim && rope_start + d + 1 < p.head_dim; d += 2) {
+            float a = k_raw[rope_start + d];
+            float b = k_raw[rope_start + d + 1];
+            apply_rope(a, b, d / 2);
+            k_out[rope_start + d] = a;
+            k_out[rope_start + d + 1] = b;
+        }
+    }
+}

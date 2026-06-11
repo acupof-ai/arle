@@ -51,7 +51,7 @@ impl std::error::Error for VulkanError {}
 #[cfg(feature = "vulkan")]
 mod real {
     use super::{Result, VulkanError};
-    use ash::{Entry, vk};
+    use ash::{vk, Entry};
     use std::ffi::{CStr, CString};
 
     fn runtime_error(context: &str, err: impl std::fmt::Display) -> VulkanError {
@@ -624,11 +624,30 @@ mod real {
             shader: &ShaderModule<'_>,
             descriptor_layouts: &[&DescriptorSetLayout<'_>],
         ) -> Result<Self> {
+            Self::create_with_push_constants(ctx, shader, descriptor_layouts, 0)
+        }
+
+        pub fn create_with_push_constants(
+            ctx: &'a VulkanContext,
+            shader: &ShaderModule<'_>,
+            descriptor_layouts: &[&DescriptorSetLayout<'_>],
+            push_constant_bytes: u32,
+        ) -> Result<Self> {
             let set_layouts: Vec<_> = descriptor_layouts
                 .iter()
                 .map(|layout| layout.raw())
                 .collect();
-            let layout_create = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+            let push_ranges = if push_constant_bytes == 0 {
+                Vec::new()
+            } else {
+                vec![vk::PushConstantRange::default()
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .offset(0)
+                    .size(push_constant_bytes)]
+            };
+            let layout_create = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(&push_ranges);
             let layout = unsafe { ctx.device.create_pipeline_layout(&layout_create, None) }
                 .map_err(|e| vk_error("creating Vulkan pipeline layout", e))?;
             let entry =
@@ -689,8 +708,8 @@ mod real {
 
 #[cfg(feature = "vulkan")]
 pub use real::{
-    CommandPool, ComputePipeline, DescriptorSet, DescriptorSetLayout, DeviceBuffer, ShaderModule,
-    VulkanContext, device_count, device_name, init,
+    device_count, device_name, init, CommandPool, ComputePipeline, DescriptorSet,
+    DescriptorSetLayout, DeviceBuffer, ShaderModule, VulkanContext,
 };
 
 #[cfg(not(feature = "vulkan"))]
@@ -810,13 +829,22 @@ mod stub {
         ) -> Result<Self> {
             Err(VULKAN_NOT_COMPILED)
         }
+
+        pub fn create_with_push_constants(
+            _ctx: &'a VulkanContext,
+            _shader: &ShaderModule<'_>,
+            _descriptor_layouts: &[&DescriptorSetLayout<'_>],
+            _push_constant_bytes: u32,
+        ) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
     }
 }
 
 #[cfg(not(feature = "vulkan"))]
 pub use stub::{
-    CommandPool, ComputePipeline, DescriptorSet, DescriptorSetLayout, DeviceBuffer, ShaderModule,
-    VulkanContext, device_count, device_name, init,
+    device_count, device_name, init, CommandPool, ComputePipeline, DescriptorSet,
+    DescriptorSetLayout, DeviceBuffer, ShaderModule, VulkanContext,
 };
 
 #[cfg(test)]
