@@ -4,12 +4,15 @@ import type { TopNavLink } from "../data/content.ts";
 interface Props {
   left: string;
   links: TopNavLink[];
+  /** Bordered language-switch link rendered first in the nav. */
+  lang?: TopNavLink;
 }
-const { left, links } = Astro.props;
+const { left, links, lang } = Astro.props;
 ---
 <header class="masthead">
   <span class="left">{left}</span>
   <nav class="right" aria-label="primary">
+    {lang && <a class="lang" href={lang.href}>{lang.label}</a>}
     {links.map((l) => <a href={l.href}>{l.label}</a>)}
   </nav>
 </header>
@@ -34,6 +37,7 @@ const { left, links } = Astro.props;
   }
   .right {
     display: flex;
+    align-items: baseline;
     gap: 22px;
     flex-wrap: nowrap;
     flex: none;
@@ -45,4 +49,16 @@ const { left, links } = Astro.props;
     transition: color var(--t-base);
   }
   .right a:hover { color: var(--ink); }
+  .right a.lang {
+    border: 1px solid var(--line);
+    color: var(--ink-soft);
+    padding: 3px 10px;
+    letter-spacing: 0.14em;
+    transition: border-color var(--t-base), color var(--t-base);
+  }
+  .right a.lang:hover { border-color: var(--ink); color: var(--ink); }
+
+  @media (max-width: 760px) {
+    .right { flex-wrap: wrap; white-space: normal; gap: 10px 16px; justify-content: flex-end; }
+  }
 </style>
