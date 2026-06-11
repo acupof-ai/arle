@@ -63,11 +63,13 @@ Backend-specific (stays put — genuinely not shared):
 ## Phased landing (small committed tranches, bench/wins each)
 
 - **Phase B ✅ (`15ec44cd`):** added `infer-seam/src/resource.rs` (pure kernel +
-  10 unit tests). Shipped behavior-neutral (no consumers wired yet). The Metal
-  `plan_resource_budget` re-route is split out as **B′ (optional, deferred)** —
-  Metal is already top-down-correct; routing it through the kernel is pure
-  convergence with a byte-identical gate, not a fix, so it follows the bug-fix
-  tranches.
+  10 unit tests). Shipped behavior-neutral (no consumers wired yet).
+- **Phase B′ ✅ (`e5ad704f`):** Metal `plan_resource_budget` re-routed through
+  the kernel (`fits_fixed` guard, `from_limit` + `affordable()`,
+  `clamp_to_affordable`). Byte-identical (`saturating_sub` == `-` after the
+  guard; nested-floor identity for pages; `.max(1)` a proven no-op);
+  `MetalResourcePlan`/`describe()` unchanged. Locked by a new byte-identity
+  unit test (fits + clamps + tight regimes).
 - **Phase C1 ✅ (`a23336eb`):** DSv4 `kv_budget_num_slots` routes through the
   kernel. **Byte-identical** (`from_free` reproduces `floor(free×0.9)−Σfixed`;
   the two saturating_subs fold, proven in a unit test). NCCL min-reduce stays
@@ -84,9 +86,9 @@ Backend-specific (stays put — genuinely not shared):
   host (the pod) is byte-identical and a constrained one scales down; probe miss
   → cap. 7/7 kv_tier tests (incl. new probe tests).
 
-**Convergence reached:** VRAM (C1+C2) and host RAM/SSD (C3) all flow through the
-one neutral infer-seam kernel. Only B′ (Metal re-route) remains, and it is
-optional polish, not a correctness gap.
+**Convergence complete:** VRAM (DSv4 C1 + Qwen3.5/3.6 C2), host RAM/SSD (C3),
+and Metal (B′) all flow through the one neutral infer-seam kernel. No fragmented
+budget surface remains.
 
 Each phase: `cargo test --workspace` + clippy clean + wins/ entry (or
 `pending-remote` for pod-only). No default-flip without a wall-clock license
