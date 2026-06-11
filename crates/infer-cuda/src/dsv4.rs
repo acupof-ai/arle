@@ -1062,7 +1062,7 @@ impl Dsv4Model {
         }
 
         let (stream, mut keepalive) =
-            self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos)?;
+            self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, false)?;
         if let Some(out) = last_hidden_out.as_deref_mut() {
             self.capture_mtp_stream_hidden(&stream, seq_len - 1, out, &mut keepalive)?;
         }
@@ -1104,7 +1104,7 @@ impl Dsv4Model {
                 slot.capture_spec_rollback(&self.ctx, kv_adapter, start_pos + 1)?;
             }
             let (stream, mut keepalive) =
-                self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos)?;
+                self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, true)?;
             let mut h0 = DeviceVec::zeros(&self.ctx, stream_dim)?;
             let mut h1 = DeviceVec::zeros(&self.ctx, stream_dim)?;
             self.capture_mtp_stream_hidden(&stream, 0, &mut h0, &mut keepalive)?;
@@ -1136,7 +1136,7 @@ impl Dsv4Model {
             let row_start = start_pos + row;
             let row_position = position + row as u64;
             let (stream, mut keepalive) =
-                self.forward_tokens_stream_impl(slot, kv_adapter, &[token_id], row_start)?;
+                self.forward_tokens_stream_impl(slot, kv_adapter, &[token_id], row_start, false)?;
             let mut row_hidden =
                 DeviceVec::zeros(&self.ctx, self.config.hidden_size * self.config.hc_mult)?;
             self.capture_mtp_stream_hidden(&stream, 0, &mut row_hidden, &mut keepalive)?;
@@ -1776,6 +1776,13 @@ impl Dsv4Model {
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         tokens: &[u32],
         start_pos: usize,
+        // When true (MTP batched verify only), run attention PER TOKEN on the
+        // seq_len==1 decode path (device start_pos → FlashMLA/DSA decode), in
+        // order so token r+1 attends to token r's just-written KV — point-wise/
+        // MoE stay batched for the weight-read amortization. The batched
+        // (host-start_pos) compressed/DSA path is incorrect for a small chunk at
+        // a fully-populated mid-sequence position; prefill keeps it (false).
+        per_token_attn: bool,
     ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
         ensure!(
             !tokens.is_empty(),
@@ -1841,6 +1848,26 @@ impl Dsv4Model {
         keepalive.keep_hidden(&stream);
         drop(nvtx_embed);
         self.dump_tail_row("init_stream", &stream, start_pos);
+        // Per-token verify attention scratch (one [hidden,1] row), reused across
+        // layers. Allocated only on the verify path; keepalive'd against the
+        // disabled-event-tracking premature-free hazard.
+        // Separate device start_pos buffer (the function-level `start_pos_device`
+        // immutably borrows `slot.start_pos_device` for the whole fn, so the loop
+        // needs its own).
+        let (mut normed_row, mut attn_out_row, mut verify_pos_dev) = if per_token_attn {
+            let nr = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
+            let ar = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
+            let pos = self
+                .ctx
+                .stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| anyhow!("DSv4 verify pos buffer alloc failed: {e}"))?;
+            keepalive.keep_hidden(&nr);
+            keepalive.keep_hidden(&ar);
+            (Some(nr), Some(ar), Some(pos))
+        } else {
+            (None, None, None)
+        };
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC-wrap MLA attention.
@@ -1869,7 +1896,57 @@ impl Dsv4Model {
             keepalive.keep_hidden(&normed);
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            {
+            if per_token_attn && seq_len > 1 {
+                // MTP verify: attention PER TOKEN on the seq_len==1 decode path
+                // (device start_pos), in order so token r+1 attends to token r's
+                // just-written KV. Mirrors forward_decode_batch's Step-A loop and
+                // the (correct) non-batched verify; avoids the broken batched
+                // host-start_pos compressed/DSA path at a mid-sequence chunk.
+                let _nvtx = crate::nvtx::range("dsv4/mla_attn_per_token");
+                let normed_row = normed_row.as_mut().expect("per-token verify scratch");
+                let attn_out_row = attn_out_row.as_mut().expect("per-token verify scratch");
+                let verify_pos_dev = verify_pos_dev.as_mut().expect("per-token verify scratch");
+                let (layer_pool, mut dsa_shared) =
+                    kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                for r in 0..seq_len {
+                    let pos_r = start_pos + r;
+                    let pos_r_i32 = i32::try_from(pos_r)
+                        .map_err(|_| anyhow!("DSv4 verify pos {pos_r} overflows i32"))?;
+                    self.ctx
+                        .stream
+                        .memcpy_htod(&[pos_r_i32], verify_pos_dev)
+                        .map_err(|e| anyhow!("DSv4 verify start_pos H2D failed: {e}"))?;
+                    let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
+                    self.ctx
+                        .stream
+                        .memcpy_dtod(&src, &mut normed_row.data)
+                        .map_err(|e| anyhow!("DSv4 verify attn copy-in failed: {e}"))?;
+                    crate::attention::mla_attention(
+                        &self.ctx,
+                        &self.config,
+                        &layer.attention,
+                        layer.mode,
+                        layer.compress_ratio,
+                        layer_idx,
+                        &*normed_row,
+                        &mut slot.attention[layer_idx],
+                        layer_pool,
+                        dsa_shared.as_deref_mut(),
+                        pos_r,
+                        Some(&*verify_pos_dev),
+                        &self.tp,
+                        attn_out_row,
+                        &mut keepalive,
+                    )?;
+                    let mut dst = attn_out
+                        .data
+                        .slice_mut(r * hidden_size..(r + 1) * hidden_size);
+                    self.ctx
+                        .stream
+                        .memcpy_dtod(&attn_out_row.data, &mut dst)
+                        .map_err(|e| anyhow!("DSv4 verify attn copy-out failed: {e}"))?;
+                }
+            } else {
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn");
                 crate::stage_profile::profile(ctx, "dsv4/stage/mla_attn", || {
                     let (layer_pool, dsa_shared) =
