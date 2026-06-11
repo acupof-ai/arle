@@ -336,6 +336,30 @@ pub fn set_wired_limit_bytes(limit: u64) -> u64 {
     previous
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatorMemory {
+    pub active_bytes: usize,
+    pub peak_bytes: usize,
+    pub cache_bytes: usize,
+}
+
+pub fn allocator_memory() -> AllocatorMemory {
+    let stats = AllocatorMemory {
+        active_bytes: unsafe { mlx_sys::mlx_get_active_memory() },
+        peak_bytes: unsafe { mlx_sys::mlx_get_peak_memory() },
+        cache_bytes: unsafe { mlx_sys::mlx_get_cache_memory() },
+    };
+    panic_if_mlx_error("mlx allocator memory stats");
+    stats
+}
+
+pub fn clear_metal_cache() {
+    unsafe {
+        mlx_sys::mlx_metal_clear_cache();
+    }
+    panic_if_mlx_error("mlx_metal_clear_cache");
+}
+
 pub fn load_safetensors(path: &str) -> anyhow::Result<std::collections::HashMap<String, MlxArray>> {
     let path = std::ffi::CString::new(path)?;
     let mut names: *mut *const i8 = std::ptr::null_mut();

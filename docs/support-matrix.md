@@ -127,8 +127,8 @@ below is the one-glance view — for any change, edit
 
 | Capability | Status | One-line |
 | --- | --- | --- |
-| BF16 KV cache | production | Default via `--kv-cache-dtype auto`; correctness-safe reference. |
-| INT8 KV cache (CUDA) | production | `--kv-cache-dtype int8`; per-(token, head) /127; +57–113% throughput vs BF16 on A100 (`wins/2026-05-26-bench-int8-vs-bf16-kv-a100`). |
+| BF16 KV cache | production | Explicit reference via `--kv-cache-dtype bf16`; correctness-safe fallback. |
+| INT8 KV cache (Metal + CUDA) | production (Metal default; CUDA production) | Metal `--kv-cache-dtype auto` resolves to `int8` and stores full-attention K/V as MLX affine 8-bit packed triples; `bf16` remains the explicit fallback. CUDA `--kv-cache-dtype int8` uses KIVI per-channel K + per-row V; +57–113% throughput vs BF16 on A100 (`wins/2026-05-26-bench-int8-vs-bf16-kv-a100`). |
 | FP8 E4M3 KV cache (CUDA, +KIVI) | opt-in | `--kv-cache-dtype fp8`; KIVI per-channel K + per-token V scaffolding (`8c6d92db`/`73a72615`/`25c7d409`); quality verdict deferred pending §5 paged-prefill investigation. |
 | TurboQuant KV 2/3/4-bit (CUDA) | experimental | `--kv-cache-dtype tq{2,3,4}`; FWHT + packed indices; page_size=1 bypasses the HD128 paged prefill — the only KV format that matches the HF first token on the 2026-05-27 chat audit. |
 | Weights — W4A16 / W8A16 / W2A16 | production / experimental (W2) | Native GEMV + Marlin W4 prefill; safetensors auto-detect. |
@@ -138,10 +138,10 @@ below is the one-glance view — for any change, edit
 | Weights — DSv4 FP8/FP4 block-scaled | in progress | `Dsv4Fp8BlockScaled` / `Dsv4Fp4BlockScaled`; pending CUDA V4 attention/MoE/MTP kernels. |
 
 Backend reach:
-- Quantized KV cache is **CUDA-only** today. Metal stores KV in the
-  model's native dtype (`bf16` / `f16`) and does not expose
-  `--kv-cache-dtype`. Metal weight-quantized MLX models are
-  unaffected.
+- Quantized KV cache is supported on Metal for INT8 only. Metal `auto`
+  defaults to INT8 full-attention KV (MLX affine 8-bit groups) with
+  `--kv-cache-dtype bf16` as the reference fallback. Metal does not support
+  FP8/TurboQuant KV. Metal weight-quantized MLX models are unaffected.
 
 ---
 
