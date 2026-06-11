@@ -139,6 +139,16 @@ impl KvAllocator for HostPagedKvPool {
             .collect())
     }
 
+    fn free_detached_pages(&mut self, pages: &[u32]) {
+        for &page in pages {
+            debug_assert!(
+                self.page_refs.get(&page).copied().unwrap_or(0) == 0,
+                "free_detached_pages: page {page} is retained"
+            );
+            self.free.push(page);
+        }
+    }
+
     fn free_slot(&mut self, slot: usize) {
         let Some(pages) = self.slot_pages.get_mut(slot) else {
             return;
