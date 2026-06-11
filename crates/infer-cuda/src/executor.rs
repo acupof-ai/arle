@@ -2009,6 +2009,11 @@ impl Qwen35CudaExecutor {
             model_path.as_ref(),
             max_seq_len,
         )?;
+        // Dynamic KV mem budget (unified with DSv4 via the infer-seam kernel):
+        // clamp num_slots to what post-weights free VRAM affords. Qwen3.5/3.6
+        // previously admitted the requested count as-is → OOM at large
+        // max_seq_len. Deterministic + NCCL min-reduced ⇒ TP-consistent.
+        let num_slots = model.kv_budget_num_slots(num_slots)?;
         let mut slots = Vec::with_capacity(num_slots);
         for _ in 0..num_slots {
             slots.push(model.new_slot_state()?);
