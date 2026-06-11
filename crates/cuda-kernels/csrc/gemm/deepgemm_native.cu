@@ -935,6 +935,14 @@ std::vector<Layout> get_bf16_layout_candidates(const GemmDesc& desc, bool masked
   return candidates;
 }
 
+// Defined below with the FP8 host path; the BF16 launcher precedes it in
+// file order, so forward-declare here.
+std::shared_ptr<NativeRuntime> get_or_build_runtime(
+    const std::string& name,
+    const std::string& code,
+    int major,
+    int minor);
+
 GemmConfig get_best_bf16_config(const GemmDesc& desc, bool masked) {
   const auto candidates = get_bf16_layout_candidates(desc, masked);
   if (candidates.empty()) {
