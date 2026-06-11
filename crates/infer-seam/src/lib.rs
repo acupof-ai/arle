@@ -9,6 +9,8 @@ use infer_plan::{ForwardPlan, StepOutput};
 
 #[path = "allocator.rs"]
 mod allocator;
+#[path = "host_paged_kv_pool.rs"]
+mod host_paged_kv_pool;
 #[path = "kv.rs"]
 mod kv;
 #[path = "kv_batch.rs"]
@@ -19,6 +21,7 @@ mod kv_query;
 mod prefix_store;
 
 pub use allocator::KvAllocator;
+pub use host_paged_kv_pool::HostPagedKvPool;
 pub use kv::KvPool;
 pub use kv_batch::{KvBatchDescriptor, KvBatchRow, KvBatchRowKind};
 pub use kv_query::KvQuery;

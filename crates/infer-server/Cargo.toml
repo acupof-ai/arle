@@ -8,9 +8,7 @@ publish.workspace = true
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
-hf-hub = { version = "0.5", features = ["tokio"], optional = true }
 infer-core = { path = "../infer-core" }
-infer-metal = { path = "../infer-metal", default-features = false }
 infer-plan = { path = "../infer-plan", features = ["serde"] }
 infer-seam = { path = "../infer-seam" }
 log = "0.4"
@@ -21,13 +19,6 @@ tokenizers = { workspace = true }
 uuid = { workspace = true }
 minijinja = { version = "2.20.0", features = ["loop_controls"] }
 minijinja-contrib = { version = "2.20.0", features = ["pycompat"] }
-
-[features]
-default = []
-metal = ["dep:hf-hub", "infer-metal/metal"]
-
-[dev-dependencies]
-tower = "0.5"
 
 [lints]
 workspace = true

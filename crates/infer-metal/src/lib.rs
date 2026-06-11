@@ -1,9 +1,10 @@
 //! Metal backend executor (Apple Silicon) — the primary AI-PC backend.
 //!
-//! Implements the host-only [`infer_seam`] contracts: [`MetalKvPool`] is the
-//! host page manager and [`MetalExecutor`] the submit/poll seam. The real MLX
-//! Qwen3.5 forward + on-device KV live behind `#[cfg(feature = "metal")]`; the
-//! feature-free path keeps a CPU placeholder so the seam is testable.
+//! Implements the Metal [`infer_seam::BackendExecutor`] contract. [`MetalKvPool`]
+//! is a compatibility alias for the backend-neutral host page manager in
+//! `infer-seam`; the real MLX Qwen3.5 forward + on-device KV live behind
+//! `#[cfg(feature = "metal")]`. The feature-free path keeps a CPU placeholder
+//! so the seam is testable.
 
 // `kv_pool` and the `MetalExecutor` placeholder seam stay feature-free so default
 // `infer-server`/agent-bench builds and unit tests compile without `metal`.

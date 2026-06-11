@@ -65,7 +65,7 @@ cuda = [
 # Marker feature for builds without a CUDA toolchain (macOS, dev CI).
 no-cuda = ["infer-cuda?/no-cuda", "cuda-kernels?/no-cuda"]
 # Metal backend via infer-metal (Apple Silicon).
-metal = ["dep:infer-metal", "infer-metal/metal", "infer-server/metal"]
+metal = ["dep:infer-metal", "infer-metal/metal"]
 # HIP backend via infer-hip (AMD ROCm, DSv4 GGUF). infer-server has no
 # hip-specific code, so no infer-server feature is forwarded (unlike metal).
 hip = ["dep:infer-hip", "infer-hip/hip"]
