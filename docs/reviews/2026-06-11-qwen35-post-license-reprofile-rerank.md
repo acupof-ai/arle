@@ -26,7 +26,8 @@ K = 512 → `kv = 64` → each lane runs the v-loop only 2 iterations →
 one-row-per-warp keeps ~2 weight loads in flight; the swiglu kernel at
 K = 2048 × 2 matrices runs ~16 in flight. Binding constraint =
 **memory-level parallelism**, not DRAM bandwidth. Fix shipped as `30611ad4`
-(4-row warp tile); A/B pending at the time of this doc.
+(4-row warp tile); A/B LICENSED — 69.3 → 45.7 µs/layer, c=1 +6.6% / c≥2 +11%
+(`docs/experience/wins/2026-06-11-qwen35-moe-down-kernel-row-tile.md`).
 
 ## Prefill band (3072 tokens, chunked 2048)
 
