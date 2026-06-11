@@ -15,6 +15,7 @@ __global__ void nonpaged_prefill_attention_kernel(
     int head_dim,
     int seq_len,
     int start_pos,
+    const int *__restrict__ start_pos_dev,
     int max_seq_len,
     float sm_scale) {
   int q_head = blockIdx.x;
@@ -26,6 +27,14 @@ __global__ void nonpaged_prefill_attention_kernel(
 
   if (q_head >= num_q_heads || token >= seq_len || dim >= head_dim) {
     return;
+  }
+
+  // Device-resident position override (CUDA-graph decode replay): when set,
+  // the per-step start_pos lives in device memory so ONE captured graph
+  // replays across positions instead of baking the host scalar. Same math
+  // either way (kv_len below derives from start_pos identically).
+  if (start_pos_dev != nullptr) {
+    start_pos = *start_pos_dev;
   }
 
   int gqa_ratio = num_q_heads / num_kv_heads;
@@ -152,6 +161,54 @@ extern "C" cudaError_t nonpaged_prefill_attention_cuda(
       head_dim,
       seq_len,
       start_pos,
+      /*start_pos_dev=*/nullptr,
+      max_seq_len,
+      sm_scale);
+  return cudaGetLastError();
+}
+
+// Device-position variant: start_pos is read from `start_pos_dev` (one i32 in
+// device memory) instead of a host launch arg, so the launch is CUDA-graph
+// capture-safe — replaying the captured graph re-reads the staged position
+// every step (the Qwen3.5/3.6 whole-step decode graph stages it pre-replay).
+// Grid/block depend only on (num_q_heads, seq_len, head_dim), all
+// shape-constant at decode; the kv walk is bounded inside the kernel by the
+// device-read start_pos. kv-length host validation is impossible here (the
+// value lives on device); callers must enforce start_pos + seq_len <=
+// max_seq_len host-side before staging.
+extern "C" cudaError_t nonpaged_prefill_attention_devpos_cuda(
+    const uint16_t *q,
+    const uint16_t *k_cache,
+    const uint16_t *v_cache,
+    uint16_t *out,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int *start_pos_dev,
+    int max_seq_len,
+    float sm_scale,
+    cudaStream_t stream) {
+  if (num_q_heads <= 0 || num_kv_heads <= 0 || seq_len < 0 ||
+      max_seq_len < seq_len || (head_dim != 128 && head_dim != 256) ||
+      num_q_heads % num_kv_heads != 0 || start_pos_dev == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  if (seq_len == 0) {
+    return cudaSuccess;
+  }
+  dim3 grid(num_q_heads, seq_len);
+  nonpaged_prefill_attention_kernel<<<grid, head_dim, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16 *>(q),
+      reinterpret_cast<const __nv_bfloat16 *>(k_cache),
+      reinterpret_cast<const __nv_bfloat16 *>(v_cache),
+      reinterpret_cast<__nv_bfloat16 *>(out),
+      num_q_heads,
+      num_kv_heads,
+      head_dim,
+      seq_len,
+      /*start_pos=*/0,
+      start_pos_dev,
       max_seq_len,
       sm_scale);
   return cudaGetLastError();
