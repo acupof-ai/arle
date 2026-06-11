@@ -1615,6 +1615,7 @@ name = "infer-vulkan"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "deepseek-spec",
  "infer-hip",
  "infer-plan",
  "infer-seam",
