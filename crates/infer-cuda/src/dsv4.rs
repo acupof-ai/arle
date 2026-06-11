@@ -2301,8 +2301,9 @@ impl Dsv4Model {
         position: u64,
     ) -> Result<(u32, DeviceVec)> {
         ensure!(
-            dsv4_spec_decode_enabled(),
-            "DSv4 MTP forward called while ARLE_DSV4_SPEC_DECODE is disabled"
+            self.spec_decode_on,
+            "DSv4 MTP forward called while spec decode is off (need --spec-type mtp / \
+             --mtp-draft-tokens, or ARLE_DSV4_SPEC_DECODE=1)"
         );
         ensure!(
             !dsv4_use_deepep_transport()?,
