@@ -43,12 +43,18 @@ pub(crate) fn print_startup_banner(info: &SystemInfo) {
         GpuInfo::Metal {
             chip,
             unified_memory_gb,
+            recommended_working_set_gb,
         } => {
+            let memory = if let Some(working_set) = recommended_working_set_gb {
+                format!("· {unified_memory_gb:.0} GB unified · {working_set:.1} GB working set")
+            } else {
+                format!("· {unified_memory_gb:.0} GB unified")
+            };
             eprintln!(
                 "  {}  {} {}",
                 style("gpu").dim(),
                 style(chip).bold().green(),
-                style(format!("· {unified_memory_gb:.0} GB unified")).dim()
+                style(memory).dim()
             );
         }
         GpuInfo::None => {
