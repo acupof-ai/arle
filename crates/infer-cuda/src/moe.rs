@@ -1497,6 +1497,104 @@ mod dsv4_gpu {
             })
         }
 
+        /// Device bytes of the ONE shared [`Dsv4MoeDecodeScratch`].
+        /// MUST mirror [`Dsv4MoeDecodeScratch::new`]'s allocations.
+        pub(crate) fn device_bytes(
+            cfg: &infer_moe::MoeConfig,
+            split: &ExpertSplit,
+            layer: &Dsv4MoeLayer,
+        ) -> usize {
+            fn b(elems: usize, elem_bytes: usize) -> usize {
+                elems.saturating_mul(elem_bytes)
+            }
+            fn bf16(hidden_dim: usize, seq_len: usize) -> usize {
+                hidden_dim.saturating_mul(seq_len).saturating_mul(2)
+            }
+            let topk = cfg.top_k;
+            let num_groups = layer.num_groups.max(split.experts_per_rank);
+            let hidden_dim = layer.hidden_dim;
+            let intermediate = layer.intermediate;
+            let shared_intermediate = layer.shared_w2.cols;
+            let hidden_scale_cols = hidden_dim.div_ceil(128);
+            let inter_scale_cols = intermediate.div_ceil(128);
+
+            let mut total = 0usize;
+            total = total.saturating_add(b(topk, 4)); // route_indices
+            total = total.saturating_add(b(topk, 4)); // route_weights
+            total = total.saturating_add(b(1, 4)); // token_ids
+            total = total.saturating_add(bf16(cfg.num_experts, 1)); // router_logits
+            total = total.saturating_add(b(num_groups, 4)); // counts
+            total = total.saturating_add(b(num_groups, 4)); // offsets
+            total = total.saturating_add(b(1, 4)); // scan_total
+            total = total.saturating_add(bf16(hidden_dim, topk)); // packed_hidden
+            total = total.saturating_add(b(topk, 4)); // packed_route_slot
+            total = total.saturating_add(b(topk, 4)); // packed_weight
+            total = total.saturating_add(b(num_groups, 4)); // cursors
+            total = total.saturating_add(bf16(hidden_dim, topk)); // route_out
+
+            let grouped_max_m = topk.max(128);
+            let grouped_scale_stride_m = grouped_max_m.div_ceil(4) * 4;
+            let grouped_rows = num_groups.saturating_mul(grouped_max_m);
+            total = total.saturating_add(b(grouped_rows.saturating_mul(hidden_dim), 1));
+            total = total.saturating_add(b(
+                num_groups
+                    .saturating_mul(grouped_scale_stride_m)
+                    .saturating_mul(hidden_scale_cols),
+                4,
+            ));
+            total = total.saturating_add(bf16(2usize.saturating_mul(intermediate), grouped_rows));
+            total = total.saturating_add(b(grouped_rows.saturating_mul(intermediate), 1));
+            total = total.saturating_add(b(
+                num_groups
+                    .saturating_mul(grouped_scale_stride_m)
+                    .saturating_mul(inter_scale_cols),
+                4,
+            ));
+            total = total.saturating_add(bf16(hidden_dim, grouped_rows));
+            total = total.saturating_add(bf16(hidden_dim, topk.max(1)));
+            total = total.saturating_add(b(num_groups, 4)); // masked_m
+            total = total.saturating_add(b(num_groups, 4)); // active_experts
+
+            let contig_rows = topk.max(1).saturating_mul(CONTIG_ROUTE_ALIGN);
+            let contig_scale_stride_m = contig_rows.div_ceil(4) * 4;
+            total = total.saturating_add(b(contig_rows.saturating_mul(hidden_dim), 1));
+            total = total.saturating_add(b(
+                contig_scale_stride_m.saturating_mul(hidden_scale_cols),
+                4,
+            ));
+            total = total.saturating_add(bf16(2usize.saturating_mul(intermediate), contig_rows));
+            total = total.saturating_add(b(contig_rows.saturating_mul(intermediate), 1));
+            total =
+                total.saturating_add(b(contig_scale_stride_m.saturating_mul(inter_scale_cols), 4));
+            total = total.saturating_add(bf16(hidden_dim, contig_rows)); // out
+            total = total.saturating_add(bf16(hidden_dim, contig_rows)); // packed_hidden
+            total = total.saturating_add(b(contig_rows, 4)); // packed_route_slot
+            total = total.saturating_add(b(contig_rows, 4)); // packed_weight
+            total = total.saturating_add(b(contig_rows, 4)); // m_indices
+            total = total.saturating_add(b(3, 4)); // active_experts + offsets + counts
+
+            let shared_max_m = 128usize;
+            let shared_scale_stride_m = shared_max_m.div_ceil(4) * 4;
+            let shared_inter_scale_cols = shared_intermediate.div_ceil(128);
+            total = total.saturating_add(b(shared_max_m.saturating_mul(hidden_dim), 1));
+            total = total.saturating_add(b(
+                shared_scale_stride_m.saturating_mul(hidden_scale_cols),
+                4,
+            ));
+            total = total.saturating_add(bf16(
+                2usize.saturating_mul(shared_intermediate),
+                shared_max_m,
+            ));
+            total = total.saturating_add(b(shared_max_m.saturating_mul(shared_intermediate), 1));
+            total = total.saturating_add(b(
+                shared_scale_stride_m.saturating_mul(shared_inter_scale_cols),
+                4,
+            ));
+            total = total.saturating_add(bf16(hidden_dim, shared_max_m));
+            total = total.saturating_add(b(4, 4)); // active_experts + offsets + counts + masked_m
+            total
+        }
+
         fn reset_routed(&mut self, ctx: &DeviceContext) -> Result<()> {
             ctx.stream
                 .memset_zeros(&mut self.counts)
