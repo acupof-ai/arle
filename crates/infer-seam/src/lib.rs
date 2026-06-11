@@ -107,6 +107,44 @@ pub trait BackendExecutor {
     /// the default is a no-op for page-sliceable or stateless executors.
     fn release_prefix_pages(&mut self, _pages: &[u32]) {}
 
+    /// Number of KV pages the backend's host-side tier store (T1 DRAM) can
+    /// hold. `0` (the default) means the backend has no tier store and the
+    /// engine never calls the demote/promote hooks — the baseline eviction
+    /// path stays byte-for-byte unchanged.
+    fn kv_tier_capacity_pages(&self) -> usize {
+        0
+    }
+
+    /// Copy the contents of device KV pages into the backend's host tier
+    /// store, keyed by the engine-assigned tier keys.
+    ///
+    /// The copy MUST be complete (host copy durable, no in-flight device
+    /// reads pending) before this returns: the engine frees each accepted
+    /// page immediately after, and a later allocation may overwrite it.
+    /// Returns how many *leading* entries were accepted; entries past that
+    /// count were rejected (store full) and the engine falls back to plain
+    /// eviction for them. The default backend has no tier store and accepts
+    /// nothing.
+    fn demote_prefix_pages(&mut self, _entries: &[(u32, u64)]) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    /// Copy tier-store entries back into freshly allocated device KV pages
+    /// (`(tier_key, dst_page)` pairs).
+    ///
+    /// The copy MUST be complete before this returns: the engine attaches the
+    /// destination pages to a slot immediately after and the next forward
+    /// step reads them. Promoted entries stay in the store until the engine
+    /// drops them via [`BackendExecutor::drop_kv_tier_entries`]. Only called
+    /// when [`BackendExecutor::kv_tier_capacity_pages`] is nonzero.
+    fn promote_prefix_pages(&mut self, _entries: &[(u64, u32)]) -> anyhow::Result<()> {
+        anyhow::bail!("backend has no KV tier store")
+    }
+
+    /// Drop tier-store entries whose radix nodes were severed or restored to
+    /// device residency. The default is a no-op for backends without a tier.
+    fn drop_kv_tier_entries(&mut self, _keys: &[u64]) {}
+
     /// Move the model's device weights to host RAM and free the VRAM (OPD teacher
     /// time-share), returning the device bytes freed. The default is a no-op
     /// (returns 0) so backends that do not support weight offload are unaffected.

@@ -274,6 +274,8 @@ mod tests {
             Ok((0..pages as u32).collect())
         }
 
+        fn free_detached_pages(&mut self, _pages: &[u32]) {}
+
         fn free_slot(&mut self, _slot: usize) {}
 
         fn truncate_slot(&mut self, slot: usize, new_len: usize) -> Result<()> {

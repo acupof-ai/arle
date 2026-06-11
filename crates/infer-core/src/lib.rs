@@ -133,6 +133,24 @@ pub struct CompletedRequest {
     pub finish: Option<FinishReason>,
 }
 
+/// Engine throughput counters, monotonic since engine start.
+///
+/// Maintained on the apply path of the backend-neutral engine so every
+/// backend reports the same semantics; surfaced through `/v1/stats` and
+/// `/metrics` for QPS/TPS computation by scrape tooling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThroughputStats {
+    /// Executor steps whose output was applied.
+    pub steps: u64,
+    /// Prompt tokens advanced through (chunked) prefill.
+    pub prefill_tokens: u64,
+    /// Tokens committed to requests (final prefill chunk + decode).
+    pub generated_tokens: u64,
+    /// Requests finished after holding a slot, any finish reason (immediate
+    /// ingress rejections are not counted — they did no engine work).
+    pub requests_completed: u64,
+}
+
 /// Prefix-cache counters maintained by the backend-neutral scheduler.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrefixCacheStats {
@@ -266,6 +284,7 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     model_stop_token_ids: Vec<u32>,
     /// Prefix-cache accounting exposed to serving telemetry.
     prefix_cache_stats: PrefixCacheStats,
+    throughput_stats: ThroughputStats,
     /// Optional per-token observer invoked as each token is committed to a
     /// request, so a serving layer can stream tokens live. `None` by default —
     /// when unset, token commit behavior is byte-identical to before.
@@ -323,6 +342,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             warmed_up: false,
             model_stop_token_ids,
             prefix_cache_stats: PrefixCacheStats::default(),
+            throughput_stats: ThroughputStats::default(),
             on_token: None,
         }
     }
@@ -565,6 +585,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         stats
     }
 
+    /// Return engine throughput counters (steps, tokens, completions).
+    #[must_use]
+    pub fn throughput_stats(&self) -> ThroughputStats {
+        self.throughput_stats
+    }
+
     /// Return a completed request by handle.
     #[must_use]
     pub fn completed(&self, handle: RequestHandle) -> Option<&CompletedRequest> {
@@ -622,6 +648,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     }
 
     fn apply_output(&mut self, plan: &ForwardPlan, output: StepOutput) -> Result<()> {
+        self.throughput_stats.steps = self.throughput_stats.steps.saturating_add(1);
         let mut tokens_by_slot: BTreeMap<usize, VecDeque<SlotToken>> = BTreeMap::new();
         for token in output.tokens {
             tokens_by_slot
@@ -647,6 +674,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
             let prompt_len = request.prompt_tokens.len();
             let new_start = (row.start_pos + row.tokens.len()).min(prompt_len);
+            self.throughput_stats.prefill_tokens = self
+                .throughput_stats
+                .prefill_tokens
+                .saturating_add(new_start.saturating_sub(row.start_pos) as u64);
             request.prefill_start_pos = new_start;
             if new_start >= prompt_len {
                 request.phase = RequestPhase::Decoding;
@@ -700,6 +731,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         }
 
+        self.throughput_stats.generated_tokens = self
+            .throughput_stats
+            .generated_tokens
+            .saturating_add(committed.len() as u64);
+
         // Stream committed tokens to the observer (if any) before finishing slots,
         // so a serving layer sees the terminal token ahead of completion.
         if let Some(observer) = &mut self.on_token {
@@ -718,6 +754,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let Some(mut request) = self.active.remove(&slot) else {
             return;
         };
+        self.throughput_stats.requests_completed =
+            self.throughput_stats.requests_completed.saturating_add(1);
         request.phase = RequestPhase::Finished;
         request.finish = Some(reason);
         self.publish_prefix_blocks(slot, &request);
@@ -1104,6 +1142,12 @@ mod testing {
                 self.retain_page(page);
             }
             Ok(pages)
+        }
+
+        fn free_detached_pages(&mut self, pages: &[u32]) {
+            // Mock detached pages carry a retain ref (see alloc_detached_pages);
+            // releasing it returns them to the free pool.
+            KvPrefixStore::release_pages(self, pages);
         }
 
         fn free_slot(&mut self, slot: usize) {
@@ -2325,6 +2369,38 @@ mod tests {
         let request = engine.active.values().next().expect("request still active");
         assert_eq!(request.prefill_start_pos, 3);
         assert!(matches!(request.phase, RequestPhase::Prefilling { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn throughput_counters_track_steps_tokens_and_completions() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 4, 64),
+            test_config(1),
+        );
+        let before = engine.throughput_stats();
+        assert_eq!(before.steps, 0);
+        assert_eq!(before.prefill_tokens, 0);
+        assert_eq!(before.generated_tokens, 0);
+        assert_eq!(before.requests_completed, 0);
+
+        let handle = engine.submit_request(vec![1, 2, 3, 4, 9], 3);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(handle).expect("completed"));
+
+        let stats = engine.throughput_stats();
+        assert_eq!(stats.prefill_tokens, 5, "whole prompt prefilled once");
+        assert_eq!(
+            stats.generated_tokens, 3,
+            "length-bound run commits max_tokens tokens"
+        );
+        assert_eq!(stats.requests_completed, 1);
+        assert!(
+            stats.steps >= 2,
+            "at least one prefill and one decode step, got {}",
+            stats.steps
+        );
         Ok(())
     }
 

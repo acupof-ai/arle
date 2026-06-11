@@ -231,6 +231,7 @@ impl ModelsResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsResponse {
     pub scheduler: SchedulerStats,
+    pub throughput: ThroughputStatsResponse,
     pub prefix_cache: PrefixCacheStatsResponse,
     pub ssd_recall: SsdRecallStats,
 }
@@ -242,6 +243,12 @@ impl StatsResponse {
                 active_requests: counters.active_requests,
                 queue_depth: counters.queue_depth,
                 kv_free_pages: counters.kv_free_pages,
+            },
+            throughput: ThroughputStatsResponse {
+                steps: counters.throughput.steps,
+                prefill_tokens: counters.throughput.prefill_tokens,
+                generated_tokens: counters.throughput.generated_tokens,
+                requests_completed: counters.throughput.requests_completed,
             },
             prefix_cache: PrefixCacheStatsResponse {
                 lookups: counters.prefix_cache.lookups,
@@ -268,6 +275,16 @@ pub struct SchedulerStats {
     pub active_requests: usize,
     pub queue_depth: usize,
     pub kv_free_pages: usize,
+}
+
+/// Engine throughput counters (monotonic since engine start), for QPS/TPS
+/// computation by polling clients.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThroughputStatsResponse {
+    pub steps: u64,
+    pub prefill_tokens: u64,
+    pub generated_tokens: u64,
+    pub requests_completed: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -477,12 +494,20 @@ mod tests {
                 published_pages: 8,
                 cached_pages: 8,
             },
+            throughput: infer_core::ThroughputStats {
+                steps: 12,
+                prefill_tokens: 300,
+                generated_tokens: 48,
+                requests_completed: 3,
+            },
         });
 
         let v = serde_json::to_value(&resp).expect("serialize");
         assert_eq!(v["scheduler"]["kv_free_pages"], 7);
         assert_eq!(v["prefix_cache"]["hit_rate"], 0.75);
         assert_eq!(v["prefix_cache"]["hit_tokens"], 96);
+        assert_eq!(v["throughput"]["generated_tokens"], 48);
+        assert_eq!(v["throughput"]["requests_completed"], 3);
         assert_eq!(v["ssd_recall"]["available"], false);
         assert!(v["ssd_recall"]["recall_rate"].is_null());
     }
