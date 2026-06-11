@@ -824,7 +824,7 @@ impl Qwen35Model {
                 );
                 budget
                     .affordable()
-                    .map_or(i32::MAX, |n| i32::try_from(n.max(1)).unwrap_or(i32::MAX))
+                    .map_or(i32::MAX, |n| i32::try_from(n).unwrap_or(i32::MAX))
             }
             // Can't query (no active context / driver error) → don't bind the
             // min; the other ranks' budgets still apply.
@@ -833,6 +833,19 @@ impl Qwen35Model {
         let affordable =
             self.tp
                 .all_reduce_min_scalar_i32(&self.ctx, affordable_local)? as usize;
+        // Reject-below-fixed guard (parity with Metal's fits_fixed + DSv4): a
+        // cross-rank-min affordable of 0 means post-weights free VRAM cannot
+        // hold even one slot at this max_seq_len. Fail closed uniformly
+        // (lockstep-safe — same reduced scalar on every rank) instead of the
+        // former `max(1)` admitting one slot and OOMing at slot allocation.
+        anyhow::ensure!(
+            affordable > 0,
+            "Qwen3.5 KV budget rejected startup: post-weights free VRAM affords 0 slots at \
+             max_seq_len {} (per_slot ~{}MB exceeds {MEM_FRACTION} of free). Lower --max-seq-len \
+             or free VRAM.",
+            self.max_seq_len,
+            per_slot >> 20,
+        );
         let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
         if clamped {
             log::warn!(
