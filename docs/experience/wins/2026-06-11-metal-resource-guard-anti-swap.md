@@ -40,6 +40,30 @@ No large-model serve was allowed to proceed after the guard was rebuilt.
 | `./target/release/arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8137 --num-slots 1` with current `vm.swapusage used=817 MiB` | FAIL-CLOSED before weight load |
 | Same command with `--allow-swap --memory-budget-bytes 1073741824` | FAIL-CLOSED before weight load: budget below fixed requirement |
 
+Follow-up CLI status check:
+
+```text
+sysctl vm.swapusage: used = 785.06M
+vm_stat sampled free/inactive/speculative pages
+```
+
+Qwen3.6 trial now reports the system state directly in the CLI error:
+
+```text
+Metal resource guard rejected startup: system total=48.0GiB available=22.9GiB swap_used=785MiB; macOS swap is already active above the guardrail (used=785 MiB).
+```
+
+Budget-only trial with `--allow-swap --memory-budget-bytes 17179869184` still
+fails before weight load:
+
+```text
+Metal resource guard rejected startup: system total=48.0GiB available=22.4GiB swap_used=785MiB; memory budget 16 GiB is below fixed requirement 25 GiB (weights 19 GiB + runtime headroom 6 GiB + static state 61 MiB).
+```
+
+Interpretation: on the current host state, Qwen3.6 should not be loaded. The
+system has active swap and only about 16 GiB anti-swap budget after reserve,
+while Qwen3.6 needs about 25 GiB before runtime KV headroom.
+
 ## Prompt Performance Sanity
 
 Because the host already had active swap (`vm.swapusage used=817 MiB`), the
