@@ -15,6 +15,8 @@ mod model_picker;
 mod modelscope;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod repl;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod runtime_report;
 mod serve;
 #[cfg(all(unix, feature = "cuda"))]
 mod serve_multiproc;
@@ -52,6 +54,12 @@ pub fn run() -> ExitCode {
 
     let mut args = Args::parse();
     let command = args.command.take();
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+    let _exit_report = if should_print_exit_report(&args, command.as_ref()) {
+        Some(runtime_report::ExitResourceReport::enabled())
+    } else {
+        None
+    };
 
     match command {
         Some(CliCommand::Train(command)) => return train_cli::run_train(*command),
@@ -80,6 +88,11 @@ pub fn run() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn should_print_exit_report(args: &Args, command: Option<&CliCommand>) -> bool {
+    !args.doctor && !args.list_models && matches!(command, None | Some(CliCommand::Run(_)))
 }
 
 fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
@@ -381,5 +394,40 @@ mod resolve_tests {
         // caller's fallback fire instead of pinning the cap to 0.
         let dir = write_config(r#"{"max_position_embeddings": 0}"#);
         assert!(read_model_max_context(dir.path().to_str().unwrap()).is_none());
+    }
+}
+
+#[cfg(test)]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod exit_report_tests {
+    use super::{Args, should_print_exit_report};
+    use clap::Parser;
+
+    fn parse(argv: &[&str]) -> Args {
+        Args::try_parse_from(argv).expect("parse")
+    }
+
+    #[test]
+    fn exit_report_prints_for_default_agent_path() {
+        let args = parse(&["arle"]);
+        assert!(should_print_exit_report(&args, args.command.as_ref()));
+    }
+
+    #[test]
+    fn exit_report_prints_for_run_path() {
+        let args = parse(&["arle", "run", "--prompt", "hello"]);
+        assert!(should_print_exit_report(&args, args.command.as_ref()));
+    }
+
+    #[test]
+    fn exit_report_skips_inspection_and_serve_paths() {
+        let args = parse(&["arle", "--doctor"]);
+        assert!(!should_print_exit_report(&args, args.command.as_ref()));
+
+        let args = parse(&["arle", "--list-models"]);
+        assert!(!should_print_exit_report(&args, args.command.as_ref()));
+
+        let args = parse(&["arle", "serve", "--model-path", "model"]);
+        assert!(!should_print_exit_report(&args, args.command.as_ref()));
     }
 }
