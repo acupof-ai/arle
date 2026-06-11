@@ -90,6 +90,13 @@ pub enum Kernel {
     Qwen35GatedDeltaNet,
 }
 
+const SPEC_WORKGROUP_32: &[(u32, u32)] = &[(0, 32)];
+const SPEC_FLASH_ATTN_WORKGROUP: &[(u32, u32)] = &[(0, 128)];
+const SPEC_MMVQ_IQ2_XXS: &[(u32, u32)] = &[(0, 32), (1, 4), (2, 1)];
+const SPEC_MMVQ_Q2_K: &[(u32, u32)] = &[(0, 32), (1, 2), (2, 1)];
+const SPEC_GEMV_K_Q8_1: &[(u32, u32)] = &[(0, 32), (1, 1), (2, 1)];
+const SPEC_RMS_NORM_MUL: &[(u32, u32)] = &[(1, 1)];
+
 impl Kernel {
     pub const ALL: &'static [Self] = &[
         Self::MmvqIq2Xxs,
@@ -152,6 +159,36 @@ impl Kernel {
             Kernel::SwigluClamped => "swiglu_clamped",
             Kernel::Qwen35SsmConv => "qwen35_ssm_conv",
             Kernel::Qwen35GatedDeltaNet => "qwen35_gated_delta_net",
+        }
+    }
+
+    pub const fn specialization_u32(self) -> &'static [(u32, u32)] {
+        match self {
+            Kernel::MmvqIq2Xxs => SPEC_MMVQ_IQ2_XXS,
+            Kernel::MmvqQ2K => SPEC_MMVQ_Q2_K,
+            Kernel::GemvQ4K | Kernel::GemvQ5K | Kernel::GemvQ6K => SPEC_GEMV_K_Q8_1,
+            Kernel::RmsNorm => SPEC_RMS_NORM_MUL,
+            Kernel::SoftMax | Kernel::ArgMax => SPEC_WORKGROUP_32,
+            Kernel::FlashAttn => SPEC_FLASH_ATTN_WORKGROUP,
+            Kernel::QuantizeQ8_1
+            | Kernel::RopeNeox
+            | Kernel::RopeNorm
+            | Kernel::Silu
+            | Kernel::Gelu
+            | Kernel::GeGlu
+            | Kernel::SwiGlu
+            | Kernel::Add
+            | Kernel::GetRows
+            | Kernel::Dsv4PrepareQk
+            | Kernel::Dsv4CompressorUpdate
+            | Kernel::Dsv4CsaSelect
+            | Kernel::Dsv4HybridAttention
+            | Kernel::Dsv4SwaAttention
+            | Kernel::Dsv4Mhc
+            | Kernel::Dsv4OutputInverseRope
+            | Kernel::SwigluClamped
+            | Kernel::Qwen35SsmConv
+            | Kernel::Qwen35GatedDeltaNet => &[],
         }
     }
 }
@@ -543,11 +580,12 @@ mod real {
             .map_err(|e| KernelError::Runtime(e.to_string()))?;
         let set = vulkan_sys::DescriptorSet::storage_buffers(ctx, &layout, buffers)
             .map_err(|e| KernelError::Runtime(e.to_string()))?;
-        let pipeline = vulkan_sys::ComputePipeline::create_with_push_constants(
+        let pipeline = vulkan_sys::ComputePipeline::create_with_push_constants_and_specialization(
             ctx,
             &shader,
             &[&layout],
             push_bytes.len() as u32,
+            kernel.specialization_u32(),
         )
         .map_err(|e| KernelError::Runtime(e.to_string()))?;
         let commands = vulkan_sys::CommandPool::create(ctx)
@@ -662,6 +700,34 @@ mod tests {
         ];
         assert_eq!(names.len(), 18);
         assert!(names.iter().all(|name| !name.is_empty()));
+    }
+
+    #[test]
+    fn shader_specializations_cover_runtime_specialization_constants() {
+        assert_eq!(
+            Kernel::MmvqIq2Xxs.specialization_u32(),
+            &[(0, 32), (1, 4), (2, 1)]
+        );
+        assert_eq!(
+            Kernel::MmvqQ2K.specialization_u32(),
+            &[(0, 32), (1, 2), (2, 1)]
+        );
+        assert_eq!(
+            Kernel::GemvQ4K.specialization_u32(),
+            &[(0, 32), (1, 1), (2, 1)]
+        );
+        assert_eq!(
+            Kernel::GemvQ5K.specialization_u32(),
+            Kernel::GemvQ4K.specialization_u32()
+        );
+        assert_eq!(
+            Kernel::GemvQ6K.specialization_u32(),
+            Kernel::GemvQ4K.specialization_u32()
+        );
+        assert_eq!(Kernel::SoftMax.specialization_u32(), &[(0, 32)]);
+        assert_eq!(Kernel::ArgMax.specialization_u32(), &[(0, 32)]);
+        assert_eq!(Kernel::FlashAttn.specialization_u32(), &[(0, 128)]);
+        assert_eq!(Kernel::RmsNorm.specialization_u32(), &[(1, 1)]);
     }
 
     #[cfg(feature = "vulkan")]
