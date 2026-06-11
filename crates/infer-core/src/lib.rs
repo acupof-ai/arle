@@ -132,6 +132,23 @@ pub struct CompletedRequest {
     pub finish: Option<FinishReason>,
 }
 
+/// Prefix-cache counters maintained by the backend-neutral scheduler.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefixCacheStats {
+    /// Requests admitted while prefix caching was enabled.
+    pub lookups: u64,
+    /// Lookups that attached at least one backend-reusable prefix page.
+    pub hits: u64,
+    /// Total prompt tokens skipped by attached prefix pages.
+    pub hit_tokens: u64,
+    /// Total prefix pages attached to admitted requests.
+    pub hit_pages: u64,
+    /// Prompt pages newly retained in the radix cache.
+    pub published_pages: u64,
+    /// Pages currently retained by the radix cache.
+    pub cached_pages: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct WaitingRequestHint {
     session_affinity_tokens: usize,
@@ -246,6 +263,8 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     /// Model-default stop token ids (EOS + configured stops) read once from the
     /// executor. Used as the fallback stop set for requests that supply none.
     model_stop_token_ids: Vec<u32>,
+    /// Prefix-cache accounting exposed to serving telemetry.
+    prefix_cache_stats: PrefixCacheStats,
     /// Optional per-token observer invoked as each token is committed to a
     /// request, so a serving layer can stream tokens live. `None` by default —
     /// when unset, token commit behavior is byte-identical to before.
@@ -293,6 +312,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             pending_plan: None,
             warmed_up: false,
             model_stop_token_ids,
+            prefix_cache_stats: PrefixCacheStats::default(),
             on_token: None,
         }
     }
@@ -475,6 +495,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     #[must_use]
     pub fn kv_free_pages(&self) -> usize {
         self.kv.free_pages()
+    }
+
+    /// Return prefix-cache counters plus the current retained cache size.
+    #[must_use]
+    pub fn prefix_cache_stats(&self) -> PrefixCacheStats {
+        let mut stats = self.prefix_cache_stats;
+        stats.cached_pages = self.radix.cached_page_count();
+        stats
     }
 
     /// Return a completed request by handle.
@@ -2153,6 +2181,9 @@ mod tests {
 
         engine.run_to_idle()?;
         assert_finished(engine.completed(first).expect("first completed"));
+        assert_eq!(engine.prefix_cache_stats().lookups, 1);
+        assert_eq!(engine.prefix_cache_stats().hits, 0);
+        assert_eq!(engine.prefix_cache_stats().published_pages, 1);
 
         let hit = engine.radix.peek_longest_prefix_match(&[1, 2, 3, 4]);
         assert_eq!(hit.matched_len, 4);
@@ -2172,6 +2203,12 @@ mod tests {
         assert_eq!(request.reused_prefix_pages, vec![cached_page]);
         assert_eq!(engine.kv.page_indices(slot)[0], cached_page);
         assert_eq!(engine.kv_free_pages(), free_after_publish - 1);
+        let stats = engine.prefix_cache_stats();
+        assert_eq!(stats.lookups, 2);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.hit_tokens, 4);
+        assert_eq!(stats.hit_pages, 1);
+        assert_eq!(stats.cached_pages, 1);
 
         engine.run_to_idle()?;
         assert_finished(engine.completed(second).expect("second completed"));

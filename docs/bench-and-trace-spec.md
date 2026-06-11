@@ -80,10 +80,10 @@ delta attributable.
 
 ### 3.1 `/v1/stats` service trace
 
-> **Rewrite gap (2026-06-10):** the rewrite `infer-server` has not re-ported
-> `/v1/stats` — the route does not exist; probes degrade to absent. Until the
-> observability re-port lands, report §3.1 counters as `n/a (rewrite gap)`
-> instead of hunting for the endpoint.
+> **Rewrite status (2026-06-11):** `infer-server` exposes a minimal JSON
+> `/v1/stats` surface: scheduler counters plus prefix-cache hit counters. SSD
+> KV recall is reported as unavailable because the rewrite serve path has no
+> active SSD recall tier.
 
 Captured automatically by `bench_guidellm.sh` as
 `service_stats_before.txt`, `service_stats_trace.jsonl`,
