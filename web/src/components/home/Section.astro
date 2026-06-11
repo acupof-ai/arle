@@ -6,10 +6,12 @@ interface Props {
   title: string;
   /** Sub-caption rendered as raw HTML (links allowed). */
   caption: string;
+  /** Full-bleed ink band — inverted typesetting (the manifesto treatment). */
+  band?: boolean;
 }
-const { id, title, caption } = Astro.props;
+const { id, title, caption, band = false } = Astro.props;
 ---
-<section id={id}>
+<section id={id} class:list={[{ band }]}>
   <h2>{title}</h2>
   <p class="sub" set:html={caption}></p>
   <slot />
@@ -45,4 +47,23 @@ const { id, title, caption } = Astro.props;
   .sub :global(b) { color: var(--ink); font-weight: 600; }
   .sub :global(code) { color: var(--ink); font-weight: 600; }
   .sub :global(a) { color: var(--ink); }
+
+  /* full-bleed ink band — escapes the centered column on both sides */
+  section.band {
+    margin-left: calc(50% - 50vw);
+    margin-right: calc(50% - 50vw);
+    padding: 88px calc(50vw - 50%);
+    background: var(--console);
+    color: var(--paper);
+  }
+  section.band :global(::selection) { background: var(--paper); color: var(--ink); }
+  section.band h2 { color: var(--paper); }
+  section.band h2::before { color: rgba(255, 255, 255, 0.45); }
+  section.band .sub {
+    color: rgba(255, 255, 255, 0.65);
+    border-bottom-color: rgba(255, 255, 255, 0.18);
+  }
+  section.band .sub :global(b) { color: var(--paper); }
+  section.band .sub :global(a),
+  section.band .sub :global(code) { color: var(--paper); }
 </style>

@@ -3,9 +3,12 @@ import Site from "../layouts/Site.astro";
 import Masthead from "../components/Masthead.astro";
 import Hero from "../components/home/Hero.astro";
 import Section from "../components/home/Section.astro";
+import Why from "../components/home/Why.astro";
+import Arch from "../components/home/Arch.astro";
 import Install from "../components/home/Install.astro";
 import Bench from "../components/home/Bench.astro";
 import Matrix from "../components/home/Matrix.astro";
+import Contribute from "../components/home/Contribute.astro";
 import Files from "../components/home/Files.astro";
 import SiteFooter from "../components/SiteFooter.astro";
 import { ZH } from "../data/content.ts";
@@ -14,8 +17,16 @@ const s = ZH.sections;
 ---
 <Site locale={ZH}>
   <div class="page">
-    <Masthead left={ZH.masthead.left} links={ZH.masthead.links} />
+    <Masthead left={ZH.masthead.left} lang={ZH.masthead.lang} links={ZH.masthead.links} />
     <Hero hero={ZH.hero} />
+
+    <Section id="why" band title={s.why.title} caption={s.why.caption}>
+      <Why cells={s.why.cells} />
+    </Section>
+
+    <Section id="architecture" title={s.architecture.title} caption={s.architecture.caption}>
+      <Arch rows={s.architecture.rows} foot={s.architecture.foot} />
+    </Section>
 
     <Section id="install" title={s.install.title} caption={s.install.caption}>
       <Install cards={s.install.cards} />
@@ -27,6 +38,10 @@ const s = ZH.sections;
 
     <Section id="matrix" title={s.matrix.title} caption={s.matrix.caption}>
       <Matrix head={s.matrix.head} rows={s.matrix.rows} />
+    </Section>
+
+    <Section id="contribute" title={s.contribute.title} caption={s.contribute.caption}>
+      <Contribute rows={s.contribute.rows} starAsk={s.contribute.starAsk} />
     </Section>
 
     <Section id="files" title={s.files.title} caption={s.files.caption}>

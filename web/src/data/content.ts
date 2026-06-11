@@ -17,7 +17,7 @@ export type Terminal = {
   title: string;
   /** Right-hand cwd in the bar. */
   cwd: string;
-  /** Lines of the <pre> body. Raw HTML allowed (use <span class="p|c|ok|warn|k|out|dim">). */
+  /** Lines of the <pre> body. Raw HTML allowed (use <span class="p|c|ok|warn|k|out|dim|caret">). */
   lines: string[];
 };
 
@@ -83,6 +83,61 @@ export type Files = {
   rows: FileRow[];
 };
 
+export type WhyCell = {
+  /** Coral kicker above the heading (e.g. "conviction · 01"). */
+  no: string;
+  title: string;
+  /** Body paragraph. Raw HTML allowed. */
+  body: string;
+};
+
+export type Why = {
+  caption: string; // raw HTML allowed
+  cells: WhyCell[];
+};
+
+export type ArchChip = {
+  label: string;
+  /** bin = inverted ink, door = solid ink border, feat = dashed (feature-gated). */
+  kind?: "bin" | "door" | "feat";
+};
+
+export type ArchRow = {
+  /** Left layer label (e.g. "front door"). */
+  layer: string;
+  chips: ArchChip[];
+  /** Right-hand note. Raw HTML allowed. */
+  note: string;
+};
+
+export type Architecture = {
+  caption: string; // raw HTML allowed
+  rows: ArchRow[];
+  /** Footer spans under the diagram. Raw HTML allowed. */
+  foot: string[];
+};
+
+export type BattleRow = {
+  /** Priority label (e.g. "P1 · active"). */
+  pri: string;
+  /** Coral-hot highlight on the priority label. */
+  hot?: boolean;
+  title: string;
+  desc: string;
+  /** Landing spot — crates / issue numbers. */
+  where: string;
+};
+
+export type Contribute = {
+  caption: string; // raw HTML allowed
+  rows: BattleRow[];
+  starAsk: {
+    /** Lead paragraph of the dark star-ask band. Raw HTML allowed. */
+    html: string;
+    cta: CtaLink;
+  };
+};
+
 export type Locale = {
   lang: string;
   hreflang: string;
@@ -97,22 +152,29 @@ export type Locale = {
   /** Top masthead — `arle(1)` left, uppercase nav right. */
   masthead: {
     left: string;
+    /** Bordered language-switch link rendered first in the nav. */
+    lang: TopNavLink;
     links: TopNavLink[];
   };
   hero: {
-    /** Wordmark text after the coral period — almost always "arle". */
-    wordmark: string;
+    /** Uppercase kicker line above the lockup. */
+    kicker: string;
+    /** Manifesto headline. Raw HTML — use <span class="magic"> + <span class="quiet">. */
+    headline: string;
     /** Lede paragraph. Raw HTML allowed. */
     lede: string;
     signals: Signal[];
-    primaryCta: CtaLink;
-    secondaryCta: CtaLink;
+    /** First entry renders as the primary (inverted) CTA. */
+    ctas: CtaLink[];
     terminal: Terminal;
   };
   sections: {
+    why: { title: string } & Why;
+    architecture: { title: string } & Architecture;
     install: { title: string } & Install;
     bench: { title: string } & Bench;
     matrix: { title: string } & Matrix;
+    contribute: { title: string } & Contribute;
     files: { title: string } & Files;
   };
   footer: {
@@ -140,7 +202,7 @@ const TERMINAL_LINES_EN = [
   '<span class="out">api     </span><span class="ok">ok</span>    <span class="c"># /v1/chat/completions · streaming</span>',
   "",
   '<span class="p">$</span> arle <span class="k">serve</span> --backend cuda --model Qwen3-4B',
-  '<span class="dim">listening on</span> http://0.0.0.0:8000  <span class="dim">·</span> <span class="ok">ready</span> <span class="dim">in 1.4s</span>',
+  '<span class="dim">listening on</span> http://0.0.0.0:8000  <span class="dim">·</span> <span class="ok">ready</span> <span class="dim">in 1.4s</span><span class="caret" aria-hidden="true"></span>',
 ];
 
 const INSTALL_CARDS_EN: InstallCard[] = [
@@ -246,7 +308,7 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "step", value: "0.164", unit: "s" },
       { key: "vs naive CPU", value: "~170", unit: "×" },
       { key: "moderate vs PyTorch CUDA", value: "1.71", unit: "× ARLE faster" },
-      { key: "held-out overlap 5k", value: "50→82.8", unit: "%" },
+      { key: "held-out overlap 5k", value: "82.8", unit: "% (from 50)" },
     ],
     cmd: "cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- --lr 1e-7 --steps 5000",
     href: "https://github.com/cklxx/arle/blob/main/docs/projects/2026-05-21-opd-cuda-cycle-wrap.md",
@@ -301,7 +363,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
     stability: "beta",
     stabilityLabel: "beta · 闸门已 license",
     caption:
-      '<b>cuda</b> · 8×H20 TP=8 / EP=8 · <code>DeepSeek-V4-Flash FP8</code> · B=1,官方 FlashMLA / DSA / DeepGEMM + MTP · 256K 可启动、needle 230K 精确命中',
+      '<b>cuda</b> · 8×H20 TP=8 / EP=8 · <code>DeepSeek-V4-Flash FP8</code> · B=1，官方 FlashMLA / DSA / DeepGEMM + MTP · 256K 可启动、needle 230K 精确命中',
     cells: [
       { key: "prefill", value: "23", unit: "ms" },
       { key: "解码", value: "15", unit: "ms/tok" },
@@ -320,7 +382,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "step", value: "0.164", unit: "s" },
       { key: "对比 naive CPU", value: "~170", unit: "×" },
       { key: "moderate vs PyTorch CUDA", value: "1.71", unit: "× ARLE 领先" },
-      { key: "held-out 5k overlap", value: "50→82.8", unit: "%" },
+      { key: "held-out 5k overlap", value: "82.8", unit: "%（自 50）" },
     ],
     cmd: "cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- --lr 1e-7 --steps 5000",
     href: "https://github.com/cklxx/arle/blob/main/docs/projects/2026-05-21-opd-cuda-cycle-wrap.md",
@@ -374,16 +436,16 @@ const MATRIX_ROWS_EN: string[][] = [
     "<code>cuda</code>",
     '<span class="pill ok">stable</span>',
     "Linux + NVIDIA Ampere+",
-    "Qwen3 / Qwen3.5",
-    "FP16 / BF16, GGUF Q4_K",
+    "Qwen3 / Qwen3.5 · DeepSeek-V4-Flash (8×H20)",
+    "FP16 / BF16 · FP8 KV (auto) · GGUF Q4_K",
     "OpenAI v1",
   ],
   [
     "<code>metal</code>",
     '<span class="pill warn">beta</span>',
     "Apple Silicon (M1+)",
-    "Qwen3 / Qwen3.5",
-    "FP16 / BF16, dense GGUF",
+    "Qwen3.5 · Qwen3.6 MoE (canonical)",
+    "FP16 / BF16 · MLX 4-bit · GGUF Q4_K",
     "OpenAI v1",
   ],
   [
@@ -401,16 +463,16 @@ const MATRIX_ROWS_ZH: string[][] = [
     "<code>cuda</code>",
     '<span class="pill ok">stable</span>',
     "Linux + NVIDIA Ampere+",
-    "Qwen3 / Qwen3.5",
-    "FP16 / BF16、GGUF Q4_K",
+    "Qwen3 / Qwen3.5 · DeepSeek-V4-Flash（8×H20）",
+    "FP16 / BF16 · FP8 KV（auto）· GGUF Q4_K",
     "OpenAI v1",
   ],
   [
     "<code>metal</code>",
     '<span class="pill warn">beta</span>',
     "Apple Silicon（M1+）",
-    "Qwen3 / Qwen3.5",
-    "FP16 / BF16、dense GGUF",
+    "Qwen3.5 · Qwen3.6 MoE（canonical）",
+    "FP16 / BF16 · MLX 4-bit · GGUF Q4_K",
     "OpenAI v1",
   ],
   [
@@ -423,13 +485,188 @@ const MATRIX_ROWS_ZH: string[][] = [
   ],
 ];
 
+const WHY_CELLS_EN: WhyCell[] = [
+  {
+    no: "conviction · 01",
+    title: "From scratch is the point.",
+    body:
+      "From-scratch autograd, scheduler, radix prefix cache, paged KV, CUDA graphs, MLX bridge. The concepts you’ve only met in papers are here as small Rust files — <b>read one crate, own one concept</b>.",
+  },
+  {
+    no: "conviction · 02",
+    title: "Kills are documented.",
+    body:
+      "Dead ends stay in the repo, marked <code>KILL</code> with the measurement that killed them. You inherit the measurements, not just the conclusions — <b>months of A/B work, free to read</b>.",
+  },
+  {
+    no: "conviction · 03",
+    title: "Numbers are dated.",
+    body:
+      'Every benchmark is a dated snapshot in <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> with env, params, and regressions. Nothing is curated. “Fast” is a number with a date, or it’s nothing.',
+  },
+  {
+    no: "conviction · 04",
+    title: "One binary, no glue.",
+    body:
+      "No Python at serving time, no sidecar processes, no config sprawl. <code>arle</code> is the only binary the workspace builds — <b>clone to first token in minutes</b>, on a GPU box or a MacBook.",
+  },
+];
+
+const WHY_CELLS_ZH: WhyCell[] = [
+  {
+    no: "conviction · 01",
+    title: "从零写起，就是目的。",
+    body:
+      "自研 autograd、调度器、radix 前缀缓存、paged KV、CUDA graphs、MLX bridge。论文里见过的概念，在这里是一个个小 Rust 文件 —— <b>读一个 crate，吃透一个概念</b>。",
+  },
+  {
+    no: "conviction · 02",
+    title: "被砍掉的也留档。",
+    body:
+      "死路留在仓库里，标着 <code>KILL</code> 和杀死它的测量数据。你继承的是测量过程，不只是结论 —— <b>几个月的 A/B 实验，免费可读</b>。",
+  },
+  {
+    no: "conviction · 03",
+    title: "数字都有日期。",
+    body:
+      '每个基准都是 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 里带日期的快照，环境、参数、回归俱全。没有精选。「快」要么是带日期的数字，要么什么都不是。',
+  },
+  {
+    no: "conviction · 04",
+    title: "一个二进制，零胶水。",
+    body:
+      "serving 时没有 Python，没有 sidecar 进程，没有配置蔓延。<code>arle</code> 是 workspace 唯一构建的二进制 —— <b>从 clone 到第一个 token 只要几分钟</b>，GPU 机器或 MacBook 都行。",
+  },
+];
+
+const ARCH_ROWS: ArchRow[] = [
+  {
+    layer: "bin",
+    chips: [{ label: "arle", kind: "bin" }],
+    note: "the only binary the workspace builds · <code>src/main.rs</code>",
+  },
+  {
+    layer: "control plane",
+    chips: [{ label: "cli" }, { label: "agent" }, { label: "chat" }, { label: "tools" }],
+    note: "REPL · session loop · protocol · sandboxed tools",
+  },
+  {
+    layer: "front door",
+    chips: [{ label: "infer-api", kind: "door" }],
+    note: "<code>InferenceEngine</code> · <code>LoadedInferenceEngine</code> · backends plug in here",
+  },
+  {
+    layer: "server · core",
+    chips: [{ label: "infer-server" }, { label: "infer-core" }],
+    note: "OpenAI v1 facade (axum) · <code>Engine&lt;E,K&gt;</code> · scheduler · radix prefix",
+  },
+  {
+    layer: "seam · ir",
+    chips: [{ label: "infer-seam" }, { label: "infer-plan" }],
+    note: "<code>BackendExecutor</code> + <code>KvPool</code> seam · <code>ForwardPlan</code> IR — host-only",
+  },
+  {
+    layer: "backends",
+    chips: [{ label: "infer-cuda", kind: "feat" }, { label: "infer-metal", kind: "feat" }],
+    note: "feature-gated · metal’s host KV pool doubles as the cpu smoke path",
+  },
+  {
+    layer: "kernels",
+    chips: [{ label: "cuda-kernels" }, { label: "mlx-sys" }, { label: "kv-native-sys" }],
+    note: "CUDA C / TileLang · MLX C++ bridge · KV persistence",
+  },
+];
+
+const ARCH_FOOT_EN: string[] = [
+  "<b>pure leaves</b> · infer-topo · infer-moe · infer-util",
+  "<b>specs</b> · qwen3 · qwen35 · deepseek",
+  "<b>ffi</b> · deepep-sys · xgrammar-sys",
+  "<b>train</b> · autograd + train — OPD-only since 2026-05-18",
+];
+
+const ARCH_FOOT_ZH: string[] = [
+  "<b>纯叶子</b> · infer-topo · infer-moe · infer-util",
+  "<b>specs</b> · qwen3 · qwen35 · deepseek",
+  "<b>ffi</b> · deepep-sys · xgrammar-sys",
+  "<b>train</b> · autograd + train — 2026-05-18 起仅 OPD",
+];
+
+const BATTLE_ROWS_EN: BattleRow[] = [
+  {
+    pri: "P1 · active",
+    hot: true,
+    title: "Batched serving lane",
+    desc: "the keystone — KvBatchDescriptor + ModelKvAdapter batched lowering, DSv4 first; c-sweep must clear TTFT · ITL · tok/s",
+    where: "infer-core · infer-cuda · #60 #61",
+  },
+  {
+    pri: "P2 · queued",
+    title: "Speculative decoding, default-good",
+    desc: "frozen-KV MTP on DSv4 — checkpoint-native draft head, no training; whole-step decode graph re-licensed 2026-06-10",
+    where: "infer-cuda · docs/plans · #70 #62",
+  },
+  {
+    pri: "P3 · queued",
+    title: "Qwen3.6 CUDA + the AIPC lane",
+    desc: "second ModelKvAdapter brings Qwen3.6 to CUDA; Metal single-user convergence; HIP/ROCm enters as the third backend on the seam",
+    where: "infer-cuda · infer-metal · #65 #71",
+  },
+  {
+    pri: "open",
+    title: "KV-quant parity gate",
+    desc: "model-generic kv-dtype dispatch at the seam + neutral needle-gate harness — unblocks the Qwen BF16 / INT8 / FP8 / TQ4 matrix",
+    where: "infer-cuda · cuda-kernels · #68",
+  },
+  {
+    pri: "open",
+    title: "Agent workloads",
+    desc: "W3/W4 cross-engine trace baseline — the harness exists, the workloads want breadth",
+    where: "crates/agent-bench · #63",
+  },
+];
+
+const BATTLE_ROWS_ZH: BattleRow[] = [
+  {
+    pri: "P1 · active",
+    hot: true,
+    title: "Batched serving lane",
+    desc: "keystone —— KvBatchDescriptor + ModelKvAdapter 批量下放，DSv4 先行；c-sweep 须同时过 TTFT · ITL · tok/s",
+    where: "infer-core · infer-cuda · #60 #61",
+  },
+  {
+    pri: "P2 · queued",
+    title: "投机解码默认好用",
+    desc: "DSv4 上的 frozen-KV MTP —— checkpoint 原生 draft head、零训练；whole-step decode graph 2026-06-10 重新 license",
+    where: "infer-cuda · docs/plans · #70 #62",
+  },
+  {
+    pri: "P3 · queued",
+    title: "Qwen3.6 CUDA + AIPC 路线",
+    desc: "第二个 ModelKvAdapter 把 Qwen3.6 带上 CUDA；Metal 单用户收敛；HIP/ROCm 作为 seam 上的第三后端进场",
+    where: "infer-cuda · infer-metal · #65 #71",
+  },
+  {
+    pri: "open",
+    title: "KV 量化 parity 闸门",
+    desc: "seam 层模型无关的 kv-dtype 分发 + 中立 needle 闸门 —— 解锁 Qwen BF16 / INT8 / FP8 / TQ4 矩阵",
+    where: "infer-cuda · cuda-kernels · #68",
+  },
+  {
+    pri: "open",
+    title: "Agent workloads",
+    desc: "W3/W4 跨引擎 trace 基线 —— harness 已就绪，workload 等着扩面",
+    where: "crates/agent-bench · #63",
+  },
+];
+
 const FILES_EN: FileRow[] = [
   { path: "/README.md", desc: "public overview · install · CLI · architecture", href: "https://github.com/cklxx/arle/blob/main/README.md" },
+  { path: "/docs/codebase-map.md", desc: "canonical workspace topology", href: "https://github.com/cklxx/arle/blob/main/docs/codebase-map.md" },
   { path: "/docs/http-api.md", desc: "HTTP contract · streaming behavior", href: "https://github.com/cklxx/arle/blob/main/docs/http-api.md" },
   { path: "/docs/support-matrix.md", desc: "backend / model / quant support", href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md" },
-  { path: "/docs/stability-policy.md", desc: "stability levels · compatibility posture", href: "https://github.com/cklxx/arle/blob/main/docs/stability-policy.md" },
   { path: "/docs/experience/wins/", desc: "dated benchmark snapshots", href: "https://github.com/cklxx/arle/tree/main/docs/experience/wins" },
   { path: "/crates/cli/", desc: "arle binary · verbs · doctor", href: "https://github.com/cklxx/arle/tree/main/crates/cli" },
+  { path: "/crates/infer-api/", desc: "the single public front door", href: "https://github.com/cklxx/arle/tree/main/crates/infer-api" },
   { path: "/crates/infer-core/", desc: "runtime spine · engine · scheduler · radix cache", href: "https://github.com/cklxx/arle/tree/main/crates/infer-core" },
   { path: "/crates/cuda-kernels/", desc: "cuda kernel crate · csrc · prelude", href: "https://github.com/cklxx/arle/tree/main/crates/cuda-kernels" },
   { path: "/crates/mlx-sys/", desc: "metal bridge · cmake + cc", href: "https://github.com/cklxx/arle/tree/main/crates/mlx-sys" },
@@ -439,11 +676,12 @@ const FILES_EN: FileRow[] = [
 
 const FILES_ZH: FileRow[] = [
   { path: "/README.zh-CN.md", desc: "中文公共入口：安装 · CLI · 架构", href: "https://github.com/cklxx/arle/blob/main/README.zh-CN.md" },
+  { path: "/docs/codebase-map.md", desc: "权威 workspace 拓扑", href: "https://github.com/cklxx/arle/blob/main/docs/codebase-map.md" },
   { path: "/docs/http-api.md", desc: "HTTP 契约 · 流式行为", href: "https://github.com/cklxx/arle/blob/main/docs/http-api.md" },
   { path: "/docs/support-matrix.md", desc: "后端 / 模型 / 量化支持", href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md" },
-  { path: "/docs/stability-policy.md", desc: "稳定性分级 · 兼容性姿态", href: "https://github.com/cklxx/arle/blob/main/docs/stability-policy.md" },
   { path: "/docs/experience/wins/", desc: "带日期的基准快照", href: "https://github.com/cklxx/arle/tree/main/docs/experience/wins" },
   { path: "/crates/cli/", desc: "arle 二进制 · 子命令 · doctor", href: "https://github.com/cklxx/arle/tree/main/crates/cli" },
+  { path: "/crates/infer-api/", desc: "唯一的公共前门", href: "https://github.com/cklxx/arle/tree/main/crates/infer-api" },
   { path: "/crates/infer-core/", desc: "运行时主干 · engine · scheduler · radix cache", href: "https://github.com/cklxx/arle/tree/main/crates/infer-core" },
   { path: "/crates/cuda-kernels/", desc: "cuda kernel crate · csrc · prelude", href: "https://github.com/cklxx/arle/tree/main/crates/cuda-kernels" },
   { path: "/crates/mlx-sys/", desc: "metal 桥接 · cmake + cc", href: "https://github.com/cklxx/arle/tree/main/crates/mlx-sys" },
@@ -457,29 +695,37 @@ export const EN: Locale = {
   meta: {
     title: "arle(1) — runtime-first rust workspace",
     description:
-      "ARLE is a runtime-first Rust workspace for serving Qwen3.5 / Qwen3.6 and DeepSeek-V4-Flash on CUDA, Metal, and CPU. arle serve is the OpenAI-compatible serving path; arle is the unified front door for run, serve, train, and data flows.",
-    ogTitle: "arle — runtime-first Rust workspace",
+      "ARLE is a runtime-first Rust workspace for serving Qwen3.5 / Qwen3.6 and DeepSeek-V4-Flash on CUDA, Metal, and CPU. The whole modern inference stack — continuous batching, radix prefix cache, paged KV, CUDA graphs, speculative decode — hand-built in Rust.",
+    ogTitle: "arle — inference stops being magic",
     ogDescription:
-      "arle serve is the OpenAI-compatible serving path on CUDA, Metal, and CPU. arle is the unified front door for run, serve, train, and data.",
+      "The whole modern inference stack — continuous batching, radix prefix cache, paged KV, CUDA graphs, speculative decode — hand-built in Rust, small enough to read in a weekend.",
     ogUrl: "https://cklxx.github.io/arle/",
     canonical: "https://cklxx.github.io/arle/",
   },
   masthead: {
     left: "arle(1)",
+    lang: { label: "中文", href: "/arle/zh-cn/" },
     links: [
+      { label: "why", href: "#why" },
+      { label: "architecture", href: "#architecture" },
       { label: "install", href: "#install" },
       { label: "bench", href: "#bench" },
-      { label: "matrix", href: "#matrix" },
-      { label: "github ↗", href: "https://github.com/cklxx/arle" },
+      { label: "contribute", href: "#contribute" },
+      { label: "github ↗", href: "https://github.com/cklxx/arle" },
     ],
   },
   hero: {
-    wordmark: "arle",
+    kicker: "one person · pure rust · from scratch · in public",
+    headline:
+      'Inference stops<br>being <span class="magic">magic</span><span class="quiet">.</span>',
     lede:
-      "A runtime-first Rust workspace. <b>arle serve</b> is the OpenAI-compatible serving path on CUDA, Metal, and CPU; <b>arle</b> is the unified front door for run, serve, train, and data flows.",
+      "The whole modern inference stack — continuous batching, radix prefix cache, paged KV, CUDA graphs, speculative decode — hand-built in Rust, <b>small enough to read in a weekend</b>.",
     signals: SIGNALS,
-    primaryCta: { label: "$ Quickstart", href: "#install" },
-    secondaryCta: { label: "cklxx/arle ↗", href: "https://github.com/cklxx/arle" },
+    ctas: [
+      { label: "★ Star cklxx/arle", href: "https://github.com/cklxx/arle" },
+      { label: "$ Quickstart", href: "#install" },
+      { label: "contribute →", href: "#contribute" },
+    ],
     terminal: {
       title: "arle — bash",
       cwd: "~/projects/arle",
@@ -487,6 +733,19 @@ export const EN: Locale = {
     },
   },
   sections: {
+    why: {
+      title: "Why this exists",
+      caption:
+        "Not a wrapper, not a binding, not a fork. Every layer the big engines hide behind a pip install exists here as <b>a few hundred lines you can step through</b> — and a readable trail of why each one looks the way it does.",
+      cells: WHY_CELLS_EN,
+    },
+    architecture: {
+      title: "Architecture",
+      caption:
+        'Post-cutover (2026-06-04) the monolithic <code>infer</code> crate is gone. The runtime is a device-neutral crate graph — dependencies flow strictly downward, <b>infer-core carries no backend dependency</b>, and backends plug in at the front door. Canonical topology lives in <a href="https://github.com/cklxx/arle/blob/main/docs/codebase-map.md"><code>docs/codebase-map.md</code></a>.',
+      rows: ARCH_ROWS,
+      foot: ARCH_FOOT_EN,
+    },
     install: {
       title: "Install",
       caption:
@@ -505,6 +764,17 @@ export const EN: Locale = {
         'Three backends, one runtime contract. Authoritative truth lives in <a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md"><code>docs/support-matrix.md</code></a>.',
       head: ["backend", "stability", "os / hardware", "models", "quants", "api"],
       rows: MATRIX_ROWS_EN,
+    },
+    contribute: {
+      title: "Where a contribution lands",
+      caption:
+        'No queue, no committee — <b>a weekend PR here can move a headline number</b>, and the battlefields are public: the serial phase plan lives in <a href="https://github.com/cklxx/arle/blob/main/ROADMAP.md"><code>ROADMAP.md</code></a> with one tracked issue per front. Start with <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>, not the maintainer plans tree.',
+      rows: BATTLE_ROWS_EN,
+      starAsk: {
+        html:
+          "<b>Stars are the only metric a solo project has.</b> If this repo saved you a read of someone else’s CUDA — or just proved it can be done in Rust — leave one. It decides how much time this gets.",
+        cta: { label: "★ Star cklxx/arle", href: "https://github.com/cklxx/arle" },
+      },
     },
     files: {
       title: "Files",
@@ -525,29 +795,37 @@ export const ZH: Locale = {
   meta: {
     title: "arle(1) — 以 runtime 为主干的 rust workspace",
     description:
-      "ARLE 是以 runtime 为主干的 Rust workspace，覆盖 CUDA、Metal、CPU 上 Qwen3.5 / Qwen3.6 与 DeepSeek-V4-Flash 的 serving。arle serve 是 OpenAI 兼容的 serving 路径；arle 是 run / serve / train / data 的统一前门。",
-    ogTitle: "arle — runtime-first Rust workspace",
+      "ARLE 是以 runtime 为主干的 Rust workspace，覆盖 CUDA、Metal、CPU 上 Qwen3.5 / Qwen3.6 与 DeepSeek-V4-Flash 的 serving。现代推理栈的全部 —— continuous batching、radix 前缀缓存、paged KV、CUDA graphs、投机解码 —— 一个人用 Rust 手写。",
+    ogTitle: "arle — 推理，不再是魔法",
     ogDescription:
-      "arle serve 在 CUDA、Metal、CPU 上提供 OpenAI 兼容 serving；arle 是 run / serve / train / data 的统一前门。",
+      "现代推理栈的全部 —— continuous batching、radix 前缀缓存、paged KV、CUDA graphs、投机解码 —— 一个人用 Rust 手写，小到一个周末就能读完。",
     ogUrl: "https://cklxx.github.io/arle/zh-cn/",
     canonical: "https://cklxx.github.io/arle/zh-cn/",
   },
   masthead: {
     left: "arle(1)",
+    lang: { label: "EN", href: "/arle/" },
     links: [
+      { label: "理念", href: "#why" },
+      { label: "架构", href: "#architecture" },
       { label: "安装", href: "#install" },
       { label: "基准", href: "#bench" },
-      { label: "矩阵", href: "#matrix" },
-      { label: "github ↗", href: "https://github.com/cklxx/arle" },
+      { label: "参与", href: "#contribute" },
+      { label: "github ↗", href: "https://github.com/cklxx/arle" },
     ],
   },
   hero: {
-    wordmark: "arle",
+    kicker: "一个人 · 纯 rust · 从零写起 · 公开构建",
+    headline:
+      '推理，不再是<br><span class="magic">魔法</span><span class="quiet">。</span>',
     lede:
-      "以 runtime 为主干的 Rust workspace。<b>arle serve</b> 是 CUDA、Metal、CPU 上的 OpenAI 兼容 serving 路径；<b>arle</b> 是 run / serve / train / data 的统一前门。",
+      "现代推理栈的全部 —— continuous batching、radix 前缀缓存、paged KV、CUDA graphs、投机解码 —— 一个人用 Rust 手写，<b>小到一个周末就能读完</b>。",
     signals: SIGNALS,
-    primaryCta: { label: "$ Quickstart", href: "#install" },
-    secondaryCta: { label: "cklxx/arle ↗", href: "https://github.com/cklxx/arle" },
+    ctas: [
+      { label: "★ Star cklxx/arle", href: "https://github.com/cklxx/arle" },
+      { label: "$ Quickstart", href: "#install" },
+      { label: "参与贡献 →", href: "#contribute" },
+    ],
     terminal: {
       title: "arle — bash",
       cwd: "~/projects/arle",
@@ -555,6 +833,19 @@ export const ZH: Locale = {
     },
   },
   sections: {
+    why: {
+      title: "为什么做这个",
+      caption:
+        "不是 wrapper，不是 binding，不是 fork。大引擎藏在 pip install 背后的每一层，在这里都是<b>几百行可以单步调试的 Rust</b> —— 还有每个决定为什么长这样的完整记录。",
+      cells: WHY_CELLS_ZH,
+    },
+    architecture: {
+      title: "架构",
+      caption:
+        '2026-06-04 cutover 之后，单体 <code>infer</code> crate 已经不在了。运行时是一张设备无关的 crate 图 —— 依赖严格向下流动，<b>infer-core 不依赖任何后端</b>，后端在前门接入。权威拓扑见 <a href="https://github.com/cklxx/arle/blob/main/docs/codebase-map.md"><code>docs/codebase-map.md</code></a>。',
+      rows: ARCH_ROWS,
+      foot: ARCH_FOOT_ZH,
+    },
     install: {
       title: "安装",
       caption:
@@ -573,6 +864,17 @@ export const ZH: Locale = {
         '三种后端，一份运行时契约。权威矩阵见 <a href="https://github.com/cklxx/arle/blob/main/docs/support-matrix.md"><code>docs/support-matrix.md</code></a>。',
       head: ["后端", "稳定度", "系统 / 硬件", "模型", "量化", "API"],
       rows: MATRIX_ROWS_ZH,
+    },
+    contribute: {
+      title: "贡献会落在哪",
+      caption:
+        '没有排队，没有委员会 —— <b>一个周末的 PR 就能改动头条数字</b>，战场全部公开：串行 phase 计划在 <a href="https://github.com/cklxx/arle/blob/main/ROADMAP.md"><code>ROADMAP.md</code></a>，每条战线一个跟踪 issue。从 <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a> 开始，不要先钻维护者计划树。',
+      rows: BATTLE_ROWS_ZH,
+      starAsk: {
+        html:
+          "<b>Star 是个人项目唯一的指标。</b>如果这个仓库帮你省下了啃别人 CUDA 的时间 —— 或者只是证明了这件事 Rust 写得出来 —— 留一颗。它决定这件事能得到多少时间。",
+        cta: { label: "★ Star cklxx/arle", href: "https://github.com/cklxx/arle" },
+      },
     },
     files: {
       title: "文件",

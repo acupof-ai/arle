@@ -1,0 +1,62 @@
+---
+import type { WhyCell } from "../../data/content.ts";
+
+interface Props {
+  cells: WhyCell[];
+}
+const { cells } = Astro.props;
+---
+<div class="why-grid">
+  {cells.map((c) => (
+    <div class="cell">
+      <h3><span class="no">{c.no}</span>{c.title}</h3>
+      <p set:html={c.body} />
+    </div>
+  ))}
+</div>
+<style>
+  .why-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+  }
+  .cell {
+    padding: 34px 32px;
+    border-right: 1px solid rgba(255, 255, 255, 0.14);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  }
+  .cell:nth-child(2n) { border-right: none; }
+  .cell:nth-last-child(-n+2) { border-bottom: none; }
+  .cell h3 {
+    margin: 0 0 12px;
+    font-size: 24px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--paper);
+  }
+  .cell h3 .no {
+    color: var(--coral);
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    display: block;
+    margin-bottom: 10px;
+  }
+  .cell p {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.7;
+    color: rgba(255, 255, 255, 0.62);
+  }
+  .cell p :global(b) { color: var(--paper); font-weight: 700; }
+  .cell p :global(code) { color: var(--paper); font-weight: 600; }
+  .cell p :global(a) { color: var(--paper); }
+
+  @media (max-width: 760px) {
+    .why-grid { grid-template-columns: 1fr; }
+    .cell { border-right: none; }
+    .cell:nth-last-child(-n+2) { border-bottom: 1px solid rgba(255, 255, 255, 0.14); }
+    .cell:last-child { border-bottom: none; }
+  }
+</style>

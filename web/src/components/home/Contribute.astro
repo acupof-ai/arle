@@ -1,0 +1,104 @@
+---
+import type { Contribute } from "../../data/content.ts";
+
+interface Props {
+  rows: Contribute["rows"];
+  starAsk: Contribute["starAsk"];
+}
+const { rows, starAsk } = Astro.props;
+---
+<ul class="battle">
+  {rows.map((r) => (
+    <li>
+      <span class:list={["pri", { hot: r.hot }]}>{r.pri}</span>
+      <span class="what"><b>{r.title}</b><span class="d">{r.desc}</span></span>
+      <span class="where">{r.where}</span>
+    </li>
+  ))}
+</ul>
+<div class="star-ask">
+  <p set:html={starAsk.html} />
+  <a href={starAsk.cta.href}>{starAsk.cta.label}</a>
+</div>
+<style>
+  .battle {
+    list-style: none;
+    margin: 0 0 28px;
+    padding: 0;
+  }
+  .battle li {
+    display: grid;
+    grid-template-columns: 88px 1fr auto;
+    gap: 18px;
+    align-items: baseline;
+    padding: 16px 0;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .battle li:first-child { border-top: 1px solid var(--ink); }
+  .pri {
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    font-feature-settings: "tnum" 1;
+  }
+  .pri.hot { color: var(--coral); font-weight: 700; }
+  .what { font-size: 14px; color: var(--ink); }
+  .what b { font-weight: 700; }
+  .what .d {
+    color: var(--ink-soft);
+    font-size: 12px;
+    display: block;
+    margin-top: 3px;
+  }
+  .where {
+    font-size: 11px;
+    color: var(--ink-soft);
+    white-space: nowrap;
+  }
+
+  /* the one solid-coral surface on the page */
+  .star-ask {
+    margin-left: calc(50% - 50vw);
+    margin-right: calc(50% - 50vw);
+    padding: 64px calc(50vw - 50%);
+    background: var(--console);
+    color: var(--paper);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 24px 40px;
+  }
+  .star-ask :global(::selection) { background: var(--paper); color: var(--ink); }
+  .star-ask p {
+    margin: 0;
+    flex: 1;
+    min-width: 280px;
+    font-size: 19px;
+    line-height: 1.55;
+    color: rgba(255, 255, 255, 0.7);
+  }
+  .star-ask p :global(b) { font-weight: 700; color: var(--paper); }
+  .star-ask a {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 15px;
+    white-space: nowrap;
+    padding: 16px 24px;
+    border: 1px solid var(--coral);
+    background: var(--coral);
+    color: #fff;
+    text-decoration: none;
+    transition: background var(--t-base), color var(--t-base), border-color var(--t-base);
+  }
+  .star-ask a:hover { background: transparent; color: var(--coral); }
+
+  @media (max-width: 760px) {
+    .battle li {
+      grid-template-columns: 1fr;
+      gap: 6px;
+    }
+    .where { white-space: normal; }
+  }
+</style>
