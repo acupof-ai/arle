@@ -1897,30 +1897,44 @@ impl Dsv4Model {
             if layer_idx == 0 {
                 self.dump_tail_row("attn_out_pre_ar_L0", &attn_out, start_pos);
             }
-            // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
-            {
-                let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
-                crate::stage_profile::profile(ctx, "dsv4/stage/attn_allreduce", || {
-                    self.tp.all_reduce_sum(&self.ctx, &mut attn_out)
+            // SAFETY: hc_post writes the full stream buffer.
+            let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+            let fused_attn = dsv4_fused_ar_enabled()
+                && self.tp.try_fused_ar_hc_post(
+                    &self.ctx,
+                    &attn_out,
+                    None,
+                    &stream,
+                    &mhc.post,
+                    &mhc.comb,
+                    &mut attn_stream,
+                    hidden_size,
+                    hc_mult,
+                )?;
+            if !fused_attn {
+                // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
+                {
+                    let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
+                    crate::stage_profile::profile(ctx, "dsv4/stage/attn_allreduce", || {
+                        self.tp.all_reduce_sum(&self.ctx, &mut attn_out)
+                    })?;
+                }
+                crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
+                    crate::hc::hc_post(
+                        &self.ctx,
+                        &attn_out,
+                        &stream,
+                        &mhc.post,
+                        &mhc.comb,
+                        hidden_size,
+                        hc_mult,
+                        &mut attn_stream,
+                    )
                 })?;
             }
             if layer_idx == 0 {
                 self.dump_tail_row("attn_out_L0", &attn_out, start_pos);
             }
-            // SAFETY: hc_post writes the full stream buffer.
-            let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
-                crate::hc::hc_post(
-                    &self.ctx,
-                    &attn_out,
-                    &stream,
-                    &mhc.post,
-                    &mhc.comb,
-                    hidden_size,
-                    hc_mult,
-                    &mut attn_stream,
-                )
-            })?;
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
 
@@ -2958,6 +2972,17 @@ fn dsv4_whole_step_graph_enabled() -> bool {
 fn dsv4_comm_overlap_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_COMM_OVERLAP").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+/// Fuse the per-layer all-reduce with the following DSv4 hc_post (and the moe
+/// shared-add) into one device kernel. A/B flag, default off until the matched
+/// pair licenses it; the one-shot comm must be active (else silently falls
+/// back to the AR + hc_post pair).
+fn dsv4_fused_ar_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_FUSED_AR").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }
