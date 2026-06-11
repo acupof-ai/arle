@@ -5,6 +5,8 @@
 //! tensors, collectives, sampling, and the model forward all live inside the
 //! backend executors ([`BackendExecutor`]), never crossing this seam.
 
+use std::cell::Cell;
+
 use infer_plan::{ForwardPlan, StepOutput};
 
 #[path = "allocator.rs"]
@@ -65,6 +67,15 @@ pub trait BackendExecutor {
         Vec::new()
     }
 
+    /// Maximum number of plan rows the backend can execute in one scheduler
+    /// step. Backend-neutral schedulers use this as a capability, not a type
+    /// dependency: batched backends keep the unbounded default, while scalar
+    /// backends (Metal/MLX today) report `1` so core never submits a plan shape
+    /// the executor must reject.
+    fn max_rows_per_step(&self) -> usize {
+        usize::MAX
+    }
+
     /// How many leading prefix-cache pages of `block_ids` (in prompt order) the
     /// executor can actually reuse when attaching this prefix to a slot.
     ///
@@ -80,6 +91,12 @@ pub trait BackendExecutor {
     fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
         block_ids.len()
     }
+
+    /// Notify the backend that host prefix-cache pages were evicted from the
+    /// radix cache and released by the host KV pool. Backends that mirror page
+    /// contents or prefix snapshots below the seam can drop those mirrors here;
+    /// the default is a no-op for page-sliceable or stateless executors.
+    fn release_prefix_pages(&mut self, _pages: &[u32]) {}
 
     /// Move the model's device weights to host RAM and free the VRAM (OPD teacher
     /// time-share), returning the device bytes freed. The default is a no-op
@@ -164,5 +181,66 @@ impl ResourceGovernor for PermissiveGovernor {
 
     fn should_yield(&self) -> bool {
         false
+    }
+}
+
+/// Static cooperative governor for local, low-impact serving.
+///
+/// It is intentionally backend-neutral: the caller chooses a token budget and
+/// optional cooperative yield cadence, while engine-core enforces those knobs at
+/// scheduler boundaries. OS-signal readers can wrap the same trait later without
+/// changing service or scheduler code.
+#[derive(Debug)]
+pub struct CooperativeGovernor {
+    admission: AdmissionVerdict,
+    budget: StepBudget,
+    yield_every_ticks: usize,
+    tick: Cell<usize>,
+}
+
+impl CooperativeGovernor {
+    /// Build a governor that admits normally, enforces `budget`, and never
+    /// voluntarily yields unless [`Self::with_yield_every_ticks`] is used.
+    #[must_use]
+    pub fn new(budget: StepBudget) -> Self {
+        Self {
+            admission: AdmissionVerdict::Admit,
+            budget,
+            yield_every_ticks: 0,
+            tick: Cell::new(0),
+        }
+    }
+
+    /// Override the admission verdict returned at scheduler admission.
+    #[must_use]
+    pub fn with_admission(mut self, admission: AdmissionVerdict) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// Yield every `n` scheduler ticks. `0` disables periodic yield.
+    #[must_use]
+    pub fn with_yield_every_ticks(mut self, n: usize) -> Self {
+        self.yield_every_ticks = n;
+        self
+    }
+}
+
+impl ResourceGovernor for CooperativeGovernor {
+    fn admission_gate(&self) -> AdmissionVerdict {
+        self.admission
+    }
+
+    fn step_budget(&self) -> StepBudget {
+        self.budget
+    }
+
+    fn should_yield(&self) -> bool {
+        if self.yield_every_ticks == 0 {
+            return false;
+        }
+        let tick = self.tick.get().wrapping_add(1);
+        self.tick.set(tick);
+        tick.is_multiple_of(self.yield_every_ticks)
     }
 }

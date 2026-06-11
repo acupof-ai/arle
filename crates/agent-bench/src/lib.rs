@@ -645,8 +645,8 @@ pub fn cuda_qwen35_engine_from_model_path(
 }
 
 // ---------------------------------------------------------------------------
-// Concurrent (c>=2) drive — validates the Metal executor's behavior when the
-// planner batches >1 row into a single tick (two requests admitted at once).
+// Concurrent (c>=2) drive — validates scheduler/executor behavior when multiple
+// requests are submitted at once.
 // ---------------------------------------------------------------------------
 
 /// Result of driving N concurrent requests through an engine to completion.
@@ -654,8 +654,7 @@ pub fn cuda_qwen35_engine_from_model_path(
 pub struct ConcurrentResult {
     /// Per-request generated token ids, in submission order.
     pub generated: Vec<Vec<u32>>,
-    /// `Err` message if any `engine.step()` failed (e.g. the Metal executor's
-    /// single-row guard tripping on a multi-row plan), else `None`.
+    /// `Err` message if any `engine.step()` failed, else `None`.
     pub step_error: Option<String>,
     /// Scheduler ticks taken to drain (0 if a step errored).
     pub ticks: u64,
@@ -685,8 +684,8 @@ impl ConcurrentResult {
 /// Submit all `requests` (`(prompt, gen_tokens)`) into `engine` at once, then
 /// drive to idle. Returns each request's generated tokens, the first step error
 /// (if any), and the tick count. A step error is captured rather than
-/// propagated so a caller can assert the Metal single-row guard fires (a
-/// multi-row plan must error loud, never silently mis-decode).
+/// propagated so tests can assert either successful scheduling or a loud backend
+/// failure depending on the executor capability under test.
 pub fn drive_concurrent<E, K>(
     engine: &mut Engine<E, K>,
     requests: &[(Vec<u32>, usize)],
@@ -975,7 +974,8 @@ mod tests {
     /// c>=2 plan-shape fact (CPU, no MLX): with two requests admitted at once
     /// and `num_slots=2`, the planner batches both into a single tick's plan —
     /// proving a genuine concurrent workload produces a multi-row `ForwardPlan`.
-    /// This is the shape the Metal executor's single-row guard must reject.
+    /// Scalar backends report a row cap to the scheduler so this multi-row shape
+    /// is only produced for backends that can accept it.
     #[test]
     fn concurrent_plan_batches_multiple_rows() -> Result<()> {
         // Probe executor that records the max rows seen in any single plan.
@@ -1036,20 +1036,17 @@ mod tests {
     }
 
     /// REAL Metal c>=2 validation (Qwen3.5-0.8B, fast). Submits two greedy
-    /// requests at once through the Metal engine and drives to idle. The
-    /// rewrite Metal executor supports exactly one row per plan, so the planner's
-    /// multi-row concurrent plan must surface a LOUD error (never silently
-    /// mis-decode), and the pipeline fast path must NOT fire on any concurrent
-    /// step. Prints the per-request fingerprint + pipeline hit count for a
-    /// cross-process matched A/B (run once with `INFER_METAL_PIPELINE=1`, once
-    /// without; the captured-error string and hit count must match).
+    /// requests at once through the Metal engine and drives to idle. The Metal
+    /// executor reports a one-row capability, so the shared scheduler must
+    /// serialize admission instead of producing a multi-row plan and letting the
+    /// executor error.
     ///   CUDARC_CUDA_VERSION=12060 cargo test --release -p agent-bench \
     ///     --no-default-features --features metal,no-cuda \
-    ///     metal_c2_fall_to_head_qwen35_08b -- --ignored --nocapture
+    ///     metal_c2_serializes_qwen35_08b -- --ignored --nocapture
     #[cfg(feature = "metal")]
     #[test]
     #[ignore = "real Metal c>=2 validation; needs --features metal + cached Qwen3.5-0.8B-MLX-4bit"]
-    fn metal_c2_fall_to_head_qwen35_08b() -> Result<()> {
+    fn metal_c2_serializes_qwen35_08b() -> Result<()> {
         let model = "mlx-community/Qwen3.5-0.8B-MLX-4bit";
         let hits_before = infer_metal::pipeline_fast_path_hits();
         let (mut engine, _ttft) = metal_engine_from_model_path(model)?;
@@ -1078,35 +1075,29 @@ mod tests {
             res.fingerprint(),
             hits_after - hits_before,
         );
-        // The single-row guard MUST fire: a concurrent plan is multi-row.
-        let err = res
-            .step_error
-            .as_deref()
-            .expect("c>=2 multi-row plan must surface a loud error, not silently decode");
-        assert!(
-            err.contains("exactly one prefill or decode row"),
-            "expected the Metal single-row guard, got: {err}"
-        );
-        // The pipeline fast path must never fire during a concurrent run.
         assert_eq!(
-            hits_after - hits_before,
-            0,
-            "pipeline fast path fired during a c>=2 run (gating gap!)"
+            res.step_error, None,
+            "Metal row cap should make c>=2 serialize in the scheduler"
         );
+        assert_eq!(
+            res.generated.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![16, 16]
+        );
+        let _ = hits_after - hits_before;
         Ok(())
     }
 
     /// REAL Metal c>=2 validation on the CANONICAL MoE model
     /// (`mlx-community/Qwen3.6-35B-A3B-4bit`). Same contract as the 0.8B variant:
-    /// the multi-row concurrent plan must surface the single-row guard, and the
-    /// pipeline must not fire concurrently.
+    /// the shared scheduler must serialize work before the Metal executor sees
+    /// it.
     ///   cargo test --release -p agent-bench --no-default-features \
     ///     --features metal,no-cuda \
-    ///     metal_c2_fall_to_head_qwen36_canonical -- --ignored --nocapture
+    ///     metal_c2_serializes_qwen36_canonical -- --ignored --nocapture
     #[cfg(feature = "metal")]
     #[test]
     #[ignore = "real Metal MoE c>=2 validation; needs --features metal + ~19GB cached Qwen3.6-35B-A3B-4bit"]
-    fn metal_c2_fall_to_head_qwen36_canonical() -> Result<()> {
+    fn metal_c2_serializes_qwen36_canonical() -> Result<()> {
         let model = "mlx-community/Qwen3.6-35B-A3B-4bit";
         let hits_before = infer_metal::pipeline_fast_path_hits();
         let (mut engine, _ttft) = metal_engine_from_model_path(model)?;
@@ -1134,19 +1125,15 @@ mod tests {
             res.fingerprint(),
             hits_after - hits_before,
         );
-        let err = res
-            .step_error
-            .as_deref()
-            .expect("c>=2 multi-row plan must surface a loud error, not silently decode");
-        assert!(
-            err.contains("exactly one prefill or decode row"),
-            "expected the Metal single-row guard, got: {err}"
+        assert_eq!(
+            res.step_error, None,
+            "Metal row cap should make c>=2 serialize in the scheduler"
         );
         assert_eq!(
-            hits_after - hits_before,
-            0,
-            "pipeline fast path fired during a c>=2 run (gating gap!)"
+            res.generated.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![16, 16]
         );
+        let _ = hits_after - hits_before;
         Ok(())
     }
 

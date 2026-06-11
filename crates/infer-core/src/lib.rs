@@ -15,6 +15,7 @@ use anyhow::{Result, bail};
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
     AdmissionVerdict, BackendExecutor, KvPool, PermissiveGovernor, PollResult, ResourceGovernor,
+    StepBudget,
 };
 
 /// Stable handle returned to callers when a request is submitted.
@@ -293,9 +294,18 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     pub fn with_config_and_governor(
         executor: E,
         kv: K,
-        config: SchedulerConfig,
+        mut config: SchedulerConfig,
         governor: Box<dyn ResourceGovernor>,
     ) -> Self {
+        let max_rows = executor.max_rows_per_step().max(1);
+        if config.num_slots > max_rows {
+            log::warn!(
+                "executor caps rows per step at {max_rows}; scheduler slots {} -> {max_rows}",
+                config.num_slots
+            );
+            config.num_slots = max_rows;
+        }
+        config.num_slots = config.num_slots.max(1);
         let radix = RadixCache::new(kv.page_size().max(1));
         let model_stop_token_ids = executor.model_stop_token_ids();
         Self {
@@ -441,8 +451,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         }
 
+        let budget = self.governor.step_budget();
+        if self.governor.should_yield() || budget.max_tokens == 0 || budget.max_micros == 0 {
+            std::thread::yield_now();
+            return Ok(());
+        }
+
         self.admit_waiting()?;
         let mut plan = self.build_forward_plan();
+        self.apply_step_budget(&mut plan, budget);
         if plan.is_idle() {
             return Ok(());
         }
@@ -457,6 +474,43 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.inflight = Some(self.executor.submit(&plan, &mut self.kv)?);
         self.pending_plan = Some(plan);
         Ok(())
+    }
+
+    fn apply_step_budget(&self, plan: &mut ForwardPlan, budget: StepBudget) {
+        if budget.max_tokens == usize::MAX {
+            return;
+        }
+
+        let mut remaining = budget.max_tokens;
+        if remaining == 0 {
+            plan.decode_rows.clear();
+            plan.prefill_rows.clear();
+            plan.mode = infer_plan::ForwardMode::Idle;
+            return;
+        }
+
+        if plan.decode_rows.len() > remaining {
+            plan.decode_rows.truncate(remaining);
+            plan.prefill_rows.clear();
+            plan.mode =
+                planner::plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
+            return;
+        }
+        remaining -= plan.decode_rows.len();
+
+        let mut keep_prefills = 0;
+        for row in &mut plan.prefill_rows {
+            if remaining == 0 {
+                break;
+            }
+            if row.tokens.len() > remaining {
+                row.tokens.truncate(remaining);
+            }
+            remaining = remaining.saturating_sub(row.tokens.len());
+            keep_prefills += 1;
+        }
+        plan.prefill_rows.truncate(keep_prefills);
+        plan.mode = planner::plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
     }
 
     /// Run scheduler ticks until there is no waiting, active, or in-flight work.
@@ -1187,6 +1241,42 @@ mod testing {
         }
     }
 
+    #[derive(Debug, Clone)]
+    pub(super) struct SingleRowExecutor {
+        inner: MockExecutor,
+        pub(super) max_rows_seen: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl SingleRowExecutor {
+        pub(super) fn new() -> Self {
+            Self {
+                inner: MockExecutor::ready(),
+                max_rows_seen: std::rc::Rc::new(std::cell::Cell::new(0)),
+            }
+        }
+    }
+
+    impl BackendExecutor for SingleRowExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            let rows = plan.prefill_rows.len() + plan.decode_rows.len();
+            self.max_rows_seen.set(self.max_rows_seen.get().max(rows));
+            if rows > 1 {
+                bail!("single-row executor received {rows} rows");
+            }
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        fn max_rows_per_step(&self) -> usize {
+            1
+        }
+    }
+
     /// Mock executor that reports model-default stop tokens, mirroring how a
     /// real backend (e.g. Metal) exposes its config EOS/stop ids to the engine.
     #[derive(Debug, Clone)]
@@ -1541,6 +1631,28 @@ mod testing {
             false
         }
     }
+
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct TokenBudgetGovernor {
+        pub(super) max_tokens: usize,
+    }
+
+    impl ResourceGovernor for TokenBudgetGovernor {
+        fn admission_gate(&self) -> AdmissionVerdict {
+            AdmissionVerdict::Admit
+        }
+
+        fn step_budget(&self) -> StepBudget {
+            StepBudget {
+                max_tokens: self.max_tokens,
+                max_micros: u64::MAX,
+            }
+        }
+
+        fn should_yield(&self) -> bool {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1550,7 +1662,8 @@ mod tests {
 
     use super::testing::{
         DeviceMirrorExecutor, HoldGovernor, LimitedPrefixExecutor, MockExecutor, MockKvPool,
-        SamplingExecutor, SpecMirrorExecutor, StopTokenExecutor, WarmupCountingExecutor,
+        SamplingExecutor, SingleRowExecutor, SpecMirrorExecutor, StopTokenExecutor,
+        TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -2167,6 +2280,45 @@ mod tests {
         assert_eq!(engine.active_count(), 0);
         assert_eq!(engine.waiting_count(), 1);
         assert!(!engine.has_inflight());
+        Ok(())
+    }
+
+    #[test]
+    fn backend_row_cap_clamps_scheduler_slots() -> Result<()> {
+        let executor = SingleRowExecutor::new();
+        let max_rows_seen = executor.max_rows_seen.clone();
+        let mut engine = Engine::with_config(executor, MockKvPool::new(4), test_config(4));
+        engine.submit_request(vec![1, 2, 3], 1);
+        engine.submit_request(vec![10, 11, 12], 1);
+
+        engine.step()?;
+
+        assert_eq!(engine.active_count(), 1);
+        assert_eq!(engine.waiting_count(), 1);
+        assert_eq!(max_rows_seen.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn step_budget_clamps_prefill_tokens() -> Result<()> {
+        let mut config = test_config(1);
+        config.chunked_prefill_size = 8;
+        let mut engine = Engine::with_config_and_governor(
+            MockExecutor::ready(),
+            MockKvPool::new(1),
+            config,
+            Box::new(TokenBudgetGovernor { max_tokens: 3 }),
+        );
+        engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8], 1);
+
+        // First tick submits a 3-token prefill chunk; second tick polls and
+        // applies it, proving the governor budget was enforced before submit.
+        engine.step()?;
+        engine.step()?;
+
+        let request = engine.active.values().next().expect("request still active");
+        assert_eq!(request.prefill_start_pos, 3);
+        assert!(matches!(request.phase, RequestPhase::Prefilling { .. }));
         Ok(())
     }
 

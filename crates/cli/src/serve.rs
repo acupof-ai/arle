@@ -158,31 +158,22 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         None
     };
 
-    // Speculative / MTP routing is supported by Metal and CUDA on the rewrite
-    // serve stack. The CLI rejects it for other backends so the error surface
-    // is clear; the chosen backend carries it through to infer-api, whose serve
-    // path lowers `--spec-type mtp` into the engine config (CUDA DSv4 consumes
-    // it) and fail-closes the unimplemented variants. `--mtp-draft-model` (an
-    // external draft model) stays Metal-only: CUDA uses the checkpoint-native
-    // MTP head.
-    if serve_args.spec_type != ServeSpecTypeArg::None
-        && !matches!(backend, ServeBackend::Metal | ServeBackend::Cuda)
-    {
-        return Err(
-            "--spec-type is currently only supported by the Metal and CUDA backends".to_string(),
-        );
+    // Speculative / MTP routing is checkpoint-native CUDA-only in the rewrite
+    // serve stack. DSv4's depth-K MTP head lowers through `mtp_draft_tokens`;
+    // Metal's monolith-era external draft route has not been re-ported, so the
+    // CLI fails closed before startup rather than letting infer-api fail later.
+    if serve_args.spec_type == ServeSpecTypeArg::Auto {
+        return Err("--spec-type auto is not implemented; use mtp".to_string());
     }
-    if serve_args.mtp_draft_model.is_some() && backend != ServeBackend::Metal {
-        return Err(
-            "--mtp-draft-model is currently only supported by the Metal backend".to_string(),
-        );
+    if serve_args.spec_type != ServeSpecTypeArg::None && backend != ServeBackend::Cuda {
+        return Err("--spec-type is currently only supported by the CUDA backend".to_string());
     }
-    if serve_args.mtp_draft_tokens.is_some()
-        && !matches!(backend, ServeBackend::Metal | ServeBackend::Cuda)
-    {
+    if serve_args.mtp_draft_model.is_some() {
+        return Err("--mtp-draft-model is not supported by the rewrite serve stack".to_string());
+    }
+    if serve_args.mtp_draft_tokens.is_some() && backend != ServeBackend::Cuda {
         return Err(
-            "--mtp-draft-tokens is currently only supported by the Metal and CUDA backends"
-                .to_string(),
+            "--mtp-draft-tokens is currently only supported by the CUDA backend".to_string(),
         );
     }
 
@@ -318,6 +309,7 @@ fn resolve_engine_config(serve_args: &ServeArgs) -> Result<EngineLoadConfig, Str
     let mut config = EngineLoadConfig::default();
 
     if serve_args.low_impact {
+        config.low_impact = true;
         config.num_slots = 1;
         config.total_pages = config.total_pages.min(1024);
         config.max_prompt_tokens = config.max_prompt_tokens.min(8192);
@@ -516,6 +508,7 @@ mod tests {
         assert_eq!(config.options.engine_config.max_prompt_tokens, 8192);
         assert_eq!(config.options.engine_config.max_total_tokens, 8192);
         assert_eq!(config.options.engine_config.chunked_prefill_size, 32);
+        assert!(config.options.engine_config.low_impact);
     }
 
     #[test]
@@ -654,13 +647,13 @@ mod tests {
     }
 
     #[test]
-    fn non_metal_spec_type_errors_when_compiled_non_metal() {
+    fn non_cuda_spec_type_errors_when_compiled_non_cuda() {
         if skip_if_no_backend() {
             return;
         }
-        // Only meaningful when the compiled backend is not Metal; on a Metal
-        // build `--spec-type mtp` is accepted, so skip there.
-        if CompiledBackend::detect() == CompiledBackend::Metal {
+        // Only meaningful when the compiled backend is not CUDA; on a CUDA
+        // build `--spec-type mtp` is accepted for checkpoint-native DSv4 MTP.
+        if CompiledBackend::detect() == CompiledBackend::Cuda {
             return;
         }
         let (args, serve) = parse_serve(&[
@@ -673,15 +666,36 @@ mod tests {
             "--spec-type",
             "mtp",
         ]);
-        let err = resolve_config(&args, &serve).expect_err("reject non-Metal spec type");
+        let err = resolve_config(&args, &serve).expect_err("reject non-CUDA spec type");
         assert_eq!(
             err,
-            "--spec-type is currently only supported by the Metal backend"
+            "--spec-type is currently only supported by the CUDA backend"
         );
     }
 
     #[test]
-    fn metal_spec_type_accepted_when_compiled_metal() {
+    fn cuda_spec_type_accepted_when_compiled_cuda() {
+        if CompiledBackend::detect() != CompiledBackend::Cuda {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            "cuda",
+            "--model-path",
+            "model",
+            "--spec-type",
+            "mtp",
+        ]);
+        let config = resolve_config(&args, &serve).expect("CUDA accepts checkpoint-native MTP");
+        assert_eq!(config.backend, ServeBackend::Cuda);
+        assert_eq!(config.options.spec.spec_type, ServeSpecType::Mtp);
+        assert_eq!(config.options.engine_config.mtp_draft_tokens, Some(1));
+    }
+
+    #[test]
+    fn metal_spec_type_rejected_when_compiled_metal() {
         if CompiledBackend::detect() != CompiledBackend::Metal {
             return;
         }
@@ -695,13 +709,15 @@ mod tests {
             "--spec-type",
             "mtp",
         ]);
-        let config = resolve_config(&args, &serve).expect("metal accepts spec type");
-        assert_eq!(config.backend, ServeBackend::Metal);
-        assert_eq!(config.options.spec.spec_type, ServeSpecType::Mtp);
+        let err = resolve_config(&args, &serve).expect_err("Metal MTP is fail-closed");
+        assert_eq!(
+            err,
+            "--spec-type is currently only supported by the CUDA backend"
+        );
     }
 
     #[test]
-    fn metal_mtp_draft_model_implies_mtp_spec() {
+    fn mtp_draft_model_is_rejected() {
         if CompiledBackend::detect() != CompiledBackend::Metal {
             return;
         }
@@ -717,14 +733,11 @@ mod tests {
             "--mtp-draft-tokens",
             "2",
         ]);
-        let config = resolve_config(&args, &serve).expect("metal accepts mtp draft options");
-        assert_eq!(config.backend, ServeBackend::Metal);
-        assert_eq!(config.options.spec.spec_type, ServeSpecType::Mtp);
+        let err = resolve_config(&args, &serve).expect_err("external draft model is not re-ported");
         assert_eq!(
-            config.options.spec.mtp_draft_model.as_deref(),
-            Some("draft-model")
+            err,
+            "--mtp-draft-model is not supported by the rewrite serve stack"
         );
-        assert_eq!(config.options.spec.mtp_draft_tokens, Some(2));
     }
 
     #[test]
