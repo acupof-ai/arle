@@ -210,7 +210,7 @@ def _fq_kkt_kernel():
                 T.barrier_wait(k_is_ready, 0)
 
                 # A = K @ K^T
-                T.gemm_v1(
+                T.gemm(
                     k_shared, k_shared, a64_fragment, transpose_B=True, clear_accum=True
                 )
 
@@ -289,9 +289,9 @@ def _fq_kkt_kernel():
                         a32i0_shared[k_s, k_t] = a32i_fragment[j_s, k_s, k_t]
                     else:
                         a32i1_shared[k_s, k_t] = a32i_fragment[j_s, k_s, k_t]
-                T.gemm_v1(a32i1_shared, a32o_shared, a32o_fragment, clear_accum=True)
+                T.gemm(a32i1_shared, a32o_shared, a32o_fragment, clear_accum=True)
                 T.copy(a32o_fragment, a32o_shared)
-                T.gemm_v1(a32o_shared, a32i0_shared, a32o_fragment, clear_accum=True)
+                T.gemm(a32o_shared, a32i0_shared, a32o_fragment, clear_accum=True)
 
                 # Combine inversion output
                 for j_s, k_s, k_t in T.Parallel(2, 32, 32):
@@ -477,7 +477,7 @@ def _fq_fwd_kernel():
                     # [STAGE 0] 5
                     T.barrier_wait(bar_5, i_s % 2)
                     # S += K^T @ V'
-                    T.gemm_v1(
+                    T.gemm(
                         k_shared[i_s % 2, :, :],
                         vn_shared,
                         h_fragment,
@@ -524,7 +524,7 @@ def _fq_fwd_kernel():
                     # [STAGE 0] 1
                     T.barrier_wait(bar_1, i_s % 2)
                     # U = K @ S
-                    T.gemm_v1(
+                    T.gemm(
                         k_shared[i_s % 2, :, :], h_shared, u_fragment, clear_accum=True
                     )
 
@@ -541,7 +541,7 @@ def _fq_fwd_kernel():
                     # [STAGE 0] 3
                     T.barrier_wait(bar_3, i_s % 2)
                     # Vd = Ag @ W
-                    T.gemm_v1(
+                    T.gemm(
                         a_shared[i_s % 2, :, :],
                         v_shared[i_s % 2, :, :],
                         v_fragment,
@@ -575,7 +575,7 @@ def _fq_fwd_kernel():
                     # [STAGE 0] 0
                     T.barrier_wait(bar_0, i_s % 2)
                     # P = Q K^T
-                    T.gemm_v1(
+                    T.gemm(
                         q_shared[i_s % 2, :, :],
                         k_shared[i_s % 2, :, :],
                         p_fragment,
@@ -609,7 +609,7 @@ def _fq_fwd_kernel():
                     # [STAGE 0] 2
                     T.barrier_wait(bar_1, i_s % 2)
                     # O = Q @ S
-                    T.gemm_v1(
+                    T.gemm(
                         q_shared[i_s % 2, :, :], h_shared, o_fragment, clear_accum=True
                     )
 
@@ -627,7 +627,7 @@ def _fq_fwd_kernel():
                     # [STAGE 0] 4
                     T.barrier_wait(bar_4, i_s % 2)
                     # O += Pg @ Vd
-                    T.gemm_v1(p_shared, vd_shared, o_fragment, clear_accum=False)
+                    T.gemm(p_shared, vd_shared, o_fragment, clear_accum=False)
                     T.barrier_arrive(bar_5)
 
                     # [STAGE 0] 5
