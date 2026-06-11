@@ -13,7 +13,7 @@ systematic gap: **budget logic was fragmented and partly absent**.
 | DSv4 CUDA | bottom-up clamp `free×0.9 − shared`, NCCL min-reduce (dsv4.rs) | ok |
 | Qwen3.5/3.6 CUDA | **NO clamp** — requested num_slots admitted as-is | **OOM at large max_seq_len (the #60 failure class)** |
 | Metal | top-down `plan_resource_budget` (its own planner) | ok, but not shared |
-| Host RAM (T1) / SSD (T2) | hardcoded 4 GiB / 20 GiB constants | not machine-derived |
+| Host RAM (T1) / SSD (T2) | hardcoded 4 GiB / 20 GiB constants | not machine-derived (**fixed C3**) |
 
 ## What Worked
 
@@ -42,13 +42,34 @@ guards).
     crash at slot alloc, new = clamp + serve. Dense Qwen3 is out of scope: it
     uses a `PagedKVPool` sized by `total_pages` (global pool), not
     num_slots×max_seq_len, so it has no slot-multiplied OOM.
+- **Phase C3** (`5353f17f`): **host RAM (T1) / SSD (T2) tiers machine-derived**
+  instead of hardcoded. `kv_tier.rs` gains two probes — `/proc/meminfo`
+  `MemAvailable` (dep-free) for RAM, POSIX `statvfs` (libc, unix) for free disk
+  — feeding the same neutral `split_host_tiers` kernel. The hardcoded
+  `DEFAULT_KV_TIER_BUDGET_BYTES` (4 GiB) / `DEFAULT_KV_SSD_BUDGET_BYTES`
+  (20 GiB) are deleted; `default_t1_budget_bytes()` (executor constructor) and
+  `default_t2_budget_bytes(root)` (the `--kv-ssd-path` attach in `loaded.rs`)
+  replace them.
+  - **Caps == the old constants** (`HostTierPolicy::default`): an ample host
+    (the H20 pod, 256+ GiB RAM / TB disk) resolves to the exact 4 GiB / 20 GiB
+    defaults — **byte-identical serving footprint**, no pod regression. A
+    constrained host scales down (RAM ×0.25 with a 1 GiB floor, SSD ×0.5); a
+    probe miss (Mac: no `/proc`) falls back to the cap, so it never
+    over-shrinks. CLI overrides (`--kv-t1-budget-bytes` / `--kv-ssd-max-bytes`)
+    are untouched — they short-circuit the probe.
+
+With C3 the audit's last fragmented surface converges: **VRAM (DSv4 + Qwen3.5/3.6)
+and host RAM/SSD now all flow through the one neutral infer-seam kernel.**
 
 ## Evidence
 
 - `infer-seam` unit tests: **10/10 pass** (kernel arithmetic, DSv4 fold
   byte-identity, tier caps/floors/fallback).
+- `infer-cuda` `kv_tier` tests: **7/7 pass**, including C3's new probe tests
+  (`statvfs` on a real dir reports Some + nonexistent path → None; T1 budget in
+  `[1 GiB, 4 GiB]`; T2 budget ≤ 20 GiB cap).
 - Mac CUDA-Rust typecheck (`cuda,no-cuda`) + `clippy -D warnings`: **clean** for
-  C1 and C2.
+  C1, C2, and C3 (both `cuda,no-cuda` and `no-cuda` paths).
 - DSv4 C1 byte-identity: the #60 pod 8-slot run already exercises this exact
   path (`shared MoE decode 114MB` came through `kv_budget_num_slots`); the
   refactor preserves the log line and arithmetic.
