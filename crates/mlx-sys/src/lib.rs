@@ -53,6 +53,9 @@ unsafe extern "C" {
     /// Returns 1 when MLX reports Neural Accelerator kernels available, 0 when
     /// unavailable, and -1 on bridge/runtime error.
     pub fn mlx_metal_nax_available() -> i32;
+    /// Returns Metal's recommended max GPU working set in bytes, or 0 when no
+    /// system Metal device is available.
+    pub fn mlx_metal_recommended_max_working_set_size() -> u64;
 
     // === Array lifecycle ===
 

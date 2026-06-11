@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::{config, wired_limit};
+use crate::{config, mlx, wired_limit};
 
 use crate::executor::MetalKvCacheDtype;
 
@@ -43,6 +43,7 @@ pub struct MetalResourceRequest {
 pub struct MetalSystemStatus {
     pub total_memory_bytes: Option<usize>,
     pub available_memory_bytes: Option<usize>,
+    pub recommended_max_working_set_bytes: Option<usize>,
     pub swap_used_bytes: Option<usize>,
     pub pageouts_delta_bytes: Option<usize>,
     pub swapouts_delta_bytes: Option<usize>,
@@ -54,6 +55,7 @@ impl MetalSystemStatus {
         Self {
             total_memory_bytes: physical_memory_bytes(),
             available_memory_bytes: available_memory_bytes(),
+            recommended_max_working_set_bytes: mlx::recommended_max_working_set_size_bytes(),
             swap_used_bytes: swap_used_bytes(),
             pageouts_delta_bytes: None,
             swapouts_delta_bytes: None,
@@ -73,9 +75,10 @@ impl MetalSystemStatus {
             )
         };
         format!(
-            "system total={} available={} swap_used={} {paging}",
+            "system total={} available={} gpu_working_set={} swap_used={} {paging}",
             format_gib(self.total_memory_bytes),
             format_gib(self.available_memory_bytes),
+            format_gib(self.recommended_max_working_set_bytes),
             format_mib(self.swap_used_bytes),
         )
     }
@@ -102,6 +105,7 @@ impl PagingActivity {
 pub struct MetalResourcePlan {
     pub total_memory_bytes: Option<usize>,
     pub available_memory_bytes: Option<usize>,
+    pub recommended_max_working_set_bytes: Option<usize>,
     pub swap_used_bytes: Option<usize>,
     pub pageouts_delta_bytes: Option<usize>,
     pub swapouts_delta_bytes: Option<usize>,
@@ -128,6 +132,7 @@ impl MetalResourcePlan {
             MetalSystemStatus {
                 total_memory_bytes: self.total_memory_bytes,
                 available_memory_bytes: self.available_memory_bytes,
+                recommended_max_working_set_bytes: self.recommended_max_working_set_bytes,
                 swap_used_bytes: self.swap_used_bytes,
                 pageouts_delta_bytes: self.pageouts_delta_bytes,
                 swapouts_delta_bytes: self.swapouts_delta_bytes,
@@ -165,6 +170,7 @@ pub fn plan_resource_budget(
     let system_status = MetalSystemStatus::current();
     let total_memory_bytes = system_status.total_memory_bytes;
     let available_memory_bytes = system_status.available_memory_bytes;
+    let recommended_max_working_set_bytes = system_status.recommended_max_working_set_bytes;
     let swap_used_bytes = system_status.swap_used_bytes;
     let paging = sample_paging_activity();
     let system_status = MetalSystemStatus {
@@ -206,6 +212,7 @@ pub fn plan_resource_budget(
         request.low_impact,
         total_memory_bytes,
         available_memory_bytes,
+        recommended_max_working_set_bytes,
         &system_status_line,
     )?;
 
@@ -273,6 +280,7 @@ pub fn plan_resource_budget(
     Ok(MetalResourcePlan {
         total_memory_bytes,
         available_memory_bytes,
+        recommended_max_working_set_bytes,
         swap_used_bytes,
         pageouts_delta_bytes: system_status.pageouts_delta_bytes,
         swapouts_delta_bytes: system_status.swapouts_delta_bytes,
@@ -299,6 +307,7 @@ fn resolve_memory_limit(
     low_impact: bool,
     total_memory_bytes: Option<usize>,
     available_memory_bytes: Option<usize>,
+    recommended_max_working_set_bytes: Option<usize>,
     system_status_line: &str,
 ) -> anyhow::Result<usize> {
     if let Some(budget) = explicit_budget {
@@ -347,6 +356,9 @@ fn resolve_memory_limit(
     }
 
     let mut candidates = Vec::new();
+    if let Some(working_set) = recommended_max_working_set_bytes {
+        candidates.push(working_set);
+    }
     if let Some(total) = total_memory_bytes {
         let reserve =
             explicit_reserve.unwrap_or_else(|| default_system_reserve_bytes(total, low_impact));
@@ -640,10 +652,26 @@ mod tests {
             false,
             Some(48 * GIB),
             Some(40 * GIB),
+            Some(36 * GIB),
             "system unit-test",
         )
         .unwrap();
         assert_eq!(budget, 22 * GIB);
+    }
+
+    #[test]
+    fn recommended_working_set_caps_auto_budget() {
+        let budget = resolve_memory_limit(
+            None,
+            None,
+            false,
+            Some(128 * GIB),
+            Some(120 * GIB),
+            Some(80 * GIB),
+            "system unit-test",
+        )
+        .unwrap();
+        assert_eq!(budget, 80 * GIB);
     }
 
     #[test]
@@ -654,6 +682,7 @@ mod tests {
             false,
             Some(48 * GIB),
             Some(4 * GIB),
+            Some(36 * GIB),
             "system unit-test",
         )
         .expect_err("low available memory must fail closed");
@@ -666,6 +695,7 @@ mod tests {
         let status = MetalSystemStatus {
             total_memory_bytes: Some(48 * GIB),
             available_memory_bytes: Some(24 * GIB + 512 * MIB),
+            recommended_max_working_set_bytes: Some(36 * GIB),
             swap_used_bytes: Some(817 * MIB),
             pageouts_delta_bytes: Some(0),
             swapouts_delta_bytes: Some(0),
@@ -673,7 +703,7 @@ mod tests {
         };
         assert_eq!(
             status.describe(),
-            "system total=48.0GiB available=24.5GiB swap_used=817MiB pageouts_delta=0MiB swapouts_delta=0MiB sample=1000ms"
+            "system total=48.0GiB available=24.5GiB gpu_working_set=36.0GiB swap_used=817MiB pageouts_delta=0MiB swapouts_delta=0MiB sample=1000ms"
         );
     }
 

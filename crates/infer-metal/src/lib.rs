@@ -33,7 +33,9 @@ pub use executor::pipeline_fast_path_hits;
 pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
 pub use kv_pool::MetalKvPool;
 #[cfg(feature = "metal")]
-pub use mlx::{AllocatorMemory, allocator_memory, clear_metal_cache};
+pub use mlx::{
+    AllocatorMemory, allocator_memory, clear_metal_cache, recommended_max_working_set_size_bytes,
+};
 #[cfg(feature = "metal")]
 pub use model_source::resolve_model_path;
 #[cfg(feature = "metal")]

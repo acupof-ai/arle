@@ -372,6 +372,11 @@ pub fn clear_metal_cache() {
     panic_if_mlx_error("mlx_metal_clear_cache");
 }
 
+pub fn recommended_max_working_set_size_bytes() -> Option<usize> {
+    let bytes = unsafe { mlx_sys::mlx_metal_recommended_max_working_set_size() };
+    usize::try_from(bytes).ok().filter(|bytes| *bytes > 0)
+}
+
 pub fn load_safetensors(path: &str) -> anyhow::Result<std::collections::HashMap<String, MlxArray>> {
     let path = std::ffi::CString::new(path)?;
     let mut names: *mut *const i8 = std::ptr::null_mut();

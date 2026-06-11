@@ -952,7 +952,16 @@ fn gpu_label(info: &hardware::GpuInfo) -> String {
         hardware::GpuInfo::Metal {
             chip,
             unified_memory_gb,
-        } => format!("{chip} ({unified_memory_gb:.1} GB unified)"),
+            recommended_working_set_gb,
+        } => {
+            if let Some(working_set) = recommended_working_set_gb {
+                format!(
+                    "{chip} ({unified_memory_gb:.1} GB unified, {working_set:.1} GB working set)"
+                )
+            } else {
+                format!("{chip} ({unified_memory_gb:.1} GB unified)")
+            }
+        }
         hardware::GpuInfo::None => "none".to_string(),
     }
 }

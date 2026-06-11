@@ -169,6 +169,7 @@ mod tests {
             CompiledBackend::Metal => GpuInfo::Metal {
                 chip: "Apple M4".to_string(),
                 unified_memory_gb: memory_gb,
+                recommended_working_set_gb: None,
             },
             CompiledBackend::Cuda => GpuInfo::Cuda {
                 name: "L4".to_string(),

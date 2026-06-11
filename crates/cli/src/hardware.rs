@@ -17,6 +17,7 @@ pub(crate) enum GpuInfo {
     Metal {
         chip: String,
         unified_memory_gb: f64,
+        recommended_working_set_gb: Option<f64>,
     },
     /// No GPU detected or not applicable.
     None,
@@ -156,8 +157,17 @@ impl SystemInfo {
             },
             CompiledBackend::Metal => match &self.gpu {
                 GpuInfo::Metal {
-                    unified_memory_gb, ..
-                } => *unified_memory_gb * 0.75, // leave headroom for OS
+                    unified_memory_gb,
+                    recommended_working_set_gb,
+                    ..
+                } => {
+                    let working_set =
+                        recommended_working_set_gb.unwrap_or(*unified_memory_gb * 0.75);
+                    let physical_budget = metal_physical_budget_gb(*unified_memory_gb);
+                    let available_budget =
+                        metal_available_budget_gb(*unified_memory_gb, self.available_ram_gb);
+                    working_set.min(physical_budget).min(available_budget)
+                }
                 _ => 0.0,
             },
             // No host AMD-GPU probe yet (the catalog has no HIP entries either);
@@ -273,10 +283,32 @@ fn detect_apple_gpu(total_ram_gb: f64) -> GpuInfo {
         GpuInfo::Metal {
             chip,
             unified_memory_gb: total_ram_gb,
+            recommended_working_set_gb: recommended_metal_working_set_gb(),
         }
     } else {
         GpuInfo::None
     }
+}
+
+#[cfg(feature = "metal")]
+fn recommended_metal_working_set_gb() -> Option<f64> {
+    infer_api::metal_recommended_max_working_set_size_bytes()
+        .map(|bytes| bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+#[cfg(not(feature = "metal"))]
+fn recommended_metal_working_set_gb() -> Option<f64> {
+    None
+}
+
+fn metal_physical_budget_gb(total_memory_gb: f64) -> f64 {
+    let reserve = (total_memory_gb / 4.0).max(14.0).min(total_memory_gb - 1.0);
+    (total_memory_gb - reserve).max(0.0)
+}
+
+fn metal_available_budget_gb(total_memory_gb: f64, available_memory_gb: f64) -> f64 {
+    let reserve = if total_memory_gb >= 32.0 { 8.0 } else { 6.0 };
+    (available_memory_gb - reserve).max(0.0)
 }
 
 #[cfg(test)]
@@ -325,5 +357,22 @@ mod tests {
     fn compiled_backend_has_name() {
         let backend = CompiledBackend::detect();
         assert!(!backend.name().is_empty());
+    }
+
+    #[test]
+    fn metal_effective_memory_accounts_for_current_available_headroom() {
+        let info = SystemInfo {
+            cpu_name: "test".to_string(),
+            cpu_cores: 8,
+            total_ram_gb: 48.0,
+            available_ram_gb: 22.8,
+            gpu: GpuInfo::Metal {
+                chip: "Apple M4 Pro".to_string(),
+                unified_memory_gb: 48.0,
+                recommended_working_set_gb: Some(37.4),
+            },
+            compiled_backend: CompiledBackend::Metal,
+        };
+        assert!((info.effective_memory_gb() - 14.8).abs() < 0.1);
     }
 }

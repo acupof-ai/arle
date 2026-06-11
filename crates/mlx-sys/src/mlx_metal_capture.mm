@@ -25,6 +25,7 @@
 #import <Metal/Metal.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -76,6 +77,16 @@ std::atomic<bool> g_capture_active{false};
 }  // namespace
 
 extern "C" {
+
+uint64_t mlx_metal_recommended_max_working_set_size(void) {
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (device == nil) {
+            return 0;
+        }
+        return static_cast<uint64_t>(device.recommendedMaxWorkingSetSize);
+    }
+}
 
 // Returns non-zero if a capture was started for this step. The caller must
 // invoke maybe_capture_qwen35_step_end() with the same return value.
