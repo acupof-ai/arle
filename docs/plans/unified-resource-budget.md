@@ -20,7 +20,7 @@ The real systematic gap is **budget fragmentation + hardcoded host tiers**:
 
 | Surface | Where | Behavior | Gap |
 |---------|-------|----------|-----|
-| DSv4 CUDA VRAM | `Dsv4Model::kv_budget_num_slots` dsv4.rs:1024-1158 | bottom-up: `mem_get_info().free × 0.9 − dsa_shared − moe_decode_shared`, `/ per_slot`, **NCCL min-reduce** (1144) | reject-below-fixed guard absent (saturating_sub to 0 → max(1)) |
+| DSv4 CUDA VRAM | `Dsv4Model::kv_budget_num_slots` dsv4.rs:1024-1158 | bottom-up: `mem_get_info().free × 0.9 − dsa_shared − moe_decode_shared`, `/ per_slot`, **NCCL min-reduce** (1144) | ~~reject-below-fixed guard absent (saturating_sub to 0 → max(1))~~ **fixed C4** |
 | Qwen3 + Qwen3.5 CUDA VRAM | executor.rs:89,99 | `num_slots` passed straight through — **NO clamp** (doc confirms at 259-262 only DSv4 clamps) | **can OOM at large max_seq_len — the #60 failure class, unfixed** |
 | Metal unified VRAM | `plan_resource_budget` resource.rs:156-302 | top-down: `resolve_memory_limit − (weights + headroom + static_state)`, page-capacity floor, full guard suite + paging pressure | mature; the template |
 | Host RAM tier (T1) | kv_tier.rs:19 `DEFAULT_KV_TIER_BUDGET_BYTES = 4<<30` | **hardcoded 4 GiB** | not system-derived, not coordinated with VRAM/disk |
@@ -85,10 +85,22 @@ Backend-specific (stays put — genuinely not shared):
   `split_host_tiers`; CLI opt-out preserved. Caps == old constants, so an ample
   host (the pod) is byte-identical and a constrained one scales down; probe miss
   → cap. 7/7 kv_tier tests (incl. new probe tests).
+- **Phase C4 ✅ (`75530149`):** reject-below-fixed parity — the last audit gap.
+  Both CUDA `from_free` paths dropped the per-rank `affordable().max(1)`,
+  NCCL-min-reduce the **real** affordable count, then bail uniformly
+  (`anyhow::ensure!(affordable > 0, …)`) when the reduced count is 0 — matching
+  Metal's `fits_fixed` two-stage guard. **Lockstep-safe** (every rank branches
+  on the same reduced scalar → the TP group rejects/admits as one, no half-OOM).
+  **Byte-identical in every working config** (`max(1)` was a no-op once the real
+  affordable ≥ 1 on all ranks); behavior changes ONLY in the previously-OOMing
+  regime — now a clear `affords 0 slots at max_seq_len N` error instead of a
+  device OOM at arena/slot allocation. Pod boot-rejects-vs-OOM gate =
+  pending-remote (dormant on the pod: `free×0.9 ≫ per_slot`).
 
-**Convergence complete:** VRAM (DSv4 C1 + Qwen3.5/3.6 C2), host RAM/SSD (C3),
-and Metal (B′) all flow through the one neutral infer-seam kernel. No fragmented
-budget surface remains.
+**Convergence complete:** VRAM (DSv4 C1 + Qwen3.5/3.6 C2 + reject-parity C4),
+host RAM/SSD (C3), and Metal (B′) all flow through the one neutral infer-seam
+kernel — for both the **budget arithmetic** and the **reject policy**. No
+fragmented budget surface remains.
 
 Each phase: `cargo test --workspace` + clippy clean + wins/ entry (or
 `pending-remote` for pod-only). No default-flip without a wall-clock license
