@@ -3,6 +3,7 @@
 
 This checker stays intentionally narrow:
 - only public/governance docs and GitHub templates
+- workspace-members <-> codebase-map truth-surface sync (refactor roadmap R0.2)
 - no deep validation of historical plans / experience logs
 - no external dependencies
 """
@@ -89,6 +90,13 @@ DISALLOWED_PUBLIC_MARKERS = [
 
 JUNK_PATH_RE = re.compile(r"(^|/)(\.DS_Store|Thumbs\.db|__pycache__/|.*\.pyc)$")
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+
+WORKSPACE_MANIFEST = Path("Cargo.toml")
+CODEBASE_MAP = Path("docs/codebase-map.md")
+WORKSPACE_MEMBER_RE = re.compile(r'^\s*"crates/([A-Za-z0-9_-]+)"\s*,?\s*$')
+# Includes `*` so wildcard mentions like `crates/infer-*` are captured whole
+# (and then skipped) instead of truncating to a non-existent crate name.
+CRATE_REF_RE = re.compile(r"crates/([A-Za-z0-9_*-]+)")
 
 
 def repo_path(path: Path) -> str:
@@ -183,6 +191,47 @@ def check_template(path: Path, required_strings: list[str]) -> list[str]:
     return [f"{path}: missing required template fields: {joined}"]
 
 
+def parse_workspace_members() -> list[str]:
+    members: list[str] = []
+    in_members = False
+    for line in load_text(ROOT / WORKSPACE_MANIFEST).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("members = ["):
+            in_members = True
+            continue
+        if in_members:
+            if stripped.startswith("]"):
+                break
+            match = WORKSPACE_MEMBER_RE.match(line)
+            if match:
+                members.append(match.group(1))
+    return members
+
+
+def check_workspace_truth_surface() -> list[str]:
+    """codebase-map.md is the canonical workspace topology; keep it mechanically
+    in sync with the Cargo workspace so a new crate cannot land undocumented
+    (docs/plans/2026-06-12-architecture-refactor-roadmap.md R0.2)."""
+    errors = []
+    members = parse_workspace_members()
+    if not members:
+        return [f"{WORKSPACE_MANIFEST}: could not parse [workspace] members"]
+    map_text = load_text(ROOT / CODEBASE_MAP)
+    for name in members:
+        if f"crates/{name}" not in map_text:
+            errors.append(
+                f"{CODEBASE_MAP}: workspace member crates/{name} is undocumented"
+            )
+    for name in sorted(set(CRATE_REF_RE.findall(map_text))):
+        if "*" in name:
+            continue
+        if not (ROOT / "crates" / name).is_dir():
+            errors.append(
+                f"{CODEBASE_MAP}: references crates/{name}, which does not exist in the tree"
+            )
+    return errors
+
+
 def check_git_tracked_junk() -> list[str]:
     try:
         output = subprocess.check_output(
@@ -220,6 +269,7 @@ def main() -> int:
     errors.extend(check_template(Path(".github/ISSUE_TEMPLATE/bug_report.md"), BUG_TEMPLATE_REQUIRED_FIELDS))
     errors.extend(check_template(Path(".github/ISSUE_TEMPLATE/feature_request.md"), FEATURE_TEMPLATE_REQUIRED_FIELDS))
     errors.extend(check_git_tracked_junk())
+    errors.extend(check_workspace_truth_surface())
 
     if errors:
         print("[repo-hygiene] FAIL")
@@ -229,7 +279,8 @@ def main() -> int:
 
     print("[repo-hygiene] OK")
     print(
-        "[repo-hygiene] public docs, templates, local links, and tracked junk checks all passed"
+        "[repo-hygiene] public docs, templates, local links, tracked junk, and "
+        "workspace truth-surface checks all passed"
     )
     return 0
 
