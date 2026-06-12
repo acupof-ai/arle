@@ -2386,8 +2386,14 @@ impl Dsv4Model {
             }
             _ => None,
         };
+        // Step-profile sub-buckets (decode hunt): pure-host launch wall of the
+        // attention half vs the MoE half, summed across layers. Plain Instant
+        // arithmetic — no syncs, no events, no measurable distortion.
+        let mut prof_attn_ms = 0f64;
+        let mut prof_moe_ms = 0f64;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
+            let prof_t0 = std::time::Instant::now();
             // ── Attention half: HC-wrap MLA attention.
             let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_params", || {
                 crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)
@@ -2567,6 +2573,8 @@ impl Dsv4Model {
             })?;
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
+            prof_attn_ms += prof_t0.elapsed().as_secs_f64() * 1000.0;
+            let prof_t1 = std::time::Instant::now();
 
             // ── MoE half: HC-wrap the FP8 DeepGEMM MoE block.
             let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_params", || {
@@ -2863,6 +2871,26 @@ impl Dsv4Model {
             drop(nvtx_shared_hc);
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
+            prof_moe_ms += prof_t1.elapsed().as_secs_f64() * 1000.0;
+        }
+        if seq_len == 1
+            && self.tp.config().rank == 0
+            && std::env::var("ARLE_DSV4_STEP_PROFILE").as_deref() == Ok("1")
+        {
+            static SUB: std::sync::Mutex<(f64, f64, u32)> = std::sync::Mutex::new((0.0, 0.0, 0));
+            let mut sub = SUB.lock().unwrap();
+            sub.0 += prof_attn_ms;
+            sub.1 += prof_moe_ms;
+            sub.2 += 1;
+            if sub.2 >= 100 {
+                eprintln!(
+                    "[step-profile-sub] n={} attn-half host mean={:.3}ms moe-half host mean={:.3}ms",
+                    sub.2,
+                    sub.0 / sub.2 as f64,
+                    sub.1 / sub.2 as f64
+                );
+                *sub = (0.0, 0.0, 0);
+            }
         }
 
         slot.seq_len += seq_len;
