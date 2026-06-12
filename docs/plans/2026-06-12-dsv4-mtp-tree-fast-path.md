@@ -63,6 +63,35 @@ Consequences:
 - Degenerate (looping) text is not a valid spec-decode test load — the
   standing rule, re-confirmed.
 
+### P0 addendum — measured acceptance curves (EOS fix landed `ea71e060`,
+### clean 256-token essay workload, same binary, 2026-06-12)
+
+EOS verified: `completion_tokens=9, finish=stop` on the France prompt.
+Clean no-spec long-form baseline: **32.52 tok/s**.
+
+| config | per-level conditional accept | A | tok/s today (per-row verify) |
+|---|---|---|---|
+| chain d1 | q₁=0.695 | 1.70 | 19.68 |
+| chain d4 | q₁=0.651, **q₂=0.357**, q₃=0.333, q₄=0.200 | 1.98 | 13.89 |
+| tree d2k2 | **q₁(top2)=0.933**, q₂(top2)=0.531 | **2.43** | 14.84 |
+
+Two structural facts:
+1. **Depth decay is the wall**: the nextn-1 head is depth-1-trained;
+   conditional accept collapses 0.65 → 0.36 at level 2 (chain). Deep CHAINS
+   are dead with this head.
+2. **Width rescues level 1 dramatically**: top-2 coverage 0.933 vs 0.651 —
+   and holds level 2 at 0.53 vs 0.36. The tree axis is the right axis.
+
+Revised end-state budget (P1 verify ≈ 32 ms + P3 draft ≈ 2.5 ms/level,
+P2 re-forward folded): d2k2 → A 2.43 / ~37 ms = **~66 tok/s ≈ 2.0×**;
+d4k2 (q₃₄ extrapolated ~0.45/0.40) → A ~2.7 / ~42 ms = ~65 tok/s — deeper
+buys nothing with the current head; sweet spot is depth 2–3, topk 2–3.
+**Beyond 2× requires raising the q-curve itself: an OPD-distilled
+depth-robust draft head (EAGLE-style multi-step), q ~0.9/0.65+ to depth 4–6
+→ A 3.5–4.5 → 100–130 tok/s (3–4×).** Hard floor: tok/s = A × 33 (one
+weight-read forward per step); A is bounded by text entropy, so the 极致 is
+workload-distribution-shaped, not a single number.
+
 ## Coordination note (2026-06-12)
 
 `attention.rs` (+318) and `executor.rs` (+109) carry ckl's in-flight
