@@ -34,31 +34,63 @@ code would violate license-or-kill, no-half-states, and correctness-gate-on-
 real-path. So: Claude owns the line-level spec; the pod session executes and
 validates each dtype before it counts as landed.
 
-## Current state (evidence, grep-confirmed 2026-06-12)
+## Current state — SOLID re-grounding (code-read 2026-06-12, supersedes the first draft)
 
-- **CUDA consumes the dtype only at the boundary (T4).** `grep kv_cache_dtype
-  crates/infer-cuda/src` → resolve-gate only; the executor constructors still
-  take `(model_path, num_slots, total_pages)` (`executor.rs`), no dtype param.
-- **The Qwen3.5/3.6 MoE KV is contiguous BF16 per-layer caches**:
-  `Qwen35SlotState.k_caches/v_caches: Vec<DeviceVec>`, each
-  `DeviceVec::zeros(ctx, max_seq_len * kv_dim)` bf16 (`qwen35.rs:147-186`); read
-  by the nonpaged BF16 attention kernels. `per_slot_kv_bytes()` hard-codes the
-  bf16 byte budget. **Only the `full_attention` layers have these caches** — see
-  the model-routing note below.
-- **The dense Qwen3 KV** lives in `QwenCudaExecutor` (`executor.rs`), a separate
-  path on the shared `PagedKVPool`; every layer is full-attention.
+The first draft of this plan claimed "the Qwen paths run nonpaged full-attention
+today; the quant path brings paged attention to them." **Reading the source
+refutes that for the dense lane** and changes the whole T3 sizing. The corrected
+truth, per file+line:
+
+- **The dense Qwen3 path is ALREADY paged.** `QwenCudaExecutor` holds
+  `kv: PagedKVPool` (`executor.rs:410`); `paged_attention` (`attention.rs:2469`)
+  → `prefill_attention`/`decode_attention` → `run_tilelang_paged`
+  (`attention.rs:2676`) read the pool through FlashInfer-style
+  `meta.kv_indices` + `meta.kv_indptr` page tables, built in `loader.rs:274-322`
+  + `decode_graph.rs`. So the page-table build + paged read **already exist** for
+  dense Qwen3; the "bring paged attention to a nonpaged model" work does NOT
+  apply here.
+- **`PagedKVPool` is ALREADY format-aware.** It carries `format: KVFormat`
+  (`{BF16, INT8, FP8E4M3, INT4, TurboQuant{..}, PackedBytes{..}}`,
+  `paged_kv.rs`); BF16/INT8/FP8E4M3 all share `page_size = 16`
+  (`paged_kv.rs:2601-2603`); per-token byte sizing is already format-branched
+  (`paged_kv.rs:413-415`); a `KVCacheDtype → KVFormat` map exists for BF16/INT8
+  (`paged_kv.rs:357-358`). `from_qwen3_bf16_safetensors` simply **hardcodes
+  `KVFormat::BF16`** at its two pool-construction sites (`executor.rs:491,500`).
+- **The dense store is two kernels, and only the second changes.**
+  `prefill_attention_paged_prep_cuda` (`prefill_attention_paged_prep.cu`) runs
+  (1) `prefill_attention_paged_qk_norm_rope_hd128_kernel` — RMSNorm+RoPE applied
+  **in place** on `q_batch`/`k_batch` (the kernel writes the RoPE'd value back to
+  the same buffer, line 79), then (2)
+  `prefill_attention_paged_kv_write_hd128_kernel` — scatters the now-RoPE'd
+  `k_batch` + raw `v_batch` into the **BF16** pool through the page table
+  (lines 108-109). Decode mirrors this via `decode_prep_paged_cuda`. So the quant
+  store is a **drop-in replacement of kernel (2) only**: keep RoPE-in-place, then
+  call `quantize_paged_kv_<dtype>_per_channel(k_batch, v_batch → pool,
+  k_static_scales, new_token_indices)`.
+- **`Qwen3.5/3.6 MoE KV is the genuinely nonpaged lane.** `Qwen35SlotState`
+  (`qwen35.rs:14` — "this model OWNS its KV state (no `PagedKVPool`)") holds
+  contiguous BF16 per-layer caches (`k_caches/v_caches: Vec<DeviceVec>`,
+  `qwen35.rs:147-186`); `per_slot_kv_bytes()` hard-codes the BF16 budget. Only
+  the `full_attention` layers (1-in-4, `full_attention_interval: 4`) have caches.
+  **This is the lane where "bring paging to a nonpaged model" really applies** —
+  a materially bigger diff, deliberately split off (see lane order below).
 - **DSv4 FP8 KV is a bespoke MLA latent arena** (`Dsv4MlaKvArena`, 584 B/token,
-  FlashMLA MODEL1 NoPE=448/RoPE=64, kv_heads=1; `dsv4.rs`) — model-specific, NOT
-  a generic INT8/FP8/TQ4 substrate the Qwen paths can reuse.
-- **cuda-kernels already has the quant kernels + Rust wrappers, unwired into any
-  executor**: `kv_quant.rs` (24 pub fns: `quantize_paged_kv_{int8,fp8,int4}_
-  per_channel`, the `*_per_channel` scale calibration, fused
-  `decode_attention_{int8,fp8}_per_channel_k`), `kv_turboquant.rs` (TQ4:
-  `turboquant_quantize_paged_single`, `turboquant_fused_decode_attention`),
-  `turboquant_state.rs` (rotations + Lloyd-Max codebook). cuda-level tests, zero
-  infer-cuda callers.
+  FlashMLA MODEL1; `dsv4.rs`) — model-specific, not the generic substrate.
+- **The quant kernels + Rust wrappers exist, unwired into any executor.**
+  `kv_quant.rs`: `quantize_paged_kv_{int8,fp8,int4}_per_channel`, the
+  `compute_k_per_channel_absmax` → `finalize_k_per_channel_scales{,_int8,_int4}`
+  calibration, `dequantize_paged_kv_{int8,fp8}_to_hnd`, the fused
+  `decode_attention_{int8,fp8}_per_channel_k` (read side takes the SAME
+  `kv_indices` + `kv_meta`(=kv_indptr) + pool ptrs + `k_static_scales` +
+  `v_scales` + workspace). `kv_turboquant.rs`: TQ4
+  (`turboquant_quantize_paged_single`, `turboquant_fused_decode_attention`),
+  `turboquant_state.rs` (rotations + Lloyd-Max codebook).
 
-So the math is ported at the kernel level; the gap is executor integration.
+**Net: the substrate is far more complete than the first draft assumed.** For the
+dense lane the gap is purely executor glue: thread the format into pool creation,
+replace the BF16 store-scatter with the quant-scatter, swap the BF16 read kernel
+for the quant read kernel, and manage the per-channel scale buffers. No new paged
+attention, no new page-table build.
 
 ## Model routing on the pod (verified 2026-06-12)
 
@@ -66,112 +98,109 @@ So the math is ported at the kernel level; the gap is executor integration.
 
 | On-pod model | arch / `model_type` | CUDA path | KV state | Gate quality |
 |---|---|---|---|---|
-| `Qwen3-0.6B` | `Qwen3ForCausalLM` / `qwen3` (dense) | `from_qwen3_bf16_safetensors` (`QwenCudaExecutor`) | dense, **all** layers full-attn, no MoE non-det | cleanest correctness signal; 0.6B may miss long needles |
-| `Qwen3.6-35B-A3B` | `Qwen3_5MoeForConditionalGeneration` / `qwen3_5_moe` | `from_qwen35_moe_safetensors` (`Qwen35CudaExecutor` → `Qwen35SlotState`) | MoE; **only 1-in-4 layers full-attn** (`full_attention_interval: 4`; the rest linear-attention recurrent, no KV cache); MoE non-det widens the gate | the issue's literal target family; slow boot (~70 GB BF16) |
+| `Qwen3-0.6B` | `Qwen3ForCausalLM` / `qwen3` (dense) | `from_qwen3_bf16_safetensors` (`QwenCudaExecutor`) | **already paged** (`PagedKVPool`), all layers full-attn, no MoE non-det | cleanest correctness signal; 0.6B may miss long needles |
+| `Qwen3.6-35B-A3B` | `Qwen3_5MoeForConditionalGeneration` / `qwen3_5_moe` | `from_qwen35_moe_safetensors` (`Qwen35CudaExecutor` → `Qwen35SlotState`) | **nonpaged** contiguous caches; only 1-in-4 layers full-attn; MoE non-det widens the gate | the issue's literal target family; needs paging first; slow boot |
 
-**There is no `/data01/models/Qwen3.5-4B` on the pod** (the earlier spec assumed
-it). The qwen3_5_moe family is present as `Qwen3.6-35B-A3B`.
+**There is no `/data01/models/Qwen3.5-4B` on the pod.** The qwen3_5_moe family is
+present as `Qwen3.6-35B-A3B`.
 
-## The architecture decision — SETTLED by the kernel source (evidence, not hypothesis)
+## Architecture decision — SETTLED (dense lane needs only glue; quant pool layout already chosen)
 
-I first hypothesized "A — contiguous-with-scales, reuse the kernels unchanged."
-Reading the `.cu` source on 2026-06-12 **refutes A**:
+The quant kernels are FlashInfer-style page-table-driven (read via
+`kv_indices`/`kv_indptr`, write into a page-blocked NHD quant pool with
+`kQuantPageSize = 16`). The dense Qwen3 pool is *already* that layout in BF16
+(`[max_total_pages, num_kv_heads, page_size, head_dim]`, `page_size = 16`,
+`paged_kv.rs:40-42`), addressed by the same `kv_indices`/`kv_indptr`. So the
+quant pool is the **same pool with `format != BF16`** — `PagedKVPool` already
+sizes its bytes per-format. No layout migration; flip the format at construction.
 
-- **Write** (`csrc/kv/kv_quant.cu`): `quantize_paged_kv_*_kernel` takes
-  `new_token_indices`, `page_idx = token_row / kPageSize` with `kPageSize = 16`
-  compile-time, into a page-blocked **NHD** layout. For a contiguous buffer this
-  reduces to flat indexing — the write side *alone* looks A-compatible.
-- **Read** (`csrc/attention/decode_attention_quantized.cu`): the fused
-  `decode_attention_{fp8,int8,int4}_per_channel_k` kernels read KV through a
-  **page-table indirection** — `kv_indices` (block table) + `kv_indptr`
-  (per-request page offsets): `page_idx = kv_indices[page_start_global + g];
-  row_base = page_idx * kQuantPageSize`. Genuine FlashInfer-style paged
-  attention. The contiguous per-layer caches have no `kv_indices`/`kv_indptr`.
+One subtlety in the write kernel: `quantize_paged_kv_*_per_channel`
+(`csrc/kv/kv_quant.cu`) computes `page_idx = token_row / kQuantPageSize`, i.e. it
+assumes an **identity** logical→physical page map (the DSv4 case). The dense pool
+uses a **real** (non-identity) page table, so pass `new_token_indices` =
+**physical flat rows** (`physical_page * page_size + token_in_page`) rather than
+logical positions, and the contiguous-assumption write lands in the right
+physical slot. That physical-row builder is the one piece of new host code.
 
-**Verdict: B is required.** Quant-KV must live in a paged NHD quant pool (data +
-per-channel scales) addressed by `kv_indices`/`kv_indptr`, and the quant decode
-replaces the nonpaged BF16 attention. This is materially more than "change
-`DeviceVec`'s element type": the Qwen paths run **nonpaged** full-attention
-today; the quant path brings paged attention (page-table build per step) to
-them. That is the strongest reason T3 is a pod session.
+Page-table reuse — `dsv4_page_table.rs` core math (`physical_page` logical→
+physical lookup; `contiguous_page_table_byte_range` contiguity proof) is
+**shape-agnostic** (operates on a generic `table: &[u32]` + `page_bytes`; only
+the error strings + the 584 B test fixture are DSv4-flavored; pure host code,
+CPU-testable). **Lift it to a backend-neutral `paged_kv_table.rs`** (rename the
+DSv4 strings) per the unified-abstraction rule, and add the physical-row builder
+there (CPU-testable, same discipline).
 
-Scope guard: the host seam stays unchanged — `CudaKvPool = HostPagedKvPool`
-already allocates page ids; the page-blocked NHD *device* quant pool +
-`kv_indices`/`kv_indptr` build are a backend-internal CUDA detail below the seam.
-T1/T2/T4 (dispatch + gate + boundary) are untouched.
+Scope guard: the host seam is unchanged — `CudaKvPool = HostPagedKvPool` already
+allocates page ids; the device quant pool format + the physical-row builder are
+backend-internal CUDA details below the seam. T1/T2/T4 untouched.
 
-Page-table reuse — SETTLED (read `dsv4_page_table.rs` 2026-06-12): its core math
-(`physical_page` logical→physical lookup; `contiguous_page_table_byte_range`
-contiguity proof) is **shape-agnostic** — it operates on a generic `table: &[u32]`
-+ `page_bytes`; only the error strings and the 584 B test fixture are DSv4-
-flavored, and it is pure host code (CPU-testable, no nvcc). So: **lift it to a
-backend-neutral `paged_kv_table.rs`** (rename the DSv4 error strings) per the
-unified-abstraction rule, and reuse it for the Qwen paths. What it does NOT yet
-have — and what is new code either way — is the FlashInfer-style
-`kv_indices`/`kv_indptr` per-request flattening the
-`decode_attention_*_per_channel_k` kernels consume; add that builder into the
-lifted module (CPU-testable, same discipline).
+## Which gate lane first — dense Qwen3 (already paged → small diff), MoE deferred
 
-## Which gate lane first — dense Qwen3, then the MoE full-attn layers
+1. **Dense Qwen3** (`QwenCudaExecutor`): already paged, all layers full-attn, no
+   MoE non-determinism, fast boot → the smallest diff, the tightest gate
+   envelope, and the fastest iteration on the fraught FP8 path. The gate is
+   "quant within the same model's BF16 same-config envelope," so the 0.6B's
+   absolute miss-rate doesn't matter — the BF16 run on the *same* model is the
+   reference. If the 0.6B BF16 envelope is too narrow to detect quant
+   regressions on the long rungs, fetch a stronger dense Qwen3 (Qwen3-4B/8B).
+2. **Qwen3.6-35B-A3B** (`Qwen35SlotState`): the issue's literal family, but its
+   KV is **nonpaged contiguous caches** — wiring quant there first requires
+   bringing paged attention to that path (the big diff the first draft mis-
+   attributed to the dense lane). **Deferred to a fast-follow** once the shared
+   substrate (format-flip + quant store/read + physical-row builder + scale
+   state) is proven on the dense lane. Tracked as a #68 follow-on, not a blocker
+   for landing the dense-lane matrix.
 
-The substrate (paged NHD quant pool + page-table builder + quant append/decode)
-is **shared and model-generic** (the #68 mandate). Wire it once; both Qwen paths
-consume it. Validate it on the **cleanest correctness lane first**:
+Rationale: root-cause on a clean baseline (`§0.1`); the substrate being shared is
+what keeps this model-generic rather than a per-model fork — the MoE lane reuses
+the exact same quant store/read/scale code once its caches are paged.
 
-1. **Dense Qwen3** (`QwenCudaExecutor`): all layers full-attn, **no MoE
-   non-determinism**, fast boot → the tightest gate envelope and fastest
-   iteration on the fraught FP8 path. The 0.6B on-pod model may not pass the
-   long-needle rungs in BF16; gate quant against whatever rungs BF16 passes (the
-   gate is "quant within the BF16 same-config envelope," so the reference is the
-   same model in BF16, not an absolute miss-rate). Fetch a stronger dense Qwen3
-   (e.g. Qwen3-4B/8B) if the 0.6B BF16 envelope is too narrow to detect quant
-   regressions.
-2. **Qwen3.6-35B-A3B** (`Qwen35SlotState`, the qwen3_5_moe family the issue
-   names): confirm the shared substrate on its `full_attention` layers (1-in-4).
-   Cheap once the substrate exists; the MoE non-det envelope is the gate's
-   designed-for floor.
+## T3 — wire the quant hot path (dense Qwen3 lane, per dtype, each gated by T5)
 
-Rationale: root-cause on a clean baseline (`§0.1`), and the substrate being
-shared is what makes this model-generic rather than a per-model fork.
+Per dtype, cheapest correctness first: **INT8 → FP8 → TQ4.** INT4/TQ2/TQ3 stay
+report-only (monolith gate precedent). All steps are dense-lane glue on the
+already-paged pool — no new paged attention.
 
-## T3 — wire the quant hot path (per dtype, each gated by T5 before it counts)
-
-Per dtype, in this order (cheapest correctness first): **INT8 → FP8 → TQ4.**
-INT4/TQ2/TQ3 stay report-only (monolith gate precedent). All steps assume the
-**B verdict**: a page-blocked NHD quant pool, not the contiguous cache. Land in
-the chosen first lane (dense Qwen3), then graft onto `Qwen35SlotState`.
-
-0. **T4 carry-over**: when the first non-BF16 dtype lands, add its
+0. **T4 carry-over** (when the first non-BF16 dtype lands): add its
    `CudaKvCacheDtype` variant + `resolve` arm, thread `kv_cache_dtype:
-   CudaKvCacheDtype` through the executor constructor it touches, and widen the
-   CLI int8-on-CUDA guard (`serve.rs`). These were deliberately deferred from T4.
-1. Stand up the per-layer **paged NHD quant pool** for the full-attn layers
-   (replaces the contiguous caches for dtype ≠ Bf16): quant-byte data buffer
-   (`kQuantPageSize`-blocked NHD) + per-channel `k_static_scales` (and `v_scales`
-   where the kernel takes them). Build/maintain `kv_indices`/`kv_indptr` per step
-   via the lifted `paged_kv_table.rs`. Update `per_slot_kv_bytes()` to the quant
-   width so the unified `SlotBudget` sizes slots correctly. Bf16 keeps the
-   existing contiguous path byte-for-byte.
-2. KV append (after q/k/v projection + RoPE, before store): call
-   `cuda_kernels::kv_quant::quantize_paged_kv_<dtype>_per_channel` with
-   `new_token_indices` = the rows written into the paged pool. INT8/FP8 need the
-   two-step per-channel scale calibration
-   (`compute_k_per_channel_absmax` → `finalize_k_per_channel_scales{,_int8}`) on
-   the prefill pass; cache static K scales per layer.
-3. Decode read: replace the nonpaged BF16 decode attention with the
-   page-table-driven `decode_attention_{int8,fp8}_per_channel_k` (TQ4:
-   `turboquant_fused_decode_attention` + `turboquant_state`). Size partial/merge
-   scratch via the `*_workspace_bytes` helpers. Prefill read: dequant-to-bf16
-   (`dequantize_paged_kv_<dtype>_to_hnd`) into a bf16 HND work buffer for the
-   existing prefill attention, unless a fused quant prefill kernel exists.
-4. TQ4 only: build `TurboQuantLayerState` (rotations + Lloyd-Max codebook) at
+   CudaKvCacheDtype` (→ `KVFormat`) through `from_qwen3_bf16_safetensors` into the
+   two `PagedKVPool` construction sites (`executor.rs:491,500`, replacing the
+   hardcoded `KVFormat::BF16`), and widen the CLI int8-on-CUDA guard
+   (`serve.rs`). Deferred from T4 by design.
+1. **Pool format flip.** `from_qwen3_bf16_safetensors` constructs the pool with
+   the resolved `KVFormat` instead of `KVFormat::BF16`. Byte sizing + page_size
+   are already format-driven — nothing else to change pool-side. Bf16 keeps the
+   exact existing path (format == BF16 → no quant branch taken anywhere).
+2. **Per-layer scale state.** Allocate, per full-attn layer, `k_static_scales:
+   DeviceVec<f32>` (length `kv_dim`) and the `v_scales` buffer the decode kernel
+   takes. Calibrate K static scales on the prefill pass:
+   `compute_k_per_channel_absmax` over the RoPE'd K → `finalize_k_per_channel_
+   scales_int8` (INT8) / `finalize_k_per_channel_scales` (FP8). Confirm the V
+   scale convention from the decode kernel (per-token dynamic vs per-channel
+   static) before wiring — read `decode_attention_int8_per_channel_k` semantics.
+3. **Store (replace kernel 2).** After the in-place RMSNorm+RoPE kernel, instead
+   of `prefill_attention_paged_kv_write_hd128_kernel` (BF16 scatter), call
+   `quantize_paged_kv_<dtype>_per_channel(k_batch, v_batch → pool,
+   k_static_scales, new_token_indices = physical rows)`. Decode store mirrors via
+   the single-token path. Build `new_token_indices` (physical flat rows) from the
+   page table via the lifted `paged_kv_table.rs`.
+4. **Decode read (swap).** Replace `run_tilelang_paged` (BF16) with
+   `decode_attention_{int8,fp8}_per_channel_k` (TQ4:
+   `turboquant_fused_decode_attention` + `turboquant_rotate_query`), passing the
+   existing `meta.kv_indices`/`meta.kv_indptr`, the pool ptrs, the scale buffers,
+   and a workspace sized by `decode_attention_<dtype>_workspace_bytes`.
+5. **Prefill read.** The TileLang prefill kernel reads BF16 from the pool; with a
+   quant pool it must read quant. Simplest correct path: after the quant store,
+   `dequantize_paged_kv_<dtype>_to_hnd` the touched pages into a BF16 HND work
+   buffer and run the existing `run_tilelang_paged` prefill against that buffer
+   (a fused quant-prefill kernel is a perf follow-on, not a correctness need).
+6. **TQ4 only:** build `TurboQuantLayerState` (rotations + Lloyd-Max codebook) at
    load; rotate Q with `turboquant_rotate_query` before the fused decode.
 
 ## T5 — license-or-kill (the gate, built in T1)
 
-Single GPU. BF16 reference first, then each dtype (replace `<MODEL>` with the
-chosen lane's path — `/data01/models/Qwen3-0.6B` for the dense lane, or a fetched
-Qwen3-4B/8B; `/data01/models/Qwen3.6-35B-A3B` for the MoE confirm):
+Single GPU. BF16 reference first, then each dtype (`<MODEL>` =
+`/data01/models/Qwen3-0.6B` for the dense lane, or a fetched Qwen3-4B/8B):
 
 ```
 GATE_PROFILE=generic MODEL=<MODEL> scripts/lever_gate.sh bf16_ref
@@ -192,14 +221,16 @@ envelope, each dtype's ladder, and the license/kill call.
 
 - **FP8 first-token garbage** is config-suspect first (per-channel scale
   calibration window) — A/B the same prompt on BF16 before staring at kernel code.
-- **Paged attention for the Qwen paths (B above)** is the big-diff risk: bringing
-  the `kv_indices`/`kv_indptr` build to a model that runs nonpaged today. The
-  page-table build is the new correctness surface — validate it on Bf16 first (a
-  paged-Bf16 decode that matches the nonpaged Bf16 reference) BEFORE layering
-  quant, so a quant miss isn't confounded by a page-table bug.
-- **MoE-lane layer coverage**: on Qwen3.6-35B-A3B only ~25% of layers are
-  full-attn, so the quant-KV memory/perf delta there is bounded to those layers —
-  don't read the dense-lane win as the MoE-lane win.
+- **Physical-row `new_token_indices` builder** is the new correctness surface on
+  the dense lane (the write kernel assumes identity pages; the dense pool's table
+  is non-identity). Validate it in isolation: a CPU unit test on the lifted
+  `paged_kv_table.rs` builder, then an INT8 store→dequant→compare round-trip on a
+  short prompt before trusting the full needle ladder.
+- **Prefill dequant correctness**: the dequant-to-HND prefill path is new glue;
+  confirm an INT8 prefill matches the BF16 prefill on a short prompt before the
+  ladder so a prefill bug isn't read as a quant-quality miss.
+- **MoE lane is a separate, larger diff** (nonpaged → paged); don't read the
+  dense-lane license as the MoE-lane license. Fast-follow, tracked under #68.
 - **Budget interaction**: the quant width flows into `per_slot_kv_bytes` → the
   unified `SlotBudget`; verify slot count rises ~proportionally to the byte
   saving and that the C2 clamp / C4 reject messages still name real knobs.
