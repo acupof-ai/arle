@@ -2796,12 +2796,16 @@ fn run_quant_decode(
         .int8_attn_workspace
         .as_ref()
         .ok_or_else(|| anyhow!("quant KV pool missing split-KV attention workspace"))?;
-    // The pool sizes the workspace with an approximate-max-heads heuristic
-    // (num_splits=32, paged_kv.rs); fail loud rather than overrun it.
-    let needed = kv_quant::decode_attention_int8_workspace_bytes(1, num_q_heads, head_dim, 32);
+    // The kernel adapts its split count to the workspace it is given
+    // (`choose_decode_num_splits` clamps by workspace_bytes, ≥1 split), so the
+    // only unfittable case is a single split not fitting. The pool sizes the
+    // workspace from an approximate-max-heads heuristic (paged_kv.rs) that can
+    // undershoot the full 32-split footprint for q40/q64 dense shapes at small
+    // num_slots — gating on 32 splits here would falsely reject those.
+    let needed = kv_quant::decode_attention_int8_workspace_bytes(1, num_q_heads, head_dim, 1);
     ensure!(
         needed <= pool.int8_attn_workspace_bytes,
-        "quant decode workspace needs {needed} bytes, pool allocated {}",
+        "quant decode workspace cannot fit a single split: needs {needed} bytes, pool allocated {}",
         pool.int8_attn_workspace_bytes
     );
     let sm_scale = 1.0 / (head_dim as f32).sqrt();
