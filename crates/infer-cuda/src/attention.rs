@@ -20,9 +20,9 @@ use std::sync::{Mutex, OnceLock};
 use crate::dsv4::{
     Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer, Dsv4MlaKvArena,
 };
-use crate::dsv4_page_table::{contiguous_page_table_byte_range, physical_page};
 use crate::loader::PageMeta;
 use crate::moe_config::ExpertSplit;
+use crate::paged_kv_table::{contiguous_page_table_byte_range, physical_page};
 use crate::tp::TpRuntime;
 
 const DSV4_FLASHMLA_MODEL1: i32 = 1;
