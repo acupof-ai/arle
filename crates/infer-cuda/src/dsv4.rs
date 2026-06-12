@@ -2173,6 +2173,21 @@ impl Dsv4Model {
         let eps = self.config.rms_norm_eps;
         let ctx = &self.ctx;
 
+        // Tail decomposition (decode hunt): backlog-drain sync + per-op laps.
+        let tprof = seq_len == 1
+            && self.tp.config().rank == 0
+            && std::env::var("ARLE_DSV4_STEP_PROFILE").as_deref() == Ok("1");
+        let mut tail_ms = [0f64; 5];
+        let mut tlap = std::time::Instant::now();
+        let mut lapf = |i: usize, tlap: &mut std::time::Instant| {
+            if tprof {
+                let _ = self.ctx.sync();
+                tail_ms[i] = tlap.elapsed().as_secs_f64() * 1000.0;
+                *tlap = std::time::Instant::now();
+            }
+        };
+        lapf(0, &mut tlap);
+
         let _nvtx = crate::nvtx::range("dsv4/lm_head_sample");
         // ── Head HC: fold the last token's wide stream row → one hidden vector.
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
@@ -2186,6 +2201,7 @@ impl Dsv4Model {
                 &mut last_hidden,
             )
         })?;
+        lapf(1, &mut tlap);
         keepalive.keep_hidden(stream);
         keepalive.keep_vec(&last_hidden);
         if let Some(out) = last_hidden_out {
@@ -2205,15 +2221,36 @@ impl Dsv4Model {
         crate::stage_profile::profile(ctx, "dsv4/stage/head_norm", || {
             crate::ops::rms_norm_vec(ctx, &last_hidden, &self.norm, eps, &mut last_normed)
         })?;
+        lapf(2, &mut tlap);
         keepalive.keep_vec(&last_normed);
         let mut logits = DeviceVec::zeros(ctx, self.lm_head.rows)?;
         crate::stage_profile::profile(ctx, "dsv4/stage/lm_head_project", || {
             self.lm_head_project(&last_normed, &mut logits)
         })?;
         keepalive.keep_vec(&logits);
-        crate::stage_profile::profile(ctx, "dsv4/stage/sample", || {
+        lapf(3, &mut tlap);
+        let token = crate::stage_profile::profile(ctx, "dsv4/stage/sample", || {
             crate::executor::sample_cuda_token(ctx, &logits, params, position)
-        })
+        })?;
+        if tprof {
+            tail_ms[4] = tlap.elapsed().as_secs_f64() * 1000.0;
+            static TACC: std::sync::Mutex<([f64; 5], u32)> =
+                std::sync::Mutex::new(([0.0; 5], 0));
+            let mut acc = TACC.lock().unwrap();
+            for i in 0..5 {
+                acc.0[i] += tail_ms[i];
+            }
+            acc.1 += 1;
+            if acc.1 >= 100 {
+                let n = acc.1 as f64;
+                eprintln!(
+                    "[step-profile-tail] n={} backlog={:.3} head_hc={:.3} head_norm={:.3} lm_head={:.3} sample={:.3} ms",
+                    acc.1, acc.0[0] / n, acc.0[1] / n, acc.0[2] / n, acc.0[3] / n, acc.0[4] / n
+                );
+                *acc = ([0.0; 5], 0);
+            }
+        }
+        Ok(token)
     }
 
     // col1-bug pinpoint (2026-06-08, ARLE_DSV4_TAIL_DUMP): for the capital selftest
