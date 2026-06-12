@@ -831,11 +831,19 @@ mod backend {
         let kind = detect_cuda_model_kind(model_path)?;
         // Resolve the requested KV dtype against the CUDA support matrix at the
         // engine boundary, mirroring the Metal path's `MetalKvCacheDtype::resolve`
-        // (#68 T2). Today this only admits BF16 and fails loud on the paged
-        // quant modes (int8/fp8/tq4) pending #68 T3; the executor constructors do
-        // not consume the resolved dtype yet, so the result is the validation,
-        // not a threaded value — that lands with T3.
-        infer_cuda::CudaKvCacheDtype::resolve(config.kv_cache_dtype)?;
+        // (#68 T2). Admits BF16/INT8/FP8 (tq4 fails loud — see resolve); the
+        // resolved dtype threads into the dense-Qwen3 constructor below (#68 T3).
+        let kv_dtype = infer_cuda::CudaKvCacheDtype::resolve(config.kv_cache_dtype)?;
+        if kv_dtype != infer_cuda::CudaKvCacheDtype::Bf16
+            && !matches!(kind, CudaModelKind::Qwen3Dense)
+        {
+            anyhow::bail!(
+                "--kv-cache-dtype {} is wired for the dense Qwen3 paged-KV path \
+                 (#68 T3); {kind:?} owns its KV state internally and does not \
+                 consume the paged quant pool",
+                kv_dtype.label()
+            );
+        }
         let mut scheduler = config.scheduler_config();
         // Cross-request prompt-prefix reuse (the host radix cache) is only sound
         // when a cached prefix's KV can be re-attached to a new slot and read
@@ -892,6 +900,7 @@ mod backend {
                 model_path,
                 num_slots,
                 config.total_pages,
+                kv_dtype,
             )?,
             // Qwen3Moe clamps `num_slots` to free HBM inside the constructor
             // (`Qwen35Model::kv_budget_num_slots`, unified with DSv4 via the

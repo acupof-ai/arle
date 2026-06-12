@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use cuda_kernels::KVFormat;
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -279,6 +280,17 @@ pub(crate) struct PageMeta {
     pub(crate) positions: CudaSlice<i32>,
     pub(crate) seq_len: usize,
     pub(crate) num_pages: usize,
+    /// Host copy of the request's prefix length (tokens already in the pool
+    /// before this forward). Quant formats use it to size the prefix refill.
+    pub(crate) start_pos: usize,
+    /// Global pool token rows for the NEW tokens [start_pos, start_pos+seq_len).
+    /// Quant formats only (refill/quantize row lists); None for BF16.
+    pub(crate) new_token_rows: Option<CudaSlice<i32>>,
+    /// Global pool token rows for the prefix [0, start_pos). Quant + start_pos>0 only.
+    pub(crate) prefix_token_rows: Option<CudaSlice<i32>>,
+    /// Packed fused-decode metadata `[page_indptr(b+1) | last_page_len(b)]`
+    /// from `build_quantized_decode_indptr`. Quant formats only.
+    pub(crate) quant_decode_meta: Option<CudaSlice<i32>>,
 }
 
 impl PageMeta {
@@ -316,6 +328,39 @@ impl PageMeta {
             .iter()
             .map(|&page| page as i32)
             .collect::<Vec<_>>();
+        // Quant formats (INT8/FP8) need explicit token-row lists: the prefix
+        // refill + new-row quantize kernels address the pool by global token
+        // row, and the fused decode kernel consumes the packed
+        // `[page_indptr | last_page_len]` metadata. BF16 carries None — zero
+        // overhead on the default path.
+        let quant = matches!(pool.format, KVFormat::INT8 | KVFormat::FP8E4M3);
+        let (new_token_rows, prefix_token_rows, quant_decode_meta) = if quant {
+            let new_rows = pool
+                .token_rows_for_range(slot, start_pos, seq_len)
+                .into_iter()
+                .map(|row| row as i32)
+                .collect::<Vec<_>>();
+            let prefix_rows = if start_pos > 0 {
+                let rows = pool
+                    .token_rows_for_range(slot, 0, start_pos)
+                    .into_iter()
+                    .map(|row| row as i32)
+                    .collect::<Vec<_>>();
+                Some(upload_i32(ctx, &rows)?)
+            } else {
+                None
+            };
+            (
+                Some(upload_i32(ctx, &new_rows)?),
+                prefix_rows,
+                Some(upload_i32(
+                    ctx,
+                    &pool.build_quantized_decode_indptr(&[slot]),
+                )?),
+            )
+        } else {
+            (None, None, None)
+        };
         Ok(Self {
             q_indptr: upload_i32(ctx, &[0, seq_len as i32])?,
             kv_indptr: upload_i32(ctx, &[0, num_pages as i32])?,
@@ -326,6 +371,10 @@ impl PageMeta {
             positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
             seq_len,
             num_pages,
+            start_pos,
+            new_token_rows,
+            prefix_token_rows,
+            quant_decode_meta,
         })
     }
 }
