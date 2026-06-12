@@ -41,6 +41,14 @@ use clap::Parser;
 use infer_api::{InferenceEngine, LoadedInferenceEngine};
 
 pub fn run() -> ExitCode {
+    // Install the logger FIRST, before any subcommand dispatch. `serve`, `train`,
+    // and `model` early-return from the match below and never reach `run_impl`'s
+    // init, so without this they would run with NO logger — every `log::error!`
+    // in the serve/engine path (e.g. an engine-thread `step()` failure) became a
+    // silent no-op, masking real failures. Default `warn`; RUST_LOG overrides.
+    // Idempotent (`call_once`), so `run_impl`'s later call is a harmless no-op.
+    infer_util::logging::init_stderr("warn");
+
     // DSv4 multiproc-serve worker entry. When ARLE_WORKER_RANK>0 is set (by the
     // serve coordinator before spawning this process), this process is a worker
     // rank: short-circuit BEFORE clap parsing — it joins the NCCL group as its
@@ -122,9 +130,8 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
     {
         use std::io::IsTerminal;
 
-        // Keep the interactive CLI quiet by default. Users can opt into
-        // verbose internals by setting RUST_LOG explicitly.
-        infer_util::logging::init_stderr("warn");
+        // Logger already installed at the top of `run()` (quiet "warn" default;
+        // RUST_LOG overrides). No re-init here.
 
         // Interactive startup: hardware detection + model picker + download.
         // Falls back to resolve_model_source() when non-interactive.
