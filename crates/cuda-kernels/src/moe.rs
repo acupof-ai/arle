@@ -886,6 +886,12 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
 /// Contiguous m-grouped FP8 GEMM (`f8f8bf16`, NT): `d = a @ b^T` where each
 /// activation row's expert group is read from `m_indices`.
 ///
+/// `mk_align` is the caller's per-group row alignment (64 or 128). The
+/// contiguous scheduler resolves the B group once per BLOCK_M output tile, so
+/// the bridge caps its block_m candidates at `mk_align`; `m` must be a
+/// multiple of it. 128 is the upstream-default alignment; 64 halves the pad
+/// rows for the DSv4 decode band.
+///
 /// # Safety
 /// All pointers must be valid on `stream`; `m_indices` must contain one local
 /// expert id in `[0, num_groups)` per activation row.
@@ -902,6 +908,7 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
     n: usize,
     k: usize,
     sfa_aligned_m: usize,
+    mk_align: usize,
     stream: CUstream,
 ) -> Result<()> {
     unsafe {
@@ -917,6 +924,7 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
             i32::try_from(n)?,
             i32::try_from(k)?,
             i32::try_from(sfa_aligned_m)?,
+            i32::try_from(mk_align)?,
             stream,
         )
         .result()?;

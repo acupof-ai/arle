@@ -137,26 +137,47 @@ pub(crate) fn flatten_routing(
 /// `get_mk_alignment_for_contiguous_layout()`): the kernel resolves the B-side
 /// expert group ONCE per BLOCK_M output tile from `m_indices[tile_start]`
 /// (vendor `deep_gemm/scheduler/gemm.cuh::get_global_idx`), and BLOCK_M for
-/// the contiguous layout is pinned to 128 — so every expert group's row
-/// segment must start at a multiple of 128, with `-1` on every pad row.
+/// the contiguous layout is pinned to 128 upstream — so every expert group's
+/// row segment must start at a multiple of 128, with `-1` on every pad row.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const DEEPGEMM_CONTIG_ALIGN: usize = 128;
 
-/// Host upper bound on the 128-aligned packed row count for the DeepGEMM
-/// contiguous grouped layout. The true total `Σ_g align(count_g, 128)` is
+/// DSv4 decode-band per-group row alignment. 64 is the smallest legal value:
+/// the SM90 warpgroup MMA grants only block_m ∈ {64, 128}, and the native
+/// bridge caps its block_m candidates at the alignment the caller packed with
+/// (`mk_align`), so 64-aligned groups + block_m=64 tiles satisfy the same
+/// per-tile single-group contract at half the pad rows. At decode shapes
+/// (R = topk·B ≤ 128 routes) the row-linear kernels (pack/swiglu/scatter)
+/// dominate the grouped-lane cost, so halving pad rows halves them
+/// (2026-06-12 nsys: 128-alignment inflated the lane 149× vs the pre-ba1dd607
+/// compact-but-contract-violating packing, −23% e2e B=1).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const DSV4_DECODE_CONTIG_ALIGN: usize = 64;
+
+/// Routed-row ceiling for the 64-aligned decode band: `topk(8) × B_max(16)`.
+/// Above it (prefill chunks), the GEMM tail dominates and block_m=128
+/// configs win — use [`DEEPGEMM_CONTIG_ALIGN`].
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const DSV4_DECODE_CONTIG_MAX_ROUTES: usize = 128;
+
+/// Host upper bound on the `align`-aligned packed row count for the DeepGEMM
+/// contiguous grouped layout. The true total `Σ_g align(count_g, a)` is
 /// device-resident (counts come from the on-device router), and the GEMM's
 /// `m` / the TMA descriptors are host values — so the launch uses this cap
 /// instead of a per-layer D2H sync:
 ///
-/// `Σ_g align(c_g, 128) ≤ R + 127·G_active ≤ align(R, 128) + 128·min(R, G)`
+/// `Σ_g align(c_g, a) ≤ R + (a−1)·G_active ≤ align(R, a) + a·min(R, G)`
 ///
 /// (G_active ≤ min(R, G) since every active group has ≥ 1 route). Tiles past
 /// the true aligned total carry `m_indices = -1` and compute excluded garbage.
-/// Always a multiple of 128 (the native bridge rejects unaligned `m`).
+/// Always a multiple of `align`.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub(crate) fn deepgemm_contig_rows_cap(total_routes: usize, local_experts: usize) -> usize {
-    let a = DEEPGEMM_CONTIG_ALIGN;
-    total_routes.div_ceil(a) * a + a * local_experts.min(total_routes)
+pub(crate) fn deepgemm_contig_rows_cap(
+    total_routes: usize,
+    local_experts: usize,
+    align: usize,
+) -> usize {
+    total_routes.div_ceil(align) * align + align * local_experts.min(total_routes)
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -1524,7 +1545,7 @@ mod gpu {
         let rows = if use_masked {
             local_experts * DEEPGEMM_MASKED_BAND
         } else {
-            deepgemm_contig_rows_cap(total_routes, local_experts)
+            deepgemm_contig_rows_cap(total_routes, local_experts, DEEPGEMM_CONTIG_ALIGN)
         };
         ensure!(
             rows.checked_mul(hidden_dim.max(moe_inter))
@@ -1787,7 +1808,10 @@ mod dsv4_gpu {
     use half::bf16;
     use std::sync::Arc;
 
-    use super::{DEEPGEMM_CONTIG_ALIGN, alloc_neg1_i32, deepgemm_contig_rows_cap};
+    use super::{
+        DEEPGEMM_CONTIG_ALIGN, DSV4_DECODE_CONTIG_ALIGN, DSV4_DECODE_CONTIG_MAX_ROUTES,
+        alloc_neg1_i32, deepgemm_contig_rows_cap,
+    };
     use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
     use crate::moe_config::ExpertSplit;
     use crate::ops::gemm_batch;
@@ -2686,6 +2710,14 @@ mod dsv4_gpu {
         keepalive.keep_i32(&counts);
         keepalive.keep_i32(&offsets);
         keepalive.keep_i32(&scan_total);
+        // Decode band (R = topk·B ≤ 128 routes): pack 64-aligned and cap the
+        // GEMM's block_m at 64 — same per-tile single-group contract, half the
+        // pad rows ground by the row-linear kernels (pack/swiglu/scatter).
+        let contig_align = if total_routes <= DSV4_DECODE_CONTIG_MAX_ROUTES {
+            DSV4_DECODE_CONTIG_ALIGN
+        } else {
+            DEEPGEMM_CONTIG_ALIGN
+        };
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
         unsafe {
             moe::dsv4_count_local_experts(
@@ -2702,13 +2734,14 @@ mod dsv4_gpu {
                 cache_ptr(&offsets, ctx),
                 cache_ptr(&scan_total, ctx),
                 experts_per_rank,
-                DEEPGEMM_CONTIG_ALIGN,
+                contig_align,
                 ctx.stream.cu_stream(),
             )?;
         }
 
-        // ── 4. Pack routed tokens grouped-by-local-expert (128-aligned rows). ──
-        let packed_rows = deepgemm_contig_rows_cap(total_routes.max(1), experts_per_rank);
+        // ── 4. Pack routed tokens grouped-by-local-expert (aligned rows). ──────
+        let packed_rows =
+            deepgemm_contig_rows_cap(total_routes.max(1), experts_per_rank, contig_align);
         let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, packed_rows)?;
         keepalive.keep_hidden(&packed_hidden);
         // Initialize to -1 (the invalid sentinel), NOT 0. The scatter kernel
@@ -2779,6 +2812,7 @@ mod dsv4_gpu {
                 &packed_hidden,
                 &counts,
                 &offsets,
+                contig_align,
                 swiglu_limit,
                 keepalive,
             )?
@@ -3304,12 +3338,16 @@ mod dsv4_gpu {
     /// Run the FP8 DeepGEMM 5-call grouped expert pipeline over this rank's local
     /// experts; returns the padded/aligned expert output. The caller's
     /// `packed_route_slot = -1` pad rows decide which rows reach route slots.
+    /// `contig_align` must match the per-group alignment `offsets` were packed
+    /// with (the bridge caps block_m at it so tiles never span groups).
+    #[allow(clippy::too_many_arguments)]
     fn deepgemm_grouped_experts(
         ctx: &DeviceContext,
         layer: &Dsv4MoeLayer,
         packed_hidden: &HiddenStates,
         counts: &cudarc::driver::CudaSlice<i32>,
         offsets: &cudarc::driver::CudaSlice<i32>,
+        contig_align: usize,
         swiglu_limit: f32,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<HiddenStates> {
@@ -3429,6 +3467,7 @@ mod dsv4_gpu {
                 2 * intermediate,
                 hidden_dim,
                 scale_stride_m,
+                contig_align,
                 stream,
             )?;
             moe::dsv4_deepgemm_swiglu_quantize_w13(
@@ -3456,6 +3495,7 @@ mod dsv4_gpu {
                 hidden_dim,
                 intermediate,
                 scale_stride_m,
+                contig_align,
                 stream,
             )?;
         }
@@ -3678,6 +3718,7 @@ mod dsv4_gpu {
                 2 * intermediate,
                 hidden_dim,
                 scratch.scale_stride_m,
+                DEEPGEMM_CONTIG_ALIGN,
                 stream,
             )?;
             moe::dsv4_deepgemm_swiglu_quantize_w13(
@@ -3705,6 +3746,7 @@ mod dsv4_gpu {
                 hidden_dim,
                 intermediate,
                 scratch.scale_stride_m,
+                DEEPGEMM_CONTIG_ALIGN,
                 stream,
             )?;
         }
@@ -4587,7 +4629,7 @@ mod tests {
             );
         }
         // The host launch cap bounds the device-side aligned total.
-        let cap = super::deepgemm_contig_rows_cap(total_routes as usize, counts.len());
+        let cap = super::deepgemm_contig_rows_cap(total_routes as usize, counts.len(), ALIGN);
         assert!(
             total as usize <= cap,
             "aligned total {total} > host cap {cap}"
@@ -4608,7 +4650,7 @@ mod tests {
             padded[..counts.len()].copy_from_slice(&counts);
             let routes: i32 = padded.iter().sum();
             let (_, total) = aligned_scan_ref(&padded, ALIGN as i32);
-            let cap = super::deepgemm_contig_rows_cap(routes.max(1) as usize, experts);
+            let cap = super::deepgemm_contig_rows_cap(routes.max(1) as usize, experts, ALIGN);
             assert!(
                 total as usize <= cap,
                 "aligned total {total} > cap {cap} for counts {padded:?}"
@@ -4647,12 +4689,36 @@ mod tests {
         );
     }
 
+    /// DSv4 decode-band contract: 64-aligned groups keep BLOCK_M=64 tiles
+    /// single-group, and the bridge MUST cap block_m at the packing alignment
+    /// — the same layout under a BLOCK_M=128 tile spans two groups.
+    #[test]
+    fn decode_band_64_alignment_needs_block_m_cap() {
+        const A64: usize = super::DSV4_DECODE_CONTIG_ALIGN;
+        // B=1 decode shape: topk=8 routes over 8 distinct local experts.
+        let counts = vec![1i32; 8];
+        let (offsets, total) = aligned_scan_ref(&counts, A64 as i32);
+        assert_eq!(total as usize, 8 * A64);
+        let cap = super::deepgemm_contig_rows_cap(8, 32, A64);
+        assert!(total as usize <= cap && cap % A64 == 0);
+        let m = fill_m_indices_ref(&counts, &offsets, cap);
+        assert!(
+            tile_contract_holds(&m, A64),
+            "64-aligned + block_m=64 holds"
+        );
+        assert!(
+            !tile_contract_holds(&m, ALIGN),
+            "64-aligned + block_m=128 must violate: a 128-row tile spans two \
+             64-row groups — this is what GemmDesc.max_block_m prevents"
+        );
+    }
+
     #[test]
     fn dsv4_fp8_prefill_rows_cap_keeps_pad_rows_invalid() {
         let counts = vec![100i32, 100];
         let total_routes: i32 = counts.iter().sum();
         let (offsets, aligned_total) = aligned_scan_ref(&counts, ALIGN as i32);
-        let rows_cap = super::deepgemm_contig_rows_cap(total_routes as usize, counts.len());
+        let rows_cap = super::deepgemm_contig_rows_cap(total_routes as usize, counts.len(), ALIGN);
         let m = fill_m_indices_ref(&counts, &offsets, rows_cap);
 
         assert_eq!(offsets, vec![0, 128]);
