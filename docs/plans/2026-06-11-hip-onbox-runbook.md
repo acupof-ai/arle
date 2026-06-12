@@ -72,7 +72,7 @@ cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 | 4.1 | Loader: residency plan log + upload completes | total device bytes ≈ plan §1 estimate (~58–75 GB); any fail-loud "matmul role on non-gemv residency" error = recipe mismatch between the GGUF's tensor types and the policy table — fix policy, not kernel |
 | 4.2 | `/v1/models` responds; one greedy completion (`temp 0`, short prompt) | **decode and READ the actual tokens** (distilled lesson — judge text, not metrics). Cross-check the same prompt on the nisparks fork (3.3): outputs need not match token-exact (different kernels), both must be coherent |
 | 4.3 | Garbage output? config-suspect first: dump GGUF metadata vs our config map (`infer_hip::config` values vs llama.cpp's printed hparams), THEN layer-by-layer (per-layer RoPE theta switch and swiglu clamp are the two known foot-guns) | — |
-| 4.4 | Needle gate ×3 same-config repeats + same-config-twice floor (`scripts/dsv4_needle_gate.py` against the HTTP endpoint; ladder as deep as the box's ctx budget allows) | needle-exact at every rung; repeat variance within the nondeterminism floor |
+| 4.4 | Needle gate ×3 same-config repeats + same-config-twice floor (`scripts/needle_gate.py` against the HTTP endpoint; ladder as deep as the box's ctx budget allows) | needle-exact at every rung; repeat variance within the nondeterminism floor |
 
 ## 5. Perf + license (#78)
 

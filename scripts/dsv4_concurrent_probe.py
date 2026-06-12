@@ -76,7 +76,7 @@ async def throughput_run():
 
 
 def build_needle(target_len_tokens, code="738291"):
-    # Mirror dsv4_needle_gate's shape: filler notes + a buried secret code.
+    # Mirror needle_gate's shape: filler notes + a buried secret code.
     topics = ["the river", "a old key", "the market", "her letter", "the storm"]
     n_notes = max(1, target_len_tokens // 8)
     notes = [f"Note {i+1}: {topics[i % len(topics)]}." for i in range(n_notes)]
