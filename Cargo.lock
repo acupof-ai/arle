@@ -1549,6 +1549,8 @@ dependencies = [
  "hf-hub",
  "infer-plan",
  "infer-seam",
+ "kv-native-sys",
+ "libc",
  "log",
  "mlx-sys",
  "serde",
