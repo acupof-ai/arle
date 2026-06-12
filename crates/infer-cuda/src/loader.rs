@@ -900,6 +900,7 @@ impl SafetensorLoader {
             shared_up,
             shared_down,
             shared_gate_router,
+            fused_sglang: std::cell::OnceCell::new(),
         })
     }
 
@@ -1690,6 +1691,33 @@ pub(crate) struct MoeLayerWeights {
     pub(crate) shared_up: DeviceMatrix,
     pub(crate) shared_down: DeviceMatrix,
     pub(crate) shared_gate_router: DeviceMatrix,
+    /// Lazily-built SGLang `fused_moe` stacked weight cache (`w1 [E, 2N, K]`
+    /// gate-then-up + `w2 [E, K, N]` down, contiguous BF16, this rank's local
+    /// experts). EMPTY by default — populated only on the first
+    /// `ARLE_QWEN35_MOE_FUSED_SGLANG` forward (U3 opt-in lane), so load-time
+    /// VRAM + bytes are byte-identical to the hand path. Single-threaded
+    /// executor (`!Sync`, like the loader's `RefCell`), so `OnceCell` interior
+    /// mutability over `&self` weights is sound. Costs ~+1.5 GB for the
+    /// Qwen3.6 single-GPU shard (w1 ≈ 256·1024·2048·2 B ≈ 1.0 GB, w2 ≈
+    /// 256·2048·512·2 B ≈ 0.5 GB) when the flag is on.
+    pub(crate) fused_sglang: std::cell::OnceCell<MoeFusedSglangWeights>,
+}
+
+/// SGLang `fused_moe` stacked expert-weight cache for one MoE layer (built
+/// lazily by the U3 fused path; see [`MoeLayerWeights::fused_sglang`]).
+///
+/// `w1` is `[E_l, 2N, K]` row-major BF16: for local expert `e`, rows `[0, N)`
+/// are the gate `[N, K]` and rows `[N, 2N)` are the up `[N, K]` (gate-then-up,
+/// matching SGLang's stacked `w13_weight`). `w2` is `[E_l, K, N]` row-major
+/// BF16: the per-expert down `[K, N]` verbatim. `num_experts` = this rank's
+/// local expert count, `gate_up_rows` = `2N`, `hidden` = `K`, `moe_inter` = `N`.
+pub(crate) struct MoeFusedSglangWeights {
+    pub(crate) w1: CudaSlice<half::bf16>,
+    pub(crate) w2: CudaSlice<half::bf16>,
+    pub(crate) num_experts: usize,
+    pub(crate) gate_up_rows: usize,
+    pub(crate) hidden: usize,
+    pub(crate) moe_inter: usize,
 }
 
 /// One contiguous `[groups, rows, cols]` row-major BF16 expert-weight buffer —
