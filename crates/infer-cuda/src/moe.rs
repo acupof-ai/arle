@@ -2996,10 +2996,15 @@ mod dsv4_gpu {
         let local_start = split.local_expert_start;
         let total_routes = num_tokens * topk;
         // Decode-band grouped-GEMV lane (B=1): zero pad rows, no activation
-        // quantize. Default ON in band; ARLE_DSV4_MOE_DECODE_GEMV=0 reverts
-        // to the contiguous DeepGEMM lane (the one-line kill switch).
+        // quantize. KILLED as a default 2026-06-13: the scalar dequant GEMV
+        // runs ~25% of HBM bandwidth and loses to DeepGEMM grinding the
+        // 64-aligned pad rows (34.9 vs 36.5 tok/s B=1; needle 512 flipped
+        // exact->partial x1). Opt-in ARLE_DSV4_MOE_DECODE_GEMV=1 keeps the
+        // lane as the substrate for a vectorized/MMA grouped decode kernel
+        // (or the vendored SGLang fused_moe lane) — the padding-tax target
+        // it aimed at (+2.8ms/tok vs era) is real and still open.
         if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES
-            && std::env::var("ARLE_DSV4_MOE_DECODE_GEMV").as_deref() != Ok("0")
+            && std::env::var("ARLE_DSV4_MOE_DECODE_GEMV").as_deref() == Ok("1")
         {
             let tables = layer.gemv_tables.get_or_init(|| {
                 build_gemv_tables(ctx, layer).unwrap_or_else(|e| {
