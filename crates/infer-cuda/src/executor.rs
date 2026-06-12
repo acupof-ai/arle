@@ -975,10 +975,15 @@ struct StepProfileProbe {
 
 impl StepProfileProbe {
     fn from_env() -> Option<Self> {
-        (std::env::var("ARLE_DSV4_STEP_PROFILE").as_deref() == Ok("1")).then(|| StepProfileProbe {
-            last_exit: None,
-            fwd_ms: Vec::with_capacity(128),
-            gap_ms: Vec::with_capacity(128),
+        (std::env::var("ARLE_DSV4_STEP_PROFILE").as_deref() == Ok("1")).then(|| {
+            // Arm the per-stage collector too when its env is set — the serve
+            // path has no other driver for it (only the parity example had).
+            crate::set_dsv4_stage_profile_active(true);
+            StepProfileProbe {
+                last_exit: None,
+                fwd_ms: Vec::with_capacity(128),
+                gap_ms: Vec::with_capacity(128),
+            }
         })
     }
 
@@ -995,12 +1000,19 @@ impl StepProfileProbe {
                 let mean = v.iter().sum::<f64>() / v.len() as f64;
                 (mean, med)
             };
+            let wall_ms: f64 = self.fwd_ms.iter().sum();
             let (fm, fp50) = stats(&mut self.fwd_ms);
             let (gm, gp50) = stats(&mut self.gap_ms);
             eprintln!(
                 "[step-profile] n=100 fwd mean={fm:.3}ms p50={fp50:.3}ms | gap mean={gm:.3}ms p50={gp50:.3}ms | period~{:.3}ms",
                 fm + gm
             );
+            // Per-stage attribution rides the same flush when
+            // ARLE_DSV4_STAGE_PROFILE is also set (host_ms names the launch
+            // knife per labeled stage; rank-0 print only).
+            crate::print_dsv4_stage_profile("decode", 100, wall_ms);
+            crate::reset_dsv4_stage_profile();
+            crate::set_dsv4_stage_profile_active(true);
             self.fwd_ms.clear();
             self.gap_ms.clear();
         }
