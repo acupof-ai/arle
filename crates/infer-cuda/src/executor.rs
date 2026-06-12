@@ -20,6 +20,9 @@ use crate::graph::GraphBucket;
 use crate::model::CudaModel;
 use crate::ops::argmax;
 
+#[path = "executor/spec_decode.rs"]
+mod spec_decode;
+
 const SUPPORTED_PAGE_SIZE: usize = 16;
 const DSV4_DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
@@ -1396,199 +1399,14 @@ impl Dsv4CudaExecutor {
             params.is_greedy(),
             "DSv4 MTP greedy verify currently supports greedy sampling only"
         );
-        let spec = &mut self.spec_slots[slot_idx];
-        let pending = spec
+        let pending = self.spec_slots[slot_idx]
             .pending
             .ok_or_else(|| anyhow::anyhow!("DSv4 MTP decode missing pending token"))?;
         ensure!(
             pending == last_token,
             "DSv4 MTP pending token {pending} != DecodeRow.last_token {last_token}"
         );
-        let hidden = spec
-            .hidden
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("DSv4 MTP decode missing previous hidden"))?
-            .clone();
-
-        // ── Depth-K MTP: chain K drafts off the MTP head, verify
-        // [pending, d0..d_{K-1}] in ONE batched forward, accept the longest correct
-        // prefix, commit accepted+bonus, roll back the rejected tail. K=1 reduces to
-        // the validated depth-1 batched-verify path. Greedy-equivalent: every committed
-        // token is the target's argmax.
-        //
-        // Depth-K (K>1) is PARKED on the draft-quality wall: the checkpoint's 1-layer
-        // mtp.0 nextn head loops when chained (drafts=[223,4489,223,4489]), accept
-        // collapses to 1/4 @ K=4 (measured 2026-06-11) so there is no amortization
-        // benefit, plus a residual K>1 verify correctness bug. The --mtp-draft-tokens
-        // flag stays wired for a future EAGLE-tree draft head; until one lands we clamp
-        // to depth-1 so an explicit `--mtp-draft-tokens N` can never run the broken path.
-        // See errors/2026-06-11-dsv4-mtp-depth-k-draft-quality-wall.md.
-        let requested = self.spec_draft_tokens.unwrap_or(1).max(1);
-        // Depth-K is clamped to 1 by default (the parked linear-chain bug). For the
-        // linear-chain diagnostic/fix work, ARLE_DSV4_MTP_UNCLAMP=1 honors the requested
-        // depth so the chain can be measured + fixed; default users stay safe at depth-1.
-        let unclamp = std::env::var("ARLE_DSV4_MTP_UNCLAMP").as_deref() == Ok("1");
-        if requested > 1 && !unclamp {
-            log::warn!(
-                "[dsv4-mtp] --mtp-draft-tokens={requested} requested but depth-K is parked \
-                 (draft-quality wall: 1-layer nextn head loops, accept 1/4 @ K=4); clamping to depth-1"
-            );
-        }
-        let depth = if unclamp { requested } else { 1usize };
-
-        // Draft chain: d_i = mtp_forward(prev_stream, prev_token) at start_pos+i, each
-        // chaining from the previous draft's wide MTP stream so d_{i+1} conditions on d_i.
-        // DIAGNOSTIC control ARLE_DSV4_MTP_CHAIN_FRESH=1: feed the trunk (draft-0) hidden
-        // to EVERY draft instead of the chained d_stream — isolates whether the chain's
-        // 2-cycle is the off-distribution 1-layer-MTP-stream feedback vs position/KV.
-        let chain_fresh = std::env::var("ARLE_DSV4_MTP_CHAIN_FRESH").as_deref() == Ok("1");
-        let mut drafts: Vec<u32> = Vec::with_capacity(depth);
-        let trunk_hidden = hidden;
-        let mut prev_stream: Option<DeviceVec> = None;
-        let mut chain_token = pending;
-        // Frozen-KV MTP P1-2: snapshot the K+1 ring slots [start_pos ..= start_pos+depth]
-        // (SW + FP8 + the fp8 packed_rows counter) BEFORE ANY speculative write. The
-        // draft loop below (mtp_forward -> run_mtp_transformer_layer -> mla_attention)
-        // ALSO writes the frozen target layer's SW/FP8 ring at start_pos+i, so the
-        // snapshot MUST precede it — capturing after the draft loop would snapshot
-        // draft-polluted slots for the target layer. On a partial-accept reject with
-        // start_pos >= sliding_window the rejected drafts' ring writes alias still-active
-        // window slots; restore_spec_ring_tail puts the committed content back. No-op
-        // when spec_rings is unallocated (spec decode off).
-        self.model.capture_spec_rings(
-            &mut self.slots[slot_idx],
-            &mut self.kv_adapter,
-            start_pos,
-            depth,
-        )?;
-        for i in 0..depth {
-            let h_prev: &DeviceVec = match (chain_fresh, prev_stream.as_ref()) {
-                (false, Some(prev)) => prev,
-                _ => &trunk_hidden,
-            };
-            let (d, d_stream) = self.model.mtp_forward(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                h_prev,
-                chain_token,
-                (start_pos + i) as u64,
-            )?;
-            drafts.push(d);
-            chain_token = d;
-            prev_stream = Some(d_stream);
-        }
-
-        // Verify K+1 tokens: argmax[j] = target argmax AFTER verify_tokens[j], so
-        // argmax[i] is exactly what draft i must equal; hiddens[j] = that MTP stream.
-        let mut verify_tokens: Vec<u32> = Vec::with_capacity(depth + 1);
-        verify_tokens.push(pending);
-        verify_tokens.extend_from_slice(&drafts);
-        // Frozen-KV: speculative verify runs with the compressor FROZEN (mutates
-        // nothing compressed). Clear the flag even on error.
-        crate::attention::set_dsv4_verify_frozen(true);
-        let verify_res = self.model.forward_tokens_verify(
-            &mut self.slots[slot_idx],
-            &mut self.kv_adapter,
-            &verify_tokens,
-            start_pos,
-            position,
-        );
-        crate::attention::set_dsv4_verify_frozen(false);
-        let (argmax, mut hiddens) = verify_res?;
-        ensure!(
-            argmax.len() == depth + 1 && hiddens.len() == depth + 1,
-            "DSv4 MTP depth-{depth} verify expected {} rows, got argmax={} hidden={}",
-            depth + 1,
-            argmax.len(),
-            hiddens.len()
-        );
-
-        // Longest accepted prefix: draft i accepted iff it equals argmax[i]; stop
-        // at the first mismatch.
-        let mut n = 0usize;
-        while n < depth && drafts[n] == argmax[n] {
-            n += 1;
-        }
-        let bonus = argmax[n]; // target's correction (n<depth) or continuation (n==depth)
-        self.mtp_accepts += n;
-        self.mtp_rejects += depth - n;
-        if std::env::var("ARLE_DSV4_MTP_DRAFT_DUMP").as_deref() == Ok("1")
-            && self.model.tp.config().rank == 0
-        {
-            let matches: Vec<bool> = (0..depth).map(|i| drafts[i] == argmax[i]).collect();
-            eprintln!(
-                "[dsv4-mtp-draft] depth={depth} start_pos={start_pos} accepted={n} drafts={drafts:?} targets={:?} matches={matches:?}",
-                &argmax[..depth]
-            );
-        }
-        if self.model.tp.config().rank == 0 {
-            eprintln!(
-                "[dsv4-mtp] depth={depth} accepted={n}/{depth} accept_total={} reject_total={} pending={pending} bonus={bonus}",
-                self.mtp_accepts, self.mtp_rejects
-            );
-        }
-
-        // PERF-CEILING DIAGNOSTIC (ARLE_DSV4_MTP_SKIP_REFORWARD=1): skip the commit
-        // re-forward to measure the A1 (compressor-only commit) perf target. The
-        // accepted prefix's SW/FP8 KV is already written by the verify; this just
-        // advances seq_len to the committed length and reuses the verify hidden.
-        // CORRECTNESS-BROKEN: the frozen compressor is never committed for the
-        // accepted tokens, so compressed blocks desync past the first boundary —
-        // for tok/s measurement ONLY, never a default.
-        if std::env::var("ARLE_DSV4_MTP_SKIP_REFORWARD").as_deref() == Ok("1") {
-            self.model
-                .truncate_slot(&mut self.slots[slot_idx], start_pos + n + 1)?;
-            self.model.restore_spec_ring_tail(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                start_pos,
-                n,
-                depth,
-            )?;
-            spec.pending = Some(bonus);
-            spec.hidden = Some(hiddens.remove(n));
-            let mut out: Vec<u32> = Vec::with_capacity(n + 1);
-            out.extend_from_slice(&drafts[..n]);
-            out.push(bonus);
-            return Ok(out);
-        }
-        // Frozen-KV commit (Option A): the speculative verify mutated nothing
-        // compressed, so there is no rollback snapshot and no full/partial split.
-        // Truncate to the pre-step length, then re-forward the accepted prefix
-        // [pending, d0..d_{n-1}] NON-frozen — committing the compressor for exactly
-        // the accepted tokens. Always re-forwards (even on full accept); a
-        // compressor-only commit (no re-forward) is the perf follow-up.
-        let _ = &hiddens;
-        self.model
-            .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
-        // Frozen-KV MTP P1-2: restore the REJECTED ring tail (slots accepted_n+1
-        // ..= depth) the verify wrote over still-active window slots. The accepted
-        // slots [0 ..= n] are left to the re-forward below, which overwrites them.
-        // No-op when spec decode is off. MUST run after truncate (which only
-        // resets lengths) and before the re-forward.
-        self.model.restore_spec_ring_tail(
-            &mut self.slots[slot_idx],
-            &mut self.kv_adapter,
-            start_pos,
-            n,
-            depth,
-        )?;
-        let mut prefix: Vec<u32> = Vec::with_capacity(n + 1);
-        prefix.push(pending);
-        prefix.extend_from_slice(&drafts[..n]);
-        let (_, mut re_hiddens) = self.model.forward_tokens_verify(
-            &mut self.slots[slot_idx],
-            &mut self.kv_adapter,
-            &prefix,
-            start_pos,
-            position,
-        )?;
-        spec.pending = Some(bonus);
-        spec.hidden = Some(re_hiddens.remove(n));
-        let mut out: Vec<u32> = Vec::with_capacity(n + 1);
-        out.extend_from_slice(&drafts[..n]);
-        out.push(bonus);
-        Ok(out)
+        self.spec_step(slot_idx, start_pos, position)
     }
 
     fn forward_decode_row(&mut self, row: &Dsv4DecodeBatchRow) -> Result<Vec<SlotToken>> {
