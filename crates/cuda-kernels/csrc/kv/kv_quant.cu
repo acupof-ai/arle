@@ -519,6 +519,145 @@ cudaError_t dequantize_paged_kv_int8_to_hnd_cuda(
     return cudaGetLastError();
 }
 
+// Durable FP8 NHD → BF16 HND work-buffer refill for **per-channel K** (KIVI).
+//
+// Same shape as dequantize_paged_kv_fp8_to_hnd_kernel, but the scale is a
+// `[num_kv_heads, head_dim]` static channel table indexed per ELEMENT
+// (`k_static_scales[kv_head * head_dim + d]`), not a per-(token, head) array.
+// Per-channel K quantize never writes per-token K scales, so refilling K
+// through the per-token sibling reads zeros and corrupts the prefix.
+__global__ void dequantize_paged_kv_fp8_per_channel_k_to_hnd_kernel(
+    const __nv_fp8_e4m3* __restrict__ kv_fp8,
+    const float* __restrict__ k_static_scales,
+    __nv_bfloat16* __restrict__ kv_bf16_hnd,
+    const int32_t* __restrict__ token_rows,
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim)
+{
+    int kv_head = blockIdx.x;
+    int tok_flat = blockIdx.y;
+    int d = threadIdx.x * 4;
+    if (d >= head_dim) return;
+
+    int token_row = token_rows[tok_flat];
+    constexpr int kPageSize = 16;
+    int page_idx = token_row / kPageSize;
+    int offset_in_page = token_row % kPageSize;
+    int src_offset = token_row * kv_dim + kv_head * head_dim + d;
+    int scale_offset = kv_head * head_dim + d;
+    int dst_offset = page_idx * kPageSize * kv_dim
+                   + kv_head * kPageSize * head_dim
+                   + offset_in_page * head_dim
+                   + d;
+    if (d + 3 < head_dim && ((src_offset | dst_offset | scale_offset) & 3) == 0) {
+        __nv_fp8x4_e4m3 packed =
+            *reinterpret_cast<const __nv_fp8x4_e4m3*>(kv_fp8 + src_offset);
+        float4 vals = static_cast<float4>(packed);
+        float4 scales4 = *reinterpret_cast<const float4*>(k_static_scales + scale_offset);
+        __nv_bfloat162 out01 = __floats2bfloat162_rn(vals.x * scales4.x, vals.y * scales4.y);
+        __nv_bfloat162 out23 = __floats2bfloat162_rn(vals.z * scales4.z, vals.w * scales4.w);
+        *reinterpret_cast<__nv_bfloat162*>(kv_bf16_hnd + dst_offset) = out01;
+        *reinterpret_cast<__nv_bfloat162*>(kv_bf16_hnd + dst_offset + 2) = out23;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (d + i < head_dim) {
+                float scale = k_static_scales[scale_offset + i];
+                float val = static_cast<float>(kv_fp8[src_offset + i]) * scale;
+                kv_bf16_hnd[dst_offset + i] = __float2bfloat16(val);
+            }
+        }
+    }
+}
+
+cudaError_t dequantize_paged_kv_fp8_per_channel_k_to_hnd_cuda(
+    const __nv_fp8_e4m3* kv_fp8,
+    const float* k_static_scales,
+    __nv_bfloat16* kv_bf16_hnd,
+    const int32_t* token_rows,
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim,
+    int total_tokens,
+    cudaStream_t stream)
+{
+    if (total_tokens <= 0) return cudaSuccess;
+    dim3 grid(num_kv_heads, total_tokens);
+    dim3 block((head_dim + 3) / 4);
+    dequantize_paged_kv_fp8_per_channel_k_to_hnd_kernel<<<grid, block, 0, stream>>>(
+        kv_fp8, k_static_scales, kv_bf16_hnd, token_rows, num_kv_heads, head_dim, kv_dim);
+    return cudaGetLastError();
+}
+
+// Durable INT8 NHD → BF16 HND work-buffer refill for **per-channel K** (KIVI).
+__global__ void dequantize_paged_kv_int8_per_channel_k_to_hnd_kernel(
+    const int8_t* __restrict__ kv_int8,
+    const float* __restrict__ k_static_scales,
+    __nv_bfloat16* __restrict__ kv_bf16_hnd,
+    const int32_t* __restrict__ token_rows,
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim)
+{
+    int kv_head = blockIdx.x;
+    int tok_flat = blockIdx.y;
+    int d = threadIdx.x * 2;
+    if (d >= head_dim) return;
+
+    int token_row = token_rows[tok_flat];
+    constexpr int kPageSize = 16;
+    int page_idx = token_row / kPageSize;
+    int offset_in_page = token_row % kPageSize;
+    int src_offset = token_row * kv_dim + kv_head * head_dim + d;
+    int scale_offset = kv_head * head_dim + d;
+    int dst_offset = page_idx * kPageSize * kv_dim
+                   + kv_head * kPageSize * head_dim
+                   + offset_in_page * head_dim
+                   + d;
+    if (d + 1 < head_dim) {
+        float scale0 = k_static_scales[scale_offset];
+        float scale1 = k_static_scales[scale_offset + 1];
+        if (((src_offset | dst_offset) & 1) == 0) {
+            uint16_t packed = *reinterpret_cast<const uint16_t*>(kv_int8 + src_offset);
+            int8_t lo = static_cast<int8_t>(packed & 0xffu);
+            int8_t hi = static_cast<int8_t>((packed >> 8) & 0xffu);
+            __nv_bfloat162 out = __floats2bfloat162_rn(
+                static_cast<float>(lo) * scale0,
+                static_cast<float>(hi) * scale1);
+            *reinterpret_cast<__nv_bfloat162*>(kv_bf16_hnd + dst_offset) = out;
+        } else {
+            float val0 = static_cast<float>(kv_int8[src_offset]) * scale0;
+            float val1 = static_cast<float>(kv_int8[src_offset + 1]) * scale1;
+            kv_bf16_hnd[dst_offset] = __float2bfloat16(val0);
+            kv_bf16_hnd[dst_offset + 1] = __float2bfloat16(val1);
+        }
+    } else {
+        float scale = k_static_scales[scale_offset];
+        float val = static_cast<float>(kv_int8[src_offset]) * scale;
+        kv_bf16_hnd[dst_offset] = __float2bfloat16(val);
+    }
+}
+
+cudaError_t dequantize_paged_kv_int8_per_channel_k_to_hnd_cuda(
+    const int8_t* kv_int8,
+    const float* k_static_scales,
+    __nv_bfloat16* kv_bf16_hnd,
+    const int32_t* token_rows,
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim,
+    int total_tokens,
+    cudaStream_t stream)
+{
+    if (total_tokens <= 0) return cudaSuccess;
+    dim3 grid(num_kv_heads, total_tokens);
+    dim3 block((head_dim + 1) / 2);
+    dequantize_paged_kv_int8_per_channel_k_to_hnd_kernel<<<grid, block, 0, stream>>>(
+        kv_int8, k_static_scales, kv_bf16_hnd, token_rows, num_kv_heads, head_dim, kv_dim);
+    return cudaGetLastError();
+}
+
 // ============================================================================
 // Dequantize paged INT8 KV → bf16 working buffer (NHD paged layout).
 //

@@ -65,17 +65,21 @@ fn decode_graph_enabled() -> bool {
 /// *request*, each backend resolves it against what it can actually honor and
 /// fails loud rather than silently downgrading.
 ///
-/// Today the CUDA path resolves exactly one dtype (BF16) — the contiguous
-/// per-layer caches the Qwen executors run. The paged quant-KV modes
-/// (`Int8`/`Fp8`/`Tq4`) are wired one at a time under #68 T3; until a mode's
-/// kernel path lands, [`CudaKvCacheDtype::resolve`] bails on it. New variants are
-/// added here as T3 lands each mode — the enum trails the real, validated paths,
-/// it does not pre-declare unimplemented ones.
+/// The CUDA path resolves BF16 (default) plus the paged quant-KV modes INT8 and
+/// FP8 E4M3 (#68 T3) on the dense-Qwen3 paged pool: KIVI per-channel K scales +
+/// per-(token, head) V scales, fused-dequant decode attention. `Tq4` stays a
+/// loud explicit deferral until a paged-prefill kernel path exists for
+/// TurboQuant — the enum trails the real, validated paths, it does not
+/// pre-declare unimplemented ones.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CudaKvCacheDtype {
-    /// Native BF16 per-layer caches (the only CUDA KV dtype wired today).
+    /// Native BF16 per-layer caches (the default CUDA KV dtype).
     #[default]
     Bf16,
+    /// Paged INT8 quant KV (KIVI per-channel K + per-token V scales, #68 T3).
+    Int8,
+    /// Paged FP8 E4M3 quant KV (KIVI per-channel K + per-token V scales, #68 T3).
+    Fp8,
 }
 
 impl CudaKvCacheDtype {
@@ -84,22 +88,37 @@ impl CudaKvCacheDtype {
     pub fn label(self) -> &'static str {
         match self {
             Self::Bf16 => "bf16",
+            Self::Int8 => "int8",
+            Self::Fp8 => "fp8",
         }
     }
 
     /// Resolve a backend-neutral requested dtype against the CUDA support matrix.
-    /// `Auto`/`Bf16` → BF16; the paged quant modes (`Int8`/`Fp8`/`Tq4`) fail loud
-    /// with a "pending #68 T3" message until their kernel path is wired and
-    /// gated, rather than silently falling back to BF16.
+    /// `Auto`/`Bf16` → BF16; `Int8`/`Fp8` → the paged quant modes (#68 T3);
+    /// `Tq4` fails loud with an explicit-deferral message rather than silently
+    /// falling back to BF16.
     pub fn resolve(requested: infer_seam::KvCacheDtype) -> Result<Self> {
         use infer_seam::KvCacheDtype;
         match requested {
             KvCacheDtype::Auto | KvCacheDtype::Bf16 => Ok(Self::Bf16),
-            other => anyhow::bail!(
-                "CUDA KV cache currently supports bf16; requested {} is the paged \
-                 quant-KV path, not yet wired (#68 T3)",
-                other.label()
+            KvCacheDtype::Int8 => Ok(Self::Int8),
+            KvCacheDtype::Fp8 => Ok(Self::Fp8),
+            KvCacheDtype::Tq4 => anyhow::bail!(
+                "CUDA KV cache dtype tq4 is deferred: TurboQuant pools use \
+                 page_size=1 while the TileLang paged prefill kernels are compiled \
+                 for PAGE_SIZE=16 — no paged-prefill kernel path exists for TQ (the \
+                 monolith never had one either); tracked in #68"
             ),
+        }
+    }
+
+    /// The cuda-kernels pool format this dtype selects.
+    #[must_use]
+    pub fn kv_format(self) -> KVFormat {
+        match self {
+            Self::Bf16 => KVFormat::BF16,
+            Self::Int8 => KVFormat::INT8,
+            Self::Fp8 => KVFormat::FP8E4M3,
         }
     }
 }
@@ -132,9 +151,15 @@ impl RealCudaExecutor {
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
+        kv_dtype: CudaKvCacheDtype,
     ) -> Result<Self> {
         Ok(Self::Qwen(Box::new(
-            QwenCudaExecutor::from_qwen3_bf16_safetensors(model_path, num_slots, total_pages)?,
+            QwenCudaExecutor::from_qwen3_bf16_safetensors(
+                model_path,
+                num_slots,
+                total_pages,
+                kv_dtype,
+            )?,
         )))
     }
 
@@ -474,6 +499,7 @@ impl QwenCudaExecutor {
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
+        kv_dtype: CudaKvCacheDtype,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "CudaExecutor requires at least one slot");
         ensure!(
@@ -482,13 +508,14 @@ impl QwenCudaExecutor {
         );
 
         let model = CudaModel::from_safetensors(model_path.as_ref())?;
+        let kv_format = kv_dtype.kv_format();
         let token_budget = total_pages * SUPPORTED_PAGE_SIZE;
         let budget_bytes = PagedKVPool::budget_bytes_for_tokens(
             model.config.num_hidden_layers,
             model.config.num_key_value_heads,
             model.config.head_dim,
             token_budget,
-            KVFormat::BF16,
+            kv_format,
         );
         let kv = PagedKVPool::with_format(
             &model.ctx,
@@ -497,11 +524,11 @@ impl QwenCudaExecutor {
             model.config.head_dim,
             num_slots,
             budget_bytes,
-            KVFormat::BF16,
+            kv_format,
         )?;
         ensure!(
             kv.page_size == SUPPORTED_PAGE_SIZE,
-            "R6 BF16 Qwen3 expects cuda-kernels page_size={SUPPORTED_PAGE_SIZE}, got {}",
+            "R6 paged Qwen3 expects cuda-kernels page_size={SUPPORTED_PAGE_SIZE}, got {}",
             kv.page_size
         );
 
@@ -714,6 +741,14 @@ impl QwenCudaExecutor {
                 "CUDA decode graph disabled under tensor parallelism \
                  (world_size>1, NCCL collectives are not graph-capturable); \
                  using eager forward"
+            );
+            return Ok(());
+        }
+        if self.kv.format != KVFormat::BF16 {
+            info!(
+                "CUDA decode graph disabled for quantized KV (format {:?}); decode runs eager \
+                 through the fused-dequant kernels (#68 T3 V1)",
+                self.kv.format
             );
             return Ok(());
         }
@@ -2543,7 +2578,7 @@ mod tests {
 
     #[test]
     fn resolve_cuda_support_matrix() {
-        // Auto + explicit Bf16 resolve to the one wired CUDA dtype.
+        // Auto + explicit Bf16 resolve to the default CUDA dtype.
         assert_eq!(
             CudaKvCacheDtype::resolve(KvCacheDtype::Auto).unwrap(),
             CudaKvCacheDtype::Bf16
@@ -2552,19 +2587,27 @@ mod tests {
             CudaKvCacheDtype::resolve(KvCacheDtype::Bf16).unwrap(),
             CudaKvCacheDtype::Bf16
         );
-        // The paged quant-KV modes fail loud (pending #68 T3), never silent-downgrade.
-        for unwired in [KvCacheDtype::Int8, KvCacheDtype::Fp8, KvCacheDtype::Tq4] {
-            let err = CudaKvCacheDtype::resolve(unwired)
-                .expect_err("quant KV dtype must bail until its T3 path lands");
-            let msg = err.to_string();
-            assert!(
-                msg.contains(unwired.label()),
-                "error names the dtype: {msg}"
-            );
-            assert!(
-                msg.contains("#68 T3"),
-                "error cites the wiring ticket: {msg}"
-            );
-        }
+        // The paged quant-KV modes wired by #68 T3 resolve to their variants.
+        assert_eq!(
+            CudaKvCacheDtype::resolve(KvCacheDtype::Int8).unwrap(),
+            CudaKvCacheDtype::Int8
+        );
+        assert_eq!(
+            CudaKvCacheDtype::resolve(KvCacheDtype::Fp8).unwrap(),
+            CudaKvCacheDtype::Fp8
+        );
+        // Tq4 stays an explicit deferral (no paged-prefill kernel path for
+        // TurboQuant's page_size=1 pools), never a silent downgrade.
+        let err = CudaKvCacheDtype::resolve(KvCacheDtype::Tq4)
+            .expect_err("tq4 must bail with the explicit-deferral message");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("TurboQuant"),
+            "error explains the TurboQuant deferral: {msg}"
+        );
+        assert!(
+            msg.contains("page_size"),
+            "error cites the page_size mismatch: {msg}"
+        );
     }
 }

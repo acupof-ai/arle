@@ -1606,14 +1606,16 @@ impl TokenKVPool {
     }
 
     /// KIVI per-channel K scale CudaSlice ref for a layer.
-    /// Returns `None` when the pool is not in FP8 mode (BF16 / INT8 / TQ
-    /// keep their per-(token, head) scales).
+    /// Returns `None` when the pool format carries no per-channel K table
+    /// (the table is allocated for FP8E4M3 / INT8 / INT4; BF16 needs no
+    /// scales and TQ keeps its own norm/codebook state).
     pub fn k_static_scales_slice(&self, layer: usize) -> Option<&CudaSlice<f32>> {
         self.k_static_scales.as_ref().map(|s| &s[layer])
     }
 
     /// KIVI per-channel K scale pointer for a layer (raw device address),
-    /// for kernels that consume `*const f32`. `None` when not FP8 mode.
+    /// for kernels that consume `*const f32`. `None` when the format carries
+    /// no per-channel K table (allocated for FP8E4M3 / INT8 / INT4).
     pub fn k_static_scales_ptr(
         &self,
         layer: usize,

@@ -668,6 +668,92 @@ pub fn dequantize_paged_kv_int8_to_hnd(
     Ok(())
 }
 
+/// Per-channel-K variant of [`dequantize_paged_kv_fp8_to_hnd`] for the KIVI
+/// prefix refill: K reads the static `[num_kv_heads, head_dim]` channel scale
+/// table instead of per-(token, head) scales. The per-token sibling must NOT
+/// be used for per-channel K — per-channel K quantize never writes per-token
+/// K scales, so it would refill the prefix as zeros.
+#[allow(clippy::too_many_arguments)]
+pub fn dequantize_paged_kv_fp8_per_channel_k_to_hnd(
+    ctx: &DeviceContext,
+    kv_fp8_ptr: u64,
+    k_static_scales_ptr: u64,
+    kv_bf16_hnd_ptr: u64,
+    token_rows_gpu: &CudaSlice<i32>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    total_tokens: usize,
+) -> Result<()> {
+    if total_tokens == 0 {
+        return Ok(());
+    }
+    let mut offset = 0usize;
+    while offset < total_tokens {
+        let chunk_tokens = (total_tokens - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
+        let rows = token_rows_gpu.slice(offset..offset + chunk_tokens);
+        let (rows_ptr, _g) = rows.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::dequantize_paged_kv_fp8_per_channel_k_to_hnd_cuda(
+                kv_fp8_ptr as *const u8,
+                k_static_scales_ptr as *const f32,
+                kv_bf16_hnd_ptr as *mut ffi::Half,
+                rows_ptr as *const i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dim as i32,
+                chunk_tokens as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        offset += chunk_tokens;
+    }
+    Ok(())
+}
+
+/// Per-channel-K variant of [`dequantize_paged_kv_int8_to_hnd`] for the KIVI
+/// prefix refill (see [`dequantize_paged_kv_fp8_per_channel_k_to_hnd`] for why
+/// the per-token sibling is wrong for per-channel K).
+#[allow(clippy::too_many_arguments)]
+pub fn dequantize_paged_kv_int8_per_channel_k_to_hnd(
+    ctx: &DeviceContext,
+    kv_int8_ptr: u64,
+    k_static_scales_ptr: u64,
+    kv_bf16_hnd_ptr: u64,
+    token_rows_gpu: &CudaSlice<i32>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    total_tokens: usize,
+) -> Result<()> {
+    if total_tokens == 0 {
+        return Ok(());
+    }
+    let mut offset = 0usize;
+    while offset < total_tokens {
+        let chunk_tokens = (total_tokens - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
+        let rows = token_rows_gpu.slice(offset..offset + chunk_tokens);
+        let (rows_ptr, _g) = rows.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::dequantize_paged_kv_int8_per_channel_k_to_hnd_cuda(
+                kv_int8_ptr as *const i8,
+                k_static_scales_ptr as *const f32,
+                kv_bf16_hnd_ptr as *mut ffi::Half,
+                rows_ptr as *const i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                kv_dim as i32,
+                chunk_tokens as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        offset += chunk_tokens;
+    }
+    Ok(())
+}
+
 // ─── Fused-dequant decode attention (INT8+scale) ───
 
 /// Workspace size for split-KV fused INT8 decode attention.
@@ -1162,6 +1248,141 @@ mod tests {
         let ctx = DeviceContext::new().expect("failed to create CUDA context");
         run_hnd_refill_case(&ctx, 8);
         run_hnd_refill_case(&ctx, 7);
+    }
+
+    fn run_per_channel_k_fp8_refill_case(ctx: &DeviceContext, head_dim: usize) {
+        let num_kv_heads = 3usize;
+        let total_tokens = 17usize;
+        let kv_dim = num_kv_heads * head_dim;
+        let elem_count = total_tokens * kv_dim;
+        let hnd_elem_count = total_tokens.div_ceil(16) * 16 * kv_dim;
+
+        let fp8_pattern = [0x00u8, 0x38, 0xb8, 0x40];
+        let fp8_host: Vec<u8> = (0..elem_count)
+            .map(|idx| fp8_pattern[idx % fp8_pattern.len()])
+            .collect();
+        // Per-channel scale table: [num_kv_heads * head_dim].
+        let scale_host: Vec<f32> = (0..num_kv_heads * head_dim)
+            .map(|idx| 0.25 + (idx % 5) as f32 * 0.125)
+            .collect();
+        let token_rows_host: Vec<i32> = (0..total_tokens).map(|idx| idx as i32).collect();
+
+        let fp8_gpu = ctx.stream.clone_htod(&fp8_host).expect("fp8 H2D");
+        let scales_gpu = ctx.stream.clone_htod(&scale_host).expect("scales H2D");
+        let token_rows_gpu = ctx.stream.clone_htod(&token_rows_host).expect("rows H2D");
+        let mut fp8_out = ctx
+            .stream
+            .alloc_zeros::<u16>(hnd_elem_count)
+            .expect("fp8 out");
+
+        {
+            let (fp8_ptr, _fp8_guard) = fp8_gpu.device_ptr(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales_gpu.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = fp8_out.device_ptr_mut(&ctx.stream);
+            dequantize_paged_kv_fp8_per_channel_k_to_hnd(
+                ctx,
+                fp8_ptr,
+                scales_ptr,
+                out_ptr,
+                &token_rows_gpu,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                total_tokens,
+            )
+            .expect("fp8 per-channel-k hnd refill");
+        }
+
+        ctx.sync().expect("sync per-channel-k fp8 refill");
+        let got = ctx.stream.clone_dtoh(&fp8_out).expect("fp8 D2H");
+
+        for token_row in 0..total_tokens {
+            for kv_head in 0..num_kv_heads {
+                for d in 0..head_dim {
+                    let scale = scale_host[kv_head * head_dim + d];
+                    let src = token_row * kv_dim + kv_head * head_dim + d;
+                    let dst = hnd_offset(token_row, kv_head, d, head_dim, kv_dim);
+                    let expected = bf16::from_f32(fp8_reference(fp8_host[src]) * scale).to_bits();
+                    assert_eq!(
+                        got[dst], expected,
+                        "fp8 per-channel-k mismatch head_dim={head_dim} token={token_row} head={kv_head} d={d}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn run_per_channel_k_int8_refill_case(ctx: &DeviceContext, head_dim: usize) {
+        let num_kv_heads = 3usize;
+        let total_tokens = 17usize;
+        let kv_dim = num_kv_heads * head_dim;
+        let elem_count = total_tokens * kv_dim;
+        let hnd_elem_count = total_tokens.div_ceil(16) * 16 * kv_dim;
+
+        let int8_host: Vec<i8> = (0..elem_count).map(|idx| (idx as i8 % 9) - 4).collect();
+        // Per-channel scale table: [num_kv_heads * head_dim].
+        let scale_host: Vec<f32> = (0..num_kv_heads * head_dim)
+            .map(|idx| 0.25 + (idx % 5) as f32 * 0.125)
+            .collect();
+        let token_rows_host: Vec<i32> = (0..total_tokens).map(|idx| idx as i32).collect();
+
+        let int8_gpu = ctx.stream.clone_htod(&int8_host).expect("int8 H2D");
+        let scales_gpu = ctx.stream.clone_htod(&scale_host).expect("scales H2D");
+        let token_rows_gpu = ctx.stream.clone_htod(&token_rows_host).expect("rows H2D");
+        let mut int8_out = ctx
+            .stream
+            .alloc_zeros::<u16>(hnd_elem_count)
+            .expect("int8 out");
+
+        {
+            let (int8_ptr, _int8_guard) = int8_gpu.device_ptr(&ctx.stream);
+            let (scales_ptr, _scales_guard) = scales_gpu.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = int8_out.device_ptr_mut(&ctx.stream);
+            dequantize_paged_kv_int8_per_channel_k_to_hnd(
+                ctx,
+                int8_ptr,
+                scales_ptr,
+                out_ptr,
+                &token_rows_gpu,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                total_tokens,
+            )
+            .expect("int8 per-channel-k hnd refill");
+        }
+
+        ctx.sync().expect("sync per-channel-k int8 refill");
+        let got = ctx.stream.clone_dtoh(&int8_out).expect("int8 D2H");
+
+        for token_row in 0..total_tokens {
+            for kv_head in 0..num_kv_heads {
+                for d in 0..head_dim {
+                    let scale = scale_host[kv_head * head_dim + d];
+                    let src = token_row * kv_dim + kv_head * head_dim + d;
+                    let dst = hnd_offset(token_row, kv_head, d, head_dim, kv_dim);
+                    let expected = bf16::from_f32(int8_host[src] as f32 * scale).to_bits();
+                    assert_eq!(
+                        got[dst], expected,
+                        "int8 per-channel-k mismatch head_dim={head_dim} token={token_row} head={kv_head} d={d}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hnd_refill_fp8_per_channel_k_matches_scale_table() {
+        let ctx = DeviceContext::new().expect("failed to create CUDA context");
+        run_per_channel_k_fp8_refill_case(&ctx, 8);
+        run_per_channel_k_fp8_refill_case(&ctx, 7);
+    }
+
+    #[test]
+    fn hnd_refill_int8_per_channel_k_matches_scale_table() {
+        let ctx = DeviceContext::new().expect("failed to create CUDA context");
+        run_per_channel_k_int8_refill_case(&ctx, 8);
+        run_per_channel_k_int8_refill_case(&ctx, 7);
     }
 
     #[test]
