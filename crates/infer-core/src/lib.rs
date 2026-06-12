@@ -678,9 +678,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .max_total_tokens
                 .saturating_sub(prompt_tokens.len()),
         );
+        let mut sampling = options.sampling;
+        if sampling.max_new_tokens.is_none() {
+            sampling.max_new_tokens = Some(max_tokens);
+        }
         if max_tokens == 0 {
             return NormalizedRequest::Completed(
-                RequestState::new(handle, prompt_tokens, options.priority, 0, options.sampling)
+                RequestState::new(handle, prompt_tokens, options.priority, 0, sampling)
                     .complete_immediately(FinishReason::Length),
             );
         }
@@ -690,7 +694,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             prompt_tokens,
             options.priority,
             max_tokens,
-            options.sampling,
+            sampling,
         ))
     }
 
@@ -1923,8 +1927,11 @@ mod testing {
 
 #[cfg(test)]
 mod tests {
-    use infer_plan::{FinishReason, argmax_logit, sample_token};
-    use infer_seam::{KvAllocator, KvQuery};
+    use infer_plan::{
+        DiffusionBlockModel, DiffusionCanvasPrediction, DiffusionGenerationConfig,
+        DiffusionModelError, FinishReason, argmax_logit, sample_token,
+    };
+    use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool, KvAllocator, KvQuery};
 
     use super::testing::{
         DeviceMirrorExecutor, HoldGovernor, LimitedPrefixExecutor, MockExecutor, MockKvPool,
@@ -3217,6 +3224,176 @@ mod tests {
             prefill_start_positions.contains(&2) && prefill_start_positions.contains(&4),
             "expected chunked progress across ticks, got {prefill_start_positions:?}"
         );
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct FakeDiffusionModel {
+        prompts: Vec<Vec<u32>>,
+        commits: Vec<Vec<u32>>,
+        begin_configs: Vec<DiffusionGenerationConfig>,
+        predictions: Vec<DiffusionCanvasPrediction>,
+        calls: usize,
+    }
+
+    impl DiffusionBlockModel for FakeDiffusionModel {
+        fn begin_request(
+            &mut self,
+            config: &DiffusionGenerationConfig,
+        ) -> std::result::Result<(), DiffusionModelError> {
+            self.begin_configs.push(config.clone());
+            Ok(())
+        }
+
+        fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<(), DiffusionModelError> {
+            self.prompts.push(prompt_tokens.to_vec());
+            Ok(())
+        }
+
+        fn predict_canvas(
+            &mut self,
+            _canvas: &[u32],
+            _valid_len: usize,
+            _step: usize,
+            _temperature: f32,
+        ) -> Result<DiffusionCanvasPrediction, DiffusionModelError> {
+            let idx = self.calls.min(self.predictions.len().saturating_sub(1));
+            self.calls += 1;
+            self.predictions
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| DiffusionModelError::new("no prediction"))
+        }
+
+        fn commit(&mut self, tokens: &[u32]) -> Result<(), DiffusionModelError> {
+            self.commits.push(tokens.to_vec());
+            Ok(())
+        }
+    }
+
+    fn diffusion_prediction(tokens: &[u32], canvas_len: usize) -> DiffusionCanvasPrediction {
+        let mut sampled_tokens = vec![0; canvas_len];
+        let mut argmax_tokens = vec![0; canvas_len];
+        let entropies = vec![0.0; canvas_len];
+        for (idx, &token) in tokens.iter().enumerate() {
+            sampled_tokens[idx] = token;
+            argmax_tokens[idx] = token;
+        }
+        DiffusionCanvasPrediction {
+            sampled_tokens,
+            argmax_tokens,
+            entropies,
+        }
+    }
+
+    fn diffusion_config(max_new_tokens: usize) -> DiffusionGenerationConfig {
+        DiffusionGenerationConfig {
+            canvas_length: 4,
+            max_denoising_steps: 1,
+            max_new_tokens,
+            vocab_size: 128,
+            stop_token_ids: vec![99],
+            pad_token_id: 0,
+            entropy_bound: 0.1,
+            confidence_threshold: 0.01,
+            t_min: 0.4,
+            t_max: 0.8,
+            stability_threshold: 1,
+            seed: 0,
+        }
+    }
+
+    #[test]
+    fn diffusion_buffered_executor_runs_through_engine_completion() -> Result<()> {
+        let model = FakeDiffusionModel {
+            predictions: vec![diffusion_prediction(&[10, 11, 12], 4)],
+            ..FakeDiffusionModel::default()
+        };
+        let executor = BufferedDiffusionExecutor::new(model, diffusion_config(3));
+        let mut config = test_config(1);
+        config.chunked_prefill_size = 2;
+        let mut engine = Engine::with_config(executor, HostPagedKvPool::new(1, 8, 4), config);
+
+        let handle = engine.submit_request_with_options(
+            vec![1, 2, 3, 4],
+            3,
+            RequestOptions {
+                sampling: SamplingParams {
+                    max_new_tokens: Some(3),
+                    ..SamplingParams::default()
+                },
+                ..RequestOptions::default()
+            },
+        );
+        engine.run_to_idle()?;
+
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(completed.prompt_tokens, vec![1, 2, 3, 4]);
+        assert_eq!(completed.generated_tokens, vec![10, 11, 12]);
+        assert!(matches!(completed.finish, Some(FinishReason::Length)));
+        Ok(())
+    }
+
+    #[test]
+    fn diffusion_executor_uses_engine_max_tokens_without_sampling_override() -> Result<()> {
+        let model = FakeDiffusionModel {
+            predictions: vec![diffusion_prediction(&[10, 11], 4)],
+            ..FakeDiffusionModel::default()
+        };
+        let executor = BufferedDiffusionExecutor::new(model, diffusion_config(8));
+        let mut engine =
+            Engine::with_config(executor, HostPagedKvPool::new(1, 8, 4), test_config(1));
+
+        let handle = engine.submit_request(vec![1, 2], 2);
+        engine.run_to_idle()?;
+
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(completed.generated_tokens, vec![10, 11]);
+        let model = engine.executor.into_inner();
+        assert_eq!(model.begin_configs.len(), 1);
+        assert_eq!(model.begin_configs[0].max_new_tokens, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn diffusion_executor_disables_prefix_reuse_for_repeated_prompt() -> Result<()> {
+        let model = FakeDiffusionModel {
+            predictions: vec![
+                diffusion_prediction(&[10, 11], 4),
+                diffusion_prediction(&[20, 21], 4),
+            ],
+            ..FakeDiffusionModel::default()
+        };
+        let executor = BufferedDiffusionExecutor::new(model, diffusion_config(2));
+        let mut engine =
+            Engine::with_config(executor, HostPagedKvPool::new(1, 8, 4), test_config(1));
+
+        let prompt = vec![1, 2, 3, 4];
+        let first = engine.submit_request(prompt.clone(), 2);
+        engine.run_to_idle()?;
+        let second = engine.submit_request(prompt.clone(), 2);
+        engine.run_to_idle()?;
+
+        assert_eq!(
+            engine
+                .completed(first)
+                .expect("first request completed")
+                .generated_tokens,
+            vec![10, 11]
+        );
+        assert_eq!(
+            engine
+                .completed(second)
+                .expect("second request completed")
+                .generated_tokens,
+            vec![20, 21]
+        );
+        let stats = engine.prefix_cache_stats();
+        assert_eq!(stats.lookups, 2);
+        assert_eq!(stats.hits, 0);
+        assert!(stats.published_pages > 0);
+        let model = engine.executor.into_inner();
+        assert_eq!(model.prompts, vec![prompt.clone(), prompt]);
         Ok(())
     }
 

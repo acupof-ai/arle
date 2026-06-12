@@ -52,12 +52,12 @@ pub enum Gemma4LauncherKind {
     MoeExperts,
 }
 
-pub const GEMMA4_RMS_NORM_ADDS_ONE: bool = true;
+pub const GEMMA4_RMS_NORM_ADDS_ONE: bool = false;
 
 pub fn gemma4_forward_ops(config: &gemma_spec::Gemma4TextConfig) -> Vec<Gemma4Op> {
     let mut ops = Vec::new();
     ops.push(Gemma4Op::TokenEmbedding);
-    for (layer_idx, layer_type) in config.layer_types.iter().enumerate() {
+    for layer_type in &config.layer_types {
         if config.has_per_layer_embeddings() {
             ops.push(Gemma4Op::PerLayerEmbedding);
         }
@@ -84,22 +84,16 @@ pub fn gemma4_forward_ops(config: &gemma_spec::Gemma4TextConfig) -> Vec<Gemma4Op
             Gemma4Op::AttentionResidual,
             Gemma4Op::PreMlpRmsNorm,
         ]);
-        if config.enable_moe_block && layer_idx + 1 != config.num_hidden_layers {
-            ops.extend_from_slice(&[
-                Gemma4Op::Router,
-                Gemma4Op::RoutedExperts,
-                Gemma4Op::SharedExpert,
-                Gemma4Op::MlpResidual,
-            ]);
-        } else {
-            ops.extend_from_slice(&[
-                Gemma4Op::GateProj,
-                Gemma4Op::UpProj,
-                Gemma4Op::GeGlu,
-                Gemma4Op::DownProj,
-                Gemma4Op::MlpResidual,
-            ]);
+        ops.extend_from_slice(&[
+            Gemma4Op::GateProj,
+            Gemma4Op::UpProj,
+            Gemma4Op::GeGlu,
+            Gemma4Op::DownProj,
+        ]);
+        if config.uses_moe_block() {
+            ops.extend_from_slice(&[Gemma4Op::Router, Gemma4Op::RoutedExperts]);
         }
+        ops.push(Gemma4Op::MlpResidual);
     }
     ops.push(Gemma4Op::FinalRmsNorm);
     ops.push(Gemma4Op::LmHead);
@@ -313,7 +307,7 @@ mod tests {
         assert!(ops.contains(&Gemma4Op::GeGlu));
         assert_eq!(ops[ops.len() - 2], Gemma4Op::FinalRmsNorm);
         assert_eq!(ops[ops.len() - 1], Gemma4Op::LmHead);
-        assert!(GEMMA4_RMS_NORM_ADDS_ONE);
+        assert!(!GEMMA4_RMS_NORM_ADDS_ONE);
     }
 
     #[test]
@@ -343,10 +337,31 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_norm_weight_adds_one_is_pinned() {
-        assert_eq!(gemma4_effective_norm_weight(0.0), 1.0);
-        assert_eq!(gemma4_effective_norm_weight(-0.25), 0.75);
-        assert!(GEMMA4_RMS_NORM_ADDS_ONE);
+    fn gemma4_norm_weight_is_plain_scale() {
+        assert_eq!(gemma4_effective_norm_weight(0.0), 0.0);
+        assert_eq!(gemma4_effective_norm_weight(-0.25), -0.25);
+        assert!(!GEMMA4_RMS_NORM_ADDS_ONE);
+    }
+
+    #[test]
+    fn gemma4_moe_layers_keep_dense_mlp_and_router() {
+        let mut cfg = config();
+        cfg.num_experts = Some(128);
+        cfg.top_k_experts = Some(8);
+        cfg.moe_intermediate_size = Some(512);
+        assert!(cfg.uses_moe_block());
+
+        let ops = gemma4_forward_ops(&cfg);
+        assert!(ops.contains(&Gemma4Op::GateProj));
+        assert!(ops.contains(&Gemma4Op::UpProj));
+        assert!(ops.contains(&Gemma4Op::DownProj));
+        assert!(ops.contains(&Gemma4Op::Router));
+        assert!(ops.contains(&Gemma4Op::RoutedExperts));
+        assert!(!ops.contains(&Gemma4Op::SharedExpert));
+        assert_eq!(
+            ops.iter().filter(|op| **op == Gemma4Op::Router).count(),
+            cfg.num_hidden_layers
+        );
     }
 
     #[cfg(feature = "vulkan")]

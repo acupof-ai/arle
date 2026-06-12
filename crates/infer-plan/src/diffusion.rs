@@ -1,0 +1,729 @@
+//! Backend-neutral block-diffusion generation loop.
+//!
+//! Diffusion-style text models do not fit the autoregressive
+//! prefill-then-one-token-decode [`ForwardPlan`](crate::ForwardPlan) contract:
+//! one generation block owns a fixed canvas, repeatedly denoises all positions,
+//! and commits the whole converged canvas. This module keeps that outer loop in
+//! pure host code while backends provide the block model implementation.
+
+use thiserror::Error;
+
+use crate::FinishReason;
+
+/// Default DiffusionGemma canvas length.
+pub const DEFAULT_DIFFUSION_CANVAS_LENGTH: usize = 256;
+/// Default DiffusionGemma maximum denoising steps.
+pub const DEFAULT_DIFFUSION_MAX_DENOISING_STEPS: usize = 48;
+/// Default DiffusionGemma entropy-bound sampler budget.
+pub const DEFAULT_DIFFUSION_ENTROPY_BOUND: f32 = 0.1;
+/// Default DiffusionGemma confidence threshold for adaptive stopping.
+pub const DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD: f32 = 0.005;
+/// Default DiffusionGemma temperature schedule start.
+pub const DEFAULT_DIFFUSION_T_MAX: f32 = 0.8;
+/// Default DiffusionGemma temperature schedule end.
+pub const DEFAULT_DIFFUSION_T_MIN: f32 = 0.4;
+/// Default DiffusionGemma stability threshold in consecutive argmax canvases.
+pub const DEFAULT_DIFFUSION_STABILITY_THRESHOLD: usize = 1;
+
+/// Backend-neutral parameters for a block-diffusion generation.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffusionGenerationConfig {
+    /// Fixed denoising canvas length.
+    pub canvas_length: usize,
+    /// Maximum denoise passes per canvas before forced commit.
+    pub max_denoising_steps: usize,
+    /// Maximum output tokens requested by the caller.
+    pub max_new_tokens: usize,
+    /// Vocabulary size used for renoising unaccepted positions.
+    pub vocab_size: u32,
+    /// Token ids that terminate generation when first committed.
+    pub stop_token_ids: Vec<u32>,
+    /// Padding token id; only used to fill the unused tail of a short final canvas.
+    pub pad_token_id: u32,
+    /// Entropy-bound sampler budget.
+    pub entropy_bound: f32,
+    /// Average entropy threshold for adaptive stopping.
+    pub confidence_threshold: f32,
+    /// Minimum temperature in the linear denoise schedule.
+    pub t_min: f32,
+    /// Maximum temperature in the linear denoise schedule.
+    pub t_max: f32,
+    /// Required number of stable argmax canvases before adaptive commit.
+    pub stability_threshold: usize,
+    /// Deterministic renoise / Gumbel seed.
+    pub seed: u64,
+}
+
+impl DiffusionGenerationConfig {
+    /// DiffusionGemma defaults from the public model config.
+    #[must_use]
+    pub fn diffusion_gemma(max_new_tokens: usize, vocab_size: u32) -> Self {
+        Self {
+            canvas_length: DEFAULT_DIFFUSION_CANVAS_LENGTH,
+            max_denoising_steps: DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
+            max_new_tokens,
+            vocab_size,
+            stop_token_ids: vec![1, 106, 50],
+            pad_token_id: 0,
+            entropy_bound: DEFAULT_DIFFUSION_ENTROPY_BOUND,
+            confidence_threshold: DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
+            t_min: DEFAULT_DIFFUSION_T_MIN,
+            t_max: DEFAULT_DIFFUSION_T_MAX,
+            stability_threshold: DEFAULT_DIFFUSION_STABILITY_THRESHOLD,
+            seed: 0,
+        }
+    }
+
+    fn validate(&self) -> Result<(), DiffusionGenerateError> {
+        if self.canvas_length == 0 {
+            return Err(DiffusionGenerateError::InvalidConfig(
+                "canvas_length must be greater than zero",
+            ));
+        }
+        if self.max_denoising_steps == 0 {
+            return Err(DiffusionGenerateError::InvalidConfig(
+                "max_denoising_steps must be greater than zero",
+            ));
+        }
+        if self.vocab_size == 0 {
+            return Err(DiffusionGenerateError::InvalidConfig(
+                "vocab_size must be greater than zero",
+            ));
+        }
+        if !(self.t_min.is_finite() && self.t_max.is_finite()) || self.t_min < 0.0 {
+            return Err(DiffusionGenerateError::InvalidConfig(
+                "temperature schedule must be finite and non-negative",
+            ));
+        }
+        if !self.entropy_bound.is_finite() || self.entropy_bound < 0.0 {
+            return Err(DiffusionGenerateError::InvalidConfig(
+                "entropy_bound must be finite and non-negative",
+            ));
+        }
+        if !self.confidence_threshold.is_finite() || self.confidence_threshold < 0.0 {
+            return Err(DiffusionGenerateError::InvalidConfig(
+                "confidence_threshold must be finite and non-negative",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Small host-visible sampler output for one denoise pass.
+///
+/// Backends should keep logits and probabilities on device when possible and
+/// only return these compact per-position facts to the outer loop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffusionCanvasPrediction {
+    /// Temperature-sampled candidate token for each canvas position.
+    pub sampled_tokens: Vec<u32>,
+    /// Greedy candidate token for each canvas position.
+    pub argmax_tokens: Vec<u32>,
+    /// Entropy of the model distribution for each canvas position.
+    pub entropies: Vec<f32>,
+}
+
+impl DiffusionCanvasPrediction {
+    fn validate(&self, canvas_len: usize) -> Result<(), DiffusionGenerateError> {
+        if self.sampled_tokens.len() != canvas_len {
+            return Err(DiffusionGenerateError::InvalidPrediction {
+                field: "sampled_tokens",
+                expected: canvas_len,
+                got: self.sampled_tokens.len(),
+            });
+        }
+        if self.argmax_tokens.len() != canvas_len {
+            return Err(DiffusionGenerateError::InvalidPrediction {
+                field: "argmax_tokens",
+                expected: canvas_len,
+                got: self.argmax_tokens.len(),
+            });
+        }
+        if self.entropies.len() != canvas_len {
+            return Err(DiffusionGenerateError::InvalidPrediction {
+                field: "entropies",
+                expected: canvas_len,
+                got: self.entropies.len(),
+            });
+        }
+        if self.entropies.iter().any(|x| !x.is_finite() || *x < 0.0) {
+            return Err(DiffusionGenerateError::InvalidConfig(
+                "prediction entropies must be finite and non-negative",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Backend hook consumed by [`generate_diffusion`].
+pub trait DiffusionBlockModel {
+    /// Start a request with the exact generation config selected by the engine.
+    fn begin_request(
+        &mut self,
+        _config: &DiffusionGenerationConfig,
+    ) -> Result<(), DiffusionModelError> {
+        Ok(())
+    }
+
+    /// Prefill prompt context before denoising the first canvas.
+    fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<(), DiffusionModelError>;
+
+    /// Run one bidirectional denoise pass for the current canvas.
+    fn predict_canvas(
+        &mut self,
+        canvas: &[u32],
+        valid_len: usize,
+        step: usize,
+        temperature: f32,
+    ) -> Result<DiffusionCanvasPrediction, DiffusionModelError>;
+
+    /// Commit a finalized canvas back into the model's causal context so the
+    /// next canvas can condition on it.
+    fn commit(&mut self, tokens: &[u32]) -> Result<(), DiffusionModelError>;
+}
+
+/// Stringly backend error wrapper, intentionally dependency-free.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[error("{message}")]
+pub struct DiffusionModelError {
+    pub message: String,
+}
+
+impl DiffusionModelError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Failure from the backend-neutral diffusion loop.
+#[derive(Debug, Error, PartialEq)]
+pub enum DiffusionGenerateError {
+    #[error("invalid diffusion config: {0}")]
+    InvalidConfig(&'static str),
+    #[error("invalid diffusion prediction {field}: expected {expected}, got {got}")]
+    InvalidPrediction {
+        field: &'static str,
+        expected: usize,
+        got: usize,
+    },
+    #[error("diffusion model error: {0}")]
+    Model(#[from] DiffusionModelError),
+}
+
+/// Per-step trace useful for tests and future `/v1/stats` counters.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffusionStepTrace {
+    pub block_index: usize,
+    pub step: usize,
+    pub accepted_positions: usize,
+    pub mean_entropy: f32,
+    pub confident: bool,
+    pub stable: bool,
+    pub committed: bool,
+}
+
+/// Aggregate diffusion-loop stats.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiffusionGenerateStats {
+    pub blocks: usize,
+    pub denoise_steps: usize,
+    pub forced_commits: usize,
+    pub adaptive_commits: usize,
+}
+
+/// Completed block-diffusion generation.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffusionGenerateOutput {
+    pub generated_tokens: Vec<u32>,
+    pub finish: FinishReason,
+    pub stats: DiffusionGenerateStats,
+    pub trace: Vec<DiffusionStepTrace>,
+}
+
+/// Run the backend-neutral block-diffusion loop.
+pub fn generate_diffusion<M: DiffusionBlockModel>(
+    model: &mut M,
+    prompt_tokens: &[u32],
+    config: &DiffusionGenerationConfig,
+) -> Result<DiffusionGenerateOutput, DiffusionGenerateError> {
+    config.validate()?;
+    if config.max_new_tokens == 0 {
+        return Ok(DiffusionGenerateOutput {
+            generated_tokens: Vec::new(),
+            finish: FinishReason::Length,
+            stats: DiffusionGenerateStats::default(),
+            trace: Vec::new(),
+        });
+    }
+
+    model.begin_request(config)?;
+    model.prefill(prompt_tokens)?;
+
+    let mut output = Vec::with_capacity(config.max_new_tokens);
+    let mut trace = Vec::new();
+    let mut stats = DiffusionGenerateStats::default();
+    let mut finish = FinishReason::Length;
+    let mut block_index = 0usize;
+
+    while output.len() < config.max_new_tokens {
+        let remaining = config.max_new_tokens - output.len();
+        let valid_len = remaining.min(config.canvas_length);
+        let mut canvas = initial_canvas(config, block_index, valid_len);
+        let mut history: Vec<Vec<u32>> = Vec::new();
+
+        for step in 0..config.max_denoising_steps {
+            let temperature = diffusion_temperature(config, step);
+            let prediction = model.predict_canvas(&canvas, valid_len, step, temperature)?;
+            prediction.validate(config.canvas_length)?;
+
+            let accepted_mask = entropy_bound_acceptance_mask(
+                &prediction.entropies[..valid_len],
+                config.entropy_bound,
+            );
+            let accepted_positions = accepted_mask.iter().filter(|&&accepted| accepted).count();
+            let mean_entropy = mean(&prediction.entropies[..valid_len]);
+            let confident = mean_entropy < config.confidence_threshold;
+
+            for i in 0..valid_len {
+                canvas[i] = if accepted_mask[i] {
+                    prediction.sampled_tokens[i]
+                } else {
+                    renoise_token(config, block_index, step, i)
+                };
+            }
+            for token in canvas.iter_mut().take(config.canvas_length).skip(valid_len) {
+                *token = config.pad_token_id;
+            }
+
+            history.push(prediction.argmax_tokens[..valid_len].to_vec());
+            if history.len() > config.stability_threshold.max(1) {
+                history.remove(0);
+            }
+            let stable = history_is_stable(&history, config.stability_threshold);
+            let forced = step + 1 >= config.max_denoising_steps;
+            let committed = forced || (stable && confident);
+
+            trace.push(DiffusionStepTrace {
+                block_index,
+                step,
+                accepted_positions,
+                mean_entropy,
+                confident,
+                stable,
+                committed,
+            });
+            stats.denoise_steps += 1;
+
+            if !committed {
+                continue;
+            }
+
+            if forced {
+                stats.forced_commits += 1;
+            } else {
+                stats.adaptive_commits += 1;
+            }
+
+            let mut commit_tokens = prediction.argmax_tokens[..valid_len].to_vec();
+            let stop_at = first_stop_position(&commit_tokens, &config.stop_token_ids);
+            if let Some(pos) = stop_at {
+                commit_tokens.truncate(pos + 1);
+                finish = FinishReason::Stop;
+            }
+            model.commit(&commit_tokens)?;
+            output.extend_from_slice(&commit_tokens);
+            break;
+        }
+
+        stats.blocks += 1;
+        block_index += 1;
+        if matches!(finish, FinishReason::Stop) || stats.blocks > config.max_new_tokens {
+            break;
+        }
+    }
+
+    if output.len() > config.max_new_tokens {
+        output.truncate(config.max_new_tokens);
+    }
+
+    Ok(DiffusionGenerateOutput {
+        generated_tokens: output,
+        finish,
+        stats,
+        trace,
+    })
+}
+
+/// Convert row-major logits into compact canvas predictions.
+///
+/// This host utility is intended for tests and first bring-up. Production MLX /
+/// CUDA paths should do this on device and return [`DiffusionCanvasPrediction`].
+pub fn diffusion_prediction_from_logits(
+    logits: &[f32],
+    canvas_len: usize,
+    vocab_size: usize,
+    temperature: f32,
+    seed: u64,
+    step: usize,
+) -> Result<DiffusionCanvasPrediction, DiffusionGenerateError> {
+    if canvas_len == 0 || vocab_size == 0 {
+        return Err(DiffusionGenerateError::InvalidConfig(
+            "canvas_len and vocab_size must be greater than zero",
+        ));
+    }
+    let expected = canvas_len * vocab_size;
+    if logits.len() != expected {
+        return Err(DiffusionGenerateError::InvalidPrediction {
+            field: "logits",
+            expected,
+            got: logits.len(),
+        });
+    }
+
+    let mut sampled_tokens = Vec::with_capacity(canvas_len);
+    let mut argmax_tokens = Vec::with_capacity(canvas_len);
+    let mut entropies = Vec::with_capacity(canvas_len);
+    for row in 0..canvas_len {
+        let row_logits = &logits[row * vocab_size..(row + 1) * vocab_size];
+        let (sampled, argmax, entropy) =
+            predict_row(row_logits, temperature, seed, step, row as u64);
+        sampled_tokens.push(sampled);
+        argmax_tokens.push(argmax);
+        entropies.push(entropy);
+    }
+    Ok(DiffusionCanvasPrediction {
+        sampled_tokens,
+        argmax_tokens,
+        entropies,
+    })
+}
+
+/// DiffusionGemma entropy-bound acceptance mask.
+///
+/// Mirrors the upstream rule: sort positions by entropy, accept positions whose
+/// cumulative entropy excluding the current maximum remains within the bound.
+#[must_use]
+pub fn entropy_bound_acceptance_mask(entropies: &[f32], entropy_bound: f32) -> Vec<bool> {
+    let mut sorted: Vec<(usize, f32)> = entropies.iter().copied().enumerate().collect();
+    sorted.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let mut mask = vec![false; entropies.len()];
+    let mut cumsum = 0.0f32;
+    let mut cummax = 0.0f32;
+    for (idx, entropy) in sorted {
+        cumsum += entropy;
+        cummax = cummax.max(entropy);
+        if cumsum - cummax <= entropy_bound {
+            mask[idx] = true;
+        }
+    }
+    mask
+}
+
+fn diffusion_temperature(config: &DiffusionGenerationConfig, step: usize) -> f32 {
+    let remaining = config.max_denoising_steps.saturating_sub(step).max(1) as f32;
+    config.t_min + (config.t_max - config.t_min) * (remaining / config.max_denoising_steps as f32)
+}
+
+fn initial_canvas(
+    config: &DiffusionGenerationConfig,
+    block_index: usize,
+    valid_len: usize,
+) -> Vec<u32> {
+    let mut canvas = Vec::with_capacity(config.canvas_length);
+    for i in 0..config.canvas_length {
+        if i < valid_len {
+            canvas.push(renoise_token(config, block_index, usize::MAX, i));
+        } else {
+            canvas.push(config.pad_token_id);
+        }
+    }
+    canvas
+}
+
+fn renoise_token(
+    config: &DiffusionGenerationConfig,
+    block_index: usize,
+    step: usize,
+    position: usize,
+) -> u32 {
+    let bits = splitmix64(
+        config.seed
+            ^ ((block_index as u64) << 32)
+            ^ ((step as u64).wrapping_mul(0x9E37_79B9))
+            ^ position as u64,
+    );
+    (bits % u64::from(config.vocab_size)) as u32
+}
+
+fn history_is_stable(history: &[Vec<u32>], threshold: usize) -> bool {
+    let threshold = threshold.max(1);
+    if history.len() < threshold {
+        return false;
+    }
+    let Some(first) = history.first() else {
+        return false;
+    };
+    history.iter().all(|row| row == first)
+}
+
+fn mean(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f32>() / values.len() as f32
+}
+
+fn first_stop_position(tokens: &[u32], stop_token_ids: &[u32]) -> Option<usize> {
+    tokens
+        .iter()
+        .position(|token| stop_token_ids.iter().any(|stop| stop == token))
+}
+
+fn predict_row(
+    logits: &[f32],
+    temperature: f32,
+    seed: u64,
+    step: usize,
+    row: u64,
+) -> (u32, u32, f32) {
+    let mut argmax = 0usize;
+    let mut argmax_v = f32::NEG_INFINITY;
+    for (idx, &logit) in logits.iter().enumerate() {
+        if logit > argmax_v {
+            argmax = idx;
+            argmax_v = logit;
+        }
+    }
+
+    if logits.is_empty() {
+        return (0, 0, 0.0);
+    }
+
+    let temp = temperature.max(0.0);
+    let inv_t = if temp > 0.0 { 1.0 / temp } else { 1.0 };
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    let mut probs = Vec::with_capacity(logits.len());
+    for &logit in logits {
+        let p = ((logit - max) * inv_t).exp();
+        probs.push(p);
+        sum += p;
+    }
+
+    if !sum.is_finite() || sum <= 0.0 {
+        return (argmax as u32, argmax as u32, 0.0);
+    }
+
+    let mut entropy = 0.0f32;
+    for p in &mut probs {
+        *p /= sum;
+        if *p > 0.0 {
+            entropy -= *p * p.ln();
+        }
+    }
+
+    if temp <= 0.0 {
+        return (argmax as u32, argmax as u32, entropy);
+    }
+
+    let mut sampled = 0usize;
+    let mut sampled_v = f32::NEG_INFINITY;
+    for (idx, &logit) in logits.iter().enumerate() {
+        let gumbel = sample_gumbel(seed, step, row, idx as u64);
+        let noisy = logit * inv_t + gumbel;
+        if noisy > sampled_v {
+            sampled_v = noisy;
+            sampled = idx;
+        }
+    }
+    (sampled as u32, argmax as u32, entropy)
+}
+
+fn sample_gumbel(seed: u64, step: usize, row: u64, vocab_idx: u64) -> f32 {
+    let bits = splitmix64(
+        seed ^ ((step as u64) << 40) ^ (row << 20) ^ vocab_idx.wrapping_mul(0xD1B5_4A32_D192_ED03),
+    );
+    let u = (((bits >> 40) as f32) + 1.0) / ((1u32 << 24) as f32 + 2.0);
+    -(-u.ln()).ln()
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeDiffusionModel {
+        predictions: Vec<DiffusionCanvasPrediction>,
+        calls: usize,
+        begin_configs: Vec<DiffusionGenerationConfig>,
+        prefills: Vec<Vec<u32>>,
+        commits: Vec<Vec<u32>>,
+    }
+
+    impl DiffusionBlockModel for FakeDiffusionModel {
+        fn begin_request(
+            &mut self,
+            config: &DiffusionGenerationConfig,
+        ) -> Result<(), DiffusionModelError> {
+            self.begin_configs.push(config.clone());
+            Ok(())
+        }
+
+        fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<(), DiffusionModelError> {
+            self.prefills.push(prompt_tokens.to_vec());
+            Ok(())
+        }
+
+        fn predict_canvas(
+            &mut self,
+            _canvas: &[u32],
+            _valid_len: usize,
+            _step: usize,
+            _temperature: f32,
+        ) -> Result<DiffusionCanvasPrediction, DiffusionModelError> {
+            let idx = self.calls.min(self.predictions.len().saturating_sub(1));
+            self.calls += 1;
+            self.predictions
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| DiffusionModelError::new("no prediction"))
+        }
+
+        fn commit(&mut self, tokens: &[u32]) -> Result<(), DiffusionModelError> {
+            self.commits.push(tokens.to_vec());
+            Ok(())
+        }
+    }
+
+    fn prediction(
+        tokens: &[u32],
+        entropies: &[f32],
+        canvas_len: usize,
+    ) -> DiffusionCanvasPrediction {
+        let mut sampled_tokens = vec![0; canvas_len];
+        let mut argmax_tokens = vec![0; canvas_len];
+        let mut entropy = vec![0.0; canvas_len];
+        for (idx, &token) in tokens.iter().enumerate() {
+            sampled_tokens[idx] = token;
+            argmax_tokens[idx] = token;
+        }
+        for (idx, &value) in entropies.iter().enumerate() {
+            entropy[idx] = value;
+        }
+        DiffusionCanvasPrediction {
+            sampled_tokens,
+            argmax_tokens,
+            entropies: entropy,
+        }
+    }
+
+    fn test_config(max_new_tokens: usize) -> DiffusionGenerationConfig {
+        DiffusionGenerationConfig {
+            canvas_length: 4,
+            max_denoising_steps: 4,
+            max_new_tokens,
+            vocab_size: 100,
+            stop_token_ids: vec![99],
+            pad_token_id: 0,
+            entropy_bound: 0.1,
+            confidence_threshold: 0.02,
+            t_min: 0.4,
+            t_max: 0.8,
+            stability_threshold: 2,
+            seed: 7,
+        }
+    }
+
+    #[test]
+    fn entropy_bound_acceptance_matches_upstream_rule() {
+        let mask = entropy_bound_acceptance_mask(&[0.2, 0.2, 0.2, 0.01], 0.1);
+        assert_eq!(mask, vec![true, false, false, true]);
+
+        let all = entropy_bound_acceptance_mask(&[0.01, 0.02, 0.03], 0.1);
+        assert_eq!(all, vec![true, true, true]);
+    }
+
+    #[test]
+    fn generate_commits_after_stability_and_confidence() {
+        let mut model = FakeDiffusionModel {
+            predictions: vec![
+                prediction(&[10, 11, 12, 13], &[0.01, 0.01, 0.01, 0.01], 4),
+                prediction(&[10, 11, 12, 13], &[0.01, 0.01, 0.01, 0.01], 4),
+            ],
+            ..FakeDiffusionModel::default()
+        };
+        let out = generate_diffusion(&mut model, &[1, 2, 3], &test_config(3)).unwrap();
+        assert_eq!(out.generated_tokens, vec![10, 11, 12]);
+        assert_eq!(out.finish, FinishReason::Length);
+        assert_eq!(out.stats.blocks, 1);
+        assert_eq!(out.stats.denoise_steps, 2);
+        assert_eq!(out.stats.adaptive_commits, 1);
+        assert_eq!(model.begin_configs, vec![test_config(3)]);
+        assert_eq!(model.prefills, vec![vec![1, 2, 3]]);
+        assert_eq!(model.commits, vec![vec![10, 11, 12]]);
+    }
+
+    #[test]
+    fn generate_forces_commit_at_max_steps() {
+        let mut cfg = test_config(2);
+        cfg.max_denoising_steps = 2;
+        cfg.confidence_threshold = 0.0;
+        let mut model = FakeDiffusionModel {
+            predictions: vec![
+                prediction(&[20, 21, 0, 0], &[1.0, 1.0, 0.0, 0.0], 4),
+                prediction(&[22, 23, 0, 0], &[1.0, 1.0, 0.0, 0.0], 4),
+            ],
+            ..FakeDiffusionModel::default()
+        };
+        let out = generate_diffusion(&mut model, &[], &cfg).unwrap();
+        assert_eq!(out.generated_tokens, vec![22, 23]);
+        assert_eq!(out.stats.forced_commits, 1);
+        assert_eq!(out.trace.last().map(|t| t.committed), Some(true));
+    }
+
+    #[test]
+    fn generate_stops_at_first_committed_stop_token() {
+        let mut model = FakeDiffusionModel {
+            predictions: vec![
+                prediction(&[10, 99, 12, 13], &[0.01, 0.01, 0.01, 0.01], 4),
+                prediction(&[10, 99, 12, 13], &[0.01, 0.01, 0.01, 0.01], 4),
+            ],
+            ..FakeDiffusionModel::default()
+        };
+        let out = generate_diffusion(&mut model, &[], &test_config(4)).unwrap();
+        assert_eq!(out.generated_tokens, vec![10, 99]);
+        assert_eq!(out.finish, FinishReason::Stop);
+        assert_eq!(model.commits, vec![vec![10, 99]]);
+    }
+
+    #[test]
+    fn logits_prediction_returns_argmax_entropy_and_seeded_sample() {
+        let logits = vec![
+            0.0, 3.0, 1.0, //
+            2.0, 0.0, 1.0,
+        ];
+        let greedy = diffusion_prediction_from_logits(&logits, 2, 3, 0.0, 5, 0).unwrap();
+        assert_eq!(greedy.argmax_tokens, vec![1, 0]);
+        assert_eq!(greedy.sampled_tokens, greedy.argmax_tokens);
+        assert!(greedy.entropies.iter().all(|h| *h >= 0.0 && h.is_finite()));
+
+        let sampled_a = diffusion_prediction_from_logits(&logits, 2, 3, 0.7, 5, 1).unwrap();
+        let sampled_b = diffusion_prediction_from_logits(&logits, 2, 3, 0.7, 5, 1).unwrap();
+        assert_eq!(sampled_a.sampled_tokens, sampled_b.sampled_tokens);
+    }
+}

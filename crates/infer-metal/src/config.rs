@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use infer_plan::DiffusionGenerationConfig;
 
 /// MLX affine quantization settings.
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +101,38 @@ pub(crate) struct MetalModelConfig {
     pub(crate) arch: MetalQwen35ArchConfig,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MetalDiffusionGemmaConfig {
+    pub(crate) config: gemma_spec::DiffusionGemmaConfig,
+    pub(crate) generation: DiffusionGenerationConfig,
+}
+
+pub(crate) fn load_diffusion_gemma_config(model_dir: &Path) -> Result<MetalDiffusionGemmaConfig> {
+    let path = model_dir.join("config.json");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).context("config.json parse")?;
+    diffusion_gemma_config_from_value(&value)
+}
+
+pub fn model_dir_is_diffusion_gemma(model_dir: &Path) -> bool {
+    let path = model_dir.join("config.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(root) = value.as_object() else {
+        return false;
+    };
+    let text_config = root
+        .get("text_config")
+        .and_then(serde_json::Value::as_object);
+    let model = text_config.unwrap_or(root);
+    is_diffusion_gemma_config(root, model)
+}
+
 /// Load a safetensors Qwen3.5/Qwen3.6 config for the clean Metal executor.
 pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
     let path = model_dir.join("config.json");
@@ -113,6 +146,25 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         .get("text_config")
         .and_then(serde_json::Value::as_object);
     let model = text_config.unwrap_or(root);
+    if is_diffusion_gemma_config(root, model) {
+        let diffusion = diffusion_gemma_config_from_value(&value)?;
+        anyhow::bail!(
+            "DiffusionGemma cannot be loaded by the autoregressive Qwen Metal executor: \
+             parsed text hidden_size={} layers={} canvas={} vocab={}; use the \
+             infer-api MetalDiffusionGemma route, which owns the block-diffusion \
+             generate loop and dedicated MLX Gemma4/DiffusionGemma bridge",
+            diffusion.config.text_config.hidden_size,
+            diffusion.config.text_config.num_hidden_layers,
+            diffusion.generation.canvas_length,
+            diffusion.generation.vocab_size,
+        );
+    }
+    if is_gemma4_config(root, model) {
+        anyhow::bail!(
+            "Gemma4 Metal loading is not wired yet: infer-metal still lacks the MLX \
+             Gemma4 forward path and weight mapping"
+        );
+    }
 
     let get_usize =
         |obj: &serde_json::Map<String, serde_json::Value>, key: &str, default: usize| -> usize {
@@ -323,6 +375,93 @@ fn extend_unique(target: &mut Vec<u32>, src: Vec<u32>) {
     }
 }
 
+pub(crate) fn diffusion_gemma_config_from_value(
+    value: &serde_json::Value,
+) -> Result<MetalDiffusionGemmaConfig> {
+    let config = gemma_spec::DiffusionGemmaConfig::from_json_value(value)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    let generation = diffusion_generation_from_config(&config)?;
+    Ok(MetalDiffusionGemmaConfig { config, generation })
+}
+
+fn diffusion_generation_from_config(
+    config: &gemma_spec::DiffusionGemmaConfig,
+) -> Result<DiffusionGenerationConfig> {
+    let text = &config.text_config;
+    let vocab_size =
+        u32::try_from(text.vocab_size).context("DiffusionGemma vocab_size does not fit in u32")?;
+    let generation_config = &config.generation_config;
+    let max_new_tokens = generation_config
+        .max_new_tokens
+        .unwrap_or(config.canvas_length);
+    let mut generation = DiffusionGenerationConfig::diffusion_gemma(max_new_tokens, vocab_size);
+    generation.canvas_length = config.canvas_length;
+    generation.max_denoising_steps = generation_config
+        .max_denoising_steps
+        .unwrap_or(generation.max_denoising_steps);
+    generation.pad_token_id = generation_config
+        .pad_token_id
+        .unwrap_or(generation.pad_token_id);
+    generation.confidence_threshold = generation_config
+        .confidence_threshold
+        .unwrap_or(generation.confidence_threshold);
+    generation.entropy_bound = generation_config
+        .sampler_config
+        .as_ref()
+        .and_then(|sampler| sampler.entropy_bound)
+        .unwrap_or(generation.entropy_bound);
+    generation.stability_threshold = generation_config
+        .stability_threshold
+        .unwrap_or(generation.stability_threshold);
+    generation.t_min = generation_config.t_min.unwrap_or(generation.t_min);
+    generation.t_max = generation_config.t_max.unwrap_or(generation.t_max);
+    generation.stop_token_ids = generation_config
+        .eos_token_id
+        .as_ref()
+        .or(config.eos_token_id.as_ref())
+        .map(parse_eos_field)
+        .filter(|ids| !ids.is_empty())
+        .unwrap_or_else(|| vec![1, 106, 50]);
+    Ok(generation)
+}
+
+fn is_diffusion_gemma_config(
+    root: &serde_json::Map<String, serde_json::Value>,
+    model: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    model_type_is(root, "diffusion_gemma")
+        || model_type_is(model, "diffusion_gemma")
+        || architectures_contain(root, "DiffusionGemma")
+        || architectures_contain(model, "DiffusionGemma")
+}
+
+fn is_gemma4_config(
+    root: &serde_json::Map<String, serde_json::Value>,
+    model: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    model_type_is(root, "gemma4")
+        || model_type_is(model, "gemma4")
+        || architectures_contain(root, "Gemma4")
+        || architectures_contain(model, "Gemma4")
+}
+
+fn model_type_is(obj: &serde_json::Map<String, serde_json::Value>, expected: &str) -> bool {
+    obj.get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|model_type| model_type == expected)
+}
+
+fn architectures_contain(obj: &serde_json::Map<String, serde_json::Value>, needle: &str) -> bool {
+    obj.get("architectures")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|archs| {
+            archs
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|arch| arch.contains(needle))
+        })
+}
+
 /// Parse a JSON array field into `Vec<usize>`, dropping non-integer elements.
 /// Returns `None` when the key is absent or not an array.
 fn parse_usize_array(
@@ -336,4 +475,149 @@ fn parse_usize_array(
                 .filter_map(|v| v.as_u64().map(|n| n as usize))
                 .collect::<Vec<_>>()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use serde_json::json;
+
+    use super::{diffusion_gemma_config_from_value, is_diffusion_gemma_config, is_gemma4_config};
+
+    fn diffusion_gemma_value() -> serde_json::Value {
+        json!({
+            "architectures": ["DiffusionGemmaForBlockDiffusion"],
+            "model_type": "diffusion_gemma",
+            "canvas_length": 256,
+            "eos_token_id": [1, 106, 50],
+            "generation_config": {
+                "confidence_threshold": 0.005,
+                "eos_token_id": [1, 106, 50],
+                "max_denoising_steps": 48,
+                "max_new_tokens": 256,
+                "pad_token_id": 0,
+                "sampler_config": {
+                    "_cls_name": "EntropyBoundSamplerConfig",
+                    "entropy_bound": 0.1
+                },
+                "stability_threshold": 1,
+                "t_max": 0.8,
+                "t_min": 0.4
+            },
+            "text_config": {
+                "vocab_size": 262144,
+                "hidden_size": 2816,
+                "intermediate_size": 2112,
+                "num_hidden_layers": 6,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "head_dim": 256,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "max_position_embeddings": 262144,
+                "initializer_range": 0.02,
+                "rms_norm_eps": 1e-6,
+                "sliding_window": 1024,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention"
+                ],
+                "rope_parameters": {
+                    "full_attention": {
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0,
+                        "rope_type": "proportional"
+                    },
+                    "sliding_attention": {
+                        "rope_theta": 10000.0,
+                        "rope_type": "default"
+                    }
+                },
+                "global_head_dim": 512,
+                "moe_intermediate_size": 704,
+                "num_experts": 128,
+                "num_global_key_value_heads": 2,
+                "top_k_experts": 8
+            }
+        })
+    }
+
+    fn temp_model_dir_with_config(value: &serde_json::Value) -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "infer-metal-diffusion-gemma-config-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp model dir");
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(value).expect("serialize config"),
+        )
+        .expect("write config");
+        dir
+    }
+
+    #[test]
+    fn diffusion_gemma_or_gemma4_configs_fail_loud() {
+        let value = json!({
+            "architectures": ["DiffusionGemmaForDiffusionLM"],
+            "model_type": "diffusion_gemma",
+            "text_config": {
+                "model_type": "gemma4"
+            }
+        });
+        let root = value.as_object().unwrap();
+        let model = root
+            .get("text_config")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+
+        assert!(is_diffusion_gemma_config(root, model));
+        assert!(is_gemma4_config(root, model));
+    }
+
+    #[test]
+    fn qwen35_config_is_not_diffusion_gemma_or_gemma4() {
+        let value = json!({
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "model_type": "qwen3",
+            "layer_types": ["full_attention"]
+        });
+        let root = value.as_object().unwrap();
+
+        assert!(!is_diffusion_gemma_config(root, root));
+        assert!(!is_gemma4_config(root, root));
+    }
+
+    #[test]
+    fn diffusion_gemma_config_lowers_generation_defaults() {
+        let value = diffusion_gemma_value();
+
+        let parsed = diffusion_gemma_config_from_value(&value).unwrap();
+        assert_eq!(parsed.generation.canvas_length, 256);
+        assert_eq!(parsed.generation.max_denoising_steps, 48);
+        assert_eq!(parsed.generation.max_new_tokens, 256);
+        assert_eq!(parsed.generation.vocab_size, 262_144);
+        assert_eq!(parsed.generation.stop_token_ids, vec![1, 106, 50]);
+        assert!(parsed.config.text_config.uses_moe_block());
+    }
+
+    #[test]
+    fn load_metal_config_fails_closed_for_diffusion_gemma() {
+        let value = diffusion_gemma_value();
+        let dir = temp_model_dir_with_config(&value);
+        let err = super::load_metal_config(&dir).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("DiffusionGemma cannot be loaded by the autoregressive"));
+        assert!(message.contains("hidden_size=2816"));
+        assert!(message.contains("canvas=256"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

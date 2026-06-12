@@ -14,6 +14,8 @@ mod kv_pool;
 #[cfg(feature = "metal")]
 mod config;
 #[cfg(feature = "metal")]
+mod diffusion_gemma;
+#[cfg(feature = "metal")]
 mod loader;
 #[cfg(feature = "metal")]
 mod mlx;
@@ -28,6 +30,10 @@ mod weights;
 #[cfg(feature = "metal")]
 mod wired_limit;
 
+#[cfg(feature = "metal")]
+pub use config::model_dir_is_diffusion_gemma;
+#[cfg(feature = "metal")]
+pub use diffusion_gemma::{LoadedMetalDiffusionGemma, MetalDiffusionGemmaModel};
 pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
 #[cfg(feature = "metal")]
 pub use executor::{

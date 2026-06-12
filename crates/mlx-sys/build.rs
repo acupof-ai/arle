@@ -136,6 +136,7 @@ fn main() {
         .std("c++17")
         .file("src/mlx_bridge.cpp")
         .file("src/mlx_dflash_draft_model.cpp")
+        .file("src/mlx_gemma4_diffusion_model.cpp")
         .file("src/mlx_qwen35_model.cpp")
         .file("src/mlx_qwen35_moe_block.cpp")
         .include("src")
@@ -190,6 +191,7 @@ fn main() {
     // Rerun if bridge files change.
     println!("cargo:rerun-if-changed=src/mlx_bridge.cpp");
     println!("cargo:rerun-if-changed=src/mlx_dflash_draft_model.cpp");
+    println!("cargo:rerun-if-changed=src/mlx_gemma4_diffusion_model.cpp");
     println!("cargo:rerun-if-changed=src/mlx_qwen35_model.cpp");
     println!("cargo:rerun-if-changed=src/mlx_qwen35_moe_block.cpp");
     println!("cargo:rerun-if-changed=src/mlx_metal_capture.mm");

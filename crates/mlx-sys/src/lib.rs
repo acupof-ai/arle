@@ -391,6 +391,98 @@ unsafe extern "C" {
         out_kv_caches: *mut *mut mlx_array,
     ) -> i32;
 
+    // === DiffusionGemma / Gemma4 block-diffusion model ===
+
+    pub fn diffusion_gemma_new() -> *mut std::ffi::c_void;
+    pub fn diffusion_gemma_free(model: *mut std::ffi::c_void);
+    pub fn diffusion_gemma_add_dense_weight(model: *mut std::ffi::c_void, w: *mut mlx_array)
+    -> i32;
+    pub fn diffusion_gemma_add_affine_weight(
+        model: *mut std::ffi::c_void,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+    ) -> i32;
+    pub fn diffusion_gemma_set_config(
+        model: *mut std::ffi::c_void,
+        hidden_size: i32,
+        vocab_size: i32,
+        rms_eps: f32,
+        final_logit_softcap: f32,
+    );
+    pub fn diffusion_gemma_set_embed(
+        model: *mut std::ffi::c_void,
+        embed_id: i32,
+        final_norm_id: i32,
+    );
+    #[allow(clippy::too_many_arguments)]
+    pub fn diffusion_gemma_push_layer(
+        model: *mut std::ffi::c_void,
+        is_full_attention: bool,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        rope_theta: f32,
+        sliding_window: i32,
+        input_ln_id: i32,
+        q_id: i32,
+        k_id: i32,
+        v_id: i32,
+        o_id: i32,
+        q_norm_id: i32,
+        k_norm_id: i32,
+        post_attn_ln_id: i32,
+        pre_ff_ln_id: i32,
+        gate_id: i32,
+        up_id: i32,
+        down_id: i32,
+        post_ff_ln_id: i32,
+        pre_ff2_ln_id: i32,
+        post_ff1_ln_id: i32,
+        post_ff2_ln_id: i32,
+        router_id: i32,
+        router_scale_id: i32,
+        per_expert_scale_id: i32,
+        expert_gate_up_id: i32,
+        expert_down_id: i32,
+        layer_scalar_id: i32,
+        num_experts: i32,
+        top_k: i32,
+    ) -> i32;
+    pub fn diffusion_gemma_set_self_conditioning(
+        model: *mut std::ffi::c_void,
+        pre_norm_id: i32,
+        gate_id: i32,
+        up_id: i32,
+        down_id: i32,
+    ) -> i32;
+    pub fn diffusion_gemma_finalize(model: *mut std::ffi::c_void) -> i32;
+    pub fn diffusion_gemma_begin_request(model: *mut std::ffi::c_void, seed: u64) -> i32;
+    pub fn diffusion_gemma_prefill(
+        model: *mut std::ffi::c_void,
+        tokens: *const i32,
+        len: i32,
+    ) -> i32;
+    pub fn diffusion_gemma_commit(
+        model: *mut std::ffi::c_void,
+        tokens: *const i32,
+        len: i32,
+    ) -> i32;
+    pub fn diffusion_gemma_predict_canvas(
+        model: *mut std::ffi::c_void,
+        canvas: *const i32,
+        canvas_len: i32,
+        valid_len: i32,
+        step: i32,
+        temperature: f32,
+        out_sampled: *mut u32,
+        out_argmax: *mut u32,
+        out_entropy: *mut f32,
+    ) -> i32;
+
     // === Compiled Qwen3.5 model ===
 
     pub fn qwen35_compiled_new() -> *mut std::ffi::c_void;

@@ -1555,6 +1555,7 @@ name = "infer-metal"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "gemma-spec",
  "hf-hub",
  "infer-plan",
  "infer-seam",

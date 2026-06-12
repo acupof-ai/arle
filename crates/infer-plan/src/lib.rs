@@ -4,8 +4,15 @@
 //! implementations. It intentionally carries no device tensor, stream, graph,
 //! or backend runtime types.
 
+mod diffusion;
 mod sample;
 
+pub use diffusion::{
+    DiffusionBlockModel, DiffusionCanvasPrediction, DiffusionGenerateError,
+    DiffusionGenerateOutput, DiffusionGenerateStats, DiffusionGenerationConfig,
+    DiffusionModelError, DiffusionStepTrace, diffusion_prediction_from_logits,
+    entropy_bound_acceptance_mask, generate_diffusion,
+};
 pub use sample::{argmax_logit, sample_token};
 
 /// Forward execution mode requested by the engine core.
@@ -106,7 +113,7 @@ impl ForwardPlan {
 
 /// Reason a slot stopped producing tokens.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
     /// A configured stop token or stop condition fired.
     Stop,
