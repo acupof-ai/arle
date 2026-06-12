@@ -85,10 +85,18 @@ pub fn default_t2_budget_bytes(root: &Path) -> usize {
 
 pub(crate) struct CudaKvTierStore {
     t1_capacity_pages: usize,
-    /// T1 entries: key -> (touch stamp, page payload).
-    t1: BTreeMap<u64, (u64, Vec<u8>)>,
+    /// T1 entries: key -> touch stamp + page payload.
+    t1: BTreeMap<u64, T1Entry>,
+    /// Ordered by (touch stamp, key) for O(log n) coldest selection.
+    t1_lru: BTreeSet<(u64, u64)>,
     clock: u64,
     disk: Option<DiskTier>,
+    read_scratch: Vec<u8>,
+}
+
+struct T1Entry {
+    stamp: u64,
+    payload: Vec<u8>,
 }
 
 struct DiskTier {
@@ -110,8 +118,10 @@ impl CudaKvTierStore {
         Self {
             t1_capacity_pages,
             t1: BTreeMap::new(),
+            t1_lru: BTreeSet::new(),
             clock: 0,
             disk: None,
+            read_scratch: Vec::new(),
         }
     }
 
@@ -148,29 +158,43 @@ impl CudaKvTierStore {
     /// disk write failed.
     pub(crate) fn insert(&mut self, key: u64, payload: Vec<u8>) -> bool {
         if self.t1.len() < self.t1_capacity_pages {
-            self.clock += 1;
-            self.t1.insert(key, (self.clock, payload));
+            self.insert_t1(key, payload);
             return true;
         }
         if self.t1_capacity_pages > 0 && self.spill_coldest_to_disk() {
-            self.clock += 1;
-            self.t1.insert(key, (self.clock, payload));
+            self.insert_t1(key, payload);
             return true;
         }
         // Disk-only configuration (or the spill failed): write directly.
         self.write_to_disk(key, &payload)
     }
 
+    fn next_stamp(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1);
+        self.clock
+    }
+
+    fn insert_t1(&mut self, key: u64, payload: Vec<u8>) {
+        let stamp = self.next_stamp();
+        if let Some(old) = self.t1.insert(key, T1Entry { stamp, payload }) {
+            self.t1_lru.remove(&(old.stamp, key));
+        }
+        self.t1_lru.insert((stamp, key));
+    }
+
     fn write_to_disk(&mut self, key: u64, payload: &[u8]) -> bool {
         let Some(disk) = &mut self.disk else {
             return false;
         };
-        if disk.keys.len() >= disk.capacity_pages {
+        let already_present = disk.keys.contains(&key);
+        if !already_present && disk.keys.len() >= disk.capacity_pages {
             return false;
         }
-        match kv_native_sys::write_block_atomic(&disk.root, fingerprint(key), payload) {
+        match kv_native_sys::write_block_cache(&disk.root, fingerprint(key), payload) {
             Ok(()) => {
-                disk.keys.insert(key);
+                if !already_present {
+                    disk.keys.insert(key);
+                }
                 true
             }
             Err(err) => {
@@ -184,15 +208,20 @@ impl CudaKvTierStore {
     }
 
     fn spill_coldest_to_disk(&mut self) -> bool {
-        let Some((&key, _)) = self.t1.iter().min_by_key(|(_, (stamp, _))| *stamp) else {
+        let Some((stamp, key)) = self.t1_lru.iter().next().copied() else {
             return false;
         };
-        let (stamp, payload) = self.t1.remove(&key).expect("key just observed");
-        if self.write_to_disk(key, &payload) {
+        self.t1_lru.remove(&(stamp, key));
+        let Some(entry) = self.t1.remove(&key) else {
+            return false;
+        };
+        debug_assert_eq!(entry.stamp, stamp);
+        if self.write_to_disk(key, &entry.payload) {
             true
         } else {
             // Keep the entry in RAM rather than lose it; report no room.
-            self.t1.insert(key, (stamp, payload));
+            self.t1.insert(key, entry);
+            self.t1_lru.insert((stamp, key));
             false
         }
     }
@@ -200,18 +229,25 @@ impl CudaKvTierStore {
     /// Fetch a payload for promotion (T1 hit bumps recency; T2 reads from
     /// disk without re-warming — the engine drops promoted keys right after).
     pub(crate) fn read(&mut self, key: u64) -> Result<Cow<'_, [u8]>> {
-        if self.t1.contains_key(&key) {
-            self.clock += 1;
-            let entry = self.t1.get_mut(&key).expect("contains_key above");
-            entry.0 = self.clock;
-            return Ok(Cow::Borrowed(entry.1.as_slice()));
+        if let Some(old_stamp) = self.t1.get(&key).map(|entry| entry.stamp) {
+            let stamp = self.next_stamp();
+            self.t1_lru.remove(&(old_stamp, key));
+            self.t1_lru.insert((stamp, key));
+            let entry = self.t1.get_mut(&key).expect("key observed above");
+            entry.stamp = stamp;
+            return Ok(Cow::Borrowed(entry.payload.as_slice()));
         }
-        if let Some(disk) = &self.disk {
+        let disk_root = self.disk.as_ref().and_then(|disk| {
             if disk.keys.contains(&key) {
-                let payload = kv_native_sys::read_block(&disk.root, fingerprint(key))
-                    .with_context(|| format!("KV T2 read for key {key}"))?;
-                return Ok(Cow::Owned(payload));
+                Some(disk.root.clone())
+            } else {
+                None
             }
+        });
+        if let Some(root) = disk_root {
+            kv_native_sys::read_block_into(&root, fingerprint(key), &mut self.read_scratch)
+                .with_context(|| format!("KV T2 read for key {key}"))?;
+            return Ok(Cow::Borrowed(self.read_scratch.as_slice()));
         }
         Err(anyhow!("KV tier store has no entry for key {key}"))
     }
@@ -219,7 +255,9 @@ impl CudaKvTierStore {
     /// Drop entries from both levels (disk files unlinked best-effort).
     pub(crate) fn remove(&mut self, keys: &[u64]) {
         for key in keys {
-            self.t1.remove(key);
+            if let Some(entry) = self.t1.remove(key) {
+                self.t1_lru.remove(&(entry.stamp, *key));
+            }
             if let Some(disk) = &mut self.disk {
                 if disk.keys.remove(key) {
                     if let Ok(path) = kv_native_sys::block_path(&disk.root, fingerprint(*key)) {
@@ -239,11 +277,22 @@ impl CudaKvTierStore {
     fn disk_len(&self) -> usize {
         self.disk.as_ref().map_or(0, |d| d.keys.len())
     }
+
+    #[cfg(test)]
+    fn coldest_t1_key(&self) -> Option<u64> {
+        self.t1_lru.iter().next().map(|(_, key)| *key)
+    }
+
+    #[cfg(test)]
+    fn read_scratch_capacity(&self) -> usize {
+        self.read_scratch.capacity()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
 
     fn temp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -279,8 +328,10 @@ mod tests {
 
         assert!(store.insert(1, vec![1; 8]));
         assert!(store.insert(2, vec![2; 8]));
+        assert_eq!(store.coldest_t1_key(), Some(1));
         // Touch key 1 so key 2 is the coldest when 3 arrives.
         store.read(1).expect("touch");
+        assert_eq!(store.coldest_t1_key(), Some(2));
         assert!(store.insert(3, vec![3; 8]));
         assert_eq!(store.t1_len(), 2);
         assert_eq!(store.disk_len(), 1, "coldest entry spilled");
@@ -292,6 +343,57 @@ mod tests {
         store.remove(&[2]);
         assert_eq!(store.disk_len(), 0);
         assert!(store.read(2).is_err());
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn disk_read_reuses_store_scratch_buffer() {
+        let root = temp_root("scratch");
+        let mut store = CudaKvTierStore::with_budget(0, 8);
+        store.set_disk(root.clone(), 32, 8);
+        assert!(store.insert(1, vec![1; 8]));
+
+        {
+            let first = store.read(1).expect("first disk read");
+            assert!(
+                matches!(&first, Cow::Borrowed(_)),
+                "disk read borrows scratch"
+            );
+            assert_eq!(first.as_ref(), &[1u8; 8]);
+        }
+        let cap = store.read_scratch_capacity();
+
+        {
+            let second = store.read(1).expect("second disk read");
+            assert_eq!(second.as_ref(), &[1u8; 8]);
+        }
+        assert_eq!(
+            store.read_scratch_capacity(),
+            cap,
+            "second disk read reused scratch allocation"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn disk_full_allows_replacing_existing_key() {
+        let root = temp_root("replace");
+        let mut store = CudaKvTierStore::with_budget(0, 8);
+        store.set_disk(root.clone(), 8, 8);
+
+        assert!(store.insert(1, vec![1; 8]));
+        assert!(store.is_full());
+        assert!(
+            store.insert(1, vec![9; 8]),
+            "replace does not consume capacity"
+        );
+        assert_eq!(store.disk_len(), 1);
+        assert_eq!(
+            store.read(1).expect("replaced disk read").as_ref(),
+            &[9u8; 8]
+        );
 
         std::fs::remove_dir_all(&root).expect("cleanup");
     }

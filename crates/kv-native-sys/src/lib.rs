@@ -6,6 +6,7 @@
 
 use std::fs::OpenOptions;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
@@ -77,6 +78,17 @@ pub fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_file_atomic_impl(path, bytes, true)
+}
+
+/// Atomic replacement for cache payloads that are safe to rebuild after a
+/// crash. Keeps the temp-write + rename property, but skips data and directory
+/// fsyncs to avoid turning cache spill into a durability workload.
+pub fn write_file_atomic_cache(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_file_atomic_impl(path, bytes, false)
+}
+
+fn write_file_atomic_impl(path: &Path, bytes: &[u8], durable: bool) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -99,17 +111,21 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
                 .mode(0o644)
                 .open(&tmp_path)?;
             tmp.write_all(bytes)?;
-            tmp.sync_data()?;
+            if durable {
+                tmp.sync_data()?;
+            }
         }
         std::fs::rename(&tmp_path, path)?;
-        // fsync the parent directory so the rename is durable on power loss.
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-        let parent = parent.unwrap_or_else(|| Path::new("."));
-        let dir = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY)
-            .open(parent)?;
-        dir.sync_all()?;
+        if durable {
+            // fsync the parent directory so the rename is durable on power loss.
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+            let parent = parent.unwrap_or_else(|| Path::new("."));
+            let dir = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                .open(parent)?;
+            dir.sync_all()?;
+        }
         Ok(())
     })();
 
@@ -130,6 +146,27 @@ pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
     // 0-byte file returns Ok(empty); missing file surfaces as NotFound.
     // `std::fs::read` already handles both correctly.
     std::fs::read(path)
+}
+
+pub fn read_file_into(path: &Path, dst: &mut Vec<u8>) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "read_file_into: empty path",
+        ));
+    }
+    dst.clear();
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    if let Ok(metadata) = file.metadata() {
+        if let Ok(len) = usize::try_from(metadata.len()) {
+            dst.reserve(len);
+        }
+    }
+    if let Err(err) = file.read_to_end(dst) {
+        dst.clear();
+        return Err(err);
+    }
+    Ok(())
 }
 
 pub fn remove_file(path: &Path, ignore_not_found: bool) -> io::Result<()> {
@@ -162,9 +199,19 @@ pub fn write_block_atomic(root: &Path, fingerprint: [u8; 16], bytes: &[u8]) -> i
     write_file_atomic(&path, bytes)
 }
 
+pub fn write_block_cache(root: &Path, fingerprint: [u8; 16], bytes: &[u8]) -> io::Result<()> {
+    let path = block_path(root, fingerprint)?;
+    write_file_atomic_cache(&path, bytes)
+}
+
 pub fn read_block(root: &Path, fingerprint: [u8; 16]) -> io::Result<Vec<u8>> {
     let path = block_path(root, fingerprint)?;
     read_file(&path)
+}
+
+pub fn read_block_into(root: &Path, fingerprint: [u8; 16], dst: &mut Vec<u8>) -> io::Result<()> {
+    let path = block_path(root, fingerprint)?;
+    read_file_into(&path, dst)
 }
 
 /// Like [`read_block`] but returns an owning guard over the heap-allocated
@@ -1172,6 +1219,34 @@ mod tests {
         assert_eq!(owned.as_slice(), &[] as &[u8]);
         let slice: &[u8] = &owned;
         assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn cache_block_write_roundtrips_without_durable_api() {
+        let dir = tempdir().unwrap();
+        let fp = [0x41u8; 16];
+        write_block_cache(dir.path(), fp, b"first").unwrap();
+        assert_eq!(read_block(dir.path(), fp).unwrap(), b"first");
+
+        write_block_cache(dir.path(), fp, b"second-payload").unwrap();
+        assert_eq!(read_block(dir.path(), fp).unwrap(), b"second-payload");
+    }
+
+    #[test]
+    fn read_block_into_reuses_caller_buffer() {
+        let dir = tempdir().unwrap();
+        let fp = [0x42u8; 16];
+        let payload = vec![7u8; 4096];
+        write_block_cache(dir.path(), fp, &payload).unwrap();
+
+        let mut scratch = Vec::with_capacity(payload.len());
+        read_block_into(dir.path(), fp, &mut scratch).unwrap();
+        assert_eq!(scratch, payload);
+        let cap = scratch.capacity();
+
+        read_block_into(dir.path(), fp, &mut scratch).unwrap();
+        assert_eq!(scratch, payload);
+        assert_eq!(scratch.capacity(), cap, "second read reused allocation");
     }
 
     #[test]
