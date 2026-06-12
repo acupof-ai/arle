@@ -81,6 +81,56 @@ impl ServeKvSsdOptions {
     pub fn requested(&self) -> bool {
         self.root.is_some() || self.max_bytes.is_some() || self.high_performance_non_preemptive
     }
+
+    #[must_use]
+    pub fn default_root() -> PathBuf {
+        if let Some(path) = std::env::var_os("ARLE_KV_SSD_PATH")
+            && !path.is_empty()
+        {
+            return PathBuf::from(path);
+        }
+        default_cache_root().join("arle").join("kv-ssd")
+    }
+
+    pub fn fill_default_root(&mut self) {
+        if self.requested() && self.root.is_none() {
+            self.root = Some(Self::default_root());
+            self.high_performance_non_preemptive = true;
+        }
+    }
+}
+
+fn default_cache_root() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(path) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(path);
+        }
+        if let Some(path) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(path).join("AppData").join("Local");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join("Library").join("Caches");
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(path) = std::env::var_os("XDG_CACHE_HOME")
+            && !path.is_empty()
+        {
+            return PathBuf::from(path);
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".cache");
+        }
+    }
+
+    std::env::temp_dir()
 }
 
 /// Speculative decode mode requested at the serve boundary.
@@ -135,7 +185,8 @@ impl ServeSpecOptions {
     feature = "vulkan",
     feature = "cpu"
 ))]
-pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
+pub fn serve_http(mut opts: ServeHttpOptions) -> Result<()> {
+    opts.kv_ssd.fill_default_root();
     validate_kv_ssd_options(&opts.kv_ssd)?;
 
     // Lower the requested spec surface into the engine config. The blanket
@@ -195,9 +246,10 @@ fn validate_kv_ssd_options(opts: &ServeKvSsdOptions) -> Result<()> {
         return Ok(());
     }
 
-    let root = opts.root.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("--kv-ssd-max-bytes requires --kv-ssd-path so the KV tier has a root")
-    })?;
+    let root = opts
+        .root
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("KV SSD tier requested without a resolved root"))?;
     anyhow::ensure!(
         !root.as_os_str().is_empty(),
         "--kv-ssd-path must not be empty"
@@ -207,11 +259,13 @@ fn validate_kv_ssd_options(opts: &ServeKvSsdOptions) -> Result<()> {
         "--kv-ssd-path must be absolute for serving; got {}",
         root.display()
     );
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("create --kv-ssd-path {}", root.display()))?;
     let meta = std::fs::metadata(root)
         .with_context(|| format!("inspect --kv-ssd-path {}", root.display()))?;
     anyhow::ensure!(
         meta.is_dir(),
-        "--kv-ssd-path must be an existing directory; got {}",
+        "--kv-ssd-path must be a directory; got {}",
         root.display()
     );
     anyhow::ensure!(
@@ -250,15 +304,16 @@ mod tests {
     use super::{ServeKvSsdOptions, validate_kv_ssd_options};
 
     #[test]
-    fn kv_ssd_rejects_capacity_without_root() {
-        let err = validate_kv_ssd_options(&ServeKvSsdOptions {
+    fn kv_ssd_capacity_without_root_uses_default_root() {
+        let mut opts = ServeKvSsdOptions {
             root: None,
             max_bytes: Some(1),
             high_performance_non_preemptive: true,
-        })
-        .expect_err("capacity without root should fail");
+        };
+        opts.fill_default_root();
 
-        assert!(err.to_string().contains("--kv-ssd-path"));
+        assert_eq!(opts.root, Some(ServeKvSsdOptions::default_root()));
+        validate_kv_ssd_options(&opts).expect("default root should pass structural validation");
     }
 
     #[test]
