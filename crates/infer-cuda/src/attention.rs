@@ -2520,6 +2520,217 @@ impl Dsv4SpecRingSnapshot {
     }
 }
 
+/// P2 commit fold (fast-path plan): commit the ACCEPTED verify prefix into ONE
+/// layer's persistent state WITHOUT re-running the full forward. §0.1 mutated
+/// buffers and their dispositions:
+/// - compressor + indexer state (`pending/overlap/compressed{,seq_len}`):
+///   re-ingested here by the same NON-frozen batched `compressor_forward` the
+///   re-forward would have run, over the PERSISTED attn-normed rows.
+/// - bf16 SW ring: re-derive `k_prepared` (wkv → kv_norm → rope at the chain
+///   positions) from the persisted rows, then the same window roll the
+///   prefill path uses.
+/// - FP8 SW ring: strided pack of those K rows at `pos % sliding_window`
+///   (table-routed, mirrors `flashmla_pack_sw_ring`).
+/// - `fp8_kv_comp_packed_rows` / `dsa_official.packed_rows`: untouched —
+///   the next decode's `flashmla_pack_compressed_delta` / `csa_select` bulk
+///   paths self-heal off the advanced `compressed.seq_len`.
+///
+/// The Q-side compute is discarded (the verify already produced argmax and
+/// hiddens); `q_dummy` feeds the prepare kernel's Q arm with zeros.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_layer_fold(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    state: &mut Dsv4LayerAttentionState,
+    pool: &mut Dsv4LayerKvLayout,
+    gathered: &HiddenStates,
+    start_pos: usize,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<()> {
+    let m = gathered.seq_len;
+    ensure!(m > 0, "DSv4 commit fold needs at least the pending row");
+    let head_dim = config.head_dim;
+    let rope = &config.rope_parameters;
+    let (rope_base, original_seq_len) = if compress_ratio > 0 {
+        let osl = i32::try_from(rope.original_max_position_embeddings).map_err(|_| {
+            anyhow!(
+                "DSv4 original_max_position_embeddings {} overflows i32",
+                rope.original_max_position_embeddings
+            )
+        })?;
+        (config.compress_rope_theta, osl)
+    } else {
+        (config.rope_theta, 0i32)
+    };
+
+    // ── Compressor + indexer ingestion (compressed layers only), exactly the
+    // calls the re-forward's mla_attention would have made, non-frozen.
+    if mode != DeepSeekV4AttentionMode::SlidingWindow {
+        let compressor = attention.compressor.as_ref().ok_or_else(|| {
+            anyhow!("DSv4 commit fold: {mode:?} layer without compressor weights")
+        })?;
+        let overlap = compress_ratio < 16;
+        let compressor_state = state
+            .compressor
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 commit fold: {mode:?} layer without compressor state"))?;
+        compressor_forward(
+            ctx,
+            config,
+            compressor,
+            gathered,
+            compressor_state,
+            head_dim,
+            compress_ratio,
+            overlap,
+            start_pos,
+            None,
+            true,
+            original_seq_len,
+            keepalive,
+        )?;
+        if mode == DeepSeekV4AttentionMode::CompressedSparse {
+            let indexer = attention
+                .indexer
+                .as_ref()
+                .ok_or_else(|| anyhow!("DSv4 commit fold: CSA layer without indexer weights"))?;
+            let use_official_dsa = dsv4_dsa_official_enabled()?;
+            let indexer_rope_original_seq_len = if use_official_dsa {
+                i32::try_from(config.rope_parameters.original_max_position_embeddings)
+                    .map_err(|_| anyhow!("DSv4 commit fold indexer rope len overflows i32"))?
+            } else {
+                0
+            };
+            let indexer_state = state
+                .indexer
+                .as_mut()
+                .ok_or_else(|| anyhow!("DSv4 commit fold: CSA layer without indexer state"))?;
+            compressor_forward(
+                ctx,
+                config,
+                &indexer.compressor,
+                gathered,
+                indexer_state,
+                config.index_head_dim,
+                compress_ratio,
+                true,
+                start_pos,
+                None,
+                use_official_dsa,
+                indexer_rope_original_seq_len,
+                keepalive,
+            )?;
+        }
+    }
+
+    // ── K re-derivation: wkv → kv_norm → rope at chain positions.
+    let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, m)? };
+    dsv4_linear(ctx, &attention.wkv, gathered, &mut kv_raw)?;
+    keepalive.keep_hidden(&kv_raw);
+    let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
+    keepalive.keep_hidden(&kv_normed);
+    let local_width = attention.wq_b.rows;
+    let local_heads = local_width / head_dim;
+    let q_dummy = HiddenStates {
+        data: ctx
+            .stream
+            .alloc_zeros::<half::bf16>(local_width * m)
+            .map_err(|e| anyhow!("DSv4 commit fold q scratch alloc failed: {e}"))?,
+        hidden_dim: local_width,
+        seq_len: m,
+    };
+    let mut q_discard = unsafe { HiddenStates::uninit(ctx, local_width, m)? };
+    let mut k_prepared = unsafe { HiddenStates::uninit(ctx, head_dim, m)? };
+    {
+        let (q_raw_ptr, _qr) = q_dummy.data.device_ptr(&ctx.stream);
+        let (k_raw_ptr, _kr) = kv_normed.data.device_ptr(&ctx.stream);
+        let (q_out_ptr, _qo) = q_discard.data.device_ptr_mut(&ctx.stream);
+        let (k_out_ptr, _ko) = k_prepared.data.device_ptr_mut(&ctx.stream);
+        // SAFETY: buffers sized above; q arm runs on zeros and is discarded.
+        unsafe {
+            ffi::dsv4_prepare_qk_cuda(
+                q_raw_ptr as *const ffi::Half,
+                k_raw_ptr as *const ffi::Half,
+                q_out_ptr as *mut ffi::Half,
+                k_out_ptr as *mut ffi::Half,
+                m as i32,
+                local_heads as i32,
+                head_dim as i32,
+                config.qk_rope_head_dim as i32,
+                start_pos as i32,
+                config.rms_norm_eps,
+                rope_base,
+                original_seq_len,
+                rope.factor,
+                rope.beta_fast,
+                rope.beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    keepalive.keep_hidden(&q_dummy);
+    keepalive.keep_hidden(&q_discard);
+    keepalive.keep_hidden(&k_prepared);
+
+    // ── bf16 SW ring roll (chain shape — identical to the prefill path).
+    update_bf16_sw_window(
+        ctx,
+        &mut state.sw_window_cache,
+        &k_prepared,
+        start_pos,
+        None,
+        config,
+    )?;
+
+    // ── FP8 SW ring pack for the accepted positions (table-routed strided
+    // pack, mirrors flashmla_pack_sw_ring's math for m explicit slots).
+    if let Some(flash) = &mut state.flashmla {
+        let page_block_size = 64;
+        let mut block_ids = Vec::with_capacity(m);
+        let mut rows = Vec::with_capacity(m);
+        {
+            let table = pool.flashmla_page_table(flash.slot_idx)?;
+            for i in 0..m {
+                let slot_idx = (start_pos + i) % config.sliding_window;
+                let page = physical_page(table, slot_idx / page_block_size)?;
+                block_ids.push(
+                    i32::try_from(page)
+                        .map_err(|_| anyhow!("DSv4 commit fold FP8 page overflows i32"))?,
+                );
+                rows.push((slot_idx % page_block_size) as i32);
+            }
+        }
+        ctx.stream
+            .memcpy_htod(&block_ids, &mut flash.sw_bulk_block_ids)
+            .map_err(|e| anyhow!("DSv4 commit fold FP8 block_ids H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&rows, &mut flash.sw_bulk_rows)
+            .map_err(|e| anyhow!("DSv4 commit fold FP8 rows H2D failed: {e}"))?;
+        let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
+        let pool_buf = pool.flashmla_pool_data_mut()?;
+        let (pool_ptr, _pg) = pool_buf.device_ptr_mut(&ctx.stream);
+        let nope_ptr = k_ptr;
+        let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
+        flash_kv::dsv4_fp8_kv_pack_strided_raw(
+            ctx,
+            nope_ptr,
+            rope_ptr,
+            pool_ptr,
+            &flash.sw_bulk_block_ids,
+            &flash.sw_bulk_rows,
+            m,
+            page_block_size,
+            config.head_dim,
+            config.head_dim,
+        )?;
+    }
+    Ok(())
+}
+
 /// Device-side draft-tree topology for ONE spec-verify forward: per-row
 /// absolute positions (`start_pos + depth`, repeats across siblings) and
 /// per-row branch ancestors as flattened chunk-row indices (`[n, max_anc]`,
