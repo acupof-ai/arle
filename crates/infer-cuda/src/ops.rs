@@ -290,6 +290,34 @@ pub(crate) fn copy_row_to_hidden(
         .map_err(|e| anyhow!("D2D copy stream row failed: {e}"))
 }
 
+/// Host-side top-`k`: copy the logits to host and return the indices of the `k`
+/// largest values, highest-first (`out[0]` is the argmax). `k` is clamped to the
+/// vocab. One O(n·k) partial-select pass — no full sort, no heap churn — fine for
+/// the small `k` a draft tree branches by. The D2H copy makes this a diagnostic /
+/// draft-side path; `argmax_cuda` stays the production top-1 sampler.
+pub(crate) fn topk_host(ctx: &DeviceContext, logits: &DeviceVec, k: usize) -> Result<Vec<u32>> {
+    ensure!(k > 0, "topk_host k must be > 0");
+    let host: Vec<bf16> = ctx
+        .stream
+        .clone_dtoh(&logits.data)
+        .map_err(|e| anyhow!("D2H topk logits failed: {e}"))?;
+    ensure!(!host.is_empty(), "topk_host on empty logits");
+    let k = k.min(host.len());
+    // Running top-k kept sorted descending by value; insert each candidate at its
+    // rank and truncate. O(n·k) for small k, allocation-free past the initial cap.
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+    for (i, v) in host.iter().enumerate() {
+        let v = v.to_f32();
+        if top.len() == k && v <= top[k - 1].1 {
+            continue;
+        }
+        let pos = top.partition_point(|&(_, tv)| tv >= v);
+        top.insert(pos, (i as u32, v));
+        top.truncate(k);
+    }
+    Ok(top.into_iter().map(|(i, _)| i).collect())
+}
+
 pub(crate) fn argmax(ctx: &DeviceContext, logits: &DeviceVec) -> Result<u32> {
     let mut out = ctx
         .stream
