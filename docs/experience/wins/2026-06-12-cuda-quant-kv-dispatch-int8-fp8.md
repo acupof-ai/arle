@@ -4,11 +4,10 @@
 **Scope:** `cuda-kernels` (2 new per-channel-K dequant kernels + wrappers),
 `infer-cuda` (executor dtype admission, loader PageMeta quant fields,
 attention refill/calibrate/quantize/fused-decode dispatch), `infer-api`/`cli`
-threading. **Commit:** `d9f930b6`.
-**Status: pending-remote** — the two new `.cu` kernels have never been
-compiled by nvcc (no CUDA toolchain on the Mac), the device-gated GPU tests
-(`cargo test -p cuda-kernels --release --features cuda hnd_refill`) need an
-H20, and the int8/fp8 needle gates vs the BF16 envelope are owed (T5).
+threading. **Commits:** `d9f930b6` (port), `b2415c01` (codex-review P2:
+workspace gate on the 1-split floor).
+**Status: VERIFIED on H20** (same day) — **correctness LICENSED for INT8 and
+FP8; decode perf −77% at B=1, optimization owed before any wider rollout.**
 
 ## Context
 
@@ -50,27 +49,52 @@ Pool transports needed **zero changes**: tier store
 (`copy_pages_device_to_device`) already carry data plane + scales + norms
 per layer.
 
-## Verification (Mac-side; device work pending-remote)
+## Verification
 
-- `CUDARC_CUDA_VERSION=12060 cargo check -p infer-api --release
-  --no-default-features --features cuda,no-cuda --lib` PASS.
-- `cargo test -p agent-infer` (cpu,no-cuda,cli) PASS; `cargo test -p cli`
-  147/147 PASS; clippy `-D warnings` clean on the touched crates; fmt clean.
-- New GPU tests committed (exact bf16-bit comparison vs the scale table,
-  head_dim 8 and 7 covering the vectorized + scalar kernel paths) — run on
-  pod.
-- BF16 default path byte-for-byte unchanged (quant ops are format-gated; the
-  BF16 envelope `exact=3 partial=0 miss=0 DET` at len 115/300/446/2000/8000
-  from the 06-12 hd128 fix entry is the T5 reference).
+Mac-side: `CUDARC_CUDA_VERSION=12060 cargo check -p infer-api` (cuda,no-cuda)
+PASS; `cargo test -p agent-infer` (cpu,no-cuda,cli) PASS; `cargo test -p cli`
+147/147; clippy `-D warnings` clean; fmt clean.
 
-## Pending (T5 — license-or-kill per dtype)
+H20 pod (sm_90a, CUDA 12.9, `scripts/dsv4_toolchain.sh build`, 2026-06-12):
 
-`GATE_PROFILE=generic MODEL=/data01/models/Qwen3-0.6B
-SERVE_FLAGS="--kv-cache-dtype <dt>" scripts/lever_gate.sh qwen06b_<dt>_raw
-RAW=1` for int8/fp8. **RAW=1 mandatory** (chat template burns the token
-budget in `<think>` → all-miss). PASS = within ±1 of the BF16 envelope per
-length, zero garbage. Plus one `bench_guidellm.sh` run per dtype for the
-perf row.
+- **nvcc first compile of both new kernels: PASS** (full `cuda,nccl` link).
+- **GPU kernel tests 3/3**: `hnd_refill_{fp8,int8}_per_channel_k_matches_scale_table`
+  (exact bf16-bit match vs the scale table; head_dim 8 = vectorized path,
+  head_dim 7 = scalar fallback) + the pre-existing reference test.
+- **Needle gates** (`GATE_PROFILE=generic MODEL=/data01/models/Qwen3-0.6B
+  SERVE_FLAGS="--kv-cache-dtype <dt>" scripts/lever_gate.sh qwen06b_<dt>_raw
+  RAW=1`; RAW=1 mandatory — chat template burns the budget in `<think>`):
+
+  | dtype | len 115/300/446/2000/8000 | verdict |
+  |---|---|---|
+  | bf16 (envelope, hd128 entry) | exact=3 partial=0 miss=0 DET ×5 | baseline |
+  | int8 | exact=3 partial=0 miss=0 DET ×5 | **LICENSED (correctness)** |
+  | fp8 | exact=3 partial=0 miss=0 DET ×5 | **LICENSED (correctness)** |
+  | tq4 | — | DEFERRED (`resolve()` bails; page_size=1 vs PAGE_SIZE=16) |
+
+- **Path probe** (RUST_LOG=info, not inferred): pool boots `format=INT8`
+  (data 268.4 MB/layer vs 536.9 MB bf16 — the 2× KV-memory win) and warmup
+  logs "decode graph disabled for quantized KV … fused-dequant kernels".
+
+## Perf row (same-binary, same-shell, same-prompt, side-by-side ×3)
+
+B=1 decode, 256 tokens, Qwen3-0.6B, GPU 0, no decode graph in any lane
+(INFER_CUDA_DECODE_GRAPH unset):
+
+| dtype | tok/s (runs 2–3 steady) | Δ vs bf16 |
+|---|---|---|
+| bf16 | 439 | — |
+| int8 | ~100 | **−77%** |
+| fp8 | ~102 | **−77%** |
+
+The quant decode lane pays ~3 extra launches/layer (calibrate-check +
+row-quantize + two-phase split-KV) against TileLang's single tuned bf16
+decode kernel — at 0.6B/B=1 that's launch-bound territory. **No default
+flip is proposed (bf16 stays default), so correctness licensing stands; the
+perf gap is the cost of the opt-in lane today and the optimization target
+(fused quantize+attend, graph re-enable for quant) before any wider
+rollout.** guidellm is absent on the pod; this same-session side-by-side
+A/B is the Δ% row.
 
 ## Rule
 
