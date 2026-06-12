@@ -11,8 +11,10 @@
 #   # DSv4 (8xH20, TP=8) — the dsv4 profile carries the multi-GPU + kernel env:
 #   GATE_PROFILE=dsv4 scripts/lever_gate.sh baseline
 #   GATE_PROFILE=dsv4 scripts/lever_gate.sh flashmla ARLE_DSV4_FLASHMLA_DECODE=1
-#   # Qwen3.5 (single GPU) KV-dtype matrix — pass serve flags, generic profile:
-#   GATE_PROFILE=generic MODEL=/data01/models/Qwen3.5-4B \
+#   # Qwen (single GPU) KV-dtype matrix — pass serve flags, generic profile.
+#   # MODEL is any on-pod single-GPU Qwen: Qwen3-0.6B (dense, cleanest gate) or
+#   # Qwen3.6-35B-A3B (qwen3_5_moe family). No Qwen3.5-4B checkpoint on the pod.
+#   GATE_PROFILE=generic MODEL=/data01/models/Qwen3-0.6B \
 #     SERVE_FLAGS="--kv-cache-dtype fp8" scripts/lever_gate.sh qwen_fp8
 #
 # Each invocation: boots a serve with the lever env, runs the gate matrix,

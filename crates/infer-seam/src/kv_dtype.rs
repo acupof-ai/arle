@@ -8,8 +8,9 @@
 //! a requested dtype fails loud at construction, it does not silently downgrade.
 //!
 //! `Auto` defers to the backend default (Metal resolves it to INT8 after the
-//! Metal int8 gate; CUDA keeps BF16). `Fp8`/`Tq4` are reserved for the CUDA
-//! paged-KV quant path (#68 T3/T4) and are not yet reachable from the CLI.
+//! Metal int8 gate; CUDA keeps BF16). `Fp8`/`Tq4` are CUDA-only paged-KV quant
+//! modes: the CLI accepts them (#68 T4) but the CUDA resolve fails loud until
+//! each mode's paged kernel path lands (#68 T3).
 
 /// Requested KV-cache storage dtype, resolved per-backend at construction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
