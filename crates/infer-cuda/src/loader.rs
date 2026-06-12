@@ -1592,6 +1592,27 @@ impl SafetensorLoader {
             } else {
                 (None, None)
             };
+        // Replicated decode attention: FULL-width wq_b/wo_a copies alongside
+        // the shards (decode reads full, prefill keeps the sharded math).
+        let (wq_b_full, wo_a_full) =
+            if crate::attention::dsv4_replicated_attn_enabled() && tp.world_size > 1 {
+                (
+                    Some(self.load_dsv4_block_scaled_sharded(
+                        ctx,
+                        &names.wq_b,
+                        Shard::Replicated,
+                        tp,
+                    )?),
+                    Some(self.load_dsv4_block_scaled_sharded(
+                        ctx,
+                        &names.wo_a,
+                        Shard::Replicated,
+                        tp,
+                    )?),
+                )
+            } else {
+                (None, None)
+            };
         Ok(crate::dsv4::Dsv4Attention {
             wq_a,
             wqkv_a_deepgemm,
@@ -1604,6 +1625,8 @@ impl SafetensorLoader {
             wo_b,
             wo_a_deepgemm,
             wo_b_deepgemm,
+            wq_b_full,
+            wo_a_full,
             attn_sink,
             attn_sink_f32,
             compressor: names
