@@ -1529,6 +1529,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-gguf"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "deepseek-spec",
+ "memmap2",
+]
+
+[[package]]
 name = "infer-hip"
 version = "0.1.5"
 dependencies = [
@@ -1536,9 +1545,9 @@ dependencies = [
  "deepseek-spec",
  "hip-kernels",
  "hip-sys",
+ "infer-gguf",
  "infer-plan",
  "infer-seam",
- "memmap2",
 ]
 
 [[package]]
@@ -1626,7 +1635,7 @@ dependencies = [
  "anyhow",
  "deepseek-spec",
  "gemma-spec",
- "infer-hip",
+ "infer-gguf",
  "infer-plan",
  "infer-seam",
  "qwen3-spec",

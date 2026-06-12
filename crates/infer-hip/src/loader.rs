@@ -15,8 +15,8 @@
 
 use anyhow::{Result, bail};
 
-use crate::config::{Dsv4TensorKind, classify_tensor};
-use crate::gguf::{GgmlType, GgufFile, TensorInfo};
+use infer_gguf::deepseek4::{Dsv4TensorKind, classify_tensor};
+use infer_gguf::gguf::{GgmlType, GgufFile, TensorInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KQuant {
@@ -144,8 +144,8 @@ pub mod upload {
     use hip_sys::DeviceBuffer;
 
     use super::{Residency, ResidencyPlan, f32_to_bf16_rne};
-    use crate::dequant;
-    use crate::gguf::{GgmlType, GgufFile};
+    use infer_gguf::dequant;
+    use infer_gguf::gguf::{GgmlType, GgufFile};
 
     pub struct DeviceTensor {
         pub name: String,
@@ -218,7 +218,7 @@ pub mod upload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gguf::test_writer::{T, V, write_to_temp};
+    use infer_gguf::gguf::test_writer::{T, V, write_to_temp};
 
     #[test]
     fn bf16_rne_pinned() {

@@ -456,9 +456,10 @@ impl GgufFile {
     }
 }
 
-/// Synthetic-GGUF writer for unit tests across this crate's modules.
-#[cfg(test)]
-pub(crate) mod test_writer {
+/// Synthetic-GGUF writer for unit tests in this crate and its consumers
+/// (`infer-hip` / `infer-vulkan` test builds reach it cross-crate, so it
+/// cannot be `#[cfg(test)]`).
+pub mod test_writer {
     use super::GGUF_DEFAULT_ALIGNMENT;
 
     pub enum V {

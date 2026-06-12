@@ -73,8 +73,8 @@ Current workspace members (ownership and boundaries are listed in
 - **specs:** `crates/qwen3-spec`, `crates/qwen35-spec`, `crates/deepseek-spec`,
   `crates/gemma-spec`
 - **training:** `crates/autograd`, `crates/train`
-- **substrate:** `crates/kv-native-sys`, `crates/xgrammar-sys`,
-  `crates/agent-bench`
+- **substrate:** `crates/infer-gguf`, `crates/kv-native-sys`,
+  `crates/xgrammar-sys`, `crates/agent-bench`
 
 ## 2. Main execution paths
 
@@ -340,17 +340,17 @@ The AIPC lane (#71/#76/#77; plans
 landed ahead of the Phase 3 ordering — ratification pending, see
 [`plans/2026-06-12-architecture-refactor-roadmap.md`](plans/2026-06-12-architecture-refactor-roadmap.md) §6.
 
-- `crates/infer-hip/src/{executor,kv_pool,model,loader,gguf,dequant,config}.rs`:
+- `crates/infer-hip/src/{executor,kv_pool,model,loader}.rs`:
   `HipDsv4Executor` + `HipKvPool` seam impls; DSv4-Flash GGUF 2-bit
   shim-portable lane (FlashMLA/official-DSA/DeepGEMM datacenter paths
   excluded by design). GGUF reader + CPU dequant + deepseek4 GGUF→config
-  mapping currently live here — extraction to a neutral `infer-gguf` leaf is
-  roadmap tranche R1.
+  mapping live in the neutral `infer-gguf` leaf (extracted 2026-06-12,
+  roadmap tranche R1 done).
 - `crates/infer-vulkan/src/{executor,kv_pool,model_*.rs}`: seam-correct
   skeleton — `VulkanExecutor` + `VulkanKvPool` implement the seam; forward
   order pinned for Qwen3/3.5/3.6, DSv4, and Gemma4; device execution pending
-  the shader ABI. Re-exports `infer-hip`'s GGUF host modules (the lateral
-  dep R1 kills).
+  the shader ABI. Re-exports `infer-gguf`'s GGUF host modules
+  (`deepseek4`/`dequant`/`gguf`).
 
 Both compile and test on any host (device features off ⇒ stub layers), so
 they ride the normal CPU CI lanes.
@@ -370,6 +370,7 @@ These crates sit around the runtime graph:
 - `crates/hip-kernels`: HIP kernel build + FFI layer for the AIPC DSv4 2-bit lane (llama.cpp-adapted IQ2_XXS/Q2_K mmvq corpus; hipcc-gated, layout helpers always compiled)
 - `crates/vulkan-sys`: ash-backed Vulkan loader wrapper (stub off the `vulkan` feature, mirroring `hip-sys`)
 - `crates/vulkan-kernels`: glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` (typecheck-only without `glslc`)
+- `crates/infer-gguf`: GGUF v2/v3 memmap reader + llama.cpp-port CPU dequantizers + per-arch GGUF→spec-config mappers (`deepseek4`); consumers: `infer-hip`, `infer-vulkan`
 - `crates/kv-native-sys`: local persistence substrate (POSIX file + content-addressed block object ops, WAL append/replay, mmap + shared-memory descriptors) backing the KV T2 disk tiers — consumers: `infer-cuda/src/kv_tier.rs` (RAM + disk store) and `infer-metal`'s SSD tier (`MetalSsdTier`)
 - `crates/xgrammar-sys`: Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode) — **zero code consumers** since the monolith deletion; license-or-kill verdict pending ([roadmap §6](plans/2026-06-12-architecture-refactor-roadmap.md))
 - `crates/qwen3-spec`: Qwen3 config + tensor-parallel `Shard` enum (TP layout authority)
@@ -412,13 +413,16 @@ infer-cuda
 infer-metal
   -> infer-plan, infer-seam (+ mlx-sys under "metal")        (never infer-core)
 
+infer-gguf
+  -> deepseek-spec   (neutral GGUF host substrate leaf; spec crates never depend back)
+
 infer-hip
-  -> infer-plan, infer-seam, deepseek-spec
+  -> infer-plan, infer-seam, deepseek-spec, infer-gguf
      (+ hip-sys, hip-kernels under "hip")                    (never infer-core)
 
 infer-vulkan
   -> infer-plan, infer-seam, deepseek-spec, gemma-spec, qwen3-spec, qwen35-spec,
-     infer-hip (GGUF host substrate — DEBT, dies in roadmap R1)
+     infer-gguf
      (+ vulkan-sys, vulkan-kernels under "vulkan")           (never infer-core)
 ```
 
