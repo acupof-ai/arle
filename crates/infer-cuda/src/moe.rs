@@ -369,7 +369,7 @@ mod gpu {
     /// | `fm_sorted_token_ids` | `[max_padded]` i32 | none        | the native align kernel int4-fills the whole buffer with the `numel` pad sentinel (block 1) then scatters every real route id (block 0) — every slot written each call |
     /// | `fm_expert_ids`       | `[num_blocks]` i32 | none        | the align kernel writes the per-block expert id for every block |
     /// | `fm_total_padded`     | `[1]` i32        | memset 0      | REQUIRED: align kernel `atomicAdd`s the cumsum/total |
-    /// | `fm_cumsum`           | `[E + 1]` i32    | memset 0      | REQUIRED: align kernel `atomicAdd`s per-expert counts then scans in place |
+    /// | `fm_cumsum`           | `[E + 2]` i32    | memset 0      | REQUIRED: align kernel `atomicAdd`s per-expert counts then scans in place (E+1 padded experts + the `total` slot, mirroring SGLang's `num_experts + 2`) |
     /// | `fm_cache1`           | `[numel, 2N]` bf16 | none        | GEMM1 writes every valid route row (`offs_token < numel`); pad-tile rows are masked stores, never read by act (act runs over `numel` rows) |
     /// | `fm_cache2`           | `[numel, N]` bf16  | none        | act_and_mul writes all `numel` rows (silu·up); GEMM2 reads exactly these |
     /// | `fm_cache3`           | `[numel, K]` bf16  | none        | GEMM2 writes every valid route row; sum-reduce reads `[T, topk, K]` = all `numel` rows |
@@ -409,7 +409,9 @@ mod gpu {
         fm_expert_ids: SliceSlot<i32>,
         /// `[1]` i32 — moe_align total padded tokens (zeroed every call).
         fm_total_padded: SliceSlot<i32>,
-        /// `[num_experts + 1]` i32 — moe_align cumsum scratch (zeroed).
+        /// `[num_experts + 2]` i32 — moe_align cumsum scratch (zeroed). E+1
+        /// padded experts (SGLang's `+1` dummy expert-0 shift) + the `total`
+        /// slot, matching the python wrapper's `num_experts + 2`.
         fm_cumsum: SliceSlot<i32>,
         /// cache1 `[num_tokens*topk, 2*moe_inter]` bf16 (gate||up GEMM1 out).
         fm_cache1: SliceSlot<bf16>,
@@ -732,6 +734,16 @@ mod gpu {
                 "ARLE_QWEN35_MOE_FUSED_SGLANG: routed_scaling_factor={} but the \
                  fused sum-reduce cubin bakes 1.0. Rebuild the cubin or unset the flag.",
                 cfg.routed_scaling_factor
+            );
+            // `top_k` is BAKED into the GEMM1 cubin (top_k=8, the Qwen3.6-A3B
+            // routing fan-out; A's row offset is `offs_token // top_k`). A model
+            // with a different top_k would silently mis-index the activation
+            // rows. Loud-fail instead of producing garbage.
+            ensure!(
+                topk == 8,
+                "ARLE_QWEN35_MOE_FUSED_SGLANG: top_k={} but the fused GEMM1 cubin \
+                 bakes top_k=8 (Qwen3.6-A3B). Rebuild the cubin or unset the flag.",
+                topk
             );
             moe_forward_fused_sglang(
                 ctx,
@@ -1245,7 +1257,16 @@ mod gpu {
 
         let numel = num_tokens * topk; // flattened topk_ids length
         let block_size = moe::FUSED_MOE_BLOCK_SIZE_M;
-        let max_padded = moe::fused_moe_max_num_tokens_padded(numel, num_experts, block_size);
+        // SGLang shifts expert ids by +1 (`topk_ids + 1`, a dummy expert-0
+        // slot), so the align kernel runs over E+1 expert slots — the kernel's
+        // `num_experts` arg, the cumsum scratch, and the pad-fill envelope must
+        // ALL use the padded count, mirroring the python `moe_align_block_size`
+        // wrapper: kernel arg = `num_experts + 1`, `cumsum_buffer` =
+        // `num_experts + 2`, `max_num_tokens_padded` over `num_experts + 1`
+        // groups. Passing the bare E drops the highest expert (its count lands
+        // in `shared_counts[E]`, which aliases `prefix[0]` and is never read).
+        let align_experts = num_experts + 1;
+        let max_padded = moe::fused_moe_max_num_tokens_padded(numel, align_experts, block_size);
         let num_blocks = max_padded.div_ceil(block_size);
 
         // ── moe_align scratch. sorted_token_ids must be the numel sentinel for
@@ -1260,7 +1281,7 @@ mod gpu {
         let expert_ids_ptr = cache_ptr(expert_ids, ctx);
         let total_padded = scratch.fm_total_padded.get_zeroed(ctx, 1)?;
         let total_padded_ptr = cache_ptr(total_padded, ctx);
-        let cumsum = scratch.fm_cumsum.get_zeroed(ctx, num_experts + 1)?;
+        let cumsum = scratch.fm_cumsum.get_zeroed(ctx, num_experts + 2)?;
         let cumsum_ptr = cache_ptr(cumsum, ctx);
 
         // SAFETY: all buffers valid on ctx.stream for the documented shapes;
@@ -1272,7 +1293,7 @@ mod gpu {
                 expert_ids_ptr,
                 total_padded_ptr,
                 cumsum_ptr,
-                num_experts,
+                align_experts,
                 block_size,
                 numel,
                 max_padded,
