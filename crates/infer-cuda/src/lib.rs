@@ -437,6 +437,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn model_stop_token_ids(&self) -> Vec<u32> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => Vec::new(),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.model_stop_token_ids(),
+        }
+    }
+
     fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {

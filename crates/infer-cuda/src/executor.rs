@@ -227,6 +227,19 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Model-default stop tokens, engine-core's fallback stop set for
+    /// requests that supply none. Without this every CUDA request ignores the
+    /// model's EOS and pads to `max_tokens` with post-EOS degenerate text
+    /// (found via the MTP P0 probe — the Metal executor always had the
+    /// equivalent override).
+    pub(crate) fn model_stop_token_ids(&self) -> Vec<u32> {
+        match self {
+            Self::Qwen(q) => q.model.config.eos_token_ids.clone(),
+            Self::Qwen35(q) => q.model.config.stop_token_ids.clone(),
+            Self::Dsv4(d) => d.model.config.eos_token_id.into_iter().collect(),
+        }
+    }
+
     /// T1 host-tier hooks. Only dense Qwen3 has a page-addressable device
     /// pool with cross-request prefix reuse, so it is the only arm with a
     /// tier store; the hybrid/DSv4 arms (prefix cache disabled — recurrent /

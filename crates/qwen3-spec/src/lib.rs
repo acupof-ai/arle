@@ -237,6 +237,11 @@ pub struct Qwen3Config {
     pub rope_scaling: Option<RopeScalingConfig>,
     pub tie_word_embeddings: bool,
     pub max_position_embeddings: usize,
+    /// Model-default stop tokens from `config.json`'s `eos_token_id`
+    /// (scalar or list in HF exports), normalized to a flat list. Empty when
+    /// the config omits it. Serving uses these as the fallback stop set for
+    /// requests that supply none.
+    pub eos_token_ids: Vec<u32>,
 }
 
 /// Nested RoPE block emitted by newer HF transformers exports, e.g.
@@ -274,6 +279,26 @@ struct Qwen3ConfigRaw {
     rope_scaling: Option<RopeScalingConfig>,
     tie_word_embeddings: bool,
     max_position_embeddings: usize,
+    /// HF exports write `eos_token_id` as a scalar OR a list; tolerate both.
+    #[serde(default)]
+    eos_token_id: Option<EosTokenIds>,
+}
+
+/// `eos_token_id` wire forms: `1`, `[1, 2]`, or absent.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EosTokenIds {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl EosTokenIds {
+    fn into_vec(self) -> Vec<u32> {
+        match self {
+            EosTokenIds::One(id) => vec![id],
+            EosTokenIds::Many(ids) => ids,
+        }
+    }
 }
 
 impl From<Qwen3ConfigRaw> for Qwen3Config {
@@ -298,6 +323,10 @@ impl From<Qwen3ConfigRaw> for Qwen3Config {
             rope_scaling: raw.rope_scaling,
             tie_word_embeddings: raw.tie_word_embeddings,
             max_position_embeddings: raw.max_position_embeddings,
+            eos_token_ids: raw
+                .eos_token_id
+                .map(EosTokenIds::into_vec)
+                .unwrap_or_default(),
         }
     }
 }
