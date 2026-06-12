@@ -112,35 +112,33 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                     T.cast(0, dtype),
                 )
 
-            # Per-tile page-index precomputes (depend on j only, not d): hoisting
-            # to a 1D fragment kills the ~128x duplicate divmod + KV_indices gather
-            # a (j, d) loop would incur.
-            page_idx_j = T.alloc_fragment((BLOCK_N,), index_dtype)
-            in_page_j = T.alloc_fragment((BLOCK_N,), index_dtype)
-            valid_j = T.alloc_fragment((BLOCK_N,), index_dtype)
-
+            # Page lookup stays INLINE in the (j, d) copy loop. Hoisting it to
+            # (BLOCK_N,) fragments (526515bd) lowers to a half-warpgroup
+            # predicated region `if (tid >> 6 == 0)` containing a
+            # __syncthreads(): threads 64-127 skip it and arrive at the wgmma
+            # block's barrier instead → barrier slip → partial-warpgroup
+            # wgmma.mma_async → device spin on sm_90a. The duplicate divmod is
+            # the price of correctness. See
+            # errors/2026-06-04-tilelang-hd128-prefill-wgmma-hang-sm90a.md.
             for kn in T.Pipelined(T.ceildiv(kv_visible_end, BLOCK_N), num_stages=NUM_STAGES):
                 col0 = kn * BLOCK_N
-                for j in T.Parallel(BLOCK_N):
+                for j, d in T.Parallel(BLOCK_N, HEAD_DIM):
                     abs_col = col0 + j
                     page_local = abs_col // PAGE_SIZE
-                    in_page_j[j] = abs_col % PAGE_SIZE
-                    valid_j[j] = T.if_then_else(abs_col < kv_total_len, 1, 0)
-                    page_idx_j[j] = T.if_then_else(
+                    in_page = abs_col % PAGE_SIZE
+                    page_idx = T.if_then_else(
                         abs_col < kv_total_len,
                         KV_indices[kv_page_start + page_local],
                         0,
                     )
-                for j, d in T.Parallel(BLOCK_N, HEAD_DIM):
-                    is_valid = valid_j[j] != 0
                     k_tile[j, d] = T.if_then_else(
-                        is_valid,
-                        K_pool[page_idx_j[j], kv_head, in_page_j[j], d],
+                        abs_col < kv_total_len,
+                        K_pool[page_idx, kv_head, in_page, d],
                         T.cast(0, dtype),
                     )
                     v_tile[j, d] = T.if_then_else(
-                        is_valid,
-                        V_pool[page_idx_j[j], kv_head, in_page_j[j], d],
+                        abs_col < kv_total_len,
+                        V_pool[page_idx, kv_head, in_page, d],
                         T.cast(0, dtype),
                     )
 
