@@ -1442,6 +1442,7 @@ impl SafetensorLoader {
             routing_kind,
             shared_w13,
             shared_w2,
+            gemv_tables: std::sync::OnceLock::new(),
         })
     }
 

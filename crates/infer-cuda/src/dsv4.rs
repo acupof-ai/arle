@@ -188,6 +188,11 @@ pub(crate) struct Dsv4MoeLayer {
     /// Dense shared expert FP8 caches (always-on, n_shared_experts == 1).
     pub shared_w13: Dsv4Fp8DeepGemmWeightCache,
     pub shared_w2: Dsv4Fp8DeepGemmWeightCache,
+    /// Decode-band grouped-GEMV lane tables (per-expert weight/scale pointer
+    /// tables + UE8M0-re-encoded scales), built lazily on first decode-band
+    /// MoE forward. `Some(None)` = build attempted and failed the lossless
+    /// UE8M0 check — the contiguous DeepGEMM lane stays the fallback.
+    pub gemv_tables: std::sync::OnceLock<Option<crate::moe::Dsv4GemvTables>>,
 }
 
 /// One DSv4 transformer layer: hyper-connection mixers (`hc_attn`/`hc_ffn`),
@@ -2234,8 +2239,7 @@ impl Dsv4Model {
         })?;
         if tprof {
             tail_ms[4] = tlap.elapsed().as_secs_f64() * 1000.0;
-            static TACC: std::sync::Mutex<([f64; 5], u32)> =
-                std::sync::Mutex::new(([0.0; 5], 0));
+            static TACC: std::sync::Mutex<([f64; 5], u32)> = std::sync::Mutex::new(([0.0; 5], 0));
             let mut acc = TACC.lock().unwrap();
             for i in 0..5 {
                 acc.0[i] += tail_ms[i];
@@ -2245,7 +2249,12 @@ impl Dsv4Model {
                 let n = acc.1 as f64;
                 eprintln!(
                     "[step-profile-tail] n={} backlog={:.3} head_hc={:.3} head_norm={:.3} lm_head={:.3} sample={:.3} ms",
-                    acc.1, acc.0[0] / n, acc.0[1] / n, acc.0[2] / n, acc.0[3] / n, acc.0[4] / n
+                    acc.1,
+                    acc.0[0] / n,
+                    acc.0[1] / n,
+                    acc.0[2] / n,
+                    acc.0[3] / n,
+                    acc.0[4] / n
                 );
                 *acc = ([0.0; 5], 0);
             }
