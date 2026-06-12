@@ -55,7 +55,8 @@ const DSV4_THINK_END: &str = "</think>";
 
 impl OpenAiTokenizer {
     /// Load `tokenizer.json` from a model dir and resolve the chat template:
-    /// checkpoint `chat_template` → builtin per-architecture → ChatML + warn.
+    /// checkpoint `chat_template` / `chat_template.jinja` → builtin
+    /// per-architecture → ChatML + warn.
     pub fn from_model_dir(model_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         let tokenizer_path = model_dir.join("tokenizer.json");
@@ -266,9 +267,10 @@ fn render_deepseek_v4(messages: &[ChatMessage]) -> Result<String> {
 /// Resolve the chat template for a model dir:
 /// 1. `tokenizer_config.json` `chat_template` (string, or HF list-of-named —
 ///    `default` preferred) → [`ChatTemplate::Jinja`];
-/// 2. `config.json` `architectures` starting with `DeepseekV4` →
+/// 2. `chat_template.jinja` next to the tokenizer → [`ChatTemplate::Jinja`];
+/// 3. `config.json` `architectures` starting with `DeepseekV4` →
 ///    [`ChatTemplate::BuiltinDeepseekV4`];
-/// 3. otherwise [`ChatTemplate::BuiltinChatMl`] (caller warns).
+/// 4. otherwise [`ChatTemplate::BuiltinChatMl`] (caller warns).
 fn resolve_chat_template(model_dir: &Path) -> Result<ChatTemplate> {
     let tok_cfg = read_json(&model_dir.join("tokenizer_config.json"))?;
     if let Some(cfg) = &tok_cfg
@@ -278,6 +280,19 @@ fn resolve_chat_template(model_dir: &Path) -> Result<ChatTemplate> {
             source,
             bos_token: extract_token(cfg, "bos_token").unwrap_or_default(),
             eos_token: extract_token(cfg, "eos_token").unwrap_or_default(),
+        });
+    }
+    if let Some(source) = read_chat_template_file(model_dir)? {
+        return Ok(ChatTemplate::Jinja {
+            source,
+            bos_token: tok_cfg
+                .as_ref()
+                .and_then(|cfg| extract_token(cfg, "bos_token"))
+                .unwrap_or_default(),
+            eos_token: tok_cfg
+                .as_ref()
+                .and_then(|cfg| extract_token(cfg, "eos_token"))
+                .unwrap_or_default(),
         });
     }
     let model_cfg = read_json(&model_dir.join("config.json"))?;
@@ -306,6 +321,16 @@ fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
     Ok(Some(
         serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?,
     ))
+}
+
+fn read_chat_template_file(model_dir: &Path) -> Result<Option<String>> {
+    let path = model_dir.join("chat_template.jinja");
+    if !path.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("read {}", path.display()))
+        .map(Some)
 }
 
 /// `chat_template` is a string, or (HF multi-template form) a list of
@@ -465,6 +490,44 @@ mod tests {
         assert_eq!(extract_chat_template(&cfg2).as_deref(), Some("S"));
         assert_eq!(extract_token(&cfg2, "eos_token").as_deref(), Some("<eos>"));
     }
+
+    #[test]
+    fn resolves_external_chat_template_file() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "infer-server-chat-template-file-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template": null, "bos_token": "<bos>", "eos_token": "<eos>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("chat_template.jinja"),
+            "{{ bos_token }}{{ eos_token }}",
+        )
+        .unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+
+        let template = resolve_chat_template(&dir).unwrap();
+        let ChatTemplate::Jinja {
+            source,
+            bos_token,
+            eos_token,
+        } = template
+        else {
+            panic!("external template should resolve to Jinja");
+        };
+        assert_eq!(source, "{{ bos_token }}{{ eos_token }}");
+        assert_eq!(bos_token, "<bos>");
+        assert_eq!(eos_token, "<eos>");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]
@@ -512,5 +575,51 @@ mod real_checkpoint_tests {
         .unwrap();
         assert!(out.contains("<|im_start|>user\nhi<|im_end|>"), "got: {out}");
         assert!(out.ends_with("<|im_start|>assistant\n"), "got: {out}");
+    }
+
+    #[test]
+    fn real_diffusion_gemma_external_template_renders_if_cached() {
+        let Some(home) = std::env::var_os("HOME") else {
+            eprintln!("skip: HOME not set");
+            return;
+        };
+        let root = Path::new(&home).join(
+            ".cache/huggingface/hub/models--mlx-community--diffusiongemma-26B-A4B-it-4bit/snapshots",
+        );
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            eprintln!("skip: DiffusionGemma HF snapshot not present");
+            return;
+        };
+        let Some(dir) = entries
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("chat_template.jinja").exists())
+        else {
+            eprintln!("skip: DiffusionGemma chat_template.jinja not present");
+            return;
+        };
+
+        let template = resolve_chat_template(&dir).unwrap();
+        let ChatTemplate::Jinja {
+            source,
+            bos_token,
+            eos_token,
+        } = template
+        else {
+            panic!("DiffusionGemma should resolve external chat_template.jinja");
+        };
+        let out = render_jinja(
+            &source,
+            &bos_token,
+            &eos_token,
+            &[ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+            }],
+        )
+        .unwrap();
+        assert!(out.contains("<|turn>user"), "got: {out}");
+        assert!(out.contains("hi"), "got: {out}");
+        assert!(out.contains("<|turn>model"), "got: {out}");
     }
 }

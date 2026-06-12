@@ -54,10 +54,9 @@ Metal DiffusionGemma bridge:
   `BufferedDiffusionExecutor<MetalDiffusionGemmaModel>` over a host admission KV
   pool instead of the Qwen `MetalExecutor`. Prefix reuse is disabled and the
   scheduler is clamped to single-flight.
-- DiffusionGemma chat is fail-closed: the target tokenizer has
-  `chat_template=null`, so `/v1/completions` is licensed first while
-  `/v1/chat/completions` returns an explicit unsupported-template error instead
-  of silently using Qwen ChatML.
+- DiffusionGemma chat template loading handles the downloaded checkpoint layout:
+  `tokenizer_config.json` has `chat_template=null`, but `chat_template.jinja`
+  sits next to the tokenizer and is now resolved before falling back to ChatML.
 - `infer-vulkan`'s Gemma4 contract now pins plain-scale RMSNorm and the
   DiffusionGemma/Gemma4 MoE shape where dense MLP remains present and router /
   routed experts are additional work.
@@ -94,13 +93,15 @@ No benchmark was run because this is a new model bring-up path and the target
 checkpoint is not present in the local HF cache. Before any support level higher
 than pending-local-smoke, run `/v1/completions` against
 `mlx-community/diffusiongemma-26B-A4B-it-4bit` and record the prompt, generated
-text, denoise stats, memory guard line, and failure/retry details here or in a
-follow-up wins/errors entry. This entry does not cover unrelated DSv4 MTP dirty
-work that may be present in the local worktree.
+text, chat-template rendering, denoise stats, memory guard line, and
+failure/retry details here or in a follow-up wins/errors entry. This entry does
+not cover unrelated DSv4 MTP dirty work that may be present in the local
+worktree.
 
 ## Rule
 
 Block-diffusion models need a separate canvas denoise/commit loop and a separate
 backend model object. Do not bend the autoregressive Qwen executor into a
-DiffusionGemma loader; route it as its own `DiffusionBlockModel` and keep chat
-disabled until a verified prompt template exists.
+DiffusionGemma loader; route it as its own `DiffusionBlockModel`, and treat
+external `chat_template.jinja` files as first-class checkpoint templates rather
+than falling back to Qwen ChatML.

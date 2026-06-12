@@ -783,11 +783,7 @@ mod backend {
             "--kv-ssd-path: DiffusionGemma Metal owns no page-addressable KV tier store"
         );
 
-        let tokenizer = OpenAiTokenizer::from_model_dir_without_chat(
-            resolved,
-            "DiffusionGemma checkpoint tokenizer_config.json has chat_template=null; \
-             use /v1/completions until a verified DiffusionGemma chat renderer is added",
-        )?;
+        let tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
         let model_id = crate::serve_engine::model_id_from_path(model_path);
         let model_source = resolved.to_string_lossy().to_string();
         let mut scheduler = config.scheduler_config();
