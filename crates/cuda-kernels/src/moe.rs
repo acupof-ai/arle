@@ -1385,10 +1385,10 @@ pub fn device_vec_ptr(vec: &DeviceVec, ctx: &DeviceContext) -> RawDevicePtr<bf16
 
 /// Grouped FP8 w8a16 GEMV over per-expert weight/scale pointer tables:
 /// for packed row `offsets[e] + i` (i < counts[e], device-resident), computes
-/// `out[row] = dequant(weights[e]) @ input[row]`. Scales are UE8M0 bytes over
+/// `out[row] = dequant(weights[e]) @ input[row]`. Scales are f32 over
 /// `[scale_rows, scale_cols]` blocks of the `[n, k]` weight. `expert_indices`
 /// NULL ⇒ identity (grid z spans all `num_experts`; inactive groups exit on
-/// `counts`). Wraps [`ffi::dsv4_fp8_grouped_gemv_batch_cuda`].
+/// `counts`). Wraps [`ffi::dsv4_fp8_grouped_gemv_batch_f32s_cuda`].
 ///
 /// # Safety
 /// All pointers/tables valid on `stream`; tables hold `num_experts` entries.
@@ -1409,7 +1409,7 @@ pub unsafe fn dsv4_fp8_grouped_gemv_batch(
     stream: CUstream,
 ) -> Result<()> {
     unsafe {
-        ffi::dsv4_fp8_grouped_gemv_batch_cuda(
+        ffi::dsv4_fp8_grouped_gemv_batch_f32s_cuda(
             weight_ptrs.as_ptr(),
             scale_ptrs.as_ptr(),
             input.as_ptr() as *const Half,
@@ -1456,7 +1456,7 @@ pub unsafe fn dsv4_fp8_grouped_gemv_pair_batch(
     stream: CUstream,
 ) -> Result<()> {
     unsafe {
-        ffi::dsv4_fp8_grouped_gemv_pair_batch_cuda(
+        ffi::dsv4_fp8_grouped_gemv_pair_batch_f32s_cuda(
             weight_a_ptrs.as_ptr(),
             scale_a_ptrs.as_ptr(),
             weight_b_ptrs.as_ptr(),
