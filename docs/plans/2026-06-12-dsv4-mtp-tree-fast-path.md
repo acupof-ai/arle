@@ -217,6 +217,31 @@ independent — build alongside P1.**
 - [ ] d2k2 / d3k2 / d2k3 / d3k3 on the EOS-clean essay workload ×3,
       same-binary vs no-spec 32.52; license the best config or kill.
 
+## Comm plan (2026-06-12 evening — ckl's 1-3, ordered by dependency)
+
+Anatomy: 129 latency-bound 8 KB collectives/token (86 AR = 2/layer
+attn+MoE; 43 AG = FlashMLA Q gather/layer); measured NCCL time is mostly
+rank-arrival spin (ranks 2/4 late; med 48 µs vs avg 69-78 µs). Protocol swaps
+don't help (the in-tree one-shot AR/AG was already judged wash: "decode wall
+is rank-skew-bound, not protocol-bound" — args.rs comm-backend note).
+
+1. **NUMA pinning (landed `4bee3009`, default ON)** — kills the placement
+   lottery feeding the skew. A/B FIRST: it changes the comm floor every
+   later decision prices against.
+2+3. **Attention de-TP (one item)**: the attn-side AR cannot be deferred
+   through the FFN RMSNorm (nonlinear), so "merge the two ARs" and
+   "DP-attention" collapse into the same move — replicate the attention
+   weights (wq_b/wo_a/wo_b full-width per rank: ~tens of MB) and compute
+   attention REDUNDANTLY on every rank at B=1: identical inputs (the MoE AR
+   output is rank-identical) ⇒ identical outputs, NO attn AR, NO Q AG —
+   43 AR + 43 AG removed, leaving 43 MoE ARs. Cost: full-width attention
+   linears + FlashMLA per rank (~+4-5 ms compute) vs ~−5-7 ms comm+skew at
+   today's floor. DECISION GATE: re-price after (1) lands — if pinning
+   collapses the skew, the trade may invert. SGLang's equivalents: DP
+   attention (MLA), DeepEP all-to-all MoE, EPLB expert rebalancing + TBO
+   (both batch-lane levers, not B=1: one token activates 8 experts, so
+   placement imbalance is a c≥2 phenomenon).
+
 ## Validation ladder (one pass at the end, plus one early gate)
 
 1. After P1: needle 3000,6000 ×3 @0.5 — chain (fallback lane untouched) AND
