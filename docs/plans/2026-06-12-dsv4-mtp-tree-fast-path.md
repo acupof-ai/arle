@@ -37,19 +37,39 @@ Counting forwards is the whole game:
 Conclusion: **all three pillars are load-bearing**. Building any one alone
 produces another kill — that is the "half-step" trap this doc forbids.
 
-## P0 — accept-rate root cause (the multiplier, probe FIRST)
+## P0 — accept-rate root cause: RESOLVED 2026-06-12 (probe `2a7c5514`)
 
-Measured first-draft accept: 36% on the ab_decode prompt (a trivially
-predictable list continuation), 60% on the needle window. A healthy nextn MTP
-head sits 60–80%+. If 36% is a defect (position off-by-one in `mtp_forward`,
-h_prev mismatch, digit tokenization), fixing it moves A more than any kernel
-work; if it is genuinely the head's quality on that text, the budget rows
-above stand.
+Verdict: **the head is healthy; the workload was the artifact.** 472
+(target, draft) pairs from an ab_decode run under `ARLE_DSV4_MTP_PROBE=1`:
 
-Probe (cheap, read-only): log `(draft, target_argmax)` pairs per step for one
-ab_decode run (the old `ARLE_DSV4_MTP_DRAFT_DUMP` env is dead code — re-add a
-guarded eprintln in `spec_step`), eyeball 50 pairs: are rejects near-misses
-(quality) or nonsense (bug)? Decide before building P2 depth.
+- On the ~7 meaningful tokens per request the draft hits **6/7 ≈ 86%**
+  ('Hello'→'!', 'The'→' capital', ' of'→' France' …; the one miss is
+  ' Paris' vs the target's markdown ' **' — a formatting fork, not nonsense).
+- The remaining ~465 samples are POST-EOS degenerate cycling ('2 3 . EOS
+  BOS'): the answer EOSes at token ~7 but generation runs to max_tokens.
+  Root cause of THAT: the CUDA executor never overrides the seam's
+  `model_stop_token_ids` (default empty; Metal overrides it), so DSv4 serves
+  with no model stop set and EVERY request pads to max_tokens with garbage.
+  Separate serving bug — fix is one trait-method override + eos_token_id
+  plumbing through deepseek-spec (which has no eos field today).
+
+Consequences:
+- Real-text A is far higher than today's measurements: chain ≈ 1.86, tree
+  topk2 d2 ≈ 2.4–2.6 (per-level ~0.86) — the "prize row" economics are real:
+  P1+P2 at ~52 ms ⇒ ~45–50 tok/s (+40% over no-spec).
+- ALL of today's A/tok-s numbers were measured on the degenerate-tail
+  workload. The final license-or-kill MUST use an EOS-honoring serve (after
+  the stop fix) or prompts that genuinely consume the token budget.
+- Degenerate (looping) text is not a valid spec-decode test load — the
+  standing rule, re-confirmed.
+
+## Coordination note (2026-06-12)
+
+`attention.rs` (+318) and `executor.rs` (+109) carry ckl's in-flight
+quant-KV-dispatch WIP. P1's `csa_select` pin, the prefill-path reuse, and the
+EOS-stop fix all edit those files — landing them now would sweep his hunks
+(file-level commits). P1 implementation waits for that WIP to land;
+`dsv4.rs`/`spec_decode.rs`/csrc remain free.
 
 ## P1 — batched verify on the EXISTING sparse kernel
 
