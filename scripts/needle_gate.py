@@ -1,12 +1,16 @@
-"""#56 long-ctx closeout matrix: needle ladder x same-config-repeat control.
+"""Model/backend-neutral correctness gate: needle ladder × same-config-repeat
+control (generalized from dsv4_needle_gate.py per #68).
 
-Usage: python3 _pod_needle_matrix.py [lengths_csv] [runs] [depth]
+Usage: python3 needle_gate.py [lengths_csv] [runs] [depth]
   lengths_csv  approx prompt-token targets (default spans the 241 boundary)
   runs         same-config repeats per length (default 3)
   depth        needle depth 0.0=start .. 1.0=end (default 0.0)
 
-Env: PORT (default 18189), MODEL (default "x"), CHAT=1 to route through
-/v1/chat/completions (proper chat template) instead of raw /v1/completions.
+Routing (the gate is model-neutral via the checkpoint Jinja chat template, #66):
+  default      /v1/chat/completions — correct for any model, no per-model shim
+  RAW=1        raw /v1/completions (+ TEMPLATE=dsv4 for the legacy DSv4 shim)
+
+Env: PORT (default 18189), MODEL (default "x").
 
 Prints one line per run with the raw decoded completion, then a per-length
 summary line: exact/partial/miss counts + deterministic? (all runs identical).
@@ -84,7 +88,7 @@ def one_chat(prompt):
     return out, pt, dt
 
 
-one = one_chat if os.environ.get("CHAT") == "1" else one_completion
+one = one_completion if os.environ.get("RAW") == "1" else one_chat
 
 
 def classify(out):
