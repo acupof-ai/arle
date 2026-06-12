@@ -36,6 +36,22 @@ impl MetalKvCacheDtype {
             Self::Int8 => "int8",
         }
     }
+
+    /// Resolve a backend-neutral requested dtype against the Metal support
+    /// matrix. `Auto` resolves to INT8 (the Metal default after the int8 gate);
+    /// `Fp8`/`Tq4` are CUDA-only paged-KV quant modes and fail loud here rather
+    /// than silently downgrading.
+    pub fn resolve(requested: infer_seam::KvCacheDtype) -> anyhow::Result<Self> {
+        use infer_seam::KvCacheDtype;
+        match requested {
+            KvCacheDtype::Auto | KvCacheDtype::Int8 => Ok(Self::Int8),
+            KvCacheDtype::Bf16 => Ok(Self::Bf16),
+            other => anyhow::bail!(
+                "Metal KV cache supports bf16/int8; requested {} is CUDA-only",
+                other.label()
+            ),
+        }
+    }
 }
 
 /// Cross-step decode pipelining (env-gated, default ON since
@@ -1251,6 +1267,29 @@ mod tests {
     use super::*;
     use crate::kv_pool::MetalKvPool;
     use infer_plan::{DecodeRow, ForwardMode, PrefillRow};
+
+    // The whole point of seam-level dispatch (#68): a backend resolves the
+    // requested dtype against its OWN support matrix and fails loud on an
+    // unsupported request rather than silently downgrading. Metal supports
+    // bf16/int8 (Auto → int8); the CUDA-only fp8/tq4 modes must error here.
+    #[test]
+    fn resolve_metal_support_matrix() {
+        use infer_seam::KvCacheDtype;
+        assert_eq!(
+            MetalKvCacheDtype::resolve(KvCacheDtype::Auto).unwrap(),
+            MetalKvCacheDtype::Int8
+        );
+        assert_eq!(
+            MetalKvCacheDtype::resolve(KvCacheDtype::Int8).unwrap(),
+            MetalKvCacheDtype::Int8
+        );
+        assert_eq!(
+            MetalKvCacheDtype::resolve(KvCacheDtype::Bf16).unwrap(),
+            MetalKvCacheDtype::Bf16
+        );
+        assert!(MetalKvCacheDtype::resolve(KvCacheDtype::Fp8).is_err());
+        assert!(MetalKvCacheDtype::resolve(KvCacheDtype::Tq4).is_err());
+    }
 
     // Regression guard for the "K/V slice token range [..] exceeds shape=[..]"
     // crash: a long generation outgrows the prefill reservation, so `kv_flat`
