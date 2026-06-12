@@ -427,8 +427,11 @@ FlashMLA decode + fused-wqkv correctness LICENSED — default flips still need
 a wall-clock perf license per the bench spec; pooled/contig-MoE flip KILLED
 (-24%). Qwen dense KV-dtype matrix **resolved 2026-06-12 (#68)**: seam-level
 kv-dtype dispatch landed (`--kv-cache-dtype`, default bf16 unchanged);
-INT8/FP8 correctness LICENSED (needle exact 15/15 DET = BF16 envelope) but
-decode −77% at B=1 — opt-in only, no default flip without a perf license;
+INT8/FP8 correctness LICENSED (needle exact 15/15 DET = BF16 envelope);
+the initial decode −77% at B=1 was an uncached per-layer-per-step
+`cudaGetDeviceProperties` in the quant decode shim — fixed same day
+(static SM-count cache), post-fix −27% vs bf16+graph / −7% vs eager bf16
+— opt-in only, no default flip without a perf license;
 TQ4 DEFERRED (TurboQuant page_size=1 vs TileLang PAGE_SIZE=16). Verdicts:
 [wins entry](docs/experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md).
 
