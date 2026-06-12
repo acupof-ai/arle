@@ -98,6 +98,26 @@ size_t decode_attention_int8_workspace_bytes(
     return out_bytes + m_bytes + l_bytes;
 }
 
+// SM count queried once and cached: `cudaGetDeviceProperties` is the full
+// ~100-attribute query (~220 us/call measured, nsys cuda_api_sum 2026-06-12)
+// and `choose_decode_num_splits` runs per layer per decode step — uncached it
+// alone cost ~6.1 ms/token on Qwen3-0.6B (61% of the quant decode step).
+// Single static, not per-device: each serve process pins one device. Mirrors
+// `device_num_sm()` in arle_fa3_shim.cu.
+static int cached_multiprocessor_count(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return -1;
+        if (cudaDeviceGetAttribute(&cached, cudaDevAttrMultiProcessorCount, dev)
+                != cudaSuccess) {
+            cached = -1;
+        }
+    }
+    return cached;
+}
+
 static int choose_decode_num_splits(
     int batch_size,
     int num_qo_heads,
@@ -107,13 +127,8 @@ static int choose_decode_num_splits(
 {
     if (total_q_heads <= 0 || workspace_bytes == 0) return 1;
 
-    int device = 0;
-    cudaError_t err = cudaGetDevice(&device);
-    if (err != cudaSuccess) return 1;
-
-    cudaDeviceProp props;
-    err = cudaGetDeviceProperties(&props, device);
-    if (err != cudaSuccess || props.multiProcessorCount <= 0) return 1;
+    int sm_count = cached_multiprocessor_count();
+    if (sm_count <= 0) return 1;
 
     // 32 blocks/SM saturates the kMaxSplits=32 cap on L4 (SM89, 58 SMs) for
     // Qwen3.5-4B. num_splits=8 (old kTargetBlocksPerSm=4) left us at ~14% warp
@@ -124,7 +139,7 @@ static int choose_decode_num_splits(
     constexpr int kTargetBlocksPerSm = 32;
     constexpr int kMaxSplits = 32;
 
-    int target_blocks = props.multiProcessorCount * kTargetBlocksPerSm;
+    int target_blocks = sm_count * kTargetBlocksPerSm;
     int desired_splits = (target_blocks + total_q_heads - 1) / total_q_heads;
     if (desired_splits < 1) desired_splits = 1;
     if (desired_splits > kMaxSplits) desired_splits = kMaxSplits;
