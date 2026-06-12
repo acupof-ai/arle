@@ -85,6 +85,28 @@ current hand decode-band path).
   (`input + route*K + feature`), and the validated hand pack kernel
   `dsv4_pack_local_experts_kernel` (`hidden[token*hidden_dim + col]`). Internal
   caches (cache1/2/3) and the repacked weights were already correct.
+- **moe_align expert-id +1 shift (caught + fixed in review, codex P1):** the
+  vendored `moe_align_block_size` kernel reindexes `expert_id = topk_ids[i] + 1`
+  (a dummy expert-0 slot; the E real experts occupy `[1, E]`). The device code is
+  byte-equal to upstream — but upstream is correct **only because its python
+  caller pads the count**: `sgl_moe_align_block_size(topk_ids, num_experts + 1,
+  …)` with `cumsum_buffer = empty(num_experts + 2)`. The first cut of our Rust
+  caller passed the bare `E` (256) and sized cumsum `E+1`. With `num_experts=E`
+  the kernel's `shared_counts[E]` (where the highest expert 255's count lands,
+  since `255+1=256`) aliases `prefix[0]` — never zeroed, never read into the scan
+  → **expert 255 silently dropped**, every token routed to it produces zero MoE
+  output. Resolved by tracing the python wrapper
+  (`moe_runner/triton_utils/moe_align_block_size.py:79`): pass `align_experts =
+  num_experts + 1` to the kernel, size `fm_cumsum` to `num_experts + 2`, and
+  compute `max_padded` over `num_experts + 1` block-groups. The `.cu` header now
+  documents the load-bearing `+1` convention so the next caller can't re-strip it.
+- **top_k==8 baked-cubin guard (caught + fixed in review, codex P2):** the GEMM1
+  cubin bakes `top_k=8` (A's row offset = `offs_token // top_k`); the fused
+  dispatch branch previously ran for any greedy MoE config. Qwen3.6-A3B *is*
+  top_k=8 so the intended model was fine, but a model with a different top_k
+  would silently mis-index activation rows. Added an `ensure!(topk == 8, …)`
+  loud-fail alongside the existing `ep_size==1` / `routed_scaling_factor==1.0`
+  cubin-bake guards.
 - **Weight layout:** stacked per-expert (NOT grouped), gate-then-up (NOT
   interleaved), down verbatim. Repack = pure D2D gather-concat, +1.5 GB.
 - **topk_ids/topk_weights tap:** step-2 `dsv4_route` output (token-major
@@ -142,6 +164,17 @@ gate first; vendor triton source UNMODIFIED (every quant branch kept, compile on
 the bf16 cubin); enumerate EVERY scratch slot with a write-before-read proof and a
 no-per-step-alloc guarantee before claiming the lane is wired. Perf license comes
 from the pod wall-clock A/B, never the source survey.
+
+**Byte-equal device code ≠ ported contract.** A vendored `.cu` whose kernel
+body is identical to upstream can still be wrong if the *host invocation
+convention* didn't come with it. `moe_align`'s `+1` expert shift is correct only
+because upstream's python caller passes `num_experts + 1` and sizes
+`cumsum_buffer = num_experts + 2`; the kernel device code carries no trace of
+that requirement. When porting a kernel, port its caller's argument derivation
+(padding, sizing, shift conventions) as a first-class part of the contract, and
+document the load-bearing convention in the vendored file's header so a future
+caller can't silently re-strip it. Diff the *python/host wrapper*, not just the
+`.cu`.
 
 **A transposed activation stride is a c=1-invisible bug.** When a new GEMM lane
 takes the per-token (M) stride as a runtime arg, derive it from a *validated*
