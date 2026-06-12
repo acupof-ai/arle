@@ -1383,6 +1383,103 @@ pub fn device_vec_ptr(vec: &DeviceVec, ctx: &DeviceContext) -> RawDevicePtr<bf16
     crate::tensor::cache_ptr(&vec.data, ctx)
 }
 
+/// Grouped FP8 w8a16 GEMV over per-expert weight/scale pointer tables:
+/// for packed row `offsets[e] + i` (i < counts[e], device-resident), computes
+/// `out[row] = dequant(weights[e]) @ input[row]`. Scales are UE8M0 bytes over
+/// `[scale_rows, scale_cols]` blocks of the `[n, k]` weight. `expert_indices`
+/// NULL ⇒ identity (grid z spans all `num_experts`; inactive groups exit on
+/// `counts`). Wraps [`ffi::dsv4_fp8_grouped_gemv_batch_cuda`].
+///
+/// # Safety
+/// All pointers/tables valid on `stream`; tables hold `num_experts` entries.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_fp8_grouped_gemv_batch(
+    weight_ptrs: RawDevicePtr<u64>,
+    scale_ptrs: RawDevicePtr<u64>,
+    input: RawDevicePtr<bf16>,
+    output: RawDevicePtr<bf16>,
+    offsets: RawDevicePtr<i32>,
+    counts: RawDevicePtr<i32>,
+    num_experts: usize,
+    max_count: usize,
+    n: usize,
+    k: usize,
+    scale_rows: usize,
+    scale_cols: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_fp8_grouped_gemv_batch_cuda(
+            weight_ptrs.as_ptr(),
+            scale_ptrs.as_ptr(),
+            input.as_ptr() as *const Half,
+            output.as_mut_ptr() as *mut Half,
+            offsets.as_ptr(),
+            counts.as_ptr(),
+            std::ptr::null(),
+            i32::try_from(num_experts)?,
+            i32::try_from(max_count)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(scale_rows)?,
+            i32::try_from(scale_cols)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Pair variant of [`dsv4_fp8_grouped_gemv_batch`]: two weight/scale tables
+/// (gate + up halves of the fused w13) computed from ONE pass over the input
+/// row — halves the activation reads for the SwiGLU pair.
+///
+/// # Safety
+/// See [`dsv4_fp8_grouped_gemv_batch`]; both tables share `[n, k]` geometry.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_fp8_grouped_gemv_pair_batch(
+    weight_a_ptrs: RawDevicePtr<u64>,
+    scale_a_ptrs: RawDevicePtr<u64>,
+    weight_b_ptrs: RawDevicePtr<u64>,
+    scale_b_ptrs: RawDevicePtr<u64>,
+    input: RawDevicePtr<bf16>,
+    output_a: RawDevicePtr<bf16>,
+    output_b: RawDevicePtr<bf16>,
+    offsets: RawDevicePtr<i32>,
+    counts: RawDevicePtr<i32>,
+    num_experts: usize,
+    max_count: usize,
+    n: usize,
+    k: usize,
+    scale_rows: usize,
+    scale_cols: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_fp8_grouped_gemv_pair_batch_cuda(
+            weight_a_ptrs.as_ptr(),
+            scale_a_ptrs.as_ptr(),
+            weight_b_ptrs.as_ptr(),
+            scale_b_ptrs.as_ptr(),
+            input.as_ptr() as *const Half,
+            output_a.as_mut_ptr() as *mut Half,
+            output_b.as_mut_ptr() as *mut Half,
+            offsets.as_ptr(),
+            counts.as_ptr(),
+            std::ptr::null(),
+            i32::try_from(num_experts)?,
+            i32::try_from(max_count)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(scale_rows)?,
+            i32::try_from(scale_cols)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 // ============================================================================
 // SGLang `fused_moe` decode lane (U3, opt-in `ARLE_QWEN35_MOE_FUSED_SGLANG`).
 // Native `moe_align_block_size` + the four triton AOT cubins (GEMM1 / act /
