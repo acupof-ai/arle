@@ -673,6 +673,7 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         sfa_aligned_m: i32,
+        mk_align: i32,
         stream: CUstream,
     ) -> CUresult;
 

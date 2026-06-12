@@ -46,6 +46,7 @@ extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
     int,
     int,
     int,
+    int,
     CUstream) {
   return CUDA_ERROR_NOT_SUPPORTED;
 }

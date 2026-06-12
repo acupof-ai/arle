@@ -103,6 +103,12 @@ struct GemmDesc {
   int expected_n;
   int expected_k;
   int expected_num_groups;
+  // Upper bound on block_m for MGroupedContiguous: the scheduler resolves the
+  // B group once per BLOCK_M tile from m_indices[tile_start], so block_m must
+  // not exceed the caller's per-group row alignment. 128 (the legacy contiguous
+  // alignment) keeps every pre-existing call site unchanged; the DSv4 decode
+  // band passes 64 so groups can be packed 64-aligned (half the pad rows).
+  int max_block_m = 128;
 };
 
 struct LayoutInfo {
@@ -615,6 +621,7 @@ std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
       if (desc.num_sms % (cluster_m * cluster_n) != 0) continue;
       for (int block_m : {64, 128}) {
         if (conservative && block_m != 64) continue;
+        if (block_m > desc.max_block_m) continue;
         for (int block_n = step; block_n <= 192; block_n += step) {
           if (block_n > block_k) {
             const int diff = block_n - block_k;
@@ -1447,6 +1454,7 @@ CUresult launch_sm90_grouped_contiguous(
     int n,
     int k,
     int sfa_aligned_m,
+    int mk_align,
     CUstream stream) {
   cudaDeviceProp prop{};
   CUresult prop_err = current_device_prop(&prop);
@@ -1468,6 +1476,7 @@ CUresult launch_sm90_grouped_contiguous(
       n,
       k,
       1,
+      mk_align,
   };
   const auto config = get_best_config(desc);
   const auto code = generate_kernel_code(desc, config, "MGroupedContiguous");
@@ -1774,6 +1783,7 @@ extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
     int n,
     int k,
     int sfa_aligned_m,
+    int mk_align,
     CUstream stream) {
   if (a == nullptr || sfa == nullptr || b == nullptr || sfb == nullptr ||
       d == nullptr || m_indices == nullptr || stream == nullptr || num_groups <= 0 ||
@@ -1784,10 +1794,17 @@ extern "C" CUresult dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
       sfa_aligned_m < get_tma_aligned_size(m, sizeof(float))) {
     return CUDA_ERROR_INVALID_VALUE;
   }
+  // mk_align caps the block_m candidates (see GemmDesc.max_block_m) so an
+  // output tile can never span two mk_align-aligned groups. The per-group row
+  // alignment itself stays the caller's packing contract, as before.
+  if (mk_align != 64 && mk_align != 128) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
 
   try {
     return launch_sm90_grouped_contiguous(
-        a, sfa, b, sfb, d, m_indices, num_groups, m, n, k, sfa_aligned_m, stream);
+        a, sfa, b, sfb, d, m_indices, num_groups, m, n, k, sfa_aligned_m, mk_align,
+        stream);
   } catch (const std::exception& err) {
     std::fprintf(stderr, "DeepGEMM native contiguous bridge failed: %s\n", err.what());
     return CUDA_ERROR_UNKNOWN;
