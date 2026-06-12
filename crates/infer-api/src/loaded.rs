@@ -806,6 +806,13 @@ mod backend {
         config: &EngineLoadConfig,
     ) -> Result<infer_core::Engine<CudaExecutor, CudaKvPool>> {
         let kind = detect_cuda_model_kind(model_path)?;
+        // Resolve the requested KV dtype against the CUDA support matrix at the
+        // engine boundary, mirroring the Metal path's `MetalKvCacheDtype::resolve`
+        // (#68 T2). Today this only admits BF16 and fails loud on the paged
+        // quant modes (int8/fp8/tq4) pending #68 T3; the executor constructors do
+        // not consume the resolved dtype yet, so the result is the validation,
+        // not a threaded value — that lands with T3.
+        infer_cuda::CudaKvCacheDtype::resolve(config.kv_cache_dtype)?;
         let mut scheduler = config.scheduler_config();
         // Cross-request prompt-prefix reuse (the host radix cache) is only sound
         // when a cached prefix's KV can be re-attached to a new slot and read

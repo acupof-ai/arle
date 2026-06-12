@@ -330,17 +330,37 @@ fn resolve_engine_config(
         ServeKvCacheDtypeArg::Auto => KvCacheDtype::Auto,
         ServeKvCacheDtypeArg::Bf16 => KvCacheDtype::Bf16,
         ServeKvCacheDtypeArg::Int8 => KvCacheDtype::Int8,
+        ServeKvCacheDtypeArg::Fp8 => KvCacheDtype::Fp8,
+        ServeKvCacheDtypeArg::Tq4 => KvCacheDtype::Tq4,
     };
     let mut config = EngineLoadConfig {
         kv_cache_dtype,
         ..EngineLoadConfig::default()
     };
 
-    if config.kv_cache_dtype == KvCacheDtype::Int8 && backend != ServeBackend::Metal {
-        return Err(format!(
-            "--kv-cache-dtype int8 is currently implemented for the Metal backend; active backend is {}",
-            backend.label()
-        ));
+    // Quant KV dtypes route to the backend that implements them. Reject the
+    // mismatched combos at the CLI boundary; the per-backend `*KvCacheDtype::
+    // resolve` is the fine authority for "supported vs pending #68 T3" on the
+    // matching backend (CUDA fp8/tq4 flow through to it and fail loud there
+    // until their paged path lands).
+    match config.kv_cache_dtype {
+        // INT8 is the Metal int8 path today; CUDA int8 lands with #68 T3 (this
+        // arm then widens to also admit the CUDA backend).
+        KvCacheDtype::Int8 if backend != ServeBackend::Metal => {
+            return Err(format!(
+                "--kv-cache-dtype int8 is currently implemented for the Metal backend; active backend is {}",
+                backend.label()
+            ));
+        }
+        // FP8 / TQ4 are CUDA-only paged quant modes.
+        KvCacheDtype::Fp8 | KvCacheDtype::Tq4 if backend != ServeBackend::Cuda => {
+            return Err(format!(
+                "--kv-cache-dtype {} is a CUDA-only paged quant mode; active backend is {}",
+                config.kv_cache_dtype.label(),
+                backend.label()
+            ));
+        }
+        _ => {}
     }
 
     if serve_args.low_impact {
@@ -628,6 +648,29 @@ mod tests {
         ]);
         let err = resolve_config(&args, &serve).expect_err("non-metal int8 rejected");
         assert!(err.contains("--kv-cache-dtype int8"), "got: {err}");
+    }
+
+    #[test]
+    fn kv_cache_dtype_fp8_rejects_non_cuda_backend() {
+        // FP8/TQ4 are CUDA-only paged quant modes; on any non-CUDA backend the
+        // CLI guard must reject early (symmetric to the int8/Metal guard). Runs
+        // on the metal/cpu lanes; skips on CUDA (where fp8 flows through to the
+        // CUDA resolve's "pending #68 T3" bail instead).
+        if skip_if_no_backend() || compiled_backend_flag() == "cuda" {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--kv-cache-dtype",
+            "fp8",
+        ]);
+        let err = resolve_config(&args, &serve).expect_err("non-cuda fp8 rejected");
+        assert!(err.contains("CUDA-only paged quant mode"), "got: {err}");
     }
 
     #[test]

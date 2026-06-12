@@ -56,6 +56,51 @@ fn decode_graph_enabled() -> bool {
     }
 }
 
+/// CUDA KV-cache storage dtype, resolved from the backend-neutral
+/// [`infer_seam::KvCacheDtype`] request against the CUDA support matrix at engine
+/// construction. Mirrors `infer_metal::MetalKvCacheDtype`: the seam carries the
+/// *request*, each backend resolves it against what it can actually honor and
+/// fails loud rather than silently downgrading.
+///
+/// Today the CUDA path resolves exactly one dtype (BF16) — the contiguous
+/// per-layer caches the Qwen executors run. The paged quant-KV modes
+/// (`Int8`/`Fp8`/`Tq4`) are wired one at a time under #68 T3; until a mode's
+/// kernel path lands, [`CudaKvCacheDtype::resolve`] bails on it. New variants are
+/// added here as T3 lands each mode — the enum trails the real, validated paths,
+/// it does not pre-declare unimplemented ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CudaKvCacheDtype {
+    /// Native BF16 per-layer caches (the only CUDA KV dtype wired today).
+    #[default]
+    Bf16,
+}
+
+impl CudaKvCacheDtype {
+    /// Stable lowercase label for logs and gate report lines.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+        }
+    }
+
+    /// Resolve a backend-neutral requested dtype against the CUDA support matrix.
+    /// `Auto`/`Bf16` → BF16; the paged quant modes (`Int8`/`Fp8`/`Tq4`) fail loud
+    /// with a "pending #68 T3" message until their kernel path is wired and
+    /// gated, rather than silently falling back to BF16.
+    pub fn resolve(requested: infer_seam::KvCacheDtype) -> Result<Self> {
+        use infer_seam::KvCacheDtype;
+        match requested {
+            KvCacheDtype::Auto | KvCacheDtype::Bf16 => Ok(Self::Bf16),
+            other => anyhow::bail!(
+                "CUDA KV cache currently supports bf16; requested {} is the paged \
+                 quant-KV path, not yet wired (#68 T3)",
+                other.label()
+            ),
+        }
+    }
+}
+
 /// The real cuda-kernels executor. Dense Qwen3 runs the paged continuous-batching
 /// path ([`QwenCudaExecutor`]); Qwen3.5/3.6 HYBRID MoE runs the gated-delta +
 /// periodic-full-attention forward ([`Qwen35CudaExecutor`]), which owns its KV
@@ -2670,4 +2715,37 @@ fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64
     };
     println!("sample_topk variant={variant} position={position} top={best:?} margin={margin:.6}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CudaKvCacheDtype;
+    use infer_seam::KvCacheDtype;
+
+    #[test]
+    fn resolve_cuda_support_matrix() {
+        // Auto + explicit Bf16 resolve to the one wired CUDA dtype.
+        assert_eq!(
+            CudaKvCacheDtype::resolve(KvCacheDtype::Auto).unwrap(),
+            CudaKvCacheDtype::Bf16
+        );
+        assert_eq!(
+            CudaKvCacheDtype::resolve(KvCacheDtype::Bf16).unwrap(),
+            CudaKvCacheDtype::Bf16
+        );
+        // The paged quant-KV modes fail loud (pending #68 T3), never silent-downgrade.
+        for unwired in [KvCacheDtype::Int8, KvCacheDtype::Fp8, KvCacheDtype::Tq4] {
+            let err = CudaKvCacheDtype::resolve(unwired)
+                .expect_err("quant KV dtype must bail until its T3 path lands");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(unwired.label()),
+                "error names the dtype: {msg}"
+            );
+            assert!(
+                msg.contains("#68 T3"),
+                "error cites the wiring ticket: {msg}"
+            );
+        }
+    }
 }
