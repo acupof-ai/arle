@@ -59,6 +59,20 @@ run repeats the exact invocation above plus `SERVE_FLAGS="--kv-cache-dtype <dt>"
 No perf delta claimed vs a prior baseline — there is none: this path never
 completed a single request on H20 before. The entry IS the baseline.
 
+## Killed hypothesis: "warmup runs decode with uninit PageMeta"
+
+The debug session flagged garbage meta (`q_indptr=[2092116076, 32591]`) at warmup —
+a probe artifact, not a bug. The garbage appears exactly at the second warmup pass
+(the graph CAPTURE): under stream capture the `R6_ATTN_DEBUG` dtoh probes are
+recorded into the graph instead of executed, so the dump prints the uninitialized
+*host* staging Vec. Three-way confirmation: (1) the first (eager) pass dumps clean
+meta through all 28 layers; (2) the capture-rejection error "112 host-side memcpy
+nodes" = 4 probe arrays × 28 layers exactly; (3) small Vecs show heap garbage while
+the 8192-entry `kv_indices` shows zeros — malloc-bin reuse vs fresh-mmap pages,
+possible only for a host-side buffer. `stage1_write` initializes device meta before
+every pass. **Rule:** a dtoh probe under stream capture reads its own uninit host
+buffer — never interpret probe output produced inside a capture region.
+
 ## Rule
 
 - A "route-around and defer" classification on a kernel bug is a standing tax —
