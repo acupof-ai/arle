@@ -68,8 +68,12 @@ pub fn gemv_kind(residency: Residency) -> Option<GemvKind> {
 /// `HyperConnection`/`HeadHyperConnection` cover both the mixer matrix
 /// (`*_fn`, 2-D) and the base/scale vectors, so the rank disambiguates;
 /// the embedding table only matmuls when it doubles as the tied lm_head.
-pub fn is_matmul_bearing(kind: crate::config::Dsv4TensorKind, ndims: usize, tied: bool) -> bool {
-    use crate::config::Dsv4TensorKind::*;
+pub fn is_matmul_bearing(
+    kind: infer_gguf::deepseek4::Dsv4TensorKind,
+    ndims: usize,
+    tied: bool,
+) -> bool {
+    use infer_gguf::deepseek4::Dsv4TensorKind::*;
     match kind {
         TokenEmbedding => tied,
         OutputHead | AttnQA | AttnQB | AttnKvLatent | AttnOutA | AttnOutB | CompressorKv
@@ -86,7 +90,14 @@ pub fn is_matmul_bearing(kind: crate::config::Dsv4TensorKind, ndims: usize, tied
 /// (e.g. f32 router gate in a community GGUF) is a clear load error, not a
 /// silent garbage forward. `ndims` comes from the GGUF tensor info.
 pub fn validate_matmul_residency<'a>(
-    tensors: impl Iterator<Item = (&'a str, crate::config::Dsv4TensorKind, Residency, usize)>,
+    tensors: impl Iterator<
+        Item = (
+            &'a str,
+            infer_gguf::deepseek4::Dsv4TensorKind,
+            Residency,
+            usize,
+        ),
+    >,
     tied_embeddings: bool,
 ) -> Result<()> {
     for (name, kind, residency, ndims) in tensors {
@@ -292,10 +303,10 @@ mod device {
     use hip_sys::{DeviceBuffer, Stream};
 
     use super::{GemvKind, LayerOffsets, gemv_kind, slot_layer_offsets};
-    use crate::config::classify_tensor;
-    use crate::gguf::{GgmlType, GgufFile};
     use crate::kv_pool::Dsv4SlotShape;
     use crate::loader::{Residency, ResidencyPlan, upload::DeviceTensor};
+    use infer_gguf::deepseek4::classify_tensor;
+    use infer_gguf::gguf::{GgmlType, GgufFile};
 
     fn check(code: i32, what: &str) -> Result<()> {
         if code == 0 {
@@ -430,14 +441,16 @@ mod device {
                 let role = classify_tensor(&info.name)?;
                 let Some(layer) = role.layer else { continue };
                 match role.kind {
-                    crate::config::Dsv4TensorKind::RouterBias => {
+                    infer_gguf::deepseek4::Dsv4TensorKind::RouterBias => {
                         let n = info.element_count() as usize;
-                        let bias =
-                            crate::dequant::dequantize_row_f32(gguf.tensor_data(&info.name)?, n)
-                                .context("router bias dequant")?;
+                        let bias = infer_gguf::dequant::dequantize_row_f32(
+                            gguf.tensor_data(&info.name)?,
+                            n,
+                        )
+                        .context("router bias dequant")?;
                         bias_by_layer.insert(layer, bias);
                     }
-                    crate::config::Dsv4TensorKind::RouterHashTable => {
+                    infer_gguf::deepseek4::Dsv4TensorKind::RouterHashTable => {
                         ensure!(
                             info.ggml_type == GgmlType::I64,
                             "tid2eid must be I64, got {:?}",
@@ -1401,8 +1414,8 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Dsv4TensorKind;
     use crate::loader::{KQuant, Residency};
+    use infer_gguf::deepseek4::Dsv4TensorKind;
 
     fn small_config() -> DeepSeekV4Config {
         crate::kv_pool::test_config()
