@@ -425,9 +425,12 @@ non-determinism). DSv4 lever verdicts
 ([wins entry](docs/experience/wins/2026-06-10-dsv4-lever-gate-license-or-kill.md)):
 FlashMLA decode + fused-wqkv correctness LICENSED — default flips still need
 a wall-clock perf license per the bench spec; pooled/contig-MoE flip KILLED
-(-24%). Qwen3.5's BF16/INT8/FP8/TQ4 matrix stays BLOCKED until the quant-KV
-dispatch is re-ported to the rewrite's paged-KV path — tracked in #68
-(model-generic by design: seam-level kv-dtype dispatch + neutral gate harness).
+(-24%). Qwen dense KV-dtype matrix **resolved 2026-06-12 (#68)**: seam-level
+kv-dtype dispatch landed (`--kv-cache-dtype`, default bf16 unchanged);
+INT8/FP8 correctness LICENSED (needle exact 15/15 DET = BF16 envelope) but
+decode −77% at B=1 — opt-in only, no default flip without a perf license;
+TQ4 DEFERRED (TurboQuant page_size=1 vs TileLang PAGE_SIZE=16). Verdicts:
+[wins entry](docs/experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md).
 
 Env vars: `TORCH_CUDA_ARCH_LIST` (SM override, PyTorch convention; alt `CMAKE_CUDA_ARCHITECTURES`),
 `INFER_TILELANG_PYTHON` (TileLang AOT Python), `INFER_TEST_MODEL_PATH`
