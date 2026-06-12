@@ -260,6 +260,60 @@ pub(crate) struct Dsv4SlotImage {
 /// drafts are the future axis this ceiling anticipates).
 const MAX_SPEC_DRAFT_DEPTH: usize = 8;
 
+/// Max draft-tree node count (root + drafts) the per-slot node scratch is sized
+/// for. Like [`MAX_SPEC_DRAFT_DEPTH`] this is a pre-allocation ceiling, not a
+/// runtime shape: the actual tree size is `depth`/`topk`-driven per step and the
+/// draft stops branching at this cap. 64 covers a complete topk=2 tree to depth
+/// 5 (63 nodes) or topk=4 to depth 2 (21); each scratch slot is one SW head-dim
+/// BF16 row + one FP8 ring token (~1.6 KiB/layer), so the ceiling is cheap.
+pub(crate) const MAX_SPEC_TREE_NODES: usize = 64;
+
+/// Row schedule for one speculative verify forward: how each flattened
+/// draft-tree row maps onto an absolute position, and which node-scratch ring
+/// fix-ups keep every row's sliding-window attention consistent with ITS
+/// ancestor path. Rows are BFS-ordered (all of depth d before depth d+1), so a
+/// row's window never covers a position a deeper earlier row destroyed, and a
+/// restored source row always ran (and saved) before its dependant.
+///
+/// The compressed/DSA side needs none of this: a frozen verify pins the
+/// selector to the committed compressed keys (P1-A), which are identical for
+/// every row. Only the SW ring is position-keyed (`pos % sliding_window`), so
+/// only sibling rows sharing a depth fight over a slot.
+///
+/// A linear chain is the degenerate case — strictly increasing positions, no
+/// fix-ups — and reproduces the validated per-token verify exactly.
+pub(crate) struct SpecVerifySchedule {
+    /// Per row: absolute position (`start_pos + node depth`).
+    pub(crate) positions: Vec<usize>,
+    /// Per row: source rows whose parked ring slots must be replayed BEFORE
+    /// this row's attention (ancestors whose slot a sibling overwrote).
+    pub(crate) restores: Vec<Vec<usize>>,
+    /// Per row: park this row's ring slot AFTER its attention (set exactly for
+    /// rows some later row restores).
+    pub(crate) saves: Vec<bool>,
+}
+
+impl SpecVerifySchedule {
+    /// The degenerate linear-chain schedule: row `r` at `start_pos + r`, no
+    /// fix-ups. Byte-identical attention behaviour to the validated chain path.
+    pub(crate) fn chain(n: usize, start_pos: usize) -> Self {
+        Self {
+            positions: (0..n).map(|r| start_pos + r).collect(),
+            restores: vec![Vec::new(); n],
+            saves: vec![false; n],
+        }
+    }
+
+    /// Whether this schedule is the plain chain the per-row no-scratch
+    /// fallback can express: row `r` at `start_pos + r`, zero fix-ups. Any
+    /// repeated/tree position or fix-up requires the batched per-row path.
+    pub(crate) fn is_chain(&self) -> bool {
+        self.restores.iter().all(|r| r.is_empty())
+            && self.saves.iter().all(|&s| !s)
+            && self.positions.windows(2).all(|w| w[1] == w[0] + 1)
+    }
+}
+
 pub(crate) struct Dsv4SlotState {
     attention: Vec<crate::attention::Dsv4LayerAttentionState>,
     /// Per-attention-layer K+1-slot snapshot of the speculative-verify SW + FP8
@@ -267,6 +321,13 @@ pub(crate) struct Dsv4SlotState {
     /// pre-allocated ONCE here (no per-step alloc). One entry per attention layer,
     /// index-aligned with `attention`.
     spec_rings: Option<Vec<crate::attention::Dsv4SpecRingSnapshot>>,
+    /// Per-attention-layer node scratch for spec TREE drafting/verify: parks
+    /// each tree node's just-written SW/FP8 ring slot so sibling overwrites can
+    /// be replayed per ancestor path ([`SpecVerifySchedule`]). Sized
+    /// [`MAX_SPEC_TREE_NODES`] slots; `Some` only when `model.spec_decode_on`.
+    /// Distinct lifetime from `spec_rings` (committed pre-verify contents vs
+    /// in-flight per-node speculative contents).
+    spec_nodes: Option<Vec<crate::attention::Dsv4SpecRingSnapshot>>,
     start_pos_device: CudaSlice<i32>,
     decode_graph: Option<Dsv4DecodeGraphScratch>,
     /// Pre-allocated NVSHMEM low-latency MoE scratch, reused across all layers +
@@ -570,6 +631,22 @@ impl Dsv4SlotState {
         } else {
             None
         };
+        // Spec-tree node scratch: same per-slot shapes, sized by node COUNT
+        // (the snapshot constructor allocates `arg+1` slots).
+        let spec_nodes = if model.spec_decode_on {
+            let mut nodes = Vec::with_capacity(attention.len());
+            for state in &attention {
+                nodes.push(state.alloc_spec_ring_snapshot(
+                    &model.ctx,
+                    &model.config,
+                    &model.kv_arena,
+                    MAX_SPEC_TREE_NODES - 1,
+                )?);
+            }
+            Some(nodes)
+        } else {
+            None
+        };
         let start_pos_device = model
             .ctx
             .stream
@@ -593,6 +670,7 @@ impl Dsv4SlotState {
         Ok(Self {
             attention,
             spec_rings,
+            spec_nodes,
             start_pos_device,
             decode_graph: None,
             #[cfg(feature = "deepep")]
@@ -656,6 +734,56 @@ impl Dsv4SlotState {
             state.restore_spec_ring_tail(ctx, pool, snap, start_pos, accepted_n, depth)?;
         }
         Ok(())
+    }
+
+    /// Park ONE layer's ring slot for tree node `node_idx` (just written at
+    /// `abs_pos`) into the node scratch. Used by the MTP draft loop, which only
+    /// writes the frozen target layer; the verify forward does the same inline
+    /// per layer. Errors when spec decode is off (callers are spec-only).
+    pub(crate) fn spec_node_save(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        layer_idx: usize,
+        node_idx: usize,
+        abs_pos: usize,
+    ) -> Result<()> {
+        let snaps = self
+            .spec_nodes
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 spec-tree node scratch missing (spec decode off?)"))?;
+        let pool = kv_adapter.layer_mut(layer_idx)?;
+        self.attention[layer_idx].save_spec_node_slot(
+            ctx,
+            pool,
+            &mut snaps[layer_idx],
+            node_idx,
+            abs_pos,
+        )
+    }
+
+    /// Replay ONE layer's parked ring slot for tree node `node_idx` back to the
+    /// live ring at `abs_pos`. Counterpart of [`Self::spec_node_save`].
+    pub(crate) fn spec_node_restore(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        layer_idx: usize,
+        node_idx: usize,
+        abs_pos: usize,
+    ) -> Result<()> {
+        let snaps = self
+            .spec_nodes
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 spec-tree node scratch missing (spec decode off?)"))?;
+        let pool = kv_adapter.layer_mut(layer_idx)?;
+        self.attention[layer_idx].restore_spec_node_slot(
+            ctx,
+            pool,
+            &snaps[layer_idx],
+            node_idx,
+            abs_pos,
+        )
     }
 
     pub(crate) fn seq_len(&self) -> usize {
@@ -1213,6 +1341,42 @@ impl Dsv4Model {
         slot.restore_spec_ring_tail(&self.ctx, kv_adapter, start_pos, accepted_n, depth)
     }
 
+    /// Park the MTP frozen target layer's ring slot for draft-tree node
+    /// `node_idx`. The draft (`mtp_forward`) writes ONLY that layer's SW/FP8
+    /// ring, so the draft loop's sibling fix-ups touch one layer; the verify
+    /// forward handles all layers inline via [`SpecVerifySchedule`].
+    pub(crate) fn mtp_save_node_ring(
+        &self,
+        slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        node_idx: usize,
+        abs_pos: usize,
+    ) -> Result<()> {
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 MTP node-ring save without a loaded MTP head"))?;
+        let layer_idx = self.mtp_frozen_target_layer_idx(mtp)?;
+        slot.spec_node_save(&self.ctx, kv_adapter, layer_idx, node_idx, abs_pos)
+    }
+
+    /// Replay the MTP frozen target layer's parked ring slot for draft-tree
+    /// node `node_idx`. Counterpart of [`Self::mtp_save_node_ring`].
+    pub(crate) fn mtp_restore_node_ring(
+        &self,
+        slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        node_idx: usize,
+        abs_pos: usize,
+    ) -> Result<()> {
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 MTP node-ring restore without a loaded MTP head"))?;
+        let layer_idx = self.mtp_frozen_target_layer_idx(mtp)?;
+        slot.spec_node_restore(&self.ctx, kv_adapter, layer_idx, node_idx, abs_pos)
+    }
+
     pub(crate) fn dump_mtp_rollback_state(
         &self,
         slot: &Dsv4SlotState,
@@ -1299,7 +1463,7 @@ impl Dsv4Model {
         }
 
         let (stream, mut keepalive) =
-            self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, false)?;
+            self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, None)?;
         if let Some(out) = last_hidden_out {
             self.capture_mtp_stream_hidden(&stream, seq_len - 1, out, &mut keepalive)?;
         }
@@ -1316,6 +1480,8 @@ impl Dsv4Model {
         Ok(token)
     }
 
+    /// Chain verify: the degenerate one-branch schedule (`[pending, d0..]` at
+    /// strictly increasing positions). Also the commit re-forward's entry.
     pub(crate) fn forward_tokens_verify(
         &self,
         slot: &mut Dsv4SlotState,
@@ -1324,24 +1490,47 @@ impl Dsv4Model {
         start_pos: usize,
         position: u64,
     ) -> Result<(Vec<u32>, Vec<DeviceVec>)> {
+        let sched = SpecVerifySchedule::chain(tokens.len(), start_pos);
+        self.forward_tokens_verify_scheduled(slot, kv_adapter, tokens, start_pos, position, &sched)
+    }
+
+    /// Verify `tokens` (a flattened draft tree in BFS row order) in ONE forward
+    /// under `sched`'s per-row positions and ring fix-ups. Returns per row the
+    /// target argmax AFTER that row's token and the row's MTP stream hidden.
+    pub(crate) fn forward_tokens_verify_scheduled(
+        &self,
+        slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        tokens: &[u32],
+        start_pos: usize,
+        position: u64,
+        sched: &SpecVerifySchedule,
+    ) -> Result<(Vec<u32>, Vec<DeviceVec>)> {
         ensure!(
             !tokens.is_empty(),
             "DSv4 verify forward requires at least one token"
         );
+        ensure!(
+            sched.positions.len() == tokens.len()
+                && sched.restores.len() == tokens.len()
+                && sched.saves.len() == tokens.len(),
+            "DSv4 verify schedule rows {} != tokens {}",
+            sched.positions.len(),
+            tokens.len()
+        );
         let _nvtx = crate::nvtx::range("dsv4/lm_head_verify");
         let params = SamplingParams::default();
 
-        // Batched verify (opt-in, default off; KNOWN col1 bug — see selftest probe).
-        // ONE 2-token forward amortizes the weight read (proven +63%).
+        // Batched verify: ONE multi-row forward amortizes the weight read
+        // (proven +63%). The ONLY path that can express a tree schedule.
         if dsv4_mtp_batched_verify_enabled() && tokens.len() >= 2 {
             let stream_dim = self.config.hidden_size * self.config.hc_mult;
-            // Depth-K verify: ONE forward over `[pending, d0..d_{K-1}]` amortizes the
-            // weight read across K+1 tokens. `hiddens[j]` = position j's MTP stream;
-            // `argmax[j]` = the target's argmax AFTER `tokens[j]` (so `argmax[i]` is
-            // exactly what draft i must equal to be accepted). Per-token attention
-            // (`per_token_attn=true`) keeps the mid-sequence compressed/DSA path correct.
+            // `hiddens[j]` = row j's MTP stream; `argmax[j]` = the target's
+            // argmax AFTER `tokens[j]` (so `argmax[i]` is exactly what an
+            // accepted child of node i must equal). Per-row attention keeps the
+            // mid-sequence compressed/DSA path correct.
             let (stream, mut keepalive) =
-                self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, true)?;
+                self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, Some(sched))?;
             let n = tokens.len();
             let mut hiddens = Vec::with_capacity(n);
             for i in 0..n {
@@ -1355,7 +1544,7 @@ impl Dsv4Model {
                     &stream,
                     i,
                     &params,
-                    position + (i as u64 - 1),
+                    position + (sched.positions[i - 1] - start_pos) as u64,
                     None,
                     &mut keepalive,
                 )?;
@@ -1366,13 +1555,18 @@ impl Dsv4Model {
             return Ok((argmax, hiddens));
         }
 
+        ensure!(
+            sched.is_chain(),
+            "DSv4 spec tree verify requires the batched verify path \
+             (ARLE_DSV4_MTP_BATCHED_VERIFY disabled?)"
+        );
         let mut argmax_tokens = Vec::with_capacity(tokens.len());
         let mut hiddens = Vec::with_capacity(tokens.len());
         for (row, &token_id) in tokens.iter().enumerate() {
             let row_start = start_pos + row;
             let row_position = position + row as u64;
             let (stream, mut keepalive) =
-                self.forward_tokens_stream_impl(slot, kv_adapter, &[token_id], row_start, false)?;
+                self.forward_tokens_stream_impl(slot, kv_adapter, &[token_id], row_start, None)?;
             let mut row_hidden =
                 DeviceVec::zeros(&self.ctx, self.config.hidden_size * self.config.hc_mult)?;
             self.capture_mtp_stream_hidden(&stream, 0, &mut row_hidden, &mut keepalive)?;
@@ -2014,13 +2208,17 @@ impl Dsv4Model {
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         tokens: &[u32],
         start_pos: usize,
-        // When true (MTP batched verify only), run attention PER TOKEN on the
+        // `Some` (MTP batched verify only): run attention PER ROW on the
         // seq_len==1 decode path (device start_pos → FlashMLA/DSA decode), in
-        // order so token r+1 attends to token r's just-written KV — point-wise/
-        // MoE stay batched for the weight-read amortization. The batched
-        // (host-start_pos) compressed/DSA path is incorrect for a small chunk at
-        // a fully-populated mid-sequence position; prefill keeps it (false).
-        per_token_attn: bool,
+        // schedule order so each row attends to its ancestor path's just-written
+        // KV — point-wise/MoE stay batched for the weight-read amortization. The
+        // schedule carries per-row positions (tree rows share `start_pos+depth`)
+        // and the node-scratch ring fix-ups siblings need; a chain schedule has
+        // no fix-ups and reproduces the validated per-token verify exactly. The
+        // batched (host-start_pos) compressed/DSA path is incorrect for a small
+        // chunk at a fully-populated mid-sequence position; prefill keeps it
+        // (`None`).
+        verify: Option<&SpecVerifySchedule>,
     ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
         ensure!(
             !tokens.is_empty(),
@@ -2092,7 +2290,7 @@ impl Dsv4Model {
         // Separate device start_pos buffer (the function-level `start_pos_device`
         // immutably borrows `slot.start_pos_device` for the whole fn, so the loop
         // needs its own).
-        let (mut normed_row, mut attn_out_row, mut verify_pos_dev) = if per_token_attn {
+        let (mut normed_row, mut attn_out_row, mut verify_pos_dev) = if verify.is_some() {
             let nr = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
             let ar = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
             let pos = self
@@ -2134,12 +2332,16 @@ impl Dsv4Model {
             keepalive.keep_hidden(&normed);
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            if per_token_attn && seq_len > 1 {
-                // MTP verify: attention PER TOKEN on the seq_len==1 decode path
-                // (device start_pos), in order so token r+1 attends to token r's
-                // just-written KV. Mirrors forward_decode_batch's Step-A loop and
-                // the (correct) non-batched verify; avoids the broken batched
-                // host-start_pos compressed/DSA path at a mid-sequence chunk.
+            if let Some(sched) = verify.filter(|_| seq_len > 1) {
+                // MTP verify: attention PER ROW on the seq_len==1 decode path
+                // (device start_pos), in schedule order so each row attends to
+                // its ancestor path's just-written KV. Mirrors
+                // forward_decode_batch's Step-A loop and the (correct)
+                // non-batched verify; avoids the broken batched host-start_pos
+                // compressed/DSA path at a mid-sequence chunk. Tree schedules
+                // interleave node-scratch ring fix-ups: restore a row's stale
+                // ancestor slots before it attends, park its own slot after if
+                // a later branch chains from it.
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_per_token");
                 let normed_row = normed_row.as_mut().expect("per-token verify scratch");
                 let attn_out_row = attn_out_row.as_mut().expect("per-token verify scratch");
@@ -2147,7 +2349,20 @@ impl Dsv4Model {
                 let (layer_pool, mut dsa_shared) =
                     kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                 for r in 0..seq_len {
-                    let pos_r = start_pos + r;
+                    let pos_r = sched.positions[r];
+                    for &src in &sched.restores[r] {
+                        let snaps = slot
+                            .spec_nodes
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("DSv4 spec tree verify needs node scratch"))?;
+                        slot.attention[layer_idx].restore_spec_node_slot(
+                            &self.ctx,
+                            layer_pool,
+                            &snaps[layer_idx],
+                            src,
+                            sched.positions[src],
+                        )?;
+                    }
                     let pos_r_i32 = i32::try_from(pos_r)
                         .map_err(|_| anyhow!("DSv4 verify pos {pos_r} overflows i32"))?;
                     self.ctx
@@ -2176,6 +2391,19 @@ impl Dsv4Model {
                         attn_out_row,
                         &mut keepalive,
                     )?;
+                    if sched.saves[r] {
+                        let snaps = slot
+                            .spec_nodes
+                            .as_mut()
+                            .ok_or_else(|| anyhow!("DSv4 spec tree verify needs node scratch"))?;
+                        slot.attention[layer_idx].save_spec_node_slot(
+                            &self.ctx,
+                            layer_pool,
+                            &mut snaps[layer_idx],
+                            r,
+                            pos_r,
+                        )?;
+                    }
                     let mut dst = attn_out
                         .data
                         .slice_mut(r * hidden_size..(r + 1) * hidden_size);
