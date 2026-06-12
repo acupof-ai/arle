@@ -415,8 +415,13 @@ mod backend {
 
         #[cfg(feature = "metal")]
         fn load_metal(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
-            let (serve, tokenizer, model_id) =
-                metal_serve_handle(model_path, config, infer_server::ServeShutdown::new())?;
+            let kv_ssd = crate::serve::ServeKvSsdOptions::default();
+            let (serve, tokenizer, model_id) = metal_serve_handle(
+                model_path,
+                config,
+                &kv_ssd,
+                infer_server::ServeShutdown::new(),
+            )?;
             Ok(Self::Metal(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
             )))
@@ -513,19 +518,19 @@ mod backend {
         kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
-        // The T2 disk tier is consumed by the CUDA arm only; every other
+        // The T2 disk tier is consumed by CUDA and Metal; every other
         // backend fails closed on an explicit request instead of silently
         // serving without it.
-        #[cfg(not(all(not(feature = "metal"), feature = "cuda")))]
+        #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
         anyhow::ensure!(
             !kv_ssd.requested(),
-            "--kv-ssd-path: the T2 KV tier is CUDA-only today (Metal pending #74/#83)"
+            "--kv-ssd-path: the T2 KV tier is only supported by CUDA and Metal today"
         );
 
         #[cfg(feature = "metal")]
         {
             let _ = enable_cuda_graph;
-            return router_metal(model_path, &config, shutdown);
+            return router_metal(model_path, &config, kv_ssd, shutdown);
         }
 
         #[cfg(all(not(feature = "metal"), feature = "cuda"))]
@@ -570,6 +575,7 @@ mod backend {
     fn metal_serve_handle(
         model_path: &str,
         config: &EngineLoadConfig,
+        kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<(
         ServeHandle<MetalExecutor, MetalKvPool>,
@@ -649,6 +655,21 @@ mod backend {
             },
             shutdown,
         )?;
+        if kv_ssd.requested() {
+            let root = kv_ssd
+                .root
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--kv-ssd-max-bytes requires --kv-ssd-path"))?;
+            let budget = kv_ssd
+                .max_bytes
+                .unwrap_or_else(|| infer_metal::default_t2_budget_bytes(&root));
+            let consumed =
+                serve.run_on_executor(move |e| e.set_kv_tier_disk(root, budget, page_size))?;
+            anyhow::ensure!(
+                consumed,
+                "--kv-ssd-path: the loaded Metal model has no usable page-addressable KV tier store"
+            );
+        }
         Ok((serve, tokenizer, model_id))
     }
 
@@ -659,9 +680,11 @@ mod backend {
     fn router_metal(
         model_path: &str,
         config: &EngineLoadConfig,
+        kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
-        let (serve, tokenizer, model_id) = metal_serve_handle(model_path, config, shutdown)?;
+        let (serve, tokenizer, model_id) =
+            metal_serve_handle(model_path, config, kv_ssd, shutdown)?;
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
     }
 
