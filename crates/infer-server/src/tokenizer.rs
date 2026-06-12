@@ -34,6 +34,9 @@ enum ChatTemplate {
     BuiltinDeepseekV4,
     /// Last-resort Qwen ChatML (warned at load).
     BuiltinChatMl,
+    /// This backend intentionally exposes `/v1/completions` only because the
+    /// checkpoint ships no chat template and no verified builtin renderer.
+    UnsupportedChat { reason: String },
 }
 
 /// Tokenizer and chat-template adapter for the OpenAI v1 facade.
@@ -79,8 +82,32 @@ impl OpenAiTokenizer {
                     model_dir.display()
                 );
             }
+            ChatTemplate::UnsupportedChat { reason } => {
+                log::warn!(
+                    "chat template disabled for {}: {reason}",
+                    model_dir.display()
+                );
+            }
         }
         Ok(Self { inner, template })
+    }
+
+    /// Load a tokenizer for `/v1/completions` while making
+    /// `/v1/chat/completions` fail closed.
+    pub fn from_model_dir_without_chat(
+        model_dir: impl AsRef<Path>,
+        reason: impl Into<String>,
+    ) -> Result<Self> {
+        let model_dir = model_dir.as_ref();
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        let inner = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|err| anyhow!("load tokenizer {} failed: {err}", tokenizer_path.display()))?;
+        Ok(Self {
+            inner,
+            template: ChatTemplate::UnsupportedChat {
+                reason: reason.into(),
+            },
+        })
     }
 
     /// Encode text into token ids without adding special tokens.
@@ -113,6 +140,9 @@ impl OpenAiTokenizer {
             } => render_jinja(source, bos_token, eos_token, messages),
             ChatTemplate::BuiltinDeepseekV4 => render_deepseek_v4(messages),
             ChatTemplate::BuiltinChatMl => render_chatml(messages),
+            ChatTemplate::UnsupportedChat { reason } => {
+                anyhow::bail!("chat completions are not supported for this tokenizer: {reason}")
+            }
         }
     }
 }
@@ -406,6 +436,19 @@ mod tests {
             rendered,
             "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    #[test]
+    fn unsupported_chat_template_fails_closed() {
+        let tokenizer = OpenAiTokenizer {
+            inner: Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default()),
+            template: ChatTemplate::UnsupportedChat {
+                reason: "no verified template".to_string(),
+            },
+        };
+        let err = tokenizer.render_chat(&[msg("user", "hi")]).unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+        assert!(err.to_string().contains("no verified template"));
     }
 
     #[test]
