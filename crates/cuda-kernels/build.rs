@@ -2546,6 +2546,21 @@ fn main() {
             ]);
         }
 
+        // flashinfer fused add+RMSNorm shim (ARLE_QWEN35_FUSED_ADDNORM). The
+        // vendored flashinfer headers live under csrc/vendor/flashinfer/; the
+        // shim's `#include "vendor/flashinfer/norm.cuh"` resolves via the
+        // always-present `-Icsrc`, and norm.cuh's internal `#include
+        // "flashinfer/..."` includes resolve via `-Icsrc/vendor`. flashinfer is
+        // header-only C++17 templates (std::gcd, DISPATCH_ALIGNED_VEC_SIZE).
+        if stem == "arle_fused_add_rmsnorm" {
+            nvcc_args.extend([
+                "-std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "-Icsrc/vendor".to_string(),
+            ]);
+        }
+
         // FA3 hopper units + ARLE shim. Flag set mirrors hopper/setup.py:
         // NDEBUG is upstream-marked "otherwise performance is severely
         // impacted"; EXTENDED_MMA_SHAPES is required for FA3's WGMMA tiles.
