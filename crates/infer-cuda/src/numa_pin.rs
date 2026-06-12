@@ -1,0 +1,142 @@
+//! Pin this TP worker's threads to the NUMA node of its own GPU.
+//!
+//! Evidence (2026-06-12 trace, 8×H20 B=1 decode): per-rank compute is dead
+//! even, but two ranks arrive last at every collective and the other six
+//! spin inside their NCCL kernels waiting — ~129 latency-bound 8 KB
+//! collectives per token amplify host launch jitter into multiple ms of
+//! wall. Unpinned workers wander across sockets; pinning each rank to a
+//! disjoint core slice of its GPU's NUMA node removes the scheduler-placement
+//! lottery (the documented ±6% session drift is the same lottery).
+//!
+//! Default ON for multi-rank CUDA workers; `ARLE_NUMA_PIN=0` opts out. Every
+//! decision is logged loudly; ANY failure leaves the process unpinned and
+//! boots normally (pinning is never load-bearing for correctness).
+
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "nccl"), allow(dead_code))]
+pub(crate) fn pin_to_gpu_numa(ordinal: usize, world_size: usize) {
+    if matches!(
+        std::env::var("ARLE_NUMA_PIN").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    ) {
+        log::info!("[numa-pin] disabled via ARLE_NUMA_PIN=0");
+        return;
+    }
+    match try_pin(ordinal, world_size) {
+        Ok(msg) => log::info!("[numa-pin] {msg}"),
+        Err(err) => log::warn!("[numa-pin] unpinned (non-fatal): {err:#}"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[cfg_attr(not(feature = "nccl"), allow(dead_code))]
+pub(crate) fn pin_to_gpu_numa(_ordinal: usize, _world_size: usize) {}
+
+#[cfg(target_os = "linux")]
+fn try_pin(ordinal: usize, world_size: usize) -> anyhow::Result<String> {
+    use anyhow::{Context, anyhow, ensure};
+
+    // GPU index → PCI bus id → NUMA node, for ALL GPUs (slice assignment
+    // needs to know how many ranks share this node). nvidia-smi is a boot
+    // one-shot; no per-step cost.
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=index,pci.bus_id", "--format=csv,noheader"])
+        .output()
+        .context("nvidia-smi spawn failed")?;
+    ensure!(out.status.success(), "nvidia-smi exited non-zero");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut nodes: Vec<(usize, i32)> = Vec::new(); // (gpu index, numa node)
+    for line in text.lines() {
+        let mut parts = line.split(',').map(str::trim);
+        let (Some(idx), Some(bus)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let idx: usize = idx.parse().context("gpu index parse")?;
+        // nvidia-smi prints e.g. 00000000:8A:00.0; sysfs wants lowercase with
+        // a 4-hex-digit domain.
+        let bus = bus.to_lowercase();
+        let bus_tail = bus.split_once(':').map(|(_, t)| t).unwrap_or(&bus);
+        let sys = format!("/sys/bus/pci/devices/0000:{bus_tail}/numa_node");
+        let node: i32 = std::fs::read_to_string(&sys)
+            .with_context(|| format!("read {sys}"))?
+            .trim()
+            .parse()
+            .context("numa_node parse")?;
+        nodes.push((idx, node));
+    }
+    ensure!(!nodes.is_empty(), "no GPUs parsed from nvidia-smi");
+    let my_node = nodes
+        .iter()
+        .find(|(i, _)| *i == ordinal)
+        .map(|(_, n)| *n)
+        .ok_or_else(|| anyhow!("GPU ordinal {ordinal} not in nvidia-smi list"))?;
+    // numa_node = -1 (single-node / unknown): pin to a disjoint slice of the
+    // whole online cpu set instead — the win is disjointness + stickiness.
+    let cpulist_path = if my_node >= 0 {
+        format!("/sys/devices/system/node/node{my_node}/cpulist")
+    } else {
+        "/sys/devices/system/cpu/online".to_string()
+    };
+    let cpus = parse_cpulist(
+        std::fs::read_to_string(&cpulist_path)
+            .with_context(|| format!("read {cpulist_path}"))?
+            .trim(),
+    )?;
+    ensure!(!cpus.is_empty(), "empty cpulist at {cpulist_path}");
+
+    // This rank's slice index among ranks that share the node (GPU-ordinal
+    // order); world_size bounds the divisor when nvidia-smi sees more GPUs
+    // than the TP group uses.
+    let sharers: Vec<usize> = nodes
+        .iter()
+        .filter(|(i, n)| (*n == my_node || my_node < 0) && *i < world_size)
+        .map(|(i, _)| *i)
+        .collect();
+    let slot = sharers.iter().position(|&i| i == ordinal).unwrap_or(0);
+    let nshare = sharers.len().max(1);
+    let per = (cpus.len() / nshare).max(1);
+    let slice = &cpus[slot * per..((slot + 1) * per).min(cpus.len())];
+    ensure!(!slice.is_empty(), "empty core slice");
+
+    // SAFETY: plain libc cpu_set_t manipulation on this process (pid 0).
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        for &c in slice {
+            libc::CPU_SET(c, &mut set);
+        }
+        ensure!(
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0,
+            "sched_setaffinity failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(format!(
+        "rank gpu{ordinal} → numa{my_node}, cores {}..{} ({} of {} on node, {} sharers)",
+        slice[0],
+        slice[slice.len() - 1],
+        slice.len(),
+        cpus.len(),
+        nshare
+    ))
+}
+
+/// Parse a sysfs cpulist like `0-23,96-119` into core ids.
+#[cfg(target_os = "linux")]
+fn parse_cpulist(s: &str) -> anyhow::Result<Vec<usize>> {
+    use anyhow::Context;
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let a: usize = a.trim().parse().context("cpulist range start")?;
+            let b: usize = b.trim().parse().context("cpulist range end")?;
+            out.extend(a..=b);
+        } else {
+            out.push(part.parse().context("cpulist entry")?);
+        }
+    }
+    Ok(out)
+}
