@@ -24,10 +24,12 @@ instantiations. The structural debts are:
    kernels — a compute-graph IR is explicitly a non-goal (§7).
 2. **P2 — sibling backends are laterally coupled.** `infer-vulkan` depends on
    `infer-hip` for GGUF host substrate. Extract to a neutral leaf (R1).
+   **Resolved** by `infer-gguf` (`31bf4322`).
 3. **P3 — the truth surface (docs) structurally lags code.** 7 workspace
    crates are undocumented; codebase-map describes deleted seam traits.
    Manual resync loses to ~15 commits/2 days; the fix is a CI gate (R0.2),
-   not another one-off resync.
+   not another one-off resync. **Resynced** (`07948a3d`) and **gated in CI**
+   (`215807e3`).
 4. **Sequencing is everything.** R2 (batched lowering) **is** Phase 1 — not
    new work. R3–R5 must not start while `attention.rs`/`dsv4.rs` carry
    uncommitted WIP. R4/R6 have explicit *trigger conditions*; starting them
@@ -37,16 +39,12 @@ instantiations. The structural debts are:
 
 ### §1.1 Files you must not touch
 
-The working tree carries ckl WIP. Do **not** edit, stage, stash, or checkout:
-
-- `crates/infer-cuda/src/attention.rs`
-- `crates/infer-cuda/src/dsv4.rs`
-- `crates/cuda-kernels/tools/tilelang/batch_prefill_paged_hd128.py`
-- `docs/experience/errors/2026-06-04-tilelang-hd128-prefill-wgmma-hang-sm90a.md`
-- anything else dirty in `git status` that your tranche did not create
-
-If your tranche needs one of these files, the tranche is **blocked** — report
-back, do not work around.
+**Run `git status` before you start — the dirty set changes daily; never
+trust a snapshot list in any doc.** Anything dirty in the working tree that
+your tranche did not create is ckl WIP: do **not** edit, stage, stash, or
+checkout it. If your tranche needs a dirty file, the tranche is **blocked**
+— report back, do not work around. Re-check `git status` and `git log`
+before committing: ckl lands divergent commits mid-session.
 
 ### §1.2 Process rules
 
@@ -71,15 +69,19 @@ back, do not work around.
 - Verification commands for host-only work:
   `cargo check -p <crates>`, `cargo test -p <crates>`,
   `cargo clippy -p <crates> -- -D warnings`, and on Mac the CUDA typecheck
-  lane `cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib`.
+  lane needs the cudarc nvcc bypass:
+  `CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib`
+  (bare invocation fails on a Mac without nvcc).
+- **When you land a tranche, update its Status line in this doc in the same
+  commit.** A stale steering doc misroutes every later agent.
 
 ## §2 Problem inventory (evidence, survey 2026-06-12)
 
 | # | Problem | Evidence anchors |
 |---|---|---|
 | P1 | DSv4 forward-order truth ×3: CUDA imperative (`infer-cuda/src/dsv4.rs`), declarative `DeepSeekV4AttentionLayerPlan` (`deepseek-spec/src/v4.rs`, consumed **only** by `infer-hip/src/model.rs`), HIP doc comments pinning CUDA line numbers ("call sites at attention.rs:4372/… on today's tree" — already rotting). §0.1 mutated-buffer enumerations also per-backend. Model files: infer-cuda{model,qwen35,dsv4}, infer-metal{qwen35}, infer-hip{model}, infer-vulkan{model_qwen3,_qwen35,_qwen36,_dsv4,_gemma4} | `grep -rn AttentionLayerPlan crates` |
-| P2 | Lateral backend dep: `infer-vulkan` → `infer-hip` for `{config, dequant, gguf}` | `crates/infer-vulkan/Cargo.toml`; `crates/infer-vulkan/src/lib.rs:8` |
-| P3 | Truth surface stale: codebase-map missing 7 crates (`gemma-spec`, `hip-sys`, `hip-kernels`, `infer-hip`, `infer-vulkan`, `vulkan-sys`, `vulkan-kernels`); §3.2 describes deleted seam traits (Communicator/Sampler/GraphRunner/ModelArch) and misses driven `ResourceGovernor` (`infer-core/src/lib.rs:308`, `infer-api/src/loaded.rs:641`) + `KvBatchDescriptor`; kv-native-sys "zero dependents" false (infer-cuda `kv_tier.rs`, infer-metal `MetalSsdTier`); architecture.md parity matrix lacks HIP/Vulkan; CLAUDE.md/AGENTS.md workspace tree stale; ROADMAP says ROCm enters at Phase 3 while ~10k LOC landed | this survey |
+| P2 | Lateral backend dep: `infer-vulkan` → `infer-hip` for `{config, dequant, gguf}`. **Resolved by R1** (`31bf4322`): both consume the neutral `infer-gguf` leaf | `crates/infer-vulkan/Cargo.toml`; `crates/infer-vulkan/src/lib.rs:8` (pre-R1) |
+| P3 | Truth surface stale: codebase-map missing 7 crates (`gemma-spec`, `hip-sys`, `hip-kernels`, `infer-hip`, `infer-vulkan`, `vulkan-sys`, `vulkan-kernels`); §3.2 describes deleted seam traits (Communicator/Sampler/GraphRunner/ModelArch) and misses driven `ResourceGovernor` (`infer-core/src/lib.rs:308`, `infer-api/src/loaded.rs:641`) + `KvBatchDescriptor`; kv-native-sys "zero dependents" false (infer-cuda `kv_tier.rs`, infer-metal `MetalSsdTier`); architecture.md parity matrix lacks HIP/Vulkan; CLAUDE.md/AGENTS.md workspace tree stale; ROADMAP says ROCm enters at Phase 3 while ~10k LOC landed. **Resynced in R0.1** (`07948a3d`), **CI-gated in R0.2** (`215807e3`) | this survey |
 | P4 | infer-cuda re-monolithization: 31.5k LOC; `attention.rs` 6,679 lines mixing 4 concerns (MLA attention, `ModelKvAdapter` at `attention.rs:257` `pub(crate)` with one impl, KvBatchDescriptor lowering, FlashMLA/TileLang glue); `moe.rs` 4.3k; `dsv4.rs` 3.6k; per-capability per-model match arms in `executor.rs` (kv-tier: Qwen only; slot-tier: DSv4 only — coverage matrix lives nowhere) | `wc -l`, `executor.rs:210-260` |
 | P5 | Seam narrative vs reality: `BackendExecutor` is 15+ methods (capability default-methods: stop ids, max rows/live, prefix reuse ×2, page-tier ×4, slot-tier ×3, weight offload ×2) while docs say "two traits, submit/poll". The default-method pattern itself is **correct** (KV tier is the model example: engine drives, backends store) — the gap is governance + docs | `infer-seam/src/lib.rs:53-198` |
 | P6 | Dead/residual: `xgrammar-sys` has zero code consumers (grammar decode lost in monolith deletion); 63 `env::var("ARLE_/INFER_*")` runtime knobs vs decision D5 (CLI flags), audit plan exists (`2026-06-07-dsv4-code-cleanup-audit.md`); `EchoExecutor` duplicated (`infer-server/src/lib.rs:518`, `agent-bench/src/lib.rs:167`); ~2k lines of test mocks inline in `infer-core/src/lib.rs` | greps in this survey |
@@ -107,7 +109,7 @@ deferred).
 
 ## §4 Tranches
 
-### R0.1 — Truth-surface resync (docs-only) — owner: Claude
+### R0.1 — Truth-surface resync (docs-only) — ✅ LANDED `07948a3d` (2026-06-12)
 
 Fix exactly these stale claims; preserve everything else:
 
@@ -138,7 +140,7 @@ Fix exactly these stale claims; preserve everything else:
 Exit: every claim above matches code truth. Verify: re-run the greps in §2.
 Commit: `docs: resync truth surface with workspace reality` (docs-only).
 
-### R0.2 — CI truth-surface gate — owner: Claude
+### R0.2 — CI truth-surface gate — ✅ LANDED `215807e3` (2026-06-12)
 
 Extend `scripts/check_repo_hygiene.py` (already wired in CI job
 `repo-hygiene`) with one check: parse `[workspace] members` from root
@@ -164,7 +166,7 @@ Execute per the existing audit plan
 `INFER_NCCL_UNIQUE_ID`, build/toolchain) vs runtime-knob→CLI-flag. Touches
 hot paths → needs its own brief + bench entries; do not fold into R0.1/R0.2.
 
-### R1 — GGUF host substrate extraction — delegated, brief below
+### R1 — GGUF host substrate extraction — ✅ LANDED `31bf4322` (2026-06-12; codex review: no blocking issues)
 
 **Goal:** kill the `infer-vulkan → infer-hip` lateral dep by extracting the
 GGUF host substrate to a neutral leaf crate `crates/infer-gguf`.
@@ -272,8 +274,8 @@ the documented, deliberate choice (R0.1 notes it in architecture.md).
 ## §5 Sequencing
 
 ```
-R0.1 ──▶ R0.2          (independent of R1; same wave)
-R1                      (independent; may run after R0.2 so the gate covers it)
+R0.1 ✅ ──▶ R0.2 ✅     (landed 2026-06-12: 07948a3d, 215807e3)
+R1 ✅                   (landed 2026-06-12: 31bf4322)
 R2 (= Phase 1, active) ──▶ R3 ──▶ R4 (= Phase 3 Qwen3.6 item)
                        └─▶ R5 (opportunistic, after WIP lands)
 R6: trigger-only.   R0.3: blocked on ckl.   R0.4: queued, own brief.
