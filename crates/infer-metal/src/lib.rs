@@ -28,9 +28,9 @@ mod weights;
 #[cfg(feature = "metal")]
 mod wired_limit;
 
-#[cfg(feature = "metal")]
-pub use executor::pipeline_fast_path_hits;
 pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
+#[cfg(feature = "metal")]
+pub use executor::{paged_kv_read_fallbacks, paged_kv_read_hits, pipeline_fast_path_hits};
 pub use kv_pool::MetalKvPool;
 #[cfg(feature = "metal")]
 pub use mlx::{
