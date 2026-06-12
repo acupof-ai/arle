@@ -6,7 +6,7 @@ It states what the repository currently supports, what is still limited, and
 what validation exists for each area. If something is not listed as supported
 here, do not assume it is supported just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-06-10.
+State reflected here is based on repository evidence as of 2026-06-12.
 **The device-neutral rewrite (`crates/infer-*`) IS the product** — PR #53 merged
 to `main` 2026-06-04, and the legacy monolithic `infer/` crate is **deleted**.
 Sections 1–7 below were written against the legacy runtime; those capabilities
@@ -36,7 +36,13 @@ a dated `wins/` entry says so. Project framing:
 
 **New-stack model coverage:** Qwen3.5 / Qwen3.6 on Metal (verified); Qwen3 dense +
 DeepSeek-V4-Flash (TP=8/EP=8) on CUDA (prefill verified, decode in progress);
-Qwen3.5/3.6 hybrid on CUDA (parity follow-up).
+Qwen3.5/3.6 hybrid on CUDA (parity follow-up). DiffusionGemma has the
+backend-neutral block-diffusion generate-loop substrate wired through
+`infer-plan`/`infer-seam`, Engine completion and repeated-prompt tests, Gemma4 /
+DiffusionGemma config parsing, and a first Metal `MetalDiffusionGemmaModel`
+bridge routed through `infer-api`. CUDA/Vulkan DiffusionGemma forward paths
+still fail closed. Target 26B generation smoke is pending because the checkpoint
+is not cached locally.
 
 **Now in the new stack (was legacy-only):** TP / EP / DeepEP multi-GPU, DeepGEMM
 (FP8 grouped GEMM), DSv4 (MLA + FP8 KV), and the HTTP/serving surface
@@ -103,6 +109,7 @@ Notes:
 | Qwen3.5 | Supported | Primary supported family. Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B has two measured Metal single-request paths: MLX SafeTensors 4bit step-driver reaches 305.5 tok/s for `1024/256`, while GGUF Q4_K_M exact default is 202.1 tok/s direct and its opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s step-driver on the same `1024/256` profile. RoPE scaling (YARN / Linear / NtkAware) wired through `Qwen35Config::rope_scaling` for long-ctx extend (Phase 1+2 closed; Phase 3 bench pending). Metal DFlash is substrate-only in the rewrite serve path; see §4a for the current validation note. |
 | Qwen3.6 / Qwen3.5-MoE | Supported (Metal canonical), CUDA pending (#65) | `mlx-community/Qwen3.6-35B-A3B-4bit` is the **canonical Metal production model** (globally unified 2026-05-07) — every Metal serve/bench/test defaults to it. CUDA classifies Qwen3 MoE checkpoints (`infer-api` `classify_cuda_model`), but Qwen3.6 CUDA serving needs the second `ModelKvAdapter` (#65, Phase 3). |
 | DeepSeek V4 | Serving (CUDA 8×H20 TP=8/EP=8) | DSv4-Flash serves via `arle serve --backend cuda` in-process multi-rank: FlashMLA + DSA/CSA/HCA hybrid attention, FP8 KV, DeepGEMM FP8 MoE, DeepEP/allreduce transports. Needle-exact to 32K after the per-layer RoPE theta fix (`fa355315`); decode ~39 tok/s c=1. Open debt tracked in #55 (Phase 0: #56–#58; batched lane #60/#61; MTP default #62). `crates/deepseek-spec` remains V4-only; DSv4 scratch pretrain stays retired (2026-05-18 OPD-only pivot). |
+| DiffusionGemma | Metal-wired, pending target smoke | `infer-plan` contains a backend-neutral block-diffusion generate loop matching the public DiffusionGemma generation contract shape: fixed canvas, denoise passes, entropy-bound acceptance, stability/confidence convergence, and whole-canvas commit hook. `infer-seam::BufferedDiffusionExecutor` adapts that loop into the normal `BackendExecutor`/Engine path, disables cross-request prefix reuse, and honors Engine-normalized `max_tokens`. `gemma-spec` parses the top-level DiffusionGemma config, nested Gemma4 RoPE map, and MoE fields. `infer-metal` now loads `model.decoder.*` with per-weight MLX quantization overrides, registers a dedicated C++ Gemma4/DiffusionGemma forward bridge, handles full-attention K=V layers, self-conditioning, tied embedding logits, and canvas-sized device sampling summaries, then `infer-api` routes it as `MetalDiffusionGemma`. `/v1/completions` is the licensed surface; `/v1/chat/completions` fails closed while the tokenizer has `chat_template=null`. CUDA/Vulkan classification fails closed instead of falling through to Qwen/Qwen3 dense. Runtime generation correctness and perf remain pending until the 26B 4-bit checkpoint is downloaded and a completions smoke/bench entry is recorded. |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Not carried | Deleted from the current registry/spec/train surface; reintroduction would require a new explicit project, not a compatibility branch inside DSv4. |
 | Mistral / Mixtral / Gemma / Phi | Planned | Not yet supported. |
